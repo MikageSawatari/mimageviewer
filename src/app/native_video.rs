@@ -2149,7 +2149,17 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
-                if wheel.ctrl && self.video_tile_mode_active {
+                if !wheel.ctrl
+                    && self.apply_shift_alt_wheel_pair(
+                        ctx,
+                        wheel.delta as f32,
+                        wheel.shift,
+                        wheel.alt,
+                        None,
+                        "native-video-wheel-pair",
+                    )
+                {
+                } else if wheel.ctrl && self.video_tile_mode_active {
                     let delta = if wheel.delta > 0 { -1 } else { 1 };
                     self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
                 } else if !wheel.ctrl {
@@ -4903,19 +4913,14 @@ impl App {
             }
             // VK_BROWSER_BACK / VK_BROWSER_FORWARD: マウス進む/戻るボタンが Browser_Back/Forward
             // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
-            // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。Ctrl+↑/↓ と同じ DFS ナビと
-            // 等価に扱う。
+            // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。マウス戻る/進む設定を通す。
             0xA6 => {
-                crate::logger::log(format!(
-                    "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} vk=0xA6"
-                ));
-                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+                self.mouse_ring_nav =
+                    self.apply_mouse_back_forward_button(ctx, false, "native-video-key");
             }
             0xA7 => {
-                crate::logger::log(format!(
-                    "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} vk=0xA7"
-                ));
-                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+                self.mouse_ring_nav =
+                    self.apply_mouse_back_forward_button(ctx, true, "native-video-key");
             }
             _ if self
                 .keymap
@@ -6043,18 +6048,14 @@ impl App {
             match event.button {
                 NativeVideoMouseButton::Extra1 => {
                     self.native_video_pointer_down = None;
-                    crate::logger::log(format!(
-                        "[input-nav] source=native-video-mouse action=ctrl_nav_back fs_idx={fs_idx} button=Extra1"
-                    ));
-                    self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+                    self.mouse_ring_nav =
+                        self.apply_mouse_back_forward_button(ctx, false, "native-video-mouse");
                     return;
                 }
                 NativeVideoMouseButton::Extra2 => {
                     self.native_video_pointer_down = None;
-                    crate::logger::log(format!(
-                        "[input-nav] source=native-video-mouse action=ctrl_nav_forward fs_idx={fs_idx} button=Extra2"
-                    ));
-                    self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+                    self.mouse_ring_nav =
+                        self.apply_mouse_back_forward_button(ctx, true, "native-video-mouse");
                     return;
                 }
                 _ => {}

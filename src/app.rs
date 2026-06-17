@@ -2862,6 +2862,8 @@ pub struct App {
     pub(crate) mouse_ring_suppress_context_menu_once: bool,
     /// グリッドのリングアクションから発生したナビゲーションをフレーム後段に合流させる予約。
     pub(crate) mouse_ring_nav: Option<crate::ui_main::AddressBarNav>,
+    /// 既存ユーザー向け: マウス戻る/進むボタンの既定変更を一度だけ確認する。
+    pub(crate) show_mouse_nav_migration_prompt: bool,
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
     /// 右クリック長押し検出用: 押下開始時刻と座標
@@ -4825,7 +4827,17 @@ impl App {
     ///
     /// spec §8 で並列 `Settings::load()` を撲滅した結果、production では main thread の
     /// `Settings::load()` が唯一の呼び出し点になっており、その結果を ここに引き渡す。
-    pub fn new_from_settings(mut settings: crate::settings::Settings) -> Self {
+    pub fn new_from_settings(settings: crate::settings::Settings) -> Self {
+        Self::new_from_settings_with_load_meta(
+            settings,
+            crate::settings::SettingsLoadMeta::default(),
+        )
+    }
+
+    pub fn new_from_settings_with_load_meta(
+        mut settings: crate::settings::Settings,
+        load_meta: crate::settings::SettingsLoadMeta,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
         #[cfg(windows)]
@@ -4842,6 +4854,8 @@ impl App {
             crate::video::clock::clamp_playback_speed(settings.video_playback_speed);
         let video_continuous_mode = settings.video_continuous_mode;
         let video_session_muted = settings.video_start_muted || settings.video_muted;
+        let show_mouse_nav_migration_prompt =
+            Self::should_show_mouse_nav_migration_prompt(&settings, &load_meta);
         // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
         // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
         let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
@@ -5155,6 +5169,7 @@ impl App {
             mouse_ring_grid_target_idx: None,
             mouse_ring_suppress_context_menu_once: false,
             mouse_ring_nav: None,
+            show_mouse_nav_migration_prompt,
             fs_secondary_press_start: None,
             fs_middle_zoom_drag: None,
             fs_context_menu_idx: None,
@@ -5832,6 +5847,27 @@ impl App {
         }
 
         app
+    }
+
+    fn should_show_mouse_nav_migration_prompt(
+        settings: &crate::settings::Settings,
+        load_meta: &crate::settings::SettingsLoadMeta,
+    ) -> bool {
+        use crate::settings_db::BootSource;
+        if settings.ring_shortcuts.mouse_nav_prompt_done
+            || !matches!(
+                settings.ring_shortcuts.mouse_back_forward_action,
+                crate::ring_shortcut::MouseBackForwardActionId::None
+            )
+        {
+            return false;
+        }
+        matches!(
+            load_meta.boot_source,
+            BootSource::LoadedExistingDb
+                | BootSource::MigratedFromJson
+                | BootSource::RestoredFromDbBackup
+        )
     }
 }
 
@@ -6592,6 +6628,7 @@ impl App {
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
+            || self.show_mouse_nav_migration_prompt
             || self.show_cache_manager
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
@@ -6629,6 +6666,7 @@ impl App {
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
+            || self.show_mouse_nav_migration_prompt
             || self.show_cache_manager
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
@@ -6649,6 +6687,51 @@ impl App {
             || self.editing_addon_install_state.is_some()
             // テキスト注釈の子ダイアログ表示中も同様にフルスクリーンキーを止める (Codex P2)。
             || self.text_subdialog_open()
+    }
+
+    pub(crate) fn show_mouse_nav_migration_prompt_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_mouse_nav_migration_prompt {
+            return;
+        }
+
+        let mut open = true;
+        let mut choice = None;
+        egui::Window::new("マウス戻る/進むボタン")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label("マウスの戻る/進むボタンの標準動作を選んでください。");
+                ui.add_space(6.0);
+                ui.label("標準では、ブラウザやエクスプローラーに近いフォルダ履歴の戻る/進むとして使います。");
+                ui.label("従来どおり、ツリー順の前/次フォルダ移動として使うこともできます。");
+                ui.add_space(6.0);
+                ui.small("後で 環境設定 > リングショートカット から変更できます。");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("標準にする").clicked() {
+                        choice = Some(
+                            crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext,
+                        );
+                    }
+                    if ui.button("従来どおり").clicked() {
+                        choice =
+                            Some(crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext);
+                    }
+                });
+            });
+
+        if choice.is_none() && !open {
+            choice = Some(crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext);
+        }
+        if let Some(action) = choice {
+            self.settings.ring_shortcuts.mouse_back_forward_action = action;
+            self.settings.ring_shortcuts.mouse_nav_prompt_done = true;
+            self.settings.save();
+            self.show_mouse_nav_migration_prompt = false;
+        }
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
@@ -16798,15 +16881,18 @@ impl App {
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
+        let mouse_nav_back = mouse_back || browser_back;
+        let mouse_nav_forward = mouse_forward || browser_forward;
+        if mouse_nav_back || mouse_nav_forward {
+            return self.apply_mouse_back_forward_button(ctx, mouse_nav_forward, "grid-mouse");
+        }
         let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
         let key_r = self.keymap.pressed_action(ctx, KeyAction::GridRotateCw);
         let key_l = self.keymap.pressed_action(ctx, KeyAction::GridRotateCcw);
 
         // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定。
-        // マウス戻る/進む (Extra1/Extra2 = native XButton、または Browser_Back/Forward
-        // 経由) も Ctrl+↑/↓ と等価に扱う。
-        let ctrl_up = (ctrl_held && up) || mouse_back || browser_back;
-        let ctrl_down = (ctrl_held && down) || mouse_forward || browser_forward;
+        let ctrl_up = ctrl_held && up;
+        let ctrl_down = ctrl_held && down;
         if ctrl_up || ctrl_down {
             crate::logger::log(format!(
                 "[input-nav] source=grid action={} ctrl_held={ctrl_held} up={up} down={down} \
@@ -18209,8 +18295,32 @@ impl App {
         let cell_h = self.last_cell_h.max(1.0);
 
         // マウスホイールイベントだけを取り出し、egui には渡さない
-        let (scroll_delta_y, ctrl) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
+        let (scroll_delta_y, ctrl, shift, alt) = ctx.input(|i| {
+            (
+                i.raw_scroll_delta.y,
+                i.modifiers.ctrl,
+                i.modifiers.shift,
+                i.modifiers.alt,
+            )
+        });
         if scroll_delta_y.abs() > 0.5 {
+            if self.apply_shift_alt_wheel_pair(
+                ctx,
+                scroll_delta_y,
+                shift,
+                alt,
+                None,
+                "grid-wheel-pair",
+            ) {
+                ctx.input_mut(|i| {
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+                });
+                return;
+            }
+
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
@@ -34523,6 +34633,7 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_first_setup_dialog(ctx);
+        self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。

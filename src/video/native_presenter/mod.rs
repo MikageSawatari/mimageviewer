@@ -7908,6 +7908,7 @@ mod tests {
             y: 100,
             shift: false,
             ctrl,
+            alt: false,
         })
     }
 

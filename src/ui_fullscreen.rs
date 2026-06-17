@@ -1673,7 +1673,7 @@ impl App {
     }
 
     /// ホイールによるマウス位置固定ズームを適用する。ズームが変化したら true を返す。
-    fn apply_wheel_zoom(
+    pub(crate) fn apply_wheel_zoom(
         zoom: &mut f32,
         pan: &mut egui::Vec2,
         wheel_y: f32,
@@ -1690,7 +1690,7 @@ impl App {
     }
 
     /// 現在のフルスクリーン画像が PDF ページなら、指定ズームで再レンダリングを要求する。
-    fn maybe_rerender_pdf(&mut self, zoom: f32) {
+    pub(crate) fn maybe_rerender_pdf(&mut self, zoom: f32) {
         if let Some(idx) = self.fullscreen_idx {
             if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
                 // 表示中ページのズーム由来再レンダなので priority レーン (即応)。
@@ -2202,6 +2202,7 @@ pub(crate) struct FsKeyAction {
     pub(crate) nav_delta: i32,
     pub(crate) ctrl_nav: Option<i32>,
     pub(crate) sibling_nav: Option<i32>,
+    pub(crate) mouse_nav: Option<crate::ui_main::AddressBarNav>,
     /// Home/End などの絶対ジャンプ先 item index
     pub(crate) jump_to: Option<usize>,
 }
@@ -4432,6 +4433,7 @@ impl App {
             close_to_page_list,
             ctrl_nav,
             sibling_nav,
+            None,
             nav_delta,
             jump_to,
             fs_idx,
@@ -5139,6 +5141,8 @@ impl App {
             self.bump_input_seq("fs_root_ctrl_nav", None);
         } else if key_action.sibling_nav.is_some() {
             self.bump_input_seq("fs_root_sibling_nav", None);
+        } else if key_action.mouse_nav.is_some() {
+            self.bump_input_seq("fs_root_mouse_nav", None);
         } else if key_action.jump_to.is_some() {
             self.bump_input_seq("fs_root_large_jump", None);
         } else if key_action.close || key_action.close_to_page_list {
@@ -5151,6 +5155,7 @@ impl App {
             key_action.close_to_page_list,
             key_action.ctrl_nav,
             key_action.sibling_nav,
+            key_action.mouse_nav,
             key_action.nav_delta,
             key_action.jump_to,
             fs_idx,
@@ -5177,6 +5182,7 @@ impl App {
             nav_delta: 0,
             ctrl_nav: None,
             sibling_nav: None,
+            mouse_nav: None,
             jump_to: None,
         };
 
@@ -6336,14 +6342,24 @@ impl App {
                 action.nav_delta = dir;
             }
         }
-        if ctrl_d || mouse_forward || browser_forward {
+        let mouse_nav_forward = mouse_forward || browser_forward;
+        let mouse_nav_back = mouse_back || browser_back;
+        if mouse_nav_forward || mouse_nav_back {
+            action.mouse_nav = self.apply_mouse_back_forward_button(
+                ctx,
+                mouse_nav_forward,
+                "fullscreen-egui-mouse",
+            );
+            return action;
+        }
+        if ctrl_d {
             crate::logger::log(format!(
                 "[input-nav] source=fullscreen-egui action=ctrl_nav_forward fs_idx={fs_idx} \
                  ctrl_down={ctrl_d} mouse_forward={mouse_forward} browser_forward={browser_forward}"
             ));
             action.ctrl_nav = Some(1);
         }
-        if ctrl_u || mouse_back || browser_back {
+        if ctrl_u {
             crate::logger::log(format!(
                 "[input-nav] source=fullscreen-egui action=ctrl_nav_back fs_idx={fs_idx} \
                  ctrl_up={ctrl_u} mouse_back={mouse_back} browser_back={browser_back}"
@@ -6725,8 +6741,14 @@ impl App {
         let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
-        let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
-        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let (wheel_y, ctrl_held, shift_held, alt_held) = ctx.input(|i| {
+            (
+                i.raw_scroll_delta.y,
+                i.modifiers.ctrl,
+                i.modifiers.shift,
+                i.modifiers.alt,
+            )
+        });
         #[cfg(windows)]
         let suppress_egui_wheel = should_suppress_egui_wheel_for_native_detached_video(
             state.is_video,
@@ -6757,13 +6779,24 @@ impl App {
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
         } else if wheel_y.abs() > 0.5 && handle_wheel_here {
+            let wheel_pair_applied = !ctrl_held
+                && self.apply_shift_alt_wheel_pair(
+                    ctx,
+                    wheel_y,
+                    shift_held,
+                    alt_held,
+                    Some(default_image_rect),
+                    "fullscreen-wheel-pair",
+                );
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
                 i.events
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
-            if self.analysis_mode {
+            if wheel_pair_applied {
+                // handled by configurable mouse wheel pair
+            } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
                 let image_rect = analysis_image_rect(full_rect);
@@ -7500,6 +7533,7 @@ impl App {
         close_to_page_list: bool,
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
+        mouse_nav: Option<crate::ui_main::AddressBarNav>,
         nav_delta: i32,
         jump_to: Option<usize>,
         fs_idx: usize,
@@ -7544,6 +7578,8 @@ impl App {
             self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
         } else if let Some(delta) = sibling_nav {
             self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
+        } else if let Some(nav) = mouse_nav {
+            self.mouse_ring_nav = Some(nav);
         } else if !close_fs && !close_to_page_list {
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来 nav_delta 等で別項目を開き直さないようガードする。

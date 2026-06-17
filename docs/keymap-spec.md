@@ -13,8 +13,9 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 [keymap.ini.default](keymap.ini.default) と、起動時に生成される `keymap.ini` /
 `keymap.ini.default` の先頭コメントを正とする。マウス、ゲームパッド、
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
-例外として、マウス右ドラッグのフリックとゲームパッド <kbd>X</kbd> リングは
-`Settings.ring_shortcuts` の 8 方向スロットで厳選アクションだけを差し替えられる。
+マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
+フリック、マウス戻る / 進むボタン、Shift / Alt + ホイール、ゲームパッド <kbd>X</kbd> リングは
+`Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
 これは `KeyAction` / `keymap.ini` の完全カスタマイズではなく、マウス・ゲームパッド用の
 固定入力レイヤーで扱う。
 レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear`、
@@ -59,6 +60,8 @@ OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keyma
 | <kbd>Delete</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを削除 (通常はゴミ箱。ZIP/PDF 内ページなど仮想項目は対象外) |
 | <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。静止画 / ZIP画像 / PDFページは detached viewport、動画は同じ detached viewport の child native presenter で表示する |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイル D&D 送出 (コピー)。複数チェック選択時はその実パス群をまとめてドラッグ。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外 |
+| マウス戻る / 進むボタン | `Settings.ring_shortcuts.mouse_back_forward_action` に従う。新規環境の既定はフォルダ履歴の戻る / 進む。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、従来互換の Ctrl+↑ / Ctrl+↓ 相当 |
+| Shift / Alt + マウスホイール | `Settings.ring_shortcuts.shift_wheel_pair` / `alt_wheel_pair` のペアアクションが現在画面で有効な場合だけ実行。未設定または無効な画面では通常ホイール処理へフォールバック |
 | エクスプローラ等からのドロップ | mIV ウィンドウへファイルをドロップすると現在表示中のフォルダへコピー (**フォルダは v1.1.0 で一旦無効化・skip**)。ZIP/PDF / 検索結果グリッドなど実フォルダ以外を表示中は拒否 |
 | グリッド空白の右クリック | 現在の実フォルダの Windows Shell 背景メニューを表示する。mIV 先頭項目の「貼り付け」および Shell 側の Paste はどちらも Shell `paste` verb を使い、新しいフォルダ作成やペースト後の一覧更新は表示中フォルダ watcher が拾う |
 
@@ -105,6 +108,8 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。ZIP/PDF/変換アーカイブ内のページでは、そのコンテナのページ一覧 (L2) を表示 (= Esc/Enter の「L1 へ直帰」と対をなす) |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る |
 | マウスホイール | 前 / 次のファイル。縦/横連結モードでは連結方向へスクロール |
+| Shift / Alt + マウスホイール | `Settings.ring_shortcuts.shift_wheel_pair` / `alt_wheel_pair` のペアアクションが現在画面で有効な場合だけ実行。画像ではページジャンプ、ズーム、フォルダ履歴 / ツリー順 / 兄弟フォルダ移動、動画では音量・マーカー移動などを割り当て可能。未設定または無効な画面では通常ホイール処理へフォールバック |
+| マウス戻る / 進むボタン | `Settings.ring_shortcuts.mouse_back_forward_action` に従う。新規環境の既定はフォルダ履歴の戻る / 進む。従来どおりに設定した場合は Ctrl+↑ / Ctrl+↓ 相当 |
 | マウス左クリック | (画像) ページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左半分クリックで次 / 右半分クリックで前 / (動画) 再生・一時停止トグル |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
 | <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> | 現在のコンテナへレーティング 1〜5 / 解除 |

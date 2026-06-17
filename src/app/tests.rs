@@ -5519,6 +5519,7 @@ mod favorite_adjustment_defaults_tests {
             false,
             None,
             None,
+            None,
             0,
             None,
             0,
@@ -14075,7 +14076,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
 
-        app.handle_fs_navigation(&ctx, true, false, None, None, 0, None, idx);
+        app.handle_fs_navigation(&ctx, true, false, None, None, None, 0, None, idx);
 
         assert_eq!(app.fullscreen_idx, None);
         assert!(app.settings.detached_viewer_enabled);

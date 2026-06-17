@@ -894,7 +894,9 @@ fn main() -> eframe::Result {
     // 結果、起動時に Settings::load() が走るのはここだけ。`saved` を後段の Susie 初期化、
     // ウィンドウ位置、`App::default` などすべてに引き回す。
     let t = Instant::now();
-    let saved = settings::Settings::load();
+    let settings_load = settings::Settings::load_with_meta();
+    let saved = settings_load.settings;
+    let settings_load_meta = settings_load.meta;
     emit_startup("settings_load", Some(t));
 
     // 設定 (開発者タブ) で性能ログが ON なら、ここで perf を有効化する。
@@ -1018,7 +1020,10 @@ fn main() -> eframe::Result {
             let t = Instant::now();
             // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
-            let mut app = app::App::new_from_settings(saved.clone());
+            let mut app = app::App::new_from_settings_with_load_meta(
+                saved.clone(),
+                settings_load_meta.clone(),
+            );
             emit_startup("app_default", Some(t));
             if let Some(path) = startup_open_path.clone() {
                 app.set_startup_open_path(path);

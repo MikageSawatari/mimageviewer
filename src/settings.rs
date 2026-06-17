@@ -3739,6 +3739,29 @@ fn reset_backup_state_for_test() {
     crate::settings_db::set_save_suppressed(false);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsLoadMeta {
+    pub boot_source: crate::settings_db::BootSource,
+    pub previous_last_seen_version: Option<String>,
+    pub db_loaded: bool,
+}
+
+impl Default for SettingsLoadMeta {
+    fn default() -> Self {
+        Self {
+            boot_source: crate::settings_db::BootSource::CleanInstall,
+            previous_last_seen_version: None,
+            db_loaded: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SettingsLoadResult {
+    pub settings: Settings,
+    pub meta: SettingsLoadMeta,
+}
+
 impl Settings {
     pub fn books_root_path(&self) -> PathBuf {
         crate::books::settings_books_root(self)
@@ -3808,6 +3831,14 @@ impl Settings {
     /// `*.bak1..bak10`) は `boot_settings_db` の内部で migration として読まれるだけで、
     /// 通常ロードでは触らない (= migration 完了後は `.migrated-<ts>` にリネーム済み)。
     pub fn load() -> Self {
+        Self::load_with_meta().settings
+    }
+
+    /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
+    ///
+    /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
+    /// 変更確認など「clean install と upgrade を区別したい」用途でこのメタ情報を使う。
+    pub fn load_with_meta() -> SettingsLoadResult {
         let data_dir = crate::data_dir::get();
         let outcome = crate::settings_db::boot_settings_db(&data_dir);
         let source = outcome.source;
@@ -3823,6 +3854,7 @@ impl Settings {
             );
         }
         let mut settings = outcome.settings;
+        let previous_last_seen_version = settings.last_seen_version.clone();
 
         // SQLite 化で「文字列のままディスク上にいる外部編集 settings.json」のパスは
         // 消えているが、scheme migration が将来追加される可能性は残るので、`Settings::load`
@@ -3838,6 +3870,18 @@ impl Settings {
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         settings.sanitize();
+        let mouse_nav_clean_install_defaulted = source
+            == crate::settings_db::BootSource::CleanInstall
+            && !settings.ring_shortcuts.mouse_nav_prompt_done
+            && matches!(
+                settings.ring_shortcuts.mouse_back_forward_action,
+                crate::ring_shortcut::MouseBackForwardActionId::None
+            );
+        if mouse_nav_clean_install_defaulted {
+            settings.ring_shortcuts.mouse_back_forward_action =
+                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext;
+            settings.ring_shortcuts.mouse_nav_prompt_done = true;
+        }
         let video_volume_sanitized =
             (settings.video_volume - video_volume_before_sanitize).abs() > 1.0e-9;
         let video_playback_speed_sanitized =
@@ -3892,11 +3936,19 @@ impl Settings {
             || video_loop_migrated
             || video_volume_sanitized
             || video_playback_speed_sanitized
+            || mouse_nav_clean_install_defaulted
             || version_changed
         {
             settings.save_internal_no_rotation();
         }
-        settings
+        SettingsLoadResult {
+            settings,
+            meta: SettingsLoadMeta {
+                boot_source: source,
+                previous_last_seen_version,
+                db_loaded,
+            },
+        }
     }
 
     /// v0.9.0 開発初期版の単一 VST3 プラグイン形式 (`vst3_plugin_path` + `vst3_plugin_state`)
@@ -4563,6 +4615,13 @@ mod tests {
         ];
         original.ring_shortcuts.mouse_flick_enabled = true;
         original.ring_shortcuts.gamepad_ring_enabled = false;
+        original.ring_shortcuts.shift_wheel_pair =
+            crate::ring_shortcut::WheelPairActionId::ZoomInOut;
+        original.ring_shortcuts.alt_wheel_pair =
+            crate::ring_shortcut::WheelPairActionId::FolderHistoryPrevNext;
+        original.ring_shortcuts.mouse_back_forward_action =
+            crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext;
+        original.ring_shortcuts.mouse_nav_prompt_done = true;
         original.ring_shortcuts.grid.slots[0] = crate::ring_shortcut::RingActionId::GridHistoryBack;
         let json = serde_json::to_string(&original).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
@@ -4632,6 +4691,19 @@ mod tests {
         assert!(!loaded.ring_shortcuts.mouse_flick_enabled);
         assert!(loaded.ring_shortcuts.gamepad_ring_enabled);
         assert_eq!(
+            loaded.ring_shortcuts.shift_wheel_pair,
+            crate::ring_shortcut::WheelPairActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.alt_wheel_pair,
+            crate::ring_shortcut::WheelPairActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_back_forward_action,
+            crate::ring_shortcut::MouseBackForwardActionId::None
+        );
+        assert!(!loaded.ring_shortcuts.mouse_nav_prompt_done);
+        assert_eq!(
             loaded.ring_shortcuts.grid.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
             crate::ring_shortcut::RingActionId::AddToBook
         );
@@ -4673,6 +4745,9 @@ mod tests {
             "ring_shortcuts": {
                 "mouse_flick_enabled": true,
                 "gamepad_ring_enabled": false,
+                "shift_wheel_pair": "future_wheel",
+                "alt_wheel_pair": "zoom_in_out",
+                "mouse_back_forward_action": "future_mouse_nav",
                 "grid": { "slots": ["future_action", "video_capture"] },
                 "image": { "slots": ["video_capture"] },
                 "video": { "slots": ["image_capture"] }
@@ -4683,6 +4758,18 @@ mod tests {
 
         assert!(loaded.ring_shortcuts.mouse_flick_enabled);
         assert!(!loaded.ring_shortcuts.gamepad_ring_enabled);
+        assert_eq!(
+            loaded.ring_shortcuts.shift_wheel_pair,
+            crate::ring_shortcut::WheelPairActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.alt_wheel_pair,
+            crate::ring_shortcut::WheelPairActionId::ZoomInOut
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_back_forward_action,
+            crate::ring_shortcut::MouseBackForwardActionId::None
+        );
         assert_eq!(
             loaded.ring_shortcuts.grid.slots.len(),
             crate::ring_shortcut::RING_SHORTCUT_SLOT_COUNT
@@ -6102,6 +6189,13 @@ mod tests {
             s.show_toolbar_facet_filter = false;
             s.ring_shortcuts.mouse_flick_enabled = true;
             s.ring_shortcuts.gamepad_ring_enabled = false;
+            s.ring_shortcuts.shift_wheel_pair =
+                crate::ring_shortcut::WheelPairActionId::VideoVolumeUpDown;
+            s.ring_shortcuts.alt_wheel_pair =
+                crate::ring_shortcut::WheelPairActionId::FolderHistoryPrevNext;
+            s.ring_shortcuts.mouse_back_forward_action =
+                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext;
+            s.ring_shortcuts.mouse_nav_prompt_done = true;
             s.ring_shortcuts.x_picker_hint_shown = true;
             s.ring_shortcuts.image.slots[crate::ring_shortcut::RingDirection::Right.slot_index()] =
                 crate::ring_shortcut::RingActionId::ImageCapture;
@@ -6283,6 +6377,25 @@ mod tests {
             assert!(
                 !loaded.ring_shortcuts.gamepad_ring_enabled,
                 "ring shortcut gamepad toggle should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.shift_wheel_pair,
+                crate::ring_shortcut::WheelPairActionId::VideoVolumeUpDown,
+                "ring shortcut Shift wheel pair should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.alt_wheel_pair,
+                crate::ring_shortcut::WheelPairActionId::FolderHistoryPrevNext,
+                "ring shortcut Alt wheel pair should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_back_forward_action,
+                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext,
+                "mouse back/forward action should survive roundtrip"
+            );
+            assert!(
+                loaded.ring_shortcuts.mouse_nav_prompt_done,
+                "mouse nav prompt flag should survive roundtrip"
             );
             assert!(
                 loaded.ring_shortcuts.x_picker_hint_shown,
@@ -6477,6 +6590,14 @@ mod tests {
             let env = setup_backup_env();
             let loaded = Settings::load();
             assert_eq!(loaded.favorites.len(), 0);
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_back_forward_action,
+                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext
+            );
+            assert!(
+                loaded.ring_shortcuts.mouse_nav_prompt_done,
+                "clean install should silently accept the new mouse back/forward default"
+            );
             // load() 内で migration/version トリガで save() が走るか、または明示的に save。
             let mut s = loaded;
             s.add_favorite("first_install".into(), PathBuf::from(r"C:\first"));

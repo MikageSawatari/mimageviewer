@@ -124,6 +124,7 @@ pub struct NativeVideoMouseWheelEvent {
     pub y: i32,
     pub shift: bool,
     pub ctrl: bool,
+    pub alt: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1243,6 +1244,7 @@ fn native_mouse_wheel_event(
         y: point.y,
         shift: mouse_shift(wparam),
         ctrl: mouse_ctrl(wparam),
+        alt: unsafe { GetKeyState(VK_MENU.0 as i32) } < 0,
     }
 }
 

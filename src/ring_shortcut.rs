@@ -360,6 +360,187 @@ impl<'de> Deserialize<'de> for RingActionId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MouseBackForwardActionId {
+    None,
+    FolderHistoryPrevNext,
+    TreeFolderPrevNext,
+    Unknown(String),
+}
+
+impl MouseBackForwardActionId {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::FolderHistoryPrevNext => "folder_history_prev_next",
+            Self::TreeFolderPrevNext => "tree_folder_prev_next",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" | "" => Self::None,
+            "folder_history_prev_next" => Self::FolderHistoryPrevNext,
+            "tree_folder_prev_next" => Self::TreeFolderPrevNext,
+            _ => return None,
+        })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "未設定 (従来どおり)",
+            Self::FolderHistoryPrevNext => "フォルダ履歴 戻る/進む",
+            Self::TreeFolderPrevNext => "ツリー順 前/次フォルダ",
+            Self::Unknown(_) => "不明な設定",
+        }
+    }
+
+    pub fn effective(&self) -> Self {
+        match self {
+            Self::FolderHistoryPrevNext => Self::FolderHistoryPrevNext,
+            Self::TreeFolderPrevNext => Self::TreeFolderPrevNext,
+            Self::None | Self::Unknown(_) => Self::TreeFolderPrevNext,
+        }
+    }
+}
+
+impl Default for MouseBackForwardActionId {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl Serialize for MouseBackForwardActionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MouseBackForwardActionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WheelPairActionId {
+    None,
+    FolderHistoryPrevNext,
+    TreeFolderPrevNext,
+    SiblingFolderPrevNext,
+    PageJumpPrevNext,
+    ZoomInOut,
+    VideoVolumeUpDown,
+    VideoMarkerPrevNext,
+    Unknown(String),
+}
+
+impl WheelPairActionId {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::FolderHistoryPrevNext => "folder_history_prev_next",
+            Self::TreeFolderPrevNext => "tree_folder_prev_next",
+            Self::SiblingFolderPrevNext => "sibling_folder_prev_next",
+            Self::PageJumpPrevNext => "page_jump_prev_next",
+            Self::ZoomInOut => "zoom_in_out",
+            Self::VideoVolumeUpDown => "video_volume_up_down",
+            Self::VideoMarkerPrevNext => "video_marker_prev_next",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" | "" => Self::None,
+            "folder_history_prev_next" => Self::FolderHistoryPrevNext,
+            "tree_folder_prev_next" => Self::TreeFolderPrevNext,
+            "sibling_folder_prev_next" => Self::SiblingFolderPrevNext,
+            "page_jump_prev_next" => Self::PageJumpPrevNext,
+            "zoom_in_out" => Self::ZoomInOut,
+            "video_volume_up_down" => Self::VideoVolumeUpDown,
+            "video_marker_prev_next" => Self::VideoMarkerPrevNext,
+            _ => return None,
+        })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "なし",
+            Self::FolderHistoryPrevNext => "フォルダ履歴 戻る/進む",
+            Self::TreeFolderPrevNext => "ツリー順 前/次フォルダ",
+            Self::SiblingFolderPrevNext => "兄弟フォルダ 前/次",
+            Self::PageJumpPrevNext => "ページジャンプ 前/次",
+            Self::ZoomInOut => "ズーム イン/アウト",
+            Self::VideoVolumeUpDown => "動画音量 上げる/下げる",
+            Self::VideoMarkerPrevNext => "動画マーカー 前/次",
+            Self::Unknown(_) => "不明な設定",
+        }
+    }
+
+    pub fn available() -> &'static [Self] {
+        const AVAILABLE: &[WheelPairActionId] = &[
+            WheelPairActionId::None,
+            WheelPairActionId::FolderHistoryPrevNext,
+            WheelPairActionId::TreeFolderPrevNext,
+            WheelPairActionId::SiblingFolderPrevNext,
+            WheelPairActionId::PageJumpPrevNext,
+            WheelPairActionId::ZoomInOut,
+            WheelPairActionId::VideoVolumeUpDown,
+            WheelPairActionId::VideoMarkerPrevNext,
+        ];
+        AVAILABLE
+    }
+
+    pub fn is_valid_for_context(&self, context: RingShortcutContext) -> bool {
+        match self {
+            Self::None | Self::Unknown(_) => false,
+            Self::FolderHistoryPrevNext
+            | Self::TreeFolderPrevNext
+            | Self::SiblingFolderPrevNext => true,
+            Self::PageJumpPrevNext | Self::ZoomInOut => {
+                context == RingShortcutContext::ImageFullscreen
+            }
+            Self::VideoVolumeUpDown | Self::VideoMarkerPrevNext => {
+                context == RingShortcutContext::VideoFullscreen
+            }
+        }
+    }
+}
+
+impl Default for WheelPairActionId {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl Serialize for WheelPairActionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WheelPairActionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RingShortcutProfile {
     #[serde(default = "default_ring_slots")]
@@ -404,6 +585,14 @@ pub struct RingShortcutSettings {
     #[serde(default = "default_true")]
     pub gamepad_ring_enabled: bool,
     #[serde(default)]
+    pub shift_wheel_pair: WheelPairActionId,
+    #[serde(default)]
+    pub alt_wheel_pair: WheelPairActionId,
+    #[serde(default)]
+    pub mouse_back_forward_action: MouseBackForwardActionId,
+    #[serde(default)]
+    pub mouse_nav_prompt_done: bool,
+    #[serde(default)]
     pub x_picker_hint_shown: bool,
     #[serde(default = "default_grid_profile")]
     pub grid: RingShortcutProfile,
@@ -438,6 +627,18 @@ impl RingShortcutSettings {
         self.grid.sanitize(RingShortcutContext::Grid);
         self.image.sanitize(RingShortcutContext::ImageFullscreen);
         self.video.sanitize(RingShortcutContext::VideoFullscreen);
+        if matches!(self.shift_wheel_pair, WheelPairActionId::Unknown(_)) {
+            self.shift_wheel_pair = WheelPairActionId::None;
+        }
+        if matches!(self.alt_wheel_pair, WheelPairActionId::Unknown(_)) {
+            self.alt_wheel_pair = WheelPairActionId::None;
+        }
+        if matches!(
+            self.mouse_back_forward_action,
+            MouseBackForwardActionId::Unknown(_)
+        ) {
+            self.mouse_back_forward_action = MouseBackForwardActionId::None;
+        }
     }
 }
 
@@ -446,6 +647,10 @@ impl Default for RingShortcutSettings {
         Self {
             mouse_flick_enabled: false,
             gamepad_ring_enabled: true,
+            shift_wheel_pair: WheelPairActionId::None,
+            alt_wheel_pair: WheelPairActionId::None,
+            mouse_back_forward_action: MouseBackForwardActionId::None,
+            mouse_nav_prompt_done: false,
             x_picker_hint_shown: false,
             grid: default_grid_profile(),
             image: default_image_profile(),
@@ -657,6 +862,13 @@ mod tests {
         let defaults = RingShortcutSettings::default();
         assert_eq!(defaults.mouse_flick_enabled, false);
         assert_eq!(defaults.gamepad_ring_enabled, true);
+        assert_eq!(defaults.shift_wheel_pair, WheelPairActionId::None);
+        assert_eq!(defaults.alt_wheel_pair, WheelPairActionId::None);
+        assert_eq!(
+            defaults.mouse_back_forward_action,
+            MouseBackForwardActionId::None
+        );
+        assert_eq!(defaults.mouse_nav_prompt_done, false);
         assert_eq!(defaults.x_picker_hint_shown, false);
         assert_eq!(
             defaults.grid.slots[RingDirection::Up.slot_index()],
@@ -678,17 +890,36 @@ mod tests {
         settings.grid.slots[0] = RingActionId::Unknown("future_action".to_string());
         settings.image.slots[1] = RingActionId::VideoCapture;
         settings.video.slots.push(RingActionId::ImageCapture);
+        settings.shift_wheel_pair = WheelPairActionId::Unknown("future_wheel".to_string());
+        settings.mouse_back_forward_action =
+            MouseBackForwardActionId::Unknown("future_mouse_nav".to_string());
 
         settings.sanitize();
 
         assert_eq!(settings.grid.slots[0], RingActionId::None);
         assert_eq!(settings.image.slots[1], RingActionId::None);
         assert_eq!(settings.video.slots.len(), RING_SHORTCUT_SLOT_COUNT);
+        assert_eq!(settings.shift_wheel_pair, WheelPairActionId::None);
+        assert_eq!(
+            settings.mouse_back_forward_action,
+            MouseBackForwardActionId::None
+        );
     }
 
     #[test]
     fn unknown_action_id_deserializes_for_later_sanitize() {
         let action: RingActionId = serde_json::from_str(r#""future_action""#).unwrap();
         assert_eq!(action, RingActionId::Unknown("future_action".to_string()));
+        let wheel: WheelPairActionId = serde_json::from_str(r#""future_wheel""#).unwrap();
+        assert_eq!(
+            wheel,
+            WheelPairActionId::Unknown("future_wheel".to_string())
+        );
+        let mouse_nav: MouseBackForwardActionId =
+            serde_json::from_str(r#""future_mouse_nav""#).unwrap();
+        assert_eq!(
+            mouse_nav,
+            MouseBackForwardActionId::Unknown("future_mouse_nav".to_string())
+        );
     }
 }

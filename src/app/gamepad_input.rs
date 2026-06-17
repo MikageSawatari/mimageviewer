@@ -9,9 +9,9 @@ use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
 use crate::grid_item::GridItem;
 use crate::ring_shortcut::{
-    MOUSE_FLICK_MOVE_THRESHOLD_PX, MouseFlickOutcome, MouseFlickState, PostFilterDrillState,
-    RingActionId, RingDirection, RingPickerRowId, RingPickerState, RingShortcutContext,
-    mouse_flick_guide_delay, mouse_flick_menu_delay,
+    MOUSE_FLICK_MOVE_THRESHOLD_PX, MouseBackForwardActionId, MouseFlickOutcome, MouseFlickState,
+    PostFilterDrillState, RingActionId, RingDirection, RingPickerRowId, RingPickerState,
+    RingShortcutContext, WheelPairActionId, mouse_flick_guide_delay, mouse_flick_menu_delay,
 };
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
@@ -1111,7 +1111,7 @@ impl App {
                 self.dispatch_native_video_key(ctx, fs_idx, 0x1B, false, false, false);
             } else {
                 self.bump_input_seq("gamepad_fs_close", None);
-                self.handle_fs_navigation(ctx, true, false, None, None, 0, None, fs_idx);
+                self.handle_fs_navigation(ctx, true, false, None, None, None, 0, None, fs_idx);
             }
             return None;
         }
@@ -1885,6 +1885,268 @@ impl App {
         }
     }
 
+    pub(crate) fn apply_mouse_back_forward_button(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        match self
+            .settings
+            .ring_shortcuts
+            .mouse_back_forward_action
+            .effective()
+        {
+            MouseBackForwardActionId::FolderHistoryPrevNext => {
+                crate::logger::log(format!(
+                    "[input-nav] source={source} action=folder_history_{}",
+                    if forward { "forward" } else { "back" }
+                ));
+                if self.is_snapshot_active() || self.items_are_drive_list {
+                    return None;
+                }
+                Some(if forward {
+                    AddressBarNav::HistoryForward
+                } else {
+                    AddressBarNav::HistoryBack
+                })
+            }
+            MouseBackForwardActionId::TreeFolderPrevNext => {
+                crate::logger::log(format!(
+                    "[input-nav] source={source} action=tree_folder_{}",
+                    if forward { "forward" } else { "back" }
+                ));
+                self.apply_tree_folder_nav(ctx, forward, source);
+                None
+            }
+            MouseBackForwardActionId::None | MouseBackForwardActionId::Unknown(_) => None,
+        }
+    }
+
+    pub(crate) fn apply_configured_wheel_pair(
+        &mut self,
+        ctx: &egui::Context,
+        pair: WheelPairActionId,
+        wheel_up: bool,
+        image_rect: Option<egui::Rect>,
+        source: &'static str,
+    ) -> bool {
+        let context = self.current_ring_shortcut_context();
+        if !pair.is_valid_for_context(context) {
+            return false;
+        }
+        match pair {
+            WheelPairActionId::None | WheelPairActionId::Unknown(_) => false,
+            WheelPairActionId::FolderHistoryPrevNext => {
+                self.mouse_ring_nav = self.apply_mouse_history_nav(wheel_up, source);
+                true
+            }
+            WheelPairActionId::TreeFolderPrevNext => {
+                self.apply_tree_folder_nav(ctx, !wheel_up, source);
+                true
+            }
+            WheelPairActionId::SiblingFolderPrevNext => {
+                self.apply_sibling_folder_nav(ctx, !wheel_up, source);
+                true
+            }
+            WheelPairActionId::PageJumpPrevNext => {
+                if let Some(fs_idx) = self.fullscreen_idx
+                    && context == RingShortcutContext::ImageFullscreen
+                {
+                    self.apply_wheel_page_jump(ctx, fs_idx, !wheel_up);
+                    true
+                } else {
+                    false
+                }
+            }
+            WheelPairActionId::ZoomInOut => {
+                if context != RingShortcutContext::ImageFullscreen || self.analysis_mode {
+                    return false;
+                }
+                let Some(rect) = image_rect else {
+                    return false;
+                };
+                let wheel_y = if wheel_up { 120.0 } else { -120.0 };
+                let mouse = ctx.input(|i| i.pointer.hover_pos());
+                let changed = Self::apply_wheel_zoom(
+                    &mut self.fs_zoom,
+                    &mut self.fs_pan,
+                    wheel_y,
+                    mouse,
+                    rect.center(),
+                );
+                if changed {
+                    self.maybe_rerender_pdf(self.fs_zoom);
+                }
+                true
+            }
+            WheelPairActionId::VideoVolumeUpDown => {
+                if context == RingShortcutContext::VideoFullscreen {
+                    self.apply_video_wheel_volume(ctx, wheel_up);
+                    true
+                } else {
+                    false
+                }
+            }
+            WheelPairActionId::VideoMarkerPrevNext => {
+                if let Some(fs_idx) = self.fullscreen_idx
+                    && context == RingShortcutContext::VideoFullscreen
+                {
+                    self.jump_native_video_marker(fs_idx, !wheel_up);
+                    self.request_native_video_hud_repaint(ctx);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    pub(crate) fn apply_shift_alt_wheel_pair(
+        &mut self,
+        ctx: &egui::Context,
+        wheel_y: f32,
+        shift: bool,
+        alt: bool,
+        image_rect: Option<egui::Rect>,
+        source: &'static str,
+    ) -> bool {
+        if wheel_y.abs() <= 0.5 {
+            return false;
+        }
+        let pair = if shift {
+            self.settings.ring_shortcuts.shift_wheel_pair.clone()
+        } else if alt {
+            self.settings.ring_shortcuts.alt_wheel_pair.clone()
+        } else {
+            return false;
+        };
+        self.apply_configured_wheel_pair(ctx, pair, wheel_y > 0.0, image_rect, source)
+    }
+
+    fn apply_mouse_history_nav(
+        &mut self,
+        wheel_up: bool,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.is_snapshot_active() || self.items_are_drive_list {
+            return None;
+        }
+        let nav = if wheel_up {
+            AddressBarNav::HistoryBack
+        } else {
+            AddressBarNav::HistoryForward
+        };
+        crate::logger::log(format!(
+            "[input-nav] source={source} action=wheel_folder_history_{}",
+            if wheel_up { "back" } else { "forward" }
+        ));
+        Some(nav)
+    }
+
+    fn apply_tree_folder_nav(&mut self, ctx: &egui::Context, forward: bool, source: &'static str) {
+        if let Some(fs_idx) = self.fullscreen_idx {
+            let native_toast = self.current_fullscreen_is_video(fs_idx);
+            self.bump_input_seq(
+                source,
+                Some(if forward { "tree_forward" } else { "tree_back" }),
+            );
+            self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, forward, native_toast);
+        } else {
+            self.handle_grid_tree_folder_nav(forward, source);
+        }
+    }
+
+    fn handle_grid_tree_folder_nav(&mut self, forward: bool, source: &'static str) {
+        self.bump_input_seq(
+            source,
+            Some(if forward { "tree_forward" } else { "tree_back" }),
+        );
+        let in_local_search = self.show_search_bar;
+        let in_favsearch = self.favsearch.active;
+        let in_global_search = self.global_search.active;
+        let in_global_search_drilled = in_global_search && self.global_search.drill.is_some();
+        let in_tag_view = self.tag_view.active;
+
+        if self.is_snapshot_active() {
+            let _ = self.snapshot_navigate_grid(forward);
+        } else if in_global_search_drilled {
+            self.global_search_ctrl_nav(forward);
+        } else if in_global_search {
+        } else if in_local_search {
+            self.cancel_pending_folder_nav();
+        } else if in_favsearch {
+            self.favsearch_ctrl_nav(forward);
+        } else if in_tag_view {
+            self.cancel_pending_folder_nav();
+        } else if self.zip_nav_handle_ctrl_updown(forward) {
+        } else if let Some(cur) = self.effective_folder() {
+            self.start_folder_nav(cur, forward, FolderNavMode::Grid);
+        }
+    }
+
+    fn apply_sibling_folder_nav(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        source: &'static str,
+    ) {
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.bump_input_seq(
+                source,
+                Some(if forward {
+                    "sibling_forward"
+                } else {
+                    "sibling_back"
+                }),
+            );
+            let native_toast = self.current_fullscreen_is_video(fs_idx);
+            self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, forward, native_toast);
+        } else {
+            self.bump_input_seq(
+                source,
+                Some(if forward {
+                    "sibling_forward"
+                } else {
+                    "sibling_back"
+                }),
+            );
+            if self.is_snapshot_active() {
+                let _ = self.snapshot_navigate_grid_page(forward);
+            } else if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            } else if self.show_search_bar {
+                self.cancel_pending_folder_nav();
+            } else if let Some(cur) = self.effective_folder() {
+                self.start_folder_nav(cur, forward, FolderNavMode::SiblingGrid);
+            }
+        }
+    }
+
+    fn apply_wheel_page_jump(&mut self, ctx: &egui::Context, fs_idx: usize, forward: bool) {
+        if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
+            self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+        } else {
+            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                at_end: forward,
+                at: Instant::now(),
+            });
+        }
+    }
+
+    fn apply_video_wheel_volume(&mut self, ctx: &egui::Context, wheel_up: bool) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let delta = if wheel_up { 1 } else { -1 };
+        let volume = self
+            .fs_video_player(fs_idx)
+            .map(|player| player.volume())
+            .unwrap_or(self.settings.video_volume);
+        let next = step_video_volume_by_fader_key_step(volume, delta);
+        self.handle_native_video_set_volume_command(ctx, fs_idx, next, true);
+        self.request_native_video_hud_repaint(ctx);
+    }
+
     fn apply_ring_action(
         &mut self,
         ctx: &egui::Context,
@@ -2333,7 +2595,7 @@ impl App {
     fn navigate_gamepad_still(&mut self, ctx: &egui::Context, fs_idx: usize, base_delta: i32) {
         let nav_delta = self.spread_nav_delta(base_delta);
         self.bump_input_seq("gamepad_fs_nav", Some(&format!("delta={nav_delta}")));
-        self.handle_fs_navigation(ctx, false, false, None, None, nav_delta, None, fs_idx);
+        self.handle_fs_navigation(ctx, false, false, None, None, None, nav_delta, None, fs_idx);
     }
 
     fn handle_gamepad_spread_nudge(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
@@ -2356,7 +2618,17 @@ impl App {
                 self.persist_current_reading_flow();
                 self.adjust_spread_target = AdjustSpreadTarget::Left;
                 self.bump_input_seq("gamepad_fs_nudge", Some(&format!("idx={new_idx}")));
-                self.handle_fs_navigation(ctx, false, false, None, None, 0, Some(new_idx), fs_idx);
+                self.handle_fs_navigation(
+                    ctx,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    0,
+                    Some(new_idx),
+                    fs_idx,
+                );
                 self.show_feedback_toast("見開きを1ページずらしました".to_string());
             }
         } else {

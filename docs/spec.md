@@ -545,10 +545,10 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 行だけが上書きになり、コメントのままの操作はビルトイン既定キー (将来の変更を含む)
 に追従する。現在バージョンの標準 Action 一覧は、起動時に更新生成される
 `%APPDATA%\mimageviewer\keymap.ini.default` と `docs/keymap.ini.default` を参照する。
-GUI での編集、競合検知、マウス /
-ゲームパッド / OS クリップボード / D&D の割り当て変更は対象外。
-例外として、マウス右ドラッグのフリックとゲームパッド X リングは
-`Settings.ring_shortcuts` の 8 方向スロットで厳選アクションだけを差し替えられる。
+GUI での編集、競合検知、OS クリップボード / D&D の割り当て変更は対象外。
+マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
+フリック、マウス戻る / 進むボタン、Shift / Alt + ホイール、ゲームパッド X リングは
+`Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
 これは `KeyAction` / `keymap.ini` の完全カスタマイズではなく、
 マウス・ゲームパッド用の小さな固定メニューとして扱う。
 
@@ -588,9 +588,10 @@ GUI での編集、競合検知、マウス /
 | Ctrl + O | フォルダを開くダイアログ（無効なパスはエラー表示） |
 | Ctrl + ↑ | ツリー順で前のフォルダ / コンテナへ |
 | Ctrl + ↓ | ツリー順で次のフォルダ / コンテナへ |
-| マウス戻るボタン | ツリー順で前のフォルダ / コンテナへ（Ctrl+↑ と同じ）。XButton1 native / WM_APPCOMMAND / `Browser_Back` キーストロークの 3 経路に対応 |
-| マウス進むボタン | ツリー順で次のフォルダ / コンテナへ（Ctrl+↓ と同じ）。XButton2 native / WM_APPCOMMAND / `Browser_Forward` キーストロークの 3 経路に対応 |
+| マウス戻るボタン | `Settings.ring_shortcuts.mouse_back_forward_action` に従う。新規環境の既定はフォルダ履歴を戻る（Alt+← と同じ）。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、従来互換のツリー順で前のフォルダ / コンテナへ（Ctrl+↑ と同じ）。XButton1 native / WM_APPCOMMAND / `Browser_Back` キーストロークの 3 経路に対応 |
+| マウス進むボタン | `Settings.ring_shortcuts.mouse_back_forward_action` に従う。新規環境の既定はフォルダ履歴を進む（Alt+→ と同じ）。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、従来互換のツリー順で次のフォルダ / コンテナへ（Ctrl+↓ と同じ）。XButton2 native / WM_APPCOMMAND / `Browser_Forward` キーストロークの 3 経路に対応 |
 | Ctrl + マウスホイール | 列数を増減 |
+| Shift / Alt + マウスホイール | `Settings.ring_shortcuts.shift_wheel_pair` / `alt_wheel_pair` にペアアクションが設定され、かつ現在画面で有効な場合だけ実行する。未設定または無効な画面では従来のホイール操作へフォールバック |
 | Alt + 1〜9 | 列数を 1〜9 に切り替え |
 | Alt + 0 | 列数を 10 に切り替え |
 | Alt + - | サムネイル表示 / 詳細表示を切り替え |
@@ -633,6 +634,7 @@ GUI での編集、競合検知、マウス /
 | Ctrl+Alt+Shift+D | 画像パイプラインのデバッグ出力。現在ページ (見開き時は左右ページ) の段階別 PNG と `manifest.json` を `%APPDATA%\mimageviewer\debug-pipeline\...` に保存 |
 | マウスホイール | 通常表示では前/次の画像へ。縦/横連結モードでは連結方向へスクロール。編集モードの画像上ではズーム |
 | Ctrl + マウスホイール | マウス位置中心にズーム（0.1〜50 倍）。編集パネル上でもズームを優先 |
+| Shift / Alt + マウスホイール | `Settings.ring_shortcuts.shift_wheel_pair` / `alt_wheel_pair` のペアアクションが現在画面で有効な場合だけ実行する。画像ではページジャンプ、ズーム、フォルダ履歴 / ツリー順 / 兄弟フォルダ移動、動画では音量・マーカー移動などを割り当て可能。未設定または無効な画面では従来のホイール操作へフォールバック |
 | 中ボタン（ホイール押し込み）+ 上下ドラッグ | ドラッグ開始位置を中心にズーム |
 | Space + 左ドラッグ（編集モード中） | 一時パン。すでに描画/図形編集/切り取り枠/注釈ドラッグ中の操作は横取りしない |
 | 左ドラッグ（ズーム中） | パン（表示範囲を移動） |
@@ -641,8 +643,8 @@ GUI での編集、競合検知、マウス /
 | Ctrl + ↑ | ツリー順で前のフォルダ / コンテナへ移動し、その先頭画像 / 動画をフルスクリーンで表示 |
 | Ctrl + ↓ | ツリー順で次のフォルダ / コンテナへ移動し、その先頭画像 / 動画をフルスクリーンで表示 |
 | 右 Ctrl（押している間） / 左クリック長押し | 元画像プレビュー（mIV 側の補正/ポストフィルタ/AI/消しゴム補完/補正レイヤー/隠蔽加工/テキスト注釈を一時的に外す） |
-| マウス戻るボタン | Ctrl+↑ と同じ（画像系 / 動画 native 経路とも有効）。XButton1 native / WM_APPCOMMAND / `Browser_Back` キーストロークの 3 経路に対応 |
-| マウス進むボタン | Ctrl+↓ と同じ（画像系 / 動画 native 経路とも有効）。XButton2 native / WM_APPCOMMAND / `Browser_Forward` キーストロークの 3 経路に対応 |
+| マウス戻るボタン | `Settings.ring_shortcuts.mouse_back_forward_action` に従う。新規環境の既定はフォルダ履歴を戻る。従来どおりに設定した場合は Ctrl+↑ と同じツリー順移動。画像系 / 動画 native 経路とも有効 |
+| マウス進むボタン | `Settings.ring_shortcuts.mouse_back_forward_action` に従う。新規環境の既定はフォルダ履歴を進む。従来どおりに設定した場合は Ctrl+↓ と同じツリー順移動。画像系 / 動画 native 経路とも有効 |
 | Enter | 動画の場合、フルスクリーンで自動再生する。動画フルスクリーン中の Space / Enter は再生/一時停止トグル (Phase 1: 旧 Space=チェックは削除) |
 | Ctrl + B | 動画の場合、現在の再生フレームを画像として追加先の本へ追加する |
 | Backspace | フルスクリーンを閉じて一覧へ戻る。動画 native presenter 経路でも画像フルスクリーンと同じく App 側へ転送する |
@@ -660,8 +662,9 @@ GUI での編集、競合検知、マウス /
 | 画面右 1/4 | メタデータパネルをホバー表示 |
 | 画面上部 | ファイル情報バー + 操作ボタン |
 
-補足: Ctrl+↑↓ とマウス戻る / 進むボタンは、画像系 / Windows native 動画 /
-Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
+補足: Ctrl+↑↓ は従来どおりツリー順移動。マウス戻る / 進むボタンは設定により
+フォルダ履歴またはツリー順移動を選べる。ツリー順に設定した場合の画像系 /
+Windows native 動画 / Ctrl+S / Ctrl+G のスコープ解決は Ctrl+↑↓ と共通化している。横断仕様は
 [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) を参照。
 
 ### 7.3 ゲームパッド操作
@@ -828,7 +831,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。環境設定 → ツールバーからクリアできる |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
-| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。マウス右ドラッグのフリック有効化 (既定 OFF)、ゲームパッド X リング有効化 (既定 ON)、グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、X ピッカー初回案内の表示済み状態を保持する |
+| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。マウス右ドラッグのフリック有効化 (既定 OFF)、ゲームパッド X リング有効化 (既定 ON)、グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、Shift / Alt + ホイールのペアアクション、マウス戻る / 進むボタンの割り当てと移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |

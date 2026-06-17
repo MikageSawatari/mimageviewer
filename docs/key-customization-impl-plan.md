@@ -18,7 +18,9 @@
 - 画像フルスクリーン、編集モード (消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤー)、
   グリッド主要操作、egui/native 動画主要操作を keymap 経由にした。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
-  D&D、マウス、ゲームパッド、IME 確定は固定扱いのまま。
+  D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
+  右ドラッグ、戻る / 進むボタン、Shift / Alt + ホイール、ゲームパッド X リングは
+  `Settings.ring_shortcuts` の小さな固定入力レイヤーで扱う。
 
 ---
 
@@ -33,7 +35,9 @@
 - **競合検知しない。** 先勝ち (consume / VK match 経路は先頭一致が勝つ。grid の `key_pressed`
   経路だけは非消費なので衝突時は両方発火する = 仕様として明記)。
 - **MVP で対象外にする入力を明示する。** ゲームパッド、マウス操作、D&D、OS/egui の
-  `Event::Copy` / `Event::Cut`、クリップボード paste、IME 確定、右クリックメニューは固定扱い。
+  `Event::Copy` / `Event::Cut`、クリップボード paste、IME 確定、右クリックメニューは keymap.ini では固定扱い。
+  ただし右ドラッグ、戻る / 進むボタン、Shift / Alt + ホイール、ゲームパッド X リングは
+  `Settings.ring_shortcuts` 側で限定カスタマイズする。
   将来対応する場合もキーボード keymap とは別フェーズにする。
 - **入力パターンは 3 種、差し替え方向は固定** (design doc §8.6):
   - **Press** (通常キー押下、M=ルーペ・ロックトグル含む): キー↔通常キー / 修飾↔修飾 自由
@@ -396,7 +400,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 1. **keymap 対象か固定扱いかを決める。**
    閲覧・編集・動画の通常ショートカットは原則 keymap 対象。IME 確定、OS clipboard、
-   D&D、右クリック、マウス、ゲームパッドなど固定扱いにする入力は、`docs/keymap-spec.md`
+   D&D、右クリック、通常マウス、ゲームパッドなど固定扱いにする入力は、`docs/keymap-spec.md`
    の該当節に「対象外」の理由を残す。
 2. **対象なら `KeyAction` を追加する。**
    `ini_name()` / `description()` / `context()` / `trigger()` / `default_chords()` を埋める。
@@ -461,7 +465,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - FsToggleWindowMode `F11` (固定)
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
-- BrowserBack/Forward、マウス戻る/進む、ホイール、クリックは固定。
+- BrowserBack/Forward、マウス戻る/進む、Shift / Alt + ホイールは
+  `Settings.ring_shortcuts` の固定入力レイヤーで扱う。通常ホイール、Ctrl+ホイール、クリックは固定。
 
 ### FsImage (Ph2) ★
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
@@ -535,7 +540,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### 固定・対象外として明示するもの
 - Gamepad: `src/app/gamepad_input.rs` の閲覧専用ボタン/軸入力。
-- Mouse: ホイール、クリック、戻る/進む、D&D、右クリックメニュー。
+- Mouse: 通常ホイール、Ctrl+ホイール、クリック、D&D、右クリックメニューは固定。
+  右ドラッグ、戻る/進む、Shift / Alt + ホイールは `Settings.ring_shortcuts` で限定カスタマイズ。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
   ファイル削除ワーカー起動。
 - OS 状態参照: RightCtrl original preview、native presenter の一部 routing。

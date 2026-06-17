@@ -121,6 +121,7 @@ impl App {
             nav_delta: 0,
             ctrl_nav: None,
             sibling_nav: None,
+            mouse_nav: None,
             jump_to: None,
         };
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
