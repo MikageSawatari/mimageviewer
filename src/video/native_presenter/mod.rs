@@ -827,17 +827,17 @@ pub struct NativeOverlayRingPickerRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeOverlayRingPickerDrill {
     pub title: String,
-    pub group_line: String,
-    pub item_line: String,
-    pub selected_line: String,
+    pub items: Vec<String>,
+    pub selected: usize,
     pub footer: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NativeOverlayRingGuide {
     pub heading: String,
     pub detail: String,
     pub selected_slot: Option<usize>,
+    pub center_client_px: Option<egui::Pos2>,
     pub slots: Vec<NativeOverlayRingGuideSlot>,
 }
 
@@ -1209,11 +1209,9 @@ impl NativeOverlayInputRouting {
             // 同じ raw wheel を App へ二重転送しない。
             // モーダル中はカーソルがダイアログ外の dark backdrop にあっても wheel を
             // App へ流さない (= 動画切替誘発防止、Codex P3 C1)。
-            NativeEvent::MouseWheel(wheel) => {
+            NativeEvent::MouseWheel(_) => {
                 if self.modal_dialog_active || self.consumed_wheel {
                     false
-                } else if wheel.shift || wheel.alt {
-                    true
                 } else {
                     !self.wants_pointer_input
                 }
@@ -4990,6 +4988,7 @@ impl NativeEguiOverlay {
                 self::overlay_draw::native_ring_guide_overlay_rect(
                     width_points,
                     height_points,
+                    self.pixels_per_point,
                     guide,
                 )
             });
@@ -5636,6 +5635,7 @@ impl NativeEguiOverlay {
                         ctx,
                         overlay_width_points,
                         overlay_height_points,
+                        ppp,
                         guide,
                     );
                 }
@@ -5666,6 +5666,7 @@ impl NativeEguiOverlay {
                         ctx,
                         overlay_width_points,
                         overlay_height_points,
+                        ppp,
                         guide,
                     );
                 }
@@ -5750,6 +5751,7 @@ impl NativeEguiOverlay {
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
+                    ppp,
                     guide,
                 );
             }
@@ -7999,18 +8001,6 @@ mod tests {
             y: 100,
             shift: false,
             ctrl,
-            alt: false,
-        })
-    }
-
-    fn modified_wheel(shift: bool, alt: bool) -> NativeVideoWindowEvent {
-        NativeVideoWindowEvent::MouseWheel(NativeVideoMouseWheelEvent {
-            delta: 120,
-            x: 100,
-            y: 100,
-            shift,
-            ctrl: false,
-            alt,
         })
     }
 
@@ -8055,8 +8045,7 @@ mod tests {
             ..Default::default()
         };
         assert!(!over_ui.should_forward_to_ui(&wheel(true)));
-        assert!(over_ui.should_forward_to_ui(&modified_wheel(true, false)));
-        assert!(over_ui.should_forward_to_ui(&modified_wheel(false, true)));
+        assert!(!over_ui.should_forward_to_ui(&wheel(false)));
     }
 
     #[test]

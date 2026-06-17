@@ -243,6 +243,7 @@ pub struct GamepadInputState {
     y_modifier_used: bool,
     west_ring_direction: Option<RingDirection>,
     west_tap_suppressed: bool,
+    directional_neutral_required: bool,
     analog_last_tick: Option<Instant>,
     left_stick_next_step: Option<Instant>,
     trigger_next_step: Option<Instant>,
@@ -258,6 +259,7 @@ impl Default for GamepadInputState {
             y_modifier_used: false,
             west_ring_direction: None,
             west_tap_suppressed: false,
+            directional_neutral_required: false,
             analog_last_tick: None,
             left_stick_next_step: None,
             trigger_next_step: None,
@@ -294,6 +296,7 @@ impl GamepadInputState {
         self.repeat_next.clear();
         self.y_modifier_used = false;
         self.reset_west_ring_state();
+        self.directional_neutral_required = false;
         self.analog_last_tick = None;
         self.left_stick_next_step = None;
         self.trigger_next_step = None;
@@ -414,6 +417,29 @@ impl GamepadInputState {
         }
     }
 
+    pub fn require_directional_neutral(&mut self) {
+        self.directional_neutral_required = true;
+        self.left_stick_next_step = None;
+        self.analog_last_tick = None;
+        for button in DPAD_BUTTONS {
+            self.repeat_next.remove(&button);
+        }
+    }
+
+    pub fn clear_directional_neutral_required(&mut self) {
+        self.directional_neutral_required = false;
+    }
+
+    pub fn directional_neutral_required(&self) -> bool {
+        self.directional_neutral_required
+    }
+
+    pub fn dpad_direction_down(&self) -> bool {
+        DPAD_BUTTONS
+            .iter()
+            .any(|button| self.buttons.contains(button))
+    }
+
     pub fn finish_west_release(&mut self) -> WestReleaseOutcome {
         let outcome = if self.west_tap_suppressed {
             WestReleaseOutcome::Suppressed
@@ -471,6 +497,13 @@ fn is_repeatable_button(button: PadButton) -> bool {
             | PadButton::RightShoulder
     )
 }
+
+const DPAD_BUTTONS: [PadButton; 4] = [
+    PadButton::DPadUp,
+    PadButton::DPadDown,
+    PadButton::DPadLeft,
+    PadButton::DPadRight,
+];
 
 fn step_due(
     next_step: &mut Option<Instant>,
@@ -535,5 +568,27 @@ mod tests {
         state.set_button_down(PadButton::West, false, now);
 
         assert_eq!(state.finish_west_release(), WestReleaseOutcome::Suppressed);
+    }
+
+    #[test]
+    fn directional_neutral_gate_clears_dpad_repeats() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        state.set_button_down(PadButton::DPadRight, true, now);
+
+        state.require_directional_neutral();
+
+        assert!(state.directional_neutral_required());
+        assert!(state.dpad_direction_down());
+        assert!(!state.due_button_repeat(
+            PadButton::DPadRight,
+            now + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(95)
+        ));
+
+        state.set_button_down(PadButton::DPadRight, false, now);
+        assert!(!state.dpad_direction_down());
+        state.clear_directional_neutral_required();
+        assert!(!state.directional_neutral_required());
     }
 }

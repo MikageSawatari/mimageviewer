@@ -142,6 +142,27 @@ impl RotationDb {
             .query_row("SELECT COUNT(*) FROM rotations", [], |row| row.get(0))
             .unwrap_or(0)
     }
+
+    /// 回転が保存されているキーを全件返す。
+    ///
+    /// `set_key(..., Rotation::None)` は行を削除するため、通常は全行が対象だが、
+    /// 念のため angle=0 の旧/手動行は除外する。
+    pub fn load_rotated_keys(&self) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT path FROM rotations WHERE angle != 0")
+        else {
+            return set;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return set;
+        };
+        for row in rows.flatten() {
+            set.insert(row);
+        }
+        set
+    }
 }
 
 /// パスを正規化 (小文字化 + バックスラッシュ→スラッシュ)

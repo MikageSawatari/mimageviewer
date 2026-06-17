@@ -239,6 +239,26 @@ impl ConcealDb {
         set
     }
 
+    /// 隠蔽加工マスクを持つページキーを全件返す。スロットキーは除外する。
+    ///
+    /// スマートフィルタの親コンテナ判定用。ビットマップ BLOB は読まない。
+    pub fn load_all_conceal_keys(&self) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT page_path FROM conceal_entries
+             WHERE page_path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'",
+        ) else {
+            return set;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return set;
+        };
+        for row in rows.flatten() {
+            set.insert(row);
+        }
+        set
+    }
+
     fn upsert(
         &self,
         key: &str,

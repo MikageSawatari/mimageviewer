@@ -2158,17 +2158,7 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
-                if !wheel.ctrl
-                    && self.apply_shift_alt_wheel_pair(
-                        ctx,
-                        wheel.delta as f32,
-                        wheel.shift,
-                        wheel.alt,
-                        None,
-                        "native-video-wheel-pair",
-                    )
-                {
-                } else if wheel.ctrl && self.video_tile_mode_active {
+                if wheel.ctrl && self.video_tile_mode_active {
                     let delta = if wheel.delta > 0 { -1 } else { 1 };
                     self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
                 } else if !wheel.ctrl {
@@ -6075,6 +6065,8 @@ impl App {
                         pos,
                         None,
                     );
+                } else {
+                    self.native_video_secondary_press_start = Some(pos);
                 }
                 return;
             }
@@ -6086,9 +6078,27 @@ impl App {
                     false,
                     true,
                 );
-                if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::Fired) {
+                if matches!(
+                    outcome,
+                    crate::ring_shortcut::MouseFlickOutcome::Fired
+                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
+                ) {
                     return;
                 }
+                if let crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(menu_pos) = outcome {
+                    self.fs_context_menu_idx = Some(fs_idx);
+                    self.fs_context_menu_pos = menu_pos;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+            if let Some(start_pos) = self.native_video_secondary_press_start.take() {
+                if pos.distance(start_pos) < 20.0 {
+                    self.fs_context_menu_idx = Some(fs_idx);
+                    self.fs_context_menu_pos = pos;
+                    ctx.request_repaint();
+                }
+                return;
             }
             self.close_fullscreen();
             return;

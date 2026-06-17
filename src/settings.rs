@@ -515,6 +515,8 @@ impl FacetSizePreset {
 )]
 pub enum FacetEditFlag {
     Adjustment,
+    /// 旧開発版の「AI補正あり」。読み込み互換のため残すが、UI には出さない。
+    AiAdjustment,
     LocalAdjustment,
     Mask,
     Conceal,
@@ -530,6 +532,7 @@ impl FacetEditFlag {
     pub fn label(self) -> &'static str {
         match self {
             Self::Adjustment => "補",
+            Self::AiAdjustment => "AI",
             Self::LocalAdjustment => "レ",
             Self::Mask => "消",
             Self::Conceal => "隠",
@@ -545,6 +548,7 @@ impl FacetEditFlag {
     pub fn menu_label(self) -> &'static str {
         match self {
             Self::Adjustment => "補（補正）",
+            Self::AiAdjustment => "AI補正あり",
             Self::LocalAdjustment => "レ（補正レイヤー）",
             Self::Mask => "消（消しゴムマスク）",
             Self::Conceal => "隠（隠蔽加工）",
@@ -595,6 +599,8 @@ pub struct FacetFilter {
     pub size_preset: Option<FacetSizePreset>,
     #[serde(default)]
     pub edits: std::collections::BTreeSet<FacetEditFlag>,
+    #[serde(default, alias = "ai_adjustment_include_descendants")]
+    pub edit_include_descendants: bool,
 }
 
 impl FacetFilter {
@@ -619,6 +625,25 @@ impl FacetFilter {
 
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn has_rollup_edit_filter(&self) -> bool {
+        self.edits.iter().any(|flag| flag.rolls_up_to_containers())
+    }
+}
+
+impl FacetEditFlag {
+    pub fn rolls_up_to_containers(self) -> bool {
+        matches!(
+            self,
+            Self::Adjustment
+                | Self::AiAdjustment
+                | Self::LocalAdjustment
+                | Self::Mask
+                | Self::Conceal
+                | Self::Annotation
+                | Self::Rotation
+        )
     }
 }
 
@@ -1230,13 +1255,7 @@ impl FullscreenFitMode {
     }
 
     pub fn all() -> &'static [Self] {
-        &[
-            Self::Page,
-            Self::MarginFit,
-            Self::Width,
-            Self::Height,
-            Self::Original,
-        ]
+        &[Self::Page, Self::Width, Self::Height, Self::Original]
     }
 
     pub fn default_for_flow(flow: ReadingFlow) -> Self {
@@ -1249,22 +1268,18 @@ impl FullscreenFitMode {
         }
     }
 
-    pub fn effective_for_flow(self, flow: ReadingFlow) -> Self {
-        if !flow.is_paged() && matches!(self, Self::MarginFit) {
-            Self::default_for_flow(flow)
+    pub fn effective_for_flow(self, _flow: ReadingFlow) -> Self {
+        if matches!(self, Self::MarginFit) {
+            Self::Page
         } else {
             self
         }
     }
 
     /// フロー上で選べるモード一覧 (ツールバーのメニュー・[0] 循環で共有)。
-    /// 連結読み (非ページ) では余白カットフィットを除外する。
-    pub fn selectable_for_flow(flow: ReadingFlow) -> &'static [Self] {
-        if flow.is_paged() {
-            Self::all()
-        } else {
-            &[Self::Page, Self::Width, Self::Height, Self::Original]
-        }
+    /// 旧余白カットフィットは表示トリムへ移行したため、新規選択肢には含めない。
+    pub fn selectable_for_flow(_flow: ReadingFlow) -> &'static [Self] {
+        Self::all()
     }
 
     pub fn next_for_flow(self, flow: ReadingFlow) -> Self {
@@ -1272,6 +1287,22 @@ impl FullscreenFitMode {
         let current = self.effective_for_flow(flow);
         let pos = modes.iter().position(|&m| m == current).unwrap_or(0);
         modes[(pos + 1) % modes.len()]
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenLeftPanelTab {
+    #[default]
+    Adjustment,
+    ViewTrim,
+}
+
+impl FullscreenLeftPanelTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Adjustment => "画像補正",
+            Self::ViewTrim => "表示トリム",
+        }
     }
 }
 
@@ -1757,6 +1788,9 @@ pub struct Settings {
     /// 自動フィット時に 100% 未満へ縮小しない。
     #[serde(default)]
     pub fullscreen_fit_no_downscale: bool,
+    /// フルスクリーン左ホバーパネルで最後に開いていたタブ。
+    #[serde(default)]
+    pub fullscreen_left_panel_tab: FullscreenLeftPanelTab,
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
@@ -1798,8 +1832,8 @@ pub struct Settings {
     #[serde(default)]
     pub auto_fullscreen_zip_pdf: bool,
 
-    /// 旧設定互換用。新規コードでは `fullscreen_fit_mode == MarginFit` を source of truth
-    /// として扱い、sanitize/save 時に同期する。
+    /// 旧設定互換用。読み込み時に `fullscreen_fit_mode == MarginFit` へ寄せ、
+    /// 本を開いたタイミングで表示トリム Auto + ページ全体フィットへ移行する。
     #[serde(default)]
     pub margin_fit_enabled: bool,
 
@@ -2928,6 +2962,7 @@ impl Default for Settings {
             fullscreen_fit_mode: FullscreenFitMode::default(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
+            fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
@@ -3870,6 +3905,22 @@ impl Settings {
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         settings.sanitize();
+        let mouse_nav_upgrade_prompt_pending = matches!(
+            source,
+            crate::settings_db::BootSource::LoadedExistingDb
+                | crate::settings_db::BootSource::MigratedFromJson
+                | crate::settings_db::BootSource::RestoredFromDbBackup
+                | crate::settings_db::BootSource::FailedFallbackDefault
+        ) && !settings.ring_shortcuts.mouse_nav_prompt_done
+            && matches!(
+                settings.ring_shortcuts.mouse_back_forward_action,
+                crate::ring_shortcut::MouseBackForwardActionId::None
+            );
+        if mouse_nav_upgrade_prompt_pending {
+            settings.ring_shortcuts.set_mouse_buttons_from_legacy_pair(
+                crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext,
+            );
+        }
         let mouse_nav_clean_install_defaulted = source
             == crate::settings_db::BootSource::CleanInstall
             && !settings.ring_shortcuts.mouse_nav_prompt_done
@@ -3878,8 +3929,11 @@ impl Settings {
                 crate::ring_shortcut::MouseBackForwardActionId::None
             );
         if mouse_nav_clean_install_defaulted {
+            settings.ring_shortcuts.set_mouse_buttons_from_legacy_pair(
+                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext,
+            );
             settings.ring_shortcuts.mouse_back_forward_action =
-                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext;
+                crate::ring_shortcut::MouseBackForwardActionId::None;
             settings.ring_shortcuts.mouse_nav_prompt_done = true;
         }
         let video_volume_sanitized =
@@ -4055,6 +4109,9 @@ impl Settings {
         sanitize_details_column_widths(&mut self.details_column_widths);
         self.normalize_tag_settings();
         self.normalize_facet_tag_filter();
+        if self.facet_filter.edits.remove(&FacetEditFlag::AiAdjustment) {
+            self.facet_filter.edits.insert(FacetEditFlag::Adjustment);
+        }
     }
 
     fn normalize_tag_settings(&mut self) {
@@ -4518,7 +4575,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_fit_mode_cycles_skip_margin_fit_in_continuous_flow() {
+    fn fullscreen_fit_mode_cycles_exclude_legacy_margin_fit() {
         assert_eq!(
             FullscreenFitMode::default_for_flow(ReadingFlow::Paged),
             FullscreenFitMode::Page
@@ -4533,7 +4590,7 @@ mod tests {
         );
         assert_eq!(
             FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged),
-            FullscreenFitMode::MarginFit
+            FullscreenFitMode::Width
         );
         assert_eq!(
             FullscreenFitMode::Page.next_for_flow(ReadingFlow::Vertical),
@@ -4541,18 +4598,17 @@ mod tests {
         );
         assert_eq!(
             FullscreenFitMode::MarginFit.effective_for_flow(ReadingFlow::Horizontal),
-            FullscreenFitMode::Height
+            FullscreenFitMode::Page
         );
     }
 
     #[test]
     fn fit_mode_menu_list_matches_flow() {
-        // ページ表示ではメニューに 5 モード全て (余白カットフィット含む)。
+        // 余白カットフィットは表示トリムへ移行したため、ページ表示でも候補から外す。
         assert_eq!(
             FullscreenFitMode::selectable_for_flow(ReadingFlow::Paged),
             FullscreenFitMode::all()
         );
-        // 連結読み (縦/横) では余白カットフィットを除く 4 モード。
         for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
             let modes = FullscreenFitMode::selectable_for_flow(flow);
             assert_eq!(modes.len(), 4);
@@ -4619,8 +4675,12 @@ mod tests {
             crate::ring_shortcut::WheelPairActionId::ZoomInOut;
         original.ring_shortcuts.alt_wheel_pair =
             crate::ring_shortcut::WheelPairActionId::FolderHistoryPrevNext;
-        original.ring_shortcuts.mouse_back_forward_action =
-            crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext;
+        original.ring_shortcuts.mouse_buttons_grid.back =
+            crate::ring_shortcut::RingActionId::GridParentFolder;
+        original.ring_shortcuts.mouse_buttons_image.forward =
+            crate::ring_shortcut::RingActionId::ImageSlideshow;
+        original.ring_shortcuts.mouse_buttons_video.back =
+            crate::ring_shortcut::RingActionId::VideoMute;
         original.ring_shortcuts.mouse_nav_prompt_done = true;
         original.ring_shortcuts.grid.slots[0] = crate::ring_shortcut::RingActionId::GridHistoryBack;
         let json = serde_json::to_string(&original).unwrap();
@@ -4702,6 +4762,14 @@ mod tests {
             loaded.ring_shortcuts.mouse_back_forward_action,
             crate::ring_shortcut::MouseBackForwardActionId::None
         );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_grid.back,
+            crate::ring_shortcut::RingActionId::GridHistoryBack
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_grid.forward,
+            crate::ring_shortcut::RingActionId::GridHistoryForward
+        );
         assert!(!loaded.ring_shortcuts.mouse_nav_prompt_done);
         assert_eq!(
             loaded.ring_shortcuts.grid.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
@@ -4748,6 +4816,9 @@ mod tests {
                 "shift_wheel_pair": "future_wheel",
                 "alt_wheel_pair": "zoom_in_out",
                 "mouse_back_forward_action": "future_mouse_nav",
+                "mouse_buttons_grid": { "back": "future_mouse_button", "forward": "grid_history_forward" },
+                "mouse_buttons_image": { "back": "grid_history_back", "forward": "video_capture" },
+                "mouse_buttons_video": { "back": "image_capture", "forward": "grid_history_forward" },
                 "grid": { "slots": ["future_action", "video_capture"] },
                 "image": { "slots": ["video_capture"] },
                 "video": { "slots": ["image_capture"] }
@@ -4769,6 +4840,18 @@ mod tests {
         assert_eq!(
             loaded.ring_shortcuts.mouse_back_forward_action,
             crate::ring_shortcut::MouseBackForwardActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_grid.back,
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_image.forward,
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_video.back,
+            crate::ring_shortcut::RingActionId::None
         );
         assert_eq!(
             loaded.ring_shortcuts.grid.slots.len(),
@@ -6168,6 +6251,7 @@ mod tests {
             s.facet_filter.date_preset = Some(FacetDatePreset::Last30Days);
             s.facet_filter.size_preset = Some(FacetSizePreset::MiB10To100);
             s.facet_filter.edits.insert(FacetEditFlag::Tagged);
+            s.facet_filter.edit_include_descendants = true;
             s.thumb_aspect_auto = true;
             s.thumb_aspect = ThumbAspect::Portrait2x3;
             s.thumb_tooltip_show_filename = false;
@@ -6180,6 +6264,7 @@ mod tests {
             s.thumb_tooltip_show_video_dimensions = true;
             s.thumb_tooltip_show_video_codec = true;
             s.thumb_tooltip_show_location = true;
+            s.fullscreen_left_panel_tab = FullscreenLeftPanelTab::ViewTrim;
             s.toolbar_cols_details_visible = false;
             s.toolbar_aspect_auto_visible = false;
             s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
@@ -6193,8 +6278,12 @@ mod tests {
                 crate::ring_shortcut::WheelPairActionId::VideoVolumeUpDown;
             s.ring_shortcuts.alt_wheel_pair =
                 crate::ring_shortcut::WheelPairActionId::FolderHistoryPrevNext;
-            s.ring_shortcuts.mouse_back_forward_action =
-                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext;
+            s.ring_shortcuts.mouse_buttons_grid.back =
+                crate::ring_shortcut::RingActionId::GridParentFolder;
+            s.ring_shortcuts.mouse_buttons_image.forward =
+                crate::ring_shortcut::RingActionId::ImageSlideshow;
+            s.ring_shortcuts.mouse_buttons_video.back =
+                crate::ring_shortcut::RingActionId::VideoMute;
             s.ring_shortcuts.mouse_nav_prompt_done = true;
             s.ring_shortcuts.x_picker_hint_shown = true;
             s.ring_shortcuts.image.slots[crate::ring_shortcut::RingDirection::Right.slot_index()] =
@@ -6340,6 +6429,10 @@ mod tests {
                 "facet_filter edit flags should survive roundtrip"
             );
             assert!(
+                loaded.facet_filter.edit_include_descendants,
+                "facet_filter edit descendant option should survive roundtrip"
+            );
+            assert!(
                 !loaded.toolbar_cols_details_visible,
                 "toolbar_cols_details_visible (false override) should survive roundtrip"
             );
@@ -6390,8 +6483,23 @@ mod tests {
             );
             assert_eq!(
                 loaded.ring_shortcuts.mouse_back_forward_action,
-                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext,
-                "mouse back/forward action should survive roundtrip"
+                crate::ring_shortcut::MouseBackForwardActionId::None,
+                "legacy mouse back/forward action should remain migrated"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_buttons_grid.back,
+                crate::ring_shortcut::RingActionId::GridParentFolder,
+                "grid mouse back button action should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_buttons_image.forward,
+                crate::ring_shortcut::RingActionId::ImageSlideshow,
+                "image mouse forward button action should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_buttons_video.back,
+                crate::ring_shortcut::RingActionId::VideoMute,
+                "video mouse back button action should survive roundtrip"
             );
             assert!(
                 loaded.ring_shortcuts.mouse_nav_prompt_done,
@@ -6451,6 +6559,11 @@ mod tests {
             assert!(
                 loaded.thumb_tooltip_show_location,
                 "thumb tooltip location flag should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.fullscreen_left_panel_tab,
+                FullscreenLeftPanelTab::ViewTrim,
+                "fullscreen left panel tab should survive roundtrip"
             );
         }
 
@@ -6592,7 +6705,15 @@ mod tests {
             assert_eq!(loaded.favorites.len(), 0);
             assert_eq!(
                 loaded.ring_shortcuts.mouse_back_forward_action,
-                crate::ring_shortcut::MouseBackForwardActionId::FolderHistoryPrevNext
+                crate::ring_shortcut::MouseBackForwardActionId::None
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_buttons_grid.back,
+                crate::ring_shortcut::RingActionId::GridHistoryBack
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_buttons_grid.forward,
+                crate::ring_shortcut::RingActionId::GridHistoryForward
             );
             assert!(
                 loaded.ring_shortcuts.mouse_nav_prompt_done,

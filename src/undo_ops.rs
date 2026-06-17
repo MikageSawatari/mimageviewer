@@ -324,7 +324,11 @@ impl App {
         let target = if use_before { &c.before } else { &c.after };
         match &c.scope {
             AdjustUndoScope::Page(idx) => match target {
-                Some(p) => self.set_page_params(*idx, p.clone()),
+                Some(p) => {
+                    let old = self.effective_params(*idx).clone();
+                    self.set_page_params(*idx, p.clone());
+                    self.clear_caches_for_param_change(*idx, &old, p);
+                }
                 None => {
                     // 個別エントリを消す経路。`clear_page_params` は AI キャッシュも
                     // 適切に落としてくれる。エントリが既に無ければ no-op。

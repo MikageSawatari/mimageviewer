@@ -792,10 +792,6 @@ unsafe extern "system" fn hud_wnd_proc(
                     y: pt.y,
                     shift: mouse_shift(wparam),
                     ctrl: mouse_ctrl(wparam),
-                    alt: unsafe {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_MENU};
-                        GetKeyState(VK_MENU.0 as i32) < 0
-                    },
                 };
                 let _ = state
                     .event_tx

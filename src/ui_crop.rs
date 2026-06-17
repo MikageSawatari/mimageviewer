@@ -66,6 +66,21 @@ fn crop_handle_cursor(handle: CropHandle) -> egui::CursorIcon {
     }
 }
 
+pub(crate) fn auto_export_crop_rect_from_pixels(pixels: &egui::ColorImage) -> Option<CropRect> {
+    let bbox =
+        crate::margin_fit::detect_content_bbox(pixels, crate::margin_fit::DEFAULT_TOLERANCE)?;
+    let [w, h] = pixels.size;
+    Some(
+        CropRect {
+            min_x: bbox.min.x * w.max(1) as f32,
+            min_y: bbox.min.y * h.max(1) as f32,
+            max_x: bbox.max.x * w.max(1) as f32,
+            max_y: bbox.max.y * h.max(1) as f32,
+        }
+        .sanitized(w, h),
+    )
+}
+
 impl App {
     pub(crate) fn export_crop_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let pos = egui::pos2(full_rect.left() + PANEL_MARGIN, full_rect.top() + PANEL_TOP);
@@ -289,6 +304,19 @@ impl App {
                 self.set_export_crop_for_idx(fs_idx, None, image_size);
             }
         });
+        let auto_enabled = self.current_raw_source_pixels(fs_idx).is_some();
+        let auto_resp = ui.add_enabled(
+            auto_enabled,
+            egui::Button::new("自動クロップ").min_size(egui::vec2(ui.available_width(), 24.0)),
+        );
+        if auto_resp.clicked() {
+            if self.apply_auto_export_crop_for_idx(fs_idx) {
+                self.show_feedback_toast("[自動クロップ]".to_string());
+            } else {
+                self.show_feedback_toast("[余白を検出できません]".to_string());
+            }
+        }
+        auto_resp.on_hover_text("四辺の単色余白を検出して切り取り範囲に設定します");
 
         let mut x = settings.rect.min_x.round() as i32;
         let mut y = settings.rect.min_y.round() as i32;
@@ -324,6 +352,26 @@ impl App {
                 image_size,
             );
         }
+    }
+
+    pub(crate) fn apply_auto_export_crop_for_idx(&mut self, fs_idx: usize) -> bool {
+        let Some(source) = self.current_raw_source_pixels(fs_idx) else {
+            return false;
+        };
+        let Some(rect) = auto_export_crop_rect_from_pixels(&source) else {
+            return false;
+        };
+        let image_size = source.size;
+        self.export_crop_aspect_mode = CropAspectMode::Free;
+        self.set_export_crop_for_idx(
+            fs_idx,
+            Some(CropSettings {
+                rect,
+                aspect_mode: CropAspectMode::Free,
+            }),
+            image_size,
+        );
+        true
     }
 
     fn export_crop_aspect_ratio(
@@ -563,4 +611,64 @@ fn centered_default_crop(image_size: [usize; 2]) -> CropRect {
         max_y: (h + crop_h) * 0.5,
     }
     .sanitized(image_size[0], image_size[1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn white(w: usize, h: usize) -> egui::ColorImage {
+        egui::ColorImage::new([w, h], vec![egui::Color32::WHITE; w * h])
+    }
+
+    fn fill(
+        img: &mut egui::ColorImage,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        color: egui::Color32,
+    ) {
+        let [w, h] = img.size;
+        for y in y0.min(h)..y1.min(h) {
+            for x in x0.min(w)..x1.min(w) {
+                img.pixels[y * w + x] = color;
+            }
+        }
+    }
+
+    #[test]
+    fn auto_export_crop_rect_converts_detected_bbox_to_source_pixels() {
+        let mut img = white(100, 80);
+        fill(&mut img, 20, 16, 80, 64, egui::Color32::BLACK);
+
+        let rect =
+            auto_export_crop_rect_from_pixels(&img).expect("auto crop should detect content");
+
+        assert!(
+            rect.min_x >= 15.0 && rect.min_x <= 22.0,
+            "min_x={}",
+            rect.min_x
+        );
+        assert!(
+            rect.min_y >= 11.0 && rect.min_y <= 18.0,
+            "min_y={}",
+            rect.min_y
+        );
+        assert!(
+            rect.max_x >= 78.0 && rect.max_x <= 85.0,
+            "max_x={}",
+            rect.max_x
+        );
+        assert!(
+            rect.max_y >= 62.0 && rect.max_y <= 69.0,
+            "max_y={}",
+            rect.max_y
+        );
+    }
+
+    #[test]
+    fn auto_export_crop_rect_returns_none_for_solid_page() {
+        assert!(auto_export_crop_rect_from_pixels(&white(64, 64)).is_none());
+    }
 }

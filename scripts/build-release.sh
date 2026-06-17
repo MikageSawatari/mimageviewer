@@ -7,7 +7,7 @@
 #   1. 実行中の mimageviewer.exe / mimageviewer-susie32.exe を `taskkill` で停止
 #   2. ファイルハンドル解放を待つ
 #   3. VST3 C++ bridge を再ビルド (core が include_bytes! で内包するため)
-#   4. core → launcher の 2 段階 cargo build
+#   4. core → launcher の 2 段階 cargo build (CARGO_INCREMENTAL=0)
 #   5. APPDATA 上の stale VST3 bridge cache を削除 (次回起動時に再展開させる)
 # を順に実行する。
 #
@@ -86,11 +86,11 @@ fi
 #      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
 #
 # cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 2 回呼ぶ。
-echo "[build-release] (2/3) cargo build --release --bin mimageviewer-core $*"
-cargo build --release --bin mimageviewer-core "$@"
+echo "[build-release] (2/3) CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core $*"
+CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core "$@"
 
-echo "[build-release] (3/3) cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
-cargo build --release -p mimageviewer-launcher --bin mimageviewer "$@"
+echo "[build-release] (3/3) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
+CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer "$@"
 
 # T56: APPDATA 上の展開済み VST3 bridge cache を削除して、次回起動時に新 bridge を
 # 展開させる。これをしないと開発機が旧 bridge を握り続け、再ビルドした bridge が

@@ -877,10 +877,11 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
 グリッド表示で個別補正があるページの左上に青い「補」バッジを表示する
 (`draw_cell` の `has_page_override` フラグ)。
 
-### 8.3 フルスクリーン上部バーのボタン
+### 8.3 フルスクリーン左ホバーパネル
 
-画像補正パネルトグルボタン (🎨) を 1 つだけ置く。
-パネルが開いているときは青、個別設定があるときは薄い警告色、それ以外は通常色。
+フルスクリーンの左端 / 上端 / 右端ホバーで開く左パネルに、
+`画像補正 / 表示トリム` の 2 タブを置く。選択タブは `Settings::fullscreen_left_panel_tab`
+へ保存し、次回起動後も同じタブで開く。上部ホバーバーには画像補正専用の 🎨 ボタンを置かない。
 
 ### 8.4 補正レイヤー編集時の表示補助
 
@@ -954,10 +955,15 @@ struct LocalAdjustmentChange {
 
 ### 適用ロジック (`apply_adjustment_change_to_app`)
 
-スコープごとに既存の書き込み API を再利用するだけ — `set_page_params` /
-`clear_page_params` / `set_favorite_default` / `clear_favorite_default` /
-`copy_params_to_global`。これらは DB 更新・サイドカー更新・キャッシュ無効化を
-すべて内部で行うので、Undo 用に副作用を再実装する必要はない。
+スコープごとに既存の書き込み API を再利用する。ただし `Page(Some)` の復元は
+`set_page_params` の後に `clear_caches_for_param_change(old, new)` を通し、通常の
+スライダー / スロット適用と同じ final AI 差分無効化を行う。`set_page_params`
+単体は DB 更新・サイドカー更新・軽量な表示キャッシュ無効化までを担当し、
+final pipeline / AI cache の差分分類は呼び出し側責務。
+
+`Page(None)` は `clear_page_params`、お気に入りとグローバルは
+`set_favorite_default` / `clear_favorite_default` / `copy_params_to_global` を使う。
+これらの経路は通常操作と同じ副作用に乗せ、Undo 用に別の永続化経路を作らない。
 
 補正レイヤーは `apply_local_adjustment_change_to_app` で `before` / `after` の
 `Vec<LocalAdjustmentLayer>` を `set_local_adjust_layers_for_idx` へ戻す。これにより

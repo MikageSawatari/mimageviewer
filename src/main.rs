@@ -142,6 +142,7 @@ pub mod ui_text_links;
 #[cfg(windows)]
 #[cfg(windows)]
 pub mod ui_video_tile;
+mod ui_view_trim;
 mod undo_ops;
 pub mod undo_stack;
 pub mod update_check;
@@ -152,6 +153,8 @@ pub mod video_bookmarks_parser;
 pub mod video_chapter_thumbs;
 pub mod video_pins;
 pub mod video_thumb;
+pub mod view_trim;
+pub mod view_trim_db;
 pub mod wic_decoder;
 pub mod xmp_reader;
 pub mod xmp_writer;

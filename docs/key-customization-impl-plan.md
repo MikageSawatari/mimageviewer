@@ -19,8 +19,9 @@
   グリッド主要操作、egui/native 動画主要操作を keymap 経由にした。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
-  右ドラッグ、戻る / 進むボタン、Shift / Alt + ホイール、ゲームパッド X リングは
-  `Settings.ring_shortcuts` の小さな固定入力レイヤーで扱う。
+  右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは
+  `Settings.ring_shortcuts` の小さな固定入力レイヤーで扱う。UI 上はリングとマウスボタンを
+  別ページに分ける。
 
 ---
 
@@ -36,9 +37,11 @@
   経路だけは非消費なので衝突時は両方発火する = 仕様として明記)。
 - **MVP で対象外にする入力を明示する。** ゲームパッド、マウス操作、D&D、OS/egui の
   `Event::Copy` / `Event::Cut`、クリップボード paste、IME 確定、右クリックメニューは keymap.ini では固定扱い。
-  ただし右ドラッグ、戻る / 進むボタン、Shift / Alt + ホイール、ゲームパッド X リングは
-  `Settings.ring_shortcuts` 側で限定カスタマイズする。
-  将来対応する場合もキーボード keymap とは別フェーズにする。
+  ただし右ドラッグ、ゲームパッド X リング、戻る / 進むボタンは
+  `Settings.ring_shortcuts` 側で限定カスタマイズする。戻る / 進むボタンは
+  グリッド / 画像フルスクリーン / 動画フルスクリーンごとに単体アクションを割り当てる。
+  Shift / Alt + ホイールのカスタマイズは、グリッド / 画像 / 動画でルーティング差が大きいため
+  将来の別フェーズにする。
 - **入力パターンは 3 種、差し替え方向は固定** (design doc §8.6):
   - **Press** (通常キー押下、M=ルーペ・ロックトグル含む): キー↔通常キー / 修飾↔修飾 自由
   - **Modifier-hold** (Shift ルーペ): 修飾↔修飾のみ
@@ -465,8 +468,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - FsToggleWindowMode `F11` (固定)
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
-- BrowserBack/Forward、マウス戻る/進む、Shift / Alt + ホイールは
-  `Settings.ring_shortcuts` の固定入力レイヤーで扱う。通常ホイール、Ctrl+ホイール、クリックは固定。
+- BrowserBack/Forward、マウス戻る/進むは
+  `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
+  コンテキスト別に個別割り当て、通常ホイール、Ctrl+ホイール、クリックは固定。
 
 ### FsImage (Ph2) ★
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
@@ -541,7 +545,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ### 固定・対象外として明示するもの
 - Gamepad: `src/app/gamepad_input.rs` の閲覧専用ボタン/軸入力。
 - Mouse: 通常ホイール、Ctrl+ホイール、クリック、D&D、右クリックメニューは固定。
-  右ドラッグ、戻る/進む、Shift / Alt + ホイールは `Settings.ring_shortcuts` で限定カスタマイズ。
+  右ドラッグ、戻る/進むは `Settings.ring_shortcuts` で限定カスタマイズ。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
   ファイル削除ワーカー起動。
 - OS 状態参照: RightCtrl original preview、native presenter の一部 routing。

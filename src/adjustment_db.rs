@@ -4,7 +4,7 @@
 //! 旧 (v0.6.0 開発版) の `presets` テーブル / preset_idx 方式は廃止。
 //! 表示時の有効パラメータは `page_params.get(page) ?? settings.global_preset`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
@@ -328,6 +328,25 @@ impl AdjustmentDb {
         }
         map
     }
+
+    /// ページ個別パラメータが保存されているページキーを全件読み込む。
+    ///
+    /// スマートフィルタの状態ロールアップはファイルシステムや書庫を走査せず、
+    /// このキー集合を exact/prefix 判定することでコンテナ内の補正済みページを検出する。
+    /// `favorite_params` / グローバル標準はページ個別ではないため含めない。
+    pub fn load_page_param_keys(&self) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        let Ok(mut stmt) = self.conn.prepare("SELECT page_path FROM page_params") else {
+            return keys;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return keys;
+        };
+        for row in rows.flatten() {
+            keys.insert(row);
+        }
+        keys
+    }
 }
 
 /// パスを正規化 (小文字化 + バックスラッシュ→スラッシュ)。
@@ -396,6 +415,30 @@ mod tests {
         // 明示削除すれば消える
         db.remove_page_params(page).unwrap();
         assert!(db.get_page_params(page).is_none());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn db_load_page_param_keys_returns_all_page_params() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mimageviewer_page_param_keys_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let db = AdjustmentDb::open_at(&tmp).unwrap();
+
+        let plain = "c:/test/plain.jpg";
+        let ai = "c:/test/ai.jpg";
+        let mut ai_params = AdjustParams::default();
+        ai_params.upscale_model = Some("auto".to_string());
+
+        db.set_page_params(plain, &AdjustParams::default()).unwrap();
+        db.set_page_params(ai, &ai_params).unwrap();
+
+        let keys = db.load_page_param_keys();
+        assert!(keys.contains(ai));
+        assert!(keys.contains(plain));
 
         let _ = std::fs::remove_file(&tmp);
     }

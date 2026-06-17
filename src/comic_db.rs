@@ -156,6 +156,26 @@ impl ComicDb {
         }
         set
     }
+
+    /// テキスト注釈を持つページキーを全件返す。
+    ///
+    /// スマートフィルタの親コンテナ判定用。`doc_json` は読まない。
+    pub fn load_all_comic_keys(&self) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT page_path FROM comic_entries")
+        else {
+            return set;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return set;
+        };
+        for row in rows.flatten() {
+            set.insert(row);
+        }
+        set
+    }
 }
 
 #[cfg(test)]

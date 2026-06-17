@@ -525,10 +525,11 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 1. テクスチャ選択 (上記の優先順位)
 2. 回転 (rotation_db, 0/90/180/270)
 3. ユーザーのフリー回転 (fs_free_rotation, 一時的・非永続)
-4. フィットモード (ページ全体 / 余白カット / 横幅 / 縦幅 / 100%原寸)
-5. 自動フィット倍率制限 (`fullscreen_fit_no_upscale` / `fullscreen_fit_no_downscale`)
-6. Zoom (fs_zoom, 0.1〜50.0)
-7. Pan (fs_pan)
+4. 表示トリムの content bbox 決定
+5. フィットモード (ページ全体 / 横幅 / 縦幅 / 100%原寸)
+6. 自動フィット倍率制限 (`fullscreen_fit_no_upscale` / `fullscreen_fit_no_downscale`)
+7. Zoom (fs_zoom, 0.1〜50.0)
+8. Pan (fs_pan)
 ```
 
 `settings.fullscreen_fit_mode` は <kbd>0</kbd> で循環する。ホバーバーのフィットボタンは
@@ -536,13 +537,12 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 青でハイライトする (見開きボタンのポップアップと同型)。メニュー項目選択は
 `set_fullscreen_fit_mode_for_current` を直接呼び、<kbd>0</kbd> 循環 (`cycle_fullscreen_fit_mode`)
 とは別系統。メニュー候補は `FullscreenFitMode::selectable_for_flow` が返す
-(ページ表示=全5モード、連結読み=余白カットを除く4モード)。ページ単位へ切り替えたときはページ全体、
+(余白カットフィットを除く4モード)。ページ単位へ切り替えたときはページ全体、
 縦連結へ切り替えたときは横幅フィット、横連結へ切り替えたときは縦幅フィットに戻す。連結モード中は
-余白カットフィットを候補から外し、保存値が余白カットでも表示時は flow に応じた既定フィットへ
-フォールバックする。
+保存値が旧余白カットフィットでもページ全体フィットとして扱う。
 
 フィットメニュー下部の「拡大しない」「縮小しない」は `FullscreenFitScaleLimits` として
-自動フィット倍率にだけ適用する。つまりページ全体/横幅/縦幅/余白カットが求めた `fit_scale`
+自動フィット倍率にだけ適用する。つまりページ全体/横幅/縦幅が求めた `fit_scale`
 を 100% で clamp してから、ユーザー操作の `fs_zoom` を掛ける。明示的な Ctrl+ホイール、
 中ボタンドラッグ、ゲームパッド等の手動ズームは制限しない。`縮小しない` が ON の場合は
 ページ全体フィットでも 100% 表示で画面外へはみ出すことがあるため、`fullscreen_fit_allows_drag_pan`
@@ -552,12 +552,15 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 同じ基準を使う。右 Ctrl の元画像プレビューや分析モードでは raw 表示に合わせるため、raw
 サイズを優先する。
 
-**余白カットフィット** (`FullscreenFitMode::MarginFit`) は rotation/フリー回転なしのとき、
-ステップ 4 のフィットを「画像全体」ではなく「中身の bbox」基準にする。
-`fs_margin_bbox`(idx) が `margin_fit::detect_content_bbox` で
+旧 **余白カットフィット** (`FullscreenFitMode::MarginFit`) は設定互換入口としてだけ残している。
+新規 UI / <kbd>0</kbd> 循環 / フィットメニューには出さず、本を開いたタイミングで
+`fullscreen_fit_mode = Page` と表示トリム `Auto` へ移行する。表示トリムパネルの
+「自動余白カット」が同じ検出結果を使う。
+`cached_margin_bbox`(idx) が `margin_fit::detect_content_bbox` で
 中身の bounding box (正規化座標) を検出してキャッシュ (`fs_margin_bbox_cache`、
 `fs_cache` と同じタイミングでクリア) し、`draw_fs_image` が `fit_scale` を bbox サイズで
-求めて中心を bbox 中心へ寄せる (= 余白分ズームイン)。**ピクセルは一切変えない**ので補正/
+求めて中心を bbox 中心へ寄せる (= 余白分ズームイン)。描画時は bbox 外を描かず背景に落とすが、
+**ソースピクセルは一切変えない**ので補正/
 AI/エクスポートには無影響。
 
 検出は「全部映る」優先の頑健化版 ([margin_fit.rs](../src/margin_fit.rs)):
@@ -576,11 +579,40 @@ AI/エクスポートには無影響。
 診断: 余白カットモードへ切り替えた時に `log_margin_fit_diag` が各成分の面積・位置・各辺の決定要因を
 logger へ出力 (`[margin-fit diag]`)。
 
-**見開き (`draw_fs_spread`)** でも有効: 左右各ページの content bbox を `spread_content_union`
-で combined 空間 (左ページ x∈[0,left_w] / 右ページ x∈[left_w,left_w+right_w]) に写像して
-union を取り、セット全体の外周余白を詰める (bbox 無しのページは全域扱い=切らない)。
-`fit_scale` を union 基準にし、union 中心を画面中心へ寄せる。どちらかが回転していれば
-通常フィットにフォールバック。
+**見開き (`draw_fs_spread`)** でも有効: 左右各ページの content bbox をページ別に保持し、
+見える幅だけを `spread_page_gap_px` に合わせて詰める (bbox 無しのページは全域扱い=切らない)。
+中央側をトリムした場合も、切った領域を見開き中央に残さず、左右の見える端が設定 gap で並ぶ。
+`fit_scale` は左右の見える幅の合計と上下 bbox の union 高さを基準にし、描画時はページ全体
+rect のうち bbox 部分だけを UV 指定して描く。内部的にはトリム量によって左右のページ rect が
+重なることがあるため、`FsSpreadLayout` は UV 変換用のページ rect とヒットテスト用の見える rect
+を分けて保持する。どちらかが回転していれば通常フィットにフォールバック。
+
+**表示トリム** (`ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs`) は、
+漫画ビューア用途で読みながら使う表示専用トリム。左端 / 上端 / 右端ホバーで開く左パネルの
+`画像補正 / 表示トリム` タブから操作し、選択中タブは `Settings::fullscreen_left_panel_tab`
+へ保存する。
+本側の基本モードは `ViewTrimApplyMode::{None, Auto, Book}` のラジオで選ぶ。
+`None` は bbox を使わず、`Auto` は表示中ページごとに `cached_margin_bbox` を使う。
+`Book` は本全体設定を適用する。「このページの個別設定を適用」はチェックボックスで、
+チェックした現在ページだけ `Page` として一時適用し、前後ページへ移動すると自動で外れる。
+`Book` / チェック中の `Page` では、単ページ / 見開き連動 (上・下・中央側・外側) / 見開き左右別を
+0〜20% で調整する UI が展開される。スライダーを動かした対象は自動的にその手動モードで
+適用される。手動指定された bbox も、自動検出 bbox も、ページ全体 / 横幅 / 縦幅 /
+100% 原寸で fit 基準として使う。
+bbox 外は描画せず背景色を見せるだけで、
+`export_crop.rs` の切り取り、保存、Ctrl+E エクスポート、補正 / AI キャッシュには影響しない。
+見開きの「左右別」切替は値を移行し、連動→左右別では中央側/外側を左右ページへ展開、
+左右別→連動では中央側/外側/上下を平均値へ畳む。
+自動検出ボタンは `Book` / `Page` の手動設定へ現在ページの検出結果を流し込むための補助であり、
+`Auto` とは別物。`Auto` は保存済みの手動値を作らず、ページごとに検出する。
+旧 `FullscreenFitMode::MarginFit` が保存されている場合は、表示トリムの適用モード `Auto` と
+ページ全体フィットへ移行して保存する。
+基本適用モードと本全体設定は `view_trim.db::view_trim_books` に本キー
+(`spread_container_key` と同じ粒度。ネスト ZIP は zip_path + 実効 prefix) で保存する。
+ページ個別設定は `view_trim.db::view_trim_pages` に `page_path_key` で保存する。
+`Page` は本側の適用モードとしては保存せず、チェック状態もセッション中の現在ページに限る。
+`Auto` は「モード」だけ保存し、検出 bbox は保存しない。スライダードラッグ中はメモリだけ更新し、
+マウスを離したフレームで本設定と表示中ページの個別値をまとめて SQLite へ書き込む。
 
 Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする。

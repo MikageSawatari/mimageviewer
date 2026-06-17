@@ -5,7 +5,7 @@
 //! 中央 DB を authoritative にし、フォルダ移動時の復元用バックアップとして
 //! `mimageviewer.dat` にも同じレイヤー配列をミラーする。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use local_adjust_core::LocalAdjustmentLayer;
@@ -123,6 +123,26 @@ impl LocalAdjustDb {
             .replace('[', "\\[");
         let pattern = format!("{escaped}%");
         let Ok(rows) = stmt.query_map([&pattern], |row| row.get::<_, String>(0)) else {
+            return set;
+        };
+        for row in rows.flatten() {
+            set.insert(row);
+        }
+        set
+    }
+
+    /// 補正レイヤー行が存在するページキーを全件返す。
+    ///
+    /// スマートフィルタの親コンテナ判定用。巨大な `layers_json` は読まない。
+    pub fn load_all_layer_keys(&self) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT page_path FROM local_adjust_pages")
+        else {
+            return set;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
             return set;
         };
         for row in rows.flatten() {

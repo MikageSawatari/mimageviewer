@@ -94,7 +94,7 @@ Explorer 互換のカラム並びインポート。
 | サイズ | `image_metas[idx]` (同上。動画は `video_items`) |
 | ★レーティング | `get_rating(idx)` |
 | タグ | `cell_tag_list(idx)` |
-| 補正/ローカル補正/マスク/隠蔽/注釈/回転 | `adjustment_page_params` / `local_adjust_pages` / `mask_pages` / `conceal_pages` / `comic_pages` / `get_rotation` |
+| 補正/ローカル補正/マスク/隠蔽/注釈/回転 | `adjustment_page_params` / `adjusted_page_keys` / `local_adjust_page_keys` / `mask_page_keys` / `conceal_page_keys` / `comic_page_keys` / `rotation_page_keys` |
 | 📌ピン | `folder_pin_map` |
 
 **追加 I/O 必要 (第二弾。遅延ロード前提)**:
@@ -227,6 +227,18 @@ struct FacetFilter {
 - 種別・拡張子: distinct 値チェックボックス。
 - 編集: `補正 / ローカル補正 / マスク / 隠蔽 / 注釈 / 回転 / タグあり / ★あり` の有無。
   「補正済みだけ」「未整理 (タグ★無し) だけ」の一覧化が即できる。
+- 補正系状態の親ロールアップ: `補` / `レ` / `消` / `隠` / `文` / `回` は、画像ページ自身だけでなく、
+  そのページを含む ZIP / PDF / 変換アーカイブ / フォルダも対象にする。判定は各編集 DB の
+  page_path キー (`adjustment.db` / `local_adjust.db` / `mask.db` / `conceal.db` / `comic.db` /
+  `rotation.db`) を exact/prefix 判定する。フォルダは既定では直下の画像 / 直下の書庫だけを対象にし、
+  `子フォルダも対象` ON 時だけ子孫フォルダ配下も対象にする。ファイルシステムや書庫の中身は
+  フィルタ時に走査しない。グローバル標準・お気に入り標準の補正は対象外で、ページ個別設定
+  (`このフォルダの全画像に適用` によるコピーを含む) だけを `補` として扱う。
+- サムネイル左上の編集バッジ (`補` / `レ` / `消` / `隠` / `文`) と詳細表示の状態列
+  (`回` を含む) も同じ編集 DB キー集合から判定する。ただし表示上のロールアップは
+  「1 つ上の見える親」だけに限定し、子フォルダや直下書庫内ページをフォルダセルへさらに伝播しない。
+  通常の ZIP 内仮想フォルダは直下ページのみ、内側アーカイブとして表示される ZipDir はその本の
+  内部ページをまとめて示す。
 - AI: v1.7.0 で `png_metadata::AiMetadata` 由来の「モデル」「生成ツール」を追加。
   現在グリッドの遅延メタデータから distinct 値を集計し、グローバル索引には保存しない。
 

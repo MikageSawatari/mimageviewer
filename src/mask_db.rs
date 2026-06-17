@@ -977,6 +977,26 @@ impl MaskDb {
         set
     }
 
+    /// 消しゴムマスクを持つページキーを全件返す。スロットキーは除外する。
+    ///
+    /// スマートフィルタの親コンテナ判定用。BLOB は読まず、キー列だけを使う。
+    pub fn load_all_mask_keys(&self) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT path FROM masks
+             WHERE path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'",
+        ) else {
+            return set;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return set;
+        };
+        for row in rows.flatten() {
+            set.insert(row);
+        }
+        set
+    }
+
     fn upsert_mask(
         &self,
         key: &str,

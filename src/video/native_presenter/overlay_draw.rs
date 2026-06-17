@@ -1781,28 +1781,38 @@ pub(super) fn draw_native_toast(
 pub(super) fn native_ring_guide_overlay_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
-    _guide: &NativeOverlayRingGuide,
+    pixels_per_point: f32,
+    guide: &NativeOverlayRingGuide,
 ) -> egui::Rect {
     let margin = 16.0;
     let usable_w = (overlay_width_points - margin * 2.0).max(120.0);
     let usable_h = (overlay_height_points - margin * 2.0).max(120.0);
-    let radius = (overlay_width_points.min(overlay_height_points) * 0.18).clamp(72.0, 132.0);
-    let size = ((radius + 88.0) * 2.0).min(usable_w).min(usable_h);
-    egui::Rect::from_center_size(
-        egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
-        egui::vec2(size, size),
-    )
+    let radius = ring_guide_radius(overlay_width_points, overlay_height_points);
+    let size = ((radius + 116.0) * 2.0).min(usable_w).min(usable_h);
+    let center = guide.center_client_px.map_or_else(
+        || egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
+        |pos| {
+            let ppp = pixels_per_point.max(1.0);
+            egui::pos2(pos.x / ppp, pos.y / ppp)
+        },
+    );
+    egui::Rect::from_center_size(center, egui::vec2(size, size))
 }
 
 pub(super) fn draw_native_ring_guide_overlay(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
+    pixels_per_point: f32,
     guide: &NativeOverlayRingGuide,
 ) -> Option<egui::Rect> {
-    let outer_rect =
-        native_ring_guide_overlay_rect(overlay_width_points, overlay_height_points, guide);
-    let radius = ((outer_rect.width().min(outer_rect.height()) - 168.0) * 0.5).clamp(58.0, 132.0);
+    let outer_rect = native_ring_guide_overlay_rect(
+        overlay_width_points,
+        overlay_height_points,
+        pixels_per_point,
+        guide,
+    );
+    let radius = ((outer_rect.width().min(outer_rect.height()) - 224.0) * 0.5).clamp(120.0, 164.0);
     let area_response = egui::Area::new(egui::Id::new("native_video_ring_guide_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(outer_rect.min)
@@ -1812,106 +1822,140 @@ pub(super) fn draw_native_ring_guide_overlay(
             let panel_rect = egui::Rect::from_min_size(ui.min_rect().min, outer_rect.size());
             let center = panel_rect.center();
             let painter = ui.painter();
-            painter.circle_filled(
-                center,
-                radius + 82.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128),
-            );
-            painter.circle_stroke(
-                center,
-                radius + 82.0,
-                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(56)),
-            );
-
+            let inner_radius = 62.0_f32;
+            let outer_radius = radius + 46.0;
+            let label_radius = (inner_radius + outer_radius) * 0.5;
             for (idx, unit) in native_ring_direction_units().iter().enumerate() {
-                let pos = center + *unit * radius;
                 let is_selected = guide.selected_slot == Some(idx);
                 let fill = if is_selected {
-                    egui::Color32::from_rgb(72, 126, 190)
+                    egui::Color32::from_rgba_unmultiplied(72, 126, 190, 218)
                 } else {
-                    egui::Color32::from_black_alpha(170)
+                    egui::Color32::from_black_alpha(118)
                 };
                 let stroke = if is_selected {
                     egui::Stroke::new(2.0, egui::Color32::WHITE)
                 } else {
                     egui::Stroke::new(1.0, egui::Color32::from_white_alpha(120))
                 };
-                let circle_r = if is_selected { 25.0 } else { 21.0 };
-                painter.circle_filled(pos, circle_r, fill);
-                painter.circle_stroke(pos, circle_r, stroke);
-                let label = guide
-                    .slots
-                    .get(idx)
-                    .map(|slot| slot.short_label.as_str())
-                    .unwrap_or("");
-                painter.text(
-                    pos,
-                    egui::Align2::CENTER_CENTER,
-                    truncate_overlay_text(label, 4),
-                    egui::FontId::proportional(if is_selected { 14.0 } else { 12.5 }),
-                    egui::Color32::WHITE,
+                draw_native_annular_segment(
+                    painter,
+                    center,
+                    inner_radius,
+                    outer_radius,
+                    idx,
+                    fill,
+                    stroke,
                 );
                 let action_label = guide
                     .slots
                     .get(idx)
                     .map(|slot| slot.action_label.as_str())
                     .unwrap_or("");
-                let (align, offset) = native_ring_direction_action_label_layout(idx);
-                painter.text(
-                    pos + offset,
-                    align,
-                    truncate_overlay_text(action_label, 13),
-                    egui::FontId::proportional(if is_selected { 12.0 } else { 11.0 }),
-                    egui::Color32::from_white_alpha(if is_selected { 245 } else { 205 }),
+                draw_native_ring_segment_label(
+                    painter,
+                    center + *unit * label_radius,
+                    &truncate_overlay_text(action_label, 11),
+                    is_selected,
                 );
             }
-
-            let label_rect = egui::Rect::from_center_size(center, egui::vec2(230.0, 56.0));
-            painter.rect_filled(
-                label_rect,
-                8.0,
-                egui::Color32::from_black_alpha(if guide.selected_slot.is_some() {
-                    205
-                } else {
-                    175
-                }),
-            );
-            painter.rect_stroke(
-                label_rect,
-                8.0,
-                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110)),
-                egui::StrokeKind::Outside,
-            );
-            painter.text(
-                center + egui::vec2(0.0, -11.0),
-                egui::Align2::CENTER_CENTER,
-                truncate_overlay_text(&guide.heading, 18),
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_white_alpha(220),
-            );
-            painter.text(
-                center + egui::vec2(0.0, 11.0),
-                egui::Align2::CENTER_CENTER,
-                truncate_overlay_text(&guide.detail, 24),
-                egui::FontId::proportional(16.0),
-                egui::Color32::WHITE,
-            );
         });
 
     Some(area_response.response.rect)
 }
 
-fn native_ring_direction_action_label_layout(idx: usize) -> (egui::Align2, egui::Vec2) {
-    match idx {
-        0 => (egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -32.0)),
-        1 => (egui::Align2::LEFT_BOTTOM, egui::vec2(29.0, -27.0)),
-        2 => (egui::Align2::LEFT_CENTER, egui::vec2(34.0, 0.0)),
-        3 => (egui::Align2::LEFT_TOP, egui::vec2(29.0, 27.0)),
-        4 => (egui::Align2::CENTER_TOP, egui::vec2(0.0, 32.0)),
-        5 => (egui::Align2::RIGHT_TOP, egui::vec2(-29.0, 27.0)),
-        6 => (egui::Align2::RIGHT_CENTER, egui::vec2(-34.0, 0.0)),
-        _ => (egui::Align2::RIGHT_BOTTOM, egui::vec2(-29.0, -27.0)),
+fn ring_guide_radius(overlay_width_points: f32, overlay_height_points: f32) -> f32 {
+    (overlay_width_points.min(overlay_height_points) * 0.20).clamp(144.0, 164.0)
+}
+
+fn draw_native_annular_segment(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    inner_radius: f32,
+    outer_radius: f32,
+    idx: usize,
+    fill: egui::Color32,
+    stroke: egui::Stroke,
+) {
+    let mid = native_ring_direction_angle_rad(idx);
+    let half = std::f32::consts::PI / 8.0;
+    let start = mid - half;
+    let end = mid + half;
+    let steps = 8;
+    let mut outer_points = Vec::with_capacity(steps + 1);
+    let mut inner_points = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = start + (end - start) * i as f32 / steps as f32;
+        outer_points.push(native_ring_point(center, outer_radius, t));
+        inner_points.push(native_ring_point(center, inner_radius, t));
     }
+    for i in 0..steps {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                outer_points[i],
+                outer_points[i + 1],
+                inner_points[i + 1],
+                inner_points[i],
+            ],
+            fill,
+            egui::Stroke::NONE,
+        ));
+    }
+    painter.add(egui::Shape::line(outer_points.clone(), stroke));
+    painter.add(egui::Shape::line(inner_points.clone(), stroke));
+    painter.line_segment([outer_points[0], inner_points[0]], stroke);
+    painter.line_segment(
+        [*outer_points.last().unwrap(), *inner_points.last().unwrap()],
+        stroke,
+    );
+}
+
+fn draw_native_ring_segment_label(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    selected: bool,
+) {
+    let font = egui::FontId::proportional(if selected { 14.5 } else { 13.5 });
+    let color = egui::Color32::WHITE;
+    let galley = painter.layout_no_wrap(text.to_string(), font, color);
+    let padding = egui::vec2(8.0, 4.0);
+    let rect = egui::Rect::from_center_size(center, galley.size() + padding * 2.0);
+    painter.rect_filled(
+        rect,
+        4.0,
+        if selected {
+            egui::Color32::from_rgba_unmultiplied(22, 44, 72, 232)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 214)
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(
+            if selected { 1.4 } else { 1.0 },
+            egui::Color32::from_white_alpha(if selected { 210 } else { 150 }),
+        ),
+        egui::StrokeKind::Outside,
+    );
+    painter.galley(rect.min + padding, galley, color);
+}
+
+fn native_ring_direction_angle_rad(idx: usize) -> f32 {
+    match idx {
+        0 => -std::f32::consts::FRAC_PI_2,
+        1 => -std::f32::consts::FRAC_PI_4,
+        2 => 0.0,
+        3 => std::f32::consts::FRAC_PI_4,
+        4 => std::f32::consts::FRAC_PI_2,
+        5 => std::f32::consts::FRAC_PI_4 * 3.0,
+        6 => std::f32::consts::PI,
+        _ => -std::f32::consts::FRAC_PI_4 * 3.0,
+    }
+}
+
+fn native_ring_point(center: egui::Pos2, radius: f32, angle: f32) -> egui::Pos2 {
+    center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
 }
 
 fn native_ring_direction_units() -> &'static [egui::Vec2; 8] {
@@ -1929,6 +1973,27 @@ fn native_ring_direction_units() -> &'static [egui::Vec2; 8] {
     &UNITS
 }
 
+#[cfg(test)]
+mod ring_guide_tests {
+    use super::*;
+
+    #[test]
+    fn native_ring_guide_center_converts_client_pixels_to_points() {
+        let guide = NativeOverlayRingGuide {
+            heading: String::new(),
+            detail: String::new(),
+            selected_slot: None,
+            center_client_px: Some(egui::pos2(300.0, 150.0)),
+            slots: Vec::new(),
+        };
+
+        let rect = native_ring_guide_overlay_rect(800.0, 600.0, 1.5, &guide);
+
+        assert!((rect.center().x - 200.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.center().y - 100.0).abs() < 0.01, "{rect:?}");
+    }
+}
+
 pub(super) fn native_ring_picker_overlay_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
@@ -1940,8 +2005,8 @@ pub(super) fn native_ring_picker_overlay_rect(
     let row_h = 32.0;
     let desired_w = (overlay_width_points * 0.60).clamp(340.0, 560.0);
     let panel_w = desired_w.min(usable_w);
-    let desired_h = if picker.drill.is_some() {
-        188.0
+    let desired_h = if let Some(drill) = picker.drill.as_ref() {
+        104.0 + row_h * drill.items.len().max(1) as f32
     } else {
         96.0 + row_h * picker.rows.len() as f32
     };
@@ -1992,22 +2057,35 @@ pub(super) fn draw_native_ring_picker_overlay(
                                 .color(egui::Color32::from_white_alpha(200)),
                         );
                         ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(truncate_overlay_text(&drill.group_line, 44))
-                                .size(16.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.label(
-                            egui::RichText::new(truncate_overlay_text(&drill.item_line, 44))
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(truncate_overlay_text(&drill.selected_line, 48))
-                                .size(13.0)
-                                .color(egui::Color32::from_white_alpha(210)),
-                        );
+                        let row_h = 32.0;
+                        let selected = drill.selected.min(drill.items.len().saturating_sub(1));
+                        for (idx, item) in drill.items.iter().enumerate() {
+                            let is_selected = idx == selected;
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_h),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                rect,
+                                5.0,
+                                if is_selected {
+                                    egui::Color32::from_rgb(56, 94, 138)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                },
+                            );
+                            ui.painter().text(
+                                egui::pos2(rect.min.x + 10.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_overlay_text(item, 44),
+                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                                egui::Color32::from_white_alpha(if is_selected {
+                                    255
+                                } else {
+                                    215
+                                }),
+                            );
+                        }
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(truncate_overlay_text(&drill.footer, 54))
@@ -2016,12 +2094,24 @@ pub(super) fn draw_native_ring_picker_overlay(
                         );
                     } else {
                         let row_h = 32.0;
-                        for (idx, row) in picker.rows.iter().enumerate() {
+                        let available_h = (panel_rect.height() - 96.0).max(row_h);
+                        let visible_rows = ((available_h / row_h).floor() as usize)
+                            .max(1)
+                            .min(picker.rows.len().max(1));
+                        let start = selected_row
+                            .saturating_sub(visible_rows / 2)
+                            .min(picker.rows.len().saturating_sub(visible_rows));
+                        let end = (start + visible_rows).min(picker.rows.len());
+                        let mut first_row_rect = None;
+                        let mut last_row_rect = None;
+                        for (idx, row) in picker.rows.iter().enumerate().take(end).skip(start) {
                             let selected = idx == selected_row;
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), row_h),
                                 egui::Sense::hover(),
                             );
+                            first_row_rect.get_or_insert(rect);
+                            last_row_rect = Some(rect);
                             let fill = if selected {
                                 egui::Color32::from_rgb(56, 94, 138)
                             } else {
@@ -2029,7 +2119,12 @@ pub(super) fn draw_native_ring_picker_overlay(
                             };
                             ui.painter().rect_filled(rect, 5.0, fill);
                             let label_pos = egui::pos2(rect.min.x + 10.0, rect.center().y);
-                            let value_pos = egui::pos2(rect.max.x - 10.0, rect.center().y);
+                            let value_right = if picker.rows.len() > visible_rows {
+                                rect.max.x - 24.0
+                            } else {
+                                rect.max.x - 10.0
+                            };
+                            let value_pos = egui::pos2(value_right, rect.center().y);
                             ui.painter().text(
                                 label_pos,
                                 egui::Align2::LEFT_CENTER,
@@ -2045,6 +2140,15 @@ pub(super) fn draw_native_ring_picker_overlay(
                                 egui::Color32::WHITE,
                             );
                         }
+                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                            draw_native_overlay_scrollbar(
+                                ui.painter(),
+                                egui::Rect::from_min_max(first.min, last.max),
+                                picker.rows.len(),
+                                visible_rows,
+                                start,
+                            );
+                        }
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(truncate_overlay_text(&picker.footer, 54))
@@ -2056,6 +2160,36 @@ pub(super) fn draw_native_ring_picker_overlay(
         });
 
     Some(area_response.response.rect)
+}
+
+fn draw_native_overlay_scrollbar(
+    painter: &egui::Painter,
+    rows_rect: egui::Rect,
+    total_rows: usize,
+    visible_rows: usize,
+    scroll_top: usize,
+) {
+    if total_rows <= visible_rows || visible_rows == 0 {
+        return;
+    }
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rows_rect.max.x - 8.0, rows_rect.min.y + 4.0),
+        egui::pos2(rows_rect.max.x - 3.0, rows_rect.max.y - 4.0),
+    );
+    if track.height() <= 4.0 {
+        return;
+    }
+    painter.rect_filled(track, 2.5, egui::Color32::from_white_alpha(48));
+    let ratio = visible_rows as f32 / total_rows as f32;
+    let thumb_h = (track.height() * ratio).clamp(18.0, track.height());
+    let max_scroll = total_rows.saturating_sub(visible_rows).max(1) as f32;
+    let t = (scroll_top as f32 / max_scroll).clamp(0.0, 1.0);
+    let thumb_top = track.min.y + (track.height() - thumb_h) * t;
+    let thumb = egui::Rect::from_min_max(
+        egui::pos2(track.min.x, thumb_top),
+        egui::pos2(track.max.x, thumb_top + thumb_h),
+    );
+    painter.rect_filled(thumb, 2.5, egui::Color32::from_white_alpha(180));
 }
 
 /// 音量ノーマライズ スキャン中の進捗パネル (中央表示)。

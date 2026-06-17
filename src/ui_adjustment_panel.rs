@@ -30,15 +30,15 @@ use crate::local_adjust_catalog::{
 use crate::local_adjust_effect_ui::draw_effect_params;
 use crate::ui_fullscreen::SpreadPair;
 
-const HEADER_H: f32 = 36.0;
+const HEADER_H: f32 = 64.0;
+const TAB_ROW_H: f32 = 24.0;
 const SECTION_FONT: f32 = 12.0;
 /// ラベルの色（暗い背景で読みやすい白系）
 const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 
 /// 左パネルの幅
-// ヘッダーのツール入口アイコンは 6 個 (消しゴム/補正/隠蔽/切り取り/テキスト/エクスポート)。
-// 各 28px + gap 4px + 右余白 8px のクラスタと「画像補正」タイトルが衝突しないよう、
-// アイコン 1 個分 (約 32px) 広げて 292px にしている (テキスト注釈アイコン追加時に拡幅)。
+// ヘッダーには 画像補正 / 表示トリム のタブと、画像補正タブ用のツール入口アイコン
+// (消しゴム/補正/隠蔽/切り取り/テキスト/エクスポート) を置く。
 pub const LEFT_PANEL_WIDTH: f32 = 292.0;
 /// 左パネルの下端をウィンドウ下端から少し浮かせる余白。
 pub const LEFT_PANEL_BOTTOM_MARGIN: f32 = 20.0;
@@ -7033,6 +7033,38 @@ fn draw_header_icon_button(
     }
 }
 
+fn draw_left_panel_tab_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+    tab: crate::settings::FullscreenLeftPanelTab,
+    selected: &mut crate::settings::FullscreenLeftPanelTab,
+) -> bool {
+    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let active = *selected == tab;
+    let bg = if active {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
+    } else if resp.hovered() {
+        egui::Color32::from_rgba_unmultiplied(95, 95, 95, 210)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 180)
+    };
+    ui.painter().rect_filled(rect, 5.0, bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        tab.label(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    if resp.clicked() && !active {
+        *selected = tab;
+        true
+    } else {
+        false
+    }
+}
+
 fn local_adjust_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
     (full_rect.max.y - panel_pos.y - LOCAL_ADJUST_PANEL_BOTTOM_MARGIN)
         .max(LOCAL_ADJUST_PANEL_MIN_BODY_H + 40.0)
@@ -10945,17 +10977,17 @@ impl App {
             return;
         };
 
-        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) =
-            match self.resolve_spread_pair(fs_root_idx) {
-                SpreadPair::Double { left, right } => {
-                    let target = match self.adjust_spread_target {
-                        AdjustSpreadTarget::Left => left,
-                        AdjustSpreadTarget::Right => right,
-                    };
-                    (target, Some((left, right)))
-                }
-                SpreadPair::Single => (fs_root_idx, None),
-            };
+        let spread_pair = self.resolve_spread_pair(fs_root_idx);
+        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
+            SpreadPair::Double { left, right } => {
+                let target = match self.adjust_spread_target {
+                    AdjustSpreadTarget::Left => left,
+                    AdjustSpreadTarget::Right => right,
+                };
+                (target, Some((left, right)))
+            }
+            SpreadPair::Single => (fs_root_idx, None),
+        };
         self.ensure_local_adjust_layers_loaded(fs_idx);
         self.ensure_local_adjust_masks_match_source_dims(fs_idx);
         let layers = self
@@ -11390,17 +11422,17 @@ impl App {
         // 見開き Double 表示中は adjust_spread_target に応じて左/右ページを編集対象に。
         // Single では fs_root_idx をそのまま使う。以降の `fs_idx` は編集対象 idx を指し、
         // 補正値読み書きパスは単ページ経路と同一。
-        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) =
-            match self.resolve_spread_pair(fs_root_idx) {
-                SpreadPair::Double { left, right } => {
-                    let target = match self.adjust_spread_target {
-                        AdjustSpreadTarget::Left => left,
-                        AdjustSpreadTarget::Right => right,
-                    };
-                    (target, Some((left, right)))
-                }
-                SpreadPair::Single => (fs_root_idx, None),
-            };
+        let spread_pair = self.resolve_spread_pair(fs_root_idx);
+        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
+            SpreadPair::Double { left, right } => {
+                let target = match self.adjust_spread_target {
+                    AdjustSpreadTarget::Left => left,
+                    AdjustSpreadTarget::Right => right,
+                };
+                (target, Some((left, right)))
+            }
+            SpreadPair::Single => (fs_root_idx, None),
+        };
 
         let painter = ui.painter_at(panel_rect);
         painter.rect_filled(
@@ -11419,187 +11451,219 @@ impl App {
         child.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
         // ── ヘッダー ──
-        // タイトルを左寄せにし、右側に処理順の入口
-        // (消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート) を並べる。
-        // 補正レイヤーは独立左パネル、エクスポートは Ctrl+E と同じダイアログで開く。
+        // 左ホバーパネルは 画像補正 / 表示トリム のタブ式。
+        // 画像補正タブだけ、処理順の入口 (消しゴム / 補正レイヤー / 隠蔽加工 /
+        // 切り取り / テキスト / エクスポート) を 2 行目に並べる。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         const HEADER_BTN_SIZE: f32 = 28.0;
         const HEADER_BTN_GAP: f32 = 4.0;
         const HEADER_RIGHT_PAD: f32 = 8.0;
-        // タイトル左寄せ (本文と同じ左余白、CENTER_Y 縦中央)
-        child.painter().text(
-            egui::pos2(header_rect.min.x + BODY_PAD_LEFT, header_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            "画像補正",
-            egui::FontId::proportional(16.0),
-            egui::Color32::WHITE,
+        let mut selected_tab = self.settings.fullscreen_left_panel_tab;
+        let tab_gap = 4.0;
+        let tab_w =
+            ((header_rect.width() - BODY_PAD_LEFT - BODY_PAD_RIGHT - tab_gap) * 0.5).max(80.0);
+        let tab_y = header_rect.min.y + 6.0;
+        let tab_x = header_rect.min.x + BODY_PAD_LEFT;
+        let adjustment_tab_rect =
+            egui::Rect::from_min_size(egui::pos2(tab_x, tab_y), egui::vec2(tab_w, TAB_ROW_H));
+        let view_trim_tab_rect = egui::Rect::from_min_size(
+            egui::pos2(tab_x + tab_w + tab_gap, tab_y),
+            egui::vec2(tab_w, TAB_ROW_H),
         );
-        // 起動可能か (= 画像のみ。動画 / セパレータ / コンテナ は無効化)。
-        // `image_dims` が None なら未ロード / 非画像なので無効。
-        let can_overlay_edit = image_dims.is_some()
-            && matches!(
-                self.items.get(fs_idx),
-                Some(
-                    crate::grid_item::GridItem::Image(_)
-                        | crate::grid_item::GridItem::ZipImage { .. }
-                        | crate::grid_item::GridItem::PdfPage { .. }
-                )
+        let adjustment_tab_changed = draw_left_panel_tab_button(
+            &mut child,
+            adjustment_tab_rect,
+            "left_panel_adjustment_tab",
+            crate::settings::FullscreenLeftPanelTab::Adjustment,
+            &mut selected_tab,
+        );
+        let view_trim_tab_changed = draw_left_panel_tab_button(
+            &mut child,
+            view_trim_tab_rect,
+            "left_panel_view_trim_tab",
+            crate::settings::FullscreenLeftPanelTab::ViewTrim,
+            &mut selected_tab,
+        );
+        let tab_changed = adjustment_tab_changed || view_trim_tab_changed;
+        if tab_changed {
+            if self.settings.fullscreen_left_panel_tab
+                == crate::settings::FullscreenLeftPanelTab::ViewTrim
+                && selected_tab != crate::settings::FullscreenLeftPanelTab::ViewTrim
+            {
+                self.persist_pending_view_trim_state();
+            }
+            self.settings.fullscreen_left_panel_tab = selected_tab;
+            self.settings.save();
+            child.ctx().request_repaint();
+        }
+        if selected_tab == crate::settings::FullscreenLeftPanelTab::Adjustment {
+            // 起動可能か (= 画像のみ。動画 / セパレータ / コンテナ は無効化)。
+            // `image_dims` が None なら未ロード / 非画像なので無効。
+            let can_overlay_edit = image_dims.is_some()
+                && matches!(
+                    self.items.get(fs_idx),
+                    Some(
+                        crate::grid_item::GridItem::Image(_)
+                            | crate::grid_item::GridItem::ZipImage { .. }
+                            | crate::grid_item::GridItem::PdfPage { .. }
+                    )
+                );
+            // 右側 6 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト / エクスポート。
+            // テキストは comic 注釈モード (最前面・パイプライン最終段) なので crop と export の間に置く。
+            let btn_y = header_rect.min.y + 34.0;
+            let export_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
+            let text_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+            let crop_btn_x = text_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+            let conceal_btn_x = crop_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+            let local_adjust_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+            let erase_btn_x = local_adjust_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+            let erase_rect = egui::Rect::from_min_size(
+                egui::pos2(erase_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
             );
-        // 右側 6 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト / エクスポート。
-        // テキストは comic 注釈モード (最前面・パイプライン最終段) なので crop と export の間に置く。
-        let btn_y = header_rect.center().y - HEADER_BTN_SIZE / 2.0;
-        let export_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
-        let text_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let crop_btn_x = text_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let conceal_btn_x = crop_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let local_adjust_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let erase_btn_x = local_adjust_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let erase_rect = egui::Rect::from_min_size(
-            egui::pos2(erase_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
-        let local_adjust_rect = egui::Rect::from_min_size(
-            egui::pos2(local_adjust_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
-        let conceal_rect = egui::Rect::from_min_size(
-            egui::pos2(conceal_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
-        let crop_rect = egui::Rect::from_min_size(
-            egui::pos2(crop_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
-        let text_rect = egui::Rect::from_min_size(
-            egui::pos2(text_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
-        let export_rect = egui::Rect::from_min_size(
-            egui::pos2(export_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
-        let mut activate_erase = false;
-        let mut activate_local_adjust = false;
-        let mut activate_conceal = false;
-        let mut activate_crop = false;
-        let mut activate_text = false;
-        let mut activate_export = false;
+            let local_adjust_rect = egui::Rect::from_min_size(
+                egui::pos2(local_adjust_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+            );
+            let conceal_rect = egui::Rect::from_min_size(
+                egui::pos2(conceal_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+            );
+            let crop_rect = egui::Rect::from_min_size(
+                egui::pos2(crop_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+            );
+            let text_rect = egui::Rect::from_min_size(
+                egui::pos2(text_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+            );
+            let export_rect = egui::Rect::from_min_size(
+                egui::pos2(export_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+            );
+            let mut activate_erase = false;
+            let mut activate_local_adjust = false;
+            let mut activate_conceal = false;
+            let mut activate_crop = false;
+            let mut activate_text = false;
+            let mut activate_export = false;
 
-        let erase_resp = draw_header_icon_button(
-            &mut child,
-            erase_rect,
-            "adjust_panel_erase_btn",
-            can_overlay_edit,
-            false,
-            "消しゴム (E)",
-            crate::ui_fullscreen::draw_icons::draw_eraser_icon,
-        );
-        if can_overlay_edit && erase_resp.clicked() {
-            activate_erase = true;
-        }
+            let erase_resp = draw_header_icon_button(
+                &mut child,
+                erase_rect,
+                "adjust_panel_erase_btn",
+                can_overlay_edit,
+                false,
+                "消しゴム (E)",
+                crate::ui_fullscreen::draw_icons::draw_eraser_icon,
+            );
+            if can_overlay_edit && erase_resp.clicked() {
+                activate_erase = true;
+            }
 
-        let local_adjust_resp = draw_header_icon_button(
-            &mut child,
-            local_adjust_rect,
-            "adjust_panel_local_adjust_btn",
-            can_overlay_edit,
-            false,
-            "補正レイヤー",
-            crate::ui_fullscreen::draw_icons::draw_local_adjust_icon,
-        );
-        if can_overlay_edit && local_adjust_resp.clicked() {
-            activate_local_adjust = true;
-        }
+            let local_adjust_resp = draw_header_icon_button(
+                &mut child,
+                local_adjust_rect,
+                "adjust_panel_local_adjust_btn",
+                can_overlay_edit,
+                false,
+                "補正レイヤー",
+                crate::ui_fullscreen::draw_icons::draw_local_adjust_icon,
+            );
+            if can_overlay_edit && local_adjust_resp.clicked() {
+                activate_local_adjust = true;
+            }
 
-        let conceal_resp = draw_header_icon_button(
-            &mut child,
-            conceal_rect,
-            "adjust_panel_conceal_btn",
-            can_overlay_edit,
-            false,
-            "隠蔽加工 (Ctrl+M)",
-            crate::ui_fullscreen::draw_icons::draw_mosaic_icon,
-        );
-        if can_overlay_edit && conceal_resp.clicked() {
-            activate_conceal = true;
-        }
+            let conceal_resp = draw_header_icon_button(
+                &mut child,
+                conceal_rect,
+                "adjust_panel_conceal_btn",
+                can_overlay_edit,
+                false,
+                "隠蔽加工 (Ctrl+M)",
+                crate::ui_fullscreen::draw_icons::draw_mosaic_icon,
+            );
+            if can_overlay_edit && conceal_resp.clicked() {
+                activate_conceal = true;
+            }
 
-        let crop_resp = draw_header_icon_button(
-            &mut child,
-            crop_rect,
-            "adjust_panel_crop_btn",
-            can_overlay_edit,
-            false,
-            "切り取り",
-            crate::ui_fullscreen::draw_icons::draw_crop_icon,
-        );
-        if can_overlay_edit && crop_resp.clicked() {
-            activate_crop = true;
-        }
+            let crop_resp = draw_header_icon_button(
+                &mut child,
+                crop_rect,
+                "adjust_panel_crop_btn",
+                can_overlay_edit,
+                false,
+                "切り取り",
+                crate::ui_fullscreen::draw_icons::draw_crop_icon,
+            );
+            if can_overlay_edit && crop_resp.clicked() {
+                activate_crop = true;
+            }
 
-        let text_resp = draw_header_icon_button(
-            &mut child,
-            text_rect,
-            "adjust_panel_text_btn",
-            can_overlay_edit,
-            false,
-            "テキスト注釈 (Ctrl+T)",
-            crate::ui_fullscreen::draw_icons::draw_text_icon,
-        );
-        if can_overlay_edit && text_resp.clicked() {
-            activate_text = true;
-        }
+            let text_resp = draw_header_icon_button(
+                &mut child,
+                text_rect,
+                "adjust_panel_text_btn",
+                can_overlay_edit,
+                false,
+                "テキスト注釈 (Ctrl+T)",
+                crate::ui_fullscreen::draw_icons::draw_text_icon,
+            );
+            if can_overlay_edit && text_resp.clicked() {
+                activate_text = true;
+            }
 
-        let export_resp = draw_header_icon_button(
-            &mut child,
-            export_rect,
-            "adjust_panel_export_btn",
-            can_overlay_edit,
-            false,
-            "エクスポート",
-            crate::ui_fullscreen::draw_icons::draw_export_icon,
-        );
-        if can_overlay_edit && export_resp.clicked() {
-            activate_export = true;
-        }
-        // クリック処理は描画後にディスパッチ (借用衝突回避)。
-        // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
-        // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
-        // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
-        // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
-        if activate_local_adjust {
-            self.adjustment_mode = false;
-            self.local_adjust_mode = true;
-            self.local_adjust_show_source = false;
-            self.local_adjust_show_mask = true;
-            return;
-        }
-        if activate_erase {
-            self.adjustment_mode = false;
-            self.enter_erase_mode(fs_root_idx);
-            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
-        }
-        if activate_conceal {
-            self.adjustment_mode = false;
-            self.enter_conceal_mode(fs_root_idx);
-            return;
-        }
-        if activate_crop {
-            self.adjustment_mode = false;
-            self.enter_export_crop_mode(fs_root_idx);
-            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
-        }
-        if activate_text {
-            self.adjustment_mode = false;
-            self.enter_text_mode(fs_root_idx);
-            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
-        }
-        if activate_export {
-            self.adjustment_mode = false;
-            let ctx = child.ctx().clone();
-            self.open_export_dialog_for_current(&ctx, fs_idx);
-            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+            let export_resp = draw_header_icon_button(
+                &mut child,
+                export_rect,
+                "adjust_panel_export_btn",
+                can_overlay_edit,
+                false,
+                "エクスポート",
+                crate::ui_fullscreen::draw_icons::draw_export_icon,
+            );
+            if can_overlay_edit && export_resp.clicked() {
+                activate_export = true;
+            }
+            // クリック処理は描画後にディスパッチ (借用衝突回避)。
+            // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
+            // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
+            // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
+            // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
+            if activate_local_adjust {
+                self.adjustment_mode = false;
+                self.local_adjust_mode = true;
+                self.local_adjust_show_source = false;
+                self.local_adjust_show_mask = true;
+                return;
+            }
+            if activate_erase {
+                self.adjustment_mode = false;
+                self.enter_erase_mode(fs_root_idx);
+                return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+            }
+            if activate_conceal {
+                self.adjustment_mode = false;
+                self.enter_conceal_mode(fs_root_idx);
+                return;
+            }
+            if activate_crop {
+                self.adjustment_mode = false;
+                self.enter_export_crop_mode(fs_root_idx);
+                return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+            }
+            if activate_text {
+                self.adjustment_mode = false;
+                self.enter_text_mode(fs_root_idx);
+                return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+            }
+            if activate_export {
+                self.adjustment_mode = false;
+                let ctx = child.ctx().clone();
+                self.open_export_dialog_for_current(&ctx, fs_idx);
+                return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+            }
         }
 
         // ── R5: パネル body 全体を 1 つの ScrollArea で囲む ──
@@ -11609,7 +11673,7 @@ impl App {
         // 沈んで触れない」「補正パネルだけ全体スクロールが効かない」状態だった
         // (実機 FB R5: 「画像補正パネルはまだ中央部分だけスクロールします」)。
         //
-        // 新方針: ヘッダ (HEADER_H = 36px) は絶対位置で固定し、それより下を 1 つの
+        // 新方針: ヘッダ (HEADER_H = 64px) は絶対位置で固定し、それより下を 1 つの
         // ScrollArea でフロー配置する。
         let body_rect = egui::Rect::from_min_max(
             egui::pos2(
@@ -11622,6 +11686,26 @@ impl App {
         let body_height = body_rect.height();
         let body_width = body_rect.width();
         let content_width = (body_width - BODY_SCROLLBAR_RESERVE).max(120.0);
+
+        if selected_tab == crate::settings::FullscreenLeftPanelTab::ViewTrim {
+            let ctx = child.ctx().clone();
+            body_child.allocate_ui_with_layout(
+                egui::vec2(body_width, body_height),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(content_width);
+                    self.draw_view_trim_controls(
+                        ui,
+                        &ctx,
+                        fs_root_idx,
+                        spread_pair,
+                        content_width,
+                        body_height,
+                    );
+                },
+            );
+            return;
+        }
 
         let mut apply_all_clicked = false;
         let mut clear_all_clicked = false;

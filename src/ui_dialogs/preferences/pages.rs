@@ -1,7 +1,6 @@
 use super::*;
 use crate::ring_shortcut::{
-    MouseBackForwardActionId, RingActionId, RingDirection, RingShortcutContext,
-    RingShortcutSettings, WheelPairActionId,
+    RingActionId, RingDirection, RingShortcutContext, RingShortcutSettings,
 };
 use crate::settings::{
     self, AiFeatureMode, CachePolicy, FullscreenFitMode, FullscreenJumpMode, Parallelism,
@@ -682,50 +681,78 @@ pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState
     ui.small("X 単体で開くピッカーパネルの項目は固定で、この画面では変更しません。");
 
     ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new("マウスボタン/ホイール").strong());
-    egui::Grid::new("ring_shortcut_mouse_bindings")
-        .num_columns(2)
-        .spacing([10.0, 6.0])
-        .show(ui, |ui| {
-            ui.label("戻る/進むボタン");
-            egui::ComboBox::from_id_salt("mouse_back_forward_action")
-                .width(220.0)
-                .selected_text(settings.mouse_back_forward_action.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut settings.mouse_back_forward_action,
-                        MouseBackForwardActionId::FolderHistoryPrevNext,
-                        MouseBackForwardActionId::FolderHistoryPrevNext.label(),
-                    );
-                    ui.selectable_value(
-                        &mut settings.mouse_back_forward_action,
-                        MouseBackForwardActionId::TreeFolderPrevNext,
-                        MouseBackForwardActionId::TreeFolderPrevNext.label(),
-                    );
-                });
-            ui.end_row();
-
-            wheel_pair_combo(ui, "Shift+ホイール", &mut settings.shift_wheel_pair);
-            wheel_pair_combo(ui, "Alt+ホイール", &mut settings.alt_wheel_pair);
-        });
-    ui.small("ホイールペアは設定した組み合わせが現在画面で有効なときだけ消費し、それ以外は従来のホイール操作に戻ります。");
-
-    ui.add_space(10.0);
     for &context in RingShortcutContext::all() {
         ring_shortcut_context_editor(ui, settings, context);
     }
 }
 
-fn wheel_pair_combo(ui: &mut egui::Ui, label: &'static str, value: &mut WheelPairActionId) {
+pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let settings = &mut state.settings.ring_shortcuts;
+
+    ui.small("戻る/進むボタンは、リングショートカットと同じ単発アクションから選べます。");
+    ui.small("割り当てはグリッド、画像フルスクリーン、動画フルスクリーンで別々に保存します。");
+
+    ui.add_space(8.0);
+    for &context in RingShortcutContext::all() {
+        mouse_button_context_editor(ui, settings, context);
+    }
+}
+
+fn mouse_button_context_editor(
+    ui: &mut egui::Ui,
+    settings: &mut RingShortcutSettings,
+    context: RingShortcutContext,
+) {
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(context.label()).strong());
+        if ui.button("既定に戻す").clicked() {
+            settings.reset_mouse_button_profile(context);
+        }
+    });
+
+    let available = RingActionId::available_for_context(context);
+    let profile = settings.mouse_button_profile_mut(context);
+    profile.sanitize(context);
+    egui::Grid::new(("mouse_button_bindings", context))
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            mouse_button_action_combo(
+                ui,
+                ("mouse_button_action", context, "back"),
+                "戻るボタン",
+                &mut profile.back,
+                &available,
+                context,
+            );
+            mouse_button_action_combo(
+                ui,
+                ("mouse_button_action", context, "forward"),
+                "進むボタン",
+                &mut profile.forward,
+                &available,
+                context,
+            );
+        });
+}
+
+fn mouse_button_action_combo(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    label: &'static str,
+    value: &mut RingActionId,
+    available: &[RingActionId],
+    context: RingShortcutContext,
+) {
     ui.label(label);
-    egui::ComboBox::from_id_salt(("wheel_pair", label))
+    egui::ComboBox::from_id_salt(id)
         .width(220.0)
-        .selected_text(value.label())
+        .selected_text(value.label_for_context(context))
         .show_ui(ui, |ui| {
-            for action in WheelPairActionId::available() {
-                ui.selectable_value(value, action.clone(), action.label());
+            for action in available {
+                ui.selectable_value(value, action.clone(), action.label_for_context(context));
             }
         });
     ui.end_row();

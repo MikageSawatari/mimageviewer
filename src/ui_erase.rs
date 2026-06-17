@@ -2502,6 +2502,7 @@ impl App {
             Some(v) => v,
             None => {
                 self.mask_pages.remove(&fs_idx);
+                self.mask_page_keys.remove(&key);
                 return None;
             }
         };
@@ -2509,6 +2510,7 @@ impl App {
         crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
         if !composite.iter().any(|&m| m) {
             self.mask_pages.remove(&fs_idx);
+            self.mask_page_keys.remove(&key);
             return None;
         }
         self.run_inpaint_and_cache(ctx, fs_idx, source, composite, w, h, "ensure-result", false);
@@ -2671,6 +2673,7 @@ impl App {
             // ensure_erase_result_texture と同じく、composite 空のときは mask_pages
             // からも外しておく (badge 一貫性、Phase 1-5 code-review CONFIRMED)。
             self.mask_pages.remove(&idx);
+            self.mask_page_keys.remove(&key);
             return;
         }
 

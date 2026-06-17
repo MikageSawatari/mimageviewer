@@ -6,7 +6,7 @@
 #   1. Stops mimageviewer-* processes started from this repo or extracted to APPDATA
 #   2. Polls for file-handle release (up to 10 seconds)
 #   3. Rebuilds the VST3 C++ bridge before core embeds it
-#   4. Builds release core + launcher (extra cargo args are passed through)
+#   4. Builds release core + launcher with CARGO_INCREMENTAL=0 (extra cargo args are passed through)
 #   5. Clears the extracted VST3 bridge cache so next launch re-extracts it
 #
 # Usage:
@@ -58,6 +58,30 @@ function Ensure-LibclangPath {
             $env:LIBCLANG_PATH = $found.DirectoryName
             Write-Host ("[build-release] using LIBCLANG_PATH={0}" -f $found.DirectoryName)
             return
+        }
+    }
+}
+
+function Invoke-ReleaseCargo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $Args
+    )
+
+    # Cargo.toml keeps release incremental enabled for local rebuild speed, but
+    # ThinLTO + rust-lld has produced stale incremental objects with unresolved
+    # SIMD symbols in release packaging builds. The wrapper favors reliability.
+    $oldCargoIncremental = $env:CARGO_INCREMENTAL
+    $hadCargoIncremental = Test-Path Env:CARGO_INCREMENTAL
+    $env:CARGO_INCREMENTAL = '0'
+    try {
+        & cargo @Args
+        return $LASTEXITCODE
+    } finally {
+        if ($hadCargoIncremental) {
+            $env:CARGO_INCREMENTAL = $oldCargoIncremental
+        } else {
+            Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue
         }
     }
 }
@@ -249,15 +273,15 @@ Ensure-LibclangPath
 
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
-Write-Host ("[build-release] (2/3) cargo {0}" -f ($coreCmd -join ' '))
-& cargo @coreCmd
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host ("[build-release] (2/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
+$coreExit = Invoke-ReleaseCargo -Args $coreCmd
+if ($coreExit -ne 0) { exit $coreExit }
 
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
-Write-Host ("[build-release] (3/3) cargo {0}" -f ($launcherCmd -join ' '))
-& cargo @launcherCmd
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host ("[build-release] (3/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
+$launcherExit = Invoke-ReleaseCargo -Args $launcherCmd
+if ($launcherExit -ne 0) { exit $launcherExit }
 
 $extractedBridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
 $extractedBridgeHash = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe.sha256'

@@ -687,6 +687,95 @@ impl crate::app::App {
         nav
     }
 
+    pub(crate) fn copy_item_path_to_clipboard(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        let Some(item) = self.items.get(idx).cloned() else {
+            return false;
+        };
+        let text = match item {
+            GridItem::Image(path)
+            | GridItem::Video(path)
+            | GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path) => native_path_text(&path),
+            GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
+                native_path_text(&path)
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            }
+            | GridItem::ZipDir {
+                zip_path,
+                dir_prefix: entry_name,
+                ..
+            } => format!("{}:{}", native_path_text(&zip_path), entry_name),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
+            GridItem::ZipSeparator { .. } => return false,
+        };
+        ctx.copy_text(text);
+        true
+    }
+
+    pub(crate) fn copy_item_file_name_to_clipboard(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> bool {
+        let Some(item) = self.items.get(idx) else {
+            return false;
+        };
+        let name = item.name().to_string();
+        if name.is_empty() {
+            return false;
+        }
+        ctx.copy_text(name);
+        true
+    }
+
+    pub(crate) fn copy_item_image_to_clipboard(&mut self, idx: usize) -> bool {
+        let Some(item) = self.items.get(idx).cloned() else {
+            return false;
+        };
+        let rotation = self.get_rotation(idx);
+        match item {
+            GridItem::Image(path) => {
+                copy_image_to_clipboard(&path, rotation);
+                true
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                copy_zip_image_to_clipboard(&zip_path, &entry_name, rotation);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn open_item_folder_in_explorer(&mut self, idx: usize) -> bool {
+        let Some(item) = self.items.get(idx).cloned() else {
+            return false;
+        };
+        let path = match item {
+            GridItem::Image(path)
+            | GridItem::Video(path)
+            | GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path) => path,
+            GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
+                path
+            }
+            GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => zip_path,
+            GridItem::PdfPage { pdf_path, .. } => pdf_path,
+            GridItem::ZipSeparator { .. } => return false,
+        };
+        open_folder_in_explorer(&path);
+        true
+    }
+
     fn try_show_native_grid_context_menu(
         &mut self,
         ctx: &egui::Context,
@@ -1095,7 +1184,7 @@ impl crate::app::App {
     }
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。
-    /// 右クリック長押しでトリガーされる。
+    /// 移動なし右クリックでトリガーされる。
     /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。
     pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> bool {
         let idx = match self.fs_context_menu_idx {
@@ -1114,6 +1203,25 @@ impl crate::app::App {
         let mut close = false;
         let mut close_fullscreen = false;
         let pos = self.fs_context_menu_pos;
+
+        match self.try_show_native_grid_context_menu(
+            ctx,
+            pos,
+            idx,
+            item.clone(),
+            false,
+            false,
+            false,
+            None,
+        ) {
+            NativeGridContextMenuOutcome::Consumed(_) => {
+                self.fs_context_menu_idx = None;
+                self.cached_handlers = None;
+                ctx.request_repaint();
+                return false;
+            }
+            NativeGridContextMenuOutcome::Fallback => {}
+        }
 
         let mut open = true;
         egui::Window::new("fs_context_menu")

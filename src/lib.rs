@@ -128,6 +128,8 @@ pub mod video_bookmarks;
 pub mod video_bookmarks_parser;
 pub mod video_chapter_thumbs;
 pub mod video_pins;
+pub mod view_trim;
+pub mod view_trim_db;
 pub mod wic_decoder;
 pub mod xmp_reader;
 pub mod xmp_writer;

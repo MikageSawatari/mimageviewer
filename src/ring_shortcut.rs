@@ -4,6 +4,7 @@
 //! module keeps the persisted action ids, context filtering, and defaults in one
 //! place so preferences UI and future input dispatch use the same inventory.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub const RING_SHORTCUT_SLOT_COUNT: usize = 8;
 pub const MOUSE_FLICK_MOVE_THRESHOLD_PX: f32 = 20.0;
+pub const MOUSE_FLICK_NEUTRAL_RADIUS_PX: f32 = 48.0;
 pub const MOUSE_FLICK_GUIDE_DELAY_MS: u64 = 170;
 pub const MOUSE_FLICK_MENU_DELAY_MS: u64 = 400;
 
@@ -116,6 +118,10 @@ pub enum RingActionId {
     GridHistoryBack,
     GridHistoryForward,
     GridParentFolder,
+    TreeFolderPrev,
+    TreeFolderNext,
+    SiblingFolderPrev,
+    SiblingFolderNext,
     ImageRotateLeft,
     ImageRotateRight,
     ImageCapture,
@@ -124,10 +130,16 @@ pub enum RingActionId {
     ImagePixelGrid,
     ImageBackgroundCycle,
     ImageComparePin,
+    ImageCopyToClipboard,
+    ImageOpenFolder,
+    ImageCopyPath,
+    ImageCopyFileName,
     VideoCapture,
     VideoMute,
     VideoLoop,
     VideoBookmark,
+    VideoMarkerPrev,
+    VideoMarkerNext,
     VideoTileMode,
     VideoExternalPlayer,
     Unknown(String),
@@ -148,6 +160,10 @@ impl RingActionId {
             Self::GridHistoryBack => "grid_history_back",
             Self::GridHistoryForward => "grid_history_forward",
             Self::GridParentFolder => "grid_parent_folder",
+            Self::TreeFolderPrev => "tree_folder_prev",
+            Self::TreeFolderNext => "tree_folder_next",
+            Self::SiblingFolderPrev => "sibling_folder_prev",
+            Self::SiblingFolderNext => "sibling_folder_next",
             Self::ImageRotateLeft => "image_rotate_left",
             Self::ImageRotateRight => "image_rotate_right",
             Self::ImageCapture => "image_capture",
@@ -156,10 +172,16 @@ impl RingActionId {
             Self::ImagePixelGrid => "image_pixel_grid",
             Self::ImageBackgroundCycle => "image_background_cycle",
             Self::ImageComparePin => "image_compare_pin",
+            Self::ImageCopyToClipboard => "image_copy_to_clipboard",
+            Self::ImageOpenFolder => "image_open_folder",
+            Self::ImageCopyPath => "image_copy_path",
+            Self::ImageCopyFileName => "image_copy_file_name",
             Self::VideoCapture => "video_capture",
             Self::VideoMute => "video_mute",
             Self::VideoLoop => "video_loop",
             Self::VideoBookmark => "video_bookmark",
+            Self::VideoMarkerPrev => "video_marker_prev",
+            Self::VideoMarkerNext => "video_marker_next",
             Self::VideoTileMode => "video_tile_mode",
             Self::VideoExternalPlayer => "video_external_player",
             Self::Unknown(s) => s.as_str(),
@@ -180,6 +202,10 @@ impl RingActionId {
             "grid_history_back" => Self::GridHistoryBack,
             "grid_history_forward" => Self::GridHistoryForward,
             "grid_parent_folder" => Self::GridParentFolder,
+            "tree_folder_prev" => Self::TreeFolderPrev,
+            "tree_folder_next" => Self::TreeFolderNext,
+            "sibling_folder_prev" => Self::SiblingFolderPrev,
+            "sibling_folder_next" => Self::SiblingFolderNext,
             "image_rotate_left" => Self::ImageRotateLeft,
             "image_rotate_right" => Self::ImageRotateRight,
             "image_capture" => Self::ImageCapture,
@@ -188,10 +214,16 @@ impl RingActionId {
             "image_pixel_grid" => Self::ImagePixelGrid,
             "image_background_cycle" => Self::ImageBackgroundCycle,
             "image_compare_pin" => Self::ImageComparePin,
+            "image_copy_to_clipboard" => Self::ImageCopyToClipboard,
+            "image_open_folder" => Self::ImageOpenFolder,
+            "image_copy_path" => Self::ImageCopyPath,
+            "image_copy_file_name" => Self::ImageCopyFileName,
             "video_capture" => Self::VideoCapture,
             "video_mute" => Self::VideoMute,
             "video_loop" => Self::VideoLoop,
             "video_bookmark" => Self::VideoBookmark,
+            "video_marker_prev" => Self::VideoMarkerPrev,
+            "video_marker_next" => Self::VideoMarkerNext,
             "video_tile_mode" => Self::VideoTileMode,
             "video_external_player" => Self::VideoExternalPlayer,
             _ => return None,
@@ -218,6 +250,10 @@ impl RingActionId {
             Self::GridHistoryBack => "フォルダ履歴 戻る",
             Self::GridHistoryForward => "フォルダ履歴 進む",
             Self::GridParentFolder => "親フォルダへ",
+            Self::TreeFolderPrev => "ツリー順 前フォルダ",
+            Self::TreeFolderNext => "ツリー順 次フォルダ",
+            Self::SiblingFolderPrev => "兄弟フォルダ 前",
+            Self::SiblingFolderNext => "兄弟フォルダ 次",
             Self::ImageRotateLeft => "回転 L",
             Self::ImageRotateRight => "回転 R",
             Self::ImageCapture => "キャプチャ保存",
@@ -226,10 +262,16 @@ impl RingActionId {
             Self::ImagePixelGrid => "ピクセルグリッド",
             Self::ImageBackgroundCycle => "背景色サイクル",
             Self::ImageComparePin => "比較ピン",
+            Self::ImageCopyToClipboard => "画像をクリップボードにコピー",
+            Self::ImageOpenFolder => "フォルダを開く",
+            Self::ImageCopyPath => "パスをコピー",
+            Self::ImageCopyFileName => "ファイル名をコピー",
             Self::VideoCapture => "キャプチャ保存",
             Self::VideoMute => "ミュート",
             Self::VideoLoop => "ループ",
             Self::VideoBookmark => "ブックマーク追加",
+            Self::VideoMarkerPrev => "前のマーカー",
+            Self::VideoMarkerNext => "次のマーカー",
             Self::VideoTileMode => "タイルモード",
             Self::VideoExternalPlayer => "外部プレイヤーで開く",
             Self::Unknown(_) => "不明なアクション",
@@ -252,6 +294,10 @@ impl RingActionId {
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
                     | Self::GridParentFolder
+                    | Self::TreeFolderPrev
+                    | Self::TreeFolderNext
+                    | Self::SiblingFolderPrev
+                    | Self::SiblingFolderNext
             ),
             RingShortcutContext::ImageFullscreen => matches!(
                 self,
@@ -260,6 +306,12 @@ impl RingActionId {
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::CycleFavorite
+                    | Self::GridHistoryBack
+                    | Self::GridHistoryForward
+                    | Self::TreeFolderPrev
+                    | Self::TreeFolderNext
+                    | Self::SiblingFolderPrev
+                    | Self::SiblingFolderNext
                     | Self::ImageRotateLeft
                     | Self::ImageRotateRight
                     | Self::ImageCapture
@@ -268,6 +320,10 @@ impl RingActionId {
                     | Self::ImagePixelGrid
                     | Self::ImageBackgroundCycle
                     | Self::ImageComparePin
+                    | Self::ImageCopyToClipboard
+                    | Self::ImageOpenFolder
+                    | Self::ImageCopyPath
+                    | Self::ImageCopyFileName
             ),
             RingShortcutContext::VideoFullscreen => matches!(
                 self,
@@ -276,10 +332,18 @@ impl RingActionId {
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::CycleFavorite
+                    | Self::GridHistoryBack
+                    | Self::GridHistoryForward
+                    | Self::TreeFolderPrev
+                    | Self::TreeFolderNext
+                    | Self::SiblingFolderPrev
+                    | Self::SiblingFolderNext
                     | Self::VideoCapture
                     | Self::VideoMute
                     | Self::VideoLoop
                     | Self::VideoBookmark
+                    | Self::VideoMarkerPrev
+                    | Self::VideoMarkerNext
                     | Self::VideoTileMode
                     | Self::VideoExternalPlayer
             ),
@@ -301,6 +365,10 @@ impl RingActionId {
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
                 Self::GridParentFolder,
+                Self::TreeFolderPrev,
+                Self::TreeFolderNext,
+                Self::SiblingFolderPrev,
+                Self::SiblingFolderNext,
             ],
             RingShortcutContext::ImageFullscreen => vec![
                 Self::None,
@@ -308,6 +376,12 @@ impl RingActionId {
                 Self::PinRepresentativeThumb,
                 Self::ToggleDetachedViewer,
                 Self::CycleFavorite,
+                Self::GridHistoryBack,
+                Self::GridHistoryForward,
+                Self::TreeFolderPrev,
+                Self::TreeFolderNext,
+                Self::SiblingFolderPrev,
+                Self::SiblingFolderNext,
                 Self::ImageRotateLeft,
                 Self::ImageRotateRight,
                 Self::ImageCapture,
@@ -316,6 +390,10 @@ impl RingActionId {
                 Self::ImagePixelGrid,
                 Self::ImageBackgroundCycle,
                 Self::ImageComparePin,
+                Self::ImageCopyToClipboard,
+                Self::ImageOpenFolder,
+                Self::ImageCopyPath,
+                Self::ImageCopyFileName,
             ],
             RingShortcutContext::VideoFullscreen => vec![
                 Self::None,
@@ -323,10 +401,18 @@ impl RingActionId {
                 Self::PinRepresentativeThumb,
                 Self::ToggleDetachedViewer,
                 Self::CycleFavorite,
+                Self::GridHistoryBack,
+                Self::GridHistoryForward,
+                Self::TreeFolderPrev,
+                Self::TreeFolderNext,
+                Self::SiblingFolderPrev,
+                Self::SiblingFolderNext,
                 Self::VideoCapture,
                 Self::VideoMute,
                 Self::VideoLoop,
                 Self::VideoBookmark,
+                Self::VideoMarkerPrev,
+                Self::VideoMarkerNext,
                 Self::VideoTileMode,
                 Self::VideoExternalPlayer,
             ],
@@ -428,6 +514,58 @@ impl<'de> Deserialize<'de> for MouseBackForwardActionId {
         let value = String::deserialize(deserializer)?;
         Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MouseButtonProfile {
+    #[serde(default = "default_mouse_back_button_action")]
+    pub back: RingActionId,
+    #[serde(default = "default_mouse_forward_button_action")]
+    pub forward: RingActionId,
+}
+
+impl MouseButtonProfile {
+    pub fn new(back: RingActionId, forward: RingActionId) -> Self {
+        Self { back, forward }
+    }
+
+    pub fn action(&self, forward: bool) -> RingActionId {
+        if forward {
+            self.forward.clone()
+        } else {
+            self.back.clone()
+        }
+    }
+
+    pub fn sanitize(&mut self, context: RingShortcutContext) {
+        if !self.back.is_valid_for_context(context) {
+            self.back = RingActionId::None;
+        }
+        if !self.forward.is_valid_for_context(context) {
+            self.forward = RingActionId::None;
+        }
+    }
+}
+
+impl Default for MouseButtonProfile {
+    fn default() -> Self {
+        default_mouse_button_profile()
+    }
+}
+
+fn default_mouse_back_button_action() -> RingActionId {
+    RingActionId::GridHistoryBack
+}
+
+fn default_mouse_forward_button_action() -> RingActionId {
+    RingActionId::GridHistoryForward
+}
+
+fn default_mouse_button_profile() -> MouseButtonProfile {
+    MouseButtonProfile::new(
+        default_mouse_back_button_action(),
+        default_mouse_forward_button_action(),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -584,12 +722,19 @@ pub struct RingShortcutSettings {
     pub mouse_flick_enabled: bool,
     #[serde(default = "default_true")]
     pub gamepad_ring_enabled: bool,
+    // Compatibility only: Shift/Alt wheel customization is postponed.
     #[serde(default)]
     pub shift_wheel_pair: WheelPairActionId,
     #[serde(default)]
     pub alt_wheel_pair: WheelPairActionId,
     #[serde(default)]
     pub mouse_back_forward_action: MouseBackForwardActionId,
+    #[serde(default = "default_mouse_button_profile")]
+    pub mouse_buttons_grid: MouseButtonProfile,
+    #[serde(default = "default_mouse_button_profile")]
+    pub mouse_buttons_image: MouseButtonProfile,
+    #[serde(default = "default_mouse_button_profile")]
+    pub mouse_buttons_video: MouseButtonProfile,
     #[serde(default)]
     pub mouse_nav_prompt_done: bool,
     #[serde(default)]
@@ -623,21 +768,65 @@ impl RingShortcutSettings {
         *self.profile_mut(context) = default_profile_for_context(context);
     }
 
+    pub fn mouse_button_profile(&self, context: RingShortcutContext) -> &MouseButtonProfile {
+        match context {
+            RingShortcutContext::Grid => &self.mouse_buttons_grid,
+            RingShortcutContext::ImageFullscreen => &self.mouse_buttons_image,
+            RingShortcutContext::VideoFullscreen => &self.mouse_buttons_video,
+        }
+    }
+
+    pub fn mouse_button_profile_mut(
+        &mut self,
+        context: RingShortcutContext,
+    ) -> &mut MouseButtonProfile {
+        match context {
+            RingShortcutContext::Grid => &mut self.mouse_buttons_grid,
+            RingShortcutContext::ImageFullscreen => &mut self.mouse_buttons_image,
+            RingShortcutContext::VideoFullscreen => &mut self.mouse_buttons_video,
+        }
+    }
+
+    pub fn reset_mouse_button_profile(&mut self, context: RingShortcutContext) {
+        *self.mouse_button_profile_mut(context) = default_mouse_button_profile();
+    }
+
+    pub fn set_mouse_buttons_from_legacy_pair(&mut self, action: MouseBackForwardActionId) {
+        let Some((back, forward)) = legacy_mouse_button_pair(action) else {
+            return;
+        };
+        let profile = MouseButtonProfile::new(back, forward);
+        self.mouse_buttons_grid = profile.clone();
+        self.mouse_buttons_image = profile.clone();
+        self.mouse_buttons_video = profile;
+    }
+
     pub fn sanitize(&mut self) {
         self.grid.sanitize(RingShortcutContext::Grid);
         self.image.sanitize(RingShortcutContext::ImageFullscreen);
         self.video.sanitize(RingShortcutContext::VideoFullscreen);
+        self.mouse_buttons_grid.sanitize(RingShortcutContext::Grid);
+        self.mouse_buttons_image
+            .sanitize(RingShortcutContext::ImageFullscreen);
+        self.mouse_buttons_video
+            .sanitize(RingShortcutContext::VideoFullscreen);
         if matches!(self.shift_wheel_pair, WheelPairActionId::Unknown(_)) {
             self.shift_wheel_pair = WheelPairActionId::None;
         }
         if matches!(self.alt_wheel_pair, WheelPairActionId::Unknown(_)) {
             self.alt_wheel_pair = WheelPairActionId::None;
         }
-        if matches!(
-            self.mouse_back_forward_action,
-            MouseBackForwardActionId::Unknown(_)
-        ) {
-            self.mouse_back_forward_action = MouseBackForwardActionId::None;
+        match self.mouse_back_forward_action.clone() {
+            MouseBackForwardActionId::FolderHistoryPrevNext
+            | MouseBackForwardActionId::TreeFolderPrevNext => {
+                self.set_mouse_buttons_from_legacy_pair(self.mouse_back_forward_action.clone());
+                self.mouse_back_forward_action = MouseBackForwardActionId::None;
+                self.mouse_nav_prompt_done = true;
+            }
+            MouseBackForwardActionId::Unknown(_) => {
+                self.mouse_back_forward_action = MouseBackForwardActionId::None;
+            }
+            MouseBackForwardActionId::None => {}
         }
     }
 }
@@ -650,6 +839,9 @@ impl Default for RingShortcutSettings {
             shift_wheel_pair: WheelPairActionId::None,
             alt_wheel_pair: WheelPairActionId::None,
             mouse_back_forward_action: MouseBackForwardActionId::None,
+            mouse_buttons_grid: default_mouse_button_profile(),
+            mouse_buttons_image: default_mouse_button_profile(),
+            mouse_buttons_video: default_mouse_button_profile(),
             mouse_nav_prompt_done: false,
             x_picker_hint_shown: false,
             grid: default_grid_profile(),
@@ -661,6 +853,21 @@ impl Default for RingShortcutSettings {
 
 fn default_true() -> bool {
     true
+}
+
+pub fn legacy_mouse_button_pair(
+    action: MouseBackForwardActionId,
+) -> Option<(RingActionId, RingActionId)> {
+    match action {
+        MouseBackForwardActionId::FolderHistoryPrevNext => Some((
+            RingActionId::GridHistoryBack,
+            RingActionId::GridHistoryForward,
+        )),
+        MouseBackForwardActionId::TreeFolderPrevNext => {
+            Some((RingActionId::TreeFolderPrev, RingActionId::TreeFolderNext))
+        }
+        MouseBackForwardActionId::None | MouseBackForwardActionId::Unknown(_) => None,
+    }
 }
 
 fn default_ring_slots() -> Vec<RingActionId> {
@@ -794,11 +1001,12 @@ pub struct RingPickerOriginalState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerState {
     pub context: RingShortcutContext,
+    pub anchor: RingPickerAnchor,
     pub original: RingPickerOriginalState,
     pub row: usize,
     pub dirty_rows: Vec<RingPickerRowId>,
     pub x_close_armed: bool,
-    pub drill: Option<PostFilterDrillState>,
+    pub drill: Option<PickerListState>,
     pub grid_cols: usize,
     pub sort_order: crate::settings::SortOrder,
     pub thumb_aspect_auto: bool,
@@ -816,6 +1024,24 @@ pub struct RingPickerState {
     pub video_continuous_mode: crate::video::VideoContinuousMode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingPickerAnchor {
+    pub folder: Option<PathBuf>,
+    pub item_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadFavoritePickerState {
+    pub selected: usize,
+    pub scroll_top: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadVideoMarkerPickerState {
+    pub selected: usize,
+    pub scroll_top: usize,
+}
+
 impl RingPickerState {
     pub fn current_row(&self) -> usize {
         self.row
@@ -831,16 +1057,16 @@ impl RingPickerState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PostFilterDrillMode {
-    Group,
-    Item,
+pub enum PickerListMode {
+    RowValues(RingPickerRowId),
+    PostFilterGroup,
+    PostFilterItem { group: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PostFilterDrillState {
-    pub mode: PostFilterDrillMode,
-    pub group: usize,
-    pub item: usize,
+pub struct PickerListState {
+    pub mode: PickerListMode,
+    pub selected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -881,6 +1107,7 @@ pub enum MouseFlickOutcome {
     None,
     ShortTap,
     LongPressMenu(egui::Pos2),
+    Cancelled,
     Fired,
 }
 
@@ -899,6 +1126,11 @@ mod tests {
             defaults.mouse_back_forward_action,
             MouseBackForwardActionId::None
         );
+        for &context in RingShortcutContext::all() {
+            let profile = defaults.mouse_button_profile(context);
+            assert_eq!(profile.back, RingActionId::GridHistoryBack);
+            assert_eq!(profile.forward, RingActionId::GridHistoryForward);
+        }
         assert_eq!(defaults.mouse_nav_prompt_done, false);
         assert_eq!(defaults.x_picker_hint_shown, false);
         assert_eq!(
@@ -924,6 +1156,9 @@ mod tests {
         settings.shift_wheel_pair = WheelPairActionId::Unknown("future_wheel".to_string());
         settings.mouse_back_forward_action =
             MouseBackForwardActionId::Unknown("future_mouse_nav".to_string());
+        settings.mouse_buttons_grid.back = RingActionId::Unknown("future_mouse_button".to_string());
+        settings.mouse_buttons_image.forward = RingActionId::VideoCapture;
+        settings.mouse_buttons_video.back = RingActionId::ImageCapture;
 
         settings.sanitize();
 
@@ -935,6 +1170,29 @@ mod tests {
             settings.mouse_back_forward_action,
             MouseBackForwardActionId::None
         );
+        assert_eq!(settings.mouse_buttons_grid.back, RingActionId::None);
+        assert_eq!(settings.mouse_buttons_image.forward, RingActionId::None);
+        assert_eq!(settings.mouse_buttons_video.back, RingActionId::None);
+    }
+
+    #[test]
+    fn sanitize_migrates_legacy_mouse_button_pair_to_profiles() {
+        let mut settings = RingShortcutSettings::default();
+        settings.mouse_back_forward_action = MouseBackForwardActionId::TreeFolderPrevNext;
+        settings.mouse_nav_prompt_done = false;
+
+        settings.sanitize();
+
+        assert_eq!(
+            settings.mouse_back_forward_action,
+            MouseBackForwardActionId::None
+        );
+        assert!(settings.mouse_nav_prompt_done);
+        for &context in RingShortcutContext::all() {
+            let profile = settings.mouse_button_profile(context);
+            assert_eq!(profile.back, RingActionId::TreeFolderPrev);
+            assert_eq!(profile.forward, RingActionId::TreeFolderNext);
+        }
     }
 
     #[test]

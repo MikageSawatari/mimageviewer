@@ -2487,6 +2487,16 @@ pub(crate) struct PendingNativeDrag {
     pub post_drag_toast: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GridEditBadges {
+    pub page_override: bool,
+    pub local_adjust: bool,
+    pub mask: bool,
+    pub conceal: bool,
+    pub comic: bool,
+    pub rotation: bool,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -2498,6 +2508,9 @@ pub struct App {
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
     pub(crate) gamepad_state: crate::gamepad::GamepadInputState,
     pub(crate) ring_picker: Option<crate::ring_shortcut::RingPickerState>,
+    pub(crate) gamepad_favorite_picker: Option<crate::ring_shortcut::GamepadFavoritePickerState>,
+    pub(crate) gamepad_video_marker_picker:
+        Option<crate::ring_shortcut::GamepadVideoMarkerPickerState>,
     pub(crate) tx: mpsc::Sender<ThumbMsg>,
     pub(crate) rx: mpsc::Receiver<ThumbMsg>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
@@ -2655,9 +2668,26 @@ pub struct App {
     pub(crate) detached_viewer_no_activate_once: bool,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
-    /// 余白カットフィット用の中身 bbox キャッシュ (正規化座標)。idx → Some(bbox) / None(余白なし)。
+    /// 表示トリムの自動余白カット用の中身 bbox キャッシュ (正規化座標)。idx → Some(bbox) / None(余白なし)。
     /// `fs_cache` と同じタイミング (フォルダ移動・idx 無効化) でクリアする。
     pub(crate) fs_margin_bbox_cache: std::collections::HashMap<usize, Option<egui::Rect>>,
+    /// 表示トリム (読みながら使う表示専用の余白カット) の調整パネル表示。
+    /// 出力用の切り取りとは独立し、保存 / エクスポートのピクセルには影響しない。
+    pub(crate) view_trim_mode: bool,
+    /// 表示トリムの本単位適用モード。Page は旧 DB 互換用で、新規 UI ではここへ永続しない。
+    pub(crate) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    /// 表示トリムパネルで編集する対象。Book はセッション中の本全体、Page は idx 単位。
+    pub(crate) view_trim_scope: crate::view_trim::ViewTrimScope,
+    /// 表示トリムの「このページの個別設定を適用」チェックが有効な fullscreen root idx。
+    /// ページ移動時に外れる一時状態で、DB へは保存しない。
+    pub(crate) view_trim_page_apply_root_idx: Option<usize>,
+    pub(crate) view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
+    pub(crate) view_trim_page_overrides:
+        std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
+    pub(crate) view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
+    pub(crate) view_trim_save_pending: bool,
+    /// 表示トリム DB ハンドル。本ごとの適用モード / 本全体設定とページ個別設定を保存する。
+    pub(crate) view_trim_db: Option<crate::view_trim_db::ViewTrimDb>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -2866,7 +2896,8 @@ pub struct App {
     pub(crate) show_mouse_nav_migration_prompt: bool,
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
-    /// 右クリック長押し検出用: 押下開始時刻と座標
+    /// フルスクリーン右クリック判定用: 押下開始時刻と座標。
+    /// 移動なし release はコンテキストメニュー、移動ありはフリック / 取消へ分岐する。
     pub(crate) fs_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
     /// フルスクリーン用コンテキストメニューの対象アイテムインデックス
     pub(crate) fs_context_menu_idx: Option<usize>,
@@ -3798,6 +3829,20 @@ pub struct App {
     /// の順でフォールバックする。解決は [`App::effective_params`] に集約。
     pub(crate) adjustment_page_params:
         std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    /// ページ個別の補正パラメータを持つ page_path キー集合。
+    /// フィルタ時にフォルダや書庫を走査せず、正規化キーの exact/prefix 判定だけで
+    /// 親コンテナへの「補」状態ロールアップを判定するために使う。
+    pub(crate) adjusted_page_keys: std::collections::BTreeSet<String>,
+    /// 補正レイヤーを持つ page_path キー集合 (状態フィルタの親コンテナ判定用)。
+    pub(crate) local_adjust_page_keys: std::collections::BTreeSet<String>,
+    /// 消しゴムマスクを持つ page_path キー集合 (状態フィルタの親コンテナ判定用)。
+    pub(crate) mask_page_keys: std::collections::BTreeSet<String>,
+    /// 隠蔽加工マスクを持つ page_path キー集合 (状態フィルタの親コンテナ判定用)。
+    pub(crate) conceal_page_keys: std::collections::BTreeSet<String>,
+    /// テキスト注釈を持つ page_path キー集合 (状態フィルタの親コンテナ判定用)。
+    pub(crate) comic_page_keys: std::collections::BTreeSet<String>,
+    /// 非破壊回転を持つ page_path / video key 集合 (状態フィルタの親コンテナ判定用)。
+    pub(crate) rotation_page_keys: std::collections::BTreeSet<String>,
     /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
     /// 起動時に `adjustment_db.load_all_favorite_params()` から復元。
     /// 解決は [`App::effective_params`] 参照。
@@ -4689,6 +4734,10 @@ pub struct App {
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
     #[cfg(windows)]
+    /// Native fullscreen presenter 上の右クリック候補。egui 側の pointer 状態とは
+    /// 別に release 時の移動量だけでコンテキストメニューを判定する。
+    native_video_secondary_press_start: Option<egui::Pos2>,
+    #[cfg(windows)]
     /// App へ転送された直近の native 動画 `MouseMove` の client 座標。実機修正
     /// (2026-06-06): navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変)
     /// move が `handle_native_video_window_event` の MouseMove → `mark_native_video_hud_activity`
@@ -4889,6 +4938,13 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
 
         let t = std::time::Instant::now();
+        let rotation_page_keys = rotation_db
+            .as_ref()
+            .map(crate::rotation_db::RotationDb::load_rotated_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_rotation_keys", 0, t);
+
+        let t = std::time::Instant::now();
         let audio_normalize_db = crate::audio_normalize_db::AudioNormalizeDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_audio_normalize", 0, t);
 
@@ -4927,6 +4983,10 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_spread", 0, t);
 
         let t = std::time::Instant::now();
+        let view_trim_db = crate::view_trim_db::ViewTrimDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
+
+        let t = std::time::Instant::now();
         let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
         let book_resume_writer = if book_resume_db.is_some() {
             crate::book_resume_db::BookResumeWriter::spawn()
@@ -4950,8 +5010,22 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_adjustment", 0, t);
 
         let t = std::time::Instant::now();
+        let adjusted_page_keys = adjustment_db
+            .as_ref()
+            .map(crate::adjustment_db::AdjustmentDb::load_page_param_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_adjusted_page_keys", 0, t);
+
+        let t = std::time::Instant::now();
         let local_adjust_db = crate::local_adjust_db::LocalAdjustDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_local_adjust", 0, t);
+
+        let t = std::time::Instant::now();
+        let local_adjust_page_keys = local_adjust_db
+            .as_ref()
+            .map(crate::local_adjust_db::LocalAdjustDb::load_all_layer_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_local_adjust_keys", 0, t);
 
         let t = std::time::Instant::now();
         let export_crop_db = crate::export_crop::CropDb::open().ok();
@@ -4962,12 +5036,33 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
         let t = std::time::Instant::now();
+        let mask_page_keys = mask_db
+            .as_ref()
+            .map(crate::mask_db::MaskDb::load_all_mask_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_mask_keys", 0, t);
+
+        let t = std::time::Instant::now();
         let conceal_db = crate::conceal_db::ConcealDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_conceal", 0, t);
 
         let t = std::time::Instant::now();
+        let conceal_page_keys = conceal_db
+            .as_ref()
+            .map(crate::conceal_db::ConcealDb::load_all_conceal_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_conceal_keys", 0, t);
+
+        let t = std::time::Instant::now();
         let comic_db = crate::comic_db::ComicDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_comic", 0, t);
+
+        let t = std::time::Instant::now();
+        let comic_page_keys = comic_db
+            .as_ref()
+            .map(crate::comic_db::ComicDb::load_all_comic_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_comic_keys", 0, t);
 
         let t = std::time::Instant::now();
         let comic_user_stamp_db = crate::comic_user_stamps::ComicUserStampDb::open().ok();
@@ -5055,6 +5150,8 @@ impl App {
             gamepad: crate::gamepad::GamepadRuntime::new(),
             gamepad_state: crate::gamepad::GamepadInputState::default(),
             ring_picker: None,
+            gamepad_favorite_picker: None,
+            gamepad_video_marker_picker: None,
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
@@ -5106,6 +5203,15 @@ impl App {
             detached_viewer_no_activate_once: false,
             fs_cache: std::collections::HashMap::new(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
+            view_trim_mode: false,
+            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_scope: crate::view_trim::ViewTrimScope::Book,
+            view_trim_page_apply_root_idx: None,
+            view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
+            view_trim_page_overrides: std::collections::HashMap::new(),
+            view_trim_dirty_page_overrides: std::collections::HashSet::new(),
+            view_trim_save_pending: false,
+            view_trim_db,
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
@@ -5485,6 +5591,12 @@ impl App {
             export_crop_mode: false,
             adjust_spread_target: AdjustSpreadTarget::Left,
             adjustment_page_params: std::collections::HashMap::new(),
+            adjusted_page_keys,
+            local_adjust_page_keys,
+            mask_page_keys,
+            conceal_page_keys,
+            comic_page_keys,
+            rotation_page_keys,
             adjustment_favorite_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -5784,6 +5896,8 @@ impl App {
             pending_main_foreground_reclaim_force_at: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
+            #[cfg(windows)]
+            native_video_secondary_press_start: None,
             #[cfg(windows)]
             native_video_last_move_client: None,
             last_ui_heartbeat_log: std::time::Instant::now(),
@@ -6708,7 +6822,7 @@ impl App {
                 ui.label("標準では、ブラウザやエクスプローラーに近いフォルダ履歴の戻る/進むとして使います。");
                 ui.label("従来どおり、ツリー順の前/次フォルダ移動として使うこともできます。");
                 ui.add_space(6.0);
-                ui.small("後で 環境設定 > リングショートカット から変更できます。");
+                ui.small("後で 環境設定 > マウスボタン から変更できます。");
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("標準にする").clicked() {
@@ -6727,7 +6841,11 @@ impl App {
             choice = Some(crate::ring_shortcut::MouseBackForwardActionId::TreeFolderPrevNext);
         }
         if let Some(action) = choice {
-            self.settings.ring_shortcuts.mouse_back_forward_action = action;
+            self.settings
+                .ring_shortcuts
+                .set_mouse_buttons_from_legacy_pair(action);
+            self.settings.ring_shortcuts.mouse_back_forward_action =
+                crate::ring_shortcut::MouseBackForwardActionId::None;
             self.settings.ring_shortcuts.mouse_nav_prompt_done = true;
             self.settings.save();
             self.show_mouse_nav_migration_prompt = false;
@@ -7632,6 +7750,135 @@ impl App {
             crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
         ) {
             self.reading_direction = crate::settings::ReadingDirection::Ltr;
+        }
+    }
+
+    pub(crate) fn apply_view_trim_for_key(&mut self, key: &std::path::Path) {
+        self.apply_view_trim_for_key_with_fallback(key, None);
+    }
+
+    pub(crate) fn apply_view_trim_for_key_with_fallback(
+        &mut self,
+        key: &std::path::Path,
+        fallback: Option<&std::path::Path>,
+    ) {
+        let state = self
+            .view_trim_db
+            .as_ref()
+            .and_then(|db| db.get_book_state(key))
+            .or_else(|| {
+                fallback.and_then(|fb| {
+                    self.view_trim_db
+                        .as_ref()
+                        .and_then(|db| db.get_book_state(fb))
+                })
+            })
+            .unwrap_or_default();
+        self.view_trim_apply_mode = match state.apply_mode {
+            crate::view_trim::ViewTrimApplyMode::Page => crate::view_trim::ViewTrimApplyMode::None,
+            mode => mode,
+        };
+        self.view_trim_book_settings = state.book_settings;
+        self.view_trim_page_apply_root_idx = None;
+        self.view_trim_scope = match self.view_trim_apply_mode {
+            crate::view_trim::ViewTrimApplyMode::None
+            | crate::view_trim::ViewTrimApplyMode::Auto
+            | crate::view_trim::ViewTrimApplyMode::Book
+            | crate::view_trim::ViewTrimApplyMode::Page => crate::view_trim::ViewTrimScope::Book,
+        };
+
+        let legacy_margin_fit = matches!(
+            self.settings.fullscreen_fit_mode,
+            crate::settings::FullscreenFitMode::MarginFit
+        ) || self.settings.margin_fit_enabled;
+        if legacy_margin_fit {
+            self.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
+            self.settings.margin_fit_enabled = false;
+            if matches!(
+                self.view_trim_apply_mode,
+                crate::view_trim::ViewTrimApplyMode::None
+            ) {
+                self.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+            }
+            self.view_trim_scope = crate::view_trim::ViewTrimScope::Book;
+            self.settings.save();
+            if let Some(db) = &self.view_trim_db {
+                let migrated = crate::view_trim::ViewTrimBookState {
+                    apply_mode: self.view_trim_apply_mode,
+                    book_settings: self.view_trim_book_settings,
+                };
+                if let Err(err) = db.set_book_state(key, migrated) {
+                    crate::logger::log(format!(
+                        "view_trim: failed to migrate legacy margin fit for book: {err}"
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn persist_current_view_trim_book_state(&self) {
+        let (Some(db), Some(key)) = (&self.view_trim_db, self.spread_container_key()) else {
+            return;
+        };
+        let state = crate::view_trim::ViewTrimBookState {
+            apply_mode: match self.view_trim_apply_mode {
+                crate::view_trim::ViewTrimApplyMode::Page => {
+                    crate::view_trim::ViewTrimApplyMode::None
+                }
+                mode => mode,
+            },
+            book_settings: self.view_trim_book_settings,
+        };
+        if let Err(err) = db.set_book_state(&key, state) {
+            crate::logger::log(format!("view_trim: failed to save book state: {err}"));
+        }
+    }
+
+    pub(crate) fn persist_view_trim_page_override(
+        &self,
+        idx: usize,
+        page_override: crate::view_trim::ViewTrimPageOverride,
+    ) {
+        let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
+            return;
+        };
+        if let Err(err) = db.set_page_override(&key, page_override) {
+            crate::logger::log(format!(
+                "view_trim: failed to save page override idx={idx}: {err}"
+            ));
+        }
+    }
+
+    pub(crate) fn remove_view_trim_page_override(&self, idx: usize) {
+        let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
+            return;
+        };
+        if let Err(err) = db.remove_page_override(&key) {
+            crate::logger::log(format!(
+                "view_trim: failed to remove page override idx={idx}: {err}"
+            ));
+        }
+    }
+
+    pub(crate) fn hydrate_view_trim_page_overrides_for_current_items(
+        &mut self,
+        prefix_path: &std::path::Path,
+    ) {
+        self.view_trim_page_overrides.clear();
+        let Some(db) = &self.view_trim_db else {
+            return;
+        };
+        let prefix = crate::adjustment_db::normalize_path(prefix_path);
+        let page_map = db.load_page_overrides_by_prefix(&prefix);
+        if page_map.is_empty() {
+            return;
+        }
+        for idx in 0..self.items.len() {
+            if let Some(key) = self.page_path_key(idx)
+                && let Some(page_override) = page_map.get(&key)
+            {
+                self.view_trim_page_overrides.insert(idx, *page_override);
+            }
         }
     }
 
@@ -9959,6 +10206,7 @@ impl App {
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
             self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
+            self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
 
         // 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出した場合の変換提案の段取り。
@@ -10182,6 +10430,7 @@ impl App {
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
             self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
+            self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         // ★付きの本を開いて一時解除したフィルタを、本より上の階層へ戻ったら復元する
         // (実フォルダの maybe_restore_rating_filter_if_out_of_scope に相当)。
@@ -11442,6 +11691,7 @@ impl App {
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
         self.apply_spread_for_key(&source_path);
+        self.apply_view_trim_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.search_filter = None;
@@ -11626,6 +11876,21 @@ impl App {
                 &[(
                     "ms",
                     serde_json::Value::from(crop_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
+            );
+        }
+
+        let view_trim_t0 = std::time::Instant::now();
+        self.hydrate_view_trim_page_overrides_for_current_items(&source_path);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_view_trim_db",
+                None,
+                sli_seq,
+                &[(
+                    "ms",
+                    serde_json::Value::from(view_trim_t0.elapsed().as_secs_f64() * 1000.0),
                 )],
             );
         }
@@ -11933,12 +12198,18 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
     ) {
         debug_assert_eq!(items.len(), image_metas.len());
+        self.persist_pending_view_trim_state();
         self.items = items;
         self.image_metas = image_metas;
         self.thumbnails = (0..self.items.len())
             .map(|_| ThumbnailState::Pending)
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
+        self.view_trim_mode = false;
+        self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_overrides.clear();
+        self.view_trim_dirty_page_overrides.clear();
+        self.view_trim_save_pending = false;
         if let Some(pending) = self.details_meta_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -13247,8 +13518,8 @@ impl App {
     }
 
     /// 現在の `items` に対して、idx-keyed なページ編集状態 (画像補正の個別パラメータ /
-    /// ローカル調整レイヤー / 最終段 crop / 消しゴムマスク / 隠蔽マスク) を一旦 clear し、
-    /// DB から再 hydrate する。
+    /// ローカル調整レイヤー / 最終段 crop / 表示トリム個別設定 / 消しゴムマスク /
+    /// 隠蔽マスク) を一旦 clear し、DB から再 hydrate する。
     ///
     /// `load_folder` (= `start_loading_items`) の hydration ブロック (perf イベント
     /// `sli_adjustment_db` / `sli_local_adjust_db` / `sli_export_crop_db` / mask / conceal)
@@ -13269,7 +13540,8 @@ impl App {
     /// `local_adjust_selected_layers` は DB を持たない UI 選択状態なので clear のみ
     /// (load_folder と同じ。再選択時に 0 始まりで復元される)。
     /// idx-keyed なページ編集状態 (補正の個別パラメータ / ローカル調整レイヤー + 選択 idx /
-    /// 最終段 crop / 消しゴムマスク / 隠蔽マスクのバッジ集合) を全 clear する。
+    /// 最終段 crop / 表示トリム個別設定 / 消しゴムマスク / 隠蔽マスクのバッジ集合) を
+    /// 全 clear する。
     ///
     /// `rehydrate_page_edit_state_for_current_items` の clear 段であり、
     /// 「ページ編集 overlay を出さない」べき経路 (= 検索 view 由来 snapshot や
@@ -13283,6 +13555,10 @@ impl App {
         self.local_adjust_selected_layers.clear();
         self.export_crop_page_settings.clear();
         self.export_crop_pages.clear();
+        self.view_trim_page_apply_root_idx = None;
+        self.persist_pending_view_trim_state();
+        self.view_trim_page_overrides.clear();
+        self.view_trim_dirty_page_overrides.clear();
         self.mask_pages.clear();
         self.conceal_pages.clear();
         self.comic_pages.clear();
@@ -13343,6 +13619,7 @@ impl App {
         else {
             self.local_adjust_pages.remove(&idx);
             self.local_adjust_selected_layers.remove(&idx);
+            Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, false);
             return false;
         };
 
@@ -13385,6 +13662,7 @@ impl App {
                 }
             }
         }
+        self.hydrate_view_trim_page_overrides_for_current_items(prefix_path);
         if let Some(db) = &self.mask_db {
             let mask_keys = db.load_mask_keys(&prefix);
             if !mask_keys.is_empty() {
@@ -13511,6 +13789,15 @@ impl App {
             .collect();
         self.export_crop_pages = self
             .export_crop_pages
+            .iter()
+            .filter_map(|&i| shift(i))
+            .collect();
+        self.view_trim_page_overrides = std::mem::take(&mut self.view_trim_page_overrides)
+            .into_iter()
+            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .collect();
+        self.view_trim_dirty_page_overrides = self
+            .view_trim_dirty_page_overrides
             .iter()
             .filter_map(|&i| shift(i))
             .collect();
@@ -14334,35 +14621,40 @@ impl App {
     }
 
     fn copy_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
-        if let Some(db) = &self.adjustment_db
-            && let Err(e) = db.copy_page_params_key(from, to)
-        {
-            errors.push(format!("adjustment: {e}"));
+        if let Some(db) = &self.adjustment_db {
+            match db.copy_page_params_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.adjusted_page_keys, from, to),
+                Err(e) => errors.push(format!("adjustment: {e}")),
+            }
         }
-        if let Some(db) = &self.local_adjust_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("local_adjust: {e}"));
+        if let Some(db) = &self.local_adjust_db {
+            match db.copy_entry_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.local_adjust_page_keys, from, to),
+                Err(e) => errors.push(format!("local_adjust: {e}")),
+            }
         }
         if let Some(db) = &self.export_crop_db
             && let Err(e) = db.copy_entry_key(from, to)
         {
             errors.push(format!("crop: {e}"));
         }
-        if let Some(db) = &self.mask_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("erase: {e}"));
+        if let Some(db) = &self.mask_db {
+            match db.copy_entry_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.mask_page_keys, from, to),
+                Err(e) => errors.push(format!("erase: {e}")),
+            }
         }
-        if let Some(db) = &self.conceal_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("conceal: {e}"));
+        if let Some(db) = &self.conceal_db {
+            match db.copy_entry_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.conceal_page_keys, from, to),
+                Err(e) => errors.push(format!("conceal: {e}")),
+            }
         }
-        if let Some(db) = &self.comic_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("comic: {e}"));
+        if let Some(db) = &self.comic_db {
+            match db.copy_entry_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.comic_page_keys, from, to),
+                Err(e) => errors.push(format!("comic: {e}")),
+            }
         }
         if let Some(db) = &self.rating_db
             && let Err(e) = db.copy_entry_key(from, to)
@@ -14377,35 +14669,40 @@ impl App {
     }
 
     fn move_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
-        if let Some(db) = &self.adjustment_db
-            && let Err(e) = db.move_page_params_key(from, to)
-        {
-            errors.push(format!("adjustment: {e}"));
+        if let Some(db) = &self.adjustment_db {
+            match db.move_page_params_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.adjusted_page_keys, from, to),
+                Err(e) => errors.push(format!("adjustment: {e}")),
+            }
         }
-        if let Some(db) = &self.local_adjust_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("local_adjust: {e}"));
+        if let Some(db) = &self.local_adjust_db {
+            match db.move_entry_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.local_adjust_page_keys, from, to),
+                Err(e) => errors.push(format!("local_adjust: {e}")),
+            }
         }
         if let Some(db) = &self.export_crop_db
             && let Err(e) = db.move_entry_key(from, to)
         {
             errors.push(format!("crop: {e}"));
         }
-        if let Some(db) = &self.mask_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("erase: {e}"));
+        if let Some(db) = &self.mask_db {
+            match db.move_entry_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.mask_page_keys, from, to),
+                Err(e) => errors.push(format!("erase: {e}")),
+            }
         }
-        if let Some(db) = &self.conceal_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("conceal: {e}"));
+        if let Some(db) = &self.conceal_db {
+            match db.move_entry_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.conceal_page_keys, from, to),
+                Err(e) => errors.push(format!("conceal: {e}")),
+            }
         }
-        if let Some(db) = &self.comic_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("comic: {e}"));
+        if let Some(db) = &self.comic_db {
+            match db.move_entry_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.comic_page_keys, from, to),
+                Err(e) => errors.push(format!("comic: {e}")),
+            }
         }
         if let Some(db) = &self.rating_db
             && let Err(e) = db.move_entry_key(from, to)
@@ -18295,32 +18592,8 @@ impl App {
         let cell_h = self.last_cell_h.max(1.0);
 
         // マウスホイールイベントだけを取り出し、egui には渡さない
-        let (scroll_delta_y, ctrl, shift, alt) = ctx.input(|i| {
-            (
-                i.raw_scroll_delta.y,
-                i.modifiers.ctrl,
-                i.modifiers.shift,
-                i.modifiers.alt,
-            )
-        });
+        let (scroll_delta_y, ctrl) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta_y.abs() > 0.5 {
-            if self.apply_shift_alt_wheel_pair(
-                ctx,
-                scroll_delta_y,
-                shift,
-                alt,
-                None,
-                "grid-wheel-pair",
-            ) {
-                ctx.input_mut(|i| {
-                    i.raw_scroll_delta = egui::Vec2::ZERO;
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    i.events
-                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-                });
-                return;
-            }
-
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
@@ -20846,6 +21119,283 @@ impl App {
         self.facet_filter_active()
     }
 
+    pub(crate) fn grid_edit_badges(&self, idx: usize) -> GridEditBadges {
+        GridEditBadges {
+            page_override: self.adjustment_page_params.contains_key(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.adjusted_page_keys),
+            local_adjust: self.local_adjust_pages.contains(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.local_adjust_page_keys),
+            mask: self.mask_pages.contains(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.mask_page_keys),
+            conceal: self.conceal_pages.contains(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.conceal_page_keys),
+            comic: self.comic_pages.contains(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.comic_page_keys),
+            rotation: self.item_has_one_level_rotation(idx),
+        }
+    }
+
+    fn page_key_set_has_prefix(keys: &std::collections::BTreeSet<String>, prefix: &str) -> bool {
+        keys.range(prefix.to_owned()..)
+            .next()
+            .is_some_and(|key| key.starts_with(prefix))
+    }
+
+    fn normalized_folder_page_prefix(path: &std::path::Path) -> String {
+        let mut prefix = crate::adjustment_db::normalize_path(path);
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        prefix
+    }
+
+    fn normalized_archive_page_prefix(path: &std::path::Path) -> String {
+        format!("{}::", crate::adjustment_db::normalize_path(path))
+    }
+
+    fn page_key_is_direct_child_of_folder(key: &str, folder_prefix: &str) -> bool {
+        let Some(rest) = key.strip_prefix(folder_prefix) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        match (rest.find('/'), rest.find("::")) {
+            (Some(slash), Some(virtual_sep)) => virtual_sep < slash,
+            (Some(_), None) => false,
+            _ => true,
+        }
+    }
+
+    fn page_key_is_direct_file_child_of_folder(key: &str, folder_prefix: &str) -> bool {
+        let Some(rest) = key.strip_prefix(folder_prefix) else {
+            return false;
+        };
+        !rest.is_empty() && !rest.contains('/') && !rest.contains("::")
+    }
+
+    fn page_key_is_direct_child_of_virtual_prefix(key: &str, prefix: &str) -> bool {
+        let Some(rest) = key.strip_prefix(prefix) else {
+            return false;
+        };
+        !rest.is_empty() && !rest.contains('/')
+    }
+
+    fn folder_contains_page_key(
+        keys: &std::collections::BTreeSet<String>,
+        path: &std::path::Path,
+        include_descendants: bool,
+    ) -> bool {
+        let prefix = Self::normalized_folder_page_prefix(path);
+        if include_descendants {
+            return Self::page_key_set_has_prefix(keys, &prefix);
+        }
+        for key in keys.range(prefix.clone()..) {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if Self::page_key_is_direct_child_of_folder(key, &prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn folder_contains_one_level_edit_key(
+        keys: &std::collections::BTreeSet<String>,
+        path: &std::path::Path,
+    ) -> bool {
+        let prefix = Self::normalized_folder_page_prefix(path);
+        for key in keys.range(prefix.clone()..) {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if Self::page_key_is_direct_file_child_of_folder(key, &prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn archive_contains_page_key(
+        keys: &std::collections::BTreeSet<String>,
+        path: &std::path::Path,
+    ) -> bool {
+        let prefix = Self::normalized_archive_page_prefix(path);
+        Self::page_key_set_has_prefix(keys, &prefix)
+    }
+
+    fn zip_dir_contains_page_key(
+        keys: &std::collections::BTreeSet<String>,
+        zip_path: &std::path::Path,
+        dir_prefix: &str,
+    ) -> bool {
+        let prefix = format!(
+            "{}::{}",
+            crate::adjustment_db::normalize_path(zip_path),
+            dir_prefix.to_lowercase()
+        );
+        Self::page_key_set_has_prefix(keys, &prefix)
+    }
+
+    fn zip_dir_contains_one_level_edit_key(
+        keys: &std::collections::BTreeSet<String>,
+        zip_path: &std::path::Path,
+        dir_prefix: &str,
+        is_archive: bool,
+    ) -> bool {
+        let prefix = format!(
+            "{}::{}",
+            crate::adjustment_db::normalize_path(zip_path),
+            dir_prefix.to_lowercase()
+        );
+        if is_archive {
+            return Self::page_key_set_has_prefix(keys, &prefix);
+        }
+        for key in keys.range(prefix.clone()..) {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if Self::page_key_is_direct_child_of_virtual_prefix(key, &prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn item_has_one_level_edit_key(
+        &self,
+        idx: usize,
+        keys: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let Some(item) = self.items.get(idx) else {
+            return false;
+        };
+        match item {
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => self
+                .page_path_key(idx)
+                .is_some_and(|key| keys.contains(&key)),
+            GridItem::Folder(path) => Self::folder_contains_one_level_edit_key(keys, path),
+            GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+                Self::archive_contains_page_key(keys, path)
+            }
+            GridItem::ConvertibleArchive { path, .. } => {
+                Self::archive_contains_page_key(keys, path)
+            }
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                is_archive,
+                ..
+            } => Self::zip_dir_contains_one_level_edit_key(keys, zip_path, dir_prefix, *is_archive),
+            GridItem::SearchContainer { path, kind, .. } => match kind {
+                crate::grid_item::SearchContainerKind::Folder => {
+                    Self::folder_contains_one_level_edit_key(keys, path)
+                }
+                crate::grid_item::SearchContainerKind::Zip => {
+                    Self::archive_contains_page_key(keys, path)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    fn item_has_page_edit_key(
+        &self,
+        idx: usize,
+        keys: &std::collections::BTreeSet<String>,
+        include_descendants: bool,
+    ) -> bool {
+        let Some(item) = self.items.get(idx) else {
+            return false;
+        };
+        match item {
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => self
+                .page_path_key(idx)
+                .is_some_and(|key| keys.contains(&key)),
+            GridItem::Folder(path) => {
+                Self::folder_contains_page_key(keys, path, include_descendants)
+            }
+            GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+                Self::archive_contains_page_key(keys, path)
+            }
+            GridItem::ConvertibleArchive { path, .. } => {
+                Self::archive_contains_page_key(keys, path)
+            }
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => Self::zip_dir_contains_page_key(keys, zip_path, dir_prefix),
+            GridItem::SearchContainer { path, kind, .. } => match kind {
+                crate::grid_item::SearchContainerKind::Folder => {
+                    Self::folder_contains_page_key(keys, path, include_descendants)
+                }
+                crate::grid_item::SearchContainerKind::Zip => {
+                    Self::archive_contains_page_key(keys, path)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    fn item_has_one_level_rotation(&self, idx: usize) -> bool {
+        let Some(item) = self.items.get(idx) else {
+            return false;
+        };
+        match item {
+            GridItem::Image(_)
+            | GridItem::ZipImage { .. }
+            | GridItem::PdfPage { .. }
+            | GridItem::Video(_) => {
+                self.rotation_cache
+                    .get(&idx)
+                    .is_some_and(|rot| !rot.is_none())
+                    || self
+                        .rotation_key_for_idx(idx)
+                        .is_some_and(|key| self.rotation_page_keys.contains(&key))
+            }
+            _ => self.item_has_one_level_edit_key(idx, &self.rotation_page_keys),
+        }
+    }
+
+    fn item_has_rotation_edit(&mut self, idx: usize, include_descendants: bool) -> bool {
+        let Some(item) = self.items.get(idx).cloned() else {
+            return false;
+        };
+        match item {
+            GridItem::Image(_)
+            | GridItem::ZipImage { .. }
+            | GridItem::PdfPage { .. }
+            | GridItem::Video(_) => !self.get_rotation(idx).is_none(),
+            GridItem::Folder(path) => {
+                Self::folder_contains_page_key(&self.rotation_page_keys, &path, include_descendants)
+            }
+            GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+                Self::archive_contains_page_key(&self.rotation_page_keys, &path)
+            }
+            GridItem::ConvertibleArchive { path, .. } => {
+                Self::archive_contains_page_key(&self.rotation_page_keys, &path)
+            }
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => Self::zip_dir_contains_page_key(&self.rotation_page_keys, &zip_path, &dir_prefix),
+            GridItem::SearchContainer { path, kind, .. } => match kind {
+                crate::grid_item::SearchContainerKind::Folder => Self::folder_contains_page_key(
+                    &self.rotation_page_keys,
+                    &path,
+                    include_descendants,
+                ),
+                crate::grid_item::SearchContainerKind::Zip => {
+                    Self::archive_contains_page_key(&self.rotation_page_keys, &path)
+                }
+            },
+            _ => false,
+        }
+    }
+
     fn passes_facet_filter(&mut self, idx: usize, ignore: Option<FacetField>) -> bool {
         use crate::settings::{FacetEditFlag, FacetTagMode};
 
@@ -20974,14 +21524,52 @@ impl App {
             } else {
                 0
             };
+            let include_descendants = self.settings.facet_filter.edit_include_descendants;
             for flag in edit_flags {
                 let matched = match flag {
-                    FacetEditFlag::Adjustment => self.adjustment_page_params.contains_key(&idx),
-                    FacetEditFlag::LocalAdjustment => self.local_adjust_pages.contains(&idx),
-                    FacetEditFlag::Mask => self.mask_pages.contains(&idx),
-                    FacetEditFlag::Conceal => self.conceal_pages.contains(&idx),
-                    FacetEditFlag::Annotation => self.comic_pages.contains(&idx),
-                    FacetEditFlag::Rotation => !self.get_rotation(idx).is_none(),
+                    FacetEditFlag::Adjustment | FacetEditFlag::AiAdjustment => {
+                        self.adjustment_page_params.contains_key(&idx)
+                            || self.item_has_page_edit_key(
+                                idx,
+                                &self.adjusted_page_keys,
+                                include_descendants,
+                            )
+                    }
+                    FacetEditFlag::LocalAdjustment => {
+                        self.local_adjust_pages.contains(&idx)
+                            || self.item_has_page_edit_key(
+                                idx,
+                                &self.local_adjust_page_keys,
+                                include_descendants,
+                            )
+                    }
+                    FacetEditFlag::Mask => {
+                        self.mask_pages.contains(&idx)
+                            || self.item_has_page_edit_key(
+                                idx,
+                                &self.mask_page_keys,
+                                include_descendants,
+                            )
+                    }
+                    FacetEditFlag::Conceal => {
+                        self.conceal_pages.contains(&idx)
+                            || self.item_has_page_edit_key(
+                                idx,
+                                &self.conceal_page_keys,
+                                include_descendants,
+                            )
+                    }
+                    FacetEditFlag::Annotation => {
+                        self.comic_pages.contains(&idx)
+                            || self.item_has_page_edit_key(
+                                idx,
+                                &self.comic_page_keys,
+                                include_descendants,
+                            )
+                    }
+                    FacetEditFlag::Rotation => {
+                        self.item_has_rotation_edit(idx, include_descendants)
+                    }
                     FacetEditFlag::Tagged => {
                         item_supports_tags(&item)
                             && (!self.cell_tags_loaded(idx) || !self.cell_tag_list(idx).is_empty())
@@ -21314,26 +21902,23 @@ impl App {
 
     fn details_state_bits(&self, idx: usize) -> u32 {
         let mut bits = 0u32;
-        if self.adjustment_page_params.contains_key(&idx) {
+        let badges = self.grid_edit_badges(idx);
+        if badges.page_override {
             bits |= 1 << 0;
         }
-        if self.local_adjust_pages.contains(&idx) {
+        if badges.local_adjust {
             bits |= 1 << 1;
         }
-        if self.mask_pages.contains(&idx) {
+        if badges.mask {
             bits |= 1 << 2;
         }
-        if self.conceal_pages.contains(&idx) {
+        if badges.conceal {
             bits |= 1 << 3;
         }
-        if self.comic_pages.contains(&idx) {
+        if badges.comic {
             bits |= 1 << 4;
         }
-        if self
-            .rotation_cache
-            .get(&idx)
-            .is_some_and(|rot| !rot.is_none())
-        {
+        if badges.rotation {
             bits |= 1 << 5;
         }
         bits
@@ -21650,6 +22235,7 @@ impl App {
         if let Some(ref db) = self.rotation_db {
             let _ = db.set_key(&key, rot);
         }
+        Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
     }
 
     // ── レーティング ───────────────────────────────────────────────
@@ -24295,6 +24881,7 @@ impl App {
         self.native_video_front_last_raise = None;
         self.native_video_front_recover_after_external_foreground = false;
         self.native_video_pointer_down = None;
+        self.native_video_secondary_press_start = None;
         self.schedule_native_video_main_chrome_restore();
         let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
         if native_video_was_active || self.native_video_main_cloaked {
@@ -24581,7 +25168,13 @@ impl App {
         self.fs_last_main_focus_restore_at = None;
         self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
+        #[cfg(windows)]
+        {
+            self.native_video_secondary_press_start = None;
+        }
         self.mouse_ring_flick = None;
+        self.gamepad_favorite_picker = None;
+        self.gamepad_video_marker_picker = None;
         self.mouse_ring_grid_target_idx = None;
         self.mouse_ring_suppress_context_menu_once = false;
         self.fs_middle_zoom_drag = None;
@@ -24618,6 +25211,9 @@ impl App {
         // fullscreen idx を引き継ぐため、復元せず破棄する (Codex P1)。
         self.export_crop_spread_ctx = None;
         self.reset_export_crop_mode();
+        self.persist_pending_view_trim_state();
+        self.view_trim_mode = false;
+        self.view_trim_page_apply_root_idx = None;
         self.local_adjust_mode = false;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
@@ -25893,6 +26489,7 @@ impl App {
         if let Some(db) = &self.mask_db {
             let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
+        Self::set_page_key_presence(&mut self.mask_page_keys, &key, true);
         self.mask_pages.insert(idx);
         self.bump_erase_mask_generation(idx);
         let sidecar_mask =
@@ -25909,6 +26506,7 @@ impl App {
         if let Some(db) = &self.mask_db {
             let _ = db.delete(&key);
         }
+        Self::set_page_key_presence(&mut self.mask_page_keys, &key, false);
         self.mask_pages.remove(&idx);
         self.bump_erase_mask_generation(idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
@@ -25964,6 +26562,7 @@ impl App {
         if let Some(db) = &self.conceal_db {
             let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
+        Self::set_page_key_presence(&mut self.conceal_page_keys, &key, true);
         self.conceal_pages.insert(idx);
         self.bump_conceal_mask_generation(idx);
         let sidecar_conceal =
@@ -25981,6 +26580,7 @@ impl App {
         if let Some(db) = &self.conceal_db {
             let _ = db.delete(&key);
         }
+        Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
         self.conceal_pages.remove(&idx);
         self.bump_conceal_mask_generation(idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
@@ -26006,6 +26606,7 @@ impl App {
                 ));
             }
         }
+        Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
         if layers.is_empty() {
             self.with_sidecar_mut(idx, |sc, rel| sc.remove_local_adjust_layers(rel));
         } else {
@@ -27305,6 +27906,7 @@ impl App {
                         // バッジ集合に居るが DB に実体が無い (race / 外部削除など)。
                         // 集合からも外して以降の試行を止める。
                         self.conceal_pages.remove(&idx);
+                        Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
                     }
                     return None;
                 }
@@ -27313,6 +27915,9 @@ impl App {
         if !bitmap.iter().any(|&b| b) && shapes.is_empty() {
             // 実質空マスク。バッジから外す。
             self.conceal_pages.remove(&idx);
+            if let Some(key) = self.page_path_key(idx) {
+                Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
+            }
             return None;
         }
 
@@ -27325,6 +27930,9 @@ impl App {
         if !composite.iter().any(|&b| b) {
             if !editing_this_idx {
                 self.conceal_pages.remove(&idx);
+                if let Some(key) = self.page_path_key(idx) {
+                    Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
+                }
             }
             return None;
         }
@@ -29069,6 +29677,7 @@ impl App {
         } else {
             self.comic_pages.insert(idx);
         }
+        Self::set_page_key_presence(&mut self.comic_page_keys, key, !objects.is_empty());
         // 比較 (Wipe/Diff) 準備済みキャッシュは comic を焼き込むため、注釈の保存で旧ピクセルが
         // stale になる。該当 idx の準備済みペア / 準備中ジョブを落とす (mark_comic_dirty が拾えない
         // 非現在ページ保存もカバー)。
@@ -30017,6 +30626,14 @@ impl App {
             if stats.imported_comic > 0 {
                 self.comic_docs.clear();
             }
+            if stats.imported_adjust > 0
+                || stats.imported_mask > 0
+                || stats.imported_conceal > 0
+                || stats.imported_local_adjust > 0
+                || stats.imported_comic > 0
+            {
+                self.refresh_edit_rollup_keys_from_dbs();
+            }
         }
         self.sidecars.insert(sidecar_folder.to_path_buf(), sidecar);
         if import_edits && let Some(db) = &self.adjustment_db {
@@ -30342,6 +30959,77 @@ impl App {
             .unwrap_or(&self.settings.global_preset)
     }
 
+    fn refresh_edit_rollup_keys_from_dbs(&mut self) {
+        self.adjusted_page_keys = self
+            .adjustment_db
+            .as_ref()
+            .map(crate::adjustment_db::AdjustmentDb::load_page_param_keys)
+            .unwrap_or_default();
+        self.local_adjust_page_keys = self
+            .local_adjust_db
+            .as_ref()
+            .map(crate::local_adjust_db::LocalAdjustDb::load_all_layer_keys)
+            .unwrap_or_default();
+        self.mask_page_keys = self
+            .mask_db
+            .as_ref()
+            .map(crate::mask_db::MaskDb::load_all_mask_keys)
+            .unwrap_or_default();
+        self.conceal_page_keys = self
+            .conceal_db
+            .as_ref()
+            .map(crate::conceal_db::ConcealDb::load_all_conceal_keys)
+            .unwrap_or_default();
+        self.comic_page_keys = self
+            .comic_db
+            .as_ref()
+            .map(crate::comic_db::ComicDb::load_all_comic_keys)
+            .unwrap_or_default();
+        self.rotation_page_keys = self
+            .rotation_db
+            .as_ref()
+            .map(crate::rotation_db::RotationDb::load_rotated_keys)
+            .unwrap_or_default();
+    }
+
+    fn set_page_key_presence(
+        keys: &mut std::collections::BTreeSet<String>,
+        key: &str,
+        present: bool,
+    ) {
+        if present {
+            keys.insert(key.to_owned());
+        } else {
+            keys.remove(key);
+        }
+    }
+
+    fn set_page_keys_presence(
+        keys: &mut std::collections::BTreeSet<String>,
+        page_keys: &[String],
+        present: bool,
+    ) {
+        if present {
+            keys.extend(page_keys.iter().cloned());
+        } else {
+            for key in page_keys {
+                keys.remove(key);
+            }
+        }
+    }
+
+    fn copy_page_key_presence(keys: &mut std::collections::BTreeSet<String>, from: &str, to: &str) {
+        if keys.contains(from) {
+            keys.insert(to.to_owned());
+        }
+    }
+
+    fn move_page_key_presence(keys: &mut std::collections::BTreeSet<String>, from: &str, to: &str) {
+        if keys.remove(from) {
+            keys.insert(to.to_owned());
+        }
+    }
+
     fn book_page_default_adjust_params() -> &'static crate::adjustment::AdjustParams {
         static DEFAULT: std::sync::OnceLock<crate::adjustment::AdjustParams> =
             std::sync::OnceLock::new();
@@ -30422,6 +31110,7 @@ impl App {
                 if let Some(db) = &self.adjustment_db {
                     let _ = db.remove_page_params(&key);
                 }
+                Self::set_page_key_presence(&mut self.adjusted_page_keys, &key, false);
             }
             self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         } else {
@@ -30430,12 +31119,13 @@ impl App {
                 if let Some(db) = &self.adjustment_db {
                     let _ = db.set_page_params(&key, &params);
                 }
+                Self::set_page_key_presence(&mut self.adjusted_page_keys, &key, true);
             }
             self.with_sidecar_mut(idx, move |sc, rel| sc.set_adjust(rel, params));
         }
-        // 補正値が変わった可能性があるので色調キャッシュは常に落とす。
-        // Undo/Redo 経路 (apply_adjustment_change_to_app) もここを通って正しく invalidate される。
-        // AI キャッシュは ai_settings_eq 差分判定が必要なので呼び出し側に任せる。
+        // 補正値が変わった可能性があるので、軽量な表示キャッシュは常に落とす。
+        // final pipeline / AI キャッシュは差分分類が必要なので呼び出し側で
+        // clear_caches_for_param_change を通す。
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
         if thumb_color_changed {
@@ -30459,6 +31149,7 @@ impl App {
             if let Some(db) = &self.adjustment_db {
                 let _ = db.remove_page_params(&key);
             }
+            Self::set_page_key_presence(&mut self.adjusted_page_keys, &key, false);
         }
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         self.adjustment_cache.remove(&idx);
@@ -30546,6 +31237,7 @@ impl App {
             if let Some(db) = self.adjustment_db.as_mut() {
                 let _ = db.remove_page_params_bulk(&keys);
             }
+            Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
             for (folder, rels) in sidecar_coords {
                 if let Some(sc) = self.sidecar_mut(&folder) {
                     sc.remove_adjust_bulk(rels);
@@ -30558,6 +31250,7 @@ impl App {
             if let Some(db) = self.adjustment_db.as_mut() {
                 let _ = db.set_page_params_bulk(&keys, &params);
             }
+            Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, true);
             for (folder, rels) in sidecar_coords {
                 if let Some(sc) = self.sidecar_mut(&folder) {
                     sc.set_adjust_bulk(rels, &params);
@@ -30589,6 +31282,7 @@ impl App {
         if let Some(db) = self.adjustment_db.as_mut() {
             let _ = db.remove_page_params_bulk(&keys);
         }
+        Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
         for (folder, rels) in sidecar_coords {
             if let Some(sc) = self.sidecar_mut(&folder) {
                 sc.remove_adjust_bulk(rels);

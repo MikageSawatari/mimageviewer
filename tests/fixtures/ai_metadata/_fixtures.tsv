@@ -1,0 +1,33 @@
+file	intent
+a1111_basic.png	A1111 standard params (tEXt)
+a1111_hashes_json.png	A1111 with Hashes JSON after Model (leak trigger: JSON commas)
+a1111_variation_seed.png	A1111 with Variation seed fields after Model
+a1111_batch.png	A1111 with Batch size/pos after Model
+a1111_dynamic_prompts_template.png	A1111 + Dynamic Prompts Template/Negative Template blocks (multi-line leak)
+a1111_model_path_ext.png	A1111 Model with subfolder path + .safetensors (normalization)
+a1111_model_hash_suffix.png	A1111 Model name with trailing (hash) suffix
+comfyui_basic.png	ComfyUI clean single checkpoint
+comfyui_nan.png	ComfyUI with NaN (DPRandomGenerator) -> strict JSON parse fails (bug)
+comfyui_infinity.png	ComfyUI with Infinity token (invalid JSON)
+comfyui_multi_ckpt.png	ComfyUI base + refiner checkpoints
+comfyui_unet_loader.png	ComfyUI UNETLoader (flux-style, unet_name, no ckpt_name)
+novelai_basic.png	NovelAI (Software/Source/Comment/Description/Title) -> '(NovelAI)' label
+invokeai_new.png	InvokeAI new invokeai_metadata JSON (model is nested object)
+invokeai_legacy_sdmeta.png	InvokeAI legacy sd-metadata JSON (model_weights) + Dream
+invokeai_dream.png	InvokeAI legacy Dream text only (no model name)
+swarmui_basic.png	SwarmUI parameters JSON (sui_image_params.model)
+fooocus_basic.png	Fooocus Comment-less parameters JSON (base_model) + fooocus_scheme
+fooocus_refiner.png	Fooocus with real refiner_model set
+easydiffusion_basic.png	EasyDiffusion per-field chunks (use_stable_diffusion_model path)
+enc_a1111_ztxt.png	A1111 params in compressed zTXt chunk
+enc_a1111_itxt.png	A1111 params in iTXt chunk
+enc_a1111_utf8_text.png	A1111 params as raw UTF-8 bytes in tEXt (multibyte, before IDAT)
+enc_a1111_text_after_idat.png	A1111 params in tEXt placed AFTER IDAT (reader must not stop at IDAT)
+jpeg_a1111_unicode.jpg	A1111 params in EXIF UserComment (UNICODE)
+jpeg_a1111_ascii.jpg	A1111 params in EXIF UserComment (ASCII)
+garbage_parameters.png	Non-AI garbage in parameters chunk
+empty_parameters.png	Empty parameters chunk
+broken_json_prompt.png	ComfyUI prompt chunk: truncated/invalid JSON
+huge_parameters.png	A1111 params with ~200KB prompt (oversized field)
+control_no_text.png	Plain image, no text chunks (non-AI control)
+control_software_only.png	Only Software chunk, non-AI (control)

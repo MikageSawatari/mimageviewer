@@ -59,7 +59,7 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | Shift+↑↓ | 音量を dB フェーダー目盛りの 1/4 幅で上下 |
 | Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動 |
 | Ctrl+PageUp/PageDown | `handle_fullscreen_sibling_nav_context` 経由で画像系と同じ兄弟限定移動 |
-| マウス戻る / 進む | native window / HUD 側の XButton を App 側で Ctrl+↑↓ と同じ経路へ接続 |
+| マウス戻る / 進む | native window / HUD 側の XButton を App 側のマウスボタン割り当て経路へ接続。既定は履歴戻る / 進む、従来どおりを選んだ既存環境では Ctrl+↑↓ と同じ |
 | S | 動画タイルモード ON/OFF |
 | S タイルモード中のホイール | 前後アイテムへ移動。移動先も動画なら native presenter を保持して source 差し替え |
 | S タイルモード中の Ctrl+ホイール | タイル列数変更 |
@@ -95,7 +95,7 @@ Ctrl+S / Ctrl+G はフルスクリーン側でも専用スコープを維持す�
 | Shift+↑↓ | 前後アイテム | 音量 | 動画プレイヤー慣例として差異を許容 |
 | Ctrl+↑↓ | 現在コンテキストの前後フォルダ / 前後検索結果 | 同左 | native 動画 / タイルモードでも有効にする |
 | Ctrl+PageUp/PageDown | 前後の兄弟フォルダ | 同左 | 空フォルダを skip しない。検索中は実フォルダの兄弟概念に戻さず no-op |
-| マウス戻る / 進む | Ctrl+↑↓ と同じ | Ctrl+↑↓ と同じ | native 動画でも同じにする |
+| マウス戻る / 進む | 環境設定「マウスボタン」の context 別割り当て | 同左 | 既定は履歴戻る / 進む。ツリー順を選んだ場合は Ctrl+↑↓ と同じ |
 
 Ctrl+↑↓ の「現在コンテキスト」は以下の優先順位で解釈する:
 
@@ -194,7 +194,7 @@ no-op 案内は段階を分ける:
 - [x] 画像 (`Image`) のフルスクリーン末尾 / 先頭で、境界ヒントと Ctrl+↑↓ が一致する。
 - [x] ZIP 内画像 (`ZipImage`) と PDF ページ (`PdfPage`) でも同じ。
 - [x] 動画 native フルスクリーンで Ctrl+↑↓ が画像と同じコンテキスト移動になる。
-- [x] native 動画のマウス戻る / 進むも Ctrl+↑↓ と同じ App 経路に入る。
+- [x] native 動画のマウス戻る / 進むも App 側のマウスボタン割り当て経路に入る。
 - [x] 動画 S タイルモード中も Ctrl+↑↓ が効き、移動先が動画ならタイルモードを維持し、画像 / ZIP / PDF / 変換アーカイブならタイルを閉じる。
 - [x] タイルを一度閉じた後、次の動画移動で暗黙にタイルへ復帰しない。
 - [x] Ctrl+F フィルタ中は、同一一覧移動はフィルタ後の `visible_indices`、Ctrl+↑↓ は no-op。
@@ -226,9 +226,10 @@ no-op 案内は段階を分ける:
 - `FolderNavMode::Favsearch { fullscreen }` で Ctrl+S のグリッド移動と
   フルスクリーン維持を分ける。
 - native 動画の XButton は Win32 / HUD で `Extra1/Extra2` に変換済みなので、
-  App 側 handler で Ctrl+↑↓ と同じ経路に送る。
+  App 側 handler で `apply_mouse_back_forward_button` に送り、context 別のマウスボタン割り当てを適用する。
 - マウス進む/戻るボタンは、ハードウェアやドライバの設定によって以下の 3 経路の
-  いずれでも届きうる。mIV はすべて同じフォルダ DFS ナビへ集約する。
+  いずれでも届きうる。mIV はすべて `apply_mouse_back_forward_button` へ集約し、
+  `Settings.ring_shortcuts.mouse_buttons_grid/image/video` の単体アクションを実行する。
   1. **WM_XBUTTONDOWN** (native 5 ボタンマウス標準): winit → egui の
      `PointerButton::Extra1/Extra2` として届く。`handle_keyboard` / `update_fullscreen` /
      native video `handle_native_video_mouse_button` が直接 bind 済み。
@@ -236,7 +237,7 @@ no-op 案内は段階を分ける:
      - **メインウィンドウ**: `src/main.rs` の `install_mouse_nav_hook` が `WH_GETMESSAGE`
        フックで観測し、グローバル atomic `PENDING_MOUSE_NAV_BACK/FORWARD` に積む。
        `App::take_pending_mouse_nav` を介して `handle_keyboard` / `update_fullscreen` が
-       消費し、既存の `ctrl_up/down` 経路に OR 合成。
+       消費し、`apply_mouse_back_forward_button` に合流する。
      - **native 動画 HWND**: `src/video/native_window.rs` の wndproc が `WM_APPCOMMAND`
        を `NativeVideoWindowEvent::KeyDown(vk=0xA6 or 0xA7)` に変換して event_tx に流す。
   3. **WM_KEYDOWN VK_BROWSER_BACK (0xA6) / VK_BROWSER_FORWARD (0xA7)** (mouse driver や
@@ -268,6 +269,6 @@ no-op 案内は段階を分ける:
 
 1. Ctrl+F 絞り込み中に動画を fullscreen で開いて Ctrl+↓ を押すと、移動せず toast で理由が分かる。
 2. 動画 S タイル中に Ctrl+↑↓ で動画 → 画像 → 動画と渡っても、一度閉じたタイルが暗黙復帰しない。
-3. Ctrl+S 結果から動画を開いて XButton1 / XButton2 を押すと、favsearch スコープ内を移動する。
+3. マウスボタンをツリー順 前/次に設定した状態で、Ctrl+S 結果から動画を開いて XButton1 / XButton2 を押すと、favsearch スコープ内を移動する。標準設定では履歴戻る / 進むになる。
 4. Ctrl+F バーが開いたまま画像を fullscreen で開いて Ctrl+↓ を押すと、中央に「Ctrl+F検索中はフォルダ移動しません」が出る。
 5. Ctrl+S / Ctrl+G の結果一覧から fullscreen へ入った状態で Ctrl+↓ を押すと、中央に「検索結果を開いてからCtrl+↑↓で移動できます」が出る。

@@ -2996,6 +2996,178 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn facet_edit_rollup_matches_leaf_archives_and_optional_descendant_folders() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetEditFlag;
+
+        let mut app = setup_app();
+        let root = std::path::PathBuf::from("c:/pics");
+        let image_ai = root.join("ai.jpg");
+        let image_plain = root.join("plain.jpg");
+        let zip = root.join("book.zip");
+        let direct_folder = root.join("direct");
+        let deep_folder = root.join("deep");
+
+        app.current_folder = Some(root);
+        app.items = vec![
+            GridItem::Image(image_ai.clone()),
+            GridItem::Image(image_plain),
+            GridItem::ZipFile(zip.clone()),
+            GridItem::Folder(direct_folder.clone()),
+            GridItem::Folder(deep_folder.clone()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::normalize_path(&image_ai));
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&zip, "p001.jpg"));
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &direct_folder.join("p001.jpg"),
+            ));
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &deep_folder.join("child").join("p001.jpg"),
+            ));
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Adjustment);
+
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0, 2, 3],
+            "既定ではページ自身、直下の書庫、直下の画像を含むフォルダだけ通す"
+        );
+
+        app.settings.facet_filter.edit_include_descendants = true;
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0, 2, 3, 4],
+            "子フォルダも対象にすると孫階層の補正ページを含むフォルダも通す"
+        );
+
+        app.settings.facet_filter.edits.clear();
+        app.settings.facet_filter.edit_include_descendants = false;
+        app.mask_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&zip, "mask.jpg"));
+        app.settings.facet_filter.edits.insert(FacetEditFlag::Mask);
+
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![2],
+            "消しゴムなど page_params 以外の編集DBも同じ親ロールアップ経路で通す"
+        );
+    }
+
+    #[test]
+    fn grid_edit_badges_roll_up_only_to_one_visible_parent() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let root = std::path::PathBuf::from("c:/pics");
+        let image = root.join("edited.jpg");
+        let direct_folder = root.join("direct");
+        let deep_folder = root.join("deep");
+        let archive_parent = root.join("archive-parent");
+        let zip = root.join("book.zip");
+        let outer_zip = root.join("outer.zip");
+
+        app.current_folder = Some(root);
+        app.items = vec![
+            GridItem::Image(image.clone()),
+            GridItem::Folder(direct_folder.clone()),
+            GridItem::Folder(deep_folder.clone()),
+            GridItem::Folder(archive_parent.clone()),
+            GridItem::ZipFile(zip.clone()),
+            GridItem::ZipDir {
+                zip_path: outer_zip.clone(),
+                dir_prefix: "chapter/".to_string(),
+                is_archive: false,
+                representative: None,
+            },
+            GridItem::ZipDir {
+                zip_path: outer_zip.clone(),
+                dir_prefix: "deep/".to_string(),
+                is_archive: false,
+                representative: None,
+            },
+            GridItem::ZipDir {
+                zip_path: outer_zip.clone(),
+                dir_prefix: "books/inner.zip/".to_string(),
+                is_archive: true,
+                representative: None,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::normalize_path(&image));
+        app.mask_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &direct_folder.join("p001.jpg"),
+            ));
+        app.conceal_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &deep_folder.join("child").join("p001.jpg"),
+            ));
+        app.comic_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(
+                &archive_parent.join("book.zip"),
+                "p001.jpg",
+            ));
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&zip, "p001.jpg"));
+        app.local_adjust_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(
+                &outer_zip,
+                "chapter/p001.jpg",
+            ));
+        app.local_adjust_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(
+                &outer_zip,
+                "deep/child/p001.jpg",
+            ));
+        app.mask_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(
+                &outer_zip,
+                "books/inner.zip/sub/p001.jpg",
+            ));
+
+        assert!(app.grid_edit_badges(0).page_override);
+        assert!(
+            app.grid_edit_badges(1).mask,
+            "フォルダ直下の編集済みページは、そのフォルダセルへ出す"
+        );
+        assert!(
+            !app.grid_edit_badges(2).conceal,
+            "孫フォルダ配下の編集はサムネバッジでは親の親へ伝播しない"
+        );
+        assert!(
+            !app.grid_edit_badges(3).comic,
+            "直下書庫内ページは書庫セル側で示し、フォルダセルへは伝播しない"
+        );
+        assert!(app.grid_edit_badges(4).page_override);
+        assert!(
+            app.grid_edit_badges(5).local_adjust,
+            "通常の ZIP 内仮想フォルダは直下ページだけを示す"
+        );
+        assert!(
+            !app.grid_edit_badges(6).local_adjust,
+            "通常の ZIP 内仮想フォルダは下位フォルダへは伝播しない"
+        );
+        assert!(
+            app.grid_edit_badges(7).mask,
+            "内側アーカイブとして表示される ZipDir はその本全体を示す"
+        );
+    }
+
+    #[test]
     fn opening_zip_under_facet_filter_suppresses_then_restores_parent_filter() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use crate::settings::FacetItemKind;
@@ -5434,43 +5606,6 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 見開きの余白カット: 左右ページの content を combined 空間で union する。
-    #[test]
-    fn spread_content_union_combines_both_pages() {
-        use crate::ui_fullscreen::spread_content_union;
-        use egui::{Rect, pos2};
-        let left = Some(Rect::from_min_max(pos2(0.1, 0.2), pos2(0.8, 0.9)));
-        let right = Some(Rect::from_min_max(pos2(0.0, 0.1), pos2(0.9, 1.0)));
-        // left_w=100, right_w=120, combined_h=200。
-        let (x0, y0, x1, y1) = spread_content_union(left, right, 100.0, 120.0, 200.0).unwrap();
-        // 左 x[10,80] 右 x[100,208] → union [10,208]。y 左[40,180] 右[20,200] → [20,200]。
-        assert!((x0 - 10.0).abs() < 1e-3, "x0 {x0}");
-        assert!((x1 - 208.0).abs() < 1e-3, "x1 {x1}");
-        assert!((y0 - 20.0).abs() < 1e-3, "y0 {y0}");
-        assert!((y1 - 200.0).abs() < 1e-3, "y1 {y1}");
-    }
-
-    /// bbox 無しのページは全域扱い (余白を切らない) で union される。
-    #[test]
-    fn spread_content_union_none_page_uses_full_region() {
-        use crate::ui_fullscreen::spread_content_union;
-        use egui::{Rect, pos2};
-        let left = Some(Rect::from_min_max(pos2(0.2, 0.2), pos2(0.7, 0.8)));
-        // 右は None → 右ページ全域 (x[100,200], y[0,200])。
-        let (x0, y0, x1, y1) = spread_content_union(left, None, 100.0, 100.0, 200.0).unwrap();
-        assert!((x0 - 20.0).abs() < 1e-3, "x0 {x0}");
-        assert!((x1 - 200.0).abs() < 1e-3, "x1 {x1}");
-        assert!((y0 - 0.0).abs() < 1e-3, "y0 {y0}");
-        assert!((y1 - 200.0).abs() < 1e-3, "y1 {y1}");
-    }
-
-    /// 両方 None なら余白カット無効 (None)。
-    #[test]
-    fn spread_content_union_both_none_returns_none() {
-        use crate::ui_fullscreen::spread_content_union;
-        assert!(spread_content_union(None, None, 100.0, 100.0, 200.0).is_none());
-    }
-
     /// 「ページを直接開く」設定 ON で ZIP/PDF ページを見ているときの close 要求
     /// (Esc/Enter/右クリック) は、その場で閉じず「親フォルダ (L1) へ戻る」予約を
     /// 立てる (= L2 ページ一覧を見せずに L1 へ抜ける)。判定は設定 + コンテナ内かのみで、
@@ -7834,8 +7969,13 @@ mod favorite_adjustment_defaults_tests {
         app.fs_spread_layout = Some(crate::ui_fullscreen::FsSpreadLayout {
             left_idx: 0,
             left_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
+            left_hit_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
             right_idx: 1,
             right_rect: egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(10.0, 10.0)),
+            right_hit_rect: egui::Rect::from_min_size(
+                egui::pos2(10.0, 0.0),
+                egui::vec2(10.0, 10.0),
+            ),
         });
 
         app.open_export_dialog_for_current(&ctx, 1);
@@ -10092,6 +10232,66 @@ mod pipeline_cache_refactor_tests {
         (edit_key, final_key)
     }
 
+    #[test]
+    fn page_adjustment_undo_redo_invalidates_final_ai_cache_for_color_change() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/undo-final-ai.jpg");
+
+        let mut before = crate::adjustment::AdjustParams::default();
+        before.brightness = 10.0;
+        let mut after = before.clone();
+        after.brightness = 30.0;
+        app.set_page_params(idx, before.clone());
+        app.capture_adjust_full("test color change".into(), |a| {
+            a.set_page_params(idx, after.clone());
+        });
+
+        let (undo_edit_key, undo_final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "undo_final_ai");
+
+        app.apply_meta_undo();
+
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            before.brightness
+        );
+        assert!(
+            !app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == undo_edit_key),
+            "Undo of a color-affecting page override must drop stale final AI"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&undo_final_key),
+            "Undo of a color-affecting page override must drop stale final composite"
+        );
+        assert!(
+            app.edit_result_cache.contains_key(&undo_edit_key),
+            "AdjustParam changes should keep the source-resolution edit result"
+        );
+
+        let (redo_edit_key, redo_final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "redo_final_ai");
+
+        app.apply_meta_redo();
+
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            after.brightness
+        );
+        assert!(
+            !app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == redo_edit_key),
+            "Redo of a color-affecting page override must drop stale final AI"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&redo_final_key),
+            "Redo of a color-affecting page override must drop stale final composite"
+        );
+    }
+
     fn insert_local_adjust_cache(
         app: &mut App,
         ctx: &egui::Context,
@@ -12341,6 +12541,80 @@ mod pipeline_cache_refactor_tests {
         assert!(app.has_retained_final_ai(2, mk_key(2), edit_size));
     }
 
+    #[test]
+    fn bulk_color_change_retained_final_ai_misses_current_color_hash() {
+        let mut app = setup_app();
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        let image_idx = push_image(&mut app, "C:/pics/retained-bulk.jpg");
+        let pdf_idx = push_pdf_page(&mut app, "C:/docs/retained-bulk.pdf", 1);
+        let edit_size = [16, 16];
+        let pixels = || {
+            Arc::new(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::from_rgb(32, 64, 96)],
+            ))
+        };
+
+        let mut before = crate::adjustment::AdjustParams::default();
+        before.upscale_model = Some("realesr_general_v3".to_string());
+        app.apply_params_to_all_pages(before.clone());
+
+        let image_old_key = app
+            .final_ai_key_for_pixels(dummy_edit_key(&app, image_idx), edit_size, &before)
+            .expect("image params should request final AI");
+        let pdf_old_key = app
+            .final_ai_key_for_pixels(dummy_edit_key(&app, pdf_idx), edit_size, &before)
+            .expect("pdf params should request final AI");
+        assert!(app.insert_retained_final_ai(image_idx, image_old_key, edit_size, pixels()));
+        assert!(app.insert_retained_final_ai(pdf_idx, pdf_old_key, edit_size, pixels()));
+        assert!(app.has_retained_final_ai(image_idx, image_old_key, edit_size));
+        assert!(app.has_retained_final_ai(pdf_idx, pdf_old_key, edit_size));
+
+        let mut after = before.clone();
+        after.brightness = 25.0;
+        app.apply_params_to_all_pages(after);
+
+        let image_current_key = app
+            .final_ai_key_for_pixels(
+                dummy_edit_key(&app, image_idx),
+                edit_size,
+                app.effective_params(image_idx),
+            )
+            .expect("image params should still request final AI");
+        let pdf_current_key = app
+            .final_ai_key_for_pixels(
+                dummy_edit_key(&app, pdf_idx),
+                edit_size,
+                app.effective_params(pdf_idx),
+            )
+            .expect("pdf params should still request final AI");
+
+        assert_ne!(
+            image_old_key.color_ai_hash, image_current_key.color_ai_hash,
+            "color-affecting bulk change must move current image lookup to a new retained key"
+        );
+        assert_ne!(
+            pdf_old_key.color_ai_hash, pdf_current_key.color_ai_hash,
+            "color-affecting bulk change must move current PDF lookup to a new retained key"
+        );
+        assert!(
+            !app.has_retained_final_ai(image_idx, image_current_key, edit_size),
+            "retained image entry may remain, but must not match current color params"
+        );
+        assert!(
+            !app.has_retained_final_ai(pdf_idx, pdf_current_key, edit_size),
+            "retained PDF final AI slot may remain, but must not match current color params"
+        );
+        assert!(
+            app.has_retained_final_ai(image_idx, image_old_key, edit_size),
+            "old retained image entry can stay available for undoing back to the old params"
+        );
+        assert!(
+            app.has_retained_final_ai(pdf_idx, pdf_old_key, edit_size),
+            "old retained PDF final AI slot can stay available for undoing back to the old params"
+        );
+    }
+
     /// 外部アプリが現在フォルダの実ファイルを差し替えた場合、同じ path / 同じ寸法でも
     /// retained key だけでは内容差分を表せない。signature 差分で自動再ロードする経路では
     /// 保持 LRU を捨て、旧画像の AI 結果を新画像に流用しない。
@@ -14240,6 +14514,42 @@ mod still_window_mode_key_tests {
             .expect("viewer navigation should update detached sync stamp");
         assert_eq!(stamp.idx, second);
         assert_eq!(stamp.items_generation, app.items_generation);
+    }
+
+    #[test]
+    fn detached_continuous_reanchor_updates_viewer_sync_stamp() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+        app.selected = Some(first);
+        app.open_fullscreen(first);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+
+        app.fs_vertical_scroll = 125.0;
+        app.reanchor_continuous_reading_viewer(&ctx, &[0.0, 100.0], 1, second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.selected, Some(second));
+        assert!(app.scroll_to_selected);
+        assert_eq!(app.fs_vertical_scroll, 25.0);
+        let stamp = app
+            .last_viewer_sync_stamp
+            .as_ref()
+            .expect("continuous reanchor should update detached sync stamp");
+        assert_eq!(stamp.idx, second);
+        assert_eq!(stamp.items_generation, app.items_generation);
+
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(
+            app.fs_vertical_scroll, 25.0,
+            "fresh stamp should prevent a detached reopen that resets continuous scroll"
+        );
     }
 
     #[test]

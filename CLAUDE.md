@@ -716,6 +716,11 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 1. `cargo build --release --bin mimageviewer-core` → 本体生成
 2. `cargo build --release --bin mimageviewer` → ランチャー生成 (本体を include_bytes!)
 
+ラッパーは両方の cargo 呼び出しで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
+release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
+rust-lld で stale incremental object が残ると `fast_image_resize` などの SIMD symbol が
+release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
+
 `cargo build --release` を直接打つ場合は ① → ② の順で 2 回打つこと。
 ランチャー側 build.rs が `target/release/mimageviewer-core.exe` の存在をチェックし、
 無ければ復旧手順付きで止まる。

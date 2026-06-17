@@ -4503,6 +4503,22 @@ impl App {
                     changed = true;
                 }
             }
+            ui.separator();
+            let rollup_filter_selected = self.settings.facet_filter.has_rollup_edit_filter();
+            ui.add_enabled_ui(rollup_filter_selected, |ui| {
+                let mut include_descendants =
+                    self.settings.facet_filter.edit_include_descendants;
+                let resp = ui.checkbox(&mut include_descendants, "子フォルダも対象");
+                if resp
+                    .on_hover_text(
+                        "補正・補正レイヤー・消しゴム・隠蔽・注釈・回転の状態フィルタで、子フォルダ配下の保存済み編集も対象にします",
+                    )
+                    .changed()
+                {
+                    self.settings.facet_filter.edit_include_descendants = include_descendants;
+                    changed = true;
+                }
+            });
         });
         suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
@@ -4587,13 +4603,19 @@ impl App {
             facet_chip(ui, format!("サイズ:{}", preset.label()));
         }
         if !filter.edits.is_empty() {
-            let values = filter
+            let mut values = filter
                 .edits
                 .iter()
                 .take(3)
                 .map(|flag| flag.label())
-                .collect::<Vec<_>>()
-                .join(",");
+                .collect::<Vec<_>>();
+            if filter.has_rollup_edit_filter()
+                && filter.edit_include_descendants
+                && values.len() < 3
+            {
+                values.push("子フォルダ");
+            }
+            let values = values.join(",");
             facet_chip(ui, format!("状態:{values}"));
         }
     }
@@ -6154,14 +6176,15 @@ impl App {
         }
         let tags = self.cell_tag_list(idx);
         let tag_name = crate::app::primary_grid_tag_for_badge(tags)?.to_owned();
+        let badges = self.grid_edit_badges(idx);
         let badge_rect = crate::app::grid_tag_badge_hit_rect(
             ui,
             cell_rect,
-            self.adjustment_page_params.contains_key(&idx),
-            self.local_adjust_pages.contains(&idx),
-            self.mask_pages.contains(&idx),
-            self.conceal_pages.contains(&idx),
-            self.comic_pages.contains(&idx),
+            badges.page_override,
+            badges.local_adjust,
+            badges.mask,
+            badges.conceal,
+            badges.comic,
             self.cell_has_pin_badge(idx),
             tags,
         )?;
@@ -6237,6 +6260,7 @@ impl App {
                 }
             }
             crate::ring_shortcut::MouseFlickOutcome::ShortTap
+            | crate::ring_shortcut::MouseFlickOutcome::Cancelled
             | crate::ring_shortcut::MouseFlickOutcome::Fired
             | crate::ring_shortcut::MouseFlickOutcome::None => {}
         }
@@ -6396,6 +6420,7 @@ impl App {
         self.draw_mouse_ring_flick_overlay(ui, full_rect);
         self.draw_gamepad_ring_overlay(ui, full_rect);
         self.draw_gamepad_picker_overlay(ui, full_rect);
+        self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
         self.draw_feedback_toast(ui, full_rect, ctx);
         self.render_details_thumbnail_tooltip(ctx, hovered_preview);
 
@@ -7053,22 +7078,23 @@ impl App {
 
     fn details_state_text(&mut self, idx: usize) -> String {
         let mut flags = Vec::new();
-        if self.adjustment_page_params.contains_key(&idx) {
+        let badges = self.grid_edit_badges(idx);
+        if badges.page_override {
             flags.push("補");
         }
-        if self.local_adjust_pages.contains(&idx) {
+        if badges.local_adjust {
             flags.push("レ");
         }
-        if self.mask_pages.contains(&idx) {
+        if badges.mask {
             flags.push("消");
         }
-        if self.conceal_pages.contains(&idx) {
+        if badges.conceal {
             flags.push("隠");
         }
-        if self.comic_pages.contains(&idx) {
+        if badges.comic {
             flags.push("文");
         }
-        if !self.get_rotation(idx).is_none() {
+        if badges.rotation {
             flags.push("回");
         }
         // 代表サムネピン (ネスト ZIP では本ごとピン Model B: ルート = zip_path /
@@ -7133,6 +7159,7 @@ impl App {
                     self.draw_mouse_ring_flick_overlay(ui, full_rect);
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
+                    self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                     self.draw_feedback_toast(ui, full_rect, ctx);
                     self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
@@ -7158,6 +7185,7 @@ impl App {
                     self.draw_mouse_ring_flick_overlay(ui, full_rect);
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
+                    self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                     self.draw_feedback_toast(ui, full_rect, ctx);
                     self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
@@ -7283,12 +7311,7 @@ impl App {
                                 }
 
                                 let rot = self.get_rotation(idx);
-                                let has_page_override =
-                                    self.adjustment_page_params.contains_key(&idx);
-                                let has_local_adjust = self.local_adjust_pages.contains(&idx);
-                                let has_mask = self.mask_pages.contains(&idx);
-                                let has_conceal = self.conceal_pages.contains(&idx);
-                                let has_comic = self.comic_pages.contains(&idx);
+                                let badges = self.grid_edit_badges(idx);
                                 let rating = if self.items_are_drive_list {
                                     0
                                 } else {
@@ -7331,11 +7354,11 @@ impl App {
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
                                     spread_pair_cursor_idx == Some(idx),
-                                    has_page_override,
-                                    has_local_adjust,
-                                    has_mask,
-                                    has_conceal,
-                                    has_comic,
+                                    badges.page_override,
+                                    badges.local_adjust,
+                                    badges.mask,
+                                    badges.conceal,
+                                    badges.comic,
                                     rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
@@ -7416,6 +7439,7 @@ impl App {
                 self.draw_mouse_ring_flick_overlay(ui, full_rect);
                 self.draw_gamepad_ring_overlay(ui, full_rect);
                 self.draw_gamepad_picker_overlay(ui, full_rect);
+                self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                 self.draw_feedback_toast(ui, full_rect, ctx);
 
                 nav

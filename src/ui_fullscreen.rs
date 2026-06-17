@@ -671,8 +671,18 @@ impl AdjustScope {
 pub struct FsSpreadLayout {
     pub left_idx: usize,
     pub left_rect: egui::Rect,
+    pub left_hit_rect: egui::Rect,
     pub right_idx: usize,
     pub right_rect: egui::Rect,
+    pub right_hit_rect: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpreadPageDrawRects {
+    left_rect: egui::Rect,
+    left_hit_rect: egui::Rect,
+    right_rect: egui::Rect,
+    right_hit_rect: egui::Rect,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -888,6 +898,68 @@ fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui:
     let fit_scale =
         (rect.width() / display_size.x.max(1.0)).min(rect.height() / display_size.y.max(1.0));
     egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
+}
+
+fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            rect.left() + rect.width() * uv.min.x,
+            rect.top() + rect.height() * uv.min.y,
+        ),
+        egui::pos2(
+            rect.left() + rect.width() * uv.max.x,
+            rect.top() + rect.height() * uv.max.y,
+        ),
+    )
+}
+
+fn layout_spread_page_rects(
+    center: egui::Pos2,
+    left_w: f32,
+    right_w: f32,
+    combined_h: f32,
+    total_scale: f32,
+    spread_gap: f32,
+    left_bbox: egui::Rect,
+    right_bbox: egui::Rect,
+    content_active: bool,
+) -> SpreadPageDrawRects {
+    let scaled_lw = left_w * total_scale;
+    let scaled_rw = right_w * total_scale;
+    let scaled_h = combined_h * total_scale;
+    let scaled_left_visible_w = (left_bbox.width() * left_w).max(1.0) * total_scale;
+    let scaled_right_visible_w = (right_bbox.width() * right_w).max(1.0) * total_scale;
+
+    let total_visible_w = scaled_left_visible_w + spread_gap + scaled_right_visible_w;
+    let visible_start_x = center.x - total_visible_w * 0.5;
+    let start_y = center.y - scaled_h * 0.5;
+    let left_x = visible_start_x - left_bbox.min.x * scaled_lw;
+    let right_visible_x = visible_start_x + scaled_left_visible_w + spread_gap;
+    let right_x = right_visible_x - right_bbox.min.x * scaled_rw;
+
+    let left_rect =
+        egui::Rect::from_min_size(egui::pos2(left_x, start_y), egui::vec2(scaled_lw, scaled_h));
+    let right_rect = egui::Rect::from_min_size(
+        egui::pos2(right_x, start_y),
+        egui::vec2(scaled_rw, scaled_h),
+    );
+    let left_hit_rect = if content_active {
+        normalized_sub_rect(left_rect, left_bbox)
+    } else {
+        left_rect
+    };
+    let right_hit_rect = if content_active {
+        normalized_sub_rect(right_rect, right_bbox)
+    } else {
+        right_rect
+    };
+
+    SpreadPageDrawRects {
+        left_rect,
+        left_hit_rect,
+        right_rect,
+        right_hit_rect,
+    }
 }
 
 fn valid_layout_size_or_fallback(size: egui::Vec2, fallback: egui::Vec2) -> egui::Vec2 {
@@ -1137,6 +1209,7 @@ impl App {
             self.analysis_mode = true;
             self.enter_analysis_mode_bypass();
             // 補正パネルと排他
+            self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
             self.local_adjust_mode = false;
             self.local_adjust_add_layer_dialog_open = false;
@@ -1972,43 +2045,6 @@ fn vertical_reading_reanchor_scroll(scroll: f32, old_offsets: &[f32], new_pos: u
         .get(new_pos)
         .map(|offset| scroll - *offset)
         .unwrap_or(scroll)
-}
-
-/// 見開きの左右ページの content bbox (各ページ正規化座標 0..1) を combined 空間
-/// (幅 `left_w + right_w` × 高さ `combined_h`、左ページが x∈[0,left_w]、右ページが
-/// x∈[left_w, left_w+right_w]) に写像し、union を取って返す。両方 `None` のときは
-/// `None` (= 余白カット無効)。bbox 無しのページは全域 (余白を切らない) 扱い。
-/// 返り値 `(x0, y0, x1, y1)` は combined 空間の矩形。
-pub(crate) fn spread_content_union(
-    margin_left: Option<egui::Rect>,
-    margin_right: Option<egui::Rect>,
-    left_w: f32,
-    right_w: f32,
-    combined_h: f32,
-) -> Option<(f32, f32, f32, f32)> {
-    if margin_left.is_none() && margin_right.is_none() {
-        return None;
-    }
-    let combined_w = left_w + right_w;
-    let (lx0, ly0, lx1, ly1) = match margin_left {
-        Some(b) => (
-            b.min.x * left_w,
-            b.min.y * combined_h,
-            b.max.x * left_w,
-            b.max.y * combined_h,
-        ),
-        None => (0.0, 0.0, left_w, combined_h),
-    };
-    let (rx0, ry0, rx1, ry1) = match margin_right {
-        Some(b) => (
-            left_w + b.min.x * right_w,
-            b.min.y * combined_h,
-            left_w + b.max.x * right_w,
-            b.max.y * combined_h,
-        ),
-        None => (left_w, 0.0, combined_w, combined_h),
-    };
-    Some((lx0.min(rx0), ly0.min(ry0), lx1.max(rx1), ly1.max(ry1)))
 }
 
 /// 指定インデックスの画像が横長（幅>高さ）かを判定する。
@@ -3473,7 +3509,11 @@ impl App {
                                             } else {
                                                 self.effective_fullscreen_fit_mode()
                                             };
-                                            let content_bbox = self.fs_margin_bbox(fs_idx);
+                                            let content_bbox = if state.is_video {
+                                                None
+                                            } else {
+                                                self.view_trim_single_content_bbox(fs_idx)
+                                            };
                                             let bg_style = self.fs_bg_style(ctx);
                                             Self::draw_fs_image(
                                                 ui,
@@ -3538,7 +3578,11 @@ impl App {
                                         } else {
                                             self.effective_fullscreen_fit_mode()
                                         };
-                                        let content_bbox = self.fs_margin_bbox(fs_idx);
+                                        let content_bbox = if state.is_video {
+                                            None
+                                        } else {
+                                            self.view_trim_single_content_bbox(fs_idx)
+                                        };
                                         let bg_style = self.fs_bg_style(ctx);
                                         Self::draw_fs_image(
                                             ui, image_rect,
@@ -3933,6 +3977,13 @@ impl App {
                             let image_size =
                                 state.image_dims.map(|(w, h)| [w as usize, h as usize]);
                             self.draw_export_crop_panel(ctx, full_rect, fs_idx, image_size);
+                        } else if self.view_trim_mode
+                            && !state.is_video
+                            && !compare_wipe_active
+                            && !panorama_mode_active_now
+                            && self.reading_flow.is_paged()
+                        {
+                            self.draw_view_trim_panel(ctx, full_rect, fs_idx, spread_pair);
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
                             // 描画と当たり判定で同じ rect を使う (adjustment_panel_rect 参照)。
@@ -4068,6 +4119,15 @@ impl App {
                             let fit_mode = self.effective_fullscreen_fit_mode();
                             let fit_no_upscale = self.settings.fullscreen_fit_no_upscale;
                             let fit_no_downscale = self.settings.fullscreen_fit_no_downscale;
+                            if is_video_mode
+                                || !self.reading_flow.is_paged()
+                                || panorama_mode_active
+                            {
+                                self.view_trim_mode = false;
+                                self.view_trim_page_apply_root_idx = None;
+                            }
+                            let view_trim_active =
+                                self.view_trim_active_for_display(fs_idx, spread_pair);
                             let mut fit_mode_choice: Option<FullscreenFitMode> = None;
                             let mut fit_no_upscale_choice: Option<bool> = None;
                             let mut fit_no_downscale_choice: Option<bool> = None;
@@ -4105,6 +4165,8 @@ impl App {
                                 &mut fit_mode_choice,
                                 &mut fit_no_upscale_choice,
                                 &mut fit_no_downscale_choice,
+                                &mut self.view_trim_mode,
+                                view_trim_active,
                                 state.pdf_content_type,
                                 is_video_mode,
                                 video_meta,
@@ -4202,9 +4264,17 @@ impl App {
                         }
 
                         // ── 右上フィードバックトースト ──
+                        if self.mouse_ring_flick.is_some()
+                            && self.current_ring_shortcut_context()
+                                == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
+                        {
+                            self.sync_native_video_ring_guide_overlay(ctx);
+                        }
                         self.draw_mouse_ring_flick_overlay(ui, full_rect);
                         self.draw_gamepad_ring_overlay(ui, full_rect);
                         self.draw_gamepad_picker_overlay(ui, full_rect);
+                        self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
+                        self.draw_gamepad_video_marker_picker_overlay(ui, full_rect);
                         self.draw_feedback_toast(ui, full_rect, ctx);
 
                         // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
@@ -6481,7 +6551,6 @@ impl App {
         prev_foreground_hwnd: usize,
     ) -> (i32, bool) {
         let mut nav_delta = 0i32;
-        let mut close = false;
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、連続読み中の
         // デッドな pan-drag (fs_pan に書いても縦/横描画は fs_vertical_scroll しか見ないため
@@ -6628,6 +6697,8 @@ impl App {
                             self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
                         let in_export_crop_panel = self.export_crop_mode
                             && self.export_crop_panel_rect(full_rect).contains(p);
+                        let in_view_trim_panel =
+                            self.view_trim_mode && self.view_trim_panel_rect(full_rect).contains(p);
                         // テキスト注釈モードの左 (一覧) / 右 (詳細) パネル。一覧 ScrollArea を
                         // ホイールでスクロールしたいので、パネル上のホイールはズームに使わない
                         // (実機 FB 2026-06-07)。text mode では image_rect == full_rect なので
@@ -6643,6 +6714,7 @@ impl App {
                             || in_local_adjust_panel
                             || in_conceal_panel
                             || in_export_crop_panel
+                            || in_view_trim_panel
                             || in_text_panel
                             || in_seek_panel
                     })
@@ -6656,11 +6728,16 @@ impl App {
         // 強制的に落とす。
         if compare_wipe_active {
             if self.adjustment_mode && !self.adjustment_dragging {
+                self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
         } else if self.is_overlay_edit_mode_active() {
             // 消しゴム / 補正レイヤー / 隠蔽加工モード中は補正パネルを強制 OFF
             // (編集中に色補正バーが画面端ホバーで開かないように)。
+            self.persist_pending_view_trim_state();
+            self.adjustment_mode = false;
+        } else if self.view_trim_mode {
+            self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else {
             let edge_hover = passive_hover_enabled
@@ -6685,6 +6762,7 @@ impl App {
                 && self.adjustment_mode
                 && !self.adjustment_dragging
             {
+                self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
             }
         }
@@ -6741,14 +6819,7 @@ impl App {
         let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
-        let (wheel_y, ctrl_held, shift_held, alt_held) = ctx.input(|i| {
-            (
-                i.raw_scroll_delta.y,
-                i.modifiers.ctrl,
-                i.modifiers.shift,
-                i.modifiers.alt,
-            )
-        });
+        let (wheel_y, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         #[cfg(windows)]
         let suppress_egui_wheel = should_suppress_egui_wheel_for_native_detached_video(
             state.is_video,
@@ -6779,24 +6850,13 @@ impl App {
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
         } else if wheel_y.abs() > 0.5 && handle_wheel_here {
-            let wheel_pair_applied = !ctrl_held
-                && self.apply_shift_alt_wheel_pair(
-                    ctx,
-                    wheel_y,
-                    shift_held,
-                    alt_held,
-                    Some(default_image_rect),
-                    "fullscreen-wheel-pair",
-                );
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
                 i.events
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
-            if wheel_pair_applied {
-                // handled by configurable mouse wheel pair
-            } else if self.analysis_mode {
+            if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
                 let image_rect = analysis_image_rect(full_rect);
@@ -7076,13 +7136,15 @@ impl App {
                 }
                 match self.update_mouse_ring_flick(ctx, self.current_ring_shortcut_context()) {
                     crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                        close = true;
+                        self.fs_context_menu_idx = self.fullscreen_idx;
+                        self.fs_context_menu_pos = secondary_pos;
                     }
                     crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(pos) => {
                         self.fs_context_menu_idx = self.fullscreen_idx;
                         self.fs_context_menu_pos = pos;
                     }
                     crate::ring_shortcut::MouseFlickOutcome::Fired
+                    | crate::ring_shortcut::MouseFlickOutcome::Cancelled
                     | crate::ring_shortcut::MouseFlickOutcome::None => {}
                 }
             } else if secondary_in_seek_panel {
@@ -7108,9 +7170,10 @@ impl App {
                     self.fs_context_menu_pos = current_pos;
                     self.fs_secondary_press_start = None;
                 } else if secondary_released {
-                    if moved < 20.0 && elapsed < std::time::Duration::from_millis(400) {
-                        // 短押し → 従来通り閉じる
-                        close = true;
+                    if moved < 20.0 {
+                        // 移動なしの右クリック → グリッドと同じくコンテキストメニュー。
+                        self.fs_context_menu_idx = self.fullscreen_idx;
+                        self.fs_context_menu_pos = current_pos;
                     }
                     self.fs_secondary_press_start = None;
                 } else if moved >= 20.0 {
@@ -7120,7 +7183,7 @@ impl App {
             }
         }
 
-        (nav_delta, close)
+        (nav_delta, false)
     }
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
@@ -7775,16 +7838,9 @@ impl App {
     /// `bg_style` が Default 以外のとき、画像 rect の直下に透過背景を塗る。
     ///
     /// 動画は native presenter が独立 HWND に直接描画するので、ここでは
-    /// 余白カットフィット用の中身 bbox を取得 (キャッシュ付き)。設定 OFF / 余白なし /
-    /// pixels 未取得 (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の
-    /// pixels から検出する。
-    pub(crate) fn fs_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
-        if !matches!(
-            self.effective_fullscreen_fit_mode(),
-            FullscreenFitMode::MarginFit
-        ) {
-            return None;
-        }
+    /// 余白カット用の中身 bbox を取得 (キャッシュ付き)。余白なし / pixels 未取得
+    /// (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の pixels から検出する。
+    pub(crate) fn cached_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
         if let Some(cached) = self.fs_margin_bbox_cache.get(&idx) {
             return *cached;
         }
@@ -7906,28 +7962,39 @@ impl App {
                 }
                 _ => tex_size,
             };
-            let margin_bbox = content_bbox
+            let fit_bbox = content_bbox
                 .filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON);
+            let bbox_fit = fit_bbox.map(|bbox| {
+                let bbox_w = (bbox.width() * display_size.x).max(1.0);
+                let bbox_h = (bbox.height() * display_size.y).max(1.0);
+                let center_px = egui::vec2(
+                    (bbox.center().x - 0.5) * display_size.x,
+                    (bbox.center().y - 0.5) * display_size.y,
+                );
+                (bbox_w, bbox_h, center_px)
+            });
             let page_fit =
                 || (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
-            let (fit_scale, content_center_px) = match fit_mode {
-                FullscreenFitMode::MarginFit if margin_bbox.is_some() => {
-                    let bbox = margin_bbox.unwrap();
-                    let bbox_w = (bbox.width() * display_size.x).max(1.0);
-                    let bbox_h = (bbox.height() * display_size.y).max(1.0);
-                    let s = (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h);
-                    let cpx = egui::vec2(
-                        (bbox.center().x - 0.5) * display_size.x,
-                        (bbox.center().y - 0.5) * display_size.y,
-                    );
-                    (s, cpx)
+            let (fit_scale, content_center_px) = match (fit_mode, bbox_fit) {
+                (FullscreenFitMode::Width, Some((bbox_w, _, center_px))) => {
+                    (full_rect.width() / bbox_w, center_px)
                 }
-                FullscreenFitMode::Width => (full_rect.width() / display_size.x, egui::Vec2::ZERO),
-                FullscreenFitMode::Height => {
+                (FullscreenFitMode::Width, None) => {
+                    (full_rect.width() / display_size.x, egui::Vec2::ZERO)
+                }
+                (FullscreenFitMode::Height, Some((_, bbox_h, center_px))) => {
+                    (full_rect.height() / bbox_h, center_px)
+                }
+                (FullscreenFitMode::Height, None) => {
                     (full_rect.height() / display_size.y, egui::Vec2::ZERO)
                 }
-                FullscreenFitMode::Original => (1.0, egui::Vec2::ZERO),
-                _ => (page_fit(), egui::Vec2::ZERO),
+                (FullscreenFitMode::Original, Some((_, _, center_px))) => (1.0, center_px),
+                (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
+                (_, Some((bbox_w, bbox_h, center_px))) => (
+                    (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h),
+                    center_px,
+                ),
+                (_, None) => (page_fit(), egui::Vec2::ZERO),
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
             let (total_scale, base_center) = match zoom_pan {
@@ -7937,8 +8004,16 @@ impl App {
             // 中身 bbox の中心をウィンドウ中心へ寄せる (content_center_px=0 なら従来どおり)。
             let center = base_center - content_center_px * total_scale;
             let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
+            let (paint_rect, uv_rect) = match fit_bbox {
+                Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
+                None => (
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                ),
+            };
             let needs_clip = zoom_pan.is_some()
                 || free_rotation_rad.abs() > TRANSFORM_EPSILON
+                || fit_bbox.is_some()
                 || !matches!(fit_mode, FullscreenFitMode::Page)
                 || fit_scale_limits.active();
             let painter = if needs_clip {
@@ -7949,15 +8024,10 @@ impl App {
             // 透過画像用背景 (B キーで切替)。回転時は img_rect が回転前の bbox になるため
             // 視覚的ズレを避けて rotation が None のときのみ適用する。
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
-                paint_transparent_bg(&painter, img_rect, bg_style);
+                paint_transparent_bg(&painter, paint_rect, bg_style);
             }
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
-                painter.image(
-                    handle.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
+                painter.image(handle.id(), paint_rect, uv_rect, egui::Color32::WHITE);
             } else {
                 crate::app::draw_rotated_image_ex(
                     &painter,
@@ -7968,7 +8038,9 @@ impl App {
                     center,
                 );
             }
-            if should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan) {
+            if fit_bbox.is_none()
+                && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
+            {
                 Self::draw_fs_pixel_grid(
                     &painter,
                     full_rect,
@@ -8217,7 +8289,10 @@ impl App {
         if self.analysis_mode {
             self.reset_analysis_mode();
         }
+        self.persist_pending_view_trim_state();
         self.adjustment_mode = false;
+        self.view_trim_mode = false;
+        self.view_trim_page_apply_root_idx = None;
         if self.erase_mode {
             self.reset_erase_mode();
         }
@@ -9011,6 +9086,24 @@ impl App {
         process
     }
 
+    pub(crate) fn reanchor_continuous_reading_viewer(
+        &mut self,
+        ctx: &egui::Context,
+        old_offsets: &[f32],
+        new_pos: usize,
+        new_idx: usize,
+    ) {
+        if self.items.get(new_idx).is_none() {
+            return;
+        }
+        self.fs_vertical_scroll =
+            vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
+        self.fullscreen_idx = Some(new_idx);
+        self.sync_main_selection_from_viewer_idx(new_idx);
+        self.record_book_resume(new_idx);
+        ctx.request_repaint();
+    }
+
     fn draw_fs_continuous_reading(
         &mut self,
         ui: &mut egui::Ui,
@@ -9100,6 +9193,7 @@ impl App {
                 &location,
                 holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
+                None,
             );
         }
         for separator in separators {
@@ -9116,14 +9210,7 @@ impl App {
             && let Some(unit) = units.get(new_pos)
         {
             let new_idx = unit.anchor_idx;
-            self.fs_vertical_scroll =
-                vertical_reading_reanchor_scroll(self.fs_vertical_scroll, &offsets, new_pos);
-            self.fullscreen_idx = Some(new_idx);
-            self.selected = Some(new_idx);
-            self.scroll_to_selected = true;
-            self.update_last_selected_image();
-            self.record_book_resume(new_idx);
-            ctx.request_repaint();
+            self.reanchor_continuous_reading_viewer(ctx, &offsets, new_pos, new_idx);
         }
 
         self.fs_spread_layout = None;
@@ -10668,9 +10755,9 @@ impl App {
             let Some(layout) = self.fs_spread_layout else {
                 return;
             };
-            let (page_idx, page_rect) = if layout.left_rect.contains(cursor) {
+            let (page_idx, page_rect) = if layout.left_hit_rect.contains(cursor) {
                 (layout.left_idx, layout.left_rect)
-            } else if layout.right_rect.contains(cursor) {
+            } else if layout.right_hit_rect.contains(cursor) {
                 (layout.right_idx, layout.right_rect)
             } else {
                 return;
@@ -10791,16 +10878,18 @@ impl App {
         let fit_scale_limits = self.fullscreen_fit_scale_limits();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
-        // 余白カットフィット (見開き): 各ページの content bbox を取得し、後で左右セットの
-        // union をフィットさせる。回転ページは対象外 (single 同様)。`fs_margin_bbox` は
-        // &mut self なので bg_style の借用より前に算出しておく。
-        let margin_left = if left_rot.is_none() {
-            self.fs_margin_bbox(left_idx)
+        // 表示トリム / 自動余白カット (見開き): 各ページの content bbox を取得し、
+        // 後で左右セットをフィットさせる。回転ページは対象外 (single 同様)。
+        let content_left = if left_rot.is_none() {
+            self.view_trim_spread_content_bbox(left_idx, crate::view_trim::ViewTrimSpreadSide::Left)
         } else {
             None
         };
-        let margin_right = if right_rot.is_none() {
-            self.fs_margin_bbox(right_idx)
+        let content_right = if right_rot.is_none() {
+            self.view_trim_spread_content_bbox(
+                right_idx,
+                crate::view_trim::ViewTrimSpreadSide::Right,
+            )
         } else {
             None
         };
@@ -10851,6 +10940,8 @@ impl App {
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
         let painter = if zoom_pan.is_some()
+            || content_left.is_some()
+            || content_right.is_some()
             || !matches!(fit_mode, FullscreenFitMode::Page)
             || fit_scale_limits.active()
         {
@@ -10867,40 +10958,43 @@ impl App {
             let right_w = rs.x * (combined_h / rs.y);
 
             let combined_w = left_w + right_w;
+            let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            let left_bbox = content_left.unwrap_or(full_bbox);
+            let right_bbox = content_right.unwrap_or(full_bbox);
+            let content_active = content_left.is_some() || content_right.is_some();
+            let left_visible_w = (left_bbox.width() * left_w).max(1.0);
+            let right_visible_w = (right_bbox.width() * right_w).max(1.0);
 
-            // 余白カットフィット: 左右ページの content 矩形を combined 空間に写像して union を
-            // 取り、セット全体の外周余白を詰める (回転なし & 設定 ON & どちらかに bbox あり)。
-            let content = if matches!(fit_mode, FullscreenFitMode::MarginFit) {
-                spread_content_union(margin_left, margin_right, left_w, right_w, combined_h)
-            } else {
-                None
-            };
-
-            // フィット基準: content (余白カット) があればその幅高さ、無ければ combined 全体。
-            let (fit_w, fit_h, content_center) = match content {
-                Some((cx0, cy0, cx1, cy1)) => (
-                    (cx1 - cx0).max(1.0),
+            // 表示トリム / 余白カット時は、見える左右ページを gap に合わせて詰める。
+            // 中央側をトリムした場合も、切った領域が見開き中央に残らないようにする。
+            let (fit_w, fit_h, content_center_offset) = if content_active {
+                let cy0 = (left_bbox.min.y * combined_h).min(right_bbox.min.y * combined_h);
+                let cy1 = (left_bbox.max.y * combined_h).max(right_bbox.max.y * combined_h);
+                (
+                    left_visible_w + right_visible_w,
                     (cy1 - cy0).max(1.0),
-                    egui::vec2((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5),
-                ),
-                None => (
-                    combined_w,
-                    combined_h,
-                    egui::vec2(combined_w * 0.5, combined_h * 0.5),
-                ),
+                    egui::vec2(0.0, ((cy0 + cy1) * 0.5) - (combined_h * 0.5)),
+                )
+            } else {
+                (combined_w, combined_h, egui::Vec2::ZERO)
             };
             let page_fit = || {
                 ((image_rect.width() - spread_gap).max(1.0) / combined_w)
                     .min(image_rect.height() / combined_h)
             };
+            let content_fit = || {
+                ((image_rect.width() - spread_gap).max(1.0) / fit_w)
+                    .min(image_rect.height() / fit_h)
+            };
             let fit_scale = match fit_mode {
-                FullscreenFitMode::MarginFit if content.is_some() => {
-                    ((image_rect.width() - spread_gap).max(1.0) / fit_w)
-                        .min(image_rect.height() / fit_h)
+                FullscreenFitMode::Width if content_active => {
+                    (image_rect.width() - spread_gap).max(1.0) / fit_w
                 }
                 FullscreenFitMode::Width => (image_rect.width() - spread_gap).max(1.0) / combined_w,
+                FullscreenFitMode::Height if content_active => image_rect.height() / fit_h,
                 FullscreenFitMode::Height => image_rect.height() / combined_h,
                 FullscreenFitMode::Original => 1.0,
+                _ if content_active => content_fit(),
                 _ => page_fit(),
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
@@ -10909,47 +11003,41 @@ impl App {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
                 None => (fit_scale, image_rect.center()),
             };
-            // content (= 余白カット後の中身) の中心を画面中心へ寄せる。
-            // content_center=combined 中心のとき (余白カット無効) は従来どおり 0 ずれ。
-            let combined_center = egui::vec2(combined_w * 0.5, combined_h * 0.5);
-            let center = base_center - (content_center - combined_center) * total_scale;
+            let center = base_center - content_center_offset * total_scale;
 
-            let scaled_lw = left_w * total_scale;
-            let scaled_rw = right_w * total_scale;
-            let scaled_h = combined_h * total_scale;
-
-            // 全体を中央に配置
-            let total_w = scaled_lw + spread_gap + scaled_rw;
-            let start_x = center.x - total_w * 0.5;
-            let start_y = center.y - scaled_h * 0.5;
-
-            let left_rect = egui::Rect::from_min_size(
-                egui::pos2(start_x, start_y),
-                egui::vec2(scaled_lw, scaled_h),
-            );
-            let right_rect = egui::Rect::from_min_size(
-                egui::pos2(start_x + scaled_lw + spread_gap, start_y),
-                egui::vec2(scaled_rw, scaled_h),
+            // 見える領域を中央に配置し、フルページ矩形はその背後へ戻す。
+            let spread_rects = layout_spread_page_rects(
+                center,
+                left_w,
+                right_w,
+                combined_h,
+                total_scale,
+                spread_gap,
+                left_bbox,
+                right_bbox,
+                content_active,
             );
 
             // ナビロック中でも、新 target が items に入った後は旧ページを
             // fallback 描画しない。タイトル/パスだけ先に進み、画像だけ旧フォルダに
             // 残る状態を避けるため、描画可否は helper に集約する。
             let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
-            for (rect, idx, rot, location, display_tex) in [
+            for (rect, idx, rot, location, display_tex, content_bbox) in [
                 (
-                    left_rect,
+                    spread_rects.left_rect,
                     left_idx,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
+                    content_left,
                 ),
                 (
-                    right_rect,
+                    spread_rects.right_rect,
                     right_idx,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
+                    content_right,
                 ),
             ] {
                 Self::draw_fs_spread_page(
@@ -10962,15 +11050,18 @@ impl App {
                     location,
                     holdover_for_locked.as_ref(),
                     display_tex,
+                    content_bbox,
                 );
             }
 
             // ルーペが参照するレイアウトを記録 (両ページのサイズが既知のときのみ信頼できる)
             self.fs_spread_layout = Some(FsSpreadLayout {
                 left_idx,
-                left_rect,
+                left_rect: spread_rects.left_rect,
+                left_hit_rect: spread_rects.left_hit_rect,
                 right_idx,
-                right_rect,
+                right_rect: spread_rects.right_rect,
+                right_hit_rect: spread_rects.right_hit_rect,
             });
         } else {
             // サイズ不明の場合は均等分割フォールバック
@@ -10985,13 +11076,14 @@ impl App {
             );
             // フォールバック分岐でも nav ロック中の holdover 可否は上のパスと同じ。
             let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
-            for (rect, idx, rot, location, display_tex) in [
+            for (rect, idx, rot, location, display_tex, content_bbox) in [
                 (
                     left_rect,
                     left_idx,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
+                    content_left,
                 ),
                 (
                     right_rect,
@@ -10999,6 +11091,7 @@ impl App {
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
+                    content_right,
                 ),
             ] {
                 Self::draw_fs_spread_page(
@@ -11011,6 +11104,7 @@ impl App {
                     location,
                     holdover_for_locked.as_ref(),
                     display_tex,
+                    content_bbox,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -11066,6 +11160,7 @@ impl App {
         location_display: &str,
         holdover_tex: Option<&egui::TextureHandle>,
         display_tex: Option<&egui::TextureHandle>,
+        content_bbox: Option<egui::Rect>,
     ) {
         let thumb_tex = match thumbnails.get(idx) {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
@@ -11082,15 +11177,18 @@ impl App {
                 _ => tex_size,
             };
             let img_rect = fit_display_size_in_rect(rect, display_size);
-            // 回転中は bbox のズレを避けて背景を適用しない
-            if rotation.is_none() {
-                paint_transparent_bg(painter, img_rect, bg_style);
-                painter.image(
-                    handle.id(),
+            let fit_bbox = content_bbox.filter(|_| rotation.is_none());
+            let (paint_rect, uv_rect) = match fit_bbox {
+                Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
+                None => (
                     img_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
+                ),
+            };
+            // 回転中は bbox のズレを避けて背景を適用しない
+            if rotation.is_none() {
+                paint_transparent_bg(painter, paint_rect, bg_style);
+                painter.image(handle.id(), paint_rect, uv_rect, egui::Color32::WHITE);
             } else {
                 crate::app::draw_rotated_image(painter, handle.id(), img_rect, rotation);
             }
@@ -11133,6 +11231,7 @@ impl App {
             && !self.show_metadata_panel
             && !self.metadata_panel_hover_active
             && !self.adjustment_mode
+            && !self.view_trim_mode
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.spread_popup_open
@@ -11187,9 +11286,9 @@ impl App {
         ai_upscale_info: Option<(&str, u32, u32)>,
         // 画像補正パネル表示トグル
         adjustment_mode: &mut bool,
-        local_adjust_mode: &mut bool,
+        _local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
-        has_page_override: bool,
+        _has_page_override: bool,
         // ズーム/フィットモード (画像のみ)。fit_mode = 現在の実効モード。
         // ボタンクリックで fit_popup_open をトグルし、メニュー項目選択で
         // fit_mode_choice に選択モードを返す ([0] キーの循環とは別系統)。
@@ -11200,6 +11299,8 @@ impl App {
         fit_mode_choice: &mut Option<FullscreenFitMode>,
         fit_no_upscale_choice: &mut Option<bool>,
         fit_no_downscale_choice: &mut Option<bool>,
+        view_trim_mode: &mut bool,
+        _view_trim_active: bool,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
         pdf_content_type: Option<PdfPageContentType>,
         // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
@@ -11238,6 +11339,7 @@ impl App {
             && !*spread_popup_open
             && !*fit_popup_open
             && !*adjustment_mode
+            && !*view_trim_mode
         {
             return;
         }
@@ -11832,19 +11934,11 @@ impl App {
                 if fit_no_upscale { "ON" } else { "OFF" },
                 if fit_no_downscale { "ON" } else { "OFF" }
             );
-            let fit_tip = if !reading_flow.is_paged() {
-                format!(
-                    "ズーム/フィット: {} [クリックで選択 / 0で循環]\n{}\n連結モードでは余白カットフィットをスキップ",
-                    fit_mode.label(),
-                    limit_tip
-                )
-            } else {
-                format!(
-                    "ズーム/フィット: {} [クリックで選択 / 0で循環]\n{}",
-                    fit_mode.label(),
-                    limit_tip
-                )
-            };
+            let fit_tip = format!(
+                "ズーム/フィット: {} [クリックで選択 / 0で循環]\n{}",
+                fit_mode.label(),
+                limit_tip
+            );
             let mf_resp = mf_resp.hover_tip_dark(fit_tip);
             fit_resp_rect = mf_resp.rect;
             if mf_resp.clicked() {
@@ -12008,55 +12102,6 @@ impl App {
                     *fit_popup_open = false;
                 }
             }
-        }
-
-        // 🎨 画像補正パネルトグルボタン (動画では非表示)
-        // 補正ボタン (360 モード中は非表示)
-        if !is_video && !panorama_mode_active && reading_flow.is_paged() {
-            let btn_rect = egui::Rect::from_min_size(
-                egui::pos2(next_x, bar_rect.min.y + BAR_BUTTON_MARGIN),
-                egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
-            );
-            let resp = ui.interact(
-                btn_rect,
-                egui::Id::new("fs_adjust_btn"),
-                egui::Sense::click(),
-            );
-            let bg = if *adjustment_mode {
-                egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
-            } else if has_page_override {
-                // 個別設定が効いているときは薄い警告色でヒント
-                egui::Color32::from_rgba_unmultiplied(120, 100, 60, 200)
-            } else if resp.hovered() {
-                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-            };
-            ui.painter().rect_filled(btn_rect, 4.0, bg);
-            ui.painter().text(
-                btn_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "🎨",
-                egui::FontId::proportional(16.0),
-                egui::Color32::WHITE,
-            );
-            let tooltip = if has_page_override {
-                "画像補正 (このページは個別設定あり)"
-            } else {
-                "画像補正"
-            };
-            let resp = resp.hover_tip_dark(tooltip);
-            if resp.clicked() {
-                let opening = !*adjustment_mode;
-                *adjustment_mode = opening;
-                if opening {
-                    *local_adjust_mode = false;
-                }
-            }
-            if resp.hovered() {
-                *nav_delta = 0;
-            }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
         // ── 左側: フォルダ + ファイル名 (または archive > entry) ──
@@ -13167,25 +13212,38 @@ impl App {
     ) -> egui::Rect {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
         let display_size = rotated_display_size(tex_size, rotation);
-        let margin_bbox = content_bbox.filter(|_| rotation.is_none());
+        let fit_bbox = content_bbox.filter(|_| rotation.is_none());
+        let bbox_fit = fit_bbox.map(|bbox| {
+            let bbox_w = (bbox.width() * display_size.x).max(1.0);
+            let bbox_h = (bbox.height() * display_size.y).max(1.0);
+            let center = egui::vec2(
+                (bbox.center().x - 0.5) * display_size.x,
+                (bbox.center().y - 0.5) * display_size.y,
+            );
+            (bbox_w, bbox_h, center)
+        });
         let page_fit =
             || (image_rect.width() / display_size.x).min(image_rect.height() / display_size.y);
-        let (fit_scale, content_center_px) = match fit_mode {
-            FullscreenFitMode::MarginFit if margin_bbox.is_some() => {
-                let bbox = margin_bbox.unwrap();
-                let bbox_w = (bbox.width() * display_size.x).max(1.0);
-                let bbox_h = (bbox.height() * display_size.y).max(1.0);
-                let scale = (image_rect.width() / bbox_w).min(image_rect.height() / bbox_h);
-                let center = egui::vec2(
-                    (bbox.center().x - 0.5) * display_size.x,
-                    (bbox.center().y - 0.5) * display_size.y,
-                );
-                (scale, center)
+        let (fit_scale, content_center_px) = match (fit_mode, bbox_fit) {
+            (FullscreenFitMode::Width, Some((bbox_w, _, center))) => {
+                (image_rect.width() / bbox_w, center)
             }
-            FullscreenFitMode::Width => (image_rect.width() / display_size.x, egui::Vec2::ZERO),
-            FullscreenFitMode::Height => (image_rect.height() / display_size.y, egui::Vec2::ZERO),
-            FullscreenFitMode::Original => (1.0, egui::Vec2::ZERO),
-            _ => (page_fit(), egui::Vec2::ZERO),
+            (FullscreenFitMode::Width, None) => {
+                (image_rect.width() / display_size.x, egui::Vec2::ZERO)
+            }
+            (FullscreenFitMode::Height, Some((_, bbox_h, center))) => {
+                (image_rect.height() / bbox_h, center)
+            }
+            (FullscreenFitMode::Height, None) => {
+                (image_rect.height() / display_size.y, egui::Vec2::ZERO)
+            }
+            (FullscreenFitMode::Original, Some((_, _, center))) => (1.0, center),
+            (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
+            (_, Some((bbox_w, bbox_h, center))) => (
+                (image_rect.width() / bbox_w).min(image_rect.height() / bbox_h),
+                center,
+            ),
+            (_, None) => (page_fit(), egui::Vec2::ZERO),
         };
         let fit_scale = fit_scale_limits.apply(fit_scale);
         let (total_scale, base_center) = match zoom_pan {
@@ -13218,9 +13276,9 @@ impl App {
             let Some(layout) = self.fs_spread_layout else {
                 return Err("見開きレイアウトの準備後に再実行してください".to_string());
             };
-            let (idx, page_rect) = if layout.left_rect.contains(pos) {
+            let (idx, page_rect) = if layout.left_hit_rect.contains(pos) {
                 (layout.left_idx, layout.left_rect)
-            } else if layout.right_rect.contains(pos) {
+            } else if layout.right_hit_rect.contains(pos) {
                 (layout.right_idx, layout.right_rect)
             } else {
                 return Err("ページ上をドラッグしてください".to_string());
@@ -13239,7 +13297,7 @@ impl App {
 
         let source_size = self.capture_region_source_size_for_idx(ctx, fs_idx)?;
         let rotation = self.get_rotation(fs_idx);
-        let content_bbox = self.fs_margin_bbox(fs_idx);
+        let content_bbox = self.view_trim_single_content_bbox(fs_idx);
         let fit_mode = self.effective_fullscreen_fit_mode();
         let fit_scale_limits = self.fullscreen_fit_scale_limits();
         let target_rect = self.capture_region_image_rect_for_source(
@@ -15447,6 +15505,59 @@ mod tests {
         assert!((rect.min_y - expected.min_y).abs() < 0.01, "{rect:?}");
         assert!((rect.max_x - expected.max_x).abs() < 0.01, "{rect:?}");
         assert!((rect.max_y - expected.max_y).abs() < 0.01, "{rect:?}");
+    }
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn spread_layout_collapses_inner_trim_to_gap() {
+        let left_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.90, 1.0));
+        let right_bbox = egui::Rect::from_min_max(egui::pos2(0.10, 0.0), egui::pos2(1.0, 1.0));
+
+        let rects = layout_spread_page_rects(
+            egui::pos2(500.0, 300.0),
+            100.0,
+            100.0,
+            120.0,
+            2.0,
+            8.0,
+            left_bbox,
+            right_bbox,
+            true,
+        );
+
+        assert_f32_close(
+            rects.right_hit_rect.left() - rects.left_hit_rect.right(),
+            8.0,
+        );
+        assert!(rects.left_rect.right() > rects.left_hit_rect.right());
+        assert!(rects.right_rect.left() < rects.right_hit_rect.left());
+    }
+
+    #[test]
+    fn spread_layout_without_trim_keeps_full_rect_gap() {
+        let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+
+        let rects = layout_spread_page_rects(
+            egui::pos2(100.0, 50.0),
+            30.0,
+            40.0,
+            20.0,
+            1.0,
+            5.0,
+            full_bbox,
+            full_bbox,
+            false,
+        );
+
+        assert_f32_close(rects.right_rect.left() - rects.left_rect.right(), 5.0);
+        assert_eq!(rects.left_rect, rects.left_hit_rect);
+        assert_eq!(rects.right_rect, rects.right_hit_rect);
     }
 
     #[test]
