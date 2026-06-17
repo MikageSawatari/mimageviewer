@@ -3151,18 +3151,22 @@ impl App {
                 None
             }
             RingActionId::ImageRotateLeft if context == RingShortcutContext::ImageFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx
-                    && !self.current_fullscreen_spread_is_double(fs_idx)
-                {
-                    self.rotate_image_ccw(fs_idx);
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    if self.current_fullscreen_spread_is_double(fs_idx) {
+                        self.show_feedback_toast("見開き表示中は回転できません".to_string());
+                    } else {
+                        self.rotate_image_ccw(fs_idx);
+                    }
                 }
                 None
             }
             RingActionId::ImageRotateRight if context == RingShortcutContext::ImageFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx
-                    && !self.current_fullscreen_spread_is_double(fs_idx)
-                {
-                    self.rotate_image_cw(fs_idx);
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    if self.current_fullscreen_spread_is_double(fs_idx) {
+                        self.show_feedback_toast("見開き表示中は回転できません".to_string());
+                    } else {
+                        self.rotate_image_cw(fs_idx);
+                    }
                 }
                 None
             }
@@ -3175,11 +3179,15 @@ impl App {
             RingActionId::ImageToggleMetadata
                 if context == RingShortcutContext::ImageFullscreen =>
             {
-                if let Some(fs_idx) = self.fullscreen_idx
-                    && !self.current_fullscreen_spread_is_double(fs_idx)
-                {
-                    self.show_metadata_panel = !self.show_metadata_panel;
-                    self.metadata_panel_hover_active = false;
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    if self.current_fullscreen_spread_is_double(fs_idx) {
+                        self.show_feedback_toast(
+                            "見開き表示中はメタデータ表示を切り替えできません".to_string(),
+                        );
+                    } else {
+                        self.show_metadata_panel = !self.show_metadata_panel;
+                        self.metadata_panel_hover_active = false;
+                    }
                 }
                 None
             }

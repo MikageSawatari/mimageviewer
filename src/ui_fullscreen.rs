@@ -727,6 +727,7 @@ impl CaptureRegionSelection {
 struct VerticalReadingPage {
     idx: usize,
     rect: egui::Rect,
+    content_bbox: Option<egui::Rect>,
 }
 
 #[derive(Clone, Debug)]
@@ -769,6 +770,31 @@ struct ContinuousReadingPageSize {
     idx: usize,
     width: f32,
     height: f32,
+    content_bbox: Option<egui::Rect>,
+}
+
+impl ContinuousReadingPageSize {
+    fn full(idx: usize, width: f32, height: f32) -> Self {
+        Self {
+            idx,
+            width,
+            height,
+            content_bbox: None,
+        }
+    }
+
+    fn bbox(&self) -> egui::Rect {
+        self.content_bbox
+            .unwrap_or_else(|| egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)))
+    }
+
+    fn visible_width(&self) -> f32 {
+        (self.width * self.bbox().width()).max(1.0)
+    }
+
+    fn visible_height(&self) -> f32 {
+        (self.height * self.bbox().height()).max(1.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -827,21 +853,64 @@ impl FullscreenFitScaleLimits {
 fn continuous_reading_page_rects(
     unit_rect: egui::Rect,
     size: &ContinuousReadingUnitSize,
-) -> Vec<(usize, egui::Rect)> {
+) -> Vec<(usize, egui::Rect, Option<egui::Rect>)> {
     let mut rects = Vec::with_capacity(size.pages.len());
-    let mut x = unit_rect.min.x;
+    if size.pages.is_empty() {
+        return rects;
+    }
+    if size.pages.len() == 1 {
+        let page = &size.pages[0];
+        let bbox = page.bbox();
+        let visible_size = egui::vec2(page.visible_width(), page.visible_height());
+        let visible_rect = egui::Rect::from_center_size(unit_rect.center(), visible_size);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                visible_rect.min.x - bbox.min.x * page.width,
+                visible_rect.min.y - bbox.min.y * page.height,
+            ),
+            egui::vec2(page.width, page.height),
+        );
+        rects.push((page.idx, rect, page.content_bbox));
+        return rects;
+    }
+
+    let total_visible_w = size
+        .pages
+        .iter()
+        .map(ContinuousReadingPageSize::visible_width)
+        .sum::<f32>()
+        + size.page_gap.max(0.0) * size.pages.len().saturating_sub(1) as f32;
+    let (visible_y_min, visible_y_max) = size.pages.iter().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(min_y, max_y), page| {
+            let bbox = page.bbox();
+            (
+                min_y.min(bbox.min.y * page.height),
+                max_y.max(bbox.max.y * page.height),
+            )
+        },
+    );
+    let visible_y_min = if visible_y_min.is_finite() {
+        visible_y_min
+    } else {
+        0.0
+    };
+    let visible_h = if visible_y_max.is_finite() {
+        (visible_y_max - visible_y_min).max(1.0)
+    } else {
+        size.height.max(1.0)
+    };
+    let full_top = unit_rect.center().y - visible_h * 0.5 - visible_y_min;
+    let mut visible_x = unit_rect.center().x - total_visible_w.max(1.0) * 0.5;
+
     for page in &size.pages {
-        let rect = if size.pages.len() == 1 {
-            egui::Rect::from_center_size(unit_rect.center(), egui::vec2(page.width, page.height))
-        } else {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(x, unit_rect.min.y),
-                egui::vec2(page.width, page.height),
-            );
-            x += page.width + size.page_gap;
-            rect
-        };
-        rects.push((page.idx, rect));
+        let bbox = page.bbox();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(visible_x - bbox.min.x * page.width, full_top),
+            egui::vec2(page.width, page.height),
+        );
+        visible_x += page.visible_width() + size.page_gap.max(0.0);
+        rects.push((page.idx, rect, page.content_bbox));
     }
     rects
 }
@@ -3186,6 +3255,7 @@ impl App {
         let mut nav_delta: i32 = 0;
         let mut ctrl_nav: Option<i32> = None;
         let mut sibling_nav: Option<i32> = None;
+        let mut mouse_nav: Option<crate::ui_main::AddressBarNav> = None;
         let mut jump_to: Option<usize> = None;
         // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
         // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
@@ -3455,6 +3525,7 @@ impl App {
                         nav_delta = key_action.nav_delta;
                         ctrl_nav = key_action.ctrl_nav;
                         sibling_nav = key_action.sibling_nav;
+                        mouse_nav = key_action.mouse_nav;
                         jump_to = key_action.jump_to;
                         // perf: キー起因のナビはここで input_seq を進める
                         if nav_delta != 0 {
@@ -3463,6 +3534,8 @@ impl App {
                             self.bump_input_seq("fs_ctrl_nav", None);
                         } else if sibling_nav.is_some() {
                             self.bump_input_seq("fs_sibling_nav", None);
+                        } else if mouse_nav.is_some() {
+                            self.bump_input_seq("fs_mouse_nav", None);
                         } else if jump_to.is_some() {
                             self.bump_input_seq("fs_large_jump", None);
                         } else if key_action.close {
@@ -4657,7 +4730,7 @@ impl App {
             close_to_page_list,
             ctrl_nav,
             sibling_nav,
-            None,
+            mouse_nav,
             nav_delta,
             jump_to,
             fs_idx,
@@ -8762,25 +8835,44 @@ impl App {
             .pages
             .iter()
             .copied()
-            .map(|idx| {
+            .enumerate()
+            .map(|(screen_pos, idx)| {
                 let base = self.vertical_reading_base_size(idx, fallback, prefer_processed);
+                let rotation = self.get_rotation(idx);
+                let content_bbox = if rotation.is_none() {
+                    if unit.pages.len() == 2 {
+                        let side = if screen_pos == 0 {
+                            crate::view_trim::ViewTrimSpreadSide::Left
+                        } else {
+                            crate::view_trim::ViewTrimSpreadSide::Right
+                        };
+                        self.view_trim_spread_content_bbox(idx, side)
+                    } else {
+                        self.view_trim_single_content_bbox(idx)
+                    }
+                } else {
+                    None
+                };
                 ContinuousReadingPageSize {
                     idx,
                     width: base.x.max(1.0),
                     height: base.y.max(1.0),
+                    content_bbox,
                 }
             })
             .collect::<Vec<_>>();
 
         if page_bases.len() <= 1 {
-            let page = page_bases.pop().unwrap_or(ContinuousReadingPageSize {
-                idx: unit.anchor_idx,
-                width: fallback.x.max(1.0),
-                height: fallback.y.max(1.0),
+            let page = page_bases.pop().unwrap_or_else(|| {
+                ContinuousReadingPageSize::full(
+                    unit.anchor_idx,
+                    fallback.x.max(1.0),
+                    fallback.y.max(1.0),
+                )
             });
             return ContinuousReadingUnitSize {
-                width: page.width,
-                height: page.height,
+                width: page.visible_width(),
+                height: page.visible_height(),
                 page_gap: 0.0,
                 pages: vec![page],
             };
@@ -8796,10 +8888,35 @@ impl App {
             page.height = combined_h;
             combined_w += page.width;
         }
+        let content_active = page_bases.iter().any(|page| page.content_bbox.is_some());
+        let (unit_width, unit_height) = if content_active {
+            let width = page_bases
+                .iter()
+                .map(ContinuousReadingPageSize::visible_width)
+                .sum::<f32>();
+            let (min_y, max_y) = page_bases.iter().fold(
+                (f32::INFINITY, f32::NEG_INFINITY),
+                |(min_y, max_y), page| {
+                    let bbox = page.bbox();
+                    (
+                        min_y.min(bbox.min.y * page.height),
+                        max_y.max(bbox.max.y * page.height),
+                    )
+                },
+            );
+            let height = if min_y.is_finite() && max_y.is_finite() {
+                (max_y - min_y).max(1.0)
+            } else {
+                combined_h
+            };
+            (width, height)
+        } else {
+            (combined_w, combined_h)
+        };
         ContinuousReadingUnitSize {
             pages: page_bases,
-            width: combined_w.max(1.0),
-            height: combined_h.max(1.0),
+            width: unit_width.max(1.0),
+            height: unit_height.max(1.0),
             page_gap: 0.0,
         }
     }
@@ -9029,8 +9146,12 @@ impl App {
                 });
                 continue;
             }
-            for (idx, rect) in continuous_reading_page_rects(unit_rect, size) {
-                pages.push(VerticalReadingPage { idx, rect });
+            for (idx, rect, content_bbox) in continuous_reading_page_rects(unit_rect, size) {
+                pages.push(VerticalReadingPage {
+                    idx,
+                    rect,
+                    content_bbox,
+                });
             }
         }
 
@@ -9357,7 +9478,7 @@ impl App {
                 &location,
                 holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
-                None,
+                page.content_bbox,
             );
         }
         for separator in separators {
@@ -16217,10 +16338,12 @@ mod tests {
             VerticalReadingPage {
                 idx: 1,
                 rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
+                content_bbox: None,
             },
             VerticalReadingPage {
                 idx: 2,
                 rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
+                content_bbox: None,
             },
         ];
 
@@ -16242,10 +16365,12 @@ mod tests {
             VerticalReadingPage {
                 idx: 1,
                 rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
+                content_bbox: None,
             },
             VerticalReadingPage {
                 idx: 2,
                 rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
+                content_bbox: None,
             },
         ];
 
@@ -16302,11 +16427,7 @@ mod tests {
         let unit_rect =
             egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
         let size = ContinuousReadingUnitSize {
-            pages: vec![ContinuousReadingPageSize {
-                idx: 42,
-                width: 96.0,
-                height: 100.0,
-            }],
+            pages: vec![ContinuousReadingPageSize::full(42, 96.0, 100.0)],
             width: 200.0,
             height: 100.0,
             page_gap: 0.0,
@@ -16316,6 +16437,72 @@ mod tests {
         assert_eq!(rects[0].0, 42);
         assert!((rects[0].1.center().x - unit_rect.center().x).abs() < 0.001);
         assert!((rects[0].1.width() - 96.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn continuous_single_page_rect_aligns_trimmed_content_inside_virtual_unit() {
+        let unit_rect =
+            egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(80.0, 100.0));
+        let size = ContinuousReadingUnitSize {
+            pages: vec![ContinuousReadingPageSize {
+                idx: 7,
+                width: 100.0,
+                height: 100.0,
+                content_bbox: Some(egui::Rect::from_min_max(
+                    egui::pos2(0.1, 0.0),
+                    egui::pos2(0.9, 1.0),
+                )),
+            }],
+            width: 80.0,
+            height: 100.0,
+            page_gap: 0.0,
+        };
+
+        let rects = continuous_reading_page_rects(unit_rect, &size);
+
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, 7);
+        assert_eq!(rects[0].2, size.pages[0].content_bbox);
+        assert!((rects[0].1.width() - 100.0).abs() < 0.001);
+        let visible = normalized_sub_rect(rects[0].1, size.pages[0].bbox());
+        assert!((visible.left() - unit_rect.left()).abs() < 0.001);
+        assert!((visible.right() - unit_rect.right()).abs() < 0.001);
+    }
+
+    #[test]
+    fn continuous_spread_rects_pack_trimmed_inner_edges_to_gap() {
+        let unit_rect =
+            egui::Rect::from_center_size(egui::pos2(100.0, 60.0), egui::vec2(190.0, 120.0));
+        let left_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.9, 1.0));
+        let right_bbox = egui::Rect::from_min_max(egui::pos2(0.1, 0.0), egui::pos2(1.0, 1.0));
+        let size = ContinuousReadingUnitSize {
+            pages: vec![
+                ContinuousReadingPageSize {
+                    idx: 1,
+                    width: 100.0,
+                    height: 120.0,
+                    content_bbox: Some(left_bbox),
+                },
+                ContinuousReadingPageSize {
+                    idx: 2,
+                    width: 100.0,
+                    height: 120.0,
+                    content_bbox: Some(right_bbox),
+                },
+            ],
+            width: 180.0,
+            height: 120.0,
+            page_gap: 10.0,
+        };
+
+        let rects = continuous_reading_page_rects(unit_rect, &size);
+
+        assert_eq!(rects.len(), 2);
+        let left_visible = normalized_sub_rect(rects[0].1, left_bbox);
+        let right_visible = normalized_sub_rect(rects[1].1, right_bbox);
+        assert!((right_visible.left() - left_visible.right() - 10.0).abs() < 0.001);
+        assert!((left_visible.left() - unit_rect.left()).abs() < 0.001);
+        assert!((right_visible.right() - unit_rect.right()).abs() < 0.001);
     }
 
     #[test]
@@ -16339,11 +16526,7 @@ mod tests {
         ];
         let mut sizes = vec![
             ContinuousReadingUnitSize {
-                pages: vec![ContinuousReadingPageSize {
-                    idx: 1,
-                    width: 320.0,
-                    height: 480.0,
-                }],
+                pages: vec![ContinuousReadingPageSize::full(1, 320.0, 480.0)],
                 width: 320.0,
                 height: 480.0,
                 page_gap: 0.0,
@@ -16355,11 +16538,7 @@ mod tests {
                 page_gap: 0.0,
             },
             ContinuousReadingUnitSize {
-                pages: vec![ContinuousReadingPageSize {
-                    idx: 3,
-                    width: 500.0,
-                    height: 700.0,
-                }],
+                pages: vec![ContinuousReadingPageSize::full(3, 500.0, 700.0)],
                 width: 500.0,
                 height: 700.0,
                 page_gap: 0.0,
@@ -16386,11 +16565,7 @@ mod tests {
                 page_gap: 0.0,
             },
             ContinuousReadingUnitSize {
-                pages: vec![ContinuousReadingPageSize {
-                    idx: 2,
-                    width: 640.0,
-                    height: 360.0,
-                }],
+                pages: vec![ContinuousReadingPageSize::full(2, 640.0, 360.0)],
                 width: 640.0,
                 height: 360.0,
                 page_gap: 0.0,

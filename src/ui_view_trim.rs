@@ -7,7 +7,7 @@ use crate::ui_fullscreen::SpreadPair;
 use crate::ui_fullscreen::draw_icons::draw_close_icon;
 use crate::view_trim::{
     MAX_VIEW_TRIM_MARGIN, ViewTrimApplyMode, ViewTrimBookSettings, ViewTrimLinkedMargins,
-    ViewTrimMargins, ViewTrimPageOverride, ViewTrimScope, ViewTrimSpreadSide,
+    ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide,
 };
 
 const PANEL_W: f32 = 260.0;
@@ -541,7 +541,6 @@ impl App {
             match base_apply_mode {
                 ViewTrimApplyMode::Book => {
                     book.enabled = true;
-                    self.view_trim_scope = ViewTrimScope::Book;
                 }
                 ViewTrimApplyMode::None | ViewTrimApplyMode::Auto | ViewTrimApplyMode::Page => {}
             }
@@ -552,14 +551,12 @@ impl App {
         if page_apply_changed {
             if page_apply {
                 self.view_trim_page_apply_root_idx = Some(fs_idx);
-                self.view_trim_scope = ViewTrimScope::Page;
                 page_single.enabled = true;
                 page_left.enabled = true;
                 page_right.enabled = true;
                 changed = true;
             } else {
                 self.view_trim_page_apply_root_idx = None;
-                self.view_trim_scope = ViewTrimScope::Book;
             }
             apply_mode = if page_apply {
                 ViewTrimApplyMode::Page
@@ -690,17 +687,11 @@ impl App {
             }
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_apply_mode = base_apply_mode;
-            self.view_trim_scope = ViewTrimScope::Book;
             self.view_trim_book_settings = book;
             changed = true;
             repaint_requested = true;
         } else {
             self.view_trim_apply_mode = base_apply_mode;
-            self.view_trim_scope = if page_apply {
-                ViewTrimScope::Page
-            } else {
-                ViewTrimScope::Book
-            };
             self.view_trim_book_settings = book;
             if page_apply
                 && (changed

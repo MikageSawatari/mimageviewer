@@ -7879,6 +7879,20 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.display_should_defer_final_ai(idx));
     }
 
+    #[test]
+    fn details_warm_image_dims_uses_pdf_raster_content_type() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        app.items.push(GridItem::PdfPage {
+            pdf_path: std::path::PathBuf::from("c:/p/doc.pdf"),
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w: 321, h: 654 }),
+        });
+
+        assert_eq!(app.details_warm_image_dims(0), Some((321, 654)));
+    }
+
     /// GitHub issue #1 / Codex P2 (AI 先読み): 非表示 Raster PDF の 4096px レンダに AI を
     /// 流すと表示時 native 再レンダで捨てるため、native 着地まで AI 先読みを保留する。
     /// `pdf_prefetch_should_defer_ai` は should_native と違いズーム / in-flight を見ず、
@@ -9861,6 +9875,29 @@ mod favorite_adjustment_defaults_tests {
             app.local_adjust_selected_layers.get(&0).copied(),
             Some(0),
             "残存 layer 数 (1) を超えた選択 idx は clamp される"
+        );
+    }
+
+    #[test]
+    fn remove_items_batch_shifts_view_trim_page_apply_root_idx() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/p/a.jpg");
+        let b = push_image(&mut app, "C:/p/b.jpg");
+        let c = push_image(&mut app, "C:/p/c.jpg");
+        assert_eq!((a, b, c), (0, 1, 2));
+
+        app.view_trim_page_apply_root_idx = Some(c);
+        app.remove_items_batch(&[b]);
+        assert_eq!(
+            app.view_trim_page_apply_root_idx,
+            Some(1),
+            "削除位置より後ろの一時適用 root idx は新 idx へ shift される"
+        );
+
+        app.remove_items_batch(&[1]);
+        assert_eq!(
+            app.view_trim_page_apply_root_idx, None,
+            "一時適用中ページ自体が削除されたら root idx はクリアされる"
         );
     }
 

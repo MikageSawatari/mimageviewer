@@ -25,6 +25,7 @@ pub(crate) struct ScannedDir {
 /// 数百枚のフォルダで per-entry 1-5ms、合計 500-1000ms のブロック源になる
 /// (AI 画像フォルダで計測実績あり)。必ず `entry.file_type()` 側を使うこと。
 /// 方針は [docs/ui-responsiveness.md §1.1](../../docs/ui-responsiveness.md) にまとめてある。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true)
 }

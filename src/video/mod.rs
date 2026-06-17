@@ -1550,6 +1550,34 @@ fn reflow_child_to_parent_client(
 }
 
 #[cfg(windows)]
+fn resize_existing_native_window_to_rect(
+    hwnd: windows::Win32::Foundation::HWND,
+    placement: NativeVideoPlacement,
+    rect: windows::Win32::Foundation::RECT,
+) -> (u32, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos};
+    let w = (rect.right - rect.left).max(1) as u32;
+    let h = (rect.bottom - rect.top).max(1) as u32;
+    let (x, y) = if placement.is_child_window() {
+        (0, 0)
+    } else {
+        (rect.left, rect.top)
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            w as i32,
+            h as i32,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+    (w, h)
+}
+
+#[cfg(windows)]
 fn native_window_mode_for_placement(
     placement: NativeVideoPlacement,
     rect: windows::Win32::Foundation::RECT,
@@ -2371,8 +2399,28 @@ fn run_native_video_output(
                     activate_on_show,
                 } => {
                     if placement == cur_placement && owner_hwnd == cur_owner_hwnd {
-                        // 同一モードへの切替は no-op。App が pending を解除できるよう
-                        // 成功イベントだけは返す (Codex #6 + request_id プロトコル)。
+                        // 同一モードでも rect が変わることがある (detached viewer の
+                        // 仮想フルスクリーン切替など)。window と presenter surface は
+                        // 更新し、App が pending を解除できるよう成功イベントを返す。
+                        let (new_width, new_height) = resize_existing_native_window_to_rect(
+                            window.hwnd(),
+                            placement,
+                            new_rect,
+                        );
+                        presenter.set_hud_geometry(
+                            new_rect.left,
+                            new_rect.top,
+                            new_width,
+                            new_height,
+                        );
+                        if let Err(err) = presenter.resize(new_width, new_height) {
+                            crate::logger::log(format!(
+                                "[native-video] same placement resize_to({new_width}x{new_height}) failed: {err}"
+                            ));
+                        }
+                        if placement.is_child_window() {
+                            last_parent_client_size = (new_width, new_height);
+                        }
                         let _ = ui_event_tx.send((
                             source.source_epoch,
                             NativeVideoOutputEvent::PlacementSwitched {

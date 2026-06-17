@@ -7,19 +7,6 @@ const ZERO_EPS: f32 = 0.0005;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ViewTrimScope {
-    Book,
-    Page,
-}
-
-impl Default for ViewTrimScope {
-    fn default() -> Self {
-        Self::Book
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ViewTrimApplyMode {
     None,
     Auto,

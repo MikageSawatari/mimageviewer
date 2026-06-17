@@ -6472,12 +6472,15 @@ impl App {
         hovered_preview: Option<(usize, egui::Rect)>,
     ) {
         let viewport_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
-        let Some((idx, anchor_rect)) = hovered_preview else {
+        if self.items_are_drive_list || hovered_preview.is_none() {
             self.set_details_hover_thumbnail_idx(None);
             if self.details_hover_thumb_viewport_open {
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
                 self.details_hover_thumb_viewport_open = false;
             }
+            return;
+        }
+        let Some((idx, anchor_rect)) = hovered_preview else {
             return;
         };
 

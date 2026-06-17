@@ -1723,6 +1723,51 @@ impl App {
         ));
     }
 
+    #[cfg(windows)]
+    pub(crate) fn sync_detached_video_child_presenter_rect(&mut self) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !self.viewer_session_is_detached()
+            || !matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            || !matches!(self.items.get(idx), Some(GridItem::Video(_)))
+            || self.native_video_mode_switch.is_some()
+        {
+            return;
+        }
+        let Some((placement, rect, owner_hwnd)) =
+            self.native_video_target_for_presentation(ViewerPresentation::DetachedWindow)
+        else {
+            return;
+        };
+        if !matches!(
+            placement,
+            crate::video::NativeVideoPlacement::DetachedViewerChild
+        ) {
+            return;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) else {
+            return;
+        };
+
+        self.native_video_mode_switch_seq = self.native_video_mode_switch_seq.wrapping_add(1);
+        let request_id = self.native_video_mode_switch_seq;
+        player.switch_native_placement(request_id, placement, owner_hwnd, rect, false);
+        self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
+            request_id,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+        });
+        crate::logger::log(format!(
+            "[native-video] sync detached child rect request={request_id} \
+             rect=({},{} {}x{})",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        ));
+    }
+
     pub(super) fn toggle_video_window_mode(&mut self) {
         if self.viewer_session_is_detached() {
             crate::logger::log(

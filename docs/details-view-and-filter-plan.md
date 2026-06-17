@@ -532,7 +532,8 @@ struct DetailsMetaRequest {
 処理順の推奨:
 
 1. 既存 DB / メモリから取れるものを先に埋める。
-   `ThumbnailState::Loaded.source_dims`、catalog の `source_dims`、PDF meta cache、既存
+   `ThumbnailState::Loaded.source_dims`、PDF ラスターページの `content_type` 寸法、
+   catalog の `source_dims`、PDF meta cache、既存
    `exif_cache` / `metadata_cache` など。同一フォルダ内で既に読んだ値は再利用する。
 2. それでも不足するものだけ I/O する。
    画像ヘッダ/EXIF、FFmpeg probe、PDF/ZIP 列挙など。

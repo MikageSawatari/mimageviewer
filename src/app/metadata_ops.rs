@@ -451,6 +451,18 @@ pub(super) fn run_details_meta_load(
                 .and_then(probe_image_dims_from_bytes);
         }
 
+        if target.load_image_dims
+            && dims.is_none()
+            && let GridItem::PdfPage {
+                content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }),
+                ..
+            } = &target.item
+            && *w > 0
+            && *h > 0
+        {
+            dims = Some((*w, *h));
+        }
+
         if target.load_video_meta
             && let GridItem::Video(path) = &target.item
         {

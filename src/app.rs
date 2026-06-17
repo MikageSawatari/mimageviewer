@@ -26,9 +26,11 @@ pub(crate) use startup_ops::{
 };
 
 use folder_scan::is_miv_upscaled_derivative;
+#[cfg(test)]
+pub(crate) use folder_scan::scan_directory;
 pub(crate) use folder_scan::{
-    ScannedDir, scan_directory, scan_directory_with_convertible_archives,
-    scan_directory_with_settings, signature_from_scan,
+    ScannedDir, scan_directory_with_convertible_archives, scan_directory_with_settings,
+    signature_from_scan,
 };
 #[cfg(test)]
 pub(crate) use grid_paint::cell_has_lower_left_container_badge;
@@ -2692,8 +2694,6 @@ pub struct App {
     pub(crate) view_trim_mode: bool,
     /// 表示トリムの本単位適用モード。Page は旧 DB 互換用で、新規 UI ではここへ永続しない。
     pub(crate) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
-    /// 表示トリムパネルで編集する対象。Book はセッション中の本全体、Page は idx 単位。
-    pub(crate) view_trim_scope: crate::view_trim::ViewTrimScope,
     /// 表示トリムの「このページの個別設定を適用」チェックが有効な fullscreen root idx。
     /// ページ移動時に外れる一時状態で、DB へは保存しない。
     pub(crate) view_trim_page_apply_root_idx: Option<usize>,
@@ -5239,7 +5239,6 @@ impl App {
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
             view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
-            view_trim_scope: crate::view_trim::ViewTrimScope::Book,
             view_trim_page_apply_root_idx: None,
             view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
             view_trim_page_overrides: std::collections::HashMap::new(),
@@ -7824,12 +7823,6 @@ impl App {
         };
         self.view_trim_book_settings = state.book_settings;
         self.view_trim_page_apply_root_idx = None;
-        self.view_trim_scope = match self.view_trim_apply_mode {
-            crate::view_trim::ViewTrimApplyMode::None
-            | crate::view_trim::ViewTrimApplyMode::Auto
-            | crate::view_trim::ViewTrimApplyMode::Book
-            | crate::view_trim::ViewTrimApplyMode::Page => crate::view_trim::ViewTrimScope::Book,
-        };
 
         let legacy_margin_fit = matches!(
             self.settings.fullscreen_fit_mode,
@@ -7844,7 +7837,6 @@ impl App {
             ) {
                 self.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
             }
-            self.view_trim_scope = crate::view_trim::ViewTrimScope::Book;
             self.settings.save();
             if let Some(db) = &self.view_trim_db {
                 let migrated = crate::view_trim::ViewTrimBookState {
@@ -13854,6 +13846,7 @@ impl App {
             .iter()
             .filter_map(|&i| shift(i))
             .collect();
+        self.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx.and_then(shift);
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
         self.conceal_pages = self
             .conceal_pages
@@ -19718,6 +19711,7 @@ impl App {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
                     true
                 } else {
+                    self.sync_detached_video_child_presenter_rect();
                     ctx.request_repaint();
                     false
                 }
@@ -21094,6 +21088,15 @@ impl App {
     }
 
     fn details_warm_image_dims(&self, idx: usize) -> Option<(u32, u32)> {
+        if let Some(GridItem::PdfPage {
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }),
+            ..
+        }) = self.items.get(idx)
+            && *w > 0
+            && *h > 0
+        {
+            return Some((*w, *h));
+        }
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
                 source_dims: Some([w, h]),
