@@ -1209,11 +1209,22 @@ impl NativeOverlayInputRouting {
             // 同じ raw wheel を App へ二重転送しない。
             // モーダル中はカーソルがダイアログ外の dark backdrop にあっても wheel を
             // App へ流さない (= 動画切替誘発防止、Codex P3 C1)。
-            NativeEvent::MouseWheel(_) => {
-                !self.wants_pointer_input && !self.consumed_wheel && !self.modal_dialog_active
+            NativeEvent::MouseWheel(wheel) => {
+                if self.modal_dialog_active || self.consumed_wheel {
+                    false
+                } else if wheel.shift || wheel.alt {
+                    true
+                } else {
+                    !self.wants_pointer_input
+                }
             }
             // モーダル中はクリックも App へ流さない (= 右クリックで fullscreen 終了して
             // 入力中テキストが消える事故防止、Codex P2 C3)。
+            NativeEvent::MouseButton(button)
+                if button.button == crate::video::native_window::NativeVideoMouseButton::Right =>
+            {
+                !self.modal_dialog_active
+            }
             NativeEvent::MouseMove(_) | NativeEvent::MouseButton(_) | NativeEvent::MouseLeave => {
                 !self.wants_pointer_input && !self.modal_dialog_active
             }
@@ -7967,7 +7978,8 @@ mod tests {
         should_claim_text_input_focus,
     };
     use crate::video::native_window::{
-        NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
+        NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
+        NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
     };
 
     fn key(virtual_key: u32) -> NativeVideoKeyEvent {
@@ -7988,6 +8000,29 @@ mod tests {
             shift: false,
             ctrl,
             alt: false,
+        })
+    }
+
+    fn modified_wheel(shift: bool, alt: bool) -> NativeVideoWindowEvent {
+        NativeVideoWindowEvent::MouseWheel(NativeVideoMouseWheelEvent {
+            delta: 120,
+            x: 100,
+            y: 100,
+            shift,
+            ctrl: false,
+            alt,
+        })
+    }
+
+    fn mouse_button(button: NativeVideoMouseButton) -> NativeVideoWindowEvent {
+        NativeVideoWindowEvent::MouseButton(NativeVideoMouseButtonEvent {
+            button,
+            down: true,
+            double_click: false,
+            x: 100,
+            y: 100,
+            shift: false,
+            ctrl: false,
         })
     }
 
@@ -8020,6 +8055,25 @@ mod tests {
             ..Default::default()
         };
         assert!(!over_ui.should_forward_to_ui(&wheel(true)));
+        assert!(over_ui.should_forward_to_ui(&modified_wheel(true, false)));
+        assert!(over_ui.should_forward_to_ui(&modified_wheel(false, true)));
+    }
+
+    #[test]
+    fn native_overlay_routes_right_click_close_over_hud() {
+        let over_ui = NativeOverlayInputRouting {
+            wants_pointer_input: true,
+            ..Default::default()
+        };
+        assert!(over_ui.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Right)));
+        assert!(!over_ui.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Left)));
+
+        let modal = NativeOverlayInputRouting {
+            wants_pointer_input: true,
+            modal_dialog_active: true,
+            ..Default::default()
+        };
+        assert!(!modal.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Right)));
     }
 
     #[test]

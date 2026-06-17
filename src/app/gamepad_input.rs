@@ -10,9 +10,9 @@ use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleas
 use crate::grid_item::GridItem;
 use crate::ring_shortcut::{
     MOUSE_FLICK_MOVE_THRESHOLD_PX, MouseBackForwardActionId, MouseFlickOutcome, MouseFlickState,
-    PostFilterDrillState, RingActionId, RingDirection, RingPickerOriginalState, RingPickerRowId,
-    RingPickerState, RingShortcutContext, WheelPairActionId, mouse_flick_guide_delay,
-    mouse_flick_menu_delay,
+    PostFilterDrillMode, PostFilterDrillState, RingActionId, RingDirection,
+    RingPickerOriginalState, RingPickerRowId, RingPickerState, RingShortcutContext,
+    WheelPairActionId, mouse_flick_guide_delay, mouse_flick_menu_delay,
 };
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
@@ -55,6 +55,8 @@ const VIDEO_PICKER_ROWS: &[RingPickerRowId] = &[
     RingPickerRowId::VideoVolume,
     RingPickerRowId::VideoPlaybackSpeed,
     RingPickerRowId::VideoContinuousMode,
+    RingPickerRowId::ItemRating,
+    RingPickerRowId::ContainerRating,
 ];
 
 struct PostFilterGroup {
@@ -216,7 +218,7 @@ impl App {
         let painter = ui.painter();
         let center = full_rect.center();
         let radius = (full_rect.width().min(full_rect.height()) * 0.18).clamp(72.0, 132.0);
-        let backdrop_radius = radius + 48.0;
+        let backdrop_radius = radius + 82.0;
         painter.circle_filled(
             center,
             backdrop_radius,
@@ -249,6 +251,22 @@ impl App {
                 ring_direction_short_label(direction),
                 egui::FontId::proportional(if is_selected { 14.0 } else { 12.5 }),
                 egui::Color32::WHITE,
+            );
+            let action = self
+                .settings
+                .ring_shortcuts
+                .profile(context)
+                .slots
+                .get(direction.slot_index())
+                .cloned()
+                .unwrap_or_default();
+            let (align, offset) = ring_direction_action_label_layout(direction);
+            painter.text(
+                pos + offset,
+                align,
+                truncate_ring_overlay_label(action.label_for_context(context), 13),
+                egui::FontId::proportional(if is_selected { 12.0 } else { 11.0 }),
+                egui::Color32::from_white_alpha(if is_selected { 245 } else { 205 }),
             );
         }
 
@@ -668,8 +686,18 @@ impl App {
             .get(drill.item)
             .copied()
             .unwrap_or(PostFilter::None);
+        let (title, footer) = match drill.mode {
+            PostFilterDrillMode::Group => (
+                "ポストフィルタ: グループ",
+                "上下:グループ  A:項目へ  B:戻る  X:確定",
+            ),
+            PostFilterDrillMode::Item => (
+                "ポストフィルタ: 項目",
+                "左右:項目  A:選択  B:グループ  X:確定",
+            ),
+        };
         ui.label(
-            egui::RichText::new("ポストフィルタ")
+            egui::RichText::new(title)
                 .size(14.0)
                 .color(egui::Color32::from_white_alpha(200)),
         );
@@ -696,13 +724,13 @@ impl App {
         );
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new(format!("選択中: {}", picker.post_filter.display_label()))
+            egui::RichText::new(format!("現在: {}", picker.post_filter.display_label()))
                 .size(13.0)
                 .color(egui::Color32::from_white_alpha(210)),
         );
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("上下:グループ  左右:項目  A/B:戻る  X:確定")
+            egui::RichText::new(footer)
                 .size(12.0)
                 .color(egui::Color32::from_white_alpha(190)),
         );
@@ -730,7 +758,7 @@ impl App {
             RingPickerRowId::ReadingDirection => picker.reading_direction.label().to_string(),
             RingPickerRowId::FitMode => picker.fit_mode.label().to_string(),
             RingPickerRowId::PostFilter => {
-                format!("{}  Aで選択", picker.post_filter.display_label())
+                format!("{}  Aでグループ選択", picker.post_filter.display_label())
             }
             RingPickerRowId::UpscaleModel => {
                 crate::adjustment::upscale_model_label(picker.upscale_model_key.as_deref())
@@ -906,8 +934,9 @@ impl App {
                     && self.gamepad_state.west_ring_active()
                 {
                     if let Some(dir) = button_dir(action.button) {
-                        self.gamepad_state
-                            .mark_west_ring_direction(ring_direction_from_pad_dir(dir));
+                        let direction = ring_direction_from_dpad_buttons(&self.gamepad_state)
+                            .unwrap_or_else(|| ring_direction_from_pad_dir(dir));
+                        self.gamepad_state.mark_west_ring_direction(direction);
                         self.sync_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     } else if action.button == PadButton::East
@@ -1317,7 +1346,7 @@ impl App {
                 match action.button {
                     PadButton::South if action.kind == PadActionKind::Press => {
                         if self.ring_picker_drill_active() {
-                            self.exit_ring_picker_drill(ctx);
+                            self.confirm_ring_picker_drill(ctx);
                         } else if self.current_ring_picker_row_kind()
                             == Some(RingPickerRowId::PostFilter)
                         {
@@ -1328,7 +1357,7 @@ impl App {
                     }
                     PadButton::East if action.kind == PadActionKind::Press => {
                         if self.ring_picker_drill_active() {
-                            self.exit_ring_picker_drill(ctx);
+                            self.back_ring_picker_drill(ctx);
                         } else {
                             self.cancel_ring_picker(ctx);
                         }
@@ -1560,9 +1589,7 @@ impl App {
                 self.settings.save();
             }
             RingPickerRowId::GridSortOrder if self.settings.sort_order != picker.sort_order => {
-                self.settings.sort_order = picker.sort_order;
-                self.rebuild_visible_indices();
-                self.settings.save();
+                self.apply_grid_picker_sort_order(picker.sort_order);
             }
             RingPickerRowId::GridThumbAspect
                 if self.settings.thumb_aspect_auto != picker.thumb_aspect_auto
@@ -1625,7 +1652,13 @@ impl App {
             {
                 self.preview_current_folder_rating(picker.container_rating);
             }
-            // PostFilter / UpscaleModel remain commit-only to avoid expensive redraws per repeat.
+            RingPickerRowId::PostFilter
+                if self.reading_flow.is_paged()
+                    && self.effective_params(fs_idx).post_filter != picker.post_filter =>
+            {
+                self.preview_picker_post_filter(fs_idx, picker.post_filter);
+            }
+            // UpscaleModel remains commit-only to avoid expensive redraws per repeat.
             _ => {}
         }
     }
@@ -1669,6 +1702,14 @@ impl App {
             {
                 self.set_video_continuous_mode_common(ctx, fs_idx, picker.video_continuous_mode);
             }
+            RingPickerRowId::ItemRating => {
+                self.preview_picker_item_rating(picker, picker.item_rating);
+            }
+            RingPickerRowId::ContainerRating
+                if self.current_folder_rating() != picker.container_rating =>
+            {
+                self.preview_current_folder_rating(picker.container_rating);
+            }
             _ => {}
         }
     }
@@ -1702,39 +1743,107 @@ impl App {
         self.sync_native_video_picker_overlay(ctx);
     }
 
-    fn exit_ring_picker_drill(&mut self, ctx: &egui::Context) {
-        if let Some(picker) = self.ring_picker.as_mut() {
-            picker.drill = None;
+    fn confirm_ring_picker_drill(&mut self, ctx: &egui::Context) {
+        let mut selected_filter = None;
+        let mut needs_sync = false;
+        if let Some(picker) = self.ring_picker.as_mut()
+            && let Some(mut drill) = picker.drill
+        {
+            let group = POST_FILTER_GROUPS
+                .get(drill.group)
+                .unwrap_or(&POST_FILTER_GROUPS[0]);
+            match drill.mode {
+                PostFilterDrillMode::Group => {
+                    drill.mode = PostFilterDrillMode::Item;
+                    drill.item = drill.item.min(group.filters.len().saturating_sub(1));
+                    selected_filter = group.filters.get(drill.item).copied();
+                    picker.drill = Some(drill);
+                }
+                PostFilterDrillMode::Item => {
+                    selected_filter = group.filters.get(drill.item).copied();
+                    picker.drill = None;
+                }
+            }
             picker.x_close_armed = false;
+            needs_sync = true;
         }
-        ctx.request_repaint();
-        self.sync_native_video_picker_overlay(ctx);
+        if let Some(filter) = selected_filter {
+            self.set_ring_picker_post_filter_selection(ctx, filter);
+        } else if needs_sync {
+            ctx.request_repaint();
+            self.sync_native_video_picker_overlay(ctx);
+        }
+    }
+
+    fn back_ring_picker_drill(&mut self, ctx: &egui::Context) {
+        let mut needs_sync = false;
+        if let Some(picker) = self.ring_picker.as_mut()
+            && let Some(mut drill) = picker.drill
+        {
+            if drill.mode == PostFilterDrillMode::Item {
+                drill.mode = PostFilterDrillMode::Group;
+                picker.drill = Some(drill);
+            } else {
+                picker.drill = None;
+            }
+            picker.x_close_armed = false;
+            needs_sync = true;
+        }
+        if needs_sync {
+            ctx.request_repaint();
+            self.sync_native_video_picker_overlay(ctx);
+        }
     }
 
     fn handle_post_filter_drill_direction(&mut self, ctx: &egui::Context, dir: PadDir) {
-        let Some(picker) = self.ring_picker.as_mut() else {
-            return;
-        };
-        let Some(mut drill) = picker.drill else {
-            return;
-        };
-        match dir {
-            PadDir::Up | PadDir::Down => {
-                let delta = if dir == PadDir::Down { 1 } else { -1 };
-                drill.group = cycle_index(POST_FILTER_GROUPS.len(), drill.group, delta);
-                let len = POST_FILTER_GROUPS[drill.group].filters.len();
-                drill.item = drill.item.min(len.saturating_sub(1));
+        let mut selected_filter = None;
+        let mut needs_sync = false;
+        if let Some(picker) = self.ring_picker.as_mut()
+            && let Some(mut drill) = picker.drill
+        {
+            match (drill.mode, dir) {
+                (PostFilterDrillMode::Group, PadDir::Up | PadDir::Down) => {
+                    let delta = if dir == PadDir::Down { 1 } else { -1 };
+                    drill.group = cycle_index(POST_FILTER_GROUPS.len(), drill.group, delta);
+                    let len = POST_FILTER_GROUPS[drill.group].filters.len();
+                    drill.item = drill.item.min(len.saturating_sub(1));
+                }
+                (PostFilterDrillMode::Item, PadDir::Left | PadDir::Right) => {
+                    let delta = if dir == PadDir::Right { 1 } else { -1 };
+                    let len = POST_FILTER_GROUPS[drill.group].filters.len();
+                    drill.item = cycle_index(len, drill.item, delta);
+                    selected_filter = POST_FILTER_GROUPS[drill.group]
+                        .filters
+                        .get(drill.item)
+                        .copied();
+                }
+                _ => {}
             }
-            PadDir::Left | PadDir::Right => {
-                let delta = if dir == PadDir::Right { 1 } else { -1 };
-                let len = POST_FILTER_GROUPS[drill.group].filters.len();
-                drill.item = cycle_index(len, drill.item, delta);
-            }
+            picker.drill = Some(drill);
+            picker.x_close_armed = false;
+            needs_sync = true;
         }
-        picker.post_filter = POST_FILTER_GROUPS[drill.group].filters[drill.item];
-        picker.drill = Some(drill);
-        mark_picker_dirty(picker, RingPickerRowId::PostFilter);
-        picker.x_close_armed = false;
+        if let Some(filter) = selected_filter {
+            self.set_ring_picker_post_filter_selection(ctx, filter);
+        } else if needs_sync {
+            ctx.request_repaint();
+            self.sync_native_video_picker_overlay(ctx);
+        }
+    }
+
+    fn set_ring_picker_post_filter_selection(&mut self, ctx: &egui::Context, filter: PostFilter) {
+        let mut changed = false;
+        if let Some(picker) = self.ring_picker.as_mut() {
+            if picker.post_filter != filter {
+                picker.post_filter = filter;
+                mark_picker_dirty(picker, RingPickerRowId::PostFilter);
+                changed = true;
+            }
+            picker.x_close_armed = false;
+        }
+        if changed {
+            self.preview_ring_picker_row(ctx, RingPickerRowId::PostFilter);
+        }
         ctx.request_repaint();
         self.sync_native_video_picker_overlay(ctx);
     }
@@ -1811,8 +1920,18 @@ impl App {
                 .get(drill.item)
                 .copied()
                 .unwrap_or(PostFilter::None);
+            let (title, footer) = match drill.mode {
+                PostFilterDrillMode::Group => (
+                    "ポストフィルタ: グループ",
+                    "上下:グループ  A:項目へ  B:戻る  X:確定",
+                ),
+                PostFilterDrillMode::Item => (
+                    "ポストフィルタ: 項目",
+                    "左右:項目  A:選択  B:グループ  X:確定",
+                ),
+            };
             crate::video::native_presenter::NativeOverlayRingPickerDrill {
-                title: "ポストフィルタ".to_string(),
+                title: title.to_string(),
                 group_line: format!(
                     "{}/{}  {}",
                     drill.group + 1,
@@ -1825,8 +1944,8 @@ impl App {
                     group.filters.len(),
                     filter.display_label()
                 ),
-                selected_line: format!("選択中: {}", picker.post_filter.display_label()),
-                footer: "上下:グループ  左右:項目  A/B:戻る  X:確定".to_string(),
+                selected_line: format!("現在: {}", picker.post_filter.display_label()),
+                footer: footer.to_string(),
             }
         });
         crate::video::native_presenter::NativeOverlayRingPicker {
@@ -1991,9 +2110,7 @@ impl App {
         if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder)
             && self.settings.sort_order != original.sort_order
         {
-            self.settings.sort_order = original.sort_order;
-            self.rebuild_visible_indices();
-            self.settings.save();
+            self.apply_grid_picker_sort_order(original.sort_order);
         }
         if picker
             .dirty_rows
@@ -2069,6 +2186,12 @@ impl App {
         {
             self.preview_current_folder_rating(original.container_rating);
         }
+        if picker.dirty_rows.contains(&RingPickerRowId::PostFilter)
+            && self.reading_flow.is_paged()
+            && self.effective_params(fs_idx).post_filter != original.post_filter
+        {
+            self.preview_picker_post_filter(fs_idx, original.post_filter);
+        }
     }
 
     fn restore_video_picker_original(
@@ -2112,6 +2235,16 @@ impl App {
             && self.video_continuous_mode != original.video_continuous_mode
         {
             self.set_video_continuous_mode_common(ctx, fs_idx, original.video_continuous_mode);
+        }
+        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            self.restore_picker_item_ratings(&original.item_rating_records);
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+            && self.current_folder_rating() != original.container_rating
+        {
+            self.preview_current_folder_rating(original.container_rating);
         }
     }
 
@@ -2167,9 +2300,7 @@ impl App {
         if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder)
             && self.settings.sort_order != picker.sort_order
         {
-            self.settings.sort_order = picker.sort_order;
-            self.rebuild_visible_indices();
-            settings_changed = true;
+            self.apply_grid_picker_sort_order(picker.sort_order);
         }
         if picker
             .dirty_rows
@@ -2194,6 +2325,16 @@ impl App {
         {
             self.show_container_rating_toast(picker.container_rating);
         }
+    }
+
+    fn apply_grid_picker_sort_order(&mut self, sort_order: SortOrder) {
+        if self.settings.sort_order == sort_order {
+            return;
+        }
+        self.settings.sort_order = sort_order;
+        self.settings.save();
+        self.apply_sort_change_reload();
+        self.scroll_to_selected = true;
     }
 
     fn apply_picker_thumb_aspect(&mut self, auto: bool, aspect: ThumbAspect) {
@@ -2268,6 +2409,9 @@ impl App {
         }
         if self.reading_flow.is_paged() {
             if picker.dirty_rows.contains(&RingPickerRowId::PostFilter) {
+                if self.effective_params(fs_idx).post_filter != picker.original.post_filter {
+                    self.preview_picker_post_filter(fs_idx, picker.original.post_filter);
+                }
                 self.apply_picker_post_filter(fs_idx, picker.post_filter);
             }
             if picker.dirty_rows.contains(&RingPickerRowId::UpscaleModel) {
@@ -2316,6 +2460,17 @@ impl App {
         {
             self.set_video_continuous_mode_common(ctx, fs_idx, picker.video_continuous_mode);
         }
+        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            self.apply_fullscreen_picker_rating(fs_idx, picker.item_rating);
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+            && self.current_folder_rating() != picker.container_rating
+            && self.set_current_folder_rating(picker.container_rating)
+        {
+            self.show_container_rating_toast(picker.container_rating);
+        }
     }
 
     fn apply_fullscreen_picker_rating(&mut self, fs_idx: usize, stars: u8) {
@@ -2338,6 +2493,28 @@ impl App {
         }
     }
 
+    fn preview_picker_post_filter(&mut self, fs_idx: usize, next: PostFilter) {
+        let scope = self.resolve_adjust_scope(fs_idx);
+        let old_params = self.effective_params(fs_idx).clone();
+        if old_params.post_filter == next {
+            return;
+        }
+        let mut params = old_params.clone();
+        params.post_filter = next;
+        match scope {
+            crate::ui_fullscreen::AdjustScope::PageOverride => {
+                self.adjustment_page_params.insert(fs_idx, params.clone());
+            }
+            crate::ui_fullscreen::AdjustScope::FavoriteDefault(id) => {
+                self.adjustment_favorite_params.insert(id, params.clone());
+            }
+            crate::ui_fullscreen::AdjustScope::Global => {
+                self.settings.global_preset = params.clone();
+            }
+        }
+        self.clear_caches_for_param_change(fs_idx, &old_params, &params);
+    }
+
     fn apply_picker_post_filter(&mut self, fs_idx: usize, next: PostFilter) {
         let scope = self.resolve_adjust_scope(fs_idx);
         let old_params = self.effective_params(fs_idx).clone();
@@ -2355,13 +2532,7 @@ impl App {
             format!("ポストフィルタ: {}", next.display_label()),
             |app| {
                 app.write_params_for_scope(fs_idx, scope, params.clone());
-                match scope {
-                    crate::ui_fullscreen::AdjustScope::PageOverride => {
-                        app.clear_caches_for_param_change(fs_idx, &old_params, &params)
-                    }
-                    crate::ui_fullscreen::AdjustScope::FavoriteDefault(_)
-                    | crate::ui_fullscreen::AdjustScope::Global => {}
-                }
+                app.clear_caches_for_param_change(fs_idx, &old_params, &params);
             },
         );
     }
@@ -3508,6 +3679,31 @@ fn ring_direction_from_pad_dir(dir: PadDir) -> RingDirection {
     }
 }
 
+fn ring_direction_from_dpad_buttons(state: &GamepadInputState) -> Option<RingDirection> {
+    let up = state.button_down(PadButton::DPadUp);
+    let down = state.button_down(PadButton::DPadDown);
+    let left = state.button_down(PadButton::DPadLeft);
+    let right = state.button_down(PadButton::DPadRight);
+    let vertical = match (up, down) {
+        (true, false) => Some(PadDir::Up),
+        (false, true) => Some(PadDir::Down),
+        _ => None,
+    };
+    let horizontal = match (left, right) {
+        (true, false) => Some(PadDir::Left),
+        (false, true) => Some(PadDir::Right),
+        _ => None,
+    };
+    match (vertical, horizontal) {
+        (Some(PadDir::Up), Some(PadDir::Right)) => Some(RingDirection::UpRight),
+        (Some(PadDir::Down), Some(PadDir::Right)) => Some(RingDirection::DownRight),
+        (Some(PadDir::Down), Some(PadDir::Left)) => Some(RingDirection::DownLeft),
+        (Some(PadDir::Up), Some(PadDir::Left)) => Some(RingDirection::UpLeft),
+        (Some(dir), None) | (None, Some(dir)) => Some(ring_direction_from_pad_dir(dir)),
+        _ => None,
+    }
+}
+
 fn ring_direction_unit(direction: RingDirection) -> egui::Vec2 {
     const D: f32 = std::f32::consts::FRAC_1_SQRT_2;
     match direction {
@@ -3520,6 +3716,29 @@ fn ring_direction_unit(direction: RingDirection) -> egui::Vec2 {
         RingDirection::Left => egui::vec2(-1.0, 0.0),
         RingDirection::UpLeft => egui::vec2(-D, -D),
     }
+}
+
+fn ring_direction_action_label_layout(direction: RingDirection) -> (egui::Align2, egui::Vec2) {
+    match direction {
+        RingDirection::Up => (egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -32.0)),
+        RingDirection::UpRight => (egui::Align2::LEFT_BOTTOM, egui::vec2(29.0, -27.0)),
+        RingDirection::Right => (egui::Align2::LEFT_CENTER, egui::vec2(34.0, 0.0)),
+        RingDirection::DownRight => (egui::Align2::LEFT_TOP, egui::vec2(29.0, 27.0)),
+        RingDirection::Down => (egui::Align2::CENTER_TOP, egui::vec2(0.0, 32.0)),
+        RingDirection::DownLeft => (egui::Align2::RIGHT_TOP, egui::vec2(-29.0, 27.0)),
+        RingDirection::Left => (egui::Align2::RIGHT_CENTER, egui::vec2(-34.0, 0.0)),
+        RingDirection::UpLeft => (egui::Align2::RIGHT_BOTTOM, egui::vec2(-29.0, -27.0)),
+    }
+}
+
+fn truncate_ring_overlay_label(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3).max(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
 }
 
 fn ring_direction_short_label(direction: RingDirection) -> &'static str {
@@ -3661,12 +3880,8 @@ fn cycle_rating(current: u8, delta: i32) -> u8 {
 }
 
 fn rating_label(stars: u8) -> String {
-    let stars = stars.min(5);
-    if stars == 0 {
-        "なし".to_string()
-    } else {
-        format!("{} / 5", stars)
-    }
+    let stars = stars.min(5) as usize;
+    format!("{}{}", "★".repeat(stars), "☆".repeat(5 - stars))
 }
 
 fn mark_picker_dirty(picker: &mut RingPickerState, row: RingPickerRowId) {
@@ -3700,12 +3915,17 @@ fn drill_for_post_filter(filter: PostFilter) -> PostFilterDrillState {
     for (group_idx, group) in POST_FILTER_GROUPS.iter().enumerate() {
         if let Some(item_idx) = group.filters.iter().position(|&f| f == filter) {
             return PostFilterDrillState {
+                mode: PostFilterDrillMode::Group,
                 group: group_idx,
                 item: item_idx,
             };
         }
     }
-    PostFilterDrillState { group: 0, item: 0 }
+    PostFilterDrillState {
+        mode: PostFilterDrillMode::Group,
+        group: 0,
+        item: 0,
+    }
 }
 
 #[cfg(test)]
@@ -3713,11 +3933,13 @@ mod tests {
     use super::{
         POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis, cycle_rating,
         cycle_video_playback_speed, drill_for_post_filter, gamepad_grid_nav_target_pos,
-        mouse_flick_direction, picker_rows_for_context, ring_direction_from_stick,
+        mouse_flick_direction, picker_rows_for_context, rating_label,
+        ring_direction_from_dpad_buttons, ring_direction_from_stick,
     };
     use crate::adjustment::PostFilter;
-    use crate::ring_shortcut::RingShortcutContext;
+    use crate::gamepad::{GamepadInputState, PadButton};
     use crate::ring_shortcut::{MouseFlickState, RingDirection};
+    use crate::ring_shortcut::{PostFilterDrillMode, RingShortcutContext};
     use crate::settings::{ReadingDirection, ReadingFlow};
     use eframe::egui;
 
@@ -3859,7 +4081,15 @@ mod tests {
         );
         assert_eq!(
             picker_rows_for_context(RingShortcutContext::VideoFullscreen).len(),
-            3
+            5
+        );
+        assert!(
+            picker_rows_for_context(RingShortcutContext::VideoFullscreen)
+                .contains(&crate::ring_shortcut::RingPickerRowId::ItemRating)
+        );
+        assert!(
+            picker_rows_for_context(RingShortcutContext::VideoFullscreen)
+                .contains(&crate::ring_shortcut::RingPickerRowId::ContainerRating)
         );
     }
 
@@ -3868,6 +4098,34 @@ mod tests {
         assert_eq!(cycle_rating(0, -1), 5);
         assert_eq!(cycle_rating(5, 1), 0);
         assert_eq!(cycle_rating(2, 1), 3);
+    }
+
+    #[test]
+    fn rating_label_always_uses_five_stars() {
+        assert_eq!(rating_label(0), "☆☆☆☆☆");
+        assert_eq!(rating_label(2), "★★☆☆☆");
+        assert_eq!(rating_label(7), "★★★★★");
+    }
+
+    #[test]
+    fn dpad_ring_direction_combines_cardinals() {
+        let now = std::time::Instant::now();
+        let mut state = GamepadInputState::default();
+        state.set_button_down(PadButton::DPadUp, true, now);
+        state.set_button_down(PadButton::DPadRight, true, now);
+        assert_eq!(
+            ring_direction_from_dpad_buttons(&state),
+            Some(RingDirection::UpRight)
+        );
+
+        state.set_button_down(PadButton::DPadRight, false, now);
+        assert_eq!(
+            ring_direction_from_dpad_buttons(&state),
+            Some(RingDirection::Up)
+        );
+
+        state.set_button_down(PadButton::DPadDown, true, now);
+        assert_eq!(ring_direction_from_dpad_buttons(&state), None);
     }
 
     #[test]
@@ -3890,6 +4148,7 @@ mod tests {
             assert_eq!(occurrences, 1, "{filter:?}");
 
             let drill = drill_for_post_filter(filter);
+            assert_eq!(drill.mode, PostFilterDrillMode::Group);
             assert_eq!(POST_FILTER_GROUPS[drill.group].filters[drill.item], filter);
         }
     }

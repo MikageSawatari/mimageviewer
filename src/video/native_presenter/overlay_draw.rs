@@ -1787,7 +1787,7 @@ pub(super) fn native_ring_guide_overlay_rect(
     let usable_w = (overlay_width_points - margin * 2.0).max(120.0);
     let usable_h = (overlay_height_points - margin * 2.0).max(120.0);
     let radius = (overlay_width_points.min(overlay_height_points) * 0.18).clamp(72.0, 132.0);
-    let size = ((radius + 56.0) * 2.0).min(usable_w).min(usable_h);
+    let size = ((radius + 88.0) * 2.0).min(usable_w).min(usable_h);
     egui::Rect::from_center_size(
         egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
         egui::vec2(size, size),
@@ -1802,7 +1802,7 @@ pub(super) fn draw_native_ring_guide_overlay(
 ) -> Option<egui::Rect> {
     let outer_rect =
         native_ring_guide_overlay_rect(overlay_width_points, overlay_height_points, guide);
-    let radius = ((outer_rect.width().min(outer_rect.height()) - 104.0) * 0.5).clamp(58.0, 132.0);
+    let radius = ((outer_rect.width().min(outer_rect.height()) - 168.0) * 0.5).clamp(58.0, 132.0);
     let area_response = egui::Area::new(egui::Id::new("native_video_ring_guide_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(outer_rect.min)
@@ -1814,12 +1814,12 @@ pub(super) fn draw_native_ring_guide_overlay(
             let painter = ui.painter();
             painter.circle_filled(
                 center,
-                radius + 48.0,
+                radius + 82.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128),
             );
             painter.circle_stroke(
                 center,
-                radius + 48.0,
+                radius + 82.0,
                 egui::Stroke::new(1.0, egui::Color32::from_white_alpha(56)),
             );
 
@@ -1850,6 +1850,19 @@ pub(super) fn draw_native_ring_guide_overlay(
                     truncate_overlay_text(label, 4),
                     egui::FontId::proportional(if is_selected { 14.0 } else { 12.5 }),
                     egui::Color32::WHITE,
+                );
+                let action_label = guide
+                    .slots
+                    .get(idx)
+                    .map(|slot| slot.action_label.as_str())
+                    .unwrap_or("");
+                let (align, offset) = native_ring_direction_action_label_layout(idx);
+                painter.text(
+                    pos + offset,
+                    align,
+                    truncate_overlay_text(action_label, 13),
+                    egui::FontId::proportional(if is_selected { 12.0 } else { 11.0 }),
+                    egui::Color32::from_white_alpha(if is_selected { 245 } else { 205 }),
                 );
             }
 
@@ -1886,6 +1899,19 @@ pub(super) fn draw_native_ring_guide_overlay(
         });
 
     Some(area_response.response.rect)
+}
+
+fn native_ring_direction_action_label_layout(idx: usize) -> (egui::Align2, egui::Vec2) {
+    match idx {
+        0 => (egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -32.0)),
+        1 => (egui::Align2::LEFT_BOTTOM, egui::vec2(29.0, -27.0)),
+        2 => (egui::Align2::LEFT_CENTER, egui::vec2(34.0, 0.0)),
+        3 => (egui::Align2::LEFT_TOP, egui::vec2(29.0, 27.0)),
+        4 => (egui::Align2::CENTER_TOP, egui::vec2(0.0, 32.0)),
+        5 => (egui::Align2::RIGHT_TOP, egui::vec2(-29.0, 27.0)),
+        6 => (egui::Align2::RIGHT_CENTER, egui::vec2(-34.0, 0.0)),
+        _ => (egui::Align2::RIGHT_BOTTOM, egui::vec2(-29.0, -27.0)),
+    }
 }
 
 fn native_ring_direction_units() -> &'static [egui::Vec2; 8] {

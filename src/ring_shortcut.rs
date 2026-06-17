@@ -831,7 +831,14 @@ impl RingPickerState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostFilterDrillMode {
+    Group,
+    Item,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PostFilterDrillState {
+    pub mode: PostFilterDrillMode,
     pub group: usize,
     pub item: usize,
 }
