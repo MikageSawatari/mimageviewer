@@ -14359,12 +14359,12 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_viewer_cleanup_font_resync_does_not_blank_main_paint() {
+    fn detached_viewer_cleanup_font_resync_uses_conservative_repass() {
         assert!(
-            !should_defer_main_paint_for_font_atlas_resync(
+            should_defer_main_paint_for_font_atlas_resync(
                 FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
             ),
-            "detached viewer close should resync fonts without a one-frame black main window"
+            "detached viewer close should avoid painting with a stale font atlas"
         );
         assert!(
             should_defer_main_paint_for_font_atlas_resync("fullscreen_viewport_cleanup"),

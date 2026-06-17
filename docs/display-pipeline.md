@@ -276,15 +276,16 @@ full upload から再開させる。通常の `configure_fonts` は定義が同�
 `configure_fonts_for_texture_resync` の `set_fonts` は egui 仕様で「次 pass の begin_pass で
 適用」されるため、フル atlas アップロードが効く前にメイン UI を描くと上記 panic が再発する。
 `maybe_defer_for_main_font_atlas_resync` は、`should_defer_main_paint_for_font_atlas_resync` が
-true を返す経路 (`fullscreen_viewport_cleanup` / `native_video_backdrop_hide` /
-`fullscreen_viewport_recreate`) では `ctx.request_discard()` でその pass を破棄し、egui の
+true を返す全 resync 経路 (`detached_viewer_cleanup` / `fullscreen_viewport_cleanup` /
+`native_video_backdrop_hide` / `fullscreen_viewport_recreate`) で `ctx.request_discard()` を使って
+その pass を破棄し、egui の
 **同一 OS フレーム内 multi-pass** (`max_passes`=2) で `update()` を再走させる。次 pass の
 begin_pass で新フォントが適用され、フル atlas アップロードがメイン UI 描画より前に入る。
 破棄された pass は paint されないので黒/空白フレームは出ず、2 度目の pass は入力 events が空
 (`RawInput::take` 済み) なので close / ナビ等の入力起因処理も二重発火しない。`will_discard()`
 が false (multi-pass 予算なし) の稀なケースだけ、従来どおりこの pass の描画を飛ばして次フレーム
-で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup
-(`should_defer_…` が false) は defer せずそのまま描く。
+で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup も、メイン UI を stale
+font atlas のまま描くとフォント崩れが残ることがあるため、同じ保守経路へ乗せる。
 
 なお、専用ボーダーレス fullscreen viewport を閉じると、別トップレベル窓の `Visible(false)` が
 DWM で反映されるまで約 1 フレームかかるため、メインウィンドウが手前に合成されてから fullscreen

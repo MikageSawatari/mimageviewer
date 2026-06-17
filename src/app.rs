@@ -184,8 +184,8 @@ fn should_restore_fullscreen_focus_from_main_focus(
         && !fullscreen_root_key_handled
 }
 
-fn should_defer_main_paint_for_font_atlas_resync(reason: &str) -> bool {
-    reason != FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
+fn should_defer_main_paint_for_font_atlas_resync(_reason: &str) -> bool {
+    true
 }
 
 /// Ctrl+↑↓ フォルダナビゲーションの発火元モード。DFS 完了後に mode に応じて
