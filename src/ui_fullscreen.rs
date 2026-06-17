@@ -2027,6 +2027,52 @@ fn vertical_reading_visible_positions(
         .collect()
 }
 
+fn vertical_reading_process_indices_for_pages<F>(
+    pages: &[VerticalReadingPage],
+    current_idx: usize,
+    image_rect: egui::Rect,
+    reading_flow: ReadingFlow,
+    mut processed_texture_cached: F,
+) -> std::collections::HashSet<usize>
+where
+    F: FnMut(usize) -> bool,
+{
+    let mut candidates = pages.iter().collect::<Vec<_>>();
+    let horizontal = reading_flow.is_horizontal();
+    let center = image_rect.center();
+    candidates.sort_by(|a, b| {
+        let a_current = a.idx != current_idx;
+        let b_current = b.idx != current_idx;
+        let a_dist = if horizontal {
+            (a.rect.center().x - center.x).abs()
+        } else {
+            (a.rect.center().y - center.y).abs()
+        };
+        let b_dist = if horizontal {
+            (b.rect.center().x - center.x).abs()
+        } else {
+            (b.rect.center().y - center.y).abs()
+        };
+        a_current.cmp(&b_current).then_with(|| {
+            a_dist
+                .partial_cmp(&b_dist)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    let mut process = std::collections::HashSet::new();
+    for page in candidates {
+        if processed_texture_cached(page.idx) {
+            continue;
+        }
+        process.insert(page.idx);
+        if process.len() >= VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME {
+            break;
+        }
+    }
+    process
+}
+
 fn vertical_reading_nearest_position(offsets: &[f32], scroll: f32) -> Option<usize> {
     offsets
         .iter()
@@ -9091,12 +9137,17 @@ impl App {
         }
     }
 
-    fn vertical_reading_processed_texture_cached(&self, idx: usize) -> bool {
+    fn vertical_reading_cached_processed_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
         if self.comic_pages.contains(&idx) {
-            self.current_comic_composite_texture(idx).is_some()
+            self.current_comic_composite_texture(idx)
         } else {
-            self.current_final_composite_texture(idx).is_some()
+            self.current_final_composite_texture(idx)
         }
+    }
+
+    fn vertical_reading_processed_texture_cached(&self, idx: usize) -> bool {
+        self.vertical_reading_cached_processed_texture(idx)
+            .is_some()
     }
 
     fn vertical_reading_process_indices(
@@ -9105,40 +9156,13 @@ impl App {
         current_idx: usize,
         image_rect: egui::Rect,
     ) -> std::collections::HashSet<usize> {
-        let mut candidates = pages.iter().collect::<Vec<_>>();
-        let horizontal = self.reading_flow.is_horizontal();
-        let center = image_rect.center();
-        candidates.sort_by(|a, b| {
-            let a_current = a.idx != current_idx;
-            let b_current = b.idx != current_idx;
-            let a_dist = if horizontal {
-                (a.rect.center().x - center.x).abs()
-            } else {
-                (a.rect.center().y - center.y).abs()
-            };
-            let b_dist = if horizontal {
-                (b.rect.center().x - center.x).abs()
-            } else {
-                (b.rect.center().y - center.y).abs()
-            };
-            a_current.cmp(&b_current).then_with(|| {
-                a_dist
-                    .partial_cmp(&b_dist)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        });
-
-        let mut process = std::collections::HashSet::new();
-        for page in candidates {
-            if page.idx != current_idx && self.vertical_reading_processed_texture_cached(page.idx) {
-                continue;
-            }
-            process.insert(page.idx);
-            if process.len() >= VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME {
-                break;
-            }
-        }
-        process
+        vertical_reading_process_indices_for_pages(
+            pages,
+            current_idx,
+            image_rect,
+            self.reading_flow,
+            |idx| self.vertical_reading_processed_texture_cached(idx),
+        )
     }
 
     pub(crate) fn reanchor_continuous_reading_viewer(
@@ -9217,10 +9241,12 @@ impl App {
             let display_tex = if original_preview_active {
                 self.resolve_original_preview_tex(page.idx)
                     .or_else(|| self.resolve_fs_display_tex(page.idx, true))
+            } else if let Some(tex) = self.vertical_reading_cached_processed_texture(page.idx) {
+                Some(tex)
             } else if process_indices.contains(&page.idx) {
                 // 連結読みでも単ページ/見開きと同じ final pipeline を使う。ただし
-                // 新規 GPU upload は中央付近から 1 フレームずつ進め、スクロール中の
-                // 大量同期生成を避ける。
+                // 新規 GPU upload は未生成の可視ページだけを 1 フレームずつ進め、
+                // スクロール中の大量同期生成を避ける。
                 self.resolve_fs_processed_texture(ctx, page.idx, false)
             } else {
                 self.resolve_fs_display_tex(page.idx, true)
@@ -15998,6 +16024,56 @@ mod tests {
 
         assert_eq!(vertical_reading_reanchor_scroll(110.0, &offsets, 2), 0.0);
         assert_eq!(vertical_reading_reanchor_scroll(-110.0, &offsets, 0), 0.0);
+    }
+
+    #[test]
+    fn vertical_reading_process_indices_skip_cached_current_page() {
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let pages = vec![
+            VerticalReadingPage {
+                idx: 1,
+                rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
+            },
+            VerticalReadingPage {
+                idx: 2,
+                rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
+            },
+        ];
+
+        let process = vertical_reading_process_indices_for_pages(
+            &pages,
+            1,
+            image_rect,
+            ReadingFlow::Vertical,
+            |idx| idx == 1,
+        );
+
+        assert_eq!(process, std::collections::HashSet::from([2]));
+    }
+
+    #[test]
+    fn vertical_reading_process_indices_prefers_uncached_current_page() {
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let pages = vec![
+            VerticalReadingPage {
+                idx: 1,
+                rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
+            },
+            VerticalReadingPage {
+                idx: 2,
+                rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
+            },
+        ];
+
+        let process = vertical_reading_process_indices_for_pages(
+            &pages,
+            1,
+            image_rect,
+            ReadingFlow::Vertical,
+            |idx| idx == 2,
+        );
+
+        assert_eq!(process, std::collections::HashSet::from([1]));
     }
 
     #[test]
