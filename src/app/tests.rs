@@ -14181,6 +14181,44 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn still_window_mode_schedules_main_font_resync_when_hiding_fullscreen_viewport() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.video_in_window_mode = false;
+        app.native_video_in_window_active = false;
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.fs_viewport_shown = true;
+
+        app.toggle_still_window_mode();
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+        assert!(app.main_font_atlas_resync_pending);
+        assert_eq!(
+            app.main_font_atlas_resync_reason,
+            Some(FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE)
+        );
+    }
+
+    #[test]
+    fn font_resync_is_not_blocked_by_embedded_still_viewer() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.video_in_window_mode = true;
+        app.native_video_in_window_active = true;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE);
+
+        let deferred = app.maybe_defer_for_main_font_atlas_resync(&ctx, "test");
+
+        assert!(deferred, "embedded still viewer paints on the main ctx");
+        assert!(!app.main_font_atlas_resync_pending);
+        assert_eq!(app.main_font_atlas_resync_generation, 1);
+    }
+
+    #[test]
     fn still_image_root_f11_repeat_is_ignored() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

@@ -142,6 +142,7 @@ pub(crate) enum DetachedViewerBorderlessTransitionPhase {
 }
 
 pub(crate) const FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP: &str = "detached_viewer_cleanup";
+pub(crate) const FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE: &str = "still_window_mode";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ViewerSyncStamp {
@@ -19114,7 +19115,7 @@ impl App {
         if !self.main_font_atlas_resync_pending {
             return false;
         }
-        if self.viewer_session_blocks_main_window() {
+        if self.viewer_session_blocks_main_window() && !self.fullscreen_embedded_still_active() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return false;
         }

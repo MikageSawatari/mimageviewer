@@ -277,7 +277,7 @@ full upload から再開させる。通常の `configure_fonts` は定義が同�
 適用」されるため、フル atlas アップロードが効く前にメイン UI を描くと上記 panic が再発する。
 `maybe_defer_for_main_font_atlas_resync` は、`should_defer_main_paint_for_font_atlas_resync` が
 true を返す全 resync 経路 (`detached_viewer_cleanup` / `fullscreen_viewport_cleanup` /
-`native_video_backdrop_hide` / `fullscreen_viewport_recreate`) で `ctx.request_discard()` を使って
+`native_video_backdrop_hide` / `fullscreen_viewport_recreate` / `still_window_mode`) で `ctx.request_discard()` を使って
 その pass を破棄し、egui の
 **同一 OS フレーム内 multi-pass** (`max_passes`=2) で `update()` を再走させる。次 pass の
 begin_pass で新フォントが適用され、フル atlas アップロードがメイン UI 描画より前に入る。
@@ -286,6 +286,11 @@ begin_pass で新フォントが適用され、フル atlas アップロード�
 が false (multi-pass 予算なし) の稀なケースだけ、従来どおりこの pass の描画を飛ばして次フレーム
 で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup も、メイン UI を stale
 font atlas のまま描くとフォント崩れが残ることがあるため、同じ保守経路へ乗せる。
+
+静止画の F11 / ホバーバーボタンで専用 fullscreen viewport から in-window 表示へ戻す経路は、
+最初の embedded 描画がメイン `egui::Context` で走る。古い fullscreen viewport を隠した後に
+resync を予約すると 1 フレームだけ stale font atlas でメイン UI を描いてしまうため、
+`toggle_still_window_mode` で `still_window_mode` resync を先に予約する。
 
 なお、専用ボーダーレス fullscreen viewport を閉じると、別トップレベル窓の `Visible(false)` が
 DWM で反映されるまで約 1 フレームかかるため、メインウィンドウが手前に合成されてから fullscreen
