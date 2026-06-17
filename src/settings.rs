@@ -778,6 +778,73 @@ impl CachePolicy {
 }
 
 // -----------------------------------------------------------------------
+// ArchiveFileHandling
+// -----------------------------------------------------------------------
+
+/// RAR / 7z / LZH など、ZIP 変換キャッシュを作って閲覧するアーカイブの扱い。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFileHandling {
+    /// 旧 `archive_convert_without_dialog` だけが存在する設定からの読み込み直後。
+    /// UI や実行時判定には出さず、load-time migration で Ask / Convert に寄せる。
+    Legacy,
+    /// 開く前に確認ダイアログを表示する。
+    Ask,
+    /// 確認ダイアログを省略して変換を開始する。
+    Convert,
+    /// 一覧・フォルダ移動・ZIP 内の入れ子提案で変換対象アーカイブを扱わない。
+    Ignore,
+}
+
+impl Default for ArchiveFileHandling {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
+impl ArchiveFileHandling {
+    pub fn from_legacy_without_dialog(without_dialog: bool) -> Self {
+        if without_dialog {
+            Self::Convert
+        } else {
+            Self::Ask
+        }
+    }
+
+    pub fn resolved(self, legacy_without_dialog: bool) -> Self {
+        match self {
+            Self::Legacy => Self::from_legacy_without_dialog(legacy_without_dialog),
+            other => other,
+        }
+    }
+
+    pub fn all_user_visible() -> &'static [Self] {
+        &[Self::Ask, Self::Convert, Self::Ignore]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy | Self::Ask => "確認してからキャッシュを作成する",
+            Self::Convert => "確認せずキャッシュを作成する",
+            Self::Ignore => "無視する",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Legacy | Self::Ask => {
+                "未変換の RAR / 7z / LZH を開くときに確認ダイアログを表示します。"
+            }
+            Self::Convert => {
+                "確認画面だけを省略して変換します。進捗、パスワード入力、エラーは表示します。"
+            }
+            Self::Ignore => {
+                "RAR / 7z / LZH を一覧やフォルダ移動の対象にせず、変換キャッシュも開きません。"
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // インデクサ速度プロファイル (v0.8.0, docs/search-expansion-design.md §7.5)
 // -----------------------------------------------------------------------
 
@@ -1500,8 +1567,12 @@ pub struct Settings {
     /// 0 は無制限 (= 既存挙動)。
     #[serde(default)]
     pub archive_cache_max_bytes: u64,
-    /// RAR / 7z / LZH を開くとき、確認ダイアログを省略して変換キャッシュを作成する。
-    /// 変換中の進捗、パスワード入力、エラーは引き続きダイアログ表示する。
+    /// RAR / 7z / LZH などの変換対象アーカイブをどう扱うか。
+    #[serde(default)]
+    pub archive_file_handling: ArchiveFileHandling,
+    /// 旧設定互換: RAR / 7z / LZH を開くとき、確認ダイアログを省略するか。
+    /// 新規 UI / 実行時判定は `archive_file_handling` を source of truth とし、
+    /// この bool は古い設定の読み込み互換と旧版へ戻した場合の近似互換のために同期する。
     #[serde(default)]
     pub archive_convert_without_dialog: bool,
     /// 一括キャッシュ作成: ZIP 内の全画像をキャッシュ対象にする
@@ -2924,6 +2995,7 @@ impl Default for Settings {
             cache_pdf_always: true,
             cache_zip_always: true,
             archive_cache_max_bytes: 0,
+            archive_file_handling: ArchiveFileHandling::Ask,
             archive_convert_without_dialog: false,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
@@ -3507,6 +3579,7 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
+    settings.migrate_legacy_archive_file_handling();
     settings.sanitize();
 }
 
@@ -3811,6 +3884,25 @@ impl Settings {
         }
     }
 
+    pub fn archive_file_handling_resolved(&self) -> ArchiveFileHandling {
+        self.archive_file_handling
+            .resolved(self.archive_convert_without_dialog)
+    }
+
+    pub fn archive_convert_suppresses_confirm(&self) -> bool {
+        self.archive_file_handling_resolved() == ArchiveFileHandling::Convert
+    }
+
+    pub fn archive_file_handling_ignores_convertible(&self) -> bool {
+        self.archive_file_handling_resolved() == ArchiveFileHandling::Ignore
+    }
+
+    pub fn set_archive_file_handling(&mut self, handling: ArchiveFileHandling) {
+        let handling = handling.resolved(self.archive_convert_without_dialog);
+        self.archive_file_handling = handling;
+        self.archive_convert_without_dialog = handling == ArchiveFileHandling::Convert;
+    }
+
     /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
     /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
     pub fn video_open_resume(&self) -> ResumeMode {
@@ -3904,6 +3996,7 @@ impl Settings {
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
+        let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
         settings.sanitize();
         let mouse_nav_upgrade_prompt_pending = matches!(
             source,
@@ -3988,6 +4081,7 @@ impl Settings {
         if vst3_migrated
             || autoplay_mode_migrated
             || video_loop_migrated
+            || archive_file_handling_migrated
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || mouse_nav_clean_install_defaulted
@@ -4003,6 +4097,22 @@ impl Settings {
                 db_loaded,
             },
         }
+    }
+
+    /// 旧 `archive_convert_without_dialog` から新しい 3 択設定へ移行する。
+    /// `ArchiveFileHandling::Legacy` は serde default 専用で、load 後は残さない。
+    fn migrate_legacy_archive_file_handling(&mut self) -> bool {
+        if self.archive_file_handling != ArchiveFileHandling::Legacy {
+            let old_without_dialog = self.archive_convert_without_dialog;
+            self.archive_convert_without_dialog =
+                self.archive_file_handling == ArchiveFileHandling::Convert;
+            return old_without_dialog != self.archive_convert_without_dialog;
+        }
+        let migrated =
+            ArchiveFileHandling::from_legacy_without_dialog(self.archive_convert_without_dialog);
+        self.archive_file_handling = migrated;
+        self.archive_convert_without_dialog = migrated == ArchiveFileHandling::Convert;
+        true
     }
 
     /// v0.9.0 開発初期版の単一 VST3 プラグイン形式 (`vst3_plugin_path` + `vst3_plugin_state`)
@@ -4308,11 +4418,14 @@ impl Settings {
             settings_diag_log("settings: save suppressed (session-wide flag set)");
             return;
         }
-        // 保存直前に旧フィールドを新フィールドから導出する (Phase 0.10 ループモード移行)。
+        // 保存直前に旧フィールドを新フィールドから導出する。
         // self は &self なので clone してから書き換える。
         let snapshot = {
             let mut s = self.clone();
             s.video_loop = !matches!(s.video_loop_mode, VideoLoopMode::Off);
+            let archive_handling = s.archive_file_handling_resolved();
+            s.archive_file_handling = archive_handling;
+            s.archive_convert_without_dialog = archive_handling == ArchiveFileHandling::Convert;
             s
         };
 
@@ -4440,6 +4553,7 @@ mod tests {
         assert!(s.cache_videos_always);
         assert!(s.cache_webp_always);
         assert_eq!(s.archive_cache_max_bytes, 0);
+        assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ask);
         assert!(!s.archive_convert_without_dialog);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
@@ -5027,6 +5141,36 @@ mod tests {
         let mut s = Settings::default();
         assert!(!s.migrate_legacy_video_loop());
         assert_eq!(s.video_loop_mode, VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn migrate_legacy_archive_handling_uses_old_without_dialog_bool() {
+        let mut s = Settings::default();
+        s.archive_file_handling = ArchiveFileHandling::Legacy;
+        s.archive_convert_without_dialog = true;
+
+        assert!(s.migrate_legacy_archive_file_handling());
+        assert_eq!(s.archive_file_handling, ArchiveFileHandling::Convert);
+        assert!(s.archive_convert_without_dialog);
+
+        let mut s = Settings::default();
+        s.archive_file_handling = ArchiveFileHandling::Legacy;
+        s.archive_convert_without_dialog = false;
+
+        assert!(s.migrate_legacy_archive_file_handling());
+        assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ask);
+        assert!(!s.archive_convert_without_dialog);
+    }
+
+    #[test]
+    fn migrate_legacy_archive_handling_keeps_explicit_ignore() {
+        let mut s = Settings::default();
+        s.archive_file_handling = ArchiveFileHandling::Ignore;
+        s.archive_convert_without_dialog = true;
+
+        assert!(s.migrate_legacy_archive_file_handling());
+        assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ignore);
+        assert!(!s.archive_convert_without_dialog);
     }
 
     #[test]

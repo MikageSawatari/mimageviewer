@@ -6086,7 +6086,13 @@ impl App {
                     }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
-                    let open_outcome = if let Some(cached) = self.try_archive_cache_lookup(&pf) {
+                    let open_outcome = if self.settings.archive_file_handling_ignores_convertible()
+                    {
+                        self.show_feedback_toast(
+                            "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                        );
+                        crate::app::FolderOpenOutcome::Ignored
+                    } else if let Some(cached) = self.try_archive_cache_lookup(&pf) {
                         if self.open_archive_via_cache(pf, cached, auto_fs) {
                             crate::app::FolderOpenOutcome::Loaded
                         } else {

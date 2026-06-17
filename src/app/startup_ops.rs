@@ -246,7 +246,8 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     settings.auto_fullscreen_zip_pdf
         && matches!(kind, crate::folder_tree::OpenablePathKind::File)
         && (crate::folder_tree::is_virtual_folder(openable)
-            || crate::folder_tree::is_convertible_archive_path(openable))
+            || (!settings.archive_file_handling_ignores_convertible()
+                && crate::folder_tree::is_convertible_archive_path(openable)))
 }
 
 fn resolve_startup_open_path(

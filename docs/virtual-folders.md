@@ -125,17 +125,19 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
 - **起動時復元のルーティング**: `App::update` 初回フレームは `load_folder` ではなく
   `load_folder_or_convert_archive` を通す。元アーカイブパスを渡すとキャッシュ参照 →
   `open_archive_via_cache` で開き直し、キャッシュが無ければ変換ダイアログを出す。
-  `archive_convert_without_dialog` が ON の場合は Confirm 画面だけを省略して自動変換する
-  (変換中の進捗 / パスワード入力 / エラーは引き続き表示)。
+  `archive_file_handling` が `Convert` の場合は Confirm 画面だけを省略して自動変換する
+  (変換中の進捗 / パスワード入力 / エラーは引き続き表示)。`Ignore` の場合は
+  キャッシュヒットも含めて変換アーカイブとして開かない。
 - **`resolve_openable_path` / `is_convertible_archive_path`**: 起動復元・アドレスバー入力で
   変換アーカイブを「開けるパス」として返す (ネイティブ ZIP/PDF を判定する `is_virtual_folder`
   とは別関数)。これが無いと変換アーカイブのパスが親フォルダに丸められて本を開き直せない。
-- **Ctrl+↑↓ / 兄弟移動**: `folder_should_stop` と `sorted_subdirs` は RAR/CBR/7z/CB7/LZH/LHA も
-  ZIP/PDF と同じコンテナ候補として扱い、`App::load_folder_nav_target` から
-  `load_folder_or_convert_archive` へ渡す。分割 RAR は先頭パートのみを候補にし、後続パートは
-  フォルダナビで重複停止しない。
+- **Ctrl+↑↓ / 兄弟移動**: `archive_file_handling` が `Ignore` 以外なら、
+  `folder_should_stop` と `sorted_subdirs` は RAR/CBR/7z/CB7/LZH/LHA も ZIP/PDF と同じ
+  コンテナ候補として扱い、`App::load_folder_nav_target` から
+  `load_folder_or_convert_archive` へ渡す。`Ignore` では一覧スキャンと同じく候補から外す。
+  分割 RAR は先頭パートのみを候補にし、後続パートはフォルダナビで重複停止しない。
 - **フルスクリーン Ctrl+↑↓ 中の未変換アーカイブ**: 変換キャッシュが無くても
-  `archive_convert_without_dialog` により確認なしで変換できる場合は、直前ページの
+  `archive_file_handling == Convert` により確認なしで変換できる場合は、直前ページの
   holdover と nav lock を維持し、変換完了後にキャッシュ ZIP を開いてフルスクリーンへ
   復帰する。確認ダイアログ、パスワード入力、エラー、キャンセルなどユーザー操作が
   必要な状態へ入った場合は復帰予約を破棄し、従来どおり一覧/ダイアログ操作へ戻す。
@@ -238,8 +240,9 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   `pending_auto_fs_open` を立てる (ZipFile/PdfFile/ConvertibleArchive のみ。Folder は対象外)。
 - 起動パス / 既存インスタンス転送 (`open_startup_path`) は、解決後の openable が
   ZIP/CBZ/PDF または RAR/CBR/7z/CB7/LZH/LHA のときだけ同じ明示オープン意図を渡す。
-  変換アーカイブは `archive_convert_without_dialog` など既存の変換設定に従い、
+  変換アーカイブは `archive_file_handling` に従い、`Ask` / `Convert` の場合だけ
   キャッシュヒット / 変換確認 / 自動変換の後で同じ deferred fullscreen 経路に入る。
+  `Ignore` では明示オープンの自動フルスクリーン予約も立てない。
 - `load_zip_as_folder` / `load_pdf_as_folder` がこれを `mem::take` し、enumerate 完了で
   先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate` (`DeferredFsReopen`) に
   載せ替える。Ctrl+↑↓ フォルダナビと同じ consume 経路 (`finalize_zip_enumerate` /

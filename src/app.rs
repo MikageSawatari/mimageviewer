@@ -26,7 +26,10 @@ pub(crate) use startup_ops::{
 };
 
 use folder_scan::is_miv_upscaled_derivative;
-pub(crate) use folder_scan::{ScannedDir, scan_directory, signature_from_scan};
+pub(crate) use folder_scan::{
+    ScannedDir, scan_directory, scan_directory_with_convertible_archives,
+    scan_directory_with_settings, signature_from_scan,
+};
 #[cfg(test)]
 pub(crate) use grid_paint::cell_has_lower_left_container_badge;
 pub(crate) use grid_paint::{
@@ -1410,9 +1413,8 @@ fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
 use eframe::egui;
 
 use crate::folder_tree::{
-    FolderNavOutcome, folder_has_still_image, folder_should_stop, is_apple_double,
-    navigate_folder_with_skip, next_folder_dfs, next_sibling_folder, prev_folder_dfs,
-    prev_sibling_folder, walk_dirs_recursive,
+    FolderNavOutcome, is_apple_double, navigate_folder_with_skip, next_folder_dfs,
+    next_sibling_folder, prev_folder_dfs, prev_sibling_folder, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -7600,7 +7602,7 @@ impl App {
         // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
         // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
         // ウイルススキャン等が触っただけで mtime が更新されるケースを救済する。
-        let scan = scan_directory(&folder);
+        let scan = scan_directory_with_settings(&folder, &self.settings);
         let new_sig = signature_from_scan(&scan);
         if self.current_folder_signature == Some(new_sig) {
             self.current_folder_last_mtime = Some(new_mtime);
@@ -8119,6 +8121,13 @@ impl App {
         if path.is_file()
             && let Some(format) = format
         {
+            if self.settings.archive_file_handling_ignores_convertible() {
+                self.pending_auto_fs_open = false;
+                self.show_feedback_toast(
+                    "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                );
+                return FolderOpenOutcome::Ignored;
+            }
             if let Some(cached) = self.try_archive_cache_lookup(&path) {
                 if self
                     .effective_folder()
@@ -8293,7 +8302,7 @@ impl App {
         // pre_scan が与えられていれば DFS スレッドで既に走査済み (UI 非ブロック)。
         // 無ければ UI スレッドで scan_directory を呼ぶ (従来挙動)。
         let scan_t0 = std::time::Instant::now();
-        let scan = pre_scan.unwrap_or_else(|| scan_directory(&path));
+        let scan = pre_scan.unwrap_or_else(|| scan_directory_with_settings(&path, &self.settings));
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
@@ -9927,7 +9936,8 @@ impl App {
         // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
         // 無限再帰にはならない。lookup は mtime+size 検証付き (元 ZIP が更新されたら
         // miss して通常経路 → 列挙で再検出 → 再変換提案)。
-        if let Some(cached) = self.try_archive_cache_lookup(&zip_path)
+        if !self.settings.archive_file_handling_ignores_convertible()
+            && let Some(cached) = self.try_archive_cache_lookup(&zip_path)
             && !crate::folder_tree::path_eq(&cached, &zip_path)
         {
             crate::logger::log(format!(
@@ -10328,6 +10338,7 @@ impl App {
             && self.archive_source_override.is_none()
             && self.archive_convert.is_none()
             && !self.is_snapshot_active()
+            && !self.settings.archive_file_handling_ignores_convertible()
     }
 
     /// ZIP 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出したときの「入れ子を展開した
@@ -17543,7 +17554,13 @@ impl App {
                                 self.record_tag_view_nav_open(&pf);
                             }
                             let open_outcome =
-                                if let Some(cached) = self.try_archive_cache_lookup(&pf) {
+                                if self.settings.archive_file_handling_ignores_convertible() {
+                                    self.show_feedback_toast(
+                                        "設定により RAR / 7z / LZH アーカイブを無視しています"
+                                            .into(),
+                                    );
+                                    FolderOpenOutcome::Ignored
+                                } else if let Some(cached) = self.try_archive_cache_lookup(&pf) {
                                     if self.open_archive_via_cache(pf, cached, auto_fs) {
                                         FolderOpenOutcome::Loaded
                                     } else {
@@ -17843,12 +17860,7 @@ impl App {
         let sibling_only = mode.sibling_only();
         // スライドショー NextFolder だけは判定述語を「静止画あり」にして、動画のみ /
         // 画像なしフォルダを skip-walk で飛ばす。手動 Ctrl+↑↓ 等は従来どおり動画込み。
-        let should_stop: fn(&std::path::Path, Option<&AtomicBool>) -> bool =
-            if matches!(mode, FolderNavMode::SlideshowNext) {
-                folder_has_still_image
-            } else {
-                folder_should_stop
-            };
+        let still_only = matches!(mode, FolderNavMode::SlideshowNext);
         let start_path_disp = if crate::perf::is_enabled() {
             current.display().to_string()
         } else {
@@ -17880,7 +17892,19 @@ impl App {
                         prev_sibling_folder(&current, tree_opts)
                     };
                     path.map(|path| FolderNavOutcome {
-                        hit_image_folder: should_stop(&path, Some(&cancel_w)),
+                        hit_image_folder: if still_only {
+                            crate::folder_tree::folder_has_still_image_with_options(
+                                &path,
+                                Some(&cancel_w),
+                                tree_opts,
+                            )
+                        } else {
+                            crate::folder_tree::folder_should_stop_with_options(
+                                &path,
+                                Some(&cancel_w),
+                                tree_opts,
+                            )
+                        },
                         path,
                     })
                 }
@@ -17888,7 +17912,17 @@ impl App {
                 navigate_folder_with_skip(
                     &current,
                     |p| next_folder_dfs(p, tree_opts),
-                    should_stop,
+                    |path, cancel| {
+                        if still_only {
+                            crate::folder_tree::folder_has_still_image_with_options(
+                                path, cancel, tree_opts,
+                            )
+                        } else {
+                            crate::folder_tree::folder_should_stop_with_options(
+                                path, cancel, tree_opts,
+                            )
+                        }
+                    },
                     skip_limit,
                     Some(&cancel_w),
                 )
@@ -17896,7 +17930,17 @@ impl App {
                 navigate_folder_with_skip(
                     &current,
                     |p| prev_folder_dfs(p, tree_opts),
-                    should_stop,
+                    |path, cancel| {
+                        if still_only {
+                            crate::folder_tree::folder_has_still_image_with_options(
+                                path, cancel, tree_opts,
+                            )
+                        } else {
+                            crate::folder_tree::folder_should_stop_with_options(
+                                path, cancel, tree_opts,
+                            )
+                        }
+                    },
                     skip_limit,
                     Some(&cancel_w),
                 )
@@ -17912,7 +17956,10 @@ impl App {
             } else if let Some(o) = outcome.as_ref() {
                 if o.path.is_dir() {
                     let scan_t0 = std::time::Instant::now();
-                    let s = scan_directory(&o.path);
+                    let s = scan_directory_with_convertible_archives(
+                        &o.path,
+                        tree_opts.include_convertible_archives,
+                    );
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "nav",
@@ -18024,11 +18071,14 @@ impl App {
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         let scan_path = path.clone();
+        let include_convertible_archives =
+            !self.settings.archive_file_handling_ignores_convertible();
         std::thread::spawn(move || {
             if cancel_w.load(Ordering::Relaxed) {
                 return;
             }
-            let scan = scan_directory(&scan_path);
+            let scan =
+                scan_directory_with_convertible_archives(&scan_path, include_convertible_archives);
             if !cancel_w.load(Ordering::Relaxed) {
                 let _ = tx.send(scan);
             }

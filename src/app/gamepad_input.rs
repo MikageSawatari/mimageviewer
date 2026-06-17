@@ -3814,7 +3814,11 @@ impl App {
                 let auto_fs = self.settings.auto_fullscreen_zip_pdf;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
-                if let Some(cached) = self.try_archive_cache_lookup(&path) {
+                if self.settings.archive_file_handling_ignores_convertible() {
+                    self.show_feedback_toast(
+                        "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                    );
+                } else if let Some(cached) = self.try_archive_cache_lookup(&path) {
                     self.open_archive_via_cache(path, cached, auto_fs);
                 } else {
                     self.request_archive_convert(path, format, auto_fs);

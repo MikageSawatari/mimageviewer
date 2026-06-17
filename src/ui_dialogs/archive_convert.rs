@@ -218,11 +218,14 @@ impl App {
         format: ArchiveFormat,
         auto_fullscreen: bool,
     ) -> bool {
+        if self.settings.archive_file_handling_ignores_convertible() {
+            return false;
+        }
         if self.archive_convert.is_some() {
             return false;
         }
         let rx = spawn_archive_scan(src.clone(), format, None);
-        let suppress_confirm = self.settings.archive_convert_without_dialog;
+        let suppress_confirm = self.settings.archive_convert_suppresses_confirm();
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
             format,
@@ -635,8 +638,9 @@ impl App {
                 .archive_convert
                 .as_ref()
                 .is_some_and(|state| state.suppress_confirm_next_time);
-            if suppress_next_time && !self.settings.archive_convert_without_dialog {
-                self.settings.archive_convert_without_dialog = true;
+            if suppress_next_time && !self.settings.archive_convert_suppresses_confirm() {
+                self.settings
+                    .set_archive_file_handling(crate::settings::ArchiveFileHandling::Convert);
                 self.settings.save();
             }
             self.start_archive_convert();

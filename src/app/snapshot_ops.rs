@@ -782,6 +782,12 @@ impl App {
                     return false;
                 };
                 let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
+                if self.settings.archive_file_handling_ignores_convertible() {
+                    self.show_feedback_toast(
+                        "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                    );
+                    return false;
+                }
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
                     self.snapshot_load_and_open(cached, resume_slideshow, None);
                     true
@@ -1089,6 +1095,12 @@ impl App {
             let target_path = match &entry.target {
                 SnapshotTarget::Fs(p) => p.clone(),
                 SnapshotTarget::ConvertibleArchive { path, .. } => {
+                    if self.settings.archive_file_handling_ignores_convertible() {
+                        self.show_feedback_toast(
+                            "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                        );
+                        return false;
+                    }
                     if let Some(cached) = self.try_archive_cache_lookup(path) {
                         cached
                     } else {

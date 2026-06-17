@@ -708,6 +708,7 @@ impl App {
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
                     self.settings.video_thumb_use_sidecar_image,
+                    self.settings.archive_file_handling_resolved(),
                 );
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
@@ -828,6 +829,7 @@ impl App {
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
                     self.settings.video_thumb_use_sidecar_image,
+                    self.settings.archive_file_handling_resolved(),
                 );
                 if old_dup != new_dup {
                     self.reload_current_folder_preserving_override();

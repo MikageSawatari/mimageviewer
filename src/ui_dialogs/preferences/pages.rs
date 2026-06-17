@@ -3,9 +3,9 @@ use crate::ring_shortcut::{
     RingActionId, RingDirection, RingShortcutContext, RingShortcutSettings,
 };
 use crate::settings::{
-    self, AiFeatureMode, CachePolicy, FullscreenFitMode, FullscreenJumpMode, Parallelism,
-    ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, ThumbAspect,
-    ToolbarSectionDisplay, UiTheme,
+    self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
+    Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode,
+    ThumbAspect, ToolbarSectionDisplay, UiTheme,
 };
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -1660,13 +1660,21 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "RAR / 7z / LZH から作成した ZIP キャッシュの容量上限です。\n\
          上限を超えた場合、次回の変換完了後に最終アクセスが古いものから削除します。",
     );
-    ui.checkbox(
-        &mut s.archive_convert_without_dialog,
-        "確認ダイアログを省略してキャッシュを作成する",
-    );
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("RAR / 7z / LZH の処理").strong());
+    let mut archive_handling = s.archive_file_handling_resolved();
+    for &handling in ArchiveFileHandling::all_user_visible() {
+        if ui
+            .radio_value(&mut archive_handling, handling, handling.label())
+            .on_hover_text(handling.description())
+            .changed()
+        {
+            s.set_archive_file_handling(archive_handling);
+        }
+    }
     ui.label(
         egui::RichText::new(
-            "ON にすると、未変換の RAR / 7z / LZH を開いたときに確認画面を省略して変換します。変換中の進捗、パスワード入力、エラーは表示されます。",
+            "「無視する」では、一覧・フォルダ移動・ZIP 内の入れ子変換提案で RAR / 7z / LZH を扱いません。",
         )
         .small()
         .weak(),

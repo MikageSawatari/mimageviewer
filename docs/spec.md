@@ -468,7 +468,7 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 | **動画ファイル** | サムネイル画像（Windows Shell API 経由）。フルスクリーン HUD でユーザーが指定したフレームがあればそれを優先 |
 | **ZIP ファイル** | 1枚目の画像サムネイル＋ZIP バッジ（ダブルクリックで中を開く）。**ユーザーが📌で手動指定**したエントリがあれば自動選定を上書きする |
 | **PDF ファイル** | 1ページ目のサムネイル＋PDF バッジ（ダブルクリックで中を開く）。**ユーザーが📌で手動指定**したページがあれば自動選定を上書きする |
-| **RAR / 7z / LZH などの変換アーカイブ** | 未変換ならアーカイブアイコン＋形式バッジ。1 回開いて変換キャッシュ ZIP ができると、その ZIP の 1 枚目サムネイル＋形式バッジを表示する。変換後ビュー内で📌指定したエントリがあれば代表サムネに反映する |
+| **RAR / 7z / LZH などの変換アーカイブ** | `archive_file_handling` が `Ignore` 以外なら表示する。未変換ならアーカイブアイコン＋形式バッジ。1 回開いて変換キャッシュ ZIP ができると、その ZIP の 1 枚目サムネイル＋形式バッジを表示する。変換後ビュー内で📌指定したエントリがあれば代表サムネに反映する |
 
 #### 代表サムネの手動ピン (folder thumb pin)
 
@@ -760,16 +760,18 @@ X リングは「環境設定 > リングショートカット」で差し替え
 ### 起動引数
 
 `mimageviewer.exe <パス>` の最初の位置引数は起動時に開く対象として扱う。
-通常フォルダはその場所を開き、ZIP / CBZ / PDF / RAR / CBR / 7z / CB7 / LZH / LHA
-は本として開く。通常の画像・動画ファイルが指定された場合は親フォルダを開き、
+通常フォルダはその場所を開き、ZIP / CBZ / PDF は本として開く。RAR / CBR / 7z /
+CB7 / LZH / LHA は `archive_file_handling` が `Ignore` 以外なら本として開く。
+通常の画像・動画ファイルが指定された場合は親フォルダを開き、
 そのファイルをフルスクリーンで開く。ショートカットへのドラッグ＆ドロップや
 SendTo は Windows が対象パスを位置引数として渡すため、この経路で処理する。
 
 `auto_fullscreen_zip_pdf` が ON の場合、起動引数 / SendTo / 外部ファイラ経由で
 ZIP / CBZ / PDF / 対応アーカイブを直接開いたときも、一覧で Enter / ダブルクリックした
 場合と同じ明示オープンとして扱い、ページ一覧を経由せずフルスクリーン表示へ進む。
-RAR / CBR / 7z / CB7 / LZH / LHA は既存の変換設定に従い、確認が必要なら変換ダイアログ、
-表示しない設定なら自動変換を挟んでから開く。パスワード付き PDF は既存のパスワード
+RAR / CBR / 7z / CB7 / LZH / LHA は `archive_file_handling` に従い、`Ask` なら
+変換ダイアログ、`Convert` なら自動変換を挟んでから開く。`Ignore` では開かない。
+パスワード付き PDF は既存のパスワード
 ダイアログと保存済みパスワードを使い、入力成功後に明示オープン時のフルスクリーン
 予約を継続する。
 
@@ -882,7 +884,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `cache_pdf_always` | bool | true | PDF ページは常にキャッシュ |
 | `cache_zip_always` | bool | true | ZIP 内画像は常にキャッシュ |
 | `archive_cache_max_bytes` | u64 | 0 | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP から作成した変換済み ZIP キャッシュの容量上限。`0` は無制限。環境設定では MB 単位で指定する。上限を超えた場合は、次回の変換完了後に最終アクセスが古いキャッシュから削除する。直近で作成したキャッシュは、単体で上限を超えても削除しない |
-| `archive_convert_without_dialog` | bool | false | 未変換の RAR / 7z / LZH (および非 ZIP アーカイブを入れ子に含む ZIP) を開くとき、確認ダイアログを省略して変換キャッシュを作成する。変換中の進捗、パスワード入力、変換エラーは引き続きダイアログ表示する |
+| `archive_file_handling` | ArchiveFileHandling | Ask | RAR / 7z / LZH (および非 ZIP アーカイブを入れ子に含む ZIP) の扱い。`Ask` は確認ダイアログを表示、`Convert` は確認だけ省略して変換、`Ignore` は一覧・フォルダ移動・ZIP 内の入れ子変換提案で扱わず、既存の変換キャッシュも開かない。変換中の進捗、パスワード入力、変換エラーは `Ask` / `Convert` とも表示する |
+| `archive_convert_without_dialog` | bool | false | 旧設定互換フィールド。新規 UI / 実行時判定は `archive_file_handling` を使い、保存時は `archive_file_handling == Convert` に同期する |
 | `batch_cache_zip_contents` | bool | false | 一括キャッシュ作成で ZIP 内の全画像をキャッシュ |
 | `batch_cache_pdf_contents` | bool | false | 一括キャッシュ作成で PDF 内の全ページをキャッシュ |
 | `search_index_checks` | Vec\<PathBuf\> | [] | お気に入り検索インデックス作成でチェック済みのフォルダ |

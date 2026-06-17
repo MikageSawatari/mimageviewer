@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct FolderTreeOptions {
     /// 同名フォルダがある ZIP をスキップする (= `Settings.skip_zip_if_folder_exists`)。
     pub skip_zip: bool,
+    /// RAR/7z/LZH などの変換アーカイブをフォルダ移動候補に含める。
+    pub include_convertible_archives: bool,
     /// サブフォルダ / ZIP のソート順 (= `Settings.sort_order`)。
     pub sort_order: crate::settings::SortOrder,
 }
@@ -30,6 +32,7 @@ impl FolderTreeOptions {
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
         Self {
             skip_zip: settings.skip_zip_if_folder_exists,
+            include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
             sort_order: settings.sort_order,
         }
     }
@@ -39,6 +42,7 @@ impl Default for FolderTreeOptions {
     fn default() -> Self {
         Self {
             skip_zip: true,
+            include_convertible_archives: true,
             sort_order: crate::settings::SortOrder::default(),
         }
     }
@@ -123,9 +127,10 @@ pub fn is_convertible_archive_path(path: &Path) -> bool {
         .is_some()
 }
 
-fn is_folder_nav_file_candidate(path: &Path) -> bool {
+fn is_folder_nav_file_candidate(path: &Path, opts: FolderTreeOptions) -> bool {
     is_virtual_folder(path)
-        || (is_convertible_archive_path(path)
+        || (opts.include_convertible_archives
+            && is_convertible_archive_path(path)
             && !crate::archive_converter::is_non_first_rar_part(path))
 }
 
@@ -151,7 +156,15 @@ fn is_folder_nav_file_candidate(path: &Path) -> bool {
 /// 見ている想定なので、この戻り値は「止まるべきではない」ではなく
 /// 「判定を打ち切った」という意味で使われる)。
 pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
-    folder_qualifies(path, cancel, true)
+    folder_should_stop_with_options(path, cancel, FolderTreeOptions::default())
+}
+
+pub fn folder_should_stop_with_options(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+    opts: FolderTreeOptions,
+) -> bool {
+    folder_qualifies(path, cancel, true, opts)
 }
 
 /// スライドショーの次フォルダ判定用: 静止画系コンテンツがあるか。
@@ -160,19 +173,33 @@ pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
 /// 動画のみフォルダを skip-walk で飛ばし、静止画フォルダに直接着地できる。
 /// PDF / 画像入り ZIP は静止画系コンテナとして true。
 pub fn folder_has_still_image(path: &Path, cancel: Option<&AtomicBool>) -> bool {
-    folder_qualifies(path, cancel, false)
+    folder_has_still_image_with_options(path, cancel, FolderTreeOptions::default())
+}
+
+pub fn folder_has_still_image_with_options(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+    opts: FolderTreeOptions,
+) -> bool {
+    folder_qualifies(path, cancel, false, opts)
 }
 
 /// `folder_should_stop` / `folder_has_still_image` の共通実装。
 /// `include_video=true` なら動画拡張子も「立ち寄る」条件に含める。
-fn folder_qualifies(path: &Path, cancel: Option<&AtomicBool>, include_video: bool) -> bool {
+fn folder_qualifies(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+    include_video: bool,
+    opts: FolderTreeOptions,
+) -> bool {
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return false;
     }
 
     if path.is_file() {
         if is_convertible_archive_path(path) {
-            return !crate::archive_converter::is_non_first_rar_part(path);
+            return opts.include_convertible_archives
+                && !crate::archive_converter::is_non_first_rar_part(path);
         }
         if !is_virtual_folder(path) {
             return false;
@@ -606,7 +633,7 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
                     real_folder_names.insert(name.to_lowercase());
                 }
                 dirs.push((p, mtime));
-            } else if kind.is_file() && is_folder_nav_file_candidate(&p) {
+            } else if kind.is_file() && is_folder_nav_file_candidate(&p, opts) {
                 container_candidates.push((p, mtime));
             }
         }
@@ -850,6 +877,52 @@ mod tests {
             !names.iter().any(|n| n == "c.part02.rar"),
             "non-first split RAR parts must not become separate Ctrl+↑↓ targets: {names:?}"
         );
+    }
+
+    #[test]
+    fn sorted_subdirs_can_ignore_convertible_archives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        for name in ["a.zip", "b.pdf", "c.rar", "d.7z", "e.lzh"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        let opts = FolderTreeOptions {
+            include_convertible_archives: false,
+            ..FolderTreeOptions::default()
+        };
+
+        let names: Vec<_> = sorted_subdirs(root, opts)
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        for expected in ["a.zip", "b.pdf", "folder"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected}: {names:?}"
+            );
+        }
+        for ignored in ["c.rar", "d.7z", "e.lzh"] {
+            assert!(
+                !names.iter().any(|n| n == ignored),
+                "unexpected {ignored}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_should_stop_can_ignore_convertible_archive_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rar = tmp.path().join("book.rar");
+        std::fs::write(&rar, b"rar").unwrap();
+        let opts = FolderTreeOptions {
+            include_convertible_archives: false,
+            ..FolderTreeOptions::default()
+        };
+
+        assert!(!folder_should_stop_with_options(&rar, None, opts));
+        assert!(!folder_has_still_image_with_options(&rar, None, opts));
     }
 
     #[cfg(windows)]

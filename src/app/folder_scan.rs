@@ -26,6 +26,23 @@ pub(crate) struct ScannedDir {
 /// (AI 画像フォルダで計測実績あり)。必ず `entry.file_type()` 側を使うこと。
 /// 方針は [docs/ui-responsiveness.md §1.1](../../docs/ui-responsiveness.md) にまとめてある。
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
+    scan_directory_with_convertible_archives(path, true)
+}
+
+pub(crate) fn scan_directory_with_settings(
+    path: &std::path::Path,
+    settings: &crate::settings::Settings,
+) -> ScannedDir {
+    scan_directory_with_convertible_archives(
+        path,
+        !settings.archive_file_handling_ignores_convertible(),
+    )
+}
+
+pub(crate) fn scan_directory_with_convertible_archives(
+    path: &std::path::Path,
+    include_convertible_archives: bool,
+) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
@@ -71,8 +88,9 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
                 folders.push((GridItem::ZipFile(p), Some((mtime, file_size))));
             } else if ext_lower == "pdf" {
                 folders.push((GridItem::PdfFile(p), Some((mtime, file_size))));
-            } else if let Some(fmt) =
-                crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
+            } else if include_convertible_archives
+                && let Some(fmt) =
+                    crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
                 if fmt == crate::archive_converter::ArchiveFormat::Rar
                     && crate::archive_converter::is_non_first_rar_part(&p)

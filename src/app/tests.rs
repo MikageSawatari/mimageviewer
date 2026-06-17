@@ -81,6 +81,26 @@ fn scan_folder_names(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+#[test]
+fn scan_directory_can_ignore_convertible_archives() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
+    std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
+    std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
+    std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
+
+    let scan = scan_directory_with_convertible_archives(tmp.path(), false);
+
+    assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
+    assert!(
+        !scan
+            .folders
+            .iter()
+            .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
+        "convertible archives should be hidden from the folder list"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn scan_directory_lists_windows_directory_symlink_and_file_symlink() {
