@@ -246,9 +246,11 @@ detached viewer (F12) を使う。
 F11 の MainWindow / Fullscreen 選択は、F12 の detached ON/OFF とは独立した
 non-detached 側の表示設定として保持する。動画の native presenter から
 `DetachedWindow` への `PlacementSwitched` が返っても `settings.video_in_window_mode`
-は更新せず、F12 を OFF にしたときは直前の F11 状態へ戻る。静止画 detached 中の
+は更新せず、F12 を OFF にしたときは直前の F11 状態へ戻る。detached 中の
 F11 は non-detached 設定を更新せず、通常配置を保持したまま装飾なし・モニター全体の
-仮想フルスクリーンをトグルする。動画 detached 中の F11 は無効のままにする。
+仮想フルスクリーンをトグルする。動画 detached では native presenter を fullscreen
+presenter に作り直さず、detached viewport host を広げて child presenter を親 client rect
+へ追従させる。
 静止画の fullscreen viewport と detached viewport は装飾・サイズ・taskbar 表示が異なるため、表示形態が
 変わるときは既存 viewport を隠して ViewportId 世代を進め、新しい表示先として作り直す。
 静止画 / PDF / ZIP 画像の fullscreen viewport と detached viewport はどちらも hidden

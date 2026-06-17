@@ -5859,7 +5859,8 @@ impl App {
         //
         // 動画アイテム上では skip する。動画は native presenter が
         // `handle_native_video_key_event` の 0x7A arm で F11 を直接拾い
-        // `toggle_video_window_mode()` (presenter rebuild を伴う) を呼ぶ。
+        // `toggle_video_window_mode_for_input()` に流す。通常表示では presenter
+        // rebuild、detached では host の仮想フルスクリーン切替になる。
         // 起動直後の black backdrop / コンテキストメニュー表示中などで egui に
         // F11 が漏れて来た場合に still 用 toggle が走ると、設定だけ flip して
         // 動画 presenter のモードと乖離するため。is_video_fs は

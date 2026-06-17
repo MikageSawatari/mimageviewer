@@ -1725,7 +1725,9 @@ impl App {
 
     pub(super) fn toggle_video_window_mode(&mut self) {
         if self.viewer_session_is_detached() {
-            self.show_feedback_toast("別ウィンドウ表示中は F11 を無効にしています".to_string());
+            crate::logger::log(
+                "[native-video] detached F11 ignored by non-context toggle path".to_string(),
+            );
             return;
         }
         let current_intent = self
@@ -1738,6 +1740,20 @@ impl App {
             ViewerPresentation::MainWindow
         };
         self.switch_native_video_viewer_presentation(target, true);
+    }
+
+    pub(super) fn toggle_video_window_mode_for_input(&mut self, ctx: &egui::Context) {
+        if self.viewer_session_is_detached() {
+            if self.video_tile_mode_active {
+                return;
+            }
+            if self.show_vst3_manager {
+                self.toggle_native_video_vst3_gui();
+            }
+            self.toggle_detached_viewer_borderless_fullscreen(ctx);
+            return;
+        }
+        self.toggle_video_window_mode();
     }
 
     /// 静止画フルスクリーンのウィンドウ / 全画面 表示を切り替える。
@@ -1931,7 +1947,7 @@ impl App {
                 self.close_fullscreen();
             }
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
-                self.toggle_video_window_mode();
+                self.toggle_video_window_mode_for_input(ctx);
             }
             crate::video::NativeVideoOutputEvent::PlacementSwitched {
                 request_id,
@@ -4858,7 +4874,7 @@ impl App {
             // toggle_still_window_mode (設定 flip だけ) では代用できない。
             // normalize scan 中は上の `normalize_state` ガードで既に弾かれている。
             0x7A if !key.shift && !key.ctrl && !key.repeat => {
-                self.toggle_video_window_mode();
+                self.toggle_video_window_mode_for_input(ctx);
                 hud_activity = false;
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
