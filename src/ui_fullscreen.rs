@@ -8164,17 +8164,29 @@ impl App {
     /// 余白カット用の中身 bbox を取得 (キャッシュ付き)。余白なし / pixels 未取得
     /// (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の pixels から検出する。
     pub(crate) fn cached_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
-        if let Some(cached) = self.fs_margin_bbox_cache.get(&idx) {
+        let (load_seq, pixels_ptr, pixels) = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static {
+                pixels, load_seq, ..
+            }) => (
+                *load_seq,
+                std::sync::Arc::as_ptr(pixels) as usize,
+                std::sync::Arc::clone(pixels),
+            ),
+            _ => {
+                self.fs_margin_bbox_cache.remove(&idx);
+                return None;
+            }
+        };
+        if let Some((cached_seq, cached_ptr, cached)) = self.fs_margin_bbox_cache.get(&idx)
+            && *cached_seq == load_seq
+            && *cached_ptr == pixels_ptr
+        {
             return *cached;
         }
-        let bbox = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => crate::margin_fit::detect_content_bbox(
-                &**pixels,
-                crate::margin_fit::DEFAULT_TOLERANCE,
-            ),
-            _ => None,
-        };
-        self.fs_margin_bbox_cache.insert(idx, bbox);
+        let bbox =
+            crate::margin_fit::detect_content_bbox(&pixels, crate::margin_fit::DEFAULT_TOLERANCE);
+        self.fs_margin_bbox_cache
+            .insert(idx, (load_seq, pixels_ptr, bbox));
         bbox
     }
 

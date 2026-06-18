@@ -1,7 +1,6 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::fs_animation::FsCacheEntry;
 use crate::settings::FullscreenFitMode;
 use crate::ui_fullscreen::SpreadPair;
 use crate::ui_fullscreen::draw_icons::draw_close_icon;
@@ -24,27 +23,19 @@ fn linked_from_detected(
     left: Option<ViewTrimMargins>,
     right: Option<ViewTrimMargins>,
 ) -> Option<ViewTrimLinkedMargins> {
-    match (left, right) {
-        (Some(l), Some(r)) => Some(ViewTrimLinkedMargins {
-            top: l.top.max(r.top),
-            bottom: l.bottom.max(r.bottom),
-            inner: l.right.max(r.left),
-            outer: l.left.max(r.right),
-        }),
-        (Some(l), None) => Some(ViewTrimLinkedMargins {
-            top: l.top,
-            bottom: l.bottom,
-            inner: l.right,
-            outer: l.left,
-        }),
-        (None, Some(r)) => Some(ViewTrimLinkedMargins {
-            top: r.top,
-            bottom: r.bottom,
-            inner: r.left,
-            outer: r.right,
-        }),
-        (None, None) => None,
+    if left.is_none() && right.is_none() {
+        return None;
     }
+    let l = left.unwrap_or_default().clamped();
+    let r = right.unwrap_or_default().clamped();
+    let linked = ViewTrimLinkedMargins {
+        top: l.top.min(r.top),
+        bottom: l.bottom.min(r.bottom),
+        inner: l.right.min(r.left),
+        outer: l.left.min(r.right),
+    }
+    .clamped();
+    (!linked.is_zero()).then_some(linked)
 }
 
 #[cfg(test)]
@@ -107,17 +98,44 @@ mod tests {
         assert_close(left.margins.bottom, 0.12);
         assert_close(right.margins.bottom, 0.12);
     }
-}
 
-fn common_from_detected(
-    left: Option<ViewTrimMargins>,
-    right: Option<ViewTrimMargins>,
-) -> Option<ViewTrimMargins> {
-    match (left, right) {
-        (Some(l), Some(r)) => Some(l.max_with(r)),
-        (Some(l), None) => Some(l),
-        (None, Some(r)) => Some(r),
-        (None, None) => None,
+    #[test]
+    fn linked_auto_detect_uses_less_aggressive_shared_margins() {
+        let linked = linked_from_detected(
+            Some(ViewTrimMargins {
+                left: 0.02,
+                top: 0.12,
+                right: 0.08,
+                bottom: 0.07,
+            }),
+            Some(ViewTrimMargins {
+                left: 0.04,
+                top: 0.03,
+                right: 0.10,
+                bottom: 0.15,
+            }),
+        )
+        .unwrap();
+
+        assert_close(linked.top, 0.03);
+        assert_close(linked.bottom, 0.07);
+        assert_close(linked.inner, 0.04);
+        assert_close(linked.outer, 0.02);
+    }
+
+    #[test]
+    fn linked_auto_detect_requires_safe_margins_for_both_pages() {
+        let linked = linked_from_detected(
+            Some(ViewTrimMargins {
+                left: 0.02,
+                top: 0.12,
+                right: 0.08,
+                bottom: 0.07,
+            }),
+            None,
+        );
+
+        assert!(linked.is_none());
     }
 }
 
@@ -383,13 +401,8 @@ impl App {
             .clamped()
     }
 
-    fn auto_detect_view_trim_margins(&self, idx: usize) -> Option<ViewTrimMargins> {
-        let pixels = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => pixels,
-            _ => return None,
-        };
-        crate::margin_fit::detect_content_bbox(pixels, crate::margin_fit::DEFAULT_TOLERANCE)
-            .map(ViewTrimMargins::from_bbox)
+    fn auto_detect_view_trim_margins(&mut self, idx: usize) -> Option<ViewTrimMargins> {
+        self.cached_margin_bbox(idx).map(ViewTrimMargins::from_bbox)
     }
 
     pub(crate) fn persist_pending_view_trim_state(&mut self) {
@@ -720,9 +733,8 @@ impl App {
                             detected = true;
                             changed = true;
                         }
-                    } else if let Some(common) = common_from_detected(left_m, right_m) {
-                        page_left = ViewTrimPageOverride::from_margins(common);
-                        page_right = ViewTrimPageOverride::from_margins(common);
+                    } else if let Some(linked) = linked_from_detected(left_m, right_m) {
+                        set_page_spread_linked_margins(&mut page_left, &mut page_right, linked);
                         detected = true;
                         changed = true;
                     }

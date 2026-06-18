@@ -2700,9 +2700,11 @@ pub struct App {
     pub(crate) detached_viewer_no_activate_once: bool,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
-    /// 表示トリムの自動余白カット用の中身 bbox キャッシュ (正規化座標)。idx → Some(bbox) / None(余白なし)。
-    /// `fs_cache` と同じタイミング (フォルダ移動・idx 無効化) でクリアする。
-    pub(crate) fs_margin_bbox_cache: std::collections::HashMap<usize, Option<egui::Rect>>,
+    /// 表示トリムの自動余白カット用の中身 bbox キャッシュ (正規化座標)。
+    /// idx → (fs load_seq, pixels ptr, Some(bbox) / None(余白なし))。
+    /// `fs_cache` の差し替わりを検出し、古い bbox を使い回さない。
+    pub(crate) fs_margin_bbox_cache:
+        std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     /// 表示トリム (読みながら使う表示専用の余白カット) の調整パネル表示。
     /// 出力用の切り取りとは独立し、保存 / エクスポートのピクセルには影響しない。
     pub(crate) view_trim_mode: bool,
@@ -20373,6 +20375,7 @@ impl App {
         if self.fullscreen_idx == Some(selected) {
             if item_key_changed {
                 self.fs_cache.remove(&selected);
+                self.fs_margin_bbox_cache.remove(&selected);
                 if let Some((cancel, _, _)) = self.fs_pending.remove(&selected) {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -24756,6 +24759,7 @@ impl App {
                     #[cfg(windows)]
                     self.cleanup_normalize_state_for_fs_idx(k);
                     self.fs_cache.remove(&k);
+                    self.fs_margin_bbox_cache.remove(&k);
                 }
             }
             if !self.fs_cache.contains_key(&idx) {
@@ -24847,6 +24851,7 @@ impl App {
                         load_seq: self.input_seq,
                     },
                 );
+                self.fs_margin_bbox_cache.remove(&idx);
                 #[cfg(windows)]
                 self.init_normalize_state_for_opened_video(idx);
                 #[cfg(windows)]
@@ -25577,6 +25582,8 @@ impl App {
         }
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
+        self.fs_margin_bbox_cache
+            .retain(|k, _| keep_set.contains(k));
 
         // 現在表示中の画像がまだデコード中 (fs_cache に入っていない) なら、
         // その画像に CPU を独占させるため他の pending をすべてキャンセルする。
@@ -34551,6 +34558,7 @@ impl App {
                 }
             };
             self.fs_cache.insert(key, entry);
+            self.fs_margin_bbox_cache.remove(&key);
             self.bump_input_generation_for_fs_cache_reload(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
             // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
