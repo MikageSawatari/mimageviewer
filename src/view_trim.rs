@@ -235,6 +235,26 @@ impl ViewTrimPageOverride {
     }
 }
 
+pub fn harmonize_spread_auto_bboxes(
+    left: Option<egui::Rect>,
+    right: Option<egui::Rect>,
+) -> (Option<egui::Rect>, Option<egui::Rect>) {
+    if left.is_none() && right.is_none() {
+        return (None, None);
+    }
+
+    let mut left_margins = left.map(ViewTrimMargins::from_bbox).unwrap_or_default();
+    let mut right_margins = right.map(ViewTrimMargins::from_bbox).unwrap_or_default();
+    let top = left_margins.top.min(right_margins.top);
+    let bottom = left_margins.bottom.min(right_margins.bottom);
+    left_margins.top = top;
+    left_margins.bottom = bottom;
+    right_margins.top = top;
+    right_margins.bottom = bottom;
+
+    (left_margins.bbox(), right_margins.bbox())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ViewTrimBookState {
     #[serde(default)]
@@ -340,6 +360,39 @@ mod tests {
         assert_eq!(right.right, 0.04);
         assert_eq!(left.top, 0.01);
         assert_eq!(right.bottom, 0.02);
+    }
+
+    #[test]
+    fn spread_auto_bboxes_share_less_aggressive_vertical_trim() {
+        let left = egui::Rect::from_min_max(egui::pos2(0.02, 0.12), egui::pos2(0.96, 0.93));
+        let right = egui::Rect::from_min_max(egui::pos2(0.05, 0.04), egui::pos2(0.98, 0.88));
+
+        let (left_out, right_out) = harmonize_spread_auto_bboxes(Some(left), Some(right));
+        let left_m = ViewTrimMargins::from_bbox(left_out.unwrap());
+        let right_m = ViewTrimMargins::from_bbox(right_out.unwrap());
+
+        assert!((left_m.left - 0.02).abs() < 1e-6);
+        assert!((left_m.right - 0.04).abs() < 1e-6);
+        assert!((right_m.left - 0.05).abs() < 1e-6);
+        assert!((right_m.right - 0.02).abs() < 1e-6);
+        assert!((left_m.top - 0.04).abs() < 1e-6);
+        assert!((right_m.top - 0.04).abs() < 1e-6);
+        assert!((left_m.bottom - 0.07).abs() < 1e-6);
+        assert!((right_m.bottom - 0.07).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spread_auto_bbox_missing_page_counts_as_no_vertical_trim() {
+        let right = egui::Rect::from_min_max(egui::pos2(0.05, 0.04), egui::pos2(0.98, 0.88));
+
+        let (left_out, right_out) = harmonize_spread_auto_bboxes(None, Some(right));
+        let right_m = ViewTrimMargins::from_bbox(right_out.unwrap());
+
+        assert!(left_out.is_none());
+        assert!((right_m.left - 0.05).abs() < 1e-6);
+        assert!((right_m.right - 0.02).abs() < 1e-6);
+        assert!(right_m.top <= 1e-6);
+        assert!(right_m.bottom <= 1e-6);
     }
 
     #[test]

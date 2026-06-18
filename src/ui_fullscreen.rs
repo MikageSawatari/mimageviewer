@@ -8904,6 +8904,18 @@ impl App {
             };
         }
 
+        let paired_content_bboxes = if unit.pages.len() == 2 {
+            let left_idx = unit.pages[0];
+            let right_idx = unit.pages[1];
+            if self.get_rotation(left_idx).is_none() && self.get_rotation(right_idx).is_none() {
+                Some(self.view_trim_spread_content_bboxes(left_idx, right_idx))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut page_bases = unit
             .pages
             .iter()
@@ -8913,7 +8925,13 @@ impl App {
                 let base = self.vertical_reading_base_size(idx, fallback, prefer_processed);
                 let rotation = self.get_rotation(idx);
                 let content_bbox = if rotation.is_none() {
-                    if unit.pages.len() == 2 {
+                    if let Some((left_bbox, right_bbox)) = paired_content_bboxes {
+                        if screen_pos == 0 {
+                            left_bbox
+                        } else {
+                            right_bbox
+                        }
+                    } else if unit.pages.len() == 2 {
                         let side = if screen_pos == 0 {
                             crate::view_trim::ViewTrimSpreadSide::Left
                         } else {
@@ -11239,18 +11257,27 @@ impl App {
         let right_rot = self.get_rotation(right_idx);
         // 表示トリム / 自動余白カット (見開き): 各ページの content bbox を取得し、
         // 後で左右セットをフィットさせる。回転ページは対象外 (single 同様)。
-        let content_left = if left_rot.is_none() {
-            self.view_trim_spread_content_bbox(left_idx, crate::view_trim::ViewTrimSpreadSide::Left)
+        let (content_left, content_right) = if left_rot.is_none() && right_rot.is_none() {
+            self.view_trim_spread_content_bboxes(left_idx, right_idx)
         } else {
-            None
-        };
-        let content_right = if right_rot.is_none() {
-            self.view_trim_spread_content_bbox(
-                right_idx,
-                crate::view_trim::ViewTrimSpreadSide::Right,
+            (
+                if left_rot.is_none() {
+                    self.view_trim_spread_content_bbox(
+                        left_idx,
+                        crate::view_trim::ViewTrimSpreadSide::Left,
+                    )
+                } else {
+                    None
+                },
+                if right_rot.is_none() {
+                    self.view_trim_spread_content_bbox(
+                        right_idx,
+                        crate::view_trim::ViewTrimSpreadSide::Right,
+                    )
+                } else {
+                    None
+                },
             )
-        } else {
-            None
         };
         // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。

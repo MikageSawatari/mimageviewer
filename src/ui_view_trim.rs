@@ -320,6 +320,25 @@ impl App {
         }
     }
 
+    pub(crate) fn view_trim_spread_content_bboxes(
+        &mut self,
+        left_idx: usize,
+        right_idx: usize,
+    ) -> (Option<egui::Rect>, Option<egui::Rect>) {
+        self.clear_stale_view_trim_page_apply();
+        match self.effective_view_trim_apply_mode() {
+            ViewTrimApplyMode::None => (None, None),
+            ViewTrimApplyMode::Auto => crate::view_trim::harmonize_spread_auto_bboxes(
+                self.cached_margin_bbox(left_idx),
+                self.cached_margin_bbox(right_idx),
+            ),
+            ViewTrimApplyMode::Book | ViewTrimApplyMode::Page => (
+                self.view_trim_spread_bbox(left_idx, ViewTrimSpreadSide::Left),
+                self.view_trim_spread_bbox(right_idx, ViewTrimSpreadSide::Right),
+            ),
+        }
+    }
+
     pub(crate) fn view_trim_active_for_display(
         &self,
         fs_idx: usize,
