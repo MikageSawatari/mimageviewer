@@ -56,7 +56,7 @@ pub(crate) enum PreferencesPage {
     DuplicateFiles,
     ExifDisplay,
     SpreadMode,
-    /// 読書/再生位置の復元 (動画・ZIP/PDF × 一覧から開く・Ctrl+↑↓ 移動)
+    /// 履歴と復元 (読書履歴、読書/再生位置の復元)
     PlaybackResume,
     SusiePlugins,
     /// v0.8.0: 自動インデクサ速度プロファイル
@@ -99,7 +99,7 @@ impl PreferencesPage {
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "表示モード",
-            Self::PlaybackResume => "位置の復元",
+            Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "自動インデクサ速度",
             Self::TrayResidency => "タスクトレイ常駐",
@@ -190,7 +190,7 @@ const TREE: &[TreeCategory] = &[
         children: &[],
     },
     TreeCategory {
-        label: "位置の復元",
+        label: "履歴と復元",
         page: Some(PreferencesPage::PlaybackResume),
         children: &[],
     },
@@ -288,7 +288,7 @@ pub(crate) struct PreferencesState {
     /// 直近の音量ノーマライズ測定値削除結果。
     pub audio_normalize_clear_result: Option<String>,
 
-    // ── 位置の復元ページ用 ─────────────────────────────────────
+    // ── 履歴と復元ページ用 ─────────────────────────────────────
     /// 環境設定を開いた時点 / 削除後の ZIP/PDF 読書位置の記憶件数。
     pub book_resume_entry_count: usize,
     /// ZIP/PDF 読書位置クリアを App 側へ伝える one-shot フラグ。
@@ -954,7 +954,7 @@ impl App {
             }
         }
 
-        // 位置の復元ページ: ZIP/PDF 読書位置クリア (one-shot)。
+        // 履歴と復元ページ: ZIP/PDF 読書位置クリア (one-shot)。
         let mut clear_book_resume_requested = false;
         if let Some(ps) = self.pref_state.as_mut() {
             if ps.book_resume_clear_requested {
@@ -990,7 +990,7 @@ impl App {
             }
         }
 
-        // 位置の復元ページ: 読書履歴クリア (one-shot)。
+        // 履歴と復元ページ: 読書履歴クリア (one-shot)。
         let mut clear_reading_history_requested = false;
         if let Some(ps) = self.pref_state.as_mut() {
             if ps.reading_history_clear_requested {

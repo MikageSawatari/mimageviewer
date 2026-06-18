@@ -93,7 +93,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         egui::RichText::new(
             "ページをフルスクリーン表示する場合、開く位置 (1 ページ目 / 続きから) は\
-             「位置の復元」設定に従います。フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
+             「履歴と復元」設定に従います。フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
              Backspace でそのファイルのページ一覧を表示します。外部ファイラや SendTo から\
              開いた本にも適用されます。",
         )
@@ -2007,7 +2007,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.label(crate::settings::format_video_volume_db(s.video_volume));
         });
 
-        // 再生位置レジューム (続き/先頭の切替・位置クリア) は「位置の復元」ページに集約。
+        // 再生位置レジューム (続き/先頭の切替・位置クリア) は「履歴と復元」ページに集約。
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
@@ -3069,9 +3069,9 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     let s = &mut state.settings;
 
     ui.label(
-        "動画と ZIP/PDF (本) を「一覧から開いたとき」と「Ctrl+↑↓ で移動したとき」に、\n\
-         前回の位置 (続きから) で開くか、最初/先頭から開くかを設定します。\n\
-         保存された位置が無いときは自動的に先頭になります。",
+        "動画と ZIP/PDF (本) の位置復元と、読書履歴を管理します。\n\
+         一覧から開いたとき / Ctrl+↑↓ で移動したときに、前回の位置 (続きから) で\n\
+         開くか、最初/先頭から開くかを選べます。保存された位置が無いときは自動的に先頭になります。",
     );
     ui.add_space(10.0);
 
