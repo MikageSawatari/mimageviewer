@@ -105,29 +105,16 @@
 
 ## 6. リリース前確認 / 依存更新
 
-### 6.1 PDFium 7881 → 7891 への更新 (次回メンテで取り込む)
-
-- 背景: v1.8.0 リリース時 (2026-06-18) の Phase 2 依存チェックで `bash scripts/setup-pdfium.sh check`
-  が新版 chromium/7891 を検出した (当時 vendor は `BUILD=7881`)。v1.8.0 は表示トリム等の機能リリースで、
-  PDF エンジン更新は再検証コストが見合わないため見送り、現状維持 (7881) で公開した。
-- やること:
-  - `bash scripts/setup-pdfium.sh` で最新版を取得し `vendor/pdfium/` を更新する。
-  - 更新後に PDF 表示の手動確認 (開封 / ページ列挙 / サムネ / フルスクリーン / パスワード PDF)。
-  - リリース手順は `CLAUDE.md` Phase 2 step 1-3 に従う。
-- 注意: 取り込み時点でさらに新しい週次ビルドが出ている可能性が高い。7891 固定にこだわらず、
-  着手時に `check` を再実行して最新を取得する。
-- 優先度: P2 / 次回メンテナンスリリース (v1.8.1 等)。
-
-### 6.2 ネイティブ依存
+### 6.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
-| PDFium | 7891 取り込みは 6.1 参照。以後は vendor 更新後の PDF 表示手動確認が必要 | PDF 開封、ページ列挙、サムネ、フルスクリーン、パスワード PDF |
+| PDFium | vendor 更新後の PDF 表示手動確認が必要 | PDF 開封、ページ列挙、サムネ、フルスクリーン、パスワード PDF |
 | FFmpeg LGPL shared | 動画再生の手動確認と LGPL ソース tarball 配置更新 | DLL 名が変わる更新では `setup-ffmpeg.sh` / loader / `build.rs` を揃える |
 | ONNX Runtime | `ort-sys` 要求 DLL と setup script の VERSION を確認 | C API バージョン一致、`+crt-static` + `load-dynamic` 維持 |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
 
-### 6.3 Rust クレート
+### 6.2 Rust クレート
 
 - 通常の `cargo update` は互換範囲でまとめて実施する。
 - メジャー / rc 脱出は個別判断:
