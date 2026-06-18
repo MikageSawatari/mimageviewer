@@ -292,6 +292,33 @@ font atlas のまま描くとフォント崩れが残ることがあるため、
 resync を予約すると 1 フレームだけ stale font atlas でメイン UI を描いてしまうため、
 `toggle_still_window_mode` で `still_window_mode` resync を先に予約する。
 
+#### resync は数フレーム再発行する (close 直後の ROOT surface 欠落対策)
+
+2026-06-18 に、マルチモニタで「画像フルスクリーン → ウィンドウに戻る」と **メインウィンドウの
+UI 文字 (ツールバー・情報オーバーレイ等) が 100% 文字化けし、フォルダ移動で直る** 再発不具合を
+egui-wgpu への一時計装で根因特定した:
+
+- フルスクリーンを閉じる際、egui の shared font atlas は near-full から fresh atlas へ
+  recreate されて **縮む** (例: 高さ 64 → 32)。これは `pos=None` の full(realloc) delta を生む。
+- ところがその **同じ 1 フレームだけ、メインウィンドウ (ROOT viewport) の wgpu surface が
+  一時的に消えており** (close / cloak / DWM 遷移中)、`egui-wgpu` の `paint_and_update_textures`
+  が `surfaces.get(viewport_id) == None` で early return する。そのフレームの full(realloc) は
+  **GPU へ届かず捨てられる**。
+- egui の atlas は 32、GPU texture は 64 のまま固着し、glyph UV (atlas=32 で正規化) が
+  64 高のテクスチャを参照して全 glyph が縦 2 倍ずれ → 文字化け。atlas が clean なので egui は
+  delta を再発行せず、後で atlas が再び育って full delta が surface のあるフレームに当たるまで
+  (= フォルダ移動で新規 glyph 追加) 直らない。
+
+対策 = **resync を 1 フレームきりでなく数フレーム連続で再発行**する
+(`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`)。`request_main_font_atlas_resync` が
+`main_font_atlas_resync_repeats_left` をセットし、`maybe_defer_for_main_font_atlas_resync` が
+`ctx.cumulative_frame_nr()` で **1 OS フレーム 1 発行** にゲートしながら毎フレーム set_fonts を
+再発行する。surface が戻ったフレームで full upload が確実に ROOT へ届く。フレームゲートは、
+discard 再パスと `update_early` / `pre_main_ui` の 2 箇所呼び出しで同一フレーム内に repeats を
+使い切る / 黒フレームになるのを防ぐ。連続再発行で font ファイルを毎フレーム読み直さないよう
+`configure_fonts_for_texture_resync` は定義をプロセス内キャッシュ (定義は固定パス + 決定的
+メトリクスで不変)。
+
 なお、専用ボーダーレス fullscreen viewport を閉じると、別トップレベル窓の `Visible(false)` が
 DWM で反映されるまで約 1 フレームかかるため、メインウィンドウが手前に合成されてから fullscreen
 窓 (黒) が消えるまでの間、メイン周囲に一瞬黒地が残る。これは上記の panic / 黒コンテンツ問題とは

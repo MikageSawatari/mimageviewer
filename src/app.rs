@@ -148,6 +148,13 @@ pub(crate) enum DetachedViewerBorderlessTransitionPhase {
 
 pub(crate) const FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP: &str = "detached_viewer_cleanup";
 pub(crate) const FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE: &str = "still_window_mode";
+/// フォント atlas full upload を何フレーム連続で再発行するか。fullscreen close 直後は
+/// メインウィンドウ (ROOT viewport) の wgpu surface が 1 フレームだけ消え、その frame の
+/// full(realloc) upload が `paint_and_update_textures` の no-surface early return で捨てられる。
+/// 1 回きりだと texture が旧サイズに固着して UI 文字が化ける (atlas=32 / texture=64 のような
+/// UV 不一致)。数フレーム再発行して surface が戻ったフレームで届かせる。
+#[cfg(windows)]
+pub(crate) const MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ViewerSyncStamp {
@@ -3580,6 +3587,18 @@ pub struct App {
     /// から再開させるための one-shot。
     #[cfg(windows)]
     pub(crate) main_font_atlas_resync_pending: bool,
+    /// フォント atlas 再アップロードを残り何フレーム再発行するか。close 直後の 1 フレームは
+    /// メインウィンドウの wgpu surface が一時的に消えて full(realloc) upload が捨てられる
+    /// (`paint_and_update_textures` の no-surface early return)。1 回きりだと texture が
+    /// 旧サイズのまま固着して UI 文字が化けるため、数フレーム再発行して surface が戻った
+    /// フレームで確実に届かせる。
+    #[cfg(windows)]
+    pub(crate) main_font_atlas_resync_repeats_left: u32,
+    /// 最後に resync を発行した OS フレーム番号 (`ctx.cumulative_frame_nr`)。discard 再パスや
+    /// update 内 2 箇所の呼び出しで同一 OS フレーム内に複数回発行して repeats を浪費しない
+    /// ように、1 OS フレーム 1 発行へゲートする。
+    #[cfg(windows)]
+    pub(crate) main_font_atlas_resync_last_fire_frame: u64,
     #[cfg(windows)]
     pub(crate) main_font_atlas_resync_generation: u64,
     #[cfg(windows)]
@@ -5542,6 +5561,10 @@ impl App {
             still_fullscreen_viewport_enter_suppress_until: None,
             #[cfg(windows)]
             main_font_atlas_resync_pending: false,
+            #[cfg(windows)]
+            main_font_atlas_resync_repeats_left: 0,
+            #[cfg(windows)]
+            main_font_atlas_resync_last_fire_frame: u64::MAX,
             #[cfg(windows)]
             main_font_atlas_resync_generation: 0,
             #[cfg(windows)]
@@ -19144,6 +19167,10 @@ impl App {
             ));
         }
         self.main_font_atlas_resync_pending = true;
+        // close 直後の 1 フレームだけメインウィンドウの wgpu surface が消えて full upload が
+        // 捨てられる (no-surface early return)。数フレーム再発行して、surface が戻った
+        // フレームで確実に届かせる。
+        self.main_font_atlas_resync_repeats_left = MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES;
         if self.main_font_atlas_resync_reason.is_none() {
             self.main_font_atlas_resync_reason = Some(reason);
         }
@@ -19163,15 +19190,38 @@ impl App {
             return false;
         }
 
-        self.main_font_atlas_resync_pending = false;
+        // 1 OS フレーム 1 発行へゲートする。discard 再パスや update 内 2 箇所
+        // (update_early / pre_main_ui) で同一フレーム内に複数回呼ばれても、2 回目以降は
+        // 再発行せず paint を進めさせる (= repeats を 1 フレームで使い切らない / 黒フレーム回避)。
+        let frame_nr = ctx.cumulative_frame_nr();
+        if self.main_font_atlas_resync_last_fire_frame == frame_nr {
+            return false;
+        }
+        self.main_font_atlas_resync_last_fire_frame = frame_nr;
+
+        // 数フレーム再発行する。最後の 1 回まで pending/reason を保持し、毎フレーム
+        // set_fonts で full atlas upload を再要求して surface 復帰フレームに届かせる。
+        let repeats_left = self.main_font_atlas_resync_repeats_left.saturating_sub(1);
+        self.main_font_atlas_resync_repeats_left = repeats_left;
+        let final_fire = repeats_left == 0;
+        if final_fire {
+            self.main_font_atlas_resync_pending = false;
+        }
         self.main_font_atlas_resync_generation =
             self.main_font_atlas_resync_generation.wrapping_add(1);
         let generation = self.main_font_atlas_resync_generation;
-        let reason = self
-            .main_font_atlas_resync_reason
-            .take()
-            .unwrap_or("unknown");
+        let reason = if final_fire {
+            self.main_font_atlas_resync_reason
+                .take()
+                .unwrap_or("unknown")
+        } else {
+            self.main_font_atlas_resync_reason.unwrap_or("unknown")
+        };
         crate::ui_fonts::configure_fonts_for_texture_resync(ctx, generation);
+        if !final_fire {
+            // 次フレームでも再発行する。surface が戻るまで full upload を出し続ける。
+            ctx.request_repaint();
+        }
         let defer_main_paint = should_defer_main_paint_for_font_atlas_resync(reason);
         if !defer_main_paint {
             // detached cleanup 等、保守的 defer が不要な経路。フォント再アップロードを

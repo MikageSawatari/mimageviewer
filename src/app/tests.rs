@@ -14268,11 +14268,32 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::MainWindow;
         app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE);
 
+        // First fire: applies a full atlas re-upload, but stays armed so the next few
+        // frames re-emit it. This survives the 1-frame gap at fullscreen close where the
+        // ROOT viewport's wgpu surface is missing and the upload would be dropped.
         let deferred = app.maybe_defer_for_main_font_atlas_resync(&ctx, "test");
-
         assert!(deferred, "embedded still viewer paints on the main ctx");
-        assert!(!app.main_font_atlas_resync_pending);
         assert_eq!(app.main_font_atlas_resync_generation, 1);
+        assert!(
+            app.main_font_atlas_resync_pending,
+            "resync re-arms for several frames to survive the close-frame surface gap"
+        );
+
+        // Drains the remaining repeats; pending clears only on the final fire.
+        // Reset the per-frame gate each iteration to simulate a fresh OS frame (a default
+        // Context keeps cumulative_frame_nr at 0, which would otherwise gate re-fires).
+        let mut fires = 1u32;
+        while app.main_font_atlas_resync_pending {
+            app.main_font_atlas_resync_last_fire_frame = u64::MAX;
+            assert!(app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"));
+            fires += 1;
+            assert!(fires <= 16, "resync repeat must terminate");
+        }
+        assert_eq!(fires, MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES);
+        assert_eq!(
+            app.main_font_atlas_resync_generation,
+            u64::from(MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES)
+        );
     }
 
     #[test]

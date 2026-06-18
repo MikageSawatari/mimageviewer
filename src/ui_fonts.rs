@@ -157,9 +157,19 @@ pub fn configure_fonts(ctx: &egui::Context) {
 }
 
 pub fn configure_fonts_for_texture_resync(ctx: &egui::Context, generation: u64) {
-    let mut fonts = mimageviewer_font_definitions();
+    // texture resync は full atlas re-upload を出すために surface 復帰まで数フレーム連続で
+    // 呼ばれる (app.rs `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`)。毎回 `mimageviewer_font_definitions`
+    // を作ると Yu Gothic 等の font ファイルを毎フレーム std::fs::read してしまうため、
+    // 定義は不変 (固定パス + 決定的メトリクス) なので一度だけ構築して clone で使い回す。
+    let mut fonts = base_font_definitions_cached();
     add_font_texture_resync_marker(&mut fonts, generation);
     ctx.set_fonts(fonts);
+}
+
+fn base_font_definitions_cached() -> egui::FontDefinitions {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<egui::FontDefinitions> = OnceLock::new();
+    BASE.get_or_init(mimageviewer_font_definitions).clone()
 }
 
 fn mimageviewer_font_definitions() -> egui::FontDefinitions {
