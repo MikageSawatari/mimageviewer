@@ -186,7 +186,9 @@ impl App {
     }
 
     pub(super) fn open_default_startup_target(&mut self) {
-        if should_start_in_drive_list(&self.settings) {
+        if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::ReadingHistory {
+            self.enter_reading_history();
+        } else if should_start_in_drive_list(&self.settings) {
             self.enter_drive_list(None);
         } else if let Some(folder) = crate::known_folders::startup_folder(
             self.settings.startup_folder_mode,

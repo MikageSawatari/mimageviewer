@@ -2261,6 +2261,12 @@ pub(crate) fn search_results_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__search_results__")
 }
 
+/// 読書履歴ビューで current_folder に設定する合成パス。
+/// `%APPDATA%/mimageviewer/__reading_history__` (実在させない、カタログキーとしてのみ使用)。
+pub(crate) fn reading_history_synthetic_path() -> PathBuf {
+    crate::data_dir::get().join("__reading_history__")
+}
+
 /// サムネイル色調補正の対象アイテムかどうか。
 ///
 /// 補正は「ページ単位の色調を持つ画像系」だけに掛ける ([docs/display-pipeline.md §1.5](docs/display-pipeline.md))。
@@ -2753,6 +2759,8 @@ pub struct App {
     pub(crate) items_are_global_search_view: bool,
     /// 現在の `items` がタグビュー (Ctrl+T) の一時結果一覧かを示す。
     pub(crate) items_are_tag_view: bool,
+    /// 現在の `items` が読書履歴の仮想ビューかを示す。
+    pub(crate) items_are_reading_history_view: bool,
     /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
     /// `current_folder = None` と併用し、通常フォルダの D&D / rating / 代表サムネ探索
     /// を明示的に止める。
@@ -3513,6 +3521,15 @@ pub struct App {
     /// 直近に DB へ書いた `(コンテナパス, page idx)`。フルスクリーンのページ送り毎の
     /// 重複書き込みを抑止する dedup。
     pub(crate) last_book_resume: Option<(PathBuf, usize)>,
+    /// フルスクリーンで読んだ本の履歴 DB。
+    pub(crate) reading_history_db: Option<crate::reading_history_db::ReadingHistoryDb>,
+    /// 読書履歴の書き込みを UI スレッドから外す background writer。
+    pub(crate) reading_history_writer: Option<crate::reading_history_db::ReadingHistoryWriter>,
+    /// 読書履歴ビュー表示中の DB 行キャッシュ (key → row)。
+    pub(crate) reading_history_rows:
+        std::collections::HashMap<String, crate::reading_history_db::ReadingHistoryEntry>,
+    /// 直近に読書履歴へ送った key と時刻。連続ページ送りの同一 key 書き込みを抑える。
+    pub(crate) last_reading_history_touch: Option<(String, std::time::Instant)>,
 
     // ── フルスクリーン表示モード ──────────────────────────────
     /// 表示モード DB (フォルダごとのページ構成 / 連結方式永続化)
@@ -5049,6 +5066,15 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_book_resume", 0, t);
 
         let t = std::time::Instant::now();
+        let reading_history_db = crate::reading_history_db::ReadingHistoryDb::open().ok();
+        let reading_history_writer = if reading_history_db.is_some() {
+            crate::reading_history_db::ReadingHistoryWriter::spawn()
+        } else {
+            None
+        };
+        crate::perf::emit_ms("startup", "db_open_reading_history", 0, t);
+
+        let t = std::time::Instant::now();
         let auto_aspect_cache_db = crate::auto_aspect_cache::AutoAspectCacheDb::open()
             .map_err(|e| crate::logger::log(format!("auto_aspect_cache_db open failed: {e}")))
             .ok();
@@ -5271,6 +5297,7 @@ impl App {
             items_generation: 0,
             items_are_global_search_view: false,
             items_are_tag_view: false,
+            items_are_reading_history_view: false,
             items_are_drive_list: false,
             show_favorites_editor: false,
             favorite_delete_confirm: None,
@@ -5532,6 +5559,10 @@ impl App {
             book_resume_db,
             book_resume_writer,
             last_book_resume: None,
+            reading_history_db,
+            reading_history_writer,
+            reading_history_rows: std::collections::HashMap::new(),
+            last_reading_history_touch: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             spread_shift_anchor_idx: None,
@@ -7956,7 +7987,9 @@ impl App {
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
-                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
+                || self.items_are_reading_history_view
+                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path())
+                || crate::folder_tree::path_eq(&cur, &reading_history_synthetic_path());
             if !leaving_search_view && !self.items_are_drive_list {
                 self.folder_history
                     .insert(cur, (self.scroll_offset_y, self.selected));
@@ -9912,6 +9945,132 @@ impl App {
         self.update_favsearch_address();
     }
 
+    /// 読書履歴ビューを開く。
+    pub(crate) fn enter_reading_history(&mut self) {
+        crate::logger::log("=== enter_reading_history ===");
+        if self.global_search.active {
+            self.global_search.saved_folder = None;
+            self.close_global_search();
+        }
+        if self.favsearch.active {
+            self.favsearch.saved_folder = None;
+            self.close_favsearch();
+        }
+        if self.tag_view.active {
+            self.tag_view.saved_folder = None;
+            self.close_tag_view();
+        }
+        if self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            self.search_has_focus = false;
+            self.search_tag_bridge.clear();
+            self.cancel_search_pending();
+        }
+
+        let limit = self
+            .settings
+            .reading_history_limit
+            .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
+        let entries = match self
+            .reading_history_db
+            .as_ref()
+            .map(|db| db.list_recent(limit))
+        {
+            Some(Ok(entries)) => entries,
+            Some(Err(e)) => {
+                crate::logger::log(format!("reading-history: list failed: {e}"));
+                self.show_feedback_toast("[読書履歴を読み込めませんでした]".to_string());
+                Vec::new()
+            }
+            None => {
+                self.show_feedback_toast("[読書履歴 DB を開けません]".to_string());
+                Vec::new()
+            }
+        };
+
+        let mut items: Vec<GridItem> = Vec::with_capacity(entries.len());
+        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(entries.len());
+        let mut rows = std::collections::HashMap::with_capacity(entries.len());
+        for entry in entries {
+            image_metas.push(reading_history_meta_for_entry(&entry));
+            items.push(reading_history_grid_item(&entry));
+            rows.insert(entry.key.clone(), entry);
+        }
+
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> =
+                items.iter().filter_map(GridItem::container_path).collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+        let existing_keys: std::collections::HashSet<String> = items
+            .iter()
+            .zip(image_metas.iter())
+            .flat_map(|(it, meta)| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    *meta,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                    true,
+                )
+            })
+            .collect();
+
+        self.start_loading_items(
+            reading_history_synthetic_path(),
+            items,
+            image_metas,
+            existing_keys,
+            Vec::new(),
+            None,
+        );
+        self.items_are_reading_history_view = true;
+        self.reading_history_rows = rows;
+        self.address = "読書履歴".to_string();
+        self.rebuild_visible_indices();
+        if self.selected.is_none()
+            && let Some(&idx) = self.visible_indices.first()
+        {
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        }
+    }
+
+    /// 読書履歴ビューから 1 件削除する。
+    pub(crate) fn remove_reading_history_entry_for_idx(&mut self, idx: usize) {
+        let Some(key) = self.items.get(idx).and_then(reading_history_key_for_item) else {
+            return;
+        };
+        let result = match self.reading_history_db.as_ref() {
+            Some(db) => db.remove_key(&key).map_err(|e| e.to_string()),
+            None => Err("読書履歴 DB を開けません".to_string()),
+        };
+        match result {
+            Ok(()) => {
+                self.show_feedback_toast("[読書履歴から削除しました]".to_string());
+                self.enter_reading_history();
+            }
+            Err(err) => {
+                crate::logger::log(format!("reading-history: remove failed: {err}"));
+                self.show_feedback_toast("[読書履歴の削除に失敗しました]".to_string());
+            }
+        }
+    }
+
     /// `path` を包含する最も近いお気に入り (パスが最長一致するもの) を返す。
     /// ZIP/PDF を開いている最中に呼ぶと ZIP/PDF 本体のパスで判定されるので、
     /// 仮想フォルダ内ページにもお気に入り標準が適用される。
@@ -11589,7 +11748,9 @@ impl App {
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
-                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
+                || self.items_are_reading_history_view
+                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path())
+                || crate::folder_tree::path_eq(&cur, &reading_history_synthetic_path());
             let has_grid_state_to_save =
                 !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
             if !leaving_search_view && has_grid_state_to_save {
@@ -12085,7 +12246,9 @@ impl App {
         }
 
         let catalog_del_t0 = std::time::Instant::now();
-        if source_path != search_results_synthetic_path() {
+        if source_path != search_results_synthetic_path()
+            && source_path != reading_history_synthetic_path()
+        {
             if let Some(ref cat) = catalog_arc {
                 if let Err(e) = cat.delete_missing(&catalog_existing_keys) {
                     crate::logger::log(format!("  catalog delete_missing failed: {e}"));
@@ -12213,9 +12376,11 @@ impl App {
                 self.redirect_selected_to_visible();
             }
         }
-        // 検索結果用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
+        // 検索結果 / 読書履歴用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
         let save_t0 = std::time::Instant::now();
-        if source_path != search_results_synthetic_path() {
+        if source_path != search_results_synthetic_path()
+            && source_path != reading_history_synthetic_path()
+        {
             // 変換アーカイブ (RAR/CBR/7z/LZH) 閲覧中は source_path (= current_folder) が
             // キャッシュ ZIP (`archive_cache\..\book.zip`) を指す。次回起動で復元すべきは
             // 元アーカイブなので、archive_source_override を反映した effective_folder() を
@@ -12293,7 +12458,9 @@ impl App {
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
         self.items_are_tag_view = false;
+        self.items_are_reading_history_view = false;
         self.items_are_drive_list = false;
+        self.reading_history_rows.clear();
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
@@ -19085,6 +19252,114 @@ impl App {
         self.last_book_resume = Some((folder, idx));
     }
 
+    /// 現在のフルスクリーンページを「最近読んだ本」として記録する。
+    pub(crate) fn record_reading_history(&mut self, idx: usize) {
+        if !self.settings.reading_history_enabled
+            || self.reading_history_writer.is_none()
+            || self.global_search.active
+            || self.items_are_global_search_view
+            || self.tag_view.active
+            || self.items_are_tag_view
+            || !self.is_readable_page_idx(idx)
+        {
+            return;
+        }
+        let Some((page_pos, page_count)) = self.current_reading_history_page_position(idx) else {
+            return;
+        };
+        let Some((path, kind, archive_format)) = self.reading_history_target_for_page(idx) else {
+            return;
+        };
+        let key = crate::path_key::normalize_keep_drive(&path);
+        const TOUCH_THROTTLE: std::time::Duration = std::time::Duration::from_secs(30);
+        let now = std::time::Instant::now();
+        if self
+            .last_reading_history_touch
+            .as_ref()
+            .is_some_and(|(last_key, at)| {
+                last_key == &key && now.duration_since(*at) < TOUCH_THROTTLE
+            })
+        {
+            return;
+        }
+
+        let keep_progress = !self.zip_nav.as_ref().is_some_and(|n| !n.at_root());
+        let title = reading_history_title_for_path(&path);
+        let entry = crate::reading_history_db::ReadingHistoryEntry::new(
+            path,
+            kind,
+            archive_format,
+            title,
+            keep_progress.then_some(page_pos),
+            keep_progress.then_some(page_count),
+        );
+        if let Some(writer) = &self.reading_history_writer {
+            writer.record(entry, self.settings.reading_history_limit);
+        }
+        self.last_reading_history_touch = Some((key, now));
+    }
+
+    fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
+        let mut page_count = 0_i64;
+        let mut page_pos = None;
+        for &candidate in self.current_grid_order() {
+            let item = self.items.get(candidate)?;
+            if !item.has_page_data() {
+                return None;
+            }
+            page_count += 1;
+            if candidate == idx {
+                page_pos = Some(page_count);
+            }
+        }
+        page_pos
+            .map(|pos| (pos, page_count))
+            .filter(|(_, count)| *count > 0)
+    }
+
+    fn reading_history_target_for_page(
+        &self,
+        idx: usize,
+    ) -> Option<(
+        PathBuf,
+        crate::reading_history_db::ReadingHistoryKind,
+        Option<crate::archive_converter::ArchiveFormat>,
+    )> {
+        if let Some(path) = self.archive_source_override.clone() {
+            return Some((
+                path.clone(),
+                crate::reading_history_db::ReadingHistoryKind::Archive,
+                crate::reading_history_db::archive_format_for_path(&path),
+            ));
+        }
+        match self.items.get(idx)? {
+            GridItem::Image(_) => {
+                let folder = self.current_folder.clone()?;
+                if crate::folder_tree::path_eq(&folder, &search_results_synthetic_path())
+                    || crate::folder_tree::path_eq(&folder, &reading_history_synthetic_path())
+                {
+                    return None;
+                }
+                Some((
+                    folder,
+                    crate::reading_history_db::ReadingHistoryKind::Folder,
+                    None,
+                ))
+            }
+            GridItem::ZipImage { zip_path, .. } => Some((
+                zip_path.clone(),
+                crate::reading_history_db::ReadingHistoryKind::Zip,
+                None,
+            )),
+            GridItem::PdfPage { pdf_path, .. } => Some((
+                pdf_path.clone(),
+                crate::reading_history_db::ReadingHistoryKind::Pdf,
+                None,
+            )),
+            _ => None,
+        }
+    }
+
     /// 現在のコンテナ (`current_folder`) の保存済み読書位置を、現在の `items` に対して
     /// 検証して返す。範囲外 / 本ページでない場合は None (= 先頭にフォールバック)。
     pub(crate) fn resume_page_for_container(&self) -> Option<usize> {
@@ -20103,6 +20378,7 @@ impl App {
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
         // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
         self.record_book_resume(idx);
+        self.record_reading_history(idx);
         self.video_continuous_last_eof = None;
         #[cfg(windows)]
         let entering_native_video_fullscreen =
@@ -21325,7 +21601,9 @@ impl App {
         // 出していたが、ユーザー設定が壊れる hidden mode だった。
         let rating_filter = self.effective_rating_filter();
         // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
-        let rating_filter_active = !self.items_are_drive_list && !rating_filter.iter().all(|&b| b);
+        let rating_filter_active = !self.items_are_drive_list
+            && !self.items_are_reading_history_view
+            && !rating_filter.iter().all(|&b| b);
 
         let n = self.items.len();
         let mut result = Vec::with_capacity(n);
@@ -21343,7 +21621,7 @@ impl App {
                     }
                 }
             }
-            if !self.passes_facet_filter(i, None) {
+            if !self.items_are_reading_history_view && !self.passes_facet_filter(i, None) {
                 continue;
             }
             result.push(i);
@@ -21416,7 +21694,9 @@ impl App {
     pub(crate) fn facet_candidate_indices(&mut self, ignore: FacetField) -> Vec<usize> {
         let search_filter = self.search_filter.clone();
         let rating_filter = self.effective_rating_filter();
-        let rating_filter_active = !self.items_are_drive_list && !rating_filter.iter().all(|&b| b);
+        let rating_filter_active = !self.items_are_drive_list
+            && !self.items_are_reading_history_view
+            && !rating_filter.iter().all(|&b| b);
         let mut out = Vec::new();
         for i in 0..self.items.len() {
             if let Some(ref f) = search_filter {
@@ -21432,7 +21712,7 @@ impl App {
                     }
                 }
             }
-            if self.passes_facet_filter(i, Some(ignore)) {
+            if self.items_are_reading_history_view || self.passes_facet_filter(i, Some(ignore)) {
                 out.push(i);
             }
         }
@@ -21962,7 +22242,8 @@ impl App {
     }
 
     pub(crate) fn current_grid_order(&self) -> &[usize] {
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+        if !self.items_are_reading_history_view
+            && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && self.details_order.len() == self.visible_indices.len()
         {
             &self.details_order
@@ -22007,6 +22288,7 @@ impl App {
     pub(crate) fn details_header_sort_active(&self) -> bool {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && !self.current_folder_is_book_folder()
+            && !self.items_are_reading_history_view
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
     }
 
@@ -22037,6 +22319,9 @@ impl App {
     }
 
     pub(crate) fn set_details_sort_key(&mut self, key: crate::settings::DetailsSortKey) {
+        if self.items_are_reading_history_view {
+            return;
+        }
         let lazy_key = matches!(
             key,
             crate::settings::DetailsSortKey::Created
@@ -22075,7 +22360,10 @@ impl App {
             key = self.settings.details_sort_key;
             ascending = self.settings.details_sort_ascending;
         }
-        if key == crate::settings::DetailsSortKey::Toolbar || self.current_folder_is_book_folder() {
+        if key == crate::settings::DetailsSortKey::Toolbar
+            || self.current_folder_is_book_folder()
+            || self.items_are_reading_history_view
+        {
             self.details_order = self.visible_indices.clone();
             return;
         }
@@ -36750,11 +37038,13 @@ impl App {
             .is_some_and(use_full_path_cache_keys_for_folder)
             || self.items_are_global_search_view
             || self.items_are_tag_view
+            || self.items_are_reading_history_view
     }
 }
 
 fn use_full_path_cache_keys_for_folder(path: &std::path::Path) -> bool {
     path == search_results_synthetic_path().as_path()
+        || path == reading_history_synthetic_path().as_path()
         || crate::path_key::is_drive_or_share_root(path)
 }
 
@@ -36763,6 +37053,50 @@ fn use_full_path_cache_keys_for_folder(path: &std::path::Path) -> bool {
 /// 通常の basename キー・コンテナキー (`folderthumb:` 等) と自然に区別される。
 fn image_full_path_cache_key(path: &std::path::Path) -> String {
     format!("imgthumb:{}", path.to_string_lossy())
+}
+
+fn reading_history_grid_item(entry: &crate::reading_history_db::ReadingHistoryEntry) -> GridItem {
+    match entry.kind {
+        crate::reading_history_db::ReadingHistoryKind::Folder => {
+            GridItem::Folder(entry.path.clone())
+        }
+        crate::reading_history_db::ReadingHistoryKind::Zip => GridItem::ZipFile(entry.path.clone()),
+        crate::reading_history_db::ReadingHistoryKind::Pdf => GridItem::PdfFile(entry.path.clone()),
+        crate::reading_history_db::ReadingHistoryKind::Archive => {
+            if let Some(format) = entry
+                .archive_format
+                .or_else(|| crate::reading_history_db::archive_format_for_path(&entry.path))
+            {
+                GridItem::ConvertibleArchive {
+                    path: entry.path.clone(),
+                    format,
+                }
+            } else {
+                GridItem::ZipFile(entry.path.clone())
+            }
+        }
+    }
+}
+
+fn reading_history_meta_for_entry(
+    entry: &crate::reading_history_db::ReadingHistoryEntry,
+) -> Option<(i64, i64)> {
+    let mtime = entry.mtime_ms.map(|ms| ms / 1000).unwrap_or(0);
+    let file_size = entry.file_size.unwrap_or(0);
+    Some((mtime, file_size))
+}
+
+fn reading_history_key_for_item(item: &GridItem) -> Option<String> {
+    let path = item.container_path()?;
+    Some(crate::path_key::normalize_keep_drive(path))
+}
+
+fn reading_history_title_for_path(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
 fn drive_list_catalog_path() -> PathBuf {

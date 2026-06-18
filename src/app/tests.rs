@@ -3650,6 +3650,71 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    #[test]
+    fn install_new_items_resets_reading_history_view_state() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items_are_reading_history_view = true;
+        app.reading_history_rows.insert(
+            "c:/books/a.zip".to_string(),
+            crate::reading_history_db::ReadingHistoryEntry {
+                key: "c:/books/a.zip".to_string(),
+                path: std::path::PathBuf::from("c:/books/a.zip"),
+                kind: crate::reading_history_db::ReadingHistoryKind::Zip,
+                archive_format: None,
+                title: "a.zip".to_string(),
+                last_read_at_ms: 1,
+                last_page: Some(1),
+                page_count: Some(2),
+                file_size: None,
+                mtime_ms: None,
+            },
+        );
+
+        app.install_new_items(
+            vec![GridItem::Image(std::path::PathBuf::from("c:/books/p1.jpg"))],
+            vec![None],
+        );
+
+        assert!(!app.items_are_reading_history_view);
+        assert!(app.reading_history_rows.is_empty());
+    }
+
+    #[test]
+    fn reading_history_page_position_requires_page_only_order() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/books/p1.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/books/p2.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        assert_eq!(app.current_reading_history_page_position(1), Some((2, 2)));
+
+        app.items.insert(
+            0,
+            GridItem::Folder(std::path::PathBuf::from("c:/books/sub")),
+        );
+        app.visible_indices = vec![0, 1, 2];
+        assert_eq!(app.current_reading_history_page_position(1), None);
+    }
+
+    #[test]
+    fn reading_history_target_uses_archive_source_override() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.archive_source_override = Some(std::path::PathBuf::from("c:/books/source.rar"));
+        app.items = vec![GridItem::ZipImage {
+            zip_path: std::path::PathBuf::from("c:/cache/book.zip"),
+            entry_name: "p1.jpg".to_string(),
+        }];
+
+        let (path, kind, format) = app.reading_history_target_for_page(0).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("c:/books/source.rar"));
+        assert_eq!(kind, crate::reading_history_db::ReadingHistoryKind::Archive);
+        assert_eq!(format, Some(crate::archive_converter::ArchiveFormat::Rar));
+    }
+
     /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
     /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
     /// drilled view が空にならない。

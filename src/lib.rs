@@ -84,6 +84,7 @@ pub mod os_theme;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
+pub mod reading_history_db;
 // loose-deps ポータブルビルド専用の native ファイル所在解決 (exe 隣の bundled file)。
 // 通常ビルドでは中身が無いので宣言ごと cfg で落とす。詳細: docs/portable-build-plan.md
 pub mod db_backup;

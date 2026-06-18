@@ -122,6 +122,11 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
     );
     ui.radio_value(
         &mut state.settings.startup_folder_mode,
+        StartupFolderMode::ReadingHistory,
+        StartupFolderMode::ReadingHistory.label(),
+    );
+    ui.radio_value(
+        &mut state.settings.startup_folder_mode,
         StartupFolderMode::Specific,
         StartupFolderMode::Specific.label(),
     );
@@ -3144,6 +3149,40 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         state.book_resume_clear_requested = true;
     }
     if let Some(msg) = &state.book_resume_clear_result {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(msg)
+                .size(11.0)
+                .color(egui::Color32::from_gray(150)),
+        );
+    }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("読書履歴").strong());
+    ui.checkbox(
+        &mut state.settings.reading_history_enabled,
+        "フルスクリーンで読んだ本を読書履歴に記録する",
+    );
+    ui.horizontal(|ui| {
+        ui.label("保持件数:");
+        ui.add(
+            egui::DragValue::new(&mut state.settings.reading_history_limit)
+                .range(1..=crate::reading_history_db::READING_HISTORY_LIMIT_MAX)
+                .speed(10),
+        );
+        ui.label(format!(
+            "/ 最大 {}",
+            crate::reading_history_db::READING_HISTORY_LIMIT_MAX
+        ));
+    });
+    let history_count = state.reading_history_entry_count;
+    ui.label(format!("読書履歴: {history_count} 件を記憶。"));
+    if history_count > 0 && ui.button("読書履歴をすべてクリア").clicked() {
+        state.reading_history_clear_requested = true;
+    }
+    if let Some(msg) = &state.reading_history_clear_result {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(msg)

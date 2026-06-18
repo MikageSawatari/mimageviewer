@@ -2667,6 +2667,7 @@ impl App {
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
         self.record_book_resume(target_idx);
+        self.record_reading_history(target_idx);
         ctx.request_repaint();
     }
 
@@ -9384,6 +9385,7 @@ impl App {
         self.fullscreen_idx = Some(new_idx);
         self.sync_main_selection_from_viewer_idx(new_idx);
         self.record_book_resume(new_idx);
+        self.record_reading_history(new_idx);
         ctx.request_repaint();
     }
 

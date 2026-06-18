@@ -295,6 +295,12 @@ pub(crate) struct PreferencesState {
     pub book_resume_clear_requested: bool,
     /// 直近の ZIP/PDF 読書位置削除結果。
     pub book_resume_clear_result: Option<String>,
+    /// 環境設定を開いた時点 / 削除後の読書履歴の記憶件数。
+    pub reading_history_entry_count: usize,
+    /// 読書履歴クリアを App 側へ伝える one-shot フラグ。
+    pub reading_history_clear_requested: bool,
+    /// 直近の読書履歴削除結果。
+    pub reading_history_clear_result: Option<String>,
 
     // ── エクスプローラ連携ページ用 ──────────────────────────────
     /// SendTo ショートカットの状態。ページを初めて開いた時と操作後に更新する。
@@ -388,6 +394,7 @@ impl PreferencesState {
         audio_normalize_db_available: bool,
         audio_normalize_entry_count: usize,
         book_resume_entry_count: usize,
+        reading_history_entry_count: usize,
     ) -> Self {
         let manual_threads = match &s.parallelism {
             Parallelism::Manual(n) => *n,
@@ -481,6 +488,9 @@ impl PreferencesState {
             book_resume_entry_count,
             book_resume_clear_requested: false,
             book_resume_clear_result: None,
+            reading_history_entry_count,
+            reading_history_clear_requested: false,
+            reading_history_clear_result: None,
             send_to_status: None,
             send_to_action_message: None,
             gpu_vendor,
@@ -565,6 +575,10 @@ impl App {
                     .map(|db| db.count())
                     .unwrap_or(0),
                 self.book_resume_db
+                    .as_ref()
+                    .map(|db| db.count())
+                    .unwrap_or(0),
+                self.reading_history_db
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
@@ -726,6 +740,7 @@ impl App {
                 let old_ai_backend = self.settings.ai_backend.clone();
                 let new_ai_backend = state.settings.ai_backend.clone();
                 let old_ai_feature_mode = self.settings.ai_feature_mode;
+                let old_reading_history_limit = self.settings.reading_history_limit;
 
                 // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
                 // 無効化トリガに使う)
@@ -773,12 +788,28 @@ impl App {
                     .settings
                     .overwrite_non_preferences_from(&mut self.settings);
 
+                state.settings.reading_history_limit = state
+                    .settings
+                    .reading_history_limit
+                    .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
                 self.settings = state.settings;
                 if clear_recent_folders_requested {
                     self.clear_recent_folders();
                 }
                 if clear_quick_folder_slots_requested {
                     self.clear_quick_folder_slots();
+                }
+                if old_reading_history_limit != self.settings.reading_history_limit {
+                    if let Some(writer) = &self.reading_history_writer {
+                        writer.prune(self.settings.reading_history_limit);
+                    } else if let Some(db) = self.reading_history_db.as_ref() {
+                        if let Err(e) = db.prune(self.settings.reading_history_limit) {
+                            crate::logger::log(format!("reading-history prune failed: {e}"));
+                        }
+                    }
+                    if self.items_are_reading_history_view {
+                        self.enter_reading_history();
+                    }
                 }
                 self.settings.save();
 
@@ -956,6 +987,43 @@ impl App {
                             Some(format!("読書位置の削除に失敗しました: {err}"));
                     }
                 }
+            }
+        }
+
+        // 位置の復元ページ: 読書履歴クリア (one-shot)。
+        let mut clear_reading_history_requested = false;
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.reading_history_clear_requested {
+                ps.reading_history_clear_requested = false;
+                clear_reading_history_requested = true;
+            }
+        }
+        if clear_reading_history_requested {
+            let result = match self.reading_history_db.as_ref() {
+                Some(db) => match db.clear_all() {
+                    Ok(deleted) => {
+                        crate::logger::log(format!("[reading_history] cleared {deleted} entries"));
+                        Ok((deleted, db.count()))
+                    }
+                    Err(e) => Err(format!("{e}")),
+                },
+                None => Err("読書履歴 DB を開けませんでした".to_string()),
+            };
+            if let Some(ps) = self.pref_state.as_mut() {
+                match result {
+                    Ok((deleted, remaining)) => {
+                        ps.reading_history_entry_count = remaining;
+                        ps.reading_history_clear_result =
+                            Some(format!("読書履歴を {deleted} 件削除しました。"));
+                    }
+                    Err(err) => {
+                        ps.reading_history_clear_result =
+                            Some(format!("読書履歴の削除に失敗しました: {err}"));
+                    }
+                }
+            }
+            if self.items_are_reading_history_view {
+                self.enter_reading_history();
             }
         }
 

@@ -50,7 +50,7 @@ pub fn startup_folder(
             .and_then(resolve_startup_last_folder)
             .or_else(desktop_dir)
             .or_else(|| last_folder.and_then(resolve_startup_last_folder)),
-        StartupFolderMode::Drives => None,
+        StartupFolderMode::Drives | StartupFolderMode::ReadingHistory => None,
     }
 }
 
@@ -197,6 +197,19 @@ mod tests {
         assert_eq!(
             startup_folder(
                 StartupFolderMode::Drives,
+                Some(tmp.path()),
+                Some(tmp.path())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_folder_reading_history_is_virtual_and_returns_none() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(
+            startup_folder(
+                StartupFolderMode::ReadingHistory,
                 Some(tmp.path()),
                 Some(tmp.path())
             ),

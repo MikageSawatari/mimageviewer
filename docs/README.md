@@ -33,6 +33,7 @@
 | [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドからエクスプローラ等へファイルをドラッグ送出 (コピー) する機能の実装設計＋実装メモ。シェル `IDataObject` + `SHDoDragDrop` 方式。実装済み (2026-05、`src/file_drag.rs`)、残るは §8.2 の実機検証 |
 | [ring-shortcut-plan.md](ring-shortcut-plan.md) | マウス右フリック / ゲームパッド X リングショートカット + パッド専用ピッカーパネルの設計。Phase 1 は `RingActionId` / `PickerCommand`、`Settings.ring_shortcuts` 永続化、環境設定ページから着手 |
 | [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md) | サムネイル比率の自動選択 (`thumb_aspect_auto`) の設計と実装計画。`log(ratio)` の中央値 → 最近接バケット方式 + 6 段ゲート (min_samples / 連勝継続 / cooldown / 切替上限 / 入力 idle / log 距離マージン)。実装済み (2026-05、`src/auto_aspect.rs`) |
+| [reading-history-plan.md](reading-history-plan.md) | 最近読んだフォルダ / ZIP / PDF を「読書履歴」として専用ビューに集める機能の実装メモ。記録対象は `Image` / `ZipImage` / `PdfPage` をフルスクリーンで開いた時、動画は除外。Ctrl+S コンテナ検索は対象、Ctrl+G アイテム検索とタグビューは対象外。変換アーカイブはキャッシュ ZIP ではなく元 RAR/7z/LZH を保存する。MVP 実装済み (2026-06、`src/reading_history_db.rs`) |
 | [local-adjustment-layer-v1.1.0-plan.md](local-adjustment-layer-v1.1.0-plan.md) | **Codex 案**。v1.1.0 候補の画像補正ピボット計画。全体補正の強化、手描き/グラデーション/範囲/セグメンテーション生成マスク、マスク反転付きの部分補正レイヤーを、消しゴム後・隠蔽加工前の非破壊レイヤーとして追加する設計 |
 | [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md) | 補正レイヤーへ追加していくフィルタ候補リスト。イラスト用途を主眼に、効果選択 UI 方針、優先度、実装難易度、詳細設計を整理 |
 | [speech-bubble-tool-design.md](speech-bubble-tool-design.md) | **Codex 案**。漫画 / AI イラスト投稿向けの吹き出し・セリフ入れツール設計。補正レイヤーとは分け、隠蔽加工後・crop 前に載せる前提で、テキスト、尾、縦書き、IME、保存、書き出しを整理 |

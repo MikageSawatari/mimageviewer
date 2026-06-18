@@ -1069,6 +1069,10 @@ fn default_resume_from_start() -> ResumeMode {
     ResumeMode::FromStart
 }
 
+fn default_reading_history_limit() -> usize {
+    crate::reading_history_db::READING_HISTORY_LIMIT_DEFAULT
+}
+
 // -----------------------------------------------------------------------
 // SpreadMode (フルスクリーンページ構成)
 // -----------------------------------------------------------------------
@@ -1411,7 +1415,7 @@ pub struct RecentApp {
 // StartupFolderMode (起動時に開く場所)
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFolderMode {
     /// 前回終了時に表示していた場所。既存挙動との互換のためデフォルト。
@@ -1423,6 +1427,25 @@ pub enum StartupFolderMode {
     Specific,
     /// 実フォルダではなく、接続済みドライブ一覧を表示する。
     Drives,
+    /// 実フォルダではなく、最近フルスクリーンで読んだ本の一覧を表示する。
+    ReadingHistory,
+}
+
+impl<'de> serde::Deserialize<'de> for StartupFolderMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "previous" => Self::Previous,
+            "desktop" => Self::Desktop,
+            "specific" => Self::Specific,
+            "drives" => Self::Drives,
+            "reading_history" => Self::ReadingHistory,
+            _ => Self::Previous,
+        })
+    }
 }
 
 impl StartupFolderMode {
@@ -1432,6 +1455,7 @@ impl StartupFolderMode {
             Self::Desktop => "デスクトップ",
             Self::Specific => "指定フォルダ",
             Self::Drives => "ドライブ一覧",
+            Self::ReadingHistory => "読書履歴",
         }
     }
 }
@@ -2166,6 +2190,12 @@ pub struct Settings {
     /// (位置復元マトリクス「ZIP/PDF × Ctrl+↑↓ 移動」。既定 = 先頭から = 従来「フォルダ先頭着地」)
     #[serde(default = "default_resume_from_start")]
     pub book_nav_resume: ResumeMode,
+    /// フルスクリーンで開いた本 (フォルダ / ZIP / PDF) を読書履歴に記録するか。
+    #[serde(default = "default_true")]
+    pub reading_history_enabled: bool,
+    /// 読書履歴の保持件数。既定 1000、上限 1000。
+    #[serde(default = "default_reading_history_limit")]
+    pub reading_history_limit: usize,
     /// ハードウェアデコードを利用するか (Windows D3D11VA)。D3D11VA 非対応 codec は
     /// SW で再生し、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーとして扱う。
     /// HEVC / 4K 動画の CPU 負荷を大きく下げるため既定 ON。GPU ドライバの不具合等で
@@ -3123,6 +3153,8 @@ impl Default for Settings {
             video_nav_resume: ResumeMode::Resume,
             book_open_resume: ResumeMode::Resume,
             book_nav_resume: ResumeMode::FromStart,
+            reading_history_enabled: true,
+            reading_history_limit: default_reading_history_limit(),
             video_hw_decode: true,
             video_deinterlace: VideoDeinterlaceMode::default(),
             video_thumb_use_sidecar_image: true,
@@ -4189,6 +4221,9 @@ impl Settings {
         self.fullscreen_fixed_jump_count = self
             .fullscreen_fixed_jump_count
             .clamp(FULLSCREEN_FIXED_JUMP_MIN, FULLSCREEN_FIXED_JUMP_MAX);
+        self.reading_history_limit = self
+            .reading_history_limit
+            .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
         self.fullscreen_cursor_hide_delay_secs =
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
         self.retained_final_ai_cache_max_entries = self.retained_final_ai_cache_max_entries.clamp(
@@ -4529,6 +4564,11 @@ mod tests {
         assert!(s.last_folder.is_none());
         assert_eq!(s.startup_folder_mode, StartupFolderMode::Previous);
         assert!(s.startup_folder_path.is_none());
+        assert!(s.reading_history_enabled);
+        assert_eq!(
+            s.reading_history_limit,
+            crate::reading_history_db::READING_HISTORY_LIMIT_DEFAULT
+        );
         assert!(s.recent_folders.is_empty());
         assert_eq!(s.quick_folder_slots, [None, None]);
         assert!(s.window_pos.is_none());
@@ -5009,6 +5049,32 @@ mod tests {
         s.folder_skip_limit = 999;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 30);
+    }
+
+    #[test]
+    fn sanitize_clamps_reading_history_limit() {
+        let mut s = Settings::default();
+        s.reading_history_limit = 0;
+        s.sanitize();
+        assert_eq!(s.reading_history_limit, 1);
+
+        s.reading_history_limit = crate::reading_history_db::READING_HISTORY_LIMIT_MAX + 1;
+        s.sanitize();
+        assert_eq!(
+            s.reading_history_limit,
+            crate::reading_history_db::READING_HISTORY_LIMIT_MAX
+        );
+    }
+
+    #[test]
+    fn startup_folder_mode_unknown_falls_back_to_previous() {
+        let loaded: Settings = serde_json::from_str(
+            r#"{
+                "startup_folder_mode": "future_mode"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.startup_folder_mode, StartupFolderMode::Previous);
     }
 
     #[test]

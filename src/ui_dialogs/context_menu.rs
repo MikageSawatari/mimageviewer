@@ -340,23 +340,25 @@ impl crate::app::App {
 
         // 記録済みの座標に固定表示
         let pos = self.context_menu_pos;
-        match self.try_show_native_grid_context_menu(
-            ctx,
-            pos,
-            idx,
-            item.clone(),
-            is_folder_context,
-            has_checked,
-            in_search,
-            folder_command_target.clone(),
-        ) {
-            NativeGridContextMenuOutcome::Consumed(nav) => {
-                self.context_menu_idx = None;
-                self.cached_handlers = None;
-                ctx.request_repaint();
-                return nav;
+        if !self.items_are_reading_history_view {
+            match self.try_show_native_grid_context_menu(
+                ctx,
+                pos,
+                idx,
+                item.clone(),
+                is_folder_context,
+                has_checked,
+                in_search,
+                folder_command_target.clone(),
+            ) {
+                NativeGridContextMenuOutcome::Consumed(nav) => {
+                    self.context_menu_idx = None;
+                    self.cached_handlers = None;
+                    ctx.request_repaint();
+                    return nav;
+                }
+                NativeGridContextMenuOutcome::Fallback => {}
             }
-            NativeGridContextMenuOutcome::Fallback => {}
         }
 
         let mut open = true;
@@ -663,8 +665,15 @@ impl crate::app::App {
                     // separator が残るのを防ぐため呼び出し自体を skip)。
                     // pin 不能 / アグリゲートビュー / drill-down 等の条件分岐とそれに伴う
                     // separator 描画は helper 側に集約 (Codex Phase D 再指摘)。
-                    if !is_folder_context {
+                    if !is_folder_context && !self.items_are_reading_history_view {
                         if self.render_folder_pin_menu_entry(ui, &item) {
+                            close = true;
+                        }
+                    }
+                    if self.items_are_reading_history_view && !is_folder_context {
+                        ui.separator();
+                        if ui.button("履歴から削除").clicked() {
+                            self.remove_reading_history_entry_for_idx(idx);
                             close = true;
                         }
                     }
@@ -1007,6 +1016,7 @@ impl crate::app::App {
             || target.item_index.is_none()
             || self.items_are_global_search_view
             || self.items_are_tag_view
+            || self.items_are_reading_history_view
             || self.archive_source_override.is_some() && self.zip_nav.is_none()
         {
             return None;
