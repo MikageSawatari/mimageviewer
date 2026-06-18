@@ -59,7 +59,7 @@ pub(crate) enum PreferencesPage {
     /// 履歴と復元 (読書履歴、読書/再生位置の復元)
     PlaybackResume,
     SusiePlugins,
-    /// v0.8.0: 自動インデクサ速度プロファイル
+    /// v0.8.0: 検索インデックスの速度プロファイル
     IndexerSpeed,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
     TrayResidency,
@@ -81,7 +81,7 @@ impl PreferencesPage {
     fn label(self) -> &'static str {
         match self {
             Self::General => "全体設定",
-            Self::StartupFolder => "開始フォルダ",
+            Self::StartupFolder => "起動時に開く場所",
             Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
             Self::Toolbar => "ツールバー",
@@ -98,14 +98,14 @@ impl PreferencesPage {
             Self::Book => "製本",
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
-            Self::SpreadMode => "表示モード",
+            Self::SpreadMode => "閲覧表示",
             Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
-            Self::IndexerSpeed => "自動インデクサ速度",
+            Self::IndexerSpeed => "検索インデックス",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
             Self::UpdateCheck => "更新確認",
-            Self::Video => "動画再生",
+            Self::Video => "動画",
             Self::Vst3 => "VST3 プラグイン",
             Self::EditingAddon => "編集用追加ファイル",
             Self::Developer => "開発者",
@@ -130,14 +130,14 @@ const TREE: &[TreeCategory] = &[
         children: &[],
     },
     TreeCategory {
-        label: "開始フォルダ",
-        page: Some(PreferencesPage::StartupFolder),
-        children: &[],
-    },
-    TreeCategory {
-        label: "エクスプローラ連携",
-        page: Some(PreferencesPage::ExplorerIntegration),
-        children: &[],
+        label: "起動と連携",
+        page: None,
+        children: &[
+            PreferencesPage::StartupFolder,
+            PreferencesPage::ExplorerIntegration,
+            PreferencesPage::TrayResidency,
+            PreferencesPage::UpdateCheck,
+        ],
     },
     TreeCategory {
         label: "表示",
@@ -145,6 +145,7 @@ const TREE: &[TreeCategory] = &[
         children: &[
             PreferencesPage::Thumbnail,
             PreferencesPage::Toolbar,
+            PreferencesPage::SpreadMode,
             PreferencesPage::Slideshow,
             PreferencesPage::Capture,
             PreferencesPage::MouseButtons,
@@ -159,22 +160,19 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::Prefetch,
             PreferencesPage::GpuMemory,
             PreferencesPage::AiBackend,
+            PreferencesPage::Cache,
         ],
     },
     TreeCategory {
-        label: "キャッシュ",
-        page: Some(PreferencesPage::Cache),
-        children: &[],
-    },
-    TreeCategory {
-        label: "フォルダ",
-        page: Some(PreferencesPage::Folder),
-        children: &[],
-    },
-    TreeCategory {
-        label: "製本",
-        page: Some(PreferencesPage::Book),
-        children: &[],
+        label: "ライブラリ",
+        page: None,
+        children: &[
+            PreferencesPage::Folder,
+            PreferencesPage::Book,
+            PreferencesPage::PlaybackResume,
+            PreferencesPage::Rating,
+            PreferencesPage::IndexerSpeed,
+        ],
     },
     TreeCategory {
         label: "ファイル処理",
@@ -182,70 +180,18 @@ const TREE: &[TreeCategory] = &[
         children: &[
             PreferencesPage::DuplicateFiles,
             PreferencesPage::ExifDisplay,
+            PreferencesPage::SusiePlugins,
         ],
     },
     TreeCategory {
-        label: "表示モード",
-        page: Some(PreferencesPage::SpreadMode),
-        children: &[],
+        label: "動画・音声",
+        page: None,
+        children: &[PreferencesPage::Video, PreferencesPage::Vst3],
     },
     TreeCategory {
-        label: "履歴と復元",
-        page: Some(PreferencesPage::PlaybackResume),
-        children: &[],
-    },
-    TreeCategory {
-        label: "Susie プラグイン",
-        page: Some(PreferencesPage::SusiePlugins),
-        children: &[],
-    },
-    // 全文検索インデクサ (Ctrl+F / Ctrl+G 用) の速度プロファイル
-    TreeCategory {
-        label: "全文検索インデクサ",
-        page: Some(PreferencesPage::IndexerSpeed),
-        children: &[],
-    },
-    // v0.9: タスクトレイ常駐
-    TreeCategory {
-        label: "タスクトレイ常駐",
-        page: Some(PreferencesPage::TrayResidency),
-        children: &[],
-    },
-    // v0.8.1: レーティングの XMP 書き込み (opt-in)
-    TreeCategory {
-        label: "レーティング",
-        page: Some(PreferencesPage::Rating),
-        children: &[],
-    },
-    // バージョン更新確認 (起動時 + 24h 周期)
-    TreeCategory {
-        label: "更新確認",
-        page: Some(PreferencesPage::UpdateCheck),
-        children: &[],
-    },
-    // 動画再生 (HW デコード等)
-    TreeCategory {
-        label: "動画再生",
-        page: Some(PreferencesPage::Video),
-        children: &[],
-    },
-    // VST3 プラグイン設定 (= 動画再生時の音声プラグイン処理)
-    TreeCategory {
-        label: "VST3 プラグイン",
-        page: Some(PreferencesPage::Vst3),
-        children: &[],
-    },
-    // 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の導入 / 削除
-    TreeCategory {
-        label: "編集用追加ファイル",
-        page: Some(PreferencesPage::EditingAddon),
-        children: &[],
-    },
-    // 開発者 / 診断 (ログ zip 書き出し・性能ログ記録)
-    TreeCategory {
-        label: "開発者",
-        page: Some(PreferencesPage::Developer),
-        children: &[],
+        label: "拡張と診断",
+        page: None,
+        children: &[PreferencesPage::EditingAddon, PreferencesPage::Developer],
     },
 ];
 
@@ -406,12 +352,7 @@ impl PreferencesState {
                 .unwrap_or(2);
             (cores / 2).max(1)
         };
-        let mut expanded = HashSet::new();
-        for cat in TREE {
-            if !cat.children.is_empty() {
-                expanded.insert(cat.label);
-            }
-        }
+        let expanded = HashSet::new();
 
         // AI バックエンドページ用の情報を 1 回だけ取得 (環境設定ダイアログを開いた時点)
         let gpu_vendor = crate::gpu_info::query_primary_gpu_vendor();
@@ -1233,6 +1174,11 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
                 if let Some(page) = cat.page {
                     state.selected = page;
+                } else if !is_expanded
+                    && !cat.children.contains(&state.selected)
+                    && let Some(&first_child) = cat.children.first()
+                {
+                    state.selected = first_child;
                 }
             }
 
