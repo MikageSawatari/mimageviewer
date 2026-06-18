@@ -71,7 +71,6 @@ impl ReadingHistoryEntry {
         page_count: Option<i64>,
     ) -> Self {
         let key = normalize_path_keep_drive(&path);
-        let (file_size, mtime_ms) = path_metadata(&path);
         Self {
             key,
             path,
@@ -81,8 +80,8 @@ impl ReadingHistoryEntry {
             last_read_at_ms: now_ms(),
             last_page,
             page_count,
-            file_size,
-            mtime_ms,
+            file_size: None,
+            mtime_ms: None,
         }
     }
 }
@@ -135,6 +134,15 @@ impl ReadingHistoryDb {
         let limit = clamp_limit(limit);
         if entry.key.is_empty() {
             entry.key = normalize_path_keep_drive(&entry.path);
+        }
+        if entry.file_size.is_none() || entry.mtime_ms.is_none() {
+            let (file_size, mtime_ms) = path_metadata(&entry.path);
+            if entry.file_size.is_none() {
+                entry.file_size = file_size;
+            }
+            if entry.mtime_ms.is_none() {
+                entry.mtime_ms = mtime_ms;
+            }
         }
         let existed: Option<i64> = self
             .conn

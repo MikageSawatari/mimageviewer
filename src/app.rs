@@ -37086,7 +37086,7 @@ fn reading_history_meta_for_entry(
     Some((mtime, file_size))
 }
 
-fn reading_history_key_for_item(item: &GridItem) -> Option<String> {
+pub(crate) fn reading_history_key_for_item(item: &GridItem) -> Option<String> {
     let path = item.container_path()?;
     Some(crate::path_key::normalize_keep_drive(path))
 }

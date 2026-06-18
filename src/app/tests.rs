@@ -3715,6 +3715,39 @@ mod phase_c_drill_nav_tests {
         assert_eq!(format, Some(crate::archive_converter::ArchiveFormat::Rar));
     }
 
+    #[test]
+    fn reading_history_metadata_is_available_to_grid_and_details_ui() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let path = std::path::PathBuf::from("c:/books/a.zip");
+        let key = crate::path_key::normalize_keep_drive(&path);
+
+        app.items_are_reading_history_view = true;
+        app.items = vec![GridItem::ZipFile(path.clone())];
+        app.reading_history_rows.insert(
+            key.clone(),
+            crate::reading_history_db::ReadingHistoryEntry {
+                key,
+                path,
+                kind: crate::reading_history_db::ReadingHistoryKind::Zip,
+                archive_format: None,
+                title: "a.zip".to_string(),
+                last_read_at_ms: 1_700_000_000_000,
+                last_page: Some(12),
+                page_count: Some(120),
+                file_size: Some(1234),
+                mtime_ms: Some(1_700_000_000_000),
+            },
+        );
+
+        let details = app.reading_history_details_state_text(0).unwrap();
+        assert!(details.contains("12 / 120"));
+
+        let tooltip = app.reading_history_tooltip_lines(0).unwrap().join("\n");
+        assert!(tooltip.contains("最終閲覧"));
+        assert!(tooltip.contains("既読位置 12 / 120"));
+    }
+
     /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
     /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
     /// drilled view が空にならない。

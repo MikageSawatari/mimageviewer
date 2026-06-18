@@ -20,6 +20,7 @@
 | AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
+| 読書履歴 writer | `std::thread` (`reading-history-writer`) + mpsc | 1 | フルスクリーンで読んだ画像フォルダ / ZIP / PDF / 変換アーカイブを `reading_history.db` へ upsert / prune する。UI スレッドは履歴 entry を送るだけで、ファイルサイズ / mtime の `metadata()` 補完も writer 側で行う。キャンセルは持たず、App drop 時に tx close → queue drain → join |
 | テキスト注釈ベイク | `std::thread` (`comic-bake`) + mpsc | 閲覧時最大 2 | Ctrl+T 注釈を final composite 上へ焼き込む。閲覧時は stamp 画像の cache miss デコードも worker 側で行い、完了時に `comic_stamp_cache` へ merge する。編集中はライブ追従を優先し、プレビュー解像度で同期ベイクする |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |

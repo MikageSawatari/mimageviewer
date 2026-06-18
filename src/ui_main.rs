@@ -709,7 +709,7 @@ impl DetailsColumn {
             Self::Kind => 96.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
-            Self::State => 92.0,
+            Self::State => 176.0,
             Self::ImageDimensions => 108.0,
             Self::VideoDuration => 94.0,
             Self::VideoDimensions => 112.0,
@@ -1496,6 +1496,27 @@ fn format_details_mtime(secs: i64, _show_seconds: bool) -> String {
         String::new()
     } else {
         secs.to_string()
+    }
+}
+
+fn reading_history_last_read_text(
+    entry: &crate::reading_history_db::ReadingHistoryEntry,
+    show_seconds: bool,
+) -> Option<String> {
+    let text = format_details_mtime(entry.last_read_at_ms / 1000, show_seconds);
+    (!text.is_empty()).then_some(text)
+}
+
+fn reading_history_progress_text(
+    entry: &crate::reading_history_db::ReadingHistoryEntry,
+) -> Option<String> {
+    let page = entry.last_page?;
+    if page <= 0 {
+        return None;
+    }
+    match entry.page_count {
+        Some(count) if count > 0 => Some(format!("{page} / {count}")),
+        _ => Some(format!("{page} ページ目")),
     }
 }
 
@@ -6607,6 +6628,64 @@ impl App {
         egui::pos2(x, y)
     }
 
+    pub(crate) fn reading_history_entry_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<&crate::reading_history_db::ReadingHistoryEntry> {
+        if !self.items_are_reading_history_view {
+            return None;
+        }
+        let key = self
+            .items
+            .get(idx)
+            .and_then(crate::app::reading_history_key_for_item)?;
+        self.reading_history_rows.get(&key)
+    }
+
+    pub(crate) fn reading_history_details_state_text(&self, idx: usize) -> Option<String> {
+        let entry = self.reading_history_entry_for_idx(idx)?;
+        let mut parts = Vec::new();
+        if let Some(last_read) =
+            reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
+        {
+            parts.push(last_read);
+        }
+        if let Some(progress) = reading_history_progress_text(entry) {
+            parts.push(progress);
+        }
+        (!parts.is_empty()).then(|| parts.join("  "))
+    }
+
+    pub(crate) fn reading_history_tooltip_lines(&self, idx: usize) -> Option<Vec<String>> {
+        let entry = self.reading_history_entry_for_idx(idx)?;
+        let mut lines = Vec::new();
+        if let Some(last_read) =
+            reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
+        {
+            lines.push(format!("最終閲覧 {last_read}"));
+        }
+        if let Some(progress) = reading_history_progress_text(entry) {
+            lines.push(format!("既読位置 {progress}"));
+        }
+        (!lines.is_empty()).then_some(lines)
+    }
+
+    fn draw_reading_history_tooltip(&self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize) {
+        let Some(lines) = self.reading_history_tooltip_lines(idx) else {
+            return;
+        };
+        let response = ui.interact(
+            rect,
+            ui.id().with(("reading_history_item_tooltip", idx)),
+            egui::Sense::hover(),
+        );
+        response.on_hover_ui_at_pointer(|ui| {
+            for line in lines {
+                ui.label(line);
+            }
+        });
+    }
+
     fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
@@ -6707,7 +6786,12 @@ impl App {
             }
             let sorted = !book_sort_locked
                 && sort_key.is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
-            let mut base_title = col.title().to_string();
+            let mut base_title =
+                if self.items_are_reading_history_view && col == DetailsColumn::State {
+                    "既読".to_string()
+                } else {
+                    col.title().to_string()
+                };
             if matches!(
                 col,
                 DetailsColumn::Created
@@ -7111,10 +7195,16 @@ impl App {
                 ),
             }
         }
+        self.draw_reading_history_tooltip(ui, rect, idx);
         hovered_preview_rect
     }
 
     fn details_state_text(&mut self, idx: usize) -> String {
+        if self.items_are_reading_history_view {
+            return self
+                .reading_history_details_state_text(idx)
+                .unwrap_or_default();
+        }
         let mut flags = Vec::new();
         let badges = self.grid_edit_badges(idx);
         if badges.page_override {
@@ -7424,6 +7514,8 @@ impl App {
                                     }
                                 }
 
+                                self.draw_reading_history_tooltip(ui, cell_rect, idx);
+
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
                                 if self.selected == Some(idx) {
                                     self.selected_cell_rect = Some(cell_rect);
@@ -7513,6 +7605,9 @@ impl App {
             if !name.is_empty() {
                 lines.push(name);
             }
+        }
+        if let Some(history_lines) = self.reading_history_tooltip_lines(idx) {
+            lines.push(history_lines.join("   "));
         }
 
         let mut fields = Vec::new();
