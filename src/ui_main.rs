@@ -6482,7 +6482,11 @@ impl App {
         }
 
         let full_rect = ui.max_rect();
-        self.draw_mouse_ring_flick_overlay(ui, full_rect);
+        self.draw_mouse_ring_flick_overlay(
+            ui,
+            full_rect,
+            crate::ring_shortcut::RingShortcutContext::Grid,
+        );
         self.draw_gamepad_ring_overlay(ui, full_rect);
         self.draw_gamepad_picker_overlay(ui, full_rect);
         self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
@@ -7315,7 +7319,11 @@ impl App {
                         self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
-                    self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                    self.draw_mouse_ring_flick_overlay(
+                        ui,
+                        full_rect,
+                        crate::ring_shortcut::RingShortcutContext::Grid,
+                    );
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
@@ -7341,7 +7349,11 @@ impl App {
                         self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
-                    self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                    self.draw_mouse_ring_flick_overlay(
+                        ui,
+                        full_rect,
+                        crate::ring_shortcut::RingShortcutContext::Grid,
+                    );
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
@@ -7589,7 +7601,11 @@ impl App {
                 // show_feedback_toast でセットされたテキストをグリッド画面でも描画する。
                 // フルスクリーン側は render_fullscreen_viewport が別途呼ぶ。
                 let full_rect = ui.max_rect();
-                self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                self.draw_mouse_ring_flick_overlay(
+                    ui,
+                    full_rect,
+                    crate::ring_shortcut::RingShortcutContext::Grid,
+                );
                 self.draw_gamepad_ring_overlay(ui, full_rect);
                 self.draw_gamepad_picker_overlay(ui, full_rect);
                 self.draw_gamepad_favorite_picker_overlay(ui, full_rect);

@@ -242,13 +242,26 @@ impl App {
         });
     }
 
-    pub(crate) fn draw_mouse_ring_flick_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
+    /// `surface_context` identifies which window is drawing: `Grid` for the main
+    /// window's grid, or the active fullscreen context for the viewer window. With a
+    /// detached viewer open, the main window and the viewer are two separate, live
+    /// windows that share the single `mouse_ring_flick` state; only the window the
+    /// ring belongs to should render it, otherwise the ring appears in both windows.
+    pub(crate) fn draw_mouse_ring_flick_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        surface_context: RingShortcutContext,
+    ) {
         if !self.settings.ring_shortcuts.mouse_flick_enabled || self.ring_picker.is_some() {
             return;
         }
         let Some(flick) = self.mouse_ring_flick.as_ref() else {
             return;
         };
+        if flick.context != surface_context {
+            return;
+        }
         if !flick.guide_visible() {
             return;
         }
@@ -297,6 +310,18 @@ impl App {
             return MouseFlickOutcome::None;
         };
         if existing.context != context {
+            // This entry point is the grid's per-frame ring updater (always called with
+            // `RingShortcutContext::Grid`). While a fullscreen viewer lives in a separate
+            // viewport (normal F11 or the detached window), the main window keeps rendering
+            // the grid behind it, so this runs every frame even though the grid is not the
+            // active surface. Do NOT cancel a flick that belongs to the currently-active
+            // ring context — doing so destroyed the fullscreen flick one frame after it was
+            // created, so the overlay only flashed for a single frame and never reached
+            // `guide_visible()`. Only drop a genuinely stale flick whose context is no
+            // longer the active one.
+            if existing.context == self.current_ring_shortcut_context() {
+                return MouseFlickOutcome::None;
+            }
             self.cancel_mouse_ring_flick();
             self.clear_native_video_ring_guide_overlay(ctx);
             return MouseFlickOutcome::None;
@@ -356,6 +381,13 @@ impl App {
             let Some(flick) = self.mouse_ring_flick.as_mut() else {
                 return MouseFlickOutcome::None;
             };
+            // The flick belongs to another surface (e.g. the detached viewer's per-frame
+            // update runs with `secondary_down=false` while the user is right-dragging the
+            // main window's grid). Leave it alone — otherwise the `!secondary_down` branch
+            // below would cancel the other window's live flick.
+            if flick.context != context {
+                return MouseFlickOutcome::None;
+            }
             flick.current_pos = pointer_pos;
             if flick.moved() >= MOUSE_FLICK_MOVE_THRESHOLD_PX {
                 flick.armed = true;

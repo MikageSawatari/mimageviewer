@@ -4550,7 +4550,8 @@ impl App {
                         {
                             self.sync_native_video_ring_guide_overlay(ctx);
                         }
-                        self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                        let ring_surface_context = self.current_ring_shortcut_context();
+                        self.draw_mouse_ring_flick_overlay(ui, full_rect, ring_surface_context);
                         self.draw_gamepad_ring_overlay(ui, full_rect);
                         self.draw_gamepad_picker_overlay(ui, full_rect);
                         self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
@@ -7410,7 +7411,15 @@ impl App {
         // 用途 (popup 側の外クリック判定) に専念させ、フルスクリーン終了 / コンテキスト
         // メニューを誤発火させない。handle_fs_wheel_and_click は hover bar 描画より前に
         // 走るため、ここで読む popup 状態はまだ閉じられていない。
-        if !self.analysis_mode
+        // Native video owns all of its own right-click handling (ring start/update/cancel,
+        // close, long-press menu) through the presenter window — see
+        // `handle_native_video_mouse_button`. The egui viewport behind the presenter never
+        // receives the video's mouse events, so running this block for video would report
+        // `secondary_down == false` every frame and cancel the presenter-created flick. In
+        // the non-detached path `render_fullscreen_viewport` early-returns before reaching
+        // here; in the detached path the egui body runs, so we must skip video explicitly.
+        if !state.is_video
+            && !self.analysis_mode
             && !self.is_overlay_edit_mode_active()
             && self.fs_context_menu_idx.is_none()
             && !self.spread_popup_open
