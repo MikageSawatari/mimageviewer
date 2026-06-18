@@ -68,6 +68,7 @@ enum PinButtonClick {
 pub(crate) enum AddressBarNav {
     Direct(PathBuf),
     DriveList(Option<PathBuf>),
+    ReadingHistory,
     HistoryBack,
     HistoryForward,
 }
@@ -709,7 +710,7 @@ impl DetailsColumn {
             Self::Kind => 96.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
-            Self::State => 176.0,
+            Self::State => 92.0,
             Self::ImageDimensions => 108.0,
             Self::VideoDuration => 94.0,
             Self::VideoDimensions => 112.0,
@@ -1553,6 +1554,10 @@ impl App {
                         self.show_open_folder_dialog = true;
                         ui.close();
                     }
+                    if ui.button("読書履歴を開く").clicked() {
+                        self.enter_reading_history();
+                        ui.close();
+                    }
                     if ui.button("現在地フィルタ (Ctrl+F)").clicked() {
                         // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
                         self.open_local_metadata_search();
@@ -1656,10 +1661,6 @@ impl App {
                     }
                     if ui.button("本棚フォルダを開く").clicked() {
                         self.open_books_root();
-                        ui.close();
-                    }
-                    if ui.button("読書履歴").clicked() {
-                        self.enter_reading_history();
                         ui.close();
                     }
                     if ui.button("追加先の本を開く").clicked() {
@@ -4994,7 +4995,9 @@ impl App {
                                         "ドライブ一覧へ [BS]".to_string()
                                     }
                                     Some(
-                                        AddressBarNav::HistoryBack | AddressBarNav::HistoryForward,
+                                        AddressBarNav::HistoryBack
+                                        | AddressBarNav::HistoryForward
+                                        | AddressBarNav::ReadingHistory,
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
                                 }
@@ -5072,6 +5075,10 @@ impl App {
                             ui.set_min_width(220.0);
                             if ui.button("ドライブ一覧").clicked() {
                                 result = Some(AddressBarNav::DriveList(None));
+                                ui.close();
+                            }
+                            if ui.button("読書履歴").clicked() {
+                                result = Some(AddressBarNav::ReadingHistory);
                                 ui.close();
                             }
                             ui.separator();
@@ -6642,18 +6649,16 @@ impl App {
         self.reading_history_rows.get(&key)
     }
 
-    pub(crate) fn reading_history_details_state_text(&self, idx: usize) -> Option<String> {
+    /// 詳細表示「最終閲覧」列 (= 読書履歴ビューでは更新日時列を転用) の文字列。
+    pub(crate) fn reading_history_last_read_for_idx(&self, idx: usize) -> Option<String> {
         let entry = self.reading_history_entry_for_idx(idx)?;
-        let mut parts = Vec::new();
-        if let Some(last_read) =
-            reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
-        {
-            parts.push(last_read);
-        }
-        if let Some(progress) = reading_history_progress_text(entry) {
-            parts.push(progress);
-        }
-        (!parts.is_empty()).then(|| parts.join("  "))
+        reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
+    }
+
+    /// 詳細表示「既読位置」列 (= 読書履歴ビューでは状態列を転用) の文字列。
+    pub(crate) fn reading_history_progress_for_idx(&self, idx: usize) -> Option<String> {
+        let entry = self.reading_history_entry_for_idx(idx)?;
+        reading_history_progress_text(entry)
     }
 
     pub(crate) fn reading_history_tooltip_lines(&self, idx: usize) -> Option<Vec<String>> {
@@ -6671,9 +6676,15 @@ impl App {
     }
 
     fn draw_reading_history_tooltip(&self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize) {
-        let Some(lines) = self.reading_history_tooltip_lines(idx) else {
+        let Some(entry) = self.reading_history_entry_for_idx(idx) else {
             return;
         };
+        // 読書履歴は複数フォルダ / ドライブの本が混在するため、場所 (フルパス) を
+        // 先頭に出して同名の本を判別できるようにする。
+        let mut lines = vec![format!("場所 {}", entry.path.display())];
+        if let Some(extra) = self.reading_history_tooltip_lines(idx) {
+            lines.extend(extra);
+        }
         let response = ui.interact(
             rect,
             ui.id().with(("reading_history_item_tooltip", idx)),
@@ -6786,12 +6797,15 @@ impl App {
             }
             let sorted = !book_sort_locked
                 && sort_key.is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
-            let mut base_title =
-                if self.items_are_reading_history_view && col == DetailsColumn::State {
-                    "既読".to_string()
-                } else {
-                    col.title().to_string()
-                };
+            let mut base_title = if self.items_are_reading_history_view {
+                match col {
+                    DetailsColumn::Modified => "最終閲覧".to_string(),
+                    DetailsColumn::State => "既読位置".to_string(),
+                    _ => col.title().to_string(),
+                }
+            } else {
+                col.title().to_string()
+            };
             if matches!(
                 col,
                 DetailsColumn::Created
@@ -7075,6 +7089,13 @@ impl App {
                 )
             })
             .unwrap_or_else(|| (String::new(), String::new()));
+        // 読書履歴ビューでは「更新日時」列を最終閲覧、「状態」列を既読位置に転用する。
+        let modified_text = if self.items_are_reading_history_view {
+            self.reading_history_last_read_for_idx(idx)
+                .unwrap_or_default()
+        } else {
+            modified_text
+        };
         let state_text = self.details_state_text(idx);
         let mut hovered_preview_rect = None;
 
@@ -7202,7 +7223,7 @@ impl App {
     fn details_state_text(&mut self, idx: usize) -> String {
         if self.items_are_reading_history_view {
             return self
-                .reading_history_details_state_text(idx)
+                .reading_history_progress_for_idx(idx)
                 .unwrap_or_default();
         }
         let mut flags = Vec::new();

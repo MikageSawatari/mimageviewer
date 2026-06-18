@@ -7064,6 +7064,10 @@ impl App {
                 self.enter_drive_list(origin);
                 true
             }
+            crate::ui_main::AddressBarNav::ReadingHistory => {
+                self.enter_reading_history();
+                true
+            }
             crate::ui_main::AddressBarNav::HistoryBack
             | crate::ui_main::AddressBarNav::HistoryForward => false,
         }
@@ -36388,6 +36392,10 @@ impl eframe::App for App {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
                     crate::ui_main::AddressBarNav::DriveList(origin) => {
                         self.enter_drive_list(origin);
+                        None
+                    }
+                    crate::ui_main::AddressBarNav::ReadingHistory => {
+                        self.enter_reading_history();
                         None
                     }
                     crate::ui_main::AddressBarNav::HistoryBack => {

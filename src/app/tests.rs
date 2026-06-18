@@ -3740,8 +3740,11 @@ mod phase_c_drill_nav_tests {
             },
         );
 
-        let details = app.reading_history_details_state_text(0).unwrap();
-        assert!(details.contains("12 / 120"));
+        // 詳細表示は「最終閲覧」列と「既読位置」列に分離する。
+        let progress = app.reading_history_progress_for_idx(0).unwrap();
+        assert_eq!(progress, "12 / 120");
+        let last_read = app.reading_history_last_read_for_idx(0).unwrap();
+        assert!(!last_read.is_empty());
 
         let tooltip = app.reading_history_tooltip_lines(0).unwrap().join("\n");
         assert!(tooltip.contains("最終閲覧"));
