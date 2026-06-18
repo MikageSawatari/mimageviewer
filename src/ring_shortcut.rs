@@ -123,6 +123,8 @@ pub enum RingActionId {
     TreeFolderNext,
     SiblingFolderPrev,
     SiblingFolderNext,
+    ImageHome,
+    ImageEnd,
     ImageRotateLeft,
     ImageRotateRight,
     ImageCapture,
@@ -166,6 +168,8 @@ impl RingActionId {
             Self::TreeFolderNext => "tree_folder_next",
             Self::SiblingFolderPrev => "sibling_folder_prev",
             Self::SiblingFolderNext => "sibling_folder_next",
+            Self::ImageHome => "image_home",
+            Self::ImageEnd => "image_end",
             Self::ImageRotateLeft => "image_rotate_left",
             Self::ImageRotateRight => "image_rotate_right",
             Self::ImageCapture => "image_capture",
@@ -209,6 +213,8 @@ impl RingActionId {
             "tree_folder_next" => Self::TreeFolderNext,
             "sibling_folder_prev" => Self::SiblingFolderPrev,
             "sibling_folder_next" => Self::SiblingFolderNext,
+            "image_home" => Self::ImageHome,
+            "image_end" => Self::ImageEnd,
             "image_rotate_left" => Self::ImageRotateLeft,
             "image_rotate_right" => Self::ImageRotateRight,
             "image_capture" => Self::ImageCapture,
@@ -258,6 +264,8 @@ impl RingActionId {
             Self::TreeFolderNext => "ツリー順 次フォルダ",
             Self::SiblingFolderPrev => "兄弟フォルダ 前",
             Self::SiblingFolderNext => "兄弟フォルダ 次",
+            Self::ImageHome => "先頭へ (Home)",
+            Self::ImageEnd => "末尾へ (End)",
             Self::ImageRotateLeft => "回転 L",
             Self::ImageRotateRight => "回転 R",
             Self::ImageCapture => "キャプチャ保存",
@@ -316,6 +324,8 @@ impl RingActionId {
                     | Self::TreeFolderNext
                     | Self::SiblingFolderPrev
                     | Self::SiblingFolderNext
+                    | Self::ImageHome
+                    | Self::ImageEnd
                     | Self::ImageRotateLeft
                     | Self::ImageRotateRight
                     | Self::ImageCapture
@@ -387,6 +397,8 @@ impl RingActionId {
                 Self::TreeFolderNext,
                 Self::SiblingFolderPrev,
                 Self::SiblingFolderNext,
+                Self::ImageHome,
+                Self::ImageEnd,
                 Self::ImageRotateLeft,
                 Self::ImageRotateRight,
                 Self::ImageCapture,
@@ -1303,6 +1315,26 @@ mod tests {
             RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
                 .contains(&RingActionId::ToggleWindowMode)
         );
+    }
+
+    #[test]
+    fn image_boundary_actions_are_available_only_for_image_fullscreen() {
+        for action in [RingActionId::ImageHome, RingActionId::ImageEnd] {
+            assert!(!action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+            assert!(!action.is_valid_for_context(RingShortcutContext::VideoFullscreen));
+            assert!(
+                !RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                    .contains(&action)
+            );
+            assert!(
+                !RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
+                    .contains(&action)
+            );
+        }
     }
 
     #[test]

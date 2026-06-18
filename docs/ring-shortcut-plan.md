@@ -429,6 +429,7 @@ FsCommon/FsImage/FsVideo)。native video の Ctrl 系ナビは KeyAction 経由�
 | 兄弟フォルダ 前/次 | `FsSiblingPrev` / `FsSiblingNext` (+ grid / native video は直接ハンドラ) | Grid / ImageFS / VideoFS | 輪 / 環 |
 | 親フォルダへ | Backspace 直接 | Grid | 戻 / 環 |
 | ページジャンプ 前/次 (10%) | `FsFixedJumpPrev` / `FsFixedJumpNext` | ImageFS | 輪 |
+| 同一一覧 先頭/末尾 | `RingActionId::ImageHome/End` → Home/End 相当 | ImageFS | 戻 / 環 |
 | お気に入り巡回 | Start 直接ハンドラ | Grid / ImageFS / VideoFS | 環 |
 
 **本・整理 (リング単発)**

@@ -3438,6 +3438,18 @@ impl App {
                 self.apply_sibling_folder_nav(ctx, true, source);
                 None
             }
+            RingActionId::ImageHome if context == RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.handle_fullscreen_boundary_jump(ctx, fs_idx, false, source);
+                }
+                None
+            }
+            RingActionId::ImageEnd if context == RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.handle_fullscreen_boundary_jump(ctx, fs_idx, true, source);
+                }
+                None
+            }
             RingActionId::ImageRotateLeft if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
@@ -3797,7 +3809,7 @@ impl App {
             if let Some(fs_idx) = self.fullscreen_idx
                 && !self.current_fullscreen_is_video(fs_idx)
             {
-                self.handle_gamepad_spread_nudge(ctx, fs_idx, dir);
+                self.handle_gamepad_still_y_direction(ctx, fs_idx, dir);
             } else if let Some(fs_idx) = self.fullscreen_idx {
                 self.handle_gamepad_video_y_direction(ctx, fs_idx, dir, repeat);
             } else {
@@ -3911,6 +3923,23 @@ impl App {
             PadDir::Up => -1,
         };
         self.navigate_gamepad_still(ctx, fs_idx, base_delta);
+    }
+
+    fn handle_gamepad_still_y_direction(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        dir: PadDir,
+    ) {
+        match dir {
+            PadDir::Up => {
+                self.handle_fullscreen_boundary_jump(ctx, fs_idx, false, "gamepad_y_home")
+            }
+            PadDir::Down => {
+                self.handle_fullscreen_boundary_jump(ctx, fs_idx, true, "gamepad_y_end")
+            }
+            PadDir::Left | PadDir::Right => self.handle_gamepad_spread_nudge(ctx, fs_idx, dir),
+        }
     }
 
     fn navigate_gamepad_still(&mut self, ctx: &egui::Context, fs_idx: usize, base_delta: i32) {

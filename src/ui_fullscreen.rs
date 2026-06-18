@@ -6757,36 +6757,12 @@ impl App {
         }
 
         if key_home {
-            let display_order = self.current_grid_order().to_vec();
-            if let Some(first) =
-                crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false)
-            {
-                if first != fs_idx {
-                    // Home もフォルダ内移動なのでスライドショーは止めない。
-                    action.jump_to = Some(first);
-                } else {
-                    self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
-                        at_end: false,
-                        at: std::time::Instant::now(),
-                    });
-                }
-            }
+            // Home もフォルダ内移動なのでスライドショーは止めない。
+            action.jump_to = self.fullscreen_boundary_jump_target(fs_idx, false);
         }
         if key_end {
-            let display_order = self.current_grid_order().to_vec();
-            if let Some(last) =
-                crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true)
-            {
-                if last != fs_idx {
-                    // End もフォルダ内移動なのでスライドショーは止めない。
-                    action.jump_to = Some(last);
-                } else {
-                    self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
-                        at_end: true,
-                        at: std::time::Instant::now(),
-                    });
-                }
-            }
+            // End もフォルダ内移動なのでスライドショーは止めない。
+            action.jump_to = self.fullscreen_boundary_jump_target(fs_idx, true);
         }
 
         action
@@ -7726,6 +7702,38 @@ impl App {
         // Timer-driven slideshow advances are fullscreen-internal navigation too, so
         // use the same cursor-state carry path as keyboard/mouse page turns.
         self.open_fullscreen_from_fs_navigation(ctx, idx);
+    }
+
+    pub(crate) fn fullscreen_boundary_jump_target(
+        &mut self,
+        fs_idx: usize,
+        at_end: bool,
+    ) -> Option<usize> {
+        let display_order = self.current_grid_order().to_vec();
+        let target =
+            crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, at_end)?;
+        if target != fs_idx {
+            Some(target)
+        } else {
+            self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                at_end,
+                at: std::time::Instant::now(),
+            });
+            None
+        }
+    }
+
+    pub(crate) fn handle_fullscreen_boundary_jump(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        at_end: bool,
+        source: &'static str,
+    ) {
+        if let Some(target) = self.fullscreen_boundary_jump_target(fs_idx, at_end) {
+            self.bump_input_seq(source, Some(if at_end { "end" } else { "home" }));
+            self.handle_fs_navigation(ctx, false, false, None, None, None, 0, Some(target), fs_idx);
+        }
     }
 
     pub(crate) fn handle_fullscreen_ctrl_nav_context(
