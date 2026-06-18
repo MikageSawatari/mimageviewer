@@ -439,6 +439,12 @@ pub enum NativeVideoOutputEvent {
     OpenExternalUrl {
         url: String,
     },
+    ToggleTag {
+        name: String,
+    },
+    OpenTagViewForTag {
+        name: String,
+    },
     /// 音量ノーマライズボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
     /// OnUnmeasured → スキャン起動)。詳細は `App::handle_toggle_normalize`。
     ToggleNormalize,
@@ -1497,6 +1503,8 @@ fn send_native_overlay_command(
         }
         Command::ClearAllBookmarksForCurrent => NativeVideoOutputEvent::ClearAllBookmarksForCurrent,
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
+        Command::ToggleTag { name } => NativeVideoOutputEvent::ToggleTag { name },
+        Command::OpenTagViewForTag { name } => NativeVideoOutputEvent::OpenTagViewForTag { name },
         Command::ToggleNormalize => NativeVideoOutputEvent::ToggleNormalize,
         Command::DisableNormalize => NativeVideoOutputEvent::DisableNormalize,
         Command::CancelNormalizeScan => NativeVideoOutputEvent::CancelNormalizeScan,
@@ -3170,6 +3178,24 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::OpenExternalUrl { url },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleTag {
+                                name,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleTag { name },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::OpenTagViewForTag {
+                                name,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::OpenTagViewForTag { name },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleNormalize => {

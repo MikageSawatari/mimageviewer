@@ -2,11 +2,14 @@
 //!
 //! AI 画像生成メタデータ (A1111/ComfyUI) と EXIF 撮影情報を右サイドパネルに表示する。
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 
 use crate::app::App;
 use crate::exif_reader::{self, ExifInfo};
 use crate::png_metadata::{A1111Metadata, AiMetadata, ComfyUIMetadata};
+use crate::tag_ops::TagTarget;
 use crate::xmp_reader::{self, XmpTweetInfo};
 
 /// パネル幅 (ピクセル)
@@ -17,6 +20,25 @@ const TOP_BAR_H: f32 = 44.0;
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
+
+#[derive(Clone)]
+struct TagPanelRow {
+    label: Option<String>,
+    note: Option<String>,
+    targets: Vec<TagTarget>,
+    tags_by_target: Vec<Vec<String>>,
+}
+
+impl TagPanelRow {
+    fn disabled() -> Self {
+        Self {
+            label: None,
+            note: None,
+            targets: Vec::new(),
+            tags_by_target: Vec::new(),
+        }
+    }
+}
 
 impl App {
     /// フルスクリーンでメタデータパネルをオーバーレイ描画する。
@@ -213,12 +235,7 @@ impl App {
         let sidecar_info = self.get_current_sidecar();
 
         // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
-        let taggable_path = self.current_tag_target_path();
-        let current_tags: Vec<String> = if taggable_path.is_some() {
-            self.get_current_tags_cached()
-        } else {
-            Vec::new()
-        };
+        let tag_rows = self.collect_fullscreen_tag_panel_rows();
         let defined_tags: Vec<_> = self
             .settings
             .tags
@@ -228,7 +245,7 @@ impl App {
             .collect();
 
         // タグボタンクリックを closure 内で検出し、後段で self の操作に流す。
-        let mut clicked_tag: Option<String> = None;
+        let mut clicked_tag: Option<(String, Vec<TagTarget>)> = None;
         let mut searched_tag: Option<String> = None;
 
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
@@ -251,8 +268,7 @@ impl App {
                     draw_tag_panel(
                         ui,
                         &defined_tags,
-                        &current_tags,
-                        taggable_path.is_some(),
+                        &tag_rows,
                         &mut clicked_tag,
                         &mut searched_tag,
                     );
@@ -332,8 +348,8 @@ impl App {
             });
 
         // タグボタンクリックの後処理 (closure 外で self を可変借用する)
-        if let Some(tag_name) = clicked_tag {
-            self.request_tag_toggle_for_selection(&tag_name);
+        if let Some((tag_name, targets)) = clicked_tag {
+            self.request_tag_toggle_for_targets(&tag_name, targets);
         }
         if let Some(tag_name) = searched_tag {
             self.open_tag_view_for_tag(&tag_name);
@@ -371,43 +387,131 @@ impl App {
         self.sidecar_display_cache.get(&key).cloned().flatten()
     }
 
-    /// 現在のフルスクリーン項目に対応する mIV タグ一覧を取得する。
-    /// ZipImage / PdfPage はコンテナ本体のタグへフォールバックする。
-    pub(crate) fn get_current_tags_cached(&mut self) -> Vec<String> {
-        let Some(path) = self.current_tag_target_path() else {
-            return Vec::new();
+    fn collect_fullscreen_tag_panel_rows(&mut self) -> Vec<TagPanelRow> {
+        let Some(idx) = self.fullscreen_idx else {
+            return vec![TagPanelRow::disabled()];
         };
-        let key = crate::tags_db::item_key_for_path(&path);
-        if let Some(cached) = self.tags_cache.get(&key) {
-            return cached.clone();
+
+        if let crate::ui_fullscreen::SpreadPair::Double { left, right } =
+            self.resolve_visible_spread_pair(idx)
+        {
+            if let Some(row) = self.container_spread_tag_panel_row(left, right) {
+                return vec![row];
+            }
+            if let Some(rows) = self.normal_image_tag_panel_rows(&[left, right]) {
+                return rows;
+            }
         }
-        let tags = self
-            .tags_db
-            .as_ref()
-            .map(|db| db.display_tags_for_item(&key))
-            .unwrap_or_default();
-        self.tags_cache.insert(key, tags.clone());
-        tags
+
+        if let Some(rows) = self.normal_image_tag_panel_rows(&[idx]) {
+            return rows;
+        }
+
+        self.single_tag_panel_row(idx)
+            .map(|row| vec![row])
+            .unwrap_or_else(|| vec![TagPanelRow::disabled()])
     }
 
-    /// 現在のフルスクリーン項目のタグ対象パスを返す。
-    /// 変換アーカイブ閲覧中はコンテナを元アーカイブパスへ remap する
-    /// (`App::remap_tag_target_path`、tag_ops.rs と同一規則)。
-    fn current_tag_target_path(&self) -> Option<std::path::PathBuf> {
+    fn single_tag_panel_row(&mut self, idx: usize) -> Option<TagPanelRow> {
+        let target = self.tag_target_for_index(idx, true)?;
+        let note = self.tag_target_note_for_item(idx, &target.path);
+        Some(self.build_tag_panel_row(None, note, vec![target]))
+    }
+
+    fn container_spread_tag_panel_row(&mut self, left: usize, right: usize) -> Option<TagPanelRow> {
+        let left_target = self.tag_target_for_index(left, true)?;
+        let right_target = self.tag_target_for_index(right, true)?;
+        if !crate::folder_tree::path_eq(&left_target.path, &right_target.path) {
+            return None;
+        }
+        let note = self.tag_target_note_for_item(left, &left_target.path);
+        Some(self.build_tag_panel_row(None, note, vec![left_target]))
+    }
+
+    fn normal_image_tag_panel_rows(&mut self, indices: &[usize]) -> Option<Vec<TagPanelRow>> {
+        if indices.is_empty() {
+            return None;
+        }
+        let mut image_paths = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            match self.items.get(idx) {
+                Some(crate::grid_item::GridItem::Image(path)) => image_paths.push(path.clone()),
+                _ => return None,
+            }
+        }
+
+        let shared_parent = shared_parent_folder(&image_paths)?;
+        let folder_path = self
+            .current_folder
+            .clone()
+            .filter(|path| crate::folder_tree::path_eq(path, &shared_parent))?;
+        let folder_name = tag_path_display_name(&folder_path);
+        let folder_target = self.tag_target_for_path(folder_path, false);
+        let mut rows = vec![self.build_tag_panel_row(
+            Some("フォルダ".to_string()),
+            Some(format!("タグ対象: {folder_name}")),
+            vec![folder_target],
+        )];
+
+        let mut page_targets = Vec::new();
+        for &idx in indices {
+            if let Some(target) = self.tag_target_for_index(idx, true) {
+                page_targets.push(target);
+            }
+        }
+        if !page_targets.is_empty() {
+            let page_note = if page_targets.len() >= 2 {
+                "タグ対象: 表示中の2ページ"
+            } else {
+                "タグ対象: 現在のページ"
+            };
+            rows.push(self.build_tag_panel_row(
+                Some("ページ".to_string()),
+                Some(page_note.to_string()),
+                page_targets,
+            ));
+        }
+        Some(rows)
+    }
+
+    fn build_tag_panel_row(
+        &mut self,
+        label: Option<String>,
+        note: Option<String>,
+        mut targets: Vec<TagTarget>,
+    ) -> TagPanelRow {
+        dedup_tag_targets(&mut targets);
+        let paths: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
+        self.hydrate_tags_cache_for_paths(&paths);
+        let tags_by_target = paths
+            .iter()
+            .map(|path| {
+                let key = crate::tags_db::item_key_for_path(path);
+                self.tags_cache.get(&key).cloned().unwrap_or_default()
+            })
+            .collect();
+        TagPanelRow {
+            label,
+            note,
+            targets,
+            tags_by_target,
+        }
+    }
+
+    fn tag_target_note_for_item(&self, idx: usize, target_path: &Path) -> Option<String> {
         use crate::grid_item::GridItem;
-        let idx = self.fullscreen_idx?;
-        let path = match self.items.get(idx)? {
-            GridItem::Folder(p)
-            | GridItem::Image(p)
-            | GridItem::Video(p)
-            | GridItem::ZipFile(p)
-            | GridItem::PdfFile(p)
-            | GridItem::ConvertibleArchive { path: p, .. } => p.clone(),
-            GridItem::ZipImage { zip_path, .. } => zip_path.clone(),
-            GridItem::PdfPage { pdf_path, .. } => pdf_path.clone(),
+
+        let target_kind = match self.items.get(idx)? {
+            GridItem::ZipImage { .. }
+            | GridItem::ZipFile(_)
+            | GridItem::ConvertibleArchive { .. } => "この本",
+            GridItem::PdfPage { .. } | GridItem::PdfFile(_) => "このPDF",
             _ => return None,
         };
-        Some(self.remap_tag_target_path(path))
+        Some(format!(
+            "タグ対象: {target_kind} ({})",
+            tag_path_display_name(target_path)
+        ))
     }
 }
 
@@ -422,10 +526,18 @@ const JSON_COLOR: egui::Color32 = egui::Color32::from_rgb(190, 200, 210);
 const SECTION_FONT: f32 = 14.0;
 const BODY_FONT: f32 = 13.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagButtonState {
+    Off,
+    Mixed,
+    On,
+}
+
 /// タグパネル描画 (docs/tag-feature.md §4.4)。
 ///
 /// 登録タグを ON/OFF ボタンで横並び表示。各ボタンの外観:
 /// - ON (現在のファイルに付与済み): 緑背景 + 強調
+/// - Mixed (見開きの一部ページだけ付与済み): アンバー背景
 /// - OFF: 通常
 /// - 対応形式外: グレーアウト (クリック不可)
 ///
@@ -433,11 +545,11 @@ const BODY_FONT: f32 = 13.0;
 fn draw_tag_panel(
     ui: &mut egui::Ui,
     defined_tags: &[crate::settings::TagDef],
-    current_tags: &[String],
-    is_taggable: bool,
-    clicked_tag: &mut Option<String>,
+    rows: &[TagPanelRow],
+    clicked_tag: &mut Option<(String, Vec<TagTarget>)>,
     searched_tag: &mut Option<String>,
 ) {
+    let any_taggable = rows.iter().any(|row| !row.targets.is_empty());
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("タグ")
@@ -445,58 +557,144 @@ fn draw_tag_panel(
                 .size(14.0)
                 .strong(),
         );
-        if !is_taggable {
+        if !any_taggable {
             ui.label(egui::RichText::new("(対象外)").size(10.0).color(DIM_COLOR))
                 .on_hover_text("この項目にはタグを付けられません。");
         }
     });
     ui.add_space(4.0);
 
-    // ボタンを折り返し配置。付与中は `#タグ名` を緑色で、未付与は通常色で表示する
-    // (丸ドット等の装飾は付けない: ラベルの色とボタン背景で状態を伝える)。
-    ui.horizontal_wrapped(|ui| {
-        for def in defined_tags {
-            let with_hash = format!("#{}", def.name);
-            let is_on = current_tags
-                .iter()
-                .any(|t| crate::tags_db::normalize_tag_key(t) == def.tag_key);
-            let label = egui::RichText::new(&with_hash).color(if is_on {
-                egui::Color32::from_rgb(180, 255, 180)
-            } else {
-                TEXT_COLOR
-            });
-            let btn = egui::Button::new(label)
-                .fill(if is_on {
-                    egui::Color32::from_rgba_unmultiplied(60, 120, 70, 200)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(50, 50, 60, 180)
-                })
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    if is_on {
-                        egui::Color32::from_rgb(120, 200, 120)
-                    } else {
-                        egui::Color32::from_gray(80)
-                    },
-                ));
-            let resp = ui.add_enabled(is_taggable, btn);
-            let resp = resp.on_hover_text(if is_on {
-                format!("クリックで `{with_hash}` を削除")
-            } else {
-                format!("クリックで `{with_hash}` を付与")
-            });
-            let clicked = resp.clicked();
-            resp.context_menu(|ui| {
-                if ui.button("このタグで探す").clicked() {
-                    *searched_tag = Some(def.name.clone());
-                    ui.close();
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row_idx > 0 {
+            ui.add_space(7.0);
+        }
+        if row.label.is_some() || row.note.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(label) = row.label.as_deref() {
+                    ui.label(
+                        egui::RichText::new(label)
+                            .color(LABEL_COLOR)
+                            .size(12.0)
+                            .strong(),
+                    );
+                }
+                if let Some(note) = row.note.as_deref() {
+                    ui.label(egui::RichText::new(note).size(11.0).color(DIM_COLOR));
                 }
             });
-            if clicked {
-                *clicked_tag = Some(def.name.clone());
+            ui.add_space(3.0);
+        }
+
+        // ボタンを折り返し配置。付与中は `#タグ名` を緑色で、未付与は通常色で表示する
+        // (丸ドット等の装飾は付けない: ラベルの色とボタン背景で状態を伝える)。
+        ui.horizontal_wrapped(|ui| {
+            for def in defined_tags {
+                let with_hash = format!("#{}", def.name);
+                let state = tag_button_state(row, &def.tag_key);
+                let label = egui::RichText::new(&with_hash).color(match state {
+                    TagButtonState::On => egui::Color32::from_rgb(180, 255, 180),
+                    TagButtonState::Mixed => egui::Color32::from_rgb(255, 220, 145),
+                    TagButtonState::Off => TEXT_COLOR,
+                });
+                let btn = egui::Button::new(label)
+                    .fill(match state {
+                        TagButtonState::On => {
+                            egui::Color32::from_rgba_unmultiplied(60, 120, 70, 200)
+                        }
+                        TagButtonState::Mixed => {
+                            egui::Color32::from_rgba_unmultiplied(110, 85, 35, 210)
+                        }
+                        TagButtonState::Off => {
+                            egui::Color32::from_rgba_unmultiplied(50, 50, 60, 180)
+                        }
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        match state {
+                            TagButtonState::On => egui::Color32::from_rgb(120, 200, 120),
+                            TagButtonState::Mixed => egui::Color32::from_rgb(210, 160, 80),
+                            TagButtonState::Off => egui::Color32::from_gray(80),
+                        },
+                    ));
+                let is_taggable = !row.targets.is_empty();
+                let resp = ui.add_enabled(is_taggable, btn);
+                let resp = resp.on_hover_text(match state {
+                    TagButtonState::On => format!("クリックで `{with_hash}` を削除"),
+                    TagButtonState::Mixed => {
+                        format!("一部の対象に付与済み。クリックで `{with_hash}` を全対象に付与")
+                    }
+                    TagButtonState::Off => format!("クリックで `{with_hash}` を付与"),
+                });
+                let clicked = resp.clicked();
+                resp.context_menu(|ui| {
+                    if ui.button("このタグで探す").clicked() {
+                        *searched_tag = Some(def.name.clone());
+                        ui.close();
+                    }
+                });
+                if clicked {
+                    *clicked_tag = Some((def.name.clone(), row.targets.clone()));
+                }
             }
+        });
+    }
+}
+
+fn tag_button_state(row: &TagPanelRow, tag_key: &str) -> TagButtonState {
+    let target_count = row.tags_by_target.len();
+    if target_count == 0 {
+        return TagButtonState::Off;
+    }
+    let tagged_count = row
+        .tags_by_target
+        .iter()
+        .filter(|tags| {
+            tags.iter()
+                .any(|tag| crate::tags_db::normalize_tag_key(tag) == tag_key)
+        })
+        .count();
+    if tagged_count == 0 {
+        TagButtonState::Off
+    } else if tagged_count == target_count {
+        TagButtonState::On
+    } else {
+        TagButtonState::Mixed
+    }
+}
+
+fn dedup_tag_targets(targets: &mut Vec<TagTarget>) {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    targets.retain(|target| {
+        if seen
+            .iter()
+            .any(|path| crate::folder_tree::path_eq(path, &target.path))
+        {
+            false
+        } else {
+            seen.push(target.path.clone());
+            true
         }
     });
+}
+
+fn shared_parent_folder(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first_parent = paths.first()?.parent()?;
+    if paths.iter().all(|path| {
+        path.parent()
+            .is_some_and(|p| crate::folder_tree::path_eq(p, first_parent))
+    }) {
+        Some(first_parent.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn tag_path_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn draw_a1111_panel(ui: &mut egui::Ui, ctx: &egui::Context, meta: &A1111Metadata) {

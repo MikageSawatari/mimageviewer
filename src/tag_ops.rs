@@ -14,9 +14,9 @@ use crate::tag_write_worker::{
 };
 
 #[derive(Clone)]
-struct TagTarget {
-    path: PathBuf,
-    tag_sidecar: Option<TagSidecarTarget>,
+pub(crate) struct TagTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) tag_sidecar: Option<TagSidecarTarget>,
 }
 
 fn tag_target_for_item(item: &GridItem, fullscreen: bool) -> Option<TagTarget> {
@@ -111,6 +111,25 @@ impl App {
         self.selected.map(|idx| vec![idx]).unwrap_or_default()
     }
 
+    pub(crate) fn tag_target_for_index(&self, idx: usize, fullscreen: bool) -> Option<TagTarget> {
+        let item = self.items.get(idx)?;
+        tag_target_for_item(item, fullscreen).map(|mut target| {
+            if self.idx_is_compiled_book_page(idx) {
+                target.tag_sidecar = None;
+            }
+            self.remap_tag_target(target)
+        })
+    }
+
+    pub(crate) fn tag_target_for_path(&self, path: PathBuf, write_sidecar: bool) -> TagTarget {
+        self.remap_tag_target(TagTarget {
+            tag_sidecar: write_sidecar
+                .then(|| crate::tag_write_worker::sidecar_target_for_real_file(&path))
+                .flatten(),
+            path,
+        })
+    }
+
     /// タグ書き込みの対象ファイル列 (`selection_target_indices` の解決結果のうち、
     /// 実パスを持つタグ対応 item のみ)。ZIP/PDF ページのフルスクリーン中は
     /// コンテナ自身へフォールバックする (変換アーカイブは元パスへ remap)。
@@ -118,15 +137,7 @@ impl App {
         let fullscreen = self.fullscreen_idx.is_some();
         self.selection_target_indices()
             .into_iter()
-            .filter_map(|idx| {
-                let item = self.items.get(idx)?;
-                tag_target_for_item(item, fullscreen).map(|mut target| {
-                    if self.idx_is_compiled_book_page(idx) {
-                        target.tag_sidecar = None;
-                    }
-                    self.remap_tag_target(target)
-                })
-            })
+            .filter_map(|idx| self.tag_target_for_index(idx, fullscreen))
             .collect()
     }
 
@@ -198,12 +209,26 @@ impl App {
     }
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
-        let name_owned = name.to_string();
         let mode = if self.fullscreen_idx.is_some() {
             "fullscreen"
         } else {
             "grid"
         };
+        let targets = self.tag_targets();
+        self.request_tag_toggle_for_targets_impl(name, targets, mode);
+    }
+
+    pub(crate) fn request_tag_toggle_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
+        self.request_tag_toggle_for_targets_impl(name, targets, "explicit");
+    }
+
+    fn request_tag_toggle_for_targets_impl(
+        &mut self,
+        name: &str,
+        targets: Vec<TagTarget>,
+        mode: &str,
+    ) {
+        let name_owned = name.to_string();
         crate::logger::log(format!(
             "[TAG] toggle requested: tag=#{name} mode={mode} \
              selected={:?} fullscreen_idx={:?} checked_count={}",
@@ -211,7 +236,6 @@ impl App {
             self.fullscreen_idx,
             self.checked.len(),
         ));
-        let targets = self.tag_targets();
         if targets.is_empty() {
             return;
         }

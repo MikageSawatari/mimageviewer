@@ -666,12 +666,21 @@ pub struct NativeOverlayTimelineMarker {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct NativeOverlayTagDef {
+    pub name: String,
+    pub tag_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct NativeOverlayMetadata {
     pub file_name: String,
     pub title: Option<String>,
     pub artist: Option<String>,
     pub original_url: Option<String>,
     pub description: Option<String>,
+    pub probe_info_available: bool,
+    pub current_tags: Vec<String>,
+    pub shortcut_tags: Vec<NativeOverlayTagDef>,
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
@@ -1176,6 +1185,12 @@ pub enum NativeOverlayCommand {
     ClearAllBookmarksForCurrent,
     OpenExternalUrl {
         url: String,
+    },
+    ToggleTag {
+        name: String,
+    },
+    OpenTagViewForTag {
+        name: String,
     },
     /// 音量ノーマライズボタンの左クリック (3 状態モデルでトグル動作)。
     ToggleNormalize,
@@ -5268,7 +5283,10 @@ impl NativeEguiOverlay {
         if self.vst3_panel_visible() {
             return false;
         }
-        if self.video_metadata.is_none() {
+        let Some(metadata) = self.video_metadata.as_ref() else {
+            return false;
+        };
+        if !metadata.probe_info_available && metadata.shortcut_tags.is_empty() {
             return false;
         }
         if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {

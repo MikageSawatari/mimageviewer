@@ -2151,6 +2151,15 @@ impl App {
             crate::video::NativeVideoOutputEvent::OpenExternalUrl { url } => {
                 self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
             }
+            crate::video::NativeVideoOutputEvent::ToggleTag { name } => {
+                self.request_tag_toggle_for_selection(&name);
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::OpenTagViewForTag { name } => {
+                self.open_tag_view_for_tag(&name);
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::ToggleNormalize => {
                 self.handle_toggle_normalize(ctx, fs_idx);
             }
@@ -3665,17 +3674,39 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn sync_native_video_metadata(&self, fs_idx: usize) {
+    pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
+        let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => Some(player.path().clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.hydrate_tags_cache_for_paths(std::slice::from_ref(&path));
+        let current_tags = self
+            .tags_cache
+            .get(&crate::tags_db::item_key_for_path(&path))
+            .cloned()
+            .unwrap_or_default();
+        let shortcut_tags: Vec<_> = self
+            .settings
+            .tags
+            .iter()
+            .filter(|tag| tag.show_shortcut)
+            .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
+                name: tag.name.clone(),
+                tag_key: tag.tag_key.clone(),
+            })
+            .collect();
+
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        let metadata = player.info().map(|info| {
-            let file_name = player
-                .path()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("video")
-                .to_string();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("video")
+            .to_string();
+        let metadata = if let Some(info) = player.info() {
             // 動的状態を Acquire load して snapshot 化 (= overlay は毎フレーム rebuild
             // されるので、ここで読んだ値が右パネルに反映される)。
             use std::sync::atomic::Ordering;
@@ -3692,6 +3723,9 @@ impl App {
                 artist: info.artist.clone(),
                 original_url: info.original_url.clone(),
                 description: info.description.clone(),
+                probe_info_available: true,
+                current_tags,
+                shortcut_tags,
                 width: info.width,
                 height: info.height,
                 duration_secs: info.duration_secs,
@@ -3710,8 +3744,36 @@ impl App {
                 deinterlace_status,
                 interlace_detected,
             }
-        });
-        player.set_native_metadata(metadata);
+        } else {
+            crate::video::native_presenter::NativeOverlayMetadata {
+                file_name,
+                title: None,
+                artist: None,
+                original_url: None,
+                description: None,
+                probe_info_available: false,
+                current_tags,
+                shortcut_tags,
+                width: 0,
+                height: 0,
+                duration_secs: 0.0,
+                video_codec: String::new(),
+                video_decoder: String::new(),
+                audio_codec: None,
+                audio_bit_rate_bps: 0,
+                avg_fps: 0.0,
+                bit_rate_bps: 0,
+                chapter_count: 0,
+                hw_decode_active: false,
+                gpu_path_active: false,
+                d3d11va_supported: false,
+                deinterlace_mode: self.settings.video_deinterlace,
+                last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
+                deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
+                interlace_detected: false,
+            }
+        };
+        player.set_native_metadata(Some(metadata));
     }
 
     #[cfg(windows)]

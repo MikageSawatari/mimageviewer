@@ -5319,6 +5319,48 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.tag_target_paths(), vec![cache_zip]);
     }
 
+    #[test]
+    fn fullscreen_spread_zip_pages_share_container_tag_target() {
+        let mut app = setup_app();
+        let zip = PathBuf::from(r"D:\comics\book.zip");
+        app.current_folder = Some(zip.clone());
+        app.items.push(GridItem::ZipImage {
+            zip_path: zip.clone(),
+            entry_name: "p001.jpg".into(),
+        });
+        app.items.push(GridItem::ZipImage {
+            zip_path: zip.clone(),
+            entry_name: "p002.jpg".into(),
+        });
+
+        let left = app.tag_target_for_index(0, true).unwrap();
+        let right = app.tag_target_for_index(1, true).unwrap();
+
+        assert_eq!(left.path, zip);
+        assert_eq!(left.path, right.path);
+        assert!(left.tag_sidecar.is_some());
+    }
+
+    #[test]
+    fn normal_image_spread_tag_targets_remain_each_file_and_folder_has_no_sidecar() {
+        let mut app = setup_app();
+        let folder = PathBuf::from(r"D:\pics");
+        app.current_folder = Some(folder.clone());
+        let left_idx = push_image(&mut app, r"D:\pics\a.jpg");
+        let right_idx = push_image(&mut app, r"D:\pics\b.jpg");
+
+        let folder_target = app.tag_target_for_path(folder.clone(), false);
+        let left = app.tag_target_for_index(left_idx, true).unwrap();
+        let right = app.tag_target_for_index(right_idx, true).unwrap();
+
+        assert_eq!(folder_target.path, folder);
+        assert!(folder_target.tag_sidecar.is_none());
+        assert_eq!(left.path, PathBuf::from(r"D:\pics\a.jpg"));
+        assert_eq!(right.path, PathBuf::from(r"D:\pics\b.jpg"));
+        assert!(left.tag_sidecar.is_some());
+        assert!(right.tag_sidecar.is_some());
+    }
+
     /// Codex P2 #1 回帰: グリッド Q / Ctrl+Backspace の一括解除
     /// (`clear_page_params_for_selection`) が capture_adjust_full でラップされ、
     /// N 枚の個別設定が 1 回の Ctrl+Z で全て復元される。

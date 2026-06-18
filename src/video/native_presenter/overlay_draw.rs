@@ -2997,6 +2997,76 @@ pub(super) fn native_vst3_chain_slot_tooltip(slot: &NativeOverlayVst3ChainSlot) 
     }
 }
 
+fn draw_native_tag_panel(
+    ui: &mut egui::Ui,
+    metadata: &NativeOverlayMetadata,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    if metadata.shortcut_tags.is_empty() {
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            egui::RichText::new("タグ")
+                .color(egui::Color32::WHITE)
+                .size(13.0)
+                .strong(),
+        );
+    });
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(14.0);
+        for def in &metadata.shortcut_tags {
+            let with_hash = format!("#{}", def.name);
+            let is_on = metadata
+                .current_tags
+                .iter()
+                .any(|tag| crate::tags_db::normalize_tag_key(tag) == def.tag_key);
+            let label = egui::RichText::new(&with_hash).color(if is_on {
+                egui::Color32::from_rgb(180, 255, 180)
+            } else {
+                egui::Color32::from_rgb(230, 230, 230)
+            });
+            let button = egui::Button::new(label)
+                .fill(if is_on {
+                    egui::Color32::from_rgba_unmultiplied(60, 120, 70, 210)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(50, 50, 60, 190)
+                })
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    if is_on {
+                        egui::Color32::from_rgb(120, 200, 120)
+                    } else {
+                        egui::Color32::from_gray(80)
+                    },
+                ));
+            let resp = ui.add(button);
+            let resp = resp.on_hover_text(if is_on {
+                format!("クリックで `{with_hash}` を削除")
+            } else {
+                format!("クリックで `{with_hash}` を付与")
+            });
+            let clicked = resp.clicked();
+            resp.context_menu(|ui| {
+                if ui.button("このタグで探す").clicked() {
+                    commands.push(NativeOverlayCommand::OpenTagViewForTag {
+                        name: def.name.clone(),
+                    });
+                    ui.close();
+                }
+            });
+            if clicked {
+                commands.push(NativeOverlayCommand::ToggleTag {
+                    name: def.name.clone(),
+                });
+            }
+        }
+    });
+}
+
 pub(super) fn draw_native_metadata_panel(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -3041,7 +3111,11 @@ pub(super) fn draw_native_metadata_panel(
                 .title
                 .as_deref()
                 .filter(|title| !title.trim().is_empty())
-                .unwrap_or(&metadata.file_name);
+                .unwrap_or(if metadata.probe_info_available {
+                    &metadata.file_name
+                } else {
+                    ""
+                });
             // 「GPU経路」は ファイル open 時の能力フラグ (= GPU video device が
             // 利用可能か)。per-frame の実プレゼン経路は別行「フレーム表示」で動的に
             // 表示する。
@@ -3090,19 +3164,96 @@ pub(super) fn draw_native_metadata_panel(
                     metadata.original_url.clone().unwrap_or_default(),
                 ),
                 ("説明", metadata.description.clone().unwrap_or_default()),
-                ("解像度", format!("{}x{}", metadata.width, metadata.height)),
-                ("フレームレート", format_fps(metadata.avg_fps)),
+                (
+                    "解像度",
+                    if metadata.probe_info_available {
+                        format!("{}x{}", metadata.width, metadata.height)
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "フレームレート",
+                    if metadata.probe_info_available {
+                        format_fps(metadata.avg_fps)
+                    } else {
+                        String::new()
+                    },
+                ),
                 ("コーデック", metadata.video_codec.clone()),
                 ("デコーダ", metadata.video_decoder.clone()),
-                ("音声", audio_label),
-                ("総ビットレート", format_bitrate(metadata.bit_rate_bps)),
-                ("長さ", format_overlay_time(metadata.duration_secs)),
-                ("チャプター", metadata.chapter_count.to_string()),
-                ("GPU経路", gpu_path_kind.to_string()),
-                ("デコード", decode_kind.to_string()),
-                ("フレーム表示", frame_path_kind.to_string()),
-                ("デインターレース", deinterlace_text),
-                ("D3D11VA", d3d11va.to_string()),
+                (
+                    "音声",
+                    if metadata.probe_info_available {
+                        audio_label
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "総ビットレート",
+                    if metadata.probe_info_available {
+                        format_bitrate(metadata.bit_rate_bps)
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "長さ",
+                    if metadata.probe_info_available {
+                        format_overlay_time(metadata.duration_secs)
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "チャプター",
+                    if metadata.probe_info_available {
+                        metadata.chapter_count.to_string()
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "GPU経路",
+                    if metadata.probe_info_available {
+                        gpu_path_kind.to_string()
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "デコード",
+                    if metadata.probe_info_available {
+                        decode_kind.to_string()
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "フレーム表示",
+                    if metadata.probe_info_available {
+                        frame_path_kind.to_string()
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "デインターレース",
+                    if metadata.probe_info_available {
+                        deinterlace_text
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "D3D11VA",
+                    if metadata.probe_info_available {
+                        d3d11va.to_string()
+                    } else {
+                        String::new()
+                    },
+                ),
             ];
             rows.retain(|(_, value)| !metadata_clean_text(value).is_empty());
 
@@ -3119,6 +3270,12 @@ pub(super) fn draw_native_metadata_panel(
                 .max_height(content_rect.height())
                 .show(&mut content_ui, |ui| {
                     ui.add_space(6.0);
+                    draw_native_tag_panel(ui, metadata, commands);
+                    if !metadata.shortcut_tags.is_empty() && !rows.is_empty() {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
                     for (label, value) in rows {
                         let value = metadata_clean_text(&value);
                         ui.horizontal_top(|ui| {

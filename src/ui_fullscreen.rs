@@ -4266,9 +4266,7 @@ impl App {
                             let panel_rect = adjustment_panel_rect(full_rect);
                             self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
                             // 右側にメタデータパネルも同時表示（show_metadata_panel の状態に関係なく）
-                            if !is_spread_double {
-                                self.draw_metadata_panel_forced(ui, ctx, full_rect);
-                            }
+                            self.draw_metadata_panel_forced(ui, ctx, full_rect);
                         } else if panorama_mode_active_now {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
                             // (docs/panorama-360-view-plan.md フィードバック対応)。
@@ -4277,8 +4275,7 @@ impl App {
                             // Phase 2a: NeedsUserConfirmation バナー (§3.6.2 / §3.6.4)。
                             // 大画像 (>200 MP) で確認待ちのときだけ描画。
                             self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
-                        } else if !is_spread_double
-                            && !compare_wipe_active
+                        } else if !compare_wipe_active
                             && !self.is_overlay_edit_mode_active()
                         {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
@@ -6456,8 +6453,8 @@ impl App {
                 action.close = true;
             }
         }
-        // 見開きダブル表示中は I/Z/R/L を無効化
-        if key_i && !is_spread_double {
+        // 見開きダブル表示中は Z/R/L を無効化。I はタグ右パネルでも使う。
+        if key_i {
             self.show_metadata_panel = !self.show_metadata_panel;
             self.metadata_panel_hover_active = false;
         }
