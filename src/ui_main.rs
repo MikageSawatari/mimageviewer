@@ -159,6 +159,19 @@ fn compute_cell_size(avail_w: f32, cols: usize, height_ratio: f32) -> Option<(f3
     Some((cell_w, cell_h))
 }
 
+fn snapped_scroll_extent(natural_h: f32, viewport_h: f32, row_h: f32) -> (f32, f32) {
+    let natural_h = natural_h.max(0.0);
+    let viewport_h = viewport_h.max(0.0);
+    if natural_h <= viewport_h {
+        return (natural_h, 0.0);
+    }
+
+    let row_h = row_h.max(1.0);
+    let raw_max = natural_h - viewport_h;
+    let max_offset = (raw_max / row_h).ceil() * row_h;
+    (max_offset + viewport_h, max_offset)
+}
+
 fn is_rating_solo(rf: &[bool; 6], idx: usize) -> bool {
     (0..6).all(|i| rf[i] == (i == idx))
 }
@@ -6307,29 +6320,12 @@ impl App {
             self.last_cell_h = Self::DETAILS_ROW_H;
         }
 
-        if scroll_to {
-            self.apply_scroll_to_selected(1, Self::DETAILS_ROW_H);
-        }
-
         if self.details_order.len() != self.visible_indices.len() {
             self.rebuild_details_order();
         }
         let display_order = self.current_grid_order().to_vec();
         let row_count = display_order.len();
         let natural_h = row_count as f32 * Self::DETAILS_ROW_H;
-        let total_h = if natural_h <= self.last_viewport_h {
-            natural_h
-        } else {
-            let raw_max = natural_h - self.last_viewport_h;
-            let snapped_max = (raw_max / Self::DETAILS_ROW_H).ceil() * Self::DETAILS_ROW_H;
-            snapped_max + self.last_viewport_h
-        };
-        let max_offset = if total_h <= self.last_viewport_h {
-            0.0
-        } else {
-            total_h - self.last_viewport_h
-        };
-        self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
 
         let mut nav: Option<PathBuf> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
@@ -6345,6 +6341,15 @@ impl App {
                     egui::Sense::hover(),
                 );
                 self.draw_details_header(ui, header_rect);
+
+                let viewport_h = ui.available_height().max(0.0);
+                self.last_viewport_h = viewport_h;
+                if scroll_to {
+                    self.apply_scroll_to_selected(1, Self::DETAILS_ROW_H);
+                }
+                let (total_h, max_offset) =
+                    snapped_scroll_extent(natural_h, viewport_h, Self::DETAILS_ROW_H);
+                self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
 
                 let old_scroll_style = ui.spacing().scroll;
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
@@ -7238,6 +7243,9 @@ impl App {
                     self.last_cell_h = cell_h;
                 }
 
+                let viewport_h = ui.available_height().max(0.0);
+                self.last_viewport_h = viewport_h;
+
                 if scroll_to {
                     self.apply_scroll_to_selected(cols, cell_h);
                 }
@@ -7248,19 +7256,7 @@ impl App {
                 // egui 内部の max offset = total_h - viewport_h が行境界に揃うよう、
                 // total_h を拡張する。これにより egui と自前の行スナップが一致し振動を防ぐ。
                 // 拡張量は最大 cell_h 未満（端数の補正のみ）。
-                let total_h = if natural_h <= self.last_viewport_h {
-                    natural_h
-                } else {
-                    let raw_max = natural_h - self.last_viewport_h;
-                    let snapped_max = (raw_max / cell_h).ceil() * cell_h;
-                    snapped_max + self.last_viewport_h
-                };
-
-                let max_offset = if total_h <= self.last_viewport_h {
-                    0.0
-                } else {
-                    total_h - self.last_viewport_h
-                };
+                let (total_h, max_offset) = snapped_scroll_extent(natural_h, viewport_h, cell_h);
                 self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
 
                 let mut nav: Option<PathBuf> = None;
@@ -7271,7 +7267,8 @@ impl App {
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(self.scroll_offset_y)
                     .show_viewport(ui, |ui, viewport| {
-                        // ビューポート高さを記録（次フレームのスクロール計算に使う）
+                        // 実際のビューポート高さも記録する。リサイズ中の scroll extent
+                        // 計算自体は上の `ui.available_height()` で同フレーム内に行う。
                         self.last_viewport_h = viewport.height();
 
                         let (content_rect, _) = ui.allocate_exact_size(
@@ -8312,6 +8309,28 @@ mod compute_cell_size_tests {
     fn cols_zero_falls_back_to_one() {
         let (w, _) = compute_cell_size(800.0, 0, 1.0).expect("Some");
         assert_eq!(w, 800.0);
+    }
+
+    #[test]
+    fn snapped_scroll_extent_tracks_current_viewport_height() {
+        let natural_h = 1000.0;
+        let row_h = 100.0;
+
+        let (tall_total_h, tall_max_offset) = snapped_scroll_extent(natural_h, 600.0, row_h);
+        let (short_total_h, short_max_offset) = snapped_scroll_extent(natural_h, 450.0, row_h);
+
+        assert_eq!(tall_total_h, 1000.0);
+        assert_eq!(tall_max_offset, 400.0);
+        assert_eq!(short_total_h, 1050.0);
+        assert_eq!(short_max_offset, 600.0);
+    }
+
+    #[test]
+    fn snapped_scroll_extent_does_not_expand_short_content() {
+        let (total_h, max_offset) = snapped_scroll_extent(280.0, 600.0, 100.0);
+
+        assert_eq!(total_h, 280.0);
+        assert_eq!(max_offset, 0.0);
     }
 }
 
