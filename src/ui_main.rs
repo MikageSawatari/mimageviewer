@@ -6927,11 +6927,18 @@ impl App {
         changed |= ui
             .checkbox(&mut self.settings.details_show_size, "サイズ")
             .changed();
+        // 読書履歴ビューでは「更新日時」列を最終閲覧、「状態」列を既読位置に転用するため、
+        // 列表示メニューのラベルもヘッダ・行表示と揃える。
+        let (modified_label, state_label) = if self.items_are_reading_history_view {
+            ("最終閲覧", "既読位置")
+        } else {
+            ("更新日時", "状態")
+        };
         changed |= ui
-            .checkbox(&mut self.settings.details_show_modified, "更新日時")
+            .checkbox(&mut self.settings.details_show_modified, modified_label)
             .changed();
         changed |= ui
-            .checkbox(&mut self.settings.details_show_state, "状態")
+            .checkbox(&mut self.settings.details_show_state, state_label)
             .changed();
 
         ui.separator();
