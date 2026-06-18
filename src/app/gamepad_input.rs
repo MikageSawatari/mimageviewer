@@ -35,6 +35,20 @@ const GAMEPAD_LIST_VISIBLE_ROWS: usize = 12;
 const RING_STICK_COMMIT_THRESHOLD: f32 = 0.50;
 const RING_STICK_HYSTERESIS_DEGREES: f32 = 8.0;
 
+fn request_ring_overlay_repaint(ctx: &egui::Context) {
+    ctx.request_repaint();
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+fn request_ring_overlay_repaint_after(ctx: &egui::Context, duration: Duration) {
+    ctx.request_repaint_after(duration);
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        ctx.request_repaint_after_for(duration, egui::ViewportId::ROOT);
+    }
+}
+
 const GRID_PICKER_ROWS: &[RingPickerRowId] = &[
     RingPickerRowId::GridColumns,
     RingPickerRowId::GridSortOrder,
@@ -271,7 +285,7 @@ impl App {
         self.mouse_ring_grid_target_idx = grid_target_idx;
         self.mouse_ring_suppress_context_menu_once = false;
         self.sync_native_video_ring_guide_overlay(ctx);
-        ctx.request_repaint_after(mouse_flick_guide_delay());
+        request_ring_overlay_repaint_after(ctx, mouse_flick_guide_delay());
     }
 
     pub(crate) fn update_mouse_ring_flick(
@@ -309,6 +323,17 @@ impl App {
     }
 
     pub(crate) fn update_native_mouse_ring_flick(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> MouseFlickOutcome {
+        self.update_mouse_ring_flick_with_pos(ctx, context, pos, secondary_down, secondary_released)
+    }
+
+    pub(crate) fn update_mouse_ring_flick_with_pos(
         &mut self,
         ctx: &egui::Context,
         context: RingShortcutContext,
@@ -356,12 +381,12 @@ impl App {
                 {
                     self.mouse_ring_nav = Some(nav);
                 }
-                ctx.request_repaint();
+                request_ring_overlay_repaint(ctx);
                 return MouseFlickOutcome::Fired;
             }
             if moved < MOUSE_FLICK_MOVE_THRESHOLD_PX {
                 self.mouse_ring_suppress_context_menu_once = true;
-                ctx.request_repaint();
+                request_ring_overlay_repaint(ctx);
                 return if long_press {
                     self.mouse_ring_grid_target_idx = None;
                     MouseFlickOutcome::Cancelled
@@ -372,11 +397,11 @@ impl App {
             if ring_visible {
                 self.mouse_ring_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
-                ctx.request_repaint();
+                request_ring_overlay_repaint(ctx);
                 return MouseFlickOutcome::Cancelled;
             }
             self.mouse_ring_grid_target_idx = None;
-            ctx.request_repaint();
+            request_ring_overlay_repaint(ctx);
             return MouseFlickOutcome::None;
         }
 
@@ -439,11 +464,11 @@ impl App {
         };
         let elapsed = flick.elapsed();
         if elapsed < mouse_flick_guide_delay() {
-            ctx.request_repaint_after(mouse_flick_guide_delay() - elapsed);
+            request_ring_overlay_repaint_after(ctx, mouse_flick_guide_delay() - elapsed);
         } else if !flick.armed && elapsed < mouse_flick_menu_delay() {
-            ctx.request_repaint_after(mouse_flick_menu_delay() - elapsed);
+            request_ring_overlay_repaint_after(ctx, mouse_flick_menu_delay() - elapsed);
         } else if flick.armed {
-            ctx.request_repaint_after(GAMEPAD_REPAINT_INTERVAL);
+            request_ring_overlay_repaint_after(ctx, GAMEPAD_REPAINT_INTERVAL);
         }
     }
 

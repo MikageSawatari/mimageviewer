@@ -148,6 +148,55 @@ fn should_suppress_egui_wheel_for_native_detached_video(
     is_video && detached && native_presenter_active
 }
 
+fn fullscreen_pointer_pos_from_viewport(
+    raw_pos: egui::Pos2,
+    viewport_inner: Option<egui::Rect>,
+    full_rect: egui::Rect,
+) -> egui::Pos2 {
+    if full_rect.contains(raw_pos) {
+        return raw_pos;
+    }
+
+    if let Some(inner) = viewport_inner {
+        // Depending on the viewport path, egui can report pointer positions either
+        // in viewport-local points or in virtual-desktop points. Try both mappings
+        // before falling back to a visible clamped position.
+        let candidates = [
+            raw_pos - inner.min.to_vec2() + full_rect.min.to_vec2(),
+            raw_pos + inner.min.to_vec2(),
+            raw_pos - full_rect.min.to_vec2(),
+            raw_pos + full_rect.min.to_vec2(),
+        ];
+        for candidate in candidates {
+            if full_rect.contains(candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    egui::pos2(
+        raw_pos.x.clamp(full_rect.min.x, full_rect.max.x),
+        raw_pos.y.clamp(full_rect.min.y, full_rect.max.y),
+    )
+}
+
+fn fullscreen_pointer_pos_or(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    fallback: egui::Pos2,
+) -> egui::Pos2 {
+    ctx.input(|i| {
+        i.pointer
+            .interact_pos()
+            .or_else(|| i.pointer.latest_pos())
+            .or_else(|| i.pointer.hover_pos())
+            .map(|pos| {
+                fullscreen_pointer_pos_from_viewport(pos, i.viewport().inner_rect, full_rect)
+            })
+            .unwrap_or(fallback)
+    })
+}
+
 /// 中ボタンドラッグズーム: 縦 N px で倍率 2 倍/半分になる感度 (v0.8.1)。
 /// 100 px で 2 倍 (= 上へ 200 px で 4 倍)。ホイール 1 ノッチ ≈ 10% と比べて粗めだが、
 /// 縦フル (1080 px) ストロークすれば 2^10 ≈ 1000 倍まで届くので十分。
@@ -7370,7 +7419,7 @@ impl App {
             let secondary_down = ctx.input(|i| i.pointer.secondary_down());
             let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
             let secondary_released = ctx.input(|i| i.pointer.secondary_released());
-            let secondary_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
             let secondary_in_seek_panel =
                 seek_panel_interactive && seek_panel_rect.contains(secondary_pos);
             // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
@@ -7387,7 +7436,13 @@ impl App {
                         None,
                     );
                 }
-                match self.update_mouse_ring_flick(ctx, self.current_ring_shortcut_context()) {
+                match self.update_mouse_ring_flick_with_pos(
+                    ctx,
+                    self.current_ring_shortcut_context(),
+                    secondary_pos,
+                    secondary_down,
+                    secondary_released,
+                ) {
                     crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
                         close = true;
                     }
@@ -7406,7 +7461,7 @@ impl App {
                 && let Some((start_time, start_pos)) = self.fs_secondary_press_start
             {
                 let elapsed = start_time.elapsed();
-                let current_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or(start_pos));
+                let current_pos = fullscreen_pointer_pos_or(ctx, full_rect, start_pos);
                 let moved = current_pos.distance(start_pos);
 
                 if !secondary_released
@@ -15782,6 +15837,32 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn fullscreen_pointer_pos_normalizes_viewport_and_desktop_coords() {
+        let local_full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let desktop_inner =
+            egui::Rect::from_min_size(egui::pos2(1920.0, 0.0), egui::vec2(1280.0, 720.0));
+
+        assert_eq!(
+            fullscreen_pointer_pos_from_viewport(
+                egui::pos2(2020.0, 120.0),
+                Some(desktop_inner),
+                local_full
+            ),
+            egui::pos2(100.0, 120.0)
+        );
+
+        let desktop_full = desktop_inner;
+        assert_eq!(
+            fullscreen_pointer_pos_from_viewport(
+                egui::pos2(100.0, 120.0),
+                Some(desktop_inner),
+                desktop_full
+            ),
+            egui::pos2(2020.0, 120.0)
+        );
     }
 
     fn assert_crop_rect_close(

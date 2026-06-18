@@ -4927,7 +4927,45 @@ mod tests {
         assert!(!loaded.ring_shortcuts.mouse_nav_prompt_done);
         assert_eq!(
             loaded.ring_shortcuts.grid.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
+            crate::ring_shortcut::RingActionId::GridParentFolder
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.grid.slots
+                [crate::ring_shortcut::RingDirection::DownLeft.slot_index()],
             crate::ring_shortcut::RingActionId::AddToBook
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.grid.slots
+                [crate::ring_shortcut::RingDirection::DownRight.slot_index()],
+            crate::ring_shortcut::RingActionId::GridToggleCheck
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.image.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
+            crate::ring_shortcut::RingActionId::ImageSlideshow
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.image.slots
+                [crate::ring_shortcut::RingDirection::DownLeft.slot_index()],
+            crate::ring_shortcut::RingActionId::AddToBook
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.image.slots
+                [crate::ring_shortcut::RingDirection::UpLeft.slot_index()],
+            crate::ring_shortcut::RingActionId::ImageCapture
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.video.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
+            crate::ring_shortcut::RingActionId::VideoLoop
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.video.slots
+                [crate::ring_shortcut::RingDirection::DownLeft.slot_index()],
+            crate::ring_shortcut::RingActionId::AddToBook
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.video.slots
+                [crate::ring_shortcut::RingDirection::UpLeft.slot_index()],
+            crate::ring_shortcut::RingActionId::VideoCapture
         );
         assert_eq!(loaded.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert_eq!(loaded.fullscreen_jump_mode, FullscreenJumpMode::Percent);

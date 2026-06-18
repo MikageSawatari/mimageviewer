@@ -887,12 +887,12 @@ pub fn default_profile_for_context(context: RingShortcutContext) -> RingShortcut
 
 fn default_grid_profile() -> RingShortcutProfile {
     RingShortcutProfile::new(vec![
-        RingActionId::AddToBook,
+        RingActionId::GridParentFolder,
         RingActionId::GridToggleSnapshotLock,
         RingActionId::GridHistoryForward,
-        RingActionId::None,
-        RingActionId::PinRepresentativeThumb,
         RingActionId::GridToggleCheck,
+        RingActionId::PinRepresentativeThumb,
+        RingActionId::AddToBook,
         RingActionId::GridHistoryBack,
         RingActionId::GridToggleDetails,
     ])
@@ -900,12 +900,12 @@ fn default_grid_profile() -> RingShortcutProfile {
 
 fn default_image_profile() -> RingShortcutProfile {
     RingShortcutProfile::new(vec![
-        RingActionId::AddToBook,
+        RingActionId::ImageSlideshow,
         RingActionId::ImageToggleMetadata,
         RingActionId::ImageRotateRight,
         RingActionId::None,
         RingActionId::PinRepresentativeThumb,
-        RingActionId::ImageSlideshow,
+        RingActionId::AddToBook,
         RingActionId::ImageRotateLeft,
         RingActionId::ImageCapture,
     ])
@@ -913,14 +913,14 @@ fn default_image_profile() -> RingShortcutProfile {
 
 fn default_video_profile() -> RingShortcutProfile {
     RingShortcutProfile::new(vec![
-        RingActionId::AddToBook,
         RingActionId::VideoLoop,
-        RingActionId::VideoCapture,
+        RingActionId::VideoExternalPlayer,
+        RingActionId::VideoTileMode,
         RingActionId::VideoBookmark,
         RingActionId::PinRepresentativeThumb,
-        RingActionId::VideoTileMode,
+        RingActionId::AddToBook,
         RingActionId::VideoMute,
-        RingActionId::VideoExternalPlayer,
+        RingActionId::VideoCapture,
     ])
 }
 
@@ -1137,15 +1137,47 @@ mod tests {
         assert_eq!(defaults.x_picker_hint_shown, false);
         assert_eq!(
             defaults.grid.slots[RingDirection::Up.slot_index()],
+            RingActionId::GridParentFolder
+        );
+        assert_eq!(
+            defaults.grid.slots[RingDirection::DownLeft.slot_index()],
             RingActionId::AddToBook
+        );
+        assert_eq!(
+            defaults.grid.slots[RingDirection::DownRight.slot_index()],
+            RingActionId::GridToggleCheck
+        );
+        assert_eq!(
+            defaults.image.slots[RingDirection::Up.slot_index()],
+            RingActionId::ImageSlideshow
         );
         assert_eq!(
             defaults.image.slots[RingDirection::UpRight.slot_index()],
             RingActionId::ImageToggleMetadata
         );
         assert_eq!(
+            defaults.image.slots[RingDirection::DownLeft.slot_index()],
+            RingActionId::AddToBook
+        );
+        assert_eq!(
+            defaults.image.slots[RingDirection::UpLeft.slot_index()],
+            RingActionId::ImageCapture
+        );
+        assert_eq!(
+            defaults.video.slots[RingDirection::Up.slot_index()],
+            RingActionId::VideoLoop
+        );
+        assert_eq!(
+            defaults.video.slots[RingDirection::DownLeft.slot_index()],
+            RingActionId::AddToBook
+        );
+        assert_eq!(
             defaults.video.slots[RingDirection::DownRight.slot_index()],
             RingActionId::VideoBookmark
+        );
+        assert_eq!(
+            defaults.video.slots[RingDirection::UpLeft.slot_index()],
+            RingActionId::VideoCapture
         );
     }
 

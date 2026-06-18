@@ -674,7 +674,7 @@ pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState
 
     ui.checkbox(
         &mut settings.mouse_flick_enabled,
-        "マウス右ドラッグでフリックを有効にする",
+        "マウス右ドラッグ / 長押しでフリックを有効にする",
     )
     .on_hover_text("OFF のときも、右短タップの既存動作はそのまま使えます。");
     ui.small("ゲームパッド X は常にリング/ピッカーとして使えます。マウス右ドラッグは誤操作を避けるため既定 OFF です。");
