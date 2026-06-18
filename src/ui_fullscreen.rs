@@ -3377,10 +3377,14 @@ impl App {
                         self.save_detached_viewer_placement_from_logical_rect(
                             rect, inner_rect, maximized,
                         );
-                        self.capture_detached_viewer_host_hwnd_from_logical_rect(
-                            rect,
-                            pixels_per_point,
-                        );
+                        // New viewports are created hidden, so same-frame HWND matching can
+                        // grab the previous generation that is about to be destroyed.
+                        if !need_show {
+                            self.capture_detached_viewer_host_hwnd_from_logical_rect(
+                                rect,
+                                pixels_per_point,
+                            );
+                        }
                     }
                 }
                 #[cfg(windows)]
