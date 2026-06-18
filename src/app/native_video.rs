@@ -1787,7 +1787,7 @@ impl App {
         self.switch_native_video_viewer_presentation(target, true);
     }
 
-    pub(super) fn toggle_video_window_mode_for_input(&mut self, ctx: &egui::Context) {
+    pub(crate) fn toggle_video_window_mode_for_input(&mut self, ctx: &egui::Context) {
         if self.viewer_session_is_detached() {
             if self.video_tile_mode_active {
                 return;

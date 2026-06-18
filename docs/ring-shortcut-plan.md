@@ -174,7 +174,8 @@
 | ↙ | 本棚に追加 | 本棚に追加 | 本棚に追加 (フレーム) |
 | ↘ | チェック ON/OFF | (空き) | ブックマーク追加 |
 
-- 別ウィンドウ (F12) はデフォルトから除外 (パッドは基本フルスクリーン/最大化のため)。
+- ウィンドウ/全画面切替 (F11) と別ウィンドウ (F12) はデフォルトから除外
+  (パッドは基本フルスクリーン/最大化のため)。画像・動画フルスクリーンの
   割り当て可能リストには残し、希望者がカスタマイズで入れられる。
 - パノラマ / 360 は共通リングから除外 (視点操作にスティック対応が別途必要で、パッド単独だと
   中途半端になるため)。マウス側の既存 UI で扱う。
@@ -384,8 +385,8 @@ AI モデル・★固定・代表サムネ pin は set-specific アクション�
 
 ### リング (一発もの) の候補
 
-- **全 context 共通**: 本棚に追加 / 代表サムネ (フレーム) にピン留め / 別ウィンドウ ON/OFF /
-  お気に入り巡回。
+- **全 context 共通**: 本棚に追加 / 代表サムネ (フレーム) にピン留め / お気に入り巡回。
+- **FS 共通**: ウィンドウ/全画面切替 / 別ウィンドウ ON/OFF。
 - **グリッド**: 表示↔詳細 / ★固定 / チェック ON/OFF / 全選択 / フォルダ履歴 戻る・進む / 親フォルダへ。
 - **画像 FS**: 回転 R / 回転 L / キャプチャ保存 / メタデータ表示 / スライドショー / ピクセルグリッド /
   背景色サイクル / 比較ピン。(**消しゴム・隠蔽・分析のモード起動は Phase 1 では外す**。モード遷移で
@@ -447,7 +448,8 @@ FsCommon/FsImage/FsVideo)。native video の Ctrl 系ナビは KeyAction 経由�
 |---|---|---|---|
 | 回転 R / L | `GridRotateCw/Ccw` / `FsRotateCw/Ccw` | Grid / ImageFS | 環 |
 | メタデータ表示 | `FsToggleMetadata` (FsCommon。VideoFS 対象なら ★新規 video metadata apply) | ImageFS | 環 |
-| 別ウィンドウ ON/OFF | `ToggleDetachedViewerMode` | Grid / ImageFS / VideoFS | 環 |
+| ウィンドウ/全画面切替 | `RingActionId::ToggleWindowMode` → F11 相当 | ImageFS / VideoFS | 環 |
+| 別ウィンドウ ON/OFF | `ToggleDetachedViewerMode` | ImageFS / VideoFS | 環 |
 | 表示↔詳細 | `GridToggleDetailsView` | Grid | 環 |
 | スライドショー | `FsSlideshow` | ImageFS | 環 |
 | ピクセルグリッド | `FsPixelGrid` | ImageFS | 環 |

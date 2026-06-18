@@ -110,6 +110,7 @@ pub enum RingActionId {
     AddToBook,
     PinRepresentativeThumb,
     ToggleDetachedViewer,
+    ToggleWindowMode,
     CycleFavorite,
     GridToggleDetails,
     GridToggleSnapshotLock,
@@ -152,6 +153,7 @@ impl RingActionId {
             Self::AddToBook => "add_to_book",
             Self::PinRepresentativeThumb => "pin_representative_thumb",
             Self::ToggleDetachedViewer => "toggle_detached_viewer",
+            Self::ToggleWindowMode => "toggle_window_mode",
             Self::CycleFavorite => "cycle_favorite",
             Self::GridToggleDetails => "grid_toggle_details",
             Self::GridToggleSnapshotLock => "grid_toggle_snapshot_lock",
@@ -194,6 +196,7 @@ impl RingActionId {
             "add_to_book" => Self::AddToBook,
             "pin_representative_thumb" => Self::PinRepresentativeThumb,
             "toggle_detached_viewer" => Self::ToggleDetachedViewer,
+            "toggle_window_mode" => Self::ToggleWindowMode,
             "cycle_favorite" => Self::CycleFavorite,
             "grid_toggle_details" => Self::GridToggleDetails,
             "grid_toggle_snapshot_lock" => Self::GridToggleSnapshotLock,
@@ -242,6 +245,7 @@ impl RingActionId {
                 _ => "代表サムネにピン留め",
             },
             Self::ToggleDetachedViewer => "別ウィンドウ ON/OFF",
+            Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::CycleFavorite => "お気に入り巡回",
             Self::GridToggleDetails => "表示/詳細",
             Self::GridToggleSnapshotLock => "★固定",
@@ -285,7 +289,6 @@ impl RingActionId {
                 Self::None
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
-                    | Self::ToggleDetachedViewer
                     | Self::CycleFavorite
                     | Self::GridToggleDetails
                     | Self::GridToggleSnapshotLock
@@ -305,6 +308,7 @@ impl RingActionId {
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
+                    | Self::ToggleWindowMode
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
@@ -331,6 +335,7 @@ impl RingActionId {
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
+                    | Self::ToggleWindowMode
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
@@ -356,7 +361,6 @@ impl RingActionId {
                 Self::None,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
-                Self::ToggleDetachedViewer,
                 Self::CycleFavorite,
                 Self::GridToggleDetails,
                 Self::GridToggleSnapshotLock,
@@ -374,6 +378,7 @@ impl RingActionId {
                 Self::None,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
+                Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
@@ -399,6 +404,7 @@ impl RingActionId {
                 Self::None,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
+                Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
@@ -1208,6 +1214,8 @@ mod tests {
     fn sanitize_clears_unknown_and_wrong_context_actions() {
         let mut settings = RingShortcutSettings::default();
         settings.grid.slots[0] = RingActionId::Unknown("future_action".to_string());
+        settings.grid.slots[1] = RingActionId::ToggleWindowMode;
+        settings.grid.slots[2] = RingActionId::ToggleDetachedViewer;
         settings.image.slots[1] = RingActionId::VideoCapture;
         settings.video.slots.push(RingActionId::ImageCapture);
         settings.shift_wheel_pair = WheelPairActionId::Unknown("future_wheel".to_string());
@@ -1220,6 +1228,8 @@ mod tests {
         settings.sanitize();
 
         assert_eq!(settings.grid.slots[0], RingActionId::None);
+        assert_eq!(settings.grid.slots[1], RingActionId::None);
+        assert_eq!(settings.grid.slots[2], RingActionId::None);
         assert_eq!(settings.image.slots[1], RingActionId::None);
         assert_eq!(settings.video.slots.len(), RING_SHORTCUT_SLOT_COUNT);
         assert_eq!(settings.shift_wheel_pair, WheelPairActionId::None);
@@ -1230,6 +1240,47 @@ mod tests {
         assert_eq!(settings.mouse_buttons_grid.back, RingActionId::None);
         assert_eq!(settings.mouse_buttons_image.forward, RingActionId::None);
         assert_eq!(settings.mouse_buttons_video.back, RingActionId::None);
+    }
+
+    #[test]
+    fn fullscreen_viewer_toggles_are_available_only_in_fullscreen_contexts() {
+        assert!(!RingActionId::ToggleWindowMode.is_valid_for_context(RingShortcutContext::Grid));
+        assert!(
+            !RingActionId::ToggleDetachedViewer.is_valid_for_context(RingShortcutContext::Grid)
+        );
+        assert!(
+            RingActionId::ToggleWindowMode
+                .is_valid_for_context(RingShortcutContext::ImageFullscreen)
+        );
+        assert!(
+            RingActionId::ToggleDetachedViewer
+                .is_valid_for_context(RingShortcutContext::ImageFullscreen)
+        );
+        assert!(
+            RingActionId::ToggleWindowMode
+                .is_valid_for_context(RingShortcutContext::VideoFullscreen)
+        );
+        assert!(
+            RingActionId::ToggleDetachedViewer
+                .is_valid_for_context(RingShortcutContext::VideoFullscreen)
+        );
+
+        assert!(
+            !RingActionId::available_for_context(RingShortcutContext::Grid)
+                .contains(&RingActionId::ToggleWindowMode)
+        );
+        assert!(
+            !RingActionId::available_for_context(RingShortcutContext::Grid)
+                .contains(&RingActionId::ToggleDetachedViewer)
+        );
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                .contains(&RingActionId::ToggleWindowMode)
+        );
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
+                .contains(&RingActionId::ToggleWindowMode)
+        );
     }
 
     #[test]

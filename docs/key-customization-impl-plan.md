@@ -466,7 +466,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   - keymap-spec では画像/動画共通だが、native 動画経路では転送 whitelist に I/Tab が無い。
     Ph5 で「FsCommon に置くか、FsImage 専用にするか」を実コードで確定する。
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
-- FsToggleWindowMode `F11` (固定)
+- FsToggleWindowMode `F11` (固定。リングショートカットでは画像・動画フルスクリーンの
+  一発アクションとして同等操作を割り当て可能)
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で

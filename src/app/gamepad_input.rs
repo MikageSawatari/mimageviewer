@@ -3120,6 +3120,10 @@ impl App {
                 self.toggle_detached_viewer_mode();
                 None
             }
+            RingActionId::ToggleWindowMode => {
+                self.apply_ring_toggle_window_mode(ctx, context);
+                None
+            }
             RingActionId::CycleFavorite => self.handle_gamepad_start(ctx),
             RingActionId::AddToBook => {
                 self.apply_ring_add_to_book(ctx, context);
@@ -3328,6 +3332,31 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn apply_ring_toggle_window_mode(&mut self, ctx: &egui::Context, context: RingShortcutContext) {
+        match context {
+            RingShortcutContext::ImageFullscreen => {
+                #[cfg(windows)]
+                {
+                    if self.viewer_session_is_detached() {
+                        self.toggle_detached_viewer_borderless_fullscreen(ctx);
+                    } else {
+                        self.toggle_still_window_mode();
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = ctx;
+                    self.show_feedback_toast("この操作は Windows でのみ利用できます".to_string());
+                }
+            }
+            RingShortcutContext::VideoFullscreen => {
+                self.toggle_video_window_mode_for_input(ctx);
+            }
+            RingShortcutContext::Grid => {}
         }
     }
 
