@@ -4994,10 +4994,11 @@ impl App {
                                     Some(AddressBarNav::DriveList(None)) => {
                                         "ドライブ一覧へ [BS]".to_string()
                                     }
+                                    Some(AddressBarNav::ReadingHistory) => {
+                                        "読書履歴へ戻る [BS]".to_string()
+                                    }
                                     Some(
-                                        AddressBarNav::HistoryBack
-                                        | AddressBarNav::HistoryForward
-                                        | AddressBarNav::ReadingHistory,
+                                        AddressBarNav::HistoryBack | AddressBarNav::HistoryForward,
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
                                 }
@@ -6066,6 +6067,8 @@ impl App {
             self.update_last_selected_image();
         }
         if response.double_clicked() {
+            // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+            self.note_reading_history_open(idx);
             match self.items.get(idx) {
                 Some(GridItem::Folder(p)) => {
                     // Ctrl+G 絞り込みビューでは「ヒットを含む子フォルダ」を Folder として

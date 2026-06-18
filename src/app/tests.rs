@@ -3751,6 +3751,47 @@ mod phase_c_drill_nav_tests {
         assert!(tooltip.contains("既読位置 12 / 120"));
     }
 
+    #[test]
+    fn reading_history_open_routes_back_to_history_view() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+
+        // 読書履歴ビューで本 (ZIP) を開いた → 戻り先予約が立つ。
+        app.items_are_reading_history_view = true;
+        app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
+            "c:/books/a.zip",
+        ))];
+        app.note_reading_history_open(0);
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(std::path::PathBuf::from("c:/books/a.zip"))
+        );
+
+        // 本を開いた後 (ビューを抜け current_folder = 本) は、親へ戻る操作で読書履歴へ。
+        app.items_are_reading_history_view = false;
+        app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip"));
+        assert!(matches!(
+            app.reading_history_back_nav(),
+            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+        ));
+        assert!(matches!(
+            app.resolve_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+        ));
+
+        // 本より深い階層 / 別の場所では通常の親フォルダ遷移 (= 読書履歴ではない)。
+        app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip/sub"));
+        assert!(app.reading_history_back_nav().is_none());
+        app.current_folder = Some(std::path::PathBuf::from("c:/other"));
+        assert!(app.reading_history_back_nav().is_none());
+
+        // 読書履歴ビュー外で開いても予約は立たない。
+        app.reading_history_return_from = None;
+        app.items_are_reading_history_view = false;
+        app.note_reading_history_open(0);
+        assert!(app.reading_history_return_from.is_none());
+    }
+
     /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
     /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
     /// drilled view が空にならない。

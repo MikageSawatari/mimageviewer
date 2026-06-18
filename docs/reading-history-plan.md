@@ -228,11 +228,19 @@ DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` �
 - 入口: 製本とは無関係なので製本メニューには置かない。ファイルメニューの
   「読書履歴を開く」と、アドレスバー「場所▼」の「読書履歴」(ドライブ一覧の下) から開く。
   既存の「最近開いたフォルダ履歴」とは別物だと分かる配置にする。
-- ダブルクリック / Enter: 通常のコンテナ open と同じ
+- ダブルクリック / Enter: 通常のコンテナ open と同じ。読書履歴から開いた本は、
+  `reading_history_return_from` に effective パスを焼き付ける
+- 本を閉じて親へ戻る (Backspace / 戻る / フルスクリーン Esc 直帰): 実ディレクトリではなく
+  読書履歴ビューへ戻る。判定は `reading_history_back_nav()` (= `effective_folder()` が
+  `reading_history_return_from` と一致する間だけ ReadingHistory を返す)。本より深い階層では
+  通常の親フォルダへ戻り、本の階層まで戻ったところで読書履歴へ抜ける。
+  `grid_parent_nav_target` / `resolve_grid_parent_nav` / `resolve_return_to_parent_nav` の
+  3 経路で同じ判定を通す
 - Backspace: 読書履歴へ来る前の場所に戻る。起動直後はドライブ一覧またはデスクトップへ
 - 右クリック:
-  - 開く
   - 履歴から削除
+  - この本のフォルダに移動 (本を含む実フォルダへ移動して前後の本を探す。
+    `parent_folder_for_nav` + `JumpFromSearch` を流用し、戻った先で本を選択状態にする)
   - パスをコピー
   - Explorer で場所を開く
   - 変換アーカイブの場合は既存の変換関連操作に合流

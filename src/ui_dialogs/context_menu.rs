@@ -514,6 +514,18 @@ impl crate::app::App {
                                 nav = Some(ContextMenuAction::JumpFromSearch(native_nav_path(p)));
                                 close = true;
                             }
+                            if self.items_are_reading_history_view
+                                && !is_folder_context
+                                && ui.button("この本のフォルダに移動").clicked()
+                            {
+                                self.select_after_load = p
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|s| s.to_string());
+                                nav =
+                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
+                                close = true;
+                            }
                             ui.separator();
                             if is_folder_context {
                                 if ui
@@ -554,6 +566,17 @@ impl crate::app::App {
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
+                                nav =
+                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
+                                close = true;
+                            }
+                            if self.items_are_reading_history_view
+                                && ui.button("この本のフォルダに移動").clicked()
+                            {
+                                self.select_after_load = p
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|s| s.to_string());
                                 nav =
                                     parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
                                 close = true;
@@ -647,6 +670,17 @@ impl crate::app::App {
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
+                                nav = parent_folder_for_nav(path)
+                                    .map(ContextMenuAction::JumpFromSearch);
+                                close = true;
+                            }
+                            if self.items_are_reading_history_view
+                                && ui.button("この本のフォルダに移動").clicked()
+                            {
+                                self.select_after_load = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|s| s.to_string());
                                 nav = parent_folder_for_nav(path)
                                     .map(ContextMenuAction::JumpFromSearch);
                                 close = true;

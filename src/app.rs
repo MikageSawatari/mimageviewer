@@ -3530,6 +3530,11 @@ pub struct App {
         std::collections::HashMap<String, crate::reading_history_db::ReadingHistoryEntry>,
     /// 直近に読書履歴へ送った key と時刻。連続ページ送りの同一 key 書き込みを抑える。
     pub(crate) last_reading_history_touch: Option<(String, std::time::Instant)>,
+    /// 読書履歴ビューから開いた本の effective パス。本を閉じて親へ戻るとき、実ディレクトリ
+    /// ではなく読書履歴ビューへ戻すために使う。`effective_folder()` がこれと一致する間だけ
+    /// 「親 = 読書履歴」とみなす (深い階層へ潜った後は通常の親フォルダへ戻り、本の階層まで
+    /// 戻ったところで読書履歴へ抜ける)。
+    pub(crate) reading_history_return_from: Option<PathBuf>,
 
     // ── フルスクリーン表示モード ──────────────────────────────
     /// 表示モード DB (フォルダごとのページ構成 / 連結方式永続化)
@@ -5563,6 +5568,7 @@ impl App {
             reading_history_writer,
             reading_history_rows: std::collections::HashMap::new(),
             last_reading_history_touch: None,
+            reading_history_return_from: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             spread_shift_anchor_idx: None,
@@ -6988,7 +6994,29 @@ impl App {
     /// グリッド上の「親へ戻る」操作 (Backspace / Alt+↑ / ツールバー⬆ / Pad B) の
     /// 共通ナビゲーション先を返す。ドライブルートでは親 `Path` が無いので、ドライブ
     /// 一覧へ戻す専用ナビを返す。
+    /// 読書履歴ビューから開いた本を「親へ戻る」操作で閉じるとき、実ディレクトリではなく
+    /// 読書履歴ビューへ戻す。本の effective パスにいる間だけ有効 (深い階層では None)。
+    pub(crate) fn reading_history_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
+        let from = self.reading_history_return_from.as_ref()?;
+        let cur = self.effective_folder()?;
+        crate::folder_tree::path_eq(&cur, from)
+            .then_some(crate::ui_main::AddressBarNav::ReadingHistory)
+    }
+
+    /// 読書履歴ビューでコンテナを開いたとき、その本へ戻り先予約を立てる。
+    pub(crate) fn note_reading_history_open(&mut self, idx: usize) {
+        if !self.items_are_reading_history_view {
+            return;
+        }
+        if let Some(path) = self.items.get(idx).and_then(GridItem::container_path) {
+            self.reading_history_return_from = Some(path.to_path_buf());
+        }
+    }
+
     pub(crate) fn grid_parent_nav_target(&self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.reading_history_back_nav() {
+            return Some(nav);
+        }
         let cur = self.effective_folder()?;
         if let Some(parent) = cur.parent() {
             Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()))
@@ -6998,6 +7026,9 @@ impl App {
     }
 
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.reading_history_back_nav() {
+            return Some(nav);
+        }
         let cur = self.effective_folder()?;
         let nav = if let Some(parent) = cur.parent() {
             self.select_after_load = cur
@@ -7022,6 +7053,9 @@ impl App {
     /// では `effective_folder() == current_folder` なので挙動不変)。親が取れない
     /// (ドライブ root 等) ときは `None` を返し、呼び出し側が close にフォールバックする。
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.reading_history_back_nav() {
+            return Some(nav);
+        }
         let cur = self.effective_folder()?;
         let parent = cur.parent()?;
         self.select_after_load = cur
@@ -9952,6 +9986,8 @@ impl App {
     /// 読書履歴ビューを開く。
     pub(crate) fn enter_reading_history(&mut self) {
         crate::logger::log("=== enter_reading_history ===");
+        // いま読書履歴ビューにいるので、戻り先予約は消費済み扱いにする。
+        self.reading_history_return_from = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
             self.close_global_search();
@@ -17680,6 +17716,8 @@ impl App {
                 // 同じ挙動をグリッドからも使えるようにする)。
                 let shift_enter = !self.ime_input_active() && ctx.input(|i| i.modifiers.shift);
                 if let Some(idx) = self.selected {
+                    // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+                    self.note_reading_history_open(idx);
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p))
                         | Some(GridItem::ZipFile(p))
