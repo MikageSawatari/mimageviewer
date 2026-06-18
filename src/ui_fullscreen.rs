@@ -7386,10 +7386,6 @@ impl App {
                     crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
                         close = true;
                     }
-                    crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(pos) => {
-                        self.fs_context_menu_idx = self.fullscreen_idx;
-                        self.fs_context_menu_pos = pos;
-                    }
                     crate::ring_shortcut::MouseFlickOutcome::Fired
                     | crate::ring_shortcut::MouseFlickOutcome::Cancelled
                     | crate::ring_shortcut::MouseFlickOutcome::None => {}

@@ -1109,7 +1109,6 @@ impl MouseFlickState {
 pub enum MouseFlickOutcome {
     None,
     ShortTap,
-    LongPressMenu(egui::Pos2),
     Cancelled,
     Fired,
 }

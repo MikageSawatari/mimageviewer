@@ -6279,23 +6279,6 @@ impl App {
                     self.open_current_folder_context_menu_at(ctx, pos);
                 }
             }
-            crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(pos) => {
-                let target_idx = self.mouse_ring_grid_target_idx.take();
-                if self.context_menu_idx.is_some() {
-                    return;
-                }
-                if let Some(idx) = target_idx
-                    && idx < self.items.len()
-                    && !self.items_are_drive_list
-                {
-                    self.selected = Some(idx);
-                    self.update_last_selected_image();
-                    self.context_menu_idx = Some(idx);
-                    self.context_menu_pos = pos;
-                } else {
-                    self.open_current_folder_context_menu_at(ctx, pos);
-                }
-            }
             crate::ring_shortcut::MouseFlickOutcome::Cancelled
             | crate::ring_shortcut::MouseFlickOutcome::Fired
             | crate::ring_shortcut::MouseFlickOutcome::None => {}

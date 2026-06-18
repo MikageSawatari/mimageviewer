@@ -6163,12 +6163,6 @@ impl App {
                     ctx.request_repaint();
                     return;
                 }
-                if let crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(menu_pos) = outcome {
-                    self.fs_context_menu_idx = Some(fs_idx);
-                    self.fs_context_menu_pos = menu_pos;
-                    ctx.request_repaint();
-                    return;
-                }
             }
             if let Some((start_time, start_pos)) = self.native_video_secondary_press_start.take() {
                 if pos.distance(start_pos) < 20.0 {
