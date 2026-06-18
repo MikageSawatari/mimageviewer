@@ -14,7 +14,63 @@
 
 ## 1. 優先候補
 
-現時点ではなし。
+### 1.1 フルスクリーン右パネルでのタグ操作を全画像 / 動画へ拡張
+
+- 背景: X で「動画や見開きの ZIP を閲覧中に、静止画の時のような右側のタグを選択できる
+  パネルを表示できるか」という要望。現状は、静止画単ページの `Image Info` 右パネルには
+  タグセクションがあるが、見開き時は右パネル自体を抑止し、動画は native overlay の
+  `動画メタ情報` 右パネルにタグセクションが無い。
+- 目標:
+  - 画像 / ZIP 内画像 / PDF ページ / 変換アーカイブ内ページ / 動画のフルスクリーン表示中に、
+    右パネル上で mIV タグを付与 / 解除できるようにする。
+  - タグの正本は引き続き `tags.db`。メディア本体、XMP、検索索引へは書かない。
+  - 既存のグリッド / 単ページ静止画のタグ操作、タグビュー、Undo/Redo の挙動を崩さない。
+- 画像側の仕様:
+  - 単ページ表示: 既存の `Image Info` 右パネル最上段のタグセクションを維持する。
+  - ZIP 内画像 / PDF ページ / 変換アーカイブ内ページ: 仮想ページ個別ではなく、親の
+    ZIP / PDF / 元アーカイブをタグ対象にする。これは `current_tag_target_path` /
+    `tag_target_for_item(..., fullscreen=true)` の既存方針と同じ。パネル上には
+    `タグ対象: この本 (book.zip)` のように対象が本体であることを表示する。
+  - 見開きで左右が同じコンテナに属する場合 (ZIP/PDF/変換アーカイブ): 1 つのタグセクションだけを表示し、
+    その本体へ付与 / 解除する。
+  - 見開きで左右が別の実画像ファイルの場合: タグ対象を `左ページ` / `右ページ` / `両ページ`
+    から選べる小さな segmented control をタグセクション内に出す。既定は現在の `fullscreen_idx`
+    に対応するページ。対象が曖昧なまま 1 ページだけに付与しない。
+  - 連結読み (縦 / 横) では、初期スコープは表示中心に最も近いページ、または既存の
+    アンカー `fullscreen_idx` を対象にする。実装前に「スクロール中に対象が勝手に変わる」違和感が
+    出ないか確認し、必要なら `タグ対象ページを固定` / `現在中心ページ` の明示 UI を追加する。
+  - EXIF / AI メタデータ本文は見開きでは従来どおり省略してよい。v1.9.0 の必須目標は
+    **タグセクションを見ながら操作できること**。
+- 動画側の仕様:
+  - native overlay の `動画メタ情報` 右パネルの最上段に、静止画右パネルと同等のタグセクションを追加する。
+    動画メタデータが未取得 / 空でもタグセクションは表示できるようにする。
+  - 右パネルの表示条件は既存の動画右パネルに合わせる (右端 hover / 固定表示 / I または Tab 系の
+    既存操作)。新しい設定項目は増やさない。
+  - native overlay 側では DB を直接読まない。App 側で `tags_cache` / ショートカットタグ /
+    現在動画のタグ対象キーを `NativeOverlayMetadata` か専用の tag panel state へ渡し、クリック時は
+    `NativeOverlayCommand::ToggleTag { name }` / `OpenTagViewForTag { name }` のような command で
+    App 側の既存タグ操作に戻す。
+  - F12 別ウィンドウ / 枠なし全画面でも、同じ native overlay 経路でタグ操作できることを確認する。
+- 実装メモ:
+  - 静止画側の `ui_metadata_panel.rs` にはすでに `current_tag_target_path` があり、
+    `ZipImage` / `PdfPage` を親コンテナへフォールバックできる。見開き抑止条件
+    (`!is_spread_double`) を緩める場合は、クリックナビゲーション / ホイール / 右パネル当たり判定も
+    同じ rect で更新する。
+  - `tag_ops.rs` のフルスクリーン対象解決は現在 `fullscreen_idx` 1 件のみ。見開きの
+    `左ページ` / `右ページ` / `両ページ` を実装する場合は、右パネル専用に明示 target path 群を渡す
+    経路を追加し、古いグリッド選択や checked に影響されないようにする。
+  - タグ状態の取得は `tags_cache` prewarm / `TagsDb::display_tags_for_item` の既存キャッシュ方針を使う。
+    フルスクリーン描画フレームで同期 DB 読みを増やさない。
+  - 付与 / 解除は既存 `tag_write_worker` と meta undo 集約を再利用する。動画でも XMP sidecar へ
+    旧タグを書き戻さない。
+- 確認項目:
+  - 通常画像単ページ、通常画像見開き、ZIP 見開き、PDF 見開き、変換済み RAR/7z/LZH の見開き、
+    動画フルスクリーン、F12 別ウィンドウ動画。
+  - ZIP/PDF/変換アーカイブは本体セルのタグバッジ / タグビュー結果と同じキーに付くこと。
+  - 見開きの左右別実画像では、選択した対象だけ / 両方にタグが付くこと。
+  - 右パネル上のホイール / クリックがページ送りや動画操作へ漏れないこと。
+  - Ctrl+Z / Ctrl+Y でタグ変更を戻せること。
+- 優先度: P2 / v1.9.0 候補。
 
 ## 2. アーカイブ / 仮想フォルダ
 
@@ -145,4 +201,5 @@
 | 入力カスタマイズ / マウス / ゲームパッド | `docs/keymap-spec.md`, `docs/key-customization-impl-plan.md`, `docs/ring-shortcut-plan.md` |
 | フルスクリーン / F12 別ウィンドウ / 連結読み | `docs/display-pipeline.md`, `docs/detached-viewer-implementation-plan.md`, `docs/fullscreen-navigation-consistency.md` |
 | 表示 / AI / 補正 | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md` |
+| タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
 | リリース / 依存更新 | `CLAUDE.md` のリリース手順、各 native 依存管理節 |
