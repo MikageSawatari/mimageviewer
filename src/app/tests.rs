@@ -3824,6 +3824,36 @@ mod phase_c_drill_nav_tests {
         assert!(app.reading_history_return_from.is_none());
     }
 
+    #[test]
+    fn reading_history_back_nav_handles_converted_archive() {
+        use crate::archive_converter::ArchiveFormat;
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+
+        // 読書履歴の変換アーカイブを開く → 予約は (キャッシュ ZIP ではなく) 元アーカイブ。
+        app.items_are_reading_history_view = true;
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: std::path::PathBuf::from("c:/books/a.rar"),
+            format: ArchiveFormat::Rar,
+        }];
+        app.note_reading_history_open(0);
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(std::path::PathBuf::from("c:/books/a.rar"))
+        );
+
+        // 開いた後は current_folder = キャッシュ ZIP / archive_source_override = 元アーカイブ。
+        // open_archive_via_cache が予約を元アーカイブへ復元しているので、effective_folder()
+        // (= override) と一致し、閉じると読書履歴へ戻る。
+        app.items_are_reading_history_view = false;
+        app.current_folder = Some(std::path::PathBuf::from("c:/cache/abcd/book.zip"));
+        app.archive_source_override = Some(std::path::PathBuf::from("c:/books/a.rar"));
+        assert!(matches!(
+            app.reading_history_back_nav(),
+            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+        ));
+    }
+
     /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
     /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
     /// drilled view が空にならない。

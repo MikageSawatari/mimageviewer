@@ -244,6 +244,12 @@ DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` �
   - 別の本 / フォルダへ明示ナビで出たら予約を捨てる: `load_folder_with_scan` が予約した本
     以外の実フォルダへ移ったときクリア、`enter_drive_list` でもクリア、コンテナの
     再オープン時は `note_reading_history_open` がクリア
+  - **変換アーカイブの例外**: 読書履歴の RAR/7z/LZH を開くと `open_archive_via_cache` /
+    変換完了処理が `load_folder(cache_zip)` を呼ぶため、`cache_zip != 元アーカイブ` で予約が
+    `load_folder_with_scan` のクリアに巻き込まれる。`archive_source_override` を元パスへ戻すのと
+    同様に、ロード前に「予約が元アーカイブと一致したか」を退避し、ロード成功後に
+    `reading_history_return_from = 元アーカイブ` を書き戻す (= 閉じると読書履歴へ戻れる)。
+    読書履歴以外から開いた変換アーカイブでは退避フラグが立たないので誤保持しない
 - 読書履歴の合成パスは履歴 back/forward スタックに積まない (`record_folder_nav_transition` /
   quick folder target capture で `__search_results__` と同様に除外)。読書履歴へ戻るのは上記
   「親へ戻る」専用経路だけにし、Alt+← で実体のない合成パスを開こうとする事故を防ぐ

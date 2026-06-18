@@ -185,6 +185,13 @@ impl App {
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
+        // load_folder(cache_zip) は load_folder_with_scan のクリアで読書履歴の戻り先予約を
+        // 落とす (cache_zip != 元アーカイブのため)。読書履歴から開いた本なら、override を
+        // 元パスへ戻すのと同じく予約も元アーカイブへ復元する (= 閉じると読書履歴へ戻れる)。
+        let restore_reading_history = self
+            .reading_history_return_from
+            .as_ref()
+            .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
         self.load_folder(cached_zip.clone());
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
         // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
@@ -206,6 +213,9 @@ impl App {
             self.remember_recent_folder(&src);
         }
         self.update_active_quick_folder_target(&src);
+        if restore_reading_history {
+            self.reading_history_return_from = Some(src.clone());
+        }
         self.archive_source_override = Some(src);
         true
     }
@@ -311,6 +321,12 @@ impl App {
                 // 元 (RAR/7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
                 // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
                 let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
+                // load_folder(cache_zip) で読書履歴の戻り先予約が落ちるので、元アーカイブと
+                // 一致していたかを退避し、override 復元と同じく後で書き戻す。
+                let restore_reading_history = match (&src, &self.reading_history_return_from) {
+                    (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
+                    _ => false,
+                };
                 // 明示オープンからの変換 (state.auto_fullscreen=true) のときだけ、変換成功
                 // 直後に 1 ページ目を自動フルスクリーン表示する (履歴/アドレスバー経由の
                 // 変換は false なので発火しない)。
@@ -358,6 +374,9 @@ impl App {
                         self.remember_recent_folder(&src);
                     }
                     self.update_active_quick_folder_target(&src);
+                    if restore_reading_history {
+                        self.reading_history_return_from = Some(src.clone());
+                    }
                     self.archive_source_override = Some(src);
                 }
                 if self.favsearch.active {
