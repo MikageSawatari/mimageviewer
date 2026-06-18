@@ -3792,6 +3792,38 @@ mod phase_c_drill_nav_tests {
         assert!(app.reading_history_return_from.is_none());
     }
 
+    #[test]
+    fn reading_history_return_reservation_lifetime() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+
+        // 履歴から本を開いて予約を立てる。
+        app.items_are_reading_history_view = true;
+        app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
+            "c:/books/a.zip",
+        ))];
+        app.note_reading_history_open(0);
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(std::path::PathBuf::from("c:/books/a.zip"))
+        );
+
+        // 本の中でページ (画像) を開くだけでは予約は維持される。
+        app.items_are_reading_history_view = false;
+        app.items = vec![GridItem::Image(std::path::PathBuf::from("c:/books/p1.jpg"))];
+        app.note_reading_history_open(0);
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(std::path::PathBuf::from("c:/books/a.zip"))
+        );
+
+        // 読書履歴ビュー以外で別のコンテナを開いたら予約を捨てる
+        // (= 別の本/フォルダへ出たので、以後 Backspace は通常の親フォルダへ)。
+        app.items = vec![GridItem::Folder(std::path::PathBuf::from("c:/elsewhere"))];
+        app.note_reading_history_open(0);
+        assert!(app.reading_history_return_from.is_none());
+    }
+
     /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
     /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
     /// drilled view が空にならない。

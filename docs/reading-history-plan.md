@@ -228,14 +228,25 @@ DB には最終閲覧日時と、取れる場合は `last_page` / `page_count` �
 - 入口: 製本とは無関係なので製本メニューには置かない。ファイルメニューの
   「読書履歴を開く」と、アドレスバー「場所▼」の「読書履歴」(ドライブ一覧の下) から開く。
   既存の「最近開いたフォルダ履歴」とは別物だと分かる配置にする。
-- ダブルクリック / Enter: 通常のコンテナ open と同じ。読書履歴から開いた本は、
-  `reading_history_return_from` に effective パスを焼き付ける
-- 本を閉じて親へ戻る (Backspace / 戻る / フルスクリーン Esc 直帰): 実ディレクトリではなく
-  読書履歴ビューへ戻る。判定は `reading_history_back_nav()` (= `effective_folder()` が
-  `reading_history_return_from` と一致する間だけ ReadingHistory を返す)。本より深い階層では
-  通常の親フォルダへ戻り、本の階層まで戻ったところで読書履歴へ抜ける。
-  `grid_parent_nav_target` / `resolve_grid_parent_nav` / `resolve_return_to_parent_nav` の
-  3 経路で同じ判定を通す
+- ダブルクリック / Enter: 通常のコンテナ open と同じ。`note_reading_history_open` が
+  戻り先予約 (`reading_history_return_from`) を更新する: 読書履歴ビューで本 (コンテナ) を
+  開いたら本の container パスを焼き付け、読書履歴ビュー以外で別コンテナを開いたら捨てる。
+  画像 / ページ (非コンテナ) のオープンでは変えない (本の中でページを読むだけなので保持)
+- 本を「親へ戻る」操作で閉じる (Backspace / アドレスバーの親へ戻る / 自動フルスクリーン時の
+  Esc 直帰): 実ディレクトリではなく読書履歴ビューへ戻る。判定は `reading_history_back_nav()`
+  (= `effective_folder()` が `reading_history_return_from` と一致する間だけ ReadingHistory を
+  返す)。`grid_parent_nav_target` / `resolve_grid_parent_nav` / `resolve_return_to_parent_nav`
+  の 3 経路で同じ判定を通す
+- **戻り先予約の寿命管理**:
+  - ネスト ZIP の深い階層 (`zip_nav` が root でない) では `reading_history_back_nav` は
+    None を返す (`effective_folder()` は深さに関わらず root ZIP のままなので、明示的に弾く)。
+    root に戻ってから読書履歴へ抜ける = Esc 直帰経路でも深い階層から一気に戻らない
+  - 別の本 / フォルダへ明示ナビで出たら予約を捨てる: `load_folder_with_scan` が予約した本
+    以外の実フォルダへ移ったときクリア、`enter_drive_list` でもクリア、コンテナの
+    再オープン時は `note_reading_history_open` がクリア
+- 読書履歴の合成パスは履歴 back/forward スタックに積まない (`record_folder_nav_transition` /
+  quick folder target capture で `__search_results__` と同様に除外)。読書履歴へ戻るのは上記
+  「親へ戻る」専用経路だけにし、Alt+← で実体のない合成パスを開こうとする事故を防ぐ
 - Backspace: 読書履歴へ来る前の場所に戻る。起動直後はドライブ一覧またはデスクトップへ
 - 右クリック:
   - 履歴から削除

@@ -6997,19 +6997,43 @@ impl App {
     /// 読書履歴ビューから開いた本を「親へ戻る」操作で閉じるとき、実ディレクトリではなく
     /// 読書履歴ビューへ戻す。本の effective パスにいる間だけ有効 (深い階層では None)。
     pub(crate) fn reading_history_back_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
+        // ネスト ZIP の深い階層では本のルート扱いにしない。effective_folder() は深さに
+        // 関わらず root ZIP のままなので、zip_nav の深さで明示的に弾く (root に戻ってから
+        // 読書履歴へ抜ける。docs「深い階層では通常の親へ」と整合させる。Esc 直帰経路も同じ)。
+        if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
+            return None;
+        }
         let from = self.reading_history_return_from.as_ref()?;
         let cur = self.effective_folder()?;
         crate::folder_tree::path_eq(&cur, from)
             .then_some(crate::ui_main::AddressBarNav::ReadingHistory)
     }
 
-    /// 読書履歴ビューでコンテナを開いたとき、その本へ戻り先予約を立てる。
+    /// グリッドからコンテナを開いたときに、読書履歴ビューへの戻り先予約を更新する。
+    ///
+    /// - 読書履歴ビューで本 (コンテナ) を開いた → その本へ戻り先を焼き付ける。
+    /// - 読書履歴ビュー以外で別のコンテナを開いた → 古い予約を捨てる (別の本/フォルダへ
+    ///   出たので、以後 Backspace は読書履歴ではなく通常の親フォルダへ向かう)。
+    /// - 画像 / ページ等 (非コンテナ) のオープンでは予約を変えない (= 本の中でページを
+    ///   読んでいるだけなので戻り先を保持する)。
     pub(crate) fn note_reading_history_open(&mut self, idx: usize) {
-        if !self.items_are_reading_history_view {
+        let Some(item) = self.items.get(idx) else {
+            return;
+        };
+        let is_container = matches!(
+            item,
+            GridItem::Folder(_)
+                | GridItem::ZipFile(_)
+                | GridItem::PdfFile(_)
+                | GridItem::ConvertibleArchive { .. }
+        );
+        if !is_container {
             return;
         }
-        if let Some(path) = self.items.get(idx).and_then(GridItem::container_path) {
-            self.reading_history_return_from = Some(path.to_path_buf());
+        if self.items_are_reading_history_view {
+            self.reading_history_return_from = item.container_path().map(|p| p.to_path_buf());
+        } else {
+            self.reading_history_return_from = None;
         }
     }
 
@@ -7227,7 +7251,9 @@ impl App {
             return None;
         }
         let target = self.effective_folder()?;
-        if crate::folder_tree::path_eq(&target, &search_results_synthetic_path()) {
+        if crate::folder_tree::path_eq(&target, &search_results_synthetic_path())
+            || crate::folder_tree::path_eq(&target, &reading_history_synthetic_path())
+        {
             return None;
         }
         Some(target)
@@ -7371,11 +7397,14 @@ impl App {
             return;
         }
 
-        // 合成検索結果パス (__search_results__) は実在しないため、移動元として
-        // 履歴スタックに積まない (安全網。通常は上位の検索ガードで弾かれる)。
+        // 合成パス (__search_results__ / __reading_history__) は実在しないため、移動元
+        // として履歴スタックに積まない (戻る/Alt+← で実フォルダとして開こうとして失敗する
+        // のを防ぐ。読書履歴へ戻る導線は reading_history_back_nav 経由の専用経路を使う)。
         // ただし新しい遷移自体は発生しているので forward 履歴はクリアする
         // (新規ナビゲーションが forward 履歴を無効化する原則)。
-        if crate::folder_tree::path_eq(&current, &search_results_synthetic_path()) {
+        if crate::folder_tree::path_eq(&current, &search_results_synthetic_path())
+            || crate::folder_tree::path_eq(&current, &reading_history_synthetic_path())
+        {
             self.clear_active_folder_nav_forward_stack();
             self.update_active_quick_folder_target(target);
             return;
@@ -8021,6 +8050,8 @@ impl App {
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
         self.cancel_folder_pane_open();
+        // 読書履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
+        self.reading_history_return_from = None;
 
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
@@ -8253,6 +8284,15 @@ impl App {
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
         self.cancel_folder_pane_open();
+        // 読書履歴から開いた本以外の実フォルダへ明示ナビで出たら、戻り先予約を捨てる
+        // (アドレスバー / 履歴戻る / フォルダナビ等。予約した本そのものを開き直す場合は維持)。
+        if self
+            .reading_history_return_from
+            .as_ref()
+            .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
+        {
+            self.reading_history_return_from = None;
+        }
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
         // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
