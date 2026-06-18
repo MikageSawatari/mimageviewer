@@ -1046,6 +1046,28 @@ pub struct GamepadFavoritePickerState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GamepadLocationNav {
+    Direct(PathBuf),
+    DriveList,
+    ReadingHistory,
+    BooksRoot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadLocationEntry {
+    pub label: String,
+    pub value: String,
+    pub nav: GamepadLocationNav,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadLocationPickerState {
+    pub selected: usize,
+    pub scroll_top: usize,
+    pub entries: Vec<GamepadLocationEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GamepadVideoMarkerPickerState {
     pub selected: usize,
     pub scroll_top: usize,

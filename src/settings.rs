@@ -1665,6 +1665,12 @@ pub struct Settings {
     /// サムネイル選択情報ツールチップに親フォルダ / コンテナ名を表示する。
     #[serde(default)]
     pub thumb_tooltip_show_location: bool,
+    /// サムネイル選択情報ツールチップに読書履歴の最終閲覧日時を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_tooltip_show_reading_history_last_read: bool,
+    /// サムネイル選択情報ツールチップに読書履歴の既読位置を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_tooltip_show_reading_history_progress: bool,
 
     // ── タグ機能 (docs/tag-feature.md) ──────────────────────────
     /// ユーザ定義のタグ一覧 (メニュー / ツールバー に表示される順)。
@@ -3045,6 +3051,8 @@ impl Default for Settings {
             thumb_tooltip_show_video_dimensions: false,
             thumb_tooltip_show_video_codec: false,
             thumb_tooltip_show_location: false,
+            thumb_tooltip_show_reading_history_last_read: true,
+            thumb_tooltip_show_reading_history_progress: true,
             exif_hidden_tags: default_exif_hidden_tags(),
             skip_zip_if_folder_exists: true,
             skip_image_if_video_exists: true,
@@ -6512,6 +6520,8 @@ mod tests {
             s.thumb_tooltip_show_video_dimensions = true;
             s.thumb_tooltip_show_video_codec = true;
             s.thumb_tooltip_show_location = true;
+            s.thumb_tooltip_show_reading_history_last_read = false;
+            s.thumb_tooltip_show_reading_history_progress = false;
             s.fullscreen_left_panel_tab = FullscreenLeftPanelTab::ViewTrim;
             s.toolbar_cols_details_visible = false;
             s.toolbar_aspect_auto_visible = false;
@@ -6807,6 +6817,14 @@ mod tests {
             assert!(
                 loaded.thumb_tooltip_show_location,
                 "thumb tooltip location flag should survive roundtrip"
+            );
+            assert!(
+                !loaded.thumb_tooltip_show_reading_history_last_read,
+                "thumb tooltip reading-history last-read flag should survive roundtrip"
+            );
+            assert!(
+                !loaded.thumb_tooltip_show_reading_history_progress,
+                "thumb tooltip reading-history progress flag should survive roundtrip"
             );
             assert_eq!(
                 loaded.fullscreen_left_panel_tab,

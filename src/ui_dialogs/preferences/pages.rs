@@ -329,6 +329,14 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.thumb_tooltip_show_video_dimensions, "動画解像度");
     ui.checkbox(&mut s.thumb_tooltip_show_video_codec, "動画コーデック");
     ui.checkbox(&mut s.thumb_tooltip_show_location, "場所");
+    ui.checkbox(
+        &mut s.thumb_tooltip_show_reading_history_last_read,
+        "読書履歴: 最終閲覧",
+    );
+    ui.checkbox(
+        &mut s.thumb_tooltip_show_reading_history_progress,
+        "読書履歴: 既読位置",
+    );
 }
 
 pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {

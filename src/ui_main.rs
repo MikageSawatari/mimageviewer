@@ -69,6 +69,7 @@ pub(crate) enum AddressBarNav {
     Direct(PathBuf),
     DriveList(Option<PathBuf>),
     ReadingHistory,
+    BooksRoot,
     HistoryBack,
     HistoryForward,
 }
@@ -4997,6 +4998,9 @@ impl App {
                                     Some(AddressBarNav::ReadingHistory) => {
                                         "読書履歴へ戻る [BS]".to_string()
                                     }
+                                    Some(AddressBarNav::BooksRoot) => {
+                                        "本棚フォルダへ".to_string()
+                                    }
                                     Some(
                                         AddressBarNav::HistoryBack | AddressBarNav::HistoryForward,
                                     )
@@ -5080,6 +5084,14 @@ impl App {
                             }
                             if ui.button("読書履歴").clicked() {
                                 result = Some(AddressBarNav::ReadingHistory);
+                                ui.close();
+                            }
+                            if ui
+                                .button("本棚フォルダ")
+                                .hover_tip(self.book_root_path().to_string_lossy().to_string())
+                                .clicked()
+                            {
+                                result = Some(AddressBarNav::BooksRoot);
                                 ui.close();
                             }
                             ui.separator();
@@ -6066,7 +6078,7 @@ impl App {
             self.selected = Some(idx);
             self.update_last_selected_image();
         }
-        if response.double_clicked() {
+        if response.double_clicked() && self.guard_reading_history_open(idx) {
             // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
             self.note_reading_history_open(idx);
             match self.items.get(idx) {
@@ -6490,6 +6502,7 @@ impl App {
         self.draw_gamepad_ring_overlay(ui, full_rect);
         self.draw_gamepad_picker_overlay(ui, full_rect);
         self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
+        self.draw_gamepad_location_picker_overlay(ui, full_rect);
         self.draw_feedback_toast(ui, full_rect, ctx);
         self.render_details_thumbnail_tooltip(ctx, hovered_preview);
 
@@ -6668,18 +6681,36 @@ impl App {
         reading_history_progress_text(entry)
     }
 
-    pub(crate) fn reading_history_tooltip_lines(&self, idx: usize) -> Option<Vec<String>> {
+    fn reading_history_info_lines(
+        &self,
+        idx: usize,
+        show_last_read: bool,
+        show_progress: bool,
+    ) -> Option<Vec<String>> {
         let entry = self.reading_history_entry_for_idx(idx)?;
         let mut lines = Vec::new();
-        if let Some(last_read) =
-            reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
+        if show_last_read
+            && let Some(last_read) =
+                reading_history_last_read_text(entry, self.settings.details_timestamp_show_seconds)
         {
             lines.push(format!("最終閲覧 {last_read}"));
         }
-        if let Some(progress) = reading_history_progress_text(entry) {
+        if show_progress && let Some(progress) = reading_history_progress_text(entry) {
             lines.push(format!("既読位置 {progress}"));
         }
         (!lines.is_empty()).then_some(lines)
+    }
+
+    pub(crate) fn reading_history_tooltip_lines(&self, idx: usize) -> Option<Vec<String>> {
+        self.reading_history_info_lines(idx, true, true)
+    }
+
+    pub(crate) fn reading_history_selection_info_lines(&self, idx: usize) -> Option<Vec<String>> {
+        self.reading_history_info_lines(
+            idx,
+            self.settings.thumb_tooltip_show_reading_history_last_read,
+            self.settings.thumb_tooltip_show_reading_history_progress,
+        )
     }
 
     fn draw_reading_history_tooltip(&self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize) {
@@ -7327,6 +7358,7 @@ impl App {
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
+                    self.draw_gamepad_location_picker_overlay(ui, full_rect);
                     self.draw_feedback_toast(ui, full_rect, ctx);
                     self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
@@ -7357,6 +7389,7 @@ impl App {
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
+                    self.draw_gamepad_location_picker_overlay(ui, full_rect);
                     self.draw_feedback_toast(ui, full_rect, ctx);
                     self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
@@ -7609,6 +7642,7 @@ impl App {
                 self.draw_gamepad_ring_overlay(ui, full_rect);
                 self.draw_gamepad_picker_overlay(ui, full_rect);
                 self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
+                self.draw_gamepad_location_picker_overlay(ui, full_rect);
                 self.draw_feedback_toast(ui, full_rect, ctx);
 
                 nav
@@ -7653,7 +7687,7 @@ impl App {
                 lines.push(name);
             }
         }
-        if let Some(history_lines) = self.reading_history_tooltip_lines(idx) {
+        if let Some(history_lines) = self.reading_history_selection_info_lines(idx) {
             lines.push(history_lines.join("   "));
         }
 

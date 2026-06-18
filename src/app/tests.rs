@@ -3749,6 +3749,72 @@ mod phase_c_drill_nav_tests {
         let tooltip = app.reading_history_tooltip_lines(0).unwrap().join("\n");
         assert!(tooltip.contains("最終閲覧"));
         assert!(tooltip.contains("既読位置 12 / 120"));
+
+        let selection_info = app
+            .reading_history_selection_info_lines(0)
+            .unwrap()
+            .join("\n");
+        assert!(selection_info.contains("最終閲覧"));
+        assert!(selection_info.contains("既読位置 12 / 120"));
+
+        app.settings.thumb_tooltip_show_reading_history_last_read = false;
+        let selection_info = app
+            .reading_history_selection_info_lines(0)
+            .unwrap()
+            .join("\n");
+        assert!(!selection_info.contains("最終閲覧"));
+        assert!(selection_info.contains("既読位置 12 / 120"));
+
+        app.settings.thumb_tooltip_show_reading_history_progress = false;
+        assert!(app.reading_history_selection_info_lines(0).is_none());
+        let tooltip = app.reading_history_tooltip_lines(0).unwrap().join("\n");
+        assert!(tooltip.contains("最終閲覧"));
+        assert!(tooltip.contains("既読位置 12 / 120"));
+    }
+
+    #[test]
+    fn reading_history_open_guard_removes_definitely_missing_item() {
+        use crate::app::{ReadingHistoryOpenPathStatus, reading_history_open_path_status};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        let path = app.tmp.path().join("missing.zip");
+        let key = crate::path_key::normalize_keep_drive(&path);
+
+        app.items_are_reading_history_view = true;
+        app.items = vec![GridItem::ZipFile(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.reading_history_rows.insert(
+            key.clone(),
+            crate::reading_history_db::ReadingHistoryEntry {
+                key,
+                path: path.clone(),
+                kind: crate::reading_history_db::ReadingHistoryKind::Zip,
+                archive_format: None,
+                title: "missing.zip".to_string(),
+                last_read_at_ms: 1,
+                last_page: Some(1),
+                page_count: Some(2),
+                file_size: None,
+                mtime_ms: None,
+            },
+        );
+
+        assert_eq!(
+            reading_history_open_path_status(&path),
+            ReadingHistoryOpenPathStatus::Missing
+        );
+        assert!(!app.guard_reading_history_open(0));
+        assert!(app.items.is_empty());
+        assert!(app.reading_history_rows.is_empty());
+        assert!(app.selected.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text.contains("ファイルが見つからない"))
+        );
     }
 
     #[test]

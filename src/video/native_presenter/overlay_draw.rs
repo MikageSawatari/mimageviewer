@@ -2104,6 +2104,8 @@ pub(super) fn draw_native_ring_picker_overlay(
                         let end = (start + visible_rows).min(picker.rows.len());
                         let mut first_row_rect = None;
                         let mut last_row_rect = None;
+                        let has_scrollbar = picker.rows.len() > visible_rows;
+                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
                         for (idx, row) in picker.rows.iter().enumerate().take(end).skip(start) {
                             let selected = idx == selected_row;
                             let (rect, _) = ui.allocate_exact_size(
@@ -2112,19 +2114,21 @@ pub(super) fn draw_native_ring_picker_overlay(
                             );
                             first_row_rect.get_or_insert(rect);
                             last_row_rect = Some(rect);
+                            let row_rect = egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(
+                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
+                                    rect.max.y,
+                                ),
+                            );
                             let fill = if selected {
                                 egui::Color32::from_rgb(56, 94, 138)
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
-                            ui.painter().rect_filled(rect, 5.0, fill);
-                            let label_pos = egui::pos2(rect.min.x + 10.0, rect.center().y);
-                            let value_right = if picker.rows.len() > visible_rows {
-                                rect.max.x - 24.0
-                            } else {
-                                rect.max.x - 10.0
-                            };
-                            let value_pos = egui::pos2(value_right, rect.center().y);
+                            ui.painter().rect_filled(row_rect, 5.0, fill);
+                            let label_pos = egui::pos2(row_rect.min.x + 10.0, row_rect.center().y);
+                            let value_pos = egui::pos2(row_rect.max.x - 10.0, row_rect.center().y);
                             ui.painter().text(
                                 label_pos,
                                 egui::Align2::LEFT_CENTER,

@@ -2540,6 +2540,7 @@ pub struct App {
     pub(crate) gamepad_state: crate::gamepad::GamepadInputState,
     pub(crate) ring_picker: Option<crate::ring_shortcut::RingPickerState>,
     pub(crate) gamepad_favorite_picker: Option<crate::ring_shortcut::GamepadFavoritePickerState>,
+    pub(crate) gamepad_location_picker: Option<crate::ring_shortcut::GamepadLocationPickerState>,
     pub(crate) gamepad_video_marker_picker:
         Option<crate::ring_shortcut::GamepadVideoMarkerPickerState>,
     pub(crate) tx: mpsc::Sender<ThumbMsg>,
@@ -5235,6 +5236,7 @@ impl App {
             gamepad_state: crate::gamepad::GamepadInputState::default(),
             ring_picker: None,
             gamepad_favorite_picker: None,
+            gamepad_location_picker: None,
             gamepad_video_marker_picker: None,
             tx,
             rx,
@@ -7009,6 +7011,71 @@ impl App {
             .then_some(crate::ui_main::AddressBarNav::ReadingHistory)
     }
 
+    /// 読書履歴ビューの項目を開く直前に、消えたコンテナへ入らないようにする。
+    ///
+    /// 表示直後に履歴全体を検査すると、外付けドライブやネットワークパスで UI が重くなったり、
+    /// 後から件数が変わって行がずれる体験になる。ここではユーザーが実際に開こうとした
+    /// 1 件だけを軽く確認し、確実に存在しない場合だけ現在のビューと DB から外す。
+    pub(crate) fn guard_reading_history_open(&mut self, idx: usize) -> bool {
+        if !self.items_are_reading_history_view {
+            return true;
+        }
+        let Some((path, key)) = self.items.get(idx).and_then(|item| {
+            let is_container = matches!(
+                item,
+                GridItem::Folder(_)
+                    | GridItem::ZipFile(_)
+                    | GridItem::PdfFile(_)
+                    | GridItem::ConvertibleArchive { .. }
+            );
+            is_container.then(|| {
+                (
+                    item.container_path().map(|p| p.to_path_buf()),
+                    reading_history_key_for_item(item),
+                )
+            })
+        }) else {
+            return true;
+        };
+        let Some(path) = path else {
+            return true;
+        };
+
+        match reading_history_open_path_status(&path) {
+            ReadingHistoryOpenPathStatus::Available => true,
+            ReadingHistoryOpenPathStatus::Missing => {
+                self.forget_missing_reading_history_entry(idx, key);
+                self.show_feedback_toast(
+                    "ファイルが見つからないため、読書履歴から削除しました".to_string(),
+                );
+                false
+            }
+            ReadingHistoryOpenPathStatus::Unavailable => {
+                self.show_feedback_toast(
+                    "ファイルにアクセスできません。外付けドライブが未接続の可能性があります"
+                        .to_string(),
+                );
+                false
+            }
+        }
+    }
+
+    fn forget_missing_reading_history_entry(&mut self, idx: usize, key: Option<String>) {
+        if let Some(key) = key {
+            self.reading_history_rows.remove(&key);
+            if let Some(writer) = &self.reading_history_writer {
+                writer.remove_keys(vec![key.clone()]);
+            } else if let Some(db) = self.reading_history_db.as_ref()
+                && let Err(e) = db.remove_key(&key)
+            {
+                crate::logger::log(format!("reading-history: remove missing failed: {e}"));
+            }
+        }
+        if idx < self.items.len() {
+            self.remove_items_batch(&[idx]);
+        }
+    }
+
     /// グリッドからコンテナを開いたときに、読書履歴ビューへの戻り先予約を更新する。
     ///
     /// - 読書履歴ビューで本 (コンテナ) を開いた → その本へ戻り先を焼き付ける。
@@ -7124,6 +7191,10 @@ impl App {
             }
             crate::ui_main::AddressBarNav::ReadingHistory => {
                 self.enter_reading_history();
+                true
+            }
+            crate::ui_main::AddressBarNav::BooksRoot => {
+                self.open_books_root();
                 true
             }
             crate::ui_main::AddressBarNav::HistoryBack
@@ -8050,6 +8121,7 @@ impl App {
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
         self.cancel_folder_pane_open();
+        self.gamepad_location_picker = None;
         // 読書履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
         self.reading_history_return_from = None;
 
@@ -10028,6 +10100,7 @@ impl App {
         crate::logger::log("=== enter_reading_history ===");
         // いま読書履歴ビューにいるので、戻り先予約は消費済み扱いにする。
         self.reading_history_return_from = None;
+        self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
             self.close_global_search();
@@ -10071,13 +10144,20 @@ impl App {
             }
         };
 
+        self.install_reading_history_entries(entries);
+    }
+
+    fn install_reading_history_entries(
+        &mut self,
+        entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
+    ) {
         let mut items: Vec<GridItem> = Vec::with_capacity(entries.len());
         let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(entries.len());
         let mut rows = std::collections::HashMap::with_capacity(entries.len());
-        for entry in entries {
-            image_metas.push(reading_history_meta_for_entry(&entry));
-            items.push(reading_history_grid_item(&entry));
-            rows.insert(entry.key.clone(), entry);
+        for entry in entries.iter() {
+            image_metas.push(reading_history_meta_for_entry(entry));
+            items.push(reading_history_grid_item(entry));
+            rows.insert(entry.key.clone(), entry.clone());
         }
 
         let pin_map_for_existing: std::collections::HashMap<
@@ -11733,6 +11813,7 @@ impl App {
         // 再設定するので、ここでクリアしても問題ない。階層内ナビ (enter/back) は
         // install_new_items の軽量経路を使い start_loading_items を通らない (= 維持)。
         self.zip_nav = None;
+        self.gamepad_location_picker = None;
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
         let preserve_archive_source_override = previous_archive_source_override.is_some()
@@ -17756,6 +17837,9 @@ impl App {
                 // 同じ挙動をグリッドからも使えるようにする)。
                 let shift_enter = !self.ime_input_active() && ctx.input(|i| i.modifiers.shift);
                 if let Some(idx) = self.selected {
+                    if !self.guard_reading_history_open(idx) {
+                        return None;
+                    }
                     // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
                     self.note_reading_history_open(idx);
                     match self.items.get(idx) {
@@ -25890,6 +25974,7 @@ impl App {
         }
         self.mouse_ring_flick = None;
         self.gamepad_favorite_picker = None;
+        self.gamepad_location_picker = None;
         self.gamepad_video_marker_picker = None;
         self.mouse_ring_grid_target_idx = None;
         self.mouse_ring_suppress_context_menu_once = false;
@@ -36476,6 +36561,10 @@ impl eframe::App for App {
                         self.enter_reading_history();
                         None
                     }
+                    crate::ui_main::AddressBarNav::BooksRoot => {
+                        self.open_books_root();
+                        None
+                    }
                     crate::ui_main::AddressBarNav::HistoryBack => {
                         let snapshot = self.folder_nav_history_snapshot();
                         let target = self.navigate_folder_history_back();
@@ -37139,6 +37228,55 @@ fn use_full_path_cache_keys_for_folder(path: &std::path::Path) -> bool {
 /// 通常の basename キー・コンテナキー (`folderthumb:` 等) と自然に区別される。
 fn image_full_path_cache_key(path: &std::path::Path) -> String {
     format!("imgthumb:{}", path.to_string_lossy())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadingHistoryOpenPathStatus {
+    Available,
+    Missing,
+    Unavailable,
+}
+
+pub(crate) fn reading_history_open_path_status(
+    path: &std::path::Path,
+) -> ReadingHistoryOpenPathStatus {
+    match path.try_exists() {
+        Ok(true) => ReadingHistoryOpenPathStatus::Available,
+        Ok(false) if reading_history_storage_root_available(path) => {
+            ReadingHistoryOpenPathStatus::Missing
+        }
+        Ok(false) | Err(_) => ReadingHistoryOpenPathStatus::Unavailable,
+    }
+}
+
+#[cfg(windows)]
+fn reading_history_storage_root_available(path: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return true;
+    };
+    match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            let drive = format!("{}:\\", char::from(letter));
+            std::path::Path::new(&drive).try_exists().unwrap_or(false)
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            let root = std::path::PathBuf::from(format!(
+                r"\\{}\{}",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ));
+            root.try_exists().unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn reading_history_storage_root_available(_path: &std::path::Path) -> bool {
+    true
 }
 
 fn reading_history_grid_item(entry: &crate::reading_history_db::ReadingHistoryEntry) -> GridItem {

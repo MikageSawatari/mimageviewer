@@ -8,7 +8,8 @@ use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
 use crate::grid_item::GridItem;
 use crate::ring_shortcut::{
-    GamepadFavoritePickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
+    GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
+    GamepadLocationPickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
     MOUSE_FLICK_NEUTRAL_RADIUS_PX, MouseFlickOutcome, MouseFlickState, PickerListMode,
     PickerListState, RingActionId, RingDirection, RingPickerAnchor, RingPickerOriginalState,
     RingPickerRowId, RingPickerState, RingShortcutContext, mouse_flick_guide_delay,
@@ -642,6 +643,8 @@ impl App {
                         ui.add_space(6.0);
                         let mut first_row_rect = None;
                         let mut last_row_rect = None;
+                        let has_scrollbar = self.settings.favorites.len() > visible_rows;
+                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
                         for idx in start..end {
                             let fav = &self.settings.favorites[idx];
                             let is_selected = idx == selected;
@@ -651,8 +654,15 @@ impl App {
                             );
                             first_row_rect.get_or_insert(rect);
                             last_row_rect = Some(rect);
+                            let row_rect = egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(
+                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
+                                    rect.max.y,
+                                ),
+                            );
                             ui.painter().rect_filled(
-                                rect,
+                                row_rect,
                                 5.0,
                                 if is_selected {
                                     egui::Color32::from_rgb(56, 94, 138)
@@ -661,7 +671,7 @@ impl App {
                                 },
                             );
                             ui.painter().text(
-                                egui::pos2(rect.min.x + 10.0, rect.center().y),
+                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 truncate_ring_overlay_label(&fav.name, 22),
                                 egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
@@ -671,13 +681,9 @@ impl App {
                                     220
                                 }),
                             );
-                            let value_right = if self.settings.favorites.len() > visible_rows {
-                                rect.max.x - 24.0
-                            } else {
-                                rect.max.x - 10.0
-                            };
+                            let value_right = row_rect.max.x - 10.0;
                             ui.painter().text(
-                                egui::pos2(value_right, rect.center().y),
+                                egui::pos2(value_right, row_rect.center().y),
                                 egui::Align2::RIGHT_CENTER,
                                 truncate_ring_overlay_label(&fav.path.display().to_string(), 34),
                                 egui::FontId::proportional(12.5),
@@ -760,6 +766,8 @@ impl App {
                         ui.add_space(6.0);
                         let mut first_row_rect = None;
                         let mut last_row_rect = None;
+                        let has_scrollbar = markers.len() > visible_rows;
+                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
                         for idx in start..end {
                             let marker = &markers[idx];
                             let is_selected = idx == selected;
@@ -769,8 +777,15 @@ impl App {
                             );
                             first_row_rect.get_or_insert(rect);
                             last_row_rect = Some(rect);
+                            let row_rect = egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(
+                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
+                                    rect.max.y,
+                                ),
+                            );
                             ui.painter().rect_filled(
-                                rect,
+                                row_rect,
                                 5.0,
                                 if is_selected {
                                     egui::Color32::from_rgb(56, 94, 138)
@@ -779,7 +794,7 @@ impl App {
                                 },
                             );
                             ui.painter().text(
-                                egui::pos2(rect.min.x + 10.0, rect.center().y),
+                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 video_marker_primary_label(marker),
                                 egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
@@ -789,13 +804,8 @@ impl App {
                                     220
                                 }),
                             );
-                            let value_right = if markers.len() > visible_rows {
-                                rect.max.x - 24.0
-                            } else {
-                                rect.max.x - 10.0
-                            };
                             ui.painter().text(
-                                egui::pos2(value_right, rect.center().y),
+                                egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
                                 egui::Align2::RIGHT_CENTER,
                                 truncate_ring_overlay_label(
                                     &video_marker_secondary_label(marker),
@@ -814,6 +824,118 @@ impl App {
                                 ui.painter(),
                                 egui::Rect::from_min_max(first.min, last.max),
                                 markers.len(),
+                                visible_rows,
+                                start,
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("上下:選択  A:移動  B/Select:閉じる")
+                                .size(12.0)
+                                .color(egui::Color32::from_white_alpha(190)),
+                        );
+                    });
+            });
+    }
+
+    pub(crate) fn draw_gamepad_location_picker_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+    ) {
+        let Some(picker) = self.gamepad_location_picker.as_ref() else {
+            return;
+        };
+        let painter = ui.painter();
+        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
+
+        let row_h = 34.0;
+        let visible_rows = picker.entries.len().min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
+        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
+        let panel_h = 92.0 + row_h * visible_rows as f32;
+        let panel_rect =
+            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+        let selected = picker.selected.min(picker.entries.len().saturating_sub(1));
+        let start = picker
+            .scroll_top
+            .min(picker.entries.len().saturating_sub(visible_rows));
+        let end = (start + visible_rows).min(picker.entries.len());
+
+        egui::Area::new(egui::Id::new("gamepad_location_picker_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(panel_rect.min)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_size(panel_rect.size());
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(224))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(panel_w - 28.0);
+                        ui.label(
+                            egui::RichText::new("場所")
+                                .size(17.0)
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        let mut first_row_rect = None;
+                        let mut last_row_rect = None;
+                        let has_scrollbar = picker.entries.len() > visible_rows;
+                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
+                        for idx in start..end {
+                            let entry = &picker.entries[idx];
+                            let is_selected = idx == selected;
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_h),
+                                egui::Sense::hover(),
+                            );
+                            first_row_rect.get_or_insert(rect);
+                            last_row_rect = Some(rect);
+                            let row_rect = egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(
+                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
+                                    rect.max.y,
+                                ),
+                            );
+                            ui.painter().rect_filled(
+                                row_rect,
+                                5.0,
+                                if is_selected {
+                                    egui::Color32::from_rgb(56, 94, 138)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                },
+                            );
+                            ui.painter().text(
+                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                truncate_ring_overlay_label(&entry.label, 22),
+                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                                egui::Color32::from_white_alpha(if is_selected {
+                                    255
+                                } else {
+                                    220
+                                }),
+                            );
+                            ui.painter().text(
+                                egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                truncate_ring_overlay_label(&entry.value, 34),
+                                egui::FontId::proportional(12.5),
+                                egui::Color32::from_white_alpha(if is_selected {
+                                    235
+                                } else {
+                                    180
+                                }),
+                            );
+                        }
+                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                            draw_picker_scrollbar(
+                                ui.painter(),
+                                egui::Rect::from_min_max(first.min, last.max),
+                                picker.entries.len(),
                                 visible_rows,
                                 start,
                             );
@@ -1069,6 +1191,7 @@ impl App {
             || self.gamepad_state.button_down(PadButton::West)
             || self.ring_picker.is_some()
             || self.gamepad_favorite_picker.is_some()
+            || self.gamepad_location_picker.is_some()
             || self.gamepad_video_marker_picker.is_some()
     }
 
@@ -1092,6 +1215,9 @@ impl App {
         }
         if self.gamepad_favorite_picker.is_some() {
             return self.dispatch_gamepad_favorite_picker_button(ctx, action);
+        }
+        if self.gamepad_location_picker.is_some() {
+            return self.dispatch_gamepad_location_picker_button(ctx, action);
         }
         if self.ring_picker.is_some() {
             self.dispatch_gamepad_picker_button(ctx, action);
@@ -1155,8 +1281,7 @@ impl App {
                         None
                     }
                     PadButton::Select if action.kind == PadActionKind::Press => {
-                        self.handle_gamepad_select(ctx);
-                        None
+                        self.handle_gamepad_select(ctx)
                     }
                     PadButton::Start if action.kind == PadActionKind::Press => {
                         self.handle_gamepad_start(ctx)
@@ -1192,6 +1317,9 @@ impl App {
         }
         if self.gamepad_favorite_picker.is_some() {
             return self.dispatch_gamepad_favorite_picker_analog(ctx, now);
+        }
+        if self.gamepad_location_picker.is_some() {
+            return self.dispatch_gamepad_location_picker_analog(ctx, now);
         }
         if self.ring_picker.is_some() {
             return self.dispatch_gamepad_picker_analog(ctx, now);
@@ -1434,6 +1562,7 @@ impl App {
         let mut picker = self.build_ring_picker_state(context);
         picker.clamp_row(picker_rows_for_context(context).len());
         self.gamepad_favorite_picker = None;
+        self.gamepad_location_picker = None;
         self.gamepad_video_marker_picker = None;
         self.ring_picker = Some(picker);
         self.clear_native_video_ring_guide_overlay(ctx);
@@ -1834,6 +1963,104 @@ impl App {
         );
         ctx.request_repaint();
         Some(AddressBarNav::Direct(target))
+    }
+
+    fn dispatch_gamepad_location_picker_button(
+        &mut self,
+        ctx: &egui::Context,
+        action: PadAction,
+    ) -> Option<AddressBarNav> {
+        match action.kind {
+            PadActionKind::Release => None,
+            PadActionKind::Press | PadActionKind::Repeat => {
+                if let Some(dir) = button_dir(action.button) {
+                    if matches!(dir, PadDir::Up | PadDir::Down) {
+                        self.move_gamepad_location_picker(ctx, dir);
+                    }
+                    return None;
+                }
+                match action.button {
+                    PadButton::South if action.kind == PadActionKind::Press => {
+                        self.confirm_gamepad_location_picker(ctx)
+                    }
+                    PadButton::East | PadButton::Select if action.kind == PadActionKind::Press => {
+                        self.gamepad_location_picker = None;
+                        self.gamepad_state.require_directional_neutral();
+                        ctx.request_repaint();
+                        None
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn dispatch_gamepad_location_picker_analog(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+    ) -> bool {
+        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick_dir = dominant_stick_dir(stick);
+        let active = stick_dir.is_some();
+        let due = self
+            .gamepad_state
+            .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
+        if due && let Some(dir @ (PadDir::Up | PadDir::Down)) = stick_dir {
+            self.move_gamepad_location_picker(ctx, dir);
+        }
+        active
+    }
+
+    fn move_gamepad_location_picker(&mut self, ctx: &egui::Context, dir: PadDir) {
+        let Some(picker) = self.gamepad_location_picker.as_mut() else {
+            return;
+        };
+        let len = picker.entries.len();
+        if len == 0 {
+            self.gamepad_location_picker = None;
+            self.gamepad_state.require_directional_neutral();
+            ctx.request_repaint();
+            return;
+        }
+        let delta = if dir == PadDir::Down { 1 } else { -1 };
+        picker.selected = cycle_index(len, picker.selected, delta);
+        update_location_picker_scroll(picker);
+        ctx.request_repaint();
+    }
+
+    fn confirm_gamepad_location_picker(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+        let selected = self
+            .gamepad_location_picker
+            .as_ref()
+            .map(|picker| picker.selected)
+            .unwrap_or(0);
+        let nav = self
+            .gamepad_location_picker
+            .as_ref()
+            .and_then(|picker| picker.entries.get(selected))
+            .map(|entry| entry.nav.clone());
+        self.gamepad_location_picker = None;
+        self.gamepad_state.require_directional_neutral();
+        ctx.request_repaint();
+
+        let Some(nav) = nav else {
+            return None;
+        };
+        let nav = match nav {
+            GamepadLocationNav::DriveList => AddressBarNav::DriveList(None),
+            GamepadLocationNav::ReadingHistory => AddressBarNav::ReadingHistory,
+            GamepadLocationNav::BooksRoot => AddressBarNav::BooksRoot,
+            GamepadLocationNav::Direct(path) => {
+                let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
+                    self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
+                    return None;
+                };
+                AddressBarNav::Direct(resolved)
+            }
+        };
+        self.bump_input_seq("gamepad_location_nav", Some(&format!("{nav:?}")));
+        Some(nav)
     }
 
     fn ring_picker_is_stale(&self) -> bool {
@@ -3521,13 +3748,14 @@ impl App {
         let _ = ctx;
     }
 
-    fn handle_gamepad_select(&mut self, ctx: &egui::Context) {
+    fn handle_gamepad_select(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         let Some(fs_idx) = self.fullscreen_idx else {
-            return;
+            self.open_gamepad_location_picker(ctx);
+            return None;
         };
         if self.current_fullscreen_is_video(fs_idx) {
             self.open_gamepad_video_marker_picker(ctx, fs_idx);
-            return;
+            return None;
         }
         // 見開きモード (キーボードのショートカット 1〜5) を巡回トグルする。
         // Single → Ltr → LtrCover → Rtl → RtlCover → Single … の順。
@@ -3535,11 +3763,12 @@ impl App {
         // 対応アイテム (画像/ZIP画像/PDFページ) のときだけ。動画/非対応アイテム上で
         // 切り替えると、見えないモードがフォルダに永続化されてナビや各モードキーが壊れる。
         if !self.vertical_reading_supported_idx(fs_idx) {
-            return;
+            return None;
         }
         let next = self.spread_mode.next_in_spread_cycle();
         self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
         self.show_feedback_toast(format!("[Pad:{}]", next.label()));
+        None
     }
 
     fn handle_gamepad_y_tap(&mut self, ctx: &egui::Context) {
@@ -3778,6 +4007,7 @@ impl App {
         };
         update_favorite_picker_scroll(&mut picker, self.settings.favorites.len());
         self.ring_picker = None;
+        self.gamepad_location_picker = None;
         self.gamepad_video_marker_picker = None;
         self.gamepad_favorite_picker = Some(picker);
         ctx.request_repaint();
@@ -3806,9 +4036,94 @@ impl App {
         update_video_marker_picker_scroll(&mut picker, markers.len());
         self.ring_picker = None;
         self.gamepad_favorite_picker = None;
+        self.gamepad_location_picker = None;
         self.gamepad_video_marker_picker = Some(picker);
         ctx.request_repaint();
         self.sync_native_video_marker_picker_overlay(ctx);
+    }
+
+    fn open_gamepad_location_picker(&mut self, ctx: &egui::Context) {
+        if self.is_snapshot_active() {
+            self.show_feedback_toast(
+                "スナップショット中は他のフォルダに移動できません".to_string(),
+            );
+            return;
+        }
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            self.show_feedback_toast("検索中は場所リストを開けません".to_string());
+            return;
+        }
+        let entries = self.build_gamepad_location_entries();
+        if entries.is_empty() {
+            self.show_feedback_toast("移動できる場所がありません".to_string());
+            return;
+        }
+        let selected = self.current_gamepad_location_index(&entries).unwrap_or(0);
+        let mut picker = GamepadLocationPickerState {
+            selected,
+            scroll_top: selected.saturating_sub(5),
+            entries,
+        };
+        update_location_picker_scroll(&mut picker);
+        self.ring_picker = None;
+        self.gamepad_favorite_picker = None;
+        self.gamepad_video_marker_picker = None;
+        self.gamepad_location_picker = Some(picker);
+        ctx.request_repaint();
+    }
+
+    fn build_gamepad_location_entries(&self) -> Vec<GamepadLocationEntry> {
+        let book_root = self.book_root_path();
+        let mut entries = vec![
+            GamepadLocationEntry {
+                label: "ドライブ一覧".to_string(),
+                value: "接続ドライブ".to_string(),
+                nav: GamepadLocationNav::DriveList,
+            },
+            GamepadLocationEntry {
+                label: "読書履歴".to_string(),
+                value: "最近読んだ本".to_string(),
+                nav: GamepadLocationNav::ReadingHistory,
+            },
+            GamepadLocationEntry {
+                label: "本棚フォルダ".to_string(),
+                value: book_root.display().to_string(),
+                nav: GamepadLocationNav::BooksRoot,
+            },
+        ];
+
+        for location in crate::known_folders::quick_locations() {
+            let value = location.path.display().to_string();
+            entries.push(GamepadLocationEntry {
+                label: location.label.to_string(),
+                value,
+                nav: GamepadLocationNav::Direct(location.path),
+            });
+        }
+        for drive in crate::known_folders::available_drives() {
+            let label = drive.display().to_string();
+            entries.push(GamepadLocationEntry {
+                label: label.clone(),
+                value: "ドライブ".to_string(),
+                nav: GamepadLocationNav::Direct(drive),
+            });
+        }
+        entries
+    }
+
+    fn current_gamepad_location_index(&self, entries: &[GamepadLocationEntry]) -> Option<usize> {
+        let effective_folder = self.effective_folder();
+        let book_root = self.book_root_path();
+        entries.iter().position(|entry| match &entry.nav {
+            GamepadLocationNav::DriveList => self.items_are_drive_list,
+            GamepadLocationNav::ReadingHistory => self.items_are_reading_history_view,
+            GamepadLocationNav::BooksRoot => effective_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &book_root)),
+            GamepadLocationNav::Direct(path) => effective_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, path)),
+        })
     }
 
     fn current_gamepad_favorite_index(&self) -> Option<usize> {
@@ -3879,6 +4194,11 @@ impl App {
             return None;
         }
         let idx = self.selected?;
+        if !self.guard_reading_history_open(idx) {
+            return None;
+        }
+        // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
+        self.note_reading_history_open(idx);
         let item = self.items.get(idx).cloned();
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
@@ -4520,6 +4840,23 @@ fn update_favorite_picker_scroll(picker: &mut GamepadFavoritePickerState, len: u
 }
 
 fn update_video_marker_picker_scroll(picker: &mut GamepadVideoMarkerPickerState, len: usize) {
+    if len == 0 {
+        picker.selected = 0;
+        picker.scroll_top = 0;
+        return;
+    }
+    let visible = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
+    picker.selected = picker.selected.min(len - 1);
+    if picker.selected < picker.scroll_top {
+        picker.scroll_top = picker.selected;
+    } else if picker.selected >= picker.scroll_top + visible {
+        picker.scroll_top = picker.selected + 1 - visible;
+    }
+    picker.scroll_top = picker.scroll_top.min(len.saturating_sub(visible));
+}
+
+fn update_location_picker_scroll(picker: &mut GamepadLocationPickerState) {
+    let len = picker.entries.len();
     if len == 0 {
         picker.selected = 0;
         picker.scroll_top = 0;

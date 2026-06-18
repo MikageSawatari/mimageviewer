@@ -209,6 +209,19 @@ impl ReadingHistoryDb {
         Ok(())
     }
 
+    pub fn remove_keys(&self, keys: &[String]) -> Result<usize, rusqlite::Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed = 0usize;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM reading_history WHERE key = ?1")?;
+            for key in keys {
+                removed += stmt.execute([key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
         self.conn.execute("DELETE FROM reading_history", [])
     }
@@ -241,6 +254,7 @@ pub struct ReadingHistoryWriter {
 
 enum ReadingHistoryCommand {
     Upsert(ReadingHistoryEntry, usize),
+    RemoveKeys(Vec<String>),
     Prune(usize),
 }
 
@@ -260,6 +274,9 @@ impl ReadingHistoryWriter {
                 while let Ok(command) = rx.recv() {
                     let result = match command {
                         ReadingHistoryCommand::Upsert(entry, limit) => db.upsert(entry, limit),
+                        ReadingHistoryCommand::RemoveKeys(keys) => {
+                            db.remove_keys(&keys).map(|_| ())
+                        }
                         ReadingHistoryCommand::Prune(limit) => db.prune(limit).map(|_| ()),
                     };
                     if let Err(e) = result {
@@ -288,6 +305,15 @@ impl ReadingHistoryWriter {
     pub fn prune(&self, limit: usize) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(ReadingHistoryCommand::Prune(limit));
+        }
+    }
+
+    pub fn remove_keys(&self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(ReadingHistoryCommand::RemoveKeys(keys));
         }
     }
 }
@@ -423,6 +449,12 @@ mod tests {
 
         db.remove_key(&a.key).unwrap();
         assert_eq!(db.count(), 1);
+        let removed = db
+            .remove_keys(&[b.key.clone(), "missing".to_string()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(db.count(), 0);
+        db.upsert(b.clone(), 1000).unwrap();
         assert_eq!(db.clear_all().unwrap(), 1);
         assert_eq!(db.count(), 0);
     }
