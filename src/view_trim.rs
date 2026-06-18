@@ -219,6 +219,8 @@ pub struct ViewTrimPageOverride {
     pub enabled: bool,
     #[serde(default)]
     pub margins: ViewTrimMargins,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_side: Option<ViewTrimSpreadSide>,
 }
 
 impl ViewTrimPageOverride {
@@ -226,12 +228,49 @@ impl ViewTrimPageOverride {
         Self {
             enabled: true,
             margins: margins.clamped(),
+            spread_side: None,
+        }
+    }
+
+    pub fn from_spread_margins(margins: ViewTrimMargins, side: ViewTrimSpreadSide) -> Self {
+        Self {
+            enabled: true,
+            margins: margins.clamped(),
+            spread_side: Some(side),
         }
     }
 
     pub fn bbox(self) -> Option<egui::Rect> {
         self.enabled.then_some(())?;
         self.margins.bbox()
+    }
+
+    pub fn margins_for_spread_side(self, side: ViewTrimSpreadSide) -> ViewTrimMargins {
+        let margins = self.margins.clamped();
+        match self.spread_side {
+            Some(authored_side) if authored_side != side => ViewTrimMargins {
+                left: margins.right,
+                top: margins.top,
+                right: margins.left,
+                bottom: margins.bottom,
+            }
+            .clamped(),
+            _ => margins,
+        }
+    }
+
+    pub fn for_spread_side(self, side: ViewTrimSpreadSide) -> Self {
+        let side_semantic = self.spread_side.is_some();
+        Self {
+            enabled: self.enabled,
+            margins: self.margins_for_spread_side(side),
+            spread_side: side_semantic.then_some(side),
+        }
+    }
+
+    pub fn spread_bbox(self, side: ViewTrimSpreadSide) -> Option<egui::Rect> {
+        self.enabled.then_some(())?;
+        self.margins_for_spread_side(side).bbox()
     }
 }
 
@@ -393,6 +432,46 @@ mod tests {
         assert!((right_m.right - 0.02).abs() < 1e-6);
         assert!(right_m.top <= 1e-6);
         assert!(right_m.bottom <= 1e-6);
+    }
+
+    #[test]
+    fn page_override_authored_for_spread_side_preserves_inner_outer_when_side_flips() {
+        let override_left = ViewTrimPageOverride::from_spread_margins(
+            ViewTrimMargins {
+                left: 0.03,
+                top: 0.01,
+                right: 0.08,
+                bottom: 0.02,
+            },
+            ViewTrimSpreadSide::Left,
+        );
+
+        let as_left = override_left.margins_for_spread_side(ViewTrimSpreadSide::Left);
+        let as_right = override_left.margins_for_spread_side(ViewTrimSpreadSide::Right);
+
+        assert_eq!(as_left.left, 0.03);
+        assert_eq!(as_left.right, 0.08);
+        assert_eq!(as_right.left, 0.08);
+        assert_eq!(as_right.right, 0.03);
+        assert_eq!(as_right.top, 0.01);
+        assert_eq!(as_right.bottom, 0.02);
+    }
+
+    #[test]
+    fn page_override_without_spread_side_stays_in_image_coordinates() {
+        let override_image = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.03,
+            top: 0.01,
+            right: 0.08,
+            bottom: 0.02,
+        });
+
+        let as_right = override_image.margins_for_spread_side(ViewTrimSpreadSide::Right);
+
+        assert_eq!(as_right.left, 0.03);
+        assert_eq!(as_right.right, 0.08);
+        assert_eq!(as_right.top, 0.01);
+        assert_eq!(as_right.bottom, 0.02);
     }
 
     #[test]

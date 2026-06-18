@@ -4401,6 +4401,8 @@ impl App {
                             {
                                 self.view_trim_mode = false;
                                 self.view_trim_page_apply_root_idx = None;
+                                self.view_trim_page_spread_separate =
+                                    self.view_trim_book_settings.spread_separate;
                             }
                             let view_trim_active =
                                 self.view_trim_active_for_display(fs_idx, spread_pair);
@@ -8628,6 +8630,7 @@ impl App {
         self.adjustment_mode = false;
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         if self.erase_mode {
             self.reset_erase_mode();
         }

@@ -38,6 +38,21 @@ fn linked_from_detected(
     (!linked.is_zero()).then_some(linked)
 }
 
+fn page_override_from_display_bbox(bbox: Option<egui::Rect>) -> ViewTrimPageOverride {
+    ViewTrimPageOverride::from_margins(bbox.map(ViewTrimMargins::from_bbox).unwrap_or_default())
+}
+
+fn page_overrides_from_auto_spread_bboxes(
+    left: Option<egui::Rect>,
+    right: Option<egui::Rect>,
+) -> (ViewTrimPageOverride, ViewTrimPageOverride) {
+    let (left, right) = crate::view_trim::harmonize_spread_auto_bboxes(left, right);
+    (
+        page_override_from_display_bbox(left),
+        page_override_from_display_bbox(right),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +85,8 @@ mod tests {
         assert_close(right.margins.right, 0.03);
         assert_close(left.margins.top, 0.01);
         assert_close(right.margins.bottom, 0.02);
+        assert_eq!(left.spread_side, Some(ViewTrimSpreadSide::Left));
+        assert_eq!(right.spread_side, Some(ViewTrimSpreadSide::Right));
     }
 
     #[test]
@@ -97,6 +114,35 @@ mod tests {
         assert_close(right.margins.top, 0.05);
         assert_close(left.margins.bottom, 0.12);
         assert_close(right.margins.bottom, 0.12);
+        assert_eq!(left.spread_side, Some(ViewTrimSpreadSide::Left));
+        assert_eq!(right.spread_side, Some(ViewTrimSpreadSide::Right));
+    }
+
+    #[test]
+    fn page_switch_to_separate_clears_spread_side_semantics() {
+        let mut left = ViewTrimPageOverride::from_spread_margins(
+            ViewTrimMargins {
+                left: 0.02,
+                top: 0.04,
+                right: 0.08,
+                bottom: 0.10,
+            },
+            ViewTrimSpreadSide::Left,
+        );
+        let mut right = ViewTrimPageOverride::from_spread_margins(
+            ViewTrimMargins {
+                left: 0.12,
+                top: 0.06,
+                right: 0.16,
+                bottom: 0.14,
+            },
+            ViewTrimSpreadSide::Right,
+        );
+
+        set_page_spread_separate(&mut left, &mut right, true);
+
+        assert_eq!(left.spread_side, None);
+        assert_eq!(right.spread_side, None);
     }
 
     #[test]
@@ -137,6 +183,26 @@ mod tests {
 
         assert!(linked.is_none());
     }
+
+    #[test]
+    fn page_apply_seed_from_auto_spread_freezes_displayed_auto_trim() {
+        let left_bbox = egui::Rect::from_min_max(egui::pos2(0.02, 0.12), egui::pos2(0.92, 0.93));
+        let right_bbox = egui::Rect::from_min_max(egui::pos2(0.06, 0.03), egui::pos2(0.98, 0.84));
+
+        let (left, right) =
+            page_overrides_from_auto_spread_bboxes(Some(left_bbox), Some(right_bbox));
+
+        assert!(left.enabled);
+        assert!(right.enabled);
+        assert_close(left.margins.left, 0.02);
+        assert_close(left.margins.right, 0.08);
+        assert_close(right.margins.left, 0.06);
+        assert_close(right.margins.right, 0.02);
+        assert_close(left.margins.top, 0.03);
+        assert_close(right.margins.top, 0.03);
+        assert_close(left.margins.bottom, 0.07);
+        assert_close(right.margins.bottom, 0.07);
+    }
 }
 
 fn set_book_spread_separate(book: &mut ViewTrimBookSettings, separate: bool) {
@@ -159,11 +225,20 @@ fn set_page_spread_separate(
     right: &mut ViewTrimPageOverride,
     separate: bool,
 ) {
-    if !separate {
+    if separate {
+        left.spread_side = None;
+        right.spread_side = None;
+    } else {
         let linked = ViewTrimLinkedMargins::average_from_separate(left.margins, right.margins);
         let enabled = left.enabled || right.enabled;
-        left.margins = linked.margins_for(ViewTrimSpreadSide::Left);
-        right.margins = linked.margins_for(ViewTrimSpreadSide::Right);
+        *left = ViewTrimPageOverride::from_spread_margins(
+            linked.margins_for(ViewTrimSpreadSide::Left),
+            ViewTrimSpreadSide::Left,
+        );
+        *right = ViewTrimPageOverride::from_spread_margins(
+            linked.margins_for(ViewTrimSpreadSide::Right),
+            ViewTrimSpreadSide::Right,
+        );
         left.enabled = enabled;
         right.enabled = enabled;
     }
@@ -174,10 +249,14 @@ fn set_page_spread_linked_margins(
     right: &mut ViewTrimPageOverride,
     linked: ViewTrimLinkedMargins,
 ) {
-    left.margins = linked.margins_for(ViewTrimSpreadSide::Left);
-    right.margins = linked.margins_for(ViewTrimSpreadSide::Right);
-    left.enabled = true;
-    right.enabled = true;
+    *left = ViewTrimPageOverride::from_spread_margins(
+        linked.margins_for(ViewTrimSpreadSide::Left),
+        ViewTrimSpreadSide::Left,
+    );
+    *right = ViewTrimPageOverride::from_spread_margins(
+        linked.margins_for(ViewTrimSpreadSide::Right),
+        ViewTrimSpreadSide::Right,
+    );
 }
 
 fn margin_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) -> bool {
@@ -275,6 +354,7 @@ impl App {
             && self.view_trim_page_apply_root_idx != self.fullscreen_idx
         {
             self.view_trim_page_apply_root_idx = None;
+            self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
     }
 
@@ -309,7 +389,7 @@ impl App {
                 .view_trim_page_overrides
                 .get(&idx)
                 .copied()
-                .and_then(ViewTrimPageOverride::bbox),
+                .and_then(|p| p.spread_bbox(side)),
             ViewTrimApplyMode::None | ViewTrimApplyMode::Auto => None,
         }
     }
@@ -387,7 +467,7 @@ impl App {
     ) -> ViewTrimMargins {
         self.view_trim_page_overrides
             .get(&idx)
-            .map(|p| p.margins)
+            .map(|p| p.margins_for_spread_side(side))
             .unwrap_or_else(|| {
                 if self.view_trim_book_settings.spread_separate {
                     match side {
@@ -438,10 +518,23 @@ impl App {
                     || self.view_trim_page_overrides.contains_key(&right)
             }
         };
+        let page_single_has_override = self.view_trim_page_overrides.contains_key(&fs_idx);
+        let (page_left_has_override, page_right_has_override) = match spread_pair {
+            SpreadPair::Double { left, right } => (
+                self.view_trim_page_overrides.contains_key(&left),
+                self.view_trim_page_overrides.contains_key(&right),
+            ),
+            SpreadPair::Single => (page_single_has_override, page_single_has_override),
+        };
 
         let mut base_apply_mode = self.effective_view_trim_base_apply_mode();
         let mut base_mode_changed = false;
         let mut page_apply = self.view_trim_page_apply_active_for_current_root();
+        let mut page_spread_separate = if page_apply {
+            self.view_trim_page_spread_separate
+        } else {
+            self.view_trim_book_settings.spread_separate
+        };
         let mut page_apply_changed = false;
         let mut apply_mode = if page_apply {
             ViewTrimApplyMode::Page
@@ -459,6 +552,7 @@ impl App {
                 .view_trim_page_overrides
                 .get(&left)
                 .copied()
+                .map(|p| p.for_spread_side(ViewTrimSpreadSide::Left))
                 .unwrap_or_else(|| {
                     ViewTrimPageOverride::from_margins(
                         self.view_trim_spread_margins_for_ui(left, ViewTrimSpreadSide::Left),
@@ -471,6 +565,7 @@ impl App {
                 .view_trim_page_overrides
                 .get(&right)
                 .copied()
+                .map(|p| p.for_spread_side(ViewTrimSpreadSide::Right))
                 .unwrap_or_else(|| {
                     ViewTrimPageOverride::from_margins(
                         self.view_trim_spread_margins_for_ui(right, ViewTrimSpreadSide::Right),
@@ -568,21 +663,21 @@ impl App {
                     }
                     ViewTrimApplyMode::Page => {
                         if is_spread {
-                            let mut spread_separate = book.spread_separate;
+                            let mut spread_separate = page_spread_separate;
                             if ui
                                 .checkbox(&mut spread_separate, "見開きの左右を別々に調整")
                                 .changed()
                             {
-                                set_book_spread_separate(&mut book, spread_separate);
                                 set_page_spread_separate(
                                     &mut page_left,
                                     &mut page_right,
                                     spread_separate,
                                 );
+                                page_spread_separate = spread_separate;
                                 changed = true;
                             }
                             ui.add_space(4.0);
-                            if book.spread_separate {
+                            if page_spread_separate {
                                 page_left.enabled = true;
                                 let left_changed =
                                     margins_controls(ui, "左ページ", &mut page_left.margins);
@@ -660,12 +755,36 @@ impl App {
         if page_apply_changed {
             if page_apply {
                 self.view_trim_page_apply_root_idx = Some(fs_idx);
+                if matches!(base_apply_mode, ViewTrimApplyMode::Auto) {
+                    match spread_pair {
+                        SpreadPair::Single => {
+                            if !page_single_has_override {
+                                page_single = page_override_from_display_bbox(
+                                    self.cached_margin_bbox(fs_idx),
+                                );
+                            }
+                        }
+                        SpreadPair::Double { left, right } => {
+                            let left_bbox = self.cached_margin_bbox(left);
+                            let right_bbox = self.cached_margin_bbox(right);
+                            let (auto_left, auto_right) =
+                                page_overrides_from_auto_spread_bboxes(left_bbox, right_bbox);
+                            if !page_left_has_override {
+                                page_left = auto_left;
+                            }
+                            if !page_right_has_override {
+                                page_right = auto_right;
+                            }
+                        }
+                    }
+                }
                 page_single.enabled = true;
                 page_left.enabled = true;
                 page_right.enabled = true;
                 changed = true;
             } else {
                 self.view_trim_page_apply_root_idx = None;
+                page_spread_separate = book.spread_separate;
             }
             apply_mode = if page_apply {
                 ViewTrimApplyMode::Page
@@ -722,7 +841,7 @@ impl App {
                     let left_m = self.auto_detect_view_trim_margins(left);
                     let right_m = self.auto_detect_view_trim_margins(right);
                     let mut detected = false;
-                    if book.spread_separate {
+                    if page_spread_separate {
                         if let Some(m) = left_m {
                             page_left = ViewTrimPageOverride::from_margins(m);
                             detected = true;
@@ -795,11 +914,17 @@ impl App {
             }
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_apply_mode = base_apply_mode;
+            self.view_trim_page_spread_separate = book.spread_separate;
             self.view_trim_book_settings = book;
             changed = true;
             repaint_requested = true;
         } else {
             self.view_trim_apply_mode = base_apply_mode;
+            self.view_trim_page_spread_separate = if page_apply {
+                page_spread_separate
+            } else {
+                book.spread_separate
+            };
             self.view_trim_book_settings = book;
             if page_apply
                 && (changed
@@ -817,8 +942,14 @@ impl App {
                     SpreadPair::Double { left, right } => {
                         page_left.enabled = true;
                         page_right.enabled = true;
-                        self.view_trim_page_overrides.insert(left, page_left);
-                        self.view_trim_page_overrides.insert(right, page_right);
+                        let mut stored_left = page_left;
+                        let mut stored_right = page_right;
+                        if page_spread_separate {
+                            stored_left.spread_side = None;
+                            stored_right.spread_side = None;
+                        }
+                        self.view_trim_page_overrides.insert(left, stored_left);
+                        self.view_trim_page_overrides.insert(right, stored_right);
                         self.view_trim_dirty_page_overrides.insert(left);
                         self.view_trim_dirty_page_overrides.insert(right);
                     }

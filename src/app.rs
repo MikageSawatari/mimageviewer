@@ -2713,6 +2713,8 @@ pub struct App {
     /// 表示トリムの「このページの個別設定を適用」チェックが有効な fullscreen root idx。
     /// ページ移動時に外れる一時状態で、DB へは保存しない。
     pub(crate) view_trim_page_apply_root_idx: Option<usize>,
+    /// Page 個別適用中の見開き左右別 UI 状態。Book 設定には保存しない。
+    pub(crate) view_trim_page_spread_separate: bool,
     pub(crate) view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
     pub(crate) view_trim_page_overrides:
         std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
@@ -5294,6 +5296,7 @@ impl App {
             view_trim_mode: false,
             view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
             view_trim_page_apply_root_idx: None,
+            view_trim_page_spread_separate: false,
             view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
             view_trim_page_overrides: std::collections::HashMap::new(),
             view_trim_dirty_page_overrides: std::collections::HashSet::new(),
@@ -8017,6 +8020,7 @@ impl App {
         };
         self.view_trim_book_settings = state.book_settings;
         self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
 
         let legacy_margin_fit = matches!(
             self.settings.fullscreen_fit_mode,
@@ -12603,6 +12607,7 @@ impl App {
         self.items_generation = self.items_generation.wrapping_add(1);
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         self.view_trim_page_overrides.clear();
         self.view_trim_dirty_page_overrides.clear();
         self.view_trim_save_pending = false;
@@ -13954,6 +13959,7 @@ impl App {
         self.export_crop_page_settings.clear();
         self.export_crop_pages.clear();
         self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         self.persist_pending_view_trim_state();
         self.view_trim_page_overrides.clear();
         self.view_trim_dirty_page_overrides.clear();
@@ -14200,6 +14206,9 @@ impl App {
             .filter_map(|&i| shift(i))
             .collect();
         self.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx.and_then(shift);
+        if self.view_trim_page_apply_root_idx.is_none() {
+            self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
+        }
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
         self.conceal_pages = self
             .conceal_pages
@@ -26022,6 +26031,7 @@ impl App {
         self.persist_pending_view_trim_state();
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         self.local_adjust_mode = false;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
