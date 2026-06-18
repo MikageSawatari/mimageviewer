@@ -47,6 +47,68 @@ fn linked_from_detected(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn page_linked_margins_map_inner_and_outer_to_spread_sides() {
+        let mut left = ViewTrimPageOverride::default();
+        let mut right = ViewTrimPageOverride::default();
+        let linked = ViewTrimLinkedMargins {
+            top: 0.01,
+            bottom: 0.02,
+            inner: 0.08,
+            outer: 0.03,
+        };
+
+        set_page_spread_linked_margins(&mut left, &mut right, linked);
+
+        assert!(left.enabled);
+        assert!(right.enabled);
+        assert_close(left.margins.left, 0.03);
+        assert_close(left.margins.right, 0.08);
+        assert_close(right.margins.left, 0.08);
+        assert_close(right.margins.right, 0.03);
+        assert_close(left.margins.top, 0.01);
+        assert_close(right.margins.bottom, 0.02);
+    }
+
+    #[test]
+    fn page_switch_to_linked_preserves_inner_and_outer_semantics() {
+        let mut left = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.02,
+            top: 0.04,
+            right: 0.08,
+            bottom: 0.10,
+        });
+        let mut right = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            left: 0.12,
+            top: 0.06,
+            right: 0.16,
+            bottom: 0.14,
+        });
+
+        set_page_spread_separate(&mut left, &mut right, false);
+
+        assert_close(left.margins.left, 0.09);
+        assert_close(left.margins.right, 0.10);
+        assert_close(right.margins.left, 0.10);
+        assert_close(right.margins.right, 0.09);
+        assert_close(left.margins.top, 0.05);
+        assert_close(right.margins.top, 0.05);
+        assert_close(left.margins.bottom, 0.12);
+        assert_close(right.margins.bottom, 0.12);
+    }
+}
+
 fn common_from_detected(
     left: Option<ViewTrimMargins>,
     right: Option<ViewTrimMargins>,
@@ -80,13 +142,24 @@ fn set_page_spread_separate(
     separate: bool,
 ) {
     if !separate {
-        let common = left.margins.average_with(right.margins);
+        let linked = ViewTrimLinkedMargins::average_from_separate(left.margins, right.margins);
         let enabled = left.enabled || right.enabled;
-        left.margins = common;
-        right.margins = common;
+        left.margins = linked.margins_for(ViewTrimSpreadSide::Left);
+        right.margins = linked.margins_for(ViewTrimSpreadSide::Right);
         left.enabled = enabled;
         right.enabled = enabled;
     }
+}
+
+fn set_page_spread_linked_margins(
+    left: &mut ViewTrimPageOverride,
+    right: &mut ViewTrimPageOverride,
+    linked: ViewTrimLinkedMargins,
+) {
+    left.margins = linked.margins_for(ViewTrimSpreadSide::Left);
+    right.margins = linked.margins_for(ViewTrimSpreadSide::Right);
+    left.enabled = true;
+    right.enabled = true;
 }
 
 fn margin_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) -> bool {
@@ -496,12 +569,16 @@ impl App {
                             } else {
                                 page_left.enabled = true;
                                 page_right.enabled = true;
-                                let mut common = page_left.margins.average_with(page_right.margins);
-                                if margins_controls(ui, "左右共通", &mut common) {
-                                    page_left.margins = common;
-                                    page_right.margins = common;
-                                    page_left.enabled = true;
-                                    page_right.enabled = true;
+                                let mut linked = ViewTrimLinkedMargins::average_from_separate(
+                                    page_left.margins,
+                                    page_right.margins,
+                                );
+                                if linked_controls(ui, &mut linked) {
+                                    set_page_spread_linked_margins(
+                                        &mut page_left,
+                                        &mut page_right,
+                                        linked,
+                                    );
                                     changed = true;
                                 }
                             }
