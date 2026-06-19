@@ -3388,6 +3388,9 @@ impl App {
         let active_book_name = self.active_book_name();
         let toolbar_book_rows = self.book_list_cache.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
+        let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
+            &self.settings.toolbar_section_order,
+        );
         let any_toolbar_section = show_folder_tree_button
             || show_bookshelf
             || show_cols
@@ -3483,14 +3486,42 @@ impl App {
                 }
 
                 ui.horizontal_wrapped(|ui| {
+                use crate::settings::ToolbarSectionId as TS;
                 let mut first_section = true;
+                // ピン留めタグ (タグセクションで使用)。ループ前に 1 度だけ算出する。
+                let toolbar_tags: Vec<_> = self
+                    .settings
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.show_shortcut)
+                    .map(|t| t.name.clone())
+                    .collect();
+                for &section in &toolbar_section_order {
+                    // セクションごとの表示可否 (= 旧 `if show_*` と同一条件)。
+                    let visible = match section {
+                        TS::FolderTree => show_folder_tree_button,
+                        TS::Bookshelf => show_bookshelf,
+                        TS::Cols => show_cols,
+                        TS::Aspect => show_aspect,
+                        TS::Sort => show_sort,
+                        TS::Rating => show_rating,
+                        TS::Favorites => show_favs,
+                        TS::Tags => show_tags,
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    if !first_section {
+                        ui.separator();
+                    }
+                    match section {
                 // ツールバー VST ボタンは v0.9.0 開発中に削除 (= ユーザー要望 2026-04
                 // 「ツールバーの VST ボタンも不要になったので削除」)。
                 // VST3 プラグインのプレイバックパネルは動画再生中にホバーバー側の
                 // VST ボタンから開く (フルスクリーンビューポート内で完結)。
                 // 通常表示中はパネルを開く手段は無く、設定変更は環境設定→
                 // VST3 プラグイン から行う運用。
-                if show_folder_tree_button {
+                TS::FolderTree => {
                     let active = self.settings.folder_tree_pane_visible;
                     let resp = ui
                         .selectable_label(active, "ツリー")
@@ -3498,12 +3529,8 @@ impl App {
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
                     }
-                    first_section = false;
                 }
-                if show_bookshelf {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Bookshelf => {
                     toolbar_label(ui, "本棚:", 46.0);
                     let combo = egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         .width(160.0)
@@ -3548,12 +3575,8 @@ impl App {
                     {
                         toolbar_book_open_active = true;
                     }
-                    first_section = false;
                 }
-                if show_cols {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Cols => {
                     toolbar_label(ui, "列:", 28.0);
                     match self.settings.toolbar_cols_display {
                         crate::settings::ToolbarSectionDisplay::Buttons => {
@@ -3615,12 +3638,8 @@ impl App {
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
-                    first_section = false;
                 }
-                if show_aspect {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Aspect => {
                     toolbar_label(ui, "比率:", 42.0);
                     let auto_visible = self.settings.toolbar_aspect_auto_visible;
                     let auto_selected = self.settings.thumb_aspect_auto;
@@ -3706,12 +3725,8 @@ impl App {
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
-                    first_section = false;
                 }
-                if show_sort {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Sort => {
                     let details_sort_disabled = self.details_header_sort_active();
                     let sort_disabled = details_sort_disabled || book_sort_locked;
                     let sort_label = toolbar_label(ui, "ソート:", 54.0);
@@ -3776,12 +3791,8 @@ impl App {
                             });
                         }
                     }
-                    first_section = false;
                 }
-                if show_rating {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Rating => {
                     // Ctrl+G の集約ビュー (= 検索結果のフォルダ一覧) では★フィルタを
                     // 反映できない (ヒット件数と filter の二重集計が必要で実装コスト大)。
                     // ドリルイン後は file list + サブフォルダ件数の両方に反映するので
@@ -3862,12 +3873,8 @@ impl App {
                         self.toggle_snapshot(label);
                     }
 
-                    first_section = false;
                 }
-                if show_favs {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Favorites => {
                     toolbar_label(ui, "お気に入り:", 76.0);
                     if self.settings.favorites.is_empty() {
                         ui.label(egui::RichText::new("(未登録)").weak());
@@ -3886,21 +3893,9 @@ impl App {
                             }
                         }
                     }
-                    first_section = false;
                 }
-
                 // タグセクション (docs/tag-feature.md §4.3)
-                let toolbar_tags: Vec<_> = self
-                    .settings
-                    .tags
-                    .iter()
-                    .filter(|tag| tag.show_shortcut)
-                    .map(|t| t.name.clone())
-                    .collect();
-                if show_tags {
-                    if !first_section {
-                        ui.separator();
-                    }
+                TS::Tags => {
                     toolbar_label(ui, "タグ:", 42.0);
                     let has_target = self.tag_target_path_count() > 0;
                     if ui
@@ -3917,7 +3912,7 @@ impl App {
                     {
                         toolbar_tag_view_open = true;
                     }
-                    for name in toolbar_tags {
+                    for name in &toolbar_tags {
                         let label = format!("#{name}");
                         let resp = ui.add_enabled(has_target, egui::Button::new(label));
                         let clicked = resp.clicked();
@@ -3928,9 +3923,12 @@ impl App {
                             }
                         });
                         if clicked {
-                            toolbar_tag_click = Some(name);
+                            toolbar_tag_click = Some(name.clone());
                         }
                     }
+                }
+                    }
+                    first_section = false;
                 }
                 });
             });

@@ -677,6 +677,63 @@ impl ToolbarSectionDisplay {
 }
 
 // -----------------------------------------------------------------------
+// ToolbarSectionId (v2.0.0)
+// -----------------------------------------------------------------------
+
+/// ツールバーのセクション識別子。
+///
+/// セクション描画をハードコード順から `toolbar_section_order` によるデータ駆動ループへ
+/// 移すための列挙 (v2.0.0 Phase 1)。並べ替え (ドラッグ) と表示/非表示カスタマイズの土台。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolbarSectionId {
+    FolderTree,
+    Bookshelf,
+    Cols,
+    Aspect,
+    Sort,
+    Rating,
+    Favorites,
+    Tags,
+}
+
+impl ToolbarSectionId {
+    /// 既定の並び順 (= v1.x までのハードコード順)。これを崩すと既存ユーザーの
+    /// 見た目が変わるので、`toolbar_section_order` 未設定時は必ずこの順を使う。
+    pub fn default_order() -> &'static [Self] {
+        &[
+            Self::FolderTree,
+            Self::Bookshelf,
+            Self::Cols,
+            Self::Aspect,
+            Self::Sort,
+            Self::Rating,
+            Self::Favorites,
+            Self::Tags,
+        ]
+    }
+
+    /// 保存済み順序に、未登録のセクションを既定順で末尾追加して返す。
+    ///
+    /// 詳細列の `details_ordered_columns` と同じ「保存順に無い新項目は末尾追加」方式。
+    /// 空 Vec は既定順そのまま。重複は最初の 1 つだけ採用 (破損データ耐性)。
+    /// 後方互換 / 将来のセクション追加の両方に耐える。
+    pub fn ordered_with_fallback(saved: &[Self]) -> Vec<Self> {
+        let mut out: Vec<Self> = Vec::with_capacity(Self::default_order().len());
+        for &id in saved {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        for &id in Self::default_order() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+}
+
+// -----------------------------------------------------------------------
 // SortOrder
 // -----------------------------------------------------------------------
 
@@ -1978,6 +2035,10 @@ pub struct Settings {
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
+    /// ツールバーのセクション並び順 (v2.0.0)。空 = 既定順。
+    /// `ToolbarSectionId::ordered_with_fallback` で未登録セクションを補完する。
+    #[serde(default)]
+    pub toolbar_section_order: Vec<ToolbarSectionId>,
 
     // ── フォルダサムネイル ──────────────────────────────────────
     /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
@@ -3120,6 +3181,7 @@ impl Default for Settings {
             toolbar_aspect_display: ToolbarSectionDisplay::default(),
             toolbar_sort_display: ToolbarSectionDisplay::default(),
             toolbar_sort_items: default_toolbar_sort_items(),
+            toolbar_section_order: Vec::new(),
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
@@ -4560,6 +4622,48 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Toolbar section order (v2.0.0 Phase 1) --
+
+    #[test]
+    fn toolbar_section_order_empty_is_default() {
+        let got = ToolbarSectionId::ordered_with_fallback(&[]);
+        assert_eq!(got, ToolbarSectionId::default_order().to_vec());
+    }
+
+    #[test]
+    fn toolbar_section_order_appends_missing_in_default_order() {
+        // 保存順が一部だけ (Tags を先頭へ) でも、残りは既定順で末尾補完される。
+        let saved = vec![ToolbarSectionId::Tags, ToolbarSectionId::Cols];
+        let got = ToolbarSectionId::ordered_with_fallback(&saved);
+        assert_eq!(got[0], ToolbarSectionId::Tags);
+        assert_eq!(got[1], ToolbarSectionId::Cols);
+        // 全 8 セクションが過不足なく 1 回ずつ含まれる。
+        assert_eq!(got.len(), ToolbarSectionId::default_order().len());
+        for &id in ToolbarSectionId::default_order() {
+            assert_eq!(
+                got.iter().filter(|&&x| x == id).count(),
+                1,
+                "{id:?} は 1 回だけ含まれるべき"
+            );
+        }
+    }
+
+    #[test]
+    fn toolbar_section_order_dedups_corrupt_duplicates() {
+        let saved = vec![
+            ToolbarSectionId::Cols,
+            ToolbarSectionId::Cols,
+            ToolbarSectionId::Cols,
+        ];
+        let got = ToolbarSectionId::ordered_with_fallback(&saved);
+        assert_eq!(got.len(), ToolbarSectionId::default_order().len());
+        assert_eq!(got[0], ToolbarSectionId::Cols);
+        assert_eq!(
+            got.iter().filter(|&&x| x == ToolbarSectionId::Cols).count(),
+            1
+        );
+    }
 
     // -- Settings defaults --
 
