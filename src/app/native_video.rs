@@ -3683,6 +3683,61 @@ impl App {
         }
     }
 
+    /// 動画 native overlay 用のタグ候補カタログを `NativeOverlayTagDef` の Arc として返す。
+    /// 初回 (またはタグ変更後) のみ構築し、以降は Arc clone を返すだけ。
+    #[cfg(windows)]
+    fn cached_native_overlay_tag_choices(
+        &mut self,
+    ) -> std::sync::Arc<[crate::video::native_presenter::NativeOverlayTagDef]> {
+        if let Some(cached) = self.native_overlay_tag_choices_cache.as_ref() {
+            return cached.clone();
+        }
+        let built: std::sync::Arc<[_]> = self
+            .cached_tag_choice_catalog()
+            .into_iter()
+            .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
+                name: tag.name,
+                tag_key: tag.tag_key,
+                count: tag.count,
+                pinned: tag.pinned,
+                last_applied_at: tag.last_applied_at,
+            })
+            .collect();
+        self.native_overlay_tag_choices_cache = Some(built.clone());
+        built
+    }
+
+    /// 動画 native overlay 用のピン留めタグ (常時表示ボタン) を Arc として返す。
+    /// `last_applied_at` はカタログから引く。タグ変更後のみ再構築する。
+    #[cfg(windows)]
+    fn cached_native_overlay_shortcut_tags(
+        &mut self,
+    ) -> std::sync::Arc<[crate::video::native_presenter::NativeOverlayTagDef]> {
+        if let Some(cached) = self.native_overlay_shortcut_tags_cache.as_ref() {
+            return cached.clone();
+        }
+        let catalog = self.cached_native_overlay_tag_choices();
+        let built: std::sync::Arc<[_]> = self
+            .settings
+            .tags
+            .iter()
+            .filter(|tag| tag.show_shortcut)
+            .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
+                name: tag.name.clone(),
+                tag_key: tag.tag_key.clone(),
+                count: 0,
+                pinned: true,
+                last_applied_at: catalog
+                    .iter()
+                    .find(|choice| choice.tag_key == tag.tag_key)
+                    .map(|choice| choice.last_applied_at)
+                    .unwrap_or(0),
+            })
+            .collect();
+        self.native_overlay_shortcut_tags_cache = Some(built.clone());
+        built
+    }
+
     #[cfg(windows)]
     pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
         let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -3694,34 +3749,11 @@ impl App {
         let item_key = crate::tags_db::item_key_for_path(&path);
         self.hydrate_tags_cache_for_paths(std::slice::from_ref(&path));
         let current_tags = self.tags_cache.get(&item_key).cloned().unwrap_or_default();
-        let tag_choices: Vec<_> = self
-            .cached_tag_choice_catalog()
-            .into_iter()
-            .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
-                name: tag.name,
-                tag_key: tag.tag_key,
-                count: tag.count,
-                pinned: tag.pinned,
-                last_applied_at: tag.last_applied_at,
-            })
-            .collect();
-        let shortcut_tags: Vec<_> = self
-            .settings
-            .tags
-            .iter()
-            .filter(|tag| tag.show_shortcut)
-            .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
-                name: tag.name.clone(),
-                tag_key: tag.tag_key.clone(),
-                count: 0,
-                pinned: true,
-                last_applied_at: tag_choices
-                    .iter()
-                    .find(|choice| choice.tag_key == tag.tag_key)
-                    .map(|choice| choice.last_applied_at)
-                    .unwrap_or(0),
-            })
-            .collect();
+        // tag_choices / shortcut_tags は Arc キャッシュからの clone (refcount bump) だけ。
+        // 中身はタグ変更時のみ再構築される (cached_native_overlay_* / invalidate_tag_apply_suggestions)。
+        // これでフルスクリーン動画中の毎フレーム sync が大きなカタログを作り直さなくなる。
+        let tag_choices = self.cached_native_overlay_tag_choices();
+        let shortcut_tags = self.cached_native_overlay_shortcut_tags();
 
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;

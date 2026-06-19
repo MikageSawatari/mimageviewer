@@ -3124,7 +3124,7 @@ fn native_visible_tag_choices(
 ) -> Vec<NativeOverlayTagDef> {
     let mut out = Vec::new();
     let mut seen = Vec::<String>::new();
-    for def in &metadata.shortcut_tags {
+    for def in metadata.shortcut_tags.iter() {
         if !def.tag_key.is_empty() && !seen.iter().any(|key| key == &def.tag_key) {
             seen.push(def.tag_key.clone());
             out.push(def.clone());
@@ -3196,6 +3196,7 @@ fn draw_native_tag_picker_panel(
     tag_picker_focus_request: &mut bool,
     tag_picker_recent_tab: &mut bool,
     tag_picker_enter_pressed: bool,
+    tag_picker_ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     ui.horizontal(|ui| {
@@ -3233,6 +3234,7 @@ fn draw_native_tag_picker_panel(
         tag_picker_focus_request,
         tag_picker_recent_tab,
         tag_picker_enter_pressed,
+        tag_picker_ime_active,
         commands,
         &mut close_after_apply,
     );
@@ -3265,6 +3267,7 @@ fn draw_native_tag_picker(
     focus_request: &mut bool,
     recent_tab: &mut bool,
     enter_pressed: bool,
+    ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
     close_after_apply: &mut bool,
 ) {
@@ -3277,9 +3280,30 @@ fn draw_native_tag_picker(
                 .hint_text("タグを検索/入力")
                 .return_key(None::<egui::KeyboardShortcut>),
         );
+        // IME 変換確定/キャンセルの Enter/Escape で TextEdit のフォーカスが外れることが
+        // ある (Windows IME)。そのフレームに合わせてフォーカスを取り戻す
+        // (静止画右パネルの `restore_focus_for_ime_key` と同方針)。
+        let restore_focus_for_ime_key = ime_active
+            && input_resp.lost_focus()
+            && ui.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Enter | egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
         if *focus_request {
             input_resp.request_focus();
             *focus_request = false;
+        } else if restore_focus_for_ime_key {
+            input_resp.request_focus();
+            *focus_request = true;
+            ui.ctx().request_repaint();
         }
         let normalized = crate::tags_db::normalize_tag_display_name(input.trim());
         let valid = native_tag_input_valid(&normalized);
@@ -3404,7 +3428,7 @@ fn native_picker_choices(
 ) -> Vec<NativeOverlayTagDef> {
     let mut out = Vec::new();
     let mut seen = Vec::<String>::new();
-    for choice in &metadata.tag_choices {
+    for choice in metadata.tag_choices.iter() {
         if choice.tag_key.is_empty() || seen.iter().any(|key| key == &choice.tag_key) {
             continue;
         }
@@ -3453,6 +3477,8 @@ pub(super) fn draw_native_metadata_panel(
     sticky_tags: &mut Vec<NativeOverlayTagDef>,
     tag_picker_recent_tab: &mut bool,
     tag_picker_enter_pressed: bool,
+    tag_picker_escape_pressed: bool,
+    tag_picker_ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
@@ -3660,6 +3686,17 @@ pub(super) fn draw_native_metadata_panel(
                         );
                     }
                     if *tag_picker_open {
+                        // Escape でピッカーを閉じる (静止画右パネルと挙動を揃える)。
+                        // IME 変換キャンセルの Escape は呼び出し側で除外済み。
+                        if tag_picker_escape_pressed {
+                            close_native_tag_picker(
+                                tag_picker_open,
+                                tag_picker_input,
+                                tag_picker_focus_request,
+                                tag_picker_recent_tab,
+                            );
+                            return;
+                        }
                         draw_native_tag_picker_panel(
                             ui,
                             metadata,
@@ -3668,6 +3705,7 @@ pub(super) fn draw_native_metadata_panel(
                             tag_picker_focus_request,
                             tag_picker_recent_tab,
                             tag_picker_enter_pressed,
+                            tag_picker_ime_active,
                             commands,
                         );
                         return;

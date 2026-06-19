@@ -693,8 +693,12 @@ pub struct NativeOverlayMetadata {
     pub description: Option<String>,
     pub probe_info_available: bool,
     pub current_tags: Vec<String>,
-    pub shortcut_tags: Vec<NativeOverlayTagDef>,
-    pub tag_choices: Vec<NativeOverlayTagDef>,
+    // タグ候補カタログとピン留めタグは数十〜数百件になり得るうえ、overlay metadata は
+    // フルスクリーン動画中 **毎フレーム** rebuild される (app::sync_native_video_metadata)。
+    // 毎フレーム Vec を作り直すと UI スレッドで無駄な確保が積み上がるので、App 側で
+    // 構築済み Arc をキャッシュし、ここはその Arc clone (refcount bump) だけにする。
+    pub shortcut_tags: std::sync::Arc<[NativeOverlayTagDef]>,
+    pub tag_choices: std::sync::Arc<[NativeOverlayTagDef]>,
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
@@ -5645,7 +5649,10 @@ impl NativeEguiOverlay {
         if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
             viewport.native_pixels_per_point = Some(ppp);
         }
-        let tag_picker_enter_allowed = !self.ime_input_active();
+        // IME 変換中 (`ime_input_active`) は Enter/Escape を確定/キャンセルキーとして扱わない
+        // (変換の確定・取り消しをタグピッカーが奪わないため、静止画側 `dialog_*_pressed` と同方針)。
+        let tag_picker_ime_active = self.ime_input_active();
+        let tag_picker_enter_allowed = !tag_picker_ime_active;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if !overlay_visible {
                 return;
@@ -5822,6 +5829,10 @@ impl NativeEguiOverlay {
             }
             let tag_picker_enter_pressed =
                 tag_picker_enter_allowed && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            // Escape はピッカーを閉じる (静止画右パネルのタグピッカーと挙動を揃える)。
+            // IME 変換キャンセルの Escape は `tag_picker_enter_allowed` で除外済み。
+            let tag_picker_escape_pressed =
+                tag_picker_enter_allowed && ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if right_panel_visible && let Some(metadata) = video_metadata.as_ref() {
                 draw_native_metadata_panel(
                     ctx,
@@ -5835,6 +5846,8 @@ impl NativeEguiOverlay {
                     &mut self.tag_panel_sticky_tags,
                     &mut self.tag_picker_recent_tab,
                     tag_picker_enter_pressed,
+                    tag_picker_escape_pressed,
+                    tag_picker_ime_active,
                     &mut commands,
                 );
             }

@@ -36,6 +36,13 @@ impl App {
         self.tag_apply_suggestion_key = None;
         self.tag_apply_suggestions.clear();
         self.tag_choice_catalog_cache = None;
+        // 動画 native overlay 用の変換済みタグ Arc キャッシュも同時に落とす
+        // (タグ件数 / last_applied_at / ピン状態が変わるため)。
+        #[cfg(windows)]
+        {
+            self.native_overlay_tag_choices_cache = None;
+            self.native_overlay_shortcut_tags_cache = None;
+        }
         self.tag_apply_selection_cache = None;
         // facet メニュー側のキャッシュも同じタイミング (タグデータ変更) で破棄する。
         self.facet_tag_suggestion_cache = None;

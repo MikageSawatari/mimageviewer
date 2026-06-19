@@ -2811,6 +2811,16 @@ pub struct App {
     pub(crate) tag_apply_suggestion_key: Option<String>,
     pub(crate) tag_apply_suggestions: Vec<(String, String, usize, bool, i64)>,
     pub(crate) tag_choice_catalog_cache: Option<Vec<(String, String, usize, bool, i64)>>,
+    /// 動画 native overlay 向けにタグカタログ / ピン留めタグを `NativeOverlayTagDef` へ
+    /// 変換済みのキャッシュ。`sync_native_video_metadata` がフルスクリーン動画中に毎フレーム
+    /// 呼ばれるため、ここで Arc を保持して毎フレームの再構築 + 確保を避ける。
+    /// `invalidate_tag_apply_suggestions` (= タグ変更 / `settings.tags` 変更) で None に落とす。
+    #[cfg(windows)]
+    pub(crate) native_overlay_tag_choices_cache:
+        Option<std::sync::Arc<[crate::video::native_presenter::NativeOverlayTagDef]>>,
+    #[cfg(windows)]
+    pub(crate) native_overlay_shortcut_tags_cache:
+        Option<std::sync::Arc<[crate::video::native_presenter::NativeOverlayTagDef]>>,
     pub(crate) fullscreen_tag_picker_open: bool,
     pub(crate) fullscreen_tag_picker_input: String,
     pub(crate) fullscreen_tag_picker_row_key: Option<String>,
@@ -5332,6 +5342,10 @@ impl App {
             tag_apply_suggestion_key: None,
             tag_apply_suggestions: Vec::new(),
             tag_choice_catalog_cache: None,
+            #[cfg(windows)]
+            native_overlay_tag_choices_cache: None,
+            #[cfg(windows)]
+            native_overlay_shortcut_tags_cache: None,
             fullscreen_tag_picker_open: false,
             fullscreen_tag_picker_input: String::new(),
             fullscreen_tag_picker_row_key: None,
