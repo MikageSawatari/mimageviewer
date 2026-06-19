@@ -12542,9 +12542,16 @@ impl App {
         // ときは履歴より優先する: 深い階層から BS で戻ったとき、最初にフォルダへ入った位置
         // ではなく「今いる位置」にカーソルを合わせるため。指定アイテムが items に見つから
         // なかった場合 (削除等) のみ履歴へフォールバック。
+        let history_state = self.folder_history.get(&source_path).copied();
         let restored = self.try_select_after_load();
+        if restored && let Some((scroll, _)) = history_state {
+            // BS / direct-page close は select_after_load で選択対象を更新するが、
+            // 視点は戻り先リストでユーザーが見ていたスクロール位置を先に復元する。
+            // scroll_to_selected は残し、対象が範囲外になった場合だけ render_grid で補正する。
+            self.scroll_offset_y = scroll;
+        }
         if !restored {
-            if let Some(&(scroll, sel)) = self.folder_history.get(&source_path) {
+            if let Some((scroll, sel)) = history_state {
                 self.scroll_offset_y = scroll;
                 self.selected = sel;
                 if sel.is_some() {
@@ -12559,7 +12566,7 @@ impl App {
         // 同セッション履歴 (folder_history) に位置が無い (= 再起動後の初回など) かつ
         // select_after_load も無い場合、永続化した読書位置 (book_resume_db) をグリッド選択に
         // 復元する (= 再起動を跨いだ「続きから」)。
-        if !restored && !self.folder_history.contains_key(&source_path) {
+        if !restored && history_state.is_none() {
             let resume = self
                 .book_resume_db
                 .as_ref()
@@ -12571,6 +12578,11 @@ impl App {
                 self.redirect_selected_to_visible();
             }
         }
+        // A freshly loaded grid must not inherit stale idle-upgrade timing from
+        // the previous grid. Scroll history has been restored by this point, so
+        // restart the quiet window from the restored position.
+        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        self.last_scroll_change_time = std::time::Instant::now();
         // 検索結果 / 読書履歴用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
         let save_t0 = std::time::Instant::now();
         if source_path != search_results_synthetic_path()
@@ -16016,6 +16028,17 @@ impl App {
         const MAX_TEXTURES_PER_FRAME: u32 = 8;
         let mut textures_created = 0u32;
         let mut received = 0u32;
+        // **黒サムネ回帰修正 (2026-06-19, v1.8.0 regression)**: フルスクリーン close 直後は
+        // メインウィンドウの wgpu surface が 1 フレーム消え、その frame に queue した
+        // テクスチャ upload (delta) が `paint_and_update_textures` の no-surface early return で
+        // 捨てられる。font atlas は `main_font_atlas_resync` が数フレーム再 upload して救済するが、
+        // **この窓で `load_texture` した grid サムネは upload だけ捨てられて handle は Loaded** の
+        // ため、GPU データ空 = 真っ黒の backdrop だけが描かれる (idle 高画質化が再レンダする
+        // ~500ms 後まで固着)。対策: resync 窓の間はサムネのテクスチャ化を `texture_backlog` へ
+        // 先送りし、surface が戻ってから upload する。ColorImage は破棄せず保持されるので
+        // 数フレーム遅れて正しく表示される。
+        let defer_texture_uploads = self.main_font_atlas_resync_pending;
+        let mut deferred_for_resync = 0u32;
         let (keep_start, keep_end) = self.keep_range;
 
         // バックログ + チャネルから受信した結果を統合して処理する。
@@ -16131,7 +16154,10 @@ impl App {
 
             match color_image_opt {
                 Some(color_image) => {
-                    if treat_as_in_range && textures_created < MAX_TEXTURES_PER_FRAME {
+                    if treat_as_in_range
+                        && textures_created < MAX_TEXTURES_PER_FRAME
+                        && !defer_texture_uploads
+                    {
                         // from_cache=true: 1 ショット経路 (cache save なし) → 即 remove。
                         // from_cache=false: from-source 経路。cache save 完了後の
                         //   第 2 シグナル (canceled=true) 到着まで `requested` を保持。
@@ -16244,8 +16270,11 @@ impl App {
                             }
                         }
                     } else if treat_as_in_range {
-                        // 上限到達だが keep_range 内 (or 動画): 次フレームに持ち越す。
-                        // requested は除去しない (重複リクエスト防止)
+                        // 上限到達 or font-atlas-resync 窓 (defer_texture_uploads) で keep_range 内
+                        // (or 動画): 次フレームに持ち越す。requested は除去しない (重複リクエスト防止)。
+                        if defer_texture_uploads {
+                            deferred_for_resync += 1;
+                        }
                         self.texture_backlog.push(crate::thumb_loader::ThumbMsg {
                             idx: i,
                             image: Some(color_image),
@@ -16287,6 +16316,21 @@ impl App {
                 "  [main] poll_thumbnails: received {received} ({textures_created} textures, {} backlog)",
                 self.texture_backlog.len()
             ));
+            ctx.request_repaint();
+        }
+        if deferred_for_resync > 0 {
+            // resync 窓でサムネ upload を先送りした件数。これが出ていれば回帰修正が機能して
+            // いる (= 旧来なら黒サムネ化していた upload を surface 復帰まで待たせた)。
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "thumb",
+                    "upload_deferred_for_resync",
+                    None,
+                    self.input_seq,
+                    &[("count", serde_json::Value::from(deferred_for_resync))],
+                );
+            }
+            // resync 完了後に backlog を確実に処理させる (surface 復帰フレームで再走)。
             ctx.request_repaint();
         }
         // auto_aspect: 新規 Loaded で samples が増えた可能性があるので切替判定。
@@ -16948,6 +16992,10 @@ impl App {
                 "  [queue] push +{new_hi}H +{new_lo}L  keep=[{keep_start}..{keep_end})  vis=[{visible_raw_start}..{visible_raw_end})  requested={}",
                 self.requested.len(),
             ));
+            // Normal frames also request repaint in the tail via `requested_nonempty`.
+            // Fullscreen cleanup / font-atlas resync can return before that tail, so
+            // wake the UI from the enqueue site as well.
+            ctx.request_repaint();
         }
         let t4 = frame_t0.elapsed();
 
@@ -17397,17 +17445,32 @@ impl App {
     /// 以前は範囲外サムネイルの `Pending` が常に repaint を駆動していたため、自然に
     /// 500ms アイドル判定へ到達していた。範囲外 `Pending` で常時描画しないようにした後も、
     /// 高画質化の開始タイミングだけは維持する。
+    ///
+    /// **MARGIN の意図 (フレーム内境界レース対策、2026-06-19)**:
+    /// `enqueue_idle_upgrades` はフレーム先頭 (`update_keep_range_and_requests` 内) で
+    /// idle 経過を評価し、本関数はフレーム末尾で評価する。同一フレーム内で経過時間が
+    /// ちょうど 500ms 境界をまたぐと、enqueue は「まだ idle 未満」で skip する一方、本関数は
+    /// 「idle 到達」とみなして `None` を返し、egui がそのまま就寝してしまう。すると次の
+    /// ユーザー入力 (マウス移動等) までアイドル高画質化が一切走らず、ESC で親一覧へ直帰した
+    /// 直後にサムネが低画質/灰色のまま固まる (perf-log で約 7.9 秒のフレーム停止を確認、
+    /// `tail_repaint action=none reasons=[]` のまま入力まで 0 フレーム)。
+    /// そこで wake フレームを閾値より MARGIN だけ後ろに置き、起床したフレーム先頭の
+    /// enqueue が確実に「idle 到達済み」で enqueue できるようにする。enqueue が走れば
+    /// `requested` が埋まり、上の早期 return が `None` を返して通常の repaint ループに移る。
     fn thumb_idle_upgrade_recheck_delay(&self) -> Option<std::time::Duration> {
         const SCROLL_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
         const INPUT_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+        // フレーム長 + Windows タイマー粒度 (~15ms) を十分に上回る余白。
+        const MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
 
         if !self.settings.thumb_idle_upgrade || !self.requested.is_empty() {
             return None;
         }
 
-        let mut delay = SCROLL_IDLE.saturating_sub(self.last_scroll_change_time.elapsed());
+        let mut delay =
+            (SCROLL_IDLE + MARGIN).saturating_sub(self.last_scroll_change_time.elapsed());
         if let Some(last_input_at) = self.last_input_at {
-            delay = delay.max(INPUT_IDLE.saturating_sub(last_input_at.elapsed()));
+            delay = delay.max((INPUT_IDLE + MARGIN).saturating_sub(last_input_at.elapsed()));
         }
 
         if delay.is_zero() { None } else { Some(delay) }
@@ -35969,6 +36032,19 @@ impl eframe::App for App {
         // フルスクリーン入力が root 側で処理されたフレームや専用 viewport の repaint だけが
         // 走ったフレームで予約が残るため、描画後に通常の入力ナビへ合流させる。
         let mut fullscreen_close_nav = self.take_pending_return_to_parent_nav();
+        if let Some(nav) = fullscreen_close_nav.take() {
+            let unsupported_history_nav = matches!(
+                nav,
+                crate::ui_main::AddressBarNav::HistoryBack
+                    | crate::ui_main::AddressBarNav::HistoryForward
+            );
+            if unsupported_history_nav {
+                fullscreen_close_nav = Some(nav);
+            } else if self.apply_fullscreen_close_nav_immediate(nav) {
+                ctx.request_repaint();
+                return;
+            }
+        }
         #[cfg(windows)]
         let embedded_fs_active =
             embedded_fs_active_before_render || self.fullscreen_embedded_still_active();

@@ -5432,6 +5432,236 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// `select_after_load` で「戻ってきた子」を選ぶ場合でも、スクロール位置は
+    /// 戻り先フォルダで保存していた値を優先する。選択アイテムがその位置から
+    /// 外れる場合だけ `render_grid` 側の scroll_to_selected が補正する。
+    #[test]
+    fn select_after_load_preserves_folder_history_scroll() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("root");
+        std::fs::create_dir_all(&parent).unwrap();
+        let other = parent.join("other.pdf");
+        let book = parent.join("book.pdf");
+        std::fs::write(&other, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&book, b"%PDF-1.4\n").unwrap();
+
+        app.folder_history.insert(parent.clone(), (321.0, Some(0)));
+        app.select_after_load = Some("book.pdf".to_string());
+
+        app.start_loading_items(
+            parent,
+            vec![GridItem::PdfFile(other), GridItem::PdfFile(book)],
+            vec![None, None],
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "select_after_load should still choose the returned child"
+        );
+        assert_eq!(
+            app.scroll_offset_y, 321.0,
+            "history scroll should be restored before selected visibility correction"
+        );
+        assert!(
+            app.scroll_to_selected,
+            "render_grid should still ensure the selected child is visible if needed"
+        );
+    }
+
+    #[test]
+    fn start_loading_items_resets_idle_upgrade_timer_after_scroll_restore() {
+        use crate::grid_item::GridItem;
+        use std::time::{Duration, Instant};
+
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("root");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.pdf");
+        std::fs::write(&book, b"%PDF-1.4\n").unwrap();
+
+        app.folder_history.insert(parent.clone(), (321.0, Some(0)));
+        app.scroll_offset_y = 900.0;
+        app.last_scroll_offset_y_tracked = 900.0;
+        app.last_scroll_change_time = Instant::now() - Duration::from_secs(5);
+        let stale_idle_at = app.last_scroll_change_time;
+
+        app.start_loading_items(
+            parent,
+            vec![GridItem::PdfFile(book)],
+            vec![None],
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            app.scroll_offset_y, 321.0,
+            "history scroll should be restored first"
+        );
+        assert_eq!(
+            app.last_scroll_offset_y_tracked, app.scroll_offset_y,
+            "idle upgrade tracking should start from the restored scroll position"
+        );
+        assert!(
+            app.last_scroll_change_time.duration_since(stale_idle_at) >= Duration::from_secs(4),
+            "folder load should replace the stale idle timestamp"
+        );
+        assert!(
+            app.last_scroll_change_time.elapsed() < Duration::from_secs(1),
+            "idle upgrade should receive a fresh quiet window after folder load"
+        );
+    }
+
+    #[test]
+    fn update_keep_range_enqueue_requests_repaints_before_tail() {
+        use crate::grid_item::GridItem;
+        use std::sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let mut app = setup_app();
+        let image = app.tmp.path().join("cover.jpg");
+        std::fs::write(&image, b"not decoded in this test").unwrap();
+
+        app.items = vec![GridItem::Image(image)];
+        app.image_metas = vec![Some((1, 24))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.settings.grid_cols = 1;
+        app.last_cell_size = 120.0;
+        app.last_cell_h = 120.0;
+        app.last_viewport_h = 120.0;
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        let repaint_count_cb = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_cb.fetch_add(1, Ordering::Relaxed);
+        });
+
+        app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+
+        assert!(
+            app.requested.contains_key(&0),
+            "pending visible item should be queued for loading"
+        );
+        assert!(
+            repaint_count.load(Ordering::Relaxed) > 0,
+            "enqueueing thumbnail work must wake the UI even if App::update returns before its tail"
+        );
+    }
+
+    /// 黒サムネ回帰修正 (2026-06-19, v1.8.0): font-atlas-resync 窓
+    /// (`main_font_atlas_resync_pending`) の間は、フルスクリーン close 直後の no-surface
+    /// フレームで upload が捨てられるのを避けるため、サムネのテクスチャ化を
+    /// `texture_backlog` へ先送りする。pending が解除されたら通常どおり Loaded 化する。
+    #[test]
+    fn thumbnail_upload_deferred_during_font_atlas_resync() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let img = app.tmp.path().join("p.jpg");
+        std::fs::write(&img, b"x").unwrap();
+        app.items = vec![GridItem::Image(img)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![Some((1, 1))];
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.requested.insert(0, false);
+        let cur_gen = app.items_generation;
+
+        let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
+        let send = |app: &App| {
+            app.tx
+                .send(crate::thumb_loader::ThumbMsg {
+                    idx: 0,
+                    image: Some(color.clone()),
+                    from_cache: true,
+                    source_dims: Some((2, 2)),
+                    canceled: false,
+                    finalized: false,
+                    input_seq: 0,
+                    items_gen: cur_gen,
+                })
+                .unwrap();
+        };
+
+        let ctx = egui::Context::default();
+
+        // resync 窓: テクスチャ化せず backlog へ先送り (黒サムネ化させない)。
+        app.main_font_atlas_resync_pending = true;
+        send(&app);
+        app.poll_thumbnails(&ctx);
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Pending),
+            "during resync the thumbnail must not be uploaded (would be discarded -> black)"
+        );
+        assert_eq!(
+            app.texture_backlog.len(),
+            1,
+            "the ColorImage should be parked in the backlog, not dropped"
+        );
+
+        // resync 解除後: 次の poll で backlog から Loaded 化する。
+        app.main_font_atlas_resync_pending = false;
+        app.poll_thumbnails(&ctx);
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+            "after the surface returns the thumbnail uploads normally"
+        );
+        assert!(app.texture_backlog.is_empty(), "backlog should be drained");
+    }
+
+    /// アイドル高画質化の repaint レース対策 (2026-06-19): idle 閾値 (500ms) を過ぎても、
+    /// `enqueue_idle_upgrades` がフレーム境界で取りこぼす可能性のある区間
+    /// (`[500ms, 500ms+MARGIN)`) では、`thumb_idle_upgrade_recheck_delay` が `None` を返さず
+    /// wake を要求し続けること。ここで `None` を返すと egui が就寝し、次のユーザー入力まで
+    /// 高画質化が走らない (ESC 直帰でサムネが低画質のまま固まるバグの根本原因)。
+    #[test]
+    fn idle_upgrade_recheck_keeps_waking_inside_margin_window() {
+        use std::time::{Duration, Instant};
+
+        let mut app = setup_app();
+        app.settings.thumb_idle_upgrade = true;
+        app.requested.clear();
+        // スクロールは十分前に停止済み。入力だけが境界付近。
+        app.last_scroll_change_time = Instant::now() - Duration::from_secs(5);
+        app.last_scroll_offset_y_tracked = app.scroll_offset_y;
+
+        // 旧実装では 500ms を超えた時点で None を返し、enqueue がフレーム境界で skip すると
+        // そのまま就寝した。MARGIN 区間内ではまだ wake を要求し続ける必要がある。
+        app.last_input_at = Some(Instant::now() - Duration::from_millis(515));
+        assert!(
+            app.thumb_idle_upgrade_recheck_delay().is_some(),
+            "within [500ms, 500ms+MARGIN) the recheck must keep scheduling a wake \
+             so the next frame's enqueue_idle_upgrades can actually fire"
+        );
+
+        // MARGIN を十分に過ぎたら、その間に必ず wake フレームで enqueue が走っている前提なので
+        // recheck は譲り、以後は requested ベースのループに任せる (None)。
+        app.last_input_at = Some(Instant::now() - Duration::from_millis(700));
+        assert!(
+            app.thumb_idle_upgrade_recheck_delay().is_none(),
+            "well past threshold+margin the time-based recheck yields"
+        );
+
+        // in-flight があるときは requested ベースのループが回すので recheck は出ない。
+        app.last_input_at = Some(Instant::now() - Duration::from_millis(515));
+        app.requested.insert(0, false);
+        assert!(
+            app.thumb_idle_upgrade_recheck_delay().is_none(),
+            "while work is in flight the requested_nonempty tail drives repaints"
+        );
+    }
+
     /// Codex P3 (2026-04): ヒントの指す名前が items に無い場合 (削除等) は false を
     /// 返し、`start_loading_items` 側の履歴フォールバック分岐に委ねる。
     #[test]
@@ -6022,6 +6252,43 @@ mod favorite_adjustment_defaults_tests {
             !app.pending_return_to_parent,
             "parent return request should be consumed once it is merged"
         );
+    }
+
+    /// PDF/ZIP の「ページを直接開く」モードから Esc で親一覧へ直帰するときも、
+    /// 親一覧の保存済みスクロール位置を復元する。
+    #[test]
+    fn direct_page_parent_return_preserves_parent_scroll_history() {
+        let mut app = setup_app();
+        let parent = app.tmp.path().join("manga");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.pdf");
+        std::fs::write(&book, b"%PDF-1.4\n").unwrap();
+
+        app.items.push(GridItem::PdfPage {
+            pdf_path: book.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.current_folder = Some(book.clone());
+        app.fullscreen_idx = Some(0);
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.folder_history.insert(parent.clone(), (240.0, None));
+        app.pending_return_to_parent = true;
+
+        let nav = app
+            .take_pending_return_to_parent_nav()
+            .expect("parent return request should become navigation");
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+
+        assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.scroll_offset_y, 240.0,
+            "parent list scroll should survive the direct-page close route"
+        );
+        assert!(app.scroll_to_selected);
     }
 
     /// ウィンドウ内フルスクリーン (embedded still) では root 側キー処理が

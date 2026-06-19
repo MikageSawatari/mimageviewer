@@ -33,7 +33,43 @@ Failed は単発の終端ステート。デコードエラー時のみ。
    - 通常キュー: `reload_queue` (Image/ZipImage/PdfPage)
    - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/ConvertibleArchive/ZipDir — 全体走査、
      ZIP セントラルディレクトリ読み、または ZIP 内 prefix の代表解決が必要。PdfFile は PDF ワーカー IPC なので通常キュー)
+   - 1 件以上キューへ投入したフレームは `update_keep_range_and_requests` 自身も repaint を要求する。
+     通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン cleanup や
+     font atlas resync で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
 4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード
+   - 一覧ロード直後は `start_loading_items` が履歴スクロール復元後の位置で idle 判定をリセットし、
+     親一覧へ戻った瞬間に古い idle 時刻で高品質再生成が走らないようにする。
+   - **フレーム内境界レース対策 (2026-06-19)**: アップグレードの起動条件 (input/scroll が
+     500ms idle) は `enqueue_idle_upgrades` がフレーム先頭で、`thumb_idle_upgrade_recheck_delay`
+     がフレーム末尾で評価する。同一フレーム内で経過時間が 500ms 境界をまたぐと、enqueue は
+     skip・recheck は `None` を返して egui が就寝し、**次のユーザー入力までアップグレードが
+     走らない** (ESC で親一覧へ直帰した直後にサムネが低画質/灰色のまま固まる。perf-log で
+     約 7.9 秒のフレーム停止 = `tail_repaint action=none reasons=[]` を確認)。`recheck_delay`
+     は閾値に `MARGIN` (50ms) を足して wake フレームを閾値より後ろへずらし、起床フレーム先頭の
+     enqueue が確実に enqueue できるようにする。BS で 1 段ずつ戻ると境界をまたがず発生しにくいが、
+     ESC 直帰では再現性が高かった。
+
+### 1.2.1 黒サムネ回帰 (v1.8.0) と font-atlas-resync 窓での upload 先送り
+
+**症状 (v1.8.0 で発生 / v1.7.0 では起きない)**: フルスクリーン (静止画 / PDF ページ) を
+Esc / BS で閉じてグリッドへ戻った直後、一部のサムネが**真っ黒**になり ~0.5 秒固着する
+(その後アイドル高画質化の再レンダで自然回復)。
+
+**原因**: v1.8.0 のフルスクリーン viewport cleanup (`show_viewport_immediate` +
+`Visible(false)` + recreate) により、**close 直後の 1 フレームだけメインウィンドウの
+wgpu surface が消える**。その frame に `ctx.load_texture` で queue したテクスチャ upload
+(delta) は eframe の `paint_and_update_textures` の no-surface early return で**捨てられる**。
+font atlas は `main_font_atlas_resync` が数フレーム再 upload して救済していたが、**同じ窓で
+作られた grid サムネのテクスチャは upload だけ捨てられて `ThumbnailState::Loaded` のまま
+残る** → GPU データ空 = `draw_thumb_texture` の黒 backdrop だけが描かれる。テクスチャの
+**中身は正常** (perf 計装 `thumb/suspect_black` で 0 件確認) で、純粋に GPU upload が落ちただけ。
+
+**修正 (2026-06-19, `poll_thumbnails`)**: `main_font_atlas_resync_pending` が立っている間は
+サムネのテクスチャ化を `texture_backlog` へ**先送り**し、surface が戻ってから upload する。
+ColorImage は破棄せず保持するので数フレーム遅れて正しく表示される (黒化しない)。
+perf イベント `thumb/upload_deferred_for_resync` で先送り件数を記録。font atlas 側の
+resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで待つ」方針を
+ユーザーテクスチャにも広げた形。
 
 ### 1.3 ワーカー側の流れ
 
