@@ -181,6 +181,12 @@ impl App {
             let (cleaned, retag_ops) = build_tag_editor_apply_plan(draft, &previous);
             self.settings.tags = cleaned;
             self.settings.save();
+            // タグ定義が変わったら、タグ候補 / 動画 native overlay 用キャッシュを必ず破棄する。
+            // retag_ops が空 (ピン表示の切替や並び替えだけの変更) でも、fullscreen / video の
+            // タグピッカーへ即反映させるため、tag maintenance の有無に関わらず invalidate する
+            // (Codex P2 2026-06-19: 以前は start_tag_maintenance 経由でしか落ちず、ピン/並び替え
+            //  だけの保存が再起動まで反映されなかった)。
+            self.invalidate_tag_apply_suggestions();
             if !retag_ops.is_empty() {
                 self.start_tag_maintenance(retag_ops);
             }

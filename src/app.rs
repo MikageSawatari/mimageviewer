@@ -17750,6 +17750,14 @@ impl App {
         // コンテナ★の Undo/Redo も空表示時に効くよう、可視アイテム数には依存させない。
         self.handle_meta_undo_keys(ctx);
 
+        // F11: メインウィンドウを最大化 ⇔ 復元する (グリッド表示時)。フルスクリーン中は
+        // ui_fullscreen 側が F11 を window/全画面トグルに使うのでこの経路には来ない。
+        // ウィンドウ操作なので可視アイテム数に依存させない (空フォルダ / 検索 0 件でも効く。
+        // Codex P3 2026-06-19: 以前は `if vi_len > 0` 内にあり 0 件グリッドで無反応だった)。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.toggle_main_window_maximized(ctx);
+        }
+
         let display_order = self.current_grid_order().to_vec();
         let vi = display_order.as_slice();
         let vi_len = vi.len();
@@ -17895,12 +17903,6 @@ impl App {
                         MaskShortcut::DeleteConceal => self.delete_conceal_masks_from_selection(),
                     }
                 }
-            }
-
-            // F11: メインウィンドウを最大化 ⇔ 復元する (グリッド表示時)。フルスクリーン中は
-            // ui_fullscreen 側が F11 を window/全画面トグルに使うのでこの経路には来ない。
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
-                self.toggle_main_window_maximized(ctx);
             }
 
             // ──
