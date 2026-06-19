@@ -4778,6 +4778,13 @@ impl NativeEguiOverlay {
         // egui tooltip は hover 後に `request_repaint_after(tooltip_delay)` で開く。
         // native overlay には eframe の repaint callback が無いため、hover UI 表示中は
         // periodic tick で egui pass も回して delay 到達を拾う。
+        // **再生停止バグ修正 (2026-06-19)**: タグ確定 Enter で `render_once()` が pending
+        // イベントを overlay egui へ流すと、タグ付与後にピッカーが閉じて `text_input_active`
+        // が false に落ちる。その「閉じた当の Enter」を `should_forward_to_ui` が転送扱いに
+        // すると、App 側 (`handle_native_video_key_event`) で再生 toggle が走り動画が一時停止する
+        // (IME 確定後の Enter で再現)。イベント処理 *前* のテキスト入力状態を捕まえ、転送判定は
+        // これを OR して「受領時にテキスト入力中だったキーは App へ転送しない」を保証する。
+        let text_input_active_before_events = self.text_input_active();
         let commands = self.render_once()?;
         // overlay が wheel を NavigateItem / TileColumnsDelta に変換したフレームでは、
         // 同じ raw wheel イベントを App へ二重転送しないよう routing に印を付ける。
@@ -4789,6 +4796,7 @@ impl NativeEguiOverlay {
             )
         });
         let mut routing = self.input_routing();
+        routing.text_input_active |= text_input_active_before_events;
         routing.consumed_wheel = consumed_wheel;
         // モーダル中央テキストダイアログの表示中は、App へ raw event を流さない
         // (Codex C1/C2/C3: dark backdrop 上の wheel/right-click が暴発する事故防止)。
