@@ -3383,6 +3383,10 @@ impl App {
                 self.apply_ring_toggle_window_mode(ctx, context);
                 None
             }
+            RingActionId::ToggleMaximize => {
+                self.toggle_main_window_maximized(ctx);
+                None
+            }
             RingActionId::CycleFavorite => self.handle_gamepad_start(ctx),
             RingActionId::AddToBook => {
                 self.apply_ring_add_to_book(ctx, context);

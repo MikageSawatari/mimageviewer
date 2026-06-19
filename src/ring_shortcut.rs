@@ -111,6 +111,7 @@ pub enum RingActionId {
     PinRepresentativeThumb,
     ToggleDetachedViewer,
     ToggleWindowMode,
+    ToggleMaximize,
     CycleFavorite,
     GridToggleDetails,
     GridToggleSnapshotLock,
@@ -156,6 +157,7 @@ impl RingActionId {
             Self::PinRepresentativeThumb => "pin_representative_thumb",
             Self::ToggleDetachedViewer => "toggle_detached_viewer",
             Self::ToggleWindowMode => "toggle_window_mode",
+            Self::ToggleMaximize => "toggle_maximize",
             Self::CycleFavorite => "cycle_favorite",
             Self::GridToggleDetails => "grid_toggle_details",
             Self::GridToggleSnapshotLock => "grid_toggle_snapshot_lock",
@@ -201,6 +203,7 @@ impl RingActionId {
             "pin_representative_thumb" => Self::PinRepresentativeThumb,
             "toggle_detached_viewer" => Self::ToggleDetachedViewer,
             "toggle_window_mode" => Self::ToggleWindowMode,
+            "toggle_maximize" => Self::ToggleMaximize,
             "cycle_favorite" => Self::CycleFavorite,
             "grid_toggle_details" => Self::GridToggleDetails,
             "grid_toggle_snapshot_lock" => Self::GridToggleSnapshotLock,
@@ -252,6 +255,7 @@ impl RingActionId {
             },
             Self::ToggleDetachedViewer => "別ウィンドウ ON/OFF",
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
+            Self::ToggleMaximize => "ウィンドウ最大化/復元",
             Self::CycleFavorite => "お気に入り巡回",
             Self::GridToggleDetails => "表示/詳細",
             Self::GridToggleSnapshotLock => "★固定",
@@ -295,6 +299,7 @@ impl RingActionId {
             RingShortcutContext::Grid => matches!(
                 self,
                 Self::None
+                    | Self::ToggleMaximize
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
@@ -369,6 +374,7 @@ impl RingActionId {
         let actions = match context {
             RingShortcutContext::Grid => vec![
                 Self::None,
+                Self::ToggleMaximize,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
@@ -1218,6 +1224,35 @@ mod tests {
         assert_eq!(
             defaults.video.slots[RingDirection::UpLeft.slot_index()],
             RingActionId::VideoCapture
+        );
+    }
+
+    #[test]
+    fn toggle_maximize_action_round_trips_and_is_grid_only() {
+        // as_str <-> from_str (設定永続化のラウンドトリップ)。
+        assert_eq!(RingActionId::ToggleMaximize.as_str(), "toggle_maximize");
+        assert_eq!(
+            RingActionId::from_str("toggle_maximize"),
+            Some(RingActionId::ToggleMaximize)
+        );
+        // グリッド (メインウィンドウ) のリング / マウスボタン両方の候補に出る。
+        assert!(RingActionId::ToggleMaximize.is_valid_for_context(RingShortcutContext::Grid));
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::Grid)
+                .contains(&RingActionId::ToggleMaximize)
+        );
+        // フルスクリーン (画像/動画) では最大化が無意味なので候補に出さない。
+        assert!(
+            !RingActionId::ToggleMaximize
+                .is_valid_for_context(RingShortcutContext::ImageFullscreen)
+        );
+        assert!(
+            !RingActionId::ToggleMaximize
+                .is_valid_for_context(RingShortcutContext::VideoFullscreen)
+        );
+        assert_eq!(
+            RingActionId::ToggleMaximize.label_for_context(RingShortcutContext::Grid),
+            "ウィンドウ最大化/復元"
         );
     }
 

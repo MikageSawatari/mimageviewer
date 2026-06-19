@@ -17897,6 +17897,12 @@ impl App {
                 }
             }
 
+            // F11: メインウィンドウを最大化 ⇔ 復元する (グリッド表示時)。フルスクリーン中は
+            // ui_fullscreen 側が F11 を window/全画面トグルに使うのでこの経路には来ない。
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+                self.toggle_main_window_maximized(ctx);
+            }
+
             // ──
             // VST3 プラグイン GUI のショートカットキー (旧 V キー) は撤去した。
             // 理由: プラグイン GUI が最前面で開くと mIV メインウィンドウから
@@ -20246,6 +20252,17 @@ impl App {
         } else {
             "別ウィンドウを通常表示に戻しました".to_string()
         });
+        ctx.request_repaint();
+    }
+
+    /// メインウィンドウ (ROOT viewport) の最大化 ⇔ 復元をトグルする。
+    /// グリッド表示時の F11 / リング・マウスショートカット `ToggleMaximize` から呼ぶ。
+    pub(crate) fn toggle_main_window_maximized(&self, ctx: &egui::Context) {
+        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Maximized(!is_max),
+        );
         ctx.request_repaint();
     }
 
