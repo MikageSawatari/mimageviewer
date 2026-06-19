@@ -3507,6 +3507,7 @@ impl App {
                         TS::Rating => show_rating,
                         TS::Favorites => show_favs,
                         TS::Tags => show_tags,
+                        TS::Unknown => false,
                     };
                     if !visible {
                         continue;
@@ -3927,6 +3928,7 @@ impl App {
                         }
                     }
                 }
+                TS::Unknown => {}
                     }
                     first_section = false;
                 }

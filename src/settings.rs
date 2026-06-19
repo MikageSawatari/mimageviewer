@@ -694,6 +694,11 @@ pub enum ToolbarSectionId {
     Rating,
     Favorites,
     Tags,
+    /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
+    /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
+    /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
+    #[serde(other)]
+    Unknown,
 }
 
 impl ToolbarSectionId {
@@ -720,6 +725,10 @@ impl ToolbarSectionId {
     pub fn ordered_with_fallback(saved: &[Self]) -> Vec<Self> {
         let mut out: Vec<Self> = Vec::with_capacity(Self::default_order().len());
         for &id in saved {
+            // 未知セクションは描画対象にしない (forward-compat: 将来変種を読み飛ばす)。
+            if id == Self::Unknown {
+                continue;
+            }
             if !out.contains(&id) {
                 out.push(id);
             }
@@ -4662,6 +4671,39 @@ mod tests {
         assert_eq!(
             got.iter().filter(|&&x| x == ToolbarSectionId::Cols).count(),
             1
+        );
+    }
+
+    #[test]
+    fn toolbar_section_order_drops_unknown_future_variants() {
+        // 将来バージョンの未知セクションは描画順から除外される (forward-compat)。
+        let saved = vec![
+            ToolbarSectionId::Tags,
+            ToolbarSectionId::Unknown,
+            ToolbarSectionId::Cols,
+        ];
+        let got = ToolbarSectionId::ordered_with_fallback(&saved);
+        assert!(
+            !got.contains(&ToolbarSectionId::Unknown),
+            "Unknown は除外されるべき"
+        );
+        assert_eq!(got.len(), ToolbarSectionId::default_order().len());
+        assert_eq!(got[0], ToolbarSectionId::Tags);
+        assert_eq!(got[1], ToolbarSectionId::Cols);
+    }
+
+    #[test]
+    fn toolbar_section_id_deserializes_unknown_tolerantly() {
+        // 旧バイナリ × 新データ: 未知の variant 名はエラーにならず Unknown になる。
+        let v: Vec<ToolbarSectionId> =
+            serde_json::from_str(r#"["Cols","FutureSection","Tags"]"#).unwrap();
+        assert_eq!(
+            v,
+            vec![
+                ToolbarSectionId::Cols,
+                ToolbarSectionId::Unknown,
+                ToolbarSectionId::Tags,
+            ]
         );
     }
 
