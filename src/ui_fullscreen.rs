@@ -6946,7 +6946,9 @@ impl App {
         let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
         let panel_left = full_rect.max.x - panel_w;
         let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
-        let has_right_panel = self.show_metadata_panel || self.metadata_panel_hover_active;
+        let has_right_panel = self.show_metadata_panel
+            || self.metadata_panel_hover_active
+            || self.fullscreen_tag_picker_open;
         // 当たり判定は描画と同じ rect を使う (adjustment_panel_rect 参照)。
         let left_panel_right = adjustment_panel_rect(full_rect).max.x;
         // When the OS cursor is hidden, egui still exposes the last hover position.

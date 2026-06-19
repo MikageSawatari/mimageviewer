@@ -8,7 +8,7 @@ use super::{
     NativeBookmarkTitleEdit, NativeBulkBookmarkDialog, NativeFrameStepHold, NativeOverlayCommand,
     NativeOverlayJumpEntry, NativeOverlayMetadata, NativeOverlayNavigationPreview,
     NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayRingGuide,
-    NativeOverlayRingPicker, NativeOverlayThumbnail, NativeOverlayTileOverlay,
+    NativeOverlayRingPicker, NativeOverlayTagDef, NativeOverlayThumbnail, NativeOverlayTileOverlay,
     NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind, NativeOverlayToast,
     NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
     NativeOverlayVst3SlotState,
@@ -3000,11 +3000,15 @@ pub(super) fn native_vst3_chain_slot_tooltip(slot: &NativeOverlayVst3ChainSlot) 
 fn draw_native_tag_panel(
     ui: &mut egui::Ui,
     metadata: &NativeOverlayMetadata,
+    tag_picker_open: &mut bool,
+    tag_picker_input: &mut String,
+    tag_picker_focus_request: &mut bool,
+    tag_picker_recent_tab: &mut bool,
+    _sticky_item_key: &mut Option<String>,
+    sticky_tags: &mut Vec<NativeOverlayTagDef>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
-    if metadata.shortcut_tags.is_empty() {
-        return;
-    }
+    let visible_tags = native_visible_tag_choices(metadata, sticky_tags);
 
     ui.horizontal(|ui| {
         ui.add_space(14.0);
@@ -3014,57 +3018,427 @@ fn draw_native_tag_panel(
                 .size(13.0)
                 .strong(),
         );
-    });
-    ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(14.0);
-        for def in &metadata.shortcut_tags {
-            let with_hash = format!("#{}", def.name);
-            let is_on = metadata
-                .current_tags
-                .iter()
-                .any(|tag| crate::tags_db::normalize_tag_key(tag) == def.tag_key);
-            let label = egui::RichText::new(&with_hash).color(if is_on {
-                egui::Color32::from_rgb(180, 255, 180)
+        let plus_label = if *tag_picker_open { "×" } else { "＋" };
+        let plus_resp = ui
+            .small_button(plus_label)
+            .on_hover_text(if *tag_picker_open {
+                "タグ入力を閉じる"
             } else {
-                egui::Color32::from_rgb(230, 230, 230)
+                "タグを検索/入力して付ける"
             });
-            let button = egui::Button::new(label)
-                .fill(if is_on {
-                    egui::Color32::from_rgba_unmultiplied(60, 120, 70, 210)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(50, 50, 60, 190)
-                })
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    if is_on {
-                        egui::Color32::from_rgb(120, 200, 120)
-                    } else {
-                        egui::Color32::from_gray(80)
-                    },
-                ));
-            let resp = ui.add(button);
-            let resp = resp.on_hover_text(if is_on {
-                format!("クリックで `{with_hash}` を削除")
+        if plus_resp.clicked() {
+            *tag_picker_open = !*tag_picker_open;
+            if *tag_picker_open {
+                tag_picker_input.clear();
+                *tag_picker_focus_request = true;
+                *tag_picker_recent_tab = false;
             } else {
-                format!("クリックで `{with_hash}` を付与")
-            });
-            let clicked = resp.clicked();
-            resp.context_menu(|ui| {
-                if ui.button("このタグで探す").clicked() {
-                    commands.push(NativeOverlayCommand::OpenTagViewForTag {
-                        name: def.name.clone(),
-                    });
-                    ui.close();
-                }
-            });
-            if clicked {
-                commands.push(NativeOverlayCommand::ToggleTag {
-                    name: def.name.clone(),
-                });
+                tag_picker_input.clear();
+                *tag_picker_focus_request = false;
+                *tag_picker_recent_tab = false;
             }
         }
     });
+    ui.add_space(4.0);
+
+    if !visible_tags.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(14.0);
+            for def in &visible_tags {
+                let with_hash = format!("#{}", def.name);
+                let is_on = native_tag_is_on(&metadata.current_tags, &def.tag_key);
+                let (text_color, fill_color, stroke_color) = native_tag_button_visuals(is_on);
+                let label = egui::RichText::new(&with_hash).color(text_color).strong();
+                let button = egui::Button::new(label)
+                    .fill(fill_color)
+                    .stroke(egui::Stroke::new(1.15, stroke_color));
+                let resp = ui.add(button);
+                let resp = resp.on_hover_text(if is_on {
+                    format!("クリックで `{with_hash}` を削除")
+                } else {
+                    format!("クリックで `{with_hash}` を付与")
+                });
+                let clicked = resp.clicked();
+                resp.context_menu(|ui| {
+                    if ui.button("このタグで探す").clicked() {
+                        commands.push(NativeOverlayCommand::OpenTagViewForTag {
+                            name: def.name.clone(),
+                        });
+                        ui.close();
+                    }
+                });
+                if clicked {
+                    commands.push(NativeOverlayCommand::ToggleTag {
+                        name: def.name.clone(),
+                    });
+                }
+            }
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new("（タグなし）")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(150)),
+            );
+        });
+    }
+}
+
+fn sync_native_tag_sticky(
+    metadata: &NativeOverlayMetadata,
+    sticky_item_key: &mut Option<String>,
+    sticky_tags: &mut Vec<NativeOverlayTagDef>,
+) -> bool {
+    let changed = sticky_item_key.as_deref() != Some(metadata.item_key.as_str());
+    if changed {
+        *sticky_item_key = Some(metadata.item_key.clone());
+        sticky_tags.clear();
+    }
+    for tag in &metadata.current_tags {
+        let tag_key = crate::tags_db::normalize_tag_key(tag);
+        if tag_key.is_empty()
+            || metadata
+                .shortcut_tags
+                .iter()
+                .any(|def| def.tag_key == tag_key)
+            || sticky_tags.iter().any(|def| def.tag_key == tag_key)
+        {
+            continue;
+        }
+        sticky_tags.push(NativeOverlayTagDef {
+            name: native_tag_display_name(metadata, &tag_key, tag),
+            tag_key,
+            count: 0,
+            pinned: false,
+            last_applied_at: 0,
+        });
+    }
+    changed
+}
+
+fn native_visible_tag_choices(
+    metadata: &NativeOverlayMetadata,
+    sticky_tags: &[NativeOverlayTagDef],
+) -> Vec<NativeOverlayTagDef> {
+    let mut out = Vec::new();
+    let mut seen = Vec::<String>::new();
+    for def in &metadata.shortcut_tags {
+        if !def.tag_key.is_empty() && !seen.iter().any(|key| key == &def.tag_key) {
+            seen.push(def.tag_key.clone());
+            out.push(def.clone());
+        }
+    }
+    for def in sticky_tags {
+        if !def.tag_key.is_empty() && !seen.iter().any(|key| key == &def.tag_key) {
+            seen.push(def.tag_key.clone());
+            out.push(def.clone());
+        }
+    }
+    for tag in &metadata.current_tags {
+        let tag_key = crate::tags_db::normalize_tag_key(tag);
+        if !tag_key.is_empty() && !seen.iter().any(|key| key == &tag_key) {
+            seen.push(tag_key.clone());
+            out.push(NativeOverlayTagDef {
+                name: native_tag_display_name(metadata, &tag_key, tag),
+                tag_key,
+                count: 0,
+                pinned: false,
+                last_applied_at: 0,
+            });
+        }
+    }
+    out
+}
+
+fn native_tag_display_name(
+    metadata: &NativeOverlayMetadata,
+    tag_key: &str,
+    fallback: &str,
+) -> String {
+    metadata
+        .tag_choices
+        .iter()
+        .chain(metadata.shortcut_tags.iter())
+        .find(|def| def.tag_key == tag_key)
+        .map(|def| def.name.clone())
+        .unwrap_or_else(|| crate::tags_db::strip_display_hash(fallback).to_string())
+}
+
+fn native_tag_is_on(current_tags: &[String], tag_key: &str) -> bool {
+    current_tags
+        .iter()
+        .any(|tag| crate::tags_db::normalize_tag_key(tag) == tag_key)
+}
+
+fn native_tag_button_visuals(is_on: bool) -> (egui::Color32, egui::Color32, egui::Color32) {
+    if is_on {
+        (
+            egui::Color32::from_rgb(236, 255, 238),
+            egui::Color32::from_rgba_unmultiplied(26, 108, 62, 246),
+            egui::Color32::from_rgb(132, 236, 156),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(248, 250, 255),
+            egui::Color32::from_rgba_unmultiplied(35, 38, 50, 246),
+            egui::Color32::from_rgb(132, 146, 174),
+        )
+    }
+}
+
+fn draw_native_tag_picker_panel(
+    ui: &mut egui::Ui,
+    metadata: &NativeOverlayMetadata,
+    tag_picker_open: &mut bool,
+    tag_picker_input: &mut String,
+    tag_picker_focus_request: &mut bool,
+    tag_picker_recent_tab: &mut bool,
+    tag_picker_enter_pressed: bool,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            egui::RichText::new("タグを選択")
+                .color(egui::Color32::WHITE)
+                .size(13.0)
+                .strong(),
+        );
+        if ui.button("戻る").clicked() {
+            close_native_tag_picker(
+                tag_picker_open,
+                tag_picker_input,
+                tag_picker_focus_request,
+                tag_picker_recent_tab,
+            );
+        }
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            egui::RichText::new(&metadata.file_name)
+                .size(11.0)
+                .color(egui::Color32::from_rgb(168, 176, 188)),
+        );
+    });
+
+    let mut close_after_apply = false;
+    draw_native_tag_picker(
+        ui,
+        metadata,
+        tag_picker_input,
+        tag_picker_focus_request,
+        tag_picker_recent_tab,
+        tag_picker_enter_pressed,
+        commands,
+        &mut close_after_apply,
+    );
+    if close_after_apply {
+        close_native_tag_picker(
+            tag_picker_open,
+            tag_picker_input,
+            tag_picker_focus_request,
+            tag_picker_recent_tab,
+        );
+    }
+}
+
+fn close_native_tag_picker(
+    tag_picker_open: &mut bool,
+    tag_picker_input: &mut String,
+    tag_picker_focus_request: &mut bool,
+    tag_picker_recent_tab: &mut bool,
+) {
+    *tag_picker_open = false;
+    tag_picker_input.clear();
+    *tag_picker_focus_request = false;
+    *tag_picker_recent_tab = false;
+}
+
+fn draw_native_tag_picker(
+    ui: &mut egui::Ui,
+    metadata: &NativeOverlayMetadata,
+    input: &mut String,
+    focus_request: &mut bool,
+    recent_tab: &mut bool,
+    enter_pressed: bool,
+    commands: &mut Vec<NativeOverlayCommand>,
+    close_after_apply: &mut bool,
+) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        let input_resp = ui.add_sized(
+            [174.0, 22.0],
+            egui::TextEdit::singleline(input)
+                .hint_text("タグを検索/入力")
+                .return_key(None::<egui::KeyboardShortcut>),
+        );
+        if *focus_request {
+            input_resp.request_focus();
+            *focus_request = false;
+        }
+        let normalized = crate::tags_db::normalize_tag_display_name(input.trim());
+        let valid = native_tag_input_valid(&normalized);
+        let add_clicked = ui.add_enabled(valid, egui::Button::new("付ける")).clicked();
+        let enter_pressed = input_resp.has_focus() && enter_pressed;
+        if valid && (add_clicked || enter_pressed) {
+            commands.push(NativeOverlayCommand::AddTag {
+                name: normalized.clone(),
+            });
+            input.clear();
+            *focus_request = true;
+            *close_after_apply = true;
+        }
+    });
+    let normalized = crate::tags_db::normalize_tag_display_name(input.trim());
+    let input_too_long = normalized.chars().count() > 64;
+    let input_has_whitespace = crate::tags_db::tag_display_name_has_whitespace(&normalized);
+    if input_too_long || input_has_whitespace {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new(if input_too_long {
+                    "タグ名は64文字以内です。"
+                } else {
+                    "タグ名に空白は使えません。"
+                })
+                .size(11.0)
+                .color(egui::Color32::from_rgb(220, 120, 90)),
+            );
+        });
+    }
+
+    let query_key = crate::tags_db::normalize_tag_key(&normalized);
+    draw_native_tag_picker_tabs(ui, recent_tab);
+    let mut choices = native_picker_choices(metadata, &query_key, *recent_tab);
+    choices.truncate(12);
+    ui.add_space(4.0);
+    if choices.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new("候補なし")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(150)),
+            );
+        });
+        return;
+    }
+
+    for choice in choices {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            let tag = format!("#{}", choice.name);
+            let label_w = (ui.available_width() - 118.0).max(96.0);
+            ui.add_sized(
+                [label_w, 20.0],
+                egui::Label::new(
+                    egui::RichText::new(&tag)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(246, 248, 252)),
+                )
+                .truncate(),
+            )
+            .on_hover_text(tag);
+            let meta = if choice.count > 0 {
+                format!("{}件", choice.count)
+            } else if choice.pinned {
+                "ピン".to_string()
+            } else {
+                String::new()
+            };
+            ui.add_sized(
+                [34.0, 20.0],
+                egui::Label::new(
+                    egui::RichText::new(meta)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(188, 198, 214)),
+                ),
+            );
+            let is_on = native_tag_is_on(&metadata.current_tags, &choice.tag_key);
+            let button_label = if is_on { "外す" } else { "付ける" };
+            if ui.button(button_label).clicked() {
+                if is_on {
+                    commands.push(NativeOverlayCommand::RemoveTag {
+                        name: choice.name.clone(),
+                    });
+                    *close_after_apply = true;
+                } else {
+                    commands.push(NativeOverlayCommand::AddTag {
+                        name: choice.name.clone(),
+                    });
+                    *close_after_apply = true;
+                }
+            }
+        });
+    }
+}
+
+fn native_tag_input_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && !crate::tags_db::tag_display_name_has_whitespace(name)
+}
+
+fn draw_native_tag_picker_tabs(ui: &mut egui::Ui, recent_tab: &mut bool) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        if ui.selectable_label(!*recent_tab, "ピン留め").clicked() {
+            *recent_tab = false;
+        }
+        if ui.selectable_label(*recent_tab, "最近").clicked() {
+            *recent_tab = true;
+        }
+    });
+}
+
+fn native_picker_choices(
+    metadata: &NativeOverlayMetadata,
+    query_key: &str,
+    recent_tab: bool,
+) -> Vec<NativeOverlayTagDef> {
+    let mut out = Vec::new();
+    let mut seen = Vec::<String>::new();
+    for choice in &metadata.tag_choices {
+        if choice.tag_key.is_empty() || seen.iter().any(|key| key == &choice.tag_key) {
+            continue;
+        }
+        if !query_key.is_empty() {
+            if !choice.tag_key.starts_with(query_key) {
+                continue;
+            }
+        } else if recent_tab {
+            if choice.last_applied_at <= 0 {
+                continue;
+            }
+        } else if !choice.pinned {
+            continue;
+        }
+        seen.push(choice.tag_key.clone());
+        out.push(choice.clone());
+    }
+    if !query_key.is_empty() {
+        out.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.last_applied_at.cmp(&a.last_applied_at))
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    } else if recent_tab {
+        out.sort_by(|a, b| {
+            b.last_applied_at
+                .cmp(&a.last_applied_at)
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+    out
 }
 
 pub(super) fn draw_native_metadata_panel(
@@ -3072,6 +3446,13 @@ pub(super) fn draw_native_metadata_panel(
     overlay_width_points: f32,
     overlay_height_points: f32,
     metadata: &NativeOverlayMetadata,
+    tag_picker_open: &mut bool,
+    tag_picker_input: &mut String,
+    tag_picker_focus_request: &mut bool,
+    sticky_item_key: &mut Option<String>,
+    sticky_tags: &mut Vec<NativeOverlayTagDef>,
+    tag_picker_recent_tab: &mut bool,
+    tag_picker_enter_pressed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
@@ -3270,8 +3651,43 @@ pub(super) fn draw_native_metadata_panel(
                 .max_height(content_rect.height())
                 .show(&mut content_ui, |ui| {
                     ui.add_space(6.0);
-                    draw_native_tag_panel(ui, metadata, commands);
-                    if !metadata.shortcut_tags.is_empty() && !rows.is_empty() {
+                    if sync_native_tag_sticky(metadata, sticky_item_key, sticky_tags) {
+                        close_native_tag_picker(
+                            tag_picker_open,
+                            tag_picker_input,
+                            tag_picker_focus_request,
+                            tag_picker_recent_tab,
+                        );
+                    }
+                    if *tag_picker_open {
+                        draw_native_tag_picker_panel(
+                            ui,
+                            metadata,
+                            tag_picker_open,
+                            tag_picker_input,
+                            tag_picker_focus_request,
+                            tag_picker_recent_tab,
+                            tag_picker_enter_pressed,
+                            commands,
+                        );
+                        return;
+                    }
+                    draw_native_tag_panel(
+                        ui,
+                        metadata,
+                        tag_picker_open,
+                        tag_picker_input,
+                        tag_picker_focus_request,
+                        tag_picker_recent_tab,
+                        sticky_item_key,
+                        sticky_tags,
+                        commands,
+                    );
+                    if (!metadata.shortcut_tags.is_empty()
+                        || !metadata.current_tags.is_empty()
+                        || *tag_picker_open)
+                        && !rows.is_empty()
+                    {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(8.0);

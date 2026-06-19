@@ -442,6 +442,12 @@ pub enum NativeVideoOutputEvent {
     ToggleTag {
         name: String,
     },
+    AddTag {
+        name: String,
+    },
+    RemoveTag {
+        name: String,
+    },
     OpenTagViewForTag {
         name: String,
     },
@@ -1504,6 +1510,8 @@ fn send_native_overlay_command(
         Command::ClearAllBookmarksForCurrent => NativeVideoOutputEvent::ClearAllBookmarksForCurrent,
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
         Command::ToggleTag { name } => NativeVideoOutputEvent::ToggleTag { name },
+        Command::AddTag { name } => NativeVideoOutputEvent::AddTag { name },
+        Command::RemoveTag { name } => NativeVideoOutputEvent::RemoveTag { name },
         Command::OpenTagViewForTag { name } => NativeVideoOutputEvent::OpenTagViewForTag { name },
         Command::ToggleNormalize => NativeVideoOutputEvent::ToggleNormalize,
         Command::DisableNormalize => NativeVideoOutputEvent::DisableNormalize,
@@ -3187,6 +3195,24 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleTag { name },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::AddTag {
+                                name,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::AddTag { name },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::RemoveTag {
+                                name,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::RemoveTag { name },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::OpenTagViewForTag {

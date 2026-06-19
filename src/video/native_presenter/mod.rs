@@ -411,6 +411,15 @@ struct NativeEguiOverlay {
     /// **composition 中のみ** 抑止するために参照する (commit 直後はすぐ通す方が
     /// UX 上自然、Codex P3 2026-05-24)。
     ime_composing: bool,
+    /// Enter/Escape の IME 確定・キャンセルハイジャックを防ぐため、Ime event 直後は
+    /// 短時間ダイアログ確定扱いにしない。Ctrl+V/C/X には使わない。
+    ime_last_event_at: Option<Instant>,
+    tag_picker_open: bool,
+    tag_picker_input: String,
+    tag_picker_focus_request: bool,
+    tag_picker_recent_tab: bool,
+    tag_panel_sticky_item_key: Option<String>,
+    tag_panel_sticky_tags: Vec<NativeOverlayTagDef>,
     video_metadata: Option<NativeOverlayMetadata>,
     fallback_file_name: String,
     navigation_preview: Option<NativeOverlayNavigationPreview>,
@@ -669,10 +678,14 @@ pub struct NativeOverlayTimelineMarker {
 pub struct NativeOverlayTagDef {
     pub name: String,
     pub tag_key: String,
+    pub count: usize,
+    pub pinned: bool,
+    pub last_applied_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeOverlayMetadata {
+    pub item_key: String,
     pub file_name: String,
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -681,6 +694,7 @@ pub struct NativeOverlayMetadata {
     pub probe_info_available: bool,
     pub current_tags: Vec<String>,
     pub shortcut_tags: Vec<NativeOverlayTagDef>,
+    pub tag_choices: Vec<NativeOverlayTagDef>,
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
@@ -1187,6 +1201,12 @@ pub enum NativeOverlayCommand {
         url: String,
     },
     ToggleTag {
+        name: String,
+    },
+    AddTag {
+        name: String,
+    },
+    RemoveTag {
         name: String,
     },
     OpenTagViewForTag {
@@ -3768,6 +3788,13 @@ impl NativeEguiOverlay {
             bookmark_title_edit: None,
             bulk_bookmark_dialog: None,
             ime_composing: false,
+            ime_last_event_at: None,
+            tag_picker_open: false,
+            tag_picker_input: String::new(),
+            tag_picker_focus_request: false,
+            tag_picker_recent_tab: false,
+            tag_panel_sticky_item_key: None,
+            tag_panel_sticky_tags: Vec::new(),
             video_metadata: None,
             fallback_file_name: String::new(),
             navigation_preview: None,
@@ -3978,6 +4005,7 @@ impl NativeEguiOverlay {
             NativeEvent::Ime(ime) => {
                 // IME composition state を追跡: Ctrl+V/C/X 等のクリップボードショートカットを
                 // **変換中だけ** 抑止するため (Codex P3: commit 直後の Ctrl+V を落とさない)。
+                self.ime_last_event_at = Some(Instant::now());
                 match &ime {
                     NativeVideoImeEvent::Enabled => {}
                     NativeVideoImeEvent::Preedit(text) => {
@@ -5182,7 +5210,18 @@ impl NativeEguiOverlay {
     }
 
     fn text_input_active(&self) -> bool {
-        self.bookmark_title_edit.is_some() || self.bulk_bookmark_dialog.is_some()
+        self.bookmark_title_edit.is_some()
+            || self.bulk_bookmark_dialog.is_some()
+            || self.tag_picker_open
+    }
+
+    fn ime_input_active(&self) -> bool {
+        if self.ime_composing {
+            return true;
+        }
+        self.ime_last_event_at
+            .map(|at| at.elapsed() < Duration::from_millis(300))
+            .unwrap_or(false)
     }
 
     fn maybe_claim_text_input_focus(&mut self) {
@@ -5286,11 +5325,18 @@ impl NativeEguiOverlay {
         let Some(metadata) = self.video_metadata.as_ref() else {
             return false;
         };
-        if !metadata.probe_info_available && metadata.shortcut_tags.is_empty() {
+        if !metadata.probe_info_available
+            && metadata.shortcut_tags.is_empty()
+            && metadata.current_tags.is_empty()
+            && metadata.tag_choices.is_empty()
+        {
             return false;
         }
         if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {
             return false;
+        }
+        if self.tag_picker_open {
+            return true;
         }
         let Some(pos) = self.pointer_pos else {
             return false;
@@ -5599,6 +5645,7 @@ impl NativeEguiOverlay {
         if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
             viewport.native_pixels_per_point = Some(ppp);
         }
+        let tag_picker_enter_allowed = !self.ime_input_active();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if !overlay_visible {
                 return;
@@ -5773,12 +5820,21 @@ impl NativeEguiOverlay {
                     guide,
                 );
             }
+            let tag_picker_enter_pressed =
+                tag_picker_enter_allowed && ctx.input(|i| i.key_pressed(egui::Key::Enter));
             if right_panel_visible && let Some(metadata) = video_metadata.as_ref() {
                 draw_native_metadata_panel(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
                     metadata,
+                    &mut self.tag_picker_open,
+                    &mut self.tag_picker_input,
+                    &mut self.tag_picker_focus_request,
+                    &mut self.tag_panel_sticky_item_key,
+                    &mut self.tag_panel_sticky_tags,
+                    &mut self.tag_picker_recent_tab,
+                    tag_picker_enter_pressed,
                     &mut commands,
                 );
             }

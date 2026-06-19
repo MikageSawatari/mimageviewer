@@ -307,12 +307,24 @@ impl App {
         self.request_tag_set_for_selection(name, false);
     }
 
+    pub(crate) fn request_tag_add_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
+        self.request_tag_set_for_targets(name, targets, true);
+    }
+
+    pub(crate) fn request_tag_remove_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
+        self.request_tag_set_for_targets(name, targets, false);
+    }
+
     fn request_tag_set_for_selection(&mut self, name: &str, add: bool) {
+        let targets = self.tag_targets();
+        self.request_tag_set_for_targets(name, targets, add);
+    }
+
+    fn request_tag_set_for_targets(&mut self, name: &str, targets: Vec<TagTarget>, add: bool) {
         let name = crate::tags_db::normalize_tag_display_name(name);
         if name.is_empty() {
             return;
         }
-        let targets = self.tag_targets();
         if targets.is_empty() {
             return;
         }

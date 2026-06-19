@@ -2156,6 +2156,16 @@ impl App {
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
+            crate::video::NativeVideoOutputEvent::AddTag { name } => {
+                self.request_tag_add_for_selection(&name);
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::RemoveTag { name } => {
+                self.request_tag_remove_for_selection(&name);
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::OpenTagViewForTag { name } => {
                 self.open_tag_view_for_tag(&name);
                 self.mark_native_video_hud_activity(ctx);
@@ -3681,12 +3691,20 @@ impl App {
         }) else {
             return;
         };
+        let item_key = crate::tags_db::item_key_for_path(&path);
         self.hydrate_tags_cache_for_paths(std::slice::from_ref(&path));
-        let current_tags = self
-            .tags_cache
-            .get(&crate::tags_db::item_key_for_path(&path))
-            .cloned()
-            .unwrap_or_default();
+        let current_tags = self.tags_cache.get(&item_key).cloned().unwrap_or_default();
+        let tag_choices: Vec<_> = self
+            .cached_tag_choice_catalog()
+            .into_iter()
+            .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
+                name: tag.name,
+                tag_key: tag.tag_key,
+                count: tag.count,
+                pinned: tag.pinned,
+                last_applied_at: tag.last_applied_at,
+            })
+            .collect();
         let shortcut_tags: Vec<_> = self
             .settings
             .tags
@@ -3695,6 +3713,13 @@ impl App {
             .map(|tag| crate::video::native_presenter::NativeOverlayTagDef {
                 name: tag.name.clone(),
                 tag_key: tag.tag_key.clone(),
+                count: 0,
+                pinned: true,
+                last_applied_at: tag_choices
+                    .iter()
+                    .find(|choice| choice.tag_key == tag.tag_key)
+                    .map(|choice| choice.last_applied_at)
+                    .unwrap_or(0),
             })
             .collect();
 
@@ -3718,6 +3743,7 @@ impl App {
             );
             let interlace_detected = info.dynamic.interlace_detected.load(Ordering::Acquire);
             crate::video::native_presenter::NativeOverlayMetadata {
+                item_key: item_key.clone(),
                 file_name,
                 title: info.title.clone(),
                 artist: info.artist.clone(),
@@ -3726,6 +3752,7 @@ impl App {
                 probe_info_available: true,
                 current_tags,
                 shortcut_tags,
+                tag_choices,
                 width: info.width,
                 height: info.height,
                 duration_secs: info.duration_secs,
@@ -3746,6 +3773,7 @@ impl App {
             }
         } else {
             crate::video::native_presenter::NativeOverlayMetadata {
+                item_key,
                 file_name,
                 title: None,
                 artist: None,
@@ -3754,6 +3782,7 @@ impl App {
                 probe_info_available: false,
                 current_tags,
                 shortcut_tags,
+                tag_choices,
                 width: 0,
                 height: 0,
                 duration_secs: 0.0,

@@ -11,11 +11,12 @@ use eframe::egui;
 use crate::app::App;
 
 #[derive(Clone)]
-struct TagChoice {
-    name: String,
-    tag_key: String,
-    count: usize,
-    pinned: bool,
+pub(crate) struct TagChoice {
+    pub(crate) name: String,
+    pub(crate) tag_key: String,
+    pub(crate) count: usize,
+    pub(crate) pinned: bool,
+    pub(crate) last_applied_at: i64,
 }
 
 impl App {
@@ -34,6 +35,7 @@ impl App {
     pub(crate) fn invalidate_tag_apply_suggestions(&mut self) {
         self.tag_apply_suggestion_key = None;
         self.tag_apply_suggestions.clear();
+        self.tag_choice_catalog_cache = None;
         self.tag_apply_selection_cache = None;
         // facet メニュー側のキャッシュも同じタイミング (タグデータ変更) で破棄する。
         self.facet_tag_suggestion_cache = None;
@@ -81,6 +83,7 @@ impl App {
                 tag_key: tag_key.clone(),
                 count: *count,
                 pinned: false,
+                last_applied_at: 0,
             })
             .collect();
         let current_keys: HashSet<String> = current_tags
@@ -311,6 +314,7 @@ impl App {
                         choice.tag_key.clone(),
                         choice.count,
                         choice.pinned,
+                        choice.last_applied_at,
                     )
                 })
                 .collect();
@@ -318,13 +322,53 @@ impl App {
         }
         self.tag_apply_suggestions
             .iter()
-            .map(|(name, tag_key, count, pinned)| TagChoice {
-                name: name.clone(),
-                tag_key: tag_key.clone(),
-                count: *count,
-                pinned: *pinned,
-            })
+            .map(
+                |(name, tag_key, count, pinned, last_applied_at)| TagChoice {
+                    name: name.clone(),
+                    tag_key: tag_key.clone(),
+                    count: *count,
+                    pinned: *pinned,
+                    last_applied_at: *last_applied_at,
+                },
+            )
             .collect()
+    }
+
+    pub(crate) fn cached_tag_choice_catalog(&mut self) -> Vec<TagChoice> {
+        if self.tag_choice_catalog_cache.is_none() {
+            let catalog = tag_choice_catalog(self);
+            self.tag_choice_catalog_cache = Some(
+                catalog
+                    .iter()
+                    .map(|choice| {
+                        (
+                            choice.name.clone(),
+                            choice.tag_key.clone(),
+                            choice.count,
+                            choice.pinned,
+                            choice.last_applied_at,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        self.tag_choice_catalog_cache
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .iter()
+                    .map(
+                        |(name, tag_key, count, pinned, last_applied_at)| TagChoice {
+                            name: name.clone(),
+                            tag_key: tag_key.clone(),
+                            count: *count,
+                            pinned: *pinned,
+                            last_applied_at: *last_applied_at,
+                        },
+                    )
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -429,6 +473,7 @@ fn current_selection_tags(app: &App, paths: &[PathBuf]) -> Vec<TagChoice> {
                     tag_key,
                     count: 1,
                     pinned: false,
+                    last_applied_at: 0,
                 });
         }
     }
@@ -482,6 +527,7 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
                         tag_key: tag.tag_key.clone(),
                         count: 0,
                         pinned: tag.show_shortcut,
+                        last_applied_at: 0,
                     });
                 }
             }
@@ -498,6 +544,7 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
             if !seen.insert(summary.tag_key.clone()) {
                 if let Some(choice) = out.iter_mut().find(|c| c.tag_key == summary.tag_key) {
                     choice.count = summary.count;
+                    choice.last_applied_at = summary.last_applied_at;
                 }
                 continue;
             }
@@ -510,6 +557,7 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
                 tag_key: summary.tag_key,
                 count: summary.count,
                 pinned,
+                last_applied_at: summary.last_applied_at,
             });
             added += 1;
         }
@@ -523,6 +571,66 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
         let remaining = QUERY_LIMIT.saturating_sub(out.len());
         add_summaries(&mut out, &mut seen, &mut summaries, remaining);
         out.truncate(QUERY_LIMIT);
+    }
+
+    out
+}
+
+fn tag_choice_catalog(app: &App) -> Vec<TagChoice> {
+    const RECENT_LIMIT: usize = 256;
+
+    let mut summaries = app
+        .tags_db
+        .as_ref()
+        .map(|db| db.tag_summaries())
+        .unwrap_or_default();
+    summaries.sort_by(|a, b| {
+        b.last_applied_at
+            .cmp(&a.last_applied_at)
+            .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
+    });
+    let summary_by_key: HashMap<String, crate::tags_db::TagSummary> = summaries
+        .iter()
+        .map(|summary| (summary.tag_key.clone(), summary.clone()))
+        .collect();
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for tag in &app.settings.tags {
+        if seen.insert(tag.tag_key.clone()) {
+            let count = summary_by_key
+                .get(&tag.tag_key)
+                .map(|summary| summary.count)
+                .unwrap_or(0);
+            out.push(TagChoice {
+                name: tag.name.clone(),
+                tag_key: tag.tag_key.clone(),
+                count,
+                pinned: tag.show_shortcut,
+                last_applied_at: summary_by_key
+                    .get(&tag.tag_key)
+                    .map(|summary| summary.last_applied_at)
+                    .unwrap_or(0),
+            });
+        }
+    }
+
+    let mut recent_added = 0usize;
+    for summary in summaries {
+        if recent_added >= RECENT_LIMIT {
+            break;
+        }
+        if seen.insert(summary.tag_key.clone()) {
+            out.push(TagChoice {
+                name: summary.tag,
+                tag_key: summary.tag_key,
+                count: summary.count,
+                pinned: false,
+                last_applied_at: summary.last_applied_at,
+            });
+            recent_added += 1;
+        }
     }
 
     out

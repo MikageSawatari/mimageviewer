@@ -2809,7 +2809,15 @@ pub struct App {
     pub(crate) show_tag_apply: bool,
     pub(crate) tag_apply_input: String,
     pub(crate) tag_apply_suggestion_key: Option<String>,
-    pub(crate) tag_apply_suggestions: Vec<(String, String, usize, bool)>,
+    pub(crate) tag_apply_suggestions: Vec<(String, String, usize, bool, i64)>,
+    pub(crate) tag_choice_catalog_cache: Option<Vec<(String, String, usize, bool, i64)>>,
+    pub(crate) fullscreen_tag_picker_open: bool,
+    pub(crate) fullscreen_tag_picker_input: String,
+    pub(crate) fullscreen_tag_picker_row_key: Option<String>,
+    pub(crate) fullscreen_tag_picker_focus_request: bool,
+    pub(crate) fullscreen_tag_picker_recent_tab: bool,
+    pub(crate) fullscreen_tag_panel_target_key: Option<String>,
+    pub(crate) fullscreen_tag_panel_sticky_tags: Vec<(String, String)>,
     /// タグ付与ダイアログの選択スナップショット: (選択フィンガープリント, 対象パス,
     /// 現在の選択タグ (name, tag_key, count))。毎フレームの全選択 clone + NFKC を防ぐ。
     #[allow(clippy::type_complexity)]
@@ -5323,6 +5331,14 @@ impl App {
             tag_apply_input: String::new(),
             tag_apply_suggestion_key: None,
             tag_apply_suggestions: Vec::new(),
+            tag_choice_catalog_cache: None,
+            fullscreen_tag_picker_open: false,
+            fullscreen_tag_picker_input: String::new(),
+            fullscreen_tag_picker_row_key: None,
+            fullscreen_tag_picker_focus_request: false,
+            fullscreen_tag_picker_recent_tab: false,
+            fullscreen_tag_panel_target_key: None,
+            fullscreen_tag_panel_sticky_tags: Vec::new(),
             tag_apply_selection_cache: None,
             facet_tag_suggestion_cache: None,
             facet_tag_counts_cache: None,
@@ -6842,6 +6858,7 @@ impl App {
             || self.show_favorites_editor
             || self.show_tag_editor
             || self.show_tag_apply
+            || self.fullscreen_tag_picker_open
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_new_folder_dialog
@@ -6880,6 +6897,7 @@ impl App {
             || self.show_favorites_editor
             || self.show_tag_editor
             || self.show_tag_apply
+            || self.fullscreen_tag_picker_open
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_new_folder_dialog
@@ -6910,6 +6928,16 @@ impl App {
             || self.editing_addon_install_state.is_some()
             // テキスト注釈の子ダイアログ表示中も同様にフルスクリーンキーを止める (Codex P2)。
             || self.text_subdialog_open()
+    }
+
+    pub(crate) fn clear_fullscreen_tag_picker_state(&mut self) {
+        self.fullscreen_tag_picker_open = false;
+        self.fullscreen_tag_picker_input.clear();
+        self.fullscreen_tag_picker_row_key = None;
+        self.fullscreen_tag_picker_focus_request = false;
+        self.fullscreen_tag_picker_recent_tab = false;
+        self.fullscreen_tag_panel_target_key = None;
+        self.fullscreen_tag_panel_sticky_tags.clear();
     }
 
     pub(crate) fn show_mouse_nav_migration_prompt_dialog(&mut self, ctx: &egui::Context) {
@@ -25785,6 +25813,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.capture_region_selection = None;
+        self.clear_fullscreen_tag_picker_state();
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
         // 開いたとき分析モードのまま起動してしまう (fullscreen_idx がまだ有効なうちに呼ぶ)。
         if self.analysis_mode {
