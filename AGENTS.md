@@ -48,6 +48,11 @@ always-active guidance.
   design that can be made fundamentally correct; if the correct design is larger
   than expected, document the scope and proceed in coherent steps rather than
   landing a stopgap that is likely to create follow-up bug reports.
+- Do not remove, disable, delay, or degrade existing user-facing functionality as
+  a bug fix or temporary workaround without explicit user approval. If a correct
+  fix appears to require a behavior change, explain the trade-off and ask before
+  editing. Bug fixes should preserve the intended feature set unless the user has
+  approved the functional change.
 
 ## UI And Tests
 
