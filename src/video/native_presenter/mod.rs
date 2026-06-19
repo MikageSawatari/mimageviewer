@@ -1233,7 +1233,14 @@ impl NativeOverlayInputRouting {
 
         match event {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
-                if !self.text_input_active && native_video_fullscreen_shortcut_key(key) {
+                if self.text_input_active {
+                    // テキスト入力中 (タグピッカー / ブックマーク編集) はキーをテキスト編集が
+                    // 消費するので App へ一切転送しない。`wants_keyboard_input` (前フレーム
+                    // sample) は TextEdit が確定 Enter でフォーカスを一瞬失うとその隙に false に
+                    // なり、Enter が App へ漏れて fullscreen close = 再生停止を誘発していた
+                    // (動画タグ付与で Enter 確定 → 停止、の実害)。text_input_active で確実に塞ぐ。
+                    false
+                } else if native_video_fullscreen_shortcut_key(key) {
                     true
                 } else if self.modal_dialog_active {
                     // モーダル中はショートカット以外のキーも App へ流さない
@@ -8216,6 +8223,24 @@ mod tests {
         // text_input_active 中はマウス進む/戻るも UI 側へ流さない (= text 編集の邪魔をしない)。
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA6))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA7))));
+    }
+
+    /// 回帰 (2026-06-19): 動画タグピッカーで Enter 確定すると TextEdit が一瞬フォーカスを
+    /// 失い `wants_keyboard_input` が false になる。その隙に Enter が App へ転送されて
+    /// fullscreen close = 再生停止していた。`text_input_active` 中は `wants_keyboard_input`
+    /// の値に関わらずキーを一切 App へ転送しないこと (focus が無い瞬間も塞ぐ)。
+    #[test]
+    fn native_overlay_never_forwards_keys_while_text_input_active_without_focus() {
+        let routing = NativeOverlayInputRouting {
+            wants_keyboard_input: false,
+            text_input_active: true,
+            ..Default::default()
+        };
+        // Enter (0x0D) / Escape (0x1B) / Space (0x20) / F11 (0x7A) いずれも転送しない。
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x1B))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x7A))));
     }
 
     #[test]
