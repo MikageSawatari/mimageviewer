@@ -1114,6 +1114,7 @@ impl App {
         // 復活してしまう (Codex P2)。
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_showing_flat = false;
         // 旧タスク停止: インデックスが付け替わるので in-flight は意味を失う
         if let Some(pending) = self.search_pending.take() {
             pending.cancel();

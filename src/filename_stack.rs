@@ -144,13 +144,15 @@ pub fn group_media(media: Vec<StackMember>, separator: char, sort: SortOrder) ->
 
 /// スタックモードのビュー状態 (App が `Option<StackView>` で保持)。
 ///
-/// `drilled` で 2 状態を表す:
-/// - `None` = 集約ビュー (1 グループ = 1 セル。複数枚はスタックセル + バッジ、単独は通常セル)。
-/// - `Some(g)` = メンバーグリッド (groups[g] のメンバーを実 `Image`/`Video` セルで展開)。
+/// グリッドは常に**集約ビュー** (1 グループ = 1 セル。複数枚はスタックセル + バッジ、単独は
+/// 通常セル) を表示する。スタック/画像セルを開くと、フルスクリーンは **フラット読書ビュー**
+/// (= 全画像を 1 本の並びに展開) を読む: `↓↑` は境界を越えて順送り、`Shift+↓↑` で次/前のスタック
+/// の先頭へジャンプ、`Ctrl+↓↑` はフォルダ移動 (据え置き)。メンバーグリッドは設けない
+/// (1 枚スタックの割合が高く、毎回中間グリッドを挟むと煩雑なため。実機フィードバック 2026-06-20)。
 ///
-/// `passthrough` は画像以外 (フォルダ / ZIP / PDF / 変換アーカイブ) のセル列で、集約ビューの
-/// 先頭に置く (= 通常レイアウトのコンテナ先頭慣習を踏襲、plan §4 「素通し表示」)。`groups` は
-/// メディア (画像 + 動画) を prefix でまとめたもの (動画は単独固定)。
+/// `passthrough` は画像以外 (フォルダ / ZIP / PDF / 変換アーカイブ) のセル列で、両ビューの先頭に
+/// 置く (= 通常レイアウトのコンテナ先頭慣習を踏襲、plan §4 「素通し表示」)。`groups` はメディア
+/// (画像 + 動画) を prefix でまとめたもの (動画は単独固定)。
 /// (`GridItem` が `Debug` 非対応のため `Debug` は derive しない。)
 #[derive(Clone)]
 pub struct StackView {
@@ -160,14 +162,12 @@ pub struct StackView {
     pub separator: char,
     /// 構築時のソート順 (グループ/メンバーの並びはこれに従う)。
     pub sort: SortOrder,
-    /// 画像以外のコンテナセル (集約ビュー先頭の passthrough)。
+    /// 画像以外のコンテナセル (両ビュー先頭の passthrough)。
     pub passthrough: Vec<GridItem>,
     /// `passthrough` と同インデックスの `(mtime, size)`。
     pub passthrough_metas: Vec<Option<(i64, i64)>>,
     /// メディアグループ (表示順)。
     pub groups: Vec<StackGroup>,
-    /// ドリル状態。`None` = 集約、`Some(g)` = groups[g] のメンバーグリッド。
-    pub drilled: Option<usize>,
 }
 
 impl StackView {
@@ -188,7 +188,6 @@ impl StackView {
             passthrough,
             passthrough_metas,
             groups,
-            drilled: None,
         }
     }
 
@@ -199,7 +198,8 @@ impl StackView {
         self.groups.iter().any(|g| g.is_stack())
     }
 
-    /// 集約ビューの `(items, image_metas)` を作る。passthrough (コンテナ) → グループセルの順。
+    /// 集約ビュー (グリッド表示) の `(items, image_metas)` を作る。
+    /// passthrough (コンテナ) → グループセル (1 グループ 1 セル) の順。
     pub fn materialize_aggregated(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         let mut items = self.passthrough.clone();
         let mut metas = self.passthrough_metas.clone();
@@ -221,13 +221,14 @@ impl StackView {
         (items, metas)
     }
 
-    /// groups[g] のメンバーグリッド `(items, image_metas)` を作る。
-    /// 範囲外の g は空を返す。メンバーは実 `Image`/`Video` セル (展開後は通常操作可能)。
-    pub fn materialize_member(&self, g: usize) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
-        let mut items = Vec::new();
-        let mut metas = Vec::new();
-        if let Some(group) = self.groups.get(g) {
-            for m in &group.members {
+    /// フラット読書ビュー (フルスクリーン用) の `(items, image_metas)` を作る。
+    /// passthrough → 全グループのメンバーを順に展開 (実 `Image`/`Video` セル)。
+    /// これにより `↓↑` はスタック境界を越えて全画像を順送りできる。
+    pub fn materialize_flat(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+        let mut items = self.passthrough.clone();
+        let mut metas = self.passthrough_metas.clone();
+        for g in &self.groups {
+            for m in &g.members {
                 items.push(if m.is_video {
                     GridItem::Video(m.path.clone())
                 } else {
@@ -239,7 +240,69 @@ impl StackView {
         (items, metas)
     }
 
-    /// `key` を持つグループの index を返す (集約セルのクリック → ドリル先解決)。
+    /// フラットビューでのグループ g の先頭メンバーの index。範囲外なら `None`。
+    /// = passthrough 長 + g より前のグループのメンバー総数。
+    pub fn flat_start_of_group(&self, g: usize) -> Option<usize> {
+        if g >= self.groups.len() {
+            return None;
+        }
+        let before: usize = self.groups[..g].iter().map(|x| x.members.len()).sum();
+        Some(self.passthrough.len() + before)
+    }
+
+    /// フラットビューの index `flat_idx` が属するグループ index。passthrough 領域や
+    /// 範囲外なら `None`。`Shift+↓↑` のジャンプ元判定 / 閉じたときの集約セル再選択に使う。
+    pub fn group_of_flat_index(&self, flat_idx: usize) -> Option<usize> {
+        let pt = self.passthrough.len();
+        if flat_idx < pt {
+            return None;
+        }
+        let mut offset = pt;
+        for (g, group) in self.groups.iter().enumerate() {
+            let end = offset + group.members.len();
+            if flat_idx < end {
+                return Some(g);
+            }
+            offset = end;
+        }
+        None
+    }
+
+    /// 集約ビューの index `agg_idx` をフラットビューでの先頭メンバー index へ写す。
+    /// passthrough 領域 (コンテナ) は `None` (= 開く動作はフルスクリーンでなく通常ナビ)。
+    pub fn flat_index_for_aggregated(&self, agg_idx: usize) -> Option<usize> {
+        let pt = self.passthrough.len();
+        if agg_idx < pt {
+            return None;
+        }
+        self.flat_start_of_group(agg_idx - pt)
+    }
+
+    /// グループ g に対応する集約ビューの index (= passthrough 長 + g)。
+    pub fn aggregated_index_of_group(&self, g: usize) -> usize {
+        self.passthrough.len() + g
+    }
+
+    /// `Shift+↓↑` のジャンプ先 (フラットビュー index)。フラットビューの現在地 `cur` から:
+    /// - `forward`: 次のスタックの先頭メンバー。最後のスタックなら `None`。
+    /// - `backward`: スタック途中なら現スタックの先頭、既に先頭なら前のスタックの先頭。
+    ///   先頭スタックの先頭なら `None`。
+    /// `cur` が passthrough 領域 (コンテナ) のときは `None`。
+    pub fn stack_jump_target(&self, cur: usize, forward: bool) -> Option<usize> {
+        let g = self.group_of_flat_index(cur)?;
+        if forward {
+            self.flat_start_of_group(g + 1)
+        } else {
+            let start = self.flat_start_of_group(g)?;
+            if cur > start {
+                Some(start)
+            } else {
+                g.checked_sub(1).and_then(|pg| self.flat_start_of_group(pg))
+            }
+        }
+    }
+
+    /// `key` を持つグループの index を返す。
     pub fn group_index_by_key(&self, key: &str) -> Option<usize> {
         self.groups.iter().position(|g| g.key == key)
     }
@@ -508,39 +571,81 @@ mod tests {
     }
 
     #[test]
-    fn materialize_member_expands_group_into_real_images() {
-        let media = vec![img("post_p1.jpg"), img("post_p0.jpg")];
+    fn materialize_flat_expands_all_members_after_passthrough() {
+        // フォルダ 1 + スタック "post"(2枚) + 単独 "solo"。フラット = [folder, post_p0, post_p1, solo]。
+        let media = vec![img("solo.jpg"), img("post_p1.jpg"), img("post_p0.jpg")];
         let sv = StackView::build(
             PathBuf::from(r"C:\dl"),
-            Vec::new(),
-            Vec::new(),
+            vec![folder("sub")],
+            vec![None],
             media,
             '_',
             SortOrder::FileName,
         );
-        let g = sv.group_index_by_key("post").expect("group exists");
-        let (items, metas) = sv.materialize_member(g);
-        assert_eq!(items.len(), 2);
-        assert_eq!(metas.len(), 2);
-        // メンバーは実 Image セル、FileName 昇順。
-        assert_eq!(item_name(&items[0]), "post_p0.jpg");
-        assert_eq!(item_name(&items[1]), "post_p1.jpg");
-        assert!(items.iter().all(|i| matches!(i, GridItem::Image(_))));
+        let (items, metas) = sv.materialize_flat();
+        assert_eq!(items.len(), metas.len());
+        assert!(matches!(items[0], GridItem::Folder(_)));
+        let names: Vec<String> = items[1..].iter().map(item_name).collect();
+        assert_eq!(names, vec!["post_p0.jpg", "post_p1.jpg", "solo.jpg"]);
+        assert!(items[1..].iter().all(|i| matches!(i, GridItem::Image(_))));
     }
 
     #[test]
-    fn materialize_member_out_of_range_is_empty() {
+    fn flat_index_mapping_round_trips_with_groups() {
+        // passthrough 1 (folder) + groups: post(2), solo(1)。
+        // フラット index: 0=folder, 1=post_p0, 2=post_p1, 3=solo。
+        // 集約 index:     0=folder, 1=Stack(post), 2=Image(solo)。
+        let media = vec![img("post_p0.jpg"), img("post_p1.jpg"), img("solo.jpg")];
         let sv = StackView::build(
             PathBuf::from(r"C:\dl"),
-            Vec::new(),
-            Vec::new(),
-            vec![img("a.jpg")],
+            vec![folder("sub")],
+            vec![None],
+            media,
             '_',
             SortOrder::FileName,
         );
-        let (items, metas) = sv.materialize_member(99);
-        assert!(items.is_empty());
-        assert!(metas.is_empty());
+        // グループ起点。
+        assert_eq!(sv.flat_start_of_group(0), Some(1)); // post → flat 1
+        assert_eq!(sv.flat_start_of_group(1), Some(3)); // solo → flat 3
+        assert_eq!(sv.flat_start_of_group(2), None);
+        // 集約 index → フラット先頭。
+        assert_eq!(sv.flat_index_for_aggregated(0), None); // passthrough folder
+        assert_eq!(sv.flat_index_for_aggregated(1), Some(1)); // Stack(post) → flat 1
+        assert_eq!(sv.flat_index_for_aggregated(2), Some(3)); // Image(solo) → flat 3
+        // フラット index → グループ。
+        assert_eq!(sv.group_of_flat_index(0), None); // passthrough
+        assert_eq!(sv.group_of_flat_index(1), Some(0)); // post
+        assert_eq!(sv.group_of_flat_index(2), Some(0)); // post の 2 枚目
+        assert_eq!(sv.group_of_flat_index(3), Some(1)); // solo
+        assert_eq!(sv.group_of_flat_index(99), None);
+        // グループ → 集約 index。
+        assert_eq!(sv.aggregated_index_of_group(0), 1);
+        assert_eq!(sv.aggregated_index_of_group(1), 2);
+    }
+
+    #[test]
+    fn stack_jump_target_moves_between_stacks() {
+        // passthrough 1(folder) + post(2 @1,2) + solo(1 @3)。
+        let media = vec![img("post_p0.jpg"), img("post_p1.jpg"), img("solo.jpg")];
+        let sv = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            vec![folder("sub")],
+            vec![None],
+            media,
+            '_',
+            SortOrder::FileName,
+        );
+        // forward: 現スタックのどこからでも次スタック先頭へ。最後は None。
+        assert_eq!(sv.stack_jump_target(1, true), Some(3)); // post p0 → solo
+        assert_eq!(sv.stack_jump_target(2, true), Some(3)); // post p1 → solo
+        assert_eq!(sv.stack_jump_target(3, true), None); // solo (最後) → 端
+        // backward: 途中なら現スタック先頭、先頭なら前スタック先頭、先頭スタック先頭は None。
+        assert_eq!(sv.stack_jump_target(2, false), Some(1)); // post p1 → post 先頭
+        assert_eq!(sv.stack_jump_target(1, false), None); // post 先頭 (最初) → 端
+        assert_eq!(sv.stack_jump_target(3, false), Some(1)); // solo → 前スタック post 先頭
+        // passthrough (コンテナ) からは None。
+        assert_eq!(sv.stack_jump_target(0, true), None);
+        assert_eq!(sv.stack_jump_target(0, false), None);
     }
 
     #[test]

@@ -4232,6 +4232,11 @@ impl App {
         }
         // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
         self.note_reading_history_open(idx);
+        // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
+        // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
+        if self.stack_try_open_from_grid(idx) {
+            return None;
+        }
         let item = self.items.get(idx).cloned();
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
@@ -4287,12 +4292,10 @@ impl App {
                 self.zip_nav_enter(&dir_prefix);
                 None
             }
-            // ファイル名スタック (v2.0.0): 集約セルを展開してメンバーグリッドへ降りる。
-            Some(GridItem::Stack { key, .. }) => {
-                let key = key.clone();
-                self.stack_drill_into(&key);
-                None
-            }
+            // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid で
+            // 既に処理済み (フラットフルスクリーンへ)。ここに来るのは非スタックモードのみで
+            // Stack セルは存在しないが、網羅性のため no-op を置く。
+            Some(GridItem::Stack { .. }) => None,
             None => None,
         }
     }
@@ -4313,10 +4316,6 @@ impl App {
         }
         if self.local_search_blocks_parent_nav() {
             self.cancel_pending_folder_nav();
-            return None;
-        }
-        // ファイル名スタックのメンバーグリッド内なら集約ビューへ戻る。
-        if self.stack_drill_back() {
             return None;
         }
         // ネスト ZIP ツリー内なら 1 階層戻る (ルートなら false → 親フォルダへ抜ける)。

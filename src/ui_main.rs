@@ -6416,17 +6416,6 @@ impl App {
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // ファイル名スタック表示トグル (v2.0.0、フォルダ欄の右端)。
-                        // 通常フォルダ表示のときだけ出す (検索 / ZIP ツリー / ドライブ一覧では無効)。
-                        if stack_available {
-                            let resp = ui.selectable_label(stack_on, "スタック").hover_tip(
-                                "同じ接頭辞のファイルを 1 つに畳んで表示する [トグル]",
-                            );
-                            if resp.clicked() {
-                                stack_toggle = true;
-                            }
-                            ui.add_space(4.0);
-                        }
                         if folder_rating >= 1 && folder_rating <= 5 {
                             let stars = "★".repeat(folder_rating as usize);
                             ui.label(
@@ -6445,6 +6434,19 @@ impl App {
                                     .color(egui::Color32::from_gray(140)),
                             )
                             .hover_tip("表示中のサムネイル数 / 全サムネイル数");
+                            ui.add_space(4.0);
+                        }
+                        // ファイル名スタック表示トグル (v2.0.0)。サムネ枚数 (12/345) の左側に置く
+                        // (実機フィードバック 2026-06-20)。通常フォルダ表示のときだけ出す
+                        // (検索 / ZIP ツリー / ドライブ一覧では無効)。
+                        if stack_available {
+                            let resp = ui.selectable_label(stack_on, "スタック").hover_tip(
+                                "同じ接頭辞のファイルを 1 つに畳んで表示 [トグル]。スタックを開くと \
+                                 ↓↑ で全画像送り・Shift+↓↑ で次/前のスタックへ",
+                            );
+                            if resp.clicked() {
+                                stack_toggle = true;
+                            }
                             ui.add_space(4.0);
                         }
                         // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
@@ -7369,6 +7371,11 @@ impl App {
         if response.double_clicked() && self.guard_reading_history_open(idx) {
             // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
             self.note_reading_history_open(idx);
+            // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
+            // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
+            if self.stack_try_open_from_grid(idx) {
+                return nav;
+            }
             match self.items.get(idx) {
                 Some(GridItem::Folder(p)) => {
                     // Ctrl+G 絞り込みビューでは「ヒットを含む子フォルダ」を Folder として
@@ -7493,11 +7500,10 @@ impl App {
                     self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                     self.zip_nav_enter(&dp);
                 }
-                // ファイル名スタック (v2.0.0): 集約セルをダブルクリックでメンバーグリッドへ降りる。
-                Some(GridItem::Stack { key, .. }) => {
-                    let key = key.clone();
-                    self.stack_drill_into(&key);
-                }
+                // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid
+                // で処理済み (フラットフルスクリーンへ)。非スタックモードでは Stack セルは存在
+                // しないので網羅性のため no-op。
+                Some(GridItem::Stack { .. }) => {}
                 None => {}
             }
         }

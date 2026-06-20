@@ -111,9 +111,15 @@ impl crate::app::App {
             && !self.tag_view.active
     }
 
-    /// スタックモードが ON か (集約 or メンバーグリッド)。トグルボタンの状態表示に使う。
+    /// スタックモードが ON か。トグルボタンの選択状態表示に使う。
     pub(crate) fn stack_mode_on(&self) -> bool {
         self.stack_mode_requested
+    }
+
+    /// 集約グリッドを表示中か (= スタックモード ON かつフラット読書フルスクリーン中でない)。
+    /// グリッドのセルクリック → フラットフルスクリーンへ入れる状態かの判定に使う。
+    pub(crate) fn stack_mode_aggregated(&self) -> bool {
+        self.stack_view.is_some() && !self.stack_showing_flat
     }
 
     /// スタックモードを切り替える。同一フォルダを再読込して集約 / 通常を作り直す
@@ -127,7 +133,6 @@ impl crate::app::App {
             return;
         };
         self.stack_mode_requested = !self.stack_mode_requested;
-        self.stack_return_select_key = None;
         self.load_folder(folder);
         if self.stack_mode_requested
             && self
@@ -141,124 +146,131 @@ impl crate::app::App {
         }
     }
 
-    /// 集約セルのスタックを展開してメンバーグリッドへドリルインする。
-    /// `key` は `GridItem::Stack.key`。単独セル (= Image/Video) はここを通らない。
+    /// 集約グリッドでメディアセル (スタック / 単独画像 / 動画) を開いたとき、フラット読書
+    /// フルスクリーンへ入る。`agg_idx` は集約 `self.items` の index。コンテナ (passthrough) は
+    /// `false` を返して通常ナビ (フォルダ/ZIP/PDF を開く) に委ねる。戻り値 true = ここで処理した。
+    pub(crate) fn stack_try_open_from_grid(&mut self, agg_idx: usize) -> bool {
+        if !self.stack_mode_aggregated() {
+            return false;
+        }
+        let flat_idx = self
+            .stack_view
+            .as_ref()
+            .and_then(|sv| sv.flat_index_for_aggregated(agg_idx));
+        let Some(flat_idx) = flat_idx else {
+            // passthrough コンテナ → フルスクリーンでなく通常ナビへ。
+            return false;
+        };
+        self.stack_enter_flat_fullscreen(flat_idx);
+        true
+    }
+
+    /// フラット読書ビュー (全画像を展開した並び) へ `self.items` を差し替え、`flat_idx` を
+    /// フルスクリーンで開く。
     ///
     /// in-memory な items 差し替えなので、`zip_nav_show_current_level` と同じ軽量ビュー切替の
     /// 後始末 (idx 状態 + キュー破棄 / visible_indices 再構築 / ページ編集状態の再 hydrate /
     /// rating・tag prewarm) を必ず行う。これを怠ると旧 (集約) ビューの stale な
-    /// `visible_indices` が `update_keep_range_and_requests` で `thumbnails[i]` を範囲外参照
-    /// して panic する (Codex P1)。
-    pub(crate) fn stack_drill_into(&mut self, key: &str) {
-        let (g, items, metas) = {
-            let Some(sv) = self.stack_view.as_ref() else {
-                return;
-            };
-            let Some(g) = sv.group_index_by_key(key) else {
-                return;
-            };
-            // 集約セルが Stack なのは is_stack グループだけだが、防御的に確認する。
-            if !sv.groups[g].is_stack() {
-                return;
-            }
-            let (items, metas) = sv.materialize_member(g);
-            (g, items, metas)
+    /// `visible_indices` が範囲外参照 panic を起こす (Codex P1)。
+    fn stack_enter_flat_fullscreen(&mut self, flat_idx: usize) {
+        let (items, metas) = match self.stack_view.as_ref() {
+            Some(sv) => sv.materialize_flat(),
+            None => return,
         };
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
+        self.swap_stack_view_items(items, metas, &folder, Some(flat_idx));
+        self.stack_showing_flat = true;
+        self.fs_open_intent_from_grid = true;
+        self.open_fullscreen(flat_idx);
+    }
 
-        // 旧 (集約) ビューの in-flight 検索 / 詳細メタ pending を停止 (idx が付け替わる)。
+    /// フルスクリーン中の `Shift+↓↑`: 次/前のスタックの先頭画像へジャンプする。
+    /// フラット読書ビューでないときは `false` (= 呼び出し側が通常のページ送りに委ねる)。
+    /// 端では stack ジャンプ可能位置が無いので `true` (消費) のまま no-op にする。
+    pub(crate) fn stack_jump(&mut self, ctx: &egui::Context, forward: bool) -> bool {
+        if !self.stack_showing_flat {
+            return false;
+        }
+        let Some(cur) = self.fullscreen_idx else {
+            return false;
+        };
+        let target = self
+            .stack_view
+            .as_ref()
+            .and_then(|sv| sv.stack_jump_target(cur, forward));
+        if let Some(t) = target {
+            self.open_fullscreen_from_fs_navigation(ctx, t);
+        }
+        true
+    }
+
+    /// フラットフルスクリーンが閉じたら集約グリッドへ戻す (毎フレーム reconcile、
+    /// `render_grid` の直前で呼ぶ)。スタックモードが解除済み (フォルダナビ等) なら何もしない。
+    pub(crate) fn stack_reconcile_after_fullscreen_close(&mut self) {
+        if !self.stack_showing_flat || self.fullscreen_idx.is_some() {
+            return;
+        }
+        // フルスクリーンが閉じた → フラグを落とす。
+        self.stack_showing_flat = false;
+        // 集約を再構築するための材料を取り出す (借用は install 前に閉じる)。
+        let Some((items, metas, folder, select_agg)) = ({
+            let Some(sv) = self.stack_view.as_ref() else {
+                // フォルダナビ等で stack_view が破棄済み → 通常フォルダが表示されている。何もしない。
+                return;
+            };
+            // close_fullscreen が selected に復元した「最後に見ていた flat index」を集約セルへ写す。
+            let select_agg = self
+                .selected
+                .and_then(|flat| sv.group_of_flat_index(flat))
+                .map(|g| sv.aggregated_index_of_group(g));
+            let (items, metas) = sv.materialize_aggregated();
+            Some((items, metas, sv.folder.clone(), select_agg))
+        }) else {
+            return;
+        };
+        self.swap_stack_view_items(items, metas, &folder, select_agg);
+    }
+
+    /// 集約/フラット間の in-memory ビュー切替の共通後始末。`select` を選択し scroll する。
+    fn swap_stack_view_items(
+        &mut self,
+        items: Vec<GridItem>,
+        metas: Vec<Option<(i64, i64)>>,
+        folder: &std::path::Path,
+        select: Option<usize>,
+    ) {
+        // 旧ビューの in-flight 検索 / 詳細メタ pending を停止 (idx が付け替わる)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel();
         }
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel();
         }
-        if let Some(sv) = self.stack_view.as_mut() {
-            sv.drilled = Some(g);
-        }
-        self.stack_return_select_key = Some(key.to_string());
-
-        // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
-        // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / zip nav と同じ)。
         self.invalidate_idx_state_and_queues();
         self.current_folder_rating_cache = None;
-        // メンバーは実 Image ファイル。実フォルダ prefix でページ編集状態 (補正 / crop /
-        // view-trim / 消しゴム / ローカル調整 / 隠蔽) を再 hydrate し、旧 idx の編集が別 entry へ
-        // 漏れないようにする (page_path_key は実パスキーを返すので folder prefix で正しく載る)。
-        self.rehydrate_page_edit_state_for_current_items(&folder);
+        // セルは実 Image (フラット) / 単独 Image (集約)。実フォルダ prefix でページ編集状態
+        // (補正 / crop / view-trim / 消しゴム / ローカル調整 / 隠蔽) を再 hydrate する
+        // (page_path_key が実パスキーを返すので folder prefix で正しく載る)。
+        self.rehydrate_page_edit_state_for_current_items(folder);
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
-        // path-keyed メタキャッシュはメンバー用にリセット。
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.tags_cache.clear();
-        // Ctrl+F フィルタの残留を解除 (集約ビュー向けなのでメンバーグリッドでは無効)。
         self.search_filter = None;
         self.search_query.clear();
-        // 先頭メンバーを選択 (メンバーは常に 2 枚以上)。
-        self.selected = Some(0);
+        self.selected = select;
         self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = true;
+        self.scroll_to_selected = select.is_some();
         self.scroll_hint
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        // rating フィルタ有効時に rebuild_visible_indices が per-item で SQLite を引かないよう
-        // 事前 prewarm (start_loading_items / zip nav と同じ)。
         self.prewarm_rating_cache();
         // ★ visible_indices 再構築。stale index による範囲外参照 panic を防ぐ (Codex P1)。
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();
-        self.update_stack_address();
-    }
-
-    /// メンバーグリッドから集約ビューへ戻る (Backspace)。集約ビューに居る / スタックモードで
-    /// ない場合は `false` を返す (= 呼び出し側が通常の親フォルダ遷移に進む)。
-    pub(crate) fn stack_drill_back(&mut self) -> bool {
-        let Some(sv) = self.stack_view.as_ref() else {
-            return false;
-        };
-        if sv.drilled.is_none() {
-            return false;
-        }
-        let folder = sv.folder.clone();
-        // 集約ビューは動画サムネ再生成のため同一フォルダ再読込で作り直す。
-        // stack_mode_requested は維持されているので hook が集約を再構築する。
-        self.load_folder(folder);
-        // 戻り先のスタックセルを再選択して視認性を保つ (ZIP ツリーの BS と同様)。
-        if let Some(key) = self.stack_return_select_key.take() {
-            self.select_stack_cell_by_key(&key);
-        }
-        true
-    }
-
-    /// 集約ビューで `key` を持つ `GridItem::Stack` セルを選択してスクロールする。
-    fn select_stack_cell_by_key(&mut self, key: &str) {
-        let idx = self
-            .items
-            .iter()
-            .position(|it| matches!(it, GridItem::Stack { key: k, .. } if k == key));
-        if let Some(idx) = idx {
-            self.selected = Some(idx);
-            self.scroll_to_selected = true;
-        }
-    }
-
-    /// アドレス欄をスタックのパンくず表示にする (メンバーグリッド時のみ)。
-    /// 集約ビューは通常のフォルダパス表示のまま (start_loading_items が設定済み)。
-    pub(crate) fn update_stack_address(&mut self) {
-        let Some(sv) = self.stack_view.as_ref() else {
-            return;
-        };
-        let Some(g) = sv.drilled else {
-            return;
-        };
-        let Some(group) = sv.groups.get(g) else {
-            return;
-        };
-        let folder = sv.folder.display().to_string();
-        self.address = format!("{folder} > {}", group.key);
     }
 }

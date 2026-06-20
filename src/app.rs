@@ -3848,12 +3848,13 @@ pub struct App {
     /// 自動解除 (= `load_folder_with_scan` の folder_changes 時に false)。同一フォルダの
     /// 再読込 (ソート変更・外部更新) では維持して再グループ化する。
     pub(crate) stack_mode_requested: bool,
-    /// 集約 / メンバーグリッドの実体。`stack_mode_requested` && 通常フォルダのとき
+    /// 集約ビューの実体 (groups + passthrough)。`stack_mode_requested` && 通常フォルダのとき
     /// `load_folder_with_scan` が構築し、`start_loading_items` がクリアする (zip_nav と同様)。
-    /// `drilled` でビュー段を表す (None=集約 / Some(g)=メンバーグリッド)。
     pub(crate) stack_view: Option<crate::filename_stack::StackView>,
-    /// メンバーグリッドから集約へ戻ったとき再選択するスタックの key (戻り先の視認性)。
-    pub(crate) stack_return_select_key: Option<String>,
+    /// 今 `self.items` がフラット読書ビュー (= スタックを開いてフルスクリーン中) か。
+    /// グリッドは常に集約だが、セルを開くと一時的にフラット展開へ差し替える。フルスクリーンを
+    /// 閉じると `stack_reconcile_after_fullscreen_close` が集約へ戻す。
+    pub(crate) stack_showing_flat: bool,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -5761,7 +5762,7 @@ impl App {
             zip_nav: None,
             stack_mode_requested: false,
             stack_view: None,
-            stack_return_select_key: None,
+            stack_showing_flat: false,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -8261,6 +8262,7 @@ impl App {
         // ファイル名スタックも同様に解除 (SLI を通らない経路なので明示的に)。
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_showing_flat = false;
         crate::zip_loader::clear_nested_cache();
 
         let (tx, rx) = mpsc::channel();
@@ -11970,6 +11972,7 @@ impl App {
         // 同一フォルダ再読込 (ソート変更・メンバー戻り) では hook が復元する。
         self.stack_view = None;
         self.stack_mode_requested = false;
+        self.stack_showing_flat = false;
         self.gamepad_location_picker = None;
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
@@ -18101,6 +18104,11 @@ impl App {
                     }
                     // 読書履歴ビューから本を開く場合は、閉じたときに読書履歴へ戻れるよう予約する。
                     self.note_reading_history_open(idx);
+                    // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
+                    // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
+                    if self.stack_try_open_from_grid(idx) {
+                        return None;
+                    }
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p))
                         | Some(GridItem::ZipFile(p))
@@ -18220,11 +18228,10 @@ impl App {
                             self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                             self.zip_nav_enter(&dp);
                         }
-                        // ファイル名スタック (v2.0.0): Enter でメンバーグリッドへ降りる。
-                        Some(GridItem::Stack { key, .. }) => {
-                            let key = key.clone();
-                            self.stack_drill_into(&key);
-                        }
+                        // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の
+                        // stack_try_open_from_grid で処理済み (フラットフルスクリーンへ)。
+                        // 非スタックモードでは Stack セルは存在しないので網羅性のため no-op。
+                        Some(GridItem::Stack { .. }) => {}
                         None => {}
                     }
                 }
@@ -18273,11 +18280,6 @@ impl App {
             }
             if self.local_search_blocks_parent_nav() {
                 self.cancel_pending_folder_nav();
-                return None;
-            }
-            // ファイル名スタックのメンバーグリッドに居るなら、親フォルダへ抜ける前に
-            // 集約ビューへ戻る (集約ビューに居る / スタックモードでないなら false で素通し)。
-            if self.stack_drill_back() {
                 return None;
             }
             // ネスト ZIP ツリー内なら、実フォルダ親へ抜ける前に 1 階層戻る (Phase 3)。
@@ -36780,6 +36782,10 @@ impl eframe::App for App {
         // wheel が背面のサムネイル一覧にも通り抜ける。
         self.suppress_popup_wheel_before_grid(ctx);
         self.process_scroll(ctx);
+
+        // ファイル名スタック: フラット読書フルスクリーンを閉じたら集約グリッドへ戻す
+        // (render_grid の直前で reconcile して、閉じた瞬間に集約表示が出るようにする)。
+        self.stack_reconcile_after_fullscreen_close();
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();

@@ -5939,15 +5939,25 @@ impl App {
                 && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
                     || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
         });
+        // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
+        // ジャンプ」に割り当てる。動画再生中 (video_shift_vertical_key=音量) はそちらが優先。
+        // 非スタック / 非フラットでは従来どおり Shift+↓↑ はプレーン ↓↑ のエイリアス (ページ送り)。
+        let stack_flat_nav = self.stack_showing_flat && !video_shift_vertical_key;
+        let stack_jump_next = stack_flat_nav
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
+        let stack_jump_prev = stack_flat_nav
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
         let arrow_down = ctx.input_mut(|i| {
             !video_shift_vertical_key
                 && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown))
+                    || (!stack_flat_nav
+                        && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)))
         });
         let arrow_up = ctx.input_mut(|i| {
             !video_shift_vertical_key
                 && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp))
+                    || (!stack_flat_nav
+                        && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)))
         });
         let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
@@ -6694,6 +6704,15 @@ impl App {
         }
         if nav_prev && !ctrl_u {
             action.nav_delta = self.spread_nav_delta(-1);
+        }
+        // ファイル名スタック: Shift+↓↑ で次/前のスタックの先頭画像へ絶対ジャンプ
+        // (フラット読書ビューのときのみ。端では no-op で消費)。Shift キーは上で
+        // stack_jump_next/prev として既に consume 済みなので plain 矢印 nav とは排他。
+        if stack_jump_next {
+            self.stack_jump(ctx, true);
+        }
+        if stack_jump_prev {
+            self.stack_jump(ctx, false);
         }
         // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在の表示ユニット先頭を
         // 1 ページぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
