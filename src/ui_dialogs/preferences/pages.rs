@@ -466,6 +466,15 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
         });
     }
+    // 3 択版 (展開 / 折りたたみ / プルダウン)。お気に入り / タグ / 本棚用。
+    fn display_radio3(ui: &mut egui::Ui, value: &mut ToolbarSectionDisplay) {
+        ui.horizontal(|ui| {
+            ui.label("表示:");
+            for &opt in ToolbarSectionDisplay::all_with_collapsible() {
+                ui.radio_value(value, opt, opt.label());
+            }
+        });
+    }
 
     // ── 列 ──
     ui.add_space(6.0);
@@ -543,6 +552,9 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "ツリー（フォルダツリー表示切り替え）",
     );
     ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚");
+    if s.show_toolbar_bookshelf {
+        display_radio3(ui, &mut s.toolbar_bookshelf_display);
+    }
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
     ui.checkbox(
         &mut s.show_toolbar_facet_filter,
@@ -550,7 +562,13 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     )
     .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。");
     ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
+    if s.show_toolbar_favorites {
+        display_radio3(ui, &mut s.toolbar_favorites_display);
+    }
     ui.checkbox(&mut s.show_toolbar_tags, "タグ");
+    if s.show_toolbar_tags {
+        display_radio3(ui, &mut s.toolbar_tags_display);
+    }
     if clear_recent_folders_clicked {
         s.recent_folders.clear();
         s.quick_folder_recent_folders = [Vec::new(), Vec::new()];

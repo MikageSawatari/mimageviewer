@@ -396,6 +396,29 @@ enum RatingAssign {
     Container(u8),
 }
 
+/// ツールバーの折りたたみ可能セクション先頭の ▶/▼ トグル (折りたたみモードのみ描画)。
+/// 戻り値 = (インライン項目を描くべきか, トグルされた新 collapsed 値 or None)。
+/// 展開=常にインライン描画 / プルダウン=インライン無し (ComboBox 側で出す)。
+fn toolbar_section_fold_toggle(
+    ui: &mut egui::Ui,
+    mode: crate::settings::ToolbarSectionDisplay,
+    collapsed: bool,
+) -> (bool, Option<bool>) {
+    use crate::settings::ToolbarSectionDisplay as D;
+    match mode {
+        D::Dropdown => (false, None),
+        D::Collapsible => {
+            let arrow = if collapsed { "▶" } else { "▼" };
+            let toggled = ui
+                .button(arrow)
+                .on_hover_text("このセクションの折りたたみ")
+                .clicked();
+            (!collapsed, toggled.then_some(!collapsed))
+        }
+        D::Buttons | D::Unknown => (true, None),
+    }
+}
+
 fn draw_rating_filter_button(
     ui: &mut egui::Ui,
     rf: &mut [bool; 6],
@@ -3657,25 +3680,38 @@ impl App {
                     {
                         toolbar_book_open_active = true;
                     }
-                    // ピン留めした本のボタン (左=開く / 右=選択したアイテムを追加)。
-                    // 実在する本だけ表示する (削除済みのピンは出さない)。
-                    for pin in &toolbar_pinned_books {
-                        let exists = toolbar_book_rows
-                            .as_ref()
-                            .is_some_and(|rows| rows.iter().any(|r| &r.name == pin));
-                        if !exists {
-                            continue;
-                        }
-                        // ハイライトはしない (追加先=active 本を強調すると「このアイテムを
-                        // その本に入れた」と誤解されるため。ユーザー判断 2026-06-20)。
-                        let resp = ui.button(pin).hover_tip(
-                            "左: この本を開く / 右: 選択したアイテムをこの本へ追加",
-                        );
-                        if resp.clicked() {
-                            toolbar_book_pin_open = Some(pin.clone());
-                        }
-                        if resp.secondary_clicked() {
-                            toolbar_book_pin_add = Some(pin.clone());
+                    // ピン留め本のボタンは本棚セクションの表示形式に従う。プルダウン時は
+                    // コンボが全本を選べるのでピンボタンは出さない。折りたたみは ▶/▼ で畳める。
+                    let book_mode = self.settings.toolbar_bookshelf_display;
+                    let (show_pins, new_collapsed) = toolbar_section_fold_toggle(
+                        ui,
+                        book_mode,
+                        self.settings.toolbar_bookshelf_collapsed,
+                    );
+                    if let Some(c) = new_collapsed {
+                        self.settings.toolbar_bookshelf_collapsed = c;
+                        self.settings.save();
+                    }
+                    if show_pins {
+                        // 左=開く / 右=選択したアイテムを追加。実在する本だけ (削除済みピンは出さない)。
+                        for pin in &toolbar_pinned_books {
+                            let exists = toolbar_book_rows
+                                .as_ref()
+                                .is_some_and(|rows| rows.iter().any(|r| &r.name == pin));
+                            if !exists {
+                                continue;
+                            }
+                            // ハイライトはしない (追加先=active 本を強調すると「このアイテムを
+                            // その本に入れた」と誤解されるため。ユーザー判断 2026-06-20)。
+                            let resp = ui.button(pin).hover_tip(
+                                "左: この本を開く / 右: 選択したアイテムをこの本へ追加",
+                            );
+                            if resp.clicked() {
+                                toolbar_book_pin_open = Some(pin.clone());
+                            }
+                            if resp.secondary_clicked() {
+                                toolbar_book_pin_add = Some(pin.clone());
+                            }
                         }
                     }
                 }
@@ -3996,11 +4032,54 @@ impl App {
                 }
                 TS::Favorites => {
                     toolbar_label(ui, "お気に入り:", 76.0);
+                    let fav_mode = self.settings.toolbar_favorites_display;
+                    let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
+                        ui,
+                        fav_mode,
+                        self.settings.toolbar_favorites_collapsed,
+                    );
+                    if let Some(c) = new_collapsed {
+                        self.settings.toolbar_favorites_collapsed = c;
+                        self.settings.save();
+                    }
+                    let current = self.current_folder.clone();
                     if self.settings.favorites.is_empty() {
-                        ui.label(egui::RichText::new("(未登録)").weak());
-                    } else {
-                        // 現在のフォルダと一致するお気に入りをハイライト
-                        let current = self.current_folder.clone();
+                        if show_inline || fav_mode == crate::settings::ToolbarSectionDisplay::Dropdown
+                        {
+                            ui.label(egui::RichText::new("(未登録)").weak());
+                        }
+                    } else if fav_mode == crate::settings::ToolbarSectionDisplay::Dropdown {
+                        // プルダウン: アクションは「移動」1 つなので、選ぶだけで発動。
+                        let sel_text = current
+                            .as_ref()
+                            .and_then(|c| {
+                                self.settings
+                                    .favorites
+                                    .iter()
+                                    .find(|f| &f.path == c)
+                                    .map(|f| f.name.clone())
+                            })
+                            .unwrap_or_else(|| "選択".to_string());
+                        let combo = egui::ComboBox::from_id_salt("toolbar_fav_combo")
+                            .width(160.0)
+                            .selected_text(sel_text)
+                            .show_ui(ui, |ui| {
+                                apply_toolbar_style(ui);
+                                for fav in &self.settings.favorites {
+                                    let selected =
+                                        current.as_ref().map(|c| c == &fav.path).unwrap_or(false);
+                                    if ui
+                                        .selectable_label(selected, &fav.name)
+                                        .on_hover_text(fav.path.to_string_lossy())
+                                        .clicked()
+                                    {
+                                        toolbar_fav_nav = Some(fav.path.clone());
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
+                    } else if show_inline {
                         for fav in &self.settings.favorites {
                             let selected =
                                 current.as_ref().map(|c| c == &fav.path).unwrap_or(false);
@@ -4018,6 +4097,7 @@ impl App {
                 TS::Tags => {
                     toolbar_label(ui, "タグ:", 42.0);
                     let has_target = self.tag_target_path_count() > 0;
+                    // 設定 / 検索 はセクション全体の操作 (Phase 3 で ⚙ に集約予定)。表示形式に依らず常に出す。
                     if ui
                         .add_enabled(has_target, egui::Button::new("設定"))
                         .hover_tip("選択中の項目へタグを付ける/外す")
@@ -4032,26 +4112,80 @@ impl App {
                     {
                         toolbar_tag_view_open = true;
                     }
-                    for name in &toolbar_tags {
-                        let label = format!("#{name}");
-                        // 統一ジェスチャ (toolbar-customization-plan §1.1):
-                        //   左クリック   = タグビューを開く (副作用なし)
-                        //   右クリック   = 選択へタグ付与トグル (副作用あり)
-                        //   Shift+右     = 今いるコンテナへ付与トグル
-                        // 左クリックは対象が無くても使えるのでボタンは常に有効にする。
-                        let resp = ui.button(label).hover_tip(if has_target {
-                            "左: タグビュー / 右: 選択したアイテムへ付与 / Shift+右: この場所(コンテナ)へ付与"
+                    let tag_mode = self.settings.toolbar_tags_display;
+                    let (show_inline, new_collapsed) =
+                        toolbar_section_fold_toggle(ui, tag_mode, self.settings.toolbar_tags_collapsed);
+                    if let Some(c) = new_collapsed {
+                        self.settings.toolbar_tags_collapsed = c;
+                        self.settings.save();
+                    }
+                    if tag_mode == crate::settings::ToolbarSectionDisplay::Dropdown {
+                        // プルダウン: コンボでタグを 1 つ選び、[付与][タグビュー] で操作 (右クリックは使わない)。
+                        if toolbar_tags.is_empty() {
+                            ui.label(egui::RichText::new("(ピン留めタグなし)").weak());
                         } else {
-                            "左: タグビュー / Shift+右: この場所(コンテナ)へ付与 (右で選択へ付与するには項目を選ぶ)"
-                        });
-                        if resp.clicked() {
-                            toolbar_tag_search = Some(name.clone());
+                            // 一時選択を有効なピン留めタグへ正規化 (無ければ先頭)。
+                            let pick = self
+                                .toolbar_tag_dropdown_pick
+                                .as_ref()
+                                .filter(|p| toolbar_tags.iter().any(|t| t == *p))
+                                .cloned()
+                                .unwrap_or_else(|| toolbar_tags[0].clone());
+                            let mut new_pick: Option<String> = None;
+                            let combo = egui::ComboBox::from_id_salt("toolbar_tag_combo")
+                                .width(140.0)
+                                .selected_text(format!("#{pick}"))
+                                .show_ui(ui, |ui| {
+                                    apply_toolbar_style(ui);
+                                    for name in &toolbar_tags {
+                                        if ui
+                                            .selectable_label(name == &pick, format!("#{name}"))
+                                            .clicked()
+                                        {
+                                            new_pick = Some(name.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
+                            if let Some(p) = new_pick {
+                                self.toolbar_tag_dropdown_pick = Some(p);
+                            }
+                            if ui
+                                .add_enabled(has_target, egui::Button::new("付与"))
+                                .hover_tip("選択したアイテムへこのタグを付与/解除")
+                                .clicked()
+                            {
+                                toolbar_tag_click = Some(pick.clone());
+                            }
+                            if ui
+                                .button("タグビュー")
+                                .hover_tip("このタグのタグビューを開く")
+                                .clicked()
+                            {
+                                toolbar_tag_search = Some(pick.clone());
+                            }
                         }
-                        if resp.secondary_clicked() {
-                            if ui.input(|i| i.modifiers.shift) {
-                                toolbar_tag_container = Some(name.clone());
-                            } else if has_target {
-                                toolbar_tag_click = Some(name.clone());
+                    } else if show_inline {
+                        for name in &toolbar_tags {
+                            let label = format!("#{name}");
+                            // 統一ジェスチャ (toolbar-customization-plan §1.1):
+                            //   左クリック = タグビューを開く / 右クリック = 選択へ付与 / Shift+右 = コンテナへ付与
+                            // 左クリックは対象が無くても使えるのでボタンは常に有効にする。
+                            let resp = ui.button(label).hover_tip(if has_target {
+                                "左: タグビュー / 右: 選択したアイテムへ付与 / Shift+右: この場所(コンテナ)へ付与"
+                            } else {
+                                "左: タグビュー / Shift+右: この場所(コンテナ)へ付与 (右で選択へ付与するには項目を選ぶ)"
+                            });
+                            if resp.clicked() {
+                                toolbar_tag_search = Some(name.clone());
+                            }
+                            if resp.secondary_clicked() {
+                                if ui.input(|i| i.modifiers.shift) {
+                                    toolbar_tag_container = Some(name.clone());
+                                } else if has_target {
+                                    toolbar_tag_click = Some(name.clone());
+                                }
                             }
                         }
                     }

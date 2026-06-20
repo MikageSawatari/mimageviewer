@@ -2997,6 +2997,9 @@ pub struct App {
     pub(crate) book_manager_rename_inputs: std::collections::BTreeMap<String, String>,
     pub(crate) book_manager_delete_confirm: Option<String>,
     pub(crate) book_list_cache: Option<Vec<crate::books::BookInfo>>,
+    /// タグセクションがプルダウン表示のときに、コンボで選択中のタグ名 (非永続)。
+    /// `None` のときは先頭のピン留めタグを使う。v2.0.0。
+    pub(crate) toolbar_tag_dropdown_pick: Option<String>,
     pub(crate) book_reorder: Option<BookReorderState>,
     /// Ctrl+Alt+Shift+D / 画像パイプラインデバッグ出力の worker 完了待ち。
     pub(crate) pipeline_debug_export_pending:
@@ -5417,6 +5420,7 @@ impl App {
             book_manager_rename_inputs: std::collections::BTreeMap::new(),
             book_manager_delete_confirm: None,
             book_list_cache: None,
+            toolbar_tag_dropdown_pick: None,
             book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,
