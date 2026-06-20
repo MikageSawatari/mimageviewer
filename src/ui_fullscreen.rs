@@ -1780,10 +1780,11 @@ impl App {
         let context_ok = self.reading_flow.is_paged()
             && !self.is_panorama_mode_active(fs_idx)
             && !self.analysis_mode
-            && !self.erase_mode
-            && !self.text_mode
-            && !self.conceal_mode
-            && !self.local_adjust_mode
+            // 消しゴム / 補正レイヤー / 隠蔽 / 切り取り / 注釈 をまとめて除外 (Codex P2: 切り取り
+            // モード漏れ防止のため手書き列挙でなく is_overlay_edit_mode_active を使う)。
+            && !self.is_overlay_edit_mode_active()
+            // 比較表示中は通常閲覧外 (Double では比較描画が優先され入力と表示がずれるため、Codex P3)。
+            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
             && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         if !context_ok {
             // コンテキスト外: ズーム解除し、エッジ状態もリセット
