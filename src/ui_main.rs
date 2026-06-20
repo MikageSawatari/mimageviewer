@@ -2275,8 +2275,12 @@ impl App {
                                 entries = vec![last];
                             }
                         }
-                        self.whats_new_entries = entries;
-                        self.show_whats_new = true;
+                        // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
+                        // ショートカットを塞がないよう、開かない (Codex P3)。
+                        if !entries.is_empty() {
+                            self.whats_new_entries = entries;
+                            self.show_whats_new = true;
+                        }
                         ui.close();
                     }
                     if ui.button("バージョン情報").clicked() {

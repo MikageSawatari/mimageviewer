@@ -1275,6 +1275,9 @@ fn cli_flag_takes_value(flag: &str) -> bool {
             | "--dcomp-window-size"
             | "--dcomp-sync-interval"
             | "--dcomp-start"
+            // 開発用: 「重要な変更点」を任意の前バージョンから強制表示する (値=前バージョン)。
+            // ここに登録しないと、続く <ver> が startup パスとして開かれてしまう (Codex P3)。
+            | "--whatsnew-from"
     )
 }
 
