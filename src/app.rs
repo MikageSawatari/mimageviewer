@@ -3000,6 +3000,11 @@ pub struct App {
     /// タグセクションがプルダウン表示のときに、コンボで選択中のタグ名 (非永続)。
     /// `None` のときは先頭のピン留めタグを使う。v2.0.0。
     pub(crate) toolbar_tag_dropdown_pick: Option<String>,
+    /// 前フレームのツールバー本体 (中身) の矩形 (非永続)。空き領域右クリック検出用の
+    /// 背景 interact をセクションより前に登録する必要があり、その矩形に前フレーム値を
+    /// 使う (egui の z-order: 先に登録 = 背面 → ボタンが直接 hit で勝ち、空き領域だけ
+    /// 背景が拾う)。初回 (None) は背景メニュー無効。v2.0.0 Phase 3。
+    pub(crate) toolbar_content_rect: Option<egui::Rect>,
     pub(crate) book_reorder: Option<BookReorderState>,
     /// Ctrl+Alt+Shift+D / 画像パイプラインデバッグ出力の worker 完了待ち。
     pub(crate) pipeline_debug_export_pending:
@@ -5421,6 +5426,7 @@ impl App {
             book_manager_delete_confirm: None,
             book_list_cache: None,
             toolbar_tag_dropdown_pick: None,
+            toolbar_content_rect: None,
             book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,

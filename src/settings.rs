@@ -3040,16 +3040,16 @@ fn default_fullscreen_jump_percent() -> u32 {
 fn default_fullscreen_fixed_jump_count() -> usize {
     FULLSCREEN_FIXED_JUMP_DEFAULT
 }
-fn default_toolbar_cols_items() -> Vec<usize> {
+pub(crate) fn default_toolbar_cols_items() -> Vec<usize> {
     (MIN_GRID_COLS..=MAX_GRID_COLS).collect()
 }
-fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
+pub(crate) fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
     ThumbAspect::all().to_vec()
 }
-fn default_toolbar_aspect_auto_visible() -> bool {
+pub(crate) fn default_toolbar_aspect_auto_visible() -> bool {
     true
 }
-fn default_toolbar_sort_items() -> Vec<SortOrder> {
+pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
 pub fn default_rating_filter() -> [bool; 6] {

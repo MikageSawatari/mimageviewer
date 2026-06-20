@@ -3495,6 +3495,8 @@ impl App {
         let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
             &self.settings.toolbar_section_order,
         );
+        // 前フレームのツールバー content rect (空き領域 右クリック用背景 interact の矩形)。
+        let toolbar_bg_rect = self.toolbar_content_rect;
         let any_toolbar_section = show_folder_tree_button
             || show_bookshelf
             || show_cols
@@ -3568,7 +3570,15 @@ impl App {
             const TOOLBAR_ASPECT_COMBO_HEIGHT: f32 = 280.0;
             const TOOLBAR_SORT_COMBO_HEIGHT: f32 = 240.0;
 
-            ui.scope(|ui| {
+            // 空き領域 右クリック用の背景 interact。セクション (= ui.scope の中身) より
+            // **前** に登録することで z-order が背面になり、ボタンの直接クリックは奪わず、
+            // 何も無い余白の右クリックだけ背景が拾う (egui hit_test の仕様、kittest で検証済)。
+            // 矩形は前フレームの content rect を使う (今フレームの高さは描画後でないと
+            // 分からないため)。初回 (None) は背景メニュー無効。
+            let bg_resp = toolbar_bg_rect
+                .map(|r| ui.interact(r, ui.id().with("toolbar_bg_menu"), egui::Sense::click()));
+
+            let scope_resp = ui.scope(|ui| {
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
                 // FontTweak.y_offset で補正)。詳細: src/ui_fonts.rs の TOOLBAR_TEXT_FAMILY_NAME。
                 apply_toolbar_style(ui);
@@ -4231,6 +4241,14 @@ impl App {
                 }
                 });
             });
+            // 次フレームの背景 interact 用に content rect を記録する。
+            self.toolbar_content_rect = Some(scope_resp.response.rect);
+            // 空き領域 右クリック → セクション表示 ON/OFF + 並び順リセットのメニュー。
+            if let Some(bg) = bg_resp {
+                bg.context_menu(|ui| {
+                    self.draw_toolbar_visibility_menu(ui);
+                });
+            }
             ui.add_space(2.0);
         });
 
@@ -4318,6 +4336,107 @@ impl App {
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
 
         toolbar_fav_nav
+    }
+
+    /// ツールバーの空き領域 右クリックメニュー (v2.0.0 Phase 3, §1.2 / §5)。
+    /// 各セクションの表示 ON/OFF と「ツールバーを既定に戻す」を提供する。
+    /// 環境設定のツールバーページに代わるカスタマイズ入口。
+    fn draw_toolbar_visibility_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label("表示するセクション");
+        ui.separator();
+        let s = &mut self.settings;
+        let mut changed = false;
+        // 既定のセクション並び順 (FolderTree→Bookshelf→Cols→Aspect→Sort→Rating→Favorites→Tags) に
+        // 揃えてチェックボックスを並べる。
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_folder_tree_button, "ツリー")
+            .changed();
+        changed |= ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚").changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_cols, "列")
+            .on_hover_text("項目が無いと表示されません (セクションのラベルを右クリックで列を選択)")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_aspect, "比率")
+            .on_hover_text(
+                "項目が無いと表示されません (セクションのラベルを右クリックで比率を選択)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_sort, "ソート")
+            .on_hover_text(
+                "項目が無いと表示されません (セクションのラベルを右クリックでソートを選択)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_rating, "レーティング (★)")
+            .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_favorites, "お気に入り")
+            .changed();
+        changed |= ui.checkbox(&mut s.show_toolbar_tags, "タグ").changed();
+        ui.separator();
+        changed |= ui
+            .checkbox(
+                &mut s.show_toolbar_facet_filter,
+                "スマートフィルタ (絞り込みバー)",
+            )
+            .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。")
+            .changed();
+
+        ui.separator();
+        if ui
+            .button("ツールバーを既定に戻す")
+            .on_hover_text("セクションの表示・並び順・表示形式・出す項目をすべて初期状態に戻します")
+            .clicked()
+        {
+            self.reset_toolbar_customization();
+            ui.close();
+            ui.ctx().request_repaint();
+            return;
+        }
+
+        if changed {
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// ツールバーのカスタマイズ (表示・並び順・行頭・表示形式・出す項目) を既定に戻す。
+    /// 空き領域 / セクション右クリックメニューの「既定に戻す」から呼ぶ。
+    fn reset_toolbar_customization(&mut self) {
+        use crate::settings::ToolbarSectionDisplay;
+        let s = &mut self.settings;
+        // 表示フラグ
+        s.show_toolbar_folder_tree_button = true;
+        s.show_toolbar_bookshelf = true;
+        s.show_toolbar_cols = true;
+        s.show_toolbar_aspect = true;
+        s.show_toolbar_sort = true;
+        s.show_toolbar_rating = true;
+        s.show_toolbar_favorites = true;
+        s.show_toolbar_tags = true;
+        s.show_toolbar_facet_filter = true;
+        // 並び順 / 行頭
+        s.toolbar_section_order = Vec::new();
+        s.toolbar_section_new_row = Vec::new();
+        // 表示形式 / 折りたたみ
+        s.toolbar_cols_display = ToolbarSectionDisplay::default();
+        s.toolbar_aspect_display = ToolbarSectionDisplay::default();
+        s.toolbar_sort_display = ToolbarSectionDisplay::default();
+        s.toolbar_favorites_display = ToolbarSectionDisplay::default();
+        s.toolbar_tags_display = ToolbarSectionDisplay::default();
+        s.toolbar_bookshelf_display = ToolbarSectionDisplay::default();
+        s.toolbar_favorites_collapsed = false;
+        s.toolbar_tags_collapsed = false;
+        s.toolbar_bookshelf_collapsed = false;
+        // 出す項目
+        s.toolbar_cols_items = crate::settings::default_toolbar_cols_items();
+        s.toolbar_cols_details_visible = true;
+        s.toolbar_aspect_items = crate::settings::default_toolbar_aspect_items();
+        s.toolbar_aspect_auto_visible = crate::settings::default_toolbar_aspect_auto_visible();
+        s.toolbar_sort_items = crate::settings::default_toolbar_sort_items();
+        s.save();
     }
 
     // ── スマートフィルタバー ────────────────────────────────────────
