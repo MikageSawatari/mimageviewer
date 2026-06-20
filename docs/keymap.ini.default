@@ -128,7 +128,7 @@
 # FsCompareDiff = Alt+C ; 差分比較を切り替える
 # FsRotateCw = R ; 現在の画像を右に90度回転する
 # FsRotateCcw = L ; 現在の画像を左に90度回転する
-# FsAnalysis = Z ; 画像分析モードを開く
+# FsAnalysis = Shift+Z ; 画像分析モードを開く
 # FsPanorama = V ; 360度パノラマモードを切り替える
 # FsPixelGrid = G ; ピクセルグリッド表示を切り替える
 # FsLoupeLockToggle = M ; ルーペの固定表示を切り替える

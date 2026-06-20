@@ -3710,6 +3710,22 @@ pub struct App {
     pub(crate) fs_zoom: f32,
     /// 通常フルスクリーンのパンオフセット（スクリーン座標系）
     pub(crate) fs_pan: egui::Vec2,
+
+    // ── ZipPla 風 全画面ズームモード (Z キー、v2.0.0) ──────────────
+    // 画像の一部を画面いっぱいに拡大 (cover) し、マウス位置で表示範囲をパンする
+    // (元画像範囲内のみ、余白なし)。現行ルーペ (M / Shift) とは別物。
+    // 状態は settings に保存せず**アプリセッション内のみ**保持する (倍率はページ送りを
+    // またいで引き継ぎ、グリッドへ戻ると解除)。詳細: docs/keymap-spec.md / display-pipeline.md。
+    /// ズーム + マウスパン中 (Z を離して確定した状態)
+    pub(crate) fs_zoom_active: bool,
+    /// Z 押下中の照準 (枠表示) 中。離すと `fs_zoom_active` へ確定する
+    pub(crate) fs_zoom_aiming: bool,
+    /// cover に対する拡大倍率 (>= 1.0)。セッション内で引き継ぐ
+    pub(crate) fs_zoom_factor: f32,
+    /// 前フレームの Z (修飾なし) 押下状態。押下/離しのエッジ検出に使う
+    pub(crate) fs_zoom_z_was_down: bool,
+    /// ズーム中に Z で解除したフレームのラッチ。離すまで再照準を抑止する
+    pub(crate) fs_zoom_exit_pending: bool,
     /// 通常フルスクリーンのパンドラッグ開始状態
     pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     /// 連結読みモードのスクロール量。現在ページ中心を 0 とし、正方向で次のユニットへ進む。
@@ -5715,6 +5731,11 @@ impl App {
             fs_suppress_primary_until_release: false,
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
+            fs_zoom_active: false,
+            fs_zoom_aiming: false,
+            fs_zoom_factor: 2.0,
+            fs_zoom_z_was_down: false,
+            fs_zoom_exit_pending: false,
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
@@ -26075,6 +26096,8 @@ impl App {
         if self.analysis_mode {
             self.reset_analysis_mode();
         }
+        // ZipPla 風全画面ズーム (Z) も一覧に戻ったら解除する (倍率はセッション保持のため残す)。
+        self.fs_zoom_reset();
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
         // 進行中のノーマライズスキャンをキャンセル + 全 fs_idx の UI 状態をクリア

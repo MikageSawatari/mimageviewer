@@ -1939,7 +1939,9 @@ impl KeyAction {
             FsCompareDiff => ChordList::one(Chord::alt(C)),
             FsRotateCw => ChordList::one(Chord::key(R)),
             FsRotateCcw => ChordList::one(Chord::key(L)),
-            FsAnalysis => ChordList::one(Chord::key(Z)),
+            // Z は ZipPla 風の全画面ズームモード (ホールド式・固定入力) に明け渡し、
+            // 画像分析モードは Shift+Z へ移動した (v2.0.0)。
+            FsAnalysis => ChordList::one(Chord::shift(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
@@ -2648,6 +2650,27 @@ fn modifier_held_via_os(kind: ModKind) -> bool {
         ModKind::Alt => VK_MENU.0,
     };
     unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+/// 修飾キー (Ctrl/Shift/Alt) なしで指定キーが物理的に押されているかを OS 直読みで返す。
+/// フルスクリーンビューポートでは egui の key_down / modifiers が stale になるため
+/// (Shift ルーペ / 右 Ctrl 元画像と同じ事情)、ホールド式の入力判定にはこちらを使う。
+/// 非 Windows では常に false。
+// 呼び出し元は bin 専用の `ui_fullscreen.rs` (ZipPla 風ズーム) のみ。lib 側ビルドからは
+// 未使用に見えるため dead_code を許可する。
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn plain_key_held_via_os(key: KeyName) -> bool {
+    key_held_via_os(key)
+        && !modifier_held_via_os(ModKind::Ctrl)
+        && !modifier_held_via_os(ModKind::Shift)
+        && !modifier_held_via_os(ModKind::Alt)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub(crate) fn plain_key_held_via_os(_key: KeyName) -> bool {
+    false
 }
 
 #[cfg(windows)]
