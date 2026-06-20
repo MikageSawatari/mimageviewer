@@ -143,26 +143,74 @@ impl crate::app::App {
 
     /// 集約セルのスタックを展開してメンバーグリッドへドリルインする。
     /// `key` は `GridItem::Stack.key`。単独セル (= Image/Video) はここを通らない。
+    ///
+    /// in-memory な items 差し替えなので、`zip_nav_show_current_level` と同じ軽量ビュー切替の
+    /// 後始末 (idx 状態 + キュー破棄 / visible_indices 再構築 / ページ編集状態の再 hydrate /
+    /// rating・tag prewarm) を必ず行う。これを怠ると旧 (集約) ビューの stale な
+    /// `visible_indices` が `update_keep_range_and_requests` で `thumbnails[i]` を範囲外参照
+    /// して panic する (Codex P1)。
     pub(crate) fn stack_drill_into(&mut self, key: &str) {
-        let Some(sv) = self.stack_view.as_ref() else {
+        let (g, items, metas) = {
+            let Some(sv) = self.stack_view.as_ref() else {
+                return;
+            };
+            let Some(g) = sv.group_index_by_key(key) else {
+                return;
+            };
+            // 集約セルが Stack なのは is_stack グループだけだが、防御的に確認する。
+            if !sv.groups[g].is_stack() {
+                return;
+            }
+            let (items, metas) = sv.materialize_member(g);
+            (g, items, metas)
+        };
+        let Some(folder) = self.current_folder.clone() else {
             return;
         };
-        let Some(g) = sv.group_index_by_key(key) else {
-            return;
-        };
-        // 集約セルが Stack なのは is_stack グループだけだが、防御的に確認する。
-        if !sv.groups[g].is_stack() {
-            return;
+
+        // 旧 (集約) ビューの in-flight 検索 / 詳細メタ pending を停止 (idx が付け替わる)。
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel();
         }
-        let (items, metas) = sv.materialize_member(g);
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel();
+        }
         if let Some(sv) = self.stack_view.as_mut() {
             sv.drilled = Some(g);
         }
         self.stack_return_select_key = Some(key.to_string());
+
+        // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
+        // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / zip nav と同じ)。
+        self.invalidate_idx_state_and_queues();
+        self.current_folder_rating_cache = None;
+        // メンバーは実 Image ファイル。実フォルダ prefix でページ編集状態 (補正 / crop /
+        // view-trim / 消しゴム / ローカル調整 / 隠蔽) を再 hydrate し、旧 idx の編集が別 entry へ
+        // 漏れないようにする (page_path_key は実パスキーを返すので folder prefix で正しく載る)。
+        self.rehydrate_page_edit_state_for_current_items(&folder);
+        self.local_adjust_generation.clear();
+        self.local_adjust_cache.clear();
+        // path-keyed メタキャッシュはメンバー用にリセット。
+        self.metadata_cache.clear();
+        self.exif_cache.clear();
+        self.xmp_cache.clear();
+        self.tags_cache.clear();
+        // Ctrl+F フィルタの残留を解除 (集約ビュー向けなのでメンバーグリッドでは無効)。
+        self.search_filter = None;
+        self.search_query.clear();
+        // 先頭メンバーを選択 (メンバーは常に 2 枚以上)。
         self.selected = Some(0);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = true;
+        self.scroll_hint
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // rating フィルタ有効時に rebuild_visible_indices が per-item で SQLite を引かないよう
+        // 事前 prewarm (start_loading_items / zip nav と同じ)。
+        self.prewarm_rating_cache();
+        // ★ visible_indices 再構築。stale index による範囲外参照 panic を防ぐ (Codex P1)。
+        self.rebuild_visible_indices();
+        self.prewarm_grid_tags();
         self.update_stack_address();
     }
 

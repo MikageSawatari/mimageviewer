@@ -8258,6 +8258,9 @@ impl App {
         // 破棄しないと、BS / gamepad-back が zip_nav_back() を先に拾って current_folder=None の
         // まま旧 ZIP 階層を復活させてしまう (Codex P2)。ネスト ZIP バイト列キャッシュも破棄。
         self.zip_nav = None;
+        // ファイル名スタックも同様に解除 (SLI を通らない経路なので明示的に)。
+        self.stack_mode_requested = false;
+        self.stack_view = None;
         crate::zip_loader::clear_nested_cache();
 
         let (tx, rx) = mpsc::channel();
@@ -8786,6 +8789,9 @@ impl App {
             Some(folder_signature),
         );
         if let Some(sv) = pending_stack_view {
+            // start_loading_items が stack_mode_requested を一旦 false にするので、ここで
+            // ユーザー意図を復元する (次の同一フォルダ再読込 = ソート変更等でも維持される)。
+            self.stack_mode_requested = true;
             self.stack_view = Some(sv);
         }
 
@@ -11955,11 +11961,15 @@ impl App {
         // 再設定するので、ここでクリアしても問題ない。階層内ナビ (enter/back) は
         // install_new_items の軽量経路を使い start_loading_items を通らない (= 維持)。
         self.zip_nav = None;
-        // ファイル名スタックの集約/メンバービューも、別コンテナ遷移では破棄する
-        // (`load_folder_with_scan` が通常フォルダで再構築する。zip_nav と同じ規約)。
-        // `stack_mode_requested` (ユーザー意図) はここでは触らない — 同一フォルダ再読込で
-        // 維持し、別フォルダへのナビ時のみ load_folder_with_scan 側で false にする。
+        // ファイル名スタックは「通常フォルダ表示のときだけ ON」のビューモードなので、
+        // 任意のコンテナ遷移 (フォルダ/ZIP/PDF/検索結果/タグ/履歴) でここを通るたびに
+        // ビュー実体 (`stack_view`) とユーザー意図 (`stack_mode_requested`) の両方を破棄する。
+        // 通常フォルダ読込 (`load_folder_with_scan`) だけが、この呼び出しの **後** で
+        // 直前の意図に基づき両方を再設定する (= zip_nav を finalize_zip_enumerate が後で
+        // 再設定するのと同じパターン)。これにより Ctrl+G 等 SLI を通る経路でも確実に解除され、
+        // 同一フォルダ再読込 (ソート変更・メンバー戻り) では hook が復元する。
         self.stack_view = None;
+        self.stack_mode_requested = false;
         self.gamepad_location_picker = None;
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();

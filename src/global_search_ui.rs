@@ -1108,6 +1108,12 @@ impl App {
         // (zip_nav 維持の軽量経路 zip_nav_show_current_level は install_new_items を
         // 直接呼ぶのでここを通らない。)
         self.zip_nav = None;
+        // ファイル名スタックも解除する。検索は start_loading_items を通らない軽量経路なので、
+        // ここで意図 (stack_mode_requested) と実体 (stack_view) の両方を明示的に破棄しないと、
+        // 検索を閉じて同一フォルダへ戻ったとき (folder_changes=false) にスタックモードが
+        // 復活してしまう (Codex P2)。
+        self.stack_mode_requested = false;
+        self.stack_view = None;
         // 旧タスク停止: インデックスが付け替わるので in-flight は意味を失う
         if let Some(pending) = self.search_pending.take() {
             pending.cancel();
