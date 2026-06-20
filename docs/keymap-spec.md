@@ -321,7 +321,9 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
   排他になるので衝突しない。状態 (`fs_zoom_active` / `fs_zoom_aiming` / `fs_zoom_factor`) は
   settings に保存せずアプリセッション内のみ保持し、グリッドへ戻ると解除 (倍率は維持)。
   カスタマイズ対象には含めない。**画像分析モードは `KeyAction::FsAnalysis` のまま Shift+Z へ移動**
-  (既定 chord 変更、`keymap.ini` でカスタマイズ可)。
+  (既定 chord 変更、`keymap.ini` でカスタマイズ可)。なお `keymap.ini` で `FsAnalysis` を**修飾なしの
+  Z** へ割り当て直すと固定の全画面ズーム (Z) と衝突する (分析トグルとズーム照準が同時に起きる)。
+  ズームは固定入力なので、Z を分析へ戻したいユーザーは別キーを使うこと (既知の競合)。
 - 5/1/30 秒シークの粒度は動画プレイヤー一般の慣例 (mpv: ←→=5s, Shift+←→=1s,
   ←/→ alone in YouTube=5s, J/L=10s) を踏襲しつつ、modifier で粒度切替できる
   ようにした。
