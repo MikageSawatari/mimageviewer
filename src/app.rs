@@ -23942,7 +23942,9 @@ impl App {
             ));
         }
         let folder = self.current_folder.as_ref()?;
-        if folder == &search_results_synthetic_path() {
+        // 検索結果 / 読書履歴の擬似パスは実コンテナではないので評価対象外 (Codex P2)。
+        if folder == &search_results_synthetic_path() || folder == &reading_history_synthetic_path()
+        {
             return None;
         }
         Some((crate::adjustment_db::normalize_path(folder), folder.clone()))

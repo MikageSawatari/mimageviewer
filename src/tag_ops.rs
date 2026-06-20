@@ -222,17 +222,21 @@ impl App {
     /// ツールバーのピンタグ Shift+右クリック用 (toolbar-customization-plan.md §1.1)。
     /// 合成ビュー (検索 / タグビュー / 読書履歴) は対象コンテナが無いので no-op + 通知。
     pub(crate) fn request_tag_toggle_for_current_container(&mut self, name: &str) {
-        if self.items_are_global_search_view
-            || self.items_are_tag_view
-            || self.items_are_reading_history_view
-        {
-            self.show_feedback_toast("この画面ではコンテナにタグを付けられません".to_string());
-            return;
-        }
         let Some(folder) = self.current_folder.clone() else {
             self.show_feedback_toast("タグを付けるコンテナがありません".to_string());
             return;
         };
+        // 合成ビュー (Ctrl+G / Ctrl+S 検索・読書履歴・タグビュー・ドライブ一覧) の擬似パスは
+        // 実コンテナではないので no-op。検索系は擬似パス一致で判定する (view フラグだけでは
+        // Ctrl+S favsearch を取りこぼす — Codex P2)。
+        if folder == crate::app::search_results_synthetic_path()
+            || folder == crate::app::reading_history_synthetic_path()
+            || self.items_are_tag_view
+            || self.items_are_drive_list
+        {
+            self.show_feedback_toast("この画面ではコンテナにタグを付けられません".to_string());
+            return;
+        }
         // コンテナ (フォルダ/ZIP/PDF) は XMP サイドカー非対象なので tags.db のみ。
         let target = self.tag_target_for_path(folder, false);
         self.request_tag_toggle_for_targets(name, vec![target]);
