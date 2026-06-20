@@ -3680,18 +3680,25 @@ impl App {
                     {
                         toolbar_book_open_active = true;
                     }
-                    // ピン留め本のボタンは本棚セクションの表示形式に従う。プルダウン時は
-                    // コンボが全本を選べるのでピンボタンは出さない。折りたたみは ▶/▼ で畳める。
+                    // ピン留め本は他セクションと揃えて常にボタンで出す (コンボは全本用に常時表示)。
+                    // 折りたたみモードのときだけ ▶/▼ で畳める。
                     let book_mode = self.settings.toolbar_bookshelf_display;
-                    let (show_pins, new_collapsed) = toolbar_section_fold_toggle(
-                        ui,
-                        book_mode,
-                        self.settings.toolbar_bookshelf_collapsed,
-                    );
-                    if let Some(c) = new_collapsed {
-                        self.settings.toolbar_bookshelf_collapsed = c;
-                        self.settings.save();
-                    }
+                    let show_pins =
+                        if book_mode == crate::settings::ToolbarSectionDisplay::Collapsible {
+                            let collapsed = self.settings.toolbar_bookshelf_collapsed;
+                            let arrow = if collapsed { "▶" } else { "▼" };
+                            if ui
+                                .button(arrow)
+                                .on_hover_text("ピン留め本の折りたたみ")
+                                .clicked()
+                            {
+                                self.settings.toolbar_bookshelf_collapsed = !collapsed;
+                                self.settings.save();
+                            }
+                            !collapsed
+                        } else {
+                            true
+                        };
                     if show_pins {
                         // 左=開く / 右=選択したアイテムを追加。実在する本だけ (削除済みピンは出さない)。
                         for pin in &toolbar_pinned_books {
@@ -4060,24 +4067,36 @@ impl App {
                                     .map(|f| f.name.clone())
                             })
                             .unwrap_or_else(|| "選択".to_string());
-                        let combo = egui::ComboBox::from_id_salt("toolbar_fav_combo")
-                            .width(160.0)
-                            .selected_text(sel_text)
-                            .show_ui(ui, |ui| {
-                                apply_toolbar_style(ui);
-                                for fav in &self.settings.favorites {
-                                    let selected =
-                                        current.as_ref().map(|c| c == &fav.path).unwrap_or(false);
-                                    if ui
-                                        .selectable_label(selected, &fav.name)
-                                        .on_hover_text(fav.path.to_string_lossy())
-                                        .clicked()
-                                    {
-                                        toolbar_fav_nav = Some(fav.path.clone());
-                                        ui.close();
-                                    }
-                                }
-                            });
+                        // ComboBox を固定サイズ領域に包んで `horizontal_wrapped` の折返しを効かせる
+                        // (右端でそのまま置くと見切れるため。toolbar_label と同じ手法)。
+                        let combo = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(168.0, ui.spacing().interact_size.y),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    egui::ComboBox::from_id_salt("toolbar_fav_combo")
+                                        .width(160.0)
+                                        .selected_text(sel_text)
+                                        .show_ui(ui, |ui| {
+                                            apply_toolbar_style(ui);
+                                            for fav in &self.settings.favorites {
+                                                let selected = current
+                                                    .as_ref()
+                                                    .map(|c| c == &fav.path)
+                                                    .unwrap_or(false);
+                                                if ui
+                                                    .selectable_label(selected, &fav.name)
+                                                    .on_hover_text(fav.path.to_string_lossy())
+                                                    .clicked()
+                                                {
+                                                    toolbar_fav_nav = Some(fav.path.clone());
+                                                    ui.close();
+                                                }
+                                            }
+                                        })
+                                },
+                            )
+                            .inner;
                         toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                     } else if show_inline {
                         for fav in &self.settings.favorites {
@@ -4132,21 +4151,32 @@ impl App {
                                 .cloned()
                                 .unwrap_or_else(|| toolbar_tags[0].clone());
                             let mut new_pick: Option<String> = None;
-                            let combo = egui::ComboBox::from_id_salt("toolbar_tag_combo")
-                                .width(140.0)
-                                .selected_text(format!("#{pick}"))
-                                .show_ui(ui, |ui| {
-                                    apply_toolbar_style(ui);
-                                    for name in &toolbar_tags {
-                                        if ui
-                                            .selectable_label(name == &pick, format!("#{name}"))
-                                            .clicked()
-                                        {
-                                            new_pick = Some(name.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                });
+                            let combo = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(148.0, ui.spacing().interact_size.y),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        egui::ComboBox::from_id_salt("toolbar_tag_combo")
+                                            .width(140.0)
+                                            .selected_text(format!("#{pick}"))
+                                            .show_ui(ui, |ui| {
+                                                apply_toolbar_style(ui);
+                                                for name in &toolbar_tags {
+                                                    if ui
+                                                        .selectable_label(
+                                                            name == &pick,
+                                                            format!("#{name}"),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        new_pick = Some(name.clone());
+                                                        ui.close();
+                                                    }
+                                                }
+                                            })
+                                    },
+                                )
+                                .inner;
                             toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                             if let Some(p) = new_pick {
                                 self.toolbar_tag_dropdown_pick = Some(p);

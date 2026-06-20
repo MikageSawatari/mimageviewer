@@ -553,7 +553,13 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚");
     if s.show_toolbar_bookshelf {
-        display_radio3(ui, &mut s.toolbar_bookshelf_display);
+        // 本棚はコンボ(全本)が常時あり、ピンは常にボタンで出すので 展開/折りたたみ の 2 択。
+        ui.horizontal(|ui| {
+            ui.label("表示:");
+            for &opt in ToolbarSectionDisplay::all_collapsible_only() {
+                ui.radio_value(&mut s.toolbar_bookshelf_display, opt, opt.label());
+            }
+        });
     }
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
     ui.checkbox(

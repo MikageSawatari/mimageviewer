@@ -673,9 +673,14 @@ impl ToolbarSectionDisplay {
     pub fn all() -> &'static [Self] {
         &[Self::Buttons, Self::Dropdown]
     }
-    /// お気に入り / タグ / 本棚用 (展開 / 折りたたみ / プルダウンの 3 択)。
+    /// お気に入り / タグ用 (展開 / 折りたたみ / プルダウンの 3 択)。
     pub fn all_with_collapsible() -> &'static [Self] {
         &[Self::Buttons, Self::Collapsible, Self::Dropdown]
+    }
+    /// 本棚用 (展開 / 折りたたみの 2 択)。本棚はコンボ(全本)が常時あり、ピンは常にボタンで
+    /// 出すので、プルダウンは設けない (展開と区別が付かないため)。
+    pub fn all_collapsible_only() -> &'static [Self] {
+        &[Self::Buttons, Self::Collapsible]
     }
     pub fn label(self) -> &'static str {
         match self {
