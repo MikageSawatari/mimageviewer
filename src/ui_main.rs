@@ -2101,6 +2101,13 @@ impl App {
                         self.open_settings_restore_dialog();
                         ui.close();
                     }
+                    ui.separator();
+                    // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
+                    // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
+                    // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                    ui.menu_button("ツールバー", |ui| {
+                        self.draw_toolbar_visibility_menu(ui);
+                    });
                     if ui.button("環境設定…").clicked() {
                         self.show_preferences = true;
                         ui.close();
@@ -3504,18 +3511,16 @@ impl App {
         let tb_sorts = self.settings.toolbar_sort_items.clone();
         let toolbar_details_visible = self.settings.toolbar_cols_details_visible;
         let details_mode = self.settings.grid_view_mode == GridViewMode::Details;
-        // v2.0.0: 各セクションに明示的な表示フラグ (show_toolbar_*) を持たせ、空き領域
-        // 右クリックの表示チェックリストから ON/OFF できる。最終表示可否は
-        // 「フラグ AND 描ける項目がある」。フラグ既定 true なので旧挙動 (項目で決まる) と同じ。
-        let show_cols =
-            self.settings.show_toolbar_cols && (!tb_cols.is_empty() || toolbar_details_visible);
-        // 比率セクション: 手動 7 種を全部外しても「自動」だけ ON なら表示する
-        // (Codex P3 2026-05)。`toolbar_aspect_auto_visible` は別フラグなので
-        // tb_aspects 空 + auto_visible で section が消える事故を防ぐ。
-        let show_aspect = self.settings.show_toolbar_aspect
-            && !details_mode
-            && (self.settings.toolbar_aspect_auto_visible || !tb_aspects.is_empty());
-        let show_sort = self.settings.show_toolbar_sort && !tb_sorts.is_empty();
+        // v2.0.0: 各セクションの表示可否は明示フラグ (show_toolbar_*) だけで決める。
+        // 旧来は「項目リストが空 = 非表示」だったが、それだと項目を全部外したとき
+        // セクションのラベル (= 右クリックで項目を再追加する入口) ごと消えてしまう
+        // (Codex P3)。フラグで存在を管理し、項目が無いセクションはラベル + ヒントだけ
+        // 描く。空き領域 / 「設定→ツールバー」/ ラベル右クリックから ON/OFF・項目編集できる。
+        // フラグは既定 true なので、初期状態の見た目は従来と同じ。
+        let show_cols = self.settings.show_toolbar_cols;
+        // 比率は詳細一覧モードでは無意味なので隠す (従来どおり)。
+        let show_aspect = self.settings.show_toolbar_aspect && !details_mode;
+        let show_sort = self.settings.show_toolbar_sort;
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;
@@ -3614,8 +3619,19 @@ impl App {
             // 何も無い余白の右クリックだけ背景が拾う (egui hit_test の仕様、kittest で検証済)。
             // 矩形は前フレームの content rect を使う (今フレームの高さは描画後でないと
             // 分からないため)。初回 (None) は背景メニュー無効。
-            let bg_resp = toolbar_bg_rect
-                .map(|r| ui.interact(r, ui.id().with("toolbar_bg_menu"), egui::Sense::click()));
+            //
+            // ⚠ 高さは「ツールバー先頭 1 行ぶん」に丸める (Codex P2)。前フレームが複数行で
+            // 今フレームが 1 行に縮んだ場合、前フレームの背の高い rect をそのまま使うと、
+            // 下のアドレスバー / グリッドの空き部分まで背景 interact が伸び、そこの右クリックを
+            // 誤って奪うことがある。先頭行の高さに収めれば必ず現ツールバー内に収まり、
+            // 先頭行の末尾余白 (最も普通の空き領域) は拾える。複数行時の 2 行目以降の余白は
+            // 「設定→ツールバー」メニューで代替できる。
+            let bg_resp = toolbar_bg_rect.map(|r| {
+                let row_h = (ui.spacing().interact_size.y + 6.0).min(r.height());
+                let capped =
+                    egui::Rect::from_min_size(r.min, egui::vec2(r.width(), row_h.max(1.0)));
+                ui.interact(capped, ui.id().with("toolbar_bg_menu"), egui::Sense::click())
+            });
 
             let scope_resp = ui.scope(|ui| {
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
@@ -3861,6 +3877,11 @@ impl App {
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
+                    // 項目が無い (列も詳細も外した) ときは、ラベルだけだと意図が伝わらないので
+                    // 右クリックへ誘導するヒントを出す (Codex P3: 項目を全部外しても入口を残す)。
+                    if tb_cols.is_empty() && !toolbar_details_visible {
+                        ui.label(egui::RichText::new("(右クリックで列を選択)").weak());
+                    }
                 }
                 TS::Aspect => {
                     toolbar_label(ui, "比率:", 42.0)
@@ -3954,6 +3975,10 @@ impl App {
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
+                    // 「自動」も手動比率も全部外したときの右クリック誘導 (Codex P3)。
+                    if !auto_visible && tb_aspects.is_empty() {
+                        ui.label(egui::RichText::new("(右クリックで比率を選択)").weak());
+                    }
                 }
                 TS::Sort => {
                     let details_sort_disabled = self.details_header_sort_active();
@@ -4026,6 +4051,10 @@ impl App {
                                     egui::ComboBox::is_open(ctx, combo.response.id);
                             });
                         }
+                    }
+                    // ソート候補を全部外したときの右クリック誘導 (Codex P3)。
+                    if tb_sorts.is_empty() {
+                        ui.label(egui::RichText::new("(右クリックでソートを選択)").weak());
                     }
                 }
                 TS::Rating => {
