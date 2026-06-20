@@ -1097,13 +1097,17 @@ fn draw_toolbar_drop_indicator(
         return;
     }
     let vis_idx = toolbar_drop_index(anchors, pointer);
-    let (x, top, bottom) = if vis_idx == 0 {
-        let r = anchors[0].1;
-        (r.left() - 2.0, r.top(), r.bottom())
-    } else {
-        // 挿入位置の直前セクションの右端 (= その行の末尾。折返し時も正しい行に出る)。
-        let r = anchors[vis_idx - 1].1;
-        (r.right() + 2.0, r.top(), r.bottom())
+    let prev = (vis_idx > 0).then(|| anchors[vis_idx - 1].1);
+    let next = anchors.get(vis_idx).map(|(_, r)| *r);
+    let on_pointer_row = |r: egui::Rect| pointer.y >= r.top() && pointer.y <= r.bottom();
+    // ポインタと同じ行にあるアンカーを優先してマーカーを出す (折返し時に「前の行の末尾」へ
+    // 誤表示しないように。Codex P3)。同行の prev があればその右端、無ければ同行の next の左端。
+    let (x, top, bottom) = match (prev, next) {
+        (Some(p), _) if on_pointer_row(p) => (p.right() + 2.0, p.top(), p.bottom()),
+        (_, Some(n)) if on_pointer_row(n) => (n.left() - 2.0, n.top(), n.bottom()),
+        (Some(p), _) => (p.right() + 2.0, p.top(), p.bottom()),
+        (_, Some(n)) => (n.left() - 2.0, n.top(), n.bottom()),
+        (None, None) => return,
     };
     let color = ui.visuals().selection.bg_fill;
     let stroke = egui::Stroke::new(2.0, color);
@@ -4704,6 +4708,16 @@ impl App {
         s.show_toolbar_favorites = true;
         s.show_toolbar_tags = true;
         s.show_toolbar_facet_filter = true;
+        // フォルダバー (アドレス行) もセクション扱いなので一緒に既定へ戻す (Codex P3)。
+        s.show_toolbar_folder = true;
+        s.show_address_bar_history_nav = true;
+        s.show_address_bar_quick_folders = true;
+        s.show_toolbar_parent_button = true;
+        s.show_toolbar_prev_folder = true;
+        s.show_toolbar_next_folder = true;
+        s.show_address_bar_favorite_button = true;
+        s.show_address_bar_history_menu = true;
+        s.show_address_bar_folder_pin = true;
         // 並び順 / 行頭
         s.toolbar_section_order = Vec::new();
         s.toolbar_section_new_row = Vec::new();

@@ -4515,6 +4515,17 @@ impl Settings {
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
+        // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
+        // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
+        self.show_toolbar_folder = src.show_toolbar_folder;
+        self.show_address_bar_history_nav = src.show_address_bar_history_nav;
+        self.show_address_bar_quick_folders = src.show_address_bar_quick_folders;
+        self.show_toolbar_parent_button = src.show_toolbar_parent_button;
+        self.show_toolbar_prev_folder = src.show_toolbar_prev_folder;
+        self.show_toolbar_next_folder = src.show_toolbar_next_folder;
+        self.show_address_bar_favorite_button = src.show_address_bar_favorite_button;
+        self.show_address_bar_history_menu = src.show_address_bar_history_menu;
+        self.show_address_bar_folder_pin = src.show_address_bar_folder_pin;
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
         // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
