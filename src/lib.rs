@@ -53,6 +53,7 @@ pub mod external_links;
 pub mod external_metadata;
 pub mod fast_resize;
 pub mod file_drag;
+pub mod filename_stack;
 pub mod folder_rating_counter;
 pub mod folder_thumb_pins;
 pub mod folder_tree;

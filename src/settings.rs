@@ -1636,6 +1636,12 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
+    /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
+    /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
+    /// 永続化しない (フォルダを出ると自動解除) が、区切り文字はここに保存する。
+    #[serde(default = "default_stack_separator")]
+    pub stack_separator: char,
     /// サムネイルキャッシュの長辺ピクセル数
     #[serde(default = "default_thumb_px")]
     pub thumb_px: u32,
@@ -2913,6 +2919,9 @@ fn default_cache_size_threshold_bytes() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_stack_separator() -> char {
+    '_'
+}
 fn default_active_book_name() -> String {
     crate::books::DEFAULT_BOOK_NAME.to_string()
 }
@@ -3259,6 +3268,7 @@ impl Default for Settings {
             show_toolbar_sort: true,
             toolbar_section_new_row: Vec::new(),
             toolbar_section_drag_enabled: false,
+            stack_separator: default_stack_separator(),
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
@@ -4830,6 +4840,23 @@ mod tests {
             s.toolbar_section_new_row.is_empty(),
             "新規 new_row 集合は欠落時 空"
         );
+    }
+
+    #[test]
+    fn stack_separator_defaults_to_underscore_when_missing() {
+        // v2.0.0 で追加したファイル名スタックの区切り文字は、旧 settings JSON
+        // (フィールド無し) を読んだとき既定 '_' になる (docs/filename-stack-plan.md §6)。
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.stack_separator, '_');
+    }
+
+    #[test]
+    fn stack_separator_roundtrips() {
+        let mut s = Settings::default();
+        s.stack_separator = '-';
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stack_separator, '-');
     }
 
     #[test]
