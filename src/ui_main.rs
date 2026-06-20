@@ -996,6 +996,45 @@ fn finish_details_header_drag(
     reorder_details_column(settings, drag.column, target, insert_after)
 }
 
+// ── ツールバー セクション カスタマイズ helper (v2.0.0 Phase 3) ──────────────
+
+/// セクションの表示用ラベル (右クリックメニューのヘッダ / チェックボックス文言)。
+fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> &'static str {
+    use crate::settings::ToolbarSectionId as TS;
+    match section {
+        TS::FolderTree => "ツリー",
+        TS::Bookshelf => "本棚",
+        TS::Cols => "列",
+        TS::Aspect => "比率",
+        TS::Sort => "ソート",
+        TS::Rating => "レーティング (★)",
+        TS::Favorites => "お気に入り",
+        TS::Tags => "タグ",
+        TS::Unknown => "",
+    }
+}
+
+/// セクションの表示フラグ (show_toolbar_*) を設定する。
+/// 未知セクションは no-op。
+fn set_toolbar_section_visible(
+    settings: &mut crate::settings::Settings,
+    section: crate::settings::ToolbarSectionId,
+    visible: bool,
+) {
+    use crate::settings::ToolbarSectionId as TS;
+    match section {
+        TS::FolderTree => settings.show_toolbar_folder_tree_button = visible,
+        TS::Bookshelf => settings.show_toolbar_bookshelf = visible,
+        TS::Cols => settings.show_toolbar_cols = visible,
+        TS::Aspect => settings.show_toolbar_aspect = visible,
+        TS::Sort => settings.show_toolbar_sort = visible,
+        TS::Rating => settings.show_toolbar_rating = visible,
+        TS::Favorites => settings.show_toolbar_favorites = visible,
+        TS::Tags => settings.show_toolbar_tags = visible,
+        TS::Unknown => {}
+    }
+}
+
 #[cfg(test)]
 fn adjusted_book_reorder_insert_index(src: usize, insert_index: usize, len: usize) -> usize {
     let insert_index = insert_index.min(len);
@@ -3594,14 +3633,24 @@ impl App {
                 // widget と詰まる/重なる/wrap 判定が狂う (Codex 助言 2026-05)。
                 // 固定幅を明示すること。日本語ラベルは数が固定なので呼び出し側で
                 // 目視チューンした値を渡す。
+                // v2.0.0 Phase 3: セクションラベルは右クリックで「セクション設定」メニューを
+                // 開く対象にするため、ラベル領域に click sense を重ねた response を返す。
+                // id はラベル文字列で salt して衝突を避ける (horizontal_wrapped 内は同一 ui id)。
                 fn toolbar_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
                     let h = ui.spacing().interact_size.y;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(width, h),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| ui.label(text),
+                    let rect = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(width, h),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.label(text),
+                        )
+                        .response
+                        .rect;
+                    ui.interact(
+                        rect,
+                        ui.id().with((text, "toolbar_section_label")),
+                        egui::Sense::click(),
                     )
-                    .inner
                 }
 
                 ui.horizontal_wrapped(|ui| {
@@ -3645,13 +3694,20 @@ impl App {
                     let active = self.settings.folder_tree_pane_visible;
                     let resp = ui
                         .selectable_label(active, "ツリー")
-                        .on_hover_text("左側に実フォルダツリーを表示");
+                        .on_hover_text("左側に実フォルダツリーを表示\n右クリック: このセクションの設定");
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
                     }
+                    resp.context_menu(|ui| {
+                        self.draw_section_settings_menu(ui, TS::FolderTree);
+                    });
                 }
                 TS::Bookshelf => {
-                    toolbar_label(ui, "本棚:", 46.0);
+                    toolbar_label(ui, "本棚:", 46.0)
+                        .hover_tip("右クリック: このセクションの設定")
+                        .context_menu(|ui| {
+                            self.draw_section_settings_menu(ui, TS::Bookshelf);
+                        });
                     let combo = egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         .width(160.0)
                         .height(320.0)
@@ -3738,7 +3794,11 @@ impl App {
                     }
                 }
                 TS::Cols => {
-                    toolbar_label(ui, "列:", 28.0);
+                    toolbar_label(ui, "列:", 28.0)
+                        .hover_tip("右クリック: このセクションの設定")
+                        .context_menu(|ui| {
+                            self.draw_section_settings_menu(ui, TS::Cols);
+                        });
                     match self.settings.toolbar_cols_display {
                         crate::settings::ToolbarSectionDisplay::Buttons
                         | crate::settings::ToolbarSectionDisplay::Collapsible
@@ -3803,7 +3863,11 @@ impl App {
                     }
                 }
                 TS::Aspect => {
-                    toolbar_label(ui, "比率:", 42.0);
+                    toolbar_label(ui, "比率:", 42.0)
+                        .hover_tip("右クリック: このセクションの設定")
+                        .context_menu(|ui| {
+                            self.draw_section_settings_menu(ui, TS::Aspect);
+                        });
                     let auto_visible = self.settings.toolbar_aspect_auto_visible;
                     let auto_selected = self.settings.thumb_aspect_auto;
                     let auto_label = if let Some(current) = self.auto_aspect.current {
@@ -3895,13 +3959,18 @@ impl App {
                     let details_sort_disabled = self.details_header_sort_active();
                     let sort_disabled = details_sort_disabled || book_sort_locked;
                     let sort_label = toolbar_label(ui, "ソート:", 54.0);
-                    if book_sort_locked {
-                        sort_label.hover_tip("本棚内または読書履歴では表示順が固定されます。");
+                    let sort_label = if book_sort_locked {
+                        sort_label.hover_tip("本棚内または読書履歴では表示順が固定されます。")
                     } else if details_sort_disabled {
                         sort_label.hover_tip(
                             "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
-                        );
-                    }
+                        )
+                    } else {
+                        sort_label.hover_tip("右クリック: このセクションの設定")
+                    };
+                    sort_label.context_menu(|ui| {
+                        self.draw_section_settings_menu(ui, TS::Sort);
+                    });
                     match self.settings.toolbar_sort_display {
                         crate::settings::ToolbarSectionDisplay::Buttons
                         | crate::settings::ToolbarSectionDisplay::Collapsible
@@ -3970,11 +4039,16 @@ impl App {
                     // hover ヒントは disable 中の widget では拾われにくいので
                     // (egui の sense)、有効な「★:」ラベル側に乗せる。
                     let star_label = toolbar_label(ui, "★:", 24.0);
-                    if aggregated_search {
+                    let star_label = if aggregated_search {
                         star_label.hover_tip(
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
-                        );
-                    }
+                        )
+                    } else {
+                        star_label.hover_tip("右クリック: このセクションの設定")
+                    };
+                    star_label.context_menu(|ui| {
+                        self.draw_section_settings_menu(ui, TS::Rating);
+                    });
                     // ★ボタン群を `add_enabled_ui` でまとめると、その scope が「残り幅」
                     // だけの狭い子 UI を作るので `horizontal_wrapped` の wrap が子 UI 内で
                     // 起きてしまい、★★ 以降が右端の縦帯に積まれて崩れる。enabled は各
@@ -4053,7 +4127,11 @@ impl App {
 
                 }
                 TS::Favorites => {
-                    toolbar_label(ui, "お気に入り:", 76.0);
+                    toolbar_label(ui, "お気に入り:", 76.0)
+                        .hover_tip("右クリック: このセクションの設定")
+                        .context_menu(|ui| {
+                            self.draw_section_settings_menu(ui, TS::Favorites);
+                        });
                     let fav_mode = self.settings.toolbar_favorites_display;
                     let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
                         ui,
@@ -4129,7 +4207,11 @@ impl App {
                 }
                 // タグセクション (docs/tag-feature.md §4.3)
                 TS::Tags => {
-                    toolbar_label(ui, "タグ:", 42.0);
+                    toolbar_label(ui, "タグ:", 42.0)
+                        .hover_tip("右クリック: このセクションの設定")
+                        .context_menu(|ui| {
+                            self.draw_section_settings_menu(ui, TS::Tags);
+                        });
                     let has_target = self.tag_target_path_count() > 0;
                     // 設定 / 検索 はセクション全体の操作 (Phase 3 で ⚙ に集約予定)。表示形式に依らず常に出す。
                     if ui
@@ -4437,6 +4519,186 @@ impl App {
         s.toolbar_aspect_auto_visible = crate::settings::default_toolbar_aspect_auto_visible();
         s.toolbar_sort_items = crate::settings::default_toolbar_sort_items();
         s.save();
+    }
+
+    /// セクションのラベル右クリックで開く「このセクションの設定」メニュー
+    /// (v2.0.0 Phase 3, §1.2)。表示形式・出す項目・管理ダイアログ・非表示・既定化を提供。
+    fn draw_section_settings_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        section: crate::settings::ToolbarSectionId,
+    ) {
+        use crate::settings::ToolbarSectionDisplay as TD;
+        use crate::settings::ToolbarSectionId as TS;
+
+        ui.label(egui::RichText::new(toolbar_section_display_label(section)).strong());
+        ui.separator();
+
+        let mut changed = false;
+        // 表示形式 (展開/折りたたみ/プルダウン) ラジオの共通描画。
+        fn display_radio(ui: &mut egui::Ui, value: &mut TD, options: &[TD], changed: &mut bool) {
+            ui.horizontal(|ui| {
+                ui.label("表示:");
+                for &opt in options {
+                    *changed |= ui.radio_value(value, opt, opt.label()).changed();
+                }
+            });
+        }
+
+        match section {
+            TS::FolderTree | TS::Rating => {
+                // 表示形式・出す項目を持たない。非表示 / 既定化のみ (下の共通部)。
+            }
+            TS::Bookshelf => {
+                // 本棚はコンボ(全本)が常時あり、ピンは常にボタンで出すので 展開/折りたたみ の 2 択。
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_bookshelf_display,
+                    TD::all_collapsible_only(),
+                    &mut changed,
+                );
+                ui.separator();
+                if ui.button("本の管理…").clicked() {
+                    self.show_book_manager = true;
+                    ui.close();
+                }
+            }
+            TS::Cols => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_cols_display,
+                    TD::all(),
+                    &mut changed,
+                );
+                ui.separator();
+                ui.label("出す列:");
+                ui.horizontal_wrapped(|ui| {
+                    for cols in 1..=10usize {
+                        let mut checked = self.settings.toolbar_cols_items.contains(&cols);
+                        if ui.checkbox(&mut checked, format!("{cols}")).changed() {
+                            if checked {
+                                self.settings.toolbar_cols_items.push(cols);
+                                self.settings.toolbar_cols_items.sort();
+                            } else {
+                                self.settings.toolbar_cols_items.retain(|&c| c != cols);
+                            }
+                            changed = true;
+                        }
+                    }
+                    changed |= ui
+                        .checkbox(&mut self.settings.toolbar_cols_details_visible, "詳細")
+                        .changed();
+                });
+            }
+            TS::Aspect => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_aspect_display,
+                    TD::all(),
+                    &mut changed,
+                );
+                ui.separator();
+                ui.label("出す比率:");
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .checkbox(&mut self.settings.toolbar_aspect_auto_visible, "自動")
+                        .changed();
+                    for &aspect in crate::settings::ThumbAspect::all() {
+                        let mut checked = self.settings.toolbar_aspect_items.contains(&aspect);
+                        if ui.checkbox(&mut checked, aspect.label()).changed() {
+                            if checked {
+                                self.settings.toolbar_aspect_items.push(aspect);
+                                let order: Vec<_> = crate::settings::ThumbAspect::all().to_vec();
+                                self.settings.toolbar_aspect_items.sort_by_key(|a| {
+                                    order.iter().position(|o| o == a).unwrap_or(usize::MAX)
+                                });
+                            } else {
+                                self.settings.toolbar_aspect_items.retain(|&a| a != aspect);
+                            }
+                            changed = true;
+                        }
+                    }
+                });
+            }
+            TS::Sort => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_sort_display,
+                    TD::all(),
+                    &mut changed,
+                );
+                ui.separator();
+                ui.label("出すソート:");
+                ui.horizontal_wrapped(|ui| {
+                    for &order in crate::settings::SortOrder::all() {
+                        let mut checked = self.settings.toolbar_sort_items.contains(&order);
+                        if ui.checkbox(&mut checked, order.short_label()).changed() {
+                            if checked {
+                                self.settings.toolbar_sort_items.push(order);
+                                let canonical: Vec<_> = crate::settings::SortOrder::all().to_vec();
+                                self.settings.toolbar_sort_items.sort_by_key(|so| {
+                                    canonical.iter().position(|o| o == so).unwrap_or(usize::MAX)
+                                });
+                            } else {
+                                self.settings.toolbar_sort_items.retain(|&so| so != order);
+                            }
+                            changed = true;
+                        }
+                    }
+                });
+            }
+            TS::Favorites => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_favorites_display,
+                    TD::all_with_collapsible(),
+                    &mut changed,
+                );
+                ui.separator();
+                if ui.button("お気に入りを編集…").clicked() {
+                    self.show_favorites_editor = true;
+                    ui.close();
+                }
+            }
+            TS::Tags => {
+                display_radio(
+                    ui,
+                    &mut self.settings.toolbar_tags_display,
+                    TD::all_with_collapsible(),
+                    &mut changed,
+                );
+                ui.separator();
+                if ui.button("タグを管理…").clicked() {
+                    self.show_tag_editor = true;
+                    ui.close();
+                }
+            }
+            TS::Unknown => {}
+        }
+
+        ui.separator();
+        if ui
+            .button("このセクションを隠す")
+            .on_hover_text("再表示はツールバーの空き領域を右クリック")
+            .clicked()
+        {
+            set_toolbar_section_visible(&mut self.settings, section, false);
+            self.settings.save();
+            ui.ctx().request_repaint();
+            ui.close();
+            return;
+        }
+        if ui.button("ツールバーを既定に戻す").clicked() {
+            self.reset_toolbar_customization();
+            ui.ctx().request_repaint();
+            ui.close();
+            return;
+        }
+
+        if changed {
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
     }
 
     // ── スマートフィルタバー ────────────────────────────────────────
