@@ -1014,6 +1014,74 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
     }
 }
 
+/// ツールバーのドラッグ並べ替え中の状態 (ctx の temp data に保存)。
+#[derive(Clone, Copy)]
+struct ToolbarSectionDrag {
+    section: crate::settings::ToolbarSectionId,
+    start: egui::Pos2,
+    latest: egui::Pos2,
+}
+
+/// 折返しツールバー上で、ポインタ位置が「可視セクション列」の何番目に挿入されるかを返す。
+///
+/// `anchors` は描画順 (= 現在の可視順) の (section, ラベル矩形)。詳細ヘッダーの 1 次元
+/// hit-test と違い、ツールバーは複数行に折り返すので行 (y) も考慮する:
+/// - ポインタより上の行にあるアンカーは「手前」(必ずカウント)
+/// - 同じ行で、アンカー中心がポインタより左 (= ポインタがその右) なら「手前」
+///
+/// 戻り値は可視順での挿入インデックス (0..=anchors.len())。
+fn toolbar_drop_index(
+    anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
+    pointer: egui::Pos2,
+) -> usize {
+    let mut idx = 0usize;
+    for (_, r) in anchors {
+        let row_above = r.bottom() <= pointer.y;
+        let same_row = pointer.y >= r.top() && pointer.y <= r.bottom();
+        if row_above || (same_row && pointer.x >= r.center().x) {
+            idx += 1;
+        }
+    }
+    idx
+}
+
+/// ドラッグ並べ替えの結果となる新しい **全セクション順** を計算する (純関数、テスト対象)。
+///
+/// - `current_order`: 現在の全セクション順 (`ordered_with_fallback` の結果。非表示も含む)。
+/// - `dragged`: 掴んでいるセクション。
+/// - `before`: ドロップ先の直後にくる可視セクション (= この手前に挿入)。`None` = 末尾扱い。
+/// - `last_visible`: 可視セクションの最後 (`before` が `None` のとき、この直後に置く)。
+///
+/// 非表示セクションの相対位置は保ったまま、`dragged` を可視セクション間の正しい位置へ移す。
+/// 変化が無ければ `None`。
+fn reorder_toolbar_section(
+    current_order: &[crate::settings::ToolbarSectionId],
+    dragged: crate::settings::ToolbarSectionId,
+    before: Option<crate::settings::ToolbarSectionId>,
+    last_visible: Option<crate::settings::ToolbarSectionId>,
+) -> Option<Vec<crate::settings::ToolbarSectionId>> {
+    let mut order: Vec<_> = current_order.to_vec();
+    let from = order.iter().position(|&s| s == dragged)?;
+    order.remove(from);
+    let insert_at = match before {
+        Some(b) if b != dragged => order.iter().position(|&s| s == b).unwrap_or(order.len()),
+        _ => match last_visible {
+            Some(l) if l != dragged => order
+                .iter()
+                .position(|&s| s == l)
+                .map(|p| p + 1)
+                .unwrap_or(order.len()),
+            _ => order.len(),
+        },
+    };
+    order.insert(insert_at.min(order.len()), dragged);
+    if order == current_order {
+        None
+    } else {
+        Some(order)
+    }
+}
+
 /// セクションの表示フラグ (show_toolbar_*) を設定する。
 /// 未知セクションは no-op。
 fn set_toolbar_section_visible(
@@ -3570,6 +3638,11 @@ impl App {
         let mut toolbar_tag_apply = false;
         let mut toolbar_tag_view_open = false;
         let mut toolbar_combo_popup_open = false;
+        // ドラッグ並べ替え: 前フレームの可視セクション矩形を奪って drop 計算に使い、
+        // 今フレーム描いた矩形を集めて次フレーム用に格納する。
+        let last_section_anchors = std::mem::take(&mut self.toolbar_section_anchors);
+        let mut current_section_anchors: Vec<(crate::settings::ToolbarSectionId, egui::Rect)> =
+            Vec::new();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -3649,9 +3722,10 @@ impl App {
                 // widget と詰まる/重なる/wrap 判定が狂う (Codex 助言 2026-05)。
                 // 固定幅を明示すること。日本語ラベルは数が固定なので呼び出し側で
                 // 目視チューンした値を渡す。
-                // v2.0.0 Phase 3: セクションラベルは右クリックで「セクション設定」メニューを
-                // 開く対象にするため、ラベル領域に click sense を重ねた response を返す。
-                // id はラベル文字列で salt して衝突を避ける (horizontal_wrapped 内は同一 ui id)。
+                // v2.0.0 Phase 3: セクションラベルは (a) 右クリックで「セクション設定」メニュー、
+                // (b) ドラッグでセクション並べ替え、の対象にするため、ラベル領域に
+                // click_and_drag sense を重ねた response を返す。id はラベル文字列で salt
+                // して衝突を避ける (horizontal_wrapped 内は同一 ui id)。
                 fn toolbar_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
                     let h = ui.spacing().interact_size.y;
                     let rect = ui
@@ -3665,7 +3739,7 @@ impl App {
                     ui.interact(
                         rect,
                         ui.id().with((text, "toolbar_section_label")),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     )
                 }
 
@@ -3708,22 +3782,37 @@ impl App {
                 // VST3 プラグイン から行う運用。
                 TS::FolderTree => {
                     let active = self.settings.folder_tree_pane_visible;
+                    // selectable_label は click sense のみなので、ドラッグ並べ替えも効くよう
+                    // Button::selectable + click_and_drag にする (見た目は selectable と同じ)。
                     let resp = ui
-                        .selectable_label(active, "ツリー")
-                        .on_hover_text("左側に実フォルダツリーを表示\n右クリック: このセクションの設定");
+                        .add(
+                            egui::Button::selectable(active, "ツリー")
+                                .sense(egui::Sense::click_and_drag()),
+                        )
+                        .on_hover_text(
+                            "左側に実フォルダツリーを表示\nドラッグ: 並べ替え / 右クリック: 設定",
+                        );
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
                     }
-                    resp.context_menu(|ui| {
-                        self.draw_section_settings_menu(ui, TS::FolderTree);
-                    });
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        resp,
+                        TS::FolderTree,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                 }
                 TS::Bookshelf => {
-                    toolbar_label(ui, "本棚:", 46.0)
-                        .hover_tip("右クリック: このセクションの設定")
-                        .context_menu(|ui| {
-                            self.draw_section_settings_menu(ui, TS::Bookshelf);
-                        });
+                    let lead = toolbar_label(ui, "本棚:", 46.0)
+                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Bookshelf,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     let combo = egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         .width(160.0)
                         .height(320.0)
@@ -3810,11 +3899,15 @@ impl App {
                     }
                 }
                 TS::Cols => {
-                    toolbar_label(ui, "列:", 28.0)
-                        .hover_tip("右クリック: このセクションの設定")
-                        .context_menu(|ui| {
-                            self.draw_section_settings_menu(ui, TS::Cols);
-                        });
+                    let lead = toolbar_label(ui, "列:", 28.0)
+                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Cols,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     match self.settings.toolbar_cols_display {
                         crate::settings::ToolbarSectionDisplay::Buttons
                         | crate::settings::ToolbarSectionDisplay::Collapsible
@@ -3884,11 +3977,15 @@ impl App {
                     }
                 }
                 TS::Aspect => {
-                    toolbar_label(ui, "比率:", 42.0)
-                        .hover_tip("右クリック: このセクションの設定")
-                        .context_menu(|ui| {
-                            self.draw_section_settings_menu(ui, TS::Aspect);
-                        });
+                    let lead = toolbar_label(ui, "比率:", 42.0)
+                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Aspect,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     let auto_visible = self.settings.toolbar_aspect_auto_visible;
                     let auto_selected = self.settings.thumb_aspect_auto;
                     let auto_label = if let Some(current) = self.auto_aspect.current {
@@ -3991,11 +4088,15 @@ impl App {
                             "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
                         )
                     } else {
-                        sort_label.hover_tip("右クリック: このセクションの設定")
+                        sort_label.hover_tip("ドラッグ: 並べ替え / 右クリック: 設定")
                     };
-                    sort_label.context_menu(|ui| {
-                        self.draw_section_settings_menu(ui, TS::Sort);
-                    });
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        sort_label,
+                        TS::Sort,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     match self.settings.toolbar_sort_display {
                         crate::settings::ToolbarSectionDisplay::Buttons
                         | crate::settings::ToolbarSectionDisplay::Collapsible
@@ -4073,11 +4174,15 @@ impl App {
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
                         )
                     } else {
-                        star_label.hover_tip("右クリック: このセクションの設定")
+                        star_label.hover_tip("ドラッグ: 並べ替え / 右クリック: 設定")
                     };
-                    star_label.context_menu(|ui| {
-                        self.draw_section_settings_menu(ui, TS::Rating);
-                    });
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        star_label,
+                        TS::Rating,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     // ★ボタン群を `add_enabled_ui` でまとめると、その scope が「残り幅」
                     // だけの狭い子 UI を作るので `horizontal_wrapped` の wrap が子 UI 内で
                     // 起きてしまい、★★ 以降が右端の縦帯に積まれて崩れる。enabled は各
@@ -4156,11 +4261,15 @@ impl App {
 
                 }
                 TS::Favorites => {
-                    toolbar_label(ui, "お気に入り:", 76.0)
-                        .hover_tip("右クリック: このセクションの設定")
-                        .context_menu(|ui| {
-                            self.draw_section_settings_menu(ui, TS::Favorites);
-                        });
+                    let lead = toolbar_label(ui, "お気に入り:", 76.0)
+                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Favorites,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     let fav_mode = self.settings.toolbar_favorites_display;
                     let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
                         ui,
@@ -4236,11 +4345,15 @@ impl App {
                 }
                 // タグセクション (docs/tag-feature.md §4.3)
                 TS::Tags => {
-                    toolbar_label(ui, "タグ:", 42.0)
-                        .hover_tip("右クリック: このセクションの設定")
-                        .context_menu(|ui| {
-                            self.draw_section_settings_menu(ui, TS::Tags);
-                        });
+                    let lead = toolbar_label(ui, "タグ:", 42.0)
+                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Tags,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
                     let has_target = self.tag_target_path_count() > 0;
                     // 設定 / 検索 はセクション全体の操作 (Phase 3 で ⚙ に集約予定)。表示形式に依らず常に出す。
                     if ui
@@ -4362,6 +4475,9 @@ impl App {
             }
             ui.add_space(2.0);
         });
+
+        // 次フレームのドラッグ並べ替え drop 計算用に、今フレームの可視セクション矩形を格納。
+        self.toolbar_section_anchors = current_section_anchors;
 
         if toolbar_combo_popup_open {
             consume_wheel_input(ctx);
@@ -4727,6 +4843,106 @@ impl App {
         if changed {
             self.settings.save();
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// セクションの leading widget (ラベル / ツリーボタン) 共通の後処理 (v2.0.0 Phase 3):
+    /// (1) 今フレームの矩形を anchors に記録、(2) ドラッグ並べ替えを処理、
+    /// (3) 右クリックでセクション設定メニューを開く。`resp` は消費する。
+    fn finish_toolbar_section_lead(
+        &mut self,
+        ui: &egui::Ui,
+        resp: egui::Response,
+        section: crate::settings::ToolbarSectionId,
+        current_anchors: &mut Vec<(crate::settings::ToolbarSectionId, egui::Rect)>,
+        last_anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
+    ) {
+        current_anchors.push((section, resp.rect));
+        self.handle_toolbar_section_drag(ui, &resp, section, last_anchors);
+        resp.context_menu(|ui| {
+            self.draw_section_settings_menu(ui, section);
+        });
+    }
+
+    /// セクションラベルのドラッグによる並べ替えを処理する (詳細ヘッダーのドラッグと同型)。
+    /// drop 位置は前フレームの全可視セクション矩形 (`last_anchors`) から計算する
+    /// (drag_stopped 時点では後続セクションをまだ今フレームで描いていないため)。
+    fn handle_toolbar_section_drag(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        section: crate::settings::ToolbarSectionId,
+        last_anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
+    ) {
+        let drag_id = egui::Id::new("toolbar_section_drag_state");
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+        {
+            let start = ui.ctx().input(|i| i.pointer.press_origin().unwrap_or(pos));
+            // egui の temp data は remove 時に Default を要求するので Option で包む
+            // (詳細ヘッダーの DetailsHeaderDrag と同型)。
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    drag_id,
+                    Some(ToolbarSectionDrag {
+                        section,
+                        start,
+                        latest: pos,
+                    }),
+                )
+            });
+        }
+        if resp.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+        {
+            ui.ctx().data_mut(|d| {
+                if let Some(mut drag) = d.get_temp::<Option<ToolbarSectionDrag>>(drag_id).flatten()
+                    && drag.section == section
+                {
+                    drag.latest = pos;
+                    d.insert_temp(drag_id, Some(drag));
+                }
+            });
+        }
+        if resp.drag_stopped_by(egui::PointerButton::Primary) {
+            let drag = ui
+                .ctx()
+                .data_mut(|d| d.remove_temp::<Option<ToolbarSectionDrag>>(drag_id))
+                .flatten();
+            if let Some(mut drag) = drag {
+                if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                    drag.latest = pos;
+                }
+                // 誤ドラッグ防止: 移動量が小さい場合は並べ替えない (= ただのクリック扱い)。
+                if drag.section == section && (drag.latest - drag.start).length() >= 6.0 {
+                    let vis_idx = toolbar_drop_index(last_anchors, drag.latest);
+                    let before = last_anchors.get(vis_idx).map(|(s, _)| *s);
+                    let last_visible = last_anchors.last().map(|(s, _)| *s);
+                    let current = crate::settings::ToolbarSectionId::ordered_with_fallback(
+                        &self.settings.toolbar_section_order,
+                    );
+                    if let Some(new_order) =
+                        reorder_toolbar_section(&current, drag.section, before, last_visible)
+                    {
+                        crate::logger::log(format!(
+                            "toolbar section reorder: {:?} -> idx {vis_idx}",
+                            drag.section
+                        ));
+                        self.settings.toolbar_section_order = new_order;
+                        self.settings.save();
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
         }
     }
 
@@ -9246,6 +9462,83 @@ mod compute_cell_size_tests {
 
         assert_eq!(total_h, 280.0);
         assert_eq!(max_offset, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod toolbar_reorder_tests {
+    use super::*;
+    use crate::settings::ToolbarSectionId as TS;
+
+    fn rect(x: f32, y: f32, w: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, 20.0))
+    }
+
+    #[test]
+    fn drop_index_single_row_picks_by_x() {
+        // 1 行に 3 セクション: [A x=0..40][B x=50..90][C x=100..140] (y=0..20)。
+        let anchors = [
+            (TS::Cols, rect(0.0, 0.0, 40.0)),
+            (TS::Aspect, rect(50.0, 0.0, 40.0)),
+            (TS::Sort, rect(100.0, 0.0, 40.0)),
+        ];
+        // 一番左より前 → 0
+        assert_eq!(toolbar_drop_index(&anchors, egui::pos2(-5.0, 10.0)), 0);
+        // A の中心より左 (x<20) → 0
+        assert_eq!(toolbar_drop_index(&anchors, egui::pos2(10.0, 10.0)), 0);
+        // A の中心より右、B の中心より左 → 1
+        assert_eq!(toolbar_drop_index(&anchors, egui::pos2(30.0, 10.0)), 1);
+        // 末尾より右 → 3
+        assert_eq!(toolbar_drop_index(&anchors, egui::pos2(200.0, 10.0)), 3);
+    }
+
+    #[test]
+    fn drop_index_second_row_counts_first_row_as_before() {
+        // 2 行: 行0 = [A,B] (y=0..20), 行1 = [C] (y=30..50)。
+        let anchors = [
+            (TS::Cols, rect(0.0, 0.0, 40.0)),
+            (TS::Aspect, rect(50.0, 0.0, 40.0)),
+            (TS::Sort, rect(0.0, 30.0, 40.0)),
+        ];
+        // 行1 の C 中心より左 → 行0 の 2 つが「上の行」で手前 → 2
+        assert_eq!(toolbar_drop_index(&anchors, egui::pos2(5.0, 40.0)), 2);
+        // 行1 の C 中心より右 → 3
+        assert_eq!(toolbar_drop_index(&anchors, egui::pos2(35.0, 40.0)), 3);
+    }
+
+    #[test]
+    fn reorder_moves_before_target() {
+        let order = TS::default_order().to_vec();
+        // Tags を Cols の手前へ。
+        let got = reorder_toolbar_section(&order, TS::Tags, Some(TS::Cols), None).unwrap();
+        let cols_pos = got.iter().position(|&s| s == TS::Cols).unwrap();
+        let tags_pos = got.iter().position(|&s| s == TS::Tags).unwrap();
+        assert_eq!(tags_pos + 1, cols_pos, "Tags は Cols の直前に来る");
+        assert_eq!(got.len(), order.len(), "全セクションが保たれる");
+    }
+
+    #[test]
+    fn reorder_to_end_uses_last_visible() {
+        let order = TS::default_order().to_vec();
+        // FolderTree を末尾 (最後の可視 = Tags) の直後へ。
+        let got = reorder_toolbar_section(&order, TS::FolderTree, None, Some(TS::Tags)).unwrap();
+        assert_eq!(*got.last().unwrap(), TS::FolderTree);
+    }
+
+    #[test]
+    fn reorder_noop_returns_none() {
+        let order = TS::default_order().to_vec();
+        // Bookshelf を Cols (= 元々その直後) の手前へ → 位置不変。
+        assert!(reorder_toolbar_section(&order, TS::Bookshelf, Some(TS::Cols), None).is_none());
+    }
+
+    #[test]
+    fn reorder_keeps_hidden_sections_relative_order() {
+        // 非表示も含む全順序を current_order に渡す前提。可視= [Cols, Sort] だけで
+        // Sort を Cols の手前へ動かしても、間にある (非表示の) Aspect は保たれる。
+        let order = vec![TS::Cols, TS::Aspect, TS::Sort, TS::Tags];
+        let got = reorder_toolbar_section(&order, TS::Sort, Some(TS::Cols), None).unwrap();
+        assert_eq!(got, vec![TS::Sort, TS::Cols, TS::Aspect, TS::Tags]);
     }
 }
 

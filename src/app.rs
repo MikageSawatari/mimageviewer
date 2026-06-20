@@ -3005,6 +3005,11 @@ pub struct App {
     /// 使う (egui の z-order: 先に登録 = 背面 → ボタンが直接 hit で勝ち、空き領域だけ
     /// 背景が拾う)。初回 (None) は背景メニュー無効。v2.0.0 Phase 3。
     pub(crate) toolbar_content_rect: Option<egui::Rect>,
+    /// 前フレームの各ツールバーセクション (可視のみ) のラベル矩形 (描画順)。非永続。
+    /// ドラッグ並べ替えのドロップ位置計算に使う。ドロップは drag_stopped 時 (= まだ後続
+    /// セクションを描く前) に確定するので、全セクションの矩形が揃っている前フレーム値を
+    /// 参照する (toolbar_content_rect と同型のパターン)。v2.0.0 Phase 3。
+    pub(crate) toolbar_section_anchors: Vec<(crate::settings::ToolbarSectionId, egui::Rect)>,
     pub(crate) book_reorder: Option<BookReorderState>,
     /// Ctrl+Alt+Shift+D / 画像パイプラインデバッグ出力の worker 完了待ち。
     pub(crate) pipeline_debug_export_pending:
@@ -5427,6 +5432,7 @@ impl App {
             book_list_cache: None,
             toolbar_tag_dropdown_pick: None,
             toolbar_content_rect: None,
+            toolbar_section_anchors: Vec::new(),
             book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,
