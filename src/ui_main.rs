@@ -1064,8 +1064,11 @@ fn reorder_toolbar_section(
     let from = order.iter().position(|&s| s == dragged)?;
     order.remove(from);
     let insert_at = match before {
-        Some(b) if b != dragged => order.iter().position(|&s| s == b).unwrap_or(order.len()),
-        _ => match last_visible {
+        // 掴んでいるセクション自身の手前にドロップ = 元の位置 = 移動なし (Codex P2)。
+        // ここを `_` に落とすと last_visible 経由で末尾へ誤移動してしまう。
+        Some(b) if b == dragged => return None,
+        Some(b) => order.iter().position(|&s| s == b).unwrap_or(order.len()),
+        None => match last_visible {
             Some(l) if l != dragged => order
                 .iter()
                 .position(|&s| s == l)
@@ -9559,6 +9562,18 @@ mod toolbar_reorder_tests {
         let order = TS::default_order().to_vec();
         // Bookshelf を Cols (= 元々その直後) の手前へ → 位置不変。
         assert!(reorder_toolbar_section(&order, TS::Bookshelf, Some(TS::Cols), None).is_none());
+    }
+
+    #[test]
+    fn reorder_before_self_is_noop() {
+        // 掴んでいるセクション自身の左半分でドロップ → before==dragged → 移動なし。
+        // (回帰: 以前は last_visible 経由で末尾へ誤移動して保存されていた。Codex P2)
+        let order = TS::default_order().to_vec();
+        assert!(
+            reorder_toolbar_section(&order, TS::Bookshelf, Some(TS::Bookshelf), Some(TS::Tags))
+                .is_none(),
+            "自分自身の手前ドロップは no-op であるべき"
+        );
     }
 
     #[test]
