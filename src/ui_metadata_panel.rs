@@ -996,16 +996,27 @@ fn draw_fullscreen_tag_picker(
         ui.horizontal(|ui| {
             let tag = format!("#{}", choice.name);
             let label_w = (ui.available_width() - 124.0).max(96.0);
-            ui.add_sized(
-                [label_w, 20.0],
-                egui::Label::new(
-                    egui::RichText::new(&tag)
-                        .monospace()
-                        .color(egui::Color32::from_rgb(246, 248, 252)),
+            // タグ名は固定幅 label_w を確保しつつ左揃えにする。`add_sized` は中央寄せ +
+            // 引き伸ばしになり、行ごとに `#` の x がずれて読みづらい。`set_min_width` で
+            // label_w を必ず消費し、右側の件数 / ボタン列の右揃えを保つ。
+            let resp = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(label_w, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_width(label_w);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&tag)
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(246, 248, 252)),
+                            )
+                            .truncate(),
+                        )
+                    },
                 )
-                .truncate(),
-            )
-            .on_hover_text(tag);
+                .inner;
+            resp.on_hover_text(tag);
             let meta = if choice.count > 0 {
                 format!("{}件", choice.count)
             } else if choice.pinned {

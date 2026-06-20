@@ -3219,11 +3219,22 @@ fn draw_native_tag_picker_panel(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
-        ui.label(
-            egui::RichText::new(&metadata.file_name)
-                .size(11.0)
-                .color(egui::Color32::from_rgb(168, 176, 188)),
+        // 長いタイトル / ファイル名は単一行 (Extend) だとパネル右端を越えて描かれて
+        // しまうため、パネル幅で折り返して最大 2 行に収める。超過分は末尾 `…` + ホバーで
+        // 全文を出す (jump panel のブックマーク タイトルと同じ方針)。
+        let max_w = (ui.available_width() - 4.0).max(40.0);
+        let (galley, truncated) = layout_wrapped_with_max_lines(
+            ui.painter(),
+            &metadata.file_name,
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_rgb(168, 176, 188),
+            max_w,
+            2,
         );
+        let resp = ui.add(egui::Label::new(galley));
+        if truncated {
+            resp.on_hover_text(&metadata.file_name);
+        }
     });
 
     let mut close_after_apply = false;
@@ -3358,16 +3369,27 @@ fn draw_native_tag_picker(
             ui.add_space(14.0);
             let tag = format!("#{}", choice.name);
             let label_w = (ui.available_width() - 118.0).max(96.0);
-            ui.add_sized(
-                [label_w, 20.0],
-                egui::Label::new(
-                    egui::RichText::new(&tag)
-                        .monospace()
-                        .color(egui::Color32::from_rgb(246, 248, 252)),
+            // タグ名は固定幅 label_w を確保しつつ左揃えにする。`add_sized` は中央寄せ +
+            // 引き伸ばしになり、行ごとに `#` の x がずれて読みづらい。`set_min_width` で
+            // label_w を必ず消費し、右側の件数 / ボタン列の右揃えを保つ。
+            let resp = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(label_w, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_width(label_w);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&tag)
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(246, 248, 252)),
+                            )
+                            .truncate(),
+                        )
+                    },
                 )
-                .truncate(),
-            )
-            .on_hover_text(tag);
+                .inner;
+            resp.on_hover_text(tag);
             let meta = if choice.count > 0 {
                 format!("{}件", choice.count)
             } else if choice.pinned {
