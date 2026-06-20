@@ -3666,8 +3666,9 @@ impl App {
                         if !exists {
                             continue;
                         }
-                        let is_active = pin == &active_book_name;
-                        let resp = ui.selectable_label(is_active, pin).hover_tip(
+                        // ハイライトはしない (追加先=active 本を強調すると「このアイテムを
+                        // その本に入れた」と誤解されるため。ユーザー判断 2026-06-20)。
+                        let resp = ui.button(pin).hover_tip(
                             "左: この本を開く / 右: 選択したアイテムをこの本へ追加",
                         );
                         if resp.clicked() {
