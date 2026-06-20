@@ -474,9 +474,9 @@ fn draw_rating_filter_button(
             // ── 評価の付与 (フィルタではなく) — toolbar-customization-plan.md §1.1 ──
             ui.separator();
             let assign_sel = if idx == 0 {
-                "選択を未評価に".to_string()
+                "選択したアイテムを未評価に".to_string()
             } else {
-                format!("選択へ ★{idx} を付与")
+                format!("選択したアイテムへ ★{idx} を付与")
             };
             if ui
                 .add_enabled(has_selection, egui::Button::new(assign_sel))
@@ -486,13 +486,31 @@ fn draw_rating_filter_button(
                 ui.close();
             }
             let assign_cont = if idx == 0 {
-                "この場所を未評価に".to_string()
+                "この場所(コンテナ)を未評価に".to_string()
             } else {
-                format!("この場所へ ★{idx} を付与")
+                format!("この場所(コンテナ)へ ★{idx} を付与")
             };
             if ui.button(assign_cont).clicked() {
                 assign = Some(RatingAssign::Container(idx as u8));
                 ui.close();
+            }
+            // ★1〜5 では「未評価に戻す」も同じメニューに出す
+            // (「なし」ボタンを探さずにその場で解除できるように)。
+            if idx >= 1 {
+                if ui
+                    .add_enabled(
+                        has_selection,
+                        egui::Button::new("選択したアイテムを未評価に"),
+                    )
+                    .clicked()
+                {
+                    assign = Some(RatingAssign::Selection(0));
+                    ui.close();
+                }
+                if ui.button("この場所(コンテナ)を未評価に").clicked() {
+                    assign = Some(RatingAssign::Container(0));
+                    ui.close();
+                }
             }
         });
     }
@@ -3969,9 +3987,9 @@ impl App {
                         //   Shift+右     = 今いるコンテナへ付与トグル
                         // 左クリックは対象が無くても使えるのでボタンは常に有効にする。
                         let resp = ui.button(label).hover_tip(if has_target {
-                            "左: タグビュー / 右: 選択へ付与 / Shift+右: この場所へ付与"
+                            "左: タグビュー / 右: 選択したアイテムへ付与 / Shift+右: この場所(コンテナ)へ付与"
                         } else {
-                            "左: タグビュー / Shift+右: この場所へ付与 (右で選択へ付与するには項目を選ぶ)"
+                            "左: タグビュー / Shift+右: この場所(コンテナ)へ付与 (右で選択へ付与するには項目を選ぶ)"
                         });
                         if resp.clicked() {
                             toolbar_tag_search = Some(name.clone());
@@ -4044,6 +4062,10 @@ impl App {
         if let Some(n) = toolbar_rating_assign_container {
             if self.set_current_folder_rating(n) {
                 self.show_container_rating_toast(n);
+            } else {
+                // 合成ビュー等で実コンテナが無い場合。常に何らかのフィードバックを返す
+                // (グリッドからのコンテナ付与で無反応に見えないように)。
+                self.show_feedback_toast("この画面ではこの場所に評価を付けられません".to_string());
             }
         }
 

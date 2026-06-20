@@ -226,10 +226,13 @@ impl App {
             self.show_feedback_toast("タグを付けるコンテナがありません".to_string());
             return;
         };
-        // 合成ビュー (Ctrl+G / Ctrl+S 検索・読書履歴・タグビュー・ドライブ一覧) の擬似パスは
-        // 実コンテナではないので no-op。検索系は擬似パス一致で判定する (view フラグだけでは
-        // Ctrl+S favsearch を取りこぼす — Codex P2)。
-        if folder == crate::app::search_results_synthetic_path()
+        // 合成ビューでは実コンテナが無いので no-op + 通知。判定は経路ごとに異なる:
+        //   - Ctrl+G グローバル検索: current_folder は検索前の実フォルダのまま + global_search.active
+        //     (擬似パスにならないのでフラグで判定 — これを落として実害が出た)。
+        //   - Ctrl+S お気に入り検索 / 読書履歴: current_folder が擬似パスになるのでパス一致で判定。
+        //   - タグビュー / ドライブ一覧: 専用フラグ。
+        if self.global_search.active
+            || folder == crate::app::search_results_synthetic_path()
             || folder == crate::app::reading_history_synthetic_path()
             || self.items_are_tag_view
             || self.items_are_drive_list

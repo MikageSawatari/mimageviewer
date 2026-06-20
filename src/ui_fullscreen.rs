@@ -12963,6 +12963,10 @@ impl App {
             self.fs_feedback_toast_reveal_path = None;
             return;
         }
+        // トースト表示中は自前で再描画を要求する。worker 駆動でない同期操作
+        // (グリッドからのコンテナ評価付与など) でも、表示時間いっぱいフェードアウトまで
+        // 確実に描画されるようにする (worker 経路だけ偶発的に repaint される状態を解消)。
+        ctx.request_repaint();
 
         // フェードアウト (最後の0.3秒)
         let alpha = if elapsed > duration - 0.3 {
