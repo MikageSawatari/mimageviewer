@@ -651,26 +651,36 @@ impl FacetEditFlag {
 // ツールバーセクションの表示形式
 // -----------------------------------------------------------------------
 
-/// ツールバーの各セクション (列 / 比率 / ソート) の表示形式。
+/// ツールバーの各セクションの表示形式。
 ///
-/// `Buttons`: 横並びの `selectable_label` 群 (既存挙動)。すべての選択肢が常時見える。
-/// `Dropdown`: `ComboBox` 1 個。選択中ラベルだけ常時表示、開いたとき選択肢が出る。
-///
-/// プルダウンは「たまに変えるが選択肢を一覧したい」用途のスペース節約用。
+/// `Buttons` (展開): 横並びの `selectable_label` 群。すべての選択肢が常時見える。
+/// `Collapsible` (折りたたみ): 展開と同じ横並びだが ▶/▽ で畳める (お気に入り/タグ/本棚のみ)。
+/// `Dropdown` (プルダウン): `ComboBox` + アクションボタン。選択肢を一覧してスペース節約。
+/// `Unknown`: 将来バージョンの未知の値を旧バイナリが読んだ場合の安全弁 (= 展開扱い)。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum ToolbarSectionDisplay {
     #[default]
     Buttons,
+    Collapsible,
     Dropdown,
+    /// 未知の variant (ダウングレード耐性)。描画では展開 (Buttons) 扱いにする。
+    #[serde(other)]
+    Unknown,
 }
 
 impl ToolbarSectionDisplay {
+    /// 列 / 比率 / ソート用 (展開 / プルダウンの 2 択。`Collapsible` は付けない)。
     pub fn all() -> &'static [Self] {
         &[Self::Buttons, Self::Dropdown]
     }
+    /// お気に入り / タグ / 本棚用 (展開 / 折りたたみ / プルダウンの 3 択)。
+    pub fn all_with_collapsible() -> &'static [Self] {
+        &[Self::Buttons, Self::Collapsible, Self::Dropdown]
+    }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Buttons => "展開",
+            Self::Buttons | Self::Unknown => "展開",
+            Self::Collapsible => "折りたたみ",
             Self::Dropdown => "プルダウン",
         }
     }
@@ -2045,6 +2055,20 @@ pub struct Settings {
     /// ツールバー「ソート」セクションの表示形式 (展開 / プルダウン)。
     #[serde(default)]
     pub toolbar_sort_display: ToolbarSectionDisplay,
+    /// お気に入り / タグ / 本棚セクションの表示形式 (展開 / 折りたたみ / プルダウン)。v2.0.0。
+    #[serde(default)]
+    pub toolbar_favorites_display: ToolbarSectionDisplay,
+    #[serde(default)]
+    pub toolbar_tags_display: ToolbarSectionDisplay,
+    #[serde(default)]
+    pub toolbar_bookshelf_display: ToolbarSectionDisplay,
+    /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
+    #[serde(default)]
+    pub toolbar_favorites_collapsed: bool,
+    #[serde(default)]
+    pub toolbar_tags_collapsed: bool,
+    #[serde(default)]
+    pub toolbar_bookshelf_collapsed: bool,
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
@@ -3194,6 +3218,12 @@ impl Default for Settings {
             toolbar_cols_display: ToolbarSectionDisplay::default(),
             toolbar_aspect_display: ToolbarSectionDisplay::default(),
             toolbar_sort_display: ToolbarSectionDisplay::default(),
+            toolbar_favorites_display: ToolbarSectionDisplay::default(),
+            toolbar_tags_display: ToolbarSectionDisplay::default(),
+            toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
+            toolbar_favorites_collapsed: false,
+            toolbar_tags_collapsed: false,
+            toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_section_order: Vec::new(),
             folder_thumb_sort: default_folder_thumb_sort(),
@@ -4711,6 +4741,23 @@ mod tests {
                 ToolbarSectionId::Tags,
             ]
         );
+    }
+
+    #[test]
+    fn toolbar_section_display_unknown_is_tolerant() {
+        // 旧バイナリ × 新データ: 未知の表示形式はエラーにならず Unknown (= 展開扱い)。
+        let v: ToolbarSectionDisplay = serde_json::from_str("\"FutureMode\"").unwrap();
+        assert_eq!(v, ToolbarSectionDisplay::Unknown);
+        assert_eq!(v.label(), "展開");
+    }
+
+    #[test]
+    fn toolbar_section_display_known_variants_roundtrip() {
+        for m in ToolbarSectionDisplay::all_with_collapsible() {
+            let s = serde_json::to_string(m).unwrap();
+            let back: ToolbarSectionDisplay = serde_json::from_str(&s).unwrap();
+            assert_eq!(*m, back);
+        }
     }
 
     // -- Settings defaults --

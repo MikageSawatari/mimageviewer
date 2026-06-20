@@ -3682,7 +3682,9 @@ impl App {
                 TS::Cols => {
                     toolbar_label(ui, "列:", 28.0);
                     match self.settings.toolbar_cols_display {
-                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                        crate::settings::ToolbarSectionDisplay::Buttons
+                        | crate::settings::ToolbarSectionDisplay::Collapsible
+                        | crate::settings::ToolbarSectionDisplay::Unknown => {
                             for &cols in &tb_cols {
                                 let selected = !details_mode && self.settings.grid_cols == cols;
                                 if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
@@ -3779,7 +3781,9 @@ impl App {
                     }
 
                     match self.settings.toolbar_aspect_display {
-                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                        crate::settings::ToolbarSectionDisplay::Buttons
+                        | crate::settings::ToolbarSectionDisplay::Collapsible
+                        | crate::settings::ToolbarSectionDisplay::Unknown => {
                             if auto_visible
                                 && ui.selectable_label(auto_selected, auto_label).clicked()
                             {
@@ -3841,7 +3845,9 @@ impl App {
                         );
                     }
                     match self.settings.toolbar_sort_display {
-                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                        crate::settings::ToolbarSectionDisplay::Buttons
+                        | crate::settings::ToolbarSectionDisplay::Collapsible
+                        | crate::settings::ToolbarSectionDisplay::Unknown => {
                             // `add_enabled_ui` でボタン群全体を包むと、右端の残り幅だけを持つ
                             // 子 UI 内で折り返されて縦に積まれる。各ボタンを親の
                             // `horizontal_wrapped` に直接載せ、幅不足時はツールバー全体の
