@@ -14028,6 +14028,17 @@ impl App {
     }
 
     pub(crate) fn add_grid_selection_to_active_book(&mut self, ctx: &egui::Context) {
+        let name = self.active_book_name();
+        self.add_grid_selection_to_named_book(ctx, name);
+    }
+
+    /// グリッドの選択 (チェック優先・無ければカーソル) を指定した本へ追加する。
+    /// ツールバーのピン留め本ボタンの右クリックから本名指定で呼ぶ。
+    pub(crate) fn add_grid_selection_to_named_book(
+        &mut self,
+        ctx: &egui::Context,
+        book_name: String,
+    ) {
         if self.book_op_pending.is_some() {
             self.show_feedback_toast("製本処理中です".to_string());
             return;
@@ -14060,8 +14071,8 @@ impl App {
             return;
         }
         let count = sources.len();
-        self.start_book_append(ctx, sources);
-        self.show_feedback_toast(format!("追加先の本へ追加中: {count} ページ"));
+        self.start_book_append_to_named(ctx, book_name.clone(), sources);
+        self.show_feedback_toast(format!("「{book_name}」へ追加中: {count} ページ"));
     }
 
     pub(crate) fn add_clipboard_image_to_active_book(&mut self, ctx: &egui::Context) {

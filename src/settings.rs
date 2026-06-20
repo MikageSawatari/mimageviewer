@@ -1863,6 +1863,10 @@ pub struct Settings {
     /// 製本でページ追加先にする本名。
     #[serde(default = "default_active_book_name")]
     pub active_book_name: String,
+    /// ツールバーの本棚セクションにボタンとして固定表示する本名のリスト (表示順)。
+    /// 本は本棚ルート直下のフォルダ名で識別する (UUID なし)。v2.0.0。
+    #[serde(default)]
+    pub pinned_books: Vec<String>,
 
     // ── 隠蔽加工 (Concealment) ─────────────────────────────────
     //
@@ -3134,6 +3138,7 @@ impl Default for Settings {
             capture_format: crate::capture::CaptureFormat::default(),
             book_root: None,
             active_book_name: default_active_book_name(),
+            pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
@@ -4451,6 +4456,7 @@ impl Settings {
         self.search_index_checks = std::mem::take(&mut src.search_index_checks);
         // ── 製本 runtime 選択 ──
         self.active_book_name = std::mem::take(&mut src.active_book_name);
+        self.pinned_books = std::mem::take(&mut src.pinned_books);
         // ── 「アプリケーションで開く」履歴 ──
         self.recent_open_with_apps = std::mem::take(&mut src.recent_open_with_apps);
         self.custom_open_with_apps = std::mem::take(&mut src.custom_open_with_apps);

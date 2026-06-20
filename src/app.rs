@@ -14949,12 +14949,22 @@ impl App {
         ctx: &egui::Context,
         sources: Vec<crate::books::BookPageSource>,
     ) {
+        let book_name = self.active_book_name();
+        self.start_book_append_to_named(ctx, book_name, sources);
+    }
+
+    /// `start_book_append` の本名指定版 (ツールバーのピン留め本へ追加する用)。
+    pub(crate) fn start_book_append_to_named(
+        &mut self,
+        ctx: &egui::Context,
+        book_name: String,
+        sources: Vec<crate::books::BookPageSource>,
+    ) {
         if sources.is_empty() {
             self.show_feedback_toast("追加するページがありません".to_string());
             return;
         }
         let root = self.book_root_path();
-        let book_name = self.active_book_name();
         self.start_book_op(ctx, "book-append", move || {
             crate::books::append_pages(root, book_name, sources)
         });

@@ -2207,6 +2207,7 @@ impl App {
         let mut open_request: Option<PathBuf> = None;
         let mut set_active_request: Option<String> = None;
         let mut rename_request: Option<(String, String)> = None;
+        let mut pin_toggle_request: Option<String> = None;
         let mut delete_request: Option<String> = None;
         let mut refresh_request = false;
         let default_pos = ctx.content_rect().center() - egui::vec2(250.0, 220.0);
@@ -2324,6 +2325,20 @@ impl App {
                                                     rename_request =
                                                         Some((row.name.clone(), new_name.clone()));
                                                 }
+                                                let is_pinned = self
+                                                    .settings
+                                                    .pinned_books
+                                                    .iter()
+                                                    .any(|b| b == &row.name);
+                                                if ui
+                                                    .selectable_label(is_pinned, "固定")
+                                                    .on_hover_text(
+                                                        "ツールバーの本棚にこの本のボタンを固定表示する",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pin_toggle_request = Some(row.name.clone());
+                                                }
                                             },
                                         );
                                     });
@@ -2387,6 +2402,14 @@ impl App {
             self.settings.active_book_name = name.clone();
             self.settings.save();
             self.book_manager_rename_name = name;
+        }
+        if let Some(name) = pin_toggle_request {
+            if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
+                self.settings.pinned_books.remove(pos);
+            } else {
+                self.settings.pinned_books.push(name);
+            }
+            self.settings.save();
         }
         if let Some((old_name, new_name)) = rename_request {
             self.start_book_rename(ctx, old_name, new_name);
@@ -3438,6 +3461,7 @@ impl App {
         }
         let active_book_name = self.active_book_name();
         let toolbar_book_rows = self.book_list_cache.clone();
+        let toolbar_pinned_books = self.settings.pinned_books.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
         let has_rating_selection = has_book_add_target;
         let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
@@ -3464,6 +3488,8 @@ impl App {
         let mut toolbar_book_add = false;
         let mut toolbar_book_open_active = false;
         let mut toolbar_book_target_name: Option<String> = None;
+        let mut toolbar_book_pin_open: Option<String> = None;
+        let mut toolbar_book_pin_add: Option<String> = None;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
         let mut toolbar_tag_container: Option<String> = None;
@@ -3630,6 +3656,26 @@ impl App {
                         .clicked()
                     {
                         toolbar_book_open_active = true;
+                    }
+                    // ピン留めした本のボタン (左=開く / 右=選択したアイテムを追加)。
+                    // 実在する本だけ表示する (削除済みのピンは出さない)。
+                    for pin in &toolbar_pinned_books {
+                        let exists = toolbar_book_rows
+                            .as_ref()
+                            .is_some_and(|rows| rows.iter().any(|r| &r.name == pin));
+                        if !exists {
+                            continue;
+                        }
+                        let is_active = pin == &active_book_name;
+                        let resp = ui.selectable_label(is_active, pin).hover_tip(
+                            "左: この本を開く / 右: 選択したアイテムをこの本へ追加",
+                        );
+                        if resp.clicked() {
+                            toolbar_book_pin_open = Some(pin.clone());
+                        }
+                        if resp.secondary_clicked() {
+                            toolbar_book_pin_add = Some(pin.clone());
+                        }
                     }
                 }
                 TS::Cols => {
@@ -4026,6 +4072,13 @@ impl App {
         }
         if toolbar_book_open_active {
             toolbar_fav_nav = Some(self.active_book_folder_path());
+        }
+        // ピン留め本: 左クリック=開く / 右クリック=選択を追加。
+        if let Some(name) = toolbar_book_pin_open {
+            toolbar_fav_nav = Some(crate::books::book_folder(&self.book_root_path(), &name));
+        }
+        if let Some(name) = toolbar_book_pin_add {
+            self.add_grid_selection_to_named_book(ctx, name);
         }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。
