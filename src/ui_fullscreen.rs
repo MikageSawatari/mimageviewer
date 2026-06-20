@@ -14078,11 +14078,23 @@ impl App {
         let mut sources = Vec::new();
         let mut errors = Vec::new();
         for idx in indices {
-            // ファイル名スタックの集約セルは、そのスタックのメンバー画像を全部展開して追加する
-            // (設計 §5: スタック選択 → 本へメンバー全部コピー)。Stack セルは
-            // book_page_source_for_idx の対象外 (1 idx = N メンバー) なので先にここで展開する。
-            if let Some(members) = self.stack_member_book_sources(idx) {
-                sources.extend(members);
+            // ファイル名スタックの集約セルは、そのメンバー画像を 1 枚ずつ通常の Grid 追加と同じ規則
+            // (同一本ページ拒否 + 色補正/非破壊回転の焼き込み) で展開する。Stack セルは
+            // book_page_source_for_idx の対象外 (1 idx = N メンバー) なので専用経路で個別変換する。
+            // これで「スタックを本へ追加」が「スタック解除 → メンバー全選択 → 本へ追加」と同結果になる。
+            if let Some(member_paths) = self.stack_member_paths(idx) {
+                for member_path in member_paths {
+                    match self.book_page_source_for_stack_member(&member_path, &target_folder) {
+                        Ok(source) => sources.push(source),
+                        Err(err) => {
+                            errors.push(err.clone());
+                            crate::logger::log(format!(
+                                "book add skip stack member {}: {err}",
+                                member_path.display()
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
             match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid, &target_folder) {
@@ -14178,35 +14190,99 @@ impl App {
         self.show_feedback_toast("動画フレームを追加先の本へ追加中".to_string());
     }
 
-    /// 集約グリッドの `GridItem::Stack` セルを、そのスタックのメンバー画像 (実ファイル) の
-    /// `BookPageSource::File` 列へ展開する (設計 §5: スタック → 本へメンバー全部コピー)。
-    /// Stack セルでない / スタックビューでないときは `None` を返す (= 通常の
-    /// `book_page_source_for_idx` 経路に委ねる)。動画メンバーは念のため除外する。
-    fn stack_member_book_sources(&self, idx: usize) -> Option<Vec<crate::books::BookPageSource>> {
+    /// 集約グリッドの `GridItem::Stack` セルが指すスタックのメンバー画像 (実ファイル) のパス列を返す。
+    /// Stack セルでない / スタックビューでないときは `None` (= 通常の `book_page_source_for_idx`
+    /// 経路に委ねる)。動画メンバーは本へ追加できないので除外する。
+    fn stack_member_paths(&self, idx: usize) -> Option<Vec<std::path::PathBuf>> {
         let GridItem::Stack { key, .. } = self.items.get(idx)? else {
             return None;
         };
         let sv = self.stack_view.as_ref()?;
         let g = sv.group_index_by_key(key)?;
         let group = sv.groups.get(g)?;
-        let sources = group
-            .members
-            .iter()
-            .filter(|m| !m.is_video)
-            .map(|m| {
-                let original_name = m
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "page".to_string());
-                crate::books::BookPageSource::File {
-                    src: m.path.clone(),
-                    original_name,
-                }
+        Some(
+            group
+                .members
+                .iter()
+                .filter(|m| !m.is_video)
+                .map(|m| m.path.clone())
+                .collect(),
+        )
+    }
+
+    /// スタックメンバー (集約ビューでは `items` に現れない実ファイル) を、通常の Grid 追加と同じ規則で
+    /// `BookPageSource` へ変換する。`book_page_source_for_idx` の Image + Grid 分岐をパスベースで再現:
+    /// 同一本ページは拒否し、色補正/非破壊回転があれば `AdjustedFile` に焼き込む。idx を持たないので
+    /// params / rotation は各 DB をパスキーで直接引く (= スタック解除 → メンバー選択 → 追加と同結果)。
+    fn book_page_source_for_stack_member(
+        &self,
+        path: &std::path::Path,
+        target_book_folder: &std::path::Path,
+    ) -> Result<crate::books::BookPageSource, String> {
+        let original_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "page".to_string());
+        // 本ページは同一本なら拒否、別本なら生コピー (book_page_source_for_idx と同じ)。
+        if let Some(book_folder) = self.compiled_book_page_folder(path) {
+            if crate::folder_tree::path_eq(&book_folder, target_book_folder) {
+                return Err(BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string());
+            }
+            return Ok(crate::books::BookPageSource::File {
+                src: path.to_path_buf(),
+                original_name,
+            });
+        }
+        let key = crate::adjustment_db::normalize_path(path);
+        let rotation = self
+            .rotation_db
+            .as_ref()
+            .and_then(|db| db.get_key(&key))
+            .unwrap_or(crate::rotation_db::Rotation::None);
+        let params = self.stack_member_effective_params(path, &key);
+        if params.is_color_identity() && rotation.is_none() {
+            Ok(crate::books::BookPageSource::File {
+                src: path.to_path_buf(),
+                original_name,
             })
-            .collect();
-        Some(sources)
+        } else {
+            Ok(crate::books::BookPageSource::AdjustedFile {
+                src: path.to_path_buf(),
+                original_name,
+                params,
+                rotation,
+                format: self.settings.capture_format,
+                jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
+                    self.fs_transparent_bg_mode,
+                ),
+            })
+        }
+    }
+
+    /// メンバーパスの有効補正パラメータ (`effective_params(idx)` のパスベース版)。
+    /// ページ個別 (adjustment_db) → お気に入り標準 → global の順で解決する。`set_page_params` は
+    /// DB へ書き戻すので、集約ビューで idx キャッシュに無いメンバーでも DB から正しく拾える。
+    fn stack_member_effective_params(
+        &self,
+        path: &std::path::Path,
+        key: &str,
+    ) -> crate::adjustment::AdjustParams {
+        if let Some(p) = self
+            .adjustment_db
+            .as_ref()
+            .and_then(|db| db.get_page_params(key))
+        {
+            return p;
+        }
+        if let Some(fav) = path
+            .parent()
+            .and_then(|dir| self.find_nearest_favorite(dir))
+            && let Some(p) = self.adjustment_favorite_params.get(&fav.id)
+        {
+            return p.clone();
+        }
+        self.settings.global_preset.clone()
     }
 
     fn book_page_source_for_idx(

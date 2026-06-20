@@ -6552,7 +6552,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn grid_book_add_expands_stack_to_all_members() {
         // ファイル名スタックの集約セルを選んで本へ追加すると、メンバー全部がコピーされる
-        // (Codex P2 修正: stack_member_book_sources による展開、設計 §5)。
+        // (Codex P2 修正: stack_member_paths による展開、設計 §5)。
         use crate::filename_stack::{StackMember, StackView};
         use crate::grid_item::{GridItem, ThumbnailState};
 
@@ -6613,6 +6613,91 @@ mod favorite_adjustment_defaults_tests {
             outputs.len(),
             2,
             "スタックの全メンバー (2 枚) が本へ追加される"
+        );
+    }
+
+    #[test]
+    fn grid_book_add_burns_stack_member_rotation() {
+        // Codex P2 再修正: スタックを本へ追加するとき、隠れメンバーの非破壊回転も
+        // 通常追加と同じく焼き込む (= スタック解除 → メンバー選択 → 追加と同結果)。
+        // 旧実装は全メンバーを生 File にしていたため回転が落ちていた。
+        use crate::filename_stack::{StackMember, StackView};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use image::GenericImageView;
+
+        let mut app = setup_app();
+        let dir = app.tmp.path().to_path_buf();
+        let root = dir.join("books");
+        let p0 = dir.join("post_p0.png");
+        let p1 = dir.join("post_p1.png");
+        // どちらも 2x1。p1 だけ時計回り回転を付けるので、焼き込まれれば 1x2 になる。
+        for p in [&p0, &p1] {
+            let mut img = image::RgbaImage::new(2, 1);
+            img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+            img.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+            img.save(p).expect("write member image");
+        }
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+
+        // p1 を一時的に単独アイテムにして回転を付ける (rotation_db へ書き込まれる)。
+        app.items = vec![GridItem::Image(p1.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+        app.rotate_image_cw(0);
+        // idx キャッシュは集約ビュー再構築で無効化される想定なので、本番同様クリアしておく
+        // (パスベース resolver が rotation_db を引くことを確認する意図)。
+        app.rotation_cache.clear();
+
+        // post_p0 / post_p1 の 2 枚スタックを集約ビューで構築。
+        let media = vec![
+            StackMember {
+                path: p0.clone(),
+                mtime: 0,
+                size: 8,
+                is_video: false,
+            },
+            StackMember {
+                path: p1.clone(),
+                mtime: 0,
+                size: 8,
+                is_video: false,
+            },
+        ];
+        let sv = StackView::build(
+            dir.clone(),
+            Vec::new(),
+            Vec::new(),
+            media,
+            '_',
+            crate::settings::SortOrder::FileName,
+        );
+        let (items, _metas) = sv.materialize_aggregated();
+        app.items = items;
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.stack_view = Some(sv);
+        app.stack_showing_flat = false;
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let mut dims = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .map(|entry| {
+                image::open(entry.expect("book page entry").path())
+                    .expect("decode book page")
+                    .dimensions()
+            })
+            .collect::<Vec<_>>();
+        dims.sort();
+        assert_eq!(
+            dims,
+            vec![(1, 2), (2, 1)],
+            "回転のあるメンバーだけ 1x2 に焼き込まれ、もう一方は 2x1 のまま"
         );
     }
 
