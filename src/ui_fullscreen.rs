@@ -1774,15 +1774,9 @@ impl App {
 
     /// ZipPla 風全画面ズームのキー状態機械を 1 フレーム進める。Z (修飾なし) のホールド/離しを
     /// OS 直読みのエッジで検出する。fit 状態で押下=照準開始、離す=ズーム確定、ズーム中の押下=解除。
-    /// 単ページの通常閲覧でだけ動く (見開き/連結/パノラマ/動画/分析モードは対象外)。
-    fn update_fs_zoom_mode_keys(
-        &mut self,
-        ctx: &egui::Context,
-        fs_idx: usize,
-        is_spread_double: bool,
-    ) {
-        let context_ok = !is_spread_double
-            && self.reading_flow.is_paged()
+    /// 通常閲覧 (単ページ / 見開き) で動く (連結/パノラマ/動画/分析/編集モードは対象外)。
+    fn update_fs_zoom_mode_keys(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let context_ok = self.reading_flow.is_paged()
             && !self.is_panorama_mode_active(fs_idx)
             && !self.analysis_mode
             && !self.erase_mode
@@ -2353,6 +2347,47 @@ fn zip_aim_frame_rect(
         disp_rect.top() + (center_img.y - vis.y / 2.0) * fit,
     );
     egui::Rect::from_min_size(min, egui::vec2(vis.x * fit, vis.y * fit))
+}
+
+/// 見開き (合成ページ) 用 ZipPla ズーム。可視幅 = 単ページ幅 × 1.2 / factor を狙い (ZipPla の
+/// 見開き既定 ≈ 単ページ幅 1.2 倍)、余白が出ないよう cover で下限を取る。`draw_fs_spread` の
+/// `zoom_pan` 用に (zoom = total/fit_scale, pan) を返す。`vis` / `center` は照準枠用。
+/// `view` = 見開き描画領域サイズ、`composite` = 合成ページサイズ (左右幅合計 × 高さ)、
+/// `cursor_comp` = composite px のカーソル位置 (`zip_cursor_image_px` で band 写像済み)。
+fn zip_spread_zoom_pan(
+    view: egui::Vec2,
+    composite: egui::Vec2,
+    single_page_w: f32,
+    factor: f32,
+    fit_scale: f32,
+    cursor_comp: egui::Vec2,
+) -> (f32, egui::Vec2, egui::Vec2, egui::Vec2) {
+    if composite.x <= 0.0 || composite.y <= 0.0 || view.x <= 0.0 || view.y <= 0.0 {
+        return (1.0, egui::Vec2::ZERO, view, composite * 0.5);
+    }
+    let target_vis_w = (1.2 * single_page_w.max(1.0) / factor.max(1.0)).max(1.0);
+    let cover = (view.x / composite.x).max(view.y / composite.y);
+    let total = (view.x / target_vis_w).max(cover).max(f32::EPSILON);
+    let vis = egui::vec2(
+        (view.x / total).min(composite.x),
+        (view.y / total).min(composite.y),
+    );
+    let cx = cursor_comp
+        .x
+        .clamp(vis.x / 2.0, (composite.x - vis.x / 2.0).max(vis.x / 2.0));
+    let cy = cursor_comp
+        .y
+        .clamp(vis.y / 2.0, (composite.y - vis.y / 2.0).max(vis.y / 2.0));
+    let pan = egui::vec2(
+        (composite.x / 2.0 - cx) * total,
+        (composite.y / 2.0 - cy) * total,
+    );
+    let zoom = if fit_scale > 0.0 {
+        total / fit_scale
+    } else {
+        1.0
+    };
+    (zoom, pan, vis, egui::vec2(cx, cy))
 }
 
 fn capture_region_outside_rects(bounds: egui::Rect, hole: egui::Rect) -> [egui::Rect; 4] {
@@ -5948,7 +5983,7 @@ impl App {
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
         // 無効化され、コンテキスト外なら状態をリセットする。編集モードの early-return より前に
         // 毎フレーム呼び、Z 押しっぱで対象外へ移ったときに状態が残らないようにする。
-        self.update_fs_zoom_mode_keys(ctx, fs_idx, is_spread_double);
+        self.update_fs_zoom_mode_keys(ctx, fs_idx);
 
         if Self::consume_pipeline_debug_shortcut(ctx) {
             self.start_pipeline_debug_export(ctx, fs_idx);
@@ -7536,8 +7571,8 @@ impl App {
                 i.events
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
-            if self.fs_zoom_mode_engaged() && !is_spread_double {
-                // ZipPla 風全画面ズーム: ホイールで倍率変更 (照準中・ズーム中の両方)。
+            if self.fs_zoom_mode_engaged() {
+                // ZipPla 風全画面ズーム: ホイールで倍率変更 (照準中・ズーム中の両方、見開きも)。
                 // ページ送りは矢印 / クリックに残し、ホイールはズームに振る。
                 self.adjust_fs_zoom_factor(wheel_y);
             } else if self.analysis_mode {
@@ -11748,7 +11783,9 @@ impl App {
             || content_right.is_some()
             || !matches!(fit_mode, FullscreenFitMode::Page)
             || fit_scale_limits.active()
+            || self.fs_zoom_mode_engaged()
         {
+            // ZipPla ズーム中は cover で image_rect 外へはみ出すので必ずクリップする。
             ui.painter().with_clip_rect(image_rect)
         } else {
             ui.painter().clone()
@@ -11802,6 +11839,47 @@ impl App {
                 _ => page_fit(),
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
+
+            // ZipPla 風 全画面ズーム (見開き、Phase B): 合成ページを cover×factor 相当へ拡大し、
+            // カーソル位置でパン。照準中は fit のまま枠 (aim_frame) を出す。トリム (content_active)
+            // との併用ではトリム中央寄せを無効化して合成ページ全体を対象にする (niche 妥協)。
+            let mut aim_frame: Option<egui::Rect> = None;
+            let (zoom_pan, content_center_offset) = if self.fs_zoom_mode_engaged() {
+                let composite = egui::vec2(combined_w, combined_h);
+                let single_page_w = combined_w * 0.5;
+                let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
+                let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+                let pan_band = egui::Rect::from_min_max(
+                    egui::pos2(image_rect.left(), image_rect.top() + top_m),
+                    egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
+                );
+                let cursor = ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .unwrap_or_else(|| image_rect.center());
+                let cursor_comp =
+                    zip_cursor_image_px(pan_band, egui::Vec2::ZERO, composite, cursor);
+                let (zoom, pan, vis, center_comp) = zip_spread_zoom_pan(
+                    image_rect.size(),
+                    composite,
+                    single_page_w,
+                    self.fs_zoom_factor,
+                    fit_scale,
+                    cursor_comp,
+                );
+                if self.fs_zoom_active {
+                    (Some((zoom, pan)), egui::Vec2::ZERO)
+                } else {
+                    // 照準枠: 合成ページは fit_scale で image_rect 中心に表示される前提。
+                    let comp_disp_min = image_rect.center() - composite * (fit_scale * 0.5);
+                    let frame_min = comp_disp_min
+                        + egui::vec2(center_comp.x - vis.x / 2.0, center_comp.y - vis.y / 2.0)
+                            * fit_scale;
+                    aim_frame = Some(egui::Rect::from_min_size(frame_min, vis * fit_scale));
+                    (None, content_center_offset)
+                }
+            } else {
+                (zoom_pan, content_center_offset)
+            };
 
             let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
@@ -11867,6 +11945,21 @@ impl App {
                 right_rect: spread_rects.right_rect,
                 right_hit_rect: spread_rects.right_hit_rect,
             });
+
+            // ZipPla ズーム照準中の枠 (見開き)。離すと枠の範囲が全画面化する。
+            if let Some(frame) = aim_frame {
+                let frame_painter = ui.painter().with_clip_rect(image_rect);
+                let dim = egui::Color32::from_black_alpha(120);
+                for r in capture_region_outside_rects(image_rect, frame) {
+                    frame_painter.rect_filled(r, 0.0, dim);
+                }
+                frame_painter.rect_stroke(
+                    frame,
+                    0.0,
+                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                    egui::StrokeKind::Outside,
+                );
+            }
         } else {
             // サイズ不明の場合は均等分割フォールバック
             // (ズーム/パンはサイズが分かってからでないと正しく計算できないため適用しない)
@@ -16467,6 +16560,38 @@ mod tests {
         // cover(bbox)=300/200=1.5、total=6.0、vis=300/6=50。center=clamp(0,25,175)=25 (bbox 相対) →
         // center_img=125。pan=(200-125)*6=450。これは bbox 内 (余白 (<100) を見せない) を意味する。
         assert!((pan.x - 450.0).abs() < 0.5 && (pan.y - 450.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn zip_spread_zoom_default_shows_about_1_2_page_widths() {
+        // Phase B: 見開き既定 (factor 1) は単ページ幅の約 1.2 倍を表示する。
+        let view = egui::vec2(1920.0, 1080.0);
+        let composite = egui::vec2(2000.0, 1400.0); // 2 ページ × 1000px 幅
+        let single_page_w = 1000.0;
+        let (_zoom, _pan, vis, _c) = zip_spread_zoom_pan(
+            view,
+            composite,
+            single_page_w,
+            1.0,
+            0.5,
+            egui::vec2(1000.0, 700.0),
+        );
+        assert!(
+            (vis.x - 1200.0).abs() < 1.0,
+            "既定は単ページ幅の約 1.2 倍 (1200px) を表示: {}",
+            vis.x
+        );
+    }
+
+    #[test]
+    fn zip_spread_zoom_clamps_center_within_composite() {
+        let view = egui::vec2(1920.0, 1080.0);
+        let composite = egui::vec2(2000.0, 1400.0);
+        let (_z, pan, vis, center) =
+            zip_spread_zoom_pan(view, composite, 1000.0, 1.0, 0.5, egui::vec2(0.0, 0.0));
+        // 左上隅へ向けても表示中心は composite 内 (>= vis/2) へ clamp (余白を見せない)。
+        assert!(center.x >= vis.x / 2.0 - 0.01 && center.y >= vis.y / 2.0 - 0.01);
+        assert!(pan.x.is_finite() && pan.y.is_finite());
     }
 
     #[test]
