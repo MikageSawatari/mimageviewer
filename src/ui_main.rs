@@ -875,13 +875,63 @@ fn set_details_column_width(
     true
 }
 
-fn details_content_width(avail_w: f32, settings: &crate::settings::Settings) -> f32 {
-    let fixed: f32 = details_ordered_columns(settings, false)
+/// 固定幅モード時の名前列幅 (clamp 済み)。
+fn details_name_fixed_width(settings: &crate::settings::Settings) -> f32 {
+    settings
+        .details_name_width
+        .clamp(DetailsColumn::Name.min_width(), 800.0)
+}
+
+/// 名前列を固定幅へ切り替えて幅を保存する。値が変わったら true。
+fn set_details_name_width(settings: &mut crate::settings::Settings, width: f32) -> bool {
+    let width = width.clamp(DetailsColumn::Name.min_width(), 800.0);
+    if !settings.details_name_width_auto && (settings.details_name_width - width).abs() <= 0.1 {
+        return false;
+    }
+    settings.details_name_width_auto = false;
+    settings.details_name_width = width;
+    true
+}
+
+/// 詳細表示の水平レイアウト。縦スクロールバーの gutter を考慮して、ヘッダと行の列が
+/// ぴったり揃い、縦バー出現時に右端列が欠けたり不要な横スクロールバーが出たりしないようにする。
+struct DetailsLayout {
+    /// 名前列の実効幅。
+    name_w: f32,
+    /// 行 / ヘッダ背景の幅 (>= 全列合計。pane を埋める)。
+    pane_w: f32,
+    /// 外側 (水平) スクロールが扱う総コンテンツ幅 (= pane_w + gutter)。
+    extent: f32,
+}
+
+fn details_fixed_columns_width(settings: &crate::settings::Settings) -> f32 {
+    details_ordered_columns(settings, false)
         .into_iter()
         .filter(|col| *col != DetailsColumn::Name)
         .map(|col| details_column_width(settings, col))
-        .sum();
-    avail_w.max(DetailsColumn::Name.default_width() + fixed)
+        .sum()
+}
+
+fn details_layout(
+    avail_w: f32,
+    gutter: f32,
+    settings: &crate::settings::Settings,
+) -> DetailsLayout {
+    let fixed = details_fixed_columns_width(settings);
+    let columns_avail = (avail_w - gutter).max(0.0);
+    let name_w = if settings.details_name_width_auto {
+        (columns_avail - fixed).max(DetailsColumn::Name.default_width())
+    } else {
+        details_name_fixed_width(settings)
+    };
+    let columns_w = name_w + fixed;
+    let pane_w = columns_w.max(columns_avail);
+    let extent = pane_w + gutter;
+    DetailsLayout {
+        name_w,
+        pane_w,
+        extent,
+    }
 }
 
 fn details_column_rects(
@@ -895,7 +945,11 @@ fn details_column_rects(
         .filter(|col| *col != DetailsColumn::Name)
         .map(|col| details_column_width(settings, col))
         .sum();
-    let name_width = (rect.width() - fixed).max(DetailsColumn::Name.default_width());
+    let name_width = if settings.details_name_width_auto {
+        (rect.width() - fixed).max(DetailsColumn::Name.default_width())
+    } else {
+        details_name_fixed_width(settings)
+    };
     let specs = columns
         .into_iter()
         .map(|col| {
@@ -7671,14 +7725,7 @@ impl App {
         spread_pair_cursor_idx: Option<usize>,
     ) -> Option<PathBuf> {
         let avail_w = ui.available_width().max(1.0);
-        let content_w = details_content_width(avail_w, &self.settings);
-
-        if (content_w - self.last_cell_size).abs() > 0.5
-            || (Self::DETAILS_ROW_H - self.last_cell_h).abs() > 0.5
-        {
-            self.last_cell_size = content_w;
-            self.last_cell_h = Self::DETAILS_ROW_H;
-        }
+        let avail_h = ui.available_height().max(0.0);
 
         if self.details_order.len() != self.visible_indices.len() {
             self.rebuild_details_order();
@@ -7686,6 +7733,31 @@ impl App {
         let display_order = self.current_grid_order().to_vec();
         let row_count = display_order.len();
         let natural_h = row_count as f32 * Self::DETAILS_ROW_H;
+
+        // 縦スクロールバーが出るときだけその幅 (gutter) を右側へ確保する。これを見込まないと、
+        // 内側の縦スクロール (solid) が gutter ぶん外形を広げ、ヘッダ (縦バー外) と行 (縦バー内) が
+        // ずれて右端列が欠け、不要な横スクロールバーまで出る。viewport はヘッダ + 行間を引いた概算で
+        // 判定し、境界帯では「gutter を多めに確保」側へ倒す (= 列が欠けるより無害)。
+        // 危険なのは「出ないと予測したのに egui が出す」側 (= 上記バグが再発) だけ。境界では gutter を
+        // 多めに確保する方へ倒す (余分に取っても右に空き帯が出るだけで無害) ため概算を少し小さめにする。
+        let viewport_h_est =
+            (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - 2.0).max(0.0);
+        let needs_vscroll = natural_h > viewport_h_est;
+        let gutter = if needs_vscroll {
+            egui::style::ScrollStyle::solid().allocated_width()
+        } else {
+            0.0
+        };
+        let layout = details_layout(avail_w, gutter, &self.settings);
+        let content_w = layout.pane_w;
+        self.last_details_name_width = layout.name_w;
+
+        if (content_w - self.last_cell_size).abs() > 0.5
+            || (Self::DETAILS_ROW_H - self.last_cell_h).abs() > 0.5
+        {
+            self.last_cell_size = content_w;
+            self.last_cell_h = Self::DETAILS_ROW_H;
+        }
 
         let mut nav: Option<PathBuf> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
@@ -7695,7 +7767,9 @@ impl App {
             .id_salt("details_list_horizontal")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_min_width(content_w);
+                // 外側コンテンツ幅 = pane + gutter。pane より広くしておくことで内側縦スクロールの
+                // gutter が pane の右外に収まり、ヘッダ・行の列が揃う。
+                ui.set_min_width(layout.extent);
                 let (header_rect, _) = ui.allocate_exact_size(
                     egui::vec2(content_w, Self::DETAILS_HEADER_H),
                     egui::Sense::hover(),
@@ -8062,7 +8136,8 @@ impl App {
         let header_drag_id = ui.id().with("details_header_drag_state");
         for (col, col_rect) in columns.iter().copied() {
             let mut header_hit = col_rect;
-            if col != DetailsColumn::Name && header_hit.width() > 12.0 {
+            // 右端 6px は列幅リサイズ用に空けておく (名前列も固定幅化のためリサイズ可)。
+            if header_hit.width() > 12.0 {
                 header_hit.max.x -= 6.0;
             }
             let response = ui.interact(
@@ -8200,7 +8275,7 @@ impl App {
                 [col_rect.right_top(), col_rect.right_bottom()],
                 egui::Stroke::new(1.0, stroke_color),
             );
-            if col != DetailsColumn::Name {
+            {
                 let resize_rect = egui::Rect::from_center_size(
                     egui::pos2(col_rect.right(), col_rect.center().y),
                     egui::vec2(8.0, col_rect.height()),
@@ -8218,12 +8293,21 @@ impl App {
                     );
                 }
                 if resize_response.dragged() {
-                    let current = details_column_width(&self.settings, col);
-                    if set_details_column_width(
-                        &mut self.settings,
-                        col,
-                        current + resize_response.drag_delta().x,
-                    ) {
+                    let changed = if col == DetailsColumn::Name {
+                        // 名前列の境界ドラッグ = 自動調整をやめ、その幅を固定幅として保存する。
+                        set_details_name_width(
+                            &mut self.settings,
+                            col_rect.width() + resize_response.drag_delta().x,
+                        )
+                    } else {
+                        let current = details_column_width(&self.settings, col);
+                        set_details_column_width(
+                            &mut self.settings,
+                            col,
+                            current + resize_response.drag_delta().x,
+                        )
+                    };
+                    if changed {
                         ui.ctx().request_repaint();
                     }
                 }
@@ -8251,6 +8335,27 @@ impl App {
         ui.separator();
         let mut name_visible = true;
         ui.add_enabled(false, egui::Checkbox::new(&mut name_visible, "名前"));
+
+        // 名前列の幅: 既定は残り幅へ自動調整。OFF にすると現在の幅で固定し、横スクロールで
+        // 全列を確認できる。境界ドラッグでも自動的に固定幅へ切り替わる。
+        let mut name_auto = self.settings.details_name_width_auto;
+        if ui
+            .checkbox(&mut name_auto, "名前の幅を自動調整")
+            .on_hover_text("OFF にすると現在の名前列幅で固定します (境界ドラッグでも固定されます)")
+            .changed()
+        {
+            if name_auto {
+                self.settings.details_name_width_auto = true;
+                self.settings.details_name_width = DetailsColumn::Name.default_width();
+            } else {
+                self.settings.details_name_width_auto = false;
+                self.settings.details_name_width = self
+                    .last_details_name_width
+                    .clamp(DetailsColumn::Name.min_width(), 800.0);
+            }
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
 
         let old_lazy = (
             self.settings.details_show_created,
@@ -9686,7 +9791,7 @@ mod compute_cell_size_tests {
     }
 
     #[test]
-    fn details_content_width_overflows_when_saved_width_needs_it() {
+    fn details_layout_overflows_when_saved_width_needs_it() {
         let mut settings = minimal_details_settings();
         assert!(set_details_column_width(
             &mut settings,
@@ -9694,8 +9799,97 @@ mod compute_cell_size_tests {
             220.0
         ));
 
-        let width = details_content_width(200.0, &settings);
-        assert_eq!(width, DetailsColumn::Name.default_width() + 220.0);
+        // avail が狭くても、保存済みの広い列のために pane は名前列既定幅 + その列幅まで広がる。
+        let layout = details_layout(200.0, 0.0, &settings);
+        assert_eq!(layout.pane_w, DetailsColumn::Name.default_width() + 220.0);
+        assert_eq!(layout.extent, layout.pane_w, "gutter 0 なら extent == pane");
+    }
+
+    #[test]
+    fn details_layout_reserves_gutter_and_avoids_horizontal_scroll() {
+        // 名前列が残り幅を埋める通常ケース。縦バー gutter を引いた幅に列を収めれば、
+        // 総コンテンツ幅 (extent) は avail と一致 → 余計な横スクロールバーは出ない。
+        let settings = minimal_details_settings(); // Name + Size(92)
+        let gutter = 10.0;
+        let layout = details_layout(600.0, gutter, &settings);
+        assert!((layout.extent - 600.0).abs() < 0.01, "extent == avail");
+        assert!(
+            (layout.pane_w - (600.0 - gutter)).abs() < 0.01,
+            "pane は gutter を引いた幅"
+        );
+        assert!(
+            (layout.name_w - (600.0 - gutter - 92.0)).abs() < 0.01,
+            "名前列が残り幅を埋める"
+        );
+    }
+
+    #[test]
+    fn details_layout_without_gutter_fills_pane() {
+        let settings = minimal_details_settings();
+        let layout = details_layout(600.0, 0.0, &settings);
+        assert!((layout.extent - 600.0).abs() < 0.01);
+        assert!((layout.pane_w - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn details_layout_fixed_name_overflows_into_horizontal_scroll() {
+        let mut settings = minimal_details_settings();
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 500.0;
+        let layout = details_layout(300.0, 10.0, &settings);
+        assert!((layout.name_w - 500.0).abs() < 0.01, "固定幅を尊重");
+        assert!(
+            layout.extent > 300.0,
+            "列が収まらないので横スクロールが必要 (extent > avail)"
+        );
+    }
+
+    #[test]
+    fn details_layout_fixed_name_smaller_than_pane_leaves_gap() {
+        let mut settings = minimal_details_settings();
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 120.0;
+        let layout = details_layout(600.0, 10.0, &settings);
+        assert!((layout.name_w - 120.0).abs() < 0.01);
+        let columns_w = layout.name_w + details_fixed_columns_width(&settings);
+        assert!(
+            columns_w < layout.pane_w,
+            "固定名前列が pane より狭いと右側に余白が残る"
+        );
+        assert!((layout.extent - 600.0).abs() < 0.01, "横スクロールは不要");
+    }
+
+    #[test]
+    fn set_details_name_width_switches_to_fixed_and_is_idempotent() {
+        let mut settings = crate::settings::Settings::default();
+        assert!(settings.details_name_width_auto);
+        assert!(set_details_name_width(&mut settings, 210.0));
+        assert!(!settings.details_name_width_auto, "固定モードへ切替");
+        assert!((settings.details_name_width - 210.0).abs() < 0.01);
+        assert!(
+            !set_details_name_width(&mut settings, 210.0),
+            "同値なら変更なし"
+        );
+    }
+
+    #[test]
+    fn details_column_rects_fixed_name_uses_saved_width() {
+        let mut settings = minimal_details_settings();
+        settings.details_name_width_auto = false;
+        settings.details_name_width = 150.0;
+        let rects = details_column_rects(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 24.0)),
+            &settings,
+        );
+        let name_rect = rects
+            .iter()
+            .find(|(col, _)| *col == DetailsColumn::Name)
+            .map(|(_, r)| *r)
+            .expect("name column rect");
+        assert!(
+            (name_rect.width() - 150.0).abs() < 0.01,
+            "固定名前列は rect 幅でなく保存幅を使う"
+        );
     }
 
     #[test]

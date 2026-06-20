@@ -2565,6 +2565,8 @@ pub struct App {
     pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
     pub(crate) last_cell_h: f32,
+    /// 詳細表示で前フレームに描画した名前列の実効幅（ヘッダ右クリックで「固定幅へ」する際に使う）
+    pub(crate) last_details_name_width: f32,
 
     /// サムネイル比率の自動選択 (`settings.thumb_aspect_auto` が true のときに動く)。
     /// 詳細: [docs/auto-thumb-aspect-plan.md](../docs/auto-thumb-aspect-plan.md)
@@ -5320,6 +5322,7 @@ impl App {
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
+            last_details_name_width: 140.0,
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             auto_aspect_cache_db,
             last_viewport_h: 600.0,

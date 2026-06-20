@@ -1587,6 +1587,13 @@ pub struct Settings {
     pub details_show_video_dimensions: bool,
     #[serde(default)]
     pub details_show_video_codec: bool,
+    /// 名前列の幅を自動調整する (= 残り幅を埋める)。`false` で `details_name_width`
+    /// を固定幅として使い、横スクロールで全列を確認できる。既定 `true` (従来挙動)。
+    #[serde(default = "default_true")]
+    pub details_name_width_auto: bool,
+    /// 固定幅モード時の名前列幅 (px)。`details_name_width_auto` が `false` のときだけ参照。
+    #[serde(default = "default_details_name_width")]
+    pub details_name_width: f32,
     #[serde(default)]
     pub facet_filter: FacetFilter,
     /// ユーザーが手動で選んだ比率。Auto モードでも **書き換えない**
@@ -2895,6 +2902,9 @@ fn default_grid_cols() -> usize {
 fn default_details_sort_ascending() -> bool {
     true
 }
+fn default_details_name_width() -> f32 {
+    140.0
+}
 fn default_prefetch_back() -> usize {
     4
 }
@@ -3130,6 +3140,8 @@ impl Default for Settings {
             details_timestamp_show_seconds: false,
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
+            details_name_width_auto: true,
+            details_name_width: default_details_name_width(),
             details_show_preview: true,
             details_show_rating: true,
             details_show_tags: true,
@@ -4490,6 +4502,8 @@ impl Settings {
         self.details_timestamp_show_seconds = src.details_timestamp_show_seconds;
         self.details_column_order = src.details_column_order.clone();
         self.details_column_widths = src.details_column_widths.clone();
+        self.details_name_width_auto = src.details_name_width_auto;
+        self.details_name_width = src.details_name_width;
         self.details_show_preview = src.details_show_preview;
         self.details_show_rating = src.details_show_rating;
         self.details_show_tags = src.details_show_tags;
@@ -6817,6 +6831,8 @@ mod tests {
             s.details_show_video_duration = true;
             s.details_show_video_dimensions = true;
             s.details_show_video_codec = true;
+            s.details_name_width_auto = false;
+            s.details_name_width = 222.0;
             s.facet_filter.kinds.insert(FacetItemKind::Image);
             s.facet_filter.exts.insert("png".to_string());
             s.facet_filter
@@ -6927,6 +6943,14 @@ mod tests {
                     .any(|entry| entry.column == DetailsColumnId::Size
                         && (entry.width - 128.0).abs() < 0.1),
                 "details_column_widths should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_name_width_auto,
+                "details_name_width_auto should survive roundtrip"
+            );
+            assert!(
+                (loaded.details_name_width - 222.0).abs() < 0.1,
+                "details_name_width should survive roundtrip"
             );
             assert!(
                 !loaded.details_show_preview,
