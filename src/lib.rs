@@ -123,6 +123,7 @@ pub mod ui_text_links;
 pub mod undo_stack;
 pub mod update_check;
 pub mod vector_edit;
+pub mod version_highlights;
 #[cfg(windows)]
 pub mod video;
 pub mod video_bookmarks;
