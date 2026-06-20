@@ -18106,7 +18106,11 @@ impl App {
                     self.note_reading_history_open(idx);
                     // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
-                    if self.stack_try_open_from_grid(idx) {
+                    // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
+                    // (= 動画 + shift_enter のときは intercept をスキップして下の Video arm に流す)。
+                    let stack_skip_for_shift_video =
+                        shift_enter && matches!(self.items.get(idx), Some(GridItem::Video(_)));
+                    if !stack_skip_for_shift_video && self.stack_try_open_from_grid(idx, false) {
                         return None;
                     }
                     match self.items.get(idx) {

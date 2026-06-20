@@ -149,7 +149,14 @@ impl crate::app::App {
     /// 集約グリッドでメディアセル (スタック / 単独画像 / 動画) を開いたとき、フラット読書
     /// フルスクリーンへ入る。`agg_idx` は集約 `self.items` の index。コンテナ (passthrough) は
     /// `false` を返して通常ナビ (フォルダ/ZIP/PDF を開く) に委ねる。戻り値 true = ここで処理した。
-    pub(crate) fn stack_try_open_from_grid(&mut self, agg_idx: usize) -> bool {
+    ///
+    /// `from_double_click` = ダブルクリック経由か (動画の場合に 2 打目の play/pause トグルを
+    /// 抑制するため)。通常の grid→fullscreen 経路と同じ開幕ガードをここで張る。
+    pub(crate) fn stack_try_open_from_grid(
+        &mut self,
+        agg_idx: usize,
+        from_double_click: bool,
+    ) -> bool {
         if !self.stack_mode_aggregated() {
             return false;
         }
@@ -161,6 +168,16 @@ impl crate::app::App {
             // passthrough コンテナ → フルスクリーンでなく通常ナビへ。
             return false;
         };
+        // 開幕ガード (通常の grid open 経路と同じ):
+        // - Enter で開いた同フレームに fullscreen 側が同じ Enter を拾って即 close するのを防ぐ
+        //   (Enter が押下されていなければ fullscreen 側初フレームで自動リセットされるので、
+        //    click/gamepad 経由で立てても無害)。
+        self.fs_suppress_enter_close_until_release = true;
+        // - ダブルクリックで動画を開いたとき、2 打目クリックが fullscreen の動画 play/pause を
+        //   トグルしないよう抑制する (静止画は open_fullscreen の focus-regain グレースで足りる)。
+        if from_double_click && matches!(self.items.get(agg_idx), Some(GridItem::Video(_))) {
+            self.fs_suppress_primary_until_release = true;
+        }
         self.stack_enter_flat_fullscreen(flat_idx);
         true
     }

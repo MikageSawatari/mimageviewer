@@ -4234,7 +4234,7 @@ impl App {
         self.note_reading_history_open(idx);
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
-        if self.stack_try_open_from_grid(idx) {
+        if self.stack_try_open_from_grid(idx, false) {
             return None;
         }
         let item = self.items.get(idx).cloned();

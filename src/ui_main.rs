@@ -7373,7 +7373,7 @@ impl App {
             self.note_reading_history_open(idx);
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
-            if self.stack_try_open_from_grid(idx) {
+            if self.stack_try_open_from_grid(idx, true) {
                 return nav;
             }
             match self.items.get(idx) {
