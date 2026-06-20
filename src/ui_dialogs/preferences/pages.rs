@@ -4,8 +4,7 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
-    Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode,
-    ThumbAspect, ToolbarSectionDisplay, UiTheme,
+    Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, UiTheme,
 };
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -345,9 +344,18 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let mut clear_quick_folders_clicked = false;
 
     ui.label(
-        "チェックを外した項目はツールバーから隠れます。\n\
-         セクション内の全項目を外すとセクション自体が非表示になります。\n\
-         上から順に画面のツールバー左端 → 右端に対応します。",
+        "フォルダバー (アドレス行) に出すボタンを選びます。\n\
+         チェックを外した項目はフォルダバーから隠れます。",
+    );
+    ui.add_space(4.0);
+    // v2.0.0: ツールバー本体のセクション (列/比率/ソート/ツリー/本棚/★/お気に入り/タグ) の
+    // 表示・並び順・表示形式・出す項目は、このページではなく **ツールバーの右クリック**
+    // (空き領域 = 表示するセクション、セクションのラベル = そのセクションの設定) で行う。
+    ui.label(
+        egui::RichText::new(
+            "※ ツールバー本体のセクションは、ツールバーを右クリックしてカスタマイズします。",
+        )
+        .weak(),
     );
     ui.add_space(6.0);
 
@@ -455,126 +463,14 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // 動作には影響しない。
     let _ = &mut s.show_toolbar_vst3; // 未使用警告抑制
 
-    // セクションごとの「展開 / プルダウン」表示形式選択 helper。
-    // Buttons (= 展開): 既存挙動、横並びの selectable_label 群。
-    // Dropdown (= プルダウン): ComboBox 1 個。スペース節約用。
-    fn display_radio(ui: &mut egui::Ui, value: &mut ToolbarSectionDisplay) {
-        ui.horizontal(|ui| {
-            ui.label("表示:");
-            for &opt in ToolbarSectionDisplay::all() {
-                ui.radio_value(value, opt, opt.label());
-            }
-        });
-    }
-    // 3 択版 (展開 / 折りたたみ / プルダウン)。お気に入り / タグ / 本棚用。
-    fn display_radio3(ui: &mut egui::Ui, value: &mut ToolbarSectionDisplay) {
-        ui.horizontal(|ui| {
-            ui.label("表示:");
-            for &opt in ToolbarSectionDisplay::all_with_collapsible() {
-                ui.radio_value(value, opt, opt.label());
-            }
-        });
-    }
+    // v2.0.0: ツールバー本体のセクション設定 (列/比率/ソート/ツリー/本棚/★/スマートフィルタ/
+    // お気に入り/タグ の表示・並び順・表示形式・出す項目) は、このページから撤去し、
+    // **ツールバーの右クリック** へ移した:
+    //   - 空き領域 右クリック (または「設定」メニュー → ツールバー) = 表示するセクション
+    //   - セクションのラベル 右クリック = そのセクションの設定 (表示形式 / 出す項目 / 行頭 / 隠す)
+    //   - セクションのラベル ドラッグ = 並べ替え
+    // 設定値 (show_toolbar_* / toolbar_*_display / toolbar_*_items / 並び順) は保持している。
 
-    // ── 列 ──
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new("列").strong());
-    display_radio(ui, &mut s.toolbar_cols_display);
-    ui.horizontal_wrapped(|ui| {
-        for cols in 1..=10usize {
-            let mut checked = s.toolbar_cols_items.contains(&cols);
-            if ui.checkbox(&mut checked, format!("{cols}")).changed() {
-                if checked {
-                    s.toolbar_cols_items.push(cols);
-                    s.toolbar_cols_items.sort();
-                } else {
-                    s.toolbar_cols_items.retain(|&c| c != cols);
-                }
-            }
-        }
-        ui.checkbox(&mut s.toolbar_cols_details_visible, "詳細");
-    });
-
-    // ── 比率 ──
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new("比率").strong());
-    display_radio(ui, &mut s.toolbar_aspect_display);
-    ui.horizontal_wrapped(|ui| {
-        // 「自動」項目 (常時 7 種より前に表示)。デフォルト ON。
-        ui.checkbox(&mut s.toolbar_aspect_auto_visible, "自動");
-        for &aspect in ThumbAspect::all() {
-            let mut checked = s.toolbar_aspect_items.contains(&aspect);
-            if ui.checkbox(&mut checked, aspect.label()).changed() {
-                if checked {
-                    s.toolbar_aspect_items.push(aspect);
-                    let order: Vec<_> = ThumbAspect::all().to_vec();
-                    s.toolbar_aspect_items
-                        .sort_by_key(|a| order.iter().position(|o| o == a).unwrap_or(usize::MAX));
-                } else {
-                    s.toolbar_aspect_items.retain(|&a| a != aspect);
-                }
-            }
-        }
-    });
-
-    // ── ソート ──
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new("ソート").strong());
-    display_radio(ui, &mut s.toolbar_sort_display);
-    ui.horizontal_wrapped(|ui| {
-        for &order in SortOrder::all() {
-            let mut checked = s.toolbar_sort_items.contains(&order);
-            if ui.checkbox(&mut checked, order.short_label()).changed() {
-                if checked {
-                    s.toolbar_sort_items.push(order);
-                    let canonical: Vec<_> = SortOrder::all().to_vec();
-                    s.toolbar_sort_items.sort_by_key(|so| {
-                        canonical.iter().position(|o| o == so).unwrap_or(usize::MAX)
-                    });
-                } else {
-                    s.toolbar_sort_items.retain(|&so| so != order);
-                }
-            }
-        }
-    });
-
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(2.0);
-    ui.checkbox(
-        &mut s.show_toolbar_folder_tree_button,
-        "ツリー（フォルダツリー表示切り替え）",
-    );
-    ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚");
-    if s.show_toolbar_bookshelf {
-        // 本棚はコンボ(全本)が常時あり、ピンは常にボタンで出すので 展開/折りたたみ の 2 択。
-        ui.horizontal(|ui| {
-            ui.label("表示:");
-            for &opt in ToolbarSectionDisplay::all_collapsible_only() {
-                ui.radio_value(&mut s.toolbar_bookshelf_display, opt, opt.label());
-            }
-        });
-    }
-    ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
-    ui.checkbox(
-        &mut s.show_toolbar_facet_filter,
-        "スマートフィルタ (絞り込みバー)",
-    )
-    .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。");
-    ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
-    if s.show_toolbar_favorites {
-        display_radio3(ui, &mut s.toolbar_favorites_display);
-    }
-    ui.checkbox(&mut s.show_toolbar_tags, "タグ");
-    if s.show_toolbar_tags {
-        display_radio3(ui, &mut s.toolbar_tags_display);
-    }
     if clear_recent_folders_clicked {
         s.recent_folders.clear();
         s.quick_folder_recent_folders = [Vec::new(), Vec::new()];

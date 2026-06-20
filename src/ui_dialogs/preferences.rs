@@ -84,7 +84,9 @@ impl PreferencesPage {
             Self::StartupFolder => "起動時に開く場所",
             Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
-            Self::Toolbar => "ツールバー",
+            // v2.0.0: ツールバーのセクション設定は右クリックへ移行し、このページは
+            // フォルダバー (アドレス行) 専用になった。enum 名は内部互換のため Toolbar のまま。
+            Self::Toolbar => "フォルダバー",
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
             Self::MouseButtons => "マウスボタン",
