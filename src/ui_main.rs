@@ -388,12 +388,21 @@ fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
 /// から各ボタンに直接渡す。`context_menu` は egui 上、disabled でも開いてしまうので
 /// `if enabled` で明示ガードする (`resp.clicked()` 側は `add_enabled` が消費するので
 /// 二重ガードは belt-and-suspenders)。
+/// ★ボタン右クリックメニューでの「付与」要求 (フィルタとは別操作)。
+/// ★は左右クリック + 修飾キーが全てフィルタに使われているため、評価の付与は
+/// 右クリックメニュー経由で行う (toolbar-customization-plan.md §1.1)。
+enum RatingAssign {
+    Selection(u8),
+    Container(u8),
+}
+
 fn draw_rating_filter_button(
     ui: &mut egui::Ui,
     rf: &mut [bool; 6],
     idx: usize,
     enabled: bool,
-) -> bool {
+    has_selection: bool,
+) -> (bool, Option<RatingAssign>) {
     let sel = rf[idx];
     let resp = ui
         .add_enabled(
@@ -402,6 +411,7 @@ fn draw_rating_filter_button(
         )
         .hover_tip(rating_tooltip(idx));
     let mut changed = false;
+    let mut assign: Option<RatingAssign> = None;
     if enabled && resp.clicked() {
         let mods = ui.input(|i| i.modifiers);
         // Windows 専用ビルドなので mods.command は ctrl と同値 (egui 内で alias)。
@@ -461,9 +471,32 @@ fn draw_rating_filter_button(
                 changed = true;
                 ui.close();
             }
+            // ── 評価の付与 (フィルタではなく) — toolbar-customization-plan.md §1.1 ──
+            ui.separator();
+            let assign_sel = if idx == 0 {
+                "選択を未評価に".to_string()
+            } else {
+                format!("選択へ ★{idx} を付与")
+            };
+            if ui
+                .add_enabled(has_selection, egui::Button::new(assign_sel))
+                .clicked()
+            {
+                assign = Some(RatingAssign::Selection(idx as u8));
+                ui.close();
+            }
+            let assign_cont = if idx == 0 {
+                "この場所を未評価に".to_string()
+            } else {
+                format!("この場所へ ★{idx} を付与")
+            };
+            if ui.button(assign_cont).clicked() {
+                assign = Some(RatingAssign::Container(idx as u8));
+                ui.close();
+            }
         });
     }
-    changed
+    (changed, assign)
 }
 
 // ── native ファイル D&D (ドラッグでコピー送出) ───────────────────────
@@ -3388,6 +3421,7 @@ impl App {
         let active_book_name = self.active_book_name();
         let toolbar_book_rows = self.book_list_cache.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
+        let has_rating_selection = has_book_add_target;
         let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
             &self.settings.toolbar_section_order,
         );
@@ -3407,6 +3441,8 @@ impl App {
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_sort_changed = false;
         let mut toolbar_rating_changed = false;
+        let mut toolbar_rating_assign_selection: Option<u8> = None;
+        let mut toolbar_rating_assign_container: Option<u8> = None;
         let mut toolbar_book_add = false;
         let mut toolbar_book_open_active = false;
         let mut toolbar_book_target_name: Option<String> = None;
@@ -3815,13 +3851,24 @@ impl App {
                     // 起きてしまい、★★ 以降が右端の縦帯に積まれて崩れる。enabled は各
                     // ボタン側に渡し、親の wrap に直接乗せて次の row に流させる。
                     for idx in 0..6 {
-                        if draw_rating_filter_button(
+                        let (changed, assign) = draw_rating_filter_button(
                             ui,
                             &mut self.settings.rating_filter,
                             idx,
                             !aggregated_search,
-                        ) {
+                            has_rating_selection,
+                        );
+                        if changed {
                             toolbar_rating_changed = true;
+                        }
+                        match assign {
+                            Some(RatingAssign::Selection(n)) => {
+                                toolbar_rating_assign_selection = Some(n)
+                            }
+                            Some(RatingAssign::Container(n)) => {
+                                toolbar_rating_assign_container = Some(n)
+                            }
+                            None => {}
                         }
                     }
                     // ★フィルタ一時解除中: コンテナ自身の★で開いた結果として filter が
@@ -3987,6 +4034,16 @@ impl App {
                 self.rebuild_items_from_global_search();
             } else {
                 self.rebuild_visible_indices();
+            }
+        }
+        // ★付与 (右クリックメニュー、§1.1)。apply_rating_to_selection は対象解決・undo・
+        // 再描画を自前で行う。コンテナ付与は変更時のみトースト。
+        if let Some(n) = toolbar_rating_assign_selection {
+            self.apply_rating_to_selection(n);
+        }
+        if let Some(n) = toolbar_rating_assign_container {
+            if self.set_current_folder_rating(n) {
+                self.show_container_rating_toast(n);
             }
         }
 
