@@ -14055,10 +14055,11 @@ impl App {
             return;
         }
 
+        let target_folder = crate::books::book_folder(&self.book_root_path(), &book_name);
         let mut sources = Vec::new();
         let mut errors = Vec::new();
         for idx in indices {
-            match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid) {
+            match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid, &target_folder) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
                     errors.push(err.clone());
@@ -14100,7 +14101,13 @@ impl App {
             self.show_feedback_toast("製本処理中です".to_string());
             return;
         }
-        let source = match self.book_page_source_for_idx(ctx, fs_idx, BookAddMode::Fullscreen) {
+        let active_folder = self.active_book_folder_path();
+        let source = match self.book_page_source_for_idx(
+            ctx,
+            fs_idx,
+            BookAddMode::Fullscreen,
+            &active_folder,
+        ) {
             Ok(source) => source,
             Err(err) => {
                 self.show_feedback_toast(friendly_book_add_error(err));
@@ -14150,6 +14157,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
         mode: BookAddMode,
+        target_book_folder: &std::path::Path,
     ) -> Result<crate::books::BookPageSource, String> {
         let item = self
             .items
@@ -14159,7 +14167,7 @@ impl App {
         if let GridItem::Image(path) = &item
             && let Some(book_folder) = self.compiled_book_page_folder(path)
         {
-            if crate::folder_tree::path_eq(&book_folder, &self.active_book_folder_path()) {
+            if crate::folder_tree::path_eq(&book_folder, target_book_folder) {
                 return Err(BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string());
             }
             let original_name = path

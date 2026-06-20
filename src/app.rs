@@ -15323,6 +15323,17 @@ impl App {
                     self.settings.active_book_name = new_name.clone();
                     self.settings.save();
                 }
+                // ツールバーのピン留めも旧名→新名へ追従 (Codex P2: 放置すると exists
+                // フィルタでピンが消えたように見える)。
+                if let Some(pos) = self
+                    .settings
+                    .pinned_books
+                    .iter()
+                    .position(|b| b == &old_name)
+                {
+                    self.settings.pinned_books[pos] = new_name.clone();
+                    self.settings.save();
+                }
                 self.book_manager_rename_name = new_name.clone();
                 self.book_manager_rename_inputs.remove(&old_name);
                 self.book_manager_rename_inputs
@@ -15336,6 +15347,11 @@ impl App {
                     self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
                     self.settings.save();
                     self.book_manager_rename_name = self.settings.active_book_name.clone();
+                }
+                // 削除された本のピン留めも除去 (Codex P2: 残すと同名再作成でピンが復活する)。
+                if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
+                    self.settings.pinned_books.remove(pos);
+                    self.settings.save();
                 }
                 self.book_manager_delete_confirm = None;
                 self.book_manager_rename_inputs.remove(&name);
