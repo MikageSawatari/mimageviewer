@@ -4426,6 +4426,13 @@ impl Settings {
         }
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
+        // 手編集や移行で非有限 / 範囲外の名前列幅が混入しても安全にする
+        // (列幅と同じ 40.0..=800.0 へ clamp。実行時もレイアウト側で clamp するが二重に守る)。
+        if !self.details_name_width.is_finite() {
+            self.details_name_width = default_details_name_width();
+        } else {
+            self.details_name_width = self.details_name_width.clamp(40.0, 800.0);
+        }
         self.normalize_tag_settings();
         self.normalize_facet_tag_filter();
         if self.facet_filter.edits.remove(&FacetEditFlag::AiAdjustment) {
@@ -5415,6 +5422,33 @@ mod tests {
     /// なっていれば sanitize でクランプされる。下限 0 は Ctrl+↑↓ が
     /// 機能しなくなり、上限超過は ZIP 中身検査込みの DFS が長時間走って
     /// UI 非応答を招くため両側で防衛する。
+    #[test]
+    fn sanitize_clamps_details_name_width() {
+        let mut s = Settings::default();
+        s.details_name_width = 5.0;
+        s.sanitize();
+        assert!(
+            (s.details_name_width - 40.0).abs() < 0.01,
+            "下限 40 へ clamp"
+        );
+
+        let mut s = Settings::default();
+        s.details_name_width = 5000.0;
+        s.sanitize();
+        assert!(
+            (s.details_name_width - 800.0).abs() < 0.01,
+            "上限 800 へ clamp"
+        );
+
+        let mut s = Settings::default();
+        s.details_name_width = f32::NAN;
+        s.sanitize();
+        assert!(
+            (s.details_name_width - default_details_name_width()).abs() < 0.01,
+            "非有限は既定へ"
+        );
+    }
+
     #[test]
     fn sanitize_clamps_folder_skip_limit() {
         let mut s = Settings::default();

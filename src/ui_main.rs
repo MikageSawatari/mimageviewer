@@ -7738,10 +7738,24 @@ impl App {
         // 内側の縦スクロール (solid) が gutter ぶん外形を広げ、ヘッダ (縦バー外) と行 (縦バー内) が
         // ずれて右端列が欠け、不要な横スクロールバーまで出る。viewport はヘッダ + 行間を引いた概算で
         // 判定し、境界帯では「gutter を多めに確保」側へ倒す (= 列が欠けるより無害)。
+        // 横方向にあふれる (固定名前列 / 広い列) と外側に水平スクロールバーが出る。それが solid 設定だと
+        // 内側縦ビューポートの高さを削るので、その分も概算から引く (既定 floating では allocated=0 なので無影響)。
+        let fixed_cols_w = details_fixed_columns_width(&self.settings);
+        let name_w_unconstrained = if self.settings.details_name_width_auto {
+            (avail_w - fixed_cols_w).max(DetailsColumn::Name.default_width())
+        } else {
+            details_name_fixed_width(&self.settings)
+        };
+        let h_overflow = name_w_unconstrained + fixed_cols_w > avail_w + 0.5;
+        let hbar = if h_overflow {
+            ui.spacing().scroll.allocated_width()
+        } else {
+            0.0
+        };
         // 危険なのは「出ないと予測したのに egui が出す」側 (= 上記バグが再発) だけ。境界では gutter を
         // 多めに確保する方へ倒す (余分に取っても右に空き帯が出るだけで無害) ため概算を少し小さめにする。
         let viewport_h_est =
-            (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - 2.0).max(0.0);
+            (avail_h - Self::DETAILS_HEADER_H - ui.spacing().item_spacing.y - hbar - 2.0).max(0.0);
         let needs_vscroll = natural_h > viewport_h_est;
         let gutter = if needs_vscroll {
             egui::style::ScrollStyle::solid().allocated_width()
@@ -8276,9 +8290,12 @@ impl App {
                 egui::Stroke::new(1.0, stroke_color),
             );
             {
-                let resize_rect = egui::Rect::from_center_size(
-                    egui::pos2(col_rect.right(), col_rect.center().y),
-                    egui::vec2(8.0, col_rect.height()),
+                // リサイズのつかみ代は列の内側 (右端から左へ 8px) に置く。境界中央に置くと右半分が
+                // 次列ヘッダ (click_and_drag) の当たり判定と重なり、ドラッグがソート/並べ替えに
+                // 横取りされる。境界線の視覚インジケータは下で別途描くので操作感は保たれる。
+                let resize_rect = egui::Rect::from_min_max(
+                    egui::pos2(col_rect.right() - 8.0, col_rect.top()),
+                    egui::pos2(col_rect.right(), col_rect.bottom()),
                 );
                 let resize_response = ui.interact(
                     resize_rect,
