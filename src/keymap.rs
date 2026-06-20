@@ -772,7 +772,8 @@ pub enum KeyAction {
     FsCompareDiff,
     FsRotateCw,
     FsRotateCcw,
-    FsAnalysis,
+    FsImageAnalysis,
+    FsZoomMode,
     FsPanorama,
     FsPixelGrid,
     FsLoupeLockToggle,
@@ -969,7 +970,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsCompareDiff,
     KeyAction::FsRotateCw,
     KeyAction::FsRotateCcw,
-    KeyAction::FsAnalysis,
+    KeyAction::FsImageAnalysis,
+    KeyAction::FsZoomMode,
     KeyAction::FsPanorama,
     KeyAction::FsPixelGrid,
     KeyAction::FsLoupeLockToggle,
@@ -1201,7 +1203,8 @@ impl KeyAction {
             FsCompareDiff => "FsCompareDiff",
             FsRotateCw => "FsRotateCw",
             FsRotateCcw => "FsRotateCcw",
-            FsAnalysis => "FsAnalysis",
+            FsImageAnalysis => "FsImageAnalysis",
+            FsZoomMode => "FsZoomMode",
             FsPanorama => "FsPanorama",
             FsPixelGrid => "FsPixelGrid",
             FsLoupeLockToggle => "FsLoupeLockToggle",
@@ -1408,7 +1411,8 @@ impl KeyAction {
             FsCompareDiff => "差分比較を切り替える",
             FsRotateCw => "現在の画像を右に90度回転する",
             FsRotateCcw => "現在の画像を左に90度回転する",
-            FsAnalysis => "画像分析モードを開く",
+            FsImageAnalysis => "画像分析モードを開く",
+            FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度パノラマモードを切り替える",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
@@ -1597,7 +1601,8 @@ impl KeyAction {
             | FsCompareDiff
             | FsRotateCw
             | FsRotateCcw
-            | FsAnalysis
+            | FsImageAnalysis
+            | FsZoomMode
             | FsPanorama
             | FsPixelGrid
             | FsLoupeLockToggle
@@ -1668,9 +1673,8 @@ impl KeyAction {
         use KeyAction::*;
         match self {
             FsLoupeHold => KeyTrigger::ModifierHold,
-            EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan => {
-                KeyTrigger::KeyHold
-            }
+            EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
+            | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -1744,7 +1748,7 @@ impl KeyAction {
             | FsCompareDiff
             | FsRotateCw
             | FsRotateCcw
-            | FsAnalysis
+            | FsImageAnalysis
             | FsPanorama
             | FsPixelGrid
             | FsLoupeLockToggle
@@ -1939,9 +1943,11 @@ impl KeyAction {
             FsCompareDiff => ChordList::one(Chord::alt(C)),
             FsRotateCw => ChordList::one(Chord::key(R)),
             FsRotateCcw => ChordList::one(Chord::key(L)),
-            // Z は ZipPla 風の全画面ズームモード (ホールド式・固定入力) に明け渡し、
-            // 画像分析モードは Shift+Z へ移動した (v2.0.0)。
-            FsAnalysis => ChordList::one(Chord::shift(Z)),
+            // Z は ZipPla 風の全画面ズームモード (KeyHold) に明け渡し、画像分析モードは
+            // Shift+Z へ移動・アクション名も FsImageAnalysis へ改名した (v2.0.0、旧 `FsAnalysis`
+            // のカスタム割当は未知アクションとして無視され、新既定へ移行する)。
+            FsImageAnalysis => ChordList::one(Chord::shift(Z)),
+            FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
@@ -2331,6 +2337,58 @@ impl Keymap {
             .any(|chord| self.key_held_chord(ctx, chord))
     }
 
+    /// KeyHold アクションに割り当てられたキーについて、このフレームの egui Key イベント
+    /// (押下 / 離し) を取り出して消費する。戻り値 = (押下イベントあり, 離しイベントあり)。
+    /// OS 直読みのエッジ (`key_held_action` のフレーム間差分) では取りこぼす高速タップ
+    /// (idle からの同フレーム 押下+離し) を救うために併用する。修飾キー付きは対象外。
+    pub fn take_key_hold_edges(&self, ctx: &egui::Context, action: KeyAction) -> (bool, bool) {
+        debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        let keys: Vec<egui::Key> = if let Some(chords) = self.overrides.get(&action) {
+            chords
+                .iter()
+                .filter_map(|c| c.key.map(KeyName::to_egui))
+                .collect()
+        } else {
+            action
+                .default_chords()
+                .iter()
+                .filter_map(|c| c.key.map(KeyName::to_egui))
+                .collect()
+        };
+        if keys.is_empty() {
+            return (false, false);
+        }
+        ctx.input_mut(|i| {
+            let mut pressed = false;
+            let mut released = false;
+            i.events.retain(|e| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: p,
+                    modifiers,
+                    repeat,
+                    ..
+                } = e
+                    && !modifiers.ctrl
+                    && !modifiers.shift
+                    && !modifiers.alt
+                    && keys.contains(key)
+                {
+                    if *p {
+                        if !*repeat {
+                            pressed = true;
+                        }
+                    } else {
+                        released = true;
+                    }
+                    return false; // consume
+                }
+                true
+            });
+            (pressed, released)
+        })
+    }
+
     pub fn modifier_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
         if let Some(chords) = self.overrides.get(&action) {
@@ -2652,27 +2710,6 @@ fn modifier_held_via_os(kind: ModKind) -> bool {
     unsafe { GetAsyncKeyState(vk as i32) < 0 }
 }
 
-/// 修飾キー (Ctrl/Shift/Alt) なしで指定キーが物理的に押されているかを OS 直読みで返す。
-/// フルスクリーンビューポートでは egui の key_down / modifiers が stale になるため
-/// (Shift ルーペ / 右 Ctrl 元画像と同じ事情)、ホールド式の入力判定にはこちらを使う。
-/// 非 Windows では常に false。
-// 呼び出し元は bin 専用の `ui_fullscreen.rs` (ZipPla 風ズーム) のみ。lib 側ビルドからは
-// 未使用に見えるため dead_code を許可する。
-#[cfg(windows)]
-#[allow(dead_code)]
-pub(crate) fn plain_key_held_via_os(key: KeyName) -> bool {
-    key_held_via_os(key)
-        && !modifier_held_via_os(ModKind::Ctrl)
-        && !modifier_held_via_os(ModKind::Shift)
-        && !modifier_held_via_os(ModKind::Alt)
-}
-
-#[cfg(not(windows))]
-#[allow(dead_code)]
-pub(crate) fn plain_key_held_via_os(_key: KeyName) -> bool {
-    false
-}
-
 #[cfg(windows)]
 pub fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
@@ -2896,6 +2933,42 @@ mod tests {
         assert_eq!(
             keymap.overrides.get(&KeyAction::FsAdjustSlot1).unwrap()[0],
             Chord::ctrl(KeyName::F1)
+        );
+    }
+
+    #[test]
+    fn legacy_fs_analysis_binding_is_dropped_after_rename() {
+        // v2.0.0 改名: 旧 `FsAnalysis = Z` のカスタム割当は未知アクションとして無視され、
+        // 新既定 (FsImageAnalysis=Shift+Z / FsZoomMode=Z) へ移行する (Z=ズーム衝突回避)。
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsImage]
+            FsAnalysis = Z
+            "#,
+        );
+        assert!(
+            keymap
+                .warnings()
+                .iter()
+                .any(|w| w.contains("unknown key action") && w.contains("FsAnalysis")),
+            "旧 FsAnalysis は未知アクション警告になる"
+        );
+        // どのアクションにも override は付かない (= 全員新既定へ)。
+        assert!(!keymap.overrides.contains_key(&KeyAction::FsImageAnalysis));
+        assert!(!keymap.overrides.contains_key(&KeyAction::FsZoomMode));
+    }
+
+    #[test]
+    fn zoom_and_analysis_default_chords_and_triggers() {
+        assert_eq!(KeyAction::FsZoomMode.trigger(), KeyTrigger::KeyHold);
+        assert_eq!(KeyAction::FsImageAnalysis.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            KeyAction::FsZoomMode.default_chords().iter().next(),
+            Some(Chord::key(KeyName::Z))
+        );
+        assert_eq!(
+            KeyAction::FsImageAnalysis.default_chords().iter().next(),
+            Some(Chord::shift(KeyName::Z))
         );
     }
 

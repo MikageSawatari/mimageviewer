@@ -612,7 +612,8 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 ```
 
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
-**描画は `draw_fs_image` を再利用**する (`draw_fs_zoom_mode`)。専用の固定ホールド入力 (Z) で動き、
+**描画は `draw_fs_image` を再利用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
+keymap カスタマイズ可) のホールドで動き、
 ズーム中は「cover 倍率 (画像が画面を覆う最小倍率) × `fs_zoom_factor`」を `zoom_pan` に変換して
 ページ全体フィット指定で描く。パンはカーソル正規化位置を元画像範囲へ写し、余白が出ないよう
 range を clamp する (`zip_cover_zoom_pan`)。照準中 (Z 押下中) はページ全体フィットで全体を見せつつ

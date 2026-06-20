@@ -312,18 +312,20 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
   同一キーの処理が 2 系統に割れて consume 順 (Shift を先に誰が取るか) の管理が難しくなる。
   そのため ③ も同じ箇所で `stack_showing_flat` を条件に raw consume する
   (`App::stack_jump`)。カスタマイズ対象には含めない。
-- **ZipPla 風 全画面ズーム (<kbd>Z</kbd>) は `KeyAction` 化せず固定ホールド入力で扱う**
-  (固定扱いの理由)。Z は「押している間=照準 (枠表示) / 離す=ズーム確定 / ズーム中の押下=解除」
-  というホールド + トグルのハイブリッドで、`consume_action` の離散押下モデルに乗らない。
-  そこで Shift ルーペ / 右 Ctrl 元画像と同じく **OS キー直読み (`plain_key_held_via_os(KeyName::Z)`)
-  のフレーム間エッジ検出**で実装する (フルスクリーンビューポートでは egui の key_down が stale に
-  なるため)。Shift/Ctrl/Alt を伴う Z (= Shift+Z 分析 / Ctrl+Z undo) とは「修飾なし」条件で
-  排他になるので衝突しない。状態 (`fs_zoom_active` / `fs_zoom_aiming` / `fs_zoom_factor`) は
-  settings に保存せずアプリセッション内のみ保持し、グリッドへ戻ると解除 (倍率は維持)。
-  カスタマイズ対象には含めない。**画像分析モードは `KeyAction::FsAnalysis` のまま Shift+Z へ移動**
-  (既定 chord 変更、`keymap.ini` でカスタマイズ可)。なお `keymap.ini` で `FsAnalysis` を**修飾なしの
-  Z** へ割り当て直すと固定の全画面ズーム (Z) と衝突する (分析トグルとズーム照準が同時に起きる)。
-  ズームは固定入力なので、Z を分析へ戻したいユーザーは別キーを使うこと (既知の競合)。
+- **ZipPla 風 全画面ズームは `KeyAction::FsZoomMode` (KeyHold トリガ、既定 <kbd>Z</kbd>) として扱う**。
+  「押している間=照準 (枠表示) / 離す=ズーム確定 / ズーム中の押下=解除」というホールド + トグルの
+  ハイブリッドだが、`KeyHold` アクション基盤 (Shift ルーペ `FsLoupeHold` / 編集モードの Space パンと
+  同じ枠組み) に乗せてカスタマイズ可能にした。押下状態は `keymap.key_held_action` (OS 直読み =
+  フルスクリーンビューポートで stale な egui key_down を回避) で取り、高速タップ (idle からの同
+  フレーム押下+離し) は `keymap.take_key_hold_edges` (egui Key イベント) で補完する (Codex P2)。
+  状態 (`fs_zoom_active` / `fs_zoom_aiming` / `fs_zoom_factor`) は settings に保存せずアプリ
+  セッション内のみ保持し、グリッドへ戻ると解除 (倍率は維持)。
+- **画像分析モードは `FsAnalysis` → `FsImageAnalysis` へ改名し、既定 chord を <kbd>Shift</kbd>+<kbd>Z</kbd>
+  へ移動**した (v2.0.0)。改名により、旧バージョンの `keymap.ini` に残る `FsAnalysis = …` の割当ては
+  **未知アクションとして無視され**、全員が新既定 (Z=ズーム / Shift+Z=分析) へ移行する (旧 Z=分析の
+  カスタムと固定ズームが衝突するのを避けるための clean break)。分析を別キーへ割り当てていた場合も
+  新名 `FsImageAnalysis` で設定し直す。`FsZoomMode` と `FsImageAnalysis` はどちらも `keymap.ini` で
+  カスタマイズ可能。
 - 5/1/30 秒シークの粒度は動画プレイヤー一般の慣例 (mpv: ←→=5s, Shift+←→=1s,
   ←/→ alone in YouTube=5s, J/L=10s) を踏襲しつつ、modifier で粒度切替できる
   ようにした。

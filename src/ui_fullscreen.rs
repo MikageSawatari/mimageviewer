@@ -1796,39 +1796,13 @@ impl App {
             self.fs_zoom_reset();
             return;
         }
-        // 修飾なし Z の押下/離しを (a) egui イベント (b) OS 直読みの両方から取る。イベントは
-        // 高速タップ (同フレーム内の押下+離し) を取りこぼさず、OS 直読みは FS ビューポートで
-        // KeyUp イベントが届かず stale 化したホールドを救う (Codex P2)。プレーン Z は消費して
-        // 他経路へ漏らさない (Shift+Z 分析 / Ctrl+Z undo は修飾ありなので対象外)。
-        let (z_press_event, z_release_event) = ctx.input_mut(|i| {
-            let mut pressed = false;
-            let mut released = false;
-            i.events.retain(|e| {
-                if let egui::Event::Key {
-                    key: egui::Key::Z,
-                    pressed: p,
-                    modifiers,
-                    repeat,
-                    ..
-                } = e
-                    && !modifiers.ctrl
-                    && !modifiers.shift
-                    && !modifiers.alt
-                {
-                    if *p {
-                        if !*repeat {
-                            pressed = true;
-                        }
-                    } else {
-                        released = true;
-                    }
-                    return false; // consume plain Z
-                }
-                true
-            });
-            (pressed, released)
-        });
-        let z_down = crate::keymap::plain_key_held_via_os(crate::keymap::KeyName::Z);
+        // FsZoomMode (KeyHold、既定 Z) の押下/離しを (a) egui イベント (b) OS 直読みの両方から取る。
+        // イベントは高速タップ (同フレーム内の押下+離し) を取りこぼさず、OS 直読みは FS ビュー
+        // ポートで KeyUp が届かず stale 化したホールドを救う (Codex P2)。割当キーは keymap で
+        // カスタマイズ可。エッジ取得時に該当キーイベントは消費して他経路へ漏らさない。
+        let (z_press_event, z_release_event) =
+            self.keymap.take_key_hold_edges(ctx, KeyAction::FsZoomMode);
+        let z_down = self.keymap.key_held_action(ctx, KeyAction::FsZoomMode);
         let rising = z_press_event || (z_down && !self.fs_zoom_z_was_down);
         let falling = z_release_event || (!z_down && self.fs_zoom_z_was_down);
         if rising {
@@ -6343,7 +6317,7 @@ impl App {
         let key_s = self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
         let key_r = self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
         let key_l = self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
-        let key_z = self.keymap.consume_action(ctx, KeyAction::FsAnalysis);
+        let key_z = self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
         // V: 360 度パノラマビューワーモード トグル (docs/panorama-360-view-plan.md)。
         // 消しゴムモード中は ui_erase 側が V (vertical line tool) を先に consume するので、
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
