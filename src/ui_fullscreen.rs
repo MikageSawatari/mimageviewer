@@ -14078,6 +14078,13 @@ impl App {
         let mut sources = Vec::new();
         let mut errors = Vec::new();
         for idx in indices {
+            // ファイル名スタックの集約セルは、そのスタックのメンバー画像を全部展開して追加する
+            // (設計 §5: スタック選択 → 本へメンバー全部コピー)。Stack セルは
+            // book_page_source_for_idx の対象外 (1 idx = N メンバー) なので先にここで展開する。
+            if let Some(members) = self.stack_member_book_sources(idx) {
+                sources.extend(members);
+                continue;
+            }
             match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid, &target_folder) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
@@ -14169,6 +14176,37 @@ impl App {
         };
         self.start_book_append(ctx, vec![source]);
         self.show_feedback_toast("動画フレームを追加先の本へ追加中".to_string());
+    }
+
+    /// 集約グリッドの `GridItem::Stack` セルを、そのスタックのメンバー画像 (実ファイル) の
+    /// `BookPageSource::File` 列へ展開する (設計 §5: スタック → 本へメンバー全部コピー)。
+    /// Stack セルでない / スタックビューでないときは `None` を返す (= 通常の
+    /// `book_page_source_for_idx` 経路に委ねる)。動画メンバーは念のため除外する。
+    fn stack_member_book_sources(&self, idx: usize) -> Option<Vec<crate::books::BookPageSource>> {
+        let GridItem::Stack { key, .. } = self.items.get(idx)? else {
+            return None;
+        };
+        let sv = self.stack_view.as_ref()?;
+        let g = sv.group_index_by_key(key)?;
+        let group = sv.groups.get(g)?;
+        let sources = group
+            .members
+            .iter()
+            .filter(|m| !m.is_video)
+            .map(|m| {
+                let original_name = m
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "page".to_string());
+                crate::books::BookPageSource::File {
+                    src: m.path.clone(),
+                    original_name,
+                }
+            })
+            .collect();
+        Some(sources)
     }
 
     fn book_page_source_for_idx(

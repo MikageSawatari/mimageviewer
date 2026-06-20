@@ -26,6 +26,13 @@
   ジャンプ / `Ctrl+↓↑`=フォルダ移動 (据え置き)。Shift+↓↑ は raw consume_key (動画音量と同流儀、
   `stack_showing_flat` 中のみ stack jump)。
 - **区切り文字**: `settings.stack_separator: char` (既定 `_`、`#[serde(default)]`、永続)。
+- **②製本との連携 (§5)**: 集約グリッドでスタックセルを選択 → ピン本/アクティブ本へ追加すると、
+  `add_grid_selection_to_named_book` の `stack_member_book_sources` がメンバー全部を
+  `BookPageSource::File` へ展開してコピー追加する (Codex P2 対応)。
+- **トグルの有効条件**: `stack_mode_available` は実ディレクトリ表示のときだけ true。
+  `current_folder_last_mtime.is_some()` (= dir 実体のみ Some) で PDF ページ一覧 / ZIP / 検索合成を
+  除外し、Ctrl+F 現在地検索中 (`show_search_bar` / `search_filter` / `search_pending`) も不可
+  (トグルは load_folder 経由で検索フィルタが消えるため) (Codex P2 対応)。
 - **MVP 制限**: スタックモード中の Ctrl+F / facet は集約セル (prefix キー / 代表拡張子) で照合し、
   隠れたメンバー名/メタは未評価。Shift+↓↑ は端で no-op (次フォルダは Ctrl+↓)。breadcrumb は集約=
   フォルダパスのまま。

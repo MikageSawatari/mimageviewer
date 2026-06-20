@@ -6550,6 +6550,73 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn grid_book_add_expands_stack_to_all_members() {
+        // ファイル名スタックの集約セルを選んで本へ追加すると、メンバー全部がコピーされる
+        // (Codex P2 修正: stack_member_book_sources による展開、設計 §5)。
+        use crate::filename_stack::{StackMember, StackView};
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let dir = app.tmp.path().to_path_buf();
+        let root = dir.join("books");
+        let p0 = dir.join("post_p0.jpg");
+        let p1 = dir.join("post_p1.jpg");
+        std::fs::write(&p0, b"member-0").expect("write member 0");
+        std::fs::write(&p1, b"member-1").expect("write member 1");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+
+        // post_p0 / post_p1 = prefix "post" の 2 枚スタック。集約ビューを構築する。
+        let media = vec![
+            StackMember {
+                path: p0.clone(),
+                mtime: 0,
+                size: 8,
+                is_video: false,
+            },
+            StackMember {
+                path: p1.clone(),
+                mtime: 0,
+                size: 8,
+                is_video: false,
+            },
+        ];
+        let sv = StackView::build(
+            dir.clone(),
+            Vec::new(),
+            Vec::new(),
+            media,
+            '_',
+            crate::settings::SortOrder::FileName,
+        );
+        let (items, _metas) = sv.materialize_aggregated();
+        assert!(
+            matches!(items[0], GridItem::Stack { .. }),
+            "集約 items[0] はスタックセル"
+        );
+        app.items = items;
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.stack_view = Some(sv);
+        app.stack_showing_flat = false;
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let outputs = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .map(|entry| entry.expect("book page entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs.len(),
+            2,
+            "スタックの全メンバー (2 枚) が本へ追加される"
+        );
+    }
+
+    #[test]
     fn grid_book_add_burns_rotation_before_copying_to_book() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use image::GenericImageView;

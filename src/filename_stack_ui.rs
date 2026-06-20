@@ -98,10 +98,15 @@ pub(crate) fn stack_video_items(
 }
 
 impl crate::app::App {
-    /// スタックモードのトグルが使える状況か (= 通常フォルダ表示)。
-    /// ZIP ツリー / 検索 / タグ / 読書履歴 / ドライブ一覧などの特殊ビューでは無効。
+    /// スタックモードのトグルが使える状況か (= 実ディレクトリの通常表示)。
+    /// ZIP ツリー / PDF ページ一覧 / 検索 / タグ / 読書履歴 / ドライブ一覧などの特殊・仮想
+    /// ビューでは無効。
     pub(crate) fn stack_mode_available(&self) -> bool {
-        self.current_folder.is_some()
+        // `current_folder_last_mtime` は実ディレクトリのときだけ `Some` (load_folder で
+        // `.filter(|m| m.is_dir())` 済み)。ZIP / PDF / 検索合成は仮想フォルダで常に `None` なので、
+        // これ 1 つで PDF ページ一覧 (current_folder が PDF ファイルを指す) を確実に除外できる。
+        self.current_folder_last_mtime.is_some()
+            && self.current_folder.is_some()
             && self.zip_nav.is_none()
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
@@ -110,6 +115,11 @@ impl crate::app::App {
             && !self.global_search.active
             && !self.favsearch.active
             && !self.tag_view.active
+            // Ctrl+F (現在地フィルタ) 中はトグル不可: トグルは load_folder 経由なので
+            // search_filter / search_query が消えてしまうため。
+            && !self.show_search_bar
+            && self.search_filter.is_none()
+            && self.search_pending.is_none()
     }
 
     /// スタックモードが ON か。トグルボタンの選択状態表示に使う。
