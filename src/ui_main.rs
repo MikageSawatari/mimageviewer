@@ -3465,13 +3465,18 @@ impl App {
         let tb_sorts = self.settings.toolbar_sort_items.clone();
         let toolbar_details_visible = self.settings.toolbar_cols_details_visible;
         let details_mode = self.settings.grid_view_mode == GridViewMode::Details;
-        let show_cols = !tb_cols.is_empty() || toolbar_details_visible;
+        // v2.0.0: 各セクションに明示的な表示フラグ (show_toolbar_*) を持たせ、空き領域
+        // 右クリックの表示チェックリストから ON/OFF できる。最終表示可否は
+        // 「フラグ AND 描ける項目がある」。フラグ既定 true なので旧挙動 (項目で決まる) と同じ。
+        let show_cols =
+            self.settings.show_toolbar_cols && (!tb_cols.is_empty() || toolbar_details_visible);
         // 比率セクション: 手動 7 種を全部外しても「自動」だけ ON なら表示する
         // (Codex P3 2026-05)。`toolbar_aspect_auto_visible` は別フラグなので
         // tb_aspects 空 + auto_visible で section が消える事故を防ぐ。
-        let show_aspect =
-            !details_mode && (self.settings.toolbar_aspect_auto_visible || !tb_aspects.is_empty());
-        let show_sort = !tb_sorts.is_empty();
+        let show_aspect = self.settings.show_toolbar_aspect
+            && !details_mode
+            && (self.settings.toolbar_aspect_auto_visible || !tb_aspects.is_empty());
+        let show_sort = self.settings.show_toolbar_sort && !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;

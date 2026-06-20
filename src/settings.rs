@@ -2081,6 +2081,23 @@ pub struct Settings {
     /// `ToolbarSectionId::ordered_with_fallback` で未登録セクションを補完する。
     #[serde(default)]
     pub toolbar_section_order: Vec<ToolbarSectionId>,
+    /// ツールバーに「列」セクションを表示する (v2.0.0)。
+    /// 旧来は `toolbar_cols_items` が空 (かつ詳細も非表示) = 非表示だったが、統一
+    /// カスタマイズで明示的な表示フラグを持たせ、空き領域右クリックの表示チェック
+    /// リストから切替える。最終的な表示可否は「このフラグ AND 項目が 1 つ以上ある」。
+    #[serde(default = "default_true")]
+    pub show_toolbar_cols: bool,
+    /// ツールバーに「比率」セクションを表示する (v2.0.0)。
+    #[serde(default = "default_true")]
+    pub show_toolbar_aspect: bool,
+    /// ツールバーに「ソート」セクションを表示する (v2.0.0)。
+    #[serde(default = "default_true")]
+    pub show_toolbar_sort: bool,
+    /// 「行頭に表示」= そのセクションの前で改行するセクション集合 (v2.0.0)。
+    /// 自動折返し (horizontal_wrapped) に加え、ユーザーが行区切りを固定できる。
+    /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
+    #[serde(default)]
+    pub toolbar_section_new_row: Vec<ToolbarSectionId>,
 
     // ── フォルダサムネイル ──────────────────────────────────────
     /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
@@ -3231,6 +3248,10 @@ impl Default for Settings {
             toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_section_order: Vec::new(),
+            show_toolbar_cols: true,
+            show_toolbar_aspect: true,
+            show_toolbar_sort: true,
+            toolbar_section_new_row: Vec::new(),
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
@@ -4465,6 +4486,35 @@ impl Settings {
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
+        // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
+        // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
+        // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
+        // 全て live (= App 側) の値を引き継ぐ。
+        self.show_toolbar_cols = src.show_toolbar_cols;
+        self.show_toolbar_aspect = src.show_toolbar_aspect;
+        self.show_toolbar_sort = src.show_toolbar_sort;
+        self.show_toolbar_favorites = src.show_toolbar_favorites;
+        self.show_toolbar_tags = src.show_toolbar_tags;
+        self.show_toolbar_folder_tree_button = src.show_toolbar_folder_tree_button;
+        self.show_toolbar_bookshelf = src.show_toolbar_bookshelf;
+        self.show_toolbar_rating = src.show_toolbar_rating;
+        self.show_toolbar_facet_filter = src.show_toolbar_facet_filter;
+        self.toolbar_cols_display = src.toolbar_cols_display;
+        self.toolbar_aspect_display = src.toolbar_aspect_display;
+        self.toolbar_sort_display = src.toolbar_sort_display;
+        self.toolbar_favorites_display = src.toolbar_favorites_display;
+        self.toolbar_tags_display = src.toolbar_tags_display;
+        self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
+        self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
+        self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
+        self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
+        self.toolbar_cols_items = std::mem::take(&mut src.toolbar_cols_items);
+        self.toolbar_cols_details_visible = src.toolbar_cols_details_visible;
+        self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
+        self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
+        self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
+        self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
+        self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
         // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
@@ -4745,6 +4795,21 @@ mod tests {
                 ToolbarSectionId::Unknown,
                 ToolbarSectionId::Tags,
             ]
+        );
+    }
+
+    #[test]
+    fn show_toolbar_cols_aspect_sort_default_true_when_missing() {
+        // v2.0.0 で追加した表示フラグは、旧 settings JSON (フィールド無し) を読んだとき
+        // `default_true` で true になる。false にすると既存ユーザーで列/比率/ソートが
+        // 消える退行になるため、欠落 = 表示 (true) を担保する。
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.show_toolbar_cols);
+        assert!(s.show_toolbar_aspect);
+        assert!(s.show_toolbar_sort);
+        assert!(
+            s.toolbar_section_new_row.is_empty(),
+            "新規 new_row 集合は欠落時 空"
         );
     }
 
@@ -6741,6 +6806,10 @@ mod tests {
             s.pinned_books = vec!["テスト本".to_string()];
             s.show_toolbar_bookshelf = false;
             s.show_toolbar_facet_filter = false;
+            s.show_toolbar_cols = false;
+            s.show_toolbar_aspect = false;
+            s.show_toolbar_sort = false;
+            s.toolbar_section_new_row = vec![ToolbarSectionId::Tags, ToolbarSectionId::Favorites];
             s.ring_shortcuts.mouse_flick_enabled = true;
             s.ring_shortcuts.gamepad_ring_enabled = false;
             s.ring_shortcuts.shift_wheel_pair =
@@ -6957,6 +7026,17 @@ mod tests {
             assert!(
                 !loaded.show_toolbar_facet_filter,
                 "show_toolbar_facet_filter (false override) should survive roundtrip"
+            );
+            assert!(
+                !loaded.show_toolbar_cols
+                    && !loaded.show_toolbar_aspect
+                    && !loaded.show_toolbar_sort,
+                "show_toolbar_cols/aspect/sort (false override) should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_section_new_row,
+                vec![ToolbarSectionId::Tags, ToolbarSectionId::Favorites],
+                "toolbar_section_new_row should survive roundtrip"
             );
             assert!(
                 loaded.ring_shortcuts.mouse_flick_enabled,
