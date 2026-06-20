@@ -2948,6 +2948,9 @@ pub struct App {
     pub(crate) mouse_ring_nav: Option<crate::ui_main::AddressBarNav>,
     /// 既存ユーザー向け: マウス戻る/進むボタンの既定変更を一度だけ確認する。
     pub(crate) show_mouse_nav_migration_prompt: bool,
+    /// ツールバーを既定に戻す前の確認ダイアログ (v2.0.0)。影響が大きい操作なので
+    /// 右クリックメニューからは外し、「設定→ツールバー」でのみこの確認を経て実行する。
+    pub(crate) show_toolbar_reset_confirm: bool,
     /// 更新後 初回起動の「重要な変更点」ダイアログ (v2.0.0、version_highlights ④)。
     pub(crate) show_whats_new: bool,
     /// 表示する変更点エントリ (起動時の version またぎ / ヘルプ再表示で算出)。非永続。
@@ -5432,6 +5435,7 @@ impl App {
             mouse_ring_suppress_context_menu_once: false,
             mouse_ring_nav: None,
             show_mouse_nav_migration_prompt,
+            show_toolbar_reset_confirm: false,
             show_whats_new,
             whats_new_entries,
             fs_secondary_press_start: None,
@@ -6924,6 +6928,7 @@ impl App {
             || self.show_preferences
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
+            || self.show_toolbar_reset_confirm
             || self.show_cache_manager
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
@@ -6964,6 +6969,7 @@ impl App {
             || self.show_preferences
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
+            || self.show_toolbar_reset_confirm
             || self.show_cache_manager
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
@@ -36404,6 +36410,7 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_whats_new_dialog(ctx);
+        self.show_toolbar_reset_confirm_dialog(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
         if !main_viewer_blocked {
             self.draw_export_dialog(ctx);

@@ -2217,8 +2217,9 @@ impl App {
                     // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
                     // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
                     // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                    // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
                     ui.menu_button("ツールバー", |ui| {
-                        self.draw_toolbar_visibility_menu(ui);
+                        self.draw_toolbar_visibility_menu(ui, true);
                     });
                     if ui.button("環境設定…").clicked() {
                         self.show_preferences = true;
@@ -4554,10 +4555,11 @@ impl App {
             });
             // 次フレームの背景 interact 用に content rect を記録する。
             self.toolbar_content_rect = Some(scope_resp.response.rect);
-            // 空き領域 右クリック → セクション表示 ON/OFF + 並び順リセットのメニュー。
+            // 空き領域 右クリック → セクション表示 ON/OFF メニュー。「既定に戻す」は影響が
+            // 大きく取り消せないので、ここ (右クリック) には出さない (show_reset=false)。
             if let Some(bg) = bg_resp {
                 bg.context_menu(|ui| {
-                    self.draw_toolbar_visibility_menu(ui);
+                    self.draw_toolbar_visibility_menu(ui, false);
                 });
             }
             ui.add_space(2.0);
@@ -4655,7 +4657,10 @@ impl App {
     /// ツールバーの空き領域 右クリックメニュー (v2.0.0 Phase 3, §1.2 / §5)。
     /// 各セクションの表示 ON/OFF と「ツールバーを既定に戻す」を提供する。
     /// 環境設定のツールバーページに代わるカスタマイズ入口。
-    fn draw_toolbar_visibility_menu(&mut self, ui: &mut egui::Ui) {
+    /// 空き領域 右クリック / 「設定→ツールバー」共通の表示チェックリスト。
+    /// `show_reset` = 「ツールバーを既定に戻す」を出すか。影響が大きい操作なので、右クリック
+    /// メニュー (空き領域) では出さず、「設定→ツールバー」でのみ出す + 実行前に確認を挟む。
+    fn draw_toolbar_visibility_menu(&mut self, ui: &mut egui::Ui, show_reset: bool) {
         ui.label("表示するセクション");
         ui.separator();
         let s = &mut self.settings;
@@ -4722,21 +4727,60 @@ impl App {
             )
             .changed();
 
-        ui.separator();
-        if ui
-            .button("ツールバーを既定に戻す")
-            .on_hover_text("セクションの表示・並び順・表示形式・出す項目をすべて初期状態に戻します")
-            .clicked()
-        {
-            self.reset_toolbar_customization();
-            ui.close();
-            ui.ctx().request_repaint();
-            return;
+        // 「ツールバーを既定に戻す」は影響が大きく取り消せないので、右クリック (空き領域) には
+        // 出さず、「設定→ツールバー」(show_reset=true) でのみ出す。実行は確認ダイアログ経由。
+        if show_reset {
+            ui.separator();
+            if ui
+                .button("ツールバーを既定に戻す…")
+                .on_hover_text(
+                    "セクションの表示・並び順・表示形式・出す項目をすべて初期状態に戻します",
+                )
+                .clicked()
+            {
+                self.show_toolbar_reset_confirm = true;
+                ui.close();
+            }
         }
 
         if changed {
             self.settings.save();
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// 「ツールバーを既定に戻す」確認ダイアログ (v2.0.0)。`設定→ツールバー` からのみ起動。
+    pub(crate) fn show_toolbar_reset_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_toolbar_reset_confirm {
+            return;
+        }
+        let mut open = true;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        egui::Window::new("ツールバーを既定に戻す")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(dialog_pos)
+            .show(ctx, |ui| {
+                ui.label(
+                    "ツールバーのセクションの表示・並び順・表示形式・出す項目を\nすべて初期状態に戻します。",
+                );
+                ui.label("カスタマイズした内容は失われます。");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("既定に戻す").clicked() {
+                        self.reset_toolbar_customization();
+                        self.show_toolbar_reset_confirm = false;
+                        ui.ctx().request_repaint();
+                    }
+                    if ui.button("キャンセル").clicked() || escape_pressed {
+                        self.show_toolbar_reset_confirm = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_toolbar_reset_confirm = false;
         }
     }
 
@@ -4986,12 +5030,8 @@ impl App {
             ui.close();
             return;
         }
-        if ui.button("ツールバーを既定に戻す").clicked() {
-            self.reset_toolbar_customization();
-            ui.ctx().request_repaint();
-            ui.close();
-            return;
-        }
+        // 「ツールバーを既定に戻す」は影響が大きいので、ここ (項目右クリック) には出さない。
+        // 「設定→ツールバー」からのみ、確認ダイアログを経て実行する (実機フィードバック)。
 
         if changed {
             self.settings.save();
