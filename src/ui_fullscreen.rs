@@ -1870,9 +1870,9 @@ impl App {
             .input(|i| i.pointer.hover_pos())
             .unwrap_or_else(|| image_rect.center());
         let no_limits = FullscreenFitScaleLimits::default();
-        let bg_style = self.fs_bg_style(ctx);
         let Some(tex_size) = tex_size else {
             // テクスチャ未ロード: 通常のプレースホルダ描画へ委ねる。
+            let bg_style = self.fs_bg_style(ctx);
             Self::draw_fs_image(
                 ui,
                 image_rect,
@@ -1899,9 +1899,26 @@ impl App {
             }
             _ => tex_size,
         };
+        // 表示トリムが有効ならパン対象をトリム後 bbox に絞る (切り落とした余白へパンしない、Phase D)。
+        // 回転ページは draw_fs_image 側で bbox を使わないので通常どおり全体を対象にする。
+        // mut 借用 (view_trim_single_content_bbox) を bg_style の immutable 借用より前に済ませる。
+        let (content_min, content_size) = match rotation
+            .is_none()
+            .then(|| self.view_trim_single_content_bbox(fs_idx))
+            .flatten()
+        {
+            Some(bbox) => (
+                egui::vec2(bbox.min.x * display_size.x, bbox.min.y * display_size.y),
+                egui::vec2(
+                    (bbox.width() * display_size.x).max(1.0),
+                    (bbox.height() * display_size.y).max(1.0),
+                ),
+            ),
+            None => (egui::Vec2::ZERO, display_size),
+        };
         // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
-        // そこへ入る前に画像の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。左右は
-        // ズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
+        // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
+        // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
         let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
         let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
         let pan_band = egui::Rect::from_min_max(
@@ -1909,10 +1926,17 @@ impl App {
             egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
         );
         // 照準枠とズームパンで共通のカーソル→画像写像を使う (両者の表示範囲を一致させる)。
-        let cursor_img = zip_cursor_image_px(pan_band, display_size, cursor);
+        let cursor_img = zip_cursor_image_px(pan_band, content_min, content_size, cursor);
+        let bg_style = self.fs_bg_style(ctx);
         if active {
-            let (zoom, pan) =
-                zip_cover_zoom_pan(image_rect.size(), display_size, factor, cursor_img);
+            let (zoom, pan) = zip_cover_zoom_pan(
+                image_rect.size(),
+                display_size,
+                content_min,
+                content_size,
+                factor,
+                cursor_img,
+            );
             Self::draw_fs_image(
                 ui,
                 image_rect,
@@ -1931,6 +1955,9 @@ impl App {
                 no_limits,
                 None,
             );
+            // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。
+            // request_pdf_rerender は同解像度キャッシュがあれば早期 return するので毎フレ呼んでも安全。
+            self.maybe_rerender_pdf(zoom);
         } else {
             // 照準: 全体を contain 表示してズーム範囲の枠を重ねる。
             Self::draw_fs_image(
@@ -1951,7 +1978,14 @@ impl App {
                 no_limits,
                 None,
             );
-            let frame = zip_aim_frame_rect(image_rect, display_size, factor, cursor_img);
+            let frame = zip_aim_frame_rect(
+                image_rect,
+                display_size,
+                content_min,
+                content_size,
+                factor,
+                cursor_img,
+            );
             let painter = ui.painter().with_clip_rect(image_rect);
             let dim = egui::Color32::from_black_alpha(120);
             for r in capture_region_outside_rects(image_rect, frame) {
@@ -2212,88 +2246,111 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
-/// カーソルを「パン操作帯 (`band`)」基準で画像ピクセル座標 (`[0, image]`) へ写す。`band` は
-/// 画面からホバーバー領域 (上下) を差し引いた矩形で、**カーソルが band の端に達した時点で
-/// 画像の端まで到達**する (= 上下のホバー領域に入る前に上端・下端まで見られる。実機 FB
-/// 2026-06-21)。照準枠とズーム中パンで同じ写像を使い、両者の表示範囲を一致させる。
-fn zip_cursor_image_px(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
-    if image.x <= 0.0 || image.y <= 0.0 {
-        return egui::vec2(image.x * 0.5, image.y * 0.5);
-    }
+/// カーソルを「パン操作帯 (`band`)」基準で、パン対象のコンテンツ領域
+/// (`content_min`..`content_min + content_size`、画像ピクセル) へ写す。`band` は画面から
+/// ホバーバー領域 (上下) を差し引いた矩形で、**カーソルが band の端に達した時点でコンテンツ
+/// 領域の端まで到達**する (= 上下のホバー領域に入る前に端まで見られる。実機 FB 2026-06-21)。
+/// 表示トリム時は content をトリム後 bbox にすることで切り落とした余白へパンしない。通常は
+/// content = (0, display_size)。照準枠とズーム中パンで同じ写像を使い、両者の表示範囲を一致させる。
+fn zip_cursor_image_px(
+    band: egui::Rect,
+    content_min: egui::Vec2,
+    content_size: egui::Vec2,
+    cursor: egui::Pos2,
+) -> egui::Vec2 {
     let nx = ((cursor.x - band.left()) / band.width().max(1.0)).clamp(0.0, 1.0);
     let ny = ((cursor.y - band.top()) / band.height().max(1.0)).clamp(0.0, 1.0);
-    egui::vec2(nx * image.x, ny * image.y)
+    content_min + egui::vec2(nx * content_size.x, ny * content_size.y)
 }
 
-/// ズーム中に画面へ映る元画像範囲 (画像ピクセル) と表示中心 (画像ピクセル, 範囲が画像外へ
-/// 出ないよう clamp 済み) を返す。照準枠・ズームパンの共通土台。
+/// コンテンツ領域 (`content_size`) を cover する倍率 × `factor` で、画面に映る範囲サイズ (画像
+/// ピクセル) と、その中心 (コンテンツ領域内へ clamp 済み・`content_min` 相対) を返す。
+/// 照準枠・ズームパンの共通土台。
 fn zip_visible_src(
     view: egui::Vec2,
-    image: egui::Vec2,
+    content_size: egui::Vec2,
     factor: f32,
-    cursor_img: egui::Vec2,
+    cursor_in_content: egui::Vec2,
 ) -> (egui::Vec2, egui::Vec2) {
-    let cover = (view.x / image.x).max(view.y / image.y);
+    let cover = (view.x / content_size.x.max(1.0)).max(view.y / content_size.y.max(1.0));
     let total = (cover * factor.max(1.0)).max(f32::EPSILON);
-    let vis_w = (view.x / total).min(image.x);
-    let vis_h = (view.y / total).min(image.y);
-    let cx = cursor_img
+    let vis_w = (view.x / total).min(content_size.x);
+    let vis_h = (view.y / total).min(content_size.y);
+    let cx = cursor_in_content
         .x
-        .clamp(vis_w / 2.0, (image.x - vis_w / 2.0).max(vis_w / 2.0));
-    let cy = cursor_img
+        .clamp(vis_w / 2.0, (content_size.x - vis_w / 2.0).max(vis_w / 2.0));
+    let cy = cursor_in_content
         .y
-        .clamp(vis_h / 2.0, (image.y - vis_h / 2.0).max(vis_h / 2.0));
+        .clamp(vis_h / 2.0, (content_size.y - vis_h / 2.0).max(vis_h / 2.0));
     (egui::vec2(vis_w, vis_h), egui::vec2(cx, cy))
 }
 
-/// ZipPla 風全画面ズーム: cover 倍率 × `factor` の表示を `draw_fs_image` の `zoom_pan`
-/// (= ページ全体フィットに対する倍率, パン) として返す。`cursor_img` (画像ピクセル, `[0,image]`
-/// へ clamp 済み) を表示範囲の中心にし、表示範囲が画像外へ出ないよう中心を clamp する (= 余白なし)。
+/// ZipPla 風全画面ズーム: コンテンツ領域 (`content_min`/`content_size`、表示トリム時は bbox、
+/// 通常は `(0, display_size)`) を cover する倍率 × `factor` を、`draw_fs_image` の `zoom_pan`
+/// (= ページ全体フィット `display_size` に対する倍率, パン) として返す。表示範囲はコンテンツ
+/// 領域内へ clamp する (= 余白 / 切り落とした領域を見せない)。
 fn zip_cover_zoom_pan(
     view: egui::Vec2,
-    image: egui::Vec2,
+    display_size: egui::Vec2,
+    content_min: egui::Vec2,
+    content_size: egui::Vec2,
     factor: f32,
     cursor_img: egui::Vec2,
 ) -> (f32, egui::Vec2) {
-    if image.x <= 0.0 || image.y <= 0.0 || view.x <= 0.0 || view.y <= 0.0 {
+    if display_size.x <= 0.0
+        || display_size.y <= 0.0
+        || content_size.x <= 0.0
+        || content_size.y <= 0.0
+        || view.x <= 0.0
+        || view.y <= 0.0
+    {
         return (1.0, egui::Vec2::ZERO);
     }
-    let page_fit = (view.x / image.x).min(view.y / image.y);
-    let cover = (view.x / image.x).max(view.y / image.y);
+    let page_fit = (view.x / display_size.x).min(view.y / display_size.y);
+    let cover = (view.x / content_size.x).max(view.y / content_size.y);
     let total = cover * factor.max(1.0);
     let zoom = if page_fit > 0.0 {
         total / page_fit
     } else {
         1.0
     };
-    let (_vis, center) = zip_visible_src(view, image, factor, cursor_img);
+    let (_vis, center_rel) = zip_visible_src(view, content_size, factor, cursor_img - content_min);
+    let center_img = content_min + center_rel;
     // 表示中心 (画像ピクセル) を画面中心へ寄せる pan (スクリーン座標)。
     let pan = egui::vec2(
-        (image.x / 2.0 - center.x) * total,
-        (image.y / 2.0 - center.y) * total,
+        (display_size.x / 2.0 - center_img.x) * total,
+        (display_size.y / 2.0 - center_img.y) * total,
     );
     (zoom, pan)
 }
 
-/// 照準 (Z 押下中) で表示する枠のスクリーン矩形。画像はページ全体フィット (contain) で
-/// 表示している前提で、`cursor_img` を中心 (画像範囲内へ clamp) にズーム範囲を描く。
+/// 照準 (Z 押下中) で表示する枠のスクリーン矩形。画像はページ全体フィット (contain、
+/// `display_size`) で表示している前提で、コンテンツ領域内の表示範囲を枠として描く。
 /// 離した瞬間の `zip_cover_zoom_pan` の表示範囲と完全に一致する。
 fn zip_aim_frame_rect(
     view_rect: egui::Rect,
-    image: egui::Vec2,
+    display_size: egui::Vec2,
+    content_min: egui::Vec2,
+    content_size: egui::Vec2,
     factor: f32,
     cursor_img: egui::Vec2,
 ) -> egui::Rect {
-    if image.x <= 0.0 || image.y <= 0.0 {
+    if display_size.x <= 0.0 || display_size.y <= 0.0 {
         return view_rect;
     }
-    let fit = (view_rect.width() / image.x).min(view_rect.height() / image.y);
-    let disp = egui::vec2(image.x * fit, image.y * fit);
+    let fit = (view_rect.width() / display_size.x).min(view_rect.height() / display_size.y);
+    let disp = egui::vec2(display_size.x * fit, display_size.y * fit);
     let disp_rect = egui::Rect::from_center_size(view_rect.center(), disp);
-    let (vis, center) = zip_visible_src(view_rect.size(), image, factor, cursor_img);
+    let (vis, center_rel) = zip_visible_src(
+        view_rect.size(),
+        content_size,
+        factor,
+        cursor_img - content_min,
+    );
+    let center_img = content_min + center_rel;
     let min = egui::pos2(
-        disp_rect.left() + (center.x - vis.x / 2.0) * fit,
-        disp_rect.top() + (center.y - vis.y / 2.0) * fit,
+        disp_rect.left() + (center_img.x - vis.x / 2.0) * fit,
+        disp_rect.top() + (center_img.y - vis.y / 2.0) * fit,
     );
     egui::Rect::from_min_size(min, egui::vec2(vis.x * fit, vis.y * fit))
 }
@@ -16306,6 +16363,22 @@ mod tests {
     use crate::grid_item::GridItem;
     use std::path::PathBuf;
 
+    // テスト用ラッパ: コンテンツ領域 = 画像全体 (トリムなし) で zoom helper を呼ぶ。
+    fn tz_pan(
+        view: egui::Vec2,
+        image: egui::Vec2,
+        factor: f32,
+        cursor: egui::Vec2,
+    ) -> (f32, egui::Vec2) {
+        zip_cover_zoom_pan(view, image, egui::Vec2::ZERO, image, factor, cursor)
+    }
+    fn tz_aim(view: egui::Rect, image: egui::Vec2, factor: f32, cursor: egui::Vec2) -> egui::Rect {
+        zip_aim_frame_rect(view, image, egui::Vec2::ZERO, image, factor, cursor)
+    }
+    fn tz_cursor(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
+        zip_cursor_image_px(band, egui::Vec2::ZERO, image, cursor)
+    }
+
     #[test]
     fn zip_cover_zoom_factor_one_fills_screen_no_margin() {
         // 横長画像 (400x200) を 300x300 のビューに cover 表示すると、factor=1 でも画面を覆い、
@@ -16313,15 +16386,15 @@ mod tests {
         let view = egui::vec2(300.0, 300.0);
         let image = egui::vec2(400.0, 200.0);
         // cover = max(300/400, 300/200) = 1.5。中央 (200,100)。
-        let (zoom_c, pan_c) = zip_cover_zoom_pan(view, image, 1.0, egui::vec2(200.0, 100.0));
+        let (zoom_c, pan_c) = tz_pan(view, image, 1.0, egui::vec2(200.0, 100.0));
         assert!(zoom_c > 0.0);
         assert!(pan_c.length() < 0.01, "中央ではパン 0");
         // 左端 (画像 x=0)。vis_w=300/1.5=200、cx=clamp(0,100,300)=100、pan_x=(200-100)*1.5=150。
-        let (_z, pan_left) = zip_cover_zoom_pan(view, image, 1.0, egui::vec2(0.0, 100.0));
+        let (_z, pan_left) = tz_pan(view, image, 1.0, egui::vec2(0.0, 100.0));
         assert!((pan_left.x - 150.0).abs() < 0.01, "左端で +pan");
         assert!(pan_left.y.abs() < 0.01, "縦はパン不可");
         // 右端 (画像 x=400)。cx=clamp(400,100,300)=300、pan_x=(200-300)*1.5=-150。
-        let (_z, pan_right) = zip_cover_zoom_pan(view, image, 1.0, egui::vec2(400.0, 100.0));
+        let (_z, pan_right) = tz_pan(view, image, 1.0, egui::vec2(400.0, 100.0));
         assert!((pan_right.x + 150.0).abs() < 0.01, "右端で -pan");
     }
 
@@ -16330,15 +16403,15 @@ mod tests {
         let view = egui::vec2(300.0, 300.0);
         let image = egui::vec2(400.0, 200.0);
         let center = egui::vec2(200.0, 100.0);
-        let (zoom1, _) = zip_cover_zoom_pan(view, image, 1.0, center);
-        let (zoom2, _) = zip_cover_zoom_pan(view, image, 2.0, center);
+        let (zoom1, _) = tz_pan(view, image, 1.0, center);
+        let (zoom2, _) = tz_pan(view, image, 2.0, center);
         assert!(
             (zoom2 - zoom1 * 2.0).abs() < 0.001,
             "factor 2 で zoom 倍率も 2 倍"
         );
         // factor=2: total=3.0, vis_h=300/3=100。上端 (画像 y=0): cy=clamp(0,50,150)=50、
         // pan_y=(100-50)*3=150。
-        let (_z, pan_top) = zip_cover_zoom_pan(view, image, 2.0, egui::vec2(200.0, 0.0));
+        let (_z, pan_top) = tz_pan(view, image, 2.0, egui::vec2(200.0, 0.0));
         assert!((pan_top.y - 150.0).abs() < 0.01, "拡大で縦もパン可能に");
     }
 
@@ -16347,8 +16420,8 @@ mod tests {
         let view = egui::vec2(300.0, 300.0);
         let image = egui::vec2(400.0, 200.0);
         let center = egui::vec2(200.0, 100.0);
-        let (zoom_half, _) = zip_cover_zoom_pan(view, image, 0.5, center);
-        let (zoom_one, _) = zip_cover_zoom_pan(view, image, 1.0, center);
+        let (zoom_half, _) = tz_pan(view, image, 0.5, center);
+        let (zoom_one, _) = tz_pan(view, image, 1.0, center);
         assert!(
             (zoom_half - zoom_one).abs() < 0.001,
             "factor<1 は cover (1.0) に clamp"
@@ -16357,7 +16430,7 @@ mod tests {
 
     #[test]
     fn zip_cover_zoom_handles_degenerate_sizes() {
-        let (zoom, pan) = zip_cover_zoom_pan(
+        let (zoom, pan) = tz_pan(
             egui::Vec2::ZERO,
             egui::vec2(10.0, 10.0),
             2.0,
@@ -16365,7 +16438,7 @@ mod tests {
         );
         assert_eq!(zoom, 1.0);
         assert_eq!(pan, egui::Vec2::ZERO);
-        let (zoom2, _) = zip_cover_zoom_pan(
+        let (zoom2, _) = tz_pan(
             egui::vec2(10.0, 10.0),
             egui::Vec2::ZERO,
             2.0,
@@ -16375,20 +16448,42 @@ mod tests {
     }
 
     #[test]
+    fn zip_cover_zoom_pans_within_trim_bbox_only() {
+        // Phase D: content をトリム後 bbox に絞ると、表示中心が bbox 内へ clamp され、余白へ
+        // パンしない。display 400x400、bbox = 中央 200x200 (min (100,100))。
+        let view = egui::vec2(300.0, 300.0);
+        let display = egui::vec2(400.0, 400.0);
+        let content_min = egui::vec2(100.0, 100.0);
+        let content_size = egui::vec2(200.0, 200.0);
+        // カーソルを画像左上 (0,0) へ向けても、表示中心は bbox 内 (>= content_min) に留まる。
+        let (_zoom, pan) = zip_cover_zoom_pan(
+            view,
+            display,
+            content_min,
+            content_size,
+            4.0,
+            egui::vec2(0.0, 0.0),
+        );
+        // cover(bbox)=300/200=1.5、total=6.0、vis=300/6=50。center=clamp(0,25,175)=25 (bbox 相対) →
+        // center_img=125。pan=(200-125)*6=450。これは bbox 内 (余白 (<100) を見せない) を意味する。
+        assert!((pan.x - 450.0).abs() < 0.5 && (pan.y - 450.0).abs() < 0.5);
+    }
+
+    #[test]
     fn zip_cursor_image_px_maps_band_to_image_and_clamps() {
         // band (パン操作帯) の端でちょうど画像の端へ到達する写像。
         let band = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
         let image = egui::vec2(400.0, 200.0);
         // band 中央 → 画像中央。
-        let c = zip_cursor_image_px(band, image, band.center());
+        let c = tz_cursor(band, image, band.center());
         assert!((c.x - 200.0).abs() < 0.01 && (c.y - 100.0).abs() < 0.01);
         // band 上端 (y=0) → 画像 y=0、band 下端 (y=300) → 画像 y=200。
-        let top = zip_cursor_image_px(band, image, egui::pos2(150.0, 0.0));
+        let top = tz_cursor(band, image, egui::pos2(150.0, 0.0));
         assert!((top.y - 0.0).abs() < 0.01, "band 上端で画像上端");
-        let bottom = zip_cursor_image_px(band, image, egui::pos2(150.0, 300.0));
+        let bottom = tz_cursor(band, image, egui::pos2(150.0, 300.0));
         assert!((bottom.y - 200.0).abs() < 0.01, "band 下端で画像下端");
         // band 外 (-50,-50) → [0,image] へ clamp。
-        let outside = zip_cursor_image_px(band, image, egui::pos2(-50.0, -50.0));
+        let outside = tz_cursor(band, image, egui::pos2(-50.0, -50.0));
         assert!(outside.x >= 0.0 && outside.y >= 0.0);
     }
 
@@ -16404,10 +16499,10 @@ mod tests {
             egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
         );
         // カーソルが上部ホバー帯の下端 (y=top_m) に来た時点で画像上端へ到達している。
-        let at_band_top = zip_cursor_image_px(band, image, egui::pos2(150.0, top_m));
+        let at_band_top = tz_cursor(band, image, egui::pos2(150.0, top_m));
         assert!((at_band_top.y - 0.0).abs() < 0.01);
         // カーソルが上部ホバー帯内 (y < top_m) でも画像上端で saturate (それ以上戻らない)。
-        let inside_hover = zip_cursor_image_px(band, image, egui::pos2(150.0, top_m * 0.5));
+        let inside_hover = tz_cursor(band, image, egui::pos2(150.0, top_m * 0.5));
         assert!((inside_hover.y - 0.0).abs() < 0.01);
     }
 
@@ -16420,9 +16515,9 @@ mod tests {
         let factor = 2.0;
         // contain 上端付近を指す (レターボックスでズレやすい点)。
         let cursor = egui::pos2(150.0, 80.0);
-        let cursor_img = zip_cursor_image_px(view_rect, image, cursor);
-        let frame = zip_aim_frame_rect(view_rect, image, factor, cursor_img);
-        let (zoom, pan) = zip_cover_zoom_pan(view_rect.size(), image, factor, cursor_img);
+        let cursor_img = tz_cursor(view_rect, image, cursor);
+        let frame = tz_aim(view_rect, image, factor, cursor_img);
+        let (zoom, pan) = tz_pan(view_rect.size(), image, factor, cursor_img);
         // ズーム時、枠の画像範囲が画面いっぱい (view_rect) に写ることを検算する。
         // contain fit と total scale。
         let fit = (view_rect.width() / image.x).min(view_rect.height() / image.y);
@@ -16456,8 +16551,8 @@ mod tests {
         let image = egui::vec2(400.0, 200.0);
         // contain fit = 0.75。表示画像 = 300x150、中央 (y:75..225)。中央を指す。
         let cursor_img = egui::vec2(200.0, 100.0);
-        let f1 = zip_aim_frame_rect(view, image, 1.0, cursor_img);
-        let f2 = zip_aim_frame_rect(view, image, 2.0, cursor_img);
+        let f1 = tz_aim(view, image, 1.0, cursor_img);
+        let f2 = tz_aim(view, image, 2.0, cursor_img);
         assert!(
             f2.width() < f1.width() && f2.height() < f1.height(),
             "factor が大きいほど枠は小さい"
