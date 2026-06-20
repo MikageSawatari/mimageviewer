@@ -1,18 +1,19 @@
 //! ファイル名 prefix スタック (v2.0.0、`docs/filename-stack-plan.md`) の App 側グルー。
 //!
 //! 純グループ化ロジックは [`crate::filename_stack`]。ここはそれを `App` の状態
-//! (`stack_view` / `stack_mode_requested`) とビュー (`self.items`) に橋渡しする。
+//! (`stack_view` / `stack_mode_requested` / `stack_showing_flat`) とビュー (`self.items`) に橋渡しする。
 //!
-//! ビューは 3 段:
-//! - **集約** (drilled=None): 1 グループ = 1 セル。複数枚画像はスタックセル + バッジ、単独は
-//!   通常 Image/Video セル。コンテナ (フォルダ/ZIP/PDF) は先頭に素通し表示。
-//! - **メンバーグリッド** (drilled=Some): スタックをクリックで展開。メンバーは実 Image セルで、
-//!   通常のフルスクリーン読書・★・タグ・チェック・D&D がそのまま効く。
-//! - **フルスクリーン**: メンバーグリッドから通常どおり開く (本フェーズでは特別な配線なし)。
+//! ビューは 2 段 (メンバーグリッドは設けない。1 枚スタックの割合が高く中間グリッドが煩雑なため):
+//! - **集約グリッド** (`stack_showing_flat=false`): 1 グループ = 1 セル。複数枚画像はスタックセル +
+//!   バッジ、単独は通常 Image/Video セル。コンテナ (フォルダ/ZIP/PDF) は先頭に素通し表示。
+//! - **フラット読書フルスクリーン** (`stack_showing_flat=true`): セルを開くと `self.items` を全画像
+//!   展開 (materialize_flat) に差し替えてフルスクリーンへ。`↓↑` は境界を越えて順送り、`Shift+↓↑` で
+//!   次/前のスタック先頭へジャンプ、`Ctrl+↓↑` はフォルダ移動 (据え置き)。閉じると
+//!   `stack_reconcile_after_fullscreen_close` が集約グリッドへ戻す。
 //!
-//! 構築は `load_folder_with_scan` の hook 経由 (集約ビューは start_loading_items が動画
-//! サムネスレッドを起動するため必ずフォルダ読込を通す)。メンバーグリッドへのドリルは
-//! in-memory (`install_new_items`)、集約への戻りは同一フォルダ再読込で行う。
+//! 集約グリッドの構築は `load_folder_with_scan` の hook 経由 (start_loading_items が動画サムネ
+//! スレッドを起動するため必ずフォルダ読込を通す)。集約⇔フラットの切替は in-memory
+//! (`swap_stack_view_items` = install_new_items + 軽量ビュー切替後始末)。
 
 use std::path::PathBuf;
 
