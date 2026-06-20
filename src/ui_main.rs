@@ -1085,6 +1085,43 @@ fn reorder_toolbar_section(
     }
 }
 
+/// ドラッグ並べ替え中、ドロップ先に I 字の挿入マーカーを描く (実機フィードバック 2026-06-20)。
+/// `anchors` は前フレームの可視セクション矩形 (描画順)。`pointer` は現在のポインタ位置。
+/// 線は「挿入位置の手前のセクションの右端」(先頭なら先頭の左端) に、そのセクションの行の高さで引く。
+fn draw_toolbar_drop_indicator(
+    ui: &egui::Ui,
+    anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
+    pointer: egui::Pos2,
+) {
+    if anchors.is_empty() {
+        return;
+    }
+    let vis_idx = toolbar_drop_index(anchors, pointer);
+    let (x, top, bottom) = if vis_idx == 0 {
+        let r = anchors[0].1;
+        (r.left() - 2.0, r.top(), r.bottom())
+    } else {
+        // 挿入位置の直前セクションの右端 (= その行の末尾。折返し時も正しい行に出る)。
+        let r = anchors[vis_idx - 1].1;
+        (r.right() + 2.0, r.top(), r.bottom())
+    };
+    let color = ui.visuals().selection.bg_fill;
+    let stroke = egui::Stroke::new(2.0, color);
+    // パネルより前面に描く (セパレータやボタンに隠れないように)。
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("toolbar_drop_indicator"),
+    ));
+    painter.line_segment([egui::pos2(x, top), egui::pos2(x, bottom)], stroke);
+    // I 字の上下キャップ。
+    let cap = 4.0;
+    painter.line_segment([egui::pos2(x - cap, top), egui::pos2(x + cap, top)], stroke);
+    painter.line_segment(
+        [egui::pos2(x - cap, bottom), egui::pos2(x + cap, bottom)],
+        stroke,
+    );
+}
+
 /// セクションの表示フラグ (show_toolbar_*) を設定する。
 /// 未知セクションは no-op。
 fn set_toolbar_section_visible(
@@ -4622,6 +4659,17 @@ impl App {
             )
             .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。")
             .changed();
+        // フォルダバー (アドレス行) も「並べ替えできないだけのセクション」として扱う。
+        // ここで s (= &mut self.settings) の借用は終わり、以降は self を使う。
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_folder, "フォルダバー (アドレス行)")
+            .changed();
+
+        // 出すボタンの細かい設定 (アドレスバー左端「フォルダ:」の右クリックと同じ内容)。
+        // フォルダバーを隠していてもここから設定・再表示できる。
+        ui.menu_button("フォルダバーの設定…", |ui| {
+            self.draw_folder_bar_settings_menu(ui);
+        });
 
         ui.separator();
         if ui
@@ -4878,6 +4926,99 @@ impl App {
         }
     }
 
+    /// フォルダバー (アドレス行) の設定メニュー (v2.0.0 Phase 3, 実機フィードバック 2026-06-20)。
+    /// アドレスバー左端の「フォルダ:」ラベル右クリック、および「設定」メニュー → ツールバー →
+    /// フォルダバーの設定 から開く。フォルダバーは並べ替えできないだけのセクション扱い。
+    fn draw_folder_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("フォルダバー").strong());
+        ui.separator();
+        let mut changed = false;
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_history_nav,
+                "履歴の戻る/進む (←/→)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_quick_folders,
+                "A/B クイックフォルダ",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_toolbar_parent_button,
+                "親フォルダ (⬆)",
+            )
+            .changed();
+        let mut show_tree_nav =
+            self.settings.show_toolbar_prev_folder || self.settings.show_toolbar_next_folder;
+        if ui
+            .checkbox(&mut show_tree_nav, "ツリー順の前/次フォルダ (▲/▼)")
+            .on_hover_text("Ctrl+↑/↓ と同じく、深さ優先のツリー順で前後のフォルダへ移動します。")
+            .changed()
+        {
+            self.settings.show_toolbar_prev_folder = show_tree_nav;
+            self.settings.show_toolbar_next_folder = show_tree_nav;
+            changed = true;
+        }
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_favorite_button,
+                "お気に入り追加/設定 (♡/♥)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_history_menu,
+                "最近開いたフォルダ履歴メニュー",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_folder_pin,
+                "代表サムネ固定 (📌)",
+            )
+            .changed();
+
+        ui.separator();
+        let mut clear_recent = false;
+        let mut clear_quick = false;
+        if ui.button("最近開いたフォルダ履歴をクリア").clicked() {
+            clear_recent = true;
+            ui.close();
+        }
+        if ui.button("A/B の記憶した場所をクリア").clicked() {
+            clear_quick = true;
+            ui.close();
+        }
+
+        ui.separator();
+        if ui
+            .button("フォルダバーを隠す")
+            .on_hover_text("再表示は「設定」メニュー → ツールバー → フォルダバー")
+            .clicked()
+        {
+            self.settings.show_toolbar_folder = false;
+            changed = true;
+            ui.close();
+        }
+
+        if changed {
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
+        // クリア系は settings 以外 (session 状態) も触るので、専用メソッド + save を呼ぶ。
+        if clear_recent {
+            self.clear_recent_folders();
+            self.settings.save();
+        }
+        if clear_quick {
+            self.clear_quick_folder_slots();
+            self.settings.save();
+        }
+    }
+
     /// セクションの leading widget (ラベル / ツリーボタン) 共通の後処理 (v2.0.0 Phase 3):
     /// (1) 今フレームの矩形を anchors に記録、(2) ドラッグ並べ替えを処理、
     /// (3) 右クリックでセクション設定メニューを開く。`resp` は消費する。
@@ -4909,6 +5050,10 @@ impl App {
         let drag_id = egui::Id::new("toolbar_section_drag_state");
         if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            // ドロップ先に I 字マーカーを表示してどこへ入るか分かるようにする。
+            if let Some(pointer) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                draw_toolbar_drop_indicator(ui, last_anchors, pointer);
+            }
         } else if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -5807,7 +5952,13 @@ impl App {
                 // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
                 let mut search_drill_up = false;
                 ui.horizontal(|ui| {
-                    ui.label("フォルダ:");
+                    // 左端のラベルを右クリックすると、フォルダバーの設定メニューを開く
+                    // (他のツールバーセクションと操作を揃える。実機フィードバック 2026-06-20)。
+                    ui.add(egui::Label::new("フォルダ:").sense(egui::Sense::click()))
+                        .on_hover_text("右クリック: フォルダバーの設定")
+                        .context_menu(|ui| {
+                            self.draw_folder_bar_settings_menu(ui);
+                        });
                     let show_history_nav = self.settings.show_address_bar_history_nav;
                     let show_quick_folders = self.settings.show_address_bar_quick_folders;
                     let show_parent = self.settings.show_toolbar_parent_button;

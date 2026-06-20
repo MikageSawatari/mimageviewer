@@ -39,7 +39,6 @@ pub(crate) enum PreferencesPage {
     StartupFolder,
     ExplorerIntegration,
     Thumbnail,
-    Toolbar,
     Slideshow,
     Capture,
     MouseButtons,
@@ -84,9 +83,6 @@ impl PreferencesPage {
             Self::StartupFolder => "起動時に開く場所",
             Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
-            // v2.0.0: ツールバーのセクション設定は右クリックへ移行し、このページは
-            // フォルダバー (アドレス行) 専用になった。enum 名は内部互換のため Toolbar のまま。
-            Self::Toolbar => "フォルダバー",
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
             Self::MouseButtons => "マウスボタン",
@@ -146,7 +142,6 @@ const TREE: &[TreeCategory] = &[
         page: None,
         children: &[
             PreferencesPage::Thumbnail,
-            PreferencesPage::Toolbar,
             PreferencesPage::SpreadMode,
             PreferencesPage::Slideshow,
             PreferencesPage::Capture,
@@ -212,8 +207,6 @@ pub(crate) struct PreferencesState {
     pub capture_output_dir_input: String,
     pub book_root_input: String,
     pub startup_folder_path_input: String,
-    pub recent_folders_clear_requested: bool,
-    pub quick_folder_slots_clear_requested: bool,
     pub exif_add_tag_input: String,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
@@ -416,8 +409,6 @@ impl PreferencesState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            recent_folders_clear_requested: false,
-            quick_folder_slots_clear_requested: false,
             exif_add_tag_input: String::new(),
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
@@ -716,8 +707,6 @@ impl App {
                 // VST3 ページで再スキャンした候補を App 側に反映
                 #[cfg(windows)]
                 let new_vst3_discovered = state.vst3_discovered.clone();
-                let clear_recent_folders_requested = state.recent_folders_clear_requested;
-                let clear_quick_folder_slots_requested = state.quick_folder_slots_clear_requested;
 
                 // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
                 // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
@@ -736,12 +725,8 @@ impl App {
                     .reading_history_limit
                     .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
                 self.settings = state.settings;
-                if clear_recent_folders_requested {
-                    self.clear_recent_folders();
-                }
-                if clear_quick_folder_slots_requested {
-                    self.clear_quick_folder_slots();
-                }
+                // (フォルダ履歴 / A・B 記憶のクリアは v2.0.0 でフォルダバーの右クリック
+                //  メニューへ移動。環境設定 OK 経路でのクリア要求は廃止。)
                 if old_reading_history_limit != self.settings.reading_history_limit {
                     if let Some(writer) = &self.reading_history_writer {
                         writer.prune(self.settings.reading_history_limit);
@@ -1209,7 +1194,6 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::StartupFolder => page_startup_folder(ui, state),
         PreferencesPage::ExplorerIntegration => page_explorer_integration(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
-        PreferencesPage::Toolbar => page_toolbar(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
         PreferencesPage::MouseButtons => page_mouse_buttons(ui, state),
