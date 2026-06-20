@@ -3412,6 +3412,7 @@ impl App {
         let mut toolbar_book_target_name: Option<String> = None;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
+        let mut toolbar_tag_container: Option<String> = None;
         let mut toolbar_tag_apply = false;
         let mut toolbar_tag_view_open = false;
         let mut toolbar_combo_popup_open = false;
@@ -3915,16 +3916,25 @@ impl App {
                     }
                     for name in &toolbar_tags {
                         let label = format!("#{name}");
-                        let resp = ui.add_enabled(has_target, egui::Button::new(label));
-                        let clicked = resp.clicked();
-                        resp.context_menu(|ui| {
-                            if ui.button("このタグで探す").clicked() {
-                                toolbar_tag_search = Some(name.clone());
-                                ui.close();
-                            }
+                        // 統一ジェスチャ (toolbar-customization-plan §1.1):
+                        //   左クリック   = タグビューを開く (副作用なし)
+                        //   右クリック   = 選択へタグ付与トグル (副作用あり)
+                        //   Shift+右     = 今いるコンテナへ付与トグル
+                        // 左クリックは対象が無くても使えるのでボタンは常に有効にする。
+                        let resp = ui.button(label).hover_tip(if has_target {
+                            "左: タグビュー / 右: 選択へ付与 / Shift+右: この場所へ付与"
+                        } else {
+                            "左: タグビュー / Shift+右: この場所へ付与 (右で選択へ付与するには項目を選ぶ)"
                         });
-                        if clicked {
-                            toolbar_tag_click = Some(name.clone());
+                        if resp.clicked() {
+                            toolbar_tag_search = Some(name.clone());
+                        }
+                        if resp.secondary_clicked() {
+                            if ui.input(|i| i.modifiers.shift) {
+                                toolbar_tag_container = Some(name.clone());
+                            } else if has_target {
+                                toolbar_tag_click = Some(name.clone());
+                            }
                         }
                     }
                 }
@@ -3986,6 +3996,9 @@ impl App {
         }
         if let Some(name) = toolbar_tag_search {
             self.open_tag_view_for_tag(&name);
+        }
+        if let Some(name) = toolbar_tag_container {
+            self.request_tag_toggle_for_current_container(&name);
         }
         if toolbar_tag_apply {
             self.open_tag_apply_dialog();

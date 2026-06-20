@@ -218,6 +218,26 @@ impl App {
         self.request_tag_toggle_for_targets_impl(name, targets, mode);
     }
 
+    /// 「今いるコンテナ」(current_folder = 実フォルダ / ZIP / PDF) にタグをトグルする。
+    /// ツールバーのピンタグ Shift+右クリック用 (toolbar-customization-plan.md §1.1)。
+    /// 合成ビュー (検索 / タグビュー / 読書履歴) は対象コンテナが無いので no-op + 通知。
+    pub(crate) fn request_tag_toggle_for_current_container(&mut self, name: &str) {
+        if self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.items_are_reading_history_view
+        {
+            self.show_feedback_toast("この画面ではコンテナにタグを付けられません".to_string());
+            return;
+        }
+        let Some(folder) = self.current_folder.clone() else {
+            self.show_feedback_toast("タグを付けるコンテナがありません".to_string());
+            return;
+        };
+        // コンテナ (フォルダ/ZIP/PDF) は XMP サイドカー非対象なので tags.db のみ。
+        let target = self.tag_target_for_path(folder, false);
+        self.request_tag_toggle_for_targets(name, vec![target]);
+    }
+
     pub(crate) fn request_tag_toggle_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
         self.request_tag_toggle_for_targets_impl(name, targets, "explicit");
     }
