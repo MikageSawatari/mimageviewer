@@ -615,12 +615,18 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 **描画は `draw_fs_image` を再利用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
 keymap カスタマイズ可) のホールドで動き、
 ズーム中は「cover 倍率 (画像が画面を覆う最小倍率) × `fs_zoom_factor`」を `zoom_pan` に変換して
-ページ全体フィット指定で描く。パンはカーソル正規化位置を元画像範囲へ写し、余白が出ないよう
-range を clamp する (`zip_cover_zoom_pan`)。照準中 (Z 押下中) はページ全体フィットで全体を見せつつ
-ズーム範囲の枠 (`zip_aim_frame_rect`) を重ねる。倍率・状態は settings に保存せずセッション内のみ
-保持し、ページ送りをまたいで維持・グリッドへ戻ると解除。単ページ通常閲覧専用 (見開き / 連結 /
-パノラマ / 動画 / 分析モードでは無効。見開き・PDF 高倍率再レンダ・表示トリム連動は今後の拡張)。
-操作仕様とキー固定の理由は [keymap-spec.md](keymap-spec.md) を参照。
+ページ全体フィット指定で描く (`zip_cover_zoom_pan`)。**既定 `fs_zoom_factor = 1.0` = cover** で、
+縦長画像では横幅目一杯 (ZipPla 単ページの既定) になる。ホイールで倍率変更。
+パンはカーソル位置を**操作帯 (`pan_band`)** 基準で元画像範囲へ写す (`zip_cursor_image_px`)。操作帯は
+画面から上下のホバーバー領域 (上部バー `TOP_BAR_HOVER_Y` / 下部 `FS_SEEK_BAR_HEIGHT`) を内側へ
+詰めた矩形で、**カーソルがホバー領域へ入る前に画像の上端・下端へ到達**する (実機 FB 2026-06-21)。
+ズーム中は左右の補正/メタデータパネルを抑止して (`adjustment_active` / メタデータ描画を
+`!fs_zoom_active` ゲート、左端ホバーの `adjustment_mode` も抑止) パン操作を邪魔しない。
+照準中 (Z 押下中) はページ全体フィットで全体を見せつつズーム範囲の枠 (`zip_aim_frame_rect`) を
+重ねる (パン操作帯と同じ写像なので、離した瞬間の表示範囲と枠が一致)。倍率・状態は settings に
+保存せずセッション内のみ保持し、ページ送りをまたいで維持・グリッドへ戻ると解除。単ページ通常
+閲覧専用 (見開き / 連結 / パノラマ / 動画 / 分析モードでは無効。見開き既定 ≈ 単ページ幅 1.2× /
+PDF 高倍率再レンダ・表示トリム連動は今後の拡張)。操作仕様は [keymap-spec.md](keymap-spec.md) を参照。
 
 `settings.fullscreen_fit_mode` は <kbd>0</kbd> で循環する。ホバーバーのフィットボタンは
 クリックで選択メニュー (`fit_popup_open`) を開き、flow で選べるモードを一覧表示して現在モードを

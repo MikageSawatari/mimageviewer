@@ -1899,8 +1899,17 @@ impl App {
             }
             _ => tex_size,
         };
-        // 照準枠とズームパンで共通のカーソル→画像写像を使う (レターボックスでもズレない)。
-        let cursor_img = zip_cursor_image_px(image_rect, display_size, cursor);
+        // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
+        // そこへ入る前に画像の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。左右は
+        // ズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
+        let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
+        let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+        let pan_band = egui::Rect::from_min_max(
+            egui::pos2(image_rect.left(), image_rect.top() + top_m),
+            egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
+        );
+        // 照準枠とズームパンで共通のカーソル→画像写像を使う (両者の表示範囲を一致させる)。
+        let cursor_img = zip_cursor_image_px(pan_band, display_size, cursor);
         if active {
             let (zoom, pan) =
                 zip_cover_zoom_pan(image_rect.size(), display_size, factor, cursor_img);
@@ -2203,24 +2212,17 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
-/// ZipPla 風全画面ズーム: cover 倍率 (画像が画面を覆う最小倍率) に `factor` を掛けた表示を、
-/// `draw_fs_image` の `zoom_pan` (= ページ全体フィットに対する倍率, パン) として返す。パンは
-/// カーソル正規化位置 (0..1) を元画像範囲へ写し、余白が出ないよう範囲を clamp する。
-/// `view` = 画面 (image_rect) サイズ、`image` = 回転後の表示テクスチャサイズ。
-/// カーソルを contain (ページ全体フィット) 表示基準で画像ピクセル座標へ写し、`[0, image]` へ
-/// clamp して返す。照準枠とズーム中パンで**同じ写像**を使い、レターボックス画像でも「離した
-/// 瞬間の表示範囲」と「照準枠」がズレないようにする (Codex P2: 座標系統一)。
-fn zip_cursor_image_px(view_rect: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
+/// カーソルを「パン操作帯 (`band`)」基準で画像ピクセル座標 (`[0, image]`) へ写す。`band` は
+/// 画面からホバーバー領域 (上下) を差し引いた矩形で、**カーソルが band の端に達した時点で
+/// 画像の端まで到達**する (= 上下のホバー領域に入る前に上端・下端まで見られる。実機 FB
+/// 2026-06-21)。照準枠とズーム中パンで同じ写像を使い、両者の表示範囲を一致させる。
+fn zip_cursor_image_px(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
     if image.x <= 0.0 || image.y <= 0.0 {
         return egui::vec2(image.x * 0.5, image.y * 0.5);
     }
-    let fit = (view_rect.width() / image.x).min(view_rect.height() / image.y);
-    let disp = egui::vec2(image.x * fit, image.y * fit);
-    let disp_rect = egui::Rect::from_center_size(view_rect.center(), disp);
-    egui::vec2(
-        ((cursor.x - disp_rect.left()) / fit).clamp(0.0, image.x),
-        ((cursor.y - disp_rect.top()) / fit).clamp(0.0, image.y),
-    )
+    let nx = ((cursor.x - band.left()) / band.width().max(1.0)).clamp(0.0, 1.0);
+    let ny = ((cursor.y - band.top()) / band.height().max(1.0)).clamp(0.0, 1.0);
+    egui::vec2(nx * image.x, ny * image.y)
 }
 
 /// ズーム中に画面へ映る元画像範囲 (画像ピクセル) と表示中心 (画像ピクセル, 範囲が画像外へ
@@ -3940,7 +3942,8 @@ impl App {
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
                         let adjustment_active = self.adjustment_mode
                             && !compare_wipe_active
-                            && !panorama_mode_active_now;
+                            && !panorama_mode_active_now
+                            && !self.fs_zoom_active;
                         // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
                         // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
                         // ときは無視する (= プラグインで分析するのは動画なので)。
@@ -4585,10 +4588,12 @@ impl App {
                             self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
                         } else if !compare_wipe_active
                             && !self.is_overlay_edit_mode_active()
+                            && !self.fs_zoom_active
                         {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
                             // 消しゴム / 隠蔽加工モード中は自前パネルとの競合 + 編集集中度
                             // 低下を避けるためメタデータ右パネル全体を抑制する。
+                            // ZipPla ズーム中も右パネルは抑止する (パン操作を邪魔しない)。
                             let right_panel_visible =
                                 self.draw_metadata_panel(ui, ctx, full_rect);
                             let _ = right_panel_visible;
@@ -7353,6 +7358,9 @@ impl App {
             self.adjustment_mode = false;
         } else if self.view_trim_mode {
             self.persist_pending_view_trim_state();
+            self.adjustment_mode = false;
+        } else if self.fs_zoom_active {
+            // ZipPla ズーム中は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
             self.adjustment_mode = false;
         } else {
             let edge_hover = passive_hover_enabled
@@ -16367,19 +16375,40 @@ mod tests {
     }
 
     #[test]
-    fn zip_cursor_image_px_maps_and_clamps_through_contain() {
-        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
+    fn zip_cursor_image_px_maps_band_to_image_and_clamps() {
+        // band (パン操作帯) の端でちょうど画像の端へ到達する写像。
+        let band = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
         let image = egui::vec2(400.0, 200.0);
-        // contain fit=0.75、表示画像=300x150、disp_rect y:75..225。
-        // 画面中央 → 画像中央。
-        let c = zip_cursor_image_px(view, image, view.center());
+        // band 中央 → 画像中央。
+        let c = zip_cursor_image_px(band, image, band.center());
         assert!((c.x - 200.0).abs() < 0.01 && (c.y - 100.0).abs() < 0.01);
-        // レターボックス上端 (y=75) → 画像 y=0。
-        let top = zip_cursor_image_px(view, image, egui::pos2(150.0, 75.0));
-        assert!((top.y - 0.0).abs() < 0.01, "contain 上端で画像 y=0");
-        // 画面外 (-50,-50) → [0,image] へ clamp。
-        let outside = zip_cursor_image_px(view, image, egui::pos2(-50.0, -50.0));
+        // band 上端 (y=0) → 画像 y=0、band 下端 (y=300) → 画像 y=200。
+        let top = zip_cursor_image_px(band, image, egui::pos2(150.0, 0.0));
+        assert!((top.y - 0.0).abs() < 0.01, "band 上端で画像上端");
+        let bottom = zip_cursor_image_px(band, image, egui::pos2(150.0, 300.0));
+        assert!((bottom.y - 200.0).abs() < 0.01, "band 下端で画像下端");
+        // band 外 (-50,-50) → [0,image] へ clamp。
+        let outside = zip_cursor_image_px(band, image, egui::pos2(-50.0, -50.0));
         assert!(outside.x >= 0.0 && outside.y >= 0.0);
+    }
+
+    #[test]
+    fn zip_pan_band_reaches_image_edge_before_top_hover_zone() {
+        // 上下のホバー帯 (上部バー/下部シークバー) へ入る前に画像端へ届くこと。
+        let image_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 600.0));
+        let image = egui::vec2(800.0, 1200.0); // 縦長
+        let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
+        let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+        let band = egui::Rect::from_min_max(
+            egui::pos2(image_rect.left(), image_rect.top() + top_m),
+            egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
+        );
+        // カーソルが上部ホバー帯の下端 (y=top_m) に来た時点で画像上端へ到達している。
+        let at_band_top = zip_cursor_image_px(band, image, egui::pos2(150.0, top_m));
+        assert!((at_band_top.y - 0.0).abs() < 0.01);
+        // カーソルが上部ホバー帯内 (y < top_m) でも画像上端で saturate (それ以上戻らない)。
+        let inside_hover = zip_cursor_image_px(band, image, egui::pos2(150.0, top_m * 0.5));
+        assert!((inside_hover.y - 0.0).abs() < 0.01);
     }
 
     #[test]

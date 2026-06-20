@@ -5733,7 +5733,8 @@ impl App {
             fs_pan: egui::Vec2::ZERO,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
-            fs_zoom_factor: 2.0,
+            // 既定 1.0 = cover (縦長画像では横幅目一杯)。ZipPla 単ページの既定に合わせる。
+            fs_zoom_factor: 1.0,
             fs_zoom_z_was_down: false,
             fs_zoom_exit_pending: false,
             fs_pan_drag_start: None,
