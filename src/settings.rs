@@ -1825,6 +1825,10 @@ pub struct Settings {
     /// 右クリックで固定解除。既定 true。
     #[serde(default = "default_true")]
     pub show_address_bar_folder_pin: bool,
+    /// フォルダバーに「スタック」表示トグルボタン (v2.0.0) を表示する。同じ接頭辞の
+    /// 画像を 1 つに畳む集約表示の ON/OFF。既定 true。
+    #[serde(default = "default_true")]
+    pub show_address_bar_stack_toggle: bool,
 
     // ── エクスプローラ連携 ────────────────────────────────────
     /// 実ファイル / 実フォルダの右クリックに Windows Shell の標準メニューを使う。
@@ -3245,6 +3249,7 @@ impl Default for Settings {
             show_address_bar_favorite_button: true,
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
+            show_address_bar_stack_toggle: true,
             use_native_shell_context_menu: true,
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
@@ -4544,6 +4549,7 @@ impl Settings {
         self.show_address_bar_favorite_button = src.show_address_bar_favorite_button;
         self.show_address_bar_history_menu = src.show_address_bar_history_menu;
         self.show_address_bar_folder_pin = src.show_address_bar_folder_pin;
+        self.show_address_bar_stack_toggle = src.show_address_bar_stack_toggle;
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
         // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
@@ -4958,6 +4964,7 @@ mod tests {
         assert!(s.show_address_bar_favorite_button);
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
+        assert!(s.show_address_bar_stack_toggle);
         assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);

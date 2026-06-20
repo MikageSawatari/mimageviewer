@@ -4827,6 +4827,7 @@ impl App {
         s.show_address_bar_favorite_button = true;
         s.show_address_bar_history_menu = true;
         s.show_address_bar_folder_pin = true;
+        s.show_address_bar_stack_toggle = true;
         // 並び順 / 行頭 / ドラッグ許可
         s.toolbar_section_order = Vec::new();
         s.toolbar_section_new_row = Vec::new();
@@ -5110,6 +5111,13 @@ impl App {
                 &mut self.settings.show_address_bar_folder_pin,
                 "代表サムネ固定 (📌)",
             )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_address_bar_stack_toggle,
+                "スタック表示トグル",
+            )
+            .on_hover_text("同じ接頭辞のファイルを 1 つに畳んで表示するトグルボタン")
             .changed();
 
         ui.separator();
@@ -6081,8 +6089,11 @@ impl App {
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
         // ファイル名スタック (v2.0.0) のトグル状態も外で確定 (closure 内は表示のみ)。
-        let stack_available = self.stack_mode_available();
+        // フォルダバー右クリックの「スタック表示トグル」設定が OFF なら隠す。ただし現在 ON の
+        // ときは隠さない (= 隠したまま OFF にできず詰むのを防ぐ)。
         let stack_on = self.stack_mode_on();
+        let stack_available = (self.settings.show_address_bar_stack_toggle || stack_on)
+            && self.stack_mode_available();
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 ui.add_space(3.0);
