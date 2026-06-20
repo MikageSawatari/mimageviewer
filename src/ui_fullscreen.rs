@@ -4670,7 +4670,9 @@ impl App {
                             && !compare_wipe_active
                             && !panorama_mode_active_now
                             && self.reading_flow.is_paged()
+                            && !self.fs_zoom_mode_engaged()
                         {
+                            // ZipPla ズーム中 (照準含む) は表示トリムパネルも抑止する。
                             self.draw_view_trim_panel(ctx, full_rect, fs_idx, spread_pair);
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
@@ -7396,7 +7398,11 @@ impl App {
         // Treat that position as stale and block passive hover side effects until a
         // real input event revives the cursor.
         let passive_hover_enabled = !self.cursor_hidden;
+        // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、当たり判定でもパネル領域を
+        // 無効化する。さもないと右ホバー帯 / ピン留めメタデータ等でホイール (倍率変更) や
+        // クリック (ページ送り) が奪われる (Codex P2)。
         let cursor_in_panel = passive_hover_enabled
+            && !self.fs_zoom_mode_engaged()
             && ctx.input(|i| {
                 i.pointer
                     .hover_pos()
@@ -7791,14 +7797,19 @@ impl App {
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
                                 let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
-                                let in_right_panel = pos.y >= 60.0
+                                // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、クリック
+                                // ナビの当たり判定でもパネル領域を無効化する (Codex P2)。
+                                let zoom_engaged = self.fs_zoom_mode_engaged();
+                                let in_right_panel = !zoom_engaged
+                                    && pos.y >= 60.0
                                     && (self.show_metadata_panel
                                         || self.metadata_panel_hover_active
                                         || pos.x > panel_threshold)
                                     && pos.x
                                         > full_rect.max.x
                                             - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
-                                let in_left_panel = self.adjustment_mode
+                                let in_left_panel = !zoom_engaged
+                                    && self.adjustment_mode
                                     && pos.x < adjustment_panel_rect(full_rect).max.x
                                     && pos.y >= 60.0;
                                 let in_seek_panel =
