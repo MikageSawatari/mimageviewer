@@ -47,3 +47,8 @@ dist/mImageViewer_portable_*.zip
 
 # Python bytecode (scripts/ のヘルパー実行で生成)
 __pycache__/
+
+# egui_kittest スナップショット差分の一時生成物 (レビュー用、コミット対象外)
+tests/snapshots/*.diff.png
+tests/snapshots/*.new.png
+tests/snapshots/*.old.png
