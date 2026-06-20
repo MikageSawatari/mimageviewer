@@ -42,6 +42,11 @@ dist/editing-pack-*/
 dist/mImageViewer_portable_*/
 dist/mImageViewer_portable_*.zip
 
+# 配布成果物・検証素材・各種スクラッチ置き場 (一切 git 管理しない)。
+# 上の dist/* 個別パターンは歴史的経緯で残すが、dist/ 配下はすべてビルド出力 /
+# テスト素材 / レビューメモ等のスクラッチなので、ディレクトリごと無視する。
+/dist/
+
 # 開発中の検証用一時ファイル
 /tmp-test/
 

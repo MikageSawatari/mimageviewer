@@ -3843,6 +3843,18 @@ pub struct App {
     /// `zip_nav` を維持する。
     pub(crate) zip_nav: Option<crate::zip_tree::ZipNavState>,
 
+    // ── ファイル名 prefix スタック (v2.0.0、`docs/filename-stack-plan.md`) ──
+    /// ユーザーのスタックモード ON 意図。トグルで切り替え、別フォルダへ移動すると
+    /// 自動解除 (= `load_folder_with_scan` の folder_changes 時に false)。同一フォルダの
+    /// 再読込 (ソート変更・外部更新) では維持して再グループ化する。
+    pub(crate) stack_mode_requested: bool,
+    /// 集約 / メンバーグリッドの実体。`stack_mode_requested` && 通常フォルダのとき
+    /// `load_folder_with_scan` が構築し、`start_loading_items` がクリアする (zip_nav と同様)。
+    /// `drilled` でビュー段を表す (None=集約 / Some(g)=メンバーグリッド)。
+    pub(crate) stack_view: Option<crate::filename_stack::StackView>,
+    /// メンバーグリッドから集約へ戻ったとき再選択するスタックの key (戻り先の視認性)。
+    pub(crate) stack_return_select_key: Option<String>,
+
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
     pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
@@ -5747,6 +5759,9 @@ impl App {
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
             zip_nav: None,
+            stack_mode_requested: false,
+            stack_view: None,
+            stack_return_select_key: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -8512,6 +8527,10 @@ impl App {
             .map(|current| !crate::folder_tree::path_eq(current, &path))
             .unwrap_or(true);
         if folder_changes {
+            // ファイル名スタックは「現在フォルダに束縛されたビューモード」なので、別フォルダへ
+            // ナビゲートしたら自動解除する (plan §3.5)。同一フォルダ再読込 (ソート変更・外部更新・
+            // メンバーグリッドからの戻り) では folder_changes=false なので維持される。
+            self.stack_mode_requested = false;
             self.clear_archive_convert_nav_history_rollback();
             // **review #11/#13 対応**: 前フォルダ向けの catch-up / neighbor-prefetch
             // ジョブをまとめてキャンセル & queue から破棄する。これにより:
@@ -8733,6 +8752,30 @@ impl App {
         // 訪問時自動索引化は廃止。「名前」フル索引化 ON のお気に入りのみ
         // name_bulk_indexer 経由で全走査する (検索結果が閲覧履歴に依らないように)。
 
+        // ファイル名 prefix スタック (v2.0.0): トグル ON のときはここで集約ビューへ変換する。
+        // existing_keys は **変換前の全 items** から既に集めてある (= 全メンバーのサムネ
+        // キャッシュキーを保持するので delete_missing が非代表メンバーを巻き添えで消さない)。
+        // 集約ビューは start_loading_items の動画サムネスレッド起動を通すため、ここで items を
+        // 差し替えてから渡す。StackView は start_loading_items が stack_view をクリアした後に設定。
+        // (items / image_metas / video_items は上で `let mut` 宣言済み。)
+        let pending_stack_view = if self.stack_mode_requested {
+            let (agg_items, agg_metas, agg_videos, sv) =
+                crate::filename_stack_ui::build_stack_aggregated(
+                    path.clone(),
+                    items,
+                    image_metas,
+                    folder_count,
+                    self.settings.stack_separator,
+                    sort,
+                );
+            items = agg_items;
+            image_metas = agg_metas;
+            video_items = agg_videos;
+            Some(sv)
+        } else {
+            None
+        };
+
         let items_len = items.len();
         self.start_loading_items(
             path,
@@ -8742,6 +8785,9 @@ impl App {
             video_items,
             Some(folder_signature),
         );
+        if let Some(sv) = pending_stack_view {
+            self.stack_view = Some(sv);
+        }
 
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -11909,6 +11955,11 @@ impl App {
         // 再設定するので、ここでクリアしても問題ない。階層内ナビ (enter/back) は
         // install_new_items の軽量経路を使い start_loading_items を通らない (= 維持)。
         self.zip_nav = None;
+        // ファイル名スタックの集約/メンバービューも、別コンテナ遷移では破棄する
+        // (`load_folder_with_scan` が通常フォルダで再構築する。zip_nav と同じ規約)。
+        // `stack_mode_requested` (ユーザー意図) はここでは触らない — 同一フォルダ再読込で
+        // 維持し、別フォルダへのナビ時のみ load_folder_with_scan 側で false にする。
+        self.stack_view = None;
         self.gamepad_location_picker = None;
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
@@ -18159,6 +18210,11 @@ impl App {
                             self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                             self.zip_nav_enter(&dp);
                         }
+                        // ファイル名スタック (v2.0.0): Enter でメンバーグリッドへ降りる。
+                        Some(GridItem::Stack { key, .. }) => {
+                            let key = key.clone();
+                            self.stack_drill_into(&key);
+                        }
                         None => {}
                     }
                 }
@@ -18207,6 +18263,11 @@ impl App {
             }
             if self.local_search_blocks_parent_nav() {
                 self.cancel_pending_folder_nav();
+                return None;
+            }
+            // ファイル名スタックのメンバーグリッドに居るなら、親フォルダへ抜ける前に
+            // 集約ビューへ戻る (集約ビューに居る / スタックモードでないなら false で素通し)。
+            if self.stack_drill_back() {
                 return None;
             }
             // ネスト ZIP ツリー内なら、実フォルダ親へ抜ける前に 1 階層戻る (Phase 3)。
@@ -22900,6 +22961,10 @@ impl App {
                 crate::grid_item::SearchContainerKind::Folder => "9-search-folder".to_string(),
                 crate::grid_item::SearchContainerKind::Zip => "9-search-zip".to_string(),
             },
+            // ファイル名スタックの集約セルは画像枠で並べる (代表画像の拡張子で副キー)。
+            GridItem::Stack { representative, .. } => {
+                format!("1-image-{}", path_extension_lower(representative))
+            }
         }
     }
 
@@ -37811,6 +37876,18 @@ fn make_load_request(
             let cache_key_override = use_full_path_keys.then(|| image_full_path_cache_key(p));
             Some(LoadRequest {
                 path: p.clone(),
+                cache_key_override,
+                ..base
+            })
+        }
+        GridItem::Stack { representative, .. } => {
+            // ファイル名スタックの集約セル: 代表画像 (実ファイル) のサムネをそのまま要求する。
+            // 専用 cache key は不要 — その実ファイルの通常 per-file サムネを再利用するので、
+            // スタックモード ON/OFF を跨いでキャッシュが命中する。
+            let cache_key_override =
+                use_full_path_keys.then(|| image_full_path_cache_key(representative));
+            Some(LoadRequest {
+                path: representative.clone(),
                 cache_key_override,
                 ..base
             })

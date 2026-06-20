@@ -94,6 +94,29 @@ fn draw_thumb(
     }
 }
 
+/// ファイル名スタックの集約セル右上に「N 枚」バッジを描く (v2.0.0)。
+/// スタックは複数枚画像をまとめた仮想コンテナなので、通常画像との見分けを付ける。
+/// スタックはチェック非対象なので右上のチェックオーバーレイとは衝突しない。
+fn draw_stack_count_badge(painter: &egui::Painter, inner: egui::Rect, count: usize) {
+    let text = format!("{count} 枚");
+    let font = egui::FontId::proportional((inner.height() * 0.09).clamp(11.0, 16.0));
+    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+    let pad = egui::vec2(6.0, 3.0);
+    let size = galley.size() + pad * 2.0;
+    // バッジの右上をセル右上 (inner.max.x-4, inner.min.y+4) に合わせる。
+    let anchor = egui::pos2(inner.max.x - 4.0, inner.min.y + 4.0);
+    let badge_rect = egui::Rect::from_min_max(
+        egui::pos2(anchor.x - size.x, anchor.y),
+        egui::pos2(anchor.x, anchor.y + size.y),
+    );
+    painter.rect_filled(
+        badge_rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+    );
+    painter.galley(badge_rect.min + pad, galley, egui::Color32::WHITE);
+}
+
 const BADGE_TEXT_TOP_PAD: f32 = 5.0;
 const BADGE_TEXT_BOTTOM_PAD: f32 = 1.0;
 
@@ -645,6 +668,13 @@ pub(crate) fn draw_cell(
                     badge_color,
                 );
             }
+        }
+        GridItem::Stack { count, .. } => {
+            // ファイル名スタックの集約セル: 代表画像を通常サムネと同様に描き、
+            // 右上に枚数バッジ (= スタックの目印)。単独グループは GridItem::Image で
+            // 描かれるのでここには来ない (= count は常に 2 以上)。
+            draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
+            draw_stack_count_badge(painter, inner, *count);
         }
     }
 

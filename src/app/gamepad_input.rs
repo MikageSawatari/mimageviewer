@@ -4287,6 +4287,12 @@ impl App {
                 self.zip_nav_enter(&dir_prefix);
                 None
             }
+            // ファイル名スタック (v2.0.0): 集約セルを展開してメンバーグリッドへ降りる。
+            Some(GridItem::Stack { key, .. }) => {
+                let key = key.clone();
+                self.stack_drill_into(&key);
+                None
+            }
             None => None,
         }
     }
@@ -4307,6 +4313,10 @@ impl App {
         }
         if self.local_search_blocks_parent_nav() {
             self.cancel_pending_folder_nav();
+            return None;
+        }
+        // ファイル名スタックのメンバーグリッド内なら集約ビューへ戻る。
+        if self.stack_drill_back() {
             return None;
         }
         // ネスト ZIP ツリー内なら 1 階層戻る (ルートなら false → 親フォルダへ抜ける)。

@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::grid_item::GridItem;
 use crate::settings::SortOrder;
 
 /// グループ化対象の 1 メディア。
@@ -139,6 +140,109 @@ pub fn group_media(media: Vec<StackMember>, separator: char, sort: SortOrder) ->
         )
     });
     groups
+}
+
+/// スタックモードのビュー状態 (App が `Option<StackView>` で保持)。
+///
+/// `drilled` で 2 状態を表す:
+/// - `None` = 集約ビュー (1 グループ = 1 セル。複数枚はスタックセル + バッジ、単独は通常セル)。
+/// - `Some(g)` = メンバーグリッド (groups[g] のメンバーを実 `Image`/`Video` セルで展開)。
+///
+/// `passthrough` は画像以外 (フォルダ / ZIP / PDF / 変換アーカイブ) のセル列で、集約ビューの
+/// 先頭に置く (= 通常レイアウトのコンテナ先頭慣習を踏襲、plan §4 「素通し表示」)。`groups` は
+/// メディア (画像 + 動画) を prefix でまとめたもの (動画は単独固定)。
+/// (`GridItem` が `Debug` 非対応のため `Debug` は derive しない。)
+#[derive(Clone)]
+pub struct StackView {
+    /// このビューが束縛されている実フォルダ。別フォルダへ移動したら破棄する。
+    pub folder: PathBuf,
+    /// グループ化区切り文字 (構築時の値)。
+    pub separator: char,
+    /// 構築時のソート順 (グループ/メンバーの並びはこれに従う)。
+    pub sort: SortOrder,
+    /// 画像以外のコンテナセル (集約ビュー先頭の passthrough)。
+    pub passthrough: Vec<GridItem>,
+    /// `passthrough` と同インデックスの `(mtime, size)`。
+    pub passthrough_metas: Vec<Option<(i64, i64)>>,
+    /// メディアグループ (表示順)。
+    pub groups: Vec<StackGroup>,
+    /// ドリル状態。`None` = 集約、`Some(g)` = groups[g] のメンバーグリッド。
+    pub drilled: Option<usize>,
+}
+
+impl StackView {
+    /// メディア (画像 + 動画) を prefix でグループ化して `StackView` を作る (集約状態)。
+    pub fn build(
+        folder: PathBuf,
+        passthrough: Vec<GridItem>,
+        passthrough_metas: Vec<Option<(i64, i64)>>,
+        media: Vec<StackMember>,
+        separator: char,
+        sort: SortOrder,
+    ) -> Self {
+        let groups = group_media(media, separator, sort);
+        Self {
+            folder,
+            separator,
+            sort,
+            passthrough,
+            passthrough_metas,
+            groups,
+            drilled: None,
+        }
+    }
+
+    /// 畳めるスタック (画像 2 枚以上のグループ) が 1 つでもあるか。
+    /// 集約しても全部単独セル = 通常一覧と同じ見た目なら、トグルしても無意味なので
+    /// 呼び出し側がトーストで知らせる等に使える。
+    pub fn has_collapsible_stack(&self) -> bool {
+        self.groups.iter().any(|g| g.is_stack())
+    }
+
+    /// 集約ビューの `(items, image_metas)` を作る。passthrough (コンテナ) → グループセルの順。
+    pub fn materialize_aggregated(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+        let mut items = self.passthrough.clone();
+        let mut metas = self.passthrough_metas.clone();
+        for g in &self.groups {
+            let rep = g.representative();
+            if g.is_stack() {
+                items.push(GridItem::Stack {
+                    key: g.key.clone(),
+                    representative: rep.path.clone(),
+                    count: g.count(),
+                });
+            } else if rep.is_video {
+                items.push(GridItem::Video(rep.path.clone()));
+            } else {
+                items.push(GridItem::Image(rep.path.clone()));
+            }
+            metas.push(Some((rep.mtime, rep.size)));
+        }
+        (items, metas)
+    }
+
+    /// groups[g] のメンバーグリッド `(items, image_metas)` を作る。
+    /// 範囲外の g は空を返す。メンバーは実 `Image`/`Video` セル (展開後は通常操作可能)。
+    pub fn materialize_member(&self, g: usize) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+        let mut items = Vec::new();
+        let mut metas = Vec::new();
+        if let Some(group) = self.groups.get(g) {
+            for m in &group.members {
+                items.push(if m.is_video {
+                    GridItem::Video(m.path.clone())
+                } else {
+                    GridItem::Image(m.path.clone())
+                });
+                metas.push(Some((m.mtime, m.size)));
+            }
+        }
+        (items, metas)
+    }
+
+    /// `key` を持つグループの index を返す (集約セルのクリック → ドリル先解決)。
+    pub fn group_index_by_key(&self, key: &str) -> Option<usize> {
+        self.groups.iter().position(|g| g.key == key)
+    }
 }
 
 /// グループ内メンバーを表示 sort 順に並べる。
@@ -346,5 +450,119 @@ mod tests {
         let groups = group_media(media, '-', SortOrder::FileName);
         assert_eq!(keys(&groups), vec!["777", "888"]);
         assert_eq!(groups[0].count(), 2);
+    }
+
+    // ── StackView ────────────────────────────────────────────────────
+
+    fn folder(name: &str) -> GridItem {
+        GridItem::Folder(PathBuf::from(format!(r"C:\dl\{name}")))
+    }
+
+    fn item_name(item: &GridItem) -> String {
+        item.name().to_string()
+    }
+
+    #[test]
+    fn aggregated_puts_passthrough_first_then_group_cells() {
+        // フォルダ 1 + (画像スタック "post" 2枚) + (単独画像 "solo")。
+        let media = vec![img("post_p0.jpg"), img("post_p1.jpg"), img("solo.jpg")];
+        let sv = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            vec![folder("sub")],
+            vec![None],
+            media,
+            '_',
+            SortOrder::FileName,
+        );
+        let (items, metas) = sv.materialize_aggregated();
+        assert_eq!(items.len(), metas.len());
+        // [0] = passthrough フォルダ。
+        assert!(matches!(items[0], GridItem::Folder(_)));
+        // [1] = スタックセル (post, count 2)。
+        match &items[1] {
+            GridItem::Stack { key, count, .. } => {
+                assert_eq!(key, "post");
+                assert_eq!(*count, 2);
+            }
+            _ => panic!("expected Stack cell at index 1"),
+        }
+        // [2] = 単独画像 (通常 Image セル、バッジなし)。
+        assert!(matches!(items[2], GridItem::Image(_)));
+        assert_eq!(item_name(&items[2]), "solo.jpg");
+    }
+
+    #[test]
+    fn aggregated_singleton_video_is_video_cell() {
+        let media = vec![vid("movie.mp4")];
+        let sv = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            media,
+            '_',
+            SortOrder::FileName,
+        );
+        let (items, _) = sv.materialize_aggregated();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], GridItem::Video(_)));
+    }
+
+    #[test]
+    fn materialize_member_expands_group_into_real_images() {
+        let media = vec![img("post_p1.jpg"), img("post_p0.jpg")];
+        let sv = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            media,
+            '_',
+            SortOrder::FileName,
+        );
+        let g = sv.group_index_by_key("post").expect("group exists");
+        let (items, metas) = sv.materialize_member(g);
+        assert_eq!(items.len(), 2);
+        assert_eq!(metas.len(), 2);
+        // メンバーは実 Image セル、FileName 昇順。
+        assert_eq!(item_name(&items[0]), "post_p0.jpg");
+        assert_eq!(item_name(&items[1]), "post_p1.jpg");
+        assert!(items.iter().all(|i| matches!(i, GridItem::Image(_))));
+    }
+
+    #[test]
+    fn materialize_member_out_of_range_is_empty() {
+        let sv = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            vec![img("a.jpg")],
+            '_',
+            SortOrder::FileName,
+        );
+        let (items, metas) = sv.materialize_member(99);
+        assert!(items.is_empty());
+        assert!(metas.is_empty());
+    }
+
+    #[test]
+    fn has_collapsible_stack_detects_multi_image_group() {
+        let with_stack = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            vec![img("p_0.jpg"), img("p_1.jpg")],
+            '_',
+            SortOrder::FileName,
+        );
+        assert!(with_stack.has_collapsible_stack());
+
+        let only_singletons = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            vec![img("a.jpg"), img("b.jpg")],
+            '_',
+            SortOrder::FileName,
+        );
+        assert!(!only_singletons.has_collapsible_stack());
     }
 }

@@ -1603,6 +1603,7 @@ fn details_kind_label(item: &GridItem) -> String {
             crate::grid_item::SearchContainerKind::Folder => "検索フォルダ".to_string(),
             crate::grid_item::SearchContainerKind::Zip => "検索ZIP".to_string(),
         },
+        GridItem::Stack { count, .. } => format!("スタック ({count})"),
     }
 }
 
@@ -1670,6 +1671,10 @@ fn selection_info_location_label(item: &GridItem) -> Option<String> {
         }
         GridItem::PdfPage { pdf_path, .. } => {
             short_path_name(pdf_path).map(|name| format!("場所 {name}"))
+        }
+        // ファイル名スタック: 代表画像の親フォルダ名を場所として出す。
+        GridItem::Stack { representative, .. } => {
+            short_path_name(representative.parent()?).map(|name| format!("場所 {name}"))
         }
         GridItem::ZipSeparator { .. } => None,
     }
@@ -6075,6 +6080,9 @@ impl App {
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
+        // ファイル名スタック (v2.0.0) のトグル状態も外で確定 (closure 内は表示のみ)。
+        let stack_available = self.stack_mode_available();
+        let stack_on = self.stack_mode_on();
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 ui.add_space(3.0);
@@ -6082,6 +6090,9 @@ impl App {
                 let mut pin_click = PinButtonClick::None;
                 let mut favorite_click = FavoriteButtonClick::None;
                 let mut tree_nav: Option<bool> = None;
+                // ファイル名スタックのトグルクリックは closure 後に処理する (load_folder で
+                // App ミュータブル借用が必要)。
+                let mut stack_toggle = false;
                 // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
                 let mut search_drill_up = false;
                 ui.horizontal(|ui| {
@@ -6405,6 +6416,17 @@ impl App {
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // ファイル名スタック表示トグル (v2.0.0、フォルダ欄の右端)。
+                        // 通常フォルダ表示のときだけ出す (検索 / ZIP ツリー / ドライブ一覧では無効)。
+                        if stack_available {
+                            let resp = ui.selectable_label(stack_on, "スタック").hover_tip(
+                                "同じ接頭辞のファイルを 1 つに畳んで表示する [トグル]",
+                            );
+                            if resp.clicked() {
+                                stack_toggle = true;
+                            }
+                            ui.add_space(4.0);
+                        }
                         if folder_rating >= 1 && folder_rating <= 5 {
                             let stars = "★".repeat(folder_rating as usize);
                             ui.label(
@@ -6604,6 +6626,9 @@ impl App {
                         self.show_favorites_editor = true;
                     }
                     FavoriteButtonClick::None => {}
+                }
+                if stack_toggle {
+                    self.toggle_stack_mode();
                 }
                 if let Some(forward) = tree_nav {
                     // 検索中は ▲▼ を検索仮想階層の前後ヒット移動に振り分ける
@@ -7467,6 +7492,11 @@ impl App {
                     self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
                     self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                     self.zip_nav_enter(&dp);
+                }
+                // ファイル名スタック (v2.0.0): 集約セルをダブルクリックでメンバーグリッドへ降りる。
+                Some(GridItem::Stack { key, .. }) => {
+                    let key = key.clone();
+                    self.stack_drill_into(&key);
                 }
                 None => {}
             }

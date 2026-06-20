@@ -637,6 +637,14 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
+                        GridItem::Stack { representative, .. } => {
+                            // ファイル名スタック集約セル: 仮想コンテナなので最小限。展開 (読書) は
+                            // 左ダブルクリック / Enter で行う。ここは代表画像のパスコピーのみ。
+                            if ui.button("代表画像のパスをコピー").clicked() {
+                                copy_path_text(ctx, representative);
+                                close = true;
+                            }
+                        }
                         GridItem::PdfPage {
                             pdf_path, page_num, ..
                         } => {
@@ -755,6 +763,8 @@ impl crate::app::App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
+            // ファイル名スタック: 代表画像の実パスをコピー。
+            GridItem::Stack { representative, .. } => native_path_text(&representative),
             GridItem::ZipSeparator { .. } => return false,
         };
         ctx.copy_text(text);
@@ -813,6 +823,8 @@ impl crate::app::App {
             }
             GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => zip_path,
             GridItem::PdfPage { pdf_path, .. } => pdf_path,
+            // ファイル名スタック: 代表画像を含むフォルダを開く。
+            GridItem::Stack { representative, .. } => representative,
             GridItem::ZipSeparator { .. } => return false,
         };
         open_folder_in_explorer(&path);
@@ -1357,10 +1369,12 @@ impl crate::app::App {
                             close = true;
                         }
                     }
-                    // ZipDir はフルスクリーン対象外 (ナビコンテナ) なので FS では最小限。
+                    // ZipDir / Stack はフルスクリーン対象外 (仮想ナビコンテナ) なので FS では
+                    // 最小限 (そもそも FS の items にはメンバーの実 Image しか入らない)。
                     GridItem::Folder(_)
                     | GridItem::ZipSeparator { .. }
-                    | GridItem::ZipDir { .. } => {
+                    | GridItem::ZipDir { .. }
+                    | GridItem::Stack { .. } => {
                         close = true;
                     }
                     GridItem::ConvertibleArchive { path, .. } => {

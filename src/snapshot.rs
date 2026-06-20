@@ -317,6 +317,9 @@ pub fn snapshot_key_from_grid_item(item: &GridItem) -> Option<SnapshotKey> {
         // ZipDir はネスト ZIP ツリーの仮想ナビコンテナ。snapshot は leaf 画像 (ZipImage)
         // を entry_name で復元するので、コンテナ自体は取り込まない (= ナビ状態側で再構築)。
         GridItem::ZipDir { .. } => None,
+        // Stack (ファイル名スタック集約セル) も仮想コンテナ。snapshot は展開後の実 Image を
+        // 取り込むので集約セル自体は対象外。
+        GridItem::Stack { .. } => None,
     }
 }
 
@@ -333,7 +336,8 @@ pub fn snapshot_entry_kind(item: &GridItem) -> Option<SnapshotEntryKind> {
         GridItem::PdfPage { .. } => Some(SnapshotEntryKind::PdfPage),
         GridItem::ZipSeparator { .. }
         | GridItem::SearchContainer { .. }
-        | GridItem::ZipDir { .. } => None,
+        | GridItem::ZipDir { .. }
+        | GridItem::Stack { .. } => None,
     }
 }
 
@@ -379,7 +383,8 @@ pub fn snapshot_target_from_grid_item(item: &GridItem) -> Option<SnapshotTarget>
         }),
         GridItem::ZipSeparator { .. }
         | GridItem::SearchContainer { .. }
-        | GridItem::ZipDir { .. } => None,
+        | GridItem::ZipDir { .. }
+        | GridItem::Stack { .. } => None,
     }
 }
 

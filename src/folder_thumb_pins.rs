@@ -194,9 +194,12 @@ pub fn source_from_grid_item(
         // ZipDir はネスト ZIP ツリーの仮想コンテナで、pin source としては有効。ただし
         // 冗長ラッパー collapse 後の実効 prefix を保存する必要があるため、zip_nav を
         // 知らない generic helper では作れない。App::folder_pin_selected_source 側で扱う。
+        // Stack (ファイル名スタックの集約セル) は実パスを持たない仮想コンテナ。MVP では
+        // 「丸ごと」操作非対応なので pin source にしない (メンバー展開後の実 Image でピンする)。
         GridItem::SearchContainer { .. }
         | GridItem::ZipSeparator { .. }
-        | GridItem::ZipDir { .. } => None,
+        | GridItem::ZipDir { .. }
+        | GridItem::Stack { .. } => None,
     }
 }
 

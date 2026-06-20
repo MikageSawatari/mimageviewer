@@ -82,6 +82,21 @@ pub enum GridItem {
         /// 列挙時は None、フルスクリーンレンダリング完了時に確定。
         content_type: Option<crate::pdf_loader::PdfPageContentType>,
     },
+    /// ファイル名 prefix スタック (v2.0.0、`docs/filename-stack-plan.md`) の集約ビューで、
+    /// 同一 prefix の画像 2 枚以上を 1 セルに畳んだ「スタック」を表す。代表画像 + 枚数バッジで
+    /// 描き、クリックでメンバーグリッドへドリルインする (ZipDir と同じ仮想コンテナ扱い)。
+    /// 単独 (1 枚) の画像はスタックにせず通常 `Image` セルとして描く。
+    /// 実パスを持たない仮想コンテナなので、ファイル整理 / D&D / チェック / レーティングの
+    /// 対象外 (展開後のメンバーは実 `Image` なのでそちらで操作する。MVP は「丸ごと」非対応)。
+    Stack {
+        /// グループ化キー (prefix)。スタックの identity + 表示名。
+        key: String,
+        /// 代表画像の実パス (= グループ sort 先頭)。サムネ要求はこの実ファイルを読む
+        /// (専用 cache key は不要 — 通常の per-file サムネをそのまま再利用する)。
+        representative: PathBuf,
+        /// メンバー数 (>= 2、バッジ表示用)。
+        count: usize,
+    },
     /// Ctrl+G グローバルメタ検索結果の集約コンテナ (v0.8.0)。
     /// トップレベル結果ビューで、ヒットを含む親フォルダ or ZIP を 1 セルで表現する。
     /// クリックでそのコンテナに入ると、drill-down ビューに遷移して階層を維持した
@@ -215,6 +230,7 @@ impl GridItem {
             GridItem::ZipDir { dir_prefix, .. } => Cow::Borrowed(zipdir_display_name(dir_prefix)),
             GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
             GridItem::SearchContainer { path, .. } => path_display_name(path),
+            GridItem::Stack { key, .. } => Cow::Borrowed(key),
         }
     }
 
@@ -246,6 +262,7 @@ impl GridItem {
                 dir_prefix,
                 ..
             } => format!("{}:{}", zip_path.display(), dir_prefix),
+            GridItem::Stack { representative, .. } => representative.display().to_string(),
         }
     }
 
@@ -335,6 +352,9 @@ impl GridItem {
                     SearchContainerKind::Zip => "searchzip",
                 };
                 format!("{prefix}::{}", path.display())
+            }
+            GridItem::Stack { representative, .. } => {
+                format!("stack::{}", representative.display())
             }
         }
     }

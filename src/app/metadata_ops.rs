@@ -148,6 +148,8 @@ pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItem
         // ZipDir はネスト ZIP ツリーの仮想サブコンテナ。ZIP 内には実フォルダが無いので、
         // facet 上は Folder バケツに入れる (= 「フォルダ」絞り込みで子コンテナだけが出る)。
         GridItem::ZipDir { .. } => FacetItemKind::Folder,
+        // ファイル名スタックの集約セルは画像の集まりなので Image バケツ (= 画像絞り込みで残る)。
+        GridItem::Stack { .. } => FacetItemKind::Image,
     }
 }
 
@@ -162,6 +164,8 @@ pub(super) fn facet_ext_for_item(item: &GridItem) -> String {
         | GridItem::PdfFile(p)
         | GridItem::ConvertibleArchive { path: p, .. }
         | GridItem::SearchContainer { path: p, .. } => path_extension_lower(p),
+        // ファイル名スタックの集約セルは代表画像の拡張子で facet 絞り込みに乗せる。
+        GridItem::Stack { representative, .. } => path_extension_lower(representative),
         GridItem::ZipImage { entry_name, .. } => Path::new(entry_name)
             .extension()
             .and_then(|e| e.to_str())
@@ -566,6 +570,8 @@ pub(super) fn details_created_time_path(item: &GridItem) -> Option<&Path> {
         GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
             Some(path.as_path())
         }
+        // ファイル名スタック: 代表画像の作成日時を使う (実ファイル)。
+        GridItem::Stack { representative, .. } => Some(representative.as_path()),
         GridItem::ZipImage { .. }
         | GridItem::ZipSeparator { .. }
         | GridItem::ZipDir { .. }
@@ -680,10 +686,11 @@ pub(super) fn run_metadata_search(
             GridItem::Folder(_)
             | GridItem::ZipFile(_)
             | GridItem::ConvertibleArchive { .. }
-            | GridItem::ZipDir { .. } => {
-                // フォルダ / ZIP / 変換対象アーカイブ / ネスト ZIP 子コンテナ:
-                // ファイル名 (basename = ZipDir は最後のセグメント) で照合。
-                // ZipDir の子は現階層 items に含まれないので group 可視判定は不要 (名前照合のみ)。
+            | GridItem::ZipDir { .. }
+            | GridItem::Stack { .. } => {
+                // フォルダ / ZIP / 変換対象アーカイブ / ネスト ZIP 子コンテナ / スタック集約セル:
+                // ファイル名 (basename = ZipDir は最後のセグメント、Stack は prefix キー) で照合。
+                // これらの子/メンバーは現 items に含まれないので名前照合のみ (plan §3.6 MVP)。
                 if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }
