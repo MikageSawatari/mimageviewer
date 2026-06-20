@@ -18,6 +18,10 @@ Phase 3 (右クリックカスタマイズ + ドラッグ並べ替え + 環境�
 - **並べ替え** (§2.1): セクションのラベル (FolderTree は「ツリー」ボタン) を**ドラッグ**で並べ替え。
   純関数 `toolbar_drop_index` (折返し対応) + `reorder_toolbar_section` (非表示セクションの相対位置維持)
   を unit test。drop は前フレームの可視セクション矩形 (`App::toolbar_section_anchors`) から計算。
+  **ドラッグ並べ替えは既定 OFF のオプトイン** (`toolbar_section_drag_enabled`、実機フィードバック:
+  常時ドラッグ可能だと通常操作中にラベル上でカーソルが頻繁に変わって煩わしい)。ON のときだけ
+  click_and_drag sense + Grab/Grabbing カーソル + 挿入マーカーを有効化。右クリック2メニューに
+  「ドラッグで並べ替えを許可」チェックを置く。
 - **行頭に表示** (§2.2): `toolbar_section_new_row` 集合 + 描画は `ui.end_row()` (= wrapping layout で
   改行)。単一 `horizontal_wrapped` を保つので再インデントなし。
 - **表示形式** (§3): 実装どおり。プルダウン = ComboBox + アクションボタン (自前 Area は不採用)。
