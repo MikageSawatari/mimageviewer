@@ -3754,6 +3754,8 @@ impl App {
                     .filter(|tag| tag.show_shortcut)
                     .map(|t| t.name.clone())
                     .collect();
+                // 「行頭に表示」フラグ集合 (ループ内 self 借用衝突回避のため複製)。
+                let toolbar_new_row = self.settings.toolbar_section_new_row.clone();
                 for &section in &toolbar_section_order {
                     // セクションごとの表示可否 (= 旧 `if show_*` と同一条件)。
                     let visible = match section {
@@ -3771,7 +3773,14 @@ impl App {
                         continue;
                     }
                     if !first_section {
-                        ui.separator();
+                        // 「行頭に表示」セクションは、自動折返しを待たずここで改行する
+                        // (egui の end_row は wrapping layout で次の行へ移る)。それ以外は
+                        // 従来どおりセパレータで区切る。
+                        if toolbar_new_row.contains(&section) {
+                            ui.end_row();
+                        } else {
+                            ui.separator();
+                        }
                     }
                     match section {
                 // ツールバー VST ボタンは v0.9.0 開発中に削除 (= ユーザー要望 2026-04
@@ -4819,6 +4828,26 @@ impl App {
                 }
             }
             TS::Unknown => {}
+        }
+
+        ui.separator();
+        // 行頭に表示 (= このセクションの前で必ず改行)。
+        let mut new_row = self.settings.toolbar_section_new_row.contains(&section);
+        if ui
+            .checkbox(&mut new_row, "行頭に表示")
+            .on_hover_text("このセクションの前で必ず改行します (自動折返しに優先)")
+            .changed()
+        {
+            if new_row {
+                if !self.settings.toolbar_section_new_row.contains(&section) {
+                    self.settings.toolbar_section_new_row.push(section);
+                }
+            } else {
+                self.settings
+                    .toolbar_section_new_row
+                    .retain(|&s| s != section);
+            }
+            changed = true;
         }
 
         ui.separator();
