@@ -20,7 +20,10 @@ impl App {
         let mut close = false;
         let mut open_changelog = false;
         // &'static 参照の Vec なので clone は安価 (借用衝突回避のためローカルへ)。
-        let entries = self.whats_new_entries.clone();
+        // highlights_to_show は「またぎ累積」のため昇順で返すが、表示は更新履歴と揃えて
+        // **新しいバージョンを上**にする (実機フィードバック 2026-06-20)。
+        let mut entries = self.whats_new_entries.clone();
+        entries.reverse();
 
         egui::Window::new("重要な変更点")
             .open(&mut open)

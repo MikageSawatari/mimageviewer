@@ -230,7 +230,8 @@ fn whats_new_dialog_multi_version_dark() {
         must_read: MUST_20,
         highlights: HIGH_20,
     };
-    let entries = [&V15, &V20];
+    // ダイアログは新しいバージョンを上に出す (= 更新履歴と同じ並び)。テストもその順で渡す。
+    let entries = [&V20, &V15];
     snapshot_with_theme(
         "whats_new_multi_version_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
