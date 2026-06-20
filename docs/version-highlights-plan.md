@@ -1,6 +1,23 @@
 # 更新後 初回起動の「重要な変更点」表示 実装計画
 
-ステータス: **設計のみ・未実装** (2026-06-19 起案)。
+ステータス: **v2.0.0 で実装済み** (2026-06-20)。2026-06-19 起案。
+
+## 実装状況 (2026-06-20)
+
+- データ + 選択ロジック: [src/version_highlights.rs](../src/version_highlights.rs)。
+  `VersionHighlights { version, must_read, highlights }` の exe 埋め込みテーブル `table()` +
+  純関数 `highlights_to_show(prev, current, table)` (unit test 12 本) + ヘルプ再表示用 `for_version` +
+  描画 `render(ui, entries)` (App 非依存 → snapshot から呼べる)。
+- ダイアログ: [src/ui_dialogs/whats_new.rs](../src/ui_dialogs/whats_new.rs)。⚠ 必読 → ・ 新機能 →
+  「すべての変更を見る」(changelog.html) / 閉じる。display-only。
+- トリガ: `App` 構築時に `meta.previous_last_seen_version` と現行版で `highlights_to_show` を
+  評価し、非空なら表示。`last_seen_version` は `Settings::load` で更新・保存済みなので一度きり
+  (閉じなくても次回は出ない)。新規インストール (previous=None) は出さない。
+- 開発用 `--whatsnew-from <ver>` で任意の前バージョンから強制表示 (`cli_flag_takes_value` 登録済)。
+  ヘルプメニュー「重要な変更点を表示」で再表示。
+- テスト: `highlights_to_show` の unit test + egui_kittest snapshot `whats_new_multi_version_dark`。
+- **v2.0.0 の must_read = ツールバー右クリック化 + 左右クリック統一** (③ の告知)。Cargo.toml が
+  2.0.0 になった初回起動で自動表示される。
 
 ## 0. 背景と目的
 

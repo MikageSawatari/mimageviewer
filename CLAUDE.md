@@ -1322,6 +1322,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    `## 更新履歴` から生成される**生成物**なので手で編集しない (編集すると次回再生成で消える)。
    生成後 `git diff` で最新版エントリが反映されていることを確認する。
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
+5.5. **「重要な変更点」テーブルの追記** (操作・既定の変更があるリリースのみ) —
+   [src/version_highlights.rs](src/version_highlights.rs) の `TABLE` に今回バージョンの
+   エントリ (`must_read` = 操作・既定の変更、`highlights` = 主な新機能) を追加する。
+   更新後初回起動でユーザーに自動表示される (= ④ version-highlights、display-only、内部用語禁止)。
+   操作・既定の変更が無いリリースでは追記不要。追記したら
+   `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
    - マニュアル左サイドバーのリンク一覧が全 22 ページで揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
