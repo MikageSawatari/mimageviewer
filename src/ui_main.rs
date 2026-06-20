@@ -2260,6 +2260,25 @@ impl App {
                         self.kick_update_check(true);
                         ui.close();
                     }
+                    if ui
+                        .button("重要な変更点を表示")
+                        .on_hover_text("このバージョンの主な変更点をもう一度表示します")
+                        .clicked()
+                    {
+                        // 現行版のエントリ。無ければ最新エントリにフォールバック (空メニュー回避)。
+                        let mut entries = crate::version_highlights::for_version(
+                            env!("CARGO_PKG_VERSION"),
+                            crate::version_highlights::table(),
+                        );
+                        if entries.is_empty() {
+                            if let Some(last) = crate::version_highlights::table().last() {
+                                entries = vec![last];
+                            }
+                        }
+                        self.whats_new_entries = entries;
+                        self.show_whats_new = true;
+                        ui.close();
+                    }
                     if ui.button("バージョン情報").clicked() {
                         self.show_about_dialog = true;
                         ui.close();

@@ -148,6 +148,7 @@ mod undo_ops;
 pub mod undo_stack;
 pub mod update_check;
 pub mod vector_edit;
+pub mod version_highlights;
 pub mod video;
 pub mod video_bookmarks;
 pub mod video_bookmarks_parser;

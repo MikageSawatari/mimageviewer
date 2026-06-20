@@ -202,6 +202,45 @@ fn stats_histogram_compact_columns_light() {
     );
 }
 
+/// 更新後「重要な変更点」ダイアログ本体 (version_highlights::render) の回帰防止。
+/// 複数バージョンまたぎの合成 payload を食わせて、必読 (⚠) / 新機能 (・) の 2 段構成と
+/// バージョン見出しのレイアウト崩れを実機なしで検知する (docs/version-highlights-plan.md §5)。
+#[test]
+fn whats_new_dialog_multi_version_dark() {
+    use mimageviewer::version_highlights::{HighlightItem, VersionHighlights};
+    const MUST_15: &[HighlightItem] = &[HighlightItem {
+        title: "操作の既定が変わりました",
+        body: "従来の動作は設定から選べます。",
+    }];
+    const MUST_20: &[HighlightItem] = &[HighlightItem {
+        title: "ツールバーの設定は右クリックに変わりました",
+        body: "ツールバーを右クリックして表示項目・並び順・表示形式を変更します。",
+    }];
+    const HIGH_20: &[HighlightItem] = &[HighlightItem {
+        title: "よく使う本をツールバーにピン留め",
+        body: "本棚の管理画面で本を固定すると、ツールバーにボタンが並びます。",
+    }];
+    const V15: VersionHighlights = VersionHighlights {
+        version: "1.5.0",
+        must_read: MUST_15,
+        highlights: &[],
+    };
+    const V20: VersionHighlights = VersionHighlights {
+        version: "2.0.0",
+        must_read: MUST_20,
+        highlights: HIGH_20,
+    };
+    let entries = [&V15, &V20];
+    snapshot_with_theme(
+        "whats_new_multi_version_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        move |ui| {
+            ui.set_width(440.0);
+            mimageviewer::version_highlights::render(ui, &entries);
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Susie 診断 UI (PoolStatus 各バリアントのレンダリング) のスナップショット
 // ---------------------------------------------------------------------------

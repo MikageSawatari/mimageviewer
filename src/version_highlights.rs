@@ -99,6 +99,52 @@ pub fn table() -> &'static [VersionHighlights] {
     TABLE
 }
 
+/// 変更点エントリ群を egui に描く (App 非依存)。ダイアログ本体と egui_kittest スナップショット
+/// テストの両方から呼べるよう、`&[&VersionHighlights]` だけを受け取る純粋な描画関数にする。
+pub fn render(ui: &mut egui::Ui, entries: &[&VersionHighlights]) {
+    let multi = entries.len() > 1;
+    for entry in entries {
+        if multi {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("v{}", entry.version))
+                    .strong()
+                    .size(15.0),
+            );
+        }
+        if !entry.must_read.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("操作・既定の変更")
+                    .strong()
+                    .color(egui::Color32::from_rgb(210, 140, 40)),
+            );
+            for item in entry.must_read {
+                render_item(ui, "⚠", item);
+            }
+        }
+        if !entry.highlights.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("主な新機能").strong());
+            for item in entry.highlights {
+                render_item(ui, "・", item);
+            }
+        }
+        ui.add_space(6.0);
+        ui.separator();
+    }
+}
+
+/// 1 項目 (見出し + 本文)。`marker` は ⚠ (必読) / ・ (新機能)。
+fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new(format!("{marker} {}", item.title)).strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new(item.body).size(12.5));
+    });
+}
+
 const TABLE: &[VersionHighlights] = &[VersionHighlights {
     version: "2.0.0",
     must_read: &[

@@ -37,3 +37,4 @@ pub(crate) mod video_upscale;
 mod vst3_actions;
 #[cfg(windows)]
 mod vst3_manager;
+mod whats_new;

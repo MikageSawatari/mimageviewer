@@ -2948,6 +2948,10 @@ pub struct App {
     pub(crate) mouse_ring_nav: Option<crate::ui_main::AddressBarNav>,
     /// 既存ユーザー向け: マウス戻る/進むボタンの既定変更を一度だけ確認する。
     pub(crate) show_mouse_nav_migration_prompt: bool,
+    /// 更新後 初回起動の「重要な変更点」ダイアログ (v2.0.0、version_highlights ④)。
+    pub(crate) show_whats_new: bool,
+    /// 表示する変更点エントリ (起動時の version またぎ / ヘルプ再表示で算出)。非永続。
+    pub(crate) whats_new_entries: Vec<&'static crate::version_highlights::VersionHighlights>,
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
     /// フルスクリーン右クリック判定用: 押下開始時刻と座標。
@@ -5016,6 +5020,24 @@ impl App {
         let video_session_muted = settings.video_start_muted || settings.video_muted;
         let show_mouse_nav_migration_prompt =
             Self::should_show_mouse_nav_migration_prompt(&settings, &load_meta);
+        // 更新後 初回起動の「重要な変更点」(version_highlights ④)。
+        // 開発用 `--whatsnew-from <ver>` で任意の前バージョンから強制表示できる
+        // (再インストール不要でまたぎ表示を目視確認するため。docs/version-highlights-plan.md §5)。
+        let whatsnew_from_override: Option<String> = {
+            let args: Vec<String> = std::env::args().collect();
+            args.windows(2)
+                .find(|w| w[0] == "--whatsnew-from")
+                .map(|w| w[1].clone())
+        };
+        let whats_new_prev = whatsnew_from_override
+            .as_deref()
+            .or(load_meta.previous_last_seen_version.as_deref());
+        let whats_new_entries = crate::version_highlights::highlights_to_show(
+            whats_new_prev,
+            env!("CARGO_PKG_VERSION"),
+            crate::version_highlights::table(),
+        );
+        let show_whats_new = !whats_new_entries.is_empty();
         // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
         // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
         let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
@@ -5410,6 +5432,8 @@ impl App {
             mouse_ring_suppress_context_menu_once: false,
             mouse_ring_nav: None,
             show_mouse_nav_migration_prompt,
+            show_whats_new,
+            whats_new_entries,
             fs_secondary_press_start: None,
             fs_middle_zoom_drag: None,
             fs_context_menu_idx: None,
@@ -6899,6 +6923,7 @@ impl App {
             || self.book_reorder.is_some()
             || self.show_preferences
             || self.show_mouse_nav_migration_prompt
+            || self.show_whats_new
             || self.show_cache_manager
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
@@ -6938,6 +6963,7 @@ impl App {
             || self.book_reorder.is_some()
             || self.show_preferences
             || self.show_mouse_nav_migration_prompt
+            || self.show_whats_new
             || self.show_cache_manager
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
@@ -36377,6 +36403,7 @@ impl eframe::App for App {
         self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
+        self.show_whats_new_dialog(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
         if !main_viewer_blocked {
             self.draw_export_dialog(ctx);
