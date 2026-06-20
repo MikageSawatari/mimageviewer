@@ -3653,6 +3653,8 @@ impl App {
         );
         // 前フレームのツールバー content rect (空き領域 右クリック用背景 interact の矩形)。
         let toolbar_bg_rect = self.toolbar_content_rect;
+        // ドラッグ並べ替えの許可状態 (既定 OFF)。OFF のときはカーソルも変えない。
+        let drag_enabled = self.settings.toolbar_section_drag_enabled;
         let any_toolbar_section = show_folder_tree_button
             || show_bookshelf
             || show_cols
@@ -3767,10 +3769,16 @@ impl App {
                 // 固定幅を明示すること。日本語ラベルは数が固定なので呼び出し側で
                 // 目視チューンした値を渡す。
                 // v2.0.0 Phase 3: セクションラベルは (a) 右クリックで「セクション設定」メニュー、
-                // (b) ドラッグでセクション並べ替え、の対象にするため、ラベル領域に
-                // click_and_drag sense を重ねた response を返す。id はラベル文字列で salt
-                // して衝突を避ける (horizontal_wrapped 内は同一 ui id)。
-                fn toolbar_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+                // (b) ドラッグでセクション並べ替え (許可時のみ)、の対象にするため、ラベル領域に
+                // sense を重ねた response を返す。id はラベル文字列で salt して衝突を避ける。
+                // `drag_enabled=false` のときは click のみにして、ドラッグ判定もカーソル変更も
+                // 起きないようにする (実機フィードバック: カーソルが頻繁に変わるのが煩わしい)。
+                fn toolbar_label(
+                    ui: &mut egui::Ui,
+                    text: &str,
+                    width: f32,
+                    drag_enabled: bool,
+                ) -> egui::Response {
                     let h = ui.spacing().interact_size.y;
                     let rect = ui
                         .allocate_ui_with_layout(
@@ -3780,11 +3788,12 @@ impl App {
                         )
                         .response
                         .rect;
-                    ui.interact(
-                        rect,
-                        ui.id().with((text, "toolbar_section_label")),
-                        egui::Sense::click_and_drag(),
-                    )
+                    let sense = if drag_enabled {
+                        egui::Sense::click_and_drag()
+                    } else {
+                        egui::Sense::click()
+                    };
+                    ui.interact(rect, ui.id().with((text, "toolbar_section_label")), sense)
                 }
 
                 ui.horizontal_wrapped(|ui| {
@@ -3800,6 +3809,12 @@ impl App {
                     .collect();
                 // 「行頭に表示」フラグ集合 (ループ内 self 借用衝突回避のため複製)。
                 let toolbar_new_row = self.settings.toolbar_section_new_row.clone();
+                // セクションラベルの hover ヒント。ドラッグ許可状態で文言を変える。
+                let lead_hint: &str = if drag_enabled {
+                    "ドラッグ: 並べ替え / 右クリック: 設定"
+                } else {
+                    "右クリック: 設定"
+                };
                 for &section in &toolbar_section_order {
                     // セクションごとの表示可否 (= 旧 `if show_*` と同一条件)。
                     let visible = match section {
@@ -3837,14 +3852,15 @@ impl App {
                     let active = self.settings.folder_tree_pane_visible;
                     // selectable_label は click sense のみなので、ドラッグ並べ替えも効くよう
                     // Button::selectable + click_and_drag にする (見た目は selectable と同じ)。
+                    // ドラッグ不許可時は click のみ (カーソルが変わらない)。
+                    let tree_sense = if drag_enabled {
+                        egui::Sense::click_and_drag()
+                    } else {
+                        egui::Sense::click()
+                    };
                     let resp = ui
-                        .add(
-                            egui::Button::selectable(active, "ツリー")
-                                .sense(egui::Sense::click_and_drag()),
-                        )
-                        .on_hover_text(
-                            "左側に実フォルダツリーを表示\nドラッグ: 並べ替え / 右クリック: 設定",
-                        );
+                        .add(egui::Button::selectable(active, "ツリー").sense(tree_sense))
+                        .on_hover_text(format!("左側に実フォルダツリーを表示\n{lead_hint}"));
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
                     }
@@ -3857,8 +3873,7 @@ impl App {
                     );
                 }
                 TS::Bookshelf => {
-                    let lead = toolbar_label(ui, "本棚:", 46.0)
-                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    let lead = toolbar_label(ui, "本棚:", 46.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(
                         ui,
                         lead,
@@ -3952,8 +3967,7 @@ impl App {
                     }
                 }
                 TS::Cols => {
-                    let lead = toolbar_label(ui, "列:", 28.0)
-                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    let lead = toolbar_label(ui, "列:", 28.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(
                         ui,
                         lead,
@@ -4030,8 +4044,7 @@ impl App {
                     }
                 }
                 TS::Aspect => {
-                    let lead = toolbar_label(ui, "比率:", 42.0)
-                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    let lead = toolbar_label(ui, "比率:", 42.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(
                         ui,
                         lead,
@@ -4133,7 +4146,7 @@ impl App {
                 TS::Sort => {
                     let details_sort_disabled = self.details_header_sort_active();
                     let sort_disabled = details_sort_disabled || book_sort_locked;
-                    let sort_label = toolbar_label(ui, "ソート:", 54.0);
+                    let sort_label = toolbar_label(ui, "ソート:", 54.0, drag_enabled);
                     let sort_label = if book_sort_locked {
                         sort_label.hover_tip("本棚内または読書履歴では表示順が固定されます。")
                     } else if details_sort_disabled {
@@ -4141,7 +4154,7 @@ impl App {
                             "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
                         )
                     } else {
-                        sort_label.hover_tip("ドラッグ: 並べ替え / 右クリック: 設定")
+                        sort_label.hover_tip(lead_hint)
                     };
                     self.finish_toolbar_section_lead(
                         ui,
@@ -4221,13 +4234,13 @@ impl App {
                         && self.global_search.aggregate;
                     // hover ヒントは disable 中の widget では拾われにくいので
                     // (egui の sense)、有効な「★:」ラベル側に乗せる。
-                    let star_label = toolbar_label(ui, "★:", 24.0);
+                    let star_label = toolbar_label(ui, "★:", 24.0, drag_enabled);
                     let star_label = if aggregated_search {
                         star_label.hover_tip(
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
                         )
                     } else {
-                        star_label.hover_tip("ドラッグ: 並べ替え / 右クリック: 設定")
+                        star_label.hover_tip(lead_hint)
                     };
                     self.finish_toolbar_section_lead(
                         ui,
@@ -4314,8 +4327,7 @@ impl App {
 
                 }
                 TS::Favorites => {
-                    let lead = toolbar_label(ui, "お気に入り:", 76.0)
-                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    let lead = toolbar_label(ui, "お気に入り:", 76.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(
                         ui,
                         lead,
@@ -4398,8 +4410,7 @@ impl App {
                 }
                 // タグセクション (docs/tag-feature.md §4.3)
                 TS::Tags => {
-                    let lead = toolbar_label(ui, "タグ:", 42.0)
-                        .hover_tip("ドラッグ: 並べ替え / 右クリック: 設定");
+                    let lead = toolbar_label(ui, "タグ:", 42.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(
                         ui,
                         lead,
@@ -4676,6 +4687,19 @@ impl App {
         });
 
         ui.separator();
+        // ドラッグ並べ替えの許可 (既定 OFF。OFF のときはカーソルも変わらない)。
+        changed |= ui
+            .checkbox(
+                &mut self.settings.toolbar_section_drag_enabled,
+                "ドラッグで並べ替えを許可",
+            )
+            .on_hover_text(
+                "ON にすると、セクションのラベルをドラッグして並べ替えできます。\n\
+                 OFF のときはドラッグ無効で、マウスカーソルも変わりません。",
+            )
+            .changed();
+
+        ui.separator();
         if ui
             .button("ツールバーを既定に戻す")
             .on_hover_text("セクションの表示・並び順・表示形式・出す項目をすべて初期状態に戻します")
@@ -4718,9 +4742,10 @@ impl App {
         s.show_address_bar_favorite_button = true;
         s.show_address_bar_history_menu = true;
         s.show_address_bar_folder_pin = true;
-        // 並び順 / 行頭
+        // 並び順 / 行頭 / ドラッグ許可
         s.toolbar_section_order = Vec::new();
         s.toolbar_section_new_row = Vec::new();
+        s.toolbar_section_drag_enabled = false;
         // 表示形式 / 折りたたみ
         s.toolbar_cols_display = ToolbarSectionDisplay::default();
         s.toolbar_aspect_display = ToolbarSectionDisplay::default();
@@ -4914,6 +4939,17 @@ impl App {
             }
             changed = true;
         }
+        // ドラッグ並べ替えの許可 (全セクション共通のグローバル設定。既定 OFF)。
+        changed |= ui
+            .checkbox(
+                &mut self.settings.toolbar_section_drag_enabled,
+                "ドラッグで並べ替えを許可",
+            )
+            .on_hover_text(
+                "ON にすると、セクションのラベルをドラッグして並べ替えできます。\n\
+                 OFF のときはドラッグ無効で、マウスカーソルも変わりません。",
+            )
+            .changed();
 
         ui.separator();
         if ui
@@ -5061,6 +5097,13 @@ impl App {
         section: crate::settings::ToolbarSectionId,
         last_anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
     ) {
+        // ドラッグ並べ替えが許可されていなければ、カーソル変更も並べ替えもしない
+        // (実機フィードバック: 通常操作中にカーソルが頻繁に変わるのが煩わしい)。
+        // ラベルの sense も click のみになっているので drag 系イベントは元々飛ばないが、
+        // hover カーソルだけはここで明示的に抑止する必要がある。
+        if !self.settings.toolbar_section_drag_enabled {
+            return;
+        }
         let drag_id = egui::Id::new("toolbar_section_drag_state");
         if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);

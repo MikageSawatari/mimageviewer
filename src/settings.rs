@@ -2098,6 +2098,12 @@ pub struct Settings {
     /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
     #[serde(default)]
     pub toolbar_section_new_row: Vec<ToolbarSectionId>,
+    /// ツールバーセクションのドラッグ並べ替えを許可するか (v2.0.0、既定 false)。
+    /// 既定 OFF にする理由: 常時ドラッグ可能にすると、通常操作中にラベル上で頻繁に
+    /// マウスカーソルが「移動可能」形状へ変わって煩わしいため (実機フィードバック 2026-06-20)。
+    /// ON のときだけ並べ替え + カーソル変更 + 挿入マーカーを有効化する。
+    #[serde(default)]
+    pub toolbar_section_drag_enabled: bool,
 
     // ── フォルダサムネイル ──────────────────────────────────────
     /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
@@ -3252,6 +3258,7 @@ impl Default for Settings {
             show_toolbar_aspect: true,
             show_toolbar_sort: true,
             toolbar_section_new_row: Vec::new(),
+            toolbar_section_drag_enabled: false,
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
@@ -4515,6 +4522,7 @@ impl Settings {
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
+        self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
