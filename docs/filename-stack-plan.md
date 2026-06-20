@@ -27,8 +27,15 @@
   `stack_showing_flat` 中のみ stack jump)。
 - **区切り文字**: `settings.stack_separator: char` (既定 `_`、`#[serde(default)]`、永続)。
 - **②製本との連携 (§5)**: 集約グリッドでスタックセルを選択 → ピン本/アクティブ本へ追加すると、
-  `add_grid_selection_to_named_book` の `stack_member_book_sources` がメンバー全部を
-  `BookPageSource::File` へ展開してコピー追加する (Codex P2 対応)。
+  `add_grid_selection_to_named_book` が `stack_member_paths` でメンバー実パスを取り出し、
+  各メンバーを `book_page_source_for_stack_member` で**通常の Grid 追加と同じ規則**に合流させる
+  (= スタック解除 → メンバー全選択 → 追加 と同結果)。具体的には `book_page_source_for_idx` の
+  Image+Grid 分岐をパスベースで再現し、①同一本ページは拒否、②色補正/非破壊回転があれば
+  `AdjustedFile` に焼き込む。メンバーは集約 items に出ず idx を持たないため、params/rotation は
+  `adjustment_db.get_page_params` / `rotation_db.get_key` を `page_path_key` 同形のキーで直接引く
+  (`set_page_params` が DB へ書き戻すので集約ビューでも正しく拾える)。エラー時は部分コピーせず全体中止。
+  (Codex P2 第1ラウンド: メンバー展開を追加 / 第2ラウンド: 旧 `stack_member_book_sources` の
+  生 `File` 展開が同一本拒否・補正/回転焼き込みを迂回していたのを上記パスベース経路へ是正)。
 - **トグルの有効条件**: `stack_mode_available` は実ディレクトリ表示のときだけ true。
   `current_folder_last_mtime.is_some()` (= dir 実体のみ Some) で PDF ページ一覧 / ZIP / 検索合成を
   除外し、Ctrl+F 現在地検索中 (`show_search_bar` / `search_filter` / `search_pending`) も不可
