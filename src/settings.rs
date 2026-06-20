@@ -5418,10 +5418,9 @@ mod tests {
         );
     }
 
-    /// JSON 手編集等で `folder_skip_limit` が UI レンジ (1..=30) 外に
-    /// なっていれば sanitize でクランプされる。下限 0 は Ctrl+↑↓ が
-    /// 機能しなくなり、上限超過は ZIP 中身検査込みの DFS が長時間走って
-    /// UI 非応答を招くため両側で防衛する。
+    /// JSON 手編集や移行で `details_name_width` が範囲外でも、sanitize で
+    /// 非有限は既定へ、有限は 40.0..=800.0 へクランプされる (実行時のレイアウト
+    /// 側 clamp に加えた二重防衛)。
     #[test]
     fn sanitize_clamps_details_name_width() {
         let mut s = Settings::default();
@@ -5449,6 +5448,10 @@ mod tests {
         );
     }
 
+    /// JSON 手編集等で `folder_skip_limit` が UI レンジ (1..=30) 外に
+    /// なっていれば sanitize でクランプされる。下限 0 は Ctrl+↑↓ が
+    /// 機能しなくなり、上限超過は ZIP 中身検査込みの DFS が長時間走って
+    /// UI 非応答を招くため両側で防衛する。
     #[test]
     fn sanitize_clamps_folder_skip_limit() {
         let mut s = Settings::default();
