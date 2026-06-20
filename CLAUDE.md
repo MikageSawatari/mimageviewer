@@ -29,6 +29,7 @@
 | ワーカー追加・キャッシュ・キャンセル処理 | [docs/async-architecture.md](docs/async-architecture.md) |
 | UI スレッドから新しい同期 I/O / GPU アップロード / read_dir 走査を呼ぶ | [docs/ui-responsiveness.md](docs/ui-responsiveness.md) (§4 チェックリスト) |
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
+| ファイル名 prefix スタック（同接頭辞の画像を畳む集約表示・フラット読書・Shift+↓↑ ジャンプ） | [docs/filename-stack-plan.md](docs/filename-stack-plan.md) |
 | 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
 | 補正レイヤー / ローカル調整 / レイヤー合成 | [docs/local-adjustment-layer-v1.1.0-plan.md](docs/local-adjustment-layer-v1.1.0-plan.md) と [docs/local-adjust-filter-candidates.md](docs/local-adjust-filter-candidates.md) |
 | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 | [docs/keymap-spec.md](docs/keymap-spec.md) と [docs/key-customization-impl-plan.md](docs/key-customization-impl-plan.md)。新しいキー操作は原則 `KeyAction` + keymap helper 経由にする |
@@ -129,7 +130,9 @@ mimageviewer/
 │   ├── catalog.rs           # SQLite サムネイルカタログ
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
 │   ├── folder_thumb_pins.rs # 親コンテナ（Folder/ZipFile/PdfFile）の代表サムネ手動ピン DB（v0.9.x、`#pin:` cache key suffix で identity を表現）
-│   ├── grid_item.rs         # GridItem（Folder/Image/Video/ZipFile/PdfFile/ZipImage/PdfPage/ZipSeparator）/ ThumbnailState 定義
+│   ├── grid_item.rs         # GridItem（Folder/Image/Video/ZipFile/PdfFile/ZipImage/PdfPage/ZipSeparator/Stack）/ ThumbnailState 定義
+│   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
+│   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード
 │   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）

@@ -1,6 +1,39 @@
 # ファイル名 prefix スタック表示 実装計画
 
-ステータス: **設計のみ・未実装** (2026-06-19 起案)
+ステータス: **実装済み (v2.0.0、2026-06-20)**。当初設計 (2026-06-19 起案) から実機フィードバックで
+ナビモデルを変更した (メンバーグリッド方式 → 集約グリッド + 直接フラットフルスクリーン)。
+本書は最終実装に合わせて更新済み。下記「実装サマリ」が最新の正本。
+
+## 実装サマリ (v2.0.0 で実装された最終形)
+
+- **モジュール**: 純ロジック [src/filename_stack.rs](../src/filename_stack.rs) (lib+bin、`StackMember` /
+  `StackGroup` / `StackView` + `prefix_of` / `group_media` / `materialize_aggregated` /
+  `materialize_flat` / flat-index 写像 / `stack_jump_target`)、App グルー
+  [src/filename_stack_ui.rs](../src/filename_stack_ui.rs) (bin-only、トグル / 開く intercept /
+  ビュー切替)。
+- **新 GridItem**: `GridItem::Stack { key, representative, count }` (集約グリッドの畳んだセル。
+  ZipDir と同じ仮想コンテナ扱い = pin / snapshot / file-op / checkable / rating すべて対象外)。
+- **2 段ビュー (メンバーグリッドは無し)**:
+  - **集約グリッド** = 1 グループ 1 セル。複数枚画像はスタックセル + 右上「N 枚」バッジ、単独は
+    通常 Image/Video セル。コンテナ (フォルダ/ZIP/PDF) は先頭に素通し表示。
+  - **フラット読書フルスクリーン** = セルを開くと `self.items` を全画像展開 (`materialize_flat`) に
+    差し替えてフルスクリーンへ。閉じると集約へ戻る (`stack_reconcile_after_fullscreen_close`)。
+- **トグル**: アドレスバー右端、サムネ枚数「12/345」の左の selectable「スタック」。ON/OFF は
+  transient (`stack_mode_requested`、永続化しない)。別フォルダ/検索/ドライブ一覧へ移ると自動解除。
+- **サムネ**: 代表は実画像ファイルなので**専用 cache key 不要** — その実ファイルの通常 per-file
+  サムネをそのまま要求・再利用する (toggle 跨ぎでキャッシュ命中)。当初案の `stackthumb:` は不採用。
+- **ナビ (フルスクリーン)**: `↓↑`=全画像フラット順送り (境界越え) / `Shift+↓↑`=次/前スタック先頭へ
+  ジャンプ / `Ctrl+↓↑`=フォルダ移動 (据え置き)。Shift+↓↑ は raw consume_key (動画音量と同流儀、
+  `stack_showing_flat` 中のみ stack jump)。
+- **区切り文字**: `settings.stack_separator: char` (既定 `_`、`#[serde(default)]`、永続)。
+- **MVP 制限**: スタックモード中の Ctrl+F / facet は集約セル (prefix キー / 代表拡張子) で照合し、
+  隠れたメンバー名/メタは未評価。Shift+↓↑ は端で no-op (次フォルダは Ctrl+↓)。breadcrumb は集約=
+  フォルダパスのまま。
+- **新機能なのでマイグレーション不要** (CLAUDE.md「永続データ・スキーマ変更時の判断」)。
+
+---
+
+## 当初設計 (履歴。最終実装は上記サマリが正本)
 
 ## 0. 背景と目的
 
