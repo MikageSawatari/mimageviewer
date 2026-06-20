@@ -6727,6 +6727,13 @@ mod tests {
             s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
+            s.toolbar_favorites_display = ToolbarSectionDisplay::Collapsible;
+            s.toolbar_tags_display = ToolbarSectionDisplay::Dropdown;
+            s.toolbar_bookshelf_display = ToolbarSectionDisplay::Collapsible;
+            s.toolbar_favorites_collapsed = true;
+            s.toolbar_tags_collapsed = true;
+            s.toolbar_bookshelf_collapsed = true;
+            s.pinned_books = vec!["テスト本".to_string()];
             s.show_toolbar_bookshelf = false;
             s.show_toolbar_facet_filter = false;
             s.ring_shortcuts.mouse_flick_enabled = true;
@@ -6911,6 +6918,32 @@ mod tests {
                 loaded.toolbar_sort_display,
                 ToolbarSectionDisplay::Dropdown,
                 "toolbar_sort_display should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_favorites_display,
+                ToolbarSectionDisplay::Collapsible,
+                "toolbar_favorites_display should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_tags_display,
+                ToolbarSectionDisplay::Dropdown,
+                "toolbar_tags_display should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_bookshelf_display,
+                ToolbarSectionDisplay::Collapsible,
+                "toolbar_bookshelf_display should survive roundtrip"
+            );
+            assert!(
+                loaded.toolbar_favorites_collapsed
+                    && loaded.toolbar_tags_collapsed
+                    && loaded.toolbar_bookshelf_collapsed,
+                "toolbar *_collapsed flags should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.pinned_books,
+                vec!["テスト本".to_string()],
+                "pinned_books should survive roundtrip"
             );
             assert!(
                 !loaded.show_toolbar_bookshelf,
