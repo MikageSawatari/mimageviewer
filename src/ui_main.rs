@@ -1086,8 +1086,10 @@ fn reorder_toolbar_section(
 }
 
 /// ドラッグ並べ替え中、ドロップ先に I 字の挿入マーカーを描く (実機フィードバック 2026-06-20)。
-/// `anchors` は前フレームの可視セクション矩形 (描画順)。`pointer` は現在のポインタ位置。
-/// 線は「挿入位置の手前のセクションの右端」(先頭なら先頭の左端) に、そのセクションの行の高さで引く。
+/// `anchors` は前フレームの可視セクション**全体**の矩形 (ラベル + 各種ボタンを含む、描画順)。
+/// マーカーは挿入先の **次セクションのラベル手前** (= 次セクション矩形の左端) に出す。次が無い
+/// (末尾へドロップ) ときは、**前セクションの要素すべての後** (= 末尾セクション矩形の右端) に出す。
+/// これでマーカーが「ソート:」等のラベル直後ではなく、ボタンの後ろ (= 実際の挿入位置) に揃う。
 fn draw_toolbar_drop_indicator(
     ui: &egui::Ui,
     anchors: &[(crate::settings::ToolbarSectionId, egui::Rect)],
@@ -1097,17 +1099,14 @@ fn draw_toolbar_drop_indicator(
         return;
     }
     let vis_idx = toolbar_drop_index(anchors, pointer);
-    let prev = (vis_idx > 0).then(|| anchors[vis_idx - 1].1);
-    let next = anchors.get(vis_idx).map(|(_, r)| *r);
-    let on_pointer_row = |r: egui::Rect| pointer.y >= r.top() && pointer.y <= r.bottom();
-    // ポインタと同じ行にあるアンカーを優先してマーカーを出す (折返し時に「前の行の末尾」へ
-    // 誤表示しないように。Codex P3)。同行の prev があればその右端、無ければ同行の next の左端。
-    let (x, top, bottom) = match (prev, next) {
-        (Some(p), _) if on_pointer_row(p) => (p.right() + 2.0, p.top(), p.bottom()),
-        (_, Some(n)) if on_pointer_row(n) => (n.left() - 2.0, n.top(), n.bottom()),
-        (Some(p), _) => (p.right() + 2.0, p.top(), p.bottom()),
-        (_, Some(n)) => (n.left() - 2.0, n.top(), n.bottom()),
-        (None, None) => return,
+    let (x, top, bottom) = if vis_idx < anchors.len() {
+        // 次セクションのラベル手前 (= 次セクション全体矩形の左端)。
+        let r = anchors[vis_idx].1;
+        (r.left() - 2.0, r.top(), r.bottom())
+    } else {
+        // 末尾へドロップ: 末尾セクションの要素すべての後 (= 末尾セクション矩形の右端)。
+        let r = anchors[anchors.len() - 1].1;
+        (r.right() + 2.0, r.top(), r.bottom())
     };
     let color = ui.visuals().selection.bg_fill;
     let stroke = egui::Stroke::new(2.0, color);
@@ -4549,6 +4548,23 @@ impl App {
                 }
                 TS::Unknown => {}
                     }
+                    // このセクションのアンカー矩形を「ラベル + 各種ボタン」の全体に広げる
+                    // (finish_toolbar_section_lead はラベル矩形しか記録しないため)。これで
+                    // ドラッグ挿入マーカーを「次セクションのラベル手前 / 末尾なら前セクションの
+                    // 要素すべての後」に正しく出せる (実機フィードバック: マーカーが「ソート:」等の
+                    // 文字直後に出てボタンの後ろとずれていた)。同一行のときだけ右端を伸ばす
+                    // (セクション内部で折り返した場合はラベル矩形のままにして負幅を避ける)。
+                    if let Some(entry) = current_section_anchors.last_mut() {
+                        let lead = entry.1;
+                        let cur = ui.cursor();
+                        if (cur.min.y - lead.top()).abs() < lead.height() {
+                            let right = cur.min.x.max(lead.right());
+                            entry.1 = egui::Rect::from_min_max(
+                                egui::pos2(lead.left(), lead.top()),
+                                egui::pos2(right, lead.bottom()),
+                            );
+                        }
+                    }
                     first_section = false;
                 }
                 });
@@ -4703,16 +4719,13 @@ impl App {
             .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。")
             .changed();
         // フォルダバー (アドレス行) も「並べ替えできないだけのセクション」として扱う。
-        // ここで s (= &mut self.settings) の借用は終わり、以降は self を使う。
+        // 他セクション同様、ここ (メニュー) では表示 ON/OFF だけ。出すボタンの細かい設定は
+        // ツールバー上の操作 = アドレスバー左端「フォルダ:」の右クリックに統一する
+        // (実機フィードバック: フォルダバーだけメニューから設定できるのは不揃い)。
         changed |= ui
             .checkbox(&mut s.show_toolbar_folder, "フォルダバー (アドレス行)")
+            .on_hover_text("詳細設定はフォルダバー左端の「フォルダ:」を右クリック")
             .changed();
-
-        // 出すボタンの細かい設定 (アドレスバー左端「フォルダ:」の右クリックと同じ内容)。
-        // フォルダバーを隠していてもここから設定・再表示できる。
-        ui.menu_button("フォルダバーの設定…", |ui| {
-            self.draw_folder_bar_settings_menu(ui);
-        });
 
         ui.separator();
         // ドラッグ並べ替えの許可 (既定 OFF。OFF のときはカーソルも変わらない)。
