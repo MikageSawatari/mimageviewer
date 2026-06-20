@@ -2663,13 +2663,28 @@ impl Keymap {
         let Some(key) = chord.key.map(KeyName::to_egui) else {
             return false;
         };
+        // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
+        // 同時に押されている間は不成立にして、Ctrl+Z (undo) / Shift+Z (分析) 等が KeyHold
+        // アクション (例: 全画面ズーム) を誤起動しないようにする (Codex P1)。FS ビューポートで
+        // stale な egui modifiers を避け、押下中判定と同じく OS 直読みを使う。
         #[cfg(windows)]
-        if let Some(name) = chord.key {
-            if key_held_via_os(name) {
+        {
+            if modifier_held_via_os(ModKind::Ctrl)
+                || modifier_held_via_os(ModKind::Shift)
+                || modifier_held_via_os(ModKind::Alt)
+            {
+                return false;
+            }
+            if let Some(name) = chord.key
+                && key_held_via_os(name)
+            {
                 return true;
             }
         }
-        ctx.input(|i| i.key_down(key))
+        ctx.input(|i| {
+            let m = i.modifiers;
+            !m.ctrl && !m.shift && !m.alt && i.key_down(key)
+        })
     }
 
     fn modifier_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {

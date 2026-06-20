@@ -1761,6 +1761,7 @@ impl App {
         self.fs_zoom_aiming = false;
         self.fs_zoom_exit_pending = false;
         self.fs_zoom_z_was_down = false;
+        self.fs_zoom_pdf_rerender_idx = None;
     }
 
     /// 一時状態 (照準中 + エッジ検出) だけリセットする。確定済みズーム (`fs_zoom_active`) は残す。
@@ -1949,9 +1950,17 @@ impl App {
                 no_limits,
                 None,
             );
-            // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。
-            // request_pdf_rerender は同解像度キャッシュがあれば早期 return するので毎フレ呼んでも安全。
-            self.maybe_rerender_pdf(zoom);
+            // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
+            // in-flight 要求をキャンセルし続けて完了しないので (Codex P1)、(idx, zoom) が変わった
+            // ときだけ要求する (request_pdf_rerender 自体も完了キャッシュ一致なら早期 return)。
+            let rerender = self.fs_zoom_pdf_rerender_idx != Some(fs_idx)
+                || (zoom - self.fs_zoom_pdf_rerender_zoom).abs()
+                    > self.fs_zoom_pdf_rerender_zoom.max(1.0) * 0.02;
+            if rerender {
+                self.fs_zoom_pdf_rerender_idx = Some(fs_idx);
+                self.fs_zoom_pdf_rerender_zoom = zoom;
+                self.maybe_rerender_pdf(zoom);
+            }
         } else {
             // 照準: 全体を contain 表示してズーム範囲の枠を重ねる。
             Self::draw_fs_image(
@@ -4035,7 +4044,7 @@ impl App {
                         let adjustment_active = self.adjustment_mode
                             && !compare_wipe_active
                             && !panorama_mode_active_now
-                            && !self.fs_zoom_active;
+                            && !self.fs_zoom_mode_engaged();
                         // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
                         // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
                         // ときは無視する (= プラグインで分析するのは動画なので)。
@@ -4680,7 +4689,7 @@ impl App {
                             self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
                         } else if !compare_wipe_active
                             && !self.is_overlay_edit_mode_active()
-                            && !self.fs_zoom_active
+                            && !self.fs_zoom_mode_engaged()
                         {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
                             // 消しゴム / 隠蔽加工モード中は自前パネルとの競合 + 編集集中度
@@ -7451,8 +7460,8 @@ impl App {
         } else if self.view_trim_mode {
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
-        } else if self.fs_zoom_active {
-            // ZipPla ズーム中は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
+        } else if self.fs_zoom_mode_engaged() {
+            // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
             self.adjustment_mode = false;
         } else {
             let edge_hover = passive_hover_enabled
@@ -11731,6 +11740,14 @@ impl App {
                     None
                 },
             )
+        };
+        // ZipPla ズーム中 (照準含む) は表示トリムを無効化して左右ページ全体を対象にする。
+        // ズームのパン/clamp はトリム前の合成ページ座標で行うため、トリム UV と混ぜると端で
+        // 切り落とし領域が見えてしまう (Codex P2-1)。全体表示なら座標系が一致して破綻しない。
+        let (content_left, content_right) = if self.fs_zoom_mode_engaged() {
+            (None, None)
+        } else {
+            (content_left, content_right)
         };
         // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。

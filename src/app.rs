@@ -3726,6 +3726,10 @@ pub struct App {
     pub(crate) fs_zoom_z_was_down: bool,
     /// ズーム中に Z で解除したフレームのラッチ。離すまで再照準を抑止する
     pub(crate) fs_zoom_exit_pending: bool,
+    /// ズーム中 PDF 再レンダの重複要求抑止 (前回要求した (idx, zoom))。毎フレ要求すると
+    /// in-flight をキャンセルし続けて永久に完了しないため (Codex P1)。
+    pub(crate) fs_zoom_pdf_rerender_idx: Option<usize>,
+    pub(crate) fs_zoom_pdf_rerender_zoom: f32,
     /// 通常フルスクリーンのパンドラッグ開始状態
     pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     /// 連結読みモードのスクロール量。現在ページ中心を 0 とし、正方向で次のユニットへ進む。
@@ -5737,6 +5741,8 @@ impl App {
             fs_zoom_factor: 1.0,
             fs_zoom_z_was_down: false,
             fs_zoom_exit_pending: false,
+            fs_zoom_pdf_rerender_idx: None,
+            fs_zoom_pdf_rerender_zoom: 1.0,
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
