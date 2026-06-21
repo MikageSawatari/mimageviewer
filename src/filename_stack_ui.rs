@@ -16,6 +16,9 @@
 //! (`swap_stack_view_items` = install_new_items + 軽量ビュー切替後始末)。
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::filename_stack::{StackMember, StackView};
 use crate::grid_item::GridItem;
@@ -28,6 +31,65 @@ pub(crate) struct StackBuildInfo {
     pub rule: Option<String>,
     /// スクリプトが失敗し組み込み既定へフォールバックした場合のエラー要旨。
     pub script_error: Option<String>,
+}
+
+/// ユーザー定義スクリプトによるグループ分けを **ワーカーで** 実行する際の保留状態
+/// (`docs/filename-stack-scripting-plan.md`)。スクリプトは任意に重くなり得る (10 万件で
+/// ~1 秒) ので UI スレッドで走らせず、通常フォルダを先に表示しつつ裏で計算し、完了後に
+/// `poll_stack_script` が集約ビューへ差し替える。
+pub(crate) struct StackScriptPending {
+    /// ワーカー結果を捨てるためのキャンセルトークン (新ロード時に立てる)。
+    pub cancel: Arc<AtomicBool>,
+    /// ワーカーからの結果。`Ok((画像分のキー列, 採用ルール名))` または `Err(要旨)`。
+    rx: Receiver<Result<(Vec<String>, Option<String>), String>>,
+    /// このグループ分けが束縛されている実フォルダ (別フォルダへ移ったら破棄)。
+    folder: PathBuf,
+    /// 全メディア (画像 + 動画、表示順)。完了時に keys と合わせてグループ化する。
+    media: Vec<StackMember>,
+    /// 画像以外のコンテナ先頭 (集約ビューの passthrough)。
+    passthrough: Vec<GridItem>,
+    passthrough_metas: Vec<Option<(i64, i64)>>,
+    separator: char,
+    sort: SortOrder,
+    /// `media` 内で画像 (= スクリプトへ渡した対象) の index。戻りキーを media 順へ戻すのに使う。
+    image_indices: Vec<usize>,
+}
+
+/// 通常フォルダの items から、集約に必要な材料 (passthrough / passthrough_metas / media) を
+/// **非破壊で** 取り出す (`build_stack_aggregated` の前半と同じだが items を消費しない。
+/// ワーカー経路では items をそのまま通常表示に使うため)。
+pub(crate) fn extract_stack_parts(
+    items: &[GridItem],
+    image_metas: &[Option<(i64, i64)>],
+    folder_count: usize,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>, Vec<StackMember>) {
+    let fc = folder_count.min(items.len()).min(image_metas.len());
+    let mut passthrough: Vec<GridItem> = items[..fc].to_vec();
+    let mut passthrough_metas: Vec<Option<(i64, i64)>> = image_metas[..fc].to_vec();
+    let mut media: Vec<StackMember> = Vec::new();
+    for (it, meta) in items[fc..].iter().zip(&image_metas[fc..]) {
+        let (mtime, size) = meta.unwrap_or((0, 0));
+        match it {
+            GridItem::Image(path) => media.push(StackMember {
+                path: path.clone(),
+                mtime,
+                size,
+                is_video: false,
+            }),
+            GridItem::Video(path) => media.push(StackMember {
+                path: path.clone(),
+                mtime,
+                size,
+                is_video: true,
+            }),
+            // 想定外種別は素通し (build_stack_aggregated と同じ防御)。
+            other => {
+                passthrough.push(other.clone());
+                passthrough_metas.push(*meta);
+            }
+        }
+    }
+    (passthrough, passthrough_metas, media)
 }
 
 /// 通常フォルダの items (コンテナ先頭 + メディア) を集約ビューへ変換し、`StackView` を作る。
@@ -145,6 +207,167 @@ pub(crate) fn stack_video_items(
 }
 
 impl crate::app::App {
+    /// 進行中のスタックスクリプトワーカーをキャンセルして破棄する。
+    pub(crate) fn cancel_stack_script_pending(&mut self) {
+        if let Some(p) = self.stack_script_pending.take() {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// ユーザー定義スクリプトによるグループ分けをワーカーで開始する。通常フォルダは既に
+    /// 表示済みで、完了後 `poll_stack_script` が集約ビューへ差し替える。
+    pub(crate) fn spawn_stack_script_worker(
+        &mut self,
+        folder: PathBuf,
+        passthrough: Vec<GridItem>,
+        passthrough_metas: Vec<Option<(i64, i64)>>,
+        media: Vec<StackMember>,
+        separator: char,
+        sort: SortOrder,
+    ) {
+        let source = crate::filename_stack_script::active_script_source();
+        // 動画はルール判定に渡さない (常に単独)。画像だけをスクリプトへ。
+        let image_indices: Vec<usize> = media
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.is_video)
+            .map(|(i, _)| i)
+            .collect();
+        let images: Vec<StackMember> = image_indices.iter().map(|&i| media[i].clone()).collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("stack-script".into())
+            .spawn(move || {
+                let result = crate::filename_stack_script::group_keys(&images, &source)
+                    .map(|r| (r.keys, r.rule));
+                if cancel_w.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.stack_script_pending = Some(StackScriptPending {
+            cancel,
+            rx,
+            folder,
+            media,
+            passthrough,
+            passthrough_metas,
+            separator,
+            sort,
+            image_indices,
+        });
+    }
+
+    /// スタックスクリプトワーカーの結果を取り込む (毎フレーム)。完了したら集約ビューへ
+    /// 差し替える。フォルダ移動 / スタック OFF で無効化された pending は破棄する。
+    pub(crate) fn poll_stack_script(&mut self, ctx: &egui::Context) {
+        // 妥当性: フォルダが変わった / スタック OFF / 既に集約済み なら破棄。
+        let still_valid = self.stack_script_pending.as_ref().is_some_and(|p| {
+            self.stack_mode_requested
+                && self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|c| crate::folder_tree::path_eq(c, &p.folder))
+                && self.stack_view.is_none()
+                && !self.stack_showing_flat
+        });
+        if self.stack_script_pending.is_some() && !still_valid {
+            self.cancel_stack_script_pending();
+            return;
+        }
+        if self.stack_script_pending.is_none() {
+            return;
+        }
+        // 計算中は再描画を促す (通常フォルダのサムネ完了後でも poll を回すため)。
+        ctx.request_repaint();
+        // フルスクリーン表示中は items 差し替えを避ける (閉じてから適用。結果は channel で待つ)。
+        if self.fullscreen_idx.is_some() {
+            return;
+        }
+        let received = match self.stack_script_pending.as_ref().unwrap().rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.stack_script_pending = None;
+                return;
+            }
+        };
+        let pending = self.stack_script_pending.take().unwrap();
+        self.apply_stack_script_result(pending, received);
+    }
+
+    /// ワーカー結果から集約ビューを組み立てて差し替える。
+    fn apply_stack_script_result(
+        &mut self,
+        pending: StackScriptPending,
+        result: Result<(Vec<String>, Option<String>), String>,
+    ) {
+        let StackScriptPending {
+            media,
+            passthrough,
+            passthrough_metas,
+            separator,
+            sort,
+            image_indices,
+            folder,
+            ..
+        } = pending;
+        let (groups, rule, err) = match result {
+            Ok((keys, rule)) => {
+                // 画像分のキーを media 順へ戻す (動画位置は空キー = group_by_keys が一意化)。
+                let mut full = vec![String::new(); media.len()];
+                for (k, &idx) in keys.into_iter().zip(image_indices.iter()) {
+                    if let Some(slot) = full.get_mut(idx) {
+                        *slot = k;
+                    }
+                }
+                (
+                    crate::filename_stack::group_by_keys(media, &full, sort),
+                    rule,
+                    None,
+                )
+            }
+            Err(e) => {
+                crate::logger::log(format!(
+                    "stack script failed (async), fallback to builtin: {e}"
+                ));
+                (
+                    crate::filename_stack::group_media(media, separator, sort),
+                    None,
+                    Some(e),
+                )
+            }
+        };
+        let sv = StackView::from_groups(
+            folder.clone(),
+            passthrough,
+            passthrough_metas,
+            separator,
+            sort,
+            groups,
+        );
+        let collapsible = sv.has_collapsible_stack();
+        let (items, metas) = sv.materialize_aggregated();
+        self.swap_stack_view_items(items, metas, &folder, None);
+        self.stack_view = Some(sv);
+        self.stack_active_rule = rule.clone();
+        self.stack_script_error = err.clone();
+        if err.is_some() {
+            self.show_feedback_toast(
+                "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)".into(),
+            );
+        } else if !collapsible {
+            self.show_feedback_toast(
+                "まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".into(),
+            );
+        } else if let Some(rule) = rule {
+            self.show_feedback_toast(format!("スタック: 「{rule}」でまとめました"));
+        }
+    }
+
     /// スタックモードのトグルが使える状況か (= 実ディレクトリの通常表示)。
     /// ZIP ツリー / PDF ページ一覧 / 検索 / タグ / 読書履歴 / ドライブ一覧などの特殊・仮想
     /// ビューでは無効。
@@ -192,7 +415,9 @@ impl crate::app::App {
         };
         self.stack_mode_requested = !self.stack_mode_requested;
         self.load_folder(folder);
-        if self.stack_mode_requested {
+        // スクリプトをワーカーで計算中 (async) のときは、ここではトーストしない。完了時に
+        // poll_stack_script が採用ルール / 失敗 / 非該当のトーストを出す。
+        if self.stack_mode_requested && self.stack_script_pending.is_none() {
             // スクリプトが失敗して既定ルールへフォールバックした場合は最優先で知らせる。
             if self.stack_script_error.is_some() {
                 self.show_feedback_toast(

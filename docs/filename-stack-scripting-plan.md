@@ -31,11 +31,22 @@
   3. 先頭連番 (`^\d+` で始まり、連番が連続したかたまりを gap で分割)
   4. 連写 (mtime が 5 秒以内に連続。クラスタ 2 つ以上で採用)
   どれも該当しなければ全て単独。動画は常に単独 (Rust 側 `group_by_keys` が一意キーへ上書き)。
-- **実行場所**: フォルダ読込時 (`build_stack_aggregated`、UI スレッド。既存 `group_media` と
-  同所)。スクリプトは CPU 処理 + 操作上限で、別フォルダナビではスタック自動解除のため頻発
-  しない。動画はルール判定に渡さず Rust 側で常に単独化 (Codex P2)。失敗 (コンパイル/実行/
-  長さ不一致/不正キー) は組み込み既定へフォールバック + トースト + logger。
-  (将来、極端に重いユーザースクリプトでも UI を止めないよう走査 worker への移設は候補。)
+- **実行場所と性能**:
+  - **組み込み既定 (separator)** は軽量な純 Rust なのでフォルダ読込時に同期構築
+    (`build_stack_aggregated`、`group_media`)。
+  - **スクリプト経路はワーカー実行**。ユーザースクリプトは任意に重くなり得る (実測: 既定
+    カスケード release で 10k=72-144ms / 100k=0.7-1.4s) ので UI スレッドで走らせない。
+    トグル時はまず通常フォルダを表示し、グループ分けを `stack-script` スレッドで実行、完了後
+    `poll_stack_script` が集約ビューへ swap (`swap_stack_view_items` 流用)。フルスクリーン中は
+    swap を保留し閉じてから適用。`StackScriptPending` を `cancel`/folder で世代管理し、
+    別フォルダ移動・スタック OFF・再ロードで cancel。動画はルール判定に渡さず Rust 側で常に
+    単独化 (Codex P2)。失敗 (コンパイル/実行/長さ不一致/不正キー) は組み込み既定へフォールバック
+    + トースト + logger。
+  - **計測テスト**: `filename_stack_script::tests::perf_10k_default_script` (`#[ignore]`、
+    `cargo test --release ... -- --ignored --nocapture` で実行)。`distinct`/`all_matched` は
+    Rust native (HashSet/iter)。Rhai 実装だと挿入毎のデータサイズ再計算で O(n²) (10 万件 16 秒)
+    になるため native 化必須。`max_string_size` は配列内文字列バイト総量を見るので 256MB、
+    `max_operations` は 100M (100k の正当処理 ~数百万 op に対し十分・暴走は阻止)。
 - **設定**: `stack_script_enabled: bool` (既定 false、`#[serde(default)]`)。UI = 環境設定
   「フォルダ」ページ (スクリプトを開く / 既定に戻す / ヘルプ)。ON/OFF 自体は v2.0.0 同様 transient。
 - **マニュアル**: 独立ページ `htdocs/mimageviewer/manual/stack.html` (既定動作 + カスタマイズ +

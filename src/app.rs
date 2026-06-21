@@ -3883,6 +3883,9 @@ pub struct App {
     /// 直近のスタック集約構築でスクリプトが失敗し組み込み既定へフォールバックした場合の
     /// エラー要旨。トグル時にトーストで知らせる。
     pub(crate) stack_script_error: Option<String>,
+    /// ユーザー定義スクリプトによるグループ分けをワーカーで実行中の保留状態。完了後に
+    /// `poll_stack_script` が集約ビューへ差し替える (`docs/filename-stack-scripting-plan.md`)。
+    pub(crate) stack_script_pending: Option<crate::filename_stack_ui::StackScriptPending>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -5802,6 +5805,7 @@ impl App {
             stack_showing_flat: false,
             stack_active_rule: None,
             stack_script_error: None,
+            stack_script_pending: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -8302,6 +8306,7 @@ impl App {
         self.stack_mode_requested = false;
         self.stack_view = None;
         self.stack_showing_flat = false;
+        self.cancel_stack_script_pending();
         crate::zip_loader::clear_nested_cache();
 
         let (tx, rx) = mpsc::channel();
@@ -8802,22 +8807,36 @@ impl App {
         // 集約ビューは start_loading_items の動画サムネスレッド起動を通すため、ここで items を
         // 差し替えてから渡す。StackView は start_loading_items が stack_view をクリアした後に設定。
         // (items / image_metas / video_items は上で `let mut` 宣言済み。)
-        let pending_stack_view = if self.stack_mode_requested {
-            // スクリプト有効時のみソースを読む (= トグル / 同一フォルダ再読込時のみ。
-            // 別フォルダへの Ctrl+↑↓ ナビではスタックは自動解除されるので頻発しない)。
-            let script_source = self
-                .settings
-                .stack_script_enabled
-                .then(crate::filename_stack_script::active_script_source);
+        // ファイル名スタック (v2.0.0 + scripting):
+        // - スクリプト無効: 組み込み既定 (separator) を同期構築 (高速)。
+        // - スクリプト有効: ユーザースクリプトは任意に重くなり得る (10 万件で ~1 秒) ので
+        //   UI スレッドで走らせない。通常フォルダを先に表示し、グループ分けはワーカーで実行、
+        //   完了後に poll_stack_script が集約ビューへ差し替える。
+        let stack_separator = self.settings.stack_separator;
+        let stack_on = self.stack_mode_requested;
+        let stack_async = stack_on && self.settings.stack_script_enabled;
+        // 集約材料 (script 経路) は items を start_loading_items が消費する前に非破壊で取り出す。
+        let stack_async_materials = if stack_async {
+            Some(crate::filename_stack_ui::extract_stack_parts(
+                &items,
+                &image_metas,
+                folder_count,
+            ))
+        } else {
+            None
+        };
+        let stack_folder = path.clone();
+
+        let pending_stack_view = if stack_on && !stack_async {
             let (agg_items, agg_metas, agg_videos, sv, info) =
                 crate::filename_stack_ui::build_stack_aggregated(
                     path.clone(),
                     items,
                     image_metas,
                     folder_count,
-                    self.settings.stack_separator,
+                    stack_separator,
                     sort,
-                    script_source.as_deref(),
+                    None,
                 );
             items = agg_items;
             image_metas = agg_metas;
@@ -8845,6 +8864,19 @@ impl App {
             // ユーザー意図を復元する (次の同一フォルダ再読込 = ソート変更等でも維持される)。
             self.stack_mode_requested = true;
             self.stack_view = Some(sv);
+        }
+        if let Some((passthrough, passthrough_metas, media)) = stack_async_materials {
+            // start_loading_items が stack_mode_requested / stack_script_pending をリセットした
+            // 後で、通常フォルダ表示のままワーカーへグループ分けを投げる。
+            self.stack_mode_requested = true;
+            self.spawn_stack_script_worker(
+                stack_folder,
+                passthrough,
+                passthrough_metas,
+                media,
+                stack_separator,
+                sort,
+            );
         }
 
         if crate::perf::is_enabled() {
@@ -12023,6 +12055,8 @@ impl App {
         self.stack_view = None;
         self.stack_mode_requested = false;
         self.stack_showing_flat = false;
+        // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
+        self.cancel_stack_script_pending();
         self.gamepad_location_picker = None;
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
@@ -36004,6 +36038,8 @@ impl eframe::App for App {
         self.poll_favsearch();
         self.poll_tag_view();
         self.poll_metadata_load();
+        // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
+        self.poll_stack_script(ctx);
         self.poll_details_meta_load(ctx);
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
         // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み
