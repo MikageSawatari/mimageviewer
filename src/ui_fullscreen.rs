@@ -1942,7 +1942,7 @@ impl App {
         let cursor_img = zip_cursor_image_px(pan_band, content_min, content_size, cursor);
         let bg_style = self.fs_bg_style(ctx);
         if active {
-            let (zoom, pan) = zip_cover_zoom_pan(
+            let (zoom_full, pan_full) = zip_cover_zoom_pan(
                 image_rect.size(),
                 display_size,
                 content_min,
@@ -1950,6 +1950,21 @@ impl App {
                 factor,
                 cursor_img,
             );
+            // トリム時は content_bbox を draw_fs_image に渡して切り落とした余白を crop する
+            // (ズームアウトで contain まで縮めても余白を再表示しない、Codex P2)。content_bbox 経路は
+            // bbox-fit で座標系が変わるので、full-image 基準の (zoom, pan) を bbox 基準へ変換して
+            // 位置を保つ。トリム無しはそのまま (恒等)。
+            let (zoom, pan) = match trim_bbox {
+                Some(_) => zip_bbox_zoom_pan_from_full(
+                    zoom_full,
+                    pan_full,
+                    image_rect.size(),
+                    display_size,
+                    content_min,
+                    content_size,
+                ),
+                None => (zoom_full, pan_full),
+            };
             Self::draw_fs_image(
                 ui,
                 image_rect,
@@ -1966,18 +1981,18 @@ impl App {
                 pixel_grid,
                 FullscreenFitMode::Page,
                 no_limits,
-                None,
+                trim_bbox,
             );
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
             // in-flight 要求をキャンセルし続けて完了しないので (Codex P1)、(idx, zoom) が変わった
-            // ときだけ要求する (request_pdf_rerender 自体も完了キャッシュ一致なら早期 return)。
+            // ときだけ要求する。判定は画面上の拡大率に比例する full-image 基準 zoom_full を使う。
             let rerender = self.fs_zoom_pdf_rerender_idx != Some(fs_idx)
-                || (zoom - self.fs_zoom_pdf_rerender_zoom).abs()
+                || (zoom_full - self.fs_zoom_pdf_rerender_zoom).abs()
                     > self.fs_zoom_pdf_rerender_zoom.max(1.0) * 0.02;
             if rerender {
                 self.fs_zoom_pdf_rerender_idx = Some(fs_idx);
-                self.fs_zoom_pdf_rerender_zoom = zoom;
-                self.maybe_rerender_pdf(zoom);
+                self.fs_zoom_pdf_rerender_zoom = zoom_full;
+                self.maybe_rerender_pdf(zoom_full);
             }
         } else {
             // 照準: トリム後コンテンツを contain 表示してズーム範囲の枠を重ねる。
@@ -2353,6 +2368,35 @@ fn zip_cover_zoom_pan(
         (display_size.x / 2.0 - center_img.x) * total,
         (display_size.y / 2.0 - center_img.y) * total,
     );
+    (zoom, pan)
+}
+
+/// `zip_cover_zoom_pan` が返す **full-image 基準** (ページ全体フィット `display_size` に対する)
+/// `(zoom, pan)` を、`draw_fs_image` に **content_bbox を渡したとき同じ img_rect になる bbox 基準**の
+/// `(zoom, pan)` へ変換する。
+///
+/// `draw_fs_image` は `content_bbox` 指定時に「bbox を contain フィット → ×zoom → bbox 中心寄せ」で
+/// 描くため、full-image 基準の値をそのまま渡すと位置がずれる。本変換で **位置 (img_rect) を保ったまま
+/// content_bbox による UV クロップだけを得る** (= ズームアウトで contain まで縮めても切り落とした余白を
+/// 再表示しない、Codex P2)。トリム無し (`content_min = 0`, `content_size = display_size`) では恒等変換。
+fn zip_bbox_zoom_pan_from_full(
+    zoom_full: f32,
+    pan_full: egui::Vec2,
+    view: egui::Vec2,
+    display_size: egui::Vec2,
+    content_min: egui::Vec2,
+    content_size: egui::Vec2,
+) -> (f32, egui::Vec2) {
+    let page_fit = (view.x / display_size.x.max(1.0)).min(view.y / display_size.y.max(1.0));
+    let contain = (view.x / content_size.x.max(1.0)).min(view.y / content_size.y.max(1.0));
+    let total = zoom_full * page_fit;
+    let content_center = content_min + content_size * 0.5;
+    let zoom = if contain > 0.0 {
+        zoom_full * page_fit / contain
+    } else {
+        zoom_full
+    };
+    let pan = pan_full + (content_center - display_size * 0.5) * total;
     (zoom, pan)
 }
 
@@ -16664,6 +16708,58 @@ mod tests {
             egui::vec2(5.0, 5.0),
         );
         assert_eq!(zoom2, 1.0);
+    }
+
+    #[test]
+    fn zip_bbox_zoom_pan_keeps_content_screen_position() {
+        // full-image 基準 (zoom,pan) を bbox 基準へ変換しても、コンテンツ上の点のスクリーン位置が
+        // 一致する (= draw_fs_image に content_bbox を渡しても位置不変・余白だけ crop、Codex P2)。
+        let view = egui::vec2(300.0, 300.0);
+        let display = egui::vec2(400.0, 400.0);
+        let content_min = egui::vec2(100.0, 0.0); // 左右トリム (中央 200x400)
+        let content_size = egui::vec2(200.0, 400.0);
+        let factor = 0.6; // ズームアウト気味 (contain 寄り)
+        let cursor_img = content_min + content_size * 0.5;
+        let (zoom_full, pan_full) =
+            zip_cover_zoom_pan(view, display, content_min, content_size, factor, cursor_img);
+        let (zoom_b, pan_b) = zip_bbox_zoom_pan_from_full(
+            zoom_full,
+            pan_full,
+            view,
+            display,
+            content_min,
+            content_size,
+        );
+        let page_fit = (view.x / display.x).min(view.y / display.y);
+        let contain = (view.x / content_size.x).min(view.y / content_size.y);
+        let total_full = zoom_full * page_fit; // full-image: total_scale
+        let total_b = zoom_b * contain; // bbox: fit_scale(=contain) * zoom
+        assert!((total_full - total_b).abs() < 0.001, "総合倍率が一致");
+        // コンテンツ上の点 p のスクリーン位置: full=(center+pan_full+(p-display/2)*total),
+        // bbox=(center+pan_b+(p-content_center)*total)。一致するはず。
+        let center = view * 0.5;
+        let content_center = content_min + content_size * 0.5;
+        for p in [egui::vec2(150.0, 200.0), egui::vec2(200.0, 50.0)] {
+            let s_full = center + pan_full + (p - display * 0.5) * total_full;
+            let s_b = center + pan_b + (p - content_center) * total_b;
+            assert!(
+                (s_full.x - s_b.x).abs() < 0.01 && (s_full.y - s_b.y).abs() < 0.01,
+                "スクリーン位置が一致: {s_full:?} vs {s_b:?}"
+            );
+        }
+        // トリム無し (content = display 全体) は恒等変換。
+        let (zi, pi) = zip_bbox_zoom_pan_from_full(
+            2.0,
+            egui::vec2(10.0, 20.0),
+            view,
+            display,
+            egui::Vec2::ZERO,
+            display,
+        );
+        assert!(
+            (zi - 2.0).abs() < 0.001 && (pi - egui::vec2(10.0, 20.0)).length() < 0.001,
+            "トリム無しは恒等変換"
+        );
     }
 
     #[test]
