@@ -101,10 +101,11 @@ v2.0.0 のスタックは「stem の末尾区切り文字の前」固定 (`prefi
   → Vec<StackMember> {path, mtime, size, is_video}   ← すべてスキャン済み、追加 I/O なし
                                                        (is_video は Rust 側の動画単独化用。
                                                         スクリプトには渡さない)
-  → [スタックモード ON のとき]
-       ├ スクリプト有効 & コンパイル成功 → Rhai でグループキー配列を算出 (worker 上、画像のみ渡す)
-       │     └ 失敗/タイムアウト/長さ不一致 → トースト + 組み込み既定ルールへフォールバック
-       └ スクリプト無効 → 既存 group_media(separator) (組み込み既定)
+  → [スタックモード ON のとき] 常に worker で Rhai を実行 (画像のみ渡す)
+       ├ スクリプト設定 ON  → ユーザーの stack_rules.rhai (無ければ内蔵 DEFAULT_SCRIPT)
+       ├ スクリプト設定 OFF → 内蔵 DEFAULT_SCRIPT (= 既定カスケード。これも worker で実行)
+       └ どちらも 失敗/コンパイルエラー/長さ不一致 → トースト + group_media(separator) へ
+            フォールバック (= フォールバック専用経路。通常の OFF はここを通らない)
   → keys[] を Rust 側で group 化 (first-appearance 順, member は入力順, 2件以上で畳む)
   → StackView (既存) → 集約グリッド / フラットフルスクリーン (既存、変更なし)
 ```
@@ -229,8 +230,10 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
 - **スクリプト経路はフォルダ走査 worker 上で実行**し、キー配列を結果に同梱して UI へ返す
   (CLAUDE.md「UI スレッド同期 I/O は即 worker 化」)。10k の map 構築 + Rhai 評価は数〜
   数十 ms 想定だが、UI スレッドでは行わない。キャンセルは既存の走査 cancel に相乗り。
-- **組み込み既定ルール (`group_media`) は安価なので従来どおりインラインで可**。スクリプト
-  経路だけ worker 化する。
+- **通常経路はスクリプト設定 ON/OFF とも worker 上の Rhai 実行**。OFF でも内蔵 `DEFAULT_SCRIPT`
+  を worker で走らせる (= かつての「OFF=インライン separator」経路は廃止)。
+- **`group_media` は失敗時フォールバック専用**で、スクリプトがコンパイル/実行/長さ不一致で
+  失敗したときだけ結果適用時 (UI スレッド) に走る。安価なのでこの稀な経路はインラインで可。
 - perf::event を挿す: `stack/script_eval` (件数 + 所要 + ops + フォールバック有無)。
   タイムアウト (例 200ms 相当の ops 到達) でフォールバック。
 
@@ -263,8 +266,8 @@ v2.0.0 自体が**未リリース**なので `stack_separator` 含めマイグ�
 
 | フィールド | 型 | 既定 | 意味 |
 | --- | --- | --- | --- |
-| `stack_separator` | char | `_` | **組み込み既定ルール用**の区切り文字 (スクリプト無効時に使用)。既存のまま流用。 |
-| `stack_script_enabled` | bool | `false` | true かつスクリプトファイルが有効なら Rhai 経路、それ以外は組み込み既定。`#[serde(default)]`。 |
+| `stack_separator` | char | `_` | **失敗時フォールバック (`group_media`) 用**の区切り文字。スクリプトが失敗したときだけ使う。既存のまま流用。 |
+| `stack_script_enabled` | bool | `false` | true ならユーザーの `stack_rules.rhai` (無ければ内蔵 `DEFAULT_SCRIPT`)、false でも内蔵 `DEFAULT_SCRIPT` を worker 実行。どちらも失敗時のみ `group_media` へフォールバック。`#[serde(default)]`。 |
 
 - スクリプトパスは `data_dir` 由来で**設定に保存しない** (環境追従のため)。
 - スタックモードの ON/OFF 自体は従来どおり transient (永続化しない)。
