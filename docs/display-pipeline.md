@@ -616,7 +616,8 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 keymap カスタマイズ可) のホールドで動き、
 ズーム中は「cover 倍率 (画像が画面を覆う最小倍率) × `fs_zoom_factor`」を `zoom_pan` に変換して
 ページ全体フィット指定で描く (`zip_cover_zoom_pan`)。**既定 `fs_zoom_factor = 1.0` = cover** で、
-縦長画像では横幅目一杯 (ZipPla 単ページの既定) になる。ホイールで倍率変更。
+縦長画像では横幅目一杯 (ZipPla 単ページの既定) になる。ホイールは照準中 (Z 押下中) のみ倍率変更で、
+ズーム確定後は前後ページ移動 (倍率変更は Ctrl+ホイール、ZipPla 準拠)。
 パンはカーソル位置を**操作帯 (`pan_band`)** 基準で元画像範囲へ写す (`zip_cursor_image_px`)。操作帯は
 画面から上下のホバーバー領域 (上部バー `TOP_BAR_HOVER_Y` / 下部 `FS_SEEK_BAR_HEIGHT`) を内側へ
 詰めた矩形で、**カーソルがホバー領域へ入る前に画像の上端・下端へ到達**する (実機 FB 2026-06-21)。

@@ -7587,10 +7587,14 @@ impl App {
                 i.events
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
-            if self.fs_zoom_mode_engaged() {
-                // ZipPla 風全画面ズーム: ホイールで倍率変更 (照準中・ズーム中の両方、見開きも)。
-                // ページ送りは矢印 / クリックに残し、ホイールはズームに振る。
+            if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
+                // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
+                // Ctrl+ホイールのときだけ倍率変更。
                 self.adjust_fs_zoom_factor(wheel_y);
+            } else if self.fs_zoom_active {
+                // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
+                let base = if wheel_y < 0.0 { 1 } else { -1 };
+                nav_delta = self.spread_nav_delta(base);
             } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
