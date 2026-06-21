@@ -111,12 +111,18 @@ fn ext_of(p: &Path) -> String {
 /// サンドボックス済みエンジンを作る。
 fn build_engine() -> Engine {
     let mut engine = Engine::new();
-    // 暴走 backstop (自動実行されるユーザースクリプト用)。UI スレッドで走るので
-    // op 上限はやや低め (既定スクリプトの 10k ファイルは ~数十万 op で十分収まる)。
-    engine.set_max_operations(10_000_000);
+    // 暴走 backstop (自動実行されるユーザースクリプト用)。実測 (perf_10k) では native
+    // ヘルパー化後の 100k camera で ~数百万 op なので、100M はその ~30 倍の余裕。無限ループ
+    // 等は確実に止めつつ、10 万件の正当な処理は通す。スクリプトはワーカーで走るので UI は
+    // ブロックされない (本数値は OOM / 暴走の最終防壁)。
+    engine.set_max_operations(100_000_000);
     engine.set_max_call_levels(64);
     engine.set_max_expr_depths(64, 64);
-    engine.set_max_string_size(64 * 1024);
+    // 注意: Rhai の max_string_size は配列/マップ内の文字列バイト**総量**を再帰的に見る。
+    // 10k〜100k ファイルだと files 配列 (名前×N) + keys 配列で数〜数十 MB になるため、個々の
+    // 文字列ではなく総量を許容できる大きさにする (= 暴走した単一巨大文字列の OOM 防止のみを
+    // 担う上限。ループ回数は max_operations で別途縛る)。
+    engine.set_max_string_size(256 * 1024 * 1024);
     engine.set_max_array_size(8_000_000);
     engine.set_max_map_size(8_000_000);
     engine.disable_symbol("eval");
@@ -158,6 +164,24 @@ fn build_engine() -> Engine {
         let mut idx: Vec<usize> = (0..vals.len()).collect();
         idx.sort_by_key(|&i| vals[i]); // stable
         idx.into_iter().map(|i| Dynamic::from(i as i64)).collect()
+    });
+    // 全要素が () でない (= 全ファイルがそのルールに該当する) か。Rust 側 O(n)。
+    // ※ Rhai の for ループ + map で書くと要素ごとに interpreter を回り遅いので native 化。
+    engine.register_fn("stack_all_matched", |keys: rhai::Array| -> bool {
+        keys.iter().all(|d| !d.is_unit())
+    });
+    // 異なるキーの数 (() は無視)。Rust の HashSet で O(n)。
+    // ※ Rhai のマップで実装すると、Rhai が挿入のたびにデータサイズを再計算するため
+    //   O(n^2) になり 10 万件で 16 秒かかる退行になる。必ず native 側で数える。
+    engine.register_fn("stack_distinct", |keys: rhai::Array| -> i64 {
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for d in &keys {
+            if d.is_unit() {
+                continue;
+            }
+            set.insert(d.to_string());
+        }
+        set.len() as i64
     });
 
     engine
@@ -408,5 +432,83 @@ mod tests {
         let r = group_keys(&media, src).expect("int keys ok");
         assert_eq!(r.keys[0], "7");
         assert_eq!(r.keys[1], "7");
+    }
+
+    // 10k ファイルでの既定スクリプト実行時間を測る (perf 計測)。
+    // 実態は release ビルドなので、必ず `--release` で走らせる:
+    //   cargo test --release --lib filename_stack_script::tests::perf_10k -- --ignored --nocapture
+    // (debug ビルドの Rhai インタプリタは桁違いに遅く、実アプリの目安にならない。)
+    #[test]
+    #[ignore = "perf 計測。`cargo test --release ... -- --ignored --nocapture` で実行"]
+    fn perf_10k_default_script() {
+        use std::time::Instant;
+
+        // 代表的なフォルダ形状を size 件ぶん作る (採用ルールが異なる = 走るルール数が違う)。
+        fn mxd(n: usize) -> Vec<StackMember> {
+            // ルール1 (命名パターン) で即採用 — 1 走査
+            (0..n)
+                .map(|i| {
+                    m(
+                        &format!(
+                            "20260429_1100_{:04}_{:010}_p01_m{:02}_@artist.jpg",
+                            i / 4,
+                            i / 4,
+                            i % 4
+                        ),
+                        0,
+                        false,
+                    )
+                })
+                .collect()
+        }
+        fn pixiv(n: usize) -> Vec<StackMember> {
+            // ルール2 (末尾連番) で採用 — rule1 全走査 + rule2 全走査
+            (0..n)
+                .map(|i| m(&format!("{:08}_p{}.jpg", i / 5, i % 5), 0, false))
+                .collect()
+        }
+        fn camera(n: usize) -> Vec<StackMember> {
+            // 連写 — rule1/2/3 を全走査して落ち rule4 で採用 (最重ケース)
+            (0..n)
+                .map(|i| {
+                    m(
+                        &format!("IMG_{:06}.jpg", 1000 + i),
+                        100 * (i / 5) as i64 + (i % 5) as i64,
+                        false,
+                    )
+                })
+                .collect()
+        }
+
+        for &size in &[10_000usize, 100_000usize] {
+            let scenarios: [(&str, Vec<StackMember>); 3] = [
+                ("mxd (rule1 即採用)", mxd(size)),
+                ("pixiv (rule2 採用)", pixiv(size)),
+                ("camera (rule4=最重)", camera(size)),
+            ];
+            for (name, media) in &scenarios {
+                // warmup (regex キャッシュを温める = アプリ稼働中の定常状態に合わせる)。
+                let warm = match group_keys(media, DEFAULT_SCRIPT) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        println!("[perf] {size:>7} {name:<22} ERROR: {e}");
+                        continue;
+                    }
+                };
+                assert_eq!(warm.keys.len(), media.len());
+                let mut best = f64::INFINITY;
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    let r = group_keys(media, DEFAULT_SCRIPT).expect("runs");
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                    std::hint::black_box(&r);
+                    best = best.min(ms);
+                }
+                println!(
+                    "[perf] {size:>7} {name:<22} best={best:7.1}ms rule={:?}",
+                    warm.rule
+                );
+            }
+        }
     }
 }

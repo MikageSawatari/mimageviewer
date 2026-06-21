@@ -30,22 +30,22 @@
 fn group(files) {
     // 1) 命名パターン: 末尾に固定接尾辞が付き途中の番号だけ変わる形 (mXD 等)
     let k = rule_suffix_fixed(files);
-    if all_matched(k) {
+    if stack_all_matched(k) {
         return #{ rule: "命名パターン", keys: k };
     }
     // 2) 末尾が連番 / ページ番号 ("name_001" "id_p0" など)
     k = rule_trailing_number(files);
-    if all_matched(k) && distinct(k) >= 2 {
+    if stack_all_matched(k) && stack_distinct(k) >= 2 {
         return #{ rule: "末尾連番", keys: k };
     }
     // 3) 先頭が連番 ("0001_xxxx") を連続したかたまりごとに (切れ目で分割)
     k = rule_leading_serial(files);
-    if all_matched(k) && distinct(k) >= 2 {
+    if stack_all_matched(k) && stack_distinct(k) >= 2 {
         return #{ rule: "先頭連番", keys: k };
     }
     // 4) 更新時刻が近いもの (連写): クラスタが 2 つ以上できたら採用
     k = rule_time_burst(files);
-    if distinct(k) >= 2 {
+    if stack_distinct(k) >= 2 {
         return #{ rule: "更新時刻", keys: k };
     }
     // どれも該当せず -> 全て単独
@@ -121,28 +121,6 @@ fn rule_time_burst(files) {
     keys
 }
 
-// ---- 補助: 全ファイルが該当か (() が 1 つも無い) ----
-fn all_matched(keys) {
-    for k in keys {
-        if k == () {
-            return false;
-        }
-    }
-    true
-}
-
-// ---- 補助: 異なるキーの数 (() は無視) ----
-fn distinct(keys) {
-    let seen = #{};
-    let n = 0;
-    for k in keys {
-        if k == () {
-            continue;
-        }
-        if !(k in seen) {
-            seen[k] = true;
-            n += 1;
-        }
-    }
-    n
-}
+// 補助関数 stack_all_matched(keys) / stack_distinct(keys) は本体側が提供する native 関数
+// (Rust で O(n))。Rhai で書くと要素ごとに interpreter を回り、特に distinct はマップ挿入の
+// たびに Rhai がデータサイズを再計算して O(n^2) になるため (10 万件で 16 秒)、native 化している。
