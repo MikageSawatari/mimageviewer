@@ -11767,14 +11767,9 @@ impl App {
                 },
             )
         };
-        // ZipPla ズーム中 (照準含む) は表示トリムを無効化して左右ページ全体を対象にする。
-        // ズームのパン/clamp はトリム前の合成ページ座標で行うため、トリム UV と混ぜると端で
-        // 切り落とし領域が見えてしまう (Codex P2-1)。全体表示なら座標系が一致して破綻しない。
-        let (content_left, content_right) = if self.fs_zoom_mode_engaged() {
-            (None, None)
-        } else {
-            (content_left, content_right)
-        };
+        // ZipPla ズーム中もトリムを維持する。ズームのパン/clamp を「トリム後合成ページ」
+        // (fit_w × fit_h) 座標で行い (下記)、layout_spread_page_rects のトリム配置と座標系を
+        // 一致させることで、トリム後コンテンツだけを拡大表示する (= 余白を見せない)。
         // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
         let left_location = self.location_display_for_loading(left_idx);
@@ -11883,13 +11878,15 @@ impl App {
             };
             let fit_scale = fit_scale_limits.apply(fit_scale);
 
-            // ZipPla 風 全画面ズーム (見開き、Phase B): 合成ページを cover×factor 相当へ拡大し、
-            // カーソル位置でパン。照準中は fit のまま枠 (aim_frame) を出す。トリム (content_active)
-            // との併用ではトリム中央寄せを無効化して合成ページ全体を対象にする (niche 妥協)。
+            // ZipPla 風 全画面ズーム (見開き): **トリム後合成ページ** (fit_w × fit_h、トリムが
+            // 無ければ combined_w × combined_h) を cover×factor 相当へ拡大し、カーソル位置でパン。
+            // composite をトリム後サイズにすることで pan/clamp がトリム配置 (content_center_offset +
+            // layout_spread_page_rects) と一致し、トリム後コンテンツだけを拡大表示する (余白を見せない)。
+            // 照準中は fit のまま枠 (aim_frame) を出す。
             let mut aim_frame: Option<egui::Rect> = None;
             let (zoom_pan, content_center_offset) = if self.fs_zoom_mode_engaged() {
-                let composite = egui::vec2(combined_w, combined_h);
-                let single_page_w = combined_w * 0.5;
+                let composite = egui::vec2(fit_w, fit_h);
+                let single_page_w = fit_w * 0.5;
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
@@ -11910,9 +11907,11 @@ impl App {
                     cursor_comp,
                 );
                 if self.fs_zoom_active {
-                    (Some((zoom, pan)), egui::Vec2::ZERO)
+                    // content_center_offset (トリム中央寄せ) を active でも維持する。これにより
+                    // base_center + pan と layout のトリム配置の座標系が一致する (トリム無しでは 0)。
+                    (Some((zoom, pan)), content_center_offset)
                 } else {
-                    // 照準枠: 合成ページは fit_scale で image_rect 中心に表示される前提。
+                    // 照準枠: トリム後合成ページが fit_scale で image_rect 中心に表示される前提。
                     let comp_disp_min = image_rect.center() - composite * (fit_scale * 0.5);
                     let frame_min = comp_disp_min
                         + egui::vec2(center_comp.x - vis.x / 2.0, center_comp.y - vis.y / 2.0)
