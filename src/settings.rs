@@ -3275,9 +3275,15 @@ impl Default for Settings {
             toolbar_cols_details_visible: true,
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_aspect_auto_visible: default_toolbar_aspect_auto_visible(),
-            toolbar_cols_display: ToolbarSectionDisplay::default(),
-            toolbar_aspect_display: ToolbarSectionDisplay::default(),
-            toolbar_sort_display: ToolbarSectionDisplay::default(),
+            // 新規インストールの既定: 列 / 比率 / ソートはプルダウンにして既定ツールバーの
+            // 幅を狭くする (v2.0.0)。**enum の既定 (ToolbarSectionDisplay::default() = Buttons)
+            // は変えない** — settings_db は不足キーを `#[serde(default)]` = enum 既定で埋めるため、
+            // それを変えると v1.9.0 から更新した既存ユーザーまで巻き込んでしまう。ここ
+            // (Settings::default) は DB が無い新規インストールだけが通る経路なので、ここでだけ
+            // Dropdown を指定すれば「既存ユーザーは展開のまま / 新規ユーザーはプルダウン」になる。
+            toolbar_cols_display: ToolbarSectionDisplay::Dropdown,
+            toolbar_aspect_display: ToolbarSectionDisplay::Dropdown,
+            toolbar_sort_display: ToolbarSectionDisplay::Dropdown,
             toolbar_favorites_display: ToolbarSectionDisplay::default(),
             toolbar_tags_display: ToolbarSectionDisplay::default(),
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
@@ -4882,6 +4888,37 @@ mod tests {
         // (フィールド無し) を読んだとき既定 '_' になる (docs/filename-stack-plan.md §6)。
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.stack_separator, '_');
+    }
+
+    #[test]
+    fn toolbar_cols_aspect_sort_dropdown_default_only_for_new_installs() {
+        // v2.0.0: 既定ツールバーの幅を狭くするため、列 / 比率 / ソートの表示形式は
+        // **新規インストールだけ** プルダウンを既定にする。既存ユーザー (v1.9.0 から更新 =
+        // settings.db に当該キーが無い) は展開 (Buttons) のまま維持する。
+        //
+        // - 新規インストール経路 = `Settings::default()` → プルダウン。
+        let d = Settings::default();
+        assert_eq!(d.toolbar_cols_display, ToolbarSectionDisplay::Dropdown);
+        assert_eq!(d.toolbar_aspect_display, ToolbarSectionDisplay::Dropdown);
+        assert_eq!(d.toolbar_sort_display, ToolbarSectionDisplay::Dropdown);
+
+        // - 既存ユーザー経路 = settings_db の `from_value(map)` で当該キーが欠けている状態。
+        //   `#[serde(default)]` = `ToolbarSectionDisplay::default()` = Buttons (展開) になる。
+        //   ここを Buttons に固定しておくことが「既存ユーザーは変わらない」契約の要。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.toolbar_cols_display, ToolbarSectionDisplay::Buttons);
+        assert_eq!(
+            loaded.toolbar_aspect_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert_eq!(loaded.toolbar_sort_display, ToolbarSectionDisplay::Buttons);
+
+        // お気に入り / タグ / 本棚は今回の変更対象外: 新規・既存とも展開のまま。
+        assert_eq!(d.toolbar_favorites_display, ToolbarSectionDisplay::Buttons);
+        assert_eq!(
+            loaded.toolbar_favorites_display,
+            ToolbarSectionDisplay::Buttons
+        );
     }
 
     #[test]

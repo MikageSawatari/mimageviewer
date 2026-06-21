@@ -4889,10 +4889,11 @@ impl App {
         s.toolbar_section_order = Vec::new();
         s.toolbar_section_new_row = Vec::new();
         s.toolbar_section_drag_enabled = false;
-        // 表示形式 / 折りたたみ
-        s.toolbar_cols_display = ToolbarSectionDisplay::default();
-        s.toolbar_aspect_display = ToolbarSectionDisplay::default();
-        s.toolbar_sort_display = ToolbarSectionDisplay::default();
+        // 表示形式 / 折りたたみ。「既定に戻す」= 新規インストールの既定に揃えるので、
+        // 列 / 比率 / ソートは新規既定と同じプルダウンにする (Settings::default と一致)。
+        s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
+        s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
+        s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
         s.toolbar_favorites_display = ToolbarSectionDisplay::default();
         s.toolbar_tags_display = ToolbarSectionDisplay::default();
         s.toolbar_bookshelf_display = ToolbarSectionDisplay::default();
