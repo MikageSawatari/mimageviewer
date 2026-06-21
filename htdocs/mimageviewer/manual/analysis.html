@@ -53,7 +53,15 @@
   <main class="content">
     <h1 class="page-title">画像分析モード</h1>
     <p class="page-desc">イラスト・写真の色彩やバランスを詳しく分析するためのツールです。
-    フルスクリーン表示中に <kbd>Z</kbd> キーまたはホバーバーの 🔬 ボタンで起動します。</p>
+    フルスクリーン表示中に <kbd>Shift</kbd>+<kbd>Z</kbd> キーまたはホバーバーの 🔬 ボタンで起動します。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <kbd>Z</kbd> キー単体は<a href="fullscreen.html#zoom">部分拡大ズーム</a>に割り当てられています。
+        画像分析モードは <kbd>Shift</kbd>+<kbd>Z</kbd> です。
+      </div>
+    </div>
 
     <h2>分析モードの開始 / 終了</h2>
     <div class="table-wrap">
@@ -62,7 +70,7 @@
           <tr><th>操作</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>Z</kbd></td><td>分析モードの ON / OFF を切り替え</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>Z</kbd></td><td>分析モードの ON / OFF を切り替え</td></tr>
           <tr><td>ホバーバーの 🔬 ボタン</td><td>分析モード ON / OFF</td></tr>
           <tr><td>分析パネル右上の × ボタン</td><td>分析モード OFF（フルスクリーンは維持）</td></tr>
         </tbody>
@@ -106,8 +114,8 @@
       <div class="box-body">
         <strong>通常表示との連携：</strong>
         ズーム / パンの状態は、通常のフルスクリーン表示と分析モードの間で引き継がれます。
-        通常表示で <kbd>Ctrl</kbd>+ホイールでズームしてから <kbd>Z</kbd> キーで分析モードに入ると、
-        同じ倍率・位置のまま分析できます。逆に分析モードでズームした状態で <kbd>Z</kbd> キーで通常表示に戻ると、
+        通常表示で <kbd>Ctrl</kbd>+ホイールでズームしてから <kbd>Shift</kbd>+<kbd>Z</kbd> キーで分析モードに入ると、
+        同じ倍率・位置のまま分析できます。逆に分析モードでズームした状態で <kbd>Shift</kbd>+<kbd>Z</kbd> キーで通常表示に戻ると、
         その倍率が維持されます。
       </div>
     </div>

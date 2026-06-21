@@ -262,6 +262,7 @@
           <tr><td><kbd>→</kbd> / <kbd>↓</kbd></td><td>次の画像へ。縦読み中の <kbd>↓</kbd> は下へスクロール</td></tr>
           <tr><td><kbd>←</kbd> / <kbd>↑</kbd></td><td>前の画像へ。縦読み中の <kbd>↑</kbd> は上へスクロール</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>設定した量だけ前 / 次へジャンプ。既定は全ページの 10%。見開き中は最低 2 ページ移動</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd></td><td>ファイル名スタックを開いて読書中は前 / 次のスタックの先頭へジャンプ（それ以外は <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> と同じページジャンプ）。<a href="grid.html#stack">ファイル名スタック</a>を参照</td></tr>
           <tr><td><kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>縦読み中は画面単位で上下スクロール</td></tr>
           <tr><td><kbd>Home</kbd></td><td>フォルダ内の最初の画像へ</td></tr>
           <tr><td><kbd>End</kbd></td><td>フォルダ内の最後の画像へ</td></tr>
@@ -355,6 +356,8 @@
           <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>動画フルスクリーン中：前 / 次の 1 フレームへ移動して一時停止</td></tr>
           <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>動画フルスクリーン中：前 / 次のファイル（画像と同じ動作）</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd></td><td>動画フルスクリーン中：音量を dB 目盛りの 1/4 幅で上下（-∞dB〜+18dB）</td></tr>
+          <tr><td><kbd>Z</kbd></td><td>部分拡大ズーム。押している間は拡大範囲の枠を表示（マウスで枠移動・ホイールで枠サイズ＝倍率）、離すと全画面に拡大してマウスでパン、もう一度 <kbd>Z</kbd> で解除。短押しでも即拡大。拡大中のホイールは前後ページ移動、<kbd>Ctrl</kbd>+ホイールで倍率変更。倍率はページ送りでも保持（<a href="fullscreen.html#zoom">詳細</a>）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>Z</kbd></td><td>画像分析モード ON / OFF（<a href="analysis.html">詳細</a>）</td></tr>
           <tr><td><kbd>Shift</kbd>（押しっぱなし） / <kbd>M</kbd></td><td>ルーペ（カーソル周辺の拡大表示）。Shift は押している間のみ、M はトグル。見開き・消しゴム・画像分析モードでも併用可</td></tr>
           <tr><td><kbd>B</kbd></td><td>透過画像の背景色切替（黒 → 白 → 市松 の順に循環。AIアップスケール表示中は黒 ↔ 白の2段）。透過のない画像では切り替わりません</td></tr>
         </tbody>
@@ -435,7 +438,7 @@
     </div>
 
     <h2>画像分析モード</h2>
-    <p><kbd>Z</kbd> キーまたはホバーバーの 🔬 ボタンで分析モードに入ります。詳しい用途は<a href="fullscreen.html#analysis">フルスクリーン表示 &gt; 画像分析モード</a>をご覧ください。</p>
+    <p><kbd>Shift</kbd>+<kbd>Z</kbd> キーまたはホバーバーの 🔬 ボタンで分析モードに入ります。詳しい用途は<a href="fullscreen.html#analysis">フルスクリーン表示 &gt; 画像分析モード</a>をご覧ください。<kbd>Z</kbd> キー単体は<a href="fullscreen.html#zoom">部分拡大ズーム</a>です。</p>
 
     <h3>分析モード — 切り替え</h3>
     <div class="table-wrap">
@@ -444,7 +447,7 @@
           <tr><th>キー / 操作</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>Z</kbd></td><td>分析モード ON / OFF</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>Z</kbd></td><td>分析モード ON / OFF</td></tr>
           <tr><td>ホバーバー 🔬 ボタン</td><td>分析モード ON / OFF</td></tr>
           <tr><td>パネル右上 × ボタン</td><td>分析モード OFF</td></tr>
         </tbody>
