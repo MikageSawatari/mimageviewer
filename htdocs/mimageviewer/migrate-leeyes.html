@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leeyes からの移行ガイド | mImageViewer</title>
+  <meta name="description" content="Leeyes から mImageViewer へ移行する方への案内。Leeyes で使っていた Susie 画像プラグインの引き継ぎ手順・見開きなどの操作・おすすめの初期設定・移行で増える機能をまとめています。">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+                   "游ゴシック体", YuGothic, "Yu Gothic", "メイリオ", Meiryo, sans-serif;
+      background: linear-gradient(135deg, #fff5f9 0%, #ffeef7 100%);
+      background-attachment: fixed;
+      color: #333; line-height: 1.7; min-height: 100vh;
+    }
+    a { color: #d63384; text-decoration: none; }
+    a:hover { text-decoration: underline; color: #a02860; }
+
+    header {
+      background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px);
+      border-bottom: 1px solid #ffb0d9; padding: 0 2rem;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-inner { max-width: 900px; margin: 0 auto; display: flex; align-items: center; gap: 2rem; height: 56px; }
+    .logo { font-size: 1.2rem; font-weight: 700; background: linear-gradient(90deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .site-nav a { color: #a02860; font-size: 0.9rem; font-weight: 600; }
+    .site-nav a:hover { color: #d63384; text-decoration: none; }
+
+    .hero {
+      background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 50%, #ffd0eb 100%);
+      border-bottom: 1px solid #ffb0d9; padding: 2.75rem 2rem 2.5rem; text-align: center;
+    }
+    .hero .crumb { font-size: 0.82rem; color: #a02860; opacity: 0.85; margin-bottom: 0.6rem; }
+    .hero h1 {
+      font-size: 2.1rem; font-weight: 700;
+      background: linear-gradient(135deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+      margin-bottom: 0.5rem;
+    }
+    .hero .tagline { font-size: 1rem; color: #a02860; }
+
+    main { max-width: 820px; margin: 0 auto; padding: 2.75rem 2rem 1rem; }
+    section { margin-bottom: 2.75rem; }
+    .lead { color: #555; font-size: 1rem; }
+
+    h2 {
+      font-size: 1.3rem; font-weight: 700; color: #c0255a;
+      margin-bottom: 1.1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #ffb0d9; position: relative;
+    }
+    h2::after { content: ""; position: absolute; left: 0; bottom: -2px; width: 60px; height: 2px;
+      background: linear-gradient(90deg, #ff60c0, #d63384); }
+    h3 { font-size: 1.02rem; font-weight: 700; color: #d63384; margin: 1.4rem 0 0.5rem; }
+    p { margin-bottom: 0.8rem; color: #444; }
+    strong { color: #c0255a; }
+
+    .pink-list { list-style: none; padding: 0; }
+    .pink-list li { padding: 0.45rem 0 0.45rem 1.4rem; border-bottom: 1px solid #ffeef7;
+      font-size: 0.95rem; color: #444; position: relative; }
+    .pink-list li::before { content: "♦"; position: absolute; left: 0; color: #ff60c0; font-size: 0.65rem; top: 0.7rem; }
+    .pink-list li:last-child { border-bottom: none; }
+
+    .steps { counter-reset: step; list-style: none; padding: 0; margin: 0.4rem 0; }
+    .steps li { position: relative; padding: 0.55rem 0 0.55rem 2.5rem; border-bottom: 1px solid #ffeef7;
+      color: #444; font-size: 0.95rem; }
+    .steps li:last-child { border-bottom: none; }
+    .steps li::before { counter-increment: step; content: counter(step);
+      position: absolute; left: 0; top: 0.5rem; width: 1.65rem; height: 1.65rem; line-height: 1.65rem;
+      text-align: center; border-radius: 50%; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; font-size: 0.8rem; font-weight: 700; }
+
+    kbd { display: inline-block; background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 5px;
+      padding: 0.1em 0.55em; font-family: "Consolas", "Courier New", monospace; font-size: 0.83em;
+      color: #c0255a; white-space: nowrap; }
+    code { background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 4px; padding: 0.1em 0.45em;
+      font-family: "Consolas", "Courier New", monospace; font-size: 0.88em; color: #c0255a; }
+
+    .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
+      border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
+
+    .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
+    .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
+
+    .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.1rem; }
+    .feature-card { background: #fff; border: 1px solid #ffe0ec; border-radius: 15px; padding: 1.2rem 1.3rem;
+      box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08); }
+    .feature-card .icon { font-size: 1.6rem; margin-bottom: 0.4rem; }
+    .feature-card h3 { margin: 0 0 0.35rem; font-size: 0.97rem; color: #c0255a; }
+    .feature-card p { font-size: 0.88rem; color: #666; margin: 0; }
+
+    .manual-cta { background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 100%);
+      border: 1px solid #ffb0d9; border-radius: 16px; padding: 1.8rem 2.2rem; display: flex;
+      align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+    .manual-cta-body { flex: 1; min-width: 200px; }
+    .manual-cta-title { font-size: 1.12rem; font-weight: 700; color: #c0255a; margin-bottom: 0.3rem; }
+    .manual-cta-body p { font-size: 0.92rem; color: #a02860; margin: 0; }
+    .btn-download { display: inline-block; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; padding: 0.7rem 2rem; border-radius: 30px; font-size: 1rem; font-weight: 700;
+      box-shadow: 0 4px 15px rgba(214, 51, 132, 0.35); white-space: nowrap; }
+    .btn-download:hover { text-decoration: none; color: #fff; transform: translateY(-2px); }
+
+    .related { display: flex; gap: 0.7rem; flex-wrap: wrap; }
+    .related a { display: inline-block; background: #fff; border: 1px solid #ffb0d9; border-radius: 20px;
+      padding: 0.4rem 1.1rem; font-size: 0.88rem; color: #a02860; font-weight: 600; }
+    .related a:hover { background: #d63384; color: #fff; text-decoration: none; }
+
+    footer { border-top: 1px solid #ffb0d9; background: rgba(255, 255, 255, 0.6); padding: 2rem;
+      text-align: center; color: #a02860; font-size: 0.85rem; }
+
+    @media (max-width: 600px) { .hero h1 { font-size: 1.7rem; } main { padding: 2rem 1rem; } }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <span class="logo">mikage.to</span>
+    <nav class="site-nav">
+      <a href="index.html">mImageViewer</a>
+      <a href="manual/index.html">マニュアル</a>
+      <a href="index.html#download">ダウンロード</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="crumb"><a href="index.html">mImageViewer</a> ＞ 移行ガイド</div>
+  <h1>Leeyes からの移行ガイド</h1>
+  <p class="tagline">Leeyes をお使いの方が mImageViewer に乗り換えるために</p>
+</div>
+
+<main>
+
+  <section>
+    <p class="lead">Leeyes で見開き中心に漫画を読んできた方へ。mImageViewer は <strong>Leeyes で使っていた Susie 画像プラグインをそのまま活かせる</strong>ので、移行のハードルが低いビューアです。このページでは <strong>プラグインの引き継ぎ・操作・おすすめの初期設定・移行で増える機能</strong> をまとめました。</p>
+    <img class="shot" src="ss_fullscreen.png" alt="mImageViewer のフルスクリーン見開き表示">
+    <p class="shot-cap">フルスクリーンでの見開き表示</p>
+  </section>
+
+  <section>
+    <h2>はじめに知っておきたいこと</h2>
+    <ul class="pink-list">
+      <li><strong>動作環境は Windows 11</strong> です。</li>
+      <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
+      <li><strong>一般的な画像形式は Susie プラグインなしで表示できます。</strong>Leeyes は標準では BMP のみで、JPEG・PNG などの表示に Susie プラグインが必要でしたが、mImageViewer は <strong>JPEG / PNG / GIF / WebP / BMP / HEIC / AVIF / RAW</strong> などに最初から対応しています（JPEG・PNG などは内蔵のデコーダーが優先され、Susie は使われません）。</li>
+      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き・分割された RAR にも対応します）。</li>
+      <li><strong>キー・マウスのカスタマイズは限定的です。</strong>Leeyes はキー・マウス操作を細かく GUI で設定できますが、mImageViewer はキーの再割り当てが設定ファイル（keymap.ini）を編集する上級者向けの方法のみです。マウスは戻る／進むボタンとリングショートカット（マウスのフリック操作）のカスタマイズに対応します（GUI で自由にキーを割り当てる機能はありません）。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>おすすめの初期設定</h2>
+    <p>Leeyes の見開きの使い心地に近づけるための初期設定です。最初に一度だけ設定しておけば、以降の本すべてに適用されます。</p>
+    <ul class="steps">
+      <li><strong>見開き（右→左）を既定にする</strong> ―― 「環境設定 → 表示 → 閲覧表示」の <strong>デフォルトのページ構成</strong> を <strong>見開き 右→左</strong> に設定します。</li>
+      <li><strong>開いたらすぐ全画面で読む</strong> ―― 「環境設定 → 全体設定」の「ZIP/PDF/対応アーカイブ」で <strong>開いたとき、ページをフルスクリーン表示</strong> を選びます。</li>
+      <li>必要に応じて、「環境設定 → 表示 → 閲覧表示」の <strong>ズーム/フィット</strong> で既定の表示倍率（ページ全体・横幅フィットなど）を選びます。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>見開き・表示の操作（フルスクリーン）</h2>
+    <p>フルスクリーン表示中は、次のキーで切り替えられます。</p>
+    <ul class="pink-list">
+      <li><strong>ページ構成の切り替え（数字キー）</strong>：<kbd>1</kbd> 単ページ ／ <kbd>2</kbd> 見開き 左→右 ／ <kbd>3</kbd> 見開き 左→右（表紙あり）／ <kbd>4</kbd> 見開き 右→左 ／ <kbd>5</kbd> 見開き 右→左（表紙あり）。<br>日本の漫画は <kbd>4</kbd>（右→左）が基本です。1 ページ目が単独の表紙になっている本は <kbd>5</kbd>（表紙あり）にすると、以降の見開きが正しく揃います。</li>
+      <li><strong>途中でページの組がずれたとき</strong>：<kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd>（1 ページずらし）</li>
+      <li><strong>読み方向の切り替え</strong>（右→左 ⇄ 左→右）：<kbd>7</kbd></li>
+      <li><strong>表示の流れ</strong>（ページ単位／縦連結／横連結スクロール）：<kbd>6</kbd></li>
+      <li><strong>表示倍率</strong>（ページ全体／横幅／縦幅／100%原寸）：<kbd>0</kbd></li>
+      <li><strong>部分拡大ズーム</strong>：<kbd>Z</kbd>（押している間に拡大範囲を指定＋ホイールで倍率、離すと拡大、もう一度 <kbd>Z</kbd> で戻る）</li>
+      <li><strong>ページ送り</strong>：画像の左右クリック／<kbd>←</kbd> <kbd>→</kbd>／マウスホイール（右→左ではクリックの向きも反転します）</li>
+      <li><strong>フルスクリーンの切替</strong>：<kbd>F11</kbd>、<strong>終了</strong>：<kbd>Esc</kbd></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>続きから読む・前回の本を探す</h2>
+    <ul class="pink-list">
+      <li><strong>続きから／最初から</strong>の切り替え：「環境設定 → ライブラリ → 履歴と復元」で設定します（一覧から開いたときの既定は「続きから」）。</li>
+      <li><strong>前回読んでいた本を探す</strong>：「ファイル」メニューの <strong>読書履歴を開く</strong>、またはフォルダバーの <strong>場所▼ → 読書履歴</strong> から、最近開いた本・ページを新しい順に開けます。</li>
+      <li><strong>よく開くフォルダを登録する（Leeyes の「本棚」に相当）</strong>：mImageViewer の <strong>お気に入り</strong>に、よく使うフォルダを登録してすぐ開けます。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Susie プラグインが必要なケース（特殊・レトロ形式のみ）</h2>
+    <p>上のとおり一般的な形式は Susie なしで表示できるので、<strong>多くの方は Susie の移行は不要</strong>です。<strong>PI / MAG / PIC / PIC2 / XLD4</strong> などの特殊・レトロ形式を読みたい場合のみ、Leeyes で使っていた <strong>.spi（32bit）プラグイン</strong>を引き継げます。</p>
+    <ul class="steps">
+      <li>「環境設定 → ファイル処理 → Susie プラグイン」を開きます。</li>
+      <li><strong>Susie 画像プラグインを有効にする</strong> を ON にします。</li>
+      <li><strong>📁 フォルダを開く</strong> を押します（プラグイン用のフォルダが開きます）。</li>
+      <li>開いたフォルダに、Leeyes で使っていた <strong>.spi ファイル（32bit）</strong>をコピーします。</li>
+      <li><strong>⟳ プラグインを再読み込み</strong> を押します。</li>
+      <li>「ロード済みプラグイン」に名前と対応形式が表示されれば完了です。</li>
+    </ul>
+    <div class="info-box">対応するのは <strong>32bit の .spi</strong> です。mImageViewer 本体が 64bit でもそのまま利用できます。</div>
+  </section>
+
+  <section>
+    <h2>移行で新しく手に入る機能</h2>
+    <div class="features">
+      <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
+      <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
+      <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
+      <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">🏷️</div><h3>タグ・検索・製本</h3><p>タグ付け・横断検索・読書履歴、好きなページを 1 冊にまとめる製本機能。</p></div>
+      <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="manual-cta">
+      <div class="manual-cta-body">
+        <div class="manual-cta-title">mImageViewer を使ってみる</div>
+        <p>無料でダウンロードできます。インストール不要の単体 exe 版・ポータブル版もあります。</p>
+      </div>
+      <a class="btn-download" href="index.html#download">ダウンロード</a>
+    </div>
+    <p style="margin-top:1rem;font-size:0.9rem;">操作やショートカットの詳細は <a href="manual/index.html">オンラインマニュアル</a> を参照してください。</p>
+  </section>
+
+  <section>
+    <h2>ほかのビューアから移行する方</h2>
+    <div class="related">
+      <a href="migrate-mangameeya.html">マンガミーヤからの移行</a>
+      <a href="migrate-zippla.html">ZipPla からの移行</a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
+</footer>
+
+</body>
+</html>

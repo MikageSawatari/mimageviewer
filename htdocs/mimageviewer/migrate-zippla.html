@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZipPla からの移行ガイド | mImageViewer</title>
+  <meta name="description" content="ZipPla から mImageViewer へ移行する方への案内。なじみやすいズーム操作、タグ・レート・検索の対応、見開きなどの操作、おすすめの初期設定、移行で増える機能をまとめています。">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+                   "游ゴシック体", YuGothic, "Yu Gothic", "メイリオ", Meiryo, sans-serif;
+      background: linear-gradient(135deg, #fff5f9 0%, #ffeef7 100%);
+      background-attachment: fixed;
+      color: #333; line-height: 1.7; min-height: 100vh;
+    }
+    a { color: #d63384; text-decoration: none; }
+    a:hover { text-decoration: underline; color: #a02860; }
+
+    header {
+      background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px);
+      border-bottom: 1px solid #ffb0d9; padding: 0 2rem;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-inner { max-width: 900px; margin: 0 auto; display: flex; align-items: center; gap: 2rem; height: 56px; }
+    .logo { font-size: 1.2rem; font-weight: 700; background: linear-gradient(90deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .site-nav a { color: #a02860; font-size: 0.9rem; font-weight: 600; }
+    .site-nav a:hover { color: #d63384; text-decoration: none; }
+
+    .hero {
+      background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 50%, #ffd0eb 100%);
+      border-bottom: 1px solid #ffb0d9; padding: 2.75rem 2rem 2.5rem; text-align: center;
+    }
+    .hero .crumb { font-size: 0.82rem; color: #a02860; opacity: 0.85; margin-bottom: 0.6rem; }
+    .hero h1 {
+      font-size: 2.1rem; font-weight: 700;
+      background: linear-gradient(135deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+      margin-bottom: 0.5rem;
+    }
+    .hero .tagline { font-size: 1rem; color: #a02860; }
+
+    main { max-width: 820px; margin: 0 auto; padding: 2.75rem 2rem 1rem; }
+    section { margin-bottom: 2.75rem; }
+    .lead { color: #555; font-size: 1rem; }
+
+    h2 {
+      font-size: 1.3rem; font-weight: 700; color: #c0255a;
+      margin-bottom: 1.1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #ffb0d9; position: relative;
+    }
+    h2::after { content: ""; position: absolute; left: 0; bottom: -2px; width: 60px; height: 2px;
+      background: linear-gradient(90deg, #ff60c0, #d63384); }
+    h3 { font-size: 1.02rem; font-weight: 700; color: #d63384; margin: 1.4rem 0 0.5rem; }
+    p { margin-bottom: 0.8rem; color: #444; }
+    strong { color: #c0255a; }
+
+    .pink-list { list-style: none; padding: 0; }
+    .pink-list li { padding: 0.45rem 0 0.45rem 1.4rem; border-bottom: 1px solid #ffeef7;
+      font-size: 0.95rem; color: #444; position: relative; }
+    .pink-list li::before { content: "♦"; position: absolute; left: 0; color: #ff60c0; font-size: 0.65rem; top: 0.7rem; }
+    .pink-list li:last-child { border-bottom: none; }
+
+    .steps { counter-reset: step; list-style: none; padding: 0; margin: 0.4rem 0; }
+    .steps li { position: relative; padding: 0.55rem 0 0.55rem 2.5rem; border-bottom: 1px solid #ffeef7;
+      color: #444; font-size: 0.95rem; }
+    .steps li:last-child { border-bottom: none; }
+    .steps li::before { counter-increment: step; content: counter(step);
+      position: absolute; left: 0; top: 0.5rem; width: 1.65rem; height: 1.65rem; line-height: 1.65rem;
+      text-align: center; border-radius: 50%; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; font-size: 0.8rem; font-weight: 700; }
+
+    kbd { display: inline-block; background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 5px;
+      padding: 0.1em 0.55em; font-family: "Consolas", "Courier New", monospace; font-size: 0.83em;
+      color: #c0255a; white-space: nowrap; }
+    code { background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 4px; padding: 0.1em 0.45em;
+      font-family: "Consolas", "Courier New", monospace; font-size: 0.88em; color: #c0255a; }
+
+    .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
+      border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
+
+    .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
+    .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
+
+    .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.1rem; }
+    .feature-card { background: #fff; border: 1px solid #ffe0ec; border-radius: 15px; padding: 1.2rem 1.3rem;
+      box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08); }
+    .feature-card .icon { font-size: 1.6rem; margin-bottom: 0.4rem; }
+    .feature-card h3 { margin: 0 0 0.35rem; font-size: 0.97rem; color: #c0255a; }
+    .feature-card p { font-size: 0.88rem; color: #666; margin: 0; }
+
+    .manual-cta { background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 100%);
+      border: 1px solid #ffb0d9; border-radius: 16px; padding: 1.8rem 2.2rem; display: flex;
+      align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+    .manual-cta-body { flex: 1; min-width: 200px; }
+    .manual-cta-title { font-size: 1.12rem; font-weight: 700; color: #c0255a; margin-bottom: 0.3rem; }
+    .manual-cta-body p { font-size: 0.92rem; color: #a02860; margin: 0; }
+    .btn-download { display: inline-block; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; padding: 0.7rem 2rem; border-radius: 30px; font-size: 1rem; font-weight: 700;
+      box-shadow: 0 4px 15px rgba(214, 51, 132, 0.35); white-space: nowrap; }
+    .btn-download:hover { text-decoration: none; color: #fff; transform: translateY(-2px); }
+
+    .related { display: flex; gap: 0.7rem; flex-wrap: wrap; }
+    .related a { display: inline-block; background: #fff; border: 1px solid #ffb0d9; border-radius: 20px;
+      padding: 0.4rem 1.1rem; font-size: 0.88rem; color: #a02860; font-weight: 600; }
+    .related a:hover { background: #d63384; color: #fff; text-decoration: none; }
+
+    footer { border-top: 1px solid #ffb0d9; background: rgba(255, 255, 255, 0.6); padding: 2rem;
+      text-align: center; color: #a02860; font-size: 0.85rem; }
+
+    @media (max-width: 600px) { .hero h1 { font-size: 1.7rem; } main { padding: 2rem 1rem; } }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <span class="logo">mikage.to</span>
+    <nav class="site-nav">
+      <a href="index.html">mImageViewer</a>
+      <a href="manual/index.html">マニュアル</a>
+      <a href="index.html#download">ダウンロード</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="crumb"><a href="index.html">mImageViewer</a> ＞ 移行ガイド</div>
+  <h1>ZipPla からの移行ガイド</h1>
+  <p class="tagline">ZipPla をお使いの方が mImageViewer に乗り換えるために</p>
+</div>
+
+<main>
+
+  <section>
+    <p class="lead">ZipPla で漫画の閲覧と管理をしてきた方へ。mImageViewer は <strong>タグ・レーティング・検索といった整理の機能</strong>に対応し、見開き表示やマウス追従の部分拡大ズームなども備えています。このページでは <strong>整理機能の対応・操作・おすすめの初期設定・移行で増える機能</strong> をまとめました。</p>
+    <img class="shot" src="ss_grid.png" alt="mImageViewer のサムネイル一覧表示">
+    <p class="shot-cap">サムネイル一覧での表示</p>
+  </section>
+
+  <section>
+    <h2>はじめに知っておきたいこと</h2>
+    <ul class="pink-list">
+      <li><strong>動作環境は Windows 11</strong> です。</li>
+      <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
+      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き・分割された RAR にも対応します）。</li>
+      <li><strong>音声ファイル単体は扱いません。</strong>ZipPla は音声ファイルも管理できますが、mImageViewer は画像・漫画・動画のビューアです（動画内の音声は再生しますが、mp3 などの音声ファイル単体の管理・再生には対応していません）。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>タグ・レーティングの保存方式がちがいます（重要）</h2>
+    <p>ここは ZipPla と mImageViewer で仕組みが大きく異なります。移行前にご確認ください。</p>
+    <ul class="pink-list">
+      <li><strong>ZipPla</strong>：タグや★を <strong>ファイル名に書き込む</strong>方式です（例：<code>0001 {zpi$t=風景}.jpg</code>）。そのため、どのソフトでファイルを移動・コピーしてもタグは一緒に動きますが、ファイル名そのものが変わります。</li>
+      <li><strong>mImageViewer</strong>：タグや★は <strong>ファイルを変更せず、本体内で管理</strong>します（ファイル名は変わりません）。ただし、タグ・★は<strong>ファイルの場所（パス）にひも付く</strong>ため、<strong>ファイルを移動・名前変更すると、タグ・★は引き継がれません</strong>（移動先に付き直りません）。これは mImageViewer 内の操作（名前の変更・切り取り＆貼り付け・コピー）でも、エクスプローラーなど外部での操作でも同様です。</li>
+    </ul>
+    <div class="info-box">まとめると、mImageViewer は<strong>元のファイル名を変えない</strong>代わりに、<strong>ファイルを移動・改名するとタグ・★が外れます</strong>。タグを付けたあとはファイルを動かさない、または<strong>置き場所・名前を決めてからタグ付けする</strong>のがおすすめです。</div>
+  </section>
+
+  <section>
+    <h2>整理機能の対応（操作は変わります）</h2>
+    <ul class="pink-list">
+      <li><strong>タグ・★レーティング・検索 … 対応しています。</strong>ファイルにタグや★を付けて、タグや★で絞り込み・横断検索ができます（操作の手順は ZipPla とは異なります）。</li>
+      <li><strong>サムネイル一覧での管理 … 対応しています。</strong>フォルダ・ZIP・PDF などをサムネイル一覧で見渡せます。</li>
+      <li><strong>よくアクセスするフォルダの登録（本棚）… 「お気に入り」に当たります。</strong>ZipPla でよく開くフォルダを登録していた使い方は、mImageViewer では <strong>お気に入り</strong>機能で行えます（よく使うフォルダを登録してすぐ開けます）。</li>
+      <li><strong>「製本」はこれとは別の機能です。</strong>好きなページ（画像・ZIP/PDF のページ・動画のフレームなど）を <strong>コピーして、新しい 1 冊として保存</strong>する機能です。フォルダを登録する「お気に入り」とは目的が違うので、混同しないようご注意ください。</li>
+    </ul>
+    <div class="info-box">タグ・検索・お気に入り・製本などの具体的な操作手順は <a href="manual/index.html">オンラインマニュアル</a> にまとまっています。ZipPla とは画面構成・操作が異なるため、最初に一度ご確認いただくとスムーズです。</div>
+  </section>
+
+  <section>
+    <h2>おすすめの初期設定</h2>
+    <p>最初に一度だけ設定しておけば、以降の本すべてに適用されます。</p>
+    <ul class="steps">
+      <li><strong>見開き（右→左）を既定にする</strong> ―― 「環境設定 → 表示 → 閲覧表示」の <strong>デフォルトのページ構成</strong> を <strong>見開き 右→左</strong> に設定します。</li>
+      <li><strong>開いたらすぐ読書を始める</strong> ―― 「環境設定 → 全体設定」の「ZIP/PDF/対応アーカイブ」で <strong>開いたとき、ページをフルスクリーン表示</strong> を選びます。</li>
+      <li><strong>RAR / 7z / LZH の扱いを選ぶ</strong> ―― 「環境設定 → パフォーマンス → キャッシュ」の「RAR / 7z / LZH の処理」で、確認あり・確認なし変換・無視 から選べます。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>見開き・表示の操作（フルスクリーン）</h2>
+    <p>フルスクリーン表示中は、次のキーで切り替えられます。</p>
+    <ul class="pink-list">
+      <li><strong>ページ構成の切り替え（数字キー）</strong>：<kbd>1</kbd> 単ページ ／ <kbd>2</kbd> 見開き 左→右 ／ <kbd>3</kbd> 見開き 左→右（表紙あり）／ <kbd>4</kbd> 見開き 右→左 ／ <kbd>5</kbd> 見開き 右→左（表紙あり）。<br>日本の漫画は <kbd>4</kbd>（右→左）が基本です。1 ページ目が単独の表紙になっている本は <kbd>5</kbd>（表紙あり）にすると、以降の見開きが正しく揃います。</li>
+      <li><strong>途中でページの組がずれたとき</strong>：<kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd>（1 ページずらし）</li>
+      <li><strong>読み方向の切り替え</strong>（右→左 ⇄ 左→右）：<kbd>7</kbd></li>
+      <li><strong>表示の流れ</strong>（ページ単位／縦連結／横連結スクロール）：<kbd>6</kbd></li>
+      <li><strong>表示倍率</strong>（ページ全体／横幅／縦幅／100%原寸）：<kbd>0</kbd></li>
+      <li><strong>部分拡大ズーム</strong>：<kbd>Z</kbd>（押している間に拡大範囲を指定＋ホイールで倍率、離すと拡大、もう一度 <kbd>Z</kbd> で戻る。マウスを動かすと拡大位置を移動）</li>
+      <li><strong>ページ送り</strong>：画像の左右クリック／<kbd>←</kbd> <kbd>→</kbd>／マウスホイール（右→左ではクリックの向きも反転します）</li>
+      <li><strong>フルスクリーンの切替</strong>：<kbd>F11</kbd>、<strong>終了</strong>：<kbd>Esc</kbd></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>続きから読む・前回の本を探す</h2>
+    <ul class="pink-list">
+      <li><strong>続きから／最初から</strong>の切り替え：「環境設定 → ライブラリ → 履歴と復元」で設定します（一覧から開いたときの既定は「続きから」）。</li>
+      <li><strong>前回読んでいた本を探す</strong>：「ファイル」メニューの <strong>読書履歴を開く</strong>、またはフォルダバーの <strong>場所▼ → 読書履歴</strong> から、最近開いた本・ページを新しい順に開けます。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>移行で新しく手に入る機能</h2>
+    <p>ZipPla にあったタグ・★・検索に当たる機能があります（保存方式・操作は異なります。上の「タグ・レーティングの保存方式がちがいます」を参照）。あわせて、以下が新しく加わります。</p>
+    <div class="features">
+      <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
+      <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
+      <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
+      <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">📚</div><h3>製本</h3><p>好きなページを集めて、番号付きの新しい 1 冊として保存できます。</p></div>
+      <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="manual-cta">
+      <div class="manual-cta-body">
+        <div class="manual-cta-title">mImageViewer を使ってみる</div>
+        <p>無料でダウンロードできます。インストール不要の単体 exe 版・ポータブル版もあります。</p>
+      </div>
+      <a class="btn-download" href="index.html#download">ダウンロード</a>
+    </div>
+    <p style="margin-top:1rem;font-size:0.9rem;">操作やショートカットの詳細は <a href="manual/index.html">オンラインマニュアル</a> を参照してください。</p>
+  </section>
+
+  <section>
+    <h2>ほかのビューアから移行する方</h2>
+    <div class="related">
+      <a href="migrate-mangameeya.html">マンガミーヤからの移行</a>
+      <a href="migrate-leeyes.html">Leeyes からの移行</a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
+</footer>
+
+</body>
+</html>
