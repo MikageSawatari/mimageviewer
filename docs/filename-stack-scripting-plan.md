@@ -16,10 +16,14 @@
   を `include_str!` で内蔵。ユーザーは `<data_dir>/stack_rules.rhai` で上書き
   (通常版/単体exe版=`%APPDATA%\mimageviewer\`、ポータブル版=exe 隣の `data\`。`data_dir` が吸収)。
 - **契約**: `fn group(files)` が files と同じ長さのキー配列を返す (同キー=同スタック、
-  2 件以上で畳む)。`files[i] = #{ name, stem, ext, mtime, size, is_video }`。戻り値を
+  2 件以上で畳む)。**files に渡るのは画像のみ** (`#{ name, stem, ext, mtime, size }`。フォルダ/
+  ZIP/PDF は passthrough、動画は常に単独なので渡さない → `is_video` は公開しない)。戻り値を
   `#{ rule, keys }` にすると採用ルール名をトースト表示。`()` を返したファイルは単独。
-- **公開ヘルパー**: `regex_is_match` / `regex_capture` / `regex_replace` (regex クレート、
-  線形時間・コンパイル結果キャッシュ) と `argsort_int` (整数配列→昇順添字)。
+- **公開ヘルパー** (全て native = O(n) 高速。全件の判定/集計/並べ替えは必ずこれを使い、Rhai で
+  全件ループ/マップ構築しないこと。マップ 1 件ずつ追加は O(n²) で 10 万件 16 秒の罠):
+  `regex_is_match` / `regex_capture` / `regex_replace` (regex クレート、線形時間・キャッシュ) /
+  `argsort_int` (整数配列→昇順添字) / `stack_all_matched(keys)` (() が無い=全件該当か) /
+  `stack_distinct(keys)` (異なるキー数、() 無視)。
 - **サンドボックス**: `eval` / `import` 無効 (import 無効で既定 FileModuleResolver 経由の
   ファイル読みを封殺、Codex P1)、`set_max_operations(10M)` ほか各種上限、I/O/OS は非公開。
   戻りキーは文字列 / 数値 / `()` のみ受理 (配列・マップ等はエラー→既定へフォールバック、Codex P2)。

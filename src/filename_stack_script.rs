@@ -197,6 +197,8 @@ pub fn group_keys(media: &[StackMember], source: &str) -> Result<GroupingResult,
         .compile(source)
         .map_err(|e| format!("スクリプトのコンパイルに失敗: {e}"))?;
 
+    // 呼び出し側 (spawn_stack_script_worker) が **画像のみ** を渡す。フォルダ/ZIP/PDF は
+    // passthrough、動画は常に単独なので、スクリプトには画像しか来ない (= is_video は公開しない)。
     let files: rhai::Array = media
         .iter()
         .map(|m| {
@@ -206,7 +208,6 @@ pub fn group_keys(media: &[StackMember], source: &str) -> Result<GroupingResult,
             map.insert("ext".into(), Dynamic::from(ext_of(&m.path)));
             map.insert("mtime".into(), Dynamic::from(m.mtime));
             map.insert("size".into(), Dynamic::from(m.size));
-            map.insert("is_video".into(), Dynamic::from(m.is_video));
             Dynamic::from(map)
         })
         .collect();

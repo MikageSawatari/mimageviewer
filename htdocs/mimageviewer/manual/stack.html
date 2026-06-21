@@ -184,14 +184,15 @@
           <tr><td><code>ext</code></td><td>小文字の拡張子</td></tr>
           <tr><td><code>mtime</code></td><td>更新時刻（秒）</td></tr>
           <tr><td><code>size</code></td><td>ファイルサイズ（バイト）</td></tr>
-          <tr><td><code>is_video</code></td><td>動画かどうか（真偽値）</td></tr>
         </tbody>
       </table>
     </div>
     <ul>
+      <li><strong>スクリプトに渡されるのは画像だけです。</strong> フォルダ・ZIP・PDF はグリッドの先頭に
+      そのまま表示され、動画は常に単独で並びます（いずれもスクリプトには渡らず、まとめる対象になりません）。
+      そのため <code>files</code> に動画やフォルダは入りません。</li>
       <li>返り値を <code>#{ rule: "表示名", keys: [...] }</code> の形にすると、採用したルール名を画面に表示できます（任意）。
       キー配列だけを返した場合は、ルール名は表示されません。</li>
-      <li>動画は常に単独で並びます（スタックに混ざりません）。</li>
     </ul>
 
     <h3>使えるヘルパー関数</h3>
@@ -206,8 +207,22 @@
           <tr><td><code>regex_capture(text, pattern, group)</code></td><td>文字列</td><td>一致した丸かっこ番号 <code>group</code> の中身を返します（一致しなければ空文字）。</td></tr>
           <tr><td><code>regex_replace(text, pattern, replacement)</code></td><td>文字列</td><td>一致した部分を置き換えた文字列を返します。</td></tr>
           <tr><td><code>argsort_int(整数の配列)</code></td><td>添字の配列</td><td>渡した値を昇順に並べたときの添字（インデックス）の配列を返します。連番順・時刻順の処理に使います。</td></tr>
+          <tr><td><code>stack_all_matched(keys)</code></td><td>真偽値</td><td>キー配列に「該当なし（<code>()</code>）」が 1 つも無いか＝<strong>全ファイルがそのルールに当てはまったか</strong>を返します。「全部当てはまったときだけ採用する」判定に使います。</td></tr>
+          <tr><td><code>stack_distinct(keys)</code></td><td>整数</td><td>キー配列の中の<strong>異なるキーの個数</strong>（<code>()</code> は無視）を返します。「2 つ以上のスタックができるときだけ採用する」（＝全部が 1 つの巨大スタックに潰れるのを防ぐ）判定に使います。</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>速度の注意。</strong> 全ファイルに対する「判定」や「集計」「並べ替え」は、上のヘルパー関数
+        （<code>stack_all_matched</code> / <code>stack_distinct</code> / <code>argsort_int</code>）を使ってください。
+        これらは内部で高速に処理されます。自分で全ファイルをループして数えたり、ファイルごとに配列やマップへ
+        1 件ずつ追加していく書き方をすると、ファイル数が多いときに非常に遅くなります
+        （特にマップへ 1 件ずつ追加する処理は、ファイル数の二乗に比例して遅くなり、数万件で十数秒かかります）。
+        画像 1 万件で一瞬、10 万件でも 1 秒程度で終わるように、ファイル数に比例する程度（O(n)）で書くのが目安です。
+      </div>
     </div>
 
     <div class="box info">
@@ -249,25 +264,34 @@
 【契約】
 - 入口は fn group(files) です。files と同じ長さのグループキー配列を返します。
   同じキーになったファイルが同じスタックにまとまります（同じキーが 2 つ以上で畳まれます）。
+- files に渡るのは画像だけです（フォルダ / ZIP / PDF / 動画は渡りません。動画は常に単独）。
 - files[i] は次のフィールドを持ちます:
-  - name     : 拡張子つきのファイル名
-  - stem     : 拡張子を除いたファイル名
-  - ext      : 小文字の拡張子
-  - mtime    : 更新時刻（秒）
-  - size     : ファイルサイズ（バイト）
-  - is_video : 動画かどうか（真偽値）
+  - name   : 拡張子つきのファイル名
+  - stem   : 拡張子を除いたファイル名
+  - ext    : 小文字の拡張子
+  - mtime  : 更新時刻（秒）
+  - size   : ファイルサイズ（バイト）
+- まとめないファイルのキーは () （unit）にできます。
 - 返り値を #{ rule: "表示名", keys: [...] } の形にすると、採用したルール名を画面に表示できます（任意）。
-- 動画は常に単独で並びます（スタックに混ざりません）。
 
-【使えるヘルパー関数】
+【使えるヘルパー関数】（全ファイルの判定・集計・並べ替えは必ずこれらを使うこと）
 - regex_is_match(text, pattern)            -&gt; 真偽値。正規表現に一致するか。
 - regex_capture(text, pattern, group)      -&gt; 文字列。一致した丸かっこ番号 group の中身（不一致は空文字）。
 - regex_replace(text, pattern, replacement)-&gt; 文字列。一致部分を置き換えた結果。
 - argsort_int(整数の配列)                  -&gt; 値を昇順に並べたときの添字の配列。連番順・時刻順に使う。
+- stack_all_matched(keys)                  -&gt; 真偽値。キーに () が 1 つも無い（＝全ファイル該当）か。
+- stack_distinct(keys)                     -&gt; 整数。異なるキーの個数（() は無視）。2 つ以上のスタックができるかの判定に使う。
 
 【正規表現】
 - regex_capture / regex_is_match / regex_replace で使えます（Rust の正規表現構文）。
 - 後方参照、先読み / 後読みは使えません。
+
+【性能（重要）】
+- ファイル数に比例する程度（O(n)）で書くこと。画像 1 万件で一瞬、10 万件でも 1 秒程度が目安。
+- 全ファイルの判定・集計・並べ替えは stack_all_matched / stack_distinct / argsort_int を使う。
+  自前で全ファイルをループして数える・並べ替えるのは避ける。
+- 特に Rhai のマップ（#{}）にファイルごとに 1 件ずつ追加していく書き方は、ファイル数の二乗に比例して
+  非常に遅くなる（数万件で十数秒）。重複排除や個数集計は stack_distinct を使うこと。
 
 【制約】
 - ファイル操作・ネットワーク・OS 操作はできません（隔離された環境で動きます）。

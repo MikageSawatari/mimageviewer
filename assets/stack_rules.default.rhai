@@ -1,24 +1,29 @@
 // mImageViewer ファイル名スタック 分割ルール (既定)
 // =====================================================================
-// この Rhai スクリプトは、フォルダ内のメディア(画像 + 動画)を「スタック」へ
-// 畳むためのグループキーを決めます。詳しくはオンラインマニュアルの
-// 「スタック表示」ページ(カスタマイズ節)を参照してください。
+// この Rhai スクリプトは、フォルダ内の **画像** を「スタック」へ畳むためのグループキーを
+// 決めます。詳しくはオンラインマニュアルの「スタック表示」ページ(カスタマイズ節)を参照。
+//
+// 渡されるのは画像だけです。フォルダ / ZIP / PDF はグリッド先頭にそのまま表示され、動画は
+// 常に単独で並びます (= いずれもスクリプトには渡らず、ここで束ねる対象外)。
 //
 // 入口は fn group(files)。files と同じ長さのグループキー配列を返します。
-//   files[i] = #{ name, stem, ext, mtime, size, is_video }
+//   files[i] = #{ name, stem, ext, mtime, size }   (画像のみ)
 //     name:String  拡張子つきファイル名   stem:String 拡張子なし
 //     ext:String   小文字の拡張子(ドット無し)
 //     mtime:INT    更新時刻(秒)           size:INT    バイト数
-//     is_video:bool 動画か(動画は常に単独になります)
 //   戻り値: 各ファイルのキー文字列。同じキー = 同じスタック(2 枚以上で畳む)。
 //           キーを () にしたファイルは「このルールでは束ねない」を意味します。
 //   戻り値を #{ rule: "表示名", keys: [...] } にすると採用ルール名を表示できます。
 //
-// 使えるヘルパー関数:
-//   regex_is_match(text, pattern) -> bool
-//   regex_capture(text, pattern, group) -> String   (不一致 / 範囲外は "")
-//   regex_replace(text, pattern, replacement) -> String
-//   argsort_int(整数の配列) -> 添字配列              (値の昇順に並べた添字)
+// 使えるヘルパー関数 (いずれも本体側の native 実装 = 高速。全ファイルに対する判定・集計は
+// 必ずこれらを使い、Rhai のループ/配列/マップを自前で全件回さないこと。特に Rhai のマップに
+// 1 件ずつ追加する処理は要素数の二乗で激遅になる → 10 万件で十数秒):
+//   regex_is_match(text, pattern) -> bool             正規表現に一致するか
+//   regex_capture(text, pattern, group) -> String     一致した丸かっこ番号 group の中身(不一致 "")
+//   regex_replace(text, pattern, replacement) -> String  一致部分を置換した文字列
+//   argsort_int(整数の配列) -> 添字配列               値を昇順に並べたときの添字(連番順/時刻順に)
+//   stack_all_matched(keys) -> bool                   keys に () が 1 つも無い(= 全ファイル該当)か
+//   stack_distinct(keys) -> INT                       keys 中の異なるキーの数(() は無視)
 //   正規表現は Rust の regex 構文(後方参照・先読みは非対応、線形時間で安全)。
 //
 // 動作: 下記ルールを上から順に試し、「全ファイルが該当」(汎用ルールはさらに
