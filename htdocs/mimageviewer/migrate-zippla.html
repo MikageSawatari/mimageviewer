@@ -79,6 +79,15 @@
     .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
       border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
 
+    .table-scroll { overflow-x: auto; margin: 0.75rem 0 1rem; background: #fff;
+      border: 1px solid #ffe0ec; border-radius: 8px; }
+    .compare-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 0.9rem; }
+    .compare-table th, .compare-table td { padding: 0.65rem 0.8rem; border-bottom: 1px solid #ffeef7;
+      vertical-align: top; text-align: left; }
+    .compare-table th { background: #fff0f7; color: #c0255a; font-weight: 700; white-space: nowrap; }
+    .compare-table td:first-child { width: 24%; color: #a02860; font-weight: 700; }
+    .compare-table tr:last-child td { border-bottom: none; }
+
     .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
       box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
     .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
@@ -144,7 +153,9 @@
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11</strong> です。</li>
       <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
-      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き・分割された RAR にも対応します）。</li>
+      <li><strong>左側のフォルダツリーは初期状態では表示しません。</strong>フォルダツリーで移動したい場合は、ツールバーの <strong>ツリー</strong> ボタン（または <kbd>F</kbd>）で左側に表示できます。</li>
+      <li><strong>フォルダにも表紙のようなサムネイルを出せます。</strong>フォルダ・ZIP・PDF の代表サムネイルは自動で選ばれますが、好きな画像やページを <kbd>P</kbd> キーやフォルダバーのピンで固定できます。フォルダを表紙つきの本棚のように整理する使い方を想定しています。</li>
+      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き RAR に対応し、分割 RAR は <code>.part01.rar</code> などの先頭パートから開けます）。</li>
       <li><strong>音声ファイル単体は扱いません。</strong>ZipPla は音声ファイルも管理できますが、mImageViewer は画像・漫画・動画のビューアです（動画内の音声は再生しますが、mp3 などの音声ファイル単体の管理・再生には対応していません）。</li>
     </ul>
   </section>
@@ -154,20 +165,68 @@
     <p>ここは ZipPla と mImageViewer で仕組みが大きく異なります。移行前にご確認ください。</p>
     <ul class="pink-list">
       <li><strong>ZipPla</strong>：タグや★を <strong>ファイル名に書き込む</strong>方式です（例：<code>0001 {zpi$t=風景}.jpg</code>）。そのため、どのソフトでファイルを移動・コピーしてもタグは一緒に動きますが、ファイル名そのものが変わります。</li>
-      <li><strong>mImageViewer</strong>：タグや★は <strong>ファイルを変更せず、本体内で管理</strong>します（ファイル名は変わりません）。ただし、タグ・★は<strong>ファイルの場所（パス）にひも付く</strong>ため、<strong>ファイルを移動・名前変更すると、タグ・★は引き継がれません</strong>（移動先に付き直りません）。これは mImageViewer 内の操作（名前の変更・切り取り＆貼り付け・コピー）でも、エクスプローラーなど外部での操作でも同様です。</li>
+      <li><strong>mImageViewer</strong>：タグや★は、既定では <strong>ファイルを変更せず、本体内で管理</strong>します（ファイル名は変わりません）。ただし、タグ・★は<strong>ファイルの場所（パス）にひも付く</strong>ため、通常のファイル操作で<strong>ファイルを移動・名前変更すると、タグ・★は引き継がれません</strong>（移動先に付き直りません）。単体画像の★だけは、設定を有効にすると JPEG / PNG / WebP の XMP レーティングにも書き込めますが、ZIP / PDF などの本全体の評価やタグを外部ファイルへ同期する機能ではありません。</li>
     </ul>
     <div class="info-box">まとめると、mImageViewer は<strong>元のファイル名を変えない</strong>代わりに、<strong>ファイルを移動・改名するとタグ・★が外れます</strong>。タグを付けたあとはファイルを動かさない、または<strong>置き場所・名前を決めてからタグ付けする</strong>のがおすすめです。</div>
   </section>
 
   <section>
+    <h2>機能比較</h2>
+    <p>ZipPla で使っていた整理機能を、mImageViewer 側の機能に置き換えて見るための表です。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>項目</th><th>ZipPla</th><th>mImageViewer</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>タグ・★の保存</td><td>タグや★をファイル名に書き込む方式です。移動・コピーしても情報が一緒に動きますが、ファイル名は変わります。</td><td>既定では本体内のカタログで管理し、ファイル名は変えません。単体画像の★のみ、設定で JPEG / PNG / WebP の XMP レーティングにも書き込めます。</td></tr>
+          <tr><td>タグで探す</td><td>タグ・評価・フィルタで整理できます。</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、グリッドのタグ絞り込み、★フィルターで探します。mIV タグは <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> の全文検索には混ぜません。</td></tr>
+          <tr><td>ブックマーク/スマートフォルダ</td><td>フォルダーブックマークやスマートフォルダで整理できます。</td><td>よく使う場所は「お気に入り」、条件で探す用途はタグビュー・検索・読書履歴で代替します。スマートフォルダと完全に同じ自動分類機能はありません。</td></tr>
+          <tr><td>フォルダ移動</td><td>フォルダーブックマークやフォルダツリーから場所を選ぶ使い方があります。</td><td>初期状態ではツリーを出さず、サムネイル一覧を広く使います。ツリーが必要なときはツールバーの <strong>ツリー</strong> ボタンで表示します。</td></tr>
+          <tr><td>フォルダの見た目</td><td>タグ・評価・フィルタで整理できます。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を固定して、表紙つきの本棚のように整理できます。</td></tr>
+          <tr><td>管理対象</td><td>アーカイブ、PDF、画像、動画フレーム、音声ファイルなどを管理できます。</td><td>画像・漫画・PDF・動画の閲覧に対応します。動画内の音声は再生しますが、mp3 など音声ファイル単体の管理・再生は対象外です。</td></tr>
+          <tr><td>アーカイブ</td><td>アーカイブや PDF をサムネイル管理・閲覧できます。</td><td>ZIP / CBZ は直接開きます。RAR / 7z / LZH は初回に ZIP キャッシュ化してから表示します。</td></tr>
+          <tr><td>拡大表示</td><td>内蔵ビューアの拡大鏡・ズーム系の操作があります。</td><td><kbd>Z</kbd> の ZipPla 風部分拡大ズームで、範囲指定後にマウス移動だけで拡大位置を動かせます。</td></tr>
+          <tr><td>操作カスタマイズ</td><td>ショートカットキーやマウス操作を調整できます。</td><td>キー変更は <code>keymap.ini</code> 編集、マウスは戻る/進むボタンとリングショートカットの割り当てが中心です。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
     <h2>整理機能の対応（操作は変わります）</h2>
     <ul class="pink-list">
-      <li><strong>タグ・★レーティング・検索 … 対応しています。</strong>ファイルにタグや★を付けて、タグや★で絞り込み・横断検索ができます（操作の手順は ZipPla とは異なります）。</li>
+      <li><strong>タグ・★レーティング・検索 … 対応しています。</strong>ファイルにタグや★を付けて、タグビュー・★フィルター・検索バーで絞り込めます（操作の手順は ZipPla とは異なります）。</li>
       <li><strong>サムネイル一覧での管理 … 対応しています。</strong>フォルダ・ZIP・PDF などをサムネイル一覧で見渡せます。</li>
-      <li><strong>よくアクセスするフォルダの登録（本棚）… 「お気に入り」に当たります。</strong>ZipPla でよく開くフォルダを登録していた使い方は、mImageViewer では <strong>お気に入り</strong>機能で行えます（よく使うフォルダを登録してすぐ開けます）。</li>
+      <li><strong>よくアクセスするフォルダの登録 … 「お気に入り」に当たります。</strong>ZipPla のフォルダーブックマークのように、よく使うフォルダを登録してすぐ開けます。ZipPla のスマートフォルダと完全に同じ自動分類機能はありませんが、タグビュー・検索・読書履歴で近い使い方ができます。</li>
       <li><strong>「製本」はこれとは別の機能です。</strong>好きなページ（画像・ZIP/PDF のページ・動画のフレームなど）を <strong>コピーして、新しい 1 冊として保存</strong>する機能です。フォルダを登録する「お気に入り」とは目的が違うので、混同しないようご注意ください。</li>
     </ul>
     <div class="info-box">タグ・検索・お気に入り・製本などの具体的な操作手順は <a href="manual/index.html">オンラインマニュアル</a> にまとまっています。ZipPla とは画面構成・操作が異なるため、最初に一度ご確認いただくとスムーズです。</div>
+  </section>
+
+  <section>
+    <h2>操作対応表</h2>
+    <p>ZipPla で使っていた整理・閲覧操作を、mImageViewer では次の操作に置き換えてください。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>やりたいこと</th><th>mImageViewer の操作</th><th>補足</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ZipPla 風に一部を拡大する</td><td><kbd>Z</kbd> を押して範囲を指定し、離すと拡大。もう一度 <kbd>Z</kbd> で戻ります。</td><td>範囲指定中はホイールで倍率を調整できます。拡大後はマウス移動で表示位置を動かします。</td></tr>
+          <tr><td>タグを付ける</td><td>一覧で対象を選び <kbd>T</kbd>、またはタグメニュー/右パネルから付けます。</td><td>mIV タグはファイル名や XMP には書き込まれません。</td></tr>
+          <tr><td>タグで探す</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd> でタグビューを開きます。</td><td>複数タグは <code>#tag1 #tag2</code> のように入力すると AND 検索になります。</td></tr>
+          <tr><td>★を付ける</td><td><kbd>F1</kbd>〜<kbd>F5</kbd> で★1〜★5、<kbd>F6</kbd> で解除。</td><td>フォルダや ZIP/PDF 本体へ★を付けたい場合は <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> を使います。</td></tr>
+          <tr><td>今の場所を絞り込む</td><td><kbd>Ctrl</kbd>+<kbd>F</kbd> で現在地フィルタ。</td><td>いま表示している一覧だけをファイル名やメタ情報で絞り込みます。</td></tr>
+          <tr><td>お気に入り全体から探す</td><td><kbd>Ctrl</kbd>+<kbd>S</kbd> はフォルダ/ZIP/PDF 名、<kbd>Ctrl</kbd>+<kbd>G</kbd> は画像/PDF/動画の検索。</td><td>お気に入り側で索引を ON にしておくと横断検索できます。</td></tr>
+          <tr><td>ページ送り</td><td><kbd>←</kbd> <kbd>→</kbd>、マウスホイール、画面左右クリック。</td><td>右→左読みではクリック方向も漫画向けに反転します。</td></tr>
+          <tr><td>見開きにする</td><td><kbd>4</kbd> が見開き 右→左、<kbd>5</kbd> が表紙ありの見開き 右→左。</td><td>表紙だけ単独にしたい漫画は <kbd>5</kbd> が便利です。</td></tr>
+          <tr><td>よく使う場所へ行く</td><td>「お気に入り」に登録し、「場所▼」やお気に入りメニューから開きます。</td><td>最近読んだ本は「読書履歴」からも開けます。</td></tr>
+          <tr><td>左側ツリーで移動する</td><td>ツールバーの <strong>ツリー</strong> ボタン、または <kbd>F</kbd> でフォルダツリーを表示します。</td><td>初期状態では非表示です。現在フォルダに合わせて必要な範囲が展開されます。</td></tr>
+          <tr><td>フォルダに表紙を付ける</td><td>代表にしたい画像・ページを選んで <kbd>P</kbd>、またはフォルダバーのピンで固定します。</td><td>フォルダ・ZIP・PDF の一覧で中身が分かりやすくなります。</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -204,13 +263,15 @@
   </section>
 
   <section>
-    <h2>移行で新しく手に入る機能</h2>
-    <p>ZipPla にあったタグ・★・検索に当たる機能があります（保存方式・操作は異なります。上の「タグ・レーティングの保存方式がちがいます」を参照）。あわせて、以下が新しく加わります。</p>
+    <h2>移行で使える便利な機能</h2>
+    <p>ZipPla にあったタグ・★・検索に当たる機能があります（保存方式・操作は異なります。上の「タグ・レーティングの保存方式がちがいます」を参照）。あわせて、mImageViewer では次の機能も使えます。</p>
     <div class="features">
       <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
       <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
+      <div class="feature-card"><div class="icon">✂️</div><h3>表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">🎮</div><h3>ゲームパッド対応</h3><p>一覧移動・ページ送り・フォルダ移動・見開き切替などをゲームパッドだけで操作できます。</p></div>
       <div class="feature-card"><div class="icon">📚</div><h3>製本</h3><p>好きなページを集めて、番号付きの新しい 1 冊として保存できます。</p></div>
       <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
     </div>

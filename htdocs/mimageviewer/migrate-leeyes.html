@@ -79,6 +79,15 @@
     .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
       border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
 
+    .table-scroll { overflow-x: auto; margin: 0.75rem 0 1rem; background: #fff;
+      border: 1px solid #ffe0ec; border-radius: 8px; }
+    .compare-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 0.9rem; }
+    .compare-table th, .compare-table td { padding: 0.65rem 0.8rem; border-bottom: 1px solid #ffeef7;
+      vertical-align: top; text-align: left; }
+    .compare-table th { background: #fff0f7; color: #c0255a; font-weight: 700; white-space: nowrap; }
+    .compare-table td:first-child { width: 24%; color: #a02860; font-weight: 700; }
+    .compare-table tr:last-child td { border-bottom: none; }
+
     .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
       box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
     .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
@@ -144,10 +153,33 @@
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11</strong> です。</li>
       <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
+      <li><strong>左側のフォルダツリーは初期状態では表示しません。</strong>フォルダツリーで移動したい場合は、ツールバーの <strong>ツリー</strong> ボタン（または <kbd>F</kbd>）で左側に表示できます。</li>
+      <li><strong>フォルダにも表紙のようなサムネイルを出せます。</strong>フォルダ・ZIP・PDF の代表サムネイルは自動で選ばれますが、好きな画像やページを <kbd>P</kbd> キーやフォルダバーのピンで固定できます。フォルダを表紙つきの本棚のように整理する使い方を想定しています。</li>
       <li><strong>一般的な画像形式は Susie プラグインなしで表示できます。</strong>Leeyes は標準では BMP のみで、JPEG・PNG などの表示に Susie プラグインが必要でしたが、mImageViewer は <strong>JPEG / PNG / GIF / WebP / BMP / HEIC / AVIF / RAW</strong> などに最初から対応しています（JPEG・PNG などは内蔵のデコーダーが優先され、Susie は使われません）。</li>
-      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き・分割された RAR にも対応します）。</li>
+      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き RAR に対応し、分割 RAR は <code>.part01.rar</code> などの先頭パートから開けます）。</li>
       <li><strong>キー・マウスのカスタマイズは限定的です。</strong>Leeyes はキー・マウス操作を細かく GUI で設定できますが、mImageViewer はキーの再割り当てが設定ファイル（keymap.ini）を編集する上級者向けの方法のみです。マウスは戻る／進むボタンとリングショートカット（マウスのフリック操作）のカスタマイズに対応します（GUI で自由にキーを割り当てる機能はありません）。</li>
     </ul>
+  </section>
+
+  <section>
+    <h2>機能比較</h2>
+    <p>Leeyes で使っていた機能が、mImageViewer ではどこに当たるかの早見表です。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>項目</th><th>Leeyes</th><th>mImageViewer</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>画像形式</td><td>標準では BMP 中心で、JPEG / PNG などは Susie プラグインを組み合わせる使い方が中心です。</td><td>JPEG / PNG / GIF / WebP / BMP などを内蔵で表示します。HEIC / AVIF / RAW なども対応環境では扱えます。</td></tr>
+          <tr><td>Susie プラグイン</td><td>一般的な画像や ZIP の表示にも重要でした。</td><td>PI / MAG / PIC / PIC2 / XLD4 など、特殊・レトロ形式を読むための追加手段です。対応するのは 32bit の <code>.spi</code> です。</td></tr>
+          <tr><td>アーカイブ</td><td>ZIP などは導入している Susie プラグイン構成に依存します。</td><td>ZIP / CBZ は直接開きます。RAR / 7z / LZH は初回に ZIP キャッシュ化してから表示します。</td></tr>
+          <tr><td>見開き読書</td><td>漫画向けの見開き閲覧を中心に使えます。</td><td>右→左見開き、表紙あり見開き、1 ページずらし、縦/横連結、部分拡大ズームをキーで切り替えられます。</td></tr>
+          <tr><td>本棚・履歴</td><td>本棚に登録した場所から開く使い方ができます。</td><td>よく開く場所は「お気に入り」、最近読んだ本は「読書履歴」、途中ページは「続きから再開」で扱います。左側ツリーが必要なときはツールバーの <strong>ツリー</strong> ボタンで表示します。</td></tr>
+          <tr><td>フォルダの見た目</td><td>フォルダ名を中心に場所を選ぶ使い方が基本です。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を固定して、表紙つきの本棚のように整理できます。</td></tr>
+          <tr><td>操作カスタマイズ</td><td>キー・マウス操作を GUI で細かく調整できます。</td><td>キー変更は <code>keymap.ini</code> 編集、マウスは戻る/進むボタンとリングショートカットの割り当てが中心です。</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -158,6 +190,31 @@
       <li><strong>開いたらすぐ全画面で読む</strong> ―― 「環境設定 → 全体設定」の「ZIP/PDF/対応アーカイブ」で <strong>開いたとき、ページをフルスクリーン表示</strong> を選びます。</li>
       <li>必要に応じて、「環境設定 → 表示 → 閲覧表示」の <strong>ズーム/フィット</strong> で既定の表示倍率（ページ全体・横幅フィットなど）を選びます。</li>
     </ul>
+  </section>
+
+  <section>
+    <h2>操作対応表</h2>
+    <p>Leeyes 側でキーを変更していた場合でも、mImageViewer ではまず次の操作を覚えると移行しやすくなります。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>やりたいこと</th><th>mImageViewer の操作</th><th>補足</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>開く / 閉じる</td><td>一覧で <kbd>Enter</kbd> またはダブルクリック。戻るときは <kbd>Esc</kbd> / <kbd>Enter</kbd> / <kbd>BS</kbd>。</td><td><kbd>Esc</kbd> は親の一覧へ戻り、<kbd>BS</kbd> は ZIP/PDF 内ではページ一覧へ 1 段戻ります。</td></tr>
+          <tr><td>ページ送り</td><td><kbd>←</kbd> <kbd>→</kbd>、マウスホイール、画面左右クリック。</td><td>右→左読みではクリック方向も漫画向けに反転します。</td></tr>
+          <tr><td>日本の漫画向け見開き</td><td><kbd>4</kbd> が見開き 右→左、<kbd>5</kbd> が表紙ありの見開き 右→左。</td><td><kbd>1</kbd>〜<kbd>5</kbd> で単ページ/見開き/表紙ありを切り替えます。</td></tr>
+          <tr><td>見開きの組ずれを直す</td><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd></td><td>現在の本だけで 1 ページずらして、空白ページや欠落ページによるズレを補正します。</td></tr>
+          <tr><td>表示倍率を変える</td><td><kbd>0</kbd> でフィット方式を巡回。<kbd>Ctrl</kbd>+ホイールでズーム。</td><td>ページ全体、横幅、縦幅、100% 原寸を切り替えられます。</td></tr>
+          <tr><td>細部を拡大して読む</td><td><kbd>Z</kbd> で部分拡大ズーム。<kbd>M</kbd> または <kbd>Shift</kbd> 押しっぱなしでルーペ。</td><td><kbd>Z</kbd> は拡大範囲を決めてから読む方式、ルーペは一時確認向けです。</td></tr>
+          <tr><td>次の本・前の本へ移動</td><td><kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で前後のフォルダ / ZIP / PDF / 変換アーカイブへ移動します。</td></tr>
+          <tr><td>本棚の代わり</td><td>「お気に入り」に登録し、「場所▼」やお気に入りメニューから開きます。</td><td>最近読んだ本は「読書履歴」からも開けます。</td></tr>
+          <tr><td>左側ツリーで移動する</td><td>ツールバーの <strong>ツリー</strong> ボタン、または <kbd>F</kbd> でフォルダツリーを表示します。</td><td>初期状態では非表示です。現在フォルダに合わせて必要な範囲が展開されます。</td></tr>
+          <tr><td>フォルダに表紙を付ける</td><td>代表にしたい画像・ページを選んで <kbd>P</kbd>、またはフォルダバーのピンで固定します。</td><td>フォルダ・ZIP・PDF の一覧で中身が分かりやすくなります。</td></tr>
+          <tr><td>マウス操作を割り当てる</td><td>環境設定の「マウスボタン」「リングショートカット」を使います。</td><td>戻る/進むボタンや右ドラッグのフリックに、よく使う操作を割り当てられます。</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -199,12 +256,14 @@
   </section>
 
   <section>
-    <h2>移行で新しく手に入る機能</h2>
+    <h2>移行で使える便利な機能</h2>
     <div class="features">
       <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
       <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
+      <div class="feature-card"><div class="icon">✂️</div><h3>表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">🎮</div><h3>ゲームパッド対応</h3><p>一覧移動・ページ送り・フォルダ移動・見開き切替などをゲームパッドだけで操作できます。</p></div>
       <div class="feature-card"><div class="icon">🏷️</div><h3>タグ・検索・製本</h3><p>タグ付け・横断検索・読書履歴、好きなページを 1 冊にまとめる製本機能。</p></div>
       <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
     </div>

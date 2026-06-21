@@ -79,6 +79,15 @@
     .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
       border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
 
+    .table-scroll { overflow-x: auto; margin: 0.75rem 0 1rem; background: #fff;
+      border: 1px solid #ffe0ec; border-radius: 8px; }
+    .compare-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 0.9rem; }
+    .compare-table th, .compare-table td { padding: 0.65rem 0.8rem; border-bottom: 1px solid #ffeef7;
+      vertical-align: top; text-align: left; }
+    .compare-table th { background: #fff0f7; color: #c0255a; font-weight: 700; white-space: nowrap; }
+    .compare-table td:first-child { width: 24%; color: #a02860; font-weight: 700; }
+    .compare-table tr:last-child td { border-bottom: none; }
+
     .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
       box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
     .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
@@ -144,9 +153,33 @@
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11</strong> です。</li>
       <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
-      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま開けます。パスワード付き・分割された RAR にも対応します）。RAR のまま大量に保管している場合は、初回だけ変換の待ち時間とディスク容量が必要になる点が、マンガミーヤとの違いです。</li>
+      <li><strong>左側のフォルダツリーは初期状態では表示しません。</strong>フォルダツリーで移動したい場合は、ツールバーの <strong>ツリー</strong> ボタン（または <kbd>F</kbd>）で左側に表示できます。</li>
+      <li><strong>フォルダにも表紙のようなサムネイルを出せます。</strong>フォルダ・ZIP・PDF の代表サムネイルは自動で選ばれますが、好きな画像やページを <kbd>P</kbd> キーやフォルダバーのピンで固定できます。フォルダを表紙つきの本棚のように整理する使い方を想定しています。</li>
+      <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま開けます。パスワード付き RAR に対応し、分割 RAR は <code>.part01.rar</code> などの先頭パートから開けます）。RAR のまま大量に保管している場合は、初回だけ変換の待ち時間とディスク容量が必要になる点が、マンガミーヤとの違いです。</li>
       <li><strong>キー・マウスのカスタマイズは限定的です。</strong>マンガミーヤはキー・マウス操作を細かくカスタマイズできますが、mImageViewer はキーの再割り当てが設定ファイル（keymap.ini）を編集する上級者向けの方法のみです。マウスは戻る／進むボタンとリングショートカット（マウスのフリック操作）のカスタマイズに対応します（GUI で自由にキーを割り当てる機能はありません）。</li>
     </ul>
+  </section>
+
+  <section>
+    <h2>機能比較</h2>
+    <p>マンガミーヤでよく使われる機能を、mImageViewer 側の対応機能に置き換えて見るための表です。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>項目</th><th>マンガミーヤ</th><th>mImageViewer</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>基本用途</td><td>多機能でカスタマイズ性の高い漫画用画像ビューアです。</td><td>Windows 11 向けに、見開き閲覧・整理・補正・AI 処理を統合した画像/漫画/動画ビューアです。</td></tr>
+          <tr><td>画像形式</td><td>JPEG / PNG / GIF / BMP / JPEG2000 / TXT などに対応し、追加形式は Susie プラグインで補う構成です。</td><td>JPEG / PNG / GIF / WebP / BMP などを内蔵で表示します。HEIC / AVIF / JPEG XL / RAW なども対応環境では扱えます。</td></tr>
+          <tr><td>アーカイブ</td><td>ZIP / RAR / LHA / PDF（画像）/ CBZ / CBR / CBL などを扱えます。</td><td>ZIP / CBZ は直接開きます。RAR / 7z / LZH は初回に ZIP キャッシュ化してから表示します。</td></tr>
+          <tr><td>見開き読書</td><td>漫画向けの見開き・表示設定を細かく調整して読む使い方ができます。</td><td>右→左見開き、表紙あり見開き、1 ページずらし、縦/横連結、表示倍率をフルスクリーン中に切り替えられます。</td></tr>
+          <tr><td>フォルダ移動</td><td>左側のフォルダツリーや操作設定を使って移動する使い方があります。</td><td>初期状態ではツリーを出さず、サムネイル一覧を広く使います。ツリーが必要なときはツールバーの <strong>ツリー</strong> ボタンで表示します。</td></tr>
+          <tr><td>フォルダの見た目</td><td>フォルダ名を中心に場所を選ぶ使い方が基本です。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を固定して、表紙つきの本棚のように整理できます。</td></tr>
+          <tr><td>操作設定</td><td>操作設定からキーボードショートカット、マウスジェスチャー、パッド操作などを細かく設定できます。</td><td>キー変更は <code>keymap.ini</code> 編集、マウスは戻る/進むボタンとリングショートカットの割り当てが中心です。</td></tr>
+          <tr><td>移行で増える機能</td><td>旧環境でも軽快に漫画を読むことに強みがあります。</td><td>タグ・レーティング、読書履歴、PDF/動画、色調補正、AI アップスケール、AI ノイズ除去、製本が使えます。</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -157,6 +190,31 @@
       <li><strong>開いたらすぐ読書を始める</strong> ―― 「環境設定 → 全体設定」の「ZIP/PDF/対応アーカイブ」で <strong>開いたとき、ページをフルスクリーン表示</strong> を選びます。</li>
       <li><strong>RAR を毎回確認なしで変換する</strong> ―― 「環境設定 → パフォーマンス → キャッシュ」の「RAR / 7z / LZH の処理」を <strong>確認せずキャッシュを作成する</strong> にします。</li>
     </ul>
+  </section>
+
+  <section>
+    <h2>操作対応表</h2>
+    <p>マンガミーヤで操作をカスタマイズしていた方は、mImageViewer 側の標準操作をこの表から覚えると移行しやすくなります。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>やりたいこと</th><th>mImageViewer の操作</th><th>補足</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>開く / 閉じる</td><td>一覧で <kbd>Enter</kbd> またはダブルクリック。戻るときは <kbd>Esc</kbd> / <kbd>Enter</kbd> / <kbd>BS</kbd>。</td><td>ZIP/PDF/変換アーカイブ内では、<kbd>Esc</kbd> と <kbd>BS</kbd> で戻り先が異なる場合があります。</td></tr>
+          <tr><td>ページ送り</td><td><kbd>←</kbd> <kbd>→</kbd>、マウスホイール、画面左右クリック。</td><td>右→左読みではクリック方向も漫画向けに反転します。</td></tr>
+          <tr><td>日本の漫画向け見開き</td><td><kbd>4</kbd> が見開き 右→左、<kbd>5</kbd> が表紙ありの見開き 右→左。</td><td><kbd>1</kbd>〜<kbd>5</kbd> で単ページ/見開き/表紙ありを切り替えます。</td></tr>
+          <tr><td>見開きの組ずれを直す</td><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd></td><td>途中でページの組がずれた本を、現在の閲覧中だけ 1 ページずらして読めます。</td></tr>
+          <tr><td>縦スクロール/横スクロール風に読む</td><td><kbd>6</kbd> でページ単位、縦連結、横連結を切り替えます。</td><td>連結中は矢印キーやホイールがスクロールとして働きます。</td></tr>
+          <tr><td>表示倍率を変える</td><td><kbd>0</kbd> でフィット方式を巡回。<kbd>Ctrl</kbd>+ホイールでズーム。</td><td>ページ全体、横幅、縦幅、100% 原寸を切り替えられます。</td></tr>
+          <tr><td>細部を拡大して読む</td><td><kbd>Z</kbd> で部分拡大ズーム。<kbd>M</kbd> または <kbd>Shift</kbd> 押しっぱなしでルーペ。</td><td><kbd>Z</kbd> は拡大範囲を決めてから読む方式、ルーペは一時確認向けです。</td></tr>
+          <tr><td>次の本・前の本へ移動</td><td><kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で前後のフォルダ / ZIP / PDF / 変換アーカイブへ移動します。</td></tr>
+          <tr><td>左側ツリーで移動する</td><td>ツールバーの <strong>ツリー</strong> ボタン、または <kbd>F</kbd> でフォルダツリーを表示します。</td><td>初期状態では非表示です。現在フォルダに合わせて必要な範囲が展開されます。</td></tr>
+          <tr><td>フォルダに表紙を付ける</td><td>代表にしたい画像・ページを選んで <kbd>P</kbd>、またはフォルダバーのピンで固定します。</td><td>フォルダ・ZIP・PDF の一覧で中身が分かりやすくなります。</td></tr>
+          <tr><td>キー・マウスを割り当てる</td><td>キーは <code>keymap.ini</code>、マウスは「マウスボタン」「リングショートカット」を使います。</td><td>マンガミーヤほど GUI で全操作を編集する方式ではありません。</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -197,12 +255,14 @@
   </section>
 
   <section>
-    <h2>移行で新しく手に入る機能</h2>
+    <h2>移行で使える便利な機能</h2>
     <div class="features">
       <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
       <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
+      <div class="feature-card"><div class="icon">✂️</div><h3>表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">🎮</div><h3>ゲームパッド対応</h3><p>一覧移動・ページ送り・フォルダ移動・見開き切替などをゲームパッドだけで操作できます。</p></div>
       <div class="feature-card"><div class="icon">🏷️</div><h3>タグ・検索・製本</h3><p>タグ付け・横断検索・読書履歴、好きなページを 1 冊にまとめる製本機能。</p></div>
       <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
     </div>
