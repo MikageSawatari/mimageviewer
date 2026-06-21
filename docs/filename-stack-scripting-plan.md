@@ -31,24 +31,33 @@
   3. 先頭連番 (`^\d+` で始まり、連番が連続したかたまりを gap で分割)
   4. 連写 (mtime が 5 秒以内に連続。クラスタ 2 つ以上で採用)
   どれも該当しなければ全て単独。動画は常に単独 (Rust 側 `group_by_keys` が一意キーへ上書き)。
-- **実行場所と性能**:
-  - **組み込み既定 (separator)** は軽量な純 Rust なのでフォルダ読込時に同期構築
-    (`build_stack_aggregated`、`group_media`)。
-  - **スクリプト経路はワーカー実行**。ユーザースクリプトは任意に重くなり得る (実測: 既定
+- **常にスクリプトで分類 (チェック有無に関わらず)**:
+  - 設定 `stack_script_enabled` が **OFF でも内蔵既定スクリプト** (`DEFAULT_SCRIPT` = カスケード)
+    で分類する。ON のときユーザーの `stack_rules.rhai` (無ければ内蔵既定)。旧「OFF = 末尾連番
+    だけの同期 separator ルール」は廃止 (`build_stack_aggregated` も削除)。`group_media`
+    (separator) は **スクリプト失敗時のフォールバック専用**。
+  - **どちらもワーカー実行**。ユーザースクリプトも内蔵既定も任意に重くなり得る (実測: 既定
     カスケード release で 10k=72-144ms / 100k=0.7-1.4s) ので UI スレッドで走らせない。
     トグル時はまず通常フォルダを表示し、グループ分けを `stack-script` スレッドで実行、完了後
-    `poll_stack_script` が集約ビューへ swap (`swap_stack_view_items` 流用)。フルスクリーン中は
-    swap を保留し閉じてから適用。`StackScriptPending` を `cancel`/folder で世代管理し、
-    別フォルダ移動・スタック OFF・再ロードで cancel。動画はルール判定に渡さず Rust 側で常に
-    単独化 (Codex P2)。失敗 (コンパイル/実行/長さ不一致/不正キー) は組み込み既定へフォールバック
+    `poll_stack_script` が **`start_loading_items` 経由** で集約ビューへ差し替える (動画サムネ起動 /
+    キャッシュ保護 / 世代更新を同期パスと同形にするため。`swap_stack_view_items` は不可=Codex P2)。
+    フルスクリーン中は差し替えを保留し閉じてから適用。`StackScriptPending` を `cancel`/folder で
+    世代管理し、別フォルダ移動・スタック OFF・再ロードで cancel。動画はルール判定に渡さず Rust 側で
+    常に単独化 (Codex P2)。失敗 (コンパイル/実行/長さ不一致/不正キー) は組み込み既定へフォールバック
     + トースト + logger。
+  - **トグル時のカーソル保持**: ON にした瞬間のカーソル画像パスを `stack_toggle_select_path` に
+    控え、集約完了時に `StackView::aggregated_index_for_member_path` でその画像を含むスタックセルを
+    選択する。OFF 側は通常フォルダで `select_after_load` (ファイル名) によりその代表画像を選択する。
   - **計測テスト**: `filename_stack_script::tests::perf_10k_default_script` (`#[ignore]`、
     `cargo test --release ... -- --ignored --nocapture` で実行)。`distinct`/`all_matched` は
     Rust native (HashSet/iter)。Rhai 実装だと挿入毎のデータサイズ再計算で O(n²) (10 万件 16 秒)
     になるため native 化必須。`max_string_size` は配列内文字列バイト総量を見るので 256MB、
     `max_operations` は 100M (100k の正当処理 ~数百万 op に対し十分・暴走は阻止)。
-- **設定**: `stack_script_enabled: bool` (既定 false、`#[serde(default)]`)。UI = 環境設定
-  「フォルダ」ページ (スクリプトを開く / 既定に戻す / ヘルプ)。ON/OFF 自体は v2.0.0 同様 transient。
+- **設定**: `stack_script_enabled: bool` (既定 false、`#[serde(default)]`)。OFF=内蔵既定
+  スクリプト / ON=ユーザー `stack_rules.rhai`。どちらもスクリプトで分類する (OFF が separator
+  だけだった旧挙動は廃止)。UI = 環境設定「フォルダ」ページ (スクリプトを開く / 既定に戻す /
+  ヘルプ)。スタックモードの ON/OFF 自体は v2.0.0 同様 transient。`stack_separator` は失敗時
+  フォールバック専用。
 - **マニュアル**: 独立ページ `htdocs/mimageviewer/manual/stack.html` (既定動作 + カスタマイズ +
   AI 依頼テンプレート)。全 23 ページのサイドバーに追加。
 - **未リリース新機能なのでマイグレーション不要** (v2.0.0 ごと出荷前)。

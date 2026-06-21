@@ -346,6 +346,15 @@ impl StackView {
     pub fn group_index_by_key(&self, key: &str) -> Option<usize> {
         self.groups.iter().position(|g| g.key == key)
     }
+
+    /// `path` をメンバーに含むグループの集約ビュー index を返す。スタックトグル時に「カーソル
+    /// 位置の画像が含まれるスタックセル」を選択し直すのに使う。
+    pub fn aggregated_index_for_member_path(&self, path: &Path) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|g| g.members.iter().any(|m| m.path == path))
+            .map(|g| self.aggregated_index_of_group(g))
+    }
 }
 
 /// グループ内メンバーを表示 sort 順に並べる。
@@ -709,5 +718,38 @@ mod tests {
             SortOrder::FileName,
         );
         assert!(!only_singletons.has_collapsible_stack());
+    }
+
+    #[test]
+    fn aggregated_index_for_member_path_finds_containing_stack() {
+        // 集約: [0]=folder, [1]=Stack(post 2枚), [2]=Image(solo)。
+        let media = vec![img("post_p0.jpg"), img("post_p1.jpg"), img("solo.jpg")];
+        let sv = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            vec![folder("sub")],
+            vec![None],
+            media,
+            '_',
+            SortOrder::FileName,
+        );
+        // スタック内のどのメンバーからでもそのスタックセル (集約 index 1) に解決。
+        assert_eq!(
+            sv.aggregated_index_for_member_path(&PathBuf::from(r"C:\dl\post_p0.jpg")),
+            Some(1)
+        );
+        assert_eq!(
+            sv.aggregated_index_for_member_path(&PathBuf::from(r"C:\dl\post_p1.jpg")),
+            Some(1)
+        );
+        // 単独画像は自身のセル (集約 index 2)。
+        assert_eq!(
+            sv.aggregated_index_for_member_path(&PathBuf::from(r"C:\dl\solo.jpg")),
+            Some(2)
+        );
+        // 含まれないパスは None。
+        assert_eq!(
+            sv.aggregated_index_for_member_path(&PathBuf::from(r"C:\dl\nope.jpg")),
+            None
+        );
     }
 }

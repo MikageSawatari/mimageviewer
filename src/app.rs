@@ -3886,6 +3886,9 @@ pub struct App {
     /// ユーザー定義スクリプトによるグループ分けをワーカーで実行中の保留状態。完了後に
     /// `poll_stack_script` が集約ビューへ差し替える (`docs/filename-stack-scripting-plan.md`)。
     pub(crate) stack_script_pending: Option<crate::filename_stack_ui::StackScriptPending>,
+    /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ
+    /// カーソルを移す (トグルで被写体が飛ばないように)。OFF 側は `select_after_load` で扱う。
+    pub(crate) stack_toggle_select_path: Option<std::path::PathBuf>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -5049,6 +5052,14 @@ impl App {
         mut settings: crate::settings::Settings,
         load_meta: crate::settings::SettingsLoadMeta,
     ) -> Self {
+        // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
+        // VST3 を強制 OFF にする。設定 DB に true が残っていても (例: 通常版の設定を流用)
+        // ここで落とすことで、bridge 起動・動画 VST 経路・設定 UI のすべてが OFF に揃う。
+        // 設定ページのトグルも無効化するので、ユーザーが ON に戻すこともできない。
+        #[cfg(windows)]
+        if !crate::video::dsp::vst3_supported() {
+            settings.vst3_enabled = false;
+        }
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
         #[cfg(windows)]
@@ -5806,6 +5817,7 @@ impl App {
             stack_active_rule: None,
             stack_script_error: None,
             stack_script_pending: None,
+            stack_toggle_select_path: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -8801,56 +8813,40 @@ impl App {
         // 訪問時自動索引化は廃止。「名前」フル索引化 ON のお気に入りのみ
         // name_bulk_indexer 経由で全走査する (検索結果が閲覧履歴に依らないように)。
 
-        // ファイル名 prefix スタック (v2.0.0): トグル ON のときはここで集約ビューへ変換する。
-        // existing_keys は **変換前の全 items** から既に集めてある (= 全メンバーのサムネ
-        // キャッシュキーを保持するので delete_missing が非代表メンバーを巻き添えで消さない)。
-        // 集約ビューは start_loading_items の動画サムネスレッド起動を通すため、ここで items を
-        // 差し替えてから渡す。StackView は start_loading_items が stack_view をクリアした後に設定。
-        // (items / image_metas / video_items は上で `let mut` 宣言済み。)
-        // ファイル名スタック (v2.0.0 + scripting):
-        // - スクリプト無効: 組み込み既定 (separator) を同期構築 (高速)。
-        // - スクリプト有効: ユーザースクリプトは任意に重くなり得る (10 万件で ~1 秒) ので
-        //   UI スレッドで走らせない。通常フォルダを先に表示し、グループ分けはワーカーで実行、
-        //   完了後に poll_stack_script が集約ビューへ差し替える。
-        let stack_separator = self.settings.stack_separator;
+        // ファイル名スタック: スタックモード ON のときは、グループ分けを **常にスクリプト
+        // (ワーカー)** で行う。
+        // - 「分類ルールをスクリプトで行う」OFF → 内蔵既定スクリプト (DEFAULT_SCRIPT、
+        //   mXD/末尾連番/先頭連番/連写のカスケード)。
+        // - ON → ユーザーの stack_rules.rhai (無ければ内蔵既定)。
+        // どちらも UI スレッドでは走らせない (重くなり得る) ので通常フォルダを先に表示し、
+        // 完了後 poll_stack_script が集約ビューへ差し替える。組み込み separator ルールは
+        // スクリプト失敗時のフォールバックのみ (旧「OFF=末尾連番だけ」の同期パスは廃止)。
+        // existing_keys は **変換前の全 items** から集めてあり (= 全メンバーのサムネキャッシュ
+        // キーを保持するので delete_missing が非代表メンバーを巻き添えで消さない)、ワーカー完了時に
+        // start_loading_items へ渡すため消費前に複製しておく。
         let stack_on = self.stack_mode_requested;
-        let stack_async = stack_on && self.settings.stack_script_enabled;
-        // 集約材料 (script 経路) は items を start_loading_items が消費する前に非破壊で取り出す。
-        let stack_async_materials = if stack_async {
-            Some(crate::filename_stack_ui::extract_stack_parts(
-                &items,
-                &image_metas,
-                folder_count,
+        let stack_async_prep = if stack_on {
+            let source = if self.settings.stack_script_enabled {
+                crate::filename_stack_script::active_script_source()
+            } else {
+                crate::filename_stack_script::DEFAULT_SCRIPT.to_string()
+            };
+            let (passthrough, passthrough_metas, media) =
+                crate::filename_stack_ui::extract_stack_parts(&items, &image_metas, folder_count);
+            Some((
+                source,
+                self.settings.stack_separator,
+                passthrough,
+                passthrough_metas,
+                media,
+                existing_keys.clone(),
+                path.clone(),
             ))
         } else {
             None
         };
-        let stack_folder = path.clone();
-        // 集約適用時に start_loading_items へ渡すため、existing_keys を消費される前に複製。
-        let stack_async_existing = stack_async.then(|| existing_keys.clone());
-
-        let pending_stack_view = if stack_on && !stack_async {
-            let (agg_items, agg_metas, agg_videos, sv, info) =
-                crate::filename_stack_ui::build_stack_aggregated(
-                    path.clone(),
-                    items,
-                    image_metas,
-                    folder_count,
-                    stack_separator,
-                    sort,
-                    None,
-                );
-            items = agg_items;
-            image_metas = agg_metas;
-            video_items = agg_videos;
-            self.stack_active_rule = info.rule;
-            self.stack_script_error = info.script_error;
-            Some(sv)
-        } else {
-            self.stack_active_rule = None;
-            self.stack_script_error = None;
-            None
-        };
+        self.stack_active_rule = None;
+        self.stack_script_error = None;
 
         let items_len = items.len();
         self.start_loading_items(
@@ -8861,13 +8857,16 @@ impl App {
             video_items,
             Some(folder_signature),
         );
-        if let Some(sv) = pending_stack_view {
-            // start_loading_items が stack_mode_requested を一旦 false にするので、ここで
-            // ユーザー意図を復元する (次の同一フォルダ再読込 = ソート変更等でも維持される)。
-            self.stack_mode_requested = true;
-            self.stack_view = Some(sv);
-        }
-        if let Some((passthrough, passthrough_metas, media)) = stack_async_materials {
+        if let Some((
+            source,
+            separator,
+            passthrough,
+            passthrough_metas,
+            media,
+            stack_existing,
+            stack_folder,
+        )) = stack_async_prep
+        {
             // start_loading_items が stack_mode_requested / stack_script_pending をリセットした
             // 後で、通常フォルダ表示のままワーカーへグループ分けを投げる。
             self.stack_mode_requested = true;
@@ -8876,10 +8875,11 @@ impl App {
                 passthrough,
                 passthrough_metas,
                 media,
-                stack_separator,
+                separator,
                 sort,
-                stack_async_existing.unwrap_or_default(),
+                stack_existing,
                 Some(folder_signature),
+                source,
             );
         }
 

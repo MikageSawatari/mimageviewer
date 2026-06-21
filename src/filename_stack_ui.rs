@@ -24,15 +24,6 @@ use crate::filename_stack::{StackMember, StackView};
 use crate::grid_item::GridItem;
 use crate::settings::SortOrder;
 
-/// スタック集約構築の付随情報 (トグル時のトースト用)。
-#[derive(Default)]
-pub(crate) struct StackBuildInfo {
-    /// 採用された分類ルールの表示名 (スクリプトが `#{ rule, keys }` を返した場合)。
-    pub rule: Option<String>,
-    /// スクリプトが失敗し組み込み既定へフォールバックした場合のエラー要旨。
-    pub script_error: Option<String>,
-}
-
 /// ユーザー定義スクリプトによるグループ分けを **ワーカーで** 実行する際の保留状態
 /// (`docs/filename-stack-scripting-plan.md`)。スクリプトは任意に重くなり得る (10 万件で
 /// ~1 秒) ので UI スレッドで走らせず、通常フォルダを先に表示しつつ裏で計算し、完了後に
@@ -97,96 +88,6 @@ pub(crate) fn extract_stack_parts(
     (passthrough, passthrough_metas, media)
 }
 
-/// 通常フォルダの items (コンテナ先頭 + メディア) を集約ビューへ変換し、`StackView` を作る。
-///
-/// `folder_count` = items 先頭のコンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) ブロック数。
-/// それ以降は Image/Video のメディア。`script_source` が `Some` のときはユーザー定義 Rhai
-/// スクリプトでグループキーを決め、失敗時は `separator` の組み込み既定へフォールバックする。
-/// 戻り値 = (集約 items, 集約 metas, 集約 video_items, StackView, 構築情報)。
-pub(crate) fn build_stack_aggregated(
-    folder: PathBuf,
-    mut items: Vec<GridItem>,
-    mut image_metas: Vec<Option<(i64, i64)>>,
-    folder_count: usize,
-    separator: char,
-    sort: SortOrder,
-    script_source: Option<&str>,
-) -> (
-    Vec<GridItem>,
-    Vec<Option<(i64, i64)>>,
-    Vec<(usize, PathBuf, u64)>,
-    StackView,
-    StackBuildInfo,
-) {
-    let folder_count = folder_count.min(items.len());
-    let media_items = items.split_off(folder_count);
-    let media_metas = image_metas.split_off(folder_count);
-    // items / image_metas は passthrough (コンテナ) ブロックになった。
-    let mut media: Vec<StackMember> = Vec::with_capacity(media_items.len());
-    for (it, meta) in media_items.into_iter().zip(media_metas) {
-        let (mtime, size) = meta.unwrap_or((0, 0));
-        match it {
-            GridItem::Image(path) => media.push(StackMember {
-                path,
-                mtime,
-                size,
-                is_video: false,
-            }),
-            GridItem::Video(path) => media.push(StackMember {
-                path,
-                mtime,
-                size,
-                is_video: true,
-            }),
-            // 防御的: 通常フォルダのメディアブロックは Image/Video のみのはずだが、
-            // 想定外の種別が来たら passthrough 末尾に素通しする (グループ化に混ぜない)。
-            other => {
-                items.push(other);
-                image_metas.push(meta);
-            }
-        }
-    }
-
-    let mut info = StackBuildInfo::default();
-    // グループ化: スクリプト有効ならそれ、失敗・無効なら組み込み既定 (separator)。
-    let groups = match script_source {
-        Some(src) => {
-            // 動画はルール判定に含めない (常に単独。Codex P2)。画像だけをスクリプトへ渡し、
-            // 戻りキーを元の media 順へ戻す (動画位置は空キー = group_by_keys が一意化する)。
-            let image_media: Vec<StackMember> =
-                media.iter().filter(|m| !m.is_video).cloned().collect();
-            match crate::filename_stack_script::group_keys(&image_media, src) {
-                Ok(res) => {
-                    info.rule = res.rule;
-                    let mut img_keys = res.keys.into_iter();
-                    let full_keys: Vec<String> = media
-                        .iter()
-                        .map(|m| {
-                            if m.is_video {
-                                String::new()
-                            } else {
-                                img_keys.next().unwrap_or_default()
-                            }
-                        })
-                        .collect();
-                    crate::filename_stack::group_by_keys(media, &full_keys, sort)
-                }
-                Err(e) => {
-                    crate::logger::log(format!("stack script failed, fallback to builtin: {e}"));
-                    info.script_error = Some(e);
-                    crate::filename_stack::group_media(media, separator, sort)
-                }
-            }
-        }
-        None => crate::filename_stack::group_media(media, separator, sort),
-    };
-
-    let sv = StackView::from_groups(folder, items, image_metas, separator, sort, groups);
-    let (agg_items, agg_metas) = sv.materialize_aggregated();
-    let video_items = stack_video_items(&agg_items, &agg_metas);
-    (agg_items, agg_metas, video_items, sv, info)
-}
-
 /// 集約 / メンバービューの items から動画セルの `(idx, path, size)` を集める
 /// (`start_loading_items` の video サムネスレッド用、元の媒体ループと同形式)。
 pub(crate) fn stack_video_items(
@@ -221,6 +122,9 @@ impl crate::app::App {
 
     /// ユーザー定義スクリプトによるグループ分けをワーカーで開始する。通常フォルダは既に
     /// 表示済みで、完了後 `poll_stack_script` が集約ビューへ差し替える。
+    ///
+    /// `source` は実行する Rhai スクリプト本文。チェックなし (= 既定) のときは内蔵
+    /// `DEFAULT_SCRIPT`、チェックありのときはユーザーの `stack_rules.rhai` を呼び出し側が渡す。
     pub(crate) fn spawn_stack_script_worker(
         &mut self,
         folder: PathBuf,
@@ -231,8 +135,8 @@ impl crate::app::App {
         sort: SortOrder,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<u64>,
+        source: String,
     ) {
-        let source = crate::filename_stack_script::active_script_source();
         // 動画はルール判定に渡さない (常に単独)。画像だけをスクリプトへ。
         let image_indices: Vec<usize> = media
             .iter()
@@ -385,6 +289,16 @@ impl crate::app::App {
         self.stack_view = Some(sv);
         self.stack_active_rule = rule.clone();
         self.stack_script_error = err.clone();
+        // トグル ON 時のカーソル画像を含むスタックセルへカーソルを移す (被写体を保つ)。
+        if let Some(target) = self.stack_toggle_select_path.take()
+            && let Some(idx) = self
+                .stack_view
+                .as_ref()
+                .and_then(|sv| sv.aggregated_index_for_member_path(&target))
+        {
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        }
         if err.is_some() {
             self.show_feedback_toast(
                 "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)".into(),
@@ -433,6 +347,17 @@ impl crate::app::App {
         self.stack_view.is_some() && !self.stack_showing_flat
     }
 
+    /// 現在カーソル位置 (selected) のセルの代表画像/動画パス。スタックトグルで被写体を保つため。
+    /// 通常セル (Image/Video) はそのパス、スタックセルは代表画像、コンテナは `None`。
+    fn current_selected_representative_path(&self) -> Option<std::path::PathBuf> {
+        let idx = self.selected?;
+        match self.items.get(idx)? {
+            GridItem::Image(p) | GridItem::Video(p) => Some(p.clone()),
+            GridItem::Stack { representative, .. } => Some(representative.clone()),
+            _ => None,
+        }
+    }
+
     /// スタックモードを切り替える。同一フォルダを再読込して集約 / 通常を作り直す
     /// (folder_changes=false なので `stack_mode_requested` は維持される)。
     pub(crate) fn toggle_stack_mode(&mut self) {
@@ -443,7 +368,24 @@ impl crate::app::App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
+        // トグル前のカーソル画像 (代表パス) を捕まえ、トグル後も同じ被写体に留まるようにする。
+        let target = self.current_selected_representative_path();
+        // 通常フォルダでの選択は名前ベースの select_after_load で復元する (ON 時の計算中の
+        // 通常表示 / OFF 時の最終表示の両方で効く)。ON 時の最終的な集約ビューでは、その画像を
+        // 含むスタックセルへ apply_stack_script_result が選択し直す。
+        if let Some(name) = target
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            self.select_after_load = Some(name.to_string());
+        }
         self.stack_mode_requested = !self.stack_mode_requested;
+        self.stack_toggle_select_path = if self.stack_mode_requested {
+            target
+        } else {
+            None
+        };
         self.load_folder(folder);
         // スクリプトをワーカーで計算中 (async) のときは、ここではトーストしない。完了時に
         // poll_stack_script が採用ルール / 失敗 / 非該当のトーストを出す。

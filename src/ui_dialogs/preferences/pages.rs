@@ -1952,6 +1952,29 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
          リアルタイムに分析・加工できます。",
     );
     ui.add_space(8.0);
+
+    // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
+    // 機能を利用できない。トグルを無効化し、理由をホバーで示す (= ユーザー要望の挙動)。
+    if !crate::video::dsp::vst3_supported() {
+        state.settings.vst3_enabled = false;
+        let mut off = false;
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut off, "VST3 プラグイン処理を有効にする"),
+        )
+        .on_hover_text("ポータブル版では利用できません");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "この版では VST3 プラグイン機能を利用できません。\
+                 インストーラ版または単体 exe 版をご利用ください。",
+            )
+            .weak()
+            .small(),
+        );
+        return;
+    }
+
     ui.checkbox(
         &mut state.settings.vst3_enabled,
         "VST3 プラグイン処理を有効にする",
