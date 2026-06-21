@@ -1895,14 +1895,15 @@ impl App {
             }
             _ => tex_size,
         };
-        // 表示トリムが有効ならパン対象をトリム後 bbox に絞る (切り落とした余白へパンしない、Phase D)。
+        // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
         // 回転ページは draw_fs_image 側で bbox を使わないので通常どおり全体を対象にする。
         // mut 借用 (view_trim_single_content_bbox) を bg_style の immutable 借用より前に済ませる。
-        let (content_min, content_size) = match rotation
+        // 正規化 bbox は照準オーバービューの draw_fs_image にも渡す (= 余白を出さずトリム後を表示)。
+        let trim_bbox = rotation
             .is_none()
             .then(|| self.view_trim_single_content_bbox(fs_idx))
-            .flatten()
-        {
+            .flatten();
+        let (content_min, content_size) = match trim_bbox {
             Some(bbox) => (
                 egui::vec2(bbox.min.x * display_size.x, bbox.min.y * display_size.y),
                 egui::vec2(
@@ -1963,7 +1964,9 @@ impl App {
                 self.maybe_rerender_pdf(zoom);
             }
         } else {
-            // 照準: 全体を contain 表示してズーム範囲の枠を重ねる。
+            // 照準: トリム後コンテンツを contain 表示してズーム範囲の枠を重ねる。
+            // content_bbox に trim_bbox を渡すことで、オーバービューにも余白を出さない
+            // (= 通常表示と同じトリム後の見た目)。枠はそのコンテンツ表示矩形内に描く。
             Self::draw_fs_image(
                 ui,
                 image_rect,
@@ -1980,16 +1983,10 @@ impl App {
                 false,
                 FullscreenFitMode::Page,
                 no_limits,
-                None,
+                trim_bbox,
             );
-            let frame = zip_aim_frame_rect(
-                image_rect,
-                display_size,
-                content_min,
-                content_size,
-                factor,
-                cursor_img,
-            );
+            let frame =
+                zip_aim_frame_rect(image_rect, content_min, content_size, factor, cursor_img);
             let painter = ui.painter().with_clip_rect(image_rect);
             let dim = egui::Color32::from_black_alpha(120);
             for r in capture_region_outside_rects(image_rect, frame) {
@@ -2338,33 +2335,36 @@ fn zip_cover_zoom_pan(
     (zoom, pan)
 }
 
-/// 照準 (Z 押下中) で表示する枠のスクリーン矩形。画像はページ全体フィット (contain、
-/// `display_size`) で表示している前提で、コンテンツ領域内の表示範囲を枠として描く。
-/// 離した瞬間の `zip_cover_zoom_pan` の表示範囲と完全に一致する。
+/// 照準 (Z 押下中) で表示する枠のスクリーン矩形。オーバービューは**トリム後コンテンツ**を
+/// contain 表示している前提で (draw_fs_image に content_bbox を渡すのと同じ配置)、そのコンテンツ
+/// 表示矩形の中に表示範囲を枠として描く。離した瞬間の `zip_cover_zoom_pan` の表示範囲と一致する。
+/// トリムが無いとき (`content_min = 0`, `content_size = display_size`) は従来の全体表示と一致する。
 fn zip_aim_frame_rect(
     view_rect: egui::Rect,
-    display_size: egui::Vec2,
     content_min: egui::Vec2,
     content_size: egui::Vec2,
     factor: f32,
     cursor_img: egui::Vec2,
 ) -> egui::Rect {
-    if display_size.x <= 0.0 || display_size.y <= 0.0 {
+    if content_size.x <= 0.0 || content_size.y <= 0.0 {
         return view_rect;
     }
-    let fit = (view_rect.width() / display_size.x).min(view_rect.height() / display_size.y);
-    let disp = egui::vec2(display_size.x * fit, display_size.y * fit);
-    let disp_rect = egui::Rect::from_center_size(view_rect.center(), disp);
+    // コンテンツを contain 表示する矩形 (= draw_fs_image が content_bbox 指定時に描く位置)。
+    let fit = (view_rect.width() / content_size.x).min(view_rect.height() / content_size.y);
+    let content_disp = egui::Rect::from_center_size(
+        view_rect.center(),
+        egui::vec2(content_size.x * fit, content_size.y * fit),
+    );
     let (vis, center_rel) = zip_visible_src(
         view_rect.size(),
         content_size,
         factor,
         cursor_img - content_min,
     );
-    let center_img = content_min + center_rel;
+    // center_rel はコンテンツ相対 (0..content_size) なので、content_disp 内へそのまま写す。
     let min = egui::pos2(
-        disp_rect.left() + (center_img.x - vis.x / 2.0) * fit,
-        disp_rect.top() + (center_img.y - vis.y / 2.0) * fit,
+        content_disp.left() + (center_rel.x - vis.x / 2.0) * fit,
+        content_disp.top() + (center_rel.y - vis.y / 2.0) * fit,
     );
     egui::Rect::from_min_size(min, egui::vec2(vis.x * fit, vis.y * fit))
 }
@@ -16509,7 +16509,7 @@ mod tests {
         zip_cover_zoom_pan(view, image, egui::Vec2::ZERO, image, factor, cursor)
     }
     fn tz_aim(view: egui::Rect, image: egui::Vec2, factor: f32, cursor: egui::Vec2) -> egui::Rect {
-        zip_aim_frame_rect(view, image, egui::Vec2::ZERO, image, factor, cursor)
+        zip_aim_frame_rect(view, egui::Vec2::ZERO, image, factor, cursor)
     }
     fn tz_cursor(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
         zip_cursor_image_px(band, egui::Vec2::ZERO, image, cursor)
@@ -16735,6 +16735,69 @@ mod tests {
                 "枠は表示画像内: {f:?} in {disp:?}"
             );
         }
+    }
+
+    #[test]
+    fn zip_aim_with_trim_uses_content_overview_and_matches_commit() {
+        // 表示トリムで左右を切った縦長コンテンツ (画像 400x400、トリム後は中央 200x400)。
+        // 照準オーバービューはトリム後コンテンツを contain 表示し、枠はその中だけに出る
+        // (= 切り落とした余白を見せない)。離した瞬間のズーム表示範囲とも一致する。
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
+        let display = egui::vec2(400.0, 400.0);
+        let content_min = egui::vec2(100.0, 0.0);
+        let content_size = egui::vec2(200.0, 400.0);
+        let factor = 1.0;
+        let cursor_img = content_min + content_size / 2.0; // コンテンツ中心
+
+        // コンテンツ contain 表示矩形 (= オーバービューでトリム後画像が出る位置)。
+        let fit = (view.width() / content_size.x).min(view.height() / content_size.y);
+        let content_disp = egui::Rect::from_center_size(
+            view.center(),
+            egui::vec2(content_size.x * fit, content_size.y * fit),
+        );
+        // 全体画像を出していたらオーバービューはもっと横に広い (= バグ時に余白が見える)。
+        // トリム反映後はコンテンツ基準なので狭いことを確認する。
+        let full_fit = (view.width() / display.x).min(view.height() / display.y);
+        assert!(
+            content_disp.width() < display.x * full_fit - 1.0,
+            "オーバービューはトリム後コンテンツ基準 (全体画像より狭い)"
+        );
+
+        let frame = zip_aim_frame_rect(view, content_min, content_size, factor, cursor_img);
+        // 枠はコンテンツ表示矩形の中に収まる (余白側へはみ出さない)。
+        assert!(
+            frame.left() >= content_disp.left() - 0.5
+                && frame.right() <= content_disp.right() + 0.5
+                && frame.top() >= content_disp.top() - 0.5
+                && frame.bottom() <= content_disp.bottom() + 0.5,
+            "枠はトリム後コンテンツ表示内: {frame:?} in {content_disp:?}"
+        );
+
+        // 照準枠 ↔ 確定ズームの一致: 枠の画像ピクセル範囲がズーム時に画面いっぱいへ写る。
+        let frame_img_min = content_min
+            + egui::vec2(
+                (frame.left() - content_disp.left()) / fit,
+                (frame.top() - content_disp.top()) / fit,
+            );
+        let (zoom, pan) = zip_cover_zoom_pan(
+            view.size(),
+            display,
+            content_min,
+            content_size,
+            factor,
+            cursor_img,
+        );
+        let page_fit = (view.width() / display.x).min(view.height() / display.y);
+        let total = zoom * page_fit;
+        let mapped_min = egui::vec2(
+            view.center().x + pan.x + (frame_img_min.x - display.x / 2.0) * total,
+            view.center().y + pan.y + (frame_img_min.y - display.y / 2.0) * total,
+        );
+        assert!(
+            (mapped_min.x - view.left()).abs() < 0.5 && (mapped_min.y - view.top()).abs() < 0.5,
+            "枠左上がズーム時に画面左上へ写る: {mapped_min:?} vs {:?}",
+            view.min
+        );
     }
 
     #[test]
