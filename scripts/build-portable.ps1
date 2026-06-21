@@ -101,11 +101,15 @@ $copies = @(
     @{ src = 'vendor\ort\onnxruntime.dll';           dst = 'onnxruntime.dll' }
     @{ src = 'vendor\ort\onnxruntime_providers_shared.dll'; dst = 'onnxruntime_providers_shared.dll' }
     @{ src = 'vendor\susie-worker\mimageviewer-susie32.exe'; dst = 'mimageviewer-susie32.exe' }
-    # NOTE: mimageviewer-vst3-host.exe は意図的に同梱しない。未署名の bridge exe が一部の
-    # セキュリティソフトに誤検知され、ポータブル zip のダウンロードがブロックされる事象が
-    # あるため (v2.0.0)。host が無いと src/video/dsp/vst3_supported() が false を返し、
-    # アプリ側で VST3 機能が自動的に無効化される (設定でも ON にできない)。
-    # 恒久対策 = bridge exe をコード署名 → 署名後はこの行を復活させて再同梱する。
+    # NOTE: mimageviewer-vst3-host.exe is intentionally NOT bundled. The unsigned
+    # bridge exe is false-flagged by some security software, which blocked the
+    # portable zip download (v2.0.0). Without the host, src/video/dsp/vst3_supported()
+    # returns false and the app auto-disables VST3 (it cannot be turned on in settings).
+    # Permanent fix = code-sign the bridge exe, then restore this line to re-bundle it.
+    # (Keep this file ASCII-only: PowerShell 5.1 reads BOM-less .ps1 as the system
+    #  ANSI codepage, and a CP932-misdecoded Japanese comment once silently swallowed
+    #  the LICENSE-ffmpeg.txt entry below via comment line-continuation. See the
+    #  CLAUDE.md encoding policy: .ps1 = ASCII only.)
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'installer\readme_portable.txt';        dst = 'readme.txt' }
