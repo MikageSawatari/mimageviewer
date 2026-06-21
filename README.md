@@ -1,9 +1,53 @@
 # mImageViewer
 
-Windows 向け高速サムネイルビューワー
-
 [![GitHub release](https://img.shields.io/github/v/release/MikageSawatari/mimageviewer)](https://github.com/MikageSawatari/mimageviewer/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Platform: Windows 11](https://img.shields.io/badge/platform-Windows%2011-0078D6)](https://github.com/MikageSawatari/mimageviewer/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/MikageSawatari/mimageviewer/total)](https://github.com/MikageSawatari/mimageviewer/releases)
+
+**English** | [日本語](#日本語)
+
+A fast, GPU-accelerated **image, comic/manga and video viewer for Windows 11**, written in Rust.
+It opens folders as a thumbnail grid, reads images straight out of ZIP and PDF, plays video
+inline, and includes GPU AI upscaling.
+
+> **Note:** The application UI is currently available in **Japanese only**.
+
+![mImageViewer thumbnail grid](htdocs/mimageviewer/ss_grid.png)
+
+### Highlights
+
+- GPU-accelerated thumbnail grid with an on-disk cache (instant on re-open)
+- Wide format support: JPEG, PNG, GIF, WebP, BMP, HEIC/HEIF, AVIF, JPEG XL, TIFF and camera RAW
+- Reads images directly inside **ZIP / CBZ** archives and **PDF** — no extraction;
+  RAR / CBR / 7z / CB7 / LZH are auto-converted on click
+- **Two-page spread** reading (left-to-right / right-to-left) and continuous vertical /
+  horizontal scrolling for manga & comics
+- **Inline video playback** (MP4 / MKV / MOV / AVI / WMV / MPEG / HEVC / AV1) via FFmpeg
+- **AI 4x upscaling** (Real-ESRGAN / Real-CUGAN / NMKD-Siax), JPEG denoise and an MI-GAN
+  inpainting eraser — GPU-accelerated via DirectML / TensorRT
+- Reads **AI-generation metadata** (prompts / parameters) from PNG text chunks and JPEG EXIF
+- Non-destructive rotation, adjustment presets & local adjustment layers, tagging and search
+- **Susie plug-in** support (.spi) for retro PC-98 / X68000 formats (PI / MAG / PIC …)
+
+### Screenshots
+
+| Fullscreen | AI upscaling | AI metadata |
+|---|---|---|
+| ![Fullscreen](htdocs/mimageviewer/ss_fullscreen.png) | ![AI upscaling](htdocs/mimageviewer/ss_upscale.png) | ![AI metadata](htdocs/mimageviewer/ss_metadata.png) |
+
+### Download
+
+Get the latest build from the [**Releases page**](https://github.com/MikageSawatari/mimageviewer/releases/latest) —
+installer, single-exe, and portable editions are available (details in the Japanese section below).
+
+Full documentation: [**online manual**](https://mikage.to/mimageviewer/manual/) (Japanese).
+
+---
+
+<a id="日本語"></a>
+
+Windows 向け高速サムネイルビューワー
 
 ## こんな方におすすめ
 
