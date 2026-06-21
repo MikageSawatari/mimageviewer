@@ -82,6 +82,11 @@ fn get_regex(pattern: &str) -> Option<Regex> {
         return entry.clone();
     }
     let compiled = Regex::new(pattern).ok();
+    // 無制限肥大を防ぐ (ファイル名からパターンを動的生成するスクリプト対策、Codex P3)。
+    // 静的パターンしか使わない通常スクリプトでは到達しない上限。
+    if cache.len() >= 1024 {
+        cache.clear();
+    }
     cache.insert(pattern.to_string(), compiled.clone());
     compiled
 }
@@ -106,14 +111,19 @@ fn ext_of(p: &Path) -> String {
 /// サンドボックス済みエンジンを作る。
 fn build_engine() -> Engine {
     let mut engine = Engine::new();
-    // 暴走 backstop (自動実行されるユーザースクリプト用)。
-    engine.set_max_operations(50_000_000);
+    // 暴走 backstop (自動実行されるユーザースクリプト用)。UI スレッドで走るので
+    // op 上限はやや低め (既定スクリプトの 10k ファイルは ~数十万 op で十分収まる)。
+    engine.set_max_operations(10_000_000);
     engine.set_max_call_levels(64);
     engine.set_max_expr_depths(64, 64);
     engine.set_max_string_size(64 * 1024);
     engine.set_max_array_size(8_000_000);
     engine.set_max_map_size(8_000_000);
     engine.disable_symbol("eval");
+    // import 経由のモジュール読み込み (既定 FileModuleResolver による任意 .rhai の
+    // ファイル読み) を封じる。これを忘れると I/O 非公開のサンドボックスに穴が空く
+    // (Codex P1)。import はパース時に拒否される。
+    engine.disable_symbol("import");
 
     engine.register_fn("regex_is_match", |text: &str, pattern: &str| -> bool {
         get_regex(pattern)
@@ -205,18 +215,27 @@ pub fn group_keys(media: &[StackMember], source: &str) -> Result<GroupingResult,
         ));
     }
 
+    // キーは「文字列」または `()` (= 単独) のみ受け付ける。数値は文字列化して許容するが、
+    // 配列 / マップ / bool 等が来たら誤グループ化を防ぐためエラー → 組み込み既定へフォールバック
+    // させる (Codex P2)。
     let keys: Vec<String> = arr
         .into_iter()
         .enumerate()
         .map(|(i, d)| {
             if d.is_unit() {
                 // 未該当 (()) は一意キー = 単独スタック。NUL 区切りで実キーと衝突しない。
-                format!("\u{0}solo\u{0}{}", media[i].path.display())
+                Ok(format!("\u{0}solo\u{0}{}", media[i].path.display()))
+            } else if d.is_string() {
+                Ok(d.into_string().unwrap_or_default())
+            } else if d.is_int() {
+                Ok(d.as_int().unwrap_or(0).to_string())
             } else {
-                d.clone().into_string().unwrap_or_else(|_| d.to_string())
+                Err(format!(
+                    "スクリプトのキーが文字列でも数値でもありません (index {i})"
+                ))
             }
         })
-        .collect();
+        .collect::<Result<Vec<String>, String>>()?;
 
     Ok(GroupingResult { keys, rule })
 }
@@ -357,5 +376,37 @@ mod tests {
         let src = r#"fn group(files) { [] }"#;
         let media = vec![m("a.jpg", 0, false)];
         assert!(group_keys(&media, src).is_err());
+    }
+
+    #[test]
+    fn import_is_blocked() {
+        // import を無効化しているので、import を含むスクリプトはコンパイルできず Err。
+        let src = r#"import "foo" as bar; fn group(files) { files.map(|f| f.name) }"#;
+        let media = vec![m("a.jpg", 0, false)];
+        assert!(group_keys(&media, src).is_err());
+    }
+
+    #[test]
+    fn eval_is_blocked() {
+        let src = r#"fn group(files) { eval("1"); files.map(|f| f.name) }"#;
+        let media = vec![m("a.jpg", 0, false)];
+        assert!(group_keys(&media, src).is_err());
+    }
+
+    #[test]
+    fn non_string_non_int_key_is_rejected() {
+        // 配列をキーに返すと誤グループ化を防ぐため Err (→ 呼び出し側で既定へフォールバック)。
+        let src = r#"fn group(files) { files.map(|f| [1, 2]) }"#;
+        let media = vec![m("a.jpg", 0, false), m("b.jpg", 0, false)];
+        assert!(group_keys(&media, src).is_err());
+    }
+
+    #[test]
+    fn int_key_is_accepted_as_string() {
+        let src = r#"fn group(files) { files.map(|f| 7) }"#;
+        let media = vec![m("a.jpg", 0, false), m("b.jpg", 0, false)];
+        let r = group_keys(&media, src).expect("int keys ok");
+        assert_eq!(r.keys[0], "7");
+        assert_eq!(r.keys[1], "7");
     }
 }

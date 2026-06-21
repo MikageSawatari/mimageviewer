@@ -83,17 +83,34 @@ pub(crate) fn build_stack_aggregated(
     let mut info = StackBuildInfo::default();
     // グループ化: スクリプト有効ならそれ、失敗・無効なら組み込み既定 (separator)。
     let groups = match script_source {
-        Some(src) => match crate::filename_stack_script::group_keys(&media, src) {
-            Ok(res) => {
-                info.rule = res.rule;
-                crate::filename_stack::group_by_keys(media, &res.keys, sort)
+        Some(src) => {
+            // 動画はルール判定に含めない (常に単独。Codex P2)。画像だけをスクリプトへ渡し、
+            // 戻りキーを元の media 順へ戻す (動画位置は空キー = group_by_keys が一意化する)。
+            let image_media: Vec<StackMember> =
+                media.iter().filter(|m| !m.is_video).cloned().collect();
+            match crate::filename_stack_script::group_keys(&image_media, src) {
+                Ok(res) => {
+                    info.rule = res.rule;
+                    let mut img_keys = res.keys.into_iter();
+                    let full_keys: Vec<String> = media
+                        .iter()
+                        .map(|m| {
+                            if m.is_video {
+                                String::new()
+                            } else {
+                                img_keys.next().unwrap_or_default()
+                            }
+                        })
+                        .collect();
+                    crate::filename_stack::group_by_keys(media, &full_keys, sort)
+                }
+                Err(e) => {
+                    crate::logger::log(format!("stack script failed, fallback to builtin: {e}"));
+                    info.script_error = Some(e);
+                    crate::filename_stack::group_media(media, separator, sort)
+                }
             }
-            Err(e) => {
-                crate::logger::log(format!("stack script failed, fallback to builtin: {e}"));
-                info.script_error = Some(e);
-                crate::filename_stack::group_media(media, separator, sort)
-            }
-        },
+        }
         None => crate::filename_stack::group_media(media, separator, sort),
     };
 
