@@ -44,6 +44,7 @@ pub mod external_metadata;
 pub mod fast_resize;
 pub mod file_drag;
 pub mod filename_stack;
+pub mod filename_stack_script;
 // filename_stack_ui は App (main.rs 側 private module) に impl するため bin crate のみで公開する
 mod filename_stack_ui;
 pub mod folder_pane;

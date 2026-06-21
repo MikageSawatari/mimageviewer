@@ -2389,6 +2389,62 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .size(11.0)
         .color(egui::Color32::from_gray(150)),
     );
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("ファイル名スタック").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "アドレスバーの「スタック」ボタンで、似たファイルを自動で分類して 1 つに畳んで表示します。\n\
+         既定では末尾連番・先頭連番・更新時刻 (連写) などを順に判定します。",
+    );
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.stack_script_enabled,
+        "分類ルールをスクリプト (カスタム) で行う",
+    )
+    .on_hover_text(
+        "OFF: 内蔵の自動分類ルールを使います。\n\
+         ON: データフォルダの stack_rules.rhai (無ければ内蔵既定) を使います。",
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .button("スクリプトを開く")
+            .on_hover_text("stack_rules.rhai を作成 (無ければ既定で) してエディタで開きます")
+            .clicked()
+        {
+            match crate::filename_stack_script::ensure_user_script_exists() {
+                Ok(path) => {
+                    let _ = opener::open(&path);
+                }
+                Err(e) => crate::logger::log(format!("stack script open failed: {e}")),
+            }
+        }
+        if ui
+            .button("既定に戻す")
+            .on_hover_text("stack_rules.rhai を内蔵の既定スクリプトで上書きします")
+            .clicked()
+        {
+            if let Err(e) = crate::filename_stack_script::reset_user_script() {
+                crate::logger::log(format!("stack script reset failed: {e}"));
+            }
+        }
+        if ui.link("書き方をヘルプで見る").clicked() {
+            let url = crate::ui_helpers::manual_url("stack.html", None);
+            crate::ui_helpers::open_url(&url);
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "スクリプトは Rhai 言語で書きます (正規表現も使えます)。書き方や AI への依頼\n\
+             テンプレートはヘルプの「スタック表示」ページを参照してください。",
+        )
+        .size(11.0)
+        .color(egui::Color32::from_gray(150)),
+    );
 }
 
 pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>スタック表示 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>スタック表示</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html" class="active">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">スタック表示</h1>
+    <p class="page-desc">似たファイル名・連番・撮影タイミングの画像をひとまとめにして、一覧をすっきり見渡す機能です。</p>
+
+    <h2>スタックとは</h2>
+    <p>1 つのフォルダの中に、同じ投稿の連番ページや連写した写真など「ひとまとまりとして扱いたい画像」が
+    たくさん混在していると、一覧が縦に長くなって全体を見渡しにくくなります。
+    <strong>スタック表示</strong>は、こうした似たファイル名・連番・撮影タイミングの画像を自動で分類し、
+    1 つのセル（サムネイル）に畳んでくれる機能です。</p>
+    <ul>
+      <li><strong>ON / OFF：</strong>グリッド右上（アドレスバーの右側）の <strong>「スタック」</strong> トグルで切り替えます。
+      ON にしている状態は一時的なもので、別のフォルダへ移動すると自動的に解除されます。</li>
+      <li><strong>枚数バッジ：</strong>畳まれたスタックの右上には、まとめた枚数のバッジが付きます。
+      まとめる相手がいない（1 枚しかない）画像は、畳まずに通常どおり 1 枚で表示されます。</li>
+      <li><strong>1 本の並びで読める：</strong>畳んだスタックをダブルクリックまたは <kbd>Enter</kbd> で開くと、
+      フォルダ内の画像を 1 枚ずつ並べたフルスクリーン表示に入ります。
+      スタックの中だけでなく、フォルダ全体を続けて読めます。</li>
+    </ul>
+
+    <p>フルスクリーンでのページ移動は次のとおりです。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>↓</kbd> / <kbd>↑</kbd></td><td>すべての画像を 1 枚ずつ順送り（スタックの境界を越えて進みます）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>↓</kbd> / <kbd>↑</kbd></td><td>次 / 前のスタックの先頭画像へジャンプ</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        スタック表示は今いるフォルダだけの一時的な見せ方で、ファイルそのものは移動・変更されません。
+        通常のフォルダ表示のときだけ使え、検索結果・ZIP / PDF の中・ドライブ一覧では表示されません。
+      </div>
+    </div>
+
+    <h2>既定の分類ルール</h2>
+    <p>スタックのまとめ方は、いくつかのルールを<strong>上から順に試して</strong>決まります。
+    判定の考え方は次のとおりです。</p>
+    <ul>
+      <li>あるルールが「フォルダ内の<strong>すべてのファイル</strong>に当てはまる」場合に、そのルールを採用します。</li>
+      <li>汎用的なルールは、「<strong>2 つ以上のまとまり</strong>ができる」場合だけ採用します。
+      フォルダ全体が 1 個の巨大なスタックに潰れてしまうのを避けるためです。</li>
+      <li>どのルールにも当てはまらなかった場合は、<strong>何も畳みません</strong>（すべて 1 枚ずつ単独表示）。</li>
+    </ul>
+    <p>このように、迷ったときは「畳まない」側に倒す安全寄りの作りになっているため、
+    意図しないスタックが勝手に作られることはありません。</p>
+
+    <p>試されるルールは、上から順に次のとおりです。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>順</th><th>ルール</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>命名パターン</td>
+            <td>ファイル名の末尾に固定の接尾辞が付いていて、途中の番号だけが変わる形をまとめます。
+            たとえば作者が配布しているダウンローダ mXD のファイル名
+            （<code>20260429_1100_0003_1234567890_p01_m01_@user.jpg</code> のように、
+            末尾が <code>_m01_@ユーザー名</code> で枚数の部分だけ変わるもの）に対応する例です。</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td>末尾が連番・ページ番号</td>
+            <td>ファイル名の末尾が連番やページ番号になっている場合
+            （例: <code>name_001</code> / <code>name_002</code>、<code>id_p0</code> / <code>id_p1</code>）に、
+            番号の手前の部分でまとめます。</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>先頭が連番</td>
+            <td>ファイル名の先頭が連番になっている場合（例: <code>0001_xxxx</code> / <code>0002_xxxx</code>）に、
+            連番が途切れずに続いたかたまりごとにまとめます。番号の切れ目でスタックを分けます。</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td>更新時刻が近いもの（連写）</td>
+            <td>更新時刻が近いファイルをまとめます。既定では、連続して更新されたファイルのうち
+            <strong>5 秒以内</strong>のものを 1 つのスタックにまとめます。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>カスタマイズ（上級者向け）</h2>
+    <p>分類ルールは <strong>Rhai スクリプト</strong>で自由に書き換えられます。
+    自分の使っているファイル名の付け方に合わせて、好きなようにまとめ方を定義できます。</p>
+
+    <h3>スクリプトの場所</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>導入方法</th><th>スクリプトの場所</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>インストーラ版 / 単体 exe 版</td><td><code>%APPDATA%\mimageviewer\stack_rules.rhai</code></td></tr>
+          <tr><td>ポータブル版</td><td>実行ファイルと同じ場所の <code>data\stack_rules.rhai</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>操作</h3>
+    <p>環境設定 → 「フォルダ」ページの「ファイル名スタック」欄から操作します。</p>
+    <ul>
+      <li><strong>「スクリプトを使う」チェック：</strong>カスタムスクリプトを有効にします。OFF のときは既定の分類ルールが使われます。</li>
+      <li><strong>「スクリプトを開く」ボタン：</strong>スクリプトファイルをテキストエディタで開きます。</li>
+      <li><strong>「既定に戻す」ボタン：</strong>スクリプトの内容を初期状態（既定のルールを書いたもの）に戻します。</li>
+    </ul>
+
+    <h3>スクリプトの約束事</h3>
+    <ul>
+      <li>入口は <code>fn group(files)</code> という関数です。<code>files</code> と<strong>同じ長さ</strong>の
+      グループキー配列を返します。同じキーになったファイルが同じスタックにまとまります
+      （同じキーが 2 つ以上あって初めて畳まれます）。</li>
+      <li><code>files[i]</code> は次のフィールドを持ちます。</li>
+    </ul>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>フィールド</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>name</code></td><td>拡張子つきのファイル名</td></tr>
+          <tr><td><code>stem</code></td><td>拡張子を除いたファイル名</td></tr>
+          <tr><td><code>ext</code></td><td>小文字の拡張子</td></tr>
+          <tr><td><code>mtime</code></td><td>更新時刻（秒）</td></tr>
+          <tr><td><code>size</code></td><td>ファイルサイズ（バイト）</td></tr>
+          <tr><td><code>is_video</code></td><td>動画かどうか（真偽値）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li>返り値を <code>#{ rule: "表示名", keys: [...] }</code> の形にすると、採用したルール名を画面に表示できます（任意）。
+      キー配列だけを返した場合は、ルール名は表示されません。</li>
+      <li>動画は常に単独で並びます（スタックに混ざりません）。</li>
+    </ul>
+
+    <h3>使えるヘルパー関数</h3>
+    <p>スクリプトの中では、次のヘルパー関数が使えます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>関数</th><th>戻り値</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>regex_is_match(text, pattern)</code></td><td>真偽値</td><td>正規表現に一致するかどうかを返します。</td></tr>
+          <tr><td><code>regex_capture(text, pattern, group)</code></td><td>文字列</td><td>一致した丸かっこ番号 <code>group</code> の中身を返します（一致しなければ空文字）。</td></tr>
+          <tr><td><code>regex_replace(text, pattern, replacement)</code></td><td>文字列</td><td>一致した部分を置き換えた文字列を返します。</td></tr>
+          <tr><td><code>argsort_int(整数の配列)</code></td><td>添字の配列</td><td>渡した値を昇順に並べたときの添字（インデックス）の配列を返します。連番順・時刻順の処理に使います。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>正規表現は使えます。</strong>
+        <code>regex_capture</code> / <code>regex_is_match</code> / <code>regex_replace</code> で、Rust の正規表現構文が使えます。
+        線形時間で安全に動作しますが、後方参照（backreference）と先読み / 後読み（lookahead / lookbehind）は使えません。
+      </div>
+    </div>
+
+    <h3>制約</h3>
+    <ul>
+      <li>ファイル操作・ネットワーク・OS 操作はできません（安全のため隔離された環境で動きます）。</li>
+      <li>1 回の処理量には上限があります。</li>
+      <li>EXIF の撮影時刻やカメラ機種といった重い情報は渡されません。
+      ただし、ファイルの更新時刻（<code>mtime</code>）は使えます。</li>
+    </ul>
+
+    <h3>例：mXD のファイル名をまとめる</h3>
+    <p>たとえば、末尾が <code>_m01_@ユーザー名</code> のように「<code>_m</code> ＋ 番号 ＋ <code>_@</code>」で終わる
+    ファイル名を、その手前の部分でまとめたい場合は、次のように書けます。</p>
+    <pre><code>fn group(files) {
+    let keys = [];
+    for f in files {
+        keys.push(regex_capture(f.stem, "^(.+)_m\d+_@", 1));
+    }
+    keys
+}</code></pre>
+    <p><code>regex_capture(f.stem, "^(.+)_m\d+_@", 1)</code> は、<code>_m</code> ＋ 数字 ＋ <code>_@</code> の手前にある
+    丸かっこ <code>(.+)</code> の中身を取り出します。同じ取り出し結果になったファイルが、1 つのスタックにまとまります。</p>
+
+    <h2 id="ai-template">AI にスクリプト修正を頼むときのテンプレート</h2>
+    <p>正規表現や Rhai スクリプトに慣れていなくても、AI アシスタント（チャット型 AI など）に
+    まとめ方を相談すれば、スクリプトを書いてもらえます。下の枠の文章を<strong>そのままコピーして AI に貼り付け</strong>、
+    末尾の「やりたいこと」だけ自分の言葉で書き足してください。</p>
+    <pre><code>あなたは mImageViewer のファイル名スタック分割スクリプト（Rhai 言語）を編集します。
+
+【契約】
+- 入口は fn group(files) です。files と同じ長さのグループキー配列を返します。
+  同じキーになったファイルが同じスタックにまとまります（同じキーが 2 つ以上で畳まれます）。
+- files[i] は次のフィールドを持ちます:
+  - name     : 拡張子つきのファイル名
+  - stem     : 拡張子を除いたファイル名
+  - ext      : 小文字の拡張子
+  - mtime    : 更新時刻（秒）
+  - size     : ファイルサイズ（バイト）
+  - is_video : 動画かどうか（真偽値）
+- 返り値を #{ rule: "表示名", keys: [...] } の形にすると、採用したルール名を画面に表示できます（任意）。
+- 動画は常に単独で並びます（スタックに混ざりません）。
+
+【使えるヘルパー関数】
+- regex_is_match(text, pattern)            -&gt; 真偽値。正規表現に一致するか。
+- regex_capture(text, pattern, group)      -&gt; 文字列。一致した丸かっこ番号 group の中身（不一致は空文字）。
+- regex_replace(text, pattern, replacement)-&gt; 文字列。一致部分を置き換えた結果。
+- argsort_int(整数の配列)                  -&gt; 値を昇順に並べたときの添字の配列。連番順・時刻順に使う。
+
+【正規表現】
+- regex_capture / regex_is_match / regex_replace で使えます（Rust の正規表現構文）。
+- 後方参照、先読み / 後読みは使えません。
+
+【制約】
+- ファイル操作・ネットワーク・OS 操作はできません（隔離された環境で動きます）。
+- 1 回の処理量には上限があります。
+- EXIF の撮影時刻やカメラ機種などの重い情報は渡されません（更新時刻 mtime は使えます）。
+
+【やりたいこと】
+ここに、どんなファイル名をどうまとめたいかを書いてください。
+（例のファイル名を 2〜3 個添えると、より正確なスクリプトが作れます。）
+</code></pre>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        AI が書いたスクリプトは、「スクリプトを開く」で開いたファイルに貼り付けて保存し、
+        「スクリプトを使う」を ON にすると反映されます。思ったとおりにまとまらないときは、
+        実際のファイル名をいくつか AI に伝えて調整を頼んでください。
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

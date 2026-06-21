@@ -21,10 +21,21 @@ use crate::filename_stack::{StackMember, StackView};
 use crate::grid_item::GridItem;
 use crate::settings::SortOrder;
 
+/// スタック集約構築の付随情報 (トグル時のトースト用)。
+#[derive(Default)]
+pub(crate) struct StackBuildInfo {
+    /// 採用された分類ルールの表示名 (スクリプトが `#{ rule, keys }` を返した場合)。
+    pub rule: Option<String>,
+    /// スクリプトが失敗し組み込み既定へフォールバックした場合のエラー要旨。
+    pub script_error: Option<String>,
+}
+
 /// 通常フォルダの items (コンテナ先頭 + メディア) を集約ビューへ変換し、`StackView` を作る。
 ///
 /// `folder_count` = items 先頭のコンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) ブロック数。
-/// それ以降は Image/Video のメディア。戻り値 = (集約 items, 集約 metas, 集約 video_items, StackView)。
+/// それ以降は Image/Video のメディア。`script_source` が `Some` のときはユーザー定義 Rhai
+/// スクリプトでグループキーを決め、失敗時は `separator` の組み込み既定へフォールバックする。
+/// 戻り値 = (集約 items, 集約 metas, 集約 video_items, StackView, 構築情報)。
 pub(crate) fn build_stack_aggregated(
     folder: PathBuf,
     mut items: Vec<GridItem>,
@@ -32,11 +43,13 @@ pub(crate) fn build_stack_aggregated(
     folder_count: usize,
     separator: char,
     sort: SortOrder,
+    script_source: Option<&str>,
 ) -> (
     Vec<GridItem>,
     Vec<Option<(i64, i64)>>,
     Vec<(usize, PathBuf, u64)>,
     StackView,
+    StackBuildInfo,
 ) {
     let folder_count = folder_count.min(items.len());
     let media_items = items.split_off(folder_count);
@@ -67,10 +80,27 @@ pub(crate) fn build_stack_aggregated(
         }
     }
 
-    let sv = StackView::build(folder, items, image_metas, media, separator, sort);
+    let mut info = StackBuildInfo::default();
+    // グループ化: スクリプト有効ならそれ、失敗・無効なら組み込み既定 (separator)。
+    let groups = match script_source {
+        Some(src) => match crate::filename_stack_script::group_keys(&media, src) {
+            Ok(res) => {
+                info.rule = res.rule;
+                crate::filename_stack::group_by_keys(media, &res.keys, sort)
+            }
+            Err(e) => {
+                crate::logger::log(format!("stack script failed, fallback to builtin: {e}"));
+                info.script_error = Some(e);
+                crate::filename_stack::group_media(media, separator, sort)
+            }
+        },
+        None => crate::filename_stack::group_media(media, separator, sort),
+    };
+
+    let sv = StackView::from_groups(folder, items, image_metas, separator, sort, groups);
     let (agg_items, agg_metas) = sv.materialize_aggregated();
     let video_items = stack_video_items(&agg_items, &agg_metas);
-    (agg_items, agg_metas, video_items, sv)
+    (agg_items, agg_metas, video_items, sv, info)
 }
 
 /// 集約 / メンバービューの items から動画セルの `(idx, path, size)` を集める
@@ -145,15 +175,25 @@ impl crate::app::App {
         };
         self.stack_mode_requested = !self.stack_mode_requested;
         self.load_folder(folder);
-        if self.stack_mode_requested
-            && self
+        if self.stack_mode_requested {
+            // スクリプトが失敗して既定ルールへフォールバックした場合は最優先で知らせる。
+            if self.stack_script_error.is_some() {
+                self.show_feedback_toast(
+                    "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)"
+                        .into(),
+                );
+            } else if self
                 .stack_view
                 .as_ref()
                 .is_some_and(|sv| !sv.has_collapsible_stack())
-        {
-            self.show_feedback_toast(
-                "まとめられるスタックがありません (同じ区切り文字の連番が必要です)".into(),
-            );
+            {
+                self.show_feedback_toast(
+                    "まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".into(),
+                );
+            } else if let Some(rule) = self.stack_active_rule.clone() {
+                // 採用された分類ルール名をトーストで知らせる (どのルールが当たったか可視化)。
+                self.show_feedback_toast(format!("スタック: 「{rule}」でまとめました"));
+            }
         }
     }
 

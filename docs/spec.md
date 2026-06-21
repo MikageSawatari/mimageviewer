@@ -929,6 +929,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `thumb_tooltip_show_reading_history_progress` | bool | true | 読書履歴ビューのサムネイル情報ツールチップに既読位置を表示するか |
 | `sort_order` | SortOrder | FileName | 通常フォルダのソート順（FileName / Numeric / DateAsc / DateDesc）。本フォルダ閲覧中は UI を無効化し、設定値に関わらず番号順固定 |
 | `stack_separator` | char | `_` | ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。ファイル名 (拡張子除く) の末尾区切り文字の前でフォルダ内画像をまとめる（例 `_`: `12345678_p0.jpg` → `12345678`）。スタックモードの ON/OFF 自体は transient で永続化しない。詳細は [filename-stack-plan.md](filename-stack-plan.md) |
+| `stack_script_enabled` | bool | false | ファイル名スタックのグループ分けをユーザー定義 Rhai スクリプト (`<data_dir>/stack_rules.rhai`、無ければ内蔵既定) で行うか。false のとき `stack_separator` の組み込みルール。スクリプト失敗時は組み込み既定へフォールバック。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | `show_address_bar_stack_toggle` | bool | true | フォルダバーに「スタック」表示トグルボタンを出すか。フォルダバー左端「フォルダ:」の右クリックメニューで切替 |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
 | `last_folder` | Option\<PathBuf\> | None | 前回終了した場所。実フォルダの場合はそのパス、ドライブ一覧の場合は空パス sentinel を保存する。起動時の場所が「前回終了した場所」のときに使用する。実フォルダの末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |

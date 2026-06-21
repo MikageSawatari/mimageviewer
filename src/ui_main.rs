@@ -5171,7 +5171,7 @@ impl App {
                 &mut self.settings.show_address_bar_stack_toggle,
                 "スタック表示トグル",
             )
-            .on_hover_text("同じ接頭辞のファイルを 1 つに畳んで表示するトグルボタン")
+            .on_hover_text("似たファイルを自動で分類して 1 つに畳んで表示するトグルボタン")
             .changed();
 
         ui.separator();
@@ -6506,8 +6506,8 @@ impl App {
                         // (検索 / ZIP ツリー / ドライブ一覧では無効)。
                         if stack_available {
                             let resp = ui.selectable_label(stack_on, "スタック").hover_tip(
-                                "同じ接頭辞のファイルを 1 つに畳んで表示 [トグル]。スタックを開くと \
-                                 ↓↑ で全画像送り・Shift+↓↑ で次/前のスタックへ",
+                                "似たファイルを自動で分類して 1 つに畳んで表示 [トグル]。スタックを開くと \
+                                 ↓↑ で全画像送り・Shift+↓↑ で次/前のスタックへ (分類ルールはヘルプ参照)",
                             );
                             if resp.clicked() {
                                 stack_toggle = true;

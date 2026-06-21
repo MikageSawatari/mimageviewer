@@ -3877,6 +3877,12 @@ pub struct App {
     /// グリッドは常に集約だが、セルを開くと一時的にフラット展開へ差し替える。フルスクリーンを
     /// 閉じると `stack_reconcile_after_fullscreen_close` が集約へ戻す。
     pub(crate) stack_showing_flat: bool,
+    /// 直近のスタック集約構築で採用された分類ルールの表示名 (スクリプト経由のみ)。
+    /// トグル成功トーストに出す (`docs/filename-stack-scripting-plan.md`)。
+    pub(crate) stack_active_rule: Option<String>,
+    /// 直近のスタック集約構築でスクリプトが失敗し組み込み既定へフォールバックした場合の
+    /// エラー要旨。トグル時にトーストで知らせる。
+    pub(crate) stack_script_error: Option<String>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -5794,6 +5800,8 @@ impl App {
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
+            stack_active_rule: None,
+            stack_script_error: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -8795,7 +8803,13 @@ impl App {
         // 差し替えてから渡す。StackView は start_loading_items が stack_view をクリアした後に設定。
         // (items / image_metas / video_items は上で `let mut` 宣言済み。)
         let pending_stack_view = if self.stack_mode_requested {
-            let (agg_items, agg_metas, agg_videos, sv) =
+            // スクリプト有効時のみソースを読む (= トグル / 同一フォルダ再読込時のみ。
+            // 別フォルダへの Ctrl+↑↓ ナビではスタックは自動解除されるので頻発しない)。
+            let script_source = self
+                .settings
+                .stack_script_enabled
+                .then(crate::filename_stack_script::active_script_source);
+            let (agg_items, agg_metas, agg_videos, sv, info) =
                 crate::filename_stack_ui::build_stack_aggregated(
                     path.clone(),
                     items,
@@ -8803,12 +8817,17 @@ impl App {
                     folder_count,
                     self.settings.stack_separator,
                     sort,
+                    script_source.as_deref(),
                 );
             items = agg_items;
             image_metas = agg_metas;
             video_items = agg_videos;
+            self.stack_active_rule = info.rule;
+            self.stack_script_error = info.script_error;
             Some(sv)
         } else {
+            self.stack_active_rule = None;
+            self.stack_script_error = None;
             None
         };
 

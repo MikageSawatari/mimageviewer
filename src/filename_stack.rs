@@ -96,16 +96,11 @@ fn name_of(path: &Path) -> &str {
 ///
 /// 戻り値のグループ順 = 表示順。`materialize` 系の呼び出し側はこの順でセルを並べる。
 pub fn group_media(media: Vec<StackMember>, separator: char, sort: SortOrder) -> Vec<StackGroup> {
-    let mut map: HashMap<String, Vec<StackMember>> = HashMap::new();
-    // 挿入順を保持して、後段のグループ sort が安定するようにする (HashMap 反復順は非決定)。
-    let mut order: Vec<String> = Vec::new();
-    for m in media {
-        let key = if m.is_video {
-            // 動画はスタックに混ぜない。path を一意キーにして必ず単独グループにする。
-            // (basename だと別ディレクトリ同名で衝突しうるが、ここは単一フォルダなので
-            //  path 全体で十分に一意。)
-            format!("\u{0}video\u{0}{}", m.path.display())
-        } else {
+    // 組み込み既定ルール = 各メディアの prefix (末尾区切りの前) をグループキーにする。
+    // 動画は group_by_keys が一意キーへ上書きするので、ここでの値は使われない。
+    let keys: Vec<String> = media
+        .iter()
+        .map(|m| {
             let stem = stem_of(&m.path);
             let p = prefix_of(stem, separator);
             if p.is_empty() {
@@ -113,6 +108,30 @@ pub fn group_media(media: Vec<StackMember>, separator: char, sort: SortOrder) ->
             } else {
                 p.to_string()
             }
+        })
+        .collect();
+    group_by_keys(media, &keys, sort)
+}
+
+/// 既に算出済みのグループキー (`media` と同じ長さ) からグループを組み立てる。
+///
+/// - 同じキー = 同じグループ。グループ順はキーの **初出順** (HashMap 反復順は非決定
+///   なので `order` で安定化)。
+/// - **動画は keys に関わらず必ず単独グループ** (path 由来の一意キーへ上書き。plan §3.2/§4)。
+/// - グループ内メンバー / グループ自体の並びは `sort` に従う。
+///
+/// ユーザー定義スクリプト ([`crate::filename_stack_script`]) も組み込み既定
+/// ([`group_media`]) も、このキー → グループ変換を共有する。
+pub fn group_by_keys(media: Vec<StackMember>, keys: &[String], sort: SortOrder) -> Vec<StackGroup> {
+    debug_assert_eq!(media.len(), keys.len());
+    let mut map: HashMap<String, Vec<StackMember>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (i, m) in media.into_iter().enumerate() {
+        let key = if m.is_video {
+            // 動画はスタックに混ぜない。path を一意キーにして必ず単独グループにする。
+            format!("\u{0}video\u{0}{}", m.path.display())
+        } else {
+            keys.get(i).cloned().unwrap_or_default()
         };
         if !map.contains_key(&key) {
             order.push(key.clone());
@@ -181,6 +200,27 @@ impl StackView {
         sort: SortOrder,
     ) -> Self {
         let groups = group_media(media, separator, sort);
+        Self::from_groups(
+            folder,
+            passthrough,
+            passthrough_metas,
+            separator,
+            sort,
+            groups,
+        )
+    }
+
+    /// 既に算出済みのグループ列から `StackView` を作る (集約状態)。
+    /// ユーザー定義スクリプト経由 ([`crate::filename_stack_script`] + [`group_by_keys`]) の
+    /// グループをそのまま載せるための入口。
+    pub fn from_groups(
+        folder: PathBuf,
+        passthrough: Vec<GridItem>,
+        passthrough_metas: Vec<Option<(i64, i64)>>,
+        separator: char,
+        sort: SortOrder,
+        groups: Vec<StackGroup>,
+    ) -> Self {
         Self {
             folder,
             separator,

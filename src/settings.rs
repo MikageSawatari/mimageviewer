@@ -1649,6 +1649,12 @@ pub struct Settings {
     /// 永続化しない (フォルダを出ると自動解除) が、区切り文字はここに保存する。
     #[serde(default = "default_stack_separator")]
     pub stack_separator: char,
+    /// ファイル名スタックのグループ分けをユーザー定義 Rhai スクリプトで行うか。
+    /// false のとき `stack_separator` の組み込みルール。true のとき
+    /// `<data_dir>/stack_rules.rhai` (無ければ内蔵既定) を使う
+    /// (docs/filename-stack-scripting-plan.md)。
+    #[serde(default)]
+    pub stack_script_enabled: bool,
     /// サムネイルキャッシュの長辺ピクセル数
     #[serde(default = "default_thumb_px")]
     pub thumb_px: u32,
@@ -3286,6 +3292,7 @@ impl Default for Settings {
             toolbar_section_new_row: Vec::new(),
             toolbar_section_drag_enabled: false,
             stack_separator: default_stack_separator(),
+            stack_script_enabled: false,
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
