@@ -30513,15 +30513,18 @@ impl App {
 
     fn apply_final_post_filter(
         &self,
-        src: &egui::ColorImage,
+        src: Arc<egui::ColorImage>,
         params: &crate::adjustment::AdjustParams,
-    ) -> egui::ColorImage {
+    ) -> Arc<egui::ColorImage> {
         let apply_pf =
             !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
         if apply_pf {
-            crate::post_filter::apply(src, params.post_filter)
+            Arc::new(crate::post_filter::apply(&src, params.post_filter))
         } else {
-            src.clone()
+            // ポストフィルタ無効時は全画素コピー (~45MP で 50-96ms) を避けて Arc を素通し。
+            // 無変換 (色補正/AI/シャープも無し) なら src は edit_pixels と同一 Arc のままなので、
+            // 呼び出し側の `Arc::ptr_eq` 判定で二重 GPU アップロードも回避できる。
+            src
         }
     }
 
@@ -30552,7 +30555,7 @@ impl App {
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
         let t_post0 = perf_on.then(std::time::Instant::now);
-        let post_filtered = Arc::new(self.apply_final_post_filter(&sharpened, params));
+        let post_filtered = self.apply_final_post_filter(sharpened, params);
         let fc_post_ms = t_post0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let t_clamp0 = perf_on.then(std::time::Instant::now);
         let upload = clamp_for_gpu(&post_filtered);
@@ -30761,30 +30764,47 @@ impl App {
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
         let t_post0 = perf_on.then(std::time::Instant::now);
-        let post_filtered = Arc::new(self.apply_final_post_filter(&sharpened, &params));
+        let post_filtered = self.apply_final_post_filter(sharpened, &params);
         let fc_post_ms = t_post0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
-        let t_clamp0 = perf_on.then(std::time::Instant::now);
-        let upload = clamp_for_gpu(&post_filtered);
-        let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
             egui::TextureOptions::NEAREST
         } else {
             egui::TextureOptions::LINEAR
         };
         let [fc_w, fc_h] = post_filtered.size;
-        let t_up0 = perf_on.then(std::time::Instant::now);
-        let texture = ctx.load_texture(
-            format!(
-                "final_composite_{}_{}_{}_{}",
-                final_key.edit_key.idx,
-                final_key.edit_key.source_gen,
-                final_key.params_hash,
-                final_key.bg
-            ),
-            upload.into_owned(),
-            tex_opts,
-        );
-        let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        // 二重 GPU アップロード回避: 色補正/AI/シャープ/ポストフィルタがすべて無変換のとき、
+        // post_filtered は edit_pixels と同一 Arc。その場合は既にアップロード済みの edit-result
+        // テクスチャ (LINEAR) をそのまま再利用し、同じ画素の再アップロード (~45MP で 50-88ms) を
+        // 省く。edit-result も無変換時の最終合成も LINEAR なので見た目は同一。テクスチャが取れない
+        // 稀なケース (cpu-only prefetch 等) のみ従来どおりアップロードする。
+        let reused_edit_texture = Arc::ptr_eq(&post_filtered, &edit_pixels)
+            .then(|| {
+                self.edit_result_cache
+                    .get(&edit_key)
+                    .and_then(|e| e.texture.clone())
+            })
+            .flatten();
+        let (texture, fc_clamp_ms, fc_upload_ms) = if let Some(reused) = reused_edit_texture {
+            (reused, 0.0, 0.0)
+        } else {
+            let t_clamp0 = perf_on.then(std::time::Instant::now);
+            let upload = clamp_for_gpu(&post_filtered);
+            let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+            let t_up0 = perf_on.then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!(
+                    "final_composite_{}_{}_{}_{}",
+                    final_key.edit_key.idx,
+                    final_key.edit_key.source_gen,
+                    final_key.params_hash,
+                    final_key.bg
+                ),
+                upload.into_owned(),
+                tex_opts,
+            );
+            let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+            (texture, fc_clamp_ms, fc_upload_ms)
+        };
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
