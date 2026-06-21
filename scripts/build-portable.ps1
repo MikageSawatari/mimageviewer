@@ -101,7 +101,11 @@ $copies = @(
     @{ src = 'vendor\ort\onnxruntime.dll';           dst = 'onnxruntime.dll' }
     @{ src = 'vendor\ort\onnxruntime_providers_shared.dll'; dst = 'onnxruntime_providers_shared.dll' }
     @{ src = 'vendor\susie-worker\mimageviewer-susie32.exe'; dst = 'mimageviewer-susie32.exe' }
-    @{ src = 'vendor\vst3-host\mimageviewer-vst3-host.exe';  dst = 'mimageviewer-vst3-host.exe' }
+    # NOTE: mimageviewer-vst3-host.exe は意図的に同梱しない。未署名の bridge exe が一部の
+    # セキュリティソフトに誤検知され、ポータブル zip のダウンロードがブロックされる事象が
+    # あるため (v2.0.0)。host が無いと src/video/dsp/vst3_supported() が false を返し、
+    # アプリ側で VST3 機能が自動的に無効化される (設定でも ON にできない)。
+    # 恒久対策 = bridge exe をコード署名 → 署名後はこの行を復活させて再同梱する。
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'installer\readme_portable.txt';        dst = 'readme.txt' }
@@ -132,7 +136,7 @@ foreach ($c in $copies) {
 if ($missing.Count -gt 0) {
     Write-Warning "[portable] MISSING source files (package incomplete):"
     foreach ($m in $missing) { Write-Warning "  - $m" }
-    throw "[portable] aborting: $($missing.Count) required file(s) missing. Run scripts/bootstrap-vendor.sh and restore models/vst3-host."
+    throw "[portable] aborting: $($missing.Count) required file(s) missing. Run scripts/bootstrap-vendor.sh and restore models."
 }
 
 # ---------------------------------------------------------------------------
