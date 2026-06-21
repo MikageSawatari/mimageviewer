@@ -8826,6 +8826,8 @@ impl App {
             None
         };
         let stack_folder = path.clone();
+        // 集約適用時に start_loading_items へ渡すため、existing_keys を消費される前に複製。
+        let stack_async_existing = stack_async.then(|| existing_keys.clone());
 
         let pending_stack_view = if stack_on && !stack_async {
             let (agg_items, agg_metas, agg_videos, sv, info) =
@@ -8876,6 +8878,8 @@ impl App {
                 media,
                 stack_separator,
                 sort,
+                stack_async_existing.unwrap_or_default(),
+                Some(folder_signature),
             );
         }
 
@@ -12030,7 +12034,7 @@ impl App {
     /// 与えられた `items` / `image_metas` を新しい状態として設定し、
     /// 旧タスクをキャンセル → カタログを開く → 永続ワーカー + 動画スレッドを起動 →
     /// 履歴復元 → last_folder 保存 までを行う。
-    fn start_loading_items(
+    pub(crate) fn start_loading_items(
         &mut self,
         source_path: PathBuf,
         items: Vec<GridItem>,

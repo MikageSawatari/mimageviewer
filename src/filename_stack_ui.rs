@@ -53,6 +53,11 @@ pub(crate) struct StackScriptPending {
     sort: SortOrder,
     /// `media` 内で画像 (= スクリプトへ渡した対象) の index。戻りキーを media 順へ戻すのに使う。
     image_indices: Vec<usize>,
+    /// 変換前 (全 items) のサムネキャッシュキー。集約適用時 `start_loading_items` に渡して
+    /// delete_missing が非代表メンバーのキャッシュを巻き添えで消さないようにする (同期パスと同じ)。
+    existing_keys: std::collections::HashSet<String>,
+    /// フォルダ signature (同期パスと同じく `start_loading_items` へ渡す)。
+    folder_signature: Option<u64>,
 }
 
 /// 通常フォルダの items から、集約に必要な材料 (passthrough / passthrough_metas / media) を
@@ -224,6 +229,8 @@ impl crate::app::App {
         media: Vec<StackMember>,
         separator: char,
         sort: SortOrder,
+        existing_keys: std::collections::HashSet<String>,
+        folder_signature: Option<u64>,
     ) {
         let source = crate::filename_stack_script::active_script_source();
         // 動画はルール判定に渡さない (常に単独)。画像だけをスクリプトへ。
@@ -258,6 +265,8 @@ impl crate::app::App {
             separator,
             sort,
             image_indices,
+            existing_keys,
+            folder_signature,
         });
     }
 
@@ -291,7 +300,13 @@ impl crate::app::App {
             Ok(r) => r,
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
-                self.stack_script_pending = None;
+                // ワーカー起動失敗等で tx が落ちた → 組み込み既定でフォールバック集約する
+                // (通常フォルダ表示のまま放置せず、スタックを成立させる)。
+                let pending = self.stack_script_pending.take().unwrap();
+                self.apply_stack_script_result(
+                    pending,
+                    Err("スタックスクリプトのワーカーを起動できませんでした".to_string()),
+                );
                 return;
             }
         };
@@ -313,6 +328,8 @@ impl crate::app::App {
             sort,
             image_indices,
             folder,
+            existing_keys,
+            folder_signature,
             ..
         } = pending;
         let (groups, rule, err) = match result {
@@ -350,8 +367,21 @@ impl crate::app::App {
             groups,
         );
         let collapsible = sv.has_collapsible_stack();
-        let (items, metas) = sv.materialize_aggregated();
-        self.swap_stack_view_items(items, metas, &folder, None);
+        let (agg_items, agg_metas) = sv.materialize_aggregated();
+        let agg_videos = stack_video_items(&agg_items, &agg_metas);
+        // 集約ビューを通常ロードと同じ経路で適用する (= 同期パスの末尾と同形)。これにより
+        // 動画サムネスレッドの起動 / キャッシュ保護 (existing_keys) / 世代更新が正しく行われる
+        // (swap_stack_view_items は in-memory swap で動画スレッドを再起動しないため不可。Codex P2)。
+        // start_loading_items が stack_* をリセットするので、その後に意図を復元する。
+        self.start_loading_items(
+            folder,
+            agg_items,
+            agg_metas,
+            existing_keys,
+            agg_videos,
+            folder_signature,
+        );
+        self.stack_mode_requested = true;
         self.stack_view = Some(sv);
         self.stack_active_rule = rule.clone();
         self.stack_script_error = err.clone();
