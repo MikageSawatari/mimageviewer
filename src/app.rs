@@ -5087,6 +5087,16 @@ impl App {
                 .find(|w| w[0] == "--whatsnew-from")
                 .map(|w| w[1].clone())
         };
+        // 開発フラグに不正値 (例: "v1.5,0") を渡すと highlights_to_show が fail-safe で空を返し、
+        // ダイアログが「無言で出ない」。検証手段としては紛らわしいので警告ログを出す。
+        if let Some(ver) = whatsnew_from_override.as_deref()
+            && !crate::version_highlights::is_valid_version(ver)
+        {
+            crate::logger::log(format!(
+                "--whatsnew-from の値 '{ver}' を解釈できません (例: 1.9.0)。\
+                 重要な変更点ダイアログは表示されません"
+            ));
+        }
         let whats_new_prev = whatsnew_from_override
             .as_deref()
             .or(load_meta.previous_last_seen_version.as_deref());

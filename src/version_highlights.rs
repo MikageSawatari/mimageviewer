@@ -42,6 +42,12 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
+/// バージョン文字列が `parse_version` で解釈できるか。開発用 `--whatsnew-from <ver>` の
+/// 値検証に使う (= 不正値を渡したのに無言でダイアログが出ないのを警告ログで知らせるため)。
+pub fn is_valid_version(s: &str) -> bool {
+    parse_version(s).is_some()
+}
+
 /// 更新後初回起動で表示する変更点を選ぶ (純関数、テスト対象)。
 ///
 /// - `prev = None` (新規インストール) → 空 (新規ユーザーを「変更点」で迎えない)。
