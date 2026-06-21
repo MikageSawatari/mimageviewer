@@ -59,6 +59,10 @@ Rust コードが走る前に Windows ローダが DLL を解決する必要が�
 | mimageviewer-vst3-host.exe | [video/dsp/extract.rs:8](../src/video/dsp/extract.rs) | `data_dir/vst3/` | path を spawn |
 | AI モデル 7 本 (*.onnx) | [ai/model_manager.rs:23-53](../src/ai/model_manager.rs) | `data_dir/models/` | path |
 
+> ⚠ この表は **非ポータブル (= 単体exe/インストーラ) の core** の埋め込み機構を示す。
+> **ポータブル版では `mimageviewer-vst3-host.exe` だけは同梱しない** (v2.0.0、未署名 exe の
+> AV 誤検知対策。§4.7 と本書末尾の注を参照)。他 5 経路は portable でも loose 同梱で carry over。
+
 **重要な観察**: 6 経路すべてが「`data_dir::get()` に join → (必要なら) `extract_embedded_file` で
 書き出し → 確定した `PathBuf` を返す」という**同一パターン**。アプリ本体 (UI/描画/async/動画/comic)
 は、この `PathBuf` を受け取るだけで「どこから来たか」を一切気にしない。
@@ -149,6 +153,10 @@ pub fn resolve(asset: Asset) -> Result<PathBuf, String> {
         Asset::OnnxRuntime => dir.join("onnxruntime.dll"),
         Asset::OnnxProvidersShared => dir.join("onnxruntime_providers_shared.dll"),
         Asset::SusieWorker => dir.join("mimageviewer-susie32.exe"),
+        // ※ 実装メモ (v2.0.0): ポータブル版は vst3-host を **同梱しない** (AV 誤検知対策)。
+        //    実コードの所在解決は `native_assets::bundled(name)` で、vst3-host は
+        //    `vst3_supported()` 経由で「あれば使う / 無ければ機能を自動無効化」する扱い。
+        //    下のスケッチの Asset::Vst3Host 分岐は portable では実質使われない。
         Asset::Vst3Host => dir.join("mimageviewer-vst3-host.exe"),
         Asset::Model(name) => dir.join("models").join(name),
     };
