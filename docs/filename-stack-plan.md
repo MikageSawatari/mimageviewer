@@ -40,8 +40,12 @@
   `current_folder_last_mtime.is_some()` (= dir 実体のみ Some) で PDF ページ一覧 / ZIP / 検索合成を
   除外し、Ctrl+F 現在地検索中 (`show_search_bar` / `search_filter` / `search_pending`) も不可
   (トグルは load_folder 経由で検索フィルタが消えるため) (Codex P2 対応)。
-- **MVP 制限**: スタックモード中の Ctrl+F / facet は集約セル (prefix キー / 代表拡張子) で照合し、
-  隠れたメンバー名/メタは未評価。Shift+↓↑ は端で no-op (次フォルダは Ctrl+↓)。breadcrumb は集約=
+- **MVP 制限**: スタックモード中の Ctrl+F / facet は集約セル単位で照合し、隠れたメンバー名/メタは
+  未評価。内訳: **種別 / 拡張子の facet は代表画像で評価** (集約セルは image-like)、**メンバー単位の
+  メタデータ facet (タグ / AI モデル / AI ツール) は集約セルを一律で素通し** (= `facet_tag_filter_applies`
+  / `facet_ai_filter_applies` がスタックを対象外にする。集約セル単体ではメンバーのタグ/AI メタを
+  評価できないため、全落ちさせず残す。タグ facet と AI facet で挙動が食い違わないように揃えた)。
+  Ctrl+F も prefix キーで照合。Shift+↓↑ は端で no-op (次フォルダは Ctrl+↓)。breadcrumb は集約=
   フォルダパスのまま。
 - **新機能なのでマイグレーション不要** (CLAUDE.md「永続データ・スキーマ変更時の判断」)。
 

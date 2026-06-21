@@ -491,7 +491,7 @@ FsCommon/FsImage/FsVideo)。native video の Ctrl 系ナビは KeyAction 経由�
 
 **載せない (除外)**: タグ付け (`GridTagApply`) / タグビュー (`GridTagView`) / エクスポート (`FsExport`) =
 ダイアログ・テキスト/検索 UI が続く。消しゴム・隠蔽・分析・注釈モード起動 (`FsEraseMode` /
-`FsConcealMode` / `FsAnalysis` / `FsTextMode`) = モード遷移で Phase 1 では外す (§7)。
+`FsConcealMode` / `FsImageAnalysis` / `FsTextMode`) = モード遷移で Phase 1 では外す (§7)。
 細かいシーク・パン・ズーム微調整・パノラマ視点操作 = 連続値 / nav 依存。
 
 **★ (新規 apply が必要) のまとめ**: ★固定トグル / ソート順 set / サムネ縦横比 set / ポストフィルタ set /

@@ -2012,6 +2012,12 @@ impl App {
     /// 戻り値は「このフレームで中ボタンがアクティブに使われていた」か。true なら
     /// 呼び出し側はこの後の左クリック/右クリックの解釈をスキップしてよい。
     fn handle_middle_drag_zoom(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
+        // ZipPla 風ズーム (照準中 / 確定中) は専用描画経路で fs_zoom/fs_pan を使わない。
+        // 中ボタンドラッグで不可視の fs_zoom を書き換えると、Z で抜けた瞬間に予期せぬ倍率で
+        // 表示されてしまうので、ズームモード中は中ボタンズームを無効化する。
+        if self.fs_zoom_mode_engaged() {
+            return false;
+        }
         let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
@@ -2170,7 +2176,8 @@ impl App {
     }
 
     pub(crate) fn apply_gamepad_fullscreen_zoom(&mut self, amount: f32, dt: f32) -> bool {
-        if self.analysis_mode || amount.abs() < 0.01 || dt <= 0.0 {
+        // ZipPla 風ズーム中は専用経路なので、ゲームパッドで不可視の fs_zoom を動かさない。
+        if self.analysis_mode || self.fs_zoom_mode_engaged() || amount.abs() < 0.01 || dt <= 0.0 {
             return false;
         }
         let old_zoom = self.fs_zoom;
@@ -2184,7 +2191,10 @@ impl App {
     }
 
     pub(crate) fn apply_gamepad_fullscreen_pan(&mut self, delta: egui::Vec2) -> bool {
-        if self.analysis_mode || delta.length_sq() <= f32::EPSILON || self.fs_zoom <= ZOOM_NEAR_ONE
+        if self.analysis_mode
+            || self.fs_zoom_mode_engaged()
+            || delta.length_sq() <= f32::EPSILON
+            || self.fs_zoom <= ZOOM_NEAR_ONE
         {
             return false;
         }

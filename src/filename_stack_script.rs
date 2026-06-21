@@ -15,7 +15,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 use rhai::{Dynamic, Engine, Scope};
@@ -24,6 +25,11 @@ use crate::filename_stack::StackMember;
 
 /// 内蔵の既定スクリプト (カスケード分割ルール)。
 pub const DEFAULT_SCRIPT: &str = include_str!("../assets/stack_rules.default.rhai");
+
+/// ユーザースクリプトとして読み込む上限バイト数。通常の分類スクリプトは数 KB なので、
+/// これを超えるファイルは「壊れている / 別物が置かれた」とみなし内蔵既定へフォールバックする
+/// (= 巨大ファイルや低速メディアで `read_to_string` がワーカー起動前に長時間ブロックするのを防ぐ)。
+const MAX_SCRIPT_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// スクリプト実行の結果。
 pub struct GroupingResult {
@@ -40,8 +46,25 @@ pub fn script_path() -> PathBuf {
 }
 
 /// 実際に使うスクリプトソースを返す。ユーザーファイルがあればそれ、無ければ内蔵既定。
+///
+/// **ワーカースレッドから呼ぶこと** (= ファイル I/O を UI スレッドに乗せない)。`MAX_SCRIPT_BYTES`
+/// を超えるファイルは読まずに既定へフォールバックし、巨大 / 低速メディア上のファイルで
+/// `read_to_string` が長時間ブロックするのを防ぐ。
 pub fn active_script_source() -> String {
-    match std::fs::read_to_string(script_path()) {
+    let path = script_path();
+    // 先に長さを見て上限超過なら読まない (TOCTOU は自分の設定ファイルなので実害なし)。
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > MAX_SCRIPT_BYTES
+    {
+        crate::logger::log(format!(
+            "stack script too large ({} bytes > {} cap), using builtin default: {}",
+            meta.len(),
+            MAX_SCRIPT_BYTES,
+            path.display()
+        ));
+        return DEFAULT_SCRIPT.to_string();
+    }
+    match std::fs::read_to_string(&path) {
         Ok(s) if !s.trim().is_empty() => s,
         _ => DEFAULT_SCRIPT.to_string(),
     }
@@ -190,9 +213,35 @@ fn build_engine() -> Engine {
 /// `media` を `source` (Rhai スクリプト) の `group(files)` でグループ分けする。
 ///
 /// 戻り値の `keys` は `media` と同じ長さ。失敗時は `Err` (呼び出し側で組み込み
-/// 既定ルールへフォールバックする)。
+/// 既定ルールへフォールバックする)。キャンセル不要な呼び出し (テスト等) 向けの薄いラッパ。
 pub fn group_keys(media: &[StackMember], source: &str) -> Result<GroupingResult, String> {
-    let engine = build_engine();
+    group_keys_cancellable(media, source, Arc::new(AtomicBool::new(false)))
+}
+
+/// `group_keys` のキャンセル可能版。ワーカースレッドから `cancel` (= 新ロード時に立つ
+/// キャンセルトークン) を渡すと、Rhai インタプリタの `on_progress` フックが定期的に確認して
+/// **計算途中でも中断**する (= フォルダ/トグル連打で旧ワーカーが 10 万件の処理を最後まで
+/// 走らせ続けてスレッドが累積・CPU を食うのを防ぐ)。中断時は `Err` を返すが、呼び出し側は
+/// cancel が立っているので結果を捨てる。
+pub fn group_keys_cancellable(
+    media: &[StackMember],
+    source: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<GroupingResult, String> {
+    let mut engine = build_engine();
+    // 数万 op ごとにキャンセルを確認する (per-op で atomic load すると interpreter が重く
+    // なるので下位ビットでマスクして間引く)。`Some(..)` を返すと Rhai が ErrorTerminated で
+    // 即座に評価を打ち切る。
+    {
+        let cancel = Arc::clone(&cancel);
+        engine.on_progress(move |ops| {
+            if ops & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
+                Some(Dynamic::UNIT) // 中断
+            } else {
+                None
+            }
+        });
+    }
     let ast = engine
         .compile(source)
         .map_err(|e| format!("スクリプトのコンパイルに失敗: {e}"))?;
@@ -433,6 +482,40 @@ mod tests {
         let r = group_keys(&media, src).expect("int keys ok");
         assert_eq!(r.keys[0], "7");
         assert_eq!(r.keys[1], "7");
+    }
+
+    #[test]
+    fn cancel_flag_aborts_long_running_script() {
+        // 既にキャンセル済みなら、重いループ (10 万件相当の処理) を最後まで走らせず
+        // 途中で中断し Err を返す (= ワーカーが結果を捨てる前提)。
+        let cancel = Arc::new(AtomicBool::new(true));
+        // Rhai は `let mut` を持たず変数は既定で可変。重いループで on_progress を多数回踏ませる。
+        let src = r#"
+            fn group(files) {
+                let x = 0;
+                for i in 0..5000000 { x += 1; }
+                files.map(|f| f.name)
+            }
+        "#;
+        let media = vec![m("a.jpg", 0, false)];
+        let r = group_keys_cancellable(&media, src, cancel);
+        assert!(r.is_err(), "cancel 済みなら中断して Err を返すはず");
+    }
+
+    #[test]
+    fn no_cancel_completes_normally() {
+        // キャンセルされていなければ同じ重いループでも完走する (= on_progress が誤爆しない)。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let src = r#"
+            fn group(files) {
+                let x = 0;
+                for i in 0..1000 { x += 1; }
+                files.map(|f| f.stem)
+            }
+        "#;
+        let media = vec![m("a.jpg", 0, false), m("b.jpg", 0, false)];
+        let r = group_keys_cancellable(&media, src, cancel).expect("完走するはず");
+        assert_eq!(r.keys.len(), 2);
     }
 
     // 10k ファイルでの既定スクリプト実行時間を測る (perf 計測)。

@@ -480,7 +480,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsContinuousScrollForward/Back `PageDown/PageUp` (P)(連続読み時のみ)
 - FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
-- FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsAnalysis `Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★
+- FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
 - FsLoupeLockToggle `M` (P) ★ / FsLoupeHold `Shift` (MH, Ph6。修飾↔修飾のみ)
 - FsEraseMode `E` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★

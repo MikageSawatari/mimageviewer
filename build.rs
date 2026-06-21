@@ -59,7 +59,7 @@ fn main() {
 /// セットアップ手順を含む明確なエラーメッセージで終了する。
 fn check_vendor_files() {
     // (path, setup script / 取得方法)
-    let required: &[(&str, &str)] = &[
+    let mut required: Vec<(&str, &str)> = vec![
         (
             "vendor/pdfium/bin/pdfium.dll",
             "bash scripts/setup-pdfium.sh",
@@ -124,11 +124,10 @@ fn check_vendor_files() {
             "vendor/ffmpeg/lib/swresample.lib",
             "bash scripts/setup-ffmpeg.sh",
         ),
-        // AI モデルは配布スクリプトが無いので、既存インストール済み環境からコピーする旨を案内
-        (
-            "vendor/models/anime_classifier_mobilenetv3.onnx",
-            "インストール済み環境の %APPDATA%\\mimageviewer\\models\\ からコピー",
-        ),
+        // AI モデルは配布スクリプトが無いので、既存インストール済み環境からコピーする旨を案内。
+        // ここに並べるのは `src/ai/model_manager.rs` の EMBEDDED_MODELS と
+        // `scripts/build-portable.ps1` の $models に一致させること
+        // (= 旧 anime_classifier_mobilenetv3.onnx は現在どちらからも外れているので要求しない)。
         (
             "vendor/models/realesrgan_x4plus.onnx",
             "インストール済み環境の %APPDATA%\\mimageviewer\\models\\ からコピー",
@@ -157,15 +156,24 @@ fn check_vendor_files() {
             "vendor/models/migan.onnx",
             "インストール済み環境の %APPDATA%\\mimageviewer\\models\\ からコピー",
         ),
-        // VST3 host bridge プロセス。CMake で `crates/vst3-host/` をビルドすると
-        // ここに配置される。本体 (`mimageviewer-core.exe`) に `include_bytes!` で
-        // 内包し、初回 VST3 enable 時に `%APPDATA%\mimageviewer\vst3\` へ展開する
-        // (PDFium / Susie ワーカーと同パターン)。
-        (
+    ];
+
+    // VST3 host bridge プロセスは **通常ビルド (インストーラ / 単体 exe) のみ**
+    // `include_bytes!` で本体 (`mimageviewer-core.exe`) に内包する。CMake で
+    // `crates/vst3-host/` をビルドするとここに配置され、初回 VST3 enable 時に
+    // `%APPDATA%\mimageviewer\vst3\` へ展開する (PDFium / Susie ワーカーと同パターン)。
+    //
+    // ポータブルビルド (feature = "portable") では、未署名 exe が一部のセキュリティ
+    // ソフトに誤検知され zip ダウンロードがブロックされる事象を避けるため **同梱しない**
+    // (`scripts/build-portable.ps1` も copy 対象外、`vst3_supported()` が false を返して
+    // VST3 機能を自動無効化する)。よって portable では必須ファイルにしない。
+    // 将来 exe をコード署名して再同梱する場合は build-portable.ps1 と合わせて復活させる。
+    if std::env::var_os("CARGO_FEATURE_PORTABLE").is_none() {
+        required.push((
             "vendor/vst3-host/mimageviewer-vst3-host.exe",
             "cmake -S crates/vst3-host -B crates/vst3-host/build -G \"Visual Studio 18 2026\" -A x64 && cmake --build crates/vst3-host/build --config Release",
-        ),
-    ];
+        ));
+    }
 
     let missing: Vec<&(&str, &str)> = required
         .iter()
@@ -174,7 +182,7 @@ fn check_vendor_files() {
 
     if missing.is_empty() {
         // 変更されたら再チェックするよう cargo に通知
-        for (p, _) in required {
+        for (p, _) in &required {
             println!("cargo:rerun-if-changed={p}");
         }
         return;

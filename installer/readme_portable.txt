@@ -31,6 +31,11 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   管理者権限           不要                必要（UAC）
   設定・データの保存先 このフォルダ\data\  %APPDATA%\mimageviewer\
   アンインストール     フォルダを削除      Windows の設定から削除
+  VST3 プラグイン処理  非対応              対応
+
+  ※ ポータブル版では動画音声の VST3 プラグイン処理は利用できません
+    （環境設定の該当項目は選択できません）。VST3 を使う場合は
+    インストーラ版または単体 exe 版をご利用ください。
 
 
 ----------------------------------------------------------------
@@ -57,7 +62,6 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   mimageviewer.exe                本体
   *.dll                           動画再生 / PDF / AI 用ライブラリ
   mimageviewer-susie32.exe        Susie プラグイン用 32bit ワーカー
-  mimageviewer-vst3-host.exe      VST3 プラグイン処理用プロセス
   models\                         AI 用モデル
   LICENSE-ffmpeg.txt              FFmpeg のライセンス本文
   UNRAR-LICENSE.txt               UnRAR のライセンス本文
@@ -116,7 +120,6 @@ TensorRT 高速化パックを利用する場合のみ、ユーザー操作に�
     https://mikage.to/mimageviewer/
   - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB
     RAR 展開に使用します。同梱の UNRAR-LICENSE.txt を参照してください。
-  - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）
 

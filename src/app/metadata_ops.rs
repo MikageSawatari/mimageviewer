@@ -202,6 +202,21 @@ pub(super) fn facet_tag_filter_applies(item: &GridItem) -> bool {
     )
 }
 
+/// AI モデル/ツールのファセット絞り込みを **この種別に適用するか**。
+///
+/// `facet_tag_filter_applies` と同じ思想で、**スタック集約セルは対象外 = 素通し**にする。
+/// スタックは隠れメンバーの AI メタデータを集約セル単体では評価できず、`facet_ai_model_values`
+/// が常に空を返すため、ゲートしないと AI モデル/ツール絞り込み中に**スタックが全落ち**する
+/// (= タグ絞り込みでは素通しなのに AI 絞り込みでは全消えする、という不整合になる)。
+/// メンバー単位メタデータ (タグ / AI モデル / AI ツール) の絞り込みでは、スタックは
+/// 一貫して素通し扱いにする (種別 / 拡張子の絞り込みは従来どおり代表画像で評価される)。
+///
+/// Image / ZipImage 以外の通常コンテナ (Folder / ZIP / PDF / 動画) は従来どおり「非該当で落とす」
+/// 挙動を維持する (= AI モデル絞り込み中は AI 画像だけを見せる既存仕様、v1.7.0〜)。
+pub(super) fn facet_ai_filter_applies(item: &GridItem) -> bool {
+    !matches!(item, GridItem::Stack { .. })
+}
+
 /// `current` が `anchor` 配下 (= 同一 or 子孫) かを case-insensitive に判定する。
 /// Windows の case-insensitive FS 対応 (`C:\Photos` と `c:\photos` を同一扱い)。
 /// ドライブ文字は保持するので、cross-drive の偶然一致を起こさない
@@ -979,5 +994,30 @@ mod tests {
     #[test]
     fn probe_image_dims_from_bytes_rejects_invalid_data() {
         assert_eq!(probe_image_dims_from_bytes(b"not an image"), None);
+    }
+
+    #[test]
+    fn facet_member_metadata_filters_exempt_stack_consistently() {
+        use std::path::PathBuf;
+        let img = GridItem::Image(PathBuf::from("a.png"));
+        let stack = GridItem::Stack {
+            key: "a".into(),
+            representative: PathBuf::from("a_0.png"),
+            count: 3,
+        };
+        let folder = GridItem::Folder(PathBuf::from("dir"));
+
+        // 通常画像はタグ / AI ファセットの対象。
+        assert!(facet_tag_filter_applies(&img));
+        assert!(facet_ai_filter_applies(&img));
+
+        // スタック集約セルは **両方とも対象外 = 素通し** (= 全落ちしない。タグと AI で挙動を揃える)。
+        assert!(!facet_tag_filter_applies(&stack));
+        assert!(!facet_ai_filter_applies(&stack));
+
+        // フォルダはタグ対象外だが AI ファセットは従来どおり「非該当で落とす」挙動を維持
+        // (= facet_ai_filter_applies はスタック以外を対象にする)。
+        assert!(!facet_tag_filter_applies(&folder));
+        assert!(facet_ai_filter_applies(&folder));
     }
 }

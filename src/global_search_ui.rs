@@ -1115,6 +1115,11 @@ impl App {
         self.stack_mode_requested = false;
         self.stack_view = None;
         self.stack_showing_flat = false;
+        // 進行中のスタックスクリプトワーカーも明示破棄する。`poll_stack_script` の妥当性判定
+        // (stack_mode_requested=false) でも次フレームに破棄されるが、他の解除経路
+        // (start_loading_items / reset_to_drive_list / トグル) と挙動を揃え、ワーカーを
+        // 1 フレーム余分に走らせない (= 結果適用の取りこぼしも防ぐ)。
+        self.cancel_stack_script_pending();
         // 旧タスク停止: インデックスが付け替わるので in-flight は意味を失う
         if let Some(pending) = self.search_pending.take() {
             pending.cancel();

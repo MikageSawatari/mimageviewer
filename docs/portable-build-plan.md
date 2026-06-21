@@ -305,10 +305,10 @@ portable は launcher を使わないので影響しないが、抽出ロジッ�
 
 `build-release.ps1` を参考にした専用スクリプト。手順:
 
-1. VST3 bridge を cmake ビルド (既存ロジック流用)。
-2. `cargo build --release --bin mimageviewer-core --features portable` で core を生成。
+1. `cargo build --release --bin mimageviewer-core --features portable` で core を生成。
    - launcher (`-p mimageviewer-launcher`) は**ビルドしない**。
-3. 配布フォルダ `dist/portable/` を組み立て:
+   - VST3 bridge (`mimageviewer-vst3-host.exe`) は **同梱しない** (下記の注を参照)。
+2. 配布フォルダ `dist/portable/` を組み立て:
 
 ```
 mImageViewer_portable/
@@ -318,12 +318,19 @@ mImageViewer_portable/
 ├─ pdfium.dll
 ├─ onnxruntime.dll  onnxruntime_providers_shared.dll
 ├─ mimageviewer-susie32.exe
-├─ mimageviewer-vst3-host.exe
 ├─ models/
 │   ├─ realesrgan_x4plus.onnx  ... (7 本)
 ├─ readme.txt                        (ポータブル版用。解凍即起動・data/ 説明・LGPL 通知)
 └─ data/                             (初回起動時に自動作成。zip には空 or 同梱しない)
 ```
+
+> ⚠ **VST3 host exe は v2.0.0 以降ポータブル版に同梱しない**。未署名の
+> `mimageviewer-vst3-host.exe` を一部のセキュリティソフトがランサム誤検知し、ブラウザの
+> zip ダウンロードがブロックされる事象があったため (commit `ec83fee0`)。同梱しないことで
+> `src/video/dsp/vst3_supported()` が `false` を返し、VST3 機能はアプリ側で自動無効化される
+> (設定でも ON 不可)。`build.rs` の vendor チェックも `CARGO_FEATURE_PORTABLE` 時は
+> vst3-host を必須にしない。恒久対策 = bridge exe をコード署名 → 署名後に
+> `build-portable.ps1` の copy 行と build.rs の条件、本節を合わせて復活させる。
 
 4. **同梱漏れ検出**: コピーするファイル一覧を `native_assets` の Asset 列挙と FFmpeg DLL 名から
    導出し、コピー後に全ファイルの存在を assert。1 つでも欠けたらスクリプトを fail させる
@@ -402,7 +409,8 @@ mImageViewer_portable/
 - [ ] 動画を再生できる (FFmpeg DLL loose 解決、launcher 不在でロード成功)。
 - [ ] AI アップスケール / デノイズが動く (onnxruntime + models loose 解決)。
 - [ ] Susie プラグインが読める (susie32 worker loose 解決 + spawn)。
-- [ ] VST3 を有効化して動画音声がプラグインを通る (vst3-host loose 解決 + spawn)。
+- [ ] VST3 が**自動無効化**されている (環境設定→動画タブで「VST3 プラグイン処理」が選択不可・
+      「ポータブル版では利用できません」表示。`vst3_supported()` が false。host exe 非同梱)。
 - [ ] インストール版をトレイ常駐させた状態でポータブル版を起動 → **両方独立して動く** (mutex 分離)。
 - [ ] フォルダごと別 PC にコピーしても動く (絶対パス依存がない)。
 - [ ] (AV) 手元の Defender / 主要 AV でスキャン → 単体 exe 版より誤検知が減る/消えることを確認。

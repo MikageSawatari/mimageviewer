@@ -123,8 +123,10 @@ impl crate::app::App {
     /// ユーザー定義スクリプトによるグループ分けをワーカーで開始する。通常フォルダは既に
     /// 表示済みで、完了後 `poll_stack_script` が集約ビューへ差し替える。
     ///
-    /// `source` は実行する Rhai スクリプト本文。チェックなし (= 既定) のときは内蔵
-    /// `DEFAULT_SCRIPT`、チェックありのときはユーザーの `stack_rules.rhai` を呼び出し側が渡す。
+    /// `script_enabled` = 「分類ルールをスクリプトで行う」設定。true ならユーザーの
+    /// `stack_rules.rhai` (無ければ内蔵既定)、false なら内蔵 `DEFAULT_SCRIPT` を使う。
+    /// **ソースの読み込み (ファイル I/O) はワーカースレッド内で行う** (= UI スレッドに
+    /// `read_to_string` を乗せない)。
     pub(crate) fn spawn_stack_script_worker(
         &mut self,
         folder: PathBuf,
@@ -135,7 +137,7 @@ impl crate::app::App {
         sort: SortOrder,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<u64>,
-        source: String,
+        script_enabled: bool,
     ) {
         // 動画はルール判定に渡さない (常に単独)。画像だけをスクリプトへ。
         let image_indices: Vec<usize> = media
@@ -151,8 +153,18 @@ impl crate::app::App {
         std::thread::Builder::new()
             .name("stack-script".into())
             .spawn(move || {
-                let result = crate::filename_stack_script::group_keys(&images, &source)
-                    .map(|r| (r.keys, r.rule));
+                // スクリプト本文の読み込みもワーカー側で行う (UI スレッドの同期 I/O 回避)。
+                let source = if script_enabled {
+                    crate::filename_stack_script::active_script_source()
+                } else {
+                    crate::filename_stack_script::DEFAULT_SCRIPT.to_string()
+                };
+                let result = crate::filename_stack_script::group_keys_cancellable(
+                    &images,
+                    &source,
+                    Arc::clone(&cancel_w),
+                )
+                .map(|r| (r.keys, r.rule));
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }

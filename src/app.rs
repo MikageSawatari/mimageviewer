@@ -41,10 +41,10 @@ pub(crate) use grid_paint::{
 pub(crate) use metadata_ops::FacetField;
 use metadata_ops::{
     DetailsSortPrimary, DetailsSortRow, cmp_option_last, ctrl_f_progress_total,
-    details_created_time_path, facet_ext_for_item, facet_kind_for_item, facet_tag_filter_applies,
-    format_details_duration, format_details_timestamp, item_supports_tags, passes_rating_filter,
-    path_extension_lower, path_in_subtree_ci, run_details_meta_load, run_metadata_load,
-    run_metadata_search, stem_lower, tag_item_path,
+    details_created_time_path, facet_ai_filter_applies, facet_ext_for_item, facet_kind_for_item,
+    facet_tag_filter_applies, format_details_duration, format_details_timestamp,
+    item_supports_tags, passes_rating_filter, path_extension_lower, path_in_subtree_ci,
+    run_details_meta_load, run_metadata_load, run_metadata_search, stem_lower, tag_item_path,
 };
 #[cfg(test)]
 pub(crate) use prefetch_policy::BlockReason;
@@ -8826,15 +8826,13 @@ impl App {
         // start_loading_items へ渡すため消費前に複製しておく。
         let stack_on = self.stack_mode_requested;
         let stack_async_prep = if stack_on {
-            let source = if self.settings.stack_script_enabled {
-                crate::filename_stack_script::active_script_source()
-            } else {
-                crate::filename_stack_script::DEFAULT_SCRIPT.to_string()
-            };
+            // スクリプト本文の読み込み (ファイル I/O) はワーカー側で行うので、ここでは
+            // 「スクリプトを使うか」のフラグだけを渡す (UI スレッドの同期 read_to_string 回避)。
+            let script_enabled = self.settings.stack_script_enabled;
             let (passthrough, passthrough_metas, media) =
                 crate::filename_stack_ui::extract_stack_parts(&items, &image_metas, folder_count);
             Some((
-                source,
+                script_enabled,
                 self.settings.stack_separator,
                 passthrough,
                 passthrough_metas,
@@ -8858,7 +8856,7 @@ impl App {
             Some(folder_signature),
         );
         if let Some((
-            source,
+            script_enabled,
             separator,
             passthrough,
             passthrough_metas,
@@ -8879,7 +8877,7 @@ impl App {
                 sort,
                 stack_existing,
                 Some(folder_signature),
-                source,
+                script_enabled,
             );
         }
 
@@ -9744,6 +9742,16 @@ impl App {
         // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
         if self.is_snapshot_active() {
             self.deactivate_snapshot();
+        }
+        // スタック集約計算待ち (通常フォルダ表示中) に Ctrl+F が来たら、検索を優先する。
+        // 放置するとワーカー完了時の `apply_stack_script_result` → `start_loading_items` が
+        // `search_filter` / `search_query` をクリアし、入力した検索が消えてしまう
+        // (= スタック ON 直後の短い窓で踏める race)。ワーカーをキャンセルしスタック意図も
+        // 解除して、現在表示中の通常フォルダに対する検索を成立させる。集約完了後は
+        // `stack_mode_available()` が検索中はトグルを禁止するので、ここで先回りして解除する。
+        if self.stack_script_pending.is_some() {
+            self.cancel_stack_script_pending();
+            self.stack_mode_requested = false;
         }
         self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::LocalMeta);
@@ -22589,7 +22597,10 @@ impl App {
         if ai_filter_active && !self.details_lazy_sort_ready() {
             return true;
         }
-        if ignore != Some(FacetField::AiModel) && !self.settings.facet_filter.ai_models.is_empty() {
+        if ignore != Some(FacetField::AiModel)
+            && !self.settings.facet_filter.ai_models.is_empty()
+            && facet_ai_filter_applies(&item)
+        {
             let models = self.facet_ai_model_values(idx);
             if models.is_empty()
                 || !models
@@ -22599,7 +22610,10 @@ impl App {
                 return false;
             }
         }
-        if ignore != Some(FacetField::AiTool) && !self.settings.facet_filter.ai_tools.is_empty() {
+        if ignore != Some(FacetField::AiTool)
+            && !self.settings.facet_filter.ai_tools.is_empty()
+            && facet_ai_filter_applies(&item)
+        {
             let tool = self.facet_ai_tool_value(idx);
             if tool.is_empty() || !self.settings.facet_filter.ai_tools.contains(&tool) {
                 return false;
