@@ -618,6 +618,11 @@ keymap カスタマイズ可) のホールドで動き、
 ページ全体フィット指定で描く (`zip_cover_zoom_pan`)。**既定 `fs_zoom_factor = 1.0` = cover** で、
 縦長画像では横幅目一杯 (ZipPla 単ページの既定) になる。ホイールは照準中 (Z 押下中) のみ倍率変更で、
 ズーム確定後は前後ページ移動 (倍率変更は Ctrl+ホイール、ZipPla 準拠)。
+**ズームアウト下限 = contain** (`fs_zoom_factor < 1.0` を許可): 片方の軸が画面に収まり、もう片方に
+余白が出始める点まで縮小でき、それ以上 (上下左右どちらにも余白が出る状態) には縮まない
+(`total = (cover × factor).max(contain)`)。`factor` の dead zone を避けるため、描画側 (`draw_fs_zoom_mode` /
+`draw_fs_spread`) で画像ごとに `fs_zoom_factor` を `[contain/cover, 16]` (見開きは合成ページ基準) へ
+clamp する。`adjust_fs_zoom_factor` は広めに `[0.05, 16]` で受け、描画側 clamp が最終的な下限を決める。
 パンはカーソル位置を**操作帯 (`pan_band`)** 基準で元画像範囲へ写す (`zip_cursor_image_px`)。操作帯は
 画面から上下のホバーバー領域 (上部バー `TOP_BAR_HOVER_Y` / 下部 `FS_SEEK_BAR_HEIGHT`) を内側へ
 詰めた矩形で、**カーソルがホバー領域へ入る前に画像の上端・下端へ到達**する (実機 FB 2026-06-21)。

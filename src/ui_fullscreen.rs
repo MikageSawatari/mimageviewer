@@ -1834,7 +1834,9 @@ impl App {
             return false;
         }
         let mult = if wheel_y > 0.0 { 1.25 } else { 1.0 / 1.25 };
-        let new_factor = (self.fs_zoom_factor * mult).clamp(1.0, 16.0);
+        // 下限は 0.05 まで許可 (ズームアウト)。実際の下限 (contain) は描画側で画像ごとに
+        // factor を clamp して dead zone を防ぐので、ここは広めの安全網にする。
+        let new_factor = (self.fs_zoom_factor * mult).clamp(0.05, 16.0);
         if (new_factor - self.fs_zoom_factor).abs() < f32::EPSILON {
             return false;
         }
@@ -1855,7 +1857,7 @@ impl App {
     ) {
         let rotation = self.get_rotation(fs_idx);
         let active = self.fs_zoom_active;
-        let factor = self.fs_zoom_factor;
+        // factor はコンテンツ領域確定後に contain 下限へ clamp する (下記)。
         let pixel_grid = self.fs_pixel_grid_enabled;
         let tex_size = state
             .tex
@@ -1913,6 +1915,20 @@ impl App {
             ),
             None => (egui::Vec2::ZERO, display_size),
         };
+        // ズームアウト下限 = contain (片方の軸が画面に収まり、もう片方に余白が出る点)。
+        // factor をその下限 (= contain/cover) まで clamp して、ズームアウト後のホイールアップが
+        // 即反応するようにする (geometry も contain で floor するが、factor の dead zone を防ぐ)。
+        let z_cover =
+            (image_rect.width() / content_size.x).max(image_rect.height() / content_size.y);
+        let z_contain =
+            (image_rect.width() / content_size.x).min(image_rect.height() / content_size.y);
+        let factor_min = if z_cover > 0.0 {
+            (z_contain / z_cover).min(1.0)
+        } else {
+            1.0
+        };
+        self.fs_zoom_factor = self.fs_zoom_factor.clamp(factor_min, 16.0);
+        let factor = self.fs_zoom_factor;
         // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
@@ -2284,7 +2300,10 @@ fn zip_visible_src(
     cursor_in_content: egui::Vec2,
 ) -> (egui::Vec2, egui::Vec2) {
     let cover = (view.x / content_size.x.max(1.0)).max(view.y / content_size.y.max(1.0));
-    let total = (cover * factor.max(1.0)).max(f32::EPSILON);
+    // ズームアウト下限 = contain (片方の軸が画面に収まり、もう片方に余白が出始める点)。
+    // それ以上ズームアウトすると上下左右どちらにも余白が出るので止める (factor は 1.0 未満可)。
+    let contain = (view.x / content_size.x.max(1.0)).min(view.y / content_size.y.max(1.0));
+    let total = (cover * factor).max(contain).max(f32::EPSILON);
     let vis_w = (view.x / total).min(content_size.x);
     let vis_h = (view.y / total).min(content_size.y);
     let cx = cursor_in_content
@@ -2319,7 +2338,9 @@ fn zip_cover_zoom_pan(
     }
     let page_fit = (view.x / display_size.x).min(view.y / display_size.y);
     let cover = (view.x / content_size.x).max(view.y / content_size.y);
-    let total = cover * factor.max(1.0);
+    // ズームアウト下限 = contain (zip_visible_src と同じ。factor < 1.0 で contain まで縮小可)。
+    let contain = (view.x / content_size.x).min(view.y / content_size.y);
+    let total = (cover * factor).max(contain);
     let zoom = if page_fit > 0.0 {
         total / page_fit
     } else {
@@ -2385,9 +2406,11 @@ fn zip_spread_zoom_pan(
     if composite.x <= 0.0 || composite.y <= 0.0 || view.x <= 0.0 || view.y <= 0.0 {
         return (1.0, egui::Vec2::ZERO, view, composite * 0.5);
     }
-    let target_vis_w = (1.2 * single_page_w.max(1.0) / factor.max(1.0)).max(1.0);
-    let cover = (view.x / composite.x).max(view.y / composite.y);
-    let total = (view.x / target_vis_w).max(cover).max(f32::EPSILON);
+    let target_vis_w = (1.2 * single_page_w.max(1.0) / factor.max(f32::EPSILON)).max(1.0);
+    // ズームアウト下限 = contain (合成ページの片方の軸が画面に収まる点)。factor < 1.0 で
+    // target_vis_w が広がり、cover を下回って contain まで縮小できる。
+    let contain = (view.x / composite.x).min(view.y / composite.y);
+    let total = (view.x / target_vis_w).max(contain).max(f32::EPSILON);
     let vis = egui::vec2(
         (view.x / total).min(composite.x),
         (view.y / total).min(composite.y),
@@ -11885,8 +11908,22 @@ impl App {
             // 照準中は fit のまま枠 (aim_frame) を出す。
             let mut aim_frame: Option<egui::Rect> = None;
             let (zoom_pan, content_center_offset) = if self.fs_zoom_mode_engaged() {
-                let composite = egui::vec2(fit_w, fit_h);
+                // 合成ページ座標にページ間隔 (spread_gap) も page 単位 (spread_gap / fit_scale) で
+                // 含める (Codex P3)。これで照準枠/確定の中心計算が layout_spread_page_rects の gap
+                // 配置と一致する (確定中は layout 側の gap も同率で拡大する。下記 effective_gap)。
+                let gap_page = spread_gap / fit_scale.max(f32::EPSILON);
+                let composite = egui::vec2(fit_w + gap_page, fit_h);
                 let single_page_w = fit_w * 0.5;
+                // ズームアウト下限 = contain (合成ページの片方の軸が画面に収まる点)。factor を
+                // その下限まで clamp して dead zone を防ぐ (geometry も contain で floor する)。
+                let z_contain =
+                    (image_rect.width() / composite.x).min(image_rect.height() / composite.y);
+                let spread_factor_min = if image_rect.width() > 0.0 {
+                    (1.2 * single_page_w * z_contain / image_rect.width()).min(1.0)
+                } else {
+                    1.0
+                };
+                self.fs_zoom_factor = self.fs_zoom_factor.clamp(spread_factor_min, 16.0);
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
@@ -11929,6 +11966,15 @@ impl App {
             };
             let center = base_center - content_center_offset * total_scale;
 
+            // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
+            // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
+            // 通常表示・照準・手動 Ctrl+ホイールズームでは従来どおり一定の gap を使う。
+            let effective_gap = if self.fs_zoom_active && self.fs_zoom_mode_engaged() {
+                spread_gap * (total_scale / fit_scale.max(f32::EPSILON))
+            } else {
+                spread_gap
+            };
+
             // 見える領域を中央に配置し、フルページ矩形はその背後へ戻す。
             let spread_rects = layout_spread_page_rects(
                 center,
@@ -11936,7 +11982,7 @@ impl App {
                 right_w,
                 combined_h,
                 total_scale,
-                spread_gap,
+                effective_gap,
                 left_bbox,
                 right_bbox,
                 content_active,
@@ -16551,15 +16597,53 @@ mod tests {
     }
 
     #[test]
-    fn zip_cover_zoom_clamps_factor_below_one() {
+    fn zip_cover_zoom_out_below_one_reaches_contain() {
+        // factor<1 でズームアウトできる (下限は cover ではなく contain)。
+        // view 300x300, image 400x200: cover=1.5, contain=0.75, page_fit=0.75。
+        // contain になる factor = contain/cover = 0.5。
         let view = egui::vec2(300.0, 300.0);
         let image = egui::vec2(400.0, 200.0);
         let center = egui::vec2(200.0, 100.0);
-        let (zoom_half, _) = tz_pan(view, image, 0.5, center);
         let (zoom_one, _) = tz_pan(view, image, 1.0, center);
+        let (zoom_half, _) = tz_pan(view, image, 0.5, center);
+        let (zoom_quarter, _) = tz_pan(view, image, 0.25, center);
         assert!(
-            (zoom_half - zoom_one).abs() < 0.001,
-            "factor<1 は cover (1.0) に clamp"
+            (zoom_one - 2.0).abs() < 0.001,
+            "factor 1 は cover (zoom=2.0)"
+        );
+        assert!(
+            zoom_half < zoom_one - 0.001,
+            "factor<1 はズームアウトする (cover より下へ)"
+        );
+        assert!(
+            (zoom_half - 1.0).abs() < 0.001,
+            "factor=contain/cover で total=contain (zoom=contain/page_fit=1.0)"
+        );
+        assert!(
+            (zoom_quarter - zoom_half).abs() < 0.001,
+            "contain が下限 (それ以上ズームアウトしない)"
+        );
+    }
+
+    #[test]
+    fn zip_spread_zoom_out_below_one_reaches_contain() {
+        // 見開きも factor<1 で contain までズームアウト可能 (既定 1.2 ページ幅より広く見える)。
+        let view = egui::vec2(1920.0, 1080.0);
+        let composite = egui::vec2(2000.0, 1400.0);
+        let spw = 1000.0;
+        let cursor = egui::vec2(1000.0, 700.0);
+        let contain = (view.x / composite.x).min(view.y / composite.y); // 0.7714
+        let (_z, _p, vis_small, _c) = zip_spread_zoom_pan(view, composite, spw, 0.1, 0.5, cursor);
+        let expected_vis_x = (view.x / contain).min(composite.x);
+        assert!(
+            (vis_small.x - expected_vis_x).abs() < 1.0,
+            "factor<<1 で contain 下限まで vis が拡大 (合成ページ幅で頭打ち)"
+        );
+        let (_z1, _p1, vis_default, _c1) =
+            zip_spread_zoom_pan(view, composite, spw, 1.0, 0.5, cursor);
+        assert!(
+            vis_small.x > vis_default.x + 1.0,
+            "factor<1 は既定 (1.2 ページ幅) よりズームアウトしている"
         );
     }
 
