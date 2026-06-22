@@ -92,6 +92,38 @@
       box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
     .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
 
+    .showcase { background: #fff; border: 1px solid #ffe0ec; border-radius: 14px;
+      padding: 1rem; box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); margin-top: 1rem; }
+    .showcase-grid { display: grid; grid-template-columns: minmax(185px, 0.8fr) minmax(0, 2.2fr);
+      gap: 1rem; align-items: start; }
+    .showcase-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 520px;
+      overflow: auto; padding-right: 0.15rem; }
+    .showcase-button { width: 100%; border: 1px solid #ffd2e8; background: #fff7fb;
+      border-radius: 9px; padding: 0.62rem 0.75rem; color: #a02860; font-weight: 700;
+      text-align: left; cursor: pointer; font: inherit; line-height: 1.35; }
+    .showcase-button:hover, .showcase-button:focus, .showcase-button.is-active {
+      background: #d63384; border-color: #d63384; color: #fff; outline: none; }
+    .showcase-stage { min-width: 0; }
+    .showcase-link { display: block; border-radius: 10px; overflow: hidden; background: #111;
+      border: 1px solid #ffe0ec; }
+    .showcase-frame { position: relative; display: block; aspect-ratio: 16 / 9; background: #111; }
+    .showcase-frame img { position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; display: block; }
+    .showcase-image-alt { opacity: 0; }
+    .showcase-stage.is-animated .showcase-image-main { animation: showcase-main 2.8s steps(1, end) infinite; }
+    .showcase-stage.is-animated .showcase-image-alt { animation: showcase-alt 2.8s steps(1, end) infinite; }
+    .showcase-caption { margin-top: 0.65rem; color: #666; font-size: 0.9rem; }
+    .showcase-caption strong { color: #c0255a; display: block; margin-bottom: 0.15rem; }
+    .showcase-credit { margin-top: 0.55rem; color: #888; font-size: 0.78rem; text-align: right; }
+    @keyframes showcase-main { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+    @keyframes showcase-alt { 0%, 49% { opacity: 0; } 50%, 100% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .showcase-stage.is-animated .showcase-image-main,
+      .showcase-stage.is-animated .showcase-image-alt { animation: none; }
+      .showcase-stage.is-animated .showcase-image-main { opacity: 1; }
+      .showcase-stage.is-animated .showcase-image-alt { opacity: 0; }
+    }
+
     .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.1rem; }
     .feature-card { background: #fff; border: 1px solid #ffe0ec; border-radius: 15px; padding: 1.2rem 1.3rem;
       box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08); }
@@ -118,7 +150,13 @@
     footer { border-top: 1px solid #ffb0d9; background: rgba(255, 255, 255, 0.6); padding: 2rem;
       text-align: center; color: #a02860; font-size: 0.85rem; }
 
-    @media (max-width: 600px) { .hero h1 { font-size: 1.7rem; } main { padding: 2rem 1rem; } }
+    @media (max-width: 700px) {
+      .hero h1 { font-size: 1.7rem; }
+      main { padding: 2rem 1rem; }
+      .showcase-grid { grid-template-columns: 1fr; }
+      .showcase-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
+      .showcase-button { font-size: 0.84rem; padding: 0.55rem 0.65rem; }
+    }
   </style>
 </head>
 <body>
@@ -144,20 +182,43 @@
 
   <section>
     <p class="lead">Leeyes で見開き中心に漫画を読んできた方へ。mImageViewer は <strong>Leeyes で使っていた Susie 画像プラグインをそのまま活かせる</strong>ので、移行のハードルが低いビューアです。このページでは <strong>プラグインの引き継ぎ・操作・おすすめの初期設定・移行で増える機能</strong> をまとめました。</p>
-    <img class="shot" src="ss_fullscreen.png" alt="mImageViewer のフルスクリーン見開き表示">
-    <p class="shot-cap">フルスクリーンでの見開き表示</p>
+    <div class="showcase" data-showcase>
+      <div class="showcase-grid">
+        <div class="showcase-list" role="listbox" aria-label="漫画向け表示例">
+          <button class="showcase-button is-active" type="button" data-showcase-button data-src="ss_comic_spread_4px.webp" data-title="見開き表示" data-desc="右→左の表紙あり見開き。漫画ビューアとしての基本表示です。" data-alt="mImageViewer の漫画見開き表示">見開き表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_trim_off.webp" data-alt-src="ss_comic_trim_on.webp" data-title="見開き表示＋自動トリム" data-desc="余白のあるページを、読むときだけ自動で詰めて表示します。元ファイルは変更しません。" data-alt="mImageViewer の自動トリム表示">見開き＋自動トリム</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_zzoom_off.webp" data-alt-src="ss_comic_zzoom_on.webp" data-title="Zキー部分拡大ズーム" data-desc="Zキーで必要な部分だけ拡大。細かい文字や描き込みを確認しやすくします。" data-alt="mImageViewer のZキー部分拡大ズーム">Zキー部分拡大</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_vertical.webp" data-title="縦連結表示" data-desc="複数ページを縦方向につなげて、ズームアウト気味に流れを確認できます。" data-alt="mImageViewer の縦連結表示">縦連結表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_horizontal.webp" data-title="横連結表示" data-desc="ページを横方向につなげて、前後の流れを横長に見渡せます。" data-alt="mImageViewer の横連結表示">横連結表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_spread_0px.webp" data-title="結合済み見開きページ" data-desc="横長に結合済みの見開き画像は、設定変更で境界線なしの1枚として表示できます。" data-alt="mImageViewer の境界線なし見開き表示">境界線なし見開き</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_pseudocolor.webp" data-title="疑似カラー（肌色系）" data-desc="モノクロ漫画に肌色系の疑似カラーをかける補正例です。表示・書き出し用途に使えます。" data-alt="mImageViewer の疑似カラー補正">疑似カラー</button>
+        </div>
+        <div class="showcase-stage" data-showcase-stage>
+          <a class="showcase-link" data-showcase-link href="ss_comic_spread_4px.webp" target="_blank">
+            <span class="showcase-frame">
+              <img class="showcase-image-main" data-showcase-main src="ss_comic_spread_4px.webp" alt="mImageViewer の漫画見開き表示">
+              <img class="showcase-image-alt" data-showcase-alt alt="" hidden>
+            </span>
+          </a>
+          <p class="showcase-caption"><strong data-showcase-title>見開き表示</strong><span data-showcase-desc>右→左の表紙あり見開き。漫画ビューアとしての基本表示です。</span></p>
+        </div>
+      </div>
+      <p class="showcase-credit">使用素材: ブラックジャックによろしく 佐藤秀峰</p>
+    </div>
   </section>
 
   <section>
     <h2>はじめに知っておきたいこと</h2>
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11</strong> です。</li>
-      <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
+      <li><strong>画像ビューアと漫画ビューアを兼ねるため、デフォルトは単ページ表示</strong>です。フルスクリーン中に <kbd>1</kbd>〜<kbd>5</kbd> キーで単ページ・見開き・表紙あり見開きを切り替えられます。最初から見開きで開きたい場合は、設定画面でデフォルトを変更できます。</li>
+      <li><strong>mImageViewer はサムネイル一覧が基本のビューです。</strong>Leeyes は本棚やフォルダツリー、ファイル一覧から場所を選ぶ感覚が強いですが、mImageViewer はフォルダ・ZIP・PDF・画像・動画をサムネイルで見渡して開く設計です。よく見る場所は「お気に入り」に登録しておくと移動しやすくなります。</li>
       <li><strong>左側のフォルダツリーは初期状態では表示しません。</strong>フォルダツリーで移動したい場合は、ツールバーの <strong>ツリー</strong> ボタン（または <kbd>F</kbd>）で左側に表示できます。</li>
       <li><strong>フォルダにも表紙のようなサムネイルを出せます。</strong>フォルダ・ZIP・PDF の代表サムネイルは自動で選ばれますが、好きな画像やページを <kbd>P</kbd> キーやフォルダバーのピンで固定できます。フォルダを表紙つきの本棚のように整理する使い方を想定しています。</li>
+      <li><strong>Leeyes の「本棚」と mImageViewer の「お気に入り」は見え方が違います。</strong>Leeyes の本棚は、複数の本棚を作り、アイコンやコメントを付け、本棚の下に登録フォルダをツリー表示できます。mImageViewer のお気に入りは、よく使う場所へジャンプするための登録先です。フォルダツリーを表示しても、構造は実際のファイルシステムのままです。</li>
       <li><strong>一般的な画像形式は Susie プラグインなしで表示できます。</strong>Leeyes は標準では BMP のみで、JPEG・PNG などの表示に Susie プラグインが必要でしたが、mImageViewer は <strong>JPEG / PNG / GIF / WebP / BMP / HEIC / AVIF / RAW</strong> などに最初から対応しています（JPEG・PNG などは内蔵のデコーダーが優先され、Susie は使われません）。</li>
       <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き RAR に対応し、分割 RAR は <code>.part01.rar</code> などの先頭パートから開けます）。</li>
-      <li><strong>キー・マウスのカスタマイズは限定的です。</strong>Leeyes はキー・マウス操作を細かく GUI で設定できますが、mImageViewer はキーの再割り当てが設定ファイル（keymap.ini）を編集する上級者向けの方法のみです。マウスは戻る／進むボタンとリングショートカット（マウスのフリック操作）のカスタマイズに対応します（GUI で自由にキーを割り当てる機能はありません）。</li>
+      <li><strong>キー・マウスのカスタマイズは限定的です。</strong>Leeyes は割り当てだけでなく、左クリック時のショートカット入れ替え、スクロール量、スクロール端でのファイル移動、ドラッグスクロール量など、動作も GUI で細かく設定できます。mImageViewer はキーの再割り当てが設定ファイル（keymap.ini）を編集する上級者向けの方法のみで、マウスは戻る／進むボタンとリングショートカット（マウスのフリック操作）の割り当てが中心です。</li>
     </ul>
   </section>
 
@@ -174,9 +235,10 @@
           <tr><td>Susie プラグイン</td><td>一般的な画像や ZIP の表示にも重要でした。</td><td>PI / MAG / PIC / PIC2 / XLD4 など、特殊・レトロ形式を読むための追加手段です。対応するのは 32bit の <code>.spi</code> です。</td></tr>
           <tr><td>アーカイブ</td><td>ZIP などは導入している Susie プラグイン構成に依存します。</td><td>ZIP / CBZ は直接開きます。RAR / 7z / LZH は初回に ZIP キャッシュ化してから表示します。</td></tr>
           <tr><td>見開き読書</td><td>漫画向けの見開き閲覧を中心に使えます。</td><td>右→左見開き、表紙あり見開き、1 ページずらし、縦/横連結、部分拡大ズームをキーで切り替えられます。</td></tr>
-          <tr><td>本棚・履歴</td><td>本棚に登録した場所から開く使い方ができます。</td><td>よく開く場所は「お気に入り」、最近読んだ本は「読書履歴」、途中ページは「続きから再開」で扱います。左側ツリーが必要なときはツールバーの <strong>ツリー</strong> ボタンで表示します。</td></tr>
-          <tr><td>フォルダの見た目</td><td>フォルダ名を中心に場所を選ぶ使い方が基本です。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を固定して、表紙つきの本棚のように整理できます。</td></tr>
-          <tr><td>操作カスタマイズ</td><td>キー・マウス操作を GUI で細かく調整できます。</td><td>キー変更は <code>keymap.ini</code> 編集、マウスは戻る/進むボタンとリングショートカットの割り当てが中心です。</td></tr>
+          <tr><td>本棚・履歴</td><td>複数の本棚を作成し、アイコンやコメントを付けられます。本棚の下に登録フォルダがツリー状に見えるため、仮想フォルダに近い見え方で整理できます。</td><td>よく開く場所は「お気に入り」に登録して、場所メニューなどからジャンプします。最近読んだ本は「読書履歴」、途中ページは「続きから再開」で扱います。左側ツリーは実際のフォルダ構造を表示するもので、お気に入り配下の仮想ツリーにはなりません。</td></tr>
+          <tr><td>フォルダの見た目</td><td>本棚にはアイコンやコメントを設定できます。個々の実フォルダは、フォルダ名やツリーで場所を選ぶ使い方が中心です。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を固定して、表紙つきの本棚のように整理できます。</td></tr>
+          <tr><td>余白トリム</td><td>フィルタの「トリミング」で、上下左右を指定ピクセル分だけ削除して表示できます。自動検出や本/ページ単位の読書用トリム設定とは別の、フィルタ設定として扱う機能です。</td><td>左パネルの「表示トリム」で、自動余白カット、本全体、このページだけ、見開き左右別の調整ができます。表示専用なので元ファイルは変更しません。</td></tr>
+          <tr><td>操作カスタマイズ</td><td>キー・マウス操作の割り当てに加え、左右クリック時の動作、スクロール量、端までスクロールしたときの挙動、ドラッグスクロール量などを GUI で細かく調整できます。</td><td>キー変更は <code>keymap.ini</code> 編集、マウスは戻る/進むボタンとリングショートカットの割り当てが中心です。Leeyes ほど細かなスクロール動作の GUI 設定はありません。</td></tr>
         </tbody>
       </table>
     </div>
@@ -208,7 +270,7 @@
           <tr><td>表示倍率を変える</td><td><kbd>0</kbd> でフィット方式を巡回。<kbd>Ctrl</kbd>+ホイールでズーム。</td><td>ページ全体、横幅、縦幅、100% 原寸を切り替えられます。</td></tr>
           <tr><td>細部を拡大して読む</td><td><kbd>Z</kbd> で部分拡大ズーム。<kbd>M</kbd> または <kbd>Shift</kbd> 押しっぱなしでルーペ。</td><td><kbd>Z</kbd> は拡大範囲を決めてから読む方式、ルーペは一時確認向けです。</td></tr>
           <tr><td>次の本・前の本へ移動</td><td><kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で前後のフォルダ / ZIP / PDF / 変換アーカイブへ移動します。</td></tr>
-          <tr><td>本棚の代わり</td><td>「お気に入り」に登録し、「場所▼」やお気に入りメニューから開きます。</td><td>最近読んだ本は「読書履歴」からも開けます。</td></tr>
+          <tr><td>本棚の代わり</td><td>「お気に入り」に登録し、「場所▼」やお気に入りメニューから開きます。</td><td>Leeyes のように本棚ごとの仮想ツリーを作る機能ではなく、登録した実フォルダへ移動する使い方です。最近読んだ本は「読書履歴」からも開けます。</td></tr>
           <tr><td>左側ツリーで移動する</td><td>ツールバーの <strong>ツリー</strong> ボタン、または <kbd>F</kbd> でフォルダツリーを表示します。</td><td>初期状態では非表示です。現在フォルダに合わせて必要な範囲が展開されます。</td></tr>
           <tr><td>フォルダに表紙を付ける</td><td>代表にしたい画像・ページを選んで <kbd>P</kbd>、またはフォルダバーのピンで固定します。</td><td>フォルダ・ZIP・PDF の一覧で中身が分かりやすくなります。</td></tr>
           <tr><td>マウス操作を割り当てる</td><td>環境設定の「マウスボタン」「リングショートカット」を使います。</td><td>戻る/進むボタンや右ドラッグのフリックに、よく使う操作を割り当てられます。</td></tr>
@@ -237,7 +299,7 @@
     <ul class="pink-list">
       <li><strong>続きから／最初から</strong>の切り替え：「環境設定 → ライブラリ → 履歴と復元」で設定します（一覧から開いたときの既定は「続きから」）。</li>
       <li><strong>前回読んでいた本を探す</strong>：「ファイル」メニューの <strong>読書履歴を開く</strong>、またはフォルダバーの <strong>場所▼ → 読書履歴</strong> から、最近開いた本・ページを新しい順に開けます。</li>
-      <li><strong>よく開くフォルダを登録する（Leeyes の「本棚」に相当）</strong>：mImageViewer の <strong>お気に入り</strong>に、よく使うフォルダを登録してすぐ開けます。</li>
+      <li><strong>よく開くフォルダを登録する</strong>：mImageViewer の <strong>お気に入り</strong>に、よく使うフォルダを登録してすぐ開けます。ただし、Leeyes の本棚のように、登録先を本棚配下のツリーとしてまとめて表示する機能ではありません。</li>
     </ul>
   </section>
 
@@ -261,8 +323,8 @@
       <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
       <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
-      <div class="feature-card"><div class="icon">✂️</div><h3>表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
-      <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">✂️</div><h3>読書用表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
+      <div class="feature-card"><div class="icon">🖼️</div><h3>画像・動画も同じ管理</h3><p>漫画だけでなく、画像や動画も同じ一覧で扱えます。タグ・★・検索・代表サムネイルを共通の感覚で使えます。</p></div>
       <div class="feature-card"><div class="icon">🎮</div><h3>ゲームパッド対応</h3><p>一覧移動・ページ送り・フォルダ移動・見開き切替などをゲームパッドだけで操作できます。</p></div>
       <div class="feature-card"><div class="icon">🏷️</div><h3>タグ・検索・製本</h3><p>タグ付け・横断検索・読書履歴、好きなページを 1 冊にまとめる製本機能。</p></div>
       <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
@@ -294,5 +356,6 @@
   <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
 </footer>
 
+<script src="showcase.js"></script>
 </body>
 </html>

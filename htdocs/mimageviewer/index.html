@@ -398,6 +398,98 @@
       background: linear-gradient(to bottom, transparent, rgba(0,0,0,0.62));
       text-shadow: 0 1px 3px rgba(0,0,0,0.5);
     }
+    .showcase {
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-radius: 14px;
+      padding: 1rem;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12);
+    }
+    .showcase-grid {
+      display: grid;
+      grid-template-columns: minmax(215px, 0.9fr) minmax(0, 2.1fr);
+      gap: 1rem;
+      align-items: start;
+    }
+    .showcase-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      max-height: 590px;
+      overflow: auto;
+      padding-right: 0.15rem;
+    }
+    .showcase-button {
+      width: 100%;
+      border: 1px solid #ffd2e8;
+      background: #fff7fb;
+      border-radius: 9px;
+      padding: 0.58rem 0.75rem;
+      color: #a02860;
+      font: inherit;
+      font-size: 0.86rem;
+      font-weight: 700;
+      line-height: 1.35;
+      text-align: left;
+      cursor: pointer;
+    }
+    .showcase-button:hover,
+    .showcase-button:focus,
+    .showcase-button.is-active {
+      background: #d63384;
+      border-color: #d63384;
+      color: #fff;
+      outline: none;
+    }
+    .showcase-stage { min-width: 0; }
+    .showcase-link {
+      display: block;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #111;
+      border: 1px solid #ffe0ec;
+    }
+    .showcase-frame {
+      position: relative;
+      display: block;
+      aspect-ratio: 16 / 9;
+      background: #111;
+    }
+    .showcase-frame img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    .showcase-image-alt { opacity: 0; }
+    .showcase-stage.is-animated .showcase-image-main { animation: showcase-main 2.8s steps(1, end) infinite; }
+    .showcase-stage.is-animated .showcase-image-alt { animation: showcase-alt 2.8s steps(1, end) infinite; }
+    .showcase-caption {
+      margin-top: 0.65rem;
+      color: #666;
+      font-size: 0.9rem;
+    }
+    .showcase-caption strong {
+      color: #c0255a;
+      display: block;
+      margin-bottom: 0.15rem;
+    }
+    .showcase-credit {
+      margin-top: 0.55rem;
+      color: #888;
+      font-size: 0.78rem;
+      text-align: right;
+    }
+    @keyframes showcase-main { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+    @keyframes showcase-alt { 0%, 49% { opacity: 0; } 50%, 100% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .showcase-stage.is-animated .showcase-image-main,
+      .showcase-stage.is-animated .showcase-image-alt { animation: none; }
+      .showcase-stage.is-animated .showcase-image-main { opacity: 1; }
+      .showcase-stage.is-animated .showcase-image-alt { opacity: 0; }
+    }
 
     /* ── Use-case cards ��─ */
     .usecases {
@@ -437,6 +529,39 @@
       margin: 0;
       line-height: 1.5;
     }
+    .migration-guides {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 1rem;
+    }
+    .migration-card {
+      display: block;
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-radius: 14px;
+      padding: 1.1rem 1.2rem;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.1);
+      transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+    }
+    .migration-card:hover,
+    .migration-card:focus {
+      text-decoration: none;
+      transform: translateY(-3px);
+      box-shadow: 0 8px 24px rgba(214, 51, 132, 0.18);
+      border-color: #ffb0d9;
+      outline: none;
+    }
+    .migration-card h3 {
+      color: #c0255a;
+      font-size: 1rem;
+      margin: 0 0 0.35rem;
+    }
+    .migration-card p {
+      color: #666;
+      font-size: 0.86rem;
+      margin: 0;
+      line-height: 1.55;
+    }
 
     /* ── Responsive ── */
     @media (max-width: 600px) {
@@ -444,6 +569,9 @@
       main { padding: 2rem 1rem; }
       .download-box { flex-direction: column; align-items: flex-start; }
       .usecases { grid-template-columns: repeat(2, 1fr); margin-top: -1.5rem; padding: 0 1rem; }
+      .showcase-grid { grid-template-columns: 1fr; }
+      .showcase-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
+      .showcase-button { font-size: 0.78rem; padding: 0.5rem 0.6rem; }
     }
   </style>
 </head>
@@ -565,61 +693,37 @@
   <!-- ===== Screenshots ===== -->
   <section id="screenshots">
     <h2>スクリーンショット</h2>
-    <div class="screenshots">
-      <div class="screenshot-item">
-        <a href="ss_grid.png" target="_blank">
-          <img src="ss_grid.png" alt="サムネイルグリッド表示" loading="lazy">
-        </a>
-        <div class="screenshot-caption">📁 サムネイルグリッド表示</div>
+    <div class="showcase" data-showcase>
+      <div class="showcase-grid">
+        <div class="showcase-list" role="listbox" aria-label="スクリーンショット一覧">
+          <button class="showcase-button is-active" type="button" data-showcase-button data-src="ss_grid.png" data-title="サムネイルグリッド表示" data-desc="フォルダ・ZIP・PDF・画像・動画をサムネイルで見渡して開けます。" data-alt="mImageViewer のサムネイルグリッド表示">サムネイルグリッド</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_fullscreen.png" data-title="EXIF 表示" data-desc="フルスクリーンで画像を見ながら、撮影情報やファイル情報を確認できます。" data-alt="mImageViewer のEXIF表示">EXIF 表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_metadata.png" data-title="AI 生成情報表示" data-desc="Stable Diffusion / ComfyUI などの生成情報を画像と一緒に確認できます。" data-alt="mImageViewer のAI生成情報表示">AI 生成情報</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_analysis.png" data-title="画像分析モード" data-desc="画像の色や情報を確認しながら、閲覧・整理に使えます。" data-alt="mImageViewer の画像分析モード">画像分析モード</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_upscale.png" data-title="AI アップスケール" data-desc="低解像度画像を高精細化して、きれいな表示・書き出しに使えます。" data-alt="mImageViewer のAIアップスケール">AI アップスケール</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_eraser.png" data-title="AI 非破壊修復" data-desc="スキャン汚れや傷を、元ファイルを変えずに補修できます。" data-alt="mImageViewer のAI非破壊修復">AI 非破壊修復</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_tile.png" data-title="動画タイルモード" data-desc="長い動画の中身を一定間隔のサムネイルで確認できます。" data-alt="mImageViewer の動画タイルモード">動画タイルモード</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_bookmark.png" data-title="動画ブックマーク" data-desc="気になる場面をブックマークして、あとからすぐ開けます。" data-alt="mImageViewer の動画ブックマーク">動画ブックマーク</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_video_vst.png" data-title="VST3 プラグイン" data-desc="動画音声へ VST3 プラグインを適用できます。" data-alt="mImageViewer のVST3プラグイン">VST3 プラグイン</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_spread_4px.webp" data-title="漫画の見開き表示" data-desc="右→左の表紙あり見開きで、ZIP/PDFの漫画をそのまま読めます。" data-alt="mImageViewer の漫画見開き表示">漫画の見開き表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_trim_off.webp" data-alt-src="ss_comic_trim_on.webp" data-title="見開き＋自動トリム" data-desc="余白のあるページを、読むときだけ自動で詰めて表示します。" data-alt="mImageViewer の漫画自動トリム表示">見開き＋自動トリム</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_zzoom_off.webp" data-alt-src="ss_comic_zzoom_on.webp" data-title="Zキー部分拡大ズーム" data-desc="細かい文字や描き込みを、Zキーで部分拡大して確認できます。" data-alt="mImageViewer のZキー部分拡大ズーム">Zキー部分拡大</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_vertical.webp" data-title="縦連結表示" data-desc="複数ページを縦方向につなげて流れを確認できます。" data-alt="mImageViewer の縦連結表示">縦連結表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_horizontal.webp" data-title="横連結表示" data-desc="ページを横方向につなげ、前後のページを広く見渡せます。" data-alt="mImageViewer の横連結表示">横連結表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_spread_0px.webp" data-title="境界線なし見開き" data-desc="横長に結合済みの見開き画像は、境界線なしの1枚として表示できます。" data-alt="mImageViewer の境界線なし見開き表示">境界線なし見開き</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_pseudocolor.webp" data-title="疑似カラー（肌色系）" data-desc="モノクロ漫画へ肌色系の疑似カラーをかける補正例です。" data-alt="mImageViewer の疑似カラー補正">疑似カラー</button>
+        </div>
+        <div class="showcase-stage" data-showcase-stage>
+          <a class="showcase-link" data-showcase-link href="ss_grid.png" target="_blank">
+            <span class="showcase-frame">
+              <img class="showcase-image-main" data-showcase-main src="ss_grid.png" alt="mImageViewer のサムネイルグリッド表示">
+              <img class="showcase-image-alt" data-showcase-alt alt="" hidden>
+            </span>
+          </a>
+          <p class="showcase-caption"><strong data-showcase-title>サムネイルグリッド表示</strong><span data-showcase-desc>フォルダ・ZIP・PDF・画像・動画をサムネイルで見渡して開けます。</span></p>
+        </div>
       </div>
-      <div class="screenshot-item">
-        <a href="ss_fullscreen.png" target="_blank">
-          <img src="ss_fullscreen.png" alt="フルスクリーン表示" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🖼️ EXIF 表示</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_metadata.png" target="_blank">
-          <img src="ss_metadata.png" alt="AI メタデータパネル" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🤖 AI 生成情報表示</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_analysis.png" target="_blank">
-          <img src="ss_analysis.png" alt="画像分析モード" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🔬 画像分析モード</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_upscale.png" target="_blank">
-          <img src="ss_upscale.png" alt="AI アップスケール" loading="lazy">
-        </a>
-        <div class="screenshot-caption">✨ AI アップスケール</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_eraser.png" target="_blank">
-          <img src="ss_eraser.png" alt="AI 非破壊修復" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🧹 AI 非破壊修復</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_video_tile.png" target="_blank">
-          <img src="ss_video_tile.png" alt="動画タイルモード" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🎬 動画タイルモード</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_video_bookmark.png" target="_blank">
-          <img src="ss_video_bookmark.png" alt="動画ブックマーク" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🔖 動画ブックマーク</div>
-      </div>
-      <div class="screenshot-item">
-        <a href="ss_video_vst.png" target="_blank">
-          <img src="ss_video_vst.png" alt="VST3 プラグイン" loading="lazy">
-        </a>
-        <div class="screenshot-caption">🎛️ VST3 プラグイン</div>
-      </div>
+      <p class="showcase-credit">漫画表示例の使用素材: ブラックジャックによろしく 佐藤秀峰</p>
     </div>
   </section>
 
@@ -671,7 +775,7 @@
       <div class="feature-card">
         <div class="icon">✂️</div>
         <h3>表示トリム</h3>
-        <p>スキャン本の白/黒い余白を、読むときだけ自動または手動でカット。左パネルの「表示トリム」から、本全体・このページだけ・見開き左右別に調整でき、元ファイルや保存/エクスポート結果は変更しません。</p>
+        <p>スキャン本の白/黒い余白を、読むときだけ自動または手動でカット。左パネルの「表示トリム」から、本全体・このページだけ・見開き左右別に調整でき、元ファイルは変更しません。</p>
       </div>
       <div class="feature-card">
         <div class="icon">📷</div>
@@ -1036,6 +1140,26 @@
     </div>
   </section>
 
+  <!-- ===== Migration Guides ===== -->
+  <section id="migration-guides">
+    <h2>他ビューアからの移行ガイド</h2>
+    <p style="margin-bottom:1rem;">Leeyes、マンガミーヤ、ZipPla から乗り換える方向けに、見開き表示・操作キー・整理機能・おすすめ初期設定の違いをまとめています。</p>
+    <div class="migration-guides">
+      <a class="migration-card" href="migrate-leeyes.html">
+        <h3>Leeyes からの移行</h3>
+        <p>Susie プラグインの引き継ぎ、見開き操作、本棚とお気に入りの違いを確認できます。</p>
+      </a>
+      <a class="migration-card" href="migrate-mangameeya.html">
+        <h3>マンガミーヤからの移行</h3>
+        <p>細かな操作カスタマイズとの差分、見開き・連結表示、Avisynth 系機能との違いを整理しています。</p>
+      </a>
+      <a class="migration-card" href="migrate-zippla.html">
+        <h3>ZipPla からの移行</h3>
+        <p>タグ・評価・スマートフォルダ相当の使い方、拡大鏡から Z キーズームへの移行をまとめています。</p>
+      </a>
+    </div>
+  </section>
+
   <!-- ===== License ===== -->
   <section id="license">
     <h2>ライセンス</h2>
@@ -1084,5 +1208,6 @@
   <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
 </footer>
 
+<script src="showcase.js"></script>
 </body>
 </html>

@@ -92,6 +92,38 @@
       box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
     .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
 
+    .showcase { background: #fff; border: 1px solid #ffe0ec; border-radius: 14px;
+      padding: 1rem; box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); margin-top: 1rem; }
+    .showcase-grid { display: grid; grid-template-columns: minmax(185px, 0.8fr) minmax(0, 2.2fr);
+      gap: 1rem; align-items: start; }
+    .showcase-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 520px;
+      overflow: auto; padding-right: 0.15rem; }
+    .showcase-button { width: 100%; border: 1px solid #ffd2e8; background: #fff7fb;
+      border-radius: 9px; padding: 0.62rem 0.75rem; color: #a02860; font-weight: 700;
+      text-align: left; cursor: pointer; font: inherit; line-height: 1.35; }
+    .showcase-button:hover, .showcase-button:focus, .showcase-button.is-active {
+      background: #d63384; border-color: #d63384; color: #fff; outline: none; }
+    .showcase-stage { min-width: 0; }
+    .showcase-link { display: block; border-radius: 10px; overflow: hidden; background: #111;
+      border: 1px solid #ffe0ec; }
+    .showcase-frame { position: relative; display: block; aspect-ratio: 16 / 9; background: #111; }
+    .showcase-frame img { position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; display: block; }
+    .showcase-image-alt { opacity: 0; }
+    .showcase-stage.is-animated .showcase-image-main { animation: showcase-main 2.8s steps(1, end) infinite; }
+    .showcase-stage.is-animated .showcase-image-alt { animation: showcase-alt 2.8s steps(1, end) infinite; }
+    .showcase-caption { margin-top: 0.65rem; color: #666; font-size: 0.9rem; }
+    .showcase-caption strong { color: #c0255a; display: block; margin-bottom: 0.15rem; }
+    .showcase-credit { margin-top: 0.55rem; color: #888; font-size: 0.78rem; text-align: right; }
+    @keyframes showcase-main { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+    @keyframes showcase-alt { 0%, 49% { opacity: 0; } 50%, 100% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .showcase-stage.is-animated .showcase-image-main,
+      .showcase-stage.is-animated .showcase-image-alt { animation: none; }
+      .showcase-stage.is-animated .showcase-image-main { opacity: 1; }
+      .showcase-stage.is-animated .showcase-image-alt { opacity: 0; }
+    }
+
     .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.1rem; }
     .feature-card { background: #fff; border: 1px solid #ffe0ec; border-radius: 15px; padding: 1.2rem 1.3rem;
       box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08); }
@@ -118,7 +150,13 @@
     footer { border-top: 1px solid #ffb0d9; background: rgba(255, 255, 255, 0.6); padding: 2rem;
       text-align: center; color: #a02860; font-size: 0.85rem; }
 
-    @media (max-width: 600px) { .hero h1 { font-size: 1.7rem; } main { padding: 2rem 1rem; } }
+    @media (max-width: 700px) {
+      .hero h1 { font-size: 1.7rem; }
+      main { padding: 2rem 1rem; }
+      .showcase-grid { grid-template-columns: 1fr; }
+      .showcase-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
+      .showcase-button { font-size: 0.84rem; padding: 0.55rem 0.65rem; }
+    }
   </style>
 </head>
 <body>
@@ -144,19 +182,42 @@
 
   <section>
     <p class="lead">ZipPla で漫画の閲覧と管理をしてきた方へ。mImageViewer は <strong>タグ・レーティング・検索といった整理の機能</strong>に対応し、見開き表示やマウス追従の部分拡大ズームなども備えています。このページでは <strong>整理機能の対応・操作・おすすめの初期設定・移行で増える機能</strong> をまとめました。</p>
-    <img class="shot" src="ss_grid.png" alt="mImageViewer のサムネイル一覧表示">
-    <p class="shot-cap">サムネイル一覧での表示</p>
+    <div class="showcase" data-showcase>
+      <div class="showcase-grid">
+        <div class="showcase-list" role="listbox" aria-label="漫画向け表示例">
+          <button class="showcase-button is-active" type="button" data-showcase-button data-src="ss_comic_spread_4px.webp" data-title="見開き表示" data-desc="右→左の表紙あり見開き。漫画ビューアとしての基本表示です。" data-alt="mImageViewer の漫画見開き表示">見開き表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_trim_off.webp" data-alt-src="ss_comic_trim_on.webp" data-title="見開き表示＋自動トリム" data-desc="余白のあるページを、読むときだけ自動で詰めて表示します。元ファイルは変更しません。" data-alt="mImageViewer の自動トリム表示">見開き＋自動トリム</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_zzoom_off.webp" data-alt-src="ss_comic_zzoom_on.webp" data-title="Zキー部分拡大ズーム" data-desc="Zキーで必要な部分だけ拡大。細かい文字や描き込みを確認しやすくします。" data-alt="mImageViewer のZキー部分拡大ズーム">Zキー部分拡大</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_vertical.webp" data-title="縦連結表示" data-desc="複数ページを縦方向につなげて、ズームアウト気味に流れを確認できます。" data-alt="mImageViewer の縦連結表示">縦連結表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_horizontal.webp" data-title="横連結表示" data-desc="ページを横方向につなげて、前後の流れを横長に見渡せます。" data-alt="mImageViewer の横連結表示">横連結表示</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_spread_0px.webp" data-title="結合済み見開きページ" data-desc="横長に結合済みの見開き画像は、設定変更で境界線なしの1枚として表示できます。" data-alt="mImageViewer の境界線なし見開き表示">境界線なし見開き</button>
+          <button class="showcase-button" type="button" data-showcase-button data-src="ss_comic_pseudocolor.webp" data-title="疑似カラー（肌色系）" data-desc="モノクロ漫画に肌色系の疑似カラーをかける補正例です。表示・書き出し用途に使えます。" data-alt="mImageViewer の疑似カラー補正">疑似カラー</button>
+        </div>
+        <div class="showcase-stage" data-showcase-stage>
+          <a class="showcase-link" data-showcase-link href="ss_comic_spread_4px.webp" target="_blank">
+            <span class="showcase-frame">
+              <img class="showcase-image-main" data-showcase-main src="ss_comic_spread_4px.webp" alt="mImageViewer の漫画見開き表示">
+              <img class="showcase-image-alt" data-showcase-alt alt="" hidden>
+            </span>
+          </a>
+          <p class="showcase-caption"><strong data-showcase-title>見開き表示</strong><span data-showcase-desc>右→左の表紙あり見開き。漫画ビューアとしての基本表示です。</span></p>
+        </div>
+      </div>
+      <p class="showcase-credit">使用素材: ブラックジャックによろしく 佐藤秀峰</p>
+    </div>
   </section>
 
   <section>
     <h2>はじめに知っておきたいこと</h2>
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11</strong> です。</li>
-      <li><strong>最初の状態は「単ページ表示」</strong>です。見開きで読むには、下の「おすすめの初期設定」で見開きに変更してください（一度設定すれば以降の本にも適用されます）。</li>
+      <li><strong>画像ビューアと漫画ビューアを兼ねるため、デフォルトは単ページ表示</strong>です。フルスクリーン中に <kbd>1</kbd>〜<kbd>5</kbd> キーで単ページ・見開き・表紙あり見開きを切り替えられます。最初から見開きで開きたい場合は、設定画面でデフォルトを変更できます。</li>
+      <li><strong>mImageViewer はサムネイル一覧が基本のビューです。</strong>中央の一覧でフォルダ・ZIP・PDF・画像・動画を見渡して開く設計です。よく見る場所は「お気に入り」に登録し、フォルダ階層を見たいときだけ左側ツリーを表示する使い方がおすすめです。</li>
       <li><strong>左側のフォルダツリーは初期状態では表示しません。</strong>フォルダツリーで移動したい場合は、ツールバーの <strong>ツリー</strong> ボタン（または <kbd>F</kbd>）で左側に表示できます。</li>
       <li><strong>フォルダにも表紙のようなサムネイルを出せます。</strong>フォルダ・ZIP・PDF の代表サムネイルは自動で選ばれますが、好きな画像やページを <kbd>P</kbd> キーやフォルダバーのピンで固定できます。フォルダを表紙つきの本棚のように整理する使い方を想定しています。</li>
+      <li><strong>ZipPla のスマートフォルダは、複数フォルダとフォルダごとのフィルターを保存する仕組みです。</strong>スマートフォルダ（<code>.kdk</code>）は、登録した複数の場所を 1 つの仮想場所のようにまとめ、場所ごとにフィルターした結果を表示できます。mImageViewer には同じ保存ビューはありません。繰り返し使う分類はタグ・★・タグビュー・スマートフィルタ、複数場所の横断検索はお気に入り索引＋検索で代替します。</li>
       <li><strong>ZIP / CBZ は展開せずそのまま</strong>開けます。<strong>RAR / 7z / LZH</strong> は、最初に開くときに再圧縮なしで ZIP にまとめ直してから表示します（2 回目以降はそのまま。パスワード付き RAR に対応し、分割 RAR は <code>.part01.rar</code> などの先頭パートから開けます）。</li>
-      <li><strong>音声ファイル単体は扱いません。</strong>ZipPla は音声ファイルも管理できますが、mImageViewer は画像・漫画・動画のビューアです（動画内の音声は再生しますが、mp3 などの音声ファイル単体の管理・再生には対応していません）。</li>
+      <li><strong>音声ファイル単体は一覧に表示されません。</strong>ZipPla は対応形式として音声ファイルも挙げていますが、実機確認では形式によって外部プレイヤーを起動する動作でした。mImageViewer は画像・漫画・動画のビューアです。動画内の音声は再生しますが、mp3 / wav / m4a など音声ファイル単体の一覧表示・管理・再生には対応していません。</li>
     </ul>
   </section>
 
@@ -164,8 +225,8 @@
     <h2>タグ・レーティングの保存方式がちがいます（重要）</h2>
     <p>ここは ZipPla と mImageViewer で仕組みが大きく異なります。移行前にご確認ください。</p>
     <ul class="pink-list">
-      <li><strong>ZipPla</strong>：タグや★を <strong>ファイル名に書き込む</strong>方式です（例：<code>0001 {zpi$t=風景}.jpg</code>）。そのため、どのソフトでファイルを移動・コピーしてもタグは一緒に動きますが、ファイル名そのものが変わります。</li>
-      <li><strong>mImageViewer</strong>：タグや★は、既定では <strong>ファイルを変更せず、本体内で管理</strong>します（ファイル名は変わりません）。ただし、タグ・★は<strong>ファイルの場所（パス）にひも付く</strong>ため、通常のファイル操作で<strong>ファイルを移動・名前変更すると、タグ・★は引き継がれません</strong>（移動先に付き直りません）。単体画像の★だけは、設定を有効にすると JPEG / PNG / WebP の XMP レーティングにも書き込めますが、ZIP / PDF などの本全体の評価やタグを外部ファイルへ同期する機能ではありません。</li>
+      <li><strong>ZipPla</strong>：タグや★を <strong>選択している実体のファイル名に書き込む</strong>方式です（例：<code>0001 {zpi$t=風景}.jpg</code>）。ZIP や PDF の本体に付けた場合は <code>book {zpi$r=4}.zip</code> / <code>book {zpi$r=4}.pdf</code> のように本体ファイル名が変わり、フォルダ内の画像に付けた場合はその画像ファイル名が変わります。mImageViewer のように「コンテナ本体」と「中のページ」を別の管理対象として分ける考え方とは異なります。</li>
+      <li><strong>mImageViewer</strong>：タグや★は、既定では <strong>ファイルを変更せず、本体内で管理</strong>します（ファイル名は変わりません）。フォルダ・ZIP・PDF などの本体に付けるタグ/★と、単体画像に付けるタグ/★は、それぞれのパスにひも付きます。そのため、通常のファイル操作で<strong>ファイルを移動・名前変更すると、タグ・★は引き継がれません</strong>（移動先に付き直りません）。単体画像の★だけは、設定を有効にすると JPEG / PNG / WebP の XMP レーティングにも書き込めますが、ZIP / PDF などの本全体の評価やタグを外部ファイルへ同期する機能ではありません。</li>
     </ul>
     <div class="info-box">まとめると、mImageViewer は<strong>元のファイル名を変えない</strong>代わりに、<strong>ファイルを移動・改名するとタグ・★が外れます</strong>。タグを付けたあとはファイルを動かさない、または<strong>置き場所・名前を決めてからタグ付けする</strong>のがおすすめです。</div>
   </section>
@@ -179,14 +240,15 @@
           <tr><th>項目</th><th>ZipPla</th><th>mImageViewer</th></tr>
         </thead>
         <tbody>
-          <tr><td>タグ・★の保存</td><td>タグや★をファイル名に書き込む方式です。移動・コピーしても情報が一緒に動きますが、ファイル名は変わります。</td><td>既定では本体内のカタログで管理し、ファイル名は変えません。単体画像の★のみ、設定で JPEG / PNG / WebP の XMP レーティングにも書き込めます。</td></tr>
+          <tr><td>タグ・★の保存</td><td>タグや★を選択中の実体のファイル名に書き込む方式です。ZIP/PDF に付ければ本体ファイル名、フォルダ内画像に付ければ画像ファイル名が変わります。</td><td>既定では本体内のカタログで管理し、ファイル名は変えません。フォルダ・ZIP・PDF 本体と単体画像は別の対象として扱います。単体画像の★のみ、設定で JPEG / PNG / WebP の XMP レーティングにも書き込めます。</td></tr>
           <tr><td>タグで探す</td><td>タグ・評価・フィルタで整理できます。</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、グリッドのタグ絞り込み、★フィルターで探します。mIV タグは <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> の全文検索には混ぜません。</td></tr>
-          <tr><td>ブックマーク/スマートフォルダ</td><td>フォルダーブックマークやスマートフォルダで整理できます。</td><td>よく使う場所は「お気に入り」、条件で探す用途はタグビュー・検索・読書履歴で代替します。スマートフォルダと完全に同じ自動分類機能はありません。</td></tr>
+          <tr><td>ブックマーク/スマートフォルダ</td><td>フォルダーブックマークに加え、スマートフォルダ（<code>.kdk</code>）で複数フォルダを 1 つの仮想場所のようにまとめ、フォルダごとのフィルター結果を表示できます。</td><td>よく使う場所は「お気に入り」に登録します。mIV にはスマートフォルダと同じ保存ビューはありません。条件で繰り返し探す用途はタグビュー・★フィルター・スマートフィルタ、複数場所の横断検索はお気に入り索引＋検索で代替します。</td></tr>
           <tr><td>フォルダ移動</td><td>フォルダーブックマークやフォルダツリーから場所を選ぶ使い方があります。</td><td>初期状態ではツリーを出さず、サムネイル一覧を広く使います。ツリーが必要なときはツールバーの <strong>ツリー</strong> ボタンで表示します。</td></tr>
-          <tr><td>フォルダの見た目</td><td>タグ・評価・フィルタで整理できます。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を固定して、表紙つきの本棚のように整理できます。</td></tr>
-          <tr><td>管理対象</td><td>アーカイブ、PDF、画像、動画フレーム、音声ファイルなどを管理できます。</td><td>画像・漫画・PDF・動画の閲覧に対応します。動画内の音声は再生しますが、mp3 など音声ファイル単体の管理・再生は対象外です。</td></tr>
+          <tr><td>フォルダの見た目</td><td>表紙の手動設定や、親フォルダーの表紙に設定する操作があります。タグ・評価・フィルタと合わせて整理できます。</td><td>フォルダ・ZIP・PDF に代表サムネイルを表示できます。好きな画像を <kbd>P</kbd> で固定して、表紙つきの本棚のように整理できます。</td></tr>
+          <tr><td>管理対象</td><td>アーカイブ、PDF、画像、動画フレームなどを管理できます。音声ファイルも対応形式に含まれますが、形式によっては外部プレイヤー起動が中心です。</td><td>画像・漫画・PDF・動画の閲覧に対応します。動画内の音声は再生しますが、mp3 / wav / m4a など音声ファイル単体は一覧に表示されません。</td></tr>
           <tr><td>アーカイブ</td><td>アーカイブや PDF をサムネイル管理・閲覧できます。</td><td>ZIP / CBZ は直接開きます。RAR / 7z / LZH は初回に ZIP キャッシュ化してから表示します。</td></tr>
-          <tr><td>拡大表示</td><td>内蔵ビューアの拡大鏡・ズーム系の操作があります。</td><td><kbd>Z</kbd> の ZipPla 風部分拡大ズームで、範囲指定後にマウス移動だけで拡大位置を動かせます。</td></tr>
+          <tr><td>拡大表示</td><td>内蔵ビューアの「拡大鏡の切り替え」で一部を拡大できます。既定では <kbd>Z</kbd> と中クリックに割り当てられています。</td><td><kbd>Z</kbd> の「部分拡大ズーム」で、範囲指定後にマウス移動だけで拡大位置を動かせます。mIV の「ルーペ」（<kbd>Shift</kbd> / <kbd>M</kbd>）とは別機能です。</td></tr>
+          <tr><td>余白トリム</td><td>サムネイルには「スマートクリップ（自動検出）」や表紙サムネイルのクリッピングがあります。読書中のページ表示そのものを余白カットする設定は、手元の確認では見つかっていません。</td><td>左パネルの「表示トリム」で、自動余白カット、本全体、このページだけ、見開き左右別の調整ができます。表示専用なので元ファイルは変更しません。</td></tr>
           <tr><td>操作カスタマイズ</td><td>ショートカットキーやマウス操作を調整できます。</td><td>キー変更は <code>keymap.ini</code> 編集、マウスは戻る/進むボタンとリングショートカットの割り当てが中心です。</td></tr>
         </tbody>
       </table>
@@ -196,12 +258,31 @@
   <section>
     <h2>整理機能の対応（操作は変わります）</h2>
     <ul class="pink-list">
-      <li><strong>タグ・★レーティング・検索 … 対応しています。</strong>ファイルにタグや★を付けて、タグビュー・★フィルター・検索バーで絞り込めます（操作の手順は ZipPla とは異なります）。</li>
+      <li><strong>タグ・★レーティング … 対応しています。</strong>ファイルにタグや★を付けて、タグビュー・★フィルターで絞り込めます。タグは事前のピン留め登録なしでも、<kbd>T</kbd> から自由入力で付けられます。</li>
+      <li><strong>横断検索 … お気に入り登録と索引作成が必要です。</strong><kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> は、お気に入りに登録し、対応する索引を ON にした場所だけが対象です。準備なしで現在の一覧だけを絞る場合は <kbd>Ctrl</kbd>+<kbd>F</kbd> を使います。</li>
       <li><strong>サムネイル一覧での管理 … 対応しています。</strong>フォルダ・ZIP・PDF などをサムネイル一覧で見渡せます。</li>
-      <li><strong>よくアクセスするフォルダの登録 … 「お気に入り」に当たります。</strong>ZipPla のフォルダーブックマークのように、よく使うフォルダを登録してすぐ開けます。ZipPla のスマートフォルダと完全に同じ自動分類機能はありませんが、タグビュー・検索・読書履歴で近い使い方ができます。</li>
+      <li><strong>よくアクセスするフォルダの登録 … 「お気に入り」に当たります。</strong>ZipPla のフォルダーブックマークのように、よく使うフォルダを登録してすぐ開けます。ただし、お気に入りは登録場所へ移動するためのもので、ZipPla のスマートフォルダのように複数フォルダ＋条件を 1 つの保存ビューにする機能ではありません。</li>
+      <li><strong>スマートフォルダ的に繰り返し探す … タグ・★・スマートフィルタで置き換えます。</strong>ZipPla のスマートフォルダは、複数フォルダを束ねてフォルダごとのフィルター結果を表示する保存ビューです。mImageViewer では、固定した分類はタグや★を付けて <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビューや★フィルターで開き、今見ている一覧を条件で絞る場合はスマートフィルタを使います。</li>
       <li><strong>「製本」はこれとは別の機能です。</strong>好きなページ（画像・ZIP/PDF のページ・動画のフレームなど）を <strong>コピーして、新しい 1 冊として保存</strong>する機能です。フォルダを登録する「お気に入り」とは目的が違うので、混同しないようご注意ください。</li>
     </ul>
     <div class="info-box">タグ・検索・お気に入り・製本などの具体的な操作手順は <a href="manual/index.html">オンラインマニュアル</a> にまとまっています。ZipPla とは画面構成・操作が異なるため、最初に一度ご確認いただくとスムーズです。</div>
+  </section>
+
+  <section>
+    <h2>まずはタグ、必要なら索引検索</h2>
+    <p>ZipPla のタグ・評価・スマートフォルダ的な整理から移る場合、最初は <strong>タグ・★・現在地フィルタ</strong> から使うのがおすすめです。これらは大きな事前準備なしに使えます。</p>
+    <ul class="steps">
+      <li><strong>分類しておきたい本や画像にタグを付ける</strong> ―― 一覧で対象を選び <kbd>T</kbd>。ピン留めタグを事前登録していなくても、その場でタグ名を入力できます。</li>
+      <li><strong>タグで開く</strong> ―― <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、またはグリッド上部のタグ絞り込みを使います。タグ検索はお気に入り索引とは別の仕組みです。</li>
+      <li><strong>今開いている場所だけを絞る</strong> ―― <kbd>Ctrl</kbd>+<kbd>F</kbd> の現在地フィルタを使います。お気に入り登録や索引作成なしで、その場の一覧を絞り込めます。</li>
+    </ul>
+    <p>複数の保管場所をまたいで名前やメタデータを探したい場合だけ、次のように索引検索を設定します。</p>
+    <ul class="steps">
+      <li><strong>検索したい親フォルダを「お気に入り」に登録</strong>します。</li>
+      <li><strong>お気に入り編集で索引を ON</strong> にします。フォルダ・ZIP・PDF の名前を探す <kbd>Ctrl</kbd>+<kbd>S</kbd> には <strong>コンテナ索引</strong>、画像・PDF・動画を探す <kbd>Ctrl</kbd>+<kbd>G</kbd> には <strong>アイテム索引</strong> が必要です。</li>
+      <li><strong>初回の索引作成が終わるまで待ちます。</strong>以後は対象フォルダの変更に追従します。</li>
+      <li><strong><kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> で横断検索</strong>します。タグで探す場合は、引き続き <kbd>Ctrl</kbd>+<kbd>T</kbd> を使います。</li>
+    </ul>
   </section>
 
   <section>
@@ -213,12 +294,13 @@
           <tr><th>やりたいこと</th><th>mImageViewer の操作</th><th>補足</th></tr>
         </thead>
         <tbody>
-          <tr><td>ZipPla 風に一部を拡大する</td><td><kbd>Z</kbd> を押して範囲を指定し、離すと拡大。もう一度 <kbd>Z</kbd> で戻ります。</td><td>範囲指定中はホイールで倍率を調整できます。拡大後はマウス移動で表示位置を動かします。</td></tr>
+          <tr><td>ZipPla の拡大鏡に近い操作で拡大する</td><td>mIV では <kbd>Z</kbd> の「部分拡大ズーム」を使います。<kbd>Z</kbd> を押して範囲を指定し、離すと拡大。もう一度 <kbd>Z</kbd> で戻ります。</td><td>範囲指定中はホイールで倍率を調整できます。拡大後はマウス移動で表示位置を動かします。</td></tr>
           <tr><td>タグを付ける</td><td>一覧で対象を選び <kbd>T</kbd>、またはタグメニュー/右パネルから付けます。</td><td>mIV タグはファイル名や XMP には書き込まれません。</td></tr>
           <tr><td>タグで探す</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd> でタグビューを開きます。</td><td>複数タグは <code>#tag1 #tag2</code> のように入力すると AND 検索になります。</td></tr>
           <tr><td>★を付ける</td><td><kbd>F1</kbd>〜<kbd>F5</kbd> で★1〜★5、<kbd>F6</kbd> で解除。</td><td>フォルダや ZIP/PDF 本体へ★を付けたい場合は <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> を使います。</td></tr>
           <tr><td>今の場所を絞り込む</td><td><kbd>Ctrl</kbd>+<kbd>F</kbd> で現在地フィルタ。</td><td>いま表示している一覧だけをファイル名やメタ情報で絞り込みます。</td></tr>
-          <tr><td>お気に入り全体から探す</td><td><kbd>Ctrl</kbd>+<kbd>S</kbd> はフォルダ/ZIP/PDF 名、<kbd>Ctrl</kbd>+<kbd>G</kbd> は画像/PDF/動画の検索。</td><td>お気に入り側で索引を ON にしておくと横断検索できます。</td></tr>
+          <tr><td>スマートフォルダ風に繰り返し探す</td><td>タグ/★を付け、<kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、★フィルター、スマートフィルタで開きます。</td><td>タグは事前の索引設定なしで使えます。ZipPla の <code>.kdk</code> と同じ保存ビューではありません。</td></tr>
+          <tr><td>お気に入り全体から探す</td><td>検索したい場所をお気に入りに登録し、索引を ON にしてから使います。<kbd>Ctrl</kbd>+<kbd>S</kbd> はフォルダ/ZIP/PDF 名、<kbd>Ctrl</kbd>+<kbd>G</kbd> は画像/PDF/動画の検索です。</td><td><kbd>Ctrl</kbd>+<kbd>S</kbd> にはコンテナ索引、<kbd>Ctrl</kbd>+<kbd>G</kbd> にはアイテム索引が必要です。</td></tr>
           <tr><td>ページ送り</td><td><kbd>←</kbd> <kbd>→</kbd>、マウスホイール、画面左右クリック。</td><td>右→左読みではクリック方向も漫画向けに反転します。</td></tr>
           <tr><td>見開きにする</td><td><kbd>4</kbd> が見開き 右→左、<kbd>5</kbd> が表紙ありの見開き 右→左。</td><td>表紙だけ単独にしたい漫画は <kbd>5</kbd> が便利です。</td></tr>
           <tr><td>よく使う場所へ行く</td><td>「お気に入り」に登録し、「場所▼」やお気に入りメニューから開きます。</td><td>最近読んだ本は「読書履歴」からも開けます。</td></tr>
@@ -269,8 +351,8 @@
       <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>解像度の低い古いスキャンや小さな画像を、4 倍に高精細化して読めます。</p></div>
       <div class="feature-card"><div class="icon">✨</div><h3>AI ノイズ除去・消しゴム</h3><p>JPEG のノイズや、スキャンの汚れ・写り込みを自然に除去（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🎨</div><h3>色調補正・ポストフィルタ</h3><p>明るさ・コントラスト・色調の補正に加え、モノクロを四色刷り風にする効果なども。</p></div>
-      <div class="feature-card"><div class="icon">✂️</div><h3>表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
-      <div class="feature-card"><div class="icon">🖼️</div><h3>新しい形式に対応</h3><p>HEIC / AVIF / JPEG XL / RAW、PDF、動画のインライン再生にも対応。</p></div>
+      <div class="feature-card"><div class="icon">✂️</div><h3>読書用表示トリム</h3><p>白/黒い余白を読むときだけ自動・手動でカット。本全体・このページだけ・見開き左右別に調整できます（元ファイルは無改変）。</p></div>
+      <div class="feature-card"><div class="icon">🖼️</div><h3>画像・動画も同じ管理</h3><p>漫画だけでなく、画像や動画も同じ一覧で扱えます。タグ・★・検索・代表サムネイルを共通の感覚で使えます。</p></div>
       <div class="feature-card"><div class="icon">🎮</div><h3>ゲームパッド対応</h3><p>一覧移動・ページ送り・フォルダ移動・見開き切替などをゲームパッドだけで操作できます。</p></div>
       <div class="feature-card"><div class="icon">📚</div><h3>製本</h3><p>好きなページを集めて、番号付きの新しい 1 冊として保存できます。</p></div>
       <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
@@ -302,5 +384,6 @@
   <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
 </footer>
 
+<script src="showcase.js"></script>
 </body>
 </html>
