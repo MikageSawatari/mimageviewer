@@ -128,8 +128,7 @@ pub(super) enum DetailsSortPrimary {
 pub(super) struct DetailsSortRow {
     pub(super) idx: usize,
     pub(super) primary: DetailsSortPrimary,
-    pub(super) name_key: Vec<crate::ui_helpers::NaturalChunk>,
-    pub(super) name_lower: String,
+    pub(super) name_key: crate::filename_sort::SortNameKey,
 }
 
 pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItemKind {

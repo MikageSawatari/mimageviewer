@@ -795,7 +795,10 @@ impl SortOrder {
 
     /// 2 つのメディア項目をこのソート順で比較する。
     /// `name_a`/`name_b` はファイル名（拡張子付き）、`mtime_a`/`mtime_b` は更新日時。
-    /// `natural_key` は番号順ソート用のキー生成関数。
+    ///
+    /// 本番の一覧ソートでは、ファイル名ごとに 1 回だけ `SortNameKey` を作って
+    /// [`Self::compare_name_keys`] を使う。この関数は既存テスト・小規模呼び出し向けの
+    /// 互換 wrapper。
     ///
     /// 日付ソートで mtime が等しい場合、および番号順で natural key が等しい場合は
     /// ファイル名昇順で tiebreak する。
@@ -810,19 +813,40 @@ impl SortOrder {
         mtime_a: i64,
         name_b: &str,
         mtime_b: i64,
-        natural_key: impl Fn(&str) -> K,
+        _natural_key: impl Fn(&str) -> K,
+    ) -> std::cmp::Ordering {
+        let key_a = self.name_key(name_a);
+        let key_b = self.name_key(name_b);
+        self.compare_name_keys(&key_a, mtime_a, &key_b, mtime_b)
+    }
+
+    pub fn name_key(self, name: &str) -> crate::filename_sort::SortNameKey {
+        match self {
+            Self::Numeric => crate::filename_sort::SortNameKey::with_natural(name),
+            _ => crate::filename_sort::SortNameKey::file_name(name),
+        }
+    }
+
+    /// 事前に作った名前ソートキーで比較する。
+    ///
+    /// フォルダロードや詳細表示では各ファイル名につき 1 回だけ `SortNameKey` を作り、
+    /// ソート中はこの関数でキー同士を比較する。
+    pub fn compare_name_keys(
+        self,
+        name_a: &crate::filename_sort::SortNameKey,
+        mtime_a: i64,
+        name_b: &crate::filename_sort::SortNameKey,
+        mtime_b: i64,
     ) -> std::cmp::Ordering {
         match self {
-            Self::FileName => name_a.to_lowercase().cmp(&name_b.to_lowercase()),
-            Self::Numeric => natural_key(name_a)
-                .cmp(&natural_key(name_b))
-                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
+            Self::FileName => name_a.compare_file_name(name_b),
+            Self::Numeric => name_a.compare_natural(name_b),
             Self::DateAsc => mtime_a
                 .cmp(&mtime_b)
-                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
+                .then_with(|| name_a.compare_file_name(name_b)),
             Self::DateDesc => mtime_b
                 .cmp(&mtime_a)
-                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
+                .then_with(|| name_a.compare_file_name(name_b)),
         }
     }
 }
@@ -6163,6 +6187,16 @@ mod tests {
         let ord = SortOrder::FileName;
         let result = ord.compare("Bbb.jpg", 0, "aaa.jpg", 0, |s: &str| s.to_string());
         assert_eq!(result, std::cmp::Ordering::Greater); // "bbb" > "aaa"
+    }
+    #[cfg(windows)]
+    #[test]
+    fn sort_order_compare_precomputed_name_keys() {
+        let a = SortOrder::FileName.name_key("file2.jpg");
+        let b = SortOrder::FileName.name_key("file10.jpg");
+        assert_eq!(
+            SortOrder::FileName.compare_name_keys(&a, 0, &b, 0),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

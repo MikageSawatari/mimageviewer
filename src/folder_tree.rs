@@ -654,16 +654,18 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
         dirs.push((zp, mtime));
     }
 
-    // SortOrder::compare は &str / mtime / natural_key を取る。同関数を再利用して
-    // グリッドと完全に同じソート規則を使う。
-    dirs.sort_by(|a, b| {
-        let name_a = a.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let name_b = b.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        sort_order.compare(name_a, a.1, name_b, b.1, |s| {
-            crate::ui_helpers::natural_sort_key(s)
+    // グリッドと同じソート規則を使う。名前キーは候補ごとに 1 回だけ作る。
+    let mut keyed_dirs: Vec<_> = dirs
+        .into_iter()
+        .map(|(path, mtime)| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let key = sort_order.name_key(name);
+            (path, mtime, key)
         })
-    });
-    dirs.into_iter().map(|(p, _)| p).collect()
+        .collect();
+    keyed_dirs
+        .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort_order.compare_name_keys(ak, *a_mt, bk, *b_mt));
+    keyed_dirs.into_iter().map(|(p, _, _)| p).collect()
 }
 
 /// Windows のファイルシステムは大文字小文字を区別しないため小文字化して比較。

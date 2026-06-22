@@ -1439,7 +1439,6 @@ use crate::thumb_loader::{
     encode_and_save_with_source_dims, is_jpeg_entry, process_load_request,
     read_exif_orientation_from_bytes,
 };
-use crate::ui_helpers::natural_sort_key;
 
 /// 消しゴムモードのツール種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8726,11 +8725,16 @@ impl App {
         // folders (Folder / ZipFile / PdfFile / ConvertibleArchive) も sort_order に
         // 従って並べる (Explorer / Finder と同じ慣習で 2 段構成は維持)。
         crate::grid_item::sort_folder_block(&mut folders, &mut folder_metas, sort);
-        all_media.sort_by(|(a, _, a_mt, _), (b, _, b_mt, _)| {
-            let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            sort.compare(an, *a_mt, bn, *b_mt, natural_sort_key)
-        });
+        let mut keyed_media: Vec<_> = all_media
+            .into_iter()
+            .map(|entry| {
+                let name = entry.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let key = sort.name_key(name);
+                (entry, key)
+            })
+            .collect();
+        keyed_media.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.2, bk, b.2));
+        all_media = keyed_media.into_iter().map(|(entry, _)| entry).collect();
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -22984,8 +22988,7 @@ impl App {
         DetailsSortRow {
             idx,
             primary,
-            name_key: natural_sort_key(&name),
-            name_lower: name.to_lowercase(),
+            name_key: crate::filename_sort::SortNameKey::file_name(&name),
         }
     }
 
@@ -23055,9 +23058,7 @@ impl App {
     }
 
     fn compare_details_sort_names(a: &DetailsSortRow, b: &DetailsSortRow) -> std::cmp::Ordering {
-        a.name_key
-            .cmp(&b.name_key)
-            .then_with(|| a.name_lower.cmp(&b.name_lower))
+        a.name_key.compare_file_name(&b.name_key)
     }
 
     fn details_meta_value(&self, idx: usize) -> Option<(i64, i64)> {

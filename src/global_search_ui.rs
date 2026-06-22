@@ -821,9 +821,15 @@ pub(crate) fn build_flat_items(
             .to_string();
         rows.push((item, basename, h.mtime));
     }
-    rows.sort_by(|a, b| {
-        sort_order.compare(&a.1, a.2, &b.1, b.2, crate::ui_helpers::natural_sort_key)
-    });
+    let mut keyed_rows: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let key = sort_order.name_key(&row.1);
+            (row, key)
+        })
+        .collect();
+    keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_name_keys(ak, a.2, bk, b.2));
+    rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
     let placeholder = Some((0_i64, 0_i64));
     let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; rows.len()];
     let items: Vec<GridItem> = rows.into_iter().map(|(it, _, _)| it).collect();

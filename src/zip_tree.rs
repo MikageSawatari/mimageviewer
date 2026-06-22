@@ -182,11 +182,13 @@ impl ZipTree {
         };
 
         // 1) 子コンテナ (ZipDir)。セグメント名で sort。
-        let mut dirs: Vec<(&String, &ZipTreeNode)> = node.dirs.iter().collect();
-        dirs.sort_by(|(a, _), (b, _)| {
-            sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key)
-        });
-        for (seg, child) in dirs {
+        let mut dirs: Vec<_> = node
+            .dirs
+            .iter()
+            .map(|(seg, child)| (seg, child, sort.name_key(seg)))
+            .collect();
+        dirs.sort_by(|(_, _, ak), (_, _, bk)| sort.compare_name_keys(ak, 0, bk, 0));
+        for (seg, child, _) in dirs {
             // 代表画像。build() は画像エントリの経路上にしかノードを作らないので、
             // 任意の子ノードは部分木に必ず 1 枚以上画像を持つ → rep は実質的に常に Some。
             let rep = representative_image(child, sort);
@@ -204,19 +206,16 @@ impl ZipTree {
         }
 
         // 2) 直下画像 (ZipImage)。basename + mtime で sort。
-        let mut imgs: Vec<&ZipImageEntry> = node.images.iter().collect();
-        imgs.sort_by(|a, b| {
-            let an = entry_basename(&a.entry_name);
-            let bn = entry_basename(&b.entry_name);
-            sort.compare(
-                an,
-                a.mtime,
-                bn,
-                b.mtime,
-                crate::ui_helpers::natural_sort_key,
-            )
-        });
-        for e in imgs {
+        let mut imgs: Vec<_> = node
+            .images
+            .iter()
+            .map(|entry| {
+                let key = sort.name_key(entry_basename(&entry.entry_name));
+                (entry, key)
+            })
+            .collect();
+        imgs.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime));
+        for (e, _) in imgs {
             items.push(GridItem::ZipImage {
                 zip_path: self.zip_path.clone(),
                 entry_name: e.entry_name.clone(),
@@ -369,9 +368,13 @@ impl ZipNavState {
 
 /// `node` の子ディレクトリ名を表示 sort 順 (= `materialize_level` の ZipDir 並び) で返す。
 fn sorted_dirs(node: &ZipTreeNode, sort: SortOrder) -> Vec<&String> {
-    let mut dirs: Vec<&String> = node.dirs.keys().collect();
-    dirs.sort_by(|a, b| sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key));
-    dirs
+    let mut dirs: Vec<_> = node
+        .dirs
+        .keys()
+        .map(|seg| (seg, sort.name_key(seg)))
+        .collect();
+    dirs.sort_by(|(_, ak), (_, bk)| sort.compare_name_keys(ak, 0, bk, 0));
+    dirs.into_iter().map(|(seg, _)| seg).collect()
 }
 
 /// `stack` 最上段ノードについて、親 (`stack[len-2]`) の sort 済み子ディレクトリ列と、
@@ -489,22 +492,21 @@ fn segment_is_archive(seg: &str) -> bool {
 /// (列挙順 fallback) と違い、表示順の先頭ページを選ぶ (Codex P3 対応)。
 fn representative_image(node: &ZipTreeNode, sort: SortOrder) -> Option<&ZipImageEntry> {
     if !node.images.is_empty() {
-        return node.images.iter().min_by(|a, b| {
-            let an = entry_basename(&a.entry_name);
-            let bn = entry_basename(&b.entry_name);
-            sort.compare(
-                an,
-                a.mtime,
-                bn,
-                b.mtime,
-                crate::ui_helpers::natural_sort_key,
-            )
-        });
+        return node
+            .images
+            .iter()
+            .map(|entry| {
+                let key = sort.name_key(entry_basename(&entry.entry_name));
+                (entry, key)
+            })
+            .min_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime))
+            .map(|(entry, _)| entry);
     }
     node.dirs
         .iter()
-        .min_by(|(a, _), (b, _)| sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key))
-        .and_then(|(_, child)| representative_image(child, sort))
+        .map(|(seg, child)| (seg, child, sort.name_key(seg)))
+        .min_by(|(_, _, ak), (_, _, bk)| sort.compare_name_keys(ak, 0, bk, 0))
+        .and_then(|(_, child, _)| representative_image(child, sort))
 }
 
 impl ZipTreeNode {

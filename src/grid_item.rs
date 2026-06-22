@@ -437,15 +437,20 @@ pub fn sort_folder_block(
     // pub fn の契約違反 (folders と folder_metas の長さ不一致) は release でも止める。
     // zip は短い方に合わせるので silently drop されると並びが壊れる。
     assert_eq!(folders.len(), folder_metas.len());
-    let mut paired: Vec<_> = folders.drain(..).zip(folder_metas.drain(..)).collect();
-    paired.sort_by(|(a, ma), (b, mb)| {
-        let an = a.name();
-        let bn = b.name();
+    let mut paired: Vec<_> = folders
+        .drain(..)
+        .zip(folder_metas.drain(..))
+        .map(|(item, meta)| {
+            let key = sort.name_key(&item.name());
+            (item, meta, key)
+        })
+        .collect();
+    paired.sort_by(|(_, ma, ak), (_, mb, bk)| {
         let a_mt = ma.map(|(mt, _)| mt).unwrap_or(0);
         let b_mt = mb.map(|(mt, _)| mt).unwrap_or(0);
-        sort.compare(&an, a_mt, &bn, b_mt, crate::ui_helpers::natural_sort_key)
+        sort.compare_name_keys(ak, a_mt, bk, b_mt)
     });
-    for (f, m) in paired {
+    for (f, m, _) in paired {
         folders.push(f);
         folder_metas.push(m);
     }

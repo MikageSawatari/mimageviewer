@@ -138,3 +138,17 @@ fn meta_none_is_treated_as_mtime_zero() {
     let names: Vec<_> = folders.iter().map(|f| f.name().to_string()).collect();
     assert_eq!(names, vec!["recent", "old", "missing-meta"]);
 }
+
+#[cfg(windows)]
+#[test]
+fn folder_block_filename_uses_windows_digit_order() {
+    let names = run(
+        vec![
+            (folder("file10"), 1000),
+            (folder("file2"), 1000),
+            (folder("file1"), 1000),
+        ],
+        SortOrder::FileName,
+    );
+    assert_eq!(names, vec!["file1", "file2", "file10"]);
+}

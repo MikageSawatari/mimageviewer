@@ -32,7 +32,7 @@ use mimageviewer::thumb_loader::{
     CACHE_KEY_PDF, CACHE_KEY_ZIP, CacheDecision, LoadRequest, ThumbMsg,
     folder_thumb_auto_cache_key, process_load_request,
 };
-use mimageviewer::ui_helpers::{mtime_secs, natural_sort_key};
+use mimageviewer::ui_helpers::mtime_secs;
 
 // ───────────────────────────────────────────────────────────────────
 // コマンドライン引数
@@ -168,13 +168,32 @@ fn scan_folder(path: &Path) -> FolderContents {
         }
     }
 
-    folders.sort_by(|(a, _), (b, _)| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
     let sort = SortOrder::Numeric;
-    all_media.sort_by(|(a, _, a_mt, _), (b, _, b_mt, _)| {
-        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        sort.compare(an, *a_mt, bn, *b_mt, natural_sort_key)
-    });
+    let mut keyed_folders: Vec<_> = folders
+        .into_iter()
+        .map(|(item, meta)| {
+            let key = sort.name_key(&item.name());
+            let mtime = meta.map(|(mt, _)| mt).unwrap_or(0);
+            ((item, meta), key, mtime)
+        })
+        .collect();
+    keyed_folders
+        .sort_by(|(_, ak, a_mt), (_, bk, b_mt)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
+    folders = keyed_folders
+        .into_iter()
+        .map(|((item, meta), _, _)| (item, meta))
+        .collect();
+
+    let mut keyed_media: Vec<_> = all_media
+        .into_iter()
+        .map(|entry| {
+            let name = entry.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let key = sort.name_key(name);
+            (entry, key)
+        })
+        .collect();
+    keyed_media.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.2, bk, b.2));
+    all_media = keyed_media.into_iter().map(|(entry, _)| entry).collect();
 
     let mut counts = ItemCounts::default();
     let mut items: Vec<GridItem> = Vec::new();

@@ -669,14 +669,17 @@ fn scan_real_subfolders_inner(
         stats.dirs_returned += 1;
         dirs.push((entry.path(), mtime));
     }
-    dirs.sort_by(|a, b| {
-        let name_a = a.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let name_b = b.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        sort_order.compare(name_a, a.1, name_b, b.1, |s| {
-            crate::ui_helpers::natural_sort_key(s)
+    let mut keyed_dirs: Vec<_> = dirs
+        .into_iter()
+        .map(|(path, mtime)| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let key = sort_order.name_key(name);
+            (path, mtime, key)
         })
-    });
-    Ok(dirs.into_iter().map(|(path, _)| path).collect())
+        .collect();
+    keyed_dirs
+        .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort_order.compare_name_keys(ak, *a_mt, bk, *b_mt));
+    Ok(keyed_dirs.into_iter().map(|(path, _, _)| path).collect())
 }
 
 fn emit_folder_pane_scan_perf(

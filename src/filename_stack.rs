@@ -147,18 +147,21 @@ pub fn group_by_keys(media: Vec<StackMember>, keys: &[String], sort: SortOrder) 
     }
 
     // グループを代表メンバーで sort (= 表示順)。
-    groups.sort_by(|a, b| {
-        let ra = a.representative();
-        let rb = b.representative();
-        sort.compare(
-            name_of(&ra.path),
-            ra.mtime,
-            name_of(&rb.path),
-            rb.mtime,
-            crate::ui_helpers::natural_sort_key,
-        )
-    });
-    groups
+    let mut keyed_groups: Vec<_> = groups
+        .into_iter()
+        .map(|group| {
+            let rep = group.representative();
+            let key = sort.name_key(name_of(&rep.path));
+            let mtime = rep.mtime;
+            (group, key, mtime)
+        })
+        .collect();
+    keyed_groups
+        .sort_by(|(_, ak, a_mt), (_, bk, b_mt)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
+    keyed_groups
+        .into_iter()
+        .map(|(group, _, _)| group)
+        .collect()
 }
 
 /// スタックモードのビュー状態 (App が `Option<StackView>` で保持)。
@@ -359,15 +362,18 @@ impl StackView {
 
 /// グループ内メンバーを表示 sort 順に並べる。
 fn sort_members(members: &mut [StackMember], sort: SortOrder) {
-    members.sort_by(|a, b| {
-        sort.compare(
-            name_of(&a.path),
-            a.mtime,
-            name_of(&b.path),
-            b.mtime,
-            crate::ui_helpers::natural_sort_key,
-        )
-    });
+    let mut keyed: Vec<_> = members
+        .iter()
+        .cloned()
+        .map(|member| {
+            let key = sort.name_key(name_of(&member.path));
+            (member, key)
+        })
+        .collect();
+    keyed.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime));
+    for (slot, (member, _)) in members.iter_mut().zip(keyed) {
+        *slot = member;
+    }
 }
 
 #[cfg(test)]

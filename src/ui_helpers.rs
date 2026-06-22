@@ -654,7 +654,7 @@ pub fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
     chunks
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NaturalChunk {
     Text(String),
     Num(u64),

@@ -1931,11 +1931,20 @@ fn resolve_folder_thumb_image_inner(
     // サムネイル一覧はフォルダブロックを画像より先に出すため、代表サムネも
     // キャッシュミス時の自動選定ではサブフォルダを先に辿る。
     if remaining_depth > 0 {
-        subdirs.sort_by(|(a, a_mt), (b, b_mt)| {
-            let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
-        });
+        let mut keyed_subdirs: Vec<_> = subdirs
+            .into_iter()
+            .map(|(path, mtime)| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let key = sort.name_key(name);
+                (path, mtime, key)
+            })
+            .collect();
+        keyed_subdirs
+            .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
+        subdirs = keyed_subdirs
+            .into_iter()
+            .map(|(path, mtime, _)| (path, mtime))
+            .collect();
         for (sub, _) in &subdirs {
             // pin-aware: サブフォルダ自身に pin があれば cascade 解決して
             // leaf 画像を優先採用する。`folder_thumb_depth` を cascade depth 上限と
@@ -1988,11 +1997,20 @@ fn resolve_folder_thumb_image_inner(
     }
 
     if !images.is_empty() {
-        images.sort_by(|(a, a_mt), (b, b_mt)| {
-            let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
-        });
+        let mut keyed_images: Vec<_> = images
+            .into_iter()
+            .map(|(path, mtime)| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let key = sort.name_key(name);
+                (path, mtime, key)
+            })
+            .collect();
+        keyed_images
+            .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
+        images = keyed_images
+            .into_iter()
+            .map(|(path, mtime, _)| (path, mtime))
+            .collect();
         return Some(images.into_iter().next().unwrap().0);
     }
 
