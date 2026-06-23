@@ -22623,6 +22623,47 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub(crate) fn facet_place_label_for_key(&self, key: &str) -> String {
+        for item in &self.items {
+            let Some(path) = self.facet_place_path_for_item(item) else {
+                continue;
+            };
+            if crate::adjustment_db::normalize_path(&path) == key {
+                return self.facet_place_label_for_path(&path);
+            }
+        }
+        key.to_string()
+    }
+
+    pub(crate) fn facet_place_label_for_path(&self, path: &Path) -> String {
+        self.book_address_label_for_path(path)
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    pub(crate) fn facet_place_path_for_item(&self, item: &GridItem) -> Option<PathBuf> {
+        match item {
+            GridItem::Folder(path) => Some(path.clone()),
+            GridItem::Image(path)
+            | GridItem::Video(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. }
+            | GridItem::Stack {
+                representative: path,
+                ..
+            } => path.parent().map(Path::to_path_buf),
+            GridItem::SearchContainer { path, kind, .. } => match kind {
+                crate::grid_item::SearchContainerKind::Folder => Some(path.clone()),
+                crate::grid_item::SearchContainerKind::Zip => path.parent().map(Path::to_path_buf),
+            },
+            GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
+                zip_path.parent().map(Path::to_path_buf)
+            }
+            GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(Path::to_path_buf),
+            GridItem::ZipSeparator { .. } => None,
+        }
+    }
+
     pub(crate) fn facet_filter_active(&self) -> bool {
         self.settings.facet_filter.is_active()
     }
@@ -22932,6 +22973,18 @@ impl App {
         if ignore != Some(FacetField::Ext) && !self.settings.facet_filter.exts.is_empty() {
             let ext = facet_ext_for_item(&item);
             if ext.is_empty() || !self.settings.facet_filter.exts.contains(&ext) {
+                return false;
+            }
+        }
+
+        if ignore != Some(FacetField::Place) && !self.settings.facet_filter.place_keys.is_empty() {
+            let Some(place_key) = self
+                .facet_place_path_for_item(&item)
+                .map(|path| crate::adjustment_db::normalize_path(&path))
+            else {
+                return false;
+            };
+            if !self.settings.facet_filter.place_keys.contains(&place_key) {
                 return false;
             }
         }

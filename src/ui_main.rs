@@ -316,6 +316,12 @@ fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 }
 
+fn prepare_place_facet_menu_popup(ui: &mut egui::Ui) {
+    ui.set_min_width(280.0);
+    ui.set_max_width(560.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+}
+
 const AI_FACET_MENU_WIDTH: f32 = 520.0;
 const AI_FACET_MENU_VISIBLE_ROWS: usize = 18;
 
@@ -5538,9 +5544,22 @@ impl App {
                 show_sticky_context_menu(&filter_label_response, |ui| {
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
-                let facet_items = crate::settings::ToolbarFacetFilterItem::visible_order(
+                let mut facet_items = crate::settings::ToolbarFacetFilterItem::visible_order(
                     &self.settings.toolbar_facet_filter_items,
                 );
+                {
+                    use crate::settings::ToolbarFacetFilterItem as FI;
+                    let should_force_place =
+                        self.items_are_rating_view || !self.settings.facet_filter.place_keys.is_empty();
+                    if should_force_place && !facet_items.is_empty() && !facet_items.contains(&FI::Place)
+                    {
+                        if let Some(ext_idx) = facet_items.iter().position(|item| *item == FI::Ext) {
+                            facet_items.insert(ext_idx + 1, FI::Place);
+                        } else {
+                            facet_items.push(FI::Place);
+                        }
+                    }
+                }
                 if facet_items.is_empty() {
                     ui.label(egui::RichText::new("(右クリックでボタンを選択)").weak());
                 }
@@ -5549,6 +5568,7 @@ impl App {
                     match item {
                         FI::Kind => facet_changed |= self.draw_facet_kind_menu(ui),
                         FI::Ext => facet_changed |= self.draw_facet_ext_menu(ui),
+                        FI::Place => facet_changed |= self.draw_facet_place_menu(ui),
                         FI::AiModel => facet_changed |= self.draw_facet_ai_model_menu(ui),
                         FI::AiTool => facet_changed |= self.draw_facet_ai_tool_menu(ui),
                         FI::Rating => rating_changed |= self.draw_facet_rating_menu(ui),
@@ -5801,6 +5821,46 @@ impl App {
                     }
                     changed = true;
                 }
+            }
+        });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+        changed
+    }
+
+    fn draw_facet_place_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let label = facet_menu_label("場所", self.settings.facet_filter.place_keys.len());
+        let menu = ui.menu_button(label, |ui| {
+            prepare_place_facet_menu_popup(ui);
+            let mut counts = self.facet_place_counts();
+            for key in &self.settings.facet_filter.place_keys {
+                let label = self.facet_place_label_for_key(key);
+                counts.entry(key.clone()).or_insert((label, 0));
+            }
+            if self.settings.facet_filter.place_keys.is_empty() {
+                ui.label("すべて");
+            } else if ui.small_button("場所フィルタを解除").clicked() {
+                self.settings.facet_filter.place_keys.clear();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            if counts.is_empty() {
+                ui.label("候補なし");
+            }
+            for (key, (place_label, count)) in counts {
+                let mut selected = self.settings.facet_filter.place_keys.contains(&key);
+                let text = format!("{place_label} ({count})");
+                let response = ui.checkbox(&mut selected, text);
+                if response.changed() {
+                    if selected {
+                        self.settings.facet_filter.place_keys.insert(key.clone());
+                    } else {
+                        self.settings.facet_filter.place_keys.remove(&key);
+                    }
+                    changed = true;
+                }
+                response.on_hover_text(key);
             }
         });
         suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
@@ -6566,6 +6626,16 @@ impl App {
                 .join(",");
             facet_chip(ui, format!("拡張子:{values}"));
         }
+        if !filter.place_keys.is_empty() {
+            let values = filter
+                .place_keys
+                .iter()
+                .take(2)
+                .map(|key| self.facet_place_label_for_key(key))
+                .collect::<Vec<_>>()
+                .join(",");
+            facet_chip(ui, format!("場所:{values}"));
+        }
         if !filter.ai_models.is_empty() {
             let values = filter
                 .ai_models
@@ -6692,6 +6762,24 @@ impl App {
             if !ext.is_empty() {
                 *counts.entry(ext).or_insert(0) += 1;
             }
+        }
+        counts
+    }
+
+    fn facet_place_counts(&mut self) -> BTreeMap<String, (String, usize)> {
+        let indices = self.facet_candidate_indices(FacetField::Place);
+        let mut counts = BTreeMap::new();
+        for idx in indices {
+            let Some(item) = self.items.get(idx) else {
+                continue;
+            };
+            let Some(path) = self.facet_place_path_for_item(item) else {
+                continue;
+            };
+            let key = crate::adjustment_db::normalize_path(&path);
+            let label = self.facet_place_label_for_path(&path);
+            let entry = counts.entry(key).or_insert((label, 0));
+            entry.1 += 1;
         }
         counts
     }

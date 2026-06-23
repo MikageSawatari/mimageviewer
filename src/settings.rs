@@ -584,6 +584,8 @@ pub struct FacetFilter {
     #[serde(default)]
     pub exts: std::collections::BTreeSet<String>,
     #[serde(default)]
+    pub place_keys: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub ai_models: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub ai_tools: std::collections::BTreeSet<String>,
@@ -607,6 +609,7 @@ impl FacetFilter {
     pub fn is_active(&self) -> bool {
         !self.kinds.is_empty()
             || !self.exts.is_empty()
+            || !self.place_keys.is_empty()
             || !self.ai_models.is_empty()
             || !self.ai_tools.is_empty()
             || !self.tags.is_empty()
@@ -769,6 +772,7 @@ impl ToolbarSectionId {
 pub enum ToolbarFacetFilterItem {
     Kind,
     Ext,
+    Place,
     AiModel,
     AiTool,
     Rating,
@@ -787,6 +791,7 @@ impl ToolbarFacetFilterItem {
         &[
             Self::Kind,
             Self::Ext,
+            Self::Place,
             Self::AiModel,
             Self::AiTool,
             Self::Rating,
@@ -802,6 +807,7 @@ impl ToolbarFacetFilterItem {
         match self {
             Self::Kind => "種類",
             Self::Ext => "拡張子",
+            Self::Place => "場所",
             Self::AiModel => "AIモデル",
             Self::AiTool => "生成ツール",
             Self::Rating => "★",
@@ -7124,6 +7130,9 @@ mod tests {
             s.facet_filter.kinds.insert(FacetItemKind::Image);
             s.facet_filter.exts.insert("png".to_string());
             s.facet_filter
+                .place_keys
+                .insert("c:/pictures/source".to_string());
+            s.facet_filter
                 .ai_models
                 .insert("sd_xl_base_1.0".to_string());
             s.facet_filter.ai_tools.insert("ComfyUI".to_string());
@@ -7301,6 +7310,13 @@ mod tests {
             assert!(
                 loaded.facet_filter.exts.contains("png"),
                 "facet_filter extensions should survive roundtrip"
+            );
+            assert!(
+                loaded
+                    .facet_filter
+                    .place_keys
+                    .contains("c:/pictures/source"),
+                "facet_filter source places should survive roundtrip"
             );
             assert!(
                 loaded.facet_filter.ai_models.contains("sd_xl_base_1.0"),

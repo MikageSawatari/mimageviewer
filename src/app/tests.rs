@@ -3016,6 +3016,56 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn facet_place_filter_matches_source_parent_in_rating_view() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.items_are_rating_view = true;
+        app.items.push(GridItem::Image(std::path::PathBuf::from(
+            "c:/pics/a/one.jpg",
+        )));
+        app.items.push(GridItem::Image(std::path::PathBuf::from(
+            "c:/pics/b/two.jpg",
+        )));
+        app.items.push(GridItem::ZipImage {
+            zip_path: std::path::PathBuf::from("c:/archives/book.zip"),
+            entry_name: "p001.jpg".to_string(),
+        });
+        app.thumbnails = vec![
+            ThumbnailState::Pending,
+            ThumbnailState::Pending,
+            ThumbnailState::Pending,
+        ];
+
+        app.settings
+            .facet_filter
+            .place_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &std::path::PathBuf::from("c:/pics/a"),
+            ));
+        app.rebuild_visible_indices();
+
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "★一覧などの横断ビューでも、元ファイルの親フォルダで絞り込める"
+        );
+    }
+
+    #[test]
+    fn facet_place_label_uses_bookshelf_virtual_name_for_book_folder() {
+        let mut app = setup_app();
+        app.settings.book_root = Some(std::path::PathBuf::from("c:/library/books"));
+        let book = std::path::PathBuf::from("c:/library/books/資料集");
+
+        assert_eq!(
+            app.facet_place_label_for_path(&book),
+            "本棚 > 資料集",
+            "製本フォルダは実パスではなく本棚の仮想表記で表示する"
+        );
+    }
+
+    #[test]
     fn facet_edit_rollup_matches_leaf_archives_and_optional_descendant_folders() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use crate::settings::FacetEditFlag;

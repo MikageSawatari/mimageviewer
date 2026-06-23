@@ -108,6 +108,7 @@ pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String
 pub(crate) enum FacetField {
     Kind,
     Ext,
+    Place,
     AiModel,
     AiTool,
     Tags,
