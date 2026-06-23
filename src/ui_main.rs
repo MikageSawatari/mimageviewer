@@ -317,9 +317,8 @@ fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
 }
 
 fn prepare_place_facet_menu_popup(ui: &mut egui::Ui) {
-    ui.set_min_width(280.0);
-    ui.set_max_width(560.0);
-    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+    ui.set_width(PLACE_FACET_MENU_WIDTH);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
 }
 
 const AI_FACET_MENU_WIDTH: f32 = 520.0;
@@ -405,6 +404,44 @@ fn show_scrollable_facet_choices<R>(
         },
     )
     .inner
+}
+
+fn draw_facet_checkbox_choice(
+    ui: &mut egui::Ui,
+    selected: &mut bool,
+    text: String,
+    hover_text: &str,
+) -> bool {
+    let row_h = ui.spacing().interact_size.y.max(22.0);
+    let row_width = ui.available_width().max(1.0);
+    let mut changed = false;
+    let response = ui
+        .allocate_ui_with_layout(
+            egui::vec2(row_width, row_h),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let checkbox_response = ui.add(egui::Checkbox::without_text(selected));
+                if checkbox_response.changed() {
+                    changed = true;
+                }
+                let label_width = ui.available_width().max(1.0);
+                let label_response = ui.add_sized(
+                    egui::vec2(label_width, row_h),
+                    egui::Label::new(text)
+                        .truncate()
+                        .halign(egui::Align::Min)
+                        .sense(egui::Sense::click()),
+                );
+                if label_response.clicked() {
+                    *selected = !*selected;
+                    changed = true;
+                }
+                checkbox_response.union(label_response)
+            },
+        )
+        .inner;
+    response.on_hover_text(hover_text);
+    changed
 }
 
 fn consume_wheel_input(ctx: &egui::Context) {
@@ -5905,8 +5942,7 @@ impl App {
                         for (key, (place_label, count)) in counts {
                             let mut selected = self.settings.facet_filter.place_keys.contains(&key);
                             let text = format!("{place_label} ({count})");
-                            let response = ui.checkbox(&mut selected, text);
-                            if response.changed() {
+                            if draw_facet_checkbox_choice(ui, &mut selected, text, &key) {
                                 if selected {
                                     self.settings.facet_filter.place_keys.insert(key.clone());
                                 } else {
@@ -5914,7 +5950,6 @@ impl App {
                                 }
                                 changed = true;
                             }
-                            response.on_hover_text(key);
                         }
                     });
                 }
@@ -6076,7 +6111,8 @@ impl App {
                 .config(menu_config)
                 .ui(ui, |ui| {
                     prepare_facet_menu_popup(ui);
-                    ui.set_min_width(TAG_FACET_MENU_WIDTH);
+                    ui.set_width(TAG_FACET_MENU_WIDTH);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                     draw_sticky_settings_menu_header(ui, "タグ");
                     ui.separator();
                     let (mut counts, untagged_count) = self.facet_tag_counts();
@@ -6203,7 +6239,12 @@ impl App {
                                     let mut selected =
                                         self.settings.facet_filter.tags.contains(&tag_key);
                                     let text = format!("#{} ({count})", display);
-                                    if ui.checkbox(&mut selected, text).changed() {
+                                    if draw_facet_checkbox_choice(
+                                        ui,
+                                        &mut selected,
+                                        text,
+                                        &format!("#{display}"),
+                                    ) {
                                         if selected {
                                             self.settings.facet_filter.tags.insert(tag_key);
                                         } else {
