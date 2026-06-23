@@ -243,6 +243,7 @@ impl App {
         let exif_info = self.get_current_exif();
         let tweet_info = self.get_current_tweet_info();
         let sidecar_info = self.get_current_sidecar();
+        let current_palette = self.current_fullscreen_color_palette();
 
         // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
         let tag_rows = self.collect_fullscreen_tag_panel_rows();
@@ -292,6 +293,7 @@ impl App {
         let mut clicked_tag: Option<(String, Vec<TagTarget>)> = None;
         let mut set_tag: Option<(String, bool, Vec<TagTarget>)> = None;
         let mut searched_tag: Option<String> = None;
+        let mut clicked_palette_rgb: Option<[u8; 3]> = None;
         let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
         let tag_picker_ime_active = self.ime_input_active();
@@ -354,8 +356,23 @@ impl App {
                         || ai_metadata.is_some()
                         || exif_info.is_some()
                         || sidecar_info.is_some()
+                        || current_palette.is_some()
                     {
                         ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                }
+
+                // 画像色パレット
+                if let Some(ref palette) = current_palette {
+                    draw_image_color_palette_section(ui, palette, &mut clicked_palette_rgb);
+                    if tweet_info.is_some()
+                        || ai_metadata.is_some()
+                        || exif_info.is_some()
+                        || sidecar_info.is_some()
+                    {
+                        ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(8.0);
                     }
@@ -420,6 +437,7 @@ impl App {
                     && tweet_info.is_none()
                     && !show_tag_panel
                     && sidecar_info.is_none()
+                    && current_palette.is_none()
                 {
                     draw_no_metadata(ui);
                 }
@@ -438,6 +456,9 @@ impl App {
         }
         if let Some(tag_name) = searched_tag {
             self.open_tag_view_for_tag(&tag_name);
+        }
+        if let Some(rgb) = clicked_palette_rgb {
+            self.apply_image_color_filter_from_swatch(rgb, ctx);
         }
 
         true
@@ -813,6 +834,62 @@ fn draw_tag_panel(
             });
         }
     }
+}
+
+fn draw_image_color_palette_section(
+    ui: &mut egui::Ui,
+    palette: &crate::color_search::Palette,
+    clicked_rgb: &mut Option<[u8; 3]>,
+) {
+    if palette.colors.is_empty() {
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("画像色")
+                .color(egui::Color32::WHITE)
+                .size(14.0)
+                .strong(),
+        )
+        .on_hover_text("画像として扱える項目だけを、この色で絞り込みます。");
+        ui.label(
+            egui::RichText::new(format!("{} 色", palette.colors.len()))
+                .color(DIM_COLOR)
+                .size(11.0),
+        );
+    });
+    ui.add_space(5.0);
+
+    ui.horizontal_wrapped(|ui| {
+        for color in &palette.colors {
+            let rgb = color.rgb;
+            let fill = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            let swatch_size = egui::vec2(24.0, 24.0);
+            let (rect, response) = ui.allocate_exact_size(swatch_size, egui::Sense::click());
+            let stroke_color = if response.hovered() {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80)
+            };
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(5), fill);
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius::same(5),
+                egui::Stroke::new(1.0, stroke_color),
+                egui::epaint::StrokeKind::Outside,
+            );
+            let tooltip = format!(
+                "{} ({:.1}%)\nクリックで画像色フィルタに使用",
+                crate::color_search::hex_rgb(rgb),
+                color.ratio * 100.0
+            );
+            if response.on_hover_text(tooltip).clicked() {
+                *clicked_rgb = Some(rgb);
+            }
+        }
+    });
 }
 
 fn draw_fullscreen_tag_picker_panel(

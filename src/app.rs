@@ -9,6 +9,7 @@ use std::sync::{
 use crate::keymap::KeyAction;
 
 mod cache_ops;
+mod color_filter;
 mod folder_scan;
 mod gamepad_input;
 mod grid_paint;
@@ -3313,6 +3314,8 @@ pub struct App {
     pub(crate) facet_filter_suppression_stack: Vec<FacetFilterSuppression>,
     /// facet タグメニュー内の一時検索文字列。設定には保存しない。
     pub(crate) facet_tag_search_query: String,
+    /// 色フィルタの一時状態。Settings へ保存しないオンデマンド絞り込み。
+    pub(crate) color_filter: crate::color_search::ColorFilterState,
 
     /// 第2シグナル (`finalized=true`) を受け取ったが、第1シグナルの ColorImage が
     /// `texture_backlog` でアップロード待ちのため `requested` から remove できなかった
@@ -4743,6 +4746,13 @@ pub struct App {
     pub(crate) catalog_cache: std::collections::HashMap<PathBuf, Arc<crate::catalog::CatalogDb>>,
     /// `catalog_cache` 用 LRU 順 (古い順)。
     pub(crate) catalog_cache_order: std::collections::VecDeque<PathBuf>,
+    /// 現在表示中 items のサムネキャッシュ。色スキャンなど、サムネ worker 以外の
+    /// オンデマンド処理が既存 WebP を再利用するために保持する。
+    pub(crate) current_color_cache_map: Option<
+        Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
+    >,
+    /// 現在表示中 items の catalog。色スキャンの cache miss 補完で個別 SELECT する。
+    pub(crate) current_color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
 
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
@@ -5638,6 +5648,7 @@ impl App {
             facet_filter_scope: None,
             facet_filter_suppression_stack: Vec::new(),
             facet_tag_search_query: String::new(),
+            color_filter: crate::color_search::ColorFilterState::default(),
             pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
             vis_settle_at: None,
@@ -6103,6 +6114,8 @@ impl App {
             last_pdf_pool_snapshot_at: None,
             catalog_cache: std::collections::HashMap::new(),
             catalog_cache_order: std::collections::VecDeque::new(),
+            current_color_cache_map: None,
+            current_color_catalog: None,
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
@@ -8374,6 +8387,9 @@ impl App {
         self.fs_pending.clear();
         self.input_generation.clear();
         self.clear_all_final_pipeline_caches();
+        self.clear_color_filter_for_new_items();
+        self.current_color_cache_map = None;
+        self.current_color_catalog = None;
 
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -8436,6 +8452,8 @@ impl App {
                 .and_then(|catalog| catalog.load_all().ok())
                 .unwrap_or_default(),
         ));
+        self.current_color_cache_map = Some(Arc::clone(&cache_map));
+        self.current_color_catalog = catalog_arc.clone();
         self.seed_drive_list_pin_thumbs_from_catalog(&cache_map, catalog_arc.as_ref());
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
@@ -12065,6 +12083,10 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
     ) {
+        self.clear_color_filter_for_new_items();
+        self.current_color_cache_map = None;
+        self.current_color_catalog = None;
+
         // ネスト ZIP ツリーナビの単一チョークポイント: 別コンテナ (フォルダ/PDF/別 ZIP/
         // 検索結果) への遷移は必ずここを通るので、旧 zip_nav を破棄する。ZIP を開く
         // 経路 (finalize_zip_enumerate) は start_loading_items の **後**で zip_nav を
@@ -12641,6 +12663,8 @@ impl App {
         ));
         let catalog_entries = cache_map.read().unwrap().len();
         crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
+        self.current_color_cache_map = Some(Arc::clone(&cache_map));
+        self.current_color_catalog = catalog_arc.clone();
 
         // PDF / ZIP を仮想フォルダとして開いた場合、親フォルダ catalog の
         // pdfthumb: / zipthumb: 先頭サムネを仮想 catalog の page_0000 / 最初の
@@ -22155,6 +22179,11 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        let color_filter_t0 = if self.color_filter.enabled && crate::perf::is_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 表示集合が変わると facet タグ件数も変わる (ui_main::facet_tag_counts)。
         self.facet_tag_counts_cache = None;
         self.sync_facet_filter_scope();
@@ -22167,6 +22196,12 @@ impl App {
         let rating_filter_active = !self.items_are_drive_list
             && !self.items_are_reading_history_view
             && !rating_filter.iter().all(|&b| b);
+        let color_scope_signature =
+            if self.color_filter.enabled && self.color_filter_available_in_current_view() {
+                self.color_current_scope_signature()
+            } else {
+                None
+            };
 
         let n = self.items.len();
         let mut result = Vec::with_capacity(n);
@@ -22187,9 +22222,37 @@ impl App {
             if !self.items_are_reading_history_view && !self.passes_facet_filter(i, None) {
                 continue;
             }
+            if !self.passes_color_filter_for_scope(i, color_scope_signature) {
+                continue;
+            }
             result.push(i);
         }
         self.visible_indices = result;
+        if let (Some(t0), Some(scope_signature)) = (color_filter_t0, color_scope_signature) {
+            crate::perf::event(
+                "color",
+                "filter_apply",
+                None,
+                0,
+                &[
+                    ("items", serde_json::Value::from(n)),
+                    (
+                        "visible",
+                        serde_json::Value::from(self.visible_indices.len()),
+                    ),
+                    (
+                        "applied",
+                        serde_json::Value::from(
+                            self.color_filter.applied_scope_signature == Some(scope_signature),
+                        ),
+                    ),
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
         self.details_thumb_suppression_applied = false;
         if self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load() {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
@@ -23214,7 +23277,7 @@ impl App {
     /// 同期実行しており、大フォルダで数秒フリーズしていた。このメソッドでは
     /// スレッドを spawn し、結果は `poll_search` で受け取る。連打/新クエリで
     /// 既存検索をキャンセルできるよう `SearchPending.cancel` を立てる。
-    pub(crate) fn execute_search(&mut self) {
+    pub(crate) fn execute_search(&mut self, ctx: &egui::Context) {
         // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -23227,6 +23290,7 @@ impl App {
             self.search_filter_origin_folder = None;
             self.search_tag_bridge.clear();
             self.rebuild_visible_indices();
+            self.refresh_color_filter_for_scope_change(ctx);
             return;
         }
         self.search_filter_origin_folder = self.effective_folder();
@@ -23345,7 +23409,7 @@ impl App {
     /// 検索 in-flight 中は毎フレーム repaint を要求する必要がある (egui はアイドルで
     /// 寝るため、ワーカーが送信しても UI が拾いに来ない)。呼び出し元の update() が
     /// ctx.request_repaint() を最後に呼ぶのでそちらに任せる (個別 ctx 保持不要)。
-    pub(crate) fn poll_search(&mut self) {
+    pub(crate) fn poll_search(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.search_pending.as_ref() else {
             return;
         };
@@ -23365,6 +23429,7 @@ impl App {
                 self.selected = None;
                 self.scroll_offset_y = 0.0;
                 self.search_pending = None;
+                self.refresh_color_filter_for_scope_change(ctx);
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -36083,7 +36148,8 @@ impl eframe::App for App {
         self.poll_local_adjust_prefix_preview(ctx);
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
-        self.poll_search();
+        self.poll_search(ctx);
+        self.poll_color_scan(ctx);
         self.poll_favsearch();
         self.poll_tag_view();
         self.poll_metadata_load();

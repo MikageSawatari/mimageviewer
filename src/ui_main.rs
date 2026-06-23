@@ -5340,6 +5340,7 @@ impl App {
 
         let mut facet_changed = false;
         let mut rating_changed = false;
+        let mut color_changed = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
@@ -5353,6 +5354,9 @@ impl App {
                 facet_changed |= self.draw_facet_date_menu(ui);
                 facet_changed |= self.draw_facet_size_menu(ui);
                 facet_changed |= self.draw_facet_edit_menu(ui);
+                if self.color_filter_available_in_current_view() {
+                    color_changed |= self.draw_facet_color_menu(ui);
+                }
 
                 if self.facet_filter_suppressed() {
                     let resp = ui
@@ -5368,9 +5372,13 @@ impl App {
                     }
                 }
 
-                if self.facet_filter_active() || self.rating_filter_active() {
+                if self.facet_filter_active()
+                    || self.rating_filter_active()
+                    || self.color_filter.enabled
+                {
                     ui.separator();
                     self.draw_facet_active_chips(ui);
+                    self.draw_color_filter_active_chip(ui);
                     if ui.small_button("全解除").clicked() {
                         if self.facet_filter_active() {
                             self.settings.facet_filter.clear();
@@ -5379,6 +5387,10 @@ impl App {
                         if self.rating_filter_active() {
                             self.settings.rating_filter = crate::settings::default_rating_filter();
                             rating_changed = true;
+                        }
+                        if self.color_filter.enabled {
+                            self.color_filter.clear_filter();
+                            color_changed = true;
                         }
                     }
                 }
@@ -5391,10 +5403,21 @@ impl App {
         if rating_changed {
             self.drop_rating_filter_suppression_on_user_edit();
         }
+        let color_scope_changed = (facet_changed || rating_changed) && self.color_filter.enabled;
+        if color_scope_changed {
+            self.color_filter.applied_scope_signature = None;
+        }
         if facet_changed || rating_changed {
             self.settings.save();
             if rating_changed && self.global_search.active && self.items_are_global_search_view {
                 self.rebuild_items_from_global_search();
+            } else {
+                self.rebuild_visible_indices();
+            }
+        }
+        if color_changed || color_scope_changed {
+            if self.color_filter.enabled {
+                self.ensure_color_scan_for_current_scope(ctx);
             } else {
                 self.rebuild_visible_indices();
             }
@@ -5904,6 +5927,101 @@ impl App {
         changed
     }
 
+    fn draw_facet_color_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let active = usize::from(self.color_filter.enabled);
+        let menu = ui.menu_button(facet_menu_label("画像色", active), |ui| {
+            prepare_facet_menu_popup(ui);
+            let mut rgb = self.color_filter.query_rgb;
+            ui.horizontal(|ui| {
+                ui.label("画像色");
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    self.color_filter.query_rgb = rgb;
+                    if self.color_filter.enabled {
+                        changed = true;
+                    }
+                }
+                ui.label(crate::color_search::hex_rgb(rgb));
+            });
+
+            let mut tolerance = self.color_filter.tolerance;
+            if ui
+                .add(
+                    egui::Slider::new(
+                        &mut tolerance,
+                        crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
+                    )
+                    .text("許容範囲"),
+                )
+                .changed()
+            {
+                self.color_filter.tolerance = tolerance;
+                if self.color_filter_effectively_active() {
+                    changed = true;
+                }
+            }
+
+            if let Some(pending) = self.color_filter.pending.as_ref() {
+                ui.separator();
+                ui.label(format!(
+                    "画像色をスキャン中... {}/{}",
+                    pending.done, pending.total
+                ));
+                let progress = if pending.total == 0 {
+                    0.0
+                } else {
+                    pending.done as f32 / pending.total as f32
+                };
+                ui.add(egui::ProgressBar::new(progress).desired_width(160.0));
+                if ui.small_button("キャンセル").clicked() {
+                    self.color_filter.cancel_pending();
+                    self.color_filter.confirmation = None;
+                    self.color_filter.confirmed_large_scan_scope = None;
+                    self.color_filter.enabled = false;
+                    self.color_filter.applied_scope_signature = None;
+                    changed = true;
+                    ui.close();
+                }
+            } else if let Some(confirmation) = self.color_filter.confirmation.clone() {
+                ui.separator();
+                ui.label(format!(
+                    "未スキャンの画像 {} 件を確認します",
+                    confirmation.missing
+                ));
+                ui.horizontal(|ui| {
+                    if ui.small_button("スキャン開始").clicked() {
+                        self.confirm_large_color_scan(ui.ctx());
+                        changed = true;
+                        ui.close();
+                    }
+                    if ui.small_button("キャンセル").clicked() {
+                        self.cancel_large_color_scan_confirmation();
+                        changed = true;
+                        ui.close();
+                    }
+                });
+            }
+
+            ui.separator();
+            if ui.small_button("この画像色で絞り込み").clicked() {
+                self.color_filter.enabled = true;
+                changed = true;
+                ui.close();
+            }
+            if self.color_filter.enabled && ui.small_button("画像色フィルタを解除").clicked()
+            {
+                self.color_filter.clear_filter();
+                changed = true;
+                ui.close();
+            }
+        });
+        let menu_response = menu.response.on_hover_text(
+            "画像として扱える項目だけを、主要色で絞り込みます。動画やフォルダは対象外です。",
+        );
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
+        changed
+    }
+
     fn draw_facet_active_chips(&self, ui: &mut egui::Ui) {
         let filter = &self.settings.facet_filter;
         if !filter.kinds.is_empty() {
@@ -5998,6 +6116,32 @@ impl App {
             let values = values.join(",");
             facet_chip(ui, format!("状態:{values}"));
         }
+    }
+
+    fn draw_color_filter_active_chip(&self, ui: &mut egui::Ui) {
+        if !self.color_filter.enabled {
+            return;
+        }
+        let text = if let Some(pending) = self.color_filter.pending.as_ref() {
+            format!(
+                "画像色 {}: {}/{}",
+                crate::color_search::hex_rgb(self.color_filter.query_rgb),
+                pending.done,
+                pending.total
+            )
+        } else if let Some(confirmation) = self.color_filter.confirmation.as_ref() {
+            format!(
+                "画像色 {}: 確認待ち {}",
+                crate::color_search::hex_rgb(self.color_filter.query_rgb),
+                confirmation.missing
+            )
+        } else {
+            format!(
+                "画像色 {}",
+                crate::color_search::hex_rgb(self.color_filter.query_rgb)
+            )
+        };
+        facet_chip(ui, text);
     }
 
     fn facet_kind_counts(&mut self) -> BTreeMap<FacetItemKind, usize> {
@@ -6796,7 +6940,7 @@ impl App {
 
                 // Enter で検索実行 (IME 変換確定の Enter も同じ扱い)
                 if response.lost_focus() && raw_enter_pressed {
-                    self.execute_search();
+                    self.execute_search(ctx);
                     // フォーカスを外してカーソルキーでグリッド操作できるようにする
                     response.surrender_focus();
                     self.search_has_focus = false;
@@ -6813,6 +6957,7 @@ impl App {
                     self.search_tag_bridge.clear();
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
+                    self.refresh_color_filter_for_scope_change(ctx);
                 }
 
                 // ── 検索対象ドロップダウン (§19.7) ──
@@ -6842,7 +6987,7 @@ impl App {
                         self.search_target = next.to_target();
                         // クエリが空でなければ即再検索
                         if !self.search_query.trim().is_empty() {
-                            self.execute_search();
+                            self.execute_search(ctx);
                         }
                     }
                 }
@@ -6850,7 +6995,7 @@ impl App {
                 if crate::ui_helpers::or_mode_checkbox(ui, &mut self.search_or_mode)
                     && !self.search_query.trim().is_empty()
                 {
-                    self.execute_search();
+                    self.execute_search(ctx);
                 }
 
                 // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
@@ -6864,6 +7009,7 @@ impl App {
                     self.search_tag_bridge.clear();
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
+                    self.refresh_color_filter_for_scope_change(ctx);
                 }
 
                 // 検索中インジケータ or マッチ件数 (separator の後に表示)
