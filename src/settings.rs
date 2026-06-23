@@ -758,6 +758,86 @@ impl ToolbarSectionId {
 }
 
 // -----------------------------------------------------------------------
+// ToolbarFacetFilterItem (スマートフィルタバーに出すボタン)
+// -----------------------------------------------------------------------
+
+/// ツールバー下のスマートフィルタバーに表示するボタン。
+///
+/// `toolbar_facet_filter_items` は空 Vec を「ボタンを全部隠す」として扱うため、
+/// ここでは `ToolbarSectionId::ordered_with_fallback` のような空時 fallback は行わない。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolbarFacetFilterItem {
+    Kind,
+    Ext,
+    AiModel,
+    AiTool,
+    Rating,
+    Tags,
+    Date,
+    Size,
+    Edit,
+    Color,
+    /// 未知のボタン (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
+    #[serde(other)]
+    Unknown,
+}
+
+impl ToolbarFacetFilterItem {
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Kind,
+            Self::Ext,
+            Self::AiModel,
+            Self::AiTool,
+            Self::Rating,
+            Self::Tags,
+            Self::Date,
+            Self::Size,
+            Self::Edit,
+            Self::Color,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Kind => "種類",
+            Self::Ext => "拡張子",
+            Self::AiModel => "AIモデル",
+            Self::AiTool => "生成ツール",
+            Self::Rating => "★",
+            Self::Tags => "タグ",
+            Self::Date => "日付",
+            Self::Size => "サイズ",
+            Self::Edit => "状態",
+            Self::Color => "画像色",
+            Self::Unknown => "不明",
+        }
+    }
+
+    pub fn visible_order(saved: &[Self]) -> Vec<Self> {
+        let mut out = Vec::with_capacity(saved.len());
+        for &item in saved {
+            if item == Self::Unknown || !Self::all().contains(&item) {
+                continue;
+            }
+            if !out.contains(&item) {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    pub fn sort_like_default(items: &mut [Self]) {
+        items.sort_by_key(|item| {
+            Self::all()
+                .iter()
+                .position(|candidate| candidate == item)
+                .unwrap_or(usize::MAX)
+        });
+    }
+}
+
+// -----------------------------------------------------------------------
 // SortOrder
 // -----------------------------------------------------------------------
 
@@ -1866,6 +1946,30 @@ pub struct Settings {
     /// 画像を 1 つに畳む集約表示の ON/OFF。既定 true。
     #[serde(default = "default_true")]
     pub show_address_bar_stack_toggle: bool,
+    /// フォルダバーの「場所▼」に仮想ドライブ一覧を表示する。
+    #[serde(default = "default_true")]
+    pub show_location_drive_list: bool,
+    /// フォルダバーの「場所▼」に読書履歴を表示する。
+    #[serde(default = "default_true")]
+    pub show_location_reading_history: bool,
+    /// フォルダバーの「場所▼」にレーティング一覧サブメニューを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_rating: bool,
+    /// フォルダバーの「場所▼」に本棚フォルダを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_bookshelf: bool,
+    /// フォルダバーの「場所▼」にデスクトップを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_desktop: bool,
+    /// フォルダバーの「場所▼」にピクチャを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_pictures: bool,
+    /// フォルダバーの「場所▼」にダウンロードを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_downloads: bool,
+    /// フォルダバーの「場所▼」に利用可能な各ドライブ (`C:\` など) を表示する。
+    #[serde(default = "default_true")]
+    pub show_location_drive_roots: bool,
 
     // ── エクスプローラ連携 ────────────────────────────────────
     /// 実ファイル / 実フォルダの右クリックに Windows Shell の標準メニューを使う。
@@ -2124,6 +2228,10 @@ pub struct Settings {
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
+    /// スマートフィルタバーに表示するボタン。
+    /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
+    #[serde(default = "default_toolbar_facet_filter_items")]
+    pub toolbar_facet_filter_items: Vec<ToolbarFacetFilterItem>,
     /// ツールバーのセクション並び順 (v2.0.0)。空 = 既定順。
     /// `ToolbarSectionId::ordered_with_fallback` で未登録セクションを補完する。
     #[serde(default)]
@@ -3111,6 +3219,9 @@ pub(crate) fn default_toolbar_aspect_auto_visible() -> bool {
 pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
+pub(crate) fn default_toolbar_facet_filter_items() -> Vec<ToolbarFacetFilterItem> {
+    ToolbarFacetFilterItem::all().to_vec()
+}
 pub fn default_rating_filter() -> [bool; 6] {
     [true; 6]
 }
@@ -3292,6 +3403,14 @@ impl Default for Settings {
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
             show_address_bar_stack_toggle: true,
+            show_location_drive_list: true,
+            show_location_reading_history: true,
+            show_location_rating: true,
+            show_location_bookshelf: true,
+            show_location_desktop: true,
+            show_location_pictures: true,
+            show_location_downloads: true,
+            show_location_drive_roots: true,
             use_native_shell_context_menu: true,
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
@@ -3315,6 +3434,7 @@ impl Default for Settings {
             toolbar_tags_collapsed: false,
             toolbar_bookshelf_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
+            toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
             toolbar_section_order: Vec::new(),
             show_toolbar_cols: true,
             show_toolbar_aspect: true,
@@ -4463,6 +4583,8 @@ impl Settings {
         }
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
+        self.toolbar_facet_filter_items =
+            ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         // 手編集や移行で非有限 / 範囲外の名前列幅が混入しても安全にする
         // (列幅と同じ 40.0..=800.0 へ clamp。実行時もレイアウト側で clamp するが二重に守る)。
         if !self.details_name_width.is_finite() {
@@ -4593,6 +4715,7 @@ impl Settings {
         self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
+        self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
@@ -4608,6 +4731,14 @@ impl Settings {
         self.show_address_bar_history_menu = src.show_address_bar_history_menu;
         self.show_address_bar_folder_pin = src.show_address_bar_folder_pin;
         self.show_address_bar_stack_toggle = src.show_address_bar_stack_toggle;
+        self.show_location_drive_list = src.show_location_drive_list;
+        self.show_location_reading_history = src.show_location_reading_history;
+        self.show_location_rating = src.show_location_rating;
+        self.show_location_bookshelf = src.show_location_bookshelf;
+        self.show_location_desktop = src.show_location_desktop;
+        self.show_location_pictures = src.show_location_pictures;
+        self.show_location_downloads = src.show_location_downloads;
+        self.show_location_drive_roots = src.show_location_drive_roots;
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
         // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
@@ -4904,6 +5035,36 @@ mod tests {
             s.toolbar_section_new_row.is_empty(),
             "新規 new_row 集合は欠落時 空"
         );
+        assert_eq!(
+            s.toolbar_facet_filter_items,
+            ToolbarFacetFilterItem::all().to_vec(),
+            "絞り込みバーのボタンは旧 settings 欠落時に全表示"
+        );
+        assert!(
+            s.show_location_drive_list
+                && s.show_location_reading_history
+                && s.show_location_rating
+                && s.show_location_bookshelf
+                && s.show_location_desktop
+                && s.show_location_pictures
+                && s.show_location_downloads
+                && s.show_location_drive_roots,
+            "場所メニュー項目は旧 settings 欠落時に全表示"
+        );
+    }
+
+    #[test]
+    fn toolbar_facet_filter_items_dedup_unknown_but_preserve_empty() {
+        let v: Vec<ToolbarFacetFilterItem> =
+            serde_json::from_str(r#"["Ext","FutureFacet","Kind","Ext"]"#).unwrap();
+        assert_eq!(
+            ToolbarFacetFilterItem::visible_order(&v),
+            vec![ToolbarFacetFilterItem::Ext, ToolbarFacetFilterItem::Kind]
+        );
+        assert!(
+            ToolbarFacetFilterItem::visible_order(&[]).is_empty(),
+            "空 Vec は「全部隠す」として保持する"
+        );
     }
 
     #[test]
@@ -5054,6 +5215,18 @@ mod tests {
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
         assert!(s.show_address_bar_stack_toggle);
+        assert!(s.show_location_drive_list);
+        assert!(s.show_location_reading_history);
+        assert!(s.show_location_rating);
+        assert!(s.show_location_bookshelf);
+        assert!(s.show_location_desktop);
+        assert!(s.show_location_pictures);
+        assert!(s.show_location_downloads);
+        assert!(s.show_location_drive_roots);
+        assert_eq!(
+            s.toolbar_facet_filter_items,
+            ToolbarFacetFilterItem::all().to_vec()
+        );
         assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
@@ -6987,12 +7160,18 @@ mod tests {
             s.toolbar_favorites_collapsed = true;
             s.toolbar_tags_collapsed = true;
             s.toolbar_bookshelf_collapsed = true;
+            s.toolbar_facet_filter_items =
+                vec![ToolbarFacetFilterItem::Kind, ToolbarFacetFilterItem::Ext];
             s.pinned_books = vec!["テスト本".to_string()];
             s.show_toolbar_bookshelf = false;
             s.show_toolbar_facet_filter = false;
             s.show_toolbar_cols = false;
             s.show_toolbar_aspect = false;
             s.show_toolbar_sort = false;
+            s.show_location_reading_history = false;
+            s.show_location_rating = false;
+            s.show_location_downloads = false;
+            s.show_location_drive_roots = false;
             s.toolbar_section_new_row = vec![ToolbarSectionId::Tags, ToolbarSectionId::Favorites];
             s.ring_shortcuts.mouse_flick_enabled = true;
             s.ring_shortcuts.gamepad_ring_enabled = false;
@@ -7207,6 +7386,11 @@ mod tests {
                 "toolbar *_collapsed flags should survive roundtrip"
             );
             assert_eq!(
+                loaded.toolbar_facet_filter_items,
+                vec![ToolbarFacetFilterItem::Kind, ToolbarFacetFilterItem::Ext],
+                "toolbar_facet_filter_items should survive roundtrip"
+            );
+            assert_eq!(
                 loaded.pinned_books,
                 vec!["テスト本".to_string()],
                 "pinned_books should survive roundtrip"
@@ -7224,6 +7408,13 @@ mod tests {
                     && !loaded.show_toolbar_aspect
                     && !loaded.show_toolbar_sort,
                 "show_toolbar_cols/aspect/sort (false override) should survive roundtrip"
+            );
+            assert!(
+                !loaded.show_location_reading_history
+                    && !loaded.show_location_rating
+                    && !loaded.show_location_downloads
+                    && !loaded.show_location_drive_roots,
+                "location menu false overrides should survive roundtrip"
             );
             assert_eq!(
                 loaded.toolbar_section_new_row,

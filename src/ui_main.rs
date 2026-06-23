@@ -4988,6 +4988,14 @@ impl App {
         s.show_address_bar_history_menu = true;
         s.show_address_bar_folder_pin = true;
         s.show_address_bar_stack_toggle = true;
+        s.show_location_drive_list = true;
+        s.show_location_reading_history = true;
+        s.show_location_rating = true;
+        s.show_location_bookshelf = true;
+        s.show_location_desktop = true;
+        s.show_location_pictures = true;
+        s.show_location_downloads = true;
+        s.show_location_drive_roots = true;
         // 並び順 / 行頭 / ドラッグ許可
         s.toolbar_section_order = Vec::new();
         s.toolbar_section_new_row = Vec::new();
@@ -5009,6 +5017,7 @@ impl App {
         s.toolbar_aspect_items = crate::settings::default_toolbar_aspect_items();
         s.toolbar_aspect_auto_visible = crate::settings::default_toolbar_aspect_auto_visible();
         s.toolbar_sort_items = crate::settings::default_toolbar_sort_items();
+        s.toolbar_facet_filter_items = crate::settings::default_toolbar_facet_filter_items();
         s.save();
     }
 
@@ -5282,6 +5291,38 @@ impl App {
             .changed();
 
         ui.separator();
+        ui.label("場所▼に出す項目:");
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_drive_list, "ドライブ一覧")
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_reading_history, "読書履歴")
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_bookshelf, "本棚フォルダ")
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut self.settings.show_location_rating,
+                    "レーティングフォルダ",
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_desktop, "デスクトップ")
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_pictures, "ピクチャ")
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_downloads, "ダウンロード")
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.show_location_drive_roots, "各ドライブ")
+                .changed();
+        });
+
+        ui.separator();
         let mut clear_recent = false;
         let mut clear_quick = false;
         if ui.button("最近開いたフォルダ履歴をクリア").clicked() {
@@ -5447,18 +5488,39 @@ impl App {
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("絞り込み:").small());
-                facet_changed |= self.draw_facet_kind_menu(ui);
-                facet_changed |= self.draw_facet_ext_menu(ui);
-                facet_changed |= self.draw_facet_ai_model_menu(ui);
-                facet_changed |= self.draw_facet_ai_tool_menu(ui);
-                rating_changed |= self.draw_facet_rating_menu(ui);
-                facet_changed |= self.draw_facet_tag_menu(ui);
-                facet_changed |= self.draw_facet_date_menu(ui);
-                facet_changed |= self.draw_facet_size_menu(ui);
-                facet_changed |= self.draw_facet_edit_menu(ui);
-                if self.color_filter_available_in_current_view() {
-                    color_changed |= self.draw_facet_color_menu(ui);
+                ui.add(
+                    egui::Label::new(egui::RichText::new("絞り込み:").small())
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text("右クリック: 絞り込みバーの設定")
+                .context_menu(|ui| {
+                    self.draw_facet_filter_bar_settings_menu(ui);
+                });
+                let facet_items = crate::settings::ToolbarFacetFilterItem::visible_order(
+                    &self.settings.toolbar_facet_filter_items,
+                );
+                if facet_items.is_empty() {
+                    ui.label(egui::RichText::new("(右クリックでボタンを選択)").weak());
+                }
+                for item in facet_items {
+                    use crate::settings::ToolbarFacetFilterItem as FI;
+                    match item {
+                        FI::Kind => facet_changed |= self.draw_facet_kind_menu(ui),
+                        FI::Ext => facet_changed |= self.draw_facet_ext_menu(ui),
+                        FI::AiModel => facet_changed |= self.draw_facet_ai_model_menu(ui),
+                        FI::AiTool => facet_changed |= self.draw_facet_ai_tool_menu(ui),
+                        FI::Rating => rating_changed |= self.draw_facet_rating_menu(ui),
+                        FI::Tags => facet_changed |= self.draw_facet_tag_menu(ui),
+                        FI::Date => facet_changed |= self.draw_facet_date_menu(ui),
+                        FI::Size => facet_changed |= self.draw_facet_size_menu(ui),
+                        FI::Edit => facet_changed |= self.draw_facet_edit_menu(ui),
+                        FI::Color => {
+                            if self.color_filter_available_in_current_view() {
+                                color_changed |= self.draw_facet_color_menu(ui);
+                            }
+                        }
+                        FI::Unknown => {}
+                    }
                 }
 
                 if self.facet_filter_suppressed() {
@@ -5584,6 +5646,51 @@ impl App {
                     }
                 });
             });
+    }
+
+    fn draw_facet_filter_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
+        use crate::settings::ToolbarFacetFilterItem as FI;
+
+        ui.label(egui::RichText::new("絞り込みバー").strong());
+        ui.separator();
+        ui.label("表示するボタン:");
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            for &item in FI::all() {
+                let mut checked = self.settings.toolbar_facet_filter_items.contains(&item);
+                if ui.checkbox(&mut checked, item.label()).changed() {
+                    if checked {
+                        self.settings.toolbar_facet_filter_items.push(item);
+                        FI::sort_like_default(&mut self.settings.toolbar_facet_filter_items);
+                    } else {
+                        self.settings
+                            .toolbar_facet_filter_items
+                            .retain(|&candidate| candidate != item);
+                    }
+                    self.settings.toolbar_facet_filter_items =
+                        FI::visible_order(&self.settings.toolbar_facet_filter_items);
+                    changed = true;
+                }
+            }
+        });
+
+        ui.separator();
+        if ui
+            .button("絞り込みバーを隠す")
+            .on_hover_text(
+                "再表示はツールバーの空き領域を右クリック、または設定メニュー → ツールバー",
+            )
+            .clicked()
+        {
+            self.settings.show_toolbar_facet_filter = false;
+            changed = true;
+            ui.close();
+        }
+
+        if changed {
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
     }
 
     fn draw_facet_kind_menu(&mut self, ui: &mut egui::Ui) -> bool {
@@ -6667,37 +6774,78 @@ impl App {
 
                     let place_nav_enabled = !search_active && !snapshot_active;
                     ui.add_enabled_ui(place_nav_enabled, |ui| {
-                        ui.menu_button("場所▼", |ui| {
+                        let place_response = ui.menu_button("場所▼", |ui| {
                             ui.set_min_width(220.0);
-                            if ui.button("ドライブ一覧").clicked() {
+                            let mut drew_place_item = false;
+                            if self.settings.show_location_drive_list
+                                && ui.button("ドライブ一覧").clicked()
+                            {
                                 result = Some(AddressBarNav::DriveList(None));
                                 ui.close();
                             }
-                            if ui.button("読書履歴").clicked() {
+                            drew_place_item |= self.settings.show_location_drive_list;
+                            if self.settings.show_location_reading_history
+                                && ui.button("読書履歴").clicked()
+                            {
                                 result = Some(AddressBarNav::ReadingHistory);
                                 ui.close();
                             }
-                            ui.menu_button("レーティング", |ui| {
-                                for stars in 1..=5 {
-                                    if ui
-                                        .button(rating_view_menu_label(stars, rating_counts))
-                                        .clicked()
-                                    {
-                                        self.enter_rating_view(stars);
-                                        ui.close();
+                            drew_place_item |= self.settings.show_location_reading_history;
+                            if self.settings.show_location_rating {
+                                ui.menu_button("レーティング", |ui| {
+                                    for stars in 1..=5 {
+                                        if ui
+                                            .button(rating_view_menu_label(stars, rating_counts))
+                                            .clicked()
+                                        {
+                                            self.enter_rating_view(stars);
+                                            ui.close();
+                                        }
                                     }
-                                }
-                            });
-                            if ui
-                                .button("本棚フォルダ")
-                                .hover_tip(self.book_root_path().to_string_lossy().to_string())
-                                .clicked()
+                                });
+                                drew_place_item = true;
+                            }
+                            if self.settings.show_location_bookshelf
+                                && ui
+                                    .button("本棚フォルダ")
+                                    .hover_tip(self.book_root_path().to_string_lossy().to_string())
+                                    .clicked()
                             {
                                 result = Some(AddressBarNav::BooksRoot);
                                 ui.close();
                             }
-                            ui.separator();
-                            let quick_locations = crate::known_folders::quick_locations();
+                            drew_place_item |= self.settings.show_location_bookshelf;
+
+                            let mut quick_locations = Vec::new();
+                            let mut push_quick =
+                                |label: &'static str, path: Option<std::path::PathBuf>| {
+                                    let Some(path) = path else {
+                                        return;
+                                    };
+                                    if quick_locations.iter().any(
+                                        |existing: &crate::known_folders::QuickLocation| {
+                                            crate::folder_tree::path_eq(&existing.path, &path)
+                                        },
+                                    ) {
+                                        return;
+                                    }
+                                    quick_locations
+                                        .push(crate::known_folders::QuickLocation { label, path });
+                                };
+                            if self.settings.show_location_desktop {
+                                push_quick("デスクトップ", crate::known_folders::desktop_dir());
+                            }
+                            if self.settings.show_location_pictures {
+                                push_quick("ピクチャ", crate::known_folders::pictures_dir());
+                            }
+                            if self.settings.show_location_downloads {
+                                push_quick("ダウンロード", crate::known_folders::downloads_dir());
+                            }
+                            drop(push_quick);
+                            let drew_quick_locations = !quick_locations.is_empty();
+                            if drew_quick_locations && drew_place_item {
+                                ui.separator();
+                            }
                             for location in quick_locations {
                                 let full = location.path.to_string_lossy().to_string();
                                 if ui.button(location.label).hover_tip(&full).clicked() {
@@ -6709,23 +6857,33 @@ impl App {
                                     ui.close();
                                 }
                             }
+                            drew_place_item |= drew_quick_locations;
 
-                            let drives = crate::known_folders::available_drives();
-                            if !drives.is_empty() {
-                                ui.separator();
-                            }
-                            for drive in drives {
-                                let label = drive.to_string_lossy().to_string();
-                                if ui
-                                    .button(egui::RichText::new(&label).monospace())
-                                    .hover_tip(&label)
-                                    .clicked()
-                                {
-                                    if let Some(resolved) = resolve_folder_bar_nav_path(&drive) {
-                                        result = Some(AddressBarNav::Direct(resolved));
-                                    }
-                                    ui.close();
+                            if self.settings.show_location_drive_roots {
+                                let drives = crate::known_folders::available_drives();
+                                if !drives.is_empty() && drew_place_item {
+                                    ui.separator();
                                 }
+                                for drive in drives {
+                                    let label = drive.to_string_lossy().to_string();
+                                    if ui
+                                        .button(egui::RichText::new(&label).monospace())
+                                        .hover_tip(&label)
+                                        .clicked()
+                                    {
+                                        if let Some(resolved) =
+                                            resolve_folder_bar_nav_path(&drive)
+                                        {
+                                            result = Some(AddressBarNav::Direct(resolved));
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                drew_place_item = true;
+                            }
+
+                            if !drew_place_item {
+                                ui.label(egui::RichText::new("表示項目なし").weak());
                             }
                         })
                         .response
@@ -6735,6 +6893,9 @@ impl App {
                             "検索中は場所ジャンプを使用できません"
                         } else {
                             "デスクトップ / 主要フォルダ / ドライブへ移動"
+                        });
+                        place_response.context_menu(|ui| {
+                            self.draw_folder_bar_settings_menu(ui);
                         });
                     });
                     ui.add_space(4.0);
