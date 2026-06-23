@@ -274,6 +274,7 @@ impl App {
         self.rating_cache.clear();
         self.rotation_cache.clear();
         self.tags_cache.clear();
+        self.mark_color_filter_scope_dirty();
 
         self.snapshot = Some(SnapshotState {
             items: captured_entries,
@@ -441,9 +442,14 @@ impl App {
             //  解除は上の at_origin + pre_search_origin 分岐で load_folder に入るのでこちらは通らない。)
             let origin = snap.origin.clone();
             self.rehydrate_page_edit_state_for_current_items(&origin);
+            if self.color_filter.enabled {
+                self.mark_color_filter_scope_dirty();
+                self.rebuild_visible_indices();
+            }
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
             // visible_indices は filter / current_folder に対して再構築
+            self.mark_color_filter_scope_dirty();
             self.rebuild_visible_indices();
         }
         self.show_feedback_toast("★固定を解除しました".into());
@@ -526,6 +532,10 @@ impl App {
             self.clear_page_edit_state();
         } else {
             self.rehydrate_page_edit_state_for_current_items(&snap_origin);
+        }
+        if self.color_filter.enabled {
+            self.mark_color_filter_scope_dirty();
+            self.rebuild_visible_indices();
         }
         self.show_feedback_toast("★固定リストに戻りました".into());
         true

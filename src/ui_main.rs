@@ -297,12 +297,30 @@ fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> Strin
     format!("({:>width$}/{})", visible, total, width = width)
 }
 
+fn filtered_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
+    let total = items
+        .iter()
+        .filter(|item| counts_as_thumbnail_item(item))
+        .count();
+    let visible = visible_indices
+        .iter()
+        .filter_map(|&idx| items.get(idx))
+        .filter(|item| counts_as_thumbnail_item(item))
+        .count();
+    format!("{visible} / {total} 件")
+}
+
 fn facet_menu_label(base: &str, active: usize) -> String {
     if active == 0 {
         base.to_string()
     } else {
         format!("{base} ({active})")
     }
+}
+
+fn sticky_facet_menu_config() -> egui::containers::menu::MenuConfig {
+    egui::containers::menu::MenuConfig::new()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
 }
 
 fn prepare_facet_menu_popup(ui: &mut egui::Ui) {
@@ -5701,10 +5719,8 @@ impl App {
                     }
                 }
 
-                if self.facet_filter_active()
-                    || self.rating_filter_active()
-                    || self.color_filter.enabled
-                {
+                let rating_filter_visible = self.rating_filter_active() && !self.items_are_rating_view;
+                if self.facet_filter_active() || rating_filter_visible || self.color_filter.enabled {
                     ui.separator();
                     self.draw_facet_active_chips(ui);
                     self.draw_color_filter_active_chip(ui);
@@ -5713,7 +5729,7 @@ impl App {
                             self.settings.facet_filter.clear();
                             facet_changed = true;
                         }
-                        if self.rating_filter_active() {
+                        if rating_filter_visible {
                             self.settings.rating_filter = crate::settings::default_rating_filter();
                             rating_changed = true;
                         }
@@ -5724,7 +5740,10 @@ impl App {
                     }
                 }
                 ui.separator();
-                ui.label(egui::RichText::new(format!("{} 件", self.visible_indices.len())).small());
+                ui.label(
+                    egui::RichText::new(filtered_count_label(&self.items, &self.visible_indices))
+                        .small(),
+                );
             });
             ui.add_space(1.0);
         });
@@ -5858,84 +5877,86 @@ impl App {
     fn draw_facet_kind_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("種類", self.settings.facet_filter.kinds.len());
-        let menu = ui.menu_button(label, |ui| {
-            prepare_facet_menu_popup(ui);
-            let mut counts = self.facet_kind_counts();
-            for kind in &self.settings.facet_filter.kinds {
-                counts.entry(*kind).or_insert(0);
-            }
-            if self.settings.facet_filter.kinds.is_empty() {
-                ui.label("すべて");
-            } else if ui.small_button("種類フィルタを解除").clicked() {
-                self.settings.facet_filter.kinds.clear();
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            if counts.is_empty() {
-                ui.label("候補なし");
-            }
-            for (kind, count) in counts {
-                let mut selected = self.settings.facet_filter.kinds.contains(&kind);
-                let text = format!("{} ({count})", kind.label());
-                if ui.checkbox(&mut selected, text).changed() {
-                    if selected {
-                        self.settings.facet_filter.kinds.insert(kind);
-                    } else {
-                        self.settings.facet_filter.kinds.remove(&kind);
-                    }
-                    changed = true;
+        let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
+            .config(sticky_facet_menu_config())
+            .ui(ui, |ui| {
+                prepare_facet_menu_popup(ui);
+                let mut counts = self.facet_kind_counts();
+                for kind in &self.settings.facet_filter.kinds {
+                    counts.entry(*kind).or_insert(0);
                 }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+                if self.settings.facet_filter.kinds.is_empty() {
+                    ui.label("すべて");
+                } else if ui.small_button("種類フィルタを解除").clicked() {
+                    self.settings.facet_filter.kinds.clear();
+                    changed = true;
+                    ui.close();
+                }
+                ui.separator();
+                if counts.is_empty() {
+                    ui.label("候補なし");
+                }
+                for (kind, count) in counts {
+                    let mut selected = self.settings.facet_filter.kinds.contains(&kind);
+                    let text = format!("{} ({count})", kind.label());
+                    if ui.checkbox(&mut selected, text).changed() {
+                        if selected {
+                            self.settings.facet_filter.kinds.insert(kind);
+                        } else {
+                            self.settings.facet_filter.kinds.remove(&kind);
+                        }
+                        changed = true;
+                    }
+                }
+            });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
     fn draw_facet_ext_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("拡張子", self.settings.facet_filter.exts.len());
-        let menu = ui.menu_button(label, |ui| {
-            prepare_facet_menu_popup(ui);
-            let mut counts = self.facet_ext_counts();
-            for ext in &self.settings.facet_filter.exts {
-                counts.entry(ext.clone()).or_insert(0);
-            }
-            if self.settings.facet_filter.exts.is_empty() {
-                ui.label("すべて");
-            } else if ui.small_button("拡張子フィルタを解除").clicked() {
-                self.settings.facet_filter.exts.clear();
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            if counts.is_empty() {
-                ui.label("候補なし");
-            }
-            for (ext, count) in counts {
-                let mut selected = self.settings.facet_filter.exts.contains(&ext);
-                let text = format!(".{} ({count})", ext);
-                if ui.checkbox(&mut selected, text).changed() {
-                    if selected {
-                        self.settings.facet_filter.exts.insert(ext);
-                    } else {
-                        self.settings.facet_filter.exts.remove(&ext);
-                    }
-                    changed = true;
+        let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
+            .config(sticky_facet_menu_config())
+            .ui(ui, |ui| {
+                prepare_facet_menu_popup(ui);
+                let mut counts = self.facet_ext_counts();
+                for ext in &self.settings.facet_filter.exts {
+                    counts.entry(ext.clone()).or_insert(0);
                 }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+                if self.settings.facet_filter.exts.is_empty() {
+                    ui.label("すべて");
+                } else if ui.small_button("拡張子フィルタを解除").clicked() {
+                    self.settings.facet_filter.exts.clear();
+                    changed = true;
+                    ui.close();
+                }
+                ui.separator();
+                if counts.is_empty() {
+                    ui.label("候補なし");
+                }
+                for (ext, count) in counts {
+                    let mut selected = self.settings.facet_filter.exts.contains(&ext);
+                    let text = format!(".{} ({count})", ext);
+                    if ui.checkbox(&mut selected, text).changed() {
+                        if selected {
+                            self.settings.facet_filter.exts.insert(ext);
+                        } else {
+                            self.settings.facet_filter.exts.remove(&ext);
+                        }
+                        changed = true;
+                    }
+                }
+            });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
     fn draw_facet_place_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("場所", self.settings.facet_filter.place_keys.len());
-        let menu_config = egui::containers::menu::MenuConfig::new()
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
-            .config(menu_config)
+            .config(sticky_facet_menu_config())
             .ui(ui, |ui| {
                 prepare_place_facet_menu_popup(ui);
                 draw_sticky_settings_menu_header(ui, "場所");
@@ -5979,92 +6000,97 @@ impl App {
     fn draw_facet_ai_model_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("AIモデル", self.settings.facet_filter.ai_models.len());
-        let menu = ui.menu_button(label, |ui| {
-            prepare_ai_facet_menu_popup(ui);
-            self.request_ai_model_facet_load();
-            ui.ctx().request_repaint();
-            if !self.details_lazy_sort_ready() {
-                self.draw_ai_facet_loading_menu(ui);
-                return;
-            }
-            let mut counts = self.facet_ai_model_counts();
-            for model in &self.settings.facet_filter.ai_models {
-                counts.entry(model.clone()).or_insert(0);
-            }
-            if self.settings.facet_filter.ai_models.is_empty() {
-                ui.label("すべて");
-            } else if ui.small_button("AIモデルフィルタを解除").clicked() {
-                self.settings.facet_filter.ai_models.clear();
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            if counts.is_empty() {
-                ui.label("候補なし");
-            } else {
-                show_ai_facet_choices(ui, counts.len(), |ui| {
-                    for (model, count) in counts {
-                        let mut selected = self.settings.facet_filter.ai_models.contains(&model);
-                        let text = format!("{model} ({count})");
-                        if ui.checkbox(&mut selected, text).changed() {
-                            if selected {
-                                self.settings.facet_filter.ai_models.insert(model);
-                            } else {
-                                self.settings.facet_filter.ai_models.remove(&model);
+        let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
+            .config(sticky_facet_menu_config())
+            .ui(ui, |ui| {
+                prepare_ai_facet_menu_popup(ui);
+                self.request_ai_model_facet_load();
+                ui.ctx().request_repaint();
+                if !self.details_lazy_sort_ready() {
+                    self.draw_ai_facet_loading_menu(ui);
+                    return;
+                }
+                let mut counts = self.facet_ai_model_counts();
+                for model in &self.settings.facet_filter.ai_models {
+                    counts.entry(model.clone()).or_insert(0);
+                }
+                if self.settings.facet_filter.ai_models.is_empty() {
+                    ui.label("すべて");
+                } else if ui.small_button("AIモデルフィルタを解除").clicked() {
+                    self.settings.facet_filter.ai_models.clear();
+                    changed = true;
+                    ui.close();
+                }
+                ui.separator();
+                if counts.is_empty() {
+                    ui.label("候補なし");
+                } else {
+                    show_ai_facet_choices(ui, counts.len(), |ui| {
+                        for (model, count) in counts {
+                            let mut selected =
+                                self.settings.facet_filter.ai_models.contains(&model);
+                            let text = format!("{model} ({count})");
+                            if ui.checkbox(&mut selected, text).changed() {
+                                if selected {
+                                    self.settings.facet_filter.ai_models.insert(model);
+                                } else {
+                                    self.settings.facet_filter.ai_models.remove(&model);
+                                }
+                                changed = true;
                             }
-                            changed = true;
                         }
-                    }
-                });
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+                    });
+                }
+            });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
     fn draw_facet_ai_tool_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("生成ツール", self.settings.facet_filter.ai_tools.len());
-        let menu = ui.menu_button(label, |ui| {
-            prepare_ai_facet_menu_popup(ui);
-            self.request_ai_model_facet_load();
-            ui.ctx().request_repaint();
-            if !self.details_lazy_sort_ready() {
-                self.draw_ai_facet_loading_menu(ui);
-                return;
-            }
-            let mut counts = self.facet_ai_tool_counts();
-            for tool in &self.settings.facet_filter.ai_tools {
-                counts.entry(tool.clone()).or_insert(0);
-            }
-            if self.settings.facet_filter.ai_tools.is_empty() {
-                ui.label("すべて");
-            } else if ui.small_button("生成ツールフィルタを解除").clicked() {
-                self.settings.facet_filter.ai_tools.clear();
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            if counts.is_empty() {
-                ui.label("候補なし");
-            } else {
-                show_ai_facet_choices(ui, counts.len(), |ui| {
-                    for (tool, count) in counts {
-                        let mut selected = self.settings.facet_filter.ai_tools.contains(&tool);
-                        let text = format!("{tool} ({count})");
-                        if ui.checkbox(&mut selected, text).changed() {
-                            if selected {
-                                self.settings.facet_filter.ai_tools.insert(tool);
-                            } else {
-                                self.settings.facet_filter.ai_tools.remove(&tool);
+        let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
+            .config(sticky_facet_menu_config())
+            .ui(ui, |ui| {
+                prepare_ai_facet_menu_popup(ui);
+                self.request_ai_model_facet_load();
+                ui.ctx().request_repaint();
+                if !self.details_lazy_sort_ready() {
+                    self.draw_ai_facet_loading_menu(ui);
+                    return;
+                }
+                let mut counts = self.facet_ai_tool_counts();
+                for tool in &self.settings.facet_filter.ai_tools {
+                    counts.entry(tool.clone()).or_insert(0);
+                }
+                if self.settings.facet_filter.ai_tools.is_empty() {
+                    ui.label("すべて");
+                } else if ui.small_button("生成ツールフィルタを解除").clicked() {
+                    self.settings.facet_filter.ai_tools.clear();
+                    changed = true;
+                    ui.close();
+                }
+                ui.separator();
+                if counts.is_empty() {
+                    ui.label("候補なし");
+                } else {
+                    show_ai_facet_choices(ui, counts.len(), |ui| {
+                        for (tool, count) in counts {
+                            let mut selected = self.settings.facet_filter.ai_tools.contains(&tool);
+                            let text = format!("{tool} ({count})");
+                            if ui.checkbox(&mut selected, text).changed() {
+                                if selected {
+                                    self.settings.facet_filter.ai_tools.insert(tool);
+                                } else {
+                                    self.settings.facet_filter.ai_tools.remove(&tool);
+                                }
+                                changed = true;
                             }
-                            changed = true;
                         }
-                    }
-                });
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+                    });
+                }
+            });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
@@ -6092,29 +6118,37 @@ impl App {
     }
 
     fn draw_facet_rating_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        if self.items_are_rating_view {
+            ui.add_enabled(false, egui::Button::new("★ (固定)"))
+                .on_hover_text("レーティング一覧では★フィルタは対象★で固定されます。");
+            return false;
+        }
         let active = if self.rating_filter_active() { 1 } else { 0 };
         let mut changed = false;
-        let menu = ui.menu_button(facet_menu_label("★", active), |ui| {
-            prepare_facet_menu_popup(ui);
-            if ui.small_button("すべて表示").clicked() {
-                self.settings.rating_filter = crate::settings::default_rating_filter();
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            for idx in 0..6 {
-                let mut selected = self.settings.rating_filter[idx];
-                if ui
-                    .checkbox(&mut selected, rating_button_label(idx))
-                    .on_hover_text(rating_tooltip(idx))
-                    .changed()
-                {
-                    self.settings.rating_filter[idx] = selected;
-                    changed = true;
-                }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+        let (menu_response, _) =
+            egui::containers::menu::MenuButton::new(facet_menu_label("★", active))
+                .config(sticky_facet_menu_config())
+                .ui(ui, |ui| {
+                    prepare_facet_menu_popup(ui);
+                    if ui.small_button("すべて表示").clicked() {
+                        self.settings.rating_filter = crate::settings::default_rating_filter();
+                        changed = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    for idx in 0..6 {
+                        let mut selected = self.settings.rating_filter[idx];
+                        if ui
+                            .checkbox(&mut selected, rating_button_label(idx))
+                            .on_hover_text(rating_tooltip(idx))
+                            .changed()
+                        {
+                            self.settings.rating_filter[idx] = selected;
+                            changed = true;
+                        }
+                    }
+                });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
@@ -6122,11 +6156,9 @@ impl App {
         let active = self.settings.facet_filter.tags.len()
             + usize::from(self.settings.facet_filter.include_untagged);
         let mut changed = false;
-        let menu_config = egui::containers::menu::MenuConfig::new()
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let (menu_response, _) =
             egui::containers::menu::MenuButton::new(facet_menu_label("タグ", active))
-                .config(menu_config)
+                .config(sticky_facet_menu_config())
                 .ui(ui, |ui| {
                     prepare_facet_menu_popup(ui);
                     ui.set_width(TAG_FACET_MENU_WIDTH);
@@ -6336,7 +6368,9 @@ impl App {
     fn draw_facet_edit_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("状態", self.settings.facet_filter.edits.len());
-        let menu = ui.menu_button(label, |ui| {
+        let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
+            .config(sticky_facet_menu_config())
+            .ui(ui, |ui| {
             prepare_facet_menu_popup(ui);
             if self.settings.facet_filter.edits.is_empty() {
                 ui.label("すべて");
@@ -6374,7 +6408,7 @@ impl App {
                 }
             });
         });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
@@ -6382,11 +6416,9 @@ impl App {
         let mut changed = false;
         let active = usize::from(self.color_filter.enabled);
         self.color_filter.input_has_focus = false;
-        let menu_config = egui::containers::menu::MenuConfig::new()
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let (menu_response, _) =
             egui::containers::menu::MenuButton::new(facet_menu_label("画像色", active))
-                .config(menu_config)
+                .config(sticky_facet_menu_config())
                 .ui(ui, |ui| {
                     prepare_facet_menu_popup(ui);
                     ui.set_min_width(292.0);
@@ -6662,15 +6694,18 @@ impl App {
                 let mut b = self.color_filter.query_rgb[2] as i32;
                 let mut input_changed = false;
                 ui.horizontal(|ui| {
-                    input_changed |= ui
-                        .add(egui::DragValue::new(&mut r).range(0..=255).prefix("R "))
-                        .changed();
-                    input_changed |= ui
-                        .add(egui::DragValue::new(&mut g).range(0..=255).prefix("G "))
-                        .changed();
-                    input_changed |= ui
-                        .add(egui::DragValue::new(&mut b).range(0..=255).prefix("B "))
-                        .changed();
+                    let r_response =
+                        ui.add(egui::DragValue::new(&mut r).range(0..=255).prefix("R "));
+                    self.color_filter.input_has_focus |= r_response.has_focus();
+                    input_changed |= r_response.changed();
+                    let g_response =
+                        ui.add(egui::DragValue::new(&mut g).range(0..=255).prefix("G "));
+                    self.color_filter.input_has_focus |= g_response.has_focus();
+                    input_changed |= g_response.changed();
+                    let b_response =
+                        ui.add(egui::DragValue::new(&mut b).range(0..=255).prefix("B "));
+                    self.color_filter.input_has_focus |= b_response.has_focus();
+                    input_changed |= b_response.changed();
                 });
                 if input_changed {
                     changed |= self.set_image_color_query_from_ui([r as u8, g as u8, b as u8]);
@@ -6683,15 +6718,18 @@ impl App {
                 let mut l = (l * 100.0).round() as i32;
                 let mut input_changed = false;
                 ui.horizontal(|ui| {
-                    input_changed |= ui
-                        .add(egui::DragValue::new(&mut h).range(0..=360).prefix("H "))
-                        .changed();
-                    input_changed |= ui
-                        .add(egui::DragValue::new(&mut s).range(0..=100).prefix("S "))
-                        .changed();
-                    input_changed |= ui
-                        .add(egui::DragValue::new(&mut l).range(0..=100).prefix("L "))
-                        .changed();
+                    let h_response =
+                        ui.add(egui::DragValue::new(&mut h).range(0..=360).prefix("H "));
+                    self.color_filter.input_has_focus |= h_response.has_focus();
+                    input_changed |= h_response.changed();
+                    let s_response =
+                        ui.add(egui::DragValue::new(&mut s).range(0..=100).prefix("S "));
+                    self.color_filter.input_has_focus |= s_response.has_focus();
+                    input_changed |= s_response.changed();
+                    let l_response =
+                        ui.add(egui::DragValue::new(&mut l).range(0..=100).prefix("L "));
+                    self.color_filter.input_has_focus |= l_response.has_focus();
+                    input_changed |= l_response.changed();
                 });
                 if input_changed {
                     let rgb = crate::color_search::hsl_to_rgb(
@@ -6802,7 +6840,7 @@ impl App {
                 .join(",");
             facet_chip(ui, format!("生成ツール:{values}"));
         }
-        if self.rating_filter_active() {
+        if self.rating_filter_active() && !self.items_are_rating_view {
             let values = (0..6)
                 .filter(|&idx| self.settings.rating_filter[idx])
                 .map(rating_button_label)
@@ -6913,6 +6951,9 @@ impl App {
     }
 
     fn facet_place_counts(&mut self) -> BTreeMap<String, (String, usize)> {
+        if let Some(counts) = self.facet_place_counts_cache.as_ref() {
+            return counts.clone();
+        }
         let indices = self.facet_candidate_indices(FacetField::Place);
         let mut counts = BTreeMap::new();
         for idx in indices {
@@ -6927,6 +6968,7 @@ impl App {
             let entry = counts.entry(key).or_insert((label, 0));
             entry.1 += 1;
         }
+        self.facet_place_counts_cache = Some(counts.clone());
         counts
     }
 
@@ -10339,6 +10381,33 @@ mod rating_filter_op_tests {
         let visible_indices: Vec<usize> = (0..20).collect();
 
         assert_eq!(thumbnail_count_label(&items, &visible_indices), "( 20/100)");
+    }
+
+    #[test]
+    fn filtered_count_label_shows_visible_and_total_counts() {
+        let items: Vec<GridItem> = (0..300)
+            .map(|i| GridItem::Image(PathBuf::from(format!("img_{i}.jpg"))))
+            .collect();
+        let visible_indices: Vec<usize> = (0..123).collect();
+
+        assert_eq!(
+            filtered_count_label(&items, &visible_indices),
+            "123 / 300 件"
+        );
+    }
+
+    #[test]
+    fn filtered_count_label_ignores_zip_separators() {
+        let items = vec![
+            GridItem::Image(PathBuf::from("a.jpg")),
+            GridItem::ZipSeparator {
+                dir_display: "dir".into(),
+            },
+            GridItem::Image(PathBuf::from("b.jpg")),
+        ];
+        let visible_indices = vec![0, 1];
+
+        assert_eq!(filtered_count_label(&items, &visible_indices), "1 / 2 件");
     }
 
     #[test]

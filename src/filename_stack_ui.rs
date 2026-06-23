@@ -563,6 +563,7 @@ impl crate::app::App {
         self.scroll_hint
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.prewarm_rating_cache();
+        self.mark_color_filter_scope_dirty();
         // ★ visible_indices 再構築。stale index による範囲外参照 panic を防ぐ (Codex P1)。
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();

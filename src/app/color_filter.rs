@@ -6,6 +6,7 @@ struct ColorScanWorkItem {
 }
 
 const COLOR_SCAN_CONFIRM_MISSING_THRESHOLD: usize = 2_000;
+const MAX_COLOR_SCAN_MESSAGES_PER_FRAME: usize = 256;
 
 fn color_filter_item_supported(item: &crate::grid_item::GridItem) -> bool {
     item.has_page_data() || matches!(item, crate::grid_item::GridItem::Stack { .. })
@@ -49,6 +50,16 @@ impl App {
             self.color_filter.confirmed_large_scan_scope = None;
             self.ensure_color_scan_for_current_scope(ctx);
         }
+    }
+
+    pub(crate) fn mark_color_filter_scope_dirty(&mut self) {
+        if !self.color_filter.enabled {
+            return;
+        }
+        self.color_filter.applied_scope_signature = None;
+        self.color_filter.confirmation = None;
+        self.color_filter.confirmed_large_scan_scope = None;
+        self.color_filter_scope_refresh_pending = true;
     }
 
     pub(crate) fn confirm_large_color_scan(&mut self, ctx: &egui::Context) {
@@ -158,7 +169,8 @@ impl App {
 
         let mut finished = None;
         let mut disconnected = false;
-        loop {
+        let mut reached_frame_limit = true;
+        for _ in 0..MAX_COLOR_SCAN_MESSAGES_PER_FRAME {
             match pending.rx.try_recv() {
                 Ok(crate::color_search::ColorScanMessage::Item(item)) => {
                     pending.done = pending.done.saturating_add(1);
@@ -178,13 +190,18 @@ impl App {
                 }) => {
                     finished = Some((scan_id, scope_signature, cancelled));
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    reached_frame_limit = false;
+                    break;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     disconnected = true;
+                    reached_frame_limit = false;
                     break;
                 }
             }
         }
+        let hit_frame_limit = reached_frame_limit && finished.is_none() && !disconnected;
 
         if let Some((scan_id, scope_signature, cancelled)) = finished {
             let elapsed_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
@@ -281,6 +298,9 @@ impl App {
                     ],
                 );
             }
+        } else if hit_frame_limit {
+            ctx.request_repaint();
+            self.color_filter.pending = Some(pending);
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
             self.color_filter.pending = Some(pending);
@@ -296,12 +316,14 @@ impl App {
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
             self.color_filter.applied_scope_signature = None;
+            self.rebuild_visible_indices();
             return;
         }
         let Some(scope_signature) = self.color_current_scope_signature() else {
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
             self.color_filter.applied_scope_signature = None;
+            self.rebuild_visible_indices();
             return;
         };
 
@@ -349,6 +371,7 @@ impl App {
                 missing: work_items.len(),
             });
             self.color_filter.applied_scope_signature = None;
+            self.rebuild_visible_indices();
             if !same_confirmation {
                 self.show_feedback_toast(format!(
                     "画像色: {} 件のスキャン確認が必要です (画像色メニュー)",
@@ -374,6 +397,8 @@ impl App {
         self.color_filter.confirmed_large_scan_scope = None;
 
         let Some(cache_map) = self.current_color_cache_map.as_ref().cloned() else {
+            self.color_filter.applied_scope_signature = None;
+            self.rebuild_visible_indices();
             return;
         };
 
@@ -441,6 +466,7 @@ impl App {
             Err(e) => {
                 crate::logger::log(format!("color_scan: failed to spawn worker: {e}"));
                 self.color_filter.applied_scope_signature = None;
+                self.rebuild_visible_indices();
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "color",
@@ -568,8 +594,12 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<(crate::color_search::ColorPaletteKey, i64, i64)> {
-        self.color_work_identity_for_idx(idx)
-            .map(|(key, req)| (key, req.mtime, req.file_size))
+        let item = self.items.get(idx)?;
+        if !color_filter_item_supported(item) {
+            return None;
+        }
+        let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
+        Some((item.perf_key(), mtime, file_size))
     }
 
     fn color_work_identity_for_idx(

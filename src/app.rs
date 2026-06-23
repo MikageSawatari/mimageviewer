@@ -2869,6 +2869,10 @@ pub struct App {
     /// facet タグメニューの件数集計キャッシュ。タグ変更 (`invalidate_tag_apply_suggestions`)
     /// と表示集合変更 (`rebuild_visible_indices`) で破棄する。
     pub(crate) facet_tag_counts_cache: Option<(std::collections::BTreeMap<String, usize>, usize)>,
+    /// facet 場所メニューの件数集計キャッシュ。場所メニューはレーティング一覧などで
+    /// 開いたまま毎フレーム描画されるため、表示集合が変わるまで再利用する。
+    pub(crate) facet_place_counts_cache:
+        Option<std::collections::BTreeMap<String, (String, usize)>>,
     /// Ctrl+F のタグ橋渡し候補 (D17)。Ctrl+G と同様、検索実行時に tags.db を 1 回だけ
     /// 照会し、一致タグがあれば「タグビューで表示」チップを検索バー下に出す。
     /// タグは Ctrl+F の検索対象には混ぜない (§5.4 完全分離は不変)。
@@ -5512,6 +5516,7 @@ impl App {
             tag_apply_selection_cache: None,
             facet_tag_suggestion_cache: None,
             facet_tag_counts_cache: None,
+            facet_place_counts_cache: None,
             search_tag_bridge: Vec::new(),
             tag_maintenance_rx: None,
             tag_write_handle: None,
@@ -22573,8 +22578,9 @@ impl App {
         } else {
             None
         };
-        // 表示集合が変わると facet タグ件数も変わる (ui_main::facet_tag_counts)。
+        // 表示集合が変わると facet 件数も変わる (ui_main::facet_*_counts)。
         self.facet_tag_counts_cache = None;
+        self.facet_place_counts_cache = None;
         self.sync_facet_filter_scope();
         let search_filter = self.search_filter.clone();
         // Codex P1-2 fix: effective_rating_filter() で ★一時解除中は [true;6] が返るので

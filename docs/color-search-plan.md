@@ -70,6 +70,11 @@
 >   自動的に画像色フィルタを有効化し、ポップアップ内に「絞り込み準備中 N/M」を表示する方針へ。
 >   ポップアップは内部クリックでは閉じず、外側クリックで閉じる。画面スポイトは `GetPixel` の
 >   フレーム負荷とクリック入力の透過リスクが実機で目立ったため、画像色フィルタから完全に削除。
+> - **v2.0.0 追補レビュー後の修正 (2026-06-23)**: スタック集約/フラット切替や snapshot の
+>   in-place item 差し替えでも `ScanScopeSignature` を dirty にして差分スキャンを再評価する。
+>   UI 側の `ColorScanMessage` drain は 1 フレーム上限付きにし、大量画像スキャン完了時の hitch を避ける。
+>   RGB/HSL 数値入力中も HEX と同じくグリッドショートカットを抑止し、フィルタ適用判定では
+>   `make_load_request` を組み立てず `perf_key + mtime + size` の軽量 identity だけを見る。
 
 関連: [catalog-design.md](catalog-design.md)、[search-architecture.md](search-architecture.md)
 （Ctrl+F `execute_search` の worker パターン）、[ui-responsiveness.md](ui-responsiveness.md)（§4）、
