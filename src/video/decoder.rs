@@ -659,6 +659,8 @@ fn wait_before_gpu_output_allocation(
         ) {
             continue;
         }
+        // Keep this gate in sync with the post-blit pause park below; it must
+        // only block frames that the normal pacing loop would park after blit.
         if should_bypass_pacing_for_startup_first_frame(first_frame_delivered) {
             return VideoOutputReadiness::Ready;
         }
@@ -4019,6 +4021,8 @@ fn run_video_decode(
                                 ) {
                                     continue;
                                 }
+                                // Keep this gate in sync with
+                                // wait_before_gpu_output_allocation().
                                 if should_bypass_pacing_for_startup_first_frame(
                                     first_frame_delivered,
                                 ) {
@@ -4030,9 +4034,7 @@ fn run_video_decode(
                                 ) {
                                     break;
                                 }
-                                if engine_st == crate::video::engine::actor::state_code::PAUSED
-                                    || engine_st == crate::video::engine::actor::state_code::EOF
-                                {
+                                if engine_state_parks_decode(engine_st) {
                                     let now = std::time::Instant::now();
                                     if pause_park_last_log.is_none_or(|last| {
                                         now.duration_since(last)
@@ -4707,6 +4709,7 @@ fn run_video_decode(
                 ) {
                     continue;
                 }
+                // Keep this gate in sync with wait_before_gpu_output_allocation().
                 if should_bypass_pacing_for_startup_first_frame(first_frame_delivered) {
                     break;
                 }
@@ -4716,9 +4719,7 @@ fn run_video_decode(
                 ) {
                     break;
                 }
-                if engine_st == crate::video::engine::actor::state_code::PAUSED
-                    || engine_st == crate::video::engine::actor::state_code::EOF
-                {
+                if engine_state_parks_decode(engine_st) {
                     let now = std::time::Instant::now();
                     if pause_park_last_log.is_none_or(|last| {
                         now.duration_since(last) >= std::time::Duration::from_secs(2)
