@@ -487,8 +487,8 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
   `DeleteItem` を予約し、チャンクごとに `PerformOperations` を 1 回だけ呼ぶ。
   mIV 側の削除確認 / 進捗 UI を正とするため通常の Shell UI は抑制しつつ、
   ゴミ箱不可時の完全削除警告 (`FOF_WANTNUKEWARNING`) は残す。mIV 側キャンセルは
-  チャンク間で判定し、Shell 側の中断は `GetAnyOperationsAborted` と削除後の
-  存在確認で結果に反映する。
+  チャンク間で判定する。Shell 側の中断は `GetAnyOperationsAborted` と削除後の
+  存在確認でチャンク内の失敗として反映し、それだけでは未処理チャンクを捨てない。
 
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 

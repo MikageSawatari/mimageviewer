@@ -10,8 +10,8 @@
 //!   Vista+ の後継 API である `IFileOperation` に対象をまとめて予約し、
 //!   `PerformOperations` をチャンクごとに 1 回だけ呼ぶ。
 //! - **チャンク = cancel / UI 進捗粒度**: チャンク完了ごとに `DeleteMsg::Batch` を送り、
-//!   チャンク間で mIV 側キャンセルを受け付ける。Shell 標準 UI 側のキャンセルは
-//!   `GetAnyOperationsAborted` と削除後の存在確認で反映する。
+//!   チャンク間で mIV 側キャンセルを受け付ける。Shell 側の中断はチャンク内の
+//!   失敗として扱い、未処理チャンクを捨てない。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,6 +101,18 @@ fn run_worker(
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
 ) {
+    run_worker_with_recycler(paths, hwnd, cancel, tx, recycle_chunk);
+}
+
+fn run_worker_with_recycler<F>(
+    paths: Vec<PathBuf>,
+    hwnd: isize,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<DeleteMsg>,
+    mut recycle: F,
+) where
+    F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
+{
     for chunk in paths.chunks(FILE_OPERATION_CHUNK_SIZE) {
         if cancel.load(Ordering::Relaxed) {
             let _ = tx.send(DeleteMsg::Done { canceled: true });
@@ -108,7 +120,7 @@ fn run_worker(
         }
 
         let t0 = std::time::Instant::now();
-        let outcome = recycle_chunk(hwnd, chunk);
+        let outcome = recycle(hwnd, chunk);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "delete",
@@ -129,7 +141,10 @@ fn run_worker(
                         "failed",
                         serde_json::Value::from(outcome.failed.len() as u64),
                     ),
-                    ("canceled", serde_json::Value::from(outcome.canceled)),
+                    (
+                        "shell_aborted",
+                        serde_json::Value::from(outcome.shell_aborted),
+                    ),
                 ],
             );
         }
@@ -137,7 +152,6 @@ fn run_worker(
         for (path, msg) in &outcome.failed {
             crate::logger::log(format!("[delete] failed: {}: {msg}", path.display()));
         }
-        let canceled = outcome.canceled;
         if tx
             .send(DeleteMsg::Batch {
                 succeeded: outcome.succeeded,
@@ -147,7 +161,7 @@ fn run_worker(
         {
             return;
         }
-        if canceled {
+        if cancel.load(Ordering::Relaxed) {
             let _ = tx.send(DeleteMsg::Done { canceled: true });
             return;
         }
@@ -160,7 +174,7 @@ fn run_worker(
 struct DeleteChunkOutcome {
     succeeded: Vec<PathBuf>,
     failed: Vec<(PathBuf, String)>,
-    canceled: bool,
+    shell_aborted: bool,
 }
 
 impl DeleteChunkOutcome {
@@ -172,7 +186,7 @@ impl DeleteChunkOutcome {
                 .cloned()
                 .map(|path| (path, message.clone()))
                 .collect(),
-            canceled: false,
+            shell_aborted: false,
         }
     }
 }
@@ -306,12 +320,12 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
         return DeleteChunkOutcome {
             succeeded,
             failed,
-            canceled: false,
+            shell_aborted: false,
         };
     }
 
     let perform_error = unsafe { op.PerformOperations() }.err();
-    let aborted = unsafe { op.GetAnyOperationsAborted() }
+    let shell_aborted = unsafe { op.GetAnyOperationsAborted() }
         .map(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -319,10 +333,10 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
         if path_is_gone(&path) {
             succeeded.push(path);
         } else {
-            let msg = if aborted {
-                "削除がキャンセルされました".to_string()
-            } else if let Some(e) = &perform_error {
+            let msg = if let Some(e) = &perform_error {
                 format!("削除に失敗しました: {e}")
+            } else if shell_aborted {
+                "Shell 操作が中断されました".to_string()
             } else {
                 "削除後も対象が残っています".to_string()
             };
@@ -333,7 +347,7 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
     DeleteChunkOutcome {
         succeeded,
         failed,
-        canceled: aborted,
+        shell_aborted,
     }
 }
 
@@ -359,6 +373,86 @@ fn wide_null_path(path: &std::path::Path) -> Vec<u16> {
 #[cfg(windows)]
 fn path_is_gone(path: &std::path::Path) -> bool {
     path.try_exists().map(|exists| !exists).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn dummy_paths(count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|idx| PathBuf::from(format!(r"C:\tmp\delete-test-{idx}.jpg")))
+            .collect()
+    }
+
+    fn failed_outcome(paths: &[PathBuf], shell_aborted: bool) -> DeleteChunkOutcome {
+        DeleteChunkOutcome {
+            succeeded: Vec::new(),
+            failed: paths
+                .iter()
+                .cloned()
+                .map(|path| (path, "simulated failure".to_string()))
+                .collect(),
+            shell_aborted,
+        }
+    }
+
+    fn batch_counts(msg: &DeleteMsg) -> (usize, usize) {
+        match msg {
+            DeleteMsg::Batch { succeeded, failed } => (succeeded.len(), failed.len()),
+            DeleteMsg::Done { .. } => panic!("expected Batch"),
+        }
+    }
+
+    fn done_canceled(msg: &DeleteMsg) -> bool {
+        match msg {
+            DeleteMsg::Done { canceled } => *canceled,
+            DeleteMsg::Batch { .. } => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn worker_continues_after_shell_aborted_chunk() {
+        let paths = dummy_paths(FILE_OPERATION_CHUNK_SIZE + 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut calls = 0usize;
+
+        run_worker_with_recycler(paths, 0, cancel, tx, |_hwnd, chunk| {
+            calls += 1;
+            failed_outcome(chunk, calls == 1)
+        });
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(calls, 2, "shell_aborted chunk must not stop later chunks");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(batch_counts(&messages[0]), (0, FILE_OPERATION_CHUNK_SIZE));
+        assert_eq!(batch_counts(&messages[1]), (0, 1));
+        assert!(!done_canceled(&messages[2]));
+    }
+
+    #[test]
+    fn worker_stops_after_miv_cancel_at_chunk_boundary() {
+        let paths = dummy_paths(FILE_OPERATION_CHUNK_SIZE + 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_recycler = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let mut calls = 0usize;
+
+        run_worker_with_recycler(paths, 0, cancel, tx, |_hwnd, chunk| {
+            calls += 1;
+            cancel_for_recycler.store(true, Ordering::Relaxed);
+            failed_outcome(chunk, false)
+        });
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(calls, 1, "mIV cancel should stop before the next chunk");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(batch_counts(&messages[0]), (0, FILE_OPERATION_CHUNK_SIZE));
+        assert!(done_canceled(&messages[1]));
+    }
 }
 
 #[cfg(all(test, windows))]

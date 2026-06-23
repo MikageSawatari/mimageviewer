@@ -227,7 +227,9 @@ Implementation status:
   `FOFX_RECYCLEONDELETE` and `FOF_WANTNUKEWARNING`, suppresses routine Shell UI
   because the existing mIV delete confirmation/progress UI owns that path,
   checks `GetAnyOperationsAborted`, and classifies per-path success by verifying
-  the target path disappeared after the Shell operation.
+  the target path disappeared after the Shell operation. A Shell-side abort is
+  reported as failures for that chunk; only the mIV progress dialog cancel stops
+  later chunks.
 - Copy/move/drop replacement is still pending.
 
 Public API sketch:
