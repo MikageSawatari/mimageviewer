@@ -10357,6 +10357,13 @@ mod favorite_adjustment_defaults_tests {
         // アドレスバー
         app.address_has_focus = true;
         assert!(app.shortcuts_blocked_by_text_input());
+        app.address_has_focus = false;
+        // 画像色 HEX 入力
+        app.color_filter.input_has_focus = true;
+        assert!(
+            app.shortcuts_blocked_by_text_input(),
+            "画像色 HEX 入力中も BS / F などを grid ショートカットに漏らさない"
+        );
     }
 
     /// 削除確認ダイアログの文言は対象パスのドライブ種別・ゴミ箱設定で変わるため、

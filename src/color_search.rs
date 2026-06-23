@@ -118,6 +118,7 @@ pub struct ColorFilterState {
     pub tolerance: f32,
     pub input_mode: ColorInputMode,
     pub hex_input: String,
+    pub input_has_focus: bool,
     pub picker_hue_degrees: f32,
     pub palettes: ScanPalettes,
     pub pending: Option<ColorScanPending>,
@@ -135,6 +136,7 @@ impl Default for ColorFilterState {
             tolerance: DEFAULT_TOLERANCE,
             input_mode: ColorInputMode::default(),
             hex_input: hex_rgb(DEFAULT_QUERY_RGB),
+            input_has_focus: false,
             picker_hue_degrees: hue,
             palettes: ScanPalettes::default(),
             pending: None,
@@ -157,6 +159,7 @@ impl ColorFilterState {
         self.confirmation = None;
         self.confirmed_large_scan_scope = None;
         self.enabled = false;
+        self.input_has_focus = false;
         self.applied_scope_signature = None;
     }
 
@@ -165,6 +168,7 @@ impl ColorFilterState {
         self.confirmation = None;
         self.confirmed_large_scan_scope = None;
         self.enabled = false;
+        self.input_has_focus = false;
         self.applied_scope_signature = None;
         self.palettes.clear();
     }

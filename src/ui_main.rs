@@ -6180,6 +6180,7 @@ impl App {
     fn draw_facet_color_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let active = usize::from(self.color_filter.enabled);
+        self.color_filter.input_has_focus = false;
         let menu_config = egui::containers::menu::MenuConfig::new()
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let (menu_response, _) =
@@ -6440,6 +6441,7 @@ impl App {
                             .char_limit(7)
                             .hint_text("RRGGBB"),
                     );
+                    self.color_filter.input_has_focus |= response.has_focus();
                     if response.changed()
                         && let Some(rgb) =
                             crate::color_search::parse_hex_rgb(&self.color_filter.hex_input)

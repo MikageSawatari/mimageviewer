@@ -19867,6 +19867,7 @@ impl App {
             || self.favsearch.has_focus
             || self.global_search.has_focus
             || self.tag_view.has_focus
+            || self.color_filter.input_has_focus
     }
 
     fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
