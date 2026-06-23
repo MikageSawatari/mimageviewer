@@ -2,24 +2,25 @@
 //!
 //! ## 設計
 //!
-//! 別スレッドで `SHFileOperationW` をパス単位で呼び、結果を `DeleteMsg` として
-//! `mpsc::Receiver` 経由で UI に返す。
+//! 別スレッドで Windows Shell の `IFileOperation` をチャンク単位で呼び、結果を
+//! `DeleteMsg` として `mpsc::Receiver` 経由で UI に返す。
 //!
-//! - **1 パスずつ実行**: `SHFileOperationW` の複数パス一括呼び出しは一部のパス
-//!   条件下で `result == 0` を返しつつ実際には削除しない症状が再現したため採用せず
-//!   (2026-04 の v0.8.1 検証で判明)。perf 差は syscall overhead のみで 10-20ms/path。
-//! - **バッチ = UI 進捗粒度**: 10 件ごとに `DeleteMsg::Batch` を送り進捗更新する
-//!   (100-200ms おき)。
+//! - **チャンク単位で実行**: 旧 `SHFileOperationW` の複数パス一括呼び出しは一部のパス
+//!   条件下で `result == 0` を返しつつ実際には削除しない症状が再現したため採用しない。
+//!   Vista+ の後継 API である `IFileOperation` に対象をまとめて予約し、
+//!   `PerformOperations` をチャンクごとに 1 回だけ呼ぶ。
+//! - **チャンク = cancel / UI 進捗粒度**: チャンク完了ごとに `DeleteMsg::Batch` を送り、
+//!   チャンク間で mIV 側キャンセルを受け付ける。Shell 標準 UI 側のキャンセルは
+//!   `GetAnyOperationsAborted` と削除後の存在確認で反映する。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-/// 1 メッセージにまとめる処理件数。UI 進捗更新の粒度。
-/// 小さいほど進捗がなめらかに動くが mpsc オーバーヘッドが増える。10 は
-/// 「進捗 100-200ms おきに更新 / メッセージ数 ~100」の折衷。
-const BATCH_SIZE: usize = 10;
+/// 1 回の `IFileOperation::PerformOperations` にまとめる最大件数。
+/// 大きいほど Shell の固定費を畳めるが、mIV 側キャンセルはチャンク間でしか効かない。
+const FILE_OPERATION_CHUNK_SIZE: usize = 100;
 
 /// ワーカーから UI への進捗通知。
 #[derive(Debug)]
@@ -58,7 +59,7 @@ impl DeletePending {
 }
 
 /// 削除ワーカーを spawn する。`paths` のファイル / フォルダをゴミ箱に移動し、進捗を返す。
-pub fn spawn(paths: Vec<PathBuf>) -> DeletePending {
+pub fn spawn(paths: Vec<PathBuf>, hwnd: Option<isize>) -> DeletePending {
     let total = paths.len();
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -69,7 +70,7 @@ pub fn spawn(paths: Vec<PathBuf>) -> DeletePending {
     let spawn_result = std::thread::Builder::new()
         .name("delete-worker".into())
         .spawn(move || {
-            run_worker(paths, cancel_worker, tx_worker);
+            run_worker(paths, hwnd.unwrap_or_default(), cancel_worker, tx_worker);
         });
     if let Err(e) = spawn_result {
         let message = format!("削除 worker を開始できません: {e}");
@@ -94,30 +95,60 @@ pub fn spawn(paths: Vec<PathBuf>) -> DeletePending {
     }
 }
 
-fn run_worker(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>, tx: mpsc::Sender<DeleteMsg>) {
-    for chunk in paths.chunks(BATCH_SIZE) {
+fn run_worker(
+    paths: Vec<PathBuf>,
+    hwnd: isize,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<DeleteMsg>,
+) {
+    for chunk in paths.chunks(FILE_OPERATION_CHUNK_SIZE) {
         if cancel.load(Ordering::Relaxed) {
             let _ = tx.send(DeleteMsg::Done { canceled: true });
             return;
         }
 
-        let mut succeeded = Vec::with_capacity(chunk.len());
-        let mut failed = Vec::new();
-        for p in chunk {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(DeleteMsg::Batch { succeeded, failed });
-                let _ = tx.send(DeleteMsg::Done { canceled: true });
-                return;
-            }
-            match recycle_one(p) {
-                Ok(()) => succeeded.push(p.clone()),
-                Err(msg) => {
-                    crate::logger::log(format!("[delete] failed: {}: {msg}", p.display()));
-                    failed.push((p.clone(), msg));
-                }
-            }
+        let t0 = std::time::Instant::now();
+        let outcome = recycle_chunk(hwnd, chunk);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "delete",
+                "shell_chunk",
+                Some("ifileoperation"),
+                0,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("count", serde_json::Value::from(chunk.len() as u64)),
+                    (
+                        "succeeded",
+                        serde_json::Value::from(outcome.succeeded.len() as u64),
+                    ),
+                    (
+                        "failed",
+                        serde_json::Value::from(outcome.failed.len() as u64),
+                    ),
+                    ("canceled", serde_json::Value::from(outcome.canceled)),
+                ],
+            );
         }
-        if tx.send(DeleteMsg::Batch { succeeded, failed }).is_err() {
+
+        for (path, msg) in &outcome.failed {
+            crate::logger::log(format!("[delete] failed: {}: {msg}", path.display()));
+        }
+        let canceled = outcome.canceled;
+        if tx
+            .send(DeleteMsg::Batch {
+                succeeded: outcome.succeeded,
+                failed: outcome.failed,
+            })
+            .is_err()
+        {
+            return;
+        }
+        if canceled {
+            let _ = tx.send(DeleteMsg::Done { canceled: true });
             return;
         }
     }
@@ -126,63 +157,230 @@ fn run_worker(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Del
     });
 }
 
-/// SHFileOperationW (削除) のフラグ。**FOF_WANTNUKEWARNING を必ず含める**こと。
+struct DeleteChunkOutcome {
+    succeeded: Vec<PathBuf>,
+    failed: Vec<(PathBuf, String)>,
+    canceled: bool,
+}
+
+impl DeleteChunkOutcome {
+    fn all_failed(paths: &[PathBuf], message: String) -> Self {
+        Self {
+            succeeded: Vec::new(),
+            failed: paths
+                .iter()
+                .cloned()
+                .map(|path| (path, message.clone()))
+                .collect(),
+            canceled: false,
+        }
+    }
+}
+
+/// `IFileOperation` (削除) のフラグ。**FOF_WANTNUKEWARNING を必ず含める**こと。
 /// 含めないと、ゴミ箱に入れられない対象 (容量超過 / ゴミ箱無効ボリューム / リムーバブル /
-/// ネットワーク共有) で完全削除へフォールバックする際に FOF_NOCONFIRMATION が確認を抑制し、
-/// UI が約束した「ゴミ箱へ移動」に反して原本が無言で完全削除される
-/// (v1.0.0 データ整合性レビュー DI-1)。
+/// ネットワーク共有) で完全削除へフォールバックする際の警告が出ない構成へ退行しうる。
+/// Shell UI は抑制せず、標準の確認 / エラー UI に任せる。
 #[cfg(windows)]
-const RECYCLE_FLAGS: u32 = {
+fn recycle_flags() -> windows::Win32::UI::Shell::FILEOPERATION_FLAGS {
     use windows::Win32::UI::Shell::{
-        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+        FOF_ALLOWUNDO, FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE,
     };
-    FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0 | FOF_WANTNUKEWARNING.0
-};
+    FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING
+}
 
-/// 単一パス (ファイルまたはフォルダ) を `SHFileOperationW` で削除する。
+/// 複数パス (ファイルまたはフォルダ) を 1 回の `IFileOperation` で削除する。
 #[cfg(windows)]
-fn recycle_one(path: &std::path::Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::UI::Shell::{FO_DELETE, SHFILEOPSTRUCTW, SHFileOperationW};
-
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .chain(std::iter::once(0))
-        .collect();
-    let flags = RECYCLE_FLAGS as u16;
-    let mut op = SHFILEOPSTRUCTW {
-        wFunc: FO_DELETE,
-        pFrom: windows::core::PCWSTR(wide.as_ptr()),
-        fFlags: flags,
-        ..Default::default()
+fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
+    use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
     };
-    let result = unsafe { SHFileOperationW(&mut op) };
-    if result == 0 && !op.fAnyOperationsAborted.as_bool() {
-        Ok(())
-    } else {
-        Err(format!("SHFileOperationW failed: code={result}"))
+    use windows::Win32::UI::Shell::{
+        FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
+        SHCreateItemFromParsingName,
+    };
+    use windows::core::{IUnknown, PCWSTR};
+
+    struct ComStaGuard {
+        uninitialize: bool,
+    }
+
+    impl ComStaGuard {
+        fn new() -> Result<Self, String> {
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if hr.is_ok() {
+                Ok(Self { uninitialize: true })
+            } else if hr == RPC_E_CHANGED_MODE {
+                Ok(Self {
+                    uninitialize: false,
+                })
+            } else {
+                Err(format!("CoInitializeEx(STA) failed: 0x{:08x}", hr.0))
+            }
+        }
+    }
+
+    impl Drop for ComStaGuard {
+        fn drop(&mut self) {
+            if self.uninitialize {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let _com = match ComStaGuard::new() {
+        Ok(guard) => guard,
+        Err(err) => return DeleteChunkOutcome::all_failed(paths, err),
+    };
+    let op: IFileOperation = match unsafe {
+        CoCreateInstance(&FileOperation, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+    } {
+        Ok(op) => op,
+        Err(e) => {
+            return DeleteChunkOutcome::all_failed(
+                paths,
+                format!("IFileOperation を作成できません: {e}"),
+            );
+        }
+    };
+
+    if hwnd != 0
+        && let Err(e) = unsafe { op.SetOwnerWindow(HWND(hwnd as *mut core::ffi::c_void)) }
+    {
+        return DeleteChunkOutcome::all_failed(
+            paths,
+            format!("Shell 操作の owner window を設定できません: {e}"),
+        );
+    }
+    if let Err(e) = unsafe { op.SetOperationFlags(recycle_flags()) } {
+        return DeleteChunkOutcome::all_failed(
+            paths,
+            format!("Shell 操作フラグを設定できません: {e}"),
+        );
+    }
+
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut scheduled = Vec::new();
+    for path in paths {
+        let wide = wide_null_path(path);
+        let item: IShellItem = match unsafe {
+            SHCreateItemFromParsingName(
+                PCWSTR(wide.as_ptr()),
+                None::<&windows::Win32::System::Com::IBindCtx>,
+            )
+        } {
+            Ok(item) => item,
+            Err(e) => {
+                if path_is_gone(path) {
+                    succeeded.push(path.clone());
+                } else {
+                    failed.push((path.clone(), format!("対象を開けません: {e}")));
+                }
+                continue;
+            }
+        };
+        if let Err(e) = unsafe { op.DeleteItem(&item, None::<&IFileOperationProgressSink>) } {
+            if path_is_gone(path) {
+                succeeded.push(path.clone());
+            } else {
+                failed.push((path.clone(), format!("削除を予約できません: {e}")));
+            }
+            continue;
+        }
+        scheduled.push(path.clone());
+    }
+
+    if scheduled.is_empty() {
+        return DeleteChunkOutcome {
+            succeeded,
+            failed,
+            canceled: false,
+        };
+    }
+
+    let perform_error = unsafe { op.PerformOperations() }.err();
+    let aborted = unsafe { op.GetAnyOperationsAborted() }
+        .map(|v| v.as_bool())
+        .unwrap_or(false);
+
+    for path in scheduled {
+        if path_is_gone(&path) {
+            succeeded.push(path);
+        } else {
+            let msg = if aborted {
+                "削除がキャンセルされました".to_string()
+            } else if let Some(e) = &perform_error {
+                format!("削除に失敗しました: {e}")
+            } else {
+                "削除後も対象が残っています".to_string()
+            };
+            failed.push((path, msg));
+        }
+    }
+
+    DeleteChunkOutcome {
+        succeeded,
+        failed,
+        canceled: aborted,
     }
 }
 
 #[cfg(not(windows))]
-fn recycle_one(_path: &std::path::Path) -> Result<(), String> {
-    Err("recycle bin not supported on this platform".into())
+fn recycle_chunk(_hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
+    DeleteChunkOutcome::all_failed(
+        paths,
+        "recycle bin not supported on this platform".to_string(),
+    )
+}
+
+#[cfg(windows)]
+fn wide_null_path(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .map(|ch| if ch == b'/' as u16 { b'\\' as u16 } else { ch })
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn path_is_gone(path: &std::path::Path) -> bool {
+    path.try_exists().map(|exists| !exists).unwrap_or(false)
 }
 
 #[cfg(all(test, windows))]
 mod tests {
-    use windows::Win32::UI::Shell::FOF_WANTNUKEWARNING;
+    use windows::Win32::UI::Shell::{
+        FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE,
+    };
 
     #[test]
     fn recycle_flags_include_nuke_warning() {
         // DI-1 回帰ガード: FOF_WANTNUKEWARNING が外れると、ゴミ箱不可時に無言で完全削除
         // されるようになってしまう。削除フラグから外さないこと。
         assert_ne!(
-            super::RECYCLE_FLAGS & FOF_WANTNUKEWARNING.0,
+            super::recycle_flags().0 & FOF_WANTNUKEWARNING.0,
             0,
             "FOF_WANTNUKEWARNING must stay set so non-recyclable targets prompt before permanent delete"
+        );
+    }
+
+    #[test]
+    fn recycle_flags_request_recycle_without_suppressing_shell_ui() {
+        let flags = super::recycle_flags().0;
+        assert_ne!(
+            flags & FOFX_RECYCLEONDELETE.0,
+            0,
+            "IFileOperation delete must target the recycle bin"
+        );
+        assert_eq!(
+            flags & (FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0),
+            0,
+            "Shell confirmation/error/progress UI must remain available for delete safety"
         );
     }
 }

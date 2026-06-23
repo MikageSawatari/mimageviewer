@@ -483,7 +483,10 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
   呼ぶ。`remove_items_batch` は降順 idx 配列を受け取り、items/thumbnails/image_metas の
   物理 shift + `items_generation` bump + `adjustment_page_params` / `mask_pages` /
   `search_filter` の O(K log K) idx shift + `invalidate_idx_state_and_queues` を行う。
-  キャンセルは各ファイルの `SHFileOperationW` 呼び出し前に判定 (1 件あたり 10-20ms)。
+  ゴミ箱移動は `delete_worker` が Windows Shell `IFileOperation` へ最大 100 件ずつ
+  `DeleteItem` を予約し、チャンクごとに `PerformOperations` を 1 回だけ呼ぶ。
+  mIV 側キャンセルはチャンク間で判定し、Shell 標準 UI 側のキャンセルは
+  `GetAnyOperationsAborted` と削除後の存在確認で結果に反映する。
 
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 

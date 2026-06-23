@@ -14964,7 +14964,7 @@ impl App {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.global_search.pending = None;
-        self.delete_pending = Some(crate::delete_worker::spawn(paths));
+        self.delete_pending = Some(crate::delete_worker::spawn(paths, self.main_hwnd));
     }
 
     /// 毎フレーム `delete_pending` の進捗メッセージを受信する。

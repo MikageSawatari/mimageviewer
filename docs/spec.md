@@ -892,7 +892,9 @@ Explorer の SendTo 起動側が数秒単位で残らないようにする。
 同じ設定ページで `use_native_shell_context_menu` を切り替えられる。既定 ON のとき、
 実ファイル / 実フォルダの右クリックは Win32 `IContextMenu` による Windows 標準メニューを使う。
 mIV 独自項目はメニュー先頭に追加し、名前変更は mIV の入力ダイアログから
-`IFileOperation::RenameItem` で実行する。Shell 側のコピー / カット / ペースト /
+`IFileOperation::RenameItem` で実行する。Delete キー / mIV 独自メニューの削除は
+バックグラウンド worker から `IFileOperation::DeleteItem` をチャンク単位で使い、
+通常はゴミ箱へ移動する。Shell 側のコピー / カット / ペースト /
 プロパティ / 関連付けアプリ / 拡張メニューはそのまま表示する。背景右クリックでは現在表示中の
 実フォルダだけ Shell 背景メニューを使う。背景メニューには mIV 先頭項目として「新しいフォルダ...」と「貼り付け」も出し、Shell の New サブメニューのインライン編集前提を避けつつ、Shell 側の Paste が表示されない環境でも同じ Shell `paste` verb を実行できる。ZIP/PDF 内ページ、ZIP 内ディレクトリ、検索コンテナ、仮想項目を含む
 チェック選択では、ファイルコピー / カット / ペーストを含まない mIV 独自メニューを使う。

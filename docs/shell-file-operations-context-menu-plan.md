@@ -1,9 +1,9 @@
 # Shell file operations and native context menu plan
 
 Status: mixed. Folder A/B quick workspaces and the real-file native Shell
-context menu are implemented. `IFileOperation` copy/move/delete replacement and
-Win32 custom menus for ZIP/PDF virtual items remain for later implementation
-sessions.
+context menu are implemented. `IFileOperation` delete-to-recycle and rename are
+implemented. `IFileOperation` copy/move/drop replacement and Win32 custom menus
+for ZIP/PDF virtual items remain for later implementation sessions.
 
 ## 1. Goal
 
@@ -59,8 +59,9 @@ Useful existing facts:
 
 - `src/file_drag.rs` already creates Shell `IDataObject` values from paths and
   calls `SHDoDragDrop`.
-- `src/delete_worker.rs` already moves files to the recycle bin with
-  `SHFileOperationW`, one path at a time.
+- `src/delete_worker.rs` moves files to the recycle bin on a background worker
+  with `IFileOperation`, batching up to 100 real paths per Shell operation and
+  keeping mIV's existing progress/result channel.
 - `src/ui_dialogs/context_menu.rs` still uses PowerShell for Explorer-to-mIV
   dropped-file copy. The old egui file copy/cut/paste clipboard helpers have
   been removed; folders remain skipped in the drop path until `IFileOperation`
@@ -216,6 +217,17 @@ Settings:
 ## 6. `IFileOperation` layer
 
 Add a Windows-only module, tentatively `src/shell_file_ops.rs`.
+
+Implementation status:
+
+- Rename is implemented in `src/shell_file_ops.rs` with
+  `IFileOperation::RenameItem`.
+- Delete-to-recycle is implemented in `src/delete_worker.rs` with
+  chunked `IFileOperation::DeleteItem` + `PerformOperations`. The worker keeps
+  `FOFX_RECYCLEONDELETE` and `FOF_WANTNUKEWARNING`, does not suppress Shell UI,
+  checks `GetAnyOperationsAborted`, and classifies per-path success by verifying
+  the target path disappeared after the Shell operation.
+- Copy/move/drop replacement is still pending.
 
 Public API sketch:
 
@@ -540,8 +552,9 @@ Status: implemented.
 
 ### Phase 2 - `IFileOperation` worker
 
-- Add `src/shell_file_ops.rs`.
-- Implement direct copy/move/delete/rename requests for real paths.
+- Add `src/shell_file_ops.rs`. Status: rename implemented.
+- Implement direct copy/move/delete/rename requests for real paths. Status:
+  delete-to-recycle and rename implemented; copy/move pending.
 - Replace `copy_paths_into_folder` internals.
 - Re-enable folder paste/drop only through `IFileOperation`.
 - Preserve the current search-view guard so paste/drop cannot target stale
