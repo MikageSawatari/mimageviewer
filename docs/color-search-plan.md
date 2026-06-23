@@ -1,6 +1,6 @@
 # カラー検索（色で絞り込み）機能 設計計画
 
-> ステータス: **Phase 1/2 + Phase 3 実装済み（Codex 実装 + ClaudeCode レビュー/追補、2026-06-23）**。今回リリースの対象ビューは通常フォルダ / ZIP / PDF 表示に固定（集約ビューは見送り確定）。マニュアル（grid.html）・製品ページ（index.html）更新済み。UI snapshot は任意（既存 facet バー snapshot は無く、追加は forward-looking なので未実施）。
+> ステータス: **Phase 1/2 + Phase 3 実装済み（Codex 実装 + ClaudeCode レビュー/追補、2026-06-23）**。今回リリースの対象ビューは通常フォルダ / ZIP / PDF 表示に固定（集約ビューは見送り確定）。Eagle 風の色指定 UI（SV 面 + Hue、プリセット、HEX/RGB/HSL 入力、Windows 画面スポイト + アプリ内ルーペ）まで実装済み。マニュアル（grid.html）・製品ページ（index.html）更新済み。UI snapshot は任意（既存 facet バー snapshot は無く、追加は forward-looking なので未実施）。
 > Eagle for Windows のカラー検索を参考に、mIV のグリッド表示を「指定した色を主要色として
 > 含む画像」で絞り込む機能を追加する。
 
@@ -63,6 +63,10 @@
 >   `color_filter_available_in_current_view()` を見て案内トースト + 非有効化（不活性チップ防止）。
 >   マニュアル（grid.html「画像色で絞り込む」節）・製品ページ（index.html 機能カード）を更新。
 >   残: 集約ビュー開放（見送り確定）、UI snapshot（任意）。
+> - **Codex 追補 (2026-06-23、Eagle 風ピッカー)**: 最小 `egui::color_edit_button_srgb` から、
+>   メニュー内完結の SV 面 + Hue スライダ、通常色プリセット、HEX/RGB/HSL 入力、Windows 画面スポイトへ
+>   置き換え。スポイトは `GetPixel` でカーソル周辺のみを軽量取得し、アプリ内では小さなルーペを描画する。
+>   Eagle 先頭 2 つの特殊色（透明/白黒系と推定）は通常 RGB クエリと意味が違うため初版では未実装。
 
 関連: [catalog-design.md](catalog-design.md)、[search-architecture.md](search-architecture.md)
 （Ctrl+F `execute_search` の worker パターン）、[ui-responsiveness.md](ui-responsiveness.md)（§4）、
@@ -343,7 +347,8 @@ struct ScanPalettes {
   `settings.facet_filter` / `settings.save()` は経由しない。種類/拡張子/★/タグ等と同じ
   「現在の表示を絞り込む」枠の隣に出すイメージ。動画/フォルダは対象外なので、UI 名も
   画像のみの色フィルタであることが伝わる表現にする。
-- **コントロール**: カラーピッカー（egui、HEX/RGB 入力可）+ 許容範囲スライダ + クリア。
+- **コントロール**: メニュー内完結のカラーピッカー（SV 面 + Hue スライダ）+ 通常色プリセット +
+  HEX/RGB/HSL 入力 + Windows 画面スポイト（アプリ内ではルーペ表示）+ 許容範囲スライダ + クリア。
 - **スキャン中 UI**: 色フィルタを有効化した瞬間に「画像色をスキャン中… N/M」+ プログレス +
   キャンセル。キャンセルしたらフィルタ未適用に戻す。
 - **大量時確認 UI**: missing/stale が非常に多い場合は即スキャンせず、「未スキャンの画像 N 件」を
@@ -436,7 +441,8 @@ Eagle はサムネ/プレビュー下に**抽出済みパレットをスウォ�
    - 通常フォルダ / ZIP / PDF 限定で開始。
 3. **Phase 3 — companion + 仕上げ** 一部実装済み
    - 実装済み: メタデータパネルのパレット表示（§7.1、decode 済み CPU バッファのみ）+
-     スウォッチクリックで画像色フィルタ起動、perf 計装、大量 missing 時確認 UI、画像色表記。
+     スウォッチクリックで画像色フィルタ起動、perf 計装、大量 missing 時確認 UI、画像色表記、
+     Eagle 風ピッカー（SV/Hue、プリセット、HEX/RGB/HSL、スポイト）。
    - 後続: 集約ビュー開放の可否判断（§9）、スナップショット、マニュアル/製品ページ更新。
 
 ---

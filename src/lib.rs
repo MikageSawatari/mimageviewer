@@ -105,6 +105,7 @@ pub mod rating_write_worker;
 pub mod ring_shortcut;
 pub mod rotation_db;
 pub mod save_with_metadata;
+pub mod screen_color_picker;
 pub mod search_index_db;
 pub mod search_norm;
 pub mod search_query;

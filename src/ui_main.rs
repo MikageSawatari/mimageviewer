@@ -37,6 +37,20 @@ const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
 const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
+const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
+    [86, 86, 86],
+    [255, 255, 255],
+    [178, 178, 178],
+    [185, 154, 118],
+    [240, 142, 184],
+    [255, 79, 79],
+    [255, 181, 106],
+    [255, 218, 91],
+    [101, 202, 160],
+    [100, 199, 201],
+    [81, 142, 229],
+    [124, 98, 232],
+];
 
 #[derive(Clone, Copy)]
 enum BookReorderScrollKey {
@@ -386,6 +400,85 @@ fn draw_tag_view_menu_section(
 
 fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text.into()).small().strong());
+}
+
+fn draw_image_color_eyedropper_loupe(
+    ctx: &egui::Context,
+    sample: &crate::screen_color_picker::ScreenColorSample,
+) {
+    let Some(pointer_pos) = ctx.pointer_hover_pos() else {
+        return;
+    };
+    let side = sample.side();
+    if side == 0 {
+        return;
+    }
+    let tile = 8.0;
+    let padding = 8.0;
+    let diameter = side as f32 * tile + padding * 2.0;
+    let screen_rect = ctx.content_rect();
+    let mut pos = pointer_pos + egui::vec2(24.0, 24.0);
+    if pos.x + diameter > screen_rect.right() {
+        pos.x = pointer_pos.x - diameter - 18.0;
+    }
+    if pos.y + diameter > screen_rect.bottom() {
+        pos.y = pointer_pos.y - diameter - 18.0;
+    }
+    pos.x = pos.x.max(screen_rect.left() + 4.0);
+    pos.y = pos.y.max(screen_rect.top() + 4.0);
+
+    egui::Area::new(egui::Id::new("image_color_eyedropper_loupe"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            let center = rect.center();
+            let outer_r = diameter * 0.5;
+            let grid_r = outer_r - padding;
+            painter.circle_filled(center, outer_r, egui::Color32::from_gray(235));
+            painter.circle_stroke(
+                center,
+                outer_r - 0.5,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+            );
+            let grid_min = center - egui::vec2(side as f32 * tile, side as f32 * tile) * 0.5;
+            for y in 0..side {
+                for x in 0..side {
+                    let cell_center =
+                        grid_min + egui::vec2((x as f32 + 0.5) * tile, (y as f32 + 0.5) * tile);
+                    if cell_center.distance(center) > grid_r {
+                        continue;
+                    }
+                    if let Some(rgb) = sample.pixel(x, y) {
+                        let cell = egui::Rect::from_center_size(
+                            cell_center,
+                            egui::vec2(tile + 0.25, tile + 0.25),
+                        );
+                        painter.rect_filled(
+                            cell,
+                            0.0,
+                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                        );
+                    }
+                }
+            }
+            let center_cell =
+                egui::Rect::from_center_size(center, egui::vec2(tile * 1.35, tile * 1.35));
+            painter.rect_stroke(
+                center_cell,
+                egui::CornerRadius::same(1),
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::epaint::StrokeKind::Outside,
+            );
+            painter.rect_stroke(
+                center_cell.expand(1.5),
+                egui::CornerRadius::same(2),
+                egui::Stroke::new(1.0, egui::Color32::BLACK),
+                egui::epaint::StrokeKind::Outside,
+            );
+        });
 }
 
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
@@ -6142,34 +6235,20 @@ impl App {
         let active = usize::from(self.color_filter.enabled);
         let menu = ui.menu_button(facet_menu_label("画像色", active), |ui| {
             prepare_facet_menu_popup(ui);
-            let mut rgb = self.color_filter.query_rgb;
-            ui.horizontal(|ui| {
-                ui.label("画像色");
-                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                    self.color_filter.query_rgb = rgb;
-                    if self.color_filter.enabled {
-                        changed = true;
-                    }
-                }
-                ui.label(crate::color_search::hex_rgb(rgb));
-            });
-
-            let mut tolerance = self.color_filter.tolerance;
-            if ui
-                .add(
-                    egui::Slider::new(
-                        &mut tolerance,
-                        crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
-                    )
-                    .text("許容範囲"),
-                )
-                .changed()
-            {
-                self.color_filter.tolerance = tolerance;
-                if self.color_filter_effectively_active() {
-                    changed = true;
-                }
-            }
+            ui.set_min_width(292.0);
+            self.draw_image_color_picker_header(ui);
+            ui.add_space(6.0);
+            changed |= self.draw_image_color_sv_square(ui);
+            ui.add_space(6.0);
+            changed |= self.draw_image_color_hue_slider(ui);
+            ui.add_space(8.0);
+            changed |= self.draw_image_color_presets(ui);
+            ui.add_space(6.0);
+            changed |= self.draw_image_color_inputs(ui);
+            ui.add_space(6.0);
+            changed |= self.draw_image_color_eyedropper(ui);
+            ui.add_space(4.0);
+            changed |= self.draw_image_color_tolerance(ui);
 
             if let Some(pending) = self.color_filter.pending.as_ref() {
                 ui.separator();
@@ -6230,6 +6309,337 @@ impl App {
         );
         suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
+    }
+
+    fn draw_image_color_picker_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            self.draw_image_color_swatch(ui, self.color_filter.query_rgb, egui::vec2(28.0, 28.0));
+            ui.vertical(|ui| {
+                ui.label("画像色");
+                ui.label(
+                    egui::RichText::new(crate::color_search::hex_rgb(self.color_filter.query_rgb))
+                        .monospace()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
+        });
+    }
+
+    fn draw_image_color_sv_square(&mut self, ui: &mut egui::Ui) -> bool {
+        let desired = egui::vec2(268.0, 156.0);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let hue = self.color_filter.picker_hue_degrees;
+        let columns = 40usize;
+        let rows = 24usize;
+        let cell_w = rect.width() / columns as f32;
+        let cell_h = rect.height() / rows as f32;
+        for row in 0..rows {
+            for col in 0..columns {
+                let saturation = col as f32 / (columns - 1) as f32;
+                let value = 1.0 - row as f32 / (rows - 1) as f32;
+                let rgb = crate::color_search::hsv_to_rgb(hue, saturation, value);
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.min.x + col as f32 * cell_w,
+                        rect.min.y + row as f32 * cell_h,
+                    ),
+                    egui::vec2(cell_w + 0.5, cell_h + 0.5),
+                );
+                painter.rect_filled(cell, 0.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            }
+        }
+
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::epaint::StrokeKind::Outside,
+        );
+
+        let (_, saturation, value) = crate::color_search::rgb_to_hsv(self.color_filter.query_rgb);
+        let marker = egui::pos2(
+            rect.left() + saturation * rect.width(),
+            rect.top() + (1.0 - value) * rect.height(),
+        );
+        painter.circle_stroke(marker, 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+        painter.circle_stroke(marker, 7.5, egui::Stroke::new(1.0, egui::Color32::BLACK));
+
+        if (response.dragged() || response.clicked())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let saturation = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let value = (1.0 - (pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+            let rgb = crate::color_search::hsv_to_rgb(hue, saturation, value);
+            return self.set_image_color_query_from_ui(rgb);
+        }
+        false
+    }
+
+    fn draw_image_color_hue_slider(&mut self, ui: &mut egui::Ui) -> bool {
+        let desired = egui::vec2(268.0, 16.0);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let segments = 72usize;
+        let segment_w = rect.width() / segments as f32;
+        for i in 0..segments {
+            let hue = i as f32 / segments as f32 * 360.0;
+            let rgb = crate::color_search::hsv_to_rgb(hue, 1.0, 1.0);
+            let segment = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + i as f32 * segment_w, rect.min.y),
+                egui::vec2(segment_w + 0.5, rect.height()),
+            );
+            painter.rect_filled(
+                segment,
+                0.0,
+                egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+            );
+        }
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::epaint::StrokeKind::Outside,
+        );
+        let hue = self.color_filter.picker_hue_degrees.rem_euclid(360.0);
+        let x = rect.left() + hue / 360.0 * rect.width();
+        painter.line_segment(
+            [
+                egui::pos2(x, rect.top() - 3.0),
+                egui::pos2(x, rect.bottom() + 3.0),
+            ],
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(x + 1.5, rect.top() - 2.0),
+                egui::pos2(x + 1.5, rect.bottom() + 2.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::BLACK),
+        );
+
+        if (response.dragged() || response.clicked())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let hue = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * 360.0;
+            self.color_filter.picker_hue_degrees = hue;
+            let (_, saturation, value) =
+                crate::color_search::rgb_to_hsv(self.color_filter.query_rgb);
+            let saturation = if saturation < 0.01 { 1.0 } else { saturation };
+            let value = if value < 0.01 { 1.0 } else { value };
+            let rgb = crate::color_search::hsv_to_rgb(hue, saturation, value);
+            return self.set_image_color_query_from_ui(rgb);
+        }
+        false
+    }
+
+    fn draw_image_color_presets(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            for rgb in COLOR_FILTER_PRESETS {
+                let size = egui::vec2(24.0, 24.0);
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                let fill = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                ui.painter()
+                    .rect_filled(rect, egui::CornerRadius::same(5), fill);
+                let selected = self.color_filter.query_rgb == rgb;
+                let stroke = if selected {
+                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+                } else {
+                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                };
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(5),
+                    stroke,
+                    egui::epaint::StrokeKind::Outside,
+                );
+                if response
+                    .on_hover_text(crate::color_search::hex_rgb(rgb))
+                    .clicked()
+                {
+                    changed |= self.set_image_color_query_from_ui(rgb);
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_image_color_inputs(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            for (mode, label) in [
+                (crate::color_search::ColorInputMode::Hex, "HEX"),
+                (crate::color_search::ColorInputMode::Rgb, "RGB"),
+                (crate::color_search::ColorInputMode::Hsl, "HSL"),
+            ] {
+                if ui
+                    .selectable_label(self.color_filter.input_mode == mode, label)
+                    .clicked()
+                {
+                    self.color_filter.input_mode = mode;
+                }
+            }
+        });
+        match self.color_filter.input_mode {
+            crate::color_search::ColorInputMode::Hex => {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.color_filter.hex_input)
+                            .desired_width(118.0)
+                            .char_limit(7)
+                            .hint_text("RRGGBB"),
+                    );
+                    if response.changed()
+                        && let Some(rgb) =
+                            crate::color_search::parse_hex_rgb(&self.color_filter.hex_input)
+                    {
+                        changed |= self.set_image_color_query_from_ui(rgb);
+                    }
+                });
+            }
+            crate::color_search::ColorInputMode::Rgb => {
+                let mut r = self.color_filter.query_rgb[0] as i32;
+                let mut g = self.color_filter.query_rgb[1] as i32;
+                let mut b = self.color_filter.query_rgb[2] as i32;
+                let mut input_changed = false;
+                ui.horizontal(|ui| {
+                    input_changed |= ui
+                        .add(egui::DragValue::new(&mut r).range(0..=255).prefix("R "))
+                        .changed();
+                    input_changed |= ui
+                        .add(egui::DragValue::new(&mut g).range(0..=255).prefix("G "))
+                        .changed();
+                    input_changed |= ui
+                        .add(egui::DragValue::new(&mut b).range(0..=255).prefix("B "))
+                        .changed();
+                });
+                if input_changed {
+                    changed |= self.set_image_color_query_from_ui([r as u8, g as u8, b as u8]);
+                }
+            }
+            crate::color_search::ColorInputMode::Hsl => {
+                let (h, s, l) = crate::color_search::rgb_to_hsl(self.color_filter.query_rgb);
+                let mut h = h.round() as i32;
+                let mut s = (s * 100.0).round() as i32;
+                let mut l = (l * 100.0).round() as i32;
+                let mut input_changed = false;
+                ui.horizontal(|ui| {
+                    input_changed |= ui
+                        .add(egui::DragValue::new(&mut h).range(0..=360).prefix("H "))
+                        .changed();
+                    input_changed |= ui
+                        .add(egui::DragValue::new(&mut s).range(0..=100).prefix("S "))
+                        .changed();
+                    input_changed |= ui
+                        .add(egui::DragValue::new(&mut l).range(0..=100).prefix("L "))
+                        .changed();
+                });
+                if input_changed {
+                    let rgb = crate::color_search::hsl_to_rgb(
+                        h as f32,
+                        s as f32 / 100.0,
+                        l as f32 / 100.0,
+                    );
+                    changed |= self.set_image_color_query_from_ui(rgb);
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn poll_image_color_eyedropper(&mut self, ctx: &egui::Context) {
+        if !self.color_filter.eyedropper_active {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.color_filter.eyedropper_active = false;
+            self.color_filter.eyedropper_last_primary_down = false;
+            ctx.request_repaint();
+            return;
+        }
+
+        if let Some(sample) = crate::screen_color_picker::sample_cursor(8) {
+            if self.set_image_color_query_from_ui(sample.center_rgb) {
+                self.ensure_color_scan_for_current_scope(ctx);
+            }
+            draw_image_color_eyedropper_loupe(ctx, &sample);
+        }
+
+        let primary_down = crate::screen_color_picker::primary_button_down();
+        if primary_down && !self.color_filter.eyedropper_last_primary_down {
+            self.color_filter.eyedropper_active = false;
+            self.color_filter.eyedropper_last_primary_down = false;
+            self.show_feedback_toast(format!(
+                "スポイト: {}",
+                crate::color_search::hex_rgb(self.color_filter.query_rgb)
+            ));
+        } else {
+            self.color_filter.eyedropper_last_primary_down = primary_down;
+        }
+        ctx.request_repaint();
+    }
+
+    fn draw_image_color_eyedropper(&mut self, ui: &mut egui::Ui) -> bool {
+        let active = self.color_filter.eyedropper_active;
+        ui.horizontal(|ui| {
+            let label = if active {
+                "スポイト解除"
+            } else {
+                "スポイト"
+            };
+            if ui.selectable_label(active, label).clicked() {
+                self.color_filter.eyedropper_active = !active;
+                self.color_filter.eyedropper_last_primary_down =
+                    crate::screen_color_picker::primary_button_down();
+            }
+            if active {
+                ui.label("クリックで確定 / Escで中止");
+            }
+        });
+        false
+    }
+
+    fn draw_image_color_tolerance(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut tolerance = self.color_filter.tolerance;
+        if ui
+            .add(
+                egui::Slider::new(
+                    &mut tolerance,
+                    crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
+                )
+                .text("許容範囲"),
+            )
+            .changed()
+        {
+            self.color_filter.tolerance = tolerance;
+            return self.color_filter_effectively_active();
+        }
+        false
+    }
+
+    fn draw_image_color_swatch(&self, ui: &mut egui::Ui, rgb: [u8; 3], size: egui::Vec2) {
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(5),
+            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(5),
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::epaint::StrokeKind::Outside,
+        );
+    }
+
+    fn set_image_color_query_from_ui(&mut self, rgb: [u8; 3]) -> bool {
+        if self.color_filter.query_rgb == rgb {
+            return false;
+        }
+        self.color_filter.set_query_rgb(rgb);
+        self.color_filter_effectively_active()
     }
 
     fn draw_facet_active_chips(&self, ui: &mut egui::Ui) {

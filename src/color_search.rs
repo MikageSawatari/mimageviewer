@@ -21,6 +21,19 @@ const MERGE_DELTA_E: f32 = 10.0;
 pub type ColorPaletteKey = String;
 pub type ScanScopeSignature = u64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorInputMode {
+    Hex,
+    Rgb,
+    Hsl,
+}
+
+impl Default for ColorInputMode {
+    fn default() -> Self {
+        Self::Hex
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PaletteColor {
     pub rgb: [u8; 3],
@@ -103,6 +116,11 @@ pub struct ColorFilterState {
     pub enabled: bool,
     pub query_rgb: [u8; 3],
     pub tolerance: f32,
+    pub input_mode: ColorInputMode,
+    pub hex_input: String,
+    pub picker_hue_degrees: f32,
+    pub eyedropper_active: bool,
+    pub eyedropper_last_primary_down: bool,
     pub palettes: ScanPalettes,
     pub pending: Option<ColorScanPending>,
     pub confirmation: Option<ColorScanConfirmation>,
@@ -112,10 +130,16 @@ pub struct ColorFilterState {
 
 impl Default for ColorFilterState {
     fn default() -> Self {
+        let (hue, _, _) = rgb_to_hsv(DEFAULT_QUERY_RGB);
         Self {
             enabled: false,
             query_rgb: DEFAULT_QUERY_RGB,
             tolerance: DEFAULT_TOLERANCE,
+            input_mode: ColorInputMode::default(),
+            hex_input: hex_rgb(DEFAULT_QUERY_RGB),
+            picker_hue_degrees: hue,
+            eyedropper_active: false,
+            eyedropper_last_primary_down: false,
             palettes: ScanPalettes::default(),
             pending: None,
             confirmation: None,
@@ -138,6 +162,8 @@ impl ColorFilterState {
         self.confirmed_large_scan_scope = None;
         self.enabled = false;
         self.applied_scope_signature = None;
+        self.eyedropper_active = false;
+        self.eyedropper_last_primary_down = false;
     }
 
     pub fn clear_for_new_items(&mut self) {
@@ -147,10 +173,21 @@ impl ColorFilterState {
         self.enabled = false;
         self.applied_scope_signature = None;
         self.palettes.clear();
+        self.eyedropper_active = false;
+        self.eyedropper_last_primary_down = false;
     }
 
     pub fn query_lab(&self) -> [f32; 3] {
         srgb_to_lab(self.query_rgb)
+    }
+
+    pub fn set_query_rgb(&mut self, rgb: [u8; 3]) {
+        self.query_rgb = rgb;
+        self.hex_input = hex_rgb(rgb);
+        let (hue, saturation, _) = rgb_to_hsv(rgb);
+        if saturation > 0.001 {
+            self.picker_hue_degrees = hue;
+        }
     }
 }
 
@@ -410,9 +447,140 @@ pub fn hex_rgb(rgb: [u8; 3]) -> String {
     format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
 
+pub fn parse_hex_rgb(input: &str) -> Option<[u8; 3]> {
+    let trimmed = input.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    Some([
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    ])
+}
+
+pub fn rgb_to_hsv(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - r).abs() <= f32::EPSILON {
+        60.0 * ((g - b) / delta).rem_euclid(6.0)
+    } else if (max - g).abs() <= f32::EPSILON {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+    let saturation = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
+    (hue.rem_euclid(360.0), saturation, max)
+}
+
+pub fn hsv_to_rgb(hue_degrees: f32, saturation: f32, value: f32) -> [u8; 3] {
+    let h = hue_degrees.rem_euclid(360.0) / 60.0;
+    let s = saturation.clamp(0.0, 1.0);
+    let v = value.clamp(0.0, 1.0);
+    let c = v * s;
+    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = if h < 1.0 {
+        (c, x, 0.0)
+    } else if h < 2.0 {
+        (x, c, 0.0)
+    } else if h < 3.0 {
+        (0.0, c, x)
+    } else if h < 4.0 {
+        (0.0, x, c)
+    } else if h < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    [
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+pub fn rgb_to_hsl(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) * 0.5;
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue = if (max - r).abs() <= f32::EPSILON {
+        60.0 * ((g - b) / delta).rem_euclid(6.0)
+    } else if (max - g).abs() <= f32::EPSILON {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+    (hue.rem_euclid(360.0), saturation, lightness)
+}
+
+pub fn hsl_to_rgb(hue_degrees: f32, saturation: f32, lightness: f32) -> [u8; 3] {
+    let h = hue_degrees.rem_euclid(360.0) / 60.0;
+    let s = saturation.clamp(0.0, 1.0);
+    let l = lightness.clamp(0.0, 1.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let m = l - c * 0.5;
+    let (r1, g1, b1) = if h < 1.0 {
+        (c, x, 0.0)
+    } else if h < 2.0 {
+        (x, c, 0.0)
+    } else if h < 3.0 {
+        (0.0, c, x)
+    } else if h < 4.0 {
+        (0.0, x, c)
+    } else if h < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    [
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_rgb_parser_accepts_hash_and_plain_forms() {
+        assert_eq!(parse_hex_rgb("#5C22B3"), Some([92, 34, 179]));
+        assert_eq!(parse_hex_rgb("5c22b3"), Some([92, 34, 179]));
+        assert_eq!(parse_hex_rgb("#xyzxyz"), None);
+        assert_eq!(parse_hex_rgb("#12345"), None);
+    }
+
+    #[test]
+    fn hsv_and_hsl_round_trip_primary_color() {
+        let rgb = [92, 34, 179];
+        let (h, s, v) = rgb_to_hsv(rgb);
+        assert_eq!(hsv_to_rgb(h, s, v), rgb);
+        let (h, s, l) = rgb_to_hsl(rgb);
+        assert_eq!(hsl_to_rgb(h, s, l), rgb);
+    }
 
     #[test]
     fn solid_color_palette_is_single_dominant_color() {

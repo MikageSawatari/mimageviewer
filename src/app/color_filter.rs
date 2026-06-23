@@ -65,7 +65,7 @@ impl App {
             );
             return;
         }
-        self.color_filter.query_rgb = rgb;
+        self.color_filter.set_query_rgb(rgb);
         self.color_filter.enabled = true;
         self.color_filter.applied_scope_signature = None;
         self.ensure_color_scan_for_current_scope(ctx);
