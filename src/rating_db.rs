@@ -125,6 +125,20 @@ impl RatingDb {
         Ok(Self { conn })
     }
 
+    /// 既存 DB を読み取り専用で開く (一覧ビュー worker 用)。`ensure_schema` を呼ばないので
+    /// マイグレーション DDL を再実行しない。main 接続が起動時に移行済みである前提
+    /// (= read-only の worker 接続が ALTER TABLE を再発行して main 接続と競合しない)。
+    /// ファイルが無い / 開けない場合は呼び出し側が `open_at` へフォールバックする。
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self { conn })
+    }
+
     pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("rating.db")
     }

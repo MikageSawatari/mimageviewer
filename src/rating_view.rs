@@ -85,7 +85,12 @@ fn build_rating_view_rows(
     stars: u8,
     cancel: &AtomicBool,
 ) -> Result<RatingViewBuildResult, rusqlite::Error> {
-    let db = crate::rating_db::RatingDb::open_at(db_path)?;
+    // 既存 DB を読み取り専用で開く (マイグレーション DDL を再実行せず、main 接続と
+    // 競合しない)。ファイルが無い等で失敗したら作成込みの open_at にフォールバックする。
+    let db = match crate::rating_db::RatingDb::open_readonly(&db_path) {
+        Ok(db) => db,
+        Err(_) => crate::rating_db::RatingDb::open_at(&db_path)?,
+    };
     let rows = db.list_by_stars(stars)?;
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0usize;

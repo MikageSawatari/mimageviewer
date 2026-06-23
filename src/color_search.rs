@@ -246,7 +246,7 @@ pub fn palette_matches(palette: &Palette, query_lab: [f32; 3], tolerance: f32) -
     palette
         .colors
         .iter()
-        .any(|color| color.ratio >= RATIO_FLOOR && delta_e76(query_lab, color.lab) <= tolerance)
+        .any(|color| color.ratio >= RATIO_FLOOR && delta_e76(query_lab, color.lab) < tolerance)
 }
 
 pub fn delta_e76(a: [f32; 3], b: [f32; 3]) -> f32 {
