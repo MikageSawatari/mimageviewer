@@ -376,6 +376,24 @@ fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::
     }
 }
 
+fn show_sticky_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let _ = egui::Popup::context_menu(response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(add_contents);
+}
+
+fn draw_sticky_settings_menu_header(ui: &mut egui::Ui, title: &str) {
+    ui.set_min_width(220.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("×").on_hover_text("閉じる").clicked() {
+                ui.close();
+            }
+        });
+    });
+}
+
 fn draw_tag_view_menu_section(
     ui: &mut egui::Ui,
     title: &str,
@@ -4753,7 +4771,7 @@ impl App {
             // 空き領域 右クリック → セクション表示 ON/OFF メニュー。「既定に戻す」は影響が
             // 大きく取り消せないので、ここ (右クリック) には出さない (show_reset=false)。
             if let Some(bg) = bg_resp {
-                bg.context_menu(|ui| {
+                show_sticky_context_menu(&bg, |ui| {
                     self.draw_toolbar_visibility_menu(ui, false);
                 });
             }
@@ -4856,7 +4874,7 @@ impl App {
     /// `show_reset` = 「ツールバーを既定に戻す」を出すか。影響が大きい操作なので、右クリック
     /// メニュー (空き領域) では出さず、「設定→ツールバー」でのみ出す + 実行前に確認を挟む。
     fn draw_toolbar_visibility_menu(&mut self, ui: &mut egui::Ui, show_reset: bool) {
-        ui.label("表示するセクション");
+        draw_sticky_settings_menu_header(ui, "表示するセクション");
         ui.separator();
         let s = &mut self.settings;
         let mut changed = false;
@@ -4908,7 +4926,7 @@ impl App {
 
         ui.separator();
         // ドラッグ並べ替えの許可 (既定 OFF。OFF のときはカーソルも変わらない)。
-        changed |= ui
+        if ui
             .checkbox(
                 &mut self.settings.toolbar_section_drag_enabled,
                 "ドラッグで並べ替えを許可",
@@ -4917,7 +4935,11 @@ impl App {
                 "ON にすると、セクションのラベルをドラッグして並べ替えできます。\n\
                  OFF のときはドラッグ無効で、マウスカーソルも変わりません。",
             )
-            .changed();
+            .changed()
+        {
+            changed = true;
+            ui.close();
+        }
 
         // 「ツールバーを既定に戻す」は影響が大きく取り消せないので、右クリック (空き領域) には
         // 出さず、「設定→ツールバー」(show_reset=true) でのみ出す。実行は確認ダイアログ経由。
@@ -5045,7 +5067,7 @@ impl App {
         use crate::settings::ToolbarSectionDisplay as TD;
         use crate::settings::ToolbarSectionId as TS;
 
-        ui.label(egui::RichText::new(toolbar_section_display_label(section)).strong());
+        draw_sticky_settings_menu_header(ui, toolbar_section_display_label(section));
         ui.separator();
 
         let mut changed = false;
@@ -5059,6 +5081,8 @@ impl App {
             });
         }
 
+        let has_section_specific_settings =
+            !matches!(section, TS::FolderTree | TS::Rating | TS::Unknown);
         match section {
             TS::FolderTree | TS::Rating => {
                 // 表示形式・出す項目を持たない。非表示 / 既定化のみ (下の共通部)。
@@ -5190,7 +5214,9 @@ impl App {
             TS::Unknown => {}
         }
 
-        ui.separator();
+        if has_section_specific_settings {
+            ui.separator();
+        }
         // 行頭に表示 (= このセクションの前で必ず改行)。
         let mut new_row = self.settings.toolbar_section_new_row.contains(&section);
         if ui
@@ -5208,9 +5234,10 @@ impl App {
                     .retain(|&s| s != section);
             }
             changed = true;
+            ui.close();
         }
         // ドラッグ並べ替えの許可 (全セクション共通のグローバル設定。既定 OFF)。
-        changed |= ui
+        if ui
             .checkbox(
                 &mut self.settings.toolbar_section_drag_enabled,
                 "ドラッグで並べ替えを許可",
@@ -5219,7 +5246,11 @@ impl App {
                 "ON にすると、セクションのラベルをドラッグして並べ替えできます。\n\
                  OFF のときはドラッグ無効で、マウスカーソルも変わりません。",
             )
-            .changed();
+            .changed()
+        {
+            changed = true;
+            ui.close();
+        }
 
         ui.separator();
         if ui
@@ -5246,7 +5277,7 @@ impl App {
     /// アドレスバー左端の「フォルダ:」ラベル右クリック、および「設定」メニュー → ツールバー →
     /// フォルダバーの設定 から開く。フォルダバーは並べ替えできないだけのセクション扱い。
     fn draw_folder_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("フォルダバー").strong());
+        draw_sticky_settings_menu_header(ui, "フォルダバー");
         ui.separator();
         let mut changed = false;
         changed |= ui
@@ -5306,35 +5337,33 @@ impl App {
 
         ui.separator();
         ui.label("場所▼に出す項目:");
-        ui.horizontal_wrapped(|ui| {
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_drive_list, "ドライブ一覧")
-                .changed();
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_reading_history, "読書履歴")
-                .changed();
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_bookshelf, "本棚フォルダ")
-                .changed();
-            changed |= ui
-                .checkbox(
-                    &mut self.settings.show_location_rating,
-                    "レーティングフォルダ",
-                )
-                .changed();
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_desktop, "デスクトップ")
-                .changed();
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_pictures, "ピクチャ")
-                .changed();
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_downloads, "ダウンロード")
-                .changed();
-            changed |= ui
-                .checkbox(&mut self.settings.show_location_drive_roots, "各ドライブ")
-                .changed();
-        });
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_drive_list, "ドライブ一覧")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_reading_history, "読書履歴")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_bookshelf, "本棚フォルダ")
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_location_rating,
+                "レーティングフォルダ",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_desktop, "デスクトップ")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_pictures, "ピクチャ")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_downloads, "ダウンロード")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_drive_roots, "各ドライブ")
+            .changed();
 
         ui.separator();
         let mut clear_recent = false;
@@ -5387,7 +5416,7 @@ impl App {
     ) {
         current_anchors.push((section, resp.rect));
         self.handle_toolbar_section_drag(ui, &resp, section, last_anchors);
-        resp.context_menu(|ui| {
+        show_sticky_context_menu(&resp, |ui| {
             self.draw_section_settings_menu(ui, section);
         });
     }
@@ -5502,12 +5531,11 @@ impl App {
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new("絞り込み:").small())
-                        .sense(egui::Sense::click()),
-                )
-                .on_hover_text("右クリック: 絞り込みバーの設定")
-                .context_menu(|ui| {
+                let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
+                    .sense(egui::Sense::click());
+                let filter_label_response =
+                    ui.add(filter_label).on_hover_text("右クリック: 絞り込みバーの設定");
+                show_sticky_context_menu(&filter_label_response, |ui| {
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
                 let facet_items = crate::settings::ToolbarFacetFilterItem::visible_order(
@@ -5665,28 +5693,26 @@ impl App {
     fn draw_facet_filter_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
         use crate::settings::ToolbarFacetFilterItem as FI;
 
-        ui.label(egui::RichText::new("絞り込みバー").strong());
+        draw_sticky_settings_menu_header(ui, "絞り込みバー");
         ui.separator();
         ui.label("表示するボタン:");
         let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            for &item in FI::all() {
-                let mut checked = self.settings.toolbar_facet_filter_items.contains(&item);
-                if ui.checkbox(&mut checked, item.label()).changed() {
-                    if checked {
-                        self.settings.toolbar_facet_filter_items.push(item);
-                        FI::sort_like_default(&mut self.settings.toolbar_facet_filter_items);
-                    } else {
-                        self.settings
-                            .toolbar_facet_filter_items
-                            .retain(|&candidate| candidate != item);
-                    }
-                    self.settings.toolbar_facet_filter_items =
-                        FI::visible_order(&self.settings.toolbar_facet_filter_items);
-                    changed = true;
+        for &item in FI::all() {
+            let mut checked = self.settings.toolbar_facet_filter_items.contains(&item);
+            if ui.checkbox(&mut checked, item.label()).changed() {
+                if checked {
+                    self.settings.toolbar_facet_filter_items.push(item);
+                    FI::sort_like_default(&mut self.settings.toolbar_facet_filter_items);
+                } else {
+                    self.settings
+                        .toolbar_facet_filter_items
+                        .retain(|&candidate| candidate != item);
                 }
+                self.settings.toolbar_facet_filter_items =
+                    FI::visible_order(&self.settings.toolbar_facet_filter_items);
+                changed = true;
             }
-        });
+        }
 
         ui.separator();
         if ui
@@ -6190,7 +6216,6 @@ impl App {
                             self.color_filter.enabled = false;
                             self.color_filter.applied_scope_signature = None;
                             changed = true;
-                            ui.close();
                         }
                     } else if let Some(confirmation) = self.color_filter.confirmation.clone() {
                         ui.separator();
@@ -6202,12 +6227,10 @@ impl App {
                             if ui.small_button("スキャン開始").clicked() {
                                 self.confirm_large_color_scan(ui.ctx());
                                 changed = true;
-                                ui.close();
                             }
                             if ui.small_button("キャンセル").clicked() {
                                 self.cancel_large_color_scan_confirmation();
                                 changed = true;
-                                ui.close();
                             }
                         });
                     } else if self.color_filter.enabled {
@@ -6223,14 +6246,12 @@ impl App {
                         && ui.small_button("この画像色で絞り込み").clicked()
                     {
                         changed |= self.activate_image_color_filter_from_ui();
-                        ui.close();
                     }
                     if self.color_filter.enabled
                         && ui.small_button("画像色フィルタを解除").clicked()
                     {
                         self.color_filter.clear_filter();
                         changed = true;
-                        ui.close();
                     }
                 });
         let menu_response = menu_response.on_hover_text(
@@ -6818,11 +6839,12 @@ impl App {
                 ui.horizontal(|ui| {
                     // 左端のラベルを右クリックすると、フォルダバーの設定メニューを開く
                     // (他のツールバーセクションと操作を揃える。実機フィードバック 2026-06-20)。
-                    ui.add(egui::Label::new("フォルダ:").sense(egui::Sense::click()))
-                        .on_hover_text("右クリック: フォルダバーの設定")
-                        .context_menu(|ui| {
-                            self.draw_folder_bar_settings_menu(ui);
-                        });
+                    let folder_label_response = ui
+                        .add(egui::Label::new("フォルダ:").sense(egui::Sense::click()))
+                        .on_hover_text("右クリック: フォルダバーの設定");
+                    show_sticky_context_menu(&folder_label_response, |ui| {
+                        self.draw_folder_bar_settings_menu(ui);
+                    });
                     let show_history_nav = self.settings.show_address_bar_history_nav;
                     let show_quick_folders = self.settings.show_address_bar_quick_folders;
                     let show_parent = self.settings.show_toolbar_parent_button;
@@ -7190,7 +7212,7 @@ impl App {
                         } else {
                             "デスクトップ / 主要フォルダ / ドライブへ移動"
                         });
-                        place_response.context_menu(|ui| {
+                        show_sticky_context_menu(&place_response, |ui| {
                             self.draw_folder_bar_settings_menu(ui);
                         });
                     });
