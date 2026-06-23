@@ -5624,6 +5624,7 @@ impl App {
     // ── スマートフィルタバー ────────────────────────────────────────
 
     pub(crate) fn render_facet_filter_bar(&mut self, ctx: &egui::Context) {
+        self.color_filter.input_has_focus = false;
         if !self.settings.show_toolbar_facet_filter {
             return;
         }

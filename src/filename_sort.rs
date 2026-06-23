@@ -21,7 +21,9 @@ impl Ord for FileNameSortKey {
     fn cmp(&self, other: &Self) -> Ordering {
         let primary = match (&self.windows_key, &other.windows_key) {
             (Some(a), Some(b)) => a.cmp(b),
-            _ => self.folded.cmp(&other.folded),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => self.folded.cmp(&other.folded),
         };
         primary
             .then_with(|| self.folded.cmp(&other.folded))
@@ -163,6 +165,34 @@ mod tests {
             SortNameKey::file_name(a).compare_file_name(&SortNameKey::file_name(b))
         });
         assert_eq!(names, vec!["file1.jpg", "file2.jpg", "file10.jpg"]);
+    }
+
+    #[test]
+    fn file_name_key_mixed_windows_fallback_keeps_total_order() {
+        let mut keys = [
+            FileNameSortKey {
+                windows_key: Some(vec![2]),
+                folded: "z".to_string(),
+                original: "z".to_string(),
+            },
+            FileNameSortKey {
+                windows_key: None,
+                folded: "a".to_string(),
+                original: "a".to_string(),
+            },
+            FileNameSortKey {
+                windows_key: Some(vec![1]),
+                folded: "m".to_string(),
+                original: "m".to_string(),
+            },
+        ];
+        keys.sort();
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.original.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m", "z", "a"]
+        );
     }
 
     #[test]

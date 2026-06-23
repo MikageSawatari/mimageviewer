@@ -5461,7 +5461,7 @@ mod tests {
     fn numeric_sort_tiebreaks_on_lowercase_filename() {
         // 記号差のみのファイル名は natural key が一致するので、tiebreak が
         // 無いと FS の `read_dir` 列挙順依存になる。`SortOrder::Numeric` は
-        // ファイル名 lowercase の昇順で安定化させる。
+        // ファイル名ソートキーの昇順で安定化させる。
         use crate::ui_helpers::natural_sort_key;
         let mut names = vec![
             "foobar1.jpg",
@@ -5470,14 +5470,15 @@ mod tests {
             "foo#bar1.jpg",
         ];
         names.sort_by(|a, b| SortOrder::Numeric.compare(a, 0, b, 0, natural_sort_key));
-        // ASCII: ' ' (0x20) < '#' (0x23) < '-' (0x2D) < 'b' (0x62)
+        // Windows のファイル名ソートでは '-' は副次的に扱われるため、
+        // `foobar` が `foo-bar` より先に来る。
         assert_eq!(
             names,
             vec![
                 "foo bar1.jpg",
                 "foo#bar1.jpg",
-                "foo-bar1.jpg",
                 "foobar1.jpg",
+                "foo-bar1.jpg",
             ]
         );
     }

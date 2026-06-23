@@ -628,17 +628,17 @@ pub fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
     let mut chunks = Vec::new();
     let mut chars = name_lower.chars().peekable();
     while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
-            let mut num_str = String::new();
-            while chars.peek().map(|ch| ch.is_ascii_digit()).unwrap_or(false) {
-                num_str.push(chars.next().unwrap());
+        if natural_digit_value(c).is_some() {
+            let mut n = 0_u64;
+            while let Some(digit) = chars.peek().and_then(|ch| natural_digit_value(*ch)) {
+                chars.next();
+                n = n.saturating_mul(10).saturating_add(digit as u64);
             }
-            let n: u64 = num_str.parse().unwrap_or(0);
             chunks.push(NaturalChunk::Num(n));
         } else {
             let mut text = String::new();
             while let Some(&ch) = chars.peek() {
-                if ch.is_ascii_digit() {
+                if natural_digit_value(ch).is_some() {
                     break;
                 }
                 chars.next();
@@ -652,6 +652,16 @@ pub fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
         }
     }
     chunks
+}
+
+fn natural_digit_value(ch: char) -> Option<u32> {
+    if ch.is_ascii_digit() {
+        return Some(ch as u32 - '0' as u32);
+    }
+    if ('\u{ff10}'..='\u{ff19}').contains(&ch) {
+        return Some(ch as u32 - '\u{ff10}' as u32);
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1443,6 +1453,20 @@ mod tests {
         let b = natural_sort_key("file10.jpg");
         // 辞書順だと "file10" < "file2" になるが、自然順では逆
         assert!(a < b);
+    }
+
+    #[test]
+    fn natural_sort_key_treats_fullwidth_digits_as_numbers() {
+        let a = natural_sort_key("file２.jpg");
+        let b = natural_sort_key("file１０.jpg");
+        assert!(a < b);
+    }
+
+    #[test]
+    fn natural_sort_key_saturates_huge_numbers() {
+        let small = natural_sort_key("file9.jpg");
+        let huge = natural_sort_key("file18446744073709551616.jpg");
+        assert!(small < huge);
     }
 
     #[test]

@@ -38,9 +38,11 @@ impl App {
 
     pub(crate) fn clear_color_filter_for_new_items(&mut self) {
         self.color_filter.clear_for_new_items();
+        self.color_filter_scope_refresh_pending = false;
     }
 
     pub(crate) fn refresh_color_filter_for_scope_change(&mut self, ctx: &egui::Context) {
+        self.color_filter_scope_refresh_pending = false;
         if self.color_filter.enabled {
             self.color_filter.applied_scope_signature = None;
             self.color_filter.confirmation = None;
@@ -62,6 +64,7 @@ impl App {
         self.color_filter.confirmed_large_scan_scope = None;
         self.color_filter.enabled = false;
         self.color_filter.applied_scope_signature = None;
+        self.color_filter_scope_refresh_pending = false;
         self.rebuild_visible_indices();
     }
 
@@ -84,6 +87,7 @@ impl App {
         self.color_filter.set_query_rgb(rgb);
         self.color_filter.enabled = true;
         self.color_filter.applied_scope_signature = None;
+        self.color_filter_scope_refresh_pending = false;
         self.ensure_color_scan_for_current_scope(ctx);
         self.show_feedback_toast(format!("[画像色 {}]", crate::color_search::hex_rgb(rgb)));
     }
@@ -141,6 +145,13 @@ impl App {
     }
 
     pub(crate) fn poll_color_scan(&mut self, ctx: &egui::Context) {
+        if self.color_filter_scope_refresh_pending {
+            self.color_filter_scope_refresh_pending = false;
+            if self.color_filter.enabled {
+                self.ensure_color_scan_for_current_scope(ctx);
+            }
+        }
+
         let Some(mut pending) = self.color_filter.pending.take() else {
             return;
         };

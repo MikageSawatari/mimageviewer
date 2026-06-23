@@ -3340,6 +3340,9 @@ pub struct App {
     pub(crate) facet_tag_search_query: String,
     /// 色フィルタの一時状態。Settings へ保存しないオンデマンド絞り込み。
     pub(crate) color_filter: crate::color_search::ColorFilterState,
+    /// `egui::Context` を持たない軽量 items 差し替え経路で、次フレームに色スキャンを
+    /// 起動するための one-shot フラグ。
+    pub(crate) color_filter_scope_refresh_pending: bool,
 
     /// 第2シグナル (`finalized=true`) を受け取ったが、第1シグナルの ColorImage が
     /// `texture_backlog` でアップロード待ちのため `requested` から remove できなかった
@@ -5689,6 +5692,7 @@ impl App {
             facet_filter_suppression_stack: Vec::new(),
             facet_tag_search_query: String::new(),
             color_filter: crate::color_search::ColorFilterState::default(),
+            color_filter_scope_refresh_pending: false,
             pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
             vis_settle_at: None,
@@ -10676,24 +10680,11 @@ impl App {
             .map(|(key, _)| key.clone())
             .collect();
         drop(existing);
-        if restore_keys.len() > 16 {
+        if !restore_keys.is_empty() {
             self.reload_current_rating_view_preserving_sort();
             return;
         }
-        for key in restore_keys {
-            if let Some(row) = self.rating_view_row_for_key(&key) {
-                self.rating_view_rows.push(row);
-            }
-        }
         self.install_rating_view_rows();
-    }
-
-    fn rating_view_row_for_key(&self, key: &str) -> Option<crate::rating_view::RatingViewRow> {
-        let db = self.rating_db.as_ref()?;
-        let row = db.row_for_key(key).ok().flatten()?;
-        (row.stars == self.rating_view_stars)
-            .then(|| crate::rating_view::rating_row_to_view_row(&row))
-            .flatten()
     }
 
     fn reload_current_rating_view_preserving_sort(&mut self) {
@@ -11353,6 +11344,12 @@ impl App {
         self.install_new_items(items, metas);
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
         self.invalidate_idx_state_and_queues();
+        if self.color_filter.enabled {
+            self.color_filter.applied_scope_signature = None;
+            self.color_filter.confirmation = None;
+            self.color_filter.confirmed_large_scan_scope = None;
+            self.color_filter_scope_refresh_pending = true;
+        }
         // ZIP 内の階層ごとに Shift+F のコンテナ★キーが変わるため、アドレスバー★の
         // メモ化値も階層切替ごとに捨てる。
         self.current_folder_rating_cache = None;
@@ -12452,6 +12449,7 @@ impl App {
         folder_signature: Option<u64>,
     ) {
         self.clear_color_filter_for_new_items();
+        self.color_filter_scope_refresh_pending = false;
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
 
@@ -13306,12 +13304,14 @@ impl App {
         self.refresh_folder_pin_map();
     }
 
-    /// 現在 items の `ConvertibleArchive` について、有効な変換キャッシュ ZIP を
+    /// 現在 items の変換アーカイブについて、有効な変換キャッシュ ZIP を
     /// `make_load_request` から同期参照できる map にまとめる。
     ///
     /// SQLite `peek` と cache ZIP の `exists()` は worker で行い、UI スレッドは
     /// 現在の items から `(path, mtime, size)` を snapshot するだけにする。スクロール中 /
     /// 毎フレームのサムネ要求で archive_cache.db を叩かないための小さなキャッシュ。
+    /// 親フォルダ上の `ConvertibleArchive` セルに加え、レーティング一覧に復元された
+    /// `ZipDir` が元 RAR/7z/LZH パスを持つケースもここで解決する。
     fn start_converted_archive_cache_paths_refresh(&mut self) {
         if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
             pending.cancel();
@@ -13325,8 +13325,18 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, item)| {
-                let GridItem::ConvertibleArchive { path, .. } = item else {
-                    return None;
+                let path = match item {
+                    GridItem::ConvertibleArchive { path, .. } => path,
+                    GridItem::ZipDir { zip_path, .. }
+                        if zip_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+                            .is_some() =>
+                    {
+                        zip_path
+                    }
+                    _ => return None,
                 };
                 let (mtime, file_size) = self.image_metas.get(idx).and_then(|m| *m)?;
                 Some((path.clone(), mtime, file_size))
@@ -38825,6 +38835,10 @@ fn make_load_request(
             //
             // 本ごとの代表サムネピン (zip_path + dir_prefix キー) があれば、それを代表にする。
             // ZipDir source は通常フォルダの子フォルダ pin と同じく cascade 解決する。
+            let archive_key = crate::path_key::normalize_keep_drive(zip_path);
+            let load_zip_path = converted_archive_cache_paths
+                .get(&archive_key)
+                .unwrap_or(zip_path);
             let book_root = zip_pin_root_path(zip_path, archive_source_override, current_folder);
             let book_container = book_container_key(book_root, dir_prefix);
             let book_key = crate::path_key::normalize_keep_drive(&book_container);
@@ -38834,7 +38848,7 @@ fn make_load_request(
                         if zip_rel.is_empty() && !entry.is_empty() =>
                     {
                         return Some(LoadRequest {
-                            path: zip_path.clone(),
+                            path: load_zip_path.clone(),
                             zip_entry: Some(entry.clone()),
                             cache_key_override: Some(format!(
                                 "{}{}{}",
@@ -38863,7 +38877,7 @@ fn make_load_request(
                             match resolved.kind {
                                 crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
                                     return Some(LoadRequest {
-                                        path: zip_path.clone(),
+                                        path: load_zip_path.clone(),
                                         zip_entry: resolved.zip_entry,
                                         cache_key_override: Some(cache_key),
                                         mtime: resolved.mtime,
@@ -38873,7 +38887,7 @@ fn make_load_request(
                                 }
                                 crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
                                     return Some(LoadRequest {
-                                        path: zip_path.clone(),
+                                        path: load_zip_path.clone(),
                                         zip_dir_prefix: resolved.zip_dir_prefix,
                                         cache_key_override: Some(cache_key),
                                         resolve_override: Some(
@@ -38895,7 +38909,7 @@ fn make_load_request(
             }
             let entry = representative.clone()?;
             Some(LoadRequest {
-                path: zip_path.clone(),
+                path: load_zip_path.clone(),
                 zip_entry: Some(entry),
                 cache_key_override: Some(crate::grid_item::zipdir_cache_key(dir_prefix)),
                 ..base

@@ -121,6 +121,7 @@ impl RatingDb {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = rusqlite::Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
         Self::ensure_schema(&conn)?;
         Ok(Self { conn })
     }
@@ -136,6 +137,7 @@ impl RatingDb {
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
         Ok(Self { conn })
     }
 

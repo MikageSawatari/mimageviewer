@@ -3053,7 +3053,7 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
-    fn rating_view_refresh_reinserts_restored_row() {
+    fn rating_view_refresh_reloads_to_restore_row() {
         let mut app = setup_app();
         let image = app.tmp.path().join("rated.jpg");
         std::fs::write(&image, b"image bytes").expect("write rated image");
@@ -3082,9 +3082,18 @@ mod phase_c_drill_nav_tests {
 
         assert_eq!(existing.key, key);
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
-        assert_eq!(app.rating_view_rows.len(), 1);
-        assert_eq!(app.rating_view_rows[0].key, key);
-        assert_eq!(app.items.len(), 1);
+        assert!(
+            app.rating_view_pending.is_some(),
+            "復元行の stat / legacy ZIP 解決は UI スレッドで行わず、一覧 worker で再構築する"
+        );
+        let pending = app.rating_view_pending.take().unwrap();
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("rating view reload result")
+            .expect("rating view reload ok");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, key);
     }
 
     #[test]
