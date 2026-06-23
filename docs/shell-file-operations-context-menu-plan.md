@@ -224,7 +224,8 @@ Implementation status:
   `IFileOperation::RenameItem`.
 - Delete-to-recycle is implemented in `src/delete_worker.rs` with
   chunked `IFileOperation::DeleteItem` + `PerformOperations`. The worker keeps
-  `FOFX_RECYCLEONDELETE` and `FOF_WANTNUKEWARNING`, does not suppress Shell UI,
+  `FOFX_RECYCLEONDELETE` and `FOF_WANTNUKEWARNING`, suppresses routine Shell UI
+  because the existing mIV delete confirmation/progress UI owns that path,
   checks `GetAnyOperationsAborted`, and classifies per-path success by verifying
   the target path disappeared after the Shell operation.
 - Copy/move/drop replacement is still pending.
@@ -257,12 +258,16 @@ Execution model:
   error dialogs are owned by the mIV window.
 - Call `IFileOperation::SetOperationFlags(...)` before
   `PerformOperations`.
-- Use standard Shell UI by default:
+- Use standard Shell UI by default for Shell-owned copy/move/drop operations:
   - Do not set `FOF_SILENT`.
   - Do not set `FOF_NOCONFIRMATION`.
   - Do not set `FOF_NOERRORUI`.
   - Do not set `FOF_RENAMEONCOLLISION` unless a future setting asks for
     automatic rename-on-collision.
+- Delete-to-recycle is an exception while it is served through mIV's existing
+  confirmation/progress dialog: set `FOF_SILENT`, `FOF_NOCONFIRMATION`, and
+  `FOF_NOERRORUI` to avoid duplicate UI, but keep `FOF_WANTNUKEWARNING` so a
+  non-recyclable target still warns before permanent deletion.
 - For recycle-bin delete, use the Shell recycle behavior and keep the current
   safety principle: if the operation can become permanent deletion, the user
   must see a warning.
@@ -273,9 +278,11 @@ Execution model:
 
 Progress:
 
-- MVP uses the standard Shell progress/collision/error UI.
-- Do not build a parallel egui progress dialog for copy/move/delete in the first
-  pass.
+- MVP uses the standard Shell progress/collision/error UI for copy/move/drop.
+- Delete currently keeps the existing egui progress dialog and reports progress
+  once per `IFileOperation` chunk.
+- Do not build a parallel egui progress dialog for future Shell-owned
+  copy/move/drop paths in the first pass.
 - `IFileOperationProgressSink` is optional. Add it only when mIV needs exact
   per-item completion data, custom logging, or richer post-operation reload
   decisions. The standard UI does not require it.

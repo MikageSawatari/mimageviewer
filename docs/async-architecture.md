@@ -485,8 +485,10 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
   `search_filter` の O(K log K) idx shift + `invalidate_idx_state_and_queues` を行う。
   ゴミ箱移動は `delete_worker` が Windows Shell `IFileOperation` へ最大 100 件ずつ
   `DeleteItem` を予約し、チャンクごとに `PerformOperations` を 1 回だけ呼ぶ。
-  mIV 側キャンセルはチャンク間で判定し、Shell 標準 UI 側のキャンセルは
-  `GetAnyOperationsAborted` と削除後の存在確認で結果に反映する。
+  mIV 側の削除確認 / 進捗 UI を正とするため通常の Shell UI は抑制しつつ、
+  ゴミ箱不可時の完全削除警告 (`FOF_WANTNUKEWARNING`) は残す。mIV 側キャンセルは
+  チャンク間で判定し、Shell 側の中断は `GetAnyOperationsAborted` と削除後の
+  存在確認で結果に反映する。
 
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 

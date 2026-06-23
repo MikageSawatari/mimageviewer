@@ -180,13 +180,22 @@ impl DeleteChunkOutcome {
 /// `IFileOperation` (削除) のフラグ。**FOF_WANTNUKEWARNING を必ず含める**こと。
 /// 含めないと、ゴミ箱に入れられない対象 (容量超過 / ゴミ箱無効ボリューム / リムーバブル /
 /// ネットワーク共有) で完全削除へフォールバックする際の警告が出ない構成へ退行しうる。
-/// Shell UI は抑制せず、標準の確認 / エラー UI に任せる。
+/// mIV が削除確認 / 進捗 UI を持つため通常の Shell UI は抑制するが、
+/// `FOF_WANTNUKEWARNING` は `FOF_NOCONFIRMATION` を部分的に上書きし、
+/// ゴミ箱へ入らない対象が完全削除される前の警告を残す。
 #[cfg(windows)]
 fn recycle_flags() -> windows::Win32::UI::Shell::FILEOPERATION_FLAGS {
     use windows::Win32::UI::Shell::{
-        FOF_ALLOWUNDO, FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE,
+        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+        FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE,
     };
-    FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING
+    FOF_ALLOWUNDO
+        | FOFX_RECYCLEONDELETE
+        | FOFX_ADDUNDORECORD
+        | FOF_WANTNUKEWARNING
+        | FOF_NOCONFIRMATION
+        | FOF_NOERRORUI
+        | FOF_SILENT
 }
 
 /// 複数パス (ファイルまたはフォルダ) を 1 回の `IFileOperation` で削除する。
@@ -370,17 +379,18 @@ mod tests {
     }
 
     #[test]
-    fn recycle_flags_request_recycle_without_suppressing_shell_ui() {
+    fn recycle_flags_request_recycle_with_miv_owned_ui() {
         let flags = super::recycle_flags().0;
         assert_ne!(
             flags & FOFX_RECYCLEONDELETE.0,
             0,
             "IFileOperation delete must target the recycle bin"
         );
+        let miv_owned_ui_flags = FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0;
         assert_eq!(
-            flags & (FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0),
-            0,
-            "Shell confirmation/error/progress UI must remain available for delete safety"
+            flags & miv_owned_ui_flags,
+            miv_owned_ui_flags,
+            "mIV owns delete confirmation/progress UI; Shell UI should stay quiet except the nuke warning"
         );
     }
 }
