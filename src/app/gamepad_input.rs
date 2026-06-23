@@ -4284,6 +4284,14 @@ impl App {
                 self.drill_into_container(path, is_zip);
                 None
             }
+            Some(GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            }) if self.items_are_rating_view => {
+                self.open_rating_view_zipdir(zip_path, dir_prefix);
+                None
+            }
             // ネスト ZIP ツリーの子コンテナへ降りる (Phase 3)。
             Some(GridItem::ZipDir { dir_prefix, .. }) => {
                 // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ (Codex P2)。

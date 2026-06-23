@@ -8513,6 +8513,15 @@ impl App {
                     self.maybe_suppress_facet_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
                 }
+                // レーティング一覧に復元された ZipDir は zip_nav を持たないので、
+                // 外側 ZIP を開いてから該当 prefix へ入る。
+                Some(GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                }) if self.items_are_rating_view => {
+                    self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
+                }
                 // ネスト ZIP ツリーの子コンテナへダブルクリックで降りる (Phase 3)。
                 Some(GridItem::ZipDir { dir_prefix, .. }) => {
                     let dp = dir_prefix.clone();

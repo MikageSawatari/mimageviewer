@@ -87,6 +87,9 @@ pub struct RatingChange {
     /// XMP 書き込み判定や grid 走査用に元のパスも保持。
     /// コンテナ (フォルダ / ZIP / PDF) でも入れる。
     pub source_path: PathBuf,
+    /// rating.db の復元用メタデータ。ZipDir など、path/source だけでは
+    /// 種別を復元できない仮想コンテナの Undo/Redo で使う。
+    pub meta: Option<crate::rating_db::RatingMeta>,
     pub before: u8,
     pub after: u8,
 }
@@ -241,6 +244,7 @@ mod tests {
             changes: vec![RatingChange {
                 path_key: path.to_lowercase(),
                 source_path: PathBuf::from(path),
+                meta: None,
                 before,
                 after,
             }],

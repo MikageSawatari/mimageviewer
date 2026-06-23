@@ -3053,6 +3053,41 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn rating_view_refresh_reinserts_restored_row() {
+        let mut app = setup_app();
+        let image = app.tmp.path().join("rated.jpg");
+        std::fs::write(&image, b"image bytes").expect("write rated image");
+        let key = crate::adjustment_db::normalize_path(&image);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+            .with_source_path(&image);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 5, Some(&meta))
+            .unwrap();
+        let row = app
+            .rating_db
+            .as_ref()
+            .unwrap()
+            .row_for_key(&key)
+            .unwrap()
+            .expect("rating row");
+        app.rating_view_stars = 5;
+        let existing = crate::rating_view::rating_row_to_view_row(&row).unwrap();
+        app.rating_view_rows.clear();
+        app.items.clear();
+        app.visible_indices.clear();
+
+        app.refresh_rating_view_after_rating_changes(&[(key.clone(), 5)]);
+
+        assert_eq!(existing.key, key);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+        assert_eq!(app.rating_view_rows.len(), 1);
+        assert_eq!(app.rating_view_rows[0].key, key);
+        assert_eq!(app.items.len(), 1);
+    }
+
+    #[test]
     fn facet_place_label_uses_bookshelf_virtual_name_for_book_folder() {
         let mut app = setup_app();
         app.settings.book_root = Some(std::path::PathBuf::from("c:/library/books"));
@@ -8313,6 +8348,41 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 0);
         assert_eq!(app.current_folder_rating_cache, Some(0));
+
+        app.apply_meta_redo();
+
+        let row = app
+            .rating_db
+            .as_ref()
+            .unwrap()
+            .row_for_key(&book_key)
+            .unwrap()
+            .expect("redo should restore the ZipDir rating row");
+        assert_eq!(row.stars, 3);
+        assert_eq!(row.kind, Some(crate::rating_db::RatingItemKind::ZipDir));
+        assert_eq!(row.dir_prefix.as_deref(), Some("bookA/"));
+    }
+
+    #[test]
+    fn pending_rating_view_zipdir_open_enters_prefix_after_zip_load() {
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]));
+        app.pending_rating_view_zipdir_open = Some(crate::app::PendingRatingViewZipDirOpen {
+            source_path: zip_path.clone(),
+            dir_prefix: "bookB/".to_string(),
+        });
+
+        assert!(app.enter_pending_rating_view_zipdir_after_open(&zip_path));
+        assert!(
+            app.items.iter().any(|item| matches!(
+                item,
+                crate::grid_item::GridItem::ZipImage { entry_name, .. }
+                    if entry_name == "bookB/p1.jpg"
+            )),
+            "pending ZipDir open should materialize the requested book prefix"
+        );
     }
 
     /// 変換キャッシュ閲覧中の選択情報パス: ZIP 内アイテムのコンテナ部分が

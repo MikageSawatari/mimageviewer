@@ -8,7 +8,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
 use rusqlite::OptionalExtension;
 
 /// ratings.kind に保存する GridItem 種別。
@@ -378,9 +377,8 @@ impl RatingDb {
         Ok(out)
     }
 
-    /// テスト / デバッグ用: 1 行を取得する。
-    #[cfg(test)]
-    fn row_for_key(&self, key: &str) -> Result<Option<RatingRow>, rusqlite::Error> {
+    /// 指定キーの 1 行を一覧復元用に取得する。
+    pub fn row_for_key(&self, key: &str) -> Result<Option<RatingRow>, rusqlite::Error> {
         self.conn
             .query_row(
                 "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,

@@ -160,7 +160,15 @@ impl App {
                 for c in changes {
                     self.apply_rating_change_to_app(c, /* use_before */ true);
                 }
-                self.rebuild_visible_indices();
+                if self.items_are_rating_view {
+                    let view_changes: Vec<(String, u8)> = changes
+                        .iter()
+                        .map(|c| (c.path_key.clone(), c.before))
+                        .collect();
+                    self.refresh_rating_view_after_rating_changes(&view_changes);
+                } else {
+                    self.rebuild_visible_indices();
+                }
             }
             UndoEntry::Tag { changes, .. } => {
                 self.submit_tag_restore_jobs(changes, /* use_before */ true);
@@ -198,7 +206,15 @@ impl App {
                 for c in changes {
                     self.apply_rating_change_to_app(c, /* use_before */ false);
                 }
-                self.rebuild_visible_indices();
+                if self.items_are_rating_view {
+                    let view_changes: Vec<(String, u8)> = changes
+                        .iter()
+                        .map(|c| (c.path_key.clone(), c.after))
+                        .collect();
+                    self.refresh_rating_view_after_rating_changes(&view_changes);
+                } else {
+                    self.rebuild_visible_indices();
+                }
             }
             UndoEntry::Tag { changes, .. } => {
                 self.submit_tag_restore_jobs(changes, /* use_before */ false);
@@ -287,8 +303,16 @@ impl App {
             // 自身は self.items に含まれないため、ここに来る)。永続化に加えて、現在表示中
             // フォルダと一致する場合はアドレスバー側のキャッシュも同期する (Codex P2)。
             if let Some(db) = self.rating_db.as_ref() {
-                let meta = self.rating_meta_for_key_and_source(&c.path_key, &c.source_path);
-                let _ = db.set_user_rating(&c.path_key, target, meta.as_ref());
+                let fallback_meta;
+                let meta = match c.meta.as_ref() {
+                    Some(meta) => Some(meta),
+                    None => {
+                        fallback_meta =
+                            self.rating_meta_for_key_and_source(&c.path_key, &c.source_path);
+                        fallback_meta.as_ref()
+                    }
+                };
+                let _ = db.set_user_rating(&c.path_key, target, meta);
             }
             self.invalidate_rating_counts_cache();
             self.user_set_rating_keys.insert(c.path_key.clone());
@@ -559,6 +583,7 @@ impl App {
             changes.push(RatingChange {
                 path_key,
                 source_path,
+                meta: self.rating_meta_for_idx(idx),
                 before,
                 after,
             });
@@ -568,7 +593,7 @@ impl App {
 
     /// コンテナレーティング (Shift+F*) 用。現在表示中コンテナ 1 件の変更だけを積む。
     pub(crate) fn capture_container_rating_undo(&mut self, before: u8, after: u8) {
-        let Some((path_key, source_path)) = self.current_container_rating_key_and_source() else {
+        let Some((path_key, source_path, meta)) = self.current_container_rating_target() else {
             return;
         };
         let summary = if after == 0 {
@@ -580,6 +605,7 @@ impl App {
             vec![RatingChange {
                 path_key,
                 source_path,
+                meta: Some(meta),
                 before,
                 after,
             }],

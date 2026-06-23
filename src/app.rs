@@ -284,6 +284,12 @@ impl Drop for ZipEnumeratePending {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRatingViewZipDirOpen {
+    pub(crate) source_path: PathBuf,
+    pub(crate) dir_prefix: String,
+}
+
 /// 起動引数 / 2 重起動 activation で渡されたパスをどの文脈で開くか。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StartupOpenPathSource {
@@ -3896,6 +3902,9 @@ pub struct App {
     /// `zip_nav_show_current_level` の軽量経路 (install_new_items) を使い、これは
     /// `zip_nav` を維持する。
     pub(crate) zip_nav: Option<crate::zip_tree::ZipNavState>,
+    /// レーティング一覧から ZipDir を開いたとき、外側 ZIP の列挙完了後に
+    /// 目的の prefix へ入るための一時状態。
+    pub(crate) pending_rating_view_zipdir_open: Option<PendingRatingViewZipDirOpen>,
 
     // ── ファイル名 prefix スタック (v2.0.0、`docs/filename-stack-plan.md`) ──
     /// ユーザーのスタックモード ON 意図。トグルで切り替え、別フォルダへ移動すると
@@ -5870,6 +5879,7 @@ impl App {
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
             zip_nav: None,
+            pending_rating_view_zipdir_open: None,
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
@@ -10626,7 +10636,7 @@ impl App {
         }
     }
 
-    fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
+    pub(crate) fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
         if changes.is_empty() {
             self.rebuild_visible_indices();
             return;
@@ -10653,7 +10663,55 @@ impl App {
                 false
             }
         });
+        let existing: std::collections::HashSet<&str> = self
+            .rating_view_rows
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect();
+        let restore_keys: Vec<String> = changes
+            .iter()
+            .filter(|(key, stars)| {
+                *stars == view_stars && *stars > 0 && !existing.contains(key.as_str())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        drop(existing);
+        if restore_keys.len() > 16 {
+            self.reload_current_rating_view_preserving_sort();
+            return;
+        }
+        for key in restore_keys {
+            if let Some(row) = self.rating_view_row_for_key(&key) {
+                self.rating_view_rows.push(row);
+            }
+        }
         self.install_rating_view_rows();
+    }
+
+    fn rating_view_row_for_key(&self, key: &str) -> Option<crate::rating_view::RatingViewRow> {
+        let db = self.rating_db.as_ref()?;
+        let row = db.row_for_key(key).ok().flatten()?;
+        (row.stars == self.rating_view_stars)
+            .then(|| crate::rating_view::rating_row_to_view_row(&row))
+            .flatten()
+    }
+
+    fn reload_current_rating_view_preserving_sort(&mut self) {
+        let stars = self.rating_view_stars.clamp(1, 5);
+        if let Some(pending) = self.rating_view_pending.take() {
+            pending.cancel();
+        }
+        self.rating_view_stars = stars;
+        self.rating_view_rows.clear();
+        self.rating_view_skipped = 0;
+        self.address = format!(
+            "{} レーティング一覧を読み込み中…",
+            "★".repeat(stars as usize)
+        );
+        self.rating_view_pending = Some(crate::rating_view::spawn_rating_view_build(
+            crate::rating_db::RatingDb::db_path(),
+            stars,
+        ));
     }
 
     fn install_rating_view_rows(&mut self) {
@@ -11114,7 +11172,7 @@ impl App {
         let (items, image_metas) = nav.materialize_current(sort);
 
         self.start_loading_items(
-            zip_path,
+            zip_path.clone(),
             items,
             image_metas,
             existing_keys,
@@ -11133,6 +11191,7 @@ impl App {
             self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
+        self.enter_pending_rating_view_zipdir_after_open(&zip_path);
 
         // 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出した場合の変換提案の段取り。
         // 自動フルスクリーン予約 (deferred) と同フレームでぶつかると、提案ダイアログが
@@ -11390,6 +11449,52 @@ impl App {
             }
         };
         self.address = addr;
+    }
+
+    /// レーティング一覧に復元された ZipDir セルを開く。
+    /// 一覧ビューには `zip_nav` が無いので、外側 ZIP / 変換アーカイブを通常経路で開き、
+    /// 列挙完了後に `dir_prefix` へ入る。
+    pub(crate) fn open_rating_view_zipdir(&mut self, zip_path: PathBuf, dir_prefix: String) {
+        if dir_prefix.is_empty() {
+            return;
+        }
+        self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
+            source_path: zip_path.clone(),
+            dir_prefix,
+        });
+        if matches!(
+            self.load_folder_or_convert_archive(zip_path),
+            FolderOpenOutcome::Ignored
+        ) {
+            self.pending_rating_view_zipdir_open = None;
+        }
+    }
+
+    fn enter_pending_rating_view_zipdir_after_open(&mut self, loaded_zip_path: &Path) -> bool {
+        let Some(pending) = self.pending_rating_view_zipdir_open.take() else {
+            return false;
+        };
+        let source_matches_loaded =
+            crate::folder_tree::path_eq(&pending.source_path, loaded_zip_path);
+        let source_matches_override = self
+            .archive_source_override
+            .as_ref()
+            .is_some_and(|source| crate::folder_tree::path_eq(source, &pending.source_path));
+        if !source_matches_loaded && !source_matches_override {
+            crate::logger::log(format!(
+                "rating-view zipdir open dropped: pending={} loaded={}",
+                pending.source_path.display(),
+                loaded_zip_path.display()
+            ));
+            return false;
+        }
+        let Some(nav) = self.zip_nav.as_mut() else {
+            self.pending_rating_view_zipdir_open = Some(pending);
+            return false;
+        };
+        nav.enter(&pending.dir_prefix);
+        self.zip_nav_show_current_level();
+        true
     }
 
     /// `ZipDir` セルへ降りる (Enter / ダブルクリック / ゲームパッド accept)。
@@ -18623,6 +18728,15 @@ impl App {
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
+                        // レーティング一覧に復元された ZipDir は zip_nav を持たないので、
+                        // 外側 ZIP を開いてから該当 prefix へ入る。
+                        Some(GridItem::ZipDir {
+                            zip_path,
+                            dir_prefix,
+                            ..
+                        }) if self.items_are_rating_view => {
+                            self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
+                        }
                         // ネスト ZIP ツリーの子コンテナへ Enter で降りる (Phase 3)。
                         Some(GridItem::ZipDir { dir_prefix, .. }) => {
                             let dp = dir_prefix.clone();
@@ -23900,7 +24014,7 @@ impl App {
         }
     }
 
-    fn rating_meta_for_idx(&self, idx: usize) -> Option<crate::rating_db::RatingMeta> {
+    pub(crate) fn rating_meta_for_idx(&self, idx: usize) -> Option<crate::rating_db::RatingMeta> {
         use crate::rating_db::{RatingItemKind, RatingMeta};
         let item = self.items.get(idx)?;
         let mut meta = match item {
@@ -24703,7 +24817,7 @@ impl App {
     /// - 本の中: BS で戻った親階層に表示される `ZipDir` セルと同じ合成キー
     /// を使う。collapse で `bookB/only/` まで自動降下していても、親セルが `bookB/`
     /// なら `root\bookB` に保存する。
-    fn current_container_rating_target(
+    pub(crate) fn current_container_rating_target(
         &self,
     ) -> Option<(String, PathBuf, crate::rating_db::RatingMeta)> {
         use crate::rating_db::{RatingItemKind, RatingMeta};
