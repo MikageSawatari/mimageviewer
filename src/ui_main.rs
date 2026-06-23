@@ -425,13 +425,30 @@ fn draw_facet_checkbox_choice(
                     changed = true;
                 }
                 let label_width = ui.available_width().max(1.0);
-                let label_response = ui.add_sized(
-                    egui::vec2(label_width, row_h),
-                    egui::Label::new(text)
-                        .truncate()
-                        .halign(egui::Align::Min)
-                        .sense(egui::Sense::click()),
-                );
+                let (label_rect, label_response) =
+                    ui.allocate_exact_size(egui::vec2(label_width, row_h), egui::Sense::click());
+                if ui.is_rect_visible(label_rect) {
+                    let text_color = ui.style().interact(&label_response).text_color();
+                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                    // 1 行に収め、はみ出す分は省略記号 (…) で truncate する。hard clip ではなく
+                    // galley の overflow_character を使うことで Label::truncate() 相当の見た目を保つ。
+                    let mut job = egui::text::LayoutJob::single_section(
+                        text,
+                        egui::text::TextFormat::simple(font_id, text_color),
+                    );
+                    job.wrap = egui::text::TextWrapping {
+                        max_width: label_rect.width(),
+                        max_rows: 1,
+                        break_anywhere: true,
+                        overflow_character: Some('…'),
+                    };
+                    let galley = ui.painter().layout_job(job);
+                    let text_pos = egui::pos2(
+                        label_rect.left(),
+                        label_rect.center().y - galley.size().y * 0.5,
+                    );
+                    ui.painter().galley(text_pos, galley, text_color);
+                }
                 if label_response.clicked() {
                     *selected = !*selected;
                     changed = true;
@@ -6373,6 +6390,11 @@ impl App {
                     prepare_facet_menu_popup(ui);
                     ui.set_min_width(292.0);
                     self.draw_image_color_picker_header(ui);
+                    ui.label(
+                        egui::RichText::new("画像のみが対象です（動画・フォルダ・書庫は除外）")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
                     ui.add_space(6.0);
                     changed |= self.draw_image_color_sv_square(ui);
                     ui.add_space(6.0);
