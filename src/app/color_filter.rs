@@ -385,6 +385,9 @@ impl App {
         let cache_decision = CacheDecision::from_settings(&self.settings);
         let stats = Arc::clone(&self.stats);
         let pin_db = self.folder_thumb_pin_db.clone();
+        // サムネ生成と同じ並列度設定に従う (Auto = cores/2)。デコードを並列化しつつ
+        // I/O 競合を抑える。
+        let threads = self.settings.parallelism.thread_count();
         let total = pending.total;
 
         if crate::perf::is_enabled() {
@@ -415,6 +418,7 @@ impl App {
                     cache_decision,
                     stats,
                     pin_db,
+                    threads,
                     cancel,
                     tx,
                 );
@@ -615,18 +619,21 @@ fn run_color_scan_worker(
     cache_decision: CacheDecision,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    threads: usize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<crate::color_search::ColorScanMessage>,
 ) {
     let done = Arc::new(AtomicUsize::new(0));
     let keep_start = Arc::new(AtomicUsize::new(0));
     let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
-    let mut cancelled = false;
 
-    for item in work_items {
+    // 1 件ぶんの処理。`cache_map` / `catalog` (Mutex<Connection>) / `stats` はいずれも
+    // 内部同期されているので複数スレッドから安全に共有できる。`tx` は for_each_with の
+    // per-thread clone で渡す (Sender は !Sync のため)。
+    let process = |tx: &mut mpsc::Sender<crate::color_search::ColorScanMessage>,
+                   item: ColorScanWorkItem| {
         if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            break;
+            return;
         }
         let mtime = item.req.mtime;
         let file_size = item.req.file_size;
@@ -645,27 +652,58 @@ fn run_color_scan_worker(
             pin_db.as_deref(),
         )
         .unwrap_or_default();
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = tx.send(crate::color_search::ColorScanMessage::Item(
+            crate::color_search::ColorScanItemResult {
+                key: item.key,
+                mtime,
+                file_size,
+                palette,
+            },
+        ));
+    };
 
-        if tx
-            .send(crate::color_search::ColorScanMessage::Item(
-                crate::color_search::ColorScanItemResult {
-                    key: item.key,
-                    mtime,
-                    file_size,
-                    palette,
-                },
-            ))
-            .is_err()
-        {
-            cancelled = true;
-            break;
+    let pool = (threads > 1)
+        .then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .ok()
+        })
+        .flatten();
+
+    match pool {
+        Some(pool) => {
+            use rayon::prelude::*;
+            // Sender は !Sync なので install クロージャ内で clone せず、事前に clone して move で渡す。
+            let tx_pool = tx.clone();
+            // pool.install で par_iter を専用プール上で動かす (グローバル rayon プールを
+            // 占有してサムネ/補正処理を止めないため)。install は全タスク完了まで block するので、
+            // 抜けた時点で Item は全て tx に積まれている (= Done より前)。
+            pool.install(move || {
+                work_items
+                    .into_par_iter()
+                    .for_each_with(tx_pool, |tx, item| process(tx, item));
+            });
+        }
+        None => {
+            // 並列度 1 / プール生成失敗時は逐次実行にフォールバック。
+            let mut tx_seq = tx.clone();
+            for item in work_items {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                process(&mut tx_seq, item);
+            }
         }
     }
 
     let _ = tx.send(crate::color_search::ColorScanMessage::Done {
         scan_id,
         scope_signature,
-        cancelled: cancelled || cancel.load(Ordering::Relaxed),
+        cancelled: cancel.load(Ordering::Relaxed),
     });
 }
 
