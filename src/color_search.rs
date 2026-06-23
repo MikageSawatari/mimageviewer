@@ -119,8 +119,6 @@ pub struct ColorFilterState {
     pub input_mode: ColorInputMode,
     pub hex_input: String,
     pub picker_hue_degrees: f32,
-    pub eyedropper_active: bool,
-    pub eyedropper_last_primary_down: bool,
     pub palettes: ScanPalettes,
     pub pending: Option<ColorScanPending>,
     pub confirmation: Option<ColorScanConfirmation>,
@@ -138,8 +136,6 @@ impl Default for ColorFilterState {
             input_mode: ColorInputMode::default(),
             hex_input: hex_rgb(DEFAULT_QUERY_RGB),
             picker_hue_degrees: hue,
-            eyedropper_active: false,
-            eyedropper_last_primary_down: false,
             palettes: ScanPalettes::default(),
             pending: None,
             confirmation: None,
@@ -162,8 +158,6 @@ impl ColorFilterState {
         self.confirmed_large_scan_scope = None;
         self.enabled = false;
         self.applied_scope_signature = None;
-        self.eyedropper_active = false;
-        self.eyedropper_last_primary_down = false;
     }
 
     pub fn clear_for_new_items(&mut self) {
@@ -173,8 +167,6 @@ impl ColorFilterState {
         self.enabled = false;
         self.applied_scope_signature = None;
         self.palettes.clear();
-        self.eyedropper_active = false;
-        self.eyedropper_last_primary_down = false;
     }
 
     pub fn query_lab(&self) -> [f32; 3] {

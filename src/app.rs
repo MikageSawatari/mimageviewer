@@ -37433,7 +37433,6 @@ impl eframe::App for App {
 
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
-        self.poll_image_color_eyedropper(ctx);
         self.render_details_lazy_status_bar(ctx);
         let folder_pane_nav = self.render_folder_pane(ctx);
 

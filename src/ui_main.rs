@@ -402,85 +402,6 @@ fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text.into()).small().strong());
 }
 
-fn draw_image_color_eyedropper_loupe(
-    ctx: &egui::Context,
-    sample: &crate::screen_color_picker::ScreenColorSample,
-) {
-    let Some(pointer_pos) = ctx.pointer_hover_pos() else {
-        return;
-    };
-    let side = sample.side();
-    if side == 0 {
-        return;
-    }
-    let tile = 8.0;
-    let padding = 8.0;
-    let diameter = side as f32 * tile + padding * 2.0;
-    let screen_rect = ctx.content_rect();
-    let mut pos = pointer_pos + egui::vec2(24.0, 24.0);
-    if pos.x + diameter > screen_rect.right() {
-        pos.x = pointer_pos.x - diameter - 18.0;
-    }
-    if pos.y + diameter > screen_rect.bottom() {
-        pos.y = pointer_pos.y - diameter - 18.0;
-    }
-    pos.x = pos.x.max(screen_rect.left() + 4.0);
-    pos.y = pos.y.max(screen_rect.top() + 4.0);
-
-    egui::Area::new(egui::Id::new("image_color_eyedropper_loupe"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(pos)
-        .show(ctx, |ui| {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
-            let painter = ui.painter_at(rect);
-            let center = rect.center();
-            let outer_r = diameter * 0.5;
-            let grid_r = outer_r - padding;
-            painter.circle_filled(center, outer_r, egui::Color32::from_gray(235));
-            painter.circle_stroke(
-                center,
-                outer_r - 0.5,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
-            );
-            let grid_min = center - egui::vec2(side as f32 * tile, side as f32 * tile) * 0.5;
-            for y in 0..side {
-                for x in 0..side {
-                    let cell_center =
-                        grid_min + egui::vec2((x as f32 + 0.5) * tile, (y as f32 + 0.5) * tile);
-                    if cell_center.distance(center) > grid_r {
-                        continue;
-                    }
-                    if let Some(rgb) = sample.pixel(x, y) {
-                        let cell = egui::Rect::from_center_size(
-                            cell_center,
-                            egui::vec2(tile + 0.25, tile + 0.25),
-                        );
-                        painter.rect_filled(
-                            cell,
-                            0.0,
-                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-                        );
-                    }
-                }
-            }
-            let center_cell =
-                egui::Rect::from_center_size(center, egui::vec2(tile * 1.35, tile * 1.35));
-            painter.rect_stroke(
-                center_cell,
-                egui::CornerRadius::same(1),
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
-                egui::epaint::StrokeKind::Outside,
-            );
-            painter.rect_stroke(
-                center_cell.expand(1.5),
-                egui::CornerRadius::same(2),
-                egui::Stroke::new(1.0, egui::Color32::BLACK),
-                egui::epaint::StrokeKind::Outside,
-            );
-        });
-}
-
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
 ///
@@ -6233,78 +6154,86 @@ impl App {
     fn draw_facet_color_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let active = usize::from(self.color_filter.enabled);
-        let menu = ui.menu_button(facet_menu_label("画像色", active), |ui| {
-            prepare_facet_menu_popup(ui);
-            ui.set_min_width(292.0);
-            self.draw_image_color_picker_header(ui);
-            ui.add_space(6.0);
-            changed |= self.draw_image_color_sv_square(ui);
-            ui.add_space(6.0);
-            changed |= self.draw_image_color_hue_slider(ui);
-            ui.add_space(8.0);
-            changed |= self.draw_image_color_presets(ui);
-            ui.add_space(6.0);
-            changed |= self.draw_image_color_inputs(ui);
-            ui.add_space(6.0);
-            changed |= self.draw_image_color_eyedropper(ui);
-            ui.add_space(4.0);
-            changed |= self.draw_image_color_tolerance(ui);
+        let menu_config = egui::containers::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (menu_response, _) =
+            egui::containers::menu::MenuButton::new(facet_menu_label("画像色", active))
+                .config(menu_config)
+                .ui(ui, |ui| {
+                    prepare_facet_menu_popup(ui);
+                    ui.set_min_width(292.0);
+                    self.draw_image_color_picker_header(ui);
+                    ui.add_space(6.0);
+                    changed |= self.draw_image_color_sv_square(ui);
+                    ui.add_space(6.0);
+                    changed |= self.draw_image_color_hue_slider(ui);
+                    ui.add_space(8.0);
+                    changed |= self.draw_image_color_presets(ui);
+                    ui.add_space(6.0);
+                    changed |= self.draw_image_color_inputs(ui);
+                    ui.add_space(6.0);
+                    changed |= self.draw_image_color_tolerance(ui);
 
-            if let Some(pending) = self.color_filter.pending.as_ref() {
-                ui.separator();
-                ui.label(format!(
-                    "画像色をスキャン中... {}/{}",
-                    pending.done, pending.total
-                ));
-                let progress = if pending.total == 0 {
-                    0.0
-                } else {
-                    pending.done as f32 / pending.total as f32
-                };
-                ui.add(egui::ProgressBar::new(progress).desired_width(160.0));
-                if ui.small_button("キャンセル").clicked() {
-                    self.color_filter.cancel_pending();
-                    self.color_filter.confirmation = None;
-                    self.color_filter.confirmed_large_scan_scope = None;
-                    self.color_filter.enabled = false;
-                    self.color_filter.applied_scope_signature = None;
-                    changed = true;
-                    ui.close();
-                }
-            } else if let Some(confirmation) = self.color_filter.confirmation.clone() {
-                ui.separator();
-                ui.label(format!(
-                    "未スキャンの画像 {} 件を確認します",
-                    confirmation.missing
-                ));
-                ui.horizontal(|ui| {
-                    if ui.small_button("スキャン開始").clicked() {
-                        self.confirm_large_color_scan(ui.ctx());
-                        changed = true;
+                    if let Some(pending) = self.color_filter.pending.as_ref() {
+                        ui.separator();
+                        ui.label(format!("絞り込み準備中 {}/{}", pending.done, pending.total));
+                        let progress = if pending.total == 0 {
+                            0.0
+                        } else {
+                            pending.done as f32 / pending.total as f32
+                        };
+                        ui.add(egui::ProgressBar::new(progress).desired_width(160.0));
+                        if ui.small_button("キャンセル").clicked() {
+                            self.color_filter.cancel_pending();
+                            self.color_filter.confirmation = None;
+                            self.color_filter.confirmed_large_scan_scope = None;
+                            self.color_filter.enabled = false;
+                            self.color_filter.applied_scope_signature = None;
+                            changed = true;
+                            ui.close();
+                        }
+                    } else if let Some(confirmation) = self.color_filter.confirmation.clone() {
+                        ui.separator();
+                        ui.label(format!(
+                            "未スキャンの画像 {} 件を確認します",
+                            confirmation.missing
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.small_button("スキャン開始").clicked() {
+                                self.confirm_large_color_scan(ui.ctx());
+                                changed = true;
+                                ui.close();
+                            }
+                            if ui.small_button("キャンセル").clicked() {
+                                self.cancel_large_color_scan_confirmation();
+                                changed = true;
+                                ui.close();
+                            }
+                        });
+                    } else if self.color_filter.enabled {
+                        ui.separator();
+                        ui.label(format!(
+                            "画像色で絞り込み中 {}",
+                            crate::color_search::hex_rgb(self.color_filter.query_rgb)
+                        ));
+                    }
+
+                    ui.separator();
+                    if !self.color_filter.enabled
+                        && ui.small_button("この画像色で絞り込み").clicked()
+                    {
+                        changed |= self.activate_image_color_filter_from_ui();
                         ui.close();
                     }
-                    if ui.small_button("キャンセル").clicked() {
-                        self.cancel_large_color_scan_confirmation();
+                    if self.color_filter.enabled
+                        && ui.small_button("画像色フィルタを解除").clicked()
+                    {
+                        self.color_filter.clear_filter();
                         changed = true;
                         ui.close();
                     }
                 });
-            }
-
-            ui.separator();
-            if ui.small_button("この画像色で絞り込み").clicked() {
-                self.color_filter.enabled = true;
-                changed = true;
-                ui.close();
-            }
-            if self.color_filter.enabled && ui.small_button("画像色フィルタを解除").clicked()
-            {
-                self.color_filter.clear_filter();
-                changed = true;
-                ui.close();
-            }
-        });
-        let menu_response = menu.response.on_hover_text(
+        let menu_response = menu_response.on_hover_text(
             "画像として扱える項目だけを、主要色で絞り込みます。動画やフォルダは対象外です。",
         );
         suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
@@ -6548,59 +6477,6 @@ impl App {
         changed
     }
 
-    pub(crate) fn poll_image_color_eyedropper(&mut self, ctx: &egui::Context) {
-        if !self.color_filter.eyedropper_active {
-            return;
-        }
-
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.color_filter.eyedropper_active = false;
-            self.color_filter.eyedropper_last_primary_down = false;
-            ctx.request_repaint();
-            return;
-        }
-
-        if let Some(sample) = crate::screen_color_picker::sample_cursor(8) {
-            if self.set_image_color_query_from_ui(sample.center_rgb) {
-                self.ensure_color_scan_for_current_scope(ctx);
-            }
-            draw_image_color_eyedropper_loupe(ctx, &sample);
-        }
-
-        let primary_down = crate::screen_color_picker::primary_button_down();
-        if primary_down && !self.color_filter.eyedropper_last_primary_down {
-            self.color_filter.eyedropper_active = false;
-            self.color_filter.eyedropper_last_primary_down = false;
-            self.show_feedback_toast(format!(
-                "スポイト: {}",
-                crate::color_search::hex_rgb(self.color_filter.query_rgb)
-            ));
-        } else {
-            self.color_filter.eyedropper_last_primary_down = primary_down;
-        }
-        ctx.request_repaint();
-    }
-
-    fn draw_image_color_eyedropper(&mut self, ui: &mut egui::Ui) -> bool {
-        let active = self.color_filter.eyedropper_active;
-        ui.horizontal(|ui| {
-            let label = if active {
-                "スポイト解除"
-            } else {
-                "スポイト"
-            };
-            if ui.selectable_label(active, label).clicked() {
-                self.color_filter.eyedropper_active = !active;
-                self.color_filter.eyedropper_last_primary_down =
-                    crate::screen_color_picker::primary_button_down();
-            }
-            if active {
-                ui.label("クリックで確定 / Escで中止");
-            }
-        });
-        false
-    }
-
     fn draw_image_color_tolerance(&mut self, ui: &mut egui::Ui) -> bool {
         let mut tolerance = self.color_filter.tolerance;
         if ui
@@ -6614,7 +6490,8 @@ impl App {
             .changed()
         {
             self.color_filter.tolerance = tolerance;
-            return self.color_filter_effectively_active();
+            self.activate_image_color_filter_from_ui();
+            return true;
         }
         false
     }
@@ -6635,11 +6512,20 @@ impl App {
     }
 
     fn set_image_color_query_from_ui(&mut self, rgb: [u8; 3]) -> bool {
-        if self.color_filter.query_rgb == rgb {
+        let changed = self.color_filter.query_rgb != rgb;
+        if changed {
+            self.color_filter.set_query_rgb(rgb);
+        }
+        let activated = self.activate_image_color_filter_from_ui();
+        changed || activated
+    }
+
+    fn activate_image_color_filter_from_ui(&mut self) -> bool {
+        if self.color_filter.enabled {
             return false;
         }
-        self.color_filter.set_query_rgb(rgb);
-        self.color_filter_effectively_active()
+        self.color_filter.enabled = true;
+        true
     }
 
     fn draw_facet_active_chips(&self, ui: &mut egui::Ui) {

@@ -17,10 +17,6 @@ impl App {
             && !self.tag_view.on_results_grid()
     }
 
-    pub(crate) fn color_filter_effectively_active(&self) -> bool {
-        self.color_filter.enabled && self.color_filter.applied_scope_signature.is_some()
-    }
-
     pub(crate) fn clear_color_filter_for_new_items(&mut self) {
         self.color_filter.clear_for_new_items();
     }
