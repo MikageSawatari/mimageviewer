@@ -100,6 +100,7 @@ pub mod perf;
 pub mod png_metadata;
 pub mod post_filter;
 pub mod rating_db;
+pub mod rating_view;
 pub mod rating_write_worker;
 pub mod ring_shortcut;
 pub mod rotation_db;

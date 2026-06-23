@@ -287,8 +287,10 @@ impl App {
             // 自身は self.items に含まれないため、ここに来る)。永続化に加えて、現在表示中
             // フォルダと一致する場合はアドレスバー側のキャッシュも同期する (Codex P2)。
             if let Some(db) = self.rating_db.as_ref() {
-                let _ = db.set(&c.path_key, target);
+                let meta = self.rating_meta_for_key_and_source(&c.path_key, &c.source_path);
+                let _ = db.set_user_rating(&c.path_key, target, meta.as_ref());
             }
+            self.invalidate_rating_counts_cache();
             self.user_set_rating_keys.insert(c.path_key.clone());
             if self
                 .current_container_rating_key_and_source()

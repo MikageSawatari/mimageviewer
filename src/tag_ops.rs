@@ -232,8 +232,7 @@ impl App {
         //   - Ctrl+S お気に入り検索 / 読書履歴: current_folder が擬似パスになるのでパス一致で判定。
         //   - タグビュー / ドライブ一覧: 専用フラグ。
         if self.global_search.active
-            || folder == crate::app::search_results_synthetic_path()
-            || folder == crate::app::reading_history_synthetic_path()
+            || crate::app::is_synthetic_view_path(&folder)
             || self.items_are_tag_view
             || self.items_are_drive_list
         {

@@ -2267,6 +2267,22 @@ pub(crate) fn reading_history_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__reading_history__")
 }
 
+/// レーティング一覧ビューで current_folder に設定する合成パス。
+/// `%APPDATA%/mimageviewer/__rating_view__` (実在させない、カタログキーとしてのみ使用)。
+pub(crate) fn rating_view_synthetic_path() -> PathBuf {
+    crate::data_dir::get().join("__rating_view__")
+}
+
+/// 実フォルダではない仮想フラットビューの合成パスか。
+///
+/// 検索固有の分岐には使わず、`delete_missing` / `last_folder` 保存 / コンテナ★など
+/// 「実在パスを要求する汎用ガード」で使う。
+pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
+    crate::folder_tree::path_eq(path, &search_results_synthetic_path())
+        || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
+        || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
+}
+
 /// サムネイル色調補正の対象アイテムかどうか。
 ///
 /// 補正は「ページ単位の色調を持つ画像系」だけに掛ける ([docs/display-pipeline.md §1.5](docs/display-pipeline.md))。
@@ -2768,6 +2784,8 @@ pub struct App {
     pub(crate) items_are_tag_view: bool,
     /// 現在の `items` が読書履歴の仮想ビューかを示す。
     pub(crate) items_are_reading_history_view: bool,
+    /// 現在の `items` がレーティング一覧の仮想ビューかを示す。
+    pub(crate) items_are_rating_view: bool,
     /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
     /// `current_folder = None` と併用し、通常フォルダの D&D / rating / 代表サムネ探索
     /// を明示的に止める。
@@ -3517,6 +3535,9 @@ pub struct App {
     /// `load_folder` / `set_current_folder_rating` / `set_rating` (コンテナ変更時) で
     /// `None` に戻して無効化する。
     pub(crate) current_folder_rating_cache: Option<u8>,
+    /// ファイルメニュー / 場所▼ の ★別件数。描画フレームごとの SQLite 集計を避け、
+    /// レーティング DB を変更した経路で無効化する。
+    pub(crate) rating_counts_cache: Option<[usize; 6]>,
 
     /// ★フィルタの一時解除: 自分の★を持つコンテナ (Folder / ZIP / PDF) を開いた時、
     /// 中身には個別★が付いていないために全項目が非表示になる "空表示" 事故を防ぐ。
@@ -3549,6 +3570,15 @@ pub struct App {
     /// が同フォルダで再 spawn しないための change-detection に使う (handle を見ると
     /// worker 終了直後に再 spawn ループになる既知バグを避けるため handle ではなくこれ)。
     pub(crate) folder_rating_counts_folder_key: Option<String>,
+
+    /// レーティング一覧ビューの状態。
+    pub(crate) rating_view_stars: u8,
+    pub(crate) rating_view_sort: crate::rating_view::RatingViewSort,
+    pub(crate) rating_view_rows: Vec<crate::rating_view::RatingViewRow>,
+    pub(crate) rating_view_pending: Option<crate::rating_view::RatingViewPending>,
+    pub(crate) rating_view_skipped: usize,
+    pub(crate) rating_view_saved_folder: Option<PathBuf>,
+    pub(crate) rating_view_nav_stack: Vec<PathBuf>,
 
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
     /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
@@ -5441,6 +5471,7 @@ impl App {
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
+            items_are_rating_view: false,
             items_are_drive_list: false,
             show_favorites_editor: false,
             favorite_delete_confirm: None,
@@ -5713,10 +5744,18 @@ impl App {
             rating_filter_suppressed_at: None,
             user_set_rating_keys: std::collections::HashSet::new(),
             current_folder_rating_cache: None,
+            rating_counts_cache: None,
             folder_rating_counts: std::collections::HashMap::new(),
             folder_rating_counts_loaded: false,
             folder_rating_counter_handle: None,
             folder_rating_counts_folder_key: None,
+            rating_view_stars: 0,
+            rating_view_sort: crate::rating_view::RatingViewSort::default(),
+            rating_view_rows: Vec::new(),
+            rating_view_pending: None,
+            rating_view_skipped: 0,
+            rating_view_saved_folder: None,
+            rating_view_nav_stack: Vec::new(),
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
             book_resume_writer,
@@ -6292,11 +6331,12 @@ impl App {
             || self.tag_view.active
             || self.items_are_global_search_view
             || self.items_are_tag_view
+            || self.items_are_rating_view
         {
             return None;
         }
         let path = self.effective_folder()?;
-        if crate::folder_tree::path_eq(&path, &search_results_synthetic_path()) {
+        if is_synthetic_view_path(&path) {
             return None;
         }
         Some(path)
@@ -7505,14 +7545,13 @@ impl App {
             || self.tag_view.active
             || self.items_are_global_search_view
             || self.items_are_tag_view
+            || self.items_are_rating_view
             || self.is_snapshot_active()
         {
             return None;
         }
         let target = self.effective_folder()?;
-        if crate::folder_tree::path_eq(&target, &search_results_synthetic_path())
-            || crate::folder_tree::path_eq(&target, &reading_history_synthetic_path())
-        {
+        if is_synthetic_view_path(&target) {
             return None;
         }
         Some(target)
@@ -7656,14 +7695,12 @@ impl App {
             return;
         }
 
-        // 合成パス (__search_results__ / __reading_history__) は実在しないため、移動元
+        // 合成パス (__search_results__ / __reading_history__ / __rating_view__) は実在しないため、移動元
         // として履歴スタックに積まない (戻る/Alt+← で実フォルダとして開こうとして失敗する
         // のを防ぐ。読書履歴へ戻る導線は reading_history_back_nav 経由の専用経路を使う)。
         // ただし新しい遷移自体は発生しているので forward 履歴はクリアする
         // (新規ナビゲーションが forward 履歴を無効化する原則)。
-        if crate::folder_tree::path_eq(&current, &search_results_synthetic_path())
-            || crate::folder_tree::path_eq(&current, &reading_history_synthetic_path())
-        {
+        if is_synthetic_view_path(&current) {
             self.clear_active_folder_nav_forward_stack();
             self.update_active_quick_folder_target(target);
             return;
@@ -8065,6 +8102,17 @@ impl App {
             self.execute_tag_view();
             return;
         }
+        if self.items_are_rating_view {
+            if matches!(
+                self.rating_view_sort,
+                crate::rating_view::RatingViewSort::Normal(_)
+            ) {
+                self.rating_view_sort =
+                    crate::rating_view::RatingViewSort::Normal(self.settings.sort_order);
+            }
+            self.install_rating_view_rows();
+            return;
+        }
         if let Some(path) = self.current_folder.clone() {
             self.folder_history.remove(&path);
             self.load_folder(path);
@@ -8318,8 +8366,8 @@ impl App {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
                 || self.items_are_reading_history_view
-                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path())
-                || crate::folder_tree::path_eq(&cur, &reading_history_synthetic_path());
+                || self.items_are_rating_view
+                || is_synthetic_view_path(&cur);
             if !leaving_search_view && !self.items_are_drive_list {
                 self.folder_history
                     .insert(cur, (self.scroll_offset_y, self.selected));
@@ -10486,6 +10534,221 @@ impl App {
         }
     }
 
+    /// ★N が付いたアイテム / コンテナをフラットに並べるレーティング一覧ビューを開く。
+    pub(crate) fn enter_rating_view(&mut self, stars: u8) {
+        let stars = stars.clamp(1, 5);
+        crate::logger::log(format!("=== enter_rating_view stars={stars} ==="));
+        self.gamepad_location_picker = None;
+        if let Some(pending) = self.rating_view_pending.take() {
+            pending.cancel();
+        }
+        self.rating_view_stars = stars;
+        self.rating_view_sort = crate::rating_view::RatingViewSort::default();
+        self.rating_view_rows.clear();
+        self.rating_view_skipped = 0;
+        self.rating_view_nav_stack.clear();
+        self.rating_view_saved_folder = self
+            .current_folder
+            .clone()
+            .filter(|p| !is_synthetic_view_path(p));
+
+        if self.global_search.active {
+            self.global_search.saved_folder = None;
+            self.close_global_search();
+        }
+        if self.favsearch.active {
+            self.favsearch.saved_folder = None;
+            self.close_favsearch();
+        }
+        if self.tag_view.active {
+            self.tag_view.saved_folder = None;
+            self.close_tag_view();
+        }
+        if self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            self.search_has_focus = false;
+            self.search_tag_bridge.clear();
+            self.cancel_search_pending();
+        }
+
+        self.address = format!(
+            "{} レーティング一覧を読み込み中…",
+            "★".repeat(stars as usize)
+        );
+        self.rating_view_pending = Some(crate::rating_view::spawn_rating_view_build(
+            crate::rating_db::RatingDb::db_path(),
+            stars,
+        ));
+    }
+
+    pub(crate) fn poll_rating_view(&mut self) {
+        let Some(pending) = self.rating_view_pending.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.rating_view_pending = None;
+                if result.stars == self.rating_view_stars {
+                    self.apply_rating_view_result(result);
+                }
+            }
+            Ok(Err(msg)) => {
+                self.rating_view_pending = None;
+                crate::logger::log(format!("rating-view: build failed: {msg}"));
+                self.show_feedback_toast("[レーティング一覧を読み込めませんでした]".to_string());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rating_view_pending = None;
+            }
+        }
+    }
+
+    fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
+        self.rating_view_rows = result.rows;
+        self.rating_view_skipped = result.skipped;
+        self.install_rating_view_rows();
+        if self.rating_view_skipped > 0 {
+            self.show_feedback_toast(format!(
+                "見つからない項目を {} 件除外しました",
+                self.rating_view_skipped
+            ));
+        }
+    }
+
+    pub(crate) fn set_rating_view_sort(&mut self, sort: crate::rating_view::RatingViewSort) {
+        self.rating_view_sort = sort;
+        if self.items_are_rating_view {
+            self.install_rating_view_rows();
+        }
+    }
+
+    fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
+        if changes.is_empty() {
+            self.rebuild_visible_indices();
+            return;
+        }
+        let view_stars = self.rating_view_stars;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis().min(i64::MAX as u128) as i64);
+        let changed: std::collections::HashMap<&str, u8> = changes
+            .iter()
+            .map(|(key, stars)| (key.as_str(), *stars))
+            .collect();
+        self.rating_view_rows.retain_mut(|row| {
+            let Some(&new_stars) = changed.get(row.key.as_str()) else {
+                return true;
+            };
+            if new_stars == view_stars && new_stars > 0 {
+                if let Some(ts) = now_ms {
+                    row.rated_at_ms = Some(ts);
+                }
+                true
+            } else {
+                false
+            }
+        });
+        self.install_rating_view_rows();
+    }
+
+    fn install_rating_view_rows(&mut self) {
+        let previous_selected = self.selected;
+        let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        crate::rating_view::sort_rows(&mut self.rating_view_rows, self.rating_view_sort);
+        let items: Vec<GridItem> = self
+            .rating_view_rows
+            .iter()
+            .map(|row| row.item.clone())
+            .collect();
+        let image_metas: Vec<Option<(i64, i64)>> = self
+            .rating_view_rows
+            .iter()
+            .map(|row| row.image_meta)
+            .collect();
+        let video_items: Vec<(usize, PathBuf, u64)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| match item {
+                GridItem::Video(path) => {
+                    let size = image_metas
+                        .get(idx)
+                        .and_then(|m| *m)
+                        .map(|(_, size)| size.max(0) as u64)
+                        .unwrap_or(0);
+                    Some((idx, path.clone(), size))
+                }
+                _ => None,
+            })
+            .collect();
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> =
+                items.iter().filter_map(GridItem::container_path).collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+        let existing_keys: std::collections::HashSet<String> = items
+            .iter()
+            .zip(image_metas.iter())
+            .flat_map(|(it, meta)| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    *meta,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                    true,
+                )
+            })
+            .collect();
+
+        self.start_loading_items(
+            rating_view_synthetic_path(),
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            None,
+        );
+        self.items_are_rating_view = true;
+        self.address = format!(
+            "{} レーティング一覧",
+            "★".repeat(self.rating_view_stars as usize)
+        );
+        self.rebuild_visible_indices();
+        let selected = previous_selected_key
+            .as_deref()
+            .and_then(|key| self.rating_view_rows.iter().position(|row| row.key == key))
+            .filter(|idx| self.visible_indices.contains(idx))
+            .or_else(|| {
+                previous_selected.and_then(|idx| {
+                    self.visible_indices
+                        .iter()
+                        .copied()
+                        .find(|&visible| visible >= idx)
+                        .or_else(|| self.visible_indices.last().copied())
+                })
+            })
+            .or_else(|| self.visible_indices.first().copied());
+        if let Some(idx) = selected {
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        }
+    }
+
     /// 読書履歴ビューから 1 件削除する。
     pub(crate) fn remove_reading_history_entry_for_idx(&mut self, idx: usize) {
         let Some(key) = self.items.get(idx).and_then(reading_history_key_for_item) else {
@@ -12106,6 +12369,11 @@ impl App {
         // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
         self.cancel_stack_script_pending();
         self.gamepad_location_picker = None;
+        if !crate::folder_tree::path_eq(&source_path, &rating_view_synthetic_path()) {
+            if let Some(pending) = self.rating_view_pending.take() {
+                pending.cancel();
+            }
+        }
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
         let preserve_archive_source_override = previous_archive_source_override.is_some()
@@ -12202,8 +12470,8 @@ impl App {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
                 || self.items_are_reading_history_view
-                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path())
-                || crate::folder_tree::path_eq(&cur, &reading_history_synthetic_path());
+                || self.items_are_rating_view
+                || is_synthetic_view_path(&cur);
             let has_grid_state_to_save =
                 !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
             if !leaving_search_view && has_grid_state_to_save {
@@ -12701,9 +12969,7 @@ impl App {
         }
 
         let catalog_del_t0 = std::time::Instant::now();
-        if source_path != search_results_synthetic_path()
-            && source_path != reading_history_synthetic_path()
-        {
+        if !is_synthetic_view_path(&source_path) {
             if let Some(ref cat) = catalog_arc {
                 if let Err(e) = cat.delete_missing(&catalog_existing_keys) {
                     crate::logger::log(format!("  catalog delete_missing failed: {e}"));
@@ -12843,11 +13109,9 @@ impl App {
         // restart the quiet window from the restored position.
         self.last_scroll_offset_y_tracked = self.scroll_offset_y;
         self.last_scroll_change_time = std::time::Instant::now();
-        // 検索結果 / 読書履歴用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
+        // 検索結果 / 読書履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
         let save_t0 = std::time::Instant::now();
-        if source_path != search_results_synthetic_path()
-            && source_path != reading_history_synthetic_path()
-        {
+        if !is_synthetic_view_path(&source_path) {
             // 変換アーカイブ (RAR/CBR/7z/LZH) 閲覧中は source_path (= current_folder) が
             // キャッシュ ZIP (`archive_cache\..\book.zip`) を指す。次回起動で復元すべきは
             // 元アーカイブなので、archive_source_override を反映した effective_folder() を
@@ -12927,6 +13191,7 @@ impl App {
         self.items_are_global_search_view = false;
         self.items_are_tag_view = false;
         self.items_are_reading_history_view = false;
+        self.items_are_rating_view = false;
         self.items_are_drive_list = false;
         self.reading_history_rows.clear();
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
@@ -13505,9 +13770,9 @@ impl App {
                 _ => {}
             }
         }
-        // current_folder 自身も lookup 対象に含める (検索合成パス / 検索ビューは除外)。
+        // current_folder 自身も lookup 対象に含める (合成パス / 検索ビューは除外)。
         if let Some(cur) = self.current_folder.as_ref() {
-            if *cur != search_results_synthetic_path()
+            if !is_synthetic_view_path(cur)
                 && !self.items_are_global_search_view
                 && !self.items_are_tag_view
             {
@@ -13672,9 +13937,9 @@ impl App {
         if self.items_are_global_search_view || self.items_are_tag_view {
             return None;
         }
-        // current_folder 未確定 (起動直後 / 検索結果合成パス) は描画しない
+        // current_folder 未確定 (起動直後 / 合成ビュー) は描画しない
         let container = self.current_folder.as_ref()?;
-        if *container == search_results_synthetic_path() {
+        if is_synthetic_view_path(container) {
             return None;
         }
         // 変換キャッシュ ZIP の内部を `zip_nav` で見ている場合は、pin_container_key()
@@ -13811,7 +14076,7 @@ impl App {
         let Some(container) = self.current_folder.clone() else {
             return;
         };
-        if container == search_results_synthetic_path() {
+        if is_synthetic_view_path(&container) {
             return;
         }
         if self.items_are_global_search_view || self.items_are_tag_view {
@@ -14008,7 +14273,7 @@ impl App {
         if self.items_are_global_search_view || self.items_are_tag_view {
             return false;
         }
-        if container == search_results_synthetic_path() {
+        if is_synthetic_view_path(&container) {
             return false;
         }
         // zip_nav がある変換キャッシュ閲覧中は元アーカイブパスへピンできる。
@@ -15437,6 +15702,7 @@ impl App {
     fn finish_book_page_edit_mapping(&mut self, op: &str, errors: Vec<String>) {
         self.clear_page_edit_state();
         self.rating_cache.clear();
+        self.invalidate_rating_counts_cache();
         self.tags_cache.clear();
         if errors.is_empty() {
             return;
@@ -19910,9 +20176,7 @@ impl App {
         match self.items.get(idx)? {
             GridItem::Image(_) => {
                 let folder = self.current_folder.clone()?;
-                if crate::folder_tree::path_eq(&folder, &search_results_synthetic_path())
-                    || crate::folder_tree::path_eq(&folder, &reading_history_synthetic_path())
-                {
+                if is_synthetic_view_path(&folder) {
                     return None;
                 }
                 Some((
@@ -22195,6 +22459,7 @@ impl App {
         // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
         let rating_filter_active = !self.items_are_drive_list
             && !self.items_are_reading_history_view
+            && !self.items_are_rating_view
             && !rating_filter.iter().all(|&b| b);
         let color_scope_signature =
             if self.color_filter.enabled && self.color_filter_available_in_current_view() {
@@ -22322,6 +22587,7 @@ impl App {
         let rating_filter = self.effective_rating_filter();
         let rating_filter_active = !self.items_are_drive_list
             && !self.items_are_reading_history_view
+            && !self.items_are_rating_view
             && !rating_filter.iter().all(|&b| b);
         let mut out = Vec::new();
         for i in 0..self.items.len() {
@@ -23568,6 +23834,122 @@ impl App {
         }
     }
 
+    fn rating_meta_for_idx(&self, idx: usize) -> Option<crate::rating_db::RatingMeta> {
+        use crate::rating_db::{RatingItemKind, RatingMeta};
+        let item = self.items.get(idx)?;
+        let mut meta = match item {
+            GridItem::Image(path) => RatingMeta::new(RatingItemKind::Image).with_source_path(path),
+            GridItem::Video(path) => RatingMeta::new(RatingItemKind::Video).with_source_path(path),
+            GridItem::Folder(path) => {
+                RatingMeta::new(RatingItemKind::Folder).with_source_path(path)
+            }
+            GridItem::ZipFile(path) => {
+                RatingMeta::new(RatingItemKind::ZipFile).with_source_path(path)
+            }
+            GridItem::PdfFile(path) => {
+                RatingMeta::new(RatingItemKind::PdfFile).with_source_path(path)
+            }
+            GridItem::ConvertibleArchive { path, format } => {
+                let mut meta =
+                    RatingMeta::new(RatingItemKind::ConvertibleArchive).with_source_path(path);
+                meta.archive_format = Some(archive_format_to_rating_str(*format).to_string());
+                meta
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                let mut meta = RatingMeta::new(RatingItemKind::ZipImage).with_source_path(zip_path);
+                meta.entry_name = Some(entry_name.clone());
+                meta
+            }
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => {
+                let mut meta = RatingMeta::new(RatingItemKind::PdfPage).with_source_path(pdf_path);
+                meta.page_num = Some(*page_num);
+                meta
+            }
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                is_archive,
+                representative,
+            } => {
+                let root = zip_rating_root_path(
+                    zip_path,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                );
+                let mut meta = RatingMeta::new(RatingItemKind::ZipDir).with_source_path(root);
+                meta.dir_prefix = Some(dir_prefix.clone());
+                meta.zipdir_is_archive = Some(*is_archive);
+                meta.zipdir_representative = representative.clone();
+                meta
+            }
+            _ => return None,
+        };
+        if meta.source_path.is_none()
+            && let Some(source) = self.rating_source_path(idx)
+        {
+            meta.source_path = Some(source.to_string_lossy().to_string());
+        }
+        Some(meta)
+    }
+
+    pub(crate) fn rating_meta_for_key_and_source(
+        &self,
+        key: &str,
+        source_path: &Path,
+    ) -> Option<crate::rating_db::RatingMeta> {
+        use crate::rating_db::{RatingItemKind, RatingMeta};
+        let ext = source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut meta = if let Some((_, right)) = key.split_once("::") {
+            if ext == "pdf" {
+                let page_num = right.strip_prefix("page_")?.parse::<u32>().ok()?;
+                let mut meta =
+                    RatingMeta::new(RatingItemKind::PdfPage).with_source_path(source_path);
+                meta.page_num = Some(page_num);
+                meta
+            } else if entry_name_is_image(right) {
+                let mut meta =
+                    RatingMeta::new(RatingItemKind::ZipImage).with_source_path(source_path);
+                meta.entry_name = Some(right.to_string());
+                meta
+            } else {
+                return None;
+            }
+        } else if std::fs::metadata(source_path)
+            .ok()
+            .is_some_and(|m| m.is_dir())
+        {
+            RatingMeta::new(RatingItemKind::Folder).with_source_path(source_path)
+        } else if crate::folder_tree::is_recognized_image_ext(&ext) {
+            RatingMeta::new(RatingItemKind::Image).with_source_path(source_path)
+        } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+            RatingMeta::new(RatingItemKind::Video).with_source_path(source_path)
+        } else if crate::folder_tree::is_zip_extension(&ext) {
+            RatingMeta::new(RatingItemKind::ZipFile).with_source_path(source_path)
+        } else if ext == "pdf" {
+            RatingMeta::new(RatingItemKind::PdfFile).with_source_path(source_path)
+        } else if let Some(format) = crate::archive_converter::ArchiveFormat::from_extension(&ext) {
+            let mut meta =
+                RatingMeta::new(RatingItemKind::ConvertibleArchive).with_source_path(source_path);
+            meta.archive_format = Some(archive_format_to_rating_str(format).to_string());
+            meta
+        } else {
+            return None;
+        };
+        if meta.source_path.is_none() {
+            meta.source_path = Some(source_path.to_string_lossy().to_string());
+        }
+        Some(meta)
+    }
+
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
     /// 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
@@ -23603,6 +23985,7 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        let meta = self.rating_meta_for_idx(idx);
         // prewarm で全 item が cache に載っている前提。未取得なら 0 扱いで OK。
         let old_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
         self.rating_cache.insert(idx, stars);
@@ -23610,8 +23993,9 @@ impl App {
         // 値を上書きされないように hydrate_ratings_from_xmp が参照する。
         self.user_set_rating_keys.insert(key.clone());
         if let Some(db) = self.rating_db.as_ref() {
-            let _ = db.set(&key, stars);
+            let _ = db.set_user_rating(&key, stars, meta.as_ref());
         }
+        self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
         // ZIP 内画像 / PDF ページ) のみ親フォルダの集計に伝搬する。
         if matches!(self.items.get(idx), Some(it) if it.is_rating_leaf()) {
@@ -24068,7 +24452,7 @@ impl App {
         let Some(current) = self.current_folder.clone() else {
             return;
         };
-        if current == search_results_synthetic_path() || self.global_search.active {
+        if is_synthetic_view_path(&current) || self.global_search.active {
             return;
         }
         if self.rating_db.is_none() {
@@ -24253,7 +24637,10 @@ impl App {
     /// - 本の中: BS で戻った親階層に表示される `ZipDir` セルと同じ合成キー
     /// を使う。collapse で `bookB/only/` まで自動降下していても、親セルが `bookB/`
     /// なら `root\bookB` に保存する。
-    pub(crate) fn current_container_rating_key_and_source(&self) -> Option<(String, PathBuf)> {
+    fn current_container_rating_target(
+        &self,
+    ) -> Option<(String, PathBuf, crate::rating_db::RatingMeta)> {
+        use crate::rating_db::{RatingItemKind, RatingMeta};
         if self.global_search.active {
             return None;
         }
@@ -24263,24 +24650,57 @@ impl App {
                 self.archive_source_override.as_deref(),
                 self.current_folder.as_deref(),
             );
-            let key_path = if nav.at_root() {
-                root.to_path_buf()
+            let (key_path, meta) = if nav.at_root() {
+                let kind = archive_rating_kind_for_path(root);
+                let mut meta = RatingMeta::new(kind).with_source_path(root);
+                if kind == RatingItemKind::ConvertibleArchive
+                    && let Some(format) = archive_format_for_rating_path(root)
+                {
+                    meta.archive_format = Some(archive_format_to_rating_str(format).to_string());
+                }
+                (root.to_path_buf(), meta)
             } else {
                 let prefix = nav.current_parent_zipdir_prefix()?;
-                book_container_key_from_segs(root, &prefix)
+                let key_path = book_container_key_from_segs(root, &prefix);
+                let dir_prefix = prefix.join("/");
+                let dir_prefix = if dir_prefix.is_empty() {
+                    dir_prefix
+                } else {
+                    format!("{dir_prefix}/")
+                };
+                let mut meta = RatingMeta::new(RatingItemKind::ZipDir).with_source_path(root);
+                meta.dir_prefix = Some(dir_prefix.clone());
+                meta.zipdir_is_archive = Some(zipdir_prefix_is_archive(&dir_prefix));
+                (key_path, meta)
             };
             return Some((
                 crate::adjustment_db::normalize_path(&key_path),
                 root.to_path_buf(),
+                meta,
             ));
         }
         let folder = self.current_folder.as_ref()?;
-        // 検索結果 / 読書履歴の擬似パスは実コンテナではないので評価対象外 (Codex P2)。
-        if folder == &search_results_synthetic_path() || folder == &reading_history_synthetic_path()
-        {
+        // 検索結果 / 読書履歴 / レーティング一覧の擬似パスは実コンテナではない。
+        if is_synthetic_view_path(folder) {
             return None;
         }
-        Some((crate::adjustment_db::normalize_path(folder), folder.clone()))
+        let kind = archive_rating_kind_for_path(folder);
+        let mut meta = RatingMeta::new(kind).with_source_path(folder);
+        if kind == RatingItemKind::ConvertibleArchive
+            && let Some(format) = archive_format_for_rating_path(folder)
+        {
+            meta.archive_format = Some(archive_format_to_rating_str(format).to_string());
+        }
+        Some((
+            crate::adjustment_db::normalize_path(folder),
+            folder.clone(),
+            meta,
+        ))
+    }
+
+    pub(crate) fn current_container_rating_key_and_source(&self) -> Option<(String, PathBuf)> {
+        self.current_container_rating_target()
+            .map(|(key, source, _)| (key, source))
     }
 
     /// 現在一覧表示中のコンテナ (フォルダ / ZIP / PDF / ネスト ZIP の本) の
@@ -24300,6 +24720,20 @@ impl App {
             .unwrap_or(0);
         self.current_folder_rating_cache = Some(value);
         value
+    }
+
+    pub(crate) fn invalidate_rating_counts_cache(&mut self) {
+        self.rating_counts_cache = None;
+    }
+
+    pub(crate) fn rating_counts(&mut self) -> Option<[usize; 6]> {
+        if self.rating_counts_cache.is_none() {
+            self.rating_counts_cache = self
+                .rating_db
+                .as_ref()
+                .and_then(|db| db.count_by_stars().ok());
+        }
+        self.rating_counts_cache
     }
 
     /// Shift+F1〜F6 成功時のトースト表示 (グリッド / フルスクリーン共通)。
@@ -24327,7 +24761,7 @@ impl App {
     }
 
     fn set_current_folder_rating_internal(&mut self, stars: u8, capture_undo: bool) -> bool {
-        let Some((key, _)) = self.current_container_rating_key_and_source() else {
+        let Some((key, _, meta)) = self.current_container_rating_target() else {
             return false;
         };
         let stars = stars.min(5);
@@ -24340,8 +24774,9 @@ impl App {
             self.capture_container_rating_undo(before, stars);
         }
         if let Some(db) = self.rating_db.as_ref() {
-            let _ = db.set(&key, stars);
+            let _ = db.set_user_rating(&key, stars, Some(&meta));
         }
+        self.invalidate_rating_counts_cache();
         self.current_folder_rating_cache = Some(stars);
         // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。
         // (1 階層上に戻ったときに cached な古い値を表示しないため。通常 current_folder は
@@ -24606,11 +25041,11 @@ impl App {
         if hydrations.is_empty() {
             return;
         }
-        // key → XMP 由来★ の最終マップ (path の重複 push があっても 1 エントリに縮む)
-        let mut target: std::collections::HashMap<String, u8> =
+        // key → (XMP 由来★, 元 path) の最終マップ (path の重複 push があっても 1 エントリに縮む)
+        let mut target: std::collections::HashMap<String, (u8, PathBuf)> =
             std::collections::HashMap::with_capacity(hydrations.len());
         for (path, stars) in hydrations {
-            target.insert(crate::adjustment_db::normalize_path(&path), stars);
+            target.insert(crate::adjustment_db::normalize_path(&path), (stars, path));
         }
         // DB の現在値を 1 クエリでまとめて引く
         let keys: Vec<String> = target.keys().cloned().collect();
@@ -24618,34 +25053,37 @@ impl App {
         // DB が 0 (未登録) のエントリだけ実際にハイドレート対象にする。
         // ただし user_set_rating_keys にある path はユーザが明示的に書いたので、
         // 古い XMP 由来の値で上書きしない (F6 でクリア直後にレースで蘇るのを防止)。
-        let mut to_write: Vec<(String, u8)> = Vec::new();
-        for (key, stars) in &target {
+        let mut to_write: Vec<(String, u8, PathBuf)> = Vec::new();
+        for (key, (stars, path)) in &target {
             if current.get(key).copied().unwrap_or(0) == 0
                 && !self.user_set_rating_keys.contains(key)
             {
-                to_write.push((key.clone(), *stars));
+                to_write.push((key.clone(), *stars, path.clone()));
             }
         }
         if to_write.is_empty() {
             return;
         }
         let write_keys: std::collections::HashSet<&String> =
-            to_write.iter().map(|(k, _)| k).collect();
+            to_write.iter().map(|(k, _, _)| k).collect();
         // items の逆引き: path → idx (Image だけ)
         for (idx, item) in self.items.iter().enumerate() {
             if let GridItem::Image(p) = item {
                 let k = crate::adjustment_db::normalize_path(p);
                 if write_keys.contains(&k) {
-                    let stars = target[&k];
+                    let stars = target[&k].0;
                     self.rating_cache.insert(idx, stars);
                 }
             }
         }
-        for (key, stars) in &to_write {
-            let _ = db.set(key, *stars);
+        for (key, stars, path) in &to_write {
+            let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                .with_source_path(path);
+            let _ = db.set_imported_rating(key, *stars, Some(&meta));
         }
+        self.invalidate_rating_counts_cache();
         // 子孫★集計バッジにも反映 (to_write は DB が 0 だった path のみ = old_stars=0)。
-        for (key, stars) in &to_write {
+        for (key, stars, _) in &to_write {
             self.apply_rating_delta_to_folder_counts(key, 0, *stars);
         }
         // 実際に rating_cache が更新されたのでフィルタ影響あり
@@ -25010,6 +25448,14 @@ impl App {
             format!("★{stars}")
         };
         self.capture_rating_undo(undo_records, summary);
+        let rating_view_changes: Vec<(String, u8)> = if self.items_are_rating_view {
+            targets
+                .iter()
+                .filter_map(|&idx| self.rating_path_key(idx).map(|key| (key, stars)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for &idx in &targets {
             self.set_rating(idx, stars);
         }
@@ -25034,7 +25480,9 @@ impl App {
         if self.global_search.active && !targets.is_empty() {
             self.refresh_global_search_hit_stars(&targets);
         }
-        if self.global_search.active && self.items_are_global_search_view {
+        if self.items_are_rating_view {
+            self.refresh_rating_view_after_rating_changes(&rating_view_changes);
+        } else if self.global_search.active && self.items_are_global_search_view {
             self.rebuild_items_from_global_search();
         } else {
             self.rebuild_visible_indices();
@@ -36152,6 +36600,7 @@ impl eframe::App for App {
         self.poll_color_scan(ctx);
         self.poll_favsearch();
         self.poll_tag_view();
+        self.poll_rating_view();
         self.poll_metadata_load();
         // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
         self.poll_stack_script(ctx);
@@ -36206,8 +36655,11 @@ impl eframe::App for App {
             // pending 中は毎フレーム bump して、検索完了後に自然再開させる。
             self.activity_gate.bump();
         }
-        if self.tag_view_pending.is_some() {
+        if self.tag_view_pending.is_some() || self.rating_view_pending.is_some() {
             self.activity_gate.bump();
+        }
+        if self.rating_view_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // review #9 対応: ensure_container_mtime_populated が worker thread に
         // 投げた mtime 取得結果を drain する。完了で rebuild が走る。
@@ -37736,13 +38188,12 @@ impl App {
             || self.items_are_global_search_view
             || self.items_are_tag_view
             || self.items_are_reading_history_view
+            || self.items_are_rating_view
     }
 }
 
 fn use_full_path_cache_keys_for_folder(path: &std::path::Path) -> bool {
-    path == search_results_synthetic_path().as_path()
-        || path == reading_history_synthetic_path().as_path()
-        || crate::path_key::is_drive_or_share_root(path)
+    is_synthetic_view_path(path) || crate::path_key::is_drive_or_share_root(path)
 }
 
 /// 検索結果ビュー (Ctrl+S / Ctrl+G) の画像用 full-path cache key (Codex P1)。
@@ -37843,6 +38294,63 @@ fn reading_history_title_for_path(path: &std::path::Path) -> String {
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+fn archive_rating_kind_for_path(path: &std::path::Path) -> crate::rating_db::RatingItemKind {
+    use crate::rating_db::RatingItemKind;
+    if path.is_dir() {
+        return RatingItemKind::Folder;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if crate::folder_tree::is_zip_extension(&ext) {
+        RatingItemKind::ZipFile
+    } else if ext == "pdf" {
+        RatingItemKind::PdfFile
+    } else if crate::archive_converter::ArchiveFormat::from_extension(&ext).is_some() {
+        RatingItemKind::ConvertibleArchive
+    } else {
+        RatingItemKind::Folder
+    }
+}
+
+fn archive_format_for_rating_path(
+    path: &std::path::Path,
+) -> Option<crate::archive_converter::ArchiveFormat> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+}
+
+fn archive_format_to_rating_str(format: crate::archive_converter::ArchiveFormat) -> &'static str {
+    match format {
+        crate::archive_converter::ArchiveFormat::Rar => "rar",
+        crate::archive_converter::ArchiveFormat::SevenZ => "7z",
+        crate::archive_converter::ArchiveFormat::Lzh => "lzh",
+        crate::archive_converter::ArchiveFormat::Zip => "zip",
+    }
+}
+
+fn zipdir_prefix_is_archive(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let ext = last
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    crate::folder_tree::is_zip_extension(&ext)
+        || crate::archive_converter::ArchiveFormat::from_extension(&ext).is_some()
+}
+
+fn entry_name_is_image(entry_name: &str) -> bool {
+    let ext = entry_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    crate::folder_tree::is_recognized_image_ext(&ext)
 }
 
 fn drive_list_catalog_path() -> PathBuf {

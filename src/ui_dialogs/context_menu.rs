@@ -4,7 +4,7 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::app::search_results_synthetic_path;
+use crate::app::is_synthetic_view_path;
 use crate::grid_item::GridItem;
 use crate::native_context_menu::{
     NativeContextMenuRequest, NativeContextMenuResult, NativeMivCommand, NativeMivMenuItem,
@@ -1063,12 +1063,13 @@ impl crate::app::App {
             || self.items_are_global_search_view
             || self.items_are_tag_view
             || self.items_are_reading_history_view
+            || self.items_are_rating_view
             || self.archive_source_override.is_some() && self.zip_nav.is_none()
         {
             return None;
         }
         let container = self.current_folder.as_ref()?;
-        if container == &search_results_synthetic_path() {
+        if is_synthetic_view_path(container) {
             return None;
         }
         let source = crate::folder_thumb_pins::source_from_grid_item(container, &target.item)?;

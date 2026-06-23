@@ -222,6 +222,14 @@ fn rating_button_label(idx: usize) -> String {
     }
 }
 
+fn rating_view_menu_label(stars: u8, counts: Option<[usize; 6]>) -> String {
+    let label = "★".repeat(stars as usize);
+    match counts.and_then(|c| c.get(stars as usize).copied()) {
+        Some(count) => format!("{label} ({count})"),
+        None => label,
+    }
+}
+
 fn rating_solo_menu_label(idx: usize) -> String {
     if idx == 0 {
         "未評価のみ表示 (Ctrl+クリック)".to_string()
@@ -1815,6 +1823,7 @@ impl App {
         let mut sort_changed = false;
         let book_sort_locked =
             self.current_folder_is_book_folder() || self.items_are_reading_history_view;
+        let rating_counts = self.rating_counts();
         let selected_video_path =
             self.selected
                 .and_then(|idx| self.items.get(idx))
@@ -1842,6 +1851,17 @@ impl App {
                         self.enter_reading_history();
                         ui.close();
                     }
+                    ui.menu_button("レーティング一覧", |ui| {
+                        for stars in 1..=5 {
+                            if ui
+                                .button(rating_view_menu_label(stars, rating_counts))
+                                .clicked()
+                            {
+                                self.enter_rating_view(stars);
+                                ui.close();
+                            }
+                        }
+                    });
                     if ui.button("現在地フィルタ (Ctrl+F)").clicked() {
                         // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
                         self.open_local_metadata_search();
@@ -2217,12 +2237,37 @@ impl App {
                     } else {
                         ui.menu_button("ソート順", |ui| {
                             for &order in crate::settings::SortOrder::all() {
-                                let checked = self.settings.sort_order == order;
+                                let checked = if self.items_are_rating_view {
+                                    self.rating_view_sort
+                                        == crate::rating_view::RatingViewSort::Normal(order)
+                                } else {
+                                    self.settings.sort_order == order
+                                };
                                 let prefix = if checked { "✓ " } else { "  " };
                                 if ui.button(format!("{prefix}{}", order.label())).clicked() {
                                     self.settings.sort_order = order;
-                                    sort_changed = true;
+                                    if self.items_are_rating_view {
+                                        self.set_rating_view_sort(
+                                            crate::rating_view::RatingViewSort::Normal(order),
+                                        );
+                                    } else {
+                                        sort_changed = true;
+                                    }
                                     ui.close();
+                                }
+                            }
+                            if self.items_are_rating_view {
+                                ui.separator();
+                                for sort in [
+                                    crate::rating_view::RatingViewSort::RatedAtDesc,
+                                    crate::rating_view::RatingViewSort::RatedAtAsc,
+                                ] {
+                                    let checked = self.rating_view_sort == sort;
+                                    let prefix = if checked { "✓ " } else { "  " };
+                                    if ui.button(format!("{prefix}{}", sort.label())).clicked() {
+                                        self.set_rating_view_sort(sort);
+                                        ui.close();
+                                    }
                                 }
                             }
                         });
@@ -4256,6 +4301,9 @@ impl App {
                             for &order in &tb_sorts {
                                 let selected = if book_sort_locked {
                                     order == crate::settings::SortOrder::Numeric
+                                } else if self.items_are_rating_view {
+                                    self.rating_view_sort
+                                        == crate::rating_view::RatingViewSort::Normal(order)
                                 } else {
                                     self.settings.sort_order == order
                                 };
@@ -4266,7 +4314,28 @@ impl App {
                                 if resp.clicked() && !selected {
                                     self.settings.sort_order = order;
                                     self.settings.save();
-                                    toolbar_sort_changed = true;
+                                    if self.items_are_rating_view {
+                                        self.set_rating_view_sort(
+                                            crate::rating_view::RatingViewSort::Normal(order),
+                                        );
+                                    } else {
+                                        toolbar_sort_changed = true;
+                                    }
+                                }
+                            }
+                            if self.items_are_rating_view {
+                                for sort in [
+                                    crate::rating_view::RatingViewSort::RatedAtDesc,
+                                    crate::rating_view::RatingViewSort::RatedAtAsc,
+                                ] {
+                                    let selected = self.rating_view_sort == sort;
+                                    let resp = ui.add_enabled(
+                                        !sort_disabled,
+                                        egui::Button::selectable(selected, sort.short_label()),
+                                    );
+                                    if resp.clicked() && !selected {
+                                        self.set_rating_view_sort(sort);
+                                    }
                                 }
                             }
                         }
@@ -4274,6 +4343,8 @@ impl App {
                             ui.add_enabled_ui(!sort_disabled, |ui| {
                                 let current_text = if book_sort_locked {
                                     "番号固定".to_string()
+                                } else if self.items_are_rating_view {
+                                    self.rating_view_sort.short_label().to_string()
                                 } else {
                                     self.settings.sort_order.short_label().to_string()
                                 };
@@ -4284,7 +4355,12 @@ impl App {
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
                                         for &order in &tb_sorts {
-                                            let selected = self.settings.sort_order == order;
+                                            let selected = if self.items_are_rating_view {
+                                                self.rating_view_sort
+                                                    == crate::rating_view::RatingViewSort::Normal(order)
+                                            } else {
+                                                self.settings.sort_order == order
+                                            };
                                             if ui
                                                 .selectable_label(selected, order.short_label())
                                                 .clicked()
@@ -4292,7 +4368,29 @@ impl App {
                                             {
                                                 self.settings.sort_order = order;
                                                 self.settings.save();
-                                                toolbar_sort_changed = true;
+                                                if self.items_are_rating_view {
+                                                    self.set_rating_view_sort(
+                                                        crate::rating_view::RatingViewSort::Normal(order),
+                                                    );
+                                                } else {
+                                                    toolbar_sort_changed = true;
+                                                }
+                                            }
+                                        }
+                                        if self.items_are_rating_view {
+                                            ui.separator();
+                                            for sort in [
+                                                crate::rating_view::RatingViewSort::RatedAtDesc,
+                                                crate::rating_view::RatingViewSort::RatedAtAsc,
+                                            ] {
+                                                let selected = self.rating_view_sort == sort;
+                                                if ui
+                                                    .selectable_label(selected, sort.short_label())
+                                                    .clicked()
+                                                    && !selected
+                                                {
+                                                    self.set_rating_view_sort(sort);
+                                                }
                                             }
                                         }
                                     });
@@ -4314,10 +4412,15 @@ impl App {
                     let aggregated_search = self.global_search.active
                         && self.global_search.drill.is_none()
                         && self.global_search.aggregate;
+                    let rating_view_fixed = self.items_are_rating_view;
                     // hover ヒントは disable 中の widget では拾われにくいので
                     // (egui の sense)、有効な「★:」ラベル側に乗せる。
                     let star_label = toolbar_label(ui, "★:", 24.0, drag_enabled);
-                    let star_label = if aggregated_search {
+                    let star_label = if rating_view_fixed {
+                        star_label.hover_tip(
+                            "レーティング一覧では★フィルタは対象★で固定されます。",
+                        )
+                    } else if aggregated_search {
                         star_label.hover_tip(
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
                         )
@@ -4340,7 +4443,7 @@ impl App {
                             ui,
                             &mut self.settings.rating_filter,
                             idx,
-                            !aggregated_search,
+                            !aggregated_search && !rating_view_fixed,
                             has_rating_selection,
                         );
                         if changed {
@@ -6245,6 +6348,7 @@ impl App {
         let parent_nav_target = self.grid_parent_nav_target();
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
+        let rating_counts = self.rating_counts();
         let quick_folder_targets: [Option<PathBuf>; 2] =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
         let active_quick_folder_slot = self.active_quick_folder_slot;
@@ -6573,6 +6677,17 @@ impl App {
                                 result = Some(AddressBarNav::ReadingHistory);
                                 ui.close();
                             }
+                            ui.menu_button("レーティング", |ui| {
+                                for stars in 1..=5 {
+                                    if ui
+                                        .button(rating_view_menu_label(stars, rating_counts))
+                                        .clicked()
+                                    {
+                                        self.enter_rating_view(stars);
+                                        ui.close();
+                                    }
+                                }
+                            });
                             if ui
                                 .button("本棚フォルダ")
                                 .hover_tip(self.book_root_path().to_string_lossy().to_string())
