@@ -614,6 +614,122 @@ fn wait_for_post_seek_video_tx_space(
     true
 }
 
+enum VideoOutputReadiness {
+    Ready,
+    NewSeekPending,
+    Cancelled,
+}
+
+/// Park before taking a pooled shared D3D11 output slot.
+///
+/// The normal GPU pacing loop runs after `try_gpu_blit_path`, so it already owns
+/// one `shared_output_pool` slot. When paused source queues own the rest of the
+/// pool, acquiring that slot times out before the pause park can run.
+fn wait_before_gpu_output_allocation(
+    cancel: &AtomicBool,
+    clock: &AvClock,
+    engine_state: &AtomicU8,
+    video_tx: &Sender<VideoFrame>,
+    video_pkt_rx: &Receiver<VideoPacketMsg>,
+    current_seek_serial: u64,
+    pts_secs: f64,
+    post_seek_frame_sent: bool,
+    first_frame_delivered: bool,
+    pause_park_last_log: &mut Option<std::time::Instant>,
+    post_seek_tx_full_last_log: &mut Option<std::time::Instant>,
+) -> VideoOutputReadiness {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return VideoOutputReadiness::Cancelled;
+        }
+        if clock.current_seek_serial() != current_seek_serial {
+            return VideoOutputReadiness::NewSeekPending;
+        }
+
+        let engine_st = engine_state.load(Ordering::Acquire);
+        if wait_for_post_seek_video_tx_space(
+            post_seek_frame_sent,
+            video_tx,
+            video_pkt_rx,
+            current_seek_serial,
+            pts_secs,
+            engine_st,
+            clock.is_seeking(),
+            post_seek_tx_full_last_log,
+        ) {
+            continue;
+        }
+        if should_bypass_pacing_for_startup_first_frame(first_frame_delivered) {
+            return VideoOutputReadiness::Ready;
+        }
+        if should_bypass_pause_park_for_post_seek_first_frame(
+            clock.is_seeking(),
+            post_seek_frame_sent,
+        ) {
+            return VideoOutputReadiness::Ready;
+        }
+        if engine_state_parks_decode(engine_st) {
+            let now = std::time::Instant::now();
+            if pause_park_last_log
+                .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(2))
+            {
+                crate::logger::log(format!(
+                    "[video-decode] pre-output pause park: serial={current_seek_serial} frame_pts={pts_secs:.3} state={} pkt_rx_len={} video_tx_len={} clock_playing={} clock_seeking={}",
+                    engine_state_code_name(engine_st),
+                    video_pkt_rx.len(),
+                    video_tx.len(),
+                    clock.is_playing(),
+                    clock.is_seeking()
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "video",
+                        "pause_park",
+                        None,
+                        0,
+                        &[
+                            ("stage", serde_json::Value::from("pre_output")),
+                            (
+                                "serial",
+                                serde_json::Value::from(current_seek_serial as i64),
+                            ),
+                            ("frame_pts", serde_json::Value::from(pts_secs)),
+                            (
+                                "engine_state",
+                                serde_json::Value::from(engine_state_code_name(engine_st)),
+                            ),
+                            (
+                                "pkt_rx_len",
+                                serde_json::Value::from(video_pkt_rx.len() as i64),
+                            ),
+                            (
+                                "video_tx_len",
+                                serde_json::Value::from(video_tx.len() as i64),
+                            ),
+                            ("clock_playing", serde_json::Value::from(clock.is_playing())),
+                            ("clock_seeking", serde_json::Value::from(clock.is_seeking())),
+                        ],
+                    );
+                }
+                *pause_park_last_log = Some(now);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        if pause_park_last_log.take().is_some() {
+            crate::logger::log(format!(
+                "[video-decode] pre-output pause park exit: serial={current_seek_serial} frame_pts={pts_secs:.3} state={} pkt_rx_len={} video_tx_len={} clock_playing={} clock_seeking={}",
+                engine_state_code_name(engine_st),
+                video_pkt_rx.len(),
+                video_tx.len(),
+                clock.is_playing(),
+                clock.is_seeking()
+            ));
+        }
+        return VideoOutputReadiness::Ready;
+    }
+}
+
 fn should_bypass_pause_park_for_post_seek_first_frame(
     clock_seeking: bool,
     post_seek_frame_sent: bool,
@@ -3794,6 +3910,23 @@ fn run_video_decode(
                                 .deinterlace_status
                                 .store(DEINT_STATUS_INACTIVE, Ordering::Release);
                         }
+                    }
+                    match wait_before_gpu_output_allocation(
+                        cancel.as_ref(),
+                        clock.as_ref(),
+                        engine_state.as_ref(),
+                        &video_tx,
+                        &video_pkt_rx,
+                        current_seek_serial,
+                        pts_secs,
+                        post_seek_frame_sent,
+                        first_frame_delivered,
+                        &mut pause_park_last_log,
+                        &mut post_seek_tx_full_last_log,
+                    ) {
+                        VideoOutputReadiness::Ready => {}
+                        VideoOutputReadiness::NewSeekPending => continue 'outer,
+                        VideoOutputReadiness::Cancelled => break 'outer,
                     }
                     match try_gpu_blit_path(
                         gpu_dev,

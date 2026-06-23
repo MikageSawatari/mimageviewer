@@ -776,6 +776,16 @@ drain して queue に積み込んでいたため queue が 23 frame まで肥�
 で cap し、超えたら drain を停止することで `video_tx` (cap=8) に逆圧をかける。decoder
 側は `try_send` 失敗で古い frame を drop / 待機して自然に pacing する。
 
+**Paused/Eof 中の GPU 出力前 park** (2026-06-24):
+GPU 経路では `try_gpu_blit_path` 成功後の pacing loop に pause park があるが、この時点では
+既に `shared_output_pool` slot を 1 枚取得済み。paused 中に `source.queue=8`、
+`video_rx=7`、`present_retire=1` などで pool 16 枚が埋まると、pause park に到達する前の
+`acquire_shared_output` が 500ms timeout し、`ResourcePressure` を 60 回積んで
+`decode_failed` になる。これを避けるため、GPU shared output slot を取得する前にも
+`engine_state in [Paused, Eof]` と post-seek 1 枚目の `video_tx` 空きを確認し、
+必要なら D3D11VA の `AVFrame` を保持したまま短周期 sleep で park する。post-seek 1 枚目と
+startup 1 枚目は従来通り bypass し、seek override / 初回表示の解除を妨げない。
+
 **`GpuVideoError::ResourcePressure` バリアント** (新規追加):
 shared output pool exhausted、`E_OUTOFMEMORY` (0x8007000E)、
 `D3D11_ERROR_TOO_MANY_UNIQUE_VIEW_OBJECTS` (0x887C0003)、`TOO_MANY_UNIQUE_STATE_OBJECTS`
