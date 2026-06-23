@@ -1823,3 +1823,14 @@ reparse point 共有しない**。個別サブディレクトリ単位でも禁�
 - Comfortable reading C++ but not familiar with Rust's borrow checker details
 - Has RTX 4090, Windows 11
 - AI-assisted development workflow: Claude generates code, user reviews and tests
+
+## Claude Code tool call reliability rules
+
+- Before using Read/Edit/Write/Bash, do not write explanatory prose in the same assistant message.
+- Emit the tool call as the first and only action in the message whenever possible.
+- Use one tool call at a time. Do not batch many Read/Edit/Bash calls in one response.
+- Keep tool arguments short.
+- For long or complex shell commands, write a temporary script file first, then run the script.
+- Prefer small targeted Edit calls over large full-file Write calls.
+- After any Write/Edit, verify with Read or git diff that the file actually changed.
+- If raw text like `<invoke name="...">` or `<parameter name="...">` appears, assume the tool did not run. Re-issue only that tool call with no prose.
