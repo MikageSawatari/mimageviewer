@@ -2028,6 +2028,10 @@ impl App {
                         self.open_capture_output_dir();
                         ui.close();
                     }
+                    if ui.button("ゴミ箱を開く").clicked() {
+                        crate::ui_helpers::open_recycle_bin_async();
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("終了").clicked() {
                         // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、

@@ -5,7 +5,7 @@
 //! - ソート系: `natural_sort_key`, `NaturalChunk`
 //! - 描画系: `draw_play_icon`, `draw_zip_badge`, `draw_pdf_badge`, `draw_histogram`, `draw_format_rows`
 //! - ナビ系: `adjacent_navigable_idx`
-//! - 外部連携: `open_external_player`
+//! - 外部連携: `open_external_player`, `open_recycle_bin_async`
 
 use std::path::Path;
 
@@ -1156,6 +1156,34 @@ pub fn open_external_player(path: &Path) {
     crate::logger::log(format!("open_external_player: {}", path.display()));
     if let Err(e) = opener::open(path) {
         crate::logger::log(format!("open_external_player failed: {e}"));
+    }
+}
+
+/// Windows のゴミ箱を Explorer で開く。
+///
+/// 固定の Shell namespace URI だけを渡し、ユーザー由来のパスは扱わない。
+pub fn open_recycle_bin_async() {
+    let spawn_result = std::thread::Builder::new()
+        .name("open-recycle-bin".into())
+        .spawn(|| {
+            #[cfg(windows)]
+            {
+                const RECYCLE_BIN_SHELL_URI: &str = "shell:RecycleBinFolder";
+                crate::logger::log("open_recycle_bin: shell:RecycleBinFolder");
+                if let Err(err) = std::process::Command::new("explorer.exe")
+                    .arg(RECYCLE_BIN_SHELL_URI)
+                    .spawn()
+                {
+                    crate::logger::log(format!("open_recycle_bin failed: {err}"));
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                crate::logger::log("open_recycle_bin is only supported on Windows");
+            }
+        });
+    if let Err(err) = spawn_result {
+        crate::logger::log(format!("open_recycle_bin worker start failed: {err}"));
     }
 }
 
