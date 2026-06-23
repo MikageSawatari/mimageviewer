@@ -5975,6 +5975,7 @@ impl App {
                 } else if ui.small_button("場所フィルタを解除").clicked() {
                     self.settings.facet_filter.place_keys.clear();
                     changed = true;
+                    ui.close();
                 }
                 ui.separator();
                 if counts.is_empty() {
@@ -6251,6 +6252,7 @@ impl App {
                         self.settings.facet_filter.tags.clear();
                         self.settings.facet_filter.include_untagged = false;
                         changed = true;
+                        ui.close();
                     }
                     ui.separator();
                     let mut include_untagged = self.settings.facet_filter.include_untagged;
