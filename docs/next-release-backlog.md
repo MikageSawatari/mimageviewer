@@ -14,7 +14,26 @@
 
 ## 1. 優先候補
 
-現時点ではなし。
+### 1.1 F12 別ウィンドウ中のソート変更で動画セッションが一度閉じる
+
+- 背景: F12 の別ウィンドウで動画を表示中にメイン一覧側でソート順を変更すると、
+  元の動画アイテムがソート後の一覧に残っていても動画ウィンドウが一度閉じる。
+- 現状: ソート変更時の通常フォルダ再読み込みが `start_loading_items` 経由で走り、
+  共通処理の `close_fullscreen()` により detached viewer session / native video presenter が
+  破棄される。後段の detached viewer 同期は、session が閉じた後なので復帰できない。
+- 方針:
+  - ソート / フィルタ後の同一フォルダ再構築では、変更前の表示対象を idx ではなく
+    `metadata_cache_key` / `ViewerSyncStamp` 相当の安定キーで保持する。
+  - 再構築後の `items` から同じキーを探し、見つかれば detached session を閉じずに
+    `fullscreen_idx` / `selected` / 同期 stamp を新 idx へ付け替える。
+  - 見つからない場合、またはフォルダ移動・ZIP/PDF 仮想フォルダ遷移など同一対象維持が
+    不明な場合は、既存どおり session close を許可する。
+  - 静止画だけでなく detached 動画の native presenter / `fs_cache` / pending source swap への
+    影響を確認し、通常 fullscreen とフォルダ移動を巻き込まないテストを先に用意する。
+- 規模 / リスク: Medium / 中。修正方針は明確だが、`start_loading_items` / `close_fullscreen`
+  周辺は fullscreen lifecycle、動画 presenter、index keyed cache、履歴復元にまたがるため
+  リリース直前の小修正にはしない。
+- 優先度: P3。UX 改善として次回以降に対応。v2.1.0 のリリースブロッカーにはしない。
 
 ## 2. アーカイブ / 仮想フォルダ
 
