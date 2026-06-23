@@ -7,12 +7,31 @@ struct ColorScanWorkItem {
 
 const COLOR_SCAN_CONFIRM_MISSING_THRESHOLD: usize = 2_000;
 
+fn color_filter_item_supported(item: &crate::grid_item::GridItem) -> bool {
+    item.has_page_data() || matches!(item, crate::grid_item::GridItem::Stack { .. })
+}
+
+fn color_scan_cache_decision(req: &LoadRequest, cache_decision: CacheDecision) -> CacheDecision {
+    if req.pdf_page.is_none() {
+        return cache_decision;
+    }
+    CacheDecision {
+        policy: crate::settings::CachePolicy::Off,
+        threshold_ms: cache_decision.threshold_ms,
+        size_threshold: cache_decision.size_threshold,
+        webp_always: false,
+        pdf_always: false,
+        zip_always: false,
+    }
+}
+
 impl App {
     pub(crate) fn color_filter_available_in_current_view(&self) -> bool {
         !self.items_are_drive_list
             && !self.items_are_reading_history_view
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
+            && !self.items_are_rating_view
             && !self.favsearch.on_results_grid()
             && !self.tag_view.on_results_grid()
     }
@@ -51,7 +70,8 @@ impl App {
         rgb: [u8; 3],
         ctx: &egui::Context,
     ) {
-        // 集約ビュー (タグ / 全文検索 / お気に入り検索 / 読書履歴 / ドライブ一覧) では
+        // 集約ビュー (タグ / 全文検索 / お気に入り検索 / 読書履歴 / レーティング一覧 /
+        // ドライブ一覧) では
         // 画像色フィルタは未対応。スウォッチから有効化しても何も絞れず、不活性な
         // チップだけ残るので、案内トーストを出して有効化しない。
         if !self.color_filter_available_in_current_view() {
@@ -485,6 +505,9 @@ impl App {
             && !rating_filter.iter().all(|&b| b);
         let mut out = Vec::new();
         for i in 0..self.items.len() {
+            if !self.items.get(i).is_some_and(color_filter_item_supported) {
+                continue;
+            }
             if let Some(ref f) = search_filter
                 && !f.contains(&i)
             {
@@ -539,6 +562,9 @@ impl App {
         idx: usize,
     ) -> Option<(crate::color_search::ColorPaletteKey, LoadRequest)> {
         let item = self.items.get(idx)?;
+        if !color_filter_item_supported(item) {
+            return None;
+        }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
         let req = make_load_request(
             item,
@@ -662,6 +688,10 @@ fn load_palette_for_request(
 ) -> Option<crate::color_search::Palette> {
     let (tx, rx) = mpsc::channel();
     req.priority = false;
+    let cache_decision = color_scan_cache_decision(&req, cache_decision);
+    if req.pdf_page.is_some() {
+        req.force_cache = false;
+    }
     crate::thumb_loader::process_load_request(
         &req,
         cache_map,
@@ -691,4 +721,87 @@ fn load_palette_for_request(
     image
         .as_ref()
         .map(crate::color_search::extract_palette_from_color_image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn always_cache_decision() -> CacheDecision {
+        CacheDecision {
+            policy: crate::settings::CachePolicy::Always,
+            threshold_ms: 0,
+            size_threshold: 0,
+            webp_always: true,
+            pdf_always: true,
+            zip_always: true,
+        }
+    }
+
+    #[test]
+    fn color_filter_targets_page_images_and_stacks_only() {
+        assert!(color_filter_item_supported(
+            &crate::grid_item::GridItem::Image(PathBuf::from("a.jpg"))
+        ));
+        assert!(color_filter_item_supported(
+            &crate::grid_item::GridItem::ZipImage {
+                zip_path: PathBuf::from("book.zip"),
+                entry_name: "page.jpg".to_string(),
+            }
+        ));
+        assert!(color_filter_item_supported(
+            &crate::grid_item::GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 0,
+                content_type: None,
+            }
+        ));
+        assert!(color_filter_item_supported(
+            &crate::grid_item::GridItem::Stack {
+                key: "a".to_string(),
+                representative: PathBuf::from("a001.jpg"),
+                count: 2,
+            }
+        ));
+
+        assert!(!color_filter_item_supported(
+            &crate::grid_item::GridItem::Folder(PathBuf::from("dir"))
+        ));
+        assert!(!color_filter_item_supported(
+            &crate::grid_item::GridItem::Video(PathBuf::from("clip.mp4"))
+        ));
+        assert!(!color_filter_item_supported(
+            &crate::grid_item::GridItem::ZipFile(PathBuf::from("book.zip"))
+        ));
+        assert!(!color_filter_item_supported(
+            &crate::grid_item::GridItem::PdfFile(PathBuf::from("book.pdf"))
+        ));
+    }
+
+    #[test]
+    fn pdf_color_scan_miss_does_not_write_thumbnail_cache() {
+        let decision = always_cache_decision();
+        let pdf_req = LoadRequest {
+            pdf_page: Some(0),
+            ..Default::default()
+        };
+        let image_req = LoadRequest::default();
+
+        assert!(decision.should_cache(Path::new("book.pdf"), 1, 0.0, 0.0));
+        assert!(!color_scan_cache_decision(&pdf_req, decision).should_cache(
+            Path::new("book.pdf"),
+            1,
+            0.0,
+            0.0,
+        ));
+        assert!(
+            color_scan_cache_decision(&image_req, decision).should_cache(
+                Path::new("image.jpg"),
+                1,
+                0.0,
+                0.0,
+            )
+        );
+    }
 }

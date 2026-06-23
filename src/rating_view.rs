@@ -184,10 +184,10 @@ fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
         }
         RatingItemKind::ZipImage => {
             let zip_path = existing_source_or_key_path(row)?;
-            let entry_name = row
-                .entry_name
-                .clone()
-                .or_else(|| legacy_entry_from_key(&row.key))?;
+            let entry_name = row.entry_name.clone().or_else(|| {
+                legacy_entry_from_key(&row.key)
+                    .and_then(|entry| resolve_legacy_zip_entry_name(&zip_path, &entry))
+            })?;
             Some(GridItem::ZipImage {
                 zip_path,
                 entry_name,
@@ -236,9 +236,10 @@ fn item_from_legacy_key(row: &RatingRow) -> Option<GridItem> {
         }
     }
     if entry_is_image(right) {
+        let entry_name = resolve_legacy_zip_entry_name(&container, right)?;
         return Some(GridItem::ZipImage {
             zip_path: container,
-            entry_name: right.to_string(),
+            entry_name,
         });
     }
     None
@@ -326,6 +327,23 @@ fn legacy_entry_from_key(key: &str) -> Option<String> {
         .filter(|right| !right.is_empty())
 }
 
+fn resolve_legacy_zip_entry_name(zip_path: &Path, legacy_entry: &str) -> Option<String> {
+    let wanted = normalize_legacy_zip_entry_name(legacy_entry);
+    let entries = crate::zip_loader::enumerate_image_entries(zip_path).ok()?;
+    let mut matches = entries
+        .into_iter()
+        .filter(|entry| normalize_legacy_zip_entry_name(&entry.entry_name) == wanted);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.entry_name)
+}
+
+fn normalize_legacy_zip_entry_name(entry: &str) -> String {
+    entry.replace('\\', "/").to_lowercase()
+}
+
 fn legacy_pdf_page_from_key(key: &str) -> Option<u32> {
     key.split_once("::")
         .and_then(|(_, right)| parse_page_key(right))
@@ -379,6 +397,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 mod tests {
     use super::*;
     use crate::rating_db::{RatingItemKind, RatingRow};
+    use std::io::Write;
 
     fn row(key: String, kind: Option<RatingItemKind>, source_path: Option<String>) -> RatingRow {
         RatingRow {
@@ -394,6 +413,18 @@ mod tests {
             zipdir_is_archive: None,
             zipdir_representative: None,
         }
+    }
+
+    fn write_zip_entries(zip_path: &Path, entries: &[&str]) {
+        let file = std::fs::File::create(zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for entry in entries {
+            zip.start_file(entry, options).unwrap();
+            zip.write_all(b"image bytes").unwrap();
+        }
+        zip.finish().unwrap();
     }
 
     #[test]
@@ -419,15 +450,26 @@ mod tests {
     fn restores_legacy_zip_image_key() {
         let temp = tempfile::tempdir().unwrap();
         let zip = temp.path().join("Book.zip");
-        std::fs::write(&zip, b"zip").unwrap();
+        write_zip_entries(&zip, &["Dir/Page.JPG"]);
         let key = format!("{}::dir/page.jpg", zip.to_string_lossy());
         let r = row(key, None, None);
 
         let restored = rating_row_to_view_row(&r).unwrap();
         match restored.item {
-            GridItem::ZipImage { entry_name, .. } => assert_eq!(entry_name, "dir/page.jpg"),
+            GridItem::ZipImage { entry_name, .. } => assert_eq!(entry_name, "Dir/Page.JPG"),
             _ => panic!("expected ZipImage"),
         }
+    }
+
+    #[test]
+    fn skips_ambiguous_legacy_zip_image_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("Book.zip");
+        write_zip_entries(&zip, &["Dir/Page.JPG", "dir/page.jpg"]);
+        let key = format!("{}::dir/page.jpg", zip.to_string_lossy());
+        let r = row(key, None, None);
+
+        assert!(rating_row_to_view_row(&r).is_none());
     }
 
     #[test]
