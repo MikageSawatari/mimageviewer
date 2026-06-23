@@ -324,6 +324,9 @@ fn prepare_place_facet_menu_popup(ui: &mut egui::Ui) {
 
 const AI_FACET_MENU_WIDTH: f32 = 520.0;
 const AI_FACET_MENU_VISIBLE_ROWS: usize = 18;
+const PLACE_FACET_MENU_WIDTH: f32 = 520.0;
+const TAG_FACET_MENU_WIDTH: f32 = 360.0;
+const FACET_CHOICE_MENU_VISIBLE_ROWS: usize = 24;
 
 fn ai_facet_choice_body_height(ui: &egui::Ui, choice_count: usize) -> f32 {
     let spacing = ui.spacing();
@@ -364,6 +367,46 @@ fn show_ai_facet_choices<R>(
     .inner
 }
 
+fn facet_choice_body_height(ui: &egui::Ui, choice_count: usize) -> f32 {
+    let spacing = ui.spacing();
+    let row_h = spacing.interact_size.y.max(22.0);
+    let rows = choice_count.min(FACET_CHOICE_MENU_VISIBLE_ROWS).max(1) as f32;
+    let gaps = (rows - 1.0).max(0.0) * spacing.item_spacing.y;
+    row_h * rows + gaps + spacing.item_spacing.y * 2.0 + 4.0
+}
+
+fn show_scrollable_facet_choices<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    choice_count: usize,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if choice_count <= FACET_CHOICE_MENU_VISIBLE_ROWS {
+        return ui
+            .scope(|ui| {
+                ui.set_width(width);
+                add_contents(ui)
+            })
+            .inner;
+    }
+
+    let body_height = facet_choice_body_height(ui, choice_count);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, body_height),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_height(body_height);
+            ui.set_width(width);
+            egui::ScrollArea::vertical()
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show(ui, add_contents)
+                .inner
+        },
+    )
+    .inner
+}
+
 fn consume_wheel_input(ctx: &egui::Context) {
     ctx.input_mut(|i| {
         i.raw_scroll_delta = egui::Vec2::ZERO;
@@ -383,7 +426,11 @@ fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::
 }
 
 fn show_sticky_context_menu(response: &egui::Response, add_contents: impl FnOnce(&mut egui::Ui)) {
+    // Keep the secondary-click settings menu on a separate popup id from a possible
+    // primary-click menu_button on the same response. egui::Popup::context_menu
+    // explicitly closes its popup id on primary clicks.
     let _ = egui::Popup::context_menu(response)
+        .id(response.id.with("sticky_context_menu"))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(add_contents);
 }
@@ -5830,40 +5877,49 @@ impl App {
     fn draw_facet_place_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("場所", self.settings.facet_filter.place_keys.len());
-        let menu = ui.menu_button(label, |ui| {
-            prepare_place_facet_menu_popup(ui);
-            let mut counts = self.facet_place_counts();
-            for key in &self.settings.facet_filter.place_keys {
-                let label = self.facet_place_label_for_key(key);
-                counts.entry(key.clone()).or_insert((label, 0));
-            }
-            if self.settings.facet_filter.place_keys.is_empty() {
-                ui.label("すべて");
-            } else if ui.small_button("場所フィルタを解除").clicked() {
-                self.settings.facet_filter.place_keys.clear();
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            if counts.is_empty() {
-                ui.label("候補なし");
-            }
-            for (key, (place_label, count)) in counts {
-                let mut selected = self.settings.facet_filter.place_keys.contains(&key);
-                let text = format!("{place_label} ({count})");
-                let response = ui.checkbox(&mut selected, text);
-                if response.changed() {
-                    if selected {
-                        self.settings.facet_filter.place_keys.insert(key.clone());
-                    } else {
-                        self.settings.facet_filter.place_keys.remove(&key);
-                    }
+        let menu_config = egui::containers::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (menu_response, _) = egui::containers::menu::MenuButton::new(label)
+            .config(menu_config)
+            .ui(ui, |ui| {
+                prepare_place_facet_menu_popup(ui);
+                draw_sticky_settings_menu_header(ui, "場所");
+                ui.separator();
+                let mut counts = self.facet_place_counts();
+                for key in &self.settings.facet_filter.place_keys {
+                    let label = self.facet_place_label_for_key(key);
+                    counts.entry(key.clone()).or_insert((label, 0));
+                }
+                if self.settings.facet_filter.place_keys.is_empty() {
+                    ui.label("すべて");
+                } else if ui.small_button("場所フィルタを解除").clicked() {
+                    self.settings.facet_filter.place_keys.clear();
                     changed = true;
                 }
-                response.on_hover_text(key);
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+                ui.separator();
+                if counts.is_empty() {
+                    ui.label("候補なし");
+                } else {
+                    let choice_count = counts.len();
+                    show_scrollable_facet_choices(ui, PLACE_FACET_MENU_WIDTH, choice_count, |ui| {
+                        for (key, (place_label, count)) in counts {
+                            let mut selected = self.settings.facet_filter.place_keys.contains(&key);
+                            let text = format!("{place_label} ({count})");
+                            let response = ui.checkbox(&mut selected, text);
+                            if response.changed() {
+                                if selected {
+                                    self.settings.facet_filter.place_keys.insert(key.clone());
+                                } else {
+                                    self.settings.facet_filter.place_keys.remove(&key);
+                                }
+                                changed = true;
+                            }
+                            response.on_hover_text(key);
+                        }
+                    });
+                }
+            });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 
@@ -6013,128 +6069,154 @@ impl App {
         let active = self.settings.facet_filter.tags.len()
             + usize::from(self.settings.facet_filter.include_untagged);
         let mut changed = false;
-        let menu = ui.menu_button(facet_menu_label("タグ", active), |ui| {
-            prepare_facet_menu_popup(ui);
-            let (mut counts, untagged_count) = self.facet_tag_counts();
-            let display_names: std::collections::BTreeMap<String, String> = self
-                .settings
-                .tags
-                .iter()
-                .map(|tag| (tag.tag_key.clone(), tag.name.clone()))
-                .collect();
-            for tag in &self.settings.facet_filter.tags {
-                counts.entry(tag.clone()).or_insert(0);
-            }
-            let query_key = crate::tags_db::normalize_tag_key(&self.facet_tag_search_query);
-            let mut choices: BTreeMap<String, (String, usize)> = BTreeMap::new();
-            for (tag_key, count) in &counts {
-                let display = display_names
-                    .get(tag_key)
-                    .cloned()
-                    .unwrap_or_else(|| tag_key.clone());
-                choices.insert(tag_key.clone(), (display, *count));
-            }
-            if !query_key.is_empty() {
-                // find_by_prefix は SQLite の GROUP BY + LIKE。menu closure は毎フレーム
-                // 実行されるので、正規化クエリが変わったときだけ引き直す
-                // (tag_apply の cached_tag_apply_suggestions と同じパターン)。
-                let cache_stale = self
-                    .facet_tag_suggestion_cache
-                    .as_ref()
-                    .is_none_or(|(key, _)| *key != query_key);
-                if cache_stale {
-                    let summaries = self
-                        .tags_db
-                        .as_ref()
-                        .map(|db| db.find_by_prefix(&self.facet_tag_search_query, 50))
-                        .unwrap_or_default();
-                    self.facet_tag_suggestion_cache = Some((query_key.clone(), summaries));
-                }
-                if let Some((_, summaries)) = self.facet_tag_suggestion_cache.as_ref() {
-                    for summary in summaries {
+        let menu_config = egui::containers::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (menu_response, _) =
+            egui::containers::menu::MenuButton::new(facet_menu_label("タグ", active))
+                .config(menu_config)
+                .ui(ui, |ui| {
+                    prepare_facet_menu_popup(ui);
+                    ui.set_min_width(TAG_FACET_MENU_WIDTH);
+                    draw_sticky_settings_menu_header(ui, "タグ");
+                    ui.separator();
+                    let (mut counts, untagged_count) = self.facet_tag_counts();
+                    let display_names: std::collections::BTreeMap<String, String> = self
+                        .settings
+                        .tags
+                        .iter()
+                        .map(|tag| (tag.tag_key.clone(), tag.name.clone()))
+                        .collect();
+                    for tag in &self.settings.facet_filter.tags {
+                        counts.entry(tag.clone()).or_insert(0);
+                    }
+                    let query_key = crate::tags_db::normalize_tag_key(&self.facet_tag_search_query);
+                    let mut choices: BTreeMap<String, (String, usize)> = BTreeMap::new();
+                    for (tag_key, count) in &counts {
                         let display = display_names
-                            .get(&summary.tag_key)
+                            .get(tag_key)
                             .cloned()
-                            .unwrap_or_else(|| summary.tag.clone());
-                        let count = counts.get(&summary.tag_key).copied().unwrap_or(0);
-                        choices
-                            .entry(summary.tag_key.clone())
-                            .or_insert((display, count));
+                            .unwrap_or_else(|| tag_key.clone());
+                        choices.insert(tag_key.clone(), (display, *count));
                     }
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("一致:");
-                let mut mode = self.settings.facet_filter.tag_mode;
-                if ui
-                    .selectable_value(&mut mode, FacetTagMode::Any, FacetTagMode::Any.label())
-                    .changed()
-                {
-                    self.settings.facet_filter.tag_mode = mode;
-                    changed = true;
-                }
-                if ui
-                    .selectable_value(&mut mode, FacetTagMode::All, FacetTagMode::All.label())
-                    .changed()
-                {
-                    self.settings.facet_filter.tag_mode = mode;
-                    changed = true;
-                }
-            });
-            if self.settings.facet_filter.tags.is_empty()
-                && !self.settings.facet_filter.include_untagged
-            {
-                ui.label("すべて");
-            } else if ui.small_button("タグフィルタを解除").clicked() {
-                self.settings.facet_filter.tags.clear();
-                self.settings.facet_filter.include_untagged = false;
-                changed = true;
-                ui.close();
-            }
-            ui.separator();
-            let mut include_untagged = self.settings.facet_filter.include_untagged;
-            if ui
-                .checkbox(
-                    &mut include_untagged,
-                    format!("タグなし ({untagged_count})"),
-                )
-                .changed()
-            {
-                self.settings.facet_filter.include_untagged = include_untagged;
-                changed = true;
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("検索:");
-                let mut output = egui::TextEdit::singleline(&mut self.facet_tag_search_query)
-                    .hint_text("#タグ")
-                    .desired_width(150.0)
-                    .min_size(egui::vec2(150.0, 20.0))
-                    .show(ui);
-                let _ = crate::ui_helpers::singleline_text_edit_context_menu(
-                    ui,
-                    &mut output,
-                    &mut self.facet_tag_search_query,
-                );
-            });
-            ui.separator();
-            if choices.is_empty() {
-                ui.label("タグ候補なし");
-            }
-            for (tag_key, (display, count)) in choices {
-                let mut selected = self.settings.facet_filter.tags.contains(&tag_key);
-                let text = format!("#{} ({count})", display);
-                if ui.checkbox(&mut selected, text).changed() {
-                    if selected {
-                        self.settings.facet_filter.tags.insert(tag_key);
+                    if !query_key.is_empty() {
+                        // find_by_prefix は SQLite の GROUP BY + LIKE。menu closure は毎フレーム
+                        // 実行されるので、正規化クエリが変わったときだけ引き直す
+                        // (tag_apply の cached_tag_apply_suggestions と同じパターン)。
+                        let cache_stale = self
+                            .facet_tag_suggestion_cache
+                            .as_ref()
+                            .is_none_or(|(key, _)| *key != query_key);
+                        if cache_stale {
+                            let summaries = self
+                                .tags_db
+                                .as_ref()
+                                .map(|db| db.find_by_prefix(&self.facet_tag_search_query, 50))
+                                .unwrap_or_default();
+                            self.facet_tag_suggestion_cache = Some((query_key.clone(), summaries));
+                        }
+                        if let Some((_, summaries)) = self.facet_tag_suggestion_cache.as_ref() {
+                            for summary in summaries {
+                                let display = display_names
+                                    .get(&summary.tag_key)
+                                    .cloned()
+                                    .unwrap_or_else(|| summary.tag.clone());
+                                let count = counts.get(&summary.tag_key).copied().unwrap_or(0);
+                                choices
+                                    .entry(summary.tag_key.clone())
+                                    .or_insert((display, count));
+                            }
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("一致:");
+                        let mut mode = self.settings.facet_filter.tag_mode;
+                        if ui
+                            .selectable_value(
+                                &mut mode,
+                                FacetTagMode::Any,
+                                FacetTagMode::Any.label(),
+                            )
+                            .changed()
+                        {
+                            self.settings.facet_filter.tag_mode = mode;
+                            changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut mode,
+                                FacetTagMode::All,
+                                FacetTagMode::All.label(),
+                            )
+                            .changed()
+                        {
+                            self.settings.facet_filter.tag_mode = mode;
+                            changed = true;
+                        }
+                    });
+                    if self.settings.facet_filter.tags.is_empty()
+                        && !self.settings.facet_filter.include_untagged
+                    {
+                        ui.label("すべて");
+                    } else if ui.small_button("タグフィルタを解除").clicked() {
+                        self.settings.facet_filter.tags.clear();
+                        self.settings.facet_filter.include_untagged = false;
+                        changed = true;
+                    }
+                    ui.separator();
+                    let mut include_untagged = self.settings.facet_filter.include_untagged;
+                    if ui
+                        .checkbox(
+                            &mut include_untagged,
+                            format!("タグなし ({untagged_count})"),
+                        )
+                        .changed()
+                    {
+                        self.settings.facet_filter.include_untagged = include_untagged;
+                        changed = true;
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("検索:");
+                        let mut output =
+                            egui::TextEdit::singleline(&mut self.facet_tag_search_query)
+                                .hint_text("#タグ")
+                                .desired_width(150.0)
+                                .min_size(egui::vec2(150.0, 20.0))
+                                .show(ui);
+                        let _ = crate::ui_helpers::singleline_text_edit_context_menu(
+                            ui,
+                            &mut output,
+                            &mut self.facet_tag_search_query,
+                        );
+                    });
+                    ui.separator();
+                    if choices.is_empty() {
+                        ui.label("タグ候補なし");
                     } else {
-                        self.settings.facet_filter.tags.remove(&tag_key);
+                        let choice_count = choices.len();
+                        show_scrollable_facet_choices(
+                            ui,
+                            TAG_FACET_MENU_WIDTH,
+                            choice_count,
+                            |ui| {
+                                for (tag_key, (display, count)) in choices {
+                                    let mut selected =
+                                        self.settings.facet_filter.tags.contains(&tag_key);
+                                    let text = format!("#{} ({count})", display);
+                                    if ui.checkbox(&mut selected, text).changed() {
+                                        if selected {
+                                            self.settings.facet_filter.tags.insert(tag_key);
+                                        } else {
+                                            self.settings.facet_filter.tags.remove(&tag_key);
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                            },
+                        );
                     }
-                    changed = true;
-                }
-            }
-        });
-        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
+                });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }
 

@@ -3066,6 +3066,53 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn facet_place_filter_clears_when_scope_changes() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        app.facet_filter_scope = Some(std::path::PathBuf::from("c:/pics/a"));
+        app.current_folder = Some(std::path::PathBuf::from("c:/pics/b"));
+        app.items.push(GridItem::Image(std::path::PathBuf::from(
+            "c:/pics/b/one.jpg",
+        )));
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        app.settings
+            .facet_filter
+            .place_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &std::path::PathBuf::from("c:/pics/a"),
+            ));
+        let mut saved_filter = crate::settings::FacetFilter::default();
+        saved_filter
+            .place_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &std::path::PathBuf::from("c:/pics/a"),
+            ));
+        app.facet_filter_suppression_stack
+            .push(crate::app::FacetFilterSuppression {
+                anchor: std::path::PathBuf::from("c:/pics/a"),
+                saved_filter,
+            });
+
+        app.rebuild_visible_indices();
+
+        assert!(
+            app.settings.facet_filter.place_keys.is_empty(),
+            "場所フィルタはフォルダ移動で常に解除する"
+        );
+        assert!(
+            app.facet_filter_suppression_stack.is_empty(),
+            "場所だけの退避フィルタも移動時に破棄する"
+        );
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "stale な場所フィルタで移動先の一覧を空にしない"
+        );
+    }
+
+    #[test]
     fn facet_edit_rollup_matches_leaf_archives_and_optional_descendant_folders() {
         use crate::grid_item::{GridItem, ThumbnailState};
         use crate::settings::FacetEditFlag;

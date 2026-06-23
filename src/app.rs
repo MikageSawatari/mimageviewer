@@ -22558,6 +22558,9 @@ impl App {
         previous_scope: Option<PathBuf>,
     ) {
         let current = self.facet_filter_scope.clone();
+        if previous_scope != current {
+            self.clear_place_facet_for_scope_change();
+        }
         self.restore_facet_filter_suppression_for_path(current.as_deref());
 
         if !self.facet_filter_active() {
@@ -22572,6 +22575,15 @@ impl App {
                 "親の絞り込みを退避しました (戻ると復元)".to_string(),
             );
         }
+    }
+
+    fn clear_place_facet_for_scope_change(&mut self) {
+        self.settings.facet_filter.place_keys.clear();
+        for suppression in &mut self.facet_filter_suppression_stack {
+            suppression.saved_filter.place_keys.clear();
+        }
+        self.facet_filter_suppression_stack
+            .retain(|suppression| suppression.saved_filter.is_active());
     }
 
     pub(crate) fn restore_facet_filter_suppression_for_path(&mut self, current: Option<&Path>) {

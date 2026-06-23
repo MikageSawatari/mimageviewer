@@ -583,7 +583,7 @@ pub struct FacetFilter {
     pub kinds: std::collections::BTreeSet<FacetItemKind>,
     #[serde(default)]
     pub exts: std::collections::BTreeSet<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub place_keys: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub ai_models: std::collections::BTreeSet<String>,
@@ -7312,11 +7312,8 @@ mod tests {
                 "facet_filter extensions should survive roundtrip"
             );
             assert!(
-                loaded
-                    .facet_filter
-                    .place_keys
-                    .contains("c:/pictures/source"),
-                "facet_filter source places should survive roundtrip"
+                loaded.facet_filter.place_keys.is_empty(),
+                "facet_filter source places are transient and should not survive roundtrip"
             );
             assert!(
                 loaded.facet_filter.ai_models.contains("sd_xl_base_1.0"),
