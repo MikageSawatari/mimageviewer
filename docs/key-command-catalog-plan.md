@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout Settings 永続化スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 6 menu layout visibility render スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -184,11 +184,19 @@
 > `hidden_commands` で表現し、全コマンドが非表示になった top menu は resolver 出力から落とす。
 > まだ `Settings` へは接続せず、描画・クリック処理・保存形式は変更しない。
 >
-> **Phase 6 menu layout Settings 永続化スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 6 menu layout Settings 永続化スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `Settings.menu_layout: MenuLayoutSettings` を追加し、`settings_kv` 経由の SQLite roundtrip に
 > 乗せる。欠落時は空 `MenuLayoutSettings` になり、resolver が catalog 既定順へ補完するため
 > 既存ユーザーのメニュー表示は変わらない。未リリースの新規 `settings_kv` フィールドなので
 > DB schema migration は不要。描画・クリック処理・編集 UI はまだ変更しない。
+>
+> **Phase 6 menu layout visibility render スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `render_menubar()` で `resolve_menu_layout(&settings.menu_layout)` を読み、各 top menu が
+> resolver 出力に残っている場合だけ描画し、catalog 化済み固定 leaf 項目は
+> `ResolvedTopMenu.commands` に含まれる場合だけボタンを出す。動的なお気に入り一覧、タグ一覧、
+> レーティング一覧、サムネイル列数 / 比率 / ソート順、更新確認など catalog 外の項目は
+> 従来どおり描く。初期接続ではメニュー内順序と top menu 順序の反映はまだ行わず、表示 ON/OFF
+> だけを描画に接続する。
 
 ## 1. 背景と狙い
 
@@ -609,8 +617,11 @@ pub enum BindingPolicy {
   `TopMenuId` / `MenuCommandId` の enum ⇄ `ALL` drift テストを追加する。
 - **menu layout settings model スライス実装済み**: stable name 文字列ベースの `MenuLayoutSettings` と
   resolver を追加し、未知 ID の読み飛ばし・既定補完・非表示 command の解決を純関数で固定する。
-- **menu layout Settings 永続化スライス実装中**: `Settings.menu_layout` を追加し、欠落時 default と
+- **menu layout Settings 永続化スライス実装済み**: `Settings.menu_layout` を追加し、欠落時 default と
   `settings.db` roundtrip をテストする。描画接続・編集 UI は後続。
+- **menu layout visibility render スライス実装中**: `render_menubar()` が resolver 出力を読み、
+  catalog 化済み固定 leaf 項目と空 top menu の表示 ON/OFF を反映する。メニュー内順序・top menu
+  順序の反映は後続。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。

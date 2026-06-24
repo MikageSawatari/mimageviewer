@@ -11,7 +11,7 @@ use eframe::egui;
 
 use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget};
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::keymap::{KeyAction, Keymap, MenuCommandId};
+use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
     FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
@@ -2043,6 +2043,21 @@ impl App {
                     GridItem::Video(path) => Some(path.clone()),
                     _ => None,
                 });
+        let resolved_menu_layout = resolve_menu_layout(&self.settings.menu_layout);
+        let menu_commands = |id: TopMenuId| {
+            resolved_menu_layout
+                .menus
+                .iter()
+                .find(|menu| menu.id == id)
+                .map(|menu| menu.commands.clone())
+        };
+        let file_menu_commands = menu_commands(TopMenuId::File);
+        let favorites_menu_commands = menu_commands(TopMenuId::Favorites);
+        let books_menu_commands = menu_commands(TopMenuId::Books);
+        let video_menu_commands = menu_commands(TopMenuId::Video);
+        let tags_menu_commands = menu_commands(TopMenuId::Tags);
+        let settings_menu_commands = menu_commands(TopMenuId::Settings);
+        let help_menu_commands = menu_commands(TopMenuId::Help);
         let open_folder_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FileOpenFolder);
@@ -2130,278 +2145,338 @@ impl App {
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(7);
 
-                let response = ui.menu_button("ファイル", |ui| {
-                    if ui.button(&open_folder_menu_label).clicked() {
-                        // 既に現在フォルダが設定されていれば初期値として補完
-                        self.open_folder_input = self
-                            .current_folder
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        self.show_open_folder_dialog = true;
-                        ui.close();
-                    }
-                    if ui.button(&reading_history_menu_label).clicked() {
-                        self.enter_reading_history();
-                        ui.close();
-                    }
-                    ui.menu_button("レーティング一覧", |ui| {
-                        for stars in 1..=5 {
-                            if ui
-                                .button(rating_view_menu_label(stars, rating_counts))
+                if let Some(file_menu_commands) = &file_menu_commands {
+                    let response = ui.menu_button(TopMenuId::File.label(), |ui| {
+                        if file_menu_commands.contains(&MenuCommandId::FileOpenFolder)
+                            && ui.button(&open_folder_menu_label).clicked()
+                        {
+                            // 既に現在フォルダが設定されていれば初期値として補完
+                            self.open_folder_input = self
+                                .current_folder
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            self.show_open_folder_dialog = true;
+                            ui.close();
+                        }
+                        if file_menu_commands.contains(&MenuCommandId::FileReadingHistory)
+                            && ui.button(&reading_history_menu_label).clicked()
+                        {
+                            self.enter_reading_history();
+                            ui.close();
+                        }
+                        ui.menu_button("レーティング一覧", |ui| {
+                            for stars in 1..=5 {
+                                if ui
+                                    .button(rating_view_menu_label(stars, rating_counts))
+                                    .clicked()
+                                {
+                                    self.enter_rating_view(stars);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if file_menu_commands.contains(&MenuCommandId::FileLocalSearch)
+                            && ui.button(&local_search_menu_label).clicked()
+                        {
+                            // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
+                            self.open_local_metadata_search();
+                            ui.close();
+                        }
+                        if file_menu_commands.contains(&MenuCommandId::FileOpenCaptureFolder)
+                            && ui.button(&open_capture_folder_menu_label).clicked()
+                        {
+                            self.open_capture_output_dir();
+                            ui.close();
+                        }
+                        if file_menu_commands.contains(&MenuCommandId::FileOpenRecycleBin)
+                            && ui.button(&open_recycle_bin_menu_label).clicked()
+                        {
+                            crate::ui_helpers::open_recycle_bin_async();
+                            ui.close();
+                        }
+                        if file_menu_commands.contains(&MenuCommandId::FileQuit) {
+                            ui.separator();
+                        }
+                        if file_menu_commands.contains(&MenuCommandId::FileQuit)
+                            && ui.button(&quit_menu_label).clicked()
+                        {
+                            // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、
+                            // `shutdown_requested` を立てて `maybe_intercept_close` を通す。
+                            self.shutdown_requested
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                    top_menu_responses.push(response.response);
+                }
+
+                if let Some(favorites_menu_commands) = &favorites_menu_commands {
+                    let response = ui.menu_button(TopMenuId::Favorites.label(), |ui| {
+                        // このフォルダを追加 (クリック時は名称入力ダイアログを開く)。
+                        // お気に入りは索引ルートになるため、ZIP/PDF/変換キャッシュではなく
+                        // 実ディレクトリだけを対象にする。
+                        let favorite_target = self.current_favorite_target();
+                        let can_add = favorite_target.is_some();
+                        if favorites_menu_commands
+                            .contains(&MenuCommandId::FavoritesAddCurrentFolder)
+                            && ui
+                                .add_enabled(can_add, egui::Button::new(&favorite_add_menu_label))
+                                .hover_tip_disabled("お気に入りに追加できるのは実フォルダのみです")
                                 .clicked()
-                            {
-                                self.enter_rating_view(stars);
-                                ui.close();
+                        {
+                            if let Some(folder) = favorite_target.clone() {
+                                // 既定の名前はフォルダ名から補完
+                                let default_name = folder
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                self.fav_add_name_input = default_name;
+                                self.fav_add_target = Some(folder);
+                                self.show_fav_add_dialog = true;
+                            }
+                            ui.close();
+                        }
+
+                        // 編集
+                        if favorites_menu_commands.contains(&MenuCommandId::FavoritesEdit)
+                            && ui.button(&favorite_edit_menu_label).clicked()
+                        {
+                            self.show_favorites_editor = true;
+                            ui.close();
+                        }
+
+                        // コンテナ検索 (Ctrl+S)
+                        if favorites_menu_commands.contains(&MenuCommandId::FavoritesFavSearch)
+                            && ui.button(&fav_search_menu_label).clicked()
+                        {
+                            self.open_favsearch();
+                            ui.close();
+                        }
+
+                        // アイテム検索 (Ctrl+G)
+                        if favorites_menu_commands.contains(&MenuCommandId::FavoritesMetadataSearch)
+                            && ui.button(&metadata_search_menu_label).clicked()
+                        {
+                            // 相互排他は toggle_global_search 内で
+                            self.toggle_global_search();
+                            ui.close();
+                        }
+
+                        // 区切り線
+                        ui.separator();
+
+                        // 登録済みお気に入り一覧
+                        if self.settings.favorites.is_empty() {
+                            ui.label(egui::RichText::new("（未登録）").weak());
+                        } else {
+                            let favorites = self.settings.favorites.clone();
+                            for fav in &favorites {
+                                if ui.button(&fav.name).clicked() {
+                                    fav_nav = Some(fav.path.clone());
+                                    ui.close();
+                                }
                             }
                         }
                     });
-                    if ui.button(&local_search_menu_label).clicked() {
-                        // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
-                        self.open_local_metadata_search();
-                        ui.close();
-                    }
-                    if ui.button(&open_capture_folder_menu_label).clicked() {
-                        self.open_capture_output_dir();
-                        ui.close();
-                    }
-                    if ui.button(&open_recycle_bin_menu_label).clicked() {
-                        crate::ui_helpers::open_recycle_bin_async();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(&quit_menu_label).clicked() {
-                        // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、
-                        // `shutdown_requested` を立てて `maybe_intercept_close` を通す。
-                        self.shutdown_requested
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-                top_menu_responses.push(response.response);
+                    top_menu_responses.push(response.response);
+                }
 
-                let response = ui.menu_button("お気に入り", |ui| {
-                    // このフォルダを追加 (クリック時は名称入力ダイアログを開く)。
-                    // お気に入りは索引ルートになるため、ZIP/PDF/変換キャッシュではなく
-                    // 実ディレクトリだけを対象にする。
-                    let favorite_target = self.current_favorite_target();
-                    let can_add = favorite_target.is_some();
-                    if ui
-                        .add_enabled(can_add, egui::Button::new(&favorite_add_menu_label))
-                        .hover_tip_disabled("お気に入りに追加できるのは実フォルダのみです")
-                        .clicked()
-                    {
-                        if let Some(folder) = favorite_target.clone() {
-                            // 既定の名前はフォルダ名から補完
-                            let default_name = folder
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            self.fav_add_name_input = default_name;
-                            self.fav_add_target = Some(folder);
-                            self.show_fav_add_dialog = true;
-                        }
-                        ui.close();
-                    }
-
-                    // 編集
-                    if ui.button(&favorite_edit_menu_label).clicked() {
-                        self.show_favorites_editor = true;
-                        ui.close();
-                    }
-
-                    // コンテナ検索 (Ctrl+S)
-                    if ui.button(&fav_search_menu_label).clicked() {
-                        self.open_favsearch();
-                        ui.close();
-                    }
-
-                    // アイテム検索 (Ctrl+G)
-                    if ui.button(&metadata_search_menu_label).clicked() {
-                        // 相互排他は toggle_global_search 内で
-                        self.toggle_global_search();
-                        ui.close();
-                    }
-
-                    // 区切り線
-                    ui.separator();
-
-                    // 登録済みお気に入り一覧
-                    if self.settings.favorites.is_empty() {
-                        ui.label(egui::RichText::new("（未登録）").weak());
-                    } else {
-                        let favorites = self.settings.favorites.clone();
-                        for fav in &favorites {
-                            if ui.button(&fav.name).clicked() {
-                                fav_nav = Some(fav.path.clone());
+                if let Some(books_menu_commands) = &books_menu_commands {
+                    let response = ui.menu_button(TopMenuId::Books.label(), |ui| {
+                        let active_name = self.active_book_name();
+                        ui.label(format!("追加先の本: {active_name}"));
+                        let has_selection = self.selected.is_some() || !self.checked.is_empty();
+                        if books_menu_commands
+                            .contains(&MenuCommandId::BooksAddSelectionToActiveBook)
+                        {
+                            let add_resp = ui
+                                .add_enabled(
+                                    has_selection,
+                                    egui::Button::new(&book_add_selection_menu_label),
+                                )
+                                .hover_tip(if has_selection {
+                                    "選択中またはチェック済みの画像・ページを追加先の本へ追加"
+                                } else {
+                                    "追加する画像・ページを選択してください"
+                                });
+                            if add_resp.clicked() {
+                                self.add_grid_selection_to_active_book(ctx);
                                 ui.close();
                             }
                         }
-                    }
-                });
-                top_menu_responses.push(response.response);
-
-                let response = ui.menu_button("製本", |ui| {
-                    let active_name = self.active_book_name();
-                    ui.label(format!("追加先の本: {active_name}"));
-                    let has_selection = self.selected.is_some() || !self.checked.is_empty();
-                    let add_resp = ui
-                        .add_enabled(
-                            has_selection,
-                            egui::Button::new(&book_add_selection_menu_label),
-                        )
-                        .hover_tip(if has_selection {
-                            "選択中またはチェック済みの画像・ページを追加先の本へ追加"
-                        } else {
-                            "追加する画像・ページを選択してください"
-                        });
-                    if add_resp.clicked() {
-                        self.add_grid_selection_to_active_book(ctx);
-                        ui.close();
-                    }
-                    if ui.button(&book_add_clipboard_menu_label).clicked() {
-                        self.add_clipboard_image_to_active_book(ctx);
-                        ui.close();
-                    }
-                    if ui.button(&book_open_root_menu_label).clicked() {
-                        self.open_books_root();
-                        ui.close();
-                    }
-                    if ui.button(&book_open_active_menu_label).clicked() {
-                        fav_nav = Some(self.active_book_folder_path());
-                        ui.close();
-                    }
-                    let can_reorder_book = self.current_folder_is_book_folder();
-                    let reorder_resp = ui
-                        .add_enabled(
-                            can_reorder_book,
-                            egui::Button::new(&book_reorder_menu_label),
-                        )
-                        .hover_tip(if can_reorder_book {
-                            "現在開いている本のページ順を変更"
-                        } else {
-                            "本を開くと使用できます"
-                        });
-                    if reorder_resp.clicked() {
-                        self.open_book_reorder_from_current();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(&book_manage_menu_label).clicked() {
-                        self.show_book_manager = true;
-                        self.book_manager_rename_name = active_name.clone();
-                        self.book_list_cache = None;
-                        ui.close();
-                    }
-                    ui.separator();
-                    if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
-                        self.request_book_list_refresh();
-                    }
-                    let rows = self.book_list_cache.clone();
-                    match rows {
-                        Some(rows) if rows.is_empty() => {
-                            ui.label(egui::RichText::new("（本はまだありません）").weak());
+                        if books_menu_commands.contains(&MenuCommandId::BooksAddClipboardImage)
+                            && ui.button(&book_add_clipboard_menu_label).clicked()
+                        {
+                            self.add_clipboard_image_to_active_book(ctx);
+                            ui.close();
                         }
-                        Some(rows) => {
-                            ui.menu_button("追加先の本を選ぶ", |ui| {
-                                for row in rows {
-                                    let selected = row.name == active_name;
-                                    let label = if selected {
-                                        format!("✓ {} ({}p)", row.name, row.page_count)
-                                    } else {
-                                        format!("{} ({}p)", row.name, row.page_count)
-                                    };
-                                    if ui.button(label).clicked() {
-                                        self.settings.active_book_name = row.name.clone();
-                                        self.settings.save();
-                                        self.book_manager_rename_name = row.name;
-                                        ui.close();
+                        if books_menu_commands.contains(&MenuCommandId::BooksOpenRoot)
+                            && ui.button(&book_open_root_menu_label).clicked()
+                        {
+                            self.open_books_root();
+                            ui.close();
+                        }
+                        if books_menu_commands.contains(&MenuCommandId::BooksOpenActiveBook)
+                            && ui.button(&book_open_active_menu_label).clicked()
+                        {
+                            fav_nav = Some(self.active_book_folder_path());
+                            ui.close();
+                        }
+                        if books_menu_commands.contains(&MenuCommandId::BooksReorderCurrentBook) {
+                            let can_reorder_book = self.current_folder_is_book_folder();
+                            let reorder_resp = ui
+                                .add_enabled(
+                                    can_reorder_book,
+                                    egui::Button::new(&book_reorder_menu_label),
+                                )
+                                .hover_tip(if can_reorder_book {
+                                    "現在開いている本のページ順を変更"
+                                } else {
+                                    "本を開くと使用できます"
+                                });
+                            if reorder_resp.clicked() {
+                                self.open_book_reorder_from_current();
+                                ui.close();
+                            }
+                        }
+                        if books_menu_commands.contains(&MenuCommandId::BooksManage) {
+                            ui.separator();
+                        }
+                        if books_menu_commands.contains(&MenuCommandId::BooksManage)
+                            && ui.button(&book_manage_menu_label).clicked()
+                        {
+                            self.show_book_manager = true;
+                            self.book_manager_rename_name = active_name.clone();
+                            self.book_list_cache = None;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+                            self.request_book_list_refresh();
+                        }
+                        let rows = self.book_list_cache.clone();
+                        match rows {
+                            Some(rows) if rows.is_empty() => {
+                                ui.label(egui::RichText::new("（本はまだありません）").weak());
+                            }
+                            Some(rows) => {
+                                ui.menu_button("追加先の本を選ぶ", |ui| {
+                                    for row in rows {
+                                        let selected = row.name == active_name;
+                                        let label = if selected {
+                                            format!("✓ {} ({}p)", row.name, row.page_count)
+                                        } else {
+                                            format!("{} ({}p)", row.name, row.page_count)
+                                        };
+                                        if ui.button(label).clicked() {
+                                            self.settings.active_book_name = row.name.clone();
+                                            self.settings.save();
+                                            self.book_manager_rename_name = row.name;
+                                            ui.close();
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            }
+                            None => {
+                                ui.label(egui::RichText::new("本棚を読み込み中…").weak());
+                            }
                         }
-                        None => {
-                            ui.label(egui::RichText::new("本棚を読み込み中…").weak());
-                        }
-                    }
-                });
-                top_menu_responses.push(response.response);
+                    });
+                    top_menu_responses.push(response.response);
+                }
 
-                let response = ui.menu_button("動画", |ui| {
-                    let can_apply_to_selected = selected_video_path.is_some();
-                    if ui
-                        .add_enabled(
-                            can_apply_to_selected,
-                            egui::Button::new(&video_register_upscale_menu_label),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = selected_video_path.clone() {
-                            self.request_video_upscale(path);
+                if let Some(video_menu_commands) = &video_menu_commands {
+                    let response = ui.menu_button(TopMenuId::Video.label(), |ui| {
+                        let can_apply_to_selected = selected_video_path.is_some();
+                        if video_menu_commands.contains(&MenuCommandId::VideoRegisterUpscale)
+                            && ui
+                                .add_enabled(
+                                    can_apply_to_selected,
+                                    egui::Button::new(&video_register_upscale_menu_label),
+                                )
+                                .clicked()
+                        {
+                            if let Some(path) = selected_video_path.clone() {
+                                self.request_video_upscale(path);
+                            }
+                            ui.close();
                         }
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            can_apply_to_selected,
-                            egui::Button::new(&video_delete_upscale_menu_label),
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = selected_video_path.clone() {
-                            self.request_video_upscale_artifact_delete(path);
+                        if video_menu_commands.contains(&MenuCommandId::VideoDeleteUpscale)
+                            && ui
+                                .add_enabled(
+                                    can_apply_to_selected,
+                                    egui::Button::new(&video_delete_upscale_menu_label),
+                                )
+                                .clicked()
+                        {
+                            if let Some(path) = selected_video_path.clone() {
+                                self.request_video_upscale_artifact_delete(path);
+                            }
+                            ui.close();
                         }
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(&video_show_upscale_tasks_menu_label).clicked() {
-                        self.show_video_upscale_tasks = true;
-                        ui.close();
-                    }
-                });
-                top_menu_responses.push(response.response);
+                        if video_menu_commands.contains(&MenuCommandId::VideoShowUpscaleTasks) {
+                            ui.separator();
+                        }
+                        if video_menu_commands.contains(&MenuCommandId::VideoShowUpscaleTasks)
+                            && ui.button(&video_show_upscale_tasks_menu_label).clicked()
+                        {
+                            self.show_video_upscale_tasks = true;
+                            ui.close();
+                        }
+                    });
+                    top_menu_responses.push(response.response);
+                }
 
                 // タグメニュー (docs/tag-feature.md §4.2)
-                let response = ui.menu_button("タグ", |ui| {
-                    if ui.button(&tag_manage_pinned_menu_label).clicked() {
-                        self.open_tag_editor();
-                        ui.close();
-                    }
-                    if ui.button(&tag_view_menu_label).clicked() {
-                        self.open_tag_view();
-                        ui.close();
-                    }
-                    ui.separator();
-                    let selection_count = self.tag_target_path_count();
-                    let has_target = selection_count > 0;
-                    if ui
-                        .add_enabled(
-                            has_target,
-                            egui::Button::new(format!("タグを付ける/外す… ({selection_count})")),
-                        )
-                        .clicked()
-                    {
-                        self.open_tag_apply_dialog();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            has_target,
-                            egui::Button::new(format!(
-                                "選択中の項目からタグをクリア ({selection_count})"
-                            )),
-                        )
-                        .hover_tip("mIV 内のタグだけを削除します。")
-                        .clicked()
-                    {
-                        self.request_tag_clear_for_selection();
-                        ui.close();
-                    }
-                    let legacy_xmp_count = self.legacy_xmp_target_path_count();
-                    let has_legacy_xmp_target = legacy_xmp_count > 0;
-                    ui.separator();
-                    if ui
+                if let Some(tags_menu_commands) = &tags_menu_commands {
+                    let response =
+                        ui.menu_button(TopMenuId::Tags.label(), |ui| {
+                            if tags_menu_commands.contains(&MenuCommandId::TagsManagePinned)
+                                && ui.button(&tag_manage_pinned_menu_label).clicked()
+                            {
+                                self.open_tag_editor();
+                                ui.close();
+                            }
+                            if tags_menu_commands.contains(&MenuCommandId::TagsTagView)
+                                && ui.button(&tag_view_menu_label).clicked()
+                            {
+                                self.open_tag_view();
+                                ui.close();
+                            }
+                            ui.separator();
+                            let selection_count = self.tag_target_path_count();
+                            let has_target = selection_count > 0;
+                            if ui
+                                .add_enabled(
+                                    has_target,
+                                    egui::Button::new(format!(
+                                        "タグを付ける/外す… ({selection_count})"
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.open_tag_apply_dialog();
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    has_target,
+                                    egui::Button::new(format!(
+                                        "選択中の項目からタグをクリア ({selection_count})"
+                                    )),
+                                )
+                                .hover_tip("mIV 内のタグだけを削除します。")
+                                .clicked()
+                            {
+                                self.request_tag_clear_for_selection();
+                                ui.close();
+                            }
+                            let legacy_xmp_count = self.legacy_xmp_target_path_count();
+                            let has_legacy_xmp_target = legacy_xmp_count > 0;
+                            ui.separator();
+                            if ui
                         .add_enabled(
                             has_legacy_xmp_target,
                             egui::Button::new(format!("旧XMPタグを取り込む ({legacy_xmp_count})")),
@@ -2416,287 +2491,317 @@ impl App {
                         );
                         ui.close();
                     }
-                    if ui
-                        .add_enabled(
-                            has_legacy_xmp_target,
-                            egui::Button::new(format!(
-                                "旧XMPタグを取り込んでファイルから削除 ({legacy_xmp_count})"
-                            )),
-                        )
-                        .hover_tip("取り込み後、ファイル内の旧mIV #タグだけを削除します。")
-                        .clicked()
-                    {
-                        self.request_legacy_xmp_import_for_selection(
+                            if ui
+                                .add_enabled(
+                                    has_legacy_xmp_target,
+                                    egui::Button::new(format!(
+                                        "旧XMPタグを取り込んでファイルから削除 ({legacy_xmp_count})"
+                                    )),
+                                )
+                                .hover_tip("取り込み後、ファイル内の旧mIV #タグだけを削除します。")
+                                .clicked()
+                            {
+                                self.request_legacy_xmp_import_for_selection(
                             crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportAndRemove,
                         );
-                        ui.close();
-                    }
-                    ui.separator();
-                    let tags_snapshot: Vec<_> = self
-                        .settings
-                        .tags
-                        .iter()
-                        .filter(|tag| tag.show_shortcut)
-                        .cloned()
-                        .collect();
-                    if tags_snapshot.is_empty() {
-                        ui.label(egui::RichText::new("（ピン留めタグなし）").weak());
-                    } else {
-                        ui.menu_button("タグビューで探す", |ui| {
-                            for tag in &tags_snapshot {
-                                if ui.button(format!("#{}", tag.name)).clicked() {
-                                    self.open_tag_view_for_tag(&tag.name);
-                                    ui.close();
-                                }
-                            }
-                        });
-                        ui.separator();
-                        for tag in &tags_snapshot {
-                            let label = format!("#{}", tag.name);
-                            let btn = egui::Button::new(label);
-                            let resp = ui.add_enabled(has_target, btn);
-                            let clicked = resp.clicked();
-                            resp.context_menu(|ui| {
-                                if ui.button("このタグで探す").clicked() {
-                                    self.open_tag_view_for_tag(&tag.name);
-                                    ui.close();
-                                }
-                            });
-                            if clicked {
-                                self.request_tag_toggle_for_selection(&tag.name);
                                 ui.close();
                             }
-                        }
-                    }
-                });
-                top_menu_responses.push(response.response);
-
-                let response = ui.menu_button("設定", |ui| {
-                    ui.menu_button("サムネイル列数", |ui| {
-                        for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
-                        {
-                            let checked = self.settings.grid_cols == cols;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{cols} 列")).clicked() {
-                                self.settings.grid_cols = cols;
-                                settings_changed = true;
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.menu_button("サムネイル比率", |ui| {
-                        // 「自動」項目を先頭に表示。auto 中はチェック、再選択で再評価。
-                        let auto_checked = self.settings.thumb_aspect_auto;
-                        let auto_label = if let Some(current) = self.auto_aspect.current {
-                            format!("自動 ({})", current.label())
-                        } else {
-                            "自動".to_string()
-                        };
-                        let auto_prefix = if auto_checked { "✓ " } else { "  " };
-                        if ui.button(format!("{auto_prefix}{auto_label}")).clicked() {
-                            // 「自動」を選択。現在 Manual だったら自動に切替、すでに Auto なら再評価
-                            // のためリセット (samples は活かして即決し直す)。
-                            let was_off = !self.settings.thumb_aspect_auto;
-                            let prev_effective = self.effective_thumb_aspect();
-                            self.settings.thumb_aspect_auto = true;
-                            self.auto_aspect.reset_decision_only();
-                            if was_off {
-                                self.rebuild_auto_aspect_samples_from_loaded();
-                            }
-                            self.maybe_apply_auto_aspect(true);
-                            // Hold で current=None のまま終わったとき effective は Square。
-                            // 描画上のセル比率が変わるのでスクロール位置を補正する
-                            // (Switch されたら maybe_apply 内で fixup 済 → 二重呼出しは
-                            // 冪等で no-op、Codex P3 2026-05)。
-                            let new_effective = self.effective_thumb_aspect();
-                            if prev_effective != new_effective {
-                                self.fixup_scroll_for_aspect_change(new_effective);
-                            }
-                            settings_changed = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        for &aspect in crate::settings::ThumbAspect::all() {
-                            // 手動値表示: auto モード時はチェックしない (auto がチェックされる)
-                            let checked = !self.settings.thumb_aspect_auto
-                                && self.settings.thumb_aspect == aspect;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{}", aspect.label())).clicked() {
-                                // 個別比率クリック → Manual に切替。scroll 補正も適用。
-                                if self.settings.thumb_aspect_auto
-                                    || self.settings.thumb_aspect != aspect
-                                {
-                                    self.fixup_scroll_for_aspect_change(aspect);
-                                }
-                                self.settings.thumb_aspect_auto = false;
-                                self.settings.thumb_aspect = aspect;
-                                settings_changed = true;
-                                ui.close();
-                            }
-                        }
-                    });
-                    if book_sort_locked {
-                        ui.add_enabled(false, egui::Button::new("ソート順: 番号順固定"))
-                            .on_hover_text("本棚内または読書履歴では表示順が固定されます。");
-                    } else {
-                        ui.menu_button("ソート順", |ui| {
-                            for &order in crate::settings::SortOrder::all() {
-                                let checked = if self.items_are_rating_view {
-                                    self.rating_view_sort
-                                        == crate::rating_view::RatingViewSort::Normal(order)
-                                } else {
-                                    self.settings.sort_order == order
-                                };
-                                let prefix = if checked { "✓ " } else { "  " };
-                                if ui.button(format!("{prefix}{}", order.label())).clicked() {
-                                    self.settings.sort_order = order;
-                                    if self.items_are_rating_view {
-                                        self.set_rating_view_sort(
-                                            crate::rating_view::RatingViewSort::Normal(order),
-                                        );
-                                    } else {
-                                        sort_changed = true;
+                            ui.separator();
+                            let tags_snapshot: Vec<_> = self
+                                .settings
+                                .tags
+                                .iter()
+                                .filter(|tag| tag.show_shortcut)
+                                .cloned()
+                                .collect();
+                            if tags_snapshot.is_empty() {
+                                ui.label(egui::RichText::new("（ピン留めタグなし）").weak());
+                            } else {
+                                ui.menu_button("タグビューで探す", |ui| {
+                                    for tag in &tags_snapshot {
+                                        if ui.button(format!("#{}", tag.name)).clicked() {
+                                            self.open_tag_view_for_tag(&tag.name);
+                                            ui.close();
+                                        }
                                     }
-                                    ui.close();
-                                }
-                            }
-                            if self.items_are_rating_view {
+                                });
                                 ui.separator();
-                                for sort in [
-                                    crate::rating_view::RatingViewSort::RatedAtDesc,
-                                    crate::rating_view::RatingViewSort::RatedAtAsc,
-                                ] {
-                                    let checked = self.rating_view_sort == sort;
-                                    let prefix = if checked { "✓ " } else { "  " };
-                                    if ui.button(format!("{prefix}{}", sort.label())).clicked() {
-                                        self.set_rating_view_sort(sort);
+                                for tag in &tags_snapshot {
+                                    let label = format!("#{}", tag.name);
+                                    let btn = egui::Button::new(label);
+                                    let resp = ui.add_enabled(has_target, btn);
+                                    let clicked = resp.clicked();
+                                    resp.context_menu(|ui| {
+                                        if ui.button("このタグで探す").clicked() {
+                                            self.open_tag_view_for_tag(&tag.name);
+                                            ui.close();
+                                        }
+                                    });
+                                    if clicked {
+                                        self.request_tag_toggle_for_selection(&tag.name);
                                         ui.close();
                                     }
                                 }
                             }
                         });
-                    }
-                    ui.separator();
-                    if ui.button(&settings_thumbnail_cache_menu_label).clicked() {
-                        let cache_dir = crate::catalog::default_cache_dir();
-                        // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
-                        // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
-                        self.cache_manager_stats = None;
-                        self.cache_manager_tile_bytes = None;
-                        self.cache_manager_auto_aspect_entries = None;
-                        self.cache_manager_result = None;
-                        if self.cache_maint_pending.is_none() {
-                            self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
-                                crate::cache_maintenance::CacheMaintTask::Stats,
-                                cache_dir,
-                                self.video_tile_cache.clone(),
-                            ));
-                        }
-                        self.show_cache_manager = true;
-                        ui.close();
-                    }
-                    if ui.button(&settings_archive_cache_menu_label).clicked() {
-                        self.open_archive_cache_manager();
-                        ui.close();
-                    }
-                    if ui.button(&settings_thumbnail_quality_menu_label).clicked() {
-                        self.open_thumb_quality_dialog(ctx);
-                        ui.close();
-                    }
-                    if ui.button(&settings_stats_menu_label).clicked() {
-                        self.show_stats_dialog = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(&settings_reset_rotation_menu_label).clicked() {
-                        self.show_rotation_reset_confirm = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(&settings_restore_menu_label).clicked() {
-                        // 2026-05-17: settings.db のバックアップから復元する UI。
-                        // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
-                        // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
-                        self.open_settings_restore_dialog();
-                        ui.close();
-                    }
-                    ui.separator();
-                    // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
-                    // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
-                    // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
-                    // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
-                    ui.menu_button("ツールバー", |ui| {
-                        self.draw_toolbar_visibility_menu(ui, true);
-                    });
-                    if ui.button(&settings_preferences_menu_label).clicked() {
-                        self.show_preferences = true;
-                        ui.close();
-                    }
-                    // VST3 関連の設定は環境設定→VST3 プラグインページに集約。
-                    // 専用メニューは重複なので持たない (= ユーザー要望 2026-04)。
-                    // 動画再生中はホバーバー / ツールバーの VST ボタンから
-                    // プレイバックパネルを開く運用。
-                });
-                top_menu_responses.push(response.response);
+                    top_menu_responses.push(response.response);
+                }
 
-                let response = ui.menu_button("ヘルプ", |ui| {
-                    if ui.button(&help_open_manual_menu_label).clicked() {
-                        let url = crate::ui_helpers::manual_url("index.html", None);
-                        crate::ui_helpers::open_url(&url);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(&help_open_logs_menu_label).clicked() {
-                        let dir = crate::data_dir::logs_dir();
-                        let _ = std::fs::create_dir_all(&dir);
-                        crate::ui_helpers::open_external_player(&dir);
-                        ui.close();
-                    }
-                    ui.separator();
-                    let checking = self.update_check_pending.is_some();
-                    if ui
-                        .add_enabled(
-                            !checking,
-                            egui::Button::new(if checking {
-                                "更新を確認中…"
-                            } else {
-                                "更新を確認…"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.kick_update_check(true);
-                        ui.close();
-                    }
-                    if ui
-                        .button(&help_show_whats_new_menu_label)
-                        .on_hover_text("このバージョンの主な変更点をもう一度表示します")
-                        .clicked()
-                    {
-                        // 現行版のエントリ。無ければ最新エントリにフォールバック (空メニュー回避)。
-                        let mut entries = crate::version_highlights::for_version(
-                            env!("CARGO_PKG_VERSION"),
-                            crate::version_highlights::table(),
-                        );
-                        if entries.is_empty() {
-                            if let Some(last) = crate::version_highlights::table().last() {
-                                entries = vec![last];
+                if let Some(settings_menu_commands) = &settings_menu_commands {
+                    let response = ui.menu_button(TopMenuId::Settings.label(), |ui| {
+                        ui.menu_button("サムネイル列数", |ui| {
+                            for cols in
+                                crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
+                            {
+                                let checked = self.settings.grid_cols == cols;
+                                let prefix = if checked { "✓ " } else { "  " };
+                                if ui.button(format!("{prefix}{cols} 列")).clicked() {
+                                    self.settings.grid_cols = cols;
+                                    settings_changed = true;
+                                    ui.close();
+                                }
                             }
+                        });
+                        ui.menu_button("サムネイル比率", |ui| {
+                            // 「自動」項目を先頭に表示。auto 中はチェック、再選択で再評価。
+                            let auto_checked = self.settings.thumb_aspect_auto;
+                            let auto_label = if let Some(current) = self.auto_aspect.current {
+                                format!("自動 ({})", current.label())
+                            } else {
+                                "自動".to_string()
+                            };
+                            let auto_prefix = if auto_checked { "✓ " } else { "  " };
+                            if ui.button(format!("{auto_prefix}{auto_label}")).clicked() {
+                                // 「自動」を選択。現在 Manual だったら自動に切替、すでに Auto なら再評価
+                                // のためリセット (samples は活かして即決し直す)。
+                                let was_off = !self.settings.thumb_aspect_auto;
+                                let prev_effective = self.effective_thumb_aspect();
+                                self.settings.thumb_aspect_auto = true;
+                                self.auto_aspect.reset_decision_only();
+                                if was_off {
+                                    self.rebuild_auto_aspect_samples_from_loaded();
+                                }
+                                self.maybe_apply_auto_aspect(true);
+                                // Hold で current=None のまま終わったとき effective は Square。
+                                // 描画上のセル比率が変わるのでスクロール位置を補正する
+                                // (Switch されたら maybe_apply 内で fixup 済 → 二重呼出しは
+                                // 冪等で no-op、Codex P3 2026-05)。
+                                let new_effective = self.effective_thumb_aspect();
+                                if prev_effective != new_effective {
+                                    self.fixup_scroll_for_aspect_change(new_effective);
+                                }
+                                settings_changed = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            for &aspect in crate::settings::ThumbAspect::all() {
+                                // 手動値表示: auto モード時はチェックしない (auto がチェックされる)
+                                let checked = !self.settings.thumb_aspect_auto
+                                    && self.settings.thumb_aspect == aspect;
+                                let prefix = if checked { "✓ " } else { "  " };
+                                if ui.button(format!("{prefix}{}", aspect.label())).clicked() {
+                                    // 個別比率クリック → Manual に切替。scroll 補正も適用。
+                                    if self.settings.thumb_aspect_auto
+                                        || self.settings.thumb_aspect != aspect
+                                    {
+                                        self.fixup_scroll_for_aspect_change(aspect);
+                                    }
+                                    self.settings.thumb_aspect_auto = false;
+                                    self.settings.thumb_aspect = aspect;
+                                    settings_changed = true;
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if book_sort_locked {
+                            ui.add_enabled(false, egui::Button::new("ソート順: 番号順固定"))
+                                .on_hover_text("本棚内または読書履歴では表示順が固定されます。");
+                        } else {
+                            ui.menu_button("ソート順", |ui| {
+                                for &order in crate::settings::SortOrder::all() {
+                                    let checked = if self.items_are_rating_view {
+                                        self.rating_view_sort
+                                            == crate::rating_view::RatingViewSort::Normal(order)
+                                    } else {
+                                        self.settings.sort_order == order
+                                    };
+                                    let prefix = if checked { "✓ " } else { "  " };
+                                    if ui.button(format!("{prefix}{}", order.label())).clicked() {
+                                        self.settings.sort_order = order;
+                                        if self.items_are_rating_view {
+                                            self.set_rating_view_sort(
+                                                crate::rating_view::RatingViewSort::Normal(order),
+                                            );
+                                        } else {
+                                            sort_changed = true;
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                if self.items_are_rating_view {
+                                    ui.separator();
+                                    for sort in [
+                                        crate::rating_view::RatingViewSort::RatedAtDesc,
+                                        crate::rating_view::RatingViewSort::RatedAtAsc,
+                                    ] {
+                                        let checked = self.rating_view_sort == sort;
+                                        let prefix = if checked { "✓ " } else { "  " };
+                                        if ui.button(format!("{prefix}{}", sort.label())).clicked()
+                                        {
+                                            self.set_rating_view_sort(sort);
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
                         }
-                        // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
-                        // ショートカットを塞がないよう、開かない (Codex P3)。
-                        if !entries.is_empty() {
-                            self.whats_new_entries = entries;
-                            self.show_whats_new = true;
+                        ui.separator();
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsThumbnailCache)
+                            && ui.button(&settings_thumbnail_cache_menu_label).clicked()
+                        {
+                            let cache_dir = crate::catalog::default_cache_dir();
+                            // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
+                            // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
+                            self.cache_manager_stats = None;
+                            self.cache_manager_tile_bytes = None;
+                            self.cache_manager_auto_aspect_entries = None;
+                            self.cache_manager_result = None;
+                            if self.cache_maint_pending.is_none() {
+                                self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
+                                    crate::cache_maintenance::CacheMaintTask::Stats,
+                                    cache_dir,
+                                    self.video_tile_cache.clone(),
+                                ));
+                            }
+                            self.show_cache_manager = true;
+                            ui.close();
                         }
-                        ui.close();
-                    }
-                    if ui.button(&help_about_menu_label).clicked() {
-                        self.show_about_dialog = true;
-                        ui.close();
-                    }
-                });
-                top_menu_responses.push(response.response);
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsArchiveCache)
+                            && ui.button(&settings_archive_cache_menu_label).clicked()
+                        {
+                            self.open_archive_cache_manager();
+                            ui.close();
+                        }
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsThumbnailQuality)
+                            && ui.button(&settings_thumbnail_quality_menu_label).clicked()
+                        {
+                            self.open_thumb_quality_dialog(ctx);
+                            ui.close();
+                        }
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsStats)
+                            && ui.button(&settings_stats_menu_label).clicked()
+                        {
+                            self.show_stats_dialog = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsResetRotation)
+                            && ui.button(&settings_reset_rotation_menu_label).clicked()
+                        {
+                            self.show_rotation_reset_confirm = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsRestoreSettings)
+                            && ui.button(&settings_restore_menu_label).clicked()
+                        {
+                            // 2026-05-17: settings.db のバックアップから復元する UI。
+                            // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
+                            // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
+                            self.open_settings_restore_dialog();
+                            ui.close();
+                        }
+                        ui.separator();
+                        // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
+                        // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
+                        // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                        // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
+                        ui.menu_button("ツールバー", |ui| {
+                            self.draw_toolbar_visibility_menu(ui, true);
+                        });
+                        if settings_menu_commands.contains(&MenuCommandId::SettingsPreferences)
+                            && ui.button(&settings_preferences_menu_label).clicked()
+                        {
+                            self.show_preferences = true;
+                            ui.close();
+                        }
+                        // VST3 関連の設定は環境設定→VST3 プラグインページに集約。
+                        // 専用メニューは重複なので持たない (= ユーザー要望 2026-04)。
+                        // 動画再生中はホバーバー / ツールバーの VST ボタンから
+                        // プレイバックパネルを開く運用。
+                    });
+                    top_menu_responses.push(response.response);
+                }
+
+                if let Some(help_menu_commands) = &help_menu_commands {
+                    let response = ui.menu_button(TopMenuId::Help.label(), |ui| {
+                        if help_menu_commands.contains(&MenuCommandId::HelpOpenManual)
+                            && ui.button(&help_open_manual_menu_label).clicked()
+                        {
+                            let url = crate::ui_helpers::manual_url("index.html", None);
+                            crate::ui_helpers::open_url(&url);
+                            ui.close();
+                        }
+                        if help_menu_commands.contains(&MenuCommandId::HelpOpenLogs) {
+                            ui.separator();
+                        }
+                        if help_menu_commands.contains(&MenuCommandId::HelpOpenLogs)
+                            && ui.button(&help_open_logs_menu_label).clicked()
+                        {
+                            let dir = crate::data_dir::logs_dir();
+                            let _ = std::fs::create_dir_all(&dir);
+                            crate::ui_helpers::open_external_player(&dir);
+                            ui.close();
+                        }
+                        ui.separator();
+                        let checking = self.update_check_pending.is_some();
+                        if ui
+                            .add_enabled(
+                                !checking,
+                                egui::Button::new(if checking {
+                                    "更新を確認中…"
+                                } else {
+                                    "更新を確認…"
+                                }),
+                            )
+                            .clicked()
+                        {
+                            self.kick_update_check(true);
+                            ui.close();
+                        }
+                        if help_menu_commands.contains(&MenuCommandId::HelpShowWhatsNew)
+                            && ui
+                                .button(&help_show_whats_new_menu_label)
+                                .on_hover_text("このバージョンの主な変更点をもう一度表示します")
+                                .clicked()
+                        {
+                            // 現行版のエントリ。無ければ最新エントリにフォールバック (空メニュー回避)。
+                            let mut entries = crate::version_highlights::for_version(
+                                env!("CARGO_PKG_VERSION"),
+                                crate::version_highlights::table(),
+                            );
+                            if entries.is_empty() {
+                                if let Some(last) = crate::version_highlights::table().last() {
+                                    entries = vec![last];
+                                }
+                            }
+                            // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
+                            // ショートカットを塞がないよう、開かない (Codex P3)。
+                            if !entries.is_empty() {
+                                self.whats_new_entries = entries;
+                                self.show_whats_new = true;
+                            }
+                            ui.close();
+                        }
+                        if help_menu_commands.contains(&MenuCommandId::HelpAbout)
+                            && ui.button(&help_about_menu_label).clicked()
+                        {
+                            self.show_about_dialog = true;
+                            ui.close();
+                        }
+                    });
+                    top_menu_responses.push(response.response);
+                }
 
                 // メニュー項目の右側に新バージョン通知バッジを表示する。
                 // 押すと更新ダイアログを開き、リリースページへの誘導 / skip 操作を行える。
