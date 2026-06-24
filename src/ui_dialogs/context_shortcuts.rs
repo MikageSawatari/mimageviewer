@@ -149,6 +149,7 @@ const ERASE_HELP_SCOPES: &[CommandScope] = &[CommandScope::Erase];
 const CONCEAL_HELP_SCOPES: &[CommandScope] = &[CommandScope::Conceal];
 const CROP_HELP_SCOPES: &[CommandScope] = &[CommandScope::Crop];
 const LOCAL_ADJUST_HELP_SCOPES: &[CommandScope] = &[CommandScope::LocalAdjust];
+const TEXT_HELP_SCOPES: &[CommandScope] = &[CommandScope::Text];
 
 const ERASE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
@@ -262,6 +263,37 @@ const LOCAL_ADJUST_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const TEXT_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc",
+        description: "選択を解除する。未選択ならテキスト注釈モードを終了する",
+    },
+    FixedShortcutRow {
+        keys: "Delete / Backspace",
+        description: "選択中の注釈を削除する。本文の編集中はテキスト入力を優先する",
+    },
+    FixedShortcutRow {
+        keys: "ドラッグ",
+        description: "画像上で注釈を選択、移動、またはハンドル編集する",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール / Ctrl+ホイール",
+        description: "画像上ではズームする。パネル上ではスクロールまたはズームする",
+    },
+    FixedShortcutRow {
+        keys: "中ボタン+上下ドラッグ",
+        description: "ドラッグ開始位置を中心にズームする",
+    },
+    FixedShortcutRow {
+        keys: "右Ctrl",
+        description: "押している間だけテキスト注釈を外した元画像を表示する",
+    },
+];
+
 #[derive(Clone, Copy)]
 enum ShortcutHelpContext {
     Grid,
@@ -271,6 +303,7 @@ enum ShortcutHelpContext {
     Conceal,
     Crop,
     LocalAdjust,
+    Text,
 }
 
 impl ShortcutHelpContext {
@@ -283,6 +316,7 @@ impl ShortcutHelpContext {
             Self::Conceal => "隠蔽加工モード",
             Self::Crop => "切り取りモード",
             Self::LocalAdjust => "補正レイヤー",
+            Self::Text => "テキスト注釈モード",
         }
     }
 
@@ -295,6 +329,7 @@ impl ShortcutHelpContext {
             Self::Conceal => CONCEAL_HELP_SCOPES,
             Self::Crop => CROP_HELP_SCOPES,
             Self::LocalAdjust => LOCAL_ADJUST_HELP_SCOPES,
+            Self::Text => TEXT_HELP_SCOPES,
         }
     }
 
@@ -307,6 +342,7 @@ impl ShortcutHelpContext {
             Self::Conceal => CONCEAL_FIXED_SHORTCUT_ROWS,
             Self::Crop => CROP_FIXED_SHORTCUT_ROWS,
             Self::LocalAdjust => LOCAL_ADJUST_FIXED_SHORTCUT_ROWS,
+            Self::Text => TEXT_FIXED_SHORTCUT_ROWS,
         }
     }
 
@@ -318,7 +354,7 @@ impl ShortcutHelpContext {
                     || row.spec.action == KeyAction::ToggleDetachedViewerMode
             }
             Self::FsVideo => video_help_includes_row(row),
-            Self::Erase | Self::Conceal | Self::Crop | Self::LocalAdjust => true,
+            Self::Erase | Self::Conceal | Self::Crop | Self::LocalAdjust | Self::Text => true,
         }
     }
 }
@@ -387,6 +423,9 @@ impl App {
         }
         if self.local_adjust_mode {
             return ShortcutHelpContext::LocalAdjust;
+        }
+        if self.text_mode {
+            return ShortcutHelpContext::Text;
         }
         if self.export_crop_mode {
             return ShortcutHelpContext::Crop;

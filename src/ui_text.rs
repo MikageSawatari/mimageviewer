@@ -1185,6 +1185,14 @@ impl App {
     pub(crate) fn handle_text_keys(&mut self, ctx: &egui::Context, _fs_idx: usize) -> FsKeyAction {
         let action = FsKeyAction::default();
 
+        if !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && Self::consume_context_shortcuts_help_key(ctx)
+        {
+            self.show_context_shortcuts_help = true;
+            return action;
+        }
+
         // Ctrl+T: 再押下で退場。
         let ctrl_t = self.keymap.consume_action(ctx, KeyAction::TextConfirm);
         if ctrl_t {

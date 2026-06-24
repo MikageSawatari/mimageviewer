@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 7 native 動画 overlay ヘルプスライス実装中 / レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 7 コンテキストヘルプ全スライス実装済み / ClaudeCode レビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -94,21 +94,22 @@
 > 消しゴム / 隠蔽加工モード中の固定 `?` で同じ「ショートカット」ダイアログを開く。
 > 通常フルスクリーンの `Global` / `FsCommon` 操作は編集モード中に発火しないため、
 > 表示対象は `Erase` / `Conceal` scope の KeyAction に限定し、Esc / Enter / 矢印 /
-> ホイールなどの固定扱い入力は補助行に分ける。補正レイヤーは後続スライスで対応し、
-> 動画フルスクリーンとテキスト注釈は後続。
+> ホイールなどの固定扱い入力は補助行に分ける。補正レイヤー、動画フルスクリーン、
+> テキスト注釈は後続スライスで対応済み。
 >
 > **Phase 7 切り取りヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > 切り取りモード中の固定 `?` で同じ「ショートカット」ダイアログを開く。表示対象は
 > `Crop` scope の KeyAction (`CropExecute` / `CropSpacePan`) に限定し、Esc / ドラッグ /
-> ホイールなどの固定扱い入力は補助行へ分ける。補正レイヤーは後続スライスで対応中で、
-> 動画フルスクリーンとテキスト注釈は後続。
+> ホイールなどの固定扱い入力は補助行へ分ける。補正レイヤー、動画フルスクリーン、
+> テキスト注釈は後続スライスで対応済み。
 >
 > **Phase 7 補正レイヤーヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > 補正レイヤーパネル中の固定 `?` で同じ「ショートカット」ダイアログを開く。表示対象は
 > `LocalAdjust` scope の KeyAction に限定し、通常フルスクリーンの `Global` / `FsCommon`
 > 操作は編集モード中に混ぜない。Esc / Enter / Delete / 矢印 / ブラケット / Undo・Redo /
 > マウス操作などの固定扱い入力は補助行へ分ける。パネル内のテキスト入力や数値入力が
-> keyboard focus を持つときは `?` を奪わない。動画フルスクリーンとテキスト注釈は後続。
+> keyboard focus を持つときは `?` を奪わない。動画フルスクリーンとテキスト注釈は
+> 後続スライスで対応済み。
 >
 > **Phase 7 egui 動画ヘルプ初期スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > egui 経路の動画フルスクリーンでも固定 `?` で同じ「ショートカット」ダイアログを開く。
@@ -118,13 +119,19 @@
 > Home / End / F11 / ホイールなどの固定扱い入力は補助行へ分ける。native 動画 overlay 上で
 > 直接開くヘルプは後続スライスに残す。
 >
-> **Phase 7 native 動画 overlay ヘルプスライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 7 native 動画 overlay ヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > Windows native presenter 上でも `?` の Text イベントで動画フルスクリーン用ショートカット
 > ヘルプを開く。App 側で `NativeOverlayShortcutHelp` snapshot を作って `NativeOverlayMetadata`
 > に載せ、presenter は keymap を直接参照せず所有済み文字列だけを描画する。表示対象は
 > egui 動画ヘルプと同じく、動画中に実際に有効な `FsVideo` / 一部 `FsCommon` / `Rating` /
 > `ToggleDetachedViewerMode` に限定し、`VideoCompare*` は出さない。ヘルプ表示中は
 > presenter 内で Esc を閉じる操作として消費し、App 側へのキー・Text・ホイール転送を抑止する。
+>
+> **Phase 7 テキスト注釈ヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
+> テキスト注釈モード中の固定 `?` で同じ「ショートカット」ダイアログを開く。表示対象は
+> `Text` scope の `TextConfirm` / `TextUndo` / `TextRedo` / `TextSpacePan` と、Esc /
+> Delete / Backspace / ドラッグ / ホイール / 右Ctrl などの固定扱い入力。本文やフォント検索など
+> TextEdit が keyboard focus を持つときは `?` を奪わない。
 
 ## 1. 背景と狙い
 
@@ -560,10 +567,13 @@ pub enum BindingPolicy {
 - **egui 動画ヘルプ初期スライス実装済み**: egui 経路の動画フルスクリーンで `?` を押したとき、
   `FsVideo` scope と動画で有効な一部 `FsCommon` / `Rating` の実割り当て、固定シーク操作を
   表示する。
-- **native 動画 overlay ヘルプスライス実装中**: Windows native presenter 上でも `?` を押したとき、
+- **native 動画 overlay ヘルプスライス実装済み**: Windows native presenter 上でも `?` を押したとき、
   egui 動画ヘルプと同じ対象行を中央モーダルで表示する。snapshot は App 側で作成し、
   presenter は所有済み文字列を描画する。ヘルプ表示中は Esc で閉じ、背面動画操作へキーを
   漏らさない。
+- **テキスト注釈ヘルプスライス実装済み**: テキスト注釈モード中に `?` を押したとき、`Text`
+  scope の実割り当てと固定キーを表示する。本文や検索欄などが keyboard focus を持つ場合は
+  `?` を奪わない。
 - `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
   消しゴム / 隠蔽加工 / 補正レイヤー / テキスト注釈など) で有効なショートカット一覧を表示する。
 - 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。
