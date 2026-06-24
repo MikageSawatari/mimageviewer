@@ -18410,6 +18410,14 @@ impl App {
             return None;
         }
 
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridToggleStackMode)
+        {
+            self.toggle_stack_mode();
+            return None;
+        }
+
         let cols = self.settings.grid_cols.max(1);
 
         // Ctrl の状態判定。AutoHotKey 等の外部ツールが Ctrl+矢印を送信する場合、

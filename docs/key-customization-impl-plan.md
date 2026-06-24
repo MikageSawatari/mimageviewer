@@ -17,6 +17,10 @@
   更新生成する。起動時に読むのは `keymap.ini` だけ。警告はログへ出す。テストではユーザー環境の ini を読まない。
 - 画像フルスクリーン、編集モード (消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤー)、
   グリッド主要操作、egui/native 動画主要操作を keymap 経由にした。
+- 2026-06 Phase 1 として、既定キーを持たない `KeyAction` も許可した。`GridToggleStackMode`
+  は `keymap.ini.default` に `# GridToggleStackMode = none` として出し、ユーザーがキーを
+  指定したときだけフォルダバーの「スタック」と同じトグルを実行する。`CommandId` /
+  `CommandSpec` などのコマンドカタログ型はまだ導入していない。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
   右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは
@@ -33,6 +37,8 @@
 - **デフォルトはコードに残す。** 初回生成される `keymap.ini` は標準設定をコメントアウトで列挙する。
   コメント解除した Action だけが上書きになり、コメントのままの操作はコードの既定に追従する。
   最新の標準一覧は、起動時に上書き更新される `keymap.ini.default` で確認できる。
+  既定キーなしの Action は `# Action = none` と表示し、コメント解除してキー名を入れることで
+  割り当て可能にする。`Action = none` のままコメント解除した場合は従来どおり明示無効化。
 - **競合検知しない。** 先勝ち (consume / VK match 経路は先頭一致が勝つ。grid の `key_pressed`
   経路だけは非消費なので衝突時は両方発火する = 仕様として明記)。
 - **MVP で対象外にする入力を明示する。** ゲームパッド、マウス操作、D&D、OS/egui の
@@ -410,6 +416,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    `description()` は生成される `keymap.ini` / `keymap.ini.default` の行末コメントになるため、
    ユーザーが設定ファイル単体で操作内容を判断できる日本語説明にする。`trigger()` は
    `_ => Press` を使わない網羅 match なので、新 variant を分類しないとコンパイルで止まる。
+   標準キーを持たないがユーザー割り当て可能にしたい操作は、`default_chords()` で空の
+   `ChordList` を返す。
 3. **`ALL_ACTIONS` に追加する。**
    `KeyAction::all()` は `keymap.ini` / `keymap.ini.default` 生成、ini parse、native 動画転送 whitelist の入口。
    `all_actions_inventory_matches_key_action_enum` が enum と配列のドリフトを検知する。
@@ -420,6 +428,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    `native_video_shortcut_key` の連動を確認する。
 5. **ドキュメントと同梱 `.default` を更新する。**
    `docs/keymap-spec.md` に操作仕様、`docs/keymap.ini.default` に標準設定と行末説明を反映する。
+   既定キーなしの Action は `# Action = none` として列挙する。
    `bundled_keymap_default_matches_generated_reference` がコード生成結果とのズレを検知する。
 6. **狭いテストから回す。**
    最低限 `cargo test keymap --bin mimageviewer-core`。動画 VK を触ったら

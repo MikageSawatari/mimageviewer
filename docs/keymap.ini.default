@@ -12,7 +12,8 @@
 # - 1 つの Action でもコメント解除すると、その Action の既定キーは全置換されます。
 # - 既定キーを残したい場合は、残したいキーも Action.1..3 として明示してください。
 # - 1 つの Action には Action.1 / Action.2 / Action.3 で最大 3 個まで割り当てできます。
-# - none を指定すると、その Action を無効化できます。
+# - = none を指定すると、その Action を明示的に無効化できます。
+# - 既定キーが無い Action は # Action = none と表示されます。
 # - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。
 # - 競合は検出しません。競合時は先に判定された操作が有効になります。
 # - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。
@@ -57,6 +58,7 @@
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
+# GridToggleStackMode = none ; スタック表示を切り替える
 # GridTagApply = T ; タグを付ける/外すダイアログを開く
 # GridTagView = Ctrl+T ; タグビューを開く
 # GridRotateCw = R ; 選択中の画像を右に90度回転する

@@ -1,0 +1,533 @@
+# キー操作コマンドカタログ化計画
+
+> ステータス: **Phase 1 初期実装済み / レビュー待ち** (2026-06-24)。
+> 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
+> 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
+> 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
+>
+> **改訂メモ (2026-06-24, ClaudeCode / Codex レビュー反映)**: Phase 1 は `CommandId` /
+> `CommandSpec` の本格導入を**見送り**、既存 `KeyAction` の小さな拡張に絞る (空 `default_chords`
+> の許可・`GridToggleStackMode` 追加・`none` 未割り当て行の生成・表示用 helper まで)。
+> `CommandId` / `CommandScope` / 衝突判定は、実際に必要になる Phase 2 以降へ後ろ倒しする。
+> §3.1 / §4 / §6 / §7 はこの方針で書き直してある。
+>
+> **Phase 1 実装メモ (2026-06-24, Codex)**: `KeyAction::GridToggleStackMode` を既定未割り当てで追加し、
+> 空 `default_chords()`、`# Action = none` 生成、`effective_chords()` /
+> `first_chord_label()` / `compact_single_key_label()`、グリッド側キーハンドラへの最小配線まで実装。
+> `CommandId` / `CommandSpec` / scope 衝突判定は未導入のまま。ClaudeCode レビュー待ち。
+
+## 1. 背景と狙い
+
+現行の `src/keymap.rs` は `KeyAction` を中心に、既に多くのキーボード操作を
+`keymap.ini` で差し替えられる。ただし、これは「既にショートカットとして設計された
+キー操作」の一覧であり、アプリ全体の操作カタログではない。
+
+そのため、たとえばファイル名スタック表示トグルのように UI ボタンはあるが既定キーが
+ない操作は、ユーザーが後から `keymap.ini` でキーを割り当てる余地がない。
+
+最終的には以下を目指す。
+
+- アプリ内のユーザー操作を安定したコマンド ID で棚卸しする。
+- デフォルトでは未割り当ての操作も `keymap.ini` から割り当てられるようにする。
+- メニュー / ツール / ツールチップのキー表記を、実際の割り当てから表示できるようにする。
+- 衝突判定を、全アプリ一律ではなく「同時に有効になり得るスコープ」単位で扱う。
+- 将来のメニュー構成カスタマイズは、コマンド ID の並びとして保存できるようにする。
+
+ただし、最初のリリースでは **UI 表示変更やメニュー構成変更は行わない**。まずは
+「catalog 化」と「ini で割り当てられる範囲の拡張」を安全に進める。
+
+## 2. 非目標
+
+初期フェーズでは以下を扱わない。
+
+- GUI のキー割り当てエディタ。
+- メニュー構成のカスタマイズ。
+- メニューやツール名のショートカット表記の全面更新。
+- Esc / Enter / 矢印キーの全面自由化。
+- OS clipboard、D&D、右クリックメニュー、IME 確定、通常マウス操作、ゲームパッドの
+  `keymap.ini` 化。
+- 既存の入力 dispatch を一気に中央集権化すること。
+
+特に最後が重要で、初期フェーズでは **catalog は作るが、既存 dispatch の消費順は極力維持する**。
+バグが入りやすいのはコマンド一覧そのものではなく、`consume_key` / `key_pressed` /
+native VK 判定の優先順を変える部分である。
+
+## 3. 基本方針
+
+### 3.1 Catalog first, dispatch later
+
+最初に「この操作はコマンドである」という台帳を作る。既存の `KeyAction` はすぐ捨てず、
+コマンドに紐づくキー割り当て ID として使い続ける。
+
+> **Phase 1 では `CommandId` / `CommandSpec` を導入しない。** これらが価値を持つのは
+> メニュー構成カスタマイズ (Phase 6) や動的ラベル (Phase 5)、scope 衝突判定 (Phase 2) で
+> 「keymap.ini の Action 名から切り離した安定 ID」が要るようになってからである。1 エントリ
+> しか無い段階で `KeyAction` と 1:1 の第二 ID 空間を作ると、(a) どちらが正本か曖昧になり、
+> (b) 既存の `ALL_ACTIONS ⇄ KeyAction` ドリフト検知 (keymap.rs の
+> `all_actions_inventory_matches_key_action_enum`) に加えて `CommandId ⇄ KeyAction` の
+> 同期テストまで増える。よって **Phase 1 は既存 `KeyAction` の拡張だけ**で進め、catalog 型は
+> Phase 2 以降に後送りする (§6 参照)。
+
+#### Phase 1 で実際に作る最小形
+
+`CommandId` は使わず、`KeyAction` 側に「既定未割り当て」を表現できるようにするだけ。
+
+- `KeyAction::default_chords()` が**空の `ChordList` を返せる**ようにする
+  (現状は keymap.rs の `all_actions_have_unique_names_and_parse_back` テストが非空を
+  強制しているため、ここを「空 = 既定未割り当て」を許す形に緩める)。
+- 新規操作 `GridToggleStackMode` を**通常の `KeyAction`** として追加し、既定 chord を空にする。
+- 表示用 helper (`effective_chords` / `first_chord_label` 相当) を keymap.rs に足す。
+  Phase 1 では UI から呼ばなくてよい (生成・テスト用)。
+
+#### 将来形 (Phase 2 以降で導入する catalog 型、参考)
+
+scope 衝突判定やメニュー構成を実装する Phase で、以下のような `CommandSpec` を導入する想定。
+**Phase 1 ではこの型を作らない**ことに注意 (将来の到達点の記録)。
+
+```rust
+// Phase 2 以降。Phase 1 では未導入。
+pub enum CommandId {
+    GlobalLocalSearch,
+    GridAddToActiveBook,
+    GridToggleStackMode,
+    OpenRecycleBin, // UI / メニューだけに存在し当面 keymap 対象外の操作の例
+}
+
+pub struct CommandSpec {
+    pub id: CommandId,
+    pub label: &'static str,
+    pub scope: CommandScope,
+    pub category: CommandCategory, // 種別 (閲覧 / 編集 / 動画 など)。導入 Phase で確定する
+    pub key_action: Option<KeyAction>,
+    pub binding_policy: BindingPolicy,
+}
+```
+
+導入時の役割分担 (Phase 2 以降):
+
+- `CommandId`: UI、メニュー、将来のメニュー構成、説明文、実行単位の安定 ID。
+- `KeyAction`: `keymap.ini` の Action 名、trigger 種別、既存 helper との互換。
+
+既存 `keymap.ini` の Action 名は互換維持のため、急に `CommandId` 名へ移行しない。
+新規に割り当て可能にする操作は `KeyAction` を追加し、(catalog 導入後は) `CommandSpec.key_action`
+へ紐づける。
+
+### 3.2 デフォルト未割り当てを明示的に扱う
+
+現状の keymap 実装は「Action には既定 chord がある」前提が強い。これを緩め、以下を
+区別する。
+
+- `default_chords = [Ctrl+F]`: 既定割り当てあり。
+- `default_chords = []`: デフォルト未割り当てだが、ユーザー割り当て可能。
+- `binding_policy = Reserved`: 固定扱い。`keymap.ini` へは出さない、または固定理由を出すだけ。
+- `binding_policy = NotBindable`: UI 操作やマウス操作など、キー割り当ての対象外。
+
+生成される `keymap.ini.default` では、未割り当てコマンドは次のように見せる。
+
+```ini
+[Grid]
+# GridToggleStackMode = none ; スタック表示を切り替え (標準では未割り当て)
+```
+
+コメントを外して `Ctrl+Shift+S` などを書けば有効になる。コメントのままなら挙動ゼロ変化。
+
+#### `none` の意味を 1 つに固定する
+
+既存実装 (key-customization-impl-plan.md §3) でも `Action = none` は既に「明示無効化」を
+意味する。本 Phase で未割り当て表示にも `none` を流用するため、二義性を避けて以下に固定する。
+
+- **コメント付き `# Action = none`**: パースされない。単なる**参照表示**で「標準では未割り当て」
+  を示すだけ。`keymap.ini.default` (および初回生成 `keymap.ini`) に列挙される。
+- **コメント解除 `Action = none`**: ユーザー override として**明示無効化**。effective chord を
+  空にする。
+- ただし**元から既定未割り当ての action** (`default_chords()` が空) では、override の有無に
+  かかわらず最終的なバインドは空なので**挙動上は区別できない**。`none` が実際に意味を持つのは
+  **既定 chord を持つ action を無効化するとき**だけ (例: `FsSlideshow = none` で S 既定を殺す)。
+- 番号行との混在は従来どおり禁止 (`Action.1 = none` と `Action = none` は同義、他番号と併記しない)。
+
+実装としては「既定未割り当て (空 `default_chords`)」と「override で `none`」は同じ
+"effective = 空" に畳まれるため、パーサ側に新しい分岐は要らない。`keymap.ini.default` 生成器が
+**既定が空の action を `# Action = none` 行として出せる**ようにするだけでよい。
+
+### 3.3 固定入力は失敗ではなく分類する
+
+ユーザー要望は「操作可能なすべてのものにキーアサインの余地を残す」ことだが、すべての
+物理入力を最初から自由化すると、閉じられないダイアログや IME 誤発火を作りやすい。
+
+そのため、初期フェーズでは以下を予約扱いにする。
+
+- `Esc`: モード脱出・キャンセルの保険。将来も常に脱出できる fallback を残す。
+- `Enter`: IME 確定、グリッド open、画像 close、動画 play/pause など文脈差が大きい。
+- 矢印キー: グリッド移動、見開き、RTL、スタックジャンプ、動画 seek / 音量が絡む。
+- text field / IME 中の編集キー。
+- OS clipboard / D&D / 右クリックメニュー。
+
+予約扱いの操作も catalog には載せられるが、初期段階では `BindingPolicy::Reserved` として
+`keymap.ini` の自由割り当て対象から外す。
+
+## 4. スコープと衝突判定
+
+> **Phase 1 の実装対象外。** 本節は設計として残すが、`CommandScope` enum や衝突判定は
+> Phase 1 では一切実装しない。現行 keymap は意図的に「競合検知しない・先勝ち」
+> (key-customization-impl-plan.md §0) を選んでおり、scope 導入はその方針転換にあたる。
+> 下記の scope 一覧・active scope 表・衝突レベルは**机上の初期案**であり、§4.1 自身が注記する
+> とおり実 dispatch と綺麗に一致しない可能性がある。そのため **Phase 2 の最初に、実コードの
+> active scope 判定箇所と `consume_key` / `key_pressed` / native VK の消費順を読み出してから**
+> enum の variant と「同時 active になり得る scope の隣接関係」を確定する (§6 Phase 2 参照)。
+> 隣接関係はどこか 1 箇所の表に declare し、dispatch とのズレをテストで検知できる形にする。
+
+キー衝突は全アプリで一律に禁止しない。同時に有効になり得るスコープだけを見る。
+
+### 4.1 スコープ案
+
+```rust
+pub enum CommandScope {
+    Global,
+    Grid,
+    FsCommon,
+    FsImage,
+    FsVideo,
+    Erase,
+    Conceal,
+    Crop,
+    Text,
+    LocalAdjust,
+    DialogLocal,
+    UiOnly,
+}
+```
+
+代表的な active scope は以下。
+
+| 状態 | Active scope |
+| --- | --- |
+| グリッド | `Global`, `Grid` |
+| 画像フルスクリーン | `Global`, `FsCommon`, `FsImage` |
+| 動画フルスクリーン | `Global`, `FsCommon`, `FsVideo` |
+| 消しゴム | `Global`, `FsCommon`, `Erase` |
+| 隠蔽加工 | `Global`, `FsCommon`, `Conceal` |
+| 切り取り | `Global`, `FsCommon`, `Crop` |
+| テキスト注釈 | `Global`, `FsCommon`, `Text` |
+| 補正レイヤー | `Global`, `FsCommon`, `LocalAdjust` |
+
+実装上、既存コードが `FsImage` の一部処理を編集モード中にも通している場合は、現行挙動を
+優先して active scope を調整する。catalog 側の理想形で dispatch 順を変えない。
+
+### 4.2 衝突レベル
+
+| レベル | 条件 | 初期フェーズの扱い |
+| --- | --- | --- |
+| Hard | 同一 scope / 同一 trigger / 同一 chord | 警告。将来 GUI ではエラー候補 |
+| Active overlap | 同時 active になり得る scope 同士の同一 chord | 警告 |
+| Disjoint | 同時 active にならない scope 同士の同一 chord | 許可 |
+| Reserved | `Esc` / `Enter` / 矢印など予約キーとの衝突 | 警告または割り当て無視 |
+| Trigger mismatch | Press と KeyHold / ModifierHold の同一 chord | 個別警告。現行 dispatch を優先 |
+
+初期フェーズでは **衝突を禁止せず、警告だけ** にする。既存の簡易 keymap は競合検知なしで
+運用されているため、いきなり起動失敗や設定無効化を増やさない。
+
+### 4.3 優先度 resolver は後続フェーズ
+
+`Shift+↑↓` は現在、画像・動画・スタックで意味が変わる。
+
+- 画像通常: `↑↓` と同系統の前後移動。
+- スタックのフラット読書中: 前 / 次スタックへジャンプ。
+- 動画: 音量調整。
+
+この種のキーは、catalog に載せるだけでは安全に自由化できない。後続フェーズで
+`ActiveScopes` と優先順位を明示した resolver を作ってから移す。
+
+初期フェーズでは、`Shift+↑↓`、plain 矢印、`Esc`、`Enter` は固定または予約として扱う。
+
+## 5. BindingPolicy
+
+割り当て可否は bool ではなく段階を持たせる。
+
+```rust
+pub enum BindingPolicy {
+    /// Ctrl/Shift/Alt + 通常キーを許可する通常ショートカット。
+    FullChord,
+
+    /// ツール名の "(B)" 表示など、単独キーだけを想定する操作。
+    /// 初期実装では強制せず、compact 表示の判断だけに使ってもよい。
+    SingleKeyPreferred,
+
+    /// デフォルトでは未割り当てだが、ユーザーが割り当て可能。
+    DefaultUnassigned,
+
+    /// 安全上・互換上、当面固定。catalog には載せるが keymap 対象にしない。
+    Reserved,
+
+    /// マウス、D&D、IME、OS clipboard など keyboard binding の範囲外。
+    NotBindable,
+}
+```
+
+`SingleKeyPreferred` は、消しゴム / 隠蔽加工のツール切替ラベルに関係する。最初から
+修飾キーを禁止すると既存カスタムとの互換に影響するため、初期実装では次の扱いが安全。
+
+- 実際の `keymap.ini` では FullChord と同様に受理する。
+- 将来 UI の `ツール名 (キー)` 表示では、単独キーのときだけ `(B)` のように表示する。
+- `Ctrl+B` のような修飾付きなら、compact 表示は省略し、必要なら tooltip にフル表記を出す。
+
+## 6. 段階リリース計画
+
+数日おきのリリースに合わせ、各段階が単独で出せるようにする。
+
+### Phase 0: 設計固定とレビュー
+
+成果物:
+
+- 本書。
+- ClaudeCode / Codex review 用の観点整理。
+- 既存固定入力の棚卸し方針。
+
+完了条件:
+
+- `CommandId` と `KeyAction` の境界に合意する。**→ 合意済み (2026-06-24)**: Phase 1 では
+  `CommandId` を導入せず `KeyAction` 拡張に絞り、catalog 型は Phase 2 以降で実コードと
+  突き合わせてから入れる。
+- 初回リリースで触る範囲を `GridToggleStackMode` など少数に絞る。**→ 合意済み**。
+- Esc / Enter / 矢印を初期予約扱いにすることを確認する。**→ 合意済み**。
+
+### Phase 1: KeyAction 拡張 + デフォルト未割り当て (CommandId は導入しない)
+
+次回リリース候補。UI 表示変更は行わない。**`CommandId` / `CommandSpec` / `CommandScope` /
+`BindingPolicy` は導入しない** (§3.1 参照)。既存 `KeyAction` を小さく拡張するだけに絞る。
+
+実装内容:
+
+- `KeyAction::default_chords()` が**空の `ChordList`** を返せるようにする (= 既定未割り当て)。
+  現状 keymap.rs の `all_actions_have_unique_names_and_parse_back` が非空を強制しているので、
+  このテストを「空を許す」形へ緩める。
+- `keymap.ini.default` 生成器が、既定が空の action を `# Action = none` 行として出せるようにする。
+- `Keymap::effective_chords(action)`、`first_chord_label(action)` 相当の表示用 API を追加する。
+  初回では UI から使わなくてもよい (生成・テスト用)。
+- `GridToggleStackMode` を**通常の `KeyAction`** として追加し、既定 chord を空にして
+  `keymap.ini` から割り当て可能にする。
+- スタック表示トグルの実行は既存 `toggle_stack_mode()` を呼ぶ。
+  `toggle_stack_mode()` 自身が `stack_mode_available()` を確認するため、ボタン動作と同じ可否判定になる。
+
+リスク:
+
+- `KeyAction` は既定 chord あり前提のテストを持っているため、テスト修正が必要。
+- `none` の意味が「明示無効化」と「デフォルト未割り当て」の両方に見えるため、§3.2 で固定した
+  仕様 (コメント付き = 参照表示、コメント解除 = 明示無効化、既定空 action では区別不能) どおりに
+  生成器コメントと docs を書く。
+
+完了条件:
+
+- 既存 `keymap.ini` を編集していない環境では挙動が変わらない。
+- `GridToggleStackMode = Ctrl+Shift+S` のように書くとスタック表示が切り替わる。
+- `GridToggleStackMode = none` と書くと明示的に未割り当てになる (既定が空なので無設定と同挙動)。
+- 生成された `keymap.ini.default` が自己パースできる。
+- `CommandId` 等の新しい型を増やしていない (= ドリフト検知対象は `KeyAction` 系のまま)。
+
+### Phase 2: 衝突警告と固定入力棚卸し (catalog 型はここで導入)
+
+`CommandScope` / 衝突判定 / (必要なら) `CommandId` / `CommandSpec` / `BindingPolicy` を
+**実際に行使するのはこの Phase から**。Phase 1 では一切作らない。
+
+実装内容:
+
+- **先に実コードを読む**: active scope の判定箇所と `consume_key` / `key_pressed` / native VK の
+  消費順を棚卸しし、§4.1 の scope 案 / active scope 表 / 隣接関係を実態に合わせて確定してから
+  enum を切る (机上案のまま固定しない)。
+- scope / chord / trigger を集め、衝突分類を行う純粋関数を追加する。
+- 初期は警告ログのみ。起動失敗や設定拒否にはしない。
+- 固定入力を `Reserved` / `NotBindable` として整理する。
+- scope の隣接関係 (同時 active になり得る組) を 1 箇所の表に declare し、dispatch とのズレを
+  テストで検知できるようにする。
+- `keymap.ini.default` 先頭コメントに、衝突判定の範囲と予約キーの扱いを書く。
+
+完了条件:
+
+- 同一 scope 内で同じ chord を割り当てた場合に警告が出る。
+- `Grid` と `Erase` のような disjoint scope の同一 chord は警告しない、または低優先度警告に留める。
+- scope enum / 隣接関係が、実コードの active scope 判定と矛盾しない (テストで担保)。
+
+### Phase 3: 安全な固定キーの keymap 化
+
+実装内容:
+
+- 優先度が複雑でない固定キーから `KeyAction` 化する。
+- 候補:
+  - **グリッド側の F7-F10 マスク一括適用 / Shift+F7-F10 削除系** (`app.rs` の
+    `handle_keyboard` 内で今も raw `i.consume_key(...)` のまま。フルスクリーン側は既に
+    `FsApplyErase*` / `FsApplyConceal*` で KeyAction 化済みなので、**未 KeyAction 化なのは
+    グリッド側だけ**)。
+  - toolbar/menu 操作に対応する既存 App メソッド呼び出し。
+  - その他、既定未割り当てにできる便利操作。
+- Esc / Enter / plain 矢印 / `Shift+↑↓` はまだ予約。
+
+完了条件:
+
+- 追加した操作がすべて `CommandSpec` に載っている。
+- keymap-spec / keymap.ini.default が同期している。
+- 既存既定キーは変わらない。
+
+### Phase 4: Context resolver
+
+実装内容:
+
+- `ActiveScopes` と priority を使って、同一キーをどの command が受けるかを純粋ロジックで判定する。
+- 既存 dispatch をすべて置き換えず、まず `Shift+↑↓` のような局所的な箇所から試す。
+- 動画 native presenter の転送 whitelist と App 側 resolver を同期させる。
+
+完了条件:
+
+- スタックフラット表示中、動画中、通常画像中で `Shift+↑↓` の既存挙動を保てる。
+- resolver の優先順位が unit test で固定されている。
+
+### Phase 5: UI 表示の動的化
+
+実装内容:
+
+- メニューの `(Ctrl+F)` などを `first_chord_label()` 由来にする。
+- 消しゴム / 隠蔽加工の `筆 [B]` などを `compact_single_key_label()` 由来にする。
+- native 動画 overlay へ必要な shortcut label snapshot を渡す。
+
+完了条件:
+
+- keymap 変更後、主要メニュー / ツール名表示が実割り当てに追従する。
+- 複数 chord の場合は 1 つ目だけ表示する。
+- 修飾付き chord は compact 表示で無理に詰め込まない。
+
+### Phase 6: メニュー構成カスタマイズ
+
+実装内容:
+
+- メニュー構成を `CommandId` のツリーとして扱う。
+- ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
+- toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。
+
+この Phase は、コマンド catalog が安定してから着手する。
+
+## 7. 初回リリースの詳細タスク
+
+次回リリースまでに進める最初のステップは Phase 1 に絞る。
+
+### 7.1 実装タスク
+
+1. `KeyAction::default_chords()` が空の `ChordList` を返せるようにする。
+   (`src/command_catalog.rs` のような新モジュールや catalog 型は**作らない**。`src/keymap.rs`
+   内で完結させる。)
+2. keymap.rs の `all_actions_have_unique_names_and_parse_back` テストの「非空強制」を、空を許す形に緩める。
+3. `keymap.ini` / `keymap.ini.default` 生成で、既定が空の action を `# Action = none` 行として出す。
+4. `Keymap::effective_chords()` と表示用 label helper (`first_chord_label` 相当) を追加する。
+5. `GridToggleStackMode` を `KeyAction` に追加する (`ini_name` / `description` / `context` /
+   `trigger` / `default_chords`=空 / `ALL_ACTIONS` を揃える)。
+6. グリッド側のキーハンドラで、既存ガードを保ったまま `GridToggleStackMode` を見る。
+7. 成立時は、自己ガード付きの `toggle_stack_mode()` を呼ぶ。
+8. `docs/keymap.ini.default` と keymap 関連 docs を更新する。
+
+### 7.2 初回では触らないもの
+
+- メニュー表示の shortcut label。
+- 消しゴム / 隠蔽加工の tool label。
+- `Shift+↑↓` スタックジャンプ。
+- plain 矢印、Esc、Enter。
+- native 動画 overlay 表示。
+- GUI 設定画面。
+
+### 7.3 手動確認
+
+- keymap.ini 未編集で既存挙動が変わらない。
+- スタック対応フォルダで、アドレスバーの「スタック」ボタンが従来通り動く。
+- `GridToggleStackMode = Ctrl+Shift+S` などを設定して起動し、同じトグルが動く。
+- スタック非対応ビューでは no-op または既存と同じ toast / disabled 相当になる。
+- 検索バー、アドレス入力、ダイアログ、IME 入力中に新しいキーが誤発火しない。
+
+## 8. 自動テスト計画
+
+UI 全体の自動化より、まず純粋ロジックを厚くする。
+
+> **テストターゲット注意**: keymap の純粋ロジックは `#[cfg(test)]` で keymap.rs 内にあるが、
+> `App` を組む App-level テストは `--lib` には出ない。**`cargo test --bin mimageviewer-core`**
+> を使う (MEMORY: reference_test_target_app_tests / key-customization-impl-plan.md §8)。
+
+### 8.1 keymap unit test
+
+**Phase 1 で書くもの (KeyAction ベース、catalog 不要)**:
+
+- default unassigned action (空 `default_chords`) が `# Action = none` として生成される。
+- 既定が空の action でも `ALL_ACTIONS` / `parse_ini_name` の往復・一意性が成立する
+  (`all_actions_have_unique_names_and_parse_back` を空許容に緩めた後も他前提を壊さない)。
+- 生成した `keymap.ini.default` が warnings なし、または期待 warnings だけでパースできる。
+- `none`、空 override、複数 chord、全置換セマンティクスを検証する。
+- `first_chord_label()` が override / default / none を正しく返す。
+- `compact_single_key_label()` が単独キーだけを返し、修飾付きでは `None` を返す。
+
+**Phase 2 以降で書くもの (catalog 型を導入したら)**:
+
+- `CommandId` が重複しない。
+- `CommandSpec` が同じ `ini_name` を複数持たない。
+- 既存 `KeyAction::ALL_ACTIONS` が catalog に登録されている (`CommandId ⇄ KeyAction` ドリフト検知)。
+
+### 8.2 衝突判定 unit test
+
+Phase 2 以降。
+
+- 同一 scope の同一 chord は Hard。
+- `Grid` と `Erase` の同一 chord は Disjoint。
+- `FsCommon` と `FsImage` の同一 chord は Active overlap。
+- `FsImage` と `FsVideo` の同一 chord は通常 Disjoint。
+- `Global` と各 scope の同一 chord は Active overlap。
+- Reserved chord との衝突が検出される。
+
+### 8.3 App-level test
+
+可能なら以下を追加する。
+
+- `Keymap::from_ini_str("[Grid]\nGridToggleStackMode = Ctrl+Shift+S\n")` を注入した App で、
+  該当キー入力が stack toggle intent を立てる (実 API 名は `from_ini_str`)。
+- keymap 未設定では該当キーが no-op。
+- text focus / dialog guard 中は発火しない。
+
+実際の egui 入力イベント注入が重い場合は、key handler から小さな純粋関数を切り出してテストする。
+
+## 9. リスクと対策
+
+| リスク | 内容 | 対策 |
+| --- | --- | --- |
+| 入力消費順の変化 | `consume_key` の順番が変わると複数機能の優先度が変わる | Phase 1 では dispatch 置換を最小化する |
+| Esc / Enter 退避不能 | 自由化でモードを閉じられなくなる | 初期は Reserved。将来も fallback を残す |
+| 矢印キーの文脈衝突 | グリッド、画像、動画、スタック、RTL、見開きが絡む | resolver までは固定 |
+| `none` の混乱 | デフォルト未割り当てとユーザー明示無効化が似ている | コメントとパース仕様を明確化する |
+| UI 表示と実割り当ての不一致 | Phase 1 では表示はまだ固定 | リリースノートで「表示追従は後続」と明記する |
+| native 動画転送漏れ | App 側だけ keymap 化しても native overlay から届かない | Phase 4/5 で whitelist と同時に扱う |
+| テスト困難 | egui 入力は完全 E2E が重い | catalog / resolver / parser を純粋関数化する |
+
+## 10. ClaudeCode レビュー依頼観点
+
+レビュー時は、実装前に以下を確認してもらう。
+
+1. Phase 1 で `CommandId` / `CommandSpec` を**導入しない**判断 (既存 `KeyAction` 拡張に絞る) が
+   妥当か。後続 Phase で catalog 型を入れ直すときの手戻りが許容範囲か。
+2. 初回リリースで `GridToggleStackMode` だけを割り当て可能にする範囲が小さすぎないか。
+3. `default_chords = []` (空) と `none` の扱い (§3.2 で固定した二義性解消) が既存 keymap
+   セマンティクスを壊さないか。`all_actions_have_unique_names_and_parse_back` の非空強制を
+   緩める変更が他のテスト前提を崩さないか。
+4. `Esc` / `Enter` / 矢印 / `Shift+↑↓` を予約扱いにする線引きが妥当か。
+5. scope 衝突判定で `FsCommon`、`FsImage`、`FsVideo`、編集モードの active scope が実コードと矛盾しないか。
+6. native 動画 presenter への転送 whitelist を後続 Phase に回しても、Phase 1 の変更範囲として安全か。
+7. 自動テストを純粋ロジック中心にする方針で、回帰検出として足りない観点がないか。
+
+## 11. 実装時のドキュメント更新
+
+Phase 1 を実装するときは、少なくとも以下を更新する。
+
+- [key-customization-impl-plan.md](key-customization-impl-plan.md):
+  default unassigned (空 `default_chords`) の実装結果を追記する。Phase 1 では command catalog
+  (`CommandId` 等) は導入しない旨も残す。
+- [keymap-spec.md](keymap-spec.md):
+  スタック表示トグルが keymap 対象になったこと、Esc / Enter / 矢印を予約扱いにすることを明記する。
+- [keymap.ini.default](keymap.ini.default):
+  `GridToggleStackMode = none` を追加する。
+- [architecture-overview.md](architecture-overview.md):
+  Phase 1 は新モジュールを追加しない (keymap.rs 内で完結) ため、原則更新不要。catalog モジュールを
+  追加する Phase 2 以降でモジュール表に追記する。
+- ユーザー向け manual / spec:
+  実際にユーザー visible な変更として出すリリースでは、未割り当て操作も ini で割り当て可能になったことを短く追記する。
+
+UI 表示の動的化をまだ入れない場合は、リリースノートで「メニューやツール上のキー表示の追従は後続」と明記する。

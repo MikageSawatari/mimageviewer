@@ -709,6 +709,7 @@ pub enum KeyAction {
     GridToggleCheck,
     GridDelete,
     GridToggleFolderTreePane,
+    GridToggleStackMode,
     GridTagApply,
     GridTagView,
     GridRotateCw,
@@ -907,6 +908,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridToggleFolderTreePane,
+    KeyAction::GridToggleStackMode,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
     KeyAction::GridRotateCw,
@@ -1140,6 +1142,7 @@ impl KeyAction {
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
+            GridToggleStackMode => "GridToggleStackMode",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
@@ -1348,6 +1351,7 @@ impl KeyAction {
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
+            GridToggleStackMode => "スタック表示を切り替える",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
@@ -1549,6 +1553,7 @@ impl KeyAction {
             | GridToggleCheck
             | GridDelete
             | GridToggleFolderTreePane
+            | GridToggleStackMode
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -1685,6 +1690,7 @@ impl KeyAction {
             | GridToggleCheck
             | GridDelete
             | GridToggleFolderTreePane
+            | GridToggleStackMode
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -1880,6 +1886,7 @@ impl KeyAction {
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
+            GridToggleStackMode => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
@@ -2248,6 +2255,30 @@ impl Keymap {
         &self.warnings
     }
 
+    pub fn effective_chords(&self, action: KeyAction) -> Vec<Chord> {
+        self.overrides
+            .get(&action)
+            .cloned()
+            .unwrap_or_else(|| action.default_chords().iter().collect())
+    }
+
+    pub fn first_chord_label(&self, action: KeyAction) -> Option<String> {
+        self.effective_chords(action)
+            .into_iter()
+            .next()
+            .map(|chord| chord.display_name())
+    }
+
+    pub fn compact_single_key_label(&self, action: KeyAction) -> Option<&'static str> {
+        self.effective_chords(action).into_iter().find_map(|chord| {
+            if chord.ctrl || chord.shift || chord.alt {
+                None
+            } else {
+                chord.key.map(KeyName::display_name)
+            }
+        })
+    }
+
     pub fn consume_rating_action(&self, ctx: &egui::Context, container: bool) -> Option<u8> {
         rating_actions(container)
             .iter()
@@ -2506,7 +2537,8 @@ impl Keymap {
             "# - 既定キーを残したい場合は、残したいキーも Action.1..3 として明示してください。\n",
         );
         out.push_str("# - 1 つの Action には Action.1 / Action.2 / Action.3 で最大 3 個まで割り当てできます。\n");
-        out.push_str("# - none を指定すると、その Action を無効化できます。\n");
+        out.push_str("# - = none を指定すると、その Action を明示的に無効化できます。\n");
+        out.push_str("# - 既定キーが無い Action は # Action = none と表示されます。\n");
         out.push_str("# - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。\n");
         out.push_str("# - 競合は検出しません。競合時は先に判定された操作が有効になります。\n");
         out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
@@ -2912,12 +2944,22 @@ mod tests {
                 action.ini_name()
             );
             assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
-            assert!(
-                !action.default_chords().is_empty(),
-                "{} must have an explicit default chord or be removed from ALL_ACTIONS",
-                action.ini_name()
-            );
+            for chord in action.default_chords().iter() {
+                assert!(
+                    chord.validate_for_trigger(action.trigger()).is_ok(),
+                    "{} has an invalid default chord: {}",
+                    action.ini_name(),
+                    chord.display_name()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn grid_toggle_stack_mode_is_default_unassigned() {
+        assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
+        assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
     }
 
     #[test]
@@ -3064,6 +3106,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn effective_chord_labels_follow_defaults_overrides_and_none() {
+        let keymap = Keymap::empty();
+        assert_eq!(
+            keymap
+                .first_chord_label(KeyAction::GlobalLocalSearch)
+                .as_deref(),
+            Some("Ctrl+F")
+        );
+        assert_eq!(
+            keymap.first_chord_label(KeyAction::GridToggleStackMode),
+            None
+        );
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridToggleStackMode = Ctrl+Shift+S
+            GridPin = none
+            "#,
+        );
+        assert_eq!(
+            keymap
+                .first_chord_label(KeyAction::GridToggleStackMode)
+                .as_deref(),
+            Some("Ctrl+Shift+S")
+        );
+        assert_eq!(keymap.first_chord_label(KeyAction::GridPin), None);
+    }
+
+    #[test]
+    fn compact_single_key_label_omits_modified_chords() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Erase]
+            EraseToolBrush = Ctrl+B
+            EraseToolLasso = L
+            "#,
+        );
+        assert_eq!(
+            keymap.compact_single_key_label(KeyAction::EraseToolLasso),
+            Some("L")
+        );
+        assert_eq!(
+            keymap.compact_single_key_label(KeyAction::EraseToolBrush),
+            None
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn vk_match_uses_overridden_chord() {
@@ -3090,6 +3181,7 @@ mod tests {
         assert!(user_ini.contains("[FsImage]"));
         assert!(user_ini.contains("[Rating] ; レーティング"));
         assert!(user_ini.contains("# RatingItem1 = F1 ; 現在の画像または動画に星1を付ける"));
+        assert!(user_ini.contains("# GridToggleStackMode = none ; スタック表示を切り替える"));
         assert!(user_ini.contains("# FsSlideshow = S"));
         assert!(user_ini.contains("# TextRedo.1 = Ctrl+Y"));
         assert!(!user_ini.contains("\nFsSlideshow = S"));
@@ -3112,6 +3204,7 @@ mod tests {
         assert!(default_ini.contains(
             "# RatingContainerClear = Shift+F6 ; 現在のフォルダまたはZIP/PDF本体のレーティングを解除する"
         ));
+        assert!(default_ini.contains("# GridToggleStackMode = none ; スタック表示を切り替える"));
         assert!(default_ini.contains("# FsSlideshow = S"));
         assert!(default_ini.contains("# TextRedo.1 = Ctrl+Y"));
         assert!(!default_ini.contains("\nFsSlideshow = S"));
