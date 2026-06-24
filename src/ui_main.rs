@@ -2069,6 +2069,9 @@ impl App {
         let metadata_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FavoritesMetadataSearch);
+        let tag_manage_pinned_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::TagsManagePinned);
         let tag_view_menu_label = self.keymap.menu_command_label(MenuCommandId::TagsTagView);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
@@ -2303,7 +2306,7 @@ impl App {
 
                 // タグメニュー (docs/tag-feature.md §4.2)
                 let response = ui.menu_button("タグ", |ui| {
-                    if ui.button("ピン留めタグの管理…").clicked() {
+                    if ui.button(&tag_manage_pinned_menu_label).clicked() {
                         self.open_tag_editor();
                         ui.close();
                     }

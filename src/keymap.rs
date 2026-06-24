@@ -1211,6 +1211,7 @@ pub enum MenuCommandId {
     FavoritesEdit,
     FavoritesFavSearch,
     FavoritesMetadataSearch,
+    TagsManagePinned,
     TagsTagView,
 }
 
@@ -1226,6 +1227,7 @@ impl MenuCommandId {
         Self::FavoritesEdit,
         Self::FavoritesFavSearch,
         Self::FavoritesMetadataSearch,
+        Self::TagsManagePinned,
         Self::TagsTagView,
     ];
 
@@ -1241,6 +1243,7 @@ impl MenuCommandId {
             MenuCommandId::FavoritesEdit => "FavoritesEdit",
             MenuCommandId::FavoritesFavSearch => "FavoritesFavSearch",
             MenuCommandId::FavoritesMetadataSearch => "FavoritesMetadataSearch",
+            MenuCommandId::TagsManagePinned => "TagsManagePinned",
             MenuCommandId::TagsTagView => "TagsTagView",
         }
     }
@@ -1322,6 +1325,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::Favorites,
         label: "アイテム検索",
         action: Some(KeyAction::GlobalMetadataSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::TagsManagePinned,
+        parent: TopMenuId::Tags,
+        label: "ピン留めタグの管理…",
+        action: None,
     },
     MenuCommandSpec {
         id: MenuCommandId::TagsTagView,
@@ -3861,6 +3870,10 @@ mod tests {
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FavoritesEdit),
             "編集"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::TagsManagePinned),
+            "ピン留めタグの管理…"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
