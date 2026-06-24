@@ -1,4 +1,4 @@
-//! 更新後 初回起動の「重要な変更点」ダイアログ (v2.0.0、version_highlights ④)。
+//! 更新後 初回起動の「重要な変更点」ダイアログ (v2.0.0 で仕組み導入、version_highlights)。
 //!
 //! - 表示判定 (どのバージョンの変更点を出すか) は `App` 構築時に
 //!   [`crate::version_highlights::highlights_to_show`] (純関数) で決め、`whats_new_entries` に入る。

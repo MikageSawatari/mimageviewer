@@ -1,13 +1,13 @@
 # 更新後 初回起動の「重要な変更点」表示 実装計画
 
-ステータス: **v2.0.0 で実装済み** (2026-06-20)。2026-06-19 起案。
+ステータス: **v2.0.0 で仕組み実装済み / v2.2.0 entry 追加済み / ClaudeCode レビュー済み** (2026-06-25)。2026-06-19 起案。
 
-## 実装状況 (2026-06-20)
+## 実装状況 (2026-06-25)
 
 - データ + 選択ロジック: [src/version_highlights.rs](../src/version_highlights.rs)。
   `VersionHighlights { version, must_read, highlights }` の exe 埋め込みテーブル `table()` +
   純関数 `highlights_to_show(prev, current, table)` (unit test 12 本) + ヘルプ再表示用 `for_version` +
-  描画 `render(ui, entries)` (App 非依存 → snapshot から呼べる)。
+  `latest_not_newer_than` + 描画 `render(ui, entries)` (App 非依存 → snapshot から呼べる)。
 - ダイアログ: [src/ui_dialogs/whats_new.rs](../src/ui_dialogs/whats_new.rs)。⚠ 必読 → ・ 新機能 →
   「すべての変更を見る」(changelog.html) / 閉じる。display-only。
 - トリガ: `App` 構築時に `meta.previous_last_seen_version` と現行版で `highlights_to_show` を
@@ -18,6 +18,10 @@
 - テスト: `highlights_to_show` の unit test + egui_kittest snapshot `whats_new_multi_version_dark`。
 - **v2.0.0 の must_read = ツールバー右クリック化 + 左右クリック統一** (③ の告知)。Cargo.toml が
   2.0.0 になった初回起動で自動表示される。
+- **v2.2.0 entry** として、`?` コンテキストヘルプ、キー割り当て表示の設定追従、
+  環境設定「表示 → メニュー構成」を告知する。Cargo.toml が 2.2.0 に上がる前に entry を
+  埋め込んでも、ヘルプメニューの再表示は現行版以下の最新 entry にだけフォールバックするため、
+  開発中の 2.1.0 ビルドで v2.2.0 の告知を先取り表示しない。
 
 ## 0. 背景と目的
 

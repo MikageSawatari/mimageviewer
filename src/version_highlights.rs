@@ -1,4 +1,4 @@
-//! 更新後 初回起動の「重要な変更点」表示 (v2.0.0、docs/version-highlights-plan.md)。
+//! 更新後 初回起動の「重要な変更点」表示 (v2.0.0 で仕組み導入、docs/version-highlights-plan.md)。
 //!
 //! `update_check` (更新前・ネットワーク・全文 changelog) とは別物で、こちらは
 //! **更新後・オフライン (exe 埋め込み)・操作や既定の変更を中心とした主要部分だけ**を、
@@ -99,6 +99,23 @@ pub fn for_version<'a>(
         .collect()
 }
 
+/// 指定バージョン以下で最も新しいエントリを返す。ヘルプメニューからの再表示で、
+/// 次リリース向けのエントリを先に埋め込んだ開発版が未来の変更点を見せないために使う。
+pub fn latest_not_newer_than<'a>(
+    version: &str,
+    table: &'a [VersionHighlights],
+) -> Option<&'a VersionHighlights> {
+    let current = parse_version(version)?;
+    table
+        .iter()
+        .filter_map(|entry| {
+            let parsed = parse_version(entry.version)?;
+            (parsed <= current).then_some((parsed, entry))
+        })
+        .max_by_key(|(parsed, _)| *parsed)
+        .map(|(_, entry)| entry)
+}
+
 /// exe 埋め込みの変更点テーブル。**リリースのたびに、操作・既定の変更があれば
 /// このテーブルに 1 エントリ追記する** (CLAUDE.md リリース手順)。
 pub fn table() -> &'static [VersionHighlights] {
@@ -151,49 +168,72 @@ fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
     });
 }
 
-const TABLE: &[VersionHighlights] = &[VersionHighlights {
-    version: "2.0.0",
-    must_read: &[
-        HighlightItem {
-            title: "ツールバーの設定は右クリックに変わりました",
-            body: "ツールバーに出す項目・並び順・表示のしかたは、ツールバーを右クリックして変更します。\
-                   何も無い場所を右クリックすると表示する項目を選べ、各項目名を右クリックするとその項目の設定ができます。\
-                   並べ替えは、右クリックメニューで「ドラッグで並べ替えを許可」を ON にすると、項目名のドラッグでできます。\
-                   (環境設定の「ツールバー」ページは無くなりました)",
-        },
-        HighlightItem {
-            title: "タグ・本棚などのクリック操作を統一しました",
-            body: "ツールバーの項目は「左クリック=開く・表示」「右クリック=付与・追加」に揃えました。\
-                   タグは左クリックでタグの一覧表示、右クリックで選択中の画像へ付与します\
-                   (以前と左右が逆になっています)。",
-        },
-        HighlightItem {
-            title: "Z キーが「部分拡大ズーム」に変わりました",
-            body: "フルスクリーン表示で Z キーを押すと、画像の一部を画面いっぱいに拡大し、\
-                   マウスを動かすだけで拡大位置を移動できます。もう一度 Z で元に戻ります。\
-                   これまで Z だった画像分析モードは Shift+Z に移動しました。",
-        },
-    ],
-    highlights: &[
-        HighlightItem {
-            title: "連番画像をまとめるファイル名スタック表示",
-            body: "同じ接頭辞のファイルを 1 つのセルにまとめて、一覧をすっきり表示できます。\
-                   フォルダバーの「スタック」ボタンで切り替え。まとめ方の分類ルールは\
-                   スクリプトでカスタマイズもできます (既定の組み込みルールでも連番・連写\
-                   などを自動でまとめます)。",
-        },
-        HighlightItem {
-            title: "よく使う本をツールバーにピン留め",
-            body: "本棚の管理画面で本を「固定」すると、ツールバーにその本のボタンが並びます。\
-                   左クリックで開く、右クリックで選択中の画像をその本へ追加できます。",
-        },
-        HighlightItem {
-            title: "フォルダバーも右クリックで設定",
-            body: "フォルダ入力欄の左にある「フォルダ:」を右クリックすると、表示するボタンの選択や\
-                   履歴のクリアができます。",
-        },
-    ],
-}];
+const TABLE: &[VersionHighlights] = &[
+    VersionHighlights {
+        version: "2.0.0",
+        must_read: &[
+            HighlightItem {
+                title: "ツールバーの設定は右クリックに変わりました",
+                body: "ツールバーに出す項目・並び順・表示のしかたは、ツールバーを右クリックして変更します。\
+                       何も無い場所を右クリックすると表示する項目を選べ、各項目名を右クリックするとその項目の設定ができます。\
+                       並べ替えは、右クリックメニューで「ドラッグで並べ替えを許可」を ON にすると、項目名のドラッグでできます。\
+                       (環境設定の「ツールバー」ページは無くなりました)",
+            },
+            HighlightItem {
+                title: "タグ・本棚などのクリック操作を統一しました",
+                body: "ツールバーの項目は「左クリック=開く・表示」「右クリック=付与・追加」に揃えました。\
+                       タグは左クリックでタグの一覧表示、右クリックで選択中の画像へ付与します\
+                       (以前と左右が逆になっています)。",
+            },
+            HighlightItem {
+                title: "Z キーが「部分拡大ズーム」に変わりました",
+                body: "フルスクリーン表示で Z キーを押すと、画像の一部を画面いっぱいに拡大し、\
+                       マウスを動かすだけで拡大位置を移動できます。もう一度 Z で元に戻ります。\
+                       これまで Z だった画像分析モードは Shift+Z に移動しました。",
+            },
+        ],
+        highlights: &[
+            HighlightItem {
+                title: "連番画像をまとめるファイル名スタック表示",
+                body: "同じ接頭辞のファイルを 1 つのセルにまとめて、一覧をすっきり表示できます。\
+                       フォルダバーの「スタック」ボタンで切り替え。まとめ方の分類ルールは\
+                       スクリプトでカスタマイズもできます (既定の組み込みルールでも連番・連写\
+                       などを自動でまとめます)。",
+            },
+            HighlightItem {
+                title: "よく使う本をツールバーにピン留め",
+                body: "本棚の管理画面で本を「固定」すると、ツールバーにその本のボタンが並びます。\
+                       左クリックで開く、右クリックで選択中の画像をその本へ追加できます。",
+            },
+            HighlightItem {
+                title: "フォルダバーも右クリックで設定",
+                body: "フォルダ入力欄の左にある「フォルダ:」を右クリックすると、表示するボタンの選択や\
+                       履歴のクリアができます。",
+            },
+        ],
+    },
+    VersionHighlights {
+        version: "2.2.0",
+        must_read: &[],
+        highlights: &[
+            HighlightItem {
+                title: "現在の画面で使えるショートカット一覧",
+                body: "サムネイル一覧、画像 / 動画フルスクリーン、消しゴム・隠蔽加工・切り取り・テキスト注釈・補正レイヤーモードで ? キーを押すと、\
+                       その場で使えるキー操作を一覧できます。キー設定を変更している場合は、変更後の割り当てで表示します。",
+            },
+            HighlightItem {
+                title: "キー割り当て表示が設定に追従",
+                body: "メニュー項目、フルスクリーンのホバーバー、動画 HUD、★フィルター、編集ツールボタンなどのキー表記が、\
+                       実際のキー設定に合わせて表示されるようになりました。キーが未設定の操作も keymap.ini から割り当てられます。",
+            },
+            HighlightItem {
+                title: "メニュー構成のカスタマイズ",
+                body: "環境設定の「表示 → メニュー構成」で、上部メニューと固定メニュー項目の表示 / 非表示や並び順を変更できます。\
+                       登録済みのお気に入りやタグなど、内容が状況で変わる項目はこれまでどおりの位置に表示します。",
+            },
+        ],
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -212,6 +252,11 @@ mod tests {
         },
         VersionHighlights {
             version: "2.0.0",
+            must_read: &[],
+            highlights: &[],
+        },
+        VersionHighlights {
+            version: "2.2.0",
             must_read: &[],
             highlights: &[],
         },
@@ -293,6 +338,39 @@ mod tests {
         assert_eq!(versions(&for_version("2.0.0", T)), ["2.0.0"]);
         assert_eq!(versions(&for_version("2.0", T)), ["2.0.0"]);
         assert!(for_version("9.9.9", T).is_empty());
+    }
+
+    #[test]
+    fn latest_not_newer_than_skips_future_entries() {
+        assert_eq!(latest_not_newer_than("0.9.0", T).map(|e| e.version), None);
+        assert_eq!(
+            latest_not_newer_than("2.1.0", T).map(|e| e.version),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            latest_not_newer_than("2.2.0", T).map(|e| e.version),
+            Some("2.2.0")
+        );
+        assert_eq!(latest_not_newer_than("garbage", T).map(|e| e.version), None);
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_2_0_entry() {
+        let entries = for_version("2.2.0", table());
+        assert_eq!(versions(&entries), ["2.2.0"]);
+        let entry = entries[0];
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("ショートカット一覧"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("メニュー構成"))
+        );
     }
 
     #[test]

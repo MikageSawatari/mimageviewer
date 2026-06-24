@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正スライス実装中** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -222,6 +222,18 @@
 > 表示 / 非表示、上下移動、既定化、非表示項目の全表示を提供し、OK / 適用時は既存の
 > 環境設定保存フローに乗せる。保存値は引き続き stable name 文字列で、未知 ID は UI 表示時に
 > 読み飛ばす。登録済みお気に入り一覧やタグ一覧などの動的ブロックは個別編集対象外。
+>
+> **native 動画 overlay ヘルプ重なり補正メモ (2026-06-25, Codex / ClaudeCode レビュー済み)**:
+> native 動画 overlay で `?` ヘルプを開いた状態で右上の閉じるボタンへカーソルを移動すると、
+> 右 edge-hover パネルが上に出て閉じられない問題を修正した。`shortcut_help_open` 中は
+> right panel / jump panel の visibility 判定を false にし、ヘルプ modal の描画・入力領域を
+> 優先する。ヘルプを閉じた後は従来どおり edge-hover パネルが復帰する。
+>
+> **v2.2.0 重要変更点 entry 追加メモ (2026-06-25, Codex / ClaudeCode レビュー済み)**:
+> `src/version_highlights.rs` に v2.2.0 向け entry を追加し、`?` コンテキストヘルプ、
+> keymap 追従ラベル、環境設定「表示 → メニュー構成」をまとめて告知する。Cargo.toml が
+> まだ 2.1.0 の間に未来の entry がヘルプメニューから表示されないよう、再表示 fallback は
+> 現行版以下の最新 entry を選ぶ。
 
 ## 1. 背景と狙い
 
