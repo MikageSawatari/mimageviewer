@@ -1194,6 +1194,16 @@ pub enum TopMenuId {
 }
 
 impl TopMenuId {
+    pub const ALL: &'static [Self] = &[
+        Self::File,
+        Self::Favorites,
+        Self::Books,
+        Self::Video,
+        Self::Tags,
+        Self::Settings,
+        Self::Help,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             TopMenuId::File => "ファイル",
@@ -1530,6 +1540,13 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
 
 pub fn menu_command_catalog() -> &'static [MenuCommandSpec] {
     MENU_COMMAND_SPECS
+}
+
+pub fn menu_commands_for_parent(parent: TopMenuId) -> impl Iterator<Item = MenuCommandSpec> {
+    MENU_COMMAND_SPECS
+        .iter()
+        .copied()
+        .filter(move |spec| spec.parent == parent)
 }
 
 pub fn menu_command_spec(id: MenuCommandId) -> Option<MenuCommandSpec> {
@@ -3959,6 +3976,21 @@ mod tests {
             .collect()
     }
 
+    fn enum_variant_names_from_source(enum_name: &str) -> std::collections::BTreeSet<String> {
+        let source = include_str!("keymap.rs");
+        let marker = format!("pub enum {enum_name} {{");
+        let start = source.find(&marker).expect("enum not found");
+        let body = &source[start + marker.len()..];
+        let end = body.find("\n}").expect("enum end not found");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().trim_end_matches(',');
+                (!name.is_empty() && !name.starts_with("//")).then(|| name.to_string())
+            })
+            .collect()
+    }
+
     #[test]
     fn all_actions_inventory_matches_key_action_enum() {
         assert_eq!(
@@ -4010,6 +4042,22 @@ mod tests {
     }
 
     #[test]
+    fn top_menu_inventory_matches_top_menu_enum() {
+        let all_names: std::collections::BTreeSet<String> =
+            TopMenuId::ALL.iter().map(|id| format!("{id:?}")).collect();
+        assert_eq!(enum_variant_names_from_source("TopMenuId"), all_names);
+    }
+
+    #[test]
+    fn menu_command_inventory_matches_menu_command_enum() {
+        let all_names: std::collections::BTreeSet<String> = MenuCommandId::ALL
+            .iter()
+            .map(|id| id.stable_name().to_string())
+            .collect();
+        assert_eq!(enum_variant_names_from_source("MenuCommandId"), all_names);
+    }
+
+    #[test]
     fn menu_command_catalog_has_unique_ids_and_valid_actions() {
         assert_eq!(menu_command_catalog().len(), MenuCommandId::ALL.len());
         let mut ids = std::collections::BTreeSet::new();
@@ -4038,6 +4086,26 @@ mod tests {
                 assert_eq!(spec.description(), action.description());
             }
         }
+    }
+
+    #[test]
+    fn menu_commands_for_parent_follow_top_menu_order() {
+        let mut flattened_ids = Vec::new();
+        for parent in TopMenuId::ALL {
+            let specs: Vec<_> = menu_commands_for_parent(*parent).collect();
+            assert!(
+                !specs.is_empty(),
+                "top menu has no catalog entries: {}",
+                parent.label()
+            );
+            for spec in specs {
+                assert_eq!(spec.parent, *parent);
+                flattened_ids.push(spec.id);
+            }
+        }
+
+        let catalog_ids: Vec<_> = menu_command_catalog().iter().map(|spec| spec.id).collect();
+        assert_eq!(flattened_ids, catalog_ids);
     }
 
     #[test]

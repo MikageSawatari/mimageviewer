@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 UI-only 静的メニュー項目まとめ catalog スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 6 menu catalog drift hardening スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -166,11 +166,16 @@
 > ピン留めタグ由来の動的一覧とサブメニューは catalog 対象外のまま。クリック処理・メニュー構成・
 > 保存形式は変更しない。
 >
-> **Phase 6 UI-only 静的メニュー項目まとめ catalog スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 6 UI-only 静的メニュー項目まとめ catalog スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `TopMenuId::Books` / `Video` / `Settings` / `Help` を追加し、製本 / 動画 / 設定 / ヘルプ
 > メニューの固定ラベル leaf 項目を `MenuCommandSpec` へ追加する。`render_menubar()` はラベル取得だけを
 > catalog 経由にし、enabled 判定・hover text・クリック処理・メニュー構成・保存形式は変更しない。
 > 件数付き項目、動的一覧、サブメニュー本体、状態でラベルが変わる `更新を確認…` は catalog 対象外のまま。
+>
+> **Phase 6 menu catalog drift hardening スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `TopMenuId::ALL` と `menu_commands_for_parent()` を追加し、後続のメニュー構成保存・編集 UI が使う
+> parent 別 catalog 取得口を用意する。`TopMenuId` / `MenuCommandId` は `KeyAction` と同様に
+> `include_str!` ベースの enum ⇄ `ALL` drift テストで守る。描画・クリック処理・保存形式は変更しない。
 
 ## 1. 背景と狙い
 
@@ -584,9 +589,11 @@ pub enum BindingPolicy {
   (`このフォルダを追加…` / `編集`) を catalog 化する。登録済みお気に入りの動的一覧は対象外。
 - **タグメニュー静的項目スライス実装済み**: タグメニューの固定ラベル項目
   (`ピン留めタグの管理…`) を catalog 化する。件数付き項目やピン留めタグの動的一覧は対象外。
-- **UI-only 静的メニュー項目まとめスライス実装中**: `TopMenuId::Books` / `Video` /
+- **UI-only 静的メニュー項目まとめスライス実装済み**: `TopMenuId::Books` / `Video` /
   `Settings` / `Help` と、製本 / 動画 / 設定 / ヘルプメニューの固定ラベル leaf 項目を catalog 化する。
   件数付き項目、動的一覧、サブメニュー本体、状態でラベルが変わる更新確認ボタンは対象外。
+- **menu catalog drift hardening スライス実装中**: `TopMenuId::ALL`、parent 別 catalog iterator、
+  `TopMenuId` / `MenuCommandId` の enum ⇄ `ALL` drift テストを追加する。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。
