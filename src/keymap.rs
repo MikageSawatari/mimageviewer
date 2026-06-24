@@ -2544,6 +2544,29 @@ impl Keymap {
         }
     }
 
+    pub fn chord_labels(&self, action: KeyAction) -> Vec<String> {
+        self.effective_chords(action)
+            .into_iter()
+            .map(|chord| chord.display_name())
+            .collect()
+    }
+
+    pub fn first_chord_bracket_label(&self, label: &str, action: KeyAction) -> String {
+        match self.first_chord_label(action) {
+            Some(key_label) => format!("{label} [{key_label}]"),
+            None => label.to_owned(),
+        }
+    }
+
+    pub fn chord_list_bracket_label(&self, label: &str, action: KeyAction) -> String {
+        let key_labels = self.chord_labels(action);
+        if key_labels.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label} [{}]", key_labels.join(" / "))
+        }
+    }
+
     pub fn compact_single_key_label(&self, action: KeyAction) -> Option<&'static str> {
         self.effective_chords(action)
             .into_iter()
@@ -3742,6 +3765,38 @@ mod tests {
         assert_eq!(
             keymap.first_chord_action_label("代表サムネイル", KeyAction::GridPin),
             "代表サムネイル"
+        );
+    }
+
+    #[test]
+    fn bracket_action_labels_follow_first_or_all_effective_chords() {
+        let keymap = Keymap::empty();
+        assert_eq!(
+            keymap.first_chord_bracket_label("分析ツール", KeyAction::FsImageAnalysis),
+            "分析ツール [Shift+Z]"
+        );
+        assert_eq!(
+            keymap.chord_list_bracket_label("メタデータ", KeyAction::FsToggleMetadata),
+            "メタデータ [I / Tab]"
+        );
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsCommon]
+            FsToggleMetadata = Ctrl+I
+            FsToggleMetadata.2 = M
+
+            [FsImage]
+            FsImageAnalysis = none
+            "#,
+        );
+        assert_eq!(
+            keymap.chord_list_bracket_label("メタデータ", KeyAction::FsToggleMetadata),
+            "メタデータ [Ctrl+I / M]"
+        );
+        assert_eq!(
+            keymap.first_chord_bracket_label("分析ツール", KeyAction::FsImageAnalysis),
+            "分析ツール"
         );
     }
 

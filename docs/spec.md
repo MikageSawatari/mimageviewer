@@ -674,6 +674,10 @@ Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に
 場合だけ `keymap.ini` の実割り当てを `[B]` のような compact 表示に反映する。
 メニューバーの検索 / タグビュー項目など一部のメニュー表示と hover text は、先頭
 chord を `(Ctrl+F)` のように反映する。
+静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
+popup の shortcut 表記も `keymap.ini` の実割り当てに追従する。複数 chord を
+表示する箇所では `I / Tab` のように並べる。`Esc` / `F11` と native 動画 overlay の
+表示は当面固定扱い。
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
 フリック、マウス戻る / 進むボタン、ゲームパッド X リングは
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。

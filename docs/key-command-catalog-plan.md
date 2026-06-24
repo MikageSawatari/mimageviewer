@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 5 メニュー表示スライス実装済み / レビュー済み** (2026-06-24)。
+> ステータス: **Phase 5 フルスクリーンホバーバー表示スライス実装中 / レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -43,6 +43,12 @@
 > `Keymap::first_chord_action_label()` を追加し、メニューバーの検索 / タグビュー項目と、
 > 詳細表示・タグビュー・現在地フィルタの一部 hover text を先頭 chord 表示に追従させた。
 > native 動画 overlay と、フルスクリーンホバーバー等の広範な shortcut 表示は後続。
+>
+> **Phase 5 フルスクリーンホバーバー表示スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `Keymap::first_chord_bracket_label()` / `chord_list_bracket_label()` を追加し、静止画
+> フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット popup の
+> shortcut 表記を実 keymap から表示するようにした。`Esc` / `F11` は固定扱いのまま。
+> native 動画 overlay は後続に残す。
 
 ## 1. 背景と狙い
 
@@ -419,12 +425,15 @@ pub enum BindingPolicy {
 
 - メニューの `(Ctrl+F)` などを `first_chord_label()` 由来にする。
 - 消しゴム / 隠蔽加工の `筆 [B]` などを `compact_single_key_label()` 由来にする。
+- フルスクリーンホバーバーの `[R]` / `[Shift+Z]` / `[I / Tab]` などを実 keymap 由来にする。
 - native 動画 overlay へ必要な shortcut label snapshot を渡す。
 - **初期スライス実装済み**: 消しゴム / 隠蔽加工パネルの描画・消去ボタンとツールボタンを
   `compact_action_label()` 由来にした。
-- **メニュー表示スライス実装中**: 検索 / タグビュー系のトップメニュー項目と、一部 toolbar /
-  search bar hover text を `first_chord_action_label()` 由来にした。native 動画 overlay と
-  フルスクリーンホバーバーは未着手。
+- **メニュー表示スライス実装済み**: 検索 / タグビュー系のトップメニュー項目と、一部 toolbar /
+  search bar hover text を `first_chord_action_label()` 由来にした。
+- **フルスクリーンホバーバー表示スライス実装中**: 静止画フルスクリーンの上部ホバーバー
+  tooltip と、表示モード / ズーム・フィット popup の shortcut 表記を実 keymap 由来にした。
+  `Esc` / `F11` は固定扱い、native 動画 overlay は未着手。
 
 完了条件:
 

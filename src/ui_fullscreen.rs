@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::keymap::{FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
+use crate::keymap::{FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, Keymap};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
 use crate::ui_helpers::{HoverTipExt, open_external_player};
@@ -98,6 +98,17 @@ fn grid_book_add_rejection_message(errors: &[String], accepted_count: usize) -> 
     }
 
     friendly_book_add_error(first.clone())
+}
+
+fn spread_mode_key_action(mode: SpreadMode) -> Option<KeyAction> {
+    match mode {
+        SpreadMode::Single => Some(KeyAction::FsSpreadSingle),
+        SpreadMode::Ltr => Some(KeyAction::FsSpreadLtr),
+        SpreadMode::LtrCover => Some(KeyAction::FsSpreadLtrCover),
+        SpreadMode::Rtl => Some(KeyAction::FsSpreadRtl),
+        SpreadMode::RtlCover => Some(KeyAction::FsSpreadRtlCover),
+        SpreadMode::Vertical => None,
+    }
 }
 
 pub(crate) mod draw_icons;
@@ -4903,7 +4914,7 @@ impl App {
                             let mut fit_no_downscale_choice: Option<bool> = None;
                             let mut bar_analysis_pressed = false;
                             Self::draw_fs_hover_bar(
-                                ui, ctx, full_rect,
+                                ui, ctx, &self.keymap, full_rect,
                                 &state.location_display,
                                 display_dims, state.image_file_size,
                                 state.image_downscaled,
@@ -12295,6 +12306,7 @@ impl App {
     fn draw_fs_hover_bar(
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        keymap: &Keymap,
         full_rect: egui::Rect,
         location_display: &str,
         image_dims: Option<(u32, u32)>,
@@ -12489,8 +12501,12 @@ impl App {
                 false,
                 |p, c, r| draw_camera_icon(p, c, r),
             );
-            let camera_resp = camera_resp
-                .hover_tip_dark("クリック: クリップボードにコピー\nCtrl+クリック: 範囲を選んでコピー\nCtrl+S: ファイル保存");
+            let mut camera_tip =
+                "クリック: クリップボードにコピー\nCtrl+クリック: 範囲を選んでコピー".to_owned();
+            if let Some(save_label) = keymap.first_chord_label(KeyAction::FsCapture) {
+                camera_tip.push_str(&format!("\n{save_label}: ファイル保存"));
+            }
+            let camera_resp = camera_resp.hover_tip_dark(camera_tip);
             if camera_resp.clicked() {
                 if ctx.input(|i| i.modifiers.ctrl) || ctrl_held_via_os() {
                     *copy_capture_region_pressed = true;
@@ -12547,9 +12563,9 @@ impl App {
                 |p, c, r| draw_tile_grid_icon(p, c, r),
             );
             let tile_resp = tile_resp.hover_tip_dark(if tile_active {
-                "タイルモード解除 [S]"
+                keymap.first_chord_bracket_label("タイルモード解除", KeyAction::VideoTileMode)
             } else {
-                "タイルモード [S]"
+                keymap.first_chord_bracket_label("タイルモード", KeyAction::VideoTileMode)
             });
             if tile_resp.clicked() {
                 *tile_pressed = true;
@@ -12582,9 +12598,13 @@ impl App {
                 },
             );
             let play_resp = if *slideshow_playing {
-                play_resp.hover_tip_dark("スライドショー停止")
+                play_resp.hover_tip_dark(
+                    keymap.first_chord_bracket_label("スライドショー停止", KeyAction::FsSlideshow),
+                )
             } else {
-                play_resp.hover_tip_dark("スライドショー")
+                play_resp.hover_tip_dark(
+                    keymap.first_chord_bracket_label("スライドショー", KeyAction::FsSlideshow),
+                )
             };
             if play_resp.clicked() {
                 *slideshow_playing = !*slideshow_playing;
@@ -12607,7 +12627,8 @@ impl App {
                 false,
                 |p, c, r| draw_rotate_icon(p, c, r, true),
             );
-            let rcw_resp = rcw_resp.hover_tip_dark("右回転 [R]");
+            let rcw_resp = rcw_resp
+                .hover_tip_dark(keymap.first_chord_bracket_label("右回転", KeyAction::FsRotateCw));
             if rcw_resp.clicked() {
                 *rotate_cw = true;
             }
@@ -12625,7 +12646,8 @@ impl App {
                 false,
                 |p, c, r| draw_rotate_icon(p, c, r, false),
             );
-            let rccw_resp = rccw_resp.hover_tip_dark("左回転 [L]");
+            let rccw_resp = rccw_resp
+                .hover_tip_dark(keymap.first_chord_bracket_label("左回転", KeyAction::FsRotateCcw));
             if rccw_resp.clicked() {
                 *rotate_ccw = true;
             }
@@ -12646,7 +12668,9 @@ impl App {
                 *show_info,
                 |p, c, r| draw_info_icon(p, c, r),
             );
-            let info_resp = info_resp.hover_tip_dark("メタデータ [I / Tab]");
+            let info_resp = info_resp.hover_tip_dark(
+                keymap.chord_list_bracket_label("メタデータ", KeyAction::FsToggleMetadata),
+            );
             if info_resp.clicked() {
                 *show_info = !*show_info;
             }
@@ -12668,7 +12692,9 @@ impl App {
                 analysis_active,
                 |p, c, r| draw_analysis_icon(p, c, r),
             );
-            let analysis_resp = analysis_resp.hover_tip_dark("分析ツール [Z]");
+            let analysis_resp = analysis_resp.hover_tip_dark(
+                keymap.first_chord_bracket_label("分析ツール", KeyAction::FsImageAnalysis),
+            );
             if analysis_resp.clicked() {
                 *analysis_pressed = true;
             }
@@ -12686,11 +12712,14 @@ impl App {
         // 元設計 (常時表示 + 強調背景) はユーザーフィードバックで取り下げ。
         if !is_video && !is_spread_double && !panorama_active && reading_flow.is_paged() {
             let tooltip = match panorama_trigger {
-                Some(crate::panorama::PanoramaTrigger::Auto) => "360° 画像 (XMP 検出) [V]",
-                Some(crate::panorama::PanoramaTrigger::Hint) => {
-                    "360° ビューワーで開く (アスペクト比から推定) [V]"
+                Some(crate::panorama::PanoramaTrigger::Auto) => {
+                    keymap.first_chord_bracket_label("360° 画像 (XMP 検出)", KeyAction::FsPanorama)
                 }
-                None => "360° 画像ではありません",
+                Some(crate::panorama::PanoramaTrigger::Hint) => keymap.first_chord_bracket_label(
+                    "360° ビューワーで開く (アスペクト比から推定)",
+                    KeyAction::FsPanorama,
+                ),
+                None => "360° 画像ではありません".to_owned(),
             };
             let is_enabled = panorama_trigger.is_some();
             let pano_resp = draw_bar_button(
@@ -12740,8 +12769,28 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_resp =
-                spread_resp.hover_tip_dark("表示モード [1-5] / 連結方式 [6] / 横方向 [7]");
+            let spread_keys = SpreadMode::all()
+                .iter()
+                .filter_map(|&mode| spread_mode_key_action(mode))
+                .filter_map(|action| keymap.first_chord_label(action))
+                .collect::<Vec<_>>();
+            let mut spread_tip_parts = Vec::new();
+            if spread_keys.is_empty() {
+                spread_tip_parts.push("表示モード".to_owned());
+            } else {
+                spread_tip_parts.push(format!("表示モード [{}]", spread_keys.join(" / ")));
+            }
+            if let Some(key_label) = keymap.first_chord_label(KeyAction::FsReadingFlowCycle) {
+                spread_tip_parts.push(format!("連結方式 [{key_label}]"));
+            } else {
+                spread_tip_parts.push("連結方式".to_owned());
+            }
+            if let Some(key_label) = keymap.first_chord_label(KeyAction::FsReadingDirectionToggle) {
+                spread_tip_parts.push(format!("横方向 [{key_label}]"));
+            } else {
+                spread_tip_parts.push("横方向".to_owned());
+            }
+            let spread_resp = spread_resp.hover_tip_dark(spread_tip_parts.join(" / "));
             spread_resp_rect = spread_resp.rect;
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
@@ -12825,14 +12874,17 @@ impl App {
                     egui::Color32::from_gray(220),
                 );
 
-                let shortcut_label = format!("[{}]", mode.to_int() + 1);
-                ui.painter().text(
-                    egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    shortcut_label,
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::from_gray(140),
-                );
+                if let Some(shortcut_label) =
+                    spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
+                {
+                    ui.painter().text(
+                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("[{shortcut_label}]"),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(140),
+                    );
+                }
 
                 if item_resp.clicked() {
                     *spread_mode = mode;
@@ -12880,17 +12932,22 @@ impl App {
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_gray(220),
                 );
-                ui.painter().text(
-                    egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    if flow == ReadingFlow::Paged {
-                        "[6]"
+                if let Some(shortcut_label) =
+                    keymap.first_chord_label(KeyAction::FsReadingFlowCycle)
+                {
+                    let suffix = if flow == ReadingFlow::Paged {
+                        ""
                     } else {
-                        "[6循環]"
-                    },
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::from_gray(140),
-                );
+                        "循環"
+                    };
+                    ui.painter().text(
+                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("[{shortcut_label}{suffix}]"),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(140),
+                    );
+                }
                 if item_resp.clicked() {
                     *reading_flow = flow;
                     *spread_popup_open = false;
@@ -12932,13 +12989,17 @@ impl App {
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_gray(220),
                 );
-                ui.painter().text(
-                    egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    "[7]",
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::from_gray(140),
-                );
+                if let Some(shortcut_label) =
+                    keymap.first_chord_label(KeyAction::FsReadingDirectionToggle)
+                {
+                    ui.painter().text(
+                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("[{shortcut_label}]"),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(140),
+                    );
+                }
                 if item_resp.clicked() {
                     *reading_direction = direction;
                     *spread_popup_open = false;
@@ -12981,11 +13042,20 @@ impl App {
                 if fit_no_upscale { "ON" } else { "OFF" },
                 if fit_no_downscale { "ON" } else { "OFF" }
             );
-            let fit_tip = format!(
-                "ズーム/フィット: {} [クリックで選択 / 0で循環]\n{}",
-                fit_mode.label(),
-                limit_tip
-            );
+            let fit_tip =
+                if let Some(cycle_label) = keymap.first_chord_label(KeyAction::FsFitModeCycle) {
+                    format!(
+                        "ズーム/フィット: {} [クリックで選択 / {cycle_label}で循環]\n{}",
+                        fit_mode.label(),
+                        limit_tip
+                    )
+                } else {
+                    format!(
+                        "ズーム/フィット: {} [クリックで選択]\n{}",
+                        fit_mode.label(),
+                        limit_tip
+                    )
+                };
             let mf_resp = mf_resp.hover_tip_dark(fit_tip);
             fit_resp_rect = mf_resp.rect;
             if mf_resp.clicked() {
@@ -13030,10 +13100,16 @@ impl App {
             );
 
             let mut item_y = popup_rect.min.y + 4.0;
+            let fit_header =
+                if let Some(cycle_label) = keymap.first_chord_label(KeyAction::FsFitModeCycle) {
+                    format!("ズーム/フィット  [{cycle_label}で循環]")
+                } else {
+                    "ズーム/フィット".to_owned()
+                };
             ui.painter().text(
                 egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
                 egui::Align2::LEFT_CENTER,
-                "ズーム/フィット  [0で循環]",
+                fit_header,
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_gray(150),
             );
