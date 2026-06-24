@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout visibility render スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 6 menu layout top menu order render スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -190,13 +190,20 @@
 > 既存ユーザーのメニュー表示は変わらない。未リリースの新規 `settings_kv` フィールドなので
 > DB schema migration は不要。描画・クリック処理・編集 UI はまだ変更しない。
 >
-> **Phase 6 menu layout visibility render スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 6 menu layout visibility render スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `render_menubar()` で `resolve_menu_layout(&settings.menu_layout)` を読み、各 top menu が
 > resolver 出力に残っている場合だけ描画し、catalog 化済み固定 leaf 項目は
 > `ResolvedTopMenu.commands` に含まれる場合だけボタンを出す。動的なお気に入り一覧、タグ一覧、
 > レーティング一覧、サムネイル列数 / 比率 / ソート順、更新確認など catalog 外の項目は
 > 従来どおり描く。初期接続ではメニュー内順序と top menu 順序の反映はまだ行わず、表示 ON/OFF
 > だけを描画に接続する。
+>
+> **Phase 6 menu layout top menu order render スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `render_menubar()` の top menu 描画を `ResolvedMenuLayout.menus` の順に行うようにし、
+> `top_menu_order` の並び替えをメニューバー上の top menu 順へ反映する。各 top menu 内部の
+> 固定 leaf 項目は引き続き `ResolvedTopMenu.commands.contains(...)` による表示 ON/OFF だけを
+> 使い、メニュー内 command order と編集 UI は後続スライスに残す。クリック処理、enabled 判定、
+> hover 表示、動的 / catalog 外項目の描画は変更しない。
 
 ## 1. 背景と狙い
 
@@ -619,9 +626,10 @@ pub enum BindingPolicy {
   resolver を追加し、未知 ID の読み飛ばし・既定補完・非表示 command の解決を純関数で固定する。
 - **menu layout Settings 永続化スライス実装済み**: `Settings.menu_layout` を追加し、欠落時 default と
   `settings.db` roundtrip をテストする。描画接続・編集 UI は後続。
-- **menu layout visibility render スライス実装中**: `render_menubar()` が resolver 出力を読み、
-  catalog 化済み固定 leaf 項目と空 top menu の表示 ON/OFF を反映する。メニュー内順序・top menu
-  順序の反映は後続。
+- **menu layout visibility render スライス実装済み**: `render_menubar()` が resolver 出力を読み、
+  catalog 化済み固定 leaf 項目と空 top menu の表示 ON/OFF を反映する。
+- **menu layout top menu order render スライス実装中**: top menu の描画順を
+  `ResolvedMenuLayout.menus` に合わせる。メニュー内 command order と編集 UI は後続。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。
