@@ -4080,6 +4080,7 @@ impl NativeEguiOverlay {
                     return;
                 }
                 if crate::keymap::is_context_shortcuts_help_char(ch)
+                    && crate::keymap::native_video_context_shortcuts_help_text_enabled()
                     && self.can_open_shortcut_help()
                 {
                     self.shortcut_help_open = true;

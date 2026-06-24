@@ -65,7 +65,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        上級者向けに、一部のキーボード操作は <code>%APPDATA%\mimageviewer\keymap.ini</code> で変更できます。ファイルは初回起動時にコメント付きで生成され、最新の標準一覧は同じ場所の <code>keymap.ini.default</code> に生成されます。標準キーがない操作は <code># ... = none</code> として表示され、キー名に書き換えると割り当てできます。競合や予約キーへの割り当ては起動時に警告ログを出します。一部メニュー、★フィルター、フルスクリーンホバーバー、動画 HUD、消しゴム / 隠蔽加工パネルのツールボタンなどは、表示上のキー表記も設定に追従します。グリッド表示中、画像 / 動画フルスクリーン中、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモード中は <kbd>?</kbd> で、現在使えるショートカット一覧とキー未設定の操作を確認できます。
+        上級者向けに、一部のキーボード操作は <code>%APPDATA%\mimageviewer\keymap.ini</code> で変更できます。ファイルは初回起動時にコメント付きで生成され、最新の標準一覧は同じ場所の <code>keymap.ini.default</code> に生成されます。標準キーがない操作は <code># ... = none</code> として表示され、キー名に書き換えると割り当てできます。競合や予約キーへの割り当ては起動時に警告ログを出します。一部メニュー、★フィルター、フルスクリーンホバーバー、動画 HUD、消しゴム / 隠蔽加工パネルのツールボタンなどは、表示上のキー表記も設定に追従します。グリッド表示中、画像 / 動画フルスクリーン中、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモード中は、既定の <kbd>?</kbd> で現在使えるショートカット一覧とキー未設定の操作を確認できます。このヘルプキー自体も <code>keymap.ini</code> で変更できます。
       </div>
     </div>
 
@@ -231,7 +231,7 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>?</kbd></td><td>現在のグリッド表示で使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>現在のグリッド表示で使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>フォルダを開くダイアログ</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>現在地フィルタを表示（今表示中のグリッドを絞り込む。PDF ページ表示中は無効）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>アイテム検索バーを表示（お気に入り全体の画像・PDF・動画を横断）</td></tr>
@@ -261,7 +261,7 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>?</kbd></td><td>画像フルスクリーンで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>画像フルスクリーンで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>→</kbd> / <kbd>↓</kbd></td><td>次の画像へ。縦読み中の <kbd>↓</kbd> は下へスクロール</td></tr>
           <tr><td><kbd>←</kbd> / <kbd>↑</kbd></td><td>前の画像へ。縦読み中の <kbd>↑</kbd> は上へスクロール</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>設定した量だけ前 / 次へジャンプ。既定は全ページの 10%。見開き中は最低 2 ページ移動</td></tr>
@@ -325,7 +325,7 @@
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / マスクを確定して AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>M</kbd></td><td>隠蔽加工モード開始 / 終了（<a href="conceal.html">詳細</a>）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>フルスクリーン中: テキスト注釈モード開始 / 終了（吹き出し・装飾テキスト・スタンプ。<a href="annotation.html">詳細</a>）</td></tr>
-          <tr><td><kbd>?</kbd></td><td>テキスト注釈モード中：現在使えるショートカット一覧を表示。本文入力欄などにフォーカスがあるときは入力を優先</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>テキスト注釈モード中：現在使えるショートカット一覧を表示。本文入力欄などにフォーカスがあるときは入力を優先</td></tr>
           <tr><td><kbd>F7</kbd> / <kbd>F8</kbd></td><td>消しゴムマスクスロット 1 / 2 を現在ページに即適用</td></tr>
           <tr><td><kbd>F9</kbd> / <kbd>F10</kbd></td><td>隠蔽マスクスロット 1 / 2 を現在ページに即適用</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>F7</kbd> / <kbd>Shift</kbd>+<kbd>F8</kbd></td><td>現在ページの消しゴムマスクを削除</td></tr>
@@ -341,7 +341,7 @@
           <tr><td><kbd>Shift</kbd>+<kbd>C</kbd></td><td>画像フルスクリーン中：Wipe 比較を ON/OFF（左=ピン、右=現在。縦線はドラッグ可能）</td></tr>
           <tr><td><kbd>Alt</kbd>+<kbd>C</kbd></td><td>画像フルスクリーン中：差分比較を ON/OFF（RGB チャンネルごとの差分を色付きで強調表示）</td></tr>
           <tr><td><kbd>Space</kbd></td><td>画像フルスクリーン中：スライドショー再生中なら停止、停止中ならチェック ON/OFF ／ 動画フルスクリーン中：再生 / 一時停止トグル</td></tr>
-          <tr><td><kbd>?</kbd></td><td>動画フルスクリーンで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>動画フルスクリーンで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>動画フルスクリーン中：再生 / 一時停止トグル（<kbd>Space</kbd> と同じ）</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>Enter</kbd></td><td>動画を外部プレイヤーで開く</td></tr>
           <tr><td><kbd>B</kbd></td><td>動画フルスクリーン中：現在位置にブックマーク（🔖）を追加。左ジャンプパネルの ✏ から名称編集</td></tr>
@@ -402,7 +402,7 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>?</kbd></td><td>補正レイヤーモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>補正レイヤーモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>Esc</kbd></td><td>補正レイヤーパネルを閉じる</td></tr>
           <tr><td><kbd>Q</kbd></td><td>補正レイヤー直前の元画像表示 ON / OFF</td></tr>
           <tr><td><kbd>W</kbd></td><td>選択中レイヤーのマスク表示 ON / OFF</td></tr>
@@ -531,7 +531,7 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>?</kbd></td><td>消しゴムモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>消しゴムモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>E</kbd></td><td>開始 / AI 補完実行（2 回目）</td></tr>
           <tr><td><kbd>Esc</kbd></td><td><kbd>E</kbd> と同じく AI 補完を実行して消しゴムモード終了（フルスクリーンは継続）</td></tr>
           <tr><td><kbd>S</kbd></td><td>選択ツール (ベクタオブジェクトを枠表示してクリック選択・編集)</td></tr>
@@ -600,7 +600,7 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>?</kbd></td><td>隠蔽加工モードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>隠蔽加工モードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>M</kbd> / <kbd>Esc</kbd></td><td>隠蔽加工モード開始 / 終了</td></tr>
           <tr><td><kbd>T</kbd></td><td>加工タイプを順に切替</td></tr>
           <tr><td><kbd>1</kbd>〜<kbd>4</kbd></td><td>プリセット 1〜4 を呼び出し</td></tr>
@@ -622,7 +622,7 @@
           <tr><th>キー / 操作</th><th>動作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>?</kbd></td><td>切り取りモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>?</kbd> (既定)</td><td>切り取りモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>E</kbd></td><td>切り取りを確定し、現在の表示結果を別ファイルへエクスポート</td></tr>
           <tr><td><kbd>Esc</kbd></td><td>切り取りモードを終了</td></tr>
           <tr><td>ドラッグ</td><td>切り取り範囲を作成、移動、またはリサイズ</td></tr>

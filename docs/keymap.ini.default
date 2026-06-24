@@ -22,7 +22,7 @@
 # - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。
 # - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
 # - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,
-#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], -
+#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], /, ?, -
 # - テンキー数字は通常の数字キーと同じ扱いです。
 #   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
@@ -52,6 +52,7 @@
 # GlobalMetadataSearch = Ctrl+G ; 全フォルダのメタデータを検索する
 # GlobalOpenFolder = Ctrl+O ; フォルダを開くダイアログを表示する
 # ToggleDetachedViewerMode = F12 ; 画像・動画ビューアの別ウィンドウモードを切り替える
+# HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
 
 [Grid] ; サムネイル一覧
 # GridSelectAll = Ctrl+A ; 表示中のチェック可能な項目をすべてチェックする

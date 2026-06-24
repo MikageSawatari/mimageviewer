@@ -173,6 +173,7 @@ pub enum KeyName {
     Delete,
     OpenBracket,
     CloseBracket,
+    Slash,
     Minus,
 }
 
@@ -249,6 +250,7 @@ impl KeyName {
             "DELETE" | "DEL" => KeyName::Delete,
             "[" | "OPENBRACKET" | "LBRACKET" => KeyName::OpenBracket,
             "]" | "CLOSEBRACKET" | "RBRACKET" => KeyName::CloseBracket,
+            "/" | "SLASH" => KeyName::Slash,
             "MINUS" => KeyName::Minus,
             _ => return None,
         })
@@ -320,6 +322,7 @@ impl KeyName {
             KeyName::Delete => egui::Key::Delete,
             KeyName::OpenBracket => egui::Key::OpenBracket,
             KeyName::CloseBracket => egui::Key::CloseBracket,
+            KeyName::Slash => egui::Key::Slash,
             KeyName::Minus => egui::Key::Minus,
         }
     }
@@ -390,6 +393,7 @@ impl KeyName {
             egui::Key::Delete => KeyName::Delete,
             egui::Key::OpenBracket => KeyName::OpenBracket,
             egui::Key::CloseBracket => KeyName::CloseBracket,
+            egui::Key::Slash => KeyName::Slash,
             egui::Key::Minus => KeyName::Minus,
             _ => return None,
         })
@@ -461,6 +465,7 @@ impl KeyName {
             KeyName::Delete => 0x2E,
             KeyName::OpenBracket => 0xDB,
             KeyName::CloseBracket => 0xDD,
+            KeyName::Slash => 0xBF,
             KeyName::Minus => 0xBD,
         }
     }
@@ -531,6 +536,7 @@ impl KeyName {
             KeyName::Delete => "Delete",
             KeyName::OpenBracket => "OpenBracket",
             KeyName::CloseBracket => "CloseBracket",
+            KeyName::Slash => "/",
             KeyName::Minus => "-",
         }
     }
@@ -655,15 +661,20 @@ impl Chord {
     }
 
     pub fn display_name(self) -> String {
+        let question_mark = self.shift && self.key == Some(KeyName::Slash);
         let mut parts = Vec::new();
         if self.ctrl {
             parts.push("Ctrl".to_string());
         }
-        if self.shift {
+        if self.shift && !question_mark {
             parts.push("Shift".to_string());
         }
         if self.alt {
             parts.push("Alt".to_string());
+        }
+        if question_mark {
+            parts.push("?".to_string());
+            return parts.join("+");
         }
         if let Some(key) = self.key {
             parts.push(key.display_name().to_string());
@@ -725,6 +736,7 @@ pub enum KeyAction {
     GlobalMetadataSearch,
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
+    HelpShowContextShortcuts,
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
@@ -932,6 +944,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalMetadataSearch,
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
+    KeyAction::HelpShowContextShortcuts,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
@@ -1214,6 +1227,7 @@ impl KeyAction {
             GlobalMetadataSearch => "GlobalMetadataSearch",
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
+            HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
@@ -1431,6 +1445,7 @@ impl KeyAction {
             GlobalMetadataSearch => "全フォルダのメタデータを検索する",
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
+            HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -1640,7 +1655,8 @@ impl KeyAction {
             | GlobalFavSearch
             | GlobalMetadataSearch
             | GlobalOpenFolder
-            | ToggleDetachedViewerMode => KeyContext::Global,
+            | ToggleDetachedViewerMode
+            | HelpShowContextShortcuts => KeyContext::Global,
             GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -1786,6 +1802,7 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | HelpShowContextShortcuts
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -1990,6 +2007,7 @@ impl KeyAction {
             GlobalMetadataSearch => ChordList::one(Chord::ctrl(G)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
+            HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -2560,6 +2578,30 @@ impl Keymap {
             .collect()
     }
 
+    pub fn consume_context_shortcuts_help_action(&self, ctx: &egui::Context) -> bool {
+        let chords = self.effective_chords(KeyAction::HelpShowContextShortcuts);
+        let mut consumed = false;
+        for chord in chords.iter().copied() {
+            if self.consume_chord_no_repeat(ctx, chord) {
+                consumed = true;
+            }
+        }
+        if context_shortcuts_help_accepts_text(&chords) && consume_context_shortcuts_help_text(ctx)
+        {
+            consumed = true;
+        }
+        consumed
+    }
+
+    pub fn context_shortcuts_help_label(&self) -> String {
+        let labels = self.chord_labels(KeyAction::HelpShowContextShortcuts);
+        if labels.is_empty() {
+            "未設定".to_string()
+        } else {
+            labels.join(" / ")
+        }
+    }
+
     pub fn command_display_rows_for_active_scopes(
         &self,
         active_scopes: &[CommandScope],
@@ -2567,6 +2609,7 @@ impl Keymap {
     ) -> Vec<CommandDisplayRow> {
         command_catalog()
             .filter(|spec| active_scopes.contains(&spec.scope))
+            .filter(|spec| spec.action != KeyAction::HelpShowContextShortcuts)
             .filter_map(|spec| {
                 let shortcut_labels = self.chord_labels(spec.action);
                 if shortcut_labels.is_empty() && !include_unassigned {
@@ -3001,6 +3044,12 @@ impl Keymap {
         if let Ok(mut guard) = cell.write() {
             *guard = chords;
         }
+
+        let help_chords = self.effective_chords(KeyAction::HelpShowContextShortcuts);
+        let cell = GLOBAL_CONTEXT_HELP_CHORDS.get_or_init(|| RwLock::new(Vec::new()));
+        if let Ok(mut guard) = cell.write() {
+            *guard = help_chords;
+        }
     }
 
     pub fn user_ini_template() -> String {
@@ -3071,7 +3120,7 @@ impl Keymap {
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
         out.push_str("# - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,\n");
         out.push_str(
-            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], -\n",
+            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], /, ?, -\n",
         );
         out.push_str("# - テンキー数字は通常の数字キーと同じ扱いです。\n");
         out.push_str("#   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。\n");
@@ -3315,13 +3364,84 @@ pub(crate) fn is_context_shortcuts_help_char(ch: char) -> bool {
     matches!(ch, '?' | '？')
 }
 
+fn is_context_shortcuts_help_question_chord(chord: Chord) -> bool {
+    chord.key == Some(KeyName::Slash) && chord.shift && !chord.ctrl && !chord.alt
+}
+
+fn context_shortcuts_help_accepts_text(chords: &[Chord]) -> bool {
+    chords
+        .iter()
+        .copied()
+        .any(is_context_shortcuts_help_question_chord)
+}
+
+fn consume_context_shortcuts_help_text(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|i| {
+        if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.mac_cmd || i.modifiers.command {
+            return false;
+        }
+        let mut found = false;
+        i.events.retain(|event| {
+            let consume = !found
+                && matches!(
+                    event,
+                    egui::Event::Text(text)
+                        if {
+                            let mut chars = text.chars();
+                            matches!(
+                                (chars.next(), chars.next()),
+                                (Some(ch), None) if is_context_shortcuts_help_char(ch)
+                            )
+                        }
+                );
+            if consume {
+                found = true;
+            }
+            !consume
+        });
+        found
+    })
+}
+
 #[cfg(windows)]
 pub(crate) fn native_video_context_shortcuts_help_key_down(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
     const VK_OEM_2: u32 = 0xBF; // US/JIS: slash key, Shift produces '?'.
 
-    key.virtual_key == VK_OEM_2 && key.shift && !key.ctrl && !key.alt && !key.repeat
+    if key.repeat {
+        return false;
+    }
+    let matches = |chord: Chord| {
+        if is_context_shortcuts_help_question_chord(chord) {
+            key.virtual_key == VK_OEM_2 && key.shift && !key.ctrl && !key.alt
+        } else {
+            chord.matches_vk_parts(key.virtual_key, key.ctrl, key.shift, key.alt)
+        }
+    };
+    if let Some(cell) = GLOBAL_CONTEXT_HELP_CHORDS.get()
+        && let Ok(guard) = cell.read()
+    {
+        return guard.iter().copied().any(matches);
+    }
+    KeyAction::HelpShowContextShortcuts
+        .default_chords()
+        .iter()
+        .any(matches)
+}
+
+#[cfg(windows)]
+pub(crate) fn native_video_context_shortcuts_help_text_enabled() -> bool {
+    if let Some(cell) = GLOBAL_CONTEXT_HELP_CHORDS.get()
+        && let Ok(guard) = cell.read()
+    {
+        return context_shortcuts_help_accepts_text(&guard);
+    }
+    let defaults: Vec<_> = KeyAction::HelpShowContextShortcuts
+        .default_chords()
+        .iter()
+        .collect();
+    context_shortcuts_help_accepts_text(&defaults)
 }
 
 fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) -> bool {
@@ -3346,6 +3466,7 @@ fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) ->
 }
 
 static GLOBAL_NATIVE_VIDEO_CHORDS: OnceLock<RwLock<Vec<Chord>>> = OnceLock::new();
+static GLOBAL_CONTEXT_HELP_CHORDS: OnceLock<RwLock<Vec<Chord>>> = OnceLock::new();
 
 #[derive(Default)]
 struct ParsedAction {
@@ -3396,8 +3517,14 @@ fn parse_chord(rhs: &str) -> Result<Chord, String> {
             if key_seen {
                 return Err(format!("'{rhs}' has more than one normal key"));
             }
-            let key = KeyName::parse(token).ok_or_else(|| format!("unknown key name '{token}'"))?;
-            chord.key = Some(key);
+            if token == "?" || token.eq_ignore_ascii_case("questionmark") {
+                chord.shift = true;
+                chord.key = Some(KeyName::Slash);
+            } else {
+                let key =
+                    KeyName::parse(token).ok_or_else(|| format!("unknown key name '{token}'"))?;
+                chord.key = Some(key);
+            }
             key_seen = true;
         }
     }
@@ -3518,6 +3645,12 @@ mod tests {
     fn command_display_rows_filter_active_scopes_and_hide_unassigned() {
         let keymap = Keymap::empty();
         let rows = keymap.command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, false);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::HelpShowContextShortcuts),
+            "context help action is rendered as the dialog trigger row, not as a duplicate command row"
+        );
 
         let local_search = rows
             .iter()
@@ -4179,9 +4312,52 @@ mod tests {
         assert!(!is_context_shortcuts_help_char('/'));
     }
 
+    #[test]
+    fn question_mark_chord_parses_and_displays_as_primary_help_key() {
+        let question = Chord::shift(KeyName::Slash);
+        assert_eq!(parse_chord("?").unwrap(), question);
+        assert_eq!(parse_chord("Questionmark").unwrap(), question);
+        assert_eq!(parse_chord("Shift+/").unwrap(), question);
+        assert_eq!(question.display_name(), "?");
+        assert_eq!(
+            Chord::new(true, true, false, KeyName::Slash).display_name(),
+            "Ctrl+?"
+        );
+        assert_eq!(
+            KeyAction::HelpShowContextShortcuts
+                .default_chords()
+                .iter()
+                .next(),
+            Some(question)
+        );
+    }
+
+    #[test]
+    fn context_shortcuts_help_label_follows_overrides_and_none() {
+        let keymap = Keymap::empty();
+        assert_eq!(keymap.context_shortcuts_help_label(), "?");
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            HelpShowContextShortcuts = F1
+            "#,
+        );
+        assert_eq!(keymap.context_shortcuts_help_label(), "F1");
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            HelpShowContextShortcuts = none
+            "#,
+        );
+        assert_eq!(keymap.context_shortcuts_help_label(), "未設定");
+    }
+
     #[cfg(windows)]
     #[test]
-    fn native_video_context_help_keydown_falls_back_to_shift_slash() {
+    fn native_video_context_help_keydown_follows_keymap() {
+        Keymap::empty().install_global_native_video_shortcuts();
         let mut event = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0xBF,
             shift: true,
@@ -4199,6 +4375,44 @@ mod tests {
         event.repeat = false;
         event.ctrl = true;
         assert!(!native_video_context_shortcuts_help_key_down(&event));
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            HelpShowContextShortcuts = F1
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+
+        let shift_slash = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0xBF,
+            shift: true,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
+        assert!(!native_video_context_shortcuts_help_text_enabled());
+
+        let f1 = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0x70,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(native_video_context_shortcuts_help_key_down(&f1));
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            HelpShowContextShortcuts = none
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
+        assert!(!native_video_context_shortcuts_help_key_down(&f1));
+        assert!(!native_video_context_shortcuts_help_text_enabled());
     }
 
     #[cfg(windows)]
@@ -4226,6 +4440,7 @@ mod tests {
         assert!(user_ini.contains("上級者向けのキーボード割り当て設定です。"));
         assert!(user_ini.contains("[FsImage]"));
         assert!(user_ini.contains("[Rating] ; レーティング"));
+        assert!(user_ini.contains("# HelpShowContextShortcuts = ?"));
         assert!(user_ini.contains("# RatingItem1 = F1 ; 現在の画像または動画に星1を付ける"));
         assert!(user_ini.contains("# GridToggleStackMode = none ; スタック表示を切り替える"));
         assert!(user_ini.contains("# FsSlideshow = S"));

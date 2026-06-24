@@ -110,8 +110,11 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。
-  `?` のコンテキストヘルプは presenter 内で開く。通常は `WM_CHAR` の Text (`?` / `？`) を使い、
-  実機で `WM_CHAR` が届かない場合に備えて `Shift+VK_OEM_2` の KeyDown も fallback として扱う。
+  コンテキストヘルプは presenter 内で開く。App 側で共有した `HelpShowContextShortcuts` の
+  effective chord を見て、既定割り当てでは `WM_CHAR` の Text (`?` / `？`) を使う。実機で
+  `WM_CHAR` が届かない場合に備え、既定 `?` 相当の `Shift+VK_OEM_2` KeyDown も fallback として扱う。
+  ユーザーが `HelpShowContextShortcuts` を別キーや `none` に変更した場合、native presenter の
+  Text / KeyDown 判定も同じ effective chord に追従する。
 
 **Region 計算とアクティベーション検出**:
 

@@ -3853,7 +3853,11 @@ impl App {
         let fixed_rows = FIXED_ROWS
             .iter()
             .map(|(keys, description)| NativeOverlayShortcutHelpRow {
-                keys: (*keys).to_string(),
+                keys: if *keys == "?" {
+                    self.keymap.context_shortcuts_help_label()
+                } else {
+                    (*keys).to_string()
+                },
                 description: (*description).to_string(),
             })
             .collect();

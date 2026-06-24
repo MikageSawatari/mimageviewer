@@ -398,7 +398,7 @@ impl App {
                             draw_command_scope_rows(ui, *scope, &rows);
                         }
                         draw_unassigned_command_rows(ui, &rows);
-                        draw_fixed_rows(ui, help_context.fixed_rows());
+                        draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
 
                 ui.add_space(8.0);
@@ -519,7 +519,7 @@ fn draw_unassigned_command_rows(ui: &mut egui::Ui, rows: &[CommandDisplayRow]) {
         });
 }
 
-fn draw_fixed_rows(ui: &mut egui::Ui, rows: &[FixedShortcutRow]) {
+fn draw_fixed_rows(ui: &mut egui::Ui, keymap: &crate::keymap::Keymap, rows: &[FixedShortcutRow]) {
     ui.add_space(10.0);
     ui.label(egui::RichText::new("固定キー").strong());
     ui.add_space(2.0);
@@ -529,7 +529,12 @@ fn draw_fixed_rows(ui: &mut egui::Ui, rows: &[FixedShortcutRow]) {
         .striped(true)
         .show(ui, |ui| {
             for row in rows {
-                ui.monospace(row.keys);
+                let keys = if row.keys == "?" {
+                    keymap.context_shortcuts_help_label()
+                } else {
+                    row.keys.to_string()
+                };
+                ui.monospace(keys);
                 ui.label(row.description);
                 ui.end_row();
             }

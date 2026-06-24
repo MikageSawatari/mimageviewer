@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 7 コンテキストヘルプ全スライス実装済み / ClaudeCode レビュー済み** (2026-06-24)。
+> ステータス: **Phase 7 ヘルプキー KeyAction 化スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -134,6 +134,12 @@
 > `Text` scope の `TextConfirm` / `TextUndo` / `TextRedo` / `TextSpacePan` と、Esc /
 > Delete / Backspace / ドラッグ / ホイール / 右Ctrl などの固定扱い入力。本文やフォント検索など
 > TextEdit が keyboard focus を持つときは `?` を奪わない。
+>
+> **Phase 7 ヘルプキー KeyAction 化スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `HelpShowContextShortcuts` を `Global` scope の `KeyAction` として追加し、既定を `?`
+> (内部的には `Shift+/`) にする。egui 側の各ヘルプ dispatch、ヘルプ固定キー欄、native 動画
+> overlay の Text / KeyDown fallback はこの Action の effective chord を参照する。
+> ユーザーが `HelpShowContextShortcuts = F1` や `none` に変更した場合も、入力判定と表示が一致する。
 
 ## 1. 背景と狙い
 
@@ -551,7 +557,7 @@ pub enum BindingPolicy {
   `Keymap::command_display_rows_for_active_scopes()` で、active scope に属する
   `CommandSpec` と effective chord の表示ラベルを取り出せるようにする。UI はまだ作らず、
   dispatch も変えない。
-- **グリッドヘルプ初期スライス実装済み**: `?` を固定ヘルプキーとして扱い、グリッド文脈だけ
+- **グリッドヘルプ初期スライス実装済み**: 当時は `?` を固定ヘルプキーとして扱い、グリッド文脈だけ
   「ショートカット」ダイアログを開く。keymap 化済み操作は実割り当てから表示し、Enter /
   Backspace / 矢印など予約・固定扱いの操作は補助行で表示する。
 - **グリッドヘルプ未設定表示スライス実装済み**: キー未設定 / 明示無効化中の操作を別枠で表示し、
@@ -576,21 +582,24 @@ pub enum BindingPolicy {
 - **テキスト注釈ヘルプスライス実装済み**: テキスト注釈モード中に `?` を押したとき、`Text`
   scope の実割り当てと固定キーを表示する。本文や検索欄などが keyboard focus を持つ場合は
   `?` を奪わない。
-- `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
+- **ヘルプキー KeyAction 化スライス実装中**: `HelpShowContextShortcuts` を `Global` scope の
+  `KeyAction` として追加し、既定を `?` (内部的には `Shift+/`) にする。egui / native 動画の
+  dispatch と、ヘルプ内の固定キー欄はこの Action の effective chord に追従する。
+- 既定 `?` のヘルプキーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
   消しゴム / 隠蔽加工 / 補正レイヤー / テキスト注釈など) で有効なショートカット一覧を表示する。
 - 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。
 - 同じ `CommandSpec` / `KeyAction` の scope・description・binding policy を使い、未割り当てや
   予約扱いの操作は表示方針を明示する。
 - 複数 chord がある操作は全て表示するか、主 chord + 詳細展開にするかを UI 設計で決める。
-- `?` 自体を固定ヘルプキーにするか、`HelpShowContextShortcuts` のような `KeyAction` として
-  カスタマイズ可能にするかは、Esc / Enter / 矢印の予約整理後に判断する。
+- `?` 自体は `HelpShowContextShortcuts` として KeyAction 化する。Esc / Enter / 矢印は引き続き
+  予約・固定扱いとして残す。
 
 完了条件:
 
 - keymap 変更後、ヘルプ表示のキー一覧が実割り当てに追従する。
 - 現在コンテキストで発火しない操作を混ぜず、Global / FsCommon / 編集モード固有操作の重なりを
   active scope から説明できる。
-- テキスト入力・IME 変換・ダイアログ操作中に `?` が誤発火しない。
+- テキスト入力・IME 変換・ダイアログ操作中にヘルプキーが誤発火しない。
 - ヘルプ UI はリリース中の通常操作を阻害せず、Esc / 閉じるボタン / ウィンドウの × で閉じられる。
 
 ## 7. 初回リリースの詳細タスク

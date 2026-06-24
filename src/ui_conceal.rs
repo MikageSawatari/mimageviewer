@@ -475,7 +475,7 @@ impl App {
             jump_to: None,
         };
 
-        if !self.ime_input_active() && Self::consume_context_shortcuts_help_key(ctx) {
+        if !self.ime_input_active() && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return action;
         }

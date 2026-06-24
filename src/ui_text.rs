@@ -1187,7 +1187,7 @@ impl App {
 
         if !self.ime_input_active()
             && !ctx.wants_keyboard_input()
-            && Self::consume_context_shortcuts_help_key(ctx)
+            && self.consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;
             return action;

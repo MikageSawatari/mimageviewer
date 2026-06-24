@@ -18419,7 +18419,7 @@ impl App {
             return None;
         }
 
-        if !self.ime_input_active() && Self::consume_context_shortcuts_help_key(ctx) {
+        if !self.ime_input_active() && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return None;
         }
@@ -19371,33 +19371,8 @@ impl App {
         }
     }
 
-    pub(crate) fn consume_context_shortcuts_help_key(ctx: &egui::Context) -> bool {
-        ctx.input_mut(|i| {
-            if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.mac_cmd || i.modifiers.command {
-                return false;
-            }
-            let mut found = false;
-            i.events.retain(|event| {
-                let consume = !found
-                    && matches!(
-                        event,
-                        egui::Event::Text(text)
-                            if {
-                                let mut chars = text.chars();
-                                matches!(
-                                    (chars.next(), chars.next()),
-                                    (Some(ch), None)
-                                        if crate::keymap::is_context_shortcuts_help_char(ch)
-                                )
-                            }
-                    );
-                if consume {
-                    found = true;
-                }
-                !consume
-            });
-            found
-        })
+    pub(crate) fn consume_context_shortcuts_help_key(&self, ctx: &egui::Context) -> bool {
+        self.keymap.consume_context_shortcuts_help_action(ctx)
     }
 
     /// フォルダツリーペインのクリック/Enter ナビを worker scan 経由で開始する。

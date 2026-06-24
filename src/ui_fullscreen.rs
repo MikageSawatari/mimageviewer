@@ -6010,7 +6010,7 @@ impl App {
         if !self.ime_input_active()
             && !self.is_overlay_edit_mode_active()
             && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            && Self::consume_context_shortcuts_help_key(ctx)
+            && self.consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;
             return true;
@@ -6145,7 +6145,7 @@ impl App {
         if self.local_adjust_mode {
             if !self.ime_input_active()
                 && !ctx.wants_keyboard_input()
-                && Self::consume_context_shortcuts_help_key(ctx)
+                && self.consume_context_shortcuts_help_key(ctx)
             {
                 self.show_context_shortcuts_help = true;
                 return action;
@@ -6368,7 +6368,7 @@ impl App {
             && self.fs_context_menu_idx.is_none();
         if !self.ime_input_active()
             && self.fs_context_menu_idx.is_none()
-            && Self::consume_context_shortcuts_help_key(ctx)
+            && self.consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;
             return action;
