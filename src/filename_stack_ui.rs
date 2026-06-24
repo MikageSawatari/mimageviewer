@@ -365,6 +365,8 @@ impl crate::app::App {
         // 動画サムネスレッドの起動 / キャッシュ保護 (existing_keys) / 世代更新が正しく行われる
         // (swap_stack_view_items は in-memory swap で動画スレッドを再起動しないため不可。Codex P2)。
         // start_loading_items が stack_* をリセットするので、その後に意図を復元する。
+        let is_subfolder_expansion_stack =
+            crate::folder_tree::path_eq(&folder, &crate::app::subfolder_expansion_synthetic_path());
         self.start_loading_items(
             folder,
             agg_items,
@@ -373,6 +375,9 @@ impl crate::app::App {
             agg_videos,
             folder_signature,
         );
+        if is_subfolder_expansion_stack {
+            self.restore_subfolder_expansion_view_state_after_items_install();
+        }
         self.stack_mode_requested = true;
         self.stack_view = Some(sv);
         self.stack_active_rule = rule.clone();
@@ -695,6 +700,9 @@ impl crate::app::App {
             pending.cancel();
         }
         self.install_new_items(items, metas);
+        if crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path()) {
+            self.restore_subfolder_expansion_view_state_after_items_install();
+        }
         self.invalidate_idx_state_and_queues();
         self.current_folder_rating_cache = None;
         // セルは実 Image (フラット) / 単独 Image (集約)。実フォルダ prefix でページ編集状態

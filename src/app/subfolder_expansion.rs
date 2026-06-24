@@ -725,6 +725,29 @@ impl App {
         self.subfolder_expansion_diag = None;
     }
 
+    pub(crate) fn restore_subfolder_expansion_view_state_after_items_install(&mut self) {
+        let Some(snapshot) = self.subfolder_expansion_snapshot.clone() else {
+            return;
+        };
+        let root = self
+            .subfolder_expansion_root
+            .clone()
+            .unwrap_or_else(|| snapshot.root.clone());
+        let roots = if self.subfolder_expansion_roots.is_empty() {
+            snapshot.roots.clone()
+        } else {
+            self.subfolder_expansion_roots.clone()
+        };
+        self.items_are_subfolder_expansion_view = true;
+        self.subfolder_expansion_root = Some(root.clone());
+        self.subfolder_expansion_roots = roots.clone();
+        self.subfolder_expansion_saved_folder
+            .get_or_insert_with(|| root.clone());
+        self.subfolder_expansion_progress = None;
+        self.subfolder_expansion_install_pending = None;
+        self.address = subfolder_expansion_view_label("サブ展開", &root, &roots);
+    }
+
     pub(crate) fn exit_subfolder_expansion_view(&mut self) {
         let target = self
             .subfolder_expansion_saved_folder

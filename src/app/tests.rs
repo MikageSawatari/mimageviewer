@@ -3881,6 +3881,56 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn subfolder_stack_item_install_restores_synthetic_view_state() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::ui_main::AddressBarNav;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let image = a.join("scan_001.jpg");
+
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.current_folder_last_mtime = None;
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![a.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![a.clone()],
+            entries: vec![SubfolderExpansionEntry {
+                path: image.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+
+        app.install_new_items(vec![GridItem::Image(image)], vec![Some((1, 10))]);
+        assert!(
+            !app.items_are_subfolder_expansion_view,
+            "install_new_items 自体は既定の実ビューへ戻す"
+        );
+
+        app.restore_subfolder_expansion_view_state_after_items_install();
+
+        assert!(app.items_are_subfolder_expansion_view);
+        assert!(app.stack_mode_available());
+        assert!(app.use_full_path_cache_keys());
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        match app.subfolder_expansion_back_nav() {
+            Some(AddressBarNav::Direct(path)) => assert_eq!(path, root),
+            other => panic!("expected subfolder back nav to root, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn subfolder_expansion_toggle_uses_checked_folder_roots() {
         use crate::grid_item::{GridItem, ThumbnailState};
         let mut app = setup_app();
