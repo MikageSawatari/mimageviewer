@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 メニュー command catalog 基盤スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 6 ファイルメニュー静的項目 catalog スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -141,12 +141,19 @@
 > overlay の Text / KeyDown fallback はこの Action の effective chord を参照する。
 > ユーザーが `HelpShowContextShortcuts = F1` や `none` に変更した場合も、入力判定と表示が一致する。
 >
-> **Phase 6 メニュー command catalog 基盤スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 6 メニュー command catalog 基盤スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `MenuCommandId` / `MenuCommandSpec` / `TopMenuId` を `keymap.rs` に追加し、まず既に
 > shortcut 表示が keymap 追従している top menu 項目 (現在地フィルタ / コンテナ検索 /
 > アイテム検索 / タグビュー) だけを catalog 化する。`Keymap::menu_command_label()` から
 > 既存と同じラベルを作るように `render_menubar()` を差し替えるが、メニュー構成・クリック処理・
 > 保存形式・UI はまだ変更しない。
+>
+> **Phase 6 ファイルメニュー静的項目 catalog スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `MenuCommandId::ALL` を追加して enum ⇄ catalog の drift をテストで検知する。ファイルメニューの
+> 静的項目 (フォルダを開く / 読書履歴 / 現在地フィルタ / キャプチャ保存フォルダ / ゴミ箱 / 終了)
+> を `MenuCommandSpec` へ追加し、`render_menubar()` のラベル取得を catalog 経由にする。
+> `フォルダを開く…` は既存 `GlobalOpenFolder` と紐付け、表示上の shortcut も keymap 追従にする。
+> クリック処理・メニュー構成・保存形式は変更しない。
 
 ## 1. 背景と狙い
 
@@ -550,9 +557,12 @@ pub enum BindingPolicy {
 
 実装内容:
 
-- **基盤スライス実装中**: `MenuCommandId` / `MenuCommandSpec` / `TopMenuId` を追加し、
+- **基盤スライス実装済み**: `MenuCommandId` / `MenuCommandSpec` / `TopMenuId` を追加し、
   既に KeyAction と対応済みの top menu 項目だけを catalog 化する。`render_menubar()` は
   既存と同じラベルを `Keymap::menu_command_label()` 経由で取得するだけで、挙動は変えない。
+- **ファイルメニュー静的項目スライス実装中**: `MenuCommandId::ALL` と drift テストを追加し、
+  ファイルメニューの静的項目を catalog 化する。`フォルダを開く…` は `GlobalOpenFolder` と
+  紐付け、`Ctrl+O` などの shortcut 表示が keymap 変更に追従する。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。

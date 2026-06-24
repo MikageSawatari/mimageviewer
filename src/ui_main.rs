@@ -2043,9 +2043,22 @@ impl App {
                     GridItem::Video(path) => Some(path.clone()),
                     _ => None,
                 });
+        let open_folder_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FileOpenFolder);
+        let reading_history_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FileReadingHistory);
         let local_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FileLocalSearch);
+        let open_capture_folder_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FileOpenCaptureFolder);
+        let open_recycle_bin_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FileOpenRecycleBin);
+        let quit_menu_label = self.keymap.menu_command_label(MenuCommandId::FileQuit);
         let fav_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FavoritesFavSearch);
@@ -2059,7 +2072,7 @@ impl App {
                 let mut top_menu_responses = Vec::with_capacity(7);
 
                 let response = ui.menu_button("ファイル", |ui| {
-                    if ui.button("フォルダを開く…").clicked() {
+                    if ui.button(&open_folder_menu_label).clicked() {
                         // 既に現在フォルダが設定されていれば初期値として補完
                         self.open_folder_input = self
                             .current_folder
@@ -2069,7 +2082,7 @@ impl App {
                         self.show_open_folder_dialog = true;
                         ui.close();
                     }
-                    if ui.button("読書履歴を開く").clicked() {
+                    if ui.button(&reading_history_menu_label).clicked() {
                         self.enter_reading_history();
                         ui.close();
                     }
@@ -2089,16 +2102,16 @@ impl App {
                         self.open_local_metadata_search();
                         ui.close();
                     }
-                    if ui.button("キャプチャ保存フォルダを開く").clicked() {
+                    if ui.button(&open_capture_folder_menu_label).clicked() {
                         self.open_capture_output_dir();
                         ui.close();
                     }
-                    if ui.button("ゴミ箱を開く").clicked() {
+                    if ui.button(&open_recycle_bin_menu_label).clicked() {
                         crate::ui_helpers::open_recycle_bin_async();
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("終了").clicked() {
+                    if ui.button(&quit_menu_label).clicked() {
                         // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、
                         // `shutdown_requested` を立てて `maybe_intercept_close` を通す。
                         self.shutdown_requested

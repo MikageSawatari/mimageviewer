@@ -1201,16 +1201,38 @@ impl TopMenuId {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum MenuCommandId {
+    FileOpenFolder,
+    FileReadingHistory,
     FileLocalSearch,
+    FileOpenCaptureFolder,
+    FileOpenRecycleBin,
+    FileQuit,
     FavoritesFavSearch,
     FavoritesMetadataSearch,
     TagsTagView,
 }
 
 impl MenuCommandId {
+    pub const ALL: &'static [Self] = &[
+        Self::FileOpenFolder,
+        Self::FileReadingHistory,
+        Self::FileLocalSearch,
+        Self::FileOpenCaptureFolder,
+        Self::FileOpenRecycleBin,
+        Self::FileQuit,
+        Self::FavoritesFavSearch,
+        Self::FavoritesMetadataSearch,
+        Self::TagsTagView,
+    ];
+
     pub fn stable_name(self) -> &'static str {
         match self {
+            MenuCommandId::FileOpenFolder => "FileOpenFolder",
+            MenuCommandId::FileReadingHistory => "FileReadingHistory",
             MenuCommandId::FileLocalSearch => "FileLocalSearch",
+            MenuCommandId::FileOpenCaptureFolder => "FileOpenCaptureFolder",
+            MenuCommandId::FileOpenRecycleBin => "FileOpenRecycleBin",
+            MenuCommandId::FileQuit => "FileQuit",
             MenuCommandId::FavoritesFavSearch => "FavoritesFavSearch",
             MenuCommandId::FavoritesMetadataSearch => "FavoritesMetadataSearch",
             MenuCommandId::TagsTagView => "TagsTagView",
@@ -1236,10 +1258,40 @@ impl MenuCommandSpec {
 
 const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
     MenuCommandSpec {
+        id: MenuCommandId::FileOpenFolder,
+        parent: TopMenuId::File,
+        label: "フォルダを開く…",
+        action: Some(KeyAction::GlobalOpenFolder),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FileReadingHistory,
+        parent: TopMenuId::File,
+        label: "読書履歴を開く",
+        action: None,
+    },
+    MenuCommandSpec {
         id: MenuCommandId::FileLocalSearch,
         parent: TopMenuId::File,
         label: "現在地フィルタ",
         action: Some(KeyAction::GlobalLocalSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FileOpenCaptureFolder,
+        parent: TopMenuId::File,
+        label: "キャプチャ保存フォルダを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FileOpenRecycleBin,
+        parent: TopMenuId::File,
+        label: "ゴミ箱を開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FileQuit,
+        parent: TopMenuId::File,
+        label: "終了",
+        action: None,
     },
     MenuCommandSpec {
         id: MenuCommandId::FavoritesFavSearch,
@@ -3744,7 +3796,15 @@ mod tests {
 
     #[test]
     fn menu_command_catalog_has_unique_ids_and_valid_actions() {
+        assert_eq!(menu_command_catalog().len(), MenuCommandId::ALL.len());
         let mut ids = std::collections::BTreeSet::new();
+        for id in MenuCommandId::ALL {
+            assert!(
+                menu_command_spec(*id).is_some(),
+                "missing menu command spec for {}",
+                id.stable_name()
+            );
+        }
         for spec in menu_command_catalog() {
             assert!(
                 ids.insert(spec.id),
@@ -3769,6 +3829,14 @@ mod tests {
     fn menu_command_labels_follow_keymap_overrides() {
         let keymap = Keymap::empty();
         assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileOpenFolder),
+            "フォルダを開く… (Ctrl+O)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileReadingHistory),
+            "読書履歴を開く"
+        );
+        assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
             "現在地フィルタ (Ctrl+F)"
         );
@@ -3788,9 +3856,14 @@ mod tests {
         let keymap = Keymap::from_ini_str(
             r#"
             [Global]
+            GlobalOpenFolder = F3
             GlobalLocalSearch = F2
             GlobalFavSearch = none
             "#,
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileOpenFolder),
+            "フォルダを開く… (F3)"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),

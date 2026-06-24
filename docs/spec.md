@@ -678,7 +678,8 @@ chord を `(Ctrl+F)` のように反映する。
 レーティング系 KeyAction の実割り当てに追従する。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
 popup の shortcut 表記も `keymap.ini` の実割り当てに追従する。複数 chord を
-表示する箇所では `I / Tab` のように並べる。native 動画 overlay の top bar / bottom HUD /
+表示する箇所では `I / Tab` のように並べる。メニューバーのフォルダを開く / 検索 / タグビュー項目など一部のメニュー表示、
+native 動画 overlay の top bar / bottom HUD /
 jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は実割り当てに追従する。
 `Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
