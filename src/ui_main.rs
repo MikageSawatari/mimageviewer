@@ -2059,6 +2059,10 @@ impl App {
             .keymap
             .menu_command_label(MenuCommandId::FileOpenRecycleBin);
         let quit_menu_label = self.keymap.menu_command_label(MenuCommandId::FileQuit);
+        let favorite_add_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::FavoritesAddCurrentFolder);
+        let favorite_edit_menu_label = self.keymap.menu_command_label(MenuCommandId::FavoritesEdit);
         let fav_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FavoritesFavSearch);
@@ -2128,7 +2132,7 @@ impl App {
                     let favorite_target = self.current_favorite_target();
                     let can_add = favorite_target.is_some();
                     if ui
-                        .add_enabled(can_add, egui::Button::new("このフォルダを追加…"))
+                        .add_enabled(can_add, egui::Button::new(&favorite_add_menu_label))
                         .hover_tip_disabled("お気に入りに追加できるのは実フォルダのみです")
                         .clicked()
                     {
@@ -2147,7 +2151,7 @@ impl App {
                     }
 
                     // 編集
-                    if ui.button("編集").clicked() {
+                    if ui.button(&favorite_edit_menu_label).clicked() {
                         self.show_favorites_editor = true;
                         ui.close();
                     }

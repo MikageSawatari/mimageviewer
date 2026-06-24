@@ -1207,6 +1207,8 @@ pub enum MenuCommandId {
     FileOpenCaptureFolder,
     FileOpenRecycleBin,
     FileQuit,
+    FavoritesAddCurrentFolder,
+    FavoritesEdit,
     FavoritesFavSearch,
     FavoritesMetadataSearch,
     TagsTagView,
@@ -1220,6 +1222,8 @@ impl MenuCommandId {
         Self::FileOpenCaptureFolder,
         Self::FileOpenRecycleBin,
         Self::FileQuit,
+        Self::FavoritesAddCurrentFolder,
+        Self::FavoritesEdit,
         Self::FavoritesFavSearch,
         Self::FavoritesMetadataSearch,
         Self::TagsTagView,
@@ -1233,6 +1237,8 @@ impl MenuCommandId {
             MenuCommandId::FileOpenCaptureFolder => "FileOpenCaptureFolder",
             MenuCommandId::FileOpenRecycleBin => "FileOpenRecycleBin",
             MenuCommandId::FileQuit => "FileQuit",
+            MenuCommandId::FavoritesAddCurrentFolder => "FavoritesAddCurrentFolder",
+            MenuCommandId::FavoritesEdit => "FavoritesEdit",
             MenuCommandId::FavoritesFavSearch => "FavoritesFavSearch",
             MenuCommandId::FavoritesMetadataSearch => "FavoritesMetadataSearch",
             MenuCommandId::TagsTagView => "TagsTagView",
@@ -1291,6 +1297,18 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::FileQuit,
         parent: TopMenuId::File,
         label: "終了",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FavoritesAddCurrentFolder,
+        parent: TopMenuId::Favorites,
+        label: "このフォルダを追加…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FavoritesEdit,
+        parent: TopMenuId::Favorites,
+        label: "編集",
         action: None,
     },
     MenuCommandSpec {
@@ -3835,6 +3853,14 @@ mod tests {
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileReadingHistory),
             "読書履歴を開く"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FavoritesAddCurrentFolder),
+            "このフォルダを追加…"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FavoritesEdit),
+            "編集"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
