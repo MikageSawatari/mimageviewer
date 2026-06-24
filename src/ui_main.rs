@@ -2069,10 +2069,62 @@ impl App {
         let metadata_search_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::FavoritesMetadataSearch);
+        let book_add_selection_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::BooksAddSelectionToActiveBook);
+        let book_add_clipboard_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::BooksAddClipboardImage);
+        let book_open_root_menu_label =
+            self.keymap.menu_command_label(MenuCommandId::BooksOpenRoot);
+        let book_open_active_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::BooksOpenActiveBook);
+        let book_reorder_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::BooksReorderCurrentBook);
+        let book_manage_menu_label = self.keymap.menu_command_label(MenuCommandId::BooksManage);
+        let video_register_upscale_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::VideoRegisterUpscale);
+        let video_delete_upscale_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::VideoDeleteUpscale);
+        let video_show_upscale_tasks_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::VideoShowUpscaleTasks);
         let tag_manage_pinned_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::TagsManagePinned);
         let tag_view_menu_label = self.keymap.menu_command_label(MenuCommandId::TagsTagView);
+        let settings_thumbnail_cache_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsThumbnailCache);
+        let settings_archive_cache_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsArchiveCache);
+        let settings_thumbnail_quality_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsThumbnailQuality);
+        let settings_stats_menu_label =
+            self.keymap.menu_command_label(MenuCommandId::SettingsStats);
+        let settings_reset_rotation_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsResetRotation);
+        let settings_restore_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsRestoreSettings);
+        let settings_preferences_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsPreferences);
+        let help_open_manual_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::HelpOpenManual);
+        let help_open_logs_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpOpenLogs);
+        let help_show_whats_new_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::HelpShowWhatsNew);
+        let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -2195,7 +2247,10 @@ impl App {
                     ui.label(format!("追加先の本: {active_name}"));
                     let has_selection = self.selected.is_some() || !self.checked.is_empty();
                     let add_resp = ui
-                        .add_enabled(has_selection, egui::Button::new("追加先の本に追加"))
+                        .add_enabled(
+                            has_selection,
+                            egui::Button::new(&book_add_selection_menu_label),
+                        )
                         .hover_tip(if has_selection {
                             "選択中またはチェック済みの画像・ページを追加先の本へ追加"
                         } else {
@@ -2205,21 +2260,24 @@ impl App {
                         self.add_grid_selection_to_active_book(ctx);
                         ui.close();
                     }
-                    if ui.button("クリップボードの画像を本に追加").clicked() {
+                    if ui.button(&book_add_clipboard_menu_label).clicked() {
                         self.add_clipboard_image_to_active_book(ctx);
                         ui.close();
                     }
-                    if ui.button("本棚フォルダを開く").clicked() {
+                    if ui.button(&book_open_root_menu_label).clicked() {
                         self.open_books_root();
                         ui.close();
                     }
-                    if ui.button("追加先の本を開く").clicked() {
+                    if ui.button(&book_open_active_menu_label).clicked() {
                         fav_nav = Some(self.active_book_folder_path());
                         ui.close();
                     }
                     let can_reorder_book = self.current_folder_is_book_folder();
                     let reorder_resp = ui
-                        .add_enabled(can_reorder_book, egui::Button::new("この本を並べ替え…"))
+                        .add_enabled(
+                            can_reorder_book,
+                            egui::Button::new(&book_reorder_menu_label),
+                        )
                         .hover_tip(if can_reorder_book {
                             "現在開いている本のページ順を変更"
                         } else {
@@ -2230,7 +2288,7 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("製本の管理…").clicked() {
+                    if ui.button(&book_manage_menu_label).clicked() {
                         self.show_book_manager = true;
                         self.book_manager_rename_name = active_name.clone();
                         self.book_list_cache = None;
@@ -2275,7 +2333,7 @@ impl App {
                     if ui
                         .add_enabled(
                             can_apply_to_selected,
-                            egui::Button::new("この動画をアップスケール登録…"),
+                            egui::Button::new(&video_register_upscale_menu_label),
                         )
                         .clicked()
                     {
@@ -2287,7 +2345,7 @@ impl App {
                     if ui
                         .add_enabled(
                             can_apply_to_selected,
-                            egui::Button::new("この動画のアップスケールを削除"),
+                            egui::Button::new(&video_delete_upscale_menu_label),
                         )
                         .clicked()
                     {
@@ -2297,7 +2355,7 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("アップスケールタスク表示").clicked() {
+                    if ui.button(&video_show_upscale_tasks_menu_label).clicked() {
                         self.show_video_upscale_tasks = true;
                         ui.close();
                     }
@@ -2519,7 +2577,7 @@ impl App {
                         });
                     }
                     ui.separator();
-                    if ui.button("サムネイルキャッシュ管理").clicked() {
+                    if ui.button(&settings_thumbnail_cache_menu_label).clicked() {
                         let cache_dir = crate::catalog::default_cache_dir();
                         // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
                         // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
@@ -2537,25 +2595,25 @@ impl App {
                         self.show_cache_manager = true;
                         ui.close();
                     }
-                    if ui.button("変換済みアーカイブキャッシュ管理").clicked() {
+                    if ui.button(&settings_archive_cache_menu_label).clicked() {
                         self.open_archive_cache_manager();
                         ui.close();
                     }
-                    if ui.button("サムネイル画質…").clicked() {
+                    if ui.button(&settings_thumbnail_quality_menu_label).clicked() {
                         self.open_thumb_quality_dialog(ctx);
                         ui.close();
                     }
-                    if ui.button("統計…").clicked() {
+                    if ui.button(&settings_stats_menu_label).clicked() {
                         self.show_stats_dialog = true;
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("回転情報をリセット…").clicked() {
+                    if ui.button(&settings_reset_rotation_menu_label).clicked() {
                         self.show_rotation_reset_confirm = true;
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("設定の復元…").clicked() {
+                    if ui.button(&settings_restore_menu_label).clicked() {
                         // 2026-05-17: settings.db のバックアップから復元する UI。
                         // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
                         // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
@@ -2570,7 +2628,7 @@ impl App {
                     ui.menu_button("ツールバー", |ui| {
                         self.draw_toolbar_visibility_menu(ui, true);
                     });
-                    if ui.button("環境設定…").clicked() {
+                    if ui.button(&settings_preferences_menu_label).clicked() {
                         self.show_preferences = true;
                         ui.close();
                     }
@@ -2582,13 +2640,13 @@ impl App {
                 top_menu_responses.push(response.response);
 
                 let response = ui.menu_button("ヘルプ", |ui| {
-                    if ui.button("ヘルプサイトを開く").clicked() {
+                    if ui.button(&help_open_manual_menu_label).clicked() {
                         let url = crate::ui_helpers::manual_url("index.html", None);
                         crate::ui_helpers::open_url(&url);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("ログフォルダを開く").clicked() {
+                    if ui.button(&help_open_logs_menu_label).clicked() {
                         let dir = crate::data_dir::logs_dir();
                         let _ = std::fs::create_dir_all(&dir);
                         crate::ui_helpers::open_external_player(&dir);
@@ -2611,7 +2669,7 @@ impl App {
                         ui.close();
                     }
                     if ui
-                        .button("重要な変更点を表示")
+                        .button(&help_show_whats_new_menu_label)
                         .on_hover_text("このバージョンの主な変更点をもう一度表示します")
                         .clicked()
                     {
@@ -2633,7 +2691,7 @@ impl App {
                         }
                         ui.close();
                     }
-                    if ui.button("バージョン情報").clicked() {
+                    if ui.button(&help_about_menu_label).clicked() {
                         self.show_about_dialog = true;
                         ui.close();
                     }

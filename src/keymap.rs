@@ -1186,7 +1186,11 @@ pub fn command_catalog() -> impl Iterator<Item = CommandSpec> {
 pub enum TopMenuId {
     File,
     Favorites,
+    Books,
+    Video,
     Tags,
+    Settings,
+    Help,
 }
 
 impl TopMenuId {
@@ -1194,7 +1198,11 @@ impl TopMenuId {
         match self {
             TopMenuId::File => "ファイル",
             TopMenuId::Favorites => "お気に入り",
+            TopMenuId::Books => "製本",
+            TopMenuId::Video => "動画",
             TopMenuId::Tags => "タグ",
+            TopMenuId::Settings => "設定",
+            TopMenuId::Help => "ヘルプ",
         }
     }
 }
@@ -1211,8 +1219,28 @@ pub enum MenuCommandId {
     FavoritesEdit,
     FavoritesFavSearch,
     FavoritesMetadataSearch,
+    BooksAddSelectionToActiveBook,
+    BooksAddClipboardImage,
+    BooksOpenRoot,
+    BooksOpenActiveBook,
+    BooksReorderCurrentBook,
+    BooksManage,
+    VideoRegisterUpscale,
+    VideoDeleteUpscale,
+    VideoShowUpscaleTasks,
     TagsManagePinned,
     TagsTagView,
+    SettingsThumbnailCache,
+    SettingsArchiveCache,
+    SettingsThumbnailQuality,
+    SettingsStats,
+    SettingsResetRotation,
+    SettingsRestoreSettings,
+    SettingsPreferences,
+    HelpOpenManual,
+    HelpOpenLogs,
+    HelpShowWhatsNew,
+    HelpAbout,
 }
 
 impl MenuCommandId {
@@ -1227,8 +1255,28 @@ impl MenuCommandId {
         Self::FavoritesEdit,
         Self::FavoritesFavSearch,
         Self::FavoritesMetadataSearch,
+        Self::BooksAddSelectionToActiveBook,
+        Self::BooksAddClipboardImage,
+        Self::BooksOpenRoot,
+        Self::BooksOpenActiveBook,
+        Self::BooksReorderCurrentBook,
+        Self::BooksManage,
+        Self::VideoRegisterUpscale,
+        Self::VideoDeleteUpscale,
+        Self::VideoShowUpscaleTasks,
         Self::TagsManagePinned,
         Self::TagsTagView,
+        Self::SettingsThumbnailCache,
+        Self::SettingsArchiveCache,
+        Self::SettingsThumbnailQuality,
+        Self::SettingsStats,
+        Self::SettingsResetRotation,
+        Self::SettingsRestoreSettings,
+        Self::SettingsPreferences,
+        Self::HelpOpenManual,
+        Self::HelpOpenLogs,
+        Self::HelpShowWhatsNew,
+        Self::HelpAbout,
     ];
 
     pub fn stable_name(self) -> &'static str {
@@ -1243,8 +1291,28 @@ impl MenuCommandId {
             MenuCommandId::FavoritesEdit => "FavoritesEdit",
             MenuCommandId::FavoritesFavSearch => "FavoritesFavSearch",
             MenuCommandId::FavoritesMetadataSearch => "FavoritesMetadataSearch",
+            MenuCommandId::BooksAddSelectionToActiveBook => "BooksAddSelectionToActiveBook",
+            MenuCommandId::BooksAddClipboardImage => "BooksAddClipboardImage",
+            MenuCommandId::BooksOpenRoot => "BooksOpenRoot",
+            MenuCommandId::BooksOpenActiveBook => "BooksOpenActiveBook",
+            MenuCommandId::BooksReorderCurrentBook => "BooksReorderCurrentBook",
+            MenuCommandId::BooksManage => "BooksManage",
+            MenuCommandId::VideoRegisterUpscale => "VideoRegisterUpscale",
+            MenuCommandId::VideoDeleteUpscale => "VideoDeleteUpscale",
+            MenuCommandId::VideoShowUpscaleTasks => "VideoShowUpscaleTasks",
             MenuCommandId::TagsManagePinned => "TagsManagePinned",
             MenuCommandId::TagsTagView => "TagsTagView",
+            MenuCommandId::SettingsThumbnailCache => "SettingsThumbnailCache",
+            MenuCommandId::SettingsArchiveCache => "SettingsArchiveCache",
+            MenuCommandId::SettingsThumbnailQuality => "SettingsThumbnailQuality",
+            MenuCommandId::SettingsStats => "SettingsStats",
+            MenuCommandId::SettingsResetRotation => "SettingsResetRotation",
+            MenuCommandId::SettingsRestoreSettings => "SettingsRestoreSettings",
+            MenuCommandId::SettingsPreferences => "SettingsPreferences",
+            MenuCommandId::HelpOpenManual => "HelpOpenManual",
+            MenuCommandId::HelpOpenLogs => "HelpOpenLogs",
+            MenuCommandId::HelpShowWhatsNew => "HelpShowWhatsNew",
+            MenuCommandId::HelpAbout => "HelpAbout",
         }
     }
 }
@@ -1327,6 +1395,60 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         action: Some(KeyAction::GlobalMetadataSearch),
     },
     MenuCommandSpec {
+        id: MenuCommandId::BooksAddSelectionToActiveBook,
+        parent: TopMenuId::Books,
+        label: "追加先の本に追加",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::BooksAddClipboardImage,
+        parent: TopMenuId::Books,
+        label: "クリップボードの画像を本に追加",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::BooksOpenRoot,
+        parent: TopMenuId::Books,
+        label: "本棚フォルダを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::BooksOpenActiveBook,
+        parent: TopMenuId::Books,
+        label: "追加先の本を開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::BooksReorderCurrentBook,
+        parent: TopMenuId::Books,
+        label: "この本を並べ替え…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::BooksManage,
+        parent: TopMenuId::Books,
+        label: "製本の管理…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::VideoRegisterUpscale,
+        parent: TopMenuId::Video,
+        label: "この動画をアップスケール登録…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::VideoDeleteUpscale,
+        parent: TopMenuId::Video,
+        label: "この動画のアップスケールを削除",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::VideoShowUpscaleTasks,
+        parent: TopMenuId::Video,
+        label: "アップスケールタスク表示",
+        action: None,
+    },
+    MenuCommandSpec {
         id: MenuCommandId::TagsManagePinned,
         parent: TopMenuId::Tags,
         label: "ピン留めタグの管理…",
@@ -1337,6 +1459,72 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::Tags,
         label: "タグビュー",
         action: Some(KeyAction::GridTagView),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsThumbnailCache,
+        parent: TopMenuId::Settings,
+        label: "サムネイルキャッシュ管理",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsArchiveCache,
+        parent: TopMenuId::Settings,
+        label: "変換済みアーカイブキャッシュ管理",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsThumbnailQuality,
+        parent: TopMenuId::Settings,
+        label: "サムネイル画質…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsStats,
+        parent: TopMenuId::Settings,
+        label: "統計…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsResetRotation,
+        parent: TopMenuId::Settings,
+        label: "回転情報をリセット…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsRestoreSettings,
+        parent: TopMenuId::Settings,
+        label: "設定の復元…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsPreferences,
+        parent: TopMenuId::Settings,
+        label: "環境設定…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::HelpOpenManual,
+        parent: TopMenuId::Help,
+        label: "ヘルプサイトを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::HelpOpenLogs,
+        parent: TopMenuId::Help,
+        label: "ログフォルダを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::HelpShowWhatsNew,
+        parent: TopMenuId::Help,
+        label: "重要な変更点を表示",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::HelpAbout,
+        parent: TopMenuId::Help,
+        label: "バージョン情報",
+        action: None,
     },
 ];
 
@@ -3875,6 +4063,51 @@ mod tests {
             keymap.menu_command_label(MenuCommandId::TagsManagePinned),
             "ピン留めタグの管理…"
         );
+        for (id, label) in [
+            (
+                MenuCommandId::BooksAddSelectionToActiveBook,
+                "追加先の本に追加",
+            ),
+            (
+                MenuCommandId::BooksAddClipboardImage,
+                "クリップボードの画像を本に追加",
+            ),
+            (MenuCommandId::BooksOpenRoot, "本棚フォルダを開く"),
+            (MenuCommandId::BooksOpenActiveBook, "追加先の本を開く"),
+            (MenuCommandId::BooksReorderCurrentBook, "この本を並べ替え…"),
+            (MenuCommandId::BooksManage, "製本の管理…"),
+            (
+                MenuCommandId::VideoRegisterUpscale,
+                "この動画をアップスケール登録…",
+            ),
+            (
+                MenuCommandId::VideoDeleteUpscale,
+                "この動画のアップスケールを削除",
+            ),
+            (
+                MenuCommandId::VideoShowUpscaleTasks,
+                "アップスケールタスク表示",
+            ),
+            (
+                MenuCommandId::SettingsThumbnailCache,
+                "サムネイルキャッシュ管理",
+            ),
+            (
+                MenuCommandId::SettingsArchiveCache,
+                "変換済みアーカイブキャッシュ管理",
+            ),
+            (MenuCommandId::SettingsThumbnailQuality, "サムネイル画質…"),
+            (MenuCommandId::SettingsStats, "統計…"),
+            (MenuCommandId::SettingsResetRotation, "回転情報をリセット…"),
+            (MenuCommandId::SettingsRestoreSettings, "設定の復元…"),
+            (MenuCommandId::SettingsPreferences, "環境設定…"),
+            (MenuCommandId::HelpOpenManual, "ヘルプサイトを開く"),
+            (MenuCommandId::HelpOpenLogs, "ログフォルダを開く"),
+            (MenuCommandId::HelpShowWhatsNew, "重要な変更点を表示"),
+            (MenuCommandId::HelpAbout, "バージョン情報"),
+        ] {
+            assert_eq!(keymap.menu_command_label(id), label);
+        }
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
             "現在地フィルタ (Ctrl+F)"
