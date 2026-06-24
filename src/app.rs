@@ -2999,6 +2999,8 @@ pub struct App {
     pub(crate) show_whats_new: bool,
     /// 表示する変更点エントリ (起動時の version またぎ / ヘルプ再表示で算出)。非永続。
     pub(crate) whats_new_entries: Vec<&'static crate::version_highlights::VersionHighlights>,
+    /// `?` キーで開く現在コンテキストのショートカット一覧。
+    pub(crate) show_context_shortcuts_help: bool,
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
     /// フルスクリーン右クリック判定用: 押下開始時刻と座標。
@@ -5601,6 +5603,7 @@ impl App {
             show_toolbar_reset_confirm: false,
             show_whats_new,
             whats_new_entries,
+            show_context_shortcuts_help: false,
             fs_secondary_press_start: None,
             fs_middle_zoom_drag: None,
             fs_context_menu_idx: None,
@@ -7128,6 +7131,7 @@ impl App {
             || self.show_preferences
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
+            || self.show_context_shortcuts_help
             || self.show_toolbar_reset_confirm
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -7169,6 +7173,7 @@ impl App {
             || self.show_preferences
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
+            || self.show_context_shortcuts_help
             || self.show_toolbar_reset_confirm
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -18410,6 +18415,11 @@ impl App {
             return None;
         }
 
+        if !self.ime_input_active() && Self::consume_context_shortcuts_help_key(ctx) {
+            self.show_context_shortcuts_help = true;
+            return None;
+        }
+
         if self
             .keymap
             .consume_action(ctx, KeyAction::GridToggleStackMode)
@@ -19355,6 +19365,23 @@ impl App {
         if let Some(cur) = current {
             self.spawn_folder_nav(cur, forward, mode);
         }
+    }
+
+    fn consume_context_shortcuts_help_key(ctx: &egui::Context) -> bool {
+        ctx.input_mut(|i| {
+            if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.mac_cmd || i.modifiers.command {
+                return false;
+            }
+            let mut found = false;
+            i.events.retain(|event| {
+                let consume = !found && matches!(event, egui::Event::Text(text) if text == "?");
+                if consume {
+                    found = true;
+                }
+                !consume
+            });
+            found
+        })
     }
 
     /// フォルダツリーペインのクリック/Enter ナビを worker scan 経由で開始する。
@@ -37563,6 +37590,7 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_whats_new_dialog(ctx);
+        self.show_context_shortcuts_dialog(ctx);
         self.show_toolbar_reset_confirm_dialog(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
         if !main_viewer_blocked {

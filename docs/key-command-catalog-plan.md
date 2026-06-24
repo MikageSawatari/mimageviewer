@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 7 コンテキストヘルプ基盤スライス実装中 / レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 7 グリッドヘルプ初期スライス実装中 / レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -63,11 +63,18 @@
 > `F1〜F6` / `Shift+F1〜F6` 表記を実 keymap 由来にした。既定割り当ては従来どおり範囲表記へ
 > 畳み、カスタム時は `1:Alt+F1 / ...` のように明示する。
 >
-> **Phase 7 コンテキストヘルプ基盤スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 7 コンテキストヘルプ基盤スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `CommandDisplayRow` と `Keymap::command_display_rows_for_active_scopes()` を追加し、呼び出し側が
 > 渡した active scope に対して、`CommandSpec` と実 keymap 由来の shortcut label 一覧を取得できる
 > 純ロジックを用意する。未割り当て / `none` の Action は通常非表示、必要な場合だけ空 shortcut
 > 行として含められる。`?` ヘルプ UI、dispatch、メニュー構成変更はまだ行わない。
+>
+> **Phase 7 グリッドヘルプ初期スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> グリッド文脈に限り、固定 `?` キーで「ショートカット」ダイアログを開く。Keymap 化済み操作は
+> `GRID_ACTIVE_SCOPES` + `CommandDisplayRow` から実 effective chord を表示し、Enter / Backspace /
+> 矢印 / F11 など当面固定扱いのグリッド操作は補助行として表示する。テキスト入力・IME・既存
+> ダイアログ・フルスクリーン中は誤発火させない。画像 / 動画フルスクリーン、編集モード、
+> `?` 自体の KeyAction 化は後続。
 
 ## 1. 背景と狙い
 
@@ -481,10 +488,13 @@ pub enum BindingPolicy {
 
 実装内容:
 
-- **基盤スライス実装中**: `CommandDisplayRow` と
+- **基盤スライス実装済み**: `CommandDisplayRow` と
   `Keymap::command_display_rows_for_active_scopes()` で、active scope に属する
   `CommandSpec` と effective chord の表示ラベルを取り出せるようにする。UI はまだ作らず、
   dispatch も変えない。
+- **グリッドヘルプ初期スライス実装中**: `?` を固定ヘルプキーとして扱い、グリッド文脈だけ
+  「ショートカット」ダイアログを開く。keymap 化済み操作は実割り当てから表示し、Enter /
+  Backspace / 矢印など予約・固定扱いの操作は補助行で表示する。
 - `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
   消しゴム / 隠蔽加工 / テキスト注釈など) で有効なショートカット一覧を表示する。
 - 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。
@@ -500,7 +510,7 @@ pub enum BindingPolicy {
 - 現在コンテキストで発火しない操作を混ぜず、Global / FsCommon / 編集モード固有操作の重なりを
   active scope から説明できる。
 - テキスト入力・IME 変換・ダイアログ操作中に `?` が誤発火しない。
-- ヘルプ UI はリリース中の通常操作を阻害せず、Esc / クリック外し等で閉じられる。
+- ヘルプ UI はリリース中の通常操作を阻害せず、Esc / 閉じるボタン / ウィンドウの × で閉じられる。
 
 ## 7. 初回リリースの詳細タスク
 
