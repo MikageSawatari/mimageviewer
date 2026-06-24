@@ -2857,6 +2857,9 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) native_overlay_shortcut_tags_cache:
         Option<std::sync::Arc<[crate::video::native_presenter::NativeOverlayTagDef]>>,
+    #[cfg(windows)]
+    pub(crate) native_overlay_shortcut_help_cache:
+        Option<std::sync::Arc<crate::video::native_presenter::NativeOverlayShortcutHelp>>,
     pub(crate) fullscreen_tag_picker_open: bool,
     pub(crate) fullscreen_tag_picker_input: String,
     pub(crate) fullscreen_tag_picker_row_key: Option<String>,
@@ -5546,6 +5549,7 @@ impl App {
             native_overlay_tag_choices_cache: None,
             #[cfg(windows)]
             native_overlay_shortcut_tags_cache: None,
+            native_overlay_shortcut_help_cache: None,
             fullscreen_tag_picker_open: false,
             fullscreen_tag_picker_input: String::new(),
             fullscreen_tag_picker_row_key: None,

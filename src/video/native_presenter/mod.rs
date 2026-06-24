@@ -390,6 +390,9 @@ struct NativeEguiOverlay {
     /// (= ボタンクリックが seek bar / video HWND に抜ける、ホバー外側でカーソル形状が
     /// 戻らない、等の症状。Codex P2 #1 2026-05-24)。`None` ならダイアログ非表示または未描画。
     last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画したショートカットヘルプダイアログの actual rect。
+    /// `?` で開く中央モーダルも HUD HWND region に含めないと clip / click-through する。
+    last_drawn_shortcut_help_rect: Option<egui::Rect>,
     /// 直近 egui run で描画したゲームパッド X ピッカー overlay の actual rect。
     /// X ピッカーは App 側が入力を処理し、native overlay は表示専用だが、
     /// HUD HWND の region に含めないと SetWindowRgn で中央パネルがクリップされる。
@@ -406,6 +409,7 @@ struct NativeEguiOverlay {
     jump_entries: Vec<NativeOverlayJumpEntry>,
     bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: Option<NativeBulkBookmarkDialog>,
+    shortcut_help_open: bool,
     /// IME (日本語等の入力メソッド) 変換中フラグ。Preedit(非空) で true、
     /// Commit / Disabled / Preedit("") で false。Ctrl+V/C/X 等のショートカットを
     /// **composition 中のみ** 抑止するために参照する (commit 直後はすぐ通す方が
@@ -722,6 +726,7 @@ pub struct NativeOverlayMetadata {
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
     pub shortcuts: NativeOverlayShortcutLabels,
+    pub shortcut_help: Arc<NativeOverlayShortcutHelp>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -741,6 +746,25 @@ pub struct NativeOverlayShortcutLabels {
     pub tile_mode: Option<String>,
     pub bookmark: Option<String>,
     pub capture: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativeOverlayShortcutHelp {
+    pub sections: Vec<NativeOverlayShortcutHelpSection>,
+    pub unassigned: Vec<NativeOverlayShortcutHelpRow>,
+    pub fixed_rows: Vec<NativeOverlayShortcutHelpRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOverlayShortcutHelpSection {
+    pub title: String,
+    pub rows: Vec<NativeOverlayShortcutHelpRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOverlayShortcutHelpRow {
+    pub keys: String,
+    pub description: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1260,17 +1284,19 @@ impl NativeOverlayInputRouting {
                     // なり、Enter が App へ漏れて fullscreen close = 再生停止を誘発していた
                     // (動画タグ付与で Enter 確定 → 停止、の実害)。text_input_active で確実に塞ぐ。
                     false
+                } else if self.modal_dialog_active {
+                    // モーダル中は動画ショートカットを含めて App へ流さない
+                    // (B キーでブックマーク追加、Space で再生トグル等の暴発防止)。
+                    false
                 } else if native_video_fullscreen_shortcut_key(key) {
                     true
-                } else if self.modal_dialog_active {
-                    // モーダル中はショートカット以外のキーも App へ流さない
-                    // (B キーでブックマーク追加、X/C で comparison no-op 等の暴発防止)。
-                    false
                 } else {
                     !self.wants_keyboard_input
                 }
             }
-            NativeEvent::Text(_) | NativeEvent::Ime(_) => !self.wants_keyboard_input,
+            NativeEvent::Text(_) | NativeEvent::Ime(_) => {
+                !self.wants_keyboard_input && !self.modal_dialog_active
+            }
             // overlay が wheel を NavigateItem / TileColumnsDelta に変換済みなら、
             // 同じ raw wheel を App へ二重転送しない。
             // モーダル中はカーソルがダイアログ外の dark backdrop にあっても wheel を
@@ -3809,6 +3835,7 @@ impl NativeEguiOverlay {
             last_drawn_speed_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
+            last_drawn_shortcut_help_rect: None,
             last_drawn_ring_picker_rect: None,
             last_drawn_ring_guide_rect: None,
             hover_thumbnail: None,
@@ -3818,6 +3845,7 @@ impl NativeEguiOverlay {
             jump_entries: Vec::new(),
             bookmark_title_edit: None,
             bulk_bookmark_dialog: None,
+            shortcut_help_open: false,
             ime_composing: false,
             ime_last_event_at: None,
             tag_picker_open: false,
@@ -3951,6 +3979,16 @@ impl NativeEguiOverlay {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
+                if self.shortcut_help_open {
+                    if matches!(event, NativeEvent::KeyDown(_))
+                        && key.virtual_key == 0x1B
+                        && !key.repeat
+                    {
+                        self.shortcut_help_open = false;
+                        self.dirty = true;
+                    }
+                    return;
+                }
                 if !self.text_input_active() && native_video_fullscreen_shortcut_key(&key) {
                     return;
                 }
@@ -4030,6 +4068,14 @@ impl NativeEguiOverlay {
                 }
             }
             NativeEvent::Text(ch) => {
+                if self.shortcut_help_open {
+                    return;
+                }
+                if ch == '?' && self.can_open_shortcut_help() {
+                    self.shortcut_help_open = true;
+                    self.dirty = true;
+                    return;
+                }
                 self.pending_events.push(egui::Event::Text(ch.to_string()));
                 self.dirty = true;
             }
@@ -4093,8 +4139,9 @@ impl NativeEguiOverlay {
                 // 出ているときは、ホイールで前後の動画に飛ばない (テキストや ScrollArea の
                 // スクロールに使う、ユーザー報告 2026-05-24)。bookmark title 編集は単行で
                 // スクロール不要だが、誤って動画切替されないようにこちらも対象に含める。
-                let modal_dialog_visible =
-                    self.bulk_bookmark_dialog.is_some() || self.bookmark_title_edit.is_some();
+                let modal_dialog_visible = self.bulk_bookmark_dialog.is_some()
+                    || self.bookmark_title_edit.is_some()
+                    || self.shortcut_help_open;
                 if wheel.ctrl && self.tile_overlay.is_some() {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::TileColumnsDelta {
@@ -4729,6 +4776,7 @@ impl NativeEguiOverlay {
             || self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
             || self.bulk_bookmark_dialog.is_some()
+            || self.shortcut_help_open
             || self.toast.is_some()
             || self.video_error.is_some()
             || !self.first_frame_presented
@@ -4820,8 +4868,9 @@ impl NativeEguiOverlay {
         routing.consumed_wheel = consumed_wheel;
         // モーダル中央テキストダイアログの表示中は、App へ raw event を流さない
         // (Codex C1/C2/C3: dark backdrop 上の wheel/right-click が暴発する事故防止)。
-        routing.modal_dialog_active =
-            self.bulk_bookmark_dialog.is_some() || self.bookmark_title_edit.is_some();
+        routing.modal_dialog_active = self.bulk_bookmark_dialog.is_some()
+            || self.bookmark_title_edit.is_some()
+            || self.shortcut_help_open;
         Ok(NativeOverlayInputOutcome {
             routing,
             commands,
@@ -5167,6 +5216,26 @@ impl NativeEguiOverlay {
             }
         }
 
+        if self.shortcut_help_open {
+            let rect = self.last_drawn_shortcut_help_rect.unwrap_or_else(|| {
+                let (dialog_w, dialog_h) = self::overlay_draw::native_shortcut_help_dialog_size(
+                    width_points,
+                    height_points,
+                );
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        (width_points - dialog_w) * 0.5,
+                        (height_points - dialog_h) * 0.5,
+                    ),
+                    egui::vec2(dialog_w, dialog_h),
+                )
+            });
+            let rect_px = rect_to_px(rect.expand(2.0));
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // Normalize progress / scan blocker: 全画面被覆 (= scan 中はモーダル cancel ボタン操作のため)。
         if matches!(
             self.normalize_state.ui_state,
@@ -5252,6 +5321,16 @@ impl NativeEguiOverlay {
         self.bookmark_title_edit.is_some()
             || self.bulk_bookmark_dialog.is_some()
             || self.tag_picker_open
+    }
+
+    fn can_open_shortcut_help(&self) -> bool {
+        !self.text_input_active()
+            && !self.ime_input_active()
+            && !self.shortcut_help_open
+            && !matches!(
+                self.normalize_state.ui_state,
+                crate::video::normalize_types::NormalizeUiState::Scanning
+            )
     }
 
     fn ime_input_active(&self) -> bool {
@@ -5534,6 +5613,7 @@ impl NativeEguiOverlay {
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
         let shortcut_labels = video_metadata.as_ref().map(|metadata| &metadata.shortcuts);
+        let mut shortcut_help_open = self.shortcut_help_open;
         let fallback_file_name = self.fallback_file_name.clone();
         let navigation_preview = self.navigation_preview.clone();
         let navigation_preview_texture_id = self
@@ -5606,6 +5686,7 @@ impl NativeEguiOverlay {
             || toast_visible
             || bookmark_title_edit_visible
             || bulk_bookmark_dialog_visible
+            || shortcut_help_open
             || vst3_panel_visible
             || ring_picker_visible
             || ring_guide_visible
@@ -5637,6 +5718,7 @@ impl NativeEguiOverlay {
             || toast_visible
             || bookmark_title_edit_visible
             || bulk_bookmark_dialog_visible
+            || shortcut_help_open
             || vst3_panel_visible
             || ring_picker_visible
             || ring_guide_visible
@@ -5661,6 +5743,7 @@ impl NativeEguiOverlay {
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
+        let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_picker_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_guide_rect: Option<egui::Rect> = None;
         if !overlay_visible {
@@ -5747,6 +5830,19 @@ impl NativeEguiOverlay {
                         guide,
                     );
                 }
+                if shortcut_help_open {
+                    if let Some(metadata) = video_metadata.as_ref() {
+                        last_drawn_shortcut_help_rect = draw_native_shortcut_help_dialog(
+                            ctx,
+                            overlay_width_points,
+                            overlay_height_points,
+                            metadata.shortcut_help.as_ref(),
+                            &mut shortcut_help_open,
+                        );
+                    } else {
+                        shortcut_help_open = false;
+                    }
+                }
                 return;
             }
             if let Some(preview) = navigation_preview.as_ref() {
@@ -5777,6 +5873,19 @@ impl NativeEguiOverlay {
                         ppp,
                         guide,
                     );
+                }
+                if shortcut_help_open {
+                    if let Some(metadata) = video_metadata.as_ref() {
+                        last_drawn_shortcut_help_rect = draw_native_shortcut_help_dialog(
+                            ctx,
+                            overlay_width_points,
+                            overlay_height_points,
+                            metadata.shortcut_help.as_ref(),
+                            &mut shortcut_help_open,
+                        );
+                    } else {
+                        shortcut_help_open = false;
+                    }
                 }
                 return;
             }
@@ -5917,6 +6026,19 @@ impl NativeEguiOverlay {
                     &mut bulk_bookmark_dialog,
                     &mut commands,
                 );
+            }
+            if shortcut_help_open {
+                if let Some(metadata) = video_metadata.as_ref() {
+                    last_drawn_shortcut_help_rect = draw_native_shortcut_help_dialog(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        metadata.shortcut_help.as_ref(),
+                        &mut shortcut_help_open,
+                    );
+                } else {
+                    shortcut_help_open = false;
+                }
             }
             // Codex 4周目 P1: 旧コードは `if !bottom_hud_visible { return; }` で
             // 早期 return していたが、それだと bottom HUD 非表示時に下の
@@ -7400,12 +7522,14 @@ impl NativeEguiOverlay {
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
+        self.last_drawn_shortcut_help_rect = last_drawn_shortcut_help_rect;
         self.last_drawn_ring_picker_rect = last_drawn_ring_picker_rect;
         self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
+        self.shortcut_help_open = shortcut_help_open;
         self.maybe_claim_text_input_focus();
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
@@ -7524,7 +7648,8 @@ impl NativeEguiOverlay {
         }
         self.dirty = self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
-            || self.bulk_bookmark_dialog.is_some();
+            || self.bulk_bookmark_dialog.is_some()
+            || self.shortcut_help_open;
         log_event(
             "egui_overlay_present",
             &[
@@ -8225,6 +8350,8 @@ mod tests {
             ..Default::default()
         };
         assert!(!modal.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Right)));
+        assert!(!modal.should_forward_to_ui(&NativeVideoWindowEvent::Text('?')));
+        assert!(!modal.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
     }
 
     #[test]

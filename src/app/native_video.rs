@@ -1,5 +1,5 @@
 use super::*;
-use crate::keymap::KeyAction;
+use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
 
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
 ///
@@ -3766,6 +3766,118 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
+        match row.spec.action {
+            KeyAction::ToggleDetachedViewerMode
+            | KeyAction::FsToggleMetadata
+            | KeyAction::FsCtrlNavPrev
+            | KeyAction::FsCtrlNavNext
+            | KeyAction::FsSiblingPrev
+            | KeyAction::FsSiblingNext => true,
+            KeyAction::VideoCompareToggle
+            | KeyAction::VideoCompareCycle
+            | KeyAction::VideoCompareWipe
+            | KeyAction::VideoCompareDiff => false,
+            _ => matches!(row.spec.scope, CommandScope::Rating | CommandScope::FsVideo),
+        }
+    }
+
+    #[cfg(windows)]
+    fn build_native_overlay_shortcut_help(
+        &self,
+    ) -> crate::video::native_presenter::NativeOverlayShortcutHelp {
+        use crate::video::native_presenter::{
+            NativeOverlayShortcutHelp, NativeOverlayShortcutHelpRow,
+            NativeOverlayShortcutHelpSection,
+        };
+
+        const FIXED_ROWS: &[(&str, &str)] = &[
+            ("?", "このショートカット一覧を表示する"),
+            (
+                "Esc / Backspace",
+                "一覧へ戻る。タイルモード中の Esc は先にタイルモードを閉じる",
+            ),
+            (
+                "← / →",
+                "5秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
+            ),
+            (
+                "Shift+← / Shift+→",
+                "1秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
+            ),
+            (
+                "Ctrl+← / Ctrl+→",
+                "30秒戻る / 進む。タイルモード中はタイルカーソルを1行移動する",
+            ),
+            ("Ctrl+Shift+← / Ctrl+Shift+→", "1フレーム戻る / 進む"),
+            ("Home / End", "先頭または末尾の項目へ移動する"),
+            ("F11", "ウィンドウ内表示と全画面表示を切り替える"),
+            ("マウスホイール", "前または次の項目へ移動する"),
+            ("Ctrl+ホイール", "タイルモード中はタイル列数を変更する"),
+        ];
+
+        let rows = self
+            .keymap
+            .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, true)
+            .into_iter()
+            .filter(Self::native_video_help_includes_row)
+            .collect::<Vec<_>>();
+
+        let sections = FS_VIDEO_ACTIVE_SCOPES
+            .iter()
+            .filter_map(|scope| {
+                let section_rows = rows
+                    .iter()
+                    .filter(|row| row.spec.scope == *scope && !row.shortcut_labels.is_empty())
+                    .map(|row| NativeOverlayShortcutHelpRow {
+                        keys: row.shortcut_labels.join(" / "),
+                        description: row.spec.description().to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                (!section_rows.is_empty()).then(|| NativeOverlayShortcutHelpSection {
+                    title: scope.description().to_string(),
+                    rows: section_rows,
+                })
+            })
+            .collect();
+
+        let unassigned = rows
+            .iter()
+            .filter(|row| row.shortcut_labels.is_empty())
+            .map(|row| NativeOverlayShortcutHelpRow {
+                keys: row.spec.ini_name().to_string(),
+                description: row.spec.description().to_string(),
+            })
+            .collect();
+
+        let fixed_rows = FIXED_ROWS
+            .iter()
+            .map(|(keys, description)| NativeOverlayShortcutHelpRow {
+                keys: (*keys).to_string(),
+                description: (*description).to_string(),
+            })
+            .collect();
+
+        NativeOverlayShortcutHelp {
+            sections,
+            unassigned,
+            fixed_rows,
+        }
+    }
+
+    #[cfg(windows)]
+    fn cached_native_overlay_shortcut_help(
+        &mut self,
+    ) -> std::sync::Arc<crate::video::native_presenter::NativeOverlayShortcutHelp> {
+        if let Some(cached) = self.native_overlay_shortcut_help_cache.as_ref() {
+            return cached.clone();
+        }
+        let built = std::sync::Arc::new(self.build_native_overlay_shortcut_help());
+        self.native_overlay_shortcut_help_cache = Some(built.clone());
+        built
+    }
+
+    #[cfg(windows)]
     pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
         let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } => Some(player.path().clone()),
@@ -3782,6 +3894,7 @@ impl App {
         let tag_choices = self.cached_native_overlay_tag_choices();
         let shortcut_tags = self.cached_native_overlay_shortcut_tags();
         let shortcuts = self.native_overlay_shortcut_labels();
+        let shortcut_help = self.cached_native_overlay_shortcut_help();
 
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
@@ -3831,6 +3944,7 @@ impl App {
                 deinterlace_status,
                 interlace_detected,
                 shortcuts,
+                shortcut_help: shortcut_help.clone(),
             }
         } else {
             crate::video::native_presenter::NativeOverlayMetadata {
@@ -3862,6 +3976,7 @@ impl App {
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
                 shortcuts,
+                shortcut_help,
             }
         };
         player.set_native_metadata(Some(metadata));

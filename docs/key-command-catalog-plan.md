@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 7 egui 動画ヘルプ初期スライス実装済み / ClaudeCode レビュー済み** (2026-06-24)。
+> ステータス: **Phase 7 native 動画 overlay ヘルプスライス実装中 / レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -117,6 +117,14 @@
 > silent no-op として消費するだけなので、ヘルプには出さない。Esc / Backspace / シーク /
 > Home / End / F11 / ホイールなどの固定扱い入力は補助行へ分ける。native 動画 overlay 上で
 > 直接開くヘルプは後続スライスに残す。
+>
+> **Phase 7 native 動画 overlay ヘルプスライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> Windows native presenter 上でも `?` の Text イベントで動画フルスクリーン用ショートカット
+> ヘルプを開く。App 側で `NativeOverlayShortcutHelp` snapshot を作って `NativeOverlayMetadata`
+> に載せ、presenter は keymap を直接参照せず所有済み文字列だけを描画する。表示対象は
+> egui 動画ヘルプと同じく、動画中に実際に有効な `FsVideo` / 一部 `FsCommon` / `Rating` /
+> `ToggleDetachedViewerMode` に限定し、`VideoCompare*` は出さない。ヘルプ表示中は
+> presenter 内で Esc を閉じる操作として消費し、App 側へのキー・Text・ホイール転送を抑止する。
 
 ## 1. 背景と狙い
 
@@ -551,7 +559,11 @@ pub enum BindingPolicy {
   数値入力が keyboard focus を持つ場合は `?` を奪わない。
 - **egui 動画ヘルプ初期スライス実装済み**: egui 経路の動画フルスクリーンで `?` を押したとき、
   `FsVideo` scope と動画で有効な一部 `FsCommon` / `Rating` の実割り当て、固定シーク操作を
-  表示する。native 動画 overlay 上で直接開くヘルプは後続。
+  表示する。
+- **native 動画 overlay ヘルプスライス実装中**: Windows native presenter 上でも `?` を押したとき、
+  egui 動画ヘルプと同じ対象行を中央モーダルで表示する。snapshot は App 側で作成し、
+  presenter は所有済み文字列を描画する。ヘルプ表示中は Esc で閉じ、背面動画操作へキーを
+  漏らさない。
 - `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
   消しゴム / 隠蔽加工 / 補正レイヤー / テキスト注釈など) で有効なショートカット一覧を表示する。
 - 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。
@@ -593,7 +605,7 @@ pub enum BindingPolicy {
 - 消しゴム / 隠蔽加工の tool label。
 - `Shift+↑↓` スタックジャンプ。
 - plain 矢印、Esc、Enter。
-- native 動画 overlay 表示。
+- native 動画 overlay 表示 (shortcut label は Phase 5、`?` ヘルプは Phase 7 native スライスで対応)。
 - GUI 設定画面。
 
 ### 7.3 手動確認

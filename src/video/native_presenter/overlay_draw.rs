@@ -8,10 +8,11 @@ use super::{
     NativeBookmarkTitleEdit, NativeBulkBookmarkDialog, NativeFrameStepHold, NativeOverlayCommand,
     NativeOverlayJumpEntry, NativeOverlayMetadata, NativeOverlayNavigationPreview,
     NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayRingGuide,
-    NativeOverlayRingPicker, NativeOverlayShortcutLabels, NativeOverlayTagDef,
-    NativeOverlayThumbnail, NativeOverlayTileOverlay, NativeOverlayTimelineMarker,
-    NativeOverlayTimelineMarkerKind, NativeOverlayToast, NativeOverlayVst3ChainSlot,
-    NativeOverlayVst3Panel, NativeOverlayVst3Slot, NativeOverlayVst3SlotState,
+    NativeOverlayRingPicker, NativeOverlayShortcutHelp, NativeOverlayShortcutLabels,
+    NativeOverlayTagDef, NativeOverlayThumbnail, NativeOverlayTileOverlay,
+    NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind, NativeOverlayToast,
+    NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
+    NativeOverlayVst3SlotState,
 };
 
 const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
@@ -903,6 +904,174 @@ pub(super) fn native_bulk_bookmark_dialog_size(
         ((overlay_height_points - 64.0).min(720.0)).max(360.0)
     };
     (dialog_w, dialog_h)
+}
+
+pub(super) fn native_shortcut_help_dialog_size(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+) -> (f32, f32) {
+    let dialog_w = overlay_width_points.min(680.0).max(360.0);
+    let dialog_h = if overlay_height_points < 420.0 {
+        (overlay_height_points - 16.0).max(160.0)
+    } else {
+        ((overlay_height_points - 72.0).min(640.0)).max(360.0)
+    };
+    (dialog_w, dialog_h)
+}
+
+pub(super) fn draw_native_shortcut_help_dialog(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    help: &NativeOverlayShortcutHelp,
+    open: &mut bool,
+) -> Option<egui::Rect> {
+    if !*open {
+        return None;
+    }
+    let (dialog_w, dialog_h) =
+        native_shortcut_help_dialog_size(overlay_width_points, overlay_height_points);
+    let pos = egui::pos2(
+        (overlay_width_points - dialog_w) * 0.5,
+        (overlay_height_points - dialog_h) * 0.5,
+    );
+    let mut close_requested = false;
+    let scroll_max_h = (dialog_h - 104.0).max(120.0);
+
+    let area_response = egui::Area::new(egui::Id::new("native_video_shortcut_help_dialog"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
+                .corner_radius(egui::CornerRadius::same(5))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_min_width(dialog_w - 28.0);
+                    ui.set_max_width(dialog_w - 28.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("ショートカット")
+                                .size(15.0)
+                                .color(egui::Color32::from_rgb(238, 238, 238)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (close_rect, close_resp) = ui
+                                .allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                            draw_overlay_button_bg(
+                                ui.painter(),
+                                close_rect,
+                                close_resp.hovered(),
+                                false,
+                            );
+                            draw_overlay_close_icon(ui.painter(), close_rect);
+                            if close_resp.hover_tip_dark("閉じる").clicked() {
+                                close_requested = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("現在のコンテキスト: 動画フルスクリーン")
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(205)),
+                    );
+                    ui.add_space(6.0);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("native_video_shortcut_help_scroll")
+                        .max_height(scroll_max_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for section in &help.sections {
+                                if section.rows.is_empty() {
+                                    continue;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(&section.title)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(232, 232, 236)),
+                                );
+                                ui.add_space(2.0);
+                                egui::Grid::new((
+                                    "native_video_shortcut_help_section",
+                                    section.title.as_str(),
+                                ))
+                                .num_columns(2)
+                                .spacing([18.0, 4.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for row in &section.rows {
+                                        ui.monospace(&row.keys);
+                                        ui.label(&row.description);
+                                        ui.end_row();
+                                    }
+                                });
+                            }
+
+                            if !help.unassigned.is_empty() {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("キー未設定 / 無効化中")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(232, 232, 236)),
+                                );
+                                ui.label(
+                                    egui::RichText::new("左の名前は keymap.ini の Action 名です。")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_gray(190)),
+                                );
+                                ui.add_space(2.0);
+                                egui::Grid::new("native_video_shortcut_help_unassigned")
+                                    .num_columns(2)
+                                    .spacing([18.0, 4.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for row in &help.unassigned {
+                                            ui.monospace(&row.keys);
+                                            ui.label(&row.description);
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+
+                            if !help.fixed_rows.is_empty() {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("固定キー")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(232, 232, 236)),
+                                );
+                                ui.add_space(2.0);
+                                egui::Grid::new("native_video_shortcut_help_fixed")
+                                    .num_columns(2)
+                                    .spacing([18.0, 4.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for row in &help.fixed_rows {
+                                            ui.monospace(&row.keys);
+                                            ui.label(&row.description);
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    if ui.button("閉じる").clicked() {
+                        close_requested = true;
+                    }
+                });
+        });
+
+    if close_requested {
+        *open = false;
+    }
+    Some(area_response.response.rect)
 }
 
 /// 一括ブックマーク登録ダイアログ。中央モーダル。
