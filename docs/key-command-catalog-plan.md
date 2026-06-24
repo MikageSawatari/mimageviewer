@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 5 native 動画 overlay 表示スライスレビュー済み** (2026-06-24)。
+> ステータス: **Phase 5 レーティング tooltip 表示スライスレビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -56,6 +56,12 @@
 > 動画 top bar / bottom HUD / jump panel / seek hover thumbnail の KeyAction 由来 shortcut 表記を
 > この snapshot から表示する。`Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの
 > 入力は従来どおり。
+>
+> **Phase 5 レーティング tooltip 表示スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
+> `Keymap::first_rating_chord_label()` / `rating_chord_summary_label()` を追加し、★フィルタ
+> ボタン / スマートフィルタ内の★項目 / フォルダバー右側のコンテナ★ tooltip に出る
+> `F1〜F6` / `Shift+F1〜F6` 表記を実 keymap 由来にした。既定割り当ては従来どおり範囲表記へ
+> 畳み、カスタム時は `1:Alt+F1 / ...` のように明示する。
 
 ## 1. 背景と狙い
 
@@ -444,6 +450,9 @@ pub enum BindingPolicy {
 - **native 動画 overlay 表示スライス実装済み**: App 側で `NativeOverlayShortcutLabels` を作り、
   top bar / bottom HUD / jump panel / seek hover thumbnail の shortcut 表記を実 keymap 由来にした。
   `Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
+- **レーティング tooltip 表示スライス実装済み**: ★フィルタとフォルダバー右側のコンテナ★
+  tooltip に表示する `F1〜F6` / `Shift+F1〜F6` を、`RatingItem*` / `RatingContainer*`
+  の effective chord 由来にした。
 
 完了条件:
 

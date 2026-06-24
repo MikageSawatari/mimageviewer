@@ -34,6 +34,9 @@ Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に
 修飾付き chord や未割り当ての場合、パネル上の compact キー表記は省略する。
 メニューバーの検索 / タグビュー項目など一部のメニュー表示と hover text は、
 先頭 chord を `現在地フィルタ (Ctrl+F)` のように表示する。
+★フィルタボタン / スマートフィルタ内の★項目 / フォルダバー右側のコンテナ★ tooltip も、
+`RatingItem*` / `RatingContainer*` の実割り当てから `F1〜F6` / `Shift+F1〜F6` などの
+表示を作る。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
 popup の shortcut 表記は、`分析ツール [Shift+Z]` や `メタデータ [I / Tab]`
 のように実割り当てから作る。native 動画 overlay の top bar / bottom HUD / jump panel /

@@ -2703,6 +2703,74 @@ impl Keymap {
         bindings
     }
 
+    pub fn rating_key_action(container: bool, stars: u8) -> Option<KeyAction> {
+        rating_actions(container)
+            .iter()
+            .copied()
+            .find_map(|(action, action_stars)| (action_stars == stars).then_some(action))
+    }
+
+    pub fn first_rating_chord_label(&self, container: bool, stars: u8) -> Option<String> {
+        Self::rating_key_action(container, stars).and_then(|action| self.first_chord_label(action))
+    }
+
+    pub fn rating_chord_summary_label(&self, container: bool) -> Option<String> {
+        let labels = rating_actions(container)
+            .iter()
+            .copied()
+            .filter_map(|(action, stars)| {
+                self.first_chord_label(action).map(|label| (stars, label))
+            })
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            return None;
+        }
+
+        let expected = if container {
+            [
+                (1, "Shift+F1"),
+                (2, "Shift+F2"),
+                (3, "Shift+F3"),
+                (4, "Shift+F4"),
+                (5, "Shift+F5"),
+                (0, "Shift+F6"),
+            ]
+        } else {
+            [
+                (1, "F1"),
+                (2, "F2"),
+                (3, "F3"),
+                (4, "F4"),
+                (5, "F5"),
+                (0, "F6"),
+            ]
+        };
+        if labels.len() == expected.len()
+            && labels.iter().zip(expected).all(
+                |((stars, label), (expected_stars, expected_label))| {
+                    *stars == expected_stars && label == expected_label
+                },
+            )
+        {
+            let prefix = if container { "Shift+" } else { "" };
+            return Some(format!("{prefix}F1〜F6"));
+        }
+
+        Some(
+            labels
+                .into_iter()
+                .map(|(stars, label)| {
+                    if stars == 0 {
+                        format!("解除:{label}")
+                    } else {
+                        format!("{stars}:{label}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" / "),
+        )
+    }
+
     pub fn consume_rating_action(&self, ctx: &egui::Context, container: bool) -> Option<u8> {
         rating_actions(container)
             .iter()
@@ -3708,6 +3776,53 @@ mod tests {
         assert_eq!(keymap.consume_rating_action(&ctx, false), Some(1));
         assert_eq!(ctx.input(|i| i.events.len()), 0);
         let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn rating_shortcut_labels_follow_effective_chords() {
+        let keymap = Keymap::empty();
+        assert_eq!(
+            Keymap::rating_key_action(false, 0),
+            Some(KeyAction::RatingItemClear)
+        );
+        assert_eq!(
+            Keymap::rating_key_action(true, 5),
+            Some(KeyAction::RatingContainer5)
+        );
+        assert_eq!(
+            keymap.first_rating_chord_label(false, 3).as_deref(),
+            Some("F3")
+        );
+        assert_eq!(
+            keymap.first_rating_chord_label(true, 0).as_deref(),
+            Some("Shift+F6")
+        );
+        assert_eq!(
+            keymap.rating_chord_summary_label(false).as_deref(),
+            Some("F1〜F6")
+        );
+        assert_eq!(
+            keymap.rating_chord_summary_label(true).as_deref(),
+            Some("Shift+F1〜F6")
+        );
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Rating]
+            RatingItem3 = Ctrl+Alt+3
+            RatingContainer1 = Alt+F1
+            RatingContainerClear = none
+            "#,
+        );
+        assert_eq!(
+            keymap.first_rating_chord_label(false, 3).as_deref(),
+            Some("Ctrl+Alt+3")
+        );
+        assert_eq!(keymap.first_rating_chord_label(true, 0), None);
+        assert_eq!(
+            keymap.rating_chord_summary_label(true).as_deref(),
+            Some("1:Alt+F1 / 2:Shift+F2 / 3:Shift+F3 / 4:Shift+F4 / 5:Shift+F5")
+        );
     }
 
     #[test]

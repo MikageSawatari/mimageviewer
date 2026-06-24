@@ -11,7 +11,7 @@ use eframe::egui;
 
 use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget};
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::keymap::KeyAction;
+use crate::keymap::{KeyAction, Keymap};
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
     FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
@@ -269,14 +269,29 @@ fn rating_solo_with_unrated_menu_label(idx: usize) -> String {
     format!("★{} と未評価 (Ctrl+Shift+クリック)", idx)
 }
 
-fn rating_tooltip(idx: usize) -> String {
+fn rating_tooltip(keymap: &Keymap, idx: usize) -> String {
+    let shortcut = keymap.first_rating_chord_label(false, idx as u8);
     if idx == 0 {
-        "未評価を表示 [F6 で解除]\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: すべて表示"
-            .to_string()
-    } else {
+        let shortcut = shortcut
+            .map(|label| format!(" [{label} で解除]"))
+            .unwrap_or_default();
         format!(
-            "★{idx} を表示 [F{idx} で付与]\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} と未評価"
+            "未評価を表示{shortcut}\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: すべて表示"
         )
+    } else {
+        let shortcut = shortcut
+            .map(|label| format!(" [{label} で付与]"))
+            .unwrap_or_default();
+        format!(
+            "★{idx} を表示{shortcut}\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} と未評価"
+        )
+    }
+}
+
+fn folder_rating_tooltip(keymap: &Keymap) -> String {
+    match keymap.rating_chord_summary_label(true) {
+        Some(label) => format!("このフォルダ / ZIP / PDF のレーティング [{label}]"),
+        None => "このフォルダ / ZIP / PDF のレーティング".to_string(),
     }
 }
 
@@ -625,6 +640,7 @@ fn toolbar_section_fold_toggle(
 
 fn draw_rating_filter_button(
     ui: &mut egui::Ui,
+    keymap: &Keymap,
     rf: &mut [bool; 6],
     idx: usize,
     enabled: bool,
@@ -636,7 +652,7 @@ fn draw_rating_filter_button(
             enabled,
             egui::Button::selectable(sel, rating_button_label(idx)),
         )
-        .hover_tip(rating_tooltip(idx));
+        .hover_tip(rating_tooltip(keymap, idx));
     let mut changed = false;
     let mut assign: Option<RatingAssign> = None;
     if enabled && resp.clicked() {
@@ -4654,6 +4670,7 @@ impl App {
                     for idx in 0..6 {
                         let (changed, assign) = draw_rating_filter_button(
                             ui,
+                            &self.keymap,
                             &mut self.settings.rating_filter,
                             idx,
                             !aggregated_search && !rating_view_fixed,
@@ -6271,7 +6288,7 @@ impl App {
                         let text = format!("{} ({})", rating_button_label(idx), counts[idx]);
                         if ui
                             .checkbox(&mut selected, text)
-                            .on_hover_text(rating_tooltip(idx))
+                            .on_hover_text(rating_tooltip(&self.keymap, idx))
                             .changed()
                         {
                             self.settings.rating_filter[idx] = selected;
@@ -7732,7 +7749,7 @@ impl App {
                                     .color(egui::Color32::from_rgb(130, 170, 220))
                                     .strong(),
                             )
-                            .hover_tip("このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]");
+                            .hover_tip(folder_rating_tooltip(&self.keymap));
                             ui.add_space(4.0);
                         }
                         if let Some(count) = thumbnail_count.as_ref() {
