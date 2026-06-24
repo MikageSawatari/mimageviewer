@@ -485,8 +485,11 @@ Windows 向け高速サムネイルビューワー
 - 複数選択（Space / Ctrl+クリック）
 - 同名ファイル処理設定
 
-## ライセンス
+## ライセンス・作者
 
 [MIT License](LICENSE) — 無料でご利用いただけます。詳細は LICENSE ファイルを参照してください。
+
+**Copyright © 2026 SANO Taku (佐野 拓).** mImageViewer is developed and maintained by
+SANO Taku (online handle "Mikage Sawatari"), GitHub [@MikageSawatari](https://github.com/MikageSawatari).
 
 RAR 展開には RARLAB UnRAR source code を利用します。UnRAR のライセンス全文は [UNRAR-LICENSE.txt](UNRAR-LICENSE.txt) を参照してください。
