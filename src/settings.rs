@@ -2269,6 +2269,12 @@ pub struct Settings {
     #[serde(default)]
     pub toolbar_section_drag_enabled: bool,
 
+    // ── メニュー構成カスタマイズ ────────────────────────────────
+    /// トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF。
+    /// 空設定は catalog 既定順として解決する。描画への反映は menu layout resolver 経由。
+    #[serde(default)]
+    pub menu_layout: crate::keymap::MenuLayoutSettings,
+
     // ── フォルダサムネイル ──────────────────────────────────────
     /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
     #[serde(default = "default_folder_thumb_sort")]
@@ -3451,6 +3457,7 @@ impl Default for Settings {
             show_toolbar_sort: true,
             toolbar_section_new_row: Vec::new(),
             toolbar_section_drag_enabled: false,
+            menu_layout: crate::keymap::MenuLayoutSettings::default(),
             stack_separator: default_stack_separator(),
             stack_script_enabled: false,
             folder_thumb_sort: default_folder_thumb_sort(),
@@ -5142,6 +5149,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn menu_layout_defaults_to_catalog_order_when_missing() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.menu_layout,
+            crate::keymap::MenuLayoutSettings::default()
+        );
+        assert_eq!(
+            crate::keymap::resolve_menu_layout(&loaded.menu_layout),
+            crate::keymap::resolve_menu_layout(&crate::keymap::MenuLayoutSettings::default())
+        );
+    }
+
+    #[test]
+    fn menu_layout_roundtrips_in_settings_as_stable_names() {
+        let mut s = Settings::default();
+        s.menu_layout = crate::keymap::MenuLayoutSettings {
+            top_menu_order: vec!["Help".to_string(), "File".to_string()],
+            command_order: vec![crate::keymap::MenuCommandOrderSettings {
+                parent: "Help".to_string(),
+                commands: vec!["HelpAbout".to_string(), "HelpOpenManual".to_string()],
+            }],
+            hidden_commands: vec!["HelpOpenLogs".to_string()],
+        };
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("HelpAbout"));
+        assert!(!json.contains("ヘルプ"));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.menu_layout, s.menu_layout);
+    }
+
     // -- Settings defaults --
 
     #[test]
@@ -5237,6 +5276,7 @@ mod tests {
             s.toolbar_facet_filter_items,
             ToolbarFacetFilterItem::all().to_vec()
         );
+        assert_eq!(s.menu_layout, crate::keymap::MenuLayoutSettings::default());
         assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);

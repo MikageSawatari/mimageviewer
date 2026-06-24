@@ -2768,6 +2768,14 @@ mod tests {
             display_name: "Photoshop".to_string(),
             exe_path: r"C:\bin\ps.exe".to_string(),
         }];
+        s.menu_layout = crate::keymap::MenuLayoutSettings {
+            top_menu_order: vec!["Help".to_string(), "File".to_string()],
+            command_order: vec![crate::keymap::MenuCommandOrderSettings {
+                parent: "Help".to_string(),
+                commands: vec!["HelpAbout".to_string(), "HelpOpenManual".to_string()],
+            }],
+            hidden_commands: vec!["HelpOpenLogs".to_string()],
+        };
         s.vst3_plugins = vec![
             Vst3PluginEntry {
                 path: r"C:\vst3\eq.vst3".to_string(),
