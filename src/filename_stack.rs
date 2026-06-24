@@ -24,6 +24,10 @@ use std::path::{Path, PathBuf};
 use crate::grid_item::GridItem;
 use crate::settings::SortOrder;
 
+/// サブ展開ビューなど複数フォルダのメディアを 1 本の一覧に混ぜるとき、同じ prefix が
+/// 別フォルダ間で衝突しないようにする内部区切り。
+const PARENT_SCOPE_SEPARATOR: &str = "\u{1f}";
+
 /// グループ化対象の 1 メディア。
 #[derive(Clone, Debug, PartialEq)]
 pub struct StackMember {
@@ -111,6 +115,43 @@ pub fn group_media(media: Vec<StackMember>, separator: char, sort: SortOrder) ->
         })
         .collect();
     group_by_keys(media, &keys, sort)
+}
+
+/// 親フォルダをグループキーに混ぜた、組み込み prefix ルールのキー列を作る。
+///
+/// サブ展開ビューでは複数フォルダの画像が 1 本の一覧に混ざるため、通常の prefix だけで
+/// グループ化すると `post_p0.jpg` / `post_p1.jpg` が別フォルダ間で誤って同じスタックに
+/// 入ってしまう。ここでは `親フォルダ + prefix` を内部キーにして、同じ親フォルダ内だけで
+/// 畳まれるようにする。動画は `group_by_keys` 側で必ず単独化されるので任意キーでよい。
+pub fn parent_scoped_group_keys(media: &[StackMember], separator: char) -> Vec<String> {
+    media
+        .iter()
+        .map(|m| {
+            let stem = stem_of(&m.path);
+            let p = prefix_of(stem, separator);
+            let prefix = if p.is_empty() { stem } else { p };
+            parent_scoped_key_for_path(&m.path, prefix)
+        })
+        .collect()
+}
+
+/// 親フォルダでスコープした組み込み prefix スタック。
+pub fn group_media_by_parent(
+    media: Vec<StackMember>,
+    separator: char,
+    sort: SortOrder,
+) -> Vec<StackGroup> {
+    let keys = parent_scoped_group_keys(&media, separator);
+    group_by_keys(media, &keys, sort)
+}
+
+/// 任意のキーを親フォルダでスコープする。サブ展開時のスクリプト分類結果にも使う。
+pub fn parent_scoped_key_for_path(path: &Path, key: &str) -> String {
+    let parent_key = path
+        .parent()
+        .map(crate::adjustment_db::normalize_path)
+        .unwrap_or_default();
+    format!("{parent_key}{PARENT_SCOPE_SEPARATOR}{key}")
 }
 
 /// 既に算出済みのグループキー (`media` と同じ長さ) からグループを組み立てる。
@@ -389,6 +430,15 @@ mod tests {
         }
     }
 
+    fn img_at(folder: &str, name: &str) -> StackMember {
+        StackMember {
+            path: PathBuf::from(format!(r"C:\dl\{folder}\{name}")),
+            mtime: 0,
+            size: 0,
+            is_video: false,
+        }
+    }
+
     fn img_dated(name: &str, mtime: i64) -> StackMember {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
@@ -515,6 +565,23 @@ mod tests {
         assert_eq!(stack.count(), 2);
         // 動画グループはスタックでない。
         assert!(groups.iter().any(|g| !g.is_stack() && g.count() == 1));
+    }
+
+    #[test]
+    fn parent_scoped_grouping_does_not_merge_same_prefix_across_folders() {
+        let media = vec![
+            img_at("a", "post_p0.jpg"),
+            img_at("a", "post_p1.jpg"),
+            img_at("b", "post_p0.jpg"),
+            img_at("b", "post_p1.jpg"),
+        ];
+        let groups = group_media_by_parent(media, '_', SortOrder::FileName);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| g.is_stack()));
+        assert!(groups.iter().all(|g| g.key.ends_with("post")));
+        assert_ne!(groups[0].key, groups[1].key);
+        assert_eq!(member_names(&groups[0]), vec!["post_p0.jpg", "post_p1.jpg"]);
+        assert_eq!(member_names(&groups[1]), vec!["post_p0.jpg", "post_p1.jpg"]);
     }
 
     #[test]

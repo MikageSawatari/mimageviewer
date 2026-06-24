@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
-use rhai::{Dynamic, Engine, Scope};
+use rhai::{AST, Dynamic, Engine, Scope};
 
 use crate::filename_stack::StackMember;
 
@@ -38,6 +38,42 @@ pub struct GroupingResult {
     pub keys: Vec<String>,
     /// 採用ルールの表示名 (script が `#{ rule, keys }` を返した場合)。トースト用。
     pub rule: Option<String>,
+}
+
+/// コンパイル済みスタックスクリプト。
+///
+/// サブ展開ビューでは親フォルダごとに同じ `group(files)` を呼ぶため、フォルダごとに
+/// コンパイルし直さず AST を使い回す。
+pub struct CompiledStackScript {
+    engine: Engine,
+    ast: AST,
+}
+
+impl CompiledStackScript {
+    pub fn compile(source: &str, cancel: Arc<AtomicBool>) -> Result<Self, String> {
+        let mut engine = build_engine();
+        // 数万 op ごとにキャンセルを確認する (per-op で atomic load すると interpreter が重く
+        // なるので下位ビットでマスクして間引く)。`Some(..)` を返すと Rhai が ErrorTerminated で
+        // 即座に評価を打ち切る。
+        {
+            let cancel = Arc::clone(&cancel);
+            engine.on_progress(move |ops| {
+                if ops & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
+                    Some(Dynamic::UNIT) // 中断
+                } else {
+                    None
+                }
+            });
+        }
+        let ast = engine
+            .compile(source)
+            .map_err(|e| format!("スクリプトのコンパイルに失敗: {e}"))?;
+        Ok(Self { engine, ast })
+    }
+
+    pub fn group_keys(&self, media: &[StackMember]) -> Result<GroupingResult, String> {
+        run_group_function(&self.engine, &self.ast, media)
+    }
 }
 
 /// ユーザースクリプトのパス (`<data_dir>/stack_rules.rhai`)。
@@ -228,24 +264,15 @@ pub fn group_keys_cancellable(
     source: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<GroupingResult, String> {
-    let mut engine = build_engine();
-    // 数万 op ごとにキャンセルを確認する (per-op で atomic load すると interpreter が重く
-    // なるので下位ビットでマスクして間引く)。`Some(..)` を返すと Rhai が ErrorTerminated で
-    // 即座に評価を打ち切る。
-    {
-        let cancel = Arc::clone(&cancel);
-        engine.on_progress(move |ops| {
-            if ops & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
-                Some(Dynamic::UNIT) // 中断
-            } else {
-                None
-            }
-        });
-    }
-    let ast = engine
-        .compile(source)
-        .map_err(|e| format!("スクリプトのコンパイルに失敗: {e}"))?;
+    let script = CompiledStackScript::compile(source, cancel)?;
+    script.group_keys(media)
+}
 
+fn run_group_function(
+    engine: &Engine,
+    ast: &AST,
+    media: &[StackMember],
+) -> Result<GroupingResult, String> {
     // 呼び出し側 (spawn_stack_script_worker) が **画像のみ** を渡す。フォルダ/ZIP/PDF は
     // passthrough、動画は常に単独なので、スクリプトには画像しか来ない (= is_video は公開しない)。
     let files: rhai::Array = media
@@ -263,7 +290,7 @@ pub fn group_keys_cancellable(
 
     let mut scope = Scope::new();
     let result: Dynamic = engine
-        .call_fn(&mut scope, &ast, "group", (files,))
+        .call_fn(&mut scope, ast, "group", (files,))
         .map_err(|e| format!("スクリプトの実行に失敗: {e}"))?;
 
     // 戻り値は keys 配列、または #{ rule, keys } マップ。

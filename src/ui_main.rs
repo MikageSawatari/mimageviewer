@@ -7123,6 +7123,9 @@ impl App {
     }
 
     fn facet_ai_model_counts(&mut self) -> BTreeMap<String, usize> {
+        if let Some(counts) = self.facet_ai_model_counts_cache.as_ref() {
+            return counts.clone();
+        }
         let perf_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let indices = self.facet_candidate_indices(FacetField::AiModel);
         let candidate_count = indices.len();
@@ -7148,10 +7151,14 @@ impl App {
                 ],
             );
         }
+        self.facet_ai_model_counts_cache = Some(counts.clone());
         counts
     }
 
     fn facet_ai_tool_counts(&mut self) -> BTreeMap<String, usize> {
+        if let Some(counts) = self.facet_ai_tool_counts_cache.as_ref() {
+            return counts.clone();
+        }
         let perf_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let indices = self.facet_candidate_indices(FacetField::AiTool);
         let candidate_count = indices.len();
@@ -7178,6 +7185,7 @@ impl App {
                 ],
             );
         }
+        self.facet_ai_tool_counts_cache = Some(counts.clone());
         counts
     }
 

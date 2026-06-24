@@ -71,7 +71,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   既存の★フィルタ、タグ、詳細表示、場所 facet、画像色フィルタ、Ctrl+F 現在地フィルタは実パス item に対して使える。
   画像色フィルタは画像だけを対象にし、大量件数では通常フォルダと同じ確認ゲートを挟む。表示順は現在のソート設定に従い、
   同値は root 相対の親フォルダとフルパスで安定化する。ソート変更時は保持中の
-  スナップショットをメモリ内で再ソートし、ファイルシステムは再走査しない。
+  スナップショットをメモリ内で再ソートし、ファイルシステムは再走査しない。サブ展開ビュー上でも
+  `スタック` トグルを使える。この場合は親フォルダ単位で分類し、別フォルダの同名 prefix や
+  先頭連番が 1 つのスタックに混ざらないようにする。
 
 ### 2.2 フォルダバー
 
@@ -107,7 +109,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   `サブ展開の表示を準備中...` を表示してから一覧を差し替える。
   サブ展開中にボタンを押す、
   `Backspace` / ⬆ で戻る、または親へ戻る遷移が発生した場合は root の通常フォルダ表示へ戻る。
-  `Ctrl+↑/↓` と `Ctrl+PageUp/PageDown` は実フォルダ DFS へ落とさず no-op にする
+  `Ctrl+↑/↓` と `Ctrl+PageUp/PageDown` は実フォルダ DFS へ落とさず no-op にする。
+  展開後は `スタック` トグルでフォルダをまたいだ一覧を親フォルダ単位のスタック集約にできる
 - **場所▼ メニュー**: ドライブ一覧 / 読書履歴 / レーティング / 本棚フォルダ / デスクトップ /
   ピクチャ / ダウンロード / 利用可能なドライブ (`C:\` など) へ移動する。
   既知フォルダは Windows Known Folder API を優先し、
@@ -1268,8 +1271,9 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
   `nav.sli_prewarm_rating` /
   `nav.sli_prewarm_tags` / `nav.sli_rebuild_visible_indices` に分けて記録する。AI モデル facet
   の遅延メタデータ読込は `details_meta.load_start` / `load_done` / `ai_item_slow`、
+  `ai_total_ms` / `ai_permit_wait_ms` / `ai_extract_ms`、
   メニュー件数集計は `ui.facet_ai_model_counts_build` / `ui.facet_ai_tool_counts_build`
-  に記録する。
+  に記録する。AI facet 件数は表示集合と遅延メタキャッシュが変わるまでメモリキャッシュする。
 - **環境設定「開発者」タブ** (`PreferencesPage::Developer`): 上記 `perf_log_enabled`
   のトグルと、「ログを zip にする」ボタンを置く。
 - **診断 zip 書き出し** (`diagnostics.rs` `export_diagnostics_zip`): logs ディレクトリの

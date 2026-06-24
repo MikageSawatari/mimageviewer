@@ -15,6 +15,7 @@
 //! スレッドを起動するため必ずフォルダ読込を通す)。集約⇔フラットの切替は in-memory
 //! (`swap_stack_view_items` = install_new_items + 軽量ビュー切替後始末)。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,8 @@ pub(crate) struct StackScriptPending {
     existing_keys: std::collections::HashSet<String>,
     /// フォルダ signature (同期パスと同じく `start_loading_items` へ渡す)。
     folder_signature: Option<u64>,
+    /// サブ展開ビュー向け: 親フォルダ単位でスクリプト分類し、別フォルダの同名 prefix を混ぜない。
+    group_per_parent: bool,
 }
 
 /// 通常フォルダの items から、集約に必要な材料 (passthrough / passthrough_metas / media) を
@@ -112,6 +115,72 @@ pub(crate) fn stack_video_items(
         .collect()
 }
 
+fn stack_script_keys_for_images(
+    images: &[StackMember],
+    source: &str,
+    cancel: Arc<AtomicBool>,
+    group_per_parent: bool,
+) -> Result<(Vec<String>, Option<String>), String> {
+    if !group_per_parent {
+        return crate::filename_stack_script::group_keys_cancellable(images, source, cancel)
+            .map(|r| (r.keys, r.rule));
+    }
+
+    let script =
+        crate::filename_stack_script::CompiledStackScript::compile(source, Arc::clone(&cancel))?;
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, image) in images.iter().enumerate() {
+        let parent_key = image
+            .path
+            .parent()
+            .map(crate::adjustment_db::normalize_path)
+            .unwrap_or_default();
+        if !buckets.contains_key(&parent_key) {
+            order.push(parent_key.clone());
+        }
+        buckets.entry(parent_key).or_default().push(idx);
+    }
+
+    let mut keys = vec![String::new(); images.len()];
+    let mut rule: Option<String> = None;
+    let mut mixed_rule = false;
+    for parent_key in order {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("キャンセルされました".to_string());
+        }
+        let Some(indices) = buckets.get(&parent_key) else {
+            continue;
+        };
+        let scoped_images: Vec<StackMember> =
+            indices.iter().map(|&idx| images[idx].clone()).collect();
+        let result = script.group_keys(&scoped_images)?;
+        match result.rule {
+            Some(next) => match rule.as_ref() {
+                None => rule = Some(next),
+                Some(current) if current == &next => {}
+                Some(_) => mixed_rule = true,
+            },
+            None => {}
+        }
+        for (&image_idx, key) in indices.iter().zip(result.keys.into_iter()) {
+            if let Some(slot) = keys.get_mut(image_idx) {
+                *slot = crate::filename_stack::parent_scoped_key_for_path(
+                    &images[image_idx].path,
+                    &key,
+                );
+            }
+        }
+    }
+
+    let rule = if mixed_rule {
+        Some("親フォルダ別".to_string())
+    } else {
+        rule
+    };
+    Ok((keys, rule))
+}
+
 impl crate::app::App {
     /// 進行中のスタックスクリプトワーカーをキャンセルして破棄する。
     pub(crate) fn cancel_stack_script_pending(&mut self) {
@@ -138,6 +207,7 @@ impl crate::app::App {
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<u64>,
         script_enabled: bool,
+        group_per_parent: bool,
     ) {
         // 動画はルール判定に渡さない (常に単独)。画像だけをスクリプトへ。
         let image_indices: Vec<usize> = media
@@ -159,12 +229,12 @@ impl crate::app::App {
                 } else {
                     crate::filename_stack_script::DEFAULT_SCRIPT.to_string()
                 };
-                let result = crate::filename_stack_script::group_keys_cancellable(
+                let result = stack_script_keys_for_images(
                     &images,
                     &source,
                     Arc::clone(&cancel_w),
-                )
-                .map(|r| (r.keys, r.rule));
+                    group_per_parent,
+                );
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
@@ -183,6 +253,7 @@ impl crate::app::App {
             image_indices,
             existing_keys,
             folder_signature,
+            group_per_parent,
         });
     }
 
@@ -246,6 +317,7 @@ impl crate::app::App {
             folder,
             existing_keys,
             folder_signature,
+            group_per_parent,
             ..
         } = pending;
         let (groups, rule, err) = match result {
@@ -268,7 +340,11 @@ impl crate::app::App {
                     "stack script failed (async), fallback to builtin: {e}"
                 ));
                 (
-                    crate::filename_stack::group_media(media, separator, sort),
+                    if group_per_parent {
+                        crate::filename_stack::group_media_by_parent(media, separator, sort)
+                    } else {
+                        crate::filename_stack::group_media(media, separator, sort)
+                    },
                     None,
                     Some(e),
                 )
@@ -324,15 +400,17 @@ impl crate::app::App {
         }
     }
 
-    /// スタックモードのトグルが使える状況か (= 実ディレクトリの通常表示)。
-    /// ZIP ツリー / PDF ページ一覧 / 検索 / タグ / 読書履歴 / ドライブ一覧などの特殊・仮想
-    /// ビューでは無効。
+    /// スタックモードのトグルが使える状況か。
+    /// 通常フォルダ、またはサブ展開スナップショット表示で有効。ZIP ツリー / PDF ページ一覧 /
+    /// 検索 / タグ / 読書履歴 / ドライブ一覧などの特殊・仮想ビューでは無効。
     pub(crate) fn stack_mode_available(&self) -> bool {
-        // `current_folder_last_mtime` は実ディレクトリのときだけ `Some` (load_folder で
-        // `.filter(|m| m.is_dir())` 済み)。ZIP / PDF / 検索合成は仮想フォルダで常に `None` なので、
-        // これ 1 つで PDF ページ一覧 (current_folder が PDF ファイルを指す) を確実に除外できる。
-        self.current_folder_last_mtime.is_some()
-            && self.current_folder.is_some()
+        let regular_folder = self.current_folder_last_mtime.is_some();
+        let subfolder_expansion = self.items_are_subfolder_expansion_view
+            && self.subfolder_expansion_snapshot.is_some()
+            && self.subfolder_expansion_pending.is_none()
+            && self.subfolder_expansion_install_pending.is_none();
+        self.current_folder.is_some()
+            && (regular_folder || subfolder_expansion)
             && self.zip_nav.is_none()
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
@@ -374,7 +452,11 @@ impl crate::app::App {
     /// (folder_changes=false なので `stack_mode_requested` は維持される)。
     pub(crate) fn toggle_stack_mode(&mut self) {
         if !self.stack_mode_available() {
-            self.show_feedback_toast("スタック表示は通常フォルダでのみ使えます".into());
+            self.show_feedback_toast("スタック表示は通常フォルダまたはサブ展開で使えます".into());
+            return;
+        }
+        if self.items_are_subfolder_expansion_view {
+            self.toggle_subfolder_stack_mode();
             return;
         }
         let Some(folder) = self.current_folder.clone() else {
@@ -421,6 +503,76 @@ impl crate::app::App {
                 self.show_feedback_toast(format!("スタック: 「{rule}」でまとめました"));
             }
         }
+    }
+
+    /// サブ展開ビュー上でスタック表示を切り替える。
+    ///
+    /// ON: 現在のサブ展開一覧を親フォルダ単位で分類し、同じ合成ビューに集約セルを表示する。
+    /// OFF: 保持済みスナップショットを再インストールして、サブ展開のフラット一覧へ戻す。
+    fn toggle_subfolder_stack_mode(&mut self) {
+        let target = self.current_selected_representative_path();
+        self.cancel_stack_script_pending();
+        self.stack_active_rule = None;
+        self.stack_script_error = None;
+
+        if self.stack_mode_requested {
+            self.stack_mode_requested = false;
+            self.stack_toggle_select_path = None;
+            self.stack_view = None;
+            self.stack_showing_flat = false;
+            if self.reinstall_subfolder_expansion_snapshot() {
+                if let Some(target) = target
+                    && let Some(idx) = self.items.iter().position(|item| match item {
+                        GridItem::Image(path) | GridItem::Video(path) => {
+                            crate::folder_tree::path_eq(path, &target)
+                        }
+                        _ => false,
+                    })
+                {
+                    self.selected = Some(idx);
+                    self.scroll_to_selected = true;
+                }
+            } else if let Some(root) = self.subfolder_expansion_root.clone() {
+                let roots = if self.subfolder_expansion_roots.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    self.subfolder_expansion_roots.clone()
+                };
+                self.start_subfolder_expansion_scan_roots(root, roots);
+            }
+            return;
+        }
+
+        if self.subfolder_expansion_snapshot.is_none() {
+            self.show_feedback_toast("サブ展開のスナップショットがありません".into());
+            return;
+        }
+
+        let (passthrough, passthrough_metas, media) =
+            extract_stack_parts(&self.items, &self.image_metas, 0);
+        self.stack_mode_requested = true;
+        self.stack_toggle_select_path = target;
+        self.stack_showing_flat = false;
+        self.stack_view = None;
+        let sort_path = self
+            .subfolder_expansion_root
+            .as_deref()
+            .or(self.current_folder.as_deref());
+        let sort = sort_path
+            .map(|path| self.book_sort_order_for_path(path))
+            .unwrap_or(self.settings.sort_order);
+        self.spawn_stack_script_worker(
+            crate::app::subfolder_expansion_synthetic_path(),
+            passthrough,
+            passthrough_metas,
+            media,
+            self.settings.stack_separator,
+            sort,
+            std::collections::HashSet::new(),
+            None,
+            self.settings.stack_script_enabled,
+            true,
+        );
     }
 
     /// 集約グリッドでメディアセル (スタック / 単独画像 / 動画) を開いたとき、フラット読書
@@ -567,5 +719,48 @@ impl crate::app::App {
         // ★ visible_indices 再構築。stale index による範囲外参照 panic を防ぐ (Codex P1)。
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(path: &str) -> StackMember {
+        StackMember {
+            path: PathBuf::from(path),
+            mtime: 0,
+            size: 0,
+            is_video: false,
+        }
+    }
+
+    #[test]
+    fn script_grouping_scopes_keys_by_parent_for_subfolder_stack() {
+        let images = vec![
+            image(r"C:\root\a\scan_001.jpg"),
+            image(r"C:\root\a\scan_002.jpg"),
+            image(r"C:\root\a\other_001.jpg"),
+            image(r"C:\root\a\other_002.jpg"),
+            image(r"C:\root\b\scan_001.jpg"),
+            image(r"C:\root\b\scan_002.jpg"),
+            image(r"C:\root\b\other_001.jpg"),
+            image(r"C:\root\b\other_002.jpg"),
+        ];
+        let (keys, _rule) = stack_script_keys_for_images(
+            &images,
+            crate::filename_stack_script::DEFAULT_SCRIPT,
+            Arc::new(AtomicBool::new(false)),
+            true,
+        )
+        .expect("default script groups per parent");
+        assert_eq!(keys.len(), images.len());
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[2], keys[3]);
+        assert_eq!(keys[4], keys[5]);
+        assert_eq!(keys[6], keys[7]);
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[0], keys[4]);
+        assert_ne!(keys[2], keys[6]);
     }
 }

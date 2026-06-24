@@ -20,7 +20,12 @@
 - AI モデル facet の高速化検討用に、遅延メタデータ worker の起動/完了を
   `details_meta.load_start` / `details_meta.load_done`、100ms 以上かかった単件を
   `details_meta.ai_item_slow`、メニュー件数集計を `ui.facet_ai_model_counts_build` /
-  `ui.facet_ai_tool_counts_build` として perf log に記録する。
+  `ui.facet_ai_tool_counts_build` として perf log に記録する。`load_done` には
+  `ai_total_ms` / `ai_permit_wait_ms` / `ai_extract_ms` と各 max を分けて出し、
+  初回 0 件のまま止まって見えるケースが I/O permit 待ちなのか PNG/JPEG メタ抽出なのかを
+  切り分ける。AI モデル / 生成ツールの件数は、表示集合または遅延メタキャッシュが変わるまで
+  `facet_ai_model_counts_cache` / `facet_ai_tool_counts_cache` で再利用し、メニューを開いたままの
+  毎フレーム O(n) 再集計を避ける。
 
 ## 0. 背景と目的
 

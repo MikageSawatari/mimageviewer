@@ -369,8 +369,12 @@ pub(super) fn run_details_meta_load(
     let mut ai_other_ext = 0usize;
     let mut ai_models_total = 0usize;
     let mut ai_tools_total = 0usize;
+    let mut ai_total_ms_total = 0.0f64;
+    let mut ai_permit_wait_ms_total = 0.0f64;
     let mut ai_extract_ms_total = 0.0f64;
     let mut ai_model_ms_total = 0.0f64;
+    let mut ai_total_ms_max = 0.0f64;
+    let mut ai_permit_wait_ms_max = 0.0f64;
     let mut ai_extract_ms_max = 0.0f64;
     let mut ai_slow_items = 0usize;
     let mut catalog_maps: std::collections::HashMap<
@@ -428,35 +432,63 @@ pub(super) fn run_details_meta_load(
             }
 
             ai_metadata_checked = true;
-            let ai_extract_t0 = perf_on.then(std::time::Instant::now);
+            let ai_total_t0 = perf_on.then(std::time::Instant::now);
+            let mut item_permit_wait_ms = 0.0f64;
+            let mut item_extract_ms = 0.0f64;
             let metadata = match &target.item {
                 GridItem::Image(path) => {
+                    let wait_t0 = perf_on.then(std::time::Instant::now);
                     let _permit = io_sem.acquire(target.priority);
-                    crate::png_metadata::extract_metadata(path)
+                    if let Some(t0) = wait_t0 {
+                        item_permit_wait_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    let extract_t0 = perf_on.then(std::time::Instant::now);
+                    let metadata = crate::png_metadata::extract_metadata(path);
+                    if let Some(t0) = extract_t0 {
+                        item_extract_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    metadata
                 }
                 GridItem::ZipImage {
                     zip_path,
                     entry_name,
                 } => {
                     if zip_entry_bytes.is_none() {
+                        let wait_t0 = perf_on.then(std::time::Instant::now);
                         let _permit = io_sem.acquire(target.priority);
+                        if let Some(t0) = wait_t0 {
+                            item_permit_wait_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        let extract_t0 = perf_on.then(std::time::Instant::now);
                         zip_entry_bytes =
                             crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
+                        if let Some(t0) = extract_t0 {
+                            item_extract_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                        }
                     }
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    zip_entry_bytes
+                    let extract_t0 = perf_on.then(std::time::Instant::now);
+                    let metadata = zip_entry_bytes
                         .as_ref()
-                        .and_then(|bytes| crate::png_metadata::extract_metadata_from_bytes(bytes))
+                        .and_then(|bytes| crate::png_metadata::extract_metadata_from_bytes(bytes));
+                    if let Some(t0) = extract_t0 {
+                        item_extract_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    metadata
                 }
                 _ => None,
             };
-            if let Some(t0) = ai_extract_t0 {
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                ai_extract_ms_total += ms;
-                ai_extract_ms_max = ai_extract_ms_max.max(ms);
-                if ms >= SLOW_AI_METADATA_ITEM_MS {
+            if let Some(t0) = ai_total_t0 {
+                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                ai_total_ms_total += total_ms;
+                ai_total_ms_max = ai_total_ms_max.max(total_ms);
+                ai_permit_wait_ms_total += item_permit_wait_ms;
+                ai_permit_wait_ms_max = ai_permit_wait_ms_max.max(item_permit_wait_ms);
+                ai_extract_ms_total += item_extract_ms;
+                ai_extract_ms_max = ai_extract_ms_max.max(item_extract_ms);
+                if total_ms >= SLOW_AI_METADATA_ITEM_MS {
                     ai_slow_items += 1;
                     crate::perf::event(
                         "details_meta",
@@ -464,7 +496,12 @@ pub(super) fn run_details_meta_load(
                         None,
                         generation,
                         &[
-                            ("ms", serde_json::Value::from(ms)),
+                            ("ms", serde_json::Value::from(total_ms)),
+                            (
+                                "permit_wait_ms",
+                                serde_json::Value::from(item_permit_wait_ms),
+                            ),
+                            ("extract_ms", serde_json::Value::from(item_extract_ms)),
                             ("source", serde_json::Value::from(ai_source)),
                             ("ext", serde_json::Value::from(ai_ext.as_str())),
                             ("source_size", serde_json::Value::from(target.source_size)),
@@ -647,11 +684,21 @@ pub(super) fn run_details_meta_load(
                 ("ai_other_ext", serde_json::Value::from(ai_other_ext)),
                 ("ai_models_total", serde_json::Value::from(ai_models_total)),
                 ("ai_tools_total", serde_json::Value::from(ai_tools_total)),
+                ("ai_total_ms", serde_json::Value::from(ai_total_ms_total)),
+                (
+                    "ai_permit_wait_ms",
+                    serde_json::Value::from(ai_permit_wait_ms_total),
+                ),
                 (
                     "ai_extract_ms",
                     serde_json::Value::from(ai_extract_ms_total),
                 ),
                 ("ai_model_ms", serde_json::Value::from(ai_model_ms_total)),
+                ("ai_total_max_ms", serde_json::Value::from(ai_total_ms_max)),
+                (
+                    "ai_permit_wait_max_ms",
+                    serde_json::Value::from(ai_permit_wait_ms_max),
+                ),
                 (
                     "ai_extract_max_ms",
                     serde_json::Value::from(ai_extract_ms_max),
