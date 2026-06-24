@@ -3989,6 +3989,14 @@ impl NativeEguiOverlay {
                     }
                     return;
                 }
+                if matches!(event, NativeEvent::KeyDown(_))
+                    && crate::keymap::native_video_context_shortcuts_help_key_down(&key)
+                    && self.can_open_shortcut_help()
+                {
+                    self.shortcut_help_open = true;
+                    self.dirty = true;
+                    return;
+                }
                 if !self.text_input_active() && native_video_fullscreen_shortcut_key(&key) {
                     return;
                 }
@@ -4071,7 +4079,9 @@ impl NativeEguiOverlay {
                 if self.shortcut_help_open {
                     return;
                 }
-                if ch == '?' && self.can_open_shortcut_help() {
+                if crate::keymap::is_context_shortcuts_help_char(ch)
+                    && self.can_open_shortcut_help()
+                {
                     self.shortcut_help_open = true;
                     self.dirty = true;
                     return;

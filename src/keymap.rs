@@ -3311,6 +3311,19 @@ pub fn native_video_fullscreen_shortcut_key(
         .any(|action| fallback.matches_vk_action(action, key))
 }
 
+pub(crate) fn is_context_shortcuts_help_char(ch: char) -> bool {
+    matches!(ch, '?' | '？')
+}
+
+#[cfg(windows)]
+pub(crate) fn native_video_context_shortcuts_help_key_down(
+    key: &crate::video::native_window::NativeVideoKeyEvent,
+) -> bool {
+    const VK_OEM_2: u32 = 0xBF; // US/JIS: slash key, Shift produces '?'.
+
+    key.virtual_key == VK_OEM_2 && key.shift && !key.ctrl && !key.alt && !key.repeat
+}
+
 fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) -> bool {
     if matches!(virtual_key, 0x21 | 0x22) {
         return ctrl && !shift;
@@ -4157,6 +4170,35 @@ mod tests {
                 && (conflict.action == KeyAction::FsZoomMode
                     || conflict.other_action == Some(KeyAction::FsZoomMode))
         }));
+    }
+
+    #[test]
+    fn context_shortcuts_help_accepts_ascii_and_fullwidth_question() {
+        assert!(is_context_shortcuts_help_char('?'));
+        assert!(is_context_shortcuts_help_char('？'));
+        assert!(!is_context_shortcuts_help_char('/'));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_context_help_keydown_falls_back_to_shift_slash() {
+        let mut event = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0xBF,
+            shift: true,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(native_video_context_shortcuts_help_key_down(&event));
+
+        event.shift = false;
+        assert!(!native_video_context_shortcuts_help_key_down(&event));
+        event.shift = true;
+        event.repeat = true;
+        assert!(!native_video_context_shortcuts_help_key_down(&event));
+        event.repeat = false;
+        event.ctrl = true;
+        assert!(!native_video_context_shortcuts_help_key_down(&event));
     }
 
     #[cfg(windows)]
