@@ -6366,8 +6366,8 @@ impl App {
         // 選択操作を優先、Codex Phase 5.1 P2 反映)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.fs_context_menu_idx.is_none();
-        if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            && !self.ime_input_active()
+        if !self.ime_input_active()
+            && self.fs_context_menu_idx.is_none()
             && Self::consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;

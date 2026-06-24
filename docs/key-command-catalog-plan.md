@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 7 補正レイヤーヘルプスライス実装済み / ClaudeCode レビュー済み** (2026-06-24)。
+> ステータス: **Phase 7 egui 動画ヘルプ初期スライス実装済み / ClaudeCode レビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -109,6 +109,14 @@
 > 操作は編集モード中に混ぜない。Esc / Enter / Delete / 矢印 / ブラケット / Undo・Redo /
 > マウス操作などの固定扱い入力は補助行へ分ける。パネル内のテキスト入力や数値入力が
 > keyboard focus を持つときは `?` を奪わない。動画フルスクリーンとテキスト注釈は後続。
+>
+> **Phase 7 egui 動画ヘルプ初期スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
+> egui 経路の動画フルスクリーンでも固定 `?` で同じ「ショートカット」ダイアログを開く。
+> 表示対象は `FsVideo` scope と、動画中にも実際に届く `Rating` / `FsCommon` の一部
+> (`FsToggleMetadata`, `FsCtrlNav*`, `FsSibling*`) に限定する。`VideoCompare*` は動画では
+> silent no-op として消費するだけなので、ヘルプには出さない。Esc / Backspace / シーク /
+> Home / End / F11 / ホイールなどの固定扱い入力は補助行へ分ける。native 動画 overlay 上で
+> 直接開くヘルプは後続スライスに残す。
 
 ## 1. 背景と狙い
 
@@ -541,6 +549,9 @@ pub enum BindingPolicy {
 - **補正レイヤーヘルプスライス実装済み**: 補正レイヤーパネル中に `?` を押したとき、
   `LocalAdjust` scope の実割り当てと固定キーを表示する。パネル内のテキスト入力や
   数値入力が keyboard focus を持つ場合は `?` を奪わない。
+- **egui 動画ヘルプ初期スライス実装済み**: egui 経路の動画フルスクリーンで `?` を押したとき、
+  `FsVideo` scope と動画で有効な一部 `FsCommon` / `Rating` の実割り当て、固定シーク操作を
+  表示する。native 動画 overlay 上で直接開くヘルプは後続。
 - `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
   消しゴム / 隠蔽加工 / 補正レイヤー / テキスト注釈など) で有効なショートカット一覧を表示する。
 - 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。

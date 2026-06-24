@@ -6,7 +6,8 @@
 use crate::app::App;
 use crate::grid_item::GridItem;
 use crate::keymap::{
-    CommandDisplayRow, CommandScope, FS_IMAGE_ACTIVE_SCOPES, GRID_ACTIVE_SCOPES, KeyAction,
+    CommandDisplayRow, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES,
+    GRID_ACTIVE_SCOPES, KeyAction,
 };
 use eframe::egui;
 
@@ -98,6 +99,49 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "Ctrl+ホイール",
         description: "ズーム倍率を変更する",
+    },
+];
+
+const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc / Backspace",
+        description: "一覧へ戻る。タイルモード中の Esc は先にタイルモードを閉じる",
+    },
+    FixedShortcutRow {
+        keys: "← / →",
+        description: "5秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
+    },
+    FixedShortcutRow {
+        keys: "Shift+← / Shift+→",
+        description: "1秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+← / Ctrl+→",
+        description: "30秒戻る / 進む。タイルモード中はタイルカーソルを1行移動する",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+Shift+← / Ctrl+Shift+→",
+        description: "1フレーム戻る / 進む",
+    },
+    FixedShortcutRow {
+        keys: "Home / End",
+        description: "先頭または末尾の項目へ移動する",
+    },
+    FixedShortcutRow {
+        keys: "F11",
+        description: "ウィンドウ内表示と全画面表示を切り替える",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール",
+        description: "前または次の項目へ移動する",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+ホイール",
+        description: "タイルモード中はタイル列数を変更する",
     },
 ];
 
@@ -222,6 +266,7 @@ const LOCAL_ADJUST_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
 enum ShortcutHelpContext {
     Grid,
     FsImage,
+    FsVideo,
     Erase,
     Conceal,
     Crop,
@@ -233,6 +278,7 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => "サムネイル一覧",
             Self::FsImage => "画像フルスクリーン",
+            Self::FsVideo => "動画フルスクリーン",
             Self::Erase => "消しゴムモード",
             Self::Conceal => "隠蔽加工モード",
             Self::Crop => "切り取りモード",
@@ -244,6 +290,7 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => GRID_ACTIVE_SCOPES,
             Self::FsImage => FS_IMAGE_ACTIVE_SCOPES,
+            Self::FsVideo => FS_VIDEO_ACTIVE_SCOPES,
             Self::Erase => ERASE_HELP_SCOPES,
             Self::Conceal => CONCEAL_HELP_SCOPES,
             Self::Crop => CROP_HELP_SCOPES,
@@ -255,6 +302,7 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => GRID_FIXED_SHORTCUT_ROWS,
             Self::FsImage => FS_IMAGE_FIXED_SHORTCUT_ROWS,
+            Self::FsVideo => FS_VIDEO_FIXED_SHORTCUT_ROWS,
             Self::Erase => ERASE_FIXED_SHORTCUT_ROWS,
             Self::Conceal => CONCEAL_FIXED_SHORTCUT_ROWS,
             Self::Crop => CROP_FIXED_SHORTCUT_ROWS,
@@ -269,6 +317,7 @@ impl ShortcutHelpContext {
                 row.spec.scope != CommandScope::Global
                     || row.spec.action == KeyAction::ToggleDetachedViewerMode
             }
+            Self::FsVideo => video_help_includes_row(row),
             Self::Erase | Self::Conceal | Self::Crop | Self::LocalAdjust => true,
         }
     }
@@ -343,6 +392,11 @@ impl App {
             return ShortcutHelpContext::Crop;
         }
         if let Some(fs_idx) = self.fullscreen_idx
+            && matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+        {
+            return ShortcutHelpContext::FsVideo;
+        }
+        if let Some(fs_idx) = self.fullscreen_idx
             && matches!(
                 self.items.get(fs_idx),
                 Some(
@@ -357,6 +411,22 @@ impl App {
             return ShortcutHelpContext::FsImage;
         }
         ShortcutHelpContext::Grid
+    }
+}
+
+fn video_help_includes_row(row: &CommandDisplayRow) -> bool {
+    match row.spec.action {
+        KeyAction::ToggleDetachedViewerMode
+        | KeyAction::FsToggleMetadata
+        | KeyAction::FsCtrlNavPrev
+        | KeyAction::FsCtrlNavNext
+        | KeyAction::FsSiblingPrev
+        | KeyAction::FsSiblingNext => true,
+        KeyAction::VideoCompareToggle
+        | KeyAction::VideoCompareCycle
+        | KeyAction::VideoCompareWipe
+        | KeyAction::VideoCompareDiff => false,
+        _ => matches!(row.spec.scope, CommandScope::Rating | CommandScope::FsVideo),
     }
 }
 
