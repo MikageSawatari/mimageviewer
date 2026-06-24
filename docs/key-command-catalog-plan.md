@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu catalog drift hardening スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 6 menu layout settings model スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -172,10 +172,17 @@
 > catalog 経由にし、enabled 判定・hover text・クリック処理・メニュー構成・保存形式は変更しない。
 > 件数付き項目、動的一覧、サブメニュー本体、状態でラベルが変わる `更新を確認…` は catalog 対象外のまま。
 >
-> **Phase 6 menu catalog drift hardening スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 6 menu catalog drift hardening スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `TopMenuId::ALL` と `menu_commands_for_parent()` を追加し、後続のメニュー構成保存・編集 UI が使う
 > parent 別 catalog 取得口を用意する。`TopMenuId` / `MenuCommandId` は `KeyAction` と同様に
 > `include_str!` ベースの enum ⇄ `ALL` drift テストで守る。描画・クリック処理・保存形式は変更しない。
+>
+> **Phase 6 menu layout settings model スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `MenuLayoutSettings` / `MenuCommandOrderSettings` / `ResolvedMenuLayout` を追加し、
+> stable name 文字列ベースの保存モデルと resolver を `keymap.rs` に置く。未知 top menu / command は
+> 読み飛ばし、保存順に無い既定メニュー・新規コマンドは catalog 既定順で補完する。非表示は
+> `hidden_commands` で表現し、全コマンドが非表示になった top menu は resolver 出力から落とす。
+> まだ `Settings` へは接続せず、描画・クリック処理・保存形式は変更しない。
 
 ## 1. 背景と狙い
 
@@ -592,8 +599,10 @@ pub enum BindingPolicy {
 - **UI-only 静的メニュー項目まとめスライス実装済み**: `TopMenuId::Books` / `Video` /
   `Settings` / `Help` と、製本 / 動画 / 設定 / ヘルプメニューの固定ラベル leaf 項目を catalog 化する。
   件数付き項目、動的一覧、サブメニュー本体、状態でラベルが変わる更新確認ボタンは対象外。
-- **menu catalog drift hardening スライス実装中**: `TopMenuId::ALL`、parent 別 catalog iterator、
+- **menu catalog drift hardening スライス実装済み**: `TopMenuId::ALL`、parent 別 catalog iterator、
   `TopMenuId` / `MenuCommandId` の enum ⇄ `ALL` drift テストを追加する。
+- **menu layout settings model スライス実装中**: stable name 文字列ベースの `MenuLayoutSettings` と
+  resolver を追加し、未知 ID の読み飛ばし・既定補完・非表示 command の解決を純関数で固定する。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。

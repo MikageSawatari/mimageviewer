@@ -1215,6 +1215,31 @@ impl TopMenuId {
             TopMenuId::Help => "ヘルプ",
         }
     }
+
+    pub fn stable_name(self) -> &'static str {
+        match self {
+            TopMenuId::File => "File",
+            TopMenuId::Favorites => "Favorites",
+            TopMenuId::Books => "Books",
+            TopMenuId::Video => "Video",
+            TopMenuId::Tags => "Tags",
+            TopMenuId::Settings => "Settings",
+            TopMenuId::Help => "Help",
+        }
+    }
+
+    pub fn parse_stable_name(name: &str) -> Option<Self> {
+        match name {
+            "File" => Some(TopMenuId::File),
+            "Favorites" => Some(TopMenuId::Favorites),
+            "Books" => Some(TopMenuId::Books),
+            "Video" => Some(TopMenuId::Video),
+            "Tags" => Some(TopMenuId::Tags),
+            "Settings" => Some(TopMenuId::Settings),
+            "Help" => Some(TopMenuId::Help),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -1324,6 +1349,13 @@ impl MenuCommandId {
             MenuCommandId::HelpShowWhatsNew => "HelpShowWhatsNew",
             MenuCommandId::HelpAbout => "HelpAbout",
         }
+    }
+
+    pub fn parse_stable_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|id| id.stable_name() == name)
     }
 }
 
@@ -1554,6 +1586,125 @@ pub fn menu_command_spec(id: MenuCommandId) -> Option<MenuCommandSpec> {
         .iter()
         .copied()
         .find(|spec| spec.id == id)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MenuLayoutSettings {
+    /// Top menu order by `TopMenuId::stable_name()`. Missing menus are appended in default order.
+    #[serde(default)]
+    pub top_menu_order: Vec<String>,
+    /// Per-top-menu command order by `MenuCommandId::stable_name()`.
+    #[serde(default)]
+    pub command_order: Vec<MenuCommandOrderSettings>,
+    /// Commands hidden by `MenuCommandId::stable_name()`.
+    #[serde(default)]
+    pub hidden_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MenuCommandOrderSettings {
+    #[serde(default)]
+    pub parent: String,
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMenuLayout {
+    pub menus: Vec<ResolvedTopMenu>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedTopMenu {
+    pub id: TopMenuId,
+    pub commands: Vec<MenuCommandId>,
+}
+
+pub fn default_menu_layout_settings() -> MenuLayoutSettings {
+    MenuLayoutSettings {
+        top_menu_order: TopMenuId::ALL
+            .iter()
+            .map(|id| id.stable_name().to_string())
+            .collect(),
+        command_order: TopMenuId::ALL
+            .iter()
+            .map(|parent| MenuCommandOrderSettings {
+                parent: parent.stable_name().to_string(),
+                commands: menu_commands_for_parent(*parent)
+                    .map(|spec| spec.id.stable_name().to_string())
+                    .collect(),
+            })
+            .collect(),
+        hidden_commands: Vec::new(),
+    }
+}
+
+pub fn resolve_menu_layout(settings: &MenuLayoutSettings) -> ResolvedMenuLayout {
+    let hidden: std::collections::BTreeSet<MenuCommandId> = settings
+        .hidden_commands
+        .iter()
+        .filter_map(|name| MenuCommandId::parse_stable_name(name))
+        .collect();
+
+    let mut parents = Vec::with_capacity(TopMenuId::ALL.len());
+    for name in &settings.top_menu_order {
+        if let Some(parent) = TopMenuId::parse_stable_name(name) {
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+    }
+    for &parent in TopMenuId::ALL {
+        if !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
+
+    let menus = parents
+        .into_iter()
+        .filter_map(|parent| {
+            let commands = resolve_menu_commands_for_parent(settings, parent, &hidden);
+            (!commands.is_empty()).then_some(ResolvedTopMenu {
+                id: parent,
+                commands,
+            })
+        })
+        .collect();
+
+    ResolvedMenuLayout { menus }
+}
+
+fn resolve_menu_commands_for_parent(
+    settings: &MenuLayoutSettings,
+    parent: TopMenuId,
+    hidden: &std::collections::BTreeSet<MenuCommandId>,
+) -> Vec<MenuCommandId> {
+    let mut out = Vec::new();
+
+    for order in &settings.command_order {
+        if TopMenuId::parse_stable_name(&order.parent) != Some(parent) {
+            continue;
+        }
+        for name in &order.commands {
+            let Some(id) = MenuCommandId::parse_stable_name(name) else {
+                continue;
+            };
+            if hidden.contains(&id) || out.contains(&id) {
+                continue;
+            }
+            if menu_command_spec(id).is_some_and(|spec| spec.parent == parent) {
+                out.push(id);
+            }
+        }
+    }
+
+    for spec in menu_commands_for_parent(parent) {
+        if !hidden.contains(&spec.id) && !out.contains(&spec.id) {
+            out.push(spec.id);
+        }
+    }
+
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4106,6 +4257,131 @@ mod tests {
 
         let catalog_ids: Vec<_> = menu_command_catalog().iter().map(|spec| spec.id).collect();
         assert_eq!(flattened_ids, catalog_ids);
+    }
+
+    #[test]
+    fn menu_ids_parse_stable_names() {
+        for &id in TopMenuId::ALL {
+            assert_eq!(TopMenuId::parse_stable_name(id.stable_name()), Some(id));
+        }
+        assert_eq!(TopMenuId::parse_stable_name("FutureMenu"), None);
+
+        for &id in MenuCommandId::ALL {
+            assert_eq!(MenuCommandId::parse_stable_name(id.stable_name()), Some(id));
+        }
+        assert_eq!(MenuCommandId::parse_stable_name("FutureCommand"), None);
+    }
+
+    #[test]
+    fn default_menu_layout_settings_resolves_to_catalog_order() {
+        let resolved = resolve_menu_layout(&MenuLayoutSettings::default());
+        let default_settings = default_menu_layout_settings();
+        let resolved_from_explicit = resolve_menu_layout(&default_settings);
+        assert_eq!(resolved, resolved_from_explicit);
+
+        let resolved_parents: Vec<_> = resolved.menus.iter().map(|menu| menu.id).collect();
+        assert_eq!(resolved_parents, TopMenuId::ALL.to_vec());
+
+        for menu in &resolved.menus {
+            let expected: Vec<_> = menu_commands_for_parent(menu.id)
+                .map(|spec| spec.id)
+                .collect();
+            assert_eq!(menu.commands, expected);
+        }
+    }
+
+    #[test]
+    fn menu_layout_resolution_reorders_hides_and_appends_missing() {
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec![
+                "Help".to_string(),
+                "File".to_string(),
+                "FutureMenu".to_string(),
+                "Help".to_string(),
+            ],
+            command_order: vec![
+                MenuCommandOrderSettings {
+                    parent: "Help".to_string(),
+                    commands: vec![
+                        "HelpAbout".to_string(),
+                        "FileOpenFolder".to_string(),
+                        "FutureCommand".to_string(),
+                        "HelpOpenManual".to_string(),
+                        "HelpAbout".to_string(),
+                    ],
+                },
+                MenuCommandOrderSettings {
+                    parent: "File".to_string(),
+                    commands: vec![
+                        "FileQuit".to_string(),
+                        "FileOpenFolder".to_string(),
+                        "FileQuit".to_string(),
+                    ],
+                },
+            ],
+            hidden_commands: vec![
+                "HelpOpenLogs".to_string(),
+                "FileReadingHistory".to_string(),
+                "FutureCommand".to_string(),
+            ],
+        };
+
+        let resolved = resolve_menu_layout(&settings);
+        assert_eq!(resolved.menus[0].id, TopMenuId::Help);
+        assert_eq!(
+            resolved.menus[0].commands,
+            vec![
+                MenuCommandId::HelpAbout,
+                MenuCommandId::HelpOpenManual,
+                MenuCommandId::HelpShowWhatsNew,
+            ]
+        );
+        assert_eq!(resolved.menus[1].id, TopMenuId::File);
+        assert_eq!(
+            resolved.menus[1].commands,
+            vec![
+                MenuCommandId::FileQuit,
+                MenuCommandId::FileOpenFolder,
+                MenuCommandId::FileLocalSearch,
+                MenuCommandId::FileOpenCaptureFolder,
+                MenuCommandId::FileOpenRecycleBin,
+            ]
+        );
+        assert_eq!(resolved.menus[2].id, TopMenuId::Favorites);
+    }
+
+    #[test]
+    fn menu_layout_resolution_drops_empty_top_menus() {
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec!["Help".to_string(), "File".to_string()],
+            command_order: Vec::new(),
+            hidden_commands: menu_commands_for_parent(TopMenuId::Help)
+                .map(|spec| spec.id.stable_name().to_string())
+                .collect(),
+        };
+
+        let resolved = resolve_menu_layout(&settings);
+        let resolved_parents: Vec<_> = resolved.menus.iter().map(|menu| menu.id).collect();
+        assert!(!resolved_parents.contains(&TopMenuId::Help));
+        assert_eq!(resolved_parents.first(), Some(&TopMenuId::File));
+    }
+
+    #[test]
+    fn menu_layout_settings_roundtrip_uses_stable_names() {
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec!["Help".to_string(), "File".to_string()],
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Help".to_string(),
+                commands: vec!["HelpAbout".to_string(), "HelpOpenManual".to_string()],
+            }],
+            hidden_commands: vec!["HelpOpenLogs".to_string()],
+        };
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("HelpAbout"));
+        assert!(!json.contains("ヘルプ"));
+        let back: MenuLayoutSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
     }
 
     #[test]
