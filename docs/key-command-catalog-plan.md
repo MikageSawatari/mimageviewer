@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 7 ヘルプキー KeyAction 化スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 6 メニュー command catalog 基盤スライス実装中 / ClaudeCode レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -135,11 +135,18 @@
 > Delete / Backspace / ドラッグ / ホイール / 右Ctrl などの固定扱い入力。本文やフォント検索など
 > TextEdit が keyboard focus を持つときは `?` を奪わない。
 >
-> **Phase 7 ヘルプキー KeyAction 化スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 7 ヘルプキー KeyAction 化スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `HelpShowContextShortcuts` を `Global` scope の `KeyAction` として追加し、既定を `?`
 > (内部的には `Shift+/`) にする。egui 側の各ヘルプ dispatch、ヘルプ固定キー欄、native 動画
 > overlay の Text / KeyDown fallback はこの Action の effective chord を参照する。
 > ユーザーが `HelpShowContextShortcuts = F1` や `none` に変更した場合も、入力判定と表示が一致する。
+>
+> **Phase 6 メニュー command catalog 基盤スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `MenuCommandId` / `MenuCommandSpec` / `TopMenuId` を `keymap.rs` に追加し、まず既に
+> shortcut 表示が keymap 追従している top menu 項目 (現在地フィルタ / コンテナ検索 /
+> アイテム検索 / タグビュー) だけを catalog 化する。`Keymap::menu_command_label()` から
+> 既存と同じラベルを作るように `render_menubar()` を差し替えるが、メニュー構成・クリック処理・
+> 保存形式・UI はまだ変更しない。
 
 ## 1. 背景と狙い
 
@@ -543,11 +550,15 @@ pub enum BindingPolicy {
 
 実装内容:
 
+- **基盤スライス実装中**: `MenuCommandId` / `MenuCommandSpec` / `TopMenuId` を追加し、
+  既に KeyAction と対応済みの top menu 項目だけを catalog 化する。`render_menubar()` は
+  既存と同じラベルを `Keymap::menu_command_label()` 経由で取得するだけで、挙動は変えない。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。
 
-この Phase は、コマンド catalog が安定してから着手する。
+以降のスライスで、UI-only / keymap 対象外のメニュー項目も段階的に `MenuCommandSpec` へ
+追加し、構成保存・編集 UI は catalog が十分安定してから着手する。
 
 ### Phase 7: コンテキスト別ショートカットヘルプ (`?`)
 

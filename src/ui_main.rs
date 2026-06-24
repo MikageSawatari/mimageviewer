@@ -11,7 +11,7 @@ use eframe::egui;
 
 use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget};
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::keymap::{KeyAction, Keymap};
+use crate::keymap::{KeyAction, Keymap, MenuCommandId};
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
     FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
@@ -2045,16 +2045,14 @@ impl App {
                 });
         let local_search_menu_label = self
             .keymap
-            .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
+            .menu_command_label(MenuCommandId::FileLocalSearch);
         let fav_search_menu_label = self
             .keymap
-            .first_chord_action_label("コンテナ検索", KeyAction::GlobalFavSearch);
+            .menu_command_label(MenuCommandId::FavoritesFavSearch);
         let metadata_search_menu_label = self
             .keymap
-            .first_chord_action_label("アイテム検索", KeyAction::GlobalMetadataSearch);
-        let tag_view_menu_label = self
-            .keymap
-            .first_chord_action_label("タグビュー", KeyAction::GridTagView);
+            .menu_command_label(MenuCommandId::FavoritesMetadataSearch);
+        let tag_view_menu_label = self.keymap.menu_command_label(MenuCommandId::TagsTagView);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {

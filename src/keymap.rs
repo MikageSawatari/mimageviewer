@@ -1182,6 +1182,96 @@ pub fn command_catalog() -> impl Iterator<Item = CommandSpec> {
         .map(CommandSpec::from_action)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum TopMenuId {
+    File,
+    Favorites,
+    Tags,
+}
+
+impl TopMenuId {
+    pub fn label(self) -> &'static str {
+        match self {
+            TopMenuId::File => "ファイル",
+            TopMenuId::Favorites => "お気に入り",
+            TopMenuId::Tags => "タグ",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum MenuCommandId {
+    FileLocalSearch,
+    FavoritesFavSearch,
+    FavoritesMetadataSearch,
+    TagsTagView,
+}
+
+impl MenuCommandId {
+    pub fn stable_name(self) -> &'static str {
+        match self {
+            MenuCommandId::FileLocalSearch => "FileLocalSearch",
+            MenuCommandId::FavoritesFavSearch => "FavoritesFavSearch",
+            MenuCommandId::FavoritesMetadataSearch => "FavoritesMetadataSearch",
+            MenuCommandId::TagsTagView => "TagsTagView",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MenuCommandSpec {
+    pub id: MenuCommandId,
+    pub parent: TopMenuId,
+    pub label: &'static str,
+    pub action: Option<KeyAction>,
+}
+
+impl MenuCommandSpec {
+    pub fn description(self) -> &'static str {
+        self.action
+            .map(KeyAction::description)
+            .unwrap_or(self.label)
+    }
+}
+
+const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
+    MenuCommandSpec {
+        id: MenuCommandId::FileLocalSearch,
+        parent: TopMenuId::File,
+        label: "現在地フィルタ",
+        action: Some(KeyAction::GlobalLocalSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FavoritesFavSearch,
+        parent: TopMenuId::Favorites,
+        label: "コンテナ検索",
+        action: Some(KeyAction::GlobalFavSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::FavoritesMetadataSearch,
+        parent: TopMenuId::Favorites,
+        label: "アイテム検索",
+        action: Some(KeyAction::GlobalMetadataSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::TagsTagView,
+        parent: TopMenuId::Tags,
+        label: "タグビュー",
+        action: Some(KeyAction::GridTagView),
+    },
+];
+
+pub fn menu_command_catalog() -> &'static [MenuCommandSpec] {
+    MENU_COMMAND_SPECS
+}
+
+pub fn menu_command_spec(id: MenuCommandId) -> Option<MenuCommandSpec> {
+    MENU_COMMAND_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.id == id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandDisplayRow {
     pub spec: CommandSpec,
@@ -2602,6 +2692,17 @@ impl Keymap {
         }
     }
 
+    pub fn menu_command_label(&self, id: MenuCommandId) -> String {
+        let Some(spec) = menu_command_spec(id) else {
+            return id.stable_name().to_string();
+        };
+        if let Some(action) = spec.action {
+            self.first_chord_action_label(spec.label, action)
+        } else {
+            spec.label.to_string()
+        }
+    }
+
     pub fn command_display_rows_for_active_scopes(
         &self,
         active_scopes: &[CommandScope],
@@ -3639,6 +3740,66 @@ mod tests {
                 BindingPolicy::for_trigger(spec.action.trigger())
             );
         }
+    }
+
+    #[test]
+    fn menu_command_catalog_has_unique_ids_and_valid_actions() {
+        let mut ids = std::collections::BTreeSet::new();
+        for spec in menu_command_catalog() {
+            assert!(
+                ids.insert(spec.id),
+                "duplicate menu command id: {}",
+                spec.id.stable_name()
+            );
+            assert_eq!(menu_command_spec(spec.id), Some(*spec));
+            assert!(!spec.label.is_empty());
+            assert!(!spec.parent.label().is_empty());
+            if let Some(action) = spec.action {
+                assert!(
+                    KeyAction::all().contains(&action),
+                    "menu command action is not registered: {}",
+                    action.ini_name()
+                );
+                assert_eq!(spec.description(), action.description());
+            }
+        }
+    }
+
+    #[test]
+    fn menu_command_labels_follow_keymap_overrides() {
+        let keymap = Keymap::empty();
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileLocalSearch),
+            "現在地フィルタ (Ctrl+F)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FavoritesFavSearch),
+            "コンテナ検索 (Ctrl+S)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FavoritesMetadataSearch),
+            "アイテム検索 (Ctrl+G)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::TagsTagView),
+            "タグビュー (Ctrl+T)"
+        );
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            GlobalLocalSearch = F2
+            GlobalFavSearch = none
+            "#,
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileLocalSearch),
+            "現在地フィルタ (F2)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FavoritesFavSearch),
+            "コンテナ検索"
+        );
     }
 
     #[test]
