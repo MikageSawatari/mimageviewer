@@ -1108,7 +1108,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
 | `toolbar_{cols,aspect,sort,favorites,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_{favorites,tags,bookshelf}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
-| `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するためのフィールド。現段階では固定 leaf 項目と空 top menu の表示 ON/OFF、および top menu の表示順を描画へ接続する。メニュー内 command order と編集 UI は後続。欠落時や空設定は既定メニュー構成として扱う |
+| `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するためのフィールド。現段階では固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続する。登録済み一覧などの動的ブロックは既存位置を基準に表示し、編集 UI は後続。欠落時や空設定は既定メニュー構成として扱う |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | ウィンドウ位置・サイズ（自動保存） |
 

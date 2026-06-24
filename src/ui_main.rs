@@ -2136,65 +2136,87 @@ impl App {
                         TopMenuId::File => {
                             let file_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::File.label(), |ui| {
-                                if file_menu_commands.contains(&MenuCommandId::FileOpenFolder)
-                                    && ui.button(&open_folder_menu_label).clicked()
-                                {
-                                    // 既に現在フォルダが設定されていれば初期値として補完
-                                    self.open_folder_input = self
-                                        .current_folder
-                                        .as_ref()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    self.show_open_folder_dialog = true;
-                                    ui.close();
-                                }
-                                if file_menu_commands.contains(&MenuCommandId::FileReadingHistory)
-                                    && ui.button(&reading_history_menu_label).clicked()
-                                {
-                                    self.enter_reading_history();
-                                    ui.close();
-                                }
-                                ui.menu_button("レーティング一覧", |ui| {
-                                    for stars in 1..=5 {
-                                        if ui
-                                            .button(rating_view_menu_label(stars, rating_counts))
-                                            .clicked()
-                                        {
-                                            self.enter_rating_view(stars);
-                                            ui.close();
+                                let mut rating_menu_drawn = false;
+                                for &command in file_menu_commands {
+                                    match command {
+                                        MenuCommandId::FileOpenFolder => {
+                                            if ui.button(&open_folder_menu_label).clicked() {
+                                                // 既に現在フォルダが設定されていれば初期値として補完
+                                                self.open_folder_input = self
+                                                    .current_folder
+                                                    .as_ref()
+                                                    .map(|p| p.to_string_lossy().to_string())
+                                                    .unwrap_or_default();
+                                                self.show_open_folder_dialog = true;
+                                                ui.close();
+                                            }
                                         }
+                                        MenuCommandId::FileReadingHistory => {
+                                            if ui.button(&reading_history_menu_label).clicked() {
+                                                self.enter_reading_history();
+                                                ui.close();
+                                            }
+                                            ui.menu_button("レーティング一覧", |ui| {
+                                                for stars in 1..=5 {
+                                                    if ui
+                                                        .button(rating_view_menu_label(
+                                                            stars,
+                                                            rating_counts,
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        self.enter_rating_view(stars);
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                            rating_menu_drawn = true;
+                                        }
+                                        MenuCommandId::FileLocalSearch => {
+                                            if ui.button(&local_search_menu_label).clicked() {
+                                                // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
+                                                self.open_local_metadata_search();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FileOpenCaptureFolder => {
+                                            if ui.button(&open_capture_folder_menu_label).clicked()
+                                            {
+                                                self.open_capture_output_dir();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FileOpenRecycleBin => {
+                                            if ui.button(&open_recycle_bin_menu_label).clicked() {
+                                                crate::ui_helpers::open_recycle_bin_async();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FileQuit => {
+                                            ui.separator();
+                                            if ui.button(&quit_menu_label).clicked() {
+                                                // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、
+                                                // `shutdown_requested` を立てて `maybe_intercept_close` を通す。
+                                                self.shutdown_requested
+                                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                });
-                                if file_menu_commands.contains(&MenuCommandId::FileLocalSearch)
-                                    && ui.button(&local_search_menu_label).clicked()
-                                {
-                                    // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
-                                    self.open_local_metadata_search();
-                                    ui.close();
                                 }
-                                if file_menu_commands.contains(&MenuCommandId::FileOpenCaptureFolder)
-                                    && ui.button(&open_capture_folder_menu_label).clicked()
-                                {
-                                    self.open_capture_output_dir();
-                                    ui.close();
-                                }
-                                if file_menu_commands.contains(&MenuCommandId::FileOpenRecycleBin)
-                                    && ui.button(&open_recycle_bin_menu_label).clicked()
-                                {
-                                    crate::ui_helpers::open_recycle_bin_async();
-                                    ui.close();
-                                }
-                                if file_menu_commands.contains(&MenuCommandId::FileQuit) {
-                                    ui.separator();
-                                }
-                                if file_menu_commands.contains(&MenuCommandId::FileQuit)
-                                    && ui.button(&quit_menu_label).clicked()
-                                {
-                                    // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、
-                                    // `shutdown_requested` を立てて `maybe_intercept_close` を通す。
-                                    self.shutdown_requested
-                                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                if !rating_menu_drawn {
+                                    ui.menu_button("レーティング一覧", |ui| {
+                                        for stars in 1..=5 {
+                                            if ui
+                                                .button(rating_view_menu_label(stars, rating_counts))
+                                                .clicked()
+                                            {
+                                                self.enter_rating_view(stars);
+                                                ui.close();
+                                            }
+                                        }
+                                    });
                                 }
                             });
                             top_menu_responses.push(response.response);
@@ -2207,50 +2229,54 @@ impl App {
                                 // 実ディレクトリだけを対象にする。
                                 let favorite_target = self.current_favorite_target();
                                 let can_add = favorite_target.is_some();
-                                if favorites_menu_commands
-                                    .contains(&MenuCommandId::FavoritesAddCurrentFolder)
-                                    && ui
-                                        .add_enabled(can_add, egui::Button::new(&favorite_add_menu_label))
-                                        .hover_tip_disabled("お気に入りに追加できるのは実フォルダのみです")
-                                        .clicked()
-                                {
-                                    if let Some(folder) = favorite_target.clone() {
-                                        // 既定の名前はフォルダ名から補完
-                                        let default_name = folder
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        self.fav_add_name_input = default_name;
-                                        self.fav_add_target = Some(folder);
-                                        self.show_fav_add_dialog = true;
+                                for &command in favorites_menu_commands {
+                                    match command {
+                                        MenuCommandId::FavoritesAddCurrentFolder => {
+                                            if ui
+                                                .add_enabled(
+                                                    can_add,
+                                                    egui::Button::new(&favorite_add_menu_label),
+                                                )
+                                                .hover_tip_disabled(
+                                                    "お気に入りに追加できるのは実フォルダのみです",
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(folder) = favorite_target.clone() {
+                                                    // 既定の名前はフォルダ名から補完
+                                                    let default_name = folder
+                                                        .file_name()
+                                                        .and_then(|n| n.to_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    self.fav_add_name_input = default_name;
+                                                    self.fav_add_target = Some(folder);
+                                                    self.show_fav_add_dialog = true;
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FavoritesEdit => {
+                                            if ui.button(&favorite_edit_menu_label).clicked() {
+                                                self.show_favorites_editor = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FavoritesFavSearch => {
+                                            if ui.button(&fav_search_menu_label).clicked() {
+                                                self.open_favsearch();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::FavoritesMetadataSearch => {
+                                            if ui.button(&metadata_search_menu_label).clicked() {
+                                                // 相互排他は toggle_global_search 内で
+                                                self.toggle_global_search();
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    ui.close();
-                                }
-
-                                // 編集
-                                if favorites_menu_commands.contains(&MenuCommandId::FavoritesEdit)
-                                    && ui.button(&favorite_edit_menu_label).clicked()
-                                {
-                                    self.show_favorites_editor = true;
-                                    ui.close();
-                                }
-
-                                // コンテナ検索 (Ctrl+S)
-                                if favorites_menu_commands.contains(&MenuCommandId::FavoritesFavSearch)
-                                    && ui.button(&fav_search_menu_label).clicked()
-                                {
-                                    self.open_favsearch();
-                                    ui.close();
-                                }
-
-                                // アイテム検索 (Ctrl+G)
-                                if favorites_menu_commands.contains(&MenuCommandId::FavoritesMetadataSearch)
-                                    && ui.button(&metadata_search_menu_label).clicked()
-                                {
-                                    // 相互排他は toggle_global_search 内で
-                                    self.toggle_global_search();
-                                    ui.close();
                                 }
 
                                 // 区切り線
@@ -2277,69 +2303,70 @@ impl App {
                                 let active_name = self.active_book_name();
                                 ui.label(format!("追加先の本: {active_name}"));
                                 let has_selection = self.selected.is_some() || !self.checked.is_empty();
-                                if books_menu_commands
-                                    .contains(&MenuCommandId::BooksAddSelectionToActiveBook)
-                                {
-                                    let add_resp = ui
-                                        .add_enabled(
-                                            has_selection,
-                                            egui::Button::new(&book_add_selection_menu_label),
-                                        )
-                                        .hover_tip(if has_selection {
-                                            "選択中またはチェック済みの画像・ページを追加先の本へ追加"
-                                        } else {
-                                            "追加する画像・ページを選択してください"
-                                        });
-                                    if add_resp.clicked() {
-                                        self.add_grid_selection_to_active_book(ctx);
-                                        ui.close();
+                                for &command in books_menu_commands {
+                                    match command {
+                                        MenuCommandId::BooksAddSelectionToActiveBook => {
+                                            let add_resp = ui
+                                                .add_enabled(
+                                                    has_selection,
+                                                    egui::Button::new(&book_add_selection_menu_label),
+                                                )
+                                                .hover_tip(if has_selection {
+                                                    "選択中またはチェック済みの画像・ページを追加先の本へ追加"
+                                                } else {
+                                                    "追加する画像・ページを選択してください"
+                                                });
+                                            if add_resp.clicked() {
+                                                self.add_grid_selection_to_active_book(ctx);
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::BooksAddClipboardImage => {
+                                            if ui.button(&book_add_clipboard_menu_label).clicked() {
+                                                self.add_clipboard_image_to_active_book(ctx);
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::BooksOpenRoot => {
+                                            if ui.button(&book_open_root_menu_label).clicked() {
+                                                self.open_books_root();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::BooksOpenActiveBook => {
+                                            if ui.button(&book_open_active_menu_label).clicked() {
+                                                fav_nav = Some(self.active_book_folder_path());
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::BooksReorderCurrentBook => {
+                                            let can_reorder_book = self.current_folder_is_book_folder();
+                                            let reorder_resp = ui
+                                                .add_enabled(
+                                                    can_reorder_book,
+                                                    egui::Button::new(&book_reorder_menu_label),
+                                                )
+                                                .hover_tip(if can_reorder_book {
+                                                    "現在開いている本のページ順を変更"
+                                                } else {
+                                                    "本を開くと使用できます"
+                                                });
+                                            if reorder_resp.clicked() {
+                                                self.open_book_reorder_from_current();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::BooksManage => {
+                                            ui.separator();
+                                            if ui.button(&book_manage_menu_label).clicked() {
+                                                self.show_book_manager = true;
+                                                self.book_manager_rename_name = active_name.clone();
+                                                self.book_list_cache = None;
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                }
-                                if books_menu_commands.contains(&MenuCommandId::BooksAddClipboardImage)
-                                    && ui.button(&book_add_clipboard_menu_label).clicked()
-                                {
-                                    self.add_clipboard_image_to_active_book(ctx);
-                                    ui.close();
-                                }
-                                if books_menu_commands.contains(&MenuCommandId::BooksOpenRoot)
-                                    && ui.button(&book_open_root_menu_label).clicked()
-                                {
-                                    self.open_books_root();
-                                    ui.close();
-                                }
-                                if books_menu_commands.contains(&MenuCommandId::BooksOpenActiveBook)
-                                    && ui.button(&book_open_active_menu_label).clicked()
-                                {
-                                    fav_nav = Some(self.active_book_folder_path());
-                                    ui.close();
-                                }
-                                if books_menu_commands.contains(&MenuCommandId::BooksReorderCurrentBook) {
-                                    let can_reorder_book = self.current_folder_is_book_folder();
-                                    let reorder_resp = ui
-                                        .add_enabled(
-                                            can_reorder_book,
-                                            egui::Button::new(&book_reorder_menu_label),
-                                        )
-                                        .hover_tip(if can_reorder_book {
-                                            "現在開いている本のページ順を変更"
-                                        } else {
-                                            "本を開くと使用できます"
-                                        });
-                                    if reorder_resp.clicked() {
-                                        self.open_book_reorder_from_current();
-                                        ui.close();
-                                    }
-                                }
-                                if books_menu_commands.contains(&MenuCommandId::BooksManage) {
-                                    ui.separator();
-                                }
-                                if books_menu_commands.contains(&MenuCommandId::BooksManage)
-                                    && ui.button(&book_manage_menu_label).clicked()
-                                {
-                                    self.show_book_manager = true;
-                                    self.book_manager_rename_name = active_name.clone();
-                                    self.book_list_cache = None;
-                                    ui.close();
                                 }
                                 ui.separator();
                                 if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
@@ -2379,40 +2406,46 @@ impl App {
                             let video_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::Video.label(), |ui| {
                                 let can_apply_to_selected = selected_video_path.is_some();
-                                if video_menu_commands.contains(&MenuCommandId::VideoRegisterUpscale)
-                                    && ui
-                                        .add_enabled(
-                                            can_apply_to_selected,
-                                            egui::Button::new(&video_register_upscale_menu_label),
-                                        )
-                                        .clicked()
-                                {
-                                    if let Some(path) = selected_video_path.clone() {
-                                        self.request_video_upscale(path);
+                                for &command in video_menu_commands {
+                                    match command {
+                                        MenuCommandId::VideoRegisterUpscale => {
+                                            if ui
+                                                .add_enabled(
+                                                    can_apply_to_selected,
+                                                    egui::Button::new(&video_register_upscale_menu_label),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(path) = selected_video_path.clone() {
+                                                    self.request_video_upscale(path);
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::VideoDeleteUpscale => {
+                                            if ui
+                                                .add_enabled(
+                                                    can_apply_to_selected,
+                                                    egui::Button::new(&video_delete_upscale_menu_label),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(path) = selected_video_path.clone() {
+                                                    self.request_video_upscale_artifact_delete(path);
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::VideoShowUpscaleTasks => {
+                                            ui.separator();
+                                            if ui.button(&video_show_upscale_tasks_menu_label).clicked()
+                                            {
+                                                self.show_video_upscale_tasks = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    ui.close();
-                                }
-                                if video_menu_commands.contains(&MenuCommandId::VideoDeleteUpscale)
-                                    && ui
-                                        .add_enabled(
-                                            can_apply_to_selected,
-                                            egui::Button::new(&video_delete_upscale_menu_label),
-                                        )
-                                        .clicked()
-                                {
-                                    if let Some(path) = selected_video_path.clone() {
-                                        self.request_video_upscale_artifact_delete(path);
-                                    }
-                                    ui.close();
-                                }
-                                if video_menu_commands.contains(&MenuCommandId::VideoShowUpscaleTasks) {
-                                    ui.separator();
-                                }
-                                if video_menu_commands.contains(&MenuCommandId::VideoShowUpscaleTasks)
-                                    && ui.button(&video_show_upscale_tasks_menu_label).clicked()
-                                {
-                                    self.show_video_upscale_tasks = true;
-                                    ui.close();
                                 }
                             });
                             top_menu_responses.push(response.response);
@@ -2421,17 +2454,23 @@ impl App {
                             let tags_menu_commands = &resolved_top_menu.commands;
                             let response =
                                 ui.menu_button(TopMenuId::Tags.label(), |ui| {
-                                    if tags_menu_commands.contains(&MenuCommandId::TagsManagePinned)
-                                        && ui.button(&tag_manage_pinned_menu_label).clicked()
-                                    {
-                                        self.open_tag_editor();
-                                        ui.close();
-                                    }
-                                    if tags_menu_commands.contains(&MenuCommandId::TagsTagView)
-                                        && ui.button(&tag_view_menu_label).clicked()
-                                    {
-                                        self.open_tag_view();
-                                        ui.close();
+                                    for &command in tags_menu_commands {
+                                        match command {
+                                            MenuCommandId::TagsManagePinned => {
+                                                if ui.button(&tag_manage_pinned_menu_label).clicked()
+                                                {
+                                                    self.open_tag_editor();
+                                                    ui.close();
+                                                }
+                                            }
+                                            MenuCommandId::TagsTagView => {
+                                                if ui.button(&tag_view_menu_label).clicked() {
+                                                    self.open_tag_view();
+                                                    ui.close();
+                                                }
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                     ui.separator();
                                     let selection_count = self.tag_target_path_count();
@@ -2644,74 +2683,104 @@ impl App {
                                     });
                                 }
                                 ui.separator();
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsThumbnailCache)
-                                    && ui.button(&settings_thumbnail_cache_menu_label).clicked()
-                                {
-                                    let cache_dir = crate::catalog::default_cache_dir();
-                                    // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
-                                    // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
-                                    self.cache_manager_stats = None;
-                                    self.cache_manager_tile_bytes = None;
-                                    self.cache_manager_auto_aspect_entries = None;
-                                    self.cache_manager_result = None;
-                                    if self.cache_maint_pending.is_none() {
-                                        self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
-                                            crate::cache_maintenance::CacheMaintTask::Stats,
-                                            cache_dir,
-                                            self.video_tile_cache.clone(),
-                                        ));
+                                let mut toolbar_menu_drawn = false;
+                                for &command in settings_menu_commands {
+                                    match command {
+                                        MenuCommandId::SettingsThumbnailCache => {
+                                            if ui
+                                                .button(&settings_thumbnail_cache_menu_label)
+                                                .clicked()
+                                            {
+                                                let cache_dir = crate::catalog::default_cache_dir();
+                                                // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
+                                                // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
+                                                self.cache_manager_stats = None;
+                                                self.cache_manager_tile_bytes = None;
+                                                self.cache_manager_auto_aspect_entries = None;
+                                                self.cache_manager_result = None;
+                                                if self.cache_maint_pending.is_none() {
+                                                    self.cache_maint_pending = Some(
+                                                        crate::cache_maintenance::spawn(
+                                                            crate::cache_maintenance::CacheMaintTask::Stats,
+                                                            cache_dir,
+                                                            self.video_tile_cache.clone(),
+                                                        ),
+                                                    );
+                                                }
+                                                self.show_cache_manager = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsArchiveCache => {
+                                            if ui.button(&settings_archive_cache_menu_label).clicked()
+                                            {
+                                                self.open_archive_cache_manager();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsThumbnailQuality => {
+                                            if ui
+                                                .button(&settings_thumbnail_quality_menu_label)
+                                                .clicked()
+                                            {
+                                                self.open_thumb_quality_dialog(ctx);
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsStats => {
+                                            if ui.button(&settings_stats_menu_label).clicked() {
+                                                self.show_stats_dialog = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsResetRotation => {
+                                            ui.separator();
+                                            if ui.button(&settings_reset_rotation_menu_label).clicked()
+                                            {
+                                                self.show_rotation_reset_confirm = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsRestoreSettings => {
+                                            ui.separator();
+                                            if ui.button(&settings_restore_menu_label).clicked() {
+                                                // 2026-05-17: settings.db のバックアップから復元する UI。
+                                                // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
+                                                // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
+                                                self.open_settings_restore_dialog();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsPreferences => {
+                                            if !toolbar_menu_drawn {
+                                                ui.separator();
+                                                // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
+                                                // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
+                                                // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                                                // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
+                                                ui.menu_button("ツールバー", |ui| {
+                                                    self.draw_toolbar_visibility_menu(ui, true);
+                                                });
+                                                toolbar_menu_drawn = true;
+                                            }
+                                            if ui.button(&settings_preferences_menu_label).clicked()
+                                            {
+                                                self.show_preferences = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    self.show_cache_manager = true;
-                                    ui.close();
                                 }
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsArchiveCache)
-                                    && ui.button(&settings_archive_cache_menu_label).clicked()
-                                {
-                                    self.open_archive_cache_manager();
-                                    ui.close();
-                                }
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsThumbnailQuality)
-                                    && ui.button(&settings_thumbnail_quality_menu_label).clicked()
-                                {
-                                    self.open_thumb_quality_dialog(ctx);
-                                    ui.close();
-                                }
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsStats)
-                                    && ui.button(&settings_stats_menu_label).clicked()
-                                {
-                                    self.show_stats_dialog = true;
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsResetRotation)
-                                    && ui.button(&settings_reset_rotation_menu_label).clicked()
-                                {
-                                    self.show_rotation_reset_confirm = true;
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsRestoreSettings)
-                                    && ui.button(&settings_restore_menu_label).clicked()
-                                {
-                                    // 2026-05-17: settings.db のバックアップから復元する UI。
-                                    // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
-                                    // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
-                                    self.open_settings_restore_dialog();
-                                    ui.close();
-                                }
-                                ui.separator();
-                                // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
-                                // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
-                                // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
-                                // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
-                                ui.menu_button("ツールバー", |ui| {
-                                    self.draw_toolbar_visibility_menu(ui, true);
-                                });
-                                if settings_menu_commands.contains(&MenuCommandId::SettingsPreferences)
-                                    && ui.button(&settings_preferences_menu_label).clicked()
-                                {
-                                    self.show_preferences = true;
-                                    ui.close();
+                                if !toolbar_menu_drawn {
+                                    ui.separator();
+                                    // ツールバーのカスタマイズは原則ツールバーの右クリックで行うが、全セクションを
+                                    // 隠すとツールバー自体が消えて右クリックの入口が無くなる (Codex P2)。
+                                    // この常設メニューを最後の砦にして、いつでも再表示・既定化できるようにする。
+                                    // 「既定に戻す」は影響が大きいのでここ (設定メニュー) にだけ出す (show_reset=true)。
+                                    ui.menu_button("ツールバー", |ui| {
+                                        self.draw_toolbar_visibility_menu(ui, true);
+                                    });
                                 }
                                 // VST3 関連の設定は環境設定→VST3 プラグインページに集約。
                                 // 専用メニューは重複なので持たない (= ユーザー要望 2026-04)。
@@ -2723,69 +2792,99 @@ impl App {
                         TopMenuId::Help => {
                             let help_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::Help.label(), |ui| {
-                                if help_menu_commands.contains(&MenuCommandId::HelpOpenManual)
-                                    && ui.button(&help_open_manual_menu_label).clicked()
-                                {
-                                    let url = crate::ui_helpers::manual_url("index.html", None);
-                                    crate::ui_helpers::open_url(&url);
-                                    ui.close();
-                                }
-                                if help_menu_commands.contains(&MenuCommandId::HelpOpenLogs) {
-                                    ui.separator();
-                                }
-                                if help_menu_commands.contains(&MenuCommandId::HelpOpenLogs)
-                                    && ui.button(&help_open_logs_menu_label).clicked()
-                                {
-                                    let dir = crate::data_dir::logs_dir();
-                                    let _ = std::fs::create_dir_all(&dir);
-                                    crate::ui_helpers::open_external_player(&dir);
-                                    ui.close();
-                                }
-                                ui.separator();
-                                let checking = self.update_check_pending.is_some();
-                                if ui
-                                    .add_enabled(
-                                        !checking,
-                                        egui::Button::new(if checking {
-                                            "更新を確認中…"
-                                        } else {
-                                            "更新を確認…"
-                                        }),
-                                    )
-                                    .clicked()
-                                {
-                                    self.kick_update_check(true);
-                                    ui.close();
-                                }
-                                if help_menu_commands.contains(&MenuCommandId::HelpShowWhatsNew)
-                                    && ui
-                                        .button(&help_show_whats_new_menu_label)
-                                        .on_hover_text("このバージョンの主な変更点をもう一度表示します")
-                                        .clicked()
-                                {
-                                    // 現行版のエントリ。無ければ最新エントリにフォールバック (空メニュー回避)。
-                                    let mut entries = crate::version_highlights::for_version(
-                                        env!("CARGO_PKG_VERSION"),
-                                        crate::version_highlights::table(),
-                                    );
-                                    if entries.is_empty() {
-                                        if let Some(last) = crate::version_highlights::table().last() {
-                                            entries = vec![last];
+                                let mut update_check_drawn = false;
+                                for &command in help_menu_commands {
+                                    match command {
+                                        MenuCommandId::HelpOpenManual => {
+                                            if ui.button(&help_open_manual_menu_label).clicked() {
+                                                let url =
+                                                    crate::ui_helpers::manual_url("index.html", None);
+                                                crate::ui_helpers::open_url(&url);
+                                                ui.close();
+                                            }
                                         }
+                                        MenuCommandId::HelpOpenLogs => {
+                                            ui.separator();
+                                            if ui.button(&help_open_logs_menu_label).clicked() {
+                                                let dir = crate::data_dir::logs_dir();
+                                                let _ = std::fs::create_dir_all(&dir);
+                                                crate::ui_helpers::open_external_player(&dir);
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            let checking = self.update_check_pending.is_some();
+                                            if ui
+                                                .add_enabled(
+                                                    !checking,
+                                                    egui::Button::new(if checking {
+                                                        "更新を確認中…"
+                                                    } else {
+                                                        "更新を確認…"
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.kick_update_check(true);
+                                                ui.close();
+                                            }
+                                            update_check_drawn = true;
+                                        }
+                                        MenuCommandId::HelpShowWhatsNew => {
+                                            if ui
+                                                .button(&help_show_whats_new_menu_label)
+                                                .on_hover_text(
+                                                    "このバージョンの主な変更点をもう一度表示します",
+                                                )
+                                                .clicked()
+                                            {
+                                                // 現行版のエントリ。無ければ最新エントリにフォールバック (空メニュー回避)。
+                                                let mut entries =
+                                                    crate::version_highlights::for_version(
+                                                        env!("CARGO_PKG_VERSION"),
+                                                        crate::version_highlights::table(),
+                                                    );
+                                                if entries.is_empty() {
+                                                    if let Some(last) =
+                                                        crate::version_highlights::table().last()
+                                                    {
+                                                        entries = vec![last];
+                                                    }
+                                                }
+                                                // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
+                                                // ショートカットを塞がないよう、開かない (Codex P3)。
+                                                if !entries.is_empty() {
+                                                    self.whats_new_entries = entries;
+                                                    self.show_whats_new = true;
+                                                }
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::HelpAbout => {
+                                            if ui.button(&help_about_menu_label).clicked() {
+                                                self.show_about_dialog = true;
+                                                ui.close();
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
-                                    // ショートカットを塞がないよう、開かない (Codex P3)。
-                                    if !entries.is_empty() {
-                                        self.whats_new_entries = entries;
-                                        self.show_whats_new = true;
-                                    }
-                                    ui.close();
                                 }
-                                if help_menu_commands.contains(&MenuCommandId::HelpAbout)
-                                    && ui.button(&help_about_menu_label).clicked()
-                                {
-                                    self.show_about_dialog = true;
-                                    ui.close();
+                                if !update_check_drawn {
+                                    ui.separator();
+                                    let checking = self.update_check_pending.is_some();
+                                    if ui
+                                        .add_enabled(
+                                            !checking,
+                                            egui::Button::new(if checking {
+                                                "更新を確認中…"
+                                            } else {
+                                                "更新を確認…"
+                                            }),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.kick_update_check(true);
+                                        ui.close();
+                                    }
                                 }
                             });
                             top_menu_responses.push(response.response);
