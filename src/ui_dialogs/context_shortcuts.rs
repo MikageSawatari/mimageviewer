@@ -75,7 +75,7 @@ impl App {
         let scroll_max_h = (ctx.content_rect().height() - 180.0).min(620.0).max(160.0);
         let rows = self
             .keymap
-            .command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, false);
+            .command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, true);
         let mut close_clicked = false;
 
         egui::Window::new("ショートカット")
@@ -96,6 +96,7 @@ impl App {
                         for scope in GRID_ACTIVE_SCOPES {
                             draw_command_scope_rows(ui, *scope, &rows);
                         }
+                        draw_unassigned_command_rows(ui, &rows);
                         draw_fixed_grid_rows(ui);
                     });
 
@@ -114,7 +115,10 @@ impl App {
 }
 
 fn draw_command_scope_rows(ui: &mut egui::Ui, scope: CommandScope, rows: &[CommandDisplayRow]) {
-    if !rows.iter().any(|row| row.spec.scope == scope) {
+    if !rows
+        .iter()
+        .any(|row| row.spec.scope == scope && !row.shortcut_labels.is_empty())
+    {
         return;
     }
 
@@ -126,9 +130,34 @@ fn draw_command_scope_rows(ui: &mut egui::Ui, scope: CommandScope, rows: &[Comma
         .spacing([18.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
-            for row in rows.iter().filter(|row| row.spec.scope == scope) {
+            for row in rows
+                .iter()
+                .filter(|row| row.spec.scope == scope && !row.shortcut_labels.is_empty())
+            {
                 let shortcut = row.shortcut_labels.join(" / ");
                 ui.monospace(shortcut);
+                ui.label(row.spec.description());
+                ui.end_row();
+            }
+        });
+}
+
+fn draw_unassigned_command_rows(ui: &mut egui::Ui, rows: &[CommandDisplayRow]) {
+    if !rows.iter().any(|row| row.shortcut_labels.is_empty()) {
+        return;
+    }
+
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("キー未設定 / 無効化中").strong());
+    ui.label("左の名前は keymap.ini の Action 名です。");
+    ui.add_space(2.0);
+    egui::Grid::new("context_shortcuts_unassigned")
+        .num_columns(2)
+        .spacing([18.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for row in rows.iter().filter(|row| row.shortcut_labels.is_empty()) {
+                ui.monospace(row.spec.ini_name());
                 ui.label(row.spec.description());
                 ui.end_row();
             }
