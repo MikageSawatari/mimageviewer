@@ -139,6 +139,10 @@ impl App {
             mouse_nav: None,
             jump_to: None,
         };
+        if !self.ime_input_active() && Self::consume_context_shortcuts_help_key(ctx) {
+            self.show_context_shortcuts_help = true;
+            return action;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.reset_export_crop_mode();
             return action;

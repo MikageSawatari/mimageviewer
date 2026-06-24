@@ -65,7 +65,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        上級者向けに、一部のキーボード操作は <code>%APPDATA%\mimageviewer\keymap.ini</code> で変更できます。ファイルは初回起動時にコメント付きで生成され、最新の標準一覧は同じ場所の <code>keymap.ini.default</code> に生成されます。標準キーがない操作は <code># ... = none</code> として表示され、キー名に書き換えると割り当てできます。競合や予約キーへの割り当ては起動時に警告ログを出します。一部メニュー、★フィルター、フルスクリーンホバーバー、動画 HUD、消しゴム / 隠蔽加工パネルのツールボタンなどは、表示上のキー表記も設定に追従します。グリッド表示中、画像フルスクリーン中、消しゴム / 隠蔽加工モード中は <kbd>?</kbd> で、現在使えるショートカット一覧とキー未設定の操作を確認できます。
+        上級者向けに、一部のキーボード操作は <code>%APPDATA%\mimageviewer\keymap.ini</code> で変更できます。ファイルは初回起動時にコメント付きで生成され、最新の標準一覧は同じ場所の <code>keymap.ini.default</code> に生成されます。標準キーがない操作は <code># ... = none</code> として表示され、キー名に書き換えると割り当てできます。競合や予約キーへの割り当ては起動時に警告ログを出します。一部メニュー、★フィルター、フルスクリーンホバーバー、動画 HUD、消しゴム / 隠蔽加工パネルのツールボタンなどは、表示上のキー表記も設定に追従します。グリッド表示中、画像フルスクリーン中、消しゴム / 隠蔽加工 / 切り取りモード中は <kbd>?</kbd> で、現在使えるショートカット一覧とキー未設定の操作を確認できます。
       </div>
     </div>
 
@@ -607,6 +607,24 @@
           <tr><td><kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd></td><td>現在ページの隠蔽マスクを削除</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo</td></tr>
           <tr><td><kbd>Del</kbd></td><td>選択中のオブジェクトを削除</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>切り取りモード</h2>
+    <p>画像補正パネルの切り取りアイコンから開始します。切り取り範囲はコピー / 保存 / エクスポート時の出力に反映されます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー / 操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>?</kbd></td><td>切り取りモードで使えるショートカット一覧を表示。<code>keymap.ini</code> で変更した操作は実際の割り当てで表示し、キー未設定 / 無効化中の操作は別枠で表示</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>E</kbd></td><td>切り取りを確定し、現在の表示結果を別ファイルへエクスポート</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>切り取りモードを終了</td></tr>
+          <tr><td>ドラッグ</td><td>切り取り範囲を作成、移動、またはリサイズ</td></tr>
+          <tr><td><kbd>Space</kbd>+左ドラッグ</td><td>一時パン</td></tr>
+          <tr><td>マウスホイール / <kbd>Ctrl</kbd>+ホイール</td><td>画像上ではズーム。パネル上ではスクロールまたはズーム</td></tr>
         </tbody>
       </table>
     </div>
