@@ -1,4 +1,8 @@
 use super::*;
+use crate::keymap::{
+    MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId, menu_command_spec,
+    menu_commands_for_parent,
+};
 use crate::ring_shortcut::{
     RingActionId, RingDirection, RingShortcutContext, RingShortcutSettings,
 };
@@ -6,6 +10,7 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
     Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, UiTheme,
 };
+use std::collections::BTreeSet;
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(egui::RichText::new("テーマ").strong());
@@ -481,6 +486,265 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
     for &context in RingShortcutContext::all() {
         mouse_button_context_editor(ui, settings, context);
     }
+}
+
+pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.small("メニューバーの上位メニューと固定項目の表示順を変更します。登録済みお気に入り、タグ一覧、更新確認など状態で変わる項目は固定位置に残ります。");
+    ui.add_space(8.0);
+
+    let layout_snapshot = state.settings.menu_layout.clone();
+    let top_order = menu_layout_top_order(&layout_snapshot);
+    let hidden = menu_layout_hidden_set(&layout_snapshot);
+    let mut edit: Option<MenuLayoutEdit> = None;
+
+    ui.horizontal(|ui| {
+        if ui.button("既定に戻す").clicked() {
+            edit = Some(MenuLayoutEdit::Reset);
+        }
+        if ui.button("すべて表示").clicked() {
+            edit = Some(MenuLayoutEdit::ShowAll);
+        }
+    });
+
+    ui.add_space(8.0);
+
+    for (top_index, &top) in top_order.iter().enumerate() {
+        let command_order = menu_layout_command_order(&layout_snapshot, top);
+        let visible_count = command_order
+            .iter()
+            .filter(|id| !hidden.contains(id))
+            .count();
+        let mut top_visible = visible_count > 0;
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(top_index > 0, egui::Button::new("↑").small())
+                .on_hover_text("上へ")
+                .clicked()
+            {
+                edit = Some(MenuLayoutEdit::MoveTop(top_index, -1));
+            }
+            if ui
+                .add_enabled(
+                    top_index + 1 < top_order.len(),
+                    egui::Button::new("↓").small(),
+                )
+                .on_hover_text("下へ")
+                .clicked()
+            {
+                edit = Some(MenuLayoutEdit::MoveTop(top_index, 1));
+            }
+            if ui.checkbox(&mut top_visible, top.label()).changed() {
+                edit = Some(MenuLayoutEdit::SetTopVisible(top, top_visible));
+            }
+            ui.label(
+                egui::RichText::new(format!("{visible_count} / {}", command_order.len()))
+                    .weak()
+                    .size(11.0),
+            );
+        });
+
+        egui::CollapsingHeader::new(format!("{} の項目", top.label()))
+            .id_salt(("menu_layout_top", top))
+            .default_open(top_visible)
+            .show(ui, |ui| {
+                egui::Grid::new(("menu_layout_commands", top))
+                    .num_columns(4)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (command_index, &command) in command_order.iter().enumerate() {
+                            let mut command_visible = !hidden.contains(&command);
+                            if ui
+                                .checkbox(&mut command_visible, "")
+                                .on_hover_text("表示")
+                                .changed()
+                            {
+                                edit = Some(MenuLayoutEdit::SetCommandVisible(
+                                    command,
+                                    command_visible,
+                                ));
+                            }
+
+                            let label = menu_command_spec(command)
+                                .map(|spec| spec.label)
+                                .unwrap_or(command.stable_name());
+                            ui.label(label);
+
+                            if ui
+                                .add_enabled(command_index > 0, egui::Button::new("↑").small())
+                                .on_hover_text("上へ")
+                                .clicked()
+                            {
+                                edit = Some(MenuLayoutEdit::MoveCommand(top, command_index, -1));
+                            }
+                            if ui
+                                .add_enabled(
+                                    command_index + 1 < command_order.len(),
+                                    egui::Button::new("↓").small(),
+                                )
+                                .on_hover_text("下へ")
+                                .clicked()
+                            {
+                                edit = Some(MenuLayoutEdit::MoveCommand(top, command_index, 1));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    if let Some(edit) = edit {
+        apply_menu_layout_edit(&mut state.settings.menu_layout, edit);
+    }
+}
+
+enum MenuLayoutEdit {
+    Reset,
+    ShowAll,
+    MoveTop(usize, i32),
+    SetTopVisible(TopMenuId, bool),
+    MoveCommand(TopMenuId, usize, i32),
+    SetCommandVisible(MenuCommandId, bool),
+}
+
+fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit) {
+    match edit {
+        MenuLayoutEdit::Reset => {
+            *layout = MenuLayoutSettings::default();
+        }
+        MenuLayoutEdit::ShowAll => {
+            layout.hidden_commands.clear();
+        }
+        MenuLayoutEdit::MoveTop(index, delta) => {
+            let mut order = menu_layout_top_order(layout);
+            if move_index(&mut order, index, delta) {
+                write_menu_layout_top_order(layout, &order);
+            }
+        }
+        MenuLayoutEdit::SetTopVisible(top, visible) => {
+            let mut hidden = menu_layout_hidden_set(layout);
+            for spec in menu_commands_for_parent(top) {
+                if visible {
+                    hidden.remove(&spec.id);
+                } else {
+                    hidden.insert(spec.id);
+                }
+            }
+            write_menu_layout_hidden(layout, &hidden);
+        }
+        MenuLayoutEdit::MoveCommand(parent, index, delta) => {
+            let mut order = menu_layout_command_order(layout, parent);
+            if move_index(&mut order, index, delta) {
+                write_menu_layout_command_order(layout, parent, &order);
+            }
+        }
+        MenuLayoutEdit::SetCommandVisible(command, visible) => {
+            let mut hidden = menu_layout_hidden_set(layout);
+            if visible {
+                hidden.remove(&command);
+            } else {
+                hidden.insert(command);
+            }
+            write_menu_layout_hidden(layout, &hidden);
+        }
+    }
+}
+
+fn move_index<T>(items: &mut [T], index: usize, delta: i32) -> bool {
+    let Some(target) = (index as i32).checked_add(delta) else {
+        return false;
+    };
+    if target < 0 || target as usize >= items.len() {
+        return false;
+    }
+    items.swap(index, target as usize);
+    true
+}
+
+fn menu_layout_top_order(layout: &MenuLayoutSettings) -> Vec<TopMenuId> {
+    let mut out = Vec::with_capacity(TopMenuId::ALL.len());
+    for name in &layout.top_menu_order {
+        if let Some(id) = TopMenuId::parse_stable_name(name)
+            && !out.contains(&id)
+        {
+            out.push(id);
+        }
+    }
+    for &id in TopMenuId::ALL {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+fn write_menu_layout_top_order(layout: &mut MenuLayoutSettings, order: &[TopMenuId]) {
+    layout.top_menu_order = order
+        .iter()
+        .map(|id| id.stable_name().to_string())
+        .collect();
+}
+
+fn menu_layout_command_order(layout: &MenuLayoutSettings, parent: TopMenuId) -> Vec<MenuCommandId> {
+    let mut out = Vec::new();
+    for order in &layout.command_order {
+        if TopMenuId::parse_stable_name(&order.parent) != Some(parent) {
+            continue;
+        }
+        for name in &order.commands {
+            let Some(id) = MenuCommandId::parse_stable_name(name) else {
+                continue;
+            };
+            if out.contains(&id) {
+                continue;
+            }
+            if menu_command_spec(id).is_some_and(|spec| spec.parent == parent) {
+                out.push(id);
+            }
+        }
+    }
+    for spec in menu_commands_for_parent(parent) {
+        if !out.contains(&spec.id) {
+            out.push(spec.id);
+        }
+    }
+    out
+}
+
+fn write_menu_layout_command_order(
+    layout: &mut MenuLayoutSettings,
+    parent: TopMenuId,
+    order: &[MenuCommandId],
+) {
+    layout
+        .command_order
+        .retain(|entry| TopMenuId::parse_stable_name(&entry.parent) != Some(parent));
+    layout.command_order.push(MenuCommandOrderSettings {
+        parent: parent.stable_name().to_string(),
+        commands: order
+            .iter()
+            .map(|id| id.stable_name().to_string())
+            .collect(),
+    });
+}
+
+fn menu_layout_hidden_set(layout: &MenuLayoutSettings) -> BTreeSet<MenuCommandId> {
+    layout
+        .hidden_commands
+        .iter()
+        .filter_map(|name| MenuCommandId::parse_stable_name(name))
+        .collect()
+}
+
+fn write_menu_layout_hidden(layout: &mut MenuLayoutSettings, hidden: &BTreeSet<MenuCommandId>) {
+    layout.hidden_commands = MenuCommandId::ALL
+        .iter()
+        .copied()
+        .filter(|id| hidden.contains(id))
+        .map(|id| id.stable_name().to_string())
+        .collect();
 }
 
 fn mouse_button_context_editor(
