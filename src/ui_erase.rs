@@ -630,31 +630,40 @@ impl App {
         let key_r_tool = self.keymap.consume_action(ctx, KeyAction::EraseToolRect);
         let key_o_tool = self.keymap.consume_action(ctx, KeyAction::EraseToolEllipse);
         if key_s_tool {
-            self.switch_erase_tool(EraseTool::Select, "[選択]");
+            let toast = self.erase_tool_toast("選択", EraseTool::Select);
+            self.switch_erase_tool(EraseTool::Select, &toast);
         }
         if key_b {
-            self.switch_erase_tool(EraseTool::Brush, "[筆]");
+            let toast = self.erase_tool_toast("筆", EraseTool::Brush);
+            self.switch_erase_tool(EraseTool::Brush, &toast);
         }
         if key_l {
-            self.switch_erase_tool(EraseTool::Lasso, "[囲み]");
+            let toast = self.erase_tool_toast("囲み", EraseTool::Lasso);
+            self.switch_erase_tool(EraseTool::Lasso, &toast);
         }
         if key_p {
-            self.switch_erase_tool(EraseTool::Polygon, "[多角形]");
+            let toast = self.erase_tool_toast("多角形", EraseTool::Polygon);
+            self.switch_erase_tool(EraseTool::Polygon, &toast);
         }
         if key_v {
-            self.switch_erase_tool(EraseTool::VertLine, "[縦線]");
+            let toast = self.erase_tool_toast("縦線", EraseTool::VertLine);
+            self.switch_erase_tool(EraseTool::VertLine, &toast);
         }
         if key_h {
-            self.switch_erase_tool(EraseTool::HorizLine, "[横線]");
+            let toast = self.erase_tool_toast("横線", EraseTool::HorizLine);
+            self.switch_erase_tool(EraseTool::HorizLine, &toast);
         }
         if key_i {
-            self.switch_erase_tool(EraseTool::Line, "[直線]");
+            let toast = self.erase_tool_toast("直線", EraseTool::Line);
+            self.switch_erase_tool(EraseTool::Line, &toast);
         }
         if key_r_tool {
-            self.switch_erase_tool(EraseTool::Rect, "[矩形]");
+            let toast = self.erase_tool_toast("矩形", EraseTool::Rect);
+            self.switch_erase_tool(EraseTool::Rect, &toast);
         }
         if key_o_tool {
-            self.switch_erase_tool(EraseTool::Ellipse, "[楕円]");
+            let toast = self.erase_tool_toast("楕円", EraseTool::Ellipse);
+            self.switch_erase_tool(EraseTool::Ellipse, &toast);
         }
 
         // D: 描画モード, F: 消去モード
@@ -1030,6 +1039,29 @@ impl App {
         // (Phase 1-5 code-review CONFIRMED)。
         self.erase_panel_body_content_h = None;
         self.show_feedback_toast(toast.to_string());
+    }
+
+    fn erase_tool_key_action(tool: EraseTool) -> KeyAction {
+        match tool {
+            EraseTool::Select => KeyAction::EraseToolSelect,
+            EraseTool::Brush => KeyAction::EraseToolBrush,
+            EraseTool::Lasso => KeyAction::EraseToolLasso,
+            EraseTool::Polygon => KeyAction::EraseToolPolygon,
+            EraseTool::VertLine => KeyAction::EraseToolVLine,
+            EraseTool::HorizLine => KeyAction::EraseToolHLine,
+            EraseTool::Line => KeyAction::EraseToolLine,
+            EraseTool::Rect => KeyAction::EraseToolRect,
+            EraseTool::Ellipse => KeyAction::EraseToolEllipse,
+        }
+    }
+
+    fn erase_tool_label(&self, label: &str, tool: EraseTool) -> String {
+        self.keymap
+            .compact_action_label(label, Self::erase_tool_key_action(tool))
+    }
+
+    fn erase_tool_toast(&self, label: &str, tool: EraseTool) -> String {
+        format!("[{}]", self.erase_tool_label(label, tool))
     }
 
     /// Select 以外のツールでも「直近の選択 shape のハンドル」を操作できるよう、
@@ -2141,7 +2173,8 @@ impl App {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             if panel_toggle_button(
                                 ui,
-                                "描画 [D]",
+                                self.keymap
+                                    .compact_action_label("描画", KeyAction::ErasePaintMode),
                                 self.erase_paint_mode,
                                 Some(btn_size),
                                 Some(PanelToggleColors::paint_red()),
@@ -2152,7 +2185,8 @@ impl App {
                             }
                             if panel_toggle_button(
                                 ui,
-                                "消去 [F]",
+                                self.keymap
+                                    .compact_action_label("消去", KeyAction::EraseEraseMode),
                                 !self.erase_paint_mode,
                                 Some(btn_size),
                                 Some(PanelToggleColors::erase_blue()),
@@ -2173,16 +2207,17 @@ impl App {
                                 .color(egui::Color32::from_gray(200)),
                         );
                         let bitmap_rows: &[&[(&str, EraseTool)]] = &[
-                            &[("筆 [B]", EraseTool::Brush), ("囲み [L]", EraseTool::Lasso)],
-                            &[("多角形 [P]", EraseTool::Polygon)],
+                            &[("筆", EraseTool::Brush), ("囲み", EraseTool::Lasso)],
+                            &[("多角形", EraseTool::Polygon)],
                         ];
                         for row in bitmap_rows {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                for &(label, tool) in *row {
+                                for &(base_label, tool) in *row {
+                                    let label = self.erase_tool_label(base_label, tool);
                                     if panel_toggle_button(
                                         ui,
-                                        label,
+                                        label.as_str(),
                                         self.erase_tool == tool,
                                         Some(btn_size),
                                         None,
@@ -2201,25 +2236,26 @@ impl App {
                         );
                         let object_rows: [[(&str, EraseTool); 2]; 3] = [
                             [
-                                ("選択 [S]", EraseTool::Select),
-                                ("直線 [I]", EraseTool::Line),
+                                ("選択", EraseTool::Select),
+                                ("直線", EraseTool::Line),
                             ],
                             [
-                                ("縦線 [V]", EraseTool::VertLine),
-                                ("横線 [H]", EraseTool::HorizLine),
+                                ("縦線", EraseTool::VertLine),
+                                ("横線", EraseTool::HorizLine),
                             ],
                             [
-                                ("矩形 [R]", EraseTool::Rect),
-                                ("楕円 [O]", EraseTool::Ellipse),
+                                ("矩形", EraseTool::Rect),
+                                ("楕円", EraseTool::Ellipse),
                             ],
                         ];
                         for row in object_rows.iter() {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                for &(label, tool) in row.iter() {
+                                for &(base_label, tool) in row.iter() {
+                                    let label = self.erase_tool_label(base_label, tool);
                                     if panel_toggle_button(
                                         ui,
-                                        label,
+                                        label.as_str(),
                                         self.erase_tool == tool,
                                         Some(btn_size),
                                         None,

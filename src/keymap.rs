@@ -2538,13 +2538,23 @@ impl Keymap {
     }
 
     pub fn compact_single_key_label(&self, action: KeyAction) -> Option<&'static str> {
-        self.effective_chords(action).into_iter().find_map(|chord| {
-            if chord.ctrl || chord.shift || chord.alt {
-                None
-            } else {
-                chord.key.map(KeyName::display_name)
-            }
-        })
+        self.effective_chords(action)
+            .into_iter()
+            .next()
+            .and_then(|chord| {
+                if chord.ctrl || chord.shift || chord.alt {
+                    None
+                } else {
+                    chord.key.map(KeyName::display_name)
+                }
+            })
+    }
+
+    pub fn compact_action_label(&self, label: &str, action: KeyAction) -> String {
+        match self.compact_single_key_label(action) {
+            Some(key_label) => format!("{label} [{key_label}]"),
+            None => label.to_owned(),
+        }
     }
 
     pub fn resolve_first_action_for_chord(
@@ -3726,6 +3736,7 @@ mod tests {
             r#"
             [Erase]
             EraseToolBrush = Ctrl+B
+            EraseToolBrush.2 = J
             EraseToolLasso = L
             "#,
         );
@@ -3736,6 +3747,14 @@ mod tests {
         assert_eq!(
             keymap.compact_single_key_label(KeyAction::EraseToolBrush),
             None
+        );
+        assert_eq!(
+            keymap.compact_action_label("筆", KeyAction::EraseToolLasso),
+            "筆 [L]"
+        );
+        assert_eq!(
+            keymap.compact_action_label("筆", KeyAction::EraseToolBrush),
+            "筆"
         );
     }
 

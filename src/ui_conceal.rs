@@ -651,7 +651,8 @@ impl App {
                 self.conceal_selected_shape = None;
             }
             self.conceal_mask_texture = None;
-            self.show_feedback_toast(format!("[{}]", tool.label()));
+            let toast = self.conceal_tool_toast(Self::conceal_tool_base_label(tool), tool);
+            self.show_feedback_toast(toast);
         }
 
         // D: 描画モード, F: 消去モード
@@ -925,6 +926,43 @@ impl App {
         let mut out = mask.clone();
         crate::mask_db::rasterize_shapes_into(&mut out, &self.conceal_shapes, w, h);
         Some(out)
+    }
+
+    fn conceal_tool_base_label(tool: ConcealTool) -> &'static str {
+        match tool {
+            ConcealTool::Select => "選択",
+            ConcealTool::Brush => "筆",
+            ConcealTool::Lasso => "囲み",
+            ConcealTool::Polygon => "多角形",
+            ConcealTool::Line => "直線",
+            ConcealTool::VertLine => "縦線",
+            ConcealTool::HorizLine => "横線",
+            ConcealTool::Rect => "矩形",
+            ConcealTool::Ellipse => "楕円",
+        }
+    }
+
+    fn conceal_tool_key_action(tool: ConcealTool) -> KeyAction {
+        match tool {
+            ConcealTool::Select => KeyAction::ConcealToolSelect,
+            ConcealTool::Brush => KeyAction::ConcealToolBrush,
+            ConcealTool::Lasso => KeyAction::ConcealToolLasso,
+            ConcealTool::Polygon => KeyAction::ConcealToolPolygon,
+            ConcealTool::Line => KeyAction::ConcealToolLine,
+            ConcealTool::VertLine => KeyAction::ConcealToolVLine,
+            ConcealTool::HorizLine => KeyAction::ConcealToolHLine,
+            ConcealTool::Rect => KeyAction::ConcealToolRect,
+            ConcealTool::Ellipse => KeyAction::ConcealToolEllipse,
+        }
+    }
+
+    fn conceal_tool_label(&self, label: &str, tool: ConcealTool) -> String {
+        self.keymap
+            .compact_action_label(label, Self::conceal_tool_key_action(tool))
+    }
+
+    fn conceal_tool_toast(&self, label: &str, tool: ConcealTool) -> String {
+        format!("[{}]", self.conceal_tool_label(label, tool))
     }
 
     // ── ヒットテスト (Select ツール用) ─────────────────────────────
@@ -1992,7 +2030,10 @@ impl App {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             if panel_toggle_button(
                                                 ui,
-                                                "描画 [D]",
+                                                self.keymap.compact_action_label(
+                                                    "描画",
+                                                    KeyAction::ConcealPaintMode,
+                                                ),
                                                 self.conceal_paint_mode,
                                                 Some(btn_size),
                                                 Some(PanelToggleColors::paint_red()),
@@ -2003,7 +2044,10 @@ impl App {
                                             }
                                             if panel_toggle_button(
                                                 ui,
-                                                "消去 [F]",
+                                                self.keymap.compact_action_label(
+                                                    "消去",
+                                                    KeyAction::ConcealEraseMode,
+                                                ),
                                                 !self.conceal_paint_mode,
                                                 Some(btn_size),
                                                 Some(PanelToggleColors::erase_blue()),
@@ -2025,18 +2069,20 @@ impl App {
                                         let mut tool = self.conceal_tool;
                                         let bitmap_rows: &[&[(ConcealTool, &str)]] = &[
                                             &[
-                                                (ConcealTool::Brush, "筆 [B]"),
-                                                (ConcealTool::Lasso, "囲み [L]"),
+                                                (ConcealTool::Brush, "筆"),
+                                                (ConcealTool::Lasso, "囲み"),
                                             ],
-                                            &[(ConcealTool::Polygon, "多角形 [P]")],
+                                            &[(ConcealTool::Polygon, "多角形")],
                                         ];
                                         for row in bitmap_rows {
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                                for &(kind, label) in *row {
+                                                for &(kind, base_label) in *row {
+                                                    let label =
+                                                        self.conceal_tool_label(base_label, kind);
                                                     if panel_toggle_button(
                                                         ui,
-                                                        label,
+                                                        label.as_str(),
                                                         tool == kind,
                                                         Some(btn_size),
                                                         None,
@@ -2054,25 +2100,27 @@ impl App {
                                         );
                                         let object_rows: [[(ConcealTool, &str); 2]; 3] = [
                                             [
-                                                (ConcealTool::Select, "選択 [S]"),
-                                                (ConcealTool::Line, "直線 [I]"),
+                                                (ConcealTool::Select, "選択"),
+                                                (ConcealTool::Line, "直線"),
                                             ],
                                             [
-                                                (ConcealTool::VertLine, "縦線 [V]"),
-                                                (ConcealTool::HorizLine, "横線 [H]"),
+                                                (ConcealTool::VertLine, "縦線"),
+                                                (ConcealTool::HorizLine, "横線"),
                                             ],
                                             [
-                                                (ConcealTool::Rect, "矩形 [R]"),
-                                                (ConcealTool::Ellipse, "楕円 [O]"),
+                                                (ConcealTool::Rect, "矩形"),
+                                                (ConcealTool::Ellipse, "楕円"),
                                             ],
                                         ];
                                         for row in object_rows.iter() {
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                                for &(kind, label) in row.iter() {
+                                                for &(kind, base_label) in row.iter() {
+                                                    let label =
+                                                        self.conceal_tool_label(base_label, kind);
                                                     if panel_toggle_button(
                                                         ui,
-                                                        label,
+                                                        label.as_str(),
                                                         tool == kind,
                                                         Some(btn_size),
                                                         None,

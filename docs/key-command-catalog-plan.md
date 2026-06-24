@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 4 初期実装済み / レビュー済み** (2026-06-24)。
+> ステータス: **Phase 5 初期スライス実装済み / レビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -32,6 +32,12 @@
 > Esc / Enter / plain 矢印全体の自由化や、全面 dispatch resolver 置換はまだ行わない。
 > ClaudeCode レビュー後、`FS_IMAGE_ACTIVE_SCOPES` / `FS_VIDEO_ACTIVE_SCOPES` を共有定数化し、
 > resolver テストと実 dispatch が同じ active scope 定義を参照するようにした。
+>
+> **Phase 5 初期実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
+> `Keymap::compact_action_label()` を追加し、消しゴム / 隠蔽加工パネルの
+> 描画・消去ボタンとツールボタン (`筆 [B]` など) を実 keymap から表示するようにした。
+> 修飾付き chord や未割り当てでは compact 表示を省略する。メニュー表示、native 動画 overlay、
+> ツールチップのフル表記は後続。
 
 ## 1. 背景と狙い
 
@@ -409,12 +415,15 @@ pub enum BindingPolicy {
 - メニューの `(Ctrl+F)` などを `first_chord_label()` 由来にする。
 - 消しゴム / 隠蔽加工の `筆 [B]` などを `compact_single_key_label()` 由来にする。
 - native 動画 overlay へ必要な shortcut label snapshot を渡す。
+- **初期スライス実装済み**: 消しゴム / 隠蔽加工パネルの描画・消去ボタンとツールボタンを
+  `compact_action_label()` 由来にした。メニューと native 動画 overlay は未着手。
 
 完了条件:
 
 - keymap 変更後、主要メニュー / ツール名表示が実割り当てに追従する。
 - 複数 chord の場合は 1 つ目だけ表示する。
 - 修飾付き chord は compact 表示で無理に詰め込まない。
+- 初期スライスでは、修飾付きまたは未割り当てのツール shortcut はボタン上に表示しない。
 
 ### Phase 6: メニュー構成カスタマイズ
 
