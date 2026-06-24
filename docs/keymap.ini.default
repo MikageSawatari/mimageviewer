@@ -125,6 +125,8 @@
 [FsImage] ; 画像フルスクリーン
 # FsFixedJumpPrev = Shift+Left ; 設定した量だけ前へジャンプする
 # FsFixedJumpNext = Shift+Right ; 設定した量だけ先へジャンプする
+# FsStackJumpPrev = Shift+Up ; 前のスタックの先頭画像へジャンプする
+# FsStackJumpNext = Shift+Down ; 次のスタックの先頭画像へジャンプする
 # FsContinuousScrollForward = PageDown ; 連結表示中に次の画面分へスクロールする
 # FsContinuousScrollBack = PageUp ; 連結表示中に前の画面分へスクロールする
 # FsSpreadShiftLeft = Ctrl+Left ; 見開き表示を左方向へ1ページずらす

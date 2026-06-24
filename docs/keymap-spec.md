@@ -164,7 +164,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 |---|---|
 | <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次のファイル (見開き中は前 / 次の見開き = 2 ページ送り) |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次のファイル (= 一般慣例で左右と同義)。縦連結では縦スクロール、横連結では前 / 次ファイル。スライドショー中もフォルダ内移動は再生を止めない |
-| <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 通常はプレーン <kbd>↑</kbd>/<kbd>↓</kbd> と同義 (前 / 次ファイル)。**ファイル名スタックのフラット読書中 (v2.0.0)** は「前 / 次のスタックの先頭画像へジャンプ」(= 今の投稿の残りをスキップ。`Shift+↑` はスタック途中なら現スタック先頭、先頭なら前スタック先頭)。端では no-op (次フォルダは <kbd>Ctrl</kbd>+<kbd>↓</kbd>)。動画再生中は音量 (下表参照) |
+| <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 通常はプレーン <kbd>↑</kbd>/<kbd>↓</kbd> と同義 (前 / 次ファイル)。**ファイル名スタックのフラット読書中 (v2.0.0)** は「前 / 次のスタックの先頭画像へジャンプ」(= 今の投稿の残りをスキップ。`Shift+↑` はスタック途中なら現スタック先頭、先頭なら前スタック先頭)。端では no-op (次フォルダは <kbd>Ctrl</kbd>+<kbd>↓</kbd>)。スタックジャンプ部分の Action: `FsStackJumpPrev` / `FsStackJumpNext`。動画再生中は音量 (下表参照) |
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 現在の表示順で、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプ。既定は全ページの 10%。固定ページ数にも切替可。見開き中は最低 2 ページ進む。左右の意味は通常の左右ページ送りと同じく RTL で反転。動画は対象外 |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。1 回押すごとに必ず 1 ページ動く)。結果はセッション内の一時アンカーとして保持し、`spread_db` には保存しない。Single モードでは前 / 次ファイル。RTL では左右の意味を反転 |
@@ -312,14 +312,14 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
 - Ctrl+↑↓ も同じ思想で native key handler から
   `handle_fullscreen_ctrl_nav_context` へ流し、フォルダ / Ctrl+S / Ctrl+G の
   スコープ解決を画像系と共有する。
-- **Shift+↑↓ のスタックジャンプ (v2.0.0) は `KeyAction` 化せず raw `consume_key` で扱う**
-  (固定扱いの理由)。同じ Shift+↑↓ は ① 非スタック時のプレーン ↑↓ エイリアス (ページ送り)、
-  ② 動画再生中の音量、③ スタックのフラット読書中のスタックジャンプ、の 3 用途を
-  **コンテキストで出し分ける**。①② は既に `ui_fullscreen.rs` の同じ箇所で raw に
-  consume しており (`video_shift_vertical_key` で音量を優先)、③ だけを KeyAction にすると
-  同一キーの処理が 2 系統に割れて consume 順 (Shift を先に誰が取るか) の管理が難しくなる。
-  そのため ③ も同じ箇所で `stack_showing_flat` を条件に raw consume する
-  (`App::stack_jump`)。カスタマイズ対象には含めない。
+- **Shift+↑↓ のスタックジャンプ (v2.0.0) は 2026-06 の Phase 4 初期実装で
+  `KeyAction::FsStackJumpPrev` / `FsStackJumpNext` 化した。** 同じ Shift+↑↓ は
+  ① 非スタック時のプレーン ↑↓ エイリアス (ページ送り)、② 動画再生中の音量、
+  ③ スタックのフラット読書中のスタックジャンプ、の 3 用途をコンテキストで出し分ける。
+  `ui_fullscreen.rs` では動画の `VideoVolume*` / `VideoNextFile` / `VideoPrevFile`
+  を先に扱い、非動画かつスタックフラット時だけ `FsStackJump*` を見る。これにより
+  native 動画経路と App 側の縦方向 keymap 解決を近づけつつ、通常の Esc / Enter /
+  plain 矢印ナビゲーションは固定扱いのまま残す。
 - **ZipPla 風 全画面ズームは `KeyAction::FsZoomMode` (KeyHold トリガ、既定 <kbd>Z</kbd>) として扱う**。
   「押している間=照準 (枠表示) / 離す=ズーム確定 / ズーム中の押下=解除」というホールド + トグルの
   ハイブリッドだが、`KeyHold` アクション基盤 (Shift ルーペ `FsLoupeHold` / 編集モードの Space パンと

@@ -773,6 +773,8 @@ pub enum KeyAction {
     FsSiblingNext,
     FsFixedJumpPrev,
     FsFixedJumpNext,
+    FsStackJumpPrev,
+    FsStackJumpNext,
     RatingItem1,
     RatingItem2,
     RatingItem3,
@@ -978,6 +980,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSiblingNext,
     KeyAction::FsFixedJumpPrev,
     KeyAction::FsFixedJumpNext,
+    KeyAction::FsStackJumpPrev,
+    KeyAction::FsStackJumpNext,
     KeyAction::RatingItem1,
     KeyAction::RatingItem2,
     KeyAction::RatingItem3,
@@ -1252,6 +1256,8 @@ impl KeyAction {
             FsSiblingNext => "FsSiblingNext",
             FsFixedJumpPrev => "FsFixedJumpPrev",
             FsFixedJumpNext => "FsFixedJumpNext",
+            FsStackJumpPrev => "FsStackJumpPrev",
+            FsStackJumpNext => "FsStackJumpNext",
             RatingItem1 => "RatingItem1",
             RatingItem2 => "RatingItem2",
             RatingItem3 => "RatingItem3",
@@ -1467,6 +1473,8 @@ impl KeyAction {
             FsSiblingNext => "次の兄弟フォルダへ移動する",
             FsFixedJumpPrev => "設定した量だけ前へジャンプする",
             FsFixedJumpNext => "設定した量だけ先へジャンプする",
+            FsStackJumpPrev => "前のスタックの先頭画像へジャンプする",
+            FsStackJumpNext => "次のスタックの先頭画像へジャンプする",
             RatingItem1 => "現在の画像または動画に星1を付ける",
             RatingItem2 => "現在の画像または動画に星2を付ける",
             RatingItem3 => "現在の画像または動画に星3を付ける",
@@ -1680,6 +1688,8 @@ impl KeyAction {
             | FsSpreadShiftRight
             | FsFixedJumpPrev
             | FsFixedJumpNext
+            | FsStackJumpPrev
+            | FsStackJumpNext
             | FsSlideshow
             | FsSpaceCheck
             | FsCapture
@@ -1818,6 +1828,8 @@ impl KeyAction {
             | FsSiblingNext
             | FsFixedJumpPrev
             | FsFixedJumpNext
+            | FsStackJumpPrev
+            | FsStackJumpNext
             | RatingItem1
             | RatingItem2
             | RatingItem3
@@ -2020,6 +2032,8 @@ impl KeyAction {
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
             FsFixedJumpPrev => ChordList::one(Chord::shift(Left)),
             FsFixedJumpNext => ChordList::one(Chord::shift(Right)),
+            FsStackJumpPrev => ChordList::one(Chord::shift(Up)),
+            FsStackJumpNext => ChordList::one(Chord::shift(Down)),
             RatingItem1 => ChordList::one(Chord::key(F1)),
             RatingItem2 => ChordList::one(Chord::key(F2)),
             RatingItem3 => ChordList::one(Chord::key(F3)),
@@ -2194,20 +2208,24 @@ pub struct RatingKey {
     pub stars: u8,
 }
 
+pub const FS_IMAGE_ACTIVE_SCOPES: &[CommandScope] = &[
+    KeyContext::Global,
+    KeyContext::FsCommon,
+    KeyContext::Rating,
+    KeyContext::FsImage,
+];
+
+pub const FS_VIDEO_ACTIVE_SCOPES: &[CommandScope] = &[
+    KeyContext::Global,
+    KeyContext::FsCommon,
+    KeyContext::Rating,
+    KeyContext::FsVideo,
+];
+
 const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
     &[KeyContext::Global, KeyContext::Grid, KeyContext::Rating],
-    &[
-        KeyContext::Global,
-        KeyContext::FsCommon,
-        KeyContext::Rating,
-        KeyContext::FsImage,
-    ],
-    &[
-        KeyContext::Global,
-        KeyContext::FsCommon,
-        KeyContext::Rating,
-        KeyContext::FsVideo,
-    ],
+    FS_IMAGE_ACTIVE_SCOPES,
+    FS_VIDEO_ACTIVE_SCOPES,
     &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Erase],
     &[
         KeyContext::Global,
@@ -2527,6 +2545,38 @@ impl Keymap {
                 chord.key.map(KeyName::display_name)
             }
         })
+    }
+
+    pub fn resolve_first_action_for_chord(
+        &self,
+        chord: Chord,
+        active_scopes: &[CommandScope],
+        priority: &[KeyAction],
+    ) -> Option<KeyAction> {
+        priority.iter().copied().find(|action| {
+            action.trigger() == KeyTrigger::Press
+                && active_scopes.contains(&action.context())
+                && self.action_has_chord(*action, chord)
+        })
+    }
+
+    pub fn consume_first_action(
+        &self,
+        ctx: &egui::Context,
+        active_scopes: &[CommandScope],
+        priority: &[KeyAction],
+    ) -> Option<KeyAction> {
+        priority.iter().copied().find(|action| {
+            action.trigger() == KeyTrigger::Press
+                && active_scopes.contains(&action.context())
+                && self.consume_action(ctx, *action)
+        })
+    }
+
+    fn action_has_chord(&self, action: KeyAction, chord: Chord) -> bool {
+        self.effective_chords(action)
+            .into_iter()
+            .any(|c| c == chord)
     }
 
     pub fn binding_conflicts(&self) -> Vec<BindingConflict> {
@@ -3391,6 +3441,109 @@ mod tests {
             assert_eq!(action.context(), KeyContext::Grid);
             assert_eq!(action.trigger(), KeyTrigger::Press);
         }
+    }
+
+    #[test]
+    fn fullscreen_stack_jump_actions_match_existing_default_shortcuts() {
+        assert_eq!(
+            KeyAction::FsStackJumpPrev.default_chords().iter().next(),
+            Some(Chord::shift(KeyName::Up))
+        );
+        assert_eq!(
+            KeyAction::FsStackJumpNext.default_chords().iter().next(),
+            Some(Chord::shift(KeyName::Down))
+        );
+        for action in [KeyAction::FsStackJumpPrev, KeyAction::FsStackJumpNext] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
+    }
+
+    #[test]
+    fn fullscreen_vertical_resolver_uses_active_scope() {
+        let keymap = Keymap::empty();
+        let priority = [
+            KeyAction::VideoVolumeUp,
+            KeyAction::VideoVolumeDown,
+            KeyAction::FsStackJumpPrev,
+            KeyAction::FsStackJumpNext,
+        ];
+        let video_scopes = [
+            KeyContext::Global,
+            KeyContext::FsCommon,
+            KeyContext::Rating,
+            KeyContext::FsVideo,
+        ];
+        let image_scopes = [
+            KeyContext::Global,
+            KeyContext::FsCommon,
+            KeyContext::Rating,
+            KeyContext::FsImage,
+        ];
+
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::shift(KeyName::Up),
+                &video_scopes,
+                &priority,
+            ),
+            Some(KeyAction::VideoVolumeUp)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::shift(KeyName::Up),
+                &image_scopes,
+                &priority,
+            ),
+            Some(KeyAction::FsStackJumpPrev)
+        );
+    }
+
+    #[test]
+    fn fullscreen_vertical_resolver_honors_overrides_per_scope() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsImage]
+            FsStackJumpNext = Ctrl+Alt+J
+            [FsVideo]
+            VideoVolumeDown = Ctrl+Alt+J
+            "#,
+        );
+        assert!(keymap.warnings().is_empty());
+        let priority = [
+            KeyAction::VideoVolumeDown,
+            KeyAction::FsStackJumpNext,
+            KeyAction::VideoNextFile,
+        ];
+        let video_scopes = [
+            KeyContext::Global,
+            KeyContext::FsCommon,
+            KeyContext::Rating,
+            KeyContext::FsVideo,
+        ];
+        let image_scopes = [
+            KeyContext::Global,
+            KeyContext::FsCommon,
+            KeyContext::Rating,
+            KeyContext::FsImage,
+        ];
+
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::new(true, false, true, KeyName::J),
+                &video_scopes,
+                &priority,
+            ),
+            Some(KeyAction::VideoVolumeDown)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::new(true, false, true, KeyName::J),
+                &image_scopes,
+                &priority,
+            ),
+            Some(KeyAction::FsStackJumpNext)
+        );
     }
 
     #[test]

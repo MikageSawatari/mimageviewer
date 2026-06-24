@@ -28,6 +28,10 @@
 - 2026-06 Phase 3 初期実装として、グリッド側の F7-F10 / Shift+F7-F10 マスク一括適用・
   削除を `GridApplyErase1/2`、`GridApplyConceal1/2`、`GridDeleteEraseMask`、
   `GridDeleteConcealMask` として `KeyAction` 化した。既定キーと実行順は従来どおり。
+- 2026-06 Phase 4 初期実装として、フルスクリーン縦方向の文脈解決を小さく進めた。
+  スタックフラット読書中の `Shift+↑/↓` は `FsStackJumpPrev/Next` として `KeyAction`
+  化し、egui 動画フルスクリーンの `↑/↓` も `VideoPrevFile/NextFile` を見るようにした。
+  `Keymap::resolve_first_action_for_chord` で active scope と優先順の純粋 resolver をテストする。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
   右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは
@@ -493,6 +497,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
   FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
   FsHome/End (予約候補)
+- FsStackJumpPrev/Next `Shift+↑/↓` (P) ★: スタックフラット読書中だけ有効。非スタック時の
+  `Shift+↑/↓` は従来どおりプレーン `↑/↓` エイリアスとして固定扱い。
 - FsContinuousScrollForward/Back `PageDown/PageUp` (P)(連続読み時のみ)
 - FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
@@ -516,7 +522,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - VideoPlayPause `Space`,`Enter` / VideoExternalPlayer `Shift+Enter`
 - VideoSeekBack/Fwd `←/→` (修飾で 5/1/30 秒 = MVP固定。将来は `VideoSeekFwd5/1/30` 等へ分割)
 - VideoFrameStepBack/Fwd `Ctrl+Shift+←/→`
-- VideoSeekStart `W` / VideoVolumeUp/Down `Shift+↑/↓` / VideoNextFile `↑` / VideoPrevFile `↓`
+- VideoSeekStart `W` / VideoVolumeUp/Down `Shift+↑/↓` / VideoNextFile `↓` / VideoPrevFile `↑`
 - VideoMute `M` / VideoLoop `L` / VideoMarkerPrev `J` / VideoMarkerNext `K`
 - VideoPin `P` / VideoPerfOverlay `F` / VideoTileMode `S` / VideoBookmark `B`
 - VideoCapture `Ctrl+S`

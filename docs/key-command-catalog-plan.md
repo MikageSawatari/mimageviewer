@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 3 初期実装済み / レビュー済み** (2026-06-24)。
+> ステータス: **Phase 4 初期実装済み / レビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -25,6 +25,13 @@
 > Shift+F7-F10 のマスク一括適用・削除を `GridApplyErase1/2`、
 > `GridApplyConceal1/2`、`GridDeleteEraseMask`、`GridDeleteConcealMask` として
 > `KeyAction` 化。既定キーと実行順は従来どおりで、dispatch resolver はまだ導入しない。
+>
+> **Phase 4 初期実装メモ (2026-06-24, Codex)**: フルスクリーン縦方向だけを対象に、
+> `FsStackJumpPrev/Next` と `VideoPrevFile/NextFile` の局所 resolver 配線を追加。
+> `Keymap::resolve_first_action_for_chord` で active scope + priority の純粋判定をテストする。
+> Esc / Enter / plain 矢印全体の自由化や、全面 dispatch resolver 置換はまだ行わない。
+> ClaudeCode レビュー後、`FS_IMAGE_ACTIVE_SCOPES` / `FS_VIDEO_ACTIVE_SCOPES` を共有定数化し、
+> resolver テストと実 dispatch が同じ active scope 定義を参照するようにした。
 
 ## 1. 背景と狙い
 
@@ -245,10 +252,11 @@ dispatch 側の先勝ちで運用されていたため、いきなり起動失�
 - スタックのフラット読書中: 前 / 次スタックへジャンプ。
 - 動画: 音量調整。
 
-この種のキーは、catalog に載せるだけでは安全に自由化できない。後続フェーズで
-`ActiveScopes` と優先順位を明示した resolver を作ってから移す。
+この種のキーは、catalog に載せるだけでは安全に自由化できない。Phase 4 初期実装では、
+`ActiveScopes` と優先順位を明示した resolver の足場を置き、スタックジャンプ部分だけを
+`FsStackJumpPrev/Next` として移した。
 
-初期フェーズでは、`Shift+↑↓`、plain 矢印、`Esc`、`Enter` は固定または予約として扱う。
+plain 矢印、`Esc`、`Enter` と、非スタック時の `Shift+↑↓` エイリアスは固定または予約として扱う。
 
 ## 5. BindingPolicy
 
@@ -369,7 +377,8 @@ pub enum BindingPolicy {
     フルスクリーン側の `FsApplyErase*` / `FsApplyConceal*` と既定キーを揃えた。
   - toolbar/menu 操作に対応する既存 App メソッド呼び出し。
   - その他、既定未割り当てにできる便利操作。
-- Esc / Enter / plain 矢印 / `Shift+↑↓` はまだ予約。
+- Esc / Enter / plain 矢印はまだ予約。`Shift+↑↓` は Phase 4 初期実装でスタックジャンプ部分だけ
+  `KeyAction` 化し、非スタック時のエイリアスは固定のまま。
 
 完了条件:
 
@@ -384,6 +393,9 @@ pub enum BindingPolicy {
 - `ActiveScopes` と priority を使って、同一キーをどの command が受けるかを純粋ロジックで判定する。
 - 既存 dispatch をすべて置き換えず、まず `Shift+↑↓` のような局所的な箇所から試す。
 - 動画 native presenter の転送 whitelist と App 側 resolver を同期させる。
+- **初期実装済み**: `FsStackJumpPrev/Next` を追加し、egui フルスクリーンのスタックジャンプと
+  動画の `VideoPrevFile/NextFile` を keymap 経由へ寄せた。native 側は既存の
+  `matches_vk_action(VideoPrevFile/NextFile)` 経路を維持する。
 
 完了条件:
 

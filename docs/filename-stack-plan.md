@@ -30,8 +30,8 @@
 - **サムネ**: 代表は実画像ファイルなので**専用 cache key 不要** — その実ファイルの通常 per-file
   サムネをそのまま要求・再利用する (toggle 跨ぎでキャッシュ命中)。当初案の `stackthumb:` は不採用。
 - **ナビ (フルスクリーン)**: `↓↑`=全画像フラット順送り (境界越え) / `Shift+↓↑`=次/前スタック先頭へ
-  ジャンプ / `Ctrl+↓↑`=フォルダ移動 (据え置き)。Shift+↓↑ は raw consume_key (動画音量と同流儀、
-  `stack_showing_flat` 中のみ stack jump)。
+  ジャンプ / `Ctrl+↓↑`=フォルダ移動 (据え置き)。Phase 4 初期実装で
+  `FsStackJumpPrev/Next` として `KeyAction` 化し、動画では `VideoVolume*` を優先する。
 - **区切り文字**: `settings.stack_separator: char` (既定 `_`、`#[serde(default)]`、永続)。
 - **②製本との連携 (§5)**: 集約グリッドでスタックセルを選択 → ピン本/アクティブ本へ追加すると、
   `add_grid_selection_to_named_book` が `stack_member_paths` でメンバー実パスを取り出し、

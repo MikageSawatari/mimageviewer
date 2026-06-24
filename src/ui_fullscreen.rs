@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::keymap::KeyAction;
+use crate::keymap::{FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
 use crate::ui_helpers::{HoverTipExt, open_external_player};
@@ -6345,20 +6345,6 @@ impl App {
                     )
                 })
             });
-        let video_shift_vertical_key = is_video_fs
-            && ctx.input(|i| {
-                i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::ArrowUp | egui::Key::ArrowDown,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } if modifiers.shift
-                    )
-                })
-            });
         if is_video_fs {
             let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
                 Some(p.clone())
@@ -6432,6 +6418,15 @@ impl App {
         // 詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
+        let video_file_nav = if is_video_fs {
+            self.keymap.consume_first_action(
+                ctx,
+                FS_VIDEO_ACTIVE_SCOPES,
+                &[KeyAction::VideoPrevFile, KeyAction::VideoNextFile],
+            )
+        } else {
+            None
+        };
         let arrow_right = ctx.input_mut(|i| {
             !video_horizontal_arrow_key
                 && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
@@ -6443,25 +6438,34 @@ impl App {
                     || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
         });
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
-        // ジャンプ」に割り当てる。動画再生中 (video_shift_vertical_key=音量) はそちらが優先。
+        // ジャンプ」に割り当てる。動画再生中は Video* action (音量 / 前後ファイル) が優先。
         // 非スタック / 非フラットでは従来どおり Shift+↓↑ はプレーン ↓↑ のエイリアス (ページ送り)。
-        let stack_flat_nav = self.stack_showing_flat && !video_shift_vertical_key;
-        let stack_jump_next = stack_flat_nav
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
-        let stack_jump_prev = stack_flat_nav
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
-        let arrow_down = ctx.input_mut(|i| {
-            !video_shift_vertical_key
-                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                    || (!stack_flat_nav
-                        && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)))
-        });
-        let arrow_up = ctx.input_mut(|i| {
-            !video_shift_vertical_key
-                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                    || (!stack_flat_nav
-                        && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)))
-        });
+        let stack_flat_nav = self.stack_showing_flat && !is_video_fs;
+        let stack_jump = if stack_flat_nav {
+            self.keymap.consume_first_action(
+                ctx,
+                FS_IMAGE_ACTIVE_SCOPES,
+                &[KeyAction::FsStackJumpNext, KeyAction::FsStackJumpPrev],
+            )
+        } else {
+            None
+        };
+        let stack_jump_next = stack_jump == Some(KeyAction::FsStackJumpNext);
+        let stack_jump_prev = stack_jump == Some(KeyAction::FsStackJumpPrev);
+        let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
+            || (!is_video_fs
+                && ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                        || (!stack_flat_nav
+                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown))
+                }));
+        let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
+            || (!is_video_fs
+                && ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                        || (!stack_flat_nav
+                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp))
+                }));
         let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
         let key_i = self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
@@ -16164,8 +16168,8 @@ impl App {
         let play_pause = self.keymap.consume_action(ctx, KeyAction::VideoPlayPause);
         // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
         // タイル中は seek せずカーソル移動に切り替える。Ctrl 併用時だけ 1 行分移動。
-        // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
-        // (= マウスホイールと整合)。Shift+↑↓ だけ動画モードで音量に使う。
+        // ↑↓ は root 側で VideoPrevFile/VideoNextFile として扱う
+        // (= native 動画経路と同じ keymap action)。Shift+↑↓ だけ動画モードで音量に使う。
         let tile_active_for_keyboard = self.video_tile_mode_active;
         let tile_left_ctrl = if tile_active_for_keyboard {
             ctx.input_mut(|i| {
@@ -16246,7 +16250,7 @@ impl App {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
         let shift_up = self.keymap.consume_action(ctx, KeyAction::VideoVolumeUp);
         let shift_down = self.keymap.consume_action(ctx, KeyAction::VideoVolumeDown);
-        // ↑↓ プレーンは consume しない (= image handler が file navigation に使う)。
+        // ↑↓ プレーンは root 側で VideoPrevFile/VideoNextFile として扱う。
         let mute_key = self.keymap.consume_action(ctx, KeyAction::VideoMute);
         let loop_key = self.keymap.consume_action(ctx, KeyAction::VideoLoop);
         // Phase 5.4.1: B キーで現在位置にブックマーク追加 (動画モード限定)。
