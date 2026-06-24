@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 5 レーティング tooltip 表示スライスレビュー済み** (2026-06-24)。
+> ステータス: **Phase 7 コンテキストヘルプ基盤スライス実装中 / レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -62,6 +62,12 @@
 > ボタン / スマートフィルタ内の★項目 / フォルダバー右側のコンテナ★ tooltip に出る
 > `F1〜F6` / `Shift+F1〜F6` 表記を実 keymap 由来にした。既定割り当ては従来どおり範囲表記へ
 > 畳み、カスタム時は `1:Alt+F1 / ...` のように明示する。
+>
+> **Phase 7 コンテキストヘルプ基盤スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `CommandDisplayRow` と `Keymap::command_display_rows_for_active_scopes()` を追加し、呼び出し側が
+> 渡した active scope に対して、`CommandSpec` と実 keymap 由来の shortcut label 一覧を取得できる
+> 純ロジックを用意する。未割り当て / `none` の Action は通常非表示、必要な場合だけ空 shortcut
+> 行として含められる。`?` ヘルプ UI、dispatch、メニュー構成変更はまだ行わない。
 
 ## 1. 背景と狙い
 
@@ -475,6 +481,10 @@ pub enum BindingPolicy {
 
 実装内容:
 
+- **基盤スライス実装中**: `CommandDisplayRow` と
+  `Keymap::command_display_rows_for_active_scopes()` で、active scope に属する
+  `CommandSpec` と effective chord の表示ラベルを取り出せるようにする。UI はまだ作らず、
+  dispatch も変えない。
 - `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
   消しゴム / 隠蔽加工 / テキスト注釈など) で有効なショートカット一覧を表示する。
 - 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。

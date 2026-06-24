@@ -1169,6 +1169,12 @@ pub fn command_catalog() -> impl Iterator<Item = CommandSpec> {
         .map(CommandSpec::from_action)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDisplayRow {
+    pub spec: CommandSpec,
+    pub shortcut_labels: Vec<String>,
+}
+
 const RATING_ITEM_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingItem1, 1),
     (KeyAction::RatingItem2, 2),
@@ -2208,6 +2214,9 @@ pub struct RatingKey {
     pub stars: u8,
 }
 
+pub const GRID_ACTIVE_SCOPES: &[CommandScope] =
+    &[KeyContext::Global, KeyContext::Grid, KeyContext::Rating];
+
 pub const FS_IMAGE_ACTIVE_SCOPES: &[CommandScope] = &[
     KeyContext::Global,
     KeyContext::FsCommon,
@@ -2223,7 +2232,7 @@ pub const FS_VIDEO_ACTIVE_SCOPES: &[CommandScope] = &[
 ];
 
 const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
-    &[KeyContext::Global, KeyContext::Grid, KeyContext::Rating],
+    GRID_ACTIVE_SCOPES,
     FS_IMAGE_ACTIVE_SCOPES,
     FS_VIDEO_ACTIVE_SCOPES,
     &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Erase],
@@ -2548,6 +2557,26 @@ impl Keymap {
         self.effective_chords(action)
             .into_iter()
             .map(|chord| chord.display_name())
+            .collect()
+    }
+
+    pub fn command_display_rows_for_active_scopes(
+        &self,
+        active_scopes: &[CommandScope],
+        include_unassigned: bool,
+    ) -> Vec<CommandDisplayRow> {
+        command_catalog()
+            .filter(|spec| active_scopes.contains(&spec.scope))
+            .filter_map(|spec| {
+                let shortcut_labels = self.chord_labels(spec.action);
+                if shortcut_labels.is_empty() && !include_unassigned {
+                    return None;
+                }
+                Some(CommandDisplayRow {
+                    spec,
+                    shortcut_labels,
+                })
+            })
             .collect()
     }
 
@@ -3470,6 +3499,86 @@ mod tests {
                 BindingPolicy::for_trigger(spec.action.trigger())
             );
         }
+    }
+
+    #[test]
+    fn command_display_rows_filter_active_scopes_and_hide_unassigned() {
+        let keymap = Keymap::empty();
+        let rows = keymap.command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, false);
+
+        let local_search = rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::GlobalLocalSearch)
+            .expect("global actions should be visible in grid context");
+        assert_eq!(local_search.spec.scope, KeyContext::Global);
+        assert_eq!(local_search.shortcut_labels, vec!["Ctrl+F".to_owned()]);
+
+        let grid_pin = rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::GridPin)
+            .expect("grid actions should be visible in grid context");
+        assert_eq!(grid_pin.spec.scope, KeyContext::Grid);
+        assert_eq!(grid_pin.shortcut_labels, vec!["P".to_owned()]);
+
+        let rating = rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::RatingItem1)
+            .expect("rating actions should be visible in grid context");
+        assert_eq!(rating.spec.scope, KeyContext::Rating);
+        assert_eq!(rating.shortcut_labels, vec!["F1".to_owned()]);
+
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsSlideshow)
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::GridToggleStackMode)
+        );
+
+        let rows = keymap.command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, true);
+        let stack_toggle = rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::GridToggleStackMode)
+            .expect("include_unassigned should include default-unassigned actions");
+        assert_eq!(stack_toggle.spec.scope, KeyContext::Grid);
+        assert!(stack_toggle.shortcut_labels.is_empty());
+    }
+
+    #[test]
+    fn command_display_rows_follow_overrides_and_none() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridToggleStackMode = Ctrl+Shift+S
+            GridPin = none
+            "#,
+        );
+        assert!(
+            keymap.warnings().is_empty(),
+            "unexpected warnings: {:?}",
+            keymap.warnings()
+        );
+
+        let rows = keymap.command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, false);
+        let stack_toggle = rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::GridToggleStackMode)
+            .expect("customized default-unassigned action should be visible");
+        assert_eq!(
+            stack_toggle.shortcut_labels,
+            vec!["Ctrl+Shift+S".to_owned()]
+        );
+        assert!(!rows.iter().any(|row| row.spec.action == KeyAction::GridPin));
+
+        let rows = keymap.command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, true);
+        let grid_pin = rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::GridPin)
+            .expect("include_unassigned should include explicitly disabled actions");
+        assert!(grid_pin.shortcut_labels.is_empty());
     }
 
     #[test]
