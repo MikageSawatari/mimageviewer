@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-const MAX_SUBFOLDER_EXPANSION_DEPTH: u32 = 64;
+const MAX_SUBFOLDER_EXPANSION_DEPTH: u32 = 40;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const INSTALL_BUSY_ITEM_THRESHOLD: usize = 50_000;
+const INSTALL_BUSY_MIN_OVERLAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct SubfolderExpansionOptions {
@@ -74,6 +76,7 @@ pub(crate) struct SubfolderExpansionEntry {
 #[derive(Debug)]
 pub(crate) struct SubfolderExpansionResult {
     pub(crate) root: PathBuf,
+    pub(crate) roots: Vec<PathBuf>,
     pub(crate) entries: Vec<SubfolderExpansionEntry>,
     /// 動画パスの正規化キー -> 同名 sidecar 画像パス。
     ///
@@ -86,6 +89,7 @@ pub(crate) struct SubfolderExpansionResult {
 #[derive(Clone, Debug)]
 pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) root: PathBuf,
+    pub(crate) roots: Vec<PathBuf>,
     pub(crate) entries: Vec<SubfolderExpansionEntry>,
     pub(crate) video_thumb_overrides: HashMap<String, PathBuf>,
     pub(crate) diag: SubfolderExpansionDiag,
@@ -99,8 +103,15 @@ pub(crate) enum SubfolderExpansionEvent {
 
 pub(crate) struct SubfolderExpansionPending {
     pub(crate) root: PathBuf,
+    pub(crate) roots: Vec<PathBuf>,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) rx: mpsc::Receiver<SubfolderExpansionEvent>,
+}
+
+pub(crate) struct SubfolderExpansionInstallPending {
+    pub(crate) snapshot: SubfolderExpansionSnapshot,
+    pub(crate) show_toast: bool,
+    pub(crate) queued_at: Instant,
 }
 
 impl SubfolderExpansionPending {
@@ -111,17 +122,25 @@ impl SubfolderExpansionPending {
 
 pub(crate) fn spawn_subfolder_expansion_worker(
     root: PathBuf,
+    roots: Vec<PathBuf>,
     options: SubfolderExpansionOptions,
 ) -> Result<SubfolderExpansionPending, String> {
+    let roots = normalize_expansion_roots(&root, roots);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_w = Arc::clone(&cancel);
     let root_w = root.clone();
+    let roots_w = roots.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("subfolder-expansion".into())
         .spawn(move || {
-            let event = match scan_subfolder_expansion(root_w, options, Arc::clone(&cancel_w), &tx)
-            {
+            let event = match scan_subfolder_expansion(
+                root_w,
+                roots_w,
+                options,
+                Arc::clone(&cancel_w),
+                &tx,
+            ) {
                 Some(_result) if cancel_w.load(Ordering::Relaxed) => {
                     SubfolderExpansionEvent::Cancelled
                 }
@@ -132,23 +151,36 @@ pub(crate) fn spawn_subfolder_expansion_worker(
         })
         .map_err(|e| format!("サブ展開ワーカーを起動できませんでした: {e}"))?;
 
-    Ok(SubfolderExpansionPending { root, cancel, rx })
+    Ok(SubfolderExpansionPending {
+        root,
+        roots,
+        cancel,
+        rx,
+    })
 }
 
 fn scan_subfolder_expansion(
     root: PathBuf,
+    roots: Vec<PathBuf>,
     options: SubfolderExpansionOptions,
     cancel: Arc<AtomicBool>,
     tx: &mpsc::Sender<SubfolderExpansionEvent>,
 ) -> Option<SubfolderExpansionResult> {
+    let roots = normalize_expansion_roots(&root, roots);
     let mut result = SubfolderExpansionResult {
         root: root.clone(),
+        roots: roots.clone(),
         entries: Vec::new(),
         video_thumb_overrides: HashMap::new(),
         diag: SubfolderExpansionDiag::default(),
     };
     let mut visited = HashSet::new();
-    let mut stack = vec![(root, 0_u32)];
+    let mut stack: Vec<_> = roots
+        .iter()
+        .rev()
+        .cloned()
+        .map(|root| (root, 0_u32))
+        .collect();
     let mut last_progress = Instant::now();
 
     while let Some((dir, depth)) = stack.pop() {
@@ -188,6 +220,28 @@ fn scan_subfolder_expansion(
         SubfolderExpansionProgress::from_diag(&result.diag, None),
     ));
     Some(result)
+}
+
+fn normalize_expansion_roots(root: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let source = if roots.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        roots
+    };
+    let mut normalized: Vec<PathBuf> = Vec::new();
+    for path in source {
+        if normalized
+            .iter()
+            .any(|existing| crate::folder_tree::path_eq(existing, &path))
+        {
+            continue;
+        }
+        normalized.push(path);
+    }
+    if normalized.is_empty() {
+        normalized.push(root.to_path_buf());
+    }
+    normalized
 }
 
 fn scan_one_directory(
@@ -439,6 +493,41 @@ fn path_name_for_sort(path: &Path) -> String {
 }
 
 impl App {
+    pub(crate) fn grid_item_can_be_checked(&self, idx: usize) -> bool {
+        let Some(item) = self.items.get(idx) else {
+            return false;
+        };
+        item.is_checkable()
+            || (self.subfolder_expansion_available() && matches!(item, GridItem::Folder(_)))
+    }
+
+    pub(crate) fn selected_subfolder_expansion_roots(&self) -> Vec<PathBuf> {
+        if !self.subfolder_expansion_available() || self.checked.is_empty() {
+            return Vec::new();
+        }
+        let mut indices: Vec<_> = self.checked.iter().copied().collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|idx| match self.items.get(idx) {
+                Some(GridItem::Folder(path)) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn subfolder_expansion_action_tooltip(&self) -> String {
+        let roots = self.selected_subfolder_expansion_roots();
+        if roots.is_empty() {
+            "現在のフォルダ以下の画像と動画をフラット表示\nフォルダを Space / Ctrl+クリックで選ぶと、選んだフォルダだけをまとめて展開できます".to_string()
+        } else {
+            format!(
+                "チェックした {} 個のフォルダ以下の画像と動画をまとめてフラット表示",
+                roots.len()
+            )
+        }
+    }
+
     pub(crate) fn subfolder_expansion_available(&self) -> bool {
         self.current_folder_last_mtime.is_some()
             && self.current_folder.is_some()
@@ -462,6 +551,12 @@ impl App {
     }
 
     pub(crate) fn subfolder_expansion_pending_label(&self) -> Option<String> {
+        if let Some(pending) = self.subfolder_expansion_install_pending.as_ref() {
+            return Some(format!(
+                "サブ展開準備中 {}件",
+                pending.snapshot.entries.len()
+            ));
+        }
         let pending = self.subfolder_expansion_pending.as_ref()?;
         let progress = self.subfolder_expansion_progress.as_ref();
         Some(match progress {
@@ -471,11 +566,27 @@ impl App {
                     progress.media_found, progress.dirs_scanned
                 )
             }
-            None => format!("サブ展開中: {}", pending.root.display()),
+            None => {
+                if pending.roots.len() > 1 {
+                    format!(
+                        "サブ展開中: {} ({}フォルダ)",
+                        pending.root.display(),
+                        pending.roots.len()
+                    )
+                } else {
+                    format!("サブ展開中: {}", pending.root.display())
+                }
+            }
         })
     }
 
     pub(crate) fn subfolder_expansion_pending_tooltip(&self) -> Option<String> {
+        if let Some(pending) = self.subfolder_expansion_install_pending.as_ref() {
+            return Some(format!(
+                "サブ展開の表示を準備中: {}件",
+                pending.snapshot.entries.len()
+            ));
+        }
         let pending = self.subfolder_expansion_pending.as_ref()?;
         let progress = self.subfolder_expansion_progress.as_ref();
         Some(match progress {
@@ -498,12 +609,24 @@ impl App {
                     )
                 }
             }
-            None => format!("サブ展開中: {}", pending.root.display()),
+            None => {
+                if pending.roots.len() > 1 {
+                    format!(
+                        "サブ展開中: {}\n起点: {}フォルダ",
+                        pending.root.display(),
+                        pending.roots.len()
+                    )
+                } else {
+                    format!("サブ展開中: {}", pending.root.display())
+                }
+            }
         })
     }
 
     pub(crate) fn toggle_subfolder_expansion_view(&mut self) {
-        if self.subfolder_expansion_pending.is_some() {
+        if self.subfolder_expansion_pending.is_some()
+            || self.subfolder_expansion_install_pending.is_some()
+        {
             let should_return_to_root = self.items_are_subfolder_expansion_view
                 || self.current_folder.as_ref().is_some_and(|cur| {
                     crate::folder_tree::path_eq(cur, &subfolder_expansion_synthetic_path())
@@ -538,10 +661,21 @@ impl App {
             self.show_feedback_toast("サブ展開は通常フォルダでのみ使えます".into());
             return;
         }
-        self.start_subfolder_expansion_scan(root);
+        let selected_roots = self.selected_subfolder_expansion_roots();
+        let roots = if selected_roots.is_empty() {
+            vec![root.clone()]
+        } else {
+            selected_roots
+        };
+        self.start_subfolder_expansion_scan_roots(root, roots);
     }
 
-    pub(crate) fn start_subfolder_expansion_scan(&mut self, root: PathBuf) {
+    pub(crate) fn start_subfolder_expansion_scan_roots(
+        &mut self,
+        root: PathBuf,
+        roots: Vec<PathBuf>,
+    ) {
+        let roots = normalize_expansion_roots(&root, roots);
         self.cancel_subfolder_expansion_pending();
         self.cancel_pending_folder_nav();
         self.cancel_stack_script_pending();
@@ -549,14 +683,17 @@ impl App {
         self.stack_view = None;
         self.stack_showing_flat = false;
         self.subfolder_expansion_root = Some(root.clone());
+        self.subfolder_expansion_roots = roots.clone();
         self.subfolder_expansion_saved_folder = Some(root.clone());
         self.subfolder_expansion_snapshot = None;
+        self.subfolder_expansion_install_pending = None;
         self.subfolder_expansion_progress = Some(SubfolderExpansionProgress::default());
         self.subfolder_expansion_diag = None;
-        self.address = format!("サブ展開中: {}", root.display());
+        self.address = subfolder_expansion_view_label("サブ展開中", &root, &roots);
 
         match spawn_subfolder_expansion_worker(
             root.clone(),
+            roots,
             SubfolderExpansionOptions::from(&self.settings),
         ) {
             Ok(pending) => {
@@ -573,14 +710,17 @@ impl App {
         if let Some(pending) = self.subfolder_expansion_pending.take() {
             pending.cancel();
         }
+        self.subfolder_expansion_install_pending = None;
         self.subfolder_expansion_progress = None;
     }
 
     pub(crate) fn clear_subfolder_expansion_view_state(&mut self) {
         self.items_are_subfolder_expansion_view = false;
         self.subfolder_expansion_root = None;
+        self.subfolder_expansion_roots.clear();
         self.subfolder_expansion_saved_folder = None;
         self.subfolder_expansion_snapshot = None;
+        self.subfolder_expansion_install_pending = None;
         self.subfolder_expansion_progress = None;
         self.subfolder_expansion_diag = None;
     }
@@ -607,6 +747,9 @@ impl App {
     }
 
     pub(crate) fn poll_subfolder_expansion(&mut self, ctx: &egui::Context) {
+        if self.poll_subfolder_expansion_install(ctx) {
+            return;
+        }
         if self.subfolder_expansion_pending.is_none() {
             return;
         }
@@ -627,8 +770,10 @@ impl App {
                     let Some(pending) = self.subfolder_expansion_pending.take() else {
                         return;
                     };
-                    if crate::folder_tree::path_eq(&pending.root, &result.root) {
-                        self.apply_subfolder_expansion_result(result);
+                    if crate::folder_tree::path_eq(&pending.root, &result.root)
+                        && expansion_roots_eq(&pending.roots, &result.roots)
+                    {
+                        self.apply_subfolder_expansion_result(result, ctx);
                     }
                     return;
                 }
@@ -648,20 +793,77 @@ impl App {
         }
     }
 
-    fn apply_subfolder_expansion_result(&mut self, result: SubfolderExpansionResult) {
+    fn poll_subfolder_expansion_install(&mut self, ctx: &egui::Context) -> bool {
+        let Some(pending) = self.subfolder_expansion_install_pending.as_ref() else {
+            return false;
+        };
+        let elapsed = pending.queued_at.elapsed();
+        if elapsed < INSTALL_BUSY_MIN_OVERLAY {
+            ctx.request_repaint_after(INSTALL_BUSY_MIN_OVERLAY - elapsed);
+            return true;
+        }
+        let Some(pending) = self.subfolder_expansion_install_pending.take() else {
+            return false;
+        };
+        self.install_subfolder_expansion_snapshot(pending.snapshot, pending.show_toast);
+        true
+    }
+
+    fn apply_subfolder_expansion_result(
+        &mut self,
+        result: SubfolderExpansionResult,
+        ctx: &egui::Context,
+    ) {
         let SubfolderExpansionResult {
             root,
+            roots,
             entries,
             video_thumb_overrides,
             diag,
         } = result;
         let snapshot = SubfolderExpansionSnapshot {
             root,
+            roots,
             entries,
             video_thumb_overrides,
             diag,
         };
-        self.install_subfolder_expansion_snapshot(snapshot, true);
+        self.queue_or_install_subfolder_expansion_snapshot(snapshot, true, ctx);
+    }
+
+    fn queue_or_install_subfolder_expansion_snapshot(
+        &mut self,
+        snapshot: SubfolderExpansionSnapshot,
+        show_toast: bool,
+        ctx: &egui::Context,
+    ) {
+        let item_count = snapshot.entries.len();
+        if item_count < INSTALL_BUSY_ITEM_THRESHOLD {
+            self.install_subfolder_expansion_snapshot(snapshot, show_toast);
+            return;
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "subfolder",
+                "install_defer_for_overlay",
+                None,
+                self.input_seq,
+                &[
+                    ("items", serde_json::Value::from(item_count)),
+                    ("roots", serde_json::Value::from(snapshot.roots.len())),
+                ],
+            );
+        }
+        self.subfolder_expansion_progress =
+            Some(SubfolderExpansionProgress::from_diag(&snapshot.diag, None));
+        self.address =
+            subfolder_expansion_view_label("サブ展開準備中", &snapshot.root, &snapshot.roots);
+        self.subfolder_expansion_install_pending = Some(SubfolderExpansionInstallPending {
+            snapshot,
+            show_toast,
+            queued_at: Instant::now(),
+        });
+        ctx.request_repaint();
     }
 
     pub(crate) fn reinstall_subfolder_expansion_snapshot(&mut self) -> bool {
@@ -677,14 +879,49 @@ impl App {
         snapshot: SubfolderExpansionSnapshot,
         show_toast: bool,
     ) {
+        let install_t0 = Instant::now();
+        let perf_on = crate::perf::is_enabled();
+        let seq = self.input_seq;
+        let entry_count = snapshot.entries.len();
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_begin",
+                None,
+                seq,
+                &[
+                    ("items", serde_json::Value::from(entry_count)),
+                    ("roots", serde_json::Value::from(snapshot.roots.len())),
+                    ("show_toast", serde_json::Value::from(show_toast)),
+                ],
+            );
+        }
         let root = snapshot.root.clone();
+        let roots = snapshot.roots.clone();
         let diag = snapshot.diag.clone();
         let video_thumb_overrides = snapshot.video_thumb_overrides.clone();
+        let sort_t0 = Instant::now();
         let sorted = sort_entries_for_view(
             snapshot.entries.clone(),
             self.book_sort_order_for_path(&root),
             &root,
         );
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_sort",
+                None,
+                seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(sort_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("items", serde_json::Value::from(sorted.len())),
+                ],
+            );
+        }
+        let build_t0 = Instant::now();
         let mut items = Vec::with_capacity(sorted.len());
         let mut image_metas = Vec::with_capacity(sorted.len());
         let mut video_items = Vec::new();
@@ -701,26 +938,61 @@ impl App {
             }
             image_metas.push(Some((mtime, file_size)));
         }
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_build_items",
+                None,
+                seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(build_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("items", serde_json::Value::from(items.len())),
+                    ("videos", serde_json::Value::from(video_items.len())),
+                ],
+            );
+        }
 
+        let override_t0 = Instant::now();
         self.video_thumb_overrides.clear();
         self.video_thumb_overrides.extend(video_thumb_overrides);
-        let existing_keys: HashSet<String> = items
-            .iter()
-            .zip(image_metas.iter())
-            .flat_map(|(item, meta)| {
-                folder_thumb_existing_keys_for(
-                    item,
-                    *meta,
-                    &HashMap::new(),
-                    self.folder_thumb_pin_db.as_deref(),
-                    Some(self.settings.folder_thumb_sort),
-                    self.settings.folder_thumb_depth,
-                    true,
-                )
-            })
-            .collect();
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_video_overrides",
+                None,
+                seq,
+                &[(
+                    "ms",
+                    serde_json::Value::from(override_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
+            );
+        }
+        // synthetic view では start_loading_items 側が catalog delete_missing をスキップする。
+        // そのため 50 万件級で巨大な存続キー集合を作る必要がない。
+        let existing_keys_t0 = Instant::now();
+        let existing_keys: HashSet<String> = HashSet::new();
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_existing_keys",
+                None,
+                seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(existing_keys_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("keys", serde_json::Value::from(existing_keys.len())),
+                    ("skipped", serde_json::Value::from(true)),
+                ],
+            );
+        }
 
         let item_count = items.len();
+        let start_loading_t0 = Instant::now();
         self.start_loading_items(
             subfolder_expansion_synthetic_path(),
             items,
@@ -729,17 +1001,80 @@ impl App {
             video_items,
             None,
         );
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_start_loading",
+                None,
+                seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(start_loading_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("items", serde_json::Value::from(item_count)),
+                ],
+            );
+        }
+        let state_t0 = Instant::now();
         self.items_are_subfolder_expansion_view = true;
         self.subfolder_expansion_root = Some(root.clone());
+        self.subfolder_expansion_roots = roots.clone();
         self.subfolder_expansion_saved_folder = Some(root.clone());
         self.subfolder_expansion_snapshot = Some(snapshot);
         self.subfolder_expansion_progress = None;
         self.subfolder_expansion_diag = Some(diag.clone());
-        self.address = format!("サブ展開: {}", root.display());
+        self.address = subfolder_expansion_view_label("サブ展開", &root, &roots);
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_state",
+                None,
+                seq,
+                &[(
+                    "ms",
+                    serde_json::Value::from(state_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
+            );
+        }
+        let rebuild_t0 = Instant::now();
         self.rebuild_visible_indices();
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_rebuild_visible",
+                None,
+                seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(rebuild_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "visible",
+                        serde_json::Value::from(self.visible_indices.len()),
+                    ),
+                ],
+            );
+        }
         if let Some(&idx) = self.visible_indices.first() {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
+        }
+        if perf_on {
+            crate::perf::event(
+                "subfolder",
+                "install_end",
+                None,
+                seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(install_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("items", serde_json::Value::from(item_count)),
+                ],
+            );
         }
 
         let skipped = diag.read_dir_errors
@@ -754,10 +1089,61 @@ impl App {
             self.show_feedback_toast(format!(
                 "サブ展開: {item_count}件 (読めなかった項目 {skipped}件)"
             ));
+        } else if roots.len() > 1 {
+            self.show_feedback_toast(format!(
+                "サブ展開: {item_count}件 ({}フォルダ)",
+                roots.len()
+            ));
         } else {
             self.show_feedback_toast(format!("サブ展開: {item_count}件"));
         }
     }
+
+    pub(crate) fn render_subfolder_expansion_install_overlay(&self, ctx: &egui::Context) {
+        let Some(pending) = self.subfolder_expansion_install_pending.as_ref() else {
+            return;
+        };
+        let item_count = pending.snapshot.entries.len();
+        egui::Area::new("subfolder_expansion_install_overlay".into())
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 232))
+                    .inner_margin(egui::Margin::symmetric(22, 16))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("サブ展開の表示を準備中...")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("{item_count} 件を一覧に反映しています"))
+                                .color(egui::Color32::from_gray(220)),
+                        );
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+}
+
+fn subfolder_expansion_view_label(prefix: &str, root: &Path, roots: &[PathBuf]) -> String {
+    if roots.len() > 1 {
+        format!("{prefix}: {} ({}フォルダ)", root.display(), roots.len())
+    } else {
+        format!("{prefix}: {}", root.display())
+    }
+}
+
+fn expansion_roots_eq(a: &[PathBuf], b: &[PathBuf]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(left, right)| crate::folder_tree::path_eq(left, right))
 }
 
 #[cfg(test)]
@@ -767,6 +1153,46 @@ mod tests {
     #[test]
     fn synthetic_path_is_registered_as_synthetic_view() {
         assert!(is_synthetic_view_path(&subfolder_expansion_synthetic_path()));
+    }
+
+    #[test]
+    fn scan_uses_checked_roots_only_when_multiple_roots_are_supplied() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        let a = root.join("a");
+        let b = root.join("b");
+        let c = root.join("c");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(a.join("a.jpg"), b"a").unwrap();
+        std::fs::write(b.join("b.png"), b"b").unwrap();
+        std::fs::write(c.join("c.jpg"), b"c").unwrap();
+        let (tx, _rx) = mpsc::channel();
+
+        let result = scan_subfolder_expansion(
+            root.clone(),
+            vec![a.clone(), b.clone()],
+            SubfolderExpansionOptions {
+                skip_image_if_video_exists: false,
+                skip_duplicate_images: false,
+                video_thumb_use_sidecar_image: true,
+                image_ext_priority: Vec::new(),
+            },
+            Arc::new(AtomicBool::new(false)),
+            &tx,
+        )
+        .expect("scan should finish");
+
+        let mut names: Vec<_> = result
+            .entries
+            .iter()
+            .filter_map(|entry| entry.path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        assert_eq!(result.root, root);
+        assert_eq!(result.roots, vec![a, b]);
+        assert_eq!(names, vec!["a.jpg", "b.png"]);
     }
 
     #[test]

@@ -352,8 +352,27 @@ pub(super) fn run_details_meta_load(
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
 ) {
+    const SLOW_AI_METADATA_ITEM_MS: f64 = 100.0;
+
+    let perf_on = crate::perf::is_enabled();
+    let worker_t0 = perf_on.then(std::time::Instant::now);
+    let target_count = targets.len();
     let mut done = initial_done;
     let mut failed = initial_failed;
+    let mut ai_targets = 0usize;
+    let mut ai_success = 0usize;
+    let mut ai_empty = 0usize;
+    let mut ai_fs_images = 0usize;
+    let mut ai_zip_images = 0usize;
+    let mut ai_png = 0usize;
+    let mut ai_jpeg = 0usize;
+    let mut ai_other_ext = 0usize;
+    let mut ai_models_total = 0usize;
+    let mut ai_tools_total = 0usize;
+    let mut ai_extract_ms_total = 0.0f64;
+    let mut ai_model_ms_total = 0.0f64;
+    let mut ai_extract_ms_max = 0.0f64;
+    let mut ai_slow_items = 0usize;
     let mut catalog_maps: std::collections::HashMap<
         PathBuf,
         Option<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
@@ -387,7 +406,29 @@ pub(super) fn run_details_meta_load(
         }
 
         if target.load_ai_metadata {
+            ai_targets += 1;
+            let (ai_source, ai_ext) = match &target.item {
+                GridItem::Image(path) => {
+                    ai_fs_images += 1;
+                    ("fs", path_extension_lower(path))
+                }
+                GridItem::ZipImage { entry_name, .. } => {
+                    ai_zip_images += 1;
+                    (
+                        "zip",
+                        path_extension_lower(std::path::Path::new(entry_name)),
+                    )
+                }
+                _ => ("other", String::new()),
+            };
+            match ai_ext.as_str() {
+                "png" => ai_png += 1,
+                "jpg" | "jpeg" | "jfif" => ai_jpeg += 1,
+                _ => ai_other_ext += 1,
+            }
+
             ai_metadata_checked = true;
+            let ai_extract_t0 = perf_on.then(std::time::Instant::now);
             let metadata = match &target.item {
                 GridItem::Image(path) => {
                     let _permit = io_sem.acquire(target.priority);
@@ -411,9 +452,39 @@ pub(super) fn run_details_meta_load(
                 }
                 _ => None,
             };
+            if let Some(t0) = ai_extract_t0 {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                ai_extract_ms_total += ms;
+                ai_extract_ms_max = ai_extract_ms_max.max(ms);
+                if ms >= SLOW_AI_METADATA_ITEM_MS {
+                    ai_slow_items += 1;
+                    crate::perf::event(
+                        "details_meta",
+                        "ai_item_slow",
+                        None,
+                        generation,
+                        &[
+                            ("ms", serde_json::Value::from(ms)),
+                            ("source", serde_json::Value::from(ai_source)),
+                            ("ext", serde_json::Value::from(ai_ext.as_str())),
+                            ("source_size", serde_json::Value::from(target.source_size)),
+                            ("priority", serde_json::Value::from(target.priority as u8)),
+                        ],
+                    );
+                }
+            }
             if let Some(meta) = metadata.as_ref() {
+                ai_success += 1;
+                let ai_model_t0 = perf_on.then(std::time::Instant::now);
                 ai_models = crate::png_metadata::model_names(meta);
                 ai_tool = crate::png_metadata::ai_tool_name(meta).map(str::to_string);
+                if let Some(t0) = ai_model_t0 {
+                    ai_model_ms_total += t0.elapsed().as_secs_f64() * 1000.0;
+                }
+                ai_models_total += ai_models.len();
+                ai_tools_total += usize::from(ai_tool.is_some());
+            } else {
+                ai_empty += 1;
             }
         }
 
@@ -546,6 +617,48 @@ pub(super) fn run_details_meta_load(
 
     if cancel.load(Ordering::Relaxed) {
         return;
+    }
+    if let Some(t0) = worker_t0 {
+        crate::perf::event(
+            "details_meta",
+            "load_done",
+            None,
+            generation,
+            &[
+                (
+                    "ms",
+                    serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("targets", serde_json::Value::from(target_count)),
+                ("total", serde_json::Value::from(total)),
+                (
+                    "processed",
+                    serde_json::Value::from(done.saturating_sub(initial_done)),
+                ),
+                ("cached_done", serde_json::Value::from(initial_done)),
+                ("failed", serde_json::Value::from(failed)),
+                ("ai_targets", serde_json::Value::from(ai_targets)),
+                ("ai_success", serde_json::Value::from(ai_success)),
+                ("ai_empty", serde_json::Value::from(ai_empty)),
+                ("ai_fs_images", serde_json::Value::from(ai_fs_images)),
+                ("ai_zip_images", serde_json::Value::from(ai_zip_images)),
+                ("ai_png", serde_json::Value::from(ai_png)),
+                ("ai_jpeg", serde_json::Value::from(ai_jpeg)),
+                ("ai_other_ext", serde_json::Value::from(ai_other_ext)),
+                ("ai_models_total", serde_json::Value::from(ai_models_total)),
+                ("ai_tools_total", serde_json::Value::from(ai_tools_total)),
+                (
+                    "ai_extract_ms",
+                    serde_json::Value::from(ai_extract_ms_total),
+                ),
+                ("ai_model_ms", serde_json::Value::from(ai_model_ms_total)),
+                (
+                    "ai_extract_max_ms",
+                    serde_json::Value::from(ai_extract_ms_max),
+                ),
+                ("ai_slow_items", serde_json::Value::from(ai_slow_items)),
+            ],
+        );
     }
     let _ = tx.send(DetailsMetaEvent::Finished { generation, failed });
 }

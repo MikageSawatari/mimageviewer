@@ -3677,7 +3677,7 @@ impl App {
         };
         if self.checked.contains(&idx) {
             self.checked.remove(&idx);
-        } else if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+        } else if self.grid_item_can_be_checked(idx) {
             self.checked.insert(idx);
         }
     }

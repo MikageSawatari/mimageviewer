@@ -2711,8 +2711,31 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
+    use crate::app::subfolder_expansion_synthetic_path;
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
+
+    fn grid_key_nav(
+        app: &mut crate::app::App,
+        modifiers: egui::Modifiers,
+        key: egui::Key,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        nav
+    }
 
     /// Ctrl+G 絞り込みビューで folder_path に drill-in したあと、その配下の PDF を
     /// 開くと、drill_back_one_level が「PDF → folder_path (ヒット一覧) → Aggregated」
@@ -3819,6 +3842,110 @@ mod phase_c_drill_nav_tests {
 
         assert!(!app.items_are_reading_history_view);
         assert!(app.reading_history_rows.is_empty());
+    }
+
+    #[test]
+    fn start_loading_items_resets_subfolder_expansion_state_and_cache_key_mode() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![root.join("a")];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        assert!(
+            app.use_full_path_cache_keys(),
+            "サブ展開 synthetic view では full-path cache key を使う"
+        );
+
+        app.start_loading_items(
+            root.clone(),
+            vec![GridItem::Image(root.join("p1.jpg"))],
+            vec![Some((1, 10))],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert!(!app.items_are_subfolder_expansion_view);
+        assert!(app.subfolder_expansion_root.is_none());
+        assert!(app.subfolder_expansion_roots.is_empty());
+        assert!(
+            !app.use_full_path_cache_keys(),
+            "通常フォルダへ戻ったら full-path cache key mode も解除する"
+        );
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+    }
+
+    #[test]
+    fn subfolder_expansion_toggle_uses_checked_folder_roots() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        app.current_folder = Some(root.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        app.items = vec![GridItem::Folder(a.clone()), GridItem::Folder(b.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.checked.insert(1);
+        app.checked.insert(0);
+
+        app.toggle_subfolder_expansion_view();
+
+        let pending = app
+            .subfolder_expansion_pending
+            .as_ref()
+            .expect("checked folders should start a scan");
+        assert_eq!(pending.root, root);
+        assert_eq!(pending.roots, vec![a, b]);
+        pending.cancel();
+    }
+
+    #[test]
+    fn grid_ctrl_down_is_noop_during_subfolder_expansion_view() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.current_folder_last_mtime = None;
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![root.clone()];
+        app.items = vec![GridItem::Image(root.join("p1.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![Some((1, 10))];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+
+        let nav = grid_key_nav(&mut app, egui::Modifiers::CTRL, egui::Key::ArrowDown);
+
+        assert!(nav.is_none());
+        assert!(
+            app.folder_nav_pending.is_none(),
+            "サブ展開ビューでは Ctrl+↓ で実フォルダ DFS を開始しない"
+        );
+    }
+
+    #[test]
+    fn subfolder_expansion_allows_image_color_filter() {
+        let mut app = setup_app();
+        app.items_are_subfolder_expansion_view = true;
+
+        assert!(
+            app.color_filter_available_in_current_view(),
+            "サブ展開ビューは実パス画像を持つため画像色フィルタを表示する"
+        );
     }
 
     #[test]

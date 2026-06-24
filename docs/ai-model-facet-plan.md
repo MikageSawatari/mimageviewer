@@ -17,6 +17,10 @@
   また Flux 系の `UNETLoader` / `UNETLoaderGGUF` の `unet_name` も主モデル候補として扱う。
 - InvokeAI 新形式の `model` object は、object 全体をモデル名として文字列化せず、
   `model_name` / `name` / `model_weights` など既知フィールドから実名だけを平坦化する。
+- AI モデル facet の高速化検討用に、遅延メタデータ worker の起動/完了を
+  `details_meta.load_start` / `details_meta.load_done`、100ms 以上かかった単件を
+  `details_meta.ai_item_slow`、メニュー件数集計を `ui.facet_ai_model_counts_build` /
+  `ui.facet_ai_tool_counts_build` として perf log に記録する。
 
 ## 0. 背景と目的
 

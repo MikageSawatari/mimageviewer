@@ -33,7 +33,6 @@ impl App {
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
             && !self.items_are_rating_view
-            && !self.items_are_subfolder_expansion_view
             && !self.favsearch.on_results_grid()
             && !self.tag_view.on_results_grid()
     }
@@ -91,7 +90,7 @@ impl App {
         // チップだけ残るので、案内トーストを出して有効化しない。
         if !self.color_filter_available_in_current_view() {
             self.show_feedback_toast(
-                "このビューでは画像色フィルタを使えません (通常フォルダ / ZIP / PDF で利用できます)"
+                "このビューでは画像色フィルタを使えません (通常フォルダ / サブ展開 / ZIP / PDF で利用できます)"
                     .to_string(),
             );
             return;
@@ -637,6 +636,8 @@ impl App {
             "global_search"
         } else if self.items_are_tag_view {
             "tag"
+        } else if self.items_are_subfolder_expansion_view {
+            "subfolder_expansion"
         } else if self.favsearch.on_results_grid() {
             "favsearch"
         } else if self.items_are_reading_history_view {

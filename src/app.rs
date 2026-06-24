@@ -3952,6 +3952,9 @@ pub struct App {
     /// サブ展開ビューの実 root。`current_folder` は synthetic path になるため、戻り先や
     /// 再スキャンのために実パスを別保持する。
     pub(crate) subfolder_expansion_root: Option<PathBuf>,
+    /// サブ展開の走査起点。単一 root 展開では root 1 件、チェックしたフォルダから
+    /// 展開した場合はそのフォルダ群を保持する。
+    pub(crate) subfolder_expansion_roots: Vec<PathBuf>,
     /// サブ展開ビューから Backspace / トグル OFF で戻る先。初期版は root と同じ。
     pub(crate) subfolder_expansion_saved_folder: Option<PathBuf>,
     /// ボタン押下時点の走査結果。ソート変更ではこれを再利用し、ファイルシステムを再走査しない。
@@ -3959,6 +3962,9 @@ pub struct App {
         Option<subfolder_expansion::SubfolderExpansionSnapshot>,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
+    /// サブ展開 worker 完了後、巨大な snapshot を UI に反映する直前の 1 フレーム待ち状態。
+    pub(crate) subfolder_expansion_install_pending:
+        Option<subfolder_expansion::SubfolderExpansionInstallPending>,
     /// フォルダバーに出す軽量進捗。
     pub(crate) subfolder_expansion_progress:
         Option<subfolder_expansion::SubfolderExpansionProgress>,
@@ -5925,9 +5931,11 @@ impl App {
             stack_script_pending: None,
             stack_toggle_select_path: None,
             subfolder_expansion_root: None,
+            subfolder_expansion_roots: Vec::new(),
             subfolder_expansion_saved_folder: None,
             subfolder_expansion_snapshot: None,
             subfolder_expansion_pending: None,
+            subfolder_expansion_install_pending: None,
             subfolder_expansion_progress: None,
             subfolder_expansion_diag: None,
             fs_nav_after_pdf_enumerate: None,
@@ -8180,6 +8188,11 @@ impl App {
             .as_ref()
             .map(|pending| pending.root.clone())
         {
+            self.subfolder_expansion_roots = self
+                .subfolder_expansion_pending
+                .as_ref()
+                .map(|pending| pending.roots.clone())
+                .unwrap_or_else(|| vec![root.clone()]);
             self.subfolder_expansion_root = Some(root.clone());
             self.subfolder_expansion_saved_folder = Some(root);
             return;
@@ -8189,7 +8202,12 @@ impl App {
                 return;
             }
             if let Some(root) = self.subfolder_expansion_root.clone() {
-                self.start_subfolder_expansion_scan(root);
+                let roots = if self.subfolder_expansion_roots.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    self.subfolder_expansion_roots.clone()
+                };
+                self.start_subfolder_expansion_scan_roots(root, roots);
             }
             return;
         }
@@ -12601,8 +12619,9 @@ impl App {
         self.last_prefetch_suppressed_emit_at = None;
 
         // perf: start_loading_items 全体 + 内訳 (sidecar_flush / close_fullscreen /
-        // state_reset / prewarm_rating / adjustment_db / mask_db / catalog_open /
-        // catalog_load_all / catalog_delete_missing / spawn_workers / settings_save)。
+        // state_reset / prewarm_rating / prewarm_tags / rebuild_visible_indices /
+        // adjustment_db / mask_db / catalog_open / catalog_load_all /
+        // catalog_delete_missing / spawn_workers / settings_save)。
         // UI スレッドブロックの真犯人を特定するため、区間ごとに ms を記録する。
         let sli_t0 = std::time::Instant::now();
         let sli_seq = self.input_seq;
@@ -12783,15 +12802,8 @@ impl App {
         // 1 回のクエリで全アイテムのレーティングを引いてキャッシュに載せる。
         // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
-        let prewarm_t0 = std::time::Instant::now();
+        let prewarm_rating_t0 = std::time::Instant::now();
         self.prewarm_rating_cache();
-        // タグバッジ用も同様に tags.db から一括 prewarm。
-        // rating と合算すると tags.db 側の退行が見えないので区間を分けて計測する
-        // (cold tags.db + 大フォルダで UI スレッド同期クエリが伸びる潜在箇所)。
-        let prewarm_tags_t0 = std::time::Instant::now();
-        self.prewarm_grid_tags();
-        let prewarm_tags_ms = prewarm_tags_t0.elapsed().as_secs_f64() * 1000.0;
-        self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -12800,15 +12812,45 @@ impl App {
                 sli_seq,
                 &[(
                     "ms",
-                    serde_json::Value::from(prewarm_t0.elapsed().as_secs_f64() * 1000.0),
+                    serde_json::Value::from(prewarm_rating_t0.elapsed().as_secs_f64() * 1000.0),
                 )],
             );
+        }
+        // タグバッジ用も同様に tags.db から一括 prewarm。
+        // rating と合算すると tags.db 側の退行が見えないので区間を分けて計測する
+        // (cold tags.db + 大フォルダで UI スレッド同期クエリが伸びる潜在箇所)。
+        let prewarm_tags_t0 = std::time::Instant::now();
+        self.prewarm_grid_tags();
+        if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
                 "sli_prewarm_tags",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(prewarm_tags_ms))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(prewarm_tags_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
+            );
+        }
+        let rebuild_t0 = std::time::Instant::now();
+        self.rebuild_visible_indices();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_rebuild_visible_indices",
+                None,
+                sli_seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(rebuild_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "visible",
+                        serde_json::Value::from(self.visible_indices.len()),
+                    ),
+                ],
             );
         }
         // 表示モード: DB から読み込み、なければデフォルト値 (本体は apply_spread_for_key)。
@@ -18549,7 +18591,7 @@ impl App {
                     };
                     for vp in start..=end {
                         if let Some(&idx) = vi.get(vp)
-                            && self.items.get(idx).is_some_and(|it| it.is_checkable())
+                            && self.grid_item_can_be_checked(idx)
                         {
                             self.checked.insert(idx);
                         }
@@ -18568,7 +18610,7 @@ impl App {
                 if let Some(idx) = self.selected {
                     if self.checked.contains(&idx) {
                         self.checked.remove(&idx);
-                    } else if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                    } else if self.grid_item_can_be_checked(idx) {
                         self.checked.insert(idx);
                     }
                 }
@@ -22248,8 +22290,27 @@ impl App {
             }
         }
 
+        let normal_targets = visible_targets.len();
+        let low_targets = background_targets.len();
         visible_targets.extend(background_targets);
         let targets = visible_targets;
+        let target_count = targets.len();
+        let ai_targets = targets
+            .iter()
+            .filter(|target| target.load_ai_metadata)
+            .count();
+        let created_targets = targets
+            .iter()
+            .filter(|target| target.load_created_at)
+            .count();
+        let image_dim_targets = targets
+            .iter()
+            .filter(|target| target.load_image_dims)
+            .count();
+        let video_meta_targets = targets
+            .iter()
+            .filter(|target| target.load_video_meta)
+            .count();
 
         if total == 0 || targets.is_empty() {
             self.details_image_dims_state = LazyColumnState::Ready {
@@ -22295,6 +22356,41 @@ impl App {
         } else {
             HashSet::new()
         };
+
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "details_meta",
+                "load_start",
+                None,
+                generation,
+                &[
+                    ("targets", serde_json::Value::from(target_count)),
+                    ("total", serde_json::Value::from(total)),
+                    ("cached_done", serde_json::Value::from(cached_done)),
+                    ("cached_failed", serde_json::Value::from(cached_failed)),
+                    ("normal_targets", serde_json::Value::from(normal_targets)),
+                    ("low_targets", serde_json::Value::from(low_targets)),
+                    ("ai_targets", serde_json::Value::from(ai_targets)),
+                    ("created_targets", serde_json::Value::from(created_targets)),
+                    (
+                        "image_dim_targets",
+                        serde_json::Value::from(image_dim_targets),
+                    ),
+                    (
+                        "video_meta_targets",
+                        serde_json::Value::from(video_meta_targets),
+                    ),
+                    ("ai_facet_load", serde_json::Value::from(ai_facet_load)),
+                    (
+                        "grid_mode",
+                        serde_json::Value::from(match self.settings.grid_view_mode {
+                            crate::settings::GridViewMode::Thumbnail => "thumbnail",
+                            crate::settings::GridViewMode::Details => "details",
+                        }),
+                    ),
+                ],
+            );
+        }
 
         std::thread::Builder::new()
             .name("details-meta-load".to_string())
@@ -27019,7 +27115,12 @@ impl App {
                 if !self.reinstall_subfolder_expansion_snapshot()
                     && let Some(root) = self.subfolder_expansion_root.clone()
                 {
-                    self.start_subfolder_expansion_scan(root);
+                    let roots = if self.subfolder_expansion_roots.is_empty() {
+                        vec![root.clone()]
+                    } else {
+                        self.subfolder_expansion_roots.clone()
+                    };
+                    self.start_subfolder_expansion_scan_roots(root, roots);
                 }
             } else if let Some(cur) = self.current_folder.clone()
                 && !is_synthetic_view_path(&cur)
@@ -37363,6 +37464,7 @@ impl eframe::App for App {
 
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
+        self.render_subfolder_expansion_install_overlay(ctx);
 
         // ── PDF / ZIP コンテナ列挙待ちバッジ (左下、進捗バーの上に積む) ──
         // PDFium 開封 + 列挙の 100ms〜1.3 秒の間「親フォルダのまま動かない」状態に
@@ -37538,7 +37640,7 @@ impl eframe::App for App {
             }
         }
 
-        // ── Ctrl+A: 表示中の全アイテムをチェック ─────────────────────
+        // ── Ctrl+A: 表示中のチェック可能なアイテムをチェック ─────────
         // Ctrl+D / Ctrl+Shift+A: 選択解除 (右クリックメニュー「選択解除」と同等)。
         // Ctrl+D を primary、Ctrl+Shift+A を alias として両方受け付ける。メニュー側の
         // ヘルプ表記は Ctrl+D に統一 (3 キー同時押しより 2 キーの方が提示しやすい)。

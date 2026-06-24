@@ -424,6 +424,44 @@ fn show_scrollable_facet_choices<R>(
     .inner
 }
 
+fn show_virtualized_facet_choice_rows(
+    ui: &mut egui::Ui,
+    width: f32,
+    choice_count: usize,
+    mut add_row: impl FnMut(&mut egui::Ui, usize),
+) {
+    if choice_count <= FACET_CHOICE_MENU_VISIBLE_ROWS {
+        ui.scope(|ui| {
+            ui.set_width(width);
+            for idx in 0..choice_count {
+                add_row(ui, idx);
+            }
+        });
+        return;
+    }
+
+    let spacing = ui.spacing();
+    let row_h = spacing.interact_size.y.max(22.0) + spacing.item_spacing.y;
+    let body_height = facet_choice_body_height(ui, choice_count);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, body_height),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_height(body_height);
+            ui.set_width(width);
+            egui::ScrollArea::vertical()
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, choice_count, |ui, row_range| {
+                    ui.set_width(width);
+                    for idx in row_range {
+                        add_row(ui, idx);
+                    }
+                });
+        },
+    );
+}
+
 fn draw_facet_checkbox_choice(
     ui: &mut egui::Ui,
     selected: &mut bool,
@@ -5656,6 +5694,8 @@ impl App {
         }
 
         let mut facet_changed = false;
+        let mut place_changed = false;
+        let mut non_place_facet_changed = false;
         let mut rating_changed = false;
         let mut color_changed = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
@@ -5690,16 +5730,52 @@ impl App {
                 for item in facet_items {
                     use crate::settings::ToolbarFacetFilterItem as FI;
                     match item {
-                        FI::Kind => facet_changed |= self.draw_facet_kind_menu(ui),
-                        FI::Ext => facet_changed |= self.draw_facet_ext_menu(ui),
-                        FI::Place => facet_changed |= self.draw_facet_place_menu(ui),
-                        FI::AiModel => facet_changed |= self.draw_facet_ai_model_menu(ui),
-                        FI::AiTool => facet_changed |= self.draw_facet_ai_tool_menu(ui),
+                        FI::Kind => {
+                            let changed = self.draw_facet_kind_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::Ext => {
+                            let changed = self.draw_facet_ext_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::Place => {
+                            let changed = self.draw_facet_place_menu(ui);
+                            place_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::AiModel => {
+                            let changed = self.draw_facet_ai_model_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::AiTool => {
+                            let changed = self.draw_facet_ai_tool_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
                         FI::Rating => rating_changed |= self.draw_facet_rating_menu(ui),
-                        FI::Tags => facet_changed |= self.draw_facet_tag_menu(ui),
-                        FI::Date => facet_changed |= self.draw_facet_date_menu(ui),
-                        FI::Size => facet_changed |= self.draw_facet_size_menu(ui),
-                        FI::Edit => facet_changed |= self.draw_facet_edit_menu(ui),
+                        FI::Tags => {
+                            let changed = self.draw_facet_tag_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::Date => {
+                            let changed = self.draw_facet_date_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::Size => {
+                            let changed = self.draw_facet_size_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
+                        FI::Edit => {
+                            let changed = self.draw_facet_edit_menu(ui);
+                            non_place_facet_changed |= changed;
+                            facet_changed |= changed;
+                        }
                         FI::Color => {
                             if self.color_filter_available_in_current_view() {
                                 color_changed |= self.draw_facet_color_menu(ui);
@@ -5760,11 +5836,19 @@ impl App {
             self.color_filter.applied_scope_signature = None;
         }
         if facet_changed || rating_changed {
+            let preserve_place_counts =
+                place_changed && !non_place_facet_changed && !rating_changed;
+            let place_counts_cache = preserve_place_counts
+                .then(|| self.facet_place_counts_cache.clone())
+                .flatten();
             self.settings.save();
             if rating_changed && self.global_search.active && self.items_are_global_search_view {
                 self.rebuild_items_from_global_search();
             } else {
                 self.rebuild_visible_indices();
+            }
+            if preserve_place_counts {
+                self.facet_place_counts_cache = place_counts_cache;
             }
         }
         if color_changed || color_scope_changed {
@@ -5981,21 +6065,44 @@ impl App {
                 if counts.is_empty() {
                     ui.label("候補なし");
                 } else {
+                    let counts: Vec<_> = counts.into_iter().collect();
                     let choice_count = counts.len();
-                    show_scrollable_facet_choices(ui, PLACE_FACET_MENU_WIDTH, choice_count, |ui| {
-                        for (key, (place_label, count)) in counts {
-                            let mut selected = self.settings.facet_filter.place_keys.contains(&key);
+                    let selected_count = self.settings.facet_filter.place_keys.len();
+                    let render_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+                    show_virtualized_facet_choice_rows(
+                        ui,
+                        PLACE_FACET_MENU_WIDTH,
+                        choice_count,
+                        |ui, idx| {
+                            let (key, (place_label, count)) = &counts[idx];
+                            let mut selected = self.settings.facet_filter.place_keys.contains(key);
                             let text = format!("{place_label} ({count})");
-                            if draw_facet_checkbox_choice(ui, &mut selected, text, &key) {
+                            if draw_facet_checkbox_choice(ui, &mut selected, text, key.as_str()) {
                                 if selected {
                                     self.settings.facet_filter.place_keys.insert(key.clone());
                                 } else {
-                                    self.settings.facet_filter.place_keys.remove(&key);
+                                    self.settings.facet_filter.place_keys.remove(key);
                                 }
                                 changed = true;
                             }
-                        }
-                    });
+                        },
+                    );
+                    if let Some(t0) = render_t0 {
+                        crate::perf::event(
+                            "ui",
+                            "facet_place_menu_render",
+                            None,
+                            self.input_seq,
+                            &[
+                                (
+                                    "ms",
+                                    serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                                ),
+                                ("choices", serde_json::Value::from(choice_count)),
+                                ("selected", serde_json::Value::from(selected_count)),
+                            ],
+                        );
+                    }
                 }
             });
         suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
@@ -6979,7 +7086,9 @@ impl App {
         if let Some(counts) = self.facet_place_counts_cache.as_ref() {
             return counts.clone();
         }
+        let perf_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let indices = self.facet_candidate_indices(FacetField::Place);
+        let candidate_count = indices.len();
         let mut counts = BTreeMap::new();
         for idx in indices {
             let Some(item) = self.items.get(idx) else {
@@ -6993,29 +7102,81 @@ impl App {
             let entry = counts.entry(key).or_insert((label, 0));
             entry.1 += 1;
         }
+        if let Some(t0) = perf_t0 {
+            crate::perf::event(
+                "ui",
+                "facet_place_counts_build",
+                None,
+                self.input_seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("candidates", serde_json::Value::from(candidate_count)),
+                    ("places", serde_json::Value::from(counts.len())),
+                ],
+            );
+        }
         self.facet_place_counts_cache = Some(counts.clone());
         counts
     }
 
     fn facet_ai_model_counts(&mut self) -> BTreeMap<String, usize> {
+        let perf_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let indices = self.facet_candidate_indices(FacetField::AiModel);
+        let candidate_count = indices.len();
         let mut counts = BTreeMap::new();
         for idx in indices {
             for model in self.facet_ai_model_values(idx) {
                 *counts.entry(model).or_insert(0) += 1;
             }
         }
+        if let Some(t0) = perf_t0 {
+            crate::perf::event(
+                "ui",
+                "facet_ai_model_counts_build",
+                None,
+                self.input_seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("candidates", serde_json::Value::from(candidate_count)),
+                    ("models", serde_json::Value::from(counts.len())),
+                ],
+            );
+        }
         counts
     }
 
     fn facet_ai_tool_counts(&mut self) -> BTreeMap<String, usize> {
+        let perf_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let indices = self.facet_candidate_indices(FacetField::AiTool);
+        let candidate_count = indices.len();
         let mut counts = BTreeMap::new();
         for idx in indices {
             let tool = self.facet_ai_tool_value(idx);
             if !tool.is_empty() {
                 *counts.entry(tool).or_insert(0) += 1;
             }
+        }
+        if let Some(t0) = perf_t0 {
+            crate::perf::event(
+                "ui",
+                "facet_ai_tool_counts_build",
+                None,
+                self.input_seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("candidates", serde_json::Value::from(candidate_count)),
+                    ("tools", serde_json::Value::from(counts.len())),
+                ],
+            );
         }
         counts
     }
@@ -7600,7 +7761,7 @@ impl App {
                             } else if subfolder_expansion_on {
                                 "サブ展開を解除して元のフォルダへ戻る".to_string()
                             } else {
-                                "現在のフォルダ以下の画像と動画をフラット表示".to_string()
+                                self.subfolder_expansion_action_tooltip()
                             };
                             let resp = ui
                                 .selectable_label(subfolder_expansion_on || pending, label)
@@ -8503,7 +8664,7 @@ impl App {
                     };
                     for vp in start..=end {
                         if let Some(&vidx) = display_order.get(vp) {
-                            if self.items.get(vidx).is_some_and(|it| it.is_checkable()) {
+                            if self.grid_item_can_be_checked(vidx) {
                                 self.checked.insert(vidx);
                             }
                         }
@@ -8517,13 +8678,13 @@ impl App {
                     if let Some(prev_sel) = self.selected {
                         if prev_sel != idx
                             && self.idx_visible(prev_sel)
-                            && self.items.get(prev_sel).is_some_and(|it| it.is_checkable())
+                            && self.grid_item_can_be_checked(prev_sel)
                         {
                             self.checked.insert(prev_sel);
                         }
                     }
                 }
-                if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                if self.grid_item_can_be_checked(idx) {
                     if self.checked.contains(&idx) {
                         self.checked.remove(&idx);
                     } else {

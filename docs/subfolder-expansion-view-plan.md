@@ -27,10 +27,10 @@ mIV はカタログ前提ではないため、常時追従ではなくユーザ�
 | 画面上の短名 | `サブ展開` を第一候補。ツールチップやメニューでは長い説明を使う |
 | 対象 | 通常ファイルシステム上の画像/動画。ZIP/PDF/変換アーカイブの中身は対象外 |
 | 永続化 | ビュー状態は保存しない。設定DB / 検索DB / rating DB のスキーマ変更なし |
-| synthetic view | `current_folder` は専用 synthetic path にする。実 root は `subfolder_expansion_root` / 戻り先は `subfolder_expansion_saved_folder` に保持する |
+| synthetic view | `current_folder` は専用 synthetic path にする。実 root は `subfolder_expansion_root` / 走査起点は `subfolder_expansion_roots` / 戻り先は `subfolder_expansion_saved_folder` に保持する |
 | 横断ナビ | `Ctrl+↑↓` / `Ctrl+PageUp/Down` は実フォルダ DFS に落とさず no-op + ヒントにする |
 | スキャン並列化 | 初期版は single-thread worker + perf 計測。bounded parallel scan は実測後の後続候補 |
-| 画像色フィルタ | 初期版ではサブ展開ビュー上では無効化する。大量デコードを伴うため後続で解放判断 |
+| 画像色フィルタ | サブ展開ビュー上でも利用可能にする。実パス画像だけを対象にし、大量件数では確認ゲートを挟む |
 
 実装メモ (2026-06-24):
 
@@ -40,6 +40,9 @@ mIV はカタログ前提ではないため、常時追従ではなくユーザ�
   root 通常フォルダへ戻る。
 - `subfolder_expansion_synthetic_path()` を `is_synthetic_view_path` に追加し、
   catalog `delete_missing`、`last_folder`、実フォルダ履歴、コンテナ★から切り離す。
+- 通常フォルダ表示中はフォルダも Space / Ctrl+クリックでチェックでき、チェックしたフォルダが
+  1 件以上ある場合は、そのフォルダ群だけをサブ展開の走査起点にする。チェックなしでは従来どおり
+  現在フォルダ全体を展開する。
 - 動画サムネイル override はサブ展開ビューで同名動画が衝突しないよう full path key を優先する。
 - 完了結果を `SubfolderExpansionSnapshot` として保持し、ソート変更時はメモリ内で再ソートして
   再表示する。ソート変更ではファイルシステムを再走査しない。
@@ -77,8 +80,9 @@ mIV はカタログ前提ではないため、常時追従ではなくユーザ�
 メニューやツールチップでは短名だけに頼らない:
 
 - メニュー: `サブフォルダを展開して表示`
-- ツールチップ: `現在のフォルダ以下の画像と動画をフラット表示`
-- ビュー見出し: `サブ展開: <root>`
+- ツールチップ: `現在のフォルダ以下の画像と動画をフラット表示`。チェックしたフォルダがある場合は
+  `チェックした N 個のフォルダ以下の画像と動画をまとめてフラット表示`。
+- ビュー見出し: `サブ展開: <root>`。複数起点の場合は root に加えて `Nフォルダ` を併記する。
 
 ### 2.2 配置
 
@@ -86,6 +90,8 @@ mIV はカタログ前提ではないため、常時追従ではなくユーザ�
 - 初期実装ではメニュー項目は置かない。必要になったら `ファイル` または `表示` メニューへ
   `サブフォルダを展開して表示` を追加する。
 - 実ディレクトリ表示中のみ有効にする。合成ビューや ZIP/PDF 内では disabled。
+- 実ディレクトリ表示中にフォルダを Space / Ctrl+クリックでチェックしてから `サブ展開` を押すと、
+  現在フォルダ全体ではなくチェックしたフォルダ群だけを 1 つのフラットビューにまとめる。
 
 `サブ展開` 中に同じトグルを押すと、元の通常フォルダ表示へ戻る。専用の更新ボタンは作らない。
 
@@ -95,6 +101,9 @@ mIV はカタログ前提ではないため、常時追従ではなくユーザ�
 - 表示例: `サブ展開中 1,240件 / 180フォルダ`
 - `中止` ボタン、または `サブ展開中 ...` ラベルのクリックでキャンセルする。
 - フォルダ移動 / 検索ビュー遷移 / アプリ終了では自動キャンセルする。
+- 走査完了後、結果件数が大きく UI 反映だけで 0.5 秒以上かかる可能性が高い場合は、
+  `サブ展開の表示を準備中...` の中央オーバーレイを短時間描画してから `items` を差し替える。
+  これにより sort / DB prewarm / visible index 再構築中も、処理中であることが画面に残る。
 
 完了後にだけ `items` を差し替える。途中結果で一覧を小刻みに置き換えない。
 
@@ -132,6 +141,8 @@ ZIP/PDF/変換アーカイブの中身まで展開すると、パスキー、パ
 有効:
 
 - 通常の実ディレクトリ
+- 通常の実ディレクトリ直下でチェックした実フォルダ群。チェックしたフォルダが 1 件以上ある場合は、
+  現在フォルダ全体ではなくそのフォルダ群を起点として扱う。
 - 本棚内の実ディレクトリも、実パスとしては動かせるため許可候補。ただし製本ルート全体への適用は
   大量走査になりやすいので確認ダイアログの対象にする。
 
@@ -161,6 +172,7 @@ UI の enabled 判定だけでなく、実行関数側でも同じガードを�
 ```rust
 items_are_subfolder_expansion_view: bool,
 subfolder_expansion_root: Option<PathBuf>,
+subfolder_expansion_roots: Vec<PathBuf>,
 subfolder_expansion_saved_folder: Option<PathBuf>,
 subfolder_expansion_pending: Option<SubfolderExpansionPending>,
 subfolder_expansion_diag: Option<SubfolderExpansionDiag>,
@@ -171,9 +183,9 @@ subfolder_expansion_diag: Option<SubfolderExpansionDiag>,
 ```rust
 struct SubfolderExpansionPending {
     root: PathBuf,
+    roots: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<SubfolderExpansionEvent>,
-    seq: u64,
 }
 ```
 
@@ -182,13 +194,16 @@ worker result:
 ```rust
 struct SubfolderExpansionResult {
     root: PathBuf,
-    rows: Vec<SubfolderExpansionRow>,
+    roots: Vec<PathBuf>,
+    entries: Vec<SubfolderExpansionEntry>,
     diag: SubfolderExpansionDiag,
 }
 
-struct SubfolderExpansionRow {
-    item: GridItem,              // Image / Video only
-    meta: Option<(i64, i64)>,    // mtime secs, file size
+struct SubfolderExpansionEntry {
+    path: PathBuf,
+    is_video: bool,
+    mtime: i64,
+    file_size: i64,
 }
 ```
 
@@ -210,7 +225,9 @@ view と同じガードに乗る。
 - `start_loading_items` 内の catalog `delete_missing` が synthetic path では走らない。
 - `last_folder` / folder history / container rating など、実フォルダ前提の経路から区別できる。
 
-実 root は `subfolder_expansion_root` として別に保持する。Backspace / パンくず / トグル OFF で
+実 root は `subfolder_expansion_root` として別に保持する。チェックした複数フォルダを起点にした場合も、
+戻り先や表示上の親はボタンを押した通常フォルダ root とし、実際の走査起点は
+`subfolder_expansion_roots` に保持する。Backspace / パンくず / トグル OFF で
 戻る先は `subfolder_expansion_saved_folder` (= 通常は root 実フォルダ) とし、synthetic path の
 親 (`%APPDATA%\mimageviewer` など) へ落ちないようにする。
 
@@ -225,24 +242,25 @@ full-path key の集合を渡しておく方針でもよい。
 ```
 enter_subfolder_expansion_view(root):
   - root が実ディレクトリか確認
+  - チェックしたフォルダがあれば roots = checked folders、なければ roots = [root]
   - 実行禁止ビュー / snapshot lock / 自ビュー再入をガード
   - 必要なら大規模走査確認を出す
-  - start_loading_items より前に root / saved_folder を退避
+  - start_loading_items より前に root / roots / saved_folder を退避
   - 既存 pending を cancel
   - worker を spawn
   - UI は現フォルダ表示のまま進捗表示
 
 worker:
-  - root 以下を single-thread で深さ優先走査
+  - roots 以下を single-thread で深さ優先走査
   - DirEntry::file_type() / metadata() を使う
-  - 画像/動画だけ SubfolderExpansionRow にする
+  - 画像/動画だけ SubfolderExpansionEntry にする
   - duplicate filter は worker 側で同一親フォルダ内だけ適用する
   - 定期的に Progress event を送る
   - cancel が立ったら中断
   - Done(result) を送る
 
 poll_subfolder_expansion:
-  - stale seq / root mismatch は破棄
+  - stale root / roots mismatch は破棄
   - sort を適用
   - synthetic path で start_loading_items 相当へ入れる
   - items_are_subfolder_expansion_view = true
@@ -273,7 +291,7 @@ root / saved_folder の退避は必ずその前に済ませる。synthetic view 
 ディレクトリ symlink / junction は、`search_walker` と同じ方針に揃える。独自の簡易実装を作らない。
 
 - `canonicalize` 由来の visited key でループを防ぐ。
-- depth limit は `search_walker` と同じ値に揃える。
+- depth limit は `search_walker` と同じ 40 に揃える。
 - reparse point を追うか skip するかも、検索インデクサと不一致にならないようにする。
 
 将来 bounded parallel scan を入れる場合、visited set は `Mutex<HashSet<_>>` で共有し、
@@ -328,9 +346,9 @@ root 相対で見せられると分かりやすい。
 root 相対表示は polish として後続候補にする。共通の `facet_place_label_for_path` を変える場合は、
 他ビューへ影響しないようサブ展開ビュー限定の分岐にする。
 
-画像色フィルタは初期版では無効化する。サブ展開ビューは大量件数になりやすく、画像色フィルタは
-実ファイル decode / 色抽出を伴うため、まずは本来価値である `場所` facet、詳細表示、★、タグに
-スコープを絞る。後続で解放する場合は、既存の大量時確認 UI と scope signature の整合性を確認する。
+画像色フィルタはサブ展開ビューでも利用可能にする。サブ展開ビューは大量件数になりやすく、
+実ファイル decode / 色抽出を伴うため、通常フォルダと同じ大量時確認 UI を使い、
+scope signature は `subfolder_expansion` として通常フォルダと分ける。動画は既存の画像色フィルタ対象外。
 
 ### 7.3 ソート
 
@@ -423,10 +441,21 @@ facet の一貫性を保つため。ただしネットワーク共有などで m
 perf で確認し、問題が見えたら「名前順 + 詳細 OFF では遅延収集」の後続最適化を検討する。
 
 完了後の `items` 差し替えと sort は UI スレッドで走るため、結果件数が非常に大きい場合はここも
-計測対象にする。必要なら worker 側で sort key 生成まで済ませる。
+計測対象にする。`subfolder.install_sort` / `install_build_items` / `install_existing_keys` /
+`install_start_loading` / `install_rebuild_visible` / `install_end` を出し、どこで止まっているかを
+ログで切り分ける。サブ展開 synthetic view では catalog `delete_missing` がスキップされるため、
+`existing_keys` は空集合を渡し、50 万件級の巨大な存続キー集合を作らない。必要なら worker 側で
+sort key 生成まで済ませる。
 
 `facet_place_counts` など、表示集合に対する facet 件数再計算も O(n) になり得る。1 万件超の
-サブ展開でフィルタ操作時にヒッチが出ないか perf 計測対象に入れる。
+サブ展開でフィルタ操作時にヒッチが出ないか、`ui.facet_place_counts_build` で初回キャッシュ構築時間を
+計測対象に入れる。`start_loading_items` は `nav.sli_prewarm_rating` / `sli_prewarm_tags` /
+`sli_rebuild_visible_indices` を分けて記録し、rating / tag / visible index のどれが支配的かを見る。
+大量サブ展開では `場所` 件数キャッシュを遅延構築し、場所フィルタ自身の変更では
+キャッシュを破棄しない。これにより、チェック操作直後の再描画で同じ O(n) 集計を繰り返さない。
+`場所` メニューは候補が多い場合に可視行だけを `show_rows` で描画し、
+`ui.facet_place_menu_render` でメニュー描画時間を計測する。初回クリック時の件数構築がまだ
+体感上重い場合は、メニューオープン時の処理中表示や worker 化を後続で検討する。
 
 ---
 
@@ -438,11 +467,13 @@ perf で確認し、問題が見えたら「名前順 + 詳細 OFF では遅延�
 4. [x] Backspace / パンくず / アドレスバー / `Ctrl+↑↓` / `Ctrl+PageUp/Down` の明示分岐を追加する。
 5. [x] フォルダバーへ `サブ展開` を追加し、UI enabled と実行関数側の両方で入場ガードする。
 6. [x] 進捗 + キャンセル UI を追加する。
-7. [x] 画像色フィルタの availability からサブ展開ビューを外す。
+7. [x] 画像色フィルタをサブ展開ビューでも利用可能にし、大量件数は確認ゲートで扱う。
 8. [x] ソート変更時に snapshot を再利用し、再帰走査を避ける。
 9. [x] ★ facet に表示中 snapshot 由来の件数を出す。
-10. [ ] 実機レビューで詳細表示 / facet / ★ / タグ / file operation の動作を確認する。
-11. [ ] perf log と大規模フォルダの実測を取る。
+10. [x] チェックした複数フォルダを 1 つのサブ展開ビューにまとめる。
+11. [x] 大量件数の表示反映前に中央処理中オーバーレイを出し、詳細 perf イベントを追加する。
+12. [ ] 実機レビューで詳細表示 / facet / ★ / タグ / file operation の動作を確認する。
+13. [ ] perf log と大規模フォルダの実測を取る。
 
 ---
 
@@ -465,10 +496,12 @@ App-level test:
 - 合成ビューから戻ると root 通常表示へ戻る。
 - Backspace / パンくず / pending return-to-parent が synthetic path の親ではなく root 実フォルダへ戻る。
 - Ctrl+↑↓ / Ctrl+PageUp/Down が `start_folder_nav` に落ちず no-op になる。
+- 通常フォルダでチェックした複数フォルダだけを起点にサブ展開できる。
+- 通常フォルダへ戻ると synthetic view state と full path cache key mode が解除される。
 - stale worker result を捨てる。
 - ★ / タグ / facet が実パスに効く。
 - 場所 facet で特定サブフォルダだけに絞れる。
-- 画像色フィルタが初期版ではサブ展開ビューで無効。
+- 画像色フィルタがサブ展開ビューで画像だけを対象にし、大量件数では確認ゲートを挟む。
 - delete / move 後に対象行をメモリ上から除去できる。
 
 手動確認:
@@ -508,5 +541,5 @@ App-level test:
 - root / saved_folder は `start_loading_items` より前に退避し、入場ガードを UI と実行関数の
   両方に置く方針を明記した。
 
-P2 は概ね採用し、画像色フィルタは初期版で無効、場所 facet の root 相対ラベルと bounded parallel
+P2 は概ね採用し、画像色フィルタは確認ゲート付きで解放、場所 facet の root 相対ラベルと bounded parallel
 scan は後続扱いにした。metadata 収集は初期版では維持し、perf で問題が出た場合に遅延化する。
