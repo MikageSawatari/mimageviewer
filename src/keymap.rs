@@ -72,11 +72,32 @@ impl KeyContext {
     }
 }
 
+pub type CommandScope = KeyContext;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum KeyTrigger {
     Press,
     ModifierHold,
     KeyHold,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BindingPolicy {
+    FullChord,
+    SingleModifier,
+    SinglePlainKey,
+    Reserved,
+    NotBindable,
+}
+
+impl BindingPolicy {
+    fn for_trigger(trigger: KeyTrigger) -> Self {
+        match trigger {
+            KeyTrigger::Press => BindingPolicy::FullChord,
+            KeyTrigger::ModifierHold => BindingPolicy::SingleModifier,
+            KeyTrigger::KeyHold => BindingPolicy::SinglePlainKey,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1098,6 +1119,40 @@ const ALL_ACTIONS: &[KeyAction] = &[
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
 // inventory and this array so newly added actions cannot silently miss ini generation.
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CommandSpec {
+    pub action: KeyAction,
+    pub scope: CommandScope,
+    pub trigger: KeyTrigger,
+    pub binding_policy: BindingPolicy,
+}
+
+impl CommandSpec {
+    pub fn from_action(action: KeyAction) -> Self {
+        Self {
+            action,
+            scope: action.context(),
+            trigger: action.trigger(),
+            binding_policy: BindingPolicy::for_trigger(action.trigger()),
+        }
+    }
+
+    pub fn ini_name(self) -> &'static str {
+        self.action.ini_name()
+    }
+
+    pub fn description(self) -> &'static str {
+        self.action.description()
+    }
+}
+
+pub fn command_catalog() -> impl Iterator<Item = CommandSpec> {
+    KeyAction::all()
+        .iter()
+        .copied()
+        .map(CommandSpec::from_action)
+}
+
 const RATING_ITEM_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingItem1, 1),
     (KeyAction::RatingItem2, 2),
@@ -2097,6 +2152,157 @@ pub struct RatingKey {
     pub stars: u8,
 }
 
+const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
+    &[KeyContext::Global, KeyContext::Grid, KeyContext::Rating],
+    &[
+        KeyContext::Global,
+        KeyContext::FsCommon,
+        KeyContext::Rating,
+        KeyContext::FsImage,
+    ],
+    &[
+        KeyContext::Global,
+        KeyContext::FsCommon,
+        KeyContext::Rating,
+        KeyContext::FsVideo,
+    ],
+    &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Erase],
+    &[
+        KeyContext::Global,
+        KeyContext::FsCommon,
+        KeyContext::Conceal,
+    ],
+    &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Crop],
+    &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Text],
+    &[
+        KeyContext::Global,
+        KeyContext::FsCommon,
+        KeyContext::LocalAdjust,
+    ],
+];
+
+pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
+    a == b
+        || ACTIVE_SCOPE_SETS
+            .iter()
+            .any(|set| set.contains(&a) && set.contains(&b))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BindingConflictKind {
+    Hard,
+    ActiveOverlap,
+    TriggerMismatch,
+    Reserved,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BindingConflict {
+    pub kind: BindingConflictKind,
+    pub chord: Chord,
+    pub action: KeyAction,
+    pub other_action: Option<KeyAction>,
+    pub scope: CommandScope,
+    pub other_scope: CommandScope,
+    pub trigger: KeyTrigger,
+    pub other_trigger: KeyTrigger,
+    pub reserved_name: Option<&'static str>,
+}
+
+impl BindingConflict {
+    fn warning(self) -> String {
+        let chord = self.chord.display_name();
+        match self.kind {
+            BindingConflictKind::Reserved => format!(
+                "binding warning: '{}' uses reserved shortcut {} ({}) in overlapping scope [{}]",
+                self.action.ini_name(),
+                chord,
+                self.reserved_name.unwrap_or("reserved input"),
+                self.scope.ini_name()
+            ),
+            BindingConflictKind::Hard
+            | BindingConflictKind::ActiveOverlap
+            | BindingConflictKind::TriggerMismatch => {
+                let Some(other) = self.other_action else {
+                    return format!(
+                        "binding warning: '{}' uses {} in overlapping scope [{}]",
+                        self.action.ini_name(),
+                        chord,
+                        self.scope.ini_name()
+                    );
+                };
+                format!(
+                    "binding warning: '{}' and '{}' both use {} ({:?}; [{}]/{:?} vs [{}]/{:?})",
+                    self.action.ini_name(),
+                    other.ini_name(),
+                    chord,
+                    self.kind,
+                    self.scope.ini_name(),
+                    self.trigger,
+                    self.other_scope.ini_name(),
+                    self.other_trigger
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct EffectiveBinding {
+    action: KeyAction,
+    scope: CommandScope,
+    trigger: KeyTrigger,
+    chord: Chord,
+    customized: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ReservedBinding {
+    scope: CommandScope,
+    trigger: KeyTrigger,
+    chord: Chord,
+    name: &'static str,
+}
+
+const RESERVED_BINDINGS: &[ReservedBinding] = &[
+    ReservedBinding {
+        scope: KeyContext::Global,
+        trigger: KeyTrigger::Press,
+        chord: Chord::key(KeyName::Esc),
+        name: "Escape navigation / cancel",
+    },
+    ReservedBinding {
+        scope: KeyContext::Global,
+        trigger: KeyTrigger::Press,
+        chord: Chord::key(KeyName::Enter),
+        name: "Enter navigation / confirm",
+    },
+    ReservedBinding {
+        scope: KeyContext::Global,
+        trigger: KeyTrigger::Press,
+        chord: Chord::key(KeyName::Left),
+        name: "plain arrow navigation",
+    },
+    ReservedBinding {
+        scope: KeyContext::Global,
+        trigger: KeyTrigger::Press,
+        chord: Chord::key(KeyName::Right),
+        name: "plain arrow navigation",
+    },
+    ReservedBinding {
+        scope: KeyContext::Global,
+        trigger: KeyTrigger::Press,
+        chord: Chord::key(KeyName::Up),
+        name: "plain arrow navigation",
+    },
+    ReservedBinding {
+        scope: KeyContext::Global,
+        trigger: KeyTrigger::Press,
+        chord: Chord::key(KeyName::Down),
+        name: "plain arrow navigation",
+    },
+];
+
 impl Keymap {
     pub fn empty() -> Self {
         Self::default()
@@ -2245,10 +2451,12 @@ impl Keymap {
             overrides.insert(action, chords);
         }
 
-        Self {
+        let mut keymap = Self {
             overrides,
             warnings,
-        }
+        };
+        keymap.append_binding_conflict_warnings();
+        keymap
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -2277,6 +2485,90 @@ impl Keymap {
                 chord.key.map(KeyName::display_name)
             }
         })
+    }
+
+    pub fn binding_conflicts(&self) -> Vec<BindingConflict> {
+        let bindings = self.effective_bindings();
+        let mut conflicts = Vec::new();
+
+        for (i, first) in bindings.iter().copied().enumerate() {
+            for second in bindings.iter().copied().skip(i + 1) {
+                if first.chord != second.chord
+                    || first.action == second.action
+                    || !command_scopes_overlap(first.scope, second.scope)
+                    || !(first.customized || second.customized)
+                {
+                    continue;
+                }
+                let kind = if first.trigger != second.trigger {
+                    BindingConflictKind::TriggerMismatch
+                } else if first.scope == second.scope {
+                    BindingConflictKind::Hard
+                } else {
+                    BindingConflictKind::ActiveOverlap
+                };
+                conflicts.push(BindingConflict {
+                    kind,
+                    chord: first.chord,
+                    action: first.action,
+                    other_action: Some(second.action),
+                    scope: first.scope,
+                    other_scope: second.scope,
+                    trigger: first.trigger,
+                    other_trigger: second.trigger,
+                    reserved_name: None,
+                });
+            }
+        }
+
+        for binding in bindings
+            .iter()
+            .copied()
+            .filter(|binding| binding.customized)
+        {
+            for reserved in RESERVED_BINDINGS {
+                if binding.chord == reserved.chord
+                    && command_scopes_overlap(binding.scope, reserved.scope)
+                {
+                    conflicts.push(BindingConflict {
+                        kind: BindingConflictKind::Reserved,
+                        chord: binding.chord,
+                        action: binding.action,
+                        other_action: None,
+                        scope: binding.scope,
+                        other_scope: reserved.scope,
+                        trigger: binding.trigger,
+                        other_trigger: reserved.trigger,
+                        reserved_name: Some(reserved.name),
+                    });
+                }
+            }
+        }
+
+        conflicts
+    }
+
+    fn append_binding_conflict_warnings(&mut self) {
+        for conflict in self.binding_conflicts() {
+            self.warnings.push(conflict.warning());
+        }
+    }
+
+    fn effective_bindings(&self) -> Vec<EffectiveBinding> {
+        let mut bindings = Vec::new();
+        for spec in command_catalog() {
+            let customized = self.overrides.contains_key(&spec.action);
+            for chord in self.effective_chords(spec.action) {
+                bindings.push(EffectiveBinding {
+                    action: spec.action,
+                    scope: spec.scope,
+                    trigger: spec.trigger,
+                    chord,
+                    customized,
+                });
+            }
+        }
+        bindings
     }
 
     pub fn consume_rating_action(&self, ctx: &egui::Context, container: bool) -> Option<u8> {
@@ -2539,8 +2831,12 @@ impl Keymap {
         out.push_str("# - 1 つの Action には Action.1 / Action.2 / Action.3 で最大 3 個まで割り当てできます。\n");
         out.push_str("# - = none を指定すると、その Action を明示的に無効化できます。\n");
         out.push_str("# - 既定キーが無い Action は # Action = none と表示されます。\n");
+        out.push_str("# - 同時に有効になり得る Action へ同じキーを割り当てると起動時に警告ログを出します。\n");
+        out.push_str(
+            "# - Esc / Enter / 修飾なし矢印キーは予約扱いです。割り当てても警告ログを出します。\n",
+        );
         out.push_str("# - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。\n");
-        out.push_str("# - 競合は検出しません。競合時は先に判定された操作が有効になります。\n");
+        out.push_str("# - 競合は拒否しません。競合時は先に判定された操作が有効になります。\n");
         out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
         out.push_str("# - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。\n");
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
@@ -2956,6 +3252,54 @@ mod tests {
     }
 
     #[test]
+    fn command_catalog_has_one_spec_per_key_action() {
+        let specs: Vec<CommandSpec> = command_catalog().collect();
+        assert_eq!(specs.len(), KeyAction::all().len());
+
+        let mut actions = std::collections::BTreeSet::new();
+        for spec in specs {
+            assert!(
+                actions.insert(spec.action.ini_name()),
+                "duplicate command spec for {}",
+                spec.action.ini_name()
+            );
+            assert_eq!(spec.scope, spec.action.context());
+            assert_eq!(spec.trigger, spec.action.trigger());
+            assert_eq!(
+                spec.binding_policy,
+                BindingPolicy::for_trigger(spec.action.trigger())
+            );
+        }
+    }
+
+    #[test]
+    fn command_scope_overlap_table_matches_current_dispatch_model() {
+        assert!(command_scopes_overlap(KeyContext::Global, KeyContext::Grid));
+        assert!(command_scopes_overlap(KeyContext::Rating, KeyContext::Grid));
+        assert!(command_scopes_overlap(
+            KeyContext::Rating,
+            KeyContext::FsImage
+        ));
+        assert!(command_scopes_overlap(
+            KeyContext::FsCommon,
+            KeyContext::FsImage
+        ));
+        assert!(command_scopes_overlap(
+            KeyContext::FsCommon,
+            KeyContext::Erase
+        ));
+        assert!(!command_scopes_overlap(KeyContext::Grid, KeyContext::Erase));
+        assert!(!command_scopes_overlap(
+            KeyContext::FsImage,
+            KeyContext::FsVideo
+        ));
+        assert!(!command_scopes_overlap(
+            KeyContext::Erase,
+            KeyContext::Conceal
+        ));
+    }
+
+    #[test]
     fn grid_toggle_stack_mode_is_default_unassigned() {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
@@ -2967,15 +3311,15 @@ mod tests {
         let keymap = Keymap::from_ini_str(
             r#"
             [FsImage]
-            FsSlideshow.1 = P
-            FsSlideshow.2 = Ctrl+S
+            FsSlideshow.1 = Ctrl+Alt+P
+            FsSlideshow.2 = Ctrl+Alt+S
             "#,
         );
         assert!(keymap.warnings().is_empty());
         let chords = keymap.overrides.get(&KeyAction::FsSlideshow).unwrap();
         assert_eq!(chords.len(), 2);
-        assert_eq!(chords[0], Chord::key(KeyName::P));
-        assert_eq!(chords[1], Chord::ctrl(KeyName::S));
+        assert_eq!(chords[0], Chord::new(true, false, true, KeyName::P));
+        assert_eq!(chords[1], Chord::new(true, false, true, KeyName::S));
     }
 
     #[test]
@@ -3153,6 +3497,113 @@ mod tests {
             keymap.compact_single_key_label(KeyAction::EraseToolBrush),
             None
         );
+    }
+
+    #[test]
+    fn binding_conflicts_warn_for_same_scope_override() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridToggleStackMode = Space
+            "#,
+        );
+        let conflicts = keymap.binding_conflicts();
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::Hard
+                && conflict.action == KeyAction::GridToggleCheck
+                && conflict.other_action == Some(KeyAction::GridToggleStackMode)
+                || conflict.kind == BindingConflictKind::Hard
+                    && conflict.action == KeyAction::GridToggleStackMode
+                    && conflict.other_action == Some(KeyAction::GridToggleCheck)
+        }));
+        assert!(keymap.warnings().iter().any(|warning| {
+            warning.contains("GridToggleStackMode") && warning.contains("GridToggleCheck")
+        }));
+    }
+
+    #[test]
+    fn binding_conflicts_warn_for_active_overlap() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            GlobalOpenFolder = T
+            "#,
+        );
+        assert!(keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::ActiveOverlap
+                && conflict.chord == Chord::key(KeyName::T)
+                && (conflict.action == KeyAction::GlobalOpenFolder
+                    || conflict.other_action == Some(KeyAction::GlobalOpenFolder))
+        }));
+    }
+
+    #[test]
+    fn binding_conflicts_ignore_duplicate_chords_within_same_action() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsImage]
+            FsSlideshow.1 = Ctrl+Alt+S
+            FsSlideshow.2 = Ctrl+Alt+S
+            "#,
+        );
+        assert!(
+            keymap.warnings().is_empty(),
+            "unexpected warnings: {:?}",
+            keymap.warnings()
+        );
+        assert!(keymap.binding_conflicts().is_empty());
+    }
+
+    #[test]
+    fn binding_conflicts_ignore_disjoint_scopes() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Erase]
+            EraseToolBrush = Ctrl+J
+            [Conceal]
+            ConcealToolBrush = Ctrl+J
+            "#,
+        );
+        assert!(
+            keymap.warnings().is_empty(),
+            "unexpected warnings: {:?}",
+            keymap.warnings()
+        );
+        assert!(keymap.binding_conflicts().is_empty());
+    }
+
+    #[test]
+    fn binding_conflicts_warn_for_reserved_navigation_keys() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridToggleStackMode = Enter
+            "#,
+        );
+        assert!(keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::Reserved
+                && conflict.action == KeyAction::GridToggleStackMode
+                && conflict.chord == Chord::key(KeyName::Enter)
+        }));
+        assert!(keymap.warnings().iter().any(|warning| {
+            warning.contains("GridToggleStackMode") && warning.contains("reserved shortcut Enter")
+        }));
+    }
+
+    #[test]
+    fn binding_conflicts_warn_for_trigger_mismatch() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsImage]
+            FsZoomMode = S
+            "#,
+        );
+        assert!(keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::TriggerMismatch
+                && conflict.chord == Chord::key(KeyName::S)
+                && (conflict.action == KeyAction::FsZoomMode
+                    || conflict.other_action == Some(KeyAction::FsZoomMode))
+        }));
     }
 
     #[cfg(windows)]

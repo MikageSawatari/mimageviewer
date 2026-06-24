@@ -3,7 +3,7 @@
 > ステータス: **実装済み / 保守メモ**。v1.1.0+。
 > 設計の経緯・調査・代替案は [key-customization-plan.md](key-customization-plan.md) に残す。
 > 簡易版の実装判断は本書を優先し、差異が出たら本書へ集約する。
-> 本書は「簡易版 (テキスト ini / GUI なし / 競合検知なし)」を実際に作るための手順書。
+> 本書は「簡易版 (テキスト ini / GUI なし / 競合は警告のみ)」を実際に作るための手順書。
 
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [key-customization-plan.md](key-customization-plan.md) §8 (簡易版の設計確定事項)。
@@ -21,6 +21,10 @@
   は `keymap.ini.default` に `# GridToggleStackMode = none` として出し、ユーザーがキーを
   指定したときだけフォルダバーの「スタック」と同じトグルを実行する。`CommandId` /
   `CommandSpec` などのコマンドカタログ型はまだ導入していない。
+- 2026-06 Phase 2 初期実装として、`KeyContext` を scope とする `CommandSpec` /
+  `BindingPolicy` / active scope 隣接表 / `BindingConflict` を追加した。ユーザー override が
+  同時 active になり得る既存割り当てや、Esc / Enter / 修飾なし矢印の予約キーに重なる場合は
+  起動時に警告ログを出す。設定拒否や dispatch 変更はしない。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
   右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは
@@ -39,8 +43,9 @@
   最新の標準一覧は、起動時に上書き更新される `keymap.ini.default` で確認できる。
   既定キーなしの Action は `# Action = none` と表示し、コメント解除してキー名を入れることで
   割り当て可能にする。`Action = none` のままコメント解除した場合は従来どおり明示無効化。
-- **競合検知しない。** 先勝ち (consume / VK match 経路は先頭一致が勝つ。grid の `key_pressed`
-  経路だけは非消費なので衝突時は両方発火する = 仕様として明記)。
+- **競合は拒否しない。** ユーザー override が同時 active になり得る割り当てや予約キーに
+  重なる場合は警告ログを出すが、設定は読み込む。dispatch は先勝ち (consume / VK match
+  経路は先頭一致が勝つ。grid の `key_pressed` 経路だけは非消費なので衝突時は両方発火する)。
 - **MVP で対象外にする入力を明示する。** ゲームパッド、マウス操作、D&D、OS/egui の
   `Event::Copy` / `Event::Cut`、クリップボード paste、IME 確定、右クリックメニューは keymap.ini では固定扱い。
   ただし右ドラッグ、ゲームパッド X リング、戻る / 進むボタンは

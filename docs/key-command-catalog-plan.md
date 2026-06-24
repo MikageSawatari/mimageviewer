@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 1 初期実装済み / レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 2 初期実装済み / レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -15,6 +15,11 @@
 > 空 `default_chords()`、`# Action = none` 生成、`effective_chords()` /
 > `first_chord_label()` / `compact_single_key_label()`、グリッド側キーハンドラへの最小配線まで実装。
 > `CommandId` / `CommandSpec` / scope 衝突判定は未導入のまま。ClaudeCode レビュー待ち。
+>
+> **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
+> `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。
+> ユーザー override が絡む同一 chord の Hard / ActiveOverlap / TriggerMismatch と、
+> Esc / Enter / 修飾なし矢印キーの Reserved を起動時 warning として出す。設定拒否や dispatch 変更はしない。
 
 ## 1. 背景と狙い
 
@@ -168,8 +173,9 @@ pub struct CommandSpec {
 ## 4. スコープと衝突判定
 
 > **Phase 1 の実装対象外。** 本節は設計として残すが、`CommandScope` enum や衝突判定は
-> Phase 1 では一切実装しない。現行 keymap は意図的に「競合検知しない・先勝ち」
-> (key-customization-impl-plan.md §0) を選んでおり、scope 導入はその方針転換にあたる。
+> Phase 1 では一切実装しない。Phase 2 初期実装後も、競合は**拒否せず警告ログのみ**とし、
+> dispatch は現行の「先勝ち」(key-customization-impl-plan.md §0) のまま維持する。
+> scope 導入はこの警告を出すための整理であり、dispatch 方針自体はまだ変えない。
 > 下記の scope 一覧・active scope 表・衝突レベルは**机上の初期案**であり、§4.1 自身が注記する
 > とおり実 dispatch と綺麗に一致しない可能性がある。そのため **Phase 2 の最初に、実コードの
 > active scope 判定箇所と `consume_key` / `key_pressed` / native VK の消費順を読み出してから**
@@ -223,8 +229,8 @@ pub enum CommandScope {
 | Reserved | `Esc` / `Enter` / 矢印など予約キーとの衝突 | 警告または割り当て無視 |
 | Trigger mismatch | Press と KeyHold / ModifierHold の同一 chord | 個別警告。現行 dispatch を優先 |
 
-初期フェーズでは **衝突を禁止せず、警告だけ** にする。既存の簡易 keymap は競合検知なしで
-運用されているため、いきなり起動失敗や設定無効化を増やさない。
+初期フェーズでは **衝突を禁止せず、警告だけ** にする。既存の簡易 keymap は競合しても
+dispatch 側の先勝ちで運用されていたため、いきなり起動失敗や設定無効化を増やさない。
 
 ### 4.3 優先度 resolver は後続フェーズ
 
