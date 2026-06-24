@@ -6143,6 +6143,13 @@ impl App {
         }
 
         if self.local_adjust_mode {
+            if !self.ime_input_active()
+                && !ctx.wants_keyboard_input()
+                && Self::consume_context_shortcuts_help_key(ctx)
+            {
+                self.show_context_shortcuts_help = true;
+                return action;
+            }
             // 多角形作成中の Ctrl+Z は頂点戻し。ただし consume_key は matches_logically 判定の
             // ため Modifiers::CTRL 指定でも Ctrl+Shift+Z (やり直し) を吸ってしまう
             // (undo_ops.rs handle_meta_undo_keys の注記と同じ罠)。そこでイベントの修飾子を

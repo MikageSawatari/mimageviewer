@@ -104,6 +104,7 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
 const ERASE_HELP_SCOPES: &[CommandScope] = &[CommandScope::Erase];
 const CONCEAL_HELP_SCOPES: &[CommandScope] = &[CommandScope::Conceal];
 const CROP_HELP_SCOPES: &[CommandScope] = &[CommandScope::Crop];
+const LOCAL_ADJUST_HELP_SCOPES: &[CommandScope] = &[CommandScope::LocalAdjust];
 
 const ERASE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
@@ -174,6 +175,49 @@ const CROP_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const LOCAL_ADJUST_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc",
+        description: "編集中の図形操作を解除する。解除対象がなければ補正レイヤーパネルを閉じる",
+    },
+    FixedShortcutRow {
+        keys: "Enter",
+        description: "多角形マスクの頂点列を確定する",
+    },
+    FixedShortcutRow {
+        keys: "Delete",
+        description: "選択中の図形マスクを削除する",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z",
+        description: "多角形入力中は頂点を戻す。それ以外は補正レイヤー操作を取り消し / やり直し",
+    },
+    FixedShortcutRow {
+        keys: "矢印 / Ctrl+矢印",
+        description: "選択中の図形マスクを 1px / 10px 移動する",
+    },
+    FixedShortcutRow {
+        keys: "[ / ] / Ctrl+[ / Ctrl+]",
+        description: "選択中の図形マスクを 0.1度 / 1度 回転する",
+    },
+    FixedShortcutRow {
+        keys: "Shift+ハンドル / Alt+ハンドル",
+        description: "角度や比率をスナップする、または中心固定で変形する",
+    },
+    FixedShortcutRow {
+        keys: "ドラッグ",
+        description: "画像上でマスク範囲を作成、選択、または編集する",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール / Ctrl+ホイール",
+        description: "画像上ではズームする。パネル上ではスクロールまたはズームする",
+    },
+];
+
 #[derive(Clone, Copy)]
 enum ShortcutHelpContext {
     Grid,
@@ -181,6 +225,7 @@ enum ShortcutHelpContext {
     Erase,
     Conceal,
     Crop,
+    LocalAdjust,
 }
 
 impl ShortcutHelpContext {
@@ -191,6 +236,7 @@ impl ShortcutHelpContext {
             Self::Erase => "消しゴムモード",
             Self::Conceal => "隠蔽加工モード",
             Self::Crop => "切り取りモード",
+            Self::LocalAdjust => "補正レイヤー",
         }
     }
 
@@ -201,6 +247,7 @@ impl ShortcutHelpContext {
             Self::Erase => ERASE_HELP_SCOPES,
             Self::Conceal => CONCEAL_HELP_SCOPES,
             Self::Crop => CROP_HELP_SCOPES,
+            Self::LocalAdjust => LOCAL_ADJUST_HELP_SCOPES,
         }
     }
 
@@ -211,6 +258,7 @@ impl ShortcutHelpContext {
             Self::Erase => ERASE_FIXED_SHORTCUT_ROWS,
             Self::Conceal => CONCEAL_FIXED_SHORTCUT_ROWS,
             Self::Crop => CROP_FIXED_SHORTCUT_ROWS,
+            Self::LocalAdjust => LOCAL_ADJUST_FIXED_SHORTCUT_ROWS,
         }
     }
 
@@ -221,7 +269,7 @@ impl ShortcutHelpContext {
                 row.spec.scope != CommandScope::Global
                     || row.spec.action == KeyAction::ToggleDetachedViewerMode
             }
-            Self::Erase | Self::Conceal | Self::Crop => true,
+            Self::Erase | Self::Conceal | Self::Crop | Self::LocalAdjust => true,
         }
     }
 }
@@ -287,6 +335,9 @@ impl App {
         }
         if self.conceal_mode {
             return ShortcutHelpContext::Conceal;
+        }
+        if self.local_adjust_mode {
+            return ShortcutHelpContext::LocalAdjust;
         }
         if self.export_crop_mode {
             return ShortcutHelpContext::Crop;
