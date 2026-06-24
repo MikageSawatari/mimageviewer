@@ -18654,7 +18654,7 @@ impl App {
             // F9/F10: 隠蔽マスクスロット 1/2 を一括適用
             // Shift+F7/F8/F9/F10: 適用済みマスクを対象ページから削除
             // (チェック済みアイテムがあれば一括、なければ選択 1 件に)
-            // フルスクリーン側 (ui_fullscreen.rs) と揃えて修飾キー無しのみ受け付ける。
+            // フルスクリーン側 (ui_fullscreen.rs) と同じ既定キーを keymap 経由で扱う。
             {
                 enum MaskShortcut {
                     ApplyErase(usize),
@@ -18663,27 +18663,33 @@ impl App {
                     DeleteConceal,
                 }
 
-                let mask_shortcut = ctx.input_mut(|i| {
-                    if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F7)
-                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F8)
-                    {
-                        Some(MaskShortcut::DeleteErase)
-                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F9)
-                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
-                    {
-                        Some(MaskShortcut::DeleteConceal)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F7) {
-                        Some(MaskShortcut::ApplyErase(1))
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
-                        Some(MaskShortcut::ApplyErase(2))
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
-                        Some(MaskShortcut::ApplyConceal(1))
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F10) {
-                        Some(MaskShortcut::ApplyConceal(2))
-                    } else {
-                        None
-                    }
-                });
+                let mask_shortcut = if self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridDeleteEraseMask)
+                {
+                    Some(MaskShortcut::DeleteErase)
+                } else if self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridDeleteConcealMask)
+                {
+                    Some(MaskShortcut::DeleteConceal)
+                } else if self.keymap.consume_action(ctx, KeyAction::GridApplyErase1) {
+                    Some(MaskShortcut::ApplyErase(1))
+                } else if self.keymap.consume_action(ctx, KeyAction::GridApplyErase2) {
+                    Some(MaskShortcut::ApplyErase(2))
+                } else if self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridApplyConceal1)
+                {
+                    Some(MaskShortcut::ApplyConceal(1))
+                } else if self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridApplyConceal2)
+                {
+                    Some(MaskShortcut::ApplyConceal(2))
+                } else {
+                    None
+                };
                 if let Some(mask_shortcut) = mask_shortcut {
                     match mask_shortcut {
                         MaskShortcut::ApplyErase(slot) => self.apply_slot_to_selection(slot),

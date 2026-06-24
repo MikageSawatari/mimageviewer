@@ -91,6 +91,14 @@
 # GridAdjustSlot10 = Ctrl+0 ; 補正プリセットスロット10を適用する
 # GridClearAdjust.1 = Ctrl+Backspace ; 選択中の画像の補正を解除する
 # GridClearAdjust.2 = Q ; 選択中の画像の補正を解除する
+# GridApplyErase1 = F7 ; 消しゴムマスクスロット1を選択中またはチェック済み画像に適用する
+# GridApplyErase2 = F8 ; 消しゴムマスクスロット2を選択中またはチェック済み画像に適用する
+# GridApplyConceal1 = F9 ; 隠蔽マスクスロット1を選択中またはチェック済み画像に適用する
+# GridApplyConceal2 = F10 ; 隠蔽マスクスロット2を選択中またはチェック済み画像に適用する
+# GridDeleteEraseMask.1 = Shift+F7 ; 選択中またはチェック済み画像の消しゴムマスクを削除する
+# GridDeleteEraseMask.2 = Shift+F8 ; 選択中またはチェック済み画像の消しゴムマスクを削除する
+# GridDeleteConcealMask.1 = Shift+F9 ; 選択中またはチェック済み画像の隠蔽マスクを削除する
+# GridDeleteConcealMask.2 = Shift+F10 ; 選択中またはチェック済み画像の隠蔽マスクを削除する
 
 [FsCommon] ; フルスクリーン共通
 # FsToggleMetadata.1 = I ; メタデータパネルの固定表示を切り替える

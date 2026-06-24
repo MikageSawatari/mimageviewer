@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 2 初期実装済み / レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 3 初期実装済み / レビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -14,12 +14,17 @@
 > **Phase 1 実装メモ (2026-06-24, Codex)**: `KeyAction::GridToggleStackMode` を既定未割り当てで追加し、
 > 空 `default_chords()`、`# Action = none` 生成、`effective_chords()` /
 > `first_chord_label()` / `compact_single_key_label()`、グリッド側キーハンドラへの最小配線まで実装。
-> `CommandId` / `CommandSpec` / scope 衝突判定は未導入のまま。ClaudeCode レビュー待ち。
+> `CommandId` / `CommandSpec` / scope 衝突判定は未導入のまま。ClaudeCode レビュー済み。
 >
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
 > `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。
 > ユーザー override が絡む同一 chord の Hard / ActiveOverlap / TriggerMismatch と、
 > Esc / Enter / 修飾なし矢印キーの Reserved を起動時 warning として出す。設定拒否や dispatch 変更はしない。
+>
+> **Phase 3 初期実装メモ (2026-06-24, Codex)**: グリッド側に残っていた F7-F10 /
+> Shift+F7-F10 のマスク一括適用・削除を `GridApplyErase1/2`、
+> `GridApplyConceal1/2`、`GridDeleteEraseMask`、`GridDeleteConcealMask` として
+> `KeyAction` 化。既定キーと実行順は従来どおりで、dispatch resolver はまだ導入しない。
 
 ## 1. 背景と狙い
 
@@ -358,10 +363,10 @@ pub enum BindingPolicy {
 
 - 優先度が複雑でない固定キーから `KeyAction` 化する。
 - 候補:
-  - **グリッド側の F7-F10 マスク一括適用 / Shift+F7-F10 削除系** (`app.rs` の
-    `handle_keyboard` 内で今も raw `i.consume_key(...)` のまま。フルスクリーン側は既に
-    `FsApplyErase*` / `FsApplyConceal*` で KeyAction 化済みなので、**未 KeyAction 化なのは
-    グリッド側だけ**)。
+  - **グリッド側の F7-F10 マスク一括適用 / Shift+F7-F10 削除系**。
+    **→ Phase 3 初期実装済み**。`GridApplyErase1/2`、`GridApplyConceal1/2`、
+    `GridDeleteEraseMask`、`GridDeleteConcealMask` として `KeyAction` 化し、
+    フルスクリーン側の `FsApplyErase*` / `FsApplyConceal*` と既定キーを揃えた。
   - toolbar/menu 操作に対応する既存 App メソッド呼び出し。
   - その他、既定未割り当てにできる便利操作。
 - Esc / Enter / plain 矢印 / `Shift+↑↓` はまだ予約。

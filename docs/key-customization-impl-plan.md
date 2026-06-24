@@ -25,6 +25,9 @@
   `BindingPolicy` / active scope 隣接表 / `BindingConflict` を追加した。ユーザー override が
   同時 active になり得る既存割り当てや、Esc / Enter / 修飾なし矢印の予約キーに重なる場合は
   起動時に警告ログを出す。設定拒否や dispatch 変更はしない。
+- 2026-06 Phase 3 初期実装として、グリッド側の F7-F10 / Shift+F7-F10 マスク一括適用・
+  削除を `GridApplyErase1/2`、`GridApplyConceal1/2`、`GridDeleteEraseMask`、
+  `GridDeleteConcealMask` として `KeyAction` 化した。既定キーと実行順は従来どおり。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
   右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは
@@ -466,8 +469,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridToggleFolderTreePane `F` (P) / GridDelete `Delete` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
   GridPin `P` (P) / GridCompareX `X` (P)
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
-  GridDeleteErase1/2 `Shift+F7/F8` / GridDeleteConceal1/2 `Shift+F9/F10`
-  (family・予約候補)
+  GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
 - RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridClipboardCopy/Cut/Paste `Ctrl+C/X/V`、D&D、右クリック操作は

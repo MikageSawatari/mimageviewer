@@ -760,6 +760,12 @@ pub enum KeyAction {
     GridAdjustSlot9,
     GridAdjustSlot10,
     GridClearAdjust,
+    GridApplyErase1,
+    GridApplyErase2,
+    GridApplyConceal1,
+    GridApplyConceal2,
+    GridDeleteEraseMask,
+    GridDeleteConcealMask,
     FsToggleMetadata,
     FsCtrlNavPrev,
     FsCtrlNavNext,
@@ -959,6 +965,12 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridAdjustSlot9,
     KeyAction::GridAdjustSlot10,
     KeyAction::GridClearAdjust,
+    KeyAction::GridApplyErase1,
+    KeyAction::GridApplyErase2,
+    KeyAction::GridApplyConceal1,
+    KeyAction::GridApplyConceal2,
+    KeyAction::GridDeleteEraseMask,
+    KeyAction::GridDeleteConcealMask,
     KeyAction::FsToggleMetadata,
     KeyAction::FsCtrlNavPrev,
     KeyAction::FsCtrlNavNext,
@@ -1227,6 +1239,12 @@ impl KeyAction {
             GridAdjustSlot9 => "GridAdjustSlot9",
             GridAdjustSlot10 => "GridAdjustSlot10",
             GridClearAdjust => "GridClearAdjust",
+            GridApplyErase1 => "GridApplyErase1",
+            GridApplyErase2 => "GridApplyErase2",
+            GridApplyConceal1 => "GridApplyConceal1",
+            GridApplyConceal2 => "GridApplyConceal2",
+            GridDeleteEraseMask => "GridDeleteEraseMask",
+            GridDeleteConcealMask => "GridDeleteConcealMask",
             FsToggleMetadata => "FsToggleMetadata",
             FsCtrlNavPrev => "FsCtrlNavPrev",
             FsCtrlNavNext => "FsCtrlNavNext",
@@ -1436,6 +1454,12 @@ impl KeyAction {
             GridAdjustSlot9 => "補正プリセットスロット9を適用する",
             GridAdjustSlot10 => "補正プリセットスロット10を適用する",
             GridClearAdjust => "選択中の画像の補正を解除する",
+            GridApplyErase1 => "消しゴムマスクスロット1を選択中またはチェック済み画像に適用する",
+            GridApplyErase2 => "消しゴムマスクスロット2を選択中またはチェック済み画像に適用する",
+            GridApplyConceal1 => "隠蔽マスクスロット1を選択中またはチェック済み画像に適用する",
+            GridApplyConceal2 => "隠蔽マスクスロット2を選択中またはチェック済み画像に適用する",
+            GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
+            GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
             FsToggleMetadata => "メタデータパネルの固定表示を切り替える",
             FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
@@ -1637,7 +1661,13 @@ impl KeyAction {
             | GridAdjustSlot8
             | GridAdjustSlot9
             | GridAdjustSlot10
-            | GridClearAdjust => KeyContext::Grid,
+            | GridClearAdjust
+            | GridApplyErase1
+            | GridApplyErase2
+            | GridApplyConceal1
+            | GridApplyConceal2
+            | GridDeleteEraseMask
+            | GridDeleteConcealMask => KeyContext::Grid,
             FsToggleMetadata | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
                 KeyContext::FsCommon
             }
@@ -1775,6 +1805,12 @@ impl KeyAction {
             | GridAdjustSlot9
             | GridAdjustSlot10
             | GridClearAdjust
+            | GridApplyErase1
+            | GridApplyErase2
+            | GridApplyConceal1
+            | GridApplyConceal2
+            | GridDeleteEraseMask
+            | GridDeleteConcealMask
             | FsToggleMetadata
             | FsCtrlNavPrev
             | FsCtrlNavNext
@@ -1971,6 +2007,12 @@ impl KeyAction {
             GridAdjustSlot9 => ChordList::one(Chord::ctrl(Num9)),
             GridAdjustSlot10 => ChordList::one(Chord::ctrl(Num0)),
             GridClearAdjust => ChordList::two(Chord::ctrl(Backspace), Chord::key(Q)),
+            GridApplyErase1 => ChordList::one(Chord::key(F7)),
+            GridApplyErase2 => ChordList::one(Chord::key(F8)),
+            GridApplyConceal1 => ChordList::one(Chord::key(F9)),
+            GridApplyConceal2 => ChordList::one(Chord::key(F10)),
+            GridDeleteEraseMask => ChordList::two(Chord::shift(F7), Chord::shift(F8)),
+            GridDeleteConcealMask => ChordList::two(Chord::shift(F9), Chord::shift(F10)),
             FsToggleMetadata => ChordList::two(Chord::key(I), Chord::key(Tab)),
             FsCtrlNavPrev => ChordList::one(Chord::ctrl(Up)),
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
@@ -3304,6 +3346,51 @@ mod tests {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
+    }
+
+    #[test]
+    fn grid_mask_actions_match_existing_default_shortcuts() {
+        assert_eq!(
+            KeyAction::GridApplyErase1.default_chords().iter().next(),
+            Some(Chord::key(KeyName::F7))
+        );
+        assert_eq!(
+            KeyAction::GridApplyErase2.default_chords().iter().next(),
+            Some(Chord::key(KeyName::F8))
+        );
+        assert_eq!(
+            KeyAction::GridApplyConceal1.default_chords().iter().next(),
+            Some(Chord::key(KeyName::F9))
+        );
+        assert_eq!(
+            KeyAction::GridApplyConceal2.default_chords().iter().next(),
+            Some(Chord::key(KeyName::F10))
+        );
+        assert_eq!(
+            KeyAction::GridDeleteEraseMask
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::F7), Chord::shift(KeyName::F8)]
+        );
+        assert_eq!(
+            KeyAction::GridDeleteConcealMask
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::F9), Chord::shift(KeyName::F10)]
+        );
+        for action in [
+            KeyAction::GridApplyErase1,
+            KeyAction::GridApplyErase2,
+            KeyAction::GridApplyConceal1,
+            KeyAction::GridApplyConceal2,
+            KeyAction::GridDeleteEraseMask,
+            KeyAction::GridDeleteConcealMask,
+        ] {
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
     }
 
     #[test]
