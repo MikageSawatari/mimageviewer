@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor スライス実装中 / ClaudeCode レビュー待ち** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正スライス実装中** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -128,6 +128,9 @@
 > presenter 内で Esc を閉じる操作として消費し、App 側へのキー・Text・ホイール転送を抑止する。
 > 実機補正として、`?` は `WM_CHAR` の ASCII / 全角 `？` に加え、`WM_CHAR` が届かない
 > native ウィンドウ環境向けに `Shift+VK_OEM_2` KeyDown でも開く。
+> ヘルプは native overlay 内のモーダルとして扱い、表示中は右メタデータパネル / 左ジャンプパネルの
+> hover 表示を抑止する。右上の閉じるボタンへカーソルを移動したときに右パネルが重なって
+> 閉じられなくなる実機症状への補正。
 >
 > **Phase 7 テキスト注釈ヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > テキスト注釈モード中の固定 `?` で同じ「ショートカット」ダイアログを開く。表示対象は
@@ -213,7 +216,7 @@
 > 表示する。クリック処理、enabled 判定、hover 表示、shortcut label、保存形式は変更しない。
 > 編集 UI は後続。
 >
-> **Phase 6 menu layout editor スライス実装メモ (2026-06-25, Codex / レビュー待ち)**:
+> **Phase 6 menu layout editor スライス実装メモ (2026-06-25, Codex / ClaudeCode レビュー済み)**:
 > 環境設定の表示カテゴリへ「メニュー構成」ページを追加し、`Settings.menu_layout` を
 > `PreferencesState.settings` の一時コピー上で編集できるようにする。top menu と固定 leaf 項目の
 > 表示 / 非表示、上下移動、既定化、非表示項目の全表示を提供し、OK / 適用時は既存の
@@ -647,7 +650,7 @@ pub enum BindingPolicy {
   `ResolvedMenuLayout.menus` に合わせる。
 - **menu layout command order render スライス実装済み**: catalog 化済み固定 leaf 項目の
   メニュー内描画順を `ResolvedTopMenu.commands` に合わせる。動的ブロックは既存アンカーに残す。
-- **menu layout editor スライス実装中**: 環境設定「表示 → メニュー構成」で top menu と固定 leaf
+- **menu layout editor スライス実装済み**: 環境設定「表示 → メニュー構成」で top menu と固定 leaf
   項目の表示 / 非表示、上下移動、既定化を編集できるようにする。
 - メニュー構成を `CommandId` のツリーとして扱う。
 - ユーザー設定には `CommandId` の並びだけを保存し、処理本体を複製しない。
@@ -685,11 +688,12 @@ pub enum BindingPolicy {
 - **native 動画 overlay ヘルプスライス実装済み**: Windows native presenter 上でも `?` を押したとき、
   egui 動画ヘルプと同じ対象行を中央モーダルで表示する。snapshot は App 側で作成し、
   presenter は所有済み文字列を描画する。ヘルプ表示中は Esc で閉じ、背面動画操作へキーを
-  漏らさない。
+  漏らさない。実機補正として、ヘルプ表示中は右メタデータパネル / 左ジャンプパネルの hover
+  表示も抑止し、右上の閉じるボタンにパネルが重ならないようにする。
 - **テキスト注釈ヘルプスライス実装済み**: テキスト注釈モード中に `?` を押したとき、`Text`
   scope の実割り当てと固定キーを表示する。本文や検索欄などが keyboard focus を持つ場合は
   `?` を奪わない。
-- **ヘルプキー KeyAction 化スライス実装中**: `HelpShowContextShortcuts` を `Global` scope の
+- **ヘルプキー KeyAction 化スライス実装済み**: `HelpShowContextShortcuts` を `Global` scope の
   `KeyAction` として追加し、既定を `?` (内部的には `Shift+/`) にする。egui / native 動画の
   dispatch と、ヘルプ内の固定キー欄はこの Action の effective chord に追従する。
 - 既定 `?` のヘルプキーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /

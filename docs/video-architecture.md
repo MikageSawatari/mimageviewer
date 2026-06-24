@@ -114,7 +114,8 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   effective chord を見て、既定割り当てでは `WM_CHAR` の Text (`?` / `？`) を使う。実機で
   `WM_CHAR` が届かない場合に備え、既定 `?` 相当の `Shift+VK_OEM_2` KeyDown も fallback として扱う。
   ユーザーが `HelpShowContextShortcuts` を別キーや `none` に変更した場合、native presenter の
-  Text / KeyDown 判定も同じ effective chord に追従する。
+  Text / KeyDown 判定も同じ effective chord に追従する。ヘルプ表示中は中央モーダルを優先し、
+  右メタデータパネル / 左ジャンプパネルの edge-hover 表示は抑止する。
 
 **Region 計算とアクティベーション検出**:
 

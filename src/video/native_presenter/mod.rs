@@ -1099,6 +1099,56 @@ fn normalize_clipboard_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+#[derive(Clone, Copy)]
+struct NativeRightPanelVisibilityInputs {
+    shortcut_help_open: bool,
+    external_drag_in_progress: bool,
+    vst3_panel_visible: bool,
+    metadata_available: bool,
+    video_speed_popup_open: bool,
+    hover_preview_active: bool,
+    tag_picker_open: bool,
+    pointer_in_hover_rect: bool,
+}
+
+fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
+    if input.shortcut_help_open {
+        return false;
+    }
+    if input.external_drag_in_progress || input.vst3_panel_visible {
+        return false;
+    }
+    if !input.metadata_available {
+        return false;
+    }
+    if input.video_speed_popup_open || input.hover_preview_active {
+        return false;
+    }
+    input.tag_picker_open || input.pointer_in_hover_rect
+}
+
+#[derive(Clone, Copy)]
+struct NativeJumpPanelVisibilityInputs {
+    shortcut_help_open: bool,
+    vst3_panel_visible: bool,
+    video_speed_popup_open: bool,
+    hover_preview_active: bool,
+    pointer_in_hover_rect: bool,
+}
+
+fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs) -> bool {
+    if input.shortcut_help_open {
+        return false;
+    }
+    if input.vst3_panel_visible {
+        return false;
+    }
+    if input.video_speed_popup_open || input.hover_preview_active {
+        return false;
+    }
+    input.pointer_in_hover_rect
+}
+
 #[cfg(test)]
 mod clipboard_normalize_tests {
     use super::normalize_clipboard_newlines;
@@ -5443,64 +5493,56 @@ impl NativeEguiOverlay {
     }
 
     fn right_panel_visible(&self) -> bool {
-        // 実機修正 (2026-05-12): 外部 drag 中は right panel を表示しない (= VST を画面右に
-        // ドラッグしたとき panel が出て VST 入力が奪われる症状の対応)。
-        if self.external_drag_in_progress {
-            return false;
-        }
-        if self.vst3_panel_visible() {
-            return false;
-        }
         let Some(metadata) = self.video_metadata.as_ref() else {
             return false;
         };
-        if !metadata.probe_info_available
-            && metadata.shortcut_tags.is_empty()
-            && metadata.current_tags.is_empty()
-            && metadata.tag_choices.is_empty()
-        {
-            return false;
-        }
-        if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {
-            return false;
-        }
-        if self.tag_picker_open {
-            return true;
-        }
-        let Some(pos) = self.pointer_pos else {
-            return false;
-        };
-        let overlay_width_points = self.width as f32 / self.pixels_per_point;
-        let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        let panel_w =
-            native_metadata_panel_rect(overlay_width_points, overlay_height_points).width();
-        let x_min = overlay_width_points - panel_w;
-        native_panel_hover_rect(
-            egui::pos2(x_min, 0.0),
-            egui::vec2(overlay_width_points - x_min, overlay_height_points),
-            overlay_height_points,
-        )
-        .contains(pos)
+        let metadata_available = metadata.probe_info_available
+            || !metadata.shortcut_tags.is_empty()
+            || !metadata.current_tags.is_empty()
+            || !metadata.tag_choices.is_empty();
+        let pointer_in_hover_rect = self.pointer_pos.is_some_and(|pos| {
+            let overlay_width_points = self.width as f32 / self.pixels_per_point;
+            let overlay_height_points = self.height as f32 / self.pixels_per_point;
+            let panel_w =
+                native_metadata_panel_rect(overlay_width_points, overlay_height_points).width();
+            let x_min = overlay_width_points - panel_w;
+            native_panel_hover_rect(
+                egui::pos2(x_min, 0.0),
+                egui::vec2(overlay_width_points - x_min, overlay_height_points),
+                overlay_height_points,
+            )
+            .contains(pos)
+        });
+        native_right_panel_visible_from_inputs(NativeRightPanelVisibilityInputs {
+            shortcut_help_open: self.shortcut_help_open,
+            external_drag_in_progress: self.external_drag_in_progress,
+            vst3_panel_visible: self.vst3_panel_visible(),
+            metadata_available,
+            video_speed_popup_open: self.video_speed_popup_open,
+            hover_preview_active: self.hover_preview_target_secs.is_some(),
+            tag_picker_open: self.tag_picker_open,
+            pointer_in_hover_rect,
+        })
     }
 
     fn jump_panel_visible(&self) -> bool {
-        if self.vst3_panel_visible() {
-            return false;
-        }
-        if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {
-            return false;
-        }
-        let Some(pos) = self.pointer_pos else {
-            return false;
-        };
-        let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        let x_max = native_jump_panel_width();
-        native_panel_hover_rect(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(x_max, overlay_height_points),
-            overlay_height_points,
-        )
-        .contains(pos)
+        let pointer_in_hover_rect = self.pointer_pos.is_some_and(|pos| {
+            let overlay_height_points = self.height as f32 / self.pixels_per_point;
+            let x_max = native_jump_panel_width();
+            native_panel_hover_rect(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(x_max, overlay_height_points),
+                overlay_height_points,
+            )
+            .contains(pos)
+        });
+        native_jump_panel_visible_from_inputs(NativeJumpPanelVisibilityInputs {
+            shortcut_help_open: self.shortcut_help_open,
+            vst3_panel_visible: self.vst3_panel_visible(),
+            video_speed_popup_open: self.video_speed_popup_open,
+            hover_preview_active: self.hover_preview_target_secs.is_some(),
+            pointer_in_hover_rect,
+        })
     }
 
     fn pointer_over_scroll_panel(&self, pos: egui::Pos2) -> bool {
@@ -8272,10 +8314,11 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeOverlayInputRouting, NativePixelSample, compare_pixel_probe,
-        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
-        metadata_clean_text, native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel,
-        should_claim_text_input_focus,
+        NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativePixelSample,
+        NativeRightPanelVisibilityInputs, compare_pixel_probe, compute_video_visual_transform,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, metadata_clean_text,
+        native_jump_panel_visible_from_inputs, native_right_panel_visible_from_inputs,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
@@ -8363,6 +8406,57 @@ mod tests {
         assert!(!modal.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Right)));
         assert!(!modal.should_forward_to_ui(&NativeVideoWindowEvent::Text('?')));
         assert!(!modal.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+    }
+
+    #[test]
+    fn shortcut_help_modal_suppresses_native_edge_panels() {
+        let right_base = NativeRightPanelVisibilityInputs {
+            shortcut_help_open: false,
+            external_drag_in_progress: false,
+            vst3_panel_visible: false,
+            metadata_available: true,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            tag_picker_open: false,
+            pointer_in_hover_rect: true,
+        };
+        assert!(native_right_panel_visible_from_inputs(right_base));
+        assert!(!native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                shortcut_help_open: true,
+                ..right_base
+            }
+        ));
+        assert!(native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                tag_picker_open: true,
+                pointer_in_hover_rect: false,
+                ..right_base
+            }
+        ));
+        assert!(!native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                shortcut_help_open: true,
+                tag_picker_open: true,
+                pointer_in_hover_rect: false,
+                ..right_base
+            }
+        ));
+
+        let jump_base = NativeJumpPanelVisibilityInputs {
+            shortcut_help_open: false,
+            vst3_panel_visible: false,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            pointer_in_hover_rect: true,
+        };
+        assert!(native_jump_panel_visible_from_inputs(jump_base));
+        assert!(!native_jump_panel_visible_from_inputs(
+            NativeJumpPanelVisibilityInputs {
+                shortcut_help_open: true,
+                ..jump_base
+            }
+        ));
     }
 
     #[test]
