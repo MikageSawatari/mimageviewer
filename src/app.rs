@@ -19378,7 +19378,19 @@ impl App {
             }
             let mut found = false;
             i.events.retain(|event| {
-                let consume = !found && matches!(event, egui::Event::Text(text) if text == "?");
+                let consume = !found
+                    && matches!(
+                        event,
+                        egui::Event::Text(text)
+                            if {
+                                let mut chars = text.chars();
+                                matches!(
+                                    (chars.next(), chars.next()),
+                                    (Some(ch), None)
+                                        if crate::keymap::is_context_shortcuts_help_char(ch)
+                                )
+                            }
+                    );
                 if consume {
                     found = true;
                 }

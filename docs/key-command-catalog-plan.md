@@ -126,6 +126,8 @@
 > egui 動画ヘルプと同じく、動画中に実際に有効な `FsVideo` / 一部 `FsCommon` / `Rating` /
 > `ToggleDetachedViewerMode` に限定し、`VideoCompare*` は出さない。ヘルプ表示中は
 > presenter 内で Esc を閉じる操作として消費し、App 側へのキー・Text・ホイール転送を抑止する。
+> 実機補正として、`?` は `WM_CHAR` の ASCII / 全角 `？` に加え、`WM_CHAR` が届かない
+> native ウィンドウ環境向けに `Shift+VK_OEM_2` KeyDown でも開く。
 >
 > **Phase 7 テキスト注釈ヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > テキスト注釈モード中の固定 `?` で同じ「ショートカット」ダイアログを開く。表示対象は

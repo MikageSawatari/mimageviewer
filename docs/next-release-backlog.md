@@ -35,6 +35,79 @@
   リリース直前の小修正にはしない。
 - 優先度: P3。UX 改善として次回以降に対応。v2.1.0 のリリースブロッカーにはしない。
 
+### 1.2 補正画像ありフィルタの親ロールアップが変換済み RAR/LZH/7z を拾わない
+
+- 背景: 5ch レス 837。「補正画像有り書庫」の絞り込みを ZIP だけでなく、変換済み
+  LZH/RAR 等にも対応してほしいという要望。
+- 現状:
+  - RAR/7z/LZH/CBR/CB7 を開くと、内部ページは `GridItem::ZipImage { zip_path:
+    <archive_cache>\...\book.zip, entry_name }` として表示される。
+  - ページ個別補正 / 補正レイヤー / マスク / 隠蔽 / 注釈 / 回転のページキーは
+    `App::page_path_key` 経由で保存されるため、変換アーカイブ内ページは
+    `normalize(cache_zip)::entry` 側のキーになる。
+  - 一方、親フォルダ上のセルは `GridItem::ConvertibleArchive { path: 元RAR/LZH, .. }` で、
+    `item_has_page_edit_key` / `item_has_one_level_edit_key` /
+    `item_has_rotation_edit` は `archive_contains_page_key(keys, 元RAR/LZH)` だけを見る。
+    そのため、変換後に付けたページ補正がキャッシュ ZIP キー側に存在していても、
+    親の `ConvertibleArchive` セルにはロールアップされない。
+  - 意図的な対象外処理ではなく、キャッシュ ZIP と元アーカイブの二重パスをまたぐ
+    ロールアップ判定の橋渡し漏れと考えられる。
+- 方針:
+  - ページ編集 DB の保存キーは当面変更しない。既存データ移行やサイドカー規則へ波及させず、
+    親ロールアップ判定だけで元アーカイブと有効なキャッシュ ZIP の両方を候補 root として見る。
+  - `converted_archive_cache_paths` (`normalize_keep_drive(元アーカイブ)` → cache ZIP) を使い、
+    `GridItem::ConvertibleArchive` の `item_has_page_edit_key` /
+    `item_has_one_level_edit_key` / `item_has_rotation_edit` で
+    `archive_contains_page_key(keys, 元アーカイブ) || archive_contains_page_key(keys, cache_zip)`
+    を判定する。
+  - レーティング一覧などで `ZipDir { zip_path: 元RAR/LZH, dir_prefix, .. }` が復元される経路も
+    同じ問題を起こし得るため、必要なら ZipDir の prefix 判定でも cache ZIP root を候補に含める。
+  - `converted_archive_cache_paths` は非同期 worker で埋まる。絞り込み有効時に map 完了後も
+    `visible_indices` が古いままにならないよう、`poll_converted_archive_cache_paths` 完了時に
+    ロールアップ編集フィルタが有効なら `rebuild_visible_indices()` を走らせる、または同等の
+    再計算を必ず発火させる。
+  - ユニットテストを追加する:
+    - 親フォルダに `ConvertibleArchive { path: source.rar }` があり、
+      `converted_archive_cache_paths[source] = cache.zip`、`adjusted_page_keys` に
+      `zip_entry_key(cache.zip, "p001.jpg")` がある状態で、`FacetEditFlag::Adjustment`
+      の絞り込みを通ること。
+    - 同じ経路で mask / local-adjust / rotation の代表 1 つ以上も確認する。
+    - cache map が空のときは従来通り miss し、map 完了後の再計算で表示されること。
+- 規模 / リスク: Low-Medium。ロールアップ判定に限定すれば小さい修正で済む見込み。
+  ただし、ページ編集 DB の正本キーを元アーカイブへ移す方針にすると、既存データ移行、
+  `page_path_key`、サイドカー、hydration、Undo、検索/タグ/レーティングとの整合まで波及するため、
+  今回は避ける。
+- 参考:
+  - `src/app.rs` の `page_path_key` は ZipImage の `zip_path` をそのまま使う。
+  - `src/tag_ops.rs` には同種の cache/source キー割れを避けるため、タグ対象を
+    `archive_source_override` で元アーカイブへ remap するコメントと実装がある。
+  - `docs/virtual-folders.md` は、ページ単位 DB は `page_path_key`、変換アーカイブの
+    コンテナ★は元アーカイブ root とする、と分けて整理している。
+- 優先度: P2。ユーザー要望への追従で、次回リリース候補。
+
+### 1.3 `番号順` の名称を区切り無視の連番用途として明確化する
+
+- 背景: 5ch レス 839。v2.1.0 で `名前順` を Windows に近い自然な順序へ寄せ、
+  `page 1` → `page 2` → `page 10` のように並ぶようになったため、従来の
+  `番号順` との違いが分かりにくくなった。
+- 現状:
+  - `SortOrder::FileName` は `filename_sort::FileNameSortKey` 経由で Windows の
+    `LCMapStringEx(... SORT_DIGITSASNUMBERS ...)` を使い、数字部分を自然に扱う。
+  - `SortOrder::Numeric` は `ui_helpers::natural_sort_key` を使い、記号・空白を捨てて
+    数字部分を数値比較する。`page# 1` / `page#1` / `page # 10` のように
+    区切りや空白が揺れるファイル名を、より強く連番として寄せる用途が残る。
+  - ただし UI 表示が `番号順` のままだと、通常の自然な名前順との違いが伝わりにくい。
+- 方針:
+  - `SortOrder::Numeric` の内部 enum / 設定値は互換性のため残す。
+  - 通常ラベルは `番号順（区切り無視）`、短縮ラベルは `番号*` に変更する。
+  - ツールチップ / 説明には
+    `記号・空白などを無視して連番を優先して並び替えます`
+    を表示する。
+  - 詳細表示ヘッダやツールバーの表示幅が足りない場所では `番号*` を使い、
+    hover で上記説明を出す。
+  - `名前順` は通常用途の推奨として維持する。新規既定値は `SortOrder::FileName` のまま。
+- 優先度: P2。小規模 UI 文言修正だが、ソート修正後の混乱を減らすため次回候補。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断
