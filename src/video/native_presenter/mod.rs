@@ -721,6 +721,26 @@ pub struct NativeOverlayMetadata {
     pub deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot,
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
+    pub shortcuts: NativeOverlayShortcutLabels,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NativeOverlayShortcutLabels {
+    pub play_pause: Option<String>,
+    pub seek_start: Option<String>,
+    pub volume_up: Option<String>,
+    pub volume_down: Option<String>,
+    pub next_file: Option<String>,
+    pub prev_file: Option<String>,
+    pub mute: Option<String>,
+    pub loop_mode: Option<String>,
+    pub marker_prev: Option<String>,
+    pub marker_next: Option<String>,
+    pub pin: Option<String>,
+    pub perf_overlay: Option<String>,
+    pub tile_mode: Option<String>,
+    pub bookmark: Option<String>,
+    pub capture: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5513,6 +5533,7 @@ impl NativeEguiOverlay {
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
+        let shortcut_labels = video_metadata.as_ref().map(|metadata| &metadata.shortcuts);
         let fallback_file_name = self.fallback_file_name.clone();
         let navigation_preview = self.navigation_preview.clone();
         let navigation_preview_texture_id = self
@@ -5873,6 +5894,7 @@ impl NativeEguiOverlay {
                     position_secs,
                     &jump_entries,
                     &jump_texture_ids,
+                    shortcut_labels,
                     &mut bookmark_title_edit,
                     &mut bulk_bookmark_dialog,
                     &mut commands,
@@ -6142,8 +6164,10 @@ impl NativeEguiOverlay {
                         );
                         draw_overlay_button_bg(painter, replay_rect, replay_resp.hovered(), false);
                         draw_overlay_replay_icon(painter, replay_rect.center(), btn_size * 0.36);
-                        let replay_resp =
-                            replay_resp.hover_tip_dark("最初から再生 (頭出し + 即再生) [W]");
+                        let replay_resp = replay_resp.hover_tip_dark(native_label_with_shortcut(
+                            "最初から再生 (頭出し + 即再生)",
+                            shortcut_labels.and_then(|s| s.seek_start.as_deref()),
+                        ));
                         if replay_resp.clicked() {
                             commands.push(NativeOverlayCommand::SeekToStartAndPlay);
                         }
@@ -6164,11 +6188,14 @@ impl NativeEguiOverlay {
                         } else {
                             draw_overlay_play_icon(painter, play_rect.center(), btn_size * 0.38);
                         }
-                        let play_resp = play_resp.hover_tip_dark(if is_playing {
-                            "一時停止 [Space / Enter]"
-                        } else {
-                            "再生 [Space / Enter]"
-                        });
+                        let play_resp = play_resp.hover_tip_dark(native_label_with_shortcut(
+                            if is_playing {
+                                "一時停止"
+                            } else {
+                                "再生"
+                            },
+                            shortcut_labels.and_then(|s| s.play_pause.as_deref()),
+                        ));
                         if play_resp.clicked() {
                             commands.push(NativeOverlayCommand::TogglePlay);
                         }
@@ -6253,14 +6280,14 @@ impl NativeEguiOverlay {
                             }
                         }
                         let hover_text = if continuous_active {
-                            "連続再生中はループ無効"
+                            "連続再生中はループ無効".to_owned()
                         } else {
-                            match loop_mode {
-                                VideoLoopMode::Off => "ループ再生 [L]",
-                                VideoLoopMode::Full => "ループ: 全体 [L]",
-                                VideoLoopMode::Chapter => "ループ: チャプター [L]",
-                                VideoLoopMode::Bookmark => "ループ: ブックマーク [L]",
-                            }
+                            native_label_with_shortcut(match loop_mode {
+                                VideoLoopMode::Off => "ループ再生",
+                                VideoLoopMode::Full => "ループ: 全体",
+                                VideoLoopMode::Chapter => "ループ: チャプター",
+                                VideoLoopMode::Bookmark => "ループ: ブックマーク",
+                            }, shortcut_labels.and_then(|s| s.loop_mode.as_deref()))
                         };
                         let loop_resp = loop_resp.hover_tip_dark(hover_text);
                         if loop_resp.clicked() && !continuous_active {
@@ -6329,7 +6356,11 @@ impl NativeEguiOverlay {
                                 false,
                             );
                             draw_overlay_arrow_icon(painter, prev_file_rect, -1);
-                            let prev_file_resp = prev_file_resp.hover_tip_dark("前の項目 [↑]");
+                            let prev_file_resp =
+                                prev_file_resp.hover_tip_dark(native_label_with_shortcut(
+                                    "前の項目",
+                                    shortcut_labels.and_then(|s| s.prev_file.as_deref()),
+                                ));
                             if prev_file_resp.clicked() {
                                 commands.push(NativeOverlayCommand::NavigateItem { delta: -1 });
                             }
@@ -6351,7 +6382,11 @@ impl NativeEguiOverlay {
                                 false,
                             );
                             draw_overlay_arrow_icon(painter, next_file_rect, 1);
-                            let next_file_resp = next_file_resp.hover_tip_dark("次の項目 [↓]");
+                            let next_file_resp =
+                                next_file_resp.hover_tip_dark(native_label_with_shortcut(
+                                    "次の項目",
+                                    shortcut_labels.and_then(|s| s.next_file.as_deref()),
+                                ));
                             if next_file_resp.clicked() {
                                 commands.push(NativeOverlayCommand::NavigateItem { delta: 1 });
                             }
@@ -6399,12 +6434,16 @@ impl NativeEguiOverlay {
                                 -1,
                                 markers_present,
                             );
-                            let prev_marker_resp =
-                                prev_marker_resp.hover_tip_dark(if markers_present {
-                                    "前のマーカー (チャプター/ブックマーク/ピン) [J]"
+                            let prev_marker_resp = prev_marker_resp.hover_tip_dark(
+                                if markers_present {
+                                    native_label_with_shortcut(
+                                        "前のマーカー (チャプター/ブックマーク/ピン)",
+                                        shortcut_labels.and_then(|s| s.marker_prev.as_deref()),
+                                    )
                                 } else {
-                                    "マーカーがありません"
-                                });
+                                    "マーカーがありません".to_owned()
+                                },
+                            );
                             if markers_present && prev_marker_resp.clicked() {
                                 commands.push(NativeOverlayCommand::JumpMarker { next: false });
                             }
@@ -6439,12 +6478,16 @@ impl NativeEguiOverlay {
                                 1,
                                 markers_present,
                             );
-                            let next_marker_resp =
-                                next_marker_resp.hover_tip_dark(if markers_present {
-                                    "次のマーカー (チャプター/ブックマーク/ピン) [K]"
+                            let next_marker_resp = next_marker_resp.hover_tip_dark(
+                                if markers_present {
+                                    native_label_with_shortcut(
+                                        "次のマーカー (チャプター/ブックマーク/ピン)",
+                                        shortcut_labels.and_then(|s| s.marker_next.as_deref()),
+                                    )
                                 } else {
-                                    "マーカーがありません"
-                                });
+                                    "マーカーがありません".to_owned()
+                                },
+                            );
                             if markers_present && next_marker_resp.clicked() {
                                 commands.push(NativeOverlayCommand::JumpMarker { next: true });
                             }
@@ -6516,7 +6559,10 @@ impl NativeEguiOverlay {
                             draw_overlay_button_bg(painter, save_rect, save_resp.hovered(), false);
                             draw_overlay_save_icon(painter, save_rect);
                             let save_resp =
-                                save_resp.hover_tip_dark("現在フレームをファイル保存 [Ctrl+S]");
+                                save_resp.hover_tip_dark(native_label_with_shortcut(
+                                    "現在フレームをファイル保存",
+                                    shortcut_labels.and_then(|s| s.capture.as_deref()),
+                                ));
                             if save_resp.clicked() {
                                 commands.push(NativeOverlayCommand::SaveFrameToFile);
                             }
@@ -6858,11 +6904,16 @@ impl NativeEguiOverlay {
                                         egui::Color32::from_rgb(118, 214, 255)
                                     },
                                 );
-                                let pin_resp = pin_resp.hover_tip_dark(if hover_preview_pinned {
-                                    "この位置でピン留めを上書き"
-                                } else {
-                                    "この位置をピン留め"
-                                });
+                                let pin_resp = pin_resp.hover_tip_dark(
+                                    native_label_with_shortcut(
+                                        if hover_preview_pinned {
+                                            "この位置でピン留めを上書き"
+                                        } else {
+                                            "この位置をピン留め"
+                                        },
+                                        shortcut_labels.and_then(|s| s.pin.as_deref()),
+                                    ),
+                                );
                                 if pin_resp.clicked() {
                                     commands.push(NativeOverlayCommand::SetPinAt {
                                         target_secs: target,
@@ -6889,12 +6940,16 @@ impl NativeEguiOverlay {
                                         egui::Color32::from_rgb(255, 220, 80)
                                     },
                                 );
-                                let bookmark_resp =
-                                    bookmark_resp.hover_tip_dark(if hover_preview_bookmarked {
-                                        "ブックマーク済み [B]"
-                                    } else {
-                                        "ブックマークを追加 [B]"
-                                    });
+                                let bookmark_resp = bookmark_resp.hover_tip_dark(
+                                    native_label_with_shortcut(
+                                        if hover_preview_bookmarked {
+                                            "ブックマーク済み"
+                                        } else {
+                                            "ブックマークを追加"
+                                        },
+                                        shortcut_labels.and_then(|s| s.bookmark.as_deref()),
+                                    ),
+                                );
                                 if bookmark_resp.clicked() {
                                     commands.push(NativeOverlayCommand::AddBookmarkAt {
                                         target_secs: target,
@@ -7045,11 +7100,10 @@ impl NativeEguiOverlay {
                             btn_size * 0.46,
                             muted,
                         );
-                        let mute_resp = mute_resp.hover_tip_dark(if muted {
-                            "ミュート解除 [M]"
-                        } else {
-                            "ミュート [M]"
-                        });
+                        let mute_resp = mute_resp.hover_tip_dark(native_label_with_shortcut(
+                            if muted { "ミュート解除" } else { "ミュート" },
+                            shortcut_labels.and_then(|s| s.mute.as_deref()),
+                        ));
                         if mute_resp.clicked() {
                             commands.push(NativeOverlayCommand::ToggleMute);
                         }
@@ -7193,9 +7247,15 @@ impl NativeEguiOverlay {
                         if vol_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
-                        let vol_resp = vol_resp.hover_tip_dark(
-                            "音量 (右クリック / ダブルクリックで 0dB) [Shift+↑ / Shift+↓]",
-                        );
+                        let volume_shortcuts = native_joined_shortcuts(&[
+                            shortcut_labels.and_then(|s| s.volume_up.as_deref()),
+                            shortcut_labels.and_then(|s| s.volume_down.as_deref()),
+                        ]);
+                        let vol_resp =
+                            vol_resp.hover_tip_dark(native_label_with_shortcut(
+                                "音量 (右クリック / ダブルクリックで 0dB)",
+                                volume_shortcuts.as_deref(),
+                            ));
                         if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
                             self.last_volume_target = Some(1.0);
                             commands.push(NativeOverlayCommand::SetVolume {

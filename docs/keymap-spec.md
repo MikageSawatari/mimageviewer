@@ -36,7 +36,9 @@ Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に
 先頭 chord を `現在地フィルタ (Ctrl+F)` のように表示する。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
 popup の shortcut 表記は、`分析ツール [Shift+Z]` や `メタデータ [I / Tab]`
-のように実割り当てから作る。`Esc` / `F11` は固定扱い、native 動画 overlay は後続。
+のように実割り当てから作る。native 動画 overlay の top bar / bottom HUD / jump panel /
+seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当てから作る。
+`Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、

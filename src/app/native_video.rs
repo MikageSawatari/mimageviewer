@@ -3739,6 +3739,33 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn native_overlay_shortcut_labels(
+        &self,
+    ) -> crate::video::native_presenter::NativeOverlayShortcutLabels {
+        let chord_list = |action| {
+            let labels = self.keymap.chord_labels(action);
+            (!labels.is_empty()).then(|| labels.join(" / "))
+        };
+        crate::video::native_presenter::NativeOverlayShortcutLabels {
+            play_pause: chord_list(KeyAction::VideoPlayPause),
+            seek_start: self.keymap.first_chord_label(KeyAction::VideoSeekStart),
+            volume_up: self.keymap.first_chord_label(KeyAction::VideoVolumeUp),
+            volume_down: self.keymap.first_chord_label(KeyAction::VideoVolumeDown),
+            next_file: self.keymap.first_chord_label(KeyAction::VideoNextFile),
+            prev_file: self.keymap.first_chord_label(KeyAction::VideoPrevFile),
+            mute: self.keymap.first_chord_label(KeyAction::VideoMute),
+            loop_mode: self.keymap.first_chord_label(KeyAction::VideoLoop),
+            marker_prev: self.keymap.first_chord_label(KeyAction::VideoMarkerPrev),
+            marker_next: self.keymap.first_chord_label(KeyAction::VideoMarkerNext),
+            pin: self.keymap.first_chord_label(KeyAction::VideoPin),
+            perf_overlay: self.keymap.first_chord_label(KeyAction::VideoPerfOverlay),
+            tile_mode: self.keymap.first_chord_label(KeyAction::VideoTileMode),
+            bookmark: self.keymap.first_chord_label(KeyAction::VideoBookmark),
+            capture: self.keymap.first_chord_label(KeyAction::VideoCapture),
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
         let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } => Some(player.path().clone()),
@@ -3754,6 +3781,7 @@ impl App {
         // これでフルスクリーン動画中の毎フレーム sync が大きなカタログを作り直さなくなる。
         let tag_choices = self.cached_native_overlay_tag_choices();
         let shortcut_tags = self.cached_native_overlay_shortcut_tags();
+        let shortcuts = self.native_overlay_shortcut_labels();
 
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
@@ -3802,6 +3830,7 @@ impl App {
                 last_present_path,
                 deinterlace_status,
                 interlace_detected,
+                shortcuts,
             }
         } else {
             crate::video::native_presenter::NativeOverlayMetadata {
@@ -3832,6 +3861,7 @@ impl App {
                 last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
+                shortcuts,
             }
         };
         player.set_native_metadata(Some(metadata));

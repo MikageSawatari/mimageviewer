@@ -8,15 +8,32 @@ use super::{
     NativeBookmarkTitleEdit, NativeBulkBookmarkDialog, NativeFrameStepHold, NativeOverlayCommand,
     NativeOverlayJumpEntry, NativeOverlayMetadata, NativeOverlayNavigationPreview,
     NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayRingGuide,
-    NativeOverlayRingPicker, NativeOverlayTagDef, NativeOverlayThumbnail, NativeOverlayTileOverlay,
-    NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind, NativeOverlayToast,
-    NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
-    NativeOverlayVst3SlotState,
+    NativeOverlayRingPicker, NativeOverlayShortcutLabels, NativeOverlayTagDef,
+    NativeOverlayThumbnail, NativeOverlayTileOverlay, NativeOverlayTimelineMarker,
+    NativeOverlayTimelineMarkerKind, NativeOverlayToast, NativeOverlayVst3ChainSlot,
+    NativeOverlayVst3Panel, NativeOverlayVst3Slot, NativeOverlayVst3SlotState,
 };
 
 const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
 const NATIVE_PERF_AV_OFFSET_NORMAL_MS: f32 = 100.0;
 const NATIVE_PERF_AV_OFFSET_SEVERE_MS: f32 = 500.0;
+
+pub(super) fn native_label_with_shortcut(label: &str, shortcut: Option<&str>) -> String {
+    match shortcut {
+        Some(shortcut) if !shortcut.trim().is_empty() => format!("{label} [{shortcut}]"),
+        _ => label.to_owned(),
+    }
+}
+
+pub(super) fn native_joined_shortcuts(shortcuts: &[Option<&str>]) -> Option<String> {
+    let labels = shortcuts
+        .iter()
+        .flatten()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    (!labels.is_empty()).then(|| labels.join(" / "))
+}
 
 pub(super) fn draw_native_perf_overlay(
     ctx: &egui::Context,
@@ -375,6 +392,7 @@ pub(super) fn draw_native_jump_panel(
     position_secs: f64,
     entries: &[NativeOverlayJumpEntry],
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
+    shortcut_labels: Option<&NativeOverlayShortcutLabels>,
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: &mut Option<NativeBulkBookmarkDialog>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -459,7 +477,10 @@ pub(super) fn draw_native_jump_panel(
                 7.0,
                 egui::Color32::from_rgb(140, 245, 170),
             );
-            let pin_resp = pin_resp.hover_tip_dark("現在位置をピン留め");
+            let pin_resp = pin_resp.hover_tip_dark(native_label_with_shortcut(
+                "現在位置をピン留め",
+                shortcut_labels.and_then(|s| s.pin.as_deref()),
+            ));
             if pin_resp.clicked() {
                 commands.push(NativeOverlayCommand::SetPinAt {
                     target_secs: position_secs,
@@ -482,7 +503,10 @@ pub(super) fn draw_native_jump_panel(
                 7.0,
                 egui::Color32::from_rgb(255, 220, 82),
             );
-            let bm_resp = bm_resp.hover_tip_dark("現在位置をブックマーク [B]");
+            let bm_resp = bm_resp.hover_tip_dark(native_label_with_shortcut(
+                "現在位置をブックマーク",
+                shortcut_labels.and_then(|s| s.bookmark.as_deref()),
+            ));
             if bm_resp.clicked() {
                 commands.push(NativeOverlayCommand::AddBookmarkAt {
                     target_secs: position_secs,
@@ -2409,6 +2433,7 @@ pub(super) fn draw_native_top_bar(
             let gap = 8.0;
             let mut x = overlay_width_points - 12.0 - btn_size;
             let y = 13.0;
+            let shortcuts = metadata.map(|m| &m.shortcuts);
 
             draw_native_top_button(
                 ui,
@@ -2451,7 +2476,10 @@ pub(super) fn draw_native_top_bar(
                 "native_top_tile",
                 NativeTopButtonGlyph::TileGrid,
                 false,
-                "サムネイル一覧 [S]",
+                &native_label_with_shortcut(
+                    "サムネイル一覧",
+                    shortcuts.and_then(|s| s.tile_mode.as_deref()),
+                ),
                 NativeOverlayCommand::ToggleTileMode,
                 commands,
             );
@@ -2466,7 +2494,10 @@ pub(super) fn draw_native_top_bar(
                 "native_top_perf",
                 NativeTopButtonGlyph::PerfGraph,
                 perf_visible,
-                "Perfグラフ [P]",
+                &native_label_with_shortcut(
+                    "Perfグラフ",
+                    shortcuts.and_then(|s| s.perf_overlay.as_deref()),
+                ),
                 NativeOverlayCommand::TogglePerfOverlay,
                 commands,
             );
@@ -2573,6 +2604,11 @@ pub(super) fn draw_native_top_bar_tile(
             let gap = 8.0;
             let mut x = overlay_width_points - 12.0 - btn_size;
             let y = 13.0;
+            let shortcuts = metadata.map(|m| &m.shortcuts);
+            let return_shortcut = native_joined_shortcuts(&[
+                shortcuts.and_then(|s| s.tile_mode.as_deref()),
+                Some("Esc"),
+            ]);
 
             draw_native_top_button(
                 ui,
@@ -2585,7 +2621,7 @@ pub(super) fn draw_native_top_bar_tile(
                 "native_tile_top_close",
                 NativeTopButtonGlyph::Close,
                 false,
-                "動画に戻る [S / Esc]",
+                &native_label_with_shortcut("動画に戻る", return_shortcut.as_deref()),
                 NativeOverlayCommand::ToggleTileMode,
                 commands,
             );

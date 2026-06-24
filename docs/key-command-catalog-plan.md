@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 5 フルスクリーンホバーバー表示スライス実装中 / レビュー待ち** (2026-06-24)。
+> ステータス: **Phase 5 native 動画 overlay 表示スライス実装中 / レビュー待ち** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -44,11 +44,18 @@
 > 詳細表示・タグビュー・現在地フィルタの一部 hover text を先頭 chord 表示に追従させた。
 > native 動画 overlay と、フルスクリーンホバーバー等の広範な shortcut 表示は後続。
 >
-> **Phase 5 フルスクリーンホバーバー表示スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> **Phase 5 フルスクリーンホバーバー表示スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `Keymap::first_chord_bracket_label()` / `chord_list_bracket_label()` を追加し、静止画
 > フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット popup の
 > shortcut 表記を実 keymap から表示するようにした。`Esc` / `F11` は固定扱いのまま。
-> native 動画 overlay は後続に残す。
+> native 動画 overlay は後続に残した。
+>
+> **Phase 5 native 動画 overlay 表示スライス実装メモ (2026-06-24, Codex / レビュー待ち)**:
+> `NativeOverlayShortcutLabels` を `NativeOverlayMetadata` に載せ、App 側で現在の
+> `keymap.ini` effective chord から作った表示用 snapshot を native presenter へ渡すようにした。
+> 動画 top bar / bottom HUD / jump panel / seek hover thumbnail の KeyAction 由来 shortcut 表記を
+> この snapshot から表示する。`Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの
+> 入力は従来どおり。
 
 ## 1. 背景と狙い
 
@@ -431,9 +438,12 @@ pub enum BindingPolicy {
   `compact_action_label()` 由来にした。
 - **メニュー表示スライス実装済み**: 検索 / タグビュー系のトップメニュー項目と、一部 toolbar /
   search bar hover text を `first_chord_action_label()` 由来にした。
-- **フルスクリーンホバーバー表示スライス実装中**: 静止画フルスクリーンの上部ホバーバー
+- **フルスクリーンホバーバー表示スライス実装済み**: 静止画フルスクリーンの上部ホバーバー
   tooltip と、表示モード / ズーム・フィット popup の shortcut 表記を実 keymap 由来にした。
-  `Esc` / `F11` は固定扱い、native 動画 overlay は未着手。
+  `Esc` / `F11` は固定扱い。
+- **native 動画 overlay 表示スライス実装中**: App 側で `NativeOverlayShortcutLabels` を作り、
+  top bar / bottom HUD / jump panel / seek hover thumbnail の shortcut 表記を実 keymap 由来にした。
+  `Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
 完了条件:
 

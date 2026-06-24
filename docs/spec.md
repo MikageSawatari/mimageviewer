@@ -676,8 +676,9 @@ Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に
 chord を `(Ctrl+F)` のように反映する。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
 popup の shortcut 表記も `keymap.ini` の実割り当てに追従する。複数 chord を
-表示する箇所では `I / Tab` のように並べる。`Esc` / `F11` と native 動画 overlay の
-表示は当面固定扱い。
+表示する箇所では `I / Tab` のように並べる。native 動画 overlay の top bar / bottom HUD /
+jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は実割り当てに追従する。
+`Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
 フリック、マウス戻る / 進むボタン、ゲームパッド X リングは
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
