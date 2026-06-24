@@ -480,6 +480,11 @@ impl App {
             jump_to: None,
         };
 
+        if !self.ime_input_active() && Self::consume_context_shortcuts_help_key(ctx) {
+            self.show_context_shortcuts_help = true;
+            return action;
+        }
+
         // ESC: 選択があればまず解除、無ければマスクを適用 (E と同じ挙動) して終了
         //
         // 旧版は ESC でマスクを DB に保存するだけで inpaint を実行しなかったため、

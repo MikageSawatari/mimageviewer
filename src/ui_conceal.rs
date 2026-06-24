@@ -475,6 +475,11 @@ impl App {
             jump_to: None,
         };
 
+        if !self.ime_input_active() && Self::consume_context_shortcuts_help_key(ctx) {
+            self.show_context_shortcuts_help = true;
+            return action;
+        }
+
         // ESC: 選択中があればまず解除、無ければモード終了
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if esc {

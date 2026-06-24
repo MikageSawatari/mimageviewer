@@ -101,10 +101,65 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const ERASE_HELP_SCOPES: &[CommandScope] = &[CommandScope::Erase];
+const CONCEAL_HELP_SCOPES: &[CommandScope] = &[CommandScope::Conceal];
+
+const ERASE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc",
+        description: "選択や多角形入力を解除する。解除対象がなければ補完を実行して終了する",
+    },
+    FixedShortcutRow {
+        keys: "Enter",
+        description: "多角形ツールの頂点列を確定する",
+    },
+    FixedShortcutRow {
+        keys: "矢印 / Ctrl+矢印",
+        description: "マスクまたは選択オブジェクトを 1px / 10px 移動する",
+    },
+    FixedShortcutRow {
+        keys: "[ / ] / Ctrl+[ / Ctrl+]",
+        description: "マスクまたは選択オブジェクトを 0.1度 / 1度 回転する",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール / Ctrl+ホイール",
+        description: "画像上ではズームする。パネル上ではスクロールまたはズームする",
+    },
+];
+
+const CONCEAL_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc",
+        description: "選択や多角形入力を解除する。解除対象がなければ隠蔽加工モードを終了する",
+    },
+    FixedShortcutRow {
+        keys: "Enter",
+        description: "多角形ツールの頂点列を確定する",
+    },
+    FixedShortcutRow {
+        keys: "矢印 / Ctrl+矢印",
+        description: "選択オブジェクト、またはオブジェクト全体を 1px / 10px 移動する",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール / Ctrl+ホイール",
+        description: "画像上ではズームする。パネル上ではスクロールまたはズームする",
+    },
+];
+
 #[derive(Clone, Copy)]
 enum ShortcutHelpContext {
     Grid,
     FsImage,
+    Erase,
+    Conceal,
 }
 
 impl ShortcutHelpContext {
@@ -112,6 +167,8 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => "サムネイル一覧",
             Self::FsImage => "画像フルスクリーン",
+            Self::Erase => "消しゴムモード",
+            Self::Conceal => "隠蔽加工モード",
         }
     }
 
@@ -119,6 +176,8 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => GRID_ACTIVE_SCOPES,
             Self::FsImage => FS_IMAGE_ACTIVE_SCOPES,
+            Self::Erase => ERASE_HELP_SCOPES,
+            Self::Conceal => CONCEAL_HELP_SCOPES,
         }
     }
 
@@ -126,6 +185,8 @@ impl ShortcutHelpContext {
         match self {
             Self::Grid => GRID_FIXED_SHORTCUT_ROWS,
             Self::FsImage => FS_IMAGE_FIXED_SHORTCUT_ROWS,
+            Self::Erase => ERASE_FIXED_SHORTCUT_ROWS,
+            Self::Conceal => CONCEAL_FIXED_SHORTCUT_ROWS,
         }
     }
 
@@ -136,6 +197,7 @@ impl ShortcutHelpContext {
                 row.spec.scope != CommandScope::Global
                     || row.spec.action == KeyAction::ToggleDetachedViewerMode
             }
+            Self::Erase | Self::Conceal => true,
         }
     }
 }
@@ -196,6 +258,12 @@ impl App {
     }
 
     fn current_shortcut_help_context(&self) -> ShortcutHelpContext {
+        if self.erase_mode {
+            return ShortcutHelpContext::Erase;
+        }
+        if self.conceal_mode {
+            return ShortcutHelpContext::Conceal;
+        }
         if let Some(fs_idx) = self.fullscreen_idx
             && matches!(
                 self.items.get(fs_idx),
