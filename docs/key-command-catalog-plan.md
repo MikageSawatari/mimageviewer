@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 5 初期スライス実装済み / レビュー済み** (2026-06-24)。
+> ステータス: **Phase 5 メニュー表示スライス実装済み / レビュー済み** (2026-06-24)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -36,8 +36,13 @@
 > **Phase 5 初期実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `Keymap::compact_action_label()` を追加し、消しゴム / 隠蔽加工パネルの
 > 描画・消去ボタンとツールボタン (`筆 [B]` など) を実 keymap から表示するようにした。
-> 修飾付き chord や未割り当てでは compact 表示を省略する。メニュー表示、native 動画 overlay、
-> ツールチップのフル表記は後続。
+> 修飾付き chord や未割り当てでは compact 表示を省略する。この時点ではメニュー表示、
+> native 動画 overlay、ツールチップのフル表記は後続に残した。
+>
+> **Phase 5 メニュー表示スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
+> `Keymap::first_chord_action_label()` を追加し、メニューバーの検索 / タグビュー項目と、
+> 詳細表示・タグビュー・現在地フィルタの一部 hover text を先頭 chord 表示に追従させた。
+> native 動画 overlay と、フルスクリーンホバーバー等の広範な shortcut 表示は後続。
 
 ## 1. 背景と狙い
 
@@ -416,7 +421,10 @@ pub enum BindingPolicy {
 - 消しゴム / 隠蔽加工の `筆 [B]` などを `compact_single_key_label()` 由来にする。
 - native 動画 overlay へ必要な shortcut label snapshot を渡す。
 - **初期スライス実装済み**: 消しゴム / 隠蔽加工パネルの描画・消去ボタンとツールボタンを
-  `compact_action_label()` 由来にした。メニューと native 動画 overlay は未着手。
+  `compact_action_label()` 由来にした。
+- **メニュー表示スライス実装中**: 検索 / タグビュー系のトップメニュー項目と、一部 toolbar /
+  search bar hover text を `first_chord_action_label()` 由来にした。native 動画 overlay と
+  フルスクリーンホバーバーは未着手。
 
 完了条件:
 
@@ -434,6 +442,27 @@ pub enum BindingPolicy {
 - toolbar customization と同じく、表示順・表示 ON/OFF を段階的に扱う。
 
 この Phase は、コマンド catalog が安定してから着手する。
+
+### Phase 7: コンテキスト別ショートカットヘルプ (`?`)
+
+実装内容:
+
+- `?` キーで、現在のコンテキスト (グリッド / 画像フルスクリーン / 動画フルスクリーン /
+  消しゴム / 隠蔽加工 / テキスト注釈など) で有効なショートカット一覧を表示する。
+- 表示内容は固定表ではなく、現在読み込まれている `keymap.ini` の effective chords から作る。
+- 同じ `CommandSpec` / `KeyAction` の scope・description・binding policy を使い、未割り当てや
+  予約扱いの操作は表示方針を明示する。
+- 複数 chord がある操作は全て表示するか、主 chord + 詳細展開にするかを UI 設計で決める。
+- `?` 自体を固定ヘルプキーにするか、`HelpShowContextShortcuts` のような `KeyAction` として
+  カスタマイズ可能にするかは、Esc / Enter / 矢印の予約整理後に判断する。
+
+完了条件:
+
+- keymap 変更後、ヘルプ表示のキー一覧が実割り当てに追従する。
+- 現在コンテキストで発火しない操作を混ぜず、Global / FsCommon / 編集モード固有操作の重なりを
+  active scope から説明できる。
+- テキスト入力・IME 変換・ダイアログ操作中に `?` が誤発火しない。
+- ヘルプ UI はリリース中の通常操作を阻害せず、Esc / クリック外し等で閉じられる。
 
 ## 7. 初回リリースの詳細タスク
 

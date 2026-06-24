@@ -2537,6 +2537,13 @@ impl Keymap {
             .map(|chord| chord.display_name())
     }
 
+    pub fn first_chord_action_label(&self, label: &str, action: KeyAction) -> String {
+        match self.first_chord_label(action) {
+            Some(key_label) => format!("{label} ({key_label})"),
+            None => label.to_owned(),
+        }
+    }
+
     pub fn compact_single_key_label(&self, action: KeyAction) -> Option<&'static str> {
         self.effective_chords(action)
             .into_iter()
@@ -3727,7 +3734,15 @@ mod tests {
                 .as_deref(),
             Some("Ctrl+Shift+S")
         );
+        assert_eq!(
+            keymap.first_chord_action_label("スタック", KeyAction::GridToggleStackMode),
+            "スタック (Ctrl+Shift+S)"
+        );
         assert_eq!(keymap.first_chord_label(KeyAction::GridPin), None);
+        assert_eq!(
+            keymap.first_chord_action_label("代表サムネイル", KeyAction::GridPin),
+            "代表サムネイル"
+        );
     }
 
     #[test]

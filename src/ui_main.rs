@@ -11,6 +11,7 @@ use eframe::egui;
 
 use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget};
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::keymap::KeyAction;
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
     FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
@@ -2026,6 +2027,18 @@ impl App {
                     GridItem::Video(path) => Some(path.clone()),
                     _ => None,
                 });
+        let local_search_menu_label = self
+            .keymap
+            .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
+        let fav_search_menu_label = self
+            .keymap
+            .first_chord_action_label("コンテナ検索", KeyAction::GlobalFavSearch);
+        let metadata_search_menu_label = self
+            .keymap
+            .first_chord_action_label("アイテム検索", KeyAction::GlobalMetadataSearch);
+        let tag_view_menu_label = self
+            .keymap
+            .first_chord_action_label("タグビュー", KeyAction::GridTagView);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -2057,7 +2070,7 @@ impl App {
                             }
                         }
                     });
-                    if ui.button("現在地フィルタ (Ctrl+F)").clicked() {
+                    if ui.button(&local_search_menu_label).clicked() {
                         // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
                         self.open_local_metadata_search();
                         ui.close();
@@ -2113,13 +2126,13 @@ impl App {
                     }
 
                     // コンテナ検索 (Ctrl+S)
-                    if ui.button("コンテナ検索 (Ctrl+S)").clicked() {
+                    if ui.button(&fav_search_menu_label).clicked() {
                         self.open_favsearch();
                         ui.close();
                     }
 
                     // アイテム検索 (Ctrl+G)
-                    if ui.button("アイテム検索 (Ctrl+G)").clicked() {
+                    if ui.button(&metadata_search_menu_label).clicked() {
                         // 相互排他は toggle_global_search 内で
                         self.toggle_global_search();
                         ui.close();
@@ -2263,7 +2276,7 @@ impl App {
                         self.open_tag_editor();
                         ui.close();
                     }
-                    if ui.button("タグビュー (Ctrl+T)").clicked() {
+                    if ui.button(&tag_view_menu_label).clicked() {
                         self.open_tag_view();
                         ui.close();
                     }
@@ -4316,9 +4329,10 @@ impl App {
                             if toolbar_details_visible {
                                 if ui
                                     .selectable_label(details_mode, " 詳細 ")
-                                    .on_hover_text(
-                                        "サムネイルなしの詳細一覧に切り替えます (Alt+-)",
-                                    )
+                                    .on_hover_text(self.keymap.first_chord_action_label(
+                                        "サムネイルなしの詳細一覧に切り替えます",
+                                        KeyAction::GridToggleDetailsView,
+                                    ))
                                     .clicked()
                                 {
                                     self.set_grid_view_mode(GridViewMode::Details);
@@ -4816,7 +4830,10 @@ impl App {
                     }
                     if ui
                         .button("検索")
-                        .hover_tip("タグビューを開く (Ctrl+T)")
+                        .hover_tip(
+                            self.keymap
+                                .first_chord_action_label("タグビューを開く", KeyAction::GridTagView),
+                        )
                         .clicked()
                     {
                         toolbar_tag_view_open = true;
@@ -8030,13 +8047,16 @@ impl App {
         // ときだけ execute_search を呼ぶ。search_query は IME Commit で既に確定済み。
         let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        let local_search_label = self
+            .keymap
+            .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("検索:").on_hover_text(
-                    "現在地フィルタ (Ctrl+F): 今開いているフォルダ / ZIP の表示中\n\
-                     アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。",
-                );
+                ui.label("検索:").on_hover_text(format!(
+                    "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
+                     アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
+                ));
                 let mut output = egui::TextEdit::singleline(&mut self.search_query)
                     .hint_text(r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#)
                     .desired_width(320.0)
