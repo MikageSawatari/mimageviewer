@@ -33,6 +33,7 @@ impl App {
             && !self.items_are_global_search_view
             && !self.items_are_tag_view
             && !self.items_are_rating_view
+            && !self.items_are_subfolder_expansion_view
             && !self.favsearch.on_results_grid()
             && !self.tag_view.on_results_grid()
     }

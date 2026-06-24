@@ -1872,9 +1872,12 @@ pub struct Settings {
     /// サムネイル選択情報ツールチップに動画コーデックを表示する。
     #[serde(default)]
     pub thumb_tooltip_show_video_codec: bool,
-    /// サムネイル選択情報ツールチップに親フォルダ / コンテナ名を表示する。
+    /// サムネイル選択情報ツールチップに親フォルダ / コンテナ名を短い名前で表示する。
     #[serde(default)]
     pub thumb_tooltip_show_location: bool,
+    /// サムネイル選択情報ツールチップに場所をフルパスで表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_full_location: bool,
     /// サムネイル選択情報ツールチップに読書履歴の最終閲覧日時を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_reading_history_last_read: bool,
@@ -3349,6 +3352,7 @@ impl Default for Settings {
             thumb_tooltip_show_video_dimensions: false,
             thumb_tooltip_show_video_codec: false,
             thumb_tooltip_show_location: false,
+            thumb_tooltip_show_full_location: false,
             thumb_tooltip_show_reading_history_last_read: true,
             thumb_tooltip_show_reading_history_progress: true,
             exif_hidden_tags: default_exif_hidden_tags(),
@@ -7156,6 +7160,7 @@ mod tests {
             s.thumb_tooltip_show_video_dimensions = true;
             s.thumb_tooltip_show_video_codec = true;
             s.thumb_tooltip_show_location = true;
+            s.thumb_tooltip_show_full_location = true;
             s.thumb_tooltip_show_reading_history_last_read = false;
             s.thumb_tooltip_show_reading_history_progress = false;
             s.fullscreen_left_panel_tab = FullscreenLeftPanelTab::ViewTrim;
@@ -7531,6 +7536,10 @@ mod tests {
             assert!(
                 loaded.thumb_tooltip_show_location,
                 "thumb tooltip location flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_full_location,
+                "thumb tooltip full location flag should survive roundtrip"
             );
             assert!(
                 !loaded.thumb_tooltip_show_reading_history_last_read,

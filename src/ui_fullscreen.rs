@@ -1272,6 +1272,7 @@ pub(crate) enum FsNavNoOpReason {
     LocalFilterActive,
     SearchResultList,
     SearchSiblingUnsupported,
+    SubfolderExpansion,
 }
 
 impl FsBoundaryHint {
@@ -8354,6 +8355,12 @@ impl App {
             return;
         }
 
+        if self.items_are_subfolder_expansion_view {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SubfolderExpansion, native_toast);
+            return;
+        }
+
         // ネスト ZIP 内: Ctrl+↑↓ は ZIP 内ツリーの DFS で前後の本へ移り、その先頭画像を
         // 開く (#4 改: ルートの直下画像からも最初の本へ降りる)。ツリーの端では false が
         // 返り nav は不変なので、下の current_folder 分岐に落ちて ZIP を抜けて実フォルダ
@@ -8416,6 +8423,12 @@ impl App {
             return;
         }
 
+        if self.items_are_subfolder_expansion_view {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SubfolderExpansion, native_toast);
+            return;
+        }
+
         // 変換キャッシュ閲覧中の起点はユーザー視点の元アーカイブ (Codex P2、上と同様)。
         if let Some(cur) = self.effective_folder() {
             self.capture_fs_nav_holdover(fs_idx);
@@ -8450,6 +8463,7 @@ impl App {
             FsNavNoOpReason::LocalFilterActive => "Ctrl+F検索中はフォルダ移動しません",
             FsNavNoOpReason::SearchResultList => "検索結果を開いてからCtrl+↑↓で移動できます",
             FsNavNoOpReason::SearchSiblingUnsupported => "検索中は兄弟フォルダ移動しません",
+            FsNavNoOpReason::SubfolderExpansion => "サブ展開中はフォルダ移動しません",
         }
     }
 
@@ -13743,6 +13757,13 @@ impl App {
             } => (
                 Self::nav_noop_title(FsNavNoOpReason::SearchSiblingUnsupported),
                 vec!["検索を閉じると通常フォルダで移動できます"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::SubfolderExpansion,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::SubfolderExpansion),
+                vec!["サブ展開を解除すると通常フォルダで移動できます"],
             ),
         };
 

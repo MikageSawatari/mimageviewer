@@ -327,7 +327,8 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.thumb_tooltip_show_created, "作成日時");
     ui.checkbox(&mut s.thumb_tooltip_show_video_dimensions, "動画解像度");
     ui.checkbox(&mut s.thumb_tooltip_show_video_codec, "動画コーデック");
-    ui.checkbox(&mut s.thumb_tooltip_show_location, "場所");
+    ui.checkbox(&mut s.thumb_tooltip_show_location, "親フォルダ名");
+    ui.checkbox(&mut s.thumb_tooltip_show_full_location, "場所");
     ui.checkbox(
         &mut s.thumb_tooltip_show_reading_history_last_read,
         "読書履歴: 最終閲覧",

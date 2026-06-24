@@ -21,6 +21,7 @@ mod prefetch_policy;
 mod runtime_ops;
 mod snapshot_ops;
 mod startup_ops;
+mod subfolder_expansion;
 #[cfg(test)]
 pub(crate) use startup_ops::{
     startup_file_should_open_fullscreen, startup_openable_should_auto_fullscreen,
@@ -2279,6 +2280,12 @@ pub(crate) fn rating_view_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__rating_view__")
 }
 
+/// サブフォルダ展開ビューで current_folder に設定する合成パス。
+/// `%APPDATA%/mimageviewer/__subfolder_expansion__` (実在させない、カタログキーとしてのみ使用)。
+pub(crate) fn subfolder_expansion_synthetic_path() -> PathBuf {
+    crate::data_dir::get().join("__subfolder_expansion__")
+}
+
 /// 実フォルダではない仮想フラットビューの合成パスか。
 ///
 /// 検索固有の分岐には使わず、`delete_missing` / `last_folder` 保存 / コンテナ★など
@@ -2287,6 +2294,7 @@ pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
     crate::folder_tree::path_eq(path, &search_results_synthetic_path())
         || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
         || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
+        || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
 }
 
 /// サムネイル色調補正の対象アイテムかどうか。
@@ -2792,6 +2800,8 @@ pub struct App {
     pub(crate) items_are_reading_history_view: bool,
     /// 現在の `items` がレーティング一覧の仮想ビューかを示す。
     pub(crate) items_are_rating_view: bool,
+    /// 現在の `items` がサブフォルダ展開のスナップショット仮想ビューかを示す。
+    pub(crate) items_are_subfolder_expansion_view: bool,
     /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
     /// `current_folder = None` と併用し、通常フォルダの D&D / rating / 代表サムネ探索
     /// を明示的に止める。
@@ -3937,6 +3947,23 @@ pub struct App {
     /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ
     /// カーソルを移す (トグルで被写体が飛ばないように)。OFF 側は `select_after_load` で扱う。
     pub(crate) stack_toggle_select_path: Option<std::path::PathBuf>,
+
+    // ── サブフォルダ展開ビュー (snapshot flat view) ───────────────
+    /// サブ展開ビューの実 root。`current_folder` は synthetic path になるため、戻り先や
+    /// 再スキャンのために実パスを別保持する。
+    pub(crate) subfolder_expansion_root: Option<PathBuf>,
+    /// サブ展開ビューから Backspace / トグル OFF で戻る先。初期版は root と同じ。
+    pub(crate) subfolder_expansion_saved_folder: Option<PathBuf>,
+    /// ボタン押下時点の走査結果。ソート変更ではこれを再利用し、ファイルシステムを再走査しない。
+    pub(crate) subfolder_expansion_snapshot:
+        Option<subfolder_expansion::SubfolderExpansionSnapshot>,
+    /// サブ展開 worker の進行中状態。
+    pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
+    /// フォルダバーに出す軽量進捗。
+    pub(crate) subfolder_expansion_progress:
+        Option<subfolder_expansion::SubfolderExpansionProgress>,
+    /// 直近完了時の診断統計。実機レビュー時のログ/確認用。
+    pub(crate) subfolder_expansion_diag: Option<subfolder_expansion::SubfolderExpansionDiag>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -5488,6 +5515,7 @@ impl App {
             items_are_tag_view: false,
             items_are_reading_history_view: false,
             items_are_rating_view: false,
+            items_are_subfolder_expansion_view: false,
             items_are_drive_list: false,
             show_favorites_editor: false,
             favorite_delete_confirm: None,
@@ -5896,6 +5924,12 @@ impl App {
             stack_script_error: None,
             stack_script_pending: None,
             stack_toggle_select_path: None,
+            subfolder_expansion_root: None,
+            subfolder_expansion_saved_folder: None,
+            subfolder_expansion_snapshot: None,
+            subfolder_expansion_pending: None,
+            subfolder_expansion_progress: None,
+            subfolder_expansion_diag: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -7355,6 +7389,9 @@ impl App {
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
         }
+        if let Some(nav) = self.subfolder_expansion_back_nav() {
+            return Some(nav);
+        }
         let cur = self.effective_folder()?;
         if let Some(parent) = cur.parent() {
             Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()))
@@ -7365,6 +7402,9 @@ impl App {
 
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         if let Some(nav) = self.reading_history_back_nav() {
+            return Some(nav);
+        }
+        if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
         let cur = self.effective_folder()?;
@@ -7392,6 +7432,9 @@ impl App {
     /// (ドライブ root 等) ときは `None` を返し、呼び出し側が close にフォールバックする。
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         if let Some(nav) = self.reading_history_back_nav() {
+            return Some(nav);
+        }
+        if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
         let cur = self.effective_folder()?;
@@ -8132,6 +8175,24 @@ impl App {
             self.install_rating_view_rows();
             return;
         }
+        if let Some(root) = self
+            .subfolder_expansion_pending
+            .as_ref()
+            .map(|pending| pending.root.clone())
+        {
+            self.subfolder_expansion_root = Some(root.clone());
+            self.subfolder_expansion_saved_folder = Some(root);
+            return;
+        }
+        if self.items_are_subfolder_expansion_view {
+            if self.reinstall_subfolder_expansion_snapshot() {
+                return;
+            }
+            if let Some(root) = self.subfolder_expansion_root.clone() {
+                self.start_subfolder_expansion_scan(root);
+            }
+            return;
+        }
         if let Some(path) = self.current_folder.clone() {
             self.folder_history.remove(&path);
             self.load_folder(path);
@@ -8408,6 +8469,8 @@ impl App {
         self.stack_view = None;
         self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
+        self.cancel_subfolder_expansion_pending();
+        self.clear_subfolder_expansion_view_state();
         crate::zip_loader::clear_nested_cache();
 
         let (tx, rx) = mpsc::channel();
@@ -12476,6 +12539,10 @@ impl App {
         self.stack_showing_flat = false;
         // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
         self.cancel_stack_script_pending();
+        if !crate::folder_tree::path_eq(&source_path, &subfolder_expansion_synthetic_path()) {
+            self.cancel_subfolder_expansion_pending();
+            self.clear_subfolder_expansion_view_state();
+        }
         self.gamepad_location_picker = None;
         if !crate::folder_tree::path_eq(&source_path, &rating_view_synthetic_path()) {
             if let Some(pending) = self.rating_view_pending.take() {
@@ -13300,6 +13367,7 @@ impl App {
         self.items_are_tag_view = false;
         self.items_are_reading_history_view = false;
         self.items_are_rating_view = false;
+        self.items_are_subfolder_expansion_view = false;
         self.items_are_drive_list = false;
         self.reading_history_rows.clear();
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
@@ -16480,7 +16548,11 @@ impl App {
 
             let override_count = video_items
                 .iter()
-                .filter(|(_, p, _)| thumb_overrides.contains_key(&stem_lower(p)))
+                .filter(|(_, p, _)| {
+                    let full_key = crate::path_key::normalize_keep_drive(p);
+                    thumb_overrides.contains_key(&full_key)
+                        || thumb_overrides.contains_key(&stem_lower(p))
+                })
                 .count();
             crate::logger::log(format!(
                 "[video thread] start: {} videos (override={}, shell={}), thumb_size={}, display_px={}",
@@ -16554,6 +16626,7 @@ impl App {
                 let call_t0 = Instant::now();
 
                 let stem = stem_lower(&path);
+                let full_video_key = crate::path_key::normalize_keep_drive(&path);
                 // Phase 8.B': ピン留めフレームを最優先で適用 (priority chain の 1.)。
                 // pin_blobs map は spawn 時に snapshot されているので thread 安全。
                 // WebP デコード失敗時は fall-through。
@@ -16573,7 +16646,10 @@ impl App {
                         ));
                     }
                     (Some(ci), "pin")
-                } else if let Some(img_path) = thumb_overrides.get(&stem) {
+                } else if let Some(img_path) = thumb_overrides
+                    .get(&full_video_key)
+                    .or_else(|| thumb_overrides.get(&stem))
+                {
                     if retries == 0 {
                         crate::logger::log(format!(
                             "  video thumb override: idx={idx} stem={stem} img={}",
@@ -18867,6 +18943,8 @@ impl App {
                 self.favsearch_ctrl_nav(true);
             } else if in_tag_view {
                 self.cancel_pending_folder_nav();
+            } else if self.items_are_subfolder_expansion_view {
+                self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(true) {
                 // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
                 // false が返り、下の effective_folder 分岐で ZIP を抜けて実フォルダ DFS へ。
@@ -18891,6 +18969,8 @@ impl App {
                 self.favsearch_ctrl_nav(false);
             } else if in_tag_view {
                 self.cancel_pending_folder_nav();
+            } else if self.items_are_subfolder_expansion_view {
+                self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
                 // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
             } else if let Some(cur) = self.effective_folder() {
@@ -18910,6 +18990,8 @@ impl App {
                 // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
+            } else if self.items_are_subfolder_expansion_view {
+                self.cancel_pending_folder_nav();
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::SiblingGrid);
             }
@@ -18921,6 +19003,8 @@ impl App {
             } else if in_global_search || in_favsearch || in_tag_view {
                 // 同上。
             } else if in_local_search {
+                self.cancel_pending_folder_nav();
+            } else if self.items_are_subfolder_expansion_view {
                 self.cancel_pending_folder_nav();
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::SiblingGrid);
@@ -22739,7 +22823,7 @@ impl App {
                     continue;
                 }
             }
-            if rating_filter_active {
+            if rating_filter_active && ignore != FacetField::Rating {
                 let stars = self.get_rating(i);
                 if let Some(item) = self.items.get(i) {
                     if !passes_rating_filter(item, stars, &rating_filter) {
@@ -26930,7 +27014,16 @@ impl App {
         // Phase 8.B': 動画ピン留めが変更されていたら現在フォルダを再ロードして
         // グリッドサムネに反映 (= ピンの WebP がグリッド表示に出る)。
         if std::mem::take(&mut self.video_thumb_overrides_dirty) {
-            if let Some(cur) = self.current_folder.clone() {
+            if self.items_are_subfolder_expansion_view {
+                // 同じ snapshot を再適用して動画ピンの WebP を再取得する。
+                if !self.reinstall_subfolder_expansion_snapshot()
+                    && let Some(root) = self.subfolder_expansion_root.clone()
+                {
+                    self.start_subfolder_expansion_scan(root);
+                }
+            } else if let Some(cur) = self.current_folder.clone()
+                && !is_synthetic_view_path(&cur)
+            {
                 // 現フォルダ + 履歴を温存したまま再ロード
                 self.folder_history.remove(&cur);
                 self.load_folder(cur);
@@ -36800,6 +36893,7 @@ impl eframe::App for App {
         self.poll_metadata_load();
         // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
         self.poll_stack_script(ctx);
+        self.poll_subfolder_expansion(ctx);
         self.poll_details_meta_load(ctx);
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
         // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み

@@ -3323,6 +3323,8 @@ impl App {
             self.favsearch_ctrl_nav(forward);
         } else if in_tag_view {
             self.cancel_pending_folder_nav();
+        } else if self.items_are_subfolder_expansion_view {
+            self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
         } else if let Some(cur) = self.effective_folder() {
             self.start_folder_nav(cur, forward, FolderNavMode::Grid);
@@ -3359,6 +3361,8 @@ impl App {
                 let _ = self.snapshot_navigate_grid_page(forward);
             } else if self.global_search.active || self.favsearch.active || self.tag_view.active {
             } else if self.show_search_bar {
+                self.cancel_pending_folder_nav();
+            } else if self.items_are_subfolder_expansion_view {
                 self.cancel_pending_folder_nav();
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, forward, FolderNavMode::SiblingGrid);
@@ -4204,6 +4208,8 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if in_favsearch {
             self.favsearch_ctrl_nav(forward);
+        } else if self.items_are_subfolder_expansion_view {
+            self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
             // ネスト ZIP 内: ツリーを DFS で前後のノードへ (#4 改)。端では false → 下で ZIP を抜ける。
         } else if let Some(cur) = self.effective_folder() {

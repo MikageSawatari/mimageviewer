@@ -1854,7 +1854,7 @@ fn zip_entry_parent_name(entry_name: &str) -> Option<&str> {
     parent.rsplit('/').find(|segment| !segment.is_empty())
 }
 
-fn selection_info_location_label(item: &GridItem) -> Option<String> {
+fn selection_info_parent_location_label(item: &GridItem) -> Option<String> {
     match item {
         GridItem::Folder(path)
         | GridItem::Image(path)
@@ -1863,7 +1863,7 @@ fn selection_info_location_label(item: &GridItem) -> Option<String> {
         | GridItem::PdfFile(path)
         | GridItem::SearchContainer { path, .. }
         | GridItem::ConvertibleArchive { path, .. } => {
-            short_path_name(path.parent()?).map(|name| format!("場所 {name}"))
+            short_path_name(path.parent()?).map(|name| format!("親フォルダ名 {name}"))
         }
         GridItem::ZipImage {
             zip_path,
@@ -1874,7 +1874,7 @@ fn selection_info_location_label(item: &GridItem) -> Option<String> {
                 label.push_str(" > ");
                 label.push_str(parent);
             }
-            Some(format!("場所 {label}"))
+            Some(format!("親フォルダ名 {label}"))
         }
         GridItem::ZipDir {
             zip_path,
@@ -1886,14 +1886,14 @@ fn selection_info_location_label(item: &GridItem) -> Option<String> {
                 label.push_str(" > ");
                 label.push_str(parent);
             }
-            Some(format!("場所 {label}"))
+            Some(format!("親フォルダ名 {label}"))
         }
         GridItem::PdfPage { pdf_path, .. } => {
-            short_path_name(pdf_path).map(|name| format!("場所 {name}"))
+            short_path_name(pdf_path).map(|name| format!("親フォルダ名 {name}"))
         }
-        // ファイル名スタック: 代表画像の親フォルダ名を場所として出す。
+        // ファイル名スタック: 代表画像の親フォルダ名を出す。
         GridItem::Stack { representative, .. } => {
-            short_path_name(representative.parent()?).map(|name| format!("場所 {name}"))
+            short_path_name(representative.parent()?).map(|name| format!("親フォルダ名 {name}"))
         }
         GridItem::ZipSeparator { .. } => None,
     }
@@ -6141,10 +6141,12 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
+                    let counts = self.facet_rating_counts();
                     for idx in 0..6 {
                         let mut selected = self.settings.rating_filter[idx];
+                        let text = format!("{} ({})", rating_button_label(idx), counts[idx]);
                         if ui
-                            .checkbox(&mut selected, rating_button_label(idx))
+                            .checkbox(&mut selected, text)
                             .on_hover_text(rating_tooltip(idx))
                             .changed()
                         {
@@ -6944,6 +6946,23 @@ impl App {
         counts
     }
 
+    fn facet_rating_counts(&mut self) -> [usize; 6] {
+        let indices = self.facet_candidate_indices(FacetField::Rating);
+        let mut counts = [0usize; 6];
+        for idx in indices {
+            let accepts_rating = self
+                .items
+                .get(idx)
+                .is_some_and(crate::grid_item::GridItem::accepts_rating);
+            if !accepts_rating {
+                continue;
+            }
+            let stars = self.get_rating(idx).min(5) as usize;
+            counts[stars] += 1;
+        }
+        counts
+    }
+
     fn facet_ext_counts(&mut self) -> BTreeMap<String, usize> {
         let indices = self.facet_candidate_indices(FacetField::Ext);
         let mut counts = BTreeMap::new();
@@ -7108,6 +7127,12 @@ impl App {
         let stack_on = self.stack_mode_on();
         let stack_available = (self.settings.show_address_bar_stack_toggle || stack_on)
             && self.stack_mode_available();
+        let subfolder_expansion_on = self.subfolder_expansion_on();
+        let subfolder_expansion_pending_label = self.subfolder_expansion_pending_label();
+        let subfolder_expansion_pending_tooltip = self.subfolder_expansion_pending_tooltip();
+        let subfolder_expansion_available = subfolder_expansion_on
+            || subfolder_expansion_pending_label.is_some()
+            || self.subfolder_expansion_available();
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 ui.add_space(3.0);
@@ -7118,6 +7143,7 @@ impl App {
                 // ファイル名スタックのトグルクリックは closure 後に処理する (load_folder で
                 // App ミュータブル借用が必要)。
                 let mut stack_toggle = false;
+                let mut subfolder_expansion_toggle = false;
                 // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
                 let mut search_drill_up = false;
                 ui.horizontal(|ui| {
@@ -7337,6 +7363,8 @@ impl App {
                             true
                         } else if search_active {
                             search_tree_drilled_in
+                        } else if subfolder_expansion_on {
+                            false
                         } else {
                             has_current
                         };
@@ -7344,6 +7372,8 @@ impl App {
                             "★固定リストの前へ [Ctrl+↑]"
                         } else if search_active {
                             "前のヒットフォルダへ [Ctrl+↑]"
+                        } else if subfolder_expansion_on {
+                            "サブ展開中はフォルダ移動しません"
                         } else {
                             "ツリー順で前のフォルダへ [Ctrl+↑]"
                         };
@@ -7351,6 +7381,8 @@ impl App {
                             "★固定リストの次へ [Ctrl+↓]"
                         } else if search_active {
                             "次のヒットフォルダへ [Ctrl+↓]"
+                        } else if subfolder_expansion_on {
+                            "サブ展開中はフォルダ移動しません"
                         } else {
                             "ツリー順で次のフォルダへ [Ctrl+↓]"
                         };
@@ -7540,6 +7572,44 @@ impl App {
                             }
                             ui.add_space(4.0);
                         }
+                        if subfolder_expansion_available {
+                            let pending = subfolder_expansion_pending_label.is_some();
+                            if pending {
+                                let tooltip = subfolder_expansion_pending_tooltip
+                                    .clone()
+                                    .unwrap_or_else(|| "サブフォルダを走査中".to_string());
+                                let cancel_resp = ui
+                                    .small_button("中止")
+                                    .hover_tip(format!("{tooltip}\nクリック: 走査をキャンセル"));
+                                if cancel_resp.clicked() {
+                                    subfolder_expansion_toggle = true;
+                                }
+                                ui.add_space(2.0);
+                            }
+                            let label = if let Some(progress) =
+                                subfolder_expansion_pending_label.as_ref()
+                            {
+                                progress.as_str()
+                            } else {
+                                "サブ展開"
+                            };
+                            let tooltip = if pending {
+                                subfolder_expansion_pending_tooltip
+                                    .clone()
+                                    .unwrap_or_else(|| "サブフォルダを走査中".to_string())
+                            } else if subfolder_expansion_on {
+                                "サブ展開を解除して元のフォルダへ戻る".to_string()
+                            } else {
+                                "現在のフォルダ以下の画像と動画をフラット表示".to_string()
+                            };
+                            let resp = ui
+                                .selectable_label(subfolder_expansion_on || pending, label)
+                                .hover_tip(tooltip);
+                            if resp.clicked() {
+                                subfolder_expansion_toggle = true;
+                            }
+                            ui.add_space(4.0);
+                        }
                         // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
                         if let Some(info) = pin_button_info.as_ref() {
                             let label = if info.matches_current_pin {
@@ -7722,6 +7792,9 @@ impl App {
                 }
                 if stack_toggle {
                     self.toggle_stack_mode();
+                }
+                if subfolder_expansion_toggle {
+                    self.toggle_subfolder_expansion_view();
                 }
                 if let Some(forward) = tree_nav {
                     // 検索中は ▲▼ を検索仮想階層の前後ヒット移動に振り分ける
@@ -10161,6 +10234,7 @@ impl App {
         }
 
         let mut fields = Vec::new();
+        let mut full_location_line = None;
         if self.settings.thumb_tooltip_show_kind {
             fields.push(format!("種類 {}", details_kind_label(item)));
         }
@@ -10254,13 +10328,24 @@ impl App {
             fields.push(format!("作成 {display}"));
         }
         if self.settings.thumb_tooltip_show_location {
-            if let Some(location) = selection_info_location_label(item) {
+            if let Some(location) = selection_info_parent_location_label(item) {
                 fields.push(location);
+            }
+        }
+        if self.settings.thumb_tooltip_show_full_location {
+            if let Some(path) = self.facet_place_path_for_item(item) {
+                let location = self.facet_place_label_for_path(&path);
+                if !location.is_empty() {
+                    full_location_line = Some(format!("場所 {location}"));
+                }
             }
         }
 
         if !fields.is_empty() {
             lines.push(fields.join("   "));
+        }
+        if let Some(location) = full_location_line {
+            lines.push(location);
         }
         if lines.is_empty() {
             return;

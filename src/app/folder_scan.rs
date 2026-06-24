@@ -112,7 +112,7 @@ pub(crate) fn scan_directory_with_convertible_archives(
     ScannedDir { folders, all_media }
 }
 
-fn filter_upscaled_video_pairs_fast(
+pub(super) fn filter_upscaled_video_pairs_fast(
     all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
     entry_file_names_ci: &std::collections::HashSet<String>,
 ) {

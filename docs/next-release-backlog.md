@@ -35,15 +35,9 @@
   リリース直前の小修正にはしない。
 - 優先度: P3。UX 改善として次回以降に対応。v2.1.0 のリリースブロッカーにはしない。
 
-## 2. アーカイブ / 仮想フォルダ
+## 2. フォルダツリーペイン
 
-現時点ではなし。
-
----
-
-## 3. フォルダツリーペイン
-
-### 3.1 folder pane scan worker の thread 構成判断
+### 2.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
 - 現状: `folder_pane/scan_subfolders` perf event で ms / entry 数 / dir 数 / cancel / error を記録済み。
@@ -52,9 +46,9 @@
   - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
 - 優先度: P3。
 
-## 4. 補正 / AI
+## 3. 補正 / AI
 
-### 4.1 local-adjust layers の入場時同期 DB 読み
+### 3.1 local-adjust layers の入場時同期 DB 読み
 
 - 背景: フルスクリーン入場初回フレームで `LocalAdjustDb::get_layers` を同期実行する。
 - 現状: フォルダ open 一括読みを避けるための意図的 tradeoff。
@@ -63,7 +57,7 @@
   - read-only 経路の not-loaded は現状どおり None 返しを維持する。
 - 優先度: P3 monitor。
 
-### 4.2 補正パラメータ変更後に AI アップスケールキャッシュが優先される疑い (再現待ち)
+### 3.2 補正パラメータ変更後に AI アップスケールキャッシュが優先される疑い (再現待ち)
 
 - 背景: 5ch レス 792 の追跡項目。「画像補正パラメータを変更しても AI アップスケールキャッシュが
   優先され、ページを行き来すると変更が効いていないように見える」という報告。
@@ -76,7 +70,7 @@
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
 
-### 4.3 表示トリム / 余白カット
+### 3.3 表示トリム / 余白カット
 
 - 背景: 5ch レス 792-⑥。要望文は「crop 後フィット」だったが、既存の crop は投稿 / 書き出し用の
   「切り取り」で、漫画ビューア用途の「読みながらサクッと余白を詰める」機能とは目的が違う。
@@ -105,9 +99,9 @@
 
 ---
 
-## 5. 入力カスタマイズ / マウス / ゲームパッド
+## 4. 入力カスタマイズ / マウス / ゲームパッド
 
-### 5.1 Shift / Alt + ホイールのカスタマイズ再設計
+### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 
 - 背景: v1.7.0 のリングショートカット / マウスボタン実装中に、Shift / Alt + ホイールのペアバインドを
   追加候補にしたが、実機確認で動画まわりの退行リスクが高いと判断した。
@@ -120,11 +114,48 @@
   現行 UI / 入力経路からは参照しない。
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
 
+### 4.2 ゲームパッド Select の場所リストからレーティング一覧を選べない
+
+- 背景: ゲームパッドの <kbd>Select</kbd> で開く場所リストから、場所▼ / ファイルメニューにはある
+  ★1〜★5 のレーティング一覧ビューを選べない。
+- 現状: `build_gamepad_location_entries` はドライブ一覧 / 読書履歴 / 本棚フォルダ /
+  既知フォルダ / ドライブだけを `GamepadLocationPickerState` に積んでいる。
+  レーティング一覧は `enter_rating_view(stars)` 直呼びのメニュー経路だけで、
+  `GamepadLocationNav` / `AddressBarNav` 側の選択肢になっていない。
+- 方針:
+  - 場所リストに「レーティング一覧」配下、または ★1〜★5 の行を追加し、
+    <kbd>A</kbd> で `enter_rating_view(stars)` と同じ worker 構築経路へ入るようにする。
+  - 件数表示を入れる場合は、既存の `rating_counts_cache` / 無効化規則を流用し、
+    SELECT オーバーレイ描画ごとに SQLite を叩かない。
+  - 検索 / タグビュー / snapshot lock 中の抑止、レーティング一覧表示中の現在行ハイライト、
+    <kbd>B</kbd>/<kbd>Select</kbd> 閉じ、決定後の入力ニュートラル待ちが既存場所リストと同じ挙動か確認する。
+- 優先度: P3。パッドだけでレーティング一覧へ移動する導線の穴埋め。
+
+### 4.3 キーカスタマイズ設定画面 + 競合検出
+
+- 背景: `keymap.ini` / `KeyAction` / `Chord` / exact modifier match の土台はあるが、
+  現状は手書き ini 前提で GUI・競合検出がない。次バージョンでは、まずキーボード割り当ての
+  設定画面を用意し、マウス/ゲームパッドの完全カスタマイズとは分けて小さく実装したい。
+- 方針:
+  - 初期版はキーボードのみ。マウス / ゲームパッドの完全 remap は別設計にする。
+  - `KeyAction` と既存 parser / default chord 定義を正本にし、GUI は `keymap.ini` 互換の
+    上書き内容を書き出す。既存ユーザーの手書き設定を壊さない。
+  - 修飾キーは現行どおり `ModifierHold` の中から選ぶ仕組みを維持する。一般キー hold と
+    modifier hold を混ぜない。
+  - 競合検出は `(context, trigger kind, chord)` を基本にし、同時に有効になり得る context の
+    重なりだけ警告する。Press と Hold は完全同一視せず、同じ物理キーで誤爆しそうな場合は
+    警告として扱う。
+  - 競合時は保存禁止より、NeeView 風に「この割り当てを使うなら既存のどれを外すか」を
+    選べる解消UIを優先する。
+  - 既定値へ戻す、割り当て削除、最大3 chord、未対応/固定操作の説明、手書き ini の読み込みエラー表示を
+    初期UIに含める。
+- 優先度: P2 candidate。入力カスタマイズの需要に対して、既存土台を活かしやすい初期スライス。
+
 ---
 
-## 6. リリース前確認 / 依存更新
+## 5. リリース前確認 / 依存更新
 
-### 6.1 ネイティブ依存
+### 5.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
@@ -133,7 +164,7 @@
 | ONNX Runtime | `ort-sys` 要求 DLL と setup script の VERSION を確認 | C API バージョン一致、`+crt-static` + `load-dynamic` 維持 |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
 
-### 6.2 Rust クレート
+### 5.2 Rust クレート
 
 - 通常の `cargo update` は互換範囲でまとめて実施する。
 - メジャー / rc 脱出は個別判断:
@@ -154,11 +185,12 @@
 
 ---
 
-## 7. 着手時に読み直す関連ドキュメント
+## 6. 着手時に読み直す関連ドキュメント
 
 | 領域 | ドキュメント |
 | --- | --- |
 | UI 同期 I/O / worker 化 | `docs/ui-responsiveness.md`, `docs/async-architecture.md` |
+| サブフォルダ展開 / フラット仮想ビュー | `docs/subfolder-expansion-view-plan.md`, `docs/ui-responsiveness.md`, `docs/async-architecture.md`, `docs/details-view-and-filter-plan.md`, `docs/virtual-folders.md` |
 | ZIP / PDF / 変換アーカイブ | `docs/virtual-folders.md`, `docs/shell-file-operations-context-menu-plan.md` |
 | フォルダ移動 / Ctrl+↑↓ | `docs/fullscreen-navigation-consistency.md`, `docs/keymap-spec.md` |
 | 入力カスタマイズ / マウス / ゲームパッド | `docs/keymap-spec.md`, `docs/key-customization-impl-plan.md`, `docs/ring-shortcut-plan.md` |

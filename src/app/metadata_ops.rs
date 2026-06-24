@@ -111,6 +111,7 @@ pub(crate) enum FacetField {
     Place,
     AiModel,
     AiTool,
+    Rating,
     Tags,
     Date,
     Size,
