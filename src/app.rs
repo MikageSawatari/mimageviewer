@@ -19367,7 +19367,7 @@ impl App {
         }
     }
 
-    fn consume_context_shortcuts_help_key(ctx: &egui::Context) -> bool {
+    pub(crate) fn consume_context_shortcuts_help_key(ctx: &egui::Context) -> bool {
         ctx.input_mut(|i| {
             if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.mac_cmd || i.modifiers.command {
                 return false;
@@ -37590,7 +37590,9 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_whats_new_dialog(ctx);
-        self.show_context_shortcuts_dialog(ctx);
+        if !main_viewer_blocked {
+            self.show_context_shortcuts_dialog(ctx);
+        }
         self.show_toolbar_reset_confirm_dialog(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
         if !main_viewer_blocked {

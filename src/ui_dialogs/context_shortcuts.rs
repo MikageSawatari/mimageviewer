@@ -1,10 +1,13 @@
 //! 現在コンテキストで使えるショートカット一覧の初期ダイアログ。
 //!
-//! 初期スライスではグリッド文脈だけを扱い、keymap 化済みの操作は
-//! `CommandDisplayRow` から、固定扱いのナビゲーションだけを補助行として表示する。
+//! keymap 化済みの操作は `CommandDisplayRow` から、固定扱いのナビゲーションは
+//! コンテキスト別の補助行として表示する。
 
 use crate::app::App;
-use crate::keymap::{CommandDisplayRow, CommandScope, GRID_ACTIVE_SCOPES};
+use crate::grid_item::GridItem;
+use crate::keymap::{
+    CommandDisplayRow, CommandScope, FS_IMAGE_ACTIVE_SCOPES, GRID_ACTIVE_SCOPES, KeyAction,
+};
 use eframe::egui;
 
 struct FixedShortcutRow {
@@ -63,11 +66,87 @@ const GRID_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     },
 ];
 
+const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc / Enter",
+        description: "フルスクリーンを閉じて一覧へ戻る",
+    },
+    FixedShortcutRow {
+        keys: "Backspace",
+        description: "一覧へ戻る。ZIP/PDF 内ページではページ一覧へ戻る",
+    },
+    FixedShortcutRow {
+        keys: "← / → / ↑ / ↓ / マウスホイール",
+        description: "前または次の項目へ移動する",
+    },
+    FixedShortcutRow {
+        keys: "Home / End",
+        description: "先頭または末尾の項目へ移動する",
+    },
+    FixedShortcutRow {
+        keys: "F11",
+        description: "ウィンドウ内表示と全画面表示を切り替える",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+Alt+Shift+D",
+        description: "画像パイプラインのデバッグ出力を保存する",
+    },
+    FixedShortcutRow {
+        keys: "Ctrl+ホイール",
+        description: "ズーム倍率を変更する",
+    },
+];
+
+#[derive(Clone, Copy)]
+enum ShortcutHelpContext {
+    Grid,
+    FsImage,
+}
+
+impl ShortcutHelpContext {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Grid => "サムネイル一覧",
+            Self::FsImage => "画像フルスクリーン",
+        }
+    }
+
+    fn active_scopes(self) -> &'static [CommandScope] {
+        match self {
+            Self::Grid => GRID_ACTIVE_SCOPES,
+            Self::FsImage => FS_IMAGE_ACTIVE_SCOPES,
+        }
+    }
+
+    fn fixed_rows(self) -> &'static [FixedShortcutRow] {
+        match self {
+            Self::Grid => GRID_FIXED_SHORTCUT_ROWS,
+            Self::FsImage => FS_IMAGE_FIXED_SHORTCUT_ROWS,
+        }
+    }
+
+    fn includes_row(self, row: &CommandDisplayRow) -> bool {
+        match self {
+            Self::Grid => true,
+            Self::FsImage => {
+                row.spec.scope != CommandScope::Global
+                    || row.spec.action == KeyAction::ToggleDetachedViewerMode
+            }
+        }
+    }
+}
+
 impl App {
     pub(crate) fn show_context_shortcuts_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_context_shortcuts_help {
             return;
         }
+
+        let help_context = self.current_shortcut_help_context();
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
@@ -75,7 +154,10 @@ impl App {
         let scroll_max_h = (ctx.content_rect().height() - 180.0).min(620.0).max(160.0);
         let rows = self
             .keymap
-            .command_display_rows_for_active_scopes(GRID_ACTIVE_SCOPES, true);
+            .command_display_rows_for_active_scopes(help_context.active_scopes(), true)
+            .into_iter()
+            .filter(|row| help_context.includes_row(row))
+            .collect::<Vec<_>>();
         let mut close_clicked = false;
 
         egui::Window::new("ショートカット")
@@ -86,18 +168,18 @@ impl App {
             .min_width(520.0)
             .default_height(520.0)
             .show(ctx, |ui| {
-                ui.label("現在のコンテキスト: サムネイル一覧");
+                ui.label(format!("現在のコンテキスト: {}", help_context.title()));
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .id_salt("context_shortcuts_scroll")
                     .max_height(scroll_max_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for scope in GRID_ACTIVE_SCOPES {
+                        for scope in help_context.active_scopes() {
                             draw_command_scope_rows(ui, *scope, &rows);
                         }
                         draw_unassigned_command_rows(ui, &rows);
-                        draw_fixed_grid_rows(ui);
+                        draw_fixed_rows(ui, help_context.fixed_rows());
                     });
 
                 ui.add_space(8.0);
@@ -111,6 +193,24 @@ impl App {
         if !open || close_clicked || escape_pressed {
             self.show_context_shortcuts_help = false;
         }
+    }
+
+    fn current_shortcut_help_context(&self) -> ShortcutHelpContext {
+        if let Some(fs_idx) = self.fullscreen_idx
+            && matches!(
+                self.items.get(fs_idx),
+                Some(
+                    GridItem::Image(_)
+                        | GridItem::ZipImage { .. }
+                        | GridItem::PdfPage { .. }
+                        | GridItem::ZipSeparator { .. }
+                )
+            )
+            && !self.is_overlay_edit_mode_active()
+        {
+            return ShortcutHelpContext::FsImage;
+        }
+        ShortcutHelpContext::Grid
     }
 }
 
@@ -164,16 +264,16 @@ fn draw_unassigned_command_rows(ui: &mut egui::Ui, rows: &[CommandDisplayRow]) {
         });
 }
 
-fn draw_fixed_grid_rows(ui: &mut egui::Ui) {
+fn draw_fixed_rows(ui: &mut egui::Ui, rows: &[FixedShortcutRow]) {
     ui.add_space(10.0);
     ui.label(egui::RichText::new("固定キー").strong());
     ui.add_space(2.0);
-    egui::Grid::new("context_shortcuts_grid_fixed")
+    egui::Grid::new(("context_shortcuts_fixed", rows.as_ptr() as usize))
         .num_columns(2)
         .spacing([18.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
-            for row in GRID_FIXED_SHORTCUT_ROWS {
+            for row in rows {
                 ui.monospace(row.keys);
                 ui.label(row.description);
                 ui.end_row();

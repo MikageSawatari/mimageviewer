@@ -5188,6 +5188,10 @@ impl App {
                 // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
                 self.show_editing_addon_dialog(ctx);
 
+                // `?` ヘルプは押された viewport 上に出す。専用フルスクリーン viewport では
+                // メイン側に描くと背面へ隠れるため、フルスクリーン中はこちらで描く。
+                self.show_context_shortcuts_dialog(ctx);
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
             };
@@ -5999,6 +6003,18 @@ impl App {
         if self.fullscreen_embedded_still_active() {
             return !self.pending_return_to_parent;
         }
+        // モーダル表示中に main/root 側へ漏れたキーは背面操作へ流さず捨てる。
+        if self.any_modal_dialog_open_for_fullscreen_keys() {
+            return true;
+        }
+        if !self.ime_input_active()
+            && !self.is_overlay_edit_mode_active()
+            && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && Self::consume_context_shortcuts_help_key(ctx)
+        {
+            self.show_context_shortcuts_help = true;
+            return true;
+        }
         let Some(keys) = fullscreen_shortcut_event_summary(ctx) else {
             return false;
         };
@@ -6343,6 +6359,13 @@ impl App {
         // 選択操作を優先、Codex Phase 5.1 P2 反映)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.fs_context_menu_idx.is_none();
+        if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && !self.ime_input_active()
+            && Self::consume_context_shortcuts_help_key(ctx)
+        {
+            self.show_context_shortcuts_help = true;
+            return action;
+        }
         let video_horizontal_arrow_key = is_video_fs
             && ctx.input(|i| {
                 i.events.iter().any(|event| {
