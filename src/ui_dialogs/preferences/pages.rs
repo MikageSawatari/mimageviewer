@@ -888,41 +888,6 @@ pub(super) fn page_command_settings(
     command_list(ui, state, &keymap, &conflicts);
 }
 
-pub(super) fn draw_operation_command_editor_dialog(
-    ctx: &egui::Context,
-    state: &mut PreferencesState,
-    ime_active: bool,
-) {
-    if !state.command_editor_dialog_open {
-        return;
-    }
-
-    let keymap = Keymap::from_settings(&state.settings.keymap);
-    let conflicts = keymap.binding_conflicts();
-    let mut open = true;
-    egui::Window::new("キー割り当て編集")
-        .open(&mut open)
-        .resizable(true)
-        .collapsible(false)
-        .default_size([560.0, 520.0])
-        .min_width(480.0)
-        .show(ctx, |ui| {
-            if let Some(chord) = state.command_editor_source_chord {
-                command_editor_source_chord_section(ui, state, &keymap, chord);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-            }
-            command_editor(ui, state, &keymap, &conflicts, ime_active);
-        });
-
-    if !open {
-        state.command_editor_dialog_open = false;
-        state.command_editor_source_chord = None;
-        state.command_capture_slot = None;
-    }
-}
-
 pub(super) fn draw_operation_assignment_editor_dialog(
     ctx: &egui::Context,
     state: &mut PreferencesState,
@@ -1519,7 +1484,6 @@ fn open_operation_assignment_editor(
 
 fn close_assignment_editors(state: &mut PreferencesState) {
     state.operation_assignment_editor = None;
-    state.command_editor_dialog_open = false;
     state.command_editor_source_chord = None;
     state.command_capture_slot = None;
 }

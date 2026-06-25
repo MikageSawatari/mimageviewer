@@ -319,7 +319,6 @@ pub(crate) struct PreferencesState {
     pub command_chord_inputs: [String; 3],
     pub command_capture_slot: Option<usize>,
     pub command_edit_error: Option<String>,
-    pub command_editor_dialog_open: bool,
     pub command_editor_source_chord: Option<crate::keymap::Chord>,
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
@@ -540,7 +539,6 @@ impl PreferencesState {
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,
             command_edit_error: None,
-            command_editor_dialog_open: false,
             command_editor_source_chord: None,
             operation_tab: OperationCustomizeTab::Settings,
             operation_settings_tab: OperationSettingsTab::Behavior,
@@ -1254,7 +1252,6 @@ impl App {
             });
 
         if let Some(state) = self.operation_customize_state.as_mut() {
-            draw_operation_command_editor_dialog(ctx, state, ime_active);
             draw_operation_assignment_editor_dialog(ctx, state, ime_active);
             draw_mouse_gesture_recorder_dialog(ctx, state);
         }
