@@ -1006,10 +1006,55 @@ pub enum KeyAction {
     FsAiModelNext,
     FsAiModelPrev,
     FsAiModelReset,
+    FsAiModelAuto,
+    FsAiModelRealEsrganX4Plus,
+    FsAiModelRealEsrganAnime6B,
+    FsAiModelRealCugan4x,
+    FsAiModelNmkdSiax4x,
+    FsAiModelRealEsrGeneralV3,
     FsDenoiseCycle,
     FsPostFilterNext,
     FsPostFilterPrev,
     FsPostFilterReset,
+    FsPostFilterNearest,
+    FsPostFilterCrtSimple,
+    FsPostFilterCrtFull,
+    FsPostFilterCrtArcade,
+    FsPostFilterDither1bit,
+    FsPostFilterGameBoy,
+    FsPostFilterPc98,
+    FsPostFilterGameGear,
+    FsPostFilterFamicom,
+    FsPostFilterMegaDrive,
+    FsPostFilterMsx2Plus,
+    FsPostFilterSfc,
+    FsPostFilterComboFamicomCrt,
+    FsPostFilterComboPc98Crt,
+    FsPostFilterComboMsx2PlusCrt,
+    FsPostFilterComboMegaDriveCrt,
+    FsPostFilterComboSfcCrt,
+    FsPostFilterSepia,
+    FsPostFilterMonoNeutral,
+    FsPostFilterMonoCool,
+    FsPostFilterMonoWarm,
+    FsPostFilterWarmTone,
+    FsPostFilterCoolTone,
+    FsPostFilterTealOrange,
+    FsPostFilterKodakPortra,
+    FsPostFilterFujiVelvia,
+    FsPostFilterBleachBypass,
+    FsPostFilterCrossProcess,
+    FsPostFilterVintage,
+    FsPostFilterFilmGrain,
+    FsPostFilterVignette,
+    FsPostFilterLightLeak,
+    FsPostFilterSoftFocus,
+    FsPostFilterHalftone,
+    FsPostFilterOilPaint,
+    FsPostFilterSketch,
+    FsPostFilterPseudoColor4,
+    FsPostFilterPseudoColorSkin,
+    FsPostFilterSharpen,
     FsAdjustSlot1,
     FsAdjustSlot2,
     FsAdjustSlot3,
@@ -1282,10 +1327,55 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsAiModelNext,
     KeyAction::FsAiModelPrev,
     KeyAction::FsAiModelReset,
+    KeyAction::FsAiModelAuto,
+    KeyAction::FsAiModelRealEsrganX4Plus,
+    KeyAction::FsAiModelRealEsrganAnime6B,
+    KeyAction::FsAiModelRealCugan4x,
+    KeyAction::FsAiModelNmkdSiax4x,
+    KeyAction::FsAiModelRealEsrGeneralV3,
     KeyAction::FsDenoiseCycle,
     KeyAction::FsPostFilterNext,
     KeyAction::FsPostFilterPrev,
     KeyAction::FsPostFilterReset,
+    KeyAction::FsPostFilterNearest,
+    KeyAction::FsPostFilterCrtSimple,
+    KeyAction::FsPostFilterCrtFull,
+    KeyAction::FsPostFilterCrtArcade,
+    KeyAction::FsPostFilterDither1bit,
+    KeyAction::FsPostFilterGameBoy,
+    KeyAction::FsPostFilterPc98,
+    KeyAction::FsPostFilterGameGear,
+    KeyAction::FsPostFilterFamicom,
+    KeyAction::FsPostFilterMegaDrive,
+    KeyAction::FsPostFilterMsx2Plus,
+    KeyAction::FsPostFilterSfc,
+    KeyAction::FsPostFilterComboFamicomCrt,
+    KeyAction::FsPostFilterComboPc98Crt,
+    KeyAction::FsPostFilterComboMsx2PlusCrt,
+    KeyAction::FsPostFilterComboMegaDriveCrt,
+    KeyAction::FsPostFilterComboSfcCrt,
+    KeyAction::FsPostFilterSepia,
+    KeyAction::FsPostFilterMonoNeutral,
+    KeyAction::FsPostFilterMonoCool,
+    KeyAction::FsPostFilterMonoWarm,
+    KeyAction::FsPostFilterWarmTone,
+    KeyAction::FsPostFilterCoolTone,
+    KeyAction::FsPostFilterTealOrange,
+    KeyAction::FsPostFilterKodakPortra,
+    KeyAction::FsPostFilterFujiVelvia,
+    KeyAction::FsPostFilterBleachBypass,
+    KeyAction::FsPostFilterCrossProcess,
+    KeyAction::FsPostFilterVintage,
+    KeyAction::FsPostFilterFilmGrain,
+    KeyAction::FsPostFilterVignette,
+    KeyAction::FsPostFilterLightLeak,
+    KeyAction::FsPostFilterSoftFocus,
+    KeyAction::FsPostFilterHalftone,
+    KeyAction::FsPostFilterOilPaint,
+    KeyAction::FsPostFilterSketch,
+    KeyAction::FsPostFilterPseudoColor4,
+    KeyAction::FsPostFilterPseudoColorSkin,
+    KeyAction::FsPostFilterSharpen,
     KeyAction::FsAdjustSlot1,
     KeyAction::FsAdjustSlot2,
     KeyAction::FsAdjustSlot3,
@@ -2355,10 +2445,55 @@ impl KeyAction {
             FsAiModelNext => "FsAiModelNext",
             FsAiModelPrev => "FsAiModelPrev",
             FsAiModelReset => "FsAiModelReset",
+            FsAiModelAuto => "FsAiModelAuto",
+            FsAiModelRealEsrganX4Plus => "FsAiModelRealEsrganX4Plus",
+            FsAiModelRealEsrganAnime6B => "FsAiModelRealEsrganAnime6B",
+            FsAiModelRealCugan4x => "FsAiModelRealCugan4x",
+            FsAiModelNmkdSiax4x => "FsAiModelNmkdSiax4x",
+            FsAiModelRealEsrGeneralV3 => "FsAiModelRealEsrGeneralV3",
             FsDenoiseCycle => "FsDenoiseCycle",
             FsPostFilterNext => "FsPostFilterNext",
             FsPostFilterPrev => "FsPostFilterPrev",
             FsPostFilterReset => "FsPostFilterReset",
+            FsPostFilterNearest => "FsPostFilterNearest",
+            FsPostFilterCrtSimple => "FsPostFilterCrtSimple",
+            FsPostFilterCrtFull => "FsPostFilterCrtFull",
+            FsPostFilterCrtArcade => "FsPostFilterCrtArcade",
+            FsPostFilterDither1bit => "FsPostFilterDither1bit",
+            FsPostFilterGameBoy => "FsPostFilterGameBoy",
+            FsPostFilterPc98 => "FsPostFilterPc98",
+            FsPostFilterGameGear => "FsPostFilterGameGear",
+            FsPostFilterFamicom => "FsPostFilterFamicom",
+            FsPostFilterMegaDrive => "FsPostFilterMegaDrive",
+            FsPostFilterMsx2Plus => "FsPostFilterMsx2Plus",
+            FsPostFilterSfc => "FsPostFilterSfc",
+            FsPostFilterComboFamicomCrt => "FsPostFilterComboFamicomCrt",
+            FsPostFilterComboPc98Crt => "FsPostFilterComboPc98Crt",
+            FsPostFilterComboMsx2PlusCrt => "FsPostFilterComboMsx2PlusCrt",
+            FsPostFilterComboMegaDriveCrt => "FsPostFilterComboMegaDriveCrt",
+            FsPostFilterComboSfcCrt => "FsPostFilterComboSfcCrt",
+            FsPostFilterSepia => "FsPostFilterSepia",
+            FsPostFilterMonoNeutral => "FsPostFilterMonoNeutral",
+            FsPostFilterMonoCool => "FsPostFilterMonoCool",
+            FsPostFilterMonoWarm => "FsPostFilterMonoWarm",
+            FsPostFilterWarmTone => "FsPostFilterWarmTone",
+            FsPostFilterCoolTone => "FsPostFilterCoolTone",
+            FsPostFilterTealOrange => "FsPostFilterTealOrange",
+            FsPostFilterKodakPortra => "FsPostFilterKodakPortra",
+            FsPostFilterFujiVelvia => "FsPostFilterFujiVelvia",
+            FsPostFilterBleachBypass => "FsPostFilterBleachBypass",
+            FsPostFilterCrossProcess => "FsPostFilterCrossProcess",
+            FsPostFilterVintage => "FsPostFilterVintage",
+            FsPostFilterFilmGrain => "FsPostFilterFilmGrain",
+            FsPostFilterVignette => "FsPostFilterVignette",
+            FsPostFilterLightLeak => "FsPostFilterLightLeak",
+            FsPostFilterSoftFocus => "FsPostFilterSoftFocus",
+            FsPostFilterHalftone => "FsPostFilterHalftone",
+            FsPostFilterOilPaint => "FsPostFilterOilPaint",
+            FsPostFilterSketch => "FsPostFilterSketch",
+            FsPostFilterPseudoColor4 => "FsPostFilterPseudoColor4",
+            FsPostFilterPseudoColorSkin => "FsPostFilterPseudoColorSkin",
+            FsPostFilterSharpen => "FsPostFilterSharpen",
             FsAdjustSlot1 => "FsAdjustSlot1",
             FsAdjustSlot2 => "FsAdjustSlot2",
             FsAdjustSlot3 => "FsAdjustSlot3",
@@ -2666,10 +2801,55 @@ impl KeyAction {
             FsAiModelNext => "AIモデルを次へ切り替える",
             FsAiModelPrev => "AIモデルを前へ切り替える",
             FsAiModelReset => "AIモデルを標準に戻す",
+            FsAiModelAuto => "AIモデルを自動（画像タイプ判別）にする",
+            FsAiModelRealEsrganX4Plus => "AIモデルを写真・CG（ノイズ除去強）にする",
+            FsAiModelRealEsrganAnime6B => "AIモデルをイラスト・アニメにする",
+            FsAiModelRealCugan4x => "AIモデルを漫画（トーン保持）にする",
+            FsAiModelNmkdSiax4x => "AIモデルを写真（質感保持）にする",
+            FsAiModelRealEsrGeneralV3 => "AIモデルを高速汎用にする",
             FsDenoiseCycle => "デノイズ設定を切り替える",
             FsPostFilterNext => "ポストフィルタを次へ切り替える",
             FsPostFilterPrev => "ポストフィルタを前へ切り替える",
             FsPostFilterReset => "ポストフィルタを標準に戻す",
+            FsPostFilterNearest => "ポストフィルタをニアレスト（補間なし）にする",
+            FsPostFilterCrtSimple => "ポストフィルタをCRT シンプル（控えめ）にする",
+            FsPostFilterCrtFull => "ポストフィルタをCRT フル（歪み+強グロー）にする",
+            FsPostFilterCrtArcade => "ポストフィルタをCRT アーケード（高コントラスト）にする",
+            FsPostFilterDither1bit => "ポストフィルタを1bit ディザにする",
+            FsPostFilterGameBoy => "ポストフィルタをGameBoy（緑4階調）にする",
+            FsPostFilterPc98 => "ポストフィルタをPC-98（16色・適応）にする",
+            FsPostFilterGameGear => "ポストフィルタをゲームギア（32色・12bit）にする",
+            FsPostFilterFamicom => "ポストフィルタをファミコン（52色・固定）にする",
+            FsPostFilterMegaDrive => "ポストフィルタをメガドライブ（61色・9bit）にする",
+            FsPostFilterMsx2Plus => "ポストフィルタをMSX2+（256色・GRB）にする",
+            FsPostFilterSfc => "ポストフィルタをスーパーファミコン（256色・15bit）にする",
+            FsPostFilterComboFamicomCrt => "ポストフィルタをCRT × ファミコンにする",
+            FsPostFilterComboPc98Crt => "ポストフィルタをCRT × PC-98にする",
+            FsPostFilterComboMsx2PlusCrt => "ポストフィルタをCRT × MSX2+にする",
+            FsPostFilterComboMegaDriveCrt => "ポストフィルタをCRT × メガドライブにする",
+            FsPostFilterComboSfcCrt => "ポストフィルタをCRT × スーパーファミコンにする",
+            FsPostFilterSepia => "ポストフィルタをセピアにする",
+            FsPostFilterMonoNeutral => "ポストフィルタをモノクロ（ニュートラル）にする",
+            FsPostFilterMonoCool => "ポストフィルタをモノクロ（冷調）にする",
+            FsPostFilterMonoWarm => "ポストフィルタをモノクロ（暖調）にする",
+            FsPostFilterWarmTone => "ポストフィルタを暖色調にする",
+            FsPostFilterCoolTone => "ポストフィルタを寒色調にする",
+            FsPostFilterTealOrange => "ポストフィルタをTeal & Orange（シネマ調）にする",
+            FsPostFilterKodakPortra => "ポストフィルタをKodak Portra 風にする",
+            FsPostFilterFujiVelvia => "ポストフィルタをFuji Velvia 風にする",
+            FsPostFilterBleachBypass => "ポストフィルタをブリーチバイパスにする",
+            FsPostFilterCrossProcess => "ポストフィルタをクロスプロセスにする",
+            FsPostFilterVintage => "ポストフィルタをビンテージ / 褪色にする",
+            FsPostFilterFilmGrain => "ポストフィルタをフィルムグレインにする",
+            FsPostFilterVignette => "ポストフィルタをビネット（周辺減光）にする",
+            FsPostFilterLightLeak => "ポストフィルタをライトリークにする",
+            FsPostFilterSoftFocus => "ポストフィルタをソフトフォーカスにする",
+            FsPostFilterHalftone => "ポストフィルタをハーフトーン（漫画風）にする",
+            FsPostFilterOilPaint => "ポストフィルタをオイルペイント風にする",
+            FsPostFilterSketch => "ポストフィルタをスケッチ風にする",
+            FsPostFilterPseudoColor4 => "ポストフィルタを疑似カラー（4色刷り）にする",
+            FsPostFilterPseudoColorSkin => "ポストフィルタを疑似カラー（肌色）にする",
+            FsPostFilterSharpen => "ポストフィルタをシャープ化にする",
             FsAdjustSlot1 => "補正プリセットスロット1を適用する",
             FsAdjustSlot2 => "補正プリセットスロット2を適用する",
             FsAdjustSlot3 => "補正プリセットスロット3を適用する",
@@ -2934,10 +3114,55 @@ impl KeyAction {
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
+            | FsAiModelAuto
+            | FsAiModelRealEsrganX4Plus
+            | FsAiModelRealEsrganAnime6B
+            | FsAiModelRealCugan4x
+            | FsAiModelNmkdSiax4x
+            | FsAiModelRealEsrGeneralV3
             | FsDenoiseCycle
             | FsPostFilterNext
             | FsPostFilterPrev
             | FsPostFilterReset
+            | FsPostFilterNearest
+            | FsPostFilterCrtSimple
+            | FsPostFilterCrtFull
+            | FsPostFilterCrtArcade
+            | FsPostFilterDither1bit
+            | FsPostFilterGameBoy
+            | FsPostFilterPc98
+            | FsPostFilterGameGear
+            | FsPostFilterFamicom
+            | FsPostFilterMegaDrive
+            | FsPostFilterMsx2Plus
+            | FsPostFilterSfc
+            | FsPostFilterComboFamicomCrt
+            | FsPostFilterComboPc98Crt
+            | FsPostFilterComboMsx2PlusCrt
+            | FsPostFilterComboMegaDriveCrt
+            | FsPostFilterComboSfcCrt
+            | FsPostFilterSepia
+            | FsPostFilterMonoNeutral
+            | FsPostFilterMonoCool
+            | FsPostFilterMonoWarm
+            | FsPostFilterWarmTone
+            | FsPostFilterCoolTone
+            | FsPostFilterTealOrange
+            | FsPostFilterKodakPortra
+            | FsPostFilterFujiVelvia
+            | FsPostFilterBleachBypass
+            | FsPostFilterCrossProcess
+            | FsPostFilterVintage
+            | FsPostFilterFilmGrain
+            | FsPostFilterVignette
+            | FsPostFilterLightLeak
+            | FsPostFilterSoftFocus
+            | FsPostFilterHalftone
+            | FsPostFilterOilPaint
+            | FsPostFilterSketch
+            | FsPostFilterPseudoColor4
+            | FsPostFilterPseudoColorSkin
+            | FsPostFilterSharpen
             | FsAdjustSlot1
             | FsAdjustSlot2
             | FsAdjustSlot3
@@ -3157,10 +3382,55 @@ impl KeyAction {
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
+            | FsAiModelAuto
+            | FsAiModelRealEsrganX4Plus
+            | FsAiModelRealEsrganAnime6B
+            | FsAiModelRealCugan4x
+            | FsAiModelNmkdSiax4x
+            | FsAiModelRealEsrGeneralV3
             | FsDenoiseCycle
             | FsPostFilterNext
             | FsPostFilterPrev
             | FsPostFilterReset
+            | FsPostFilterNearest
+            | FsPostFilterCrtSimple
+            | FsPostFilterCrtFull
+            | FsPostFilterCrtArcade
+            | FsPostFilterDither1bit
+            | FsPostFilterGameBoy
+            | FsPostFilterPc98
+            | FsPostFilterGameGear
+            | FsPostFilterFamicom
+            | FsPostFilterMegaDrive
+            | FsPostFilterMsx2Plus
+            | FsPostFilterSfc
+            | FsPostFilterComboFamicomCrt
+            | FsPostFilterComboPc98Crt
+            | FsPostFilterComboMsx2PlusCrt
+            | FsPostFilterComboMegaDriveCrt
+            | FsPostFilterComboSfcCrt
+            | FsPostFilterSepia
+            | FsPostFilterMonoNeutral
+            | FsPostFilterMonoCool
+            | FsPostFilterMonoWarm
+            | FsPostFilterWarmTone
+            | FsPostFilterCoolTone
+            | FsPostFilterTealOrange
+            | FsPostFilterKodakPortra
+            | FsPostFilterFujiVelvia
+            | FsPostFilterBleachBypass
+            | FsPostFilterCrossProcess
+            | FsPostFilterVintage
+            | FsPostFilterFilmGrain
+            | FsPostFilterVignette
+            | FsPostFilterLightLeak
+            | FsPostFilterSoftFocus
+            | FsPostFilterHalftone
+            | FsPostFilterOilPaint
+            | FsPostFilterSketch
+            | FsPostFilterPseudoColor4
+            | FsPostFilterPseudoColorSkin
+            | FsPostFilterSharpen
             | FsAdjustSlot1
             | FsAdjustSlot2
             | FsAdjustSlot3
@@ -3434,10 +3704,55 @@ impl KeyAction {
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
+            FsAiModelAuto
+            | FsAiModelRealEsrganX4Plus
+            | FsAiModelRealEsrganAnime6B
+            | FsAiModelRealCugan4x
+            | FsAiModelNmkdSiax4x
+            | FsAiModelRealEsrGeneralV3 => ChordList::EMPTY,
             FsDenoiseCycle => ChordList::one(Chord::key(N)),
             FsPostFilterNext => ChordList::one(Chord::key(T)),
             FsPostFilterPrev => ChordList::one(Chord::shift(T)),
             FsPostFilterReset => ChordList::one(Chord::alt(T)),
+            FsPostFilterNearest
+            | FsPostFilterCrtSimple
+            | FsPostFilterCrtFull
+            | FsPostFilterCrtArcade
+            | FsPostFilterDither1bit
+            | FsPostFilterGameBoy
+            | FsPostFilterPc98
+            | FsPostFilterGameGear
+            | FsPostFilterFamicom
+            | FsPostFilterMegaDrive
+            | FsPostFilterMsx2Plus
+            | FsPostFilterSfc
+            | FsPostFilterComboFamicomCrt
+            | FsPostFilterComboPc98Crt
+            | FsPostFilterComboMsx2PlusCrt
+            | FsPostFilterComboMegaDriveCrt
+            | FsPostFilterComboSfcCrt
+            | FsPostFilterSepia
+            | FsPostFilterMonoNeutral
+            | FsPostFilterMonoCool
+            | FsPostFilterMonoWarm
+            | FsPostFilterWarmTone
+            | FsPostFilterCoolTone
+            | FsPostFilterTealOrange
+            | FsPostFilterKodakPortra
+            | FsPostFilterFujiVelvia
+            | FsPostFilterBleachBypass
+            | FsPostFilterCrossProcess
+            | FsPostFilterVintage
+            | FsPostFilterFilmGrain
+            | FsPostFilterVignette
+            | FsPostFilterLightLeak
+            | FsPostFilterSoftFocus
+            | FsPostFilterHalftone
+            | FsPostFilterOilPaint
+            | FsPostFilterSketch
+            | FsPostFilterPseudoColor4
+            | FsPostFilterPseudoColorSkin
+            | FsPostFilterSharpen => ChordList::EMPTY,
             FsAdjustSlot1 => ChordList::one(Chord::ctrl(Num1)),
             FsAdjustSlot2 => ChordList::one(Chord::ctrl(Num2)),
             FsAdjustSlot3 => ChordList::one(Chord::ctrl(Num3)),
@@ -6069,6 +6384,64 @@ mod tests {
         ] {
             assert_eq!(action.context(), KeyContext::FsImage);
             assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
+    }
+
+    #[test]
+    fn fullscreen_ai_and_post_filter_direct_actions_are_unassigned_image_commands() {
+        let actions = [
+            KeyAction::FsAiModelAuto,
+            KeyAction::FsAiModelRealEsrganX4Plus,
+            KeyAction::FsAiModelRealEsrganAnime6B,
+            KeyAction::FsAiModelRealCugan4x,
+            KeyAction::FsAiModelNmkdSiax4x,
+            KeyAction::FsAiModelRealEsrGeneralV3,
+            KeyAction::FsPostFilterNearest,
+            KeyAction::FsPostFilterCrtSimple,
+            KeyAction::FsPostFilterCrtFull,
+            KeyAction::FsPostFilterCrtArcade,
+            KeyAction::FsPostFilterDither1bit,
+            KeyAction::FsPostFilterGameBoy,
+            KeyAction::FsPostFilterPc98,
+            KeyAction::FsPostFilterGameGear,
+            KeyAction::FsPostFilterFamicom,
+            KeyAction::FsPostFilterMegaDrive,
+            KeyAction::FsPostFilterMsx2Plus,
+            KeyAction::FsPostFilterSfc,
+            KeyAction::FsPostFilterComboFamicomCrt,
+            KeyAction::FsPostFilterComboPc98Crt,
+            KeyAction::FsPostFilterComboMsx2PlusCrt,
+            KeyAction::FsPostFilterComboMegaDriveCrt,
+            KeyAction::FsPostFilterComboSfcCrt,
+            KeyAction::FsPostFilterSepia,
+            KeyAction::FsPostFilterMonoNeutral,
+            KeyAction::FsPostFilterMonoCool,
+            KeyAction::FsPostFilterMonoWarm,
+            KeyAction::FsPostFilterWarmTone,
+            KeyAction::FsPostFilterCoolTone,
+            KeyAction::FsPostFilterTealOrange,
+            KeyAction::FsPostFilterKodakPortra,
+            KeyAction::FsPostFilterFujiVelvia,
+            KeyAction::FsPostFilterBleachBypass,
+            KeyAction::FsPostFilterCrossProcess,
+            KeyAction::FsPostFilterVintage,
+            KeyAction::FsPostFilterFilmGrain,
+            KeyAction::FsPostFilterVignette,
+            KeyAction::FsPostFilterLightLeak,
+            KeyAction::FsPostFilterSoftFocus,
+            KeyAction::FsPostFilterHalftone,
+            KeyAction::FsPostFilterOilPaint,
+            KeyAction::FsPostFilterSketch,
+            KeyAction::FsPostFilterPseudoColor4,
+            KeyAction::FsPostFilterPseudoColorSkin,
+            KeyAction::FsPostFilterSharpen,
+        ];
+
+        for action in actions {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty(), "{action:?}");
+            assert!(action.is_user_facing(), "{action:?}");
         }
     }
 

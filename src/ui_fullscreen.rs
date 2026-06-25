@@ -21,6 +21,8 @@
 use eframe::egui;
 use std::sync::Arc;
 
+use crate::adjustment::PostFilter;
+use crate::ai::ModelKind;
 use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -43,6 +45,105 @@ enum BookAddMode {
     Grid,
     Fullscreen,
 }
+
+const FS_AI_MODEL_DIRECT_ACTIONS: &[(KeyAction, Option<&str>, &str)] = &[
+    (
+        KeyAction::FsAiModelAuto,
+        Some("auto"),
+        "自動 (画像タイプ判別)",
+    ),
+    (
+        KeyAction::FsAiModelRealEsrganX4Plus,
+        Some("realesrgan_x4plus"),
+        "写真・CG (ノイズ除去強)",
+    ),
+    (
+        KeyAction::FsAiModelRealEsrganAnime6B,
+        Some("realesrgan_anime6b"),
+        "イラスト・アニメ",
+    ),
+    (
+        KeyAction::FsAiModelRealCugan4x,
+        Some("realcugan_4x"),
+        "漫画 (トーン保持)",
+    ),
+    (
+        KeyAction::FsAiModelNmkdSiax4x,
+        Some("nmkd_siax_4x"),
+        "写真 (質感保持)",
+    ),
+    (
+        KeyAction::FsAiModelRealEsrGeneralV3,
+        Some("realesr_general_v3"),
+        "高速汎用",
+    ),
+];
+
+const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
+    (KeyAction::FsPostFilterNearest, PostFilter::Nearest),
+    (KeyAction::FsPostFilterCrtSimple, PostFilter::CrtSimple),
+    (KeyAction::FsPostFilterCrtFull, PostFilter::CrtFull),
+    (KeyAction::FsPostFilterCrtArcade, PostFilter::CrtArcade),
+    (KeyAction::FsPostFilterDither1bit, PostFilter::Dither1bit),
+    (KeyAction::FsPostFilterGameBoy, PostFilter::GameBoy),
+    (KeyAction::FsPostFilterPc98, PostFilter::Pc98),
+    (KeyAction::FsPostFilterGameGear, PostFilter::GameGear),
+    (KeyAction::FsPostFilterFamicom, PostFilter::Famicom),
+    (KeyAction::FsPostFilterMegaDrive, PostFilter::MegaDrive),
+    (KeyAction::FsPostFilterMsx2Plus, PostFilter::Msx2Plus),
+    (KeyAction::FsPostFilterSfc, PostFilter::Sfc),
+    (
+        KeyAction::FsPostFilterComboFamicomCrt,
+        PostFilter::ComboFamicomCrt,
+    ),
+    (
+        KeyAction::FsPostFilterComboPc98Crt,
+        PostFilter::ComboPc98Crt,
+    ),
+    (
+        KeyAction::FsPostFilterComboMsx2PlusCrt,
+        PostFilter::ComboMsx2PlusCrt,
+    ),
+    (
+        KeyAction::FsPostFilterComboMegaDriveCrt,
+        PostFilter::ComboMegaDriveCrt,
+    ),
+    (KeyAction::FsPostFilterComboSfcCrt, PostFilter::ComboSfcCrt),
+    (KeyAction::FsPostFilterSepia, PostFilter::Sepia),
+    (KeyAction::FsPostFilterMonoNeutral, PostFilter::MonoNeutral),
+    (KeyAction::FsPostFilterMonoCool, PostFilter::MonoCool),
+    (KeyAction::FsPostFilterMonoWarm, PostFilter::MonoWarm),
+    (KeyAction::FsPostFilterWarmTone, PostFilter::WarmTone),
+    (KeyAction::FsPostFilterCoolTone, PostFilter::CoolTone),
+    (KeyAction::FsPostFilterTealOrange, PostFilter::TealOrange),
+    (KeyAction::FsPostFilterKodakPortra, PostFilter::KodakPortra),
+    (KeyAction::FsPostFilterFujiVelvia, PostFilter::FujiVelvia),
+    (
+        KeyAction::FsPostFilterBleachBypass,
+        PostFilter::BleachBypass,
+    ),
+    (
+        KeyAction::FsPostFilterCrossProcess,
+        PostFilter::CrossProcess,
+    ),
+    (KeyAction::FsPostFilterVintage, PostFilter::Vintage),
+    (KeyAction::FsPostFilterFilmGrain, PostFilter::FilmGrain),
+    (KeyAction::FsPostFilterVignette, PostFilter::Vignette),
+    (KeyAction::FsPostFilterLightLeak, PostFilter::LightLeak),
+    (KeyAction::FsPostFilterSoftFocus, PostFilter::SoftFocus),
+    (KeyAction::FsPostFilterHalftone, PostFilter::Halftone),
+    (KeyAction::FsPostFilterOilPaint, PostFilter::OilPaint),
+    (KeyAction::FsPostFilterSketch, PostFilter::Sketch),
+    (
+        KeyAction::FsPostFilterPseudoColor4,
+        PostFilter::PseudoColor4,
+    ),
+    (
+        KeyAction::FsPostFilterPseudoColorSkin,
+        PostFilter::PseudoColorSkin,
+    ),
+    (KeyAction::FsPostFilterSharpen, PostFilter::Sharpen),
+];
 
 const BOOK_GRID_VIDEO_HINT: &str = "動画は再生中に追加操作を行うと、そのフレームを本へ追加できます";
 const BOOK_IMAGE_PROCESSING_HINT: &str = "画像処理中です。処理完了後にもう1度操作してください。";
@@ -6083,6 +6184,114 @@ impl App {
         true
     }
 
+    fn apply_fullscreen_ai_model_selection(
+        &mut self,
+        fs_idx: usize,
+        model_key: Option<&'static str>,
+        label: &'static str,
+        shortcut_label: &'static str,
+    ) {
+        if !self.reading_flow.is_paged() {
+            return;
+        }
+        let allowed = match model_key {
+            None => true,
+            Some("auto") => !matches!(
+                self.settings.ai_feature_mode,
+                crate::settings::AiFeatureMode::Disabled
+            ),
+            Some(key) => ModelKind::from_str(key)
+                .is_some_and(|kind| self.settings.ai_feature_mode.allows_upscale_model(kind)),
+        };
+        if !allowed {
+            self.show_feedback_toast(format!(
+                "[{shortcut_label}:アップスケール]\nこの AI モード ({}) では {} を使いません",
+                self.settings.ai_feature_mode.label(),
+                label
+            ));
+            return;
+        }
+        let scope = self.resolve_adjust_scope(fs_idx);
+        let mut params = self.effective_params(fs_idx).clone();
+        if params.upscale_model.as_deref() == model_key {
+            self.show_feedback_toast(format!(
+                "[{shortcut_label}:{}アップスケール {}]",
+                scope.label(),
+                label
+            ));
+            return;
+        }
+        params.upscale_model = model_key.map(|s| s.to_string());
+
+        // 切替先がアップスケール有効で、かつ画像サイズが
+        // `ai_upscale_size_limit` のサイズ上限以上なら処理がスキップされる。
+        // 「切り替えたのに見た目が変わらない」違和感を避けるため
+        // トーストに 2 行目で明示する。
+        let mut toast = format!(
+            "[{shortcut_label}:{}アップスケール {}]",
+            scope.label(),
+            label
+        );
+        if model_key.is_some()
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx)
+        {
+            let w = pixels.size[0] as u32;
+            let h = pixels.size[1] as u32;
+            let limit = self.settings.ai_upscale_limit();
+            if !crate::ai::upscale::should_process_rect(w, h, limit) {
+                toast.push_str(&format!(
+                    "\n(解像度が高いためアップスケール処理無効: {w}×{h} は上限 {} 未満の範囲外)",
+                    limit.label()
+                ));
+            }
+        }
+        self.show_feedback_toast(toast);
+        self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
+            app.write_params_for_scope(fs_idx, scope, params);
+            app.clear_all_adjustment_and_ai_caches(fs_idx);
+        });
+    }
+
+    fn apply_fullscreen_post_filter_selection(
+        &mut self,
+        fs_idx: usize,
+        next: PostFilter,
+        shortcut_label: &'static str,
+    ) {
+        if !self.reading_flow.is_paged() {
+            return;
+        }
+        let scope = self.resolve_adjust_scope(fs_idx);
+        let old_params = self.effective_params(fs_idx).clone();
+        if old_params.post_filter == next {
+            self.show_feedback_toast(format!(
+                "[{shortcut_label}: {} / {}]",
+                scope.label(),
+                next.display_label()
+            ));
+            return;
+        }
+        let mut params = old_params.clone();
+        params.post_filter = next;
+        self.show_feedback_toast(format!(
+            "[{shortcut_label}: {} / {}]",
+            scope.label(),
+            next.display_label()
+        ));
+        self.capture_adjust_full(
+            format!("ポストフィルタ: {}", next.display_label()),
+            |app| {
+                app.write_params_for_scope(fs_idx, scope, params.clone());
+                match scope {
+                    AdjustScope::PageOverride => {
+                        app.clear_caches_for_param_change(fs_idx, &old_params, &params)
+                    }
+                    AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
+                }
+            },
+        );
+    }
+
     /// フルスクリーンのキー入力を処理し、アクションを返す。
     fn handle_fs_key_input(
         &mut self,
@@ -6768,20 +6977,47 @@ impl App {
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
         // Shift/Alt を伴う入力まで吸収する。具体的な修飾子から先に consume する必要がある。
-        let key_u_alt = self.keymap.consume_action(ctx, KeyAction::FsAiModelReset);
-        let key_u_shift = self.keymap.consume_action(ctx, KeyAction::FsAiModelPrev);
-        let key_u = self.keymap.consume_action(ctx, KeyAction::FsAiModelNext);
+        let ai_direct_model = (!current_item_is_video)
+            .then(|| {
+                FS_AI_MODEL_DIRECT_ACTIONS
+                    .iter()
+                    .find_map(|(action, key, label)| {
+                        self.keymap
+                            .consume_action(ctx, *action)
+                            .then_some((*key, *label))
+                    })
+            })
+            .flatten();
+        let key_u_alt =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsAiModelReset);
+        let key_u_shift =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsAiModelPrev);
+        let key_u =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsAiModelNext);
         // N キー: AI デノイズサイクル
-        let key_n = self.keymap.consume_action(ctx, KeyAction::FsDenoiseCycle);
+        let key_n =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsDenoiseCycle);
         // T / Shift+T / Alt+T: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
         // P はグリッド / 動画フルスクリーンのピン留めに統一する。F は動画の FPS/Perf 表示に
         // 使っているため、ポストフィルタは T (Tone / posT filter) に割り当てる。
         // 同様に Alt+T → Shift+T → T の順で consume (matches_logically 対策)。
-        let key_t_alt = self
-            .keymap
-            .consume_action(ctx, KeyAction::FsPostFilterReset);
-        let key_t_shift = self.keymap.consume_action(ctx, KeyAction::FsPostFilterPrev);
-        let key_t = self.keymap.consume_action(ctx, KeyAction::FsPostFilterNext);
+        let post_filter_direct = (!current_item_is_video)
+            .then(|| {
+                FS_POST_FILTER_DIRECT_ACTIONS
+                    .iter()
+                    .find_map(|(action, filter)| {
+                        self.keymap.consume_action(ctx, *action).then_some(*filter)
+                    })
+            })
+            .flatten();
+        let key_t_alt = !current_item_is_video
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsPostFilterReset);
+        let key_t_shift =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPostFilterPrev);
+        let key_t =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPostFilterNext);
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
@@ -6857,17 +7093,18 @@ impl App {
 
         // U キー: AI アップスケールモデルをサイクル
         // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
-        if (key_u || key_u_shift || key_u_alt) && self.reading_flow.is_paged() {
-            let mut params = self.effective_params(fs_idx).clone();
+        if let Some((model_key, label)) = ai_direct_model {
+            self.apply_fullscreen_ai_model_selection(fs_idx, model_key, label, "AI");
+        } else if (key_u || key_u_shift || key_u_alt) && self.reading_flow.is_paged() {
             let items =
                 crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
-            let cur = items
-                .iter()
-                .position(|(_, k)| match (k, params.upscale_model.as_deref()) {
+            let cur = items.iter().position(|(_, k)| {
+                match (k, self.effective_params(fs_idx).upscale_model.as_deref()) {
                     (None, None) => true,
                     (Some(a), Some(b)) => *a == b,
                     _ => false,
-                });
+                }
+            });
             // 制限モードでは保存済みモデルを潰さない:
             //   - Disabled は「なし」のみ (= items.len() <= 1) で循環の意味が無い。
             //   - 保存済みモデルがこの AI モードのメニューに無い (cur=None) ときは、
@@ -6879,7 +7116,6 @@ impl App {
                     self.settings.ai_feature_mode.label()
                 ));
             } else {
-                let scope = self.resolve_adjust_scope(fs_idx);
                 let cur = cur.unwrap_or(0);
                 let next = if key_u_alt {
                     0
@@ -6889,31 +7125,7 @@ impl App {
                     (cur + 1) % items.len()
                 };
                 let (label, key) = items[next];
-                params.upscale_model = key.map(|s| s.to_string());
-                // 切替先がアップスケール **有効** で、かつ画像サイズが
-                // `ai_upscale_size_limit` のサイズ上限以上なら処理がスキップされる。
-                // 「切り替えたのに見た目が変わらない」違和感を避けるため
-                // トーストに 2 行目で明示する。
-                let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
-                if key.is_some()
-                    && let Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) =
-                        self.fs_cache.get(&fs_idx)
-                {
-                    let w = pixels.size[0] as u32;
-                    let h = pixels.size[1] as u32;
-                    let limit = self.settings.ai_upscale_limit();
-                    if !crate::ai::upscale::should_process_rect(w, h, limit) {
-                        toast.push_str(&format!(
-                            "\n(解像度が高いためアップスケール処理無効: {w}×{h} は上限 {} 未満の範囲外)",
-                            limit.label()
-                        ));
-                    }
-                }
-                self.show_feedback_toast(toast);
-                self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
-                    app.write_params_for_scope(fs_idx, scope, params);
-                    app.clear_all_adjustment_and_ai_caches(fs_idx);
-                });
+                self.apply_fullscreen_ai_model_selection(fs_idx, key, label, "U");
             }
         }
 
@@ -6945,14 +7157,13 @@ impl App {
         // T / Shift+T / Alt+T: ポストフィルタの次/前/なしへ切替。
         // post_filter は final AI の後段なので、差分分類 (clear_caches_for_param_change)
         // 経由で final AI cache を保持したまま final composite だけ作り直す。
-        if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
-            let scope = self.resolve_adjust_scope(fs_idx);
-            let old_params = self.effective_params(fs_idx).clone();
-            let mut params = old_params.clone();
-            let all = crate::adjustment::PostFilter::ALL;
+        if let Some(filter) = post_filter_direct {
+            self.apply_fullscreen_post_filter_selection(fs_idx, filter, "PF");
+        } else if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
+            let all = PostFilter::ALL;
             let cur = all
                 .iter()
-                .position(|f| *f == params.post_filter)
+                .position(|f| *f == self.effective_params(fs_idx).post_filter)
                 .unwrap_or(0);
             let next_idx = if key_t_alt {
                 0
@@ -6962,20 +7173,7 @@ impl App {
                 (cur + 1) % all.len()
             };
             let next = all[next_idx];
-            params.post_filter = next;
-            self.show_feedback_toast(format!("[T: {} / {}]", scope.label(), next.display_label()));
-            self.capture_adjust_full(
-                format!("ポストフィルタ: {}", next.display_label()),
-                |app| {
-                    app.write_params_for_scope(fs_idx, scope, params.clone());
-                    match scope {
-                        AdjustScope::PageOverride => {
-                            app.clear_caches_for_param_change(fs_idx, &old_params, &params)
-                        }
-                        AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
-                    }
-                },
-            );
+            self.apply_fullscreen_post_filter_selection(fs_idx, next, "T");
         }
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)

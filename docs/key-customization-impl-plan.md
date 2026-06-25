@@ -531,8 +531,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
 - FsSpreadSingle/L/LCover/R/RCover `1`..`5` (P) ★
 - FsReadingFlowCycle `6` (P) ★ / FsReadingDirectionToggle `7` (P) ★ / FsFitModeCycle `0` (P) ★
-- FsAiModelNext `U` / Prev `Shift+U` / Reset `Alt+U` ★ / FsDenoiseCycle `N` ★
-- FsPostFilterNext `T` / Prev `Shift+T` / Reset `Alt+T` ★
+- FsAiModelNext `U` / Prev `Shift+U` / Reset `Alt+U` ★ / FsAiModelAuto・各モデル直接切替 (既定未割り当て) ★ / FsDenoiseCycle `N` ★
+- FsPostFilterNext `T` / Prev `Shift+T` / Reset `Alt+T` ★ / 各ポストフィルタ直接切替 (既定未割り当て) ★
 - FsAdjustSlot1..10 `Ctrl+1`..`Ctrl+0` (P) ★ / FsClearAdjust `Ctrl+Backspace` ★
 - FsPin `P` ★ / FsApplyErase1/2 `F7/F8` / FsApplyConceal1/2 `F9/F10`
   (family・予約候補)

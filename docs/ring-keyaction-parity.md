@@ -7,7 +7,7 @@
 
 ## 背景
 
-`RingActionId` (106 variant, `src/ring_shortcut.rs`) と `KeyAction` (273 variant, `src/keymap.rs`)
+`RingActionId` (106 variant, `src/ring_shortcut.rs`) と `KeyAction` (318 variant, `src/keymap.rs`)
 を意味対応で突き合わせたところ、一部の操作が **ring/パッドには割り当てられるのにキーボードには
 割り当てられない**状態だった。キー側はハードコードの生キー処理で取り残されており、
 
