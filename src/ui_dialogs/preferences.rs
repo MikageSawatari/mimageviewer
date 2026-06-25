@@ -631,6 +631,7 @@ impl App {
                 // 右パネルは solid スクロールバーで実幅を確保する。既定の floating
                 // スクロールバーは本文上に重なるため、右端ボタンや区切り線が読みにくくなる。
                 right_ui.spacing_mut().scroll = pref_panel_scroll_style();
+                let mut command_capture_waiting = false;
                 egui::ScrollArea::vertical()
                     .id_salt("pref_panel")
                     .scroll_bar_visibility(
@@ -640,6 +641,7 @@ impl App {
                     .max_height(main_height)
                     .show(&mut right_ui, |ui| {
                         ui.set_width(ui.available_width());
+                        command_capture_waiting = state.command_capture_slot.is_some();
                         draw_page(ui, state, enter_pressed);
                     });
 
@@ -651,7 +653,7 @@ impl App {
                 ui.add_space(4.0);
 
                 // Esc でキャンセル (IME 変換中はスキップ)
-                if escape_pressed {
+                if escape_pressed && !command_capture_waiting {
                     cancel = true;
                 }
 
