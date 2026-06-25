@@ -579,6 +579,7 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                 }
                 if ui.small_button("キー編集").clicked() {
                     select_command_action(state, action);
+                    state.operation_keyboard_context = Some(action.context());
                     state.operation_tab = OperationCustomizeTab::Keyboard;
                 }
                 ui.end_row();
@@ -816,6 +817,7 @@ fn command_conflict_summary(
                         .clicked()
                     {
                         select_command_action(state, conflict.action);
+                        state.operation_keyboard_context = Some(conflict.action.context());
                         state.operation_tab = OperationCustomizeTab::Keyboard;
                     }
                     if let Some(other) = conflict.other_action {
@@ -825,6 +827,7 @@ fn command_conflict_summary(
                             .clicked()
                         {
                             select_command_action(state, other);
+                            state.operation_keyboard_context = Some(other.context());
                             state.operation_tab = OperationCustomizeTab::Keyboard;
                         }
                     } else {
@@ -859,6 +862,11 @@ fn command_list(
             ui.end_row();
 
             for &action in KeyAction::all() {
+                if let Some(context) = state.operation_keyboard_context
+                    && action.context() != context
+                {
+                    continue;
+                }
                 if !command_action_matches_filter(action, &filter) {
                     continue;
                 }

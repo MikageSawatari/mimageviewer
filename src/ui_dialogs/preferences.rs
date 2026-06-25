@@ -263,6 +263,7 @@ pub(crate) struct PreferencesState {
     pub command_edit_error: Option<String>,
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
+    pub operation_keyboard_context: Option<crate::keymap::KeyContext>,
     pub operation_ring_context: RingShortcutContext,
     pub operation_mouse_gesture_context: RightDragContext,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
@@ -475,6 +476,7 @@ impl PreferencesState {
             command_edit_error: None,
             operation_tab: OperationCustomizeTab::Settings,
             operation_settings_tab: OperationSettingsTab::Behavior,
+            operation_keyboard_context: None,
             operation_ring_context: RingShortcutContext::Grid,
             operation_mouse_gesture_context: RightDragContext::Grid,
             exif_collapsed_groups: HashSet::new(),
@@ -1368,6 +1370,8 @@ fn draw_operation_customize_page(
             page_ring_shortcut_assignments(ui, state, context);
         }
         OperationCustomizeTab::Keyboard => {
+            draw_keyboard_context_tabs(ui, state);
+            ui.add_space(8.0);
             ui.small("キー割り当てを編集します。キーボード図からの選択 UI は後続で追加します。");
             ui.add_space(8.0);
             page_command_settings(ui, state, ime_active);
@@ -1387,6 +1391,39 @@ fn draw_operation_customize_page(
             page_ring_shortcut_assignments(ui, state, context);
         }
     }
+}
+
+fn draw_keyboard_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::keymap::KeyContext;
+
+    const CONTEXTS: &[Option<KeyContext>] = &[
+        None,
+        Some(KeyContext::Global),
+        Some(KeyContext::Grid),
+        Some(KeyContext::FsCommon),
+        Some(KeyContext::Rating),
+        Some(KeyContext::FsImage),
+        Some(KeyContext::FsVideo),
+        Some(KeyContext::Erase),
+        Some(KeyContext::Conceal),
+        Some(KeyContext::Crop),
+        Some(KeyContext::Text),
+        Some(KeyContext::LocalAdjust),
+    ];
+
+    ui.horizontal_wrapped(|ui| {
+        for &context in CONTEXTS {
+            let label = context.map_or("すべて", KeyContext::description);
+            if ui
+                .selectable_label(state.operation_keyboard_context == context, label)
+                .clicked()
+            {
+                state.operation_keyboard_context = context;
+                state.command_capture_slot = None;
+                state.command_edit_error = None;
+            }
+        }
+    });
 }
 
 fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState) {
