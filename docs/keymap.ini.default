@@ -54,6 +54,8 @@
 # GlobalOpenFolder = Ctrl+O ; フォルダを開くダイアログを表示する
 # ToggleDetachedViewerMode = F12 ; 画像・動画ビューアの別ウィンドウモードを切り替える
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
+
+[Grid] ; サムネイル一覧
 # GlobalFavoritePrev = none ; 前のお気に入りへ移動する
 # GlobalFavoriteNext = none ; 次のお気に入りへ移動する
 # GlobalOpenFavorite1 = none ; お気に入り1を開く
@@ -111,8 +113,6 @@
 # GlobalOpenLocationDesktop = none ; デスクトップを開く
 # GlobalOpenLocationPictures = none ; ピクチャを開く
 # GlobalOpenLocationDownloads = none ; ダウンロードを開く
-
-[Grid] ; サムネイル一覧
 # GridSelectAll = Ctrl+A ; 表示中のチェック可能な項目をすべてチェックする
 # GridDeselect.1 = Ctrl+D ; チェックをすべて解除する
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する

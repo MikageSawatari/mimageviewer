@@ -2737,8 +2737,8 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
-            | HelpShowContextShortcuts
-            | GlobalFavoritePrev
+            | HelpShowContextShortcuts => KeyContext::Global,
+            GlobalFavoritePrev
             | GlobalFavoriteNext
             | GlobalOpenFavorite1
             | GlobalOpenFavorite2
@@ -2794,8 +2794,8 @@ impl KeyAction {
             | GlobalOpenLocationBooksRoot
             | GlobalOpenLocationDesktop
             | GlobalOpenLocationPictures
-            | GlobalOpenLocationDownloads => KeyContext::Global,
-            GridSelectAll
+            | GlobalOpenLocationDownloads
+            | GridSelectAll
             | GridDeselect
             | GridToggleCheck
             | GridDelete
@@ -5881,7 +5881,7 @@ mod tests {
     }
 
     #[test]
-    fn location_navigation_actions_are_global_and_default_unassigned() {
+    fn location_navigation_actions_are_grid_scoped_and_default_unassigned() {
         assert_eq!(
             KeyAction::GlobalOpenFavorite1.favorite_slot_number(),
             Some(1)
@@ -5910,11 +5910,36 @@ mod tests {
         );
 
         for action in GLOBAL_LOCATION_NAVIGATION_ACTIONS {
-            assert_eq!(action.context(), KeyContext::Global);
+            assert_eq!(action.context(), KeyContext::Grid);
             assert_eq!(action.trigger(), KeyTrigger::Press);
             assert!(action.default_chords().is_empty());
             assert!(action.is_location_navigation_action());
         }
+    }
+
+    #[test]
+    fn grid_location_shortcuts_do_not_overlap_fullscreen_compare_defaults() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GlobalOpenFavorite1 = X
+            "#,
+        );
+        let conflicts = keymap.binding_conflicts();
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::Hard
+                && conflict.chord == Chord::key(KeyName::X)
+                && (conflict.action == KeyAction::GlobalOpenFavorite1
+                    && conflict.other_action == Some(KeyAction::GridComparePin)
+                    || conflict.action == KeyAction::GridComparePin
+                        && conflict.other_action == Some(KeyAction::GlobalOpenFavorite1))
+        }));
+        assert!(!conflicts.iter().any(|conflict| {
+            conflict.action == KeyAction::FsCompareToggle
+                || conflict.other_action == Some(KeyAction::FsCompareToggle)
+                || conflict.action == KeyAction::VideoCompareToggle
+                || conflict.other_action == Some(KeyAction::VideoCompareToggle)
+        }));
     }
 
     #[test]

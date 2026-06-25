@@ -2058,7 +2058,8 @@ fn command_conflict_summary(
 
                 for conflict in conflicts {
                     ui.monospace(conflict.chord.display_name());
-                    ui.label(binding_conflict_kind_label(conflict.kind));
+                    ui.label(binding_conflict_kind_label(conflict.kind))
+                        .on_hover_text(binding_conflict_kind_help(conflict.kind));
                     if ui
                         .button(compact_key_action_label(conflict.action))
                         .on_hover_text(format!(
@@ -2316,7 +2317,8 @@ fn command_editor_for_action(
         for conflict in related {
             ui.horizontal(|ui| {
                 ui.monospace(conflict.chord.display_name());
-                ui.label(binding_conflict_kind_label(conflict.kind));
+                ui.label(binding_conflict_kind_label(conflict.kind))
+                    .on_hover_text(binding_conflict_kind_help(conflict.kind));
                 let other = if conflict.action == action {
                     conflict.other_action
                 } else {
@@ -2499,6 +2501,23 @@ fn binding_conflict_kind_label(kind: BindingConflictKind) -> &'static str {
         BindingConflictKind::ActiveOverlap => "同時有効",
         BindingConflictKind::TriggerMismatch => "種類違い",
         BindingConflictKind::Reserved => "固定キー",
+    }
+}
+
+fn binding_conflict_kind_help(kind: BindingConflictKind) -> &'static str {
+    match kind {
+        BindingConflictKind::Hard => {
+            "同じ文脈の操作に同じキーが割り当てられています。同時には使い分けできないため、処理順で先に判定された操作が優先されます。"
+        }
+        BindingConflictKind::ActiveOverlap => {
+            "別の文脈の操作ですが、同じ画面で同時に有効になる可能性があります。必要に応じて片方を別キーに変更してください。"
+        }
+        BindingConflictKind::TriggerMismatch => {
+            "同じキーが、押下・長押し・修飾キー長押しなど別の種類の入力に割り当てられています。意図しない反応になる場合があります。"
+        }
+        BindingConflictKind::Reserved => {
+            "Esc / Enter / 修飾なし矢印など、固定操作として扱うキーへの割り当てです。固定操作が優先される場合があります。"
+        }
     }
 }
 
