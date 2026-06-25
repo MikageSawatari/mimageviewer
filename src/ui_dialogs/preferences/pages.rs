@@ -523,7 +523,7 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
 }
 
 pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。編集は各タブから行います。");
+    ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。左端のボタンで、この画面の下部に編集欄を開きます。");
     ui.add_space(8.0);
 
     let keymap = Keymap::from_settings(&state.settings.keymap);
@@ -533,28 +533,27 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
     ui.add_space(12.0);
     let conflicted = conflicted_actions(&conflicts);
     egui::Grid::new("operation_command_overview_actions")
-        .num_columns(8)
+        .num_columns(5)
         .spacing([10.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
+            ui.strong("編集");
             ui.strong("操作");
             ui.strong("場所");
-            ui.strong("キー");
-            ui.strong("リング");
-            ui.strong("マウス");
-            ui.strong("パッド");
+            ui.strong("割り当て");
             ui.strong("状態");
-            ui.strong("");
             ui.end_row();
 
             for &action in KeyAction::all() {
-                ui.label(action.description())
-                    .on_hover_text(action.ini_name());
+                if ui.small_button("キー").clicked() {
+                    select_command_action(state, action);
+                    state.operation_keyboard_context = Some(action.context());
+                    state.operation_overview_editor = Some(OperationOverviewEditor::Keyboard);
+                }
+                ui.label(compact_key_action_label(action))
+                    .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
                 ui.label(action.context().description());
-                assignment_label(ui, &keymap.chord_labels(action));
-                dash_label(ui);
-                dash_label(ui);
-                dash_label(ui);
+                assignment_summary(ui, &[("キー", keymap.chord_labels(action))]);
                 let overridden = state
                     .settings
                     .keymap
@@ -577,11 +576,6 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                     };
                     ui.label(egui::RichText::new(status.join(" / ")).color(color));
                 }
-                if ui.small_button("キー編集").clicked() {
-                    select_command_action(state, action);
-                    state.operation_keyboard_context = Some(action.context());
-                    state.operation_tab = OperationCustomizeTab::Keyboard;
-                }
                 ui.end_row();
             }
 
@@ -599,33 +593,157 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                         context,
                         &action,
                     );
-                    ui.label(action.label_for_context(context))
-                        .on_hover_text(action.as_str());
-                    ui.label(context.label());
-                    dash_label(ui);
-                    assignment_label(ui, &ring);
-                    assignment_label(ui, &mouse);
-                    assignment_label(ui, &pad);
-                    if ring.is_empty() && mouse.is_empty() && pad.is_empty() {
-                        ui.label(egui::RichText::new("未設定").weak());
-                    } else {
-                        ui.label("設定あり");
-                    }
+                    let assigned = !ring.is_empty() || !mouse.is_empty() || !pad.is_empty();
                     ui.horizontal(|ui| {
                         if ui.small_button("リング/パッド").clicked() {
                             state.operation_ring_context = context;
-                            state.operation_tab = OperationCustomizeTab::RingShortcut;
+                            state.operation_overview_editor =
+                                Some(OperationOverviewEditor::RingShortcut(context));
+                        }
+                        if ui.small_button("進/戻").clicked() {
+                            state.operation_overview_editor =
+                                Some(OperationOverviewEditor::MouseButtons(context));
                         }
                         if ui.small_button("マウス").clicked() {
-                            state.operation_mouse_gesture_context =
-                                right_drag_context_for_ring_context(context);
-                            state.operation_tab = OperationCustomizeTab::MouseGesture;
+                            let right_drag_context = right_drag_context_for_ring_context(context);
+                            state.operation_mouse_gesture_context = right_drag_context;
+                            state.operation_overview_editor =
+                                Some(OperationOverviewEditor::MouseGesture(right_drag_context));
                         }
                     });
+                    ui.label(action.label_for_context(context))
+                        .on_hover_text(format!(
+                            "{}\n{}",
+                            ring_action_detail_label(&action, context),
+                            action.as_str()
+                        ));
+                    ui.label(context.label());
+                    assignment_summary(ui, &[("リング", ring), ("マウス", mouse), ("パッド", pad)]);
+                    if assigned {
+                        ui.label("設定あり");
+                    } else {
+                        ui.label(egui::RichText::new("未設定").weak());
+                    }
                     ui.end_row();
                 }
             }
         });
+
+    if let Some(editor) = state.operation_overview_editor {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        match editor {
+            OperationOverviewEditor::Keyboard => {
+                keyboard_chord_picker(ui, state, &keymap);
+                ui.add_space(8.0);
+                command_editor(ui, state, &keymap, &conflicts, false);
+            }
+            OperationOverviewEditor::RingShortcut(context) => {
+                ui.label(
+                    egui::RichText::new(format!("{} のリング / パッド", context.label())).strong(),
+                );
+                page_ring_shortcut_assignments(ui, state, context);
+            }
+            OperationOverviewEditor::MouseGesture(context) => {
+                ui.label(
+                    egui::RichText::new(format!("{} のマウスジェスチャ", context.label())).strong(),
+                );
+                page_mouse_gesture_bindings(ui, state, context);
+            }
+            OperationOverviewEditor::MouseButtons(context) => {
+                ui.label(
+                    egui::RichText::new(format!("{} のマウス進む / 戻る", context.label()))
+                        .strong(),
+                );
+                mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, context);
+            }
+        }
+    }
+}
+
+fn compact_key_action_label(action: KeyAction) -> String {
+    let desc = action.description();
+    let label = match action {
+        KeyAction::GlobalLocalSearch => "現在地フィルタ",
+        KeyAction::GlobalFavSearch => "コンテナ検索",
+        KeyAction::GlobalMetadataSearch => "アイテム検索",
+        KeyAction::GlobalOpenFolder => "フォルダを開く",
+        KeyAction::ToggleDetachedViewerMode => "別ウィンドウ",
+        KeyAction::HelpShowContextShortcuts => "ショートカット一覧",
+        KeyAction::GridSelectAll => "表示中を全チェック",
+        _ => desc,
+    };
+    compact_operation_label(label)
+}
+
+fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
+    match action {
+        RingActionId::GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
+        _ => action.label_for_context(context),
+    }
+}
+
+fn compact_operation_label(label: &str) -> String {
+    let mut compact = label
+        .replace("選択中またはチェック済みの", "")
+        .replace("選択中またはチェック済み画像の", "")
+        .replace("選択中またはチェック済み画像に", "")
+        .replace("現在の表示画像を", "")
+        .replace("現在の動画フレームを", "")
+        .replace("現在の動画を", "")
+        .replace("現在の再生位置を", "")
+        .replace("現在の画像または動画に", "")
+        .replace("現在の画像または動画の", "")
+        .replace("現在のフォルダまたはZIP/PDF本体に", "")
+        .replace("現在のフォルダまたはZIP/PDF本体の", "")
+        .replace("現在の画像の", "")
+        .replace("現在の画像を", "")
+        .replace("現在の項目を", "")
+        .replace("現在のページを", "")
+        .replace("現在ページの", "")
+        .replace("現在ページに", "")
+        .replace("選択中の画像を", "")
+        .replace("選択中の項目を", "")
+        .replace("選択中の", "")
+        .replace("表示中の", "");
+    for suffix in [
+        "を切り替える",
+        "に切り替える",
+        "を表示する",
+        "を開始または終了する",
+        "を開始または確定する",
+        "する",
+    ] {
+        if compact.ends_with(suffix) {
+            let len = compact.len() - suffix.len();
+            compact.truncate(len);
+            break;
+        }
+    }
+    let compact = compact.trim();
+    if compact.chars().count() <= 18 {
+        compact.to_string()
+    } else {
+        let mut out: String = compact.chars().take(17).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
+    ui.vertical(|ui| {
+        for (label, values) in groups {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{label}:")).weak());
+                if values.is_empty() {
+                    ui.label(egui::RichText::new("-").weak());
+                } else {
+                    ui.label(values.join(" / "));
+                }
+            });
+        }
+    });
 }
 
 pub(super) fn page_command_settings(
@@ -884,18 +1002,6 @@ fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, c
     }
 }
 
-fn dash_label(ui: &mut egui::Ui) {
-    ui.label(egui::RichText::new("-").weak());
-}
-
-fn assignment_label(ui: &mut egui::Ui, labels: &[String]) {
-    if labels.is_empty() {
-        dash_label(ui);
-    } else {
-        ui.label(labels.join(" / "));
-    }
-}
-
 fn push_unique_label(labels: &mut Vec<String>, label: String) {
     if !labels.contains(&label) {
         labels.push(label);
@@ -1032,7 +1138,7 @@ fn command_conflict_summary(
                     {
                         select_command_action(state, conflict.action);
                         state.operation_keyboard_context = Some(conflict.action.context());
-                        state.operation_tab = OperationCustomizeTab::Keyboard;
+                        state.operation_overview_editor = Some(OperationOverviewEditor::Keyboard);
                     }
                     if let Some(other) = conflict.other_action {
                         if ui
@@ -1042,7 +1148,7 @@ fn command_conflict_summary(
                         {
                             select_command_action(state, other);
                             state.operation_keyboard_context = Some(other.context());
-                            state.operation_tab = OperationCustomizeTab::Keyboard;
+                            state.operation_overview_editor = Some(OperationOverviewEditor::Keyboard);
                         }
                     } else {
                         ui.label(conflict.reserved_name.unwrap_or("固定キー"));
@@ -1092,8 +1198,8 @@ fn command_list(
                     select_command_action(state, action);
                 }
 
-                ui.label(action.ini_name())
-                    .on_hover_text(action.description());
+                ui.label(compact_key_action_label(action))
+                    .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
 
                 let labels = keymap.chord_labels(action);
                 if labels.is_empty() {

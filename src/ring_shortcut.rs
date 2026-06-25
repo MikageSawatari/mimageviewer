@@ -577,7 +577,7 @@ impl RingActionId {
             Self::GridToggleDetails => "表示/詳細",
             Self::GridToggleSnapshotLock => "★固定",
             Self::GridToggleCheck => "チェック ON/OFF",
-            Self::GridSelectAll => "全選択",
+            Self::GridSelectAll => "表示中を全チェック",
             Self::GridHistoryBack => "フォルダ履歴 戻る",
             Self::GridHistoryForward => "フォルダ履歴 進む",
             Self::GridParentFolder => "親フォルダへ",

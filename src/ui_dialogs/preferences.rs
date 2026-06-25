@@ -148,6 +148,7 @@ impl OperationCustomizeTab {
 pub(crate) enum OperationSettingsTab {
     Behavior,
     RightDrag,
+    MouseButtons,
 }
 
 impl OperationSettingsTab {
@@ -155,8 +156,17 @@ impl OperationSettingsTab {
         match self {
             Self::Behavior => "動作",
             Self::RightDrag => "右ドラッグ",
+            Self::MouseButtons => "マウス進む/戻る",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationOverviewEditor {
+    Keyboard,
+    RingShortcut(RingShortcutContext),
+    MouseGesture(RightDragContext),
+    MouseButtons(RingShortcutContext),
 }
 
 // ── ツリーカテゴリ定義 ──────────────────────────────────────────
@@ -263,6 +273,7 @@ pub(crate) struct PreferencesState {
     pub command_edit_error: Option<String>,
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
+    pub operation_overview_editor: Option<OperationOverviewEditor>,
     pub operation_keyboard_context: Option<crate::keymap::KeyContext>,
     pub operation_keyboard_ctrl: bool,
     pub operation_keyboard_shift: bool,
@@ -479,6 +490,7 @@ impl PreferencesState {
             command_edit_error: None,
             operation_tab: OperationCustomizeTab::Settings,
             operation_settings_tab: OperationSettingsTab::Behavior,
+            operation_overview_editor: None,
             operation_keyboard_context: None,
             operation_keyboard_ctrl: false,
             operation_keyboard_shift: false,
@@ -1437,6 +1449,7 @@ fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState)
         for tab in [
             OperationSettingsTab::Behavior,
             OperationSettingsTab::RightDrag,
+            OperationSettingsTab::MouseButtons,
         ] {
             if ui
                 .selectable_label(state.operation_settings_tab == tab, tab.label())
@@ -1449,14 +1462,8 @@ fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState)
     ui.add_space(8.0);
     match state.operation_settings_tab {
         OperationSettingsTab::Behavior => page_operation_behavior(ui, state),
-        OperationSettingsTab::RightDrag => {
-            page_right_drag_modes(ui, state);
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("マウス戻る / 進むボタン").strong());
-            page_mouse_buttons(ui, state);
-        }
+        OperationSettingsTab::RightDrag => page_right_drag_modes(ui, state),
+        OperationSettingsTab::MouseButtons => page_mouse_buttons(ui, state),
     }
 }
 
