@@ -2101,6 +2101,16 @@ impl KeyAction {
         ALL_ACTIONS
     }
 
+    pub fn is_user_facing(self) -> bool {
+        !matches!(
+            self,
+            KeyAction::VideoCompareToggle
+                | KeyAction::VideoCompareCycle
+                | KeyAction::VideoCompareWipe
+                | KeyAction::VideoCompareDiff
+        )
+    }
+
     pub fn favorite_slot_action(slot: usize) -> Option<Self> {
         FAVORITE_LOCATION_ACTIONS.get(slot.checked_sub(1)?).copied()
     }
@@ -3984,6 +3994,7 @@ impl Keymap {
         command_catalog()
             .filter(|spec| active_scopes.contains(&spec.scope))
             .filter(|spec| spec.action != KeyAction::HelpShowContextShortcuts)
+            .filter(|spec| spec.action.is_user_facing())
             .filter_map(|spec| {
                 let shortcut_labels = self.chord_labels(spec.action);
                 if shortcut_labels.is_empty() && !include_unassigned {
@@ -4073,6 +4084,8 @@ impl Keymap {
             for second in bindings.iter().copied().skip(i + 1) {
                 if first.chord != second.chord
                     || first.action == second.action
+                    || !first.action.is_user_facing()
+                    || !second.action.is_user_facing()
                     || !command_scopes_overlap(first.scope, second.scope)
                     || !(first.customized || second.customized)
                 {
@@ -4102,7 +4115,7 @@ impl Keymap {
         for binding in bindings
             .iter()
             .copied()
-            .filter(|binding| binding.customized)
+            .filter(|binding| binding.customized && binding.action.is_user_facing())
         {
             for reserved in RESERVED_BINDINGS {
                 if binding.chord == reserved.chord {
@@ -4562,7 +4575,7 @@ impl Keymap {
             for action in KeyAction::all()
                 .iter()
                 .copied()
-                .filter(|action| action.context() == section)
+                .filter(|action| action.context() == section && action.is_user_facing())
             {
                 let description = action.description();
                 let defaults: Vec<String> = action

@@ -279,10 +279,6 @@
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する
 # VideoCapture = Ctrl+S ; 現在の動画フレームをキャプチャ保存する
 # VideoAddToActiveBook = Ctrl+B ; 現在の動画フレームを追加先の本へ追加する
-# VideoCompareToggle = X ; 動画では比較表示キーを何もしない操作として消費する
-# VideoCompareCycle = C ; 動画では比較切り替えキーを何もしない操作として消費する
-# VideoCompareWipe = Shift+C ; 動画ではワイプ比較キーを何もしない操作として消費する
-# VideoCompareDiff = Alt+C ; 動画では差分比較キーを何もしない操作として消費する
 
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する

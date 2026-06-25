@@ -626,7 +626,10 @@ fn command_overview_rows(
     conflicted: &HashSet<KeyAction>,
 ) -> Vec<OperationOverviewRow> {
     let mut rows = Vec::new();
-    for &action in KeyAction::all() {
+    for &action in KeyAction::all()
+        .iter()
+        .filter(|action| action.is_user_facing())
+    {
         let overridden = state
             .settings
             .keymap
@@ -886,6 +889,7 @@ fn ring_action_has_key_action(context: RingShortcutContext, action: &RingActionI
     KeyAction::all()
         .iter()
         .copied()
+        .filter(|action| action.is_user_facing())
         .flat_map(ring_bindings_for_key_action)
         .any(|(binding_context, binding_action)| {
             binding_context == context && binding_action == *action
@@ -1598,7 +1602,10 @@ fn command_editor_source_chord_section(
                 .spacing([8.0, 3.0])
                 .striped(true)
                 .show(ui, |ui| {
-                    for &action in KeyAction::all() {
+                    for &action in KeyAction::all()
+                        .iter()
+                        .filter(|action| action.is_user_facing())
+                    {
                         if let Some(context) = state.operation_keyboard_context
                             && action.context() != context
                         {
@@ -1849,7 +1856,10 @@ fn keyboard_chord_tooltip(
 ) -> String {
     let mut lines = vec![chord.display_name()];
     let mut matches = Vec::new();
-    for &action in KeyAction::all() {
+    for &action in KeyAction::all()
+        .iter()
+        .filter(|action| action.is_user_facing())
+    {
         if let Some(context) = context_filter
             && action.context() != context
         {
@@ -1898,6 +1908,7 @@ fn actions_for_chord(
     KeyAction::all()
         .iter()
         .copied()
+        .filter(|action| action.is_user_facing())
         .filter(|action| {
             context_filter.is_none_or(|context| action.context() == context)
                 && keymap.effective_chords(*action).contains(&chord)
@@ -2117,7 +2128,10 @@ fn command_list(
             ui.strong("状態");
             ui.end_row();
 
-            for &action in KeyAction::all() {
+            for &action in KeyAction::all()
+                .iter()
+                .filter(|action| action.is_user_facing())
+            {
                 if let Some(context) = state.operation_keyboard_context
                     && action.context() != context
                 {
