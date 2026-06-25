@@ -430,6 +430,61 @@ pub enum RingActionId {
     ToggleWindowMode,
     ToggleMaximize,
     CycleFavorite,
+    OpenFavorite1,
+    OpenFavorite2,
+    OpenFavorite3,
+    OpenFavorite4,
+    OpenFavorite5,
+    OpenFavorite6,
+    OpenFavorite7,
+    OpenFavorite8,
+    OpenFavorite9,
+    OpenFavorite10,
+    OpenFavorite11,
+    OpenFavorite12,
+    OpenFavorite13,
+    OpenFavorite14,
+    OpenFavorite15,
+    OpenFavorite16,
+    OpenFavorite17,
+    OpenFavorite18,
+    OpenFavorite19,
+    OpenFavorite20,
+    OpenDriveC,
+    OpenDriveD,
+    OpenDriveE,
+    OpenDriveF,
+    OpenDriveG,
+    OpenDriveH,
+    OpenDriveI,
+    OpenDriveJ,
+    OpenDriveK,
+    OpenDriveL,
+    OpenDriveM,
+    OpenDriveN,
+    OpenDriveO,
+    OpenDriveP,
+    OpenDriveQ,
+    OpenDriveR,
+    OpenDriveS,
+    OpenDriveT,
+    OpenDriveU,
+    OpenDriveV,
+    OpenDriveW,
+    OpenDriveX,
+    OpenDriveY,
+    OpenDriveZ,
+    OpenLocationDriveList,
+    OpenLocationReadingHistory,
+    OpenLocationRating1,
+    OpenLocationRating2,
+    OpenLocationRating3,
+    OpenLocationRating4,
+    OpenLocationRating5,
+    OpenLocationBooksRoot,
+    OpenLocationDesktop,
+    OpenLocationPictures,
+    OpenLocationDownloads,
     GridToggleDetails,
     GridToggleSnapshotLock,
     GridToggleCheck,
@@ -477,7 +532,271 @@ pub enum RingActionId {
 }
 
 impl RingActionId {
+    const FAVORITE_SLOT_STRINGS: [&'static str; 20] = [
+        "open_favorite_1",
+        "open_favorite_2",
+        "open_favorite_3",
+        "open_favorite_4",
+        "open_favorite_5",
+        "open_favorite_6",
+        "open_favorite_7",
+        "open_favorite_8",
+        "open_favorite_9",
+        "open_favorite_10",
+        "open_favorite_11",
+        "open_favorite_12",
+        "open_favorite_13",
+        "open_favorite_14",
+        "open_favorite_15",
+        "open_favorite_16",
+        "open_favorite_17",
+        "open_favorite_18",
+        "open_favorite_19",
+        "open_favorite_20",
+    ];
+
+    const FAVORITE_SLOT_LABELS: [&'static str; 20] = [
+        "お気に入り 1",
+        "お気に入り 2",
+        "お気に入り 3",
+        "お気に入り 4",
+        "お気に入り 5",
+        "お気に入り 6",
+        "お気に入り 7",
+        "お気に入り 8",
+        "お気に入り 9",
+        "お気に入り 10",
+        "お気に入り 11",
+        "お気に入り 12",
+        "お気に入り 13",
+        "お気に入り 14",
+        "お気に入り 15",
+        "お気に入り 16",
+        "お気に入り 17",
+        "お気に入り 18",
+        "お気に入り 19",
+        "お気に入り 20",
+    ];
+
+    const DRIVE_STRINGS: [&'static str; 24] = [
+        "open_drive_c",
+        "open_drive_d",
+        "open_drive_e",
+        "open_drive_f",
+        "open_drive_g",
+        "open_drive_h",
+        "open_drive_i",
+        "open_drive_j",
+        "open_drive_k",
+        "open_drive_l",
+        "open_drive_m",
+        "open_drive_n",
+        "open_drive_o",
+        "open_drive_p",
+        "open_drive_q",
+        "open_drive_r",
+        "open_drive_s",
+        "open_drive_t",
+        "open_drive_u",
+        "open_drive_v",
+        "open_drive_w",
+        "open_drive_x",
+        "open_drive_y",
+        "open_drive_z",
+    ];
+
+    const DRIVE_LABELS: [&'static str; 24] = [
+        "C:\\を開く",
+        "D:\\を開く",
+        "E:\\を開く",
+        "F:\\を開く",
+        "G:\\を開く",
+        "H:\\を開く",
+        "I:\\を開く",
+        "J:\\を開く",
+        "K:\\を開く",
+        "L:\\を開く",
+        "M:\\を開く",
+        "N:\\を開く",
+        "O:\\を開く",
+        "P:\\を開く",
+        "Q:\\を開く",
+        "R:\\を開く",
+        "S:\\を開く",
+        "T:\\を開く",
+        "U:\\を開く",
+        "V:\\を開く",
+        "W:\\を開く",
+        "X:\\を開く",
+        "Y:\\を開く",
+        "Z:\\を開く",
+    ];
+
+    pub fn favorite_slot_action(slot: usize) -> Option<Self> {
+        Some(match slot {
+            1 => Self::OpenFavorite1,
+            2 => Self::OpenFavorite2,
+            3 => Self::OpenFavorite3,
+            4 => Self::OpenFavorite4,
+            5 => Self::OpenFavorite5,
+            6 => Self::OpenFavorite6,
+            7 => Self::OpenFavorite7,
+            8 => Self::OpenFavorite8,
+            9 => Self::OpenFavorite9,
+            10 => Self::OpenFavorite10,
+            11 => Self::OpenFavorite11,
+            12 => Self::OpenFavorite12,
+            13 => Self::OpenFavorite13,
+            14 => Self::OpenFavorite14,
+            15 => Self::OpenFavorite15,
+            16 => Self::OpenFavorite16,
+            17 => Self::OpenFavorite17,
+            18 => Self::OpenFavorite18,
+            19 => Self::OpenFavorite19,
+            20 => Self::OpenFavorite20,
+            _ => return None,
+        })
+    }
+
+    pub fn favorite_slot_number(&self) -> Option<usize> {
+        match self {
+            Self::OpenFavorite1 => Some(1),
+            Self::OpenFavorite2 => Some(2),
+            Self::OpenFavorite3 => Some(3),
+            Self::OpenFavorite4 => Some(4),
+            Self::OpenFavorite5 => Some(5),
+            Self::OpenFavorite6 => Some(6),
+            Self::OpenFavorite7 => Some(7),
+            Self::OpenFavorite8 => Some(8),
+            Self::OpenFavorite9 => Some(9),
+            Self::OpenFavorite10 => Some(10),
+            Self::OpenFavorite11 => Some(11),
+            Self::OpenFavorite12 => Some(12),
+            Self::OpenFavorite13 => Some(13),
+            Self::OpenFavorite14 => Some(14),
+            Self::OpenFavorite15 => Some(15),
+            Self::OpenFavorite16 => Some(16),
+            Self::OpenFavorite17 => Some(17),
+            Self::OpenFavorite18 => Some(18),
+            Self::OpenFavorite19 => Some(19),
+            Self::OpenFavorite20 => Some(20),
+            _ => None,
+        }
+    }
+
+    pub fn drive_action(letter: char) -> Option<Self> {
+        Some(match letter.to_ascii_uppercase() {
+            'C' => Self::OpenDriveC,
+            'D' => Self::OpenDriveD,
+            'E' => Self::OpenDriveE,
+            'F' => Self::OpenDriveF,
+            'G' => Self::OpenDriveG,
+            'H' => Self::OpenDriveH,
+            'I' => Self::OpenDriveI,
+            'J' => Self::OpenDriveJ,
+            'K' => Self::OpenDriveK,
+            'L' => Self::OpenDriveL,
+            'M' => Self::OpenDriveM,
+            'N' => Self::OpenDriveN,
+            'O' => Self::OpenDriveO,
+            'P' => Self::OpenDriveP,
+            'Q' => Self::OpenDriveQ,
+            'R' => Self::OpenDriveR,
+            'S' => Self::OpenDriveS,
+            'T' => Self::OpenDriveT,
+            'U' => Self::OpenDriveU,
+            'V' => Self::OpenDriveV,
+            'W' => Self::OpenDriveW,
+            'X' => Self::OpenDriveX,
+            'Y' => Self::OpenDriveY,
+            'Z' => Self::OpenDriveZ,
+            _ => return None,
+        })
+    }
+
+    pub fn drive_letter(&self) -> Option<char> {
+        match self {
+            Self::OpenDriveC => Some('C'),
+            Self::OpenDriveD => Some('D'),
+            Self::OpenDriveE => Some('E'),
+            Self::OpenDriveF => Some('F'),
+            Self::OpenDriveG => Some('G'),
+            Self::OpenDriveH => Some('H'),
+            Self::OpenDriveI => Some('I'),
+            Self::OpenDriveJ => Some('J'),
+            Self::OpenDriveK => Some('K'),
+            Self::OpenDriveL => Some('L'),
+            Self::OpenDriveM => Some('M'),
+            Self::OpenDriveN => Some('N'),
+            Self::OpenDriveO => Some('O'),
+            Self::OpenDriveP => Some('P'),
+            Self::OpenDriveQ => Some('Q'),
+            Self::OpenDriveR => Some('R'),
+            Self::OpenDriveS => Some('S'),
+            Self::OpenDriveT => Some('T'),
+            Self::OpenDriveU => Some('U'),
+            Self::OpenDriveV => Some('V'),
+            Self::OpenDriveW => Some('W'),
+            Self::OpenDriveX => Some('X'),
+            Self::OpenDriveY => Some('Y'),
+            Self::OpenDriveZ => Some('Z'),
+            _ => None,
+        }
+    }
+
+    pub fn location_rating_stars(&self) -> Option<u8> {
+        match self {
+            Self::OpenLocationRating1 => Some(1),
+            Self::OpenLocationRating2 => Some(2),
+            Self::OpenLocationRating3 => Some(3),
+            Self::OpenLocationRating4 => Some(4),
+            Self::OpenLocationRating5 => Some(5),
+            _ => None,
+        }
+    }
+
+    fn is_location_navigation_action(&self) -> bool {
+        self.favorite_slot_number().is_some()
+            || self.drive_letter().is_some()
+            || self.location_rating_stars().is_some()
+            || matches!(
+                self,
+                Self::OpenLocationDriveList
+                    | Self::OpenLocationReadingHistory
+                    | Self::OpenLocationBooksRoot
+                    | Self::OpenLocationDesktop
+                    | Self::OpenLocationPictures
+                    | Self::OpenLocationDownloads
+            )
+    }
+
+    fn location_navigation_actions() -> Vec<Self> {
+        let mut actions = Vec::with_capacity(20 + 24 + 11);
+        actions.extend((1..=20).filter_map(Self::favorite_slot_action));
+        actions.extend(('C'..='Z').filter_map(Self::drive_action));
+        actions.extend([
+            Self::OpenLocationDriveList,
+            Self::OpenLocationReadingHistory,
+            Self::OpenLocationRating1,
+            Self::OpenLocationRating2,
+            Self::OpenLocationRating3,
+            Self::OpenLocationRating4,
+            Self::OpenLocationRating5,
+            Self::OpenLocationBooksRoot,
+            Self::OpenLocationDesktop,
+            Self::OpenLocationPictures,
+            Self::OpenLocationDownloads,
+        ]);
+        actions
+    }
+
     pub fn as_str(&self) -> &str {
+        if let Some(slot) = self.favorite_slot_number() {
+            return Self::FAVORITE_SLOT_STRINGS[slot - 1];
+        }
+        if let Some(letter) = self.drive_letter() {
+            return Self::DRIVE_STRINGS[(letter as u8 - b'C') as usize];
+        }
         match self {
             Self::None => "none",
             Self::AddToBook => "add_to_book",
@@ -486,6 +805,61 @@ impl RingActionId {
             Self::ToggleWindowMode => "toggle_window_mode",
             Self::ToggleMaximize => "toggle_maximize",
             Self::CycleFavorite => "cycle_favorite",
+            Self::OpenFavorite1
+            | Self::OpenFavorite2
+            | Self::OpenFavorite3
+            | Self::OpenFavorite4
+            | Self::OpenFavorite5
+            | Self::OpenFavorite6
+            | Self::OpenFavorite7
+            | Self::OpenFavorite8
+            | Self::OpenFavorite9
+            | Self::OpenFavorite10
+            | Self::OpenFavorite11
+            | Self::OpenFavorite12
+            | Self::OpenFavorite13
+            | Self::OpenFavorite14
+            | Self::OpenFavorite15
+            | Self::OpenFavorite16
+            | Self::OpenFavorite17
+            | Self::OpenFavorite18
+            | Self::OpenFavorite19
+            | Self::OpenFavorite20
+            | Self::OpenDriveC
+            | Self::OpenDriveD
+            | Self::OpenDriveE
+            | Self::OpenDriveF
+            | Self::OpenDriveG
+            | Self::OpenDriveH
+            | Self::OpenDriveI
+            | Self::OpenDriveJ
+            | Self::OpenDriveK
+            | Self::OpenDriveL
+            | Self::OpenDriveM
+            | Self::OpenDriveN
+            | Self::OpenDriveO
+            | Self::OpenDriveP
+            | Self::OpenDriveQ
+            | Self::OpenDriveR
+            | Self::OpenDriveS
+            | Self::OpenDriveT
+            | Self::OpenDriveU
+            | Self::OpenDriveV
+            | Self::OpenDriveW
+            | Self::OpenDriveX
+            | Self::OpenDriveY
+            | Self::OpenDriveZ => unreachable!("handled by compact slot helpers"),
+            Self::OpenLocationDriveList => "open_location_drive_list",
+            Self::OpenLocationReadingHistory => "open_location_reading_history",
+            Self::OpenLocationRating1 => "open_location_rating_1",
+            Self::OpenLocationRating2 => "open_location_rating_2",
+            Self::OpenLocationRating3 => "open_location_rating_3",
+            Self::OpenLocationRating4 => "open_location_rating_4",
+            Self::OpenLocationRating5 => "open_location_rating_5",
+            Self::OpenLocationBooksRoot => "open_location_books_root",
+            Self::OpenLocationDesktop => "open_location_desktop",
+            Self::OpenLocationPictures => "open_location_pictures",
+            Self::OpenLocationDownloads => "open_location_downloads",
             Self::GridToggleDetails => "grid_toggle_details",
             Self::GridToggleSnapshotLock => "grid_toggle_snapshot_lock",
             Self::GridToggleCheck => "grid_toggle_check",
@@ -534,7 +908,20 @@ impl RingActionId {
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        Some(match s {
+        let key = s.trim().to_ascii_lowercase();
+        if let Some(index) = Self::FAVORITE_SLOT_STRINGS
+            .iter()
+            .position(|value| *value == key.as_str())
+        {
+            return Self::favorite_slot_action(index + 1);
+        }
+        if let Some(index) = Self::DRIVE_STRINGS
+            .iter()
+            .position(|value| *value == key.as_str())
+        {
+            return Self::drive_action((b'C' + index as u8) as char);
+        }
+        Some(match key.as_str() {
             "none" | "" => Self::None,
             "add_to_book" => Self::AddToBook,
             "pin_representative_thumb" => Self::PinRepresentativeThumb,
@@ -542,6 +929,17 @@ impl RingActionId {
             "toggle_window_mode" => Self::ToggleWindowMode,
             "toggle_maximize" => Self::ToggleMaximize,
             "cycle_favorite" => Self::CycleFavorite,
+            "open_location_drive_list" => Self::OpenLocationDriveList,
+            "open_location_reading_history" => Self::OpenLocationReadingHistory,
+            "open_location_rating_1" => Self::OpenLocationRating1,
+            "open_location_rating_2" => Self::OpenLocationRating2,
+            "open_location_rating_3" => Self::OpenLocationRating3,
+            "open_location_rating_4" => Self::OpenLocationRating4,
+            "open_location_rating_5" => Self::OpenLocationRating5,
+            "open_location_books_root" => Self::OpenLocationBooksRoot,
+            "open_location_desktop" => Self::OpenLocationDesktop,
+            "open_location_pictures" => Self::OpenLocationPictures,
+            "open_location_downloads" => Self::OpenLocationDownloads,
             "grid_toggle_details" => Self::GridToggleDetails,
             "grid_toggle_snapshot_lock" => Self::GridToggleSnapshotLock,
             "grid_toggle_check" => Self::GridToggleCheck,
@@ -590,6 +988,22 @@ impl RingActionId {
     }
 
     pub fn label_for_context(&self, context: RingShortcutContext) -> &'static str {
+        if let Some(slot) = self.favorite_slot_number() {
+            return Self::FAVORITE_SLOT_LABELS[slot - 1];
+        }
+        if let Some(letter) = self.drive_letter() {
+            return Self::DRIVE_LABELS[(letter as u8 - b'C') as usize];
+        }
+        if let Some(stars) = self.location_rating_stars() {
+            return match stars {
+                1 => "★1一覧",
+                2 => "★2一覧",
+                3 => "★3一覧",
+                4 => "★4一覧",
+                5 => "★5一覧",
+                _ => unreachable!("rating stars are constrained to 1..=5"),
+            };
+        }
         match self {
             Self::None => "なし",
             Self::AddToBook => match context {
@@ -604,6 +1018,61 @@ impl RingActionId {
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::ToggleMaximize => "ウィンドウ最大化/復元",
             Self::CycleFavorite => "お気に入り巡回",
+            Self::OpenFavorite1
+            | Self::OpenFavorite2
+            | Self::OpenFavorite3
+            | Self::OpenFavorite4
+            | Self::OpenFavorite5
+            | Self::OpenFavorite6
+            | Self::OpenFavorite7
+            | Self::OpenFavorite8
+            | Self::OpenFavorite9
+            | Self::OpenFavorite10
+            | Self::OpenFavorite11
+            | Self::OpenFavorite12
+            | Self::OpenFavorite13
+            | Self::OpenFavorite14
+            | Self::OpenFavorite15
+            | Self::OpenFavorite16
+            | Self::OpenFavorite17
+            | Self::OpenFavorite18
+            | Self::OpenFavorite19
+            | Self::OpenFavorite20
+            | Self::OpenDriveC
+            | Self::OpenDriveD
+            | Self::OpenDriveE
+            | Self::OpenDriveF
+            | Self::OpenDriveG
+            | Self::OpenDriveH
+            | Self::OpenDriveI
+            | Self::OpenDriveJ
+            | Self::OpenDriveK
+            | Self::OpenDriveL
+            | Self::OpenDriveM
+            | Self::OpenDriveN
+            | Self::OpenDriveO
+            | Self::OpenDriveP
+            | Self::OpenDriveQ
+            | Self::OpenDriveR
+            | Self::OpenDriveS
+            | Self::OpenDriveT
+            | Self::OpenDriveU
+            | Self::OpenDriveV
+            | Self::OpenDriveW
+            | Self::OpenDriveX
+            | Self::OpenDriveY
+            | Self::OpenDriveZ
+            | Self::OpenLocationRating1
+            | Self::OpenLocationRating2
+            | Self::OpenLocationRating3
+            | Self::OpenLocationRating4
+            | Self::OpenLocationRating5 => unreachable!("handled by compact label helpers"),
+            Self::OpenLocationDriveList => "ドライブ一覧",
+            Self::OpenLocationReadingHistory => "読書履歴",
+            Self::OpenLocationBooksRoot => "本棚フォルダ",
+            Self::OpenLocationDesktop => "デスクトップ",
+            Self::OpenLocationPictures => "ピクチャ",
+            Self::OpenLocationDownloads => "ダウンロード",
             Self::GridToggleDetails => "表示/詳細",
             Self::GridToggleSnapshotLock => "★固定",
             Self::GridToggleCheck => "チェック ON/OFF",
@@ -652,6 +1121,9 @@ impl RingActionId {
     }
 
     pub fn is_valid_for_context(&self, context: RingShortcutContext) -> bool {
+        if self.is_location_navigation_action() {
+            return true;
+        }
         match context {
             RingShortcutContext::Grid => matches!(
                 self,
@@ -738,7 +1210,7 @@ impl RingActionId {
     }
 
     pub fn available_for_context(context: RingShortcutContext) -> Vec<Self> {
-        let actions = match context {
+        let mut actions = match context {
             RingShortcutContext::Grid => vec![
                 Self::None,
                 Self::ToggleMaximize,
@@ -818,6 +1290,7 @@ impl RingActionId {
                 Self::VideoExternalPlayer,
             ],
         };
+        actions.extend(Self::location_navigation_actions());
         actions
     }
 }
@@ -2123,6 +2596,67 @@ mod tests {
             RingActionId::ToggleMaximize.label_for_context(RingShortcutContext::Grid),
             "ウィンドウ最大化/復元"
         );
+    }
+
+    #[test]
+    fn location_navigation_actions_round_trip_and_are_global_ring_candidates() {
+        let samples = [
+            (
+                RingActionId::OpenFavorite1,
+                "open_favorite_1",
+                "お気に入り 1",
+            ),
+            (
+                RingActionId::OpenFavorite20,
+                "open_favorite_20",
+                "お気に入り 20",
+            ),
+            (RingActionId::OpenDriveC, "open_drive_c", "C:\\を開く"),
+            (RingActionId::OpenDriveZ, "open_drive_z", "Z:\\を開く"),
+            (
+                RingActionId::OpenLocationDriveList,
+                "open_location_drive_list",
+                "ドライブ一覧",
+            ),
+            (
+                RingActionId::OpenLocationRating5,
+                "open_location_rating_5",
+                "★5一覧",
+            ),
+            (
+                RingActionId::OpenLocationDownloads,
+                "open_location_downloads",
+                "ダウンロード",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            for context in [
+                RingShortcutContext::Grid,
+                RingShortcutContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen,
+            ] {
+                assert!(action.is_valid_for_context(context));
+                assert!(RingActionId::available_for_context(context).contains(&action));
+            }
+        }
+
+        assert_eq!(
+            RingActionId::favorite_slot_action(20),
+            Some(RingActionId::OpenFavorite20)
+        );
+        assert_eq!(
+            RingActionId::OpenFavorite20.favorite_slot_number(),
+            Some(20)
+        );
+        assert_eq!(
+            RingActionId::drive_action('z'),
+            Some(RingActionId::OpenDriveZ)
+        );
+        assert_eq!(RingActionId::OpenDriveZ.drive_letter(), Some('Z'));
     }
 
     #[test]

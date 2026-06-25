@@ -3896,6 +3896,122 @@ impl App {
         Some(nav)
     }
 
+    fn location_navigation_blocked(&mut self) -> bool {
+        if self.is_snapshot_active() {
+            self.show_feedback_toast(
+                "スナップショット中は他のフォルダに移動できません".to_string(),
+            );
+            return true;
+        }
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            self.show_feedback_toast("検索中は場所ジャンプを使用できません".to_string());
+            return true;
+        }
+        false
+    }
+
+    fn apply_ring_favorite_slot(
+        &mut self,
+        ctx: &egui::Context,
+        slot: usize,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.is_snapshot_active() {
+            self.show_feedback_toast(
+                "スナップショット中は他のフォルダに移動できません".to_string(),
+            );
+            return None;
+        }
+        let Some(target) = self
+            .settings
+            .favorites
+            .get(slot.saturating_sub(1))
+            .map(|favorite| favorite.path.clone())
+        else {
+            self.show_feedback_toast(format!("お気に入り {slot} は未登録です"));
+            return None;
+        };
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
+        ctx.request_repaint();
+        Some(AddressBarNav::Direct(target))
+    }
+
+    fn apply_ring_drive_letter(
+        &mut self,
+        letter: char,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.location_navigation_blocked() {
+            return None;
+        }
+        let path = std::path::PathBuf::from(format!("{}:\\", letter.to_ascii_uppercase()));
+        let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
+            self.show_feedback_toast(format!("ドライブが見つかりません: {}", path.display()));
+            return None;
+        };
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
+        Some(AddressBarNav::Direct(resolved))
+    }
+
+    fn apply_ring_location_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: &RingActionId,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.location_navigation_blocked() {
+            return None;
+        }
+        if let Some(stars) = action.location_rating_stars() {
+            self.bump_input_seq(source, Some(&format!("rating_view={stars}")));
+            self.enter_rating_view(stars);
+            return None;
+        }
+        let nav = match action {
+            RingActionId::OpenLocationDriveList => AddressBarNav::DriveList(None),
+            RingActionId::OpenLocationReadingHistory => AddressBarNav::ReadingHistory,
+            RingActionId::OpenLocationBooksRoot => AddressBarNav::BooksRoot,
+            RingActionId::OpenLocationDesktop => {
+                self.quick_location_nav(crate::known_folders::desktop_dir(), "デスクトップ")?
+            }
+            RingActionId::OpenLocationPictures => {
+                self.quick_location_nav(crate::known_folders::pictures_dir(), "ピクチャ")?
+            }
+            RingActionId::OpenLocationDownloads => {
+                self.quick_location_nav(crate::known_folders::downloads_dir(), "ダウンロード")?
+            }
+            _ => return None,
+        };
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        self.bump_input_seq(source, Some(&format!("{nav:?}")));
+        ctx.request_repaint();
+        Some(nav)
+    }
+
+    fn quick_location_nav(
+        &mut self,
+        path: Option<std::path::PathBuf>,
+        label: &'static str,
+    ) -> Option<AddressBarNav> {
+        let Some(path) = path else {
+            self.show_feedback_toast(format!("{label} が見つかりません"));
+            return None;
+        };
+        let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
+            self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
+            return None;
+        };
+        Some(AddressBarNav::Direct(resolved))
+    }
+
     fn apply_tree_folder_nav(&mut self, ctx: &egui::Context, forward: bool, source: &'static str) {
         if let Some(fs_idx) = self.fullscreen_idx {
             let native_toast = self.current_fullscreen_is_video(fs_idx);
@@ -3985,6 +4101,26 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        if let Some(slot) = action.favorite_slot_number() {
+            return self.apply_ring_favorite_slot(ctx, slot, source);
+        }
+        if let Some(letter) = action.drive_letter() {
+            return self.apply_ring_drive_letter(letter, source);
+        }
+        if action.location_rating_stars().is_some()
+            || matches!(
+                action,
+                RingActionId::OpenLocationDriveList
+                    | RingActionId::OpenLocationReadingHistory
+                    | RingActionId::OpenLocationBooksRoot
+                    | RingActionId::OpenLocationDesktop
+                    | RingActionId::OpenLocationPictures
+                    | RingActionId::OpenLocationDownloads
+            )
+        {
+            return self.apply_ring_location_action(ctx, &action, source);
+        }
+
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
             RingActionId::ToggleDetachedViewer => {
