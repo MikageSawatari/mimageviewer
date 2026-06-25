@@ -7940,6 +7940,18 @@ fn egui_key_from_virtual_key(vk: u32) -> Option<egui::Key> {
         0x79 => egui::Key::F10,
         0x7A => egui::Key::F11,
         0x7B => egui::Key::F12,
+        0x7C => egui::Key::F13,
+        0x7D => egui::Key::F14,
+        0x7E => egui::Key::F15,
+        0x7F => egui::Key::F16,
+        0x80 => egui::Key::F17,
+        0x81 => egui::Key::F18,
+        0x82 => egui::Key::F19,
+        0x83 => egui::Key::F20,
+        0x84 => egui::Key::F21,
+        0x85 => egui::Key::F22,
+        0x86 => egui::Key::F23,
+        0x87 => egui::Key::F24,
         _ => return None,
     })
 }
@@ -8316,9 +8328,10 @@ mod tests {
     use super::{
         NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativePixelSample,
         NativeRightPanelVisibilityInputs, compare_pixel_probe, compute_video_visual_transform,
-        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_right_panel_visible_from_inputs,
-        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, egui_key_from_virtual_key,
+        metadata_clean_text, native_jump_panel_visible_from_inputs,
+        native_right_panel_visible_from_inputs, native_video_fullscreen_shortcut_key,
+        sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
@@ -8503,6 +8516,12 @@ mod tests {
         // 状態 (text input 以外) でも fullscreen ショートカットとして App 側へ流す (Codex P2)。
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA6))));
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA7))));
+    }
+
+    #[test]
+    fn native_virtual_key_mapping_supports_extended_function_keys() {
+        assert_eq!(egui_key_from_virtual_key(0x7C), Some(egui::Key::F13));
+        assert_eq!(egui_key_from_virtual_key(0x87), Some(egui::Key::F24));
     }
 
     #[test]

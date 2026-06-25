@@ -157,6 +157,18 @@ pub enum KeyName {
     F10,
     F11,
     F12,
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+    F21,
+    F22,
+    F23,
+    F24,
     Left,
     Right,
     Up,
@@ -234,6 +246,18 @@ impl KeyName {
             "F10" => KeyName::F10,
             "F11" => KeyName::F11,
             "F12" => KeyName::F12,
+            "F13" => KeyName::F13,
+            "F14" => KeyName::F14,
+            "F15" => KeyName::F15,
+            "F16" => KeyName::F16,
+            "F17" => KeyName::F17,
+            "F18" => KeyName::F18,
+            "F19" => KeyName::F19,
+            "F20" => KeyName::F20,
+            "F21" => KeyName::F21,
+            "F22" => KeyName::F22,
+            "F23" => KeyName::F23,
+            "F24" => KeyName::F24,
             "LEFT" | "ARROWLEFT" => KeyName::Left,
             "RIGHT" | "ARROWRIGHT" => KeyName::Right,
             "UP" | "ARROWUP" => KeyName::Up,
@@ -306,6 +330,18 @@ impl KeyName {
             KeyName::F10 => egui::Key::F10,
             KeyName::F11 => egui::Key::F11,
             KeyName::F12 => egui::Key::F12,
+            KeyName::F13 => egui::Key::F13,
+            KeyName::F14 => egui::Key::F14,
+            KeyName::F15 => egui::Key::F15,
+            KeyName::F16 => egui::Key::F16,
+            KeyName::F17 => egui::Key::F17,
+            KeyName::F18 => egui::Key::F18,
+            KeyName::F19 => egui::Key::F19,
+            KeyName::F20 => egui::Key::F20,
+            KeyName::F21 => egui::Key::F21,
+            KeyName::F22 => egui::Key::F22,
+            KeyName::F23 => egui::Key::F23,
+            KeyName::F24 => egui::Key::F24,
             KeyName::Left => egui::Key::ArrowLeft,
             KeyName::Right => egui::Key::ArrowRight,
             KeyName::Up => egui::Key::ArrowUp,
@@ -377,6 +413,18 @@ impl KeyName {
             egui::Key::F10 => KeyName::F10,
             egui::Key::F11 => KeyName::F11,
             egui::Key::F12 => KeyName::F12,
+            egui::Key::F13 => KeyName::F13,
+            egui::Key::F14 => KeyName::F14,
+            egui::Key::F15 => KeyName::F15,
+            egui::Key::F16 => KeyName::F16,
+            egui::Key::F17 => KeyName::F17,
+            egui::Key::F18 => KeyName::F18,
+            egui::Key::F19 => KeyName::F19,
+            egui::Key::F20 => KeyName::F20,
+            egui::Key::F21 => KeyName::F21,
+            egui::Key::F22 => KeyName::F22,
+            egui::Key::F23 => KeyName::F23,
+            egui::Key::F24 => KeyName::F24,
             egui::Key::ArrowLeft => KeyName::Left,
             egui::Key::ArrowRight => KeyName::Right,
             egui::Key::ArrowUp => KeyName::Up,
@@ -449,6 +497,18 @@ impl KeyName {
             KeyName::F10 => 0x79,
             KeyName::F11 => 0x7A,
             KeyName::F12 => 0x7B,
+            KeyName::F13 => 0x7C,
+            KeyName::F14 => 0x7D,
+            KeyName::F15 => 0x7E,
+            KeyName::F16 => 0x7F,
+            KeyName::F17 => 0x80,
+            KeyName::F18 => 0x81,
+            KeyName::F19 => 0x82,
+            KeyName::F20 => 0x83,
+            KeyName::F21 => 0x84,
+            KeyName::F22 => 0x85,
+            KeyName::F23 => 0x86,
+            KeyName::F24 => 0x87,
             KeyName::Left => 0x25,
             KeyName::Right => 0x27,
             KeyName::Up => 0x26,
@@ -520,6 +580,18 @@ impl KeyName {
             KeyName::F10 => "F10",
             KeyName::F11 => "F11",
             KeyName::F12 => "F12",
+            KeyName::F13 => "F13",
+            KeyName::F14 => "F14",
+            KeyName::F15 => "F15",
+            KeyName::F16 => "F16",
+            KeyName::F17 => "F17",
+            KeyName::F18 => "F18",
+            KeyName::F19 => "F19",
+            KeyName::F20 => "F20",
+            KeyName::F21 => "F21",
+            KeyName::F22 => "F22",
+            KeyName::F23 => "F23",
+            KeyName::F24 => "F24",
             KeyName::Left => "Left",
             KeyName::Right => "Right",
             KeyName::Up => "Up",
@@ -3654,7 +3726,7 @@ impl Keymap {
         out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
         out.push_str("# - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。\n");
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
-        out.push_str("# - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,\n");
+        out.push_str("# - キー名の例: A..Z, 0..9, F1..F24, Left, Right, Up, Down,\n");
         out.push_str(
             "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], /, ?, -\n",
         );
@@ -4937,6 +5009,36 @@ mod tests {
     }
 
     #[test]
+    fn extended_function_keys_parse_display_and_roundtrip() {
+        let cases = [
+            (KeyName::F13, egui::Key::F13, 0x7C, "F13"),
+            (KeyName::F14, egui::Key::F14, 0x7D, "F14"),
+            (KeyName::F15, egui::Key::F15, 0x7E, "F15"),
+            (KeyName::F16, egui::Key::F16, 0x7F, "F16"),
+            (KeyName::F17, egui::Key::F17, 0x80, "F17"),
+            (KeyName::F18, egui::Key::F18, 0x81, "F18"),
+            (KeyName::F19, egui::Key::F19, 0x82, "F19"),
+            (KeyName::F20, egui::Key::F20, 0x83, "F20"),
+            (KeyName::F21, egui::Key::F21, 0x84, "F21"),
+            (KeyName::F22, egui::Key::F22, 0x85, "F22"),
+            (KeyName::F23, egui::Key::F23, 0x86, "F23"),
+            (KeyName::F24, egui::Key::F24, 0x87, "F24"),
+        ];
+        for (name, egui_key, vk, label) in cases {
+            assert_eq!(KeyName::parse(label), Some(name));
+            assert_eq!(name.display_name(), label);
+            assert_eq!(name.to_egui(), egui_key);
+            assert_eq!(KeyName::from_egui(egui_key), Some(name));
+            assert_eq!(name.to_vk(), vk);
+        }
+        assert_eq!(parse_chord("Ctrl+F24").unwrap().display_name(), "Ctrl+F24");
+        assert_eq!(
+            parse_chord("Shift+F13").unwrap(),
+            Chord::shift(KeyName::F13)
+        );
+    }
+
+    #[test]
     fn none_disables_action() {
         let keymap = Keymap::from_ini_str(
             r#"
@@ -5284,10 +5386,30 @@ mod tests {
         assert!(keymap.matches_vk_action(KeyAction::VideoMute, &event));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn vk_match_supports_extended_function_keys() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsVideo]
+            VideoMute = F16
+            "#,
+        );
+        let event = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0x7F,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(keymap.matches_vk_action(KeyAction::VideoMute, &event));
+    }
+
     #[test]
     fn user_ini_template_is_parseable_and_comment_only() {
         let user_ini = Keymap::user_ini_template();
         assert!(user_ini.contains("上級者向けのキーボード割り当て設定です。"));
+        assert!(user_ini.contains("F1..F24"));
         assert!(user_ini.contains("[FsImage]"));
         assert!(user_ini.contains("[Rating] ; レーティング"));
         assert!(user_ini.contains("# HelpShowContextShortcuts = ?"));

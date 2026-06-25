@@ -21,7 +21,7 @@
 # - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。
 # - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。
 # - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
-# - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,
+# - キー名の例: A..Z, 0..9, F1..F24, Left, Right, Up, Down,
 #   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], /, ?, -
 # - テンキー数字は通常の数字キーと同じ扱いです。
 #   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。

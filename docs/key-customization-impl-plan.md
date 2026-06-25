@@ -587,7 +587,7 @@ egui 側で通常の数字キーと同じ `Num1` などに畳まれるため別�
 |---|---|---|---|
 | 英字 | A..Z | A..Z | 0x41..0x5A |
 | 数字 | Num0..Num9 | Num0..Num9 | 0x30..0x39 |
-| Fキー | F1..F12 | F1..F12 | 0x70..0x7B |
+| Fキー | F1..F24 | F1..F24 | 0x70..0x87 |
 | 矢印 | Left/Right/Up/Down | Arrow* | 0x25/0x27/0x26/0x28 |
 | ナビ | Home/End/PageUp/PageDown | 同名 | 0x24/0x23/0x21/0x22 |
 | 編集 | Space/Enter/Esc/Tab/Backspace/Delete | 同名 | 0x20/0x0D/0x1B/0x09/0x08/0x2E |
