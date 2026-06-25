@@ -2969,9 +2969,11 @@ pub struct App {
     pub(crate) show_preferences: bool,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    pub(crate) show_preferences_discard_confirm: bool,
     /// 操作カスタマイズダイアログ (キーボード / 右ドラッグ / リング / ジェスチャ)
     pub(crate) show_operation_customize: bool,
     pub(crate) operation_customize_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    pub(crate) show_operation_customize_discard_confirm: bool,
 
     // ── 設定の復元ダイアログ ───────────────────────────────────────
     /// `設定` メニュー →「設定の復元…」で開くダイアログの可視フラグ。
@@ -5591,7 +5593,9 @@ impl App {
             rename_error: None,
             rename_pending: None,
             show_preferences: false,
+            show_preferences_discard_confirm: false,
             show_operation_customize: false,
+            show_operation_customize_discard_confirm: false,
             show_settings_restore: false,
             settings_restore_state:
                 crate::ui_dialogs::settings_restore::SettingsRestoreState::default(),
@@ -7136,7 +7140,9 @@ impl App {
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
+            || self.show_preferences_discard_confirm
             || self.show_operation_customize
+            || self.show_operation_customize_discard_confirm
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
             || self.show_context_shortcuts_help
@@ -7179,7 +7185,9 @@ impl App {
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
+            || self.show_preferences_discard_confirm
             || self.show_operation_customize
+            || self.show_operation_customize_discard_confirm
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
             || self.show_context_shortcuts_help

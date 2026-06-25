@@ -25,6 +25,50 @@ fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     scroll
 }
 
+fn settings_equal_for_close_prompt(a: &Settings, b: &Settings) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn draw_discard_changes_confirm(
+    ctx: &egui::Context,
+    id: &'static str,
+    title: &str,
+    message: &str,
+) -> Option<bool> {
+    let mut discard = false;
+    let mut keep_editing = false;
+    let response = egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        ui.heading(title);
+        ui.add_space(8.0);
+        ui.label(message);
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("保存していない変更は元に戻せません。").weak());
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("破棄して閉じる").clicked() {
+                discard = true;
+            }
+            if ui.button("編集に戻る").clicked() {
+                keep_editing = true;
+            }
+        });
+    });
+
+    if discard {
+        Some(true)
+    } else if keep_editing || response.should_close() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(windows)]
 pub enum Vst3ScanMessage {
     Progress {
@@ -642,6 +686,87 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
 // ── メインダイアログ ────────────────────────────────────────────
 
 impl App {
+    fn preferences_dialog_has_unsaved_changes(&self) -> bool {
+        let Some(state) = self.pref_state.as_ref() else {
+            return false;
+        };
+        let mut edited = state.settings.clone();
+        let mut live = self.settings.clone();
+        edited.overwrite_non_preferences_from(&mut live);
+        !settings_equal_for_close_prompt(&edited, &self.settings)
+    }
+
+    fn operation_customize_dialog_has_unsaved_changes(&self) -> bool {
+        let Some(state) = self.operation_customize_state.as_ref() else {
+            return false;
+        };
+        let mut edited_ring = state.settings.ring_shortcuts.clone();
+        edited_ring.sanitize();
+        state.settings.keymap != self.settings.keymap || edited_ring != self.settings.ring_shortcuts
+    }
+
+    fn request_close_preferences_dialog(&mut self) {
+        if self.preferences_dialog_has_unsaved_changes() {
+            self.show_preferences = true;
+            self.show_preferences_discard_confirm = true;
+        } else {
+            self.discard_preferences_dialog();
+        }
+    }
+
+    fn discard_preferences_dialog(&mut self) {
+        self.pref_state = None;
+        self.show_preferences = false;
+        self.show_preferences_discard_confirm = false;
+    }
+
+    fn request_close_operation_customize_dialog(&mut self) {
+        if self.operation_customize_dialog_has_unsaved_changes() {
+            self.show_operation_customize = true;
+            self.show_operation_customize_discard_confirm = true;
+        } else {
+            self.discard_operation_customize_dialog();
+        }
+    }
+
+    fn discard_operation_customize_dialog(&mut self) {
+        self.operation_customize_state = None;
+        self.show_operation_customize = false;
+        self.show_operation_customize_discard_confirm = false;
+    }
+
+    fn draw_preferences_discard_confirm(&mut self, ctx: &egui::Context) {
+        if !self.show_preferences_discard_confirm {
+            return;
+        }
+        match draw_discard_changes_confirm(
+            ctx,
+            "preferences_discard_changes_confirm",
+            "環境設定の変更を破棄しますか？",
+            "OK で適用していない変更があります。",
+        ) {
+            Some(true) => self.discard_preferences_dialog(),
+            Some(false) => self.show_preferences_discard_confirm = false,
+            None => {}
+        }
+    }
+
+    fn draw_operation_customize_discard_confirm(&mut self, ctx: &egui::Context) {
+        if !self.show_operation_customize_discard_confirm {
+            return;
+        }
+        match draw_discard_changes_confirm(
+            ctx,
+            "operation_customize_discard_changes_confirm",
+            "操作カスタマイズの変更を破棄しますか？",
+            "OK で適用していない割り当て変更があります。",
+        ) {
+            Some(true) => self.discard_operation_customize_dialog(),
+            Some(false) => self.show_operation_customize_discard_confirm = false,
+            None => {}
+        }
+    }
+
     pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_preferences {
             return;
@@ -800,6 +925,7 @@ impl App {
                 });
             });
 
+        let mut close_requested_this_frame = false;
         if apply {
             if let Some(mut state) = self.pref_state.take() {
                 let old_dup = (
@@ -1000,9 +1126,14 @@ impl App {
                 }
             }
             self.show_preferences = false;
+            self.show_preferences_discard_confirm = false;
         } else if cancel || !open {
-            self.pref_state = None;
-            self.show_preferences = false;
+            close_requested_this_frame = true;
+            self.request_close_preferences_dialog();
+        }
+
+        if !close_requested_this_frame {
+            self.draw_preferences_discard_confirm(ctx);
         }
 
         let mut clear_audio_normalize_requested = false;
@@ -1265,14 +1396,20 @@ impl App {
             draw_mouse_gesture_recorder_dialog(ctx, state);
         }
 
+        let mut close_requested_this_frame = false;
         if apply {
             if let Some(state) = self.operation_customize_state.take() {
                 self.apply_operation_customize_state(state);
             }
             self.show_operation_customize = false;
+            self.show_operation_customize_discard_confirm = false;
         } else if cancel || !open {
-            self.operation_customize_state = None;
-            self.show_operation_customize = false;
+            close_requested_this_frame = true;
+            self.request_close_operation_customize_dialog();
+        }
+
+        if !close_requested_this_frame {
+            self.draw_operation_customize_discard_confirm(ctx);
         }
     }
 
