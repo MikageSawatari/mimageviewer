@@ -7,7 +7,6 @@ use crate::keymap::{
 use crate::ring_shortcut::{
     GamepadButtonSlot, MouseGestureDirection, RightDragContext, RightDragMode, RingActionId,
     RingDirection, RingShortcutContext, RingShortcutSettings, format_mouse_gesture_pattern,
-    parse_mouse_gesture_pattern,
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
@@ -529,14 +528,12 @@ pub(super) fn page_mouse_gesture_bindings(
 }
 
 pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    let settings = &mut state.settings.ring_shortcuts;
-
     ui.small("戻る/進むボタンは、リングショートカットと同じ単発アクションから選べます。");
     ui.small("割り当てはグリッド、画像フルスクリーン、動画フルスクリーンで別々に保存します。");
 
     ui.add_space(8.0);
     for &context in RingShortcutContext::all() {
-        mouse_button_context_editor(ui, settings, context);
+        mouse_button_context_editor(ui, state, context);
     }
 }
 
@@ -939,7 +936,12 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
     let mut open = true;
     let mut add_pattern = false;
     let mut close_requested = false;
-    egui::Window::new(format!("マウスジェスチャ追加: {}", recorder.context.label()))
+    let title = if recorder.replace_index.is_some() {
+        format!("マウスジェスチャ再記録: {}", recorder.context.label())
+    } else {
+        format!("マウスジェスチャ追加: {}", recorder.context.label())
+    };
+    egui::Window::new(title)
         .open(&mut open)
         .resizable(true)
         .collapsible(false)
@@ -1031,8 +1033,13 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                let action_label = if recorder.replace_index.is_some() {
+                    "更新"
+                } else {
+                    "追加"
+                };
                 if ui
-                    .add_enabled(!recorder.pattern.is_empty(), egui::Button::new("追加"))
+                    .add_enabled(!recorder.pattern.is_empty(), egui::Button::new(action_label))
                     .clicked()
                 {
                     add_pattern = true;
@@ -1054,13 +1061,22 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
             .settings
             .ring_shortcuts
             .mouse_gesture_profile_mut(recorder.context);
-        let idx = profile.bindings.len();
-        profile
-            .bindings
-            .push(crate::ring_shortcut::MouseGestureBinding::new(
-                recorder.pattern.clone(),
-                recorder.action.clone(),
-            ));
+        let binding = crate::ring_shortcut::MouseGestureBinding::new(
+            recorder.pattern.clone(),
+            recorder.action.clone(),
+        );
+        let idx = if let Some(idx) = recorder.replace_index {
+            if let Some(slot) = profile.bindings.get_mut(idx) {
+                *slot = binding;
+                idx
+            } else {
+                profile.bindings.push(binding);
+                profile.bindings.len() - 1
+            }
+        } else {
+            profile.bindings.push(binding);
+            profile.bindings.len() - 1
+        };
         state.operation_mouse_gesture_inputs.insert(
             (recorder.context, idx),
             format_mouse_gesture_pattern(&recorder.pattern),
@@ -1155,6 +1171,16 @@ fn operation_assignment_editor_title(target: &OperationAssignmentTarget) -> Stri
                 context.label()
             )
         }
+        OperationAssignmentTarget::MouseButton { context, forward } => {
+            format!(
+                "マウス{}ボタン割り当て: {}",
+                if *forward { "進む" } else { "戻る" },
+                context.label()
+            )
+        }
+        OperationAssignmentTarget::MouseGesture { context, index } => {
+            format!("マウスジェスチャ編集: {} / #{}", context.label(), index + 1)
+        }
     }
 }
 
@@ -1203,6 +1229,24 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
                 button.default_label(*context)
             ));
         }
+        OperationAssignmentTarget::MouseButton { context, forward } => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} / マウス{}ボタン",
+                    context.label(),
+                    if *forward { "進む" } else { "戻る" }
+                ))
+                .strong(),
+            );
+            ui.small("物理ボタン単体に実行する一発アクションを選びます。");
+        }
+        OperationAssignmentTarget::MouseGesture { context, index } => {
+            ui.label(
+                egui::RichText::new(format!("{} / ジェスチャ #{}", context.label(), index + 1))
+                    .strong(),
+            );
+            ui.small("このジェスチャの実行アクション、再記録、削除を行います。");
+        }
     }
 }
 
@@ -1245,6 +1289,12 @@ fn operation_assignment_tab_enabled(
             tab != OperationAssignmentTab::Keyboard
         }
         OperationAssignmentTarget::GamepadButton { .. } => tab == OperationAssignmentTab::RingPad,
+        OperationAssignmentTarget::MouseButton { .. } => {
+            tab == OperationAssignmentTab::MouseButtons
+        }
+        OperationAssignmentTarget::MouseGesture { .. } => {
+            tab == OperationAssignmentTab::MouseGesture
+        }
     }
 }
 
@@ -1311,6 +1361,19 @@ fn draw_operation_assignment_editor_body(
             gamepad_button_assignment_editor(ui, state, *context, *button);
         }
         (
+            OperationAssignmentTarget::MouseButton { context, forward },
+            OperationAssignmentTab::MouseButtons,
+        ) => {
+            mouse_button_assignment_editor(ui, state, *context, *forward);
+        }
+        (
+            OperationAssignmentTarget::MouseGesture { context, index },
+            OperationAssignmentTab::MouseGesture,
+        ) => {
+            state.operation_mouse_gesture_context = *context;
+            mouse_gesture_assignment_editor(ui, state, *context, *index);
+        }
+        (
             OperationAssignmentTarget::Ring { context, action },
             OperationAssignmentTab::MouseButtons,
         ) => {
@@ -1320,13 +1383,13 @@ fn draw_operation_assignment_editor_body(
             OperationAssignmentTarget::RingSlot { context, .. },
             OperationAssignmentTab::MouseButtons,
         ) => {
-            mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, *context);
+            mouse_button_context_editor(ui, state, *context);
         }
         (
             OperationAssignmentTarget::GamepadButton { context, .. },
             OperationAssignmentTab::MouseButtons,
         ) => {
-            mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, *context);
+            mouse_button_context_editor(ui, state, *context);
         }
         (
             OperationAssignmentTarget::Ring { context, action },
@@ -1459,6 +1522,10 @@ fn operation_assignment_editor_context(
         OperationAssignmentTarget::Ring { context, .. }
         | OperationAssignmentTarget::RingSlot { context, .. } => Some(*context),
         OperationAssignmentTarget::GamepadButton { context, .. } => Some(*context),
+        OperationAssignmentTarget::MouseButton { context, .. } => Some(*context),
+        OperationAssignmentTarget::MouseGesture { context, .. } => {
+            Some(context.gesture_action_context())
+        }
         OperationAssignmentTarget::Key(_) | OperationAssignmentTarget::Chord(_) => None,
     }
 }
@@ -1477,6 +1544,9 @@ fn open_operation_assignment_editor(
     if let Some(context) = operation_assignment_editor_context(&target) {
         state.operation_ring_context = context;
         state.operation_mouse_gesture_context = right_drag_context_for_ring_context(context);
+    }
+    if let OperationAssignmentTarget::MouseGesture { context, .. } = &target {
+        state.operation_mouse_gesture_context = *context;
     }
     state.operation_assignment_editor = Some(OperationAssignmentEditor { target, tab });
 }
@@ -2607,7 +2677,7 @@ fn right_drag_mode_combo(
 }
 fn mouse_button_context_editor(
     ui: &mut egui::Ui,
-    settings: &mut RingShortcutSettings,
+    state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
     ui.separator();
@@ -2615,54 +2685,114 @@ fn mouse_button_context_editor(
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(context.label()).strong());
         if ui.button("既定に戻す").clicked() {
-            settings.reset_mouse_button_profile(context);
+            state
+                .settings
+                .ring_shortcuts
+                .reset_mouse_button_profile(context);
         }
     });
 
-    let available = RingActionId::available_for_context(context);
-    let profile = settings.mouse_button_profile_mut(context);
-    profile.sanitize(context);
+    state
+        .settings
+        .ring_shortcuts
+        .mouse_button_profile_mut(context)
+        .sanitize(context);
     egui::Grid::new(("mouse_button_bindings", context))
-        .num_columns(2)
+        .num_columns(3)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
-            mouse_button_action_combo(
-                ui,
-                ("mouse_button_action", context, "back"),
-                "戻るボタン",
-                &mut profile.back,
-                &available,
-                context,
-            );
-            mouse_button_action_combo(
-                ui,
-                ("mouse_button_action", context, "forward"),
-                "進むボタン",
-                &mut profile.forward,
-                &available,
-                context,
-            );
+            mouse_button_row(ui, state, context, false, "戻るボタン");
+            mouse_button_row(ui, state, context, true, "進むボタン");
         });
 }
 
-fn mouse_button_action_combo(
+fn mouse_button_row(
     ui: &mut egui::Ui,
-    id: impl std::hash::Hash,
-    label: &'static str,
-    value: &mut RingActionId,
-    available: &[RingActionId],
+    state: &mut PreferencesState,
     context: RingShortcutContext,
+    forward: bool,
+    label: &'static str,
 ) {
+    let action = if forward {
+        state
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile(context)
+            .forward
+            .clone()
+    } else {
+        state
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile(context)
+            .back
+            .clone()
+    };
+    if ui.small_button("編集").clicked() {
+        open_operation_assignment_editor(
+            state,
+            OperationAssignmentTarget::MouseButton { context, forward },
+            OperationAssignmentTab::MouseButtons,
+        );
+    }
     ui.label(label);
-    egui::ComboBox::from_id_salt(id)
-        .width(220.0)
-        .selected_text(value.label_for_context(context))
-        .show_ui(ui, |ui| {
-            for action in available {
-                ui.selectable_value(value, action.clone(), action.label_for_context(context));
+    ui.label(action.label_for_context(context))
+        .on_hover_text(action.as_str());
+    ui.end_row();
+}
+
+fn mouse_button_assignment_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RingShortcutContext,
+    forward: bool,
+) {
+    let mut close_requested = false;
+    ui.group(|ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} / マウス{}ボタン",
+                context.label(),
+                if forward { "進む" } else { "戻る" }
+            ))
+            .strong(),
+        );
+        ui.small("なしを選ぶとこのボタン単体では何もしません。");
+        ui.add_space(6.0);
+
+        let available = RingActionId::available_for_context(context);
+        let profile = state
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(context);
+        profile.sanitize(context);
+        let value = if forward {
+            &mut profile.forward
+        } else {
+            &mut profile.back
+        };
+        egui::ComboBox::from_id_salt(("mouse_button_assignment_editor", context, forward))
+            .width(300.0)
+            .selected_text(value.label_for_context(context))
+            .show_ui(ui, |ui| {
+                for action in &available {
+                    ui.selectable_value(value, action.clone(), action.label_for_context(context))
+                        .on_hover_text(ring_action_detail_label(action, context));
+                }
+            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("割り当て解除").clicked() {
+                *value = RingActionId::None;
+            }
+            if ui.button("閉じる").clicked() {
+                close_requested = true;
             }
         });
-    ui.end_row();
+    });
+    if close_requested {
+        close_assignment_editors(state);
+    }
 }
 
 fn mouse_gesture_context_editor(
@@ -2670,8 +2800,6 @@ fn mouse_gesture_context_editor(
     state: &mut PreferencesState,
     context: RightDragContext,
 ) {
-    let settings = &mut state.settings.ring_shortcuts;
-    let gesture_inputs = &mut state.operation_mouse_gesture_inputs;
     let mut open_recorder = false;
     ui.separator();
     ui.add_space(4.0);
@@ -2681,75 +2809,59 @@ fn mouse_gesture_context_editor(
             open_recorder = true;
         }
         if ui.button("既定に戻す").clicked() {
-            settings.reset_mouse_gesture_profile(context);
-            gesture_inputs.retain(|(ctx, _), _| *ctx != context);
+            state
+                .settings
+                .ring_shortcuts
+                .reset_mouse_gesture_profile(context);
+            state
+                .operation_mouse_gesture_inputs
+                .retain(|(ctx, _), _| *ctx != context);
         }
     });
 
     let action_context = context.gesture_action_context();
-    let available = RingActionId::available_for_context(action_context);
-    let mut remove_idx = None;
-    let mut invalid_rows = Vec::new();
-    {
-        let profile = settings.mouse_gesture_profile_mut(context);
+    let rows = {
+        let profile = state
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_profile_mut(context);
         profile.sanitize(context);
-        egui::Grid::new(("mouse_gesture_bindings", context))
-            .num_columns(4)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("ジェスチャ").strong());
-                ui.label(egui::RichText::new("操作").strong());
-                ui.label("");
-                ui.label("");
-                ui.end_row();
+        profile.bindings.clone()
+    };
+    state
+        .operation_mouse_gesture_inputs
+        .retain(|(ctx, idx), _| *ctx != context || *idx < rows.len());
 
-                for (idx, binding) in profile.bindings.iter_mut().enumerate() {
-                    let pattern_text = gesture_inputs
-                        .entry((context, idx))
-                        .or_insert_with(|| format_mouse_gesture_pattern(&binding.pattern));
-                    let response = ui.add_sized(
-                        [82.0, 22.0],
-                        egui::TextEdit::singleline(pattern_text).hint_text("↓→"),
+    egui::Grid::new(("mouse_gesture_bindings", context))
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("編集").strong());
+            ui.label(egui::RichText::new("ジェスチャ").strong());
+            ui.label(egui::RichText::new("操作").strong());
+            ui.label("");
+            ui.end_row();
+
+            for (idx, binding) in rows.iter().enumerate() {
+                if ui.small_button("編集").clicked() {
+                    open_operation_assignment_editor(
+                        state,
+                        OperationAssignmentTarget::MouseGesture {
+                            context,
+                            index: idx,
+                        },
+                        OperationAssignmentTab::MouseGesture,
                     );
-                    if response.changed() {
-                        if let Some(pattern) = parse_mouse_gesture_pattern(pattern_text) {
-                            binding.pattern = pattern;
-                        } else {
-                            invalid_rows.push(idx + 1);
-                        }
-                    }
-                    egui::ComboBox::from_id_salt(("mouse_gesture_action", context, idx))
-                        .width(210.0)
-                        .selected_text(binding.action.label_for_context(action_context))
-                        .show_ui(ui, |ui| {
-                            for action in &available {
-                                ui.selectable_value(
-                                    &mut binding.action,
-                                    action.clone(),
-                                    action.label_for_context(action_context),
-                                );
-                            }
-                        });
-                    if ui.small_button("削除").clicked() {
-                        remove_idx = Some(idx);
-                    }
-                    ui.label(
-                        egui::RichText::new("例: ↑→ / U R")
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                    ui.end_row();
                 }
-            });
-        if let Some(idx) = remove_idx {
-            profile.bindings.remove(idx);
-            gesture_inputs.retain(|(ctx, _), _| *ctx != context);
-        }
-        let len = profile.bindings.len();
-        gesture_inputs.retain(|(ctx, idx), _| *ctx != context || *idx < len);
-    }
+                ui.monospace(format_mouse_gesture_pattern(&binding.pattern));
+                ui.label(binding.action.label_for_context(action_context))
+                    .on_hover_text(binding.action.as_str());
+                ui.label(egui::RichText::new("再記録は編集から").size(11.0).weak());
+                ui.end_row();
+            }
+        });
 
-    let profile = settings.mouse_gesture_profile(context);
+    let profile = state.settings.ring_shortcuts.mouse_gesture_profile(context);
     let mut seen = BTreeSet::new();
     let mut duplicates = Vec::new();
     for binding in &profile.bindings {
@@ -2757,19 +2869,6 @@ fn mouse_gesture_context_editor(
         if !seen.insert(label.clone()) {
             duplicates.push(label);
         }
-    }
-    if !invalid_rows.is_empty() {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!(
-                "形式を読めない行があります: {}",
-                invalid_rows
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
     }
     if !duplicates.is_empty() {
         duplicates.sort();
@@ -2792,11 +2891,123 @@ fn mouse_gesture_context_editor(
         state.operation_mouse_gesture_recorder = Some(OperationMouseGestureRecorder {
             context,
             action,
+            replace_index: None,
             pattern: Vec::new(),
             points: Vec::new(),
             recording: false,
             error: None,
         });
+    }
+}
+
+fn mouse_gesture_assignment_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RightDragContext,
+    index: usize,
+) {
+    let action_context = context.gesture_action_context();
+    let Some(binding) = state
+        .settings
+        .ring_shortcuts
+        .mouse_gesture_profile(context)
+        .bindings
+        .get(index)
+        .cloned()
+    else {
+        ui.small("このジェスチャは削除済みです。");
+        if ui.button("閉じる").clicked() {
+            close_assignment_editors(state);
+        }
+        return;
+    };
+
+    let mut action = binding.action.clone();
+    let mut close_requested = false;
+    let mut delete_requested = false;
+    let mut rerecord_requested = false;
+    ui.group(|ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} / {}",
+                context.label(),
+                format_mouse_gesture_pattern(&binding.pattern)
+            ))
+            .strong(),
+        );
+        ui.small("操作を変更するか、実際の右ドラッグでジェスチャを再記録します。");
+        ui.add_space(6.0);
+
+        egui::ComboBox::from_id_salt(("mouse_gesture_assignment_editor", context, index))
+            .width(300.0)
+            .selected_text(action.label_for_context(action_context))
+            .show_ui(ui, |ui| {
+                for candidate in RingActionId::available_for_context(action_context) {
+                    ui.selectable_value(
+                        &mut action,
+                        candidate.clone(),
+                        candidate.label_for_context(action_context),
+                    )
+                    .on_hover_text(ring_action_detail_label(&candidate, action_context));
+                }
+            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("再記録").clicked() {
+                rerecord_requested = true;
+            }
+            if ui.button("削除").clicked() {
+                delete_requested = true;
+            }
+            if ui.button("閉じる").clicked() {
+                close_requested = true;
+            }
+        });
+    });
+
+    if action != binding.action
+        && let Some(slot) = state
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_profile_mut(context)
+            .bindings
+            .get_mut(index)
+    {
+        slot.action = action.clone();
+    }
+    if rerecord_requested {
+        state.operation_mouse_gesture_recorder = Some(OperationMouseGestureRecorder {
+            context,
+            action: action.clone(),
+            replace_index: Some(index),
+            pattern: Vec::new(),
+            points: Vec::new(),
+            recording: false,
+            error: None,
+        });
+    }
+    if delete_requested {
+        if index
+            < state
+                .settings
+                .ring_shortcuts
+                .mouse_gesture_profile(context)
+                .bindings
+                .len()
+        {
+            state
+                .settings
+                .ring_shortcuts
+                .mouse_gesture_profile_mut(context)
+                .bindings
+                .remove(index);
+        }
+        state
+            .operation_mouse_gesture_inputs
+            .retain(|(ctx, _), _| *ctx != context);
+        close_assignment_editors(state);
+    } else if close_requested {
+        close_assignment_editors(state);
     }
 }
 
@@ -2929,6 +3140,7 @@ fn ring_action_mouse_gesture_editor(
         state.operation_mouse_gesture_recorder = Some(OperationMouseGestureRecorder {
             context,
             action: action.clone(),
+            replace_index: None,
             pattern: Vec::new(),
             points: Vec::new(),
             recording: false,

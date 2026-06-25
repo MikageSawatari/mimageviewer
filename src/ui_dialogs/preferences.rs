@@ -199,6 +199,14 @@ pub(crate) enum OperationAssignmentTarget {
         context: RingShortcutContext,
         button: GamepadButtonSlot,
     },
+    MouseButton {
+        context: RingShortcutContext,
+        forward: bool,
+    },
+    MouseGesture {
+        context: RightDragContext,
+        index: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,6 +219,7 @@ pub(crate) struct OperationAssignmentEditor {
 pub(crate) struct OperationMouseGestureRecorder {
     pub context: RightDragContext,
     pub action: RingActionId,
+    pub replace_index: Option<usize>,
     pub pattern: Vec<MouseGestureDirection>,
     pub points: Vec<egui::Pos2>,
     pub recording: bool,
