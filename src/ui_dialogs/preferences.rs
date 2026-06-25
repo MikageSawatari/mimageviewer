@@ -1410,10 +1410,8 @@ fn draw_operation_customize_page(
         OperationCustomizeTab::Gamepad => {
             draw_gamepad_context_tabs(ui, state);
             ui.add_space(8.0);
-            ui.small("ゲームパッド X+方向はリングショートカットと同じ割り当てを使います。X 単体で開くピッカーパネルの項目は固定です。");
-            ui.add_space(8.0);
             let context = state.operation_ring_context;
-            page_ring_shortcut_assignments(ui, state, context);
+            page_gamepad_assignments(ui, state, context);
         }
     }
 }
