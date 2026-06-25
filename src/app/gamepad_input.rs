@@ -259,6 +259,7 @@ impl App {
             .settings
             .ring_shortcuts
             .mouse_ring_enabled(surface_context)
+            || !self.settings.ring_shortcuts.mouse_ring_help_visible
             || self.ring_picker.is_some()
         {
             return;
@@ -313,6 +314,7 @@ impl App {
             .ring_shortcuts
             .right_drag_mode(surface_context)
             != RightDragMode::MouseGesture
+            || !self.settings.ring_shortcuts.mouse_gesture_help_visible
             || self.ring_picker.is_some()
         {
             return;
@@ -3048,6 +3050,11 @@ impl App {
     fn sync_native_video_mouse_gesture_overlay(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         {
+            if !self.settings.ring_shortcuts.mouse_gesture_help_visible {
+                self.set_native_video_ring_picker_overlay(None);
+                self.request_native_video_hud_repaint(ctx);
+                return;
+            }
             let overlay = self.native_video_mouse_gesture_overlay();
             self.set_native_video_ring_picker_overlay(overlay);
             self.request_native_video_hud_repaint(ctx);
@@ -3217,6 +3224,9 @@ impl App {
             );
             (selected, heading, detail, None)
         } else if self.settings.ring_shortcuts.mouse_ring_enabled(context) {
+            if !self.settings.ring_shortcuts.mouse_ring_help_visible {
+                return None;
+            }
             let flick = self.mouse_ring_flick.as_ref()?;
             if flick.context != context || !flick.guide_visible() {
                 return None;

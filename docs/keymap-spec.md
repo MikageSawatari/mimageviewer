@@ -8,7 +8,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 横断仕様と現状差分は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md)
 を参照すること。
 
-一部のキーボード操作は環境設定のコマンド設定で上書きできる。設定の正本は
+一部のキーボード操作は設定メニュー「操作カスタマイズ…」で上書きできる。設定の正本は
 `Settings.keymap` (`settings.db`) で、旧 `%APPDATA%\mimageviewer\keymap.ini`
 が残っている場合は初回起動時に 1 回だけ取り込んで
 `keymap.ini.imported*.bak` へ退避する。Action 名・書式・固定扱いの入力は

@@ -36,7 +36,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 | お気に入り | このフォルダを追加… / 編集 / コンテナ検索 (Ctrl+S) / アイテム検索 (Ctrl+G) / [登録済みフォルダ一覧] |
 | タグ | ピン留めタグの管理… / タグビュー (Ctrl+T) / タグを付ける/外す… / 選択中の項目からタグをクリア / 旧XMPタグを取り込む… / [ピン留めタグ一覧] |
 | 製本 | 追加先の本に追加 / クリップボードの画像を本に追加 / 本棚フォルダを開く / 追加先の本を開く / この本を並べ替え / 製本の管理… / 追加先の本を選ぶ |
-| 設定 | サムネイル列数 / 比率 / ソート順 / キャッシュ管理… / サムネイル画質… / 統計… / 回転情報をリセット… / 環境設定… |
+| 設定 | サムネイル列数 / 比率 / ソート順 / キャッシュ管理… / サムネイル画質… / 統計… / 回転情報をリセット… / 操作カスタマイズ… / 環境設定… |
 
 - トップレベルメニューのいずれかをクリックして開いている間は、`ファイル` /
   `お気に入り` / `動画` / `タグ` / `製本` / `設定` / `ヘルプ` の別項目へマウスを
@@ -661,7 +661,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 
 ## 7. キーボード操作
 
-一部のキーボード操作は環境設定「表示 → コマンド」で変更できる。設定は
+一部のキーボード操作は設定メニュー「操作カスタマイズ…」で変更できる。設定は
 `Settings.keymap` として `%APPDATA%\mimageviewer\settings.db` に保存する。旧形式の
 `%APPDATA%\mimageviewer\keymap.ini` が残っている場合は、初回起動時に 1 回だけ読み込んで
 同じ割り当てを settings.db へ移行し、`keymap.ini.imported*.bak` へリネームする。
@@ -822,7 +822,7 @@ F12 相当の別ウィンドウ ON/OFF もこの候補に含める。
 [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) を参照。
 
 リングショートカットの既定スロットは次の通り。既存設定を持つ環境は上書きせず、
-環境設定の「既定に戻す」または新規環境でこの配置を使う。同じ機能は同じ方向に
+操作カスタマイズの「既定に戻す」または新規環境でこの配置を使う。同じ機能は同じ方向に
 揃え、`↙` は本棚に追加、`↓` は代表サムネ / フレーム、画像・動画の `↖` は
 キャプチャ保存にする。
 
@@ -841,8 +841,7 @@ F12 相当の別ウィンドウ ON/OFF もこの候補に含める。
 
 ゲームパッドは閲覧用の固定割り当てを中心に扱う。編集、削除、外部エクスポートなどの
 破壊的操作や、完全な操作割り当て変更 UI は対象外。
-例外として、マウス戻る / 進むボタンは「環境設定 > マウスボタン」、
-X リングは「環境設定 > リングショートカット」で差し替えられる。
+例外として、マウス戻る / 進むボタンと X リングは設定メニュー「操作カスタマイズ…」で差し替えられる。
 
 | 入力 | 動作 |
 |------|------|
@@ -1017,7 +1016,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `reading_history_limit` | usize | 1000 | 読書履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
-| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進むボタンの個別割り当て、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
+| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進むボタンの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
@@ -1116,7 +1115,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `toolbar_{cols,aspect,sort,favorites,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_{favorites,tags,bookshelf}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。欠落時や空設定は既定メニュー構成として扱う |
-| `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。環境設定「表示 → コマンド」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
+| `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。設定メニュー「操作カスタマイズ…」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | ウィンドウ位置・サイズ（自動保存） |
 

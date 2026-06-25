@@ -7,6 +7,7 @@ use eframe::egui;
 use std::collections::HashSet;
 
 use crate::app::App;
+use crate::ring_shortcut::{RightDragContext, RingShortcutContext};
 use crate::settings::{Parallelism, Settings};
 
 mod pages;
@@ -41,10 +42,7 @@ pub(crate) enum PreferencesPage {
     Thumbnail,
     Slideshow,
     Capture,
-    CommandSettings,
-    MouseButtons,
     MenuLayout,
-    RingShortcut,
     Parallelism,
     Prefetch,
     GpuMemory,
@@ -87,10 +85,7 @@ impl PreferencesPage {
             Self::Thumbnail => "サムネイル",
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
-            Self::CommandSettings => "コマンド",
-            Self::MouseButtons => "マウスボタン",
             Self::MenuLayout => "メニュー構成",
-            Self::RingShortcut => "リングショートカット",
             Self::Parallelism => "並列読み込み",
             Self::Prefetch => "先読み",
             Self::GpuMemory => "GPUメモリ",
@@ -111,6 +106,55 @@ impl PreferencesPage {
             Self::Vst3 => "VST3 プラグイン",
             Self::EditingAddon => "編集用追加ファイル",
             Self::Developer => "開発者",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationCustomizeTab {
+    Settings,
+    Commands,
+    RingShortcut,
+    Keyboard,
+    MouseGesture,
+    Gamepad,
+}
+
+impl OperationCustomizeTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Settings => "設定",
+            Self::Commands => "コマンド一覧",
+            Self::RingShortcut => "リングショートカット",
+            Self::Keyboard => "キーボード",
+            Self::MouseGesture => "マウスジェスチャ",
+            Self::Gamepad => "ゲームパッド",
+        }
+    }
+
+    fn all() -> &'static [Self] {
+        &[
+            Self::Settings,
+            Self::Commands,
+            Self::RingShortcut,
+            Self::Keyboard,
+            Self::MouseGesture,
+            Self::Gamepad,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationSettingsTab {
+    Behavior,
+    RightDrag,
+}
+
+impl OperationSettingsTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Behavior => "動作",
+            Self::RightDrag => "右ドラッグ",
         }
     }
 }
@@ -149,10 +193,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::SpreadMode,
             PreferencesPage::Slideshow,
             PreferencesPage::Capture,
-            PreferencesPage::CommandSettings,
-            PreferencesPage::MouseButtons,
             PreferencesPage::MenuLayout,
-            PreferencesPage::RingShortcut,
         ],
     },
     TreeCategory {
@@ -220,6 +261,10 @@ pub(crate) struct PreferencesState {
     pub command_chord_inputs: [String; 3],
     pub command_capture_slot: Option<usize>,
     pub command_edit_error: Option<String>,
+    pub operation_tab: OperationCustomizeTab,
+    pub operation_settings_tab: OperationSettingsTab,
+    pub operation_ring_context: RingShortcutContext,
+    pub operation_mouse_gesture_context: RightDragContext,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
     /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
@@ -428,6 +473,10 @@ impl PreferencesState {
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,
             command_edit_error: None,
+            operation_tab: OperationCustomizeTab::Settings,
+            operation_settings_tab: OperationSettingsTab::Behavior,
+            operation_ring_context: RingShortcutContext::Grid,
+            operation_mouse_gesture_context: RightDragContext::Grid,
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
             auto_thread_count,
@@ -572,7 +621,6 @@ impl App {
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let ime_active = self.ime_input_active();
 
         egui::Window::new("環境設定")
             .open(&mut open)
@@ -643,7 +691,7 @@ impl App {
                     .show(&mut right_ui, |ui| {
                         ui.set_width(ui.available_width());
                         command_capture_waiting = state.command_capture_slot.is_some();
-                        draw_page(ui, state, enter_pressed, ime_active);
+                        draw_page(ui, state, enter_pressed);
                     });
 
                 // 全体の高さを確保
@@ -1041,6 +1089,132 @@ impl App {
         }
     }
 
+    pub(crate) fn show_operation_customize_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_operation_customize {
+            return;
+        }
+
+        if self.operation_customize_state.is_none() {
+            let mut state = PreferencesState::from_settings(
+                &self.settings,
+                self.ai_runtime.as_deref(),
+                self.audio_normalize_db.is_some(),
+                self.audio_normalize_db
+                    .as_ref()
+                    .map(|db| db.count())
+                    .unwrap_or(0),
+                self.book_resume_db
+                    .as_ref()
+                    .map(|db| db.count())
+                    .unwrap_or(0),
+                self.reading_history_db
+                    .as_ref()
+                    .map(|db| db.count())
+                    .unwrap_or(0),
+            );
+            state.operation_tab = OperationCustomizeTab::Settings;
+            self.operation_customize_state = Some(state);
+        }
+
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let ime_active = self.ime_input_active();
+        let dialog_pos = ctx.content_rect().min + egui::vec2(46.0, 32.0);
+
+        egui::Window::new("操作カスタマイズ")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_pos(dialog_pos)
+            .default_size([1040.0, 720.0])
+            .min_width(860.0)
+            .min_height(560.0)
+            .show(ctx, |ui| {
+                let state = self.operation_customize_state.as_mut().unwrap();
+                let available = ui.available_size();
+                let bottom_height = 38.0;
+                let main_height = (available.y - bottom_height - 14.0).max(360.0);
+
+                draw_operation_customize_tabs(ui, state);
+                ui.separator();
+
+                let mut content_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::vec2(available.x, main_height),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                content_ui.spacing_mut().scroll = pref_panel_scroll_style();
+                egui::ScrollArea::vertical()
+                    .id_salt("operation_customize_panel")
+                    .scroll_bar_visibility(
+                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
+                    .auto_shrink([false, false])
+                    .max_height(main_height)
+                    .show(&mut content_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_operation_customize_page(ui, state, ime_active);
+                    });
+                ui.allocate_space(egui::vec2(available.x, main_height));
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("  OK  ").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                    if state.command_capture_slot.is_some() {
+                        ui.small("キー入力待ち中です。Esc で入力待ちだけをキャンセルできます。");
+                    }
+                });
+            });
+
+        if apply {
+            if let Some(state) = self.operation_customize_state.take() {
+                self.apply_operation_customize_state(state);
+            }
+            self.show_operation_customize = false;
+        } else if cancel || !open {
+            self.operation_customize_state = None;
+            self.show_operation_customize = false;
+        }
+    }
+
+    fn apply_operation_customize_state(&mut self, state: PreferencesState) {
+        let old_keymap_settings = self.settings.keymap.clone();
+        let old_ring_shortcuts = self.settings.ring_shortcuts.clone();
+
+        self.settings.keymap = state.settings.keymap;
+        self.settings.ring_shortcuts = state.settings.ring_shortcuts;
+        self.settings.ring_shortcuts.sanitize();
+
+        if old_keymap_settings != self.settings.keymap {
+            let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
+            for warning in keymap.warnings() {
+                crate::logger::log(format!("[keymap] {warning}"));
+            }
+            keymap.install_global_native_video_shortcuts();
+            self.keymap = keymap;
+            self.native_overlay_shortcut_help_cache = None;
+        }
+        if old_ring_shortcuts != self.settings.ring_shortcuts {
+            #[cfg(windows)]
+            {
+                self.set_native_video_ring_guide_overlay(None);
+                self.set_native_video_ring_picker_overlay(None);
+            }
+        }
+        self.settings.save();
+    }
+
     /// 編集用追加パック削除フロー本体。
     /// - `active.json` を即削除 (= `addon_status()` が即 Missing になる、フォントは次回ベイクで外れる)
     /// - フォントキャッシュを無効化
@@ -1162,6 +1336,129 @@ impl App {
 
 // ── ツリー描画 ──────────────────────────────────────────────────
 
+fn draw_operation_customize_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.horizontal_wrapped(|ui| {
+        for &tab in OperationCustomizeTab::all() {
+            if ui
+                .selectable_label(state.operation_tab == tab, tab.label())
+                .clicked()
+            {
+                state.operation_tab = tab;
+                state.command_capture_slot = None;
+                state.command_edit_error = None;
+            }
+        }
+    });
+}
+
+fn draw_operation_customize_page(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    ime_active: bool,
+) {
+    match state.operation_tab {
+        OperationCustomizeTab::Settings => draw_operation_settings_page(ui, state),
+        OperationCustomizeTab::Commands => {
+            page_command_settings(ui, state, ime_active);
+        }
+        OperationCustomizeTab::RingShortcut => {
+            draw_ring_context_tabs(ui, state);
+            ui.add_space(8.0);
+            let context = state.operation_ring_context;
+            page_ring_shortcut_assignments(ui, state, context);
+        }
+        OperationCustomizeTab::Keyboard => {
+            ui.small("キーボード図からの編集は後続です。現時点ではコマンド一覧と同じキー割り当てエディタを使います。");
+            ui.add_space(8.0);
+            page_command_settings(ui, state, ime_active);
+        }
+        OperationCustomizeTab::MouseGesture => {
+            draw_mouse_gesture_context_tabs(ui, state);
+            ui.add_space(8.0);
+            let context = state.operation_mouse_gesture_context;
+            page_mouse_gesture_bindings(ui, state, context);
+        }
+        OperationCustomizeTab::Gamepad => {
+            draw_gamepad_context_tabs(ui, state);
+            ui.add_space(8.0);
+            ui.small("ゲームパッド X+方向はリングショートカットと同じ割り当てを使います。X 単体で開くピッカーパネルの項目は固定です。");
+            ui.add_space(8.0);
+            let context = state.operation_ring_context;
+            page_ring_shortcut_assignments(ui, state, context);
+        }
+    }
+}
+
+fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.horizontal(|ui| {
+        for tab in [
+            OperationSettingsTab::Behavior,
+            OperationSettingsTab::RightDrag,
+        ] {
+            if ui
+                .selectable_label(state.operation_settings_tab == tab, tab.label())
+                .clicked()
+            {
+                state.operation_settings_tab = tab;
+            }
+        }
+    });
+    ui.add_space(8.0);
+    match state.operation_settings_tab {
+        OperationSettingsTab::Behavior => page_operation_behavior(ui, state),
+        OperationSettingsTab::RightDrag => {
+            page_right_drag_modes(ui, state);
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("マウス戻る / 進むボタン").strong());
+            page_mouse_buttons(ui, state);
+        }
+    }
+}
+
+fn draw_ring_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.horizontal_wrapped(|ui| {
+        for &context in RingShortcutContext::all() {
+            if ui
+                .selectable_label(state.operation_ring_context == context, context.label())
+                .clicked()
+            {
+                state.operation_ring_context = context;
+            }
+        }
+    });
+}
+
+fn draw_gamepad_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.horizontal_wrapped(|ui| {
+        for &context in RingShortcutContext::all() {
+            if ui
+                .selectable_label(state.operation_ring_context == context, context.label())
+                .clicked()
+            {
+                state.operation_ring_context = context;
+            }
+        }
+    });
+}
+
+fn draw_mouse_gesture_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.horizontal_wrapped(|ui| {
+        for &context in RightDragContext::all() {
+            if ui
+                .selectable_label(
+                    state.operation_mouse_gesture_context == context,
+                    context.label(),
+                )
+                .clicked()
+            {
+                state.operation_mouse_gesture_context = context;
+            }
+        }
+    });
+}
+
 fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
     for cat in TREE {
         if cat.children.is_empty() {
@@ -1215,12 +1512,7 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 // ── 右パネル ページ描画 ─────────────────────────────────────────
 
-fn draw_page(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    enter_pressed: bool,
-    ime_active: bool,
-) {
+fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: bool) {
     ui.heading(state.selected.label());
     ui.add_space(8.0);
 
@@ -1231,10 +1523,7 @@ fn draw_page(
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
-        PreferencesPage::CommandSettings => page_command_settings(ui, state, ime_active),
-        PreferencesPage::MouseButtons => page_mouse_buttons(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),
-        PreferencesPage::RingShortcut => page_ring_shortcut(ui, state),
         PreferencesPage::Parallelism => page_parallelism(ui, state),
         PreferencesPage::Prefetch => page_prefetch(ui, state),
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),

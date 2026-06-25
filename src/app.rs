@@ -2969,6 +2969,9 @@ pub struct App {
     pub(crate) show_preferences: bool,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    /// 操作カスタマイズダイアログ (キーボード / 右ドラッグ / リング / ジェスチャ)
+    pub(crate) show_operation_customize: bool,
+    pub(crate) operation_customize_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
 
     // ── 設定の復元ダイアログ ───────────────────────────────────────
     /// `設定` メニュー →「設定の復元…」で開くダイアログの可視フラグ。
@@ -5588,10 +5591,12 @@ impl App {
             rename_error: None,
             rename_pending: None,
             show_preferences: false,
+            show_operation_customize: false,
             show_settings_restore: false,
             settings_restore_state:
                 crate::ui_dialogs::settings_restore::SettingsRestoreState::default(),
             pref_state: None,
+            operation_customize_state: None,
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
@@ -7131,6 +7136,7 @@ impl App {
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
+            || self.show_operation_customize
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
             || self.show_context_shortcuts_help
@@ -7173,6 +7179,7 @@ impl App {
             || self.show_book_manager
             || self.book_reorder.is_some()
             || self.show_preferences
+            || self.show_operation_customize
             || self.show_mouse_nav_migration_prompt
             || self.show_whats_new
             || self.show_context_shortcuts_help
@@ -37606,6 +37613,7 @@ impl eframe::App for App {
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。

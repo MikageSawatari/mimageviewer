@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。環境設定「表示 → コマンド」初期 GUI スライス実装中** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。設定メニュー「操作カスタマイズ」独立ダイアログ移設スライス実装中** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -23,13 +23,18 @@
 > `keymap.ini.default` は Action 名と既定キーの参照ファイルとして残す。
 >
 > **コマンド設定 GUI 初期スライス実装メモ (2026-06-25, Codex)**:
-> 環境設定「表示 → コマンド」を追加し、`Settings.keymap` の上書きを GUI から編集できるようにする。
+> 環境設定「表示 → コマンド」として初期実装した後、実機確認で狭い環境設定ペインでは編集 UI /
+> 競合表示 / Esc 挙動が扱いにくいことが分かったため、設定メニュー「操作カスタマイズ…」の
+> 独立した大きめのダイアログへ移設する。
+> `Settings.keymap` の上書きを GUI から編集できるようにする。
 > 一覧は `KeyAction` 全体を対象にし、Action 名 / 説明 / コンテキストで絞り込める。
 > 1 コマンド最大 3 キーを入力でき、「押して入力」で通常キー系の chord を取り込める。
 > 割り当て解除・既定復帰・全体既定化を提供する。
 > `BindingConflict` は保存禁止にせず警告として表示し、競合一覧から各コマンドの編集欄へ移動できる。
 > OK 反映時に runtime `Keymap` と native 動画転送用 shortcut snapshot も更新する。
-> マウスジェスチャーと右ドラッグ mode 4 文脈化は `Settings.ring_shortcuts` 側で実装中。リングショートカットのコマンド画面統合とゲームパッド入力範囲拡張は後続で仕様相談する。
+> 右ドラッグ mode 4 文脈化、リングショートカット、マウスジェスチャも同じ「操作カスタマイズ」
+> ダイアログにまとめる。現スライスでは既存の編集部品を大きなタブ式ダイアログへ移し、
+> キーボード図 / ゲームパッド図などの高度なビジュアル編集は後続で仕様を詰める。
 >
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
 > `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。

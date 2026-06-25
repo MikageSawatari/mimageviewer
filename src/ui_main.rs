@@ -2115,6 +2115,9 @@ impl App {
         let settings_restore_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsRestoreSettings);
+        let settings_operation_customize_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsOperationCustomize);
         let settings_preferences_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsPreferences);
@@ -2751,6 +2754,16 @@ impl App {
                                                 // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
                                                 // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
                                                 self.open_settings_restore_dialog();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsOperationCustomize => {
+                                            ui.separator();
+                                            if ui
+                                                .button(&settings_operation_customize_menu_label)
+                                                .clicked()
+                                            {
+                                                self.show_operation_customize = true;
                                                 ui.close();
                                             }
                                         }

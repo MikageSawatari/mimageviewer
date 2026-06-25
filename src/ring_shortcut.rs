@@ -1100,6 +1100,10 @@ pub struct RingShortcutSettings {
     pub mouse_nav_prompt_done: bool,
     #[serde(default)]
     pub x_picker_hint_shown: bool,
+    #[serde(default = "default_true")]
+    pub mouse_ring_help_visible: bool,
+    #[serde(default = "default_true")]
+    pub mouse_gesture_help_visible: bool,
     #[serde(default = "default_grid_profile")]
     pub grid: RingShortcutProfile,
     #[serde(default = "default_image_profile")]
@@ -1291,6 +1295,8 @@ impl Default for RingShortcutSettings {
             mouse_buttons_video: default_mouse_button_profile(),
             mouse_nav_prompt_done: false,
             x_picker_hint_shown: false,
+            mouse_ring_help_visible: true,
+            mouse_gesture_help_visible: true,
             grid: default_grid_profile(),
             image: default_image_profile(),
             video: default_video_profile(),
@@ -1701,6 +1707,8 @@ mod tests {
         );
         assert!(defaults.mouse_gestures_edit.bindings.is_empty());
         assert_eq!(defaults.gamepad_ring_enabled, true);
+        assert!(defaults.mouse_ring_help_visible);
+        assert!(defaults.mouse_gesture_help_visible);
         assert_eq!(defaults.shift_wheel_pair, WheelPairActionId::None);
         assert_eq!(defaults.alt_wheel_pair, WheelPairActionId::None);
         assert_eq!(

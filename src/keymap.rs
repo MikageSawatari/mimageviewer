@@ -1343,6 +1343,7 @@ pub enum MenuCommandId {
     SettingsStats,
     SettingsResetRotation,
     SettingsRestoreSettings,
+    SettingsOperationCustomize,
     SettingsPreferences,
     HelpOpenManual,
     HelpOpenLogs,
@@ -1379,6 +1380,7 @@ impl MenuCommandId {
         Self::SettingsStats,
         Self::SettingsResetRotation,
         Self::SettingsRestoreSettings,
+        Self::SettingsOperationCustomize,
         Self::SettingsPreferences,
         Self::HelpOpenManual,
         Self::HelpOpenLogs,
@@ -1415,6 +1417,7 @@ impl MenuCommandId {
             MenuCommandId::SettingsStats => "SettingsStats",
             MenuCommandId::SettingsResetRotation => "SettingsResetRotation",
             MenuCommandId::SettingsRestoreSettings => "SettingsRestoreSettings",
+            MenuCommandId::SettingsOperationCustomize => "SettingsOperationCustomize",
             MenuCommandId::SettingsPreferences => "SettingsPreferences",
             MenuCommandId::HelpOpenManual => "HelpOpenManual",
             MenuCommandId::HelpOpenLogs => "HelpOpenLogs",
@@ -1608,6 +1611,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::SettingsRestoreSettings,
         parent: TopMenuId::Settings,
         label: "設定の復元…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsOperationCustomize,
+        parent: TopMenuId::Settings,
+        label: "操作カスタマイズ…",
         action: None,
     },
     MenuCommandSpec {
@@ -3761,7 +3770,7 @@ impl Keymap {
                 );
             }
         }
-        out.push_str("# 通常は環境設定のコマンド設定画面から編集します。\n");
+        out.push_str("# 通常は設定メニュー「操作カスタマイズ…」から編集します。\n");
         out.push_str("#\n");
         out.push_str("# 書式:\n");
         out.push_str("# - 下のキー定義行はすべてコメントアウトされています。\n");
@@ -4763,6 +4772,10 @@ mod tests {
             (MenuCommandId::SettingsStats, "統計…"),
             (MenuCommandId::SettingsResetRotation, "回転情報をリセット…"),
             (MenuCommandId::SettingsRestoreSettings, "設定の復元…"),
+            (
+                MenuCommandId::SettingsOperationCustomize,
+                "操作カスタマイズ…",
+            ),
             (MenuCommandId::SettingsPreferences, "環境設定…"),
             (MenuCommandId::HelpOpenManual, "ヘルプサイトを開く"),
             (MenuCommandId::HelpOpenLogs, "ログフォルダを開く"),

@@ -461,7 +461,22 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 }
 
-pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState) {
+pub(super) fn page_operation_behavior(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let settings = &mut state.settings.ring_shortcuts;
+
+    ui.small("右ドラッグ操作中に表示するガイドを切り替えます。オフにしても、割り当てたリングショートカットやマウスジェスチャ自体は実行されます。");
+    ui.add_space(8.0);
+    ui.checkbox(
+        &mut settings.mouse_ring_help_visible,
+        "右ドラッグのリングショートカットガイドを表示する",
+    );
+    ui.checkbox(
+        &mut settings.mouse_gesture_help_visible,
+        "マウスジェスチャの登録一覧 / 入力中表示を表示する",
+    );
+}
+
+pub(super) fn page_right_drag_modes(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let settings = &mut state.settings.ring_shortcuts;
 
     ui.label(egui::RichText::new("マウス右ドラッグ").strong());
@@ -474,21 +489,25 @@ pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState
                 right_drag_mode_combo(ui, settings, context);
             }
         });
+}
 
-    ui.add_space(8.0);
-    ui.small("ゲームパッド X は常にリング/ピッカーとして使えます。X 単体で開くピッカーパネルの項目は固定で、この画面では変更しません。");
+pub(super) fn page_ring_shortcut_assignments(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RingShortcutContext,
+) {
+    ui.small("ゲームパッド X リングと、右ドラッグ mode をリングショートカットにした文脈で使う 8 方向スロットです。");
+    ring_shortcut_context_editor(ui, &mut state.settings.ring_shortcuts, context);
+}
 
-    ui.add_space(10.0);
-    for &context in RingShortcutContext::all() {
-        ring_shortcut_context_editor(ui, settings, context);
-    }
-
-    ui.add_space(12.0);
-    ui.label(egui::RichText::new("マウスジェスチャ").strong());
+pub(super) fn page_mouse_gesture_bindings(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RightDragContext,
+) {
+    ui.label(egui::RichText::new(context.label()).strong());
     ui.small("右ドラッグ mode をマウスジェスチャにした文脈で使います。同じ方向の連続入力は 1 stroke に圧縮され、最大 4 stroke まで登録できます。");
-    for &context in RightDragContext::all() {
-        mouse_gesture_context_editor(ui, settings, context);
-    }
+    mouse_gesture_context_editor(ui, &mut state.settings.ring_shortcuts, context);
 }
 
 pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState) {
