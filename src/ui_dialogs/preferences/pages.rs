@@ -1062,6 +1062,7 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
     egui::Window::new(title)
         .open(&mut open)
         .resizable(true)
+        .movable(false)
         .collapsible(false)
         .default_size([460.0, 360.0])
         .min_width(420.0)
@@ -1070,7 +1071,7 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
             ui.add_space(8.0);
 
             let desired = egui::vec2(ui.available_width().max(320.0), 190.0);
-            let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
             ui.painter()
                 .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
             ui.painter().rect_stroke(

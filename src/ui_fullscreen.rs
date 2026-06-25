@@ -8028,8 +8028,15 @@ impl App {
         // `secondary_down == false` every frame and cancel the presenter-created flick. In
         // the non-detached path `render_fullscreen_viewport` early-returns before reaching
         // here; in the detached path the egui body runs, so we must skip video explicitly.
+        let dialog_open_for_right_drag = self.any_dialog_open();
+        if dialog_open_for_right_drag {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            self.fs_secondary_press_start = None;
+        }
         if !state.is_video
             && !self.analysis_mode
+            && !dialog_open_for_right_drag
             && self.fs_context_menu_idx.is_none()
             && !self.spread_popup_open
             && !self.fit_popup_open

@@ -8937,7 +8937,8 @@ impl App {
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         let mut nav = None;
-        if !self.items_are_drive_list
+        if !self.any_dialog_open()
+            && !self.items_are_drive_list
             && let Some(pos) = ctx.input(|i| {
                 i.pointer
                     .secondary_pressed()
@@ -9283,7 +9284,8 @@ impl App {
         ctx: &egui::Context,
         rect: egui::Rect,
     ) {
-        if self.items_are_drive_list
+        if self.any_dialog_open()
+            || self.items_are_drive_list
             || self.mouse_ring_flick.is_some()
             || self.mouse_gesture.is_some()
         {
@@ -9320,6 +9322,11 @@ impl App {
     }
 
     fn update_grid_mouse_ring_flick(&mut self, ctx: &egui::Context) {
+        if self.any_dialog_open() {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            return;
+        }
         match self.update_mouse_ring_flick(ctx, crate::ring_shortcut::RingShortcutContext::Grid) {
             crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
                 let target_idx = self.mouse_ring_grid_target_idx.take();
