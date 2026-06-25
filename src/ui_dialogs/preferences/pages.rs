@@ -1,7 +1,7 @@
 use super::*;
 use crate::keymap::{
-    BindingConflict, BindingConflictKind, KeyAction, KeyTrigger, Keymap, MenuCommandId,
-    MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId, menu_command_spec,
+    BindingConflict, BindingConflictKind, Chord, KeyAction, KeyName, KeyTrigger, Keymap,
+    MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId, menu_command_spec,
     menu_commands_for_parent, parse_chord_for_action,
 };
 use crate::ring_shortcut::{
@@ -511,6 +511,7 @@ pub(super) fn page_command_settings(ui: &mut egui::Ui, state: &mut PreferencesSt
         if ui.button("すべて既定に戻す").clicked() {
             state.settings.keymap.overrides.clear();
             state.command_edit_loaded_for = None;
+            state.command_capture_slot = None;
             state.command_edit_error = None;
         }
     });
@@ -672,6 +673,21 @@ fn command_editor(
     };
 
     ensure_command_editor_loaded(state, keymap, action);
+    if let Some(slot) = state.command_capture_slot
+        && let Some(result) = poll_command_chord_capture(ui.ctx(), action)
+    {
+        match result {
+            Ok(label) if slot < state.command_chord_inputs.len() => {
+                state.command_chord_inputs[slot] = label;
+                state.command_edit_error = None;
+            }
+            Ok(_) => {}
+            Err(message) => {
+                state.command_edit_error = Some(message);
+            }
+        }
+        state.command_capture_slot = None;
+    }
 
     ui.label(egui::RichText::new(action.ini_name()).strong());
     ui.label(action.description());
@@ -698,7 +714,7 @@ fn command_editor(
 
     ui.add_space(8.0);
     egui::Grid::new("command_editor_slots")
-        .num_columns(2)
+        .num_columns(3)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
             for (idx, input) in state.command_chord_inputs.iter_mut().enumerate() {
@@ -712,6 +728,25 @@ fn command_editor(
                             ""
                         }),
                 );
+                let capture_active = state.command_capture_slot == Some(idx);
+                let can_capture = action.trigger() != KeyTrigger::ModifierHold;
+                let capture_label = if capture_active {
+                    "入力待ち..."
+                } else {
+                    "押して入力"
+                };
+                if ui
+                    .add_enabled(can_capture, egui::Button::new(capture_label).small())
+                    .on_hover_text(if can_capture {
+                        "次に押したキーをこの欄へ入れます。Esc でキャンセルします"
+                    } else {
+                        "修飾キー長押しは Ctrl / Shift / Alt を手入力してください"
+                    })
+                    .clicked()
+                {
+                    state.command_capture_slot = Some(idx);
+                    state.command_edit_error = None;
+                }
                 ui.end_row();
             }
         });
@@ -729,11 +764,13 @@ fn command_editor(
             state.settings.keymap.disable_action(action);
             state.command_chord_inputs = std::array::from_fn(|_| String::new());
             state.command_edit_loaded_for = Some(action);
+            state.command_capture_slot = None;
             state.command_edit_error = None;
         }
         if ui.button("既定に戻す").clicked() {
             state.settings.keymap.remove_override(action);
             state.command_edit_loaded_for = None;
+            state.command_capture_slot = None;
             state.command_edit_error = None;
         }
     });
@@ -774,6 +811,7 @@ fn command_editor(
 fn select_command_action(state: &mut PreferencesState, action: KeyAction) {
     state.command_selected = Some(action);
     state.command_edit_loaded_for = None;
+    state.command_capture_slot = None;
     state.command_edit_error = None;
 }
 
@@ -789,6 +827,7 @@ fn ensure_command_editor_loaded(state: &mut PreferencesState, keymap: &Keymap, a
     state.command_chord_inputs =
         std::array::from_fn(|idx| labels.get(idx).cloned().unwrap_or_default());
     state.command_edit_loaded_for = Some(action);
+    state.command_capture_slot = None;
     state.command_edit_error = None;
 }
 
@@ -804,6 +843,7 @@ fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
         state.settings.keymap.disable_action(action);
         state.command_chord_inputs = std::array::from_fn(|_| String::new());
         state.command_edit_loaded_for = Some(action);
+        state.command_capture_slot = None;
         state.command_edit_error = None;
         return;
     }
@@ -816,6 +856,7 @@ fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
                 state.settings.keymap.disable_action(action);
                 state.command_chord_inputs = std::array::from_fn(|_| String::new());
                 state.command_edit_loaded_for = Some(action);
+                state.command_capture_slot = None;
                 state.command_edit_error = None;
                 return;
             }
@@ -838,7 +879,48 @@ fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
         state.settings.keymap.set_override_chords(action, deduped);
     }
     state.command_edit_loaded_for = None;
+    state.command_capture_slot = None;
     state.command_edit_error = None;
+}
+
+fn poll_command_chord_capture(
+    ctx: &egui::Context,
+    action: KeyAction,
+) -> Option<Result<String, String>> {
+    ctx.input_mut(|i| {
+        let mut result = None;
+        i.events.retain(|event| {
+            if result.is_some() {
+                return true;
+            }
+            let egui::Event::Key {
+                key,
+                pressed,
+                repeat,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if !*pressed || *repeat {
+                return true;
+            }
+            if *key == egui::Key::Escape {
+                result = Some(Err("キー入力待ちをキャンセルしました。".to_string()));
+                return false;
+            }
+            let Some(name) = KeyName::from_egui(*key) else {
+                result = Some(Err(format!("このキーは割り当て対象外です: {key:?}")));
+                return false;
+            };
+            let chord = Chord::new(modifiers.ctrl, modifiers.shift, modifiers.alt, name);
+            let label = chord.display_name();
+            result = Some(parse_chord_for_action(action, &label).map(|_| label));
+            false
+        });
+        result
+    })
 }
 
 fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {

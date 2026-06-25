@@ -218,6 +218,7 @@ pub(crate) struct PreferencesState {
     pub command_selected: Option<crate::keymap::KeyAction>,
     pub command_edit_loaded_for: Option<crate::keymap::KeyAction>,
     pub command_chord_inputs: [String; 3],
+    pub command_capture_slot: Option<usize>,
     pub command_edit_error: Option<String>,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
@@ -425,6 +426,7 @@ impl PreferencesState {
             command_selected: None,
             command_edit_loaded_for: None,
             command_chord_inputs: std::array::from_fn(|_| String::new()),
+            command_capture_slot: None,
             command_edit_error: None,
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
