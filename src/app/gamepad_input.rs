@@ -8,7 +8,7 @@ use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
 use crate::grid_item::GridItem;
 use crate::ring_shortcut::{
-    GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
+    GamepadButtonSlot, GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
     GamepadLocationPickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
     MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX, MouseFlickOutcome,
     MouseFlickState, MouseGestureDirection, MouseGestureState, PickerListMode, PickerListState,
@@ -1479,7 +1479,29 @@ impl App {
                 }
                 PadEvent::AxisChanged(axis, value) => {
                     saw_input_event = true;
+                    let trigger_button = match axis {
+                        PadAxis::LeftTrigger if self.gamepad_trigger_customized(true) => {
+                            Some((PadButton::LeftTrigger, true))
+                        }
+                        PadAxis::RightTrigger if self.gamepad_trigger_customized(false) => {
+                            Some((PadButton::RightTrigger, false))
+                        }
+                        _ => None,
+                    };
                     self.gamepad_state.set_axis(axis, value);
+                    if let Some((button, left)) = trigger_button {
+                        let down = self.gamepad_state.trigger_axis_value(left) > TRIGGER_THRESHOLD;
+                        if self.gamepad_state.set_button_down(button, down, now) {
+                            actions.push(PadAction {
+                                button,
+                                kind: if down {
+                                    PadActionKind::Press
+                                } else {
+                                    PadActionKind::Release
+                                },
+                            });
+                        }
+                    }
                 }
                 PadEvent::Connected => {
                     saw_input_event = true;
@@ -1584,8 +1606,10 @@ impl App {
         let right = stick_pair(&self.gamepad_state, PadAxis::RightX, PadAxis::RightY);
         left.length_sq() > 0.0
             || right.length_sq() > 0.0
-            || self.gamepad_state.trigger_value(true) > TRIGGER_THRESHOLD
-            || self.gamepad_state.trigger_value(false) > TRIGGER_THRESHOLD
+            || (!self.gamepad_trigger_customized(true)
+                && self.gamepad_state.trigger_value(true) > TRIGGER_THRESHOLD)
+            || (!self.gamepad_trigger_customized(false)
+                && self.gamepad_state.trigger_value(false) > TRIGGER_THRESHOLD)
     }
 
     fn dispatch_gamepad_button(
@@ -1621,6 +1645,13 @@ impl App {
             }
             PadActionKind::Release if action.button == PadButton::North => {
                 if !self.gamepad_state.y_modifier_used() {
+                    if let Some(nav) = self.dispatch_gamepad_button_override(
+                        ctx,
+                        PadButton::North,
+                        PadActionKind::Press,
+                    ) {
+                        return nav;
+                    }
                     self.handle_gamepad_y_tap(ctx);
                 }
                 None
@@ -1643,6 +1674,13 @@ impl App {
                         ctx.request_repaint();
                     }
                     return None;
+                }
+                if action.button != PadButton::West
+                    && action.button != PadButton::North
+                    && let Some(nav) =
+                        self.dispatch_gamepad_button_override(ctx, action.button, action.kind)
+                {
+                    return nav;
                 }
                 if let Some(dir) = button_dir(action.button) {
                     if self.fullscreen_idx.is_none()
@@ -1758,6 +1796,77 @@ impl App {
         })
     }
 
+    fn gamepad_button_slot(button: PadButton) -> Option<GamepadButtonSlot> {
+        Some(match button {
+            PadButton::South => GamepadButtonSlot::South,
+            PadButton::East => GamepadButtonSlot::East,
+            PadButton::West => GamepadButtonSlot::West,
+            PadButton::North => GamepadButtonSlot::North,
+            PadButton::Select => GamepadButtonSlot::Select,
+            PadButton::Start => GamepadButtonSlot::Start,
+            PadButton::LeftShoulder => GamepadButtonSlot::LeftShoulder,
+            PadButton::RightShoulder => GamepadButtonSlot::RightShoulder,
+            PadButton::LeftTrigger => GamepadButtonSlot::LeftTrigger,
+            PadButton::RightTrigger => GamepadButtonSlot::RightTrigger,
+            PadButton::DPadUp
+            | PadButton::DPadDown
+            | PadButton::DPadLeft
+            | PadButton::DPadRight => return None,
+        })
+    }
+
+    fn gamepad_button_override(&self, button: PadButton) -> Option<RingActionId> {
+        let slot = Self::gamepad_button_slot(button)?;
+        self.settings
+            .ring_shortcuts
+            .gamepad_button_profile(self.current_ring_shortcut_context())
+            .action(slot)
+    }
+
+    fn gamepad_trigger_customized(&self, left: bool) -> bool {
+        self.gamepad_button_override(if left {
+            PadButton::LeftTrigger
+        } else {
+            PadButton::RightTrigger
+        })
+        .is_some()
+    }
+
+    fn dispatch_gamepad_button_override(
+        &mut self,
+        ctx: &egui::Context,
+        button: PadButton,
+        kind: PadActionKind,
+    ) -> Option<Option<AddressBarNav>> {
+        let slot = Self::gamepad_button_slot(button)?;
+        let context = self.current_ring_shortcut_context();
+        let action = self
+            .settings
+            .ring_shortcuts
+            .gamepad_button_profile(context)
+            .action(slot)?;
+        if kind != PadActionKind::Press {
+            return Some(None);
+        }
+        if matches!(action, RingActionId::None) {
+            self.show_feedback_toast(format!("[Pad:{} なし]", slot.label()));
+            return Some(None);
+        }
+        if !action.is_valid_for_context(context) {
+            crate::logger::log(format!(
+                "gamepad button ignored invalid action={} context={context:?}",
+                action.as_str()
+            ));
+            return Some(None);
+        }
+        self.show_feedback_toast(format!(
+            "[Pad:{} {}]",
+            slot.label(),
+            action.label_for_context(context)
+        ));
+        Some(self.apply_ring_action(ctx, context, action, "gamepad-button"))
+    }
+
     fn dispatch_gamepad_grid_analog(&mut self, now: Instant) -> bool {
         let mut changed = false;
         let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
@@ -1786,8 +1895,17 @@ impl App {
             changed = true;
         }
 
-        let trigger_delta =
-            self.gamepad_state.trigger_value(false) - self.gamepad_state.trigger_value(true);
+        let lt = if self.gamepad_trigger_customized(true) {
+            0.0
+        } else {
+            self.gamepad_state.trigger_value(true)
+        };
+        let rt = if self.gamepad_trigger_customized(false) {
+            0.0
+        } else {
+            self.gamepad_state.trigger_value(false)
+        };
+        let trigger_delta = rt - lt;
         let trigger_active = trigger_delta.abs() > TRIGGER_THRESHOLD;
         if self
             .gamepad_state
@@ -1806,8 +1924,16 @@ impl App {
     fn dispatch_gamepad_still_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
         let left = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
         let right = stick_pair(&self.gamepad_state, PadAxis::RightX, PadAxis::RightY);
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let lt = if self.gamepad_trigger_customized(true) {
+            0.0
+        } else {
+            self.gamepad_state.trigger_value(true)
+        };
+        let rt = if self.gamepad_trigger_customized(false) {
+            0.0
+        } else {
+            self.gamepad_state.trigger_value(false)
+        };
         let pan_active = left.length_sq() > 0.0;
         let zoom_axis = (right.y * RIGHT_STICK_ZOOM_MULTIPLIER + rt - lt)
             .clamp(-RIGHT_STICK_ZOOM_MULTIPLIER, RIGHT_STICK_ZOOM_MULTIPLIER);
@@ -1886,8 +2012,17 @@ impl App {
         fs_idx: usize,
         now: Instant,
     ) -> bool {
-        let trigger_delta =
-            self.gamepad_state.trigger_value(false) - self.gamepad_state.trigger_value(true);
+        let lt = if self.gamepad_trigger_customized(true) {
+            0.0
+        } else {
+            self.gamepad_state.trigger_value(true)
+        };
+        let rt = if self.gamepad_trigger_customized(false) {
+            0.0
+        } else {
+            self.gamepad_state.trigger_value(false)
+        };
+        let trigger_delta = rt - lt;
         let trigger_active = trigger_delta.abs() > TRIGGER_THRESHOLD;
         let due = self
             .gamepad_state
@@ -1930,6 +2065,13 @@ impl App {
         self.clear_native_video_ring_guide_overlay(ctx);
         match self.gamepad_state.finish_west_release() {
             WestReleaseOutcome::Picker => {
+                if let Some(nav) = self.dispatch_gamepad_button_override(
+                    ctx,
+                    PadButton::West,
+                    PadActionKind::Press,
+                ) {
+                    return nav;
+                }
                 self.open_gamepad_ring_picker(ctx);
                 None
             }

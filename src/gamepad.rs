@@ -352,27 +352,28 @@ impl GamepadInputState {
     }
 
     pub fn trigger_value(&self, left: bool) -> f32 {
-        let (axis, button, range) = if left {
-            (
-                PadAxis::LeftTrigger,
-                PadButton::LeftTrigger,
-                self.trigger_ranges[0],
-            )
+        let button = if left {
+            PadButton::LeftTrigger
         } else {
-            (
-                PadAxis::RightTrigger,
-                PadButton::RightTrigger,
-                self.trigger_ranges[1],
-            )
+            PadButton::RightTrigger
         };
-        let axis_value = match range {
-            TriggerRange::Unknown => self.axis(axis).clamp(0.0, 1.0),
-            TriggerRange::MinusOneToOne => ((self.axis(axis) + 1.0) * 0.5).clamp(0.0, 1.0),
-        };
+        let axis_value = self.trigger_axis_value(left);
         if self.button_down(button) {
             axis_value.max(1.0)
         } else {
             axis_value
+        }
+    }
+
+    pub fn trigger_axis_value(&self, left: bool) -> f32 {
+        let (axis, range) = if left {
+            (PadAxis::LeftTrigger, self.trigger_ranges[0])
+        } else {
+            (PadAxis::RightTrigger, self.trigger_ranges[1])
+        };
+        match range {
+            TriggerRange::Unknown => self.axis(axis).clamp(0.0, 1.0),
+            TriggerRange::MinusOneToOne => ((self.axis(axis) + 1.0) * 0.5).clamp(0.0, 1.0),
         }
     }
 
@@ -545,7 +546,7 @@ fn step_due(
 
 #[cfg(test)]
 mod tests {
-    use super::{GamepadInputState, PadButton, WestReleaseOutcome};
+    use super::{GamepadInputState, PadAxis, PadButton, WestReleaseOutcome};
     use crate::ring_shortcut::RingDirection;
     use std::time::Instant;
 
@@ -642,5 +643,20 @@ mod tests {
         assert!(!state.dpad_direction_down());
         state.clear_directional_neutral_required();
         assert!(!state.directional_neutral_required());
+    }
+
+    #[test]
+    fn trigger_axis_value_excludes_synthetic_button_state() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+
+        state.set_axis(PadAxis::LeftTrigger, 0.75);
+        assert_eq!(state.trigger_axis_value(true), 0.75);
+        assert_eq!(state.trigger_value(true), 0.75);
+
+        state.set_button_down(PadButton::LeftTrigger, true, now);
+        state.set_axis(PadAxis::LeftTrigger, 0.0);
+        assert_eq!(state.trigger_axis_value(true), 0.0);
+        assert_eq!(state.trigger_value(true), 1.0);
     }
 }
