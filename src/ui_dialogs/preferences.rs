@@ -1359,7 +1359,7 @@ fn draw_operation_customize_page(
     match state.operation_tab {
         OperationCustomizeTab::Settings => draw_operation_settings_page(ui, state),
         OperationCustomizeTab::Commands => {
-            page_command_settings(ui, state, ime_active);
+            page_command_overview(ui, state);
         }
         OperationCustomizeTab::RingShortcut => {
             draw_ring_context_tabs(ui, state);
@@ -1368,7 +1368,7 @@ fn draw_operation_customize_page(
             page_ring_shortcut_assignments(ui, state, context);
         }
         OperationCustomizeTab::Keyboard => {
-            ui.small("キーボード図からの編集は後続です。現時点ではコマンド一覧と同じキー割り当てエディタを使います。");
+            ui.small("キー割り当てを編集します。キーボード図からの選択 UI は後続で追加します。");
             ui.add_space(8.0);
             page_command_settings(ui, state, ime_active);
         }

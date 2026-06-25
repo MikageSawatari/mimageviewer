@@ -522,6 +522,111 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
     }
 }
 
+pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。編集は各タブから行います。");
+    ui.add_space(8.0);
+
+    let keymap = Keymap::from_settings(&state.settings.keymap);
+    let conflicts = keymap.binding_conflicts();
+    command_conflict_summary(ui, state, &conflicts);
+
+    ui.add_space(12.0);
+    let conflicted = conflicted_actions(&conflicts);
+    egui::Grid::new("operation_command_overview_actions")
+        .num_columns(8)
+        .spacing([10.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("操作");
+            ui.strong("場所");
+            ui.strong("キー");
+            ui.strong("リング");
+            ui.strong("マウス");
+            ui.strong("パッド");
+            ui.strong("状態");
+            ui.strong("");
+            ui.end_row();
+
+            for &action in KeyAction::all() {
+                ui.label(action.description())
+                    .on_hover_text(action.ini_name());
+                ui.label(action.context().description());
+                assignment_label(ui, &keymap.chord_labels(action));
+                dash_label(ui);
+                dash_label(ui);
+                dash_label(ui);
+                let overridden = state
+                    .settings
+                    .keymap
+                    .override_chord_labels(action)
+                    .is_some();
+                let mut status = Vec::new();
+                if overridden {
+                    status.push("上書き");
+                }
+                if conflicted.contains(&action) {
+                    status.push("競合");
+                }
+                if status.is_empty() {
+                    ui.label(egui::RichText::new("既定").weak());
+                } else {
+                    let color = if conflicted.contains(&action) {
+                        egui::Color32::from_rgb(220, 120, 80)
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.label(egui::RichText::new(status.join(" / ")).color(color));
+                }
+                if ui.small_button("キー編集").clicked() {
+                    select_command_action(state, action);
+                    state.operation_tab = OperationCustomizeTab::Keyboard;
+                }
+                ui.end_row();
+            }
+
+            for &context in RingShortcutContext::all() {
+                for action in RingActionId::available_for_context(context)
+                    .into_iter()
+                    .filter(|action| *action != RingActionId::None)
+                {
+                    let ring =
+                        ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
+                    let mouse =
+                        mouse_assignment_labels(&state.settings.ring_shortcuts, context, &action);
+                    let pad = gamepad_ring_assignment_labels(
+                        &state.settings.ring_shortcuts,
+                        context,
+                        &action,
+                    );
+                    ui.label(action.label_for_context(context))
+                        .on_hover_text(action.as_str());
+                    ui.label(context.label());
+                    dash_label(ui);
+                    assignment_label(ui, &ring);
+                    assignment_label(ui, &mouse);
+                    assignment_label(ui, &pad);
+                    if ring.is_empty() && mouse.is_empty() && pad.is_empty() {
+                        ui.label(egui::RichText::new("未設定").weak());
+                    } else {
+                        ui.label("設定あり");
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("リング").clicked() {
+                            state.operation_ring_context = context;
+                            state.operation_tab = OperationCustomizeTab::RingShortcut;
+                        }
+                        if ui.small_button("マウス").clicked() {
+                            state.operation_mouse_gesture_context =
+                                right_drag_context_for_ring_context(context);
+                            state.operation_tab = OperationCustomizeTab::MouseGesture;
+                        }
+                    });
+                    ui.end_row();
+                }
+            }
+        });
+}
+
 pub(super) fn page_command_settings(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
@@ -562,6 +667,111 @@ pub(super) fn page_command_settings(
             command_editor(ui, state, &keymap, &conflicts, ime_active);
         });
     });
+}
+
+fn dash_label(ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("-").weak());
+}
+
+fn assignment_label(ui: &mut egui::Ui, labels: &[String]) {
+    if labels.is_empty() {
+        dash_label(ui);
+    } else {
+        ui.label(labels.join(" / "));
+    }
+}
+
+fn push_unique_label(labels: &mut Vec<String>, label: String) {
+    if !labels.contains(&label) {
+        labels.push(label);
+    }
+}
+
+fn right_drag_context_for_ring_context(context: RingShortcutContext) -> RightDragContext {
+    match context {
+        RingShortcutContext::Grid => RightDragContext::Grid,
+        RingShortcutContext::ImageFullscreen => RightDragContext::ImageFullscreen,
+        RingShortcutContext::VideoFullscreen => RightDragContext::VideoFullscreen,
+    }
+}
+
+fn ring_assignment_labels(
+    settings: &RingShortcutSettings,
+    context: RingShortcutContext,
+    action: &RingActionId,
+) -> Vec<String> {
+    let right_drag_context = right_drag_context_for_ring_context(context);
+    if settings.right_drag_mode(right_drag_context) != RightDragMode::RingShortcut {
+        return Vec::new();
+    }
+    settings
+        .profile(context)
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, slot)| {
+            (slot == action).then(|| {
+                RingDirection::all()
+                    .get(idx)
+                    .map(|direction| format!("右ドラッグ {}", direction.label()))
+            })?
+        })
+        .collect()
+}
+
+fn gamepad_ring_assignment_labels(
+    settings: &RingShortcutSettings,
+    context: RingShortcutContext,
+    action: &RingActionId,
+) -> Vec<String> {
+    settings
+        .profile(context)
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, slot)| {
+            (slot == action).then(|| {
+                RingDirection::all()
+                    .get(idx)
+                    .map(|direction| format!("X+{}", direction.label()))
+            })?
+        })
+        .collect()
+}
+
+fn mouse_assignment_labels(
+    settings: &RingShortcutSettings,
+    context: RingShortcutContext,
+    action: &RingActionId,
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    let buttons = settings.mouse_button_profile(context);
+    if buttons.back == *action {
+        push_unique_label(&mut labels, "戻るボタン".to_string());
+    }
+    if buttons.forward == *action {
+        push_unique_label(&mut labels, "進むボタン".to_string());
+    }
+
+    for &right_drag_context in RightDragContext::all() {
+        if right_drag_context.gesture_action_context() != context {
+            continue;
+        }
+        let profile = settings.mouse_gesture_profile(right_drag_context);
+        for binding in &profile.bindings {
+            if binding.action == *action {
+                push_unique_label(
+                    &mut labels,
+                    format!(
+                        "{} {}",
+                        right_drag_context.label(),
+                        format_mouse_gesture_pattern(&binding.pattern)
+                    ),
+                );
+            }
+        }
+    }
+    labels
 }
 
 fn command_conflict_summary(

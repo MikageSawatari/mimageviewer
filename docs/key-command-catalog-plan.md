@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。設定メニュー「操作カスタマイズ」独立ダイアログ移設スライス実装中** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。設定メニュー「操作カスタマイズ」独立ダイアログ移設 + コマンド一覧整理スライス実装中** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -34,6 +34,8 @@
 > OK 反映時に runtime `Keymap` と native 動画転送用 shortcut snapshot も更新する。
 > 右ドラッグ mode 4 文脈化、リングショートカット、マウスジェスチャも同じ「操作カスタマイズ」
 > ダイアログにまとめる。現スライスでは既存の編集部品を大きなタブ式ダイアログへ移し、
+> 「コマンド一覧」タブはキーボード / リング / マウス / ゲームパッド割り当ての一覧表示にし、
+> キー編集本体は「キーボード」タブへ分離する。
 > キーボード図 / ゲームパッド図などの高度なビジュアル編集は後続で仕様を詰める。
 >
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
