@@ -1318,6 +1318,43 @@ mod phase_c_key_tests {
     }
 
     #[test]
+    fn gamepad_location_entries_include_rating_views() {
+        let mut app = setup_app();
+        let counts = [0, 11, 22, 33, 44, 55];
+        let entries = app.build_gamepad_location_entries(Some(counts));
+        let rating_entries: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.nav {
+                crate::ring_shortcut::GamepadLocationNav::RatingView(stars) => {
+                    Some((*stars, entry.label.as_str(), entry.value.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            rating_entries,
+            vec![
+                (1, "★1 レーティング一覧", "11 件"),
+                (2, "★2 レーティング一覧", "22 件"),
+                (3, "★3 レーティング一覧", "33 件"),
+                (4, "★4 レーティング一覧", "44 件"),
+                (5, "★5 レーティング一覧", "55 件"),
+            ]
+        );
+
+        app.items_are_rating_view = true;
+        app.rating_view_stars = 3;
+        let current = app
+            .current_gamepad_location_index(&entries)
+            .and_then(|idx| entries.get(idx));
+        assert!(matches!(
+            current.map(|entry| &entry.nav),
+            Some(crate::ring_shortcut::GamepadLocationNav::RatingView(3))
+        ));
+    }
+
+    #[test]
     fn enter_drive_list_sets_virtual_state_and_last_folder_sentinel() {
         let mut app = setup_app();
         let previous = PathBuf::from(r"C:\pics");
@@ -3245,6 +3282,157 @@ mod phase_c_drill_nav_tests {
             app.visible_indices,
             vec![2],
             "消しゴムなど page_params 以外の編集DBも同じ親ロールアップ経路で通す"
+        );
+    }
+
+    #[test]
+    fn facet_edit_rollup_matches_converted_archive_cache_zip_keys() {
+        use crate::archive_converter::ArchiveFormat;
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetEditFlag;
+
+        let mut app = setup_app();
+        let src = std::path::PathBuf::from(r"C:\books\book.rar");
+        let cache = std::path::PathBuf::from(r"C:\cache\book.zip");
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: src.clone(),
+            format: ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![Some((1, 2)); app.items.len()];
+
+        let key = crate::adjustment_db::zip_entry_key(&cache, "p001.jpg");
+        app.adjusted_page_keys.insert(key.clone());
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Adjustment);
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "cache ZIP map が無い間は従来どおり元アーカイブ root だけを見る"
+        );
+
+        app.converted_archive_cache_paths
+            .insert(crate::path_key::normalize_keep_drive(&src), cache.clone());
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "変換済みアーカイブ親セルは cache ZIP 側のページ補正も拾う"
+        );
+
+        app.settings.facet_filter.edits.clear();
+        app.adjusted_page_keys.clear();
+        app.mask_page_keys.insert(key.clone());
+        app.settings.facet_filter.edits.insert(FacetEditFlag::Mask);
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "消しゴムマスクも同じ cache ZIP ロールアップで拾う"
+        );
+
+        app.settings.facet_filter.edits.clear();
+        app.mask_page_keys.clear();
+        app.local_adjust_page_keys.insert(key.clone());
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::LocalAdjustment);
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "補正レイヤーも同じ cache ZIP ロールアップで拾う"
+        );
+
+        app.settings.facet_filter.edits.clear();
+        app.local_adjust_page_keys.clear();
+        app.rotation_page_keys.insert(key);
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Rotation);
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "非破壊回転も同じ cache ZIP ロールアップで拾う"
+        );
+    }
+
+    #[test]
+    fn converted_archive_cache_path_poll_rebuilds_rollup_edit_filter() {
+        use crate::archive_converter::ArchiveFormat;
+        use crate::grid_item::GridItem;
+        use crate::settings::FacetEditFlag;
+        use std::io::Write;
+
+        let mut app = setup_app();
+        let src = app.tmp.path().join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::File::create(&src)
+            .unwrap()
+            .write_all(b"archive")
+            .unwrap();
+        std::fs::File::create(&cached)
+            .unwrap()
+            .write_all(b"PK\x03\x04")
+            .unwrap();
+
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&src_meta);
+        let src_size = src_meta.len() as i64;
+        let cached_size = std::fs::metadata(&cached).unwrap().len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                src_mtime,
+                src_size,
+                ArchiveFormat::SevenZ,
+                &cached,
+                cached_size,
+                1,
+                false,
+            )
+            .unwrap();
+        app.adjusted_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&cached, "p001.jpg"));
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Adjustment);
+
+        app.install_new_items(
+            vec![GridItem::ConvertibleArchive {
+                path: src,
+                format: ArchiveFormat::SevenZ,
+            }],
+            vec![Some((src_mtime, src_size))],
+        );
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "worker 完了前は cache ZIP 側の補正キーをまだ拾わない"
+        );
+
+        let ctx = egui::Context::default();
+        for _ in 0..50 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "cache ZIP map 完了時に状態フィルタの表示集合も更新される"
         );
     }
 

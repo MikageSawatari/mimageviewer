@@ -114,24 +114,7 @@
   現行 UI / 入力経路からは参照しない。
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
 
-### 4.2 ゲームパッド Select の場所リストからレーティング一覧を選べない
-
-- 背景: ゲームパッドの <kbd>Select</kbd> で開く場所リストから、場所▼ / ファイルメニューにはある
-  ★1〜★5 のレーティング一覧ビューを選べない。
-- 現状: `build_gamepad_location_entries` はドライブ一覧 / 読書履歴 / 本棚フォルダ /
-  既知フォルダ / ドライブだけを `GamepadLocationPickerState` に積んでいる。
-  レーティング一覧は `enter_rating_view(stars)` 直呼びのメニュー経路だけで、
-  `GamepadLocationNav` / `AddressBarNav` 側の選択肢になっていない。
-- 方針:
-  - 場所リストに「レーティング一覧」配下、または ★1〜★5 の行を追加し、
-    <kbd>A</kbd> で `enter_rating_view(stars)` と同じ worker 構築経路へ入るようにする。
-  - 件数表示を入れる場合は、既存の `rating_counts_cache` / 無効化規則を流用し、
-    SELECT オーバーレイ描画ごとに SQLite を叩かない。
-  - 検索 / タグビュー / snapshot lock 中の抑止、レーティング一覧表示中の現在行ハイライト、
-    <kbd>B</kbd>/<kbd>Select</kbd> 閉じ、決定後の入力ニュートラル待ちが既存場所リストと同じ挙動か確認する。
-- 優先度: P3。パッドだけでレーティング一覧へ移動する導線の穴埋め。
-
-### 4.3 キーカスタマイズ設定画面 + 競合検出
+### 4.2 キーカスタマイズ設定画面 + 競合検出
 
 - 背景: `keymap.ini` / `KeyAction` / `Chord` / exact modifier match の土台はあるが、
   現状は手書き ini 前提で GUI・競合検出がない。次バージョンでは、まずキーボード割り当ての
@@ -150,6 +133,28 @@
   - 既定値へ戻す、割り当て削除、最大3 chord、未対応/固定操作の説明、手書き ini の読み込みエラー表示を
     初期UIに含める。
 - 優先度: P2 candidate。入力カスタマイズの需要に対して、既存土台を活かしやすい初期スライス。
+
+### 4.3 F13〜F24 を keymap.ini / キーカスタマイズ対象に追加する
+
+- 背景: 5ch レス 847。外付けテンキーや左手デバイスの入力を外部ツールで
+  F16〜F30 などへ置き換えて使う運用がある、という指摘。
+- 現状:
+  - `egui` / `egui-winit` 0.33 は `F13`〜`F24` を `egui::Key` として扱える。
+  - Windows の仮想キーも `VK_F13`〜`VK_F24` が存在する。
+  - 一方、mImageViewer 側の `KeyName` は `F1`〜`F12` までしか持っておらず、
+    `keymap.ini` に `F13` 以降を書いても parse できない。
+  - テンキー数字そのものは `egui-winit` が `Digit1` / `Numpad1` をどちらも
+    `egui::Key::Num1` へ畳むため、現行入力経路では通常数字キーと直接区別できない。
+- 方針:
+  - `KeyName` に `F13`〜`F24` を追加し、`parse` / `to_egui` / `from_egui` /
+    `to_vk` / `display_name` / `default.ini` 生成コメント / テストを更新する。
+  - `keymap.ini.default` の対応キー説明を `F1..F24` に更新する。
+  - native 動画 overlay / Win32 VK 経路でも `F13`〜`F24` を転送・判定できるよう、
+    `native_video_vk_from_egui_key` や動画 presenter 側の VK→egui 変換も確認する。
+  - これは「外部ツール等で F13〜F24 に変換された入力を割り当てられるようにする」
+    対応であり、テンキー物理キーを mImageViewer 単体で直接判別する対応とは分ける。
+  - `F25` 以降は egui / Win32 標準キー範囲外になるため初期対象外にする。
+- 優先度: P2 candidate。キーカスタマイズ改善と同じリリースで入れると説明しやすい。
 
 ---
 

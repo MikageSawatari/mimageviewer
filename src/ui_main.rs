@@ -2653,7 +2653,10 @@ impl App {
                                                 self.settings.sort_order == order
                                             };
                                             let prefix = if checked { "✓ " } else { "  " };
-                                            if ui.button(format!("{prefix}{}", order.label())).clicked() {
+                                            let resp = ui
+                                                .button(format!("{prefix}{}", order.label()))
+                                                .on_hover_text(order.description());
+                                            if resp.clicked() {
                                                 self.settings.sort_order = order;
                                                 if self.items_are_rating_view {
                                                     self.set_rating_view_sort(
@@ -4808,10 +4811,12 @@ impl App {
                                 } else {
                                     self.settings.sort_order == order
                                 };
-                                let resp = ui.add_enabled(
-                                    !sort_disabled,
-                                    egui::Button::selectable(selected, order.short_label()),
-                                );
+                                let resp = ui
+                                    .add_enabled(
+                                        !sort_disabled,
+                                        egui::Button::selectable(selected, order.short_label()),
+                                    )
+                                    .on_hover_text(order.description());
                                 if resp.clicked() && !selected {
                                     self.settings.sort_order = order;
                                     self.settings.save();
@@ -4862,10 +4867,10 @@ impl App {
                                             } else {
                                                 self.settings.sort_order == order
                                             };
-                                            if ui
+                                            let resp = ui
                                                 .selectable_label(selected, order.short_label())
-                                                .clicked()
-                                                && !selected
+                                                .on_hover_text(order.description());
+                                            if resp.clicked() && !selected
                                             {
                                                 self.settings.sort_order = order;
                                                 self.settings.save();

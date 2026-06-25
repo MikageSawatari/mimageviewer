@@ -13560,7 +13560,11 @@ impl App {
                 ],
             );
         }
+        let should_rebuild_visible = self.settings.facet_filter.has_rollup_edit_filter();
         self.converted_archive_cache_paths = result.paths;
+        if should_rebuild_visible {
+            self.rebuild_visible_indices();
+        }
         ctx.request_repaint();
     }
 
@@ -23143,6 +23147,23 @@ impl App {
         Self::page_key_set_has_prefix(keys, &prefix)
     }
 
+    fn converted_archive_cache_path(&self, path: &std::path::Path) -> Option<&std::path::Path> {
+        self.converted_archive_cache_paths
+            .get(&crate::path_key::normalize_keep_drive(path))
+            .map(std::path::PathBuf::as_path)
+    }
+
+    fn archive_or_converted_cache_contains_page_key(
+        &self,
+        keys: &std::collections::BTreeSet<String>,
+        path: &std::path::Path,
+    ) -> bool {
+        Self::archive_contains_page_key(keys, path)
+            || self
+                .converted_archive_cache_path(path)
+                .is_some_and(|cache_zip| Self::archive_contains_page_key(keys, cache_zip))
+    }
+
     fn zip_dir_contains_page_key(
         keys: &std::collections::BTreeSet<String>,
         zip_path: &std::path::Path,
@@ -23154,6 +23175,20 @@ impl App {
             dir_prefix.to_lowercase()
         );
         Self::page_key_set_has_prefix(keys, &prefix)
+    }
+
+    fn zip_dir_or_converted_cache_contains_page_key(
+        &self,
+        keys: &std::collections::BTreeSet<String>,
+        zip_path: &std::path::Path,
+        dir_prefix: &str,
+    ) -> bool {
+        Self::zip_dir_contains_page_key(keys, zip_path, dir_prefix)
+            || self
+                .converted_archive_cache_path(zip_path)
+                .is_some_and(|cache_zip| {
+                    Self::zip_dir_contains_page_key(keys, cache_zip, dir_prefix)
+                })
     }
 
     fn zip_dir_contains_one_level_edit_key(
@@ -23181,6 +23216,23 @@ impl App {
         false
     }
 
+    fn zip_dir_or_converted_cache_contains_one_level_edit_key(
+        &self,
+        keys: &std::collections::BTreeSet<String>,
+        zip_path: &std::path::Path,
+        dir_prefix: &str,
+        is_archive: bool,
+    ) -> bool {
+        Self::zip_dir_contains_one_level_edit_key(keys, zip_path, dir_prefix, is_archive)
+            || self
+                .converted_archive_cache_path(zip_path)
+                .is_some_and(|cache_zip| {
+                    Self::zip_dir_contains_one_level_edit_key(
+                        keys, cache_zip, dir_prefix, is_archive,
+                    )
+                })
+    }
+
     fn item_has_one_level_edit_key(
         &self,
         idx: usize,
@@ -23198,14 +23250,19 @@ impl App {
                 Self::archive_contains_page_key(keys, path)
             }
             GridItem::ConvertibleArchive { path, .. } => {
-                Self::archive_contains_page_key(keys, path)
+                self.archive_or_converted_cache_contains_page_key(keys, path)
             }
             GridItem::ZipDir {
                 zip_path,
                 dir_prefix,
                 is_archive,
                 ..
-            } => Self::zip_dir_contains_one_level_edit_key(keys, zip_path, dir_prefix, *is_archive),
+            } => self.zip_dir_or_converted_cache_contains_one_level_edit_key(
+                keys,
+                zip_path,
+                dir_prefix,
+                *is_archive,
+            ),
             GridItem::SearchContainer { path, kind, .. } => match kind {
                 crate::grid_item::SearchContainerKind::Folder => {
                     Self::folder_contains_one_level_edit_key(keys, path)
@@ -23238,13 +23295,13 @@ impl App {
                 Self::archive_contains_page_key(keys, path)
             }
             GridItem::ConvertibleArchive { path, .. } => {
-                Self::archive_contains_page_key(keys, path)
+                self.archive_or_converted_cache_contains_page_key(keys, path)
             }
             GridItem::ZipDir {
                 zip_path,
                 dir_prefix,
                 ..
-            } => Self::zip_dir_contains_page_key(keys, zip_path, dir_prefix),
+            } => self.zip_dir_or_converted_cache_contains_page_key(keys, zip_path, dir_prefix),
             GridItem::SearchContainer { path, kind, .. } => match kind {
                 crate::grid_item::SearchContainerKind::Folder => {
                     Self::folder_contains_page_key(keys, path, include_descendants)
@@ -23293,13 +23350,17 @@ impl App {
                 Self::archive_contains_page_key(&self.rotation_page_keys, &path)
             }
             GridItem::ConvertibleArchive { path, .. } => {
-                Self::archive_contains_page_key(&self.rotation_page_keys, &path)
+                self.archive_or_converted_cache_contains_page_key(&self.rotation_page_keys, &path)
             }
             GridItem::ZipDir {
                 zip_path,
                 dir_prefix,
                 ..
-            } => Self::zip_dir_contains_page_key(&self.rotation_page_keys, &zip_path, &dir_prefix),
+            } => self.zip_dir_or_converted_cache_contains_page_key(
+                &self.rotation_page_keys,
+                &zip_path,
+                &dir_prefix,
+            ),
             GridItem::SearchContainer { path, kind, .. } => match kind {
                 crate::grid_item::SearchContainerKind::Folder => Self::folder_contains_page_key(
                     &self.rotation_page_keys,

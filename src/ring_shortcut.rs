@@ -1068,6 +1068,7 @@ pub enum GamepadLocationNav {
     Direct(PathBuf),
     DriveList,
     ReadingHistory,
+    RatingView(u8),
     BooksRoot,
 }
 

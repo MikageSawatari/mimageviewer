@@ -2050,6 +2050,11 @@ impl App {
         let nav = match nav {
             GamepadLocationNav::DriveList => AddressBarNav::DriveList(None),
             GamepadLocationNav::ReadingHistory => AddressBarNav::ReadingHistory,
+            GamepadLocationNav::RatingView(stars) => {
+                self.bump_input_seq("gamepad_rating_view", Some(&stars.to_string()));
+                self.enter_rating_view(stars);
+                return None;
+            }
             GamepadLocationNav::BooksRoot => AddressBarNav::BooksRoot,
             GamepadLocationNav::Direct(path) => {
                 let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
@@ -4090,7 +4095,8 @@ impl App {
             self.show_feedback_toast("検索中は場所リストを開けません".to_string());
             return;
         }
-        let entries = self.build_gamepad_location_entries();
+        let rating_counts = self.rating_counts();
+        let entries = self.build_gamepad_location_entries(rating_counts);
         if entries.is_empty() {
             self.show_feedback_toast("移動できる場所がありません".to_string());
             return;
@@ -4109,7 +4115,10 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn build_gamepad_location_entries(&self) -> Vec<GamepadLocationEntry> {
+    pub(crate) fn build_gamepad_location_entries(
+        &self,
+        rating_counts: Option<[usize; 6]>,
+    ) -> Vec<GamepadLocationEntry> {
         let book_root = self.book_root_path();
         let mut entries = vec![
             GamepadLocationEntry {
@@ -4122,12 +4131,24 @@ impl App {
                 value: "最近読んだ本".to_string(),
                 nav: GamepadLocationNav::ReadingHistory,
             },
-            GamepadLocationEntry {
-                label: "本棚フォルダ".to_string(),
-                value: book_root.display().to_string(),
-                nav: GamepadLocationNav::BooksRoot,
-            },
         ];
+
+        for stars in 1..=5u8 {
+            let value = rating_counts
+                .map(|counts| format!("{} 件", counts[stars as usize]))
+                .unwrap_or_else(|| "レーティング一覧".to_string());
+            entries.push(GamepadLocationEntry {
+                label: format!("★{stars} レーティング一覧"),
+                value,
+                nav: GamepadLocationNav::RatingView(stars),
+            });
+        }
+
+        entries.push(GamepadLocationEntry {
+            label: "本棚フォルダ".to_string(),
+            value: book_root.display().to_string(),
+            nav: GamepadLocationNav::BooksRoot,
+        });
 
         for location in crate::known_folders::quick_locations() {
             let value = location.path.display().to_string();
@@ -4148,12 +4169,18 @@ impl App {
         entries
     }
 
-    fn current_gamepad_location_index(&self, entries: &[GamepadLocationEntry]) -> Option<usize> {
+    pub(crate) fn current_gamepad_location_index(
+        &self,
+        entries: &[GamepadLocationEntry],
+    ) -> Option<usize> {
         let effective_folder = self.effective_folder();
         let book_root = self.book_root_path();
         entries.iter().position(|entry| match &entry.nav {
             GamepadLocationNav::DriveList => self.items_are_drive_list,
             GamepadLocationNav::ReadingHistory => self.items_are_reading_history_view,
+            GamepadLocationNav::RatingView(stars) => {
+                self.items_are_rating_view && self.rating_view_stars == *stars
+            }
             GamepadLocationNav::BooksRoot => effective_folder
                 .as_ref()
                 .is_some_and(|current| crate::folder_tree::path_eq(current, &book_root)),

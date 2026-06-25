@@ -860,7 +860,7 @@ impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
             Self::FileName => "ファイル名順",
-            Self::Numeric => "番号順",
+            Self::Numeric => "番号順（区切り無視）",
             Self::DateAsc => "日付順（古い順）",
             Self::DateDesc => "日付順（新しい順）",
         }
@@ -869,9 +869,18 @@ impl SortOrder {
     pub fn short_label(self) -> &'static str {
         match self {
             Self::FileName => "名前",
-            Self::Numeric => "番号",
+            Self::Numeric => "番号*",
             Self::DateAsc => "日付↑",
             Self::DateDesc => "日付↓",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::FileName => "Windows に近い名前順で並び替えます",
+            Self::Numeric => "記号・空白などを無視して連番を優先して並び替えます",
+            Self::DateAsc => "更新日時が古いものから並び替えます",
+            Self::DateDesc => "更新日時が新しいものから並び替えます",
         }
     }
 
