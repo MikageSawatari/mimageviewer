@@ -364,6 +364,10 @@ impl App {
         if !self.show_context_shortcuts_help {
             return;
         }
+        if !self.ime_input_active() && self.consume_context_shortcuts_help_key(ctx) {
+            self.show_context_shortcuts_help = false;
+            return;
+        }
 
         let help_context = self.current_shortcut_help_context();
 
@@ -456,7 +460,6 @@ impl App {
 fn video_help_includes_row(row: &CommandDisplayRow) -> bool {
     match row.spec.action {
         KeyAction::ToggleDetachedViewerMode
-        | KeyAction::FsToggleMetadata
         | KeyAction::FsCtrlNavPrev
         | KeyAction::FsCtrlNavNext
         | KeyAction::FsSiblingPrev

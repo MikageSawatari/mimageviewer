@@ -3782,7 +3782,6 @@ impl App {
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
             KeyAction::ToggleDetachedViewerMode
-            | KeyAction::FsToggleMetadata
             | KeyAction::FsCtrlNavPrev
             | KeyAction::FsCtrlNavNext
             | KeyAction::FsSiblingPrev

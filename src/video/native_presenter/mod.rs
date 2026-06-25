@@ -4031,8 +4031,9 @@ impl NativeEguiOverlay {
                 self.modifiers = modifiers;
                 if self.shortcut_help_open {
                     if matches!(event, NativeEvent::KeyDown(_))
-                        && key.virtual_key == 0x1B
                         && !key.repeat
+                        && (key.virtual_key == 0x1B
+                            || crate::keymap::native_video_context_shortcuts_help_key_down(&key))
                     {
                         self.shortcut_help_open = false;
                         self.dirty = true;
@@ -4127,6 +4128,12 @@ impl NativeEguiOverlay {
             }
             NativeEvent::Text(ch) => {
                 if self.shortcut_help_open {
+                    if crate::keymap::is_context_shortcuts_help_char(ch)
+                        && crate::keymap::native_video_context_shortcuts_help_text_enabled()
+                    {
+                        self.shortcut_help_open = false;
+                        self.dirty = true;
+                    }
                     return;
                 }
                 if crate::keymap::is_context_shortcuts_help_char(ch)
