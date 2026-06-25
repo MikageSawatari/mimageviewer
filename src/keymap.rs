@@ -2577,18 +2577,18 @@ impl KeyAction {
             FsFixedJumpNextNoRtl => "設定した量だけ先へジャンプする (右→左読みで反転しない)",
             FsStackJumpPrev => "前のスタックの先頭画像へジャンプする",
             FsStackJumpNext => "次のスタックの先頭画像へジャンプする",
-            RatingItem1 => "現在の画像または動画に星1を付ける",
-            RatingItem2 => "現在の画像または動画に星2を付ける",
-            RatingItem3 => "現在の画像または動画に星3を付ける",
-            RatingItem4 => "現在の画像または動画に星4を付ける",
-            RatingItem5 => "現在の画像または動画に星5を付ける",
-            RatingItemClear => "現在の画像または動画のレーティングを解除する",
-            RatingContainer1 => "現在のフォルダまたはZIP/PDF本体に星1を付ける",
-            RatingContainer2 => "現在のフォルダまたはZIP/PDF本体に星2を付ける",
-            RatingContainer3 => "現在のフォルダまたはZIP/PDF本体に星3を付ける",
-            RatingContainer4 => "現在のフォルダまたはZIP/PDF本体に星4を付ける",
-            RatingContainer5 => "現在のフォルダまたはZIP/PDF本体に星5を付ける",
-            RatingContainerClear => "現在のフォルダまたはZIP/PDF本体のレーティングを解除する",
+            RatingItem1 => "星1を付ける（アイテム）",
+            RatingItem2 => "星2を付ける（アイテム）",
+            RatingItem3 => "星3を付ける（アイテム）",
+            RatingItem4 => "星4を付ける（アイテム）",
+            RatingItem5 => "星5を付ける（アイテム）",
+            RatingItemClear => "レーティングを解除する（アイテム）",
+            RatingContainer1 => "星1を付ける（コンテナ）",
+            RatingContainer2 => "星2を付ける（コンテナ）",
+            RatingContainer3 => "星3を付ける（コンテナ）",
+            RatingContainer4 => "星4を付ける（コンテナ）",
+            RatingContainer5 => "星5を付ける（コンテナ）",
+            RatingContainerClear => "レーティングを解除する（コンテナ）",
             FsContinuousScrollForward => "連結表示中に次の画面分へスクロールする",
             FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
             FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
@@ -4502,7 +4502,7 @@ impl Keymap {
         );
         out.push_str("#\n");
         out.push_str("# [Rating]\n");
-        out.push_str("# RatingItem1 = Ctrl+F1  ; 現在の画像または動画に星1を付ける\n");
+        out.push_str("# RatingItem1 = Ctrl+F1  ; 星1を付ける（アイテム）\n");
         out.push_str("#\n");
         out.push_str("# [Text]\n");
         out.push_str("# TextRedo.1 = Ctrl+Y        ; やり直し\n");
@@ -6686,7 +6686,7 @@ mod tests {
         assert!(user_ini.contains("[FsImage]"));
         assert!(user_ini.contains("[Rating] ; レーティング"));
         assert!(user_ini.contains("# HelpShowContextShortcuts = ?"));
-        assert!(user_ini.contains("# RatingItem1 = F1 ; 現在の画像または動画に星1を付ける"));
+        assert!(user_ini.contains("# RatingItem1 = F1 ; 星1を付ける（アイテム）"));
         assert!(user_ini.contains("# GridToggleStackMode = none ; スタック表示を切り替える"));
         assert!(user_ini.contains("# FsSlideshow = S"));
         assert!(user_ini.contains("# TextRedo.1 = Ctrl+Y"));
@@ -6707,9 +6707,10 @@ mod tests {
         assert!(default_ini.contains("keymap.ini.default"));
         assert!(default_ini.contains("参照用です。このファイルは編集しないでください。"));
         assert!(default_ini.contains("[Rating] ; レーティング"));
-        assert!(default_ini.contains(
-            "# RatingContainerClear = Shift+F6 ; 現在のフォルダまたはZIP/PDF本体のレーティングを解除する"
-        ));
+        assert!(
+            default_ini
+                .contains("# RatingContainerClear = Shift+F6 ; レーティングを解除する（コンテナ）")
+        );
         assert!(default_ini.contains("# GridToggleStackMode = none ; スタック表示を切り替える"));
         assert!(default_ini.contains("# FsSlideshow = S"));
         assert!(default_ini.contains("# TextRedo.1 = Ctrl+Y"));
