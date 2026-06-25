@@ -330,19 +330,14 @@ impl App {
             .ring_shortcuts
             .mouse_gesture_profile(surface_context);
         let painter = ui.painter();
-        let panel_w = (full_rect.width() * 0.42).clamp(260.0, 420.0);
-        let row_h = 22.0;
-        let rows = profile.bindings.len().max(1) as f32;
-        let panel_h = 54.0 + row_h * rows;
-        let pos = egui::pos2(
-            (gesture.start_pos.x + 18.0)
-                .min(full_rect.max.x - panel_w - 8.0)
-                .max(full_rect.min.x + 8.0),
-            (gesture.start_pos.y + 18.0)
-                .min(full_rect.max.y - panel_h - 8.0)
-                .max(full_rect.min.y + 8.0),
-        );
-        let rect = egui::Rect::from_min_size(pos, egui::vec2(panel_w, panel_h));
+        let margin = 16.0;
+        let usable_w = (full_rect.width() - margin * 2.0).max(120.0);
+        let usable_h = (full_rect.height() - margin * 2.0).max(120.0);
+        let row_h = 32.0;
+        let rows = profile.bindings.len().max(1);
+        let panel_w = (full_rect.width() * 0.60).clamp(340.0, 560.0).min(usable_w);
+        let panel_h = (96.0 + row_h * rows as f32).min(usable_h);
+        let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
         painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(220));
         painter.rect_stroke(
             rect,
@@ -351,41 +346,91 @@ impl App {
             egui::StrokeKind::Inside,
         );
         let current = if gesture.pattern.is_empty() {
-            "入力中: -".to_string()
+            "-".to_string()
         } else {
-            format!("入力中: {}", format_mouse_gesture_pattern(&gesture.pattern))
+            format_mouse_gesture_pattern(&gesture.pattern)
         };
         painter.text(
-            rect.min + egui::vec2(12.0, 10.0),
+            rect.min + egui::vec2(14.0, 14.0),
             egui::Align2::LEFT_TOP,
-            current,
-            egui::FontId::proportional(14.0),
+            format!("マウスジェスチャ / 入力中: {current}"),
+            egui::FontId::proportional(17.0),
             egui::Color32::WHITE,
         );
-        let mut y = rect.min.y + 34.0;
+        let row_left = rect.min.x + 14.0;
+        let row_right = rect.max.x - 14.0;
+        let mut y = rect.min.y + 46.0;
+        let action_context = surface_context.gesture_action_context();
+        let selected_row = profile
+            .bindings
+            .iter()
+            .position(|binding| binding.pattern == gesture.pattern)
+            .unwrap_or(0);
         if profile.bindings.is_empty() {
             painter.text(
-                egui::pos2(rect.min.x + 12.0, y),
-                egui::Align2::LEFT_TOP,
-                "登録済みジェスチャなし",
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(190),
+                egui::pos2(row_left + 10.0, y + row_h * 0.5),
+                egui::Align2::LEFT_CENTER,
+                "未登録",
+                egui::FontId::proportional(14.5),
+                egui::Color32::from_gray(205),
+            );
+            painter.text(
+                egui::pos2(row_right - 10.0, y + row_h * 0.5),
+                egui::Align2::RIGHT_CENTER,
+                "操作カスタマイズで追加",
+                egui::FontId::proportional(14.5),
+                egui::Color32::from_gray(230),
             );
         } else {
-            let action_context = surface_context.gesture_action_context();
-            for binding in &profile.bindings {
+            let available_h = (panel_h - 96.0).max(row_h);
+            let visible_rows = ((available_h / row_h).floor() as usize)
+                .max(1)
+                .min(profile.bindings.len().max(1));
+            let start = selected_row
+                .saturating_sub(visible_rows / 2)
+                .min(profile.bindings.len().saturating_sub(visible_rows));
+            let end = (start + visible_rows).min(profile.bindings.len());
+            for (idx, binding) in profile.bindings.iter().enumerate().take(end).skip(start) {
+                let selected = idx == selected_row;
+                let row_rect = egui::Rect::from_min_size(
+                    egui::pos2(row_left, y),
+                    egui::vec2((row_right - row_left).max(1.0), row_h),
+                );
+                painter.rect_filled(
+                    row_rect,
+                    5.0,
+                    if selected {
+                        egui::Color32::from_rgb(56, 94, 138)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    },
+                );
                 let pattern = format_mouse_gesture_pattern(&binding.pattern);
                 let label = binding.action.label_for_context(action_context);
                 painter.text(
-                    egui::pos2(rect.min.x + 12.0, y),
-                    egui::Align2::LEFT_TOP,
-                    format!("{pattern}  {label}"),
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_gray(220),
+                    egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    pattern,
+                    egui::FontId::proportional(14.5),
+                    egui::Color32::from_white_alpha(if selected { 245 } else { 205 }),
+                );
+                painter.text(
+                    egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    label,
+                    egui::FontId::proportional(14.5),
+                    egui::Color32::WHITE,
                 );
                 y += row_h;
             }
         }
+        painter.text(
+            egui::pos2(rect.min.x + 14.0, rect.max.y - 20.0),
+            egui::Align2::LEFT_CENTER,
+            "右ドラッグで軌跡を入力、離すと実行 / 短押しは従来操作",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(190),
+        );
     }
     pub(crate) fn start_mouse_ring_flick(
         &mut self,
