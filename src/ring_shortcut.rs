@@ -434,6 +434,16 @@ pub enum RingActionId {
     GridToggleSnapshotLock,
     GridToggleCheck,
     GridSelectAll,
+    GridColumnCount1,
+    GridColumnCount2,
+    GridColumnCount3,
+    GridColumnCount4,
+    GridColumnCount5,
+    GridColumnCount6,
+    GridColumnCount7,
+    GridColumnCount8,
+    GridColumnCount9,
+    GridColumnCount10,
     GridHistoryBack,
     GridHistoryForward,
     GridParentFolder,
@@ -480,6 +490,16 @@ impl RingActionId {
             Self::GridToggleSnapshotLock => "grid_toggle_snapshot_lock",
             Self::GridToggleCheck => "grid_toggle_check",
             Self::GridSelectAll => "grid_select_all",
+            Self::GridColumnCount1 => "grid_column_count_1",
+            Self::GridColumnCount2 => "grid_column_count_2",
+            Self::GridColumnCount3 => "grid_column_count_3",
+            Self::GridColumnCount4 => "grid_column_count_4",
+            Self::GridColumnCount5 => "grid_column_count_5",
+            Self::GridColumnCount6 => "grid_column_count_6",
+            Self::GridColumnCount7 => "grid_column_count_7",
+            Self::GridColumnCount8 => "grid_column_count_8",
+            Self::GridColumnCount9 => "grid_column_count_9",
+            Self::GridColumnCount10 => "grid_column_count_10",
             Self::GridHistoryBack => "grid_history_back",
             Self::GridHistoryForward => "grid_history_forward",
             Self::GridParentFolder => "grid_parent_folder",
@@ -526,6 +546,16 @@ impl RingActionId {
             "grid_toggle_snapshot_lock" => Self::GridToggleSnapshotLock,
             "grid_toggle_check" => Self::GridToggleCheck,
             "grid_select_all" => Self::GridSelectAll,
+            "grid_column_count_1" => Self::GridColumnCount1,
+            "grid_column_count_2" => Self::GridColumnCount2,
+            "grid_column_count_3" => Self::GridColumnCount3,
+            "grid_column_count_4" => Self::GridColumnCount4,
+            "grid_column_count_5" => Self::GridColumnCount5,
+            "grid_column_count_6" => Self::GridColumnCount6,
+            "grid_column_count_7" => Self::GridColumnCount7,
+            "grid_column_count_8" => Self::GridColumnCount8,
+            "grid_column_count_9" => Self::GridColumnCount9,
+            "grid_column_count_10" => Self::GridColumnCount10,
             "grid_history_back" => Self::GridHistoryBack,
             "grid_history_forward" => Self::GridHistoryForward,
             "grid_parent_folder" => Self::GridParentFolder,
@@ -578,6 +608,16 @@ impl RingActionId {
             Self::GridToggleSnapshotLock => "★固定",
             Self::GridToggleCheck => "チェック ON/OFF",
             Self::GridSelectAll => "表示中を全チェック",
+            Self::GridColumnCount1 => "サムネイル 1列",
+            Self::GridColumnCount2 => "サムネイル 2列",
+            Self::GridColumnCount3 => "サムネイル 3列",
+            Self::GridColumnCount4 => "サムネイル 4列",
+            Self::GridColumnCount5 => "サムネイル 5列",
+            Self::GridColumnCount6 => "サムネイル 6列",
+            Self::GridColumnCount7 => "サムネイル 7列",
+            Self::GridColumnCount8 => "サムネイル 8列",
+            Self::GridColumnCount9 => "サムネイル 9列",
+            Self::GridColumnCount10 => "サムネイル 10列",
             Self::GridHistoryBack => "フォルダ履歴 戻る",
             Self::GridHistoryForward => "フォルダ履歴 進む",
             Self::GridParentFolder => "親フォルダへ",
@@ -624,6 +664,16 @@ impl RingActionId {
                     | Self::GridToggleSnapshotLock
                     | Self::GridToggleCheck
                     | Self::GridSelectAll
+                    | Self::GridColumnCount1
+                    | Self::GridColumnCount2
+                    | Self::GridColumnCount3
+                    | Self::GridColumnCount4
+                    | Self::GridColumnCount5
+                    | Self::GridColumnCount6
+                    | Self::GridColumnCount7
+                    | Self::GridColumnCount8
+                    | Self::GridColumnCount9
+                    | Self::GridColumnCount10
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
                     | Self::GridParentFolder
@@ -699,6 +749,16 @@ impl RingActionId {
                 Self::GridToggleSnapshotLock,
                 Self::GridToggleCheck,
                 Self::GridSelectAll,
+                Self::GridColumnCount1,
+                Self::GridColumnCount2,
+                Self::GridColumnCount3,
+                Self::GridColumnCount4,
+                Self::GridColumnCount5,
+                Self::GridColumnCount6,
+                Self::GridColumnCount7,
+                Self::GridColumnCount8,
+                Self::GridColumnCount9,
+                Self::GridColumnCount10,
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
                 Self::GridParentFolder,

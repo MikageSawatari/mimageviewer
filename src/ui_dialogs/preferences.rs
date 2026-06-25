@@ -7,7 +7,9 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 
 use crate::app::App;
-use crate::ring_shortcut::{RightDragContext, RingActionId, RingDirection, RingShortcutContext};
+use crate::ring_shortcut::{
+    MouseGestureDirection, RightDragContext, RingActionId, RingDirection, RingShortcutContext,
+};
 use crate::settings::{Parallelism, Settings};
 
 mod pages;
@@ -200,6 +202,16 @@ pub(crate) struct OperationAssignmentEditor {
     pub tab: OperationAssignmentTab,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OperationMouseGestureRecorder {
+    pub context: RightDragContext,
+    pub action: RingActionId,
+    pub pattern: Vec<MouseGestureDirection>,
+    pub points: Vec<egui::Pos2>,
+    pub recording: bool,
+    pub error: Option<String>,
+}
+
 // ── ツリーカテゴリ定義 ──────────────────────────────────────────
 
 struct TreeCategory {
@@ -314,6 +326,7 @@ pub(crate) struct PreferencesState {
     pub operation_ring_context: RingShortcutContext,
     pub operation_mouse_gesture_context: RightDragContext,
     pub operation_mouse_gesture_inputs: HashMap<(RightDragContext, usize), String>,
+    pub operation_mouse_gesture_recorder: Option<OperationMouseGestureRecorder>,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
     /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
@@ -534,6 +547,7 @@ impl PreferencesState {
             operation_ring_context: RingShortcutContext::Grid,
             operation_mouse_gesture_context: RightDragContext::Grid,
             operation_mouse_gesture_inputs: HashMap::new(),
+            operation_mouse_gesture_recorder: None,
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
             auto_thread_count,
@@ -1237,6 +1251,7 @@ impl App {
         if let Some(state) = self.operation_customize_state.as_mut() {
             draw_operation_command_editor_dialog(ctx, state, ime_active);
             draw_operation_assignment_editor_dialog(ctx, state, ime_active);
+            draw_mouse_gesture_recorder_dialog(ctx, state);
         }
 
         if apply {

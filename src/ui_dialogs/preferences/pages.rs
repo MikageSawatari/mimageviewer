@@ -5,8 +5,9 @@ use crate::keymap::{
     menu_commands_for_parent, parse_chord_for_action,
 };
 use crate::ring_shortcut::{
-    RightDragContext, RightDragMode, RingActionId, RingDirection, RingShortcutContext,
-    RingShortcutSettings, format_mouse_gesture_pattern, parse_mouse_gesture_pattern,
+    MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
+    RingShortcutContext, RingShortcutSettings, format_mouse_gesture_pattern,
+    parse_mouse_gesture_pattern,
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
@@ -638,10 +639,26 @@ fn command_overview_rows(
         if is_conflicted {
             status.push("競合");
         }
+        let mut assignments = vec![("キー", keymap.chord_labels(action))];
+        if let Some((context, ring_action)) = ring_binding_for_key_action(action) {
+            let ring =
+                ring_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action);
+            let mouse =
+                mouse_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action);
+            let pad = gamepad_ring_assignment_labels(
+                &state.settings.ring_shortcuts,
+                context,
+                &ring_action,
+            );
+            if !ring.is_empty() || !mouse.is_empty() || !pad.is_empty() {
+                assignments.extend([("リング", ring), ("マウス", mouse), ("パッド", pad)]);
+                status.push("設定あり");
+            }
+        }
         rows.push(OperationOverviewRow {
             label: compact_key_action_label(action),
             context: action.context().description().to_owned(),
-            assignments: vec![("キー", keymap.chord_labels(action))],
+            assignments,
             status: status.join(" / "),
             conflicted: is_conflicted,
             hover: format!("{}\n{}", action.description(), action.ini_name()),
@@ -654,6 +671,9 @@ fn command_overview_rows(
             .into_iter()
             .filter(|action| *action != RingActionId::None)
         {
+            if ring_action_has_key_action(context, &action) {
+                continue;
+            }
             let ring = ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
             let mouse = mouse_assignment_labels(&state.settings.ring_shortcuts, context, &action);
             let pad =
@@ -678,9 +698,9 @@ fn command_overview_rows(
     }
 
     rows.sort_by(|a, b| {
-        a.label
-            .cmp(&b.label)
-            .then_with(|| a.context.cmp(&b.context))
+        a.context
+            .cmp(&b.context)
+            .then_with(|| a.label.cmp(&b.label))
             .then_with(|| a.hover.cmp(&b.hover))
     });
     rows
@@ -706,6 +726,48 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
         RingActionId::GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
         _ => action.label_for_context(context),
     }
+}
+
+fn ring_binding_for_key_action(action: KeyAction) -> Option<(RingShortcutContext, RingActionId)> {
+    let context = match action.context() {
+        crate::keymap::KeyContext::Grid => RingShortcutContext::Grid,
+        crate::keymap::KeyContext::FsImage => RingShortcutContext::ImageFullscreen,
+        crate::keymap::KeyContext::FsVideo => RingShortcutContext::VideoFullscreen,
+        _ => return None,
+    };
+    let ring_action = match action {
+        KeyAction::GridColumnCount1 => RingActionId::GridColumnCount1,
+        KeyAction::GridColumnCount2 => RingActionId::GridColumnCount2,
+        KeyAction::GridColumnCount3 => RingActionId::GridColumnCount3,
+        KeyAction::GridColumnCount4 => RingActionId::GridColumnCount4,
+        KeyAction::GridColumnCount5 => RingActionId::GridColumnCount5,
+        KeyAction::GridColumnCount6 => RingActionId::GridColumnCount6,
+        KeyAction::GridColumnCount7 => RingActionId::GridColumnCount7,
+        KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
+        KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
+        KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        _ => return None,
+    };
+    Some((context, ring_action))
+}
+
+fn ring_action_has_key_action(context: RingShortcutContext, action: &RingActionId) -> bool {
+    matches!(
+        (context, action),
+        (
+            RingShortcutContext::Grid,
+            RingActionId::GridColumnCount1
+                | RingActionId::GridColumnCount2
+                | RingActionId::GridColumnCount3
+                | RingActionId::GridColumnCount4
+                | RingActionId::GridColumnCount5
+                | RingActionId::GridColumnCount6
+                | RingActionId::GridColumnCount7
+                | RingActionId::GridColumnCount8
+                | RingActionId::GridColumnCount9
+                | RingActionId::GridColumnCount10
+        )
+    )
 }
 
 fn compact_operation_label(label: &str) -> String {
@@ -756,20 +818,18 @@ fn compact_operation_label(label: &str) -> String {
 }
 
 fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
+    if groups.iter().all(|(_, values)| values.is_empty()) {
+        ui.label(egui::RichText::new("なし").weak());
+        return;
+    }
+
     ui.vertical(|ui| {
         for (label, values) in groups {
-            if values.is_empty() {
+            for value in values {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("{label}:")).weak());
-                    ui.label(egui::RichText::new("-").weak());
+                    ui.monospace(value);
                 });
-            } else {
-                for value in values {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{label}:")).weak());
-                        ui.monospace(value);
-                    });
-                }
             }
         }
     });
@@ -888,6 +948,204 @@ pub(super) fn draw_operation_assignment_editor_dialog(
     }
 }
 
+pub(super) fn draw_mouse_gesture_recorder_dialog(
+    ctx: &egui::Context,
+    state: &mut PreferencesState,
+) {
+    let Some(mut recorder) = state.operation_mouse_gesture_recorder.clone() else {
+        return;
+    };
+
+    let mut open = true;
+    let mut add_pattern = false;
+    let mut close_requested = false;
+    egui::Window::new(format!("マウスジェスチャ追加: {}", recorder.context.label()))
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_size([460.0, 360.0])
+        .min_width(420.0)
+        .show(ctx, |ui| {
+            ui.small("下の枠内で右ボタンを押しながらマウスを動かして、ジェスチャを記録します。上下左右の最大 4 stroke まで登録できます。");
+            ui.add_space(8.0);
+
+            let desired = egui::vec2(ui.available_width().max(320.0), 190.0);
+            let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+            ui.painter().rect_stroke(
+                rect,
+                4.0,
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "右ドラッグで記録",
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().weak_text_color(),
+            );
+
+            let secondary_down =
+                ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+            let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+            if secondary_down
+                && response.hovered()
+                && !recorder.recording
+                && let Some(pos) = pointer_pos
+            {
+                recorder.recording = true;
+                recorder.pattern.clear();
+                recorder.points.clear();
+                recorder.points.push(pos);
+                recorder.error = None;
+            }
+            if recorder.recording {
+                if secondary_down {
+                    if let Some(pos) = pointer_pos {
+                        update_mouse_gesture_recording(&mut recorder, pos);
+                    }
+                    ctx.request_repaint();
+                } else {
+                    recorder.recording = false;
+                    if recorder.pattern.is_empty() {
+                        recorder.error = Some("ジェスチャが短すぎます。もう一度右ドラッグしてください。".to_owned());
+                    }
+                }
+            }
+
+            if recorder.points.len() >= 2 {
+                for pair in recorder.points.windows(2) {
+                    ui.painter().line_segment(
+                        [pair[0], pair[1]],
+                        egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                    );
+                }
+            }
+
+            ui.add_space(8.0);
+            let pattern_label = if recorder.pattern.is_empty() {
+                "未記録".to_owned()
+            } else {
+                format_mouse_gesture_pattern(&recorder.pattern)
+            };
+            ui.horizontal(|ui| {
+                ui.label("記録:");
+                ui.monospace(pattern_label);
+            });
+            if let Some(error) = &recorder.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            if let Some(conflict) = mouse_gesture_duplicate_label(
+                &state.settings.ring_shortcuts,
+                recorder.context,
+                &recorder.pattern,
+            )
+            {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("同じジェスチャが既にあります: {conflict}"),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!recorder.pattern.is_empty(), egui::Button::new("追加"))
+                    .clicked()
+                {
+                    add_pattern = true;
+                }
+                if ui.button("やり直し").clicked() {
+                    recorder.pattern.clear();
+                    recorder.points.clear();
+                    recorder.recording = false;
+                    recorder.error = None;
+                }
+                if ui.button("閉じる").clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+
+    if add_pattern && !recorder.pattern.is_empty() {
+        let profile = state
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_profile_mut(recorder.context);
+        let idx = profile.bindings.len();
+        profile
+            .bindings
+            .push(crate::ring_shortcut::MouseGestureBinding::new(
+                recorder.pattern.clone(),
+                recorder.action.clone(),
+            ));
+        state.operation_mouse_gesture_inputs.insert(
+            (recorder.context, idx),
+            format_mouse_gesture_pattern(&recorder.pattern),
+        );
+        state.operation_mouse_gesture_context = recorder.context;
+        state.operation_mouse_gesture_recorder = None;
+    } else if open && !close_requested {
+        state.operation_mouse_gesture_recorder = Some(recorder);
+    } else {
+        state.operation_mouse_gesture_recorder = None;
+    }
+}
+
+fn update_mouse_gesture_recording(recorder: &mut OperationMouseGestureRecorder, pos: egui::Pos2) {
+    let Some(&last) = recorder.points.last() else {
+        recorder.points.push(pos);
+        return;
+    };
+    let delta = pos - last;
+    if delta.length() < 24.0 {
+        return;
+    }
+    let direction = if delta.x.abs() >= delta.y.abs() {
+        if delta.x >= 0.0 {
+            MouseGestureDirection::Right
+        } else {
+            MouseGestureDirection::Left
+        }
+    } else if delta.y >= 0.0 {
+        MouseGestureDirection::Down
+    } else {
+        MouseGestureDirection::Up
+    };
+    if recorder.pattern.last().copied() != Some(direction) {
+        if recorder.pattern.len() >= crate::ring_shortcut::MOUSE_GESTURE_MAX_STROKES {
+            recorder.error = Some("最大 4 stroke までです。".to_owned());
+        } else {
+            recorder.pattern.push(direction);
+            recorder.error = None;
+        }
+    }
+    recorder.points.push(pos);
+}
+
+fn mouse_gesture_duplicate_label(
+    settings: &RingShortcutSettings,
+    context: RightDragContext,
+    pattern: &[MouseGestureDirection],
+) -> Option<String> {
+    if pattern.is_empty() {
+        return None;
+    }
+    let profile = settings.mouse_gesture_profile(context);
+    profile
+        .bindings
+        .iter()
+        .find(|binding| binding.pattern == pattern)
+        .map(|binding| {
+            binding
+                .action
+                .label_for_context(context.gesture_action_context())
+                .to_owned()
+        })
+}
+
 fn operation_assignment_editor_title(target: &OperationAssignmentTarget) -> String {
     match target {
         OperationAssignmentTarget::Key(action) => {
@@ -918,6 +1176,13 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
         OperationAssignmentTarget::Key(action) => {
             ui.label(egui::RichText::new(compact_key_action_label(*action)).strong());
             ui.small(format!("{}\n{}", action.description(), action.ini_name()));
+            if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
+                ui.small(format!(
+                    "この操作は {} のリング / マウス / パッドにも割り当てられます: {}",
+                    context.label(),
+                    ring_action.label_for_context(context)
+                ));
+            }
         }
         OperationAssignmentTarget::Chord(chord) => {
             ui.label(
@@ -975,9 +1240,11 @@ fn operation_assignment_tab_enabled(
     tab: OperationAssignmentTab,
 ) -> bool {
     match target {
-        OperationAssignmentTarget::Key(_) | OperationAssignmentTarget::Chord(_) => {
+        OperationAssignmentTarget::Key(action) => {
             tab == OperationAssignmentTab::Keyboard
+                || ring_binding_for_key_action(*action).is_some()
         }
+        OperationAssignmentTarget::Chord(_) => tab == OperationAssignmentTab::Keyboard,
         OperationAssignmentTarget::Ring { .. } | OperationAssignmentTarget::RingSlot { .. } => {
             tab != OperationAssignmentTab::Keyboard
         }
@@ -997,6 +1264,24 @@ fn draw_operation_assignment_editor_body(
             let conflicts = keymap.binding_conflicts();
             command_editor(ui, state, &keymap, &conflicts, ime_active);
         }
+        (OperationAssignmentTarget::Key(action), OperationAssignmentTab::RingPad) => {
+            if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
+                state.operation_ring_context = context;
+                ring_action_slot_editor(ui, state, context, ring_action);
+            }
+        }
+        (OperationAssignmentTarget::Key(action), OperationAssignmentTab::MouseButtons) => {
+            if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
+                ring_action_mouse_button_editor(ui, state, context, ring_action);
+            }
+        }
+        (OperationAssignmentTarget::Key(action), OperationAssignmentTab::MouseGesture) => {
+            if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
+                let right_drag_context = right_drag_context_for_ring_context(context);
+                state.operation_mouse_gesture_context = right_drag_context;
+                ring_action_mouse_gesture_editor(ui, state, right_drag_context, ring_action);
+            }
+        }
         (OperationAssignmentTarget::Chord(chord), OperationAssignmentTab::Keyboard) => {
             let keymap = Keymap::from_settings(&state.settings.keymap);
             command_editor_source_chord_section(ui, state, &keymap, *chord);
@@ -1006,9 +1291,9 @@ fn draw_operation_assignment_editor_body(
             let conflicts = keymap.binding_conflicts();
             command_editor(ui, state, &keymap, &conflicts, ime_active);
         }
-        (OperationAssignmentTarget::Ring { context, .. }, OperationAssignmentTab::RingPad) => {
+        (OperationAssignmentTarget::Ring { context, action }, OperationAssignmentTab::RingPad) => {
             state.operation_ring_context = *context;
-            page_ring_shortcut_assignments(ui, state, *context);
+            ring_action_slot_editor(ui, state, *context, action.clone());
         }
         (
             OperationAssignmentTarget::RingSlot { context, direction },
@@ -1025,8 +1310,11 @@ fn draw_operation_assignment_editor_body(
                 *context,
             );
         }
-        (OperationAssignmentTarget::Ring { context, .. }, OperationAssignmentTab::MouseButtons) => {
-            mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, *context);
+        (
+            OperationAssignmentTarget::Ring { context, action },
+            OperationAssignmentTab::MouseButtons,
+        ) => {
+            ring_action_mouse_button_editor(ui, state, *context, action.clone());
         }
         (
             OperationAssignmentTarget::RingSlot { context, .. },
@@ -1034,10 +1322,13 @@ fn draw_operation_assignment_editor_body(
         ) => {
             mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, *context);
         }
-        (OperationAssignmentTarget::Ring { context, .. }, OperationAssignmentTab::MouseGesture) => {
+        (
+            OperationAssignmentTarget::Ring { context, action },
+            OperationAssignmentTab::MouseGesture,
+        ) => {
             let right_drag_context = right_drag_context_for_ring_context(*context);
             state.operation_mouse_gesture_context = right_drag_context;
-            page_mouse_gesture_bindings(ui, state, right_drag_context);
+            ring_action_mouse_gesture_editor(ui, state, right_drag_context, action.clone());
         }
         (
             OperationAssignmentTarget::RingSlot { context, .. },
@@ -1367,53 +1658,24 @@ fn keyboard_chord_tooltip(
 }
 
 fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, chord: Chord) {
-    let Some(action) = state.command_selected else {
-        let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
-        state.command_editor_source_chord = Some(chord);
-        open_operation_assignment_editor(
-            state,
-            OperationAssignmentTarget::Chord(chord),
-            OperationAssignmentTab::Keyboard,
-        );
-        state.command_edit_error = if matches.is_empty() {
-            Some(
-                "このキーは未割り当てです。コマンド一覧の「編集」から割り当て先を選んでください。"
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-        if matches.len() == 1 {
-            open_command_editor_dialog(state, matches[0], Some(chord));
-        }
-        return;
+    let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
+    state.command_editor_source_chord = Some(chord);
+    state.command_selected = None;
+    state.command_edit_loaded_for = None;
+    state.command_capture_slot = None;
+    state.command_edit_error = None;
+    open_operation_assignment_editor(
+        state,
+        OperationAssignmentTarget::Chord(chord),
+        OperationAssignmentTab::Keyboard,
+    );
+    state.command_edit_error = if matches.is_empty() {
+        Some("このキーに割り当てるコマンドを下の一覧から選んでください。".to_string())
+    } else {
+        None
     };
-    ensure_command_editor_loaded(state, keymap, action);
-    let label = chord.display_name();
-    match parse_chord_for_action(action, &label) {
-        Ok(Some(_)) => {
-            let slot = state
-                .command_chord_inputs
-                .iter()
-                .position(|input| input.trim().is_empty())
-                .unwrap_or(0);
-            state.command_chord_inputs[slot] = label;
-            state.command_capture_slot = None;
-            state.command_edit_error = None;
-            state.command_editor_source_chord = Some(chord);
-            open_operation_assignment_editor(
-                state,
-                OperationAssignmentTarget::Key(action),
-                OperationAssignmentTab::Keyboard,
-            );
-        }
-        Ok(None) => {
-            state.command_edit_error =
-                Some("none はキー図からは選べません。割り当て解除を使ってください。".to_string());
-        }
-        Err(err) => {
-            state.command_edit_error = Some(format!("{label}: {err}"));
-        }
+    if matches.len() == 1 {
+        select_command_action(state, matches[0]);
     }
 }
 
@@ -2372,21 +2634,13 @@ fn mouse_gesture_context_editor(
 ) {
     let settings = &mut state.settings.ring_shortcuts;
     let gesture_inputs = &mut state.operation_mouse_gesture_inputs;
+    let mut open_recorder = false;
     ui.separator();
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(context.label()).strong());
         if ui.button("ジェスチャを追加").clicked() {
-            let profile = settings.mouse_gesture_profile_mut(context);
-            let pattern = first_unused_mouse_gesture_pattern(profile);
-            let idx = profile.bindings.len();
-            gesture_inputs.insert((context, idx), format_mouse_gesture_pattern(&pattern));
-            profile
-                .bindings
-                .push(crate::ring_shortcut::MouseGestureBinding::new(
-                    pattern,
-                    RingActionId::None,
-                ));
+            open_recorder = true;
         }
         if ui.button("既定に戻す").clicked() {
             settings.reset_mouse_gesture_profile(context);
@@ -2468,7 +2722,7 @@ fn mouse_gesture_context_editor(
     }
     if !invalid_rows.is_empty() {
         ui.colored_label(
-            egui::Color32::YELLOW,
+            ui.visuals().error_fg_color,
             format!(
                 "形式を読めない行があります: {}",
                 invalid_rows
@@ -2483,12 +2737,168 @@ fn mouse_gesture_context_editor(
         duplicates.sort();
         duplicates.dedup();
         ui.colored_label(
-            egui::Color32::YELLOW,
+            ui.visuals().error_fg_color,
             format!("同じジェスチャが重複しています: {}", duplicates.join(" / ")),
         );
     }
     if profile.bindings.is_empty() {
         ui.small("登録済みジェスチャはありません。右ドラッグ mode をマウスジェスチャにしても、この文脈では何も実行しません。");
+    }
+
+    if open_recorder {
+        let action_context = context.gesture_action_context();
+        let action = RingActionId::available_for_context(action_context)
+            .into_iter()
+            .find(|action| *action != RingActionId::None)
+            .unwrap_or(RingActionId::None);
+        state.operation_mouse_gesture_recorder = Some(OperationMouseGestureRecorder {
+            context,
+            action,
+            pattern: Vec::new(),
+            points: Vec::new(),
+            recording: false,
+            error: None,
+        });
+    }
+}
+
+fn ring_action_slot_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RingShortcutContext,
+    action: RingActionId,
+) {
+    ui.label(egui::RichText::new("リング / X+方向").strong());
+    ui.small("チェックした方向にこの操作を割り当てます。既に別の操作が入っている方向をチェックすると置き換えます。");
+    ui.add_space(6.0);
+
+    let profile = state.settings.ring_shortcuts.profile_mut(context);
+    profile.sanitize(context);
+    egui::Grid::new(("ring_action_slot_editor", context, action.as_str()))
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for &direction in RingDirection::all() {
+                let idx = direction.slot_index();
+                let current = profile
+                    .slots
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or(RingActionId::None);
+                let mut checked = current == action;
+                if ui.checkbox(&mut checked, direction.label()).changed() {
+                    profile.slots[idx] = if checked {
+                        action.clone()
+                    } else {
+                        RingActionId::None
+                    };
+                }
+                ui.label(current.label_for_context(context))
+                    .on_hover_text(current.as_str());
+                if idx % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+}
+
+fn ring_action_mouse_button_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RingShortcutContext,
+    action: RingActionId,
+) {
+    ui.label(egui::RichText::new("マウス進む / 戻る").strong());
+    ui.small(
+        "物理ボタンへこの操作を割り当てます。チェックを外すと、そのボタンは未割り当てになります。",
+    );
+    ui.add_space(6.0);
+
+    let profile = state
+        .settings
+        .ring_shortcuts
+        .mouse_button_profile_mut(context);
+    let mut back = profile.back == action;
+    if ui.checkbox(&mut back, "戻るボタン").changed() {
+        profile.back = if back {
+            action.clone()
+        } else {
+            RingActionId::None
+        };
+    }
+    let mut forward = profile.forward == action;
+    if ui.checkbox(&mut forward, "進むボタン").changed() {
+        profile.forward = if forward { action } else { RingActionId::None };
+    }
+}
+
+fn ring_action_mouse_gesture_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RightDragContext,
+    action: RingActionId,
+) {
+    ui.label(egui::RichText::new("マウスジェスチャ").strong());
+    ui.small(
+        "この操作へ登録済みのジェスチャだけを表示します。追加は実際に右ドラッグして記録します。",
+    );
+    ui.add_space(6.0);
+
+    if ui.button("ジェスチャを追加").clicked() {
+        state.operation_mouse_gesture_recorder = Some(OperationMouseGestureRecorder {
+            context,
+            action: action.clone(),
+            pattern: Vec::new(),
+            points: Vec::new(),
+            recording: false,
+            error: None,
+        });
+    }
+
+    let profile = state
+        .settings
+        .ring_shortcuts
+        .mouse_gesture_profile_mut(context);
+    profile.sanitize(context);
+    let mut remove_idx = None;
+    egui::Grid::new(("ring_action_mouse_gesture_editor", context, action.as_str()))
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("ジェスチャ");
+            ui.strong("操作");
+            ui.label("");
+            ui.end_row();
+            for (idx, binding) in profile.bindings.iter().enumerate() {
+                if binding.action != action {
+                    continue;
+                }
+                ui.monospace(format_mouse_gesture_pattern(&binding.pattern));
+                ui.label(
+                    binding
+                        .action
+                        .label_for_context(context.gesture_action_context()),
+                );
+                if ui.small_button("削除").clicked() {
+                    remove_idx = Some(idx);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(idx) = remove_idx {
+        profile.bindings.remove(idx);
+        state
+            .operation_mouse_gesture_inputs
+            .retain(|(ctx, _), _| *ctx != context);
+    }
+    if !profile
+        .bindings
+        .iter()
+        .any(|binding| binding.action == action)
+    {
+        ui.small("この操作へ登録済みのジェスチャはありません。");
     }
 }
 
@@ -2524,25 +2934,6 @@ fn ring_slot_assignment_editor(
                 }
             });
     });
-}
-
-fn first_unused_mouse_gesture_pattern(
-    profile: &crate::ring_shortcut::MouseGestureProfile,
-) -> Vec<crate::ring_shortcut::MouseGestureDirection> {
-    for &direction in crate::ring_shortcut::MouseGestureDirection::all() {
-        let pattern = vec![direction];
-        if !profile
-            .bindings
-            .iter()
-            .any(|binding| binding.pattern == pattern)
-        {
-            return pattern;
-        }
-    }
-    vec![
-        crate::ring_shortcut::MouseGestureDirection::Down,
-        crate::ring_shortcut::MouseGestureDirection::Right,
-    ]
 }
 
 fn gamepad_layout_preview(

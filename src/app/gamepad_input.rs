@@ -3891,6 +3891,46 @@ impl App {
                 }
                 None
             }
+            RingActionId::GridColumnCount1 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(1);
+                None
+            }
+            RingActionId::GridColumnCount2 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(2);
+                None
+            }
+            RingActionId::GridColumnCount3 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(3);
+                None
+            }
+            RingActionId::GridColumnCount4 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(4);
+                None
+            }
+            RingActionId::GridColumnCount5 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(5);
+                None
+            }
+            RingActionId::GridColumnCount6 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(6);
+                None
+            }
+            RingActionId::GridColumnCount7 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(7);
+                None
+            }
+            RingActionId::GridColumnCount8 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(8);
+                None
+            }
+            RingActionId::GridColumnCount9 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(9);
+                None
+            }
+            RingActionId::GridColumnCount10 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(10);
+                None
+            }
             RingActionId::GridHistoryBack => self.apply_folder_history_nav(false, source),
             RingActionId::GridHistoryForward => self.apply_folder_history_nav(true, source),
             RingActionId::GridParentFolder if context == RingShortcutContext::Grid => {
@@ -4077,6 +4117,14 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn apply_ring_grid_column_count(&mut self, cols: usize) {
+        self.set_grid_view_mode(crate::settings::GridViewMode::Thumbnail);
+        if cols != self.settings.grid_cols {
+            self.settings.grid_cols = cols;
+            self.settings.save();
         }
     }
 
