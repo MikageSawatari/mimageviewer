@@ -2218,6 +2218,15 @@ impl App {
                         false,
                     );
                 }
+                if self.mouse_gesture.is_some() {
+                    let _ = self.update_native_mouse_gesture(
+                        ctx,
+                        crate::ring_shortcut::RightDragContext::VideoFullscreen,
+                        egui::pos2(mouse.x as f32, mouse.y as f32),
+                        true,
+                        false,
+                    );
+                }
                 // navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変) move では
                 // hud activity を入れない。`mark_native_video_hud_activity` は overlay の位置ゲートを
                 // バイパスして `player.mark_cursor_activity()` で auto-hide 済みカーソルを復活させて
@@ -2254,8 +2263,12 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
                 self.native_video_secondary_press_start = None;
+                let gesture_was_active = self.mouse_gesture.is_some();
                 self.cancel_mouse_ring_flick();
                 self.set_native_video_ring_guide_overlay(None);
+                if gesture_was_active {
+                    self.set_native_video_ring_picker_overlay(None);
+                }
                 self.request_native_video_hud_repaint(ctx);
             }
             // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
@@ -6401,21 +6414,30 @@ impl App {
             }
             if event.down {
                 self.native_video_last_move_client = Some((event.x, event.y));
-                if self
+                match self
                     .settings
                     .ring_shortcuts
-                    .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::VideoFullscreen)
+                    .right_drag_mode(crate::ring_shortcut::RightDragContext::VideoFullscreen)
                 {
-                    self.start_mouse_ring_flick(
+                    crate::ring_shortcut::RightDragMode::RingShortcut => self
+                        .start_mouse_ring_flick(
+                            ctx,
+                            crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                            pos,
+                            None,
+                        ),
+                    crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
                         ctx,
-                        crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                        crate::ring_shortcut::RightDragContext::VideoFullscreen,
                         pos,
                         None,
-                    );
-                } else {
-                    self.native_video_secondary_press_start =
-                        Some((std::time::Instant::now(), pos));
-                    ctx.request_repaint_after(std::time::Duration::from_millis(400));
+                    ),
+                    crate::ring_shortcut::RightDragMode::Disabled
+                    | crate::ring_shortcut::RightDragMode::Unknown(_) => {
+                        self.native_video_secondary_press_start =
+                            Some((std::time::Instant::now(), pos));
+                        ctx.request_repaint_after(std::time::Duration::from_millis(400));
+                    }
                 }
                 return;
             }
@@ -6423,6 +6445,27 @@ impl App {
                 let outcome = self.update_native_mouse_ring_flick(
                     ctx,
                     crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                    pos,
+                    false,
+                    true,
+                );
+                if matches!(
+                    outcome,
+                    crate::ring_shortcut::MouseFlickOutcome::Fired
+                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
+                ) {
+                    return;
+                }
+                if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::ShortTap) {
+                    self.handle_fullscreen_close_request();
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+            if self.mouse_gesture.is_some() {
+                let outcome = self.update_native_mouse_gesture(
+                    ctx,
+                    crate::ring_shortcut::RightDragContext::VideoFullscreen,
                     pos,
                     false,
                     true,

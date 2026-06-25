@@ -8925,10 +8925,6 @@ impl App {
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         let mut nav = None;
         if !self.items_are_drive_list
-            && self
-                .settings
-                .ring_shortcuts
-                .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::Grid)
             && let Some(pos) = ctx.input(|i| {
                 i.pointer
                     .secondary_pressed()
@@ -8937,12 +8933,26 @@ impl App {
             })
             && cell_rect.contains(pos)
         {
-            self.start_mouse_ring_flick(
-                ctx,
-                crate::ring_shortcut::RingShortcutContext::Grid,
-                pos,
-                Some(idx),
-            );
+            match self
+                .settings
+                .ring_shortcuts
+                .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid)
+            {
+                crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
+                    ctx,
+                    crate::ring_shortcut::RingShortcutContext::Grid,
+                    pos,
+                    Some(idx),
+                ),
+                crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
+                    ctx,
+                    crate::ring_shortcut::RightDragContext::Grid,
+                    pos,
+                    Some(idx),
+                ),
+                crate::ring_shortcut::RightDragMode::Disabled
+                | crate::ring_shortcut::RightDragMode::Unknown(_) => {}
+            }
         }
         if response.clicked() || response.double_clicked() || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
@@ -9260,15 +9270,10 @@ impl App {
         ctx: &egui::Context,
         rect: egui::Rect,
     ) {
-        if !self
-            .settings
-            .ring_shortcuts
-            .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::Grid)
-            || self.items_are_drive_list
+        if self.items_are_drive_list
+            || self.mouse_ring_flick.is_some()
+            || self.mouse_gesture.is_some()
         {
-            return;
-        }
-        if self.mouse_ring_flick.is_some() {
             return;
         }
         if let Some(pos) = ctx.input(|i| {
@@ -9278,34 +9283,43 @@ impl App {
                 .flatten()
         }) && rect.contains(pos)
         {
-            self.start_mouse_ring_flick(
-                ctx,
-                crate::ring_shortcut::RingShortcutContext::Grid,
-                pos,
-                None,
-            );
+            match self
+                .settings
+                .ring_shortcuts
+                .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid)
+            {
+                crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
+                    ctx,
+                    crate::ring_shortcut::RingShortcutContext::Grid,
+                    pos,
+                    None,
+                ),
+                crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
+                    ctx,
+                    crate::ring_shortcut::RightDragContext::Grid,
+                    pos,
+                    None,
+                ),
+                crate::ring_shortcut::RightDragMode::Disabled
+                | crate::ring_shortcut::RightDragMode::Unknown(_) => {}
+            }
         }
     }
 
     fn update_grid_mouse_ring_flick(&mut self, ctx: &egui::Context) {
         match self.update_mouse_ring_flick(ctx, crate::ring_shortcut::RingShortcutContext::Grid) {
             crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
                 let target_idx = self.mouse_ring_grid_target_idx.take();
-                if self.context_menu_idx.is_some() {
-                    return;
-                }
-                if let Some(idx) = target_idx
-                    && idx < self.items.len()
-                    && !self.items_are_drive_list
-                {
-                    self.selected = Some(idx);
-                    self.update_last_selected_image();
-                    self.context_menu_idx = Some(idx);
-                    self.context_menu_pos = pos;
-                } else {
-                    self.open_current_folder_context_menu_at(ctx, pos);
-                }
+                self.open_grid_right_drag_short_tap_menu(ctx, target_idx);
+            }
+            crate::ring_shortcut::MouseFlickOutcome::Cancelled
+            | crate::ring_shortcut::MouseFlickOutcome::Fired
+            | crate::ring_shortcut::MouseFlickOutcome::None => {}
+        }
+        match self.update_mouse_gesture(ctx, crate::ring_shortcut::RightDragContext::Grid) {
+            crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
+                let target_idx = self.mouse_gesture_grid_target_idx.take();
+                self.open_grid_right_drag_short_tap_menu(ctx, target_idx);
             }
             crate::ring_shortcut::MouseFlickOutcome::Cancelled
             | crate::ring_shortcut::MouseFlickOutcome::Fired
@@ -9313,6 +9327,28 @@ impl App {
         }
     }
 
+    fn open_grid_right_drag_short_tap_menu(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: Option<usize>,
+    ) {
+        let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+        if self.context_menu_idx.is_some() {
+            return;
+        }
+        if let Some(idx) = target_idx
+            && idx < self.items.len()
+            && !self.items_are_drive_list
+        {
+            self.selected = Some(idx);
+            self.update_last_selected_image();
+            self.context_menu_idx = Some(idx);
+            self.context_menu_pos = pos;
+            ctx.request_repaint();
+        } else {
+            self.open_current_folder_context_menu_at(ctx, pos);
+        }
+    }
     // ── 詳細リスト ───────────────────────────────────────────────────
 
     const DETAILS_HEADER_H: f32 = 26.0;
@@ -9497,6 +9533,11 @@ impl App {
             ui,
             full_rect,
             crate::ring_shortcut::RingShortcutContext::Grid,
+        );
+        self.draw_mouse_gesture_overlay(
+            ui,
+            full_rect,
+            crate::ring_shortcut::RightDragContext::Grid,
         );
         self.draw_gamepad_ring_overlay(ui, full_rect);
         self.draw_gamepad_picker_overlay(ui, full_rect);
@@ -10388,6 +10429,11 @@ impl App {
                         full_rect,
                         crate::ring_shortcut::RingShortcutContext::Grid,
                     );
+                    self.draw_mouse_gesture_overlay(
+                        ui,
+                        full_rect,
+                        crate::ring_shortcut::RightDragContext::Grid,
+                    );
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
@@ -10418,6 +10464,11 @@ impl App {
                         ui,
                         full_rect,
                         crate::ring_shortcut::RingShortcutContext::Grid,
+                    );
+                    self.draw_mouse_gesture_overlay(
+                        ui,
+                        full_rect,
+                        crate::ring_shortcut::RightDragContext::Grid,
                     );
                     self.draw_gamepad_ring_overlay(ui, full_rect);
                     self.draw_gamepad_picker_overlay(ui, full_rect);
@@ -10671,6 +10722,11 @@ impl App {
                     ui,
                     full_rect,
                     crate::ring_shortcut::RingShortcutContext::Grid,
+                );
+                self.draw_mouse_gesture_overlay(
+                    ui,
+                    full_rect,
+                    crate::ring_shortcut::RightDragContext::Grid,
                 );
                 self.draw_gamepad_ring_overlay(ui, full_rect);
                 self.draw_gamepad_picker_overlay(ui, full_rect);

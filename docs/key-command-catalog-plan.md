@@ -29,7 +29,7 @@
 > 割り当て解除・既定復帰・全体既定化を提供する。
 > `BindingConflict` は保存禁止にせず警告として表示し、競合一覧から各コマンドの編集欄へ移動できる。
 > OK 反映時に runtime `Keymap` と native 動画転送用 shortcut snapshot も更新する。
-> マウスジェスチャー、リングショートカット統合、ゲームパッド入力範囲拡張は後続で仕様相談する。
+> マウスジェスチャーと右ドラッグ mode 4 文脈化は `Settings.ring_shortcuts` 側で実装中。リングショートカットのコマンド画面統合とゲームパッド入力範囲拡張は後続で仕様相談する。
 >
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
 > `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。

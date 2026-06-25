@@ -5057,6 +5057,11 @@ impl App {
                         }
                         let ring_surface_context = self.current_ring_shortcut_context();
                         self.draw_mouse_ring_flick_overlay(ui, full_rect, ring_surface_context);
+                        self.draw_mouse_gesture_overlay(
+                            ui,
+                            full_rect,
+                            self.current_right_drag_context(),
+                        );
                         self.draw_gamepad_ring_overlay(ui, full_rect);
                         self.draw_gamepad_picker_overlay(ui, full_rect);
                         self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
@@ -7984,7 +7989,6 @@ impl App {
         // here; in the detached path the egui body runs, so we must skip video explicitly.
         if !state.is_video
             && !self.analysis_mode
-            && !self.is_overlay_edit_mode_active()
             && self.fs_context_menu_idx.is_none()
             && !self.spread_popup_open
             && !self.fit_popup_open
@@ -7998,73 +8002,103 @@ impl App {
             // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
             // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
 
-            if self
+            let right_drag_context = self.current_right_drag_context();
+            let right_drag_mode = self
                 .settings
                 .ring_shortcuts
-                .mouse_ring_enabled(self.current_ring_shortcut_context())
-            {
-                if secondary_in_seek_panel {
-                    self.cancel_mouse_ring_flick();
-                } else if secondary_pressed {
-                    self.start_mouse_ring_flick(
-                        ctx,
-                        self.current_ring_shortcut_context(),
-                        secondary_pos,
-                        None,
-                    );
-                }
-                match self.update_mouse_ring_flick_with_pos(
-                    ctx,
-                    self.current_ring_shortcut_context(),
-                    secondary_pos,
-                    secondary_down,
-                    secondary_released,
-                ) {
-                    crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                        close = true;
+                .right_drag_mode(right_drag_context);
+
+            match right_drag_mode {
+                crate::ring_shortcut::RightDragMode::RingShortcut => {
+                    let Some(ring_context) = right_drag_context.ring_context() else {
+                        return (nav_delta, close);
+                    };
+                    if secondary_in_seek_panel {
+                        self.cancel_mouse_ring_flick();
+                    } else if secondary_pressed {
+                        self.start_mouse_ring_flick(ctx, ring_context, secondary_pos, None);
                     }
-                    crate::ring_shortcut::MouseFlickOutcome::Fired
-                    | crate::ring_shortcut::MouseFlickOutcome::Cancelled
-                    | crate::ring_shortcut::MouseFlickOutcome::None => {}
-                }
-            } else if secondary_in_seek_panel {
-                self.fs_secondary_press_start = None;
-            } else if secondary_down && self.fs_secondary_press_start.is_none() {
-                // 押下開始を記録
-                self.fs_secondary_press_start = Some((std::time::Instant::now(), secondary_pos));
-            }
-
-            if !self
-                .settings
-                .ring_shortcuts
-                .mouse_ring_enabled(self.current_ring_shortcut_context())
-                && let Some((start_time, start_pos)) = self.fs_secondary_press_start
-            {
-                let elapsed = start_time.elapsed();
-                let current_pos = fullscreen_pointer_pos_or(ctx, full_rect, start_pos);
-                let moved = current_pos.distance(start_pos);
-
-                if !secondary_released
-                    && elapsed >= std::time::Duration::from_millis(400)
-                    && moved < 20.0
-                {
-                    // 長押ししきい値超過 → 押下中にコンテキストメニューを即表示
-                    self.fs_context_menu_idx = self.fullscreen_idx;
-                    self.fs_context_menu_pos = current_pos;
-                    self.fs_secondary_press_start = None;
-                } else if secondary_released {
-                    if moved < 20.0 {
-                        if elapsed >= std::time::Duration::from_millis(400) {
-                            self.fs_context_menu_idx = self.fullscreen_idx;
-                            self.fs_context_menu_pos = current_pos;
-                        } else {
+                    match self.update_mouse_ring_flick_with_pos(
+                        ctx,
+                        ring_context,
+                        secondary_pos,
+                        secondary_down,
+                        secondary_released,
+                    ) {
+                        crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
                             close = true;
                         }
+                        crate::ring_shortcut::MouseFlickOutcome::Fired
+                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
+                        | crate::ring_shortcut::MouseFlickOutcome::None => {}
                     }
-                    self.fs_secondary_press_start = None;
-                } else if moved >= 20.0 {
-                    // マウスが動きすぎた → キャンセル
-                    self.fs_secondary_press_start = None;
+                }
+                crate::ring_shortcut::RightDragMode::MouseGesture => {
+                    if secondary_in_seek_panel {
+                        self.cancel_mouse_gesture();
+                    } else if secondary_pressed {
+                        self.start_mouse_gesture(ctx, right_drag_context, secondary_pos, None);
+                    }
+                    match self.update_mouse_gesture_with_pos(
+                        ctx,
+                        right_drag_context,
+                        secondary_pos,
+                        secondary_down,
+                        secondary_released,
+                    ) {
+                        crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
+                            if right_drag_context
+                                != crate::ring_shortcut::RightDragContext::EditMode
+                            {
+                                close = true;
+                            }
+                        }
+                        crate::ring_shortcut::MouseFlickOutcome::Fired
+                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
+                        | crate::ring_shortcut::MouseFlickOutcome::None => {}
+                    }
+                }
+                crate::ring_shortcut::RightDragMode::Disabled
+                | crate::ring_shortcut::RightDragMode::Unknown(_) => {
+                    if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
+                        return (nav_delta, close);
+                    }
+                    if secondary_in_seek_panel {
+                        self.fs_secondary_press_start = None;
+                    } else if secondary_down && self.fs_secondary_press_start.is_none() {
+                        // 押下開始を記録
+                        self.fs_secondary_press_start =
+                            Some((std::time::Instant::now(), secondary_pos));
+                    }
+
+                    if let Some((start_time, start_pos)) = self.fs_secondary_press_start {
+                        let elapsed = start_time.elapsed();
+                        let current_pos = fullscreen_pointer_pos_or(ctx, full_rect, start_pos);
+                        let moved = current_pos.distance(start_pos);
+
+                        if !secondary_released
+                            && elapsed >= std::time::Duration::from_millis(400)
+                            && moved < 20.0
+                        {
+                            // 長押ししきい値超過 → 押下中にコンテキストメニューを即表示
+                            self.fs_context_menu_idx = self.fullscreen_idx;
+                            self.fs_context_menu_pos = current_pos;
+                            self.fs_secondary_press_start = None;
+                        } else if secondary_released {
+                            if moved < 20.0 {
+                                if elapsed >= std::time::Duration::from_millis(400) {
+                                    self.fs_context_menu_idx = self.fullscreen_idx;
+                                    self.fs_context_menu_pos = current_pos;
+                                } else {
+                                    close = true;
+                                }
+                            }
+                            self.fs_secondary_press_start = None;
+                        } else if moved >= 20.0 {
+                            // マウスが動きすぎた → キャンセル
+                            self.fs_secondary_press_start = None;
+                        }
+                    }
                 }
             }
         }

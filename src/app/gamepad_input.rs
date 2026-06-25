@@ -10,10 +10,11 @@ use crate::grid_item::GridItem;
 use crate::ring_shortcut::{
     GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
     GamepadLocationPickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
-    MOUSE_FLICK_NEUTRAL_RADIUS_PX, MouseFlickOutcome, MouseFlickState, PickerListMode,
-    PickerListState, RingActionId, RingDirection, RingPickerAnchor, RingPickerOriginalState,
-    RingPickerRowId, RingPickerState, RingShortcutContext, mouse_flick_guide_delay,
-    mouse_flick_menu_delay,
+    MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX, MouseFlickOutcome,
+    MouseFlickState, MouseGestureDirection, MouseGestureState, PickerListMode, PickerListState,
+    RightDragContext, RightDragMode, RingActionId, RingDirection, RingPickerAnchor,
+    RingPickerOriginalState, RingPickerRowId, RingPickerState, RingShortcutContext,
+    format_mouse_gesture_pattern, mouse_flick_guide_delay, mouse_flick_menu_delay,
 };
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
@@ -287,6 +288,103 @@ impl App {
         });
     }
 
+    pub(crate) fn current_right_drag_context(&self) -> RightDragContext {
+        if self.is_overlay_edit_mode_active() {
+            RightDragContext::EditMode
+        } else if let Some(fs_idx) = self.fullscreen_idx {
+            if self.current_fullscreen_is_video(fs_idx) {
+                RightDragContext::VideoFullscreen
+            } else {
+                RightDragContext::ImageFullscreen
+            }
+        } else {
+            RightDragContext::Grid
+        }
+    }
+
+    pub(crate) fn draw_mouse_gesture_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        surface_context: RightDragContext,
+    ) {
+        if self
+            .settings
+            .ring_shortcuts
+            .right_drag_mode(surface_context)
+            != RightDragMode::MouseGesture
+            || self.ring_picker.is_some()
+        {
+            return;
+        }
+        let Some(gesture) = self.mouse_gesture.as_ref() else {
+            return;
+        };
+        if gesture.context != surface_context || !gesture.guide_visible() {
+            return;
+        }
+        let profile = self
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_profile(surface_context);
+        let painter = ui.painter();
+        let panel_w = (full_rect.width() * 0.42).clamp(260.0, 420.0);
+        let row_h = 22.0;
+        let rows = profile.bindings.len().max(1) as f32;
+        let panel_h = 54.0 + row_h * rows;
+        let pos = egui::pos2(
+            (gesture.start_pos.x + 18.0)
+                .min(full_rect.max.x - panel_w - 8.0)
+                .max(full_rect.min.x + 8.0),
+            (gesture.start_pos.y + 18.0)
+                .min(full_rect.max.y - panel_h - 8.0)
+                .max(full_rect.min.y + 8.0),
+        );
+        let rect = egui::Rect::from_min_size(pos, egui::vec2(panel_w, panel_h));
+        painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(220));
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)),
+            egui::StrokeKind::Inside,
+        );
+        let current = if gesture.pattern.is_empty() {
+            "入力中: -".to_string()
+        } else {
+            format!("入力中: {}", format_mouse_gesture_pattern(&gesture.pattern))
+        };
+        painter.text(
+            rect.min + egui::vec2(12.0, 10.0),
+            egui::Align2::LEFT_TOP,
+            current,
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+        let mut y = rect.min.y + 34.0;
+        if profile.bindings.is_empty() {
+            painter.text(
+                egui::pos2(rect.min.x + 12.0, y),
+                egui::Align2::LEFT_TOP,
+                "登録済みジェスチャなし",
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(190),
+            );
+        } else {
+            let action_context = surface_context.gesture_action_context();
+            for binding in &profile.bindings {
+                let pattern = format_mouse_gesture_pattern(&binding.pattern);
+                let label = binding.action.label_for_context(action_context);
+                painter.text(
+                    egui::pos2(rect.min.x + 12.0, y),
+                    egui::Align2::LEFT_TOP,
+                    format!("{pattern}  {label}"),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_gray(220),
+                );
+                y += row_h;
+            }
+        }
+    }
     pub(crate) fn start_mouse_ring_flick(
         &mut self,
         ctx: &egui::Context,
@@ -460,29 +558,258 @@ impl App {
         MouseFlickOutcome::None
     }
 
+    pub(crate) fn start_mouse_gesture(
+        &mut self,
+        ctx: &egui::Context,
+        context: RightDragContext,
+        pos: egui::Pos2,
+        grid_target_idx: Option<usize>,
+    ) {
+        if self.settings.ring_shortcuts.right_drag_mode(context) != RightDragMode::MouseGesture
+            || self.ring_picker.is_some()
+            || self.mouse_gesture.is_some()
+        {
+            return;
+        }
+        self.mouse_gesture = Some(MouseGestureState::new(context, Instant::now(), pos));
+        self.mouse_gesture_grid_target_idx = grid_target_idx;
+        self.mouse_ring_suppress_context_menu_once = false;
+        if context == RightDragContext::VideoFullscreen {
+            self.sync_native_video_mouse_gesture_overlay(ctx);
+        }
+        request_ring_overlay_repaint_after(ctx, mouse_flick_guide_delay());
+    }
+
+    pub(crate) fn update_mouse_gesture(
+        &mut self,
+        ctx: &egui::Context,
+        context: RightDragContext,
+    ) -> MouseFlickOutcome {
+        let Some(existing) = self.mouse_gesture.as_ref() else {
+            return MouseFlickOutcome::None;
+        };
+        if existing.context != context {
+            if existing.context == self.current_right_drag_context() {
+                return MouseFlickOutcome::None;
+            }
+            let old_context = existing.context;
+            self.cancel_mouse_gesture();
+            if old_context == RightDragContext::VideoFullscreen {
+                self.clear_native_video_mouse_gesture_overlay(ctx);
+            }
+            return MouseFlickOutcome::None;
+        }
+        let fallback_pos = existing.current_pos;
+        let (secondary_down, secondary_released, pointer_pos) = ctx.input(|i| {
+            (
+                i.pointer.secondary_down(),
+                i.pointer.secondary_released(),
+                i.pointer
+                    .interact_pos()
+                    .or_else(|| i.pointer.latest_pos())
+                    .unwrap_or(fallback_pos),
+            )
+        });
+        self.update_mouse_gesture_with_pos(
+            ctx,
+            context,
+            pointer_pos,
+            secondary_down,
+            secondary_released,
+        )
+    }
+
+    pub(crate) fn update_native_mouse_gesture(
+        &mut self,
+        ctx: &egui::Context,
+        context: RightDragContext,
+        pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> MouseFlickOutcome {
+        self.update_mouse_gesture_with_pos(ctx, context, pos, secondary_down, secondary_released)
+    }
+
+    pub(crate) fn update_mouse_gesture_with_pos(
+        &mut self,
+        ctx: &egui::Context,
+        context: RightDragContext,
+        pointer_pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> MouseFlickOutcome {
+        let (moved, elapsed, pattern, armed) = {
+            let Some(gesture) = self.mouse_gesture.as_mut() else {
+                return MouseFlickOutcome::None;
+            };
+            if gesture.context != context {
+                return MouseFlickOutcome::None;
+            }
+            gesture.current_pos = pointer_pos;
+            let step_delta = pointer_pos - gesture.last_step_pos;
+            if step_delta.length() >= MOUSE_GESTURE_STEP_THRESHOLD_PX {
+                if let Some(direction) = mouse_gesture_direction_from_delta(step_delta) {
+                    if gesture.pattern.last().copied() != Some(direction)
+                        && gesture.pattern.len() < crate::ring_shortcut::MOUSE_GESTURE_MAX_STROKES
+                    {
+                        gesture.pattern.push(direction);
+                        gesture.armed = true;
+                    }
+                    gesture.last_step_pos = pointer_pos;
+                }
+            }
+            (
+                gesture.moved(),
+                gesture.elapsed(),
+                gesture.pattern.clone(),
+                gesture.armed,
+            )
+        };
+
+        if secondary_released {
+            self.mouse_gesture = None;
+            if context == RightDragContext::VideoFullscreen {
+                self.clear_native_video_mouse_gesture_overlay(ctx);
+            }
+            if !pattern.is_empty() {
+                self.mouse_gesture_grid_target_idx = None;
+                self.mouse_ring_suppress_context_menu_once = true;
+                if let Some(nav) = self.trigger_mouse_gesture_action(ctx, context, &pattern) {
+                    self.mouse_ring_nav = Some(nav);
+                }
+                request_ring_overlay_repaint(ctx);
+                return MouseFlickOutcome::Fired;
+            }
+            if moved < MOUSE_FLICK_MOVE_THRESHOLD_PX {
+                self.mouse_ring_suppress_context_menu_once = true;
+                request_ring_overlay_repaint(ctx);
+                return if elapsed >= mouse_flick_menu_delay() {
+                    self.mouse_gesture_grid_target_idx = None;
+                    MouseFlickOutcome::Cancelled
+                } else {
+                    MouseFlickOutcome::ShortTap
+                };
+            }
+            if armed || elapsed >= mouse_flick_menu_delay() {
+                self.mouse_gesture_grid_target_idx = None;
+                self.mouse_ring_suppress_context_menu_once = true;
+                request_ring_overlay_repaint(ctx);
+                return MouseFlickOutcome::Cancelled;
+            }
+            self.mouse_gesture_grid_target_idx = None;
+            request_ring_overlay_repaint(ctx);
+            return MouseFlickOutcome::None;
+        }
+
+        if !secondary_down {
+            self.cancel_mouse_gesture();
+            if context == RightDragContext::VideoFullscreen {
+                self.clear_native_video_mouse_gesture_overlay(ctx);
+            }
+            return MouseFlickOutcome::None;
+        }
+        if context == RightDragContext::VideoFullscreen {
+            self.sync_native_video_mouse_gesture_overlay(ctx);
+        }
+        self.request_mouse_gesture_repaint(ctx);
+        MouseFlickOutcome::None
+    }
+
+    pub(crate) fn cancel_mouse_gesture(&mut self) {
+        self.mouse_gesture = None;
+        self.mouse_gesture_grid_target_idx = None;
+    }
+
+    fn request_mouse_gesture_repaint(&self, ctx: &egui::Context) {
+        let Some(gesture) = self.mouse_gesture.as_ref() else {
+            return;
+        };
+        let elapsed = gesture.elapsed();
+        if elapsed < mouse_flick_guide_delay() {
+            request_ring_overlay_repaint_after(ctx, mouse_flick_guide_delay() - elapsed);
+        } else if !gesture.armed && elapsed < mouse_flick_menu_delay() {
+            request_ring_overlay_repaint_after(ctx, mouse_flick_menu_delay() - elapsed);
+        } else {
+            request_ring_overlay_repaint_after(ctx, GAMEPAD_REPAINT_INTERVAL);
+        }
+    }
+
+    fn trigger_mouse_gesture_action(
+        &mut self,
+        ctx: &egui::Context,
+        context: RightDragContext,
+        pattern: &[MouseGestureDirection],
+    ) -> Option<AddressBarNav> {
+        let action_context = context.gesture_action_context();
+        let action = self
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_profile(context)
+            .action_for_pattern(pattern);
+        let pattern_label = format_mouse_gesture_pattern(pattern);
+        if !action.is_valid_for_context(action_context) {
+            crate::logger::log(format!(
+                "mouse gesture ignored invalid action={} context={context:?}",
+                action.as_str()
+            ));
+            return None;
+        }
+        if matches!(action, RingActionId::None) {
+            self.show_feedback_toast(format!("[Gesture: {pattern_label} なし]"));
+            return None;
+        }
+        self.show_feedback_toast(format!(
+            "[Gesture: {pattern_label} {}]",
+            action.label_for_context(action_context)
+        ));
+        self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
+    }
     pub(crate) fn mouse_ring_context_menu_suppressed(&self, ctx: &egui::Context) -> bool {
         if self.mouse_ring_suppress_context_menu_once {
             return true;
         }
-        let Some(flick) = self.mouse_ring_flick.as_ref() else {
-            return false;
-        };
-        if !self
-            .settings
-            .ring_shortcuts
-            .mouse_ring_enabled(flick.context)
-        {
-            return false;
+        if let Some(flick) = self.mouse_ring_flick.as_ref() {
+            if !self
+                .settings
+                .ring_shortcuts
+                .mouse_ring_enabled(flick.context)
+            {
+                return false;
+            }
+            if flick.armed {
+                return true;
+            }
+            return ctx.input(|i| {
+                i.pointer
+                    .interact_pos()
+                    .or_else(|| i.pointer.latest_pos())
+                    .is_some_and(|pos| {
+                        pos.distance(flick.start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX
+                    })
+            });
         }
-        if flick.armed {
-            return true;
+        if let Some(gesture) = self.mouse_gesture.as_ref() {
+            if self
+                .settings
+                .ring_shortcuts
+                .right_drag_mode(gesture.context)
+                != RightDragMode::MouseGesture
+            {
+                return false;
+            }
+            if gesture.armed {
+                return true;
+            }
+            return ctx.input(|i| {
+                i.pointer
+                    .interact_pos()
+                    .or_else(|| i.pointer.latest_pos())
+                    .is_some_and(|pos| {
+                        pos.distance(gesture.start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX
+                    })
+            });
         }
-        ctx.input(|i| {
-            i.pointer
-                .interact_pos()
-                .or_else(|| i.pointer.latest_pos())
-                .is_some_and(|pos| pos.distance(flick.start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX)
-        })
+        false
     }
 
     pub(crate) fn clear_mouse_ring_context_menu_suppression_if_idle(
@@ -498,6 +825,7 @@ impl App {
     pub(crate) fn cancel_mouse_ring_flick(&mut self) {
         self.mouse_ring_flick = None;
         self.mouse_ring_grid_target_idx = None;
+        self.cancel_mouse_gesture();
     }
 
     pub(crate) fn request_mouse_ring_flick_repaint(&self, ctx: &egui::Context) {
@@ -2717,6 +3045,75 @@ impl App {
         let _ = ctx;
     }
 
+    fn sync_native_video_mouse_gesture_overlay(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            let overlay = self.native_video_mouse_gesture_overlay();
+            self.set_native_video_ring_picker_overlay(overlay);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
+    fn clear_native_video_mouse_gesture_overlay(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            self.set_native_video_ring_picker_overlay(None);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
+    #[cfg(windows)]
+    fn native_video_mouse_gesture_overlay(
+        &self,
+    ) -> Option<crate::video::native_presenter::NativeOverlayRingPicker> {
+        let gesture = self.mouse_gesture.as_ref()?;
+        if gesture.context != RightDragContext::VideoFullscreen || !gesture.guide_visible() {
+            return None;
+        }
+        let profile = self
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_profile(RightDragContext::VideoFullscreen);
+        let action_context = RightDragContext::VideoFullscreen.gesture_action_context();
+        let mut rows: Vec<_> = profile
+            .bindings
+            .iter()
+            .map(
+                |binding| crate::video::native_presenter::NativeOverlayRingPickerRow {
+                    label: format_mouse_gesture_pattern(&binding.pattern),
+                    value: binding.action.label_for_context(action_context).to_string(),
+                },
+            )
+            .collect();
+        if rows.is_empty() {
+            rows.push(crate::video::native_presenter::NativeOverlayRingPickerRow {
+                label: "未登録".to_string(),
+                value: "環境設定で追加".to_string(),
+            });
+        }
+        let selected_row = profile
+            .bindings
+            .iter()
+            .position(|binding| binding.pattern == gesture.pattern)
+            .unwrap_or(0);
+        let current = if gesture.pattern.is_empty() {
+            "-".to_string()
+        } else {
+            format_mouse_gesture_pattern(&gesture.pattern)
+        };
+        Some(crate::video::native_presenter::NativeOverlayRingPicker {
+            title: format!("マウスジェスチャ / 入力中: {current}"),
+            rows,
+            selected_row,
+            footer: "右ドラッグで軌跡を入力、離すと実行 / 短押しは閉じる".to_string(),
+            drill: None,
+        })
+    }
+
     #[cfg(windows)]
     fn native_video_picker_overlay(
         &self,
@@ -4864,6 +5261,22 @@ fn angular_distance_deg(a: f32, b: f32) -> f32 {
     ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs()
 }
 
+fn mouse_gesture_direction_from_delta(delta: egui::Vec2) -> Option<MouseGestureDirection> {
+    if delta.length() < MOUSE_GESTURE_STEP_THRESHOLD_PX {
+        return None;
+    }
+    if delta.x.abs() >= delta.y.abs() {
+        if delta.x >= 0.0 {
+            Some(MouseGestureDirection::Right)
+        } else {
+            Some(MouseGestureDirection::Left)
+        }
+    } else if delta.y >= 0.0 {
+        Some(MouseGestureDirection::Down)
+    } else {
+        Some(MouseGestureDirection::Up)
+    }
+}
 fn mouse_flick_direction(flick: &MouseFlickState) -> Option<RingDirection> {
     let delta = flick.current_pos - flick.start_pos;
     if delta.length() < MOUSE_FLICK_NEUTRAL_RADIUS_PX {

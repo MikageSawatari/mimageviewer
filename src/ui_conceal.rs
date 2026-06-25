@@ -1032,7 +1032,12 @@ impl App {
         let primary_down = ctx.input(|i| i.pointer.primary_down());
         let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
         let primary_released = ctx.input(|i| i.pointer.primary_released());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed())
+            && self
+                .settings
+                .ring_shortcuts
+                .right_drag_mode(crate::ring_shortcut::RightDragContext::EditMode)
+                != crate::ring_shortcut::RightDragMode::MouseGesture;
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.conceal_paint_mode;
         // KeyHold は keymap 経由。Windows では内部で OS 状態も読むので、

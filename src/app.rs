@@ -2989,6 +2989,10 @@ pub struct App {
     pub(crate) mouse_ring_flick: Option<crate::ring_shortcut::MouseFlickState>,
     /// グリッドで右フリックを開始したセル。背景開始なら None。
     pub(crate) mouse_ring_grid_target_idx: Option<usize>,
+    /// マウス右ドラッグのジェスチャ状態。グリッド / フルスクリーンで共通。
+    pub(crate) mouse_gesture: Option<crate::ring_shortcut::MouseGestureState>,
+    /// グリッドで右ジェスチャを開始したセル。背景開始なら None。
+    pub(crate) mouse_gesture_grid_target_idx: Option<usize>,
     /// フリック成立 / 長押しメニュー後の release が従来右クリックメニューを再発火しないための抑止。
     pub(crate) mouse_ring_suppress_context_menu_once: bool,
     /// グリッドのリングアクションから発生したナビゲーションをフレーム後段に合流させる予約。
@@ -5593,6 +5597,8 @@ impl App {
             context_menu_pos: egui::Pos2::ZERO,
             mouse_ring_flick: None,
             mouse_ring_grid_target_idx: None,
+            mouse_gesture: None,
+            mouse_gesture_grid_target_idx: None,
             mouse_ring_suppress_context_menu_once: false,
             mouse_ring_nav: None,
             show_mouse_nav_migration_prompt,
@@ -27385,10 +27391,12 @@ impl App {
             self.native_video_secondary_press_start = None;
         }
         self.mouse_ring_flick = None;
+        self.mouse_gesture = None;
         self.gamepad_favorite_picker = None;
         self.gamepad_location_picker = None;
         self.gamepad_video_marker_picker = None;
         self.mouse_ring_grid_target_idx = None;
+        self.mouse_gesture_grid_target_idx = None;
         self.mouse_ring_suppress_context_menu_once = false;
         self.fs_middle_zoom_drag = None;
         self.fs_seek_drag_active = false;

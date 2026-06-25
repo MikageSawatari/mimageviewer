@@ -12,7 +12,7 @@
 
 ---
 
-**2026-06-25 追記**: NeeView 風マウスジェスチャー導入に向け、右ドラッグの用途をグリッド / 画像フルスクリーン / 動画フルスクリーン / 編集モードの 4 文脈ごとに `未使用` / `リングショートカット` / `マウスジェスチャ` から選ぶモデルへ拡張中。旧 `mouse_flick_enabled` は互換読み込み用として残し、未設定の既存環境では従来どおり 3 表示文脈のリング ON/OFF として解釈する。初期スライスでは per-context mode 保存とリング起動判定の接続までを行い、ジェスチャ登録 UI / 入力状態機械は後続で有効化する。
+**2026-06-25 追記**: NeeView 風マウスジェスチャー導入に向け、右ドラッグの用途をグリッド / 画像フルスクリーン / 動画フルスクリーン / 編集モードの 4 文脈ごとに `未使用` / `リングショートカット` / `マウスジェスチャ` から選ぶモデルへ拡張中。旧 `mouse_flick_enabled` は互換読み込み用として残し、未設定の既存環境では従来どおり 3 表示文脈のリング ON/OFF として解釈する。本スライスでは per-context mode 保存、マウスジェスチャ登録 UI、入力状態機械、長押しガイド表示まで実装する。編集モードの右ドラッグは既存の右クリック編集操作と競合するため、初期版では `未使用` / `マウスジェスチャ` のみを選択可能にする。
 
 ## 1. 背景・目的
 
@@ -518,7 +518,7 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
   より旧 DB を新コードで開いても安全に既定が入る。
 - `RingShortcutSettings` が保持する**保存対象 (全列挙、Codex 第6回 P2)**:
   - context 別 × 8 スロットの `RingActionId` (または空き)
-  - 右ドラッグ mode 4 文脈 (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`)。旧 `mouse_flick_enabled` は互換用
+  - 右ドラッグ mode 4 文脈 (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) と、4 文脈ごとの `mouse_gestures_*` (最大 4 stroke の方向列 + `RingActionId`)。旧 `mouse_flick_enabled` は互換用
   - `shift_wheel_pair` / `alt_wheel_pair` (`WheelPairActionId`) — 互換読み込み用。§5.2 のとおり現行 UI /
     入力経路からは参照しない
   - `mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video`
@@ -542,7 +542,7 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
 | メタデータ表示 | リング 1 枠へ移設 + 初回トースト案内 (機能は残す) |
 | 新規: apply 層 | `RingActionId` / `PickerCommand` + App apply API (§7) |
 | 新規 UI | リング描画オーバーレイ / パッド専用ピッカーパネル (modal・編集セッション) |
-| `Settings` | `#[serde(default)] ring_shortcuts` = 8 スロット×3 context + 右ドラッグ mode 4 文脈 + 初回案内フラグ + shift/alt wheel pair + `mouse_buttons_*` profile + 互換用 `mouse_flick_enabled` / `gamepad_ring_enabled` / 旧 `mouse_back_forward_action` / `mouse_nav_prompt_done` (§8) |
+| `Settings` | `#[serde(default)] ring_shortcuts` = 8 スロット×3 context + 右ドラッグ mode 4 文脈 + マウスジェスチャ 4 文脈 + 初回案内フラグ + shift/alt wheel pair + `mouse_buttons_*` profile + 互換用 `mouse_flick_enabled` / `gamepad_ring_enabled` / 旧 `mouse_back_forward_action` / `mouse_nav_prompt_done` (§8) |
 
 ## 10. ドキュメント / マニュアル更新 (確定後)
 

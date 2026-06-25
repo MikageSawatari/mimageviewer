@@ -86,6 +86,14 @@ impl RightDragContext {
             Self::EditMode => None,
         }
     }
+
+    pub fn gesture_action_context(self) -> RingShortcutContext {
+        match self {
+            Self::Grid => RingShortcutContext::Grid,
+            Self::ImageFullscreen | Self::EditMode => RingShortcutContext::ImageFullscreen,
+            Self::VideoFullscreen => RingShortcutContext::VideoFullscreen,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +164,207 @@ impl<'de> Deserialize<'de> for RightDragMode {
     {
         let value = String::deserialize(deserializer)?;
         Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
+    }
+}
+pub const MOUSE_GESTURE_MAX_STROKES: usize = 4;
+pub const MOUSE_GESTURE_STEP_THRESHOLD_PX: f32 = 36.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MouseGestureDirection {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+
+impl MouseGestureDirection {
+    pub fn all() -> &'static [Self] {
+        const ALL: [MouseGestureDirection; 4] = [
+            MouseGestureDirection::Up,
+            MouseGestureDirection::Right,
+            MouseGestureDirection::Down,
+            MouseGestureDirection::Left,
+        ];
+        &ALL
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Right => "right",
+            Self::Down => "down",
+            Self::Left => "left",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "u" | "up" | "↑" | "上" => Self::Up,
+            "r" | "right" | "→" | "右" => Self::Right,
+            "d" | "down" | "↓" | "下" => Self::Down,
+            "l" | "left" | "←" | "左" => Self::Left,
+            _ => return None,
+        })
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Up => "↑",
+            Self::Right => "→",
+            Self::Down => "↓",
+            Self::Left => "←",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Up => "↑ 上",
+            Self::Right => "→ 右",
+            Self::Down => "↓ 下",
+            Self::Left => "← 左",
+        }
+    }
+}
+
+impl Serialize for MouseGestureDirection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MouseGestureDirection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value)
+            .ok_or_else(|| serde::de::Error::custom("unknown mouse gesture direction"))
+    }
+}
+
+pub fn format_mouse_gesture_pattern(pattern: &[MouseGestureDirection]) -> String {
+    pattern
+        .iter()
+        .map(|d| d.symbol())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub fn parse_mouse_gesture_pattern(input: &str) -> Option<Vec<MouseGestureDirection>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed
+        .replace('＞', ">")
+        .replace('，', ",")
+        .replace('、', ",")
+        .replace('-', " ")
+        .replace('>', " ")
+        .replace(',', " ")
+        .replace('/', " ");
+    let mut out = Vec::new();
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if tokens.len() > 1 {
+        for token in tokens {
+            out.push(MouseGestureDirection::from_str(token)?);
+        }
+    } else if let Some(token) = tokens.first()
+        && let Some(direction) = MouseGestureDirection::from_str(token)
+    {
+        out.push(direction);
+    } else {
+        for ch in normalized.chars().filter(|c| !c.is_whitespace()) {
+            out.push(MouseGestureDirection::from_str(&ch.to_string())?);
+        }
+    }
+    normalize_mouse_gesture_pattern(out)
+}
+
+pub fn normalize_mouse_gesture_pattern(
+    pattern: Vec<MouseGestureDirection>,
+) -> Option<Vec<MouseGestureDirection>> {
+    let mut out = Vec::new();
+    for direction in pattern {
+        if out.last().copied() == Some(direction) {
+            continue;
+        }
+        if out.len() >= MOUSE_GESTURE_MAX_STROKES {
+            return None;
+        }
+        out.push(direction);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn deserialize_mouse_gesture_pattern<'de, D>(
+    deserializer: D,
+) -> Result<Vec<MouseGestureDirection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| MouseGestureDirection::from_str(&value))
+        .collect())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MouseGestureBinding {
+    #[serde(default, deserialize_with = "deserialize_mouse_gesture_pattern")]
+    pub pattern: Vec<MouseGestureDirection>,
+    #[serde(default)]
+    pub action: RingActionId,
+}
+
+impl MouseGestureBinding {
+    pub fn new(pattern: Vec<MouseGestureDirection>, action: RingActionId) -> Self {
+        Self { pattern, action }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MouseGestureProfile {
+    #[serde(default)]
+    pub bindings: Vec<MouseGestureBinding>,
+}
+
+impl MouseGestureProfile {
+    pub fn sanitize(&mut self, context: RightDragContext) {
+        let action_context = context.gesture_action_context();
+        let mut sanitized = Vec::new();
+        for mut binding in self.bindings.drain(..) {
+            let Some(pattern) = normalize_mouse_gesture_pattern(binding.pattern) else {
+                continue;
+            };
+            binding.pattern = pattern;
+            if !binding.action.is_valid_for_context(action_context) {
+                binding.action = RingActionId::None;
+            }
+            sanitized.push(binding);
+        }
+        self.bindings = sanitized;
+    }
+
+    pub fn action_for_pattern(&self, pattern: &[MouseGestureDirection]) -> RingActionId {
+        self.bindings
+            .iter()
+            .find(|binding| binding.pattern == pattern)
+            .map(|binding| binding.action.clone())
+            .unwrap_or(RingActionId::None)
+    }
+}
+
+impl Default for MouseGestureProfile {
+    fn default() -> Self {
+        Self {
+            bindings: Vec::new(),
+        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -862,6 +1071,14 @@ pub struct RingShortcutSettings {
     pub right_drag_video: Option<RightDragMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_drag_edit: Option<RightDragMode>,
+    #[serde(default = "default_grid_gesture_profile")]
+    pub mouse_gestures_grid: MouseGestureProfile,
+    #[serde(default = "default_image_gesture_profile")]
+    pub mouse_gestures_image: MouseGestureProfile,
+    #[serde(default = "default_video_gesture_profile")]
+    pub mouse_gestures_video: MouseGestureProfile,
+    #[serde(default = "default_edit_gesture_profile")]
+    pub mouse_gestures_edit: MouseGestureProfile,
     // Compatibility only: X ring/picker is always enabled. Old saved `false`
     // values are normalized during Settings::load()/sanitize().
     #[serde(default = "default_true")]
@@ -919,6 +1136,30 @@ impl RingShortcutSettings {
         *target = Some(mode.effective());
     }
 
+    pub fn mouse_gesture_profile(&self, context: RightDragContext) -> &MouseGestureProfile {
+        match context {
+            RightDragContext::Grid => &self.mouse_gestures_grid,
+            RightDragContext::ImageFullscreen => &self.mouse_gestures_image,
+            RightDragContext::VideoFullscreen => &self.mouse_gestures_video,
+            RightDragContext::EditMode => &self.mouse_gestures_edit,
+        }
+    }
+
+    pub fn mouse_gesture_profile_mut(
+        &mut self,
+        context: RightDragContext,
+    ) -> &mut MouseGestureProfile {
+        match context {
+            RightDragContext::Grid => &mut self.mouse_gestures_grid,
+            RightDragContext::ImageFullscreen => &mut self.mouse_gestures_image,
+            RightDragContext::VideoFullscreen => &mut self.mouse_gestures_video,
+            RightDragContext::EditMode => &mut self.mouse_gestures_edit,
+        }
+    }
+
+    pub fn reset_mouse_gesture_profile(&mut self, context: RightDragContext) {
+        *self.mouse_gesture_profile_mut(context) = default_gesture_profile_for_context(context);
+    }
     pub fn mouse_ring_enabled(&self, context: RingShortcutContext) -> bool {
         let right_drag_context = match context {
             RingShortcutContext::Grid => RightDragContext::Grid,
@@ -993,6 +1234,13 @@ impl RingShortcutSettings {
         Self::sanitize_right_drag_mode(&mut self.right_drag_image);
         Self::sanitize_right_drag_mode(&mut self.right_drag_video);
         Self::sanitize_right_drag_mode(&mut self.right_drag_edit);
+        self.mouse_gestures_grid.sanitize(RightDragContext::Grid);
+        self.mouse_gestures_image
+            .sanitize(RightDragContext::ImageFullscreen);
+        self.mouse_gestures_video
+            .sanitize(RightDragContext::VideoFullscreen);
+        self.mouse_gestures_edit
+            .sanitize(RightDragContext::EditMode);
         self.grid.sanitize(RingShortcutContext::Grid);
         self.image.sanitize(RingShortcutContext::ImageFullscreen);
         self.video.sanitize(RingShortcutContext::VideoFullscreen);
@@ -1030,6 +1278,10 @@ impl Default for RingShortcutSettings {
             right_drag_image: None,
             right_drag_video: None,
             right_drag_edit: None,
+            mouse_gestures_grid: default_grid_gesture_profile(),
+            mouse_gestures_image: default_image_gesture_profile(),
+            mouse_gestures_video: default_video_gesture_profile(),
+            mouse_gestures_edit: default_edit_gesture_profile(),
             gamepad_ring_enabled: true,
             shift_wheel_pair: WheelPairActionId::None,
             alt_wheel_pair: WheelPairActionId::None,
@@ -1077,6 +1329,60 @@ pub fn default_profile_for_context(context: RingShortcutContext) -> RingShortcut
     }
 }
 
+pub fn default_gesture_profile_for_context(context: RightDragContext) -> MouseGestureProfile {
+    match context {
+        RightDragContext::Grid => default_grid_gesture_profile(),
+        RightDragContext::ImageFullscreen => default_image_gesture_profile(),
+        RightDragContext::VideoFullscreen => default_video_gesture_profile(),
+        RightDragContext::EditMode => default_edit_gesture_profile(),
+    }
+}
+
+fn gesture_binding(pattern: &[MouseGestureDirection], action: RingActionId) -> MouseGestureBinding {
+    MouseGestureBinding::new(pattern.to_vec(), action)
+}
+
+fn default_grid_gesture_profile() -> MouseGestureProfile {
+    use MouseGestureDirection::*;
+    MouseGestureProfile {
+        bindings: vec![
+            gesture_binding(&[Up], RingActionId::GridParentFolder),
+            gesture_binding(&[Right], RingActionId::GridHistoryForward),
+            gesture_binding(&[Down], RingActionId::PinRepresentativeThumb),
+            gesture_binding(&[Left], RingActionId::GridHistoryBack),
+        ],
+    }
+}
+
+fn default_image_gesture_profile() -> MouseGestureProfile {
+    use MouseGestureDirection::*;
+    MouseGestureProfile {
+        bindings: vec![
+            gesture_binding(&[Up], RingActionId::ImageSlideshow),
+            gesture_binding(&[Right], RingActionId::ImageRotateRight),
+            gesture_binding(&[Down], RingActionId::PinRepresentativeThumb),
+            gesture_binding(&[Left], RingActionId::ImageRotateLeft),
+        ],
+    }
+}
+
+fn default_video_gesture_profile() -> MouseGestureProfile {
+    use MouseGestureDirection::*;
+    MouseGestureProfile {
+        bindings: vec![
+            gesture_binding(&[Up], RingActionId::VideoLoop),
+            gesture_binding(&[Right], RingActionId::VideoTileMode),
+            gesture_binding(&[Down], RingActionId::PinRepresentativeThumb),
+            gesture_binding(&[Left], RingActionId::VideoMute),
+        ],
+    }
+}
+
+fn default_edit_gesture_profile() -> MouseGestureProfile {
+    MouseGestureProfile {
+        bindings: Vec::new(),
+    }
+}
 fn default_grid_profile() -> RingShortcutProfile {
     RingShortcutProfile::new(vec![
         RingActionId::GridParentFolder,
@@ -1288,6 +1594,42 @@ pub struct PickerListState {
 }
 
 #[derive(Clone, Debug)]
+pub struct MouseGestureState {
+    pub context: RightDragContext,
+    pub start_time: Instant,
+    pub start_pos: egui::Pos2,
+    pub last_step_pos: egui::Pos2,
+    pub current_pos: egui::Pos2,
+    pub pattern: Vec<MouseGestureDirection>,
+    pub armed: bool,
+}
+
+impl MouseGestureState {
+    pub fn new(context: RightDragContext, start_time: Instant, start_pos: egui::Pos2) -> Self {
+        Self {
+            context,
+            start_time,
+            start_pos,
+            last_step_pos: start_pos,
+            current_pos: start_pos,
+            pattern: Vec::new(),
+            armed: false,
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    pub fn moved(&self) -> f32 {
+        self.current_pos.distance(self.start_pos)
+    }
+
+    pub fn guide_visible(&self) -> bool {
+        self.armed || self.elapsed() >= mouse_flick_menu_delay()
+    }
+}
+#[derive(Clone, Debug)]
 pub struct MouseFlickState {
     pub context: RingShortcutContext,
     pub start_time: Instant,
@@ -1339,6 +1681,25 @@ mod tests {
         for &context in RightDragContext::all() {
             assert_eq!(defaults.right_drag_mode(context), RightDragMode::Disabled);
         }
+        assert_eq!(
+            defaults
+                .mouse_gestures_grid
+                .action_for_pattern(&[MouseGestureDirection::Up]),
+            RingActionId::GridParentFolder
+        );
+        assert_eq!(
+            defaults
+                .mouse_gestures_image
+                .action_for_pattern(&[MouseGestureDirection::Right]),
+            RingActionId::ImageRotateRight
+        );
+        assert_eq!(
+            defaults
+                .mouse_gestures_video
+                .action_for_pattern(&[MouseGestureDirection::Left]),
+            RingActionId::VideoMute
+        );
+        assert!(defaults.mouse_gestures_edit.bindings.is_empty());
         assert_eq!(defaults.gamepad_ring_enabled, true);
         assert_eq!(defaults.shift_wheel_pair, WheelPairActionId::None);
         assert_eq!(defaults.alt_wheel_pair, WheelPairActionId::None);
@@ -1399,6 +1760,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mouse_gesture_patterns_parse_symbols_and_letters() {
+        use MouseGestureDirection::*;
+        assert_eq!(parse_mouse_gesture_pattern("↓→"), Some(vec![Down, Right]));
+        assert_eq!(parse_mouse_gesture_pattern("D R"), Some(vec![Down, Right]));
+        assert_eq!(parse_mouse_gesture_pattern("up"), Some(vec![Up]));
+        assert_eq!(
+            parse_mouse_gesture_pattern("down,right"),
+            Some(vec![Down, Right])
+        );
+        assert_eq!(parse_mouse_gesture_pattern("↓↓→"), Some(vec![Down, Right]));
+        assert_eq!(
+            parse_mouse_gesture_pattern("URDL"),
+            Some(vec![Up, Right, Down, Left])
+        );
+        assert_eq!(parse_mouse_gesture_pattern("URDLU"), None);
+        assert_eq!(format_mouse_gesture_pattern(&[Down, Right]), "↓→");
+    }
+    #[test]
+    fn mouse_gesture_profile_ignores_unknown_directions_on_load() {
+        let mut profile: MouseGestureProfile = serde_json::from_str(
+            r#"{"bindings":[{"pattern":["up","future","right"],"action":"grid_parent_folder"}]}"#,
+        )
+        .unwrap();
+
+        profile.sanitize(RightDragContext::Grid);
+
+        assert_eq!(profile.bindings.len(), 1);
+        assert_eq!(
+            profile.bindings[0].pattern,
+            vec![MouseGestureDirection::Up, MouseGestureDirection::Right]
+        );
+        assert_eq!(profile.bindings[0].action, RingActionId::GridParentFolder);
+    }
     #[test]
     fn right_drag_modes_inherit_legacy_toggle_until_configured() {
         let mut settings = RingShortcutSettings::default();
@@ -1506,6 +1901,17 @@ mod tests {
         settings.mouse_buttons_video.back = RingActionId::ImageCapture;
         settings.right_drag_grid = Some(RightDragMode::Unknown("future_mode".to_string()));
         settings.right_drag_image = Some(RightDragMode::MouseGesture);
+        settings
+            .mouse_gestures_grid
+            .bindings
+            .push(MouseGestureBinding::new(
+                vec![
+                    MouseGestureDirection::Up,
+                    MouseGestureDirection::Up,
+                    MouseGestureDirection::Right,
+                ],
+                RingActionId::VideoCapture,
+            ));
 
         settings.sanitize();
 
@@ -1530,6 +1936,12 @@ mod tests {
             settings.right_drag_mode(RightDragContext::ImageFullscreen),
             RightDragMode::MouseGesture
         );
+        let last = settings.mouse_gestures_grid.bindings.last().unwrap();
+        assert_eq!(
+            last.pattern,
+            vec![MouseGestureDirection::Up, MouseGestureDirection::Right]
+        );
+        assert_eq!(last.action, RingActionId::None);
     }
 
     #[test]

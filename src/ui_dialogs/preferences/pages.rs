@@ -6,7 +6,7 @@ use crate::keymap::{
 };
 use crate::ring_shortcut::{
     RightDragContext, RightDragMode, RingActionId, RingDirection, RingShortcutContext,
-    RingShortcutSettings,
+    RingShortcutSettings, format_mouse_gesture_pattern, parse_mouse_gesture_pattern,
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
@@ -481,6 +481,13 @@ pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState
     ui.add_space(10.0);
     for &context in RingShortcutContext::all() {
         ring_shortcut_context_editor(ui, settings, context);
+    }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("マウスジェスチャ").strong());
+    ui.small("右ドラッグ mode をマウスジェスチャにした文脈で使います。同じ方向の連続入力は 1 stroke に圧縮され、最大 4 stroke まで登録できます。");
+    for &context in RightDragContext::all() {
+        mouse_gesture_context_editor(ui, settings, context);
     }
 }
 
@@ -1237,6 +1244,9 @@ fn right_drag_mode_combo(
 ) {
     ui.label(context.label());
     let mut mode = settings.right_drag_mode(context);
+    if context.ring_context().is_none() && mode == RightDragMode::RingShortcut {
+        mode = RightDragMode::Disabled;
+    }
     egui::ComboBox::from_id_salt(("right_drag_mode", context))
         .width(220.0)
         .selected_text(mode.label())
@@ -1258,8 +1268,11 @@ fn right_drag_mode_combo(
                         "編集モードのリング割り当ては未対応です。ジェスチャを使ってください。",
                     );
             }
-            ui.add_enabled(false, egui::Label::new(RightDragMode::MouseGesture.label()))
-                .on_hover_text("ジェスチャ登録と入力処理は次のスライスで有効化します。");
+            ui.selectable_value(
+                &mut mode,
+                RightDragMode::MouseGesture,
+                RightDragMode::MouseGesture.label(),
+            );
         });
     settings.set_right_drag_mode(context, mode);
     ui.end_row();
@@ -1324,6 +1337,141 @@ fn mouse_button_action_combo(
     ui.end_row();
 }
 
+fn mouse_gesture_context_editor(
+    ui: &mut egui::Ui,
+    settings: &mut RingShortcutSettings,
+    context: RightDragContext,
+) {
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(context.label()).strong());
+        if ui.button("ジェスチャを追加").clicked() {
+            let profile = settings.mouse_gesture_profile_mut(context);
+            let pattern = first_unused_mouse_gesture_pattern(profile);
+            profile
+                .bindings
+                .push(crate::ring_shortcut::MouseGestureBinding::new(
+                    pattern,
+                    RingActionId::None,
+                ));
+        }
+        if ui.button("既定に戻す").clicked() {
+            settings.reset_mouse_gesture_profile(context);
+        }
+    });
+
+    let action_context = context.gesture_action_context();
+    let available = RingActionId::available_for_context(action_context);
+    let mut remove_idx = None;
+    let mut invalid_rows = Vec::new();
+    {
+        let profile = settings.mouse_gesture_profile_mut(context);
+        profile.sanitize(context);
+        egui::Grid::new(("mouse_gesture_bindings", context))
+            .num_columns(4)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("ジェスチャ").strong());
+                ui.label(egui::RichText::new("操作").strong());
+                ui.label("");
+                ui.label("");
+                ui.end_row();
+
+                for (idx, binding) in profile.bindings.iter_mut().enumerate() {
+                    let mut pattern_text = format_mouse_gesture_pattern(&binding.pattern);
+                    let response = ui.add_sized(
+                        [82.0, 22.0],
+                        egui::TextEdit::singleline(&mut pattern_text).hint_text("↓→"),
+                    );
+                    if response.changed() {
+                        if let Some(pattern) = parse_mouse_gesture_pattern(&pattern_text) {
+                            binding.pattern = pattern;
+                        } else {
+                            invalid_rows.push(idx + 1);
+                        }
+                    }
+                    egui::ComboBox::from_id_salt(("mouse_gesture_action", context, idx))
+                        .width(210.0)
+                        .selected_text(binding.action.label_for_context(action_context))
+                        .show_ui(ui, |ui| {
+                            for action in &available {
+                                ui.selectable_value(
+                                    &mut binding.action,
+                                    action.clone(),
+                                    action.label_for_context(action_context),
+                                );
+                            }
+                        });
+                    if ui.small_button("削除").clicked() {
+                        remove_idx = Some(idx);
+                    }
+                    ui.label(
+                        egui::RichText::new("例: ↑→ / U R")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                    ui.end_row();
+                }
+            });
+        if let Some(idx) = remove_idx {
+            profile.bindings.remove(idx);
+        }
+    }
+
+    let profile = settings.mouse_gesture_profile(context);
+    let mut seen = BTreeSet::new();
+    let mut duplicates = Vec::new();
+    for binding in &profile.bindings {
+        let label = format_mouse_gesture_pattern(&binding.pattern);
+        if !seen.insert(label.clone()) {
+            duplicates.push(label);
+        }
+    }
+    if !invalid_rows.is_empty() {
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            format!(
+                "形式を読めない行があります: {}",
+                invalid_rows
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    if !duplicates.is_empty() {
+        duplicates.sort();
+        duplicates.dedup();
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            format!("同じジェスチャが重複しています: {}", duplicates.join(" / ")),
+        );
+    }
+    if profile.bindings.is_empty() {
+        ui.small("登録済みジェスチャはありません。右ドラッグ mode をマウスジェスチャにしても、この文脈では何も実行しません。");
+    }
+}
+
+fn first_unused_mouse_gesture_pattern(
+    profile: &crate::ring_shortcut::MouseGestureProfile,
+) -> Vec<crate::ring_shortcut::MouseGestureDirection> {
+    for &direction in crate::ring_shortcut::MouseGestureDirection::all() {
+        let pattern = vec![direction];
+        if !profile
+            .bindings
+            .iter()
+            .any(|binding| binding.pattern == pattern)
+        {
+            return pattern;
+        }
+    }
+    vec![
+        crate::ring_shortcut::MouseGestureDirection::Down,
+        crate::ring_shortcut::MouseGestureDirection::Right,
+    ]
+}
 fn ring_shortcut_context_editor(
     ui: &mut egui::Ui,
     settings: &mut RingShortcutSettings,
