@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -2817,6 +2817,31 @@ pub struct Keymap {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeymapSettings {
+    #[serde(default)]
+    pub overrides: Vec<KeyBindingOverride>,
+    #[serde(default)]
+    pub legacy_ini_migration_done: bool,
+    #[serde(default)]
+    pub legacy_ini_backup: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeyBindingOverride {
+    pub action: String,
+    #[serde(default)]
+    pub chords: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacyKeymapIniImport {
+    pub changed: bool,
+    pub imported: bool,
+    pub backup_path: Option<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IniTemplateKind {
     UserConfig,
@@ -2992,6 +3017,34 @@ impl Keymap {
         Self::default()
     }
 
+    pub fn from_settings(settings: &KeymapSettings) -> Self {
+        let mut warnings = Vec::new();
+        let mut overrides = HashMap::new();
+        for binding in &settings.overrides {
+            let action_name = binding.action.trim();
+            let Some(action) = KeyAction::parse_ini_name(action_name) else {
+                warnings.push(format!("settings: unknown key action '{}'", binding.action));
+                continue;
+            };
+            let chords = match parse_setting_chords(action, &binding.chords, &mut warnings) {
+                Some(chords) => chords,
+                None => continue,
+            };
+            if overrides.insert(action, chords).is_some() {
+                warnings.push(format!(
+                    "settings: duplicate override for '{}', using the last value",
+                    action.ini_name()
+                ));
+            }
+        }
+        let mut keymap = Self {
+            overrides,
+            warnings,
+        };
+        keymap.append_binding_conflict_warnings();
+        keymap
+    }
+
     pub fn load_from_file(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::from_ini_str(&text),
@@ -3145,6 +3198,10 @@ impl Keymap {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    pub fn override_chords(&self, action: KeyAction) -> Option<&[Chord]> {
+        self.overrides.get(&action).map(Vec::as_slice)
     }
 
     pub fn effective_chords(&self, action: KeyAction) -> Vec<Chord> {
@@ -3677,20 +3734,18 @@ impl Keymap {
             }
         }
         out.push_str("#\n");
-        out.push_str("# 上級者向けのキーボード割り当て設定です。\n");
+        out.push_str("# キーボード割り当ての Action 名と既定キーの参照です。\n");
         match kind {
             IniTemplateKind::UserConfig => {
+                out.push_str("# 旧 keymap.ini 互換のテンプレートです。\n");
                 out.push_str(
-                    "# %APPDATA%\\mimageviewer\\keymap.ini が無いときに自動生成されます。\n",
+                    "# GUI 設定が未作成の環境では、起動時に 1 回だけ読み込まれて settings.db へ移行されます。\n",
+                );
+                out.push_str(
+                    "# 移行後の keymap.ini は keymap.ini.imported.bak へ退避され、以後は読み込まれません。\n",
                 );
                 out.push_str(
                     "# 変更したい行だけ先頭の # を外し、= の右側のキーを編集してください。\n",
-                );
-                out.push_str(
-                    "# コメントアウトされたままの行は、アプリ内蔵の既定キーを使います。\n",
-                );
-                out.push_str(
-                    "# 更新後の最新の標準一覧は keymap.ini.default を参照してください。\n",
                 );
             }
             IniTemplateKind::DefaultReference => {
@@ -3699,11 +3754,14 @@ impl Keymap {
                     "# アプリ内蔵の既定キーが変わると mimageviewer がこのファイルを上書きします。\n",
                 );
                 out.push_str(
-                    "# 変更したい行は keymap.ini へコピーするか、keymap.ini 側の同じ行を編集してください。\n",
+                    "# 旧 keymap.ini を使った手動設定は、初回起動時に settings.db へ移行されます。\n",
+                );
+                out.push_str(
+                    "# 移行後の keymap.ini は keymap.ini.imported.bak へ退避され、以後は読み込まれません。\n",
                 );
             }
         }
-        out.push_str("# keymap.ini は起動時に 1 回だけ読み込まれます。\n");
+        out.push_str("# 通常は環境設定のコマンド設定画面から編集します。\n");
         out.push_str("#\n");
         out.push_str("# 書式:\n");
         out.push_str("# - 下のキー定義行はすべてコメントアウトされています。\n");
@@ -3918,6 +3976,84 @@ impl Keymap {
     }
 }
 
+impl KeymapSettings {
+    pub fn from_keymap(keymap: &Keymap) -> Self {
+        let overrides = KeyAction::all()
+            .iter()
+            .copied()
+            .filter_map(|action| {
+                keymap
+                    .override_chords(action)
+                    .map(|chords| KeyBindingOverride {
+                        action: action.ini_name().to_string(),
+                        chords: chords.iter().copied().map(Chord::display_name).collect(),
+                    })
+            })
+            .collect();
+        Self {
+            overrides,
+            legacy_ini_migration_done: true,
+            legacy_ini_backup: None,
+        }
+    }
+
+    pub fn import_legacy_ini_if_needed(&mut self, path: &Path) -> LegacyKeymapIniImport {
+        let mut result = LegacyKeymapIniImport::default();
+        if self.legacy_ini_migration_done {
+            return result;
+        }
+
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.legacy_ini_migration_done = true;
+                result.changed = true;
+                return result;
+            }
+            Err(err) => {
+                result.warnings.push(format!(
+                    "failed to read legacy keymap.ini ({}): {}",
+                    path.display(),
+                    err
+                ));
+                return result;
+            }
+        };
+
+        let imported_keymap = Keymap::from_ini_str(&text);
+        result
+            .warnings
+            .extend(imported_keymap.warnings().iter().cloned());
+        if self.overrides.is_empty() {
+            self.overrides = Self::from_keymap(&imported_keymap).overrides;
+        } else {
+            result.warnings.push(
+                "legacy keymap.ini was found but GUI keymap settings already exist; keeping GUI settings"
+                    .to_string(),
+            );
+        }
+
+        let backup_path = next_legacy_keymap_backup_path(path);
+        match std::fs::rename(path, &backup_path) {
+            Ok(()) => {
+                self.legacy_ini_backup = Some(backup_path.to_string_lossy().into_owned());
+                result.backup_path = Some(backup_path);
+            }
+            Err(err) => {
+                result.warnings.push(format!(
+                    "failed to rename legacy keymap.ini ({}): {}",
+                    path.display(),
+                    err
+                ));
+            }
+        }
+        self.legacy_ini_migration_done = true;
+        result.changed = true;
+        result.imported = true;
+        result
+    }
+}
+
 #[cfg(windows)]
 fn key_held_via_os(key: KeyName) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -4111,6 +4247,48 @@ fn parse_action_lhs(lhs: &str) -> Result<(&str, usize), String> {
     Ok((trimmed, 1))
 }
 
+fn parse_setting_chords(
+    action: KeyAction,
+    chord_names: &[String],
+    warnings: &mut Vec<String>,
+) -> Option<Vec<Chord>> {
+    if chord_names.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut chords = Vec::new();
+    for (idx, name) in chord_names.iter().take(3).enumerate() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+            return Some(Vec::new());
+        }
+        match parse_chord(trimmed) {
+            Ok(chord) => {
+                if let Err(msg) = chord.validate_for_trigger(action.trigger()) {
+                    warnings.push(format!(
+                        "settings: '{}'.{} ignored: {}",
+                        action.ini_name(),
+                        idx + 1,
+                        msg
+                    ));
+                    continue;
+                }
+                chords.push(chord);
+            }
+            Err(msg) => warnings.push(format!(
+                "settings: '{}'.{} ignored: {}",
+                action.ini_name(),
+                idx + 1,
+                msg
+            )),
+        }
+    }
+    if chords.is_empty() {
+        None
+    } else {
+        Some(chords)
+    }
+}
+
 fn parse_chord(rhs: &str) -> Result<Chord, String> {
     let mut chord = Chord::NONE;
     let mut key_seen = false;
@@ -4140,6 +4318,25 @@ fn parse_chord(rhs: &str) -> Result<Chord, String> {
         return Err("empty key chord".to_string());
     }
     Ok(chord)
+}
+
+fn next_legacy_keymap_backup_path(path: &Path) -> PathBuf {
+    let base = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "keymap.ini".into());
+    for index in 0..1000 {
+        let name = if index == 0 {
+            format!("{base}.imported.bak")
+        } else {
+            format!("{base}.imported-{index}.bak")
+        };
+        let candidate = path.with_file_name(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.with_file_name(format!("{base}.imported-extra.bak"))
 }
 
 #[cfg(test)]
@@ -5408,7 +5605,8 @@ mod tests {
     #[test]
     fn user_ini_template_is_parseable_and_comment_only() {
         let user_ini = Keymap::user_ini_template();
-        assert!(user_ini.contains("上級者向けのキーボード割り当て設定です。"));
+        assert!(user_ini.contains("キーボード割り当ての Action 名と既定キーの参照です。"));
+        assert!(user_ini.contains("settings.db へ移行されます。"));
         assert!(user_ini.contains("F1..F24"));
         assert!(user_ini.contains("[FsImage]"));
         assert!(user_ini.contains("[Rating] ; レーティング"));
@@ -5502,5 +5700,113 @@ mod tests {
     fn bundled_keymap_default_matches_generated_reference() {
         let bundled = include_str!("../docs/keymap.ini.default").replace("\r\n", "\n");
         assert_eq!(bundled, Keymap::default_reference_ini());
+    }
+
+    #[test]
+    fn keymap_settings_roundtrip_overrides_and_none() {
+        let keymap = Keymap::from_ini_str(
+            "[Grid]\n\
+             GridPin = F13\n\
+             GridToggleStackMode = Ctrl+Shift+S\n\
+             [FsImage]\n\
+             FsSlideshow = none\n",
+        );
+        let settings = KeymapSettings::from_keymap(&keymap);
+        assert!(settings.legacy_ini_migration_done);
+        assert_eq!(settings.overrides.len(), 3);
+
+        let restored = Keymap::from_settings(&settings);
+        assert_eq!(
+            restored.effective_chords(KeyAction::GridPin),
+            vec![Chord::key(KeyName::F13)]
+        );
+        assert_eq!(
+            restored.effective_chords(KeyAction::GridToggleStackMode),
+            vec![Chord::ctrl_shift(KeyName::S)]
+        );
+        assert!(restored.effective_chords(KeyAction::FsSlideshow).is_empty());
+    }
+
+    #[test]
+    fn keymap_settings_warn_and_ignore_invalid_entries() {
+        let settings = KeymapSettings {
+            overrides: vec![
+                KeyBindingOverride {
+                    action: "NoSuchAction".to_string(),
+                    chords: vec!["F13".to_string()],
+                },
+                KeyBindingOverride {
+                    action: "FsLoupeHold".to_string(),
+                    chords: vec!["Ctrl+F13".to_string()],
+                },
+            ],
+            legacy_ini_migration_done: true,
+            legacy_ini_backup: None,
+        };
+        let keymap = Keymap::from_settings(&settings);
+        assert!(keymap.override_chords(KeyAction::FsLoupeHold).is_none());
+        assert!(
+            keymap
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("unknown key action"))
+        );
+        assert!(
+            keymap
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("ModifierHold actions"))
+        );
+    }
+
+    #[test]
+    fn legacy_keymap_ini_imports_once_and_renames_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(
+            &path,
+            "[Grid]\nGridPin = F13\nGridToggleStackMode = Ctrl+Shift+S\n",
+        )
+        .unwrap();
+
+        let mut settings = KeymapSettings::default();
+        let result = settings.import_legacy_ini_if_needed(&path);
+        assert!(result.changed);
+        assert!(result.imported);
+        assert!(!path.exists());
+        let backup_path = result.backup_path.expect("backup path");
+        assert!(backup_path.exists());
+        assert!(backup_path.ends_with("keymap.ini.imported.bak"));
+        assert!(settings.legacy_ini_migration_done);
+        assert_eq!(
+            settings.legacy_ini_backup.as_deref(),
+            Some(backup_path.to_string_lossy().as_ref())
+        );
+
+        let restored = Keymap::from_settings(&settings);
+        assert_eq!(
+            restored.effective_chords(KeyAction::GridPin),
+            vec![Chord::key(KeyName::F13)]
+        );
+        assert_eq!(
+            restored.effective_chords(KeyAction::GridToggleStackMode),
+            vec![Chord::ctrl_shift(KeyName::S)]
+        );
+
+        let second = settings.import_legacy_ini_if_needed(&path);
+        assert!(!second.changed);
+        assert!(!second.imported);
+    }
+
+    #[test]
+    fn legacy_keymap_ini_missing_marks_migration_done() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keymap.ini");
+        let mut settings = KeymapSettings::default();
+        let result = settings.import_legacy_ini_if_needed(&path);
+        assert!(result.changed);
+        assert!(!result.imported);
+        assert!(settings.legacy_ini_migration_done);
+        assert!(settings.overrides.is_empty());
     }
 }

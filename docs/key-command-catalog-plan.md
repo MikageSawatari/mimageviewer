@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行スライス実装中** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -15,6 +15,12 @@
 > 空 `default_chords()`、`# Action = none` 生成、`effective_chords()` /
 > `first_chord_label()` / `compact_single_key_label()`、グリッド側キーハンドラへの最小配線まで実装。
 > `CommandId` / `CommandSpec` / scope 衝突判定は未導入のまま。ClaudeCode レビュー済み。
+>
+> **GUI 正本化メモ (2026-06-25, Codex)**: コマンド設定 GUI に備え、キー割り当ての正本を
+> `Settings.keymap` (`settings.db`) に移す。旧 `%APPDATA%\mimageviewer\keymap.ini` がある環境では
+> 初回起動時に 1 回だけ読み込み、同じ override を settings.db へ保存してから
+> `keymap.ini.imported*.bak` へ退避する。以後 `keymap.ini` は通常読み込み対象外とし、
+> `keymap.ini.default` は Action 名と既定キーの参照ファイルとして残す。
 >
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
 > `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。

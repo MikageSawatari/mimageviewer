@@ -8,15 +8,16 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 横断仕様と現状差分は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md)
 を参照すること。
 
-一部のキーボード操作は上級者向けの `%APPDATA%\mimageviewer\keymap.ini`
-で上書きできる。Action 名・書式・固定扱いの入力は
-[keymap.ini.default](keymap.ini.default) と、起動時に生成される `keymap.ini` /
-`keymap.ini.default` の先頭コメントを正とする。マウス、ゲームパッド、
+一部のキーボード操作は環境設定のコマンド設定で上書きできる。設定の正本は
+`Settings.keymap` (`settings.db`) で、旧 `%APPDATA%\mimageviewer\keymap.ini`
+が残っている場合は初回起動時に 1 回だけ取り込んで
+`keymap.ini.imported*.bak` へ退避する。Action 名・書式・固定扱いの入力は
+[keymap.ini.default](keymap.ini.default) と、コマンド設定画面の表示を正とする。マウス、ゲームパッド、
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
 フリック、マウス戻る / 進むボタン、ゲームパッド <kbd>X</kbd> リングは
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
-これは `KeyAction` / `keymap.ini` の完全カスタマイズではなく、マウス・ゲームパッド用の
+これは `KeyAction` / コマンド設定の完全カスタマイズではなく、マウス・ゲームパッド用の
 固定入力レイヤーで扱う。
 レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear`、
 `RatingContainer1..5/Clear`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
@@ -24,16 +25,16 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keymap では上書きできない。
 Escape / Enter / 矢印ナビゲーションは文脈ごとの優先度が複雑なため当面固定扱いにする。
 標準キーを持たないが割り当て可能な操作は `keymap.ini.default` に
-`# Action = none` として列挙される。コメントを外してキー名を指定すると割り当てられ、
-`Action = none` のままコメント解除した場合は明示的な無効化として扱う。
+`# Action = none` として列挙される。コマンド設定または旧 `keymap.ini` 移行でキー名を指定すると割り当てられ、
+`Action = none` を明示した場合は無効化として扱う。
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
 Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に警告ログを出すが、
 設定自体は読み込み、現行 dispatch の優先順を変えない。
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 <kbd>?</kbd> の `HelpShowContextShortcuts` で現在の文脈で使える
-ショートカット一覧を表示する。keymap 化済み操作は現在の `keymap.ini` の実割り当てから
+ショートカット一覧を表示する。keymap 化済み操作は現在のコマンド設定の実割り当てから
 表示し、Enter / 矢印など当面固定扱いの操作は固定キーとして補助表示する。
 キー未設定または明示無効化中の割り当て可能操作は別枠で表示する。
-`HelpShowContextShortcuts` も `keymap.ini` で変更でき、ヘルプ内の固定キー欄や native 動画 overlay の表示は変更後のキーを表示する。動画フルスクリーンは egui 経路と Windows native
+`HelpShowContextShortcuts` もコマンド設定で変更でき、ヘルプ内の固定キー欄や native 動画 overlay の表示は変更後のキーを表示する。動画フルスクリーンは egui 経路と Windows native
 動画 overlay の両方で対応する。既定の `?` は設定ファイル上も `?` と書けるが、内部的には `Shift+/` と同等に扱う。
 消しゴム / 隠蔽加工パネルの描画・消去ボタンとツールボタンは、先頭 chord が
 修飾なし単独キーの場合だけ `筆 [B]` のような compact 表示を実割り当てから作る。
@@ -74,7 +75,7 @@ seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当て�
 | <kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd> | チェック済み画像 / 選択中画像から隠蔽マスクを削除。Action: `GridDeleteConcealMask` |
 | <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、フォルダバー 📌 の左クリックと同等)。ZIP 内の ZipDir も通常フォルダと同じ cascade で子の pin に追従する。pin 不能アイテム / 検索アグリゲート / zip_nav のない変換キャッシュ状態では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
 | <kbd>F</kbd> | 左側のフォルダツリーペインの表示 / 非表示を切り替える。表示時は現在フォルダへツリーカーソルを移す。非表示にする時、ツリーカーソルが別フォルダへ動いていれば <kbd>Enter</kbd> 相当でそのフォルダへ移動してグリッドへ戻る (動いていなければ単に閉じる) |
-| 既定キーなし (`GridToggleStackMode`) | `keymap.ini` でキーを割り当てると、フォルダバーの「スタック」と同じスタック表示トグルを実行する。実フォルダまたはサブ展開ビューで有効 |
+| 既定キーなし (`GridToggleStackMode`) | コマンド設定でキーを割り当てると、フォルダバーの「スタック」と同じスタック表示トグルを実行する。実フォルダまたはサブ展開ビューで有効 |
 | <kbd>T</kbd> | 選択中アイテムへタグを付ける/外すダイアログを開く |
 | <kbd>Ctrl</kbd>+<kbd>T</kbd> | タグビューを開く / 閉じる。`tags.db` のタグから候補を表示し、選んだタグを持つフォルダ・画像・動画・ZIP/PDF/対応アーカイブを検索結果グリッドに表示する。「すべての種類」プルダウンで結果の種類を絞れる。フルスクリーン中はテキスト注釈モードの <kbd>Ctrl</kbd>+<kbd>T</kbd> を優先する |
 | <kbd>X</kbd> | 選択中の画像 / ZIP 内画像 / PDF ページを比較スロットへピン留め / 同じ画像なら解除 |

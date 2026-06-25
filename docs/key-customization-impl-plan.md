@@ -4,6 +4,12 @@
 > 設計の経緯・調査・代替案は [key-customization-plan.md](key-customization-plan.md) に残す。
 > 簡易版の実装判断は本書を優先し、差異が出たら本書へ集約する。
 > 本書は「簡易版 (テキスト ini / GUI なし / 競合は警告のみ)」を実際に作るための手順書。
+>
+> **現状メモ (2026-06-25)**: この簡易版で導入した `keymap.ini` は、コマンド設定 GUI へ進むため
+> 初回起動時の移行元になった。現在の正本は `Settings.keymap` (`settings.db`) で、旧
+> `%APPDATA%\mimageviewer\keymap.ini` が残っている場合は 1 回だけ読み込んで同じ override を
+> settings.db に保存し、`keymap.ini.imported*.bak` へ退避する。`keymap.ini.default` は Action 名と
+> 既定キーの参照として引き続き生成する。
 
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [key-customization-plan.md](key-customization-plan.md) §8 (簡易版の設計確定事項)。
@@ -12,9 +18,10 @@
 - `src/keymap.rs` に Action 定義、ini parser、egui exact match、KeyHold /
   ModifierHold、native VK 判定、コメントアウト済み `keymap.ini` / `keymap.ini.default`
   生成元となる一覧を集約した。
-- `App::new_from_settings` で `%APPDATA%/mimageviewer/keymap.ini` が無ければ全キー定義行を
-  コメントアウトした user ini を初回生成し、`keymap.ini.default` は現在バージョンの標準参照として
-  更新生成する。起動時に読むのは `keymap.ini` だけ。警告はログへ出す。テストではユーザー環境の ini を読まない。
+- `Settings::load_with_meta` で旧 `%APPDATA%/mimageviewer/keymap.ini` が残っていれば 1 回だけ読み、
+  `Settings.keymap` へ移行して `keymap.ini.imported*.bak` に退避する。`App::new_from_settings` は
+  `Settings.keymap` から `Keymap` を構築し、`keymap.ini.default` は現在バージョンの標準参照として
+  更新生成する。警告はログへ出す。テストではユーザー環境の ini を読まない。
 - 画像フルスクリーン、編集モード (消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤー)、
   グリッド主要操作、egui/native 動画主要操作を keymap 経由にした。
 - 2026-06 Phase 1 として、既定キーを持たない `KeyAction` も許可した。`GridToggleStackMode`

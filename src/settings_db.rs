@@ -2776,6 +2776,20 @@ mod tests {
             }],
             hidden_commands: vec!["HelpOpenLogs".to_string()],
         };
+        s.keymap = crate::keymap::KeymapSettings {
+            overrides: vec![
+                crate::keymap::KeyBindingOverride {
+                    action: "GridPin".to_string(),
+                    chords: vec!["F13".to_string()],
+                },
+                crate::keymap::KeyBindingOverride {
+                    action: "GridToggleStackMode".to_string(),
+                    chords: vec!["Ctrl+Shift+S".to_string()],
+                },
+            ],
+            legacy_ini_migration_done: true,
+            legacy_ini_backup: Some("keymap.ini.imported.bak".to_string()),
+        };
         s.vst3_plugins = vec![
             Vst3PluginEntry {
                 path: r"C:\vst3\eq.vst3".to_string(),

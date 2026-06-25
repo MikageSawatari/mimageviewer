@@ -504,7 +504,7 @@ fn draw_unassigned_command_rows(ui: &mut egui::Ui, rows: &[CommandDisplayRow]) {
 
     ui.add_space(10.0);
     ui.label(egui::RichText::new("キー未設定 / 無効化中").strong());
-    ui.label("左の名前は keymap.ini の Action 名です。");
+    ui.label("左の名前はコマンド設定の Action 名です。");
     ui.add_space(2.0);
     egui::Grid::new("context_shortcuts_unassigned")
         .num_columns(2)

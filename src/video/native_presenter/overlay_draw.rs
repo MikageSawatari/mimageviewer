@@ -1019,7 +1019,7 @@ pub(super) fn draw_native_shortcut_help_dialog(
                                         .color(egui::Color32::from_rgb(232, 232, 236)),
                                 );
                                 ui.label(
-                                    egui::RichText::new("左の名前は keymap.ini の Action 名です。")
+                                    egui::RichText::new("左の名前はコマンド設定の Action 名です。")
                                         .size(11.5)
                                         .color(egui::Color32::from_gray(190)),
                                 );

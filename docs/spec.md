@@ -661,27 +661,28 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 
 ## 7. キーボード操作
 
-一部のキーボード操作は上級者向け設定ファイル
-`%APPDATA%\mimageviewer\keymap.ini` で変更できる。存在しない場合は起動時に
-全キー定義行をコメントアウトした `keymap.ini` を生成してから読む。コメント解除した
-行だけが上書きになり、コメントのままの操作はビルトイン既定キー (将来の変更を含む)
-に追従する。現在バージョンの標準 Action 一覧は、起動時に更新生成される
-`%APPDATA%\mimageviewer\keymap.ini.default` と `docs/keymap.ini.default` を参照する。
+一部のキーボード操作は環境設定のコマンド設定で変更できる。設定は
+`Settings.keymap` として `%APPDATA%\mimageviewer\settings.db` に保存する。旧形式の
+`%APPDATA%\mimageviewer\keymap.ini` が残っている場合は、初回起動時に 1 回だけ読み込んで
+同じ割り当てを settings.db へ移行し、`keymap.ini.imported*.bak` へリネームする。
+以後 `keymap.ini` は通常読み込み対象にしない。現在バージョンの標準 Action 一覧は、
+起動時に更新生成される `%APPDATA%\mimageviewer\keymap.ini.default` と
+`docs/keymap.ini.default` を参照する。
 標準キーを持たないが割り当て可能な操作は `# Action = none` として表示され、
-キー名に書き換えてコメント解除すると割り当てできる。`Action = none` のまま
-コメント解除した場合は明示的な無効化として扱う。
+コマンド設定または旧 keymap.ini 移行でキー名を指定すると割り当てできる。
+`Action = none` を指定した場合は明示的な無効化として扱う。
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
 Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に警告ログを出すが、
-設定自体は読み込む。GUI での編集、競合解消 UI、OS クリップボード / D&D の
-割り当て変更は対象外。
+設定自体は読み込む。競合はコマンド設定画面上でも warning として扱い、保存禁止にはしない。
+OS クリップボード / D&D の割り当て変更は対象外。
 消しゴム / 隠蔽加工パネルの描画・消去ボタンとツールボタンは、修飾なし単独キーの
-場合だけ `keymap.ini` の実割り当てを `[B]` のような compact 表示に反映する。
+場合だけ実割り当てを `[B]` のような compact 表示に反映する。
 メニューバーの検索 / タグビュー項目など一部のメニュー表示と hover text は、先頭
 chord を `(Ctrl+F)` のように反映する。
 ★フィルタボタン / スマートフィルタ内の★項目 / フォルダバー右側のコンテナ★ tooltip も、
 レーティング系 KeyAction の実割り当てに追従する。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
-popup の shortcut 表記も `keymap.ini` の実割り当てに追従する。複数 chord を
+popup の shortcut 表記も実割り当てに追従する。複数 chord を
 表示する箇所では `I / Tab` のように並べる。メニューバーのフォルダを開く / 検索 / タグビュー項目など一部のメニュー表示、
 native 動画 overlay の top bar / bottom HUD /
 jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は実割り当てに追従する。
@@ -689,7 +690,7 @@ jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は�
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
 表示する。keymap 化済み操作は現在の実割り当てで表示し、Enter / 矢印など当面固定扱いの
 操作は固定キーとして補助表示する。キー未設定または明示無効化中の割り当て可能操作は
-別枠で表示する。ヘルプ起動キー自体も `keymap.ini` で変更でき、ダイアログ内の固定キー欄や
+別枠で表示する。ヘルプ起動キー自体もコマンド設定で変更でき、ダイアログ内の固定キー欄や
 Windows native 動画 overlay の表示は変更後のキーに追従する。動画フルスクリーンは egui 経路と
 Windows native 動画 overlay の両方で対応する。
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
@@ -697,7 +698,7 @@ Windows native 動画 overlay の両方で対応する。
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
 画像・動画フルスクリーンでは、F11 相当のウィンドウ / 全画面切替と
 F12 相当の別ウィンドウ ON/OFF もこの候補に含める。
-これは `KeyAction` / `keymap.ini` の完全カスタマイズではなく、
+これは `KeyAction` / コマンド設定の完全カスタマイズではなく、
 マウス・ゲームパッド用の小さな固定メニューとして扱う。
 
 ### 7.1 サムネイル表示モード
@@ -867,9 +868,9 @@ X リングは「環境設定 > リングショートカット」で差し替え
 (2026-05 移行。旧 `settings.json` からは初回起動時に自動 migration し、旧ファイルは
 `settings.json.migrated-<ts>` にリネームされる)。詳細は
 [settings-sqlite-migration.md](settings-sqlite-migration.md) を参照。
-キーボード割り当ての上級者向け上書きだけは DB に入れず、
-`%APPDATA%\mimageviewer\keymap.ini` を起動時に存在しなければ生成し、1 回読む。
-`keymap.ini.default` は現在の標準 Action 一覧として起動時に更新する。
+キーボード割り当ても `Settings.keymap` として settings.db に保存する。旧
+`keymap.ini` が残っている場合だけ初回起動時に 1 回取り込んで
+`keymap.ini.imported*.bak` へ退避する。`keymap.ini.default` は現在の標準 Action 一覧として起動時に更新する。
 
 ### 永続化と復旧の仕組み
 

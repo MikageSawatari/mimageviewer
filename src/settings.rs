@@ -2284,6 +2284,12 @@ pub struct Settings {
     #[serde(default)]
     pub menu_layout: crate::keymap::MenuLayoutSettings,
 
+    // ── コマンド / キーボード割り当て ───────────────────────────
+    /// GUI で編集するキー割り当ての正本。旧 `keymap.ini` は初回ロード時にここへ
+    /// 取り込んでバックアップへ退避し、以後は通常読み込み対象にしない。
+    #[serde(default)]
+    pub keymap: crate::keymap::KeymapSettings,
+
     // ── フォルダサムネイル ──────────────────────────────────────
     /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
     #[serde(default = "default_folder_thumb_sort")]
@@ -3467,6 +3473,7 @@ impl Default for Settings {
             toolbar_section_new_row: Vec::new(),
             toolbar_section_drag_enabled: false,
             menu_layout: crate::keymap::MenuLayoutSettings::default(),
+            keymap: crate::keymap::KeymapSettings::default(),
             stack_separator: default_stack_separator(),
             stack_script_enabled: false,
             folder_thumb_sort: default_folder_thumb_sort(),
@@ -4387,6 +4394,27 @@ impl Settings {
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
         settings.sanitize();
+        let legacy_keymap_import =
+            if db_loaded && !MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
+                settings
+                    .keymap
+                    .import_legacy_ini_if_needed(&data_dir.join("keymap.ini"))
+            } else {
+                crate::keymap::LegacyKeymapIniImport::default()
+            };
+        if legacy_keymap_import.imported {
+            let backup = legacy_keymap_import
+                .backup_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(rename failed)".to_string());
+            settings_diag_log(&format!(
+                "settings: legacy keymap.ini imported into settings; backup={backup}"
+            ));
+        }
+        for warning in &legacy_keymap_import.warnings {
+            settings_diag_log(&format!("settings: legacy keymap.ini import: {warning}"));
+        }
         let mouse_nav_upgrade_prompt_pending = matches!(
             source,
             crate::settings_db::BootSource::LoadedExistingDb
@@ -4474,6 +4502,7 @@ impl Settings {
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || mouse_nav_clean_install_defaulted
+            || legacy_keymap_import.changed
             || version_changed
         {
             settings.save_internal_no_rotation();
@@ -6554,6 +6583,39 @@ mod tests {
         let mut s = Settings::default();
         s.add_favorite(name.to_string(), PathBuf::from(format!(r"C:\{name}")));
         s
+    }
+
+    #[test]
+    fn load_imports_legacy_keymap_ini_into_settings_db() {
+        let _env = setup_backup_env();
+        let keymap_path = crate::data_dir::get().join("keymap.ini");
+        std::fs::write(
+            &keymap_path,
+            "[Grid]\nGridPin = F13\nGridToggleStackMode = Ctrl+Shift+S\n",
+        )
+        .unwrap();
+
+        let loaded = Settings::load();
+        assert!(loaded.keymap.legacy_ini_migration_done);
+        assert!(!keymap_path.exists());
+        let backup = loaded
+            .keymap
+            .legacy_ini_backup
+            .as_ref()
+            .expect("legacy backup path");
+        assert!(std::path::Path::new(backup).exists());
+        let keymap = crate::keymap::Keymap::from_settings(&loaded.keymap);
+        assert_eq!(
+            keymap.effective_chords(crate::keymap::KeyAction::GridPin),
+            vec![crate::keymap::Chord::key(crate::keymap::KeyName::F13)]
+        );
+        assert_eq!(
+            keymap.effective_chords(crate::keymap::KeyAction::GridToggleStackMode),
+            vec![crate::keymap::Chord::ctrl_shift(crate::keymap::KeyName::S)]
+        );
+
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.keymap, loaded.keymap);
     }
 
     /// #1 atomic save / #4 preupgrade: 普通のラウンドトリップで .tmp が残らず、

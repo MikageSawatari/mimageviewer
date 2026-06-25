@@ -5422,15 +5422,7 @@ impl App {
         let keymap = if cfg!(test) {
             crate::keymap::Keymap::empty()
         } else {
-            let path = crate::data_dir::get().join("keymap.ini");
             let default_path = crate::data_dir::get().join("keymap.ini.default");
-            if let Err(err) = crate::keymap::Keymap::write_user_ini_if_missing(&path) {
-                crate::logger::log(format!(
-                    "[keymap] failed to create keymap.ini ({}): {}",
-                    path.display(),
-                    err
-                ));
-            }
             if let Err(err) = crate::keymap::Keymap::write_default_reference_ini(&default_path) {
                 crate::logger::log(format!(
                     "[keymap] failed to update keymap.ini.default ({}): {}",
@@ -5438,7 +5430,7 @@ impl App {
                     err
                 ));
             }
-            let keymap = crate::keymap::Keymap::load_from_file(&path);
+            let keymap = crate::keymap::Keymap::from_settings(&settings.keymap);
             for warning in keymap.warnings() {
                 crate::logger::log(format!("[keymap] {warning}"));
             }

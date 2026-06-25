@@ -125,8 +125,9 @@
   - 初期版はキーボード中心。マウス右ドラッグは「未使用 / リングショートカット / ジェスチャ」
     の選択へ整理し、リングショートカット設定も将来的にコマンド画面へ統合する。
     ゲームパッドもコマンドへ割り当てられる範囲を段階的に広げる。
-  - `KeyAction` と既存 parser / default chord 定義を正本にし、GUI は `keymap.ini` 互換の
-    上書き内容を書き出す。既存ユーザーの手書き設定を壊さない。
+    - `KeyAction` と既存 parser / default chord 定義を正本にし、旧 `keymap.ini` は初回起動時に
+      `Settings.keymap` へ一度だけ取り込んで `keymap.ini.imported*.bak` へ退避する。以後の GUI は
+      settings.db 側を書き換える。既存ユーザーの手書き設定ファイルはバックアップとして残す。
   - 修飾キーは現行どおり `ModifierHold` の中から選ぶ仕組みを維持する。一般キー hold と
     modifier hold を混ぜない。
   - 競合検出は `(context, trigger kind, chord)` を基本にし、同時に有効になり得る context の
