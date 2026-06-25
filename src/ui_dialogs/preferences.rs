@@ -163,7 +163,6 @@ impl OperationSettingsTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OperationOverviewEditor {
-    Keyboard,
     RingShortcut(RingShortcutContext),
     MouseGesture(RightDragContext),
     MouseButtons(RingShortcutContext),
@@ -271,6 +270,8 @@ pub(crate) struct PreferencesState {
     pub command_chord_inputs: [String; 3],
     pub command_capture_slot: Option<usize>,
     pub command_edit_error: Option<String>,
+    pub command_editor_dialog_open: bool,
+    pub command_editor_source_chord: Option<crate::keymap::Chord>,
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
     pub operation_overview_editor: Option<OperationOverviewEditor>,
@@ -488,6 +489,8 @@ impl PreferencesState {
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,
             command_edit_error: None,
+            command_editor_dialog_open: false,
+            command_editor_source_chord: None,
             operation_tab: OperationCustomizeTab::Settings,
             operation_settings_tab: OperationSettingsTab::Behavior,
             operation_overview_editor: None,
@@ -1197,6 +1200,10 @@ impl App {
                 });
             });
 
+        if let Some(state) = self.operation_customize_state.as_mut() {
+            draw_operation_command_editor_dialog(ctx, state, ime_active);
+        }
+
         if apply {
             if let Some(state) = self.operation_customize_state.take() {
                 self.apply_operation_customize_state(state);
@@ -1390,7 +1397,7 @@ fn draw_operation_customize_page(
         OperationCustomizeTab::Keyboard => {
             draw_keyboard_context_tabs(ui, state);
             ui.add_space(8.0);
-            ui.small("キー割り当てを編集します。キーボード図からの選択 UI は後続で追加します。");
+            ui.small("キー割り当てを編集します。一覧の「編集」またはキーボード図の割り当て済みキーを押すと、割り当て編集ダイアログを開きます。");
             ui.add_space(8.0);
             page_command_settings(ui, state, ime_active);
         }

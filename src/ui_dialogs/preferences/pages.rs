@@ -546,9 +546,8 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
 
             for &action in KeyAction::all() {
                 if ui.small_button("キー").clicked() {
-                    select_command_action(state, action);
                     state.operation_keyboard_context = Some(action.context());
-                    state.operation_overview_editor = Some(OperationOverviewEditor::Keyboard);
+                    open_command_editor_dialog(state, action, None);
                 }
                 ui.label(compact_key_action_label(action))
                     .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
@@ -634,11 +633,6 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
         ui.separator();
         ui.add_space(8.0);
         match editor {
-            OperationOverviewEditor::Keyboard => {
-                keyboard_chord_picker(ui, state, &keymap);
-                ui.add_space(8.0);
-                command_editor(ui, state, &keymap, &conflicts, false);
-            }
             OperationOverviewEditor::RingShortcut(context) => {
                 ui.label(
                     egui::RichText::new(format!("{} のリング / パッド", context.label())).strong(),
@@ -749,7 +743,7 @@ fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
 pub(super) fn page_command_settings(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    ime_active: bool,
+    _ime_active: bool,
 ) {
     ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
     ui.small("Esc / Enter / 修飾なし矢印など、文脈依存が強い固定操作は現在の対象外です。");
@@ -781,14 +775,83 @@ pub(super) fn page_command_settings(
     keyboard_chord_picker(ui, state, &keymap);
 
     ui.add_space(8.0);
-    ui.columns(2, |columns| {
-        columns[0].vertical(|ui| {
-            command_list(ui, state, &keymap, &conflicts);
-        });
-        columns[1].vertical(|ui| {
+    command_list(ui, state, &keymap, &conflicts);
+}
+
+pub(super) fn draw_operation_command_editor_dialog(
+    ctx: &egui::Context,
+    state: &mut PreferencesState,
+    ime_active: bool,
+) {
+    if !state.command_editor_dialog_open {
+        return;
+    }
+
+    let keymap = Keymap::from_settings(&state.settings.keymap);
+    let conflicts = keymap.binding_conflicts();
+    let mut open = true;
+    egui::Window::new("キー割り当て編集")
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_size([560.0, 520.0])
+        .min_width(480.0)
+        .show(ctx, |ui| {
+            if let Some(chord) = state.command_editor_source_chord {
+                command_editor_source_chord_section(ui, state, &keymap, chord);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+            }
             command_editor(ui, state, &keymap, &conflicts, ime_active);
         });
-    });
+
+    if !open {
+        state.command_editor_dialog_open = false;
+        state.command_editor_source_chord = None;
+        state.command_capture_slot = None;
+    }
+}
+
+fn command_editor_source_chord_section(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    keymap: &Keymap,
+    chord: Chord,
+) {
+    ui.label(
+        egui::RichText::new(format!("キー: {}", chord.display_name()))
+            .strong()
+            .size(14.0),
+    );
+    let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
+    if matches.is_empty() {
+        ui.small("このキーは現在の表示範囲では未割り当てです。コマンド一覧で割り当て先の「編集」を押してから、キーボード図のキーをクリックすると入力欄へ入ります。");
+        return;
+    }
+
+    ui.small("このキーに割り当てられているコマンド:");
+    egui::Grid::new(("command_editor_source_chord", chord.display_name()))
+        .num_columns(3)
+        .spacing([8.0, 3.0])
+        .show(ui, |ui| {
+            for action in matches {
+                if ui
+                    .small_button(if state.command_selected == Some(action) {
+                        "編集中"
+                    } else {
+                        "編集"
+                    })
+                    .clicked()
+                {
+                    open_command_editor_dialog(state, action, Some(chord));
+                }
+                ui.label(compact_key_action_label(action))
+                    .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
+                ui.label(action.context().description());
+                ui.end_row();
+            }
+        });
 }
 
 fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap: &Keymap) {
@@ -976,7 +1039,20 @@ fn keyboard_chord_tooltip(
 
 fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, chord: Chord) {
     let Some(action) = state.command_selected else {
-        state.command_edit_error = Some("先に左の一覧からコマンドを選んでください。".to_string());
+        let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
+        state.command_editor_source_chord = Some(chord);
+        state.command_editor_dialog_open = true;
+        state.command_edit_error = if matches.is_empty() {
+            Some(
+                "このキーは未割り当てです。コマンド一覧の「編集」から割り当て先を選んでください。"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        if matches.len() == 1 {
+            open_command_editor_dialog(state, matches[0], Some(chord));
+        }
         return;
     };
     ensure_command_editor_loaded(state, keymap, action);
@@ -991,6 +1067,8 @@ fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, c
             state.command_chord_inputs[slot] = label;
             state.command_capture_slot = None;
             state.command_edit_error = None;
+            state.command_editor_source_chord = Some(chord);
+            state.command_editor_dialog_open = true;
         }
         Ok(None) => {
             state.command_edit_error =
@@ -1000,6 +1078,31 @@ fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, c
             state.command_edit_error = Some(format!("{label}: {err}"));
         }
     }
+}
+
+fn actions_for_chord(
+    keymap: &Keymap,
+    chord: Chord,
+    context_filter: Option<crate::keymap::KeyContext>,
+) -> Vec<KeyAction> {
+    KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| {
+            context_filter.is_none_or(|context| action.context() == context)
+                && keymap.effective_chords(*action).contains(&chord)
+        })
+        .collect()
+}
+
+fn open_command_editor_dialog(
+    state: &mut PreferencesState,
+    action: KeyAction,
+    source_chord: Option<Chord>,
+) {
+    select_command_action(state, action);
+    state.command_editor_source_chord = source_chord;
+    state.command_editor_dialog_open = true;
 }
 
 fn push_unique_label(labels: &mut Vec<String>, label: String) {
@@ -1136,9 +1239,8 @@ fn command_conflict_summary(
                         .on_hover_text(conflict.action.description())
                         .clicked()
                     {
-                        select_command_action(state, conflict.action);
                         state.operation_keyboard_context = Some(conflict.action.context());
-                        state.operation_overview_editor = Some(OperationOverviewEditor::Keyboard);
+                        open_command_editor_dialog(state, conflict.action, Some(conflict.chord));
                     }
                     if let Some(other) = conflict.other_action {
                         if ui
@@ -1146,9 +1248,8 @@ fn command_conflict_summary(
                             .on_hover_text(other.description())
                             .clicked()
                         {
-                            select_command_action(state, other);
                             state.operation_keyboard_context = Some(other.context());
-                            state.operation_overview_editor = Some(OperationOverviewEditor::Keyboard);
+                            open_command_editor_dialog(state, other, Some(conflict.chord));
                         }
                     } else {
                         ui.label(conflict.reserved_name.unwrap_or("固定キー"));
@@ -1195,7 +1296,7 @@ fn command_list(
                     .selectable_label(selected, if selected { "選択中" } else { "編集" })
                     .clicked()
                 {
-                    select_command_action(state, action);
+                    open_command_editor_dialog(state, action, None);
                 }
 
                 ui.label(compact_key_action_label(action))
