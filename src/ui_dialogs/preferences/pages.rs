@@ -503,7 +503,11 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
     }
 }
 
-pub(super) fn page_command_settings(ui: &mut egui::Ui, state: &mut PreferencesState) {
+pub(super) fn page_command_settings(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    ime_active: bool,
+) {
     ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
     ui.small("Esc / Enter / 修飾なし矢印など、文脈依存が強い固定操作は現在の対象外です。");
     ui.add_space(8.0);
@@ -536,7 +540,7 @@ pub(super) fn page_command_settings(ui: &mut egui::Ui, state: &mut PreferencesSt
             command_list(ui, state, &keymap, &conflicts);
         });
         columns[1].vertical(|ui| {
-            command_editor(ui, state, &keymap, &conflicts);
+            command_editor(ui, state, &keymap, &conflicts, ime_active);
         });
     });
 }
@@ -679,6 +683,7 @@ fn command_editor(
     state: &mut PreferencesState,
     keymap: &Keymap,
     conflicts: &[BindingConflict],
+    ime_active: bool,
 ) {
     ui.label(egui::RichText::new("割り当て編集").strong());
     let Some(action) = state.command_selected else {
@@ -688,7 +693,7 @@ fn command_editor(
 
     ensure_command_editor_loaded(state, keymap, action);
     if let Some(slot) = state.command_capture_slot
-        && let Some(result) = poll_command_chord_capture(ui.ctx(), action)
+        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, ime_active)
     {
         match result {
             Ok(label) if slot < state.command_chord_inputs.len() => {
@@ -900,7 +905,11 @@ fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
 fn poll_command_chord_capture(
     ctx: &egui::Context,
     action: KeyAction,
+    ime_active: bool,
 ) -> Option<Result<String, String>> {
+    if ime_active {
+        return None;
+    }
     ctx.input_mut(|i| {
         let mut result = None;
         i.events.retain(|event| {

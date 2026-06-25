@@ -572,6 +572,7 @@ impl App {
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        let ime_active = self.ime_input_active();
 
         egui::Window::new("環境設定")
             .open(&mut open)
@@ -642,7 +643,7 @@ impl App {
                     .show(&mut right_ui, |ui| {
                         ui.set_width(ui.available_width());
                         command_capture_waiting = state.command_capture_slot.is_some();
-                        draw_page(ui, state, enter_pressed);
+                        draw_page(ui, state, enter_pressed, ime_active);
                     });
 
                 // 全体の高さを確保
@@ -1214,7 +1215,12 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 // ── 右パネル ページ描画 ─────────────────────────────────────────
 
-fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: bool) {
+fn draw_page(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    enter_pressed: bool,
+    ime_active: bool,
+) {
     ui.heading(state.selected.label());
     ui.add_space(8.0);
 
@@ -1225,7 +1231,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
-        PreferencesPage::CommandSettings => page_command_settings(ui, state),
+        PreferencesPage::CommandSettings => page_command_settings(ui, state, ime_active),
         PreferencesPage::MouseButtons => page_mouse_buttons(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),
         PreferencesPage::RingShortcut => page_ring_shortcut(ui, state),

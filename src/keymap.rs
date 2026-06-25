@@ -4033,12 +4033,22 @@ impl KeymapSettings {
             );
         }
 
+        self.legacy_ini_migration_done = true;
+        result.changed = true;
+        result.imported = true;
+        result
+    }
+
+    pub fn rename_imported_legacy_ini(&mut self, path: &Path) -> LegacyKeymapIniImport {
+        let mut result = LegacyKeymapIniImport::default();
         let backup_path = next_legacy_keymap_backup_path(path);
         match std::fs::rename(path, &backup_path) {
             Ok(()) => {
                 self.legacy_ini_backup = Some(backup_path.to_string_lossy().into_owned());
                 result.backup_path = Some(backup_path);
+                result.changed = true;
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 result.warnings.push(format!(
                     "failed to rename legacy keymap.ini ({}): {}",
@@ -4047,9 +4057,6 @@ impl KeymapSettings {
                 ));
             }
         }
-        self.legacy_ini_migration_done = true;
-        result.changed = true;
-        result.imported = true;
         result
     }
 
@@ -5867,7 +5874,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_keymap_ini_imports_once_and_renames_file() {
+    fn legacy_keymap_ini_imports_once_and_renames_file_after_backup_request() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("keymap.ini");
         std::fs::write(
@@ -5880,15 +5887,10 @@ mod tests {
         let result = settings.import_legacy_ini_if_needed(&path);
         assert!(result.changed);
         assert!(result.imported);
-        assert!(!path.exists());
-        let backup_path = result.backup_path.expect("backup path");
-        assert!(backup_path.exists());
-        assert!(backup_path.ends_with("keymap.ini.imported.bak"));
+        assert!(result.backup_path.is_none());
+        assert!(path.exists());
         assert!(settings.legacy_ini_migration_done);
-        assert_eq!(
-            settings.legacy_ini_backup.as_deref(),
-            Some(backup_path.to_string_lossy().as_ref())
-        );
+        assert!(settings.legacy_ini_backup.is_none());
 
         let restored = Keymap::from_settings(&settings);
         assert_eq!(
@@ -5898,6 +5900,17 @@ mod tests {
         assert_eq!(
             restored.effective_chords(KeyAction::GridToggleStackMode),
             vec![Chord::ctrl_shift(KeyName::S)]
+        );
+
+        let backup = settings.rename_imported_legacy_ini(&path);
+        let backup_path = backup.backup_path.expect("backup path");
+        assert!(backup.changed);
+        assert!(!path.exists());
+        assert!(backup_path.exists());
+        assert!(backup_path.ends_with("keymap.ini.imported.bak"));
+        assert_eq!(
+            settings.legacy_ini_backup.as_deref(),
+            Some(backup_path.to_string_lossy().as_ref())
         );
 
         let second = settings.import_legacy_ini_if_needed(&path);

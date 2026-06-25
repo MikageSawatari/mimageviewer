@@ -4394,23 +4394,17 @@ impl Settings {
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
         settings.sanitize();
+        let legacy_keymap_ini_path = data_dir.join("keymap.ini");
         let legacy_keymap_import =
             if db_loaded && !MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
                 settings
                     .keymap
-                    .import_legacy_ini_if_needed(&data_dir.join("keymap.ini"))
+                    .import_legacy_ini_if_needed(&legacy_keymap_ini_path)
             } else {
                 crate::keymap::LegacyKeymapIniImport::default()
             };
         if legacy_keymap_import.imported {
-            let backup = legacy_keymap_import
-                .backup_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "(rename failed)".to_string());
-            settings_diag_log(&format!(
-                "settings: legacy keymap.ini imported into settings; backup={backup}"
-            ));
+            settings_diag_log("settings: legacy keymap.ini imported into settings; backup pending");
         }
         for warning in &legacy_keymap_import.warnings {
             settings_diag_log(&format!("settings: legacy keymap.ini import: {warning}"));
@@ -4495,7 +4489,7 @@ impl Settings {
         // `save_internal_no_rotation` を使う。spec §6.1 で rotation は「**user** save の
         // 最初の 1 回」と定義されており、`load()` 内の migration/version 書き戻しで
         // rotation を消費すると次の真の user save が in-place 書込みになってしまう。
-        if vst3_migrated
+        let bootstrap_save_needed = vst3_migrated
             || autoplay_mode_migrated
             || video_loop_migrated
             || archive_file_handling_migrated
@@ -4503,9 +4497,28 @@ impl Settings {
             || video_playback_speed_sanitized
             || mouse_nav_clean_install_defaulted
             || legacy_keymap_import.changed
-            || version_changed
-        {
-            settings.save_internal_no_rotation();
+            || version_changed;
+        let bootstrap_saved = if bootstrap_save_needed {
+            settings.save_internal_no_rotation()
+        } else {
+            false
+        };
+        if bootstrap_saved && legacy_keymap_import.imported {
+            let legacy_keymap_backup = settings
+                .keymap
+                .rename_imported_legacy_ini(&legacy_keymap_ini_path);
+            if let Some(path) = legacy_keymap_backup.backup_path.as_ref() {
+                settings_diag_log(&format!(
+                    "settings: legacy keymap.ini backup saved {}",
+                    path.display()
+                ));
+            }
+            for warning in &legacy_keymap_backup.warnings {
+                settings_diag_log(&format!("settings: legacy keymap.ini import: {warning}"));
+            }
+            if legacy_keymap_backup.changed {
+                settings.save_internal_no_rotation();
+            }
         }
         SettingsLoadResult {
             settings,
@@ -4887,11 +4900,11 @@ impl Settings {
     /// (Codex P2 v13 2026-05-14)。**世代 rotation を発火させない / `BACKUP_DONE_THIS_SESSION`
     /// flag も立てない** ことで、spec §6.1 の「プロセス最初の **user save** で 1 回 rotate」
     /// 規約を維持する。
-    fn save_internal_no_rotation(&self) {
-        self.save_internal(false);
+    fn save_internal_no_rotation(&self) -> bool {
+        self.save_internal(false)
     }
 
-    fn save_internal(&self, allow_rotation: bool) {
+    fn save_internal(&self, allow_rotation: bool) -> bool {
         // session-wide 抑止フラグ。
         // - `MAIN_UNREADABLE_THIS_SESSION`: settings.rs 上の抑止 (旧来から維持)
         // - `settings_db::save_suppressed()`: settings_db 側の抑止 (Phase 2 で追加)
@@ -4900,7 +4913,7 @@ impl Settings {
             || crate::settings_db::save_suppressed()
         {
             settings_diag_log("settings: save suppressed (session-wide flag set)");
-            return;
+            return false;
         }
         // 保存直前に旧フィールドを新フィールドから導出する。
         // self は &self なので clone してから書き換える。
@@ -4945,6 +4958,7 @@ impl Settings {
                     "settings: save ok: favorites={} rotated={did_rotate}",
                     snapshot.favorites.len(),
                 ));
+                true
             }
             Err(e) => {
                 // SaveSuppressed のときは設計通り (= 上の suppress チェックを擦り抜けて
@@ -4955,6 +4969,7 @@ impl Settings {
                         "settings: save failed: {e} (rotated={did_rotate})"
                     ));
                 }
+                false
             }
         }
     }
