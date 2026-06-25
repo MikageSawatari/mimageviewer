@@ -12,6 +12,7 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
     Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, UiTheme,
 };
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -730,10 +731,16 @@ fn command_overview_rows(
     rows.sort_by(|a, b| {
         a.context
             .cmp(&b.context)
-            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| natural_operation_label_cmp(&a.label, &b.label))
             .then_with(|| a.hover.cmp(&b.hover))
     });
     rows
+}
+
+fn natural_operation_label_cmp(a: &str, b: &str) -> Ordering {
+    crate::ui_helpers::natural_sort_key(a)
+        .cmp(&crate::ui_helpers::natural_sort_key(b))
+        .then_with(|| a.cmp(b))
 }
 
 fn compact_key_action_label(action: KeyAction) -> String {
@@ -6509,7 +6516,7 @@ fn open_in_explorer(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::AI_SIZE_LIMIT_OPTIONS;
+    use super::{AI_SIZE_LIMIT_OPTIONS, natural_operation_label_cmp};
     use crate::app::MAX_TEXTURE_DIM;
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
@@ -6531,5 +6538,25 @@ mod tests {
         // 最大プリセットが 8192 x 8192 であること (要望: 8192 まで対応)。
         let largest = AI_SIZE_LIMIT_OPTIONS.last().copied().unwrap();
         assert_eq!((largest.0, largest.1), (max, max));
+    }
+
+    #[test]
+    fn operation_labels_sort_numbers_naturally() {
+        let mut labels = vec![
+            "サムネイル列数を10列に",
+            "サムネイル列数を1列に",
+            "サムネイル列数を2列に",
+            "サムネイル列数を9列に",
+        ];
+        labels.sort_by(|a, b| natural_operation_label_cmp(a, b));
+        assert_eq!(
+            labels,
+            vec![
+                "サムネイル列数を1列に",
+                "サムネイル列数を2列に",
+                "サムネイル列数を9列に",
+                "サムネイル列数を10列に",
+            ]
+        );
     }
 }
