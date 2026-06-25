@@ -476,9 +476,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   ToggleDetachedViewerMode `F12` (P) / HelpShowContextShortcuts `?` (P)
   - 検索・フォルダを開く系は dialog / address / search focus / fullscreen 中は既存ガードで無効化される。
   - ToggleDetachedViewerMode は dialog / text focus / IME 変換中 / 静止画 fullscreen 編集サブモードでは抑止し、fullscreen / native 動画では明示 consume する Global action。
-  - GlobalFavoritePrev/Next、GlobalOpenFavorite1..20、GlobalOpenDriveC..Z、
-    GlobalOpenLocation* は既定未割り当て。設定名は互換性のため `Global...` のままだが、
-    実体はサムネイル一覧 (`Grid`) の場所移動 Action として扱う。操作カスタマイズでキーを
+  - GridFavoritePrev/Next、GridOpenFavorite1..20、GridOpenDriveC..Z、
+    GridOpenLocation* は既定未割り当て。設定名も `Grid...` に揃え、
+    サムネイル一覧 (`Grid`) の場所移動 Action として扱う。操作カスタマイズでキーを
     割り当てると、グリッド表示中に同じ場所移動を実行する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)

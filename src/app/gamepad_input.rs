@@ -60,17 +60,17 @@ fn ring_location_action_for_key_action(action: KeyAction) -> Option<RingActionId
         return RingActionId::drive_action(letter);
     }
     Some(match action {
-        KeyAction::GlobalOpenLocationDriveList => RingActionId::OpenLocationDriveList,
-        KeyAction::GlobalOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
-        KeyAction::GlobalOpenLocationRating1 => RingActionId::OpenLocationRating1,
-        KeyAction::GlobalOpenLocationRating2 => RingActionId::OpenLocationRating2,
-        KeyAction::GlobalOpenLocationRating3 => RingActionId::OpenLocationRating3,
-        KeyAction::GlobalOpenLocationRating4 => RingActionId::OpenLocationRating4,
-        KeyAction::GlobalOpenLocationRating5 => RingActionId::OpenLocationRating5,
-        KeyAction::GlobalOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
-        KeyAction::GlobalOpenLocationDesktop => RingActionId::OpenLocationDesktop,
-        KeyAction::GlobalOpenLocationPictures => RingActionId::OpenLocationPictures,
-        KeyAction::GlobalOpenLocationDownloads => RingActionId::OpenLocationDownloads,
+        KeyAction::GridOpenLocationDriveList => RingActionId::OpenLocationDriveList,
+        KeyAction::GridOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
+        KeyAction::GridOpenLocationRating1 => RingActionId::OpenLocationRating1,
+        KeyAction::GridOpenLocationRating2 => RingActionId::OpenLocationRating2,
+        KeyAction::GridOpenLocationRating3 => RingActionId::OpenLocationRating3,
+        KeyAction::GridOpenLocationRating4 => RingActionId::OpenLocationRating4,
+        KeyAction::GridOpenLocationRating5 => RingActionId::OpenLocationRating5,
+        KeyAction::GridOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
+        KeyAction::GridOpenLocationDesktop => RingActionId::OpenLocationDesktop,
+        KeyAction::GridOpenLocationPictures => RingActionId::OpenLocationPictures,
+        KeyAction::GridOpenLocationDownloads => RingActionId::OpenLocationDownloads,
         _ => return None,
     })
 }
@@ -4013,7 +4013,7 @@ impl App {
         Some(nav)
     }
 
-    pub(crate) fn apply_global_location_key_action(
+    pub(crate) fn apply_location_navigation_key_action(
         &mut self,
         ctx: &egui::Context,
         action: KeyAction,
@@ -4029,8 +4029,8 @@ impl App {
             return self.apply_ring_location_action(ctx, &ring_action, source);
         }
         match action {
-            KeyAction::GlobalFavoritePrev => self.apply_favorite_cycle_nav(ctx, false, source),
-            KeyAction::GlobalFavoriteNext => self.apply_favorite_cycle_nav(ctx, true, source),
+            KeyAction::GridFavoritePrev => self.apply_favorite_cycle_nav(ctx, false, source),
+            KeyAction::GridFavoriteNext => self.apply_favorite_cycle_nav(ctx, true, source),
             _ => None,
         }
     }

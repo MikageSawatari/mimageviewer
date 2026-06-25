@@ -870,17 +870,17 @@ fn push_ring_binding_if_available(
 
 fn location_ring_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
     Some(match action {
-        KeyAction::GlobalOpenLocationDriveList => RingActionId::OpenLocationDriveList,
-        KeyAction::GlobalOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
-        KeyAction::GlobalOpenLocationRating1 => RingActionId::OpenLocationRating1,
-        KeyAction::GlobalOpenLocationRating2 => RingActionId::OpenLocationRating2,
-        KeyAction::GlobalOpenLocationRating3 => RingActionId::OpenLocationRating3,
-        KeyAction::GlobalOpenLocationRating4 => RingActionId::OpenLocationRating4,
-        KeyAction::GlobalOpenLocationRating5 => RingActionId::OpenLocationRating5,
-        KeyAction::GlobalOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
-        KeyAction::GlobalOpenLocationDesktop => RingActionId::OpenLocationDesktop,
-        KeyAction::GlobalOpenLocationPictures => RingActionId::OpenLocationPictures,
-        KeyAction::GlobalOpenLocationDownloads => RingActionId::OpenLocationDownloads,
+        KeyAction::GridOpenLocationDriveList => RingActionId::OpenLocationDriveList,
+        KeyAction::GridOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
+        KeyAction::GridOpenLocationRating1 => RingActionId::OpenLocationRating1,
+        KeyAction::GridOpenLocationRating2 => RingActionId::OpenLocationRating2,
+        KeyAction::GridOpenLocationRating3 => RingActionId::OpenLocationRating3,
+        KeyAction::GridOpenLocationRating4 => RingActionId::OpenLocationRating4,
+        KeyAction::GridOpenLocationRating5 => RingActionId::OpenLocationRating5,
+        KeyAction::GridOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
+        KeyAction::GridOpenLocationDesktop => RingActionId::OpenLocationDesktop,
+        KeyAction::GridOpenLocationPictures => RingActionId::OpenLocationPictures,
+        KeyAction::GridOpenLocationDownloads => RingActionId::OpenLocationDownloads,
         _ => return None,
     })
 }

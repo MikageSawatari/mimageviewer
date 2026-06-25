@@ -75,7 +75,7 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 
 `OpenFavorite1..20` / `OpenDriveC..Z` /
 `OpenLocationDriveList・ReadingHistory・Rating1..5・BooksRoot・Desktop・Pictures・Downloads` は
-当初 ring/パッド専用候補だったが、ユーザー要望により Global KeyAction として追加済み。
+当初 ring/パッド専用候補だったが、ユーザー要望により Grid 文脈の KeyAction として追加済み。
 
 ## 恒久チェックの提案
 

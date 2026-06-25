@@ -6,7 +6,7 @@ use std::sync::{
     mpsc,
 };
 
-use crate::keymap::{CommandScope, GLOBAL_LOCATION_NAVIGATION_ACTIONS, KeyAction};
+use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS};
 
 mod cache_ops;
 mod color_filter;
@@ -18439,10 +18439,10 @@ impl App {
         if let Some(action) = self.keymap.consume_first_action(
             ctx,
             &[CommandScope::Global],
-            GLOBAL_LOCATION_NAVIGATION_ACTIONS,
+            LOCATION_NAVIGATION_ACTIONS,
         ) {
             if let Some(nav) =
-                self.apply_global_location_key_action(ctx, action, "grid-location-key")
+                self.apply_location_navigation_key_action(ctx, action, "grid-location-key")
             {
                 return Some(nav);
             }

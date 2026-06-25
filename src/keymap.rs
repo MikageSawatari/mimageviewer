@@ -839,63 +839,63 @@ pub enum KeyAction {
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
     HelpShowContextShortcuts,
-    GlobalFavoritePrev,
-    GlobalFavoriteNext,
-    GlobalOpenFavorite1,
-    GlobalOpenFavorite2,
-    GlobalOpenFavorite3,
-    GlobalOpenFavorite4,
-    GlobalOpenFavorite5,
-    GlobalOpenFavorite6,
-    GlobalOpenFavorite7,
-    GlobalOpenFavorite8,
-    GlobalOpenFavorite9,
-    GlobalOpenFavorite10,
-    GlobalOpenFavorite11,
-    GlobalOpenFavorite12,
-    GlobalOpenFavorite13,
-    GlobalOpenFavorite14,
-    GlobalOpenFavorite15,
-    GlobalOpenFavorite16,
-    GlobalOpenFavorite17,
-    GlobalOpenFavorite18,
-    GlobalOpenFavorite19,
-    GlobalOpenFavorite20,
-    GlobalOpenDriveC,
-    GlobalOpenDriveD,
-    GlobalOpenDriveE,
-    GlobalOpenDriveF,
-    GlobalOpenDriveG,
-    GlobalOpenDriveH,
-    GlobalOpenDriveI,
-    GlobalOpenDriveJ,
-    GlobalOpenDriveK,
-    GlobalOpenDriveL,
-    GlobalOpenDriveM,
-    GlobalOpenDriveN,
-    GlobalOpenDriveO,
-    GlobalOpenDriveP,
-    GlobalOpenDriveQ,
-    GlobalOpenDriveR,
-    GlobalOpenDriveS,
-    GlobalOpenDriveT,
-    GlobalOpenDriveU,
-    GlobalOpenDriveV,
-    GlobalOpenDriveW,
-    GlobalOpenDriveX,
-    GlobalOpenDriveY,
-    GlobalOpenDriveZ,
-    GlobalOpenLocationDriveList,
-    GlobalOpenLocationReadingHistory,
-    GlobalOpenLocationRating1,
-    GlobalOpenLocationRating2,
-    GlobalOpenLocationRating3,
-    GlobalOpenLocationRating4,
-    GlobalOpenLocationRating5,
-    GlobalOpenLocationBooksRoot,
-    GlobalOpenLocationDesktop,
-    GlobalOpenLocationPictures,
-    GlobalOpenLocationDownloads,
+    GridFavoritePrev,
+    GridFavoriteNext,
+    GridOpenFavorite1,
+    GridOpenFavorite2,
+    GridOpenFavorite3,
+    GridOpenFavorite4,
+    GridOpenFavorite5,
+    GridOpenFavorite6,
+    GridOpenFavorite7,
+    GridOpenFavorite8,
+    GridOpenFavorite9,
+    GridOpenFavorite10,
+    GridOpenFavorite11,
+    GridOpenFavorite12,
+    GridOpenFavorite13,
+    GridOpenFavorite14,
+    GridOpenFavorite15,
+    GridOpenFavorite16,
+    GridOpenFavorite17,
+    GridOpenFavorite18,
+    GridOpenFavorite19,
+    GridOpenFavorite20,
+    GridOpenDriveC,
+    GridOpenDriveD,
+    GridOpenDriveE,
+    GridOpenDriveF,
+    GridOpenDriveG,
+    GridOpenDriveH,
+    GridOpenDriveI,
+    GridOpenDriveJ,
+    GridOpenDriveK,
+    GridOpenDriveL,
+    GridOpenDriveM,
+    GridOpenDriveN,
+    GridOpenDriveO,
+    GridOpenDriveP,
+    GridOpenDriveQ,
+    GridOpenDriveR,
+    GridOpenDriveS,
+    GridOpenDriveT,
+    GridOpenDriveU,
+    GridOpenDriveV,
+    GridOpenDriveW,
+    GridOpenDriveX,
+    GridOpenDriveY,
+    GridOpenDriveZ,
+    GridOpenLocationDriveList,
+    GridOpenLocationReadingHistory,
+    GridOpenLocationRating1,
+    GridOpenLocationRating2,
+    GridOpenLocationRating3,
+    GridOpenLocationRating4,
+    GridOpenLocationRating5,
+    GridOpenLocationBooksRoot,
+    GridOpenLocationDesktop,
+    GridOpenLocationPictures,
+    GridOpenLocationDownloads,
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
@@ -1160,63 +1160,63 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
     KeyAction::HelpShowContextShortcuts,
-    KeyAction::GlobalFavoritePrev,
-    KeyAction::GlobalFavoriteNext,
-    KeyAction::GlobalOpenFavorite1,
-    KeyAction::GlobalOpenFavorite2,
-    KeyAction::GlobalOpenFavorite3,
-    KeyAction::GlobalOpenFavorite4,
-    KeyAction::GlobalOpenFavorite5,
-    KeyAction::GlobalOpenFavorite6,
-    KeyAction::GlobalOpenFavorite7,
-    KeyAction::GlobalOpenFavorite8,
-    KeyAction::GlobalOpenFavorite9,
-    KeyAction::GlobalOpenFavorite10,
-    KeyAction::GlobalOpenFavorite11,
-    KeyAction::GlobalOpenFavorite12,
-    KeyAction::GlobalOpenFavorite13,
-    KeyAction::GlobalOpenFavorite14,
-    KeyAction::GlobalOpenFavorite15,
-    KeyAction::GlobalOpenFavorite16,
-    KeyAction::GlobalOpenFavorite17,
-    KeyAction::GlobalOpenFavorite18,
-    KeyAction::GlobalOpenFavorite19,
-    KeyAction::GlobalOpenFavorite20,
-    KeyAction::GlobalOpenDriveC,
-    KeyAction::GlobalOpenDriveD,
-    KeyAction::GlobalOpenDriveE,
-    KeyAction::GlobalOpenDriveF,
-    KeyAction::GlobalOpenDriveG,
-    KeyAction::GlobalOpenDriveH,
-    KeyAction::GlobalOpenDriveI,
-    KeyAction::GlobalOpenDriveJ,
-    KeyAction::GlobalOpenDriveK,
-    KeyAction::GlobalOpenDriveL,
-    KeyAction::GlobalOpenDriveM,
-    KeyAction::GlobalOpenDriveN,
-    KeyAction::GlobalOpenDriveO,
-    KeyAction::GlobalOpenDriveP,
-    KeyAction::GlobalOpenDriveQ,
-    KeyAction::GlobalOpenDriveR,
-    KeyAction::GlobalOpenDriveS,
-    KeyAction::GlobalOpenDriveT,
-    KeyAction::GlobalOpenDriveU,
-    KeyAction::GlobalOpenDriveV,
-    KeyAction::GlobalOpenDriveW,
-    KeyAction::GlobalOpenDriveX,
-    KeyAction::GlobalOpenDriveY,
-    KeyAction::GlobalOpenDriveZ,
-    KeyAction::GlobalOpenLocationDriveList,
-    KeyAction::GlobalOpenLocationReadingHistory,
-    KeyAction::GlobalOpenLocationRating1,
-    KeyAction::GlobalOpenLocationRating2,
-    KeyAction::GlobalOpenLocationRating3,
-    KeyAction::GlobalOpenLocationRating4,
-    KeyAction::GlobalOpenLocationRating5,
-    KeyAction::GlobalOpenLocationBooksRoot,
-    KeyAction::GlobalOpenLocationDesktop,
-    KeyAction::GlobalOpenLocationPictures,
-    KeyAction::GlobalOpenLocationDownloads,
+    KeyAction::GridFavoritePrev,
+    KeyAction::GridFavoriteNext,
+    KeyAction::GridOpenFavorite1,
+    KeyAction::GridOpenFavorite2,
+    KeyAction::GridOpenFavorite3,
+    KeyAction::GridOpenFavorite4,
+    KeyAction::GridOpenFavorite5,
+    KeyAction::GridOpenFavorite6,
+    KeyAction::GridOpenFavorite7,
+    KeyAction::GridOpenFavorite8,
+    KeyAction::GridOpenFavorite9,
+    KeyAction::GridOpenFavorite10,
+    KeyAction::GridOpenFavorite11,
+    KeyAction::GridOpenFavorite12,
+    KeyAction::GridOpenFavorite13,
+    KeyAction::GridOpenFavorite14,
+    KeyAction::GridOpenFavorite15,
+    KeyAction::GridOpenFavorite16,
+    KeyAction::GridOpenFavorite17,
+    KeyAction::GridOpenFavorite18,
+    KeyAction::GridOpenFavorite19,
+    KeyAction::GridOpenFavorite20,
+    KeyAction::GridOpenDriveC,
+    KeyAction::GridOpenDriveD,
+    KeyAction::GridOpenDriveE,
+    KeyAction::GridOpenDriveF,
+    KeyAction::GridOpenDriveG,
+    KeyAction::GridOpenDriveH,
+    KeyAction::GridOpenDriveI,
+    KeyAction::GridOpenDriveJ,
+    KeyAction::GridOpenDriveK,
+    KeyAction::GridOpenDriveL,
+    KeyAction::GridOpenDriveM,
+    KeyAction::GridOpenDriveN,
+    KeyAction::GridOpenDriveO,
+    KeyAction::GridOpenDriveP,
+    KeyAction::GridOpenDriveQ,
+    KeyAction::GridOpenDriveR,
+    KeyAction::GridOpenDriveS,
+    KeyAction::GridOpenDriveT,
+    KeyAction::GridOpenDriveU,
+    KeyAction::GridOpenDriveV,
+    KeyAction::GridOpenDriveW,
+    KeyAction::GridOpenDriveX,
+    KeyAction::GridOpenDriveY,
+    KeyAction::GridOpenDriveZ,
+    KeyAction::GridOpenLocationDriveList,
+    KeyAction::GridOpenLocationReadingHistory,
+    KeyAction::GridOpenLocationRating1,
+    KeyAction::GridOpenLocationRating2,
+    KeyAction::GridOpenLocationRating3,
+    KeyAction::GridOpenLocationRating4,
+    KeyAction::GridOpenLocationRating5,
+    KeyAction::GridOpenLocationBooksRoot,
+    KeyAction::GridOpenLocationDesktop,
+    KeyAction::GridOpenLocationPictures,
+    KeyAction::GridOpenLocationDownloads,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
@@ -2069,113 +2069,113 @@ const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
 ];
 
 const FAVORITE_LOCATION_ACTIONS: [KeyAction; 20] = [
-    KeyAction::GlobalOpenFavorite1,
-    KeyAction::GlobalOpenFavorite2,
-    KeyAction::GlobalOpenFavorite3,
-    KeyAction::GlobalOpenFavorite4,
-    KeyAction::GlobalOpenFavorite5,
-    KeyAction::GlobalOpenFavorite6,
-    KeyAction::GlobalOpenFavorite7,
-    KeyAction::GlobalOpenFavorite8,
-    KeyAction::GlobalOpenFavorite9,
-    KeyAction::GlobalOpenFavorite10,
-    KeyAction::GlobalOpenFavorite11,
-    KeyAction::GlobalOpenFavorite12,
-    KeyAction::GlobalOpenFavorite13,
-    KeyAction::GlobalOpenFavorite14,
-    KeyAction::GlobalOpenFavorite15,
-    KeyAction::GlobalOpenFavorite16,
-    KeyAction::GlobalOpenFavorite17,
-    KeyAction::GlobalOpenFavorite18,
-    KeyAction::GlobalOpenFavorite19,
-    KeyAction::GlobalOpenFavorite20,
+    KeyAction::GridOpenFavorite1,
+    KeyAction::GridOpenFavorite2,
+    KeyAction::GridOpenFavorite3,
+    KeyAction::GridOpenFavorite4,
+    KeyAction::GridOpenFavorite5,
+    KeyAction::GridOpenFavorite6,
+    KeyAction::GridOpenFavorite7,
+    KeyAction::GridOpenFavorite8,
+    KeyAction::GridOpenFavorite9,
+    KeyAction::GridOpenFavorite10,
+    KeyAction::GridOpenFavorite11,
+    KeyAction::GridOpenFavorite12,
+    KeyAction::GridOpenFavorite13,
+    KeyAction::GridOpenFavorite14,
+    KeyAction::GridOpenFavorite15,
+    KeyAction::GridOpenFavorite16,
+    KeyAction::GridOpenFavorite17,
+    KeyAction::GridOpenFavorite18,
+    KeyAction::GridOpenFavorite19,
+    KeyAction::GridOpenFavorite20,
 ];
 
 const DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
-    KeyAction::GlobalOpenDriveC,
-    KeyAction::GlobalOpenDriveD,
-    KeyAction::GlobalOpenDriveE,
-    KeyAction::GlobalOpenDriveF,
-    KeyAction::GlobalOpenDriveG,
-    KeyAction::GlobalOpenDriveH,
-    KeyAction::GlobalOpenDriveI,
-    KeyAction::GlobalOpenDriveJ,
-    KeyAction::GlobalOpenDriveK,
-    KeyAction::GlobalOpenDriveL,
-    KeyAction::GlobalOpenDriveM,
-    KeyAction::GlobalOpenDriveN,
-    KeyAction::GlobalOpenDriveO,
-    KeyAction::GlobalOpenDriveP,
-    KeyAction::GlobalOpenDriveQ,
-    KeyAction::GlobalOpenDriveR,
-    KeyAction::GlobalOpenDriveS,
-    KeyAction::GlobalOpenDriveT,
-    KeyAction::GlobalOpenDriveU,
-    KeyAction::GlobalOpenDriveV,
-    KeyAction::GlobalOpenDriveW,
-    KeyAction::GlobalOpenDriveX,
-    KeyAction::GlobalOpenDriveY,
-    KeyAction::GlobalOpenDriveZ,
+    KeyAction::GridOpenDriveC,
+    KeyAction::GridOpenDriveD,
+    KeyAction::GridOpenDriveE,
+    KeyAction::GridOpenDriveF,
+    KeyAction::GridOpenDriveG,
+    KeyAction::GridOpenDriveH,
+    KeyAction::GridOpenDriveI,
+    KeyAction::GridOpenDriveJ,
+    KeyAction::GridOpenDriveK,
+    KeyAction::GridOpenDriveL,
+    KeyAction::GridOpenDriveM,
+    KeyAction::GridOpenDriveN,
+    KeyAction::GridOpenDriveO,
+    KeyAction::GridOpenDriveP,
+    KeyAction::GridOpenDriveQ,
+    KeyAction::GridOpenDriveR,
+    KeyAction::GridOpenDriveS,
+    KeyAction::GridOpenDriveT,
+    KeyAction::GridOpenDriveU,
+    KeyAction::GridOpenDriveV,
+    KeyAction::GridOpenDriveW,
+    KeyAction::GridOpenDriveX,
+    KeyAction::GridOpenDriveY,
+    KeyAction::GridOpenDriveZ,
 ];
 
-pub const GLOBAL_LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
-    KeyAction::GlobalFavoritePrev,
-    KeyAction::GlobalFavoriteNext,
-    KeyAction::GlobalOpenFavorite1,
-    KeyAction::GlobalOpenFavorite2,
-    KeyAction::GlobalOpenFavorite3,
-    KeyAction::GlobalOpenFavorite4,
-    KeyAction::GlobalOpenFavorite5,
-    KeyAction::GlobalOpenFavorite6,
-    KeyAction::GlobalOpenFavorite7,
-    KeyAction::GlobalOpenFavorite8,
-    KeyAction::GlobalOpenFavorite9,
-    KeyAction::GlobalOpenFavorite10,
-    KeyAction::GlobalOpenFavorite11,
-    KeyAction::GlobalOpenFavorite12,
-    KeyAction::GlobalOpenFavorite13,
-    KeyAction::GlobalOpenFavorite14,
-    KeyAction::GlobalOpenFavorite15,
-    KeyAction::GlobalOpenFavorite16,
-    KeyAction::GlobalOpenFavorite17,
-    KeyAction::GlobalOpenFavorite18,
-    KeyAction::GlobalOpenFavorite19,
-    KeyAction::GlobalOpenFavorite20,
-    KeyAction::GlobalOpenDriveC,
-    KeyAction::GlobalOpenDriveD,
-    KeyAction::GlobalOpenDriveE,
-    KeyAction::GlobalOpenDriveF,
-    KeyAction::GlobalOpenDriveG,
-    KeyAction::GlobalOpenDriveH,
-    KeyAction::GlobalOpenDriveI,
-    KeyAction::GlobalOpenDriveJ,
-    KeyAction::GlobalOpenDriveK,
-    KeyAction::GlobalOpenDriveL,
-    KeyAction::GlobalOpenDriveM,
-    KeyAction::GlobalOpenDriveN,
-    KeyAction::GlobalOpenDriveO,
-    KeyAction::GlobalOpenDriveP,
-    KeyAction::GlobalOpenDriveQ,
-    KeyAction::GlobalOpenDriveR,
-    KeyAction::GlobalOpenDriveS,
-    KeyAction::GlobalOpenDriveT,
-    KeyAction::GlobalOpenDriveU,
-    KeyAction::GlobalOpenDriveV,
-    KeyAction::GlobalOpenDriveW,
-    KeyAction::GlobalOpenDriveX,
-    KeyAction::GlobalOpenDriveY,
-    KeyAction::GlobalOpenDriveZ,
-    KeyAction::GlobalOpenLocationDriveList,
-    KeyAction::GlobalOpenLocationReadingHistory,
-    KeyAction::GlobalOpenLocationRating1,
-    KeyAction::GlobalOpenLocationRating2,
-    KeyAction::GlobalOpenLocationRating3,
-    KeyAction::GlobalOpenLocationRating4,
-    KeyAction::GlobalOpenLocationRating5,
-    KeyAction::GlobalOpenLocationBooksRoot,
-    KeyAction::GlobalOpenLocationDesktop,
-    KeyAction::GlobalOpenLocationPictures,
-    KeyAction::GlobalOpenLocationDownloads,
+pub const LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
+    KeyAction::GridFavoritePrev,
+    KeyAction::GridFavoriteNext,
+    KeyAction::GridOpenFavorite1,
+    KeyAction::GridOpenFavorite2,
+    KeyAction::GridOpenFavorite3,
+    KeyAction::GridOpenFavorite4,
+    KeyAction::GridOpenFavorite5,
+    KeyAction::GridOpenFavorite6,
+    KeyAction::GridOpenFavorite7,
+    KeyAction::GridOpenFavorite8,
+    KeyAction::GridOpenFavorite9,
+    KeyAction::GridOpenFavorite10,
+    KeyAction::GridOpenFavorite11,
+    KeyAction::GridOpenFavorite12,
+    KeyAction::GridOpenFavorite13,
+    KeyAction::GridOpenFavorite14,
+    KeyAction::GridOpenFavorite15,
+    KeyAction::GridOpenFavorite16,
+    KeyAction::GridOpenFavorite17,
+    KeyAction::GridOpenFavorite18,
+    KeyAction::GridOpenFavorite19,
+    KeyAction::GridOpenFavorite20,
+    KeyAction::GridOpenDriveC,
+    KeyAction::GridOpenDriveD,
+    KeyAction::GridOpenDriveE,
+    KeyAction::GridOpenDriveF,
+    KeyAction::GridOpenDriveG,
+    KeyAction::GridOpenDriveH,
+    KeyAction::GridOpenDriveI,
+    KeyAction::GridOpenDriveJ,
+    KeyAction::GridOpenDriveK,
+    KeyAction::GridOpenDriveL,
+    KeyAction::GridOpenDriveM,
+    KeyAction::GridOpenDriveN,
+    KeyAction::GridOpenDriveO,
+    KeyAction::GridOpenDriveP,
+    KeyAction::GridOpenDriveQ,
+    KeyAction::GridOpenDriveR,
+    KeyAction::GridOpenDriveS,
+    KeyAction::GridOpenDriveT,
+    KeyAction::GridOpenDriveU,
+    KeyAction::GridOpenDriveV,
+    KeyAction::GridOpenDriveW,
+    KeyAction::GridOpenDriveX,
+    KeyAction::GridOpenDriveY,
+    KeyAction::GridOpenDriveZ,
+    KeyAction::GridOpenLocationDriveList,
+    KeyAction::GridOpenLocationReadingHistory,
+    KeyAction::GridOpenLocationRating1,
+    KeyAction::GridOpenLocationRating2,
+    KeyAction::GridOpenLocationRating3,
+    KeyAction::GridOpenLocationRating4,
+    KeyAction::GridOpenLocationRating5,
+    KeyAction::GridOpenLocationBooksRoot,
+    KeyAction::GridOpenLocationDesktop,
+    KeyAction::GridOpenLocationPictures,
+    KeyAction::GridOpenLocationDownloads,
 ];
 
 fn rating_actions(container: bool) -> &'static [(KeyAction, u8)] {
@@ -2231,72 +2231,72 @@ impl KeyAction {
 
     pub fn location_rating_stars(self) -> Option<u8> {
         match self {
-            Self::GlobalOpenLocationRating1 => Some(1),
-            Self::GlobalOpenLocationRating2 => Some(2),
-            Self::GlobalOpenLocationRating3 => Some(3),
-            Self::GlobalOpenLocationRating4 => Some(4),
-            Self::GlobalOpenLocationRating5 => Some(5),
+            Self::GridOpenLocationRating1 => Some(1),
+            Self::GridOpenLocationRating2 => Some(2),
+            Self::GridOpenLocationRating3 => Some(3),
+            Self::GridOpenLocationRating4 => Some(4),
+            Self::GridOpenLocationRating5 => Some(5),
             _ => None,
         }
     }
 
     pub fn is_location_navigation_action(self) -> bool {
-        GLOBAL_LOCATION_NAVIGATION_ACTIONS.contains(&self)
+        LOCATION_NAVIGATION_ACTIONS.contains(&self)
     }
 
     pub fn ini_name(self) -> &'static str {
         use KeyAction::*;
         if let Some(slot) = self.favorite_slot_number() {
             return match slot {
-                1 => "GlobalOpenFavorite1",
-                2 => "GlobalOpenFavorite2",
-                3 => "GlobalOpenFavorite3",
-                4 => "GlobalOpenFavorite4",
-                5 => "GlobalOpenFavorite5",
-                6 => "GlobalOpenFavorite6",
-                7 => "GlobalOpenFavorite7",
-                8 => "GlobalOpenFavorite8",
-                9 => "GlobalOpenFavorite9",
-                10 => "GlobalOpenFavorite10",
-                11 => "GlobalOpenFavorite11",
-                12 => "GlobalOpenFavorite12",
-                13 => "GlobalOpenFavorite13",
-                14 => "GlobalOpenFavorite14",
-                15 => "GlobalOpenFavorite15",
-                16 => "GlobalOpenFavorite16",
-                17 => "GlobalOpenFavorite17",
-                18 => "GlobalOpenFavorite18",
-                19 => "GlobalOpenFavorite19",
-                20 => "GlobalOpenFavorite20",
+                1 => "GridOpenFavorite1",
+                2 => "GridOpenFavorite2",
+                3 => "GridOpenFavorite3",
+                4 => "GridOpenFavorite4",
+                5 => "GridOpenFavorite5",
+                6 => "GridOpenFavorite6",
+                7 => "GridOpenFavorite7",
+                8 => "GridOpenFavorite8",
+                9 => "GridOpenFavorite9",
+                10 => "GridOpenFavorite10",
+                11 => "GridOpenFavorite11",
+                12 => "GridOpenFavorite12",
+                13 => "GridOpenFavorite13",
+                14 => "GridOpenFavorite14",
+                15 => "GridOpenFavorite15",
+                16 => "GridOpenFavorite16",
+                17 => "GridOpenFavorite17",
+                18 => "GridOpenFavorite18",
+                19 => "GridOpenFavorite19",
+                20 => "GridOpenFavorite20",
                 _ => unreachable!("favorite slot is constrained to 1..=20"),
             };
         }
         if let Some(letter) = self.drive_letter() {
             return match letter {
-                'C' => "GlobalOpenDriveC",
-                'D' => "GlobalOpenDriveD",
-                'E' => "GlobalOpenDriveE",
-                'F' => "GlobalOpenDriveF",
-                'G' => "GlobalOpenDriveG",
-                'H' => "GlobalOpenDriveH",
-                'I' => "GlobalOpenDriveI",
-                'J' => "GlobalOpenDriveJ",
-                'K' => "GlobalOpenDriveK",
-                'L' => "GlobalOpenDriveL",
-                'M' => "GlobalOpenDriveM",
-                'N' => "GlobalOpenDriveN",
-                'O' => "GlobalOpenDriveO",
-                'P' => "GlobalOpenDriveP",
-                'Q' => "GlobalOpenDriveQ",
-                'R' => "GlobalOpenDriveR",
-                'S' => "GlobalOpenDriveS",
-                'T' => "GlobalOpenDriveT",
-                'U' => "GlobalOpenDriveU",
-                'V' => "GlobalOpenDriveV",
-                'W' => "GlobalOpenDriveW",
-                'X' => "GlobalOpenDriveX",
-                'Y' => "GlobalOpenDriveY",
-                'Z' => "GlobalOpenDriveZ",
+                'C' => "GridOpenDriveC",
+                'D' => "GridOpenDriveD",
+                'E' => "GridOpenDriveE",
+                'F' => "GridOpenDriveF",
+                'G' => "GridOpenDriveG",
+                'H' => "GridOpenDriveH",
+                'I' => "GridOpenDriveI",
+                'J' => "GridOpenDriveJ",
+                'K' => "GridOpenDriveK",
+                'L' => "GridOpenDriveL",
+                'M' => "GridOpenDriveM",
+                'N' => "GridOpenDriveN",
+                'O' => "GridOpenDriveO",
+                'P' => "GridOpenDriveP",
+                'Q' => "GridOpenDriveQ",
+                'R' => "GridOpenDriveR",
+                'S' => "GridOpenDriveS",
+                'T' => "GridOpenDriveT",
+                'U' => "GridOpenDriveU",
+                'V' => "GridOpenDriveV",
+                'W' => "GridOpenDriveW",
+                'X' => "GridOpenDriveX",
+                'Y' => "GridOpenDriveY",
+                'Z' => "GridOpenDriveZ",
                 _ => unreachable!("drive letter is constrained to C..=Z"),
             };
         }
@@ -2307,34 +2307,32 @@ impl KeyAction {
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
-            GlobalFavoritePrev => "GlobalFavoritePrev",
-            GlobalFavoriteNext => "GlobalFavoriteNext",
-            GlobalOpenFavorite1 | GlobalOpenFavorite2 | GlobalOpenFavorite3
-            | GlobalOpenFavorite4 | GlobalOpenFavorite5 | GlobalOpenFavorite6
-            | GlobalOpenFavorite7 | GlobalOpenFavorite8 | GlobalOpenFavorite9
-            | GlobalOpenFavorite10 | GlobalOpenFavorite11 | GlobalOpenFavorite12
-            | GlobalOpenFavorite13 | GlobalOpenFavorite14 | GlobalOpenFavorite15
-            | GlobalOpenFavorite16 | GlobalOpenFavorite17 | GlobalOpenFavorite18
-            | GlobalOpenFavorite19 | GlobalOpenFavorite20 | GlobalOpenDriveC | GlobalOpenDriveD
-            | GlobalOpenDriveE | GlobalOpenDriveF | GlobalOpenDriveG | GlobalOpenDriveH
-            | GlobalOpenDriveI | GlobalOpenDriveJ | GlobalOpenDriveK | GlobalOpenDriveL
-            | GlobalOpenDriveM | GlobalOpenDriveN | GlobalOpenDriveO | GlobalOpenDriveP
-            | GlobalOpenDriveQ | GlobalOpenDriveR | GlobalOpenDriveS | GlobalOpenDriveT
-            | GlobalOpenDriveU | GlobalOpenDriveV | GlobalOpenDriveW | GlobalOpenDriveX
-            | GlobalOpenDriveY | GlobalOpenDriveZ => {
+            GridFavoritePrev => "GridFavoritePrev",
+            GridFavoriteNext => "GridFavoriteNext",
+            GridOpenFavorite1 | GridOpenFavorite2 | GridOpenFavorite3 | GridOpenFavorite4
+            | GridOpenFavorite5 | GridOpenFavorite6 | GridOpenFavorite7 | GridOpenFavorite8
+            | GridOpenFavorite9 | GridOpenFavorite10 | GridOpenFavorite11 | GridOpenFavorite12
+            | GridOpenFavorite13 | GridOpenFavorite14 | GridOpenFavorite15 | GridOpenFavorite16
+            | GridOpenFavorite17 | GridOpenFavorite18 | GridOpenFavorite19 | GridOpenFavorite20
+            | GridOpenDriveC | GridOpenDriveD | GridOpenDriveE | GridOpenDriveF
+            | GridOpenDriveG | GridOpenDriveH | GridOpenDriveI | GridOpenDriveJ
+            | GridOpenDriveK | GridOpenDriveL | GridOpenDriveM | GridOpenDriveN
+            | GridOpenDriveO | GridOpenDriveP | GridOpenDriveQ | GridOpenDriveR
+            | GridOpenDriveS | GridOpenDriveT | GridOpenDriveU | GridOpenDriveV
+            | GridOpenDriveW | GridOpenDriveX | GridOpenDriveY | GridOpenDriveZ => {
                 unreachable!("handled by compact location helpers")
             }
-            GlobalOpenLocationDriveList => "GlobalOpenLocationDriveList",
-            GlobalOpenLocationReadingHistory => "GlobalOpenLocationReadingHistory",
-            GlobalOpenLocationRating1 => "GlobalOpenLocationRating1",
-            GlobalOpenLocationRating2 => "GlobalOpenLocationRating2",
-            GlobalOpenLocationRating3 => "GlobalOpenLocationRating3",
-            GlobalOpenLocationRating4 => "GlobalOpenLocationRating4",
-            GlobalOpenLocationRating5 => "GlobalOpenLocationRating5",
-            GlobalOpenLocationBooksRoot => "GlobalOpenLocationBooksRoot",
-            GlobalOpenLocationDesktop => "GlobalOpenLocationDesktop",
-            GlobalOpenLocationPictures => "GlobalOpenLocationPictures",
-            GlobalOpenLocationDownloads => "GlobalOpenLocationDownloads",
+            GridOpenLocationDriveList => "GridOpenLocationDriveList",
+            GridOpenLocationReadingHistory => "GridOpenLocationReadingHistory",
+            GridOpenLocationRating1 => "GridOpenLocationRating1",
+            GridOpenLocationRating2 => "GridOpenLocationRating2",
+            GridOpenLocationRating3 => "GridOpenLocationRating3",
+            GridOpenLocationRating4 => "GridOpenLocationRating4",
+            GridOpenLocationRating5 => "GridOpenLocationRating5",
+            GridOpenLocationBooksRoot => "GridOpenLocationBooksRoot",
+            GridOpenLocationDesktop => "GridOpenLocationDesktop",
+            GridOpenLocationPictures => "GridOpenLocationPictures",
+            GridOpenLocationDownloads => "GridOpenLocationDownloads",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
@@ -2663,34 +2661,32 @@ impl KeyAction {
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
-            GlobalFavoritePrev => "前のお気に入りへ移動する",
-            GlobalFavoriteNext => "次のお気に入りへ移動する",
-            GlobalOpenFavorite1 | GlobalOpenFavorite2 | GlobalOpenFavorite3
-            | GlobalOpenFavorite4 | GlobalOpenFavorite5 | GlobalOpenFavorite6
-            | GlobalOpenFavorite7 | GlobalOpenFavorite8 | GlobalOpenFavorite9
-            | GlobalOpenFavorite10 | GlobalOpenFavorite11 | GlobalOpenFavorite12
-            | GlobalOpenFavorite13 | GlobalOpenFavorite14 | GlobalOpenFavorite15
-            | GlobalOpenFavorite16 | GlobalOpenFavorite17 | GlobalOpenFavorite18
-            | GlobalOpenFavorite19 | GlobalOpenFavorite20 | GlobalOpenDriveC | GlobalOpenDriveD
-            | GlobalOpenDriveE | GlobalOpenDriveF | GlobalOpenDriveG | GlobalOpenDriveH
-            | GlobalOpenDriveI | GlobalOpenDriveJ | GlobalOpenDriveK | GlobalOpenDriveL
-            | GlobalOpenDriveM | GlobalOpenDriveN | GlobalOpenDriveO | GlobalOpenDriveP
-            | GlobalOpenDriveQ | GlobalOpenDriveR | GlobalOpenDriveS | GlobalOpenDriveT
-            | GlobalOpenDriveU | GlobalOpenDriveV | GlobalOpenDriveW | GlobalOpenDriveX
-            | GlobalOpenDriveY | GlobalOpenDriveZ => {
+            GridFavoritePrev => "前のお気に入りへ移動する",
+            GridFavoriteNext => "次のお気に入りへ移動する",
+            GridOpenFavorite1 | GridOpenFavorite2 | GridOpenFavorite3 | GridOpenFavorite4
+            | GridOpenFavorite5 | GridOpenFavorite6 | GridOpenFavorite7 | GridOpenFavorite8
+            | GridOpenFavorite9 | GridOpenFavorite10 | GridOpenFavorite11 | GridOpenFavorite12
+            | GridOpenFavorite13 | GridOpenFavorite14 | GridOpenFavorite15 | GridOpenFavorite16
+            | GridOpenFavorite17 | GridOpenFavorite18 | GridOpenFavorite19 | GridOpenFavorite20
+            | GridOpenDriveC | GridOpenDriveD | GridOpenDriveE | GridOpenDriveF
+            | GridOpenDriveG | GridOpenDriveH | GridOpenDriveI | GridOpenDriveJ
+            | GridOpenDriveK | GridOpenDriveL | GridOpenDriveM | GridOpenDriveN
+            | GridOpenDriveO | GridOpenDriveP | GridOpenDriveQ | GridOpenDriveR
+            | GridOpenDriveS | GridOpenDriveT | GridOpenDriveU | GridOpenDriveV
+            | GridOpenDriveW | GridOpenDriveX | GridOpenDriveY | GridOpenDriveZ => {
                 unreachable!("handled by compact location helpers")
             }
-            GlobalOpenLocationDriveList => "ドライブ一覧を開く",
-            GlobalOpenLocationReadingHistory => "読書履歴を開く",
-            GlobalOpenLocationRating1 => "★1一覧を開く",
-            GlobalOpenLocationRating2 => "★2一覧を開く",
-            GlobalOpenLocationRating3 => "★3一覧を開く",
-            GlobalOpenLocationRating4 => "★4一覧を開く",
-            GlobalOpenLocationRating5 => "★5一覧を開く",
-            GlobalOpenLocationBooksRoot => "本棚フォルダを開く",
-            GlobalOpenLocationDesktop => "デスクトップを開く",
-            GlobalOpenLocationPictures => "ピクチャを開く",
-            GlobalOpenLocationDownloads => "ダウンロードを開く",
+            GridOpenLocationDriveList => "ドライブ一覧を開く",
+            GridOpenLocationReadingHistory => "読書履歴を開く",
+            GridOpenLocationRating1 => "★1一覧を開く",
+            GridOpenLocationRating2 => "★2一覧を開く",
+            GridOpenLocationRating3 => "★3一覧を開く",
+            GridOpenLocationRating4 => "★4一覧を開く",
+            GridOpenLocationRating5 => "★5一覧を開く",
+            GridOpenLocationBooksRoot => "本棚フォルダを開く",
+            GridOpenLocationDesktop => "デスクトップを開く",
+            GridOpenLocationPictures => "ピクチャを開く",
+            GridOpenLocationDownloads => "ダウンロードを開く",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -2958,63 +2954,63 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | HelpShowContextShortcuts => KeyContext::Global,
-            GlobalFavoritePrev
-            | GlobalFavoriteNext
-            | GlobalOpenFavorite1
-            | GlobalOpenFavorite2
-            | GlobalOpenFavorite3
-            | GlobalOpenFavorite4
-            | GlobalOpenFavorite5
-            | GlobalOpenFavorite6
-            | GlobalOpenFavorite7
-            | GlobalOpenFavorite8
-            | GlobalOpenFavorite9
-            | GlobalOpenFavorite10
-            | GlobalOpenFavorite11
-            | GlobalOpenFavorite12
-            | GlobalOpenFavorite13
-            | GlobalOpenFavorite14
-            | GlobalOpenFavorite15
-            | GlobalOpenFavorite16
-            | GlobalOpenFavorite17
-            | GlobalOpenFavorite18
-            | GlobalOpenFavorite19
-            | GlobalOpenFavorite20
-            | GlobalOpenDriveC
-            | GlobalOpenDriveD
-            | GlobalOpenDriveE
-            | GlobalOpenDriveF
-            | GlobalOpenDriveG
-            | GlobalOpenDriveH
-            | GlobalOpenDriveI
-            | GlobalOpenDriveJ
-            | GlobalOpenDriveK
-            | GlobalOpenDriveL
-            | GlobalOpenDriveM
-            | GlobalOpenDriveN
-            | GlobalOpenDriveO
-            | GlobalOpenDriveP
-            | GlobalOpenDriveQ
-            | GlobalOpenDriveR
-            | GlobalOpenDriveS
-            | GlobalOpenDriveT
-            | GlobalOpenDriveU
-            | GlobalOpenDriveV
-            | GlobalOpenDriveW
-            | GlobalOpenDriveX
-            | GlobalOpenDriveY
-            | GlobalOpenDriveZ
-            | GlobalOpenLocationDriveList
-            | GlobalOpenLocationReadingHistory
-            | GlobalOpenLocationRating1
-            | GlobalOpenLocationRating2
-            | GlobalOpenLocationRating3
-            | GlobalOpenLocationRating4
-            | GlobalOpenLocationRating5
-            | GlobalOpenLocationBooksRoot
-            | GlobalOpenLocationDesktop
-            | GlobalOpenLocationPictures
-            | GlobalOpenLocationDownloads
+            GridFavoritePrev
+            | GridFavoriteNext
+            | GridOpenFavorite1
+            | GridOpenFavorite2
+            | GridOpenFavorite3
+            | GridOpenFavorite4
+            | GridOpenFavorite5
+            | GridOpenFavorite6
+            | GridOpenFavorite7
+            | GridOpenFavorite8
+            | GridOpenFavorite9
+            | GridOpenFavorite10
+            | GridOpenFavorite11
+            | GridOpenFavorite12
+            | GridOpenFavorite13
+            | GridOpenFavorite14
+            | GridOpenFavorite15
+            | GridOpenFavorite16
+            | GridOpenFavorite17
+            | GridOpenFavorite18
+            | GridOpenFavorite19
+            | GridOpenFavorite20
+            | GridOpenDriveC
+            | GridOpenDriveD
+            | GridOpenDriveE
+            | GridOpenDriveF
+            | GridOpenDriveG
+            | GridOpenDriveH
+            | GridOpenDriveI
+            | GridOpenDriveJ
+            | GridOpenDriveK
+            | GridOpenDriveL
+            | GridOpenDriveM
+            | GridOpenDriveN
+            | GridOpenDriveO
+            | GridOpenDriveP
+            | GridOpenDriveQ
+            | GridOpenDriveR
+            | GridOpenDriveS
+            | GridOpenDriveT
+            | GridOpenDriveU
+            | GridOpenDriveV
+            | GridOpenDriveW
+            | GridOpenDriveX
+            | GridOpenDriveY
+            | GridOpenDriveZ
+            | GridOpenLocationDriveList
+            | GridOpenLocationReadingHistory
+            | GridOpenLocationRating1
+            | GridOpenLocationRating2
+            | GridOpenLocationRating3
+            | GridOpenLocationRating4
+            | GridOpenLocationRating5
+            | GridOpenLocationBooksRoot
+            | GridOpenLocationDesktop
+            | GridOpenLocationPictures
+            | GridOpenLocationDownloads
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -3217,63 +3213,63 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | HelpShowContextShortcuts
-            | GlobalFavoritePrev
-            | GlobalFavoriteNext
-            | GlobalOpenFavorite1
-            | GlobalOpenFavorite2
-            | GlobalOpenFavorite3
-            | GlobalOpenFavorite4
-            | GlobalOpenFavorite5
-            | GlobalOpenFavorite6
-            | GlobalOpenFavorite7
-            | GlobalOpenFavorite8
-            | GlobalOpenFavorite9
-            | GlobalOpenFavorite10
-            | GlobalOpenFavorite11
-            | GlobalOpenFavorite12
-            | GlobalOpenFavorite13
-            | GlobalOpenFavorite14
-            | GlobalOpenFavorite15
-            | GlobalOpenFavorite16
-            | GlobalOpenFavorite17
-            | GlobalOpenFavorite18
-            | GlobalOpenFavorite19
-            | GlobalOpenFavorite20
-            | GlobalOpenDriveC
-            | GlobalOpenDriveD
-            | GlobalOpenDriveE
-            | GlobalOpenDriveF
-            | GlobalOpenDriveG
-            | GlobalOpenDriveH
-            | GlobalOpenDriveI
-            | GlobalOpenDriveJ
-            | GlobalOpenDriveK
-            | GlobalOpenDriveL
-            | GlobalOpenDriveM
-            | GlobalOpenDriveN
-            | GlobalOpenDriveO
-            | GlobalOpenDriveP
-            | GlobalOpenDriveQ
-            | GlobalOpenDriveR
-            | GlobalOpenDriveS
-            | GlobalOpenDriveT
-            | GlobalOpenDriveU
-            | GlobalOpenDriveV
-            | GlobalOpenDriveW
-            | GlobalOpenDriveX
-            | GlobalOpenDriveY
-            | GlobalOpenDriveZ
-            | GlobalOpenLocationDriveList
-            | GlobalOpenLocationReadingHistory
-            | GlobalOpenLocationRating1
-            | GlobalOpenLocationRating2
-            | GlobalOpenLocationRating3
-            | GlobalOpenLocationRating4
-            | GlobalOpenLocationRating5
-            | GlobalOpenLocationBooksRoot
-            | GlobalOpenLocationDesktop
-            | GlobalOpenLocationPictures
-            | GlobalOpenLocationDownloads
+            | GridFavoritePrev
+            | GridFavoriteNext
+            | GridOpenFavorite1
+            | GridOpenFavorite2
+            | GridOpenFavorite3
+            | GridOpenFavorite4
+            | GridOpenFavorite5
+            | GridOpenFavorite6
+            | GridOpenFavorite7
+            | GridOpenFavorite8
+            | GridOpenFavorite9
+            | GridOpenFavorite10
+            | GridOpenFavorite11
+            | GridOpenFavorite12
+            | GridOpenFavorite13
+            | GridOpenFavorite14
+            | GridOpenFavorite15
+            | GridOpenFavorite16
+            | GridOpenFavorite17
+            | GridOpenFavorite18
+            | GridOpenFavorite19
+            | GridOpenFavorite20
+            | GridOpenDriveC
+            | GridOpenDriveD
+            | GridOpenDriveE
+            | GridOpenDriveF
+            | GridOpenDriveG
+            | GridOpenDriveH
+            | GridOpenDriveI
+            | GridOpenDriveJ
+            | GridOpenDriveK
+            | GridOpenDriveL
+            | GridOpenDriveM
+            | GridOpenDriveN
+            | GridOpenDriveO
+            | GridOpenDriveP
+            | GridOpenDriveQ
+            | GridOpenDriveR
+            | GridOpenDriveS
+            | GridOpenDriveT
+            | GridOpenDriveU
+            | GridOpenDriveV
+            | GridOpenDriveW
+            | GridOpenDriveX
+            | GridOpenDriveY
+            | GridOpenDriveZ
+            | GridOpenLocationDriveList
+            | GridOpenLocationReadingHistory
+            | GridOpenLocationRating1
+            | GridOpenLocationRating2
+            | GridOpenLocationRating3
+            | GridOpenLocationRating4
+            | GridOpenLocationRating5
+            | GridOpenLocationBooksRoot
+            | GridOpenLocationDesktop
+            | GridOpenLocationPictures
+            | GridOpenLocationDownloads
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -3535,63 +3531,63 @@ impl KeyAction {
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
-            GlobalFavoritePrev
-            | GlobalFavoriteNext
-            | GlobalOpenFavorite1
-            | GlobalOpenFavorite2
-            | GlobalOpenFavorite3
-            | GlobalOpenFavorite4
-            | GlobalOpenFavorite5
-            | GlobalOpenFavorite6
-            | GlobalOpenFavorite7
-            | GlobalOpenFavorite8
-            | GlobalOpenFavorite9
-            | GlobalOpenFavorite10
-            | GlobalOpenFavorite11
-            | GlobalOpenFavorite12
-            | GlobalOpenFavorite13
-            | GlobalOpenFavorite14
-            | GlobalOpenFavorite15
-            | GlobalOpenFavorite16
-            | GlobalOpenFavorite17
-            | GlobalOpenFavorite18
-            | GlobalOpenFavorite19
-            | GlobalOpenFavorite20
-            | GlobalOpenDriveC
-            | GlobalOpenDriveD
-            | GlobalOpenDriveE
-            | GlobalOpenDriveF
-            | GlobalOpenDriveG
-            | GlobalOpenDriveH
-            | GlobalOpenDriveI
-            | GlobalOpenDriveJ
-            | GlobalOpenDriveK
-            | GlobalOpenDriveL
-            | GlobalOpenDriveM
-            | GlobalOpenDriveN
-            | GlobalOpenDriveO
-            | GlobalOpenDriveP
-            | GlobalOpenDriveQ
-            | GlobalOpenDriveR
-            | GlobalOpenDriveS
-            | GlobalOpenDriveT
-            | GlobalOpenDriveU
-            | GlobalOpenDriveV
-            | GlobalOpenDriveW
-            | GlobalOpenDriveX
-            | GlobalOpenDriveY
-            | GlobalOpenDriveZ
-            | GlobalOpenLocationDriveList
-            | GlobalOpenLocationReadingHistory
-            | GlobalOpenLocationRating1
-            | GlobalOpenLocationRating2
-            | GlobalOpenLocationRating3
-            | GlobalOpenLocationRating4
-            | GlobalOpenLocationRating5
-            | GlobalOpenLocationBooksRoot
-            | GlobalOpenLocationDesktop
-            | GlobalOpenLocationPictures
-            | GlobalOpenLocationDownloads => ChordList::EMPTY,
+            GridFavoritePrev
+            | GridFavoriteNext
+            | GridOpenFavorite1
+            | GridOpenFavorite2
+            | GridOpenFavorite3
+            | GridOpenFavorite4
+            | GridOpenFavorite5
+            | GridOpenFavorite6
+            | GridOpenFavorite7
+            | GridOpenFavorite8
+            | GridOpenFavorite9
+            | GridOpenFavorite10
+            | GridOpenFavorite11
+            | GridOpenFavorite12
+            | GridOpenFavorite13
+            | GridOpenFavorite14
+            | GridOpenFavorite15
+            | GridOpenFavorite16
+            | GridOpenFavorite17
+            | GridOpenFavorite18
+            | GridOpenFavorite19
+            | GridOpenFavorite20
+            | GridOpenDriveC
+            | GridOpenDriveD
+            | GridOpenDriveE
+            | GridOpenDriveF
+            | GridOpenDriveG
+            | GridOpenDriveH
+            | GridOpenDriveI
+            | GridOpenDriveJ
+            | GridOpenDriveK
+            | GridOpenDriveL
+            | GridOpenDriveM
+            | GridOpenDriveN
+            | GridOpenDriveO
+            | GridOpenDriveP
+            | GridOpenDriveQ
+            | GridOpenDriveR
+            | GridOpenDriveS
+            | GridOpenDriveT
+            | GridOpenDriveU
+            | GridOpenDriveV
+            | GridOpenDriveW
+            | GridOpenDriveX
+            | GridOpenDriveY
+            | GridOpenDriveZ
+            | GridOpenLocationDriveList
+            | GridOpenLocationReadingHistory
+            | GridOpenLocationRating1
+            | GridOpenLocationRating2
+            | GridOpenLocationRating3
+            | GridOpenLocationRating4
+            | GridOpenLocationRating5
+            | GridOpenLocationBooksRoot
+            | GridOpenLocationDesktop
+            | GridOpenLocationPictures
+            | GridOpenLocationDownloads => ChordList::EMPTY,
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -6288,34 +6284,31 @@ mod tests {
 
     #[test]
     fn location_navigation_actions_are_grid_scoped_and_default_unassigned() {
+        assert_eq!(KeyAction::GridOpenFavorite1.favorite_slot_number(), Some(1));
         assert_eq!(
-            KeyAction::GlobalOpenFavorite1.favorite_slot_number(),
-            Some(1)
-        );
-        assert_eq!(
-            KeyAction::GlobalOpenFavorite20.favorite_slot_number(),
+            KeyAction::GridOpenFavorite20.favorite_slot_number(),
             Some(20)
         );
         assert_eq!(
             KeyAction::favorite_slot_action(1),
-            Some(KeyAction::GlobalOpenFavorite1)
+            Some(KeyAction::GridOpenFavorite1)
         );
         assert_eq!(
             KeyAction::favorite_slot_action(20),
-            Some(KeyAction::GlobalOpenFavorite20)
+            Some(KeyAction::GridOpenFavorite20)
         );
-        assert_eq!(KeyAction::GlobalOpenDriveC.drive_letter(), Some('C'));
-        assert_eq!(KeyAction::GlobalOpenDriveZ.drive_letter(), Some('Z'));
+        assert_eq!(KeyAction::GridOpenDriveC.drive_letter(), Some('C'));
+        assert_eq!(KeyAction::GridOpenDriveZ.drive_letter(), Some('Z'));
         assert_eq!(
             KeyAction::drive_action('c'),
-            Some(KeyAction::GlobalOpenDriveC)
+            Some(KeyAction::GridOpenDriveC)
         );
         assert_eq!(
             KeyAction::drive_action('Z'),
-            Some(KeyAction::GlobalOpenDriveZ)
+            Some(KeyAction::GridOpenDriveZ)
         );
 
-        for action in GLOBAL_LOCATION_NAVIGATION_ACTIONS {
+        for action in LOCATION_NAVIGATION_ACTIONS {
             assert_eq!(action.context(), KeyContext::Grid);
             assert_eq!(action.trigger(), KeyTrigger::Press);
             assert!(action.default_chords().is_empty());
@@ -6328,17 +6321,17 @@ mod tests {
         let keymap = Keymap::from_ini_str(
             r#"
             [Grid]
-            GlobalOpenFavorite1 = X
+            GridOpenFavorite1 = X
             "#,
         );
         let conflicts = keymap.binding_conflicts();
         assert!(conflicts.iter().any(|conflict| {
             conflict.kind == BindingConflictKind::Hard
                 && conflict.chord == Chord::key(KeyName::X)
-                && (conflict.action == KeyAction::GlobalOpenFavorite1
+                && (conflict.action == KeyAction::GridOpenFavorite1
                     && conflict.other_action == Some(KeyAction::GridComparePin)
                     || conflict.action == KeyAction::GridComparePin
-                        && conflict.other_action == Some(KeyAction::GlobalOpenFavorite1))
+                        && conflict.other_action == Some(KeyAction::GridOpenFavorite1))
         }));
         assert!(!conflicts.iter().any(|conflict| {
             conflict.action == KeyAction::FsCompareToggle

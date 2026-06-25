@@ -27,8 +27,8 @@ use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
-    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES,
-    GLOBAL_LOCATION_NAVIGATION_ACTIONS, KeyAction, KeyName, KeyTrigger, Keymap, command_catalog,
+    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
+    KeyTrigger, Keymap, LOCATION_NAVIGATION_ACTIONS, command_catalog,
 };
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
@@ -6607,10 +6607,10 @@ impl App {
             && let Some(location_action) = self.keymap.consume_first_action(
                 ctx,
                 &[CommandScope::Global],
-                GLOBAL_LOCATION_NAVIGATION_ACTIONS,
+                LOCATION_NAVIGATION_ACTIONS,
             )
         {
-            action.mouse_nav = self.apply_global_location_key_action(
+            action.mouse_nav = self.apply_location_navigation_key_action(
                 ctx,
                 location_action,
                 "fullscreen-location-key",
