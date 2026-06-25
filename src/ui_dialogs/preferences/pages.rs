@@ -660,6 +660,9 @@ pub(super) fn page_command_settings(
     });
 
     ui.add_space(8.0);
+    keyboard_chord_picker(ui, state, &keymap);
+
+    ui.add_space(8.0);
     ui.columns(2, |columns| {
         columns[0].vertical(|ui| {
             command_list(ui, state, &keymap, &conflicts);
@@ -668,6 +671,217 @@ pub(super) fn page_command_settings(
             command_editor(ui, state, &keymap, &conflicts, ime_active);
         });
     });
+}
+
+fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap: &Keymap) {
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("キーボード図").strong());
+            ui.checkbox(&mut state.operation_keyboard_ctrl, "Ctrl");
+            ui.checkbox(&mut state.operation_keyboard_shift, "Shift");
+            ui.checkbox(&mut state.operation_keyboard_alt, "Alt");
+            ui.small(
+                "ホバーで割り当て状況を表示。クリックすると選択中コマンドの空きキー欄へ入ります。",
+            );
+        });
+        ui.add_space(6.0);
+
+        for row in keyboard_picker_rows() {
+            ui.horizontal_wrapped(|ui| {
+                for &key in row {
+                    let chord = Chord::new(
+                        state.operation_keyboard_ctrl,
+                        state.operation_keyboard_shift,
+                        state.operation_keyboard_alt,
+                        key,
+                    );
+                    let label = key.display_name();
+                    let width = keyboard_picker_key_width(key);
+                    let response = ui.add_sized([width, 24.0], egui::Button::new(label).small());
+                    let clicked = response.clicked();
+                    response.on_hover_text(keyboard_chord_tooltip(
+                        keymap,
+                        chord,
+                        state.operation_keyboard_context,
+                    ));
+                    if clicked {
+                        assign_keyboard_picker_chord(state, keymap, chord);
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn keyboard_picker_rows() -> [&'static [KeyName]; 7] {
+    const EXTENDED_FUNCTION: &[KeyName] = &[
+        KeyName::F13,
+        KeyName::F14,
+        KeyName::F15,
+        KeyName::F16,
+        KeyName::F17,
+        KeyName::F18,
+        KeyName::F19,
+        KeyName::F20,
+        KeyName::F21,
+        KeyName::F22,
+        KeyName::F23,
+        KeyName::F24,
+    ];
+    const FUNCTION: &[KeyName] = &[
+        KeyName::F1,
+        KeyName::F2,
+        KeyName::F3,
+        KeyName::F4,
+        KeyName::F5,
+        KeyName::F6,
+        KeyName::F7,
+        KeyName::F8,
+        KeyName::F9,
+        KeyName::F10,
+        KeyName::F11,
+        KeyName::F12,
+    ];
+    const NUMBER: &[KeyName] = &[
+        KeyName::Esc,
+        KeyName::Num1,
+        KeyName::Num2,
+        KeyName::Num3,
+        KeyName::Num4,
+        KeyName::Num5,
+        KeyName::Num6,
+        KeyName::Num7,
+        KeyName::Num8,
+        KeyName::Num9,
+        KeyName::Num0,
+        KeyName::Minus,
+        KeyName::Backspace,
+    ];
+    const QWERTY: &[KeyName] = &[
+        KeyName::Tab,
+        KeyName::Q,
+        KeyName::W,
+        KeyName::E,
+        KeyName::R,
+        KeyName::T,
+        KeyName::Y,
+        KeyName::U,
+        KeyName::I,
+        KeyName::O,
+        KeyName::P,
+        KeyName::OpenBracket,
+        KeyName::CloseBracket,
+        KeyName::Slash,
+    ];
+    const HOME: &[KeyName] = &[
+        KeyName::A,
+        KeyName::S,
+        KeyName::D,
+        KeyName::F,
+        KeyName::G,
+        KeyName::H,
+        KeyName::J,
+        KeyName::K,
+        KeyName::L,
+        KeyName::Enter,
+    ];
+    const BOTTOM: &[KeyName] = &[
+        KeyName::Z,
+        KeyName::X,
+        KeyName::C,
+        KeyName::V,
+        KeyName::B,
+        KeyName::N,
+        KeyName::M,
+        KeyName::Space,
+    ];
+    const NAV: &[KeyName] = &[
+        KeyName::Home,
+        KeyName::End,
+        KeyName::PageUp,
+        KeyName::PageDown,
+        KeyName::Delete,
+        KeyName::Left,
+        KeyName::Up,
+        KeyName::Down,
+        KeyName::Right,
+    ];
+    [
+        EXTENDED_FUNCTION,
+        FUNCTION,
+        NUMBER,
+        QWERTY,
+        HOME,
+        BOTTOM,
+        NAV,
+    ]
+}
+
+fn keyboard_picker_key_width(key: KeyName) -> f32 {
+    match key {
+        KeyName::Backspace => 76.0,
+        KeyName::Enter => 68.0,
+        KeyName::Space => 132.0,
+        KeyName::PageUp | KeyName::PageDown => 62.0,
+        _ => 44.0,
+    }
+}
+
+fn keyboard_chord_tooltip(
+    keymap: &Keymap,
+    chord: Chord,
+    context_filter: Option<crate::keymap::KeyContext>,
+) -> String {
+    let mut lines = vec![chord.display_name()];
+    let mut matches = Vec::new();
+    for &action in KeyAction::all() {
+        if let Some(context) = context_filter
+            && action.context() != context
+        {
+            continue;
+        }
+        if keymap.effective_chords(action).contains(&chord) {
+            matches.push(format!(
+                "{} / {}",
+                action.context().description(),
+                action.description()
+            ));
+        }
+    }
+    if matches.is_empty() {
+        lines.push("割り当てなし".to_string());
+    } else {
+        lines.extend(matches);
+    }
+    lines.join("\n")
+}
+
+fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, chord: Chord) {
+    let Some(action) = state.command_selected else {
+        state.command_edit_error = Some("先に左の一覧からコマンドを選んでください。".to_string());
+        return;
+    };
+    ensure_command_editor_loaded(state, keymap, action);
+    let label = chord.display_name();
+    match parse_chord_for_action(action, &label) {
+        Ok(Some(_)) => {
+            let slot = state
+                .command_chord_inputs
+                .iter()
+                .position(|input| input.trim().is_empty())
+                .unwrap_or(0);
+            state.command_chord_inputs[slot] = label;
+            state.command_capture_slot = None;
+            state.command_edit_error = None;
+        }
+        Ok(None) => {
+            state.command_edit_error =
+                Some("none はキー図からは選べません。割り当て解除を使ってください。".to_string());
+        }
+        Err(err) => {
+            state.command_edit_error = Some(format!("{label}: {err}"));
+        }
+    }
 }
 
 fn dash_label(ui: &mut egui::Ui) {
