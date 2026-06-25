@@ -484,7 +484,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ### Grid (Ph4)
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpen `Enter`(予約) /
   GridParentFolder `Backspace` (P) / GridToggleCheck `Space` (P)
-- GridTreePrev/Next `Ctrl+↑/↓` (P) / GridSiblingPrev/Next `Ctrl+PageUp/Down` (P)
+- GridTreeFolderPrev/Next `Ctrl+↑/↓` (P) / GridSiblingFolderPrev/Next `Ctrl+PageUp/Down` (P)
 - GridParentAlt `Alt+↑` (P) / GridHistoryBack/Forward `Alt+←/→` (P)
 - GridHome/End/PageUp/PageDown (P)(予約候補)
 - GridToggleFolderTreePane `F` (P) / GridToggleMaximize `F11` (P) /

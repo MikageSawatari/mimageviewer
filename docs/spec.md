@@ -725,7 +725,8 @@ F12 相当の別ウィンドウ ON/OFF もこの候補に含める。
 | Alt + ← / → | フォルダ履歴を戻る / 進む（フォルダバーの ←/→ と同じ。検索中・ドライブ一覧中は無効） |
 | Home / End | 先頭 / 末尾へ移動 |
 | PageUp / PageDown | 1ページ分移動 |
-| Ctrl + PageUp / PageDown | 前 / 次の兄弟フォルダへ移動。同じ親の直下だけを対象にし、空フォルダも skip せず、子や祖先の兄弟へは入らない |
+| Ctrl + ↑ / ↓ | ツリー順で前 / 次のフォルダへ移動（Action: `GridTreeFolderPrev` / `GridTreeFolderNext`）。検索中は前 / 次の検索結果へ移動 |
+| Ctrl + PageUp / PageDown | 前 / 次の兄弟フォルダへ移動（Action: `GridSiblingFolderPrev` / `GridSiblingFolderNext`）。同じ親の直下だけを対象にし、空フォルダも skip せず、子や祖先の兄弟へは入らない |
 | Space | チェック可能なアイテムをチェック（複数選択。画像/動画/ZIP・PDF 本体/ZIP 内画像/PDF ページ/変換前アーカイブが対象。通常実フォルダのフォルダは `サブ展開` の起点選択としてチェックできる。ドライブ一覧は対象外） |
 | T | 左側のフォルダツリーペインの表示 / 非表示を切り替える |
 | Shift + ←↑→↓ | 範囲選択（移動元～移動先を一括チェック） |

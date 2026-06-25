@@ -803,6 +803,10 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
     };
     let ring_action = match action {
         KeyAction::GridParentFolder => RingActionId::GridParentFolder,
+        KeyAction::GridTreeFolderPrev => RingActionId::TreeFolderPrev,
+        KeyAction::GridTreeFolderNext => RingActionId::TreeFolderNext,
+        KeyAction::GridSiblingFolderPrev => RingActionId::SiblingFolderPrev,
+        KeyAction::GridSiblingFolderNext => RingActionId::SiblingFolderNext,
         KeyAction::GridToggleCheck => RingActionId::GridToggleCheck,
         KeyAction::GridSelectAll => RingActionId::GridSelectAll,
         KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,

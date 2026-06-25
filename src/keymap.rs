@@ -871,6 +871,10 @@ pub enum KeyAction {
     GridToggleCheck,
     GridDelete,
     GridParentFolder,
+    GridTreeFolderPrev,
+    GridTreeFolderNext,
+    GridSiblingFolderPrev,
+    GridSiblingFolderNext,
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
@@ -1143,6 +1147,10 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridParentFolder,
+    KeyAction::GridTreeFolderPrev,
+    KeyAction::GridTreeFolderNext,
+    KeyAction::GridSiblingFolderPrev,
+    KeyAction::GridSiblingFolderNext,
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
@@ -2202,6 +2210,10 @@ impl KeyAction {
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridParentFolder => "GridParentFolder",
+            GridTreeFolderPrev => "GridTreeFolderPrev",
+            GridTreeFolderNext => "GridTreeFolderNext",
+            GridSiblingFolderPrev => "GridSiblingFolderPrev",
+            GridSiblingFolderNext => "GridSiblingFolderNext",
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
@@ -2509,6 +2521,10 @@ impl KeyAction {
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridParentFolder => "親フォルダへ移動する",
+            GridTreeFolderPrev => "ツリー順で前のフォルダへ移動する",
+            GridTreeFolderNext => "ツリー順で次のフォルダへ移動する",
+            GridSiblingFolderPrev => "前の兄弟フォルダへ移動する",
+            GridSiblingFolderNext => "次の兄弟フォルダへ移動する",
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
@@ -2784,6 +2800,10 @@ impl KeyAction {
             | GridToggleCheck
             | GridDelete
             | GridParentFolder
+            | GridTreeFolderPrev
+            | GridTreeFolderNext
+            | GridSiblingFolderPrev
+            | GridSiblingFolderNext
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
@@ -2992,6 +3012,10 @@ impl KeyAction {
             | GridToggleCheck
             | GridDelete
             | GridParentFolder
+            | GridTreeFolderPrev
+            | GridTreeFolderNext
+            | GridSiblingFolderPrev
+            | GridSiblingFolderNext
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
@@ -3261,6 +3285,10 @@ impl KeyAction {
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridParentFolder => ChordList::one(Chord::key(Backspace)),
+            GridTreeFolderPrev => ChordList::one(Chord::ctrl(Up)),
+            GridTreeFolderNext => ChordList::one(Chord::ctrl(Down)),
+            GridSiblingFolderPrev => ChordList::one(Chord::ctrl(PageUp)),
+            GridSiblingFolderNext => ChordList::one(Chord::ctrl(PageDown)),
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
@@ -5123,11 +5151,123 @@ mod tests {
             .collect()
     }
 
+    fn ring_action_enum_names_from_source() -> std::collections::BTreeSet<String> {
+        let source = include_str!("ring_shortcut.rs");
+        let start = source
+            .find("pub enum RingActionId {")
+            .expect("RingActionId enum not found");
+        let body = &source[start + "pub enum RingActionId {".len()..];
+        let end = body.find("\n}").expect("RingActionId enum end not found");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let name = line
+                    .trim()
+                    .trim_end_matches(',')
+                    .split_once('(')
+                    .map_or_else(
+                        || line.trim().trim_end_matches(','),
+                        |(name, _)| name.trim(),
+                    );
+                (!name.is_empty() && !name.starts_with("//")).then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    fn add_numbered_names(
+        out: &mut std::collections::BTreeSet<String>,
+        prefix: &str,
+        range: std::ops::RangeInclusive<usize>,
+    ) {
+        out.extend(range.map(|number| format!("{prefix}{number}")));
+    }
+
+    fn add_drive_names(out: &mut std::collections::BTreeSet<String>, prefix: &str) {
+        out.extend(('C'..='Z').map(|letter| format!("{prefix}{letter}")));
+    }
+
     #[test]
     fn all_actions_inventory_matches_key_action_enum() {
         assert_eq!(
             key_action_enum_names_from_source(),
             all_actions_names_from_source()
+        );
+    }
+
+    #[test]
+    fn ring_actions_are_classified_for_key_action_parity() {
+        let mut key_handled = std::collections::BTreeSet::from([
+            "AddToBook".to_string(),
+            "PinRepresentativeThumb".to_string(),
+            "ToggleDetachedViewer".to_string(),
+            "ToggleWindowMode".to_string(),
+            "ToggleMaximize".to_string(),
+            "GridToggleDetails".to_string(),
+            "GridToggleCheck".to_string(),
+            "GridSelectAll".to_string(),
+            "GridParentFolder".to_string(),
+            "TreeFolderPrev".to_string(),
+            "TreeFolderNext".to_string(),
+            "SiblingFolderPrev".to_string(),
+            "SiblingFolderNext".to_string(),
+            "ImageRotateLeft".to_string(),
+            "ImageRotateRight".to_string(),
+            "ImageCapture".to_string(),
+            "ImageToggleMetadata".to_string(),
+            "ImageSlideshow".to_string(),
+            "ImagePixelGrid".to_string(),
+            "ImageBackgroundCycle".to_string(),
+            "ImageComparePin".to_string(),
+            "VideoCapture".to_string(),
+            "VideoMute".to_string(),
+            "VideoLoop".to_string(),
+            "VideoBookmark".to_string(),
+            "VideoMarkerPrev".to_string(),
+            "VideoMarkerNext".to_string(),
+            "VideoTileMode".to_string(),
+            "VideoExternalPlayer".to_string(),
+            "OpenLocationDriveList".to_string(),
+            "OpenLocationReadingHistory".to_string(),
+            "OpenLocationRating1".to_string(),
+            "OpenLocationRating2".to_string(),
+            "OpenLocationRating3".to_string(),
+            "OpenLocationRating4".to_string(),
+            "OpenLocationRating5".to_string(),
+            "OpenLocationBooksRoot".to_string(),
+            "OpenLocationDesktop".to_string(),
+            "OpenLocationPictures".to_string(),
+            "OpenLocationDownloads".to_string(),
+        ]);
+        add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
+        add_drive_names(&mut key_handled, "OpenDrive");
+        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=10);
+
+        let fixed_or_ring_only = std::collections::BTreeSet::from([
+            // Favorite picker / snapshot lock / Explorer open-folder are input-layer features.
+            "CycleFavorite".to_string(),
+            "GridToggleSnapshotLock".to_string(),
+            "ImageOpenFolder".to_string(),
+            // These are intentionally fixed because they depend on OS/browser/clipboard routes
+            // or reserved navigation semantics rather than ordinary keymap dispatch.
+            "GridHistoryBack".to_string(),
+            "GridHistoryForward".to_string(),
+            "ImageHome".to_string(),
+            "ImageEnd".to_string(),
+            "ImageCopyToClipboard".to_string(),
+            "ImageCopyPath".to_string(),
+            "ImageCopyFileName".to_string(),
+        ]);
+
+        let mut classified = key_handled;
+        classified.extend(fixed_or_ring_only);
+
+        let mut ring_actions = ring_action_enum_names_from_source();
+        ring_actions.remove("None");
+        ring_actions.remove("Unknown");
+
+        assert_eq!(
+            ring_actions, classified,
+            "Every RingActionId must be classified as KeyAction-backed or intentionally fixed/ring-only"
         );
     }
 
@@ -5693,13 +5833,49 @@ mod tests {
             KeyAction::FsToggleWindowMode.default_chords().iter().next(),
             Some(Chord::key(KeyName::F11))
         );
+        assert_eq!(
+            KeyAction::GridTreeFolderPrev.default_chords().iter().next(),
+            Some(Chord::ctrl(KeyName::Up))
+        );
+        assert_eq!(
+            KeyAction::GridTreeFolderNext.default_chords().iter().next(),
+            Some(Chord::ctrl(KeyName::Down))
+        );
+        assert_eq!(
+            KeyAction::GridSiblingFolderPrev
+                .default_chords()
+                .iter()
+                .next(),
+            Some(Chord::ctrl(KeyName::PageUp))
+        );
+        assert_eq!(
+            KeyAction::GridSiblingFolderNext
+                .default_chords()
+                .iter()
+                .next(),
+            Some(Chord::ctrl(KeyName::PageDown))
+        );
         assert_eq!(KeyAction::GridParentFolder.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridTreeFolderPrev.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridTreeFolderNext.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridSiblingFolderPrev.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridSiblingFolderNext.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleMaximize.context(), KeyContext::Grid);
         assert_eq!(
             KeyAction::FsToggleWindowMode.context(),
             KeyContext::FsCommon
         );
         assert_eq!(KeyAction::GridParentFolder.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::GridTreeFolderPrev.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::GridTreeFolderNext.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            KeyAction::GridSiblingFolderPrev.trigger(),
+            KeyTrigger::Press
+        );
+        assert_eq!(
+            KeyAction::GridSiblingFolderNext.trigger(),
+            KeyTrigger::Press
+        );
         assert_eq!(KeyAction::GridToggleMaximize.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::FsToggleWindowMode.trigger(), KeyTrigger::Press);
     }

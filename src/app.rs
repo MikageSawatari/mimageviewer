@@ -18525,9 +18525,12 @@ impl App {
         let key_r = self.keymap.pressed_action(ctx, KeyAction::GridRotateCw);
         let key_l = self.keymap.pressed_action(ctx, KeyAction::GridRotateCcw);
 
-        // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定。
-        let ctrl_up = ctrl_held && up;
-        let ctrl_down = ctrl_held && down;
+        let ctrl_up = self
+            .keymap
+            .consume_action(ctx, KeyAction::GridTreeFolderPrev);
+        let ctrl_down = self
+            .keymap
+            .consume_action(ctx, KeyAction::GridTreeFolderNext);
         if ctrl_up || ctrl_down {
             crate::logger::log(format!(
                 "[input-nav] source=grid action={} ctrl_held={ctrl_held} up={up} down={down} \
@@ -18542,8 +18545,12 @@ impl App {
                 browser_forward_count
             ));
         }
-        let ctrl_page_up = ctrl_held && page_up;
-        let ctrl_page_down = ctrl_held && page_down;
+        let ctrl_page_up = self
+            .keymap
+            .consume_action(ctx, KeyAction::GridSiblingFolderPrev);
+        let ctrl_page_down = self
+            .keymap
+            .consume_action(ctx, KeyAction::GridSiblingFolderNext);
         let alt_up = alt_held && up && !ctrl_held;
         let alt_left = alt_held && left && !ctrl_held;
         let alt_right = alt_held && right && !ctrl_held;
@@ -18612,17 +18619,17 @@ impl App {
                 Some((vis_pos + 1).min(vi_len - 1))
             } else if left && !ctrl_held && !alt_held {
                 Some(vis_pos.saturating_sub(1))
-            } else if down && !ctrl_down && !alt_held {
+            } else if down && !ctrl_held && !alt_held {
                 Some((vis_pos + nav_cols).min(vi_len - 1))
-            } else if up && !ctrl_up && !alt_held {
+            } else if up && !ctrl_held && !alt_held {
                 Some(vis_pos.saturating_sub(nav_cols))
             } else if home {
                 Some(0)
             } else if end {
                 Some(vi_len - 1)
-            } else if page_down && !ctrl_page_down {
+            } else if page_down && !ctrl_held {
                 Some((vis_pos + page_items).min(vi_len - 1))
-            } else if page_up && !ctrl_page_up {
+            } else if page_up && !ctrl_held {
                 Some(vis_pos.saturating_sub(page_items))
             } else {
                 None

@@ -119,6 +119,10 @@
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
 # GridParentFolder = Backspace ; 親フォルダへ移動する
+# GridTreeFolderPrev = Ctrl+Up ; ツリー順で前のフォルダへ移動する
+# GridTreeFolderNext = Ctrl+Down ; ツリー順で次のフォルダへ移動する
+# GridSiblingFolderPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する
+# GridSiblingFolderNext = Ctrl+PageDown ; 次の兄弟フォルダへ移動する
 # GridToggleMaximize = F11 ; メインウィンドウを最大化/復元する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
 # GridToggleStackMode = none ; スタック表示を切り替える
