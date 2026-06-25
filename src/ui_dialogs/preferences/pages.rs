@@ -2045,7 +2045,7 @@ fn command_conflict_summary(
             .show(ui, |ui| {
                 ui.strong("キー");
                 ui.strong("種類");
-                ui.strong("コマンド");
+                ui.strong("操作");
                 ui.strong("相手");
                 ui.end_row();
 
@@ -2053,8 +2053,12 @@ fn command_conflict_summary(
                     ui.monospace(conflict.chord.display_name());
                     ui.label(binding_conflict_kind_label(conflict.kind));
                     if ui
-                        .button(conflict.action.ini_name())
-                        .on_hover_text(conflict.action.description())
+                        .button(compact_key_action_label(conflict.action))
+                        .on_hover_text(format!(
+                            "{}\n{}",
+                            conflict.action.description(),
+                            conflict.action.ini_name()
+                        ))
                         .clicked()
                     {
                         state.operation_keyboard_context = Some(conflict.action.context());
@@ -2062,8 +2066,8 @@ fn command_conflict_summary(
                     }
                     if let Some(other) = conflict.other_action {
                         if ui
-                            .button(other.ini_name())
-                            .on_hover_text(other.description())
+                            .button(compact_key_action_label(other))
+                            .on_hover_text(format!("{}\n{}", other.description(), other.ini_name()))
                             .clicked()
                         {
                             state.operation_keyboard_context = Some(other.context());
@@ -2312,7 +2316,11 @@ fn command_editor_for_action(
                     Some(conflict.action)
                 };
                 if let Some(other) = other {
-                    if ui.button(other.ini_name()).clicked() {
+                    if ui
+                        .button(compact_key_action_label(other))
+                        .on_hover_text(format!("{}\n{}", other.description(), other.ini_name()))
+                        .clicked()
+                    {
                         select_command_action(state, other);
                     }
                 } else if let Some(name) = conflict.reserved_name {
