@@ -1,7 +1,8 @@
 use super::*;
 use crate::keymap::{
-    MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId, menu_command_spec,
-    menu_commands_for_parent,
+    BindingConflict, BindingConflictKind, KeyAction, KeyTrigger, Keymap, MenuCommandId,
+    MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId, menu_command_spec,
+    menu_commands_for_parent, parse_chord_for_action,
 };
 use crate::ring_shortcut::{
     RingActionId, RingDirection, RingShortcutContext, RingShortcutSettings,
@@ -10,7 +11,7 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
     Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, UiTheme,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(egui::RichText::new("テーマ").strong());
@@ -485,6 +486,399 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
     ui.add_space(8.0);
     for &context in RingShortcutContext::all() {
         mouse_button_context_editor(ui, settings, context);
+    }
+}
+
+pub(super) fn page_command_settings(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
+    ui.small("Esc / Enter / 修飾なし矢印など、文脈依存が強い固定操作は現在の対象外です。");
+    ui.add_space(8.0);
+
+    let keymap = Keymap::from_settings(&state.settings.keymap);
+    let conflicts = keymap.binding_conflicts();
+    command_conflict_summary(ui, state, &conflicts);
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label("絞り込み");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.command_filter)
+                .hint_text("Action 名 / 説明 / コンテキスト"),
+        );
+        if ui.button("クリア").clicked() {
+            state.command_filter.clear();
+        }
+        if ui.button("すべて既定に戻す").clicked() {
+            state.settings.keymap.overrides.clear();
+            state.command_edit_loaded_for = None;
+            state.command_edit_error = None;
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.columns(2, |columns| {
+        columns[0].vertical(|ui| {
+            command_list(ui, state, &keymap, &conflicts);
+        });
+        columns[1].vertical(|ui| {
+            command_editor(ui, state, &keymap, &conflicts);
+        });
+    });
+}
+
+fn command_conflict_summary(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    conflicts: &[BindingConflict],
+) {
+    if conflicts.is_empty() {
+        ui.label(
+            egui::RichText::new("競合している割り当てはありません。")
+                .size(11.0)
+                .weak(),
+        );
+        return;
+    }
+
+    ui.group(|ui| {
+        ui.label(
+            egui::RichText::new(format!("競合している割り当て: {} 件", conflicts.len()))
+                .strong()
+                .color(egui::Color32::from_rgb(220, 150, 80)),
+        );
+        ui.small("上から処理される側が優先される場合があります。必要に応じて片方を別キーに変更するか、割り当てを解除してください。");
+
+        egui::Grid::new("command_conflicts")
+            .num_columns(4)
+            .spacing([8.0, 3.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("キー");
+                ui.strong("種類");
+                ui.strong("コマンド");
+                ui.strong("相手");
+                ui.end_row();
+
+                for conflict in conflicts {
+                    ui.monospace(conflict.chord.display_name());
+                    ui.label(binding_conflict_kind_label(conflict.kind));
+                    if ui
+                        .button(conflict.action.ini_name())
+                        .on_hover_text(conflict.action.description())
+                        .clicked()
+                    {
+                        select_command_action(state, conflict.action);
+                    }
+                    if let Some(other) = conflict.other_action {
+                        if ui
+                            .button(other.ini_name())
+                            .on_hover_text(other.description())
+                            .clicked()
+                        {
+                            select_command_action(state, other);
+                        }
+                    } else {
+                        ui.label(conflict.reserved_name.unwrap_or("固定キー"));
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn command_list(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    keymap: &Keymap,
+    conflicts: &[BindingConflict],
+) {
+    let filter = state.command_filter.trim().to_ascii_lowercase();
+    let conflicted = conflicted_actions(conflicts);
+    ui.label(egui::RichText::new("コマンド一覧").strong());
+
+    egui::Grid::new("command_settings_actions")
+        .num_columns(5)
+        .spacing([8.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("編集");
+            ui.strong("Action");
+            ui.strong("キー");
+            ui.strong("場所");
+            ui.strong("状態");
+            ui.end_row();
+
+            for &action in KeyAction::all() {
+                if !command_action_matches_filter(action, &filter) {
+                    continue;
+                }
+                let selected = state.command_selected == Some(action);
+                if ui
+                    .selectable_label(selected, if selected { "選択中" } else { "編集" })
+                    .clicked()
+                {
+                    select_command_action(state, action);
+                }
+
+                ui.label(action.ini_name())
+                    .on_hover_text(action.description());
+
+                let labels = keymap.chord_labels(action);
+                if labels.is_empty() {
+                    ui.label(egui::RichText::new("未設定").weak());
+                } else {
+                    ui.monospace(labels.join(" / "));
+                }
+
+                ui.label(action.context().description());
+
+                let overridden = state
+                    .settings
+                    .keymap
+                    .override_chord_labels(action)
+                    .is_some();
+                let mut status = Vec::new();
+                if overridden {
+                    status.push("上書き");
+                }
+                if conflicted.contains(&action) {
+                    status.push("競合");
+                }
+                if status.is_empty() {
+                    ui.label(egui::RichText::new("既定").weak());
+                } else {
+                    let color = if conflicted.contains(&action) {
+                        egui::Color32::from_rgb(220, 120, 80)
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.label(egui::RichText::new(status.join(" / ")).color(color));
+                }
+                ui.end_row();
+            }
+        });
+}
+
+fn command_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    keymap: &Keymap,
+    conflicts: &[BindingConflict],
+) {
+    ui.label(egui::RichText::new("割り当て編集").strong());
+    let Some(action) = state.command_selected else {
+        ui.small("左の一覧または競合一覧からコマンドを選んでください。");
+        return;
+    };
+
+    ensure_command_editor_loaded(state, keymap, action);
+
+    ui.label(egui::RichText::new(action.ini_name()).strong());
+    ui.label(action.description());
+    ui.small(format!(
+        "{} / {}",
+        action.context().description(),
+        key_trigger_label(action.trigger())
+    ));
+
+    let effective_labels = keymap.chord_labels(action);
+    let effective = if effective_labels.is_empty() {
+        "未設定".to_string()
+    } else {
+        effective_labels.join(" / ")
+    };
+    ui.small(format!("現在の割り当て: {effective}"));
+
+    let override_state = match state.settings.keymap.override_chord_labels(action) {
+        Some(labels) if labels.is_empty() => "上書き: 割り当て解除".to_string(),
+        Some(labels) => format!("上書き: {}", labels.join(" / ")),
+        None => "上書きなし (既定を使用)".to_string(),
+    };
+    ui.small(override_state);
+
+    ui.add_space(8.0);
+    egui::Grid::new("command_editor_slots")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for (idx, input) in state.command_chord_inputs.iter_mut().enumerate() {
+                ui.label(format!("キー {}", idx + 1));
+                ui.add(
+                    egui::TextEdit::singleline(input)
+                        .desired_width(160.0)
+                        .hint_text(if idx == 0 {
+                            "例: Ctrl+F / F13 / none"
+                        } else {
+                            ""
+                        }),
+                );
+                ui.end_row();
+            }
+        });
+    ui.small("空欄は無視します。すべて空欄、または none を入力すると割り当て解除になります。");
+
+    if let Some(error) = &state.command_edit_error {
+        ui.colored_label(egui::Color32::from_rgb(220, 90, 80), error);
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("適用").clicked() {
+            apply_command_editor(state, action);
+        }
+        if ui.button("割り当て解除").clicked() {
+            state.settings.keymap.disable_action(action);
+            state.command_chord_inputs = std::array::from_fn(|_| String::new());
+            state.command_edit_loaded_for = Some(action);
+            state.command_edit_error = None;
+        }
+        if ui.button("既定に戻す").clicked() {
+            state.settings.keymap.remove_override(action);
+            state.command_edit_loaded_for = None;
+            state.command_edit_error = None;
+        }
+    });
+
+    let related: Vec<BindingConflict> = conflicts
+        .iter()
+        .copied()
+        .filter(|conflict| conflict.action == action || conflict.other_action == Some(action))
+        .collect();
+    if !related.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("このコマンドの競合")
+                .strong()
+                .color(egui::Color32::from_rgb(220, 150, 80)),
+        );
+        for conflict in related {
+            ui.horizontal(|ui| {
+                ui.monospace(conflict.chord.display_name());
+                ui.label(binding_conflict_kind_label(conflict.kind));
+                let other = if conflict.action == action {
+                    conflict.other_action
+                } else {
+                    Some(conflict.action)
+                };
+                if let Some(other) = other {
+                    if ui.button(other.ini_name()).clicked() {
+                        select_command_action(state, other);
+                    }
+                } else if let Some(name) = conflict.reserved_name {
+                    ui.label(name);
+                }
+            });
+        }
+    }
+}
+
+fn select_command_action(state: &mut PreferencesState, action: KeyAction) {
+    state.command_selected = Some(action);
+    state.command_edit_loaded_for = None;
+    state.command_edit_error = None;
+}
+
+fn ensure_command_editor_loaded(state: &mut PreferencesState, keymap: &Keymap, action: KeyAction) {
+    if state.command_edit_loaded_for == Some(action) {
+        return;
+    }
+    let labels = state
+        .settings
+        .keymap
+        .override_chord_labels(action)
+        .unwrap_or_else(|| keymap.chord_labels(action));
+    state.command_chord_inputs =
+        std::array::from_fn(|idx| labels.get(idx).cloned().unwrap_or_default());
+    state.command_edit_loaded_for = Some(action);
+    state.command_edit_error = None;
+}
+
+fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
+    let inputs: Vec<String> = state
+        .command_chord_inputs
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if inputs.is_empty() || inputs.iter().any(|s| s.eq_ignore_ascii_case("none")) {
+        state.settings.keymap.disable_action(action);
+        state.command_chord_inputs = std::array::from_fn(|_| String::new());
+        state.command_edit_loaded_for = Some(action);
+        state.command_edit_error = None;
+        return;
+    }
+
+    let mut chords = Vec::new();
+    for input in inputs {
+        match parse_chord_for_action(action, &input) {
+            Ok(Some(chord)) => chords.push(chord),
+            Ok(None) => {
+                state.settings.keymap.disable_action(action);
+                state.command_chord_inputs = std::array::from_fn(|_| String::new());
+                state.command_edit_loaded_for = Some(action);
+                state.command_edit_error = None;
+                return;
+            }
+            Err(err) => {
+                state.command_edit_error = Some(format!("{input}: {err}"));
+                return;
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    for chord in chords.into_iter().take(3) {
+        if !deduped.contains(&chord) {
+            deduped.push(chord);
+        }
+    }
+    if deduped.is_empty() {
+        state.settings.keymap.disable_action(action);
+    } else {
+        state.settings.keymap.set_override_chords(action, deduped);
+    }
+    state.command_edit_loaded_for = None;
+    state.command_edit_error = None;
+}
+
+fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    action.ini_name().to_ascii_lowercase().contains(filter)
+        || action.description().to_ascii_lowercase().contains(filter)
+        || action
+            .context()
+            .description()
+            .to_ascii_lowercase()
+            .contains(filter)
+}
+
+fn conflicted_actions(conflicts: &[BindingConflict]) -> HashSet<KeyAction> {
+    let mut actions = HashSet::new();
+    for conflict in conflicts {
+        actions.insert(conflict.action);
+        if let Some(other) = conflict.other_action {
+            actions.insert(other);
+        }
+    }
+    actions
+}
+
+fn binding_conflict_kind_label(kind: BindingConflictKind) -> &'static str {
+    match kind {
+        BindingConflictKind::Hard => "同じ文脈",
+        BindingConflictKind::ActiveOverlap => "同時有効",
+        BindingConflictKind::TriggerMismatch => "種類違い",
+        BindingConflictKind::Reserved => "固定キー",
+    }
+}
+
+fn key_trigger_label(trigger: KeyTrigger) -> &'static str {
+    match trigger {
+        KeyTrigger::Press => "押下",
+        KeyTrigger::ModifierHold => "修飾キー長押し",
+        KeyTrigger::KeyHold => "キー長押し",
     }
 }
 

@@ -8,8 +8,8 @@
 > **現状メモ (2026-06-25)**: この簡易版で導入した `keymap.ini` は、コマンド設定 GUI へ進むため
 > 初回起動時の移行元になった。現在の正本は `Settings.keymap` (`settings.db`) で、旧
 > `%APPDATA%\mimageviewer\keymap.ini` が残っている場合は 1 回だけ読み込んで同じ override を
-> settings.db に保存し、`keymap.ini.imported*.bak` へ退避する。`keymap.ini.default` は Action 名と
-> 既定キーの参照として引き続き生成する。
+> settings.db に保存し、`keymap.ini.imported*.bak` へ退避する。環境設定「表示 → コマンド」から
+> `Settings.keymap` を編集できる。`keymap.ini.default` は Action 名と既定キーの参照として引き続き生成する。
 
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [key-customization-plan.md](key-customization-plan.md) §8 (簡易版の設計確定事項)。
@@ -39,6 +39,9 @@
   スタックフラット読書中の `Shift+↑/↓` は `FsStackJumpPrev/Next` として `KeyAction`
   化し、egui 動画フルスクリーンの `↑/↓` も `VideoPrevFile/NextFile` を見るようにした。
   `Keymap::resolve_first_action_for_chord` で active scope と優先順の純粋 resolver をテストする。
+- 2026-06-25 の GUI 初期スライスとして、環境設定「表示 → コマンド」から `Settings.keymap` の
+  上書きを編集できるようにした。競合は保存禁止にせず警告表示に留め、競合一覧から該当コマンドの
+  編集欄へ移動できる。
 - Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
   右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは

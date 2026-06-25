@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行スライス実装中** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。環境設定「表示 → コマンド」初期 GUI スライス実装中** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -21,6 +21,14 @@
 > 初回起動時に 1 回だけ読み込み、同じ override を settings.db へ保存してから
 > `keymap.ini.imported*.bak` へ退避する。以後 `keymap.ini` は通常読み込み対象外とし、
 > `keymap.ini.default` は Action 名と既定キーの参照ファイルとして残す。
+>
+> **コマンド設定 GUI 初期スライス実装メモ (2026-06-25, Codex)**:
+> 環境設定「表示 → コマンド」を追加し、`Settings.keymap` の上書きを GUI から編集できるようにする。
+> 一覧は `KeyAction` 全体を対象にし、Action 名 / 説明 / コンテキストで絞り込める。
+> 1 コマンド最大 3 キーを入力でき、割り当て解除・既定復帰・全体既定化を提供する。
+> `BindingConflict` は保存禁止にせず警告として表示し、競合一覧から各コマンドの編集欄へ移動できる。
+> OK 反映時に runtime `Keymap` と native 動画転送用 shortcut snapshot も更新する。
+> マウスジェスチャー、リングショートカット統合、ゲームパッド入力範囲拡張は後続で仕様相談する。
 >
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
 > `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。

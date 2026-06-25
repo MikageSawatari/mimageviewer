@@ -41,6 +41,7 @@ pub(crate) enum PreferencesPage {
     Thumbnail,
     Slideshow,
     Capture,
+    CommandSettings,
     MouseButtons,
     MenuLayout,
     RingShortcut,
@@ -86,6 +87,7 @@ impl PreferencesPage {
             Self::Thumbnail => "サムネイル",
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
+            Self::CommandSettings => "コマンド",
             Self::MouseButtons => "マウスボタン",
             Self::MenuLayout => "メニュー構成",
             Self::RingShortcut => "リングショートカット",
@@ -147,6 +149,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::SpreadMode,
             PreferencesPage::Slideshow,
             PreferencesPage::Capture,
+            PreferencesPage::CommandSettings,
             PreferencesPage::MouseButtons,
             PreferencesPage::MenuLayout,
             PreferencesPage::RingShortcut,
@@ -211,6 +214,11 @@ pub(crate) struct PreferencesState {
     pub book_root_input: String,
     pub startup_folder_path_input: String,
     pub exif_add_tag_input: String,
+    pub command_filter: String,
+    pub command_selected: Option<crate::keymap::KeyAction>,
+    pub command_edit_loaded_for: Option<crate::keymap::KeyAction>,
+    pub command_chord_inputs: [String; 3],
+    pub command_edit_error: Option<String>,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
     /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
@@ -413,6 +421,11 @@ impl PreferencesState {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             exif_add_tag_input: String::new(),
+            command_filter: String::new(),
+            command_selected: None,
+            command_edit_loaded_for: None,
+            command_chord_inputs: std::array::from_fn(|_| String::new()),
+            command_edit_error: None,
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
             auto_thread_count,
@@ -678,6 +691,7 @@ impl App {
                 let new_ai_backend = state.settings.ai_backend.clone();
                 let old_ai_feature_mode = self.settings.ai_feature_mode;
                 let old_reading_history_limit = self.settings.reading_history_limit;
+                let old_keymap_settings = self.settings.keymap.clone();
 
                 // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
                 // 無効化トリガに使う)
@@ -728,6 +742,14 @@ impl App {
                     .reading_history_limit
                     .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
                 self.settings = state.settings;
+                if old_keymap_settings != self.settings.keymap {
+                    let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
+                    for warning in keymap.warnings() {
+                        crate::logger::log(format!("[keymap] {warning}"));
+                    }
+                    keymap.install_global_native_video_shortcuts();
+                    self.keymap = keymap;
+                }
                 // (フォルダ履歴 / A・B 記憶のクリアは v2.0.0 でフォルダバーの右クリック
                 //  メニューへ移動。環境設定 OK 経路でのクリア要求は廃止。)
                 if old_reading_history_limit != self.settings.reading_history_limit {
@@ -1199,6 +1221,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
+        PreferencesPage::CommandSettings => page_command_settings(ui, state),
         PreferencesPage::MouseButtons => page_mouse_buttons(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),
         PreferencesPage::RingShortcut => page_ring_shortcut(ui, state),

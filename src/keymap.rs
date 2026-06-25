@@ -4052,6 +4052,34 @@ impl KeymapSettings {
         result.imported = true;
         result
     }
+
+    pub fn override_chord_labels(&self, action: KeyAction) -> Option<Vec<String>> {
+        self.overrides
+            .iter()
+            .find(|binding| KeyAction::parse_ini_name(&binding.action) == Some(action))
+            .map(|binding| binding.chords.clone())
+    }
+
+    pub fn set_override_chords(&mut self, action: KeyAction, chords: Vec<Chord>) {
+        self.remove_override(action);
+        self.overrides.push(KeyBindingOverride {
+            action: action.ini_name().to_string(),
+            chords: chords.into_iter().map(Chord::display_name).collect(),
+        });
+    }
+
+    pub fn disable_action(&mut self, action: KeyAction) {
+        self.remove_override(action);
+        self.overrides.push(KeyBindingOverride {
+            action: action.ini_name().to_string(),
+            chords: Vec::new(),
+        });
+    }
+
+    pub fn remove_override(&mut self, action: KeyAction) {
+        self.overrides
+            .retain(|binding| KeyAction::parse_ini_name(&binding.action) != Some(action));
+    }
 }
 
 #[cfg(windows)]
@@ -4287,6 +4315,21 @@ fn parse_setting_chords(
     } else {
         Some(chords)
     }
+}
+
+pub fn parse_chord_for_action(action: KeyAction, text: &str) -> Result<Option<Chord>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let chord = parse_chord(trimmed)?;
+    chord
+        .validate_for_trigger(action.trigger())
+        .map_err(str::to_string)?;
+    Ok(Some(chord))
 }
 
 fn parse_chord(rhs: &str) -> Result<Chord, String> {
@@ -5725,6 +5768,70 @@ mod tests {
             vec![Chord::ctrl_shift(KeyName::S)]
         );
         assert!(restored.effective_chords(KeyAction::FsSlideshow).is_empty());
+    }
+
+    #[test]
+    fn keymap_settings_edit_helpers_set_disable_and_restore_default() {
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(
+            KeyAction::GridToggleStackMode,
+            vec![Chord::ctrl_shift(KeyName::S), Chord::key(KeyName::F13)],
+        );
+        assert_eq!(
+            settings.override_chord_labels(KeyAction::GridToggleStackMode),
+            Some(vec!["Ctrl+Shift+S".to_string(), "F13".to_string()])
+        );
+        let keymap = Keymap::from_settings(&settings);
+        assert_eq!(
+            keymap.effective_chords(KeyAction::GridToggleStackMode),
+            vec![Chord::ctrl_shift(KeyName::S), Chord::key(KeyName::F13)]
+        );
+
+        settings.disable_action(KeyAction::GridToggleStackMode);
+        assert_eq!(
+            settings.override_chord_labels(KeyAction::GridToggleStackMode),
+            Some(Vec::new())
+        );
+        let keymap = Keymap::from_settings(&settings);
+        assert!(
+            keymap
+                .effective_chords(KeyAction::GridToggleStackMode)
+                .is_empty()
+        );
+
+        settings.remove_override(KeyAction::GridToggleStackMode);
+        assert_eq!(
+            settings.override_chord_labels(KeyAction::GridToggleStackMode),
+            None
+        );
+        let keymap = Keymap::from_settings(&settings);
+        assert!(
+            keymap
+                .effective_chords(KeyAction::GridToggleStackMode)
+                .is_empty()
+        );
+
+        settings.set_override_chords(KeyAction::GridPin, vec![Chord::key(KeyName::F13)]);
+        assert_eq!(
+            Keymap::from_settings(&settings).effective_chords(KeyAction::GridPin),
+            vec![Chord::key(KeyName::F13)]
+        );
+        settings.remove_override(KeyAction::GridPin);
+        assert_eq!(
+            Keymap::from_settings(&settings).effective_chords(KeyAction::GridPin),
+            vec![Chord::key(KeyName::P)]
+        );
+    }
+
+    #[test]
+    fn parse_chord_for_action_validates_trigger_shape() {
+        assert_eq!(
+            parse_chord_for_action(KeyAction::GridPin, "F13"),
+            Ok(Some(Chord::key(KeyName::F13)))
+        );
+        assert_eq!(parse_chord_for_action(KeyAction::GridPin, "none"), Ok(None));
+        assert!(parse_chord_for_action(KeyAction::FsLoupeHold, "Ctrl+F13").is_err());
+        assert!(parse_chord_for_action(KeyAction::EraseSpacePan, "Ctrl+Space").is_err());
     }
 
     #[test]

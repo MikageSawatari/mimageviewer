@@ -661,7 +661,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 
 ## 7. キーボード操作
 
-一部のキーボード操作は環境設定のコマンド設定で変更できる。設定は
+一部のキーボード操作は環境設定「表示 → コマンド」で変更できる。設定は
 `Settings.keymap` として `%APPDATA%\mimageviewer\settings.db` に保存する。旧形式の
 `%APPDATA%\mimageviewer\keymap.ini` が残っている場合は、初回起動時に 1 回だけ読み込んで
 同じ割り当てを settings.db へ移行し、`keymap.ini.imported*.bak` へリネームする。
@@ -674,6 +674,8 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
 Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に警告ログを出すが、
 設定自体は読み込む。競合はコマンド設定画面上でも warning として扱い、保存禁止にはしない。
+競合一覧の各コマンド名から該当コマンドの編集欄へ移動でき、片方を別キーに変更したり
+割り当て解除したりできる。
 OS クリップボード / D&D の割り当て変更は対象外。
 消しゴム / 隠蔽加工パネルの描画・消去ボタンとツールボタンは、修飾なし単独キーの
 場合だけ実割り当てを `[B]` のような compact 表示に反映する。
@@ -1114,6 +1116,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `toolbar_{cols,aspect,sort,favorites,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_{favorites,tags,bookshelf}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。欠落時や空設定は既定メニュー構成として扱う |
+| `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。環境設定「表示 → コマンド」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | ウィンドウ位置・サイズ（自動保存） |
 
