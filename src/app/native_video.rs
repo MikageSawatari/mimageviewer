@@ -6401,7 +6401,11 @@ impl App {
             }
             if event.down {
                 self.native_video_last_move_client = Some((event.x, event.y));
-                if self.settings.ring_shortcuts.mouse_flick_enabled {
+                if self
+                    .settings
+                    .ring_shortcuts
+                    .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::VideoFullscreen)
+                {
                     self.start_mouse_ring_flick(
                         ctx,
                         crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
@@ -6511,7 +6515,12 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
-        if self.settings.ring_shortcuts.mouse_flick_enabled || self.fs_context_menu_idx.is_some() {
+        if self
+            .settings
+            .ring_shortcuts
+            .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::VideoFullscreen)
+            || self.fs_context_menu_idx.is_some()
+        {
             return;
         }
         let Some((start_time, pos)) = self.native_video_secondary_press_start else {

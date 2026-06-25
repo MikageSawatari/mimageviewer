@@ -5,7 +5,8 @@ use crate::keymap::{
     menu_commands_for_parent, parse_chord_for_action,
 };
 use crate::ring_shortcut::{
-    RingActionId, RingDirection, RingShortcutContext, RingShortcutSettings,
+    RightDragContext, RightDragMode, RingActionId, RingDirection, RingShortcutContext,
+    RingShortcutSettings,
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
@@ -463,13 +464,19 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
 pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let settings = &mut state.settings.ring_shortcuts;
 
-    ui.checkbox(
-        &mut settings.mouse_flick_enabled,
-        "マウス右ドラッグ / 長押しでフリックを有効にする",
-    )
-    .on_hover_text("OFF のときも、右短タップの既存動作はそのまま使えます。");
-    ui.small("ゲームパッド X は常にリング/ピッカーとして使えます。マウス右ドラッグは誤操作を避けるため既定 OFF です。");
-    ui.small("X 単体で開くピッカーパネルの項目は固定で、この画面では変更しません。");
+    ui.label(egui::RichText::new("マウス右ドラッグ").strong());
+    ui.small("右ドラッグの用途を文脈ごとに選びます。未使用の文脈では、右クリックや既存の短押し動作を優先します。");
+    egui::Grid::new("right_drag_mode_grid")
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            for &context in RightDragContext::all() {
+                right_drag_mode_combo(ui, settings, context);
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.small("ゲームパッド X は常にリング/ピッカーとして使えます。X 単体で開くピッカーパネルの項目は固定で、この画面では変更しません。");
 
     ui.add_space(10.0);
     for &context in RingShortcutContext::all() {
@@ -1223,6 +1230,40 @@ fn write_menu_layout_hidden(layout: &mut MenuLayoutSettings, hidden: &BTreeSet<M
         .collect();
 }
 
+fn right_drag_mode_combo(
+    ui: &mut egui::Ui,
+    settings: &mut RingShortcutSettings,
+    context: RightDragContext,
+) {
+    ui.label(context.label());
+    let mut mode = settings.right_drag_mode(context);
+    egui::ComboBox::from_id_salt(("right_drag_mode", context))
+        .width(220.0)
+        .selected_text(mode.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut mode,
+                RightDragMode::Disabled,
+                RightDragMode::Disabled.label(),
+            );
+            if context.ring_context().is_some() {
+                ui.selectable_value(
+                    &mut mode,
+                    RightDragMode::RingShortcut,
+                    RightDragMode::RingShortcut.label(),
+                );
+            } else {
+                ui.add_enabled(false, egui::Label::new(RightDragMode::RingShortcut.label()))
+                    .on_hover_text(
+                        "編集モードのリング割り当ては未対応です。ジェスチャを使ってください。",
+                    );
+            }
+            ui.add_enabled(false, egui::Label::new(RightDragMode::MouseGesture.label()))
+                .on_hover_text("ジェスチャ登録と入力処理は次のスライスで有効化します。");
+        });
+    settings.set_right_drag_mode(context, mode);
+    ui.end_row();
+}
 fn mouse_button_context_editor(
     ui: &mut egui::Ui,
     settings: &mut RingShortcutSettings,

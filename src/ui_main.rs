@@ -8925,7 +8925,10 @@ impl App {
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         let mut nav = None;
         if !self.items_are_drive_list
-            && self.settings.ring_shortcuts.mouse_flick_enabled
+            && self
+                .settings
+                .ring_shortcuts
+                .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::Grid)
             && let Some(pos) = ctx.input(|i| {
                 i.pointer
                     .secondary_pressed()
@@ -9257,7 +9260,12 @@ impl App {
         ctx: &egui::Context,
         rect: egui::Rect,
     ) {
-        if !self.settings.ring_shortcuts.mouse_flick_enabled || self.items_are_drive_list {
+        if !self
+            .settings
+            .ring_shortcuts
+            .mouse_ring_enabled(crate::ring_shortcut::RingShortcutContext::Grid)
+            || self.items_are_drive_list
+        {
             return;
         }
         if self.mouse_ring_flick.is_some() {

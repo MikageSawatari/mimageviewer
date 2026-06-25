@@ -7998,7 +7998,11 @@ impl App {
             // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
             // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
 
-            if self.settings.ring_shortcuts.mouse_flick_enabled {
+            if self
+                .settings
+                .ring_shortcuts
+                .mouse_ring_enabled(self.current_ring_shortcut_context())
+            {
                 if secondary_in_seek_panel {
                     self.cancel_mouse_ring_flick();
                 } else if secondary_pressed {
@@ -8030,7 +8034,10 @@ impl App {
                 self.fs_secondary_press_start = Some((std::time::Instant::now(), secondary_pos));
             }
 
-            if !self.settings.ring_shortcuts.mouse_flick_enabled
+            if !self
+                .settings
+                .ring_shortcuts
+                .mouse_ring_enabled(self.current_ring_shortcut_context())
                 && let Some((start_time, start_pos)) = self.fs_secondary_press_start
             {
                 let elapsed = start_time.elapsed();

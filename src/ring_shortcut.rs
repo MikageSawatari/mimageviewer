@@ -51,6 +51,114 @@ impl RingShortcutContext {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RightDragContext {
+    Grid,
+    ImageFullscreen,
+    VideoFullscreen,
+    EditMode,
+}
+
+impl RightDragContext {
+    pub fn all() -> &'static [Self] {
+        const ALL: [RightDragContext; 4] = [
+            RightDragContext::Grid,
+            RightDragContext::ImageFullscreen,
+            RightDragContext::VideoFullscreen,
+            RightDragContext::EditMode,
+        ];
+        &ALL
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grid => "グリッド",
+            Self::ImageFullscreen => "画像フルスクリーン",
+            Self::VideoFullscreen => "動画フルスクリーン",
+            Self::EditMode => "編集モード",
+        }
+    }
+
+    pub fn ring_context(self) -> Option<RingShortcutContext> {
+        match self {
+            Self::Grid => Some(RingShortcutContext::Grid),
+            Self::ImageFullscreen => Some(RingShortcutContext::ImageFullscreen),
+            Self::VideoFullscreen => Some(RingShortcutContext::VideoFullscreen),
+            Self::EditMode => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RightDragMode {
+    Disabled,
+    RingShortcut,
+    MouseGesture,
+    Unknown(String),
+}
+
+impl RightDragMode {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::RingShortcut => "ring_shortcut",
+            Self::MouseGesture => "mouse_gesture",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "disabled" | "none" | "" => Self::Disabled,
+            "ring_shortcut" | "ring" => Self::RingShortcut,
+            "mouse_gesture" | "gesture" => Self::MouseGesture,
+            _ => return None,
+        })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Disabled => "未使用",
+            Self::RingShortcut => "リングショートカット",
+            Self::MouseGesture => "マウスジェスチャ",
+            Self::Unknown(_) => "不明な設定",
+        }
+    }
+
+    pub fn effective(&self) -> Self {
+        match self {
+            Self::Disabled => Self::Disabled,
+            Self::RingShortcut => Self::RingShortcut,
+            Self::MouseGesture => Self::MouseGesture,
+            Self::Unknown(_) => Self::Disabled,
+        }
+    }
+}
+
+impl Default for RightDragMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl Serialize for RightDragMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RightDragMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_str(&value).unwrap_or(Self::Unknown(value)))
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RingDirection {
     Up,
     UpRight,
@@ -742,8 +850,18 @@ impl Default for RingShortcutProfile {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RingShortcutSettings {
+    // Compatibility only: old builds used this as a global right-drag ring toggle.
+    // Missing per-context modes inherit this value; new UI writes right_drag_*.
     #[serde(default)]
     pub mouse_flick_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_drag_grid: Option<RightDragMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_drag_image: Option<RightDragMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_drag_video: Option<RightDragMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_drag_edit: Option<RightDragMode>,
     // Compatibility only: X ring/picker is always enabled. Old saved `false`
     // values are normalized during Settings::load()/sanitize().
     #[serde(default = "default_true")]
@@ -774,6 +892,48 @@ pub struct RingShortcutSettings {
 }
 
 impl RingShortcutSettings {
+    pub fn right_drag_mode(&self, context: RightDragContext) -> RightDragMode {
+        let configured = match context {
+            RightDragContext::Grid => &self.right_drag_grid,
+            RightDragContext::ImageFullscreen => &self.right_drag_image,
+            RightDragContext::VideoFullscreen => &self.right_drag_video,
+            RightDragContext::EditMode => &self.right_drag_edit,
+        };
+        if let Some(mode) = configured {
+            return mode.effective();
+        }
+        if self.mouse_flick_enabled && context.ring_context().is_some() {
+            RightDragMode::RingShortcut
+        } else {
+            RightDragMode::Disabled
+        }
+    }
+
+    pub fn set_right_drag_mode(&mut self, context: RightDragContext, mode: RightDragMode) {
+        let target = match context {
+            RightDragContext::Grid => &mut self.right_drag_grid,
+            RightDragContext::ImageFullscreen => &mut self.right_drag_image,
+            RightDragContext::VideoFullscreen => &mut self.right_drag_video,
+            RightDragContext::EditMode => &mut self.right_drag_edit,
+        };
+        *target = Some(mode.effective());
+    }
+
+    pub fn mouse_ring_enabled(&self, context: RingShortcutContext) -> bool {
+        let right_drag_context = match context {
+            RingShortcutContext::Grid => RightDragContext::Grid,
+            RingShortcutContext::ImageFullscreen => RightDragContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen => RightDragContext::VideoFullscreen,
+        };
+        self.right_drag_mode(right_drag_context) == RightDragMode::RingShortcut
+    }
+
+    fn sanitize_right_drag_mode(mode: &mut Option<RightDragMode>) {
+        if matches!(mode, Some(RightDragMode::Unknown(_))) {
+            *mode = Some(RightDragMode::Disabled);
+        }
+    }
+
     pub fn profile(&self, context: RingShortcutContext) -> &RingShortcutProfile {
         match context {
             RingShortcutContext::Grid => &self.grid,
@@ -829,6 +989,10 @@ impl RingShortcutSettings {
 
     pub fn sanitize(&mut self) {
         self.gamepad_ring_enabled = true;
+        Self::sanitize_right_drag_mode(&mut self.right_drag_grid);
+        Self::sanitize_right_drag_mode(&mut self.right_drag_image);
+        Self::sanitize_right_drag_mode(&mut self.right_drag_video);
+        Self::sanitize_right_drag_mode(&mut self.right_drag_edit);
         self.grid.sanitize(RingShortcutContext::Grid);
         self.image.sanitize(RingShortcutContext::ImageFullscreen);
         self.video.sanitize(RingShortcutContext::VideoFullscreen);
@@ -862,6 +1026,10 @@ impl Default for RingShortcutSettings {
     fn default() -> Self {
         Self {
             mouse_flick_enabled: false,
+            right_drag_grid: None,
+            right_drag_image: None,
+            right_drag_video: None,
+            right_drag_edit: None,
             gamepad_ring_enabled: true,
             shift_wheel_pair: WheelPairActionId::None,
             alt_wheel_pair: WheelPairActionId::None,
@@ -1168,6 +1336,9 @@ mod tests {
     fn default_profiles_match_design_slots() {
         let defaults = RingShortcutSettings::default();
         assert_eq!(defaults.mouse_flick_enabled, false);
+        for &context in RightDragContext::all() {
+            assert_eq!(defaults.right_drag_mode(context), RightDragMode::Disabled);
+        }
         assert_eq!(defaults.gamepad_ring_enabled, true);
         assert_eq!(defaults.shift_wheel_pair, WheelPairActionId::None);
         assert_eq!(defaults.alt_wheel_pair, WheelPairActionId::None);
@@ -1228,6 +1399,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn right_drag_modes_inherit_legacy_toggle_until_configured() {
+        let mut settings = RingShortcutSettings::default();
+        settings.mouse_flick_enabled = true;
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::Grid),
+            RightDragMode::RingShortcut
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::ImageFullscreen),
+            RightDragMode::RingShortcut
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::VideoFullscreen),
+            RightDragMode::RingShortcut
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::EditMode),
+            RightDragMode::Disabled
+        );
+
+        settings.set_right_drag_mode(RightDragContext::Grid, RightDragMode::Disabled);
+        settings.set_right_drag_mode(
+            RightDragContext::ImageFullscreen,
+            RightDragMode::MouseGesture,
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::Grid),
+            RightDragMode::Disabled
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::ImageFullscreen),
+            RightDragMode::MouseGesture
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::VideoFullscreen),
+            RightDragMode::RingShortcut
+        );
+    }
     #[test]
     fn toggle_maximize_action_round_trips_and_is_grid_only() {
         // as_str <-> from_str (設定永続化のラウンドトリップ)。
@@ -1294,6 +1504,8 @@ mod tests {
         settings.mouse_buttons_grid.back = RingActionId::Unknown("future_mouse_button".to_string());
         settings.mouse_buttons_image.forward = RingActionId::VideoCapture;
         settings.mouse_buttons_video.back = RingActionId::ImageCapture;
+        settings.right_drag_grid = Some(RightDragMode::Unknown("future_mode".to_string()));
+        settings.right_drag_image = Some(RightDragMode::MouseGesture);
 
         settings.sanitize();
 
@@ -1310,6 +1522,14 @@ mod tests {
         assert_eq!(settings.mouse_buttons_grid.back, RingActionId::None);
         assert_eq!(settings.mouse_buttons_image.forward, RingActionId::None);
         assert_eq!(settings.mouse_buttons_video.back, RingActionId::None);
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::Grid),
+            RightDragMode::Disabled
+        );
+        assert_eq!(
+            settings.right_drag_mode(RightDragContext::ImageFullscreen),
+            RightDragMode::MouseGesture
+        );
     }
 
     #[test]

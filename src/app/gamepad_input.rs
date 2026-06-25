@@ -254,7 +254,12 @@ impl App {
         full_rect: egui::Rect,
         surface_context: RingShortcutContext,
     ) {
-        if !self.settings.ring_shortcuts.mouse_flick_enabled || self.ring_picker.is_some() {
+        if !self
+            .settings
+            .ring_shortcuts
+            .mouse_ring_enabled(surface_context)
+            || self.ring_picker.is_some()
+        {
             return;
         }
         let Some(flick) = self.mouse_ring_flick.as_ref() else {
@@ -289,7 +294,7 @@ impl App {
         pos: egui::Pos2,
         grid_target_idx: Option<usize>,
     ) {
-        if !self.settings.ring_shortcuts.mouse_flick_enabled || self.ring_picker.is_some() {
+        if !self.settings.ring_shortcuts.mouse_ring_enabled(context) || self.ring_picker.is_some() {
             return;
         }
         if self.mouse_ring_flick.is_some() {
@@ -459,12 +464,16 @@ impl App {
         if self.mouse_ring_suppress_context_menu_once {
             return true;
         }
-        if !self.settings.ring_shortcuts.mouse_flick_enabled {
-            return false;
-        }
         let Some(flick) = self.mouse_ring_flick.as_ref() else {
             return false;
         };
+        if !self
+            .settings
+            .ring_shortcuts
+            .mouse_ring_enabled(flick.context)
+        {
+            return false;
+        }
         if flick.armed {
             return true;
         }
@@ -2810,7 +2819,7 @@ impl App {
                 "方向なしで離すとピッカー",
             );
             (selected, heading, detail, None)
-        } else if self.settings.ring_shortcuts.mouse_flick_enabled {
+        } else if self.settings.ring_shortcuts.mouse_ring_enabled(context) {
             let flick = self.mouse_ring_flick.as_ref()?;
             if flick.context != context || !flick.guide_visible() {
                 return None;
