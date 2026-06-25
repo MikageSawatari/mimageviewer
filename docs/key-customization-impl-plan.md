@@ -382,9 +382,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    `RatingContainer1..5/Clear` に集約する。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
-12. **生 Event::Key / OS 状態参照経路** (F11=ui_fullscreen.rs:3998、
-    pipeline debug=pipeline_debug.rs:104、右 Ctrl の original/source preview 系) は
-   特殊。MVP では keymap 対象外の固定操作。
+12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104、
+    右 Ctrl の original/source preview 系など) は特殊。MVP では keymap 対象外の固定操作。
+    旧 F11 window mode 経路は `FsToggleWindowMode` へ昇格済みで、native 動画 presenter も
+    global shortcut snapshot 経由で同じ effective chord を使う。
 13. **ゲームパッドは固定**: `src/app/gamepad_input.rs` は閲覧専用の物理ボタン/軸入力として扱い、
     keymap.ini の対象にしない。docs/keymap-spec.md のゲームパッド節と同じ方針。
 
@@ -479,11 +480,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### Grid (Ph4)
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpen `Enter`(予約) /
-  GridParent `Backspace`(予約) / GridToggleCheck `Space` (P)
+  GridParentFolder `Backspace` (P) / GridToggleCheck `Space` (P)
 - GridTreePrev/Next `Ctrl+↑/↓` (P) / GridSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - GridParentAlt `Alt+↑` (P) / GridHistoryBack/Forward `Alt+←/→` (P)
 - GridHome/End/PageUp/PageDown (P)(予約候補)
-- GridToggleFolderTreePane `F` (P) / GridDelete `Delete` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
+- GridToggleFolderTreePane `F` (P) / GridToggleMaximize `F11` (P) /
+  GridDelete `Delete` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
   GridPin `P` (P) / GridCompareX `X` (P)
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
@@ -499,8 +501,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   - keymap-spec では画像/動画共通だが、native 動画経路では転送 whitelist に I/Tab が無い。
     Ph5 で「FsCommon に置くか、FsImage 専用にするか」を実コードで確定する。
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
-- FsToggleWindowMode `F11` (固定。リングショートカットでは画像・動画フルスクリーンの
-  一発アクションとして同等操作を割り当て可能)
+- FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
+  presenter へ転送する global snapshot に載せる。
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
@@ -539,7 +541,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - VideoMute `M` / VideoLoop `L` / VideoMarkerPrev `J` / VideoMarkerNext `K`
 - VideoPin `P` / VideoPerfOverlay `F` / VideoTileMode `S` / VideoBookmark `B`
 - VideoCapture `Ctrl+S`
-- VideoToggleWindowMode `F11` (固定)
+- FsToggleWindowMode `F11` (P、FsCommon。動画 native presenter 経路も同じ Action の
+  effective chord で転送する)
 - VideoCompareNoop `X/C/Shift+C/Alt+C`、タイル中カーソル、Ctrl+ホイール列数切替は固定。
 - native presenter 側の `native_video_fullscreen_shortcut_key` に載るキーだけ UI へ転送されるため、
   Ph5 ではこの whitelist と `KeyAction` を同時に更新する。Global の

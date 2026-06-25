@@ -743,6 +743,7 @@ pub struct NativeOverlayShortcutLabels {
     pub marker_next: Option<String>,
     pub pin: Option<String>,
     pub perf_overlay: Option<String>,
+    pub window_mode: Option<String>,
     pub tile_mode: Option<String>,
     pub bookmark: Option<String>,
     pub capture: Option<String>,
@@ -8505,6 +8506,7 @@ mod tests {
 
     #[test]
     fn native_overlay_routes_shortcuts_even_when_button_has_focus() {
+        crate::keymap::Keymap::empty().install_global_native_video_shortcuts();
         let routing = NativeOverlayInputRouting {
             wants_keyboard_input: true,
             text_input_active: false,
@@ -8533,6 +8535,7 @@ mod tests {
 
     #[test]
     fn native_overlay_keeps_shortcuts_while_text_input_is_active() {
+        crate::keymap::Keymap::empty().install_global_native_video_shortcuts();
         let routing = NativeOverlayInputRouting {
             wants_keyboard_input: true,
             text_input_active: true,
@@ -8557,6 +8560,7 @@ mod tests {
     /// の値に関わらずキーを一切 App へ転送しないこと (focus が無い瞬間も塞ぐ)。
     #[test]
     fn native_overlay_never_forwards_keys_while_text_input_active_without_focus() {
+        crate::keymap::Keymap::empty().install_global_native_video_shortcuts();
         let routing = NativeOverlayInputRouting {
             wants_keyboard_input: false,
             text_input_active: true,

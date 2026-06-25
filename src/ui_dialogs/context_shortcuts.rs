@@ -30,7 +30,7 @@ const GRID_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "選択中の動画を外部プレイヤーで開く",
     },
     FixedShortcutRow {
-        keys: "Backspace / Alt+↑",
+        keys: "Alt+↑",
         description: "親フォルダまたは検索結果の上位階層へ戻る",
     },
     FixedShortcutRow {
@@ -61,10 +61,6 @@ const GRID_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         keys: "Ctrl+PageUp / Ctrl+PageDown",
         description: "前または次の兄弟フォルダへ移動する",
     },
-    FixedShortcutRow {
-        keys: "F11",
-        description: "メインウィンドウを最大化または復元する",
-    },
 ];
 
 const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
@@ -87,10 +83,6 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "Home / End",
         description: "先頭または末尾の項目へ移動する",
-    },
-    FixedShortcutRow {
-        keys: "F11",
-        description: "ウィンドウ内表示と全画面表示を切り替える",
     },
     FixedShortcutRow {
         keys: "Ctrl+Alt+Shift+D",
@@ -130,10 +122,6 @@ const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "Home / End",
         description: "先頭または末尾の項目へ移動する",
-    },
-    FixedShortcutRow {
-        keys: "F11",
-        description: "ウィンドウ内表示と全画面表示を切り替える",
     },
     FixedShortcutRow {
         keys: "マウスホイール",
@@ -460,6 +448,7 @@ impl App {
 fn video_help_includes_row(row: &CommandDisplayRow) -> bool {
     match row.spec.action {
         KeyAction::ToggleDetachedViewerMode
+        | KeyAction::FsToggleWindowMode
         | KeyAction::FsCtrlNavPrev
         | KeyAction::FsCtrlNavNext
         | KeyAction::FsSiblingPrev

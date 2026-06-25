@@ -95,15 +95,15 @@
 > **Phase 5 フルスクリーンホバーバー表示スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `Keymap::first_chord_bracket_label()` / `chord_list_bracket_label()` を追加し、静止画
 > フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット popup の
-> shortcut 表記を実 keymap から表示するようにした。`Esc` / `F11` は固定扱いのまま。
+> shortcut 表記を実 keymap から表示するようにした。当時 `Esc` / `F11` は固定扱いのまま。
 > native 動画 overlay は当時後続に残した（後続スライスで対応済み）。
 >
 > **Phase 5 native 動画 overlay 表示スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `NativeOverlayShortcutLabels` を `NativeOverlayMetadata` に載せ、App 側で現在の
 > `keymap.ini` effective chord から作った表示用 snapshot を native presenter へ渡すようにした。
 > 動画 top bar / bottom HUD / jump panel / seek hover thumbnail の KeyAction 由来 shortcut 表記を
-> この snapshot から表示する。`Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの
-> 入力は従来どおり。
+> この snapshot から表示する。当時 `Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの
+> 入力は従来どおり。現在は F11 window mode を `FsToggleWindowMode` として keymap 対象に昇格済み。
 >
 > **Phase 5 レーティング tooltip 表示スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > `Keymap::first_rating_chord_label()` / `rating_chord_summary_label()` を追加し、★フィルタ
@@ -120,7 +120,7 @@
 > **Phase 7 グリッドヘルプ初期スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > グリッド文脈に限り、固定 `?` キーで「ショートカット」ダイアログを開く。Keymap 化済み操作は
 > `GRID_ACTIVE_SCOPES` + `CommandDisplayRow` から実 effective chord を表示し、Enter / Backspace /
-> 矢印 / F11 など当面固定扱いのグリッド操作は補助行として表示する。テキスト入力・IME・既存
+> 矢印 / F11 など当時固定扱いのグリッド操作は補助行として表示する。テキスト入力・IME・既存
 > ダイアログ・フルスクリーン中は誤発火させない。画像 / 動画フルスクリーン、編集モード、
 > `?` 自体の KeyAction 化は後続。
 >
@@ -164,7 +164,7 @@
 > 表示対象は `FsVideo` scope と、動画中にも実際に届く `Rating` / `FsCommon` の一部
 > (`FsToggleMetadata`, `FsCtrlNav*`, `FsSibling*`) に限定する。`VideoCompare*` は動画では
 > silent no-op として消費するだけなので、ヘルプには出さない。Esc / Backspace / シーク /
-> Home / End / F11 / ホイールなどの固定扱い入力は補助行へ分ける。native 動画 overlay 上で
+> Home / End / F11 / ホイールなど当時固定扱いだった入力は補助行へ分ける。native 動画 overlay 上で
 > 直接開くヘルプは後続スライスに残す。
 >
 > **Phase 7 native 動画 overlay ヘルプスライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
@@ -666,10 +666,11 @@ pub enum BindingPolicy {
   search bar hover text を `first_chord_action_label()` 由来にした。
 - **フルスクリーンホバーバー表示スライス実装済み**: 静止画フルスクリーンの上部ホバーバー
   tooltip と、表示モード / ズーム・フィット popup の shortcut 表記を実 keymap 由来にした。
-  `Esc` / `F11` は固定扱い。
+  当時 `Esc` / `F11` は固定扱い。現在は F11 window mode を `FsToggleWindowMode` として keymap 対象に昇格済み。
 - **native 動画 overlay 表示スライス実装済み**: App 側で `NativeOverlayShortcutLabels` を作り、
   top bar / bottom HUD / jump panel / seek hover thumbnail の shortcut 表記を実 keymap 由来にした。
-  `Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
+  当時 `Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。現在は
+  F11 window mode を `FsToggleWindowMode` として keymap 対象に昇格済み。
 - **レーティング tooltip 表示スライス実装済み**: ★フィルタとフォルダバー右側のコンテナ★
   tooltip に表示する `F1〜F6` / `Shift+F1〜F6` を、`RatingItem*` / `RatingContainer*`
   の effective chord 由来にした。
@@ -728,8 +729,9 @@ pub enum BindingPolicy {
   `CommandSpec` と effective chord の表示ラベルを取り出せるようにする。UI はまだ作らず、
   dispatch も変えない。
 - **グリッドヘルプ初期スライス実装済み**: 当時は `?` を固定ヘルプキーとして扱い、グリッド文脈だけ
-  「ショートカット」ダイアログを開く。keymap 化済み操作は実割り当てから表示し、Enter /
-  Backspace / 矢印など予約・固定扱いの操作は補助行で表示する。
+  「ショートカット」ダイアログを開く。keymap 化済み操作は実割り当てから表示し、当時
+  Enter / Backspace / 矢印など予約・固定扱いの操作は補助行で表示していた。現在は
+  Backspace 親フォルダ移動を `GridParentFolder` として keymap 対象に昇格済み。
 - **グリッドヘルプ未設定表示スライス実装済み**: キー未設定 / 明示無効化中の操作を別枠で表示し、
   既定キーなしの割り当て可能操作を見つけられるようにする。
 - **画像フルスクリーンヘルプスライス実装済み**: 通常の画像フルスクリーンで `?` を押したとき、

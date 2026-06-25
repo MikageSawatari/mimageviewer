@@ -813,6 +813,8 @@ pub enum KeyAction {
     GridDeselect,
     GridToggleCheck,
     GridDelete,
+    GridParentFolder,
+    GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
     GridTagApply,
@@ -851,6 +853,7 @@ pub enum KeyAction {
     GridDeleteEraseMask,
     GridDeleteConcealMask,
     FsToggleMetadata,
+    FsToggleWindowMode,
     FsCtrlNavPrev,
     FsCtrlNavNext,
     FsSiblingPrev,
@@ -1021,6 +1024,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
+    KeyAction::GridParentFolder,
+    KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
     KeyAction::GridTagApply,
@@ -1059,6 +1064,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeleteEraseMask,
     KeyAction::GridDeleteConcealMask,
     KeyAction::FsToggleMetadata,
+    KeyAction::FsToggleWindowMode,
     KeyAction::FsCtrlNavPrev,
     KeyAction::FsCtrlNavNext,
     KeyAction::FsSiblingPrev,
@@ -1838,6 +1844,8 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
+            GridParentFolder => "GridParentFolder",
+            GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
             GridTagApply => "GridTagApply",
@@ -1876,6 +1884,7 @@ impl KeyAction {
             GridDeleteEraseMask => "GridDeleteEraseMask",
             GridDeleteConcealMask => "GridDeleteConcealMask",
             FsToggleMetadata => "FsToggleMetadata",
+            FsToggleWindowMode => "FsToggleWindowMode",
             FsCtrlNavPrev => "FsCtrlNavPrev",
             FsCtrlNavNext => "FsCtrlNavNext",
             FsSiblingPrev => "FsSiblingPrev",
@@ -2056,6 +2065,8 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
+            GridParentFolder => "親フォルダへ移動する",
+            GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
             GridTagApply => "タグを付ける/外すダイアログを開く",
@@ -2094,6 +2105,7 @@ impl KeyAction {
             GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
             GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
             FsToggleMetadata => "メタデータパネルの固定表示を切り替える",
+            FsToggleWindowMode => "ウィンドウ表示と全画面表示を切り替える",
             FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
@@ -2267,6 +2279,8 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridParentFolder
+            | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
             | GridTagApply
@@ -2304,9 +2318,8 @@ impl KeyAction {
             | GridApplyConceal2
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
-            FsToggleMetadata | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
-                KeyContext::FsCommon
-            }
+            FsToggleMetadata | FsToggleWindowMode | FsCtrlNavPrev | FsCtrlNavNext
+            | FsSiblingPrev | FsSiblingNext => KeyContext::FsCommon,
             RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
             | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
             | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
@@ -2413,6 +2426,8 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridParentFolder
+            | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
             | GridTagApply
@@ -2451,6 +2466,7 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask
             | FsToggleMetadata
+            | FsToggleWindowMode
             | FsCtrlNavPrev
             | FsCtrlNavNext
             | FsSiblingPrev
@@ -2618,6 +2634,8 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
+            GridParentFolder => ChordList::one(Chord::key(Backspace)),
+            GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
@@ -2656,6 +2674,7 @@ impl KeyAction {
             GridDeleteEraseMask => ChordList::two(Chord::shift(F7), Chord::shift(F8)),
             GridDeleteConcealMask => ChordList::two(Chord::shift(F9), Chord::shift(F10)),
             FsToggleMetadata => ChordList::two(Chord::key(I), Chord::key(Tab)),
+            FsToggleWindowMode => ChordList::one(Chord::key(F11)),
             FsCtrlNavPrev => ChordList::one(Chord::ctrl(Up)),
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
@@ -3697,6 +3716,7 @@ impl Keymap {
         for action in KeyAction::all().iter().copied().filter(|action| {
             matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
                 || *action == KeyAction::ToggleDetachedViewerMode
+                || *action == KeyAction::FsToggleWindowMode
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -4134,6 +4154,7 @@ pub fn native_video_fullscreen_shortcut_key(
         .filter(|action| {
             matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
                 || *action == KeyAction::ToggleDetachedViewerMode
+                || *action == KeyAction::FsToggleWindowMode
         })
         .any(|action| fallback.matches_vk_action(action, key))
 }
@@ -4236,7 +4257,6 @@ fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) ->
             | 0x26 // Up
             | 0x27 // Right
             | 0x28 // Down
-            | 0x7A // F11
             | 0x7B // F12
             | 0xA6 // Browser back
             | 0xA7 // Browser forward
@@ -5017,6 +5037,31 @@ mod tests {
     }
 
     #[test]
+    fn window_and_parent_actions_match_existing_default_shortcuts() {
+        assert_eq!(
+            KeyAction::GridParentFolder.default_chords().iter().next(),
+            Some(Chord::key(KeyName::Backspace))
+        );
+        assert_eq!(
+            KeyAction::GridToggleMaximize.default_chords().iter().next(),
+            Some(Chord::key(KeyName::F11))
+        );
+        assert_eq!(
+            KeyAction::FsToggleWindowMode.default_chords().iter().next(),
+            Some(Chord::key(KeyName::F11))
+        );
+        assert_eq!(KeyAction::GridParentFolder.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridToggleMaximize.context(), KeyContext::Grid);
+        assert_eq!(
+            KeyAction::FsToggleWindowMode.context(),
+            KeyContext::FsCommon
+        );
+        assert_eq!(KeyAction::GridParentFolder.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::GridToggleMaximize.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::FsToggleWindowMode.trigger(), KeyTrigger::Press);
+    }
+
+    #[test]
     fn fullscreen_vertical_resolver_uses_active_scope() {
         let keymap = Keymap::empty();
         let priority = [
@@ -5637,6 +5682,41 @@ mod tests {
         assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
         assert!(!native_video_context_shortcuts_help_key_down(&f1));
         assert!(!native_video_context_shortcuts_help_text_enabled());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_window_mode_shortcut_follows_keymap() {
+        let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&event(0x7A))); // F11
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsCommon]
+            FsToggleWindowMode = F13
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x7A)));
+        assert!(native_video_fullscreen_shortcut_key(&event(0x7C))); // F13
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsCommon]
+            FsToggleWindowMode = none
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x7A)));
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x7C)));
     }
 
     #[cfg(windows)]

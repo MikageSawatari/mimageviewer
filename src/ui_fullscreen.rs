@@ -24,7 +24,10 @@ use std::sync::Arc;
 use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::keymap::{FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, Keymap};
+use crate::keymap::{
+    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
+    KeyTrigger, Keymap, command_catalog,
+};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
 use crate::ui_helpers::{HoverTipExt, open_external_player};
@@ -537,10 +540,9 @@ pub(crate) fn decide_local_adjust_preview_action(
 /// を起動するかどうかを判定する「プローブ」。押されたキーがこの集合に無いフレームは
 /// 実ハンドラ (`handle_fs_key_input` → 動画は `handle_video_input`) を一切呼ばない。
 ///
-/// ⚠️ 再発防止: フルスクリーンのショートカットキーを追加・変更したら **必ずここにも
-/// 追加する**。漏らすと、専用フルスクリーン viewport ではなくメインウィンドウに
-/// フォーカスがある経路 (in-window 動画再生など) でそのキーだけ無反応になる。
-/// 2026-05 に perf オーバーレイを P→F へ移した際、プローブへの F 追加漏れで実害が出た。
+/// 固定入力は下の静的リストで拾い、KeyAction 化済み入力は
+/// `fullscreen_shortcut_event_summary` 側で現在の keymap effective chord を見る。
+/// 2026-05 に perf オーバーレイを P→F へ移した際、静的プローブへの F 追加漏れで実害が出た。
 fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
     matches!(
         key,
@@ -595,7 +597,35 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
     )
 }
 
-fn fullscreen_shortcut_event_summary(ctx: &egui::Context) -> Option<String> {
+fn keymap_fullscreen_probe_matches(
+    keymap: &Keymap,
+    active_scopes: &[CommandScope],
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> bool {
+    if modifiers.mac_cmd {
+        return false;
+    }
+    let Some(key_name) = KeyName::from_egui(key) else {
+        return false;
+    };
+    let chord = Chord::new(modifiers.ctrl, modifiers.shift, modifiers.alt, key_name);
+    command_catalog()
+        .filter(|spec| active_scopes.contains(&spec.scope))
+        .filter(|spec| spec.trigger == KeyTrigger::Press)
+        .any(|spec| {
+            keymap
+                .effective_chords(spec.action)
+                .into_iter()
+                .any(|candidate| candidate == chord)
+        })
+}
+
+fn fullscreen_shortcut_event_summary(
+    ctx: &egui::Context,
+    keymap: &Keymap,
+    active_scopes: &[CommandScope],
+) -> Option<String> {
     let parts = ctx.input(|i| {
         i.events
             .iter()
@@ -607,7 +637,8 @@ fn fullscreen_shortcut_event_summary(ctx: &egui::Context) -> Option<String> {
                     modifiers,
                     ..
                 } = event
-                    && is_fullscreen_shortcut_probe_key(*key)
+                    && (is_fullscreen_shortcut_probe_key(*key)
+                        || keymap_fullscreen_probe_matches(keymap, active_scopes, *key, *modifiers))
                 {
                     Some(format!(
                         "{:?}:{}{}:{:?}",
@@ -633,41 +664,11 @@ fn fullscreen_shortcut_event_summary(ctx: &egui::Context) -> Option<String> {
 /// 黒 backdrop 表示中 (presenter HWND 未確定) に egui 経由で来たキーを
 /// `handle_native_video_key_event` へ渡すために使う。
 ///
-/// ⚠️ 上の `is_fullscreen_shortcut_probe_key` と対で更新すること。動画フルスクリーンの
-/// ショートカットを追加・変更したら、プローブとこの変換表の両方に足す必要がある。
+/// KeyAction 化済み入力は `KeyName` の変換表を正本にする。固定プローブに載せるだけの
+/// 入力でも、`KeyName` 未対応のキーは native VK fallback へは流さない。
 #[cfg(windows)]
 fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
-    Some(match key {
-        egui::Key::Enter => 0x0D,
-        egui::Key::Escape => 0x1B,
-        egui::Key::Space => 0x20,
-        egui::Key::End => 0x23,
-        egui::Key::Home => 0x24,
-        egui::Key::ArrowLeft => 0x25,
-        egui::Key::ArrowUp => 0x26,
-        egui::Key::ArrowRight => 0x27,
-        egui::Key::ArrowDown => 0x28,
-        egui::Key::B => 0x42,
-        egui::Key::C => 0x43,
-        egui::Key::F => 0x46,
-        egui::Key::J => 0x4A,
-        egui::Key::K => 0x4B,
-        egui::Key::L => 0x4C,
-        egui::Key::M => 0x4D,
-        egui::Key::P => 0x50,
-        egui::Key::S => 0x53,
-        egui::Key::W => 0x57,
-        egui::Key::X => 0x58,
-        egui::Key::F1 => 0x70,
-        egui::Key::F2 => 0x71,
-        egui::Key::F3 => 0x72,
-        egui::Key::F4 => 0x73,
-        egui::Key::F5 => 0x74,
-        egui::Key::F6 => 0x75,
-        egui::Key::F11 => 0x7A,
-        egui::Key::F12 => 0x7B,
-        _ => return None,
-    })
+    KeyName::from_egui(key).map(KeyName::to_vk)
 }
 
 #[cfg(windows)]
@@ -4057,7 +4058,15 @@ impl App {
                         let input_t0 = std::time::Instant::now();
 
                         // ── キー入力 ──
-                        if let Some(keys) = fullscreen_shortcut_event_summary(ctx) {
+                        let active_scopes =
+                            if matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
+                                FS_VIDEO_ACTIVE_SCOPES
+                            } else {
+                                FS_IMAGE_ACTIVE_SCOPES
+                            };
+                        if let Some(keys) =
+                            fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes)
+                        {
                             let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
                             crate::logger::log(format!(
                                 "[fs-key] source=fullscreen focused={} foreground=0x{:x} keys={}",
@@ -5645,7 +5654,9 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
-            if let Some(keys) = fullscreen_shortcut_event_summary(ctx) {
+            if let Some(keys) =
+                fullscreen_shortcut_event_summary(ctx, &self.keymap, FS_VIDEO_ACTIVE_SCOPES)
+            {
                 let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
                 crate::logger::log(format!(
                     "[fs-key] source=native-backdrop focused={} foreground=0x{:x} keys={}",
@@ -6020,7 +6031,12 @@ impl App {
             self.show_context_shortcuts_help = true;
             return true;
         }
-        let Some(keys) = fullscreen_shortcut_event_summary(ctx) else {
+        let active_scopes = if matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
+            FS_VIDEO_ACTIVE_SCOPES
+        } else {
+            FS_IMAGE_ACTIVE_SCOPES
+        };
+        let Some(keys) = fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes) else {
             return false;
         };
 
@@ -6684,35 +6700,17 @@ impl App {
         // 動画 presenter のモードと乖離するため。is_video_fs は
         // fs_context_menu_idx.is_none() を含むので使えない (= 純粋な item 種別 check)。
         //
-        // consume_key は repeat 込み + matches_logically で余分な Shift も拾うため、
-        // 厳格に「修飾なし・非 repeat」だけ抜き出す custom event filter を使う。
         #[cfg(windows)]
         {
             let current_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-            if !current_is_video {
-                let f11_pressed = ctx.input_mut(|i| {
-                    let mut found = false;
-                    i.events.retain(|e| {
-                        let consume = matches!(
-                            e,
-                            egui::Event::Key {
-                                key: egui::Key::F11,
-                                pressed: true,
-                                repeat: false,
-                                modifiers,
-                                ..
-                            } if modifiers.is_none()
-                        );
-                        if consume {
-                            found = true;
-                        }
-                        !consume
-                    });
-                    found
-                });
-                if f11_pressed && self.viewer_session_is_detached() {
+            if !current_is_video
+                && self
+                    .keymap
+                    .consume_action_no_repeat(ctx, KeyAction::FsToggleWindowMode)
+            {
+                if self.viewer_session_is_detached() {
                     self.toggle_detached_viewer_borderless_fullscreen(ctx);
-                } else if f11_pressed {
+                } else {
                     self.toggle_still_window_mode();
                     // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの
                     // render_fullscreen_viewport で起きる。ホバーバーボタンと
@@ -12546,11 +12544,18 @@ impl App {
                 in_window_mode,
                 |p, c, r| draw_window_toggle_icon(p, c, r),
             );
-            let wm_resp = wm_resp.hover_tip_dark(if in_window_mode {
-                "全画面表示に切り替え [F11]"
+            let wm_tip = if in_window_mode {
+                keymap.first_chord_bracket_label(
+                    "全画面表示に切り替え",
+                    KeyAction::FsToggleWindowMode,
+                )
             } else {
-                "ウィンドウ内表示に切り替え [F11]"
-            });
+                keymap.first_chord_bracket_label(
+                    "ウィンドウ内表示に切り替え",
+                    KeyAction::FsToggleWindowMode,
+                )
+            };
+            let wm_resp = wm_resp.hover_tip_dark(wm_tip);
             if wm_resp.clicked() {
                 *window_mode_pressed = true;
             }
@@ -16256,48 +16261,20 @@ impl App {
         // フルスクリーン用コンテキストメニュー閉鎖直後など。これらでは F11 が
         // native HWND ではなく egui の root viewport に届く (Codex P1 2026-05)。
         //
-        // 純粋な item 種別 check で動画と判定したフレームで F11 を捕まえ、
-        // 仮想 VK 0x7A を作って native HWND 経路と同じ
-        // `handle_native_video_key_event` の 0x7A arm に流す。これにより
-        // normalize scan ガード、`toggle_video_window_mode` (presenter rebuild
-        // request) など全てのロジックを一本化できる。
-        //
-        // consume_key は repeat 込み + matches_logically で余分な Shift も拾うため、
-        // 厳格に「修飾なし・非 repeat」だけ抜き出す custom event filter を使う。
+        // 純粋な item 種別 check で動画と判定したフレームで keymap 化済みの
+        // FsToggleWindowMode を捕まえる。native HWND 経路では同じ Action を VK 判定する。
         #[cfg(windows)]
         {
             let current_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-            if current_is_video {
-                let f11_pressed = ctx.input_mut(|i| {
-                    let mut found = false;
-                    i.events.retain(|e| {
-                        let consume = matches!(
-                            e,
-                            egui::Event::Key {
-                                key: egui::Key::F11,
-                                pressed: true,
-                                repeat: false,
-                                modifiers,
-                                ..
-                            } if modifiers.is_none()
-                        );
-                        if consume {
-                            found = true;
-                        }
-                        !consume
-                    });
-                    found
-                });
-                if f11_pressed {
-                    let synthetic = crate::video::native_window::NativeVideoKeyEvent {
-                        virtual_key: 0x7A,
-                        shift: false,
-                        ctrl: false,
-                        alt: false,
-                        repeat: false,
-                    };
-                    self.handle_native_video_key_event(ctx, fs_idx, synthetic);
+            if current_is_video
+                && self
+                    .keymap
+                    .consume_action_no_repeat(ctx, KeyAction::FsToggleWindowMode)
+            {
+                if !self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                    self.toggle_video_window_mode_for_input(ctx);
                 }
+                return;
             }
         }
 

@@ -48,7 +48,9 @@ Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に
 popup の shortcut 表記は、`分析ツール [Shift+Z]` や `メタデータ [I / Tab]`
 のように実割り当てから作る。native 動画 overlay の top bar / bottom HUD / jump panel /
 seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当てから作る。
-`Esc` / `F11`、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
+グリッドの <kbd>Backspace</kbd> 親フォルダ移動と、グリッド / フルスクリーンの
+<kbd>F11</kbd> 系ウィンドウ切り替えも keymap 対象にする。`Esc` / `Enter` /
+修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
@@ -60,7 +62,7 @@ seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当て�
 | キー | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当てを表示し、固定扱いのナビゲーションキーとキー未設定 / 無効化中の操作は別枠で表示する |
-| <kbd>Backspace</kbd> | 親フォルダへ。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
+| <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
 | <kbd>Alt</kbd>+<kbd>↑</kbd> | 親フォルダへ (<kbd>Backspace</kbd> と同じ。Explorer 慣習に合わせた代替ショートカット。ドライブルートではドライブ一覧へ戻る。Ctrl+F フィルタ元フォルダでは no-op) |
 | <kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | フォルダ履歴を戻る / 進む (フォルダバーの ←/→ と同じ。検索中・ドライブ一覧中は無効) |
@@ -87,7 +89,7 @@ seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当て�
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを Windows Shell のコピー / カット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合は実ファイルだけを部分コピーせず、トーストで通知して中止する |
 | <kbd>Ctrl</kbd>+<kbd>V</kbd> | Windows Shell の背景ペースト verb で、クリップボードのファイル / フォルダを現在の実フォルダへペースト。ZIP/PDF/検索結果グリッドなど実フォルダ以外では無効 |
 | <kbd>Delete</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを削除 (通常はゴミ箱。ZIP/PDF 内ページなど仮想項目は対象外) |
-| <kbd>F11</kbd> | メインウィンドウを最大化 ⇔ 元のサイズに復元する (`toggle_main_window_maximized` → `ViewportCommand::Maximized`)。フルスクリーン中は F11 が window/全画面切替 (フルスクリーン共通表参照) なので、この最大化トグルは通常 (グリッド) 表示時のみ。**固定キー (keymap 非対象)**: F11 は OS 慣習どおりの window 最大化として扱い、カスタマイズはリング / マウスショートカットの「ウィンドウ最大化/復元」(`RingActionId::ToggleMaximize`、グリッドコンテキスト) で任意ボタンへ割当可能 |
+| <kbd>F11</kbd> | メインウィンドウを最大化 ⇔ 元のサイズに復元する (`toggle_main_window_maximized` → `ViewportCommand::Maximized`)。Action: `GridToggleMaximize`。フルスクリーン中は F11 が window/全画面切替 (フルスクリーン共通表参照) なので、この最大化トグルは通常 (グリッド) 表示時のみ |
 | <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。静止画 / ZIP画像 / PDFページは detached viewport、動画は同じ detached viewport の child native presenter で表示する |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイル D&D 送出 (コピー)。複数チェック選択時はその実パス群をまとめてドラッグ。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外 |
 | マウス戻る / 進むボタン | `Settings.ring_shortcuts.mouse_buttons_grid` に従い、物理戻る / 進むボタンを個別に割り当てる。新規環境と既定リセットはフォルダ履歴の戻る / 進む。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、従来互換の Ctrl+↑ / Ctrl+↓ 相当 |
@@ -141,7 +143,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | マウス左クリック | (画像) ページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左半分クリックで次 / 右半分クリックで前 / (動画) 再生・一時停止トグル |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
 | <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> | 現在のコンテナへレーティング 1〜5 / 解除 |
-| <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。別ウィンドウ表示中は、真の fullscreen API ではなく装飾なしでモニター全体を覆う仮想フルスクリーンをトグルする。消しゴムモード中は無効化 |
+| <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。Action: `FsToggleWindowMode`。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。Windows native 動画ウィンドウにフォーカスがある場合も現在の keymap 割り当てで App 側へ転送する。別ウィンドウ表示中は、真の fullscreen API ではなく装飾なしでモニター全体を覆う仮想フルスクリーンをトグルする。消しゴムモード中は無効化 |
 | <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。Global action として keymap 対象。native 動画ウィンドウにフォーカスがある場合も App 側へ転送する。静止画のフルスクリーン編集モード中、IME 変換中、ダイアログ操作中は発火させない。F11 のウィンドウ内表示 / 全画面表示の選択は F12 とは独立して保持し、F12 OFF 時は直前の F11 状態へ戻る |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> | (画像) 現在ページを追加先の本へ追加 / (動画) 現在の再生フレームを画像として追加先の本へ追加 |
 
@@ -162,8 +164,8 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 ゲームパッドは閲覧専用の固定割り当て。編集、削除、レーティング、チェック切り替え、
 エクスポートは対象外。マウス戻る / 進むボタンは環境設定の
 「マウスボタン」、<kbd>X</kbd> リングは「リングショートカット」で差し替えられるが、
-`keymap.ini` では扱わない。画像・動画フルスクリーンのリングには、<kbd>F11</kbd> 相当の
-ウィンドウ / 全画面切替と <kbd>F12</kbd> 相当の別ウィンドウ ON/OFF も割り当てられる。
+`keymap.ini` では扱わない。画像・動画フルスクリーンのリングには、キーボード側の
+`FsToggleWindowMode` と同じウィンドウ / 全画面切替と <kbd>F12</kbd> 相当の別ウィンドウ ON/OFF も割り当てられる。
 
 | 入力 | 動作 |
 |---|---|

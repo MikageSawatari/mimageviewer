@@ -1269,6 +1269,31 @@ mod phase_c_key_tests {
     }
 
     #[test]
+    fn grid_parent_folder_follows_keymap_override() {
+        let mut app = setup_app();
+        let origin = PathBuf::from("C:/pics/origin");
+        let child = origin.join("child");
+        app.current_folder = Some(child);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridParentFolder = F13
+            "#,
+        );
+
+        assert!(
+            grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace).is_none(),
+            "Backspace is replaced when GridParentFolder is customized"
+        );
+        let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::F13);
+
+        match nav {
+            Some(crate::ui_main::AddressBarNav::Direct(path)) => assert_eq!(path, origin),
+            _ => panic!("custom GridParentFolder key should navigate to the parent folder"),
+        }
+    }
+
+    #[test]
     fn toolbar_parent_target_at_drive_root_returns_drive_list_nav() {
         let mut app = setup_app();
         let root = PathBuf::from(r"C:\");
@@ -15279,6 +15304,32 @@ mod native_video_rating_key_tests {
         );
     }
 
+    #[test]
+    fn native_video_window_mode_follows_keymap_override() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            r#"
+            [FsCommon]
+            FsToggleWindowMode = F13
+            "#,
+        );
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x7A, false)); // old F11
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "old F11 should no longer trigger after FsToggleWindowMode is customized"
+        );
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x7C, false)); // F13
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "custom F13 follows the same no-player guard and must not create an orphan switch"
+        );
+    }
+
     /// F11 を repeat 付きで送ったときはトグルが走らないことを確認する (長押し連打防止)。
     #[test]
     fn native_video_f11_repeat_is_ignored() {
@@ -15514,6 +15565,39 @@ mod still_window_mode_key_tests {
         assert!(app.settings.video_in_window_mode);
         assert!(app.native_video_in_window_active);
         assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+    }
+
+    #[test]
+    fn still_image_window_mode_follows_keymap_override() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.video_in_window_mode = false;
+        app.native_video_in_window_active = false;
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            r#"
+            [FsCommon]
+            FsToggleWindowMode = F13
+            "#,
+        );
+
+        begin_root_key_pass(&ctx, egui::Key::F11, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+        assert!(
+            handled,
+            "fullscreen root key path should absorb non-action keys"
+        );
+        assert!(!app.settings.video_in_window_mode);
+
+        begin_root_key_pass(&ctx, egui::Key::F13, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert!(app.settings.video_in_window_mode);
+        assert!(app.native_video_in_window_active);
     }
 
     #[test]

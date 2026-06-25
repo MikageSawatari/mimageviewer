@@ -61,6 +61,8 @@
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
+# GridParentFolder = Backspace ; 親フォルダへ移動する
+# GridToggleMaximize = F11 ; メインウィンドウを最大化/復元する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
 # GridToggleStackMode = none ; スタック表示を切り替える
 # GridTagApply = T ; タグを付ける/外すダイアログを開く
@@ -105,6 +107,7 @@
 [FsCommon] ; フルスクリーン共通
 # FsToggleMetadata.1 = I ; メタデータパネルの固定表示を切り替える
 # FsToggleMetadata.2 = Tab ; メタデータパネルの固定表示を切り替える
+# FsToggleWindowMode = F11 ; ウィンドウ表示と全画面表示を切り替える
 # FsCtrlNavPrev = Ctrl+Up ; 前のフォルダまたは検索結果へ移動する
 # FsCtrlNavNext = Ctrl+Down ; 次のフォルダまたは検索結果へ移動する
 # FsSiblingPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する

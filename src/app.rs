@@ -18473,7 +18473,6 @@ impl App {
             down,
             up,
             enter,
-            backspace,
             _ctrl_up_raw,
             _ctrl_down_raw,
             home,
@@ -18489,7 +18488,6 @@ impl App {
                 i.key_pressed(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::ArrowUp),
                 i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Backspace),
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::Home),
@@ -18568,7 +18566,10 @@ impl App {
         // ui_fullscreen 側が F11 を window/全画面トグルに使うのでこの経路には来ない。
         // ウィンドウ操作なので可視アイテム数に依存させない (空フォルダ / 検索 0 件でも効く。
         // Codex P3 2026-06-19: 以前は `if vi_len > 0` 内にあり 0 件グリッドで無反応だった)。
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridToggleMaximize)
+        {
             self.toggle_main_window_maximized(ctx);
         }
 
@@ -18940,8 +18941,10 @@ impl App {
         let in_tag_view = self.tag_view.active;
 
         // BS: 親フォルダへ (検索中はスタックを戻る)
-        // Ctrl+BS は個別補正の解除に使うので除外する
-        if (backspace && !ctrl_held) || alt_up {
+        // 既定の Ctrl+BS は上の個別補正解除で消費される。カスタムで同じキーへ
+        // 割り当てた場合は競合警告の対象にし、先に消費した処理を優先する。
+        let parent_key = self.keymap.consume_action(ctx, KeyAction::GridParentFolder);
+        if parent_key || alt_up {
             // フルスクリーン中の BS はフルスクリーン側ビューポートで処理する (ZIP/PDF ページ
             // なら 1 段戻って L2 ページ一覧)。ここは grid (L1/L2) での BS = 親フォルダへ。
             // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を

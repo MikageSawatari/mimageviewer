@@ -2983,7 +2983,7 @@ impl App {
     /// 仮 gain 適用前の scan は、未補正音の先読みを避けるため再生・キー操作を
     /// モーダルに止める。`ProvisionalApplied` 後は同じ worker が走っていても
     /// 確定値待ちのバックグラウンド scan なので通常操作を許可する。
-    fn normalize_scan_is_modal_for_current_player(&self, fs_idx: usize) -> bool {
+    pub(crate) fn normalize_scan_is_modal_for_current_player(&self, fs_idx: usize) -> bool {
         self.normalize_scan_matches_current_player(fs_idx)
             && self
                 .normalize_state
@@ -3772,6 +3772,7 @@ impl App {
             marker_next: self.keymap.first_chord_label(KeyAction::VideoMarkerNext),
             pin: self.keymap.first_chord_label(KeyAction::VideoPin),
             perf_overlay: self.keymap.first_chord_label(KeyAction::VideoPerfOverlay),
+            window_mode: self.keymap.first_chord_label(KeyAction::FsToggleWindowMode),
             tile_mode: self.keymap.first_chord_label(KeyAction::VideoTileMode),
             bookmark: self.keymap.first_chord_label(KeyAction::VideoBookmark),
             capture: self.keymap.first_chord_label(KeyAction::VideoCapture),
@@ -3782,6 +3783,7 @@ impl App {
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
             KeyAction::ToggleDetachedViewerMode
+            | KeyAction::FsToggleWindowMode
             | KeyAction::FsCtrlNavPrev
             | KeyAction::FsCtrlNavNext
             | KeyAction::FsSiblingPrev
@@ -3823,7 +3825,6 @@ impl App {
             ),
             ("Ctrl+Shift+← / Ctrl+Shift+→", "1フレーム戻る / 進む"),
             ("Home / End", "先頭または末尾の項目へ移動する"),
-            ("F11", "ウィンドウ内表示と全画面表示を切り替える"),
             ("マウスホイール", "前または次の項目へ移動する"),
             ("Ctrl+ホイール", "タイルモード中はタイル列数を変更する"),
         ];
@@ -5207,7 +5208,11 @@ impl App {
             // toggle_video_window_mode は presenter rebuild を伴うので
             // toggle_still_window_mode (設定 flip だけ) では代用できない。
             // normalize scan 中は上の `normalize_state` ガードで既に弾かれている。
-            0x7A if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::FsToggleWindowMode, &key) =>
+            {
                 self.toggle_video_window_mode_for_input(ctx);
                 hud_activity = false;
             }
