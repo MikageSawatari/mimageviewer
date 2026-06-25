@@ -1259,7 +1259,7 @@ fn draw_operation_assignment_editor_body(
             state.operation_keyboard_context = Some(action.context());
             let keymap = Keymap::from_settings(&state.settings.keymap);
             let conflicts = keymap.binding_conflicts();
-            command_editor(ui, state, &keymap, &conflicts, ime_active);
+            command_editor_for_action(ui, state, &keymap, &conflicts, ime_active, *action);
         }
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::RingPad) => {
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
@@ -1469,7 +1469,6 @@ fn open_operation_assignment_editor(
     tab: OperationAssignmentTab,
 ) {
     if let OperationAssignmentTarget::Key(action) = &target {
-        select_command_action(state, *action);
         state.operation_keyboard_context = Some(action.context());
     }
     if let OperationAssignmentTarget::Chord(chord) = &target {
@@ -1710,7 +1709,6 @@ fn open_command_editor_dialog(
     action: KeyAction,
     source_chord: Option<Chord>,
 ) {
-    select_command_action(state, action);
     state.command_editor_source_chord = source_chord;
     open_operation_assignment_editor(
         state,
@@ -1972,12 +1970,24 @@ fn command_editor(
     conflicts: &[BindingConflict],
     ime_active: bool,
 ) {
-    ui.label(egui::RichText::new("割り当て編集").strong());
     let Some(action) = state.command_selected else {
+        ui.label(egui::RichText::new("割り当て編集").strong());
         ui.small("左の一覧または競合一覧からコマンドを選んでください。");
         return;
     };
 
+    command_editor_for_action(ui, state, keymap, conflicts, ime_active, action);
+}
+
+fn command_editor_for_action(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    keymap: &Keymap,
+    conflicts: &[BindingConflict],
+    ime_active: bool,
+    action: KeyAction,
+) {
+    ui.label(egui::RichText::new("割り当て編集").strong());
     ensure_command_editor_loaded(state, keymap, action);
     if let Some(slot) = state.command_capture_slot
         && let Some(result) = poll_command_chord_capture(ui.ctx(), action, ime_active)
