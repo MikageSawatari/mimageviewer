@@ -507,8 +507,9 @@ pub(super) fn page_gamepad_assignments(
 ) {
     ui.small("ゲームパッド X+方向はリングショートカットと同じ 8 方向スロットを使います。X 単体で開くピッカーパネルの項目は固定です。");
     ui.small("各ボタンにマウスを重ねると、この文脈での役割を確認できます。");
+    ui.small("割り当てを変更できるのは X+方向リングです。図の X+方向セルをクリックすると、その方向を編集できます。");
     ui.add_space(8.0);
-    gamepad_layout_preview(ui, &state.settings.ring_shortcuts, context);
+    gamepad_layout_preview(ui, state, context);
     ui.add_space(12.0);
     ring_shortcut_context_editor_without_preview(ui, &mut state.settings.ring_shortcuts, context);
 }
@@ -520,7 +521,7 @@ pub(super) fn page_mouse_gesture_bindings(
 ) {
     ui.label(egui::RichText::new(context.label()).strong());
     ui.small("右ドラッグ mode をマウスジェスチャにした文脈で使います。同じ方向の連続入力は 1 stroke に圧縮され、最大 4 stroke まで登録できます。");
-    mouse_gesture_context_editor(ui, &mut state.settings.ring_shortcuts, context);
+    mouse_gesture_context_editor(ui, state, context);
 }
 
 pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -536,7 +537,7 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
 }
 
 pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。左端のボタンで、この画面の下部に編集欄を開きます。");
+    ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。左端の「編集」で割り当て編集ダイアログを開きます。");
     ui.add_space(8.0);
 
     let keymap = Keymap::from_settings(&state.settings.keymap);
@@ -545,6 +546,7 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
 
     ui.add_space(12.0);
     let conflicted = conflicted_actions(&conflicts);
+    let rows = command_overview_rows(state, &keymap, &conflicted);
     egui::Grid::new("operation_command_overview_actions")
         .num_columns(5)
         .spacing([10.0, 4.0])
@@ -557,116 +559,131 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
             ui.strong("状態");
             ui.end_row();
 
-            for &action in KeyAction::all() {
-                if ui.small_button("キー").clicked() {
-                    state.operation_keyboard_context = Some(action.context());
-                    open_command_editor_dialog(state, action, None);
+            for row in rows {
+                if ui.small_button("編集").clicked() {
+                    match row.target {
+                        OperationOverviewTarget::Key(action) => {
+                            state.operation_keyboard_context = Some(action.context());
+                            open_operation_assignment_editor(
+                                state,
+                                OperationAssignmentTarget::Key(action),
+                                OperationAssignmentTab::Keyboard,
+                            );
+                        }
+                        OperationOverviewTarget::Ring { context, action } => {
+                            open_operation_assignment_editor(
+                                state,
+                                OperationAssignmentTarget::Ring { context, action },
+                                OperationAssignmentTab::RingPad,
+                            );
+                        }
+                    }
                 }
-                ui.label(compact_key_action_label(action))
-                    .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
-                ui.label(action.context().description());
-                assignment_summary(ui, &[("キー", keymap.chord_labels(action))]);
-                let overridden = state
-                    .settings
-                    .keymap
-                    .override_chord_labels(action)
-                    .is_some();
-                let mut status = Vec::new();
-                if overridden {
-                    status.push("上書き");
-                }
-                if conflicted.contains(&action) {
-                    status.push("競合");
-                }
-                if status.is_empty() {
+                ui.label(row.label).on_hover_text(row.hover);
+                ui.label(row.context);
+                assignment_summary(ui, &row.assignments);
+                if row.status.is_empty() {
                     ui.label(egui::RichText::new("既定").weak());
                 } else {
-                    let color = if conflicted.contains(&action) {
+                    let color = if row.conflicted {
                         egui::Color32::from_rgb(220, 120, 80)
                     } else {
                         ui.visuals().text_color()
                     };
-                    ui.label(egui::RichText::new(status.join(" / ")).color(color));
+                    ui.label(egui::RichText::new(row.status).color(color));
                 }
                 ui.end_row();
             }
-
-            for &context in RingShortcutContext::all() {
-                for action in RingActionId::available_for_context(context)
-                    .into_iter()
-                    .filter(|action| *action != RingActionId::None)
-                {
-                    let ring =
-                        ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
-                    let mouse =
-                        mouse_assignment_labels(&state.settings.ring_shortcuts, context, &action);
-                    let pad = gamepad_ring_assignment_labels(
-                        &state.settings.ring_shortcuts,
-                        context,
-                        &action,
-                    );
-                    let assigned = !ring.is_empty() || !mouse.is_empty() || !pad.is_empty();
-                    ui.horizontal(|ui| {
-                        if ui.small_button("リング/パッド").clicked() {
-                            state.operation_ring_context = context;
-                            state.operation_overview_editor =
-                                Some(OperationOverviewEditor::RingShortcut(context));
-                        }
-                        if ui.small_button("進/戻").clicked() {
-                            state.operation_overview_editor =
-                                Some(OperationOverviewEditor::MouseButtons(context));
-                        }
-                        if ui.small_button("マウス").clicked() {
-                            let right_drag_context = right_drag_context_for_ring_context(context);
-                            state.operation_mouse_gesture_context = right_drag_context;
-                            state.operation_overview_editor =
-                                Some(OperationOverviewEditor::MouseGesture(right_drag_context));
-                        }
-                    });
-                    ui.label(action.label_for_context(context))
-                        .on_hover_text(format!(
-                            "{}\n{}",
-                            ring_action_detail_label(&action, context),
-                            action.as_str()
-                        ));
-                    ui.label(context.label());
-                    assignment_summary(ui, &[("リング", ring), ("マウス", mouse), ("パッド", pad)]);
-                    if assigned {
-                        ui.label("設定あり");
-                    } else {
-                        ui.label(egui::RichText::new("未設定").weak());
-                    }
-                    ui.end_row();
-                }
-            }
         });
+    ui.small("未設定のリング / マウス操作を追加するときは、上部の各タブまたは編集ダイアログから割り当ててください。");
+}
 
-    if let Some(editor) = state.operation_overview_editor {
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-        match editor {
-            OperationOverviewEditor::RingShortcut(context) => {
-                ui.label(
-                    egui::RichText::new(format!("{} のリング / パッド", context.label())).strong(),
-                );
-                page_ring_shortcut_assignments(ui, state, context);
+#[derive(Clone, Debug)]
+enum OperationOverviewTarget {
+    Key(KeyAction),
+    Ring {
+        context: RingShortcutContext,
+        action: RingActionId,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct OperationOverviewRow {
+    label: String,
+    context: String,
+    assignments: Vec<(&'static str, Vec<String>)>,
+    status: String,
+    conflicted: bool,
+    hover: String,
+    target: OperationOverviewTarget,
+}
+
+fn command_overview_rows(
+    state: &PreferencesState,
+    keymap: &Keymap,
+    conflicted: &HashSet<KeyAction>,
+) -> Vec<OperationOverviewRow> {
+    let mut rows = Vec::new();
+    for &action in KeyAction::all() {
+        let overridden = state
+            .settings
+            .keymap
+            .override_chord_labels(action)
+            .is_some();
+        let is_conflicted = conflicted.contains(&action);
+        let mut status = Vec::new();
+        if overridden {
+            status.push("上書き");
+        }
+        if is_conflicted {
+            status.push("競合");
+        }
+        rows.push(OperationOverviewRow {
+            label: compact_key_action_label(action),
+            context: action.context().description().to_owned(),
+            assignments: vec![("キー", keymap.chord_labels(action))],
+            status: status.join(" / "),
+            conflicted: is_conflicted,
+            hover: format!("{}\n{}", action.description(), action.ini_name()),
+            target: OperationOverviewTarget::Key(action),
+        });
+    }
+
+    for &context in RingShortcutContext::all() {
+        for action in RingActionId::available_for_context(context)
+            .into_iter()
+            .filter(|action| *action != RingActionId::None)
+        {
+            let ring = ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
+            let mouse = mouse_assignment_labels(&state.settings.ring_shortcuts, context, &action);
+            let pad =
+                gamepad_ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
+            if ring.is_empty() && mouse.is_empty() && pad.is_empty() {
+                continue;
             }
-            OperationOverviewEditor::MouseGesture(context) => {
-                ui.label(
-                    egui::RichText::new(format!("{} のマウスジェスチャ", context.label())).strong(),
-                );
-                page_mouse_gesture_bindings(ui, state, context);
-            }
-            OperationOverviewEditor::MouseButtons(context) => {
-                ui.label(
-                    egui::RichText::new(format!("{} のマウス進む / 戻る", context.label()))
-                        .strong(),
-                );
-                mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, context);
-            }
+            rows.push(OperationOverviewRow {
+                label: compact_operation_label(action.label_for_context(context)),
+                context: context.label().to_owned(),
+                assignments: vec![("リング", ring), ("マウス", mouse), ("パッド", pad)],
+                status: "設定あり".to_owned(),
+                conflicted: false,
+                hover: format!(
+                    "{}\n{}",
+                    ring_action_detail_label(&action, context),
+                    action.as_str()
+                ),
+                target: OperationOverviewTarget::Ring { context, action },
+            });
         }
     }
+
+    rows.sort_by(|a, b| {
+        a.label
+            .cmp(&b.label)
+            .then_with(|| a.context.cmp(&b.context))
+            .then_with(|| a.hover.cmp(&b.hover))
+    });
+    rows
 }
 
 fn compact_key_action_label(action: KeyAction) -> String {
@@ -741,14 +758,19 @@ fn compact_operation_label(label: &str) -> String {
 fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
     ui.vertical(|ui| {
         for (label, values) in groups {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("{label}:")).weak());
-                if values.is_empty() {
+            if values.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{label}:")).weak());
                     ui.label(egui::RichText::new("-").weak());
-                } else {
-                    ui.label(values.join(" / "));
+                });
+            } else {
+                for value in values {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{label}:")).weak());
+                        ui.monospace(value);
+                    });
                 }
-            });
+            }
         }
     });
 }
@@ -826,6 +848,211 @@ pub(super) fn draw_operation_command_editor_dialog(
     }
 }
 
+pub(super) fn draw_operation_assignment_editor_dialog(
+    ctx: &egui::Context,
+    state: &mut PreferencesState,
+    ime_active: bool,
+) {
+    let Some(editor) = state.operation_assignment_editor.clone() else {
+        return;
+    };
+
+    let mut open = true;
+    let title = operation_assignment_editor_title(&editor.target);
+    egui::Window::new(title)
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_size([680.0, 620.0])
+        .min_width(560.0)
+        .show(ctx, |ui| {
+            operation_assignment_editor_header(ui, &editor.target);
+            ui.add_space(6.0);
+            operation_assignment_editor_tabs(ui, state, &editor);
+            ui.separator();
+            ui.add_space(6.0);
+
+            let available_h = ui.available_height().max(220.0);
+            egui::ScrollArea::vertical()
+                .id_salt("operation_assignment_editor_body")
+                .max_height(available_h)
+                .show(ui, |ui| {
+                    draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                });
+        });
+
+    if !open {
+        state.operation_assignment_editor = None;
+        state.command_editor_source_chord = None;
+        state.command_capture_slot = None;
+    }
+}
+
+fn operation_assignment_editor_title(target: &OperationAssignmentTarget) -> String {
+    match target {
+        OperationAssignmentTarget::Key(action) => {
+            format!("操作割り当て編集: {}", compact_key_action_label(*action))
+        }
+        OperationAssignmentTarget::Chord(chord) => {
+            format!("キーから割り当て: {}", chord.display_name())
+        }
+        OperationAssignmentTarget::Ring { context, action } => {
+            format!(
+                "操作割り当て編集: {} / {}",
+                context.label(),
+                action.label_for_context(*context)
+            )
+        }
+        OperationAssignmentTarget::RingSlot { context, direction } => {
+            format!(
+                "ゲームパッド X+{} 割り当て: {}",
+                direction_short_label(*direction),
+                context.label()
+            )
+        }
+    }
+}
+
+fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssignmentTarget) {
+    match target {
+        OperationAssignmentTarget::Key(action) => {
+            ui.label(egui::RichText::new(compact_key_action_label(*action)).strong());
+            ui.small(format!("{}\n{}", action.description(), action.ini_name()));
+        }
+        OperationAssignmentTarget::Chord(chord) => {
+            ui.label(
+                egui::RichText::new(format!("キー: {}", chord.display_name()))
+                    .strong()
+                    .size(14.0),
+            );
+            ui.small("このキーに割り当てるコマンドを選ぶか、既存の割り当てを編集します。");
+        }
+        OperationAssignmentTarget::Ring { context, action } => {
+            ui.label(egui::RichText::new(action.label_for_context(*context)).strong());
+            ui.small(format!(
+                "{}\n{}",
+                ring_action_detail_label(action, *context),
+                action.as_str()
+            ));
+        }
+        OperationAssignmentTarget::RingSlot { context, direction } => {
+            ui.label(
+                egui::RichText::new(format!("{} / X+{}", context.label(), direction.label()))
+                    .strong(),
+            );
+            ui.small("この方向に実行するリングショートカットを選びます。");
+        }
+    }
+}
+
+fn operation_assignment_editor_tabs(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    editor: &OperationAssignmentEditor,
+) {
+    ui.horizontal_wrapped(|ui| {
+        for tab in [
+            OperationAssignmentTab::Keyboard,
+            OperationAssignmentTab::RingPad,
+            OperationAssignmentTab::MouseButtons,
+            OperationAssignmentTab::MouseGesture,
+        ] {
+            let enabled = operation_assignment_tab_enabled(&editor.target, tab);
+            let selected = editor.tab == tab;
+            if ui
+                .add_enabled(enabled, egui::Button::selectable(selected, tab.label()))
+                .clicked()
+                && let Some(current) = state.operation_assignment_editor.as_mut()
+            {
+                current.tab = tab;
+            }
+        }
+    });
+}
+
+fn operation_assignment_tab_enabled(
+    target: &OperationAssignmentTarget,
+    tab: OperationAssignmentTab,
+) -> bool {
+    match target {
+        OperationAssignmentTarget::Key(_) | OperationAssignmentTarget::Chord(_) => {
+            tab == OperationAssignmentTab::Keyboard
+        }
+        OperationAssignmentTarget::Ring { .. } | OperationAssignmentTarget::RingSlot { .. } => {
+            tab != OperationAssignmentTab::Keyboard
+        }
+    }
+}
+
+fn draw_operation_assignment_editor_body(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    editor: &OperationAssignmentEditor,
+    ime_active: bool,
+) {
+    match (&editor.target, editor.tab) {
+        (OperationAssignmentTarget::Key(action), OperationAssignmentTab::Keyboard) => {
+            state.operation_keyboard_context = Some(action.context());
+            let keymap = Keymap::from_settings(&state.settings.keymap);
+            let conflicts = keymap.binding_conflicts();
+            command_editor(ui, state, &keymap, &conflicts, ime_active);
+        }
+        (OperationAssignmentTarget::Chord(chord), OperationAssignmentTab::Keyboard) => {
+            let keymap = Keymap::from_settings(&state.settings.keymap);
+            command_editor_source_chord_section(ui, state, &keymap, *chord);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            let conflicts = keymap.binding_conflicts();
+            command_editor(ui, state, &keymap, &conflicts, ime_active);
+        }
+        (OperationAssignmentTarget::Ring { context, .. }, OperationAssignmentTab::RingPad) => {
+            state.operation_ring_context = *context;
+            page_ring_shortcut_assignments(ui, state, *context);
+        }
+        (
+            OperationAssignmentTarget::RingSlot { context, direction },
+            OperationAssignmentTab::RingPad,
+        ) => {
+            state.operation_ring_context = *context;
+            ring_slot_assignment_editor(ui, state, *context, *direction);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ring_shortcut_context_editor_without_preview(
+                ui,
+                &mut state.settings.ring_shortcuts,
+                *context,
+            );
+        }
+        (OperationAssignmentTarget::Ring { context, .. }, OperationAssignmentTab::MouseButtons) => {
+            mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, *context);
+        }
+        (
+            OperationAssignmentTarget::RingSlot { context, .. },
+            OperationAssignmentTab::MouseButtons,
+        ) => {
+            mouse_button_context_editor(ui, &mut state.settings.ring_shortcuts, *context);
+        }
+        (OperationAssignmentTarget::Ring { context, .. }, OperationAssignmentTab::MouseGesture) => {
+            let right_drag_context = right_drag_context_for_ring_context(*context);
+            state.operation_mouse_gesture_context = right_drag_context;
+            page_mouse_gesture_bindings(ui, state, right_drag_context);
+        }
+        (
+            OperationAssignmentTarget::RingSlot { context, .. },
+            OperationAssignmentTab::MouseGesture,
+        ) => {
+            let right_drag_context = right_drag_context_for_ring_context(*context);
+            state.operation_mouse_gesture_context = right_drag_context;
+            page_mouse_gesture_bindings(ui, state, right_drag_context);
+        }
+        _ => {
+            ui.small("この操作ではこの割り当て種別を編集できません。");
+        }
+    }
+}
+
 fn command_editor_source_chord_section(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
@@ -839,32 +1066,121 @@ fn command_editor_source_chord_section(
     );
     let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
     if matches.is_empty() {
-        ui.small("このキーは現在の表示範囲では未割り当てです。コマンド一覧で割り当て先の「編集」を押してから、キーボード図のキーをクリックすると入力欄へ入ります。");
-        return;
+        ui.small("このキーは現在の表示範囲では未割り当てです。下の一覧から割り当て先を選べます。");
+    } else {
+        ui.small("このキーに割り当てられているコマンド:");
+        egui::Grid::new(("command_editor_source_chord", chord.display_name()))
+            .num_columns(3)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                for action in matches {
+                    if ui
+                        .small_button(if state.command_selected == Some(action) {
+                            "編集中"
+                        } else {
+                            "編集"
+                        })
+                        .clicked()
+                    {
+                        open_command_editor_dialog(state, action, Some(chord));
+                    }
+                    ui.label(compact_key_action_label(action))
+                        .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
+                    ui.label(action.context().description());
+                    ui.end_row();
+                }
+            });
     }
 
-    ui.small("このキーに割り当てられているコマンド:");
-    egui::Grid::new(("command_editor_source_chord", chord.display_name()))
-        .num_columns(3)
-        .spacing([8.0, 3.0])
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("このキーを割り当てる").strong());
+    let filter = state.command_filter.trim().to_ascii_lowercase();
+    egui::ScrollArea::vertical()
+        .id_salt(("command_editor_chord_assign_list", chord.display_name()))
+        .max_height(190.0)
         .show(ui, |ui| {
-            for action in matches {
-                if ui
-                    .small_button(if state.command_selected == Some(action) {
-                        "編集中"
-                    } else {
-                        "編集"
-                    })
-                    .clicked()
-                {
-                    open_command_editor_dialog(state, action, Some(chord));
-                }
-                ui.label(compact_key_action_label(action))
-                    .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
-                ui.label(action.context().description());
-                ui.end_row();
-            }
+            egui::Grid::new(("command_editor_chord_assign_grid", chord.display_name()))
+                .num_columns(3)
+                .spacing([8.0, 3.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for &action in KeyAction::all() {
+                        if let Some(context) = state.operation_keyboard_context
+                            && action.context() != context
+                        {
+                            continue;
+                        }
+                        if !command_action_matches_filter(action, &filter) {
+                            continue;
+                        }
+                        if ui.small_button("割り当て").clicked() {
+                            assign_chord_to_action_editor(state, keymap, action, chord);
+                        }
+                        ui.label(compact_key_action_label(action))
+                            .on_hover_text(format!(
+                                "{}\n{}",
+                                action.description(),
+                                action.ini_name()
+                            ));
+                        ui.label(action.context().description());
+                        ui.end_row();
+                    }
+                });
         });
+}
+
+fn assign_chord_to_action_editor(
+    state: &mut PreferencesState,
+    keymap: &Keymap,
+    action: KeyAction,
+    chord: Chord,
+) {
+    open_command_editor_dialog(state, action, Some(chord));
+    ensure_command_editor_loaded(state, keymap, action);
+    let label = chord.display_name();
+    let slot = state
+        .command_chord_inputs
+        .iter()
+        .position(|input| input.trim().is_empty())
+        .unwrap_or(0);
+    state.command_chord_inputs[slot] = label;
+    state.command_edit_error = None;
+}
+
+fn operation_assignment_editor_context(
+    target: &OperationAssignmentTarget,
+) -> Option<RingShortcutContext> {
+    match target {
+        OperationAssignmentTarget::Ring { context, .. }
+        | OperationAssignmentTarget::RingSlot { context, .. } => Some(*context),
+        OperationAssignmentTarget::Key(_) | OperationAssignmentTarget::Chord(_) => None,
+    }
+}
+
+fn open_operation_assignment_editor(
+    state: &mut PreferencesState,
+    target: OperationAssignmentTarget,
+    tab: OperationAssignmentTab,
+) {
+    if let OperationAssignmentTarget::Key(action) = &target {
+        select_command_action(state, *action);
+        state.operation_keyboard_context = Some(action.context());
+    }
+    if let OperationAssignmentTarget::Chord(chord) = &target {
+        state.command_editor_source_chord = Some(*chord);
+    }
+    if let Some(context) = operation_assignment_editor_context(&target) {
+        state.operation_ring_context = context;
+        state.operation_mouse_gesture_context = right_drag_context_for_ring_context(context);
+    }
+    state.operation_assignment_editor = Some(OperationAssignmentEditor { target, tab });
+}
+
+fn close_assignment_editors(state: &mut PreferencesState) {
+    state.operation_assignment_editor = None;
+    state.command_editor_dialog_open = false;
+    state.command_editor_source_chord = None;
+    state.command_capture_slot = None;
 }
 
 fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap: &Keymap) {
@@ -1054,7 +1370,11 @@ fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, c
     let Some(action) = state.command_selected else {
         let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
         state.command_editor_source_chord = Some(chord);
-        state.command_editor_dialog_open = true;
+        open_operation_assignment_editor(
+            state,
+            OperationAssignmentTarget::Chord(chord),
+            OperationAssignmentTab::Keyboard,
+        );
         state.command_edit_error = if matches.is_empty() {
             Some(
                 "このキーは未割り当てです。コマンド一覧の「編集」から割り当て先を選んでください。"
@@ -1081,7 +1401,11 @@ fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, c
             state.command_capture_slot = None;
             state.command_edit_error = None;
             state.command_editor_source_chord = Some(chord);
-            state.command_editor_dialog_open = true;
+            open_operation_assignment_editor(
+                state,
+                OperationAssignmentTarget::Key(action),
+                OperationAssignmentTab::Keyboard,
+            );
         }
         Ok(None) => {
             state.command_edit_error =
@@ -1115,7 +1439,11 @@ fn open_command_editor_dialog(
 ) {
     select_command_action(state, action);
     state.command_editor_source_chord = source_chord;
-    state.command_editor_dialog_open = true;
+    open_operation_assignment_editor(
+        state,
+        OperationAssignmentTarget::Key(action),
+        OperationAssignmentTab::Keyboard,
+    );
 }
 
 fn push_unique_label(labels: &mut Vec<String>, label: String) {
@@ -1316,11 +1644,7 @@ fn command_list(
                     .on_hover_text(format!("{}\n{}", action.description(), action.ini_name()));
 
                 let labels = keymap.chord_labels(action);
-                if labels.is_empty() {
-                    ui.label(egui::RichText::new("未設定").weak());
-                } else {
-                    ui.monospace(labels.join(" / "));
-                }
+                assignment_values(ui, &labels);
 
                 ui.label(action.context().description());
 
@@ -1390,19 +1714,21 @@ fn command_editor(
     ));
 
     let effective_labels = keymap.chord_labels(action);
-    let effective = if effective_labels.is_empty() {
-        "未設定".to_string()
-    } else {
-        effective_labels.join(" / ")
-    };
-    ui.small(format!("現在の割り当て: {effective}"));
+    ui.small("現在の割り当て:");
+    assignment_summary(ui, &[("キー", effective_labels)]);
 
     let override_state = match state.settings.keymap.override_chord_labels(action) {
         Some(labels) if labels.is_empty() => "上書き: 割り当て解除".to_string(),
-        Some(labels) => format!("上書き: {}", labels.join(" / ")),
+        Some(labels) => {
+            ui.small("上書き:");
+            assignment_summary(ui, &[("キー", labels)]);
+            String::new()
+        }
         None => "上書きなし (既定を使用)".to_string(),
     };
-    ui.small(override_state);
+    if !override_state.is_empty() {
+        ui.small(override_state);
+    }
 
     ui.add_space(8.0);
     egui::Grid::new("command_editor_slots")
@@ -1449,8 +1775,11 @@ fn command_editor(
     }
 
     ui.horizontal(|ui| {
-        if ui.button("適用").clicked() {
+        if ui.button("適用して閉じる").clicked() {
             apply_command_editor(state, action);
+            if state.command_edit_error.is_none() {
+                close_assignment_editors(state);
+            }
         }
         if ui.button("割り当て解除").clicked() {
             state.settings.keymap.disable_action(action);
@@ -1458,12 +1787,17 @@ fn command_editor(
             state.command_edit_loaded_for = Some(action);
             state.command_capture_slot = None;
             state.command_edit_error = None;
+            close_assignment_editors(state);
         }
         if ui.button("既定に戻す").clicked() {
             state.settings.keymap.remove_override(action);
             state.command_edit_loaded_for = None;
             state.command_capture_slot = None;
             state.command_edit_error = None;
+            close_assignment_editors(state);
+        }
+        if ui.button("閉じる").clicked() {
+            close_assignment_editors(state);
         }
     });
 
@@ -1497,6 +1831,18 @@ fn command_editor(
                 }
             });
         }
+    }
+}
+
+fn assignment_values(ui: &mut egui::Ui, values: &[String]) {
+    if values.is_empty() {
+        ui.label(egui::RichText::new("未設定").weak());
+    } else {
+        ui.vertical(|ui| {
+            for value in values {
+                ui.monospace(value);
+            }
+        });
     }
 }
 
@@ -2021,9 +2367,11 @@ fn mouse_button_action_combo(
 
 fn mouse_gesture_context_editor(
     ui: &mut egui::Ui,
-    settings: &mut RingShortcutSettings,
+    state: &mut PreferencesState,
     context: RightDragContext,
 ) {
+    let settings = &mut state.settings.ring_shortcuts;
+    let gesture_inputs = &mut state.operation_mouse_gesture_inputs;
     ui.separator();
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -2031,6 +2379,8 @@ fn mouse_gesture_context_editor(
         if ui.button("ジェスチャを追加").clicked() {
             let profile = settings.mouse_gesture_profile_mut(context);
             let pattern = first_unused_mouse_gesture_pattern(profile);
+            let idx = profile.bindings.len();
+            gesture_inputs.insert((context, idx), format_mouse_gesture_pattern(&pattern));
             profile
                 .bindings
                 .push(crate::ring_shortcut::MouseGestureBinding::new(
@@ -2040,6 +2390,7 @@ fn mouse_gesture_context_editor(
         }
         if ui.button("既定に戻す").clicked() {
             settings.reset_mouse_gesture_profile(context);
+            gesture_inputs.retain(|(ctx, _), _| *ctx != context);
         }
     });
 
@@ -2061,13 +2412,15 @@ fn mouse_gesture_context_editor(
                 ui.end_row();
 
                 for (idx, binding) in profile.bindings.iter_mut().enumerate() {
-                    let mut pattern_text = format_mouse_gesture_pattern(&binding.pattern);
+                    let pattern_text = gesture_inputs
+                        .entry((context, idx))
+                        .or_insert_with(|| format_mouse_gesture_pattern(&binding.pattern));
                     let response = ui.add_sized(
                         [82.0, 22.0],
-                        egui::TextEdit::singleline(&mut pattern_text).hint_text("↓→"),
+                        egui::TextEdit::singleline(pattern_text).hint_text("↓→"),
                     );
                     if response.changed() {
-                        if let Some(pattern) = parse_mouse_gesture_pattern(&pattern_text) {
+                        if let Some(pattern) = parse_mouse_gesture_pattern(pattern_text) {
                             binding.pattern = pattern;
                         } else {
                             invalid_rows.push(idx + 1);
@@ -2098,7 +2451,10 @@ fn mouse_gesture_context_editor(
             });
         if let Some(idx) = remove_idx {
             profile.bindings.remove(idx);
+            gesture_inputs.retain(|(ctx, _), _| *ctx != context);
         }
+        let len = profile.bindings.len();
+        gesture_inputs.retain(|(ctx, idx), _| *ctx != context || *idx < len);
     }
 
     let profile = settings.mouse_gesture_profile(context);
@@ -2136,6 +2492,40 @@ fn mouse_gesture_context_editor(
     }
 }
 
+fn ring_slot_assignment_editor(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    context: RingShortcutContext,
+    direction: RingDirection,
+) {
+    ui.group(|ui| {
+        ui.label(
+            egui::RichText::new(format!("X+{} / {}", direction.label(), context.label()))
+                .strong(),
+        );
+        ui.small("この方向に割り当てる操作を選びます。右ドラッグをリングショートカットにしている文脈では、同じ方向の右ドラッグにも使われます。");
+        ui.add_space(6.0);
+
+        let available = RingActionId::available_for_context(context);
+        let profile = state.settings.ring_shortcuts.profile_mut(context);
+        profile.sanitize(context);
+        let idx = direction.slot_index();
+        egui::ComboBox::from_id_salt(("ring_slot_assignment_editor", context, direction))
+            .width(280.0)
+            .selected_text(profile.slots[idx].label_for_context(context))
+            .show_ui(ui, |ui| {
+                for action in &available {
+                    ui.selectable_value(
+                        &mut profile.slots[idx],
+                        action.clone(),
+                        action.label_for_context(context),
+                    )
+                    .on_hover_text(ring_action_detail_label(action, context));
+                }
+            });
+    });
+}
+
 fn first_unused_mouse_gesture_pattern(
     profile: &crate::ring_shortcut::MouseGestureProfile,
 ) -> Vec<crate::ring_shortcut::MouseGestureDirection> {
@@ -2157,10 +2547,10 @@ fn first_unused_mouse_gesture_pattern(
 
 fn gamepad_layout_preview(
     ui: &mut egui::Ui,
-    settings: &RingShortcutSettings,
+    state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
-    let profile = settings.profile(context);
+    let profile = state.settings.ring_shortcuts.profile(context).clone();
     ui.group(|ui| {
         ui.label(egui::RichText::new("ゲームパッド割り当て").strong());
         ui.add_space(4.0);
@@ -2181,7 +2571,7 @@ fn gamepad_layout_preview(
                 });
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("X+方向リング").strong().size(11.0));
-                gamepad_ring_preview(ui, profile, context);
+                gamepad_ring_preview(ui, state, &profile, context);
             });
 
             ui.add_space(16.0);
@@ -2239,6 +2629,7 @@ fn gamepad_dpad_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
 
 fn gamepad_ring_preview(
     ui: &mut egui::Ui,
+    state: &mut PreferencesState,
     profile: &crate::ring_shortcut::RingShortcutProfile,
     context: RingShortcutContext,
 ) {
@@ -2266,17 +2657,23 @@ fn gamepad_ring_preview(
                             .unwrap_or(&RingActionId::None);
                         let label = action.label_for_context(context);
                         let text = format!("X+{}\n{}", direction_short_label(*direction), label);
-                        ui.add_sized(
-                            [104.0, 42.0],
-                            egui::Label::new(egui::RichText::new(text).size(11.0))
-                                .wrap()
-                                .selectable(false),
-                        )
-                        .on_hover_text(format!(
-                            "{}\n{}",
-                            direction.label(),
-                            action.as_str()
-                        ));
+                        if ui
+                            .add_sized(
+                                [104.0, 42.0],
+                                egui::Button::new(egui::RichText::new(text).size(11.0)).wrap(),
+                            )
+                            .on_hover_text(format!("{}\n{}", direction.label(), action.as_str()))
+                            .clicked()
+                        {
+                            open_operation_assignment_editor(
+                                state,
+                                OperationAssignmentTarget::RingSlot {
+                                    context,
+                                    direction: *direction,
+                                },
+                                OperationAssignmentTab::RingPad,
+                            );
+                        }
                     }
                     None => {
                         ui.add_sized(

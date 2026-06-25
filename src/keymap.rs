@@ -2884,19 +2884,11 @@ const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
     GRID_ACTIVE_SCOPES,
     FS_IMAGE_ACTIVE_SCOPES,
     FS_VIDEO_ACTIVE_SCOPES,
-    &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Erase],
-    &[
-        KeyContext::Global,
-        KeyContext::FsCommon,
-        KeyContext::Conceal,
-    ],
-    &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Crop],
-    &[KeyContext::Global, KeyContext::FsCommon, KeyContext::Text],
-    &[
-        KeyContext::Global,
-        KeyContext::FsCommon,
-        KeyContext::LocalAdjust,
-    ],
+    &[KeyContext::Erase],
+    &[KeyContext::Conceal],
+    &[KeyContext::Crop],
+    &[KeyContext::Text],
+    &[KeyContext::LocalAdjust],
 ];
 
 pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
@@ -3405,9 +3397,7 @@ impl Keymap {
             .filter(|binding| binding.customized)
         {
             for reserved in RESERVED_BINDINGS {
-                if binding.chord == reserved.chord
-                    && command_scopes_overlap(binding.scope, reserved.scope)
-                {
+                if binding.chord == reserved.chord {
                     conflicts.push(BindingConflict {
                         kind: BindingConflictKind::Reserved,
                         chord: binding.chord,
@@ -4921,7 +4911,7 @@ mod tests {
             KeyContext::FsCommon,
             KeyContext::FsImage
         ));
-        assert!(command_scopes_overlap(
+        assert!(!command_scopes_overlap(
             KeyContext::FsCommon,
             KeyContext::Erase
         ));
@@ -4934,6 +4924,28 @@ mod tests {
             KeyContext::Erase,
             KeyContext::Conceal
         ));
+    }
+
+    #[test]
+    fn fs_common_bindings_do_not_conflict_with_edit_mode_bindings() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Fullscreen]
+            FsToggleMetadata = Ctrl+M
+            "#,
+        );
+        let conflicts = keymap.binding_conflicts();
+        assert!(
+            !conflicts.iter().any(|conflict| {
+                conflict.chord == Chord::ctrl(KeyName::M)
+                    && ((conflict.action == KeyAction::FsToggleMetadata
+                        && conflict.other_action == Some(KeyAction::ConcealExit))
+                        || (conflict.action == KeyAction::ConcealExit
+                            && conflict.other_action == Some(KeyAction::FsToggleMetadata)))
+            }),
+            "FsCommon and edit-mode commands are not active together: {:?}",
+            conflicts
+        );
     }
 
     #[test]

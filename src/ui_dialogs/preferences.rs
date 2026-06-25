@@ -4,10 +4,10 @@
 //! OK / キャンセルで一時コピーを確定 or 破棄する。
 
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::App;
-use crate::ring_shortcut::{RightDragContext, RingShortcutContext};
+use crate::ring_shortcut::{RightDragContext, RingActionId, RingDirection, RingShortcutContext};
 use crate::settings::{Parallelism, Settings};
 
 mod pages;
@@ -162,10 +162,42 @@ impl OperationSettingsTab {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OperationOverviewEditor {
-    RingShortcut(RingShortcutContext),
-    MouseGesture(RightDragContext),
-    MouseButtons(RingShortcutContext),
+pub(crate) enum OperationAssignmentTab {
+    Keyboard,
+    RingPad,
+    MouseButtons,
+    MouseGesture,
+}
+
+impl OperationAssignmentTab {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Keyboard => "キー",
+            Self::RingPad => "リング/パッド",
+            Self::MouseButtons => "進む/戻る",
+            Self::MouseGesture => "マウス",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OperationAssignmentTarget {
+    Key(crate::keymap::KeyAction),
+    Chord(crate::keymap::Chord),
+    Ring {
+        context: RingShortcutContext,
+        action: RingActionId,
+    },
+    RingSlot {
+        context: RingShortcutContext,
+        direction: RingDirection,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OperationAssignmentEditor {
+    pub target: OperationAssignmentTarget,
+    pub tab: OperationAssignmentTab,
 }
 
 // ── ツリーカテゴリ定義 ──────────────────────────────────────────
@@ -274,13 +306,14 @@ pub(crate) struct PreferencesState {
     pub command_editor_source_chord: Option<crate::keymap::Chord>,
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
-    pub operation_overview_editor: Option<OperationOverviewEditor>,
+    pub operation_assignment_editor: Option<OperationAssignmentEditor>,
     pub operation_keyboard_context: Option<crate::keymap::KeyContext>,
     pub operation_keyboard_ctrl: bool,
     pub operation_keyboard_shift: bool,
     pub operation_keyboard_alt: bool,
     pub operation_ring_context: RingShortcutContext,
     pub operation_mouse_gesture_context: RightDragContext,
+    pub operation_mouse_gesture_inputs: HashMap<(RightDragContext, usize), String>,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
     /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
@@ -493,13 +526,14 @@ impl PreferencesState {
             command_editor_source_chord: None,
             operation_tab: OperationCustomizeTab::Settings,
             operation_settings_tab: OperationSettingsTab::Behavior,
-            operation_overview_editor: None,
+            operation_assignment_editor: None,
             operation_keyboard_context: None,
             operation_keyboard_ctrl: false,
             operation_keyboard_shift: false,
             operation_keyboard_alt: false,
             operation_ring_context: RingShortcutContext::Grid,
             operation_mouse_gesture_context: RightDragContext::Grid,
+            operation_mouse_gesture_inputs: HashMap::new(),
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
             auto_thread_count,
@@ -1202,6 +1236,7 @@ impl App {
 
         if let Some(state) = self.operation_customize_state.as_mut() {
             draw_operation_command_editor_dialog(ctx, state, ime_active);
+            draw_operation_assignment_editor_dialog(ctx, state, ime_active);
         }
 
         if apply {
