@@ -506,12 +506,16 @@ pub(super) fn page_gamepad_assignments(
     state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
-    ui.small("ゲームパッド X+方向はリングショートカットと同じ 8 方向スロットを使います。X 単体で開くピッカーパネルの項目は固定です。");
+    ui.small("上の図は固定ボタンの役割確認です。X 単体で開くピッカーパネルの項目は固定です。");
     ui.small("各ボタンにマウスを重ねると、この文脈での役割を確認できます。");
-    ui.small("割り当てを変更できるのは X+方向リングです。図の X+方向セルをクリックすると、その方向を編集できます。");
+    ui.small("X+方向リングは下の 8 方向スロットで編集します。");
     ui.add_space(8.0);
-    gamepad_layout_preview(ui, state, context);
+    gamepad_layout_preview(ui, context);
     ui.add_space(12.0);
+    ui.label(egui::RichText::new("X+方向リング").strong());
+    let preview_profile = state.settings.ring_shortcuts.profile(context).clone();
+    gamepad_ring_preview(ui, state, &preview_profile, context);
+    ui.add_space(8.0);
     ring_shortcut_context_editor_without_preview(ui, &mut state.settings.ring_shortcuts, context);
 }
 
@@ -2936,14 +2940,9 @@ fn ring_slot_assignment_editor(
     });
 }
 
-fn gamepad_layout_preview(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    context: RingShortcutContext,
-) {
-    let profile = state.settings.ring_shortcuts.profile(context).clone();
+fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
     ui.group(|ui| {
-        ui.label(egui::RichText::new("ゲームパッド割り当て").strong());
+        ui.label(egui::RichText::new("ゲームパッド固定ボタン").strong());
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -2961,8 +2960,16 @@ fn gamepad_layout_preview(
                     gamepad_button(ui, "Start", "お気に入り", "お気に入りの移動パネルを開きます。");
                 });
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("X+方向リング").strong().size(11.0));
-                gamepad_ring_preview(ui, state, &profile, context);
+                ui.add_sized(
+                    [204.0, 88.0],
+                    egui::Label::new(
+                        egui::RichText::new("X 単体\nピッカーパネル\n\nX+方向は下のリング設定")
+                            .size(11.0),
+                    )
+                    .wrap()
+                    .selectable(false),
+                )
+                .on_hover_text("X を方向入力なしで離すとピッカーパネルを開きます。X+方向リングは下の 8 方向スロットで編集します。");
             });
 
             ui.add_space(16.0);
@@ -2977,7 +2984,7 @@ fn gamepad_layout_preview(
                         ui.label("");
                         gamepad_button(ui, "Y", "補助", gamepad_y_tooltip(context));
                         ui.end_row();
-                        gamepad_button(ui, "X", "ピッカー/リング", "X 単体でピッカーパネルを開きます。X を押しながら方向入力すると、下の X+方向リングを実行します。");
+                        gamepad_button(ui, "X", "ピッカー", "X 単体でピッカーパネルを開きます。X を押しながら方向入力すると、下の X+方向リングを実行します。");
                         gamepad_button(ui, "B", "戻る", gamepad_b_tooltip(context));
                         gamepad_button(ui, "A", "決定", gamepad_a_tooltip(context));
                         ui.end_row();
