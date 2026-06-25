@@ -949,10 +949,14 @@ fn compact_operation_label(label: &str) -> String {
         }
     }
     let compact = compact.trim();
-    if compact.chars().count() <= 18 {
+    const COMMAND_OVERVIEW_LABEL_MAX_CHARS: usize = 34;
+    if compact.chars().count() <= COMMAND_OVERVIEW_LABEL_MAX_CHARS {
         compact.to_string()
     } else {
-        let mut out: String = compact.chars().take(17).collect();
+        let mut out: String = compact
+            .chars()
+            .take(COMMAND_OVERVIEW_LABEL_MAX_CHARS - 1)
+            .collect();
         out.push('…');
         out
     }
