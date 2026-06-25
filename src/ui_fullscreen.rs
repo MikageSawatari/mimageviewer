@@ -25,8 +25,8 @@ use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
-    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
-    KeyTrigger, Keymap, command_catalog,
+    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES,
+    GLOBAL_LOCATION_NAVIGATION_ACTIONS, KeyAction, KeyName, KeyTrigger, Keymap, command_catalog,
 };
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
@@ -6394,6 +6394,20 @@ impl App {
             self.show_context_shortcuts_help = true;
             return action;
         }
+        if self.fs_context_menu_idx.is_none()
+            && let Some(location_action) = self.keymap.consume_first_action(
+                ctx,
+                &[CommandScope::Global],
+                GLOBAL_LOCATION_NAVIGATION_ACTIONS,
+            )
+        {
+            action.mouse_nav = self.apply_global_location_key_action(
+                ctx,
+                location_action,
+                "fullscreen-location-key",
+            );
+            return action;
+        }
         let video_horizontal_arrow_key = is_video_fs
             && ctx.input(|i| {
                 i.events.iter().any(|event| {
@@ -6457,10 +6471,6 @@ impl App {
                 .consume_action(ctx, KeyAction::FsSpreadShiftRight);
         let ctrl_page_down = self.keymap.consume_action(ctx, KeyAction::FsSiblingNext);
         let ctrl_page_up = self.keymap.consume_action(ctx, KeyAction::FsSiblingPrev);
-        let fixed_jump_next =
-            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
-        let fixed_jump_prev =
-            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpPrev);
         // PageUp/Down のスクロール用 consume も、実際に連続描画している条件
         // (continuous_reading_active_for_idx) に揃える。reading_flow だけで判定すると、
         // 非対応アイテム/解析/比較中に PageUp/Down を消費しておきながら無反応 (デッドキー) になる。
@@ -6473,6 +6483,22 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsContinuousScrollBack);
+        let page_next = !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsPageNext);
+        let page_prev = !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsPagePrev);
+        let fixed_jump_next =
+            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
+        let fixed_jump_prev =
+            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpPrev);
+        let fixed_jump_next_no_rtl = !is_video_fs
+            && !continuous_mode_for_page_keys
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsFixedJumpNextNoRtl);
+        let fixed_jump_prev_no_rtl = !is_video_fs
+            && !continuous_mode_for_page_keys
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsFixedJumpPrevNoRtl);
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
@@ -7313,8 +7339,25 @@ impl App {
         if ctrl_page_up {
             action.sibling_nav = Some(-1);
         }
+        if page_next {
+            action.nav_delta = self.spread_nav_delta(1);
+        }
+        if page_prev {
+            action.nav_delta = self.spread_nav_delta(-1);
+        }
         if fixed_jump_next || fixed_jump_prev {
             let forward = if fixed_jump_next { !rtl } else { rtl };
+            if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
+                action.jump_to = Some(new_idx);
+            } else {
+                self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    at_end: forward,
+                    at: std::time::Instant::now(),
+                });
+            }
+        }
+        if fixed_jump_next_no_rtl || fixed_jump_prev_no_rtl {
+            let forward = fixed_jump_next_no_rtl;
             if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
                 action.jump_to = Some(new_idx);
             } else {

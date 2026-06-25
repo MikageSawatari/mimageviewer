@@ -475,6 +475,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   ToggleDetachedViewerMode `F12` (P) / HelpShowContextShortcuts `?` (P)
   - 検索・フォルダを開く系は dialog / address / search focus / fullscreen 中は既存ガードで無効化される。
   - ToggleDetachedViewerMode は dialog / text focus / IME 変換中 / 静止画 fullscreen 編集サブモードでは抑止し、fullscreen / native 動画では明示 consume する Global action。
+  - GlobalFavoritePrev/Next、GlobalOpenFavorite1..20、GlobalOpenDriveC..Z、
+    GlobalOpenLocation* は既定未割り当て。操作カスタマイズでキーを割り当てると、
+    グリッド / 画像フルスクリーン / 動画フルスクリーン (native overlay 含む) から同じ場所移動を実行する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 
@@ -512,9 +515,11 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
   FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
   FsHome/End (予約候補)
+- FsPagePrev/Next は既定未割り当て。矢印キーを固定扱いに残しつつ、前 / 次ページを別キーへ明示割り当てするための Action。
 - FsStackJumpPrev/Next `Shift+↑/↓` (P) ★: スタックフラット読書中だけ有効。非スタック時の
   `Shift+↑/↓` は従来どおりプレーン `↑/↓` エイリアスとして固定扱い。
-- FsContinuousScrollForward/Back `PageDown/PageUp` (P)(連続読み時のみ)
+- FsContinuousScrollForward/Back `PageDown/PageUp` (P)(連続読み時のみ) /
+  FsFixedJumpPrevNoRtl/NextNoRtl `PageUp/PageDown` (P)(通常ページ単位表示のみ、RTL で反転しない)
 - FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)

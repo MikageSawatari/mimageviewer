@@ -7,6 +7,7 @@ use crate::adjustment::PostFilter;
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
 use crate::grid_item::GridItem;
+use crate::keymap::KeyAction;
 use crate::ring_shortcut::{
     GamepadButtonSlot, GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
     GamepadLocationPickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
@@ -49,6 +50,29 @@ fn request_ring_overlay_repaint_after(ctx: &egui::Context, duration: Duration) {
     if ctx.viewport_id() != egui::ViewportId::ROOT {
         ctx.request_repaint_after_for(duration, egui::ViewportId::ROOT);
     }
+}
+
+fn ring_location_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
+    if let Some(slot) = action.favorite_slot_number() {
+        return RingActionId::favorite_slot_action(slot);
+    }
+    if let Some(letter) = action.drive_letter() {
+        return RingActionId::drive_action(letter);
+    }
+    Some(match action {
+        KeyAction::GlobalOpenLocationDriveList => RingActionId::OpenLocationDriveList,
+        KeyAction::GlobalOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
+        KeyAction::GlobalOpenLocationRating1 => RingActionId::OpenLocationRating1,
+        KeyAction::GlobalOpenLocationRating2 => RingActionId::OpenLocationRating2,
+        KeyAction::GlobalOpenLocationRating3 => RingActionId::OpenLocationRating3,
+        KeyAction::GlobalOpenLocationRating4 => RingActionId::OpenLocationRating4,
+        KeyAction::GlobalOpenLocationRating5 => RingActionId::OpenLocationRating5,
+        KeyAction::GlobalOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
+        KeyAction::GlobalOpenLocationDesktop => RingActionId::OpenLocationDesktop,
+        KeyAction::GlobalOpenLocationPictures => RingActionId::OpenLocationPictures,
+        KeyAction::GlobalOpenLocationDownloads => RingActionId::OpenLocationDownloads,
+        _ => return None,
+    })
 }
 
 const GRID_PICKER_ROWS: &[RingPickerRowId] = &[
@@ -3994,6 +4018,55 @@ impl App {
         self.bump_input_seq(source, Some(&format!("{nav:?}")));
         ctx.request_repaint();
         Some(nav)
+    }
+
+    pub(crate) fn apply_global_location_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: KeyAction,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if let Some(slot) = action.favorite_slot_number() {
+            return self.apply_ring_favorite_slot(ctx, slot, source);
+        }
+        if let Some(letter) = action.drive_letter() {
+            return self.apply_ring_drive_letter(letter, source);
+        }
+        if let Some(ring_action) = ring_location_action_for_key_action(action) {
+            return self.apply_ring_location_action(ctx, &ring_action, source);
+        }
+        match action {
+            KeyAction::GlobalFavoritePrev => self.apply_favorite_cycle_nav(ctx, false, source),
+            KeyAction::GlobalFavoriteNext => self.apply_favorite_cycle_nav(ctx, true, source),
+            _ => None,
+        }
+    }
+
+    fn apply_favorite_cycle_nav(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.is_snapshot_active() {
+            self.show_feedback_toast(
+                "スナップショット中は他のフォルダに移動できません".to_string(),
+            );
+            return None;
+        }
+        let len = self.settings.favorites.len();
+        if len == 0 {
+            self.show_feedback_toast("お気に入りが登録されていません".to_string());
+            return None;
+        }
+        let current = self.current_gamepad_favorite_index();
+        let next = match (current, forward) {
+            (Some(idx), true) => (idx + 1) % len,
+            (Some(idx), false) => (idx + len - 1) % len,
+            (None, true) => 0,
+            (None, false) => len - 1,
+        };
+        self.apply_ring_favorite_slot(ctx, next + 1, source)
     }
 
     fn quick_location_nav(

@@ -809,6 +809,63 @@ pub enum KeyAction {
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
     HelpShowContextShortcuts,
+    GlobalFavoritePrev,
+    GlobalFavoriteNext,
+    GlobalOpenFavorite1,
+    GlobalOpenFavorite2,
+    GlobalOpenFavorite3,
+    GlobalOpenFavorite4,
+    GlobalOpenFavorite5,
+    GlobalOpenFavorite6,
+    GlobalOpenFavorite7,
+    GlobalOpenFavorite8,
+    GlobalOpenFavorite9,
+    GlobalOpenFavorite10,
+    GlobalOpenFavorite11,
+    GlobalOpenFavorite12,
+    GlobalOpenFavorite13,
+    GlobalOpenFavorite14,
+    GlobalOpenFavorite15,
+    GlobalOpenFavorite16,
+    GlobalOpenFavorite17,
+    GlobalOpenFavorite18,
+    GlobalOpenFavorite19,
+    GlobalOpenFavorite20,
+    GlobalOpenDriveC,
+    GlobalOpenDriveD,
+    GlobalOpenDriveE,
+    GlobalOpenDriveF,
+    GlobalOpenDriveG,
+    GlobalOpenDriveH,
+    GlobalOpenDriveI,
+    GlobalOpenDriveJ,
+    GlobalOpenDriveK,
+    GlobalOpenDriveL,
+    GlobalOpenDriveM,
+    GlobalOpenDriveN,
+    GlobalOpenDriveO,
+    GlobalOpenDriveP,
+    GlobalOpenDriveQ,
+    GlobalOpenDriveR,
+    GlobalOpenDriveS,
+    GlobalOpenDriveT,
+    GlobalOpenDriveU,
+    GlobalOpenDriveV,
+    GlobalOpenDriveW,
+    GlobalOpenDriveX,
+    GlobalOpenDriveY,
+    GlobalOpenDriveZ,
+    GlobalOpenLocationDriveList,
+    GlobalOpenLocationReadingHistory,
+    GlobalOpenLocationRating1,
+    GlobalOpenLocationRating2,
+    GlobalOpenLocationRating3,
+    GlobalOpenLocationRating4,
+    GlobalOpenLocationRating5,
+    GlobalOpenLocationBooksRoot,
+    GlobalOpenLocationDesktop,
+    GlobalOpenLocationPictures,
+    GlobalOpenLocationDownloads,
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
@@ -858,8 +915,12 @@ pub enum KeyAction {
     FsCtrlNavNext,
     FsSiblingPrev,
     FsSiblingNext,
+    FsPagePrev,
+    FsPageNext,
     FsFixedJumpPrev,
     FsFixedJumpNext,
+    FsFixedJumpPrevNoRtl,
+    FsFixedJumpNextNoRtl,
     FsStackJumpPrev,
     FsStackJumpNext,
     RatingItem1,
@@ -1020,6 +1081,63 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
     KeyAction::HelpShowContextShortcuts,
+    KeyAction::GlobalFavoritePrev,
+    KeyAction::GlobalFavoriteNext,
+    KeyAction::GlobalOpenFavorite1,
+    KeyAction::GlobalOpenFavorite2,
+    KeyAction::GlobalOpenFavorite3,
+    KeyAction::GlobalOpenFavorite4,
+    KeyAction::GlobalOpenFavorite5,
+    KeyAction::GlobalOpenFavorite6,
+    KeyAction::GlobalOpenFavorite7,
+    KeyAction::GlobalOpenFavorite8,
+    KeyAction::GlobalOpenFavorite9,
+    KeyAction::GlobalOpenFavorite10,
+    KeyAction::GlobalOpenFavorite11,
+    KeyAction::GlobalOpenFavorite12,
+    KeyAction::GlobalOpenFavorite13,
+    KeyAction::GlobalOpenFavorite14,
+    KeyAction::GlobalOpenFavorite15,
+    KeyAction::GlobalOpenFavorite16,
+    KeyAction::GlobalOpenFavorite17,
+    KeyAction::GlobalOpenFavorite18,
+    KeyAction::GlobalOpenFavorite19,
+    KeyAction::GlobalOpenFavorite20,
+    KeyAction::GlobalOpenDriveC,
+    KeyAction::GlobalOpenDriveD,
+    KeyAction::GlobalOpenDriveE,
+    KeyAction::GlobalOpenDriveF,
+    KeyAction::GlobalOpenDriveG,
+    KeyAction::GlobalOpenDriveH,
+    KeyAction::GlobalOpenDriveI,
+    KeyAction::GlobalOpenDriveJ,
+    KeyAction::GlobalOpenDriveK,
+    KeyAction::GlobalOpenDriveL,
+    KeyAction::GlobalOpenDriveM,
+    KeyAction::GlobalOpenDriveN,
+    KeyAction::GlobalOpenDriveO,
+    KeyAction::GlobalOpenDriveP,
+    KeyAction::GlobalOpenDriveQ,
+    KeyAction::GlobalOpenDriveR,
+    KeyAction::GlobalOpenDriveS,
+    KeyAction::GlobalOpenDriveT,
+    KeyAction::GlobalOpenDriveU,
+    KeyAction::GlobalOpenDriveV,
+    KeyAction::GlobalOpenDriveW,
+    KeyAction::GlobalOpenDriveX,
+    KeyAction::GlobalOpenDriveY,
+    KeyAction::GlobalOpenDriveZ,
+    KeyAction::GlobalOpenLocationDriveList,
+    KeyAction::GlobalOpenLocationReadingHistory,
+    KeyAction::GlobalOpenLocationRating1,
+    KeyAction::GlobalOpenLocationRating2,
+    KeyAction::GlobalOpenLocationRating3,
+    KeyAction::GlobalOpenLocationRating4,
+    KeyAction::GlobalOpenLocationRating5,
+    KeyAction::GlobalOpenLocationBooksRoot,
+    KeyAction::GlobalOpenLocationDesktop,
+    KeyAction::GlobalOpenLocationPictures,
+    KeyAction::GlobalOpenLocationDownloads,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
@@ -1069,8 +1187,12 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsCtrlNavNext,
     KeyAction::FsSiblingPrev,
     KeyAction::FsSiblingNext,
+    KeyAction::FsPagePrev,
+    KeyAction::FsPageNext,
     KeyAction::FsFixedJumpPrev,
     KeyAction::FsFixedJumpNext,
+    KeyAction::FsFixedJumpPrevNoRtl,
+    KeyAction::FsFixedJumpNextNoRtl,
     KeyAction::FsStackJumpPrev,
     KeyAction::FsStackJumpNext,
     KeyAction::RatingItem1,
@@ -1818,6 +1940,116 @@ const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingContainerClear, 0),
 ];
 
+const FAVORITE_LOCATION_ACTIONS: [KeyAction; 20] = [
+    KeyAction::GlobalOpenFavorite1,
+    KeyAction::GlobalOpenFavorite2,
+    KeyAction::GlobalOpenFavorite3,
+    KeyAction::GlobalOpenFavorite4,
+    KeyAction::GlobalOpenFavorite5,
+    KeyAction::GlobalOpenFavorite6,
+    KeyAction::GlobalOpenFavorite7,
+    KeyAction::GlobalOpenFavorite8,
+    KeyAction::GlobalOpenFavorite9,
+    KeyAction::GlobalOpenFavorite10,
+    KeyAction::GlobalOpenFavorite11,
+    KeyAction::GlobalOpenFavorite12,
+    KeyAction::GlobalOpenFavorite13,
+    KeyAction::GlobalOpenFavorite14,
+    KeyAction::GlobalOpenFavorite15,
+    KeyAction::GlobalOpenFavorite16,
+    KeyAction::GlobalOpenFavorite17,
+    KeyAction::GlobalOpenFavorite18,
+    KeyAction::GlobalOpenFavorite19,
+    KeyAction::GlobalOpenFavorite20,
+];
+
+const DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
+    KeyAction::GlobalOpenDriveC,
+    KeyAction::GlobalOpenDriveD,
+    KeyAction::GlobalOpenDriveE,
+    KeyAction::GlobalOpenDriveF,
+    KeyAction::GlobalOpenDriveG,
+    KeyAction::GlobalOpenDriveH,
+    KeyAction::GlobalOpenDriveI,
+    KeyAction::GlobalOpenDriveJ,
+    KeyAction::GlobalOpenDriveK,
+    KeyAction::GlobalOpenDriveL,
+    KeyAction::GlobalOpenDriveM,
+    KeyAction::GlobalOpenDriveN,
+    KeyAction::GlobalOpenDriveO,
+    KeyAction::GlobalOpenDriveP,
+    KeyAction::GlobalOpenDriveQ,
+    KeyAction::GlobalOpenDriveR,
+    KeyAction::GlobalOpenDriveS,
+    KeyAction::GlobalOpenDriveT,
+    KeyAction::GlobalOpenDriveU,
+    KeyAction::GlobalOpenDriveV,
+    KeyAction::GlobalOpenDriveW,
+    KeyAction::GlobalOpenDriveX,
+    KeyAction::GlobalOpenDriveY,
+    KeyAction::GlobalOpenDriveZ,
+];
+
+pub const GLOBAL_LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
+    KeyAction::GlobalFavoritePrev,
+    KeyAction::GlobalFavoriteNext,
+    KeyAction::GlobalOpenFavorite1,
+    KeyAction::GlobalOpenFavorite2,
+    KeyAction::GlobalOpenFavorite3,
+    KeyAction::GlobalOpenFavorite4,
+    KeyAction::GlobalOpenFavorite5,
+    KeyAction::GlobalOpenFavorite6,
+    KeyAction::GlobalOpenFavorite7,
+    KeyAction::GlobalOpenFavorite8,
+    KeyAction::GlobalOpenFavorite9,
+    KeyAction::GlobalOpenFavorite10,
+    KeyAction::GlobalOpenFavorite11,
+    KeyAction::GlobalOpenFavorite12,
+    KeyAction::GlobalOpenFavorite13,
+    KeyAction::GlobalOpenFavorite14,
+    KeyAction::GlobalOpenFavorite15,
+    KeyAction::GlobalOpenFavorite16,
+    KeyAction::GlobalOpenFavorite17,
+    KeyAction::GlobalOpenFavorite18,
+    KeyAction::GlobalOpenFavorite19,
+    KeyAction::GlobalOpenFavorite20,
+    KeyAction::GlobalOpenDriveC,
+    KeyAction::GlobalOpenDriveD,
+    KeyAction::GlobalOpenDriveE,
+    KeyAction::GlobalOpenDriveF,
+    KeyAction::GlobalOpenDriveG,
+    KeyAction::GlobalOpenDriveH,
+    KeyAction::GlobalOpenDriveI,
+    KeyAction::GlobalOpenDriveJ,
+    KeyAction::GlobalOpenDriveK,
+    KeyAction::GlobalOpenDriveL,
+    KeyAction::GlobalOpenDriveM,
+    KeyAction::GlobalOpenDriveN,
+    KeyAction::GlobalOpenDriveO,
+    KeyAction::GlobalOpenDriveP,
+    KeyAction::GlobalOpenDriveQ,
+    KeyAction::GlobalOpenDriveR,
+    KeyAction::GlobalOpenDriveS,
+    KeyAction::GlobalOpenDriveT,
+    KeyAction::GlobalOpenDriveU,
+    KeyAction::GlobalOpenDriveV,
+    KeyAction::GlobalOpenDriveW,
+    KeyAction::GlobalOpenDriveX,
+    KeyAction::GlobalOpenDriveY,
+    KeyAction::GlobalOpenDriveZ,
+    KeyAction::GlobalOpenLocationDriveList,
+    KeyAction::GlobalOpenLocationReadingHistory,
+    KeyAction::GlobalOpenLocationRating1,
+    KeyAction::GlobalOpenLocationRating2,
+    KeyAction::GlobalOpenLocationRating3,
+    KeyAction::GlobalOpenLocationRating4,
+    KeyAction::GlobalOpenLocationRating5,
+    KeyAction::GlobalOpenLocationBooksRoot,
+    KeyAction::GlobalOpenLocationDesktop,
+    KeyAction::GlobalOpenLocationPictures,
+    KeyAction::GlobalOpenLocationDownloads,
+];
+
 fn rating_actions(container: bool) -> &'static [(KeyAction, u8)] {
     if container {
         RATING_CONTAINER_ACTIONS
@@ -1831,8 +2063,105 @@ impl KeyAction {
         ALL_ACTIONS
     }
 
+    pub fn favorite_slot_action(slot: usize) -> Option<Self> {
+        FAVORITE_LOCATION_ACTIONS.get(slot.checked_sub(1)?).copied()
+    }
+
+    pub fn favorite_slot_number(self) -> Option<usize> {
+        FAVORITE_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
+    pub fn drive_action(letter: char) -> Option<Self> {
+        let upper = letter.to_ascii_uppercase();
+        if !('C'..='Z').contains(&upper) {
+            return None;
+        }
+        DRIVE_LOCATION_ACTIONS
+            .get((upper as u8 - b'C') as usize)
+            .copied()
+    }
+
+    pub fn drive_letter(self) -> Option<char> {
+        DRIVE_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| (b'C' + idx as u8) as char)
+    }
+
+    pub fn location_rating_stars(self) -> Option<u8> {
+        match self {
+            Self::GlobalOpenLocationRating1 => Some(1),
+            Self::GlobalOpenLocationRating2 => Some(2),
+            Self::GlobalOpenLocationRating3 => Some(3),
+            Self::GlobalOpenLocationRating4 => Some(4),
+            Self::GlobalOpenLocationRating5 => Some(5),
+            _ => None,
+        }
+    }
+
+    pub fn is_location_navigation_action(self) -> bool {
+        GLOBAL_LOCATION_NAVIGATION_ACTIONS.contains(&self)
+    }
+
     pub fn ini_name(self) -> &'static str {
         use KeyAction::*;
+        if let Some(slot) = self.favorite_slot_number() {
+            return match slot {
+                1 => "GlobalOpenFavorite1",
+                2 => "GlobalOpenFavorite2",
+                3 => "GlobalOpenFavorite3",
+                4 => "GlobalOpenFavorite4",
+                5 => "GlobalOpenFavorite5",
+                6 => "GlobalOpenFavorite6",
+                7 => "GlobalOpenFavorite7",
+                8 => "GlobalOpenFavorite8",
+                9 => "GlobalOpenFavorite9",
+                10 => "GlobalOpenFavorite10",
+                11 => "GlobalOpenFavorite11",
+                12 => "GlobalOpenFavorite12",
+                13 => "GlobalOpenFavorite13",
+                14 => "GlobalOpenFavorite14",
+                15 => "GlobalOpenFavorite15",
+                16 => "GlobalOpenFavorite16",
+                17 => "GlobalOpenFavorite17",
+                18 => "GlobalOpenFavorite18",
+                19 => "GlobalOpenFavorite19",
+                20 => "GlobalOpenFavorite20",
+                _ => unreachable!("favorite slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(letter) = self.drive_letter() {
+            return match letter {
+                'C' => "GlobalOpenDriveC",
+                'D' => "GlobalOpenDriveD",
+                'E' => "GlobalOpenDriveE",
+                'F' => "GlobalOpenDriveF",
+                'G' => "GlobalOpenDriveG",
+                'H' => "GlobalOpenDriveH",
+                'I' => "GlobalOpenDriveI",
+                'J' => "GlobalOpenDriveJ",
+                'K' => "GlobalOpenDriveK",
+                'L' => "GlobalOpenDriveL",
+                'M' => "GlobalOpenDriveM",
+                'N' => "GlobalOpenDriveN",
+                'O' => "GlobalOpenDriveO",
+                'P' => "GlobalOpenDriveP",
+                'Q' => "GlobalOpenDriveQ",
+                'R' => "GlobalOpenDriveR",
+                'S' => "GlobalOpenDriveS",
+                'T' => "GlobalOpenDriveT",
+                'U' => "GlobalOpenDriveU",
+                'V' => "GlobalOpenDriveV",
+                'W' => "GlobalOpenDriveW",
+                'X' => "GlobalOpenDriveX",
+                'Y' => "GlobalOpenDriveY",
+                'Z' => "GlobalOpenDriveZ",
+                _ => unreachable!("drive letter is constrained to C..=Z"),
+            };
+        }
         match self {
             GlobalLocalSearch => "GlobalLocalSearch",
             GlobalFavSearch => "GlobalFavSearch",
@@ -1840,6 +2169,34 @@ impl KeyAction {
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
+            GlobalFavoritePrev => "GlobalFavoritePrev",
+            GlobalFavoriteNext => "GlobalFavoriteNext",
+            GlobalOpenFavorite1 | GlobalOpenFavorite2 | GlobalOpenFavorite3
+            | GlobalOpenFavorite4 | GlobalOpenFavorite5 | GlobalOpenFavorite6
+            | GlobalOpenFavorite7 | GlobalOpenFavorite8 | GlobalOpenFavorite9
+            | GlobalOpenFavorite10 | GlobalOpenFavorite11 | GlobalOpenFavorite12
+            | GlobalOpenFavorite13 | GlobalOpenFavorite14 | GlobalOpenFavorite15
+            | GlobalOpenFavorite16 | GlobalOpenFavorite17 | GlobalOpenFavorite18
+            | GlobalOpenFavorite19 | GlobalOpenFavorite20 | GlobalOpenDriveC | GlobalOpenDriveD
+            | GlobalOpenDriveE | GlobalOpenDriveF | GlobalOpenDriveG | GlobalOpenDriveH
+            | GlobalOpenDriveI | GlobalOpenDriveJ | GlobalOpenDriveK | GlobalOpenDriveL
+            | GlobalOpenDriveM | GlobalOpenDriveN | GlobalOpenDriveO | GlobalOpenDriveP
+            | GlobalOpenDriveQ | GlobalOpenDriveR | GlobalOpenDriveS | GlobalOpenDriveT
+            | GlobalOpenDriveU | GlobalOpenDriveV | GlobalOpenDriveW | GlobalOpenDriveX
+            | GlobalOpenDriveY | GlobalOpenDriveZ => {
+                unreachable!("handled by compact location helpers")
+            }
+            GlobalOpenLocationDriveList => "GlobalOpenLocationDriveList",
+            GlobalOpenLocationReadingHistory => "GlobalOpenLocationReadingHistory",
+            GlobalOpenLocationRating1 => "GlobalOpenLocationRating1",
+            GlobalOpenLocationRating2 => "GlobalOpenLocationRating2",
+            GlobalOpenLocationRating3 => "GlobalOpenLocationRating3",
+            GlobalOpenLocationRating4 => "GlobalOpenLocationRating4",
+            GlobalOpenLocationRating5 => "GlobalOpenLocationRating5",
+            GlobalOpenLocationBooksRoot => "GlobalOpenLocationBooksRoot",
+            GlobalOpenLocationDesktop => "GlobalOpenLocationDesktop",
+            GlobalOpenLocationPictures => "GlobalOpenLocationPictures",
+            GlobalOpenLocationDownloads => "GlobalOpenLocationDownloads",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
@@ -1889,8 +2246,12 @@ impl KeyAction {
             FsCtrlNavNext => "FsCtrlNavNext",
             FsSiblingPrev => "FsSiblingPrev",
             FsSiblingNext => "FsSiblingNext",
+            FsPagePrev => "FsPagePrev",
+            FsPageNext => "FsPageNext",
             FsFixedJumpPrev => "FsFixedJumpPrev",
             FsFixedJumpNext => "FsFixedJumpNext",
+            FsFixedJumpPrevNoRtl => "FsFixedJumpPrevNoRtl",
+            FsFixedJumpNextNoRtl => "FsFixedJumpNextNoRtl",
             FsStackJumpPrev => "FsStackJumpPrev",
             FsStackJumpNext => "FsStackJumpNext",
             RatingItem1 => "RatingItem1",
@@ -2054,6 +2415,60 @@ impl KeyAction {
 
     pub fn description(self) -> &'static str {
         use KeyAction::*;
+        if let Some(slot) = self.favorite_slot_number() {
+            return match slot {
+                1 => "お気に入り1を開く",
+                2 => "お気に入り2を開く",
+                3 => "お気に入り3を開く",
+                4 => "お気に入り4を開く",
+                5 => "お気に入り5を開く",
+                6 => "お気に入り6を開く",
+                7 => "お気に入り7を開く",
+                8 => "お気に入り8を開く",
+                9 => "お気に入り9を開く",
+                10 => "お気に入り10を開く",
+                11 => "お気に入り11を開く",
+                12 => "お気に入り12を開く",
+                13 => "お気に入り13を開く",
+                14 => "お気に入り14を開く",
+                15 => "お気に入り15を開く",
+                16 => "お気に入り16を開く",
+                17 => "お気に入り17を開く",
+                18 => "お気に入り18を開く",
+                19 => "お気に入り19を開く",
+                20 => "お気に入り20を開く",
+                _ => unreachable!("favorite slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(letter) = self.drive_letter() {
+            return match letter {
+                'C' => "C:\\を開く",
+                'D' => "D:\\を開く",
+                'E' => "E:\\を開く",
+                'F' => "F:\\を開く",
+                'G' => "G:\\を開く",
+                'H' => "H:\\を開く",
+                'I' => "I:\\を開く",
+                'J' => "J:\\を開く",
+                'K' => "K:\\を開く",
+                'L' => "L:\\を開く",
+                'M' => "M:\\を開く",
+                'N' => "N:\\を開く",
+                'O' => "O:\\を開く",
+                'P' => "P:\\を開く",
+                'Q' => "Q:\\を開く",
+                'R' => "R:\\を開く",
+                'S' => "S:\\を開く",
+                'T' => "T:\\を開く",
+                'U' => "U:\\を開く",
+                'V' => "V:\\を開く",
+                'W' => "W:\\を開く",
+                'X' => "X:\\を開く",
+                'Y' => "Y:\\を開く",
+                'Z' => "Z:\\を開く",
+                _ => unreachable!("drive letter is constrained to C..=Z"),
+            };
+        }
         match self {
             GlobalLocalSearch => "現在地の一覧を絞り込み検索する",
             GlobalFavSearch => "お気に入りフォルダを横断検索する",
@@ -2061,6 +2476,34 @@ impl KeyAction {
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
+            GlobalFavoritePrev => "前のお気に入りへ移動する",
+            GlobalFavoriteNext => "次のお気に入りへ移動する",
+            GlobalOpenFavorite1 | GlobalOpenFavorite2 | GlobalOpenFavorite3
+            | GlobalOpenFavorite4 | GlobalOpenFavorite5 | GlobalOpenFavorite6
+            | GlobalOpenFavorite7 | GlobalOpenFavorite8 | GlobalOpenFavorite9
+            | GlobalOpenFavorite10 | GlobalOpenFavorite11 | GlobalOpenFavorite12
+            | GlobalOpenFavorite13 | GlobalOpenFavorite14 | GlobalOpenFavorite15
+            | GlobalOpenFavorite16 | GlobalOpenFavorite17 | GlobalOpenFavorite18
+            | GlobalOpenFavorite19 | GlobalOpenFavorite20 | GlobalOpenDriveC | GlobalOpenDriveD
+            | GlobalOpenDriveE | GlobalOpenDriveF | GlobalOpenDriveG | GlobalOpenDriveH
+            | GlobalOpenDriveI | GlobalOpenDriveJ | GlobalOpenDriveK | GlobalOpenDriveL
+            | GlobalOpenDriveM | GlobalOpenDriveN | GlobalOpenDriveO | GlobalOpenDriveP
+            | GlobalOpenDriveQ | GlobalOpenDriveR | GlobalOpenDriveS | GlobalOpenDriveT
+            | GlobalOpenDriveU | GlobalOpenDriveV | GlobalOpenDriveW | GlobalOpenDriveX
+            | GlobalOpenDriveY | GlobalOpenDriveZ => {
+                unreachable!("handled by compact location helpers")
+            }
+            GlobalOpenLocationDriveList => "ドライブ一覧を開く",
+            GlobalOpenLocationReadingHistory => "読書履歴を開く",
+            GlobalOpenLocationRating1 => "★1一覧を開く",
+            GlobalOpenLocationRating2 => "★2一覧を開く",
+            GlobalOpenLocationRating3 => "★3一覧を開く",
+            GlobalOpenLocationRating4 => "★4一覧を開く",
+            GlobalOpenLocationRating5 => "★5一覧を開く",
+            GlobalOpenLocationBooksRoot => "本棚フォルダを開く",
+            GlobalOpenLocationDesktop => "デスクトップを開く",
+            GlobalOpenLocationPictures => "ピクチャを開く",
+            GlobalOpenLocationDownloads => "ダウンロードを開く",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -2110,8 +2553,12 @@ impl KeyAction {
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
             FsSiblingNext => "次の兄弟フォルダへ移動する",
-            FsFixedJumpPrev => "設定した量だけ前へジャンプする",
-            FsFixedJumpNext => "設定した量だけ先へジャンプする",
+            FsPagePrev => "前のページへ移動する",
+            FsPageNext => "次のページへ移動する",
+            FsFixedJumpPrev => "設定した量だけ前へジャンプする (右→左読みで反転)",
+            FsFixedJumpNext => "設定した量だけ先へジャンプする (右→左読みで反転)",
+            FsFixedJumpPrevNoRtl => "設定した量だけ前へジャンプする (右→左読みで反転しない)",
+            FsFixedJumpNextNoRtl => "設定した量だけ先へジャンプする (右→左読みで反転しない)",
             FsStackJumpPrev => "前のスタックの先頭画像へジャンプする",
             FsStackJumpNext => "次のスタックの先頭画像へジャンプする",
             RatingItem1 => "現在の画像または動画に星1を付ける",
@@ -2274,7 +2721,64 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
-            | HelpShowContextShortcuts => KeyContext::Global,
+            | HelpShowContextShortcuts
+            | GlobalFavoritePrev
+            | GlobalFavoriteNext
+            | GlobalOpenFavorite1
+            | GlobalOpenFavorite2
+            | GlobalOpenFavorite3
+            | GlobalOpenFavorite4
+            | GlobalOpenFavorite5
+            | GlobalOpenFavorite6
+            | GlobalOpenFavorite7
+            | GlobalOpenFavorite8
+            | GlobalOpenFavorite9
+            | GlobalOpenFavorite10
+            | GlobalOpenFavorite11
+            | GlobalOpenFavorite12
+            | GlobalOpenFavorite13
+            | GlobalOpenFavorite14
+            | GlobalOpenFavorite15
+            | GlobalOpenFavorite16
+            | GlobalOpenFavorite17
+            | GlobalOpenFavorite18
+            | GlobalOpenFavorite19
+            | GlobalOpenFavorite20
+            | GlobalOpenDriveC
+            | GlobalOpenDriveD
+            | GlobalOpenDriveE
+            | GlobalOpenDriveF
+            | GlobalOpenDriveG
+            | GlobalOpenDriveH
+            | GlobalOpenDriveI
+            | GlobalOpenDriveJ
+            | GlobalOpenDriveK
+            | GlobalOpenDriveL
+            | GlobalOpenDriveM
+            | GlobalOpenDriveN
+            | GlobalOpenDriveO
+            | GlobalOpenDriveP
+            | GlobalOpenDriveQ
+            | GlobalOpenDriveR
+            | GlobalOpenDriveS
+            | GlobalOpenDriveT
+            | GlobalOpenDriveU
+            | GlobalOpenDriveV
+            | GlobalOpenDriveW
+            | GlobalOpenDriveX
+            | GlobalOpenDriveY
+            | GlobalOpenDriveZ
+            | GlobalOpenLocationDriveList
+            | GlobalOpenLocationReadingHistory
+            | GlobalOpenLocationRating1
+            | GlobalOpenLocationRating2
+            | GlobalOpenLocationRating3
+            | GlobalOpenLocationRating4
+            | GlobalOpenLocationRating5
+            | GlobalOpenLocationBooksRoot
+            | GlobalOpenLocationDesktop
+            | GlobalOpenLocationPictures
+            | GlobalOpenLocationDownloads => KeyContext::Global,
             GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -2327,8 +2831,12 @@ impl KeyAction {
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
+            | FsPagePrev
+            | FsPageNext
             | FsFixedJumpPrev
             | FsFixedJumpNext
+            | FsFixedJumpPrevNoRtl
+            | FsFixedJumpNextNoRtl
             | FsStackJumpPrev
             | FsStackJumpNext
             | FsSlideshow
@@ -2422,6 +2930,63 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | HelpShowContextShortcuts
+            | GlobalFavoritePrev
+            | GlobalFavoriteNext
+            | GlobalOpenFavorite1
+            | GlobalOpenFavorite2
+            | GlobalOpenFavorite3
+            | GlobalOpenFavorite4
+            | GlobalOpenFavorite5
+            | GlobalOpenFavorite6
+            | GlobalOpenFavorite7
+            | GlobalOpenFavorite8
+            | GlobalOpenFavorite9
+            | GlobalOpenFavorite10
+            | GlobalOpenFavorite11
+            | GlobalOpenFavorite12
+            | GlobalOpenFavorite13
+            | GlobalOpenFavorite14
+            | GlobalOpenFavorite15
+            | GlobalOpenFavorite16
+            | GlobalOpenFavorite17
+            | GlobalOpenFavorite18
+            | GlobalOpenFavorite19
+            | GlobalOpenFavorite20
+            | GlobalOpenDriveC
+            | GlobalOpenDriveD
+            | GlobalOpenDriveE
+            | GlobalOpenDriveF
+            | GlobalOpenDriveG
+            | GlobalOpenDriveH
+            | GlobalOpenDriveI
+            | GlobalOpenDriveJ
+            | GlobalOpenDriveK
+            | GlobalOpenDriveL
+            | GlobalOpenDriveM
+            | GlobalOpenDriveN
+            | GlobalOpenDriveO
+            | GlobalOpenDriveP
+            | GlobalOpenDriveQ
+            | GlobalOpenDriveR
+            | GlobalOpenDriveS
+            | GlobalOpenDriveT
+            | GlobalOpenDriveU
+            | GlobalOpenDriveV
+            | GlobalOpenDriveW
+            | GlobalOpenDriveX
+            | GlobalOpenDriveY
+            | GlobalOpenDriveZ
+            | GlobalOpenLocationDriveList
+            | GlobalOpenLocationReadingHistory
+            | GlobalOpenLocationRating1
+            | GlobalOpenLocationRating2
+            | GlobalOpenLocationRating3
+            | GlobalOpenLocationRating4
+            | GlobalOpenLocationRating5
+            | GlobalOpenLocationBooksRoot
+            | GlobalOpenLocationDesktop
+            | GlobalOpenLocationPictures
+            | GlobalOpenLocationDownloads
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -2471,8 +3036,12 @@ impl KeyAction {
             | FsCtrlNavNext
             | FsSiblingPrev
             | FsSiblingNext
+            | FsPagePrev
+            | FsPageNext
             | FsFixedJumpPrev
             | FsFixedJumpNext
+            | FsFixedJumpPrevNoRtl
+            | FsFixedJumpNextNoRtl
             | FsStackJumpPrev
             | FsStackJumpNext
             | RatingItem1
@@ -2630,6 +3199,63 @@ impl KeyAction {
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
+            GlobalFavoritePrev
+            | GlobalFavoriteNext
+            | GlobalOpenFavorite1
+            | GlobalOpenFavorite2
+            | GlobalOpenFavorite3
+            | GlobalOpenFavorite4
+            | GlobalOpenFavorite5
+            | GlobalOpenFavorite6
+            | GlobalOpenFavorite7
+            | GlobalOpenFavorite8
+            | GlobalOpenFavorite9
+            | GlobalOpenFavorite10
+            | GlobalOpenFavorite11
+            | GlobalOpenFavorite12
+            | GlobalOpenFavorite13
+            | GlobalOpenFavorite14
+            | GlobalOpenFavorite15
+            | GlobalOpenFavorite16
+            | GlobalOpenFavorite17
+            | GlobalOpenFavorite18
+            | GlobalOpenFavorite19
+            | GlobalOpenFavorite20
+            | GlobalOpenDriveC
+            | GlobalOpenDriveD
+            | GlobalOpenDriveE
+            | GlobalOpenDriveF
+            | GlobalOpenDriveG
+            | GlobalOpenDriveH
+            | GlobalOpenDriveI
+            | GlobalOpenDriveJ
+            | GlobalOpenDriveK
+            | GlobalOpenDriveL
+            | GlobalOpenDriveM
+            | GlobalOpenDriveN
+            | GlobalOpenDriveO
+            | GlobalOpenDriveP
+            | GlobalOpenDriveQ
+            | GlobalOpenDriveR
+            | GlobalOpenDriveS
+            | GlobalOpenDriveT
+            | GlobalOpenDriveU
+            | GlobalOpenDriveV
+            | GlobalOpenDriveW
+            | GlobalOpenDriveX
+            | GlobalOpenDriveY
+            | GlobalOpenDriveZ
+            | GlobalOpenLocationDriveList
+            | GlobalOpenLocationReadingHistory
+            | GlobalOpenLocationRating1
+            | GlobalOpenLocationRating2
+            | GlobalOpenLocationRating3
+            | GlobalOpenLocationRating4
+            | GlobalOpenLocationRating5
+            | GlobalOpenLocationBooksRoot
+            | GlobalOpenLocationDesktop
+            | GlobalOpenLocationPictures
+            | GlobalOpenLocationDownloads => ChordList::EMPTY,
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -2679,8 +3305,11 @@ impl KeyAction {
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
+            FsPagePrev | FsPageNext => ChordList::EMPTY,
             FsFixedJumpPrev => ChordList::one(Chord::shift(Left)),
             FsFixedJumpNext => ChordList::one(Chord::shift(Right)),
+            FsFixedJumpPrevNoRtl => ChordList::one(Chord::key(PageUp)),
+            FsFixedJumpNextNoRtl => ChordList::one(Chord::key(PageDown)),
             FsStackJumpPrev => ChordList::one(Chord::shift(Up)),
             FsStackJumpNext => ChordList::one(Chord::shift(Down)),
             RatingItem1 => ChordList::one(Chord::key(F1)),
@@ -3711,12 +4340,25 @@ impl Keymap {
         self.matches_vk_action_parts(action, key.virtual_key, key.ctrl, key.shift, key.alt)
     }
 
+    #[cfg(windows)]
+    pub fn matching_vk_action(
+        &self,
+        actions: &[KeyAction],
+        key: &crate::video::native_window::NativeVideoKeyEvent,
+    ) -> Option<KeyAction> {
+        actions
+            .iter()
+            .copied()
+            .find(|action| self.matches_vk_action(*action, key))
+    }
+
     pub fn install_global_native_video_shortcuts(&self) {
         let mut chords = Vec::new();
         for action in KeyAction::all().iter().copied().filter(|action| {
             matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
                 || *action == KeyAction::ToggleDetachedViewerMode
                 || *action == KeyAction::FsToggleWindowMode
+                || action.is_location_navigation_action()
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -4155,6 +4797,7 @@ pub fn native_video_fullscreen_shortcut_key(
             matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
                 || *action == KeyAction::ToggleDetachedViewerMode
                 || *action == KeyAction::FsToggleWindowMode
+                || action.is_location_navigation_action()
         })
         .any(|action| fallback.matches_vk_action(action, key))
 }
@@ -5059,6 +5702,82 @@ mod tests {
         assert_eq!(KeyAction::GridParentFolder.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridToggleMaximize.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::FsToggleWindowMode.trigger(), KeyTrigger::Press);
+    }
+
+    #[test]
+    fn location_navigation_actions_are_global_and_default_unassigned() {
+        assert_eq!(
+            KeyAction::GlobalOpenFavorite1.favorite_slot_number(),
+            Some(1)
+        );
+        assert_eq!(
+            KeyAction::GlobalOpenFavorite20.favorite_slot_number(),
+            Some(20)
+        );
+        assert_eq!(
+            KeyAction::favorite_slot_action(1),
+            Some(KeyAction::GlobalOpenFavorite1)
+        );
+        assert_eq!(
+            KeyAction::favorite_slot_action(20),
+            Some(KeyAction::GlobalOpenFavorite20)
+        );
+        assert_eq!(KeyAction::GlobalOpenDriveC.drive_letter(), Some('C'));
+        assert_eq!(KeyAction::GlobalOpenDriveZ.drive_letter(), Some('Z'));
+        assert_eq!(
+            KeyAction::drive_action('c'),
+            Some(KeyAction::GlobalOpenDriveC)
+        );
+        assert_eq!(
+            KeyAction::drive_action('Z'),
+            Some(KeyAction::GlobalOpenDriveZ)
+        );
+
+        for action in GLOBAL_LOCATION_NAVIGATION_ACTIONS {
+            assert_eq!(action.context(), KeyContext::Global);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert!(action.is_location_navigation_action());
+        }
+    }
+
+    #[test]
+    fn fullscreen_page_and_fixed_jump_actions_match_default_shortcuts() {
+        assert!(KeyAction::FsPagePrev.default_chords().is_empty());
+        assert!(KeyAction::FsPageNext.default_chords().is_empty());
+        assert_eq!(
+            KeyAction::FsFixedJumpPrev.default_chords().iter().next(),
+            Some(Chord::shift(KeyName::Left))
+        );
+        assert_eq!(
+            KeyAction::FsFixedJumpNext.default_chords().iter().next(),
+            Some(Chord::shift(KeyName::Right))
+        );
+        assert_eq!(
+            KeyAction::FsFixedJumpPrevNoRtl
+                .default_chords()
+                .iter()
+                .next(),
+            Some(Chord::key(KeyName::PageUp))
+        );
+        assert_eq!(
+            KeyAction::FsFixedJumpNextNoRtl
+                .default_chords()
+                .iter()
+                .next(),
+            Some(Chord::key(KeyName::PageDown))
+        );
+        for action in [
+            KeyAction::FsPagePrev,
+            KeyAction::FsPageNext,
+            KeyAction::FsFixedJumpPrev,
+            KeyAction::FsFixedJumpNext,
+            KeyAction::FsFixedJumpPrevNoRtl,
+            KeyAction::FsFixedJumpNextNoRtl,
+        ] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+        }
     }
 
     #[test]

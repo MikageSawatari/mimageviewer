@@ -335,11 +335,15 @@ impl ShortcutHelpContext {
     }
 
     fn includes_row(self, row: &CommandDisplayRow) -> bool {
+        if row.spec.action.is_location_navigation_action() && row.shortcut_labels.is_empty() {
+            return false;
+        }
         match self {
             Self::Grid => true,
             Self::FsImage => {
                 row.spec.scope != CommandScope::Global
                     || row.spec.action == KeyAction::ToggleDetachedViewerMode
+                    || row.spec.action.is_location_navigation_action()
             }
             Self::FsVideo => video_help_includes_row(row),
             Self::Erase | Self::Conceal | Self::Crop | Self::LocalAdjust | Self::Text => true,
@@ -453,6 +457,7 @@ fn video_help_includes_row(row: &CommandDisplayRow) -> bool {
         | KeyAction::FsCtrlNavNext
         | KeyAction::FsSiblingPrev
         | KeyAction::FsSiblingNext => true,
+        action if action.is_location_navigation_action() => !row.shortcut_labels.is_empty(),
         KeyAction::VideoCompareToggle
         | KeyAction::VideoCompareCycle
         | KeyAction::VideoCompareWipe

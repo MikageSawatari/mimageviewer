@@ -6,7 +6,7 @@ use std::sync::{
     mpsc,
 };
 
-use crate::keymap::KeyAction;
+use crate::keymap::{CommandScope, GLOBAL_LOCATION_NAVIGATION_ACTIONS, KeyAction};
 
 mod cache_ops;
 mod color_filter;
@@ -18425,6 +18425,19 @@ impl App {
             return None;
         }
         if self.folder_pane_blocks_grid_keyboard() {
+            return None;
+        }
+
+        if let Some(action) = self.keymap.consume_first_action(
+            ctx,
+            &[CommandScope::Global],
+            GLOBAL_LOCATION_NAVIGATION_ACTIONS,
+        ) {
+            if let Some(nav) =
+                self.apply_global_location_key_action(ctx, action, "grid-location-key")
+            {
+                return Some(nav);
+            }
             return None;
         }
 

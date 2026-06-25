@@ -640,21 +640,39 @@ fn command_overview_rows(
             status.push("競合");
         }
         let mut assignments = vec![("キー", keymap.chord_labels(action))];
-        if let Some((context, ring_action)) = ring_binding_for_key_action(action) {
-            let ring =
-                ring_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action);
-            let mouse =
-                mouse_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action);
-            let mut pad = gamepad_ring_assignment_labels(
-                &state.settings.ring_shortcuts,
-                context,
-                &ring_action,
-            );
-            pad.extend(gamepad_button_assignment_labels(
-                &state.settings.ring_shortcuts,
-                context,
-                &ring_action,
-            ));
+        let ring_bindings = ring_bindings_for_key_action(action);
+        if !ring_bindings.is_empty() {
+            let multi_context = ring_bindings.len() > 1;
+            let mut ring = Vec::new();
+            let mut mouse = Vec::new();
+            let mut pad = Vec::new();
+            for (context, ring_action) in ring_bindings {
+                ring.extend(contextual_assignment_labels(
+                    ring_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action),
+                    context,
+                    multi_context,
+                ));
+                mouse.extend(contextual_assignment_labels(
+                    mouse_assignment_labels(&state.settings.ring_shortcuts, context, &ring_action),
+                    context,
+                    multi_context,
+                ));
+                let mut pad_for_context = gamepad_ring_assignment_labels(
+                    &state.settings.ring_shortcuts,
+                    context,
+                    &ring_action,
+                );
+                pad_for_context.extend(gamepad_button_assignment_labels(
+                    &state.settings.ring_shortcuts,
+                    context,
+                    &ring_action,
+                ));
+                pad.extend(contextual_assignment_labels(
+                    pad_for_context,
+                    context,
+                    multi_context,
+                ));
+            }
             if !ring.is_empty() || !mouse.is_empty() || !pad.is_empty() {
                 assignments.extend([("リング", ring), ("マウス", mouse), ("パッド", pad)]);
                 status.push("設定あり");
@@ -740,14 +758,55 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
     }
 }
 
-fn ring_binding_for_key_action(action: KeyAction) -> Option<(RingShortcutContext, RingActionId)> {
+fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, RingActionId)> {
+    let mut out = Vec::new();
+    if let Some(slot) = action.favorite_slot_number()
+        && let Some(ring_action) = RingActionId::favorite_slot_action(slot)
+    {
+        push_ring_binding_if_available(&mut out, RingShortcutContext::Grid, ring_action.clone());
+        push_ring_binding_if_available(
+            &mut out,
+            RingShortcutContext::ImageFullscreen,
+            ring_action.clone(),
+        );
+        push_ring_binding_if_available(&mut out, RingShortcutContext::VideoFullscreen, ring_action);
+        return out;
+    }
+    if let Some(letter) = action.drive_letter()
+        && let Some(ring_action) = RingActionId::drive_action(letter)
+    {
+        push_ring_binding_if_available(&mut out, RingShortcutContext::Grid, ring_action.clone());
+        push_ring_binding_if_available(
+            &mut out,
+            RingShortcutContext::ImageFullscreen,
+            ring_action.clone(),
+        );
+        push_ring_binding_if_available(&mut out, RingShortcutContext::VideoFullscreen, ring_action);
+        return out;
+    }
+    if let Some(ring_action) = location_ring_action_for_key_action(action) {
+        push_ring_binding_if_available(&mut out, RingShortcutContext::Grid, ring_action.clone());
+        push_ring_binding_if_available(
+            &mut out,
+            RingShortcutContext::ImageFullscreen,
+            ring_action.clone(),
+        );
+        push_ring_binding_if_available(&mut out, RingShortcutContext::VideoFullscreen, ring_action);
+        return out;
+    }
+
     let context = match action.context() {
         crate::keymap::KeyContext::Grid => RingShortcutContext::Grid,
         crate::keymap::KeyContext::FsImage => RingShortcutContext::ImageFullscreen,
         crate::keymap::KeyContext::FsVideo => RingShortcutContext::VideoFullscreen,
-        _ => return None,
+        _ => return out,
     };
     let ring_action = match action {
+        KeyAction::GridParentFolder => RingActionId::GridParentFolder,
+        KeyAction::GridToggleCheck => RingActionId::GridToggleCheck,
+        KeyAction::GridSelectAll => RingActionId::GridSelectAll,
+        KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,
+        KeyAction::GridToggleMaximize => RingActionId::ToggleMaximize,
         KeyAction::GridColumnCount1 => RingActionId::GridColumnCount1,
         KeyAction::GridColumnCount2 => RingActionId::GridColumnCount2,
         KeyAction::GridColumnCount3 => RingActionId::GridColumnCount3,
@@ -758,28 +817,83 @@ fn ring_binding_for_key_action(action: KeyAction) -> Option<(RingShortcutContext
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
-        _ => return None,
+        KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
+        KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
+        KeyAction::FsRotateCw => RingActionId::ImageRotateRight,
+        KeyAction::FsRotateCcw => RingActionId::ImageRotateLeft,
+        KeyAction::FsCapture => RingActionId::ImageCapture,
+        KeyAction::FsSlideshow => RingActionId::ImageSlideshow,
+        KeyAction::FsPixelGrid => RingActionId::ImagePixelGrid,
+        KeyAction::FsBgCycle => RingActionId::ImageBackgroundCycle,
+        KeyAction::FsCompareToggle => RingActionId::ImageComparePin,
+        KeyAction::VideoCapture => RingActionId::VideoCapture,
+        KeyAction::VideoMute => RingActionId::VideoMute,
+        KeyAction::VideoLoop => RingActionId::VideoLoop,
+        KeyAction::VideoBookmark => RingActionId::VideoBookmark,
+        KeyAction::VideoMarkerPrev => RingActionId::VideoMarkerPrev,
+        KeyAction::VideoMarkerNext => RingActionId::VideoMarkerNext,
+        KeyAction::VideoTileMode => RingActionId::VideoTileMode,
+        KeyAction::VideoExternalPlayer => RingActionId::VideoExternalPlayer,
+        _ => return out,
     };
-    Some((context, ring_action))
+    push_ring_binding_if_available(&mut out, context, ring_action);
+    out
+}
+
+fn ring_binding_for_key_action(action: KeyAction) -> Option<(RingShortcutContext, RingActionId)> {
+    ring_bindings_for_key_action(action).into_iter().next()
+}
+
+fn push_ring_binding_if_available(
+    out: &mut Vec<(RingShortcutContext, RingActionId)>,
+    context: RingShortcutContext,
+    action: RingActionId,
+) {
+    if RingActionId::available_for_context(context).contains(&action) {
+        out.push((context, action));
+    }
+}
+
+fn location_ring_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
+    Some(match action {
+        KeyAction::GlobalOpenLocationDriveList => RingActionId::OpenLocationDriveList,
+        KeyAction::GlobalOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
+        KeyAction::GlobalOpenLocationRating1 => RingActionId::OpenLocationRating1,
+        KeyAction::GlobalOpenLocationRating2 => RingActionId::OpenLocationRating2,
+        KeyAction::GlobalOpenLocationRating3 => RingActionId::OpenLocationRating3,
+        KeyAction::GlobalOpenLocationRating4 => RingActionId::OpenLocationRating4,
+        KeyAction::GlobalOpenLocationRating5 => RingActionId::OpenLocationRating5,
+        KeyAction::GlobalOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
+        KeyAction::GlobalOpenLocationDesktop => RingActionId::OpenLocationDesktop,
+        KeyAction::GlobalOpenLocationPictures => RingActionId::OpenLocationPictures,
+        KeyAction::GlobalOpenLocationDownloads => RingActionId::OpenLocationDownloads,
+        _ => return None,
+    })
 }
 
 fn ring_action_has_key_action(context: RingShortcutContext, action: &RingActionId) -> bool {
-    matches!(
-        (context, action),
-        (
-            RingShortcutContext::Grid,
-            RingActionId::GridColumnCount1
-                | RingActionId::GridColumnCount2
-                | RingActionId::GridColumnCount3
-                | RingActionId::GridColumnCount4
-                | RingActionId::GridColumnCount5
-                | RingActionId::GridColumnCount6
-                | RingActionId::GridColumnCount7
-                | RingActionId::GridColumnCount8
-                | RingActionId::GridColumnCount9
-                | RingActionId::GridColumnCount10
-        )
-    )
+    KeyAction::all()
+        .iter()
+        .copied()
+        .flat_map(ring_bindings_for_key_action)
+        .any(|(binding_context, binding_action)| {
+            binding_context == context && binding_action == *action
+        })
+}
+
+fn contextual_assignment_labels(
+    labels: Vec<String>,
+    context: RingShortcutContext,
+    include_context: bool,
+) -> Vec<String> {
+    if include_context {
+        labels
+            .into_iter()
+            .map(|label| format!("{}: {label}", context.label()))
+            .collect()
+    } else {
+        labels
+    }
 }
 
 fn compact_operation_label(label: &str) -> String {
