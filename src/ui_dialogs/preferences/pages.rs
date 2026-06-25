@@ -2255,44 +2255,44 @@ fn command_editor_for_action(
     }
 
     ui.add_space(8.0);
-    egui::Grid::new("command_editor_slots")
-        .num_columns(3)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            for (idx, input) in state.command_chord_inputs.iter_mut().enumerate() {
-                ui.label(format!("キー {}", idx + 1));
-                ui.add(
-                    egui::TextEdit::singleline(input)
-                        .desired_width(160.0)
-                        .hint_text(if idx == 0 {
-                            "例: Ctrl+F / F13 / none"
-                        } else {
-                            ""
-                        }),
-                );
-                let capture_active = state.command_capture_slot == Some(idx);
-                let can_capture = action.trigger() != KeyTrigger::ModifierHold;
-                let capture_label = if capture_active {
-                    "入力待ち..."
-                } else {
-                    "押して入力"
-                };
-                if ui
-                    .add_enabled(can_capture, egui::Button::new(capture_label).small())
-                    .on_hover_text(if can_capture {
-                        "次に押したキーをこの欄へ入れます。Esc でキャンセルします"
+    let modifier_hold = action.trigger() == KeyTrigger::ModifierHold;
+    if modifier_hold {
+        modifier_hold_command_editor(ui, state);
+    } else {
+        egui::Grid::new("command_editor_slots")
+            .num_columns(3)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                for (idx, input) in state.command_chord_inputs.iter_mut().enumerate() {
+                    ui.label(format!("キー {}", idx + 1));
+                    ui.add(
+                        egui::TextEdit::singleline(input)
+                            .desired_width(160.0)
+                            .hint_text(if idx == 0 {
+                                "例: Ctrl+F / F13 / none"
+                            } else {
+                                ""
+                            }),
+                    );
+                    let capture_active = state.command_capture_slot == Some(idx);
+                    let capture_label = if capture_active {
+                        "入力待ち..."
                     } else {
-                        "修飾キー長押しは Ctrl / Shift / Alt を手入力してください"
-                    })
-                    .clicked()
-                {
-                    state.command_capture_slot = Some(idx);
-                    state.command_edit_error = None;
+                        "押して入力"
+                    };
+                    if ui
+                        .add(egui::Button::new(capture_label).small())
+                        .on_hover_text("次に押したキーをこの欄へ入れます。Esc でキャンセルします")
+                        .clicked()
+                    {
+                        state.command_capture_slot = Some(idx);
+                        state.command_edit_error = None;
+                    }
+                    ui.end_row();
                 }
-                ui.end_row();
-            }
-        });
-    ui.small("空欄は無視します。すべて空欄、または none を入力すると割り当て解除になります。");
+            });
+        ui.small("空欄は無視します。すべて空欄、または none を入力すると割り当て解除になります。");
+    }
 
     if let Some(error) = &state.command_edit_error {
         ui.colored_label(egui::Color32::from_rgb(220, 90, 80), error);
@@ -2305,7 +2305,7 @@ fn command_editor_for_action(
                 close_assignment_editors(state);
             }
         }
-        if ui.button("割り当て解除").clicked() {
+        if !modifier_hold && ui.button("割り当て解除").clicked() {
             state.settings.keymap.disable_action(action);
             state.command_chord_inputs = std::array::from_fn(|_| String::new());
             state.command_edit_loaded_for = Some(action);
@@ -2361,6 +2361,54 @@ fn command_editor_for_action(
             });
         }
     }
+}
+
+fn modifier_hold_command_editor(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.label("長押しに使う修飾キー:");
+    ui.horizontal_wrapped(|ui| {
+        for label in ["Ctrl", "Shift", "Alt"] {
+            let selected = modifier_hold_editor_choice(&state.command_chord_inputs) == Some(label);
+            if ui.selectable_label(selected, label).clicked() {
+                set_single_command_chord_input(state, label);
+            }
+        }
+        let disabled = modifier_hold_editor_choice(&state.command_chord_inputs).is_none();
+        if ui.selectable_label(disabled, "割り当て解除").clicked() {
+            state.command_chord_inputs = std::array::from_fn(|_| String::new());
+            state.command_capture_slot = None;
+            state.command_edit_error = None;
+        }
+    });
+    ui.small("Ctrl / Shift / Alt のいずれか、または割り当て解除を選んでから「適用して閉じる」を押します。");
+}
+
+fn modifier_hold_editor_choice(inputs: &[String; 3]) -> Option<&'static str> {
+    let mut labels = inputs.iter().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let first = labels.next()?;
+    if labels.next().is_some() || first.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if first.eq_ignore_ascii_case("ctrl") || first.eq_ignore_ascii_case("control") {
+        Some("Ctrl")
+    } else if first.eq_ignore_ascii_case("shift") {
+        Some("Shift")
+    } else if first.eq_ignore_ascii_case("alt") {
+        Some("Alt")
+    } else {
+        None
+    }
+}
+
+fn set_single_command_chord_input(state: &mut PreferencesState, label: &str) {
+    state.command_chord_inputs = std::array::from_fn(|idx| {
+        if idx == 0 {
+            label.to_string()
+        } else {
+            String::new()
+        }
+    });
+    state.command_capture_slot = None;
+    state.command_edit_error = None;
 }
 
 fn assignment_values(ui: &mut egui::Ui, values: &[String]) {
