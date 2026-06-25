@@ -4787,6 +4787,11 @@ impl Settings {
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
+        // ── 操作カスタマイズ (設定メニューの専用ダイアログで編集) ──
+        // 環境設定を開いたままキー / 右ドラッグ / リング / ジェスチャ設定を変更して OK した場合、
+        // 環境設定側の古い snapshot で巻き戻らないよう live 値を引き継ぐ。
+        self.keymap = src.keymap.clone();
+        self.ring_shortcuts = src.ring_shortcuts.clone();
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
