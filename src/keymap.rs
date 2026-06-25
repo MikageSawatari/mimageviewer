@@ -2872,13 +2872,15 @@ impl KeyAction {
             | GridApplyConceal2
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
-            FsToggleMetadata | FsToggleWindowMode | FsCtrlNavPrev | FsCtrlNavNext
-            | FsSiblingPrev | FsSiblingNext => KeyContext::FsCommon,
+            FsToggleWindowMode | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
+                KeyContext::FsCommon
+            }
             RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
             | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
             | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
+            | FsToggleMetadata
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
             | FsPagePrev
@@ -5700,6 +5702,51 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_metadata_action_is_image_scoped_not_video_scoped() {
+        assert_eq!(KeyAction::FsToggleMetadata.context(), KeyContext::FsImage);
+        for action in [
+            KeyAction::FsToggleWindowMode,
+            KeyAction::FsCtrlNavPrev,
+            KeyAction::FsCtrlNavNext,
+            KeyAction::FsSiblingPrev,
+            KeyAction::FsSiblingNext,
+        ] {
+            assert_eq!(action.context(), KeyContext::FsCommon);
+        }
+
+        let keymap = Keymap::empty();
+        let image_rows =
+            keymap.command_display_rows_for_active_scopes(FS_IMAGE_ACTIVE_SCOPES, false);
+        assert!(
+            image_rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsToggleMetadata),
+            "image fullscreen help should include metadata toggle"
+        );
+
+        let video_rows =
+            keymap.command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, false);
+        assert!(
+            !video_rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsToggleMetadata),
+            "video fullscreen active scopes should not advertise metadata toggle"
+        );
+        for action in [
+            KeyAction::FsToggleWindowMode,
+            KeyAction::FsCtrlNavPrev,
+            KeyAction::FsCtrlNavNext,
+            KeyAction::FsSiblingPrev,
+            KeyAction::FsSiblingNext,
+        ] {
+            assert!(
+                video_rows.iter().any(|row| row.spec.action == action),
+                "{action:?} should remain visible in video fullscreen"
+            );
+        }
+    }
+
+    #[test]
     fn command_display_rows_follow_overrides_and_none() {
         let keymap = Keymap::from_ini_str(
             r#"
@@ -5765,17 +5812,17 @@ mod tests {
         let keymap = Keymap::from_ini_str(
             r#"
             [Fullscreen]
-            FsToggleMetadata = Ctrl+M
+            FsCtrlNavPrev = Ctrl+M
             "#,
         );
         let conflicts = keymap.binding_conflicts();
         assert!(
             !conflicts.iter().any(|conflict| {
                 conflict.chord == Chord::ctrl(KeyName::M)
-                    && ((conflict.action == KeyAction::FsToggleMetadata
+                    && ((conflict.action == KeyAction::FsCtrlNavPrev
                         && conflict.other_action == Some(KeyAction::ConcealExit))
                         || (conflict.action == KeyAction::ConcealExit
-                            && conflict.other_action == Some(KeyAction::FsToggleMetadata)))
+                            && conflict.other_action == Some(KeyAction::FsCtrlNavPrev)))
             }),
             "FsCommon and edit-mode commands are not active together: {:?}",
             conflicts
@@ -6401,7 +6448,7 @@ mod tests {
 
         let keymap = Keymap::from_ini_str(
             r#"
-            [FsCommon]
+            [FsImage]
             FsToggleMetadata = Ctrl+I
             FsToggleMetadata.2 = M
 

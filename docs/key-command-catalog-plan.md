@@ -171,7 +171,8 @@
 > **Phase 7 egui 動画ヘルプ初期スライス実装メモ (2026-06-24, Codex / ClaudeCode レビュー済み)**:
 > egui 経路の動画フルスクリーンでも固定 `?` で同じ「ショートカット」ダイアログを開く。
 > 表示対象は `FsVideo` scope と、動画中にも実際に届く `Rating` / `FsCommon` の一部
-> (`FsToggleMetadata`, `FsCtrlNav*`, `FsSibling*`) に限定する。`VideoCompare*` は動画では
+> (`FsCtrlNav*`, `FsSibling*`, `FsToggleWindowMode`) に限定する。`FsToggleMetadata` は
+> 画像フルスクリーン専用のため動画ヘルプから除外する。`VideoCompare*` は動画では
 > silent no-op として消費するだけなので、ヘルプには出さない。Esc / Backspace / シーク /
 > Home / End / F11 / ホイールなど当時固定扱いだった入力は補助行へ分ける。native 動画 overlay 上で
 > 直接開くヘルプは後続スライスに残す。

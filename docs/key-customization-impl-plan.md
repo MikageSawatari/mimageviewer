@@ -500,11 +500,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   OS/clipboard/マウス経路を含むため本計画では固定。
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
 
-### FsSharedNavigation (画像中心、動画は Ph5 で実コード確認)
+### FsSharedNavigation (画像 / 動画で実際に共有)
 - FsClose `Esc` (予約) / FsImageClose `Enter` (画像のみ予約) / FsParent `Backspace`(予約)
-- FsToggleMetadata `I`,`Tab` (P) ★
-  - keymap-spec では画像/動画共通だが、native 動画経路では転送 whitelist に I/Tab が無い。
-    Ph5 で「FsCommon に置くか、FsImage 専用にするか」を実コードで確定する。
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
@@ -514,6 +511,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   コンテキスト別に個別割り当て、通常ホイール、Ctrl+ホイール、クリックは固定。
 
 ### FsImage (Ph2) ★
+- FsToggleMetadata `I`,`Tab` (P) ★: 画像フルスクリーンのメタデータパネル固定表示トグル。
+  動画フルスクリーンには対応する固定右パネルがないため FsImage 専用とし、動画ヘルプ /
+  native 動画 shortcut snapshot には載せない。
 - FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
   FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
   FsHome/End (予約候補)

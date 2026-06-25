@@ -6556,17 +6556,17 @@ impl App {
                 }));
         let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
-        let key_i = self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
+        let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let key_i =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
         // 動画モードでは `handle_video_input` 側で play/pause として消費するため、ここでは
         // 画像系処理に流さない。**`is_video_fs` ではなく純粋な「現在アイテムが Video か」で
         // gate する** こと: `is_video_fs` は context menu 表示中に false になるため、それで
         // gate すると context menu open の動画で Space → 画像系チェックトグルへ流出する
         // (Codex Phase 1 P2 指摘)。
-        let current_item_is_video_for_space =
-            matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        let key_space = !current_item_is_video_for_space
-            && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
+        let key_space =
+            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
         let key_ctrl_s_capture = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCapture);
@@ -6635,7 +6635,6 @@ impl App {
         // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
-        let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let key_p_pin = !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPin);
 
         // コンテナ★ (既定: Shift+F1〜F6): 開いている画像が属するコンテナ

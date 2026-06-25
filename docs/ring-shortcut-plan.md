@@ -456,7 +456,7 @@ FsCommon/FsImage/FsVideo)。native video の Ctrl 系ナビは KeyAction 経由�
 | 機能 | KeyAction / apply | context | 適入力 |
 |---|---|---|---|
 | 回転 R / L | `GridRotateCw/Ccw` / `FsRotateCw/Ccw` | Grid / ImageFS | 環 |
-| メタデータ表示 | `FsToggleMetadata` (FsCommon。VideoFS 対象なら ★新規 video metadata apply) | ImageFS | 環 |
+| メタデータ表示 | `FsToggleMetadata` (FsImage。動画には対応する固定右パネルがないため画像専用) | ImageFS | 環 |
 | ウィンドウ/全画面切替 | `RingActionId::ToggleWindowMode` → F11 相当 | ImageFS / VideoFS | 環 |
 | 別ウィンドウ ON/OFF | `ToggleDetachedViewerMode` | ImageFS / VideoFS | 環 |
 | 表示↔詳細 | `GridToggleDetailsView` | Grid | 環 |
