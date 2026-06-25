@@ -885,7 +885,7 @@ impl NativeOverlayTileOverlay {
 pub struct NativeOverlayRingPicker {
     pub title: String,
     pub rows: Vec<NativeOverlayRingPickerRow>,
-    pub selected_row: usize,
+    pub selected_row: Option<usize>,
     pub footer: String,
     pub drill: Option<NativeOverlayRingPickerDrill>,
 }

@@ -2218,7 +2218,9 @@ pub(super) fn draw_native_ring_picker_overlay(
 ) -> Option<egui::Rect> {
     let panel_rect =
         native_ring_picker_overlay_rect(overlay_width_points, overlay_height_points, picker);
-    let selected_row = picker.selected_row.min(picker.rows.len().saturating_sub(1));
+    let selected_row = picker
+        .selected_row
+        .map(|row| row.min(picker.rows.len().saturating_sub(1)));
 
     let area_response = egui::Area::new(egui::Id::new("native_video_ring_picker_overlay"))
         .order(egui::Order::Foreground)
@@ -2291,7 +2293,8 @@ pub(super) fn draw_native_ring_picker_overlay(
                         let visible_rows = ((available_h / row_h).floor() as usize)
                             .max(1)
                             .min(picker.rows.len().max(1));
-                        let start = selected_row
+                        let focus_row = selected_row.unwrap_or(0);
+                        let start = focus_row
                             .saturating_sub(visible_rows / 2)
                             .min(picker.rows.len().saturating_sub(visible_rows));
                         let end = (start + visible_rows).min(picker.rows.len());
@@ -2300,7 +2303,7 @@ pub(super) fn draw_native_ring_picker_overlay(
                         let has_scrollbar = picker.rows.len() > visible_rows;
                         let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
                         for (idx, row) in picker.rows.iter().enumerate().take(end).skip(start) {
-                            let selected = idx == selected_row;
+                            let selected = selected_row == Some(idx);
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), row_h),
                                 egui::Sense::hover(),

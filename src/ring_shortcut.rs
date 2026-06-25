@@ -358,6 +358,12 @@ impl MouseGestureProfile {
             .map(|binding| binding.action.clone())
             .unwrap_or(RingActionId::None)
     }
+
+    pub fn binding_index_for_pattern(&self, pattern: &[MouseGestureDirection]) -> Option<usize> {
+        self.bindings
+            .iter()
+            .position(|binding| binding.pattern == pattern)
+    }
 }
 
 impl Default for MouseGestureProfile {
@@ -2514,6 +2520,24 @@ mod tests {
         assert_eq!(parse_mouse_gesture_pattern("URDLU"), None);
         assert_eq!(format_mouse_gesture_pattern(&[Down, Right]), "↓→");
     }
+
+    #[test]
+    fn mouse_gesture_binding_index_requires_exact_pattern() {
+        use MouseGestureDirection::*;
+
+        let profile = MouseGestureProfile {
+            bindings: vec![
+                MouseGestureBinding::new(vec![Up], RingActionId::GridParentFolder),
+                MouseGestureBinding::new(vec![Down, Right], RingActionId::GridToggleDetails),
+            ],
+        };
+
+        assert_eq!(profile.binding_index_for_pattern(&[Up]), Some(0));
+        assert_eq!(profile.binding_index_for_pattern(&[Down, Right]), Some(1));
+        assert_eq!(profile.binding_index_for_pattern(&[Up, Down]), None);
+        assert_eq!(profile.binding_index_for_pattern(&[]), None);
+    }
+
     #[test]
     fn mouse_gesture_profile_ignores_unknown_directions_on_load() {
         let mut profile: MouseGestureProfile = serde_json::from_str(

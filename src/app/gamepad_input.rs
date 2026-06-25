@@ -385,11 +385,7 @@ impl App {
         let row_right = rect.max.x - 14.0;
         let mut y = rect.min.y + 46.0;
         let action_context = surface_context.gesture_action_context();
-        let selected_row = profile
-            .bindings
-            .iter()
-            .position(|binding| binding.pattern == gesture.pattern)
-            .unwrap_or(0);
+        let selected_row = profile.binding_index_for_pattern(&gesture.pattern);
         if profile.bindings.is_empty() {
             painter.text(
                 egui::pos2(row_left + 10.0, y + row_h * 0.5),
@@ -410,12 +406,13 @@ impl App {
             let visible_rows = ((available_h / row_h).floor() as usize)
                 .max(1)
                 .min(profile.bindings.len().max(1));
-            let start = selected_row
+            let focus_row = selected_row.unwrap_or(0);
+            let start = focus_row
                 .saturating_sub(visible_rows / 2)
                 .min(profile.bindings.len().saturating_sub(visible_rows));
             let end = (start + visible_rows).min(profile.bindings.len());
             for (idx, binding) in profile.bindings.iter().enumerate().take(end).skip(start) {
-                let selected = idx == selected_row;
+                let selected = selected_row == Some(idx);
                 let row_rect = egui::Rect::from_min_size(
                     egui::pos2(row_left, y),
                     egui::vec2((row_right - row_left).max(1.0), row_h),
@@ -3313,11 +3310,7 @@ impl App {
                 value: "環境設定で追加".to_string(),
             });
         }
-        let selected_row = profile
-            .bindings
-            .iter()
-            .position(|binding| binding.pattern == gesture.pattern)
-            .unwrap_or(0);
+        let selected_row = profile.binding_index_for_pattern(&gesture.pattern);
         let current = if gesture.pattern.is_empty() {
             "-".to_string()
         } else {
@@ -3357,7 +3350,7 @@ impl App {
         crate::video::native_presenter::NativeOverlayRingPicker {
             title: format!("X ピッカー / {}", picker.context.label()),
             rows,
-            selected_row: picker.current_row(),
+            selected_row: Some(picker.current_row()),
             footer: "上下:選択  左右:変更  A:一覧  B/X:確定".to_string(),
             drill,
         }
@@ -3382,7 +3375,7 @@ impl App {
         crate::video::native_presenter::NativeOverlayRingPicker {
             title: "お気に入り".to_string(),
             rows,
-            selected_row: picker.selected,
+            selected_row: Some(picker.selected),
             footer: "上下:選択  A:移動  B/Start:閉じる".to_string(),
             drill: None,
         }
@@ -3409,7 +3402,7 @@ impl App {
         crate::video::native_presenter::NativeOverlayRingPicker {
             title: "ブックマーク / チャプター".to_string(),
             rows,
-            selected_row: picker.selected,
+            selected_row: Some(picker.selected),
             footer: "上下:選択  A:移動  B/Select:閉じる".to_string(),
             drill: None,
         }
