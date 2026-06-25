@@ -1780,8 +1780,6 @@ fn keyboard_picker_rows() -> [&'static [KeyName]; 7] {
         KeyName::O,
         KeyName::P,
         KeyName::OpenBracket,
-        KeyName::CloseBracket,
-        KeyName::Slash,
     ];
     const HOME: &[KeyName] = &[
         KeyName::A,
@@ -1793,6 +1791,9 @@ fn keyboard_picker_rows() -> [&'static [KeyName]; 7] {
         KeyName::J,
         KeyName::K,
         KeyName::L,
+        KeyName::Semicolon,
+        KeyName::Colon,
+        KeyName::CloseBracket,
         KeyName::Enter,
     ];
     const BOTTOM: &[KeyName] = &[
@@ -1803,6 +1804,10 @@ fn keyboard_picker_rows() -> [&'static [KeyName]; 7] {
         KeyName::B,
         KeyName::N,
         KeyName::M,
+        KeyName::Comma,
+        KeyName::Period,
+        KeyName::Slash,
+        KeyName::Backslash,
         KeyName::Space,
     ];
     const NAV: &[KeyName] = &[

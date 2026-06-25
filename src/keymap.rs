@@ -185,6 +185,11 @@ pub enum KeyName {
     Delete,
     OpenBracket,
     CloseBracket,
+    Semicolon,
+    Colon,
+    Comma,
+    Period,
+    Backslash,
     Slash,
     Minus,
 }
@@ -274,6 +279,11 @@ impl KeyName {
             "DELETE" | "DEL" => KeyName::Delete,
             "[" | "OPENBRACKET" | "LBRACKET" => KeyName::OpenBracket,
             "]" | "CLOSEBRACKET" | "RBRACKET" => KeyName::CloseBracket,
+            ";" | "SEMICOLON" => KeyName::Semicolon,
+            ":" | "COLON" => KeyName::Colon,
+            "," | "COMMA" => KeyName::Comma,
+            "." | "PERIOD" | "DOT" => KeyName::Period,
+            "\\" | "BACKSLASH" | "YEN" => KeyName::Backslash,
             "/" | "SLASH" => KeyName::Slash,
             "MINUS" => KeyName::Minus,
             _ => return None,
@@ -358,6 +368,11 @@ impl KeyName {
             KeyName::Delete => egui::Key::Delete,
             KeyName::OpenBracket => egui::Key::OpenBracket,
             KeyName::CloseBracket => egui::Key::CloseBracket,
+            KeyName::Semicolon => egui::Key::Semicolon,
+            KeyName::Colon => egui::Key::Colon,
+            KeyName::Comma => egui::Key::Comma,
+            KeyName::Period => egui::Key::Period,
+            KeyName::Backslash => egui::Key::Backslash,
             KeyName::Slash => egui::Key::Slash,
             KeyName::Minus => egui::Key::Minus,
         }
@@ -441,6 +456,11 @@ impl KeyName {
             egui::Key::Delete => KeyName::Delete,
             egui::Key::OpenBracket => KeyName::OpenBracket,
             egui::Key::CloseBracket => KeyName::CloseBracket,
+            egui::Key::Semicolon => KeyName::Semicolon,
+            egui::Key::Colon => KeyName::Colon,
+            egui::Key::Comma => KeyName::Comma,
+            egui::Key::Period => KeyName::Period,
+            egui::Key::Backslash => KeyName::Backslash,
             egui::Key::Slash => KeyName::Slash,
             egui::Key::Minus => KeyName::Minus,
             _ => return None,
@@ -525,6 +545,11 @@ impl KeyName {
             KeyName::Delete => 0x2E,
             KeyName::OpenBracket => 0xDB,
             KeyName::CloseBracket => 0xDD,
+            KeyName::Semicolon => 0xBB,
+            KeyName::Colon => 0xBA,
+            KeyName::Comma => 0xBC,
+            KeyName::Period => 0xBE,
+            KeyName::Backslash => 0xDC,
             KeyName::Slash => 0xBF,
             KeyName::Minus => 0xBD,
         }
@@ -606,8 +631,13 @@ impl KeyName {
             KeyName::Tab => "Tab",
             KeyName::Backspace => "Backspace",
             KeyName::Delete => "Delete",
-            KeyName::OpenBracket => "OpenBracket",
-            KeyName::CloseBracket => "CloseBracket",
+            KeyName::OpenBracket => "[",
+            KeyName::CloseBracket => "]",
+            KeyName::Semicolon => ";",
+            KeyName::Colon => ":",
+            KeyName::Comma => ",",
+            KeyName::Period => ".",
+            KeyName::Backslash => "\\",
             KeyName::Slash => "/",
             KeyName::Minus => "-",
         }
@@ -4475,8 +4505,9 @@ impl Keymap {
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
         out.push_str("# - キー名の例: A..Z, 0..9, F1..F24, Left, Right, Up, Down,\n");
         out.push_str(
-            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], /, ?, -\n",
+            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,\n",
         );
+        out.push_str("#   [, ], ;, :, ,, ., \\, /, ?, -\n");
         out.push_str("# - テンキー数字は通常の数字キーと同じ扱いです。\n");
         out.push_str("#   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。\n");
         out.push_str(
@@ -6273,6 +6304,35 @@ mod tests {
             parse_chord("Shift+F13").unwrap(),
             Chord::shift(KeyName::F13)
         );
+    }
+
+    #[test]
+    fn punctuation_keys_parse_display_and_roundtrip() {
+        let cases = [
+            (KeyName::OpenBracket, egui::Key::OpenBracket, 0xDB, "["),
+            (KeyName::CloseBracket, egui::Key::CloseBracket, 0xDD, "]"),
+            (KeyName::Semicolon, egui::Key::Semicolon, 0xBB, ";"),
+            (KeyName::Colon, egui::Key::Colon, 0xBA, ":"),
+            (KeyName::Comma, egui::Key::Comma, 0xBC, ","),
+            (KeyName::Period, egui::Key::Period, 0xBE, "."),
+            (KeyName::Backslash, egui::Key::Backslash, 0xDC, "\\"),
+            (KeyName::Slash, egui::Key::Slash, 0xBF, "/"),
+            (KeyName::Minus, egui::Key::Minus, 0xBD, "-"),
+        ];
+        for (name, egui_key, vk, label) in cases {
+            assert_eq!(KeyName::parse(label), Some(name));
+            assert_eq!(name.display_name(), label);
+            assert_eq!(name.to_egui(), egui_key);
+            assert_eq!(KeyName::from_egui(egui_key), Some(name));
+            assert_eq!(name.to_vk(), vk);
+        }
+        assert_eq!(KeyName::parse("Semicolon"), Some(KeyName::Semicolon));
+        assert_eq!(KeyName::parse("Colon"), Some(KeyName::Colon));
+        assert_eq!(KeyName::parse("Comma"), Some(KeyName::Comma));
+        assert_eq!(KeyName::parse("Period"), Some(KeyName::Period));
+        assert_eq!(KeyName::parse("Backslash"), Some(KeyName::Backslash));
+        assert_eq!(KeyName::parse("Yen"), Some(KeyName::Backslash));
+        assert_eq!(parse_chord("Ctrl+\\").unwrap().display_name(), "Ctrl+\\");
     }
 
     #[test]
