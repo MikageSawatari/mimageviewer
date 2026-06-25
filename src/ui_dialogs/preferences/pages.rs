@@ -611,7 +611,7 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                         ui.label("設定あり");
                     }
                     ui.horizontal(|ui| {
-                        if ui.small_button("リング").clicked() {
+                        if ui.small_button("リング/パッド").clicked() {
                             state.operation_ring_context = context;
                             state.operation_tab = OperationCustomizeTab::RingShortcut;
                         }
@@ -816,6 +816,7 @@ fn command_conflict_summary(
                         .clicked()
                     {
                         select_command_action(state, conflict.action);
+                        state.operation_tab = OperationCustomizeTab::Keyboard;
                     }
                     if let Some(other) = conflict.other_action {
                         if ui
@@ -824,6 +825,7 @@ fn command_conflict_summary(
                             .clicked()
                         {
                             select_command_action(state, other);
+                            state.operation_tab = OperationCustomizeTab::Keyboard;
                         }
                     } else {
                         ui.label(conflict.reserved_name.unwrap_or("固定キー"));
