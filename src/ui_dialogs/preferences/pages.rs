@@ -1051,12 +1051,18 @@ pub(super) fn draw_operation_assignment_editor_dialog(
 
     let mut open = true;
     let title = operation_assignment_editor_title(&editor.target);
+    let safe_rect = ctx.content_rect().shrink2(egui::vec2(32.0, 48.0));
+    let safe_size = safe_rect.size().max(egui::vec2(360.0, 280.0));
+    let default_size = egui::vec2(680.0, 620.0).min(safe_size);
+    let min_size = egui::vec2(520.0, 360.0).min(safe_size);
     egui::Window::new(title)
         .open(&mut open)
         .resizable(true)
         .collapsible(false)
-        .default_size([680.0, 620.0])
-        .min_width(560.0)
+        .default_size(default_size)
+        .min_size(min_size)
+        .max_size(safe_size)
+        .constrain_to(safe_rect)
         .show(ctx, |ui| {
             operation_assignment_editor_header(ui, &editor.target);
             ui.add_space(6.0);
@@ -1074,7 +1080,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
             if chord_keyboard_editor {
                 draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
             } else {
-                let available_h = ui.available_height().max(220.0);
+                let available_h = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
                     .id_salt("operation_assignment_editor_body")
                     .max_height(available_h)

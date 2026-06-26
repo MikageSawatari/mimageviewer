@@ -1395,6 +1395,7 @@ impl App {
         let safe_rect = content_rect.shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::vec2(360.0, 300.0));
         let dialog_size = egui::vec2(900.0, 640.0).min(safe_size);
+        let min_dialog_size = egui::vec2(560.0, 420.0).min(safe_size);
         let dialog_rect = egui::Rect::from_center_size(safe_rect.center(), dialog_size);
 
         egui::Window::new("操作カスタマイズ")
@@ -1404,37 +1405,38 @@ impl App {
             .resizable(true)
             .default_pos(dialog_rect.min)
             .default_size(dialog_size)
+            .min_size(min_dialog_size)
             .max_size(safe_size)
+            .constrain_to(safe_rect)
             .show(ctx, |ui| {
                 let state = self.operation_customize_state.as_mut().unwrap();
-                let available = ui.available_size();
-                let bottom_height = 38.0;
-                let main_height = (available.y - bottom_height - 14.0).max(120.0);
 
                 draw_operation_customize_tabs(ui, state);
                 ui.separator();
 
-                let mut content_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(egui::Rect::from_min_size(
-                            ui.cursor().min,
-                            egui::vec2(available.x, main_height),
-                        ))
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                let bottom_height = 42.0;
+                let available = ui.available_size();
+                let main_height = (available.y - bottom_height - 12.0).max(140.0);
+                let panel_size = egui::vec2(available.x, main_height);
+                ui.allocate_ui_with_layout(
+                    panel_size,
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_size(panel_size);
+                        ui.spacing_mut().scroll = pref_panel_scroll_style();
+                        egui::ScrollArea::vertical()
+                            .id_salt("operation_customize_panel")
+                            .scroll_bar_visibility(
+                                egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .auto_shrink([false, false])
+                            .max_height(main_height)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_operation_customize_page(ui, state, ime_active);
+                            });
+                    },
                 );
-                content_ui.spacing_mut().scroll = pref_panel_scroll_style();
-                egui::ScrollArea::vertical()
-                    .id_salt("operation_customize_panel")
-                    .scroll_bar_visibility(
-                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                    )
-                    .auto_shrink([false, false])
-                    .max_height(main_height)
-                    .show(&mut content_ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        draw_operation_customize_page(ui, state, ime_active);
-                    });
-                ui.allocate_space(egui::vec2(available.x, main_height));
 
                 ui.add_space(4.0);
                 ui.separator();
