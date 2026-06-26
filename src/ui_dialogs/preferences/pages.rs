@@ -2404,21 +2404,25 @@ fn command_editor_for_action(
     if modifier_hold {
         modifier_hold_command_editor(ui, state);
     } else {
+        let preview_conflicts = preview_command_editor_conflicts(state, action, conflicts);
         egui::Grid::new("command_editor_slots")
-            .num_columns(3)
+            .num_columns(5)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                for (idx, input) in state.command_chord_inputs.iter_mut().enumerate() {
+                for idx in 0..state.command_chord_inputs.len() {
                     ui.label(format!("キー {}", idx + 1));
-                    ui.add(
-                        egui::TextEdit::singleline(input)
-                            .desired_width(160.0)
-                            .hint_text(if idx == 0 {
-                                "例: Ctrl+F / F13 / none"
-                            } else {
-                                ""
-                            }),
-                    );
+                    {
+                        let input = &mut state.command_chord_inputs[idx];
+                        ui.add(
+                            egui::TextEdit::singleline(input)
+                                .desired_width(command_chord_input_width())
+                                .hint_text(if idx == 0 {
+                                    "例: Ctrl+F / F13 / none"
+                                } else {
+                                    ""
+                                }),
+                        );
+                    }
                     let capture_active = state.command_capture_slot == Some(idx);
                     let capture_label = if capture_active {
                         "入力待ち..."
@@ -2433,10 +2437,31 @@ fn command_editor_for_action(
                         state.command_capture_slot = Some(idx);
                         state.command_edit_error = None;
                     }
+                    if ui
+                        .add(egui::Button::new("解除").small())
+                        .on_hover_text("この行のキー割り当てだけを解除します")
+                        .clicked()
+                    {
+                        state.command_chord_inputs[idx].clear();
+                        if state.command_capture_slot == Some(idx) {
+                            state.command_capture_slot = None;
+                        }
+                        state.command_edit_error = None;
+                    }
+                    if let Some(label) = command_slot_conflict_label(
+                        &preview_conflicts,
+                        action,
+                        state.command_chord_inputs[idx].as_str(),
+                    ) {
+                        ui.colored_label(egui::Color32::from_rgb(220, 150, 80), label)
+                            .on_hover_text("このキーを同時に使う可能性がある操作があります。必要に応じて片方を変更するか解除してください。");
+                    } else {
+                        ui.label("");
+                    }
                     ui.end_row();
                 }
             });
-        ui.small("空欄は無視します。すべて空欄、または none を入力すると割り当て解除になります。");
+        ui.small("空欄または none の行は保存時に割り当てから外れます。すべて空欄にすると、この操作のキー割り当ては解除されます。");
     }
 
     if let Some(error) = &state.command_edit_error {
@@ -2449,14 +2474,6 @@ fn command_editor_for_action(
             if state.command_edit_error.is_none() {
                 close_assignment_editors(state);
             }
-        }
-        if !modifier_hold && ui.button("割り当て解除").clicked() {
-            state.settings.keymap.disable_action(action);
-            state.command_chord_inputs = std::array::from_fn(|_| String::new());
-            state.command_edit_loaded_for = Some(action);
-            state.command_capture_slot = None;
-            state.command_edit_error = None;
-            close_assignment_editors(state);
         }
         if ui.button("既定に戻す").clicked() {
             state.settings.keymap.remove_override(action);
@@ -2505,6 +2522,63 @@ fn command_editor_for_action(
                 }
             });
         }
+    }
+}
+
+fn command_chord_input_width() -> f32 {
+    190.0
+}
+
+fn preview_command_editor_conflicts(
+    state: &PreferencesState,
+    action: KeyAction,
+    fallback: &[BindingConflict],
+) -> Vec<BindingConflict> {
+    let Ok(chords) = parse_command_chord_inputs_for_editor(action, &state.command_chord_inputs)
+    else {
+        return fallback.to_vec();
+    };
+    let mut settings = state.settings.keymap.clone();
+    if chords.is_empty() {
+        settings.disable_action(action);
+    } else {
+        settings.set_override_chords(action, chords);
+    }
+    Keymap::from_settings(&settings).binding_conflicts()
+}
+
+fn command_slot_conflict_label(
+    conflicts: &[BindingConflict],
+    action: KeyAction,
+    input: &str,
+) -> Option<String> {
+    let chord = parse_chord_for_action(action, input.trim())
+        .ok()
+        .flatten()?;
+    let mut peers = Vec::new();
+    for conflict in conflicts
+        .iter()
+        .filter(|conflict| conflict.chord == chord)
+        .filter(|conflict| conflict.action == action || conflict.other_action == Some(action))
+    {
+        let peer = if conflict.action == action {
+            conflict
+                .other_action
+                .map(compact_key_action_label)
+                .or_else(|| conflict.reserved_name.map(str::to_string))
+        } else {
+            Some(compact_key_action_label(conflict.action))
+        };
+        if let Some(peer) = peer
+            && !peers.contains(&peer)
+        {
+            peers.push(peer);
+        }
+    }
+    if peers.is_empty() {
+        None
+    } else {
+        Some(format!("「{}」と競合", peers.join("、")))
     }
 }
 
@@ -2592,47 +2666,13 @@ fn ensure_command_editor_loaded(state: &mut PreferencesState, keymap: &Keymap, a
 }
 
 fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
-    let inputs: Vec<String> = state
-        .command_chord_inputs
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if inputs.is_empty() || inputs.iter().any(|s| s.eq_ignore_ascii_case("none")) {
-        state.settings.keymap.disable_action(action);
-        state.command_chord_inputs = std::array::from_fn(|_| String::new());
-        state.command_edit_loaded_for = Some(action);
-        state.command_capture_slot = None;
-        state.command_edit_error = None;
-        return;
-    }
-
-    let mut chords = Vec::new();
-    for input in inputs {
-        match parse_chord_for_action(action, &input) {
-            Ok(Some(chord)) => chords.push(chord),
-            Ok(None) => {
-                state.settings.keymap.disable_action(action);
-                state.command_chord_inputs = std::array::from_fn(|_| String::new());
-                state.command_edit_loaded_for = Some(action);
-                state.command_capture_slot = None;
-                state.command_edit_error = None;
-                return;
-            }
-            Err(err) => {
-                state.command_edit_error = Some(format!("{input}: {err}"));
-                return;
-            }
+    let deduped = match parse_command_chord_inputs_for_editor(action, &state.command_chord_inputs) {
+        Ok(chords) => chords,
+        Err(message) => {
+            state.command_edit_error = Some(message);
+            return;
         }
-    }
-
-    let mut deduped = Vec::new();
-    for chord in chords.into_iter().take(3) {
-        if !deduped.contains(&chord) {
-            deduped.push(chord);
-        }
-    }
+    };
     if deduped.is_empty() {
         state.settings.keymap.disable_action(action);
     } else {
@@ -2641,6 +2681,31 @@ fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
     state.command_edit_loaded_for = None;
     state.command_capture_slot = None;
     state.command_edit_error = None;
+}
+
+fn parse_command_chord_inputs_for_editor(
+    action: KeyAction,
+    inputs: &[String; 3],
+) -> Result<Vec<Chord>, String> {
+    let mut deduped = Vec::new();
+    for input in inputs
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+    {
+        match parse_chord_for_action(action, &input) {
+            Ok(Some(chord)) => {
+                if !deduped.contains(&chord) {
+                    deduped.push(chord);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(format!("{input}: {err}"));
+            }
+        }
+    }
+    Ok(deduped.into_iter().take(3).collect())
 }
 
 fn poll_command_chord_capture(
