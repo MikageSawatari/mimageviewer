@@ -262,6 +262,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   同じメニューでサイズ列の表示単位を `最適` (既定) / `固定: バイト` / `固定: KB` /
   `固定: MB` から選べる。固定表示では整数部を 3 桁カンマ区切りにする。
   同じメニューの日時セクションで `秒まで表示` を切り替えられる。
+  同じメニューの `行表示` で、行区切り線・交互背景色・両方・なしを選べる。
+  行区切り線は DPI スケーリングに合わせて最低 1 物理ピクセル相当で描画する。
   `作成日時`、`画像解像度`、`動画長さ`、`動画解像度`、`動画コーデック` は遅延ロード列で、
   `作成日時` は既定で非表示。
   画像は既存のフルスクリーンキャッシュ / サムネイルカタログ / 画像ヘッダ probe、
@@ -985,6 +987,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
 | `details_timestamp_show_seconds` | bool | false | 詳細表示モードの更新日時 / 作成日時を秒まで表示するか |
+| `details_row_style` | DetailsRowStyle | Separator | 詳細表示モードの行表示。`Separator` は DPI 対応の行区切り線のみ、`Stripe` は交互背景色のみ、`SeparatorAndStripe` は両方、`Plain` はどちらも描画しない |
 | `details_column_order` | Vec\<DetailsColumnId\> | [] | 詳細表示モードの列順。空なら既定順。列ヘッダの横ドラッグで更新される |
 | `details_column_widths` | Vec\<DetailsColumnWidth\> | [] | 詳細表示モードの列幅。`名前` 以外を列ヘッダ右端ドラッグで更新する |
 | `details_name_width_auto` | bool | true | 詳細表示モードで `名前` 列を残り幅へ自動調整するか。`false` で `details_name_width` を固定幅として使う。`名前` 列右端ドラッグ / ヘッダ右クリックで切替 |

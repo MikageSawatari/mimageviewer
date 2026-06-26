@@ -345,6 +345,43 @@ impl DetailsSizeDisplayMode {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetailsRowStyle {
+    #[default]
+    Separator,
+    Stripe,
+    SeparatorAndStripe,
+    Plain,
+}
+
+impl DetailsRowStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Separator => "線のみ",
+            Self::Stripe => "交互背景色",
+            Self::SeparatorAndStripe => "線と交互背景色",
+            Self::Plain => "なし",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Separator,
+            Self::Stripe,
+            Self::SeparatorAndStripe,
+            Self::Plain,
+        ]
+    }
+
+    pub fn show_separator(self) -> bool {
+        matches!(self, Self::Separator | Self::SeparatorAndStripe)
+    }
+
+    pub fn show_alternating_background(self) -> bool {
+        matches!(self, Self::Stripe | Self::SeparatorAndStripe)
+    }
+}
+
 #[derive(
     serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
@@ -1678,6 +1715,8 @@ pub struct Settings {
     pub details_size_display_mode: DetailsSizeDisplayMode,
     #[serde(default)]
     pub details_timestamp_show_seconds: bool,
+    #[serde(default)]
+    pub details_row_style: DetailsRowStyle,
     #[serde(default)]
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
@@ -3309,6 +3348,7 @@ impl Default for Settings {
             details_sort_ascending: default_details_sort_ascending(),
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
+            details_row_style: DetailsRowStyle::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
             details_name_width_auto: true,
@@ -4734,6 +4774,7 @@ impl Settings {
         self.details_sort_ascending = src.details_sort_ascending;
         self.details_size_display_mode = src.details_size_display_mode;
         self.details_timestamp_show_seconds = src.details_timestamp_show_seconds;
+        self.details_row_style = src.details_row_style;
         self.details_column_order = src.details_column_order.clone();
         self.details_column_widths = src.details_column_widths.clone();
         self.details_name_width_auto = src.details_name_width_auto;
@@ -7234,6 +7275,7 @@ mod tests {
             s.details_sort_ascending = false;
             s.details_size_display_mode = DetailsSizeDisplayMode::FixedKb;
             s.details_timestamp_show_seconds = true;
+            s.details_row_style = DetailsRowStyle::SeparatorAndStripe;
             s.details_column_order = vec![
                 DetailsColumnId::Size,
                 DetailsColumnId::Name,
@@ -7365,6 +7407,11 @@ mod tests {
             assert!(
                 loaded.details_timestamp_show_seconds,
                 "details_timestamp_show_seconds should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.details_row_style,
+                DetailsRowStyle::SeparatorAndStripe,
+                "details_row_style should survive roundtrip"
             );
             assert_eq!(
                 loaded.details_column_order.first().copied(),

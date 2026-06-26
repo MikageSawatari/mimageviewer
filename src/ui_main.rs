@@ -13,8 +13,8 @@ use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolde
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
 use crate::settings::{
-    DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
-    FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
+    DetailsColumnId, DetailsColumnWidth, DetailsRowStyle, DetailsSortKey, FacetDatePreset,
+    FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -1111,6 +1111,76 @@ fn set_details_name_width(settings: &mut crate::settings::Settings, width: f32) 
     settings.details_name_width_auto = false;
     settings.details_name_width = width;
     true
+}
+
+fn blend_details_row_color(
+    base: egui::Color32,
+    target: egui::Color32,
+    amount: f32,
+) -> egui::Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let blend =
+        |from: u8, to: u8| ((from as f32) + ((to as f32) - (from as f32)) * amount).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        blend(base.r(), target.r()),
+        blend(base.g(), target.g()),
+        blend(base.b(), target.b()),
+        base.a(),
+    )
+}
+
+fn details_alternating_row_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        blend_details_row_color(visuals.panel_fill, egui::Color32::WHITE, 0.055)
+    } else {
+        blend_details_row_color(visuals.panel_fill, egui::Color32::BLACK, 0.035)
+    }
+}
+
+fn details_separator_color(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        blend_details_row_color(visuals.panel_fill, egui::Color32::WHITE, 0.24)
+    } else {
+        blend_details_row_color(visuals.panel_fill, egui::Color32::BLACK, 0.18)
+    }
+}
+
+fn details_row_background(
+    visuals: &egui::Visuals,
+    style: DetailsRowStyle,
+    row: usize,
+    selected: bool,
+    checked: bool,
+    hovered: bool,
+) -> egui::Color32 {
+    if selected {
+        visuals.selection.bg_fill
+    } else if checked {
+        visuals.widgets.active.bg_fill
+    } else if hovered {
+        visuals.widgets.hovered.bg_fill
+    } else if style.show_alternating_background() && row % 2 == 1 {
+        details_alternating_row_fill(visuals)
+    } else {
+        visuals.panel_fill
+    }
+}
+
+fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
+    if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    }
+}
+
+fn details_separator_stroke_width(pixels_per_point: f32) -> f32 {
+    1.0 / normalized_pixels_per_point(pixels_per_point)
+}
+
+fn details_separator_y(rect: egui::Rect, pixels_per_point: f32) -> f32 {
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
+    ((rect.bottom() * pixels_per_point).floor() - 0.5) / pixels_per_point
 }
 
 /// 詳細表示の水平レイアウト。縦スクロールバーの gutter を考慮して、ヘッダと行の列が
@@ -10125,6 +10195,14 @@ impl App {
             )
             .changed();
 
+        ui.separator();
+        ui.label("行表示");
+        for &style in DetailsRowStyle::all() {
+            changed |= ui
+                .radio_value(&mut self.settings.details_row_style, style, style.label())
+                .changed();
+        }
+
         if changed {
             let new_lazy = (
                 self.settings.details_show_created,
@@ -10157,7 +10235,7 @@ impl App {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         idx: usize,
-        _row: usize,
+        row: usize,
         is_spread_pair_cursor: bool,
     ) -> Option<egui::Rect> {
         let Some(item) = self.items.get(idx).cloned() else {
@@ -10166,13 +10244,15 @@ impl App {
         let visuals = ui.visuals();
         let selected = self.selected == Some(idx);
         let checked = self.checked.contains(&idx);
-        let bg = if selected {
-            visuals.selection.bg_fill
-        } else if checked {
-            visuals.widgets.active.bg_fill
-        } else {
-            visuals.panel_fill
-        };
+        let row_style = self.settings.details_row_style;
+        let bg = details_row_background(
+            visuals,
+            row_style,
+            row,
+            selected,
+            checked,
+            ui.rect_contains_pointer(rect),
+        );
         let text_color = if selected {
             visuals.selection.stroke.color
         } else {
@@ -10188,10 +10268,17 @@ impl App {
             );
             painter.rect_filled(accent, 0.0, visuals.selection.bg_fill);
         }
-        painter.line_segment(
-            [rect.left_bottom(), rect.right_bottom()],
-            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
-        );
+        if row_style.show_separator() {
+            let pixels_per_point = ui.ctx().pixels_per_point();
+            let y = details_separator_y(rect, pixels_per_point);
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(
+                    details_separator_stroke_width(pixels_per_point),
+                    details_separator_color(visuals),
+                ),
+            );
+        }
         if is_spread_pair_cursor && !selected {
             crate::app::draw_spread_pair_cursor(painter, rect, visuals);
         }
@@ -11521,6 +11608,70 @@ mod compute_cell_size_tests {
         settings.details_show_video_dimensions = false;
         settings.details_show_video_codec = false;
         settings
+    }
+
+    #[test]
+    fn details_separator_stays_one_physical_pixel() {
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let width = details_separator_stroke_width(pixels_per_point);
+            assert!(
+                (width * pixels_per_point - 1.0).abs() < 0.001,
+                "stroke should be one physical pixel at {pixels_per_point}x"
+            );
+        }
+    }
+
+    #[test]
+    fn details_separator_y_snaps_to_physical_pixel_center() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 28.0));
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let y = details_separator_y(rect, pixels_per_point);
+            let physical_y = y * pixels_per_point;
+            assert!(
+                (physical_y.fract() - 0.5).abs() < 0.001,
+                "line center should land on pixel center at {pixels_per_point}x"
+            );
+        }
+    }
+
+    #[test]
+    fn details_separator_y_stays_inside_current_row() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.3), egui::pos2(200.0, 28.3));
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let y = details_separator_y(rect, pixels_per_point);
+            assert!(
+                y < rect.bottom(),
+                "separator should not be painted into the next row at {pixels_per_point}x"
+            );
+            assert!(
+                y >= rect.top(),
+                "separator should stay within the current row at {pixels_per_point}x"
+            );
+        }
+    }
+
+    #[test]
+    fn details_row_background_prioritizes_interaction_over_stripe() {
+        let visuals = egui::Visuals::light();
+        let style = DetailsRowStyle::SeparatorAndStripe;
+        let striped = details_row_background(&visuals, style, 1, false, false, false);
+        assert_ne!(striped, visuals.panel_fill);
+        assert_eq!(
+            details_row_background(&visuals, style, 1, true, true, true),
+            visuals.selection.bg_fill
+        );
+        assert_eq!(
+            details_row_background(&visuals, style, 1, false, true, true),
+            visuals.widgets.active.bg_fill
+        );
+        assert_eq!(
+            details_row_background(&visuals, style, 1, false, false, true),
+            visuals.widgets.hovered.bg_fill
+        );
+        assert_eq!(
+            details_row_background(&visuals, DetailsRowStyle::Separator, 1, false, false, false),
+            visuals.panel_fill
+        );
     }
 
     #[test]
