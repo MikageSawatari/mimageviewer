@@ -1721,47 +1721,74 @@ fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap
         });
         ui.add_space(6.0);
 
-        for row in keyboard_picker_rows() {
-            ui.horizontal_wrapped(|ui| {
-                for &cell in row {
-                    match cell {
-                        KeyboardPickerCell::Key(key, label) => {
-                            let chord = Chord::new(
-                                state.operation_keyboard_ctrl,
-                                state.operation_keyboard_shift,
-                                state.operation_keyboard_alt,
-                                key,
-                            );
-                            let label = label.unwrap_or_else(|| key.display_name());
-                            let width = keyboard_picker_cell_width(label, key);
-                            let response =
-                                ui.add_sized([width, 24.0], egui::Button::new(label).small());
-                            let clicked = response.clicked();
-                            response.on_hover_text(keyboard_chord_tooltip(
-                                keymap,
-                                chord,
-                                state.operation_keyboard_context,
-                            ));
-                            if clicked {
-                                assign_keyboard_picker_chord(state, keymap, chord);
-                            }
-                        }
-                        KeyboardPickerCell::Disabled(label) => {
-                            let width = keyboard_picker_label_width(label);
-                            ui.add_enabled_ui(false, |ui| {
-                                ui.add_sized([width, 24.0], egui::Button::new(label).small())
-                            })
-                            .inner
-                            .on_hover_text("現在は割り当て対象外です。");
-                        }
-                        KeyboardPickerCell::Spacer(width) => {
-                            ui.add_space(width);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.small("メインキー");
+                let rows = keyboard_picker_main_rows();
+                draw_keyboard_picker_rows(ui, state, keymap, &rows);
+            });
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.small("ナビゲーション");
+                let rows = keyboard_picker_navigation_rows();
+                draw_keyboard_picker_rows(ui, state, keymap, &rows);
+                ui.add_space(8.0);
+                ui.small("テンキー");
+                let rows = keyboard_picker_numpad_rows();
+                draw_keyboard_picker_rows(ui, state, keymap, &rows);
+            });
+        });
+    });
+}
+
+fn draw_keyboard_picker_rows(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    keymap: &Keymap,
+    rows: &[&'static [KeyboardPickerCell]],
+) {
+    for row in rows {
+        ui.horizontal(|ui| {
+            for &cell in *row {
+                match cell {
+                    KeyboardPickerCell::Key(key, label) => {
+                        let chord = Chord::new(
+                            state.operation_keyboard_ctrl,
+                            state.operation_keyboard_shift,
+                            state.operation_keyboard_alt,
+                            key,
+                        );
+                        let label = label.unwrap_or_else(|| key.display_name());
+                        let width = keyboard_picker_cell_width(label, key);
+                        let response =
+                            ui.add_sized([width, 24.0], egui::Button::new(label).small());
+                        let clicked = response.clicked();
+                        response.on_hover_text(keyboard_chord_tooltip(
+                            keymap,
+                            chord,
+                            state.operation_keyboard_context,
+                        ));
+                        if clicked {
+                            assign_keyboard_picker_chord(state, keymap, chord);
                         }
                     }
+                    KeyboardPickerCell::Disabled(label) => {
+                        let width = keyboard_picker_label_width(label);
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.add_sized([width, 24.0], egui::Button::new(label).small())
+                        })
+                        .inner
+                        .on_hover_text("現在は割り当て対象外です。");
+                    }
+                    KeyboardPickerCell::Spacer(width) => {
+                        ui.add_space(width);
+                    }
                 }
-            });
-        }
-    });
+            }
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1771,8 +1798,8 @@ enum KeyboardPickerCell {
     Spacer(f32),
 }
 
-fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 12] {
-    use KeyboardPickerCell::{Disabled, Key, Spacer};
+fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
+    use KeyboardPickerCell::Key;
     const EXTENDED_FUNCTION: &[KeyboardPickerCell] = &[
         Key(KeyName::F13, None),
         Key(KeyName::F14, None),
@@ -1862,6 +1889,11 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 12] {
         Key(KeyName::IntlRo, Some("ろ")),
         Key(KeyName::Space, None),
     ];
+    [EXTENDED_FUNCTION, FUNCTION, NUMBER, QWERTY, HOME, BOTTOM]
+}
+
+fn keyboard_picker_navigation_rows() -> [&'static [KeyboardPickerCell]; 2] {
+    use KeyboardPickerCell::{Disabled, Key, Spacer};
     const NAV_TOP: &[KeyboardPickerCell] = &[
         Disabled("Insert"),
         Key(KeyName::Home, None),
@@ -1879,53 +1911,49 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 12] {
         Key(KeyName::Down, None),
         Key(KeyName::Right, None),
     ];
+    [NAV_TOP, NAV_BOTTOM]
+}
+
+fn keyboard_picker_numpad_rows() -> [&'static [KeyboardPickerCell]; 5] {
+    use KeyboardPickerCell::{Disabled, Key, Spacer};
     const NUMPAD_TOP: &[KeyboardPickerCell] = &[
-        Disabled("テンキー"),
+        Disabled("NumLock"),
         Key(KeyName::NumpadDivide, Some("Num/")),
         Key(KeyName::NumpadMultiply, Some("Num*")),
         Key(KeyName::NumpadSubtract, Some("Num-")),
     ];
     const NUMPAD_789: &[KeyboardPickerCell] = &[
-        Spacer(64.0),
         Key(KeyName::Numpad7, Some("Num7")),
         Key(KeyName::Numpad8, Some("Num8")),
         Key(KeyName::Numpad9, Some("Num9")),
         Key(KeyName::NumpadAdd, Some("Num+")),
     ];
     const NUMPAD_456: &[KeyboardPickerCell] = &[
-        Spacer(64.0),
         Key(KeyName::Numpad4, Some("Num4")),
         Key(KeyName::Numpad5, Some("Num5")),
         Key(KeyName::Numpad6, Some("Num6")),
+        Key(KeyName::NumpadEnter, Some("Enter")),
     ];
-    const NUMPAD_1230: &[KeyboardPickerCell] = &[
-        Spacer(64.0),
+    const NUMPAD_123: &[KeyboardPickerCell] = &[
         Key(KeyName::Numpad1, Some("Num1")),
         Key(KeyName::Numpad2, Some("Num2")),
         Key(KeyName::Numpad3, Some("Num3")),
+        Spacer(62.0),
+    ];
+    const NUMPAD_0: &[KeyboardPickerCell] = &[
         Key(KeyName::Numpad0, Some("Num0")),
         Key(KeyName::NumpadDecimal, Some("Num.")),
+        Spacer(44.0),
+        Spacer(62.0),
     ];
-    [
-        EXTENDED_FUNCTION,
-        FUNCTION,
-        NUMBER,
-        QWERTY,
-        HOME,
-        BOTTOM,
-        NAV_TOP,
-        NAV_BOTTOM,
-        NUMPAD_TOP,
-        NUMPAD_789,
-        NUMPAD_456,
-        NUMPAD_1230,
-    ]
+    [NUMPAD_TOP, NUMPAD_789, NUMPAD_456, NUMPAD_123, NUMPAD_0]
 }
 
 fn keyboard_picker_cell_width(label: &str, key: KeyName) -> f32 {
     match key {
         KeyName::Backspace => 76.0,
         KeyName::Enter => 68.0,
+        KeyName::NumpadEnter => 62.0,
         KeyName::Space => 132.0,
         KeyName::PageUp | KeyName::PageDown => 62.0,
         _ => keyboard_picker_label_width(label),
@@ -1934,7 +1962,7 @@ fn keyboard_picker_cell_width(label: &str, key: KeyName) -> f32 {
 
 fn keyboard_picker_label_width(label: &str) -> f32 {
     match label {
-        "Insert" | "Delete" | "PageUp" | "PageDown" => 62.0,
+        "Insert" | "Delete" | "PageUp" | "PageDown" | "NumLock" => 62.0,
         _ => 44.0,
     }
 }

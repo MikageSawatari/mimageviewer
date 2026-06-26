@@ -20,6 +20,7 @@ v2.2.0 の操作カスタマイズはまだ未リリースなので、保存語�
 
 - `Num1` / `Digit1` は `1`
 - `Numpad1` は `Numpad1`
+- `NumpadEnter` は `NumpadEnter`
 - `JisAt` は `@`
 - `IntlYen` は `￥`（保存名は `Yen`）
 - `IntlRo` は保存名 `Ro`（キーボード図の表示は `ろ`）
@@ -54,7 +55,7 @@ Win32 key queue は mIV 内部のショートカット判定用であり、Windo
 
 - `Num0..Num9`（メイン数字キー。`Digit0..Digit9` も入力名として受け付ける）
 - `Numpad0..Numpad9`
-- `NumpadAdd` / `NumpadSubtract` / `NumpadMultiply` / `NumpadDivide` / `NumpadDecimal`
+- `NumpadAdd` / `NumpadSubtract` / `NumpadMultiply` / `NumpadDivide` / `NumpadDecimal` / `NumpadEnter`
 - `JisCaret` (`^`)
 - `JisAt` (`@`)
 - `IntlYen` (`￥`。保存名は `Yen`)
@@ -91,6 +92,7 @@ native 動画 presenter は既に Win32 virtual key を受け取っている。`
 ## 実機確認ポイント
 
 - メイン数字キー `1` と `Numpad1` が別々にキャプチャされる。
+- 通常 Enter とテンキー Enter が別々にキャプチャされる。
 - 既定状態では、従来 `1` で動いていた操作がテンキー `1` でも動く。
 - `^` / `@` / `￥` / `ろ` がキーボード図から割り当てられ、実キーで発火する。
 - Shift+数字は `Shift+Digit*` として、配列に関係なく物理数字キーで発火する。

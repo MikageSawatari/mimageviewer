@@ -160,6 +160,7 @@ pub enum KeySlot {
     NumpadMultiply,
     NumpadDivide,
     NumpadDecimal,
+    NumpadEnter,
     F1,
     F2,
     F3,
@@ -286,6 +287,7 @@ impl KeySlot {
             "NUMPADDECIMAL" | "NUMDECIMAL" | "NPDECIMAL" | "NUMPADDOT" | "NPDOT" => {
                 KeyName::NumpadDecimal
             }
+            "NUMPADENTER" | "NUMENTER" | "NPENTER" => KeyName::NumpadEnter,
             "F1" => KeyName::F1,
             "F2" => KeyName::F2,
             "F3" => KeyName::F3,
@@ -394,6 +396,7 @@ impl KeySlot {
             | KeyName::NumpadMultiply
             | KeyName::NumpadDivide
             | KeyName::NumpadDecimal
+            | KeyName::NumpadEnter
             | KeyName::JisCaret
             | KeyName::JisAt
             | KeyName::IntlYen
@@ -624,6 +627,7 @@ impl KeySlot {
             KeyName::PageDown => 0x22,
             KeyName::Space => 0x20,
             KeyName::Enter => 0x0D,
+            KeyName::NumpadEnter => 0x0D,
             KeyName::Esc => 0x1B,
             KeyName::Tab => 0x09,
             KeyName::Backspace => 0x08,
@@ -650,6 +654,8 @@ impl KeySlot {
             KeyName::JisAt => scan_code == Self::JIS_AT_SCAN,
             KeyName::IntlYen => scan_code == Self::INTL_YEN_SCAN,
             KeyName::IntlRo => scan_code == Self::INTL_RO_SCAN,
+            KeyName::Enter => virtual_key == self.to_vk() && !_extended,
+            KeyName::NumpadEnter => virtual_key == self.to_vk() && _extended,
             // On JIS keyboards VK_OEM_5 is the Yen key.  Keep the legacy
             // Backslash slot for layouts that really report the US backslash
             // position, but do not let it steal the JIS Yen physical key.
@@ -670,6 +676,9 @@ impl KeySlot {
         }
         if scan_code == Self::INTL_RO_SCAN {
             return Some(KeyName::IntlRo);
+        }
+        if virtual_key == 0x0D && _extended {
+            return Some(KeyName::NumpadEnter);
         }
         Some(match virtual_key {
             0x41 => KeyName::A,
@@ -861,6 +870,7 @@ impl KeySlot {
             KeyName::PageDown => "PageDown",
             KeyName::Space => "Space",
             KeyName::Enter => "Enter",
+            KeyName::NumpadEnter => "NumpadEnter",
             KeyName::Esc => "Esc",
             KeyName::Tab => "Tab",
             KeyName::Backspace => "Backspace",
@@ -5147,7 +5157,7 @@ impl Keymap {
             "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,\n",
         );
         out.push_str(
-            "#   [, ], ;, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract\n",
+            "#   [, ], ;, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter\n",
         );
         out.push_str("# - テンキー数字は通常の数字キーとは別キーとして扱われます。\n");
         out.push_str("#   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。\n");
@@ -5371,7 +5381,7 @@ impl KeymapSettings {
                     .override_chords(action)
                     .map(|chords| KeyBindingOverride {
                         action: action.ini_name().to_string(),
-                        chords: chords.iter().copied().map(Chord::display_name).collect(),
+                        chords: chords.iter().copied().map(Chord::settings_name).collect(),
                     })
             })
             .collect();
@@ -5449,7 +5459,17 @@ impl KeymapSettings {
         self.overrides
             .iter()
             .find(|binding| KeyAction::parse_ini_name(&binding.action) == Some(action))
-            .map(|binding| binding.chords.clone())
+            .map(|binding| {
+                binding
+                    .chords
+                    .iter()
+                    .map(|label| {
+                        parse_chord(label)
+                            .map(|chord| chord.display_name())
+                            .unwrap_or_else(|_| label.clone())
+                    })
+                    .collect()
+            })
     }
 
     pub fn set_override_chords(&mut self, action: KeyAction, chords: Vec<Chord>) {
@@ -7076,10 +7096,15 @@ mod tests {
     fn numpad_names_parse_as_distinct_key_slots() {
         assert_eq!(KeyName::parse("Numpad1"), Some(KeyName::Numpad1));
         assert_eq!(KeyName::parse("Numpad0"), Some(KeyName::Numpad0));
+        assert_eq!(KeyName::parse("NumpadEnter"), Some(KeyName::NumpadEnter));
+        assert_eq!(KeyName::parse("NumEnter"), Some(KeyName::NumpadEnter));
         assert_eq!(KeyName::parse("Num1"), Some(KeyName::Num1));
         assert_eq!(KeyName::parse("1"), Some(KeyName::Num1));
         assert_eq!(KeyName::Numpad1.display_name(), "Numpad1");
         assert_eq!(KeyName::Numpad1.to_vk(), 0x61);
+        assert_eq!(KeyName::NumpadEnter.display_name(), "NumpadEnter");
+        assert_eq!(KeyName::NumpadEnter.to_vk(), 0x0D);
+        assert_eq!(KeyName::NumpadEnter.to_egui(), None);
     }
 
     #[test]
@@ -7170,6 +7195,7 @@ mod tests {
             KeyName::IntlYen,
             KeyName::JisAt,
             KeyName::JisCaret,
+            KeyName::NumpadEnter,
             KeyName::Numpad1,
             KeyName::Num1,
         ];
@@ -7195,6 +7221,15 @@ mod tests {
         assert!(!KeyName::Num1.matches_win32(0x61, 0x4f, false));
         assert!(KeyName::Numpad1.matches_win32(0x61, 0x4f, false));
         assert!(!KeyName::Numpad1.matches_win32(0x31, 0x02, false));
+        assert_eq!(KeyName::from_win32(0x0D, 0x1c, false), Some(KeyName::Enter));
+        assert_eq!(
+            KeyName::from_win32(0x0D, 0x1c, true),
+            Some(KeyName::NumpadEnter)
+        );
+        assert!(KeyName::Enter.matches_win32(0x0D, 0x1c, false));
+        assert!(!KeyName::Enter.matches_win32(0x0D, 0x1c, true));
+        assert!(KeyName::NumpadEnter.matches_win32(0x0D, 0x1c, true));
+        assert!(!KeyName::NumpadEnter.matches_win32(0x0D, 0x1c, false));
 
         assert_eq!(
             KeyName::from_win32(0xDC, KeyName::INTL_YEN_SCAN, false),
@@ -7780,11 +7815,15 @@ mod tests {
              GridPin = F13\n\
              GridToggleStackMode = Ctrl+Shift+S\n\
              [FsImage]\n\
-             FsSlideshow = none\n",
+             FsSlideshow = none\n\
+             FsPixelGrid = Ro\n",
         );
         let settings = KeymapSettings::from_keymap(&keymap);
         assert!(settings.legacy_ini_migration_done);
-        assert_eq!(settings.overrides.len(), 3);
+        assert_eq!(settings.overrides.len(), 4);
+        assert!(settings.overrides.iter().any(|binding| {
+            binding.action == "FsPixelGrid" && binding.chords == vec!["Ro".to_string()]
+        }));
 
         let restored = Keymap::from_settings(&settings);
         assert_eq!(
@@ -7803,16 +7842,35 @@ mod tests {
         let mut settings = KeymapSettings::default();
         settings.set_override_chords(
             KeyAction::GridToggleStackMode,
-            vec![Chord::ctrl_shift(KeyName::S), Chord::key(KeyName::F13)],
+            vec![
+                Chord::ctrl_shift(KeyName::S),
+                Chord::key(KeyName::F13),
+                Chord::key(KeyName::IntlYen),
+            ],
         );
         assert_eq!(
             settings.override_chord_labels(KeyAction::GridToggleStackMode),
-            Some(vec!["Ctrl+Shift+S".to_string(), "F13".to_string()])
+            Some(vec![
+                "Ctrl+Shift+S".to_string(),
+                "F13".to_string(),
+                "￥".to_string()
+            ])
+        );
+        assert!(settings.overrides.iter().any(|binding| {
+            binding.action == "GridToggleStackMode" && binding.chords.contains(&"Yen".to_string())
+        }));
+        settings.set_override_chords(
+            KeyAction::GridToggleStackMode,
+            vec![Chord::key(KeyName::IntlRo)],
+        );
+        assert_eq!(
+            settings.override_chord_labels(KeyAction::GridToggleStackMode),
+            Some(vec!["ろ".to_string()])
         );
         let keymap = Keymap::from_settings(&settings);
         assert_eq!(
             keymap.effective_chords(KeyAction::GridToggleStackMode),
-            vec![Chord::ctrl_shift(KeyName::S), Chord::key(KeyName::F13)]
+            vec![Chord::key(KeyName::IntlRo)]
         );
 
         settings.disable_action(KeyAction::GridToggleStackMode);

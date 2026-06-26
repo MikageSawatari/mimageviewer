@@ -144,14 +144,14 @@ pub struct Chord {
 
 /// テキスト名で持つ物理キー。Win32 VK / scan code を正本にし、egui は fallback として使う。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KeySlot { A, B, /* ...Z */ Num0, /* ...Num9 */ Numpad0, /* ...Numpad9 */ F1, /* ...F24 */
+pub enum KeySlot { A, B, /* ...Z */ Num0, /* ...Num9 */ Numpad0, /* ...Numpad9 */ NumpadEnter, F1, /* ...F24 */
     Left, Right, Up, Down, Home, End, PageUp, PageDown,
     Space, Enter, Esc, Tab, Backspace, Delete,
     OpenBracket, CloseBracket, Semicolon, Colon, Comma, Period, Backslash, Slash, Minus,
     JisCaret, JisAt, IntlYen, IntlRo }
 
 impl KeySlot {
-    pub fn parse(s: &str) -> Option<KeySlot>;   // "P" "F7" "Left" "[" "Numpad1" 等
+    pub fn parse(s: &str) -> Option<KeySlot>;   // "P" "F7" "Left" "[" "Numpad1" "NumpadEnter" 等
     pub fn to_egui(self) -> Option<egui::Key>;
     pub fn from_egui(k: egui::Key) -> Option<KeySlot>;
     pub fn to_vk(self) -> u32;                  // native 動画経路 / Win32 fallback
@@ -609,7 +609,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 |---|---|---|---|
 | 英字 | A..Z | A..Z | 0x41..0x5A |
 | 数字 | Num0..Num9 | Num0..Num9 | VK 0x30..0x39 |
-| テンキー数字 | Numpad0..Numpad9 | fallback なし (egui では Num0..Num9 に畳まれる) | VK 0x60..0x69 |
+| テンキー | Numpad0..Numpad9 / NumpadEnter | fallback なし (egui では Num0..Num9 / Enter に畳まれる) | VK 0x60..0x69 / Enter は extended bit |
 | Fキー | F1..F24 | F1..F24 | 0x70..0x87 |
 | 矢印 | Left/Right/Up/Down | Arrow* | 0x25/0x27/0x26/0x28 |
 | ナビ | Home/End/PageUp/PageDown | 同名 | 0x24/0x23/0x21/0x22 |

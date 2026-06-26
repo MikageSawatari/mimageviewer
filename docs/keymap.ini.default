@@ -24,7 +24,7 @@
 # - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
 # - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,
 #   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,
-#   [, ], ;, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract
+#   [, ], ;, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter
 # - テンキー数字は通常の数字キーとは別キーとして扱われます。
 #   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
