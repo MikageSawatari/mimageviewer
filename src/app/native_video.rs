@@ -3784,6 +3784,7 @@ impl App {
         match row.spec.action {
             KeyAction::ToggleDetachedViewerMode
             | KeyAction::FsToggleWindowMode
+            | KeyAction::FsBackToList
             | KeyAction::FsCtrlNavPrev
             | KeyAction::FsCtrlNavNext
             | KeyAction::FsSiblingPrev
@@ -3809,23 +3810,13 @@ impl App {
         const FIXED_ROWS: &[(&str, &str)] = &[
             ("?", "このショートカット一覧を表示する"),
             (
-                "Esc / Backspace",
-                "一覧へ戻る。タイルモード中の Esc は先にタイルモードを閉じる",
+                "Esc",
+                "一覧へ戻る。タイルモード中は先にタイルモードを閉じる",
             ),
             (
                 "← / →",
                 "5秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
             ),
-            (
-                "Shift+← / Shift+→",
-                "1秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
-            ),
-            (
-                "Ctrl+← / Ctrl+→",
-                "30秒戻る / 進む。タイルモード中はタイルカーソルを1行移動する",
-            ),
-            ("Ctrl+Shift+← / Ctrl+Shift+→", "1フレーム戻る / 進む"),
-            ("Home / End", "先頭または末尾の項目へ移動する"),
             ("マウスホイール", "前または次の項目へ移動する"),
             ("Ctrl+ホイール", "タイルモード中はタイル列数を変更する"),
         ];
@@ -5182,6 +5173,10 @@ impl App {
                     self.close_fullscreen();
                 }
             }
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsBackToList, &key) => {
+                self.close_fullscreen();
+                hud_activity = false;
+            }
             // W: seek to start and play.
             _ if !key.repeat
                 && self
@@ -5222,52 +5217,84 @@ impl App {
             0x25 | 0x27 if self.video_tile_mode_active => {
                 self.handle_video_tile_cursor_key(ctx, fs_idx, key.ctrl, key.virtual_key == 0x25);
             }
-            // Ctrl+Shift+Left / Right: frame step and pause.
-            0x25 if key.ctrl && key.shift => {
+            // Ctrl+Shift+Left / Right by default: frame step and pause.
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoFrameStepBack, &key) =>
+            {
                 self.step_video_frame(ctx, fs_idx, -1);
             }
-            0x27 if key.ctrl && key.shift => {
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoFrameStepForward, &key) =>
+            {
                 self.step_video_frame(ctx, fs_idx, 1);
             }
-            // Left / Right: same seek granularity as the egui fullscreen path.
-            0x25 => {
-                let delta = if key.ctrl {
-                    -30.0
-                } else if key.shift {
-                    -1.0
-                } else {
-                    -5.0
-                };
-                self.native_video_seek_relative_with_hint(fs_idx, delta);
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoSeekBackSmall, &key) =>
+            {
+                self.native_video_seek_relative_with_hint(fs_idx, -1.0);
             }
-            0x27 => {
-                let delta = if key.ctrl {
-                    30.0
-                } else if key.shift {
-                    1.0
-                } else {
-                    5.0
-                };
-                self.native_video_seek_relative_with_hint(fs_idx, delta);
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoSeekForwardSmall, &key) =>
+            {
+                self.native_video_seek_relative_with_hint(fs_idx, 1.0);
+            }
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoSeekBackLarge, &key) =>
+            {
+                self.native_video_seek_relative_with_hint(fs_idx, -30.0);
+            }
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoSeekForwardLarge, &key) =>
+            {
+                self.native_video_seek_relative_with_hint(fs_idx, 30.0);
+            }
+            // Left / Right: same seek granularity as the egui fullscreen path.
+            0x25 if !key.ctrl && !key.shift => {
+                self.native_video_seek_relative_with_hint(fs_idx, -5.0);
+            }
+            0x27 if !key.ctrl && !key.shift => {
+                self.native_video_seek_relative_with_hint(fs_idx, 5.0);
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
-            0x26 if key.ctrl && !key.shift => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::FsCtrlNavPrev, &key) =>
+            {
                 crate::logger::log(format!(
-                    "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} vk=0x26"
+                    "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} keymap=FsCtrlNavPrev"
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
             }
-            0x28 if key.ctrl && !key.shift => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::FsCtrlNavNext, &key) =>
+            {
                 crate::logger::log(format!(
-                    "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} vk=0x28"
+                    "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} keymap=FsCtrlNavNext"
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
             // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
-            0x21 if key.ctrl && !key.shift => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::FsSiblingPrev, &key) =>
+            {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, false, true);
             }
-            0x22 if key.ctrl && !key.shift => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::FsSiblingNext, &key) =>
+            {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, true, true);
             }
             // VK_BROWSER_BACK / VK_BROWSER_FORWARD: マウス進む/戻るボタンが Browser_Back/Forward
@@ -5293,10 +5320,10 @@ impl App {
             {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
             }
-            // Home / End: jump to the first / last visible navigable item.
+            // Home / End (keymap: FsJumpFirst/FsJumpLast): jump to the first / last visible navigable item.
             // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
             // (Phase 1: 画像と挙動を揃える、Codex 第 1 ラウンド P2 反映)。
-            0x24 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpFirst, &key) => {
                 let display_order = self.current_grid_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
@@ -5310,7 +5337,7 @@ impl App {
                 }
             }
             // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
-            0x23 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpLast, &key) => {
                 let display_order = self.current_grid_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);

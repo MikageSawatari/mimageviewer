@@ -1208,7 +1208,13 @@ pub enum KeyAction {
     GridDeselect,
     GridToggleCheck,
     GridDelete,
+    GridOpenSelected,
+    GridOpenExternalPlayer,
     GridParentFolder,
+    GridMoveFirst,
+    GridMoveLast,
+    GridPagePrev,
+    GridPageNext,
     GridTreeFolderPrev,
     GridTreeFolderNext,
     GridSiblingFolderPrev,
@@ -1252,7 +1258,11 @@ pub enum KeyAction {
     GridDeleteEraseMask,
     GridDeleteConcealMask,
     FsToggleMetadata,
+    FsClose,
+    FsBackToList,
     FsToggleWindowMode,
+    FsJumpFirst,
+    FsJumpLast,
     FsCtrlNavPrev,
     FsCtrlNavNext,
     FsSiblingPrev,
@@ -1383,6 +1393,12 @@ pub enum KeyAction {
     VideoExternalPlayer,
     VideoPlayPause,
     VideoSeekStart,
+    VideoSeekBackSmall,
+    VideoSeekForwardSmall,
+    VideoSeekBackLarge,
+    VideoSeekForwardLarge,
+    VideoFrameStepBack,
+    VideoFrameStepForward,
     VideoVolumeUp,
     VideoVolumeDown,
     VideoNextFile,
@@ -1402,6 +1418,7 @@ pub enum KeyAction {
     VideoCompareWipe,
     VideoCompareDiff,
     EraseConfirm,
+    EraseConfirmPolygon,
     EraseUndo,
     EraseDeleteShape,
     EraseToolSelect,
@@ -1417,6 +1434,7 @@ pub enum KeyAction {
     EraseEraseMode,
     EraseSpacePan,
     ConcealExit,
+    ConcealConfirmPolygon,
     ConcealUndo,
     ConcealDeleteShape,
     ConcealPixelGrid,
@@ -1458,6 +1476,7 @@ pub enum KeyAction {
     LaToolHLine,
     LaToolRect,
     LaToolEllipse,
+    LaConfirmPolygon,
     LaSpacePan,
 }
 
@@ -1529,7 +1548,13 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
+    KeyAction::GridOpenSelected,
+    KeyAction::GridOpenExternalPlayer,
     KeyAction::GridParentFolder,
+    KeyAction::GridMoveFirst,
+    KeyAction::GridMoveLast,
+    KeyAction::GridPagePrev,
+    KeyAction::GridPageNext,
     KeyAction::GridTreeFolderPrev,
     KeyAction::GridTreeFolderNext,
     KeyAction::GridSiblingFolderPrev,
@@ -1573,7 +1598,11 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeleteEraseMask,
     KeyAction::GridDeleteConcealMask,
     KeyAction::FsToggleMetadata,
+    KeyAction::FsClose,
+    KeyAction::FsBackToList,
     KeyAction::FsToggleWindowMode,
+    KeyAction::FsJumpFirst,
+    KeyAction::FsJumpLast,
     KeyAction::FsCtrlNavPrev,
     KeyAction::FsCtrlNavNext,
     KeyAction::FsSiblingPrev,
@@ -1704,6 +1733,12 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoExternalPlayer,
     KeyAction::VideoPlayPause,
     KeyAction::VideoSeekStart,
+    KeyAction::VideoSeekBackSmall,
+    KeyAction::VideoSeekForwardSmall,
+    KeyAction::VideoSeekBackLarge,
+    KeyAction::VideoSeekForwardLarge,
+    KeyAction::VideoFrameStepBack,
+    KeyAction::VideoFrameStepForward,
     KeyAction::VideoVolumeUp,
     KeyAction::VideoVolumeDown,
     KeyAction::VideoNextFile,
@@ -1723,6 +1758,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoCompareWipe,
     KeyAction::VideoCompareDiff,
     KeyAction::EraseConfirm,
+    KeyAction::EraseConfirmPolygon,
     KeyAction::EraseUndo,
     KeyAction::EraseDeleteShape,
     KeyAction::EraseToolSelect,
@@ -1738,6 +1774,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::EraseEraseMode,
     KeyAction::EraseSpacePan,
     KeyAction::ConcealExit,
+    KeyAction::ConcealConfirmPolygon,
     KeyAction::ConcealUndo,
     KeyAction::ConcealDeleteShape,
     KeyAction::ConcealPixelGrid,
@@ -1779,6 +1816,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::LaToolHLine,
     KeyAction::LaToolRect,
     KeyAction::LaToolEllipse,
+    KeyAction::LaConfirmPolygon,
     KeyAction::LaSpacePan,
 ];
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
@@ -2645,7 +2683,13 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
+            GridOpenSelected => "GridOpenSelected",
+            GridOpenExternalPlayer => "GridOpenExternalPlayer",
             GridParentFolder => "GridParentFolder",
+            GridMoveFirst => "GridMoveFirst",
+            GridMoveLast => "GridMoveLast",
+            GridPagePrev => "GridPagePrev",
+            GridPageNext => "GridPageNext",
             GridTreeFolderPrev => "GridTreeFolderPrev",
             GridTreeFolderNext => "GridTreeFolderNext",
             GridSiblingFolderPrev => "GridSiblingFolderPrev",
@@ -2689,7 +2733,11 @@ impl KeyAction {
             GridDeleteEraseMask => "GridDeleteEraseMask",
             GridDeleteConcealMask => "GridDeleteConcealMask",
             FsToggleMetadata => "FsToggleMetadata",
+            FsClose => "FsClose",
+            FsBackToList => "FsBackToList",
             FsToggleWindowMode => "FsToggleWindowMode",
+            FsJumpFirst => "FsJumpFirst",
+            FsJumpLast => "FsJumpLast",
             FsCtrlNavPrev => "FsCtrlNavPrev",
             FsCtrlNavNext => "FsCtrlNavNext",
             FsSiblingPrev => "FsSiblingPrev",
@@ -2820,6 +2868,12 @@ impl KeyAction {
             VideoExternalPlayer => "VideoExternalPlayer",
             VideoPlayPause => "VideoPlayPause",
             VideoSeekStart => "VideoSeekStart",
+            VideoSeekBackSmall => "VideoSeekBackSmall",
+            VideoSeekForwardSmall => "VideoSeekForwardSmall",
+            VideoSeekBackLarge => "VideoSeekBackLarge",
+            VideoSeekForwardLarge => "VideoSeekForwardLarge",
+            VideoFrameStepBack => "VideoFrameStepBack",
+            VideoFrameStepForward => "VideoFrameStepForward",
             VideoVolumeUp => "VideoVolumeUp",
             VideoVolumeDown => "VideoVolumeDown",
             VideoNextFile => "VideoNextFile",
@@ -2839,6 +2893,7 @@ impl KeyAction {
             VideoCompareWipe => "VideoCompareWipe",
             VideoCompareDiff => "VideoCompareDiff",
             EraseConfirm => "EraseConfirm",
+            EraseConfirmPolygon => "EraseConfirmPolygon",
             EraseUndo => "EraseUndo",
             EraseDeleteShape => "EraseDeleteShape",
             EraseToolSelect => "EraseToolSelect",
@@ -2854,6 +2909,7 @@ impl KeyAction {
             EraseEraseMode => "EraseEraseMode",
             EraseSpacePan => "EraseSpacePan",
             ConcealExit => "ConcealExit",
+            ConcealConfirmPolygon => "ConcealConfirmPolygon",
             ConcealUndo => "ConcealUndo",
             ConcealDeleteShape => "ConcealDeleteShape",
             ConcealPixelGrid => "ConcealPixelGrid",
@@ -2895,6 +2951,7 @@ impl KeyAction {
             LaToolHLine => "LaToolHLine",
             LaToolRect => "LaToolRect",
             LaToolEllipse => "LaToolEllipse",
+            LaConfirmPolygon => "LaConfirmPolygon",
             LaSpacePan => "LaSpacePan",
         }
     }
@@ -2999,7 +3056,13 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
+            GridOpenSelected => "選択中の項目を開く",
+            GridOpenExternalPlayer => "選択中の動画を外部プレイヤーで開く",
             GridParentFolder => "親フォルダへ移動する",
+            GridMoveFirst => "先頭の項目へ移動する",
+            GridMoveLast => "末尾の項目へ移動する",
+            GridPagePrev => "1ページ分前へ移動する",
+            GridPageNext => "1ページ分先へ移動する",
             GridTreeFolderPrev => "ツリー順で前のフォルダへ移動する",
             GridTreeFolderNext => "ツリー順で次のフォルダへ移動する",
             GridSiblingFolderPrev => "前の兄弟フォルダへ移動する",
@@ -3043,7 +3106,11 @@ impl KeyAction {
             GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
             GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
             FsToggleMetadata => "メタデータパネルの固定表示を切り替える",
+            FsClose => "画像フルスクリーンを閉じる",
+            FsBackToList => "フルスクリーンを閉じて一覧へ戻る",
             FsToggleWindowMode => "ウィンドウ表示と全画面表示を切り替える",
+            FsJumpFirst => "先頭の項目へ移動する",
+            FsJumpLast => "末尾の項目へ移動する",
             FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
@@ -3174,6 +3241,12 @@ impl KeyAction {
             VideoExternalPlayer => "現在の動画を外部プレイヤーで開く",
             VideoPlayPause => "動画の再生または一時停止を切り替える",
             VideoSeekStart => "動画の先頭へ移動して再生する",
+            VideoSeekBackSmall => "動画を1秒戻す",
+            VideoSeekForwardSmall => "動画を1秒進める",
+            VideoSeekBackLarge => "動画を30秒戻す",
+            VideoSeekForwardLarge => "動画を30秒進める",
+            VideoFrameStepBack => "動画を1フレーム戻す",
+            VideoFrameStepForward => "動画を1フレーム進める",
             VideoVolumeUp => "動画音量を上げる",
             VideoVolumeDown => "動画音量を下げる",
             VideoNextFile => "次のファイルへ移動する",
@@ -3193,6 +3266,7 @@ impl KeyAction {
             VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
             VideoCompareDiff => "動画では差分比較キーを何もしない操作として消費する",
             EraseConfirm => "消しゴム処理を実行して終了する",
+            EraseConfirmPolygon => "消しゴム多角形を確定する",
             EraseUndo => "消しゴム編集を元に戻す",
             EraseDeleteShape => "選択中の消しゴム図形を削除する",
             EraseToolSelect => "選択ツールに切り替える",
@@ -3208,6 +3282,7 @@ impl KeyAction {
             EraseEraseMode => "消去モードに切り替える",
             EraseSpacePan => "押している間だけ画像をパン操作する",
             ConcealExit => "隠蔽加工モードを終了する",
+            ConcealConfirmPolygon => "隠蔽加工の多角形を確定する",
             ConcealUndo => "隠蔽加工編集を元に戻す",
             ConcealDeleteShape => "選択中の隠蔽図形を削除する",
             ConcealPixelGrid => "ピクセルグリッド表示を切り替える",
@@ -3249,6 +3324,7 @@ impl KeyAction {
             LaToolHLine => "横線ツールに切り替える",
             LaToolRect => "矩形ツールに切り替える",
             LaToolEllipse => "楕円ツールに切り替える",
+            LaConfirmPolygon => "補正レイヤーの多角形マスクを確定する",
             LaSpacePan => "押している間だけ画像をパン操作する",
         }
     }
@@ -3323,7 +3399,13 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridOpenSelected
+            | GridOpenExternalPlayer
             | GridParentFolder
+            | GridMoveFirst
+            | GridMoveLast
+            | GridPagePrev
+            | GridPageNext
             | GridTreeFolderPrev
             | GridTreeFolderNext
             | GridSiblingFolderPrev
@@ -3366,15 +3448,15 @@ impl KeyAction {
             | GridApplyConceal2
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
-            FsToggleWindowMode | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
-                KeyContext::FsCommon
-            }
+            FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast | FsCtrlNavPrev
+            | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => KeyContext::FsCommon,
             RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
             | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
             | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsToggleMetadata
+            | FsClose
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
             | FsPagePrev
@@ -3484,28 +3566,65 @@ impl KeyAction {
             | FsApplyConceal2
             | FsDeleteEraseMask
             | FsDeleteConcealMask => KeyContext::FsImage,
-            VideoExternalPlayer | VideoPlayPause | VideoSeekStart | VideoVolumeUp
-            | VideoVolumeDown | VideoNextFile | VideoPrevFile | VideoMute | VideoLoop
-            | VideoMarkerPrev | VideoMarkerNext | VideoPin | VideoPerfOverlay | VideoTileMode
-            | VideoBookmark | VideoCapture | VideoAddToActiveBook | VideoCompareToggle
-            | VideoCompareCycle | VideoCompareWipe | VideoCompareDiff => KeyContext::FsVideo,
-            EraseConfirm | EraseUndo | EraseDeleteShape | EraseToolSelect | EraseToolBrush
-            | EraseToolLasso | EraseToolPolygon | EraseToolVLine | EraseToolHLine
-            | EraseToolLine | EraseToolRect | EraseToolEllipse | ErasePaintMode
-            | EraseEraseMode | EraseSpacePan => KeyContext::Erase,
-            ConcealExit | ConcealUndo | ConcealDeleteShape | ConcealPixelGrid
-            | ConcealTypeCycle | ConcealPreset1 | ConcealPreset2 | ConcealPreset3
-            | ConcealPreset4 | ConcealPaintMode | ConcealEraseMode | ConcealToolSelect
-            | ConcealToolBrush | ConcealToolLasso | ConcealToolPolygon | ConcealToolLine
-            | ConcealToolVLine | ConcealToolHLine | ConcealToolRect | ConcealToolEllipse
+            VideoExternalPlayer
+            | VideoPlayPause
+            | VideoSeekStart
+            | VideoSeekBackSmall
+            | VideoSeekForwardSmall
+            | VideoSeekBackLarge
+            | VideoSeekForwardLarge
+            | VideoFrameStepBack
+            | VideoFrameStepForward
+            | VideoVolumeUp
+            | VideoVolumeDown
+            | VideoNextFile
+            | VideoPrevFile
+            | VideoMute
+            | VideoLoop
+            | VideoMarkerPrev
+            | VideoMarkerNext
+            | VideoPin
+            | VideoPerfOverlay
+            | VideoTileMode
+            | VideoBookmark
+            | VideoCapture
+            | VideoAddToActiveBook
+            | VideoCompareToggle
+            | VideoCompareCycle
+            | VideoCompareWipe
+            | VideoCompareDiff => KeyContext::FsVideo,
+            EraseConfirm | EraseConfirmPolygon | EraseUndo | EraseDeleteShape | EraseToolSelect
+            | EraseToolBrush | EraseToolLasso | EraseToolPolygon | EraseToolVLine
+            | EraseToolHLine | EraseToolLine | EraseToolRect | EraseToolEllipse
+            | ErasePaintMode | EraseEraseMode | EraseSpacePan => KeyContext::Erase,
+            ConcealExit
+            | ConcealConfirmPolygon
+            | ConcealUndo
+            | ConcealDeleteShape
+            | ConcealPixelGrid
+            | ConcealTypeCycle
+            | ConcealPreset1
+            | ConcealPreset2
+            | ConcealPreset3
+            | ConcealPreset4
+            | ConcealPaintMode
+            | ConcealEraseMode
+            | ConcealToolSelect
+            | ConcealToolBrush
+            | ConcealToolLasso
+            | ConcealToolPolygon
+            | ConcealToolLine
+            | ConcealToolVLine
+            | ConcealToolHLine
+            | ConcealToolRect
+            | ConcealToolEllipse
             | ConcealSpacePan => KeyContext::Conceal,
             CropExecute | CropSpacePan => KeyContext::Crop,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
             LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush
             | LaToolEdgeBrush | LaToolGapFill | LaToolLasso | LaToolPolygon | LaToolSelect
-            | LaToolLine | LaToolVLine | LaToolHLine | LaToolRect | LaToolEllipse | LaSpacePan => {
-                KeyContext::LocalAdjust
-            }
+            | LaToolLine | LaToolVLine | LaToolHLine | LaToolRect | LaToolEllipse
+            | LaConfirmPolygon | LaSpacePan => KeyContext::LocalAdjust,
         }
     }
 
@@ -3582,7 +3701,13 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridDelete
+            | GridOpenSelected
+            | GridOpenExternalPlayer
             | GridParentFolder
+            | GridMoveFirst
+            | GridMoveLast
+            | GridPagePrev
+            | GridPageNext
             | GridTreeFolderPrev
             | GridTreeFolderNext
             | GridSiblingFolderPrev
@@ -3626,7 +3751,11 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask
             | FsToggleMetadata
+            | FsClose
+            | FsBackToList
             | FsToggleWindowMode
+            | FsJumpFirst
+            | FsJumpLast
             | FsCtrlNavPrev
             | FsCtrlNavNext
             | FsSiblingPrev
@@ -3755,6 +3884,12 @@ impl KeyAction {
             | VideoExternalPlayer
             | VideoPlayPause
             | VideoSeekStart
+            | VideoSeekBackSmall
+            | VideoSeekForwardSmall
+            | VideoSeekBackLarge
+            | VideoSeekForwardLarge
+            | VideoFrameStepBack
+            | VideoFrameStepForward
             | VideoVolumeUp
             | VideoVolumeDown
             | VideoNextFile
@@ -3774,6 +3909,7 @@ impl KeyAction {
             | VideoCompareWipe
             | VideoCompareDiff
             | EraseConfirm
+            | EraseConfirmPolygon
             | EraseUndo
             | EraseDeleteShape
             | EraseToolSelect
@@ -3788,6 +3924,7 @@ impl KeyAction {
             | ErasePaintMode
             | EraseEraseMode
             | ConcealExit
+            | ConcealConfirmPolygon
             | ConcealUndo
             | ConcealDeleteShape
             | ConcealPixelGrid
@@ -3825,7 +3962,8 @@ impl KeyAction {
             | LaToolVLine
             | LaToolHLine
             | LaToolRect
-            | LaToolEllipse => KeyTrigger::Press,
+            | LaToolEllipse
+            | LaConfirmPolygon => KeyTrigger::Press,
         }
     }
 
@@ -3900,7 +4038,13 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
+            GridOpenSelected => ChordList::one(Chord::key(Enter)),
+            GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
             GridParentFolder => ChordList::one(Chord::key(Backspace)),
+            GridMoveFirst => ChordList::one(Chord::key(Home)),
+            GridMoveLast => ChordList::one(Chord::key(End)),
+            GridPagePrev => ChordList::one(Chord::key(PageUp)),
+            GridPageNext => ChordList::one(Chord::key(PageDown)),
             GridTreeFolderPrev => ChordList::one(Chord::ctrl(Up)),
             GridTreeFolderNext => ChordList::one(Chord::ctrl(Down)),
             GridSiblingFolderPrev => ChordList::one(Chord::ctrl(PageUp)),
@@ -3944,7 +4088,11 @@ impl KeyAction {
             GridDeleteEraseMask => ChordList::two(Chord::shift(F7), Chord::shift(F8)),
             GridDeleteConcealMask => ChordList::two(Chord::shift(F9), Chord::shift(F10)),
             FsToggleMetadata => ChordList::two(Chord::key(I), Chord::key(Tab)),
+            FsClose => ChordList::one(Chord::key(Enter)),
+            FsBackToList => ChordList::one(Chord::key(Backspace)),
             FsToggleWindowMode => ChordList::one(Chord::key(F11)),
+            FsJumpFirst => ChordList::one(Chord::key(Home)),
+            FsJumpLast => ChordList::one(Chord::key(End)),
             FsCtrlNavPrev => ChordList::one(Chord::ctrl(Up)),
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
@@ -4077,6 +4225,12 @@ impl KeyAction {
             VideoExternalPlayer => ChordList::one(Chord::shift(Enter)),
             VideoPlayPause => ChordList::two(Chord::key(Space), Chord::key(Enter)),
             VideoSeekStart => ChordList::one(Chord::key(W)),
+            VideoSeekBackSmall => ChordList::one(Chord::shift(Left)),
+            VideoSeekForwardSmall => ChordList::one(Chord::shift(Right)),
+            VideoSeekBackLarge => ChordList::one(Chord::ctrl(Left)),
+            VideoSeekForwardLarge => ChordList::one(Chord::ctrl(Right)),
+            VideoFrameStepBack => ChordList::one(Chord::ctrl_shift(Left)),
+            VideoFrameStepForward => ChordList::one(Chord::ctrl_shift(Right)),
             VideoVolumeUp => ChordList::one(Chord::shift(Up)),
             VideoVolumeDown => ChordList::one(Chord::shift(Down)),
             VideoNextFile => ChordList::one(Chord::key(Down)),
@@ -4096,6 +4250,7 @@ impl KeyAction {
             VideoCompareWipe => ChordList::one(Chord::shift(C)),
             VideoCompareDiff => ChordList::one(Chord::alt(C)),
             EraseConfirm => ChordList::one(Chord::key(E)),
+            EraseConfirmPolygon => ChordList::one(Chord::key(Enter)),
             EraseUndo => ChordList::one(Chord::ctrl(Z)),
             EraseDeleteShape => ChordList::one(Chord::key(Delete)),
             EraseToolSelect => ChordList::one(Chord::key(S)),
@@ -4111,6 +4266,7 @@ impl KeyAction {
             EraseEraseMode => ChordList::one(Chord::key(F)),
             EraseSpacePan => ChordList::one(Chord::key(Space)),
             ConcealExit => ChordList::one(Chord::ctrl(M)),
+            ConcealConfirmPolygon => ChordList::one(Chord::key(Enter)),
             ConcealUndo => ChordList::one(Chord::ctrl(Z)),
             ConcealDeleteShape => ChordList::one(Chord::key(Delete)),
             ConcealPixelGrid => ChordList::one(Chord::key(G)),
@@ -4152,6 +4308,7 @@ impl KeyAction {
             LaToolHLine => ChordList::one(Chord::key(H)),
             LaToolRect => ChordList::one(Chord::key(R)),
             LaToolEllipse => ChordList::one(Chord::key(O)),
+            LaConfirmPolygon => ChordList::one(Chord::key(Enter)),
             LaSpacePan => ChordList::one(Chord::key(Space)),
         }
     }
@@ -4317,12 +4474,6 @@ const RESERVED_BINDINGS: &[ReservedBinding] = &[
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Esc),
         name: "Escape navigation / cancel",
-    },
-    ReservedBinding {
-        scope: KeyContext::Global,
-        trigger: KeyTrigger::Press,
-        chord: Chord::key(KeyName::Enter),
-        name: "Enter navigation / confirm",
     },
     ReservedBinding {
         scope: KeyContext::Global,
@@ -5061,9 +5212,10 @@ impl Keymap {
     pub fn install_global_native_video_shortcuts(&self) {
         let mut chords = Vec::new();
         for action in KeyAction::all().iter().copied().filter(|action| {
-            matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
-                || *action == KeyAction::ToggleDetachedViewerMode
-                || *action == KeyAction::FsToggleWindowMode
+            matches!(
+                action.context(),
+                KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
+            ) || *action == KeyAction::ToggleDetachedViewerMode
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -5143,7 +5295,7 @@ impl Keymap {
         out.push_str("# - 既定キーが無い Action は # Action = none と表示されます。\n");
         out.push_str("# - 同時に有効になり得る Action へ同じキーを割り当てると起動時に警告ログを出します。\n");
         out.push_str(
-            "# - Esc / Enter / 修飾なし矢印キーは予約扱いです。割り当てても警告ログを出します。\n",
+            "# - Esc / 修飾なし矢印キーは予約扱いです。割り当てても警告ログを出します。\n",
         );
         out.push_str("# - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。\n");
         out.push_str("# - 競合は拒否しません。競合時は先に判定された操作が有効になります。\n");
@@ -5171,7 +5323,7 @@ impl Keymap {
         out.push_str(
             "# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、\n",
         );
-        out.push_str("#   IME 確定、右クリックメニュー、Escape/Enter ナビゲーション、多くの矢印ナビゲーションは固定です。\n");
+        out.push_str("#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーションは固定です。\n");
         out.push_str("#\n");
         out.push_str("# 例:\n");
         out.push_str("# [FsImage]\n");
@@ -5522,7 +5674,7 @@ pub fn native_video_fullscreen_shortcut_key(
     if key.alt {
         return false;
     }
-    if native_video_fixed_shortcut_key(key.virtual_key, key.ctrl, key.shift) {
+    if native_video_fixed_shortcut_key(key.virtual_key) {
         return true;
     }
     if let Some(cell) = GLOBAL_NATIVE_VIDEO_CHORDS.get()
@@ -5544,9 +5696,10 @@ pub fn native_video_fullscreen_shortcut_key(
         .iter()
         .copied()
         .filter(|action| {
-            matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
-                || *action == KeyAction::ToggleDetachedViewerMode
-                || *action == KeyAction::FsToggleWindowMode
+            matches!(
+                action.context(),
+                KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
+            ) || *action == KeyAction::ToggleDetachedViewerMode
                 || action.is_location_navigation_action()
         })
         .any(|action| fallback.matches_vk_action(action, key))
@@ -5643,21 +5796,14 @@ pub(crate) fn native_video_context_shortcuts_help_text_enabled() -> bool {
     context_shortcuts_help_accepts_text(&defaults)
 }
 
-fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) -> bool {
-    if matches!(virtual_key, 0x21 | 0x22) {
-        return ctrl && !shift;
-    }
+fn native_video_fixed_shortcut_key(virtual_key: u32) -> bool {
     matches!(
         virtual_key,
-        0x08 // Backspace
-            | 0x1B // Escape
-            | 0x23 // End
-            | 0x24 // Home
+        0x1B // Escape
             | 0x25 // Left
             | 0x26 // Up
             | 0x27 // Right
             | 0x28 // Down
-            | 0x7B // F12
             | 0xA6 // Browser back
             | 0xA7 // Browser forward
     )
@@ -5947,6 +6093,8 @@ mod tests {
             "ImagePixelGrid".to_string(),
             "ImageBackgroundCycle".to_string(),
             "ImageComparePin".to_string(),
+            "ImageHome".to_string(),
+            "ImageEnd".to_string(),
             "VideoCapture".to_string(),
             "VideoMute".to_string(),
             "VideoLoop".to_string(),
@@ -5980,8 +6128,6 @@ mod tests {
             // or reserved navigation semantics rather than ordinary keymap dispatch.
             "GridHistoryBack".to_string(),
             "GridHistoryForward".to_string(),
-            "ImageHome".to_string(),
-            "ImageEnd".to_string(),
             "ImageCopyToClipboard".to_string(),
             "ImageCopyPath".to_string(),
             "ImageCopyFileName".to_string(),
@@ -7442,17 +7588,39 @@ mod tests {
         let keymap = Keymap::from_ini_str(
             r#"
             [Grid]
-            GridToggleStackMode = Enter
+            GridToggleStackMode = Esc
             "#,
         );
         assert!(keymap.binding_conflicts().iter().any(|conflict| {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::GridToggleStackMode
-                && conflict.chord == Chord::key(KeyName::Enter)
+                && conflict.chord == Chord::key(KeyName::Esc)
         }));
         assert!(keymap.warnings().iter().any(|warning| {
-            warning.contains("GridToggleStackMode") && warning.contains("reserved shortcut Enter")
+            warning.contains("GridToggleStackMode") && warning.contains("reserved shortcut Esc")
         }));
+    }
+
+    #[test]
+    fn enter_is_assignable_and_not_reserved() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridToggleStackMode = Enter
+            "#,
+        );
+        assert!(keymap.binding_conflicts().iter().all(|conflict| {
+            !(conflict.kind == BindingConflictKind::Reserved
+                && conflict.chord == Chord::key(KeyName::Enter))
+        }));
+        assert!(
+            keymap
+                .warnings()
+                .iter()
+                .all(|warning| !warning.contains("reserved shortcut Enter")),
+            "unexpected warnings: {:?}",
+            keymap.warnings()
+        );
     }
 
     #[test]
@@ -7622,6 +7790,41 @@ mod tests {
         keymap.install_global_native_video_shortcuts();
         assert!(!native_video_fullscreen_shortcut_key(&event(0x7A)));
         assert!(!native_video_fullscreen_shortcut_key(&event(0x7C)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_fs_common_shortcuts_follow_keymap() {
+        let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&event(0x08))); // Backspace
+        assert!(native_video_fullscreen_shortcut_key(&event(0x24))); // Home
+        assert!(native_video_fullscreen_shortcut_key(&event(0x23))); // End
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsCommon]
+            FsBackToList = F13
+            FsJumpFirst = F14
+            FsJumpLast = none
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x08)));
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x24)));
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x23)));
+        assert!(native_video_fullscreen_shortcut_key(&event(0x7C))); // F13
+        assert!(native_video_fullscreen_shortcut_key(&event(0x7D))); // F14
     }
 
     #[cfg(windows)]

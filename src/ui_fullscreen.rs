@@ -6508,7 +6508,7 @@ impl App {
                     crate::app::LocalAdjustMaskTool::Ellipse,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            if self.keymap.consume_action(ctx, KeyAction::LaConfirmPolygon)
                 && self.commit_local_adjust_polygon_from_shortcut(fs_idx)
             {
                 self.show_feedback_toast("多角形マスクを確定しました".to_string());
@@ -6648,7 +6648,8 @@ impl App {
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        // 静止画フルスクリーンでは Enter も Esc と同等に「フルスクリーン解除」トリガー。
+        // 静止画フルスクリーンでは FsClose (既定: Enter) も Esc と同等に
+        // 「フルスクリーン解除」トリガー。
         // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
         // のトグル動作を成立させる。判定は副作用ゼロの
         // `should_close_fullscreen_on_enter` に集約 (= unit test 可能)。
@@ -6667,10 +6668,9 @@ impl App {
             self.fs_context_menu_idx.is_some(),
             self.fs_suppress_enter_close_until_release,
         );
-        let enter_close = !esc
-            && enter_consume_ok
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        let esc = esc || enter_close;
+        let fs_close_key =
+            !esc && enter_consume_ok && self.keymap.consume_action(ctx, KeyAction::FsClose);
+        let esc = esc || fs_close_key;
         // 左右キーは上下と分離して処理（RTL 反転のため）
         let ctrl_d = self.keymap.consume_action(ctx, KeyAction::FsCtrlNavNext);
         let ctrl_u = self.keymap.consume_action(ctx, KeyAction::FsCtrlNavPrev);
@@ -6769,8 +6769,8 @@ impl App {
                         || (!stack_flat_nav
                             && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp))
                 }));
-        let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
-        let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
+        let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
+        let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let key_i =
             !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
@@ -7236,7 +7236,7 @@ impl App {
             .current_folder
             .as_deref()
             .is_some_and(crate::folder_tree::is_virtual_folder);
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
+        if self.keymap.consume_action(ctx, KeyAction::FsBackToList) {
             if viewing_container_page {
                 action.close_to_page_list = true;
             } else {
@@ -16611,41 +16611,42 @@ impl App {
             && tile_right_ctrl.is_none()
             && self
                 .keymap
-                .consume_fixed_chord(ctx, Chord::ctrl_shift(KeyName::Left));
+                .consume_action(ctx, KeyAction::VideoFrameStepBack);
         let ctrl_shift_right = tile_left_ctrl.is_none()
             && tile_right_ctrl.is_none()
             && self
                 .keymap
-                .consume_fixed_chord(ctx, Chord::ctrl_shift(KeyName::Right));
+                .consume_action(ctx, KeyAction::VideoFrameStepForward);
         let frame_step_key = ctrl_shift_left || ctrl_shift_right;
-        let ctrl_shift_held_now = ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift);
         let shift_left = !frame_step_key
-            && !ctrl_shift_held_now
             && self
                 .keymap
-                .consume_fixed_chord(ctx, Chord::shift(KeyName::Left));
+                .consume_action(ctx, KeyAction::VideoSeekBackSmall);
         let shift_right = !frame_step_key
-            && !ctrl_shift_held_now
             && self
                 .keymap
-                .consume_fixed_chord(ctx, Chord::shift(KeyName::Right));
+                .consume_action(ctx, KeyAction::VideoSeekForwardSmall);
         let ctrl_left = !frame_step_key
-            && !ctrl_shift_held_now
             && self
                 .keymap
-                .consume_fixed_chord(ctx, Chord::ctrl(KeyName::Left));
+                .consume_action(ctx, KeyAction::VideoSeekBackLarge);
         let ctrl_right = !frame_step_key
-            && !ctrl_shift_held_now
             && self
                 .keymap
-                .consume_fixed_chord(ctx, Chord::ctrl(KeyName::Right));
+                .consume_action(ctx, KeyAction::VideoSeekForwardLarge);
         let left = !frame_step_key
-            && !ctrl_shift_held_now
+            && !shift_left
+            && !shift_right
+            && !ctrl_left
+            && !ctrl_right
             && self
                 .keymap
                 .consume_fixed_chord(ctx, Chord::key(KeyName::Left));
         let right = !frame_step_key
-            && !ctrl_shift_held_now
+            && !shift_left
+            && !shift_right
+            && !ctrl_left
+            && !ctrl_right
             && self
                 .keymap
                 .consume_fixed_chord(ctx, Chord::key(KeyName::Right));

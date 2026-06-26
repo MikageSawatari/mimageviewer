@@ -16,7 +16,7 @@
 # - = none を指定すると、その Action を明示的に無効化できます。
 # - 既定キーが無い Action は # Action = none と表示されます。
 # - 同時に有効になり得る Action へ同じキーを割り当てると起動時に警告ログを出します。
-# - Esc / Enter / 修飾なし矢印キーは予約扱いです。割り当てても警告ログを出します。
+# - Esc / 修飾なし矢印キーは予約扱いです。割り当てても警告ログを出します。
 # - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。
 # - 競合は拒否しません。競合時は先に判定された操作が有効になります。
 # - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。
@@ -31,7 +31,7 @@
 #   OS が予約しているショートカットは keymap.ini では上書きできません。
 # - native 動画フルスクリーンでは Alt を含む組み合わせはアプリ側へ転送されません。
 # - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、
-#   IME 確定、右クリックメニュー、Escape/Enter ナビゲーション、多くの矢印ナビゲーションは固定です。
+#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーションは固定です。
 #
 # 例:
 # [FsImage]
@@ -119,7 +119,13 @@
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
+# GridOpenSelected = Enter ; 選択中の項目を開く
+# GridOpenExternalPlayer = Shift+Enter ; 選択中の動画を外部プレイヤーで開く
 # GridParentFolder = Backspace ; 親フォルダへ移動する
+# GridMoveFirst = Home ; 先頭の項目へ移動する
+# GridMoveLast = End ; 末尾の項目へ移動する
+# GridPagePrev = PageUp ; 1ページ分前へ移動する
+# GridPageNext = PageDown ; 1ページ分先へ移動する
 # GridTreeFolderPrev = Ctrl+Up ; ツリー順で前のフォルダへ移動する
 # GridTreeFolderNext = Ctrl+Down ; ツリー順で次のフォルダへ移動する
 # GridSiblingFolderPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する
@@ -187,7 +193,10 @@
 # GridDeleteConcealMask.2 = Shift+F10 ; 選択中またはチェック済み画像の隠蔽マスクを削除する
 
 [FsCommon] ; フルスクリーン共通
+# FsBackToList = Backspace ; フルスクリーンを閉じて一覧へ戻る
 # FsToggleWindowMode = F11 ; ウィンドウ表示と全画面表示を切り替える
+# FsJumpFirst = Home ; 先頭の項目へ移動する
+# FsJumpLast = End ; 末尾の項目へ移動する
 # FsCtrlNavPrev = Ctrl+Up ; 前のフォルダまたは検索結果へ移動する
 # FsCtrlNavNext = Ctrl+Down ; 次のフォルダまたは検索結果へ移動する
 # FsSiblingPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する
@@ -210,6 +219,7 @@
 [FsImage] ; 画像フルスクリーン
 # FsToggleMetadata.1 = I ; メタデータパネルの固定表示を切り替える
 # FsToggleMetadata.2 = Tab ; メタデータパネルの固定表示を切り替える
+# FsClose = Enter ; 画像フルスクリーンを閉じる
 # FsPagePrev = none ; 前のページへ移動する
 # FsPageNext = none ; 次のページへ移動する
 # FsFixedJumpPrev = Shift+Left ; 設定した量だけ前へジャンプする (右→左読みで反転)
@@ -348,6 +358,12 @@
 # VideoPlayPause.1 = Space ; 動画の再生または一時停止を切り替える
 # VideoPlayPause.2 = Enter ; 動画の再生または一時停止を切り替える
 # VideoSeekStart = W ; 動画の先頭へ移動して再生する
+# VideoSeekBackSmall = Shift+Left ; 動画を1秒戻す
+# VideoSeekForwardSmall = Shift+Right ; 動画を1秒進める
+# VideoSeekBackLarge = Ctrl+Left ; 動画を30秒戻す
+# VideoSeekForwardLarge = Ctrl+Right ; 動画を30秒進める
+# VideoFrameStepBack = Ctrl+Shift+Left ; 動画を1フレーム戻す
+# VideoFrameStepForward = Ctrl+Shift+Right ; 動画を1フレーム進める
 # VideoVolumeUp = Shift+Up ; 動画音量を上げる
 # VideoVolumeDown = Shift+Down ; 動画音量を下げる
 # VideoNextFile = Down ; 次のファイルへ移動する
@@ -365,6 +381,7 @@
 
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する
+# EraseConfirmPolygon = Enter ; 消しゴム多角形を確定する
 # EraseUndo = Ctrl+Z ; 消しゴム編集を元に戻す
 # EraseDeleteShape = Delete ; 選択中の消しゴム図形を削除する
 # EraseToolSelect = S ; 選択ツールに切り替える
@@ -382,6 +399,7 @@
 
 [Conceal] ; 隠蔽加工モード
 # ConcealExit = Ctrl+M ; 隠蔽加工モードを終了する
+# ConcealConfirmPolygon = Enter ; 隠蔽加工の多角形を確定する
 # ConcealUndo = Ctrl+Z ; 隠蔽加工編集を元に戻す
 # ConcealDeleteShape = Delete ; 選択中の隠蔽図形を削除する
 # ConcealPixelGrid = G ; ピクセルグリッド表示を切り替える
@@ -434,4 +452,5 @@
 # LaToolHLine = H ; 横線ツールに切り替える
 # LaToolRect = R ; 矩形ツールに切り替える
 # LaToolEllipse = O ; 楕円ツールに切り替える
+# LaConfirmPolygon = Enter ; 補正レイヤーの多角形マスクを確定する
 # LaSpacePan = Space ; 押している間だけ画像をパン操作する

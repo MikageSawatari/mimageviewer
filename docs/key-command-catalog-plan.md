@@ -1,6 +1,6 @@
 # キー操作コマンドカタログ化計画
 
-> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。設定メニュー「操作カスタマイズ」独立ダイアログ移設 + コマンド一覧整理、場所系 / ページジャンプ KeyAction 追加スライス実装中** (2026-06-25)。
+> ステータス: **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。設定メニュー「操作カスタマイズ」独立ダイアログ移設 + コマンド一覧整理、場所系 / ページジャンプ KeyAction 追加済み。Enter / Backspace / Home / End / PageUp / PageDown の閲覧ナビ KeyAction 化スライス実装中** (2026-06-25)。
 > 既存の簡易 keymap 実装は [key-customization-impl-plan.md](key-customization-impl-plan.md)、
 > 現行キー仕様は [keymap-spec.md](keymap-spec.md) を正とする。本書はその次段階として、
 > 「デフォルト未割り当ての操作にもキーを割り当てられる」状態へ進めるための段階計画。
@@ -77,10 +77,16 @@
 > `既定` / `なし` / 任意の一発アクションを選べるようにするスライスを実装中。
 > より高度なビジュアル編集は後続で仕様を詰める。
 >
+> **固定キー整理スライス実装メモ (2026-06-25, Codex)**:
+> ユーザー確認に基づき、グローバルに固定・変更不可とするキーを `Esc` と修飾なし矢印ナビゲーションへ絞る。
+> Enter / Backspace / Home / End / PageUp / PageDown は文脈ごとの `KeyAction` として昇格し、
+> 操作カスタマイズ、競合検出、`?` ヘルプ表示の対象にする。ツリーや製本ダイアログなど、
+> フォーカスローカルなリスト操作の Enter / Home / End は引き続きその UI 内の固定入力として扱う。
+>
 > **Phase 2 初期実装メモ (2026-06-24, Codex)**: `KeyContext` を `CommandScope` として再利用し、
 > `CommandSpec` / `BindingPolicy` / active scope 隣接表 / `BindingConflict` を `keymap.rs` に追加。
 > ユーザー override が絡む同一 chord の Hard / ActiveOverlap / TriggerMismatch と、
-> Esc / Enter / 修飾なし矢印キーの Reserved を起動時 warning として出す。設定拒否や dispatch 変更はしない。
+> 当時は Esc / Enter / 修飾なし矢印キーの Reserved を起動時 warning として出していた。現在の予約 warning は Esc / 修飾なし矢印キーのみ。
 >
 > **Phase 3 初期実装メモ (2026-06-24, Codex)**: グリッド側に残っていた F7-F10 /
 > Shift+F7-F10 のマスク一括適用・削除を `GridApplyErase1/2`、

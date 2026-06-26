@@ -1,13 +1,13 @@
 # RingActionId ↔ KeyAction パリティ棚卸し
 
-> ステータス: **棚卸し済み / 漏れ修正済み。⚠️ 13 件も triage 済みで、KeyAction 化 4 件・固定 7 件・ring 専用 3 件に分類済み** (2026-06-25)。
+> ステータス: **棚卸し済み / 漏れ修正済み。⚠️ 13 件も triage 済みで、KeyAction 化 6 件・固定 5 件・ring 専用 3 件に分類済み** (2026-06-25)。
 > 目的: キー操作コマンドカタログ化 (`docs/key-command-catalog-plan.md`) の中で、
 > 「リング/パッド/ジェスチャ (`RingActionId`) には登録したが、キーボード (`KeyAction`) には
 > 登録し忘れた」操作を洗い出し、再発を防ぐための対応表。
 
 ## 背景
 
-`RingActionId` (106 variant, `src/ring_shortcut.rs`) と `KeyAction` (318 variant, `src/keymap.rs`)
+`RingActionId` (106 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
 を意味対応で突き合わせたところ、一部の操作が **ring/パッドには割り当てられるのにキーボードには
 割り当てられない**状態だった。キー側はハードコードの生キー処理で取り残されており、
 
@@ -29,8 +29,8 @@
 
 | 判定 | 件数 |
 |---|---|
-| ✅ 対応済み | 94 |
-| 固定 (理由付き) | 7 |
+| ✅ 対応済み | 96 |
+| 固定 (理由付き) | 5 |
 | ⚪ ring 専用 (意図的) | 3 |
 | ❌ / ⚠️ 未処理 | 0 |
 
@@ -53,7 +53,7 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 | `TreeFolderPrev` / `TreeFolderNext` | Ctrl+↑↓ 生処理 (`src/app.rs`) | **KeyAction 化**推奨 (Backspace/F11 と同じ問題) | ✅ `GridTreeFolderPrev` / `GridTreeFolderNext` として KeyAction 化。既定 Ctrl+↑ / Ctrl+↓ |
 | `SiblingFolderPrev` / `SiblingFolderNext` | グリッド側 Ctrl+PageUp/PageDown 生処理。FS は `FsSiblingPrev/Next` ✅ | KeyAction 化 or 固定明記 | ✅ グリッド側を `GridSiblingFolderPrev` / `GridSiblingFolderNext` として KeyAction 化。既定 Ctrl+PageUp / Ctrl+PageDown |
 | `GridHistoryBack` / `GridHistoryForward` | マウス戻る/進むボタンと Alt+←/→ 固定入力 | キー希望なら KeyAction、不要なら固定明記 | 固定。マウス戻る/進む・ブラウザ戻る/進む hook と Alt+←/→ を同じ履歴経路へ畳む OS/マウス入力なので keymap 対象外 |
-| `ImageHome` / `ImageEnd` | Home/End 生処理 | 固定として `keymap-spec.md` 明記が妥当 | 固定。先頭/末尾移動は予約ナビゲーション扱いで、連結表示や編集サブモードとの優先関係を保つ |
+| `ImageHome` / `ImageEnd` | Home/End 生処理 | KeyAction 化 | ✅ `FsJumpFirst` / `FsJumpLast` として KeyAction 化。既定 Home / End。画像 / 動画フルスクリーン共通 |
 | `ImageCopyToClipboard` | ring/マウス/パッドから clipboard copy を実行 | 固定明記が妥当 | 固定。OS クリップボード経路で、通常の Ctrl+C / Shell menu / context menu と同じ固定入力レイヤーに置く |
 | `ImageCopyPath` / `ImageCopyFileName` | ring/マウス/パッドからパス / ファイル名を clipboard へコピー | 固定明記 or KeyAction | 固定。OS クリップボード / Shell 連携として keymap 対象外 |
 | `ImageOpenFolder` | ring/マウス/パッドから Explorer で表示フォルダを開く。対応するキー操作なし | KeyAction 化 or ring 専用明記 | ⚪ ring 専用。画像フルスクリーン中の補助操作で、既存キーボード操作は無い |

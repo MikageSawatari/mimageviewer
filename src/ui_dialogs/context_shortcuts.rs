@@ -22,28 +22,12 @@ const GRID_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "このショートカット一覧を表示する",
     },
     FixedShortcutRow {
-        keys: "Enter",
-        description: "選択中の項目を開く",
-    },
-    FixedShortcutRow {
-        keys: "Shift+Enter",
-        description: "選択中の動画を外部プレイヤーで開く",
-    },
-    FixedShortcutRow {
         keys: "Alt+↑",
         description: "親フォルダまたは検索結果の上位階層へ戻る",
     },
     FixedShortcutRow {
         keys: "← / → / ↑ / ↓",
         description: "選択位置を移動する",
-    },
-    FixedShortcutRow {
-        keys: "Home / End",
-        description: "先頭または末尾の項目へ移動する",
-    },
-    FixedShortcutRow {
-        keys: "PageUp / PageDown",
-        description: "1ページ分移動する",
     },
     FixedShortcutRow {
         keys: "Shift+矢印",
@@ -69,20 +53,12 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "このショートカット一覧を表示する",
     },
     FixedShortcutRow {
-        keys: "Esc / Enter",
+        keys: "Esc",
         description: "フルスクリーンを閉じて一覧へ戻る",
-    },
-    FixedShortcutRow {
-        keys: "Backspace",
-        description: "一覧へ戻る。ZIP/PDF 内ページではページ一覧へ戻る",
     },
     FixedShortcutRow {
         keys: "← / → / ↑ / ↓ / マウスホイール",
         description: "前または次の項目へ移動する",
-    },
-    FixedShortcutRow {
-        keys: "Home / End",
-        description: "先頭または末尾の項目へ移動する",
     },
     FixedShortcutRow {
         keys: "Ctrl+Alt+Shift+D",
@@ -100,28 +76,12 @@ const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "このショートカット一覧を表示する",
     },
     FixedShortcutRow {
-        keys: "Esc / Backspace",
-        description: "一覧へ戻る。タイルモード中の Esc は先にタイルモードを閉じる",
+        keys: "Esc",
+        description: "一覧へ戻る。タイルモード中は先にタイルモードを閉じる",
     },
     FixedShortcutRow {
         keys: "← / →",
         description: "5秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
-    },
-    FixedShortcutRow {
-        keys: "Shift+← / Shift+→",
-        description: "1秒戻る / 進む。タイルモード中はタイルカーソルを移動する",
-    },
-    FixedShortcutRow {
-        keys: "Ctrl+← / Ctrl+→",
-        description: "30秒戻る / 進む。タイルモード中はタイルカーソルを1行移動する",
-    },
-    FixedShortcutRow {
-        keys: "Ctrl+Shift+← / Ctrl+Shift+→",
-        description: "1フレーム戻る / 進む",
-    },
-    FixedShortcutRow {
-        keys: "Home / End",
-        description: "先頭または末尾の項目へ移動する",
     },
     FixedShortcutRow {
         keys: "マウスホイール",
@@ -149,10 +109,6 @@ const ERASE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "選択や多角形入力を解除する。解除対象がなければ補完を実行して終了する",
     },
     FixedShortcutRow {
-        keys: "Enter",
-        description: "多角形ツールの頂点列を確定する",
-    },
-    FixedShortcutRow {
         keys: "矢印 / Ctrl+矢印",
         description: "マスクまたは選択オブジェクトを 1px / 10px 移動する",
     },
@@ -174,10 +130,6 @@ const CONCEAL_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "Esc",
         description: "選択や多角形入力を解除する。解除対象がなければ隠蔽加工モードを終了する",
-    },
-    FixedShortcutRow {
-        keys: "Enter",
-        description: "多角形ツールの頂点列を確定する",
     },
     FixedShortcutRow {
         keys: "矢印 / Ctrl+矢印",
@@ -216,10 +168,6 @@ const LOCAL_ADJUST_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "Esc",
         description: "編集中の図形操作を解除する。解除対象がなければ補正レイヤーパネルを閉じる",
-    },
-    FixedShortcutRow {
-        keys: "Enter",
-        description: "多角形マスクの頂点列を確定する",
     },
     FixedShortcutRow {
         keys: "Delete",
@@ -453,6 +401,8 @@ fn video_help_includes_row(row: &CommandDisplayRow) -> bool {
     match row.spec.action {
         KeyAction::ToggleDetachedViewerMode
         | KeyAction::FsToggleWindowMode
+        | KeyAction::FsJumpFirst
+        | KeyAction::FsJumpLast
         | KeyAction::FsCtrlNavPrev
         | KeyAction::FsCtrlNavNext
         | KeyAction::FsSiblingPrev

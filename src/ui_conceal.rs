@@ -497,9 +497,11 @@ impl App {
             return action;
         }
 
-        // Enter: 多角形ツールの頂点列を確定。
-        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if enter
+        // 既定 Enter: 多角形ツールの頂点列を確定。
+        let confirm_polygon = self
+            .keymap
+            .consume_action(ctx, KeyAction::ConcealConfirmPolygon);
+        if confirm_polygon
             && self.conceal_tool == ConcealTool::Polygon
             && let Some(pts) =
                 crate::manual_mask_tools::take_completed_polygon(&mut self.conceal_lasso_points)

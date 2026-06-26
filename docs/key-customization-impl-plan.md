@@ -30,7 +30,7 @@
   `CommandSpec` などのコマンドカタログ型はまだ導入していない。
 - 2026-06 Phase 2 初期実装として、`KeyContext` を scope とする `CommandSpec` /
   `BindingPolicy` / active scope 隣接表 / `BindingConflict` を追加した。ユーザー override が
-  同時 active になり得る既存割り当てや、Esc / Enter / 修飾なし矢印の予約キーに重なる場合は
+  同時 active になり得る既存割り当てや、Esc / 修飾なし矢印の予約キーに重なる場合は
   起動時に警告ログを出す。設定拒否や dispatch 変更はしない。
 - 2026-06 Phase 3 初期実装として、グリッド側の F7-F10 / Shift+F7-F10 マスク一括適用・
   削除を `GridApplyErase1/2`、`GridApplyConceal1/2`、`GridDeleteEraseMask`、
@@ -45,7 +45,7 @@
   マウス進む・戻る / マウスジェスチャのタブを切り替えられる。コマンド一覧は短い表示名で
   キー操作と割り当て済みのリング / マウス / パッド操作を同じ表に混ぜ、キーボード図のキークリックから
   割り当て先コマンドを選べる。
-- Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
+- Esc ナビゲーション、修飾なし矢印ナビゲーション、OS clipboard、
   D&D、IME 確定は固定扱いのまま。マウス / ゲームパッドは keymap.ini 対象外だが、
   右ドラッグ、ゲームパッド X リング、マウス戻る / 進むボタンは
   `Settings.ring_shortcuts` の小さな固定入力レイヤーで扱う。UI 上はリングとマウスボタンを
@@ -353,10 +353,9 @@ if !key.repeat && self.keymap.matches_vk(KeyAction::VideoMute, &key, 0x4D, false
 
 design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確認:
 
-1. **矢印ナビ / Esc / Enter は当面「固定扱い」として keymap 対象外**を推奨。
-   - 理由: Esc 再割当でモード脱出不能 / Enter は IME 確定や open-close トグルと密結合 /
-     矢印は RTL 反転・見開き 2 ページ送り・動画シーク粒度と絡む。
-   - 将来解放する場合も「Esc は常に脱出可能」フォールバックを残す。
+1. **Esc と修飾なし矢印ナビは固定扱いのまま残す。Enter / Backspace / Home / End / PageUp / PageDown は文脈別 `KeyAction` として扱う。**
+   - 理由: Esc は再割当でモード脱出不能になりやすく、修飾なし矢印は RTL 反転・見開き 2 ページ送り・動画シーク粒度と絡む最低限の閲覧ナビ。
+   - Enter / Backspace / Home / End / PageUp / PageDown は操作単位が明確になったため、コマンド設定・競合検出・ヘルプ表示へ載せる。
 2. **動画シーク (←→ + 修飾で 5/1/30 秒)** は修飾でgranularityを切替える特殊構造。
    MVP では**固定**。カスタムするなら `VideoSeekFwd5/1/30` の 3 Action に分割して扱う。
 3. **IME ガード維持**: 文字キー Action は既存 `ime_input_active()` / `dialog_*_pressed` の
@@ -484,11 +483,11 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
-- GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpen `Enter`(予約) /
+- GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /
   GridParentFolder `Backspace` (P) / GridToggleCheck `Space` (P)
 - GridTreeFolderPrev/Next `Ctrl+↑/↓` (P) / GridSiblingFolderPrev/Next `Ctrl+PageUp/Down` (P)
 - GridParentAlt `Alt+↑` (P) / GridHistoryBack/Forward `Alt+←/→` (P)
-- GridHome/End/PageUp/PageDown (P)(予約候補)
+- GridMoveFirst/Last `Home/End` (P) / GridPagePrev/Next `PageUp/PageDown` (P)
 - GridToggleFolderTreePane `F` (P) / GridToggleMaximize `F11` (P) /
   GridDelete `Delete` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
   GridPin `P` (P) / GridCompareX `X` (P)
@@ -501,7 +500,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
 
 ### FsSharedNavigation (画像 / 動画で実際に共有)
-- FsClose `Esc` (予約) / FsImageClose `Enter` (画像のみ予約) / FsParent `Backspace`(予約)
+- FsClose `Enter` (画像のみ P) / FsBackToList `Backspace` (P) / `Esc` (固定)
+- FsJumpFirst/Last `Home/End` (P)
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
@@ -542,8 +542,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### FsVideo (Ph5、VK 経路)
 - VideoPlayPause `Space`,`Enter` / VideoExternalPlayer `Shift+Enter`
-- VideoSeekBack/Fwd `←/→` (修飾で 5/1/30 秒 = MVP固定。将来は `VideoSeekFwd5/1/30` 等へ分割)
-- VideoFrameStepBack/Fwd `Ctrl+Shift+←/→`
+- VideoSeekBack/Fwd `←/→` (修飾なし 5 秒は固定) / VideoSeekBackSmall/ForwardSmall `Shift+←/→` (P) /
+  VideoSeekBackLarge/ForwardLarge `Ctrl+←/→` (P)
+- VideoFrameStepBack/Fwd `Ctrl+Shift+←/→` (P)
 - VideoSeekStart `W` / VideoVolumeUp/Down `Shift+↑/↓` / VideoNextFile `↓` / VideoPrevFile `↑`
 - VideoMute `M` / VideoLoop `L` / VideoMarkerPrev `J` / VideoMarkerNext `K`
 - VideoPin `P` / VideoPerfOverlay `F` / VideoTileMode `S` / VideoBookmark `B`

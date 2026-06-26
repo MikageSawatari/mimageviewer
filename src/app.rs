@@ -18488,37 +18488,19 @@ impl App {
             })
         });
 
-        let (
-            right,
-            left,
-            down,
-            up,
-            enter,
-            _ctrl_up_raw,
-            _ctrl_down_raw,
-            home,
-            end,
-            page_up,
-            page_down,
-            mouse_back,
-            mouse_forward,
-        ) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::Enter),
-                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
-                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::Home),
-                i.key_pressed(egui::Key::End),
-                i.key_pressed(egui::Key::PageUp),
-                i.key_pressed(egui::Key::PageDown),
-                i.pointer.button_pressed(egui::PointerButton::Extra1),
-                i.pointer.button_pressed(egui::PointerButton::Extra2),
-            )
-        });
+        let (right, left, down, up, _ctrl_up_raw, _ctrl_down_raw, mouse_back, mouse_forward) = ctx
+            .input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
+                    i.pointer.button_pressed(egui::PointerButton::Extra1),
+                    i.pointer.button_pressed(egui::PointerButton::Extra2),
+                )
+            });
 
         // マウスドライバが WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD で送る経路 (上で
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
@@ -18530,6 +18512,14 @@ impl App {
             return self.apply_mouse_back_forward_button(ctx, mouse_nav_forward, "grid-mouse");
         }
         let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
+        let open_selected_key = self.keymap.pressed_action(ctx, KeyAction::GridOpenSelected);
+        let external_player_key = self
+            .keymap
+            .pressed_action(ctx, KeyAction::GridOpenExternalPlayer);
+        let home = self.keymap.pressed_action(ctx, KeyAction::GridMoveFirst);
+        let end = self.keymap.pressed_action(ctx, KeyAction::GridMoveLast);
+        let page_up = self.keymap.pressed_action(ctx, KeyAction::GridPagePrev);
+        let page_down = self.keymap.pressed_action(ctx, KeyAction::GridPageNext);
         let key_r = self.keymap.pressed_action(ctx, KeyAction::GridRotateCw);
         let key_l = self.keymap.pressed_action(ctx, KeyAction::GridRotateCcw);
 
@@ -18805,10 +18795,15 @@ impl App {
                 }
             }
 
-            if enter {
-                // Shift+Enter で動画を外部プレイヤーで開く (フルスクリーン中と
+            let external_player_video = external_player_key
+                && self
+                    .selected
+                    .and_then(|idx| self.items.get(idx))
+                    .is_some_and(|item| matches!(item, GridItem::Video(_)));
+            if open_selected_key || external_player_video {
+                // Shift+Enter などに割り当てた専用コマンドで動画を外部プレイヤーで開く
+                // (フルスクリーン中と
                 // 同じ挙動をグリッドからも使えるようにする)。
-                let shift_enter = !self.ime_input_active() && ctx.input(|i| i.modifiers.shift);
                 if let Some(idx) = self.selected {
                     if !self.guard_reading_history_open(idx) {
                         return None;
@@ -18819,9 +18814,9 @@ impl App {
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
                     // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
                     // (= 動画 + shift_enter のときは intercept をスキップして下の Video arm に流す)。
-                    let stack_skip_for_shift_video =
-                        shift_enter && matches!(self.items.get(idx), Some(GridItem::Video(_)));
-                    if !stack_skip_for_shift_video && self.stack_try_open_from_grid(idx, false) {
+                    let stack_skip_for_external_video = external_player_video
+                        && matches!(self.items.get(idx), Some(GridItem::Video(_)));
+                    if !stack_skip_for_external_video && self.stack_try_open_from_grid(idx, false) {
                         return None;
                     }
                     match self.items.get(idx) {
@@ -18843,7 +18838,7 @@ impl App {
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             return Some(crate::ui_main::AddressBarNav::Direct(p));
                         }
-                        Some(GridItem::Video(p)) if shift_enter => {
+                        Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);
                         }
                         Some(GridItem::Image(_))

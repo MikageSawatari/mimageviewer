@@ -23,9 +23,10 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 `RatingContainer1..5/Clear`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
 同じ割り当てを共有する。v2.2.0 からは物理キー寄りの `KeySlot` を正本にし、通常の数字キーとテンキー数字を別キーとして扱う。互換性のため、従来の数字キー既定操作は `1` と `Numpad1` のように両方を既定割り当てにする。
 OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keymap では上書きできない。
-Escape / Enter / 修飾なし矢印ナビゲーション、Home / End、マウス戻る / 進むボタン、
-OS クリップボードや Shell 連携 (コピー / パスコピー / フォルダを開く) は文脈依存または
-OS 入力経路が絡むため当面固定扱いにする。
+`Esc` と修飾なし矢印ナビゲーションは、モード脱出と閲覧の最低限の固定入力として keymap 対象外にする。
+Enter / Backspace / Home / End / PageUp / PageDown などの閲覧操作は文脈ごとの `KeyAction`
+として扱い、コマンド設定・競合検出・ヘルプ表示に載せる。マウス戻る / 進むボタン、OS クリップボードや
+Shell 連携 (コピー / パスコピー / フォルダを開く) は入力経路が異なるため固定入力レイヤーに残す。
 標準キーを持たないが割り当て可能な操作は `keymap.ini.default` に
 `# Action = none` として列挙される。コマンド設定または旧 `keymap.ini` 移行でキー名を指定すると割り当てられ、
 `Action = none` を明示した場合は無効化として扱う。
@@ -35,11 +36,11 @@ OS 入力経路が絡むため当面固定扱いにする。
 `GridFavorite...` / `GridOpenFavorite...` / `GridOpenDrive...` /
 `GridOpenLocation...` とし、競合判定とヘルプ表示でも `Grid` 文脈として扱う。
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
-Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に警告ログを出すが、
+Escape / 修飾なし矢印キーへ割り当てた場合は起動時に警告ログを出すが、
 設定自体は読み込み、現行 dispatch の優先順を変えない。
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 <kbd>?</kbd> の `HelpShowContextShortcuts` で現在の文脈で使える
 ショートカット一覧を表示する。keymap 化済み操作は現在のコマンド設定の実割り当てから
-表示し、Enter / 矢印など当面固定扱いの操作は固定キーとして補助表示する。
+表示し、Esc / 修飾なし矢印など固定扱いの操作は固定キーとして補助表示する。
 キー未設定または明示無効化中の割り当て可能操作は別枠で表示する。
 `HelpShowContextShortcuts` もコマンド設定で変更でき、ヘルプ内の固定キー欄や native 動画 overlay の表示は変更後のキーを表示する。動画フルスクリーンは egui 経路と Windows native
 動画 overlay の両方で対応する。既定の `?` は設定ファイル上も `?` と書けるが、内部的には `Shift+/` と同等に扱う。
@@ -55,9 +56,9 @@ Escape / Enter / 修飾なし矢印キーへ割り当てた場合は起動時に
 popup の shortcut 表記は、`分析ツール [Shift+Z]` や `メタデータ [I / Tab]`
 のように実割り当てから作る。native 動画 overlay の top bar / bottom HUD / jump panel /
 seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当てから作る。
-グリッドの <kbd>Backspace</kbd> 親フォルダ移動と、グリッド / フルスクリーンの
-<kbd>F11</kbd> 系ウィンドウ切り替えも keymap 対象にする。`Esc` / `Enter` /
-修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、Ctrl+ホイールなど固定扱いの入力は従来どおり。
+グリッドの <kbd>Backspace</kbd> 親フォルダ移動、Enter / Home / End / PageUp / PageDown
+ナビゲーション、グリッド / フルスクリーンの <kbd>F11</kbd> 系ウィンドウ切り替えも
+keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
@@ -70,12 +71,15 @@ seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当て�
 |---|---|
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当てを表示し、固定扱いのナビゲーションキーとキー未設定 / 無効化中の操作は別枠で表示する |
 | <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
-| <kbd>Enter</kbd> | 選択アイテムを開く。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
+| <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
+| <kbd>Shift</kbd>+<kbd>Enter</kbd> | 選択中の動画を外部プレイヤーで開く。Action: `GridOpenExternalPlayer` |
 | <kbd>Alt</kbd>+<kbd>↑</kbd> | 親フォルダへ (<kbd>Backspace</kbd> と同じ。Explorer 慣習に合わせた代替ショートカット。ドライブルートではドライブ一覧へ戻る。Ctrl+F フィルタ元フォルダでは no-op) |
 | <kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | フォルダ履歴を戻る / 進む (フォルダバーの ←/→ と同じ。検索中・ドライブ一覧中は無効) |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。Action: `GridTreeFolderPrev`。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。★固定 中は snapshot 内の前 entry へ |
 | <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。Action: `GridTreeFolderNext`。検索中は次のヒットフォルダへ移動。★固定 中は snapshot 内の次 entry へ |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。Action: `GridSiblingFolderPrev` / `GridSiblingFolderNext`。同じ親の直下だけを対象にし、空フォルダも skip せず、子や祖先の兄弟には入らない。検索中は無効。★固定 中は snapshot 内の前/次 image-like entry へ (Folder/Zip/Pdf entry は skip) |
+| <kbd>Home</kbd> / <kbd>End</kbd> | サムネイル一覧の先頭 / 末尾へ移動する。Action: `GridMoveFirst` / `GridMoveLast` |
+| <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | サムネイル一覧を 1 ページ分前 / 次へ移動する。Action: `GridPagePrev` / `GridPageNext` |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5。ドライブ一覧中は無効 |
 | <kbd>F6</kbd> | レーティング解除。ドライブ一覧中は無効 |
 | <kbd>F7</kbd> / <kbd>F8</kbd> | 消しゴムマスクスロット 1 / 2 をチェック済み画像へ一括適用 (チェックがなければ選択中の 1 枚)。Action: `GridApplyErase1/2` |
@@ -140,9 +144,10 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | 入力 | 動作 |
 |---|---|
 | <kbd>Esc</kbd> | フルスクリーン解除。**環境設定 `auto_fullscreen_zip_pdf` が ON で ZIP/PDF/変換アーカイブ内のページを表示している場合は、ページ一覧 (L2) を経由せず親フォルダの一覧 (L1) へ直帰** (`handle_fullscreen_close_request` → `pending_return_to_parent` → 入力ナビ合流点が親へナビ) |
-| <kbd>Enter</kbd> | (画像) フルスクリーン解除 (Esc と同等、右手側ホームポジションからの解除キー)。グリッドで Enter / ダブルクリックで開く動作とトグル成立。`auto_fullscreen_zip_pdf` ON のコンテナページでは親直帰も Esc と同じ / (動画) 再生・一時停止トグル |
+| <kbd>Enter</kbd> | (画像) フルスクリーン解除。Action: `FsClose`。グリッドで Enter / ダブルクリックで開く動作とトグル成立。`auto_fullscreen_zip_pdf` ON のコンテナページでは親直帰も Esc と同じ / (動画) 再生・一時停止トグル。Action: `VideoPlayPause` |
 | <kbd>Space</kbd> | (画像) 選択 (チェック) トグル — スライドショー再生中なら停止 / (動画) 再生・一時停止トグル |
-| <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。ZIP/PDF/変換アーカイブ内のページでは、そのコンテナのページ一覧 (L2) を表示 (= Esc/Enter の「L1 へ直帰」と対をなす) |
+| <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。Action: `FsBackToList`。ZIP/PDF/変換アーカイブ内のページでは、そのコンテナのページ一覧 (L2) を表示 (= Esc/Enter の「L1 へ直帰」と対をなす) |
+| <kbd>Home</kbd> / <kbd>End</kbd> | フルスクリーン中の先頭 / 末尾の項目へ移動する。Action: `FsJumpFirst` / `FsJumpLast`。動画 native presenter 経路でも App 側へ転送する |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る |
 | マウスホイール | 前 / 次のファイル。縦/横連結モードでは連結方向へスクロール |
 | マウス戻る / 進むボタン | `Settings.ring_shortcuts.mouse_buttons_image` / `mouse_buttons_video` に従い、物理戻る / 進むボタンを個別に割り当てる。画像フルスクリーンでは Home/End 相当の先頭 / 末尾移動も候補に含む。新規環境と既定リセットはフォルダ履歴の戻る / 進む。従来どおりを選んだ既存環境は Ctrl+↑ / Ctrl+↓ 相当 |
@@ -198,7 +203,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 通常はプレーン <kbd>↑</kbd>/<kbd>↓</kbd> と同義 (前 / 次ファイル)。**ファイル名スタックのフラット読書中 (v2.0.0)** は「前 / 次のスタックの先頭画像へジャンプ」(= 今の投稿の残りをスキップ。`Shift+↑` はスタック途中なら現スタック先頭、先頭なら前スタック先頭)。端では no-op (次フォルダは <kbd>Ctrl</kbd>+<kbd>↓</kbd>)。スタックジャンプ部分の Action: `FsStackJumpPrev` / `FsStackJumpNext`。動画再生中は音量 (下表参照) |
 | 既定キーなし (`FsPagePrev` / `FsPageNext`) | コマンド設定でキーを割り当てると、前 / 次のページへ移動する。矢印ナビゲーションは固定扱いのまま残しつつ、明示的にページ送りへ割り当てたい場合の Action |
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 現在の表示順で、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプ。Action: `FsFixedJumpPrev` / `FsFixedJumpNext`。既定は全ページの 10%。固定ページ数にも切替可。見開き中は最低 2 ページ進む。左右の意味は通常の左右ページ送りと同じく RTL で反転。動画は対象外 |
-| <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。Home/End や多くの矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネルやページジャンプなど副作用が明確な操作は KeyAction 化して競合検出対象にする |
+| <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。1 回押すごとに必ず 1 ページ動く)。結果はセッション内の一時アンカーとして保持し、`spread_db` には保存しない。Single モードでは前 / 次ファイル。RTL では左右の意味を反転 |
 | <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸で循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 
@@ -242,6 +247,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | マウスホイール | 画像上ではズーム。ツールパネル上ではパネルスクロール |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | マスクまたは選択オブジェクトを 1px / 10px 移動 |
 | <kbd>[</kbd> / <kbd>]</kbd>, <kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd> | マスクまたは選択オブジェクトを ±0.1° / ±1° 回転 |
+| <kbd>Enter</kbd> | 多角形マスクの頂点列を確定。Action: `EraseConfirmPolygon` |
 | <kbd>Shift</kbd>+ハンドル | 端点角度・回転角をスナップ、矩形/楕円の角リサイズを等比化 |
 | <kbd>Alt</kbd>+ハンドル | 矩形/楕円を中心固定でリサイズ |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> | マスク編集 Undo |
@@ -272,6 +278,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | 選択オブジェクト、またはオブジェクト全体を 1px / 10px 移動 |
 | <kbd>Shift</kbd>+ハンドル | 端点角度・回転角をスナップ、矩形/楕円の角リサイズを等比化 |
 | <kbd>Alt</kbd>+ハンドル | 矩形/楕円を中心固定でリサイズ |
+| <kbd>Enter</kbd> | 多角形マスクの頂点列を確定。Action: `ConcealConfirmPolygon` |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> | マスク編集 Undo |
 | <kbd>Del</kbd> | 選択中オブジェクトを削除 |
 
@@ -290,7 +297,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | <kbd>R</kbd> / <kbd>O</kbd> | 矩形 / 楕円ツール |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
 | <kbd>Esc</kbd> | 編集中の図形操作を解除。解除対象がなければ補正レイヤーモード終了 |
-| <kbd>Enter</kbd> | 多角形マスクの頂点列を確定 |
+| <kbd>Enter</kbd> | 多角形マスクの頂点列を確定。Action: `LaConfirmPolygon` |
 | <kbd>Del</kbd> | 選択中の図形マスクを削除 |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> | 多角形入力中は頂点を戻す。それ以外は補正レイヤー操作を Undo |
 | <kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | 補正レイヤー操作を Redo |
@@ -334,12 +341,14 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | キー / 入力 | 動作 | 備考 |
 |---|---|---|
 | <kbd>?</kbd> (既定) | 現在の動画フルスクリーンコンテキストで使えるショートカット一覧を表示 | Action: `HelpShowContextShortcuts`。egui 経路と Windows native 動画 overlay の両方で対応 |
-| <kbd>Space</kbd> / <kbd>Enter</kbd> | 再生 / 一時停止トグル | 動画 HUD 2 段化リデザイン (Phase 1) で Space を再生/停止に変更 (旧: 選択トグル)。チェックしたい場合は Esc で一覧へ戻る |
-| <kbd>Backspace</kbd> | 一覧へ戻る | 画像フルスクリーンと同じ。native presenter 経路でも App 側へ転送する |
-| <kbd>Shift</kbd>+<kbd>Enter</kbd> | 外部プレイヤー起動 | |
+| <kbd>Space</kbd> / <kbd>Enter</kbd> | 再生 / 一時停止トグル | Action: `VideoPlayPause`。動画 HUD 2 段化リデザイン (Phase 1) で Space を再生/停止に変更 (旧: 選択トグル)。チェックしたい場合は Esc で一覧へ戻る |
+| <kbd>Backspace</kbd> | 一覧へ戻る | Action: `FsBackToList`。画像フルスクリーンと同じ。native presenter 経路でも App 側へ転送する |
+| <kbd>Home</kbd> / <kbd>End</kbd> | 先頭 / 末尾の項目へ移動 | Action: `FsJumpFirst` / `FsJumpLast`。native presenter 経路でも App 側へ転送する |
+| <kbd>Shift</kbd>+<kbd>Enter</kbd> | 外部プレイヤー起動 | Action: `VideoExternalPlayer` |
 | <kbd>←</kbd> / <kbd>→</kbd> | 5 秒シーク (デフォルト) | |
-| <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Phase 7.H |
-| <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Phase 7.H |
+| <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Action: `VideoSeekBackSmall` / `VideoSeekForwardSmall` |
+| <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 フレーム戻る / 進む | Action: `VideoFrameStepBack` / `VideoFrameStepForward` |
 | <kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを前 / 次へ移動 | seek しない。現在位置より後の最初のタイルを時刻ラベル込みで強調表示 |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを 1 行分移動 | 列数分だけ前 / 次へ移動 |
 | <kbd>Space</kbd> / <kbd>Enter</kbd> (タイル中) | タイルカーソル位置から再生 | S / Esc で閉じた場合は再生位置を変更しない |
@@ -407,8 +416,9 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
   ③ スタックのフラット読書中のスタックジャンプ、の 3 用途をコンテキストで出し分ける。
   `ui_fullscreen.rs` では動画の `VideoVolume*` / `VideoNextFile` / `VideoPrevFile`
   を先に扱い、非動画かつスタックフラット時だけ `FsStackJump*` を見る。これにより
-  native 動画経路と App 側の縦方向 keymap 解決を近づけつつ、通常の Esc / Enter /
-  plain 矢印ナビゲーションは固定扱いのまま残す。
+  native 動画経路と App 側の縦方向 keymap 解決を近づけつつ、通常の Esc /
+  plain 矢印ナビゲーションは固定扱いのまま残す。Enter / Backspace / Home / End は
+  文脈ごとの `KeyAction` として扱う。
 - **ZipPla 風 全画面ズームは `KeyAction::FsZoomMode` (KeyHold トリガ、既定 <kbd>Z</kbd>) として扱う**。
   「押している間=照準 (枠表示) / 離す=ズーム確定 / ズーム中の押下=解除」というホールド + トグルの
   ハイブリッドだが、`KeyHold` アクション基盤 (Shift ルーペ `FsLoupeHold` / 編集モードの Space パンと
