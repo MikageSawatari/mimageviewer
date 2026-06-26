@@ -1709,24 +1709,40 @@ fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap
 
         for row in keyboard_picker_rows() {
             ui.horizontal_wrapped(|ui| {
-                for &key in row {
-                    let chord = Chord::new(
-                        state.operation_keyboard_ctrl,
-                        state.operation_keyboard_shift,
-                        state.operation_keyboard_alt,
-                        key,
-                    );
-                    let label = key.display_name();
-                    let width = keyboard_picker_key_width(key);
-                    let response = ui.add_sized([width, 24.0], egui::Button::new(label).small());
-                    let clicked = response.clicked();
-                    response.on_hover_text(keyboard_chord_tooltip(
-                        keymap,
-                        chord,
-                        state.operation_keyboard_context,
-                    ));
-                    if clicked {
-                        assign_keyboard_picker_chord(state, keymap, chord);
+                for &cell in row {
+                    match cell {
+                        KeyboardPickerCell::Key(key, label) => {
+                            let chord = Chord::new(
+                                state.operation_keyboard_ctrl,
+                                state.operation_keyboard_shift,
+                                state.operation_keyboard_alt,
+                                key,
+                            );
+                            let label = label.unwrap_or_else(|| key.display_name());
+                            let width = keyboard_picker_cell_width(label, key);
+                            let response =
+                                ui.add_sized([width, 24.0], egui::Button::new(label).small());
+                            let clicked = response.clicked();
+                            response.on_hover_text(keyboard_chord_tooltip(
+                                keymap,
+                                chord,
+                                state.operation_keyboard_context,
+                            ));
+                            if clicked {
+                                assign_keyboard_picker_chord(state, keymap, chord);
+                            }
+                        }
+                        KeyboardPickerCell::Disabled(label) => {
+                            let width = keyboard_picker_label_width(label);
+                            ui.add_enabled_ui(false, |ui| {
+                                ui.add_sized([width, 24.0], egui::Button::new(label).small())
+                            })
+                            .inner
+                            .on_hover_text("現在は割り当て対象外です。");
+                        }
+                        KeyboardPickerCell::Spacer(width) => {
+                            ui.add_space(width);
+                        }
                     }
                 }
             });
@@ -1734,103 +1750,120 @@ fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap
     });
 }
 
-fn keyboard_picker_rows() -> [&'static [KeyName]; 7] {
-    const EXTENDED_FUNCTION: &[KeyName] = &[
-        KeyName::F13,
-        KeyName::F14,
-        KeyName::F15,
-        KeyName::F16,
-        KeyName::F17,
-        KeyName::F18,
-        KeyName::F19,
-        KeyName::F20,
-        KeyName::F21,
-        KeyName::F22,
-        KeyName::F23,
-        KeyName::F24,
+#[derive(Clone, Copy)]
+enum KeyboardPickerCell {
+    Key(KeyName, Option<&'static str>),
+    Disabled(&'static str),
+    Spacer(f32),
+}
+
+fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
+    use KeyboardPickerCell::{Disabled, Key, Spacer};
+    const EXTENDED_FUNCTION: &[KeyboardPickerCell] = &[
+        Key(KeyName::F13, None),
+        Key(KeyName::F14, None),
+        Key(KeyName::F15, None),
+        Key(KeyName::F16, None),
+        Key(KeyName::F17, None),
+        Key(KeyName::F18, None),
+        Key(KeyName::F19, None),
+        Key(KeyName::F20, None),
+        Key(KeyName::F21, None),
+        Key(KeyName::F22, None),
+        Key(KeyName::F23, None),
+        Key(KeyName::F24, None),
     ];
-    const FUNCTION: &[KeyName] = &[
-        KeyName::F1,
-        KeyName::F2,
-        KeyName::F3,
-        KeyName::F4,
-        KeyName::F5,
-        KeyName::F6,
-        KeyName::F7,
-        KeyName::F8,
-        KeyName::F9,
-        KeyName::F10,
-        KeyName::F11,
-        KeyName::F12,
+    const FUNCTION: &[KeyboardPickerCell] = &[
+        Key(KeyName::F1, None),
+        Key(KeyName::F2, None),
+        Key(KeyName::F3, None),
+        Key(KeyName::F4, None),
+        Key(KeyName::F5, None),
+        Key(KeyName::F6, None),
+        Key(KeyName::F7, None),
+        Key(KeyName::F8, None),
+        Key(KeyName::F9, None),
+        Key(KeyName::F10, None),
+        Key(KeyName::F11, None),
+        Key(KeyName::F12, None),
     ];
-    const NUMBER: &[KeyName] = &[
-        KeyName::Esc,
-        KeyName::Num1,
-        KeyName::Num2,
-        KeyName::Num3,
-        KeyName::Num4,
-        KeyName::Num5,
-        KeyName::Num6,
-        KeyName::Num7,
-        KeyName::Num8,
-        KeyName::Num9,
-        KeyName::Num0,
-        KeyName::Minus,
-        KeyName::Backspace,
+    const NUMBER: &[KeyboardPickerCell] = &[
+        Key(KeyName::Esc, None),
+        Key(KeyName::Num1, None),
+        Key(KeyName::Num2, None),
+        Key(KeyName::Num3, None),
+        Key(KeyName::Num4, None),
+        Key(KeyName::Num5, None),
+        Key(KeyName::Num6, None),
+        Key(KeyName::Num7, None),
+        Key(KeyName::Num8, None),
+        Key(KeyName::Num9, None),
+        Key(KeyName::Num0, None),
+        Key(KeyName::Minus, None),
+        Disabled("^"),
+        Key(KeyName::Backslash, Some("￥")),
+        Key(KeyName::Backspace, None),
     ];
-    const QWERTY: &[KeyName] = &[
-        KeyName::Tab,
-        KeyName::Q,
-        KeyName::W,
-        KeyName::E,
-        KeyName::R,
-        KeyName::T,
-        KeyName::Y,
-        KeyName::U,
-        KeyName::I,
-        KeyName::O,
-        KeyName::P,
-        KeyName::OpenBracket,
+    const QWERTY: &[KeyboardPickerCell] = &[
+        Key(KeyName::Tab, None),
+        Key(KeyName::Q, None),
+        Key(KeyName::W, None),
+        Key(KeyName::E, None),
+        Key(KeyName::R, None),
+        Key(KeyName::T, None),
+        Key(KeyName::Y, None),
+        Key(KeyName::U, None),
+        Key(KeyName::I, None),
+        Key(KeyName::O, None),
+        Key(KeyName::P, None),
+        Disabled("@"),
+        Key(KeyName::OpenBracket, None),
     ];
-    const HOME: &[KeyName] = &[
-        KeyName::A,
-        KeyName::S,
-        KeyName::D,
-        KeyName::F,
-        KeyName::G,
-        KeyName::H,
-        KeyName::J,
-        KeyName::K,
-        KeyName::L,
-        KeyName::Semicolon,
-        KeyName::Colon,
-        KeyName::CloseBracket,
-        KeyName::Enter,
+    const HOME: &[KeyboardPickerCell] = &[
+        Key(KeyName::A, None),
+        Key(KeyName::S, None),
+        Key(KeyName::D, None),
+        Key(KeyName::F, None),
+        Key(KeyName::G, None),
+        Key(KeyName::H, None),
+        Key(KeyName::J, None),
+        Key(KeyName::K, None),
+        Key(KeyName::L, None),
+        Key(KeyName::Semicolon, None),
+        Key(KeyName::Colon, None),
+        Key(KeyName::CloseBracket, None),
+        Key(KeyName::Enter, None),
     ];
-    const BOTTOM: &[KeyName] = &[
-        KeyName::Z,
-        KeyName::X,
-        KeyName::C,
-        KeyName::V,
-        KeyName::B,
-        KeyName::N,
-        KeyName::M,
-        KeyName::Comma,
-        KeyName::Period,
-        KeyName::Slash,
-        KeyName::Backslash,
-        KeyName::Space,
+    const BOTTOM: &[KeyboardPickerCell] = &[
+        Key(KeyName::Z, None),
+        Key(KeyName::X, None),
+        Key(KeyName::C, None),
+        Key(KeyName::V, None),
+        Key(KeyName::B, None),
+        Key(KeyName::N, None),
+        Key(KeyName::M, None),
+        Key(KeyName::Comma, None),
+        Key(KeyName::Period, None),
+        Key(KeyName::Slash, None),
+        Disabled("\\"),
+        Key(KeyName::Space, None),
     ];
-    const NAV: &[KeyName] = &[
-        KeyName::Home,
-        KeyName::End,
-        KeyName::PageUp,
-        KeyName::PageDown,
-        KeyName::Delete,
-        KeyName::Left,
-        KeyName::Up,
-        KeyName::Down,
-        KeyName::Right,
+    const NAV_TOP: &[KeyboardPickerCell] = &[
+        Disabled("Insert"),
+        Key(KeyName::Home, None),
+        Key(KeyName::PageUp, None),
+        Spacer(48.0),
+        Spacer(48.0),
+        Key(KeyName::Up, None),
+    ];
+    const NAV_BOTTOM: &[KeyboardPickerCell] = &[
+        Key(KeyName::Delete, None),
+        Key(KeyName::End, None),
+        Key(KeyName::PageDown, None),
+        Spacer(48.0),
+        Key(KeyName::Left, None),
+        Key(KeyName::Down, None),
+        Key(KeyName::Right, None),
     ];
     [
         EXTENDED_FUNCTION,
@@ -1839,16 +1872,24 @@ fn keyboard_picker_rows() -> [&'static [KeyName]; 7] {
         QWERTY,
         HOME,
         BOTTOM,
-        NAV,
+        NAV_TOP,
+        NAV_BOTTOM,
     ]
 }
 
-fn keyboard_picker_key_width(key: KeyName) -> f32 {
+fn keyboard_picker_cell_width(label: &str, key: KeyName) -> f32 {
     match key {
         KeyName::Backspace => 76.0,
         KeyName::Enter => 68.0,
         KeyName::Space => 132.0,
         KeyName::PageUp | KeyName::PageDown => 62.0,
+        _ => keyboard_picker_label_width(label),
+    }
+}
+
+fn keyboard_picker_label_width(label: &str) -> f32 {
+    match label {
+        "Insert" | "Delete" | "PageUp" | "PageDown" => 62.0,
         _ => 44.0,
     }
 }
