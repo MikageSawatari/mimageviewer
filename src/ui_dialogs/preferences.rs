@@ -1595,6 +1595,8 @@ fn draw_operation_customize_page(
     match state.operation_tab {
         OperationCustomizeTab::Settings => draw_operation_settings_page(ui, state),
         OperationCustomizeTab::Commands => {
+            draw_operation_context_filter(ui, state);
+            ui.add_space(8.0);
             page_command_overview(ui, state);
         }
         OperationCustomizeTab::RingShortcut => {
@@ -1604,7 +1606,7 @@ fn draw_operation_customize_page(
             page_ring_shortcut_assignments(ui, state, context);
         }
         OperationCustomizeTab::Keyboard => {
-            draw_keyboard_context_tabs(ui, state);
+            draw_operation_context_filter(ui, state);
             ui.add_space(8.0);
             ui.small("キー割り当てを編集します。一覧の「編集」またはキーボード図の割り当て済みキーを押すと、割り当て編集ダイアログを開きます。");
             ui.add_space(8.0);
@@ -1625,7 +1627,7 @@ fn draw_operation_customize_page(
     }
 }
 
-fn draw_keyboard_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
+fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::keymap::KeyContext;
 
     const CONTEXTS: &[Option<KeyContext>] = &[
@@ -1643,18 +1645,26 @@ fn draw_keyboard_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
         Some(KeyContext::LocalAdjust),
     ];
 
-    ui.horizontal_wrapped(|ui| {
-        for &context in CONTEXTS {
-            let label = context.map_or("すべて", KeyContext::description);
-            if ui
-                .selectable_label(state.operation_keyboard_context == context, label)
-                .clicked()
-            {
-                state.operation_keyboard_context = context;
-                state.command_capture_slot = None;
-                state.command_edit_error = None;
-            }
-        }
+    ui.horizontal(|ui| {
+        ui.label("場所:");
+        let selected = state
+            .operation_keyboard_context
+            .map_or("すべて", KeyContext::description);
+        egui::ComboBox::from_id_salt("operation_context_filter")
+            .selected_text(selected)
+            .width(190.0)
+            .show_ui(ui, |ui| {
+                for &context in CONTEXTS {
+                    let label = context.map_or("すべて", KeyContext::description);
+                    if ui
+                        .selectable_value(&mut state.operation_keyboard_context, context, label)
+                        .clicked()
+                    {
+                        state.command_capture_slot = None;
+                        state.command_edit_error = None;
+                    }
+                }
+            });
     });
 }
 
