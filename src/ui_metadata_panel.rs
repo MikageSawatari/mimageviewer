@@ -12,11 +12,6 @@ use crate::png_metadata::{A1111Metadata, AiMetadata, ComfyUIMetadata};
 use crate::tag_ops::TagTarget;
 use crate::xmp_reader::{self, XmpTweetInfo};
 
-/// パネル幅 (ピクセル)
-const PANEL_WIDTH: f32 = 380.0;
-
-/// 上部ホバーバーの描画高さ
-const TOP_BAR_H: f32 = 44.0;
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
@@ -55,7 +50,7 @@ impl App {
     ///
     /// 表示条件:
     /// - `I` キーまたはピン留めで固定表示 ON/OFF
-    /// - マウスカーソルが画面右 1/4 にあるときもホバー表示
+    /// - マウスカーソルが画面右端のパネル幅内にあるときもホバー表示
     ///
     /// 右パネル表示中は上部バーも常に同時表示する。
     /// 右パネルは常に上部バーの下から開始する。
@@ -87,22 +82,13 @@ impl App {
         full_rect: egui::Rect,
         force_show: bool,
     ) -> bool {
-        let panel_w = PANEL_WIDTH.min(full_rect.width() * 0.5);
-        // 右パネルは常に上部バーの下から開始（上バーは常に同時表示される）
-        let panel_top = full_rect.min.y + TOP_BAR_H;
-        let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.max.x - panel_w, panel_top),
-            // 下端のページシークバーと重ならないよう、下端をシークバー分空ける。
-            egui::pos2(
-                full_rect.max.x,
-                full_rect.max.y - crate::ui_fullscreen::FS_SEEK_BAR_HEIGHT,
-            ),
-        );
+        let panel_rect = crate::ui_fullscreen::metadata_panel_rect(full_rect);
 
         if !force_show {
-            let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
+            let activation_rect =
+                crate::ui_fullscreen::metadata_panel_hover_activation_rect(full_rect);
 
-            // ホバー判定: 画面右 1/4。カーソル非表示中は最後の座標が stale なので、
+            // ホバー判定: 描画される右パネル幅内。カーソル非表示中は最後の座標が stale なので、
             // 実入力でカーソルが復帰するまでは passive hover でパネルを開かない。
             let pointer_pos = ctx.input(|i| {
                 if self.cursor_hidden {
@@ -112,7 +98,7 @@ impl App {
                 }
             });
 
-            let hover_in_right = pointer_pos.is_some_and(|p| p.x > hover_threshold);
+            let hover_in_right = pointer_pos.is_some_and(|p| activation_rect.contains(p));
             let hover_in_open_panel = self.metadata_panel_hover_active
                 && pointer_pos.is_some_and(|p| panel_rect.contains(p));
             let hover_visible = hover_in_right || hover_in_open_panel;

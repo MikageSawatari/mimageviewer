@@ -231,6 +231,24 @@ pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
 
+pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width().max(0.0) * 0.5);
+    let panel_top = full_rect.min.y + TOP_BAR_HEIGHT;
+    let panel_bottom = (full_rect.max.y - FS_SEEK_BAR_HEIGHT).max(panel_top);
+    egui::Rect::from_min_max(
+        egui::pos2(full_rect.max.x - panel_w, panel_top),
+        egui::pos2(full_rect.max.x, panel_bottom),
+    )
+}
+
+pub(crate) fn metadata_panel_hover_activation_rect(full_rect: egui::Rect) -> egui::Rect {
+    let panel = metadata_panel_rect(full_rect);
+    egui::Rect::from_min_max(
+        egui::pos2(panel.left(), full_rect.top()),
+        egui::pos2(panel.right(), full_rect.bottom()),
+    )
+}
+
 fn should_handle_fullscreen_wheel(
     cursor_in_panel: bool,
     in_video_tile: bool,
@@ -7753,9 +7771,8 @@ impl App {
 
         // ── ホイール ──
         // パネル領域内ではホイールナビゲーションを抑制
-        let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
-        let panel_left = full_rect.max.x - panel_w;
-        let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
+        let right_panel_rect = metadata_panel_rect(full_rect);
+        let right_panel_activation_rect = metadata_panel_hover_activation_rect(full_rect);
         let has_right_panel = self.show_metadata_panel
             || self.metadata_panel_hover_active
             || self.fullscreen_tag_picker_open;
@@ -7775,9 +7792,11 @@ impl App {
                     .hover_pos()
                     .map(|p| {
                         let in_right = !compare_wipe_active
-                            && p.x > panel_left
-                            && p.y >= 60.0
-                            && (has_right_panel || p.x > hover_threshold);
+                            && (if has_right_panel {
+                                right_panel_rect.contains(p)
+                            } else {
+                                right_panel_activation_rect.contains(p)
+                            });
                         let in_left = !compare_wipe_active
                             && self.adjustment_mode
                             && p.x < left_panel_right
@@ -8167,18 +8186,21 @@ impl App {
                         let any_popup = self.spread_popup_open || self.fit_popup_open;
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
-                                let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
+                                let right_panel_rect = metadata_panel_rect(full_rect);
+                                let right_panel_activation_rect =
+                                    metadata_panel_hover_activation_rect(full_rect);
                                 // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、クリック
                                 // ナビの当たり判定でもパネル領域を無効化する (Codex P2)。
                                 let zoom_engaged = self.fs_zoom_mode_engaged();
+                                let has_right_panel = self.show_metadata_panel
+                                    || self.metadata_panel_hover_active
+                                    || self.fullscreen_tag_picker_open;
                                 let in_right_panel = !zoom_engaged
-                                    && pos.y >= 60.0
-                                    && (self.show_metadata_panel
-                                        || self.metadata_panel_hover_active
-                                        || pos.x > panel_threshold)
-                                    && pos.x
-                                        > full_rect.max.x
-                                            - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
+                                    && (if has_right_panel {
+                                        right_panel_rect.contains(pos)
+                                    } else {
+                                        right_panel_activation_rect.contains(pos)
+                                    });
                                 let in_left_panel = !zoom_engaged
                                     && self.adjustment_mode
                                     && pos.x < adjustment_panel_rect(full_rect).max.x
@@ -12597,7 +12619,7 @@ impl App {
         let passive_hover_enabled = !self.cursor_hidden;
         let in_top = passive_hover_enabled && pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
         let in_right = passive_hover_enabled
-            && pointer.is_some_and(|p| p.x > full_rect.max.x - full_rect.width() * 0.25);
+            && pointer.is_some_and(|p| metadata_panel_hover_activation_rect(full_rect).contains(p));
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
         !in_top
@@ -16998,6 +17020,32 @@ mod tests {
     }
     fn tz_cursor(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
         zip_cursor_image_px(band, egui::Vec2::ZERO, image, cursor)
+    }
+
+    #[test]
+    fn metadata_panel_activation_uses_drawn_panel_width_not_view_fraction() {
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3840.0, 1080.0));
+        let panel = metadata_panel_rect(wide);
+        let activation = metadata_panel_hover_activation_rect(wide);
+        assert!((panel.width() - METADATA_PANEL_WIDTH).abs() < 0.01);
+        assert_eq!(activation.left(), panel.left());
+        assert_eq!(activation.right(), panel.right());
+        assert_eq!(activation.top(), wide.top());
+        assert_eq!(activation.bottom(), wide.bottom());
+        assert!(activation.contains(egui::pos2(3839.0, 120.0)));
+        assert!(
+            !activation.contains(egui::pos2(3840.0 - 960.0 + 1.0, 120.0)),
+            "旧 right 25% 帯の左端付近では開かない"
+        );
+    }
+
+    #[test]
+    fn metadata_panel_rect_shrinks_only_for_narrow_viewports() {
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 800.0));
+        let panel = metadata_panel_rect(narrow);
+        assert!((panel.width() - 300.0).abs() < 0.01);
+        assert_eq!(panel.top(), TOP_BAR_HEIGHT);
+        assert_eq!(panel.bottom(), 800.0 - FS_SEEK_BAR_HEIGHT);
     }
 
     #[test]
