@@ -14,16 +14,16 @@ v2.2.0 の操作カスタマイズはまだ未リリースなので、保存語�
 
 ### 1. キーの正本を KeySlot にする
 
-`Chord { ctrl, shift, alt, key }` の `key` は、文字ではなく「物理的なキー位置」を表す `KeySlot` を持つ。保存名も `Digit1` / `Numpad1` / `JisAt` のような安定名にする。
+`Chord { ctrl, shift, alt, key }` の `key` は、文字ではなく「物理的なキー位置」を表す `KeySlot` を持つ。保存・入力名は既存互換を優先し、メイン数字は従来どおり `1` / `2` など、テンキーは `Num1` / `Num2` などで明示する。parser は `Digit1` / `Numpad1` のような別名も受け付ける。
 
 ただし UI 表示はユーザーに見えるラベルを使う。
 
-- `Digit1` は `1`
+- `Num1` / `Digit1` は `1`
 - `Numpad1` は `Num1`
 - `JisAt` は `@`
 - `IntlYen` は `¥`
 
-旧 `Num1` などの名前は、未リリース中の互換補助として parser で `Digit1` へ読む。新しく生成する `keymap.ini.default` や設定保存では `Digit1` を使う。
+旧 `Num1` などの名前は、未リリース中の互換補助として parser でメイン数字キーへ読む。新しく生成する `keymap.ini.default` や設定保存では、メイン数字は `1`、テンキーは `Num1` のように表示する。
 
 ### 2. 入力トランスポートは Win32 の key edge queue
 
@@ -51,7 +51,7 @@ Win32 key queue は mIV 内部のショートカット判定用であり、Windo
 
 初期移行では以下の slot を用意する。
 
-- `Digit0..Digit9`
+- `Num0..Num9`（メイン数字キー。`Digit0..Digit9` も入力名として受け付ける）
 - `Numpad0..Numpad9`
 - `NumpadAdd` / `NumpadSubtract` / `NumpadMultiply` / `NumpadDivide` / `NumpadDecimal`
 - `JisCaret` (`^`)
@@ -68,8 +68,8 @@ Win32 key queue は mIV 内部のショートカット判定用であり、Windo
 例:
 
 ```ini
-FsSpreadSingle = Digit1, Numpad1
-FsSpreadLtr = Digit2, Numpad2
+FsSpreadSingle = 1, Num1
+FsSpreadLtr = 2, Num2
 ```
 
 ### 6. native 動画との統一
@@ -80,9 +80,9 @@ native 動画 presenter は既に Win32 virtual key を受け取っている。`
 
 ## 実装順
 
-1. `KeySlot` 型と parser / display / Win32 matcher を追加し、`Chord.key` を `Option<KeySlot>` にする。
-2. 数字キー既定割り当てを `Digit* + Numpad*` に更新し、`keymap.ini.default` を再生成する。
-3. メイン HWND に key edge queue を登録し、`Keymap::consume_action` / `pressed_action` / キャプチャを queue から読む。
+1. `KeySlot` 型と parser / display / Win32 matcher を追加し、`Chord.key` を `Option<KeySlot>` にする。（実装済み）
+2. 数字キー既定割り当てをメイン数字 + テンキーに更新し、`keymap.ini.default` を再生成する。（実装済み）
+3. メイン HWND に key edge queue を登録し、`Keymap::consume_action` / `pressed_action` / キャプチャを queue から読む。（実装済み）
 4. native 動画の key event に scan / extended を追加し、`matches_vk_action` を `matches_key_slot_action` へ寄せる。
 5. 操作カスタマイズのキーボード図を `KeySlot` ベースにし、日本語キーボード配列とテンキーを表示する。
 6. docs / tests を更新する。

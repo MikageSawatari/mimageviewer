@@ -2558,6 +2558,29 @@ fn poll_command_chord_capture(
     if ime_active {
         return None;
     }
+    #[cfg(windows)]
+    if crate::key_input::is_frame_active() {
+        let mut result = None;
+        crate::key_input::consume_key_down(false, |edge| {
+            let Some(name) = KeyName::from_win32(edge.virtual_key, edge.scan_code, edge.extended)
+            else {
+                result = Some(Err(format!(
+                    "このキーは割り当て対象外です: VK=0x{:02X}, scan=0x{:02X}",
+                    edge.virtual_key, edge.scan_code
+                )));
+                return true;
+            };
+            if name == KeyName::Esc {
+                result = Some(Err("キー入力待ちをキャンセルしました。".to_string()));
+                return true;
+            }
+            let chord = Chord::new(edge.ctrl, edge.shift, edge.alt, name);
+            let label = chord.display_name();
+            result = Some(parse_chord_for_action(action, &label).map(|_| label));
+            true
+        });
+        return result;
+    }
     ctx.input_mut(|i| {
         let mut result = None;
         i.events.retain(|event| {

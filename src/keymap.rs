@@ -216,6 +216,11 @@ pub enum KeySlot {
 pub type KeyName = KeySlot;
 
 impl KeySlot {
+    const JIS_CARET_SCAN: u16 = 0x0d;
+    const JIS_AT_SCAN: u16 = 0x1a;
+    const INTL_YEN_SCAN: u16 = 0x7d;
+    const INTL_RO_SCAN: u16 = 0x73;
+
     pub fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if matches!(trimmed, "-" | "−") {
@@ -639,6 +644,136 @@ impl KeySlot {
         }
     }
 
+    pub fn matches_win32(self, virtual_key: u32, scan_code: u16, _extended: bool) -> bool {
+        match self {
+            KeyName::JisCaret => scan_code == Self::JIS_CARET_SCAN,
+            KeyName::JisAt => scan_code == Self::JIS_AT_SCAN,
+            KeyName::IntlYen => scan_code == Self::INTL_YEN_SCAN,
+            KeyName::IntlRo => scan_code == Self::INTL_RO_SCAN,
+            // On JIS keyboards VK_OEM_5 is the Yen key.  Keep the legacy
+            // Backslash slot for layouts that really report the US backslash
+            // position, but do not let it steal the JIS Yen physical key.
+            KeyName::Backslash => virtual_key == self.to_vk() && scan_code != Self::INTL_YEN_SCAN,
+            _ => virtual_key == self.to_vk(),
+        }
+    }
+
+    pub fn from_win32(virtual_key: u32, scan_code: u16, _extended: bool) -> Option<Self> {
+        if scan_code == Self::JIS_CARET_SCAN {
+            return Some(KeyName::JisCaret);
+        }
+        if scan_code == Self::JIS_AT_SCAN {
+            return Some(KeyName::JisAt);
+        }
+        if scan_code == Self::INTL_YEN_SCAN {
+            return Some(KeyName::IntlYen);
+        }
+        if scan_code == Self::INTL_RO_SCAN {
+            return Some(KeyName::IntlRo);
+        }
+        Some(match virtual_key {
+            0x41 => KeyName::A,
+            0x42 => KeyName::B,
+            0x43 => KeyName::C,
+            0x44 => KeyName::D,
+            0x45 => KeyName::E,
+            0x46 => KeyName::F,
+            0x47 => KeyName::G,
+            0x48 => KeyName::H,
+            0x49 => KeyName::I,
+            0x4A => KeyName::J,
+            0x4B => KeyName::K,
+            0x4C => KeyName::L,
+            0x4D => KeyName::M,
+            0x4E => KeyName::N,
+            0x4F => KeyName::O,
+            0x50 => KeyName::P,
+            0x51 => KeyName::Q,
+            0x52 => KeyName::R,
+            0x53 => KeyName::S,
+            0x54 => KeyName::T,
+            0x55 => KeyName::U,
+            0x56 => KeyName::V,
+            0x57 => KeyName::W,
+            0x58 => KeyName::X,
+            0x59 => KeyName::Y,
+            0x5A => KeyName::Z,
+            0x30 => KeyName::Num0,
+            0x31 => KeyName::Num1,
+            0x32 => KeyName::Num2,
+            0x33 => KeyName::Num3,
+            0x34 => KeyName::Num4,
+            0x35 => KeyName::Num5,
+            0x36 => KeyName::Num6,
+            0x37 => KeyName::Num7,
+            0x38 => KeyName::Num8,
+            0x39 => KeyName::Num9,
+            0x60 => KeyName::Numpad0,
+            0x61 => KeyName::Numpad1,
+            0x62 => KeyName::Numpad2,
+            0x63 => KeyName::Numpad3,
+            0x64 => KeyName::Numpad4,
+            0x65 => KeyName::Numpad5,
+            0x66 => KeyName::Numpad6,
+            0x67 => KeyName::Numpad7,
+            0x68 => KeyName::Numpad8,
+            0x69 => KeyName::Numpad9,
+            0x6A => KeyName::NumpadMultiply,
+            0x6B => KeyName::NumpadAdd,
+            0x6D => KeyName::NumpadSubtract,
+            0x6E => KeyName::NumpadDecimal,
+            0x6F => KeyName::NumpadDivide,
+            0x70 => KeyName::F1,
+            0x71 => KeyName::F2,
+            0x72 => KeyName::F3,
+            0x73 => KeyName::F4,
+            0x74 => KeyName::F5,
+            0x75 => KeyName::F6,
+            0x76 => KeyName::F7,
+            0x77 => KeyName::F8,
+            0x78 => KeyName::F9,
+            0x79 => KeyName::F10,
+            0x7A => KeyName::F11,
+            0x7B => KeyName::F12,
+            0x7C => KeyName::F13,
+            0x7D => KeyName::F14,
+            0x7E => KeyName::F15,
+            0x7F => KeyName::F16,
+            0x80 => KeyName::F17,
+            0x81 => KeyName::F18,
+            0x82 => KeyName::F19,
+            0x83 => KeyName::F20,
+            0x84 => KeyName::F21,
+            0x85 => KeyName::F22,
+            0x86 => KeyName::F23,
+            0x87 => KeyName::F24,
+            0x25 => KeyName::Left,
+            0x26 => KeyName::Up,
+            0x27 => KeyName::Right,
+            0x28 => KeyName::Down,
+            0x24 => KeyName::Home,
+            0x23 => KeyName::End,
+            0x21 => KeyName::PageUp,
+            0x22 => KeyName::PageDown,
+            0x20 => KeyName::Space,
+            0x0D => KeyName::Enter,
+            0x1B => KeyName::Esc,
+            0x09 => KeyName::Tab,
+            0x08 => KeyName::Backspace,
+            0x2E => KeyName::Delete,
+            0xDB => KeyName::OpenBracket,
+            0xDD => KeyName::CloseBracket,
+            0xBB => KeyName::Semicolon,
+            0xBA => KeyName::Colon,
+            0xBC => KeyName::Comma,
+            0xBE => KeyName::Period,
+            0xDC => KeyName::Backslash,
+            0xBF => KeyName::Slash,
+            0xBD => KeyName::Minus,
+            _ => return None,
+        })
+    }
+
     pub fn display_name(self) -> &'static str {
         match self {
             KeyName::A => "A",
@@ -836,6 +971,15 @@ impl Chord {
             && self.ctrl == ctrl
             && self.shift == shift
             && self.alt == alt
+    }
+
+    #[cfg(windows)]
+    fn matches_key_edge(self, edge: crate::key_input::KeyEdge) -> bool {
+        self.key
+            .is_some_and(|name| name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended))
+            && self.ctrl == edge.ctrl
+            && self.shift == edge.shift
+            && self.alt == edge.alt
     }
 
     fn validate_for_trigger(self, trigger: KeyTrigger) -> Result<(), &'static str> {
@@ -5051,6 +5195,12 @@ impl Keymap {
         if chord.key.is_none() {
             return false;
         }
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active() {
+            return crate::key_input::consume_key_down(allow_repeat, |edge| {
+                chord.matches_key_edge(edge)
+            });
+        }
         ctx.input_mut(|i| {
             let mut found = false;
             i.events.retain(|event| {
@@ -5077,6 +5227,10 @@ impl Keymap {
     fn pressed_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
         if chord.key.is_none() {
             return false;
+        }
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active() {
+            return crate::key_input::pressed_key_down(|edge| chord.matches_key_edge(edge));
         }
         ctx.input(|i| {
             i.events.iter().any(|event| {
@@ -6901,6 +7055,38 @@ mod tests {
         assert_eq!(KeyName::parse("JisAt"), Some(KeyName::JisAt));
         assert_eq!(KeyName::parse("IntlYen"), Some(KeyName::IntlYen));
         assert_eq!(KeyName::parse("IntlRo"), Some(KeyName::IntlRo));
+    }
+
+    #[test]
+    fn win32_key_slots_distinguish_numpad_and_jis_physical_keys() {
+        assert_eq!(KeyName::from_win32(0x31, 0x02, false), Some(KeyName::Num1));
+        assert_eq!(
+            KeyName::from_win32(0x61, 0x4f, false),
+            Some(KeyName::Numpad1)
+        );
+        assert!(KeyName::Num1.matches_win32(0x31, 0x02, false));
+        assert!(!KeyName::Num1.matches_win32(0x61, 0x4f, false));
+        assert!(KeyName::Numpad1.matches_win32(0x61, 0x4f, false));
+        assert!(!KeyName::Numpad1.matches_win32(0x31, 0x02, false));
+
+        assert_eq!(
+            KeyName::from_win32(0xDC, KeyName::INTL_YEN_SCAN, false),
+            Some(KeyName::IntlYen)
+        );
+        assert!(KeyName::IntlYen.matches_win32(0xDC, KeyName::INTL_YEN_SCAN, false));
+        assert!(!KeyName::Backslash.matches_win32(0xDC, KeyName::INTL_YEN_SCAN, false));
+        assert_eq!(
+            KeyName::from_win32(0xE2, KeyName::INTL_RO_SCAN, false),
+            Some(KeyName::IntlRo)
+        );
+        assert_eq!(
+            KeyName::from_win32(0xDE, KeyName::JIS_CARET_SCAN, false),
+            Some(KeyName::JisCaret)
+        );
+        assert_eq!(
+            KeyName::from_win32(0xC0, KeyName::JIS_AT_SCAN, false),
+            Some(KeyName::JisAt)
+        );
     }
 
     #[test]

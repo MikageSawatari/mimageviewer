@@ -36658,6 +36658,7 @@ impl eframe::App for App {
                     // フックで拾い、進む/戻るボタンを Ctrl+↑/↓ と等価に扱う。詳細は
                     // main.rs の `install_mouse_nav_hook` のコメント参照。
                     crate::install_mouse_nav_hook();
+                    crate::key_input::install_main_window_subclass(hwnd_raw as u64);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
                     // watchdog に HWND を共有 (IsHungAppWindow チェック用、
@@ -36683,6 +36684,9 @@ impl eframe::App for App {
                 }
             }
         }
+
+        #[cfg(windows)]
+        crate::key_input::begin_frame();
 
         // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
         // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を
