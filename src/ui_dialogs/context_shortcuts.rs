@@ -317,7 +317,7 @@ impl App {
         let scroll_max_h = (ctx.content_rect().height() - 180.0).min(620.0).max(160.0);
         let rows = self
             .keymap
-            .command_display_rows_for_active_scopes(help_context.active_scopes(), true)
+            .command_display_rows_for_active_scopes(help_context.active_scopes(), false)
             .into_iter()
             .filter(|row| help_context.includes_row(row))
             .collect::<Vec<_>>();
@@ -341,7 +341,6 @@ impl App {
                         for scope in help_context.active_scopes() {
                             draw_command_scope_rows(ui, *scope, &rows);
                         }
-                        draw_unassigned_command_rows(ui, &rows);
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
 
@@ -438,28 +437,6 @@ fn draw_command_scope_rows(ui: &mut egui::Ui, scope: CommandScope, rows: &[Comma
             {
                 let shortcut = row.shortcut_labels.join(" / ");
                 ui.monospace(shortcut);
-                ui.label(row.spec.description());
-                ui.end_row();
-            }
-        });
-}
-
-fn draw_unassigned_command_rows(ui: &mut egui::Ui, rows: &[CommandDisplayRow]) {
-    if !rows.iter().any(|row| row.shortcut_labels.is_empty()) {
-        return;
-    }
-
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("キー未設定 / 無効化中").strong());
-    ui.label("左の名前はコマンド設定の Action 名です。");
-    ui.add_space(2.0);
-    egui::Grid::new("context_shortcuts_unassigned")
-        .num_columns(2)
-        .spacing([18.0, 4.0])
-        .striped(true)
-        .show(ui, |ui| {
-            for row in rows.iter().filter(|row| row.shortcut_labels.is_empty()) {
-                ui.monospace(row.spec.ini_name());
                 ui.label(row.spec.description());
                 ui.end_row();
             }

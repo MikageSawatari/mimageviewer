@@ -752,7 +752,6 @@ pub struct NativeOverlayShortcutLabels {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NativeOverlayShortcutHelp {
     pub sections: Vec<NativeOverlayShortcutHelpSection>,
-    pub unassigned: Vec<NativeOverlayShortcutHelpRow>,
     pub fixed_rows: Vec<NativeOverlayShortcutHelpRow>,
 }
 

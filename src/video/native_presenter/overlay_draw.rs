@@ -1011,32 +1011,6 @@ pub(super) fn draw_native_shortcut_help_dialog(
                                 });
                             }
 
-                            if !help.unassigned.is_empty() {
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new("キー未設定 / 無効化中")
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(232, 232, 236)),
-                                );
-                                ui.label(
-                                    egui::RichText::new("左の名前はコマンド設定の Action 名です。")
-                                        .size(11.5)
-                                        .color(egui::Color32::from_gray(190)),
-                                );
-                                ui.add_space(2.0);
-                                egui::Grid::new("native_video_shortcut_help_unassigned")
-                                    .num_columns(2)
-                                    .spacing([18.0, 4.0])
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        for row in &help.unassigned {
-                                            ui.monospace(&row.keys);
-                                            ui.label(&row.description);
-                                            ui.end_row();
-                                        }
-                                    });
-                            }
-
                             if !help.fixed_rows.is_empty() {
                                 ui.add_space(10.0);
                                 ui.label(

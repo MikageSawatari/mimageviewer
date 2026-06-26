@@ -3823,7 +3823,7 @@ impl App {
 
         let rows = self
             .keymap
-            .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, true)
+            .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, false)
             .into_iter()
             .filter(Self::native_video_help_includes_row)
             .collect::<Vec<_>>();
@@ -3846,15 +3846,6 @@ impl App {
             })
             .collect();
 
-        let unassigned = rows
-            .iter()
-            .filter(|row| row.shortcut_labels.is_empty())
-            .map(|row| NativeOverlayShortcutHelpRow {
-                keys: row.spec.ini_name().to_string(),
-                description: row.spec.description().to_string(),
-            })
-            .collect();
-
         let fixed_rows = FIXED_ROWS
             .iter()
             .map(|(keys, description)| NativeOverlayShortcutHelpRow {
@@ -3869,7 +3860,6 @@ impl App {
 
         NativeOverlayShortcutHelp {
             sections,
-            unassigned,
             fixed_rows,
         }
     }
