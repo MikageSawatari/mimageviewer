@@ -22,6 +22,7 @@ v2.2.0 の操作カスタマイズはまだ未リリースなので、保存語�
 - `Numpad1` は `Numpad1`
 - `JisAt` は `@`
 - `IntlYen` は `¥`
+- `IntlRo` は保存名 `Ro`（キーボード図の表示は `ろ`）
 
 旧 `Num1` などの名前は、既存 keymap.ini 互換補助として parser でメイン数字キーへ読む。新しく生成する `keymap.ini.default` や設定保存では、メイン数字は `1`、テンキーは `Numpad1` のように表示する。
 
@@ -57,7 +58,7 @@ Win32 key queue は mIV 内部のショートカット判定用であり、Windo
 - `JisCaret` (`^`)
 - `JisAt` (`@`)
 - `IntlYen` (`¥`)
-- `IntlRo` (`ろ`)
+- `IntlRo` (`ろ`。保存名は `Ro`)
 
 ### 5. 数字キーの既定割り当て
 

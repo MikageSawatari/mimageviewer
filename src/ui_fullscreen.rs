@@ -16567,82 +16567,102 @@ impl App {
         // (= native 動画経路と同じ keymap action)。Shift+↑↓ だけ動画モードで音量に使う。
         let tile_active_for_keyboard = self.video_tile_mode_active;
         let tile_left_ctrl = if tile_active_for_keyboard {
-            ctx.input_mut(|i| {
-                if i.consume_key(
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    egui::Key::ArrowLeft,
-                ) {
-                    Some(true)
-                } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft) {
-                    Some(true)
-                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
-                    Some(false)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-                    Some(false)
-                } else {
-                    None
-                }
-            })
+            if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl_shift(KeyName::Left))
+            {
+                Some(true)
+            } else if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl(KeyName::Left))
+            {
+                Some(true)
+            } else if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::shift(KeyName::Left))
+            {
+                Some(false)
+            } else if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::key(KeyName::Left))
+            {
+                Some(false)
+            } else {
+                None
+            }
         } else {
             None
         };
         let tile_right_ctrl = if tile_active_for_keyboard {
-            ctx.input_mut(|i| {
-                if i.consume_key(
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    egui::Key::ArrowRight,
-                ) {
-                    Some(true)
-                } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight) {
-                    Some(true)
-                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
-                    Some(false)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-                    Some(false)
-                } else {
-                    None
-                }
-            })
+            if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl_shift(KeyName::Right))
+            {
+                Some(true)
+            } else if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl(KeyName::Right))
+            {
+                Some(true)
+            } else if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::shift(KeyName::Right))
+            {
+                Some(false)
+            } else if self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::key(KeyName::Right))
+            {
+                Some(false)
+            } else {
+                None
+            }
         } else {
             None
         };
         let tile_left = tile_left_ctrl.is_some();
         let ctrl_shift_left = tile_left_ctrl.is_none()
             && tile_right_ctrl.is_none()
-            && ctx.input_mut(|i| {
-                i.consume_key(
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    egui::Key::ArrowLeft,
-                )
-            });
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl_shift(KeyName::Left));
         let ctrl_shift_right = tile_left_ctrl.is_none()
             && tile_right_ctrl.is_none()
-            && ctx.input_mut(|i| {
-                i.consume_key(
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    egui::Key::ArrowRight,
-                )
-            });
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl_shift(KeyName::Right));
         let frame_step_key = ctrl_shift_left || ctrl_shift_right;
         let ctrl_shift_held_now = ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift);
         let shift_left = !frame_step_key
             && !ctrl_shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::shift(KeyName::Left));
         let shift_right = !frame_step_key
             && !ctrl_shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight));
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::shift(KeyName::Right));
         let ctrl_left = !frame_step_key
             && !ctrl_shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl(KeyName::Left));
         let ctrl_right = !frame_step_key
             && !ctrl_shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::ctrl(KeyName::Right));
         let left = !frame_step_key
             && !ctrl_shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::key(KeyName::Left));
         let right = !frame_step_key
             && !ctrl_shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
+            && self
+                .keymap
+                .consume_fixed_chord(ctx, Chord::key(KeyName::Right));
         let shift_up = self.keymap.consume_action(ctx, KeyAction::VideoVolumeUp);
         let shift_down = self.keymap.consume_action(ctx, KeyAction::VideoVolumeDown);
         // ↑↓ プレーンは root 側で VideoPrevFile/VideoNextFile として扱う。

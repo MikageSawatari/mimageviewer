@@ -20194,6 +20194,7 @@ impl App {
     /// 意図はフルスクリーン継続なので、この待ち中はグリッドショートカットを全部抑止する。
     pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
         self.viewer_session_blocks_main_window()
+            || self.ime_input_active()
             || self.fs_nav_deferred_reopen_wait_active()
             || self.any_dialog_open()
             || self.address_has_focus

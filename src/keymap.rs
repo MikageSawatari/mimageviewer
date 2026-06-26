@@ -877,7 +877,7 @@ impl KeySlot {
             KeyName::JisCaret => "^",
             KeyName::JisAt => "@",
             KeyName::IntlYen => "¥",
-            KeyName::IntlRo => "\\",
+            KeyName::IntlRo => "Ro",
         }
     }
 }
@@ -5224,12 +5224,23 @@ impl Keymap {
         self.consume_chord_inner(ctx, chord, false)
     }
 
+    /// Fixed, documented inputs that are intentionally outside `KeyAction` can
+    /// still consume through the same Win32 KeySlot queue. This prevents a
+    /// remapped KeyAction and a fixed egui `consume_key` path from both seeing
+    /// the same physical key in one frame.
+    pub fn consume_fixed_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
+        self.consume_chord(ctx, chord)
+    }
+
     fn consume_chord_inner(&self, ctx: &egui::Context, chord: Chord, allow_repeat: bool) -> bool {
         if chord.key.is_none() {
             return false;
         }
         #[cfg(windows)]
         if crate::key_input::is_frame_active() {
+            if ctx.wants_keyboard_input() {
+                return false;
+            }
             return crate::key_input::consume_key_down(allow_repeat, |edge| {
                 chord.matches_key_edge(edge)
             });
@@ -5263,6 +5274,9 @@ impl Keymap {
         }
         #[cfg(windows)]
         if crate::key_input::is_frame_active() {
+            if ctx.wants_keyboard_input() {
+                return false;
+            }
             return crate::key_input::pressed_key_down(|edge| chord.matches_key_edge(edge));
         }
         ctx.input(|i| {
@@ -7090,7 +7104,7 @@ mod tests {
             (KeyName::JisCaret, "^", 0xDE),
             (KeyName::JisAt, "@", 0xC0),
             (KeyName::IntlYen, "¥", 0xDC),
-            (KeyName::IntlRo, "\\", 0xE2),
+            (KeyName::IntlRo, "Ro", 0xE2),
         ];
         for (name, label, vk) in cases {
             assert_eq!(name.display_name(), label);
@@ -7101,6 +7115,22 @@ mod tests {
         assert_eq!(KeyName::parse("JisAt"), Some(KeyName::JisAt));
         assert_eq!(KeyName::parse("IntlYen"), Some(KeyName::IntlYen));
         assert_eq!(KeyName::parse("IntlRo"), Some(KeyName::IntlRo));
+    }
+
+    #[test]
+    fn key_slot_display_names_parse_back_without_collisions() {
+        let cases = [
+            KeyName::Backslash,
+            KeyName::IntlRo,
+            KeyName::IntlYen,
+            KeyName::JisAt,
+            KeyName::JisCaret,
+            KeyName::Numpad1,
+            KeyName::Num1,
+        ];
+        for key in cases {
+            assert_eq!(KeyName::parse(key.display_name()), Some(key));
+        }
     }
 
     #[test]
