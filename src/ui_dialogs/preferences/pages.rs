@@ -1721,23 +1721,27 @@ fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap
         });
         ui.add_space(6.0);
 
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.small("メインキー");
-                let rows = keyboard_picker_main_rows();
-                draw_keyboard_picker_rows(ui, state, keymap, &rows);
-            });
-            ui.add_space(18.0);
+        ui.vertical(|ui| {
+            ui.small("メインキー");
+            let rows = keyboard_picker_main_rows();
+            draw_keyboard_picker_rows(ui, state, keymap, &rows);
+
+            ui.add_space(8.0);
             ui.separator();
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                ui.small("ナビゲーション");
-                let rows = keyboard_picker_navigation_rows();
-                draw_keyboard_picker_rows(ui, state, keymap, &rows);
-                ui.add_space(8.0);
-                ui.small("テンキー");
-                let rows = keyboard_picker_numpad_rows();
-                draw_keyboard_picker_rows(ui, state, keymap, &rows);
+            ui.add_space(8.0);
+
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.small("ナビゲーション");
+                    let rows = keyboard_picker_navigation_rows();
+                    draw_keyboard_picker_rows(ui, state, keymap, &rows);
+                });
+                ui.add_space(18.0);
+                ui.vertical(|ui| {
+                    ui.small("テンキー");
+                    let rows = keyboard_picker_numpad_rows();
+                    draw_keyboard_picker_rows(ui, state, keymap, &rows);
+                });
             });
         });
     });
