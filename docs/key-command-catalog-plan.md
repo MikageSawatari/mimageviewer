@@ -194,8 +194,9 @@
 > egui 動画ヘルプと同じく、動画中に実際に有効な `FsVideo` / 一部 `FsCommon` / `Rating` /
 > `ToggleDetachedViewerMode` に限定し、`VideoCompare*` は出さない。ヘルプ表示中は
 > presenter 内で Esc を閉じる操作として消費し、App 側へのキー・Text・ホイール転送を抑止する。
-> 実機補正として、`?` は `WM_CHAR` の ASCII / 全角 `？` に加え、`WM_CHAR` が届かない
-> native ウィンドウ環境向けに `Shift+VK_OEM_2` KeyDown でも開く。
+> `HelpShowContextShortcuts` の effective chord を KeyDown で判定し、既定 `?` は
+> native ウィンドウ上では `Shift+VK_OEM_2` として開閉する。`WM_CHAR` / Text は
+> ヘルプ開閉に使わず、文字入力用イベントとしてだけ扱う。
 > ヘルプは native overlay 内のモーダルとして扱い、表示中は右メタデータパネル / 左ジャンプパネルの
 > hover 表示を抑止する。右上の閉じるボタンへカーソルを移動したときに右パネルが重なって
 > 閉じられなくなる実機症状への補正。

@@ -5021,10 +5021,6 @@ impl Keymap {
                 consumed = true;
             }
         }
-        if context_shortcuts_help_accepts_text(&chords) && consume_context_shortcuts_help_text(ctx)
-        {
-            consumed = true;
-        }
         consumed
     }
 
@@ -6065,47 +6061,8 @@ pub fn native_video_fullscreen_shortcut_key(
         .any(|action| fallback.matches_vk_action(action, key))
 }
 
-pub(crate) fn is_context_shortcuts_help_char(ch: char) -> bool {
-    matches!(ch, '?' | '？')
-}
-
 fn is_context_shortcuts_help_question_chord(chord: Chord) -> bool {
     chord.key == Some(KeyName::Slash) && chord.shift && !chord.ctrl && !chord.alt
-}
-
-fn context_shortcuts_help_accepts_text(chords: &[Chord]) -> bool {
-    chords
-        .iter()
-        .copied()
-        .any(is_context_shortcuts_help_question_chord)
-}
-
-fn consume_context_shortcuts_help_text(ctx: &egui::Context) -> bool {
-    ctx.input_mut(|i| {
-        if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.mac_cmd || i.modifiers.command {
-            return false;
-        }
-        let mut found = false;
-        i.events.retain(|event| {
-            let consume = !found
-                && matches!(
-                    event,
-                    egui::Event::Text(text)
-                        if {
-                            let mut chars = text.chars();
-                            matches!(
-                                (chars.next(), chars.next()),
-                                (Some(ch), None) if is_context_shortcuts_help_char(ch)
-                            )
-                        }
-                );
-            if consume {
-                found = true;
-            }
-            !consume
-        });
-        found
-    })
 }
 
 #[cfg(windows)]
@@ -6140,20 +6097,6 @@ pub(crate) fn native_video_context_shortcuts_help_key_down(
         .default_chords()
         .iter()
         .any(matches)
-}
-
-#[cfg(windows)]
-pub(crate) fn native_video_context_shortcuts_help_text_enabled() -> bool {
-    if let Some(cell) = GLOBAL_CONTEXT_HELP_CHORDS.get()
-        && let Ok(guard) = cell.read()
-    {
-        return context_shortcuts_help_accepts_text(&guard);
-    }
-    let defaults: Vec<_> = KeyAction::HelpShowContextShortcuts
-        .default_chords()
-        .iter()
-        .collect();
-    context_shortcuts_help_accepts_text(&defaults)
 }
 
 fn native_video_fixed_shortcut_key(virtual_key: u32) -> bool {
@@ -8047,13 +7990,6 @@ mod tests {
     }
 
     #[test]
-    fn context_shortcuts_help_accepts_ascii_and_fullwidth_question() {
-        assert!(is_context_shortcuts_help_char('?'));
-        assert!(is_context_shortcuts_help_char('？'));
-        assert!(!is_context_shortcuts_help_char('/'));
-    }
-
-    #[test]
     fn question_mark_chord_parses_and_displays_as_primary_help_key() {
         let question = Chord::shift(KeyName::Slash);
         assert_eq!(parse_chord("?").unwrap(), question);
@@ -8138,7 +8074,6 @@ mod tests {
             repeat: false,
         };
         assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
-        assert!(!native_video_context_shortcuts_help_text_enabled());
 
         let f1 = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0x70,
@@ -8160,7 +8095,6 @@ mod tests {
         keymap.install_global_native_video_shortcuts();
         assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
         assert!(!native_video_context_shortcuts_help_key_down(&f1));
-        assert!(!native_video_context_shortcuts_help_text_enabled());
     }
 
     #[cfg(windows)]

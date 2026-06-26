@@ -4129,20 +4129,6 @@ impl NativeEguiOverlay {
             }
             NativeEvent::Text(ch) => {
                 if self.shortcut_help_open {
-                    if crate::keymap::is_context_shortcuts_help_char(ch)
-                        && crate::keymap::native_video_context_shortcuts_help_text_enabled()
-                    {
-                        self.shortcut_help_open = false;
-                        self.dirty = true;
-                    }
-                    return;
-                }
-                if crate::keymap::is_context_shortcuts_help_char(ch)
-                    && crate::keymap::native_video_context_shortcuts_help_text_enabled()
-                    && self.can_open_shortcut_help()
-                {
-                    self.shortcut_help_open = true;
-                    self.dirty = true;
                     return;
                 }
                 self.pending_events.push(egui::Event::Text(ch.to_string()));
