@@ -1334,21 +1334,32 @@ impl App {
         let mut apply = false;
         let mut cancel = false;
         let ime_active = self.ime_input_active();
-        let dialog_pos = ctx.content_rect().min + egui::vec2(46.0, 32.0);
+        let content_rect = ctx.content_rect();
+        let dialog_margin = egui::vec2(32.0, 24.0);
+        let constrain_rect = content_rect.shrink2(egui::vec2(8.0, 8.0));
+        let max_dialog_size = egui::vec2(
+            (content_rect.width() - dialog_margin.x * 2.0).max(560.0),
+            (content_rect.height() - dialog_margin.y * 2.0).max(360.0),
+        );
+        let default_dialog_size = egui::vec2(960.0, 640.0).min(max_dialog_size);
+        let min_dialog_size = egui::vec2(620.0, 360.0).min(max_dialog_size);
+        let dialog_pos = content_rect.min + dialog_margin;
 
         egui::Window::new("操作カスタマイズ")
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
             .default_pos(dialog_pos)
-            .default_size([1040.0, 720.0])
-            .min_width(860.0)
-            .min_height(560.0)
+            .default_size(default_dialog_size)
+            .constrain_to(constrain_rect)
+            .max_size(max_dialog_size)
+            .min_width(min_dialog_size.x)
+            .min_height(min_dialog_size.y)
             .show(ctx, |ui| {
                 let state = self.operation_customize_state.as_mut().unwrap();
                 let available = ui.available_size();
                 let bottom_height = 38.0;
-                let main_height = (available.y - bottom_height - 14.0).max(360.0);
+                let main_height = (available.y - bottom_height - 14.0).max(120.0);
 
                 draw_operation_customize_tabs(ui, state);
                 ui.separator();
