@@ -630,10 +630,10 @@ fn command_overview_rows(
         .filter(|action| action.is_user_facing())
     {
         let ring_bindings = ring_bindings_for_key_action(action);
-        let matches_key_context = match state.operation_keyboard_context {
-            Some(context) => action.context() == context,
-            None => true,
-        };
+        let matches_key_context = operation_keyboard_context_filter_matches(
+            state.operation_keyboard_context,
+            action.context(),
+        );
         let matches_ring_context = ring_bindings.iter().any(|(context, _)| {
             ring_context_matches_key_context(*context, state.operation_keyboard_context)
         });
@@ -1064,13 +1064,24 @@ pub(super) fn draw_operation_assignment_editor_dialog(
             ui.separator();
             ui.add_space(6.0);
 
-            let available_h = ui.available_height().max(220.0);
-            egui::ScrollArea::vertical()
-                .id_salt("operation_assignment_editor_body")
-                .max_height(available_h)
-                .show(ui, |ui| {
-                    draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
-                });
+            let chord_keyboard_editor = matches!(
+                (&editor.target, editor.tab),
+                (
+                    OperationAssignmentTarget::Chord(_),
+                    OperationAssignmentTab::Keyboard
+                )
+            );
+            if chord_keyboard_editor {
+                draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+            } else {
+                let available_h = ui.available_height().max(220.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("operation_assignment_editor_body")
+                    .max_height(available_h)
+                    .show(ui, |ui| {
+                        draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                    });
+            }
         });
 
     if !open {
@@ -1584,113 +1595,118 @@ fn command_editor_source_chord_section(
     );
     ui.small("場所ごとの現在の割り当てです。割り当てたい場所を選ぶと、下に候補が表示されます。");
 
-    egui::Grid::new(("command_editor_source_chord_contexts", chord_label.clone()))
-        .num_columns(3)
-        .spacing([10.0, 4.0])
-        .striped(true)
-        .show(ui, |ui| {
-            ui.strong("場所");
-            ui.strong("現在の割り当て");
-            ui.strong("操作");
-            ui.end_row();
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("場所:");
+            let selected =
+                operation_keyboard_context_filter_label(state.operation_keyboard_context);
+            egui::ComboBox::from_id_salt((
+                "command_editor_source_chord_context",
+                chord_label.clone(),
+            ))
+            .selected_text(selected)
+            .width(190.0)
+            .show_ui(ui, |ui| {
+                for context in key_assignment_context_filters() {
+                    let label = operation_keyboard_context_filter_label(context);
+                    ui.selectable_value(&mut state.operation_keyboard_context, context, label);
+                }
+            });
+        });
 
-            for context in key_assignment_contexts() {
-                let selected = state.operation_keyboard_context == Some(context);
-                ui.label(context.description());
-                let matches = actions_for_chord(keymap, chord, Some(context));
-                if matches.is_empty() {
-                    ui.label(egui::RichText::new("割り当てなし").weak());
-                } else {
-                    ui.vertical(|ui| {
-                        for action in matches {
-                            ui.label(compact_key_action_label(action))
-                                .on_hover_text(action.description());
-                        }
-                    });
+        let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("現在の割り当て:");
+            if matches.is_empty() {
+                ui.label(egui::RichText::new("割り当てなし").weak());
+            } else {
+                for action in matches {
+                    let label = if state.operation_keyboard_context.is_none() {
+                        format!(
+                            "{}: {}",
+                            operation_keyboard_context_filter_label(Some(action.context())),
+                            compact_key_action_label(action)
+                        )
+                    } else {
+                        compact_key_action_label(action)
+                    };
+                    ui.label(label).on_hover_text(action.description());
                 }
-                if ui
-                    .selectable_label(
-                        selected,
-                        if selected {
-                            "選択中"
-                        } else {
-                            "割り当て"
-                        },
-                    )
-                    .clicked()
-                {
-                    state.operation_keyboard_context = Some(context);
-                }
-                ui.end_row();
             }
         });
+    });
 
     ui.add_space(8.0);
-    let Some(context) = state.operation_keyboard_context else {
-        ui.small("上の表で場所を選ぶと、このキーに割り当てられる操作を選択できます。");
-        return;
-    };
-
-    ui.label(
-        egui::RichText::new(format!("{} に割り当てる操作を選ぶ", context.description())).strong(),
-    );
     let filter = state.command_filter.trim().to_ascii_lowercase();
-    egui::ScrollArea::vertical()
-        .id_salt(("command_editor_chord_assign_list", chord_label))
-        .max_height(220.0)
-        .show(ui, |ui| {
-            egui::Grid::new(("command_editor_chord_assign_grid", chord.display_name()))
-                .num_columns(4)
-                .spacing([8.0, 3.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("割り当て");
-                    ui.strong("操作");
-                    ui.strong("現在のキー");
-                    ui.strong("状態");
-                    ui.end_row();
-
-                    for &action in KeyAction::all()
-                        .iter()
-                        .filter(|action| action.is_user_facing())
-                    {
-                        if action.context() != context {
-                            continue;
-                        }
-                        if !command_action_matches_filter(action, &filter) {
-                            continue;
-                        }
-                        if ui.small_button("割り当て").clicked() {
-                            assign_chord_to_action_editor(state, keymap, action, chord);
-                        }
-                        ui.label(compact_key_action_label(action))
-                            .on_hover_text(action.description());
-                        assignment_values(ui, &keymap.chord_labels(action));
-                        let current = keymap.effective_chords(action).contains(&chord);
-                        if current {
-                            ui.label("現在割り当て済み");
-                        } else {
-                            ui.label("");
-                        }
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        let heading = match state.operation_keyboard_context {
+            Some(context) => format!(
+                "{} に割り当てる操作を選ぶ",
+                operation_keyboard_context_filter_label(Some(context))
+            ),
+            None => "割り当てる操作を選ぶ".to_string(),
+        };
+        ui.label(egui::RichText::new(heading).strong());
+        ui.add_space(4.0);
+        let candidate_height = ui.available_height().max(180.0);
+        egui::ScrollArea::vertical()
+            .id_salt(("command_editor_chord_assign_list", chord_label))
+            .max_height(candidate_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new(("command_editor_chord_assign_grid", chord.display_name()))
+                    .num_columns(4)
+                    .spacing([8.0, 3.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("割り当て");
+                        ui.strong("操作");
+                        ui.strong("現在のキー");
+                        ui.strong("状態");
                         ui.end_row();
-                    }
-                });
-        });
+
+                        for &action in KeyAction::all()
+                            .iter()
+                            .filter(|action| action.is_user_facing())
+                        {
+                            if !operation_keyboard_context_filter_matches(
+                                state.operation_keyboard_context,
+                                action.context(),
+                            ) {
+                                continue;
+                            }
+                            if !command_action_matches_filter(action, &filter) {
+                                continue;
+                            }
+                            if ui.small_button("割り当て").clicked() {
+                                assign_chord_to_action_editor(state, keymap, action, chord);
+                            }
+                            ui.label(compact_key_action_label(action))
+                                .on_hover_text(action.description());
+                            assignment_values(ui, &keymap.chord_labels(action));
+                            let current = keymap.effective_chords(action).contains(&chord);
+                            if current {
+                                ui.label("現在割り当て済み");
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    });
 }
 
-fn key_assignment_contexts() -> [KeyContext; 11] {
+fn key_assignment_context_filters() -> [Option<KeyContext>; 8] {
     [
-        KeyContext::Global,
-        KeyContext::Grid,
-        KeyContext::FsCommon,
-        KeyContext::Rating,
-        KeyContext::FsImage,
-        KeyContext::FsVideo,
-        KeyContext::Erase,
-        KeyContext::Conceal,
-        KeyContext::Crop,
-        KeyContext::Text,
-        KeyContext::LocalAdjust,
+        None,
+        Some(KeyContext::Global),
+        Some(KeyContext::Grid),
+        Some(KeyContext::FsCommon),
+        Some(KeyContext::Rating),
+        Some(KeyContext::FsImage),
+        Some(KeyContext::FsVideo),
+        Some(KeyContext::Erase),
     ]
 }
 
@@ -1733,7 +1749,8 @@ fn open_operation_assignment_editor(
     tab: OperationAssignmentTab,
 ) {
     if let OperationAssignmentTarget::Key(action) = &target {
-        state.operation_keyboard_context = Some(action.context());
+        state.operation_keyboard_context =
+            operation_keyboard_context_filter_for_context(action.context());
     }
     if let OperationAssignmentTarget::Chord(chord) = &target {
         state.command_editor_source_chord = Some(*chord);
@@ -2028,9 +2045,7 @@ fn keyboard_chord_tooltip(
         .iter()
         .filter(|action| action.is_user_facing())
     {
-        if let Some(context) = context_filter
-            && action.context() != context
-        {
+        if !operation_keyboard_context_filter_matches(context_filter, action.context()) {
             continue;
         }
         if keymap.effective_chords(action).contains(&chord) {
@@ -2078,7 +2093,7 @@ fn actions_for_chord(
         .copied()
         .filter(|action| action.is_user_facing())
         .filter(|action| {
-            context_filter.is_none_or(|context| action.context() == context)
+            operation_keyboard_context_filter_matches(context_filter, action.context())
                 && keymap.effective_chords(*action).contains(&chord)
         })
         .collect()
@@ -2294,9 +2309,10 @@ fn command_list(
                 .iter()
                 .filter(|action| action.is_user_facing())
             {
-                if let Some(context) = state.operation_keyboard_context
-                    && action.context() != context
-                {
+                if !operation_keyboard_context_filter_matches(
+                    state.operation_keyboard_context,
+                    action.context(),
+                ) {
                     continue;
                 }
                 if !command_action_matches_filter(action, &filter) {

@@ -59,6 +59,33 @@ pub fn enabled() -> bool {
     })
 }
 
+pub fn overlay_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !enabled() {
+            return false;
+        }
+        if std::env::var("MIV_KEY_DEBUG_OVERLAY")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty()
+                    && !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off")
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        std::env::var("MIV_KEY_DEBUG")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "overlay" | "ui" | "both"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 pub fn record_raw_edge(source: KeyDebugSource, edge: KeyEdge) {
     if !enabled() {
         return;
@@ -73,7 +100,9 @@ pub fn record_raw_edge(source: KeyDebugSource, edge: KeyEdge) {
         edge.repeat as u8,
         modifier_label(edge.ctrl, edge.shift, edge.alt)
     );
-    push_line(line, true);
+    // Keep the on-screen overlay complete, but avoid flooding the log with
+    // every key-up and repeat edge.  Action resolution lines are always logged.
+    push_line(line, edge.pressed && !edge.repeat);
 }
 
 pub fn record_native_video_key(
@@ -133,7 +162,7 @@ pub fn record_pressed_action(
 }
 
 pub fn render_overlay(ctx: &egui::Context) {
-    if !enabled() {
+    if !overlay_enabled() {
         return;
     }
     let lines = snapshot_lines();

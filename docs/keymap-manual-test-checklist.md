@@ -4,12 +4,20 @@ Win32 key edge queue / 日本語キーボード固有キー / テンキー分離
 
 ## デバッグ表示
 
-`MIV_KEY_DEBUG=1` を設定して起動すると、右上に直近のキー入力と解決された `KeyAction` が表示され、ログにも `[key-debug]` 行が出る。
+`MIV_KEY_DEBUG=1` を設定して起動すると、ログに `[key-debug]` 行が出る。画面右上のオーバーレイも必要な場合だけ、追加で `MIV_KEY_DEBUG_OVERLAY=1` を設定する。
 
 PowerShell 例:
 
 ```powershell
 $env:MIV_KEY_DEBUG = "1"
+cargo run --bin mimageviewer-core
+```
+
+オーバーレイも使う場合:
+
+```powershell
+$env:MIV_KEY_DEBUG = "1"
+$env:MIV_KEY_DEBUG_OVERLAY = "1"
 cargo run --bin mimageviewer-core
 ```
 
@@ -25,9 +33,10 @@ cargo run --bin mimageviewer-core
 
 | 結果 | 確認項目 |
 |---|---|
-|  | 通常起動ではデバッグ表示が出ない |
-|  | `MIV_KEY_DEBUG=1` 起動で右上にデバッグ表示が出る |
-|  | 何かキーを押すと `raw main down/up` が更新される |
+|  | 通常起動ではデバッグログ / デバッグ表示が出ない |
+|  | `MIV_KEY_DEBUG=1` 起動で `[key-debug]` ログが出る |
+|  | `MIV_KEY_DEBUG_OVERLAY=1` 併用で右上にデバッグ表示が出る |
+|  | 何かキーを押すと `raw main down/up` がログまたはオーバーレイに出る |
 |  | 操作が発火したキーでは `consume` または `pressed` が出る |
 
 ## 日本語キーボード / テンキー

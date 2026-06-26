@@ -253,6 +253,63 @@ pub(crate) enum OperationAssignmentTarget {
     },
 }
 
+pub(super) fn operation_keyboard_context_filter_label(
+    context: Option<crate::keymap::KeyContext>,
+) -> &'static str {
+    use crate::keymap::KeyContext;
+    match context {
+        None => "すべて",
+        Some(KeyContext::Erase)
+        | Some(KeyContext::Conceal)
+        | Some(KeyContext::Crop)
+        | Some(KeyContext::Text)
+        | Some(KeyContext::LocalAdjust) => "編集モード",
+        Some(context) => context.description(),
+    }
+}
+
+pub(super) fn operation_keyboard_context_filter_matches(
+    filter: Option<crate::keymap::KeyContext>,
+    context: crate::keymap::KeyContext,
+) -> bool {
+    use crate::keymap::KeyContext;
+    let Some(filter) = filter else {
+        return true;
+    };
+    if matches!(
+        filter,
+        KeyContext::Erase
+            | KeyContext::Conceal
+            | KeyContext::Crop
+            | KeyContext::Text
+            | KeyContext::LocalAdjust
+    ) {
+        return matches!(
+            context,
+            KeyContext::Erase
+                | KeyContext::Conceal
+                | KeyContext::Crop
+                | KeyContext::Text
+                | KeyContext::LocalAdjust
+        );
+    }
+    context == filter
+}
+
+pub(super) fn operation_keyboard_context_filter_for_context(
+    context: crate::keymap::KeyContext,
+) -> Option<crate::keymap::KeyContext> {
+    use crate::keymap::KeyContext;
+    Some(match context {
+        KeyContext::Erase
+        | KeyContext::Conceal
+        | KeyContext::Crop
+        | KeyContext::Text
+        | KeyContext::LocalAdjust => KeyContext::Erase,
+        context => context,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OperationAssignmentEditor {
     pub target: OperationAssignmentTarget,
@@ -1344,7 +1401,10 @@ impl App {
             .id(egui::Id::new("operation_customize_dialog_v2"))
             .open(&mut open)
             .collapsible(false)
-            .fixed_rect(dialog_rect)
+            .resizable(true)
+            .default_pos(dialog_rect.min)
+            .default_size(dialog_size)
+            .max_size(safe_size)
             .show(ctx, |ui| {
                 let state = self.operation_customize_state.as_mut().unwrap();
                 let available = ui.available_size();
@@ -1629,23 +1689,17 @@ fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState
         Some(KeyContext::FsImage),
         Some(KeyContext::FsVideo),
         Some(KeyContext::Erase),
-        Some(KeyContext::Conceal),
-        Some(KeyContext::Crop),
-        Some(KeyContext::Text),
-        Some(KeyContext::LocalAdjust),
     ];
 
     ui.horizontal(|ui| {
         ui.label("場所:");
-        let selected = state
-            .operation_keyboard_context
-            .map_or("すべて", KeyContext::description);
+        let selected = operation_keyboard_context_filter_label(state.operation_keyboard_context);
         egui::ComboBox::from_id_salt("operation_context_filter")
             .selected_text(selected)
             .width(190.0)
             .show_ui(ui, |ui| {
                 for &context in CONTEXTS {
-                    let label = context.map_or("すべて", KeyContext::description);
+                    let label = operation_keyboard_context_filter_label(context);
                     if ui
                         .selectable_value(&mut state.operation_keyboard_context, context, label)
                         .clicked()
