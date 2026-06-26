@@ -429,6 +429,7 @@ pub(crate) struct PreferencesState {
     pub command_chord_inputs: [String; 3],
     pub command_capture_slot: Option<usize>,
     pub command_edit_error: Option<String>,
+    pub command_edit_notice: Option<String>,
     pub command_editor_source_chord: Option<crate::keymap::Chord>,
     pub operation_tab: OperationCustomizeTab,
     pub operation_settings_tab: OperationSettingsTab,
@@ -649,6 +650,7 @@ impl PreferencesState {
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,
             command_edit_error: None,
+            command_edit_notice: None,
             command_editor_source_chord: None,
             operation_tab: OperationCustomizeTab::Settings,
             operation_settings_tab: OperationSettingsTab::Behavior,
@@ -1634,6 +1636,7 @@ fn draw_operation_customize_tabs(ui: &mut egui::Ui, state: &mut PreferencesState
                 state.operation_tab = tab;
                 state.command_capture_slot = None;
                 state.command_edit_error = None;
+                state.command_edit_notice = None;
             }
         }
     });
@@ -1708,6 +1711,7 @@ fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState
                     {
                         state.command_capture_slot = None;
                         state.command_edit_error = None;
+                        state.command_edit_notice = None;
                     }
                 }
             });

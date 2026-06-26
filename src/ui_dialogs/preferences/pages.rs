@@ -1030,6 +1030,7 @@ pub(super) fn page_command_settings(
             state.command_edit_loaded_for = None;
             state.command_capture_slot = None;
             state.command_edit_error = None;
+            state.command_edit_notice = None;
         }
     });
 
@@ -1690,12 +1691,10 @@ fn command_editor_source_chord_section(
                             ui.label(compact_key_action_label(action))
                                 .on_hover_text(action.description());
                             assignment_values(ui, &keymap.chord_labels(action));
-                            let current = keymap.effective_chords(action).contains(&chord);
-                            if current {
-                                ui.label("現在割り当て済み");
-                            } else {
-                                ui.label("");
-                            }
+                            ui.label(chord_assignment_candidate_status(keymap, action, chord))
+                                .on_hover_text(
+                                    "空きあり: 未使用のキー欄へ自動入力します。\n置換が必要: 編集ダイアログで置き換える行を選びます。",
+                                );
                             ui.end_row();
                         }
                     });
@@ -1725,12 +1724,35 @@ fn assign_chord_to_action_editor(
     open_command_editor_dialog(state, action, Some(chord));
     ensure_command_editor_loaded(state, keymap, action);
     let label = chord.display_name();
-    let slot = state
+    if let Some(slot) = state
+        .command_chord_inputs
+        .iter()
+        .position(|input| command_input_matches_chord(action, input, chord))
+    {
+        state.command_edit_notice = Some(format!(
+            "{label} はすでにキー {} に入っています。必要なら「適用して閉じる」で保存します。",
+            slot + 1
+        ));
+        state.command_edit_error = None;
+        return;
+    }
+    let Some(slot) = state
         .command_chord_inputs
         .iter()
         .position(|input| input.trim().is_empty())
-        .unwrap_or(0);
+    else {
+        state.command_edit_notice = Some(format!(
+            "空きキー欄がありません。置き換えたい行の「このキーに置換」を押すと {label} に差し替えます。"
+        ));
+        state.command_edit_error = None;
+        return;
+    };
     state.command_chord_inputs[slot] = label;
+    state.command_edit_notice = Some(format!(
+        "キー {} に {} を入れました。「適用して閉じる」で保存します。",
+        slot + 1,
+        state.command_chord_inputs[slot]
+    ));
     state.command_edit_error = None;
 }
 
@@ -1775,6 +1797,7 @@ fn close_assignment_editors(state: &mut PreferencesState) {
     state.operation_assignment_editor = None;
     state.command_editor_source_chord = None;
     state.command_capture_slot = None;
+    state.command_edit_notice = None;
 }
 
 fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap: &Keymap) {
@@ -2077,6 +2100,7 @@ fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, c
     state.command_edit_loaded_for = None;
     state.command_capture_slot = None;
     state.command_edit_error = None;
+    state.command_edit_notice = None;
     open_operation_assignment_editor(
         state,
         OperationAssignmentTarget::Chord(chord),
@@ -2384,10 +2408,16 @@ fn command_editor_for_action(
             Ok(label) if slot < state.command_chord_inputs.len() => {
                 state.command_chord_inputs[slot] = label;
                 state.command_edit_error = None;
+                state.command_edit_notice = Some(format!(
+                    "キー {} に {} を入力しました。「適用して閉じる」で保存します。",
+                    slot + 1,
+                    state.command_chord_inputs[slot]
+                ));
             }
             Ok(_) => {}
             Err(message) => {
                 state.command_edit_error = Some(message);
+                state.command_edit_notice = None;
             }
         }
         state.command_capture_slot = None;
@@ -2405,20 +2435,20 @@ fn command_editor_for_action(
     ));
 
     let effective_labels = keymap.chord_labels(action);
-    ui.small("現在の割り当て:");
+    ui.small("現在有効なキー:");
     assignment_summary(ui, &[("キー", effective_labels)]);
 
-    let override_state = match state.settings.keymap.override_chord_labels(action) {
-        Some(labels) if labels.is_empty() => "上書き: 割り当て解除".to_string(),
-        Some(labels) => {
-            ui.small("上書き:");
-            assignment_summary(ui, &[("キー", labels)]);
-            String::new()
-        }
-        None => "上書きなし (既定を使用)".to_string(),
+    let assignment_state = match state.settings.keymap.override_chord_labels(action) {
+        Some(labels) if labels.is_empty() => "状態: キー割り当て解除を保存済み",
+        Some(_) => "状態: 上書き設定を使用中",
+        None => "状態: 既定キーを使用中",
     };
-    if !override_state.is_empty() {
-        ui.small(override_state);
+    ui.small(assignment_state);
+    if let Some(source_chord) = state.command_editor_source_chord {
+        ui.small(format!(
+            "選択中のキー: {}。空欄に追加するか、任意の行をこのキーに置換できます。",
+            source_chord.display_name()
+        ));
     }
 
     ui.add_space(8.0);
@@ -2428,7 +2458,7 @@ fn command_editor_for_action(
     } else {
         let preview_conflicts = preview_command_editor_conflicts(state, action, conflicts);
         egui::Grid::new("command_editor_slots")
-            .num_columns(5)
+            .num_columns(6)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 for idx in 0..state.command_chord_inputs.len() {
@@ -2458,6 +2488,7 @@ fn command_editor_for_action(
                     {
                         state.command_capture_slot = Some(idx);
                         state.command_edit_error = None;
+                        state.command_edit_notice = None;
                     }
                     if ui
                         .add(egui::Button::new("解除").small())
@@ -2469,6 +2500,38 @@ fn command_editor_for_action(
                             state.command_capture_slot = None;
                         }
                         state.command_edit_error = None;
+                        state.command_edit_notice =
+                            Some(format!("キー {} の割り当てを解除しました。", idx + 1));
+                    }
+                    if let Some(source_chord) = state.command_editor_source_chord {
+                        let source_label = source_chord.display_name();
+                        let already_this_row = command_input_matches_chord(
+                            action,
+                            state.command_chord_inputs[idx].as_str(),
+                            source_chord,
+                        );
+                        if already_this_row {
+                            ui.label(egui::RichText::new("選択中").weak());
+                        } else if ui
+                            .add(egui::Button::new("このキーに置換").small())
+                            .on_hover_text(format!(
+                                "キー {} を {} に置き換えます",
+                                idx + 1,
+                                source_label
+                            ))
+                            .clicked()
+                        {
+                            state.command_chord_inputs[idx] = source_label;
+                            state.command_capture_slot = None;
+                            state.command_edit_error = None;
+                            state.command_edit_notice = Some(format!(
+                                "キー {} を {} に置き換えました。「適用して閉じる」で保存します。",
+                                idx + 1,
+                                state.command_chord_inputs[idx]
+                            ));
+                        }
+                    } else {
+                        ui.label("");
                     }
                     if let Some(label) = command_slot_conflict_label(
                         &preview_conflicts,
@@ -2488,6 +2551,9 @@ fn command_editor_for_action(
 
     if let Some(error) = &state.command_edit_error {
         ui.colored_label(egui::Color32::from_rgb(220, 90, 80), error);
+    }
+    if let Some(notice) = &state.command_edit_notice {
+        ui.colored_label(egui::Color32::from_rgb(80, 130, 180), notice);
     }
 
     ui.horizontal(|ui| {
@@ -2548,7 +2614,26 @@ fn command_editor_for_action(
 }
 
 fn command_chord_input_width() -> f32 {
-    190.0
+    260.0
+}
+
+fn chord_assignment_candidate_status(keymap: &Keymap, action: KeyAction, chord: Chord) -> String {
+    if keymap.effective_chords(action).contains(&chord) {
+        return "割り当て済み".to_string();
+    }
+    let labels = keymap.chord_labels(action);
+    if labels.len() >= 3 {
+        "置換が必要".to_string()
+    } else {
+        "空きあり".to_string()
+    }
+}
+
+fn command_input_matches_chord(action: KeyAction, input: &str, chord: Chord) -> bool {
+    parse_chord_for_action(action, input.trim())
+        .ok()
+        .flatten()
+        .is_some_and(|parsed| parsed == chord)
 }
 
 fn preview_command_editor_conflicts(
@@ -2669,6 +2754,7 @@ fn select_command_action(state: &mut PreferencesState, action: KeyAction) {
     state.command_edit_loaded_for = None;
     state.command_capture_slot = None;
     state.command_edit_error = None;
+    state.command_edit_notice = None;
 }
 
 fn ensure_command_editor_loaded(state: &mut PreferencesState, keymap: &Keymap, action: KeyAction) {
@@ -2685,6 +2771,7 @@ fn ensure_command_editor_loaded(state: &mut PreferencesState, keymap: &Keymap, a
     state.command_edit_loaded_for = Some(action);
     state.command_capture_slot = None;
     state.command_edit_error = None;
+    state.command_edit_notice = None;
 }
 
 fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
@@ -2703,6 +2790,7 @@ fn apply_command_editor(state: &mut PreferencesState, action: KeyAction) {
     state.command_edit_loaded_for = None;
     state.command_capture_slot = None;
     state.command_edit_error = None;
+    state.command_edit_notice = Some("キー割り当てを保存しました。".to_string());
 }
 
 fn parse_command_chord_inputs_for_editor(
