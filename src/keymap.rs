@@ -338,7 +338,7 @@ impl KeySlot {
             "^" | "CARET" | "JISCARET" => KeyName::JisCaret,
             "@" | "AT" | "JISAT" => KeyName::JisAt,
             "YEN" | "¥" | "￥" | "INTLYEN" | "JISYEN" => KeyName::IntlYen,
-            "RO" | "ろ" | "INTLRO" | "JISRO" => KeyName::IntlRo,
+            "RO" | "ろ" | "＼" | "INTLRO" | "JISRO" => KeyName::IntlRo,
             _ => return None,
         })
     }
@@ -887,7 +887,7 @@ impl KeySlot {
             KeyName::JisCaret => "^",
             KeyName::JisAt => "@",
             KeyName::IntlYen => "￥",
-            KeyName::IntlRo => "ろ",
+            KeyName::IntlRo => "＼",
         }
     }
 
@@ -7173,7 +7173,7 @@ mod tests {
             (KeyName::JisCaret, "^", 0xDE),
             (KeyName::JisAt, "@", 0xC0),
             (KeyName::IntlYen, "￥", 0xDC),
-            (KeyName::IntlRo, "ろ", 0xE2),
+            (KeyName::IntlRo, "＼", 0xE2),
         ];
         for (name, label, vk) in cases {
             assert_eq!(name.display_name(), label);
@@ -7184,6 +7184,7 @@ mod tests {
         assert_eq!(KeyName::parse("JisAt"), Some(KeyName::JisAt));
         assert_eq!(KeyName::parse("IntlYen"), Some(KeyName::IntlYen));
         assert_eq!(KeyName::parse("IntlRo"), Some(KeyName::IntlRo));
+        assert_eq!(KeyName::parse("＼"), Some(KeyName::IntlRo));
         assert_eq!(KeyName::parse("ろ"), Some(KeyName::IntlRo));
     }
 
@@ -7206,7 +7207,7 @@ mod tests {
         assert_eq!(KeyName::IntlRo.settings_name(), "Ro");
         assert_eq!(Chord::key(KeyName::IntlYen).display_name(), "￥");
         assert_eq!(Chord::key(KeyName::IntlYen).settings_name(), "Yen");
-        assert_eq!(Chord::key(KeyName::IntlRo).display_name(), "ろ");
+        assert_eq!(Chord::key(KeyName::IntlRo).display_name(), "＼");
         assert_eq!(Chord::key(KeyName::IntlRo).settings_name(), "Ro");
     }
 
@@ -7865,7 +7866,7 @@ mod tests {
         );
         assert_eq!(
             settings.override_chord_labels(KeyAction::GridToggleStackMode),
-            Some(vec!["ろ".to_string()])
+            Some(vec!["＼".to_string()])
         );
         let keymap = Keymap::from_settings(&settings);
         assert_eq!(

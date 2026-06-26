@@ -365,7 +365,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    ある場合 (例 C / Shift+C / Alt+C、矢印 alias) は、デフォルト chord を複数持たせて
    現行挙動を再現する。`consume_key(Modifiers::NONE, key)` へ直に寄せない。
 5. **物理キー slot**: v2.2.0 から `KeySlot` を正本にし、テンキー数字は通常数字とは別 slot として扱う。
-   日本語キーボード固有キー (`^` / `@` / `¥` / `ろ`) は egui fallback ではなく Win32 key edge queue で判定する。
+   日本語キーボード固有キー (`^` / `@` / `¥` / `＼`) は egui fallback ではなく Win32 key edge queue で判定する。
 6. **native 動画の転送ホワイトリスト**: `src/video/native_presenter/mod.rs` の
    `native_video_fullscreen_shortcut_key` を keymap 連動にしない限り、カスタムした VK が
    UI 側へ届かない。Ph5 の必須作業にする。

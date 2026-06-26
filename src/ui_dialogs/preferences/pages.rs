@@ -1,8 +1,8 @@
 use super::*;
 use crate::keymap::{
-    BindingConflict, BindingConflictKind, Chord, KeyAction, KeyName, KeyTrigger, Keymap,
-    MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId, menu_command_spec,
-    menu_commands_for_parent, parse_chord_for_action,
+    BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
+    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId,
+    menu_command_spec, menu_commands_for_parent, parse_chord_for_action,
 };
 use crate::ring_shortcut::{
     GamepadButtonSlot, MouseGestureDirection, RightDragContext, RightDragMode, RingActionId,
@@ -1359,7 +1359,9 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
                     .strong()
                     .size(14.0),
             );
-            ui.small("このキーに割り当てるコマンドを選ぶか、既存の割り当てを編集します。");
+            ui.small(
+                "場所ごとの割り当て状態を確認し、割り当てたい場所を選んでから操作を選びます。",
+            );
         }
         OperationAssignmentTarget::Ring { context, action } => {
             ui.label(egui::RichText::new(action.label_for_context(*context)).strong());
@@ -1486,11 +1488,6 @@ fn draw_operation_assignment_editor_body(
         (OperationAssignmentTarget::Chord(chord), OperationAssignmentTab::Keyboard) => {
             let keymap = Keymap::from_settings(&state.settings.keymap);
             command_editor_source_chord_section(ui, state, &keymap, *chord);
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            let conflicts = keymap.binding_conflicts();
-            command_editor(ui, state, &keymap, &conflicts, ime_active);
         }
         (OperationAssignmentTarget::Ring { context, action }, OperationAssignmentTab::RingPad) => {
             state.operation_ring_context = *context;
@@ -1579,58 +1576,85 @@ fn command_editor_source_chord_section(
     keymap: &Keymap,
     chord: Chord,
 ) {
+    let chord_label = chord.display_name();
     ui.label(
-        egui::RichText::new(format!("キー: {}", chord.display_name()))
+        egui::RichText::new(format!("キー: {chord_label}"))
             .strong()
             .size(14.0),
     );
-    let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
-    if matches.is_empty() {
-        ui.small("このキーは現在の表示範囲では未割り当てです。下の一覧から割り当て先を選べます。");
-    } else {
-        ui.small("このキーに割り当てられているコマンド:");
-        egui::Grid::new(("command_editor_source_chord", chord.display_name()))
-            .num_columns(3)
-            .spacing([8.0, 3.0])
-            .show(ui, |ui| {
-                for action in matches {
-                    if ui
-                        .small_button(if state.command_selected == Some(action) {
-                            "編集中"
-                        } else {
-                            "編集"
-                        })
-                        .clicked()
-                    {
-                        open_command_editor_dialog(state, action, Some(chord));
-                    }
-                    ui.label(compact_key_action_label(action))
-                        .on_hover_text(action.description());
-                    ui.label(action.context().description());
-                    ui.end_row();
+    ui.small("場所ごとの現在の割り当てです。割り当てたい場所を選ぶと、下に候補が表示されます。");
+
+    egui::Grid::new(("command_editor_source_chord_contexts", chord_label.clone()))
+        .num_columns(3)
+        .spacing([10.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("場所");
+            ui.strong("現在の割り当て");
+            ui.strong("操作");
+            ui.end_row();
+
+            for context in key_assignment_contexts() {
+                let selected = state.operation_keyboard_context == Some(context);
+                ui.label(context.description());
+                let matches = actions_for_chord(keymap, chord, Some(context));
+                if matches.is_empty() {
+                    ui.label(egui::RichText::new("割り当てなし").weak());
+                } else {
+                    ui.vertical(|ui| {
+                        for action in matches {
+                            ui.label(compact_key_action_label(action))
+                                .on_hover_text(action.description());
+                        }
+                    });
                 }
-            });
-    }
+                if ui
+                    .selectable_label(
+                        selected,
+                        if selected {
+                            "選択中"
+                        } else {
+                            "割り当て"
+                        },
+                    )
+                    .clicked()
+                {
+                    state.operation_keyboard_context = Some(context);
+                }
+                ui.end_row();
+            }
+        });
 
     ui.add_space(8.0);
-    ui.label(egui::RichText::new("このキーを割り当てる").strong());
+    let Some(context) = state.operation_keyboard_context else {
+        ui.small("上の表で場所を選ぶと、このキーに割り当てられる操作を選択できます。");
+        return;
+    };
+
+    ui.label(
+        egui::RichText::new(format!("{} に割り当てる操作を選ぶ", context.description())).strong(),
+    );
     let filter = state.command_filter.trim().to_ascii_lowercase();
     egui::ScrollArea::vertical()
-        .id_salt(("command_editor_chord_assign_list", chord.display_name()))
-        .max_height(190.0)
+        .id_salt(("command_editor_chord_assign_list", chord_label))
+        .max_height(220.0)
         .show(ui, |ui| {
             egui::Grid::new(("command_editor_chord_assign_grid", chord.display_name()))
-                .num_columns(3)
+                .num_columns(4)
                 .spacing([8.0, 3.0])
                 .striped(true)
                 .show(ui, |ui| {
+                    ui.strong("割り当て");
+                    ui.strong("操作");
+                    ui.strong("現在のキー");
+                    ui.strong("状態");
+                    ui.end_row();
+
                     for &action in KeyAction::all()
                         .iter()
                         .filter(|action| action.is_user_facing())
                     {
-                        if let Some(context) = state.operation_keyboard_context
-                            && action.context() != context
-                        {
+                        if action.context() != context {
                             continue;
                         }
                         if !command_action_matches_filter(action, &filter) {
@@ -1641,11 +1665,33 @@ fn command_editor_source_chord_section(
                         }
                         ui.label(compact_key_action_label(action))
                             .on_hover_text(action.description());
-                        ui.label(action.context().description());
+                        assignment_values(ui, &keymap.chord_labels(action));
+                        let current = keymap.effective_chords(action).contains(&chord);
+                        if current {
+                            ui.label("現在割り当て済み");
+                        } else {
+                            ui.label("");
+                        }
                         ui.end_row();
                     }
                 });
         });
+}
+
+fn key_assignment_contexts() -> [KeyContext; 11] {
+    [
+        KeyContext::Global,
+        KeyContext::Grid,
+        KeyContext::FsCommon,
+        KeyContext::Rating,
+        KeyContext::FsImage,
+        KeyContext::FsVideo,
+        KeyContext::Erase,
+        KeyContext::Conceal,
+        KeyContext::Crop,
+        KeyContext::Text,
+        KeyContext::LocalAdjust,
+    ]
 }
 
 fn assign_chord_to_action_editor(
@@ -1890,7 +1936,7 @@ fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
         Key(KeyName::Comma, None),
         Key(KeyName::Period, None),
         Key(KeyName::Slash, None),
-        Key(KeyName::IntlRo, Some("ろ")),
+        Key(KeyName::IntlRo, Some("＼")),
         Key(KeyName::Space, None),
     ];
     [EXTENDED_FUNCTION, FUNCTION, NUMBER, QWERTY, HOME, BOTTOM]
@@ -2297,22 +2343,6 @@ fn command_list(
                 ui.end_row();
             }
         });
-}
-
-fn command_editor(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    keymap: &Keymap,
-    conflicts: &[BindingConflict],
-    ime_active: bool,
-) {
-    let Some(action) = state.command_selected else {
-        ui.label(egui::RichText::new("割り当て編集").strong());
-        ui.small("左の一覧または競合一覧からコマンドを選んでください。");
-        return;
-    };
-
-    command_editor_for_action(ui, state, keymap, conflicts, ime_active, action);
 }
 
 fn command_editor_for_action(
