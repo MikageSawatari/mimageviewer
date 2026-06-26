@@ -538,6 +538,28 @@ pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState
     }
 }
 
+fn command_filter_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("検索:");
+        ui.label("操作");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.command_filter)
+                .desired_width(220.0)
+                .hint_text("操作名 / 説明 / 場所"),
+        );
+        ui.label("キー");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.command_key_filter)
+                .desired_width(140.0)
+                .hint_text("例: F11 / Numpad9"),
+        );
+        if ui.button("クリア").clicked() {
+            state.command_filter.clear();
+            state.command_key_filter.clear();
+        }
+    });
+}
+
 pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。左端の「編集」で割り当て編集ダイアログを開きます。");
     ui.add_space(8.0);
@@ -545,6 +567,9 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
     let keymap = Keymap::from_settings(&state.settings.keymap);
     let conflicts = keymap.binding_conflicts();
     command_conflict_summary(ui, state, &conflicts);
+
+    ui.add_space(8.0);
+    command_filter_controls(ui, state);
 
     ui.add_space(12.0);
     let conflicted = conflicted_actions(&conflicts);
@@ -645,6 +670,12 @@ fn command_overview_rows(
             .keymap
             .override_chord_labels(action)
             .is_some();
+        let key_labels = keymap.chord_labels(action);
+        if !command_action_matches_filter(action, state.command_filter.trim())
+            || !command_key_labels_match_filter(&key_labels, state.command_key_filter.trim())
+        {
+            continue;
+        }
         let is_conflicted = conflicted.contains(&action);
         let mut status = Vec::new();
         if overridden {
@@ -653,7 +684,7 @@ fn command_overview_rows(
         if is_conflicted {
             status.push("競合");
         }
-        let mut assignments = vec![("キー", keymap.chord_labels(action))];
+        let mut assignments = vec![("キー", key_labels)];
         if !ring_bindings.is_empty() {
             let multi_context = ring_bindings.len() > 1;
             let mut ring = Vec::new();
@@ -713,6 +744,19 @@ fn command_overview_rows(
             if ring_action_has_key_action(context, &action) {
                 continue;
             }
+            if !state.command_key_filter.trim().is_empty() {
+                continue;
+            }
+            let label = compact_operation_label(action.label_for_context(context));
+            let hover = ring_action_detail_label(&action, context).to_owned();
+            if !operation_text_matches_filter(
+                &label,
+                &hover,
+                context.label(),
+                state.command_filter.trim(),
+            ) {
+                continue;
+            }
             let ring = ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
             let mouse = mouse_assignment_labels(&state.settings.ring_shortcuts, context, &action);
             let mut pad =
@@ -724,7 +768,7 @@ fn command_overview_rows(
             ));
             let has_assignment = !ring.is_empty() || !mouse.is_empty() || !pad.is_empty();
             rows.push(OperationOverviewRow {
-                label: compact_operation_label(action.label_for_context(context)),
+                label,
                 context: context.label().to_owned(),
                 assignments: vec![("リング", ring), ("マウス", mouse), ("パッド", pad)],
                 status: if has_assignment {
@@ -733,7 +777,7 @@ fn command_overview_rows(
                     "未設定".to_owned()
                 },
                 conflicted: false,
-                hover: ring_action_detail_label(&action, context).to_owned(),
+                hover,
                 target: OperationOverviewTarget::Ring { context, action },
             });
         }
@@ -1017,14 +1061,8 @@ pub(super) fn page_command_settings(
     command_conflict_summary(ui, state, &conflicts);
 
     ui.add_space(10.0);
+    command_filter_controls(ui, state);
     ui.horizontal(|ui| {
-        ui.label("絞り込み");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.command_filter).hint_text("操作名 / 説明 / 場所"),
-        );
-        if ui.button("クリア").clicked() {
-            state.command_filter.clear();
-        }
         if ui.button("すべて既定に戻す").clicked() {
             state.settings.keymap.overrides.clear();
             state.command_edit_loaded_for = None;
@@ -1644,7 +1682,8 @@ fn command_editor_source_chord_section(
     });
 
     ui.add_space(8.0);
-    let filter = state.command_filter.trim().to_ascii_lowercase();
+    let filter = state.command_filter.trim().to_string();
+    let key_filter = state.command_key_filter.trim().to_string();
     egui::Frame::group(ui.style()).show(ui, |ui| {
         let heading = match state.operation_keyboard_context {
             Some(context) => format!(
@@ -1682,7 +1721,10 @@ fn command_editor_source_chord_section(
                             ) {
                                 continue;
                             }
-                            if !command_action_matches_filter(action, &filter) {
+                            let labels = keymap.chord_labels(action);
+                            if !command_action_matches_filter(action, &filter)
+                                || !command_key_labels_match_filter(&labels, &key_filter)
+                            {
                                 continue;
                             }
                             if ui.small_button("割り当て").clicked() {
@@ -1690,7 +1732,7 @@ fn command_editor_source_chord_section(
                             }
                             ui.label(compact_key_action_label(action))
                                 .on_hover_text(action.description());
-                            assignment_values(ui, &keymap.chord_labels(action));
+                            assignment_values(ui, &labels);
                             ui.label(chord_assignment_candidate_status(keymap, action, chord))
                                 .on_hover_text(
                                     "空きあり: 未使用のキー欄へ自動入力します。\n置換が必要: 編集ダイアログで置き換える行を選びます。",
@@ -2319,7 +2361,8 @@ fn command_list(
     keymap: &Keymap,
     conflicts: &[BindingConflict],
 ) {
-    let filter = state.command_filter.trim().to_ascii_lowercase();
+    let filter = state.command_filter.trim().to_string();
+    let key_filter = state.command_key_filter.trim().to_string();
     let conflicted = conflicted_actions(conflicts);
     ui.label(egui::RichText::new("コマンド一覧").strong());
 
@@ -2345,7 +2388,10 @@ fn command_list(
                 ) {
                     continue;
                 }
-                if !command_action_matches_filter(action, &filter) {
+                let labels = keymap.chord_labels(action);
+                if !command_action_matches_filter(action, &filter)
+                    || !command_key_labels_match_filter(&labels, &key_filter)
+                {
                     continue;
                 }
                 let selected = state.command_selected == Some(action);
@@ -2359,7 +2405,6 @@ fn command_list(
                 ui.label(compact_key_action_label(action))
                     .on_hover_text(action.description());
 
-                let labels = keymap.chord_labels(action);
                 assignment_values(ui, &labels);
 
                 ui.label(action.context().description());
@@ -2886,18 +2931,37 @@ fn poll_command_chord_capture(
 }
 
 fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {
+    operation_text_matches_filter(
+        &compact_key_action_label(action),
+        action.description(),
+        action.context().description(),
+        filter,
+    )
+}
+
+fn operation_text_matches_filter(
+    label: &str,
+    description: &str,
+    context: &str,
+    filter: &str,
+) -> bool {
+    let filter = filter.trim().to_ascii_lowercase();
     if filter.is_empty() {
         return true;
     }
-    compact_key_action_label(action)
-        .to_ascii_lowercase()
-        .contains(filter)
-        || action.description().to_ascii_lowercase().contains(filter)
-        || action
-            .context()
-            .description()
-            .to_ascii_lowercase()
-            .contains(filter)
+    label.to_ascii_lowercase().contains(&filter)
+        || description.to_ascii_lowercase().contains(&filter)
+        || context.to_ascii_lowercase().contains(&filter)
+}
+
+fn command_key_labels_match_filter(labels: &[String], filter: &str) -> bool {
+    let filter = filter.trim().to_ascii_lowercase();
+    if filter.is_empty() {
+        return true;
+    }
+    labels
+        .iter()
+        .any(|label| label.to_ascii_lowercase().contains(&filter))
 }
 
 fn conflicted_actions(conflicts: &[BindingConflict]) -> HashSet<KeyAction> {
