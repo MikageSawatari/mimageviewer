@@ -1338,14 +1338,19 @@ impl App {
         let dialog_margin = egui::vec2(32.0, 24.0);
         let constrain_rect = content_rect.shrink2(egui::vec2(8.0, 8.0));
         let max_dialog_size = egui::vec2(
-            (content_rect.width() - dialog_margin.x * 2.0).max(560.0),
-            (content_rect.height() - dialog_margin.y * 2.0).max(360.0),
+            (content_rect.width() - dialog_margin.x * 2.0)
+                .min(980.0)
+                .max(560.0),
+            (content_rect.height() - dialog_margin.y * 2.0)
+                .min(780.0)
+                .max(360.0),
         );
-        let default_dialog_size = egui::vec2(960.0, 640.0).min(max_dialog_size);
+        let default_dialog_size = egui::vec2(900.0, 620.0).min(max_dialog_size);
         let min_dialog_size = egui::vec2(620.0, 360.0).min(max_dialog_size);
         let dialog_pos = content_rect.min + dialog_margin;
 
         egui::Window::new("操作カスタマイズ")
+            .id(egui::Id::new("operation_customize_dialog_v2"))
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
