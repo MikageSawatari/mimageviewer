@@ -5475,10 +5475,16 @@ pub fn native_video_fullscreen_shortcut_key(
     if let Some(cell) = GLOBAL_NATIVE_VIDEO_CHORDS.get()
         && let Ok(guard) = cell.read()
     {
-        return guard
-            .iter()
-            .copied()
-            .any(|chord| chord.matches_vk_parts(key.virtual_key, key.ctrl, key.shift, key.alt));
+        return guard.iter().copied().any(|chord| {
+            chord.matches_win32_parts(
+                key.virtual_key,
+                key.scan_code,
+                key.extended,
+                key.ctrl,
+                key.shift,
+                key.alt,
+            )
+        });
     }
     let fallback = Keymap::empty();
     KeyAction::all()
@@ -5549,7 +5555,14 @@ pub(crate) fn native_video_context_shortcuts_help_key_down(
         if is_context_shortcuts_help_question_chord(chord) {
             key.virtual_key == VK_OEM_2 && key.shift && !key.ctrl && !key.alt
         } else {
-            chord.matches_vk_parts(key.virtual_key, key.ctrl, key.shift, key.alt)
+            chord.matches_win32_parts(
+                key.virtual_key,
+                key.scan_code,
+                key.extended,
+                key.ctrl,
+                key.shift,
+                key.alt,
+            )
         }
     };
     if let Some(cell) = GLOBAL_CONTEXT_HELP_CHORDS.get()
