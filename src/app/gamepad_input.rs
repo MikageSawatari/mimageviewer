@@ -4035,6 +4035,25 @@ impl App {
         }
     }
 
+    pub(crate) fn apply_pinned_tag_key_action(&mut self, action: KeyAction, source: &'static str) {
+        let Some(slot) = action.pinned_tag_slot_number() else {
+            return;
+        };
+        let Some(name) = self
+            .settings
+            .tags
+            .iter()
+            .filter(|tag| tag.show_shortcut)
+            .nth(slot.saturating_sub(1))
+            .map(|tag| tag.name.clone())
+        else {
+            self.show_feedback_toast(format!("ピン留めタグ {slot} は未登録です"));
+            return;
+        };
+        self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
+        self.request_tag_toggle_for_selection(&name);
+    }
+
     fn apply_favorite_cycle_nav(
         &mut self,
         ctx: &egui::Context,

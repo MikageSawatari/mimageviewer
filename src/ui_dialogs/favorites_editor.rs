@@ -412,10 +412,14 @@ impl App {
                         .show(ui, |ui| {
                             egui::Grid::new("fav_edit_grid")
                                 .striped(true)
-                                .num_columns(5)
+                                .num_columns(6)
                                 .spacing([8.0, 4.0])
                                 .show(ui, |ui| {
-                                    // ── ヘッダ (6→5 列に圧縮、状態は各索引列にインライン) ──
+                                    // ── ヘッダ (状態は各索引列にインライン) ──
+                                    ui.label(egui::RichText::new("番号").strong())
+                                        .on_hover_text(
+                                            "操作カスタマイズの「お気に入り1を開く」などで使う順番です。",
+                                        );
                                     ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
                                     ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
@@ -440,6 +444,12 @@ impl App {
                                     for i in 0..n {
                                         let fav_id = self.settings.favorites[i].id;
                                         let fav_path = self.settings.favorites[i].path.clone();
+
+                                        ui.label(
+                                            egui::RichText::new((i + 1).to_string())
+                                                .monospace()
+                                                .weak(),
+                                        );
 
                                         // 表示名 (編集可能) — 変更を検出したら即 save
                                         let name_resp = ui.add_sized(

@@ -68,16 +68,31 @@ impl App {
                     .show(ui, |ui| {
                         egui::Grid::new("tag_edit_grid")
                             .striped(true)
-                            .num_columns(4)
+                            .num_columns(5)
                             .spacing([8.0, 4.0])
                             .show(ui, |ui| {
+                                ui.label(egui::RichText::new("番号").strong()).on_hover_text(
+                                    "ピン留めタグ1〜20のコマンドで使う順番です。ピン留めしていないタグは番号なしです。",
+                                );
                                 ui.label(egui::RichText::new("タグ名").strong());
                                 ui.label(egui::RichText::new("プレビュー").strong());
                                 ui.label(egui::RichText::new("表示").strong());
                                 ui.label(egui::RichText::new("操作").strong());
                                 ui.end_row();
 
+                                let mut pinned_number = 0usize;
                                 for i in 0..n {
+                                    let number_label =
+                                        if self.tag_editor_draft[i].show_shortcut {
+                                            pinned_number += 1;
+                                            pinned_number.to_string()
+                                        } else {
+                                            "-".to_string()
+                                        };
+                                    ui.label(
+                                        egui::RichText::new(number_label).monospace().weak(),
+                                    );
+
                                     let resp = ui.add_sized(
                                         [200.0, 20.0],
                                         egui::TextEdit::singleline(

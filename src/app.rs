@@ -6,7 +6,7 @@ use std::sync::{
     mpsc,
 };
 
-use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS};
+use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS};
 
 mod cache_ops;
 mod color_filter;
@@ -18446,6 +18446,14 @@ impl App {
             {
                 return Some(nav);
             }
+            return None;
+        }
+
+        if let Some(action) =
+            self.keymap
+                .consume_first_action(ctx, &[CommandScope::Grid], PINNED_TAG_ACTIONS)
+        {
+            self.apply_pinned_tag_key_action(action, "grid-pinned-tag-key");
             return None;
         }
 

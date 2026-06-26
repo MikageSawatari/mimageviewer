@@ -690,7 +690,7 @@ native 動画 overlay の top bar / bottom HUD /
 jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は実割り当てに追従する。
 グリッドの Backspace 親フォルダ移動、グリッド / フルスクリーンの F11 系ウィンドウ切り替え、
 お気に入りの前後移動・1〜20 番、`C:\`〜`Z:\`、場所▼で開ける固定項目も
-keymap 対象にする。`Esc` / `Enter` / 修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、
+keymap 対象にする。ピン留めタグ 1〜20 番の付与/解除も、標準キーなしのサムネイル一覧コマンドとして割り当てできる。`Esc` / `Enter` / 修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、
 Ctrl+ホイールなど固定扱いの入力は従来どおり。
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
 表示する。keymap 化済み操作は現在の実割り当てで表示し、Enter / 矢印など当面固定扱いの

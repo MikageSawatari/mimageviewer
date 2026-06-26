@@ -1204,6 +1204,26 @@ pub enum KeyAction {
     GridOpenLocationDesktop,
     GridOpenLocationPictures,
     GridOpenLocationDownloads,
+    GridTogglePinnedTag1,
+    GridTogglePinnedTag2,
+    GridTogglePinnedTag3,
+    GridTogglePinnedTag4,
+    GridTogglePinnedTag5,
+    GridTogglePinnedTag6,
+    GridTogglePinnedTag7,
+    GridTogglePinnedTag8,
+    GridTogglePinnedTag9,
+    GridTogglePinnedTag10,
+    GridTogglePinnedTag11,
+    GridTogglePinnedTag12,
+    GridTogglePinnedTag13,
+    GridTogglePinnedTag14,
+    GridTogglePinnedTag15,
+    GridTogglePinnedTag16,
+    GridTogglePinnedTag17,
+    GridTogglePinnedTag18,
+    GridTogglePinnedTag19,
+    GridTogglePinnedTag20,
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
@@ -1544,6 +1564,26 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenLocationDesktop,
     KeyAction::GridOpenLocationPictures,
     KeyAction::GridOpenLocationDownloads,
+    KeyAction::GridTogglePinnedTag1,
+    KeyAction::GridTogglePinnedTag2,
+    KeyAction::GridTogglePinnedTag3,
+    KeyAction::GridTogglePinnedTag4,
+    KeyAction::GridTogglePinnedTag5,
+    KeyAction::GridTogglePinnedTag6,
+    KeyAction::GridTogglePinnedTag7,
+    KeyAction::GridTogglePinnedTag8,
+    KeyAction::GridTogglePinnedTag9,
+    KeyAction::GridTogglePinnedTag10,
+    KeyAction::GridTogglePinnedTag11,
+    KeyAction::GridTogglePinnedTag12,
+    KeyAction::GridTogglePinnedTag13,
+    KeyAction::GridTogglePinnedTag14,
+    KeyAction::GridTogglePinnedTag15,
+    KeyAction::GridTogglePinnedTag16,
+    KeyAction::GridTogglePinnedTag17,
+    KeyAction::GridTogglePinnedTag18,
+    KeyAction::GridTogglePinnedTag19,
+    KeyAction::GridTogglePinnedTag20,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
@@ -2464,6 +2504,31 @@ const DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
     KeyAction::GridOpenDriveZ,
 ];
 
+const PINNED_TAG_ACTIONS_ARRAY: [KeyAction; 20] = [
+    KeyAction::GridTogglePinnedTag1,
+    KeyAction::GridTogglePinnedTag2,
+    KeyAction::GridTogglePinnedTag3,
+    KeyAction::GridTogglePinnedTag4,
+    KeyAction::GridTogglePinnedTag5,
+    KeyAction::GridTogglePinnedTag6,
+    KeyAction::GridTogglePinnedTag7,
+    KeyAction::GridTogglePinnedTag8,
+    KeyAction::GridTogglePinnedTag9,
+    KeyAction::GridTogglePinnedTag10,
+    KeyAction::GridTogglePinnedTag11,
+    KeyAction::GridTogglePinnedTag12,
+    KeyAction::GridTogglePinnedTag13,
+    KeyAction::GridTogglePinnedTag14,
+    KeyAction::GridTogglePinnedTag15,
+    KeyAction::GridTogglePinnedTag16,
+    KeyAction::GridTogglePinnedTag17,
+    KeyAction::GridTogglePinnedTag18,
+    KeyAction::GridTogglePinnedTag19,
+    KeyAction::GridTogglePinnedTag20,
+];
+
+pub const PINNED_TAG_ACTIONS: &[KeyAction] = &PINNED_TAG_ACTIONS_ARRAY;
+
 pub const LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
@@ -2575,6 +2640,17 @@ impl KeyAction {
             .map(|idx| (b'C' + idx as u8) as char)
     }
 
+    pub fn pinned_tag_slot_action(slot: usize) -> Option<Self> {
+        PINNED_TAG_ACTIONS_ARRAY.get(slot.checked_sub(1)?).copied()
+    }
+
+    pub fn pinned_tag_slot_number(self) -> Option<usize> {
+        PINNED_TAG_ACTIONS_ARRAY
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
     pub fn location_rating_stars(self) -> Option<u8> {
         match self {
             Self::GridOpenLocationRating1 => Some(1),
@@ -2646,6 +2722,31 @@ impl KeyAction {
                 _ => unreachable!("drive letter is constrained to C..=Z"),
             };
         }
+        if let Some(slot) = self.pinned_tag_slot_number() {
+            return match slot {
+                1 => "GridTogglePinnedTag1",
+                2 => "GridTogglePinnedTag2",
+                3 => "GridTogglePinnedTag3",
+                4 => "GridTogglePinnedTag4",
+                5 => "GridTogglePinnedTag5",
+                6 => "GridTogglePinnedTag6",
+                7 => "GridTogglePinnedTag7",
+                8 => "GridTogglePinnedTag8",
+                9 => "GridTogglePinnedTag9",
+                10 => "GridTogglePinnedTag10",
+                11 => "GridTogglePinnedTag11",
+                12 => "GridTogglePinnedTag12",
+                13 => "GridTogglePinnedTag13",
+                14 => "GridTogglePinnedTag14",
+                15 => "GridTogglePinnedTag15",
+                16 => "GridTogglePinnedTag16",
+                17 => "GridTogglePinnedTag17",
+                18 => "GridTogglePinnedTag18",
+                19 => "GridTogglePinnedTag19",
+                20 => "GridTogglePinnedTag20",
+                _ => unreachable!("pinned tag slot is constrained to 1..=20"),
+            };
+        }
         match self {
             GlobalLocalSearch => "GlobalLocalSearch",
             GlobalFavSearch => "GlobalFavSearch",
@@ -2655,18 +2756,71 @@ impl KeyAction {
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridFavoritePrev => "GridFavoritePrev",
             GridFavoriteNext => "GridFavoriteNext",
-            GridOpenFavorite1 | GridOpenFavorite2 | GridOpenFavorite3 | GridOpenFavorite4
-            | GridOpenFavorite5 | GridOpenFavorite6 | GridOpenFavorite7 | GridOpenFavorite8
-            | GridOpenFavorite9 | GridOpenFavorite10 | GridOpenFavorite11 | GridOpenFavorite12
-            | GridOpenFavorite13 | GridOpenFavorite14 | GridOpenFavorite15 | GridOpenFavorite16
-            | GridOpenFavorite17 | GridOpenFavorite18 | GridOpenFavorite19 | GridOpenFavorite20
-            | GridOpenDriveC | GridOpenDriveD | GridOpenDriveE | GridOpenDriveF
-            | GridOpenDriveG | GridOpenDriveH | GridOpenDriveI | GridOpenDriveJ
-            | GridOpenDriveK | GridOpenDriveL | GridOpenDriveM | GridOpenDriveN
-            | GridOpenDriveO | GridOpenDriveP | GridOpenDriveQ | GridOpenDriveR
-            | GridOpenDriveS | GridOpenDriveT | GridOpenDriveU | GridOpenDriveV
-            | GridOpenDriveW | GridOpenDriveX | GridOpenDriveY | GridOpenDriveZ => {
-                unreachable!("handled by compact location helpers")
+            GridOpenFavorite1
+            | GridOpenFavorite2
+            | GridOpenFavorite3
+            | GridOpenFavorite4
+            | GridOpenFavorite5
+            | GridOpenFavorite6
+            | GridOpenFavorite7
+            | GridOpenFavorite8
+            | GridOpenFavorite9
+            | GridOpenFavorite10
+            | GridOpenFavorite11
+            | GridOpenFavorite12
+            | GridOpenFavorite13
+            | GridOpenFavorite14
+            | GridOpenFavorite15
+            | GridOpenFavorite16
+            | GridOpenFavorite17
+            | GridOpenFavorite18
+            | GridOpenFavorite19
+            | GridOpenFavorite20
+            | GridOpenDriveC
+            | GridOpenDriveD
+            | GridOpenDriveE
+            | GridOpenDriveF
+            | GridOpenDriveG
+            | GridOpenDriveH
+            | GridOpenDriveI
+            | GridOpenDriveJ
+            | GridOpenDriveK
+            | GridOpenDriveL
+            | GridOpenDriveM
+            | GridOpenDriveN
+            | GridOpenDriveO
+            | GridOpenDriveP
+            | GridOpenDriveQ
+            | GridOpenDriveR
+            | GridOpenDriveS
+            | GridOpenDriveT
+            | GridOpenDriveU
+            | GridOpenDriveV
+            | GridOpenDriveW
+            | GridOpenDriveX
+            | GridOpenDriveY
+            | GridOpenDriveZ
+            | GridTogglePinnedTag1
+            | GridTogglePinnedTag2
+            | GridTogglePinnedTag3
+            | GridTogglePinnedTag4
+            | GridTogglePinnedTag5
+            | GridTogglePinnedTag6
+            | GridTogglePinnedTag7
+            | GridTogglePinnedTag8
+            | GridTogglePinnedTag9
+            | GridTogglePinnedTag10
+            | GridTogglePinnedTag11
+            | GridTogglePinnedTag12
+            | GridTogglePinnedTag13
+            | GridTogglePinnedTag14
+            | GridTogglePinnedTag15
+            | GridTogglePinnedTag16
+            | GridTogglePinnedTag17
+            | GridTogglePinnedTag18
+            | GridTogglePinnedTag19
+            | GridTogglePinnedTag20 => {
+                unreachable!("handled by compact slot helpers")
             }
             GridOpenLocationDriveList => "GridOpenLocationDriveList",
             GridOpenLocationReadingHistory => "GridOpenLocationReadingHistory",
@@ -3019,6 +3173,31 @@ impl KeyAction {
                 _ => unreachable!("drive letter is constrained to C..=Z"),
             };
         }
+        if let Some(slot) = self.pinned_tag_slot_number() {
+            return match slot {
+                1 => "ピン留めタグ1を付与/解除する",
+                2 => "ピン留めタグ2を付与/解除する",
+                3 => "ピン留めタグ3を付与/解除する",
+                4 => "ピン留めタグ4を付与/解除する",
+                5 => "ピン留めタグ5を付与/解除する",
+                6 => "ピン留めタグ6を付与/解除する",
+                7 => "ピン留めタグ7を付与/解除する",
+                8 => "ピン留めタグ8を付与/解除する",
+                9 => "ピン留めタグ9を付与/解除する",
+                10 => "ピン留めタグ10を付与/解除する",
+                11 => "ピン留めタグ11を付与/解除する",
+                12 => "ピン留めタグ12を付与/解除する",
+                13 => "ピン留めタグ13を付与/解除する",
+                14 => "ピン留めタグ14を付与/解除する",
+                15 => "ピン留めタグ15を付与/解除する",
+                16 => "ピン留めタグ16を付与/解除する",
+                17 => "ピン留めタグ17を付与/解除する",
+                18 => "ピン留めタグ18を付与/解除する",
+                19 => "ピン留めタグ19を付与/解除する",
+                20 => "ピン留めタグ20を付与/解除する",
+                _ => unreachable!("pinned tag slot is constrained to 1..=20"),
+            };
+        }
         match self {
             GlobalLocalSearch => "現在地の一覧を絞り込み検索する",
             GlobalFavSearch => "お気に入りフォルダを横断検索する",
@@ -3028,18 +3207,71 @@ impl KeyAction {
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
-            GridOpenFavorite1 | GridOpenFavorite2 | GridOpenFavorite3 | GridOpenFavorite4
-            | GridOpenFavorite5 | GridOpenFavorite6 | GridOpenFavorite7 | GridOpenFavorite8
-            | GridOpenFavorite9 | GridOpenFavorite10 | GridOpenFavorite11 | GridOpenFavorite12
-            | GridOpenFavorite13 | GridOpenFavorite14 | GridOpenFavorite15 | GridOpenFavorite16
-            | GridOpenFavorite17 | GridOpenFavorite18 | GridOpenFavorite19 | GridOpenFavorite20
-            | GridOpenDriveC | GridOpenDriveD | GridOpenDriveE | GridOpenDriveF
-            | GridOpenDriveG | GridOpenDriveH | GridOpenDriveI | GridOpenDriveJ
-            | GridOpenDriveK | GridOpenDriveL | GridOpenDriveM | GridOpenDriveN
-            | GridOpenDriveO | GridOpenDriveP | GridOpenDriveQ | GridOpenDriveR
-            | GridOpenDriveS | GridOpenDriveT | GridOpenDriveU | GridOpenDriveV
-            | GridOpenDriveW | GridOpenDriveX | GridOpenDriveY | GridOpenDriveZ => {
-                unreachable!("handled by compact location helpers")
+            GridOpenFavorite1
+            | GridOpenFavorite2
+            | GridOpenFavorite3
+            | GridOpenFavorite4
+            | GridOpenFavorite5
+            | GridOpenFavorite6
+            | GridOpenFavorite7
+            | GridOpenFavorite8
+            | GridOpenFavorite9
+            | GridOpenFavorite10
+            | GridOpenFavorite11
+            | GridOpenFavorite12
+            | GridOpenFavorite13
+            | GridOpenFavorite14
+            | GridOpenFavorite15
+            | GridOpenFavorite16
+            | GridOpenFavorite17
+            | GridOpenFavorite18
+            | GridOpenFavorite19
+            | GridOpenFavorite20
+            | GridOpenDriveC
+            | GridOpenDriveD
+            | GridOpenDriveE
+            | GridOpenDriveF
+            | GridOpenDriveG
+            | GridOpenDriveH
+            | GridOpenDriveI
+            | GridOpenDriveJ
+            | GridOpenDriveK
+            | GridOpenDriveL
+            | GridOpenDriveM
+            | GridOpenDriveN
+            | GridOpenDriveO
+            | GridOpenDriveP
+            | GridOpenDriveQ
+            | GridOpenDriveR
+            | GridOpenDriveS
+            | GridOpenDriveT
+            | GridOpenDriveU
+            | GridOpenDriveV
+            | GridOpenDriveW
+            | GridOpenDriveX
+            | GridOpenDriveY
+            | GridOpenDriveZ
+            | GridTogglePinnedTag1
+            | GridTogglePinnedTag2
+            | GridTogglePinnedTag3
+            | GridTogglePinnedTag4
+            | GridTogglePinnedTag5
+            | GridTogglePinnedTag6
+            | GridTogglePinnedTag7
+            | GridTogglePinnedTag8
+            | GridTogglePinnedTag9
+            | GridTogglePinnedTag10
+            | GridTogglePinnedTag11
+            | GridTogglePinnedTag12
+            | GridTogglePinnedTag13
+            | GridTogglePinnedTag14
+            | GridTogglePinnedTag15
+            | GridTogglePinnedTag16
+            | GridTogglePinnedTag17
+            | GridTogglePinnedTag18
+            | GridTogglePinnedTag19
+            | GridTogglePinnedTag20 => {
+                unreachable!("handled by compact slot helpers")
             }
             GridOpenLocationDriveList => "ドライブ一覧を開く",
             GridOpenLocationReadingHistory => "読書履歴を開く",
@@ -3395,6 +3627,26 @@ impl KeyAction {
             | GridOpenLocationDesktop
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
+            | GridTogglePinnedTag1
+            | GridTogglePinnedTag2
+            | GridTogglePinnedTag3
+            | GridTogglePinnedTag4
+            | GridTogglePinnedTag5
+            | GridTogglePinnedTag6
+            | GridTogglePinnedTag7
+            | GridTogglePinnedTag8
+            | GridTogglePinnedTag9
+            | GridTogglePinnedTag10
+            | GridTogglePinnedTag11
+            | GridTogglePinnedTag12
+            | GridTogglePinnedTag13
+            | GridTogglePinnedTag14
+            | GridTogglePinnedTag15
+            | GridTogglePinnedTag16
+            | GridTogglePinnedTag17
+            | GridTogglePinnedTag18
+            | GridTogglePinnedTag19
+            | GridTogglePinnedTag20
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -3697,6 +3949,26 @@ impl KeyAction {
             | GridOpenLocationDesktop
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
+            | GridTogglePinnedTag1
+            | GridTogglePinnedTag2
+            | GridTogglePinnedTag3
+            | GridTogglePinnedTag4
+            | GridTogglePinnedTag5
+            | GridTogglePinnedTag6
+            | GridTogglePinnedTag7
+            | GridTogglePinnedTag8
+            | GridTogglePinnedTag9
+            | GridTogglePinnedTag10
+            | GridTogglePinnedTag11
+            | GridTogglePinnedTag12
+            | GridTogglePinnedTag13
+            | GridTogglePinnedTag14
+            | GridTogglePinnedTag15
+            | GridTogglePinnedTag16
+            | GridTogglePinnedTag17
+            | GridTogglePinnedTag18
+            | GridTogglePinnedTag19
+            | GridTogglePinnedTag20
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -4033,7 +4305,27 @@ impl KeyAction {
             | GridOpenLocationBooksRoot
             | GridOpenLocationDesktop
             | GridOpenLocationPictures
-            | GridOpenLocationDownloads => ChordList::EMPTY,
+            | GridOpenLocationDownloads
+            | GridTogglePinnedTag1
+            | GridTogglePinnedTag2
+            | GridTogglePinnedTag3
+            | GridTogglePinnedTag4
+            | GridTogglePinnedTag5
+            | GridTogglePinnedTag6
+            | GridTogglePinnedTag7
+            | GridTogglePinnedTag8
+            | GridTogglePinnedTag9
+            | GridTogglePinnedTag10
+            | GridTogglePinnedTag11
+            | GridTogglePinnedTag12
+            | GridTogglePinnedTag13
+            | GridTogglePinnedTag14
+            | GridTogglePinnedTag15
+            | GridTogglePinnedTag16
+            | GridTogglePinnedTag17
+            | GridTogglePinnedTag18
+            | GridTogglePinnedTag19
+            | GridTogglePinnedTag20 => ChordList::EMPTY,
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -5962,6 +6254,14 @@ fn next_legacy_keymap_backup_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn native_video_shortcut_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("native video shortcut test lock poisoned")
+    }
+
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
@@ -6829,6 +7129,22 @@ mod tests {
             KeyAction::drive_action('Z'),
             Some(KeyAction::GridOpenDriveZ)
         );
+        assert_eq!(
+            KeyAction::GridTogglePinnedTag1.pinned_tag_slot_number(),
+            Some(1)
+        );
+        assert_eq!(
+            KeyAction::GridTogglePinnedTag20.pinned_tag_slot_number(),
+            Some(20)
+        );
+        assert_eq!(
+            KeyAction::pinned_tag_slot_action(1),
+            Some(KeyAction::GridTogglePinnedTag1)
+        );
+        assert_eq!(
+            KeyAction::pinned_tag_slot_action(20),
+            Some(KeyAction::GridTogglePinnedTag20)
+        );
 
         for action in LOCATION_NAVIGATION_ACTIONS {
             assert_eq!(action.context(), KeyContext::Grid);
@@ -6836,11 +7152,18 @@ mod tests {
             assert!(action.default_chords().is_empty());
             assert!(action.is_location_navigation_action());
         }
+        for action in PINNED_TAG_ACTIONS {
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert!(!action.is_location_navigation_action());
+        }
 
         let keymap = Keymap::from_ini_str(
             r#"
             [Grid]
             GridOpenDriveC = Y
+            GridTogglePinnedTag1 = U
             "#,
         );
         assert!(keymap.warnings().is_empty());
@@ -6857,6 +7180,22 @@ mod tests {
                 Chord::key(KeyName::Y),
                 FS_VIDEO_ACTIVE_SCOPES,
                 LOCATION_NAVIGATION_ACTIONS,
+            ),
+            None
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::U),
+                GRID_ACTIVE_SCOPES,
+                PINNED_TAG_ACTIONS,
+            ),
+            Some(KeyAction::GridTogglePinnedTag1)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::U),
+                FS_IMAGE_ACTIVE_SCOPES,
+                PINNED_TAG_ACTIONS,
             ),
             None
         );
@@ -7695,6 +8034,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_context_help_keydown_follows_keymap() {
+        let _guard = native_video_shortcut_test_guard();
         Keymap::empty().install_global_native_video_shortcuts();
         let mut event = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0xBF,
@@ -7762,6 +8102,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_window_mode_shortcut_follows_keymap() {
+        let _guard = native_video_shortcut_test_guard();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             virtual_key,
             scan_code: 0,
@@ -7799,6 +8140,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_fs_common_shortcuts_follow_keymap() {
+        let _guard = native_video_shortcut_test_guard();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             virtual_key,
             scan_code: 0,
