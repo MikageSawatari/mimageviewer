@@ -568,6 +568,11 @@ impl App {
         // Shift を使わない理由: 回転の [/] は Shift+ で論理キーが {/} に化けて
         // Key::OpenBracket/CloseBracket にマッチしないため Ctrl にせざるを得ない。
         // 揃えないと覚えにくいので矢印キーもあわせて Ctrl に統一。
+        // フルスクリーンビューポートでは egui の modifier 状態が stale になり得るため、
+        // 補正レイヤーと同じく Windows では OS の実キー状態を正にする。
+        #[cfg(windows)]
+        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
+        #[cfg(not(windows))]
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 
         // 矢印キー: 平行移動 (Ctrl で 10px)

@@ -566,6 +566,11 @@ impl App {
             self.show_feedback_toast("[ベクタ削除]".to_string());
         }
 
+        // フルスクリーンビューポートでは egui の modifier 状態が stale になり得るため、
+        // 補正レイヤーと同じく Windows では OS の実キー状態を正にする。
+        #[cfg(windows)]
+        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
+        #[cfg(not(windows))]
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 
         // 矢印キー: 平行移動 (Ctrl で 10px)
