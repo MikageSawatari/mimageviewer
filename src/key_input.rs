@@ -36,6 +36,7 @@ struct KeyInputState {
     pending: VecDeque<KeyEdge>,
     frame: Vec<KeyEdge>,
     frame_active: bool,
+    frame_had_key_down: bool,
 }
 
 fn state() -> &'static Mutex<KeyInputState> {
@@ -75,6 +76,7 @@ pub fn begin_frame() {
         while let Some(edge) = guard.pending.pop_front() {
             guard.frame.push(edge);
         }
+        guard.frame_had_key_down = guard.frame.iter().any(|edge| edge.pressed);
         guard.frame_active = guard.installed_hwnd != 0;
     }
 }
@@ -83,6 +85,13 @@ pub fn is_frame_active() -> bool {
     state()
         .lock()
         .map(|guard| guard.frame_active)
+        .unwrap_or(false)
+}
+
+pub fn frame_had_key_down() -> bool {
+    state()
+        .lock()
+        .map(|guard| guard.frame_had_key_down)
         .unwrap_or(false)
 }
 
@@ -168,6 +177,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
         guard.pending.clear();
         guard.frame.clear();
         guard.frame_active = false;
+        guard.frame_had_key_down = false;
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }

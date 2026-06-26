@@ -5422,9 +5422,11 @@ impl Keymap {
             if ctx.wants_keyboard_input() {
                 return false;
             }
-            return crate::key_input::consume_key_down(allow_repeat, |edge| {
-                chord.matches_key_edge(edge)
-            });
+            if crate::key_input::frame_had_key_down() {
+                return crate::key_input::consume_key_down(allow_repeat, |edge| {
+                    chord.matches_key_edge(edge)
+                });
+            }
         }
         ctx.input_mut(|i| {
             let mut found = false;
@@ -5458,7 +5460,9 @@ impl Keymap {
             if ctx.wants_keyboard_input() {
                 return false;
             }
-            return crate::key_input::pressed_key_down(|edge| chord.matches_key_edge(edge));
+            if crate::key_input::frame_had_key_down() {
+                return crate::key_input::pressed_key_down(|edge| chord.matches_key_edge(edge));
+            }
         }
         ctx.input(|i| {
             i.events.iter().any(|event| {
