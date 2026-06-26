@@ -15235,6 +15235,8 @@ mod native_video_rating_key_tests {
     ) -> crate::video::native_window::NativeVideoKeyEvent {
         crate::video::native_window::NativeVideoKeyEvent {
             virtual_key,
+            scan_code: 0,
+            extended: false,
             shift,
             ctrl: false,
             alt: false,

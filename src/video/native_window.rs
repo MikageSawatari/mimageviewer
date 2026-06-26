@@ -39,6 +39,8 @@ use windows::core::w;
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoKeyEvent {
     pub virtual_key: u32,
+    pub scan_code: u16,
+    pub extended: bool,
     pub shift: bool,
     pub ctrl: bool,
     pub alt: bool,
@@ -845,6 +847,8 @@ unsafe extern "system" fn wnd_proc(
             {
                 let _ = tx.send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
                     virtual_key: vk,
+                    scan_code: 0,
+                    extended: false,
                     shift: false,
                     ctrl: false,
                     alt: false,
@@ -1176,8 +1180,11 @@ fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+    let raw = lparam.0 as u64;
     NativeVideoKeyEvent {
         virtual_key: wparam.0 as u32,
+        scan_code: ((raw >> 16) & 0xff) as u16,
+        extended: (raw & (1 << 24)) != 0,
         shift,
         ctrl,
         alt,

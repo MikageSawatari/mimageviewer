@@ -8349,6 +8349,8 @@ mod tests {
     fn key(virtual_key: u32) -> NativeVideoKeyEvent {
         NativeVideoKeyEvent {
             virtual_key,
+            scan_code: 0,
+            extended: false,
             shift: false,
             ctrl: false,
             alt: false,

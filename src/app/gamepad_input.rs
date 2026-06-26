@@ -5255,6 +5255,8 @@ impl App {
     ) {
         let key = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key,
+            scan_code: 0,
+            extended: false,
             shift,
             ctrl,
             alt: false,

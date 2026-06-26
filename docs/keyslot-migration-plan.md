@@ -14,16 +14,16 @@ v2.2.0 の操作カスタマイズはまだ未リリースなので、保存語�
 
 ### 1. キーの正本を KeySlot にする
 
-`Chord { ctrl, shift, alt, key }` の `key` は、文字ではなく「物理的なキー位置」を表す `KeySlot` を持つ。保存・入力名は既存互換を優先し、メイン数字は従来どおり `1` / `2` など、テンキーは `Num1` / `Num2` などで明示する。parser は `Digit1` / `Numpad1` のような別名も受け付ける。
+`Chord { ctrl, shift, alt, key }` の `key` は、文字ではなく「物理的なキー位置」を表す `KeySlot` を持つ。保存・入力名は既存互換を優先し、メイン数字は従来どおり `1` / `2` など、テンキーは `Numpad1` / `Numpad2` などで明示する。parser は `Digit1` のような別名も受け付ける。
 
 ただし UI 表示はユーザーに見えるラベルを使う。
 
 - `Num1` / `Digit1` は `1`
-- `Numpad1` は `Num1`
+- `Numpad1` は `Numpad1`
 - `JisAt` は `@`
 - `IntlYen` は `¥`
 
-旧 `Num1` などの名前は、未リリース中の互換補助として parser でメイン数字キーへ読む。新しく生成する `keymap.ini.default` や設定保存では、メイン数字は `1`、テンキーは `Num1` のように表示する。
+旧 `Num1` などの名前は、既存 keymap.ini 互換補助として parser でメイン数字キーへ読む。新しく生成する `keymap.ini.default` や設定保存では、メイン数字は `1`、テンキーは `Numpad1` のように表示する。
 
 ### 2. 入力トランスポートは Win32 の key edge queue
 
@@ -61,15 +61,15 @@ Win32 key queue は mIV 内部のショートカット判定用であり、Windo
 
 ### 5. 数字キーの既定割り当て
 
-既存挙動との互換性を優先し、従来 `1` などに割り当てられていたコマンドは、既定では `Digit1` と `Numpad1` の両方を割り当てる。
+既存挙動との互換性を優先し、従来 `1` などに割り当てられていたコマンドは、既定ではメイン数字キー (`1`) と `Numpad1` の両方を割り当てる。
 
 ユーザーは操作カスタマイズで片方を解除し、テンキーだけ別機能へ割り当てられる。
 
 例:
 
 ```ini
-FsSpreadSingle = 1, Num1
-FsSpreadLtr = 2, Num2
+FsSpreadSingle = 1, Numpad1
+FsSpreadLtr = 2, Numpad2
 ```
 
 ### 6. native 動画との統一
@@ -83,13 +83,13 @@ native 動画 presenter は既に Win32 virtual key を受け取っている。`
 1. `KeySlot` 型と parser / display / Win32 matcher を追加し、`Chord.key` を `Option<KeySlot>` にする。（実装済み）
 2. 数字キー既定割り当てをメイン数字 + テンキーに更新し、`keymap.ini.default` を再生成する。（実装済み）
 3. メイン HWND に key edge queue を登録し、`Keymap::consume_action` / `pressed_action` / キャプチャを queue から読む。（実装済み）
-4. native 動画の key event に scan / extended を追加し、`matches_vk_action` を `matches_key_slot_action` へ寄せる。
+4. native 動画の key event に scan / extended を追加し、`matches_vk_action` を `KeySlot` 判定へ寄せる。（実装済み）
 5. 操作カスタマイズのキーボード図を `KeySlot` ベースにし、日本語キーボード配列とテンキーを表示する。
 6. docs / tests を更新する。
 
 ## 実機確認ポイント
 
-- `Digit1` と `Numpad1` が別々にキャプチャされる。
+- メイン数字キー `1` と `Numpad1` が別々にキャプチャされる。
 - 既定状態では、従来 `1` で動いていた操作がテンキー `1` でも動く。
 - `^` / `@` / `¥` / `ろ` がキーボード図から割り当てられ、実キーで発火する。
 - Shift+数字は `Shift+Digit*` として、配列に関係なく物理数字キーで発火する。

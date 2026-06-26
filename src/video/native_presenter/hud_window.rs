@@ -926,6 +926,8 @@ unsafe extern "system" fn hud_wnd_proc(
                     .event_tx
                     .send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
                         virtual_key: vk,
+                        scan_code: 0,
+                        extended: false,
                         shift: false,
                         ctrl: false,
                         alt: false,

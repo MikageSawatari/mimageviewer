@@ -809,6 +809,8 @@ fn native_video_key_events_from_ctx(
                     native_video_vk_from_egui_key(*key).map(|virtual_key| {
                         crate::video::native_window::NativeVideoKeyEvent {
                             virtual_key,
+                            scan_code: 0,
+                            extended: false,
                             shift: modifiers.shift,
                             ctrl: modifiers.ctrl,
                             alt: modifiers.alt,

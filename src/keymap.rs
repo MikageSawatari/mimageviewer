@@ -275,7 +275,7 @@ impl KeySlot {
             "NUMPAD7" | "NP7" => KeyName::Numpad7,
             "NUMPAD8" | "NP8" => KeyName::Numpad8,
             "NUMPAD9" | "NP9" => KeyName::Numpad9,
-            "NUMPADADD" | "NUMADD" | "NPADD" => KeyName::NumpadAdd,
+            "NUMPADADD" | "NUMADD" | "NPADD" | "NUMPADPLUS" | "NPPLUS" => KeyName::NumpadAdd,
             "NUMPADSUBTRACT" | "NUMSUBTRACT" | "NPSUBTRACT" | "NUMPADMINUS" | "NPMINUS" => {
                 KeyName::NumpadSubtract
             }
@@ -812,21 +812,21 @@ impl KeySlot {
             KeyName::Num7 => "7",
             KeyName::Num8 => "8",
             KeyName::Num9 => "9",
-            KeyName::Numpad0 => "Num0",
-            KeyName::Numpad1 => "Num1",
-            KeyName::Numpad2 => "Num2",
-            KeyName::Numpad3 => "Num3",
-            KeyName::Numpad4 => "Num4",
-            KeyName::Numpad5 => "Num5",
-            KeyName::Numpad6 => "Num6",
-            KeyName::Numpad7 => "Num7",
-            KeyName::Numpad8 => "Num8",
-            KeyName::Numpad9 => "Num9",
-            KeyName::NumpadAdd => "Num+",
-            KeyName::NumpadSubtract => "Num-",
-            KeyName::NumpadMultiply => "Num*",
-            KeyName::NumpadDivide => "Num/",
-            KeyName::NumpadDecimal => "Num.",
+            KeyName::Numpad0 => "Numpad0",
+            KeyName::Numpad1 => "Numpad1",
+            KeyName::Numpad2 => "Numpad2",
+            KeyName::Numpad3 => "Numpad3",
+            KeyName::Numpad4 => "Numpad4",
+            KeyName::Numpad5 => "Numpad5",
+            KeyName::Numpad6 => "Numpad6",
+            KeyName::Numpad7 => "Numpad7",
+            KeyName::Numpad8 => "Numpad8",
+            KeyName::Numpad9 => "Numpad9",
+            KeyName::NumpadAdd => "NumpadAdd",
+            KeyName::NumpadSubtract => "NumpadSubtract",
+            KeyName::NumpadMultiply => "NumpadMultiply",
+            KeyName::NumpadDivide => "NumpadDivide",
+            KeyName::NumpadDecimal => "NumpadDecimal",
             KeyName::F1 => "F1",
             KeyName::F2 => "F2",
             KeyName::F3 => "F3",
@@ -973,13 +973,32 @@ impl Chord {
             && self.alt == alt
     }
 
+    fn matches_win32_parts(
+        self,
+        virtual_key: u32,
+        scan_code: u16,
+        extended: bool,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> bool {
+        self.key
+            .is_some_and(|name| name.matches_win32(virtual_key, scan_code, extended))
+            && self.ctrl == ctrl
+            && self.shift == shift
+            && self.alt == alt
+    }
+
     #[cfg(windows)]
     fn matches_key_edge(self, edge: crate::key_input::KeyEdge) -> bool {
-        self.key
-            .is_some_and(|name| name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended))
-            && self.ctrl == edge.ctrl
-            && self.shift == edge.shift
-            && self.alt == edge.alt
+        self.matches_win32_parts(
+            edge.virtual_key,
+            edge.scan_code,
+            edge.extended,
+            edge.ctrl,
+            edge.shift,
+            edge.alt,
+        )
     }
 
     fn validate_for_trigger(self, trigger: KeyTrigger) -> Result<(), &'static str> {
@@ -4980,7 +4999,21 @@ impl Keymap {
         action: KeyAction,
         key: &crate::video::native_window::NativeVideoKeyEvent,
     ) -> bool {
-        self.matches_vk_action_parts(action, key.virtual_key, key.ctrl, key.shift, key.alt)
+        debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        let matches = |chord: Chord| {
+            chord.matches_win32_parts(
+                key.virtual_key,
+                key.scan_code,
+                key.extended,
+                key.ctrl,
+                key.shift,
+                key.alt,
+            )
+        };
+        if let Some(chords) = self.overrides.get(&action) {
+            return chords.iter().copied().any(matches);
+        }
+        action.default_chords().iter().any(matches)
     }
 
     #[cfg(windows)]
@@ -6975,7 +7008,7 @@ mod tests {
         assert_eq!(KeyName::parse("Numpad0"), Some(KeyName::Numpad0));
         assert_eq!(KeyName::parse("Num1"), Some(KeyName::Num1));
         assert_eq!(KeyName::parse("1"), Some(KeyName::Num1));
-        assert_eq!(KeyName::Numpad1.display_name(), "Num1");
+        assert_eq!(KeyName::Numpad1.display_name(), "Numpad1");
         assert_eq!(KeyName::Numpad1.to_vk(), 0x61);
     }
 
@@ -7363,6 +7396,8 @@ mod tests {
         Keymap::empty().install_global_native_video_shortcuts();
         let mut event = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0xBF,
+            scan_code: 0,
+            extended: false,
             shift: true,
             ctrl: false,
             alt: false,
@@ -7389,6 +7424,8 @@ mod tests {
 
         let shift_slash = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0xBF,
+            scan_code: 0,
+            extended: false,
             shift: true,
             ctrl: false,
             alt: false,
@@ -7399,6 +7436,8 @@ mod tests {
 
         let f1 = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0x70,
+            scan_code: 0,
+            extended: false,
             shift: false,
             ctrl: false,
             alt: false,
@@ -7423,6 +7462,8 @@ mod tests {
     fn native_video_window_mode_shortcut_follows_keymap() {
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
             virtual_key,
+            scan_code: 0,
+            extended: false,
             shift: false,
             ctrl: false,
             alt: false,
@@ -7464,6 +7505,8 @@ mod tests {
         );
         let event = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0x51,
+            scan_code: 0,
+            extended: false,
             shift: false,
             ctrl: false,
             alt: false,
@@ -7483,12 +7526,56 @@ mod tests {
         );
         let event = crate::video::native_window::NativeVideoKeyEvent {
             virtual_key: 0x7F,
+            scan_code: 0,
+            extended: false,
             shift: false,
             ctrl: false,
             alt: false,
             repeat: false,
         };
         assert!(keymap.matches_vk_action(KeyAction::VideoMute, &event));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_key_slot_match_distinguishes_numpad_and_jis_keys() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsVideo]
+            VideoMute = Numpad1
+            VideoLoop = @
+            "#,
+        );
+        let numpad1 = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0x61,
+            scan_code: 0x4f,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let digit1 = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0x31,
+            scan_code: 0x02,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let jis_at = crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key: 0xC0,
+            scan_code: KeyName::JIS_AT_SCAN,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(keymap.matches_vk_action(KeyAction::VideoMute, &numpad1));
+        assert!(!keymap.matches_vk_action(KeyAction::VideoMute, &digit1));
+        assert!(keymap.matches_vk_action(KeyAction::VideoLoop, &jis_at));
     }
 
     #[test]
