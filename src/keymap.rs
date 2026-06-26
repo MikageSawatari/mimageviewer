@@ -108,7 +108,7 @@ pub enum ModKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum KeyName {
+pub enum KeySlot {
     A,
     B,
     C,
@@ -145,6 +145,21 @@ pub enum KeyName {
     Num7,
     Num8,
     Num9,
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadSubtract,
+    NumpadMultiply,
+    NumpadDivide,
+    NumpadDecimal,
     F1,
     F2,
     F3,
@@ -192,9 +207,15 @@ pub enum KeyName {
     Backslash,
     Slash,
     Minus,
+    JisCaret,
+    JisAt,
+    IntlYen,
+    IntlRo,
 }
 
-impl KeyName {
+pub type KeyName = KeySlot;
+
+impl KeySlot {
     pub fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if matches!(trimmed, "-" | "−") {
@@ -229,16 +250,37 @@ impl KeyName {
             "X" => KeyName::X,
             "Y" => KeyName::Y,
             "Z" => KeyName::Z,
-            "0" | "NUM0" | "DIGIT0" | "NUMPAD0" => KeyName::Num0,
-            "1" | "NUM1" | "DIGIT1" | "NUMPAD1" => KeyName::Num1,
-            "2" | "NUM2" | "DIGIT2" | "NUMPAD2" => KeyName::Num2,
-            "3" | "NUM3" | "DIGIT3" | "NUMPAD3" => KeyName::Num3,
-            "4" | "NUM4" | "DIGIT4" | "NUMPAD4" => KeyName::Num4,
-            "5" | "NUM5" | "DIGIT5" | "NUMPAD5" => KeyName::Num5,
-            "6" | "NUM6" | "DIGIT6" | "NUMPAD6" => KeyName::Num6,
-            "7" | "NUM7" | "DIGIT7" | "NUMPAD7" => KeyName::Num7,
-            "8" | "NUM8" | "DIGIT8" | "NUMPAD8" => KeyName::Num8,
-            "9" | "NUM9" | "DIGIT9" | "NUMPAD9" => KeyName::Num9,
+            "0" | "NUM0" | "DIGIT0" => KeyName::Num0,
+            "1" | "NUM1" | "DIGIT1" => KeyName::Num1,
+            "2" | "NUM2" | "DIGIT2" => KeyName::Num2,
+            "3" | "NUM3" | "DIGIT3" => KeyName::Num3,
+            "4" | "NUM4" | "DIGIT4" => KeyName::Num4,
+            "5" | "NUM5" | "DIGIT5" => KeyName::Num5,
+            "6" | "NUM6" | "DIGIT6" => KeyName::Num6,
+            "7" | "NUM7" | "DIGIT7" => KeyName::Num7,
+            "8" | "NUM8" | "DIGIT8" => KeyName::Num8,
+            "9" | "NUM9" | "DIGIT9" => KeyName::Num9,
+            "NUMPAD0" | "NP0" => KeyName::Numpad0,
+            "NUMPAD1" | "NP1" => KeyName::Numpad1,
+            "NUMPAD2" | "NP2" => KeyName::Numpad2,
+            "NUMPAD3" | "NP3" => KeyName::Numpad3,
+            "NUMPAD4" | "NP4" => KeyName::Numpad4,
+            "NUMPAD5" | "NP5" => KeyName::Numpad5,
+            "NUMPAD6" | "NP6" => KeyName::Numpad6,
+            "NUMPAD7" | "NP7" => KeyName::Numpad7,
+            "NUMPAD8" | "NP8" => KeyName::Numpad8,
+            "NUMPAD9" | "NP9" => KeyName::Numpad9,
+            "NUMPADADD" | "NUMADD" | "NPADD" => KeyName::NumpadAdd,
+            "NUMPADSUBTRACT" | "NUMSUBTRACT" | "NPSUBTRACT" | "NUMPADMINUS" | "NPMINUS" => {
+                KeyName::NumpadSubtract
+            }
+            "NUMPADMULTIPLY" | "NUMMULTIPLY" | "NPMULTIPLY" | "NUMPADASTERISK" | "NPASTERISK" => {
+                KeyName::NumpadMultiply
+            }
+            "NUMPADDIVIDE" | "NUMDIVIDE" | "NPDIVIDE" => KeyName::NumpadDivide,
+            "NUMPADDECIMAL" | "NUMDECIMAL" | "NPDECIMAL" | "NUMPADDOT" | "NPDOT" => {
+                KeyName::NumpadDecimal
+            }
             "F1" => KeyName::F1,
             "F2" => KeyName::F2,
             "F3" => KeyName::F3,
@@ -283,15 +325,19 @@ impl KeyName {
             ":" | "COLON" => KeyName::Colon,
             "," | "COMMA" => KeyName::Comma,
             "." | "PERIOD" | "DOT" => KeyName::Period,
-            "\\" | "BACKSLASH" | "YEN" => KeyName::Backslash,
+            "\\" | "BACKSLASH" => KeyName::Backslash,
             "/" | "SLASH" => KeyName::Slash,
             "MINUS" => KeyName::Minus,
+            "^" | "CARET" | "JISCARET" => KeyName::JisCaret,
+            "@" | "AT" | "JISAT" => KeyName::JisAt,
+            "YEN" | "¥" | "INTLYEN" | "JISYEN" => KeyName::IntlYen,
+            "RO" | "INTLRO" | "JISRO" => KeyName::IntlRo,
             _ => return None,
         })
     }
 
-    pub fn to_egui(self) -> egui::Key {
-        match self {
+    pub fn to_egui(self) -> Option<egui::Key> {
+        Some(match self {
             KeyName::A => egui::Key::A,
             KeyName::B => egui::Key::B,
             KeyName::C => egui::Key::C,
@@ -328,6 +374,25 @@ impl KeyName {
             KeyName::Num7 => egui::Key::Num7,
             KeyName::Num8 => egui::Key::Num8,
             KeyName::Num9 => egui::Key::Num9,
+            KeyName::Numpad0 => egui::Key::Num0,
+            KeyName::Numpad1 => egui::Key::Num1,
+            KeyName::Numpad2 => egui::Key::Num2,
+            KeyName::Numpad3 => egui::Key::Num3,
+            KeyName::Numpad4 => egui::Key::Num4,
+            KeyName::Numpad5 => egui::Key::Num5,
+            KeyName::Numpad6 => egui::Key::Num6,
+            KeyName::Numpad7 => egui::Key::Num7,
+            KeyName::Numpad8 => egui::Key::Num8,
+            KeyName::Numpad9 => egui::Key::Num9,
+            KeyName::NumpadAdd
+            | KeyName::NumpadSubtract
+            | KeyName::NumpadMultiply
+            | KeyName::NumpadDivide
+            | KeyName::NumpadDecimal
+            | KeyName::JisCaret
+            | KeyName::JisAt
+            | KeyName::IntlYen
+            | KeyName::IntlRo => return None,
             KeyName::F1 => egui::Key::F1,
             KeyName::F2 => egui::Key::F2,
             KeyName::F3 => egui::Key::F3,
@@ -375,7 +440,7 @@ impl KeyName {
             KeyName::Backslash => egui::Key::Backslash,
             KeyName::Slash => egui::Key::Slash,
             KeyName::Minus => egui::Key::Minus,
-        }
+        })
     }
 
     pub fn from_egui(key: egui::Key) -> Option<Self> {
@@ -505,6 +570,21 @@ impl KeyName {
             KeyName::Num7 => 0x37,
             KeyName::Num8 => 0x38,
             KeyName::Num9 => 0x39,
+            KeyName::Numpad0 => 0x60,
+            KeyName::Numpad1 => 0x61,
+            KeyName::Numpad2 => 0x62,
+            KeyName::Numpad3 => 0x63,
+            KeyName::Numpad4 => 0x64,
+            KeyName::Numpad5 => 0x65,
+            KeyName::Numpad6 => 0x66,
+            KeyName::Numpad7 => 0x67,
+            KeyName::Numpad8 => 0x68,
+            KeyName::Numpad9 => 0x69,
+            KeyName::NumpadMultiply => 0x6A,
+            KeyName::NumpadAdd => 0x6B,
+            KeyName::NumpadSubtract => 0x6D,
+            KeyName::NumpadDecimal => 0x6E,
+            KeyName::NumpadDivide => 0x6F,
             KeyName::F1 => 0x70,
             KeyName::F2 => 0x71,
             KeyName::F3 => 0x72,
@@ -552,6 +632,10 @@ impl KeyName {
             KeyName::Backslash => 0xDC,
             KeyName::Slash => 0xBF,
             KeyName::Minus => 0xBD,
+            KeyName::JisCaret => 0xDE,
+            KeyName::JisAt => 0xC0,
+            KeyName::IntlYen => 0xDC,
+            KeyName::IntlRo => 0xE2,
         }
     }
 
@@ -593,6 +677,21 @@ impl KeyName {
             KeyName::Num7 => "7",
             KeyName::Num8 => "8",
             KeyName::Num9 => "9",
+            KeyName::Numpad0 => "Num0",
+            KeyName::Numpad1 => "Num1",
+            KeyName::Numpad2 => "Num2",
+            KeyName::Numpad3 => "Num3",
+            KeyName::Numpad4 => "Num4",
+            KeyName::Numpad5 => "Num5",
+            KeyName::Numpad6 => "Num6",
+            KeyName::Numpad7 => "Num7",
+            KeyName::Numpad8 => "Num8",
+            KeyName::Numpad9 => "Num9",
+            KeyName::NumpadAdd => "Num+",
+            KeyName::NumpadSubtract => "Num-",
+            KeyName::NumpadMultiply => "Num*",
+            KeyName::NumpadDivide => "Num/",
+            KeyName::NumpadDecimal => "Num.",
             KeyName::F1 => "F1",
             KeyName::F2 => "F2",
             KeyName::F3 => "F3",
@@ -640,6 +739,10 @@ impl KeyName {
             KeyName::Backslash => "\\",
             KeyName::Slash => "/",
             KeyName::Minus => "-",
+            KeyName::JisCaret => "^",
+            KeyName::JisAt => "@",
+            KeyName::IntlYen => "¥",
+            KeyName::IntlRo => "\\",
         }
     }
 }
@@ -713,7 +816,7 @@ impl Chord {
     }
 
     fn matches_egui(self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
-        self.key.is_some_and(|name| name.to_egui() == key)
+        self.key.is_some_and(|name| name.to_egui() == Some(key))
             && modifiers.ctrl == self.ctrl
             && modifiers.shift == self.shift
             && modifiers.alt == self.alt
@@ -829,6 +932,18 @@ impl ChordList {
     pub fn is_empty(self) -> bool {
         self.len == 0
     }
+}
+
+const fn digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
+    ChordList::two(Chord::key(main), Chord::key(numpad))
+}
+
+const fn ctrl_digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
+    ChordList::two(Chord::ctrl(main), Chord::ctrl(numpad))
+}
+
+const fn alt_digit_pair(main: KeyName, numpad: KeyName) -> ChordList {
+    ChordList::two(Chord::alt(main), Chord::alt(numpad))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -3523,7 +3638,7 @@ impl KeyAction {
 
     pub fn default_chords(self) -> ChordList {
         use KeyAction::*;
-        use KeyName::*;
+        use KeySlot::*;
         match self {
             GlobalLocalSearch => ChordList::one(Chord::ctrl(F)),
             GlobalFavSearch => ChordList::one(Chord::ctrl(S)),
@@ -3607,27 +3722,27 @@ impl KeyAction {
             GridPin => ChordList::one(Chord::key(P)),
             GridComparePin => ChordList::one(Chord::key(X)),
             GridAddToActiveBook => ChordList::one(Chord::ctrl(B)),
-            GridColumnCount1 => ChordList::one(Chord::alt(Num1)),
-            GridColumnCount2 => ChordList::one(Chord::alt(Num2)),
-            GridColumnCount3 => ChordList::one(Chord::alt(Num3)),
-            GridColumnCount4 => ChordList::one(Chord::alt(Num4)),
-            GridColumnCount5 => ChordList::one(Chord::alt(Num5)),
-            GridColumnCount6 => ChordList::one(Chord::alt(Num6)),
-            GridColumnCount7 => ChordList::one(Chord::alt(Num7)),
-            GridColumnCount8 => ChordList::one(Chord::alt(Num8)),
-            GridColumnCount9 => ChordList::one(Chord::alt(Num9)),
-            GridColumnCount10 => ChordList::one(Chord::alt(Num0)),
+            GridColumnCount1 => alt_digit_pair(Num1, Numpad1),
+            GridColumnCount2 => alt_digit_pair(Num2, Numpad2),
+            GridColumnCount3 => alt_digit_pair(Num3, Numpad3),
+            GridColumnCount4 => alt_digit_pair(Num4, Numpad4),
+            GridColumnCount5 => alt_digit_pair(Num5, Numpad5),
+            GridColumnCount6 => alt_digit_pair(Num6, Numpad6),
+            GridColumnCount7 => alt_digit_pair(Num7, Numpad7),
+            GridColumnCount8 => alt_digit_pair(Num8, Numpad8),
+            GridColumnCount9 => alt_digit_pair(Num9, Numpad9),
+            GridColumnCount10 => alt_digit_pair(Num0, Numpad0),
             GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
-            GridAdjustSlot1 => ChordList::one(Chord::ctrl(Num1)),
-            GridAdjustSlot2 => ChordList::one(Chord::ctrl(Num2)),
-            GridAdjustSlot3 => ChordList::one(Chord::ctrl(Num3)),
-            GridAdjustSlot4 => ChordList::one(Chord::ctrl(Num4)),
-            GridAdjustSlot5 => ChordList::one(Chord::ctrl(Num5)),
-            GridAdjustSlot6 => ChordList::one(Chord::ctrl(Num6)),
-            GridAdjustSlot7 => ChordList::one(Chord::ctrl(Num7)),
-            GridAdjustSlot8 => ChordList::one(Chord::ctrl(Num8)),
-            GridAdjustSlot9 => ChordList::one(Chord::ctrl(Num9)),
-            GridAdjustSlot10 => ChordList::one(Chord::ctrl(Num0)),
+            GridAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
+            GridAdjustSlot2 => ctrl_digit_pair(Num2, Numpad2),
+            GridAdjustSlot3 => ctrl_digit_pair(Num3, Numpad3),
+            GridAdjustSlot4 => ctrl_digit_pair(Num4, Numpad4),
+            GridAdjustSlot5 => ctrl_digit_pair(Num5, Numpad5),
+            GridAdjustSlot6 => ctrl_digit_pair(Num6, Numpad6),
+            GridAdjustSlot7 => ctrl_digit_pair(Num7, Numpad7),
+            GridAdjustSlot8 => ctrl_digit_pair(Num8, Numpad8),
+            GridAdjustSlot9 => ctrl_digit_pair(Num9, Numpad9),
+            GridAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
             GridClearAdjust => ChordList::two(Chord::ctrl(Backspace), Chord::key(Q)),
             GridApplyErase1 => ChordList::one(Chord::key(F7)),
             GridApplyErase2 => ChordList::one(Chord::key(F8)),
@@ -3689,14 +3804,14 @@ impl KeyAction {
             FsTextMode => ChordList::one(Chord::ctrl(T)),
             FsBgCycle => ChordList::one(Chord::key(B)),
             FsPin => ChordList::one(Chord::key(P)),
-            FsSpreadSingle => ChordList::one(Chord::key(Num1)),
-            FsSpreadLtr => ChordList::one(Chord::key(Num2)),
-            FsSpreadLtrCover => ChordList::one(Chord::key(Num3)),
-            FsSpreadRtl => ChordList::one(Chord::key(Num4)),
-            FsSpreadRtlCover => ChordList::one(Chord::key(Num5)),
-            FsReadingFlowCycle => ChordList::one(Chord::key(Num6)),
-            FsReadingDirectionToggle => ChordList::one(Chord::key(Num7)),
-            FsFitModeCycle => ChordList::one(Chord::key(Num0)),
+            FsSpreadSingle => digit_pair(Num1, Numpad1),
+            FsSpreadLtr => digit_pair(Num2, Numpad2),
+            FsSpreadLtrCover => digit_pair(Num3, Numpad3),
+            FsSpreadRtl => digit_pair(Num4, Numpad4),
+            FsSpreadRtlCover => digit_pair(Num5, Numpad5),
+            FsReadingFlowCycle => digit_pair(Num6, Numpad6),
+            FsReadingDirectionToggle => digit_pair(Num7, Numpad7),
+            FsFitModeCycle => digit_pair(Num0, Numpad0),
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
@@ -3749,16 +3864,16 @@ impl KeyAction {
             | FsPostFilterPseudoColor4
             | FsPostFilterPseudoColorSkin
             | FsPostFilterSharpen => ChordList::EMPTY,
-            FsAdjustSlot1 => ChordList::one(Chord::ctrl(Num1)),
-            FsAdjustSlot2 => ChordList::one(Chord::ctrl(Num2)),
-            FsAdjustSlot3 => ChordList::one(Chord::ctrl(Num3)),
-            FsAdjustSlot4 => ChordList::one(Chord::ctrl(Num4)),
-            FsAdjustSlot5 => ChordList::one(Chord::ctrl(Num5)),
-            FsAdjustSlot6 => ChordList::one(Chord::ctrl(Num6)),
-            FsAdjustSlot7 => ChordList::one(Chord::ctrl(Num7)),
-            FsAdjustSlot8 => ChordList::one(Chord::ctrl(Num8)),
-            FsAdjustSlot9 => ChordList::one(Chord::ctrl(Num9)),
-            FsAdjustSlot10 => ChordList::one(Chord::ctrl(Num0)),
+            FsAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
+            FsAdjustSlot2 => ctrl_digit_pair(Num2, Numpad2),
+            FsAdjustSlot3 => ctrl_digit_pair(Num3, Numpad3),
+            FsAdjustSlot4 => ctrl_digit_pair(Num4, Numpad4),
+            FsAdjustSlot5 => ctrl_digit_pair(Num5, Numpad5),
+            FsAdjustSlot6 => ctrl_digit_pair(Num6, Numpad6),
+            FsAdjustSlot7 => ctrl_digit_pair(Num7, Numpad7),
+            FsAdjustSlot8 => ctrl_digit_pair(Num8, Numpad8),
+            FsAdjustSlot9 => ctrl_digit_pair(Num9, Numpad9),
+            FsAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
             FsClearAdjust => ChordList::two(Chord::ctrl(Backspace), Chord::key(Q)),
             FsApplyErase1 => ChordList::one(Chord::key(F7)),
             FsApplyErase2 => ChordList::one(Chord::key(F8)),
@@ -3807,10 +3922,10 @@ impl KeyAction {
             ConcealDeleteShape => ChordList::one(Chord::key(Delete)),
             ConcealPixelGrid => ChordList::one(Chord::key(G)),
             ConcealTypeCycle => ChordList::one(Chord::key(T)),
-            ConcealPreset1 => ChordList::one(Chord::key(Num1)),
-            ConcealPreset2 => ChordList::one(Chord::key(Num2)),
-            ConcealPreset3 => ChordList::one(Chord::key(Num3)),
-            ConcealPreset4 => ChordList::one(Chord::key(Num4)),
+            ConcealPreset1 => digit_pair(Num1, Numpad1),
+            ConcealPreset2 => digit_pair(Num2, Numpad2),
+            ConcealPreset3 => digit_pair(Num3, Numpad3),
+            ConcealPreset4 => digit_pair(Num4, Numpad4),
             ConcealPaintMode => ChordList::one(Chord::key(D)),
             ConcealEraseMode => ChordList::one(Chord::key(F)),
             ConcealToolSelect => ChordList::one(Chord::key(S)),
@@ -4637,13 +4752,13 @@ impl Keymap {
         let keys: Vec<egui::Key> = if let Some(chords) = self.overrides.get(&action) {
             chords
                 .iter()
-                .filter_map(|c| c.key.map(KeyName::to_egui))
+                .filter_map(|c| c.key.and_then(KeyName::to_egui))
                 .collect()
         } else {
             action
                 .default_chords()
                 .iter()
-                .filter_map(|c| c.key.map(KeyName::to_egui))
+                .filter_map(|c| c.key.and_then(KeyName::to_egui))
                 .collect()
         };
         if keys.is_empty() {
@@ -4829,13 +4944,17 @@ impl Keymap {
         out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
         out.push_str("# - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。\n");
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
-        out.push_str("# - キー名の例: A..Z, 0..9, F1..F24, Left, Right, Up, Down,\n");
+        out.push_str(
+            "# - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,\n",
+        );
         out.push_str(
             "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,\n",
         );
-        out.push_str("#   [, ], ;, :, ,, ., \\, /, ?, -\n");
-        out.push_str("# - テンキー数字は通常の数字キーと同じ扱いです。\n");
-        out.push_str("#   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。\n");
+        out.push_str(
+            "#   [, ], ;, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract\n",
+        );
+        out.push_str("# - テンキー数字は通常の数字キーとは別キーとして扱われます。\n");
+        out.push_str("#   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。\n");
         out.push_str(
             "# - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、\n",
         );
@@ -4978,7 +5097,7 @@ impl Keymap {
         if chord.ctrl || chord.shift || chord.alt {
             return false;
         }
-        let Some(key) = chord.key.map(KeyName::to_egui) else {
+        let Some(key) = chord.key.and_then(KeyName::to_egui) else {
             return false;
         };
         // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
@@ -6697,9 +6816,13 @@ mod tests {
     }
 
     #[test]
-    fn numpad_names_parse_as_number_aliases() {
-        assert_eq!(KeyName::parse("Numpad1"), Some(KeyName::Num1));
-        assert_eq!(KeyName::parse("Numpad0"), Some(KeyName::Num0));
+    fn numpad_names_parse_as_distinct_key_slots() {
+        assert_eq!(KeyName::parse("Numpad1"), Some(KeyName::Numpad1));
+        assert_eq!(KeyName::parse("Numpad0"), Some(KeyName::Numpad0));
+        assert_eq!(KeyName::parse("Num1"), Some(KeyName::Num1));
+        assert_eq!(KeyName::parse("1"), Some(KeyName::Num1));
+        assert_eq!(KeyName::Numpad1.display_name(), "Num1");
+        assert_eq!(KeyName::Numpad1.to_vk(), 0x61);
     }
 
     #[test]
@@ -6721,7 +6844,7 @@ mod tests {
         for (name, egui_key, vk, label) in cases {
             assert_eq!(KeyName::parse(label), Some(name));
             assert_eq!(name.display_name(), label);
-            assert_eq!(name.to_egui(), egui_key);
+            assert_eq!(name.to_egui(), Some(egui_key));
             assert_eq!(KeyName::from_egui(egui_key), Some(name));
             assert_eq!(name.to_vk(), vk);
         }
@@ -6748,7 +6871,7 @@ mod tests {
         for (name, egui_key, vk, label) in cases {
             assert_eq!(KeyName::parse(label), Some(name));
             assert_eq!(name.display_name(), label);
-            assert_eq!(name.to_egui(), egui_key);
+            assert_eq!(name.to_egui(), Some(egui_key));
             assert_eq!(KeyName::from_egui(egui_key), Some(name));
             assert_eq!(name.to_vk(), vk);
         }
@@ -6757,8 +6880,27 @@ mod tests {
         assert_eq!(KeyName::parse("Comma"), Some(KeyName::Comma));
         assert_eq!(KeyName::parse("Period"), Some(KeyName::Period));
         assert_eq!(KeyName::parse("Backslash"), Some(KeyName::Backslash));
-        assert_eq!(KeyName::parse("Yen"), Some(KeyName::Backslash));
+        assert_eq!(KeyName::parse("Yen"), Some(KeyName::IntlYen));
         assert_eq!(parse_chord("Ctrl+\\").unwrap().display_name(), "Ctrl+\\");
+    }
+
+    #[test]
+    fn jis_keys_parse_and_do_not_use_egui_fallback() {
+        let cases = [
+            (KeyName::JisCaret, "^", 0xDE),
+            (KeyName::JisAt, "@", 0xC0),
+            (KeyName::IntlYen, "¥", 0xDC),
+            (KeyName::IntlRo, "\\", 0xE2),
+        ];
+        for (name, label, vk) in cases {
+            assert_eq!(name.display_name(), label);
+            assert_eq!(name.to_egui(), None);
+            assert_eq!(name.to_vk(), vk);
+        }
+        assert_eq!(KeyName::parse("JisCaret"), Some(KeyName::JisCaret));
+        assert_eq!(KeyName::parse("JisAt"), Some(KeyName::JisAt));
+        assert_eq!(KeyName::parse("IntlYen"), Some(KeyName::IntlYen));
+        assert_eq!(KeyName::parse("IntlRo"), Some(KeyName::IntlRo));
     }
 
     #[test]

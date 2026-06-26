@@ -139,21 +139,22 @@ pub struct Chord {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
-    pub key: Option<KeyName>,   // None = 修飾単独 (ModifierHold 用)
+    pub key: Option<KeySlot>,   // None = 修飾単独 (ModifierHold 用)
 }
 
-/// テキスト名で持つ物理キー。egui::Key と Win32 VK の双方へ解決できるものだけ定義。
+/// テキスト名で持つ物理キー。Win32 VK / scan code を正本にし、egui は fallback として使う。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KeyName { A, B, /* ...Z */ Num0, /* ...Num9 */ F1, /* ...F12 */
+pub enum KeySlot { A, B, /* ...Z */ Num0, /* ...Num9 */ Numpad0, /* ...Numpad9 */ F1, /* ...F24 */
     Left, Right, Up, Down, Home, End, PageUp, PageDown,
     Space, Enter, Esc, Tab, Backspace, Delete,
-    OpenBracket, CloseBracket, Semicolon, Colon, Comma, Period, Backslash, Slash, Minus }
+    OpenBracket, CloseBracket, Semicolon, Colon, Comma, Period, Backslash, Slash, Minus,
+    JisCaret, JisAt, IntlYen, IntlRo }
 
-impl KeyName {
-    pub fn parse(s: &str) -> Option<KeyName>;   // "P" "F7" "Left" "[" 等
+impl KeySlot {
+    pub fn parse(s: &str) -> Option<KeySlot>;   // "P" "F7" "Left" "[" "Numpad1" 等
     pub fn to_egui(self) -> Option<egui::Key>;
-    pub fn from_egui(k: egui::Key) -> Option<KeyName>;
-    pub fn to_vk(self) -> Option<u32>;          // native 動画経路
+    pub fn from_egui(k: egui::Key) -> Option<KeySlot>;
+    pub fn to_vk(self) -> u32;                  // native 動画経路 / Win32 fallback
 }
 
 /// ini 由来の上書き集合。無ければ空 = 全部コードデフォルト。
@@ -363,9 +364,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 4. **exact match**: §4 の「修飾完全一致」を helper 内で保証。同一キーに NONE と SHIFT が
    ある場合 (例 C / Shift+C / Alt+C、矢印 alias) は、デフォルト chord を複数持たせて
    現行挙動を再現する。`consume_key(Modifiers::NONE, key)` へ直に寄せない。
-5. **VK 変換不能キー**: 記号の一部・非 US 配列は `to_vk()==None`。動画経路ではその上書きを
-   スキップ + 警告 (付録 B のホワイトリスト)。テンキー数字は通常の数字キー alias として扱い、
-   別アサインはできない。
+5. **物理キー slot**: v2.2.0 から `KeySlot` を正本にし、テンキー数字は通常数字とは別 slot として扱う。
+   日本語キーボード固有キー (`^` / `@` / `¥` / `ろ`) は egui fallback ではなく Win32 key edge queue で判定する。
 6. **native 動画の転送ホワイトリスト**: `src/video/native_presenter/mod.rs` の
    `native_video_fullscreen_shortcut_key` を keymap 連動にしない限り、カスタムした VK が
    UI 側へ届かない。Ph5 の必須作業にする。
@@ -402,7 +402,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - **解決ロジック**: 上書きあり/なし、複数チョード順、全置換セマンティクス。
 - **exact match consume/pressed**: 素キー override が Shift/Ctrl/Alt 付きイベントを誤消費・誤発火しないこと。
   `C` / `Shift+C` / `Alt+C`、`T` / `Shift+T` / `Alt+T`、矢印 alias を代表ケースにする。
-- **KeyName 往復**: `from_egui ∘ to_egui` / `to_vk` の整合、変換不能キーが `None` を返すこと。
+- **KeySlot 往復**: `from_egui ∘ to_egui` / `to_vk` / Win32 key edge queue の整合、egui fallback 不能キーが `None` を返すこと。
 - **VK マッチ**: `matches_vk` が修飾フラグ込みで正しく判定 (NativeVideoKeyEvent を直接組む)。
 - **native 動画転送**: `native_video_shortcut_key` がデフォルト VK とカスタム VK の両方を
   転送対象にし、対象外の Alt 系やテキスト入力中の抑止を壊さないこと。
@@ -600,20 +600,21 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 > フェーズで対象ファイルを開いて確定する**。`docs/keymap-spec.md` とコードの差異は、配線する
 > フェーズでこの付録へ戻して同期する。
 
-## 付録 B. KeyName ⇔ egui::Key ⇔ VK 変換ホワイトリスト
+## 付録 B. KeySlot ⇔ egui::Key ⇔ VK / scan code 変換ホワイトリスト
 
-双方向に安全変換できるキーのみカスタム許可。リスト外 (記号の一部・非 US 配列・
-メディアキー) は ini で警告して無視。テンキー数字は `Numpad1` などの名前を受け付けるが、
-egui 側で通常の数字キーと同じ `Num1` などに畳まれるため別アサインはできない。
+双方向に安全変換できるキーのみカスタム許可。リスト外 (PrintScreen, Pause, かな/無変換/変換,
+メディアキーなど) は ini で警告して無視。テンキー数字は `Numpad1` などの名前で通常数字と別 slot として扱う。
 
-| 分類 | KeyName | egui::Key | VK (16) |
+| 分類 | KeySlot | egui::Key | VK / scan code |
 |---|---|---|---|
 | 英字 | A..Z | A..Z | 0x41..0x5A |
-| 数字 | Num0..Num9 | Num0..Num9 | 0x30..0x39 |
+| 数字 | Num0..Num9 | Num0..Num9 | VK 0x30..0x39 |
+| テンキー数字 | Numpad0..Numpad9 | fallback なし (egui では Num0..Num9 に畳まれる) | VK 0x60..0x69 |
 | Fキー | F1..F24 | F1..F24 | 0x70..0x87 |
 | 矢印 | Left/Right/Up/Down | Arrow* | 0x25/0x27/0x26/0x28 |
 | ナビ | Home/End/PageUp/PageDown | 同名 | 0x24/0x23/0x21/0x22 |
 | 編集 | Space/Enter/Esc/Tab/Backspace/Delete | 同名 | 0x20/0x0D/0x1B/0x09/0x08/0x2E |
-| 記号 | OpenBracket/CloseBracket/Semicolon/Colon/Comma/Period/Backslash/Slash/Minus | 同名 (`?` は `Shift+Slash` として扱う) | 0xDB/0xDD/0xBB/0xBA/0xBC/0xBE/0xDC/0xBF/0xBD (※配列依存・要実機確認) |
+| 記号 | OpenBracket/CloseBracket/Semicolon/Colon/Comma/Period/Backslash/Slash/Minus | 同名 (`?` は `Shift+Slash` として扱う) | 0xDB/0xDD/0xBB/0xBA/0xBC/0xBE/0xDC/0xBF/0xBD |
+| 日本語キーボード固有 | JisCaret/JisAt/IntlYen/IntlRo | fallback なし | VK + scan code |
 
 修飾: Ctrl/Shift/Alt のみ。Win キー・AltGr は対象外。

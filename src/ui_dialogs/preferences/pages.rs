@@ -1814,8 +1814,8 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
         Key(KeyName::Num9, None),
         Key(KeyName::Num0, None),
         Key(KeyName::Minus, None),
-        Disabled("^"),
-        Key(KeyName::Backslash, Some("￥")),
+        Key(KeyName::JisCaret, Some("^")),
+        Key(KeyName::IntlYen, Some("￥")),
         Key(KeyName::Backspace, None),
     ];
     const QWERTY: &[KeyboardPickerCell] = &[
@@ -1830,7 +1830,7 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
         Key(KeyName::I, None),
         Key(KeyName::O, None),
         Key(KeyName::P, None),
-        Disabled("@"),
+        Key(KeyName::JisAt, Some("@")),
         Key(KeyName::OpenBracket, None),
     ];
     const HOME: &[KeyboardPickerCell] = &[
@@ -1859,7 +1859,7 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
         Key(KeyName::Comma, None),
         Key(KeyName::Period, None),
         Key(KeyName::Slash, None),
-        Disabled("\\"),
+        Key(KeyName::IntlRo, Some("\\")),
         Key(KeyName::Space, None),
     ];
     const NAV_TOP: &[KeyboardPickerCell] = &[
