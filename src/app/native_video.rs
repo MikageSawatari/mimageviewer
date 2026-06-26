@@ -1,7 +1,5 @@
 use super::*;
-use crate::keymap::{
-    CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, LOCATION_NAVIGATION_ACTIONS,
-};
+use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
 
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
 ///
@@ -5139,15 +5137,6 @@ impl App {
             if hud_activity {
                 self.request_native_video_hud_repaint(ctx);
             }
-            return;
-        }
-        if !key.repeat
-            && let Some(action) = self
-                .keymap
-                .matching_vk_action(LOCATION_NAVIGATION_ACTIONS, &key)
-        {
-            self.mouse_ring_nav =
-                self.apply_location_navigation_key_action(ctx, action, "native-video-location-key");
             return;
         }
         match key.virtual_key {

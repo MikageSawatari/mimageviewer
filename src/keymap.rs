@@ -335,8 +335,8 @@ impl KeySlot {
             "MINUS" => KeyName::Minus,
             "^" | "CARET" | "JISCARET" => KeyName::JisCaret,
             "@" | "AT" | "JISAT" => KeyName::JisAt,
-            "YEN" | "¥" | "INTLYEN" | "JISYEN" => KeyName::IntlYen,
-            "RO" | "INTLRO" | "JISRO" => KeyName::IntlRo,
+            "YEN" | "¥" | "￥" | "INTLYEN" | "JISYEN" => KeyName::IntlYen,
+            "RO" | "ろ" | "INTLRO" | "JISRO" => KeyName::IntlRo,
             _ => return None,
         })
     }
@@ -876,8 +876,16 @@ impl KeySlot {
             KeyName::Minus => "-",
             KeyName::JisCaret => "^",
             KeyName::JisAt => "@",
-            KeyName::IntlYen => "¥",
+            KeyName::IntlYen => "￥",
+            KeyName::IntlRo => "ろ",
+        }
+    }
+
+    pub fn settings_name(self) -> &'static str {
+        match self {
+            KeyName::IntlYen => "Yen",
             KeyName::IntlRo => "Ro",
+            _ => self.display_name(),
         }
     }
 }
@@ -1029,6 +1037,14 @@ impl Chord {
     }
 
     pub fn display_name(self) -> String {
+        self.format_name(false)
+    }
+
+    pub fn settings_name(self) -> String {
+        self.format_name(true)
+    }
+
+    fn format_name(self, settings: bool) -> String {
         let question_mark = self.shift && self.key == Some(KeyName::Slash);
         let mut parts = Vec::new();
         if self.ctrl {
@@ -1045,7 +1061,11 @@ impl Chord {
             return parts.join("+");
         }
         if let Some(key) = self.key {
-            parts.push(key.display_name().to_string());
+            parts.push(if settings {
+                key.settings_name().to_string()
+            } else {
+                key.display_name().to_string()
+            });
         }
         if parts.is_empty() {
             "none".to_string()
@@ -5034,7 +5054,6 @@ impl Keymap {
             matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
                 || *action == KeyAction::ToggleDetachedViewerMode
                 || *action == KeyAction::FsToggleWindowMode
-                || action.is_location_navigation_action()
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -5188,7 +5207,7 @@ impl Keymap {
                 let defaults: Vec<String> = action
                     .default_chords()
                     .iter()
-                    .map(Chord::display_name)
+                    .map(Chord::settings_name)
                     .collect();
                 if defaults.len() <= 1 {
                     let default = defaults
@@ -5437,7 +5456,7 @@ impl KeymapSettings {
         self.remove_override(action);
         self.overrides.push(KeyBindingOverride {
             action: action.ini_name().to_string(),
-            chords: chords.into_iter().map(Chord::display_name).collect(),
+            chords: chords.into_iter().map(Chord::settings_name).collect(),
         });
     }
 
@@ -6647,6 +6666,30 @@ mod tests {
             assert!(action.default_chords().is_empty());
             assert!(action.is_location_navigation_action());
         }
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridOpenDriveC = Y
+            "#,
+        );
+        assert!(keymap.warnings().is_empty());
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::Y),
+                GRID_ACTIVE_SCOPES,
+                LOCATION_NAVIGATION_ACTIONS,
+            ),
+            Some(KeyAction::GridOpenDriveC)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::Y),
+                FS_VIDEO_ACTIVE_SCOPES,
+                LOCATION_NAVIGATION_ACTIONS,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -7095,6 +7138,7 @@ mod tests {
         assert_eq!(KeyName::parse("Period"), Some(KeyName::Period));
         assert_eq!(KeyName::parse("Backslash"), Some(KeyName::Backslash));
         assert_eq!(KeyName::parse("Yen"), Some(KeyName::IntlYen));
+        assert_eq!(KeyName::parse("￥"), Some(KeyName::IntlYen));
         assert_eq!(parse_chord("Ctrl+\\").unwrap().display_name(), "Ctrl+\\");
     }
 
@@ -7103,8 +7147,8 @@ mod tests {
         let cases = [
             (KeyName::JisCaret, "^", 0xDE),
             (KeyName::JisAt, "@", 0xC0),
-            (KeyName::IntlYen, "¥", 0xDC),
-            (KeyName::IntlRo, "Ro", 0xE2),
+            (KeyName::IntlYen, "￥", 0xDC),
+            (KeyName::IntlRo, "ろ", 0xE2),
         ];
         for (name, label, vk) in cases {
             assert_eq!(name.display_name(), label);
@@ -7115,10 +7159,11 @@ mod tests {
         assert_eq!(KeyName::parse("JisAt"), Some(KeyName::JisAt));
         assert_eq!(KeyName::parse("IntlYen"), Some(KeyName::IntlYen));
         assert_eq!(KeyName::parse("IntlRo"), Some(KeyName::IntlRo));
+        assert_eq!(KeyName::parse("ろ"), Some(KeyName::IntlRo));
     }
 
     #[test]
-    fn key_slot_display_names_parse_back_without_collisions() {
+    fn key_slot_settings_names_parse_back_without_collisions() {
         let cases = [
             KeyName::Backslash,
             KeyName::IntlRo,
@@ -7129,8 +7174,14 @@ mod tests {
             KeyName::Num1,
         ];
         for key in cases {
-            assert_eq!(KeyName::parse(key.display_name()), Some(key));
+            assert_eq!(KeyName::parse(key.settings_name()), Some(key));
         }
+        assert_eq!(KeyName::IntlYen.settings_name(), "Yen");
+        assert_eq!(KeyName::IntlRo.settings_name(), "Ro");
+        assert_eq!(Chord::key(KeyName::IntlYen).display_name(), "￥");
+        assert_eq!(Chord::key(KeyName::IntlYen).settings_name(), "Yen");
+        assert_eq!(Chord::key(KeyName::IntlRo).display_name(), "ろ");
+        assert_eq!(Chord::key(KeyName::IntlRo).settings_name(), "Ro");
     }
 
     #[test]

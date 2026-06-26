@@ -18438,7 +18438,7 @@ impl App {
 
         if let Some(action) = self.keymap.consume_first_action(
             ctx,
-            &[CommandScope::Global],
+            &[CommandScope::Grid],
             LOCATION_NAVIGATION_ACTIONS,
         ) {
             if let Some(nav) =

@@ -28,7 +28,7 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
-    KeyTrigger, Keymap, LOCATION_NAVIGATION_ACTIONS, command_catalog,
+    KeyTrigger, Keymap, command_catalog,
 };
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
@@ -6621,20 +6621,6 @@ impl App {
             && self.consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;
-            return action;
-        }
-        if self.fs_context_menu_idx.is_none()
-            && let Some(location_action) = self.keymap.consume_first_action(
-                ctx,
-                &[CommandScope::Global],
-                LOCATION_NAVIGATION_ACTIONS,
-            )
-        {
-            action.mouse_nav = self.apply_location_navigation_key_action(
-                ctx,
-                location_action,
-                "fullscreen-location-key",
-            );
             return action;
         }
         let video_horizontal_arrow_key = is_video_fs

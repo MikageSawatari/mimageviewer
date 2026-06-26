@@ -1859,7 +1859,7 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 12] {
         Key(KeyName::Comma, None),
         Key(KeyName::Period, None),
         Key(KeyName::Slash, None),
-        Key(KeyName::IntlRo, Some("\\")),
+        Key(KeyName::IntlRo, Some("ろ")),
         Key(KeyName::Space, None),
     ];
     const NAV_TOP: &[KeyboardPickerCell] = &[
