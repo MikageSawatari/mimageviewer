@@ -1771,7 +1771,7 @@ enum KeyboardPickerCell {
     Spacer(f32),
 }
 
-fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
+fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 12] {
     use KeyboardPickerCell::{Disabled, Key, Spacer};
     const EXTENDED_FUNCTION: &[KeyboardPickerCell] = &[
         Key(KeyName::F13, None),
@@ -1879,6 +1879,33 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
         Key(KeyName::Down, None),
         Key(KeyName::Right, None),
     ];
+    const NUMPAD_TOP: &[KeyboardPickerCell] = &[
+        Disabled("テンキー"),
+        Key(KeyName::NumpadDivide, Some("Num/")),
+        Key(KeyName::NumpadMultiply, Some("Num*")),
+        Key(KeyName::NumpadSubtract, Some("Num-")),
+    ];
+    const NUMPAD_789: &[KeyboardPickerCell] = &[
+        Spacer(64.0),
+        Key(KeyName::Numpad7, Some("Num7")),
+        Key(KeyName::Numpad8, Some("Num8")),
+        Key(KeyName::Numpad9, Some("Num9")),
+        Key(KeyName::NumpadAdd, Some("Num+")),
+    ];
+    const NUMPAD_456: &[KeyboardPickerCell] = &[
+        Spacer(64.0),
+        Key(KeyName::Numpad4, Some("Num4")),
+        Key(KeyName::Numpad5, Some("Num5")),
+        Key(KeyName::Numpad6, Some("Num6")),
+    ];
+    const NUMPAD_1230: &[KeyboardPickerCell] = &[
+        Spacer(64.0),
+        Key(KeyName::Numpad1, Some("Num1")),
+        Key(KeyName::Numpad2, Some("Num2")),
+        Key(KeyName::Numpad3, Some("Num3")),
+        Key(KeyName::Numpad0, Some("Num0")),
+        Key(KeyName::NumpadDecimal, Some("Num.")),
+    ];
     [
         EXTENDED_FUNCTION,
         FUNCTION,
@@ -1888,6 +1915,10 @@ fn keyboard_picker_rows() -> [&'static [KeyboardPickerCell]; 8] {
         BOTTOM,
         NAV_TOP,
         NAV_BOTTOM,
+        NUMPAD_TOP,
+        NUMPAD_789,
+        NUMPAD_456,
+        NUMPAD_1230,
     ]
 }
 
