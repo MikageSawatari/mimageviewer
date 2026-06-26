@@ -71,6 +71,8 @@ pub mod ingest_text;
 pub mod ingest_worker;
 pub mod io_semaphore;
 #[cfg(windows)]
+pub mod key_debug;
+#[cfg(windows)]
 pub mod key_input;
 pub mod keymap;
 pub mod known_folders;

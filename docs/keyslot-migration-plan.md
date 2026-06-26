@@ -89,6 +89,8 @@ native 動画 presenter は既に Win32 virtual key を受け取っている。`
 5. 操作カスタマイズのキーボード図を `KeySlot` ベースにし、日本語キーボード配列とテンキーを表示する。
 6. docs / tests を更新する。
 
+補助診断として `MIV_KEY_DEBUG=1` を設定すると、メイン Win32 key edge queue / native 動画 HWND の生キー入力と、解決された `KeyAction` がログおよび画面右上のオーバーレイに出る。実機確認の項目は [keymap-manual-test-checklist.md](keymap-manual-test-checklist.md) に集約する。
+
 ## 実機確認ポイント
 
 - メイン数字キー `1` と `Numpad1` が別々にキャプチャされる。

@@ -5320,6 +5320,13 @@ impl Keymap {
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.consume_chord(ctx, chord) {
+                    #[cfg(windows)]
+                    crate::key_debug::record_consumed_action(
+                        action,
+                        action.context(),
+                        chord,
+                        "consume_action",
+                    );
                     return true;
                 }
             }
@@ -5327,6 +5334,13 @@ impl Keymap {
         }
         for chord in action.default_chords().iter() {
             if self.consume_chord(ctx, chord) {
+                #[cfg(windows)]
+                crate::key_debug::record_consumed_action(
+                    action,
+                    action.context(),
+                    chord,
+                    "consume_action",
+                );
                 return true;
             }
         }
@@ -5338,6 +5352,13 @@ impl Keymap {
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
                 if self.consume_chord_no_repeat(ctx, chord) {
+                    #[cfg(windows)]
+                    crate::key_debug::record_consumed_action(
+                        action,
+                        action.context(),
+                        chord,
+                        "consume_no_repeat",
+                    );
                     return true;
                 }
             }
@@ -5345,6 +5366,13 @@ impl Keymap {
         }
         for chord in action.default_chords().iter() {
             if self.consume_chord_no_repeat(ctx, chord) {
+                #[cfg(windows)]
+                crate::key_debug::record_consumed_action(
+                    action,
+                    action.context(),
+                    chord,
+                    "consume_no_repeat",
+                );
                 return true;
             }
         }
@@ -5354,15 +5382,33 @@ impl Keymap {
     pub fn pressed_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         if let Some(chords) = self.overrides.get(&action) {
-            return chords
-                .iter()
-                .copied()
-                .any(|chord| self.pressed_chord(ctx, chord));
+            for chord in chords.iter().copied() {
+                if self.pressed_chord(ctx, chord) {
+                    #[cfg(windows)]
+                    crate::key_debug::record_pressed_action(
+                        action,
+                        action.context(),
+                        chord,
+                        "pressed_action",
+                    );
+                    return true;
+                }
+            }
+            return false;
         }
-        action
-            .default_chords()
-            .iter()
-            .any(|chord| self.pressed_chord(ctx, chord))
+        for chord in action.default_chords().iter() {
+            if self.pressed_chord(ctx, chord) {
+                #[cfg(windows)]
+                crate::key_debug::record_pressed_action(
+                    action,
+                    action.context(),
+                    chord,
+                    "pressed_action",
+                );
+                return true;
+            }
+        }
+        false
     }
 
     pub fn key_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
@@ -5484,9 +5530,27 @@ impl Keymap {
             )
         };
         if let Some(chords) = self.overrides.get(&action) {
-            return chords.iter().copied().any(matches);
+            if let Some(chord) = chords.iter().copied().find(|chord| matches(*chord)) {
+                crate::key_debug::record_consumed_action(
+                    action,
+                    action.context(),
+                    chord,
+                    "native_match",
+                );
+                return true;
+            }
+            return false;
         }
-        action.default_chords().iter().any(matches)
+        if let Some(chord) = action.default_chords().iter().find(|chord| matches(*chord)) {
+            crate::key_debug::record_consumed_action(
+                action,
+                action.context(),
+                chord,
+                "native_match",
+            );
+            return true;
+        }
+        false
     }
 
     #[cfg(windows)]

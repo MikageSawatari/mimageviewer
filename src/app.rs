@@ -38605,6 +38605,9 @@ impl eframe::App for App {
                 ctx.request_repaint_after(d);
             }
         }
+
+        #[cfg(windows)]
+        crate::key_debug::render_overlay(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

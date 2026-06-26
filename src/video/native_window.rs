@@ -809,9 +809,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_KEYDOWN => {
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                let _ = tx.send(NativeVideoWindowEvent::KeyDown(native_key_event(
-                    wparam, lparam,
-                )));
+                let key = native_key_event(wparam, lparam);
+                crate::key_debug::record_native_video_key(key, true);
+                let _ = tx.send(NativeVideoWindowEvent::KeyDown(key));
             }
             if wparam.0 as u32 == 0x1B && window_state(hwnd).is_some_and(|s| s.close_on_escape) {
                 unsafe {
@@ -823,9 +823,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_KEYUP => {
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                let _ = tx.send(NativeVideoWindowEvent::KeyUp(native_key_event(
-                    wparam, lparam,
-                )));
+                let key = native_key_event(wparam, lparam);
+                crate::key_debug::record_native_video_key(key, false);
+                let _ = tx.send(NativeVideoWindowEvent::KeyUp(key));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -845,7 +845,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(vk) = synth_vk
                 && let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref())
             {
-                let _ = tx.send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                let key = NativeVideoKeyEvent {
                     virtual_key: vk,
                     scan_code: 0,
                     extended: false,
@@ -853,7 +853,9 @@ unsafe extern "system" fn wnd_proc(
                     ctrl: false,
                     alt: false,
                     repeat: false,
-                }));
+                };
+                crate::key_debug::record_native_video_key(key, true);
+                let _ = tx.send(NativeVideoWindowEvent::KeyDown(key));
                 // WM_APPCOMMAND の規約: 処理した場合 TRUE を返す。
                 return LRESULT(1);
             }

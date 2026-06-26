@@ -129,6 +129,7 @@ where
 }
 
 fn push_edge(edge: KeyEdge) {
+    crate::key_debug::record_raw_edge(crate::key_debug::KeyDebugSource::MainWin32, edge);
     if let Ok(mut guard) = state().lock() {
         while guard.pending.len() >= MAX_PENDING_EVENTS {
             guard.pending.pop_front();
