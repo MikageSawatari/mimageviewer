@@ -2508,95 +2508,92 @@ fn command_editor_for_action(
         modifier_hold_command_editor(ui, state);
     } else {
         let preview_conflicts = preview_command_editor_conflicts(state, action, conflicts);
-        egui::Grid::new("command_editor_slots")
-            .num_columns(6)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                for idx in 0..state.command_chord_inputs.len() {
-                    ui.label(format!("キー {}", idx + 1));
-                    {
-                        let input = &mut state.command_chord_inputs[idx];
-                        ui.add(
-                            egui::TextEdit::singleline(input)
-                                .desired_width(command_chord_input_width())
-                                .hint_text(if idx == 0 {
-                                    "例: Ctrl+F / F13 / none"
-                                } else {
-                                    ""
-                                }),
-                        );
+        for idx in 0..state.command_chord_inputs.len() {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [48.0, ui.spacing().interact_size.y],
+                    egui::Label::new(format!("キー {}", idx + 1)),
+                );
+                {
+                    let input = &mut state.command_chord_inputs[idx];
+                    ui.add_sized(
+                        [command_chord_input_width(), ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(input).hint_text(if idx == 0 {
+                            "例: Ctrl+F / F13 / none"
+                        } else {
+                            ""
+                        }),
+                    );
+                }
+                let capture_active = state.command_capture_slot == Some(idx);
+                let capture_label = if capture_active {
+                    "入力待ち..."
+                } else {
+                    "押して入力"
+                };
+                if ui
+                    .add(egui::Button::new(capture_label).small())
+                    .on_hover_text("次に押したキーをこの欄へ入れます。Esc でキャンセルします")
+                    .clicked()
+                {
+                    state.command_capture_slot = Some(idx);
+                    state.command_edit_error = None;
+                    state.command_edit_notice = None;
+                }
+                if ui
+                    .add(egui::Button::new("解除").small())
+                    .on_hover_text("この行のキー割り当てだけを解除します")
+                    .clicked()
+                {
+                    state.command_chord_inputs[idx].clear();
+                    if state.command_capture_slot == Some(idx) {
+                        state.command_capture_slot = None;
                     }
-                    let capture_active = state.command_capture_slot == Some(idx);
-                    let capture_label = if capture_active {
-                        "入力待ち..."
-                    } else {
-                        "押して入力"
-                    };
-                    if ui
-                        .add(egui::Button::new(capture_label).small())
-                        .on_hover_text("次に押したキーをこの欄へ入れます。Esc でキャンセルします")
-                        .clicked()
-                    {
-                        state.command_capture_slot = Some(idx);
-                        state.command_edit_error = None;
-                        state.command_edit_notice = None;
-                    }
-                    if ui
-                        .add(egui::Button::new("解除").small())
-                        .on_hover_text("この行のキー割り当てだけを解除します")
-                        .clicked()
-                    {
-                        state.command_chord_inputs[idx].clear();
-                        if state.command_capture_slot == Some(idx) {
-                            state.command_capture_slot = None;
-                        }
-                        state.command_edit_error = None;
-                        state.command_edit_notice =
-                            Some(format!("キー {} の割り当てを解除しました。", idx + 1));
-                    }
-                    if let Some(source_chord) = state.command_editor_source_chord {
-                        let source_label = source_chord.display_name();
-                        let already_this_row = command_input_matches_chord(
-                            action,
-                            state.command_chord_inputs[idx].as_str(),
-                            source_chord,
-                        );
-                        if already_this_row {
-                            ui.label(egui::RichText::new("選択中").weak());
-                        } else if ui
-                            .add(egui::Button::new("このキーに置換").small())
-                            .on_hover_text(format!(
-                                "キー {} を {} に置き換えます",
-                                idx + 1,
-                                source_label
-                            ))
-                            .clicked()
-                        {
-                            state.command_chord_inputs[idx] = source_label;
-                            state.command_capture_slot = None;
-                            state.command_edit_error = None;
-                            state.command_edit_notice = Some(format!(
-                                "キー {} を {} に置き換えました。「適用して閉じる」で保存します。",
-                                idx + 1,
-                                state.command_chord_inputs[idx]
-                            ));
-                        }
-                    } else {
-                        ui.label("");
-                    }
-                    if let Some(label) = command_slot_conflict_label(
-                        &preview_conflicts,
+                    state.command_edit_error = None;
+                    state.command_edit_notice =
+                        Some(format!("キー {} の割り当てを解除しました。", idx + 1));
+                }
+                if let Some(source_chord) = state.command_editor_source_chord {
+                    let source_label = source_chord.display_name();
+                    let already_this_row = command_input_matches_chord(
                         action,
                         state.command_chord_inputs[idx].as_str(),
-                    ) {
-                        ui.colored_label(egui::Color32::from_rgb(220, 150, 80), label)
-                            .on_hover_text("このキーを同時に使う可能性がある操作があります。必要に応じて片方を変更するか解除してください。");
-                    } else {
-                        ui.label("");
+                        source_chord,
+                    );
+                    if already_this_row {
+                        ui.label(egui::RichText::new("選択中").weak());
+                    } else if ui
+                        .add(egui::Button::new("このキーに置換").small())
+                        .on_hover_text(format!(
+                            "キー {} を {} に置き換えます",
+                            idx + 1,
+                            source_label
+                        ))
+                        .clicked()
+                    {
+                        state.command_chord_inputs[idx] = source_label;
+                        state.command_capture_slot = None;
+                        state.command_edit_error = None;
+                        state.command_edit_notice = Some(format!(
+                            "キー {} を {} に置き換えました。「適用して閉じる」で保存します。",
+                            idx + 1,
+                            state.command_chord_inputs[idx]
+                        ));
                     }
-                    ui.end_row();
                 }
             });
+            if let Some(label) = command_slot_conflict_label(
+                &preview_conflicts,
+                action,
+                state.command_chord_inputs[idx].as_str(),
+            ) {
+                ui.horizontal(|ui| {
+                    ui.add_space(56.0);
+                    ui.colored_label(egui::Color32::from_rgb(220, 150, 80), label)
+                        .on_hover_text("このキーを同時に使う可能性がある操作があります。必要に応じて片方を変更するか解除してください。");
+                });
+            }
+        }
         ui.small("空欄または none の行は保存時に割り当てから外れます。すべて空欄にすると、この操作のキー割り当ては解除されます。");
     }
 
@@ -2665,7 +2662,7 @@ fn command_editor_for_action(
 }
 
 fn command_chord_input_width() -> f32 {
-    260.0
+    300.0
 }
 
 fn chord_assignment_candidate_status(keymap: &Keymap, action: KeyAction, chord: Chord) -> String {
@@ -2881,6 +2878,9 @@ fn poll_command_chord_capture(
     if crate::key_input::is_frame_active() {
         let mut result = None;
         crate::key_input::consume_key_down(false, |edge| {
+            if is_win32_modifier_key(edge.virtual_key) {
+                return false;
+            }
             let Some(name) = KeyName::from_win32(edge.virtual_key, edge.scan_code, edge.extended)
             else {
                 result = Some(Err(format!(
@@ -2934,6 +2934,11 @@ fn poll_command_chord_capture(
         });
         result
     })
+}
+
+#[cfg(windows)]
+fn is_win32_modifier_key(virtual_key: u32) -> bool {
+    matches!(virtual_key, 0x10 | 0x11 | 0x12 | 0xA0..=0xA5)
 }
 
 fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {

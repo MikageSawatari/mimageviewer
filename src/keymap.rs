@@ -2109,7 +2109,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::FileReadingHistory,
         parent: TopMenuId::File,
         label: "読書履歴を開く",
-        action: None,
+        action: Some(KeyAction::GridOpenLocationReadingHistory),
     },
     MenuCommandSpec {
         id: MenuCommandId::FileLocalSearch,
@@ -6852,11 +6852,17 @@ mod tests {
             GlobalOpenFolder = F3
             GlobalLocalSearch = F2
             GlobalFavSearch = none
+            [Grid]
+            GridOpenLocationReadingHistory = Ctrl+L
             "#,
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileOpenFolder),
             "フォルダを開く… (F3)"
+        );
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::FileReadingHistory),
+            "読書履歴を開く (Ctrl+L)"
         );
         assert_eq!(
             keymap.menu_command_label(MenuCommandId::FileLocalSearch),
