@@ -6506,18 +6506,6 @@ mod tests {
             "CycleFavorite".to_string(),
             "GridToggleSnapshotLock".to_string(),
             "ImageOpenFolder".to_string(),
-            // Gamepad fixed-button defaults are exposed as assignable pad actions so users can
-            // swap A/B/X/Y/Select/Start/LB/RB/LT/RT without turning them into keyboard commands.
-            "GamepadAccept".to_string(),
-            "GamepadBack".to_string(),
-            "GamepadPicker".to_string(),
-            "GamepadAuxiliary".to_string(),
-            "GamepadSelectPanel".to_string(),
-            "GamepadFavoritePanel".to_string(),
-            "GamepadPrevFolder".to_string(),
-            "GamepadNextFolder".to_string(),
-            "GamepadLeftTrigger".to_string(),
-            "GamepadRightTrigger".to_string(),
             // These are intentionally fixed because they depend on OS/browser/clipboard routes
             // or reserved navigation semantics rather than ordinary keymap dispatch.
             "GridHistoryBack".to_string(),

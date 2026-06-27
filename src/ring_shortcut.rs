@@ -453,16 +453,6 @@ pub enum RingActionId {
     ToggleWindowMode,
     ToggleMaximize,
     CycleFavorite,
-    GamepadAccept,
-    GamepadBack,
-    GamepadPicker,
-    GamepadAuxiliary,
-    GamepadSelectPanel,
-    GamepadFavoritePanel,
-    GamepadPrevFolder,
-    GamepadNextFolder,
-    GamepadLeftTrigger,
-    GamepadRightTrigger,
     OpenFavorite1,
     OpenFavorite2,
     OpenFavorite3,
@@ -838,16 +828,6 @@ impl RingActionId {
             Self::ToggleWindowMode => "toggle_window_mode",
             Self::ToggleMaximize => "toggle_maximize",
             Self::CycleFavorite => "cycle_favorite",
-            Self::GamepadAccept => "gamepad_accept",
-            Self::GamepadBack => "gamepad_back",
-            Self::GamepadPicker => "gamepad_picker",
-            Self::GamepadAuxiliary => "gamepad_auxiliary",
-            Self::GamepadSelectPanel => "gamepad_select_panel",
-            Self::GamepadFavoritePanel => "gamepad_favorite_panel",
-            Self::GamepadPrevFolder => "gamepad_prev_folder",
-            Self::GamepadNextFolder => "gamepad_next_folder",
-            Self::GamepadLeftTrigger => "gamepad_left_trigger",
-            Self::GamepadRightTrigger => "gamepad_right_trigger",
             Self::OpenFavorite1
             | Self::OpenFavorite2
             | Self::OpenFavorite3
@@ -972,16 +952,6 @@ impl RingActionId {
             "toggle_window_mode" => Self::ToggleWindowMode,
             "toggle_maximize" => Self::ToggleMaximize,
             "cycle_favorite" => Self::CycleFavorite,
-            "gamepad_accept" => Self::GamepadAccept,
-            "gamepad_back" => Self::GamepadBack,
-            "gamepad_picker" => Self::GamepadPicker,
-            "gamepad_auxiliary" => Self::GamepadAuxiliary,
-            "gamepad_select_panel" => Self::GamepadSelectPanel,
-            "gamepad_favorite_panel" => Self::GamepadFavoritePanel,
-            "gamepad_prev_folder" => Self::GamepadPrevFolder,
-            "gamepad_next_folder" => Self::GamepadNextFolder,
-            "gamepad_left_trigger" => Self::GamepadLeftTrigger,
-            "gamepad_right_trigger" => Self::GamepadRightTrigger,
             "open_location_drive_list" => Self::OpenLocationDriveList,
             "open_location_reading_history" => Self::OpenLocationReadingHistory,
             "open_location_rating_1" => Self::OpenLocationRating1,
@@ -1071,16 +1041,6 @@ impl RingActionId {
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::ToggleMaximize => "ウィンドウ最大化/復元",
             Self::CycleFavorite => "お気に入り巡回",
-            Self::GamepadAccept => GamepadButtonSlot::South.default_label(context),
-            Self::GamepadBack => GamepadButtonSlot::East.default_label(context),
-            Self::GamepadPicker => GamepadButtonSlot::West.default_label(context),
-            Self::GamepadAuxiliary => GamepadButtonSlot::North.default_label(context),
-            Self::GamepadSelectPanel => GamepadButtonSlot::Select.default_label(context),
-            Self::GamepadFavoritePanel => GamepadButtonSlot::Start.default_label(context),
-            Self::GamepadPrevFolder => GamepadButtonSlot::LeftShoulder.default_label(context),
-            Self::GamepadNextFolder => GamepadButtonSlot::RightShoulder.default_label(context),
-            Self::GamepadLeftTrigger => GamepadButtonSlot::LeftTrigger.default_label(context),
-            Self::GamepadRightTrigger => GamepadButtonSlot::RightTrigger.default_label(context),
             Self::OpenFavorite1
             | Self::OpenFavorite2
             | Self::OpenFavorite3
@@ -1505,175 +1465,6 @@ fn default_mouse_button_profile() -> MouseButtonProfile {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GamepadButtonSlot {
-    South,
-    East,
-    West,
-    North,
-    Select,
-    Start,
-    LeftShoulder,
-    RightShoulder,
-    LeftTrigger,
-    RightTrigger,
-}
-
-impl GamepadButtonSlot {
-    pub fn all() -> &'static [Self] {
-        const ALL: [GamepadButtonSlot; 10] = [
-            GamepadButtonSlot::South,
-            GamepadButtonSlot::East,
-            GamepadButtonSlot::West,
-            GamepadButtonSlot::North,
-            GamepadButtonSlot::Select,
-            GamepadButtonSlot::Start,
-            GamepadButtonSlot::LeftShoulder,
-            GamepadButtonSlot::RightShoulder,
-            GamepadButtonSlot::LeftTrigger,
-            GamepadButtonSlot::RightTrigger,
-        ];
-        &ALL
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::South => "A",
-            Self::East => "B",
-            Self::West => "X",
-            Self::North => "Y",
-            Self::Select => "Select",
-            Self::Start => "Start",
-            Self::LeftShoulder => "LB",
-            Self::RightShoulder => "RB",
-            Self::LeftTrigger => "LT",
-            Self::RightTrigger => "RT",
-        }
-    }
-
-    pub fn default_label(self, context: RingShortcutContext) -> &'static str {
-        match self.default_action() {
-            RingActionId::GamepadAccept => match context {
-                RingShortcutContext::Grid => "決定 / 開く",
-                RingShortcutContext::ImageFullscreen => "次の画像",
-                RingShortcutContext::VideoFullscreen => "再生 / 一時停止",
-            },
-            RingActionId::GamepadBack => match context {
-                RingShortcutContext::Grid => "戻る",
-                RingShortcutContext::ImageFullscreen => "フルスクリーンを閉じる",
-                RingShortcutContext::VideoFullscreen => "動画を閉じる",
-            },
-            RingActionId::GamepadPicker => "ピッカー",
-            RingActionId::GamepadAuxiliary => match context {
-                RingShortcutContext::Grid => "フォルダツリー",
-                RingShortcutContext::ImageFullscreen => "補助操作",
-                RingShortcutContext::VideoFullscreen => "タイルモード",
-            },
-            RingActionId::GamepadSelectPanel => match context {
-                RingShortcutContext::Grid => "場所パネル",
-                RingShortcutContext::ImageFullscreen => "見開き切替",
-                RingShortcutContext::VideoFullscreen => "マーカー移動",
-            },
-            RingActionId::GamepadFavoritePanel => "お気に入り",
-            RingActionId::GamepadPrevFolder => "前フォルダ",
-            RingActionId::GamepadNextFolder => "次フォルダ",
-            RingActionId::GamepadLeftTrigger => match context {
-                RingShortcutContext::Grid => "スクロール",
-                RingShortcutContext::ImageFullscreen => "ズームアウト",
-                RingShortcutContext::VideoFullscreen => "左シーク",
-            },
-            RingActionId::GamepadRightTrigger => match context {
-                RingShortcutContext::Grid => "スクロール",
-                RingShortcutContext::ImageFullscreen => "ズームイン",
-                RingShortcutContext::VideoFullscreen => "右シーク",
-            },
-            _ => unreachable!("gamepad default action is constrained"),
-        }
-    }
-
-    pub fn default_action(self) -> RingActionId {
-        match self {
-            Self::South => RingActionId::GamepadAccept,
-            Self::East => RingActionId::GamepadBack,
-            Self::West => RingActionId::GamepadPicker,
-            Self::North => RingActionId::GamepadAuxiliary,
-            Self::Select => RingActionId::GamepadSelectPanel,
-            Self::Start => RingActionId::GamepadFavoritePanel,
-            Self::LeftShoulder => RingActionId::GamepadPrevFolder,
-            Self::RightShoulder => RingActionId::GamepadNextFolder,
-            Self::LeftTrigger => RingActionId::GamepadLeftTrigger,
-            Self::RightTrigger => RingActionId::GamepadRightTrigger,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct GamepadButtonProfile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub south: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub east: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub west: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub north: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub select: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub left_shoulder: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub right_shoulder: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub left_trigger: Option<RingActionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub right_trigger: Option<RingActionId>,
-}
-
-impl GamepadButtonProfile {
-    pub fn action(&self, slot: GamepadButtonSlot) -> Option<RingActionId> {
-        match slot {
-            GamepadButtonSlot::South => self.south.clone(),
-            GamepadButtonSlot::East => self.east.clone(),
-            GamepadButtonSlot::West => self.west.clone(),
-            GamepadButtonSlot::North => self.north.clone(),
-            GamepadButtonSlot::Select => self.select.clone(),
-            GamepadButtonSlot::Start => self.start.clone(),
-            GamepadButtonSlot::LeftShoulder => self.left_shoulder.clone(),
-            GamepadButtonSlot::RightShoulder => self.right_shoulder.clone(),
-            GamepadButtonSlot::LeftTrigger => self.left_trigger.clone(),
-            GamepadButtonSlot::RightTrigger => self.right_trigger.clone(),
-        }
-    }
-
-    pub fn set_action(&mut self, slot: GamepadButtonSlot, action: Option<RingActionId>) {
-        match slot {
-            GamepadButtonSlot::South => self.south = action,
-            GamepadButtonSlot::East => self.east = action,
-            GamepadButtonSlot::West => self.west = action,
-            GamepadButtonSlot::North => self.north = action,
-            GamepadButtonSlot::Select => self.select = action,
-            GamepadButtonSlot::Start => self.start = action,
-            GamepadButtonSlot::LeftShoulder => self.left_shoulder = action,
-            GamepadButtonSlot::RightShoulder => self.right_shoulder = action,
-            GamepadButtonSlot::LeftTrigger => self.left_trigger = action,
-            GamepadButtonSlot::RightTrigger => self.right_trigger = action,
-        }
-    }
-
-    pub fn sanitize(&mut self, context: RingShortcutContext) {
-        for &slot in GamepadButtonSlot::all() {
-            if self
-                .action(slot)
-                .is_some_and(|action| !action.is_valid_for_context(context))
-            {
-                self.set_action(slot, Some(RingActionId::None));
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WheelPairActionId {
     None,
@@ -1862,12 +1653,6 @@ pub struct RingShortcutSettings {
     #[serde(default = "default_mouse_button_profile")]
     pub mouse_buttons_video: MouseButtonProfile,
     #[serde(default)]
-    pub gamepad_buttons_grid: GamepadButtonProfile,
-    #[serde(default)]
-    pub gamepad_buttons_image: GamepadButtonProfile,
-    #[serde(default)]
-    pub gamepad_buttons_video: GamepadButtonProfile,
-    #[serde(default)]
     pub mouse_nav_prompt_done: bool,
     #[serde(default)]
     pub x_picker_hint_shown: bool,
@@ -1993,29 +1778,6 @@ impl RingShortcutSettings {
         *self.mouse_button_profile_mut(context) = default_mouse_button_profile();
     }
 
-    pub fn gamepad_button_profile(&self, context: RingShortcutContext) -> &GamepadButtonProfile {
-        match context {
-            RingShortcutContext::Grid => &self.gamepad_buttons_grid,
-            RingShortcutContext::ImageFullscreen => &self.gamepad_buttons_image,
-            RingShortcutContext::VideoFullscreen => &self.gamepad_buttons_video,
-        }
-    }
-
-    pub fn gamepad_button_profile_mut(
-        &mut self,
-        context: RingShortcutContext,
-    ) -> &mut GamepadButtonProfile {
-        match context {
-            RingShortcutContext::Grid => &mut self.gamepad_buttons_grid,
-            RingShortcutContext::ImageFullscreen => &mut self.gamepad_buttons_image,
-            RingShortcutContext::VideoFullscreen => &mut self.gamepad_buttons_video,
-        }
-    }
-
-    pub fn reset_gamepad_button_profile(&mut self, context: RingShortcutContext) {
-        *self.gamepad_button_profile_mut(context) = GamepadButtonProfile::default();
-    }
-
     pub fn set_mouse_buttons_from_legacy_pair(&mut self, action: MouseBackForwardActionId) {
         let Some((back, forward)) = legacy_mouse_button_pair(action) else {
             return;
@@ -2046,12 +1808,6 @@ impl RingShortcutSettings {
         self.mouse_buttons_image
             .sanitize(RingShortcutContext::ImageFullscreen);
         self.mouse_buttons_video
-            .sanitize(RingShortcutContext::VideoFullscreen);
-        self.gamepad_buttons_grid
-            .sanitize(RingShortcutContext::Grid);
-        self.gamepad_buttons_image
-            .sanitize(RingShortcutContext::ImageFullscreen);
-        self.gamepad_buttons_video
             .sanitize(RingShortcutContext::VideoFullscreen);
         if matches!(self.shift_wheel_pair, WheelPairActionId::Unknown(_)) {
             self.shift_wheel_pair = WheelPairActionId::None;
@@ -2093,9 +1849,6 @@ impl Default for RingShortcutSettings {
             mouse_buttons_grid: default_mouse_button_profile(),
             mouse_buttons_image: default_mouse_button_profile(),
             mouse_buttons_video: default_mouse_button_profile(),
-            gamepad_buttons_grid: GamepadButtonProfile::default(),
-            gamepad_buttons_image: GamepadButtonProfile::default(),
-            gamepad_buttons_video: GamepadButtonProfile::default(),
             mouse_nav_prompt_done: false,
             x_picker_hint_shown: false,
             mouse_ring_help_visible: true,
@@ -2522,10 +2275,6 @@ mod tests {
             let profile = defaults.mouse_button_profile(context);
             assert_eq!(profile.back, RingActionId::GridHistoryBack);
             assert_eq!(profile.forward, RingActionId::GridHistoryForward);
-            let gamepad_buttons = defaults.gamepad_button_profile(context);
-            for &slot in GamepadButtonSlot::all() {
-                assert_eq!(gamepad_buttons.action(slot), None);
-            }
         }
         assert_eq!(defaults.mouse_nav_prompt_done, false);
         assert_eq!(defaults.x_picker_hint_shown, false);
@@ -2757,55 +2506,6 @@ mod tests {
     }
 
     #[test]
-    fn gamepad_default_actions_round_trip_but_are_not_user_candidates() {
-        let samples = [
-            (RingActionId::GamepadAccept, "gamepad_accept"),
-            (RingActionId::GamepadBack, "gamepad_back"),
-            (RingActionId::GamepadPicker, "gamepad_picker"),
-            (RingActionId::GamepadAuxiliary, "gamepad_auxiliary"),
-            (RingActionId::GamepadSelectPanel, "gamepad_select_panel"),
-            (RingActionId::GamepadFavoritePanel, "gamepad_favorite_panel"),
-            (RingActionId::GamepadPrevFolder, "gamepad_prev_folder"),
-            (RingActionId::GamepadNextFolder, "gamepad_next_folder"),
-            (RingActionId::GamepadLeftTrigger, "gamepad_left_trigger"),
-            (RingActionId::GamepadRightTrigger, "gamepad_right_trigger"),
-        ];
-
-        for (action, id) in samples {
-            assert_eq!(action.as_str(), id);
-            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
-            for &context in RingShortcutContext::all() {
-                assert!(!action.is_valid_for_context(context));
-                assert!(
-                    !RingActionId::available_for_context(context).contains(&action),
-                    "gamepad default actions should stay out of ring/mouse/X+direction candidates"
-                );
-            }
-        }
-
-        assert_eq!(
-            GamepadButtonSlot::South.default_action(),
-            RingActionId::GamepadAccept
-        );
-        assert_eq!(
-            GamepadButtonSlot::East.default_action(),
-            RingActionId::GamepadBack
-        );
-        assert_eq!(
-            RingActionId::GamepadAccept.label_for_context(RingShortcutContext::Grid),
-            "決定 / 開く"
-        );
-        assert_eq!(
-            RingActionId::GamepadBack.label_for_context(RingShortcutContext::ImageFullscreen),
-            "フルスクリーンを閉じる"
-        );
-        assert_eq!(
-            RingActionId::GamepadAccept.label_for_context(RingShortcutContext::VideoFullscreen),
-            "再生 / 一時停止"
-        );
-    }
-
-    #[test]
     fn mouse_flick_static_guide_waits_until_long_press() {
         let pos = egui::pos2(10.0, 20.0);
         let flick = MouseFlickState::new(
@@ -2842,21 +2542,6 @@ mod tests {
         settings.mouse_buttons_grid.back = RingActionId::Unknown("future_mouse_button".to_string());
         settings.mouse_buttons_image.forward = RingActionId::VideoCapture;
         settings.mouse_buttons_video.back = RingActionId::ImageCapture;
-        settings
-            .gamepad_button_profile_mut(RingShortcutContext::Grid)
-            .set_action(
-                GamepadButtonSlot::LeftTrigger,
-                Some(RingActionId::Unknown("future_gamepad_button".to_string())),
-            );
-        settings
-            .gamepad_button_profile_mut(RingShortcutContext::ImageFullscreen)
-            .set_action(
-                GamepadButtonSlot::RightTrigger,
-                Some(RingActionId::VideoMute),
-            );
-        settings
-            .gamepad_button_profile_mut(RingShortcutContext::VideoFullscreen)
-            .set_action(GamepadButtonSlot::Select, Some(RingActionId::ImageCapture));
         settings.right_drag_grid = Some(RightDragMode::Unknown("future_mode".to_string()));
         settings.right_drag_image = Some(RightDragMode::MouseGesture);
         settings
@@ -2886,24 +2571,6 @@ mod tests {
         assert_eq!(settings.mouse_buttons_grid.back, RingActionId::None);
         assert_eq!(settings.mouse_buttons_image.forward, RingActionId::None);
         assert_eq!(settings.mouse_buttons_video.back, RingActionId::None);
-        assert_eq!(
-            settings
-                .gamepad_button_profile(RingShortcutContext::Grid)
-                .action(GamepadButtonSlot::LeftTrigger),
-            Some(RingActionId::None)
-        );
-        assert_eq!(
-            settings
-                .gamepad_button_profile(RingShortcutContext::ImageFullscreen)
-                .action(GamepadButtonSlot::RightTrigger),
-            Some(RingActionId::None)
-        );
-        assert_eq!(
-            settings
-                .gamepad_button_profile(RingShortcutContext::VideoFullscreen)
-                .action(GamepadButtonSlot::Select),
-            Some(RingActionId::None)
-        );
         assert_eq!(
             settings.right_drag_mode(RightDragContext::Grid),
             RightDragMode::Disabled

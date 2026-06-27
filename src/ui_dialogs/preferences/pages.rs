@@ -6,8 +6,8 @@ use crate::keymap::{
     parse_chord_for_action,
 };
 use crate::ring_shortcut::{
-    GamepadButtonSlot, MouseGestureDirection, RightDragContext, RightDragMode, RingActionId,
-    RingDirection, RingShortcutContext, RingShortcutSettings, format_mouse_gesture_pattern,
+    MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
+    RingShortcutContext, RingShortcutSettings, format_mouse_gesture_pattern,
     mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
@@ -508,9 +508,7 @@ pub(super) fn page_gamepad_assignments(
     state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
-    ui.small(
-        "ゲームパッド固定ボタン単体のカスタマイズは現在無効です。X+方向リングだけ編集できます。",
-    );
+    ui.small("固定ボタンは既定動作で使い、X+方向リングだけ編集できます。");
     ui.add_space(8.0);
     gamepad_layout_preview(ui, context);
     ui.add_space(12.0);
@@ -3771,20 +3769,20 @@ fn ring_slot_assignment_editor(
 fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
     ui.group(|ui| {
         ui.label(egui::RichText::new("ゲームパッド固定ボタン").strong());
-        ui.small("固定ボタン単体の動作は現在カスタマイズ対象外です。下の X+方向リングだけ編集できます。");
+        ui.small("固定ボタンは既定動作で使い、下の X+方向リングだけ編集できます。");
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 gamepad_fixed_button_label(
                     ui,
-                    context,
-                    GamepadButtonSlot::LeftTrigger,
+                    "LT",
+                    gamepad_left_trigger_label(context),
                     gamepad_trigger_tooltip(context, false),
                 );
                 gamepad_fixed_button_label(
                     ui,
-                    context,
-                    GamepadButtonSlot::LeftShoulder,
+                    "LB",
+                    "前フォルダ",
                     "前のフォルダへ移動します。",
                 );
                 ui.add_space(4.0);
@@ -3797,14 +3795,14 @@ fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
                 ui.horizontal(|ui| {
                     gamepad_fixed_button_label(
                         ui,
-                        context,
-                        GamepadButtonSlot::Select,
+                        "Select",
+                        gamepad_select_label(context),
                         gamepad_select_tooltip(context),
                     );
                     gamepad_fixed_button_label(
                         ui,
-                        context,
-                        GamepadButtonSlot::Start,
+                        "Start",
+                        "お気に入り",
                         "お気に入りの移動パネルを開きます。",
                     );
                 });
@@ -3825,14 +3823,14 @@ fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
             ui.vertical(|ui| {
                 gamepad_fixed_button_label(
                     ui,
-                    context,
-                    GamepadButtonSlot::RightTrigger,
+                    "RT",
+                    gamepad_right_trigger_label(context),
                     gamepad_trigger_tooltip(context, true),
                 );
                 gamepad_fixed_button_label(
                     ui,
-                    context,
-                    GamepadButtonSlot::RightShoulder,
+                    "RB",
+                    "次フォルダ",
                     "次のフォルダへ移動します。",
                 );
                 ui.add_space(4.0);
@@ -3843,27 +3841,27 @@ fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
                         ui.label("");
                         gamepad_fixed_button_label(
                             ui,
-                            context,
-                            GamepadButtonSlot::North,
+                            "Y",
+                            gamepad_y_label(context),
                             gamepad_y_tooltip(context),
                         );
                         ui.end_row();
                         gamepad_fixed_button_label(
                             ui,
-                            context,
-                            GamepadButtonSlot::West,
+                            "X",
+                            "ピッカー",
                             "X 単体でピッカーパネルを開きます。X を押しながら方向入力すると、下の X+方向リングを実行します。",
                         );
                         gamepad_fixed_button_label(
                             ui,
-                            context,
-                            GamepadButtonSlot::East,
+                            "B",
+                            gamepad_b_label(context),
                             gamepad_b_tooltip(context),
                         );
                         gamepad_fixed_button_label(
                             ui,
-                            context,
-                            GamepadButtonSlot::South,
+                            "A",
+                            gamepad_a_label(context),
                             gamepad_a_tooltip(context),
                         );
                         ui.end_row();
@@ -3880,15 +3878,9 @@ fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
     });
 }
 
-fn gamepad_fixed_button_label(
-    ui: &mut egui::Ui,
-    context: RingShortcutContext,
-    slot: GamepadButtonSlot,
-    tooltip: &str,
-) {
-    let mut hover = format!("{tooltip}\n\n既定: {}", slot.default_label(context));
-    hover.push_str("\n固定ボタン単体のカスタマイズは現在無効です。");
-    gamepad_button_label(ui, slot.label(), slot.default_label(context), &hover);
+fn gamepad_fixed_button_label(ui: &mut egui::Ui, button: &str, default_label: &str, tooltip: &str) {
+    let hover = format!("{tooltip}\n\n既定: {default_label}");
+    gamepad_button_label(ui, button, default_label, &hover);
 }
 
 fn gamepad_button_label(ui: &mut egui::Ui, button: &str, label: &str, tooltip: &str) {
@@ -4021,6 +4013,22 @@ fn gamepad_direction_tooltip(context: RingShortcutContext, direction: &str) -> &
     }
 }
 
+fn gamepad_left_trigger_label(context: RingShortcutContext) -> &'static str {
+    match context {
+        RingShortcutContext::Grid => "スクロール",
+        RingShortcutContext::ImageFullscreen => "ズームアウト",
+        RingShortcutContext::VideoFullscreen => "左シーク",
+    }
+}
+
+fn gamepad_right_trigger_label(context: RingShortcutContext) -> &'static str {
+    match context {
+        RingShortcutContext::Grid => "スクロール",
+        RingShortcutContext::ImageFullscreen => "ズームイン",
+        RingShortcutContext::VideoFullscreen => "右シーク",
+    }
+}
+
 fn gamepad_trigger_tooltip(context: RingShortcutContext, right: bool) -> &'static str {
     match context {
         RingShortcutContext::Grid => "サムネイル一覧ではスクロールに使います。",
@@ -4032,11 +4040,27 @@ fn gamepad_trigger_tooltip(context: RingShortcutContext, right: bool) -> &'stati
     }
 }
 
+fn gamepad_select_label(context: RingShortcutContext) -> &'static str {
+    match context {
+        RingShortcutContext::Grid => "場所パネル",
+        RingShortcutContext::ImageFullscreen => "見開き切替",
+        RingShortcutContext::VideoFullscreen => "マーカー移動",
+    }
+}
+
 fn gamepad_select_tooltip(context: RingShortcutContext) -> &'static str {
     match context {
         RingShortcutContext::Grid => "場所移動パネルを開きます。",
         RingShortcutContext::ImageFullscreen => "見開き表示を切り替えます。",
         RingShortcutContext::VideoFullscreen => "ブックマーク / チャプターの移動パネルを開きます。",
+    }
+}
+
+fn gamepad_y_label(context: RingShortcutContext) -> &'static str {
+    match context {
+        RingShortcutContext::Grid => "フォルダツリー",
+        RingShortcutContext::ImageFullscreen => "補助操作",
+        RingShortcutContext::VideoFullscreen => "タイルモード",
     }
 }
 
@@ -4054,6 +4078,14 @@ fn gamepad_y_tooltip(context: RingShortcutContext) -> &'static str {
     }
 }
 
+fn gamepad_a_label(context: RingShortcutContext) -> &'static str {
+    match context {
+        RingShortcutContext::Grid => "決定 / 開く",
+        RingShortcutContext::ImageFullscreen => "次の画像",
+        RingShortcutContext::VideoFullscreen => "再生 / 一時停止",
+    }
+}
+
 fn gamepad_a_tooltip(context: RingShortcutContext) -> &'static str {
     match context {
         RingShortcutContext::Grid => "選択中の項目を開きます。",
@@ -4061,6 +4093,14 @@ fn gamepad_a_tooltip(context: RingShortcutContext) -> &'static str {
         RingShortcutContext::VideoFullscreen => {
             "再生 / 一時停止または決定操作として Enter 相当を送ります。"
         }
+    }
+}
+
+fn gamepad_b_label(context: RingShortcutContext) -> &'static str {
+    match context {
+        RingShortcutContext::Grid => "戻る",
+        RingShortcutContext::ImageFullscreen => "閉じる",
+        RingShortcutContext::VideoFullscreen => "閉じる",
     }
 }
 

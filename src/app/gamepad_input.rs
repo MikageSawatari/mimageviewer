@@ -4081,34 +4081,6 @@ impl App {
                 self.toggle_main_window_maximized(ctx);
                 None
             }
-            RingActionId::GamepadAccept => self.handle_gamepad_accept(ctx),
-            RingActionId::GamepadBack => self.handle_gamepad_back(ctx),
-            RingActionId::GamepadPicker => {
-                self.open_gamepad_ring_picker(ctx);
-                None
-            }
-            RingActionId::GamepadAuxiliary => {
-                self.handle_gamepad_y_tap(ctx);
-                None
-            }
-            RingActionId::GamepadSelectPanel => self.handle_gamepad_select(ctx),
-            RingActionId::GamepadFavoritePanel => self.handle_gamepad_start(ctx),
-            RingActionId::GamepadPrevFolder => {
-                self.handle_gamepad_folder_nav(ctx, false);
-                None
-            }
-            RingActionId::GamepadNextFolder => {
-                self.handle_gamepad_folder_nav(ctx, true);
-                None
-            }
-            RingActionId::GamepadLeftTrigger => {
-                self.apply_gamepad_default_trigger(ctx, context, true);
-                None
-            }
-            RingActionId::GamepadRightTrigger => {
-                self.apply_gamepad_default_trigger(ctx, context, false);
-                None
-            }
             RingActionId::CycleFavorite => self.handle_gamepad_start(ctx),
             RingActionId::AddToBook => {
                 self.apply_ring_add_to_book(ctx, context);
@@ -4377,31 +4349,6 @@ impl App {
         if cols != self.settings.grid_cols {
             self.settings.grid_cols = cols;
             self.settings.save();
-        }
-    }
-
-    fn apply_gamepad_default_trigger(
-        &mut self,
-        ctx: &egui::Context,
-        context: RingShortcutContext,
-        left: bool,
-    ) {
-        match context {
-            RingShortcutContext::Grid => {
-                self.scroll_gamepad_grid(if left { -1.0 } else { 1.0 });
-            }
-            RingShortcutContext::ImageFullscreen => {
-                let axis = if left { -1.0 } else { 1.0 };
-                if self.apply_gamepad_fullscreen_zoom(axis, TRIGGER_STEP_INTERVAL.as_secs_f32()) {
-                    ctx.request_repaint();
-                }
-            }
-            RingShortcutContext::VideoFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx {
-                    let vk = if left { 0x25 } else { 0x27 };
-                    self.dispatch_native_video_key(ctx, fs_idx, vk, false, false, false);
-                }
-            }
         }
     }
 
