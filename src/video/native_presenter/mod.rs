@@ -2867,8 +2867,11 @@ impl NativeVideoPresenter {
         events: &[crate::video::native_window::NativeVideoWindowEvent],
     ) -> Result<NativeOverlayInputOutcome, String> {
         let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
+            let modal_dialog_active_before_events = overlay.modal_dialog_active_for_routing();
             overlay.push_native_events(events);
-            overlay.render_if_dirty()?
+            let mut outcome = overlay.render_if_dirty()?;
+            outcome.routing.modal_dialog_active |= modal_dialog_active_before_events;
+            outcome
         } else {
             NativeOverlayInputOutcome::empty()
         };
@@ -4922,14 +4925,18 @@ impl NativeEguiOverlay {
         routing.consumed_wheel = consumed_wheel;
         // モーダル中央テキストダイアログの表示中は、App へ raw event を流さない
         // (Codex C1/C2/C3: dark backdrop 上の wheel/right-click が暴発する事故防止)。
-        routing.modal_dialog_active = self.bulk_bookmark_dialog.is_some()
-            || self.bookmark_title_edit.is_some()
-            || self.shortcut_help_open;
+        routing.modal_dialog_active = self.modal_dialog_active_for_routing();
         Ok(NativeOverlayInputOutcome {
             routing,
             commands,
             hud_regions: self.compute_hud_regions(),
         })
+    }
+
+    fn modal_dialog_active_for_routing(&self) -> bool {
+        self.bulk_bookmark_dialog.is_some()
+            || self.bookmark_title_edit.is_some()
+            || self.shortcut_help_open
     }
 
     /// CP5: 現在表示中の overlay UI 要素の物理ピクセル RECT を集める。
