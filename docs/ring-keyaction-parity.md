@@ -52,7 +52,7 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 |---|---|---|---|
 | `TreeFolderPrev` / `TreeFolderNext` | Ctrl+↑↓ 生処理 (`src/app.rs`) | **KeyAction 化**推奨 (Backspace/F11 と同じ問題) | ✅ `GridTreeFolderPrev` / `GridTreeFolderNext` として KeyAction 化。既定 Ctrl+↑ / Ctrl+↓ |
 | `SiblingFolderPrev` / `SiblingFolderNext` | グリッド側 Ctrl+PageUp/PageDown 生処理。FS は `FsSiblingPrev/Next` ✅ | KeyAction 化 or 固定明記 | ✅ グリッド側を `GridSiblingFolderPrev` / `GridSiblingFolderNext` として KeyAction 化。既定 Ctrl+PageUp / Ctrl+PageDown |
-| `GridHistoryBack` / `GridHistoryForward` | マウス戻る/進むボタンと Alt+←/→ 固定入力 | キー希望なら KeyAction、不要なら固定明記 | 固定。マウス戻る/進む・ブラウザ戻る/進む hook と Alt+←/→ を同じ履歴経路へ畳む OS/マウス入力なので keymap 対象外 |
+| `GridHistoryBack` / `GridHistoryForward` | Alt+←/→ + マウス戻る/進むボタン | KeyAction 化 | ✅ `GridHistoryBack` / `GridHistoryForward` として KeyAction 化。既定 Alt+← / Alt+→。マウス戻る/進むボタンは別のマウス割り当てとして同じ履歴経路へ流す |
 | `ImageHome` / `ImageEnd` | Home/End 生処理 | KeyAction 化 | ✅ `FsJumpFirst` / `FsJumpLast` として KeyAction 化。既定 Home / End。画像 / 動画フルスクリーン共通 |
 | `ImageCopyToClipboard` | ring/マウス/パッドから clipboard copy を実行 | 固定明記が妥当 | 固定。OS クリップボード経路で、通常の Ctrl+C / Shell menu / context menu と同じ固定入力レイヤーに置く |
 | `ImageCopyPath` / `ImageCopyFileName` | ring/マウス/パッドからパス / ファイル名を clipboard へコピー | 固定明記 or KeyAction | 固定。OS クリップボード / Shell 連携として keymap 対象外 |

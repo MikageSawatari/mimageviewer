@@ -29,7 +29,6 @@
 #   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
 #   OS が予約しているショートカットは keymap.ini では上書きできません。
-# - native 動画フルスクリーンでは Alt を含む組み合わせはアプリ側へ転送されません。
 # - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、
 #   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーションは固定です。
 #
@@ -141,7 +140,10 @@
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
 # GridOpenSelected = Enter ; 選択中の項目を開く
 # GridOpenExternalPlayer = Shift+Enter ; 選択中の動画を外部プレイヤーで開く
-# GridParentFolder = Backspace ; 親フォルダへ移動する
+# GridParentFolder.1 = Backspace ; 親フォルダへ移動する
+# GridParentFolder.2 = Alt+Up ; 親フォルダへ移動する
+# GridHistoryBack = Alt+Left ; フォルダ履歴を戻る
+# GridHistoryForward = Alt+Right ; フォルダ履歴を進む
 # GridMoveFirst = Home ; 先頭の項目へ移動する
 # GridMoveLast = End ; 末尾の項目へ移動する
 # GridPagePrev = PageUp ; 1ページ分前へ移動する

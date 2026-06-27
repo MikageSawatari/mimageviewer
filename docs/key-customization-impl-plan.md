@@ -486,7 +486,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /
   GridParentFolder `Backspace` (P) / GridToggleCheck `Space` (P)
 - GridTreeFolderPrev/Next `Ctrl+↑/↓` (P) / GridSiblingFolderPrev/Next `Ctrl+PageUp/Down` (P)
-- GridParentAlt `Alt+↑` (P) / GridHistoryBack/Forward `Alt+←/→` (P)
+- GridParentFolder `Alt+↑` (P, `Backspace` と同一 Action の別既定割り当て) / GridHistoryBack/Forward `Alt+←/→` (P)
 - GridMoveFirst/Last `Home/End` (P) / GridPagePrev/Next `PageUp/PageDown` (P)
 - GridToggleFolderTreePane `F` (P) / GridToggleMaximize `F11` (P) /
   GridDelete `Delete` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /

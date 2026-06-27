@@ -3150,6 +3150,36 @@ impl App {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
     }
 
+    #[cfg(windows)]
+    fn install_key_input_subclass_for_viewport_rect(
+        &self,
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        use windows::Win32::Foundation::{HWND, RECT};
+
+        let Some(main_hwnd) = self.main_hwnd else {
+            return;
+        };
+        let scale = pixels_per_point.max(0.5);
+        let expected = RECT {
+            left: (outer_rect.min.x * scale).round() as i32,
+            top: (outer_rect.min.y * scale).round() as i32,
+            right: (outer_rect.max.x * scale).round() as i32,
+            bottom: (outer_rect.max.y * scale).round() as i32,
+        };
+        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect(
+            HWND(main_hwnd as *mut _),
+            expected,
+        ) else {
+            return;
+        };
+        let hwnd_raw = hwnd.0 as usize as u64;
+        if hwnd_raw != 0 {
+            crate::key_input::install_viewport_window_subclass(hwnd_raw);
+        }
+    }
+
     fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
         !is_video
             && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
@@ -4024,6 +4054,20 @@ impl App {
                 // 既に更新済みなので二重処理しない。
                 if !embedded {
                     self.update_ime_state(ctx);
+                }
+                #[cfg(windows)]
+                if !embedded {
+                    let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
+                        let vp = i.viewport();
+                        (
+                            vp.outer_rect,
+                            i.pixels_per_point,
+                            vp.minimized.unwrap_or(false),
+                        )
+                    });
+                    if !minimized && let Some(rect) = outer_rect {
+                        self.install_key_input_subclass_for_viewport_rect(rect, pixels_per_point);
+                    }
                 }
                 #[cfg(windows)]
                 if detached {

@@ -8571,12 +8571,10 @@ mod tests {
     }
 
     #[test]
-    fn native_video_fullscreen_shortcut_key_ignores_alt_combos() {
-        let mut event = key(0x20);
-        assert!(native_video_fullscreen_shortcut_key(&event));
-
+    fn native_video_fullscreen_shortcut_key_allows_alt_keymap_combos() {
+        let mut event = key(0x43);
         event.alt = true;
-        assert!(!native_video_fullscreen_shortcut_key(&event));
+        assert!(native_video_fullscreen_shortcut_key(&event));
     }
 
     #[test]

@@ -1231,6 +1231,8 @@ pub enum KeyAction {
     GridOpenSelected,
     GridOpenExternalPlayer,
     GridParentFolder,
+    GridHistoryBack,
+    GridHistoryForward,
     GridMoveFirst,
     GridMoveLast,
     GridPagePrev,
@@ -1591,6 +1593,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenSelected,
     KeyAction::GridOpenExternalPlayer,
     KeyAction::GridParentFolder,
+    KeyAction::GridHistoryBack,
+    KeyAction::GridHistoryForward,
     KeyAction::GridMoveFirst,
     KeyAction::GridMoveLast,
     KeyAction::GridPagePrev,
@@ -2840,6 +2844,8 @@ impl KeyAction {
             GridOpenSelected => "GridOpenSelected",
             GridOpenExternalPlayer => "GridOpenExternalPlayer",
             GridParentFolder => "GridParentFolder",
+            GridHistoryBack => "GridHistoryBack",
+            GridHistoryForward => "GridHistoryForward",
             GridMoveFirst => "GridMoveFirst",
             GridMoveLast => "GridMoveLast",
             GridPagePrev => "GridPagePrev",
@@ -3291,6 +3297,8 @@ impl KeyAction {
             GridOpenSelected => "選択中の項目を開く",
             GridOpenExternalPlayer => "選択中の動画を外部プレイヤーで開く",
             GridParentFolder => "親フォルダへ移動する",
+            GridHistoryBack => "フォルダ履歴を戻る",
+            GridHistoryForward => "フォルダ履歴を進む",
             GridMoveFirst => "先頭の項目へ移動する",
             GridMoveLast => "末尾の項目へ移動する",
             GridPagePrev => "1ページ分前へ移動する",
@@ -3654,6 +3662,8 @@ impl KeyAction {
             | GridOpenSelected
             | GridOpenExternalPlayer
             | GridParentFolder
+            | GridHistoryBack
+            | GridHistoryForward
             | GridMoveFirst
             | GridMoveLast
             | GridPagePrev
@@ -3976,6 +3986,8 @@ impl KeyAction {
             | GridOpenSelected
             | GridOpenExternalPlayer
             | GridParentFolder
+            | GridHistoryBack
+            | GridHistoryForward
             | GridMoveFirst
             | GridMoveLast
             | GridPagePrev
@@ -4332,7 +4344,9 @@ impl KeyAction {
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridOpenSelected => ChordList::one(Chord::key(Enter)),
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
-            GridParentFolder => ChordList::one(Chord::key(Backspace)),
+            GridParentFolder => ChordList::two(Chord::key(Backspace), Chord::alt(Up)),
+            GridHistoryBack => ChordList::one(Chord::alt(Left)),
+            GridHistoryForward => ChordList::one(Chord::alt(Right)),
             GridMoveFirst => ChordList::one(Chord::key(Home)),
             GridMoveLast => ChordList::one(Chord::key(End)),
             GridPagePrev => ChordList::one(Chord::key(PageUp)),
@@ -4682,6 +4696,27 @@ pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
         || ACTIVE_SCOPE_SETS
             .iter()
             .any(|set| set.contains(&a) && set.contains(&b))
+}
+
+fn is_overlay_edit_scope(scope: CommandScope) -> bool {
+    matches!(
+        scope,
+        KeyContext::Erase
+            | KeyContext::Conceal
+            | KeyContext::Crop
+            | KeyContext::Text
+            | KeyContext::LocalAdjust
+    )
+}
+
+fn help_context_shortcuts_overlaps_scope(action: KeyAction, scope: CommandScope) -> bool {
+    action == KeyAction::HelpShowContextShortcuts && is_overlay_edit_scope(scope)
+}
+
+fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
+    command_scopes_overlap(first.context(), second.context())
+        || help_context_shortcuts_overlaps_scope(first, second.context())
+        || help_context_shortcuts_overlaps_scope(second, first.context())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -5144,7 +5179,7 @@ impl Keymap {
                     || first.action == second.action
                     || !first.action.is_user_facing()
                     || !second.action.is_user_facing()
-                    || !command_scopes_overlap(first.scope, second.scope)
+                    || !actions_can_overlap(first.action, second.action)
                     || !(first.customized || second.customized)
                 {
                     continue;
@@ -5670,9 +5705,6 @@ impl Keymap {
         );
         out.push_str("#   OS が予約しているショートカットは keymap.ini では上書きできません。\n");
         out.push_str(
-            "# - native 動画フルスクリーンでは Alt を含む組み合わせはアプリ側へ転送されません。\n",
-        );
-        out.push_str(
             "# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、\n",
         );
         out.push_str("#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーションは固定です。\n");
@@ -6027,9 +6059,6 @@ fn modifier_held_via_os(kind: ModKind) -> bool {
 pub fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
-    if key.alt {
-        return false;
-    }
     if native_video_fixed_shortcut_key(key.virtual_key) {
         return true;
     }
@@ -6056,7 +6085,6 @@ pub fn native_video_fullscreen_shortcut_key(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
             ) || *action == KeyAction::ToggleDetachedViewerMode
-                || action.is_location_navigation_action()
         })
         .any(|action| fallback.matches_vk_action(action, key))
 }
@@ -6990,6 +7018,40 @@ mod tests {
     }
 
     #[test]
+    fn context_help_binding_conflicts_with_edit_mode_commands() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            HelpShowContextShortcuts = S
+            "#,
+        );
+        let conflicts = keymap.binding_conflicts();
+        assert!(
+            conflicts.iter().any(|conflict| {
+                conflict.kind == BindingConflictKind::ActiveOverlap
+                    && conflict.chord == Chord::key(KeyName::S)
+                    && ((conflict.action == KeyAction::HelpShowContextShortcuts
+                        && conflict.other_action == Some(KeyAction::EraseToolSelect))
+                        || (conflict.action == KeyAction::EraseToolSelect
+                            && conflict.other_action == Some(KeyAction::HelpShowContextShortcuts)))
+            }),
+            "{conflicts:?}"
+        );
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Global]
+            GlobalOpenFolder = S
+            "#,
+        );
+        assert!(!keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.chord == Chord::key(KeyName::S)
+                && (conflict.action == KeyAction::EraseToolSelect
+                    || conflict.other_action == Some(KeyAction::EraseToolSelect))
+        }));
+    }
+
+    #[test]
     fn grid_mask_actions_match_existing_default_shortcuts() {
         assert_eq!(
             KeyAction::GridApplyErase1.default_chords().iter().next(),
@@ -7053,8 +7115,19 @@ mod tests {
     #[test]
     fn window_and_parent_actions_match_existing_default_shortcuts() {
         assert_eq!(
-            KeyAction::GridParentFolder.default_chords().iter().next(),
-            Some(Chord::key(KeyName::Backspace))
+            KeyAction::GridParentFolder
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::key(KeyName::Backspace), Chord::alt(KeyName::Up)]
+        );
+        assert_eq!(
+            KeyAction::GridHistoryBack.default_chords().iter().next(),
+            Some(Chord::alt(KeyName::Left))
+        );
+        assert_eq!(
+            KeyAction::GridHistoryForward.default_chords().iter().next(),
+            Some(Chord::alt(KeyName::Right))
         );
         assert_eq!(
             KeyAction::GridToggleMaximize.default_chords().iter().next(),
@@ -7087,6 +7160,8 @@ mod tests {
             Some(Chord::ctrl(KeyName::PageDown))
         );
         assert_eq!(KeyAction::GridParentFolder.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridHistoryBack.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridHistoryForward.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridTreeFolderPrev.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridTreeFolderNext.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridSiblingFolderPrev.context(), KeyContext::Grid);
@@ -7097,6 +7172,8 @@ mod tests {
             KeyContext::FsCommon
         );
         assert_eq!(KeyAction::GridParentFolder.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::GridHistoryBack.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::GridHistoryForward.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridTreeFolderPrev.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridTreeFolderNext.trigger(), KeyTrigger::Press);
         assert_eq!(
@@ -8148,11 +8225,21 @@ mod tests {
             alt: false,
             repeat: false,
         };
+        let alt_event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: true,
+            repeat: false,
+        };
 
         Keymap::empty().install_global_native_video_shortcuts();
         assert!(native_video_fullscreen_shortcut_key(&event(0x08))); // Backspace
         assert!(native_video_fullscreen_shortcut_key(&event(0x24))); // Home
         assert!(native_video_fullscreen_shortcut_key(&event(0x23))); // End
+        assert!(native_video_fullscreen_shortcut_key(&alt_event(0x43))); // Alt+C
 
         let keymap = Keymap::from_ini_str(
             r#"

@@ -18557,9 +18557,10 @@ impl App {
         let ctrl_page_down = self
             .keymap
             .consume_action(ctx, KeyAction::GridSiblingFolderNext);
-        let alt_up = alt_held && up && !ctrl_held;
-        let alt_left = alt_held && left && !ctrl_held;
-        let alt_right = alt_held && right && !ctrl_held;
+        let history_back_key = self.keymap.consume_action(ctx, KeyAction::GridHistoryBack);
+        let history_forward_key = self
+            .keymap
+            .consume_action(ctx, KeyAction::GridHistoryForward);
 
         // Ctrl+G の DrilledInto で drill-back する手段は BS (↓で始まる通常ハンドラ)
         // と検索バーの ← ボタンに限定する。
@@ -18975,7 +18976,7 @@ impl App {
         // 既定の Ctrl+BS は上の個別補正解除で消費される。カスタムで同じキーへ
         // 割り当てた場合は競合警告の対象にし、先に消費した処理を優先する。
         let parent_key = self.keymap.consume_action(ctx, KeyAction::GridParentFolder);
-        if parent_key || alt_up {
+        if parent_key {
             // フルスクリーン中の BS はフルスクリーン側ビューポートで処理する (ZIP/PDF ページ
             // なら 1 段戻って L2 ページ一覧)。ここは grid (L1/L2) での BS = 親フォルダへ。
             // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を
@@ -19026,10 +19027,10 @@ impl App {
             && !self.show_search_bar
             && !self.items_are_drive_list
             && !self.is_snapshot_active(); // Codex P2-1: ★固定 中は履歴ナビ block
-        if alt_left && history_shortcut_allowed {
+        if history_back_key && history_shortcut_allowed {
             return Some(crate::ui_main::AddressBarNav::HistoryBack);
         }
-        if alt_right && history_shortcut_allowed {
+        if history_forward_key && history_shortcut_allowed {
             return Some(crate::ui_main::AddressBarNav::HistoryForward);
         }
 

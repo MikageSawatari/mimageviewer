@@ -32,7 +32,7 @@ pub struct KeyEdge {
 
 #[derive(Default)]
 struct KeyInputState {
-    installed_hwnd: u64,
+    installed_hwnds: Vec<u64>,
     pending: VecDeque<KeyEdge>,
     frame: Vec<KeyEdge>,
     frame_active: bool,
@@ -45,8 +45,23 @@ fn state() -> &'static Mutex<KeyInputState> {
 }
 
 pub fn install_main_window_subclass(hwnd_raw: u64) -> bool {
+    install_window_subclass(hwnd_raw, "main")
+}
+
+pub fn install_viewport_window_subclass(hwnd_raw: u64) -> bool {
+    install_window_subclass(hwnd_raw, "viewport")
+}
+
+fn install_window_subclass(hwnd_raw: u64, label: &'static str) -> bool {
     if hwnd_raw == 0 {
         return false;
+    }
+    if state()
+        .lock()
+        .map(|guard| guard.installed_hwnds.contains(&hwnd_raw))
+        .unwrap_or(false)
+    {
+        return true;
     }
     let hwnd = HWND(hwnd_raw as *mut _);
     let ok = unsafe {
@@ -60,11 +75,13 @@ pub fn install_main_window_subclass(hwnd_raw: u64) -> bool {
     };
     if ok {
         if let Ok(mut guard) = state().lock() {
-            guard.installed_hwnd = hwnd_raw;
+            if !guard.installed_hwnds.contains(&hwnd_raw) {
+                guard.installed_hwnds.push(hwnd_raw);
+            }
         }
     } else {
         crate::logger::log(format!(
-            "key-input: SetWindowSubclass failed hwnd=0x{hwnd_raw:x}"
+            "key-input: SetWindowSubclass failed label={label} hwnd=0x{hwnd_raw:x}"
         ));
     }
     ok
@@ -77,7 +94,7 @@ pub fn begin_frame() {
             guard.frame.push(edge);
         }
         guard.frame_had_key_down = guard.frame.iter().any(|edge| edge.pressed);
-        guard.frame_active = guard.installed_hwnd != 0;
+        guard.frame_active = !guard.installed_hwnds.is_empty();
     }
 }
 
@@ -172,13 +189,17 @@ unsafe extern "system" fn main_key_input_subclass_proc(
         push_edge(edge);
     } else if msg == WM_NCDESTROY
         && let Ok(mut guard) = state().lock()
-        && guard.installed_hwnd == hwnd.0 as u64
     {
-        guard.installed_hwnd = 0;
-        guard.pending.clear();
-        guard.frame.clear();
-        guard.frame_active = false;
-        guard.frame_had_key_down = false;
+        let hwnd_raw = hwnd.0 as u64;
+        guard
+            .installed_hwnds
+            .retain(|installed| *installed != hwnd_raw);
+        if guard.installed_hwnds.is_empty() {
+            guard.pending.clear();
+            guard.frame.clear();
+            guard.frame_active = false;
+            guard.frame_had_key_down = false;
+        }
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }

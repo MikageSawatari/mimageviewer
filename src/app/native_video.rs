@@ -5084,9 +5084,6 @@ impl App {
         fs_idx: usize,
         key: crate::video::native_window::NativeVideoKeyEvent,
     ) {
-        if key.alt {
-            return;
-        }
         // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
         // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
         // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
