@@ -1496,7 +1496,7 @@ impl App {
     }
 
     /// `idx` に対する「現在表示できる最良の既存テクスチャ」を Arc::clone で取り出す。
-    /// 優先順: final composite cache → edit cache → fs_cache (Static / Animated 現フレーム)
+    /// 優先順: Animated 現フレーム → final composite cache → edit cache → fs_cache (Static)
     /// → サムネ (`include_thumb=true` のときのみ)。
     ///
     /// `prepare_fullscreen_state` の高解像度 tex 解決と `current_fs_tex_for_holdover`
@@ -1508,6 +1508,9 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        if self.fs_entry_is_animated(idx) {
+            return self.current_animated_frame_texture(idx);
+        }
         // comic 注釈は最前面 (D1)。holdover / display-tex 解決でも最優先で拾う。
         if let Some(tex) = self.current_comic_composite_texture(idx) {
             return Some(tex);
@@ -1531,15 +1534,6 @@ impl App {
         }
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => return Some(tex.clone()),
-            Some(FsCacheEntry::Animated {
-                frames,
-                current_frame,
-                ..
-            }) => {
-                if let Some((h, _)) = frames.get(*current_frame) {
-                    return Some(h.clone());
-                }
-            }
             Some(FsCacheEntry::Video { .. }) => {
                 // 動画は native presenter が独立 HWND に描画するため、
                 // ここから取り出せる egui TextureHandle はない。サムネイルへ
@@ -1610,12 +1604,7 @@ impl App {
     fn resolve_original_preview_tex(&self, idx: usize) -> Option<egui::TextureHandle> {
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-            Some(FsCacheEntry::Animated {
-                frames,
-                current_frame,
-                ..
-            }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-            _ => None,
+            _ => self.current_animated_frame_texture(idx),
         }
     }
 
@@ -1623,12 +1612,7 @@ impl App {
     fn resolve_fs_pre_overlay_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-            Some(FsCacheEntry::Animated {
-                frames,
-                current_frame,
-                ..
-            }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-            _ => None,
+            _ => self.current_animated_frame_texture(idx),
         }
     }
 
@@ -1666,6 +1650,9 @@ impl App {
         let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
         if is_video {
             return None;
+        }
+        if self.fs_entry_is_animated(idx) {
+            return self.current_animated_frame_texture(idx);
         }
         // Z 分析モードは AI / 補正 / 注釈 / 隠蔽 / 消しゴム / 局所補正をすべてバイパスして
         // **raw 元画像**を表示する (右 Ctrl の original preview と同じ経路)。分析パネルの色取得・
@@ -7631,7 +7618,11 @@ impl App {
         // E: 消しゴムモード切り替え (分析・補正中は無効)。
         // 見開き中の起動は `enter_erase_mode` が一時的に Single に切り替えて
         // 左ページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
-        if key_e && !self.analysis_mode && !self.adjustment_mode {
+        if key_e
+            && !self.analysis_mode
+            && !self.adjustment_mode
+            && !self.fs_entry_is_animated(fs_idx)
+        {
             if self.erase_mode {
                 // 2回目のE: inpaint実行
                 self.execute_erase_inpaint(ctx, fs_idx);
@@ -7651,6 +7642,7 @@ impl App {
             && !self.erase_mode
             && self.reading_flow.is_paged()
             && !is_video_fs
+            && !self.fs_entry_is_animated(fs_idx)
         {
             self.enter_conceal_mode(fs_idx);
         }
@@ -7665,6 +7657,7 @@ impl App {
             && !self.conceal_mode
             && self.reading_flow.is_paged()
             && !is_video_fs
+            && !self.fs_entry_is_animated(fs_idx)
         {
             self.enter_text_mode(fs_idx);
         }
@@ -8147,6 +8140,12 @@ impl App {
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self.view_trim_mode {
+            self.persist_pending_view_trim_state();
+            self.adjustment_mode = false;
+        } else if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.fs_entry_is_animated(idx))
+        {
             self.persist_pending_view_trim_state();
             self.adjustment_mode = false;
         } else if self.fs_zoom_mode_engaged() {

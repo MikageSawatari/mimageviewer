@@ -11501,6 +11501,7 @@ impl App {
             // 起動可能か (= 画像のみ。動画 / セパレータ / コンテナ は無効化)。
             // `image_dims` が None なら未ロード / 非画像なので無効。
             let can_overlay_edit = image_dims.is_some()
+                && !self.fs_entry_is_animated(fs_idx)
                 && matches!(
                     self.items.get(fs_idx),
                     Some(

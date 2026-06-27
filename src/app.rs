@@ -30299,6 +30299,23 @@ impl App {
             .map(|entry| std::sync::Arc::clone(&entry.pixels))
     }
 
+    /// Animated images are playback-only and must bypass edit/final caches.
+    pub(crate) fn fs_entry_is_animated(&self, idx: usize) -> bool {
+        matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Animated { .. }))
+    }
+
+    /// Currently selected animation frame texture for display.
+    pub(crate) fn current_animated_frame_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+            _ => None,
+        }
+    }
+
     /// Decode result at source resolution before any edit / adjustment / AI stage.
     pub(crate) fn current_raw_source_pixels(&self, idx: usize) -> Option<Arc<egui::ColorImage>> {
         match self.fs_cache.get(&idx) {
@@ -30587,6 +30604,11 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        if self.fs_entry_is_animated(idx) {
+            // Animated images are playback-only. Edit/final cache keys are not
+            // frame-aware, so caching a derived frame here would freeze playback.
+            return None;
+        }
         let key = self.current_edit_result_key(idx);
         if let Some(entry) = self.edit_result_cache.get(&key) {
             if entry.texture.is_some() {
@@ -30623,6 +30645,9 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
         let key = self.current_edit_result_key(idx);
         if let Some(entry) = self.edit_result_cache.get(&key) {
             return Some((key, Arc::clone(&entry.pixels)));
@@ -30675,6 +30700,9 @@ impl App {
     }
 
     pub(crate) fn current_edit_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
         self.edit_result_cache
             .iter()
             .find(|(key, _)| key.idx == idx)
@@ -32038,6 +32066,9 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
         // 画像オープン時のフリーズ調査用 perf 計装 (--perf-log)。この関数の build 経路
         // (キャッシュミス時) は UI スレッドで同期実行され、AI アップスケール後の大判
         // 画像では post_filter + GPU upload が数百ms かかりうる。cat="fs" /
@@ -32250,6 +32281,9 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
         self.final_composite_cache
             .iter()
             .find(|(key, _)| key.edit_key.idx == idx)

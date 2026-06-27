@@ -243,6 +243,14 @@ enumerate defer で `fullscreen_idx == None` の間に限って描く。`items_g
   └─ .webp    → fs_animation::decode_webp_frames / decode_webp_frames_from_bytes
                 (通常画像 / ZIP 内画像)
 
+Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示時は常に
+`current_frame` の raw テクスチャを直接選び、`edit_result_cache` /
+`final_composite_cache` / comic composite などフレーム非対応の派生キャッシュには
+乗せない。編集モード・AI アップスケール・ポストフィルタは Animated では無効。
+これは edit/final cache key が idx + generation ベースで、フレーム番号を含まないため、
+1 フレームを派生キャッシュに入れると以後の `current_frame` 更新が画面へ出ず
+アニメーションが停止して見えるため。
+
 → EXIF 適用済の DynamicImage に `clamp_dynamic_for_gpu` を掛けて長辺 8192 以内に縮小
    (wgpu デフォルト上限)。7K-9K クラスの画像で過去に UI スレッドで 5s 級の
    Triangle リサイズが走ってしまい応答なしになった実害から、worker で先に縮小する。

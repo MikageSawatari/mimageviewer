@@ -1034,6 +1034,56 @@ mod startup_open_path_resolve_tests {
 }
 
 #[cfg(test)]
+mod animated_playback_only_pipeline_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn animated_entries_bypass_edit_and_final_caches() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let frame0 = egui::ColorImage::filled([1, 1], egui::Color32::RED);
+        let frame1 = egui::ColorImage::filled([1, 1], egui::Color32::GREEN);
+        let tex0 = ctx.load_texture(
+            "animated_frame_0",
+            frame0.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let tex1 = ctx.load_texture(
+            "animated_frame_1",
+            frame1.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Animated {
+                frames: vec![(tex0, 0.1), (tex1, 0.1)],
+                frame_pixels: vec![Arc::new(frame0), Arc::new(frame1)],
+                current_frame: 0,
+                next_frame_at: 0.0,
+                load_seq: 0,
+            },
+        );
+
+        assert!(app.fs_entry_is_animated(0));
+        assert!(app.current_animated_frame_texture(0).is_some());
+        assert!(app.ensure_edit_result_pixels(&ctx, 0).is_none());
+        assert!(app.ensure_edit_result_pixels_cpu(&ctx, 0).is_none());
+        assert!(app.ensure_final_composite_texture(&ctx, 0).is_none());
+        assert!(app.current_edit_result_texture(0).is_none());
+        assert!(app.current_final_composite_texture(0).is_none());
+        assert!(!app.edit_result_cache.iter().any(|(key, _)| key.idx == 0));
+        assert!(
+            !app.final_composite_cache
+                .iter()
+                .any(|(key, _)| key.edit_key.idx == 0)
+        );
+    }
+}
+
+#[cfg(test)]
 mod rotation_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;
