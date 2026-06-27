@@ -371,6 +371,15 @@ items rebuild 後に、同じ idx が別項目を指しても再同期できる�
 同じ raw idx で stamp が変わった場合は、動画 fast-swap の same-idx no-op を通さず
 `open_fullscreen` の通常初期化へ戻して再同期する。
 
+`settings.detached_viewer_open_images_in_window` または detached 画像ビューア上バーのピン留めが
+有効な画像 / ZIP画像 / PDFページ session は、メイン一覧との自動同期を行わない。次の画像を
+開くとき、現在の active detached viewer は `TextureHandle` と表示位置だけを持つ passive
+detached image window として退避される。passive window は最後の画像を表示するだけで、active
+viewer cache / AI / 先読み / スライドショー / 編集状態は単一 active session のまま扱う。
+未ピン留めの passive window がある場合は、設定 OFF でも次の画像 open にその window の配置を
+再利用する。動画はこの設定の対象外で、F12 の `detached_viewer_enabled` が ON のときだけ
+detached session へ入る。
+
 メイン一覧で `Enter` / 明示 open した項目が、開いている detached session の stamp と
 同一なら、`open_fullscreen` を再実行せず前面化要求だけを出す。静止画 detached viewport
 では `Minimized(false)` / `Visible(true)` / `Focus` を送り、動画 child presenter では

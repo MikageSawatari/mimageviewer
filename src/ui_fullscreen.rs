@@ -3151,6 +3151,246 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_image_window_viewport_id(id: u64) -> egui::ViewportId {
+        egui::ViewportId::from_hash_of(("detached_image_window", id))
+    }
+
+    #[cfg(windows)]
+    fn build_detached_image_window_builder(
+        window: &crate::app::DetachedImageWindowSnapshot,
+    ) -> egui::ViewportBuilder {
+        egui::ViewportBuilder::default()
+            .with_title(window.title.clone())
+            .with_decorations(true)
+            .with_transparent(false)
+            .with_taskbar(true)
+            .with_inner_size([window.placement.w, window.placement.h])
+            .with_position(egui::pos2(window.placement.x, window.placement.y))
+            .with_maximized(window.placement.maximized)
+    }
+
+    #[cfg(windows)]
+    fn draw_detached_image_window_bar(
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        window: &crate::app::DetachedImageWindowSnapshot,
+        close_requested: &mut bool,
+        pin_toggle_requested: &mut bool,
+    ) {
+        let hover_in_top = ctx.input(|i| {
+            i.pointer
+                .hover_pos()
+                .map(|p| p.y < TOP_BAR_HOVER_Y)
+                .unwrap_or(false)
+        });
+        if !hover_in_top {
+            return;
+        }
+
+        let bar_rect =
+            egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), TOP_BAR_HEIGHT));
+        ui.painter().rect_filled(
+            bar_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(bar_rect.min.x, bar_rect.max.y),
+                egui::pos2(bar_rect.max.x, bar_rect.max.y),
+            ],
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+            ),
+        );
+
+        let mut next_x = bar_rect.max.x - BAR_BUTTON_SIZE - BAR_BUTTON_MARGIN;
+        let close_resp = draw_bar_button(
+            ui,
+            next_x,
+            bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "detached_image_close_btn",
+            |hovered| {
+                if hovered {
+                    egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+                }
+            },
+            false,
+            |p, c, r| draw_close_icon(p, c, r),
+        )
+        .hover_tip_dark("閉じる");
+        if close_resp.clicked() {
+            *close_requested = true;
+        }
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        let pin_resp = draw_bar_button(
+            ui,
+            next_x,
+            bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "detached_image_pin_btn",
+            |hovered| bar_button_bg(hovered, window.pinned),
+            window.pinned,
+            |p, c, r| draw_pin_icon(p, c, r, window.pinned),
+        );
+        let pin_resp = pin_resp.hover_tip_dark(if window.pinned {
+            "ピン留め解除"
+        } else {
+            "ピン留め"
+        });
+        if pin_resp.clicked() {
+            *pin_toggle_requested = true;
+        }
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        let text_rect = egui::Rect::from_min_max(
+            bar_rect.min + egui::vec2(12.0, 0.0),
+            egui::pos2(next_x - 8.0, bar_rect.max.y),
+        );
+        if text_rect.width() > 24.0 {
+            let painter = ui.painter().with_clip_rect(text_rect);
+            let display_text = if let Some((w, h)) = window.image_dims {
+                format!("{}  {}×{}", window.location_display, w, h)
+            } else {
+                window.location_display.clone()
+            };
+            painter.text(
+                egui::pos2(text_rect.left(), text_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                display_text,
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(235, 238, 242),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
+        if self.detached_image_windows.is_empty() {
+            return;
+        }
+
+        let windows = self.detached_image_windows.clone();
+        let mut close_ids = Vec::new();
+        let mut toggle_pin_ids = Vec::new();
+        let mut placements = Vec::new();
+
+        for window in windows {
+            let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            let builder = Self::build_detached_image_window_builder(&window);
+            let mut close_requested = false;
+            let mut pin_toggle_requested = false;
+            let mut placement_update = None;
+
+            ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+                let (outer_rect, inner_rect, minimized, maximized) = vp_ctx.input(|i| {
+                    let vp = i.viewport();
+                    (
+                        vp.outer_rect,
+                        vp.inner_rect,
+                        vp.minimized.unwrap_or(false),
+                        vp.maximized.unwrap_or(false),
+                    )
+                });
+                if !minimized && let Some(outer) = outer_rect {
+                    let mut placement = window.placement;
+                    placement.x = outer.min.x;
+                    placement.y = outer.min.y;
+                    if let Some(inner) = inner_rect {
+                        placement.w = inner.width();
+                        placement.h = inner.height();
+                    } else {
+                        placement.w = outer.width();
+                        placement.h = outer.height();
+                    }
+                    placement.maximized = maximized;
+                    if placement.is_sane()
+                        && crate::monitor::title_bar_on_some_monitor(
+                            placement.x,
+                            placement.y,
+                            placement.w,
+                        )
+                    {
+                        placement_update = Some(placement);
+                    }
+                }
+                if vp_ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                }
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                    .show(vp_ctx, |ui| {
+                        let full_rect = ui.max_rect();
+                        Self::draw_fs_image(
+                            ui,
+                            full_rect,
+                            Some(&window.texture),
+                            None,
+                            false,
+                            false,
+                            false,
+                            window.rotation,
+                            None,
+                            0.0,
+                            &FsBgStyle::Default,
+                            &window.location_display,
+                            false,
+                            FullscreenFitMode::Page,
+                            FullscreenFitScaleLimits::default(),
+                            None,
+                        );
+                        Self::draw_detached_image_window_bar(
+                            ui,
+                            vp_ctx,
+                            full_rect,
+                            &window,
+                            &mut close_requested,
+                            &mut pin_toggle_requested,
+                        );
+                    });
+            });
+
+            if close_requested {
+                close_ids.push(window.id);
+            }
+            if pin_toggle_requested {
+                toggle_pin_ids.push(window.id);
+            }
+            if let Some(placement) = placement_update {
+                placements.push((window.id, placement));
+            }
+        }
+
+        for (id, placement) in placements {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.placement = placement;
+            }
+        }
+        for id in toggle_pin_ids {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.pinned = !window.pinned;
+            }
+        }
+        if !close_ids.is_empty() {
+            self.detached_image_windows
+                .retain(|window| !close_ids.contains(&window.id));
+        }
+    }
+
+    #[cfg(windows)]
     fn install_key_input_subclass_for_viewport_rect(
         &self,
         outer_rect: egui::Rect,
@@ -5050,7 +5290,17 @@ impl App {
                             let mut vst3_pressed = false;
                             let mut copy_capture_pressed = false;
                             let mut copy_capture_region_pressed = false;
+                            let mut detached_pin_pressed = false;
                             let mut window_mode_pressed = false;
+                            #[cfg(windows)]
+                            let show_detached_pin =
+                                cfg!(windows) && detached && !is_video_mode;
+                            #[cfg(windows)]
+                            let detached_pin_active = self.detached_viewer_pin_active;
+                            #[cfg(not(windows))]
+                            let show_detached_pin = false;
+                            #[cfg(not(windows))]
+                            let detached_pin_active = false;
                             // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
@@ -5132,6 +5382,9 @@ impl App {
                                 &mut vst3_pressed,
                                 &mut copy_capture_pressed,
                                 &mut copy_capture_region_pressed,
+                                show_detached_pin,
+                                detached_pin_active,
+                                &mut detached_pin_pressed,
                                 show_window_toggle,
                                 embedded,
                                 &mut window_mode_pressed,
@@ -5142,6 +5395,18 @@ impl App {
                             }
                             if copy_capture_region_pressed {
                                 self.begin_capture_region_selection(ctx, fs_idx);
+                            }
+                            #[cfg(windows)]
+                            if detached_pin_pressed {
+                                self.detached_viewer_pin_active =
+                                    !self.detached_viewer_pin_active;
+                                let msg = if self.detached_viewer_pin_active {
+                                    "画像別ウィンドウをピン留めしました".to_string()
+                                } else {
+                                    "画像別ウィンドウのピン留めを解除しました".to_string()
+                                };
+                                self.show_feedback_toast(msg);
+                                ctx.request_repaint();
                             }
                             // 分析ボタン押下は Z キーと同じ経路へ合流 (副作用込み、Codex P1)。
                             if bar_analysis_pressed && !is_spread_double {
@@ -12748,6 +13013,11 @@ impl App {
         vst3_pressed: &mut bool,
         copy_capture_pressed: &mut bool,
         copy_capture_region_pressed: &mut bool,
+        // detached 画像ビューアのピン留めボタン。ON の間は画像を detached で開き、
+        // メイン一覧との自動同期を止める。
+        show_detached_pin: bool,
+        detached_pin_active: bool,
+        detached_pin_pressed: &mut bool,
         // ウィンドウ / 全画面 切り替えボタン (× の左)。show=表示するか、
         // in_window=現在 in-window 表示中か、pressed=クリックされたか。
         show_window_toggle: bool,
@@ -12831,6 +13101,32 @@ impl App {
             *nav_delta = 0;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // detached 画像ビューアのピン留めボタン。
+        if show_detached_pin {
+            let pin_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_detached_pin_btn",
+                |hovered| bar_button_bg(hovered, detached_pin_active),
+                detached_pin_active,
+                |p, c, r| draw_pin_icon(p, c, r, detached_pin_active),
+            );
+            let pin_tip = if detached_pin_active {
+                "ピン留め解除\n解除すると、次に画像を開いたときこの別ウィンドウを差し替えます"
+            } else {
+                "ピン留め\n次に画像を開くときも別ウィンドウで開きます"
+            };
+            let pin_resp = pin_resp.hover_tip_dark(pin_tip);
+            if pin_resp.clicked() {
+                *detached_pin_pressed = true;
+            }
+            if pin_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
 
         // ⊞ ウィンドウ / 全画面 切り替えボタン (× の左)。
         // native 動画 HUD のトグルボタンと同じ役割を、静止画フルスクリーンの

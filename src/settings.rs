@@ -2583,6 +2583,10 @@ pub struct Settings {
     /// Phase 1 では永続設定とキー操作だけを用意し、実際の detached host は後続で接続する。
     #[serde(default)]
     pub detached_viewer_enabled: bool,
+    /// 画像系アイテム (通常画像 / ZIP 内画像 / PDF ページ) を開くたびに
+    /// detached image window を増やす。動画は既存の動画表示設定 / F12 別ウィンドウモードに従う。
+    #[serde(default)]
+    pub detached_viewer_open_images_in_window: bool,
     /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
     /// top-level window の両方で共有する。
     #[serde(default)]
@@ -3565,6 +3569,7 @@ impl Default for Settings {
             video_tile_columns: default_video_tile_columns(),
             video_in_window_mode: false,
             detached_viewer_enabled: false,
+            detached_viewer_open_images_in_window: false,
             detached_viewer_window_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
@@ -4871,6 +4876,7 @@ impl Settings {
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
+        self.detached_viewer_open_images_in_window = src.detached_viewer_open_images_in_window;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // ── お気に入り / タグ (専用ダイアログで編集) ──
         self.favorites = std::mem::take(&mut src.favorites);

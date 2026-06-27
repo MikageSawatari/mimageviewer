@@ -69,6 +69,12 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 ### 3.1 用語
 
 - `detached_viewer_enabled`: 別ウィンドウモードが ON かどうか。永続設定。
+- `detached_viewer_open_images_in_window`: 画像 / ZIP画像 / PDFページを開くたびに detached
+  image window を増やす永続設定。動画は対象外で、動画 detached は `detached_viewer_enabled` に従う。
+- `detached_viewer_pin_active`: detached 画像 viewer の上バーで切り替える一時状態。ON の間は
+  次に画像を開くときも detached viewer を使い、メイン一覧との自動同期は止める。
+- `DetachedImageWindowSnapshot`: active detached viewer から退避した passive 画像ウィンドウ。
+  `TextureHandle` / 表示名 / 配置 / ピン状態だけを持ち、処理系の active session には参加しない。
 - `ViewerSession`: 現在開いている画像・動画ビューアのセッション。`×` / `Esc` などで終了する。
 - `ViewerPresentation`: 同じセッションをどこに表示しているか。
 
@@ -376,6 +382,11 @@ enum NativeVideoPlacement {
 - detached 静止画 session 中はメインウィンドウをブロックしない。メイン root に届いたキーは fullscreen root handler が横取りせず、グリッド側へ流す。
 - detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 中の F11 は仮想フルスクリーンをトグルし、ホバーバーの window/fullscreen トグルは非表示にする。
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
+- `detached_viewer_open_images_in_window` または `detached_viewer_pin_active` で開いた画像 / ZIP画像 /
+  PDFページ detached session はメイン一覧との自動同期を行わない。次の画像を開くとき、現在の
+  active detached viewer は passive `DetachedImageWindowSnapshot` として退避し、active viewer
+  cache / AI / 先読み / スライドショー / 編集機能は単一 active session にだけ紐づく。未ピン留め
+  passive window が残っている場合は、設定 OFF でも次の画像 open にその window の配置を再利用する。
 - detached session が閉じている場合は、メイン一覧のカーソル移動だけでは再表示しない。
 - detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
 - 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native child HWND を作り直す。

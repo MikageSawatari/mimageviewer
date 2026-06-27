@@ -108,6 +108,22 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         )
         .weak(),
     );
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("画像ビューア").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut state.settings.detached_viewer_open_images_in_window,
+        "画像を開くとき、毎回新しいウィンドウで開く",
+    );
+    ui.label(
+        egui::RichText::new(
+            "通常画像、ZIP 内画像、PDF ページだけに適用します。動画は動画設定と F12 別ウィンドウモードに従います。",
+        )
+        .weak(),
+    );
 }
 
 pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

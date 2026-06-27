@@ -98,6 +98,47 @@ pub(crate) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     );
 }
 
+/// detached 画像ビューアのピン留めボタン。
+pub(super) fn draw_pin_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, pinned: bool) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.8, white);
+    let head = [
+        egui::pos2(c.x - r * 0.55, c.y - r * 0.72),
+        egui::pos2(c.x + r * 0.58, c.y - r * 0.72),
+        egui::pos2(c.x + r * 0.34, c.y - r * 0.18),
+        egui::pos2(c.x - r * 0.34, c.y - r * 0.18),
+    ];
+    if pinned {
+        painter.add(egui::Shape::convex_polygon(
+            head.to_vec(),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
+            egui::Stroke::NONE,
+        ));
+    }
+    painter.add(egui::Shape::closed_line(head.to_vec(), stroke));
+    painter.line_segment(
+        [
+            egui::pos2(c.x - r * 0.20, c.y - r * 0.18),
+            egui::pos2(c.x + r * 0.20, c.y + r * 0.34),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x + r * 0.20, c.y + r * 0.34),
+            egui::pos2(c.x, c.y + r * 0.78),
+        ],
+        egui::Stroke::new(2.0, white),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x - r * 0.45, c.y + r * 0.04),
+            egui::pos2(c.x + r * 0.45, c.y + r * 0.04),
+        ],
+        stroke,
+    );
+}
+
 /// 下部ページシークバーの固定表示トグル用ロックアイコン。
 pub(super) fn draw_seek_lock_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, locked: bool) {
     let white = egui::Color32::WHITE;
