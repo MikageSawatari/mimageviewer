@@ -250,6 +250,9 @@ Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示�
 これは edit/final cache key が idx + generation ベースで、フレーム番号を含まないため、
 1 フレームを派生キャッシュに入れると以後の `current_frame` 更新が画面へ出ず
 アニメーションが停止して見えるため。
+WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
+展開する。`image-webp` は dispose-to-background の処理を持つが、背景色未設定のままだと
+dispose が実質 no-op になり、透明差分フレームで前フレームの軌跡が残る。
 
 → EXIF 適用済の DynamicImage に `clamp_dynamic_for_gpu` を掛けて長辺 8192 以内に縮小
    (wgpu デフォルト上限)。7K-9K クラスの画像で過去に UI スレッドで 5s 級の

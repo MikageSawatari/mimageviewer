@@ -227,17 +227,19 @@ pub fn decode_webp_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorIma
     decode_webp_frames_from_reader(std::io::Cursor::new(bytes))
 }
 
-fn decode_webp_frames_from_reader<R>(reader: R) -> Option<Vec<(egui::ColorImage, f64)>>
+fn decode_webp_frames_from_reader<R>(mut reader: R) -> Option<Vec<(egui::ColorImage, f64)>>
 where
     R: std::io::BufRead + std::io::Seek,
 {
     use image::AnimationDecoder;
     use image::codecs::webp::WebPDecoder;
 
-    let decoder = WebPDecoder::new(reader).ok()?;
+    let background = webp_animation_background_rgba(&mut reader).unwrap_or([0, 0, 0, 0]);
+    let mut decoder = WebPDecoder::new(reader).ok()?;
     if !decoder.has_animation() {
         return None;
     }
+    decoder.set_background_color(image::Rgba(background)).ok()?;
     let frames = decoder.into_frames().collect_frames().ok()?;
     if frames.len() <= 1 {
         return None;
@@ -252,6 +254,47 @@ where
             })
             .collect(),
     )
+}
+
+fn webp_animation_background_rgba<R>(reader: &mut R) -> Option<[u8; 4]>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    let origin = reader.stream_position().ok()?;
+    let parsed = (|| {
+        reader.seek(std::io::SeekFrom::Start(origin)).ok()?;
+
+        let mut header = [0u8; 12];
+        reader.read_exact(&mut header).ok()?;
+        if &header[0..4] != b"RIFF" || &header[8..12] != b"WEBP" {
+            return None;
+        }
+        let riff_size = u32::from_le_bytes(header[4..8].try_into().ok()?) as u64;
+        let riff_end = origin.checked_add(8)?.checked_add(riff_size)?;
+        let mut pos = origin.checked_add(12)?;
+
+        while pos.checked_add(8)? <= riff_end {
+            reader.seek(std::io::SeekFrom::Start(pos)).ok()?;
+            let mut chunk_header = [0u8; 8];
+            reader.read_exact(&mut chunk_header).ok()?;
+            let chunk_size = u32::from_le_bytes(chunk_header[4..8].try_into().ok()?) as u64;
+            let payload_start = pos.checked_add(8)?;
+
+            if &chunk_header[0..4] == b"ANIM" && chunk_size >= 6 {
+                let mut bgra = [0u8; 4];
+                reader.read_exact(&mut bgra).ok()?;
+                let [b, g, r, a] = bgra;
+                return Some([r, g, b, a]);
+            }
+
+            pos = payload_start
+                .checked_add(chunk_size)?
+                .checked_add(chunk_size & 1)?;
+        }
+        None
+    })();
+    let _ = reader.seek(std::io::SeekFrom::Start(origin));
+    parsed
 }
 
 #[cfg(test)]
@@ -346,10 +389,10 @@ mod tests {
         [n as u8, (n >> 8) as u8, (n >> 16) as u8]
     }
 
-    fn static_webp_image_subchunk(rgba: [u8; 4]) -> Vec<u8> {
+    fn static_webp_image_subchunk_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         let mut webp = Vec::new();
         image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
-            .encode(&rgba, 1, 1, image::ExtendedColorType::Rgba8)
+            .encode(rgba, width, height, image::ExtendedColorType::Rgba8)
             .unwrap();
 
         let mut pos = 12;
@@ -366,6 +409,10 @@ mod tests {
             pos = end + (size & 1);
         }
         panic!("encoded WebP should contain VP8L or VP8 chunk");
+    }
+
+    fn static_webp_image_subchunk(rgba: [u8; 4]) -> Vec<u8> {
+        static_webp_image_subchunk_rgba(1, 1, &rgba)
     }
 
     fn animated_webp_fixture() -> Vec<u8> {
@@ -403,6 +450,76 @@ mod tests {
         webp
     }
 
+    fn animated_webp_dispose_background_fixture() -> Vec<u8> {
+        let mut chunks = Vec::new();
+
+        let mut vp8x = Vec::new();
+        vp8x.push(0b0001_0010); // alpha + animation flags
+        vp8x.extend_from_slice(&[0, 0, 0]); // reserved
+        vp8x.extend_from_slice(&u24(3)); // canvas width - 1
+        vp8x.extend_from_slice(&u24(1)); // canvas height - 1
+        chunks.extend_from_slice(&riff_chunk(b"VP8X", &vp8x));
+
+        let mut anim = Vec::new();
+        anim.extend_from_slice(&[0, 0, 0, 0]); // transparent background (BGRA)
+        anim.extend_from_slice(&0u16.to_le_bytes()); // loop forever
+        chunks.extend_from_slice(&riff_chunk(b"ANIM", &anim));
+
+        {
+            let mut append_frame = |x: u32, rgba: [u8; 4], flags: u8| {
+                let pixels: Vec<u8> = (0..4).flat_map(|_| rgba).collect();
+                let mut frame = Vec::new();
+                frame.extend_from_slice(&u24(x / 2));
+                frame.extend_from_slice(&u24(0)); // y / 2
+                frame.extend_from_slice(&u24(1)); // width - 1
+                frame.extend_from_slice(&u24(1)); // height - 1
+                frame.extend_from_slice(&u24(40)); // duration
+                frame.push(flags);
+                frame.extend_from_slice(&static_webp_image_subchunk_rgba(2, 2, &pixels));
+                chunks.extend_from_slice(&riff_chunk(b"ANMF", &frame));
+            };
+            append_frame(0, [255, 0, 0, 255], 0b0000_0011); // no blend + dispose
+            append_frame(2, [0, 255, 0, 255], 0b0000_0010); // no blend + no dispose
+        }
+
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&chunks);
+        webp
+    }
+
+    #[test]
+    fn webp_animation_background_is_bgra_in_container() {
+        let mut chunks = Vec::new();
+
+        let mut vp8x = Vec::new();
+        vp8x.push(0b0001_0010); // alpha + animation flags
+        vp8x.extend_from_slice(&[0, 0, 0]);
+        vp8x.extend_from_slice(&u24(0));
+        vp8x.extend_from_slice(&u24(0));
+        chunks.extend_from_slice(&riff_chunk(b"VP8X", &vp8x));
+
+        let mut anim = Vec::new();
+        anim.extend_from_slice(&[0x44, 0x33, 0x22, 0x11]); // B, G, R, A
+        anim.extend_from_slice(&0u16.to_le_bytes());
+        chunks.extend_from_slice(&riff_chunk(b"ANIM", &anim));
+
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&chunks);
+
+        let mut cursor = std::io::Cursor::new(webp);
+        assert_eq!(
+            webp_animation_background_rgba(&mut cursor),
+            Some([0x22, 0x33, 0x44, 0x11])
+        );
+        assert_eq!(cursor.position(), 0);
+    }
+
     #[test]
     fn decode_webp_animated_from_bytes() {
         let bytes = animated_webp_fixture();
@@ -412,6 +529,23 @@ mod tests {
         assert!((frames[1].1 - 0.08).abs() < 0.001);
         assert_eq!(frames[0].0.size, [1, 1]);
         assert_eq!(frames[1].0.size, [1, 1]);
+    }
+
+    #[test]
+    fn decode_webp_dispose_background_clears_previous_frame() {
+        let bytes = animated_webp_dispose_background_fixture();
+        let frames = decode_webp_frames_from_bytes(&bytes).expect("animated WebP should decode");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].0.size, [4, 2]);
+
+        let left = frames[1].0.pixels[0];
+        let right = frames[1].0.pixels[2];
+        assert_eq!(
+            left.a(),
+            0,
+            "disposed previous frame area should be transparent"
+        );
+        assert_eq!(right.to_srgba_unmultiplied(), [0, 255, 0, 255]);
     }
 
     #[test]
