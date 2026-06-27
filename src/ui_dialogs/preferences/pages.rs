@@ -724,7 +724,7 @@ fn command_overview_rows(
         }
         rows.push(OperationOverviewRow {
             label: compact_key_action_label(action),
-            context: action.context().description().to_owned(),
+            context: key_action_context_label(action).to_owned(),
             assignments,
             status: status.join(" / "),
             conflicted: is_conflicted,
@@ -826,6 +826,12 @@ fn compact_key_action_label(action: KeyAction) -> String {
         _ => desc,
     };
     compact_operation_label(label)
+}
+
+fn key_action_context_label(action: KeyAction) -> &'static str {
+    operation_keyboard_context_filter_label(operation_keyboard_context_filter_for_context(
+        action.context(),
+    ))
 }
 
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
@@ -1669,7 +1675,7 @@ fn command_editor_source_chord_section(
                     let label = if state.operation_keyboard_context.is_none() {
                         format!(
                             "{}: {}",
-                            operation_keyboard_context_filter_label(Some(action.context())),
+                            key_action_context_label(action),
                             compact_key_action_label(action)
                         )
                     } else {
@@ -2122,7 +2128,7 @@ fn keyboard_chord_tooltip(
         if keymap.effective_chords(action).contains(&chord) {
             matches.push(format!(
                 "{} / {}",
-                action.context().description(),
+                key_action_context_label(action),
                 action.description()
             ));
         }
@@ -2407,7 +2413,7 @@ fn command_list(
 
                 assignment_values(ui, &labels);
 
-                ui.label(action.context().description());
+                ui.label(key_action_context_label(action));
 
                 let overridden = state
                     .settings
@@ -2475,7 +2481,7 @@ fn command_editor_for_action(
     }
     ui.small(format!(
         "{} / {}",
-        action.context().description(),
+        key_action_context_label(action),
         key_trigger_label(action.trigger())
     ));
 
@@ -2934,7 +2940,7 @@ fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {
     operation_text_matches_filter(
         &compact_key_action_label(action),
         action.description(),
-        action.context().description(),
+        key_action_context_label(action),
         filter,
     )
 }
