@@ -1159,15 +1159,18 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **ビルド**: `cargo build --release` → `ISCC.exe installer\mimageviewer.iss`
+- **配布ビルド**: `.\scripts\build-dist.ps1` (clean → core → launcher → ISCC → portable を 1 コマンド、
+  stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
+  (clean/ガードなしなので配布物には使わない)。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
 - **Vector 申請用 zip**: `mImageViewer_installer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
   `installer/readme.txt` を同梱する (v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名。ポータブル
   zip と接尾辞 `_installer_` / `_portable_` で区別する。**リリース済みの過去版は遡って改名しない**)。
   readme の内容 (動作環境・連絡先・インストール手順・取り扱い種別) は Vector のファイル掲載基準
   (https://www.vector.co.jp/for_authors/upload/standard.html) を満たしていること。
-- **ポータブル版ビルド**: `.\scripts\build-portable.ps1` で
-  `cargo build --release --bin mimageviewer-core --features portable` → loose 同梱フォルダ +
+- **ポータブル版ビルド**: 配布時は build-dist.ps1 が内部で `.\scripts\build-portable.ps1` を呼ぶ。
+  `cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable`
+  (非portable core を上書きしないよう専用 target dir に分離) → loose 同梱フォルダ +
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームして同梱。
@@ -1385,21 +1388,27 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ### Phase 3: ビルド・配布成果物
 
-10. `cargo build --release` → `ISCC.exe installer\mimageviewer.iss` でインストーラを生成
-    - 開発機では mIV をタスクトレイに常駐させているケースが多い。常駐中の `mimageviewer.exe` は
-      `target\release\mimageviewer.exe` を握っているので、cargo がリンク段階で
-      LNK1104 (アクセスが拒否されました) になって失敗する。
-      その場合は `scripts\build-release.ps1` (PowerShell) もしくは
-      `bash scripts/build-release.sh` を使うと、実行中の `mimageviewer.exe` /
-      `mimageviewer-susie32.exe` を自動停止してからビルドできる。手動の
-      `Stop-Process` + `cargo build` を毎回打つ手間を省くだけのラッパー。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで clean → core → launcher → ISCC → portable)。
+    - build-dist.ps1 は最初に `cargo clean --release -p mimageviewer -p mimageviewer-launcher` (+ `target-portable` の
+      `-p mimageviewer`) してから実コンパイルするので、cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
+      ([docs は feedback_release_stale_core_cache の方針] 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
+      LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
+    - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
+    - **開発中の素早い反復は `.\scripts\build-release.ps1` 単体** (incremental・clean なし・速い)。
+      stale 検出ガードは持たないので**配布物の生成には使わない** (必ず build-dist.ps1)。
+    - portable core は専用 target dir `target-portable` に分離して焼くので、非portable の
+      `target\release\mimageviewer-core.exe` を上書きしない (フレーバー混入防止)。
+    - Vector 申請用 zip は build-dist.ps1 では作らない (下記 11 の手順で別途 `Compress-Archive`)。
 11. 配布成果物を 4 種類用意する:
     - `mimageviewer.exe` (単体exe版、mikage.to のみ)
     - `mImageViewer_setup.exe` (インストーラ版、mikage.to・窓の杜・Vector 共通)
     - `mImageViewer_installer_v<VERSION>.zip` (Vector 申請用。`mImageViewer_setup.exe` +
       `installer/readme.txt` を同梱。v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名)
     - `mImageViewer_portable_v<VERSION>.zip` (ポータブル版、mikage.to のみ。
-      `.\scripts\build-portable.ps1` で生成。loose 同梱フォルダ全体を含む)
+      build-dist.ps1 が内部の `.\scripts\build-portable.ps1` 経由で生成。loose 同梱フォルダ全体を含む)
+
+    単体exe (`target\release\mimageviewer.exe`) と `mImageViewer_setup.exe` も build-dist.ps1 が生成する。
+    Vector zip は build-dist 後に `Compress-Archive mImageViewer_setup.exe, installer\readme.txt → dist\` で別途作る。
 11.5. **ポータブル版 smoke** (v1.1.0+):
     - `dist\mImageViewer_portable_v<VER>\` を **C ドライブ以外の書込可フォルダ** (D:\ / USB 等) へ
       解凍し、`mimageviewer.exe` を起動 → PDF 表示 / 動画再生 / AI アップスケール / Susie の

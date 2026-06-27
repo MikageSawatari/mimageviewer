@@ -37,10 +37,16 @@ $scripts = Join-Path $repoRoot 'scripts'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
+# NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
+# exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
+# clean would let the build reuse a stale fingerprint -- the exact bug this script
+# exists to prevent.
 Write-Host "[build-dist] (1/4) cargo clean --release -p mimageviewer -p mimageviewer-launcher"
 & cargo clean --release -p mimageviewer -p mimageviewer-launcher
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
 Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer"
 & cargo clean --release --target-dir $portableTargetDir -p mimageviewer
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (exit {0})" -f $LASTEXITCODE) }
 
 # --- 2. Core + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
