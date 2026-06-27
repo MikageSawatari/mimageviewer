@@ -1431,10 +1431,18 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
             ui.label(
                 egui::RichText::new(format!("{} / {}", context.label(), button.label())).strong(),
             );
-            ui.small(format!(
-                "既定動作: {}。変更すると、このボタン単体の操作だけを差し替えます。X+方向リングは別設定です。",
-                button.default_label(*context)
-            ));
+            let help = if *button == GamepadButtonSlot::West {
+                format!(
+                    "既定動作: {}。X を変更した場合は X+方向リングも起動しなくなります。X+方向リングを使うには X を既定に戻してください。",
+                    button.default_label(*context)
+                )
+            } else {
+                format!(
+                    "既定動作: {}。変更すると、このボタン単体の操作を差し替えます。",
+                    button.default_label(*context)
+                )
+            };
+            ui.small(help);
         }
         OperationAssignmentTarget::MouseButton { context, forward } => {
             ui.label(

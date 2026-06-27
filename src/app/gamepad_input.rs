@@ -947,7 +947,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(panel_w - 28.0);
                         ui.label(
-                            egui::RichText::new(format!("X ピッカー / {}", picker.context.label()))
+                            egui::RichText::new(format!("ピッカー / {}", picker.context.label()))
                                 .size(17.0)
                                 .color(egui::Color32::WHITE),
                         );
@@ -1660,6 +1660,11 @@ impl App {
         }
         match action.kind {
             PadActionKind::Release if action.button == PadButton::West => {
+                if self.gamepad_button_override(PadButton::West).is_some() {
+                    self.clear_native_video_ring_guide_overlay(ctx);
+                    let _ = self.gamepad_state.finish_west_release();
+                    return None;
+                }
                 if let Some(direction) = self.current_ring_gamepad_direction() {
                     self.gamepad_state.mark_west_ring_direction(direction);
                 }
@@ -1680,6 +1685,15 @@ impl App {
             }
             PadActionKind::Release => None,
             PadActionKind::Press | PadActionKind::Repeat => {
+                if action.button == PadButton::West
+                    && let Some(nav) =
+                        self.dispatch_gamepad_button_override(ctx, action.button, action.kind)
+                {
+                    self.gamepad_state.suppress_west_ring_until_release();
+                    self.clear_native_video_ring_guide_overlay(ctx);
+                    ctx.request_repaint();
+                    return nav;
+                }
                 if self.gamepad_state.west_ring_active() {
                     if let Some(dir) = button_dir(action.button) {
                         let direction = self
@@ -1697,8 +1711,7 @@ impl App {
                     }
                     return None;
                 }
-                if action.button != PadButton::West
-                    && action.button != PadButton::North
+                if action.button != PadButton::North
                     && let Some(nav) =
                         self.dispatch_gamepad_button_override(ctx, action.button, action.kind)
                 {
@@ -2215,7 +2228,7 @@ impl App {
         self.settings.ring_shortcuts.x_picker_hint_shown = true;
         self.settings.save();
         self.show_feedback_toast_with_duration(
-            "X 単体はピッカーを開きます。メタデータ表示は画像リングの右上スロットから使えます。"
+            "ピッカーを開きました。メタデータ表示は画像リングの右上スロットから使えます。"
                 .to_string(),
             X_PICKER_HINT_TOAST_SECS,
         );
@@ -3349,7 +3362,7 @@ impl App {
             }
         });
         crate::video::native_presenter::NativeOverlayRingPicker {
-            title: format!("X ピッカー / {}", picker.context.label()),
+            title: format!("ピッカー / {}", picker.context.label()),
             rows,
             selected_row: Some(picker.current_row()),
             footer: "上下:選択  左右:変更  A:一覧  B/X:確定".to_string(),
