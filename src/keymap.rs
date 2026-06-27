@@ -1413,6 +1413,7 @@ pub enum KeyAction {
     FsDeleteEraseMask,
     FsDeleteConcealMask,
     VideoExternalPlayer,
+    VideoCloseFullscreen,
     VideoPlayPause,
     VideoSeekStart,
     VideoSeekBackSmall,
@@ -1775,6 +1776,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsDeleteEraseMask,
     KeyAction::FsDeleteConcealMask,
     KeyAction::VideoExternalPlayer,
+    KeyAction::VideoCloseFullscreen,
     KeyAction::VideoPlayPause,
     KeyAction::VideoSeekStart,
     KeyAction::VideoSeekBackSmall,
@@ -3026,6 +3028,7 @@ impl KeyAction {
             FsDeleteEraseMask => "FsDeleteEraseMask",
             FsDeleteConcealMask => "FsDeleteConcealMask",
             VideoExternalPlayer => "VideoExternalPlayer",
+            VideoCloseFullscreen => "VideoCloseFullscreen",
             VideoPlayPause => "VideoPlayPause",
             VideoSeekStart => "VideoSeekStart",
             VideoSeekBackSmall => "VideoSeekBackSmall",
@@ -3479,6 +3482,7 @@ impl KeyAction {
             FsDeleteEraseMask => "現在ページの消しゴムマスクを削除する",
             FsDeleteConcealMask => "現在ページの隠蔽マスクを削除する",
             VideoExternalPlayer => "現在の動画を外部プレイヤーで開く",
+            VideoCloseFullscreen => "動画フルスクリーンを閉じて一覧へ戻る",
             VideoPlayPause => "動画の再生または一時停止を切り替える",
             VideoSeekStart => "動画の先頭へ移動して再生する",
             VideoSeekBackSmall => "動画を1秒戻す",
@@ -3829,6 +3833,7 @@ impl KeyAction {
             | FsDeleteEraseMask
             | FsDeleteConcealMask => KeyContext::FsImage,
             VideoExternalPlayer
+            | VideoCloseFullscreen
             | VideoPlayPause
             | VideoSeekStart
             | VideoSeekBackSmall
@@ -4166,6 +4171,7 @@ impl KeyAction {
             | FsDeleteEraseMask
             | FsDeleteConcealMask
             | VideoExternalPlayer
+            | VideoCloseFullscreen
             | VideoPlayPause
             | VideoSeekStart
             | VideoSeekBackSmall
@@ -4529,6 +4535,7 @@ impl KeyAction {
             FsDeleteEraseMask => ChordList::two(Chord::shift(F7), Chord::shift(F8)),
             FsDeleteConcealMask => ChordList::two(Chord::shift(F9), Chord::shift(F10)),
             VideoExternalPlayer => ChordList::one(Chord::shift(Enter)),
+            VideoCloseFullscreen => ChordList::EMPTY,
             VideoPlayPause => ChordList::two(Chord::key(Space), Chord::key(Enter)),
             VideoSeekStart => ChordList::one(Chord::key(W)),
             VideoSeekBackSmall => ChordList::one(Chord::shift(Left)),
@@ -6959,6 +6966,33 @@ mod tests {
     }
 
     #[test]
+    fn video_close_fullscreen_is_video_scoped_and_unassigned_by_default() {
+        assert_eq!(
+            KeyAction::VideoCloseFullscreen.context(),
+            KeyContext::FsVideo
+        );
+        assert!(KeyAction::VideoCloseFullscreen.default_chords().is_empty());
+
+        let keymap = Keymap::empty();
+        let visible_rows =
+            keymap.command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, false);
+        assert!(
+            !visible_rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::VideoCloseFullscreen),
+            "unassigned video close command should not clutter shortcut help by default"
+        );
+
+        let all_rows = keymap.command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, true);
+        let close_row = all_rows
+            .iter()
+            .find(|row| row.spec.action == KeyAction::VideoCloseFullscreen)
+            .expect("operation customization should list default-unassigned video close command");
+        assert_eq!(close_row.spec.scope, KeyContext::FsVideo);
+        assert!(close_row.shortcut_labels.is_empty());
+    }
+
+    #[test]
     fn command_display_rows_follow_overrides_and_none() {
         let keymap = Keymap::from_ini_str(
             r#"
@@ -8355,6 +8389,33 @@ mod tests {
         );
         keymap.install_global_native_video_shortcuts();
         assert!(native_video_fullscreen_shortcut_key(&alt_event(0x25)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_close_fullscreen_shortcut_follows_keymap() {
+        let _guard = native_video_shortcut_test_guard();
+        let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x7E))); // F15
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsVideo]
+            VideoCloseFullscreen = F15
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&event(0x7E)));
     }
 
     #[cfg(windows)]

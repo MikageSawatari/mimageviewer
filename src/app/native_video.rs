@@ -5119,6 +5119,14 @@ impl App {
             return;
         }
         match key.virtual_key {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoCloseFullscreen, &key) =>
+            {
+                self.close_fullscreen();
+                hud_activity = false;
+            }
             // Shift+Enter: open in external player, matching the legacy egui
             // fullscreen video path.
             _ if !key.repeat

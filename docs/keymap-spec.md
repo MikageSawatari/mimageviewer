@@ -365,6 +365,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 |---|---|---|
 | <kbd>?</kbd> (既定) | 現在の動画フルスクリーンコンテキストで使えるショートカット一覧を表示 | Action: `HelpShowContextShortcuts`。egui 経路と Windows native 動画 overlay の両方で対応 |
 | <kbd>Space</kbd> / <kbd>Enter</kbd> | 再生 / 一時停止トグル | Action: `VideoPlayPause`。動画 HUD 2 段化リデザイン (Phase 1) で Space を再生/停止に変更 (旧: 選択トグル)。チェックしたい場合は Esc で一覧へ戻る |
+| 既定キーなし | 動画フルスクリーンを閉じて一覧へ戻る | Action: `VideoCloseFullscreen`。<kbd>Esc</kbd> は固定入力として残しつつ、操作カスタマイズで追加の閉じるキーを割り当てられる |
 | <kbd>Backspace</kbd> | 一覧へ戻る | Action: `FsBackToList`。画像フルスクリーンと同じ。native presenter 経路でも App 側へ転送する |
 | <kbd>Home</kbd> / <kbd>End</kbd> | 先頭 / 末尾の項目へ移動 | Action: `FsJumpFirst` / `FsJumpLast`。native presenter 経路でも App 側へ転送する |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | 外部プレイヤー起動 | Action: `VideoExternalPlayer` |

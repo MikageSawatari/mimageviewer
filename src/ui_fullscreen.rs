@@ -16583,6 +16583,9 @@ impl App {
         // トグルに追加。Enter / Shift+Enter は既存どおり (Enter = 再生/停止、Shift+Enter = 外部
         // プレイヤー)。egui の `consume_key` は修飾子マッチが厳密 (Caps Lock + Shift などで
         // 取りこぼす) ので、`modifiers.shift` を見た fallback も併用する。
+        let close_video = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoCloseFullscreen);
         let shift_enter = self
             .keymap
             .consume_action(ctx, KeyAction::VideoExternalPlayer);
@@ -16739,6 +16742,10 @@ impl App {
         let escape_for_tile = self.video_tile_mode_active
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
+        if close_video {
+            self.close_fullscreen();
+            return;
+        }
         if shift_enter {
             if let Some(p) = video_path {
                 open_external_player(p);

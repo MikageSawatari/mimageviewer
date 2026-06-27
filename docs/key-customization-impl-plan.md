@@ -541,7 +541,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsOriginalPreviewHold `RightCtrl` (Windows) / `Num0` (非 Windows fallback) は OS 状態参照のため固定。
 
 ### FsVideo (Ph5、VK 経路)
-- VideoPlayPause `Space`,`Enter` / VideoExternalPlayer `Shift+Enter`
+- VideoPlayPause `Space`,`Enter` / VideoExternalPlayer `Shift+Enter` /
+  VideoCloseFullscreen (既定未割り当て、動画フルスクリーンを閉じる追加キー)
 - VideoSeekBack/Fwd `←/→` (修飾なし 5 秒は固定) / VideoSeekBackSmall/ForwardSmall `Shift+←/→` (P) /
   VideoSeekBackLarge/ForwardLarge `Ctrl+←/→` (P)
 - VideoFrameStepBack/Fwd `Ctrl+Shift+←/→` (P)

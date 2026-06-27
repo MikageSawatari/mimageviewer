@@ -379,6 +379,7 @@
 
 [FsVideo] ; 動画フルスクリーン
 # VideoExternalPlayer = Shift+Enter ; 現在の動画を外部プレイヤーで開く
+# VideoCloseFullscreen = none ; 動画フルスクリーンを閉じて一覧へ戻る
 # VideoPlayPause.1 = Space ; 動画の再生または一時停止を切り替える
 # VideoPlayPause.2 = Enter ; 動画の再生または一時停止を切り替える
 # VideoSeekStart = W ; 動画の先頭へ移動して再生する
