@@ -2310,6 +2310,10 @@ pub fn menu_commands_for_parent(parent: TopMenuId) -> impl Iterator<Item = MenuC
         .filter(move |spec| spec.parent == parent)
 }
 
+pub fn menu_command_can_be_hidden(id: MenuCommandId) -> bool {
+    !matches!(id, MenuCommandId::SettingsPreferences)
+}
+
 pub fn menu_command_spec(id: MenuCommandId) -> Option<MenuCommandSpec> {
     MENU_COMMAND_SPECS
         .iter()
@@ -2373,6 +2377,7 @@ pub fn resolve_menu_layout(settings: &MenuLayoutSettings) -> ResolvedMenuLayout 
         .hidden_commands
         .iter()
         .filter_map(|name| MenuCommandId::parse_stable_name(name))
+        .filter(|id| menu_command_can_be_hidden(*id))
         .collect();
 
     let mut parents = Vec::with_capacity(TopMenuId::ALL.len());
@@ -6695,6 +6700,7 @@ mod tests {
             hidden_commands: vec![
                 "HelpOpenLogs".to_string(),
                 "FileReadingHistory".to_string(),
+                "SettingsPreferences".to_string(),
                 "FutureCommand".to_string(),
             ],
         };
@@ -6721,6 +6727,37 @@ mod tests {
             ]
         );
         assert_eq!(resolved.menus[2].id, TopMenuId::Favorites);
+        let settings_menu = resolved
+            .menus
+            .iter()
+            .find(|menu| menu.id == TopMenuId::Settings)
+            .expect("settings menu should remain reachable");
+        assert!(
+            settings_menu
+                .commands
+                .contains(&MenuCommandId::SettingsPreferences)
+        );
+    }
+
+    #[test]
+    fn settings_preferences_menu_command_cannot_be_hidden() {
+        assert!(!menu_command_can_be_hidden(
+            MenuCommandId::SettingsPreferences
+        ));
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec!["Settings".to_string()],
+            command_order: Vec::new(),
+            hidden_commands: menu_commands_for_parent(TopMenuId::Settings)
+                .map(|spec| spec.id.stable_name().to_string())
+                .collect(),
+        };
+
+        let resolved = resolve_menu_layout(&settings);
+        assert_eq!(resolved.menus[0].id, TopMenuId::Settings);
+        assert_eq!(
+            resolved.menus[0].commands,
+            vec![MenuCommandId::SettingsPreferences]
+        );
     }
 
     #[test]

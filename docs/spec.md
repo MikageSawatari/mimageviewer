@@ -45,6 +45,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - 環境設定「表示 → メニュー構成」から、トップレベルメニューと固定メニュー項目の
   表示 / 非表示・表示順を変更できる。登録済みお気に入り一覧、タグ一覧、更新確認など
   状況で変わる項目は固定項目ではないため個別には並べ替えない。
+  設定画面へ戻る入口を失わないよう、「設定 → 環境設定…」は非表示にできない。
 - 製本の「この本を並べ替え」は常にメニューへ表示し、本フォルダ以外では disabled にする。
   本フォルダでは専用の並べ替えダイアログを開く。小サムネイルの
   サイズをその場で調整でき、ドラッグ中は挿入先に I 字型インジケータを表示する。左右ボタンで
@@ -1133,7 +1134,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
 | `toolbar_{cols,aspect,sort,favorites,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_{favorites,tags,bookshelf}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
-| `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。欠落時や空設定は既定メニュー構成として扱う |
+| `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。「設定 → 環境設定…」は設定入口を失わないよう非表示指定を無視する。欠落時や空設定は既定メニュー構成として扱う |
 | `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。設定メニュー「操作カスタマイズ…」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | ウィンドウ位置・サイズ（自動保存） |

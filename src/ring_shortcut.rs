@@ -226,6 +226,23 @@ impl MouseGestureDirection {
     }
 }
 
+pub fn mouse_gesture_direction_from_delta(delta: egui::Vec2) -> Option<MouseGestureDirection> {
+    if delta.length() < MOUSE_GESTURE_STEP_THRESHOLD_PX {
+        return None;
+    }
+    if delta.x.abs() >= delta.y.abs() {
+        if delta.x >= 0.0 {
+            Some(MouseGestureDirection::Right)
+        } else {
+            Some(MouseGestureDirection::Left)
+        }
+    } else if delta.y >= 0.0 {
+        Some(MouseGestureDirection::Down)
+    } else {
+        Some(MouseGestureDirection::Up)
+    }
+}
+
 impl Serialize for MouseGestureDirection {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

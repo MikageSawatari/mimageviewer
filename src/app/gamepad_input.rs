@@ -16,6 +16,7 @@ use crate::ring_shortcut::{
     RightDragContext, RightDragMode, RingActionId, RingDirection, RingPickerAnchor,
     RingPickerOriginalState, RingPickerRowId, RingPickerState, RingShortcutContext,
     format_mouse_gesture_pattern, mouse_flick_guide_delay, mouse_flick_menu_delay,
+    mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
@@ -5729,22 +5730,6 @@ fn angular_distance_deg(a: f32, b: f32) -> f32 {
     ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs()
 }
 
-fn mouse_gesture_direction_from_delta(delta: egui::Vec2) -> Option<MouseGestureDirection> {
-    if delta.length() < MOUSE_GESTURE_STEP_THRESHOLD_PX {
-        return None;
-    }
-    if delta.x.abs() >= delta.y.abs() {
-        if delta.x >= 0.0 {
-            Some(MouseGestureDirection::Right)
-        } else {
-            Some(MouseGestureDirection::Left)
-        }
-    } else if delta.y >= 0.0 {
-        Some(MouseGestureDirection::Down)
-    } else {
-        Some(MouseGestureDirection::Up)
-    }
-}
 fn mouse_flick_direction(flick: &MouseFlickState) -> Option<RingDirection> {
     let delta = flick.current_pos - flick.start_pos;
     if delta.length() < MOUSE_FLICK_NEUTRAL_RADIUS_PX {

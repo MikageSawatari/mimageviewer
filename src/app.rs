@@ -15019,6 +15019,22 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
+        let removed_subfolder_paths: Vec<std::path::PathBuf> =
+            if self.subfolder_expansion_snapshot.is_some()
+                || self.subfolder_expansion_install_pending.is_some()
+            {
+                sorted_desc_idxs
+                    .iter()
+                    .filter_map(|&i| {
+                        self.items
+                            .get(i)
+                            .and_then(GridItem::drag_source_path)
+                            .map(std::path::Path::to_path_buf)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         // 物理 shift: 降順なので items.remove(i) の再 shift は発生しない。
         for &i in sorted_desc_idxs {
@@ -15033,6 +15049,7 @@ impl App {
             }
         }
         self.items_generation = self.items_generation.wrapping_add(1);
+        self.remove_paths_from_subfolder_expansion_snapshot(&removed_subfolder_paths);
 
         // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
         // 削除 idx 集合は降順入力だが、partition_point には昇順が要るので一度昇順化する。

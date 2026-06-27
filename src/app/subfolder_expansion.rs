@@ -905,6 +905,33 @@ impl App {
         true
     }
 
+    pub(crate) fn remove_paths_from_subfolder_expansion_snapshot(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let removed: HashSet<String> = paths
+            .iter()
+            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+
+        let mut active_changed = false;
+        if let Some(snapshot) = self.subfolder_expansion_snapshot.as_mut() {
+            active_changed = remove_paths_from_snapshot(snapshot, &removed);
+        }
+        if active_changed {
+            self.subfolder_expansion_diag = self
+                .subfolder_expansion_snapshot
+                .as_ref()
+                .map(|s| s.diag.clone());
+        }
+        if let Some(pending) = self.subfolder_expansion_install_pending.as_mut() {
+            remove_paths_from_snapshot(&mut pending.snapshot, &removed);
+        }
+    }
+
     pub(crate) fn take_subfolder_expansion_restore_for_synthetic_path(
         &mut self,
         path: Option<&Path>,
@@ -1251,6 +1278,27 @@ fn expansion_roots_eq(a: &[PathBuf], b: &[PathBuf]) -> bool {
             .all(|(left, right)| crate::folder_tree::path_eq(left, right))
 }
 
+fn remove_paths_from_snapshot(
+    snapshot: &mut SubfolderExpansionSnapshot,
+    removed: &HashSet<String>,
+) -> bool {
+    let before = snapshot.entries.len();
+    snapshot
+        .entries
+        .retain(|entry| !removed.contains(&crate::path_key::normalize_keep_drive(&entry.path)));
+    snapshot
+        .video_thumb_overrides
+        .retain(|video_key, image_path| {
+            !removed.contains(video_key)
+                && !removed.contains(&crate::path_key::normalize_keep_drive(image_path))
+        });
+    let changed = snapshot.entries.len() != before;
+    if changed {
+        snapshot.diag.media_found = snapshot.entries.len();
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1345,5 +1393,69 @@ mod tests {
         let sorted = sort_entries_for_view(entries, crate::settings::SortOrder::FileName, &root);
         assert!(sorted[0].path.ends_with(Path::new("a").join("same.jpg")));
         assert!(sorted[1].path.ends_with(Path::new("b").join("same.jpg")));
+    }
+
+    #[test]
+    fn snapshot_removal_drops_deleted_entries_and_video_overrides() {
+        let root = PathBuf::from(r"C:\root");
+        let kept_video = root.join("kept.mp4");
+        let removed_video = root.join("removed.mp4");
+        let removed_image = root.join("removed.jpg");
+        let kept_image = root.join("kept.jpg");
+        let mut snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            entries: vec![
+                SubfolderExpansionEntry {
+                    path: kept_video.clone(),
+                    is_video: true,
+                    mtime: 1,
+                    file_size: 10,
+                },
+                SubfolderExpansionEntry {
+                    path: removed_video.clone(),
+                    is_video: true,
+                    mtime: 2,
+                    file_size: 20,
+                },
+                SubfolderExpansionEntry {
+                    path: kept_image.clone(),
+                    is_video: false,
+                    mtime: 3,
+                    file_size: 30,
+                },
+            ],
+            video_thumb_overrides: HashMap::from([
+                (
+                    crate::path_key::normalize_keep_drive(&kept_video),
+                    kept_image.clone(),
+                ),
+                (
+                    crate::path_key::normalize_keep_drive(&removed_video),
+                    removed_image,
+                ),
+            ]),
+            diag: SubfolderExpansionDiag {
+                media_found: 3,
+                ..Default::default()
+            },
+        };
+        let removed = HashSet::from([crate::path_key::normalize_keep_drive(&removed_video)]);
+
+        assert!(remove_paths_from_snapshot(&mut snapshot, &removed));
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.path != removed_video)
+        );
+        assert_eq!(snapshot.video_thumb_overrides.len(), 1);
+        assert!(
+            snapshot
+                .video_thumb_overrides
+                .contains_key(&crate::path_key::normalize_keep_drive(&kept_video))
+        );
+        assert_eq!(snapshot.diag.media_found, 2);
     }
 }

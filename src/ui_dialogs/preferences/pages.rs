@@ -2,11 +2,13 @@ use super::*;
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
     Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, TopMenuId,
-    menu_command_spec, menu_commands_for_parent, parse_chord_for_action,
+    menu_command_can_be_hidden, menu_command_spec, menu_commands_for_parent,
+    parse_chord_for_action,
 };
 use crate::ring_shortcut::{
     GamepadButtonSlot, MouseGestureDirection, RightDragContext, RightDragMode, RingActionId,
     RingDirection, RingShortcutContext, RingShortcutSettings, format_mouse_gesture_pattern,
+    mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
@@ -1314,19 +1316,8 @@ fn update_mouse_gesture_recording(recorder: &mut OperationMouseGestureRecorder, 
         return;
     };
     let delta = pos - last;
-    if delta.length() < 24.0 {
+    let Some(direction) = mouse_gesture_direction_from_delta(delta) else {
         return;
-    }
-    let direction = if delta.x.abs() >= delta.y.abs() {
-        if delta.x >= 0.0 {
-            MouseGestureDirection::Right
-        } else {
-            MouseGestureDirection::Left
-        }
-    } else if delta.y >= 0.0 {
-        MouseGestureDirection::Down
-    } else {
-        MouseGestureDirection::Up
     };
     if recorder.pattern.last().copied() != Some(direction) {
         if recorder.pattern.len() >= crate::ring_shortcut::MOUSE_GESTURE_MAX_STROKES {
@@ -3088,9 +3079,15 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     .show(ui, |ui| {
                         for (command_index, &command) in command_order.iter().enumerate() {
                             let mut command_visible = !hidden.contains(&command);
+                            let can_hide = menu_command_can_be_hidden(command);
+                            let checkbox = egui::Checkbox::new(&mut command_visible, "");
                             if ui
-                                .checkbox(&mut command_visible, "")
-                                .on_hover_text("表示")
+                                .add_enabled(can_hide, checkbox)
+                                .on_hover_text(if can_hide {
+                                    "表示"
+                                } else {
+                                    "環境設定への入口なので非表示にできません"
+                                })
                                 .changed()
                             {
                                 edit = Some(MenuLayoutEdit::SetCommandVisible(
@@ -3160,7 +3157,7 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
             for spec in menu_commands_for_parent(top) {
                 if visible {
                     hidden.remove(&spec.id);
-                } else {
+                } else if menu_command_can_be_hidden(spec.id) {
                     hidden.insert(spec.id);
                 }
             }
@@ -3176,7 +3173,7 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
             let mut hidden = menu_layout_hidden_set(layout);
             if visible {
                 hidden.remove(&command);
-            } else {
+            } else if menu_command_can_be_hidden(command) {
                 hidden.insert(command);
             }
             write_menu_layout_hidden(layout, &hidden);
@@ -3267,6 +3264,7 @@ fn menu_layout_hidden_set(layout: &MenuLayoutSettings) -> BTreeSet<MenuCommandId
         .hidden_commands
         .iter()
         .filter_map(|name| MenuCommandId::parse_stable_name(name))
+        .filter(|id| menu_command_can_be_hidden(*id))
         .collect()
 }
 
@@ -3274,6 +3272,7 @@ fn write_menu_layout_hidden(layout: &mut MenuLayoutSettings, hidden: &BTreeSet<M
     layout.hidden_commands = MenuCommandId::ALL
         .iter()
         .copied()
+        .filter(|id| menu_command_can_be_hidden(*id))
         .filter(|id| hidden.contains(id))
         .map(|id| id.stable_name().to_string())
         .collect();
