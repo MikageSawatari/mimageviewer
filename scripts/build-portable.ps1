@@ -39,27 +39,6 @@ function Ensure-LibclangPath {
     }
 }
 
-# Newest LastWriteTime across files/dirs (dirs scanned recursively for *.rs /
-# *.toml). Freshness guard input: a freshly built exe must be at least as new as
-# its newest source, otherwise cargo returned a stale binary
-# (CLAUDE.md "feedback_release_stale_core_cache").
-function Newest-WriteTime {
-    param([string[]] $Paths)
-    $newest = [datetime]'2000-01-01'
-    foreach ($p in $Paths) {
-        if (-not (Test-Path $p)) { continue }
-        $item = Get-Item -LiteralPath $p
-        if ($item.PSIsContainer) {
-            $f = Get-ChildItem -LiteralPath $p -Recurse -File -Include *.rs, *.toml -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($f -and $f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime }
-        } elseif ($item.LastWriteTime -gt $newest) {
-            $newest = $item.LastWriteTime
-        }
-    }
-    return $newest
-}
-
 # ---------------------------------------------------------------------------
 # Read package version from Cargo.toml (first `version = "x"` under [package]).
 # ---------------------------------------------------------------------------
@@ -99,26 +78,9 @@ $portableTargetDir = Join-Path $repoRoot 'target-portable'
 $coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
 if (-not $SkipBuild) {
     Ensure-LibclangPath
-    $coreSrcNewest = Newest-WriteTime @(
-        (Join-Path $repoRoot 'src'),
-        (Join-Path $repoRoot 'build.rs'),
-        (Join-Path $repoRoot 'Cargo.toml'),
-        (Join-Path $repoRoot 'Cargo.lock')
-    )
     Write-Host "[portable] cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable"
     & cargo build --release --bin mimageviewer-core --features portable --target-dir $portableTargetDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    # Freshness guard: a core older than the newest source means cargo wrongly
-    # skipped the build. Clean the portable target dir and rebuild once.
-    if ((Get-Item $coreExe).LastWriteTime -lt $coreSrcNewest) {
-        Write-Warning "[portable] core looks STALE (older than newest source). Forcing clean rebuild."
-        & cargo clean --release --target-dir $portableTargetDir -p mimageviewer
-        & cargo build --release --bin mimageviewer-core --features portable --target-dir $portableTargetDir
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        if ((Get-Item $coreExe).LastWriteTime -lt $coreSrcNewest) {
-            throw "[portable] core STILL stale after clean rebuild: $coreExe"
-        }
-    }
 }
 if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe" }
 
