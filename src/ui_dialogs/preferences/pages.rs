@@ -1826,6 +1826,9 @@ fn open_operation_assignment_editor(
         state.operation_ring_context = context;
         state.operation_mouse_gesture_context = right_drag_context_for_ring_context(context);
     }
+    if let OperationAssignmentTarget::GamepadButton { context, .. } = &target {
+        state.operation_gamepad_context = *context;
+    }
     if let OperationAssignmentTarget::MouseGesture { context, .. } = &target {
         state.operation_mouse_gesture_context = *context;
     }
@@ -3893,7 +3896,7 @@ fn gamepad_button_assignment_editor(
         ui.small("既定を選ぶと従来のゲームパッド操作に戻ります。なしを選ぶとこのボタン単体の動作を止めます。");
         ui.add_space(6.0);
 
-        let available = RingActionId::available_for_context(context);
+        let available = RingActionId::available_for_gamepad_button_context(context);
         let profile = state.settings.ring_shortcuts.gamepad_button_profile_mut(context);
         profile.sanitize(context);
         let mut value = profile.action(button);

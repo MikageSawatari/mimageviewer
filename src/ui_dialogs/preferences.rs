@@ -440,6 +440,7 @@ pub(crate) struct PreferencesState {
     pub operation_keyboard_shift: bool,
     pub operation_keyboard_alt: bool,
     pub operation_ring_context: RingShortcutContext,
+    pub operation_gamepad_context: RingShortcutContext,
     pub operation_mouse_gesture_context: RightDragContext,
     pub operation_mouse_gesture_inputs: HashMap<(RightDragContext, usize), String>,
     pub operation_mouse_gesture_recorder: Option<OperationMouseGestureRecorder>,
@@ -662,6 +663,7 @@ impl PreferencesState {
             operation_keyboard_shift: false,
             operation_keyboard_alt: false,
             operation_ring_context: RingShortcutContext::Grid,
+            operation_gamepad_context: RingShortcutContext::Grid,
             operation_mouse_gesture_context: RightDragContext::Grid,
             operation_mouse_gesture_inputs: HashMap::new(),
             operation_mouse_gesture_recorder: None,
@@ -1678,7 +1680,7 @@ fn draw_operation_customize_page(
         OperationCustomizeTab::Gamepad => {
             draw_gamepad_context_tabs(ui, state);
             ui.add_space(8.0);
-            let context = state.operation_ring_context;
+            let context = state.operation_gamepad_context;
             page_gamepad_assignments(ui, state, context);
         }
     }
@@ -1760,10 +1762,10 @@ fn draw_gamepad_context_tabs(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.horizontal_wrapped(|ui| {
         for &context in RingShortcutContext::all() {
             if ui
-                .selectable_label(state.operation_ring_context == context, context.label())
+                .selectable_label(state.operation_gamepad_context == context, context.label())
                 .clicked()
             {
-                state.operation_ring_context = context;
+                state.operation_gamepad_context = context;
             }
         }
     });

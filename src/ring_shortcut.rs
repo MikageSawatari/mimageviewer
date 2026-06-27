@@ -453,6 +453,16 @@ pub enum RingActionId {
     ToggleWindowMode,
     ToggleMaximize,
     CycleFavorite,
+    GamepadAccept,
+    GamepadBack,
+    GamepadPicker,
+    GamepadAuxiliary,
+    GamepadSelectPanel,
+    GamepadFavoritePanel,
+    GamepadPrevFolder,
+    GamepadNextFolder,
+    GamepadLeftTrigger,
+    GamepadRightTrigger,
     OpenFavorite1,
     OpenFavorite2,
     OpenFavorite3,
@@ -828,6 +838,16 @@ impl RingActionId {
             Self::ToggleWindowMode => "toggle_window_mode",
             Self::ToggleMaximize => "toggle_maximize",
             Self::CycleFavorite => "cycle_favorite",
+            Self::GamepadAccept => "gamepad_accept",
+            Self::GamepadBack => "gamepad_back",
+            Self::GamepadPicker => "gamepad_picker",
+            Self::GamepadAuxiliary => "gamepad_auxiliary",
+            Self::GamepadSelectPanel => "gamepad_select_panel",
+            Self::GamepadFavoritePanel => "gamepad_favorite_panel",
+            Self::GamepadPrevFolder => "gamepad_prev_folder",
+            Self::GamepadNextFolder => "gamepad_next_folder",
+            Self::GamepadLeftTrigger => "gamepad_left_trigger",
+            Self::GamepadRightTrigger => "gamepad_right_trigger",
             Self::OpenFavorite1
             | Self::OpenFavorite2
             | Self::OpenFavorite3
@@ -952,6 +972,16 @@ impl RingActionId {
             "toggle_window_mode" => Self::ToggleWindowMode,
             "toggle_maximize" => Self::ToggleMaximize,
             "cycle_favorite" => Self::CycleFavorite,
+            "gamepad_accept" => Self::GamepadAccept,
+            "gamepad_back" => Self::GamepadBack,
+            "gamepad_picker" => Self::GamepadPicker,
+            "gamepad_auxiliary" => Self::GamepadAuxiliary,
+            "gamepad_select_panel" => Self::GamepadSelectPanel,
+            "gamepad_favorite_panel" => Self::GamepadFavoritePanel,
+            "gamepad_prev_folder" => Self::GamepadPrevFolder,
+            "gamepad_next_folder" => Self::GamepadNextFolder,
+            "gamepad_left_trigger" => Self::GamepadLeftTrigger,
+            "gamepad_right_trigger" => Self::GamepadRightTrigger,
             "open_location_drive_list" => Self::OpenLocationDriveList,
             "open_location_reading_history" => Self::OpenLocationReadingHistory,
             "open_location_rating_1" => Self::OpenLocationRating1,
@@ -1041,6 +1071,16 @@ impl RingActionId {
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::ToggleMaximize => "ウィンドウ最大化/復元",
             Self::CycleFavorite => "お気に入り巡回",
+            Self::GamepadAccept => GamepadButtonSlot::South.default_label(context),
+            Self::GamepadBack => GamepadButtonSlot::East.default_label(context),
+            Self::GamepadPicker => GamepadButtonSlot::West.default_label(context),
+            Self::GamepadAuxiliary => GamepadButtonSlot::North.default_label(context),
+            Self::GamepadSelectPanel => GamepadButtonSlot::Select.default_label(context),
+            Self::GamepadFavoritePanel => GamepadButtonSlot::Start.default_label(context),
+            Self::GamepadPrevFolder => GamepadButtonSlot::LeftShoulder.default_label(context),
+            Self::GamepadNextFolder => GamepadButtonSlot::RightShoulder.default_label(context),
+            Self::GamepadLeftTrigger => GamepadButtonSlot::LeftTrigger.default_label(context),
+            Self::GamepadRightTrigger => GamepadButtonSlot::RightTrigger.default_label(context),
             Self::OpenFavorite1
             | Self::OpenFavorite2
             | Self::OpenFavorite3
@@ -1151,6 +1191,16 @@ impl RingActionId {
             RingShortcutContext::Grid => matches!(
                 self,
                 Self::None
+                    | Self::GamepadAccept
+                    | Self::GamepadBack
+                    | Self::GamepadPicker
+                    | Self::GamepadAuxiliary
+                    | Self::GamepadSelectPanel
+                    | Self::GamepadFavoritePanel
+                    | Self::GamepadPrevFolder
+                    | Self::GamepadNextFolder
+                    | Self::GamepadLeftTrigger
+                    | Self::GamepadRightTrigger
                     | Self::ToggleMaximize
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
@@ -1180,6 +1230,16 @@ impl RingActionId {
             RingShortcutContext::ImageFullscreen => matches!(
                 self,
                 Self::None
+                    | Self::GamepadAccept
+                    | Self::GamepadBack
+                    | Self::GamepadPicker
+                    | Self::GamepadAuxiliary
+                    | Self::GamepadSelectPanel
+                    | Self::GamepadFavoritePanel
+                    | Self::GamepadPrevFolder
+                    | Self::GamepadNextFolder
+                    | Self::GamepadLeftTrigger
+                    | Self::GamepadRightTrigger
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
@@ -1209,6 +1269,16 @@ impl RingActionId {
             RingShortcutContext::VideoFullscreen => matches!(
                 self,
                 Self::None
+                    | Self::GamepadAccept
+                    | Self::GamepadBack
+                    | Self::GamepadPicker
+                    | Self::GamepadAuxiliary
+                    | Self::GamepadSelectPanel
+                    | Self::GamepadFavoritePanel
+                    | Self::GamepadPrevFolder
+                    | Self::GamepadNextFolder
+                    | Self::GamepadLeftTrigger
+                    | Self::GamepadRightTrigger
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
@@ -1314,6 +1384,23 @@ impl RingActionId {
             ],
         };
         actions.extend(Self::location_navigation_actions());
+        actions
+    }
+
+    pub fn available_for_gamepad_button_context(context: RingShortcutContext) -> Vec<Self> {
+        let mut actions = Self::available_for_context(context);
+        actions.extend([
+            Self::GamepadAccept,
+            Self::GamepadBack,
+            Self::GamepadPicker,
+            Self::GamepadAuxiliary,
+            Self::GamepadSelectPanel,
+            Self::GamepadFavoritePanel,
+            Self::GamepadPrevFolder,
+            Self::GamepadNextFolder,
+            Self::GamepadLeftTrigger,
+            Self::GamepadRightTrigger,
+        ]);
         actions
     }
 }
@@ -1512,41 +1599,57 @@ impl GamepadButtonSlot {
     }
 
     pub fn default_label(self, context: RingShortcutContext) -> &'static str {
-        match self {
-            Self::South => match context {
+        match self.default_action() {
+            RingActionId::GamepadAccept => match context {
                 RingShortcutContext::Grid => "決定 / 開く",
                 RingShortcutContext::ImageFullscreen => "次の画像",
                 RingShortcutContext::VideoFullscreen => "再生 / 一時停止",
             },
-            Self::East => match context {
+            RingActionId::GamepadBack => match context {
                 RingShortcutContext::Grid => "戻る",
                 RingShortcutContext::ImageFullscreen => "フルスクリーンを閉じる",
                 RingShortcutContext::VideoFullscreen => "動画を閉じる",
             },
-            Self::West => "ピッカー",
-            Self::North => match context {
+            RingActionId::GamepadPicker => "ピッカー",
+            RingActionId::GamepadAuxiliary => match context {
                 RingShortcutContext::Grid => "フォルダツリー",
                 RingShortcutContext::ImageFullscreen => "補助操作",
                 RingShortcutContext::VideoFullscreen => "タイルモード",
             },
-            Self::Select => match context {
+            RingActionId::GamepadSelectPanel => match context {
                 RingShortcutContext::Grid => "場所パネル",
                 RingShortcutContext::ImageFullscreen => "見開き切替",
                 RingShortcutContext::VideoFullscreen => "マーカー移動",
             },
-            Self::Start => "お気に入り",
-            Self::LeftShoulder => "前フォルダ",
-            Self::RightShoulder => "次フォルダ",
-            Self::LeftTrigger => match context {
+            RingActionId::GamepadFavoritePanel => "お気に入り",
+            RingActionId::GamepadPrevFolder => "前フォルダ",
+            RingActionId::GamepadNextFolder => "次フォルダ",
+            RingActionId::GamepadLeftTrigger => match context {
                 RingShortcutContext::Grid => "スクロール",
                 RingShortcutContext::ImageFullscreen => "ズームアウト",
                 RingShortcutContext::VideoFullscreen => "左シーク",
             },
-            Self::RightTrigger => match context {
+            RingActionId::GamepadRightTrigger => match context {
                 RingShortcutContext::Grid => "スクロール",
                 RingShortcutContext::ImageFullscreen => "ズームイン",
                 RingShortcutContext::VideoFullscreen => "右シーク",
             },
+            _ => unreachable!("gamepad default action is constrained"),
+        }
+    }
+
+    pub fn default_action(self) -> RingActionId {
+        match self {
+            Self::South => RingActionId::GamepadAccept,
+            Self::East => RingActionId::GamepadBack,
+            Self::West => RingActionId::GamepadPicker,
+            Self::North => RingActionId::GamepadAuxiliary,
+            Self::Select => RingActionId::GamepadSelectPanel,
+            Self::Start => RingActionId::GamepadFavoritePanel,
+            Self::LeftShoulder => RingActionId::GamepadPrevFolder,
+            Self::RightShoulder => RingActionId::GamepadNextFolder,
+            Self::LeftTrigger => RingActionId::GamepadLeftTrigger,
+            Self::RightTrigger => RingActionId::GamepadRightTrigger,
         }
     }
 }
@@ -2698,6 +2801,58 @@ mod tests {
             Some(RingActionId::OpenDriveZ)
         );
         assert_eq!(RingActionId::OpenDriveZ.drive_letter(), Some('Z'));
+    }
+
+    #[test]
+    fn gamepad_default_actions_round_trip_and_are_gamepad_button_candidates() {
+        let samples = [
+            (RingActionId::GamepadAccept, "gamepad_accept"),
+            (RingActionId::GamepadBack, "gamepad_back"),
+            (RingActionId::GamepadPicker, "gamepad_picker"),
+            (RingActionId::GamepadAuxiliary, "gamepad_auxiliary"),
+            (RingActionId::GamepadSelectPanel, "gamepad_select_panel"),
+            (RingActionId::GamepadFavoritePanel, "gamepad_favorite_panel"),
+            (RingActionId::GamepadPrevFolder, "gamepad_prev_folder"),
+            (RingActionId::GamepadNextFolder, "gamepad_next_folder"),
+            (RingActionId::GamepadLeftTrigger, "gamepad_left_trigger"),
+            (RingActionId::GamepadRightTrigger, "gamepad_right_trigger"),
+        ];
+
+        for (action, id) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            for &context in RingShortcutContext::all() {
+                assert!(action.is_valid_for_context(context));
+                assert!(
+                    RingActionId::available_for_gamepad_button_context(context).contains(&action)
+                );
+                assert!(
+                    !RingActionId::available_for_context(context).contains(&action),
+                    "gamepad default actions should stay out of generic ring/mouse candidates"
+                );
+            }
+        }
+
+        assert_eq!(
+            GamepadButtonSlot::South.default_action(),
+            RingActionId::GamepadAccept
+        );
+        assert_eq!(
+            GamepadButtonSlot::East.default_action(),
+            RingActionId::GamepadBack
+        );
+        assert_eq!(
+            RingActionId::GamepadAccept.label_for_context(RingShortcutContext::Grid),
+            "決定 / 開く"
+        );
+        assert_eq!(
+            RingActionId::GamepadBack.label_for_context(RingShortcutContext::ImageFullscreen),
+            "フルスクリーンを閉じる"
+        );
+        assert_eq!(
+            RingActionId::GamepadAccept.label_for_context(RingShortcutContext::VideoFullscreen),
+            "再生 / 一時停止"
+        );
     }
 
     #[test]
