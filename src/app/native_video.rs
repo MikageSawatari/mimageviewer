@@ -5201,7 +5201,7 @@ impl App {
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
             // behind the opaque tile grid. Ctrl moves by one visible row.
-            0x25 | 0x27 if self.video_tile_mode_active => {
+            0x25 | 0x27 if self.video_tile_mode_active && !key.alt => {
                 self.handle_video_tile_cursor_key(ctx, fs_idx, key.ctrl, key.virtual_key == 0x25);
             }
             // Ctrl+Shift+Left / Right by default: frame step and pause.
@@ -5242,10 +5242,10 @@ impl App {
                 self.native_video_seek_relative_with_hint(fs_idx, 30.0);
             }
             // Left / Right: same seek granularity as the egui fullscreen path.
-            0x25 if !key.ctrl && !key.shift => {
+            0x25 if !key.ctrl && !key.shift && !key.alt => {
                 self.native_video_seek_relative_with_hint(fs_idx, -5.0);
             }
-            0x27 if !key.ctrl && !key.shift => {
+            0x27 if !key.ctrl && !key.shift && !key.alt => {
                 self.native_video_seek_relative_with_hint(fs_idx, 5.0);
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.

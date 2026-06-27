@@ -4826,6 +4826,30 @@ const RESERVED_BINDINGS: &[ReservedBinding] = &[
         chord: Chord::key(KeyName::Down),
         name: "plain arrow navigation",
     },
+    ReservedBinding {
+        scope: KeyContext::Grid,
+        trigger: KeyTrigger::Press,
+        chord: Chord::shift(KeyName::Left),
+        name: "grid range selection",
+    },
+    ReservedBinding {
+        scope: KeyContext::Grid,
+        trigger: KeyTrigger::Press,
+        chord: Chord::shift(KeyName::Right),
+        name: "grid range selection",
+    },
+    ReservedBinding {
+        scope: KeyContext::Grid,
+        trigger: KeyTrigger::Press,
+        chord: Chord::shift(KeyName::Up),
+        name: "grid range selection",
+    },
+    ReservedBinding {
+        scope: KeyContext::Grid,
+        trigger: KeyTrigger::Press,
+        chord: Chord::shift(KeyName::Down),
+        name: "grid range selection",
+    },
 ];
 
 impl Keymap {
@@ -5211,7 +5235,9 @@ impl Keymap {
             .filter(|binding| binding.customized && binding.action.is_user_facing())
         {
             for reserved in RESERVED_BINDINGS {
-                if binding.chord == reserved.chord {
+                if binding.chord == reserved.chord
+                    && command_scopes_overlap(binding.scope, reserved.scope)
+                {
                     conflicts.push(BindingConflict {
                         kind: BindingConflictKind::Reserved,
                         chord: binding.chord,
@@ -5682,8 +5708,9 @@ impl Keymap {
         out.push_str("# - 既定キーが無い Action は # Action = none と表示されます。\n");
         out.push_str("# - 同時に有効になり得る Action へ同じキーを割り当てると起動時に警告ログを出します。\n");
         out.push_str(
-            "# - Esc / 修飾なし矢印キーは予約扱いです。割り当てても警告ログを出します。\n",
+            "# - Esc / 修飾なし矢印キー、サムネイル一覧の Shift+矢印範囲選択は予約扱いです。\n",
         );
+        out.push_str("#   割り当てても警告ログを出します。\n");
         out.push_str("# - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。\n");
         out.push_str("# - 競合は拒否しません。競合時は先に判定された操作が有効になります。\n");
         out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
@@ -5707,7 +5734,8 @@ impl Keymap {
         out.push_str(
             "# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、\n",
         );
-        out.push_str("#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーションは固定です。\n");
+        out.push_str("#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーション、\n");
+        out.push_str("#   サムネイル一覧の Shift+矢印範囲選択は固定です。\n");
         out.push_str("#\n");
         out.push_str("# 例:\n");
         out.push_str("# [FsImage]\n");
@@ -6059,7 +6087,7 @@ fn modifier_held_via_os(kind: ModKind) -> bool {
 pub fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
-    if native_video_fixed_shortcut_key(key.virtual_key) {
+    if native_video_fixed_shortcut_key(key) {
         return true;
     }
     if let Some(cell) = GLOBAL_NATIVE_VIDEO_CHORDS.get()
@@ -6127,17 +6155,13 @@ pub(crate) fn native_video_context_shortcuts_help_key_down(
         .any(matches)
 }
 
-fn native_video_fixed_shortcut_key(virtual_key: u32) -> bool {
-    matches!(
-        virtual_key,
-        0x1B // Escape
-            | 0x25 // Left
-            | 0x26 // Up
-            | 0x27 // Right
-            | 0x28 // Down
-            | 0xA6 // Browser back
-            | 0xA7 // Browser forward
-    )
+fn native_video_fixed_shortcut_key(key: &crate::video::native_window::NativeVideoKeyEvent) -> bool {
+    match key.virtual_key {
+        0x1B => !key.ctrl && !key.shift && !key.alt, // Escape
+        0x25 | 0x26 | 0x27 | 0x28 => !key.ctrl && !key.shift && !key.alt, // Plain arrows
+        0xA6 | 0xA7 => true,                         // Browser back / forward
+        _ => false,
+    }
 }
 
 static GLOBAL_NATIVE_VIDEO_CHORDS: OnceLock<RwLock<Vec<Chord>>> = OnceLock::new();
@@ -8029,6 +8053,42 @@ mod tests {
     }
 
     #[test]
+    fn binding_conflicts_warn_for_grid_shift_arrow_range_selection_only_in_grid() {
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            GridToggleStackMode = Shift+Left
+            "#,
+        );
+        assert!(keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::Reserved
+                && conflict.action == KeyAction::GridToggleStackMode
+                && conflict.chord == Chord::shift(KeyName::Left)
+                && conflict.reserved_name == Some("grid range selection")
+        }));
+        assert!(keymap.warnings().iter().any(|warning| {
+            warning.contains("GridToggleStackMode")
+                && warning.contains("reserved shortcut Shift+Left")
+                && warning.contains("grid range selection")
+        }));
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Text]
+            TextConfirm = Shift+Left
+            "#,
+        );
+        assert!(
+            keymap
+                .binding_conflicts()
+                .iter()
+                .all(|conflict| conflict.kind != BindingConflictKind::Reserved),
+            "grid-only Shift+arrow reservation must not warn in text context: {:?}",
+            keymap.binding_conflicts()
+        );
+    }
+
+    #[test]
     fn enter_is_assignable_and_not_reserved() {
         let keymap = Keymap::from_ini_str(
             r#"
@@ -8240,6 +8300,7 @@ mod tests {
         assert!(native_video_fullscreen_shortcut_key(&event(0x24))); // Home
         assert!(native_video_fullscreen_shortcut_key(&event(0x23))); // End
         assert!(native_video_fullscreen_shortcut_key(&alt_event(0x43))); // Alt+C
+        assert!(!native_video_fullscreen_shortcut_key(&alt_event(0x25))); // Alt+Left is not a fixed seek
 
         let keymap = Keymap::from_ini_str(
             r#"
@@ -8256,6 +8317,15 @@ mod tests {
         assert!(!native_video_fullscreen_shortcut_key(&event(0x23)));
         assert!(native_video_fullscreen_shortcut_key(&event(0x7C))); // F13
         assert!(native_video_fullscreen_shortcut_key(&event(0x7D))); // F14
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsVideo]
+            VideoMute = Alt+Left
+            "#,
+        );
+        keymap.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&alt_event(0x25)));
     }
 
     #[cfg(windows)]

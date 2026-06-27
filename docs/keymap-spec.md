@@ -77,10 +77,11 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
+| サムネイル一覧の範囲選択 | <kbd>Shift</kbd>+矢印キー | グリッド選択カーソルの移動とチェック追加が一体になった固定操作。Grid 文脈で同じキーを割り当てた場合は予約キー警告を出す |
 | Shell / クリップボード / D&D | Shell コピー / 切り取り / 貼り付け、Shell 右クリックメニュー、外部アプリへのドラッグ送出 | Windows Shell やクリップボードイベントの経路を優先するため、キーボードコマンドとは分ける |
 | 編集ツール内のドラッグ状態 | 消しゴム / 隠蔽加工 / 補正レイヤーの選択後の矢印 / <kbd>Ctrl</kbd>+矢印、<kbd>[</kbd> / <kbd>]</kbd>、<kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd>、ハンドル操作中の <kbd>Shift</kbd> / <kbd>Alt</kbd>、切り取り / テキスト注釈のドラッグやホイールなど | 選択中オブジェクト、ドラッグ中の形状、パネルフォーカスに依存するモード内操作。操作カスタマイズ画面では消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤーの通常コマンドは「編集モード」としてまとめるが、これらの微調整キーは固定入力のまま |
 | 360 度パノラマ表示中 | 左ドラッグの yaw/pitch、ホイールの FOV、上バーの 360 解除ボタン | パノラマ表示中だけの連続操作。<kbd>V</kbd> の 360 度パノラマモード切替 (`FsPanorama`) は `KeyAction` であり、コマンド設定で変更できる |
-| 動画の修飾なし左右 | <kbd>←</kbd> / <kbd>→</kbd> の 5 秒シーク、およびタイル中の左右カーソル移動 | 修飾なし矢印は固定ナビゲーションとして残す。<kbd>Shift</kbd> / <kbd>Ctrl</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd> 付きの動画シーク / フレーム送りは `KeyAction` 化済み |
+| 動画の修飾なし左右 | <kbd>←</kbd> / <kbd>→</kbd> の 5 秒シーク、およびタイル中の左右カーソル移動 | 修飾なし矢印は固定ナビゲーションとして残す。<kbd>Alt</kbd> 付き左右は固定シーク扱いにせず、割り当てた `KeyAction` を優先する。<kbd>Shift</kbd> / <kbd>Ctrl</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd> 付きの動画シーク / フレーム送りは `KeyAction` 化済み |
 
 補足: 画像分析モード起動の既定 <kbd>Shift</kbd>+<kbd>Z</kbd> は `FsImageAnalysis`、ルーペの
 <kbd>Shift</kbd> 押しっぱなしは `FsLoupeHold`、360 度パノラマ切替の <kbd>V</kbd> は
