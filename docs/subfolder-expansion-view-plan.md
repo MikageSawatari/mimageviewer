@@ -235,7 +235,7 @@ view と同じガードに乗る。
 戻る先は `subfolder_expansion_saved_folder` (= 通常は root 実フォルダ) とし、synthetic path の
 親 (`%APPDATA%\mimageviewer` など) へ落ちないようにする。
 
-タグビュー / レーティング一覧のように `start_loading_items` で別 synthetic view へ切り替える
+Ctrl+S お気に入り検索 / タグビュー / レーティング一覧のように `start_loading_items` で別 synthetic view へ切り替える
 一時ビューでは、切り替え直前にサブ展開の snapshot/root/roots を専用の復元 state へ退避する。
 `start_loading_items` 自体は通常どおりサブ展開 state をクリアするが、ビューを閉じると退避した
 snapshot を再インストールし、サブ展開ビューへ戻す。snapshot が無い場合は退避した root/roots で

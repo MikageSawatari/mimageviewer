@@ -3321,6 +3321,8 @@ pub struct App {
     /// 非同期実行中のお気に入り検索 (Ctrl+S)。`execute_favsearch` で spawn、
     /// `poll_favsearch` で受信 → `start_loading_items` を呼ぶ。
     pub(crate) favsearch_pending: Option<FavSearchPending>,
+    pub(crate) favsearch_subfolder_restore:
+        Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     /// 非同期実行中のタグビュー検索 (Ctrl+T)。
     pub(crate) tag_view_pending: Option<crate::tag_view::TagViewPending>,
     /// フルスクリーン画像の AI/EXIF/XMP メタデータを非同期読み込み中。
@@ -5735,6 +5737,7 @@ impl App {
             search_query: String::new(),
             search_pending: None,
             favsearch_pending: None,
+            favsearch_subfolder_restore: None,
             tag_view_pending: None,
             metadata_pending: None,
             tag_prewarm_pending: None,
@@ -10021,9 +10024,11 @@ impl App {
 
         // 検索モードで保存していた元フォルダがあれば戻す。この復帰 load_folder は
         // 履歴 (back/forward/recent) に積まない (検索は透明な一時オーバーレイ)。
+        let restore_state = self.favsearch_subfolder_restore.take();
         if let Some(saved) = self.favsearch.saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
-            if self.restore_subfolder_expansion_for_synthetic_path(&saved) {
+            if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
+            {
                 self.suppress_nav_record_for_search_restore = false;
             } else {
                 self.load_folder(saved);
@@ -10574,6 +10579,12 @@ impl App {
                 )
             })
             .collect();
+        let saved_folder = self.favsearch.saved_folder.clone();
+        if let Some(restore_state) =
+            self.take_subfolder_expansion_restore_for_synthetic_path(saved_folder.as_deref())
+        {
+            self.favsearch_subfolder_restore = Some(restore_state);
+        }
         self.start_loading_items(
             synthetic,
             items,

@@ -2556,6 +2556,67 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn closing_favsearch_after_result_restores_subfolder_expansion_snapshot() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let original = a.join("scan_001.jpg");
+        let hit = root.join("hit-folder");
+
+        app.current_folder = Some(crate::app::subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![a.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root,
+            roots: vec![a],
+            entries: vec![SubfolderExpansionEntry {
+                path: original.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+        app.favsearch.active = true;
+        app.favsearch.saved_folder = Some(crate::app::subfolder_expansion_synthetic_path());
+
+        app.apply_favsearch_results(vec![crate::search_index_db::IndexEntry {
+            path: hit,
+            display_name: "hit-folder".to_string(),
+            kind: crate::search_index_db::IndexKind::Folder,
+            mtime: 2,
+        }]);
+        assert!(
+            app.subfolder_expansion_snapshot.is_none(),
+            "お気に入り検索結果の install はサブ展開 state を一度クリアする"
+        );
+
+        app.close_favsearch();
+
+        assert!(!app.favsearch.active);
+        assert!(!app.suppress_nav_record_for_search_restore);
+        assert!(app.items_are_subfolder_expansion_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&crate::app::subfolder_expansion_synthetic_path())
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &original)),
+            "お気に入り検索で start_loading_items を通った後でも退避 snapshot へ戻す"
+        );
+    }
+
+    #[test]
     fn remember_recent_folder_ignored_during_search() {
         let mut app = setup_app();
         let recent0 = PathBuf::from(r"C:\miv-test\recent0");
