@@ -4852,6 +4852,13 @@ const RESERVED_BINDINGS: &[ReservedBinding] = &[
     },
 ];
 
+fn reserved_binding_overlaps_scope(
+    binding_scope: CommandScope,
+    reserved_scope: CommandScope,
+) -> bool {
+    reserved_scope == KeyContext::Global || command_scopes_overlap(binding_scope, reserved_scope)
+}
+
 impl Keymap {
     pub fn empty() -> Self {
         Self::default()
@@ -5236,7 +5243,7 @@ impl Keymap {
         {
             for reserved in RESERVED_BINDINGS {
                 if binding.chord == reserved.chord
-                    && command_scopes_overlap(binding.scope, reserved.scope)
+                    && reserved_binding_overlaps_scope(binding.scope, reserved.scope)
                 {
                     conflicts.push(BindingConflict {
                         kind: BindingConflictKind::Reserved,
@@ -8049,6 +8056,28 @@ mod tests {
         }));
         assert!(keymap.warnings().iter().any(|warning| {
             warning.contains("GridToggleStackMode") && warning.contains("reserved shortcut Esc")
+        }));
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Erase]
+            EraseToolBrush = Left
+
+            [Text]
+            TextConfirm = Esc
+            "#,
+        );
+        assert!(keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::Reserved
+                && conflict.action == KeyAction::EraseToolBrush
+                && conflict.chord == Chord::key(KeyName::Left)
+                && conflict.reserved_name == Some("plain arrow navigation")
+        }));
+        assert!(keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.kind == BindingConflictKind::Reserved
+                && conflict.action == KeyAction::TextConfirm
+                && conflict.chord == Chord::key(KeyName::Esc)
+                && conflict.reserved_name == Some("Escape navigation / cancel")
         }));
     }
 

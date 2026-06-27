@@ -15233,13 +15233,22 @@ mod native_video_rating_key_tests {
         virtual_key: u32,
         shift: bool,
     ) -> crate::video::native_window::NativeVideoKeyEvent {
+        native_key_with_mods(virtual_key, shift, false, false)
+    }
+
+    fn native_key_with_mods(
+        virtual_key: u32,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    ) -> crate::video::native_window::NativeVideoKeyEvent {
         crate::video::native_window::NativeVideoKeyEvent {
             virtual_key,
             scan_code: 0,
             extended: false,
             shift,
-            ctrl: false,
-            alt: false,
+            ctrl,
+            alt,
             repeat: false,
         }
     }
@@ -15414,6 +15423,40 @@ mod native_video_rating_key_tests {
             !app.settings.detached_viewer_enabled,
             "repeat F12 should not toggle detached viewer mode"
         );
+    }
+
+    #[test]
+    fn native_video_modified_escape_and_enter_do_not_close_fullscreen() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+
+        app.handle_native_video_key_event(
+            &ctx,
+            idx,
+            native_key_with_mods(0x1B, false, false, true),
+        ); // Alt+Esc
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(idx),
+            "Alt+Esc must not be treated as plain native-video Escape"
+        );
+
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.handle_native_video_key_event(
+            &ctx,
+            idx,
+            native_key_with_mods(0x0D, false, false, true),
+        ); // Alt+Enter
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(idx),
+            "Alt+Enter must not be treated as detached plain Enter close"
+        );
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x1B, false)); // plain Esc
+        assert_eq!(app.fullscreen_idx, None);
     }
 }
 

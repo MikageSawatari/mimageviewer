@@ -5088,7 +5088,7 @@ impl App {
         // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
         // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
         if self.normalize_scan_is_modal_for_current_player(fs_idx)
-            && !(key.virtual_key == 0x1B && !key.repeat)
+            && !(key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt)
         {
             return;
         }
@@ -5096,6 +5096,7 @@ impl App {
             && !key.repeat
             && !key.shift
             && !key.ctrl
+            && !key.alt
             && matches!(key.virtual_key, 0x0D | 0x1B)
         {
             self.close_fullscreen();
@@ -5151,7 +5152,7 @@ impl App {
             // does not accidentally close the fullscreen window.
             // 仮 gain 適用前のモーダルスキャン中だけ ESC を cancel に優先ルーティング。
             // ProvisionalApplied 後は通常の ESC として tile/fullscreen close に使う。
-            0x1B if !key.repeat => {
+            0x1B if !key.repeat && !key.shift && !key.ctrl && !key.alt => {
                 if self.normalize_scan_is_modal_for_current_player(fs_idx) {
                     self.handle_cancel_normalize_scan(ctx, fs_idx);
                 } else if self.close_video_tile_mode() {
