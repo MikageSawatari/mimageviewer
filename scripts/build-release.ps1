@@ -86,6 +86,27 @@ function Invoke-ReleaseCargo {
     }
 }
 
+# Newest LastWriteTime across the given files/dirs (dirs scanned recursively for
+# *.rs / *.toml). Used by the freshness guard: a freshly built exe must be at
+# least as new as its newest source input, otherwise cargo handed back a stale
+# binary (CLAUDE.md "feedback_release_stale_core_cache").
+function Newest-WriteTime {
+    param([string[]] $Paths)
+    $newest = [datetime]'2000-01-01'
+    foreach ($p in $Paths) {
+        if (-not (Test-Path $p)) { continue }
+        $item = Get-Item -LiteralPath $p
+        if ($item.PSIsContainer) {
+            $f = Get-ChildItem -LiteralPath $p -Recurse -File -Include *.rs, *.toml -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($f -and $f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime }
+        } elseif ($item.LastWriteTime -gt $newest) {
+            $newest = $item.LastWriteTime
+        }
+    }
+    return $newest
+}
+
 $repoRoot = (Get-Location).Path
 # Append a trailing separator for path-boundary scoping. Without this, sibling
 # directories like `C:\home\mimageviewer-old` would also match (StartsWith on
@@ -220,10 +241,10 @@ if (Test-Path $releaseExe) {
     }
 }
 
-# 2 段階ビルド (ランチャー方式):
-#   1. core (本体、FFmpeg DLL に静的依存) を `mimageviewer-core.exe` として生成
-#   2. launcher (FFmpeg 非依存、core + FFmpeg DLL を include_bytes! で内包) を
-#      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
+# Two-stage build (launcher scheme):
+#   1. core (the app, statically depends on FFmpeg DLLs) -> mimageviewer-core.exe
+#   2. launcher (FFmpeg-independent, embeds core + FFmpeg DLLs via include_bytes!)
+#      -> mimageviewer.exe. This is the distributed single exe.
 #
 # VST3 bridge is built first because mimageviewer-core embeds it with
 # include_bytes!. Cargo also cannot express the core -> launcher ordering, so
@@ -271,17 +292,60 @@ if (-not $SkipVst3Bridge) {
 
 Ensure-LibclangPath
 
+$coreExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer-core.exe'
+$launcherExe = $releaseExe  # target\release\mimageviewer.exe
+
+# Capture newest source mtimes BEFORE building, for the post-build freshness guard.
+$coreSrcNewest = Newest-WriteTime @(
+    (Join-Path $repoRoot 'src'),
+    (Join-Path $repoRoot 'build.rs'),
+    (Join-Path $repoRoot 'Cargo.toml'),
+    (Join-Path $repoRoot 'Cargo.lock')
+)
+$launcherSrcNewest = Newest-WriteTime @(
+    (Join-Path $repoRoot 'crates\launcher'),
+    (Join-Path $repoRoot 'Cargo.toml'),
+    (Join-Path $repoRoot 'Cargo.lock')
+)
+
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
 Write-Host ("[build-release] (2/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd
 if ($coreExit -ne 0) { exit $coreExit }
+if (-not (Test-Path $coreExe)) { throw "[build-release] core exe not produced: $coreExe" }
+# Freshness guard: if cargo handed back a core older than the newest source
+# (false up-to-date), clean and rebuild instead of shipping a stale binary.
+if ((Get-Item $coreExe).LastWriteTime -lt $coreSrcNewest) {
+    Write-Warning "[build-release] core looks STALE (older than newest source). Forcing clean rebuild of core + launcher."
+    & cargo clean --release -p mimageviewer -p mimageviewer-launcher
+    $coreExit = Invoke-ReleaseCargo -Args $coreCmd
+    if ($coreExit -ne 0) { exit $coreExit }
+    if ((Get-Item $coreExe).LastWriteTime -lt $coreSrcNewest) {
+        throw "[build-release] core STILL stale after clean rebuild: $coreExe"
+    }
+}
 
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
 Write-Host ("[build-release] (3/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
 $launcherExit = Invoke-ReleaseCargo -Args $launcherCmd
 if ($launcherExit -ne 0) { exit $launcherExit }
+if (-not (Test-Path $launcherExe)) { throw "[build-release] launcher exe not produced: $launcherExe" }
+# The launcher embeds the core via include_bytes!, so it must be newer than both
+# the freshly built core and its own sources. If cargo skipped it after a core
+# change, force a clean rebuild of just the launcher.
+$launcherFloor = (Get-Item $coreExe).LastWriteTime
+if ($launcherSrcNewest -gt $launcherFloor) { $launcherFloor = $launcherSrcNewest }
+if ((Get-Item $launcherExe).LastWriteTime -lt $launcherFloor) {
+    Write-Warning "[build-release] launcher looks STALE (older than core/sources). Forcing clean rebuild of launcher."
+    & cargo clean --release -p mimageviewer-launcher
+    $launcherExit = Invoke-ReleaseCargo -Args $launcherCmd
+    if ($launcherExit -ne 0) { exit $launcherExit }
+    if ((Get-Item $launcherExe).LastWriteTime -lt $launcherFloor) {
+        throw "[build-release] launcher STILL stale after clean rebuild: $launcherExe"
+    }
+}
 
 $extractedBridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
 $extractedBridgeHash = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe.sha256'
