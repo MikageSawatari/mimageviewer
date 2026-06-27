@@ -118,18 +118,26 @@ impl Drop for FsCacheEntry {
 fn clamp_rgba_frame_for_gpu(buf: image::RgbaImage) -> image::RgbaImage {
     let limit = crate::app::MAX_TEXTURE_DIM as u32;
     let (w, h) = buf.dimensions();
-    if w <= limit && h <= limit {
+    let (new_w, new_h) = clamped_rgba_frame_dims(w, h, limit);
+    if (new_w, new_h) == (w, h) {
         return buf;
     }
-    let scale = limit as f64 / w.max(h) as f64;
-    let new_w = ((w as f64 * scale).round() as u32).max(1);
-    let new_h = ((h as f64 * scale).round() as u32).max(1);
     crate::fast_resize::resize_rgba8_exact(
         &buf,
         new_w,
         new_h,
         crate::fast_resize::Quality::Bilinear,
     )
+}
+
+fn clamped_rgba_frame_dims(w: u32, h: u32, limit: u32) -> (u32, u32) {
+    if w <= limit && h <= limit {
+        return (w, h);
+    }
+    let scale = limit as f64 / w.max(h) as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    (new_w, new_h)
 }
 
 /// GIF をデコードしてアニメーションフレーム列を返す。
@@ -273,11 +281,8 @@ mod tests {
     fn clamp_rgba_frame_shrinks_oversized_dims() {
         let limit = crate::app::MAX_TEXTURE_DIM as u32;
         let w = limit + 2048;
-        // 本番と同じ比率で縮小されることを小さい画像で検証する。
-        // 巨大バッファを確保すると CI で遅いので、内部スケールの丸め挙動のみ確認。
-        let buf = image::RgbaImage::from_pixel(w, limit / 2, image::Rgba([0, 0, 0, 255]));
-        let out = clamp_rgba_frame_for_gpu(buf);
-        let (ow, oh) = out.dimensions();
+        // 巨大バッファを確保すると CI で落ちるため、内部スケールの丸め挙動のみ確認。
+        let (ow, oh) = clamped_rgba_frame_dims(w, limit / 2, limit);
         assert!(ow <= limit && oh <= limit, "clamped size should fit limit");
         assert_eq!(ow, limit, "long side should be pinned to limit");
     }
