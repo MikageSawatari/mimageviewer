@@ -2944,6 +2944,8 @@ pub struct App {
 
     // ── Ctrl+T タグビュー UI 状態 ─────────────────────────────────
     pub(crate) tag_view: crate::tag_view::TagViewState,
+    pub(crate) tag_view_subfolder_restore:
+        Option<subfolder_expansion::SubfolderExpansionRestoreState>,
 
     // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
     pub(crate) show_open_folder_dialog: bool,
@@ -3619,6 +3621,8 @@ pub struct App {
     pub(crate) rating_view_pending: Option<crate::rating_view::RatingViewPending>,
     pub(crate) rating_view_skipped: usize,
     pub(crate) rating_view_saved_folder: Option<PathBuf>,
+    pub(crate) rating_view_subfolder_restore:
+        Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     pub(crate) rating_view_nav_stack: Vec<PathBuf>,
 
     /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
@@ -5579,6 +5583,7 @@ impl App {
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
             tag_view: crate::tag_view::TagViewState::default(),
+            tag_view_subfolder_restore: None,
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
             open_folder_error: None,
@@ -5827,6 +5832,7 @@ impl App {
             rating_view_pending: None,
             rating_view_skipped: 0,
             rating_view_saved_folder: None,
+            rating_view_subfolder_restore: None,
             rating_view_nav_stack: Vec::new(),
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
@@ -10045,9 +10051,11 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
+        let restore_state = self.tag_view_subfolder_restore.take();
         if let Some(saved) = self.tag_view.saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
-            if self.restore_subfolder_expansion_for_synthetic_path(&saved) {
+            if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
+            {
                 self.suppress_nav_record_for_search_restore = false;
             } else {
                 self.load_folder(saved);
@@ -10178,8 +10186,12 @@ impl App {
         if result.query.trim().is_empty() {
             if self.items_are_tag_view {
                 if let Some(saved) = self.tag_view.saved_folder.clone() {
+                    let restore_state = self.tag_view_subfolder_restore.take();
                     self.suppress_nav_record_for_search_restore = true;
-                    if self.restore_subfolder_expansion_for_synthetic_path(&saved) {
+                    if self.restore_subfolder_expansion_for_synthetic_path_with_state(
+                        &saved,
+                        restore_state,
+                    ) {
                         self.suppress_nav_record_for_search_restore = false;
                     } else {
                         self.load_folder(saved);
@@ -10249,6 +10261,12 @@ impl App {
                 )
             })
             .collect();
+        let saved_folder = self.tag_view.saved_folder.clone();
+        if let Some(restore_state) =
+            self.take_subfolder_expansion_restore_for_synthetic_path(saved_folder.as_deref())
+        {
+            self.tag_view_subfolder_restore = Some(restore_state);
+        }
         self.start_loading_items(
             search_results_synthetic_path(),
             items,
@@ -10695,7 +10713,10 @@ impl App {
         self.rating_view_rows.clear();
         self.rating_view_skipped = 0;
         self.rating_view_nav_stack.clear();
-        self.rating_view_saved_folder = self.current_folder.clone();
+        if !self.items_are_rating_view {
+            self.rating_view_saved_folder = self.current_folder.clone();
+            self.rating_view_subfolder_restore = None;
+        }
 
         if self.global_search.active {
             self.global_search.saved_folder = None;
@@ -10727,6 +10748,26 @@ impl App {
             crate::rating_db::RatingDb::db_path(),
             stars,
         ));
+    }
+
+    pub(crate) fn close_rating_view(&mut self) {
+        if let Some(pending) = self.rating_view_pending.take() {
+            pending.cancel();
+        }
+        self.rating_view_rows.clear();
+        self.rating_view_skipped = 0;
+        self.rating_view_nav_stack.clear();
+        self.items_are_rating_view = false;
+        let restore_state = self.rating_view_subfolder_restore.take();
+        if let Some(saved) = self.rating_view_saved_folder.take() {
+            self.suppress_nav_record_for_search_restore = true;
+            if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
+            {
+                self.suppress_nav_record_for_search_restore = false;
+            } else {
+                self.load_folder(saved);
+            }
+        }
     }
 
     pub(crate) fn poll_rating_view(&mut self) {
@@ -10895,6 +10936,12 @@ impl App {
             })
             .collect();
 
+        let saved_folder = self.rating_view_saved_folder.clone();
+        if let Some(restore_state) =
+            self.take_subfolder_expansion_restore_for_synthetic_path(saved_folder.as_deref())
+        {
+            self.rating_view_subfolder_restore = Some(restore_state);
+        }
         self.start_loading_items(
             rating_view_synthetic_path(),
             items,
@@ -19022,6 +19069,10 @@ impl App {
             }
             if in_tag_view {
                 self.tag_view_back();
+                return None;
+            }
+            if self.items_are_rating_view || self.rating_view_pending.is_some() {
+                self.close_rating_view();
                 return None;
             }
             if self.local_search_blocks_parent_nav() {

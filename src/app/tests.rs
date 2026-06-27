@@ -4233,6 +4233,141 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn closing_tag_view_after_result_restores_subfolder_expansion_snapshot() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let original = a.join("scan_001.jpg");
+        let tag_hit = root.join("tag_hit.jpg");
+
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![a.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root,
+            roots: vec![a],
+            entries: vec![SubfolderExpansionEntry {
+                path: original.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+        app.tag_view.active = true;
+        app.tag_view.saved_folder = Some(subfolder_expansion_synthetic_path());
+        app.tag_view.query = "#猫".to_string();
+
+        app.apply_tag_view_result(crate::tag_view::TagViewResult {
+            query: "#猫".to_string(),
+            kind_filter: crate::tag_view::TagViewKindFilter::All,
+            summaries: Vec::new(),
+            entries: vec![crate::tag_view::TagViewEntry {
+                path: tag_hit,
+                kind: crate::tag_view::TagViewItemKind::Image,
+                mtime: 2,
+                file_size: 20,
+            }],
+            truncated: false,
+        });
+        assert!(app.items_are_tag_view);
+        assert!(
+            app.subfolder_expansion_snapshot.is_none(),
+            "タグビュー結果の install はサブ展開 state を一度クリアする"
+        );
+
+        app.close_tag_view();
+
+        assert!(!app.tag_view.active);
+        assert!(!app.suppress_nav_record_for_search_restore);
+        assert!(app.items_are_subfolder_expansion_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&subfolder_expansion_synthetic_path())
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &original)),
+            "タグビューで start_loading_items を通った後でも退避 snapshot へ戻す"
+        );
+    }
+
+    #[test]
+    fn closing_rating_view_after_result_restores_subfolder_expansion_snapshot() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let original = a.join("scan_001.jpg");
+        let rating_hit = root.join("rating_hit.jpg");
+
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![a.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root,
+            roots: vec![a],
+            entries: vec![SubfolderExpansionEntry {
+                path: original.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+        app.rating_view_stars = 3;
+        app.rating_view_saved_folder = Some(subfolder_expansion_synthetic_path());
+
+        app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
+            stars: 3,
+            rows: vec![crate::rating_view::RatingViewRow {
+                key: "rating-hit".to_string(),
+                item: GridItem::Image(rating_hit),
+                image_meta: Some((2, 20)),
+                rated_at_ms: Some(100),
+            }],
+            skipped: 0,
+        });
+        assert!(app.items_are_rating_view);
+        assert!(
+            app.subfolder_expansion_snapshot.is_none(),
+            "レーティング一覧結果の install はサブ展開 state を一度クリアする"
+        );
+
+        app.close_rating_view();
+
+        assert!(!app.items_are_rating_view);
+        assert!(!app.suppress_nav_record_for_search_restore);
+        assert!(app.items_are_subfolder_expansion_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&subfolder_expansion_synthetic_path())
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &original)),
+            "レーティング一覧で start_loading_items を通った後でも退避 snapshot へ戻す"
+        );
+    }
+
+    #[test]
     fn subfolder_expansion_toggle_uses_checked_folder_roots() {
         use crate::grid_item::{GridItem, ThumbnailState};
         let mut app = setup_app();

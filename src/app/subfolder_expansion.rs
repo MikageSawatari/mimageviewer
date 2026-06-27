@@ -95,6 +95,14 @@ pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) diag: SubfolderExpansionDiag,
 }
 
+#[derive(Debug)]
+pub(crate) struct SubfolderExpansionRestoreState {
+    pub(crate) root: Option<PathBuf>,
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) saved_folder: Option<PathBuf>,
+    pub(crate) snapshot: Option<SubfolderExpansionSnapshot>,
+}
+
 pub(crate) enum SubfolderExpansionEvent {
     Progress(SubfolderExpansionProgress),
     Done(SubfolderExpansionResult),
@@ -895,6 +903,56 @@ impl App {
         };
         self.install_subfolder_expansion_snapshot(snapshot, false);
         true
+    }
+
+    pub(crate) fn take_subfolder_expansion_restore_for_synthetic_path(
+        &mut self,
+        path: Option<&Path>,
+    ) -> Option<SubfolderExpansionRestoreState> {
+        let Some(path) = path else {
+            return None;
+        };
+        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
+            return None;
+        }
+        if self.subfolder_expansion_snapshot.is_none()
+            && self.subfolder_expansion_root.is_none()
+            && self.subfolder_expansion_saved_folder.is_none()
+        {
+            return None;
+        }
+        Some(SubfolderExpansionRestoreState {
+            root: self.subfolder_expansion_root.clone(),
+            roots: self.subfolder_expansion_roots.clone(),
+            saved_folder: self.subfolder_expansion_saved_folder.clone(),
+            snapshot: self.subfolder_expansion_snapshot.take(),
+        })
+    }
+
+    pub(crate) fn restore_subfolder_expansion_for_synthetic_path_with_state(
+        &mut self,
+        path: &Path,
+        state: Option<SubfolderExpansionRestoreState>,
+    ) -> bool {
+        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
+            return false;
+        }
+        if let Some(state) = state {
+            if let Some(snapshot) = state.snapshot {
+                self.install_subfolder_expansion_snapshot(snapshot, false);
+                return true;
+            }
+            if let Some(root) = state.root.or(state.saved_folder) {
+                let roots = if state.roots.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    state.roots
+                };
+                self.start_subfolder_expansion_scan_roots(root, roots);
+                return true;
+            }
+        }
+        self.restore_subfolder_expansion_for_synthetic_path(path)
     }
 
     pub(crate) fn restore_subfolder_expansion_for_synthetic_path(&mut self, path: &Path) -> bool {
