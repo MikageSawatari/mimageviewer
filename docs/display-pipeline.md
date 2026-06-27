@@ -385,8 +385,11 @@ items rebuild 後に、同じ idx が別項目を指しても再同期できる�
 detached image window として退避される。passive window は最後の画像を表示するだけで、active
 viewer cache / AI / 先読み / スライドショー / 編集状態は単一 active session のまま扱う。
 未ピン留めの passive window がある場合は、設定 OFF でも次の画像 open にその window の配置を
-再利用する。動画はこの設定の対象外で、F12 の `detached_viewer_enabled` が ON のときだけ
-detached session へ入る。
+再利用する。メイン一覧側の Backspace / フォルダ移動 / 再読込で active detached 画像 session
+を閉じる場合も、画像専用の毎回新規設定または active ピン留めが有効なら先に passive window へ
+退避する。画像専用の毎回新規設定が ON の間はピンボタンを出さず、退避 window も未ピン留め扱いに
+する。動画はこの設定の対象外で、F12 の `detached_viewer_enabled` が ON のときだけ detached
+session へ入る。
 
 メイン一覧で `Enter` / 明示 open した項目が、開いている detached session の stamp と
 同一なら、`open_fullscreen` を再実行せず前面化要求だけを出す。静止画 detached viewport

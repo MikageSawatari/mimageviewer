@@ -387,6 +387,9 @@ enum NativeVideoPlacement {
   active detached viewer は passive `DetachedImageWindowSnapshot` として退避し、active viewer
   cache / AI / 先読み / スライドショー / 編集機能は単一 active session にだけ紐づく。未ピン留め
   passive window が残っている場合は、設定 OFF でも次の画像 open にその window の配置を再利用する。
+  メイン一覧側の Backspace / フォルダ移動 / 再読込で active detached 画像 session を閉じる場合も、
+  画像専用の毎回新規設定または active ピン留めが有効なら先に passive window へ退避する。毎回新規
+  設定が ON の間はピン UI を出さず、退避 window も未ピン留め扱いにする。
 - detached session が閉じている場合は、メイン一覧のカーソル移動だけでは再表示しない。
 - detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
 - 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native child HWND を作り直す。

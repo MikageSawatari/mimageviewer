@@ -7541,6 +7541,8 @@ impl App {
             return Some(nav);
         }
         // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
+        #[cfg(windows)]
+        self.preserve_active_detached_image_window_for_main_context_change();
         self.close_fullscreen();
         None
     }
@@ -8552,6 +8554,8 @@ impl App {
             }
         }
 
+        #[cfg(windows)]
+        self.preserve_active_detached_image_window_for_main_context_change();
         self.close_fullscreen();
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -11082,6 +11086,12 @@ impl App {
             zip_path.display()
         ));
 
+        #[cfg(windows)]
+        if self.should_preserve_active_detached_image_window_for_main_context_change() {
+            self.preserve_active_detached_image_window_for_main_context_change();
+            self.close_fullscreen();
+        }
+
         // 入れ子に RAR/7z/LZH を含み、過去に「展開キャッシュ」へ変換済みの ZIP は、
         // キャッシュ ZIP へ振り替えて開く (RAR 等のキャッシュヒット経路と同じ、v1.3.0)。
         // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
@@ -11873,6 +11883,12 @@ impl App {
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
         ));
+
+        #[cfg(windows)]
+        if self.should_preserve_active_detached_image_window_for_main_context_change() {
+            self.preserve_active_detached_image_window_for_main_context_change();
+            self.close_fullscreen();
+        }
 
         // PDF を開く際、直前に ZIP を見ていた可能性があるためネスト ZIP キャッシュを破棄する。
         crate::zip_loader::clear_nested_cache();
@@ -12816,6 +12832,8 @@ impl App {
                     .insert(cur, (self.scroll_offset_y, self.selected));
             }
         }
+        #[cfg(windows)]
+        self.preserve_active_detached_image_window_for_main_context_change();
         self.close_fullscreen();
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
@@ -19150,6 +19168,15 @@ impl App {
             // ネスト ZIP ツリー内なら、実フォルダ親へ抜ける前に 1 階層戻る (Phase 3)。
             // ルート (スタック底) では zip_nav_back は false → そのまま親フォルダへ抜ける
             // (= load_folder が zip_nav をクリアして ZIP を出る)。
+            #[cfg(windows)]
+            let close_detached_after_zip_back =
+                self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root())
+                    && self.should_preserve_active_detached_image_window_for_main_context_change();
+            #[cfg(windows)]
+            if close_detached_after_zip_back {
+                self.preserve_active_detached_image_window_for_main_context_change();
+                self.close_fullscreen();
+            }
             if self.zip_nav_back() {
                 return None;
             }
@@ -20983,6 +21010,30 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn should_preserve_active_detached_image_window_for_main_context_change(&self) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        self.viewer_session_is_detached()
+            && self.viewer_item_supports_detached_still(idx)
+            && (self.settings.detached_viewer_open_images_in_window
+                || self.detached_viewer_pin_active)
+    }
+
+    #[cfg(windows)]
+    fn preserve_active_detached_image_window_for_main_context_change(&mut self) -> bool {
+        if !self.should_preserve_active_detached_image_window_for_main_context_change() {
+            return false;
+        }
+        let pinned =
+            self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
+        let parked = self.park_active_detached_image_window(pinned);
+        self.detached_viewer_pin_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        parked
+    }
+
+    #[cfg(windows)]
     fn prepare_detached_image_windows_for_open(&mut self, idx: usize) {
         if !self.fs_open_intent_from_grid || !self.viewer_item_supports_detached_still(idx) {
             return;
@@ -21007,7 +21058,7 @@ impl App {
             && (always_new || current_pinned);
         let base_placement = self.detached_viewer_window_placement();
         let parked = if should_park_active {
-            self.park_active_detached_image_window(current_pinned)
+            self.park_active_detached_image_window(current_pinned && !always_new)
         } else {
             false
         };
@@ -21022,7 +21073,7 @@ impl App {
             self.detached_viewer_open_next_still_detached_once = current_pinned && !always_new;
         }
 
-        if parked && current_pinned {
+        if parked && (current_pinned || always_new) {
             self.detached_viewer_pin_active = false;
         }
     }

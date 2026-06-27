@@ -16229,6 +16229,72 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn image_only_detached_setting_ignores_stale_pin_when_parking_next_image() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "always_new_stale_pin_first");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_pin_active = true;
+        app.fs_open_intent_from_grid = true;
+
+        app.open_fullscreen(second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(!app.detached_viewer_pin_active);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert!(!app.detached_image_windows[0].pinned);
+    }
+
+    #[test]
+    fn image_only_detached_setting_preserves_active_window_on_main_context_change() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        insert_static_fs_entry(&mut app, &ctx, idx, "always_new_main_context");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_pin_active = true;
+
+        assert!(app.should_preserve_active_detached_image_window_for_main_context_change());
+        assert!(app.preserve_active_detached_image_window_for_main_context_change());
+        app.close_fullscreen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(!app.detached_viewer_pin_active);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert!(!app.detached_image_windows[0].pinned);
+        assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
+    }
+
+    #[test]
+    fn detached_pin_preserves_active_window_on_main_context_change() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        insert_static_fs_entry(&mut app, &ctx, idx, "pinned_main_context");
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_pin_active = true;
+
+        assert!(app.should_preserve_active_detached_image_window_for_main_context_change());
+        assert!(app.preserve_active_detached_image_window_for_main_context_change());
+        app.close_fullscreen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(!app.detached_viewer_pin_active);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert!(app.detached_image_windows[0].pinned);
+        assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
+    }
+
+    #[test]
     fn unpinned_passive_window_requests_detached_for_next_image() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

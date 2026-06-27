@@ -3162,6 +3162,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         window: &crate::app::DetachedImageWindowSnapshot,
+        show_pin: bool,
         close_requested: &mut bool,
         pin_toggle_requested: &mut bool,
     ) {
@@ -3215,24 +3216,26 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        let pin_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "detached_image_pin_btn",
-            |hovered| bar_button_bg(hovered, window.pinned),
-            window.pinned,
-            |p, c, r| draw_pin_icon(p, c, r, window.pinned),
-        );
-        let pin_resp = pin_resp.hover_tip_dark(if window.pinned {
-            "ピン留め解除"
-        } else {
-            "ピン留め"
-        });
-        if pin_resp.clicked() {
-            *pin_toggle_requested = true;
+        if show_pin {
+            let pin_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "detached_image_pin_btn",
+                |hovered| bar_button_bg(hovered, window.pinned),
+                window.pinned,
+                |p, c, r| draw_pin_icon(p, c, r, window.pinned),
+            );
+            let pin_resp = pin_resp.hover_tip_dark(if window.pinned {
+                "ピン留め解除"
+            } else {
+                "ピン留め"
+            });
+            if pin_resp.clicked() {
+                *pin_toggle_requested = true;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
         let text_rect = egui::Rect::from_min_max(
             bar_rect.min + egui::vec2(12.0, 0.0),
@@ -3262,6 +3265,7 @@ impl App {
         }
 
         let windows = self.detached_image_windows.clone();
+        let show_pin = !self.settings.detached_viewer_open_images_in_window;
         let mut close_ids = Vec::new();
         let mut toggle_pin_ids = Vec::new();
         let mut placements = Vec::new();
@@ -3336,6 +3340,7 @@ impl App {
                             vp_ctx,
                             full_rect,
                             &window,
+                            show_pin,
                             &mut close_requested,
                             &mut pin_toggle_requested,
                         );
@@ -5280,8 +5285,10 @@ impl App {
                             let mut detached_pin_pressed = false;
                             let mut window_mode_pressed = false;
                             #[cfg(windows)]
-                            let show_detached_pin =
-                                cfg!(windows) && detached && !is_video_mode;
+                            let show_detached_pin = cfg!(windows)
+                                && detached
+                                && !is_video_mode
+                                && !self.settings.detached_viewer_open_images_in_window;
                             #[cfg(windows)]
                             let detached_pin_active = self.detached_viewer_pin_active;
                             #[cfg(not(windows))]
