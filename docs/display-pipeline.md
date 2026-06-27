@@ -237,9 +237,11 @@ enumerate defer で `fullscreen_idx == None` の間に限って描く。`items_g
           └─ GridItem::PdfPage    → pdf_loader::render_page (4096px、PDF ワーカープロセス)
                                      ※zoom 分析モードの時はさらに高解像度で再レンダリング
 
-アニメーション (通常画像のみ):
-  ├─ .gif      → fs_animation::decode_gif_frames
-  └─ .png/APNG → fs_animation::decode_apng_frames
+アニメーション:
+  ├─ .gif      → fs_animation::decode_gif_frames (通常画像のみ)
+  ├─ .png/APNG → fs_animation::decode_apng_frames (通常画像のみ)
+  └─ .webp    → fs_animation::decode_webp_frames / decode_webp_frames_from_bytes
+                (通常画像 / ZIP 内画像)
 
 → EXIF 適用済の DynamicImage に `clamp_dynamic_for_gpu` を掛けて長辺 8192 以内に縮小
    (wgpu デフォルト上限)。7K-9K クラスの画像で過去に UI スレッドで 5s 級の
@@ -497,7 +499,7 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
   ならば出力も 8192 以内。`edit_result_cache` / final AI 結果を入力に取るので成立する。
 - 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も
   同じ上限を尊重する。
-- GIF / APNG アニメーションは `fs_animation::clamp_rgba_frame_for_gpu` で各フレームを
+- GIF / APNG / WebP アニメーションは `fs_animation::clamp_rgba_frame_for_gpu` で各フレームを
   `MAX_TEXTURE_DIM` 以下に縮めてから `ColorImage` 化する (巨大 animated 画像で
   `ctx.load_texture` が panic するのを防ぐ安全網)。
 
@@ -926,7 +928,7 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
 | サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
 | フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で 4096px | なし (サムネのみ) |
 | EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
-| アニメーション | GIF/APNG のみ ✅ | ❌ | ❌ | — |
+| アニメーション | GIF/APNG/WebP ✅ | WebP ✅ | ❌ | — |
 | 回転 (rotation_db) | ✅ | ✅ (path+entry キー) | ✅ (path+page キー) | — |
 | プリセット補正 | ✅ | ✅ | ✅ | — |
 | AI アップスケール | ✅ | ✅ | ✅ | — |

@@ -1,8 +1,9 @@
-//! フルスクリーン表示用のアニメーション (GIF / APNG) デコードと
+//! フルスクリーン表示用のアニメーション (GIF / APNG / WebP) デコードと
 //! メインスレッドへ送るキャッシュエントリ型の定義。
 //!
 //! 通常の (静止画) フルスクリーン読み込みは `app.rs` の `start_fs_load` が直接行うが、
-//! GIF/APNG については本モジュールの `decode_*_frames` で全フレームを一括展開する。
+//! アニメーション画像については本モジュールの `decode_*_frames` で全フレームを
+//! 一括展開する。
 
 use std::path::Path;
 
@@ -21,7 +22,7 @@ use std::path::Path;
 pub enum FsLoadResult {
     /// ヘッダ解析だけで取れた EXIF 後相当の表示向き寸法。終端ではない。
     DimsOnly { source_dims: [usize; 2] },
-    /// 静止画（GIF・APNG の1フレーム目のみを含む）。
+    /// 静止画（GIF・APNG・WebP の1フレーム目のみを含む）。
     /// `source_dims` はワーカーがデコードした直後・GPU 上限 clamp 前の寸法で、
     /// ホバーバーに原寸を表示したり「ダウンスケール表示中」警告を出すために使う。
     /// `ci.size` は clamp 後なので両者が一致しないとき = clamp が発動したケース。
@@ -140,6 +141,25 @@ fn clamped_rgba_frame_dims(w: u32, h: u32, limit: u32) -> (u32, u32) {
     (new_w, new_h)
 }
 
+fn frame_delay_secs(format: &str, delay: image::Delay) -> f64 {
+    let (numer, denom) = delay.numer_denom_ms();
+    let delay = if denom > 0 {
+        numer as f64 / denom as f64 / 1000.0
+    } else {
+        crate::logger::log(format!(
+            "{format} animation frame denom=0, using 0.1s default"
+        ));
+        0.1
+    };
+    delay.max(0.02)
+}
+
+fn rgba_frame_to_color_image(buf: image::RgbaImage) -> egui::ColorImage {
+    let buf = clamp_rgba_frame_for_gpu(buf);
+    let (w, h) = buf.dimensions();
+    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], buf.as_raw())
+}
+
 /// GIF をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）や失敗時は None を返す。
 pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
@@ -158,23 +178,8 @@ pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
         frames
             .into_iter()
             .map(|frame| {
-                let (numer, denom) = frame.delay().numer_denom_ms();
-                let delay = if denom > 0 {
-                    numer as f64 / denom as f64 / 1000.0
-                } else {
-                    crate::logger::log(
-                        "GIF animation frame denom=0, using 0.1s default".to_string(),
-                    );
-                    0.1
-                };
-                let delay = delay.max(0.02); // 最低 20ms（Chrome 互換）
-                let buf = clamp_rgba_frame_for_gpu(frame.into_buffer());
-                let (w, h) = buf.dimensions();
-                let ci = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    buf.as_raw(),
-                );
-                (ci, delay)
+                let delay = frame_delay_secs("GIF", frame.delay());
+                (rgba_frame_to_color_image(frame.into_buffer()), delay)
             })
             .collect(),
     )
@@ -202,23 +207,48 @@ pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
         frames
             .into_iter()
             .map(|frame| {
-                let (numer, denom) = frame.delay().numer_denom_ms();
-                let delay = if denom > 0 {
-                    numer as f64 / denom as f64 / 1000.0
-                } else {
-                    crate::logger::log(
-                        "APNG animation frame denom=0, using 0.1s default".to_string(),
-                    );
-                    0.1
-                };
-                let delay = delay.max(0.02);
-                let buf = clamp_rgba_frame_for_gpu(frame.into_buffer());
-                let (w, h) = buf.dimensions();
-                let ci = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    buf.as_raw(),
-                );
-                (ci, delay)
+                let delay = frame_delay_secs("APNG", frame.delay());
+                (rgba_frame_to_color_image(frame.into_buffer()), delay)
+            })
+            .collect(),
+    )
+}
+
+/// Animated WebP をデコードしてアニメーションフレーム列を返す。
+/// 静止画（1フレーム）・失敗時は None を返す。
+pub fn decode_webp_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    decode_webp_frames_from_reader(reader)
+}
+
+/// ZIP 内 WebP など、実ファイルパスを持たない入力用。
+pub fn decode_webp_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorImage, f64)>> {
+    decode_webp_frames_from_reader(std::io::Cursor::new(bytes))
+}
+
+fn decode_webp_frames_from_reader<R>(reader: R) -> Option<Vec<(egui::ColorImage, f64)>>
+where
+    R: std::io::BufRead + std::io::Seek,
+{
+    use image::AnimationDecoder;
+    use image::codecs::webp::WebPDecoder;
+
+    let decoder = WebPDecoder::new(reader).ok()?;
+    if !decoder.has_animation() {
+        return None;
+    }
+    let frames = decoder.into_frames().collect_frames().ok()?;
+    if frames.len() <= 1 {
+        return None;
+    }
+
+    Some(
+        frames
+            .into_iter()
+            .map(|frame| {
+                let delay = frame_delay_secs("WebP", frame.delay());
+                (rgba_frame_to_color_image(frame.into_buffer()), delay)
             })
             .collect(),
     )
@@ -299,5 +329,97 @@ mod tests {
                 assert!(*delay >= 0.02, "frame {i} delay {delay} should be >= 0.02s");
             }
         }
+    }
+
+    fn riff_chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len() + (payload.len() & 1));
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        if payload.len() & 1 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    fn u24(n: u32) -> [u8; 3] {
+        [n as u8, (n >> 8) as u8, (n >> 16) as u8]
+    }
+
+    fn static_webp_image_subchunk(rgba: [u8; 4]) -> Vec<u8> {
+        let mut webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+            .encode(&rgba, 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+
+        let mut pos = 12;
+        while pos + 8 <= webp.len() {
+            let fourcc = &webp[pos..pos + 4];
+            let size =
+                u32::from_le_bytes([webp[pos + 4], webp[pos + 5], webp[pos + 6], webp[pos + 7]])
+                    as usize;
+            let end = pos + 8 + size;
+            assert!(end <= webp.len(), "encoded WebP chunk should fit");
+            if fourcc == b"VP8L" || fourcc == b"VP8 " {
+                return webp[pos..end + (size & 1)].to_vec();
+            }
+            pos = end + (size & 1);
+        }
+        panic!("encoded WebP should contain VP8L or VP8 chunk");
+    }
+
+    fn animated_webp_fixture() -> Vec<u8> {
+        let mut chunks = Vec::new();
+
+        let mut vp8x = Vec::new();
+        vp8x.push(0b0000_0010); // animation flag
+        vp8x.extend_from_slice(&[0, 0, 0]); // reserved
+        vp8x.extend_from_slice(&u24(0)); // canvas width - 1
+        vp8x.extend_from_slice(&u24(0)); // canvas height - 1
+        chunks.extend_from_slice(&riff_chunk(b"VP8X", &vp8x));
+
+        let mut anim = Vec::new();
+        anim.extend_from_slice(&[0, 0, 0, 0]); // background color
+        anim.extend_from_slice(&0u16.to_le_bytes()); // loop forever
+        chunks.extend_from_slice(&riff_chunk(b"ANIM", &anim));
+
+        for (rgba, delay_ms) in [([255, 0, 0, 255], 40u32), ([0, 255, 0, 255], 80u32)] {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&u24(0)); // x / 2
+            frame.extend_from_slice(&u24(0)); // y / 2
+            frame.extend_from_slice(&u24(0)); // width - 1
+            frame.extend_from_slice(&u24(0)); // height - 1
+            frame.extend_from_slice(&u24(delay_ms));
+            frame.push(0); // blend + no dispose
+            frame.extend_from_slice(&static_webp_image_subchunk(rgba));
+            chunks.extend_from_slice(&riff_chunk(b"ANMF", &frame));
+        }
+
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&chunks);
+        webp
+    }
+
+    #[test]
+    fn decode_webp_animated_from_bytes() {
+        let bytes = animated_webp_fixture();
+        let frames = decode_webp_frames_from_bytes(&bytes).expect("animated WebP should decode");
+        assert_eq!(frames.len(), 2);
+        assert!((frames[0].1 - 0.04).abs() < 0.001);
+        assert!((frames[1].1 - 0.08).abs() < 0.001);
+        assert_eq!(frames[0].0.size, [1, 1]);
+        assert_eq!(frames[1].0.size, [1, 1]);
+    }
+
+    #[test]
+    fn decode_webp_static_returns_none() {
+        let mut webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+            .encode(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(decode_webp_frames_from_bytes(&webp).is_none());
     }
 }

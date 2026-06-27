@@ -1439,7 +1439,10 @@ pub(crate) use crate::thumb_loader::{
     CACHE_KEY_ARCHIVE, CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP,
 };
 
-use crate::fs_animation::{FsCacheEntry, FsLoadResult, decode_apng_frames, decode_gif_frames};
+use crate::fs_animation::{
+    FsCacheEntry, FsLoadResult, decode_apng_frames, decode_gif_frames, decode_webp_frames,
+    decode_webp_frames_from_bytes,
+};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
     CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
@@ -26146,9 +26149,7 @@ impl App {
         }
     }
 
-    /// 1枚のフルサイズ画像を非同期で読み込み開始する。
-    /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
-    /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
+    /// フルスクリーン通常 open 用の動画プレイヤーを構築する。
     fn build_video_player_for_open(
         &mut self,
         _idx: usize,
@@ -26255,6 +26256,10 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
+    /// 1枚のフルサイズ画像を非同期で読み込み開始する。
+    /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
+    /// GIF / APNG (通常画像) と WebP (通常画像 / ZIP 内画像) は
+    /// アニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
         // 360 度パノラマビュー Phase 2a: 内部で使う tee 判定パラメータ。
         // `start_fs_load` 開始時点で App の状態をスナップショットして worker に渡す
@@ -26745,6 +26750,38 @@ impl App {
                     }
                     let _ = tx.send(FsLoadResult::Animated(frames));
                     emit_exit("png_anim");
+                    return;
+                }
+            }
+
+            // WebP: アニメーション試行。通常ファイルと ZIP 内 bytes の両方に対応する。
+            if ext == "webp" {
+                let frames = match zip_bytes.as_deref() {
+                    Some(bytes) => decode_webp_frames_from_bytes(bytes),
+                    None => decode_webp_frames(&path),
+                };
+                if let Some(frames) = frames {
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                    crate::logger::log(format!(
+                        "  fs load anim-webp: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
+                        frames.len()
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "decode_end",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[
+                                ("ms", serde_json::Value::from(elapsed)),
+                                ("format", serde_json::Value::from("webp_anim")),
+                                ("frames", serde_json::Value::from(frames.len())),
+                                ("is_zip", serde_json::Value::from(zip_bytes.is_some())),
+                            ],
+                        );
+                    }
+                    let _ = tx.send(FsLoadResult::Animated(frames));
+                    emit_exit("webp_anim");
                     return;
                 }
             }

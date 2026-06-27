@@ -96,7 +96,7 @@ Windows 向け高速サムネイルビューワー
 | 静止画（内蔵） | JPEG, PNG, GIF, WebP, BMP |
 | 静止画（WIC） | HEIC, AVIF, JPEG XL, TIFF, 各社 RAW |
 | 静止画（Susie 経由） | PI, MAG, PIC, PIC2, XLD4 などレトロ形式（.spi プラグインを導入した場合） |
-| アニメーション | GIF, APNG（Animated WebP は先頭フレームのみ表示） |
+| アニメーション | GIF, APNG, Animated WebP |
 | ドキュメント | PDF |
 | アーカイブ | ZIP / CBZ（展開不要でブラウズ）、RAR / CBR / 7z / CB7 / LZH（クリックで ZIP に自動変換） |
 | 動画（インライン再生） | MP4, MKV, MOV, AVI, WMV, MPG, MPEG, HEVC, AV1 ほか FFmpeg avformat 対応形式 |
