@@ -897,6 +897,30 @@ impl App {
         true
     }
 
+    pub(crate) fn restore_subfolder_expansion_for_synthetic_path(&mut self, path: &Path) -> bool {
+        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
+            return false;
+        }
+        if self.reinstall_subfolder_expansion_snapshot() {
+            return true;
+        }
+        if let Some(root) = self
+            .subfolder_expansion_root
+            .clone()
+            .or_else(|| self.subfolder_expansion_saved_folder.clone())
+        {
+            let roots = if self.subfolder_expansion_roots.is_empty() {
+                vec![root.clone()]
+            } else {
+                self.subfolder_expansion_roots.clone()
+            };
+            self.start_subfolder_expansion_scan_roots(root, roots);
+            return true;
+        }
+        self.show_feedback_toast("サブ展開ビューを復元できませんでした".into());
+        true
+    }
+
     fn install_subfolder_expansion_snapshot(
         &mut self,
         snapshot: SubfolderExpansionSnapshot,

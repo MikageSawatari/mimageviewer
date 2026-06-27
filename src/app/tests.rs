@@ -4144,6 +4144,95 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn subfolder_expansion_reload_reinstalls_snapshot() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let image = a.join("scan_001.jpg");
+
+        app.current_folder = Some(subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![a.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![a],
+            entries: vec![SubfolderExpansionEntry {
+                path: image.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+
+        app.reload_current_folder_preserving_override();
+
+        assert!(app.items_are_subfolder_expansion_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&subfolder_expansion_synthetic_path())
+        );
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &image)),
+            "synthetic path を実フォルダとして読み込まず snapshot の画像一覧へ戻す"
+        );
+    }
+
+    #[test]
+    fn closing_global_search_restores_subfolder_expansion_snapshot() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let image = a.join("scan_001.jpg");
+
+        app.current_folder = Some(crate::app::search_results_synthetic_path());
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![a.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root,
+            roots: vec![a],
+            entries: vec![SubfolderExpansionEntry {
+                path: image.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+
+        app.close_global_search();
+
+        assert!(!app.global_search.active);
+        assert!(!app.suppress_nav_record_for_search_restore);
+        assert!(app.items_are_subfolder_expansion_view);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &image)),
+            "検索クローズ時も synthetic path を実ロードせずサブ展開 snapshot へ戻す"
+        );
+    }
+
+    #[test]
     fn subfolder_expansion_toggle_uses_checked_folder_roots() {
         use crate::grid_item::{GridItem, ThumbnailState};
         let mut app = setup_app();

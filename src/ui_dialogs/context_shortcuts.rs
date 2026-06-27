@@ -22,28 +22,12 @@ const GRID_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "このショートカット一覧を表示する",
     },
     FixedShortcutRow {
-        keys: "Alt+↑",
-        description: "親フォルダまたは検索結果の上位階層へ戻る",
-    },
-    FixedShortcutRow {
         keys: "← / → / ↑ / ↓",
         description: "選択位置を移動する",
     },
     FixedShortcutRow {
         keys: "Shift+矢印",
         description: "移動元から移動先までをチェックする",
-    },
-    FixedShortcutRow {
-        keys: "Ctrl+↑ / Ctrl+↓",
-        description: "前または次のフォルダ / 検索結果へ移動する",
-    },
-    FixedShortcutRow {
-        keys: "Alt+← / Alt+→",
-        description: "フォルダ履歴を戻る / 進む",
-    },
-    FixedShortcutRow {
-        keys: "Ctrl+PageUp / Ctrl+PageDown",
-        description: "前または次の兄弟フォルダへ移動する",
     },
 ];
 

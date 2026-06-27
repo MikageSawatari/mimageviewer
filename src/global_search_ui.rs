@@ -1499,7 +1499,11 @@ impl App {
         // 積まない (検索は透明な一時オーバーレイ)。
         if let Some(folder) = self.global_search.saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
-            self.load_folder(folder);
+            if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
+                self.suppress_nav_record_for_search_restore = false;
+            } else {
+                self.load_folder(folder);
+            }
         }
     }
 

@@ -8172,6 +8172,9 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
+        if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
+            return;
+        }
         let saved_override = self.archive_source_override.clone();
         self.load_folder(folder);
         if let Some(src) = saved_override {
@@ -8731,6 +8734,10 @@ impl App {
         // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
         // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
         self.cancel_folder_pane_open();
+        if self.restore_subfolder_expansion_for_synthetic_path(&path) {
+            self.suppress_nav_record_for_search_restore = false;
+            return;
+        }
         // 読書履歴から開いた本以外の実フォルダへ明示ナビで出たら、戻り先予約を捨てる
         // (アドレスバー / 履歴戻る / フォルダナビ等。予約した本そのものを開き直す場合は維持)。
         if self
@@ -10010,7 +10017,11 @@ impl App {
         // 履歴 (back/forward/recent) に積まない (検索は透明な一時オーバーレイ)。
         if let Some(saved) = self.favsearch.saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
-            self.load_folder(saved);
+            if self.restore_subfolder_expansion_for_synthetic_path(&saved) {
+                self.suppress_nav_record_for_search_restore = false;
+            } else {
+                self.load_folder(saved);
+            }
         }
     }
 
@@ -10036,7 +10047,11 @@ impl App {
         self.items_are_tag_view = false;
         if let Some(saved) = self.tag_view.saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
-            self.load_folder(saved);
+            if self.restore_subfolder_expansion_for_synthetic_path(&saved) {
+                self.suppress_nav_record_for_search_restore = false;
+            } else {
+                self.load_folder(saved);
+            }
         }
     }
 
@@ -10164,7 +10179,11 @@ impl App {
             if self.items_are_tag_view {
                 if let Some(saved) = self.tag_view.saved_folder.clone() {
                     self.suppress_nav_record_for_search_restore = true;
-                    self.load_folder(saved);
+                    if self.restore_subfolder_expansion_for_synthetic_path(&saved) {
+                        self.suppress_nav_record_for_search_restore = false;
+                    } else {
+                        self.load_folder(saved);
+                    }
                 }
             }
             return;
@@ -10676,10 +10695,7 @@ impl App {
         self.rating_view_rows.clear();
         self.rating_view_skipped = 0;
         self.rating_view_nav_stack.clear();
-        self.rating_view_saved_folder = self
-            .current_folder
-            .clone()
-            .filter(|p| !is_synthetic_view_path(p));
+        self.rating_view_saved_folder = self.current_folder.clone();
 
         if self.global_search.active {
             self.global_search.saved_folder = None;
