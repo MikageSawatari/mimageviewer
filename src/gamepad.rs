@@ -433,13 +433,6 @@ impl GamepadInputState {
         }
     }
 
-    pub fn suppress_west_ring_until_release(&mut self) {
-        if self.button_down(PadButton::West) {
-            self.west_ring_direction = None;
-            self.west_tap_suppressed = true;
-        }
-    }
-
     pub fn require_directional_neutral(&mut self) {
         self.directional_neutral_required = true;
         self.left_stick_next_step = None;
@@ -628,25 +621,6 @@ mod tests {
         ));
         state.set_button_down(PadButton::West, false, now);
         assert_eq!(state.finish_west_release(), WestReleaseOutcome::Suppressed);
-    }
-
-    #[test]
-    fn suppress_west_ring_until_release_only_cancels_current_west_hold() {
-        let mut state = GamepadInputState::default();
-        let now = Instant::now();
-        state.set_button_down(PadButton::West, true, now);
-        state.mark_west_ring_direction(RingDirection::Right);
-
-        state.suppress_west_ring_until_release();
-
-        assert!(!state.west_ring_active());
-        assert_eq!(state.west_ring_direction(), None);
-        assert!(!state.directional_neutral_required());
-        state.set_button_down(PadButton::West, false, now);
-        assert_eq!(state.finish_west_release(), WestReleaseOutcome::Suppressed);
-
-        state.set_button_down(PadButton::West, true, now);
-        assert!(state.west_ring_active());
     }
 
     #[test]

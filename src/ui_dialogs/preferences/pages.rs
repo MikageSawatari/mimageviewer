@@ -508,10 +508,11 @@ pub(super) fn page_gamepad_assignments(
     state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
-    ui.small("固定ボタンをクリックすると、この文脈でのボタン単体の動作を編集できます。既定に戻すと従来のゲームパッド操作へ戻ります。");
-    ui.small("X+方向リングは下の 8 方向スロットで編集します。");
+    ui.small(
+        "ゲームパッド固定ボタン単体のカスタマイズは現在無効です。X+方向リングだけ編集できます。",
+    );
     ui.add_space(8.0);
-    gamepad_layout_preview(ui, state, context);
+    gamepad_layout_preview(ui, context);
     ui.add_space(12.0);
     ui.label(egui::RichText::new("X+方向リング").strong());
     let preview_profile = state.settings.ring_shortcuts.profile(context).clone();
@@ -703,16 +704,11 @@ fn command_overview_rows(
                     context,
                     multi_context,
                 ));
-                let mut pad_for_context = gamepad_ring_assignment_labels(
+                let pad_for_context = gamepad_ring_assignment_labels(
                     &state.settings.ring_shortcuts,
                     context,
                     &ring_action,
                 );
-                pad_for_context.extend(gamepad_button_assignment_labels(
-                    &state.settings.ring_shortcuts,
-                    context,
-                    &ring_action,
-                ));
                 pad.extend(contextual_assignment_labels(
                     pad_for_context,
                     context,
@@ -761,13 +757,8 @@ fn command_overview_rows(
             }
             let ring = ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
             let mouse = mouse_assignment_labels(&state.settings.ring_shortcuts, context, &action);
-            let mut pad =
+            let pad =
                 gamepad_ring_assignment_labels(&state.settings.ring_shortcuts, context, &action);
-            pad.extend(gamepad_button_assignment_labels(
-                &state.settings.ring_shortcuts,
-                context,
-                &action,
-            ));
             let has_assignment = !ring.is_empty() || !mouse.is_empty() || !pad.is_empty();
             rows.push(OperationOverviewRow {
                 label,
@@ -1373,13 +1364,6 @@ fn operation_assignment_editor_title(target: &OperationAssignmentTarget) -> Stri
                 context.label()
             )
         }
-        OperationAssignmentTarget::GamepadButton { context, button } => {
-            format!(
-                "ゲームパッド {} 割り当て: {}",
-                button.label(),
-                context.label()
-            )
-        }
         OperationAssignmentTarget::MouseButton { context, forward } => {
             format!(
                 "マウス{}ボタン割り当て: {}",
@@ -1426,23 +1410,6 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
                     .strong(),
             );
             ui.small("この方向に実行するリングショートカットを選びます。");
-        }
-        OperationAssignmentTarget::GamepadButton { context, button } => {
-            ui.label(
-                egui::RichText::new(format!("{} / {}", context.label(), button.label())).strong(),
-            );
-            let help = if *button == GamepadButtonSlot::West {
-                format!(
-                    "既定動作: {}。X を変更した場合は X+方向リングも起動しなくなります。X+方向リングを使うには X を既定に戻してください。",
-                    button.default_label(*context)
-                )
-            } else {
-                format!(
-                    "既定動作: {}。変更すると、このボタン単体の操作を差し替えます。",
-                    button.default_label(*context)
-                )
-            };
-            ui.small(help);
         }
         OperationAssignmentTarget::MouseButton { context, forward } => {
             ui.label(
@@ -1503,7 +1470,6 @@ fn operation_assignment_tab_enabled(
         OperationAssignmentTarget::Ring { .. } | OperationAssignmentTarget::RingSlot { .. } => {
             tab != OperationAssignmentTab::Keyboard
         }
-        OperationAssignmentTarget::GamepadButton { .. } => tab == OperationAssignmentTab::RingPad,
         OperationAssignmentTarget::MouseButton { .. } => {
             tab == OperationAssignmentTab::MouseButtons
         }
@@ -1529,9 +1495,7 @@ fn draw_operation_assignment_editor_body(
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::RingPad) => {
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
                 state.operation_ring_context = context;
-                ring_action_slot_editor(ui, state, context, ring_action.clone());
-                ui.add_space(10.0);
-                ring_action_gamepad_button_editor(ui, state, context, ring_action);
+                ring_action_slot_editor(ui, state, context, ring_action);
             }
         }
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::MouseButtons) => {
@@ -1553,8 +1517,6 @@ fn draw_operation_assignment_editor_body(
         (OperationAssignmentTarget::Ring { context, action }, OperationAssignmentTab::RingPad) => {
             state.operation_ring_context = *context;
             ring_action_slot_editor(ui, state, *context, action.clone());
-            ui.add_space(10.0);
-            ring_action_gamepad_button_editor(ui, state, *context, action.clone());
         }
         (
             OperationAssignmentTarget::RingSlot { context, direction },
@@ -1562,13 +1524,6 @@ fn draw_operation_assignment_editor_body(
         ) => {
             state.operation_ring_context = *context;
             ring_slot_assignment_editor(ui, state, *context, *direction);
-        }
-        (
-            OperationAssignmentTarget::GamepadButton { context, button },
-            OperationAssignmentTab::RingPad,
-        ) => {
-            state.operation_ring_context = *context;
-            gamepad_button_assignment_editor(ui, state, *context, *button);
         }
         (
             OperationAssignmentTarget::MouseButton { context, forward },
@@ -1596,12 +1551,6 @@ fn draw_operation_assignment_editor_body(
             mouse_button_context_editor(ui, state, *context);
         }
         (
-            OperationAssignmentTarget::GamepadButton { context, .. },
-            OperationAssignmentTab::MouseButtons,
-        ) => {
-            mouse_button_context_editor(ui, state, *context);
-        }
-        (
             OperationAssignmentTarget::Ring { context, action },
             OperationAssignmentTab::MouseGesture,
         ) => {
@@ -1611,14 +1560,6 @@ fn draw_operation_assignment_editor_body(
         }
         (
             OperationAssignmentTarget::RingSlot { context, .. },
-            OperationAssignmentTab::MouseGesture,
-        ) => {
-            let right_drag_context = right_drag_context_for_ring_context(*context);
-            state.operation_mouse_gesture_context = right_drag_context;
-            page_mouse_gesture_bindings(ui, state, right_drag_context);
-        }
-        (
-            OperationAssignmentTarget::GamepadButton { context, .. },
             OperationAssignmentTab::MouseGesture,
         ) => {
             let right_drag_context = right_drag_context_for_ring_context(*context);
@@ -1809,7 +1750,6 @@ fn operation_assignment_editor_context(
     match target {
         OperationAssignmentTarget::Ring { context, .. }
         | OperationAssignmentTarget::RingSlot { context, .. } => Some(*context),
-        OperationAssignmentTarget::GamepadButton { context, .. } => Some(*context),
         OperationAssignmentTarget::MouseButton { context, .. } => Some(*context),
         OperationAssignmentTarget::MouseGesture { context, .. } => {
             Some(context.gesture_action_context())
@@ -1833,9 +1773,6 @@ fn open_operation_assignment_editor(
     if let Some(context) = operation_assignment_editor_context(&target) {
         state.operation_ring_context = context;
         state.operation_mouse_gesture_context = right_drag_context_for_ring_context(context);
-    }
-    if let OperationAssignmentTarget::GamepadButton { context, .. } = &target {
-        state.operation_gamepad_context = *context;
     }
     if let OperationAssignmentTarget::MouseGesture { context, .. } = &target {
         state.operation_mouse_gesture_context = *context;
@@ -2246,23 +2183,6 @@ fn gamepad_ring_assignment_labels(
                     .get(idx)
                     .map(|direction| format!("X+{}", direction.label()))
             })?
-        })
-        .collect()
-}
-
-fn gamepad_button_assignment_labels(
-    settings: &RingShortcutSettings,
-    context: RingShortcutContext,
-    action: &RingActionId,
-) -> Vec<String> {
-    let profile = settings.gamepad_button_profile(context);
-    GamepadButtonSlot::all()
-        .iter()
-        .filter_map(|&slot| {
-            profile
-                .action(slot)
-                .is_some_and(|assigned| assigned == *action)
-                .then(|| slot.label().to_string())
         })
         .collect()
 }
@@ -3706,48 +3626,6 @@ fn ring_action_slot_editor(
         });
 }
 
-fn ring_action_gamepad_button_editor(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    context: RingShortcutContext,
-    action: RingActionId,
-) {
-    ui.label(egui::RichText::new("ゲームパッド固定ボタン").strong());
-    ui.small("チェックしたボタン単体にこの操作を割り当てます。チェックを外すと既定のゲームパッド動作に戻ります。");
-    ui.add_space(6.0);
-
-    let profile = state
-        .settings
-        .ring_shortcuts
-        .gamepad_button_profile_mut(context);
-    profile.sanitize(context);
-    egui::Grid::new((
-        "ring_action_gamepad_button_editor",
-        context,
-        action.as_str(),
-    ))
-    .num_columns(4)
-    .spacing([8.0, 4.0])
-    .striped(true)
-    .show(ui, |ui| {
-        for (idx, &button) in GamepadButtonSlot::all().iter().enumerate() {
-            let current = profile.action(button);
-            let mut checked = current.as_ref() == Some(&action);
-            if ui.checkbox(&mut checked, button.label()).changed() {
-                profile.set_action(button, if checked { Some(action.clone()) } else { None });
-            }
-            let label = match current {
-                None => format!("既定: {}", button.default_label(context)),
-                Some(action) => action.label_for_context(context).to_owned(),
-            };
-            ui.label(label).on_hover_text(button.default_label(context));
-            if idx % 2 == 1 {
-                ui.end_row();
-            }
-        }
-    });
-}
-
 fn ring_action_mouse_button_editor(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
@@ -3890,88 +3768,21 @@ fn ring_slot_assignment_editor(
     }
 }
 
-fn gamepad_button_assignment_editor(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    context: RingShortcutContext,
-    button: GamepadButtonSlot,
-) {
-    let mut close_requested = false;
-    ui.group(|ui| {
-        ui.label(
-            egui::RichText::new(format!("{} / {}", context.label(), button.label())).strong(),
-        );
-        ui.small("既定を選ぶと従来のゲームパッド操作に戻ります。なしを選ぶとこのボタン単体の動作を止めます。");
-        ui.add_space(6.0);
-
-        let available = RingActionId::available_for_gamepad_button_context(context);
-        let profile = state.settings.ring_shortcuts.gamepad_button_profile_mut(context);
-        profile.sanitize(context);
-        let mut value = profile.action(button);
-        let selected = match &value {
-            None => format!("既定: {}", button.default_label(context)),
-            Some(action) => action.label_for_context(context).to_owned(),
-        };
-        egui::ComboBox::from_id_salt(("gamepad_button_assignment_editor", context, button))
-            .width(300.0)
-            .selected_text(selected)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut value,
-                    None,
-                    format!("既定: {}", button.default_label(context)),
-                );
-                ui.selectable_value(
-                    &mut value,
-                    Some(RingActionId::None),
-                    RingActionId::None.label_for_context(context),
-                );
-                for action in available.into_iter().filter(|action| *action != RingActionId::None)
-                {
-                    ui.selectable_value(
-                        &mut value,
-                        Some(action.clone()),
-                        action.label_for_context(context),
-                    )
-                    .on_hover_text(ring_action_detail_label(&action, context));
-                }
-            });
-        profile.set_action(button, value);
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("既定に戻す").clicked() {
-                profile.set_action(button, None);
-            }
-            if ui.button("閉じる").clicked() {
-                close_requested = true;
-            }
-        });
-    });
-    if close_requested {
-        close_assignment_editors(state);
-    }
-}
-
-fn gamepad_layout_preview(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    context: RingShortcutContext,
-) {
+fn gamepad_layout_preview(ui: &mut egui::Ui, context: RingShortcutContext) {
     ui.group(|ui| {
         ui.label(egui::RichText::new("ゲームパッド固定ボタン").strong());
+        ui.small("固定ボタン単体の動作は現在カスタマイズ対象外です。下の X+方向リングだけ編集できます。");
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                gamepad_button_slot(
+                gamepad_fixed_button_label(
                     ui,
-                    state,
                     context,
                     GamepadButtonSlot::LeftTrigger,
                     gamepad_trigger_tooltip(context, false),
                 );
-                gamepad_button_slot(
+                gamepad_fixed_button_label(
                     ui,
-                    state,
                     context,
                     GamepadButtonSlot::LeftShoulder,
                     "前のフォルダへ移動します。",
@@ -3984,16 +3795,14 @@ fn gamepad_layout_preview(
             ui.add_space(16.0);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    gamepad_button_slot(
+                    gamepad_fixed_button_label(
                         ui,
-                        state,
                         context,
                         GamepadButtonSlot::Select,
                         gamepad_select_tooltip(context),
                     );
-                    gamepad_button_slot(
+                    gamepad_fixed_button_label(
                         ui,
-                        state,
                         context,
                         GamepadButtonSlot::Start,
                         "お気に入りの移動パネルを開きます。",
@@ -4014,16 +3823,14 @@ fn gamepad_layout_preview(
 
             ui.add_space(16.0);
             ui.vertical(|ui| {
-                gamepad_button_slot(
+                gamepad_fixed_button_label(
                     ui,
-                    state,
                     context,
                     GamepadButtonSlot::RightTrigger,
                     gamepad_trigger_tooltip(context, true),
                 );
-                gamepad_button_slot(
+                gamepad_fixed_button_label(
                     ui,
-                    state,
                     context,
                     GamepadButtonSlot::RightShoulder,
                     "次のフォルダへ移動します。",
@@ -4034,31 +3841,27 @@ fn gamepad_layout_preview(
                     .spacing([4.0, 4.0])
                     .show(ui, |ui| {
                         ui.label("");
-                        gamepad_button_slot(
+                        gamepad_fixed_button_label(
                             ui,
-                            state,
                             context,
                             GamepadButtonSlot::North,
                             gamepad_y_tooltip(context),
                         );
                         ui.end_row();
-                        gamepad_button_slot(
+                        gamepad_fixed_button_label(
                             ui,
-                            state,
                             context,
                             GamepadButtonSlot::West,
                             "X 単体でピッカーパネルを開きます。X を押しながら方向入力すると、下の X+方向リングを実行します。",
                         );
-                        gamepad_button_slot(
+                        gamepad_fixed_button_label(
                             ui,
-                            state,
                             context,
                             GamepadButtonSlot::East,
                             gamepad_b_tooltip(context),
                         );
-                        gamepad_button_slot(
+                        gamepad_fixed_button_label(
                             ui,
-                            state,
                             context,
                             GamepadButtonSlot::South,
                             gamepad_a_tooltip(context),
@@ -4077,47 +3880,15 @@ fn gamepad_layout_preview(
     });
 }
 
-fn gamepad_button_slot(
+fn gamepad_fixed_button_label(
     ui: &mut egui::Ui,
-    state: &mut PreferencesState,
     context: RingShortcutContext,
     slot: GamepadButtonSlot,
     tooltip: &str,
 ) {
-    let assigned = state
-        .settings
-        .ring_shortcuts
-        .gamepad_button_profile(context)
-        .action(slot);
-    let label = match &assigned {
-        None => slot.default_label(context).to_owned(),
-        Some(action) => action.label_for_context(context).to_owned(),
-    };
-    let text = format!("{}\n{}", slot.label(), label);
     let mut hover = format!("{tooltip}\n\n既定: {}", slot.default_label(context));
-    if let Some(action) = &assigned {
-        hover.push_str(&format!(
-            "\n現在: {}",
-            ring_action_detail_label(action, context)
-        ));
-    }
-    if ui
-        .add_sized(
-            [84.0, 40.0],
-            egui::Button::new(egui::RichText::new(text).size(11.0)).wrap(),
-        )
-        .on_hover_text(hover)
-        .clicked()
-    {
-        open_operation_assignment_editor(
-            state,
-            OperationAssignmentTarget::GamepadButton {
-                context,
-                button: slot,
-            },
-            OperationAssignmentTab::RingPad,
-        );
-    }
+    hover.push_str("\n固定ボタン単体のカスタマイズは現在無効です。");
+    gamepad_button_label(ui, slot.label(), slot.default_label(context), &hover);
 }
 
 fn gamepad_button_label(ui: &mut egui::Ui, button: &str, label: &str, tooltip: &str) {
@@ -4202,31 +3973,13 @@ fn gamepad_ring_preview(
                         }
                     }
                     None => {
-                        let x_action = state
-                            .settings
-                            .ring_shortcuts
-                            .gamepad_button_profile(context)
-                            .action(GamepadButtonSlot::West);
-                        let (label, hover) = match x_action {
-                            None => (
-                                "X 単体\nピッカー".to_owned(),
-                                "X を方向入力なしで離すとピッカーパネルを開きます。".to_owned(),
-                            ),
-                            Some(action) => (
-                                format!("X 単体\n{}", action.label_for_context(context)),
-                                format!(
-                                    "X 単体に {} が割り当てられています。\nX+方向リングは周囲の 8 方向スロットで編集します。",
-                                    action.label_for_context(context)
-                                ),
-                            ),
-                        };
                         ui.add_sized(
                             [104.0, 42.0],
-                            egui::Label::new(egui::RichText::new(label).size(11.0))
+                            egui::Label::new(egui::RichText::new("X 単体\nピッカー").size(11.0))
                                 .wrap()
                                 .selectable(false),
                         )
-                        .on_hover_text(hover);
+                        .on_hover_text("X を方向入力なしで離すとピッカーパネルを開きます。");
                     }
                 }
                 if (idx + 1) % 3 == 0 {

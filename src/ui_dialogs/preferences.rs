@@ -8,8 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::ring_shortcut::{
-    GamepadButtonSlot, MouseGestureDirection, RightDragContext, RingActionId, RingDirection,
-    RingShortcutContext,
+    MouseGestureDirection, RightDragContext, RingActionId, RingDirection, RingShortcutContext,
 };
 use crate::settings::{Parallelism, Settings};
 
@@ -238,10 +237,6 @@ pub(crate) enum OperationAssignmentTarget {
     RingSlot {
         context: RingShortcutContext,
         direction: RingDirection,
-    },
-    GamepadButton {
-        context: RingShortcutContext,
-        button: GamepadButtonSlot,
     },
     MouseButton {
         context: RingShortcutContext,

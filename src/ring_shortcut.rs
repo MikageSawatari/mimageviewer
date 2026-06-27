@@ -1191,16 +1191,6 @@ impl RingActionId {
             RingShortcutContext::Grid => matches!(
                 self,
                 Self::None
-                    | Self::GamepadAccept
-                    | Self::GamepadBack
-                    | Self::GamepadPicker
-                    | Self::GamepadAuxiliary
-                    | Self::GamepadSelectPanel
-                    | Self::GamepadFavoritePanel
-                    | Self::GamepadPrevFolder
-                    | Self::GamepadNextFolder
-                    | Self::GamepadLeftTrigger
-                    | Self::GamepadRightTrigger
                     | Self::ToggleMaximize
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
@@ -1230,16 +1220,6 @@ impl RingActionId {
             RingShortcutContext::ImageFullscreen => matches!(
                 self,
                 Self::None
-                    | Self::GamepadAccept
-                    | Self::GamepadBack
-                    | Self::GamepadPicker
-                    | Self::GamepadAuxiliary
-                    | Self::GamepadSelectPanel
-                    | Self::GamepadFavoritePanel
-                    | Self::GamepadPrevFolder
-                    | Self::GamepadNextFolder
-                    | Self::GamepadLeftTrigger
-                    | Self::GamepadRightTrigger
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
@@ -1269,16 +1249,6 @@ impl RingActionId {
             RingShortcutContext::VideoFullscreen => matches!(
                 self,
                 Self::None
-                    | Self::GamepadAccept
-                    | Self::GamepadBack
-                    | Self::GamepadPicker
-                    | Self::GamepadAuxiliary
-                    | Self::GamepadSelectPanel
-                    | Self::GamepadFavoritePanel
-                    | Self::GamepadPrevFolder
-                    | Self::GamepadNextFolder
-                    | Self::GamepadLeftTrigger
-                    | Self::GamepadRightTrigger
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
@@ -1384,23 +1354,6 @@ impl RingActionId {
             ],
         };
         actions.extend(Self::location_navigation_actions());
-        actions
-    }
-
-    pub fn available_for_gamepad_button_context(context: RingShortcutContext) -> Vec<Self> {
-        let mut actions = Self::available_for_context(context);
-        actions.extend([
-            Self::GamepadAccept,
-            Self::GamepadBack,
-            Self::GamepadPicker,
-            Self::GamepadAuxiliary,
-            Self::GamepadSelectPanel,
-            Self::GamepadFavoritePanel,
-            Self::GamepadPrevFolder,
-            Self::GamepadNextFolder,
-            Self::GamepadLeftTrigger,
-            Self::GamepadRightTrigger,
-        ]);
         actions
     }
 }
@@ -2804,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn gamepad_default_actions_round_trip_and_are_gamepad_button_candidates() {
+    fn gamepad_default_actions_round_trip_but_are_not_user_candidates() {
         let samples = [
             (RingActionId::GamepadAccept, "gamepad_accept"),
             (RingActionId::GamepadBack, "gamepad_back"),
@@ -2822,13 +2775,10 @@ mod tests {
             assert_eq!(action.as_str(), id);
             assert_eq!(RingActionId::from_str(id), Some(action.clone()));
             for &context in RingShortcutContext::all() {
-                assert!(action.is_valid_for_context(context));
-                assert!(
-                    RingActionId::available_for_gamepad_button_context(context).contains(&action)
-                );
+                assert!(!action.is_valid_for_context(context));
                 assert!(
                     !RingActionId::available_for_context(context).contains(&action),
-                    "gamepad default actions should stay out of generic ring/mouse candidates"
+                    "gamepad default actions should stay out of ring/mouse/X+direction candidates"
                 );
             }
         }

@@ -73,12 +73,12 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 
 `CycleFavorite` / `GridToggleSnapshotLock` / `ImageOpenFolder`。
 
-ゲームパッド固定ボタンの既定動作を別ボタンへ移せるようにするための
+ゲームパッド固定ボタン単体のカスタマイズ再検討用に残している
 `GamepadAccept` / `GamepadBack` / `GamepadPicker` / `GamepadAuxiliary` /
 `GamepadSelectPanel` / `GamepadFavoritePanel` / `GamepadPrevFolder` / `GamepadNextFolder` /
-`GamepadLeftTrigger` / `GamepadRightTrigger` も ring/パッド専用。これらは A/B/X/Y、
-Select/Start、LB/RB、LT/RT の既定動作を固定ボタン設定内で再配置するための ID で、
-キーボードの `KeyAction` にはしない。
+`GamepadLeftTrigger` / `GamepadRightTrigger` も ring/パッド専用。v2.2.0 では
+固定ボタン単体の編集 UI / dispatch は無効化しているため、これらの ID は保存互換と
+将来用に parse だけ維持し、キーボードの `KeyAction` にはしない。
 
 `OpenFavorite1..20` / `OpenDriveC..Z` /
 `OpenLocationDriveList・ReadingHistory・Rating1..5・BooksRoot・Desktop・Pictures・Downloads` は
