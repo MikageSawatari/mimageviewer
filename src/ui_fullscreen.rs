@@ -3151,26 +3151,165 @@ fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> 
 
 impl App {
     pub(crate) fn fullscreen_viewport_id(&self) -> egui::ViewportId {
+        #[cfg(windows)]
+        if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            && let Some(window_id) = self.detached_viewer_window_id
+        {
+            return Self::detached_image_window_viewport_id(window_id);
+        }
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
     }
 
     #[cfg(windows)]
-    fn detached_image_window_viewport_id(id: u64) -> egui::ViewportId {
+    pub(crate) fn detached_image_window_viewport_id(id: u64) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("detached_image_window", id))
     }
 
     #[cfg(windows)]
     fn build_detached_image_window_builder(
         window: &crate::app::DetachedImageWindowSnapshot,
+        apply_initial_placement: bool,
     ) -> egui::ViewportBuilder {
-        egui::ViewportBuilder::default()
+        let builder = egui::ViewportBuilder::default()
             .with_title(window.title.clone())
             .with_decorations(true)
             .with_transparent(false)
-            .with_taskbar(true)
-            .with_inner_size([window.placement.w, window.placement.h])
-            .with_position(egui::pos2(window.placement.x, window.placement.y))
-            .with_maximized(window.placement.maximized)
+            .with_taskbar(true);
+
+        if apply_initial_placement {
+            builder
+                .with_inner_size([window.placement.w, window.placement.h])
+                .with_position(egui::pos2(window.placement.x, window.placement.y))
+                .with_maximized(window.placement.maximized)
+        } else {
+            builder
+        }
+    }
+
+    #[cfg(windows)]
+    fn normalize_rect_to_full_rect(rect: egui::Rect, full_rect: egui::Rect) -> egui::Rect {
+        let w = full_rect.width().max(1.0);
+        let h = full_rect.height().max(1.0);
+        egui::Rect::from_min_max(
+            egui::pos2(
+                (rect.min.x - full_rect.min.x) / w,
+                (rect.min.y - full_rect.min.y) / h,
+            ),
+            egui::pos2(
+                (rect.max.x - full_rect.min.x) / w,
+                (rect.max.y - full_rect.min.y) / h,
+            ),
+        )
+    }
+
+    #[cfg(windows)]
+    fn rect_from_normalized(full_rect: egui::Rect, rect_norm: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                full_rect.min.x + rect_norm.min.x * full_rect.width(),
+                full_rect.min.y + rect_norm.min.y * full_rect.height(),
+            ),
+            egui::pos2(
+                full_rect.min.x + rect_norm.max.x * full_rect.width(),
+                full_rect.min.y + rect_norm.max.y * full_rect.height(),
+            ),
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_continuous_frozen_pages_for_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+    ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
+        if !self.continuous_reading_active_for_idx(idx) {
+            return Vec::new();
+        }
+        let full_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+        );
+        let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
+        let Some((units, current_pos)) = self.continuous_reading_units_and_pos(idx) else {
+            return Vec::new();
+        };
+        let prefer_processed_layout = !self.analysis_mode;
+        let Some((pages, _, _, _, _)) = self.continuous_reading_layout(
+            ctx,
+            image_rect,
+            &units,
+            current_pos,
+            prefer_processed_layout,
+        ) else {
+            return Vec::new();
+        };
+
+        pages
+            .into_iter()
+            .filter_map(|page| {
+                let texture = if self.analysis_mode {
+                    self.resolve_original_preview_tex(page.idx)
+                } else {
+                    self.vertical_reading_cached_processed_texture(page.idx)
+                        .or_else(|| self.resolve_fs_display_tex(page.idx, true))
+                }?;
+                Some(crate::app::DetachedImageWindowFrozenPage {
+                    texture,
+                    rect_norm: Self::normalize_rect_to_full_rect(page.rect, full_rect),
+                    rotation: self.get_rotation(page.idx),
+                    location_display: self.location_display_for_loading(page.idx),
+                    content_bbox: page.content_bbox,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn draw_detached_image_window_snapshot(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        window: &crate::app::DetachedImageWindowSnapshot,
+    ) {
+        if !window.frozen_continuous_pages.is_empty() {
+            let painter = ui.painter().with_clip_rect(full_rect);
+            let bg_style = FsBgStyle::Default;
+            for page in &window.frozen_continuous_pages {
+                let rect = Self::rect_from_normalized(full_rect, page.rect_norm);
+                Self::draw_fs_spread_page(
+                    &painter,
+                    rect,
+                    0,
+                    page.rotation,
+                    &[],
+                    &bg_style,
+                    &page.location_display,
+                    None,
+                    Some(&page.texture),
+                    page.content_bbox,
+                );
+            }
+            return;
+        }
+
+        Self::draw_fs_image(
+            ui,
+            full_rect,
+            Some(&window.texture),
+            None,
+            false,
+            false,
+            false,
+            window.rotation,
+            window.zoom_pan,
+            window.free_rotation,
+            &FsBgStyle::Default,
+            &window.location_display,
+            false,
+            FullscreenFitMode::Page,
+            FullscreenFitScaleLimits::default(),
+            None,
+        );
     }
 
     #[cfg(windows)]
@@ -3277,6 +3416,22 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
+        let pending_close_ids: Vec<u64> =
+            self.detached_image_window_close_pending.drain(..).collect();
+        if !pending_close_ids.is_empty() {
+            self.log_detached_image_window_debug(format!(
+                "pending_close ids={pending_close_ids:?} passive_windows={} active_context={}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context_present()
+            ));
+            self.suppress_detached_image_window_focus_activation("pending_passive_close");
+            crate::dwm_transitions::disable_transitions_for_thread_windows();
+        }
+        for id in pending_close_ids {
+            let viewport_id = Self::detached_image_window_viewport_id(id);
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+        }
+
         if self.detached_image_windows.is_empty() {
             return;
         }
@@ -3284,31 +3439,58 @@ impl App {
         let windows = self.detached_image_windows.clone();
         let show_pin = !self.settings.detached_viewer_open_images_in_window;
         let mut close_ids = Vec::new();
+        let mut close_command_ids = Vec::new();
         let mut toggle_pin_ids = Vec::new();
         let mut activate_ids = Vec::new();
-        let mut focus_updates = Vec::new();
         let mut placements = Vec::new();
+        let mut focus_updates = Vec::new();
+        let mut initial_placement_applied_ids = Vec::new();
+        let mut placement_seed_reset_ids = Vec::new();
+        let mut passive_host_updates = Vec::new();
+        let main_hwnd = self.main_hwnd;
+        let focus_activation_suppressed =
+            self.detached_image_window_focus_activation_suppressed(std::time::Instant::now());
 
         for window in windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
-            let builder = Self::build_detached_image_window_builder(&window);
-            let mut close_requested = false;
+            let apply_initial_placement = !window.initial_placement_applied;
+            let builder =
+                Self::build_detached_image_window_builder(&window, apply_initial_placement);
+            let mut viewport_close_requested = false;
+            let mut bar_close_requested = false;
             let mut pin_toggle_requested = false;
-            let mut activate_requested = false;
-            let mut focused_now_for_update = None;
             let mut placement_update = None;
+            let mut focused_now = false;
+            let mut pixels_per_point = 1.0_f32;
+            let mut captured_passive_host_hwnd = 0_u64;
+            let mut pointer_activation = false;
+            let mut scroll_activation_candidate = false;
+            let mut key_activation_candidate = false;
+            let mut wheel_activation_candidate = false;
 
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
-                let (outer_rect, inner_rect, minimized, maximized) = vp_ctx.input(|i| {
-                    let vp = i.viewport();
-                    (
-                        vp.outer_rect,
-                        vp.inner_rect,
-                        vp.minimized.unwrap_or(false),
-                        vp.maximized.unwrap_or(false),
-                    )
-                });
+                let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
+                    vp_ctx.input(|i| {
+                        let vp = i.viewport();
+                        (
+                            vp.outer_rect,
+                            vp.inner_rect,
+                            vp.minimized.unwrap_or(false),
+                            vp.maximized.unwrap_or(false),
+                            vp.focused.unwrap_or(false),
+                            i.pixels_per_point,
+                        )
+                    });
+                focused_now = focused;
+                pixels_per_point = ppp;
                 if !minimized && let Some(outer) = outer_rect {
+                    captured_passive_host_hwnd =
+                        Self::find_detached_viewer_host_hwnd_from_logical_rect(
+                            main_hwnd,
+                            outer,
+                            pixels_per_point,
+                        )
+                        .unwrap_or(0);
                     let mut placement = window.placement;
                     placement.x = outer.min.x;
                     placement.y = outer.min.y;
@@ -3331,76 +3513,185 @@ impl App {
                     }
                 }
                 if vp_ctx.input(|i| i.viewport().close_requested()) {
-                    close_requested = true;
+                    viewport_close_requested = true;
                 }
-                let (focused_now, user_activation) = vp_ctx.input(|i| {
-                    let focused = i.viewport().focused.unwrap_or(false);
-                    let input = i.pointer.any_pressed()
-                        || i.events.iter().any(|event| {
-                            matches!(
-                                event,
-                                egui::Event::Key { pressed: true, .. }
-                                    | egui::Event::PointerButton { pressed: true, .. }
-                            )
-                        });
-                    (focused, input)
+                (
+                    pointer_activation,
+                    scroll_activation_candidate,
+                    key_activation_candidate,
+                    wheel_activation_candidate,
+                ) = vp_ctx.input(|i| {
+                    let pointer = i.pointer.any_pressed();
+                    let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
+                        || i.smooth_scroll_delta != egui::Vec2::ZERO;
+                    let key = i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }));
+                    let wheel = i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
+                    (pointer, scroll, key, wheel)
                 });
-                focused_now_for_update = Some(focused_now);
-                if window.activation_armed
-                    && ((focused_now && !window.focused_last_frame) || user_activation)
-                {
-                    activate_requested = true;
-                }
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(vp_ctx, |ui| {
                         let full_rect = ui.max_rect();
-                        Self::draw_fs_image(
-                            ui,
-                            full_rect,
-                            Some(&window.texture),
-                            None,
-                            false,
-                            false,
-                            false,
-                            window.rotation,
-                            None,
-                            0.0,
-                            &FsBgStyle::Default,
-                            &window.location_display,
-                            false,
-                            FullscreenFitMode::Page,
-                            FullscreenFitScaleLimits::default(),
-                            None,
-                        );
+                        Self::draw_detached_image_window_snapshot(ui, full_rect, &window);
                         Self::draw_detached_image_window_bar(
                             ui,
                             vp_ctx,
                             full_rect,
                             &window,
                             show_pin,
-                            &mut close_requested,
+                            &mut bar_close_requested,
                             &mut pin_toggle_requested,
                         );
                     });
             });
 
-            if close_requested {
+            if bar_close_requested {
+                close_command_ids.push(window.id);
+                close_ids.push(window.id);
+            } else if viewport_close_requested {
                 close_ids.push(window.id);
             }
             if pin_toggle_requested {
                 toggle_pin_ids.push(window.id);
             }
-            if activate_requested && !close_requested && !pin_toggle_requested {
+            let can_activate = self
+                .detached_image_windows
+                .iter()
+                .any(|candidate| candidate.id == window.id && candidate.can_activate());
+            let focus_activation_raw = focused_now && !window.focused_last_frame;
+            let user_activation = pointer_activation && !focus_activation_suppressed;
+            let focus_edge = focused_now != window.focused_last_frame;
+            if (viewport_close_requested
+                || bar_close_requested
+                || pin_toggle_requested
+                || focus_edge
+                || pointer_activation
+                || scroll_activation_candidate
+                || key_activation_candidate
+                || wheel_activation_candidate)
+                && Self::detached_image_window_debug_enabled()
+            {
+                crate::logger::log(format!(
+                    "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
+                     pin_toggle={} focused={} focused_prev={} focus_edge={} \
+                     focus_suppressed={} pointer_activation={} scroll_candidate={} \
+                     key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
+                     armed={} pinned={} has_bundle={} has_descriptor={}",
+                    window.id,
+                    viewport_close_requested,
+                    bar_close_requested,
+                    pin_toggle_requested,
+                    focused_now,
+                    window.focused_last_frame,
+                    focus_edge,
+                    focus_activation_suppressed,
+                    pointer_activation,
+                    scroll_activation_candidate,
+                    key_activation_candidate,
+                    wheel_activation_candidate,
+                    user_activation,
+                    can_activate,
+                    window.activation_armed,
+                    window.pinned,
+                    window.has_paused_bundle(),
+                    window.reopen_descriptor.is_some()
+                ));
+            }
+            if can_activate && window.activation_armed && focus_activation_raw && !user_activation {
+                self.log_detached_image_window_debug(format!(
+                    "passive_focus_activation_ignored id={} suppressed={} passive_windows={} \
+                     active_context={}",
+                    window.id,
+                    focus_activation_suppressed,
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
+            }
+            if can_activate
+                && window.activation_armed
+                && focus_activation_suppressed
+                && (pointer_activation
+                    || scroll_activation_candidate
+                    || key_activation_candidate
+                    || wheel_activation_candidate)
+            {
+                self.log_detached_image_window_debug(format!(
+                    "passive_user_activation_suppressed id={} pointer={} scroll={} key={} \
+                     wheel={} passive_windows={} active_context={}",
+                    window.id,
+                    pointer_activation,
+                    scroll_activation_candidate,
+                    key_activation_candidate,
+                    wheel_activation_candidate,
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
+            }
+            if can_activate && window.activation_armed && user_activation {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
+                    window.id,
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
                 activate_ids.push(window.id);
             }
-            if let Some(focused_now) = focused_now_for_update {
-                focus_updates.push((window.id, focused_now));
-            }
             if let Some(placement) = placement_update {
-                placements.push((window.id, placement));
+                if Self::detached_passive_placement_update_looks_like_default_viewport(
+                    window.placement,
+                    placement,
+                    pixels_per_point,
+                    apply_initial_placement,
+                ) {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_placement_update_rejected_default id={} initial_apply={} \
+                         ppp={:.2} from={:?} to={:?}",
+                        window.id,
+                        apply_initial_placement,
+                        pixels_per_point,
+                        window.placement,
+                        placement
+                    ));
+                    placement_seed_reset_ids.push(window.id);
+                    ctx.request_repaint();
+                } else if placement != window.placement {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_placement_update id={} initial_apply={} ppp={:.2} \
+                         from={:?} to={:?}",
+                        window.id,
+                        apply_initial_placement,
+                        pixels_per_point,
+                        window.placement,
+                        placement
+                    ));
+                    placements.push((window.id, placement));
+                }
             }
+            if captured_passive_host_hwnd != 0
+                && captured_passive_host_hwnd != window.passive_host_hwnd
+            {
+                self.log_detached_image_window_debug(format!(
+                    "passive_hwnd_changed id={} old=0x{:x} new=0x{:x} initial_apply={} \
+                     placement={:?}",
+                    window.id,
+                    window.passive_host_hwnd,
+                    captured_passive_host_hwnd,
+                    apply_initial_placement,
+                    window.placement
+                ));
+                passive_host_updates.push((window.id, captured_passive_host_hwnd));
+            }
+            if apply_initial_placement {
+                initial_placement_applied_ids.push(window.id);
+            }
+            focus_updates.push((window.id, focused_now));
         }
 
         for (id, placement) in placements {
@@ -3412,36 +3703,104 @@ impl App {
                 window.placement = placement;
             }
         }
-        for id in toggle_pin_ids {
+        for id in initial_placement_applied_ids {
             if let Some(window) = self
                 .detached_image_windows
                 .iter_mut()
                 .find(|window| window.id == id)
+            {
+                window.initial_placement_applied = true;
+            }
+        }
+        for (id, hwnd) in passive_host_updates {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.passive_host_hwnd = hwnd;
+            }
+        }
+        for id in placement_seed_reset_ids {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.initial_placement_applied = false;
+            }
+        }
+        for id in &toggle_pin_ids {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == *id)
             {
                 window.pinned = !window.pinned;
             }
         }
-        for (id, focused_now) in focus_updates {
+        if !close_ids.is_empty() {
+            self.log_detached_image_window_debug(format!(
+                "passive_close ids={close_ids:?} command_ids={close_command_ids:?} \
+                 passive_before={} activate_ids={activate_ids:?}",
+                self.detached_image_windows.len()
+            ));
+            self.suppress_detached_image_window_focus_activation("passive_close");
+            if !close_command_ids.is_empty() {
+                crate::dwm_transitions::disable_transitions_for_thread_windows();
+            }
+            for id in &close_command_ids {
+                let viewport_id = Self::detached_image_window_viewport_id(*id);
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            }
+            self.detached_image_windows
+                .retain(|window| !close_ids.contains(&window.id));
+            if self.detached_image_windows.is_empty() {
+                self.request_main_font_atlas_resync(
+                    crate::app::FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP,
+                );
+            }
+            self.focus_main_after_detached_window_close_if_idle(ctx, "passive_close");
+        }
+        for (id, focused) in focus_updates {
+            if close_ids.contains(&id) || activate_ids.contains(&id) {
+                continue;
+            }
             if let Some(window) = self
                 .detached_image_windows
                 .iter_mut()
                 .find(|window| window.id == id)
             {
-                window.focused_last_frame = focused_now;
-                window.activation_armed = true;
+                if !focused {
+                    window.activation_armed = true;
+                }
+                window.focused_last_frame = focused;
             }
         }
-        if !close_ids.is_empty() {
-            self.detached_image_windows
-                .retain(|window| !close_ids.contains(&window.id));
-        }
+        activate_ids.sort_unstable();
+        activate_ids.dedup();
         for id in activate_ids {
-            if self
-                .detached_image_windows
-                .iter()
-                .any(|window| window.id == id)
-            {
-                self.activate_detached_image_window_snapshot(ctx, id);
+            if close_ids.contains(&id) || toggle_pin_ids.contains(&id) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_skipped id={id} close={} toggle={}",
+                    close_ids.contains(&id),
+                    toggle_pin_ids.contains(&id)
+                ));
+                continue;
+            }
+            if self.activate_detached_image_window_snapshot(ctx, id) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_committed id={id} passive_windows={} active_context={}",
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
+                break;
+            } else {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_failed id={id} passive_windows={} active_context={}",
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
             }
         }
     }
@@ -4291,6 +4650,17 @@ impl App {
             && self.detached_viewer_host_lost()
         {
             self.reset_detached_viewer_viewport_for_recreate("host_lost_before_render");
+        }
+        #[cfg(windows)]
+        if !embedded
+            && detached
+            && self.fs_viewport_shown
+            && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
+            && std::mem::take(&mut self.detached_viewer_recreate_on_next_render)
+        {
+            self.hide_current_fullscreen_viewport_for_recreate(ctx, fs_idx);
+        } else {
+            self.detached_viewer_recreate_on_next_render = false;
         }
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
@@ -8079,12 +8449,13 @@ impl App {
         // VST editor windows are bridge-process native windows. In the
         // cross-process owner-popup case, egui can still report this viewport as
         // focused while Win32 sends keyboard input to the VST editor. Check the
-        // actual foreground HWND when the user clicks back into fullscreen.
+        // actual foreground HWND when the user clicks back into fullscreen.  This
+        // must be edge-triggered; while dragging a detached window/content,
+        // primary_down stays true for many frames and repeated focus claims can
+        // make the OS window chrome flicker.
         let (fullscreen_primary_event, viewport_focused) = ctx.input(|i| {
             let focused = i.viewport().focused.unwrap_or(true);
-            let primary_event = i.pointer.primary_down()
-                || i.pointer.primary_pressed()
-                || i.pointer.primary_released();
+            let primary_event = i.pointer.primary_pressed();
             let in_fullscreen = i
                 .pointer
                 .interact_pos()
@@ -8103,8 +8474,7 @@ impl App {
             let vst_gui_visible =
                 cfg!(windows) && self.settings.vst3_enabled && self.settings.vst3_gui_visible;
             let focus_restore_click = previous_foreign_foreground || vst_gui_visible;
-            let should_claim_native_focus =
-                focus_restore_click && (previous_foreign_foreground || current_foreign_foreground);
+            let should_claim_native_focus = focus_restore_click && current_foreign_foreground;
             let claim_debounced = self
                 .fs_last_native_focus_claim_at
                 .map(|t| t.elapsed() < std::time::Duration::from_millis(100))

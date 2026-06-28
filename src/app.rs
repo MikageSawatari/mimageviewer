@@ -157,6 +157,10 @@ pub(crate) const FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE: &str = "still_windo
 /// UV 不一致)。数フレーム再発行して surface が戻ったフレームで届かせる。
 #[cfg(windows)]
 pub(crate) const MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES: u32 = 5;
+#[cfg(windows)]
+const DETACHED_VIEWER_CONTEXT_GENERATION_BASE: u64 = 1 << 63;
+#[cfg(windows)]
+const DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE: u64 = 1 << 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ViewerSyncStamp {
@@ -165,7 +169,6 @@ pub(crate) struct ViewerSyncStamp {
     items_generation: u64,
 }
 
-#[derive(Clone)]
 pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) id: u64,
     pub(crate) texture: egui::TextureHandle,
@@ -174,10 +177,395 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) pinned: bool,
     pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
+    pub(crate) free_rotation: f32,
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
-    pub(crate) source_item_key: Option<String>,
+    pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
+    pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
     pub(crate) activation_armed: bool,
     pub(crate) focused_last_frame: bool,
+    pub(crate) initial_placement_applied: bool,
+    pub(crate) passive_host_hwnd: u64,
+    paused_bundle: Option<Box<ViewerContextBundle>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DetachedImageWindowFrozenPage {
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) rect_norm: egui::Rect,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) location_display: String,
+    pub(crate) content_bbox: Option<egui::Rect>,
+}
+
+impl Clone for DetachedImageWindowSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            texture: self.texture.clone(),
+            title: self.title.clone(),
+            location_display: self.location_display.clone(),
+            image_dims: self.image_dims,
+            pinned: self.pinned,
+            rotation: self.rotation,
+            zoom_pan: self.zoom_pan,
+            free_rotation: self.free_rotation,
+            placement: self.placement,
+            frozen_continuous_pages: self.frozen_continuous_pages.clone(),
+            reopen_descriptor: self.reopen_descriptor.clone(),
+            activation_armed: self.activation_armed,
+            focused_last_frame: self.focused_last_frame,
+            initial_placement_applied: self.initial_placement_applied,
+            passive_host_hwnd: self.passive_host_hwnd,
+            paused_bundle: None,
+        }
+    }
+}
+
+impl DetachedImageWindowSnapshot {
+    pub(crate) fn can_activate(&self) -> bool {
+        self.reopen_descriptor.is_some() || self.paused_bundle.is_some()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn has_paused_bundle(&self) -> bool {
+        self.paused_bundle.is_some()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ViewerContextDescriptor {
+    Pdf {
+        path: PathBuf,
+        page_num: Option<u32>,
+    },
+    Zip {
+        path: PathBuf,
+        entry_name: Option<String>,
+        archive_source_override: Option<PathBuf>,
+    },
+}
+
+#[cfg(windows)]
+struct ActiveDetachedViewerContext {
+    bundle: ViewerContextBundle,
+}
+
+#[cfg(windows)]
+struct ViewerContextBundle {
+    address: String,
+    current_folder: Option<PathBuf>,
+    archive_source_override: Option<PathBuf>,
+    zip_nav: Option<crate::zip_tree::ZipNavState>,
+    items: Vec<GridItem>,
+    thumbnails: Vec<ThumbnailState>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    selected: Option<usize>,
+    scroll_offset_y: f32,
+    scroll_to_selected: bool,
+    requested: std::collections::HashMap<usize, bool>,
+    keep_range: (usize, usize),
+    keep_set: std::collections::HashSet<usize>,
+    details_thumb_suppression_applied: bool,
+    details_hover_thumb_idx: Option<usize>,
+    details_hover_thumb_viewport_open: bool,
+    texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
+    visible_indices: Vec<usize>,
+    details_order: Vec<usize>,
+    details_tag_prewarm_indices: Vec<usize>,
+    details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
+    details_meta_pending: Option<DetailsMetaPending>,
+    details_lazy_visible_revision: u64,
+    details_image_dims_state: LazyColumnState,
+    tag_prewarm_queued: std::collections::HashSet<usize>,
+    pending_finalize: std::collections::HashSet<usize>,
+    last_vis_range: (usize, usize),
+    vis_settle_at: Option<std::time::Instant>,
+    vis_first_logged: bool,
+    vis_all_logged: bool,
+    search_filter: Option<std::collections::HashSet<usize>>,
+    search_filter_origin_folder: Option<PathBuf>,
+    checked: std::collections::HashSet<usize>,
+    rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    rating_cache: std::collections::HashMap<usize, u8>,
+    current_folder_rating_cache: Option<u8>,
+    fullscreen_idx: Option<usize>,
+    viewer_presentation: ViewerPresentation,
+    last_viewer_sync_stamp: Option<ViewerSyncStamp>,
+    detached_viewer_independent_active: bool,
+    detached_viewer_pin_active: bool,
+    detached_viewer_open_next_still_detached_once: bool,
+    detached_viewer_window_id: Option<u64>,
+    fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
+    input_generation: std::collections::HashMap<usize, u64>,
+    fs_pending:
+        std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
+    fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
+    items_generation: u64,
+    items_are_global_search_view: bool,
+    items_are_tag_view: bool,
+    items_are_reading_history_view: bool,
+    items_are_rating_view: bool,
+    items_are_subfolder_expansion_view: bool,
+    items_are_drive_list: bool,
+    reading_history_return_from: Option<PathBuf>,
+    fs_open_intent_from_grid: bool,
+    pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
+    fs_zoom: f32,
+    fs_pan: egui::Vec2,
+    fs_zoom_active: bool,
+    fs_zoom_aiming: bool,
+    fs_zoom_factor: f32,
+    fs_zoom_pdf_rerender_idx: Option<usize>,
+    fs_zoom_pdf_rerender_zoom: f32,
+    fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    fs_vertical_scroll: f32,
+    fs_seek_drag_active: bool,
+    fs_seek_overlay_visible: bool,
+    fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    fs_free_rotation: f32,
+    fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
+    analysis_zoom: f32,
+    analysis_pan: egui::Vec2,
+    analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    spread_mode: crate::settings::SpreadMode,
+    spread_shift_anchor_idx: Option<usize>,
+    reading_flow: crate::settings::ReadingFlow,
+    reading_direction: crate::settings::ReadingDirection,
+    slideshow_playing: bool,
+    slideshow_next_at: std::time::Instant,
+    slideshow_anchor_idx: Option<usize>,
+    slideshow_scroll_anim: Option<SlideshowContinuousScrollAnim>,
+    slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
+    pdf_enumerate_pending: Option<(
+        PathBuf,
+        Option<String>,
+        crate::pdf_loader::PdfEnumerateHandle,
+    )>,
+    zip_enumerate_pending: Option<ZipEnumeratePending>,
+    fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
+    pending_auto_fs_open: bool,
+    pending_return_to_parent: bool,
+    pdf_placeholder_count: Option<u32>,
+    cached_nav_indices: Option<Vec<usize>>,
+    cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    fs_nav_locked_gen: Option<u64>,
+    fs_holdover_tex: Option<egui::TextureHandle>,
+    virtual_folder_writeback: Option<VirtualFolderWriteback>,
+    pdf_prefetch_grace_until: Option<std::time::Instant>,
+    thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    local_adjust_page_layers:
+        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    local_adjust_pages: std::collections::HashSet<usize>,
+    local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
+    local_adjust_generation: std::collections::HashMap<usize, u64>,
+    local_adjust_cache: std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
+    local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
+    export_crop_page_settings: std::collections::HashMap<usize, crate::export_crop::CropSettings>,
+    export_crop_pages: std::collections::HashSet<usize>,
+    mask_pages: std::collections::HashSet<usize>,
+    comic_pages: std::collections::HashSet<usize>,
+    conceal_pages: std::collections::HashSet<usize>,
+    erase_mask_generation: std::collections::HashMap<usize, u64>,
+    conceal_mask_generation: std::collections::HashMap<usize, u64>,
+    edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
+    final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
+    final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
+    final_ai_failed: std::collections::HashSet<FinalAiKey>,
+    final_composite_cache: std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
+    erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
+    erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    conceal_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
+    comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
+    comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
+    erase_inpaint_pending: std::collections::HashMap<
+        crate::ui_erase::EraseInpaintPendingKey,
+        crate::ui_erase::EraseInpaintPending,
+    >,
+    ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
+    normalize_ui_states:
+        std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
+    normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
+    last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
+}
+
+#[cfg(windows)]
+impl ViewerContextBundle {
+    fn empty() -> Self {
+        Self {
+            address: String::new(),
+            current_folder: None,
+            archive_source_override: None,
+            zip_nav: None,
+            items: Vec::new(),
+            thumbnails: Vec::new(),
+            image_metas: Vec::new(),
+            selected: None,
+            scroll_offset_y: 0.0,
+            scroll_to_selected: false,
+            requested: std::collections::HashMap::new(),
+            keep_range: (0, 0),
+            keep_set: std::collections::HashSet::new(),
+            details_thumb_suppression_applied: false,
+            details_hover_thumb_idx: None,
+            details_hover_thumb_viewport_open: false,
+            texture_backlog: Vec::new(),
+            visible_indices: Vec::new(),
+            details_order: Vec::new(),
+            details_tag_prewarm_indices: Vec::new(),
+            details_lazy_meta: std::collections::HashMap::new(),
+            details_meta_pending: None,
+            details_lazy_visible_revision: 0,
+            details_image_dims_state: LazyColumnState::Disabled,
+            tag_prewarm_queued: std::collections::HashSet::new(),
+            pending_finalize: std::collections::HashSet::new(),
+            last_vis_range: (0, 0),
+            vis_settle_at: None,
+            vis_first_logged: false,
+            vis_all_logged: false,
+            search_filter: None,
+            search_filter_origin_folder: None,
+            checked: std::collections::HashSet::new(),
+            rotation_cache: std::collections::HashMap::new(),
+            rating_cache: std::collections::HashMap::new(),
+            current_folder_rating_cache: None,
+            fullscreen_idx: None,
+            viewer_presentation: ViewerPresentation::Fullscreen,
+            last_viewer_sync_stamp: None,
+            detached_viewer_independent_active: false,
+            detached_viewer_pin_active: false,
+            detached_viewer_open_next_still_detached_once: false,
+            detached_viewer_window_id: None,
+            fs_cache: std::collections::HashMap::new(),
+            fs_margin_bbox_cache: std::collections::HashMap::new(),
+            input_generation: std::collections::HashMap::new(),
+            fs_pending: std::collections::HashMap::new(),
+            fs_early_dims: std::collections::HashMap::new(),
+            fs_upload_backlog: Vec::new(),
+            items_generation: 0,
+            items_are_global_search_view: false,
+            items_are_tag_view: false,
+            items_are_reading_history_view: false,
+            items_are_rating_view: false,
+            items_are_subfolder_expansion_view: false,
+            items_are_drive_list: false,
+            reading_history_return_from: None,
+            fs_open_intent_from_grid: false,
+            pending_detached_video_host_switch: None,
+            fs_zoom: 1.0,
+            fs_pan: egui::Vec2::ZERO,
+            fs_zoom_active: false,
+            fs_zoom_aiming: false,
+            fs_zoom_factor: 1.0,
+            fs_zoom_pdf_rerender_idx: None,
+            fs_zoom_pdf_rerender_zoom: 1.0,
+            fs_pan_drag_start: None,
+            fs_vertical_scroll: 0.0,
+            fs_seek_drag_active: false,
+            fs_seek_overlay_visible: false,
+            fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            fs_free_rotation: 0.0,
+            fs_rotation_drag_start: None,
+            analysis_zoom: 1.0,
+            analysis_pan: egui::Vec2::ZERO,
+            analysis_pan_drag_start: None,
+            spread_mode: crate::settings::SpreadMode::default(),
+            spread_shift_anchor_idx: None,
+            reading_flow: crate::settings::ReadingFlow::default(),
+            reading_direction: crate::settings::ReadingDirection::default(),
+            slideshow_playing: false,
+            slideshow_next_at: std::time::Instant::now(),
+            slideshow_anchor_idx: None,
+            slideshow_scroll_anim: None,
+            slideshow_scroll_range_cache: None,
+            pdf_enumerate_pending: None,
+            zip_enumerate_pending: None,
+            fs_nav_after_pdf_enumerate: None,
+            pending_auto_fs_open: false,
+            pending_return_to_parent: false,
+            pdf_placeholder_count: None,
+            cached_nav_indices: None,
+            cached_fs_seek_info: None,
+            fs_nav_locked_gen: None,
+            fs_holdover_tex: None,
+            virtual_folder_writeback: None,
+            pdf_prefetch_grace_until: None,
+            thumb_pixels: std::collections::HashMap::new(),
+            thumb_adjust_tex: std::collections::HashMap::new(),
+            adjustment_page_params: std::collections::HashMap::new(),
+            local_adjust_page_layers: std::collections::HashMap::new(),
+            local_adjust_pages: std::collections::HashSet::new(),
+            local_adjust_selected_layers: std::collections::HashMap::new(),
+            local_adjust_generation: std::collections::HashMap::new(),
+            local_adjust_cache: std::collections::HashMap::new(),
+            local_adjust_pending: std::collections::HashMap::new(),
+            export_crop_page_settings: std::collections::HashMap::new(),
+            export_crop_pages: std::collections::HashSet::new(),
+            mask_pages: std::collections::HashSet::new(),
+            comic_pages: std::collections::HashSet::new(),
+            conceal_pages: std::collections::HashSet::new(),
+            erase_mask_generation: std::collections::HashMap::new(),
+            conceal_mask_generation: std::collections::HashMap::new(),
+            edit_result_cache: std::collections::HashMap::new(),
+            final_ai_cache: std::collections::HashMap::new(),
+            final_ai_pending: std::collections::HashMap::new(),
+            final_ai_failed: std::collections::HashSet::new(),
+            final_composite_cache: std::collections::HashMap::new(),
+            adjustment_cache: std::collections::HashMap::new(),
+            erase_result_cache: std::collections::HashMap::new(),
+            erase_preview_cache: std::collections::HashMap::new(),
+            erase_base_cache: std::collections::HashMap::new(),
+            conceal_base_cache: std::collections::HashMap::new(),
+            conceal_cache: std::collections::HashMap::new(),
+            comic_cache: std::collections::HashMap::new(),
+            comic_bake_pending: std::collections::HashMap::new(),
+            erase_inpaint_pending: std::collections::HashMap::new(),
+            ai_classify_cache: std::collections::HashMap::new(),
+            normalize_ui_states: std::collections::HashMap::new(),
+            normalize_auto_scan_suppressed: std::collections::HashSet::new(),
+            last_loop_pos: std::collections::HashMap::new(),
+        }
+    }
+
+    fn pause_background_work_keep_current_frame(&mut self) {
+        self.slideshow_playing = false;
+        self.slideshow_scroll_anim = None;
+        self.slideshow_scroll_range_cache = None;
+        self.fs_seek_drag_active = false;
+        self.fs_seek_overlay_visible = false;
+        self.pending_auto_fs_open = false;
+        self.pending_return_to_parent = false;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.fs_nav_locked_gen = None;
+        self.fs_holdover_tex = None;
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        for (_, (cancel, _, _)) in self.fs_pending.drain() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.texture_backlog.clear();
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.final_ai_pending.clear();
+        for (_, pending) in self.local_adjust_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, pending) in self.comic_bake_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, pending) in self.erase_inpaint_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -275,6 +663,10 @@ pub(crate) struct DeferredFsReopen {
     /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
     /// nav=先頭で従来挙動を維持。
     pub resume_to_last_page: bool,
+    /// grid / CLI / SendTo など、ユーザーが明示的にコンテナを開いた後の自動 fullscreen。
+    /// PDF / ZIP は列挙完了後に遅れて `open_fullscreen` するため、この意図を保持して
+    /// detached viewer の focus / always-new window 判定へ渡す。
+    pub from_explicit_open: bool,
     /// パスワード付き PDF で入力ダイアログを挟んでも、この reopen 意図を維持するか。
     /// grid / CLI / SendTo の明示オープンは true、Ctrl+↑↓ などのナビ由来は false。
     pub preserve_after_password_prompt: bool,
@@ -2761,29 +3153,73 @@ pub struct App {
     /// 新しい表示先へフォーカスを移すために使う。
     #[cfg(windows)]
     pub(crate) detached_viewer_focus_requested: bool,
+    /// 次の detached 静止画描画で active viewer viewport を作り直す one-shot。
+    /// 既存 active window を passive snapshot として退避した後や、未ピン留め passive
+    /// window の配置を再利用する時は、同じ OS window の中身差し替えではなく
+    /// 新しい top-level viewport として表示する必要がある。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_recreate_on_next_render: bool,
     /// 現在の detached 静止画セッションがメイン一覧と独立しているか。
     ///
-    /// 「毎回新しいウィンドウ」やピン留め後の再オープンは、open 時点の one-shot
+    /// 「毎回新しいウィンドウ」や active viewer のピン留め中は、open 時点の one-shot
     /// フラグを消費した後も同期停止を継続する必要があるため、セッション状態として持つ。
     #[cfg(windows)]
     pub(crate) detached_viewer_independent_active: bool,
     /// 現在の画像 detached viewer をピン留め扱いにする一時状態。
     ///
-    /// 現状の detached viewer は単一 active session なので、ピン留めは「次に画像を
-    /// 開くときも detached viewer を使い、メイン選択との自動同期は止める」ための
-    /// セッション内状態として扱う。
+    /// 現状の detached viewer は単一 active session なので、ピン留めは「現在の active
+    /// viewer をメイン選択から切り離し、次に画像を開くと passive window として残す」
+    /// ためのセッション内状態として扱う。
     #[cfg(windows)]
     pub(crate) detached_viewer_pin_active: bool,
     /// ピン留めや既存の未ピン留め passive window の再利用で、次の画像 open だけを
-    /// detached viewer にする one-shot。
+    /// detached viewer にする one-shot。これは detached で開く指定だけを表し、
+    /// メイン一覧と同期しない独立 session かどうかは
+    /// `detached_viewer_independent_active` で別に管理する。
     #[cfg(windows)]
     pub(crate) detached_viewer_open_next_still_detached_once: bool,
+    /// detached viewer context が使う安定した OS window id。
+    ///
+    /// active / paused を切り替えても同じ ViewportId を使い続け、ウィンドウの
+    /// close/create を避けるために context bundle と一緒に swap する。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_window_id: Option<u64>,
+    /// active detached viewer で最後に実測した OS viewport の配置。
+    ///
+    /// `settings.detached_viewer_window_placement` は次に開く窓の seed と永続化を兼ねるため、
+    /// active 窓を pause/snapshot 化するときはこの runtime 値を優先する。
+    #[cfg(windows)]
+    pub(crate) active_detached_viewer_live_placement:
+        Option<crate::settings::DetachedViewerWindowPlacement>,
     /// active viewer から退避した静止画像の passive detached windows。
     /// 操作系・先読み・編集・AI は持たず、最後に表示したテクスチャだけを保持する。
     #[cfg(windows)]
     pub(crate) detached_image_windows: Vec<DetachedImageWindowSnapshot>,
+    /// メイン一覧から独立して動く active detached viewer の item/cache context。
+    ///
+    /// `App` の既存 fullscreen 実装は `self.items[self.fullscreen_idx]` 前提が広いため、
+    /// active viewer を処理する短い区間だけこの bundle を mount して既存処理を再利用する。
+    #[cfg(windows)]
+    active_detached_viewer_context: Option<ActiveDetachedViewerContext>,
+    /// active detached viewer の PDF / ZIP ページ文脈を処理している間、メイン一覧用の
+    /// 起動復元先・クイックフォルダ履歴を更新しないためのネスト可能な抑止カウンタ。
+    ///
+    /// detached book context は `start_loading_items` を再利用するが、そこで
+    /// `settings.last_folder` を書くと次回起動が親の本一覧ではなくページ一覧になる。
+    #[cfg(windows)]
+    detached_viewer_main_history_suppression_depth: u32,
+    /// `open_fullscreen` 等の ctx を持たない経路で passive window を消した場合に、
+    /// 次の描画フレームで該当 viewport へ明示 close を送るためのキュー。
+    #[cfg(windows)]
+    pub(crate) detached_image_window_close_pending: Vec<u64>,
+    /// detached window close 直後に OS が残り窓へ自動フォーカスを渡すことがある。
+    /// そのフォーカス遷移を「ユーザーが passive 窓を選んだ」と誤認しないための短い抑止。
+    #[cfg(windows)]
+    detached_image_window_focus_activation_suppress_until: Option<std::time::Instant>,
     #[cfg(windows)]
     pub(crate) next_detached_image_window_id: u64,
+    #[cfg(windows)]
+    next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 表示トリムの自動余白カット用の中身 bbox キャッシュ (正規化座標)。
@@ -4334,6 +4770,9 @@ pub struct App {
     pub(crate) ai_job_queue: Option<AiJobQueue>,
     /// AI ワーカーからの結果受信口 (全ジョブ共有の単一チャネル)。
     pub(crate) final_ai_rx: Option<mpsc::Receiver<FinalAiResult>>,
+    /// `final_ai_rx` は全 viewer context で共有されるため、main context が先に
+    /// active detached viewer 宛ての結果を drain した場合はここへ一時退避する。
+    pub(crate) final_ai_result_backlog: Vec<FinalAiResult>,
     /// 最終 composite cache。AdjustParams 全項目 + AI + post_filter 適用後。
     pub(crate) final_composite_cache:
         std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
@@ -5585,15 +6024,31 @@ impl App {
             #[cfg(windows)]
             detached_viewer_focus_requested: false,
             #[cfg(windows)]
+            detached_viewer_recreate_on_next_render: false,
+            #[cfg(windows)]
             detached_viewer_independent_active: false,
             #[cfg(windows)]
             detached_viewer_pin_active: false,
             #[cfg(windows)]
             detached_viewer_open_next_still_detached_once: false,
             #[cfg(windows)]
+            detached_viewer_window_id: None,
+            #[cfg(windows)]
+            active_detached_viewer_live_placement: None,
+            #[cfg(windows)]
             detached_image_windows: Vec::new(),
             #[cfg(windows)]
+            active_detached_viewer_context: None,
+            #[cfg(windows)]
+            detached_viewer_main_history_suppression_depth: 0,
+            #[cfg(windows)]
+            detached_image_window_close_pending: Vec::new(),
+            #[cfg(windows)]
+            detached_image_window_focus_activation_suppress_until: None,
+            #[cfg(windows)]
             next_detached_image_window_id: 1,
+            #[cfg(windows)]
+            next_detached_viewer_context_serial: 1,
             fs_cache: std::collections::HashMap::new(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
@@ -6145,6 +6600,7 @@ impl App {
             final_ai_failed: std::collections::HashSet::new(),
             ai_job_queue: None,
             final_ai_rx: None,
+            final_ai_result_backlog: Vec::new(),
             final_composite_cache: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_layer_bypass_cache: std::collections::HashMap::new(),
@@ -7365,6 +7821,332 @@ impl App {
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
     /// 元 (RAR/7z/LZH) のパスを返す。通常時は `current_folder` と同じ。
     /// BS / Ctrl+↑↓ / タイトルバー / アドレスバー表示で使うこと。
+    #[cfg(windows)]
+    fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
+        macro_rules! swap_field {
+            ($field:ident) => {
+                std::mem::swap(&mut self.$field, $field);
+            };
+        }
+
+        let ViewerContextBundle {
+            address,
+            current_folder,
+            archive_source_override,
+            zip_nav,
+            items,
+            thumbnails,
+            image_metas,
+            selected,
+            scroll_offset_y,
+            scroll_to_selected,
+            requested,
+            keep_range,
+            keep_set,
+            details_thumb_suppression_applied,
+            details_hover_thumb_idx,
+            details_hover_thumb_viewport_open,
+            texture_backlog,
+            visible_indices,
+            details_order,
+            details_tag_prewarm_indices,
+            details_lazy_meta,
+            details_meta_pending,
+            details_lazy_visible_revision,
+            details_image_dims_state,
+            tag_prewarm_queued,
+            pending_finalize,
+            last_vis_range,
+            vis_settle_at,
+            vis_first_logged,
+            vis_all_logged,
+            search_filter,
+            search_filter_origin_folder,
+            checked,
+            rotation_cache,
+            rating_cache,
+            current_folder_rating_cache,
+            fullscreen_idx,
+            viewer_presentation,
+            last_viewer_sync_stamp,
+            detached_viewer_independent_active,
+            detached_viewer_pin_active,
+            detached_viewer_open_next_still_detached_once,
+            detached_viewer_window_id,
+            fs_cache,
+            fs_margin_bbox_cache,
+            input_generation,
+            fs_pending,
+            fs_early_dims,
+            fs_upload_backlog,
+            items_generation,
+            items_are_global_search_view,
+            items_are_tag_view,
+            items_are_reading_history_view,
+            items_are_rating_view,
+            items_are_subfolder_expansion_view,
+            items_are_drive_list,
+            reading_history_return_from,
+            fs_open_intent_from_grid,
+            pending_detached_video_host_switch,
+            fs_zoom,
+            fs_pan,
+            fs_zoom_active,
+            fs_zoom_aiming,
+            fs_zoom_factor,
+            fs_zoom_pdf_rerender_idx,
+            fs_zoom_pdf_rerender_zoom,
+            fs_pan_drag_start,
+            fs_vertical_scroll,
+            fs_seek_drag_active,
+            fs_seek_overlay_visible,
+            fs_vertical_cache_keep_set,
+            fs_free_rotation,
+            fs_rotation_drag_start,
+            analysis_zoom,
+            analysis_pan,
+            analysis_pan_drag_start,
+            spread_mode,
+            spread_shift_anchor_idx,
+            reading_flow,
+            reading_direction,
+            slideshow_playing,
+            slideshow_next_at,
+            slideshow_anchor_idx,
+            slideshow_scroll_anim,
+            slideshow_scroll_range_cache,
+            pdf_enumerate_pending,
+            zip_enumerate_pending,
+            fs_nav_after_pdf_enumerate,
+            pending_auto_fs_open,
+            pending_return_to_parent,
+            pdf_placeholder_count,
+            cached_nav_indices,
+            cached_fs_seek_info,
+            fs_nav_locked_gen,
+            fs_holdover_tex,
+            virtual_folder_writeback,
+            pdf_prefetch_grace_until,
+            thumb_pixels,
+            thumb_adjust_tex,
+            adjustment_page_params,
+            local_adjust_page_layers,
+            local_adjust_pages,
+            local_adjust_selected_layers,
+            local_adjust_generation,
+            local_adjust_cache,
+            local_adjust_pending,
+            export_crop_page_settings,
+            export_crop_pages,
+            mask_pages,
+            comic_pages,
+            conceal_pages,
+            erase_mask_generation,
+            conceal_mask_generation,
+            edit_result_cache,
+            final_ai_cache,
+            final_ai_pending,
+            final_ai_failed,
+            final_composite_cache,
+            adjustment_cache,
+            erase_result_cache,
+            erase_preview_cache,
+            erase_base_cache,
+            conceal_base_cache,
+            conceal_cache,
+            comic_cache,
+            comic_bake_pending,
+            erase_inpaint_pending,
+            ai_classify_cache,
+            normalize_ui_states,
+            normalize_auto_scan_suppressed,
+            last_loop_pos,
+        } = bundle;
+
+        swap_field!(address);
+        swap_field!(current_folder);
+        swap_field!(archive_source_override);
+        swap_field!(zip_nav);
+        swap_field!(items);
+        swap_field!(thumbnails);
+        swap_field!(image_metas);
+        swap_field!(selected);
+        swap_field!(scroll_offset_y);
+        swap_field!(scroll_to_selected);
+        swap_field!(requested);
+        swap_field!(keep_range);
+        swap_field!(keep_set);
+        swap_field!(details_thumb_suppression_applied);
+        swap_field!(details_hover_thumb_idx);
+        swap_field!(details_hover_thumb_viewport_open);
+        swap_field!(texture_backlog);
+        swap_field!(visible_indices);
+        swap_field!(details_order);
+        swap_field!(details_tag_prewarm_indices);
+        swap_field!(details_lazy_meta);
+        swap_field!(details_meta_pending);
+        swap_field!(details_lazy_visible_revision);
+        swap_field!(details_image_dims_state);
+        swap_field!(tag_prewarm_queued);
+        swap_field!(pending_finalize);
+        swap_field!(last_vis_range);
+        swap_field!(vis_settle_at);
+        swap_field!(vis_first_logged);
+        swap_field!(vis_all_logged);
+        swap_field!(search_filter);
+        swap_field!(search_filter_origin_folder);
+        swap_field!(checked);
+        swap_field!(rotation_cache);
+        swap_field!(rating_cache);
+        swap_field!(current_folder_rating_cache);
+        swap_field!(fullscreen_idx);
+        swap_field!(viewer_presentation);
+        swap_field!(last_viewer_sync_stamp);
+        swap_field!(detached_viewer_independent_active);
+        swap_field!(detached_viewer_pin_active);
+        swap_field!(detached_viewer_open_next_still_detached_once);
+        swap_field!(detached_viewer_window_id);
+        swap_field!(fs_cache);
+        swap_field!(fs_margin_bbox_cache);
+        swap_field!(input_generation);
+        swap_field!(fs_pending);
+        swap_field!(fs_early_dims);
+        swap_field!(fs_upload_backlog);
+        swap_field!(items_generation);
+        swap_field!(items_are_global_search_view);
+        swap_field!(items_are_tag_view);
+        swap_field!(items_are_reading_history_view);
+        swap_field!(items_are_rating_view);
+        swap_field!(items_are_subfolder_expansion_view);
+        swap_field!(items_are_drive_list);
+        swap_field!(reading_history_return_from);
+        swap_field!(fs_open_intent_from_grid);
+        swap_field!(pending_detached_video_host_switch);
+        swap_field!(fs_zoom);
+        swap_field!(fs_pan);
+        swap_field!(fs_zoom_active);
+        swap_field!(fs_zoom_aiming);
+        swap_field!(fs_zoom_factor);
+        swap_field!(fs_zoom_pdf_rerender_idx);
+        swap_field!(fs_zoom_pdf_rerender_zoom);
+        swap_field!(fs_pan_drag_start);
+        swap_field!(fs_vertical_scroll);
+        swap_field!(fs_seek_drag_active);
+        swap_field!(fs_seek_overlay_visible);
+        swap_field!(fs_vertical_cache_keep_set);
+        swap_field!(fs_free_rotation);
+        swap_field!(fs_rotation_drag_start);
+        swap_field!(analysis_zoom);
+        swap_field!(analysis_pan);
+        swap_field!(analysis_pan_drag_start);
+        swap_field!(spread_mode);
+        swap_field!(spread_shift_anchor_idx);
+        swap_field!(reading_flow);
+        swap_field!(reading_direction);
+        swap_field!(slideshow_playing);
+        swap_field!(slideshow_next_at);
+        swap_field!(slideshow_anchor_idx);
+        swap_field!(slideshow_scroll_anim);
+        swap_field!(slideshow_scroll_range_cache);
+        swap_field!(pdf_enumerate_pending);
+        swap_field!(zip_enumerate_pending);
+        swap_field!(fs_nav_after_pdf_enumerate);
+        swap_field!(pending_auto_fs_open);
+        swap_field!(pending_return_to_parent);
+        swap_field!(pdf_placeholder_count);
+        swap_field!(cached_nav_indices);
+        swap_field!(cached_fs_seek_info);
+        swap_field!(fs_nav_locked_gen);
+        swap_field!(fs_holdover_tex);
+        swap_field!(virtual_folder_writeback);
+        swap_field!(pdf_prefetch_grace_until);
+        swap_field!(thumb_pixels);
+        swap_field!(thumb_adjust_tex);
+        swap_field!(adjustment_page_params);
+        swap_field!(local_adjust_page_layers);
+        swap_field!(local_adjust_pages);
+        swap_field!(local_adjust_selected_layers);
+        swap_field!(local_adjust_generation);
+        swap_field!(local_adjust_cache);
+        swap_field!(local_adjust_pending);
+        swap_field!(export_crop_page_settings);
+        swap_field!(export_crop_pages);
+        swap_field!(mask_pages);
+        swap_field!(comic_pages);
+        swap_field!(conceal_pages);
+        swap_field!(erase_mask_generation);
+        swap_field!(conceal_mask_generation);
+        swap_field!(edit_result_cache);
+        swap_field!(final_ai_cache);
+        swap_field!(final_ai_pending);
+        swap_field!(final_ai_failed);
+        swap_field!(final_composite_cache);
+        swap_field!(adjustment_cache);
+        swap_field!(erase_result_cache);
+        swap_field!(erase_preview_cache);
+        swap_field!(erase_base_cache);
+        swap_field!(conceal_base_cache);
+        swap_field!(conceal_cache);
+        swap_field!(comic_cache);
+        swap_field!(comic_bake_pending);
+        swap_field!(erase_inpaint_pending);
+        swap_field!(ai_classify_cache);
+        swap_field!(normalize_ui_states);
+        swap_field!(normalize_auto_scan_suppressed);
+        swap_field!(last_loop_pos);
+    }
+
+    #[cfg(windows)]
+    fn take_current_viewer_context_bundle(&mut self) -> ViewerContextBundle {
+        let mut bundle = ViewerContextBundle::empty();
+        self.swap_viewer_context_bundle(&mut bundle);
+        bundle
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_suppresses_main_history_persistence(&self) -> bool {
+        self.detached_viewer_main_history_suppression_depth > 0
+    }
+
+    #[cfg(not(windows))]
+    fn detached_viewer_suppresses_main_history_persistence(&self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn with_detached_viewer_main_history_suppressed<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_depth = self.detached_viewer_main_history_suppression_depth;
+        self.detached_viewer_main_history_suppression_depth = previous_depth.saturating_add(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.detached_viewer_main_history_suppression_depth = previous_depth;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[cfg(windows)]
+    fn with_active_detached_viewer_context<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        let mut active = self.active_detached_viewer_context.take()?;
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        let previous_depth = self.detached_viewer_main_history_suppression_depth;
+        self.detached_viewer_main_history_suppression_depth = previous_depth.saturating_add(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.detached_viewer_main_history_suppression_depth = previous_depth;
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        self.active_detached_viewer_context = Some(active);
+        match result {
+            Ok(value) => Some(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
         self.archive_source_override
             .clone()
@@ -7543,6 +8325,17 @@ impl App {
             crate::ui_main::AddressBarNav::DriveList(Some(cur))
         };
         Some(nav)
+    }
+
+    #[cfg(windows)]
+    fn close_detached_viewer_for_virtual_page_list_parent_nav(&mut self) {
+        let in_virtual_page_list = self
+            .current_folder
+            .as_deref()
+            .is_some_and(crate::folder_tree::is_virtual_folder);
+        if in_virtual_page_list && self.viewer_session_is_detached() {
+            self.close_fullscreen();
+        }
     }
 
     /// `pending_return_to_parent` (「ページを直接開く」設定 ON の ZIP/PDF、または
@@ -7843,6 +8636,11 @@ impl App {
     /// ここで扱う履歴はスクロール復元用の `folder_history` とは別物で、
     /// ユーザーがフォルダバーの ←/→ や履歴メニューで辿るためのもの。
     fn record_folder_nav_transition(&mut self, target: &Path) {
+        if self.detached_viewer_suppresses_main_history_persistence() {
+            self.suppress_nav_record_for_search_restore = false;
+            self.set_active_folder_nav_suppress_record_once(false);
+            return;
+        }
         // 検索 (Ctrl+G / Ctrl+S / Ctrl+T) 中の移動、および検索クローズによる検索前フォルダへの
         // 復帰は履歴 (back/forward/recent) に一切残さない。検索は透明な一時オーバーレイ
         // であり、抜けると検索前の状態に完全復帰する。`suppress_nav_record_for_search_restore`
@@ -11195,6 +11993,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
+                from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
         }
@@ -11518,30 +12317,7 @@ impl App {
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
         if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
-            // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を解決する
-            // (Codex P2 fix)。マッチしなければ / フォルダナビ由来なら従来どおり先頭着地。
-            // スライドショー NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
-            let mut new_idx = deferred
-                .target
-                .as_ref()
-                .and_then(|t| self.resolve_snapshot_target_idx(t));
-            // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
-            if new_idx.is_none() && deferred.resume_to_last_page {
-                new_idx = self.resume_page_for_container();
-            }
-            if new_idx.is_none() {
-                new_idx = self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
-            }
-            if let Some(new_idx) = new_idx {
-                self.open_fullscreen(new_idx);
-                self.selected = Some(new_idx);
-                self.scroll_to_selected = true;
-                self.update_last_selected_image();
-                if deferred.resume_slideshow {
-                    self.slideshow_playing = true;
-                    self.schedule_next_slideshow_from_now();
-                }
-            }
+            self.open_deferred_fullscreen_after_enumerate(deferred);
         }
 
         // 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出した場合、入れ子を展開した
@@ -11987,6 +12763,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
+                from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
         }
@@ -12106,6 +12883,36 @@ impl App {
                 thumb_px,
                 thumb_quality,
             );
+        }
+    }
+
+    fn open_deferred_fullscreen_after_enumerate(&mut self, deferred: DeferredFsReopen) {
+        // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を解決する。
+        // マッチしなければ / フォルダナビ由来なら従来どおり先頭着地。スライドショー
+        // NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
+        let mut new_idx = deferred
+            .target
+            .as_ref()
+            .and_then(|t| self.resolve_snapshot_target_idx(t));
+        // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
+        if new_idx.is_none() && deferred.resume_to_last_page {
+            new_idx = self.resume_page_for_container();
+        }
+        if new_idx.is_none() {
+            new_idx = self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
+        }
+        if let Some(new_idx) = new_idx {
+            if deferred.from_explicit_open {
+                self.fs_open_intent_from_grid = true;
+            }
+            self.open_fullscreen(new_idx);
+            self.selected = Some(new_idx);
+            self.scroll_to_selected = true;
+            self.update_last_selected_image();
+            if deferred.resume_slideshow {
+                self.slideshow_playing = true;
+                self.schedule_next_slideshow_from_now();
+            }
         }
     }
 
@@ -12381,32 +13188,7 @@ impl App {
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
                 // placeholder hit/miss 問わず必ず実行する (Codex P1-2)。
                 if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
-                    // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を
-                    // 解決する (Codex P2 fix)。マッチしなければ / フォルダナビ由来なら従来
-                    // どおり先頭着地。スライドショー NextFolder の deferred 再開は動画を
-                    // 開かず静止画のみに着地する。
-                    let mut new_idx = deferred
-                        .target
-                        .as_ref()
-                        .and_then(|t| self.resolve_snapshot_target_idx(t));
-                    // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
-                    if new_idx.is_none() && deferred.resume_to_last_page {
-                        new_idx = self.resume_page_for_container();
-                    }
-                    if new_idx.is_none() {
-                        new_idx =
-                            self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
-                    }
-                    if let Some(new_idx) = new_idx {
-                        self.open_fullscreen(new_idx);
-                        self.selected = Some(new_idx);
-                        self.scroll_to_selected = true;
-                        self.update_last_selected_image();
-                        if deferred.resume_slideshow {
-                            self.slideshow_playing = true;
-                            self.schedule_next_slideshow_from_now();
-                        }
-                    }
+                    self.open_deferred_fullscreen_after_enumerate(deferred);
                 }
             }
             Err(e) => {
@@ -13561,9 +14343,13 @@ impl App {
         // restart the quiet window from the restored position.
         self.last_scroll_offset_y_tracked = self.scroll_offset_y;
         self.last_scroll_change_time = std::time::Instant::now();
-        // 検索結果 / 読書履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
+        // 検索結果 / 読書履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)。
+        // active detached viewer の PDF / ZIP ページ文脈も、メイン一覧とは独立した一時 context
+        // なので last_folder / quick folder settings へ永続化しない。
         let save_t0 = std::time::Instant::now();
-        if !is_synthetic_view_path(&source_path) {
+        if !is_synthetic_view_path(&source_path)
+            && !self.detached_viewer_suppresses_main_history_persistence()
+        {
             // 変換アーカイブ (RAR/CBR/7z/LZH) 閲覧中は source_path (= current_folder) が
             // キャッシュ ZIP (`archive_cache\..\book.zip`) を指す。次回起動で復元すべきは
             // 元アーカイブなので、archive_source_override を反映した effective_folder() を
@@ -19051,6 +19837,10 @@ impl App {
                     if !stack_skip_for_external_video && self.stack_try_open_from_grid(idx, false) {
                         return None;
                     }
+                    #[cfg(windows)]
+                    if self.open_grid_container_in_detached_book_context(ctx, idx) {
+                        return None;
+                    }
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p))
                         | Some(GridItem::ZipFile(p))
@@ -19249,6 +20039,8 @@ impl App {
             if self.zip_nav_back() {
                 return None;
             }
+            #[cfg(windows)]
+            self.close_detached_viewer_for_virtual_page_list_parent_nav();
             return self.resolve_grid_parent_nav();
         }
 
@@ -19804,6 +20596,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
             return "enumerate_defer";
@@ -19818,6 +20611,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
             return "enumerate_defer";
@@ -20830,6 +21624,10 @@ impl App {
     }
 
     pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
+        #[cfg(windows)]
+        if self.active_detached_viewer_context.is_some() {
+            return true;
+        }
         if self.viewer_session_is_detached() {
             return true;
         }
@@ -21030,6 +21828,627 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_viewer_context_descriptor_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<ViewerContextDescriptor> {
+        match self.items.get(idx)? {
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => Some(ViewerContextDescriptor::Pdf {
+                path: pdf_path.clone(),
+                page_num: Some(*page_num),
+            }),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => Some(ViewerContextDescriptor::Zip {
+                path: zip_path.clone(),
+                entry_name: Some(entry_name.clone()),
+                archive_source_override: self.archive_source_override.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn detached_book_context_descriptor_for_grid_idx(
+        &self,
+        idx: usize,
+    ) -> Option<ViewerContextDescriptor> {
+        match self.items.get(idx)? {
+            GridItem::PdfFile(path) => Some(ViewerContextDescriptor::Pdf {
+                path: path.clone(),
+                page_num: None,
+            }),
+            GridItem::ZipFile(path) => Some(ViewerContextDescriptor::Zip {
+                path: path.clone(),
+                entry_name: None,
+                archive_source_override: None,
+            }),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn detached_book_context_target(
+        descriptor: &ViewerContextDescriptor,
+    ) -> Option<crate::snapshot::SnapshotTarget> {
+        match descriptor {
+            ViewerContextDescriptor::Pdf {
+                path,
+                page_num: Some(page_num),
+            } => Some(crate::snapshot::SnapshotTarget::PdfPage {
+                pdf_path: path.clone(),
+                page_num: *page_num,
+            }),
+            ViewerContextDescriptor::Zip {
+                path,
+                entry_name: Some(entry_name),
+                ..
+            } => Some(crate::snapshot::SnapshotTarget::ZipImage {
+                zip_path: path.clone(),
+                entry_name: entry_name.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn assign_next_detached_viewer_context_generation(&mut self) -> u64 {
+        let context_serial = self.next_detached_viewer_context_serial.max(1);
+        self.next_detached_viewer_context_serial = self
+            .next_detached_viewer_context_serial
+            .wrapping_add(1)
+            .max(1);
+        self.items_generation = DETACHED_VIEWER_CONTEXT_GENERATION_BASE
+            | context_serial.wrapping_mul(DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE);
+        context_serial
+    }
+
+    #[cfg(windows)]
+    fn allocate_detached_viewer_window_id(&mut self) -> u64 {
+        let id = self.next_detached_image_window_id.max(1);
+        self.next_detached_image_window_id =
+            self.next_detached_image_window_id.wrapping_add(1).max(1);
+        id
+    }
+
+    #[cfg(windows)]
+    fn ensure_detached_viewer_window_id(&mut self) -> u64 {
+        if let Some(id) = self.detached_viewer_window_id {
+            id
+        } else {
+            let id = self.allocate_detached_viewer_window_id();
+            self.detached_viewer_window_id = Some(id);
+            id
+        }
+    }
+
+    #[cfg(windows)]
+    fn pause_current_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        let Some(mut active) = self.active_detached_viewer_context.take() else {
+            return false;
+        };
+
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        let pinned =
+            self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
+        let Some(mut snapshot) =
+            self.build_active_detached_image_window_snapshot(Some(ctx), pinned)
+        else {
+            self.swap_viewer_context_bundle(&mut active.bundle);
+            self.active_detached_viewer_context = Some(active);
+            return false;
+        };
+        self.detached_viewer_pin_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        let mut paused_bundle = self.take_current_viewer_context_bundle();
+        paused_bundle.pause_background_work_keep_current_frame();
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        snapshot.paused_bundle = Some(Box::new(paused_bundle));
+        self.detached_image_windows.push(snapshot);
+        true
+    }
+
+    #[cfg(windows)]
+    fn close_current_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        let Some(mut active) = self.active_detached_viewer_context.take() else {
+            return false;
+        };
+
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        if self.fs_viewport_shown {
+            let fs_id = self.fullscreen_viewport_id();
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
+        }
+        self.close_fullscreen();
+        let _closed_context = self.take_current_viewer_context_bundle();
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_image_window_debug_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("MIV_DETACHED_WINDOW_DEBUG").is_some())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn log_detached_image_window_debug(&self, message: impl AsRef<str>) {
+        if Self::detached_image_window_debug_enabled() {
+            crate::logger::log(format!("[detached-window-debug] {}", message.as_ref()));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_detached_viewer_context_present(&self) -> bool {
+        self.active_detached_viewer_context.is_some()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn suppress_detached_image_window_focus_activation(&mut self, reason: &'static str) {
+        self.detached_image_window_focus_activation_suppress_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        self.log_detached_image_window_debug(format!(
+            "focus_activation_suppress reason={reason} passive_windows={} active_context={} \
+             fs_idx={:?} shown={} presentation={:?}",
+            self.detached_image_windows.len(),
+            self.active_detached_viewer_context.is_some(),
+            self.fullscreen_idx,
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_image_window_focus_activation_suppressed(
+        &mut self,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(until) = self.detached_image_window_focus_activation_suppress_until else {
+            return false;
+        };
+        if now < until {
+            true
+        } else {
+            self.detached_image_window_focus_activation_suppress_until = None;
+            false
+        }
+    }
+
+    #[cfg(windows)]
+    fn reset_active_detached_viewport_runtime_for_new_window(
+        &mut self,
+        generation: u64,
+        reason: &'static str,
+    ) {
+        let seed_placement = self.detached_viewer_window_placement();
+        self.log_detached_image_window_debug(format!(
+            "active_viewport_runtime_reset_new reason={reason} generation={generation} \
+             old_shown={} old_presentation={:?} old_host={} seed_placement={:?}",
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation,
+            self.detached_viewer_host_debug_state(),
+            seed_placement
+        ));
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.fs_viewport_virtual_desktop_synced_hwnd = 0;
+        self.clear_detached_viewer_host_hwnd();
+        self.active_detached_viewer_live_placement = Some(seed_placement);
+        self.detached_viewer_borderless_fullscreen = false;
+        self.detached_viewer_restore_placement = None;
+        self.detached_viewer_borderless_transition = None;
+        self.still_fullscreen_viewport_enter_suppress_until = None;
+        self.fs_viewport_recreate_after_hide = false;
+        self.fs_viewport_generation = generation;
+        self.detached_viewer_recreate_on_next_render = false;
+        self.detached_viewer_focus_requested = false;
+        self.detached_viewer_no_activate_once = false;
+        self.fs_opened_at = None;
+        self.fs_focus_grace_elapsed = false;
+        self.fs_prev_focused = false;
+        self.fs_focus_regained_at = None;
+        self.fs_prev_foreground_hwnd = 0;
+        self.fs_last_native_focus_claim_at = None;
+        self.fs_last_main_focus_restore_at = None;
+        self.fs_suppress_primary_until_release = false;
+    }
+
+    #[cfg(windows)]
+    fn adopt_active_detached_viewport_runtime_from_passive(&mut self, reason: &'static str) {
+        let seed_placement = self.detached_viewer_window_placement();
+        self.log_detached_image_window_debug(format!(
+            "active_viewport_runtime_adopt_passive reason={reason} old_shown={} \
+             old_presentation={:?} old_host={} seed_placement={:?}",
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation,
+            self.detached_viewer_host_debug_state(),
+            seed_placement
+        ));
+        self.fs_viewport_shown = true;
+        self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        self.fs_viewport_virtual_desktop_synced_hwnd = 0;
+        self.clear_detached_viewer_host_hwnd();
+        self.active_detached_viewer_live_placement = Some(seed_placement);
+        self.detached_viewer_borderless_fullscreen = false;
+        self.detached_viewer_restore_placement = None;
+        self.detached_viewer_borderless_transition = None;
+        self.still_fullscreen_viewport_enter_suppress_until = None;
+        self.fs_viewport_recreate_after_hide = false;
+        self.detached_viewer_recreate_on_next_render = false;
+        self.detached_viewer_focus_requested = true;
+        self.detached_viewer_no_activate_once = false;
+        self.fs_opened_at = Some(std::time::Instant::now());
+        self.fs_focus_grace_elapsed = false;
+        self.fs_prev_focused = true;
+        self.fs_focus_regained_at = None;
+        self.fs_prev_foreground_hwnd = 0;
+        self.fs_last_native_focus_claim_at = None;
+        self.fs_last_main_focus_restore_at = None;
+        self.fs_suppress_primary_until_release = false;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn focus_main_after_detached_window_close_if_idle(
+        &self,
+        ctx: &egui::Context,
+        reason: &'static str,
+    ) {
+        if !self.detached_image_windows.is_empty() {
+            self.log_detached_image_window_debug(format!(
+                "main_focus_after_close_skipped reason={reason} passive_windows={}",
+                self.detached_image_windows.len()
+            ));
+            return;
+        }
+        if self.active_detached_viewer_context.is_some() || self.fullscreen_idx.is_some() {
+            self.log_detached_image_window_debug(format!(
+                "main_focus_after_close_skipped reason={reason} active_context={} fs_idx={:?}",
+                self.active_detached_viewer_context.is_some(),
+                self.fullscreen_idx
+            ));
+            return;
+        }
+        self.log_detached_image_window_debug(format!(
+            "main_focus_after_close reason={reason} passive_windows={}",
+            self.detached_image_windows.len()
+        ));
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    #[cfg(windows)]
+    fn finalize_closed_active_detached_viewport(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+    ) {
+        self.log_detached_image_window_debug(format!(
+            "active_close_finalize begin viewport={viewport_id:?} fs_idx={:?} shown={} \
+             presentation={:?} passive_windows={} host={}",
+            self.fullscreen_idx,
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation,
+            self.detached_image_windows.len(),
+            self.detached_viewer_host_debug_state()
+        ));
+        self.suppress_detached_image_window_focus_activation("active_close_finalize");
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
+        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.fs_viewport_recreate_after_hide = false;
+        self.clear_detached_viewer_host_hwnd();
+        self.active_detached_viewer_live_placement = None;
+        if self.detached_image_windows.is_empty() {
+            self.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP);
+        } else {
+            self.log_detached_image_window_debug(format!(
+                "main_font_resync_deferred reason=active_close_finalize passive_windows={}",
+                self.detached_image_windows.len()
+            ));
+        }
+        self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
+        self.log_detached_image_window_debug(format!(
+            "active_close_finalize end viewport={viewport_id:?} shown={} presentation={:?} \
+             recreate_after_hide={} host={}",
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation,
+            self.fs_viewport_recreate_after_hide,
+            self.detached_viewer_host_debug_state()
+        ));
+    }
+
+    #[cfg(windows)]
+    fn park_and_close_current_active_detached_viewer(&mut self, ctx: &egui::Context) -> bool {
+        if self.pause_current_active_detached_viewer_context(ctx) {
+            return true;
+        } else if self.active_detached_viewer_context.is_some() {
+            return self.close_current_active_detached_viewer_context(ctx);
+        } else if self.viewer_session_is_detached() {
+            self.preserve_active_detached_image_window_for_main_context_change();
+            if self.fs_viewport_shown {
+                let fs_id = self.fullscreen_viewport_id();
+                ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
+            }
+            self.close_fullscreen();
+            return true;
+        }
+        self.active_detached_viewer_context.is_none()
+    }
+
+    #[cfg(windows)]
+    fn start_active_detached_book_context_from_descriptor(
+        &mut self,
+        descriptor: ViewerContextDescriptor,
+        ctx: &egui::Context,
+    ) -> bool {
+        let target = Self::detached_book_context_target(&descriptor);
+        let mut main_context = self.take_current_viewer_context_bundle();
+        let context_serial = self.assign_next_detached_viewer_context_generation();
+        self.reset_active_detached_viewport_runtime_for_new_window(
+            context_serial,
+            "start_active_detached_book_context",
+        );
+        self.detached_viewer_window_id = Some(self.allocate_detached_viewer_window_id());
+        self.pending_auto_fs_open = true;
+        self.fs_open_intent_from_grid = true;
+
+        self.with_detached_viewer_main_history_suppressed(|app| match descriptor {
+            ViewerContextDescriptor::Zip {
+                path,
+                archive_source_override,
+                ..
+            } => {
+                app.load_zip_as_folder(path);
+                if let Some(source) = archive_source_override {
+                    app.archive_source_override = Some(source.clone());
+                    app.address = source.to_string_lossy().to_string();
+                }
+            }
+            ViewerContextDescriptor::Pdf { path, .. } => {
+                app.load_pdf_as_folder(path);
+            }
+        });
+
+        if let Some(target) = target {
+            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: Some(target),
+                resume_to_last_page: false,
+                from_explicit_open: true,
+                preserve_after_password_prompt: true,
+            });
+        }
+
+        let active_context = self.take_current_viewer_context_bundle();
+        self.swap_viewer_context_bundle(&mut main_context);
+        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+        ctx.request_repaint();
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn should_open_grid_container_in_detached_book_context(&self, idx: usize) -> bool {
+        self.settings.detached_viewer_open_images_in_window
+            && self.should_auto_fullscreen_grid_container(idx)
+            && matches!(
+                self.items.get(idx),
+                Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_))
+            )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_grid_container_in_detached_book_context(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> bool {
+        if !self.should_open_grid_container_in_detached_book_context(idx) {
+            return false;
+        }
+        let Some(descriptor) = self.detached_book_context_descriptor_for_grid_idx(idx) else {
+            return false;
+        };
+
+        self.maybe_suppress_rating_filter_for_opened_container(idx);
+        self.maybe_suppress_facet_filter_for_opened_container(idx);
+
+        let base_placement = self.active_detached_viewer_current_placement();
+        let had_active_detached =
+            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        if !self.park_and_close_current_active_detached_viewer(ctx) {
+            return false;
+        }
+        if had_active_detached {
+            self.settings.detached_viewer_window_placement =
+                Some(self.offset_detached_image_window_placement(base_placement));
+        }
+        self.start_active_detached_book_context_from_descriptor(descriptor, ctx)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn activate_detached_image_window_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        id: u64,
+    ) -> bool {
+        let Some(pos) = self
+            .detached_image_windows
+            .iter()
+            .position(|window| window.id == id)
+        else {
+            return false;
+        };
+        let mut snapshot = self.detached_image_windows.remove(pos);
+
+        if let Some(mut paused_bundle) = snapshot.paused_bundle.take() {
+            let activate_placement = snapshot.placement;
+            if !self.park_and_close_current_active_detached_viewer(ctx) {
+                snapshot.paused_bundle = Some(paused_bundle);
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            }
+            paused_bundle.detached_viewer_window_id = Some(snapshot.id);
+            paused_bundle.pdf_prefetch_grace_until = None;
+            self.settings.detached_viewer_window_placement = Some(activate_placement);
+            self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
+            self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+                bundle: *paused_bundle,
+            });
+            let _ = self.with_active_detached_viewer_context(|app| {
+                app.rearm_final_ai_prefetch_after_detached_resume();
+            });
+            ctx.request_repaint();
+            return true;
+        }
+
+        let Some(descriptor) = snapshot.reopen_descriptor.clone() else {
+            self.detached_image_windows.insert(pos, snapshot);
+            return false;
+        };
+
+        ctx.send_viewport_cmd_to(
+            Self::detached_image_window_viewport_id(snapshot.id),
+            egui::ViewportCommand::Close,
+        );
+        let activate_placement = snapshot.placement;
+        if !self.park_and_close_current_active_detached_viewer(ctx) {
+            self.detached_image_windows.insert(pos, snapshot);
+            return false;
+        }
+        self.settings.detached_viewer_window_placement = Some(activate_placement);
+        self.start_active_detached_book_context_from_descriptor(descriptor, ctx)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn update_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        if self.active_detached_viewer_context.is_none() {
+            return false;
+        }
+
+        let should_drop = self
+            .with_active_detached_viewer_context(|app| {
+                let close_viewport_id = (app.fs_viewport_shown
+                    && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
+                .then(|| app.fullscreen_viewport_id());
+                app.poll_pdf_enumerate();
+                app.poll_zip_enumerate();
+                app.poll_prefetch(ctx);
+                app.poll_ai_upscale(ctx);
+                app.poll_final_ai(ctx);
+                app.poll_erase_inpaint(ctx);
+                app.poll_local_adjust_render(ctx);
+                app.poll_local_adjust_layer_bypass_preview(ctx);
+                app.poll_local_adjust_prefix_preview(ctx);
+                app.poll_local_adjust_lut_load(ctx);
+                app.poll_local_adjust_segmentation(ctx);
+
+                if app.pdf_enumerate_pending.is_some()
+                    || app.zip_enumerate_pending.is_some()
+                    || app.fs_nav_deferred_reopen_wait_active()
+                {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
+
+                if let Some(fs_idx) = app.fullscreen_idx {
+                    app.sync_upscale_from_preset(fs_idx);
+                    let continuous_keep_set = if !app.reading_flow.is_paged()
+                        && app.fs_vertical_cache_keep_set.contains(&fs_idx)
+                    {
+                        Some(app.fs_vertical_cache_keep_set.clone())
+                    } else {
+                        None
+                    };
+                    let spread_other: Option<usize> = match app.resolve_spread_pair(fs_idx) {
+                        crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                            Some(if left == fs_idx { right } else { left })
+                        }
+                        _ => None,
+                    };
+                    let mut targets: Vec<usize> = Vec::with_capacity(2);
+                    targets.push(fs_idx);
+                    if let Some(other) = spread_other {
+                        targets.push(other);
+                    }
+                    if let Some(keep_set) = continuous_keep_set.as_ref() {
+                        targets.extend(keep_set.iter().copied());
+                    }
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for idx in targets {
+                        app.maybe_native_rerender_pdf_for_ai(idx);
+                    }
+                    if let Some(keep_set) = continuous_keep_set.as_ref() {
+                        app.evict_final_pipeline_cache_for_keep_set(keep_set);
+                    } else {
+                        app.evict_final_pipeline_cache(fs_idx);
+                    }
+                    if let Some(other) = spread_other {
+                        app.maybe_start_local_adjust_render(other);
+                    }
+                    app.maybe_start_local_adjust_render(fs_idx);
+                    if let Some(keep_set) = continuous_keep_set.as_ref() {
+                        app.evict_adjustment_cache_for_keep_set(keep_set);
+                    } else {
+                        app.evict_adjustment_cache(fs_idx);
+                    }
+                    app.prefetch_final_ai(ctx, fs_idx);
+                }
+
+                app.keep_fullscreen_viewport_alive(ctx);
+                app.render_fullscreen_viewport(ctx);
+
+                if std::mem::take(&mut app.pending_return_to_parent) {
+                    app.close_fullscreen();
+                }
+
+                let detached_viewport_finalized = if app.fullscreen_idx.is_none()
+                    && let Some(viewport_id) = close_viewport_id
+                {
+                    app.finalize_closed_active_detached_viewport(ctx, viewport_id);
+                    true
+                } else {
+                    false
+                };
+                let should_drop = app.fullscreen_idx.is_none()
+                    && app.pdf_enumerate_pending.is_none()
+                    && app.zip_enumerate_pending.is_none()
+                    && !app.fs_viewport_shown;
+                if should_drop
+                    && !detached_viewport_finalized
+                    && let Some(viewport_id) = close_viewport_id
+                {
+                    app.finalize_closed_active_detached_viewport(ctx, viewport_id);
+                }
+                should_drop
+            })
+            .unwrap_or(false);
+
+        if should_drop {
+            self.active_detached_viewer_context = None;
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn rearm_final_ai_prefetch_after_detached_resume(&mut self) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let mut resume_targets = self.ai_prefetch_targets(fs_idx);
+        resume_targets.push(fs_idx);
+        resume_targets.sort_unstable();
+        resume_targets.dedup();
+        self.final_ai_failed
+            .retain(|key| !resume_targets.contains(&key.edit_key.idx));
+    }
+
+    #[cfg(windows)]
     fn detached_viewer_open_still_requested(&self, idx: usize) -> bool {
         self.viewer_item_supports_detached_still(idx)
             && (self.settings.detached_viewer_open_images_in_window
@@ -21045,8 +22464,7 @@ impl App {
     fn detached_still_open_is_independent(&self, idx: usize) -> bool {
         self.viewer_item_supports_detached_still(idx)
             && (self.settings.detached_viewer_open_images_in_window
-                || self.detached_viewer_pin_active
-                || self.detached_viewer_open_next_still_detached_once)
+                || self.detached_viewer_pin_active)
     }
 
     #[cfg(windows)]
@@ -21090,32 +22508,87 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn park_active_detached_image_window(&mut self, pinned: bool) -> bool {
-        let Some(idx) = self.fullscreen_idx else {
-            return false;
-        };
-        if !self.viewer_session_is_detached() || !self.viewer_item_supports_detached_still(idx) {
+    fn active_detached_viewer_current_placement(
+        &self,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        self.active_detached_viewer_live_placement
+            .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
+            .unwrap_or_else(|| self.detached_viewer_window_placement())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_passive_placement_update_looks_like_default_viewport(
+        previous: crate::settings::DetachedViewerWindowPlacement,
+        candidate: crate::settings::DetachedViewerWindowPlacement,
+        pixels_per_point: f32,
+        apply_initial_placement: bool,
+    ) -> bool {
+        if apply_initial_placement || previous.maximized || candidate.maximized {
             return false;
         }
-        let Some(texture) = self.resolve_fs_display_tex(idx, true) else {
+        let ppp = pixels_per_point.clamp(0.5, 4.0);
+        let default_w = candidate.w * ppp;
+        let default_h = candidate.h * ppp;
+        let near_default_800x600 =
+            (default_w - 800.0).abs() <= 40.0 && (default_h - 600.0).abs() <= 40.0;
+        if !near_default_800x600 {
             return false;
+        }
+        let shrank_hard = candidate.w < previous.w * 0.80 || candidate.h < previous.h * 0.80;
+        let moved_far =
+            (candidate.x - previous.x).abs() > 64.0 || (candidate.y - previous.y).abs() > 64.0;
+        let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
+        shrank_hard && moved_far && previous_was_substantial
+    }
+
+    #[cfg(windows)]
+    fn build_active_detached_image_window_snapshot(
+        &mut self,
+        ctx: Option<&egui::Context>,
+        pinned: bool,
+    ) -> Option<DetachedImageWindowSnapshot> {
+        let Some(idx) = self.fullscreen_idx else {
+            return None;
+        };
+        if !self.viewer_session_is_detached() || !self.viewer_item_supports_detached_still(idx) {
+            return None;
+        }
+        let Some(texture) = self.resolve_fs_display_tex(idx, true) else {
+            return None;
         };
         let texture_size = texture.size_vec2();
-        let placement = self.detached_viewer_window_placement();
-        let snapshot = DetachedImageWindowSnapshot {
-            id: self.next_detached_image_window_id,
+        let placement = self.active_detached_viewer_current_placement();
+        let frozen_continuous_pages = ctx
+            .map(|ctx| self.detached_continuous_frozen_pages_for_snapshot(ctx, idx, placement))
+            .unwrap_or_default();
+        let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
+        let id = self.ensure_detached_viewer_window_id();
+        Some(DetachedImageWindowSnapshot {
+            id,
             texture,
             title: self.detached_image_snapshot_title_for_idx(idx),
             location_display: self.detached_image_snapshot_location_for_idx(idx),
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
             pinned,
             rotation: self.get_rotation(idx),
+            zoom_pan: self.fs_zoom_pan(),
+            free_rotation: self.fs_free_rotation,
             placement,
-            source_item_key: self.metadata_cache_key(idx),
+            frozen_continuous_pages,
+            reopen_descriptor,
             activation_armed: false,
             focused_last_frame: false,
+            initial_placement_applied: false,
+            passive_host_hwnd: self.detached_viewer_host_hwnd_alive().unwrap_or(0),
+            paused_bundle: None,
+        })
+    }
+
+    #[cfg(windows)]
+    fn park_active_detached_image_window(&mut self, pinned: bool) -> bool {
+        let Some(snapshot) = self.build_active_detached_image_window_snapshot(None, pinned) else {
+            return false;
         };
-        self.next_detached_image_window_id = self.next_detached_image_window_id.wrapping_add(1);
         self.detached_image_windows.push(snapshot);
         true
     }
@@ -21140,6 +22613,9 @@ impl App {
             self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
         let parked = self.park_active_detached_image_window(pinned);
         self.detached_viewer_pin_active = false;
+        if parked {
+            self.detached_viewer_independent_active = false;
+        }
         self.detached_viewer_open_next_still_detached_once = false;
         parked
     }
@@ -21167,89 +22643,43 @@ impl App {
             && self.viewer_session_is_detached()
             && current_idx.is_some_and(|current| self.viewer_item_supports_detached_still(current))
             && (always_new || current_pinned);
-        let base_placement = self.detached_viewer_window_placement();
+        let base_placement = self.active_detached_viewer_current_placement();
         let parked = if should_park_active {
             self.park_active_detached_image_window(current_pinned && !always_new)
         } else {
             false
         };
+        if should_park_active {
+            self.detached_viewer_independent_active = false;
+        }
+        let mut should_recreate_active_viewport = false;
 
         if let Some(pos) = reusable_pos {
             let reusable = self.detached_image_windows.remove(pos);
+            self.detached_viewer_window_id = Some(reusable.id);
             self.settings.detached_viewer_window_placement = Some(reusable.placement);
             self.detached_viewer_open_next_still_detached_once = true;
+            should_recreate_active_viewport = true;
         } else if parked {
+            self.detached_viewer_window_id = Some(self.allocate_detached_viewer_window_id());
             self.settings.detached_viewer_window_placement =
                 Some(self.offset_detached_image_window_placement(base_placement));
             self.detached_viewer_open_next_still_detached_once = current_pinned && !always_new;
+            should_recreate_active_viewport = true;
         }
 
         if parked && (current_pinned || always_new) {
             self.detached_viewer_pin_active = false;
         }
-    }
-
-    #[cfg(windows)]
-    fn find_viewer_item_idx_by_metadata_key(&self, source_item_key: &str) -> Option<usize> {
-        self.items.iter().enumerate().find_map(|(idx, _)| {
-            self.metadata_cache_key(idx)
-                .filter(|key| key == source_item_key)
-                .map(|_| idx)
-        })
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn activate_detached_image_window_snapshot(
-        &mut self,
-        ctx: &egui::Context,
-        id: u64,
-    ) -> bool {
-        let Some(pos) = self
-            .detached_image_windows
-            .iter()
-            .position(|window| window.id == id)
-        else {
-            return false;
-        };
-        let Some(source_item_key) = self.detached_image_windows[pos].source_item_key.clone() else {
-            self.show_feedback_toast(
-                "この別ウィンドウは現在の一覧から再アクティブ化できません".to_string(),
+        if should_recreate_active_viewport
+            && self.fs_viewport_shown
+            && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
+        {
+            self.reset_active_detached_viewport_runtime_for_new_window(
+                self.fs_viewport_generation,
+                "prepare_detached_image_windows_for_open",
             );
-            return false;
-        };
-        let Some(idx) = self.find_viewer_item_idx_by_metadata_key(&source_item_key) else {
-            self.show_feedback_toast(
-                "この別ウィンドウの画像は現在の一覧に見つかりません".to_string(),
-            );
-            return false;
-        };
-
-        let snapshot = self.detached_image_windows.remove(pos);
-        let placement = snapshot.placement;
-        let snapshot_pinned = snapshot.pinned;
-
-        if self.fullscreen_idx.is_some() {
-            if self.fullscreen_idx != Some(idx)
-                && self.viewer_session_is_detached()
-                && self
-                    .fullscreen_idx
-                    .is_some_and(|current| self.viewer_item_supports_detached_still(current))
-            {
-                let _ = self.park_active_detached_image_window(true);
-            }
-            self.detached_viewer_independent_active = true;
-            self.close_fullscreen();
         }
-
-        self.settings.detached_viewer_window_placement = Some(placement);
-        self.detached_viewer_pin_active =
-            snapshot_pinned && !self.settings.detached_viewer_open_images_in_window;
-        self.detached_viewer_open_next_still_detached_once = true;
-        self.detached_viewer_no_activate_once = false;
-        self.detached_viewer_focus_requested = true;
-        self.open_fullscreen(idx);
-        ctx.request_repaint();
-        true
     }
 
     #[cfg(windows)]
@@ -21458,16 +22888,14 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn capture_detached_viewer_host_hwnd_from_logical_rect(
-        &mut self,
+    pub(crate) fn find_detached_viewer_host_hwnd_from_logical_rect(
+        main_hwnd: Option<isize>,
         outer_rect: egui::Rect,
         pixels_per_point: f32,
-    ) {
+    ) -> Option<u64> {
         use windows::Win32::Foundation::{HWND, RECT};
 
-        let Some(main_hwnd) = self.main_hwnd else {
-            return;
-        };
+        let main_hwnd = main_hwnd?;
         let scale = pixels_per_point.max(0.5);
         let expected = RECT {
             left: (outer_rect.min.x * scale).round() as i32,
@@ -21479,14 +22907,34 @@ impl App {
             HWND(main_hwnd as *mut _),
             expected,
         ) else {
-            return;
+            return None;
         };
         let hwnd_raw = hwnd.0 as usize as u64;
+        (hwnd_raw != 0).then_some(hwnd_raw)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn capture_detached_viewer_host_hwnd_from_logical_rect(
+        &mut self,
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        let hwnd_raw = Self::find_detached_viewer_host_hwnd_from_logical_rect(
+            self.main_hwnd,
+            outer_rect,
+            pixels_per_point,
+        )
+        .unwrap_or(0);
         if hwnd_raw != 0 && hwnd_raw != self.detached_viewer_host_hwnd {
+            let scale = pixels_per_point.max(0.5);
+            let left = (outer_rect.min.x * scale).round() as i32;
+            let top = (outer_rect.min.y * scale).round() as i32;
+            let right = (outer_rect.max.x * scale).round() as i32;
+            let bottom = (outer_rect.max.y * scale).round() as i32;
             crate::logger::log(format!(
                 "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} \
                  rect=({},{})-({},{}) ppp={scale:.2}",
-                expected.left, expected.top, expected.right, expected.bottom
+                left, top, right, bottom
             ));
             self.detached_viewer_host_hwnd = hwnd_raw;
         }
@@ -21812,6 +23260,7 @@ impl App {
             let mut placement = self.detached_viewer_window_placement();
             placement.maximized = true;
             self.settings.detached_viewer_window_placement = Some(placement);
+            self.active_detached_viewer_live_placement = Some(placement);
             return;
         }
         let size_rect = inner_rect.unwrap_or(outer_rect);
@@ -21833,14 +23282,15 @@ impl App {
         {
             return;
         }
-        self.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: outer_rect.min.x,
-                y: outer_rect.min.y,
-                w: size_rect.width(),
-                h: size_rect.height(),
-                maximized: false,
-            });
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: outer_rect.min.x,
+            y: outer_rect.min.y,
+            w: size_rect.width(),
+            h: size_rect.height(),
+            maximized: false,
+        };
+        self.settings.detached_viewer_window_placement = Some(placement);
+        self.active_detached_viewer_live_placement = Some(placement);
     }
 
     #[cfg(windows)]
@@ -21861,6 +23311,7 @@ impl App {
             let mut placement = self.detached_viewer_window_placement();
             placement.maximized = true;
             self.settings.detached_viewer_window_placement = Some(placement);
+            self.active_detached_viewer_live_placement = Some(placement);
             return;
         }
         let scale = self.last_pixels_per_point.max(0.5);
@@ -21875,6 +23326,7 @@ impl App {
             && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
         {
             self.settings.detached_viewer_window_placement = Some(placement);
+            self.active_detached_viewer_live_placement = Some(placement);
         }
     }
 
@@ -22014,6 +23466,11 @@ impl App {
         let focus_detached_from_grid = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.fs_open_intent_from_grid;
         self.viewer_presentation = presentation;
+        if matches!(presentation, ViewerPresentation::DetachedWindow) {
+            self.ensure_detached_viewer_window_id();
+        } else {
+            self.detached_viewer_window_id = None;
+        }
         self.detached_viewer_independent_active = independent_detached_still;
         if focus_detached_from_grid {
             self.detached_viewer_focus_requested = true;
@@ -22027,6 +23484,7 @@ impl App {
             self.detached_viewer_pin_active = false;
             self.detached_viewer_independent_active = false;
             self.detached_viewer_focus_requested = false;
+            self.active_detached_viewer_live_placement = None;
         }
         self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
         {
@@ -27680,9 +29138,12 @@ impl App {
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.last_viewer_sync_stamp = None;
         self.detached_viewer_focus_requested = false;
+        self.detached_viewer_recreate_on_next_render = false;
         self.detached_viewer_independent_active = false;
         self.detached_viewer_pin_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
+        self.detached_viewer_window_id = None;
+        self.active_detached_viewer_live_placement = None;
         self.fs_viewport_virtual_desktop_synced_hwnd = 0;
         self.clear_detached_viewer_borderless_fullscreen_state();
         self.vst3_deferred_video_open = None;
@@ -33218,9 +34679,36 @@ impl App {
         )))
     }
 
+    fn final_ai_result_key_job(result: &FinalAiResult) -> (FinalAiKey, u64) {
+        match result {
+            FinalAiResult::Ready { key, job_id, .. }
+            | FinalAiResult::Cancelled { key, job_id }
+            | FinalAiResult::Failed { key, job_id, .. } => (*key, *job_id),
+        }
+    }
+
+    fn should_defer_final_ai_result_for_detached_context(
+        &self,
+        key: FinalAiKey,
+        job_id: u64,
+    ) -> bool {
+        #[cfg(windows)]
+        {
+            if let Some(active) = self.active_detached_viewer_context.as_ref() {
+                return active
+                    .bundle
+                    .final_ai_pending
+                    .get(&key)
+                    .is_some_and(|pending| pending.job_id == job_id);
+            }
+        }
+        let _ = (key, job_id);
+        false
+    }
+
     pub(crate) fn poll_final_ai(&mut self, ctx: &egui::Context) {
         // 全 AI ジョブ共有の単一チャネルを drain する。
-        let mut completed = Vec::new();
+        let mut completed = std::mem::take(&mut self.final_ai_result_backlog);
         let mut disconnected = false;
         if let Some(rx) = self.final_ai_rx.as_ref() {
             loop {
@@ -33240,17 +34728,15 @@ impl App {
             crate::logger::log("[AI] final-ai worker disconnected; resetting queue".to_string());
             self.final_ai_pending.clear();
             self.retained_final_ai_orphans.clear();
+            self.final_ai_result_backlog.clear();
             self.ai_job_queue = None;
             self.final_ai_rx = None;
         }
 
         let mut repaint = false;
+        let mut deferred = Vec::new();
         for result in completed {
-            let (key, job_id) = match &result {
-                FinalAiResult::Ready { key, job_id, .. }
-                | FinalAiResult::Cancelled { key, job_id }
-                | FinalAiResult::Failed { key, job_id, .. } => (*key, *job_id),
-            };
+            let (key, job_id) = Self::final_ai_result_key_job(&result);
             // pending から既に除去済み (cancel_final_ai_for_idx / clear / evict 経由で
             // 取り消された) の結果は捨てる。retained orphan は job_id も一致したときだけ
             // 回収する。idx ベースの FinalAiKey がフォルダ遷移後に再利用されても、古い
@@ -33264,6 +34750,9 @@ impl App {
                 .get(&key)
                 .is_some_and(|orphan_job_id| *orphan_job_id == job_id);
             if !live_pending && !retained_orphan {
+                if self.should_defer_final_ai_result_for_detached_context(key, job_id) {
+                    deferred.push(result);
+                }
                 continue;
             }
             if live_pending {
@@ -33348,10 +34837,17 @@ impl App {
                 }
             }
         }
+        if !deferred.is_empty() {
+            self.final_ai_result_backlog.extend(deferred);
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         if repaint {
             ctx.request_repaint();
         }
-        if !self.final_ai_pending.is_empty() || !self.retained_final_ai_orphans.is_empty() {
+        if !self.final_ai_pending.is_empty()
+            || !self.retained_final_ai_orphans.is_empty()
+            || !self.final_ai_result_backlog.is_empty()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -38012,22 +39508,32 @@ impl eframe::App for App {
         // 細分計装: フルスクリーンビューポート関連の 3 段階を個別計測する
         // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
-        self.keep_fullscreen_viewport_alive(ctx);
+        #[cfg(windows)]
+        let active_detached_context_updated = self.update_active_detached_viewer_context(ctx);
+        #[cfg(not(windows))]
+        let active_detached_context_updated = false;
+        if !active_detached_context_updated {
+            self.keep_fullscreen_viewport_alive(ctx);
+        }
         let t_keep_fullscreen_viewport = frame_t0.elapsed();
         // in-window 静止画フルスクリーンは render_fullscreen_viewport が main ctx に
         // 直接 CentralPanel を描く。描画前に判定を控え、後段でグリッド描画を抑止する
         // (描画後だと handle_fs_navigation の close で fullscreen_idx が None になり
         //  判定が崩れるため、呼び出し直前にキャプチャする)。
         #[cfg(windows)]
-        let embedded_fs_active_before_render = self.fullscreen_embedded_still_active();
+        let embedded_fs_active_before_render =
+            !active_detached_context_updated && self.fullscreen_embedded_still_active();
         // PDF/ZIP enumerate defer または確認なしアーカイブ変換待ち中は
         // fullscreen_idx = None でも in-window 用 holdover を main ctx に描いているので、
         // 続くグリッド描画は同じく抑止する必要がある
         // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
         #[cfg(windows)]
-        let embedded_fs_pending =
-            self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
-        self.render_fullscreen_viewport(ctx);
+        let embedded_fs_pending = !active_detached_context_updated
+            && self.native_video_in_window_active
+            && self.fs_nav_deferred_reopen_wait_active();
+        if !active_detached_context_updated {
+            self.render_fullscreen_viewport(ctx);
+        }
         #[cfg(windows)]
         self.render_detached_image_windows(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();

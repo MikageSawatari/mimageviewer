@@ -3,6 +3,11 @@
 v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィンドウで表示する」機能の実装計画。
 元の要望と方針整理は [next-release-backlog.md §4.3](next-release-backlog.md#43-画像動画ビューアの別ウィンドウ化) を正とする。
 
+PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本一覧を親一覧のまま維持する本対応は、
+この初期計画の「メイン一覧と常に同期する 1 セッション」前提を超えるため、
+[detached-viewer-context-separation-plan.md](detached-viewer-context-separation-plan.md)
+を追加の設計方針として扱う。
+
 ## 1. 目的
 
 - 画像・動画を同じ操作モデルで別ウィンドウ表示できるようにする。
@@ -72,9 +77,12 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 - `detached_viewer_open_images_in_window`: 画像 / ZIP画像 / PDFページを開くたびに detached
   image window を増やす永続設定。動画は対象外で、動画 detached は `detached_viewer_enabled` に従う。
 - `detached_viewer_pin_active`: detached 画像 viewer の上バーで切り替える一時状態。ON の間は
-  次に画像を開くときも detached viewer を使い、メイン一覧との自動同期は止める。
+  現在の active viewer をメイン一覧との自動同期から切り離し、次に画像を開くときはその
+  active viewer を pinned passive window として残す。新しく開く active viewer は通常モードでは
+  メイン一覧と連動する。
 - `DetachedImageWindowSnapshot`: active detached viewer から退避した passive 画像ウィンドウ。
-  `TextureHandle` / 表示名 / 配置 / ピン状態だけを持ち、処理系の active session には参加しない。
+  `TextureHandle` / 表示名 / 配置 / ピン状態に加え、必要に応じて paused `ViewerContextBundle` を持つ。
+  active session として処理されるのは常に 1 window だけで、paused window は描画状態を保持して待機する。
 - `ViewerSession`: 現在開いている画像・動画ビューアのセッション。`×` / `Esc` などで終了する。
 - `ViewerPresentation`: 同じセッションをどこに表示しているか。
 
@@ -382,21 +390,42 @@ enum NativeVideoPlacement {
 - detached 静止画 session 中はメインウィンドウをブロックしない。メイン root に届いたキーは fullscreen root handler が横取りせず、グリッド側へ流す。
 - detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 中の F11 は仮想フルスクリーンをトグルし、ホバーバーの window/fullscreen トグルは非表示にする。
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
-- `detached_viewer_open_images_in_window` または `detached_viewer_pin_active` で開いた画像 / ZIP画像 /
-  PDFページ detached session はメイン一覧との自動同期を行わない。次の画像を開くとき、現在の
-  active detached viewer は passive `DetachedImageWindowSnapshot` として退避し、active viewer
-  cache / AI / 先読み / スライドショー / 編集機能は単一 active session にだけ紐づく。未ピン留め
-  passive window が残っている場合は、設定 OFF でも次の画像 open にその window の配置を再利用する。
+- `detached_viewer_open_images_in_window` で開いた画像 / ZIP画像 / PDFページ detached session と、
+  `detached_viewer_pin_active` が ON の現在の active viewer はメイン一覧との自動同期を行わない。
+  次の画像を開くとき、現在の active detached viewer は passive `DetachedImageWindowSnapshot` として
+  退避し、active viewer cache / AI / 先読み / スライドショー / 編集機能は単一 active session にだけ
+  紐づく。通常モードで pinned active viewer を退避した後に新しく開く active viewer は、メイン一覧
+  との連動状態に戻す。未ピン留め passive window が残っている場合は、設定 OFF でも次の画像 open に
+  その window の配置を再利用する。
   メイン一覧側の Backspace / フォルダ移動 / 再読込で active detached 画像 session を閉じる場合も、
   画像専用の毎回新規設定または active ピン留めが有効なら先に passive window へ退避する。毎回新規
-  設定が ON の間はピン UI を出さず、退避 window も未ピン留め扱いにする。
+  設定が ON の間はピン UI を出さず、退避 window も未ピン留め扱いにする。ただし ZIP/PDF の
+  L2 ページ一覧でメイン側 Backspace から親一覧へ戻る場合は、次画像 open ではなく仮想フォルダ
+  退出なので active detached viewer を passive 化せず閉じる。
+- ZIP/PDF の `auto_fullscreen_zip_pdf` は enumerate 完了後に遅れて `open_fullscreen` するため、
+  `DeferredFsReopen` に grid / CLI / SendTo の明示 open 由来かを保持し、detached viewer の
+  focus と「毎回新しいウィンドウ」判定へ渡す。Ctrl+↑↓ フォルダナビ由来の deferred reopen は
+  従来どおり focus を奪わず、always-new 判定にも grid open としては扱わない。
 - 独立 detached 静止画 session かどうかは、open 時の one-shot フラグではなく
-  `detached_viewer_independent_active` として session に保持する。これにより、ピン留め後に
-  次画像を開いたあとや passive window を再アクティブ化したあとも、ビューア側のページ送り・
-  スライドショー・編集・AI/先読み対象は active window だけに残り、メイン一覧との同期は復活しない。
-- passive `DetachedImageWindowSnapshot` は表示用 texture だけでなく元項目の metadata key と
-  focus/activation 状態を持つ。現在の `items` 内で同じ key を解決できる場合、クリックまたは
-  フォーカス復帰で active viewer として再オープンできる。解決できない場合は静止表示のまま残す。
+  `detached_viewer_independent_active` として session に保持する。これは現在の active viewer の状態であり、
+  pinned active viewer を passive window へ退避した時点で新しい active viewer へは引き継がない。
+  別の画像 window を明示操作でアクティブにしてから戻ってきても、この linked / independent 状態は
+  変えない。切り離しはピン留め操作でだけ発生する。
+- passive `DetachedImageWindowSnapshot` は表示用 texture / 表示名 / 配置 / ピン状態に加え、
+  paused `ViewerContextBundle` を持てる。active / passive は同じ stable `detached_viewer_window_id`
+  の viewport を使い、明示 pointer 操作で active viewer へ戻すときも passive viewport を閉じて
+  別 viewport を開き直さない。paused 中は先読み / AI / 編集 worker / slideshow を止めるが、表示中の 1 枚、
+  zoom / pan、現在ページ、ページ列は保持する。連結スクロール中は中央ページ 1 枚ではなく、
+  pause 時点で画面内に見えていたページ群の texture と正規化済み矩形を frozen snapshot として
+  保持し、passive window は worker を動かさずその frozen list を描く。
+- passive window の `ViewportBuilder` は初回生成時だけ placement を適用し、その後の位置 / サイズは
+  OS 側の live geometry を読み取って保存する。毎フレーム `with_position` / `with_inner_size` を
+  再適用して drag 中の窓と競合させない。
+- detached window close 後に active detached context が残らない場合は、main/root viewport へ
+  focus を 1 回だけ戻して、残存 passive window 間で OS focus が渡り歩く見た目のちらつきを抑える。
+- paused 化で止める final AI / 編集 / 消しゴム worker は pending entry を単に捨てず cancel flag を
+  立てる。final AI の結果チャネルは全 context 共有なので、main context が active detached viewer
+  宛ての結果を先に drain した場合は backlog に退避し、active context mount 時に回収する。
 - detached session が閉じている場合は、メイン一覧のカーソル移動だけでは再表示しない。
 - detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
 - 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native child HWND を作り直す。

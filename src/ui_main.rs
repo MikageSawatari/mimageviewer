@@ -9122,6 +9122,10 @@ impl App {
             if self.stack_try_open_from_grid(idx, true) {
                 return nav;
             }
+            #[cfg(windows)]
+            if self.open_grid_container_in_detached_book_context(ctx, idx) {
+                return nav;
+            }
             match self.items.get(idx) {
                 Some(GridItem::Folder(p)) => {
                     // Ctrl+G 絞り込みビューでは「ヒットを含む子フォルダ」を Folder として

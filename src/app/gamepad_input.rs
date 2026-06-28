@@ -1934,7 +1934,7 @@ impl App {
             }
             return None;
         }
-        self.handle_gamepad_grid_accept()
+        self.handle_gamepad_grid_accept(ctx)
     }
 
     fn handle_gamepad_back(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
@@ -4979,7 +4979,7 @@ impl App {
         }
     }
 
-    fn handle_gamepad_grid_accept(&mut self) -> Option<AddressBarNav> {
+    fn handle_gamepad_grid_accept(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         if self.folder_pane_blocks_grid_keyboard() {
             if let Some(FolderPaneCommand::Open(path)) = self
                 .folder_pane
@@ -5003,6 +5003,10 @@ impl App {
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
         if self.stack_try_open_from_grid(idx, false) {
+            return None;
+        }
+        #[cfg(windows)]
+        if self.open_grid_container_in_detached_book_context(ctx, idx) {
             return None;
         }
         let item = self.items.get(idx).cloned();

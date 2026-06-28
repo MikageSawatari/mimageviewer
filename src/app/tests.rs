@@ -7389,6 +7389,7 @@ mod favorite_adjustment_defaults_tests {
             resume_slideshow: false,
             target: None,
             resume_to_last_page: true,
+            from_explicit_open: true,
             preserve_after_password_prompt: true,
         });
         app.prepare_deferred_reopen_for_pdf_password_prompt();
@@ -7401,6 +7402,7 @@ mod favorite_adjustment_defaults_tests {
             resume_slideshow: false,
             target: None,
             resume_to_last_page: false,
+            from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
         app.prepare_deferred_reopen_for_pdf_password_prompt();
@@ -10665,6 +10667,7 @@ mod favorite_adjustment_defaults_tests {
             resume_slideshow: false,
             target: None,
             resume_to_last_page: false,
+            from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
 
@@ -11065,6 +11068,7 @@ mod favorite_adjustment_defaults_tests {
             resume_slideshow: false,
             target: None,
             resume_to_last_page: false,
+            from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
 
@@ -16309,6 +16313,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_pin_active = true;
+        app.detached_viewer_independent_active = true;
         app.fs_open_intent_from_grid = true;
 
         app.open_fullscreen(second);
@@ -16316,13 +16321,17 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(!app.detached_viewer_pin_active);
+        assert!(
+            !app.detached_viewer_independent_active,
+            "pinning should detach only the parked window; the follow-up active viewer stays linked to the grid"
+        );
         assert_eq!(app.detached_image_windows.len(), 1);
         assert!(app.detached_image_windows[0].pinned);
         assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
     }
 
     #[test]
-    fn pinned_followup_detached_image_remains_independent_after_one_shot_is_consumed() {
+    fn pinned_followup_detached_image_rejoins_grid_sync_after_one_shot_is_consumed() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let first = push_image(&mut app, r"C:\pics\a.jpg");
@@ -16339,22 +16348,26 @@ mod still_window_mode_key_tests {
         app.open_fullscreen(second);
 
         assert_eq!(app.fullscreen_idx, Some(second));
-        assert!(app.detached_viewer_independent_active);
+        assert!(!app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
 
         app.selected = Some(third);
         app.sync_detached_viewer_to_selected(&ctx);
 
-        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.fullscreen_idx, Some(third));
         assert_eq!(app.selected, Some(third));
 
         app.selected = Some(first);
-        app.open_fullscreen_from_fs_navigation(&ctx, third);
+        app.open_fullscreen_from_fs_navigation(&ctx, second);
 
-        assert_eq!(app.fullscreen_idx, Some(third));
+        assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(app.detached_viewer_independent_active);
-        assert_eq!(app.selected, Some(first));
+        assert!(!app.detached_viewer_independent_active);
+        assert_eq!(
+            app.selected,
+            Some(second),
+            "linked active viewer navigation should continue syncing back to the grid"
+        );
     }
 
     #[test]
@@ -16383,6 +16396,8 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
 
         app.open_fullscreen(second);
@@ -16391,6 +16406,10 @@ mod still_window_mode_key_tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(app.detached_image_windows.len(), 1);
         assert!(!app.detached_image_windows[0].pinned);
+        assert_eq!(app.detached_image_windows[0].id, 1);
+        assert_eq!(app.detached_viewer_window_id, Some(2));
+        assert!(!app.detached_viewer_recreate_on_next_render);
+        assert!(!app.fs_viewport_shown);
     }
 
     #[test]
@@ -16404,6 +16423,8 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_pin_active = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
 
         app.open_fullscreen(second);
@@ -16413,6 +16434,10 @@ mod still_window_mode_key_tests {
         assert!(!app.detached_viewer_pin_active);
         assert_eq!(app.detached_image_windows.len(), 1);
         assert!(!app.detached_image_windows[0].pinned);
+        assert_eq!(app.detached_image_windows[0].id, 1);
+        assert_eq!(app.detached_viewer_window_id, Some(2));
+        assert!(!app.detached_viewer_recreate_on_next_render);
+        assert!(!app.fs_viewport_shown);
     }
 
     #[test]
@@ -16468,7 +16493,6 @@ mod still_window_mode_key_tests {
         let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let texture = ctx.load_texture("passive_reuse", pixels, egui::TextureOptions::LINEAR);
         let placement = app.detached_viewer_window_placement();
-        let source_item_key = app.metadata_cache_key(first);
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
@@ -16478,10 +16502,16 @@ mod still_window_mode_key_tests {
                 image_dims: Some((1, 1)),
                 pinned: false,
                 rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
                 placement,
-                source_item_key,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
                 activation_armed: false,
                 focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0,
+                paused_bundle: None,
             });
         app.selected = Some(first);
         app.fs_open_intent_from_grid = true;
@@ -16491,50 +16521,863 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(app.detached_image_windows.is_empty());
+        assert_eq!(app.detached_viewer_window_id, Some(1));
+        assert!(app.detached_image_window_close_pending.is_empty());
     }
 
     #[test]
-    fn passive_detached_image_window_can_be_reactivated_as_independent_viewer() {
+    fn explicit_pdf_deferred_reopen_keeps_grid_open_intent_for_detached_viewer() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.items.push(GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 0,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.visible_indices = vec![0];
+
+        app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            resume_slideshow: false,
+            target: None,
+            resume_to_last_page: false,
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        });
+
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(
+            app.detached_viewer_focus_requested,
+            "explicit PDF auto-fullscreen should focus the detached viewer after async enumerate"
+        );
+        assert!(
+            app.detached_viewer_independent_active,
+            "always-new image window mode must still make the PDF page detached session independent"
+        );
+    }
+
+    #[test]
+    fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        insert_static_fs_entry(&mut app, &ctx, second, "reactivate_active_second");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\b.pdf")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
+        assert_eq!(app.address, r"C:\books");
+        assert_eq!(app.items.len(), 2);
+        assert!(matches!(app.items[0], GridItem::PdfFile(_)));
+        assert_eq!(app.selected, Some(0));
+        assert!(
+            app.pdf_enumerate_pending.is_none(),
+            "main context must not own the detached PDF enumerate pending"
+        );
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached PDF open should create an active viewer context");
+        assert!(
+            active.bundle.pdf_enumerate_pending.is_some(),
+            "PDF enumerate pending must move into the active detached context"
+        );
+        assert_eq!(app.items_generation, 0);
+        assert!(
+            active.bundle.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
+            "detached book context must use a generation range that main thumbnail polling cannot accept"
+        );
+        assert_eq!(
+            active.bundle.current_folder, None,
+            "without a PDF meta placeholder the active context should wait for enumerate without replacing main"
+        );
+        assert!(active.bundle.fs_nav_after_pdf_enumerate.is_some());
+    }
+
+    #[test]
+    fn detached_book_zip_open_keeps_main_grid_on_parent_list() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip")),
+            GridItem::ZipFile(PathBuf::from(r"C:\books\b.zip")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(1);
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
+
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
+        assert_eq!(app.address, r"C:\books");
+        assert_eq!(app.items.len(), 2);
+        assert!(matches!(app.items[1], GridItem::ZipFile(_)));
+        assert_eq!(app.selected, Some(1));
+        assert!(
+            app.zip_enumerate_pending.is_none(),
+            "main context must not own the detached ZIP enumerate pending"
+        );
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached ZIP open should create an active viewer context");
+        assert!(
+            active.bundle.zip_enumerate_pending.is_some(),
+            "ZIP enumerate pending must move into the active detached context"
+        );
+        assert_eq!(app.items_generation, 0);
+        assert!(
+            active.bundle.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
+            "detached book context must use a generation range that main thumbnail polling cannot accept"
+        );
+        assert_eq!(
+            active.bundle.current_folder,
+            Some(PathBuf::from(r"C:\books\b.zip"))
+        );
+        assert!(active.bundle.items.is_empty());
+        assert!(active.bundle.fs_nav_after_pdf_enumerate.is_some());
+    }
+
+    #[test]
+    fn detached_active_context_loading_does_not_persist_main_startup_history() {
+        let mut app = setup_app();
+        let parent = PathBuf::from(r"C:\books");
+        let pdf = parent.join("a.pdf");
+        app.current_folder = Some(parent.clone());
+        app.address = parent.to_string_lossy().to_string();
+        app.items = vec![GridItem::PdfFile(pdf.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.settings.last_folder = Some(parent.clone());
+        app.quick_folder_workspaces[QuickFolderSlotId::A.index()].target = Some(parent.clone());
+        app.quick_folder_workspaces[QuickFolderSlotId::A.index()].recent_folders =
+            vec![parent.clone()];
+        app.sync_quick_folder_settings();
+        let saved_last_folder = app.settings.last_folder.clone();
+        let saved_quick_slots = app.settings.quick_folder_slots.clone();
+        let saved_quick_recent = app.settings.quick_folder_recent_folders.clone();
+        let saved_nav_back = app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+            .history
+            .back_stack
+            .clone();
+
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: ViewerContextBundle::empty(),
+        });
+
+        let _ = app.with_active_detached_viewer_context(|mounted| {
+            mounted.current_folder = Some(parent.clone());
+            mounted.record_folder_nav_transition(&pdf);
+            mounted.start_loading_items(
+                pdf.clone(),
+                vec![GridItem::PdfPage {
+                    pdf_path: pdf.clone(),
+                    page_num: 0,
+                    content_type: None,
+                }],
+                vec![None],
+                HashSet::new(),
+                Vec::new(),
+                None,
+            );
+            assert_eq!(
+                mounted.current_folder,
+                Some(pdf.clone()),
+                "detached viewer context should still receive its PDF page list"
+            );
+        });
+
+        assert_eq!(
+            app.current_folder,
+            Some(parent.clone()),
+            "main grid context must remain on the parent book list"
+        );
+        assert_eq!(
+            app.settings.last_folder, saved_last_folder,
+            "detached page-list loads must not replace the startup restore target"
+        );
+        assert_eq!(app.settings.quick_folder_slots, saved_quick_slots);
+        assert_eq!(app.settings.quick_folder_recent_folders, saved_quick_recent);
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .history
+                .back_stack,
+            saved_nav_back,
+            "detached viewer navigation must not push entries into the main quick-folder back stack"
+        );
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached context should remain mounted as inactive bundle");
+        assert_eq!(active.bundle.current_folder, Some(pdf));
+    }
+
+    #[test]
+    fn detached_book_followup_open_uses_new_detached_window_id() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\b.pdf")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        let first_window_id = app
+            .active_detached_viewer_context
+            .as_ref()
+            .unwrap()
+            .bundle
+            .detached_viewer_window_id
+            .expect("first detached book context should have a window id");
+        let first_placement = app.detached_viewer_window_placement();
+
+        app.selected = Some(1);
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
+        let second_window_id = app
+            .active_detached_viewer_context
+            .as_ref()
+            .unwrap()
+            .bundle
+            .detached_viewer_window_id
+            .expect("second detached book context should have a window id");
+
+        assert_ne!(
+            first_window_id, second_window_id,
+            "each detached book active context must use a distinct fullscreen viewport id so opening a second book creates a new OS window"
+        );
+        assert!(second_window_id > first_window_id);
+        let second_placement = app.detached_viewer_window_placement();
+        assert_eq!(
+            second_placement,
+            app.offset_detached_image_window_placement(first_placement),
+            "follow-up detached book opens should be offset so the previous window remains discoverable"
+        );
+    }
+
+    #[test]
+    fn detached_book_active_context_mount_restores_main_after_fullscreen_open() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.address = r"C:\books\a.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 0,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            resume_slideshow: false,
+            target: None,
+            resume_to_last_page: false,
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        });
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        let _ = app.with_active_detached_viewer_context(|mounted| {
+            let deferred = mounted.fs_nav_after_pdf_enumerate.take().unwrap();
+            mounted.open_deferred_fullscreen_after_enumerate(deferred);
+        });
+
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
+        assert!(matches!(app.items[0], GridItem::PdfFile(_)));
+        assert_eq!(app.fullscreen_idx, None);
+
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert_eq!(active.bundle.fullscreen_idx, Some(0));
+        assert_eq!(
+            active.bundle.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert!(active.bundle.detached_viewer_independent_active);
+    }
+
+    #[test]
+    fn detached_book_second_open_parks_first_active_with_reopen_descriptor() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\b.pdf")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(1);
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.address = r"C:\books\a.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 3,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        insert_static_fs_entry(&mut app, &ctx, 0, "detached_book_first_pdf_page");
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
+
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
+        assert!(matches!(app.items[1], GridItem::PdfFile(_)));
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert!(matches!(
+            app.detached_image_windows[0].reopen_descriptor,
+            Some(ViewerContextDescriptor::Pdf {
+                ref path,
+                page_num: Some(3)
+            }) if path == &PathBuf::from(r"C:\books\a.pdf")
+        ));
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.pdf_enumerate_pending.is_some()),
+            "the second PDF should become the new active detached context"
+        );
+    }
+
+    #[test]
+    fn passive_detached_book_window_reactivation_reopens_descriptor_in_active_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\b.pdf")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+
         let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let texture = ctx.load_texture(
-            "reactivate_passive_first",
+            "passive_book_reactivate",
             pixels,
             egui::TextureOptions::LINEAR,
         );
         let placement = app.detached_viewer_window_placement();
-        let source_item_key = app.metadata_cache_key(first);
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
-                id: 7,
+                id: 42,
                 texture,
-                title: "a.jpg - mimageviewer".to_string(),
-                location_display: "a.jpg".to_string(),
+                title: "a.pdf - mimageviewer".to_string(),
+                location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
                 pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
                 placement,
-                source_item_key,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
+                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    page_num: Some(5),
+                }),
                 activation_armed: true,
                 focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0,
+                paused_bundle: None,
             });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 42));
+
+        assert!(app.detached_image_windows.is_empty());
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
+        assert!(matches!(app.items[0], GridItem::PdfFile(_)));
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert!(
+            active.bundle.pdf_enumerate_pending.is_some(),
+            "reactivation should re-enumerate in the active detached context"
+        );
+        let deferred = active.bundle.fs_nav_after_pdf_enumerate.as_ref().unwrap();
+        assert!(matches!(
+            deferred.target,
+            Some(crate::snapshot::SnapshotTarget::PdfPage {
+                ref pdf_path,
+                page_num: 5
+            }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
+        ));
+        assert!(
+            active.bundle.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
+            "reactivated active context must stay in the detached generation range"
+        );
+    }
+
+    #[test]
+    fn reactivating_passive_detached_book_preserves_current_active_window_placement() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\b.pdf")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+
+        let second_placement = app.detached_viewer_window_placement();
+        let mut main_context = app.take_current_viewer_context_bundle();
+        app.current_folder = Some(PathBuf::from(r"C:\books\b.pdf"));
+        app.address = r"C:\books\b.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\b.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        insert_static_fs_entry(&mut app, &ctx, 0, "detached_book_second_pdf_page");
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        let first_pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let first_texture = ctx.load_texture(
+            "passive_book_reactivate_placement",
+            first_pixels,
+            egui::TextureOptions::LINEAR,
+        );
+        let first_placement = crate::settings::DetachedViewerWindowPlacement {
+            x: second_placement.x + 120.0,
+            y: second_placement.y + 80.0,
+            w: second_placement.w,
+            h: second_placement.h,
+            maximized: false,
+        };
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 42,
+                texture: first_texture,
+                title: "a.pdf - mimageviewer".to_string(),
+                location_display: "a.pdf".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement: first_placement,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
+                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    page_num: Some(5),
+                }),
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0,
+                paused_bundle: None,
+            });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 42));
+
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(first_placement),
+            "reactivated window should open at its own saved placement"
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(
+            app.detached_image_windows[0].placement, second_placement,
+            "parking the previously active window must not inherit the reactivated window placement"
+        );
+        assert!(matches!(
+            app.detached_image_windows[0].reopen_descriptor,
+            Some(ViewerContextDescriptor::Pdf {
+                ref path,
+                page_num: Some(7)
+            }) if path == &PathBuf::from(r"C:\books\b.pdf")
+        ));
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        let deferred = active.bundle.fs_nav_after_pdf_enumerate.as_ref().unwrap();
+        assert!(matches!(
+            deferred.target,
+            Some(crate::snapshot::SnapshotTarget::PdfPage {
+                ref pdf_path,
+                page_num: 5
+            }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
+        ));
+    }
+
+    #[test]
+    fn reactivating_paused_detached_book_reuses_bundle_without_reenumerating() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.address = r"C:\books".to_string();
+        app.items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\books\b.pdf")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.address = r"C:\books\a.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 5,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(10);
+        app.fs_viewport_generation = 101;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_zoom = 2.25;
+        app.fs_pan = egui::vec2(30.0, -12.0);
+        insert_static_fs_entry(&mut app, &ctx, 0, "paused_book_a_page");
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        assert!(app.pause_current_active_detached_viewer_context(&ctx));
+        assert!(app.active_detached_viewer_context.is_none());
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 10);
+        assert_eq!(
+            app.detached_image_windows[0].zoom_pan,
+            Some((2.25, egui::vec2(30.0, -12.0)))
+        );
+        assert!(
+            app.detached_image_windows[0].paused_bundle.is_some(),
+            "paused detached windows should retain their viewer context"
+        );
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        app.current_folder = Some(PathBuf::from(r"C:\books\b.pdf"));
+        app.address = r"C:\books\b.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\b.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(20);
+        app.fs_viewport_generation = 202;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.detached_viewer_host_hwnd = 0x1234;
+        app.fs_viewport_recreate_after_hide = true;
+        app.detached_viewer_recreate_on_next_render = true;
+        insert_static_fs_entry(&mut app, &ctx, 0, "paused_book_b_page");
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 10));
+
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(
+            app.detached_image_windows[0].id, 20,
+            "the previously active window should be paused, not closed"
+        );
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert_eq!(active.bundle.detached_viewer_window_id, Some(10));
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.fs_viewport_presentation,
+            Some(ViewerPresentation::DetachedWindow)
+        );
+        assert_eq!(
+            app.detached_viewer_host_hwnd, 0,
+            "reactivation must not restore a stale HWND from the paused bundle"
+        );
+        assert!(
+            !app.detached_viewer_host_lost(),
+            "host_lost_before_render should not trigger before the active viewport recaptures its live HWND"
+        );
+        assert!(!app.fs_viewport_recreate_after_hide);
+        assert!(!app.detached_viewer_recreate_on_next_render);
+        assert!(app.detached_viewer_focus_requested);
+        assert_eq!(
+            active.bundle.current_folder,
+            Some(PathBuf::from(r"C:\books\a.pdf"))
+        );
+        assert_eq!(active.bundle.fullscreen_idx, Some(0));
+        assert_eq!(active.bundle.fs_zoom, 2.25);
+        assert_eq!(active.bundle.fs_pan, egui::vec2(30.0, -12.0));
+        assert!(
+            active.bundle.pdf_enumerate_pending.is_none()
+                && active.bundle.zip_enumerate_pending.is_none()
+                && active.bundle.fs_nav_after_pdf_enumerate.is_none(),
+            "reactivating a paused bundle must not restart PDF/ZIP enumeration"
+        );
+    }
+
+    #[test]
+    fn paused_continuous_detached_window_keeps_visible_page_snapshot() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(10);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            });
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        let third = push_image(&mut app, r"C:\pics\c.jpg");
+        for (idx, label) in [
+            (first, "continuous_a"),
+            (second, "continuous_b"),
+            (third, "continuous_c"),
+        ] {
+            insert_static_fs_entry(&mut app, &ctx, idx, label);
+        }
         app.fullscreen_idx = Some(second);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .expect("continuous detached viewer should build a snapshot");
+
+        assert!(
+            snapshot.frozen_continuous_pages.len() >= 2,
+            "continuous passive windows must keep the visible page range, not only the center page"
+        );
+    }
+
+    #[test]
+    fn pausing_detached_context_cancels_final_ai_pending() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(10);
+        insert_static_fs_entry(&mut app, &ctx, idx, "pause_cancel_ai_page");
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.final_ai_pending.insert(
+            key,
+            FinalAiPending {
+                job_id: 7,
+                cancel: Arc::clone(&cancel),
+                retained_key: None,
+                retained_epoch: 0,
+                allow_retained_orphan: false,
+                cancel_on_drop: true,
+            },
+        );
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        assert!(app.pause_current_active_detached_viewer_context(&ctx));
+
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "pausing a detached context must cancel final AI workers instead of orphaning them"
+        );
+        let paused = app.detached_image_windows[0]
+            .paused_bundle
+            .as_ref()
+            .unwrap();
+        assert!(paused.final_ai_pending.is_empty());
+    }
+
+    #[test]
+    fn final_ai_results_deferred_until_detached_context_is_mounted() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.final_ai_rx = Some(rx);
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: 0,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        let mut bundle = ViewerContextBundle::empty();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        bundle.final_ai_pending.insert(
+            key,
+            FinalAiPending {
+                job_id: 99,
+                cancel,
+                retained_key: None,
+                retained_epoch: 0,
+                allow_retained_orphan: false,
+                cancel_on_drop: true,
+            },
+        );
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        tx.send(FinalAiResult::Ready {
+            job_id: 99,
+            key,
+            retained_key: None,
+            retained_epoch: 0,
+            source_size: [1, 1],
+            image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            used_upscale: false,
+        })
+        .unwrap();
+
+        app.poll_final_ai(&ctx);
+
+        assert_eq!(app.final_ai_result_backlog.len(), 1);
+        assert!(!app.final_ai_cache.contains_key(&key));
+
+        let _ = app.with_active_detached_viewer_context(|mounted| {
+            mounted.poll_final_ai(&ctx);
+            assert!(mounted.final_ai_cache.contains_key(&key));
+            assert!(!mounted.final_ai_pending.contains_key(&key));
+        });
+        assert!(app.final_ai_result_backlog.is_empty());
+    }
+
+    #[test]
+    fn active_detached_book_context_counts_as_detached_lifecycle() {
+        let mut app = setup_app();
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: ViewerContextBundle::empty(),
+        });
+
+        assert!(app.viewer_session_is_detached_or_switching());
+        assert!(!app.viewer_session_blocks_main_window());
+    }
+
+    #[test]
+    fn virtual_page_list_parent_nav_closes_active_detached_without_passive_snapshot() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.items.push(GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 0,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
 
-        assert!(app.activate_detached_image_window_snapshot(&ctx, 7));
+        app.close_detached_viewer_for_virtual_page_list_parent_nav();
 
-        assert_eq!(app.fullscreen_idx, Some(first));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(app.detached_viewer_independent_active);
-        assert!(app.detached_viewer_pin_active);
-        assert_eq!(app.detached_image_windows.len(), 1);
-        assert_eq!(app.detached_image_windows[0].location_display, "b.jpg");
-        assert!(app.detached_image_windows[0].pinned);
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "Backspace from a PDF/ZIP page list is parent navigation, not a request to park the active viewer"
+        );
+        assert!(!app.detached_viewer_independent_active);
     }
 
     #[test]
@@ -16676,6 +17519,45 @@ mod still_window_mode_key_tests {
         assert!(
             should_defer_main_paint_for_font_atlas_resync("native_video_backdrop_hide"),
             "native fullscreen backdrop cleanup keeps the conservative font-atlas reset path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn finalized_active_detached_close_skips_hidden_cleanup_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_viewport_recreate_after_hide = true;
+        app.detached_viewer_host_hwnd = 0x1234;
+
+        app.finalize_closed_active_detached_viewport(
+            &ctx,
+            App::detached_image_window_viewport_id(42),
+        );
+
+        assert!(
+            !app.fs_viewport_shown,
+            "active detached close must not leave the normal hidden-viewport cleanup armed"
+        );
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert!(!app.fs_viewport_recreate_after_hide);
+        assert_eq!(app.detached_viewer_host_hwnd, 0);
+        assert!(app.main_font_atlas_resync_pending);
+        assert_eq!(
+            app.main_font_atlas_resync_reason,
+            Some(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)
+        );
+        assert!(
+            app.detached_image_window_focus_activation_suppressed(std::time::Instant::now()),
+            "OS focus handoff after close must not immediately reactivate another detached window"
+        );
+        assert!(
+            !app.detached_image_window_focus_activation_suppressed(
+                std::time::Instant::now() + std::time::Duration::from_secs(1)
+            ),
+            "the focus handoff guard is only a short close-time grace"
         );
     }
 
@@ -17027,6 +17909,91 @@ mod still_window_mode_key_tests {
         assert_eq!(placement.w, 640.0);
         assert_eq!(placement.h, 360.0);
         assert!(!placement.maximized);
+    }
+
+    #[test]
+    fn detached_active_snapshot_uses_live_viewport_placement() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        insert_static_fs_entry(&mut app, &ctx, idx, "live_placement_snapshot");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(9);
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            });
+        let live_placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 420.0,
+            y: 160.0,
+            w: 1280.0,
+            h: 840.0,
+            maximized: false,
+        };
+        app.active_detached_viewer_live_placement = Some(live_placement);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .expect("detached still snapshot should be built");
+
+        assert_eq!(
+            snapshot.placement, live_placement,
+            "pause/snapshot must preserve the active viewport's live placement, not the shared setting seed"
+        );
+    }
+
+    #[test]
+    fn passive_default_viewport_geometry_update_is_rejected() {
+        let previous = crate::settings::DetachedViewerWindowPlacement {
+            x: 502.0,
+            y: 138.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        let default_candidate = crate::settings::DetachedViewerWindowPlacement {
+            x: 152.0,
+            y: 152.0,
+            w: 533.3333,
+            h: 400.0,
+            maximized: false,
+        };
+        assert!(
+            App::detached_passive_placement_update_looks_like_default_viewport(
+                previous,
+                default_candidate,
+                1.5,
+                false,
+            )
+        );
+        assert!(
+            !App::detached_passive_placement_update_looks_like_default_viewport(
+                previous,
+                default_candidate,
+                1.5,
+                true,
+            )
+        );
+        let moved_without_default_size = crate::settings::DetachedViewerWindowPlacement {
+            x: 152.0,
+            y: 152.0,
+            w: 900.0,
+            h: 700.0,
+            maximized: false,
+        };
+        assert!(
+            !App::detached_passive_placement_update_looks_like_default_viewport(
+                previous,
+                moved_without_default_size,
+                1.5,
+                false,
+            )
+        );
     }
 
     #[test]

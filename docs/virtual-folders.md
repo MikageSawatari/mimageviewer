@@ -252,6 +252,9 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate` (`DeferredFsReopen`) に
   載せ替える。Ctrl+↑↓ フォルダナビと同じ consume 経路 (`finalize_zip_enumerate` /
   `poll_pdf_enumerate`) で `find_fullscreen_nav_target_filtered` が先頭ページを開く。
+  `DeferredFsReopen` は明示 open 由来かどうかも保持し、detached viewer では enumerate
+  完了後の window focus と「毎回新しいウィンドウ」判定へ渡す。Ctrl+↑↓ 由来の reopen は
+  focus を奪わない。
 - 通常フォルダは enumerate 待ちが無いので、`load_folder_with_scan` が既存の走査結果から
   画像のみ判定を行い、`book_open_resume` に従って保存済みページまたは先頭画像を開く。
 - パスワード付き PDF では、grid / 起動パス / SendTo 由来の明示オープン予約だけを
@@ -280,6 +283,8 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
     → L2 ページ一覧 (`FsKeyAction.close_to_page_list` → `close_fullscreen`。`current_folder` が
     コンテナ/通常フォルダのまま閉じるので L2 が出る)。
   - L2 ページ一覧 → L1 (通常の grid BS = 親フォルダ)。
+    detached viewer が開いている場合でも、この BS は仮想フォルダ退出なので active viewer を
+    passive snapshot として残さず閉じる。
   - 設定Bのまま L2 ページ一覧から再度 Enter/ダブルクリックでページ表示した場合も、
     Esc/Enter/右クリックは設定どおり L1 へ直帰する (「直接オープン由来」フラグは持たない)。
 - **Ctrl+↑↓ フォルダナビで ZIP/PDF/変換アーカイブコンテナへ移っても**、退出は同じく設定で決まる
