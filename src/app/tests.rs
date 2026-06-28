@@ -17388,6 +17388,45 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn active_detached_context_uses_its_own_analysis_mode_state() {
+        let mut app = setup_app();
+        app.analysis_mode = true;
+        app.analysis_grayscale = true;
+        app.analysis_filter_mag = 5;
+        app.analysis_pinned_color = Some([1, 2, 3, 255]);
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.analysis_mode = false;
+        bundle.analysis_grayscale = false;
+        bundle.analysis_filter_mag = 0;
+        bundle.analysis_pinned_color = None;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        let _ = app.with_active_detached_viewer_context(|mounted| {
+            assert!(
+                !mounted.analysis_mode,
+                "a detached window must not inherit analysis mode from another viewer context"
+            );
+            assert!(!mounted.analysis_grayscale);
+            assert_eq!(mounted.analysis_filter_mag, 0);
+            assert_eq!(mounted.analysis_pinned_color, None);
+
+            mounted.analysis_mode = true;
+            mounted.analysis_grayscale = true;
+            mounted.analysis_filter_mag = 10;
+            mounted.analysis_pinned_color = Some([9, 8, 7, 255]);
+        });
+
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert!(active.bundle.analysis_mode);
+        assert!(active.bundle.analysis_grayscale);
+        assert_eq!(active.bundle.analysis_filter_mag, 10);
+        assert_eq!(active.bundle.analysis_pinned_color, Some([9, 8, 7, 255]));
+        assert!(app.analysis_mode);
+        assert_eq!(app.analysis_filter_mag, 5);
+    }
+
+    #[test]
     fn virtual_page_list_parent_nav_closes_active_detached_without_passive_snapshot() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -17912,7 +17951,7 @@ mod still_window_mode_key_tests {
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
 
-        app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), false);
+        app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false);
 
         let placement = app
             .settings
@@ -17923,6 +17962,33 @@ mod still_window_mode_key_tests {
         assert_eq!(placement.w, 860.0);
         assert_eq!(placement.h, 640.0);
         assert!(!placement.maximized);
+    }
+
+    #[test]
+    fn active_detached_default_viewport_geometry_update_is_rejected_after_open() {
+        let mut app = setup_app();
+        let previous = crate::settings::DetachedViewerWindowPlacement {
+            x: 420.0,
+            y: 160.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fullscreen_idx = Some(0);
+        app.fs_opened_at = Some(std::time::Instant::now());
+        app.settings.detached_viewer_window_placement = Some(previous);
+        app.active_detached_viewer_live_placement = Some(previous);
+
+        let default_outer =
+            egui::Rect::from_min_size(egui::pos2(420.0, 160.0), egui::vec2(533.0, 400.0));
+        app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(previous)
+        );
+        assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
     }
 
     #[test]

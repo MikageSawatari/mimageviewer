@@ -299,6 +299,13 @@ struct ViewerContextBundle {
     detached_viewer_window_id: Option<u64>,
     panorama_state: Option<crate::panorama::PanoramaState>,
     pano_toast_shown_for_current_fs: bool,
+    analysis_mode: bool,
+    analysis_hover_color: Option<[u8; 4]>,
+    analysis_pinned_color: Option<[u8; 4]>,
+    analysis_grayscale: bool,
+    analysis_mosaic_grid: bool,
+    analysis_filter_mag: u8,
+    analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
     fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
@@ -333,6 +340,16 @@ struct ViewerContextBundle {
     analysis_zoom: f32,
     analysis_pan: egui::Vec2,
     analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    analysis_overlay_cache: Option<(
+        egui::TextureHandle,
+        u8,
+        Option<[u8; 4]>,
+        f32,
+        egui::Vec2,
+        usize,
+    )>,
+    analysis_hist_cache: Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
+    analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
     spread_mode: crate::settings::SpreadMode,
     spread_shift_anchor_idx: Option<usize>,
     reading_flow: crate::settings::ReadingFlow,
@@ -448,6 +465,13 @@ impl ViewerContextBundle {
             detached_viewer_window_id: None,
             panorama_state: None,
             pano_toast_shown_for_current_fs: false,
+            analysis_mode: false,
+            analysis_hover_color: None,
+            analysis_pinned_color: None,
+            analysis_grayscale: false,
+            analysis_mosaic_grid: false,
+            analysis_filter_mag: 0,
+            analysis_guide_drag: None,
             fs_cache: std::collections::HashMap::new(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
@@ -481,6 +505,9 @@ impl ViewerContextBundle {
             analysis_zoom: 1.0,
             analysis_pan: egui::Vec2::ZERO,
             analysis_pan_drag_start: None,
+            analysis_overlay_cache: None,
+            analysis_hist_cache: None,
+            analysis_sv_cache: None,
             spread_mode: crate::settings::SpreadMode::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
@@ -7879,6 +7906,13 @@ impl App {
             detached_viewer_window_id,
             panorama_state,
             pano_toast_shown_for_current_fs,
+            analysis_mode,
+            analysis_hover_color,
+            analysis_pinned_color,
+            analysis_grayscale,
+            analysis_mosaic_grid,
+            analysis_filter_mag,
+            analysis_guide_drag,
             fs_cache,
             fs_margin_bbox_cache,
             input_generation,
@@ -7912,6 +7946,9 @@ impl App {
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,
+            analysis_overlay_cache,
+            analysis_hist_cache,
+            analysis_sv_cache,
             spread_mode,
             spread_shift_anchor_idx,
             reading_flow,
@@ -8014,6 +8051,13 @@ impl App {
         swap_field!(detached_viewer_window_id);
         swap_field!(panorama_state);
         swap_field!(pano_toast_shown_for_current_fs);
+        swap_field!(analysis_mode);
+        swap_field!(analysis_hover_color);
+        swap_field!(analysis_pinned_color);
+        swap_field!(analysis_grayscale);
+        swap_field!(analysis_mosaic_grid);
+        swap_field!(analysis_filter_mag);
+        swap_field!(analysis_guide_drag);
         swap_field!(fs_cache);
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
@@ -8047,6 +8091,9 @@ impl App {
         swap_field!(analysis_zoom);
         swap_field!(analysis_pan);
         swap_field!(analysis_pan_drag_start);
+        swap_field!(analysis_overlay_cache);
+        swap_field!(analysis_hist_cache);
+        swap_field!(analysis_sv_cache);
         swap_field!(spread_mode);
         swap_field!(spread_shift_anchor_idx);
         swap_field!(reading_flow);
@@ -22516,7 +22563,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn active_detached_viewer_current_placement(
+    pub(crate) fn active_detached_viewer_current_placement(
         &self,
     ) -> crate::settings::DetachedViewerWindowPlacement {
         self.active_detached_viewer_live_placement
@@ -22547,6 +22594,28 @@ impl App {
             (candidate.x - previous.x).abs() > 64.0 || (candidate.y - previous.y).abs() > 64.0;
         let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
         shrank_hard && moved_far && previous_was_substantial
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_active_placement_update_looks_like_default_viewport(
+        previous: crate::settings::DetachedViewerWindowPlacement,
+        candidate: crate::settings::DetachedViewerWindowPlacement,
+        pixels_per_point: f32,
+    ) -> bool {
+        if previous.maximized || candidate.maximized {
+            return false;
+        }
+        let ppp = pixels_per_point.clamp(0.5, 4.0);
+        let default_w = candidate.w * ppp;
+        let default_h = candidate.h * ppp;
+        let near_default_800x600 =
+            (default_w - 800.0).abs() <= 40.0 && (default_h - 600.0).abs() <= 40.0;
+        if !near_default_800x600 {
+            return false;
+        }
+        let shrank_hard = candidate.w < previous.w * 0.80 || candidate.h < previous.h * 0.80;
+        let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
+        shrank_hard && previous_was_substantial
     }
 
     #[cfg(windows)]
@@ -23257,6 +23326,7 @@ impl App {
         &mut self,
         outer_rect: egui::Rect,
         inner_rect: Option<egui::Rect>,
+        pixels_per_point: f32,
         maximized: bool,
     ) {
         if self.detached_viewer_borderless_fullscreen
@@ -23297,6 +23367,34 @@ impl App {
             h: size_rect.height(),
             maximized: false,
         };
+        if self.viewer_session_is_detached() {
+            let previous = self
+                .active_detached_viewer_live_placement
+                .or(self.settings.detached_viewer_window_placement)
+                .filter(|p| {
+                    p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w)
+                });
+            let recently_opened_or_switched = self
+                .fs_opened_at
+                .map(|opened_at| opened_at.elapsed() <= std::time::Duration::from_millis(1500))
+                .unwrap_or(false);
+            if recently_opened_or_switched
+                && let Some(previous) = previous
+                && Self::detached_active_placement_update_looks_like_default_viewport(
+                    previous,
+                    placement,
+                    pixels_per_point,
+                )
+            {
+                self.log_detached_image_window_debug(format!(
+                    "active_placement_update_rejected_default previous={previous:?} \
+                     candidate={placement:?} ppp={pixels_per_point:.3}"
+                ));
+                self.settings.detached_viewer_window_placement = Some(previous);
+                self.active_detached_viewer_live_placement = Some(previous);
+                return;
+            }
+        }
         self.settings.detached_viewer_window_placement = Some(placement);
         self.active_detached_viewer_live_placement = Some(placement);
     }

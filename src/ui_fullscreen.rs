@@ -3566,6 +3566,7 @@ impl App {
                 .iter()
                 .any(|candidate| candidate.id == window.id && candidate.can_activate());
             let focus_activation_raw = focused_now && !window.focused_last_frame;
+            let focus_activation = focus_activation_raw && !focus_activation_suppressed;
             let user_activation = pointer_activation && !focus_activation_suppressed;
             let focus_edge = focused_now != window.focused_last_frame;
             if (viewport_close_requested
@@ -3604,12 +3605,15 @@ impl App {
                     window.reopen_descriptor.is_some()
                 ));
             }
-            if can_activate && window.activation_armed && focus_activation_raw && !user_activation {
+            if can_activate
+                && window.activation_armed
+                && focus_activation_raw
+                && focus_activation_suppressed
+            {
                 self.log_detached_image_window_debug(format!(
-                    "passive_focus_activation_ignored id={} suppressed={} passive_windows={} \
+                    "passive_focus_activation_suppressed id={} passive_windows={} \
                      active_context={}",
                     window.id,
-                    focus_activation_suppressed,
                     self.detached_image_windows.len(),
                     self.active_detached_viewer_context_present()
                 ));
@@ -3634,10 +3638,11 @@ impl App {
                     self.active_detached_viewer_context_present()
                 ));
             }
-            if can_activate && window.activation_armed && user_activation {
+            if can_activate && window.activation_armed && (focus_activation || user_activation) {
                 self.log_detached_image_window_debug(format!(
-                    "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
+                    "passive_activate_queued id={} via={} passive_windows={} active_context={}",
                     window.id,
+                    if focus_activation { "focus" } else { "pointer" },
                     self.detached_image_windows.len(),
                     self.active_detached_viewer_context_present()
                 ));
@@ -4756,7 +4761,10 @@ impl App {
                         });
                     if !minimized && let Some(rect) = outer_rect {
                         self.save_detached_viewer_placement_from_logical_rect(
-                            rect, inner_rect, maximized,
+                            rect,
+                            inner_rect,
+                            pixels_per_point,
+                            maximized,
                         );
                         // New viewports are created hidden, so same-frame HWND matching can
                         // grab the previous generation that is about to be destroyed.
@@ -6634,7 +6642,7 @@ impl App {
                     .with_position(rect.min)
                     .with_maximized(false);
             } else {
-                let placement = self.detached_viewer_window_placement();
+                let placement = self.active_detached_viewer_current_placement();
                 builder = builder
                     .with_inner_size([placement.w, placement.h])
                     .with_position(egui::pos2(placement.x, placement.y))
@@ -7571,11 +7579,11 @@ impl App {
         let key_s = self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
         let key_r = self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
         let key_l = self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
-        let key_z = self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
+        let key_z_raw = self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
         // V: 360 度パノラマビューワーモード トグル (docs/panorama-360-view-plan.md)。
         // 消しゴムモード中は ui_erase 側が V (vertical line tool) を先に consume するので、
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
-        let key_v_panorama = self.keymap.consume_action(ctx, KeyAction::FsPanorama);
+        let key_v_panorama_raw = self.keymap.consume_action(ctx, KeyAction::FsPanorama);
         let key_g = self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
         let key_m = self
             .keymap
@@ -7589,7 +7597,7 @@ impl App {
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
         let pano_active_now = self.is_panorama_mode_active(fs_idx);
         let continuous_reading = !self.reading_flow.is_paged();
-        let key_z = key_z && !pano_active_now;
+        let key_z = key_z_raw && !pano_active_now;
         let key_s = key_s && !pano_active_now;
         let key_e = key_e && !pano_active_now;
         let key_m = key_m && !pano_active_now;
@@ -7602,7 +7610,65 @@ impl App {
         let key_compare_c = key_compare_c && !pano_active_now;
         let key_z = key_z && !continuous_reading;
         let key_e = key_e && !continuous_reading;
-        let key_v_panorama = key_v_panorama && !continuous_reading;
+        let key_v_panorama = key_v_panorama_raw && !continuous_reading;
+        #[cfg(windows)]
+        if Self::detached_image_window_debug_enabled()
+            && self.viewer_session_is_detached_or_switching()
+        {
+            let (focused, event_count, key_v_event, key_z_event, key_pressed_count) =
+                ctx.input(|i| {
+                    let mut key_v_event = false;
+                    let mut key_z_event = false;
+                    let mut key_pressed_count = 0usize;
+                    for event in &i.events {
+                        if let egui::Event::Key { key, pressed, .. } = event
+                            && *pressed
+                        {
+                            key_pressed_count += 1;
+                            key_v_event |= *key == egui::Key::V;
+                            key_z_event |= *key == egui::Key::Z;
+                        }
+                    }
+                    (
+                        i.viewport().focused.unwrap_or(false),
+                        i.events.len(),
+                        key_v_event,
+                        key_z_event,
+                        key_pressed_count,
+                    )
+                });
+            if key_v_panorama_raw
+                || key_z_raw
+                || key_v_event
+                || key_z_event
+                || key_pressed_count > 0
+            {
+                self.log_detached_image_window_debug(format!(
+                    "fs_key_input fs_idx={} window_id={:?} focused={} foreground=0x{:x} \
+                     host={} active_context={} events={} pressed_keys={} key_v_event={} \
+                     key_z_event={} key_v_raw={} key_z_raw={} key_v_final={} key_z_final={} \
+                     pano_active={} continuous={} spread_double={} detect_pano={}",
+                    fs_idx,
+                    self.detached_viewer_window_id,
+                    focused,
+                    current_foreground_hwnd(),
+                    self.detached_viewer_host_debug_state(),
+                    self.active_detached_viewer_context_present(),
+                    event_count,
+                    key_pressed_count,
+                    key_v_event,
+                    key_z_event,
+                    key_v_panorama_raw,
+                    key_z_raw,
+                    key_v_panorama,
+                    key_z,
+                    pano_active_now,
+                    continuous_reading,
+                    is_spread_double,
+                    self.detect_panorama(fs_idx).is_some()
+                ));
+            }
+        }
         let key_compare_x = key_compare_x && !continuous_reading;
         let key_compare_alt_c = key_compare_alt_c && !continuous_reading;
         let key_compare_shift_c = key_compare_shift_c && !continuous_reading;

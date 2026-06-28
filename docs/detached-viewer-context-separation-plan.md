@@ -105,7 +105,10 @@ Phase 1 では、まず main だけを `ViewerContextBundle` 化して挙動を�
 - `fs_vertical_cache_keep_set`
 - `fs_zoom`, `fs_pan`, `fs_zoom_active`, `fs_zoom_aiming`, `fs_zoom_factor`,
   `fs_zoom_pdf_rerender_idx`, `fs_zoom_pdf_rerender_zoom`, `fs_pan_drag_start`,
-  `fs_free_rotation`, `analysis_zoom`, `analysis_pan`, `analysis_pan_drag_start`
+  `fs_free_rotation`, `analysis_mode`, `analysis_hover_color`, `analysis_pinned_color`,
+  `analysis_grayscale`, `analysis_mosaic_grid`, `analysis_filter_mag`,
+  `analysis_guide_drag`, `analysis_zoom`, `analysis_pan`, `analysis_pan_drag_start`,
+  `analysis_overlay_cache`, `analysis_hist_cache`, `analysis_sv_cache`
 - `spread_mode` / view trim など、本単位で読む表示設定の現在値
 
 `local_adjust_*` のようなワイルドカード表現は実装チェックリストでは使わない。上記のように実在
@@ -173,6 +176,7 @@ stable `ViewportId` を維持する。active / passive で viewport 名前空間
   - 現在ページ、ページ列、`fullscreen_idx`
   - zoom / pan / 見開き / 表示モードなど表示状態
   - 360 度パノラマの ON/OFF 状態と案内トースト済み状態
+  - Shift+Z 分析モードの ON/OFF、固定色、フィルタ、分析用キャッシュ状態
   - 現在表示中の `fs_cache` / texture
   - context generation / window id
 - fallback 用 `ViewerContextDescriptor`
@@ -281,9 +285,11 @@ active viewer 内のキーは active context へ作用する。
   `DetachedImageWindowSnapshot` へ持たせる。表示中の 1 枚と zoom / pan は保持し、先読み /
   pending worker / slideshow timer は停止する。
 - passive window は生成直後に即 reactivation しないよう、いったん focus が外れるまで
-  `activation_armed=false` とする。armed 後も OS focus-in だけでは active 化せず、window 内の
-  明示 pointer 操作で現在 active context を paused 化してから保持 bundle を active context へ
-  戻す。descriptor 再列挙は paused bundle を持たない古い snapshot の fallback としてだけ使う。
+  `activation_armed=false` とする。armed 後は window 内の明示 pointer 操作、または通常の
+  OS focus-in (タイトルバークリック / Alt-Tab / タスクバー選択など) で現在 active context を
+  paused 化してから保持 bundle を active context へ戻す。ただし close 直後の focus cascade
+  抑止期間中は focus / pointer による reactivation を抑止する。descriptor 再列挙は paused
+  bundle を持たない古い snapshot の fallback としてだけ使う。
 - passive window の位置 / サイズ / 最大化指定は生成初回だけ `ViewportBuilder` に渡し、それ以降は
   OS が管理する live geometry を読み取って `placement` へ保存する。毎フレーム placement を再適用すると、
   window drag 中に古い座標へ引き戻す frame が生じるため行わない。

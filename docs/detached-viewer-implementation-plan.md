@@ -431,6 +431,9 @@ enum NativeVideoPlacement {
 - 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native child HWND を作り直す。
 - 同期由来の detached open / 画像/動画切替は no-activate で表示し、通常の open / F12 操作では必要に応じて前面化する。
 - detached window placement は `detached_viewer_window_placement` に保存する。意味は「outer position + inner/client size + maximized flag」。最大化中は restore placement を上書きせず、`maximized` だけを更新する。
+- 静止画 detached viewport の `ViewportBuilder` が placement を再 seed する場合は、保存済み settings
+  ではなく現在の live geometry (`active_detached_viewer_live_placement`) を優先する。F12 の旧来単一窓経路でも、
+  ページ遷移や表示先切り替えで egui の既定 800x600 相当が一瞬通知された場合は保存済み配置を潰さない。
 - close-to-tray 中に detached session が開いている場合は、`release_media_session_for_tray` で `close_fullscreen()` を呼ばず、UI heartbeat と active viewer cache を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に閉じる。
 - 静止画/PDF detached と fullscreen の egui viewport を閉じる/作り直す経路では、メイン viewport の font atlas resync を one-shot 予約する。複数 viewport 後に日本語 glyph の部分更新だけが古い高さ 32 の renderer texture へ届くと wgpu validation panic になるため、メイン UI 描画前に 1 フレーム送って `configure_fonts_for_texture_resync` で font atlas full upload を強制する。
 
