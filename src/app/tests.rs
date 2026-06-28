@@ -16284,6 +16284,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_pin_active = true;
+        app.detached_viewer_independent_active = true;
 
         assert_eq!(
             app.requested_viewer_presentation_for_open(second),
@@ -16318,6 +16319,58 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         assert!(app.detached_image_windows[0].pinned);
         assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
+    }
+
+    #[test]
+    fn pinned_followup_detached_image_remains_independent_after_one_shot_is_consumed() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        let third = push_image(&mut app, r"C:\pics\c.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "pinned_independent_first");
+        app.settings.detached_viewer_enabled = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_pin_active = true;
+        app.detached_viewer_independent_active = true;
+        app.fs_open_intent_from_grid = true;
+
+        app.open_fullscreen(second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert!(app.detached_viewer_independent_active);
+        assert!(!app.detached_viewer_open_next_still_detached_once);
+
+        app.selected = Some(third);
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.selected, Some(third));
+
+        app.selected = Some(first);
+        app.open_fullscreen_from_fs_navigation(&ctx, third);
+
+        assert_eq!(app.fullscreen_idx, Some(third));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.detached_viewer_independent_active);
+        assert_eq!(app.selected, Some(first));
+    }
+
+    #[test]
+    fn independent_detached_image_close_does_not_move_main_selection() {
+        let mut app = setup_app();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        app.selected = Some(second);
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.selected, Some(second));
     }
 
     #[test]
@@ -16415,6 +16468,7 @@ mod still_window_mode_key_tests {
         let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let texture = ctx.load_texture("passive_reuse", pixels, egui::TextureOptions::LINEAR);
         let placement = app.detached_viewer_window_placement();
+        let source_item_key = app.metadata_cache_key(first);
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
@@ -16425,6 +16479,9 @@ mod still_window_mode_key_tests {
                 pinned: false,
                 rotation: crate::rotation_db::Rotation::None,
                 placement,
+                source_item_key,
+                activation_armed: false,
+                focused_last_frame: false,
             });
         app.selected = Some(first);
         app.fs_open_intent_from_grid = true;
@@ -16434,6 +16491,50 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(app.detached_image_windows.is_empty());
+    }
+
+    #[test]
+    fn passive_detached_image_window_can_be_reactivated_as_independent_viewer() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, second, "reactivate_active_second");
+        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let texture = ctx.load_texture(
+            "reactivate_passive_first",
+            pixels,
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        let source_item_key = app.metadata_cache_key(first);
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 7,
+                texture,
+                title: "a.jpg - mimageviewer".to_string(),
+                location_display: "a.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                placement,
+                source_item_key,
+                activation_armed: true,
+                focused_last_frame: false,
+            });
+        app.fullscreen_idx = Some(second);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 7));
+
+        assert_eq!(app.fullscreen_idx, Some(first));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.detached_viewer_independent_active);
+        assert!(app.detached_viewer_pin_active);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].location_display, "b.jpg");
+        assert!(app.detached_image_windows[0].pinned);
     }
 
     #[test]

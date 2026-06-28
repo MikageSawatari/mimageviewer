@@ -3285,6 +3285,8 @@ impl App {
         let show_pin = !self.settings.detached_viewer_open_images_in_window;
         let mut close_ids = Vec::new();
         let mut toggle_pin_ids = Vec::new();
+        let mut activate_ids = Vec::new();
+        let mut focus_updates = Vec::new();
         let mut placements = Vec::new();
 
         for window in windows {
@@ -3292,6 +3294,8 @@ impl App {
             let builder = Self::build_detached_image_window_builder(&window);
             let mut close_requested = false;
             let mut pin_toggle_requested = false;
+            let mut activate_requested = false;
+            let mut focused_now_for_update = None;
             let mut placement_update = None;
 
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
@@ -3328,6 +3332,24 @@ impl App {
                 }
                 if vp_ctx.input(|i| i.viewport().close_requested()) {
                     close_requested = true;
+                }
+                let (focused_now, user_activation) = vp_ctx.input(|i| {
+                    let focused = i.viewport().focused.unwrap_or(false);
+                    let input = i.pointer.any_pressed()
+                        || i.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                egui::Event::Key { pressed: true, .. }
+                                    | egui::Event::PointerButton { pressed: true, .. }
+                            )
+                        });
+                    (focused, input)
+                });
+                focused_now_for_update = Some(focused_now);
+                if window.activation_armed
+                    && ((focused_now && !window.focused_last_frame) || user_activation)
+                {
+                    activate_requested = true;
                 }
 
                 egui::CentralPanel::default()
@@ -3370,6 +3392,12 @@ impl App {
             if pin_toggle_requested {
                 toggle_pin_ids.push(window.id);
             }
+            if activate_requested && !close_requested && !pin_toggle_requested {
+                activate_ids.push(window.id);
+            }
+            if let Some(focused_now) = focused_now_for_update {
+                focus_updates.push((window.id, focused_now));
+            }
             if let Some(placement) = placement_update {
                 placements.push((window.id, placement));
             }
@@ -3393,9 +3421,28 @@ impl App {
                 window.pinned = !window.pinned;
             }
         }
+        for (id, focused_now) in focus_updates {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.focused_last_frame = focused_now;
+                window.activation_armed = true;
+            }
+        }
         if !close_ids.is_empty() {
             self.detached_image_windows
                 .retain(|window| !close_ids.contains(&window.id));
+        }
+        for id in activate_ids {
+            if self
+                .detached_image_windows
+                .iter()
+                .any(|window| window.id == id)
+            {
+                self.activate_detached_image_window_snapshot(ctx, id);
+            }
         }
     }
 
@@ -4250,6 +4297,7 @@ impl App {
         #[cfg(windows)]
         let detached_activate_on_show = if detached {
             if need_show {
+                self.detached_viewer_focus_requested = false;
                 Some(self.take_detached_viewer_activate_on_show()).filter(|active| *active)
             } else {
                 self.detached_viewer_no_activate_once = false;
@@ -4260,6 +4308,11 @@ impl App {
         };
         #[cfg(not(windows))]
         let detached_activate_on_show = Some(true);
+        #[cfg(windows)]
+        let detached_focus_existing = detached
+            && !embedded
+            && !need_show
+            && std::mem::take(&mut self.detached_viewer_focus_requested);
         let mut fs_builder = if detached {
             self.build_detached_viewer_viewport_builder(
                 fs_idx,
@@ -4400,6 +4453,13 @@ impl App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                }
+                #[cfg(windows)]
+                if detached_focus_existing {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
                 }
 
                 // 他アプリからフォーカスが戻ってきた瞬間を記録。
@@ -5414,8 +5474,9 @@ impl App {
                             }
                             #[cfg(windows)]
                             if detached_pin_pressed {
-                                self.detached_viewer_pin_active =
-                                    !self.detached_viewer_pin_active;
+                                self.detached_viewer_pin_active = !self.detached_viewer_pin_active;
+                                self.detached_viewer_independent_active =
+                                    self.detached_viewer_pin_active;
                                 let msg = if self.detached_viewer_pin_active {
                                     "画像別ウィンドウをピン留めしました".to_string()
                                 } else {
