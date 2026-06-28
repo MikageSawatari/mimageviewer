@@ -16448,6 +16448,57 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn image_only_detached_plain_image_snapshot_can_reactivate() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "reactivate_plain_first");
+        insert_static_fs_entry(&mut app, &ctx, second, "reactivate_plain_second");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_open_intent_from_grid = true;
+
+        app.open_fullscreen(second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let first_window_id = app.detached_image_windows[0].id;
+        assert!(
+            app.detached_image_windows[0].can_activate(),
+            "plain image snapshots must be able to become the active viewer again"
+        );
+        assert!(app.detached_image_windows[0].reopen_descriptor.is_none());
+        assert!(app.detached_image_windows[0].reopen_sync_stamp.is_some());
+        assert!(
+            app.panorama_state.is_none(),
+            "opening the follow-up window should still reset foreground panorama mode"
+        );
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, first_window_id));
+
+        assert_eq!(app.fullscreen_idx, Some(first));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(app.detached_viewer_window_id, Some(first_window_id));
+        assert!(
+            app.detached_viewer_independent_active,
+            "always-new detached image windows remain independent after reactivation"
+        );
+        assert!(
+            app.panorama_state.is_none(),
+            "reactivated plain image windows should return in normal display mode so V can start panorama anew"
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].location_display, "b.jpg");
+        assert!(app.detached_image_windows[0].can_activate());
+    }
+
+    #[test]
     fn image_only_detached_setting_ignores_stale_pin_when_parking_next_image() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -16542,6 +16593,7 @@ mod still_window_mode_key_tests {
                 placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
+                reopen_sync_stamp: None,
                 activation_armed: false,
                 focused_last_frame: false,
                 initial_placement_applied: false,
@@ -16968,6 +17020,7 @@ mod still_window_mode_key_tests {
                     path: PathBuf::from(r"C:\books\a.pdf"),
                     page_num: Some(5),
                 }),
+                reopen_sync_stamp: None,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
@@ -17067,6 +17120,7 @@ mod still_window_mode_key_tests {
                     path: PathBuf::from(r"C:\books\a.pdf"),
                     page_num: Some(5),
                 }),
+                reopen_sync_stamp: None,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,

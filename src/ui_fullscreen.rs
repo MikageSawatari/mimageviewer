@@ -3584,7 +3584,7 @@ impl App {
                      pin_toggle={} focused={} focused_prev={} focus_edge={} \
                      focus_suppressed={} pointer_activation={} scroll_candidate={} \
                      key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
-                     armed={} pinned={} has_bundle={} has_descriptor={}",
+                     armed={} pinned={} has_bundle={} has_descriptor={} has_stamp={}",
                     window.id,
                     viewport_close_requested,
                     bar_close_requested,
@@ -3602,7 +3602,8 @@ impl App {
                     window.activation_armed,
                     window.pinned,
                     window.has_paused_bundle(),
-                    window.reopen_descriptor.is_some()
+                    window.reopen_descriptor.is_some(),
+                    window.reopen_sync_stamp.is_some()
                 ));
             }
             if can_activate

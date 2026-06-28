@@ -182,6 +182,7 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
+    pub(crate) reopen_sync_stamp: Option<ViewerSyncStamp>,
     pub(crate) activation_armed: bool,
     pub(crate) focused_last_frame: bool,
     pub(crate) initial_placement_applied: bool,
@@ -213,6 +214,7 @@ impl Clone for DetachedImageWindowSnapshot {
             placement: self.placement,
             frozen_continuous_pages: self.frozen_continuous_pages.clone(),
             reopen_descriptor: self.reopen_descriptor.clone(),
+            reopen_sync_stamp: self.reopen_sync_stamp.clone(),
             activation_armed: self.activation_armed,
             focused_last_frame: self.focused_last_frame,
             initial_placement_applied: self.initial_placement_applied,
@@ -224,7 +226,9 @@ impl Clone for DetachedImageWindowSnapshot {
 
 impl DetachedImageWindowSnapshot {
     pub(crate) fn can_activate(&self) -> bool {
-        self.reopen_descriptor.is_some() || self.paused_bundle.is_some()
+        self.reopen_descriptor.is_some()
+            || self.reopen_sync_stamp.is_some()
+            || self.paused_bundle.is_some()
     }
 
     #[cfg(windows)]
@@ -22450,6 +22454,40 @@ impl App {
             return true;
         }
 
+        if snapshot.reopen_descriptor.is_none()
+            && let Some(stamp) = snapshot.reopen_sync_stamp.clone()
+        {
+            let Some(idx) = self.resolve_viewer_sync_stamp_idx(&stamp) else {
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            };
+            let activate_placement = snapshot.placement;
+            let activate_window_id = snapshot.id;
+            let activate_independent =
+                self.settings.detached_viewer_open_images_in_window || snapshot.pinned;
+            let activate_zoom_pan = snapshot.zoom_pan;
+            let activate_free_rotation = snapshot.free_rotation;
+            if !self.park_and_close_current_active_detached_viewer(ctx) {
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            }
+            self.detached_viewer_window_id = Some(activate_window_id);
+            self.settings.detached_viewer_window_placement = Some(activate_placement);
+            self.detached_viewer_independent_active = activate_independent;
+            self.detached_viewer_pin_active = false;
+            self.detached_viewer_open_next_still_detached_once = true;
+            self.fs_open_intent_from_grid = false;
+            self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
+            self.open_fullscreen(idx);
+            if let Some((zoom, pan)) = activate_zoom_pan {
+                self.fs_zoom = zoom;
+                self.fs_pan = pan;
+            }
+            self.fs_free_rotation = activate_free_rotation;
+            ctx.request_repaint();
+            return true;
+        }
+
         let Some(descriptor) = snapshot.reopen_descriptor.clone() else {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
@@ -22727,6 +22765,7 @@ impl App {
             .map(|ctx| self.detached_continuous_frozen_pages_for_snapshot(ctx, idx, placement))
             .unwrap_or_default();
         let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
+        let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         let id = self.ensure_detached_viewer_window_id();
         Some(DetachedImageWindowSnapshot {
             id,
@@ -22741,6 +22780,7 @@ impl App {
             placement,
             frozen_continuous_pages,
             reopen_descriptor,
+            reopen_sync_stamp,
             activation_armed: false,
             focused_last_frame: false,
             initial_placement_applied: false,
@@ -22868,6 +22908,26 @@ impl App {
             idx,
             item_key: self.metadata_cache_key(idx)?,
             items_generation: self.items_generation,
+        })
+    }
+
+    #[cfg(windows)]
+    fn resolve_viewer_sync_stamp_idx(&self, stamp: &ViewerSyncStamp) -> Option<usize> {
+        if self.items_generation == stamp.items_generation
+            && self
+                .viewer_sync_stamp_for_idx(stamp.idx)
+                .as_ref()
+                .is_some_and(|current| current.item_key == stamp.item_key)
+        {
+            return Some(stamp.idx);
+        }
+
+        self.items.iter().enumerate().find_map(|(idx, _)| {
+            if !self.viewer_item_supports_detached_still(idx) {
+                return None;
+            }
+            let key = self.metadata_cache_key(idx)?;
+            (key == stamp.item_key).then_some(idx)
         })
     }
 
