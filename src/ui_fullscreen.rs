@@ -11113,7 +11113,12 @@ impl App {
             );
         }
 
-        if let Some(new_pos) = vertical_reading_nearest_position(&offsets, self.fs_vertical_scroll)
+        // スライドショーの短時間スクロール中に current_pos を張り替えると、
+        // アニメーションの start/target が旧 offset 基準のまま残り、見た目の移動量が
+        // 不揃いになる。再アンカーはスクロール完了後のフレームで行う。
+        if self.slideshow_scroll_anim.is_none()
+            && let Some(new_pos) =
+                vertical_reading_nearest_position(&offsets, self.fs_vertical_scroll)
             && new_pos != current_pos
             && let Some(unit) = units.get(new_pos)
         {
