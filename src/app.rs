@@ -23488,43 +23488,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn save_detached_viewer_placement_from_native_geometry(
-        &mut self,
-        x: i32,
-        y: i32,
-        w: u32,
-        h: u32,
-        maximized: bool,
-    ) {
-        if self.detached_viewer_borderless_fullscreen
-            || self.detached_viewer_borderless_transition.is_some()
-        {
-            return;
-        }
-        if maximized {
-            let mut placement = self.detached_viewer_window_placement();
-            placement.maximized = true;
-            self.settings.detached_viewer_window_placement = Some(placement);
-            self.active_detached_viewer_live_placement = Some(placement);
-            return;
-        }
-        let scale = self.last_pixels_per_point.max(0.5);
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: x as f32 / scale,
-            y: y as f32 / scale,
-            w: w as f32 / scale,
-            h: h as f32 / scale,
-            maximized: false,
-        };
-        if placement.is_sane()
-            && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
-        {
-            self.settings.detached_viewer_window_placement = Some(placement);
-            self.active_detached_viewer_live_placement = Some(placement);
-        }
-    }
-
-    #[cfg(windows)]
     pub(crate) fn sync_detached_viewer_to_selected(&mut self, ctx: &egui::Context) {
         if !self.settings.detached_viewer_enabled || !self.viewer_session_is_detached() {
             return;
