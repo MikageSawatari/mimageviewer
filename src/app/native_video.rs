@@ -2272,19 +2272,7 @@ impl App {
                 self.request_native_video_hud_repaint(ctx);
             }
             // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
-            crate::video::native_window::NativeVideoWindowEvent::GeometryChanged {
-                x,
-                y,
-                w,
-                h,
-                maximized,
-            } => {
-                if self.viewer_session_is_detached()
-                    && self.detached_viewer_host_hwnd_alive().is_none()
-                {
-                    self.save_detached_viewer_placement_from_native_geometry(x, y, w, h, maximized);
-                }
-            }
+            crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. } => {}
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
             | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud => {}
         }

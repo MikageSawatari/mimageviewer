@@ -35217,6 +35217,23 @@ impl App {
     }
 
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        #[cfg(windows)]
+        {
+            let now = std::time::Instant::now();
+            let video_switch_in_flight = self
+                .native_video_mode_switch
+                .is_some_and(|pending| now < pending.deadline);
+            let detached_host_switch_in_flight = self
+                .pending_detached_video_host_switch
+                .is_some_and(|pending| now < pending.deadline);
+            if video_switch_in_flight || detached_host_switch_in_flight {
+                crate::logger::log(
+                    "[detached-viewer] ignore F12 toggle while video placement switch is pending"
+                        .to_string(),
+                );
+                return;
+            }
+        }
         self.settings.detached_viewer_enabled = !self.settings.detached_viewer_enabled;
         self.settings.save();
         #[cfg(windows)]

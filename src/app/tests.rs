@@ -17944,6 +17944,67 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn detached_video_child_geometry_does_not_overwrite_host_placement() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, r"C:\clips\a.mp4");
+        let host_placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 240.0,
+            y: 180.0,
+            w: 1280.0,
+            h: 840.0,
+            maximized: false,
+        };
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.settings.detached_viewer_window_placement = Some(host_placement);
+
+        app.handle_native_video_window_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoWindowEvent::GeometryChanged {
+                x: 0,
+                y: 0,
+                w: 1280,
+                h: 720,
+                maximized: false,
+            },
+        );
+
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(host_placement),
+            "detached video is a child HWND; its geometry must not replace the host window placement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_video_f12_does_not_retoggle_during_placement_switch() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.settings.detached_viewer_enabled = false;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 7,
+            target_presentation: ViewerPresentation::Fullscreen,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        });
+
+        app.toggle_detached_viewer_mode();
+
+        assert!(
+            !app.settings.detached_viewer_enabled,
+            "F12 leaked from the main/root path must not toggle detached mode again while migration is pending"
+        );
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(app.native_video_mode_switch.is_some());
+    }
+
+    #[test]
     fn detached_active_snapshot_uses_live_viewport_placement() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

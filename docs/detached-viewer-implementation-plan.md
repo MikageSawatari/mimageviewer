@@ -448,6 +448,11 @@ enum NativeVideoPlacement {
 
 - `NativeVideoPlacement::DetachedViewerChild`、`SwitchPlacement` / `PlacementSwitched` / `PlacementSwitchFailed` を追加済み。
 - detached 動画は egui detached viewport の child HWND として作成し、F11 は detached host の仮想フルスクリーンをトグル、F12 は再生を維持した host migration として扱う。
+- detached 動画の `GeometryChanged` は child presenter HWND の矩形であり、host window の outer / inner
+  placement ではないため、`detached_viewer_window_placement` へ保存しない。host の位置・サイズは
+  egui detached viewport 側の live geometry 保存を正とする。
+- 動画の host migration / placement switch が進行中の F12 は無視する。同じ物理キーが native video
+  HWND と main/root egui 経路の両方へ届いても、二重トグルで detached mode が戻ったり window が閉じたりしないようにする。
 - detached viewer window の `WM_CLOSE` は egui viewport close request として App へ届き、`close_fullscreen()` で session 終了・動画停止に寄せる。detached 動画の Esc / Enter も同じ close 経路に入る。
 - detached 動画では fullscreen 専用 HUD overlay HWND / fullscreen backdrop / VST owner 同期を使わず、通常 presenter HWND 側の overlay path を使う。
 - 残りは Windows 実機での複数ディスプレイ / DPI 差 / close-to-tray / 動画連続再生の確認。
