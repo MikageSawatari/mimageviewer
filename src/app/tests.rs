@@ -253,6 +253,71 @@ fn startup_archive_open_auto_fullscreen_follows_setting_and_file_kind() {
         &folder,
         crate::folder_tree::OpenablePathKind::Directory,
     ));
+
+    settings.auto_fullscreen_image_folders = true;
+    assert!(
+        startup_openable_should_auto_fullscreen(
+            &settings,
+            &folder,
+            crate::folder_tree::OpenablePathKind::Directory,
+        ),
+        "image-only folder fullscreen is decided after directory load, but explicit folder opens should carry the intent"
+    );
+
+    settings.auto_fullscreen_zip_pdf = false;
+    assert!(
+        !startup_openable_should_auto_fullscreen(
+            &settings,
+            &folder,
+            crate::folder_tree::OpenablePathKind::Directory,
+        ),
+        "folder option is subordinate to the main direct-page setting"
+    );
+}
+
+#[test]
+fn auto_fullscreen_image_only_folder_opens_page_after_load() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("pages");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("001.jpg"), b"dummy").unwrap();
+    std::fs::write(folder.join("002.png"), b"dummy").unwrap();
+
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.pending_auto_fs_open = true;
+
+    app.load_folder(folder.clone());
+
+    assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.selected, Some(0));
+    assert!(
+        !app.pending_auto_fs_open,
+        "folder auto-open request is one-shot"
+    );
+}
+
+#[test]
+fn auto_fullscreen_image_folder_ignores_mixed_folder_after_load() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("mixed");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(folder.join("child")).unwrap();
+    std::fs::write(folder.join("001.jpg"), b"dummy").unwrap();
+
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.pending_auto_fs_open = true;
+
+    app.load_folder(folder.clone());
+
+    assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+    assert_eq!(app.fullscreen_idx, None);
+    assert!(
+        !app.pending_auto_fs_open,
+        "non-matching folder still consumes stale request"
+    );
 }
 
 // ── cell_has_lower_left_container_badge ───────────────────────────────────
@@ -7228,21 +7293,49 @@ mod favorite_adjustment_defaults_tests {
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
 
-        // 設定ON でも通常フォルダ (非コンテナ) → 即 close (= 親グリッド)。
+        // 設定ON でも画像フォルダ追加設定 OFF の通常フォルダ → 即 close (= フォルダ内一覧)。
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/manga/series/p001.jpg",
+        ))];
+        app.thumbnails = vec![ThumbnailState::Pending];
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
         app.pending_return_to_parent = false;
         app.handle_fullscreen_close_request();
         assert!(
             !app.pending_return_to_parent,
-            "非コンテナは親復帰予約を立てない"
+            "画像フォルダ追加設定 OFF の通常フォルダは親復帰予約を立てない"
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
     }
 
+    #[test]
+    fn image_only_folder_direct_page_close_request_defers_to_parent_when_enabled() {
+        let mut app = setup_app();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/manga/series/p001.jpg",
+        ))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
+        app.pending_return_to_parent = false;
+
+        app.handle_fullscreen_close_request();
+
+        assert!(
+            app.pending_return_to_parent,
+            "追加設定 ON の画像のみ通常フォルダは親 (L1) へ戻る予約"
+        );
+        assert_eq!(app.fullscreen_idx, Some(0), "その場では close しない");
+    }
+
     /// `auto_open_for_current_container` のゲート判定。
-    /// ZIP/PDF コンテナ内 & 設定 ON のときだけ親直帰ルーティングを使う。
+    /// ZIP/PDF コンテナ内、または追加設定 ON の画像のみ通常フォルダのときだけ
+    /// 親直帰ルーティングを使う。
     #[test]
     fn auto_open_for_current_container_gating() {
         let mut app = setup_app();
@@ -7251,8 +7344,27 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
         assert!(
             !app.auto_open_for_current_container(),
-            "通常フォルダは対象外"
+            "追加設定 OFF の通常フォルダは対象外"
         );
+
+        app.settings.auto_fullscreen_image_folders = true;
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/manga/series/p001.jpg",
+        ))];
+        assert!(
+            app.auto_open_for_current_container(),
+            "追加設定 ON の画像のみ通常フォルダは対象"
+        );
+
+        app.items.push(GridItem::Video(std::path::PathBuf::from(
+            "c:/manga/series/clip.mp4",
+        )));
+        assert!(
+            !app.auto_open_for_current_container(),
+            "動画が混ざる通常フォルダは対象外"
+        );
+        app.settings.auto_fullscreen_image_folders = false;
+        app.items.clear();
 
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip"));
         assert!(app.auto_open_for_current_container(), "ZIP コンテナは対象");

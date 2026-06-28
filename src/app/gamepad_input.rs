@@ -4434,6 +4434,8 @@ impl App {
         if self.slideshow_playing {
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
+            self.slideshow_scroll_anim = None;
+            self.slideshow_scroll_range_cache = None;
         } else if matches!(
             self.items.get(fs_idx),
             Some(GridItem::Image(_))
@@ -5006,12 +5008,7 @@ impl App {
         let item = self.items.get(idx).cloned();
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
-                if self.settings.auto_fullscreen_zip_pdf
-                    && matches!(
-                        self.items.get(idx),
-                        Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_))
-                    )
-                {
+                if self.should_auto_fullscreen_grid_container(idx) {
                     self.pending_auto_fs_open = true;
                 }
                 self.maybe_suppress_rating_filter_for_opened_container(idx);

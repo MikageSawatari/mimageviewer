@@ -9133,6 +9133,9 @@ impl App {
                         let p = p.clone();
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
+                        if self.should_auto_fullscreen_grid_container(idx) {
+                            self.pending_auto_fs_open = true;
+                        }
                         nav = Some(p);
                     }
                 }
@@ -9142,7 +9145,7 @@ impl App {
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
-                    if self.settings.auto_fullscreen_zip_pdf {
+                    if self.should_auto_fullscreen_grid_container(idx) {
                         self.pending_auto_fs_open = true;
                     }
                     nav = Some(p);

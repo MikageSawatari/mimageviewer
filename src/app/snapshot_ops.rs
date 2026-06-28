@@ -1172,6 +1172,8 @@ impl App {
             self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
+            self.slideshow_scroll_anim = None;
+            self.slideshow_scroll_range_cache = None;
             self.show_feedback_toast(
                 if forward {
                     "★固定リスト末尾です (スライドショー停止)"

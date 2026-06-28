@@ -177,6 +177,14 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlideshowContinuousScrollAnim {
+    pub(crate) start_at: std::time::Instant,
+    pub(crate) end_at: std::time::Instant,
+    pub(crate) start_scroll: f32,
+    pub(crate) target_scroll: f32,
+}
+
 /// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
@@ -3709,6 +3717,8 @@ pub struct App {
     pub(crate) spread_popup_open: bool,
     /// ズーム/フィット切替ポップアップ表示中
     pub(crate) fit_popup_open: bool,
+    /// スライドショー設定ポップアップ表示中
+    pub(crate) slideshow_popup_open: bool,
 
     // ── スライドショー ────────────────────────────────────────────
     /// スライドショー再生中フラグ
@@ -3717,6 +3727,11 @@ pub struct App {
     pub(crate) slideshow_next_at: std::time::Instant,
     /// `slideshow_next_at` がどのフルスクリーン item の表示開始から数えているか。
     pub(crate) slideshow_anchor_idx: Option<usize>,
+    /// 連結読みスライドショーの間欠スクロールアニメーション状態。
+    pub(crate) slideshow_scroll_anim: Option<SlideshowContinuousScrollAnim>,
+    /// 直近の連結読み描画で計算したスクロール可能範囲。
+    /// (fullscreen_idx, min_scroll, max_scroll)
+    pub(crate) slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
 
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
@@ -4048,12 +4063,16 @@ pub struct App {
     /// するため) ので、単一フィールドで両方を賄える。
     pub(crate) fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
 
-    /// 「ZIP/PDF/対応アーカイブを明示的に開いたらページをフルスクリーンで開く」
+    /// 「ZIP/PDF/対応アーカイブ、または画像のみ通常フォルダを明示的に開いたら
+    /// ページをフルスクリーンで開く」
     /// (`auto_fullscreen_zip_pdf`) の one-shot 予約。grid の Enter / ダブルクリックや
-    /// 起動引数 / SendTo で立て、`load_zip_as_folder` / `load_pdf_as_folder` が
-    /// `mem::take` して `fs_nav_after_pdf_enumerate` へ変換する。
+    /// 起動引数 / SendTo で立て、ZIP/PDF は `load_zip_as_folder` / `load_pdf_as_folder` が
+    /// `mem::take` して `fs_nav_after_pdf_enumerate` へ変換する。通常フォルダの場合は
+    /// `auto_fullscreen_image_folders` ON かつ走査後の表示項目が通常画像だけなら、
+    /// `load_folder_with_scan` が同じ予約を消費して直接フルスクリーンを開く。
     pub(crate) pending_auto_fs_open: bool,
-    /// 「ページを直接開く」設定 ON で ZIP/PDF/変換アーカイブ内のページを
+    /// 「ページを直接開く」設定 ON で ZIP/PDF/変換アーカイブ内のページ、または
+    /// 追加設定 ON の画像のみ通常フォルダ内のページを
     /// フルスクリーン表示中に Esc/Enter/右クリックで親のファイル一覧へ戻る要求。
     ///
     /// その場で `close_fullscreen` すると一瞬ページ一覧 (L2) が出るため、
@@ -5893,9 +5912,12 @@ impl App {
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
             fit_popup_open: false,
+            slideshow_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             slideshow_anchor_idx: None,
+            slideshow_scroll_anim: None,
+            slideshow_scroll_range_cache: None,
             fs_viewport_shown: false,
             #[cfg(windows)]
             fs_viewport_presentation: None,
@@ -7505,8 +7527,9 @@ impl App {
         Some(nav)
     }
 
-    /// `pending_return_to_parent` (「ページを直接開く」設定 ON の ZIP/PDF で
-    /// Esc/Enter/右クリックから立つ「親フォルダ (一覧) へ戻る」予約) を消化したときの
+    /// `pending_return_to_parent` (「ページを直接開く」設定 ON の ZIP/PDF、または
+    /// 追加設定 ON の画像のみ通常フォルダで Esc/Enter/右クリックから立つ
+    /// 「親フォルダ (一覧) へ戻る」予約) を消化したときの
     /// ナビ先を返す。
     ///
     /// **変換アーカイブ対応 (Codex P1)**: 変換済み RAR/7z/LZH 閲覧中は `current_folder` が
@@ -8727,8 +8750,8 @@ impl App {
     /// 変換確認ダイアログを出す。
     ///
     /// `auto_fullscreen` は起動引数 / SendTo / 既存インスタンス転送など、
-    /// ユーザーが本ファイルを直接開いた経路だけ true にする。履歴復元や
-    /// アドレスバー移動は従来どおり false で呼ぶ。
+    /// ユーザーが本ファイルまたは画像フォルダを直接開いた経路だけ true にする。
+    /// 履歴復元やアドレスバー移動は従来どおり false で呼ぶ。
     pub(crate) fn load_folder_or_convert_archive_with_auto_fullscreen(
         &mut self,
         path: PathBuf,
@@ -8771,6 +8794,11 @@ impl App {
             }
         }
         if auto_fullscreen && path.is_file() && crate::folder_tree::is_virtual_folder(&path) {
+            self.pending_auto_fs_open = true;
+        } else if auto_fullscreen
+            && path.is_dir()
+            && self.settings.auto_fullscreen_image_folders_enabled()
+        {
             self.pending_auto_fs_open = true;
         }
         self.load_folder(path);
@@ -9036,6 +9064,12 @@ impl App {
                 image_metas.push(Some((*mtime, *file_size)));
             }
         }
+        let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
+            self.settings.auto_fullscreen_image_folders_enabled()
+                && Self::grid_items_are_image_only_folder_pages(&items)
+        } else {
+            false
+        };
 
         // 画像ファイル名集合 (カタログ掃除用キー)。pinned 形式 (`{base}#pin:{source_id}`)
         // も含めることで、`delete_missing` がピン由来の cache 行を巻き添えで消さない
@@ -9148,6 +9182,23 @@ impl App {
                 script_enabled,
                 false,
             );
+        }
+
+        if auto_open_image_folder {
+            let mut new_idx = if self.settings.book_open_resume.resumes() {
+                self.resume_page_for_container()
+            } else {
+                None
+            };
+            if new_idx.is_none() {
+                new_idx = self.find_fullscreen_nav_target_filtered(false);
+            }
+            if let Some(new_idx) = new_idx {
+                self.open_fullscreen(new_idx);
+                self.selected = Some(new_idx);
+                self.scroll_to_selected = true;
+                self.update_last_selected_image();
+            }
         }
 
         if crate::perf::is_enabled() {
@@ -11868,6 +11919,8 @@ impl App {
             self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
+            self.slideshow_scroll_anim = None;
+            self.slideshow_scroll_range_cache = None;
             self.close_fullscreen();
         }
         true
@@ -13022,6 +13075,9 @@ impl App {
         self.apply_view_trim_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
+        self.slideshow_popup_open = false;
+        self.slideshow_scroll_anim = None;
+        self.slideshow_scroll_range_cache = None;
         self.search_filter = None;
         self.search_filter_origin_folder = None;
         self.search_query.clear();
@@ -18981,14 +19037,9 @@ impl App {
                         Some(GridItem::Folder(p))
                         | Some(GridItem::ZipFile(p))
                         | Some(GridItem::PdfFile(p)) => {
-                            // 環境設定 ON のとき ZIP/PDF (フォルダは対象外) は 1 ページ目を
-                            // 即フルスクリーンで開く。
-                            if self.settings.auto_fullscreen_zip_pdf
-                                && matches!(
-                                    self.items.get(idx),
-                                    Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_))
-                                )
-                            {
+                            // 環境設定 ON のとき ZIP/PDF、または画像だけの通常フォルダは
+                            // ページ一覧を経由せずフルスクリーンで開く。
+                            if self.should_auto_fullscreen_grid_container(idx) {
                                 self.pending_auto_fs_open = true;
                             }
                             let p = p.clone();
@@ -19677,20 +19728,47 @@ impl App {
         }
     }
 
-    /// ZIP/PDF コンテナ内のフルスクリーンで「ページを直接開く」設定の退出ルーティング
+    pub(crate) fn should_auto_fullscreen_grid_container(&self, idx: usize) -> bool {
+        match self.items.get(idx) {
+            Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => {
+                self.settings.auto_fullscreen_zip_pdf
+            }
+            Some(GridItem::Folder(_)) => self.settings.auto_fullscreen_image_folders_enabled(),
+            _ => false,
+        }
+    }
+
+    fn grid_items_are_image_only_folder_pages(items: &[GridItem]) -> bool {
+        !items.is_empty() && items.iter().all(|item| matches!(item, GridItem::Image(_)))
+    }
+
+    fn items_are_image_only_folder_pages(&self) -> bool {
+        Self::grid_items_are_image_only_folder_pages(&self.items)
+    }
+
+    /// ZIP/PDF コンテナ内、または opt-in の画像のみ通常フォルダ内のフルスクリーンで、
+    /// 「ページを直接開く」設定の退出ルーティング
     /// (Esc/Enter/右クリック→親一覧 / Backspace→ページ一覧) を使うか判定する。
     ///
-    /// 通常フォルダ (loose 画像) には適用しない。検索 (Ctrl+S / Ctrl+G) 中も、Esc が
-    /// 検索を抜けて実親フォルダへ飛ぶ想定外挙動を避けるため適用しない。
+    /// 検索 (Ctrl+S / Ctrl+G) 中は、Esc が検索を抜けて実親フォルダへ飛ぶ想定外挙動を
+    /// 避けるため適用しない。
     pub(crate) fn auto_open_for_current_container(&self) -> bool {
-        self.settings.auto_fullscreen_zip_pdf
-            && !self.global_search.active
-            && !self.favsearch.active
-            && !self.tag_view.active
-            && self
-                .current_folder
-                .as_deref()
-                .is_some_and(crate::folder_tree::is_virtual_folder)
+        if !self.settings.auto_fullscreen_zip_pdf
+            || self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+        {
+            return false;
+        }
+        let Some(current_folder) = self.current_folder.as_deref() else {
+            return false;
+        };
+        if crate::folder_tree::is_virtual_folder(current_folder) {
+            return true;
+        }
+        self.settings.auto_fullscreen_image_folders_enabled()
+            && !is_synthetic_view_path(current_folder)
+            && self.items_are_image_only_folder_pages()
     }
 
     pub(crate) fn reopen_fullscreen_after_folder_nav_load(
@@ -19700,7 +19778,7 @@ impl App {
         resume_slideshow: bool,
     ) -> &'static str {
         // フォルダナビ経路は特定 leaf を持たない (= target: None)。先頭着地。
-        // 退出ルーティング (Esc→L1 / BS→L2) は設定 auto_fullscreen_zip_pdf で決まるので
+        // 退出ルーティング (Esc→L1 / BS→L2) は現在のコンテナと設定で判定するので
         // ここでフラグを立てる必要はない。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
@@ -19918,6 +19996,8 @@ impl App {
                     // 現在画像に留まる。フルスクリーンは維持。
                     self.slideshow_playing = false;
                     self.slideshow_anchor_idx = None;
+                    self.slideshow_scroll_anim = None;
+                    self.slideshow_scroll_range_cache = None;
                     self.clear_pending_folder_nav_steps();
                     self.release_fs_nav_lock();
                 }
@@ -19935,6 +20015,8 @@ impl App {
         if matches!(result.mode, FolderNavMode::SlideshowNext) && !result.hit_image_folder {
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
+            self.slideshow_scroll_anim = None;
+            self.slideshow_scroll_range_cache = None;
             self.clear_pending_folder_nav_steps();
             self.release_fs_nav_lock();
             emit_end(
@@ -22025,6 +22107,8 @@ impl App {
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
+        self.slideshow_scroll_anim = None;
+        self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
         self.fs_vertical_cache_keep_set.clear();
@@ -27462,10 +27546,10 @@ impl App {
 
     /// フルスクリーンの「閉じる」要求 (Esc / Enter / 右クリック / ビューポート close) の共通処理。
     ///
-    /// **「ページを直接開く」設定 (`auto_fullscreen_zip_pdf`) が ON で ZIP/PDF ページを
-    /// 見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る。
-    /// 判定は `auto_open_for_current_container()` (= 設定 ON & コンテナ内 & 非検索) のみで、
-    /// 直接オープン由来かどうかは見ない。それ以外 (設定 OFF / 通常画像) は 1 段だけ閉じる
+    /// **「ページを直接開く」設定が ON で ZIP/PDF ページ、または追加設定 ON の画像のみ
+    /// 通常フォルダを見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る。
+    /// 判定は `auto_open_for_current_container()` (= 設定 ON & 対象コンテナ内 & 非検索) のみで、
+    /// 直接オープン由来かどうかは見ない。それ以外 (設定 OFF / 対象外の通常画像) は 1 段だけ閉じる
     /// (`close_fullscreen`: コンテナなら L2 ページ一覧、通常画像なら親フォルダグリッド)。
     ///
     /// L1 へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
@@ -27591,6 +27675,7 @@ impl App {
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
         self.spread_popup_open = false;
         self.fit_popup_open = false;
+        self.slideshow_popup_open = false;
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
@@ -27799,6 +27884,8 @@ impl App {
         self.clear_meta_undo();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
+        self.slideshow_scroll_anim = None;
+        self.slideshow_scroll_range_cache = None;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
         self.fs_prev_focused = false;
@@ -35823,6 +35910,9 @@ impl App {
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
         self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
+        self.slideshow_scroll_anim = None;
+        self.slideshow_scroll_range_cache = None;
         self.adjustment_mode = false;
         self.local_adjust_mode = false;
         self.local_adjust_add_layer_dialog_open = false;

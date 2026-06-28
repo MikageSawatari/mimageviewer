@@ -395,7 +395,7 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 静止画フルスクリーンでは右下に `12 / 123` 形式のページ番号を常時表示する (環境設定で OFF 可能)。見開きは `12, 13 / 123`、右→左表示なら画面上の左ページから `13, 12 / 123` のように、カンマの後に 1 つスペースを入れて表示し、縦 / 横連結モードは画面中央に近い現在ページを表示する。下部ページシークバーを固定表示している間は同じ情報が重複するため右下のページ番号は表示しない。マウスを画面下部へ移動すると、フォルダ / ZIP / PDF / 変換アーカイブのフルスクリーンナビ対象がすべて画像の場合だけ画面下端フル幅のページシークバーを表示する。LTR は右端、RTL は左端にページ番号を表示し、表示内容は右下オーバーレイと同じ見開き対応ラベルにする。ドラッグ中はリアルタイムにページを移動する。縦 / 横連結モードではシーク先ページを中央に置く。ZIP の章区切り (`ZipSeparator`) は混在判定から除外する。動画など画像以外が混在する場合はシークバーを出さず、画像 / 動画 / その他の件数サマリーを表示する。シークバー端の鍵アイコンまたは環境設定で固定表示にすると、下端にシークバー領域を常時確保し、画像はその領域を除いた範囲へフィットする
 - 画面右端のメタデータパネル幅内にマウスを移動でメタデータパネルをホバー表示（ピン留め可能）。開いた後はパネル内にカーソルがある間、左端まで移動しても表示を維持する
 - メタデータパネル: AI 生成プロンプト (A1111 互換 / ComfyUI / NovelAI / InvokeAI / SwarmUI / Fooocus 系 / EasyDiffusion / JPEG EXIF UserComment) + EXIF 撮影情報 + 外部メタデータサイドカー (画像と同名 JSON/TXT を読み取り専用で表示) を表示。HTTP(S) URL はクリック可能リンクとして表示する。最上段のタグセクションでは、ピン留めタグを常時表示し、現在の対象に付いている未ピン留めタグも表示する。各行の `＋` から同じ右パネルをタグ選択ビューへ切り替え、タグを検索 / 入力して付与できる。入力欄が空のときは `ピン留め` / `最近` タブで候補を切り替える
-- S キー・▶ ボタンでスライドショー。間隔設定可能。各ページが描画できる状態になってから設定秒数を数え、右上の小さな円形インジケータで次の切替までの進行を示す。ZIP 内の区切り表示は同じ間隔で進む。**動画はスキップして継続**する（動画では止まらない）。フォルダ末尾に到達したときの動作は設定で選べる（フォルダ内でループ＝既定 / 次のフォルダへ進む / 最後で停止）。「次のフォルダへ進む」は手動フォルダ移動と同じ前順走査で次の静止画フォルダへ進み、移動先に画像が無ければ停止する。**スライドショー中のフォルダ内移動（矢印キー・ホイール・クリック・Home・End）は再生を止めない**（一部スキップしつつ継続できる）。フォルダ移動操作 (Ctrl+↑↓) や S / Space / Esc は停止する。Space は再生中は停止、停止中はチェック ON/OFF
+- S キー・▶ ボタンでスライドショー。停止中の ▶ ボタンはページ送り間隔・連結読みスクロール設定・末尾動作を設定するポップアップを開き、再生中の一時停止ボタンは即停止する。S キーは直接再生 / 停止する。通常ページ表示では各ページが描画できる状態になってから設定秒数を数え、右上の小さな円形インジケータで次の切替までの進行を示す。縦/横連結読み中は、待機時間ごとに設定した割合だけ短時間スクロールする間欠スクロールで進み、連結読みの終端で通常の末尾動作へ合流する。ZIP 内の区切り表示は同じ間隔で進む。**動画はスキップして継続**する（動画では止まらない）。フォルダ末尾に到達したときの動作は設定で選べる（フォルダ内でループ＝既定 / 次のフォルダへ進む / 最後で停止）。「次のフォルダへ進む」は手動フォルダ移動と同じ前順走査で次の静止画フォルダへ進み、移動先に画像が無ければ停止する。**スライドショー中のフォルダ内移動（矢印キー・ホイール・クリック・Home・End）は再生を止めない**（一部スキップしつつ継続できる）。フォルダ移動操作 (Ctrl+↑↓) や S / Space / Esc は停止する。Space は再生中は停止、停止中はチェック ON/OFF
 - R / L キーまたは回転ボタンで非破壊回転（通常画像 / ZIP 内画像 / PDF ページをページ単位で SQLite に保存）
 - アニメーション GIF・APNG・WebP はフルスクリーンでそのまま再生。Animated は playback-only で、編集・AI アップスケール・ポストフィルタの対象外
 - 動画はフルスクリーンでインライン再生。下部 HUD の速度ボタンから 0.5x〜3.0x の
@@ -1045,6 +1045,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
 | `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
+| `auto_fullscreen_image_folders` | bool | false | `auto_fullscreen_zip_pdf` が ON のとき、表示上の項目が 1 件以上かつ通常画像だけのフォルダも、ページ一覧を経由せずフルスクリーンで表示する。サブフォルダ、動画、ZIP/PDF、対応アーカイブが混ざるフォルダは対象外。開く位置は `book_open_resume` に従い、Esc/Enter は親一覧、Backspace はそのフォルダのページ一覧へ戻る |
 | `fullscreen_fit_mode` | FullscreenFitMode | Page | フルスクリーンのズーム/フィット基準。ページ全体 / 横幅 / 縦幅 / 100%原寸。旧ページ全体+余白カットは表示トリムの自動余白カットへ移行する |
 | `fullscreen_fit_no_upscale` | bool | false | 自動フィット時に 100% を超える拡大をしない。手動ズームは制限しない |
 | `fullscreen_fit_no_downscale` | bool | false | 自動フィット時に 100% 未満へ縮小しない。ON の場合、画像が画面外へはみ出す表示でもパンできる |
@@ -1104,7 +1105,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
 | `video_grid_open_starts_from_beginning` | bool | false | 位置復元マトリクス「動画 × 一覧から開く」の保存先 (v0.9.0 リリース済み bool を流用)。ON = 先頭から / OFF = 続きから。UI からは `video_open_resume` / `set_video_open_resume` 経由で ResumeMode として読み書き |
 | `video_nav_resume` | ResumeMode | Resume | 位置復元マトリクス「動画 × Ctrl+↑↓ 移動 (ホイール/キー含む)」。Resume=続きから / FromStart=先頭から |
-| `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |
+| `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF/対応アーカイブ/画像のみ通常フォルダ × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |
 | `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
@@ -1149,6 +1150,9 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 |--------|-----|---------|------|
 | `exif_hidden_tags` | Vec\<String\> | [MakerNote, UserComment, ...] | EXIF 表示で非表示にするタグ名リスト |
 | `slideshow_interval_secs` | f32 | 3.0 | スライドショーの切り替え間隔（秒） |
+| `slideshow_continuous_wait_secs` | f32 | 1.5 | 縦/横連結読み中スライドショーのスクロール間隔（秒） |
+| `slideshow_continuous_scroll_secs` | f32 | 0.2 | 縦/横連結読み中スライドショーの1回のスクロール時間（秒）。0 の場合は即時スクロール |
+| `slideshow_continuous_scroll_percent` | u32 | 50 | 縦/横連結読み中スライドショーの1回のスクロール量。現在の表示領域の幅または高さに対する % で指定する |
 | `slideshow_end_action` | SlideshowEndAction | LoopFolder | スライドショーがフォルダ末尾に達したときの動作。`LoopFolder`=フォルダ内で先頭へループ / `NextFolder`=次の静止画フォルダへ進む（無ければ停止） / `Stop`=末尾で停止 |
 | `skip_zip_if_folder_exists` | bool | true | 同名フォルダがある ZIP/PDF/RAR/7z/LZH をグリッドから非表示にする（フォルダツリー走査からも除外） |
 | `skip_image_if_video_exists` | bool | true | 同名動画がある画像をスキップ（画像は動画サムネイルとして使用） |

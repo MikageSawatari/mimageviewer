@@ -2068,6 +2068,15 @@ pub struct Settings {
     /// スライドショーの切り替え間隔（秒）
     #[serde(default = "default_slideshow_interval")]
     pub slideshow_interval_secs: f32,
+    /// 連結読み中スライドショーのスクロール間隔（秒）。
+    #[serde(default = "default_slideshow_continuous_wait_secs")]
+    pub slideshow_continuous_wait_secs: f32,
+    /// 連結読み中スライドショーの1回のスクロール時間（秒）。
+    #[serde(default = "default_slideshow_continuous_scroll_secs")]
+    pub slideshow_continuous_scroll_secs: f32,
+    /// 連結読み中スライドショーの1回のスクロール量（画面幅/高さに対する %）。
+    #[serde(default = "default_slideshow_continuous_scroll_percent")]
+    pub slideshow_continuous_scroll_percent: u32,
     /// スライドショーがフォルダ末尾に到達したときの動作。
     /// 新規フィールド (serde default = LoopFolder = 旧来挙動) なので移行不要。
     #[serde(default)]
@@ -2225,6 +2234,11 @@ pub struct Settings {
     /// 既定 OFF (従来どおりページ一覧を表示)。
     #[serde(default)]
     pub auto_fullscreen_zip_pdf: bool,
+    /// `auto_fullscreen_zip_pdf` が ON のとき、表示上の項目が通常画像だけのフォルダも
+    /// ページ一覧を経由せず先頭/続きページをフルスクリーンで開く。
+    /// 既定 OFF (従来どおりフォルダ内ページ一覧を表示)。
+    #[serde(default)]
+    pub auto_fullscreen_image_folders: bool,
 
     /// 旧設定互換用。読み込み時に `fullscreen_fit_mode == MarginFit` へ寄せ、
     /// 本を開いたタイミングで表示トリム Auto + ページ全体フィットへ移行する。
@@ -3259,6 +3273,15 @@ pub fn default_image_ext_priority() -> Vec<String> {
 fn default_slideshow_interval() -> f32 {
     3.0
 }
+fn default_slideshow_continuous_wait_secs() -> f32 {
+    1.5
+}
+fn default_slideshow_continuous_scroll_secs() -> f32 {
+    0.2
+}
+fn default_slideshow_continuous_scroll_percent() -> u32 {
+    50
+}
 fn default_spread_page_gap_px() -> u32 {
     4
 }
@@ -3426,6 +3449,9 @@ impl Default for Settings {
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
+            slideshow_continuous_wait_secs: default_slideshow_continuous_wait_secs(),
+            slideshow_continuous_scroll_secs: default_slideshow_continuous_scroll_secs(),
+            slideshow_continuous_scroll_percent: default_slideshow_continuous_scroll_percent(),
             slideshow_end_action: SlideshowEndAction::default(),
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
@@ -3454,6 +3480,7 @@ impl Default for Settings {
             continuous_reading_gamepad_scroll_percent_per_sec:
                 default_continuous_reading_gamepad_scroll_percent_per_sec(),
             auto_fullscreen_zip_pdf: false,
+            auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
             first_setup_completed: false,
@@ -4312,6 +4339,10 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    pub fn auto_fullscreen_image_folders_enabled(&self) -> bool {
+        self.auto_fullscreen_zip_pdf && self.auto_fullscreen_image_folders
+    }
+
     pub fn books_root_path(&self) -> PathBuf {
         crate::books::settings_books_root(self)
     }
@@ -4650,6 +4681,24 @@ impl Settings {
         self.video_playback_speed =
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
         self.ring_shortcuts.sanitize();
+        self.slideshow_interval_secs = if self.slideshow_interval_secs.is_finite() {
+            self.slideshow_interval_secs.clamp(0.5, 30.0)
+        } else {
+            default_slideshow_interval()
+        };
+        self.slideshow_continuous_wait_secs = if self.slideshow_continuous_wait_secs.is_finite() {
+            self.slideshow_continuous_wait_secs.clamp(0.1, 30.0)
+        } else {
+            default_slideshow_continuous_wait_secs()
+        };
+        self.slideshow_continuous_scroll_secs = if self.slideshow_continuous_scroll_secs.is_finite()
+        {
+            self.slideshow_continuous_scroll_secs.clamp(0.0, 5.0)
+        } else {
+            default_slideshow_continuous_scroll_secs()
+        };
+        self.slideshow_continuous_scroll_percent =
+            self.slideshow_continuous_scroll_percent.clamp(1, 100);
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
         self.continuous_reading_wheel_scroll_percent =
@@ -5333,6 +5382,10 @@ mod tests {
         assert!(s.thumb_idle_upgrade);
         assert_eq!(s.spread_page_gap_px, 4);
         assert_eq!(s.continuous_reading_gap_px, 20);
+        assert_eq!(s.slideshow_interval_secs, 3.0);
+        assert_eq!(s.slideshow_continuous_wait_secs, 1.5);
+        assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
+        assert_eq!(s.slideshow_continuous_scroll_percent, 50);
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(s.fullscreen_page_number_overlay);
@@ -5347,6 +5400,8 @@ mod tests {
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);
+        assert!(!s.auto_fullscreen_zip_pdf);
+        assert!(!s.auto_fullscreen_image_folders);
         assert!(s.show_toolbar_favorites);
         assert!(s.show_toolbar_tags);
         assert!(!s.folder_tree_pane_visible);
@@ -5939,6 +5994,10 @@ mod tests {
         s.continuous_reading_wheel_scroll_percent = 0;
         s.continuous_reading_key_scroll_percent = 999;
         s.continuous_reading_gamepad_scroll_percent_per_sec = 999;
+        s.slideshow_interval_secs = f32::NAN;
+        s.slideshow_continuous_wait_secs = f32::NAN;
+        s.slideshow_continuous_scroll_secs = f32::NAN;
+        s.slideshow_continuous_scroll_percent = 999;
         s.fullscreen_jump_percent = 999;
         s.fullscreen_fixed_jump_count = 999;
         s.fullscreen_cursor_hide_delay_secs = 99.0;
@@ -5950,6 +6009,10 @@ mod tests {
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
         assert_eq!(s.continuous_reading_key_scroll_percent, 100);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
+        assert_eq!(s.slideshow_interval_secs, 3.0);
+        assert_eq!(s.slideshow_continuous_wait_secs, 1.5);
+        assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
+        assert_eq!(s.slideshow_continuous_scroll_percent, 100);
         assert_eq!(s.fullscreen_jump_percent, FULLSCREEN_JUMP_PERCENT_MAX);
         assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MAX);
         assert_eq!(

@@ -232,14 +232,19 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 
 環境設定 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
 起動引数 / SendTo / 外部ファイラから ZIP/PDF/対応アーカイブを直接開くと、ページ一覧
-(L2) を経由せずページを直接フルスクリーン (L3) で開く**。MangaMeeya 風の
-「本棚 → 本を開く → 読む → 閉じて本棚」フロー。開く位置は `book_open_resume`
-(続きから / 先頭から) に従う。
+(L2) を経由せずページを直接フルスクリーン (L3) で開く**。追加設定
+`auto_fullscreen_image_folders` が ON の場合は、表示上の項目が通常画像だけのフォルダも
+同じくページ一覧をスキップして開く。MangaMeeya 風の「本棚 → 本を開く → 読む → 閉じて本棚」
+フロー。開く位置は `book_open_resume` (続きから / 先頭から) に従う。
 
 - グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
-  `pending_auto_fs_open` を立てる (ZipFile/PdfFile/ConvertibleArchive のみ。Folder は対象外)。
+  `pending_auto_fs_open` を立てる (ZipFile/PdfFile/ConvertibleArchive、追加設定 ON の
+  Folder)。Folder は `load_folder_with_scan` 後に表示項目が 1 件以上かつ全て `Image`
+  だった場合だけ予約を消費してフルスクリーンを開き、サブフォルダ / 動画 / ZIP/PDF /
+  変換アーカイブが混ざる場合は一覧表示に戻す。
 - 起動パス / 既存インスタンス転送 (`open_startup_path`) は、解決後の openable が
-  ZIP/CBZ/PDF または RAR/CBR/7z/CB7/LZH/LHA のときだけ同じ明示オープン意図を渡す。
+  ZIP/CBZ/PDF または RAR/CBR/7z/CB7/LZH/LHA、または追加設定 ON の Directory のときだけ
+  同じ明示オープン意図を渡す。
   変換アーカイブは `archive_file_handling` に従い、`Ask` / `Convert` の場合だけ
   キャッシュヒット / 変換確認 / 自動変換の後で同じ deferred fullscreen 経路に入る。
   `Ignore` では明示オープンの自動フルスクリーン予約も立てない。
@@ -247,6 +252,8 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate` (`DeferredFsReopen`) に
   載せ替える。Ctrl+↑↓ フォルダナビと同じ consume 経路 (`finalize_zip_enumerate` /
   `poll_pdf_enumerate`) で `find_fullscreen_nav_target_filtered` が先頭ページを開く。
+- 通常フォルダは enumerate 待ちが無いので、`load_folder_with_scan` が既存の走査結果から
+  画像のみ判定を行い、`book_open_resume` に従って保存済みページまたは先頭画像を開く。
 - パスワード付き PDF では、grid / 起動パス / SendTo 由来の明示オープン予約だけを
   入力ダイアログ後まで維持する。Ctrl+↑↓ 由来の deferred reopen は従来どおり破棄する。
 
@@ -255,27 +262,31 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 「どう入ったか」を覚える一時フラグ (旧 `fs_zip_auto_opened` / `auto_opened_container`) は
 **廃止**。階層 (L1 ファイル一覧 > L2 ページ一覧 > フルスクリーン) の概念は変えず、
 モードB はあくまで **L2 を飛ばすショートカット**として扱う。判定は設定
-`auto_fullscreen_zip_pdf` と「いまコンテナ (ZIP/PDF/変換アーカイブ由来のキャッシュ ZIP) の中か」だけ。
+`auto_fullscreen_zip_pdf` と「いまコンテナ (ZIP/PDF/変換アーカイブ由来のキャッシュ ZIP、
+または追加設定 ON の画像のみ通常フォルダ) の中か」だけ。
 
 - **分岐するのは 2 箇所だけ:**
   1. **L1 でファイルを開く** (Enter/ダブルクリック): モードA → L2 ページ一覧 / モードB →
      フルスクリーン (L2 スキップ)。
   2. **フルスクリーンで <kbd>Esc</kbd> / <kbd>Enter</kbd> / 右クリック**
      (`handle_fullscreen_close_request`): `auto_open_for_current_container()`
-     (= 設定B & `current_folder` が ZIP/PDF/変換アーカイブ由来のキャッシュ ZIP & 非検索) が真なら親一覧 (L1) へ直帰
+     (= 設定B & `current_folder` が ZIP/PDF/変換アーカイブ由来のキャッシュ ZIP、または
+     追加設定 ON の画像のみ通常フォルダ & 非検索) が真なら親一覧 (L1) へ直帰
      (`pending_return_to_parent` を立て、`App::update` の入力ナビ合流点が
      `AddressBarNav::Direct(parent)` を発行。L2 を 1 フレームも見せない)。偽なら 1 段だけ
      `close_fullscreen` (モードA のコンテナ → L2、通常画像 → 親グリッド)。
 - **<kbd>Backspace</kbd> は両モード共通で階層を 1 段戻す** (分岐なし):
-  - フルスクリーン (ZIP/PDF/変換アーカイブ由来ページ) → L2 ページ一覧 (`FsKeyAction.close_to_page_list` →
-    `close_fullscreen`。`current_folder` がコンテナのまま閉じるので L2 が出る)。
+  - フルスクリーン (ZIP/PDF/変換アーカイブ由来ページ、または追加設定 ON の画像のみ通常フォルダ)
+    → L2 ページ一覧 (`FsKeyAction.close_to_page_list` → `close_fullscreen`。`current_folder` が
+    コンテナ/通常フォルダのまま閉じるので L2 が出る)。
   - L2 ページ一覧 → L1 (通常の grid BS = 親フォルダ)。
   - 設定Bのまま L2 ページ一覧から再度 Enter/ダブルクリックでページ表示した場合も、
     Esc/Enter/右クリックは設定どおり L1 へ直帰する (「直接オープン由来」フラグは持たない)。
 - **Ctrl+↑↓ フォルダナビで ZIP/PDF/変換アーカイブコンテナへ移っても**、退出は同じく設定で決まる
   (連続読書)。`reopen_fullscreen_after_folder_nav_load` はフラグを立てる必要がなく、
-  移動先が ZIP/PDF/変換アーカイブなら次の本も Esc→親一覧 / Backspace→ページ一覧 になる。loose 画像の
-  通常フォルダへ移った場合は (コンテナでないので) 通常の出口に戻る。検索 (Ctrl+S/G) 中は
+  移動先が ZIP/PDF/変換アーカイブなら次の本も Esc→親一覧 / Backspace→ページ一覧 になる。
+  画像のみ通常フォルダも追加設定 ON なら同じ出口になり、追加設定 OFF または画像以外が混ざる
+  通常フォルダへ移った場合は通常の出口に戻る。検索 (Ctrl+S/G) 中は
   Esc が検索を抜ける想定外を避けるため `auto_open_for_current_container()` が偽になり適用しない。
 
 ---

@@ -77,6 +77,12 @@ impl App {
                 true,
                 "開いたとき、ページをフルスクリーン表示",
             );
+            ui.add_enabled_ui(self.settings.auto_fullscreen_zip_pdf, |ui| {
+                ui.checkbox(
+                    &mut self.settings.auto_fullscreen_image_folders,
+                    "画像のみの通常フォルダも、ページをフルスクリーン表示",
+                );
+            });
 
             ui.add_space(14.0);
             ui.separator();

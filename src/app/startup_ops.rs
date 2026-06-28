@@ -245,11 +245,19 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     openable: &Path,
     kind: crate::folder_tree::OpenablePathKind,
 ) -> bool {
-    settings.auto_fullscreen_zip_pdf
-        && matches!(kind, crate::folder_tree::OpenablePathKind::File)
-        && (crate::folder_tree::is_virtual_folder(openable)
-            || (!settings.archive_file_handling_ignores_convertible()
-                && crate::folder_tree::is_convertible_archive_path(openable)))
+    if !settings.auto_fullscreen_zip_pdf {
+        return false;
+    }
+    match kind {
+        crate::folder_tree::OpenablePathKind::File => {
+            crate::folder_tree::is_virtual_folder(openable)
+                || (!settings.archive_file_handling_ignores_convertible()
+                    && crate::folder_tree::is_convertible_archive_path(openable))
+        }
+        crate::folder_tree::OpenablePathKind::Directory => {
+            settings.auto_fullscreen_image_folders_enabled()
+        }
+    }
 }
 
 fn resolve_startup_open_path(

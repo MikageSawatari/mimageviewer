@@ -99,12 +99,18 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         true,
         "開いたとき、ページをフルスクリーン表示",
     );
+    ui.add_enabled_ui(state.settings.auto_fullscreen_zip_pdf, |ui| {
+        ui.checkbox(
+            &mut state.settings.auto_fullscreen_image_folders,
+            "画像のみの通常フォルダも、ページをフルスクリーン表示",
+        );
+    });
     ui.label(
         egui::RichText::new(
             "ページをフルスクリーン表示する場合、開く位置 (1 ページ目 / 続きから) は\
              「履歴と復元」設定に従います。フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
-             Backspace でそのファイルのページ一覧を表示します。外部ファイラや SendTo から\
-             開いた本にも適用されます。",
+             Backspace でその本またはフォルダのページ一覧を表示します。外部ファイラや SendTo から\
+             開いた本・画像のみの通常フォルダにも適用されます。",
         )
         .weak(),
     );
@@ -367,11 +373,46 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.horizontal(|ui| {
-        ui.label("切り替え間隔:");
+        ui.label("ページ送り間隔:");
         ui.add(
             egui::Slider::new(&mut state.settings.slideshow_interval_secs, 0.5..=30.0)
                 .suffix(" 秒")
                 .fixed_decimals(1),
+        );
+    });
+
+    ui.add_space(8.0);
+    ui.label("連結読みスライドショー:");
+    ui.horizontal(|ui| {
+        ui.label("待機時間:");
+        ui.add(
+            egui::Slider::new(
+                &mut state.settings.slideshow_continuous_wait_secs,
+                0.1..=30.0,
+            )
+            .suffix(" 秒")
+            .fixed_decimals(1),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("スクロール時間:");
+        ui.add(
+            egui::Slider::new(
+                &mut state.settings.slideshow_continuous_scroll_secs,
+                0.0..=5.0,
+            )
+            .suffix(" 秒")
+            .fixed_decimals(1),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("1回のスクロール量:");
+        ui.add(
+            egui::Slider::new(
+                &mut state.settings.slideshow_continuous_scroll_percent,
+                1..=100,
+            )
+            .suffix(" %"),
         );
     });
 
