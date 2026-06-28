@@ -16413,6 +16413,41 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn image_only_detached_setting_does_not_carry_panorama_into_next_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\pano_a.jpg");
+        let second = push_image(&mut app, r"C:\pics\pano_b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "always_new_panorama_first");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.pano_toast_shown_for_current_fs = true;
+        app.analysis_mode = true;
+        app.analysis_zoom = 2.0;
+        app.analysis_pan = egui::vec2(8.0, -3.0);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_open_intent_from_grid = true;
+
+        app.open_fullscreen(second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert!(
+            app.panorama_state.is_none(),
+            "a newly opened detached still window should start in normal image mode"
+        );
+        assert!(!app.pano_toast_shown_for_current_fs);
+        assert!(
+            !app.analysis_mode,
+            "analysis mode is also a foreground mode and must not leak into the next window"
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].location_display, "pano_a.jpg");
+    }
+
+    #[test]
     fn image_only_detached_setting_ignores_stale_pin_when_parking_next_image() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -18081,16 +18116,17 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_viewer_native_geometry_saves_outer_position_and_inner_size() {
+    fn detached_viewer_logical_rect_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
-        app.last_pixels_per_point = 2.0;
 
-        app.save_detached_viewer_placement_from_native_geometry(240, 280, 1280, 720, false);
+        let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
+        let inner = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(640.0, 360.0));
+        app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false);
 
         let placement = app
             .settings
             .detached_viewer_window_placement
-            .expect("native placement should be saved");
+            .expect("logical placement should be saved");
         assert_eq!(placement.x, 120.0);
         assert_eq!(placement.y, 140.0);
         assert_eq!(placement.w, 640.0);
@@ -18256,7 +18292,8 @@ mod still_window_mode_key_tests {
                 maximized: false,
             });
 
-        app.save_detached_viewer_placement_from_native_geometry(0, 0, 3840, 2160, true);
+        let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+        app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true);
 
         let placement = app
             .settings

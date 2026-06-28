@@ -22751,6 +22751,9 @@ impl App {
 
     #[cfg(windows)]
     fn park_active_detached_image_window(&mut self, pinned: bool) -> bool {
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.reset_detached_pause_foreground_modes(fs_idx);
+        }
         let Some(snapshot) = self.build_active_detached_image_window_snapshot(None, pinned) else {
             return false;
         };
