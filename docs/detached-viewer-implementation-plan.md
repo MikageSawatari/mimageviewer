@@ -418,6 +418,10 @@ enum NativeVideoPlacement {
   zoom / pan、現在ページ、ページ列は保持する。連結スクロール中は中央ページ 1 枚ではなく、
   pause 時点で画面内に見えていたページ群の texture と正規化済み矩形を frozen snapshot として
   保持し、passive window は worker を動かさずその frozen list を描く。
+- パノラマ、Shift+Z 分析、消しゴム / 隠蔽 / テキスト / crop / 補正レイヤーなどの前景ツールは
+  active window 専用とする。active viewer を paused 化する直前に通常画像表示へ戻し、paused
+  bundle へツール起動状態を持ち越さない。未確定の消しゴムマスクは自動 inpaint せず既存の
+  reset 経路で破棄し、隠蔽加工 / テキストなど既存の終了時保存を持つツールはその終了処理に従う。
 - passive window の `ViewportBuilder` は初回生成時だけ placement を適用し、その後の位置 / サイズは
   OS 側の live geometry を読み取って保存する。毎フレーム `with_position` / `with_inner_size` を
   再適用して drag 中の窓と競合させない。

@@ -175,8 +175,9 @@ stable `ViewportId` を維持する。active / passive で viewport 名前空間
 - 再アクティブ化用 `ViewerContextBundle`
   - 現在ページ、ページ列、`fullscreen_idx`
   - zoom / pan / 見開き / 表示モードなど表示状態
-  - 360 度パノラマの ON/OFF 状態と案内トースト済み状態
-  - Shift+Z 分析モードの ON/OFF、固定色、フィルタ、分析用キャッシュ状態
+  - 360 度パノラマ、Shift+Z 分析、消しゴム / 隠蔽 / テキスト / crop / 補正レイヤーなどの
+    前景ツールは active viewer 専用とし、paused 化する前に自動終了する。paused bundle には
+    通常画像表示へ戻した後の zoom / pan / 現在ページだけを保持する。
   - 現在表示中の `fs_cache` / texture
   - context generation / window id
 - fallback 用 `ViewerContextDescriptor`
@@ -193,6 +194,8 @@ paused window をアクティブ化したときは、保持していた `ViewerC
 pending は単に捨てず、cancel flag を立ててから context から外す。AI worker の結果チャネルは全
 context 共有なので、main context が active detached context 宛ての final AI 結果を先に drain した
 場合は backlog に退避し、active context を mount したタイミングで取り込む。
+パノラマ / 分析 / 編集系 overlay は pause 前に通常表示へ戻すため、別 window を再アクティブ化した
+ときは必要に応じてユーザーが再度起動する。
 ただし表示中の 1 枚、連結スクロールの可視範囲、zoom / pan、現在ページ、ページ列は保持する。
 これにより、再アクティブ化時の画像消失、ズーム初期化、OS ウィンドウ close/create による外枠
 ちらつきを避ける。

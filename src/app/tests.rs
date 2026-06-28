@@ -17289,6 +17289,95 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn pausing_detached_context_exits_foreground_modes_before_stashing_bundle() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        let idx = push_image(&mut app, r"C:\pics\foreground.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(42);
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, -0.5));
+        app.pano_toast_shown_for_current_fs = true;
+        app.analysis_mode = true;
+        app.analysis_zoom = 2.5;
+        app.analysis_pan = egui::vec2(12.0, -8.0);
+        app.fs_zoom = 1.25;
+        app.fs_pan = egui::vec2(3.0, 4.0);
+        app.compare_view_mode = CompareViewMode::PinnedNormal;
+        app.show_metadata_panel = true;
+        app.metadata_panel_hover_active = true;
+        app.fs_loupe_locked = true;
+        app.adjustment_mode = true;
+        app.local_adjust_mode = true;
+        app.view_trim_mode = true;
+        app.erase_mode = true;
+        app.erase_mask = Some(vec![true, false]);
+        app.erase_mask_size = [2, 1];
+        insert_static_fs_entry(&mut app, &ctx, idx, "pause_foreground_modes");
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        assert!(app.pause_current_active_detached_viewer_context(&ctx));
+
+        assert!(!app.erase_mode);
+        assert!(app.erase_mask.is_none());
+        assert!(!app.adjustment_mode);
+        assert!(!app.local_adjust_mode);
+        assert!(!app.view_trim_mode);
+        assert!(!app.show_metadata_panel);
+        assert!(!app.metadata_panel_hover_active);
+        assert!(!app.fs_loupe_locked);
+        assert!(matches!(app.compare_view_mode, CompareViewMode::Off));
+        let paused = app.detached_image_windows[0]
+            .paused_bundle
+            .as_ref()
+            .expect("pause should keep the viewer bundle");
+        assert!(
+            paused.panorama_state.is_none(),
+            "paused detached windows should freeze normal image display, not keep panorama mode active"
+        );
+        assert!(!paused.pano_toast_shown_for_current_fs);
+        assert!(!paused.analysis_mode);
+        assert_eq!(
+            paused.fs_zoom, 2.5,
+            "leaving analysis mode should preserve the analysis zoom as the normal display zoom"
+        );
+        assert_eq!(paused.fs_pan, egui::vec2(12.0, -8.0));
+    }
+
+    #[test]
+    fn detached_pause_finishes_adjustment_drag_session() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\adjust.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.adjustment_mode = true;
+        app.adjustment_dragging = true;
+        let before = crate::adjustment::AdjustParams::default();
+        let mut after = before.clone();
+        after.brightness = 18.0;
+        app.adjustment_page_params.insert(idx, after.clone());
+        app.adjustment_drag_session = Some(AdjustmentDragSession {
+            fs_idx: idx,
+            before: Some(before),
+        });
+
+        app.reset_detached_pause_foreground_modes(idx);
+
+        assert!(!app.adjustment_mode);
+        assert!(!app.adjustment_dragging);
+        assert!(app.adjustment_drag_session.is_none());
+        assert_eq!(app.adjustment_page_params.get(&idx), Some(&after));
+    }
+
+    #[test]
     fn final_ai_results_deferred_until_detached_context_is_mounted() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

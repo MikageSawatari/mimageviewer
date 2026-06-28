@@ -21987,6 +21987,9 @@ impl App {
         };
 
         self.swap_viewer_context_bundle(&mut active.bundle);
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.reset_detached_pause_foreground_modes(fs_idx);
+        }
         let pinned =
             self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
         let Some(mut snapshot) =
@@ -22004,6 +22007,91 @@ impl App {
         snapshot.paused_bundle = Some(Box::new(paused_bundle));
         self.detached_image_windows.push(snapshot);
         true
+    }
+
+    #[cfg(windows)]
+    fn reset_detached_pause_foreground_modes(&mut self, fs_idx: usize) {
+        self.spread_popup_open = false;
+        self.fit_popup_open = false;
+        self.slideshow_popup_open = false;
+        self.capture_region_selection = None;
+        self.clear_fullscreen_tag_picker_state();
+
+        self.compare_view_mode = CompareViewMode::Off;
+        if self.panorama_state.is_some() {
+            self.toggle_panorama_mode(fs_idx);
+        }
+        self.pano_toast_shown_for_current_fs = false;
+        if self.analysis_mode {
+            self.toggle_analysis_mode();
+        }
+        self.show_metadata_panel = false;
+        self.metadata_panel_hover_active = false;
+        self.fs_loupe_locked = false;
+
+        self.persist_pending_view_trim_state();
+        self.view_trim_mode = false;
+        self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
+
+        self.finish_adjustment_drag_for_detached_pause();
+        self.adjustment_mode = false;
+        self.local_adjust_mode = false;
+        self.local_adjust_add_layer_dialog_open = false;
+        self.local_adjust_change_mask_dialog_open = false;
+        self.local_adjust_change_mask_keep_manual_override = true;
+        self.local_adjust_effect_picker_dialog_open = false;
+        self.local_adjust_canvas_drag = None;
+        self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
+        self.local_adjust_selected_shape = None;
+        self.local_adjust_shape_drag = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_shape_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
+        self.local_adjust_brush_deferred_render = None;
+        self.local_adjust_lut_pending = None;
+        self.local_adjust_segmentation_pending = None;
+        self.cancel_all_local_adjust_pending();
+
+        if self.erase_mode {
+            self.reset_erase_mode();
+        }
+        if self.conceal_mode {
+            self.reset_conceal_mode();
+        }
+        if self.text_mode {
+            self.text_spread_ctx = None;
+            self.reset_text_mode();
+        }
+        if self.export_crop_mode {
+            self.export_crop_spread_ctx = None;
+            self.reset_export_crop_mode();
+        }
+    }
+
+    #[cfg(windows)]
+    fn finish_adjustment_drag_for_detached_pause(&mut self) {
+        self.adjustment_dragging = false;
+        if let Some(session) = self.adjustment_drag_session.take() {
+            let in_memory = self.adjustment_page_params.get(&session.fs_idx).cloned();
+            if session.before != in_memory {
+                if let Some(params) = in_memory.clone() {
+                    self.set_page_params(session.fs_idx, params);
+                } else {
+                    self.clear_page_params(session.fs_idx);
+                }
+                let after = self.adjustment_page_params.get(&session.fs_idx).cloned();
+                self.capture_adjustment_undo(
+                    crate::undo_stack::AdjustUndoScope::Page(session.fs_idx),
+                    session.before,
+                    after,
+                    "ページ個別の補正".to_string(),
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
