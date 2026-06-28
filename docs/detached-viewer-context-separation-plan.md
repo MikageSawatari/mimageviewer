@@ -172,6 +172,7 @@ stable `ViewportId` を維持する。active / passive で viewport 名前空間
 - 再アクティブ化用 `ViewerContextBundle`
   - 現在ページ、ページ列、`fullscreen_idx`
   - zoom / pan / 見開き / 表示モードなど表示状態
+  - 360 度パノラマの ON/OFF 状態と案内トースト済み状態
   - 現在表示中の `fs_cache` / texture
   - context generation / window id
 - fallback 用 `ViewerContextDescriptor`

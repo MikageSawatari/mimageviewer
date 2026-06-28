@@ -17356,6 +17356,38 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn active_detached_context_uses_its_own_panorama_mode_state() {
+        let mut app = setup_app();
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, 0.0));
+        app.pano_toast_shown_for_current_fs = true;
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.panorama_state = None;
+        bundle.pano_toast_shown_for_current_fs = false;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        let _ = app.with_active_detached_viewer_context(|mounted| {
+            assert!(
+                mounted.panorama_state.is_none(),
+                "a detached window must not inherit panorama mode from another viewer context"
+            );
+            assert!(
+                !mounted.pano_toast_shown_for_current_fs,
+                "panorama guide state is also per fullscreen viewer context"
+            );
+            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(0.25, -0.1));
+            mounted.pano_toast_shown_for_current_fs = true;
+        });
+
+        let active = app.active_detached_viewer_context.as_ref().unwrap();
+        assert!(
+            active.bundle.panorama_state.is_some(),
+            "panorama mode enabled in the detached window must be stored with that window"
+        );
+        assert!(active.bundle.pano_toast_shown_for_current_fs);
+    }
+
+    #[test]
     fn virtual_page_list_parent_nav_closes_active_detached_without_passive_snapshot() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;

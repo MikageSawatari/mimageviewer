@@ -297,6 +297,8 @@ struct ViewerContextBundle {
     detached_viewer_pin_active: bool,
     detached_viewer_open_next_still_detached_once: bool,
     detached_viewer_window_id: Option<u64>,
+    panorama_state: Option<crate::panorama::PanoramaState>,
+    pano_toast_shown_for_current_fs: bool,
     fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
@@ -444,6 +446,8 @@ impl ViewerContextBundle {
             detached_viewer_pin_active: false,
             detached_viewer_open_next_still_detached_once: false,
             detached_viewer_window_id: None,
+            panorama_state: None,
+            pano_toast_shown_for_current_fs: false,
             fs_cache: std::collections::HashMap::new(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
@@ -7873,6 +7877,8 @@ impl App {
             detached_viewer_pin_active,
             detached_viewer_open_next_still_detached_once,
             detached_viewer_window_id,
+            panorama_state,
+            pano_toast_shown_for_current_fs,
             fs_cache,
             fs_margin_bbox_cache,
             input_generation,
@@ -8006,6 +8012,8 @@ impl App {
         swap_field!(detached_viewer_pin_active);
         swap_field!(detached_viewer_open_next_still_detached_once);
         swap_field!(detached_viewer_window_id);
+        swap_field!(panorama_state);
+        swap_field!(pano_toast_shown_for_current_fs);
         swap_field!(fs_cache);
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
