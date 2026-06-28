@@ -2768,6 +2768,7 @@ mod tests {
             display_name: "Photoshop".to_string(),
             exe_path: r"C:\bin\ps.exe".to_string(),
         }];
+        s.detached_viewer_open_images_in_window = true;
         s.menu_layout = crate::keymap::MenuLayoutSettings {
             top_menu_order: vec!["Help".to_string(), "File".to_string()],
             command_order: vec![crate::keymap::MenuCommandOrderSettings {

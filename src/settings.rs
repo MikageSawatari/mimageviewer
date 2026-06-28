@@ -4876,7 +4876,6 @@ impl Settings {
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
-        self.detached_viewer_open_images_in_window = src.detached_viewer_open_images_in_window;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // ── お気に入り / タグ (専用ダイアログで編集) ──
         self.favorites = std::mem::take(&mut src.favorites);
@@ -5385,6 +5384,45 @@ mod tests {
         assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
+    }
+
+    #[test]
+    fn overwrite_non_preferences_keeps_detached_image_window_preference() {
+        let mut edited = Settings::default();
+        let mut live = Settings::default();
+        edited.detached_viewer_open_images_in_window = true;
+        edited.detached_viewer_enabled = false;
+        edited.detached_viewer_window_placement = None;
+        live.detached_viewer_open_images_in_window = false;
+        live.detached_viewer_enabled = true;
+        live.detached_viewer_window_placement = Some(DetachedViewerWindowPlacement {
+            x: 120.0,
+            y: 140.0,
+            w: 860.0,
+            h: 640.0,
+            maximized: true,
+        });
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert!(
+            edited.detached_viewer_open_images_in_window,
+            "the preferences checkbox value must survive OK apply"
+        );
+        assert!(
+            edited.detached_viewer_enabled,
+            "runtime F12 detached mode still comes from the live settings"
+        );
+        assert_eq!(
+            edited.detached_viewer_window_placement,
+            Some(DetachedViewerWindowPlacement {
+                x: 120.0,
+                y: 140.0,
+                w: 860.0,
+                h: 640.0,
+                maximized: true,
+            })
+        );
     }
 
     /// 旧設定 (`ai_upscale_skip_px` のみ、新フィールドなし) は `N x N` として
