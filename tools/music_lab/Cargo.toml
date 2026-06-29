@@ -1,0 +1,13 @@
+[package]
+name = "music_lab"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+cpal = "0.16"
+eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.33"
+music-core = { path = "../../crates/music-core" }
+rfd = "0.15"
+symphonia = { version = "0.5", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }

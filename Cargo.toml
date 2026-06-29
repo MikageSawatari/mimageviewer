@@ -4,11 +4,13 @@ members = [
     "crates/launcher",
     "crates/local-adjust-core",
     "crates/comic-core",
+    "crates/music-core",
     "crates/vst3-host-tester",
     "tools/png2mag",
     "tools/mask_lab",
     "tools/local_adjust_lab",
     "tools/comic_lab",
+    "tools/music_lab",
 ]
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の
