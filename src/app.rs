@@ -29827,9 +29827,13 @@ impl App {
         // wrapper (close_fullscreen_for_folder_nav_reopen) が立てる reuse 意図
         // (detached_viewer_folder_nav_reuse_window_once) も条件に含めて、folder-nav
         // reopen の間ずっと detached identity を維持する。
-        let preserve_detached_for_folder_nav = (self.fs_nav_is_locked()
-            || self.detached_viewer_folder_nav_reuse_window_once)
-            && self.viewer_session_is_detached();
+        // 判定は session 状態 (`detached_active_window_alive_wanted`) を使う。close_fullscreen は
+        // 先に `fullscreen_idx=None` にしてから本関数を呼ぶことがあり、`viewer_session_is_detached()`
+        // (= fullscreen_idx.is_some() 必須) だと folder-nav 中でも false になって borderless 等を
+        // 誤クリアする (window_id は reuse フォールバックで救われていたが borderless は救われず、
+        // F11 仮想フルスクリーンが folder-nav で最大化に化けていた)。session が alive (=未 close)
+        // の間は detached identity を維持する。
+        let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted();
         if !preserve_detached_for_folder_nav {
             self.viewer_presentation = self.non_detached_viewer_presentation();
             self.last_viewer_sync_stamp = None;

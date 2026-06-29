@@ -18119,6 +18119,8 @@ mod still_window_mode_key_tests {
         app.detached_viewer_folder_nav_reuse_window_once = true;
         app.settings.detached_viewer_open_images_in_window = true;
         app.fs_nav_locked_gen = Some(app.items_generation);
+        // session が alive (= 未 close) の間は detached identity を維持する (新ガード)。
+        app.begin_active_detached_session(42, crate::app::DetachedSource::Image);
 
         // ロック中は「現在の detached ウィンドウを park する」判定を抑止 (= 別ウィンドウ
         // 化せず内容差し替えで再利用)。
@@ -18138,15 +18140,49 @@ mod still_window_mode_key_tests {
             "folder-nav reuse intent must survive the intermediate close"
         );
 
-        // reopen 完了相当: take_detached_folder_nav_reuse_window_for_open が reuse 意図を
-        // 消費し、fs_nav ロックも解放された状態。通常 close では従来どおり detached identity を
-        // クリアする。
+        // 真の close 相当: 明示終了経路が session を畳んでから close_fullscreen を通る。
+        // session が None になったら通常どおり detached identity をクリアする。
+        app.begin_active_detached_session_close("test");
+        app.finish_active_detached_session_close("test");
         app.fs_nav_locked_gen = None;
         app.detached_viewer_folder_nav_reuse_window_once = false;
         app.prepare_viewer_presentation_close();
         assert_eq!(
             app.detached_viewer_window_id, None,
             "a normal (non-folder-nav) close still tears down the detached identity"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn folder_nav_close_preserves_borderless_fullscreen_while_session_alive() {
+        // F11 仮想フルスクリーン (borderless) が folder-nav の中間 close (close_fullscreen →
+        // prepare_viewer_presentation_close) で失われない = 最大化ウィンドウに化けないことを固定。
+        // 判定は fullscreen_idx ではなく session 状態なので、close で fullscreen_idx=None に
+        // なっていても維持できる (旧 viewer_session_is_detached 依存だと誤クリアしていた)。
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(7);
+        app.detached_viewer_borderless_fullscreen = true;
+        app.begin_active_detached_session(7, crate::app::DetachedSource::Image);
+
+        // close_fullscreen が先に fullscreen_idx=None にしてから prepare を呼ぶ状況を再現。
+        app.fullscreen_idx = None;
+        app.prepare_viewer_presentation_close();
+        assert!(
+            app.detached_viewer_borderless_fullscreen,
+            "F11 borderless must survive the intermediate folder-nav close (no revert to maximized)"
+        );
+
+        // 真の close (session を畳んでから) では borderless もクリアする。
+        app.begin_active_detached_session_close("test");
+        app.finish_active_detached_session_close("test");
+        app.prepare_viewer_presentation_close();
+        assert!(
+            !app.detached_viewer_borderless_fullscreen,
+            "a genuine close (session ended) clears borderless state"
         );
     }
 
