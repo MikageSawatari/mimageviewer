@@ -1,6 +1,8 @@
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
@@ -25,6 +27,7 @@ const TIMELINE_ROW_GAP: f32 = 12.0;
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(75);
+const PERF_LOG_INTERVAL: Duration = Duration::from_secs(2);
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 
@@ -85,13 +88,31 @@ enum LoadMsg {
 
 struct SpectrumMsg {
     bands: Vec<f32>,
+    compute_ms: f32,
 }
 
 #[derive(Default)]
 struct FrameStats {
     last_frame: Option<Instant>,
+    last_log: Option<Instant>,
+    perf_log: Option<PerfLogSink>,
     fps: f32,
     frame_ms: f32,
+    update_ms: f32,
+    poll_ms: f32,
+    top_ms: f32,
+    left_ms: f32,
+    right_ms: f32,
+    bottom_ms: f32,
+    central_ms: f32,
+    spectrum_compute_ms: f32,
+    timeline_rows: usize,
+    timeline_bins: usize,
+}
+
+struct PerfLogSink {
+    tx: mpsc::Sender<String>,
+    path: PathBuf,
 }
 
 impl FrameStats {
@@ -114,6 +135,132 @@ impl FrameStats {
             self.frame_ms = self.frame_ms * 0.90 + frame_ms * 0.10;
         }
     }
+
+    fn record_update(&mut self, duration: Duration) {
+        Self::smooth_ms(&mut self.update_ms, duration);
+    }
+
+    fn record_poll(&mut self, duration: Duration) {
+        Self::smooth_ms(&mut self.poll_ms, duration);
+    }
+
+    fn record_top(&mut self, duration: Duration) {
+        Self::smooth_ms(&mut self.top_ms, duration);
+    }
+
+    fn record_left(&mut self, duration: Duration) {
+        Self::smooth_ms(&mut self.left_ms, duration);
+    }
+
+    fn record_right(&mut self, duration: Duration) {
+        Self::smooth_ms(&mut self.right_ms, duration);
+    }
+
+    fn record_bottom(&mut self, duration: Duration) {
+        Self::smooth_ms(&mut self.bottom_ms, duration);
+    }
+
+    fn record_central(&mut self, duration: Duration, timeline: TimelineDrawStats) {
+        Self::smooth_ms(&mut self.central_ms, duration);
+        self.timeline_rows = timeline.visible_rows;
+        self.timeline_bins = timeline.drawn_bins;
+    }
+
+    fn record_spectrum_compute(&mut self, compute_ms: f32) {
+        Self::smooth_value(&mut self.spectrum_compute_ms, compute_ms.max(0.0));
+    }
+
+    fn log_path(&self) -> PathBuf {
+        self.perf_log
+            .as_ref()
+            .map(|sink| sink.path.clone())
+            .unwrap_or_else(perf_log_path)
+    }
+
+    fn maybe_log(&mut self, playing: bool, spectrum_pending: bool) {
+        let now = Instant::now();
+        if self
+            .last_log
+            .is_some_and(|last| now.saturating_duration_since(last) < PERF_LOG_INTERVAL)
+        {
+            return;
+        }
+        self.last_log = Some(now);
+
+        if self.perf_log.is_none() {
+            self.perf_log = PerfLogSink::spawn();
+        }
+        let Some(sink) = &self.perf_log else {
+            return;
+        };
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let line = format!(
+            concat!(
+                "ts_ms={ts_ms} fps={fps:.1} frame_ms={frame_ms:.1} ",
+                "update_ms={update_ms:.1} poll_ms={poll_ms:.1} top_ms={top_ms:.1} ",
+                "left_ms={left_ms:.1} right_ms={right_ms:.1} bottom_ms={bottom_ms:.1} ",
+                "central_ms={central_ms:.1} spectrum_compute_ms={spectrum_compute_ms:.1} ",
+                "timeline_rows={timeline_rows} timeline_bins={timeline_bins} ",
+                "playing={playing} spectrum_pending={spectrum_pending}"
+            ),
+            ts_ms = ts_ms,
+            fps = self.fps,
+            frame_ms = self.frame_ms,
+            update_ms = self.update_ms,
+            poll_ms = self.poll_ms,
+            top_ms = self.top_ms,
+            left_ms = self.left_ms,
+            right_ms = self.right_ms,
+            bottom_ms = self.bottom_ms,
+            central_ms = self.central_ms,
+            spectrum_compute_ms = self.spectrum_compute_ms,
+            timeline_rows = self.timeline_rows,
+            timeline_bins = self.timeline_bins,
+            playing = playing,
+            spectrum_pending = spectrum_pending,
+        );
+        let _ = sink.tx.send(line);
+    }
+
+    fn smooth_ms(slot: &mut f32, duration: Duration) {
+        Self::smooth_value(slot, duration.as_secs_f32() * 1000.0);
+    }
+
+    fn smooth_value(slot: &mut f32, value: f32) {
+        if *slot <= 0.0 {
+            *slot = value;
+        } else {
+            *slot = *slot * 0.85 + value * 0.15;
+        }
+    }
+}
+
+impl PerfLogSink {
+    fn spawn() -> Option<Self> {
+        let path = perf_log_path();
+        let thread_path = path.clone();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("music-lab-perf-log".into())
+            .spawn(move || {
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&thread_path)
+                {
+                    let _ = writeln!(file, "# mIV music lab perf log");
+                    while let Ok(line) = rx.recv() {
+                        let _ = writeln!(file, "{line}");
+                        let _ = file.flush();
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { tx, path })
+    }
 }
 
 #[derive(Default)]
@@ -135,27 +282,54 @@ struct MusicLabApp {
 
 impl eframe::App for MusicLabApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let update_start = Instant::now();
         self.frame_stats.record_frame();
+
+        let stage_start = Instant::now();
         self.poll_loader(ctx);
         self.poll_spectrum_analyzer(ctx);
-        self.draw_top_bar(ctx);
-        self.draw_left_panel(ctx);
-        self.draw_right_panel(ctx);
-        self.draw_bottom_bar(ctx);
+        self.frame_stats.record_poll(stage_start.elapsed());
 
+        let stage_start = Instant::now();
+        self.draw_top_bar(ctx);
+        self.frame_stats.record_top(stage_start.elapsed());
+
+        let stage_start = Instant::now();
+        self.draw_left_panel(ctx);
+        self.frame_stats.record_left(stage_start.elapsed());
+
+        let stage_start = Instant::now();
+        self.draw_right_panel(ctx);
+        self.frame_stats.record_right(stage_start.elapsed());
+
+        let stage_start = Instant::now();
+        self.draw_bottom_bar(ctx);
+        self.frame_stats.record_bottom(stage_start.elapsed());
+
+        let stage_start = Instant::now();
+        let mut timeline_stats = TimelineDrawStats::default();
+        let track = self.track.as_ref();
+        let player = self.player.as_ref();
+        let snap = self.player_snapshot();
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(track) = &self.track {
+            if let Some(track) = track {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        draw_timeline(ui, track, self.player.as_ref(), self.player_snapshot());
+                        timeline_stats = draw_timeline(ui, track, player, snap);
                     });
             } else {
                 draw_empty_state(ui, &self.load_status);
             }
         });
+        self.frame_stats
+            .record_central(stage_start.elapsed(), timeline_stats);
+        self.frame_stats.record_update(update_start.elapsed());
 
-        if self.player.as_ref().is_some_and(|p| p.snapshot().playing) {
+        let playing = self.player.as_ref().is_some_and(|p| p.snapshot().playing);
+        self.frame_stats.maybe_log(playing, self.spectrum_pending);
+
+        if playing {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
@@ -215,11 +389,21 @@ impl MusicLabApp {
                     }
                     ui.separator();
                     ui.label(format!(
-                        "FPS {:.1}  {:.1} ms",
-                        self.frame_stats.fps, self.frame_stats.frame_ms
+                        "FPS {:.1}  {:.1} ms  UI {:.1} C {:.1} B {:.1} bins {}",
+                        self.frame_stats.fps,
+                        self.frame_stats.frame_ms,
+                        self.frame_stats.update_ms,
+                        self.frame_stats.central_ms,
+                        self.frame_stats.bottom_ms,
+                        self.frame_stats.timeline_bins
                     ));
                     if self.spectrum_pending {
                         ui.label("Spectrum: analyzing");
+                    } else if self.frame_stats.spectrum_compute_ms > 0.0 {
+                        ui.label(format!(
+                            "Spectrum worker {:.1} ms",
+                            self.frame_stats.spectrum_compute_ms
+                        ));
                     }
                     if !self.load_status.is_empty() {
                         ui.separator();
@@ -308,6 +492,23 @@ impl MusicLabApp {
                         egui::TextEdit::singleline(&mut "#lab #music".to_string()),
                     );
                     ui.label("本体統合時に既存 tags.db へ接続する想定");
+                    ui.separator();
+                    ui.heading("Perf");
+                    ui.label(format!(
+                        "Frame/UI: {:.1} / {:.1} ms",
+                        self.frame_stats.frame_ms, self.frame_stats.update_ms
+                    ));
+                    ui.label(format!(
+                        "Central: {:.1} ms, rows {}, bins {}",
+                        self.frame_stats.central_ms,
+                        self.frame_stats.timeline_rows,
+                        self.frame_stats.timeline_bins
+                    ));
+                    ui.label(format!(
+                        "Spectrum draw/worker: {:.1} / {:.1} ms",
+                        self.frame_stats.bottom_ms, self.frame_stats.spectrum_compute_ms
+                    ));
+                    ui.label(format!("Log: {}", self.frame_stats.log_path().display()));
                 } else {
                     ui.label("Open an audio file to inspect it.");
                 }
@@ -394,6 +595,7 @@ impl MusicLabApp {
         if let Some(rx) = self.spectrum_rx.as_ref() {
             match rx.try_recv() {
                 Ok(msg) => {
+                    self.frame_stats.record_spectrum_compute(msg.compute_ms);
                     self.spectrum_bands = msg.bands;
                     self.spectrum_pending = false;
                     self.spectrum_rx = None;
@@ -430,13 +632,15 @@ impl MusicLabApp {
         let spawned = std::thread::Builder::new()
             .name("music-lab-spectrum".into())
             .spawn(move || {
+                let compute_start = Instant::now();
                 let bands = spectrum_bands_from_stereo_window(
                     &decoded.stereo_samples,
                     decoded.info.sample_rate,
                     position_secs,
                     SPECTRUM_BANDS,
                 );
-                let _ = tx.send(SpectrumMsg { bands });
+                let compute_ms = compute_start.elapsed().as_secs_f32() * 1000.0;
+                let _ = tx.send(SpectrumMsg { bands, compute_ms });
                 repaint_ctx.request_repaint();
             });
         if spawned.is_ok() {
@@ -455,6 +659,10 @@ impl MusicLabApp {
     }
 }
 
+fn perf_log_path() -> PathBuf {
+    std::env::temp_dir().join("miv_music_lab_perf.log")
+}
+
 fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
@@ -467,12 +675,19 @@ fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
     });
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TimelineDrawStats {
+    visible_rows: usize,
+    drawn_bins: usize,
+}
+
 fn draw_timeline(
     ui: &mut egui::Ui,
     track: &LoadedTrack,
     player: Option<&LabPlayer>,
     snap: PlaybackSnapshot,
-) {
+) -> TimelineDrawStats {
+    let mut stats = TimelineDrawStats::default();
     let row_secs = track.analysis.config.row_secs.max(1.0);
     let rows = (track.decoded.info.duration_secs / row_secs)
         .ceil()
@@ -502,7 +717,8 @@ fn draw_timeline(
             continue;
         }
         let row_start = row as f64 * row_secs;
-        draw_timeline_row(
+        stats.visible_rows += 1;
+        stats.drawn_bins += draw_timeline_row(
             &painter,
             row_rect,
             row_start,
@@ -543,6 +759,7 @@ fn draw_timeline(
             }
         }
     }
+    stats
 }
 
 fn draw_timeline_row(
@@ -552,7 +769,8 @@ fn draw_timeline_row(
     row_secs: f64,
     bins: &[WaveformBin],
     dark: bool,
-) {
+) -> usize {
+    let mut drawn_bins = 0;
     let bg = if dark {
         egui::Color32::from_rgb(18, 22, 24)
     } else {
@@ -597,6 +815,7 @@ fn draw_timeline_row(
         if bin_end < row_start || bin.start_secs > row_start + row_secs {
             continue;
         }
+        drawn_bins += 1;
         let visible_start = bin.start_secs.max(row_start);
         let visible_end = bin_end.min(row_start + row_secs);
 
@@ -675,6 +894,7 @@ fn draw_timeline_row(
             loudness_color(loudness),
         );
     }
+    drawn_bins
 }
 
 fn draw_beat_grid(
