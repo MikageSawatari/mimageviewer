@@ -1782,8 +1782,25 @@ impl App {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return None;
         };
-        if self.fullscreen_idx.is_some() && self.items_generation > locked_gen {
-            return None;
+        if let Some(idx) = self.fullscreen_idx
+            && self.items_generation > locked_gen
+        {
+            // 新フォルダの items が入り、新しい `fullscreen_idx` も有効になった後。
+            // ここで holdover を即座に切ると、新 idx の full / サムネがまだデコード
+            // できていない数フレームの間が黒 / loading になる。borderless 全画面では
+            // 目立たないが、装飾付きの detached window では「次のファイルへ移るたびに
+            // 一瞬ちらつく」症状になる (v2.2.0 比の体感差。詳細は
+            // docs/detached-viewer-lifecycle-redesign-proposal.md)。
+            //
+            // 描画側 (`prepare_fullscreen_state`) は full → サムネ → holdover の順で
+            // 優先するため、新 idx の表示物が用意できた / デコード失敗が確定した時点で
+            // holdover を返さないようにすれば、stale な旧画像が残ることはない。
+            // それまでは holdover (旧画像) を維持して黒を挟まず滑らかに繋ぐ。
+            let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
+            let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
+            if new_content_ready || new_content_failed {
+                return None;
+            }
         }
         self.fs_holdover_tex.clone()
     }
@@ -1797,6 +1814,10 @@ impl App {
     pub(crate) fn release_fs_nav_lock(&mut self) {
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
+        #[cfg(windows)]
+        {
+            self.detached_viewer_folder_nav_reuse_window_once = false;
+        }
     }
 
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込み、`items_generation` を
@@ -1857,7 +1878,10 @@ impl App {
             self.thumbnails.get(idx),
             Some(crate::grid_item::ThumbnailState::Loaded { .. })
         );
-        if has_full || has_thumb {
+        // 新 idx のデコードが失敗確定 (Failed) の場合も lock を解放する。さもないと
+        // holdover (旧画像) が残り続け、以降の Ctrl+↑↓ が lock でブロックされる。
+        let has_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
+        if has_full || has_thumb || has_failed {
             self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
         }
@@ -3151,6 +3175,14 @@ fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> 
 
 impl App {
     pub(crate) fn fullscreen_viewport_id(&self) -> egui::ViewportId {
+        // keep-alive (§3.1/§3.2): detached セッションが在る間は、その window_id を**最優先**で
+        // ViewportId の素にする。これで既存描画経路 (fullscreen_viewport_id 利用) と backstop
+        // (session.window_id 利用) が**常に同じ ViewportId** を指し、gap で presentation や
+        // detached_viewer_window_id が一時的に揺れても「2 枚目の小窓」を作らない。
+        #[cfg(windows)]
+        if let Some(session) = self.active_detached_session {
+            return Self::detached_image_window_viewport_id(session.window_id);
+        }
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
             && let Some(window_id) = self.detached_viewer_window_id
@@ -4308,12 +4340,7 @@ impl App {
         // 体感を緩和する。
         if self.fs_viewport_shown && self.fs_nav_deferred_reopen_wait_active() {
             #[cfg(windows)]
-            let fs_builder = match self.fs_viewport_presentation {
-                Some(ViewerPresentation::DetachedWindow) => {
-                    self.build_detached_viewer_viewport_builder(0, None, false)
-                }
-                _ => self.build_fullscreen_viewport_builder(),
-            };
+            let fs_builder = self.build_inactive_fullscreen_viewport_builder(0);
             #[cfg(not(windows))]
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
@@ -4360,6 +4387,10 @@ impl App {
                         }
                     });
             });
+            // keep-alive marker: deferred holdover で描いた fs_id が現セッションの detached id と
+            // 一致するときだけ marker を立てる (§3.6/§3.7)。
+            #[cfg(windows)]
+            self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             if cancel {
                 // 保留中の「列挙後にフルスクリーン復帰」意図を破棄。
                 // poll_pdf_enumerate 完了時のフルスクリーン再オープンが抑止され、
@@ -4371,6 +4402,11 @@ impl App {
                 // 明示 release で確実に状態をクリーンにする (embedded 用ヘルパと対称、
                 // Codex 第 3 ラウンド P2)。
                 self.release_fs_nav_lock();
+                // deferred holdover 中の Esc / × は detached viewer を閉じる明示操作。
+                // 同フレームの backstop より前に session を畳んで空窓の再描画を防ぐ
+                // (Codex レビュー #3 site 3)。
+                self.begin_active_detached_session_close("deferred_holdover_cancel");
+                self.finish_active_detached_session_close("deferred_holdover_cancel");
                 ctx.request_repaint();
             }
             return;
@@ -4381,19 +4417,26 @@ impl App {
         if !self.fs_viewport_shown {
             return;
         }
+        // ここに到達 = `fullscreen_idx=None` かつ `fs_viewport_shown` かつ deferred 待ちでない
+        // = 「本当に detached/fullscreen を閉じた」cleanup フレーム (folder-nav は上の deferred
+        // 分岐 or 同フレーム reopen で到達しない)。keep-alive session をここで確実に畳む
+        // (§3.7 closing の robust chokepoint)。これを忘れると backstop が空の detached 窓を
+        // 描き続け「小窓が残る / 閉じられない」になる (Codex レビュー #3 / 実機ログ)。
+        // 明示 close 経路 (handle_fullscreen_close_request 等) と二重でも idempotent。
+        #[cfg(windows)]
+        if self.active_detached_session.is_some() {
+            self.begin_active_detached_session_close("keep_alive_cleanup");
+            self.finish_active_detached_session_close("keep_alive_cleanup");
+        }
         // ここに来るのは close_fullscreen 直後の 1 フレーム。
         // show_viewport_immediate を 1 回呼んで viewport を alive にし、
         // ViewportBuilder::with_visible(false) は「initial」可視性しか制御しないため、
         // 一度表示済みのビューポートを隠すには明示的に Visible(false) を送る必要がある。
         // 送信直前に DWM トランジションを無効化して Win11 のフェードアウトを抑止する。
         #[cfg(windows)]
-        let fs_builder = match self.fs_viewport_presentation {
-            Some(ViewerPresentation::DetachedWindow) => {
-                self.build_detached_viewer_viewport_builder(0, None, false)
-            }
-            _ => self.build_fullscreen_viewport_builder(),
-        }
-        .with_visible(false);
+        let fs_builder = self
+            .build_inactive_fullscreen_viewport_builder(0)
+            .with_visible(false);
         #[cfg(not(windows))]
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         #[cfg(windows)]
@@ -4426,6 +4469,81 @@ impl App {
             self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
             self.fs_viewport_recreate_after_hide = false;
         }
+    }
+
+    /// keep-alive backstop (docs/detached-viewer-keepalive-design.md §3.2/§4 K0)。
+    ///
+    /// アクティブ detached セッションが生きている (`alive_wanted`) のに、このフレームで
+    /// どの既存経路も detached viewport を描かなかった場合に、ここが holdover で 1 回だけ
+    /// 描いて egui に OS ウィンドウを破棄させない。これにより PDF/ZIP の列挙待ちなど
+    /// `fullscreen_idx=None` のギャップでも「描かれないフレーム」が生じない。
+    ///
+    /// `App::update` のフルスクリーン区間の**末尾**で毎フレーム呼ぶこと。
+    #[cfg(windows)]
+    pub(crate) fn render_active_detached_viewport_backstop(&mut self, ctx: &egui::Context) {
+        if !self.detached_active_window_alive_wanted() {
+            return;
+        }
+        if self.active_detached_viewport_rendered_this_frame() {
+            return; // 既存経路が今フレーム描いた → 二重描画しない。
+        }
+        let Some(viewport_id) = self.active_detached_session_viewport_id() else {
+            return;
+        };
+        // 既存の detached 描画と同じ builder を使う (decorations/transparent/taskbar が変わると
+        // egui が窓を作り直すため)。window が既に在る (host 捕捉済み) なら geometry は触らない。
+        let title_idx = self.fullscreen_idx.unwrap_or(0);
+        let apply_placement = self.detached_viewer_host_hwnd == 0;
+        let builder = self.build_detached_viewer_viewport_builder(title_idx, None, apply_placement);
+        // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
+        let tex = self
+            .fullscreen_idx
+            .and_then(|idx| self.resolve_fs_display_tex(idx, true))
+            .or_else(|| self.fs_nav_holdover_tex_for_draw());
+        // 保険 (Codex #3): live ページも holdover も無い (fullscreen_idx=None && tex=None) なら、
+        // 描くべき中身が無い = もはや生かす意味のない空ウィンドウ。session close 漏れなどで
+        // ここに来ても、空の小窓を描き続けない (= 閉じられない症状の二重防止)。正規の
+        // 列挙待ち gap では holdover が在るのでこの早期 return には入らない。
+        if self.fullscreen_idx.is_none() && tex.is_none() {
+            self.log_detached_image_window_debug(
+                "keepalive_backstop skip: no content (fs_idx=None, no holdover)".to_string(),
+            );
+            return;
+        }
+        self.log_detached_image_window_debug(format!(
+            "keepalive_backstop window_id={:?} fs_idx={:?} has_tex={} host={}",
+            self.active_detached_session.map(|s| s.window_id),
+            self.fullscreen_idx,
+            tex.is_some(),
+            self.detached_viewer_host_debug_state()
+        ));
+        ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                .show(vp_ctx, |ui| {
+                    if let Some(handle) = tex.as_ref() {
+                        let avail = ui.available_size();
+                        let tex_size = handle.size_vec2();
+                        if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
+                            let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
+                            let img_rect = egui::Rect::from_center_size(
+                                ui.max_rect().center(),
+                                egui::vec2(tex_size.x * scale, tex_size.y * scale),
+                            );
+                            ui.painter().image(
+                                handle.id(),
+                                img_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                });
+        });
+        self.mark_active_detached_viewport_rendered();
     }
 
     /// in-window 静止画モード (`native_video_in_window_active`) で PDF/ZIP の
@@ -4649,13 +4767,18 @@ impl App {
             self.hide_current_fullscreen_viewport_for_recreate(ctx, fs_idx);
         }
         #[cfg(windows)]
-        if !embedded
+        let detached_host_lost_before_render = !embedded
             && detached
             && self.fs_viewport_shown
             && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
-            && self.detached_viewer_host_lost()
-        {
-            self.reset_detached_viewer_viewport_for_recreate("host_lost_before_render");
+            && self.detached_viewer_host_lost();
+        // host_lost を検出しても viewport は recreate しない (= generation を bump しない)。
+        // recreate するたびに既定サイズの窓が一瞬生成されるフラッシュ + recreate ループの
+        // 駆動源になっていたため、stale hwnd を捨てて次フレームの capture で取り直す。
+        // 詳細: docs/detached-viewer-lifecycle-redesign-proposal.md BA-1/BA-2/BA-3。
+        #[cfg(windows)]
+        if detached_host_lost_before_render {
+            self.handle_detached_viewer_host_lost_before_render();
         }
         #[cfg(windows)]
         if !embedded
@@ -4761,15 +4884,31 @@ impl App {
                             )
                         });
                     if !minimized && let Some(rect) = outer_rect {
-                        self.save_detached_viewer_placement_from_logical_rect(
-                            rect,
-                            inner_rect,
-                            pixels_per_point,
-                            maximized,
-                        );
-                        // New viewports are created hidden, so same-frame HWND matching can
-                        // grab the previous generation that is about to be destroyed.
+                        // New/recreated viewports can report egui's default
+                        // window rect before the requested placement settles.
+                        // Do not save or match that transient geometry.
                         if !need_show {
+                            self.remember_active_detached_viewport_render_probe(
+                                rect,
+                                pixels_per_point,
+                            );
+                            let restore_placement = self
+                                .save_detached_viewer_placement_from_logical_rect(
+                                    rect,
+                                    inner_rect,
+                                    pixels_per_point,
+                                    maximized,
+                                );
+                            if let Some(placement) = restore_placement {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                    egui::pos2(placement.x, placement.y),
+                                ));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                                    egui::vec2(placement.w, placement.h),
+                                ));
+                                ctx.request_repaint();
+                            }
                             self.capture_detached_viewer_host_hwnd_from_logical_rect(
                                 rect,
                                 pixels_per_point,
@@ -6113,6 +6252,10 @@ impl App {
                 main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _class| {
                     render_fs_body(vp_ctx, false);
                 });
+                // keep-alive marker: 描いた fs_id が現セッションの detached id と一致するときだけ
+                // marker を立てる (§3.6/§3.7)。backstop の二重描画/描き漏れ防止。
+                #[cfg(windows)]
+                self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             }
         }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
@@ -6609,6 +6752,36 @@ impl App {
 
     fn build_still_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
         self.build_fullscreen_viewport_builder_with_transparency_and_taskbar(true, true)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn build_inactive_fullscreen_viewport_builder(
+        &self,
+        fs_idx: usize,
+    ) -> egui::ViewportBuilder {
+        match self.fs_viewport_presentation {
+            Some(ViewerPresentation::DetachedWindow) => {
+                // holdover / cleanup 用の inactive builder。新規 OS 窓が生成される場合
+                // (= まだ host HWND を捕捉していない初回相当) だけ placement を seed し、
+                // 既定サイズ (822x656) で一瞬出るフラッシュを防ぐ。既に window がある
+                // (host!=0) ときは geometry を触らない: この経路は enumerate 待ち中に
+                // live_placement を更新しないため、待ちが長いときユーザーが detached 窓を
+                // drag/resize しても古い placement で引き戻さないようにする (Codex P2)。
+                let apply_placement = self.detached_viewer_host_hwnd == 0;
+                self.build_detached_viewer_viewport_builder(fs_idx, None, apply_placement)
+            }
+            Some(ViewerPresentation::Fullscreen) if !self.fs_viewport_recreate_after_hide => {
+                // Ctrl+↑↓ の PDF/ZIP deferred reopen は既存の静止画 fullscreen viewport
+                // を維持する内部遷移。待機描画中に位置・サイズを再指定すると
+                // OS 側で既存ウィンドウが一瞬別サイズへ寄ることがあるため、
+                // 静止画 fullscreen の属性だけを合わせ、geometry は触らない。
+                egui::ViewportBuilder::default()
+                    .with_decorations(false)
+                    .with_transparent(true)
+                    .with_taskbar(true)
+            }
+            _ => self.build_fullscreen_viewport_builder(),
+        }
     }
 
     fn build_detached_viewer_viewport_builder(

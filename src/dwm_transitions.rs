@@ -24,8 +24,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, GetWindowRect, HWND_TOP, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SetWindowPos,
+    EnumThreadWindows, GetWindowRect, HWND_TOP, IsIconic, IsWindowVisible, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
 };
 use windows::core::{BOOL, Result};
 
@@ -134,6 +134,31 @@ pub fn find_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT)
     }
 }
 
+pub fn debug_thread_windows_for_rect(main_hwnd: HWND, expected: RECT, limit: usize) -> String {
+    let mut state = DebugWindowsState {
+        main_hwnd,
+        expected,
+        entries: Vec::new(),
+    };
+    unsafe {
+        let tid = GetCurrentThreadId();
+        let state_ptr = &mut state as *mut DebugWindowsState;
+        let _ = EnumThreadWindows(
+            tid,
+            Some(debug_windows_enum_proc),
+            LPARAM(state_ptr as isize),
+        );
+    }
+    state.entries.sort_by_key(|entry| entry.score);
+    state
+        .entries
+        .into_iter()
+        .take(limit)
+        .map(|entry| entry.format())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn set_window_chrome_black(hwnd: HWND) {
     set_window_chrome_color(hwnd, 0x000000);
 }
@@ -181,6 +206,51 @@ struct RaiseWindowState {
     best_score: i64,
 }
 
+struct DebugWindowsState {
+    main_hwnd: HWND,
+    expected: RECT,
+    entries: Vec<DebugWindowEntry>,
+}
+
+struct DebugWindowEntry {
+    hwnd_raw: u64,
+    is_main: bool,
+    visible: bool,
+    iconic: bool,
+    rect_ok: bool,
+    rect: RECT,
+    score: i64,
+    contains_center: bool,
+    covers_most_expected: bool,
+}
+
+impl DebugWindowEntry {
+    fn format(&self) -> String {
+        if self.rect_ok {
+            format!(
+                "hwnd=0x{:x} main={} visible={} iconic={} rect=({},{} {}x{}) \
+                 score={} center={} cover={}",
+                self.hwnd_raw,
+                self.is_main,
+                self.visible,
+                self.iconic,
+                self.rect.left,
+                self.rect.top,
+                self.rect.right - self.rect.left,
+                self.rect.bottom - self.rect.top,
+                self.score,
+                self.contains_center,
+                self.covers_most_expected
+            )
+        } else {
+            format!(
+                "hwnd=0x{:x} main={} visible={} iconic={} rect=<err>",
+                self.hwnd_raw, self.is_main, self.visible, self.iconic
+            )
+        }
+    }
+}
+
 unsafe extern "system" fn raise_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut RaiseWindowState) };
     if hwnd.0 == state.main_hwnd.0 || !unsafe { IsWindowVisible(hwnd).as_bool() } {
@@ -216,5 +286,47 @@ unsafe extern "system" fn raise_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         state.best_score = score;
         state.best_hwnd = hwnd;
     }
+    BOOL(1)
+}
+
+unsafe extern "system" fn debug_windows_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut DebugWindowsState) };
+    let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+    let iconic = unsafe { IsIconic(hwnd).as_bool() };
+    let mut rect = RECT::default();
+    let rect_ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
+    let expected_width = (state.expected.right - state.expected.left).max(0) as i64;
+    let expected_height = (state.expected.bottom - state.expected.top).max(0) as i64;
+    let (score, contains_center, covers_most_expected) = if rect_ok {
+        let width = (rect.right - rect.left).max(0) as i64;
+        let height = (rect.bottom - rect.top).max(0) as i64;
+        let cx = state.expected.left + (state.expected.right - state.expected.left) / 2;
+        let cy = state.expected.top + (state.expected.bottom - state.expected.top) / 2;
+        (
+            (rect.left - state.expected.left).abs() as i64
+                + (rect.top - state.expected.top).abs() as i64
+                + (rect.right - state.expected.right).abs() as i64
+                + (rect.bottom - state.expected.bottom).abs() as i64,
+            rect.left <= cx && cx < rect.right && rect.top <= cy && cy < rect.bottom,
+            width > 0
+                && height > 0
+                && expected_width > 0
+                && expected_height > 0
+                && width * height >= (expected_width * expected_height * 2) / 3,
+        )
+    } else {
+        (i64::MAX, false, false)
+    };
+    state.entries.push(DebugWindowEntry {
+        hwnd_raw: hwnd.0 as usize as u64,
+        is_main: hwnd.0 == state.main_hwnd.0,
+        visible,
+        iconic,
+        rect_ok,
+        rect,
+        score,
+        contains_center,
+        covers_most_expected,
+    });
     BOOL(1)
 }

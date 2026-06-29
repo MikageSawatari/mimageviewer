@@ -9626,6 +9626,58 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn folder_nav_holdover_bridges_until_new_content_ready() {
+        // フォルダナビ (Ctrl+↑↓) で新フォルダ先頭画像のデコード待ち中、holdover
+        // (旧フレーム) を維持して黒フレームを挟まないことを固定する。新 idx の
+        // 表示物 (full / サムネ) が用意できたら holdover を返さない (stale 防止)。
+        // detached window で「次のファイルへ移るたびにちらつく」症状の回帰防止。
+        // docs/detached-viewer-lifecycle-redesign-proposal.md 参照。
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+
+        let holdover = ctx.load_texture(
+            "holdover_old_frame",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_holdover_tex = Some(holdover);
+        // capture 時点の generation を lock。その後フォルダ移動で items_generation が進む。
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.items_generation = app.items_generation.wrapping_add(1);
+
+        // 新 idx の full もサムネもまだ無い → holdover で黒を防ぐ。
+        assert!(
+            app.fs_nav_holdover_tex_for_draw().is_some(),
+            "new content not ready yet -> keep showing the previous frame (no black flicker)"
+        );
+
+        // 新 idx の full テクスチャが用意できた → holdover は返さない (描画側が new を優先)。
+        let new_tex = ctx.load_texture(
+            "new_full_frame",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: new_tex,
+                pixels: std::sync::Arc::new(egui::ColorImage::new(
+                    [1, 1],
+                    vec![egui::Color32::WHITE],
+                )),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        assert!(
+            app.fs_nav_holdover_tex_for_draw().is_none(),
+            "once new content is ready the holdover must stop so no stale image lingers"
+        );
+    }
+
+    #[test]
     fn details_warm_image_dims_uses_pdf_raster_content_type() {
         use crate::grid_item::GridItem;
 
@@ -10596,7 +10648,7 @@ mod favorite_adjustment_defaults_tests {
     /// Ctrl+↑↓ で次のフォルダ/ZIPへ進んだ後、タイトル/パスは新 target を
     /// 指しているのに旧 archive の画像だけが holdover で残らないこと。
     #[test]
-    fn fs_nav_holdover_for_draw_stops_after_new_fullscreen_target_is_active() {
+    fn fs_nav_holdover_for_draw_bridges_until_new_target_content_ready() {
         use crate::grid_item::{GridItem, ThumbnailState};
 
         let mut app = setup_app();
@@ -10640,9 +10692,30 @@ mod favorite_adjustment_defaults_tests {
             app.fs_holdover_tex.is_some(),
             "poll_fs_nav_lock が解除するまで内部 holdover は保持される"
         );
+        // 新 target の表示物がまだ無い間は holdover (旧画像) を描画 fallback に使う。
+        // ここで None にすると新画像デコード完了までの数フレームが黒になり、装飾付き
+        // detached window で「次のファイルへ移るたびにちらつく」症状になる。
+        assert!(
+            app.fs_nav_holdover_tex_for_draw().is_some(),
+            "新 target の表示物が未準備の間は holdover で黒を防ぐ (滑らかに繋ぐ)"
+        );
+
+        // 新 target のサムネがロードできたら holdover は使わない (描画側が新画像を優先、
+        // stale な旧画像が残らない)。
+        let new_tex = ctx.load_texture(
+            "fs-nav-new-archive",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = vec![ThumbnailState::Loaded {
+            tex: new_tex,
+            from_cache: false,
+            rendered_at_px: 64,
+            source_dims: None,
+        }];
         assert!(
             app.fs_nav_holdover_tex_for_draw().is_none(),
-            "新 target が active になった後は旧 archive 画像を描画 fallback に使わない"
+            "新 target の表示物が用意できたら holdover を停止して stale 旧画像を残さない"
         );
     }
 
@@ -17844,20 +17917,37 @@ mod still_window_mode_key_tests {
     fn detached_folder_nav_close_preserves_viewport_host_for_reopen() {
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.detached_viewer_host_hwnd = 0x1234;
+        app.detached_viewer_window_id = Some(12);
+        app.active_detached_viewer_live_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 10.0,
+                y: 20.0,
+                w: 800.0,
+                h: 600.0,
+                maximized: false,
+            });
         app.fs_viewport_generation = 77;
         app.fs_viewport_recreate_after_hide = false;
         app.pending_main_foreground_reclaim = true;
         app.pending_main_foreground_reclaim_after_hwnd = 0x5678;
+        app.fs_open_intent_from_grid = true;
+        let viewport_id_before = app.fullscreen_viewport_id();
 
         app.close_fullscreen_for_folder_nav_reopen();
 
         assert_eq!(app.fullscreen_idx, None);
         assert!(!app.viewer_session_is_detached());
+        assert_eq!(
+            app.viewer_presentation,
+            ViewerPresentation::DetachedWindow,
+            "internal detached folder nav must keep presentation so fullscreen_viewport_id keeps pointing at the same detached viewport"
+        );
         assert_eq!(app.selected, Some(idx));
         assert!(app.fs_viewport_shown);
         assert_eq!(
@@ -17865,7 +17955,25 @@ mod still_window_mode_key_tests {
             Some(ViewerPresentation::DetachedWindow)
         );
         assert_eq!(app.detached_viewer_host_hwnd, 0x1234);
+        assert_eq!(app.detached_viewer_window_id, Some(12));
+        assert_eq!(
+            app.fullscreen_viewport_id(),
+            viewport_id_before,
+            "folder-nav reopen must keep using the same detached ViewportId while fullscreen_idx is temporarily None"
+        );
+        assert!(
+            app.active_detached_viewer_live_placement.is_some(),
+            "live detached placement should survive the internal close->reopen transition"
+        );
         assert_eq!(app.fs_viewport_generation, 77);
+        assert!(
+            !app.fs_open_intent_from_grid,
+            "Ctrl+↑↓ is an internal reopen and must not carry a stale grid intent into the next detached open"
+        );
+        assert!(
+            app.detached_viewer_folder_nav_reuse_window_once,
+            "the following open_fullscreen call should explicitly reuse the detached window"
+        );
         assert!(
             !app.fs_viewport_recreate_after_hide,
             "folder-nav reopen should reuse the detached viewport instead of recreating it"
@@ -17875,6 +17983,392 @@ mod still_window_mode_key_tests {
             "internal detached navigation must not steal focus back to the main window"
         );
         assert_eq!(app.pending_main_foreground_reclaim_after_hwnd, 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_folder_nav_reopen_reuses_window_even_if_grid_intent_returns() {
+        let mut app = setup_app();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.detached_viewer_window_id = Some(12);
+        app.next_detached_image_window_id = 13;
+        app.active_detached_viewer_live_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 10.0,
+                y: 20.0,
+                w: 800.0,
+                h: 600.0,
+                maximized: false,
+            });
+        app.fs_open_intent_from_grid = true;
+        app.detached_viewer_folder_nav_reuse_window_once = true;
+        let viewport_id_before = app.fullscreen_viewport_id();
+
+        app.open_fullscreen(second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(
+            app.detached_viewer_window_id,
+            Some(12),
+            "folder-nav reopen must not allocate a new detached window id"
+        );
+        assert_eq!(app.fullscreen_viewport_id(), viewport_id_before);
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "internal folder navigation should replace the content in-place, not park the active window"
+        );
+        assert!(!app.fs_open_intent_from_grid);
+        assert!(!app.detached_viewer_folder_nav_reuse_window_once);
+        assert_eq!(app.next_detached_image_window_id, 13);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_host_lost_before_render_drops_stale_hwnd_without_recreate() {
+        // host_lost を検出しても viewport を recreate しない (= generation を bump
+        // しない) ことを固定する。recreate するとナビのたびに既定サイズの窓が一瞬
+        // 出るフラッシュ + recreate ループになる。
+        // docs/detached-viewer-lifecycle-redesign-proposal.md BA-1/BA-2/BA-3。
+        let mut app = setup_app();
+        app.fullscreen_idx = Some(push_image(&mut app, r"C:\pics\a.jpg"));
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.detached_viewer_window_id = Some(12);
+        app.fs_viewport_generation = 7;
+        // 解放済み等で IsWindow=false になる stale hwnd を模す。
+        app.detached_viewer_host_hwnd = 0x1234;
+
+        let viewport_id_before = app.fullscreen_viewport_id();
+        app.handle_detached_viewer_host_lost_before_render();
+
+        assert_eq!(
+            app.detached_viewer_host_hwnd, 0,
+            "stale hwnd must be dropped so the next frame can recapture the live window"
+        );
+        assert_eq!(
+            app.fs_viewport_generation, 7,
+            "host_lost must not bump the viewport generation (no recreate)"
+        );
+        assert!(
+            app.fs_viewport_shown,
+            "viewport stays shown; capture re-grabs the live window without recreate"
+        );
+        assert_eq!(
+            app.fullscreen_viewport_id(),
+            viewport_id_before,
+            "viewport id stays stable (no recreate)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_inactive_builder_seeds_placement_only_before_host_capture() {
+        // holdover / cleanup 用 inactive builder は、新規 OS 窓 (host 未捕捉) のときだけ
+        // placement を seed してフラッシュを防ぎ、既存 window (host 捕捉済み) には geometry を
+        // 触らず drag/resize の引き戻しを防ぐ (Codex P2)。
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        // host 未捕捉 = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
+        app.detached_viewer_host_hwnd = 0;
+        let builder = app.build_inactive_fullscreen_viewport_builder(idx);
+        assert!(
+            builder.inner_size.is_some(),
+            "fresh detached window must be created at the saved size, not the egui default"
+        );
+
+        // host 捕捉済み = 既存 window → geometry を触らない。
+        app.detached_viewer_host_hwnd = 0x1234;
+        let builder = app.build_inactive_fullscreen_viewport_builder(idx);
+        assert_eq!(
+            builder.inner_size, None,
+            "existing detached window must not be force-resized while waiting on enumerate (Codex P2)"
+        );
+        assert_eq!(
+            builder.position, None,
+            "existing detached window must not be repositioned while waiting on enumerate (Codex P2)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn folder_nav_close_preserves_detached_window_id_for_reuse() {
+        // フォルダナビ (Ctrl+↑↓) の reopen では、load_folder → start_loading_items が
+        // new items 導入前に close_fullscreen を呼ぶ。fs_nav ロック中はその close で
+        // detached_viewer_window_id を消さず維持し、reopen 側が新しい window_id を
+        // allocate して別ウィンドウ (fullscreen_viewport_id 変化 → OS 窓再生成) を
+        // 作らないことを固定する。実機動画 (2026-06-28) で「次フォルダへ移るたびに
+        // ウィンドウ再表示 + 既定サイズ小窓が一瞬」を確認した回帰の防止。
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(42);
+        app.detached_viewer_folder_nav_reuse_window_once = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+
+        // ロック中は「現在の detached ウィンドウを park する」判定を抑止 (= 別ウィンドウ
+        // 化せず内容差し替えで再利用)。
+        assert!(
+            !app.should_preserve_active_detached_image_window_for_main_context_change(),
+            "folder-nav must not park the active detached window; it is reused in place"
+        );
+
+        app.prepare_viewer_presentation_close();
+        assert_eq!(
+            app.detached_viewer_window_id,
+            Some(42),
+            "folder-nav reopen must keep the detached window_id so the same OS window is reused"
+        );
+        assert!(
+            app.detached_viewer_folder_nav_reuse_window_once,
+            "folder-nav reuse intent must survive the intermediate close"
+        );
+
+        // reopen 完了相当: take_detached_folder_nav_reuse_window_for_open が reuse 意図を
+        // 消費し、fs_nav ロックも解放された状態。通常 close では従来どおり detached identity を
+        // クリアする。
+        app.fs_nav_locked_gen = None;
+        app.detached_viewer_folder_nav_reuse_window_once = false;
+        app.prepare_viewer_presentation_close();
+        assert_eq!(
+            app.detached_viewer_window_id, None,
+            "a normal (non-folder-nav) close still tears down the detached identity"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn folder_nav_reopen_reuses_active_detached_window_id() {
+        // detached ウィンドウのフォルダナビ reopen は、(PDF/ZIP の非同期 enumerate などで)
+        // window_id が一旦 None になっても直前の window_id を再利用し、fullscreen_viewport_id
+        // (= detached では window_id 由来) を安定させる。これで次フォルダへ移るたびに
+        // ViewportId が変わって OS ウィンドウが破棄→再生成される (= 小窓カスケード /
+        // DWM フェード) のを防ぐ。v2.2.0 は generation 由来で安定していた挙動の復元。
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        // 初回 (grid から): 新規 allocate。
+        app.fs_open_intent_from_grid = true;
+        let first = app.ensure_detached_viewer_window_id();
+        let vid_first = app.fullscreen_viewport_id();
+        assert_eq!(app.last_active_detached_window_id, Some(first));
+
+        // フォルダナビの close 相当で window_id が None になる。
+        app.detached_viewer_window_id = None;
+
+        // folder-nav reopen (grid 由来でない) は同じ window_id を再利用 → ViewportId 不変。
+        app.fs_open_intent_from_grid = false;
+        let reopened = app.ensure_detached_viewer_window_id();
+        assert_eq!(
+            reopened, first,
+            "folder-nav reopen must reuse the previous detached window_id"
+        );
+        assert_eq!(
+            app.fullscreen_viewport_id(),
+            vid_first,
+            "viewport id must stay stable across folder-nav so the OS window is not recreated"
+        );
+
+        // grid からの新規オープンは別ウィンドウを作る (= 新しい id を allocate)。
+        app.detached_viewer_window_id = None;
+        app.fs_open_intent_from_grid = true;
+        let fresh = app.ensure_detached_viewer_window_id();
+        assert_ne!(
+            fresh, first,
+            "an explicit grid-originated open allocates a new window id"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_session_state_truth_table() {
+        // keep-alive の単一真実 (docs/detached-viewer-keepalive-design.md §3.1) の挙動を固定。
+        let mut app = setup_app();
+        // 初期: セッションなし → 生かさない。
+        assert!(!app.detached_active_window_alive_wanted());
+        assert_eq!(app.active_detached_session_viewport_id(), None);
+
+        // begin → 生かす。viewport id は window_id 由来で安定。
+        app.begin_active_detached_session(7, crate::app::DetachedSource::Image);
+        assert!(app.detached_active_window_alive_wanted());
+        assert_eq!(
+            app.active_detached_session_viewport_id(),
+            Some(App::detached_image_window_viewport_id(7))
+        );
+
+        // folder-nav reopen 相当 (同じ window_id で re-begin) → 据え置きで生かす。
+        app.begin_active_detached_session(7, crate::app::DetachedSource::Book);
+        assert!(app.detached_active_window_alive_wanted());
+        assert_eq!(
+            app.active_detached_session_viewport_id(),
+            Some(App::detached_image_window_viewport_id(7))
+        );
+
+        // closing=true → teardown 中は生かさない (backstop も止まる)。
+        app.begin_active_detached_session_close("test");
+        assert!(!app.detached_active_window_alive_wanted());
+
+        // finish → None。
+        app.finish_active_detached_session_close("test");
+        assert!(!app.detached_active_window_alive_wanted());
+        assert_eq!(app.active_detached_session_viewport_id(), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_rendered_marker_tracks_frame_and_id() {
+        // marker (§3.6): 現セッションの detached id を描いたフレームだけ立ち、frame_counter で
+        // 自動リセットされる。別 id では立たない (backstop の二重描画/描き漏れ防止)。
+        let mut app = setup_app();
+        app.begin_active_detached_session(3, crate::app::DetachedSource::Image);
+        app.frame_counter = 100;
+        assert!(!app.active_detached_viewport_rendered_this_frame());
+
+        // セッション id 一致 → marker が立つ。
+        app.mark_active_detached_viewport_rendered_if_matches(
+            App::detached_image_window_viewport_id(3),
+        );
+        assert!(app.active_detached_viewport_rendered_this_frame());
+
+        // 次フレーム → 自動リセット (frame_counter 同値判定)。
+        app.frame_counter = 101;
+        assert!(!app.active_detached_viewport_rendered_this_frame());
+
+        // 別 id (= 既存経路が別 viewport を描いた gap) では marker を立てない。
+        app.mark_active_detached_viewport_rendered_if_matches(
+            App::detached_image_window_viewport_id(999),
+        );
+        assert!(!app.active_detached_viewport_rendered_this_frame());
+    }
+
+    #[test]
+    fn fullscreen_folder_nav_close_preserves_still_viewport_for_reopen() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+        app.fs_viewport_generation = 42;
+        app.fs_viewport_recreate_after_hide = false;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+
+        app.close_fullscreen_for_folder_nav_reopen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.fs_viewport_presentation,
+            Some(ViewerPresentation::Fullscreen)
+        );
+        assert_eq!(app.fs_viewport_generation, 42);
+        assert!(
+            !app.fs_viewport_recreate_after_hide,
+            "internal Ctrl+↑↓ still-image navigation should reuse the visible fullscreen viewport"
+        );
+        let builder = app.build_inactive_fullscreen_viewport_builder(idx);
+        assert_eq!(
+            builder.position, None,
+            "deferred holdover must not reposition the existing fullscreen window"
+        );
+        assert_eq!(
+            builder.inner_size, None,
+            "deferred holdover must not resize the existing fullscreen window"
+        );
+        assert_eq!(
+            builder.decorations,
+            Some(false),
+            "deferred holdover should keep the borderless fullscreen style"
+        );
+        assert_eq!(
+            builder.transparent,
+            Some(true),
+            "deferred holdover should keep the transparent still-image fullscreen style"
+        );
+        assert_eq!(
+            builder.taskbar,
+            Some(true),
+            "deferred holdover must keep the still-image fullscreen window style"
+        );
+    }
+
+    #[test]
+    fn start_loading_items_during_fullscreen_nav_keeps_viewport_reuse() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+        app.fs_viewport_generation = 9;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+
+        app.close_fullscreen_for_folder_nav_reopen();
+        app.start_loading_items(
+            PathBuf::from(r"C:\books\next.pdf"),
+            vec![GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\next.pdf"),
+                page_num: 0,
+                content_type: None,
+            }],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_nav_is_locked());
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.fs_viewport_presentation,
+            Some(ViewerPresentation::Fullscreen)
+        );
+        assert_eq!(app.fs_viewport_generation, 9);
+        assert!(
+            !app.fs_viewport_recreate_after_hide,
+            "PDF placeholder install during deferred reopen must not turn the visible viewport into a recreate"
+        );
+        let builder = app.build_inactive_fullscreen_viewport_builder(0);
+        assert_eq!(
+            builder.position, None,
+            "PDF deferred reopen must not reposition the existing fullscreen window"
+        );
+        assert_eq!(
+            builder.inner_size, None,
+            "PDF deferred reopen must not resize the existing fullscreen window"
+        );
+        assert_eq!(
+            builder.decorations,
+            Some(false),
+            "PDF deferred reopen should keep the borderless fullscreen style"
+        );
+        assert_eq!(
+            builder.transparent,
+            Some(true),
+            "PDF deferred reopen should keep the transparent still-image fullscreen style"
+        );
+        assert_eq!(
+            builder.taskbar,
+            Some(true),
+            "PDF deferred reopen should not switch to the video/backdrop fullscreen builder"
+        );
     }
 
     #[test]
@@ -18129,7 +18623,9 @@ mod still_window_mode_key_tests {
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
 
-        app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false);
+        let restore =
+            app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false);
+        assert!(restore.is_none());
 
         let placement = app
             .settings
@@ -18160,13 +18656,49 @@ mod still_window_mode_key_tests {
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(420.0, 160.0), egui::vec2(533.0, 400.0));
-        app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        let restore =
+            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
 
         assert_eq!(
             app.settings.detached_viewer_window_placement,
             Some(previous)
         );
         assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
+        assert_eq!(
+            restore,
+            Some(previous),
+            "rejecting egui's default viewport geometry should request an OS-window restore"
+        );
+    }
+
+    #[test]
+    fn active_detached_default_viewport_geometry_update_is_rejected_after_grace() {
+        let mut app = setup_app();
+        let previous = crate::settings::DetachedViewerWindowPlacement {
+            x: 420.0,
+            y: 160.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fullscreen_idx = Some(0);
+        app.fs_opened_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        app.settings.detached_viewer_window_placement = Some(previous);
+        app.active_detached_viewer_live_placement = Some(previous);
+
+        let default_outer =
+            egui::Rect::from_min_size(egui::pos2(202.0, 202.0), egui::vec2(533.0, 400.0));
+        let restore =
+            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(previous),
+            "egui's default detached viewport size must never become the saved placement just because the open grace elapsed"
+        );
+        assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
+        assert_eq!(restore, Some(previous));
     }
 
     #[test]
@@ -18175,7 +18707,9 @@ mod still_window_mode_key_tests {
 
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
         let inner = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(640.0, 360.0));
-        app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false);
+        let restore =
+            app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false);
+        assert!(restore.is_none());
 
         let placement = app
             .settings
@@ -18347,7 +18881,8 @@ mod still_window_mode_key_tests {
             });
 
         let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-        app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true);
+        let restore = app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true);
+        assert!(restore.is_none());
 
         let placement = app
             .settings

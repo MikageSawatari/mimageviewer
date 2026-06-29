@@ -256,6 +256,28 @@ struct ActiveDetachedViewerContext {
     bundle: ViewerContextBundle,
 }
 
+/// アクティブ detached viewer セッションの再オープン経路の種別 (将来拡張用)。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedSource {
+    Image,
+    Book,
+}
+
+/// 「この detached 窓を生かす意思」を表す単一の明示状態。
+/// 詳細は docs/detached-viewer-keepalive-design.md §3.1 / §3.7。
+/// - `Some{closing:false}` の間だけ keep-alive (毎フレーム描画) する。
+/// - close は「真にセッションを畳む」明示経路でのみ `closing=true` → teardown 後に `None`。
+/// - folder-nav reopen / PDF/ZIP 列挙待ち / context swap では据え置き (close_fullscreen で
+///   推測クリアしない)。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActiveDetachedSession {
+    pub(crate) window_id: u64,
+    pub(crate) closing: bool,
+    pub(crate) source: DetachedSource,
+}
+
 #[cfg(windows)]
 struct ViewerContextBundle {
     address: String,
@@ -3213,6 +3235,11 @@ pub struct App {
     /// `detached_viewer_independent_active` で別に管理する。
     #[cfg(windows)]
     pub(crate) detached_viewer_open_next_still_detached_once: bool,
+    /// Ctrl+Up/Down folder navigation reopens into the existing detached
+    /// viewport. The next `open_fullscreen` must not treat that reopen like a
+    /// grid-originated "open in a new detached window" request.
+    #[cfg(windows)]
+    pub(crate) detached_viewer_folder_nav_reuse_window_once: bool,
     /// detached viewer context が使う安定した OS window id。
     ///
     /// active / paused を切り替えても同じ ViewportId を使い続け、ウィンドウの
@@ -3253,6 +3280,23 @@ pub struct App {
     detached_image_window_focus_activation_suppress_until: Option<std::time::Instant>,
     #[cfg(windows)]
     pub(crate) next_detached_image_window_id: u64,
+    /// 直近にアクティブだった detached ウィンドウの window_id。`detached_viewer_window_id`
+    /// が close で None になっても保持し、フォルダナビ (Ctrl+↑↓) の reopen で同じ window_id を
+    /// 再利用して `fullscreen_viewport_id` (= detached では window_id 由来) を安定させる。
+    /// これにより、次フォルダへ移るたびに ViewportId が変わって OS ウィンドウが破棄→再生成
+    /// される (= 小窓カスケード / DWM フェード) のを防ぐ。bundle には入れない (context swap を
+    /// 跨いで持続させる必要があるため)。
+    #[cfg(windows)]
+    pub(crate) last_active_detached_window_id: Option<u64>,
+    /// keep-alive 設計 (docs/detached-viewer-keepalive-design.md §3.1) の単一真実。
+    /// `Some{closing:false}` の間、アクティブ detached 窓を毎フレーム描画して egui に
+    /// 破棄させない。helper 5 つ (begin/closing/finish/mark/rendered) 経由でのみ触る。
+    #[cfg(windows)]
+    pub(crate) active_detached_session: Option<ActiveDetachedSession>,
+    /// アクティブ detached の `show_viewport_immediate` を最後に呼んだ frame_counter。
+    /// backstop の二重描画/描き漏れ防止 (§3.6)。
+    #[cfg(windows)]
+    pub(crate) detached_active_viewport_rendered_frame: u64,
     #[cfg(windows)]
     next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
@@ -4240,6 +4284,21 @@ pub struct App {
     /// UI スレッド上の window を列挙して捕捉する。
     #[cfg(windows)]
     pub(crate) detached_viewer_host_hwnd: u64,
+    /// 直近に active detached viewer viewport 内で観測した outer rect。
+    /// host_lost は次フレームの描画前に判定されるため、診断ログではこの値から
+    /// 「今掴むならどの HWND か」を再探索する。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_last_outer_rect: Option<egui::Rect>,
+    #[cfg(windows)]
+    pub(crate) detached_viewer_last_pixels_per_point: f32,
+    #[cfg(windows)]
+    pub(crate) detached_viewer_last_render_frame: u64,
+    #[cfg(windows)]
+    pub(crate) detached_viewer_last_render_at: Option<std::time::Instant>,
+    #[cfg(windows)]
+    pub(crate) detached_viewer_last_host_lost_frame: u64,
+    #[cfg(windows)]
+    pub(crate) detached_viewer_last_host_lost_at: Option<std::time::Instant>,
     /// F12 別ウィンドウを F11 で装飾なしの仮想フルスクリーンにしているか。
     #[cfg(windows)]
     pub(crate) detached_viewer_borderless_fullscreen: bool,
@@ -6067,6 +6126,8 @@ impl App {
             #[cfg(windows)]
             detached_viewer_open_next_still_detached_once: false,
             #[cfg(windows)]
+            detached_viewer_folder_nav_reuse_window_once: false,
+            #[cfg(windows)]
             detached_viewer_window_id: None,
             #[cfg(windows)]
             active_detached_viewer_live_placement: None,
@@ -6082,6 +6143,12 @@ impl App {
             detached_image_window_focus_activation_suppress_until: None,
             #[cfg(windows)]
             next_detached_image_window_id: 1,
+            #[cfg(windows)]
+            last_active_detached_window_id: None,
+            #[cfg(windows)]
+            active_detached_session: None,
+            #[cfg(windows)]
+            detached_active_viewport_rendered_frame: u64::MAX,
             #[cfg(windows)]
             next_detached_viewer_context_serial: 1,
             fs_cache: std::collections::HashMap::new(),
@@ -6433,6 +6500,18 @@ impl App {
             fs_viewport_virtual_desktop_synced_hwnd: 0,
             #[cfg(windows)]
             detached_viewer_host_hwnd: 0,
+            #[cfg(windows)]
+            detached_viewer_last_outer_rect: None,
+            #[cfg(windows)]
+            detached_viewer_last_pixels_per_point: 1.0,
+            #[cfg(windows)]
+            detached_viewer_last_render_frame: 0,
+            #[cfg(windows)]
+            detached_viewer_last_render_at: None,
+            #[cfg(windows)]
+            detached_viewer_last_host_lost_frame: 0,
+            #[cfg(windows)]
+            detached_viewer_last_host_lost_at: None,
             #[cfg(windows)]
             detached_viewer_borderless_fullscreen: false,
             #[cfg(windows)]
@@ -8393,6 +8472,12 @@ impl App {
             .as_deref()
             .is_some_and(crate::folder_tree::is_virtual_folder);
         if in_virtual_page_list && self.viewer_session_is_detached() {
+            // virtual page list (本の中の親) から detached を閉じる = セッション終了 (§3.7)。
+            #[cfg(windows)]
+            {
+                self.begin_active_detached_session_close("virtual_page_list_parent_nav");
+                self.finish_active_detached_session_close("virtual_page_list_parent_nav");
+            }
             self.close_fullscreen();
         }
     }
@@ -21973,15 +22058,138 @@ impl App {
         id
     }
 
+    // ── keep-alive session / marker helpers (docs/detached-viewer-keepalive-design.md §3.7) ──
+    // session state と marker は必ずこの helper 経由で触る (直接書き換え禁止)。
+
+    /// アクティブ detached セッションを開始 / 更新する (set)。既に同じ window_id の
+    /// セッションがあれば `closing` を解除して据え置く (passive→active 再開や F12 再 ON)。
+    #[cfg(windows)]
+    pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
+        let changed = self
+            .active_detached_session
+            .map(|s| s.window_id != window_id || s.closing || s.source != source)
+            .unwrap_or(true);
+        self.active_detached_session = Some(ActiveDetachedSession {
+            window_id,
+            closing: false,
+            source,
+        });
+        if changed {
+            self.log_detached_image_window_debug(format!(
+                "session_begin window_id={window_id} source={source:?}"
+            ));
+        }
+    }
+
+    /// セッション終了処理を開始する (closing=true)。teardown 中は keep-alive を止めるが、
+    /// 状態自体は finish まで残す。`reason` は診断用。
+    #[cfg(windows)]
+    pub(crate) fn begin_active_detached_session_close(&mut self, reason: &'static str) {
+        if let Some(session) = self.active_detached_session.as_mut() {
+            if !session.closing {
+                session.closing = true;
+                let window_id = session.window_id;
+                self.log_detached_image_window_debug(format!(
+                    "session_closing window_id={window_id} reason={reason}"
+                ));
+            }
+        }
+    }
+
+    /// セッション終了を完了する (None)。teardown 完了経路で必ず呼ぶ (漏れると stale session)。
+    #[cfg(windows)]
+    pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
+        if let Some(session) = self.active_detached_session.take() {
+            self.log_detached_image_window_debug(format!(
+                "session_finish window_id={} reason={reason}",
+                session.window_id
+            ));
+        }
+    }
+
+    /// 今フレーム detached 窓を生かすべきか = 唯一の述語 (§3.1)。
+    #[cfg(windows)]
+    pub(crate) fn detached_active_window_alive_wanted(&self) -> bool {
+        self.active_detached_session
+            .as_ref()
+            .is_some_and(|s| !s.closing)
+    }
+
+    /// アクティブ detached の `show_viewport_immediate(detached_id, …)` を実際に呼んだ直後に
+    /// 立てる marker (§3.6)。これ以外 (passive / cleanup / Close / backdrop) では呼ばない。
+    #[cfg(windows)]
+    pub(crate) fn mark_active_detached_viewport_rendered(&mut self) {
+        self.detached_active_viewport_rendered_frame = self.frame_counter;
+    }
+
+    /// 今フレーム既にアクティブ detached を描画済みか (backstop の二重描画防止)。
+    #[cfg(windows)]
+    pub(crate) fn active_detached_viewport_rendered_this_frame(&self) -> bool {
+        self.detached_active_viewport_rendered_frame == self.frame_counter
+    }
+
+    /// 既存描画経路が `show_viewport_immediate(rendered_id, …)` を呼んだ後に使う。
+    /// `rendered_id` が**現セッションの detached ViewportId と一致するときだけ** marker を立てる。
+    /// gap 中に presentation が揺れて fs_id がセッション id とズレた場合は marker を立てず、
+    /// backstop がセッション id を確実に描く。
+    #[cfg(windows)]
+    pub(crate) fn mark_active_detached_viewport_rendered_if_matches(
+        &mut self,
+        rendered_id: egui::ViewportId,
+    ) {
+        if let Some(session) = self.active_detached_session {
+            if rendered_id == Self::detached_image_window_viewport_id(session.window_id) {
+                self.mark_active_detached_viewport_rendered();
+            }
+        }
+    }
+
+    /// 現セッションの安定 detached ViewportId (backstop が描く対象)。
+    #[cfg(windows)]
+    pub(crate) fn active_detached_session_viewport_id(&self) -> Option<egui::ViewportId> {
+        self.active_detached_session
+            .map(|s| Self::detached_image_window_viewport_id(s.window_id))
+    }
+
     #[cfg(windows)]
     fn ensure_detached_viewer_window_id(&mut self) -> u64 {
         if let Some(id) = self.detached_viewer_window_id {
-            id
-        } else {
-            let id = self.allocate_detached_viewer_window_id();
-            self.detached_viewer_window_id = Some(id);
-            id
+            self.last_active_detached_window_id = Some(id);
+            return id;
         }
+        // フォルダナビ (Ctrl+↑↓) の reopen は同じ detached ウィンドウの中で内容を差し替える
+        // 継続操作。grid からの新規オープンでない (= !fs_open_intent_from_grid) 場合は、直前に
+        // この detached セッションで使っていた window_id を再利用する。`fullscreen_viewport_id`
+        // は detached では window_id 由来なので、毎回新しい id を allocate すると ViewportId が
+        // 変わり、egui が OS ウィンドウを破棄→再生成してしまう (= 次フォルダへ移るたびに
+        // ウィンドウ再表示 + 既定サイズ 822x656 の小窓がカスケード)。PDF/ZIP の非同期 enumerate
+        // を跨いで window_id が一旦クリアされても、ここで同じ id を復元して安定させる。
+        // 既に passive window として残っている id は衝突するので再利用しない (always-new mode)。
+        if !self.fs_open_intent_from_grid
+            && let Some(prev) = self.last_active_detached_window_id
+            && !self.detached_image_windows.iter().any(|w| w.id == prev)
+        {
+            self.log_detached_image_window_debug(format!(
+                "reuse_active_window_id reason=ensure_detached_viewer_window_id id={prev} \
+                 fs_idx={:?} grid_intent={} folder_nav_reuse_once={}",
+                self.fullscreen_idx,
+                self.fs_open_intent_from_grid,
+                self.detached_viewer_folder_nav_reuse_window_once
+            ));
+            self.detached_viewer_window_id = Some(prev);
+            return prev;
+        }
+        let id = self.allocate_detached_viewer_window_id();
+        self.log_detached_image_window_debug(format!(
+            "allocate_window_id reason=ensure_detached_viewer_window_id id={id} \
+             fs_idx={:?} grid_intent={} folder_nav_reuse_once={}",
+            self.fullscreen_idx,
+            self.fs_open_intent_from_grid,
+            self.detached_viewer_folder_nav_reuse_window_once
+        ));
+        self.detached_viewer_window_id = Some(id);
+        self.last_active_detached_window_id = Some(id);
+        id
     }
 
     #[cfg(windows)]
@@ -22104,6 +22312,9 @@ impl App {
             return false;
         };
 
+        // book context の明示 close = detached セッション終了 (§3.7 closing)。Close 送信前に
+        // closing を立て、teardown 後に finish して backstop が窓を復活させないようにする。
+        self.begin_active_detached_session_close("close_active_detached_viewer_context");
         self.swap_viewer_context_bundle(&mut active.bundle);
         if self.fs_viewport_shown {
             let fs_id = self.fullscreen_viewport_id();
@@ -22112,6 +22323,7 @@ impl App {
         self.close_fullscreen();
         let _closed_context = self.take_current_viewer_context_bundle();
         self.swap_viewer_context_bundle(&mut active.bundle);
+        self.finish_active_detached_session_close("close_active_detached_viewer_context");
         true
     }
 
@@ -22126,6 +22338,46 @@ impl App {
         if Self::detached_image_window_debug_enabled() {
             crate::logger::log(format!("[detached-window-debug] {}", message.as_ref()));
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn remember_active_detached_viewport_render_probe(
+        &mut self,
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        self.detached_viewer_last_outer_rect = Some(outer_rect);
+        self.detached_viewer_last_pixels_per_point = pixels_per_point;
+        self.detached_viewer_last_render_frame = self.frame_counter;
+        self.detached_viewer_last_render_at = Some(std::time::Instant::now());
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_expected_physical_rect(
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) -> windows::Win32::Foundation::RECT {
+        let scale = pixels_per_point.max(0.5);
+        windows::Win32::Foundation::RECT {
+            left: (outer_rect.min.x * scale).round() as i32,
+            top: (outer_rect.min.y * scale).round() as i32,
+            right: (outer_rect.max.x * scale).round() as i32,
+            bottom: (outer_rect.max.y * scale).round() as i32,
+        }
+    }
+
+    #[cfg(windows)]
+    fn format_optional_duration_ms(value: Option<std::time::Duration>) -> String {
+        value
+            .map(|duration| format!("{:.1}", duration.as_secs_f64() * 1000.0))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    #[cfg(windows)]
+    fn format_optional_hwnd(value: Option<u64>) -> String {
+        value
+            .map(|hwnd| format!("0x{hwnd:x}"))
+            .unwrap_or_else(|| "none".to_string())
     }
 
     #[cfg(windows)]
@@ -22193,6 +22445,7 @@ impl App {
         self.detached_viewer_recreate_on_next_render = false;
         self.detached_viewer_focus_requested = false;
         self.detached_viewer_no_activate_once = false;
+        self.detached_viewer_folder_nav_reuse_window_once = false;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
         self.fs_prev_focused = false;
@@ -22289,6 +22542,10 @@ impl App {
         self.fs_viewport_recreate_after_hide = false;
         self.clear_detached_viewer_host_hwnd();
         self.active_detached_viewer_live_placement = None;
+        // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
+        // ここは should_drop (fullscreen_idx None + 列挙なし + !shown) 経路でのみ呼ばれ、
+        // folder-nav reopen 中 (shown=true / 列挙中) は呼ばれないので session を畳んでよい。
+        self.finish_active_detached_session_close("active_close_finalize");
         if self.detached_image_windows.is_empty() {
             self.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP);
         } else {
@@ -22339,7 +22596,18 @@ impl App {
             context_serial,
             "start_active_detached_book_context",
         );
-        self.detached_viewer_window_id = Some(self.allocate_detached_viewer_window_id());
+        let window_id = self.allocate_detached_viewer_window_id();
+        self.log_detached_image_window_debug(format!(
+            "allocate_window_id reason=start_active_detached_book_context id={window_id} \
+             context_serial={context_serial} folder_nav_reuse_once={}",
+            self.detached_viewer_folder_nav_reuse_window_once
+        ));
+        self.detached_viewer_window_id = Some(window_id);
+        self.last_active_detached_window_id = Some(window_id);
+        self.detached_viewer_folder_nav_reuse_window_once = false;
+        // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
+        // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
+        self.begin_active_detached_session(window_id, DetachedSource::Book);
         self.pending_auto_fs_open = true;
         self.fs_open_intent_from_grid = true;
 
@@ -22444,6 +22712,10 @@ impl App {
             paused_bundle.pdf_prefetch_grace_until = None;
             self.settings.detached_viewer_window_placement = Some(activate_placement);
             self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
+            // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
+            // 通らない経路なのでここで明示的に session を立てる。
+            self.last_active_detached_window_id = Some(snapshot.id);
+            self.begin_active_detached_session(snapshot.id, DetachedSource::Book);
             self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
                 bundle: *paused_bundle,
             });
@@ -22806,6 +23078,13 @@ impl App {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
+        // フォルダナビ (Ctrl+↑↓) の reopen 中は、現在の detached ウィンドウを passive
+        // snapshot として park せず、そのまま内容を差し替えて再利用する。park すると
+        // 旧ウィンドウが passive で残り、reopen 側が新しい window_id を allocate して
+        // 別ウィンドウを生成してしまう (= 次フォルダへ移るたびにウィンドウが再生成)。
+        if self.fs_nav_is_locked() {
+            return false;
+        }
         self.viewer_session_is_detached()
             && self.viewer_item_supports_detached_still(idx)
             && (self.settings.detached_viewer_open_images_in_window
@@ -22864,12 +23143,28 @@ impl App {
 
         if let Some(pos) = reusable_pos {
             let reusable = self.detached_image_windows.remove(pos);
+            self.log_detached_image_window_debug(format!(
+                "reuse_window_id reason=prepare_detached_image_windows_for_open id={} \
+                 idx={idx} current_idx={current_idx:?} always_new={always_new} \
+                 grid_intent={} folder_nav_reuse_once={}",
+                reusable.id,
+                self.fs_open_intent_from_grid,
+                self.detached_viewer_folder_nav_reuse_window_once
+            ));
             self.detached_viewer_window_id = Some(reusable.id);
             self.settings.detached_viewer_window_placement = Some(reusable.placement);
             self.detached_viewer_open_next_still_detached_once = true;
             should_recreate_active_viewport = true;
         } else if parked {
-            self.detached_viewer_window_id = Some(self.allocate_detached_viewer_window_id());
+            let window_id = self.allocate_detached_viewer_window_id();
+            self.log_detached_image_window_debug(format!(
+                "allocate_window_id reason=prepare_detached_image_windows_for_open id={window_id} \
+                 idx={idx} current_idx={current_idx:?} always_new={always_new} \
+                 pinned={current_pinned} grid_intent={} folder_nav_reuse_once={} \
+                 base_placement={base_placement:?}",
+                self.fs_open_intent_from_grid, self.detached_viewer_folder_nav_reuse_window_once
+            ));
+            self.detached_viewer_window_id = Some(window_id);
             self.settings.detached_viewer_window_placement =
                 Some(self.offset_detached_image_window_placement(base_placement));
             self.detached_viewer_open_next_still_detached_once = current_pinned && !always_new;
@@ -23037,9 +23332,28 @@ impl App {
         unsafe { !IsWindow(Some(hwnd)).as_bool() }
     }
 
+    /// host_lost を検出したときの処理。**viewport を recreate しない**。
+    ///
+    /// recreate は `fs_viewport_generation` を bump して ViewportId を変え、egui に
+    /// OS 窓を破棄・再生成させる。だが detached の host 捕捉は geometry 依存
+    /// (`find_visible_thread_window_matching_rect` による rect 一致) なので、生成直後・
+    /// resize 途中・DPI 差・多窓で誤判定 (`candidate=none`) しやすい。recreate を許すと
+    /// folder-nav のたびに既定サイズの窓が一瞬生成されるフラッシュ + host_lost→recreate→
+    /// 既定サイズ窓→host_lost… の自己駆動ループになっていた。
+    /// 詳細: docs/detached-viewer-lifecycle-redesign-proposal.md BA-1/BA-2/BA-3。
+    ///
+    /// ここでは診断ログを残し、stale hwnd を捨てるだけにする。生きている window は
+    /// 次フレームの capture が rect 一致で取り直す (取れなければ host=0 のままで
+    /// host_lost() は false を返すので無害)。ユーザーが OS の×で閉じた等の真の
+    /// close は `close_requested` 経路で処理する。
     #[cfg(windows)]
-    pub(crate) fn detached_viewer_host_debug_state(&self) -> String {
-        let hwnd_raw = self.detached_viewer_host_hwnd;
+    pub(crate) fn handle_detached_viewer_host_lost_before_render(&mut self) {
+        self.log_detached_viewer_host_lost_diagnostic("host_lost_before_render");
+        self.clear_detached_viewer_host_hwnd();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn win32_hwnd_debug_state(hwnd_raw: u64) -> String {
         if hwnd_raw == 0 {
             return "hwnd=0".to_string();
         }
@@ -23074,23 +23388,107 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn reset_detached_viewer_viewport_for_recreate(&mut self, reason: &'static str) {
+    pub(crate) fn detached_viewer_host_debug_state(&self) -> String {
+        Self::win32_hwnd_debug_state(self.detached_viewer_host_hwnd)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn log_detached_viewer_host_lost_diagnostic(&mut self, reason: &'static str) {
+        if !Self::detached_image_window_debug_enabled() {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let since_render_ms = Self::format_optional_duration_ms(
+            self.detached_viewer_last_render_at
+                .map(|last| now.saturating_duration_since(last)),
+        );
+        let since_lost_ms = Self::format_optional_duration_ms(
+            self.detached_viewer_last_host_lost_at
+                .map(|last| now.saturating_duration_since(last)),
+        );
+        let previous_lost_frame = self.detached_viewer_last_host_lost_frame;
+        self.detached_viewer_last_host_lost_frame = self.frame_counter;
+        self.detached_viewer_last_host_lost_at = Some(now);
+
+        let captured_hwnd = self.detached_viewer_host_hwnd;
+        let mut current_rect_candidate = None;
+        let mut expected_rect_text = "none".to_string();
+        let mut thread_windows = "none".to_string();
+        if let (Some(main_hwnd), Some(rect)) =
+            (self.main_hwnd, self.detached_viewer_last_outer_rect)
+        {
+            use windows::Win32::Foundation::HWND;
+
+            let ppp = self.detached_viewer_last_pixels_per_point;
+            let expected = Self::detached_viewer_expected_physical_rect(rect, ppp);
+            expected_rect_text = format!(
+                "({},{} {}x{})",
+                expected.left,
+                expected.top,
+                expected.right - expected.left,
+                expected.bottom - expected.top
+            );
+            current_rect_candidate =
+                Self::find_detached_viewer_host_hwnd_from_logical_rect(self.main_hwnd, rect, ppp);
+            thread_windows = crate::dwm_transitions::debug_thread_windows_for_rect(
+                HWND(main_hwnd as *mut _),
+                expected,
+                12,
+            );
+        }
+        let candidate_state = current_rect_candidate
+            .map(Self::win32_hwnd_debug_state)
+            .unwrap_or_else(|| "none".to_string());
+        let last_outer_text = self
+            .detached_viewer_last_outer_rect
+            .map(|rect| {
+                format!(
+                    "pos=({:.0},{:.0}) size={:.0}x{:.0}",
+                    rect.min.x,
+                    rect.min.y,
+                    rect.width(),
+                    rect.height()
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let main_hwnd_text = self
+            .main_hwnd
+            .map(|hwnd| format!("0x{:x}", hwnd as usize))
+            .unwrap_or_else(|| "none".to_string());
+
         crate::logger::log(format!(
-            "[detached-viewer] recreate viewport: reason={reason} fullscreen_idx={:?} \
-             viewer_presentation={:?} fs_shown={} fs_presentation={:?} generation={} host={}",
+            "[detached-viewer] host_lost_diag reason={reason} frame={} \
+             last_render_frame={} frames_since_render={} since_render_ms={} \
+             prev_lost_frame={} frames_since_prev_lost={} since_prev_lost_ms={} \
+             fullscreen_idx={:?} viewer_presentation={:?} fs_presentation={:?} \
+             generation={} detached_window_id={:?} captured_hwnd=0x{:x} \
+             captured_state=\"{}\" current_rect_candidate={} candidate_state=\"{}\" \
+             main_hwnd={} expected_rect={} last_outer=\"{}\" last_ppp={:.2} \
+             thread_windows=[{}]",
+            self.frame_counter,
+            self.detached_viewer_last_render_frame,
+            self.frame_counter
+                .saturating_sub(self.detached_viewer_last_render_frame),
+            since_render_ms,
+            previous_lost_frame,
+            self.frame_counter.saturating_sub(previous_lost_frame),
+            since_lost_ms,
             self.fullscreen_idx,
             self.viewer_presentation,
-            self.fs_viewport_shown,
             self.fs_viewport_presentation,
             self.fs_viewport_generation,
-            self.detached_viewer_host_debug_state()
+            self.detached_viewer_window_id,
+            captured_hwnd,
+            self.detached_viewer_host_debug_state(),
+            Self::format_optional_hwnd(current_rect_candidate),
+            candidate_state,
+            main_hwnd_text,
+            expected_rect_text,
+            last_outer_text,
+            self.detached_viewer_last_pixels_per_point,
+            thread_windows
         ));
-        self.fs_viewport_shown = false;
-        self.fs_viewport_presentation = None;
-        self.fs_viewport_virtual_desktop_synced_hwnd = 0;
-        self.clear_detached_viewer_host_hwnd();
-        self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
-        self.fs_viewport_recreate_after_hide = false;
     }
 
     #[cfg(windows)]
@@ -23160,9 +23558,15 @@ impl App {
             let right = (outer_rect.max.x * scale).round() as i32;
             let bottom = (outer_rect.max.y * scale).round() as i32;
             crate::logger::log(format!(
-                "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} \
-                 rect=({},{})-({},{}) ppp={scale:.2}",
-                left, top, right, bottom
+                "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} frame={} \
+                 old_host=\"{}\" new_state=\"{}\" rect=({},{})-({},{}) ppp={scale:.2}",
+                self.frame_counter,
+                self.detached_viewer_host_debug_state(),
+                Self::win32_hwnd_debug_state(hwnd_raw),
+                left,
+                top,
+                right,
+                bottom
             ));
             self.detached_viewer_host_hwnd = hwnd_raw;
         }
@@ -23479,18 +23883,18 @@ impl App {
         inner_rect: Option<egui::Rect>,
         pixels_per_point: f32,
         maximized: bool,
-    ) {
+    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
         if self.detached_viewer_borderless_fullscreen
             || self.detached_viewer_borderless_transition.is_some()
         {
-            return;
+            return None;
         }
         if maximized {
             let mut placement = self.detached_viewer_window_placement();
             placement.maximized = true;
             self.settings.detached_viewer_window_placement = Some(placement);
             self.active_detached_viewer_live_placement = Some(placement);
-            return;
+            return None;
         }
         let size_rect = inner_rect.unwrap_or(outer_rect);
         if !outer_rect.min.x.is_finite()
@@ -23500,7 +23904,7 @@ impl App {
             || size_rect.width() < 320.0
             || size_rect.height() < 240.0
         {
-            return;
+            return None;
         }
         if !maximized
             && !crate::monitor::title_bar_on_some_monitor(
@@ -23509,7 +23913,7 @@ impl App {
                 outer_rect.width(),
             )
         {
-            return;
+            return None;
         }
         let placement = crate::settings::DetachedViewerWindowPlacement {
             x: outer_rect.min.x,
@@ -23525,12 +23929,7 @@ impl App {
                 .filter(|p| {
                     p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w)
                 });
-            let recently_opened_or_switched = self
-                .fs_opened_at
-                .map(|opened_at| opened_at.elapsed() <= std::time::Duration::from_millis(1500))
-                .unwrap_or(false);
-            if recently_opened_or_switched
-                && let Some(previous) = previous
+            if let Some(previous) = previous
                 && Self::detached_active_placement_update_looks_like_default_viewport(
                     previous,
                     placement,
@@ -23543,11 +23942,12 @@ impl App {
                 ));
                 self.settings.detached_viewer_window_placement = Some(previous);
                 self.active_detached_viewer_live_placement = Some(previous);
-                return;
+                return Some(previous);
             }
         }
         self.settings.detached_viewer_window_placement = Some(placement);
         self.active_detached_viewer_live_placement = Some(placement);
+        None
     }
 
     #[cfg(windows)]
@@ -23687,8 +24087,22 @@ impl App {
             && self.fs_open_intent_from_grid;
         self.viewer_presentation = presentation;
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
-            self.ensure_detached_viewer_window_id();
+            let id = self.ensure_detached_viewer_window_id();
+            // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
+            // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
+            let source = if self.active_detached_viewer_context_present() {
+                DetachedSource::Book
+            } else {
+                DetachedSource::Image
+            };
+            self.begin_active_detached_session(id, source);
         } else {
+            // 非 detached を開いた (動画 fullscreen / detached 非対応アイテム等) =
+            // detached セッションは終了。明示遷移なので session を畳む (§3.7)。
+            if self.active_detached_session.is_some() {
+                self.begin_active_detached_session_close("open_non_detached");
+                self.finish_active_detached_session_close("open_non_detached");
+            }
             self.detached_viewer_window_id = None;
         }
         self.detached_viewer_independent_active = independent_detached_still;
@@ -23752,6 +24166,35 @@ impl App {
         self.clear_pending_main_foreground_reclaim();
     }
 
+    #[cfg(windows)]
+    fn take_detached_folder_nav_reuse_window_for_open(&mut self, idx: usize) -> bool {
+        if !self.detached_viewer_folder_nav_reuse_window_once {
+            return false;
+        }
+        let presentation = self.effective_viewer_presentation_for_open(idx);
+        let reuse = matches!(presentation, ViewerPresentation::DetachedWindow)
+            && self.viewer_item_supports_detached_still(idx)
+            && self.detached_viewer_window_id.is_some();
+        self.detached_viewer_folder_nav_reuse_window_once = false;
+        if reuse {
+            self.fs_open_intent_from_grid = false;
+            self.log_detached_image_window_debug(format!(
+                "folder_nav_reuse_window_open idx={idx} window_id={:?} \
+                 generation={} presentation={presentation:?}",
+                self.detached_viewer_window_id, self.fs_viewport_generation
+            ));
+        } else {
+            self.log_detached_image_window_debug(format!(
+                "folder_nav_reuse_window_skip idx={idx} window_id={:?} \
+                 presentation={presentation:?} supports_still={} grid_intent={}",
+                self.detached_viewer_window_id,
+                self.viewer_item_supports_detached_still(idx),
+                self.fs_open_intent_from_grid
+            ));
+        }
+        reuse
+    }
+
     /// フルスクリーン表示を開始する。
     /// キャッシュ済みなら即座に表示し、そうでなければ読み込みを開始する。
     /// 動画アイテムの場合はサムネイル＋再生ボタンを表示するだけで読み込みは不要。
@@ -23763,7 +24206,12 @@ impl App {
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         #[cfg(windows)]
-        self.prepare_detached_image_windows_for_open(idx);
+        let reuse_detached_window_for_folder_nav =
+            self.take_detached_folder_nav_reuse_window_for_open(idx);
+        #[cfg(windows)]
+        if !reuse_detached_window_for_folder_nav {
+            self.prepare_detached_image_windows_for_open(idx);
+        }
         #[cfg(windows)]
         if self.vst3_deferred_video_open.is_some() && self.vst3_deferred_video_open != Some(idx) {
             self.vst3_deferred_video_open = None;
@@ -29350,22 +29798,52 @@ impl App {
             self.pending_return_to_parent = true;
             return;
         }
+        // グリッドへ戻る = detached セッションの明示終了 (§3.7 closing)。folder-nav の
+        // 内部 close とは別経路なので、ここでは確実に session を畳んでよい。
+        #[cfg(windows)]
+        {
+            self.begin_active_detached_session_close("handle_fullscreen_close_request");
+            self.finish_active_detached_session_close("handle_fullscreen_close_request");
+        }
         self.close_fullscreen();
     }
 
     #[cfg(windows)]
     fn prepare_viewer_presentation_close(&mut self) {
-        self.viewer_presentation = self.non_detached_viewer_presentation();
-        self.last_viewer_sync_stamp = None;
-        self.detached_viewer_focus_requested = false;
-        self.detached_viewer_recreate_on_next_render = false;
-        self.detached_viewer_independent_active = false;
-        self.detached_viewer_pin_active = false;
-        self.detached_viewer_open_next_still_detached_once = false;
-        self.detached_viewer_window_id = None;
-        self.active_detached_viewer_live_placement = None;
-        self.fs_viewport_virtual_desktop_synced_hwnd = 0;
-        self.clear_detached_viewer_borderless_fullscreen_state();
+        // フォルダナビ (Ctrl+↑↓) の reopen 中は detached セッションの identity を保つ。
+        // load_folder → start_loading_items が new items 導入前に close_fullscreen を呼ぶため、
+        // ここで detached_viewer_window_id をクリアすると、reopen 側の
+        // ensure_detached_viewer_window_id が新しい window_id を allocate し、
+        // fullscreen_viewport_id (= detached では window_id 由来) が変わって egui が
+        // OS ウィンドウを破棄→再生成する。これが「次フォルダへ移るたびにウィンドウが
+        // 再表示される / 既定サイズ (822x656) の小窓が一瞬カスケード表示される」症状の
+        // 原因 (実機動画 2026-06-28 で確認)。ロック中は window_id / presentation /
+        // live placement を維持して、同じウィンドウの中で内容だけ差し替える。
+        // 判定は fs_nav ロックだけに頼らない。PDF/ZIP の非同期 enumerate 待ちでは
+        // load_pdf_as_folder / start_loading_items の close 時点で fs_nav ロックが
+        // 立っていないことがあり、その場合 presentation が non-detached に落ちて
+        // keep_fullscreen_viewport_alive が detached viewport を描画しなくなり、
+        // egui が detached の OS ウィンドウを破棄→reopen で再生成 (= 小窓) してしまう。
+        // wrapper (close_fullscreen_for_folder_nav_reopen) が立てる reuse 意図
+        // (detached_viewer_folder_nav_reuse_window_once) も条件に含めて、folder-nav
+        // reopen の間ずっと detached identity を維持する。
+        let preserve_detached_for_folder_nav = (self.fs_nav_is_locked()
+            || self.detached_viewer_folder_nav_reuse_window_once)
+            && self.viewer_session_is_detached();
+        if !preserve_detached_for_folder_nav {
+            self.viewer_presentation = self.non_detached_viewer_presentation();
+            self.last_viewer_sync_stamp = None;
+            self.detached_viewer_focus_requested = false;
+            self.detached_viewer_recreate_on_next_render = false;
+            self.detached_viewer_independent_active = false;
+            self.detached_viewer_pin_active = false;
+            self.detached_viewer_open_next_still_detached_once = false;
+            self.detached_viewer_folder_nav_reuse_window_once = false;
+            self.detached_viewer_window_id = None;
+            self.active_detached_viewer_live_placement = None;
+            self.fs_viewport_virtual_desktop_synced_hwnd = 0;
+            self.clear_detached_viewer_borderless_fullscreen_state();
+        }
         self.vst3_deferred_video_open = None;
         self.native_video_front_synced_hwnd = 0;
         self.native_video_front_last_raise = None;
@@ -29425,38 +29903,59 @@ impl App {
                 && self.fs_viewport_shown
                 && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow);
             if preserve_detached_viewport {
+                let viewer_presentation = self.viewer_presentation;
                 let fs_viewport_presentation = self.fs_viewport_presentation;
                 let detached_viewer_host_hwnd = self.detached_viewer_host_hwnd;
+                let detached_viewer_window_id = self.detached_viewer_window_id;
                 let detached_viewer_borderless_fullscreen =
                     self.detached_viewer_borderless_fullscreen;
                 let detached_viewer_restore_placement = self.detached_viewer_restore_placement;
+                let detached_viewer_independent_active = self.detached_viewer_independent_active;
                 let detached_viewer_pin_active = self.detached_viewer_pin_active;
                 let detached_viewer_open_next_still_detached_once =
                     self.detached_viewer_open_next_still_detached_once;
+                let active_detached_viewer_live_placement =
+                    self.active_detached_viewer_live_placement;
                 let fs_viewport_generation = self.fs_viewport_generation;
                 self.close_fullscreen();
+                // Ctrl+↑↓ is an internal viewer-to-viewer reopen. If a stale
+                // grid-open intent survives here, always-new detached mode can
+                // allocate a fresh window_id and briefly show the default-sized
+                // viewport instead of reusing the existing detached host.
+                self.fs_open_intent_from_grid = false;
                 self.fs_viewport_shown = true;
+                self.viewer_presentation = viewer_presentation;
                 self.fs_viewport_presentation = fs_viewport_presentation;
                 self.detached_viewer_host_hwnd = detached_viewer_host_hwnd;
+                self.detached_viewer_window_id = detached_viewer_window_id;
                 self.detached_viewer_borderless_fullscreen = detached_viewer_borderless_fullscreen;
                 self.detached_viewer_restore_placement = detached_viewer_restore_placement;
+                self.detached_viewer_independent_active = detached_viewer_independent_active;
                 self.detached_viewer_pin_active = detached_viewer_pin_active;
                 self.detached_viewer_open_next_still_detached_once =
                     detached_viewer_open_next_still_detached_once;
+                self.active_detached_viewer_live_placement = active_detached_viewer_live_placement;
                 self.fs_viewport_generation = fs_viewport_generation;
                 self.fs_viewport_recreate_after_hide = false;
+                self.detached_viewer_folder_nav_reuse_window_once =
+                    detached_viewer_window_id.is_some();
                 self.clear_pending_main_foreground_reclaim();
                 crate::logger::log(format!(
                     "[detached-viewer] preserve viewport for folder-nav reopen: selected={:?} \
-                     generation={} host={}",
+                     generation={} window_id={:?} reuse_once={} host={}",
                     self.selected,
                     self.fs_viewport_generation,
+                    self.detached_viewer_window_id,
+                    self.detached_viewer_folder_nav_reuse_window_once,
                     self.detached_viewer_host_debug_state()
                 ));
                 return;
             }
         }
         self.close_fullscreen();
+        // Folder navigation is never a grid-originated open; prevent a stale
+        // intent from changing detached window allocation on the next reopen.
+        self.fs_open_intent_from_grid = false;
     }
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
@@ -29588,6 +30087,18 @@ impl App {
                 self.release_fs_nav_lock();
             }
         }
+        #[cfg(windows)]
+        let preserve_viewport_for_folder_nav_reopen = self.fs_nav_locked_gen.is_some()
+            && self.fs_viewport_shown
+            && matches!(
+                self.fs_viewport_presentation,
+                Some(ViewerPresentation::Fullscreen | ViewerPresentation::DetachedWindow)
+            )
+            && !self.native_video_fullscreen_active_for_main_backdrop();
+        #[cfg(not(windows))]
+        let preserve_viewport_for_folder_nav_reopen =
+            self.fs_nav_locked_gen.is_some() && self.fs_viewport_shown;
+
         self.fullscreen_idx = None;
         self.metadata_panel_hover_active = false;
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
@@ -29658,7 +30169,12 @@ impl App {
         // 起こさないため。
         self.last_loop_pos.clear();
         self.video_continuous_last_eof = None;
-        self.fs_viewport_recreate_after_hide = true;
+        // Ctrl+↑↓ のフォルダ横断は close → load → reopen の内部遷移として扱う。
+        // PDF/ZIP は非同期 enumerate を挟むため、fullscreen_idx=None の待機窓が
+        // 数フレーム生じる。この間に viewport を再作成対象へ回すと、列挙完了後の
+        // reopen が新規入場のように見える。nav lock が生きている内部遷移では
+        // 既存 viewport を維持し、通常の Esc/Enter close だけ再作成対象にする。
+        self.fs_viewport_recreate_after_hide = !preserve_viewport_for_folder_nav_reopen;
         #[cfg(windows)]
         {
             self.still_fullscreen_viewport_enter_suppress_until = None;
@@ -35475,6 +35991,15 @@ impl App {
                             };
                         self.fs_opened_at = Some(std::time::Instant::now());
                         self.fs_focus_grace_elapsed = false;
+                        // keep-alive session (§3.7): F12 ON で detached へ → session 開始、
+                        // F12 OFF で detached を抜ける → session 終了。
+                        if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+                            let id = self.ensure_detached_viewer_window_id();
+                            self.begin_active_detached_session(id, DetachedSource::Image);
+                        } else {
+                            self.begin_active_detached_session_close("f12_off");
+                            self.finish_active_detached_session_close("f12_off");
+                        }
                     }
                 }
             }
@@ -39773,6 +40298,12 @@ impl eframe::App for App {
         }
         #[cfg(windows)]
         self.render_detached_image_windows(ctx);
+        // keep-alive backstop (§3.2/§4 K0): ここまでの経路 (update_active_detached_viewer_context
+        // 内 / top-level の keep_alive + render_fullscreen) のどれも今フレーム detached viewport を
+        // 描かなかった場合に、holdover で 1 回だけ描いて egui に OS ウィンドウを破棄させない。
+        // 必ずアクティブ detached 描画経路すべての後 (= フルスクリーン区間末尾) で呼ぶ。
+        #[cfg(windows)]
+        self.render_active_detached_viewport_backstop(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、

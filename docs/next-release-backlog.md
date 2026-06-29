@@ -65,6 +65,34 @@
   - 元コンテナが消えた / 変換キャッシュが失効した場合のエラー表示と close cleanup を確認する。
 - 優先度: P3。需要はあるが設計変更が大きめなので、キー / マウスカスタマイズの後で検討する。
 
+### 1.3 F11 仮想フルスクリーン中に Ctrl+↓ すると最大化ウィンドウに化ける
+
+- 背景: 別ウィンドウ (detached viewer) を F11 で仮想フルスクリーン (装飾なし・モニタ全面の
+  borderless) にした状態で Ctrl+↓ (フォルダナビ) すると、仮想フルスクリーンが解除され
+  「最大化した通常ウィンドウ」になってしまう。**v2.2.0 でも再現する既存バグ**で、複数別
+  ウィンドウ作業による退行ではない (2026-06-28 ユーザー報告)。
+- 現状 (要調査):
+  - F11 は `detached_viewer_borderless_fullscreen=true` + 復帰用 `detached_viewer_restore_placement`
+    を立て、`build_detached_viewer_viewport_builder` が borderless 時は
+    `detached_viewer_borderless_target_rect()` (decorations=false + モニタ全面)、非 borderless 時は
+    通常 placement + `with_maximized(placement.maximized)` を使う。
+  - `close_fullscreen_for_folder_nav_reopen` は `detached_viewer_borderless_fullscreen` /
+    `detached_viewer_restore_placement` を preserve するが、folder-nav reopen 経路
+    (`detached_viewer_folder_nav_reuse_window_once` → open_fullscreen が prepare/placement 再適用を
+    skip) で borderless geometry が再適用されず、装飾あり + maximized の状態へ落ちている疑い。
+- 方針:
+  - folder-nav reopen 時に borderless 状態の detached window では、builder が borderless geometry
+    (decorations=false + target rect) を再適用するようにする。通常 placement / `with_maximized` へ
+    フォールバックさせない。
+  - F11 トグル (`detached_viewer_borderless_fullscreen` の set/解除と restore placement) と、
+    folder-nav / 別ファイル open 経路の builder 選択 (apply_placement / borderless 分岐) を突き合わせ、
+    どのフレームで borderless が失われるか perf/debug ログで特定してから直す。
+- 確認:
+  - F11 仮想フルスクリーン中に Ctrl+↑↓ / 次ファイル移動しても borderless のままで、最大化や
+    装飾ありに化けない。F11 解除時は元の通常ウィンドウ配置へ戻る。
+- 優先度: P3。既存バグだが UX 影響は限定的。detached viewport ライフサイクル整理
+  (`docs/detached-viewer-lifecycle-redesign-proposal.md`) と一緒に着手すると効率的。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断
@@ -204,6 +232,84 @@
   - detached viewer / native video / 通常フルスクリーンで、閉じる・最小化後の focus と復帰が破綻しない。
 - 優先度: P2 candidate。v2.2.0 の操作カスタマイズ拡張として相性がよいが、
   中ボタンは既存ドラッグ操作との競合があるため小さく確認しながら進める。
+
+### 4.4 見開き 1 ページずらしの戻り方向を再修正
+
+- 背景: mImageViewer 専用スレ 12。v2.2.0 リリース告知で
+  「Ctrl+←/→の見開き1ページずらしで戻る時の組み合わせ」を修正済みと案内したが、
+  総合スレ 839 の手順では挙動が変わっていないとの報告。
+- 現状:
+  - 既存テストは通常 LTR / RTL と横長ページ後の前方ずらしを押さえているが、
+    「表紙あり設定 + 戻り方向 + 既存 shift anchor」の実例を十分にカバーできていない。
+  - 報告では現在 `5,6 -> 4 -> 2,3 -> 1` となる。期待としては、表紙あり設定を一時的に
+    外す形でもよいので `5,6 -> 3,4 -> 1,2` のように戻れること。
+- 方針:
+  - まず総合スレ 839 の手順を unit test 化する。ページ数、表紙あり設定、開始ページ、
+    Ctrl+←/→ の順序を再現し、期待ペアを固定する。
+  - `spread_shift_anchor_idx` がある状態で戻る場合、現在位置より前の表紙 / 横長ページ /
+    区切りをどう扱うかを再定義する。少なくとも「戻る操作なのに 1 ページ単独へ吸われて
+    期待ペアを飛ばす」挙動は避ける。
+  - 必要なら、手動ずらし中はアンカー範囲内の表紙ありパリティを一時的に解除し、
+    操作地点から前後へ 2 ページ単位で組み直す。
+  - 連結読み、RTL、横長ページ、末尾端数、ゲームパッド Y+左右も同じロジックを通す。
+- 確認:
+  - 総合スレ 839 / 専用スレ 12 の再現手順で、戻り方向が期待どおりになる。
+  - 既存テスト `spread_offset_nudge_*` と横長ページ関連テストが通る。
+  - v2.2.0 で「修正済み」と案内してしまったため、リリース時は「前回修正済みと書きましたが、
+    再確認したところ漏れがありました」と補足する。
+- 優先度: P1。既に修正済みと案内した項目の再報告なので、次回で優先的に直す。
+
+### 4.5 ルートディレクトリ / ドライブ別カレントへの移動 Action
+
+- 背景: mImageViewer 専用スレ 12。v2.2.0 で「ルートディレクトリ/ドライブ一覧への移動も
+  割り当て候補に追加」と案内したが、現状の Action は `GridOpenLocationDriveList` と
+  `GridOpenDriveC..Z` (= `C:\`〜`Z:\` を開く) で、現在ドライブのルートへ移動する
+  汎用 Action は無い。
+- 要望:
+  - 現在位置のルートディレクトリへキー一発で移動したい。
+  - `C:\を開く`〜`Z:\を開く` ではなく、ドライブごとの最後の場所を覚え、
+    `D:` を開くと直近の `D:\一般コミック\手塚治虫` のような場所へ戻りたい。
+- 方針:
+  - まず `GridOpenCurrentDriveRoot` のような Action を追加し、現在の `effective_folder()` から
+    ドライブ root / UNC share root を求めて移動する。ZIP/PDF/変換アーカイブ内では元コンテナの
+    あるドライブ root を対象にする。
+  - ドライブ別カレントは、root 直行とは別 Action として追加する。既存 `GridOpenDriveC..Z` は
+    「C:\ を開く」〜「Z:\ を開く」= 必ずドライブ root を開く動作のまま残し、
+    新しく `GridSwitchDriveC..Z` のような「C: へ切り替える」〜「Z: へ切り替える」を追加する。
+    `GridSwitchDrive*` は、そのドライブで前回開いていた場所があればそこへ戻り、無ければ root へ
+    フォールバックする。
+  - ドライブ一覧 / アドレスバー / クイックフォルダ / フォルダ履歴との関係を整理する。
+    最後の場所が存在しない場合は対象ドライブ root へフォールバックする。
+- 確認:
+  - 通常フォルダ、ZIP/PDF/変換アーカイブ内、ドライブ root、UNC share root で root 移動が破綻しない。
+  - コマンド名 / 表示名 / ヘルプで「D:\ を開く」(root 直行) と「D: へ切り替える」(前回位置) を
+    明確に区別できる。
+- 優先度: P2 candidate。操作カスタマイズのフォローとして相性がよい。
+
+### 4.6 サムネイル画質設定の ZIP 内画像サンプル対応
+
+- 背景: mImageViewer 専用スレ 12。「設定 → サムネイル画質設定」が ZIP 内画像選択時に
+  「画像を1枚選択してからもう一度お試しください。」となり設定できないという報告。
+- 現状:
+  - `open_thumb_quality_dialog` は `last_selected_image_path: Option<PathBuf>` を使い、
+    worker で `image::open(path)` して A/B サンプルを作る。
+  - `update_last_selected_image` は `GridItem::Image` の実ファイルパスだけを保存し、
+    `GridItem::ZipImage` / `PdfPage` は対象外。ZIP 内画像は実パスが無いため現状の構造では
+    サンプルにできない。
+- 方針:
+  - `last_selected_image_path` ではなく、選択中 item からサンプル取得ジョブを作る構造へ変える。
+    初期対応は `GridItem::Image` と `GridItem::ZipImage`。ZIP は `zip_loader::read_entry_bytes`
+    で entry bytes を読み、`image::load_from_memory` でデコードする。
+  - PDF ページは PDFium worker / render サイズの扱いが別になるため、同時対応するか別タスクにするか判断する。
+    まずはメッセージを「ZIP/PDF内ページは未対応」ではなく実対応に寄せたい。
+  - デコードは現在と同じく worker で行い、UI スレッドで ZIP 読み / 画像デコードをしない。
+  - サンプル表示名は実パスだけでなく `book.zip > page.jpg` のような仮想表示名を持てるようにする。
+- 確認:
+  - 通常画像と ZIP 内画像でサムネイル画質 A/B ダイアログが開く。
+  - 壊れた ZIP entry / 非対応画像 / ZIP が削除済みの場合は失敗メッセージを出し、UI は固まらない。
+  - 画質適用後のキャッシュ再生成が通常画像 / ZIP 内画像で同じ設定を使う。
+- 優先度: P2 candidate。報告としてはバグ寄りだが、PDF 対応まで含めると範囲が広がるため
+  ZIP 内画像を先に小さく直す。
 
 ---
 
