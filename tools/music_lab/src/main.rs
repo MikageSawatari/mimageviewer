@@ -448,9 +448,9 @@ fn draw_timeline_row(
         .max(x0 + 1.0)
         .min(waveform_rect.right());
         let amp = (bin.peak.max(bin.rms * 2.0)).sqrt().clamp(0.025, 1.0);
-        let outer_half_h = waveform_rect.height() * 0.46 * amp;
-        let core_half_h = (outer_half_h * (0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45))
-            .clamp(1.0, outer_half_h);
+        let outer_half_h = (waveform_rect.height() * 0.46 * amp).max(1.0);
+        let core_scale = 0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45;
+        let core_half_h = (outer_half_h * core_scale).max(1.0).min(outer_half_h);
         let color = band_color(bin.band_energy);
 
         painter.rect_filled(
