@@ -24,6 +24,7 @@ const TIMELINE_WAVEFORM_H: f32 = 68.0;
 const TIMELINE_LOUDNESS_H: f32 = 18.0;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
+const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(75);
@@ -108,6 +109,7 @@ struct FrameStats {
     spectrum_compute_ms: f32,
     timeline_rows: usize,
     timeline_bins: usize,
+    timeline_cache_misses: usize,
 }
 
 struct PerfLogSink {
@@ -164,6 +166,7 @@ impl FrameStats {
         Self::smooth_ms(&mut self.central_ms, duration);
         self.timeline_rows = timeline.visible_rows;
         self.timeline_bins = timeline.drawn_bins;
+        self.timeline_cache_misses = timeline.cache_misses;
     }
 
     fn record_spectrum_compute(&mut self, compute_ms: f32) {
@@ -204,6 +207,7 @@ impl FrameStats {
                 "left_ms={left_ms:.1} right_ms={right_ms:.1} bottom_ms={bottom_ms:.1} ",
                 "central_ms={central_ms:.1} spectrum_compute_ms={spectrum_compute_ms:.1} ",
                 "timeline_rows={timeline_rows} timeline_bins={timeline_bins} ",
+                "timeline_cache_misses={timeline_cache_misses} ",
                 "playing={playing} spectrum_pending={spectrum_pending}"
             ),
             ts_ms = ts_ms,
@@ -219,6 +223,7 @@ impl FrameStats {
             spectrum_compute_ms = self.spectrum_compute_ms,
             timeline_rows = self.timeline_rows,
             timeline_bins = self.timeline_bins,
+            timeline_cache_misses = self.timeline_cache_misses,
             playing = playing,
             spectrum_pending = spectrum_pending,
         );
@@ -264,6 +269,95 @@ impl PerfLogSink {
 }
 
 #[derive(Default)]
+struct TimelineTextureCache {
+    key: Option<TimelineTextureCacheKey>,
+    rows: Vec<Option<TimelineRowTexture>>,
+}
+
+struct TimelineRowTexture {
+    texture: egui::TextureHandle,
+    represented_bins: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimelineTextureCacheKey {
+    width_px: usize,
+    waveform_h_px: usize,
+    gap_px: usize,
+    loudness_h_px: usize,
+    rows: usize,
+    bins_len: usize,
+    dark: bool,
+}
+
+impl TimelineTextureCache {
+    fn clear(&mut self) {
+        self.key = None;
+        self.rows.clear();
+    }
+
+    fn ensure(&mut self, key: TimelineTextureCacheKey) {
+        if self.key == Some(key) {
+            return;
+        }
+        self.key = Some(key);
+        self.rows.clear();
+        self.rows.resize_with(key.rows, || None);
+    }
+
+    fn row_texture(
+        &mut self,
+        ctx: &egui::Context,
+        track: &LoadedTrack,
+        row: usize,
+        row_secs: f64,
+        key: TimelineTextureCacheKey,
+    ) -> Option<(&egui::TextureHandle, usize, bool)> {
+        self.ensure(key);
+        if row >= self.rows.len() {
+            return None;
+        }
+        let mut cache_miss = false;
+        if self.rows[row].is_none() {
+            let row_start = row as f64 * row_secs;
+            let (image, represented_bins) = render_timeline_row_image(
+                row_start,
+                row_secs,
+                &track.analysis.bins,
+                key.width_px,
+                key.waveform_h_px,
+                key.gap_px,
+                key.loudness_h_px,
+                key.dark,
+            );
+            let texture = ctx.load_texture(
+                format!(
+                    "music_timeline_row_{row}_{}x{}_{}",
+                    key.width_px,
+                    key.height_px(),
+                    key.dark as u8
+                ),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.rows[row] = Some(TimelineRowTexture {
+                texture,
+                represented_bins,
+            });
+            cache_miss = true;
+        }
+        let row = self.rows[row].as_ref()?;
+        Some((&row.texture, row.represented_bins, cache_miss))
+    }
+}
+
+impl TimelineTextureCacheKey {
+    fn height_px(self) -> usize {
+        self.waveform_h_px + self.gap_px + self.loudness_h_px
+    }
+}
+
+#[derive(Default)]
 struct MusicLabApp {
     track: Option<LoadedTrack>,
     load_rx: Option<mpsc::Receiver<LoadMsg>>,
@@ -277,6 +371,7 @@ struct MusicLabApp {
     spectrum_rx: Option<mpsc::Receiver<SpectrumMsg>>,
     spectrum_pending: bool,
     last_spectrum_request: Option<Instant>,
+    timeline_cache: TimelineTextureCache,
     frame_stats: FrameStats,
 }
 
@@ -311,15 +406,17 @@ impl eframe::App for MusicLabApp {
         let track = self.track.as_ref();
         let player = self.player.as_ref();
         let snap = self.player_snapshot();
+        let load_status = self.load_status.clone();
+        let timeline_cache = &mut self.timeline_cache;
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(track) = track {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        timeline_stats = draw_timeline(ui, track, player, snap);
+                        timeline_stats = draw_timeline(ui, track, player, snap, timeline_cache);
                     });
             } else {
-                draw_empty_state(ui, &self.load_status);
+                draw_empty_state(ui, &load_status);
             }
         });
         self.frame_stats
@@ -389,13 +486,14 @@ impl MusicLabApp {
                     }
                     ui.separator();
                     ui.label(format!(
-                        "FPS {:.1}  {:.1} ms  UI {:.1} C {:.1} B {:.1} bins {}",
+                        "FPS {:.1}  {:.1} ms  UI {:.1} C {:.1} B {:.1} raster {} miss {}",
                         self.frame_stats.fps,
                         self.frame_stats.frame_ms,
                         self.frame_stats.update_ms,
                         self.frame_stats.central_ms,
                         self.frame_stats.bottom_ms,
-                        self.frame_stats.timeline_bins
+                        self.frame_stats.timeline_bins,
+                        self.frame_stats.timeline_cache_misses
                     ));
                     if self.spectrum_pending {
                         ui.label("Spectrum: analyzing");
@@ -499,10 +597,11 @@ impl MusicLabApp {
                         self.frame_stats.frame_ms, self.frame_stats.update_ms
                     ));
                     ui.label(format!(
-                        "Central: {:.1} ms, rows {}, bins {}",
+                        "Central: {:.1} ms, rows {}, raster bins {}, misses {}",
                         self.frame_stats.central_ms,
                         self.frame_stats.timeline_rows,
-                        self.frame_stats.timeline_bins
+                        self.frame_stats.timeline_bins,
+                        self.frame_stats.timeline_cache_misses
                     ));
                     ui.label(format!(
                         "Spectrum draw/worker: {:.1} / {:.1} ms",
@@ -536,6 +635,7 @@ impl MusicLabApp {
         self.spectrum_rx = None;
         self.spectrum_pending = false;
         self.last_spectrum_request = None;
+        self.timeline_cache.clear();
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("music-lab-load".into())
@@ -679,6 +779,7 @@ fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
 struct TimelineDrawStats {
     visible_rows: usize,
     drawn_bins: usize,
+    cache_misses: usize,
 }
 
 fn draw_timeline(
@@ -686,6 +787,7 @@ fn draw_timeline(
     track: &LoadedTrack,
     player: Option<&LabPlayer>,
     snap: PlaybackSnapshot,
+    cache: &mut TimelineTextureCache,
 ) -> TimelineDrawStats {
     let mut stats = TimelineDrawStats::default();
     let row_secs = track.analysis.config.row_secs.max(1.0);
@@ -705,6 +807,22 @@ fn draw_timeline(
         rect.min + egui::vec2(label_w, 8.0),
         egui::pos2(rect.max.x - 8.0, rect.min.y + content_h - 8.0),
     );
+    let ppp = ui.ctx().pixels_per_point().clamp(1.0, 3.0);
+    let width_px =
+        ((graph_rect.width() * ppp).round() as usize).clamp(1, TIMELINE_TEXTURE_MAX_WIDTH);
+    let waveform_h_px = ((TIMELINE_WAVEFORM_H * ppp).round() as usize).max(1);
+    let gap_px = ((TIMELINE_INNER_GAP * ppp).round() as usize).max(1);
+    let loudness_h_px = ((TIMELINE_LOUDNESS_H * ppp).round() as usize).max(1);
+    let texture_key = TimelineTextureCacheKey {
+        width_px,
+        waveform_h_px,
+        gap_px,
+        loudness_h_px,
+        rows,
+        bins_len: track.analysis.bins.len(),
+        dark: ui.visuals().dark_mode,
+    };
+    cache.ensure(texture_key);
 
     let clip_rect = ui.clip_rect();
     for row in 0..rows {
@@ -718,14 +836,20 @@ fn draw_timeline(
         }
         let row_start = row as f64 * row_secs;
         stats.visible_rows += 1;
-        stats.drawn_bins += draw_timeline_row(
-            &painter,
-            row_rect,
-            row_start,
-            row_secs,
-            &track.analysis.bins,
-            ui.visuals().dark_mode,
-        );
+        if let Some((texture, represented_bins, cache_miss)) =
+            cache.row_texture(ui.ctx(), track, row, row_secs, texture_key)
+        {
+            painter.image(
+                texture.id(),
+                row_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            if cache_miss {
+                stats.cache_misses += 1;
+                stats.drawn_bins += represented_bins;
+            }
+        }
         painter.text(
             egui::pos2(rect.min.x + 8.0, row_rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -762,54 +886,58 @@ fn draw_timeline(
     stats
 }
 
-fn draw_timeline_row(
-    painter: &egui::Painter,
-    rect: egui::Rect,
+fn render_timeline_row_image(
     row_start: f64,
     row_secs: f64,
     bins: &[WaveformBin],
+    width: usize,
+    waveform_h: usize,
+    gap_h: usize,
+    loudness_h: usize,
     dark: bool,
-) -> usize {
-    let mut drawn_bins = 0;
+) -> (egui::ColorImage, usize) {
+    let height = waveform_h + gap_h + loudness_h;
     let bg = if dark {
         egui::Color32::from_rgb(18, 22, 24)
     } else {
         egui::Color32::from_rgb(238, 241, 243)
     };
-    let waveform_rect =
-        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TIMELINE_WAVEFORM_H));
-    let loudness_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), waveform_rect.bottom() + TIMELINE_INNER_GAP),
-        egui::vec2(rect.width(), TIMELINE_LOUDNESS_H),
-    );
+    let mut pixels = vec![bg; width * height];
 
-    painter.rect_filled(waveform_rect, 0.0, egui::Color32::BLACK);
-    painter.rect_filled(loudness_rect, 0.0, bg);
-    painter.rect_stroke(
-        waveform_rect,
+    fill_rect_px(
+        &mut pixels,
+        width,
+        height,
+        0,
+        0,
+        width,
+        waveform_h,
+        egui::Color32::BLACK,
+    );
+    let loudness_top = waveform_h + gap_h;
+    fill_rect_px(
+        &mut pixels,
+        width,
+        height,
+        0,
+        loudness_top,
+        width,
+        height,
+        bg,
+    );
+    let center_y = waveform_h as f32 * 0.5;
+    fill_rect_f32(
+        &mut pixels,
+        width,
+        height,
         0.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 92, 116, 140)),
-        egui::StrokeKind::Inside,
-    );
-    painter.rect_stroke(
-        loudness_rect,
-        0.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 92, 116, 90)),
-        egui::StrokeKind::Inside,
+        center_y - 0.5,
+        width as f32,
+        center_y + 0.5,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
     );
 
-    let center_y = waveform_rect.center().y;
-    painter.line_segment(
-        [
-            egui::pos2(waveform_rect.left(), center_y),
-            egui::pos2(waveform_rect.right(), center_y),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
-        ),
-    );
-
+    let mut drawn_bins = 0;
     for bin in bins {
         let bin_end = bin.start_secs + bin.duration_secs;
         if bin_end < row_start || bin.start_secs > row_start + row_secs {
@@ -819,19 +947,18 @@ fn draw_timeline_row(
         let visible_start = bin.start_secs.max(row_start);
         let visible_end = bin_end.min(row_start + row_secs);
 
-        let x0 = waveform_rect.left()
-            + ((visible_start - row_start) / row_secs) as f32 * waveform_rect.width();
-        let x1 = (waveform_rect.left()
-            + ((visible_end - row_start) / row_secs) as f32 * waveform_rect.width())
-        .max(x0 + 1.0)
-        .min(waveform_rect.right());
+        let x0 = ((visible_start - row_start) / row_secs) as f32 * width as f32;
+        let x1 = (((visible_end - row_start) / row_secs) as f32 * width as f32)
+            .max(x0 + 1.0)
+            .min(width as f32);
         let amp = (bin.peak.max(bin.rms * 2.0)).sqrt().clamp(0.025, 1.0);
-        let outer_half_h = (waveform_rect.height() * 0.46 * amp).max(1.0);
+        let outer_half_h = (waveform_h as f32 * 0.46 * amp).max(1.0);
         let core_scale = 0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45;
         let core_half_h = (outer_half_h * core_scale).max(1.0).min(outer_half_h);
-        draw_spectral_waveform_bin(
-            painter,
-            waveform_rect,
+        draw_spectral_waveform_bin_pixels(
+            &mut pixels,
+            width,
+            height,
             center_y,
             x0,
             x1,
@@ -843,58 +970,289 @@ fn draw_timeline_row(
             let transient = ((bin.transient - TRANSIENT_ACCENT_MIN) / (1.0 - TRANSIENT_ACCENT_MIN))
                 .sqrt()
                 .clamp(0.0, 1.0);
-            let accent_half_h = waveform_rect.height() * (0.12 + transient * 0.22);
-            let accent_center =
-                ((x0 + x1) * 0.5).clamp(waveform_rect.left(), waveform_rect.right());
-            let accent_half_w = ((x1 - x0).max(1.5) * (0.30 + transient * 0.45)).min(3.0);
+            let accent_half_h = waveform_h as f32 * (0.12 + transient * 0.22);
+            let accent_center = ((x0 + x1) * 0.5).clamp(0.0, width as f32);
+            let accent_half_w = ((x1 - x0).max(1.5) * (0.30 + transient * 0.45)).min(6.0);
             let accent = transient_color(bin.transient_band, transient);
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(
-                        (accent_center - accent_half_w).max(waveform_rect.left()),
-                        center_y - accent_half_h,
-                    ),
-                    egui::pos2(
-                        (accent_center + accent_half_w).min(waveform_rect.right()),
-                        center_y + accent_half_h,
-                    ),
-                ),
-                0.0,
+            fill_rect_f32(
+                &mut pixels,
+                width,
+                height,
+                accent_center - accent_half_w,
+                center_y - accent_half_h,
+                accent_center + accent_half_w,
+                center_y + accent_half_h,
                 color_with_alpha(accent, (34.0 + transient * 76.0) as u8),
             );
-            painter.line_segment(
-                [
-                    egui::pos2(accent_center, center_y - accent_half_h),
-                    egui::pos2(accent_center, center_y + accent_half_h),
-                ],
-                egui::Stroke::new(
-                    1.0,
-                    color_with_alpha(
-                        brighten_color(accent, 1.18),
-                        (54.0 + transient * 96.0) as u8,
-                    ),
+            fill_rect_f32(
+                &mut pixels,
+                width,
+                height,
+                accent_center - 0.5,
+                center_y - accent_half_h,
+                accent_center + 0.5,
+                center_y + accent_half_h,
+                color_with_alpha(
+                    brighten_color(accent, 1.18),
+                    (54.0 + transient * 96.0) as u8,
                 ),
             );
         }
 
         let loudness = ((bin.loudness_db + 52.0) / 52.0).clamp(0.0, 1.0);
-        let loudness_h = (loudness_rect.height() - 2.0) * loudness.powf(0.72).max(0.02);
-        let loudness_x0 = loudness_rect.left()
-            + ((visible_start - row_start) / row_secs) as f32 * loudness_rect.width();
-        let loudness_x1 = (loudness_rect.left()
-            + ((visible_end - row_start) / row_secs) as f32 * loudness_rect.width())
-        .max(loudness_x0 + 1.0)
-        .min(loudness_rect.right());
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(loudness_x0, loudness_rect.bottom() - 1.0 - loudness_h),
-                egui::pos2(loudness_x1, loudness_rect.bottom() - 1.0),
-            ),
-            0.0,
+        let loudness_value_h =
+            (loudness_h.saturating_sub(2) as f32) * loudness.powf(0.72).max(0.02);
+        let loudness_x0 = ((visible_start - row_start) / row_secs) as f32 * width as f32;
+        let loudness_x1 = (((visible_end - row_start) / row_secs) as f32 * width as f32)
+            .max(loudness_x0 + 1.0)
+            .min(width as f32);
+        let loudness_bottom = height.saturating_sub(1) as f32;
+        fill_rect_f32(
+            &mut pixels,
+            width,
+            height,
+            loudness_x0,
+            loudness_bottom - loudness_value_h,
+            loudness_x1,
+            loudness_bottom,
             loudness_color(loudness),
         );
     }
-    drawn_bins
+
+    draw_rect_stroke_px(
+        &mut pixels,
+        width,
+        height,
+        0,
+        0,
+        width,
+        waveform_h,
+        egui::Color32::from_rgba_unmultiplied(70, 92, 116, 140),
+    );
+    draw_rect_stroke_px(
+        &mut pixels,
+        width,
+        height,
+        0,
+        loudness_top,
+        width,
+        height,
+        egui::Color32::from_rgba_unmultiplied(70, 92, 116, 90),
+    );
+
+    (egui::ColorImage::new([width, height], pixels), drawn_bins)
+}
+
+fn draw_spectral_waveform_bin_pixels(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    center_y: f32,
+    x0: f32,
+    x1: f32,
+    outer_half_h: f32,
+    core_half_h: f32,
+    band: [f32; 3],
+) {
+    let weights = spectral_weights(band);
+    let x0 = (x0 - 0.35).max(0.0);
+    let x1 = (x1 + 0.35).min(width as f32).max(x0 + 0.75);
+    fill_rect_f32(
+        pixels,
+        width,
+        height,
+        x0,
+        center_y - outer_half_h,
+        x1,
+        center_y + outer_half_h,
+        egui::Color32::from_rgba_unmultiplied(126, 104, 62, 52),
+    );
+
+    draw_spectral_half_pixels(
+        pixels,
+        width,
+        height,
+        x0,
+        x1,
+        center_y,
+        -1.0,
+        outer_half_h,
+        weights,
+        88,
+    );
+    draw_spectral_half_pixels(
+        pixels,
+        width,
+        height,
+        x0,
+        x1,
+        center_y,
+        1.0,
+        outer_half_h,
+        weights,
+        88,
+    );
+    draw_spectral_half_pixels(
+        pixels,
+        width,
+        height,
+        x0,
+        x1,
+        center_y,
+        -1.0,
+        core_half_h,
+        weights,
+        218,
+    );
+    draw_spectral_half_pixels(
+        pixels,
+        width,
+        height,
+        x0,
+        x1,
+        center_y,
+        1.0,
+        core_half_h,
+        weights,
+        218,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_spectral_half_pixels(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    x0: f32,
+    x1: f32,
+    center_y: f32,
+    direction: f32,
+    half_h: f32,
+    weights: [f32; 3],
+    alpha: u8,
+) {
+    let colors = [
+        egui::Color32::from_rgb(222, 154, 58),
+        egui::Color32::from_rgb(126, 210, 90),
+        egui::Color32::from_rgb(78, 186, 236),
+    ];
+    let mut cursor = center_y;
+    for (idx, weight) in weights.into_iter().enumerate() {
+        let h = (half_h * weight).max(0.0);
+        if h < 0.35 {
+            continue;
+        }
+        let next = cursor + direction * h;
+        fill_rect_f32(
+            pixels,
+            width,
+            height,
+            x0,
+            cursor.min(next),
+            x1,
+            cursor.max(next),
+            color_with_alpha(colors[idx], alpha),
+        );
+        cursor = next;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_rect_stroke_px(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    color: egui::Color32,
+) {
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    fill_rect_px(pixels, width, height, x0, y0, x1, (y0 + 1).min(y1), color);
+    fill_rect_px(
+        pixels,
+        width,
+        height,
+        x0,
+        y1.saturating_sub(1),
+        x1,
+        y1,
+        color,
+    );
+    fill_rect_px(pixels, width, height, x0, y0, (x0 + 1).min(x1), y1, color);
+    fill_rect_px(
+        pixels,
+        width,
+        height,
+        x1.saturating_sub(1),
+        y0,
+        x1,
+        y1,
+        color,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_rect_f32(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: egui::Color32,
+) {
+    let x0 = x0.floor().clamp(0.0, width as f32) as usize;
+    let y0 = y0.floor().clamp(0.0, height as f32) as usize;
+    let x1 = x1.ceil().clamp(0.0, width as f32) as usize;
+    let y1 = y1.ceil().clamp(0.0, height as f32) as usize;
+    fill_rect_px(pixels, width, height, x0, y0, x1, y1, color);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_rect_px(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    color: egui::Color32,
+) {
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let x1 = x1.min(width);
+    let y1 = y1.min(height);
+    for y in y0.min(height)..y1 {
+        let row = y * width;
+        for x in x0.min(width)..x1 {
+            blend_pixel(&mut pixels[row + x], color);
+        }
+    }
+}
+
+fn blend_pixel(dst: &mut egui::Color32, src: egui::Color32) {
+    let alpha = src.a() as u32;
+    if alpha >= 255 {
+        *dst = egui::Color32::from_rgb(src.r(), src.g(), src.b());
+        return;
+    }
+    if alpha == 0 {
+        return;
+    }
+    let inv = 255 - alpha;
+    let blend = |s: u8, d: u8| ((s as u32 * alpha + d as u32 * inv + 127) / 255) as u8;
+    *dst = egui::Color32::from_rgb(
+        blend(src.r(), dst.r()),
+        blend(src.g(), dst.g()),
+        blend(src.b(), dst.b()),
+    );
 }
 
 fn draw_beat_grid(
@@ -1049,67 +1407,6 @@ fn draw_spectrum(ui: &mut egui::Ui, bands: &[f32], trail: &mut Vec<f32>) {
             1.0,
             spectrum_color(i, bands.len(), value),
         );
-    }
-}
-
-fn draw_spectral_waveform_bin(
-    painter: &egui::Painter,
-    waveform_rect: egui::Rect,
-    center_y: f32,
-    x0: f32,
-    x1: f32,
-    outer_half_h: f32,
-    core_half_h: f32,
-    band: [f32; 3],
-) {
-    let weights = spectral_weights(band);
-    let x0 = (x0 - 0.35).max(waveform_rect.left());
-    let x1 = (x1 + 0.35).min(waveform_rect.right()).max(x0 + 0.75);
-    let outer_bg = egui::Rect::from_min_max(
-        egui::pos2(x0, center_y - outer_half_h),
-        egui::pos2(x1, center_y + outer_half_h),
-    );
-    painter.rect_filled(
-        outer_bg,
-        0.0,
-        egui::Color32::from_rgba_unmultiplied(126, 104, 62, 52),
-    );
-
-    draw_spectral_half(painter, x0, x1, center_y, -1.0, outer_half_h, weights, 88);
-    draw_spectral_half(painter, x0, x1, center_y, 1.0, outer_half_h, weights, 88);
-
-    draw_spectral_half(painter, x0, x1, center_y, -1.0, core_half_h, weights, 218);
-    draw_spectral_half(painter, x0, x1, center_y, 1.0, core_half_h, weights, 218);
-}
-
-fn draw_spectral_half(
-    painter: &egui::Painter,
-    x0: f32,
-    x1: f32,
-    center_y: f32,
-    direction: f32,
-    half_h: f32,
-    weights: [f32; 3],
-    alpha: u8,
-) {
-    let colors = [
-        egui::Color32::from_rgb(222, 154, 58),
-        egui::Color32::from_rgb(126, 210, 90),
-        egui::Color32::from_rgb(78, 186, 236),
-    ];
-    let mut cursor = center_y;
-    for (idx, weight) in weights.into_iter().enumerate() {
-        let h = (half_h * weight).max(0.0);
-        if h < 0.35 {
-            continue;
-        }
-        let next = cursor + direction * h;
-        let rect = egui::Rect::from_min_max(
-            egui::pos2(x0, cursor.min(next)),
-            egui::pos2(x1, cursor.max(next)),
-        );
-        painter.rect_filled(rect, 0.0, color_with_alpha(colors[idx], alpha));
-        cursor = next;
     }
 }
 
