@@ -23,6 +23,7 @@ const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const SPECTRUM_BANDS: usize = 50;
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
+const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -466,30 +467,24 @@ fn draw_timeline_row(
         let outer_half_h = (waveform_rect.height() * 0.46 * amp).max(1.0);
         let core_scale = 0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45;
         let core_half_h = (outer_half_h * core_scale).max(1.0).min(outer_half_h);
-        let color = waveform_base_color(bin);
-
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x0, center_y - outer_half_h),
-                egui::pos2(x1, center_y + outer_half_h),
-            ),
-            0.0,
-            color_with_alpha(color, 122),
+        draw_spectral_waveform_bin(
+            painter,
+            waveform_rect,
+            center_y,
+            x0,
+            x1,
+            outer_half_h,
+            core_half_h,
+            bin.band_energy,
         );
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x0, center_y - core_half_h),
-                egui::pos2(x1, center_y + core_half_h),
-            ),
-            0.0,
-            color_with_alpha(brighten_color(color, 1.24), 230),
-        );
-        if bin.transient > 0.08 {
-            let transient = bin.transient.sqrt().clamp(0.0, 1.0);
-            let accent_half_h = waveform_rect.height() * (0.18 + transient * 0.30);
+        if bin.transient > TRANSIENT_ACCENT_MIN {
+            let transient = ((bin.transient - TRANSIENT_ACCENT_MIN) / (1.0 - TRANSIENT_ACCENT_MIN))
+                .sqrt()
+                .clamp(0.0, 1.0);
+            let accent_half_h = waveform_rect.height() * (0.12 + transient * 0.22);
             let accent_center =
                 ((x0 + x1) * 0.5).clamp(waveform_rect.left(), waveform_rect.right());
-            let accent_half_w = ((x1 - x0).max(2.0) * (0.45 + transient * 0.65)).min(5.0);
+            let accent_half_w = ((x1 - x0).max(1.5) * (0.30 + transient * 0.45)).min(3.0);
             let accent = transient_color(bin.transient_band, transient);
             painter.rect_filled(
                 egui::Rect::from_min_max(
@@ -503,7 +498,7 @@ fn draw_timeline_row(
                     ),
                 ),
                 0.0,
-                color_with_alpha(accent, (78.0 + transient * 150.0) as u8),
+                color_with_alpha(accent, (34.0 + transient * 76.0) as u8),
             );
             painter.line_segment(
                 [
@@ -513,8 +508,8 @@ fn draw_timeline_row(
                 egui::Stroke::new(
                     1.0,
                     color_with_alpha(
-                        brighten_color(accent, 1.35),
-                        (80.0 + transient * 120.0) as u8,
+                        brighten_color(accent, 1.18),
+                        (54.0 + transient * 96.0) as u8,
                     ),
                 ),
             );
@@ -698,43 +693,107 @@ fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64, tra
     }
 }
 
-fn waveform_base_color(bin: &WaveformBin) -> egui::Color32 {
-    let spectral = band_color(bin.band_energy);
-    let neutral = egui::Color32::from_rgb(160, 132, 74);
-    let transient_dip = (bin.transient * 0.35).clamp(0.0, 0.35);
-    lerp_color(neutral, spectral, 0.55 - transient_dip)
+fn draw_spectral_waveform_bin(
+    painter: &egui::Painter,
+    waveform_rect: egui::Rect,
+    center_y: f32,
+    x0: f32,
+    x1: f32,
+    outer_half_h: f32,
+    core_half_h: f32,
+    band: [f32; 3],
+) {
+    let weights = spectral_weights(band);
+    let x0 = x0.max(waveform_rect.left());
+    let x1 = x1.min(waveform_rect.right()).max(x0 + 1.0);
+    let outer_bg = egui::Rect::from_min_max(
+        egui::pos2(x0, center_y - outer_half_h),
+        egui::pos2(x1, center_y + outer_half_h),
+    );
+    painter.rect_filled(
+        outer_bg,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(126, 104, 62, 52),
+    );
+
+    draw_spectral_half(painter, x0, x1, center_y, -1.0, outer_half_h, weights, 88);
+    draw_spectral_half(painter, x0, x1, center_y, 1.0, outer_half_h, weights, 88);
+
+    let inset = ((x1 - x0) * 0.12).min(1.2);
+    let core_x0 = (x0 + inset).min(x1);
+    let core_x1 = (x1 - inset).max(core_x0 + 1.0).min(x1);
+    draw_spectral_half(
+        painter,
+        core_x0,
+        core_x1,
+        center_y,
+        -1.0,
+        core_half_h,
+        weights,
+        218,
+    );
+    draw_spectral_half(
+        painter,
+        core_x0,
+        core_x1,
+        center_y,
+        1.0,
+        core_half_h,
+        weights,
+        218,
+    );
+}
+
+fn draw_spectral_half(
+    painter: &egui::Painter,
+    x0: f32,
+    x1: f32,
+    center_y: f32,
+    direction: f32,
+    half_h: f32,
+    weights: [f32; 3],
+    alpha: u8,
+) {
+    let colors = [
+        egui::Color32::from_rgb(222, 154, 58),
+        egui::Color32::from_rgb(126, 210, 90),
+        egui::Color32::from_rgb(78, 186, 236),
+    ];
+    let mut cursor = center_y;
+    for (idx, weight) in weights.into_iter().enumerate() {
+        let h = (half_h * weight).max(0.0);
+        if h < 0.35 {
+            continue;
+        }
+        let next = cursor + direction * h;
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x0, cursor.min(next)),
+            egui::pos2(x1, cursor.max(next)),
+        );
+        painter.rect_filled(rect, 0.0, color_with_alpha(colors[idx], alpha));
+        cursor = next;
+    }
+}
+
+fn spectral_weights(band: [f32; 3]) -> [f32; 3] {
+    let low = (band[0] * 0.95).sqrt().clamp(0.0, 1.0);
+    let mid = (band[1] * 0.88).sqrt().clamp(0.0, 1.0);
+    let high = (band[2] * 1.22).sqrt().clamp(0.0, 1.0);
+    let sum = (low + mid + high).max(1.0e-6);
+    [low / sum, mid / sum, high / sum]
 }
 
 fn transient_color(band: [f32; 3], strength: f32) -> egui::Color32 {
-    let low = band[0].sqrt().clamp(0.0, 1.0);
-    let mid = band[1].sqrt().clamp(0.0, 1.0);
-    let high = band[2].sqrt().clamp(0.0, 1.0);
-    let sum = (low + mid + high).max(1.0e-6);
-    let low = low / sum;
-    let mid = mid / sum;
-    let high = high / sum;
+    let weights = spectral_weights(band);
+    let low = weights[0];
+    let mid = weights[1];
+    let high = weights[2];
     let color = egui::Color32::from_rgb(
-        ((255.0 * low + 250.0 * mid + 80.0 * high).min(255.0)) as u8,
-        ((58.0 * low + 58.0 * mid + 235.0 * high).min(255.0)) as u8,
-        ((24.0 * low + 210.0 * mid + 255.0 * high).min(255.0)) as u8,
+        ((238.0 * low + 205.0 * mid + 70.0 * high).min(255.0)) as u8,
+        ((126.0 * low + 92.0 * mid + 220.0 * high).min(255.0)) as u8,
+        ((32.0 * low + 210.0 * mid + 255.0 * high).min(255.0)) as u8,
     );
-    brighten_color(color, 1.0 + strength.clamp(0.0, 1.0) * 0.35)
-}
-
-fn band_color(band: [f32; 3]) -> egui::Color32 {
-    let low = band[0].sqrt().clamp(0.0, 1.0);
-    let mid = band[1].sqrt().clamp(0.0, 1.0);
-    let high = band[2].sqrt().clamp(0.0, 1.0);
-    let sum = (low + mid + high).max(1.0e-6);
-    let low = low / sum;
-    let mid = mid / sum;
-    let high = high / sum;
-
-    egui::Color32::from_rgb(
-        ((255.0 * low + 245.0 * mid + 70.0 * high).min(255.0)) as u8,
-        ((82.0 * low + 230.0 * mid + 210.0 * high).min(255.0)) as u8,
-        ((32.0 * low + 50.0 * mid + 255.0 * high).min(255.0)) as u8,
-    )
+    brighten_color(color, 1.0 + strength.clamp(0.0, 1.0) * 0.24)
 }
 
 fn loudness_color(value: f32) -> egui::Color32 {

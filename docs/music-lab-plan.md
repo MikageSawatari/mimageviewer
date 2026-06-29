@@ -28,15 +28,37 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
 
 ## 解析エンジン候補
 
+- ライセンス方針:
+  - AGPL / GPL / NC 条件のモデルは本体同梱しない。
+  - ラボでは外部 Python ツールとして精度確認することは許容するが、配布候補とは分ける。
+  - ONNX / `ort` 統合に進む前に、コード・モデル重み・学習データ由来条件を個別に監査する。
 - Beat / downbeat:
-  - madmom: beat / downbeat の研究実装として有力。Python/モデル同梱の配布負荷がある。
-  - Essentia: BPM / beat ticks / confidence を返せる。AGPLv3 / 商用ライセンス条件に注意。
-  - aubio: 軽量で onset / beat / tempo に使えるが、DJ アプリ級の downbeat までは期待しすぎない。
+  - All-In-One Music Structure Analyzer: MIT。beats / downbeats / segment labels を一括で返すため本命候補。
+    ただし実行依存に PyTorch / NATTEN / madmom / Demucs が絡むため、まず外部 JSON 連携で評価する。
+    学習済み weights の再配布条件が明確になるまでは本体同梱しない。
+  - beat-this / BeatNet: permissive license なら候補。モデル重みの条件確認が必要。
+  - madmom: beat / downbeat の研究実装として有力だが、モデル/データが NC 条件なので本体同梱しない。
+  - Essentia: BPM / beat ticks / confidence を返せるが AGPLv3 / 商用ライセンス条件に注意し、本体同梱しない。
+  - aubio: GPLv3 のため本体同梱しない。
+  - bpm-analyzer / beat-detector: Rust ネイティブの軽量候補。ライセンスと精度を確認する。
   - librosa: 試作と検証に向く。製品組み込みより Python sidecar / offline analyzer 向き。
+- Clean MVP:
+  - Beat / tempo は onset envelope、autocorrelation / comb filter、phase fitting を `music-core` 側で実装する。
+  - Beat grid は誤検出前提で confidence、手動 BPM、first beat、downbeat offset を保存できる形にする。
+  - Downbeat / section label は自動判定を急がず、まず補正可能なグリッドとマーカーを優先する。
 - Section:
   - まずは chorus / verse の意味ラベルではなく、segment boundary / repeated section として扱う。
+  - All-In-One は intro / verse / chorus / bridge / outro などの functional label を返すため優先評価する。
   - librosa の recurrence / agglomerative clustering、MSAF 系を試作候補にする。
   - 意味ラベルは自動判定だけに頼らず、ユーザー補正・色分け・保存を前提にする。
+- Vocal interval:
+  - 曲冒頭シーク用途では音源分離ではなく、vocal activity 区間だけを検出する。
+  - Clean MVP は数秒窓の mid-band energy、harmonicity、spectral flatness、onset density から
+    vocal-likelihood を作り、歌い出し候補時刻だけをキャッシュする。
+  - All-In-One の demixed vocal stem や embeddings を利用できるか評価する。
+  - Demucs / htdemucs は MIT だが重いため、必要なら任意のバックグラウンド高精度解析として扱う。
+  - inaSpeechSegmenter は MIT だが singing voice は music 扱いなので、歌あり区間の検出にはそのまま使わない。
+  - SingingVoiceDetection 系の MIT 実装や music tagging モデルを、ONNX 化できるか確認する。
 
 ## 初期スコープ
 
@@ -53,7 +75,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - Play/Pause/Stop/seek 用の最小プレイヤー
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
-     - ドラム系の立ち上がりを transient accent として重ねる
+     - 音量の縦ラインを低 / 中 / 高域で分割して塗り、強い立ち上がりだけ transient accent として重ねる
      - 下段: ラウドネス面グラフ
    - 下段 50-band analyzer + 減衰背景
 

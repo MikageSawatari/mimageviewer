@@ -114,12 +114,12 @@ pub fn analyze_stereo_timeline(
             (high_sum / n).sqrt() as f32,
         ];
         let transient_raw = [
-            (band_rms[0] - prev_band_rms[0] * 0.82).max(0.0),
-            (band_rms[1] - prev_band_rms[1] * 0.82).max(0.0),
-            (band_rms[2] - prev_band_rms[2] * 0.82).max(0.0),
+            (band_rms[0] - prev_band_rms[0] - 0.006).max(0.0),
+            (band_rms[1] - prev_band_rms[1] - 0.006).max(0.0),
+            (band_rms[2] - prev_band_rms[2] - 0.006).max(0.0),
         ];
         let transient_total = transient_raw.iter().copied().sum::<f32>();
-        let transient = (transient_total * 4.0).clamp(0.0, 1.0);
+        let transient = (transient_total * 6.0).clamp(0.0, 1.0);
         let transient_band = if transient_total > 1.0e-8 {
             [
                 transient_raw[0] / transient_total,
@@ -143,7 +143,11 @@ pub fn analyze_stereo_timeline(
             transient,
             transient_band,
         });
-        prev_band_rms = band_rms;
+        prev_band_rms = [
+            prev_band_rms[0] * 0.68 + band_rms[0] * 0.32,
+            prev_band_rms[1] * 0.68 + band_rms[1] * 0.32,
+            prev_band_rms[2] * 0.68 + band_rms[2] * 0.32,
+        ];
 
         frame_start = frame_end;
     }
