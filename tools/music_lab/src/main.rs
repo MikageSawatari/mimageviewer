@@ -21,7 +21,8 @@ const TIMELINE_WAVEFORM_H: f32 = 68.0;
 const TIMELINE_LOUDNESS_H: f32 = 18.0;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
-const SPECTRUM_BANDS: usize = 50;
+const SPECTRUM_BANDS: usize = 108;
+const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 
@@ -233,7 +234,7 @@ impl MusicLabApp {
 
     fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("music_lab_bottom")
-            .exact_height(96.0)
+            .exact_height(152.0)
             .show(ctx, |ui| {
                 let Some(track) = &self.track else {
                     ui.centered_and_justified(|ui| ui.label("Spectrum analyzer placeholder"));
@@ -669,9 +670,11 @@ fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64, tra
     let band_w = plot.width() / bands.len() as f32;
     for (i, value) in bands.iter().enumerate() {
         let value = value.clamp(0.0, 1.0);
-        trail[i] = (trail[i] * 0.965).max(value);
-        let x0 = plot.left() + i as f32 * band_w + 0.5;
-        let x1 = (x0 + (band_w - 1.0).max(1.0)).min(plot.right());
+        trail[i] = (trail[i] * SPECTRUM_TRAIL_DECAY).max(value);
+        let x0 = plot.left() + i as f32 * band_w + 0.25;
+        let x1 = (plot.left() + (i + 1) as f32 * band_w - 0.25)
+            .max(x0 + 0.75)
+            .min(plot.right());
         let trail_h = (plot.height() - 3.0) * trail[i].max(0.015);
         painter.rect_filled(
             egui::Rect::from_min_max(
@@ -704,8 +707,8 @@ fn draw_spectral_waveform_bin(
     band: [f32; 3],
 ) {
     let weights = spectral_weights(band);
-    let x0 = x0.max(waveform_rect.left());
-    let x1 = x1.min(waveform_rect.right()).max(x0 + 1.0);
+    let x0 = (x0 - 0.35).max(waveform_rect.left());
+    let x1 = (x1 + 0.35).min(waveform_rect.right()).max(x0 + 0.75);
     let outer_bg = egui::Rect::from_min_max(
         egui::pos2(x0, center_y - outer_half_h),
         egui::pos2(x1, center_y + outer_half_h),
@@ -719,29 +722,8 @@ fn draw_spectral_waveform_bin(
     draw_spectral_half(painter, x0, x1, center_y, -1.0, outer_half_h, weights, 88);
     draw_spectral_half(painter, x0, x1, center_y, 1.0, outer_half_h, weights, 88);
 
-    let inset = ((x1 - x0) * 0.12).min(1.2);
-    let core_x0 = (x0 + inset).min(x1);
-    let core_x1 = (x1 - inset).max(core_x0 + 1.0).min(x1);
-    draw_spectral_half(
-        painter,
-        core_x0,
-        core_x1,
-        center_y,
-        -1.0,
-        core_half_h,
-        weights,
-        218,
-    );
-    draw_spectral_half(
-        painter,
-        core_x0,
-        core_x1,
-        center_y,
-        1.0,
-        core_half_h,
-        weights,
-        218,
-    );
+    draw_spectral_half(painter, x0, x1, center_y, -1.0, core_half_h, weights, 218);
+    draw_spectral_half(painter, x0, x1, center_y, 1.0, core_half_h, weights, 218);
 }
 
 fn draw_spectral_half(

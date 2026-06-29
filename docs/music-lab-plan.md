@@ -63,7 +63,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
 ## 初期スコープ
 
 1. `music-core`
-   - stereo waveform bin
+   - stereo waveform bin (lab default 25 ms)
    - low/mid/high energy
    - loudness/RMS/peak
    - 簡易 BPM / beat/bar grid
@@ -77,7 +77,9 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
      - 上段: 周波数色分けした DJ 風の塗り波形
      - 音量の縦ラインを低 / 中 / 高域で分割して塗り、強い立ち上がりだけ transient accent として重ねる
      - 下段: ラウドネス面グラフ
-   - 下段 50-band analyzer + 減衰背景
+   - 下段 108-band analyzer + 減衰背景
+     - 40 Hz - 18 kHz を約 1 semitone 幅で分割する想定
+     - 分解能優先のため、108-band 時は長めの解析窓で少し鈍い反応にする
 
 ## 本体統合時の注意
 

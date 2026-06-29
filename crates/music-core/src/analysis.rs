@@ -27,7 +27,7 @@ pub struct AnalysisConfig {
 impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
-            bin_secs: 0.10,
+            bin_secs: 0.025,
             row_secs: 30.0,
             low_cut_hz: 250.0,
             mid_cut_hz: 2_500.0,
@@ -203,7 +203,11 @@ pub fn spectrum_bands_from_stereo_window(
         return vec![0.0; bands];
     }
 
-    let requested_window = (sample_rate as usize / 24).clamp(1024, 4096);
+    let requested_window = if bands >= 96 {
+        (sample_rate as usize / 3).clamp(8192, 16_384)
+    } else {
+        (sample_rate as usize / 24).clamp(1024, 4096)
+    };
     let window_frames = requested_window.min(frame_count).max(1);
     let max_start = frame_count.saturating_sub(window_frames);
     let center_frame = if center_secs.is_finite() {
