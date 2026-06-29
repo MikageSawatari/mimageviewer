@@ -60,7 +60,11 @@ impl eframe::App for MusicLabApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(track) = &self.track {
-                draw_timeline(ui, track, self.player.as_ref(), self.player_snapshot());
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        draw_timeline(ui, track, self.player.as_ref(), self.player_snapshot());
+                    });
             } else {
                 draw_empty_state(ui, &self.load_status);
             }
@@ -307,29 +311,26 @@ fn draw_timeline(
     player: Option<&LabPlayer>,
     snap: PlaybackSnapshot,
 ) {
-    let available = ui.available_size();
-    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-
     let row_secs = track.analysis.config.row_secs.max(1.0);
     let rows = (track.decoded.info.duration_secs / row_secs)
         .ceil()
         .max(1.0) as usize;
     let row_gap = 6.0;
-    let row_h = ((rect.height() - row_gap * (rows.saturating_sub(1)) as f32) / rows as f32)
-        .clamp(34.0, 86.0);
+    let row_h = 52.0;
+    let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
+    let available = egui::vec2(ui.available_width(), ui.available_height().max(content_h));
+    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+
     let label_w = 56.0;
     let graph_rect = egui::Rect::from_min_max(
         rect.min + egui::vec2(label_w, 8.0),
-        rect.max - egui::vec2(8.0, 8.0),
+        egui::pos2(rect.max.x - 8.0, rect.min.y + content_h - 8.0),
     );
 
     for row in 0..rows {
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
-        if row_top > graph_rect.max.y {
-            break;
-        }
         let row_rect = egui::Rect::from_min_size(
             egui::pos2(graph_rect.min.x, row_top),
             egui::vec2(graph_rect.width(), row_h),
