@@ -22,6 +22,7 @@ const TIMELINE_LOUDNESS_H: f32 = 18.0;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const SPECTRUM_BANDS: usize = 50;
+const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -55,6 +56,7 @@ struct MusicLabApp {
     bookmarks: Vec<MusicBookmark>,
     next_bookmark_id: u64,
     selected_bookmark: Option<u64>,
+    spectrum_trail: Vec<f32>,
 }
 
 impl eframe::App for MusicLabApp {
@@ -199,12 +201,19 @@ impl MusicLabApp {
                     ui.label(format!("Channels: {}", track.decoded.info.channels));
                     ui.label(format!("Wave bins: {}", track.analysis.bins.len()));
                     if let Some(bpm) = track.analysis.beat_grid.bpm {
+                        let grid_visible =
+                            track.analysis.beat_grid.confidence >= BEAT_GRID_MIN_CONFIDENCE;
                         ui.label(format!(
                             "BPM: {:.1} ({:?}, {:.0}%)",
                             bpm,
                             track.analysis.beat_grid.status,
                             track.analysis.beat_grid.confidence * 100.0
                         ));
+                        ui.label(if grid_visible {
+                            "Beat grid: visible lab estimate"
+                        } else {
+                            "Beat grid: hidden below confidence threshold"
+                        });
                     } else {
                         ui.label("BPM: not estimated");
                     }
@@ -229,7 +238,12 @@ impl MusicLabApp {
                     ui.centered_and_justified(|ui| ui.label("Spectrum analyzer placeholder"));
                     return;
                 };
-                draw_spectrum(ui, track, self.player_snapshot().position_secs);
+                draw_spectrum(
+                    ui,
+                    track,
+                    self.player_snapshot().position_secs,
+                    &mut self.spectrum_trail,
+                );
             });
     }
 
@@ -237,6 +251,7 @@ impl MusicLabApp {
         self.load_status = format!("Loading {}", path.display());
         self.player = None;
         self.track = None;
+        self.spectrum_trail.clear();
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("music-lab-load".into())
@@ -304,7 +319,7 @@ fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
             ui.heading("Music lab");
-            ui.label("Open an audio file to test the one-minute-row music view.");
+            ui.label("Open an audio file to test the thirty-second-row music view.");
             if !status.is_empty() {
                 ui.label(status);
             }
@@ -451,7 +466,7 @@ fn draw_timeline_row(
         let outer_half_h = (waveform_rect.height() * 0.46 * amp).max(1.0);
         let core_scale = 0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45;
         let core_half_h = (outer_half_h * core_scale).max(1.0).min(outer_half_h);
-        let color = band_color(bin.band_energy);
+        let color = waveform_base_color(bin);
 
         painter.rect_filled(
             egui::Rect::from_min_max(
@@ -469,6 +484,41 @@ fn draw_timeline_row(
             0.0,
             color_with_alpha(brighten_color(color, 1.24), 230),
         );
+        if bin.transient > 0.08 {
+            let transient = bin.transient.sqrt().clamp(0.0, 1.0);
+            let accent_half_h = waveform_rect.height() * (0.18 + transient * 0.30);
+            let accent_center =
+                ((x0 + x1) * 0.5).clamp(waveform_rect.left(), waveform_rect.right());
+            let accent_half_w = ((x1 - x0).max(2.0) * (0.45 + transient * 0.65)).min(5.0);
+            let accent = transient_color(bin.transient_band, transient);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(
+                        (accent_center - accent_half_w).max(waveform_rect.left()),
+                        center_y - accent_half_h,
+                    ),
+                    egui::pos2(
+                        (accent_center + accent_half_w).min(waveform_rect.right()),
+                        center_y + accent_half_h,
+                    ),
+                ),
+                0.0,
+                color_with_alpha(accent, (78.0 + transient * 150.0) as u8),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(accent_center, center_y - accent_half_h),
+                    egui::pos2(accent_center, center_y + accent_half_h),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    color_with_alpha(
+                        brighten_color(accent, 1.35),
+                        (80.0 + transient * 120.0) as u8,
+                    ),
+                ),
+            );
+        }
 
         let loudness = ((bin.loudness_db + 52.0) / 52.0).clamp(0.0, 1.0);
         let loudness_h = (loudness_rect.height() - 2.0) * loudness.powf(0.72).max(0.02);
@@ -496,7 +546,13 @@ fn draw_beat_grid(
     row_secs: f64,
     analysis: &TimelineAnalysis,
 ) {
+    if analysis.beat_grid.confidence < BEAT_GRID_MIN_CONFIDENCE {
+        return;
+    }
     let row_end = row_start + row_secs;
+    let alpha_scale = ((analysis.beat_grid.confidence - BEAT_GRID_MIN_CONFIDENCE)
+        / (1.0 - BEAT_GRID_MIN_CONFIDENCE))
+        .clamp(0.0, 1.0);
     for beat in &analysis.beat_grid.beats {
         if beat.time_secs < row_start || beat.time_secs > row_end {
             continue;
@@ -506,7 +562,12 @@ fn draw_beat_grid(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(
                 0.5,
-                egui::Color32::from_rgba_unmultiplied(185, 205, 220, 74),
+                egui::Color32::from_rgba_unmultiplied(
+                    150,
+                    190,
+                    220,
+                    (24.0 + alpha_scale * 54.0) as u8,
+                ),
             ),
         );
     }
@@ -518,7 +579,15 @@ fn draw_beat_grid(
         let x = rect.left() + ((bar.time_secs - row_start) / row_secs) as f32 * rect.width();
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 70, 46, 170)),
+            egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgba_unmultiplied(
+                    55,
+                    170,
+                    255,
+                    (72.0 + alpha_scale * 92.0) as u8,
+                ),
+            ),
         );
         if x - last_bar_label_x >= 32.0 {
             painter.text(
@@ -526,7 +595,7 @@ fn draw_beat_grid(
                 egui::Align2::LEFT_TOP,
                 (bar.index + 1).to_string(),
                 egui::FontId::monospace(10.0),
-                egui::Color32::from_rgb(80, 170, 255),
+                egui::Color32::from_rgba_unmultiplied(95, 185, 255, 210),
             );
             last_bar_label_x = x;
         }
@@ -564,7 +633,7 @@ fn draw_playhead(
     );
 }
 
-fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64) {
+fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64, trail: &mut Vec<f32>) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
@@ -597,12 +666,26 @@ fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64) {
     if bands.is_empty() {
         return;
     }
+    if trail.len() != bands.len() {
+        trail.clear();
+        trail.resize(bands.len(), 0.0);
+    }
 
     let band_w = plot.width() / bands.len() as f32;
     for (i, value) in bands.iter().enumerate() {
         let value = value.clamp(0.0, 1.0);
+        trail[i] = (trail[i] * 0.965).max(value);
         let x0 = plot.left() + i as f32 * band_w + 0.5;
         let x1 = (x0 + (band_w - 1.0).max(1.0)).min(plot.right());
+        let trail_h = (plot.height() - 3.0) * trail[i].max(0.015);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, plot.bottom() - 2.0 - trail_h),
+                egui::pos2(x1, plot.bottom() - 2.0),
+            ),
+            1.0,
+            color_with_alpha(spectrum_color(i, bands.len(), trail[i]), 58),
+        );
         let h = (plot.height() - 3.0) * value.max(0.015);
         painter.rect_filled(
             egui::Rect::from_min_max(
@@ -613,6 +696,29 @@ fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64) {
             spectrum_color(i, bands.len(), value),
         );
     }
+}
+
+fn waveform_base_color(bin: &WaveformBin) -> egui::Color32 {
+    let spectral = band_color(bin.band_energy);
+    let neutral = egui::Color32::from_rgb(160, 132, 74);
+    let transient_dip = (bin.transient * 0.35).clamp(0.0, 0.35);
+    lerp_color(neutral, spectral, 0.55 - transient_dip)
+}
+
+fn transient_color(band: [f32; 3], strength: f32) -> egui::Color32 {
+    let low = band[0].sqrt().clamp(0.0, 1.0);
+    let mid = band[1].sqrt().clamp(0.0, 1.0);
+    let high = band[2].sqrt().clamp(0.0, 1.0);
+    let sum = (low + mid + high).max(1.0e-6);
+    let low = low / sum;
+    let mid = mid / sum;
+    let high = high / sum;
+    let color = egui::Color32::from_rgb(
+        ((255.0 * low + 250.0 * mid + 80.0 * high).min(255.0)) as u8,
+        ((58.0 * low + 58.0 * mid + 235.0 * high).min(255.0)) as u8,
+        ((24.0 * low + 210.0 * mid + 255.0 * high).min(255.0)) as u8,
+    );
+    brighten_color(color, 1.0 + strength.clamp(0.0, 1.0) * 0.35)
 }
 
 fn band_color(band: [f32; 3]) -> egui::Color32 {

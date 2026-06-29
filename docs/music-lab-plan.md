@@ -9,7 +9,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
 ## 方針
 
 - `music-core` は GUI / cpal / FFmpeg / VST3 に依存しない純ロジックにする。
-- `music_lab` は軽量 eframe アプリとして、音声ファイル decode、再生、1 分 1 行の
+- `music_lab` は軽量 eframe アプリとして、音声ファイル decode、再生、30 秒 1 行の
   DJ 風タイムライン、簡易 BPM 推定、ブックマーク UI を試す。
 - 本体統合時は `GridItem::Audio` を追加し、動画と同じ media viewer 枠で
   `MediaVisualMode::Music` を表示する。
@@ -26,6 +26,18 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   から直接呼ばない。
 - 動画 / 音楽の両方で同じ VST3 チェーン、同じ plugin state、同じ GUI 管理を使う。
 
+## 解析エンジン候補
+
+- Beat / downbeat:
+  - madmom: beat / downbeat の研究実装として有力。Python/モデル同梱の配布負荷がある。
+  - Essentia: BPM / beat ticks / confidence を返せる。AGPLv3 / 商用ライセンス条件に注意。
+  - aubio: 軽量で onset / beat / tempo に使えるが、DJ アプリ級の downbeat までは期待しすぎない。
+  - librosa: 試作と検証に向く。製品組み込みより Python sidecar / offline analyzer 向き。
+- Section:
+  - まずは chorus / verse の意味ラベルではなく、segment boundary / repeated section として扱う。
+  - librosa の recurrence / agglomerative clustering、MSAF 系を試作候補にする。
+  - 意味ラベルは自動判定だけに頼らず、ユーザー補正・色分け・保存を前提にする。
+
 ## 初期スコープ
 
 1. `music-core`
@@ -39,14 +51,17 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - 音声ファイルを開く
    - 全尺 decode + timeline analysis
    - Play/Pause/Stop/seek 用の最小プレイヤー
-   - 左 bookmark / 右 details / 中央 1 分 1 行 timeline
+   - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
+     - ドラム系の立ち上がりを transient accent として重ねる
      - 下段: ラウドネス面グラフ
-   - 下段 50-band analyzer
+   - 下段 50-band analyzer + 減衰背景
 
 ## 本体統合時の注意
 
 - 解析 / DB / waveform 生成は UI thread で行わない。
 - 解析結果は `audio_analysis.db` へ path + size + mtime + analysis_version で保存する。
 - 小節頭と BPM は誤検出がある前提で、手動補正を永続化する。
+- lab の簡易ビート推定は低信頼度ならグリッドを描かず、本体統合時は
+  beat/downbeat 専用エンジンか手動補正 UI に置き換える。
 - VST3 有効時の PDC は動画と同じく再生 clock / decoder pacing へ反映する。

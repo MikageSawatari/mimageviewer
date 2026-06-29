@@ -28,7 +28,7 @@ impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
             bin_secs: 0.10,
-            row_secs: 60.0,
+            row_secs: 30.0,
             low_cut_hz: 250.0,
             mid_cut_hz: 2_500.0,
         }
@@ -44,6 +44,10 @@ pub struct WaveformBin {
     pub loudness_db: f32,
     /// Normalized low / mid / high energy. Used for DJ-style color mapping.
     pub band_energy: [f32; 3],
+    /// 0..1 estimate of sudden energy change for percussive visual accents.
+    pub transient: f32,
+    /// Normalized low / mid / high contribution to the transient accent.
+    pub transient_band: [f32; 3],
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -69,6 +73,7 @@ pub fn analyze_stereo_timeline(
     let mut bins = Vec::with_capacity(frame_count.div_ceil(frames_per_bin));
     let mut low_state = 0.0_f32;
     let mut mid_state = 0.0_f32;
+    let mut prev_band_rms = [0.0_f32; 3];
     let low_alpha = one_pole_alpha(config.low_cut_hz, sample_rate);
     let mid_alpha = one_pole_alpha(config.mid_cut_hz, sample_rate);
 
@@ -103,6 +108,27 @@ pub fn analyze_stereo_timeline(
         let rms = (square_sum / n).sqrt() as f32;
         let loudness_db = linear_to_db(rms);
         let total_band = (low_sum + mid_sum + high_sum).max(f64::EPSILON);
+        let band_rms = [
+            (low_sum / n).sqrt() as f32,
+            (mid_sum / n).sqrt() as f32,
+            (high_sum / n).sqrt() as f32,
+        ];
+        let transient_raw = [
+            (band_rms[0] - prev_band_rms[0] * 0.82).max(0.0),
+            (band_rms[1] - prev_band_rms[1] * 0.82).max(0.0),
+            (band_rms[2] - prev_band_rms[2] * 0.82).max(0.0),
+        ];
+        let transient_total = transient_raw.iter().copied().sum::<f32>();
+        let transient = (transient_total * 4.0).clamp(0.0, 1.0);
+        let transient_band = if transient_total > 1.0e-8 {
+            [
+                transient_raw[0] / transient_total,
+                transient_raw[1] / transient_total,
+                transient_raw[2] / transient_total,
+            ]
+        } else {
+            [0.0; 3]
+        };
         bins.push(WaveformBin {
             start_secs: frame_start as f64 / sample_rate as f64,
             duration_secs: (frame_end - frame_start) as f64 / sample_rate as f64,
@@ -114,7 +140,10 @@ pub fn analyze_stereo_timeline(
                 (mid_sum / total_band) as f32,
                 (high_sum / total_band) as f32,
             ],
+            transient,
+            transient_band,
         });
+        prev_band_rms = band_rms;
 
         frame_start = frame_end;
     }
@@ -318,6 +347,17 @@ mod tests {
         let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
         assert!(!analysis.bins.is_empty());
         assert!(analysis.bins.iter().any(|b| b.peak > 0.5));
+    }
+
+    #[test]
+    fn analysis_marks_percussive_transients() {
+        let mut samples = Vec::new();
+        for i in 0..48_000 {
+            let x = if i % 12_000 < 180 { 0.9 } else { 0.0 };
+            samples.extend([x, x]);
+        }
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        assert!(analysis.bins.iter().any(|b| b.transient > 0.25));
     }
 
     #[test]
