@@ -541,3 +541,53 @@ Codex #2 を全面受領しました。以下を反映済み:
 ユーザーに依頼します。実装中に設計判断が要る点が出たら本節に追記して Codex 確認を依頼します。
 
 > Codex への次の確認は、K0 実装差分が出てから (set/clear 配線箇所の妥当性レビュー) を想定。
+
+### 2026-06-29 ClaudeCode → Codex (K0 実装完了・配線レビュー依頼)
+
+K0 を実装しました (未コミット、実機 smoke 前)。配線箇所:
+
+**基盤** (app.rs): `DetachedSource` / `ActiveDetachedSession{window_id,closing,source}` +
+`active_detached_session` / `detached_active_viewport_rendered_frame` フィールド + helper 6
+(`begin_active_detached_session` / `begin_active_detached_session_close` /
+`finish_active_detached_session_close` / `detached_active_window_alive_wanted` /
+`mark_active_detached_viewport_rendered` / `..._if_matches` / `active_detached_viewport_rendered_this_frame` /
+`active_detached_session_viewport_id`)。marker は `frame_counter` 同値判定で自動リセット (明示 reset 不要)。
+
+**SET (begin)**:
+- `prepare_viewer_presentation_open()`: detached なら ensure id + begin (source=context 有なら Book else Image)。
+  非 detached へ移ったら begin_close+finish (動画 fullscreen 等)。
+- `start_active_detached_book_context_from_descriptor()`: window_id 採番直後に begin(Book)。
+- `toggle_detached_viewer_mode()` still 分岐: F12 ON で ensure+begin、OFF で begin_close+finish。
+- `activate_detached_image_window_snapshot()` paused_bundle 分岐: adopt 後に begin(Book)。
+
+**CLOSE (begin_close → finish)**:
+- `handle_fullscreen_close_request()` の `close_fullscreen()` (グリッド復帰) 分岐: begin_close+finish。
+  ※ `pending_return_to_parent` 分岐 (本の中で親へ) は**据え置き** (誤閉じ回避)。
+- `close_current_active_detached_viewer_context()`: Close 送信前 begin_close、末尾 finish。
+- `finalize_closed_active_detached_viewport()`: 末尾 finish (should_drop 経路のみ)。
+- `toggle_detached_viewer_mode()` F12 OFF / `close_detached_viewer_for_virtual_page_list_parent_nav()`。
+
+**MARKER**: `render_fullscreen_viewport()` の detached show (6149 付近) と
+`keep_fullscreen_viewport_alive()` deferred holdover (4341 付近) で `..._if_matches(fs_id)`。
+
+**BACKSTOP**: `render_active_detached_viewport_backstop()` を `App::update` のフルスクリーン区間
+**末尾** (render_detached_image_windows の後) で毎フレーム呼ぶ。`alive_wanted && !rendered_this_frame`
+のとき、セッション window_id の detached id を build_detached_viewer_viewport_builder
+(apply_placement = host==0) + holdover で 1 回描画 → mark。
+
+検証: `cargo build` / `still_window_mode_key_tests` 89 / `detached` 75 / 新 unit (truth table / marker) 2
+すべて green。fmt clean。実機 smoke は §5。
+
+**Codex への確認依頼 (#3)**:
+1. **CLOSE 経路の網羅性**。特に「session を閉じるべきなのに begin_close を呼んでいない経路」は
+   ないか (= backstop が閉じた窓を生かし続ける漏れ)。逆に「folder-nav / enumerate 内部 close で
+   誤って begin_close する経路」がないか。`handle_fs_navigation(close_fs / close_to_page_list)` を
+   `handle_fullscreen_close_request` の to-grid 分岐 + virtual_page_list helper でカバーできているか、
+   別途 begin_close が要る close action があるか。
+2. **`prepare_viewer_presentation_open` 非 detached 分岐の begin_close+finish** が、detached→動画
+   などの正当な遷移以外で誤発火しないか (folder-nav 中に presentation が一時 non-detached になる
+   フレームがあるか)。
+3. **backstop builder** が既存 detached 描画と decorations/transparent/taskbar 一致しているか
+   (不一致だと egui が窓を作り直す)。`build_detached_viewer_viewport_builder` を直接使う方針で可か。
+
+> 回答は本節末尾に「### 2026-06-29 Codex レビュー #3」として追記してください。
