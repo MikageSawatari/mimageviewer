@@ -39,7 +39,10 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - 音声ファイルを開く
    - 全尺 decode + timeline analysis
    - Play/Pause/Stop/seek 用の最小プレイヤー
-   - 左 bookmark / 右 details / 中央 1 分 1 行 timeline / 下 spectrum placeholder
+   - 左 bookmark / 右 details / 中央 1 分 1 行 timeline
+     - 上段: 周波数色分けした DJ 風の塗り波形
+     - 下段: ラウドネス面グラフ
+   - 下段 50-band analyzer
 
 ## 本体統合時の注意
 

@@ -12,7 +12,7 @@ pub mod timeline;
 
 pub use analysis::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, TimelineAnalysis, WaveformBin,
-    analyze_stereo_timeline, resample_linear_stereo,
+    analyze_stereo_timeline, resample_linear_stereo, spectrum_bands_from_stereo_window,
 };
 pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};
 pub use effects::{AudioProcessBlock, EffectChain, EffectChainStats, EffectError, NoopEffectChain};

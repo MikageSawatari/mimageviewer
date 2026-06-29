@@ -6,6 +6,7 @@ use eframe::egui;
 use music_core::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, MusicBookmark, PlaybackSnapshot,
     TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
+    spectrum_bands_from_stereo_window,
 };
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -15,6 +16,12 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+
+const TIMELINE_WAVEFORM_H: f32 = 68.0;
+const TIMELINE_LOUDNESS_H: f32 = 18.0;
+const TIMELINE_INNER_GAP: f32 = 4.0;
+const TIMELINE_ROW_GAP: f32 = 12.0;
+const SPECTRUM_BANDS: usize = 50;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -315,8 +322,8 @@ fn draw_timeline(
     let rows = (track.decoded.info.duration_secs / row_secs)
         .ceil()
         .max(1.0) as usize;
-    let row_gap = 6.0;
-    let row_h = 52.0;
+    let row_gap = TIMELINE_ROW_GAP;
+    let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_LOUDNESS_H;
     let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
     let available = egui::vec2(ui.available_width(), ui.available_height().max(content_h));
     let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
@@ -392,22 +399,92 @@ fn draw_timeline_row(
     } else {
         egui::Color32::from_rgb(238, 241, 243)
     };
-    painter.rect_filled(rect, 4.0, bg);
-    let center_y = rect.center().y;
+    let waveform_rect =
+        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TIMELINE_WAVEFORM_H));
+    let loudness_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), waveform_rect.bottom() + TIMELINE_INNER_GAP),
+        egui::vec2(rect.width(), TIMELINE_LOUDNESS_H),
+    );
+
+    painter.rect_filled(waveform_rect, 0.0, egui::Color32::BLACK);
+    painter.rect_filled(loudness_rect, 0.0, bg);
+    painter.rect_stroke(
+        waveform_rect,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 92, 116, 140)),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        loudness_rect,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 92, 116, 90)),
+        egui::StrokeKind::Inside,
+    );
+
+    let center_y = waveform_rect.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(waveform_rect.left(), center_y),
+            egui::pos2(waveform_rect.right(), center_y),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+        ),
+    );
+
     for bin in bins {
-        if bin.start_secs + bin.duration_secs < row_start || bin.start_secs > row_start + row_secs {
+        let bin_end = bin.start_secs + bin.duration_secs;
+        if bin_end < row_start || bin.start_secs > row_start + row_secs {
             continue;
         }
-        let x = rect.left()
-            + (((bin.start_secs - row_start) / row_secs) as f32).clamp(0.0, 1.0) * rect.width();
-        let amp = (bin.peak.max(bin.rms * 1.8)).sqrt().clamp(0.02, 1.0);
-        let half_h = rect.height() * 0.46 * amp;
-        painter.line_segment(
-            [
-                egui::pos2(x, center_y - half_h),
-                egui::pos2(x, center_y + half_h),
-            ],
-            egui::Stroke::new(1.0, band_color(bin.band_energy)),
+        let visible_start = bin.start_secs.max(row_start);
+        let visible_end = bin_end.min(row_start + row_secs);
+
+        let x0 = waveform_rect.left()
+            + ((visible_start - row_start) / row_secs) as f32 * waveform_rect.width();
+        let x1 = (waveform_rect.left()
+            + ((visible_end - row_start) / row_secs) as f32 * waveform_rect.width())
+        .max(x0 + 1.0)
+        .min(waveform_rect.right());
+        let amp = (bin.peak.max(bin.rms * 2.0)).sqrt().clamp(0.025, 1.0);
+        let outer_half_h = waveform_rect.height() * 0.46 * amp;
+        let core_half_h = (outer_half_h * (0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45))
+            .clamp(1.0, outer_half_h);
+        let color = band_color(bin.band_energy);
+
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, center_y - outer_half_h),
+                egui::pos2(x1, center_y + outer_half_h),
+            ),
+            0.0,
+            color_with_alpha(color, 122),
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, center_y - core_half_h),
+                egui::pos2(x1, center_y + core_half_h),
+            ),
+            0.0,
+            color_with_alpha(brighten_color(color, 1.24), 230),
+        );
+
+        let loudness = ((bin.loudness_db + 52.0) / 52.0).clamp(0.0, 1.0);
+        let loudness_h = (loudness_rect.height() - 2.0) * loudness.powf(0.72).max(0.02);
+        let loudness_x0 = loudness_rect.left()
+            + ((visible_start - row_start) / row_secs) as f32 * loudness_rect.width();
+        let loudness_x1 = (loudness_rect.left()
+            + ((visible_end - row_start) / row_secs) as f32 * loudness_rect.width())
+        .max(loudness_x0 + 1.0)
+        .min(loudness_rect.right());
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(loudness_x0, loudness_rect.bottom() - 1.0 - loudness_h),
+                egui::pos2(loudness_x1, loudness_rect.bottom() - 1.0),
+            ),
+            0.0,
+            loudness_color(loudness),
         );
     }
 }
@@ -429,10 +506,11 @@ fn draw_beat_grid(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(
                 0.5,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 75),
+                egui::Color32::from_rgba_unmultiplied(185, 205, 220, 74),
             ),
         );
     }
+    let mut last_bar_label_x = f32::NEG_INFINITY;
     for bar in &analysis.beat_grid.bars {
         if bar.time_secs < row_start || bar.time_secs > row_end {
             continue;
@@ -440,11 +518,18 @@ fn draw_beat_grid(
         let x = rect.left() + ((bar.time_secs - row_start) / row_secs) as f32 * rect.width();
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(
-                1.5,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
-            ),
+            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 70, 46, 170)),
         );
+        if x - last_bar_label_x >= 32.0 {
+            painter.text(
+                egui::pos2(x + 3.0, rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                (bar.index + 1).to_string(),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgb(80, 170, 255),
+            );
+            last_bar_label_x = x;
+        }
     }
 }
 
@@ -482,40 +567,50 @@ fn draw_playhead(
 fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-    let bin = track
-        .analysis
-        .bins
-        .iter()
-        .min_by(|a, b| {
-            (a.start_secs - position_secs)
-                .abs()
-                .total_cmp(&(b.start_secs - position_secs).abs())
-        })
-        .copied()
-        .unwrap_or_default();
-    let labels = ["LOW", "MID", "HIGH"];
-    for (i, value) in bin.band_energy.iter().enumerate() {
-        let x0 = rect.left() + 18.0 + i as f32 * (rect.width() - 36.0) / 3.0;
-        let w = (rect.width() - 56.0) / 3.0;
-        let h = (rect.height() - 30.0) * value.sqrt().clamp(0.02, 1.0);
-        let bar =
-            egui::Rect::from_min_size(egui::pos2(x0, rect.bottom() - h - 18.0), egui::vec2(w, h));
+    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+
+    let plot = rect.shrink2(egui::vec2(18.0, 12.0));
+    painter.rect_filled(plot, 0.0, egui::Color32::BLACK);
+    painter.rect_stroke(
+        plot,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 92, 116, 130)),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(plot.left(), plot.bottom() - 1.0),
+            egui::pos2(plot.right(), plot.bottom() - 1.0),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35),
+        ),
+    );
+
+    let bands = spectrum_bands_from_stereo_window(
+        &track.decoded.stereo_samples,
+        track.decoded.info.sample_rate,
+        position_secs,
+        SPECTRUM_BANDS,
+    );
+    if bands.is_empty() {
+        return;
+    }
+
+    let band_w = plot.width() / bands.len() as f32;
+    for (i, value) in bands.iter().enumerate() {
+        let value = value.clamp(0.0, 1.0);
+        let x0 = plot.left() + i as f32 * band_w + 0.5;
+        let x1 = (x0 + (band_w - 1.0).max(1.0)).min(plot.right());
+        let h = (plot.height() - 3.0) * value.max(0.015);
         painter.rect_filled(
-            bar,
-            4.0,
-            band_color(match i {
-                0 => [1.0, 0.0, 0.0],
-                1 => [0.0, 1.0, 0.0],
-                _ => [0.0, 0.0, 1.0],
-            }),
-        );
-        painter.text(
-            egui::pos2(x0, rect.bottom() - 14.0),
-            egui::Align2::LEFT_CENTER,
-            labels[i],
-            egui::FontId::monospace(11.0),
-            ui.visuals().text_color(),
+            egui::Rect::from_min_max(
+                egui::pos2(x0, plot.bottom() - 2.0 - h),
+                egui::pos2(x1, plot.bottom() - 2.0),
+            ),
+            1.0,
+            spectrum_color(i, bands.len(), value),
         );
     }
 }
@@ -524,11 +619,94 @@ fn band_color(band: [f32; 3]) -> egui::Color32 {
     let low = band[0].sqrt().clamp(0.0, 1.0);
     let mid = band[1].sqrt().clamp(0.0, 1.0);
     let high = band[2].sqrt().clamp(0.0, 1.0);
+    let sum = (low + mid + high).max(1.0e-6);
+    let low = low / sum;
+    let mid = mid / sum;
+    let high = high / sum;
+
     egui::Color32::from_rgb(
-        (230.0 * low + 70.0 * mid) as u8,
-        (80.0 * low + 210.0 * mid + 150.0 * high) as u8,
-        (60.0 * mid + 240.0 * high) as u8,
+        ((255.0 * low + 245.0 * mid + 70.0 * high).min(255.0)) as u8,
+        ((82.0 * low + 230.0 * mid + 210.0 * high).min(255.0)) as u8,
+        ((32.0 * low + 50.0 * mid + 255.0 * high).min(255.0)) as u8,
     )
+}
+
+fn loudness_color(value: f32) -> egui::Color32 {
+    let value = value.clamp(0.0, 1.0);
+    let base = if value < 0.58 {
+        lerp_color(
+            egui::Color32::from_rgb(40, 190, 80),
+            egui::Color32::from_rgb(215, 225, 54),
+            value / 0.58,
+        )
+    } else {
+        lerp_color(
+            egui::Color32::from_rgb(215, 225, 54),
+            egui::Color32::from_rgb(248, 72, 38),
+            (value - 0.58) / 0.42,
+        )
+    };
+    color_with_alpha(base, 210)
+}
+
+fn spectrum_color(index: usize, total: usize, value: f32) -> egui::Color32 {
+    let t = if total <= 1 {
+        0.0
+    } else {
+        index as f32 / (total - 1) as f32
+    };
+    let base = if t < 0.20 {
+        lerp_color(
+            egui::Color32::from_rgb(244, 42, 24),
+            egui::Color32::from_rgb(255, 154, 22),
+            t / 0.20,
+        )
+    } else if t < 0.52 {
+        lerp_color(
+            egui::Color32::from_rgb(255, 216, 28),
+            egui::Color32::from_rgb(70, 232, 76),
+            (t - 0.20) / 0.32,
+        )
+    } else if t < 0.78 {
+        lerp_color(
+            egui::Color32::from_rgb(38, 230, 190),
+            egui::Color32::from_rgb(44, 138, 255),
+            (t - 0.52) / 0.26,
+        )
+    } else {
+        lerp_color(
+            egui::Color32::from_rgb(44, 138, 255),
+            egui::Color32::from_rgb(245, 82, 210),
+            (t - 0.78) / 0.22,
+        )
+    };
+    let alpha = (92.0 + 150.0 * value.clamp(0.0, 1.0)) as u8;
+    color_with_alpha(
+        brighten_color(base, 0.55 + value.clamp(0.0, 1.0) * 0.65),
+        alpha,
+    )
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |av: u8, bv: u8| av as f32 + (bv as f32 - av as f32) * t;
+    egui::Color32::from_rgb(
+        lerp(a.r(), b.r()) as u8,
+        lerp(a.g(), b.g()) as u8,
+        lerp(a.b(), b.b()) as u8,
+    )
+}
+
+fn brighten_color(color: egui::Color32, scale: f32) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        ((color.r() as f32 * scale).min(255.0)) as u8,
+        ((color.g() as f32 * scale).min(255.0)) as u8,
+        ((color.b() as f32 * scale).min(255.0)) as u8,
+    )
+}
+
+fn color_with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 fn decode_audio_file(path: &Path) -> Result<DecodedAudio, String> {

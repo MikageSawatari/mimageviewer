@@ -158,6 +158,81 @@ pub fn resample_linear_stereo(input: &[f32], input_rate: u32, output_rate: u32) 
     out
 }
 
+pub fn spectrum_bands_from_stereo_window(
+    stereo_samples: &[f32],
+    sample_rate: u32,
+    center_secs: f64,
+    bands: usize,
+) -> Vec<f32> {
+    let bands = bands.clamp(1, 128);
+    let frame_count = stereo_samples.len() / 2;
+    if sample_rate == 0 || frame_count == 0 {
+        return vec![0.0; bands];
+    }
+
+    let requested_window = (sample_rate as usize / 24).clamp(1024, 4096);
+    let window_frames = requested_window.min(frame_count).max(1);
+    let max_start = frame_count.saturating_sub(window_frames);
+    let center_frame = if center_secs.is_finite() {
+        (center_secs.max(0.0) * sample_rate as f64).round() as usize
+    } else {
+        0
+    }
+    .min(frame_count.saturating_sub(1));
+    let start_frame = center_frame
+        .saturating_sub(window_frames / 2)
+        .min(max_start);
+
+    let mut windowed = Vec::with_capacity(window_frames);
+    let denom = (window_frames.saturating_sub(1)).max(1) as f32;
+    for i in 0..window_frames {
+        let frame_idx = start_frame + i;
+        let l = stereo_samples[frame_idx * 2];
+        let r = stereo_samples[frame_idx * 2 + 1];
+        let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
+        let hann = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / denom).cos();
+        windowed.push(mono * hann);
+    }
+
+    let min_hz = 40.0_f32;
+    let nyquist = sample_rate as f32 * 0.5;
+    let max_hz = 18_000.0_f32.min(nyquist * 0.92).max(min_hz * 1.2);
+    let ratio = max_hz / min_hz;
+    let mut values = Vec::with_capacity(bands);
+    for band in 0..bands {
+        let t = if bands == 1 {
+            0.0
+        } else {
+            band as f32 / (bands - 1) as f32
+        };
+        let hz = min_hz * ratio.powf(t);
+        values.push(goertzel_power(&windowed, sample_rate, hz));
+    }
+
+    let max_value = values.iter().copied().fold(0.0_f32, f32::max);
+    if max_value <= f32::EPSILON {
+        return values;
+    }
+    for value in &mut values {
+        *value = (*value / max_value).powf(0.28).clamp(0.0, 1.0);
+    }
+    values
+}
+
+fn goertzel_power(windowed_mono: &[f32], sample_rate: u32, hz: f32) -> f32 {
+    let omega = std::f32::consts::TAU * hz / sample_rate.max(1) as f32;
+    let coeff = 2.0 * omega.cos();
+    let mut q1 = 0.0_f32;
+    let mut q2 = 0.0_f32;
+    for sample in windowed_mono {
+        let q0 = coeff * q1 - q2 + *sample;
+        q2 = q1;
+        q1 = q0;
+    }
+    let power = q1 * q1 + q2 * q2 - coeff * q1 * q2;
+    (power / windowed_mono.len().max(1) as f32).max(0.0)
+}
+
 fn one_pole_alpha(cut_hz: f32, sample_rate: u32) -> f32 {
     let x = (-2.0 * std::f32::consts::PI * cut_hz.max(1.0) / sample_rate as f32).exp();
     (1.0 - x).clamp(0.0, 1.0)
@@ -243,5 +318,20 @@ mod tests {
         let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
         assert!(!analysis.bins.is_empty());
         assert!(analysis.bins.iter().any(|b| b.peak > 0.5));
+    }
+
+    #[test]
+    fn spectrum_window_returns_requested_band_count() {
+        let mut samples = Vec::new();
+        for i in 0..48_000 {
+            let phase = std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0;
+            let x = phase.sin() * 0.5;
+            samples.extend([x, x]);
+        }
+
+        let bands = spectrum_bands_from_stereo_window(&samples, 48_000, 0.5, 50);
+        assert_eq!(bands.len(), 50);
+        assert!(bands.iter().any(|v| *v > 0.5));
+        assert!(bands.iter().all(|v| (0.0..=1.0).contains(v)));
     }
 }
