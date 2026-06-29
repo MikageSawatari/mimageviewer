@@ -36,8 +36,40 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "mIV music lab",
         options,
-        Box::new(|_| Ok(Box::<MusicLabApp>::default())),
+        Box::new(|cc| {
+            setup_fonts(&cc.egui_ctx);
+            Ok(Box::<MusicLabApp>::default())
+        }),
     )
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let font_paths = [
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+    ];
+    for path in font_paths {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "japanese".to_owned(),
+                Arc::new(egui::FontData::from_owned(data)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "japanese".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "japanese".to_owned());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 struct LoadedTrack {
@@ -56,6 +88,35 @@ struct SpectrumMsg {
 }
 
 #[derive(Default)]
+struct FrameStats {
+    last_frame: Option<Instant>,
+    fps: f32,
+    frame_ms: f32,
+}
+
+impl FrameStats {
+    fn record_frame(&mut self) {
+        let now = Instant::now();
+        let Some(last) = self.last_frame.replace(now) else {
+            return;
+        };
+        let dt = now.saturating_duration_since(last).as_secs_f32();
+        if dt <= 0.0 {
+            return;
+        }
+        let frame_ms = dt * 1000.0;
+        let fps = 1.0 / dt;
+        if self.fps <= 0.0 {
+            self.fps = fps;
+            self.frame_ms = frame_ms;
+        } else {
+            self.fps = self.fps * 0.90 + fps * 0.10;
+            self.frame_ms = self.frame_ms * 0.90 + frame_ms * 0.10;
+        }
+    }
+}
+
+#[derive(Default)]
 struct MusicLabApp {
     track: Option<LoadedTrack>,
     load_rx: Option<mpsc::Receiver<LoadMsg>>,
@@ -69,10 +130,12 @@ struct MusicLabApp {
     spectrum_rx: Option<mpsc::Receiver<SpectrumMsg>>,
     spectrum_pending: bool,
     last_spectrum_request: Option<Instant>,
+    frame_stats: FrameStats,
 }
 
 impl eframe::App for MusicLabApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_stats.record_frame();
         self.poll_loader(ctx);
         self.poll_spectrum_analyzer(ctx);
         self.draw_top_bar(ctx);
@@ -93,7 +156,7 @@ impl eframe::App for MusicLabApp {
         });
 
         if self.player.as_ref().is_some_and(|p| p.snapshot().playing) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 }
@@ -149,6 +212,14 @@ impl MusicLabApp {
                         ui.label(format!("FX {} samples", snap.effect_latency_samples));
                     } else {
                         ui.label("FX: lab no-op boundary");
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "FPS {:.1}  {:.1} ms",
+                        self.frame_stats.fps, self.frame_stats.frame_ms
+                    ));
+                    if self.spectrum_pending {
+                        ui.label("Spectrum: analyzing");
                     }
                     if !self.load_status.is_empty() {
                         ui.separator();
