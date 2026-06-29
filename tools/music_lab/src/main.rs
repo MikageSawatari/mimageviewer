@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
@@ -23,6 +24,7 @@ const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
+const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(75);
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 
@@ -49,6 +51,10 @@ enum LoadMsg {
     Failed(String),
 }
 
+struct SpectrumMsg {
+    bands: Vec<f32>,
+}
+
 #[derive(Default)]
 struct MusicLabApp {
     track: Option<LoadedTrack>,
@@ -58,12 +64,17 @@ struct MusicLabApp {
     bookmarks: Vec<MusicBookmark>,
     next_bookmark_id: u64,
     selected_bookmark: Option<u64>,
+    spectrum_bands: Vec<f32>,
     spectrum_trail: Vec<f32>,
+    spectrum_rx: Option<mpsc::Receiver<SpectrumMsg>>,
+    spectrum_pending: bool,
+    last_spectrum_request: Option<Instant>,
 }
 
 impl eframe::App for MusicLabApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_loader(ctx);
+        self.poll_spectrum_analyzer(ctx);
         self.draw_top_bar(ctx);
         self.draw_left_panel(ctx);
         self.draw_right_panel(ctx);
@@ -236,16 +247,11 @@ impl MusicLabApp {
         egui::TopBottomPanel::bottom("music_lab_bottom")
             .exact_height(152.0)
             .show(ctx, |ui| {
-                let Some(track) = &self.track else {
+                if self.track.is_none() {
                     ui.centered_and_justified(|ui| ui.label("Spectrum analyzer placeholder"));
                     return;
-                };
-                draw_spectrum(
-                    ui,
-                    track,
-                    self.player_snapshot().position_secs,
-                    &mut self.spectrum_trail,
-                );
+                }
+                draw_spectrum(ui, &self.spectrum_bands, &mut self.spectrum_trail);
             });
     }
 
@@ -253,7 +259,11 @@ impl MusicLabApp {
         self.load_status = format!("Loading {}", path.display());
         self.player = None;
         self.track = None;
+        self.spectrum_bands.clear();
         self.spectrum_trail.clear();
+        self.spectrum_rx = None;
+        self.spectrum_pending = false;
+        self.last_spectrum_request = None;
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("music-lab-load".into())
@@ -309,6 +319,63 @@ impl MusicLabApp {
         }
     }
 
+    fn poll_spectrum_analyzer(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.spectrum_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.spectrum_bands = msg.bands;
+                    self.spectrum_pending = false;
+                    self.spectrum_rx = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.spectrum_pending = false;
+                    self.spectrum_rx = None;
+                }
+            }
+        }
+
+        if self.spectrum_pending {
+            return;
+        }
+        let should_request = self.spectrum_bands.is_empty()
+            || match self.last_spectrum_request {
+                Some(last) => last.elapsed() >= SPECTRUM_REFRESH_INTERVAL,
+                None => true,
+            };
+        if !should_request {
+            return;
+        }
+        let Some(decoded) = self.track.as_ref().map(|track| Arc::clone(&track.decoded)) else {
+            return;
+        };
+        let position_secs = self.player_snapshot().position_secs;
+        let (tx, rx) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("music-lab-spectrum".into())
+            .spawn(move || {
+                let bands = spectrum_bands_from_stereo_window(
+                    &decoded.stereo_samples,
+                    decoded.info.sample_rate,
+                    position_secs,
+                    SPECTRUM_BANDS,
+                );
+                let _ = tx.send(SpectrumMsg { bands });
+                repaint_ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.spectrum_rx = Some(rx);
+            self.spectrum_pending = true;
+            self.last_spectrum_request = Some(Instant::now());
+            ctx.request_repaint_after(SPECTRUM_REFRESH_INTERVAL);
+        }
+    }
+
     fn player_snapshot(&self) -> PlaybackSnapshot {
         self.player
             .as_ref()
@@ -353,12 +420,16 @@ fn draw_timeline(
         egui::pos2(rect.max.x - 8.0, rect.min.y + content_h - 8.0),
     );
 
+    let clip_rect = ui.clip_rect();
     for row in 0..rows {
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
         let row_rect = egui::Rect::from_min_size(
             egui::pos2(graph_rect.min.x, row_top),
             egui::vec2(graph_rect.width(), row_h),
         );
+        if !clip_rect.intersects(row_rect.expand(row_gap)) {
+            continue;
+        }
         let row_start = row as f64 * row_secs;
         draw_timeline_row(
             &painter,
@@ -629,7 +700,7 @@ fn draw_playhead(
     );
 }
 
-fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64, trail: &mut Vec<f32>) {
+fn draw_spectrum(ui: &mut egui::Ui, bands: &[f32], trail: &mut Vec<f32>) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
@@ -653,12 +724,6 @@ fn draw_spectrum(ui: &mut egui::Ui, track: &LoadedTrack, position_secs: f64, tra
         ),
     );
 
-    let bands = spectrum_bands_from_stereo_window(
-        &track.decoded.stereo_samples,
-        track.decoded.info.sample_rate,
-        position_secs,
-        SPECTRUM_BANDS,
-    );
     if bands.is_empty() {
         return;
     }
