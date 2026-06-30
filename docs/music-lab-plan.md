@@ -93,7 +93,9 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
      - 上段: 周波数色分けした DJ 風の塗り波形
      - 音量の縦ラインを低 / 中 / 高域で分割して塗り、強い立ち上がりだけ transient accent として重ねる
      - 下段: 大きめの Loudness+Bass root レーンと、小さめの Key レーン
+     - Key レーンは補助情報として細めにし、Loudness+Bass root より控えめに表示する
      - Loudness+Bass root は高さを loudness、色を bass root の pitch class とする
+     - メトリクスレーンは上段波形より明るくなりすぎないよう、最大明度と alpha を抑える
      - Bass root / Key は 12 音の pitch class を五度圏カラーで表示し、オクターブ違いは同じ色にする
      - Bass root / Key は transient から作る 50-100ms 程度の表示用リズムグリッド境界でだけ色を変える
      - Key は短時間の chroma 変動ではなく、transient / density を弱めた長めの周辺窓 chroma を Krumhansl-Schmuckler / Temperley 系 major/minor profile と照合し、リズムグリッドへスナップして表示する

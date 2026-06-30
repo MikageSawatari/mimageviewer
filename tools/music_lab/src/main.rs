@@ -23,7 +23,7 @@ use symphonia::core::probe::Hint;
 const TIMELINE_WAVEFORM_H: f32 = 68.0;
 const TIMELINE_METRICS_H: f32 = 44.0;
 const TIMELINE_METRIC_LANE_COUNT: usize = 2;
-const TIMELINE_LOUDNESS_ROOT_LANE_FRACTION: f32 = 0.76;
+const TIMELINE_LOUDNESS_ROOT_LANE_FRACTION: f32 = 0.81;
 const TIMELINE_ROOT_MIN_SEGMENT_SECS: f64 = 0.050;
 const TIMELINE_ROOT_MAX_SEGMENT_SECS: f64 = 0.100;
 const TIMELINE_ROOT_TRANSIENT_THRESHOLD: f32 = 0.16;
@@ -1497,6 +1497,26 @@ fn render_timeline_row_image(
         );
     }
 
+    fill_rect_px(
+        &mut pixels,
+        width,
+        height,
+        0,
+        waveform_h,
+        width,
+        (waveform_h + gap_h).min(height),
+        egui::Color32::from_rgba_unmultiplied(36, 48, 60, 120),
+    );
+    draw_rect_stroke_px(
+        &mut pixels,
+        width,
+        height,
+        0,
+        0,
+        width,
+        height,
+        egui::Color32::from_rgba_unmultiplied(92, 112, 134, 112),
+    );
     draw_rect_stroke_px(
         &mut pixels,
         width,
@@ -1505,7 +1525,7 @@ fn render_timeline_row_image(
         0,
         width,
         waveform_h,
-        egui::Color32::from_rgba_unmultiplied(70, 92, 116, 140),
+        egui::Color32::from_rgba_unmultiplied(74, 96, 120, 118),
     );
     draw_rect_stroke_px(
         &mut pixels,
@@ -1515,7 +1535,7 @@ fn render_timeline_row_image(
         metrics_top,
         width,
         height,
-        egui::Color32::from_rgba_unmultiplied(70, 92, 116, 90),
+        egui::Color32::from_rgba_unmultiplied(74, 96, 120, 88),
     );
 
     (egui::ColorImage::new([width, height], pixels), drawn_bins)
@@ -2027,24 +2047,24 @@ fn timeline_metric_color(
     let value = value.clamp(0.0, 1.0);
     let base = match kind {
         TimelineMetricKind::LoudnessBassRoot if bass_hint.confidence > 0.06 => {
-            let color_value = bass_hint.confidence.max(0.54);
+            let color_value = (bass_hint.confidence * 0.78).clamp(0.32, 0.74);
             return color_with_alpha(
                 brighten_color(
                     key_color(60 + bass_hint.pitch_class % 12, color_value),
-                    1.12 + value * 0.28 + bass_hint.confidence * 0.20,
+                    0.86 + value * 0.16 + bass_hint.confidence * 0.12,
                 ),
-                (112.0 + value * 96.0 + bass_hint.confidence * 36.0).min(245.0) as u8,
+                (86.0 + value * 70.0 + bass_hint.confidence * 28.0).min(202.0) as u8,
             );
         }
         TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(188, 198, 92),
         TimelineMetricKind::Key if key_hint.confidence > 0.0 => {
-            let color_value = key_hint.confidence.max(0.56);
+            let color_value = (0.36 + key_hint.confidence * 0.38).min(0.74);
             return color_with_alpha(
                 brighten_color(
                     key_color(60 + key_hint.pitch_class % 12, color_value),
-                    0.98 + key_hint.confidence * 0.48,
+                    0.78 + key_hint.confidence * 0.30,
                 ),
-                (96.0 + key_hint.confidence * 146.0).min(248.0) as u8,
+                (70.0 + key_hint.confidence * 120.0).min(190.0) as u8,
             );
         }
         TimelineMetricKind::Key => egui::Color32::from_rgb(104, 214, 186),
