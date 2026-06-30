@@ -1674,13 +1674,14 @@ fn draw_spectrum(
         let x1 = (spectrum_axis_x(plot, band_high_hz) - 0.25)
             .max(x0 + 0.75)
             .min(plot.right());
+        let band_corner = if x1 - x0 < 2.0 { 0.0 } else { 1.0 };
         let ghost_h = (plot.height() - 3.0) * (trail[i] * 0.72).max(0.012);
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2((x0 - 0.45).max(plot.left()), plot.bottom() - 2.0 - ghost_h),
                 egui::pos2((x1 + 0.45).min(plot.right()), plot.bottom() - 2.0),
             ),
-            1.0,
+            band_corner,
             color_with_alpha(spectrum_color(i, bands.len(), trail[i]), 48),
         );
         let trail_h = (plot.height() - 3.0) * trail[i].max(0.015);
@@ -1689,7 +1690,7 @@ fn draw_spectrum(
                 egui::pos2((x0 - 0.2).max(plot.left()), plot.bottom() - 2.0 - trail_h),
                 egui::pos2((x1 + 0.2).min(plot.right()), plot.bottom() - 2.0),
             ),
-            1.0,
+            band_corner,
             color_with_alpha(spectrum_color(i, bands.len(), trail[i]), 100),
         );
         let h = (plot.height() - 3.0) * value.max(0.015);
@@ -1698,7 +1699,7 @@ fn draw_spectrum(
                 egui::pos2(x0, plot.bottom() - 2.0 - h),
                 egui::pos2(x1, plot.bottom() - 2.0),
             ),
-            1.0,
+            band_corner,
             spectrum_color(i, bands.len(), value),
         );
         let onset = onsets[i].clamp(0.0, 1.0);
@@ -1711,7 +1712,7 @@ fn draw_spectrum(
                     egui::pos2(x0, (y - cap_h).max(plot.top())),
                     egui::pos2(x1, (y + 1.5).min(plot.bottom())),
                 ),
-                1.0,
+                band_corner,
                 color_with_alpha(accent, (82.0 + onset * 150.0) as u8),
             );
         }
