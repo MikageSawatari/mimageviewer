@@ -95,6 +95,8 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
      - 下段: Loudness / Bass root / Key / Brightness / Drums / Change / Vocal hint の
        独立メトリクスレーン
      - Bass root / Key は 12 音の pitch class を五度圏カラーで表示し、オクターブ違いは同じ色にする
+     - Bass root / Key は値の高さより色の比較を優先し、検出中はレーン高いっぱいに塗る。
+       値はホバー表示と透明度/明るさへ残し、Change が高い区間は少し強調する
      - Brightness は高域量そのものだけでなく、周辺時間との差分も混ぜて構成変化のヒントにする
      - Drums は単発 transient ではなく、短時間窓の transient density として表示する
      - Change は loudness / bass / brightness / drum density / vocal hint / chroma の

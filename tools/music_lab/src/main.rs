@@ -1496,7 +1496,13 @@ fn draw_timeline_metric_bins(
         let lane_top = top + 0.6;
         let available_h = (lane_bottom - lane_top).max(1.0);
         let value = timeline_metric_value(kind, bin).clamp(0.0, 1.0);
-        let bar_top = lane_bottom - available_h * value.max(0.025);
+        let full_pitch_lane =
+            matches!(kind, TimelineMetricKind::BassRoot | TimelineMetricKind::Key) && value > 0.03;
+        let bar_top = if full_pitch_lane {
+            lane_top
+        } else {
+            lane_bottom - available_h * value.max(0.025)
+        };
         fill_rect_f32(
             pixels,
             width,
@@ -1592,26 +1598,28 @@ fn timeline_metric_color(kind: TimelineMetricKind, value: f32, bin: &WaveformBin
     let base = match kind {
         TimelineMetricKind::Loudness => egui::Color32::from_rgb(205, 220, 92),
         TimelineMetricKind::BassRoot if bin.bass_pitch_confidence > 0.08 => {
+            let change = bin.novelty.clamp(0.0, 1.0);
             let color_value = value.max(0.50);
             return color_with_alpha(
                 brighten_color(
                     key_color(60 + bin.bass_pitch_class % 12, color_value),
-                    1.02 + value * 0.34,
+                    1.16 + value * 0.32 + change * 0.24,
                 ),
-                (82.0 + value * 158.0) as u8,
+                (116.0 + value * 108.0 + change * 28.0).min(245.0) as u8,
             );
         }
         TimelineMetricKind::BassRoot => egui::Color32::from_rgb(224, 96, 54),
         TimelineMetricKind::Brightness => egui::Color32::from_rgb(86, 196, 246),
         TimelineMetricKind::DrumDensity => egui::Color32::from_rgb(252, 178, 48),
         TimelineMetricKind::Key if bin.key_confidence > 0.08 => {
-            let color_value = value.max(0.58);
+            let change = bin.novelty.clamp(0.0, 1.0);
+            let color_value = value.max(0.68);
             return color_with_alpha(
                 brighten_color(
                     key_color(60 + bin.key_pitch_class % 12, color_value),
-                    1.10 + value * 0.36,
+                    1.28 + value * 0.34 + change * 0.26,
                 ),
-                (90.0 + value * 152.0) as u8,
+                (132.0 + value * 94.0 + change * 30.0).min(248.0) as u8,
             );
         }
         TimelineMetricKind::Key => egui::Color32::from_rgb(104, 214, 186),

@@ -1051,7 +1051,7 @@ fn apply_chroma_metrics(
             (frame.key_confidence * normalize_range(bin.rms, 0.006, 0.06)).clamp(0.0, 1.0);
     }
 
-    let smooth_radius = (0.22 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let smooth_radius = (0.42 / bin_secs.max(0.01)).round().max(1.0) as usize;
     smooth_pitch_confidence(bins, smooth_radius);
 }
 
