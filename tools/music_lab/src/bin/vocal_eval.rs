@@ -31,14 +31,14 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let labels_path = PathBuf::from(&args[1]);
-    let thresholds = parse_thresholds(&args[2..])?;
+    let options = parse_options(&args[2..])?;
     let labels = load_label_set(&labels_path)?;
     if labels.tracks.is_empty() {
         return Err("label file has no tracks".to_string());
     }
 
     let base_dir = labels_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut aggregate = vec![EvalAccum::default(); thresholds.len()];
+    let mut aggregate = vec![EvalAccum::default(); options.thresholds.len()];
     println!("file\tthreshold\tprecision\trecall\tf1\ttp_s\tfp_s\tfn_s\ttn_s");
     for track in &labels.tracks {
         let path = resolve_track_path(base_dir, &track.path);
@@ -50,7 +50,10 @@ fn run() -> Result<(), String> {
             AnalysisConfig::default(),
         );
         let truth = build_truth_mask(&analysis, &track.vocal, &track.ignore);
-        for (idx, threshold) in thresholds.iter().copied().enumerate() {
+        if let Some(threshold) = options.dump_segments {
+            dump_segments(&analysis, &truth, threshold);
+        }
+        for (idx, threshold) in options.thresholds.iter().copied().enumerate() {
             let metrics = evaluate_threshold(&analysis, &truth, threshold);
             aggregate[idx].add(metrics);
             println!(
@@ -69,7 +72,7 @@ fn run() -> Result<(), String> {
 
     if labels.tracks.len() > 1 {
         println!("-- aggregate --");
-        for (idx, threshold) in thresholds.iter().copied().enumerate() {
+        for (idx, threshold) in options.thresholds.iter().copied().enumerate() {
             let metrics = aggregate[idx].metrics();
             println!(
                 "ALL\t{threshold:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
@@ -89,13 +92,21 @@ fn run() -> Result<(), String> {
 fn print_usage(args: &[String]) {
     let exe = args.first().map(String::as_str).unwrap_or("vocal_eval");
     println!("Usage: {exe} <labels.json> [--thresholds 0.2,0.3,0.4]");
+    println!("       {exe} <labels.json> [--dump-segments 0.1]");
     println!(
         "Labels JSON: {{ \"tracks\": [{{ \"path\": \"song.mp4\", \"vocal\": [{{ \"start\": 12.3, \"end\": 42.0 }}] }}] }}"
     );
 }
 
-fn parse_thresholds(args: &[String]) -> Result<Vec<f32>, String> {
+#[derive(Debug)]
+struct EvalOptions {
+    thresholds: Vec<f32>,
+    dump_segments: Option<f32>,
+}
+
+fn parse_options(args: &[String]) -> Result<EvalOptions, String> {
     let mut thresholds = DEFAULT_THRESHOLDS.to_vec();
+    let mut dump_segments = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -117,12 +128,27 @@ fn parse_thresholds(args: &[String]) -> Result<Vec<f32>, String> {
                 }
                 i += 2;
             }
+            "--dump-segments" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("--dump-segments requires a threshold".to_string());
+                };
+                dump_segments = Some(
+                    value
+                        .parse::<f32>()
+                        .map(|value| value.clamp(0.0, 1.0))
+                        .map_err(|e| format!("invalid dump threshold '{value}': {e}"))?,
+                );
+                i += 2;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
     thresholds.sort_by(f32::total_cmp);
     thresholds.dedup_by(|a, b| (*a - *b).abs() < f32::EPSILON);
-    Ok(thresholds)
+    Ok(EvalOptions {
+        thresholds,
+        dump_segments,
+    })
 }
 
 fn load_label_set(path: &Path) -> Result<LabelSet, String> {
@@ -178,6 +204,81 @@ fn evaluate_threshold(
         }
     }
     metrics
+}
+
+fn dump_segments(analysis: &TimelineAnalysis, truth: &[Option<bool>], threshold: f32) {
+    eprintln!("-- predicted segments @ {threshold:.3} --");
+    for segment in collect_segments(analysis, |idx, bin| {
+        truth.get(idx).and_then(|v| *v).is_some() && bin.vocal_score >= threshold
+    }) {
+        eprintln!(
+            "pred\t{:.3}\t{:.3}\t{:.3}\tpeak={:.3}\tavg={:.3}",
+            segment.start,
+            segment.end,
+            segment.end - segment.start,
+            segment.peak,
+            segment.avg
+        );
+    }
+    eprintln!("-- truth segments --");
+    for segment in collect_segments(analysis, |idx, _bin| truth.get(idx) == Some(&Some(true))) {
+        eprintln!(
+            "truth\t{:.3}\t{:.3}\t{:.3}",
+            segment.start,
+            segment.end,
+            segment.end - segment.start
+        );
+    }
+}
+
+struct DumpSegment {
+    start: f64,
+    end: f64,
+    peak: f32,
+    avg: f32,
+}
+
+fn collect_segments(
+    analysis: &TimelineAnalysis,
+    mut is_active: impl FnMut(usize, &music_core::WaveformBin) -> bool,
+) -> Vec<DumpSegment> {
+    let mut segments = Vec::new();
+    let mut start = None;
+    let mut last_end = 0.0;
+    let mut peak = 0.0_f32;
+    let mut sum = 0.0_f32;
+    let mut count = 0usize;
+    for (idx, bin) in analysis.bins.iter().enumerate() {
+        let active = is_active(idx, bin);
+        if active {
+            if start.is_none() {
+                start = Some(bin.start_secs);
+                peak = 0.0;
+                sum = 0.0;
+                count = 0;
+            }
+            last_end = bin.start_secs + bin.duration_secs;
+            peak = peak.max(bin.vocal_score);
+            sum += bin.vocal_score;
+            count += 1;
+        } else if let Some(segment_start) = start.take() {
+            segments.push(DumpSegment {
+                start: segment_start,
+                end: last_end,
+                peak,
+                avg: sum / count.max(1) as f32,
+            });
+        }
+    }
+    if let Some(segment_start) = start {
+        segments.push(DumpSegment {
+            start: segment_start,
+            end: last_end,
+            peak,
+            avg: sum / count.max(1) as f32,
+        });
+    }
+    segments
 }
 
 fn decode_audio_file(path: &Path) -> Result<DecodedAudio, String> {
@@ -370,8 +471,16 @@ mod tests {
     #[test]
     fn parse_thresholds_sorts_and_deduplicates() {
         let args = vec!["--thresholds".to_string(), "0.4,0.2,0.2".to_string()];
-        let thresholds = parse_thresholds(&args).expect("thresholds should parse");
+        let options = parse_options(&args).expect("thresholds should parse");
 
-        assert_eq!(thresholds, vec![0.2, 0.4]);
+        assert_eq!(options.thresholds, vec![0.2, 0.4]);
+    }
+
+    #[test]
+    fn parse_options_accepts_dump_segments() {
+        let args = vec!["--dump-segments".to_string(), "0.123".to_string()];
+        let options = parse_options(&args).expect("options should parse");
+
+        assert_eq!(options.dump_segments, Some(0.123));
     }
 }

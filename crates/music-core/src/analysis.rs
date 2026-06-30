@@ -120,6 +120,8 @@ pub struct WaveformBin {
     pub transient: f32,
     /// Normalized low / mid / high contribution to the transient accent.
     pub transient_band: [f32; 3],
+    /// 0..1 stereo center dominance. Lead vocals are often mixed near center.
+    pub center_ratio: f32,
     /// 0..1 lightweight vocal-likelihood estimate for timeline coloring.
     pub vocal_score: f32,
 }
@@ -159,6 +161,7 @@ pub fn analyze_stereo_timeline(
         let frame_end = (frame_start + frames_per_bin).min(frame_count);
         let mut peak = 0.0_f32;
         let mut square_sum = 0.0_f64;
+        let mut side_square_sum = 0.0_f64;
         let mut low_sum = 0.0_f64;
         let mut mid_sum = 0.0_f64;
         let mut high_sum = 0.0_f64;
@@ -173,12 +176,14 @@ pub fn analyze_stereo_timeline(
             let l = stereo_samples[frame_idx * 2];
             let r = stereo_samples[frame_idx * 2 + 1];
             let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
+            let side = ((l - r) * 0.5).clamp(-1.0, 1.0);
             if (frame_idx - frame_start) % vocal_period_step == 0 {
                 periodicity_samples.push(mono);
             }
             let abs = mono.abs();
             peak = peak.max(abs);
             square_sum += (mono as f64) * (mono as f64);
+            side_square_sum += (side as f64) * (side as f64);
             abs_sum += abs as f64;
             if have_prev_mono
                 && mono.signum() != prev_mono.signum()
@@ -201,6 +206,8 @@ pub fn analyze_stereo_timeline(
 
         let n = (frame_end - frame_start).max(1) as f64;
         let rms = (square_sum / n).sqrt() as f32;
+        let side_rms = (side_square_sum / n).sqrt() as f32;
+        let center_ratio = (rms / (rms + side_rms + 1.0e-6)).clamp(0.0, 1.0);
         let loudness_db = linear_to_db(rms);
         let total_band = (low_sum + mid_sum + high_sum).max(f64::EPSILON);
         let band_rms = [
@@ -242,6 +249,7 @@ pub fn analyze_stereo_timeline(
             mean_abs,
             rms,
             periodicity,
+            center_ratio,
         );
         vocal_raw.push(vocal_candidate);
         bins.push(WaveformBin {
@@ -253,6 +261,7 @@ pub fn analyze_stereo_timeline(
             band_energy,
             transient,
             transient_band,
+            center_ratio,
             vocal_score: 0.0,
         });
         prev_band_rms = [
@@ -597,6 +606,7 @@ fn vocal_candidate_score(
     mean_abs: f32,
     rms: f32,
     periodicity: f32,
+    center_ratio: f32,
 ) -> f32 {
     let loudness_gate = smoothstep(-50.0, -20.0, loudness_db);
     let mid_score = smoothstep(0.14, 0.50, band_energy[1]);
@@ -610,10 +620,17 @@ fn vocal_candidate_score(
     let crest_penalty = 1.0 - 0.55 * smoothstep(7.0, 16.0, crest);
     let transient_penalty = 1.0 - 0.55 * smoothstep(0.36, 0.92, transient);
     let periodicity_gate = 0.34 + 0.66 * smoothstep(0.12, 0.52, periodicity);
+    let center_gate = 0.48 + 0.52 * smoothstep(0.50, 0.82, center_ratio);
 
     let spectral = (mid_score * low_penalty * high_penalty).sqrt();
     let tonal = zcr_score * 0.64 + fullness * 0.36;
-    (loudness_gate * spectral * tonal * periodicity_gate * crest_penalty * transient_penalty)
+    (loudness_gate
+        * spectral
+        * tonal
+        * periodicity_gate
+        * center_gate
+        * crest_penalty
+        * transient_penalty)
         .clamp(0.0, 1.0)
 }
 
@@ -663,13 +680,15 @@ fn voiced_periodicity_score(samples: &[f32], sample_rate: f32) -> f32 {
 
 fn vocal_phrase_hint_score(bin: &WaveformBin) -> f32 {
     let loudness = smoothstep(-48.0, -18.0, bin.loudness_db);
-    let mid = smoothstep(0.12, 0.46, bin.band_energy[1]);
-    let air = smoothstep(0.16, 0.58, bin.band_energy[2]);
-    let voice_band = (mid * 0.82 + air * 0.28).min(1.0);
-    let low_penalty = 1.0 - 0.62 * smoothstep(0.70, 0.94, bin.band_energy[0]);
-    let high_penalty = 1.0 - 0.34 * smoothstep(0.84, 0.98, bin.band_energy[2]);
-    let transient_penalty = 1.0 - 0.42 * smoothstep(0.45, 0.95, bin.transient);
-    (loudness * voice_band * low_penalty * high_penalty * transient_penalty).clamp(0.0, 1.0)
+    let mid = smoothstep(0.18, 0.52, bin.band_energy[1]);
+    let air = smoothstep(0.22, 0.64, bin.band_energy[2]);
+    let voice_band = (mid * 0.86 + air * 0.20).min(1.0);
+    let low_penalty = 1.0 - 0.68 * smoothstep(0.62, 0.90, bin.band_energy[0]);
+    let high_penalty = 1.0 - 0.48 * smoothstep(0.74, 0.96, bin.band_energy[2]);
+    let transient_penalty = 1.0 - 0.48 * smoothstep(0.38, 0.90, bin.transient);
+    let center_gate = smoothstep(0.46, 0.82, bin.center_ratio);
+    (loudness * voice_band * low_penalty * high_penalty * transient_penalty * center_gate)
+        .clamp(0.0, 1.0)
 }
 
 fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
@@ -677,7 +696,7 @@ fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
         return;
     }
     let radius = (1.10 / bin_secs.max(0.01)).round().max(1.0) as usize;
-    let phrase_radius = (2.35 / bin_secs.max(0.01)).round().max(radius as f64) as usize;
+    let phrase_radius = (1.85 / bin_secs.max(0.01)).round().max(radius as f64) as usize;
     let phrase_hint: Vec<f32> = bins.iter().map(vocal_phrase_hint_score).collect();
     let mut smoothed = vec![0.0_f32; bins.len()];
     for i in 0..bins.len() {
@@ -731,12 +750,15 @@ fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
         let local_phrase = phrase_sum / phrase_count_f;
         let phrase_active_ratio = phrase_active as f32 / phrase_count_f;
         let phrase_strong_ratio = phrase_strong as f32 / phrase_count_f;
-        let phrase_sustain = smoothstep(0.24, 0.66, phrase_active_ratio)
-            * (0.38 + 0.62 * smoothstep(0.03, 0.22, phrase_strong_ratio));
+        let raw_support = smoothstep(0.018, 0.11, local_score)
+            * (0.48 + 0.52 * smoothstep(0.03, 0.18, active_ratio));
+        let phrase_sustain = smoothstep(0.32, 0.72, phrase_active_ratio)
+            * (0.28 + 0.72 * smoothstep(0.05, 0.26, phrase_strong_ratio))
+            * (0.35 + 0.65 * raw_support);
         let phrase_score =
             (local_phrase.powf(0.88) * phrase_sustain * transient_penalty).clamp(0.0, 1.0);
 
-        smoothed[i] = raw_score.max(phrase_score * 0.72).clamp(0.0, 1.0);
+        smoothed[i] = raw_score.max(phrase_score * 0.56).clamp(0.0, 1.0);
     }
 
     keep_only_vocal_like_segments(&mut smoothed, bin_secs);

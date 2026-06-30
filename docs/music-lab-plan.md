@@ -64,6 +64,9 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
     次の改善候補は formant 風の中域包絡や YAMNet / PANNs sidecar との比較。
     Demucs teacher は短いボーカルの途切れをフレーズ内の穴として扱う傾向が強いため、
     軽量 DSP も短いギャップは bridge し、明確な終了では release を速める。
+    男性ボーカル / ラップ / 強い加工声では teacher と軽量 DSP のズレが大きくなりやすいので、
+    評価セットに含める。軽量 DSP は teacher 完全一致ではなく、低 FP 寄りの「それっぽいヒント」
+    を合格ラインにする。高精度が必要な曲は optional Demucs sidecar の結果をキャッシュする。
   - DSP の調整は [music-lab-vocal-eval.md](music-lab-vocal-eval.md) の教師ラベル JSON と
     `cargo run -p music_lab --bin vocal_eval -- labels.json` で precision / recall を見ながら進める。
     教師ラベルは手入力を正本にせず、まず `tools/music_lab/scripts/demucs_vocal_teacher.py`

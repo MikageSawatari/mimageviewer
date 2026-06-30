@@ -91,6 +91,12 @@ Custom thresholds:
 cargo run -p music_lab --bin vocal_eval -- labels/vocal.json --thresholds 0.15,0.2,0.25,0.3
 ```
 
+Dump predicted / teacher spans for boundary inspection:
+
+```powershell
+cargo run -p music_lab --bin vocal_eval -- labels/vocal.json --thresholds 0.03 --dump-segments 0.03
+```
+
 The output is tab-separated:
 
 ```text
@@ -99,6 +105,14 @@ file    threshold   precision   recall   f1   tp_s   fp_s   fn_s   tn_s
 
 The seconds columns are weighted by timeline bin duration, so longer errors count
 more than short boundary errors.
+
+For the lightweight DSP detector, do not tune against teacher data as if it were
+perfect ground truth. Demucs teacher spans are useful and usually accurate, but
+they can include vocal-like effects, reverb tails, or extra sections. The target
+for the built-in DSP is a plausible, responsive hint: keep false positives low
+enough that instrumental gaps remain readable, and accept that strongly
+processed vocals, rap-like delivery, or demixed-teacher-only cues may be missed
+unless the optional high-accuracy sidecar is used.
 
 ## music_lab UI Integration
 
