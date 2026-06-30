@@ -7,7 +7,7 @@ use crate::beat::BeatGrid;
 
 pub const SPECTRUM_NOTE_MIN_MIDI: u8 = 21;
 pub const SPECTRUM_NOTE_MAX_MIDI: u8 = 108;
-const SPECTRUM_MIN_HZ: f32 = 40.0;
+const SPECTRUM_MIN_HZ: f32 = 20.0;
 const SPECTRUM_DISPLAY_MAX_HZ: f32 = 18_000.0;
 const SPECTRUM_DB_FLOOR: f32 = -72.0;
 const SPECTRUM_DB_CEIL: f32 = -8.0;

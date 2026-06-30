@@ -36,8 +36,11 @@ const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
-const SPECTRUM_VIEW_MIN_HZ: f32 = 40.0;
+const SPECTRUM_ANALYSIS_MIN_HZ: f32 = 20.0;
+const SPECTRUM_AXIS_MIN_HZ: f32 = 16.351_597; // C0
 const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
+const KEYBOARD_DISPLAY_MIN_MIDI: u8 = 12; // C0
+const KEYBOARD_DISPLAY_MAX_MIDI: u8 = 143; // B10, clipped by the 18 kHz axis.
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(2);
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
@@ -1542,7 +1545,7 @@ fn draw_spectrum(
     notes: &[f32],
     note_trail: &mut Vec<f32>,
 ) {
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
 
@@ -1593,15 +1596,15 @@ fn draw_spectrum(
         onsets.resize(bands.len(), 0.0);
     }
 
-    let band_w = plot.width() / bands.len() as f32;
     for (i, value) in bands.iter().enumerate() {
         let value = value.clamp(0.0, 1.0);
         let rise = (value - prev_bands[i]).max(0.0);
         onsets[i] = (onsets[i] * 0.86).max((rise * 2.8).clamp(0.0, 1.0));
         prev_bands[i] = prev_bands[i] * 0.25 + value * 0.75;
         trail[i] = (trail[i] * SPECTRUM_TRAIL_DECAY).max(value);
-        let x0 = plot.left() + i as f32 * band_w + 0.25;
-        let x1 = (plot.left() + (i + 1) as f32 * band_w - 0.25)
+        let (band_low_hz, band_high_hz) = spectrum_band_hz_range(i, bands.len());
+        let x0 = (spectrum_axis_x(plot, band_low_hz) + 0.25).max(plot.left());
+        let x1 = (spectrum_axis_x(plot, band_high_hz) - 0.25)
             .max(x0 + 0.75)
             .min(plot.right());
         let ghost_h = (plot.height() - 3.0) * (trail[i] * 0.72).max(0.012);
@@ -1646,7 +1649,58 @@ fn draw_spectrum(
             );
         }
     }
+    if let Some(pointer) = response
+        .hover_pos()
+        .filter(|pointer| plot.contains(*pointer) || keyboard_rect.contains(*pointer))
+    {
+        draw_spectrum_hover(&painter, plot, pointer);
+    }
     draw_pitch_keyboard(&painter, keyboard_rect, notes, note_trail);
+}
+
+fn draw_spectrum_hover(painter: &egui::Painter, plot: egui::Rect, pointer: egui::Pos2) {
+    let x = pointer.x.clamp(plot.left(), plot.right());
+    let hz = spectrum_axis_hz(plot, x);
+    let label = format!("{:.1} Hz  {}", hz, note_label_for_hz(hz));
+    painter.line_segment(
+        [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(230, 240, 255, 150),
+        ),
+    );
+    let label_w = (label.chars().count() as f32 * 7.2 + 16.0).min(plot.width());
+    let label_h = 22.0;
+    let label_x = if x + 10.0 + label_w <= plot.right() {
+        x + 10.0
+    } else {
+        (x - 10.0 - label_w).max(plot.left() + 4.0)
+    };
+    let label_rect = egui::Rect::from_min_size(
+        egui::pos2(label_x, plot.top() + 7.0),
+        egui::vec2(label_w, label_h),
+    );
+    painter.rect_filled(
+        label_rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(5, 8, 12, 224),
+    );
+    painter.rect_stroke(
+        label_rect,
+        3.0,
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(120, 150, 176, 180),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        label_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::monospace(12.0),
+        egui::Color32::from_rgb(238, 244, 250),
+    );
 }
 
 fn draw_pitch_keyboard(
@@ -1667,7 +1721,7 @@ fn draw_pitch_keyboard(
         note_trail[idx] = (note_trail[idx] * 0.965).max(value);
     }
 
-    for c_midi in (24_u8..=144_u8).step_by(12) {
+    for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
         let x = spectrum_axis_x(rect, midi_to_hz(c_midi));
         if x > rect.left() && x < rect.right() {
             painter.line_segment(
@@ -1680,7 +1734,7 @@ fn draw_pitch_keyboard(
         }
     }
 
-    for midi in 24_u8..=143_u8 {
+    for midi in KEYBOARD_DISPLAY_MIN_MIDI..=KEYBOARD_DISPLAY_MAX_MIDI {
         if is_black_key(midi) {
             continue;
         }
@@ -1711,7 +1765,7 @@ fn draw_pitch_keyboard(
         );
     }
 
-    for midi in 24_u8..=143_u8 {
+    for midi in KEYBOARD_DISPLAY_MIN_MIDI..=KEYBOARD_DISPLAY_MAX_MIDI {
         if !is_black_key(midi) {
             continue;
         }
@@ -1800,14 +1854,71 @@ fn conventional_key_rect(rect: egui::Rect, midi: u8, black: bool) -> Option<egui
 }
 
 fn spectrum_axis_x(rect: egui::Rect, hz: f32) -> f32 {
-    let min = SPECTRUM_VIEW_MIN_HZ;
+    let min = SPECTRUM_AXIS_MIN_HZ;
     let max = SPECTRUM_VIEW_MAX_HZ;
     let t = (hz.clamp(min, max).log2() - min.log2()) / (max.log2() - min.log2());
     rect.left() + t.clamp(0.0, 1.0) * rect.width()
 }
 
+fn spectrum_axis_hz(rect: egui::Rect, x: f32) -> f32 {
+    let min = SPECTRUM_AXIS_MIN_HZ;
+    let max = SPECTRUM_VIEW_MAX_HZ;
+    let t = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+    2.0_f32.powf(min.log2() + t * (max.log2() - min.log2()))
+}
+
+fn spectrum_band_hz(index: usize, total: usize) -> f32 {
+    if total <= 1 {
+        return SPECTRUM_ANALYSIS_MIN_HZ;
+    }
+    let ratio = SPECTRUM_VIEW_MAX_HZ / SPECTRUM_ANALYSIS_MIN_HZ;
+    let t = index as f32 / (total - 1) as f32;
+    SPECTRUM_ANALYSIS_MIN_HZ * ratio.powf(t)
+}
+
+fn spectrum_band_hz_range(index: usize, total: usize) -> (f32, f32) {
+    if total <= 1 {
+        let half = 2.0_f32.powf(1.0 / 24.0);
+        return (
+            SPECTRUM_ANALYSIS_MIN_HZ / half,
+            SPECTRUM_ANALYSIS_MIN_HZ * half,
+        );
+    }
+    let center = spectrum_band_hz(index, total);
+    let ratio = SPECTRUM_VIEW_MAX_HZ / SPECTRUM_ANALYSIS_MIN_HZ;
+    let step = ratio.powf(1.0 / (total - 1) as f32);
+    let edge_scale = step.sqrt();
+    (center / edge_scale, center * edge_scale)
+}
+
 fn midi_to_hz(midi: u8) -> f32 {
     440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+fn note_label_for_hz(hz: f32) -> String {
+    if !hz.is_finite() || hz <= 0.0 {
+        return "--".to_string();
+    }
+    let midi_exact = 69.0 + 12.0 * (hz / 440.0).log2();
+    let nearest = midi_exact.round() as i32;
+    let cents = ((midi_exact - nearest as f32) * 100.0).round() as i32;
+    let name = note_name_from_midi(nearest);
+    if cents == 0 {
+        name
+    } else if cents > 0 {
+        format!("{name} +{cents}c")
+    } else {
+        format!("{name} {cents}c")
+    }
+}
+
+fn note_name_from_midi(midi: i32) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let pitch_class = midi.rem_euclid(12) as usize;
+    let octave = midi.div_euclid(12) - 1;
+    format!("{}{}", NAMES[pitch_class], octave)
 }
 
 fn is_black_key(midi: u8) -> bool {
