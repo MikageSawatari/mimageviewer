@@ -1719,16 +1719,14 @@ fn draw_spectrum(
         );
         let onset = onsets[i].clamp(0.0, 1.0);
         if onset > 0.025 {
-            let cap_h = (2.0 + onset * 12.0).min(plot.height() * 0.18);
-            let y = plot.bottom() - 2.0 - h;
-            let accent = brighten_color(spectrum_color(i, bands.len(), value.max(onset)), 1.45);
+            let accent = brighten_color(spectrum_color(i, bands.len(), value.max(onset)), 1.18);
             painter.rect_filled(
                 egui::Rect::from_min_max(
-                    egui::pos2(x0, (y - cap_h).max(plot.top())),
-                    egui::pos2(x1, (y + 1.5).min(plot.bottom())),
+                    egui::pos2(x0, plot.bottom() - 2.0 - h),
+                    egui::pos2(x1, plot.bottom() - 2.0),
                 ),
                 band_corner,
-                color_with_alpha(accent, (82.0 + onset * 150.0) as u8),
+                color_with_alpha(accent, (24.0 + onset * 68.0) as u8),
             );
         }
     }
