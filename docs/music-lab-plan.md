@@ -92,7 +92,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
      - 音量の縦ラインを低 / 中 / 高域で分割して塗り、強い立ち上がりだけ transient accent として重ねる
-     - 下段: Loudness / Bass root / Brightness / Drums / Key / Change / Vocal hint の
+     - 下段: Loudness / Bass root / Key / Brightness / Drums / Change / Vocal hint の
        独立メトリクスレーン
      - Bass root / Key は 12 音の pitch class を五度圏カラーで表示し、オクターブ違いは同じ色にする
      - Brightness は高域量そのものだけでなく、周辺時間との差分も混ぜて構成変化のヒントにする

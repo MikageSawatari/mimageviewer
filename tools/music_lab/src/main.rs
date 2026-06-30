@@ -999,9 +999,9 @@ enum TimelineMetricKind {
 const TIMELINE_METRIC_KINDS: [TimelineMetricKind; TIMELINE_METRIC_LANE_COUNT] = [
     TimelineMetricKind::Loudness,
     TimelineMetricKind::BassRoot,
+    TimelineMetricKind::Key,
     TimelineMetricKind::Brightness,
     TimelineMetricKind::DrumDensity,
-    TimelineMetricKind::Key,
     TimelineMetricKind::Change,
     TimelineMetricKind::Vocal,
 ];
@@ -1592,27 +1592,29 @@ fn timeline_metric_color(kind: TimelineMetricKind, value: f32, bin: &WaveformBin
     let base = match kind {
         TimelineMetricKind::Loudness => egui::Color32::from_rgb(205, 220, 92),
         TimelineMetricKind::BassRoot if bin.bass_pitch_confidence > 0.08 => {
+            let color_value = value.max(0.50);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + bin.bass_pitch_class % 12, value),
-                    0.78 + value * 0.58,
+                    key_color(60 + bin.bass_pitch_class % 12, color_value),
+                    1.02 + value * 0.34,
                 ),
-                (50.0 + value * 174.0) as u8,
+                (82.0 + value * 158.0) as u8,
             );
         }
-        TimelineMetricKind::BassRoot => egui::Color32::from_rgb(190, 74, 46),
+        TimelineMetricKind::BassRoot => egui::Color32::from_rgb(224, 96, 54),
         TimelineMetricKind::Brightness => egui::Color32::from_rgb(86, 196, 246),
         TimelineMetricKind::DrumDensity => egui::Color32::from_rgb(252, 178, 48),
         TimelineMetricKind::Key if bin.key_confidence > 0.08 => {
+            let color_value = value.max(0.58);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + bin.key_pitch_class % 12, value),
-                    0.72 + value * 0.52,
+                    key_color(60 + bin.key_pitch_class % 12, color_value),
+                    1.10 + value * 0.36,
                 ),
-                (44.0 + value * 168.0) as u8,
+                (90.0 + value * 152.0) as u8,
             );
         }
-        TimelineMetricKind::Key => egui::Color32::from_rgb(78, 154, 132),
+        TimelineMetricKind::Key => egui::Color32::from_rgb(104, 214, 186),
         TimelineMetricKind::Change => egui::Color32::from_rgb(176, 116, 250),
         TimelineMetricKind::Vocal => egui::Color32::from_rgb(46, 224, 212),
     };
