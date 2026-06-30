@@ -2,7 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
-const MAX_FAVORITES: usize = 20;
+pub const MAX_FAVORITES: usize = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FavoriteAddError {
+    Duplicate,
+    LimitReached { max: usize },
+}
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct DetachedViewerWindowPlacement {
@@ -5080,16 +5086,26 @@ impl Settings {
     }
 
     /// 任意の表示名でお気に入りに追加する（重複・上限チェック付き）。
-    /// 追加された場合 true を返す。UUID は自動発行、index フラグは全 false。
-    pub fn add_favorite(&mut self, name: String, path: PathBuf) -> bool {
+    /// 追加に成功した場合 Ok(()) を返す。UUID は自動発行、index フラグは全 false。
+    pub fn try_add_favorite(
+        &mut self,
+        name: String,
+        path: PathBuf,
+    ) -> Result<(), FavoriteAddError> {
         if self.is_favorite(&path) {
-            return false;
+            return Err(FavoriteAddError::Duplicate);
         }
         if self.favorites.len() >= MAX_FAVORITES {
-            return false;
+            return Err(FavoriteAddError::LimitReached { max: MAX_FAVORITES });
         }
         self.favorites.push(FavoriteEntry::new(name, path));
-        true
+        Ok(())
+    }
+
+    /// 任意の表示名でお気に入りに追加する（重複・上限チェック付き）。
+    /// 追加された場合 true を返す。UUID は自動発行、index フラグは全 false。
+    pub fn add_favorite(&mut self, name: String, path: PathBuf) -> bool {
+        self.try_add_favorite(name, path).is_ok()
     }
 
     /// 「アプリケーションで開く」で使用したアプリを履歴に記録する。
@@ -6700,6 +6716,10 @@ mod tests {
         let mut s = Settings::default();
         s.add_favorite("Test".to_string(), PathBuf::from(r"C:\test"));
         assert!(!s.add_favorite("Test2".to_string(), PathBuf::from(r"C:\test")));
+        assert_eq!(
+            s.try_add_favorite("Test2".to_string(), PathBuf::from(r"C:\test")),
+            Err(FavoriteAddError::Duplicate)
+        );
         assert_eq!(s.favorites.len(), 1);
     }
 
@@ -6710,8 +6730,12 @@ mod tests {
             assert!(s.add_favorite(format!("F{i}"), PathBuf::from(format!(r"C:\dir{i}"))));
         }
         assert_eq!(s.favorites.len(), MAX_FAVORITES);
-        // 21個目は追加できない
+        // 上限を超える追加はできない
         assert!(!s.add_favorite("Overflow".to_string(), PathBuf::from(r"C:\overflow")));
+        assert_eq!(
+            s.try_add_favorite("Overflow".to_string(), PathBuf::from(r"C:\overflow")),
+            Err(FavoriteAddError::LimitReached { max: MAX_FAVORITES })
+        );
         assert_eq!(s.favorites.len(), MAX_FAVORITES);
     }
 
