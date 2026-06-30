@@ -1,6 +1,8 @@
 use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +13,7 @@ use music_core::{
     SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
     TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
 };
+use serde::Deserialize;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::conv::IntoSample;
@@ -175,6 +178,71 @@ struct SpectrumMsg {
 
 struct SpectrumRequest {
     position_secs: f64,
+}
+
+#[derive(Clone, Debug)]
+struct VocalTeacherAnalysis {
+    json_path: PathBuf,
+    evaluation_audio: Option<PathBuf>,
+    vocal_stem: Option<PathBuf>,
+    segments: Vec<TimeSpan>,
+    ignore: Vec<TimeSpan>,
+}
+
+impl VocalTeacherAnalysis {
+    fn vocal_total_secs(&self) -> f64 {
+        self.segments.iter().map(TimeSpan::duration).sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct TimeSpan {
+    start: f64,
+    end: f64,
+}
+
+impl TimeSpan {
+    fn duration(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+
+    fn overlaps(self, start: f64, end: f64) -> bool {
+        self.start < end && self.end > start
+    }
+}
+
+enum TeacherMsg {
+    Loaded {
+        media_path: PathBuf,
+        analysis: VocalTeacherAnalysis,
+        elapsed: Duration,
+    },
+    Failed {
+        media_path: PathBuf,
+        error: String,
+        elapsed: Duration,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct TeacherLabelSet {
+    #[serde(default)]
+    metadata: TeacherMetadata,
+    tracks: Vec<TeacherTrackLabels>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TeacherMetadata {
+    evaluation_audio: Option<PathBuf>,
+    vocal_stem: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeacherTrackLabels {
+    #[serde(default)]
+    vocal: Vec<TimeSpan>,
+    #[serde(default)]
+    ignore: Vec<TimeSpan>,
 }
 
 #[derive(Default)]
@@ -445,9 +513,14 @@ impl TimelineTextureCacheKey {
 
 #[derive(Default)]
 struct MusicLabApp {
+    active_path: Option<PathBuf>,
     track: Option<LoadedTrack>,
     load_rx: Option<mpsc::Receiver<LoadMsg>>,
     load_status: String,
+    teacher_analysis: Option<VocalTeacherAnalysis>,
+    teacher_rx: Option<mpsc::Receiver<TeacherMsg>>,
+    teacher_status: String,
+    teacher_started_at: Option<Instant>,
     player: Option<LabPlayer>,
     bookmarks: Vec<MusicBookmark>,
     next_bookmark_id: u64,
@@ -478,6 +551,7 @@ impl eframe::App for MusicLabApp {
         let stage_start = Instant::now();
         self.handle_dropped_files(ctx);
         self.poll_loader(ctx);
+        self.poll_teacher_analyzer(ctx);
         self.poll_spectrum_analyzer(ctx);
         self.frame_stats.record_poll(stage_start.elapsed());
 
@@ -501,6 +575,7 @@ impl eframe::App for MusicLabApp {
         let mut timeline_stats = TimelineDrawStats::default();
         let track = self.track.as_ref();
         let player = self.player.as_ref();
+        let teacher = self.teacher_analysis.as_ref();
         let snap = self.player_snapshot();
         let row_secs = self.timeline_row_secs();
         let load_status = self.load_status.clone();
@@ -517,6 +592,7 @@ impl eframe::App for MusicLabApp {
                                 ui,
                                 track,
                                 player,
+                                teacher,
                                 snap,
                                 timeline_cache,
                                 row_secs,
@@ -554,7 +630,7 @@ impl MusicLabApp {
                             .add_filter("Video", VIDEO_EXTENSIONS)
                             .pick_file()
                         {
-                            self.start_load(path);
+                            self.start_load(path, ctx);
                         }
                     }
 
@@ -627,6 +703,10 @@ impl MusicLabApp {
                     if !self.load_status.is_empty() {
                         ui.separator();
                         ui.label(&self.load_status);
+                    }
+                    if !self.teacher_status.is_empty() {
+                        ui.separator();
+                        ui.label(&self.teacher_status);
                     }
                 });
             });
@@ -711,6 +791,43 @@ impl MusicLabApp {
                         ui.label("BPM: not estimated");
                     }
                     ui.separator();
+                    ui.heading("Vocal teacher");
+                    if self.teacher_status.is_empty() {
+                        ui.label("Teacher: not started");
+                    } else {
+                        ui.label(&self.teacher_status);
+                    }
+                    if let Some(teacher) = &self.teacher_analysis {
+                        ui.label(format!(
+                            "Spans: {}, total {}",
+                            teacher.segments.len(),
+                            format_time(teacher.vocal_total_secs())
+                        ));
+                        ui.label(format!("JSON: {}", teacher.json_path.display()));
+                        if let Some(stem) = &teacher.vocal_stem {
+                            ui.label(format!("Stem: {}", stem.display()));
+                        }
+                        if let Some(audio) = &teacher.evaluation_audio {
+                            ui.label(format!("Eval audio: {}", audio.display()));
+                        }
+                        for (idx, span) in teacher.segments.iter().take(8).enumerate() {
+                            let label = format!(
+                                "{}  {} - {}",
+                                idx + 1,
+                                format_time(span.start),
+                                format_time(span.end)
+                            );
+                            if ui.button(label).clicked()
+                                && let Some(player) = &self.player
+                            {
+                                player.seek_secs(span.start);
+                            }
+                        }
+                        if teacher.segments.len() > 8 {
+                            ui.label(format!("... {} more", teacher.segments.len() - 8));
+                        }
+                    }
+                    ui.separator();
                     ui.heading("Tags");
                     ui.add_enabled(
                         false,
@@ -769,7 +886,7 @@ impl MusicLabApp {
             return;
         };
         if is_supported_media_path(&path) {
-            self.start_load(path);
+            self.start_load(path, ctx);
         } else {
             self.load_status = format!(
                 "Unsupported drop: {} (audio/video files only)",
@@ -778,10 +895,15 @@ impl MusicLabApp {
         }
     }
 
-    fn start_load(&mut self, path: PathBuf) {
+    fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.load_status = format!("Loading {}", path.display());
+        self.active_path = Some(path.clone());
         self.player = None;
         self.track = None;
+        self.teacher_analysis = None;
+        self.teacher_rx = None;
+        self.teacher_status.clear();
+        self.teacher_started_at = None;
         self.spectrum_bands.clear();
         self.spectrum_trail.clear();
         self.spectrum_prev_bands.clear();
@@ -796,10 +918,11 @@ impl MusicLabApp {
         self.timeline_follow_playhead = false;
         self.timeline_cache.clear();
         let (tx, rx) = mpsc::channel();
+        let load_path = path.clone();
         std::thread::Builder::new()
             .name("music-lab-load".into())
             .spawn(move || {
-                let msg = match decode_audio_file(&path) {
+                let msg = match decode_audio_file(&load_path) {
                     Ok(decoded) => {
                         let analysis = analyze_stereo_timeline(
                             &decoded.stereo_samples,
@@ -807,7 +930,7 @@ impl MusicLabApp {
                             music_lab_analysis_config(),
                         );
                         LoadMsg::Loaded(Box::new(LoadedTrack {
-                            path,
+                            path: load_path,
                             decoded: Arc::new(decoded),
                             analysis,
                         }))
@@ -818,6 +941,7 @@ impl MusicLabApp {
             })
             .ok();
         self.load_rx = Some(rx);
+        self.start_teacher_analysis(path, ctx);
     }
 
     fn poll_loader(&mut self, ctx: &egui::Context) {
@@ -847,6 +971,118 @@ impl MusicLabApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.load_status = "Loader stopped".to_string();
                 self.load_rx = None;
+            }
+        }
+    }
+
+    fn start_teacher_analysis(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let script_path = teacher_script_path();
+        if !script_path.exists() {
+            self.teacher_status = format!("Teacher: script not found: {}", script_path.display());
+            return;
+        }
+
+        let python = teacher_python_path();
+        let work_dir = teacher_work_dir();
+        let out_path = teacher_output_path(&path);
+        let (tx, rx) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        self.teacher_status = "Teacher: Demucs queued".to_string();
+        self.teacher_started_at = Some(Instant::now());
+        let media_path = path.clone();
+        let thread_media_path = path;
+        let spawned = std::thread::Builder::new()
+            .name("music-lab-teacher".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let msg = match run_teacher_sidecar(
+                    &thread_media_path,
+                    &python,
+                    &script_path,
+                    &work_dir,
+                    &out_path,
+                ) {
+                    Ok(analysis) => TeacherMsg::Loaded {
+                        media_path: thread_media_path,
+                        analysis,
+                        elapsed: started.elapsed(),
+                    },
+                    Err(error) => TeacherMsg::Failed {
+                        media_path: thread_media_path,
+                        error,
+                        elapsed: started.elapsed(),
+                    },
+                };
+                let _ = tx.send(msg);
+                repaint_ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.teacher_rx = Some(rx);
+                let name = media_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("media");
+                self.teacher_status = format!("Teacher: analyzing {name}");
+            }
+            Err(err) => {
+                self.teacher_rx = None;
+                self.teacher_status = format!("Teacher: worker spawn failed: {err}");
+            }
+        }
+    }
+
+    fn poll_teacher_analyzer(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.teacher_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(TeacherMsg::Loaded {
+                media_path,
+                analysis,
+                elapsed,
+            }) => {
+                if self.active_path.as_ref() == Some(&media_path) {
+                    let count = analysis.segments.len();
+                    let total = analysis.vocal_total_secs();
+                    self.teacher_status = format!(
+                        "Teacher: {count} vocal spans, {:.1}s total ({:.1}s)",
+                        total,
+                        elapsed.as_secs_f32()
+                    );
+                    self.teacher_analysis = Some(analysis);
+                    self.timeline_cache.clear();
+                }
+                self.teacher_rx = None;
+                self.teacher_started_at = None;
+                ctx.request_repaint();
+            }
+            Ok(TeacherMsg::Failed {
+                media_path,
+                error,
+                elapsed,
+            }) => {
+                if self.active_path.as_ref() == Some(&media_path) {
+                    self.teacher_status = format!(
+                        "Teacher: failed after {:.1}s: {error}",
+                        elapsed.as_secs_f32()
+                    );
+                }
+                self.teacher_rx = None;
+                self.teacher_started_at = None;
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if let Some(started) = self.teacher_started_at {
+                    self.teacher_status =
+                        format!("Teacher: analyzing {:.0}s", started.elapsed().as_secs_f32());
+                }
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.teacher_status = "Teacher: worker stopped".to_string();
+                self.teacher_rx = None;
+                self.teacher_started_at = None;
             }
         }
     }
@@ -962,6 +1198,141 @@ fn perf_log_path() -> PathBuf {
     std::env::temp_dir().join("miv_music_lab_perf.log")
 }
 
+fn teacher_work_dir() -> PathBuf {
+    std::env::temp_dir().join("miv_music_lab_teacher")
+}
+
+fn teacher_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("demucs_vocal_teacher.py")
+}
+
+fn teacher_python_path() -> PathBuf {
+    if let Ok(path) = std::env::var("MIV_MUSIC_TEACHER_PYTHON")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    let temp_venv_python = std::env::temp_dir()
+        .join("miv_demucs_venv_py313")
+        .join("Scripts")
+        .join("python.exe");
+    if temp_venv_python.exists() {
+        return temp_venv_python;
+    }
+    PathBuf::from("python")
+}
+
+fn teacher_output_path(media_path: &Path) -> PathBuf {
+    let stem = media_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(sanitize_teacher_file_stem)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "media".to_string());
+    teacher_work_dir().join(format!(
+        "{}_{:016x}.demucs_teacher.json",
+        stem,
+        teacher_media_key(media_path)
+    ))
+}
+
+fn sanitize_teacher_file_stem(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect()
+}
+
+fn teacher_media_key(path: &Path) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.as_os_str().to_string_lossy().hash(&mut hasher);
+    if let Ok(metadata) = std::fs::metadata(path) {
+        metadata.len().hash(&mut hasher);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+        {
+            duration.as_secs().hash(&mut hasher);
+            duration.subsec_nanos().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn run_teacher_sidecar(
+    media_path: &Path,
+    python: &Path,
+    script_path: &Path,
+    work_dir: &Path,
+    out_path: &Path,
+) -> Result<VocalTeacherAnalysis, String> {
+    std::fs::create_dir_all(work_dir).map_err(|e| format!("create {}: {e}", work_dir.display()))?;
+    let output = Command::new(python)
+        .arg(script_path)
+        .arg(media_path)
+        .arg("--out")
+        .arg(out_path)
+        .arg("--work-dir")
+        .arg(work_dir)
+        .arg("--track-path")
+        .arg("input")
+        .arg("--reuse")
+        .output()
+        .map_err(|e| format!("run {}: {e}", python.display()))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{}\n{}",
+            format!("sidecar exited with {}", output.status),
+            trim_teacher_log(&format!("{stdout}\n{stderr}"))
+        ));
+    }
+    load_teacher_analysis(out_path)
+}
+
+fn load_teacher_analysis(path: &Path) -> Result<VocalTeacherAnalysis, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let labels: TeacherLabelSet =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let Some(track) = labels.tracks.into_iter().next() else {
+        return Err(format!("{} has no tracks", path.display()));
+    };
+    Ok(VocalTeacherAnalysis {
+        json_path: path.to_path_buf(),
+        evaluation_audio: labels.metadata.evaluation_audio,
+        vocal_stem: labels.metadata.vocal_stem,
+        segments: normalize_teacher_spans(track.vocal),
+        ignore: normalize_teacher_spans(track.ignore),
+    })
+}
+
+fn normalize_teacher_spans(mut spans: Vec<TimeSpan>) -> Vec<TimeSpan> {
+    spans.retain(|span| {
+        span.start.is_finite() && span.end.is_finite() && span.end > span.start && span.end >= 0.0
+    });
+    spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+    spans
+}
+
+fn trim_teacher_log(value: &str) -> String {
+    let lines: Vec<&str> = value
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(8);
+    lines[start..].join("\n")
+}
+
 fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
@@ -985,6 +1356,7 @@ fn draw_timeline(
     ui: &mut egui::Ui,
     track: &LoadedTrack,
     player: Option<&LabPlayer>,
+    teacher: Option<&VocalTeacherAnalysis>,
     snap: PlaybackSnapshot,
     cache: &mut TimelineTextureCache,
     row_secs: f64,
@@ -1081,6 +1453,9 @@ fn draw_timeline(
             ui.visuals().text_color(),
         );
         draw_beat_grid(&painter, row_rect, row_start, row_secs, &track.analysis);
+        if let Some(teacher) = teacher {
+            draw_teacher_intervals(&painter, row_rect, row_start, row_secs, teacher);
+        }
     }
 
     draw_playhead(
@@ -1584,6 +1959,98 @@ fn draw_beat_grid(
             last_bar_label_x = x;
         }
     }
+}
+
+fn draw_teacher_intervals(
+    painter: &egui::Painter,
+    row_rect: egui::Rect,
+    row_start: f64,
+    row_secs: f64,
+    teacher: &VocalTeacherAnalysis,
+) {
+    if row_secs <= 0.0 {
+        return;
+    }
+    let row_end = row_start + row_secs;
+    let loudness_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.left(), row_rect.bottom() - TIMELINE_LOUDNESS_H),
+        row_rect.right_bottom(),
+    );
+    let waveform_marker = egui::Rect::from_min_max(
+        egui::pos2(row_rect.left(), row_rect.top() + TIMELINE_WAVEFORM_H - 3.0),
+        egui::pos2(row_rect.right(), row_rect.top() + TIMELINE_WAVEFORM_H),
+    );
+
+    for span in &teacher.ignore {
+        if !span.overlaps(row_start, row_end) {
+            continue;
+        }
+        let (x0, x1) = teacher_span_x(*span, row_rect, row_start, row_secs);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, loudness_rect.top()),
+                egui::pos2(x1, loudness_rect.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(170, 185, 200, 32),
+        );
+    }
+
+    for span in &teacher.segments {
+        if !span.overlaps(row_start, row_end) {
+            continue;
+        }
+        let (x0, x1) = teacher_span_x(*span, row_rect, row_start, row_secs);
+        let loudness_span = egui::Rect::from_min_max(
+            egui::pos2(x0, loudness_rect.top()),
+            egui::pos2(x1, loudness_rect.bottom()),
+        );
+        painter.rect_filled(
+            loudness_span,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(28, 168, 255, 92),
+        );
+        painter.rect_stroke(
+            loudness_span,
+            0.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(82, 220, 255, 165),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, waveform_marker.top()),
+                egui::pos2(x1, waveform_marker.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(48, 220, 255, 120),
+        );
+        if x1 - x0 > 56.0 && span.start >= row_start && span.start <= row_end {
+            painter.text(
+                egui::pos2(x0 + 4.0, loudness_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "teacher vocal",
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgba_unmultiplied(210, 246, 255, 220),
+            );
+        }
+    }
+}
+
+fn teacher_span_x(
+    span: TimeSpan,
+    row_rect: egui::Rect,
+    row_start: f64,
+    row_secs: f64,
+) -> (f32, f32) {
+    let row_end = row_start + row_secs;
+    let start = span.start.max(row_start).min(row_end);
+    let end = span.end.max(row_start).min(row_end);
+    let x0 = row_rect.left() + ((start - row_start) / row_secs) as f32 * row_rect.width();
+    let x1 = row_rect.left() + ((end - row_start) / row_secs) as f32 * row_rect.width();
+    (x0, x1.max(x0 + 1.0).min(row_rect.right()))
 }
 
 fn draw_playhead(

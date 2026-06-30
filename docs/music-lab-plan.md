@@ -81,9 +81,11 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - media visual mode 型
    - VST3 用 effect-chain trait
 2. `music_lab`
-   - 音声ファイル、または動画ファイル内の音声トラックを開く
-   - Open ダイアログとファイル D&D の両方で読み込みを開始する
-   - 全尺 decode + timeline analysis
+  - 音声ファイル、または動画ファイル内の音声トラックを開く
+  - Open ダイアログとファイル D&D の両方で読み込みを開始する
+  - Open / D&D 時に外部 Demucs teacher sidecar が利用可能ならバックグラウンドで起動し、
+    生成された vocal 区間をタイムラインと右 details panel に重ねて表示する
+  - 全尺 decode + timeline analysis
    - Play/Pause/Stop/seek 用の最小プレイヤー
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形

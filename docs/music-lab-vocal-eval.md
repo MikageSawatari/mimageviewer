@@ -100,6 +100,25 @@ file    threshold   precision   recall   f1   tp_s   fp_s   fn_s   tn_s
 The seconds columns are weighted by timeline bin duration, so longer errors count
 more than short boundary errors.
 
+## music_lab UI Integration
+
+When `music_lab` opens an audio or video file, including file drag-and-drop, it
+also starts the Demucs teacher helper in a background worker when the script is
+available. The UI thread never waits for Demucs. While the sidecar is running,
+the top bar and right details panel show `Teacher: analyzing ...`; when it
+finishes, generated vocal spans are overlaid on the timeline loudness row in
+cyan and listed in the right panel.
+
+Python resolution order:
+
+1. `MIV_MUSIC_TEACHER_PYTHON`
+2. `%TEMP%\miv_demucs_venv_py313\Scripts\python.exe`
+3. `python` from `PATH`
+
+The generated JSON, extracted WAV, and vocal stem are stored under
+`%TEMP%\miv_music_lab_teacher`. This is lab-only cache data and should not be
+committed.
+
 ## Teacher Data Policy
 
 External high-accuracy tools should be used to create or draft the label JSON,
