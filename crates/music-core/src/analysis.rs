@@ -608,37 +608,103 @@ fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
     if bins.is_empty() || raw.is_empty() {
         return;
     }
-    let radius = (0.45 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let radius = (1.10 / bin_secs.max(0.01)).round().max(1.0) as usize;
     let mut smoothed = vec![0.0_f32; bins.len()];
     for i in 0..bins.len() {
         let start = i.saturating_sub(radius);
         let end = (i + radius + 1).min(raw.len());
         let mut score_sum = 0.0;
         let mut transient_sum = 0.0;
+        let mut active_count = 0usize;
+        let mut strong_count = 0usize;
         let mut count = 0usize;
         for j in start..end {
             score_sum += raw[j];
             transient_sum += bins[j].transient;
+            if raw[j] > 0.16 {
+                active_count += 1;
+            }
+            if raw[j] > 0.34 {
+                strong_count += 1;
+            }
             count += 1;
         }
         let count_f = count.max(1) as f32;
         let local_score = score_sum / count_f;
         let local_transient = transient_sum / count_f;
-        let sustain_gate = smoothstep(0.10, 0.38, local_score);
-        let transient_penalty = 1.0 - 0.55 * smoothstep(0.20, 0.75, local_transient);
-        smoothed[i] =
-            ((local_score * 0.78 + raw[i] * 0.22).powf(0.85) * sustain_gate * transient_penalty)
-                .clamp(0.0, 1.0);
+        let active_ratio = active_count as f32 / count_f;
+        let strong_ratio = strong_count as f32 / count_f;
+        let sustain_gate = smoothstep(0.24, 0.62, active_ratio)
+            * (0.45 + 0.55 * smoothstep(0.05, 0.28, strong_ratio));
+        let score_gate = smoothstep(0.17, 0.42, local_score);
+        let transient_penalty = 1.0 - 0.80 * smoothstep(0.16, 0.58, local_transient);
+        smoothed[i] = (local_score.powf(0.85) * sustain_gate * score_gate * transient_penalty)
+            .clamp(0.0, 1.0);
     }
+
+    keep_only_vocal_like_segments(&mut smoothed, bin_secs);
 
     let mut state = 0.0_f32;
     for (bin, target) in bins.iter_mut().zip(smoothed) {
         if target > state {
-            state = state * 0.78 + target * 0.22;
+            state = state * 0.86 + target * 0.14;
         } else {
-            state = (state * 0.94).max(target * 0.55);
+            state = (state * 0.975).max(target * 0.40);
         }
         bin.vocal_score = state.clamp(0.0, 1.0);
+    }
+}
+
+fn keep_only_vocal_like_segments(scores: &mut [f32], bin_secs: f64) {
+    if scores.is_empty() {
+        return;
+    }
+    let min_segment_bins = (1.80 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let bridge_bins = (0.45 / bin_secs.max(0.01)).round().max(1.0) as usize;
+
+    let mut i = 0usize;
+    while i < scores.len() {
+        if scores[i] > 0.12 {
+            i += 1;
+            continue;
+        }
+        let gap_start = i;
+        while i < scores.len() && scores[i] <= 0.12 {
+            i += 1;
+        }
+        let gap_end = i;
+        if gap_start > 0 && gap_end < scores.len() && gap_end - gap_start <= bridge_bins {
+            for score in &mut scores[gap_start..gap_end] {
+                *score = 0.12;
+            }
+        }
+    }
+
+    let mut start = None;
+    for idx in 0..=scores.len() {
+        let active = idx < scores.len() && scores[idx] > 0.12;
+        match (start, active) {
+            (None, true) => start = Some(idx),
+            (Some(segment_start), false) => {
+                let segment_end = idx;
+                let segment_len = segment_end - segment_start;
+                let peak = scores[segment_start..segment_end]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f32, f32::max);
+                if segment_len < min_segment_bins || peak < 0.22 {
+                    for score in &mut scores[segment_start..segment_end] {
+                        *score = 0.0;
+                    }
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+
+    for score in scores {
+        *score = smoothstep(0.18, 0.55, *score);
     }
 }
 

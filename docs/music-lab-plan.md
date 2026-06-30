@@ -58,6 +58,9 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - 初期実装は `WaveformBin.vocal_score` として、軽量 DSP の中域比率 / zero-crossing /
     crest / transient 抑制 / 約 1 秒の持続性から 0..1 のスコアを作る。ラウドネス下段は
     `vocal_score` が高い区間だけ寒色へ寄せる。
+  - 散発的な誤反応を避けるため、短い断片は捨て、約 2 秒以上まとまる候補だけを表示する。
+    次の改善候補は autocorrelation / cepstrum などによる有声音の周期性と、
+    formant 風の中域包絡を追加してインスト誤検出を下げること。
   - All-In-One の demixed vocal stem や embeddings を利用できるか評価する。
   - Demucs / htdemucs は MIT だが重いため、必要なら任意のバックグラウンド高精度解析として扱う。
   - inaSpeechSegmenter は MIT だが singing voice は music 扱いなので、歌あり区間の検出にはそのまま使わない。
