@@ -32,7 +32,7 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac", "mp4", "m4v", "mov", "mkv", "webm",
 ];
 const SPECTRUM_BANDS: usize = 108;
-const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
+const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
@@ -84,6 +84,10 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+    apply_dark_visuals(ctx);
+}
+
+fn apply_dark_visuals(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = app_panel_bg();
     visuals.window_fill = app_panel_bg();
@@ -119,9 +123,9 @@ fn setup_fonts(ctx: &egui::Context) {
     visuals.widgets.open = visuals.widgets.active;
     visuals.selection.bg_fill = egui::Color32::from_rgb(44, 106, 170);
     visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(250, 252, 255));
-    visuals.override_text_color = Some(egui::Color32::from_rgb(226, 232, 238));
-    visuals.weak_text_color = Some(egui::Color32::from_rgb(177, 188, 198));
-    visuals.disabled_alpha = 0.74;
+    visuals.override_text_color = Some(egui::Color32::from_rgb(238, 243, 248));
+    visuals.weak_text_color = Some(egui::Color32::from_rgb(204, 214, 224));
+    visuals.disabled_alpha = 0.88;
     ctx.set_visuals(visuals);
 }
 
@@ -458,6 +462,7 @@ struct MusicLabApp {
 
 impl eframe::App for MusicLabApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_dark_visuals(ctx);
         let update_start = Instant::now();
         self.frame_stats.record_frame();
 
@@ -996,7 +1001,7 @@ fn draw_timeline(
         row_secs_millis: (row_secs * 1000.0).round() as u32,
         rows,
         bins_len: track.analysis.bins.len(),
-        dark: ui.visuals().dark_mode,
+        dark: true,
     };
     cache.ensure(texture_key);
 
@@ -1077,14 +1082,10 @@ fn render_timeline_row_image(
     waveform_h: usize,
     gap_h: usize,
     loudness_h: usize,
-    dark: bool,
+    _dark: bool,
 ) -> (egui::ColorImage, usize) {
     let height = waveform_h + gap_h + loudness_h;
-    let bg = if dark {
-        app_bg()
-    } else {
-        egui::Color32::from_rgb(238, 241, 243)
-    };
+    let bg = app_bg();
     let mut pixels = vec![bg; width * height];
 
     fill_rect_px(
@@ -1603,14 +1604,23 @@ fn draw_spectrum(
         let x1 = (plot.left() + (i + 1) as f32 * band_w - 0.25)
             .max(x0 + 0.75)
             .min(plot.right());
+        let ghost_h = (plot.height() - 3.0) * (trail[i] * 0.72).max(0.012);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2((x0 - 0.45).max(plot.left()), plot.bottom() - 2.0 - ghost_h),
+                egui::pos2((x1 + 0.45).min(plot.right()), plot.bottom() - 2.0),
+            ),
+            1.0,
+            color_with_alpha(spectrum_color(i, bands.len(), trail[i]), 48),
+        );
         let trail_h = (plot.height() - 3.0) * trail[i].max(0.015);
         painter.rect_filled(
             egui::Rect::from_min_max(
-                egui::pos2(x0, plot.bottom() - 2.0 - trail_h),
-                egui::pos2(x1, plot.bottom() - 2.0),
+                egui::pos2((x0 - 0.2).max(plot.left()), plot.bottom() - 2.0 - trail_h),
+                egui::pos2((x1 + 0.2).min(plot.right()), plot.bottom() - 2.0),
             ),
             1.0,
-            color_with_alpha(spectrum_color(i, bands.len(), trail[i]), 58),
+            color_with_alpha(spectrum_color(i, bands.len(), trail[i]), 100),
         );
         let h = (plot.height() - 3.0) * value.max(0.015);
         painter.rect_filled(

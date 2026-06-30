@@ -17,17 +17,17 @@ const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
     MultiResolutionWindowSpec {
         size: 32_768,
         upper_hz: 90.0,
-        refresh_secs: 0.100,
+        refresh_secs: 0.025,
     },
     MultiResolutionWindowSpec {
         size: 16_384,
         upper_hz: 250.0,
-        refresh_secs: 0.055,
+        refresh_secs: 0.018,
     },
     MultiResolutionWindowSpec {
         size: 8_192,
         upper_hz: 1_000.0,
-        refresh_secs: 0.028,
+        refresh_secs: 0.010,
     },
     MultiResolutionWindowSpec {
         size: 4_096,
