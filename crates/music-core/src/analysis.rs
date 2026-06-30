@@ -21,6 +21,13 @@ const SPECTRUM_LOW_DISPLAY_ATTENUATION_DB: f32 = 5.5;
 const SPECTRUM_SUB_DISPLAY_ATTENUATION_DB: f32 = 1.0;
 const SPECTRUM_PRESENCE_DISPLAY_BOOST_DB: f32 = 1.25;
 const VOCAL_PERIODICITY_TARGET_HZ: u32 = 8_000;
+const TIMELINE_CHROMA_CLASSES: usize = 12;
+const TIMELINE_CHROMA_WINDOW_SIZE: usize = 8_192;
+const TIMELINE_CHROMA_HOP_SECS: f64 = 0.10;
+const TIMELINE_BASS_MIN_HZ: f32 = 35.0;
+const TIMELINE_BASS_MAX_HZ: f32 = 260.0;
+const TIMELINE_CHROMA_MIN_HZ: f32 = 55.0;
+const TIMELINE_CHROMA_MAX_HZ: f32 = 2_800.0;
 const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
     MultiResolutionWindowSpec {
         size: 32_768,
@@ -131,6 +138,33 @@ pub struct WaveformBin {
     pub center_ratio: f32,
     /// 0..1 lightweight vocal-likelihood estimate for timeline coloring.
     pub vocal_score: f32,
+    /// 0..1 high-band presence normalized for section-change hints.
+    #[serde(default)]
+    pub brightness: f32,
+    /// 0..1 moving density of short energy rises.
+    #[serde(default)]
+    pub transient_density: f32,
+    /// 0..1 local feature change against neighboring time windows.
+    #[serde(default)]
+    pub novelty: f32,
+    /// 0..11 strongest low-frequency pitch class, C=0.
+    #[serde(default)]
+    pub bass_pitch_class: u8,
+    /// 0..1 confidence of the low-frequency pitch class.
+    #[serde(default)]
+    pub bass_pitch_confidence: f32,
+    /// 0..11 strongest broadband chroma pitch class, C=0.
+    #[serde(default)]
+    pub key_pitch_class: u8,
+    /// 0..1 confidence of the broadband chroma pitch class.
+    #[serde(default)]
+    pub key_confidence: f32,
+    /// Low-frequency pitch-class energy, normalized to max=1.
+    #[serde(default)]
+    pub bass_chroma: [f32; TIMELINE_CHROMA_CLASSES],
+    /// Broadband pitch-class energy, normalized to max=1.
+    #[serde(default)]
+    pub chroma: [f32; TIMELINE_CHROMA_CLASSES],
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -270,6 +304,15 @@ pub fn analyze_stereo_timeline(
             transient_band,
             center_ratio,
             vocal_score: 0.0,
+            brightness: 0.0,
+            transient_density: 0.0,
+            novelty: 0.0,
+            bass_pitch_class: 0,
+            bass_pitch_confidence: 0.0,
+            key_pitch_class: 0,
+            key_confidence: 0.0,
+            bass_chroma: [0.0; TIMELINE_CHROMA_CLASSES],
+            chroma: [0.0; TIMELINE_CHROMA_CLASSES],
         });
         prev_band_rms = [
             prev_band_rms[0] * 0.68 + band_rms[0] * 0.32,
@@ -280,6 +323,9 @@ pub fn analyze_stereo_timeline(
         frame_start = frame_end;
     }
     apply_vocal_scores(&mut bins, &vocal_raw, config.bin_secs);
+    apply_timeline_summary_metrics(&mut bins, config.bin_secs);
+    apply_chroma_metrics(&mut bins, stereo_samples, sample_rate, config.bin_secs);
+    apply_novelty_scores(&mut bins, config.bin_secs);
 
     let beat_grid = estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs);
 
@@ -892,6 +938,368 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
+    if high <= low {
+        return if value >= high { 1.0 } else { 0.0 };
+    }
+    ((value - low) / (high - low)).clamp(0.0, 1.0)
+}
+
+fn apply_timeline_summary_metrics(bins: &mut [WaveformBin], bin_secs: f64) {
+    if bins.is_empty() {
+        return;
+    }
+    let density_radius = (0.70 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let brightness_radius = (1.20 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let high_mid: Vec<f32> = bins
+        .iter()
+        .map(|bin| {
+            let high = bin.band_energy[2].max(0.0);
+            let mid = bin.band_energy[1].max(0.0);
+            high / (mid + high + 1.0e-6)
+        })
+        .collect();
+
+    for i in 0..bins.len() {
+        let density_start = i.saturating_sub(density_radius);
+        let density_end = (i + density_radius + 1).min(bins.len());
+        let mut transient_sum = 0.0;
+        let mut transient_active = 0usize;
+        for bin in &bins[density_start..density_end] {
+            transient_sum += bin.transient;
+            if bin.transient > 0.10 {
+                transient_active += 1;
+            }
+        }
+        let density_count = (density_end - density_start).max(1) as f32;
+        let transient_mean = transient_sum / density_count;
+        let transient_ratio = transient_active as f32 / density_count;
+        bins[i].transient_density = (smoothstep(0.025, 0.18, transient_mean) * 0.68
+            + smoothstep(0.04, 0.20, transient_ratio) * 0.42)
+            .clamp(0.0, 1.0);
+
+        let bright_start = i.saturating_sub(brightness_radius);
+        let bright_end = (i + brightness_radius + 1).min(bins.len());
+        let local_mean = high_mid[bright_start..bright_end]
+            .iter()
+            .copied()
+            .sum::<f32>()
+            / (bright_end - bright_start).max(1) as f32;
+        let absolute = normalize_range(high_mid[i], 0.035, 0.34);
+        let lift = smoothstep(0.018, 0.13, high_mid[i] - local_mean);
+        bins[i].brightness = (absolute * 0.74 + lift * 0.38).clamp(0.0, 1.0);
+    }
+}
+
+fn apply_chroma_metrics(
+    bins: &mut [WaveformBin],
+    stereo_samples: &[f32],
+    sample_rate: u32,
+    bin_secs: f64,
+) {
+    let frame_count = stereo_samples.len() / 2;
+    if bins.is_empty() || sample_rate == 0 || frame_count == 0 {
+        return;
+    }
+    let fft_size = TIMELINE_CHROMA_WINDOW_SIZE.min(frame_count).max(64);
+    let hop_frames = (TIMELINE_CHROMA_HOP_SECS * sample_rate as f64)
+        .round()
+        .max(1.0) as usize;
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    let denom = (fft_size.saturating_sub(1)).max(1) as f32;
+    let mut hann = Vec::with_capacity(fft_size);
+    let mut hann_sum = 0.0_f32;
+    for i in 0..fft_size {
+        let value = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / denom).cos();
+        hann_sum += value;
+        hann.push(value);
+    }
+    let mut samples = vec![Complex32::new(0.0, 0.0); fft_size];
+    let mut frames = Vec::new();
+    let mut center_frame = 0usize;
+    while center_frame < frame_count {
+        frames.push(analyze_chroma_frame(
+            stereo_samples,
+            center_frame,
+            sample_rate,
+            &fft,
+            &hann,
+            hann_sum,
+            &mut samples,
+        ));
+        center_frame = center_frame.saturating_add(hop_frames);
+    }
+    if frames.is_empty() {
+        return;
+    }
+
+    for bin in &mut *bins {
+        let center_secs = bin.start_secs + bin.duration_secs * 0.5;
+        let frame_idx = (center_secs / TIMELINE_CHROMA_HOP_SECS).round().max(0.0) as usize;
+        let frame = &frames[frame_idx.min(frames.len() - 1)];
+        bin.bass_chroma = frame.bass_chroma;
+        bin.chroma = frame.chroma;
+        bin.bass_pitch_class = frame.bass_pitch_class;
+        bin.bass_pitch_confidence = (frame.bass_confidence
+            * normalize_range(bin.band_energy[0], 0.05, 0.45))
+        .clamp(0.0, 1.0);
+        bin.key_pitch_class = frame.key_pitch_class;
+        bin.key_confidence =
+            (frame.key_confidence * normalize_range(bin.rms, 0.006, 0.06)).clamp(0.0, 1.0);
+    }
+
+    let smooth_radius = (0.22 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    smooth_pitch_confidence(bins, smooth_radius);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineChromaFrame {
+    bass_chroma: [f32; TIMELINE_CHROMA_CLASSES],
+    chroma: [f32; TIMELINE_CHROMA_CLASSES],
+    bass_pitch_class: u8,
+    bass_confidence: f32,
+    key_pitch_class: u8,
+    key_confidence: f32,
+}
+
+fn analyze_chroma_frame(
+    stereo_samples: &[f32],
+    center_frame: usize,
+    sample_rate: u32,
+    fft: &Arc<dyn Fft<f32>>,
+    hann: &[f32],
+    hann_sum: f32,
+    samples: &mut [Complex32],
+) -> TimelineChromaFrame {
+    let frame_count = stereo_samples.len() / 2;
+    let window_frames = samples.len();
+    let max_start = frame_count.saturating_sub(window_frames);
+    let start_frame = center_frame
+        .saturating_sub(window_frames / 2)
+        .min(max_start);
+    for (i, sample) in samples.iter_mut().enumerate() {
+        let frame_idx = start_frame + i;
+        let mono = if frame_idx < frame_count {
+            ((stereo_samples[frame_idx * 2] + stereo_samples[frame_idx * 2 + 1]) * 0.5)
+                .clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        sample.re = mono * hann.get(i).copied().unwrap_or(0.0);
+        sample.im = 0.0;
+    }
+    fft.process(samples);
+
+    let half = window_frames / 2;
+    let bin_hz = sample_rate.max(1) as f32 / window_frames as f32;
+    let scale = hann_sum.max(1.0);
+    let mut bass_chroma = [0.0_f32; TIMELINE_CHROMA_CLASSES];
+    let mut chroma = [0.0_f32; TIMELINE_CHROMA_CLASSES];
+    for idx in 1..=half {
+        let hz = idx as f32 * bin_hz;
+        if hz > TIMELINE_CHROMA_MAX_HZ {
+            break;
+        }
+        let mirror_scale = if idx == half && window_frames % 2 == 0 {
+            1.0
+        } else {
+            2.0
+        };
+        let amp = samples[idx].norm() * mirror_scale / scale;
+        let compressed = amp.max(0.0).powf(0.62);
+        if hz >= TIMELINE_BASS_MIN_HZ && hz <= TIMELINE_BASS_MAX_HZ {
+            let pc = pitch_class_for_hz(hz);
+            let focus = 1.0 - smoothstep(210.0, TIMELINE_BASS_MAX_HZ, hz) * 0.35;
+            bass_chroma[pc] += compressed * focus;
+        }
+        if hz >= TIMELINE_CHROMA_MIN_HZ {
+            let pc = pitch_class_for_hz(hz);
+            let mid_focus = (1.0 - smoothstep(1_800.0, TIMELINE_CHROMA_MAX_HZ, hz) * 0.45)
+                * (0.75 + smoothstep(80.0, 180.0, hz) * 0.25);
+            chroma[pc] += compressed * mid_focus;
+        }
+    }
+
+    let (bass_chroma, bass_pitch_class, bass_confidence) = normalize_chroma(bass_chroma);
+    let (chroma, key_pitch_class, key_confidence) = normalize_chroma(chroma);
+    TimelineChromaFrame {
+        bass_chroma,
+        chroma,
+        bass_pitch_class,
+        bass_confidence,
+        key_pitch_class,
+        key_confidence,
+    }
+}
+
+fn pitch_class_for_hz(hz: f32) -> usize {
+    let midi = (69.0 + 12.0 * (hz.max(1.0) / 440.0).log2()).round() as i32;
+    midi.rem_euclid(TIMELINE_CHROMA_CLASSES as i32) as usize
+}
+
+fn normalize_chroma(
+    values: [f32; TIMELINE_CHROMA_CLASSES],
+) -> ([f32; TIMELINE_CHROMA_CLASSES], u8, f32) {
+    let mut peak_idx = 0usize;
+    let mut peak = 0.0_f32;
+    let mut second = 0.0_f32;
+    let mut sum = 0.0_f32;
+    for (idx, value) in values.iter().copied().enumerate() {
+        sum += value;
+        if value > peak {
+            second = peak;
+            peak = value;
+            peak_idx = idx;
+        } else if value > second {
+            second = value;
+        }
+    }
+    if peak <= 1.0e-8 || sum <= 1.0e-8 {
+        return ([0.0; TIMELINE_CHROMA_CLASSES], 0, 0.0);
+    }
+    let mut normalized = values;
+    for value in &mut normalized {
+        *value = (*value / peak).clamp(0.0, 1.0);
+    }
+    let peakiness = ((peak - second) / peak.max(1.0e-8)).clamp(0.0, 1.0);
+    let concentration =
+        (peak / (sum / TIMELINE_CHROMA_CLASSES as f32 + 1.0e-8)).clamp(0.0, 3.0) / 3.0;
+    let confidence = (peakiness * 0.72 + concentration * 0.28).clamp(0.0, 1.0);
+    (normalized, peak_idx as u8, confidence)
+}
+
+fn smooth_pitch_confidence(bins: &mut [WaveformBin], radius: usize) {
+    if bins.is_empty() || radius == 0 {
+        return;
+    }
+    let original: Vec<(u8, f32, u8, f32)> = bins
+        .iter()
+        .map(|bin| {
+            (
+                bin.bass_pitch_class,
+                bin.bass_pitch_confidence,
+                bin.key_pitch_class,
+                bin.key_confidence,
+            )
+        })
+        .collect();
+    for i in 0..bins.len() {
+        let start = i.saturating_sub(radius);
+        let end = (i + radius + 1).min(bins.len());
+        let mut bass_votes = [0.0_f32; TIMELINE_CHROMA_CLASSES];
+        let mut key_votes = [0.0_f32; TIMELINE_CHROMA_CLASSES];
+        for &(bass_pc, bass_conf, key_pc, key_conf) in &original[start..end] {
+            bass_votes[bass_pc as usize % TIMELINE_CHROMA_CLASSES] += bass_conf;
+            key_votes[key_pc as usize % TIMELINE_CHROMA_CLASSES] += key_conf;
+        }
+        let (bass_pc, bass_conf) = best_vote(&bass_votes);
+        let (key_pc, key_conf) = best_vote(&key_votes);
+        bins[i].bass_pitch_class = bass_pc;
+        bins[i].bass_pitch_confidence = bins[i].bass_pitch_confidence.max(bass_conf * 0.55);
+        bins[i].key_pitch_class = key_pc;
+        bins[i].key_confidence = bins[i].key_confidence.max(key_conf * 0.50);
+    }
+}
+
+fn best_vote(votes: &[f32; TIMELINE_CHROMA_CLASSES]) -> (u8, f32) {
+    let mut best_idx = 0usize;
+    let mut best = 0.0_f32;
+    let mut sum = 0.0_f32;
+    for (idx, value) in votes.iter().copied().enumerate() {
+        sum += value;
+        if value > best {
+            best = value;
+            best_idx = idx;
+        }
+    }
+    let confidence = if sum > 1.0e-6 { best / sum } else { 0.0 };
+    (best_idx as u8, confidence.clamp(0.0, 1.0))
+}
+
+fn apply_novelty_scores(bins: &mut [WaveformBin], bin_secs: f64) {
+    if bins.len() < 4 {
+        return;
+    }
+    let radius = (1.20 / bin_secs.max(0.01)).round().max(2.0) as usize;
+    let mut raw = vec![0.0_f32; bins.len()];
+    for i in 0..bins.len() {
+        let prev_start = i.saturating_sub(radius);
+        let prev_end = i;
+        let next_start = i;
+        let next_end = (i + radius).min(bins.len());
+        if prev_end <= prev_start || next_end <= next_start {
+            continue;
+        }
+        let prev = average_feature_window(&bins[prev_start..prev_end]);
+        let next = average_feature_window(&bins[next_start..next_end]);
+        let chroma_delta = l1_delta(&prev.chroma, &next.chroma) * 0.20;
+        let bass_delta = l1_delta(&prev.bass_chroma, &next.bass_chroma) * 0.12;
+        let scalar_delta = (prev.loudness - next.loudness).abs() * 0.60
+            + (prev.bass - next.bass).abs() * 0.42
+            + (prev.brightness - next.brightness).abs() * 0.72
+            + (prev.transient_density - next.transient_density).abs() * 0.70
+            + (prev.vocal - next.vocal).abs() * 0.38;
+        raw[i] = smoothstep(0.12, 0.56, scalar_delta + chroma_delta + bass_delta);
+    }
+    let smooth_radius = (0.12 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    for i in 0..bins.len() {
+        let start = i.saturating_sub(smooth_radius);
+        let end = (i + smooth_radius + 1).min(bins.len());
+        let peak = raw[start..end].iter().copied().fold(0.0_f32, f32::max);
+        bins[i].novelty = peak.clamp(0.0, 1.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineFeatureAverage {
+    loudness: f32,
+    bass: f32,
+    brightness: f32,
+    transient_density: f32,
+    vocal: f32,
+    bass_chroma: [f32; TIMELINE_CHROMA_CLASSES],
+    chroma: [f32; TIMELINE_CHROMA_CLASSES],
+}
+
+fn average_feature_window(window: &[WaveformBin]) -> TimelineFeatureAverage {
+    let count = window.len().max(1) as f32;
+    let mut avg = TimelineFeatureAverage {
+        loudness: 0.0,
+        bass: 0.0,
+        brightness: 0.0,
+        transient_density: 0.0,
+        vocal: 0.0,
+        bass_chroma: [0.0; TIMELINE_CHROMA_CLASSES],
+        chroma: [0.0; TIMELINE_CHROMA_CLASSES],
+    };
+    for bin in window {
+        avg.loudness += normalize_range(bin.loudness_db, -52.0, 0.0);
+        avg.bass += bin.band_energy[0].clamp(0.0, 1.0);
+        avg.brightness += bin.brightness;
+        avg.transient_density += bin.transient_density;
+        avg.vocal += bin.vocal_score;
+        for pc in 0..TIMELINE_CHROMA_CLASSES {
+            avg.bass_chroma[pc] += bin.bass_chroma[pc] * bin.bass_pitch_confidence;
+            avg.chroma[pc] += bin.chroma[pc] * bin.key_confidence;
+        }
+    }
+    avg.loudness /= count;
+    avg.bass /= count;
+    avg.brightness /= count;
+    avg.transient_density /= count;
+    avg.vocal /= count;
+    for pc in 0..TIMELINE_CHROMA_CLASSES {
+        avg.bass_chroma[pc] /= count;
+        avg.chroma[pc] /= count;
+    }
+    avg
+}
+
+fn l1_delta(a: &[f32; TIMELINE_CHROMA_CLASSES], b: &[f32; TIMELINE_CHROMA_CLASSES]) -> f32 {
+    a.iter().zip(b).map(|(a, b)| (a - b).abs()).sum::<f32>() / TIMELINE_CHROMA_CLASSES as f32
+}
+
 fn estimate_simple_beat_grid(bins: &[WaveformBin], duration_secs: f64, bin_secs: f64) -> BeatGrid {
     if bins.len() < 32 || bin_secs <= 0.0 {
         return BeatGrid::empty();
@@ -975,6 +1383,74 @@ mod tests {
         }
         let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
         assert!(analysis.bins.iter().any(|b| b.transient > 0.25));
+    }
+
+    #[test]
+    fn analysis_summarizes_transient_density() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let phase = i % 6_000;
+            let x = if phase < 140 {
+                let decay = 1.0 - phase as f32 / 140.0;
+                0.8 * decay
+            } else {
+                0.0
+            };
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let max_density = analysis
+            .bins
+            .iter()
+            .map(|b| b.transient_density)
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_density > 0.18, "max_density={max_density}");
+    }
+
+    #[test]
+    fn analysis_estimates_bass_pitch_class() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let t = i as f32 / 48_000.0;
+            let x = (std::f32::consts::TAU * 110.0 * t).sin() * 0.45;
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let best = analysis
+            .bins
+            .iter()
+            .max_by(|a, b| a.bass_pitch_confidence.total_cmp(&b.bass_pitch_confidence))
+            .expect("bin");
+
+        assert_eq!(best.bass_pitch_class, 9);
+        assert!(
+            best.bass_pitch_confidence > 0.15,
+            "confidence={}",
+            best.bass_pitch_confidence
+        );
+    }
+
+    #[test]
+    fn analysis_marks_local_feature_changes() {
+        let mut samples = Vec::new();
+        for i in 0..192_000 {
+            let t = i as f32 / 48_000.0;
+            let hz = if t < 2.0 { 110.0 } else { 660.0 };
+            let x = (std::f32::consts::TAU * hz * t).sin() * 0.36;
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let max_novelty = analysis
+            .bins
+            .iter()
+            .map(|b| b.novelty)
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_novelty > 0.16, "max_novelty={max_novelty}");
     }
 
     #[test]

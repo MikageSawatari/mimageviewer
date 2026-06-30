@@ -21,8 +21,8 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 const TIMELINE_WAVEFORM_H: f32 = 68.0;
-const TIMELINE_METRICS_H: f32 = 42.0;
-const TIMELINE_METRIC_LANE_COUNT: usize = 6;
+const TIMELINE_METRICS_H: f32 = 56.0;
+const TIMELINE_METRIC_LANE_COUNT: usize = 7;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
@@ -988,19 +988,21 @@ struct TimelineDrawStats {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimelineMetricKind {
     Loudness,
-    Bass,
+    BassRoot,
     Brightness,
-    Transient,
-    Center,
+    DrumDensity,
+    Key,
+    Change,
     Vocal,
 }
 
 const TIMELINE_METRIC_KINDS: [TimelineMetricKind; TIMELINE_METRIC_LANE_COUNT] = [
     TimelineMetricKind::Loudness,
-    TimelineMetricKind::Bass,
+    TimelineMetricKind::BassRoot,
     TimelineMetricKind::Brightness,
-    TimelineMetricKind::Transient,
-    TimelineMetricKind::Center,
+    TimelineMetricKind::DrumDensity,
+    TimelineMetricKind::Key,
+    TimelineMetricKind::Change,
     TimelineMetricKind::Vocal,
 ];
 
@@ -1265,8 +1267,9 @@ fn draw_timeline_metric_hover(
     );
 
     let label = format!(
-        "{} {:.0}%  {}  {}",
+        "{}{} {:.0}%  {}  {}",
         timeline_metric_name(kind),
+        timeline_metric_extra(kind, bin),
         value * 100.0,
         format_time(time_secs),
         timeline_metric_description(kind)
@@ -1502,7 +1505,7 @@ fn draw_timeline_metric_bins(
             bar_top,
             x1,
             lane_bottom,
-            timeline_metric_color(kind, value),
+            timeline_metric_color(kind, value, bin),
         );
         if idx > 0 {
             fill_rect_f32(
@@ -1522,10 +1525,16 @@ fn draw_timeline_metric_bins(
 fn timeline_metric_value(kind: TimelineMetricKind, bin: &WaveformBin) -> f32 {
     match kind {
         TimelineMetricKind::Loudness => timeline_loudness_value(bin),
-        TimelineMetricKind::Bass => normalize_range(bin.band_energy[0], 0.08, 0.58).powf(0.82),
-        TimelineMetricKind::Brightness => normalize_range(bin.band_energy[2], 0.16, 0.74),
-        TimelineMetricKind::Transient => bin.transient.clamp(0.0, 1.0),
-        TimelineMetricKind::Center => normalize_range(bin.center_ratio, 0.48, 0.88),
+        TimelineMetricKind::BassRoot => (bin.bass_pitch_confidence
+            * normalize_range(bin.band_energy[0], 0.06, 0.48))
+        .sqrt()
+        .clamp(0.0, 1.0),
+        TimelineMetricKind::Brightness => bin.brightness.clamp(0.0, 1.0),
+        TimelineMetricKind::DrumDensity => bin.transient_density.clamp(0.0, 1.0),
+        TimelineMetricKind::Key => {
+            (bin.key_confidence * timeline_loudness_value(bin).powf(0.72)).clamp(0.0, 1.0)
+        }
+        TimelineMetricKind::Change => bin.novelty.clamp(0.0, 1.0),
         TimelineMetricKind::Vocal => bin.vocal_score.clamp(0.0, 1.0),
     }
 }
@@ -1544,10 +1553,11 @@ fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
 fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::Loudness => "Loudness",
-        TimelineMetricKind::Bass => "Bass",
+        TimelineMetricKind::BassRoot => "Bass root",
         TimelineMetricKind::Brightness => "Brightness",
-        TimelineMetricKind::Transient => "Transient",
-        TimelineMetricKind::Center => "Center",
+        TimelineMetricKind::DrumDensity => "Drums",
+        TimelineMetricKind::Key => "Key",
+        TimelineMetricKind::Change => "Change",
         TimelineMetricKind::Vocal => "Vocal hint",
     }
 }
@@ -1555,22 +1565,54 @@ fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::Loudness => "RMS",
-        TimelineMetricKind::Bass => "Low energy",
-        TimelineMetricKind::Brightness => "High energy",
-        TimelineMetricKind::Transient => "Energy rise",
-        TimelineMetricKind::Center => "Stereo center",
+        TimelineMetricKind::BassRoot => "Low pitch color",
+        TimelineMetricKind::Brightness => "High tilt/change",
+        TimelineMetricKind::DrumDensity => "Transient density",
+        TimelineMetricKind::Key => "Chroma color",
+        TimelineMetricKind::Change => "Local feature delta",
         TimelineMetricKind::Vocal => "DSP vocal-like",
     }
 }
 
-fn timeline_metric_color(kind: TimelineMetricKind, value: f32) -> egui::Color32 {
+fn timeline_metric_extra(kind: TimelineMetricKind, bin: &WaveformBin) -> String {
+    match kind {
+        TimelineMetricKind::BassRoot if bin.bass_pitch_confidence > 0.08 => {
+            format!(" {}", pitch_class_name(bin.bass_pitch_class))
+        }
+        TimelineMetricKind::Key if bin.key_confidence > 0.08 => {
+            format!(" {}", pitch_class_name(bin.key_pitch_class))
+        }
+        _ => String::new(),
+    }
+}
+
+fn timeline_metric_color(kind: TimelineMetricKind, value: f32, bin: &WaveformBin) -> egui::Color32 {
     let value = value.clamp(0.0, 1.0);
     let base = match kind {
         TimelineMetricKind::Loudness => egui::Color32::from_rgb(205, 220, 92),
-        TimelineMetricKind::Bass => egui::Color32::from_rgb(220, 92, 52),
+        TimelineMetricKind::BassRoot if bin.bass_pitch_confidence > 0.08 => {
+            return color_with_alpha(
+                brighten_color(
+                    key_color(60 + bin.bass_pitch_class % 12, value),
+                    0.78 + value * 0.58,
+                ),
+                (50.0 + value * 174.0) as u8,
+            );
+        }
+        TimelineMetricKind::BassRoot => egui::Color32::from_rgb(190, 74, 46),
         TimelineMetricKind::Brightness => egui::Color32::from_rgb(86, 196, 246),
-        TimelineMetricKind::Transient => egui::Color32::from_rgb(252, 178, 48),
-        TimelineMetricKind::Center => egui::Color32::from_rgb(166, 128, 246),
+        TimelineMetricKind::DrumDensity => egui::Color32::from_rgb(252, 178, 48),
+        TimelineMetricKind::Key if bin.key_confidence > 0.08 => {
+            return color_with_alpha(
+                brighten_color(
+                    key_color(60 + bin.key_pitch_class % 12, value),
+                    0.72 + value * 0.52,
+                ),
+                (44.0 + value * 168.0) as u8,
+            );
+        }
+        TimelineMetricKind::Key => egui::Color32::from_rgb(78, 154, 132),
+        TimelineMetricKind::Change => egui::Color32::from_rgb(176, 116, 250),
         TimelineMetricKind::Vocal => egui::Color32::from_rgb(46, 224, 212),
     };
     color_with_alpha(
@@ -2381,6 +2423,13 @@ fn note_name_from_midi(midi: i32) -> String {
     format!("{}{}", NAMES[pitch_class], octave)
 }
 
+fn pitch_class_name(pitch_class: u8) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    NAMES[pitch_class as usize % 12]
+}
+
 fn is_black_key(midi: u8) -> bool {
     matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
 }
@@ -2800,7 +2849,13 @@ mod tests {
             loudness_db: -18.0,
             band_energy: [0.62, 0.18, 0.72],
             transient: 0.55,
-            center_ratio: 0.86,
+            transient_density: 0.58,
+            brightness: 0.64,
+            novelty: 0.48,
+            bass_pitch_class: 9,
+            bass_pitch_confidence: 0.82,
+            key_pitch_class: 0,
+            key_confidence: 0.70,
             vocal_score: 0.42,
             ..WaveformBin::default()
         };
@@ -2809,7 +2864,9 @@ mod tests {
             let value = timeline_metric_value(kind, &bin);
             assert!((0.0..=1.0).contains(&value), "{kind:?}={value}");
         }
-        assert!(timeline_metric_value(TimelineMetricKind::Bass, &bin) > 0.9);
+        assert!(timeline_metric_value(TimelineMetricKind::BassRoot, &bin) > 0.7);
+        assert!(timeline_metric_value(TimelineMetricKind::DrumDensity, &bin) > 0.5);
+        assert!(timeline_metric_value(TimelineMetricKind::Change, &bin) > 0.4);
         assert!(timeline_metric_value(TimelineMetricKind::Vocal, &bin) > 0.4);
     }
 
