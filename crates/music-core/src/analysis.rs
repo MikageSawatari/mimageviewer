@@ -13,6 +13,10 @@ const SPECTRUM_DB_FLOOR: f32 = -72.0;
 const SPECTRUM_DB_CEIL: f32 = -8.0;
 const SPECTRUM_DB_GAMMA: f32 = 1.65;
 const SPECTRUM_BLEND_HALF_OCTAVES: f32 = 0.14;
+const SPECTRUM_FAST_LOW_FULL_HZ: f32 = 48.0;
+const SPECTRUM_FAST_LOW_FADE_END_HZ: f32 = 78.0;
+const SPECTRUM_FAST_LOW_PRIMARY_SIZE: usize = 4_096;
+const SPECTRUM_FAST_LOW_ATTACK_SIZE: usize = 1_024;
 const VOCAL_PERIODICITY_TARGET_HZ: u32 = 8_000;
 const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
     MultiResolutionWindowSpec {
@@ -473,7 +477,7 @@ impl SpectrumAnalyzer {
 
     fn power_for_range(&self, center_hz: f32, low_hz: f32, high_hz: f32) -> f32 {
         let weights = self.window_weights(center_hz);
-        weights
+        let base = weights
             .into_iter()
             .map(|(idx, weight)| {
                 self.windows.get(idx).map_or(0.0, |window| {
@@ -481,7 +485,45 @@ impl SpectrumAnalyzer {
                 })
             })
             .sum::<f32>()
-            .max(0.0)
+            .max(0.0);
+
+        let fast_mix = fast_low_mix(center_hz);
+        if fast_mix <= 0.0 {
+            return base;
+        }
+
+        let fast = self.fast_low_power_for_range(center_hz, low_hz, high_hz);
+        (base * (1.0 - fast_mix) + fast * fast_mix).max(0.0)
+    }
+
+    fn fast_low_power_for_range(&self, center_hz: f32, low_hz: f32, high_hz: f32) -> f32 {
+        let primary = self
+            .largest_window_at_most(SPECTRUM_FAST_LOW_PRIMARY_SIZE)
+            .map(|window| {
+                let half_width = ((high_hz - low_hz) * 0.5).max(window.bin_hz * 0.75);
+                let fast_low = (center_hz - half_width).max(SPECTRUM_MIN_HZ * 0.5);
+                let fast_high = (center_hz + half_width).min(SPECTRUM_FAST_LOW_FADE_END_HZ * 1.4);
+                range_power_from_fft(&window.powers, window.bin_hz, fast_low, fast_high)
+            })
+            .unwrap_or(0.0);
+
+        let attack = self
+            .largest_window_at_most(SPECTRUM_FAST_LOW_ATTACK_SIZE)
+            .map(|window| {
+                let attack_low = SPECTRUM_MIN_HZ * 0.5;
+                let attack_high = SPECTRUM_FAST_LOW_FADE_END_HZ * 1.35;
+                range_power_from_fft(&window.powers, window.bin_hz, attack_low, attack_high)
+            })
+            .unwrap_or(primary);
+
+        primary.max(attack * 0.45)
+    }
+
+    fn largest_window_at_most(&self, size: usize) -> Option<&SpectrumFftWindow> {
+        self.windows
+            .iter()
+            .filter(|window| window.spec.size <= size)
+            .max_by_key(|window| window.spec.size)
     }
 
     fn window_weights(&self, hz: f32) -> Vec<(usize, f32)> {
@@ -510,6 +552,18 @@ impl SpectrumAnalyzer {
             }
         }
         vec![(idx, 1.0)]
+    }
+}
+
+fn fast_low_mix(hz: f32) -> f32 {
+    if hz <= SPECTRUM_FAST_LOW_FULL_HZ {
+        0.62
+    } else if hz >= SPECTRUM_FAST_LOW_FADE_END_HZ {
+        0.0
+    } else {
+        let t = (hz - SPECTRUM_FAST_LOW_FULL_HZ)
+            / (SPECTRUM_FAST_LOW_FADE_END_HZ - SPECTRUM_FAST_LOW_FULL_HZ);
+        0.62 * (1.0 - t.clamp(0.0, 1.0))
     }
 }
 
@@ -1066,5 +1120,12 @@ mod tests {
         );
         let a4 = (69 - spectrum.note_min_midi) as usize;
         assert!(spectrum.notes[a4] > 0.5);
+    }
+
+    #[test]
+    fn spectrum_low_bass_motion_blend_fades_out_before_low_mids() {
+        assert!(fast_low_mix(32.0) > 0.6);
+        assert!(fast_low_mix(60.0) > 0.0);
+        assert_eq!(fast_low_mix(90.0), 0.0);
     }
 }
