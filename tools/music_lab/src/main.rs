@@ -12,7 +12,7 @@ use music_core::{
     TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
 };
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::conv::IntoSample;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -26,6 +26,11 @@ const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
 const TIMELINE_ROW_SECS_CHOICES: [f64; 8] = [5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac"];
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac", "mp4", "m4v", "mov", "mkv", "webm",
+];
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
@@ -457,6 +462,7 @@ impl eframe::App for MusicLabApp {
         self.frame_stats.record_frame();
 
         let stage_start = Instant::now();
+        self.handle_dropped_files(ctx);
         self.poll_loader(ctx);
         self.poll_spectrum_analyzer(ctx);
         self.frame_stats.record_poll(stage_start.elapsed());
@@ -521,10 +527,9 @@ impl MusicLabApp {
                 ui.horizontal_centered(|ui| {
                     if ui.button("Open").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(
-                                "Audio",
-                                &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac"],
-                            )
+                            .add_filter("Media", MEDIA_EXTENSIONS)
+                            .add_filter("Audio", AUDIO_EXTENSIONS)
+                            .add_filter("Video", VIDEO_EXTENSIONS)
                             .pick_file()
                         {
                             self.start_load(path);
@@ -709,7 +714,7 @@ impl MusicLabApp {
                     ));
                     ui.label(format!("Log: {}", self.frame_stats.log_path().display()));
                 } else {
-                    ui.label("Open an audio file to inspect it.");
+                    ui.label("Open or drop an audio/video file to inspect its audio track.");
                 }
             });
     }
@@ -733,6 +738,21 @@ impl MusicLabApp {
                     &mut self.spectrum_note_trail,
                 );
             });
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
+        let Some(path) = dropped_files.into_iter().find_map(|file| file.path) else {
+            return;
+        };
+        if is_supported_media_path(&path) {
+            self.start_load(path);
+        } else {
+            self.load_status = format!(
+                "Unsupported drop: {} (audio/video files only)",
+                path.display()
+            );
+        }
     }
 
     fn start_load(&mut self, path: PathBuf) {
@@ -921,7 +941,7 @@ fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
             ui.heading("Music lab");
-            ui.label("Open an audio file to test the thirty-second-row music view.");
+            ui.label("Open or drop an audio/video file to test the music timeline.");
             if !status.is_empty() {
                 ui.label(status);
             }
@@ -1914,6 +1934,17 @@ fn color_with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
+fn is_supported_media_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+            MEDIA_EXTENSIONS
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&ext))
+        })
+}
+
 fn decode_audio_file(path: &Path) -> Result<DecodedAudio, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -1931,11 +1962,31 @@ fn decode_audio_file(path: &Path) -> Result<DecodedAudio, String> {
         .map_err(|e| format!("probe: {e}"))?;
     let mut format = probed.format;
     let track = format
-        .default_track()
-        .ok_or_else(|| "no default audio track".to_string())?;
+        .tracks()
+        .iter()
+        .find(|track| {
+            track.codec_params.codec != CODEC_TYPE_NULL
+                && track.codec_params.sample_rate.is_some()
+                && track.codec_params.channels.is_some()
+        })
+        .or_else(|| {
+            format.tracks().iter().find(|track| {
+                track.codec_params.codec != CODEC_TYPE_NULL
+                    && (track.codec_params.sample_rate.is_some()
+                        || track.codec_params.channels.is_some())
+            })
+        })
+        .or_else(|| {
+            format
+                .tracks()
+                .iter()
+                .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+        })
+        .ok_or_else(|| "no supported audio track".to_string())?;
     let track_id = track.id;
+    let codec_params = track.codec_params.clone();
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
     let mut stereo_samples = Vec::new();
