@@ -7,6 +7,7 @@ use crate::beat::BeatGrid;
 
 pub const SPECTRUM_NOTE_MIN_MIDI: u8 = 21;
 pub const SPECTRUM_NOTE_MAX_MIDI: u8 = 108;
+pub const TIMELINE_ANALYSIS_VERSION: u32 = 1;
 const SPECTRUM_MIN_HZ: f32 = 20.0;
 const SPECTRUM_DISPLAY_MAX_HZ: f32 = 18_000.0;
 const SPECTRUM_DB_FLOOR: f32 = -72.0;
@@ -167,12 +168,47 @@ pub struct WaveformBin {
     pub chroma: [f32; TIMELINE_CHROMA_CLASSES],
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimelineAnalysis {
+    #[serde(default)]
+    pub analysis_version: u32,
     pub stream: AudioStreamInfo,
     pub config: AnalysisConfig,
     pub bins: Vec<WaveformBin>,
     pub beat_grid: BeatGrid,
+}
+
+impl Default for TimelineAnalysis {
+    fn default() -> Self {
+        Self {
+            analysis_version: TIMELINE_ANALYSIS_VERSION,
+            stream: AudioStreamInfo::default(),
+            config: AnalysisConfig::default(),
+            bins: Vec::new(),
+            beat_grid: BeatGrid::empty(),
+        }
+    }
+}
+
+impl TimelineAnalysis {
+    pub fn new(
+        stream: AudioStreamInfo,
+        config: AnalysisConfig,
+        bins: Vec<WaveformBin>,
+        beat_grid: BeatGrid,
+    ) -> Self {
+        Self {
+            analysis_version: TIMELINE_ANALYSIS_VERSION,
+            stream,
+            config,
+            bins,
+            beat_grid,
+        }
+    }
+
+    pub fn is_current_version(&self) -> bool {
+        self.analysis_version == TIMELINE_ANALYSIS_VERSION
+    }
 }
 
 pub fn analyze_stereo_timeline(
@@ -329,8 +365,8 @@ pub fn analyze_stereo_timeline(
 
     let beat_grid = estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs);
 
-    TimelineAnalysis {
-        stream: AudioStreamInfo {
+    TimelineAnalysis::new(
+        AudioStreamInfo {
             sample_rate,
             channels: 2,
             duration_secs,
@@ -338,7 +374,7 @@ pub fn analyze_stereo_timeline(
         config,
         bins,
         beat_grid,
-    }
+    )
 }
 
 pub fn resample_linear_stereo(input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
@@ -1396,8 +1432,29 @@ mod tests {
             samples.extend([x, x]);
         }
         let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        assert_eq!(analysis.analysis_version, TIMELINE_ANALYSIS_VERSION);
+        assert!(analysis.is_current_version());
         assert!(!analysis.bins.is_empty());
         assert!(analysis.bins.iter().any(|b| b.peak > 0.5));
+    }
+
+    #[test]
+    fn timeline_analysis_default_uses_current_version() {
+        let analysis = TimelineAnalysis::default();
+
+        assert_eq!(analysis.analysis_version, TIMELINE_ANALYSIS_VERSION);
+        assert!(analysis.is_current_version());
+        assert_eq!(analysis.beat_grid.time_signature_numerator, 4);
+    }
+
+    #[test]
+    fn timeline_analysis_detects_stale_version() {
+        let analysis = TimelineAnalysis {
+            analysis_version: TIMELINE_ANALYSIS_VERSION.saturating_sub(1),
+            ..TimelineAnalysis::default()
+        };
+
+        assert!(!analysis.is_current_version());
     }
 
     #[test]

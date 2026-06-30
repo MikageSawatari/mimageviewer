@@ -12,8 +12,8 @@ pub mod timeline;
 
 pub use analysis::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI,
-    SpectrumAnalysis, SpectrumAnalyzer, TimelineAnalysis, WaveformBin, analyze_stereo_timeline,
-    resample_linear_stereo, spectrum_analysis_from_stereo_window,
+    SpectrumAnalysis, SpectrumAnalyzer, TIMELINE_ANALYSIS_VERSION, TimelineAnalysis, WaveformBin,
+    analyze_stereo_timeline, resample_linear_stereo, spectrum_analysis_from_stereo_window,
     spectrum_bands_from_stereo_window,
 };
 pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};

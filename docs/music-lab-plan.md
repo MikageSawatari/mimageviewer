@@ -121,10 +121,24 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
      - 5 段階 FFT は高域を高頻度、低域を低頻度で更新し、直近結果を合成して描画する
    - Top bar に FPS / frame ms を表示して描画負荷を確認する
 
+## 解析結果データ契約
+
+- `TimelineAnalysis.analysis_version` は `music-core::TIMELINE_ANALYSIS_VERSION` と一致する結果だけを現行キャッシュとして扱う。
+- `TimelineAnalysis::default()` と `analyze_stereo_timeline()` は常に現行 `analysis_version` を入れる。古い serialized cache に `analysis_version` が無い場合は `0` 扱いになり、現行結果としては採用しない。
+- `WaveformBin` は表示に必要な時系列メトリクスを 1 bin に集約する:
+  - 波形/音量: `peak`, `rms`, `loudness_db`
+  - DJ 風カラー波形: `band_energy`, `transient`, `transient_band`
+  - 構成ヒント: `brightness`, `transient_density`, `novelty`
+  - 音程ヒント: `bass_pitch_class`, `bass_pitch_confidence`, `key_pitch_class`, `key_confidence`, `bass_chroma`, `chroma`
+  - ボーカル試作値: `center_ratio`, `vocal_score`
+- `BeatGrid` は `TimelineAnalysis` に含める。低 confidence の自動推定は表示側で隠せるが、キャッシュ上は推定結果と confidence を保持する。
+- Row 秒数や表示幅は解析結果に含めず、表示時の row texture raster 条件として扱う。Row 切替は解析キャッシュの再生成条件にしない。
+- 本体統合時の DB key は path / size / mtime / duration / sample_rate / channels / `analysis_version` を最低限の一致条件にする。
+
 ## 本体統合時の注意
 
 - 解析 / DB / waveform 生成は UI thread で行わない。
-- 解析結果は `audio_analysis.db` へ path + size + mtime + analysis_version で保存する。
+- 解析結果は `audio_analysis.db` へ path + size + mtime + duration + sample_rate + channels + analysis_version で保存する。
 - 小節頭と BPM は誤検出がある前提で、手動補正を永続化する。
 - lab の簡易ビート推定は低信頼度ならグリッドを描かず、本体統合時は
   beat/downbeat 専用エンジンか手動補正 UI に置き換える。

@@ -10,7 +10,8 @@ use eframe::egui;
 use music_core::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, MusicBookmark, PlaybackSnapshot,
     SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
-    TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
+    TIMELINE_ANALYSIS_VERSION, TimelineAnalysis, WaveformBin, analyze_stereo_timeline,
+    resample_linear_stereo,
 };
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -992,6 +993,15 @@ impl MusicLabApp {
                     ui.label(format!("Channels: {}", track.decoded.info.channels));
                     ui.label(format!("Wave bins: {}", track.analysis.bins.len()));
                     ui.label(format!(
+                        "Analysis: v{}{}",
+                        track.analysis.analysis_version,
+                        if track.analysis.is_current_version() {
+                            ""
+                        } else {
+                            " (stale)"
+                        }
+                    ));
+                    ui.label(format!(
                         "Row: {}",
                         format_row_secs(self.timeline_row_secs())
                     ));
@@ -1052,6 +1062,10 @@ impl MusicLabApp {
                     ));
                     if let Some(partial) = &self.partial_analysis {
                         ui.label(format!("Wave bins: {} loaded", partial.bins.len()));
+                        ui.label(format!(
+                            "Analysis: v{} / current v{}",
+                            partial.analysis_version, TIMELINE_ANALYSIS_VERSION
+                        ));
                     } else {
                         ui.label("Wave bins: analyzing");
                     }
