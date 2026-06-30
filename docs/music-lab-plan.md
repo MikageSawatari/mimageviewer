@@ -136,6 +136,51 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
 - Row 秒数や表示幅は解析結果に含めず、表示時の row texture raster 条件として扱う。Row 切替は解析キャッシュの再生成条件にしない。
 - 本体統合時の DB key は path / size / mtime / duration / sample_rate / channels / `analysis_version` を最低限の一致条件にする。
 
+## 本体統合用の非同期境界
+
+music lab の非同期処理は、mIV 本体の `docs/async-architecture.md` と同じく
+「UI thread は状態反映と少量の GPU upload だけ」に寄せる。本体統合時は lab 固有の
+`cpal` 簡易プレイヤーを動画音声 engine へ置き換えるが、worker / channel / cancel の境界は
+以下を維持する。
+
+| 境界 | 入力 | 出力 | UI thread の責務 | 本体統合時の接続先 |
+| --- | --- | --- | --- | --- |
+| probe / decode / timeline analysis worker | path, cancel token, streaming sink | `Probed`, `PartialTimeline`, `Loaded`, `Failed` | 受信を 1 frame 上限件数で処理し、部分解析を merge、該当 row version だけ invalidate | 動画 decode / audio pump 由来の PCM を同じ analysis worker へ渡す |
+| streaming playback buffer | decode 済み PCM chunk, seek/play state | `PlaybackSnapshot` (`decoded_secs`, `buffer_ahead_secs`, `underrun_count`) | 右パネルと perf log に表示するだけ。音声出力 callback や VST を直接触らない | 既存 video audio pump / normalize / VST3 PDC 計測へ接続 |
+| timeline row raster worker | `TimelineAnalysis`, row index, row seconds, texture cache key, row version | row `ColorImage` | 完成 row を 1 frame 少量ずつ texture upload。古い key / generation / row version の結果は捨てる | mIV 側でも GPU texture は transient cache。DB には保存しない |
+| spectrum worker | 再生位置周辺の短い PCM window, sample rate | spectrum bands / piano highlight / compute ms | 最新結果を表示し、pending 中は古い結果を保持。全尺 timeline 完了を待たせない | realtime analyzer として維持。永続化対象外 |
+
+### stale / cancel ルール
+
+- 新しいファイルを開いたら、旧 loader と旧 raster worker に cancel を立て、旧 `LoadMsg` は
+  path / generation / key の一致で捨てる。
+- `PartialTimeline` は確定済み row texture を即破棄せず、該当 row の `row_version` だけを上げる。
+  worker が新しい row を返すまでは古い texture を残し、ロード中の黒待ちを避ける。
+- Row 秒数、表示幅、theme、解析結果 pointer が変わる変更は `TimelineTextureCacheKey` を変え、
+  raster worker generation を進めて古い結果を破棄する。
+- worker result は UI が最後に採用した cache key / row version より古ければ適用しない。
+  部分解析と Row 切替が同時に走っても、UI thread 側の採用判定を最終防衛線にする。
+
+### 優先度とペーシング
+
+- loader message は 1 frame あたり上限件数だけ処理する。decode が速くても UI thread で
+  `PartialTimeline` を無制限 merge しない。
+- row texture upload は 1 frame あたり少数に制限する。Row 10m などの大きな切替では、
+  再生カーソル行、可視範囲、近傍 row の順に raster request を出す。
+- spectrum worker は全尺解析と独立させる。長尺ロード中でも再生バッファから短い window が取れるなら
+  下段 analyzer を動かし続ける。
+- `ctx.request_repaint_after(...)` は pending worker / pending raster / 再生中のときだけ使い、
+  待ちが無い状態で不要な busy repaint を増やさない。
+
+### 永続化とキャッシュ
+
+- 永続化するのは `TimelineAnalysis` とユーザー補正値だけにする。row texture、spectrum frame、
+  piano highlight、playback buffer はセッション内の transient state とする。
+- `TimelineAnalysis` の DB record には path / size / mtime / duration / sample_rate / channels /
+  `analysis_version` を含める。hit しても `analysis_version` が古ければ worker で再解析する。
+- mIV 本体の音声ノーマライズ、VST3 chain、動画の音声モードは playback adapter 側の責務であり、
+  `music-core` の timeline analysis 型へ混ぜない。
+
 ## 本体統合時の注意
 
 - 解析 / DB / waveform 生成は UI thread で行わない。
