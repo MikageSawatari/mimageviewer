@@ -26,11 +26,14 @@ const TIMELINE_LOUDNESS_H: f32 = 18.0;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
+const TIMELINE_ROW_SECS_CHOICES: [f64; 8] = [5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
+const SPECTRUM_VIEW_MIN_HZ: f32 = 40.0;
+const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(2);
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
@@ -77,7 +80,39 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
-    ctx.set_visuals(egui::Visuals::dark());
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = app_panel_bg();
+    visuals.window_fill = app_panel_bg();
+    visuals.extreme_bg_color = app_bg();
+    visuals.faint_bg_color = egui::Color32::from_rgb(10, 12, 14);
+    visuals.widgets.noninteractive.bg_fill = app_panel_bg();
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(20, 23, 26);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 39, 44);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(45, 52, 58);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(40, 94, 150);
+    visuals.override_text_color = Some(egui::Color32::from_rgb(222, 226, 230));
+    ctx.set_visuals(visuals);
+}
+
+fn app_bg() -> egui::Color32 {
+    egui::Color32::BLACK
+}
+
+fn app_panel_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(6, 8, 10)
+}
+
+fn app_soft_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(10, 13, 16)
+}
+
+fn app_panel_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(app_panel_bg())
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(76, 92, 108, 95),
+        ))
 }
 
 struct LoadedTrack {
@@ -289,6 +324,7 @@ struct TimelineTextureCacheKey {
     waveform_h_px: usize,
     gap_px: usize,
     loudness_h_px: usize,
+    row_secs_millis: u32,
     rows: usize,
     bins_len: usize,
     dark: bool,
@@ -372,12 +408,15 @@ struct MusicLabApp {
     selected_bookmark: Option<u64>,
     spectrum_bands: Vec<f32>,
     spectrum_trail: Vec<f32>,
+    spectrum_prev_bands: Vec<f32>,
+    spectrum_onsets: Vec<f32>,
     spectrum_notes: Vec<f32>,
     spectrum_note_trail: Vec<f32>,
     spectrum_rx: Option<mpsc::Receiver<SpectrumMsg>>,
     spectrum_pending: bool,
     last_spectrum_request: Option<Instant>,
     timeline_cache: TimelineTextureCache,
+    timeline_row_secs: f64,
     frame_stats: FrameStats,
 }
 
@@ -412,19 +451,23 @@ impl eframe::App for MusicLabApp {
         let track = self.track.as_ref();
         let player = self.player.as_ref();
         let snap = self.player_snapshot();
+        let row_secs = self.timeline_row_secs();
         let load_status = self.load_status.clone();
         let timeline_cache = &mut self.timeline_cache;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(track) = track {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        timeline_stats = draw_timeline(ui, track, player, snap, timeline_cache);
-                    });
-            } else {
-                draw_empty_state(ui, &load_status);
-            }
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(app_bg()))
+            .show(ctx, |ui| {
+                if let Some(track) = track {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            timeline_stats =
+                                draw_timeline(ui, track, player, snap, timeline_cache, row_secs);
+                        });
+                } else {
+                    draw_empty_state(ui, &load_status);
+                }
+            });
         self.frame_stats
             .record_central(stage_start.elapsed(), timeline_stats);
         self.frame_stats.record_update(update_start.elapsed());
@@ -442,6 +485,7 @@ impl MusicLabApp {
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("music_lab_top")
             .exact_height(48.0)
+            .frame(app_panel_frame())
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     if ui.button("Open").clicked() {
@@ -491,6 +535,19 @@ impl MusicLabApp {
                         ui.label("FX: lab no-op boundary");
                     }
                     ui.separator();
+                    let mut row_secs = self.timeline_row_secs();
+                    egui::ComboBox::from_id_salt("music_lab_row_secs")
+                        .selected_text(format!("Row {}", format_row_secs(row_secs)))
+                        .show_ui(ui, |ui| {
+                            for choice in TIMELINE_ROW_SECS_CHOICES {
+                                ui.selectable_value(&mut row_secs, choice, format_row_secs(choice));
+                            }
+                        });
+                    if (row_secs - self.timeline_row_secs()).abs() > f64::EPSILON {
+                        self.timeline_row_secs = row_secs;
+                        self.timeline_cache.clear();
+                    }
+                    ui.separator();
                     ui.label(format!(
                         "FPS {:.1}  {:.1} ms  UI {:.1} C {:.1} B {:.1} raster {} miss {}",
                         self.frame_stats.fps,
@@ -521,6 +578,7 @@ impl MusicLabApp {
         egui::SidePanel::left("music_lab_left")
             .resizable(true)
             .default_width(220.0)
+            .frame(app_panel_frame())
             .show(ctx, |ui| {
                 ui.heading("Bookmarks");
                 if ui
@@ -557,6 +615,7 @@ impl MusicLabApp {
         egui::SidePanel::right("music_lab_right")
             .resizable(true)
             .default_width(260.0)
+            .frame(app_panel_frame())
             .show(ctx, |ui| {
                 ui.heading("Details");
                 if let Some(track) = &self.track {
@@ -572,6 +631,10 @@ impl MusicLabApp {
                     ));
                     ui.label(format!("Channels: {}", track.decoded.info.channels));
                     ui.label(format!("Wave bins: {}", track.analysis.bins.len()));
+                    ui.label(format!(
+                        "Row: {}",
+                        format_row_secs(self.timeline_row_secs())
+                    ));
                     if let Some(bpm) = track.analysis.beat_grid.bpm {
                         let grid_visible =
                             track.analysis.beat_grid.confidence >= BEAT_GRID_MIN_CONFIDENCE;
@@ -623,6 +686,7 @@ impl MusicLabApp {
     fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("music_lab_bottom")
             .exact_height(190.0)
+            .frame(app_panel_frame())
             .show(ctx, |ui| {
                 if self.track.is_none() {
                     ui.centered_and_justified(|ui| ui.label("Spectrum analyzer placeholder"));
@@ -632,6 +696,8 @@ impl MusicLabApp {
                     ui,
                     &self.spectrum_bands,
                     &mut self.spectrum_trail,
+                    &mut self.spectrum_prev_bands,
+                    &mut self.spectrum_onsets,
                     &self.spectrum_notes,
                     &mut self.spectrum_note_trail,
                 );
@@ -644,6 +710,8 @@ impl MusicLabApp {
         self.track = None;
         self.spectrum_bands.clear();
         self.spectrum_trail.clear();
+        self.spectrum_prev_bands.clear();
+        self.spectrum_onsets.clear();
         self.spectrum_notes.clear();
         self.spectrum_note_trail.clear();
         self.spectrum_rx = None;
@@ -775,6 +843,14 @@ impl MusicLabApp {
             .map(LabPlayer::snapshot)
             .unwrap_or_default()
     }
+
+    fn timeline_row_secs(&self) -> f64 {
+        if self.timeline_row_secs > 0.0 {
+            self.timeline_row_secs
+        } else {
+            30.0
+        }
+    }
 }
 
 fn perf_log_path() -> PathBuf {
@@ -806,9 +882,10 @@ fn draw_timeline(
     player: Option<&LabPlayer>,
     snap: PlaybackSnapshot,
     cache: &mut TimelineTextureCache,
+    row_secs: f64,
 ) -> TimelineDrawStats {
     let mut stats = TimelineDrawStats::default();
-    let row_secs = track.analysis.config.row_secs.max(1.0);
+    let row_secs = row_secs.max(1.0);
     let rows = (track.decoded.info.duration_secs / row_secs)
         .ceil()
         .max(1.0) as usize;
@@ -818,7 +895,7 @@ fn draw_timeline(
     let available = egui::vec2(ui.available_width(), ui.available_height().max(content_h));
     let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+    painter.rect_filled(rect, 0.0, app_bg());
 
     let label_w = 56.0;
     let graph_rect = egui::Rect::from_min_max(
@@ -836,6 +913,7 @@ fn draw_timeline(
         waveform_h_px,
         gap_px,
         loudness_h_px,
+        row_secs_millis: (row_secs * 1000.0).round() as u32,
         rows,
         bins_len: track.analysis.bins.len(),
         dark: ui.visuals().dark_mode,
@@ -916,7 +994,7 @@ fn render_timeline_row_image(
 ) -> (egui::ColorImage, usize) {
     let height = waveform_h + gap_h + loudness_h;
     let bg = if dark {
-        egui::Color32::from_rgb(18, 22, 24)
+        app_soft_bg()
     } else {
         egui::Color32::from_rgb(238, 241, 243)
     };
@@ -1371,6 +1449,8 @@ fn draw_spectrum(
     ui: &mut egui::Ui,
     bands: &[f32],
     trail: &mut Vec<f32>,
+    prev_bands: &mut Vec<f32>,
+    onsets: &mut Vec<f32>,
     notes: &[f32],
     note_trail: &mut Vec<f32>,
 ) {
@@ -1416,10 +1496,21 @@ fn draw_spectrum(
         trail.clear();
         trail.resize(bands.len(), 0.0);
     }
+    if prev_bands.len() != bands.len() {
+        prev_bands.clear();
+        prev_bands.extend_from_slice(bands);
+    }
+    if onsets.len() != bands.len() {
+        onsets.clear();
+        onsets.resize(bands.len(), 0.0);
+    }
 
     let band_w = plot.width() / bands.len() as f32;
     for (i, value) in bands.iter().enumerate() {
         let value = value.clamp(0.0, 1.0);
+        let rise = (value - prev_bands[i]).max(0.0);
+        onsets[i] = (onsets[i] * 0.86).max((rise * 2.8).clamp(0.0, 1.0));
+        prev_bands[i] = prev_bands[i] * 0.25 + value * 0.75;
         trail[i] = (trail[i] * SPECTRUM_TRAIL_DECAY).max(value);
         let x0 = plot.left() + i as f32 * band_w + 0.25;
         let x1 = (plot.left() + (i + 1) as f32 * band_w - 0.25)
@@ -1443,6 +1534,20 @@ fn draw_spectrum(
             1.0,
             spectrum_color(i, bands.len(), value),
         );
+        let onset = onsets[i].clamp(0.0, 1.0);
+        if onset > 0.025 {
+            let cap_h = (2.0 + onset * 12.0).min(plot.height() * 0.18);
+            let y = plot.bottom() - 2.0 - h;
+            let accent = brighten_color(spectrum_color(i, bands.len(), value.max(onset)), 1.45);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, (y - cap_h).max(plot.top())),
+                    egui::pos2(x1, (y + 1.5).min(plot.bottom())),
+                ),
+                1.0,
+                color_with_alpha(accent, (82.0 + onset * 150.0) as u8),
+            );
+        }
     }
     draw_pitch_keyboard(&painter, keyboard_rect, notes, note_trail);
 }
@@ -1460,12 +1565,6 @@ fn draw_pitch_keyboard(
         note_trail.resize(note_count, 0.0);
     }
 
-    let white_keys = (SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI)
-        .filter(|midi| !is_black_key(*midi))
-        .count()
-        .max(1);
-    let white_w = rect.width() / white_keys as f32;
-    let mut white_index = 0usize;
     for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
         if is_black_key(midi) {
             continue;
@@ -1473,11 +1572,13 @@ fn draw_pitch_keyboard(
         let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
         let value = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         note_trail[idx] = (note_trail[idx] * 0.965).max(value);
-        let x0 = rect.left() + white_index as f32 * white_w;
-        let x1 = rect.left() + (white_index + 1) as f32 * white_w;
+        let (x0, x1) = note_axis_range(rect, midi);
+        if x1 <= rect.left() || x0 >= rect.right() {
+            continue;
+        }
         let key_rect = egui::Rect::from_min_max(
-            egui::pos2(x0 + 0.25, rect.top()),
-            egui::pos2(x1 - 0.25, rect.bottom()),
+            egui::pos2(x0.max(rect.left()) + 0.25, rect.top()),
+            egui::pos2(x1.min(rect.right()) - 0.25, rect.bottom()),
         );
         let base = egui::Color32::from_rgb(218, 222, 224);
         let active = key_color(midi, note_trail[idx]);
@@ -1493,25 +1594,23 @@ fn draw_pitch_keyboard(
             egui::Stroke::new(0.75, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120)),
             egui::StrokeKind::Inside,
         );
-        white_index += 1;
     }
 
-    let black_w = white_w * 0.58;
     let black_h = rect.height() * 0.64;
     for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
         if !is_black_key(midi) {
             continue;
         }
-        let Some(left_white_count) = white_keys_before(midi) else {
-            continue;
-        };
         let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
         let value = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         note_trail[idx] = (note_trail[idx] * 0.965).max(value);
-        let x = rect.left() + left_white_count as f32 * white_w;
+        let (x0, x1) = note_axis_range(rect, midi);
+        if x1 <= rect.left() || x0 >= rect.right() {
+            continue;
+        }
         let key_rect = egui::Rect::from_min_max(
-            egui::pos2(x - black_w * 0.5, rect.top()),
-            egui::pos2(x + black_w * 0.5, rect.top() + black_h),
+            egui::pos2(x0.max(rect.left()) + 0.35, rect.top()),
+            egui::pos2(x1.min(rect.right()) - 0.35, rect.top() + black_h),
         );
         let base = egui::Color32::from_rgb(18, 20, 22);
         let active = key_color(midi, note_trail[idx]);
@@ -1529,15 +1628,24 @@ fn draw_pitch_keyboard(
     }
 }
 
-fn white_keys_before(midi: u8) -> Option<usize> {
-    if midi <= SPECTRUM_NOTE_MIN_MIDI {
-        return None;
-    }
-    Some(
-        (SPECTRUM_NOTE_MIN_MIDI..midi)
-            .filter(|candidate| !is_black_key(*candidate))
-            .count(),
+fn note_axis_range(rect: egui::Rect, midi: u8) -> (f32, f32) {
+    let hz = midi_to_hz(midi);
+    let half = 2.0_f32.powf(1.0 / 24.0);
+    (
+        spectrum_axis_x(rect, hz / half),
+        spectrum_axis_x(rect, hz * half),
     )
+}
+
+fn spectrum_axis_x(rect: egui::Rect, hz: f32) -> f32 {
+    let min = SPECTRUM_VIEW_MIN_HZ;
+    let max = SPECTRUM_VIEW_MAX_HZ;
+    let t = (hz.clamp(min, max).log2() - min.log2()) / (max.log2() - min.log2());
+    rect.left() + t.clamp(0.0, 1.0) * rect.width()
+}
+
+fn midi_to_hz(midi: u8) -> f32 {
+    440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
 }
 
 fn is_black_key(midi: u8) -> bool {
@@ -1867,5 +1975,18 @@ fn format_time(secs: f64) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+fn format_row_secs(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.0}s")
+    } else {
+        let minutes = secs / 60.0;
+        if minutes.fract().abs() <= f64::EPSILON {
+            format!("{minutes:.0}m")
+        } else {
+            format!("{minutes:.1}m")
+        }
     }
 }

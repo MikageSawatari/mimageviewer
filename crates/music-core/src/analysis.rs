@@ -7,9 +7,9 @@ pub const SPECTRUM_NOTE_MIN_MIDI: u8 = 21;
 pub const SPECTRUM_NOTE_MAX_MIDI: u8 = 108;
 const SPECTRUM_MIN_HZ: f32 = 40.0;
 const SPECTRUM_DISPLAY_MAX_HZ: f32 = 18_000.0;
-const SPECTRUM_DB_FLOOR: f32 = -78.0;
-const SPECTRUM_DB_CEIL: f32 = -12.0;
-const SPECTRUM_DB_GAMMA: f32 = 1.35;
+const SPECTRUM_DB_FLOOR: f32 = -72.0;
+const SPECTRUM_DB_CEIL: f32 = -8.0;
+const SPECTRUM_DB_GAMMA: f32 = 1.65;
 const SPECTRUM_BLEND_HALF_OCTAVES: f32 = 0.14;
 const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
     MultiResolutionWindowSpec {
