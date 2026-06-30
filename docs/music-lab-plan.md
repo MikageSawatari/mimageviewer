@@ -64,6 +64,8 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
     次の改善候補は formant 風の中域包絡や YAMNet / PANNs sidecar との比較。
   - DSP の調整は [music-lab-vocal-eval.md](music-lab-vocal-eval.md) の教師ラベル JSON と
     `cargo run -p music_lab --bin vocal_eval -- labels.json` で precision / recall を見ながら進める。
+    教師ラベルは手入力を正本にせず、まず `tools/music_lab/scripts/demucs_vocal_teacher.py`
+    で外部 Demucs vocal stem 由来の JSON を生成し、耳で確認してから DSP の評価に使う。
   - All-In-One の demixed vocal stem や embeddings を利用できるか評価する。
   - Demucs / htdemucs は MIT だが重いため、必要なら任意のバックグラウンド高精度解析として扱う。
   - inaSpeechSegmenter は MIT だが singing voice は music 扱いなので、歌あり区間の検出にはそのまま使わない。

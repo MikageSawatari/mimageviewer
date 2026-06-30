@@ -30,7 +30,53 @@ Use a JSON file with one or more tracks:
   noise, or model-generated labels that should not count as either positive or
   negative.
 
-## Run
+## Generate Teacher Labels
+
+Teacher labels should normally be generated from a stronger external tool rather
+than authored from scratch by hand. For the first lab pass, use Demucs to create
+a vocal stem and convert the stem envelope into `vocal` intervals:
+
+```powershell
+$venv = "$env:TEMP\miv_demucs_venv"
+python -m venv --system-site-packages $venv
+& "$venv\Scripts\python.exe" -m pip install demucs soundfile
+& "$venv\Scripts\python.exe" tools/music_lab/scripts/demucs_vocal_teacher.py `
+  "C:\path\to\song-or-video.mp4" `
+  --out "$env:TEMP\miv_music_eval\song.demucs_teacher.json" `
+  --work-dir "$env:TEMP\miv_music_eval" `
+  --reuse
+```
+
+The helper intentionally runs outside the Rust application. Demucs, PyTorch,
+model weights, and Python runtime dependencies are only used to generate local
+teacher data and are not bundled with mIV.
+
+`demucs_vocal_teacher.py` writes:
+
+- `metadata.source_media`: original file used to create the teacher data.
+- `metadata.evaluation_audio`: extracted WAV used for repeatable evaluation.
+- `metadata.vocal_stem`: generated vocal stem.
+- `tracks[0].vocal`: generated vocal intervals.
+- `tracks[0].ignore`: small boundary spans excluded from scoring.
+
+When `vocal_eval` has trouble opening a Unicode-heavy video path on Windows, run
+the generator with `--track-path extracted`. The label JSON then points to the
+extracted WAV while keeping the original source path in metadata:
+
+```powershell
+& "$venv\Scripts\python.exe" tools/music_lab/scripts/demucs_vocal_teacher.py `
+  "C:\path\to\song-or-video.mp4" `
+  --out "$env:TEMP\miv_music_eval\song.demucs_teacher.eval_wav.json" `
+  --work-dir "$env:TEMP\miv_music_eval" `
+  --track-path extracted `
+  --reuse
+```
+
+Thresholds such as `--vocal-db` and `--ratio-db` are part of the teacher-data
+conversion from vocal stem to intervals. If the generated spans are too broad or
+too sparse, regenerate the JSON with adjusted thresholds and compare by ear.
+
+## Run Evaluation
 
 Copy `tools/music_lab/vocal_eval.example.json`, replace `path` and `vocal`
 spans, then run:
@@ -56,15 +102,15 @@ more than short boundary errors.
 
 ## Teacher Data Policy
 
-External high-accuracy tools can be used to create or draft the label JSON,
+External high-accuracy tools should be used to create or draft the label JSON,
 including tools that are not suitable for bundling with mIV. The important
 boundary is that their code, model weights, and generated runtime dependencies
 are not linked into or redistributed with mIV.
 
 Recommended workflow:
 
-1. Create coarse labels by hand or with an external model.
-2. Put uncertain boundaries in `ignore`.
+1. Generate coarse labels with an external model.
+2. Check the generated spans by ear and put uncertain boundaries in `ignore`.
 3. Run `vocal_eval` and record threshold metrics.
 4. Tune the DSP detector.
 5. Re-run the same labels to verify whether precision / recall actually moved.
