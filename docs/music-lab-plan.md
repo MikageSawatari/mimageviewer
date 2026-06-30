@@ -97,6 +97,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
      - Bass root / Key は 12 音の pitch class を五度圏カラーで表示し、オクターブ違いは同じ色にする
      - Bass root / Key は transient から作る 50-100ms 程度の表示用リズムグリッド境界でだけ色を変える
      - Key は短時間の chroma 変動ではなく、transient / density を弱めた長めの周辺窓 chroma を Krumhansl-Schmuckler / Temperley 系 major/minor profile と照合し、リズムグリッドへスナップして表示する
+     - Key は曖昧な区間も完全には消さず、低 confidence の候補として淡く表示する
      - メトリクスレーンはホバーでレーン名、値、時刻、意味、推定音名を表示する
      - 再生位置の行全体が表示中に見切れる / 画面外へ出る場合だけ自動スクロールし、手動スクロール中は追従しない
    - 下段 108-band analyzer + 減衰背景

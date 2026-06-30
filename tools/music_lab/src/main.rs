@@ -28,10 +28,13 @@ const TIMELINE_ROOT_MIN_SEGMENT_SECS: f64 = 0.050;
 const TIMELINE_ROOT_MAX_SEGMENT_SECS: f64 = 0.100;
 const TIMELINE_ROOT_TRANSIENT_THRESHOLD: f32 = 0.16;
 const TIMELINE_KEY_WINDOW_SECS: f64 = 6.0;
-const TIMELINE_KEY_TRANSIENT_PENALTY_START: f32 = 0.18;
-const TIMELINE_KEY_TRANSIENT_PENALTY_END: f32 = 0.72;
-const TIMELINE_KEY_DENSITY_PENALTY_START: f32 = 0.16;
-const TIMELINE_KEY_DENSITY_PENALTY_END: f32 = 0.62;
+const TIMELINE_KEY_TRANSIENT_PENALTY_START: f32 = 0.22;
+const TIMELINE_KEY_TRANSIENT_PENALTY_END: f32 = 0.90;
+const TIMELINE_KEY_DENSITY_PENALTY_START: f32 = 0.24;
+const TIMELINE_KEY_DENSITY_PENALTY_END: f32 = 0.86;
+const TIMELINE_KEY_TRANSIENT_REDUCTION: f32 = 0.56;
+const TIMELINE_KEY_DENSITY_REDUCTION: f32 = 0.30;
+const TIMELINE_KEY_DISPLAY_FLOOR: f32 = 0.18;
 const TIMELINE_KEY_KRUMHANSL_WEIGHT: f32 = 0.64;
 const TIMELINE_KEY_TEMPERLEY_WEIGHT: f32 = 0.36;
 const TIMELINE_KEY_KRUMHANSL_MAJOR_PROFILE: [f32; 12] = [
@@ -1700,14 +1703,14 @@ fn key_chroma_bin_weight(bin: &WaveformBin) -> f32 {
     // Lightweight HPSS-style gate: keep sustained harmonic chroma and discount percussive bins.
     let loudness = timeline_loudness_value(bin).powf(1.18);
     let transient_keep = 1.0
-        - 0.82
+        - TIMELINE_KEY_TRANSIENT_REDUCTION
             * smoothstep(
                 TIMELINE_KEY_TRANSIENT_PENALTY_START,
                 TIMELINE_KEY_TRANSIENT_PENALTY_END,
                 bin.transient,
             );
     let density_keep = 1.0
-        - 0.48
+        - TIMELINE_KEY_DENSITY_REDUCTION
             * smoothstep(
                 TIMELINE_KEY_DENSITY_PENALTY_START,
                 TIMELINE_KEY_DENSITY_PENALTY_END,
@@ -1744,10 +1747,11 @@ fn profile_key_hint(chroma: [f32; 12], presence: [f32; 12], total_weight: f32) -
     let energy =
         (chroma.iter().copied().sum::<f32>() / total_weight.max(1.0e-6)).clamp(0.0, 4.0) / 4.0;
     let margin = (best.score - second.score).max(0.0);
-    let confidence = (smoothstep(0.025, 0.18, margin)
-        * smoothstep(0.08, 0.36, best.score.max(0.0))
-        * (0.45 + 0.55 * energy.sqrt()))
-    .clamp(0.0, 1.0);
+    let score_support = smoothstep(-0.10, 0.32, best.score);
+    let margin_support = smoothstep(0.0, 0.16, margin);
+    let confidence =
+        (score_support * (0.22 + margin_support * 0.78) * (0.45 + 0.55 * energy.sqrt()))
+            .clamp(0.0, 1.0);
 
     TimelineKeyHint {
         pitch_class: best.pitch_class,
@@ -1922,7 +1926,10 @@ fn timeline_metric_display_value(
         TimelineMetricKind::LoudnessBassRoot => {
             timeline_loudness_value(bin) * (0.72 + 0.28 * bass_hint.confidence.clamp(0.0, 1.0))
         }
-        TimelineMetricKind::Key => key_hint.confidence,
+        TimelineMetricKind::Key if key_hint.confidence > 0.0 => {
+            TIMELINE_KEY_DISPLAY_FLOOR + key_hint.confidence * (1.0 - TIMELINE_KEY_DISPLAY_FLOOR)
+        }
+        TimelineMetricKind::Key => 0.0,
     }
 }
 
@@ -1996,7 +2003,7 @@ fn timeline_metric_extra(
         }
         TimelineMetricKind::Key => {
             let hint = key_hint_at_time(bins, time_secs);
-            if hint.confidence > 0.05 {
+            if hint.confidence > 0.01 {
                 format!(
                     " {} {}",
                     pitch_class_name(hint.pitch_class),
@@ -2030,14 +2037,14 @@ fn timeline_metric_color(
             );
         }
         TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(188, 198, 92),
-        TimelineMetricKind::Key if key_hint.confidence > 0.05 => {
-            let color_value = key_hint.confidence.max(0.72);
+        TimelineMetricKind::Key if key_hint.confidence > 0.0 => {
+            let color_value = key_hint.confidence.max(0.56);
             return color_with_alpha(
                 brighten_color(
                     key_color(60 + key_hint.pitch_class % 12, color_value),
-                    1.20 + key_hint.confidence * 0.34,
+                    0.98 + key_hint.confidence * 0.48,
                 ),
-                (126.0 + key_hint.confidence * 118.0).min(248.0) as u8,
+                (96.0 + key_hint.confidence * 146.0).min(248.0) as u8,
             );
         }
         TimelineMetricKind::Key => egui::Color32::from_rgb(104, 214, 186),
@@ -3442,6 +3449,22 @@ mod tests {
 
         assert_eq!(hint.pitch_class, 0);
         assert_eq!(hint.mode, TimelineKeyMode::Major);
+    }
+
+    #[test]
+    fn timeline_key_lane_keeps_low_confidence_hint_visible() {
+        let bin = WaveformBin::default();
+        let bass_hint = TimelinePitchHint::default();
+        let key_hint = TimelineKeyHint {
+            pitch_class: 0,
+            mode: TimelineKeyMode::Major,
+            confidence: 0.02,
+        };
+
+        let value =
+            timeline_metric_display_value(TimelineMetricKind::Key, &bin, bass_hint, key_hint);
+
+        assert!(value >= TIMELINE_KEY_DISPLAY_FLOOR);
     }
 
     #[test]
