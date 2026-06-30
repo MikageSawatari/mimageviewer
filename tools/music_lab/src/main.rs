@@ -81,6 +81,7 @@ const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 
 fn main() -> eframe::Result {
+    let startup_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
@@ -88,9 +89,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "mIV music lab",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::<MusicLabApp>::default())
+            Ok(Box::new(MusicLabApp {
+                startup_open_path: startup_path.clone(),
+                ..Default::default()
+            }))
         }),
     )
 }
@@ -718,6 +722,7 @@ impl TimelineTextureCacheKey {
 
 #[derive(Default)]
 struct MusicLabApp {
+    startup_open_path: Option<PathBuf>,
     active_path: Option<PathBuf>,
     track: Option<LoadedTrack>,
     loading_track: Option<LoadingTrack>,
@@ -753,6 +758,7 @@ impl eframe::App for MusicLabApp {
         self.frame_stats.record_frame();
 
         let stage_start = Instant::now();
+        self.handle_startup_open(ctx);
         self.handle_dropped_files(ctx);
         self.poll_loader(ctx);
         self.poll_spectrum_analyzer(ctx);
@@ -1147,6 +1153,20 @@ impl MusicLabApp {
         } else {
             self.load_status = format!(
                 "Unsupported drop: {} (audio/video files only)",
+                path.display()
+            );
+        }
+    }
+
+    fn handle_startup_open(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.startup_open_path.take() else {
+            return;
+        };
+        if is_supported_media_path(&path) {
+            self.start_load(path, ctx);
+        } else {
+            self.load_status = format!(
+                "Unsupported startup path: {} (audio/video files only)",
                 path.display()
             );
         }

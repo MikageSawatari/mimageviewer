@@ -21,6 +21,7 @@ Date: 2026-06-30
 
 ```powershell
 cargo run -p music_lab --release
+cargo run -p music_lab --release -- "C:\path\to\sample.mp3"
 ```
 
 確認対象は次を最低 1 本ずつ用意する。
