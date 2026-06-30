@@ -1526,7 +1526,8 @@ fn timeline_metric_value(kind: TimelineMetricKind, bin: &WaveformBin) -> f32 {
     match kind {
         TimelineMetricKind::Loudness => timeline_loudness_value(bin),
         TimelineMetricKind::BassRoot => (bin.bass_pitch_confidence
-            * normalize_range(bin.band_energy[0], 0.06, 0.48))
+            * normalize_range(bin.band_energy[0], 0.06, 0.48)
+            * timeline_loudness_value(bin).powf(0.90))
         .sqrt()
         .clamp(0.0, 1.0),
         TimelineMetricKind::Brightness => bin.brightness.clamp(0.0, 1.0),

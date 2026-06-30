@@ -1041,9 +1041,11 @@ fn apply_chroma_metrics(
         bin.bass_chroma = frame.bass_chroma;
         bin.chroma = frame.chroma;
         bin.bass_pitch_class = frame.bass_pitch_class;
+        let bass_loudness_gate = normalize_range(bin.rms, 0.004, 0.035);
         bin.bass_pitch_confidence = (frame.bass_confidence
-            * normalize_range(bin.band_energy[0], 0.05, 0.45))
-        .clamp(0.0, 1.0);
+            * normalize_range(bin.band_energy[0], 0.05, 0.45)
+            * bass_loudness_gate)
+            .clamp(0.0, 1.0);
         bin.key_pitch_class = frame.key_pitch_class;
         bin.key_confidence =
             (frame.key_confidence * normalize_range(bin.rms, 0.006, 0.06)).clamp(0.0, 1.0);
@@ -1195,10 +1197,16 @@ fn smooth_pitch_confidence(bins: &mut [WaveformBin], radius: usize) {
         }
         let (bass_pc, bass_conf) = best_vote(&bass_votes);
         let (key_pc, key_conf) = best_vote(&key_votes);
+        let bass_loudness_gate = normalize_range(bins[i].rms, 0.004, 0.035);
+        let key_loudness_gate = normalize_range(bins[i].rms, 0.006, 0.06);
         bins[i].bass_pitch_class = bass_pc;
-        bins[i].bass_pitch_confidence = bins[i].bass_pitch_confidence.max(bass_conf * 0.55);
+        bins[i].bass_pitch_confidence = bins[i]
+            .bass_pitch_confidence
+            .max(bass_conf * 0.55 * bass_loudness_gate);
         bins[i].key_pitch_class = key_pc;
-        bins[i].key_confidence = bins[i].key_confidence.max(key_conf * 0.50);
+        bins[i].key_confidence = bins[i]
+            .key_confidence
+            .max(key_conf * 0.50 * key_loudness_gate);
     }
 }
 
@@ -1431,6 +1439,25 @@ mod tests {
             "confidence={}",
             best.bass_pitch_confidence
         );
+    }
+
+    #[test]
+    fn analysis_gates_bass_pitch_in_near_silence() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let t = i as f32 / 48_000.0;
+            let x = (std::f32::consts::TAU * 110.0 * t).sin() * 0.00008;
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let max_confidence = analysis
+            .bins
+            .iter()
+            .map(|b| b.bass_pitch_confidence)
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_confidence < 0.03, "max_confidence={max_confidence}");
     }
 
     #[test]
