@@ -13,6 +13,7 @@ const SPECTRUM_DB_FLOOR: f32 = -72.0;
 const SPECTRUM_DB_CEIL: f32 = -8.0;
 const SPECTRUM_DB_GAMMA: f32 = 1.65;
 const SPECTRUM_BLEND_HALF_OCTAVES: f32 = 0.14;
+const VOCAL_PERIODICITY_TARGET_HZ: u32 = 8_000;
 const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
     MultiResolutionWindowSpec {
         size: 32_768,
@@ -150,6 +151,8 @@ pub fn analyze_stereo_timeline(
     let low_alpha = one_pole_alpha(config.low_cut_hz, sample_rate);
     let mid_alpha = one_pole_alpha(config.mid_cut_hz, sample_rate);
     let mut vocal_raw = Vec::with_capacity(frame_count.div_ceil(frames_per_bin));
+    let vocal_period_step = (sample_rate / VOCAL_PERIODICITY_TARGET_HZ).max(1) as usize;
+    let vocal_period_rate = sample_rate as f32 / vocal_period_step as f32;
 
     let mut frame_start = 0usize;
     while frame_start < frame_count {
@@ -163,11 +166,16 @@ pub fn analyze_stereo_timeline(
         let mut crossings = 0usize;
         let mut prev_mono = 0.0_f32;
         let mut have_prev_mono = false;
+        let mut periodicity_samples =
+            Vec::with_capacity((frame_end - frame_start).div_ceil(vocal_period_step).max(1));
 
         for frame_idx in frame_start..frame_end {
             let l = stereo_samples[frame_idx * 2];
             let r = stereo_samples[frame_idx * 2 + 1];
             let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
+            if (frame_idx - frame_start) % vocal_period_step == 0 {
+                periodicity_samples.push(mono);
+            }
             let abs = mono.abs();
             peak = peak.max(abs);
             square_sum += (mono as f64) * (mono as f64);
@@ -224,6 +232,7 @@ pub fn analyze_stereo_timeline(
         let crest = peak / rms.max(1.0e-6);
         let zero_cross_rate = crossings as f32 / (frame_end - frame_start).max(1) as f32;
         let mean_abs = (abs_sum / n) as f32;
+        let periodicity = voiced_periodicity_score(&periodicity_samples, vocal_period_rate);
         let vocal_candidate = vocal_candidate_score(
             loudness_db,
             band_energy,
@@ -232,6 +241,7 @@ pub fn analyze_stereo_timeline(
             transient,
             mean_abs,
             rms,
+            periodicity,
         );
         vocal_raw.push(vocal_candidate);
         bins.push(WaveformBin {
@@ -586,6 +596,7 @@ fn vocal_candidate_score(
     transient: f32,
     mean_abs: f32,
     rms: f32,
+    periodicity: f32,
 ) -> f32 {
     let loudness_gate = smoothstep(-48.0, -20.0, loudness_db);
     let mid_score = smoothstep(0.20, 0.58, band_energy[1]);
@@ -598,10 +609,56 @@ fn vocal_candidate_score(
         smoothstep(0.38, 0.64, abs_to_rms) * (1.0 - 0.35 * smoothstep(0.84, 0.96, abs_to_rms));
     let crest_penalty = 1.0 - 0.75 * smoothstep(5.5, 14.0, crest);
     let transient_penalty = 1.0 - 0.75 * smoothstep(0.28, 0.85, transient);
+    let periodicity_gate = smoothstep(0.20, 0.58, periodicity);
 
     let spectral = (mid_score * low_penalty * high_penalty).sqrt();
     let tonal = zcr_score * 0.64 + fullness * 0.36;
-    (loudness_gate * spectral * tonal * crest_penalty * transient_penalty).clamp(0.0, 1.0)
+    (loudness_gate * spectral * tonal * periodicity_gate * crest_penalty * transient_penalty)
+        .clamp(0.0, 1.0)
+}
+
+fn voiced_periodicity_score(samples: &[f32], sample_rate: f32) -> f32 {
+    if samples.len() < 48 || sample_rate <= 0.0 {
+        return 0.0;
+    }
+    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+    let energy = samples
+        .iter()
+        .map(|sample| {
+            let centered = *sample - mean;
+            centered * centered
+        })
+        .sum::<f32>();
+    if energy <= 1.0e-8 {
+        return 0.0;
+    }
+
+    let min_lag = (sample_rate / 360.0).round().max(2.0) as usize;
+    let max_lag = (sample_rate / 80.0).round().max(min_lag as f32 + 1.0) as usize;
+    let max_lag = max_lag.min(samples.len().saturating_sub(8));
+    if max_lag <= min_lag {
+        return 0.0;
+    }
+
+    let mut best = 0.0_f32;
+    for lag in min_lag..=max_lag {
+        let mut corr = 0.0;
+        let mut a_energy = 0.0;
+        let mut b_energy = 0.0;
+        for i in lag..samples.len() {
+            let a = samples[i] - mean;
+            let b = samples[i - lag] - mean;
+            corr += a * b;
+            a_energy += a * a;
+            b_energy += b * b;
+        }
+        let norm = (a_energy * b_energy).sqrt();
+        if norm > 1.0e-8 {
+            best = best.max((corr / norm).max(0.0));
+        }
+    }
+
+    best.clamp(0.0, 1.0)
 }
 
 fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
@@ -855,6 +912,27 @@ mod tests {
             .fold(0.0_f32, f32::max);
 
         assert!(max_vocal < 0.18, "max_vocal={max_vocal}");
+    }
+
+    #[test]
+    fn analysis_keeps_noise_low_vocal_score() {
+        let mut samples = Vec::new();
+        let mut state = 0x1234_5678_u32;
+        for _ in 0..96_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let white = ((state >> 8) as f32 / 16_777_215.0) * 2.0 - 1.0;
+            let x = white * 0.16;
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let max_vocal = analysis
+            .bins
+            .iter()
+            .map(|b| b.vocal_score)
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_vocal < 0.12, "max_vocal={max_vocal}");
     }
 
     #[test]
