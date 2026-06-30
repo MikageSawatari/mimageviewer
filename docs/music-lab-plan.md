@@ -62,6 +62,8 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
     autocorrelation による有声音の周期性も加えて、ノイズ的な中域反応を抑える。
     倍音/周期性はギターやシンセにも出るため、軽量 DSP だけではインストとの完全分離は期待しない。
     次の改善候補は formant 風の中域包絡や YAMNet / PANNs sidecar との比較。
+    Demucs teacher は短いボーカルの途切れをフレーズ内の穴として扱う傾向が強いため、
+    軽量 DSP も短いギャップは bridge し、明確な終了では release を速める。
   - DSP の調整は [music-lab-vocal-eval.md](music-lab-vocal-eval.md) の教師ラベル JSON と
     `cargo run -p music_lab --bin vocal_eval -- labels.json` で precision / recall を見ながら進める。
     教師ラベルは手入力を正本にせず、まず `tools/music_lab/scripts/demucs_vocal_teacher.py`

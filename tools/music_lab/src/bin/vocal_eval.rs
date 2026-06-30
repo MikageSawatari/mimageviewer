@@ -54,7 +54,7 @@ fn run() -> Result<(), String> {
             let metrics = evaluate_threshold(&analysis, &truth, threshold);
             aggregate[idx].add(metrics);
             println!(
-                "{}\t{threshold:.2}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                "{}\t{threshold:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
                 path.display(),
                 metrics.precision(),
                 metrics.recall(),
@@ -72,7 +72,7 @@ fn run() -> Result<(), String> {
         for (idx, threshold) in thresholds.iter().copied().enumerate() {
             let metrics = aggregate[idx].metrics();
             println!(
-                "ALL\t{threshold:.2}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                "ALL\t{threshold:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
                 metrics.precision(),
                 metrics.recall(),
                 metrics.f1(),

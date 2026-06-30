@@ -598,18 +598,18 @@ fn vocal_candidate_score(
     rms: f32,
     periodicity: f32,
 ) -> f32 {
-    let loudness_gate = smoothstep(-48.0, -20.0, loudness_db);
-    let mid_score = smoothstep(0.20, 0.58, band_energy[1]);
-    let low_penalty = 1.0 - 0.65 * smoothstep(0.48, 0.78, band_energy[0]);
-    let high_penalty = 1.0 - 0.65 * smoothstep(0.43, 0.72, band_energy[2]);
-    let zcr_score = smoothstep(0.0035, 0.010, zero_cross_rate)
+    let loudness_gate = smoothstep(-50.0, -20.0, loudness_db);
+    let mid_score = smoothstep(0.14, 0.50, band_energy[1]);
+    let low_penalty = 1.0 - 0.55 * smoothstep(0.55, 0.84, band_energy[0]);
+    let high_penalty = 1.0 - 0.48 * smoothstep(0.56, 0.86, band_energy[2]);
+    let zcr_score = smoothstep(0.0025, 0.0090, zero_cross_rate)
         * (1.0 - smoothstep(0.08, 0.16, zero_cross_rate));
     let abs_to_rms = mean_abs / rms.max(1.0e-6);
     let fullness =
         smoothstep(0.38, 0.64, abs_to_rms) * (1.0 - 0.35 * smoothstep(0.84, 0.96, abs_to_rms));
-    let crest_penalty = 1.0 - 0.75 * smoothstep(5.5, 14.0, crest);
-    let transient_penalty = 1.0 - 0.75 * smoothstep(0.28, 0.85, transient);
-    let periodicity_gate = smoothstep(0.20, 0.58, periodicity);
+    let crest_penalty = 1.0 - 0.55 * smoothstep(7.0, 16.0, crest);
+    let transient_penalty = 1.0 - 0.55 * smoothstep(0.36, 0.92, transient);
+    let periodicity_gate = 0.34 + 0.66 * smoothstep(0.12, 0.52, periodicity);
 
     let spectral = (mid_score * low_penalty * high_penalty).sqrt();
     let tonal = zcr_score * 0.64 + fullness * 0.36;
@@ -661,11 +661,24 @@ fn voiced_periodicity_score(samples: &[f32], sample_rate: f32) -> f32 {
     best.clamp(0.0, 1.0)
 }
 
+fn vocal_phrase_hint_score(bin: &WaveformBin) -> f32 {
+    let loudness = smoothstep(-48.0, -18.0, bin.loudness_db);
+    let mid = smoothstep(0.12, 0.46, bin.band_energy[1]);
+    let air = smoothstep(0.16, 0.58, bin.band_energy[2]);
+    let voice_band = (mid * 0.82 + air * 0.28).min(1.0);
+    let low_penalty = 1.0 - 0.62 * smoothstep(0.70, 0.94, bin.band_energy[0]);
+    let high_penalty = 1.0 - 0.34 * smoothstep(0.84, 0.98, bin.band_energy[2]);
+    let transient_penalty = 1.0 - 0.42 * smoothstep(0.45, 0.95, bin.transient);
+    (loudness * voice_band * low_penalty * high_penalty * transient_penalty).clamp(0.0, 1.0)
+}
+
 fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
     if bins.is_empty() || raw.is_empty() {
         return;
     }
     let radius = (1.10 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let phrase_radius = (2.35 / bin_secs.max(0.01)).round().max(radius as f64) as usize;
+    let phrase_hint: Vec<f32> = bins.iter().map(vocal_phrase_hint_score).collect();
     let mut smoothed = vec![0.0_f32; bins.len()];
     for i in 0..bins.len() {
         let start = i.saturating_sub(radius);
@@ -694,9 +707,36 @@ fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
         let sustain_gate = smoothstep(0.24, 0.62, active_ratio)
             * (0.45 + 0.55 * smoothstep(0.05, 0.28, strong_ratio));
         let score_gate = smoothstep(0.17, 0.42, local_score);
-        let transient_penalty = 1.0 - 0.80 * smoothstep(0.16, 0.58, local_transient);
-        smoothed[i] = (local_score.powf(0.85) * sustain_gate * score_gate * transient_penalty)
+        let transient_penalty = 1.0 - 0.62 * smoothstep(0.20, 0.68, local_transient);
+        let raw_score = (local_score.powf(0.85) * sustain_gate * score_gate * transient_penalty)
             .clamp(0.0, 1.0);
+
+        let phrase_start = i.saturating_sub(phrase_radius);
+        let phrase_end = (i + phrase_radius + 1).min(phrase_hint.len());
+        let mut phrase_sum = 0.0;
+        let mut phrase_active = 0usize;
+        let mut phrase_strong = 0usize;
+        let mut phrase_count = 0usize;
+        for score in &phrase_hint[phrase_start..phrase_end] {
+            phrase_sum += *score;
+            if *score > 0.16 {
+                phrase_active += 1;
+            }
+            if *score > 0.34 {
+                phrase_strong += 1;
+            }
+            phrase_count += 1;
+        }
+        let phrase_count_f = phrase_count.max(1) as f32;
+        let local_phrase = phrase_sum / phrase_count_f;
+        let phrase_active_ratio = phrase_active as f32 / phrase_count_f;
+        let phrase_strong_ratio = phrase_strong as f32 / phrase_count_f;
+        let phrase_sustain = smoothstep(0.24, 0.66, phrase_active_ratio)
+            * (0.38 + 0.62 * smoothstep(0.03, 0.22, phrase_strong_ratio));
+        let phrase_score =
+            (local_phrase.powf(0.88) * phrase_sustain * transient_penalty).clamp(0.0, 1.0);
+
+        smoothed[i] = raw_score.max(phrase_score * 0.72).clamp(0.0, 1.0);
     }
 
     keep_only_vocal_like_segments(&mut smoothed, bin_secs);
@@ -704,9 +744,10 @@ fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
     let mut state = 0.0_f32;
     for (bin, target) in bins.iter_mut().zip(smoothed) {
         if target > state {
-            state = state * 0.86 + target * 0.14;
+            state = state * 0.82 + target * 0.18;
         } else {
-            state = (state * 0.975).max(target * 0.40);
+            let release = if target < 0.05 { 0.94 } else { 0.965 };
+            state = (state * release).max(target * 0.55);
         }
         bin.vocal_score = state.clamp(0.0, 1.0);
     }
@@ -717,7 +758,7 @@ fn keep_only_vocal_like_segments(scores: &mut [f32], bin_secs: f64) {
         return;
     }
     let min_segment_bins = (1.80 / bin_secs.max(0.01)).round().max(1.0) as usize;
-    let bridge_bins = (0.45 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let bridge_bins = (0.85 / bin_secs.max(0.01)).round().max(1.0) as usize;
 
     let mut i = 0usize;
     while i < scores.len() {
@@ -731,8 +772,10 @@ fn keep_only_vocal_like_segments(scores: &mut [f32], bin_secs: f64) {
         }
         let gap_end = i;
         if gap_start > 0 && gap_end < scores.len() && gap_end - gap_start <= bridge_bins {
+            let bridge_score =
+                (scores[gap_start - 1].min(scores[gap_end]) * 0.72).clamp(0.22, 0.42);
             for score in &mut scores[gap_start..gap_end] {
-                *score = 0.12;
+                *score = bridge_score;
             }
         }
     }
@@ -888,6 +931,40 @@ mod tests {
             .fold(0.0_f32, f32::max);
 
         assert!(max_vocal > 0.35, "max_vocal={max_vocal}");
+    }
+
+    #[test]
+    fn analysis_bridges_short_vocal_gaps() {
+        let mut samples = Vec::new();
+        for i in 0..144_000 {
+            let t = i as f32 / 48_000.0;
+            let active = (0.25..1.35).contains(&t) || (1.75..2.85).contains(&t);
+            let envelope = if active { 1.0 } else { 0.0 };
+            let x = envelope
+                * 0.20
+                * ((std::f32::consts::TAU * 220.0 * t).sin()
+                    + 0.55 * (std::f32::consts::TAU * 440.0 * t).sin()
+                    + 0.35 * (std::f32::consts::TAU * 660.0 * t).sin()
+                    + 0.18 * (std::f32::consts::TAU * 880.0 * t).sin());
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(
+            &samples,
+            48_000,
+            AnalysisConfig {
+                bin_secs: 0.025,
+                ..AnalysisConfig::default()
+            },
+        );
+        let gap_score = analysis
+            .bins
+            .iter()
+            .filter(|bin| bin.start_secs >= 1.40 && bin.start_secs <= 1.65)
+            .map(|bin| bin.vocal_score)
+            .fold(0.0_f32, f32::max);
+
+        assert!(gap_score > 0.08, "gap_score={gap_score}");
     }
 
     #[test]
