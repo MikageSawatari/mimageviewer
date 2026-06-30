@@ -460,6 +460,7 @@ struct MusicLabApp {
     last_spectrum_request: Option<Instant>,
     timeline_cache: TimelineTextureCache,
     timeline_row_secs: f64,
+    timeline_follow_playhead: bool,
     frame_stats: FrameStats,
 }
 
@@ -499,6 +500,7 @@ impl eframe::App for MusicLabApp {
         let row_secs = self.timeline_row_secs();
         let load_status = self.load_status.clone();
         let timeline_cache = &mut self.timeline_cache;
+        let timeline_follow_playhead = &mut self.timeline_follow_playhead;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(app_bg()))
             .show(ctx, |ui| {
@@ -506,8 +508,15 @@ impl eframe::App for MusicLabApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            timeline_stats =
-                                draw_timeline(ui, track, player, snap, timeline_cache, row_secs);
+                            timeline_stats = draw_timeline(
+                                ui,
+                                track,
+                                player,
+                                snap,
+                                timeline_cache,
+                                row_secs,
+                                timeline_follow_playhead,
+                            );
                         });
                 } else {
                     draw_empty_state(ui, &load_status);
@@ -777,6 +786,7 @@ impl MusicLabApp {
         self.spectrum_rx = None;
         self.spectrum_pending = false;
         self.last_spectrum_request = None;
+        self.timeline_follow_playhead = false;
         self.timeline_cache.clear();
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -971,6 +981,7 @@ fn draw_timeline(
     snap: PlaybackSnapshot,
     cache: &mut TimelineTextureCache,
     row_secs: f64,
+    follow_playhead: &mut bool,
 ) -> TimelineDrawStats {
     let mut stats = TimelineDrawStats::default();
     let row_secs = row_secs.max(1.0);
@@ -1009,6 +1020,24 @@ fn draw_timeline(
     cache.ensure(texture_key);
 
     let clip_rect = ui.clip_rect();
+    if timeline_manual_scroll_requested(ui, &response, clip_rect) {
+        *follow_playhead = false;
+    }
+    if let Some(playhead_rect) = timeline_playhead_row_rect(
+        graph_rect,
+        snap.position_secs,
+        row_secs,
+        row_h,
+        row_gap,
+        rows,
+    ) {
+        if clip_rect.intersects(playhead_rect) {
+            *follow_playhead = true;
+        } else if snap.playing && *follow_playhead {
+            ui.scroll_to_rect(playhead_rect.expand(row_gap), None);
+        }
+    }
+
     for row in 0..rows {
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
         let row_rect = egui::Rect::from_min_size(
@@ -1068,6 +1097,44 @@ fn draw_timeline(
         }
     }
     stats
+}
+
+fn timeline_manual_scroll_requested(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    clip_rect: egui::Rect,
+) -> bool {
+    let pointer_over_timeline = ui
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pos| clip_rect.contains(pos) || response.rect.contains(pos));
+    if !pointer_over_timeline {
+        return false;
+    }
+    ui.input(|input| {
+        input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.5
+    })
+}
+
+fn timeline_playhead_row_rect(
+    graph_rect: egui::Rect,
+    position_secs: f64,
+    row_secs: f64,
+    row_h: f32,
+    row_gap: f32,
+    rows: usize,
+) -> Option<egui::Rect> {
+    if row_secs <= 0.0 || rows == 0 || !position_secs.is_finite() {
+        return None;
+    }
+    let row = (position_secs.max(0.0) / row_secs)
+        .floor()
+        .max(0.0)
+        .min(rows.saturating_sub(1) as f64) as usize;
+    let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
+    Some(egui::Rect::from_min_size(
+        egui::pos2(graph_rect.min.x, row_top),
+        egui::vec2(graph_rect.width(), row_h),
+    ))
 }
 
 fn music_lab_analysis_config() -> AnalysisConfig {
