@@ -36,6 +36,8 @@ const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
+const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
+const KEY_HIGHLIGHT_MIN_PEAK: f32 = 0.035;
 const SPECTRUM_ANALYSIS_MIN_HZ: f32 = 20.0;
 const SPECTRUM_AXIS_MIN_HZ: f32 = SPECTRUM_ANALYSIS_MIN_HZ;
 const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
@@ -1783,10 +1785,9 @@ fn draw_pitch_keyboard(
         note_trail.clear();
         note_trail.resize(note_count, 0.0);
     }
-    for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
-        let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
-        let value = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        note_trail[idx] = (note_trail[idx] * 0.965).max(value);
+    let highlight_targets = keyboard_highlight_targets(notes, note_count);
+    for (trail, target) in note_trail.iter_mut().zip(highlight_targets) {
+        *trail = (*trail * KEY_HIGHLIGHT_DECAY).max(target);
     }
 
     for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
@@ -1820,7 +1821,7 @@ fn draw_pitch_keyboard(
         };
         let active = key_color(midi, value);
         let fill = if real_key {
-            lerp_color(base, active, (0.12 + value * 0.88).clamp(0.0, 1.0))
+            lerp_color(base, active, (value * 0.94).clamp(0.0, 1.0))
         } else {
             base
         };
@@ -1865,6 +1866,82 @@ fn draw_pitch_keyboard(
             ),
             egui::StrokeKind::Inside,
         );
+    }
+}
+
+fn keyboard_highlight_targets(notes: &[f32], note_count: usize) -> Vec<f32> {
+    let raw: Vec<f32> = (0..note_count)
+        .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
+        .collect();
+    let peak = raw.iter().copied().fold(0.0_f32, f32::max);
+    if peak < KEY_HIGHLIGHT_MIN_PEAK {
+        return vec![0.0; note_count];
+    }
+
+    let mut prominence = vec![0.0; note_count];
+    for idx in 0..note_count {
+        let value = raw[idx];
+        let near = local_shoulder(&raw, idx);
+        let bed = local_spectral_bed(&raw, idx);
+        let relative_loudness = (value / peak).clamp(0.0, 1.0);
+        prominence[idx] = (value - near - bed * 0.18).max(0.0) * relative_loudness.powf(2.0);
+    }
+
+    let prominence_peak = prominence.iter().copied().fold(0.0_f32, f32::max);
+    if prominence_peak <= 1.0e-6 || prominence_peak < peak * 0.12 {
+        return vec![0.0; note_count];
+    }
+    let floor = (prominence_peak * 0.08).max(0.006);
+    prominence
+        .into_iter()
+        .zip(raw)
+        .map(|(value, raw_value)| {
+            let contrast = ((value - floor) / (prominence_peak - floor).max(1.0e-6))
+                .clamp(0.0, 1.0)
+                .powf(1.35);
+            let loudness = (raw_value / peak).clamp(0.0, 1.0).powf(0.20);
+            contrast * loudness
+        })
+        .collect()
+}
+
+fn local_shoulder(values: &[f32], idx: usize) -> f32 {
+    let mut shoulder = 0.0_f32;
+    for offset in [-2_isize, -1, 1, 2] {
+        let Some(neighbor_idx) = idx.checked_add_signed(offset) else {
+            continue;
+        };
+        let Some(value) = values.get(neighbor_idx) else {
+            continue;
+        };
+        let weight = if offset.abs() == 1 { 0.72 } else { 0.52 };
+        shoulder = shoulder.max(value * weight);
+    }
+    shoulder
+}
+
+fn local_spectral_bed(values: &[f32], idx: usize) -> f32 {
+    let mut weighted_sum = 0.0;
+    let mut weight_sum = 0.0;
+    for offset in -6_isize..=6 {
+        let distance = offset.abs();
+        if distance <= 2 {
+            continue;
+        }
+        let Some(neighbor_idx) = idx.checked_add_signed(offset) else {
+            continue;
+        };
+        let Some(value) = values.get(neighbor_idx) else {
+            continue;
+        };
+        let weight = 1.0 / distance as f32;
+        weighted_sum += value * weight;
+        weight_sum += weight;
+    }
+    if weight_sum > 0.0 {
+        weighted_sum / weight_sum
+    } else {
+        0.0
     }
 }
 
@@ -2360,5 +2437,34 @@ fn format_row_secs(secs: f64) -> String {
         } else {
             format!("{minutes:.1}m")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_highlight_suppresses_flat_note_bed() {
+        let notes = vec![0.45; 24];
+        let targets = keyboard_highlight_targets(&notes, notes.len());
+
+        assert!(targets.iter().all(|value| *value < 0.05));
+    }
+
+    #[test]
+    fn keyboard_highlight_prefers_local_peaks_over_adjacent_spill() {
+        let mut notes = vec![0.04; 24];
+        notes[9] = 0.55;
+        notes[10] = 0.90;
+        notes[11] = 0.58;
+        notes[14] = 0.70;
+
+        let targets = keyboard_highlight_targets(&notes, notes.len());
+
+        assert!(targets[10] > 0.75);
+        assert!(targets[14] > 0.45);
+        assert!(targets[9] < 0.10);
+        assert!(targets[11] < 0.10);
     }
 }
