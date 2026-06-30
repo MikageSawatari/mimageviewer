@@ -7035,6 +7035,69 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 表紙ありで 1 ページずらした後も、通常の前ページ移動は孤立ページへ吸われず
+    /// ずらした区間の前側見開きへ戻る。
+    #[test]
+    fn spread_offset_nudge_cover_back_navigation_rebuilds_from_start() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+        let mut app = setup_app();
+        for k in 0..6 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1, 2, 3, 4, 5];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::LtrCover;
+        app.fullscreen_idx = Some(3);
+
+        assert_eq!(
+            app.resolve_spread_pair(3),
+            SpreadPair::Double { left: 3, right: 4 },
+            "表紙ありの初期ペアは [3,4]"
+        );
+
+        let (new_idx, anchor_idx) = app
+            .compute_spread_offset_nudge(3, 1)
+            .expect("前方ずらしは範囲内");
+        assert_eq!(new_idx, 4);
+        assert_eq!(
+            anchor_idx, 0,
+            "表紙ありでは先頭から組み直し、直前ページの孤立を避ける"
+        );
+        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.fullscreen_idx = Some(new_idx);
+        assert_eq!(
+            app.resolve_spread_pair(new_idx),
+            SpreadPair::Double { left: 4, right: 5 },
+            "1 ページずらして [4,5]"
+        );
+
+        let prev_delta = app.spread_nav_delta(-1);
+        assert_eq!(prev_delta, -2);
+        let prev_idx = (new_idx as i32 + prev_delta) as usize;
+        app.fullscreen_idx = Some(prev_idx);
+        assert_eq!(
+            app.resolve_spread_pair(prev_idx),
+            SpreadPair::Double { left: 2, right: 3 },
+            "[4,5] から戻ると単独 [3] ではなく [2,3]"
+        );
+
+        let prev_delta = app.spread_nav_delta(-1);
+        assert_eq!(prev_delta, -2);
+        let prev_idx = (prev_idx as i32 + prev_delta) as usize;
+        app.fullscreen_idx = Some(prev_idx);
+        assert_eq!(
+            app.resolve_spread_pair(prev_idx),
+            SpreadPair::Double { left: 0, right: 1 },
+            "さらに戻ると [0,1]"
+        );
+    }
+
     /// 後方ずらし (Ctrl+←) は前方ずらしを巻き戻す。
     #[test]
     fn spread_offset_nudge_backward_reverses() {

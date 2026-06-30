@@ -3074,6 +3074,7 @@ fn spread_offset_nudge_from_units(
     units: &[SpreadDisplayUnit],
     fs_idx: usize,
     dir: i32,
+    landscape_flags: &[bool],
 ) -> Option<(usize, usize)> {
     let current_start = find_spread_display_unit(units, fs_idx)
         .map(|(_, unit)| unit.nav_start)
@@ -3084,7 +3085,23 @@ fn spread_offset_nudge_from_units(
     }
     let new_pos = new_pos as usize;
     let new_idx = nav[new_pos];
-    Some((new_idx, new_idx))
+    let anchor_pos = spread_shift_anchor_pos_for_target(new_pos, landscape_flags);
+    Some((new_idx, nav[anchor_pos]))
+}
+
+fn spread_shift_anchor_pos_for_target(target_pos: usize, landscape_flags: &[bool]) -> usize {
+    if landscape_flags.get(target_pos).copied().unwrap_or(false) {
+        return target_pos;
+    }
+
+    // 直近の硬い境界から組み直し、1 ページずらし後の通常前後移動が
+    // target 直前の孤立ページへ吸われないようにする。
+    let segment_start = (0..target_pos)
+        .rev()
+        .find(|&pos| landscape_flags.get(pos).copied().unwrap_or(false))
+        .map_or(0, |pos| pos + 1);
+    let anchor_pos = segment_start + ((target_pos - segment_start) % 2);
+    anchor_pos.min(target_pos)
 }
 
 // ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
@@ -7053,7 +7070,11 @@ impl App {
             &self.fs_cache,
             &self.thumbnails,
         );
-        spread_offset_nudge_from_units(&nav, &units, fs_idx, dir)
+        let landscape_flags = nav
+            .iter()
+            .map(|&idx| is_landscape(idx, &self.fs_cache, &self.thumbnails))
+            .collect::<Vec<_>>();
+        spread_offset_nudge_from_units(&nav, &units, fs_idx, dir, &landscape_flags)
     }
 
     pub(crate) fn fullscreen_cursor_state(&self) -> FullscreenCursorState {
@@ -19215,6 +19236,51 @@ mod tests {
             .collect()
     }
 
+    fn spread_landscape_flags(
+        nav: &[usize],
+        mut is_landscape_idx: impl FnMut(usize) -> bool,
+    ) -> Vec<bool> {
+        nav.iter()
+            .copied()
+            .map(|idx| is_landscape_idx(idx))
+            .collect()
+    }
+
+    fn spread_unit_summary_1based(units: &[SpreadDisplayUnit]) -> Vec<Vec<usize>> {
+        units
+            .iter()
+            .map(|unit| unit.pages.iter().map(|idx| idx + 1).collect())
+            .collect()
+    }
+
+    fn shifted_spread_units_1based(
+        page_count: usize,
+        spread_mode: SpreadMode,
+        landscape_pages_1based: &[usize],
+        fs_page_1based: usize,
+    ) -> (usize, usize, Vec<Vec<usize>>) {
+        let nav = (0..page_count).collect::<Vec<_>>();
+        let is_landscape_idx =
+            |idx: usize| landscape_pages_1based.iter().any(|page| *page == idx + 1);
+        let units =
+            build_spread_display_units_with_landscape(&nav, spread_mode, None, is_landscape_idx);
+        let landscape_flags = spread_landscape_flags(&nav, |idx| {
+            landscape_pages_1based.iter().any(|page| *page == idx + 1)
+        });
+        let (new_idx, anchor_idx) =
+            spread_offset_nudge_from_units(&nav, &units, fs_page_1based - 1, 1, &landscape_flags)
+                .expect("shift target is in range");
+        let shifted_units =
+            build_spread_display_units_with_landscape(&nav, spread_mode, Some(anchor_idx), |idx| {
+                landscape_pages_1based.iter().any(|page| *page == idx + 1)
+            });
+        (
+            new_idx + 1,
+            anchor_idx + 1,
+            spread_unit_summary_1based(&shifted_units),
+        )
+    }
+
     #[test]
     fn spread_display_units_repair_after_landscape_without_shift_anchor() {
         let nav = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -19261,10 +19327,11 @@ mod tests {
         let nav = [0, 1, 2, 3, 4, 5];
         let units =
             build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, None, |_| false);
+        let landscape_flags = spread_landscape_flags(&nav, |_| false);
 
         assert_eq!(
-            spread_offset_nudge_from_units(&nav, &units, 2, 1),
-            Some((2, 2))
+            spread_offset_nudge_from_units(&nav, &units, 2, 1, &landscape_flags),
+            Some((2, 0))
         );
     }
 
@@ -19275,9 +19342,10 @@ mod tests {
             build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, None, |idx| {
                 idx == 3
             });
+        let landscape_flags = spread_landscape_flags(&nav, |idx| idx == 3);
 
         assert_eq!(
-            spread_offset_nudge_from_units(&nav, &units, 4, 1),
+            spread_offset_nudge_from_units(&nav, &units, 4, 1, &landscape_flags),
             Some((5, 5))
         );
 
@@ -19289,6 +19357,56 @@ mod tests {
         assert_eq!(before_anchor_unit.pages, vec![4]);
         let (_, shifted_unit) = find_spread_display_unit(&shifted_units, 5).unwrap();
         assert_eq!(shifted_unit.pages, vec![5, 6]);
+    }
+
+    #[test]
+    fn spread_offset_nudge_page_three_matrix_matches_manual_expectations() {
+        assert_eq!(
+            shifted_spread_units_1based(5, SpreadMode::LtrCover, &[], 3),
+            (3, 1, vec![vec![1, 2], vec![3, 4], vec![5]]),
+            "表紙あり: 1 -> 2,3 -> 4,5 を 3 ページ目でずらすと表紙なし相当"
+        );
+
+        assert_eq!(
+            shifted_spread_units_1based(5, SpreadMode::Ltr, &[], 3),
+            (4, 2, vec![vec![1], vec![2, 3], vec![4, 5]]),
+            "表紙なし: 1,2 -> 3,4 -> 5 を 3 ページ目でずらすと表紙あり相当"
+        );
+
+        assert_eq!(
+            shifted_spread_units_1based(6, SpreadMode::LtrCover, &[1], 3),
+            (3, 3, vec![vec![1], vec![2], vec![3, 4], vec![5, 6]]),
+            "先頭横長: [1] -> 2,3 -> 4,5 を 3 ページ目でずらすと横長後に表紙ができる"
+        );
+
+        assert_eq!(
+            shifted_spread_units_1based(6, SpreadMode::Ltr, &[1], 3),
+            (3, 3, vec![vec![1], vec![2], vec![3, 4], vec![5, 6]]),
+            "先頭横長は表紙あり/なしどちらでも同じ"
+        );
+    }
+
+    #[test]
+    fn spread_offset_nudge_after_middle_landscape_starts_new_segment() {
+        assert_eq!(
+            shifted_spread_units_1based(8, SpreadMode::Ltr, &[3], 5),
+            (
+                5,
+                5,
+                vec![vec![1, 2], vec![3], vec![4], vec![5, 6], vec![7, 8]]
+            ),
+            "途中横長の後ろ側でも、横長直後の区間内で表紙相当の単独ページができる"
+        );
+
+        assert_eq!(
+            shifted_spread_units_1based(8, SpreadMode::LtrCover, &[4], 6),
+            (
+                6,
+                6,
+                vec![vec![1], vec![2, 3], vec![4], vec![5], vec![6, 7], vec![8]]
+            ),
+            "表紙あり + 途中横長でも、直近の横長ページを越えてアンカーを巻き戻さない"
+        );
     }
 
     #[test]
