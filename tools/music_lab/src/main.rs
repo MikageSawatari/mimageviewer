@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -189,7 +190,18 @@ struct LoadedTrack {
     analysis: TimelineAnalysis,
 }
 
+#[derive(Clone, Debug)]
+struct LoadingTrack {
+    path: PathBuf,
+    info: AudioStreamInfo,
+}
+
 enum LoadMsg {
+    Probed {
+        path: PathBuf,
+        info: AudioStreamInfo,
+    },
+    Status(String),
     Loaded(Box<LoadedTrack>),
     Failed(String),
 }
@@ -487,7 +499,9 @@ impl TimelineTextureCacheKey {
 struct MusicLabApp {
     active_path: Option<PathBuf>,
     track: Option<LoadedTrack>,
+    loading_track: Option<LoadingTrack>,
     load_rx: Option<mpsc::Receiver<LoadMsg>>,
+    load_cancel: Option<Arc<AtomicBool>>,
     load_status: String,
     player: Option<LabPlayer>,
     bookmarks: Vec<MusicBookmark>,
@@ -541,6 +555,7 @@ impl eframe::App for MusicLabApp {
         let stage_start = Instant::now();
         let mut timeline_stats = TimelineDrawStats::default();
         let track = self.track.as_ref();
+        let loading_track = self.loading_track.as_ref();
         let player = self.player.as_ref();
         let snap = self.player_snapshot();
         let row_secs = self.timeline_row_secs();
@@ -563,6 +578,13 @@ impl eframe::App for MusicLabApp {
                                 row_secs,
                                 timeline_follow_playhead,
                             );
+                        });
+                } else if let Some(loading_track) = loading_track {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            timeline_stats =
+                                draw_pending_timeline(ui, loading_track, row_secs, &load_status);
                         });
                 } else {
                     draw_empty_state(ui, &load_status);
@@ -623,10 +645,11 @@ impl MusicLabApp {
 
                     ui.separator();
                     let snap = self.player_snapshot();
+                    let duration_secs = self.display_duration_secs();
                     ui.label(format!(
                         "{} / {}",
                         format_time(snap.position_secs),
-                        format_time(snap.duration_secs)
+                        format_time(duration_secs)
                     ));
                     if snap.effect_chain_active {
                         ui.label(format!("FX {} samples", snap.effect_latency_samples));
@@ -775,6 +798,29 @@ impl MusicLabApp {
                         self.frame_stats.bottom_ms, self.frame_stats.spectrum_compute_ms
                     ));
                     ui.label(format!("Log: {}", self.frame_stats.log_path().display()));
+                } else if let Some(loading) = &self.loading_track {
+                    ui.label(loading.path.display().to_string());
+                    ui.separator();
+                    ui.label("Status: loading in background");
+                    ui.label(format!(
+                        "Duration: {}",
+                        format_time(loading.info.duration_secs)
+                    ));
+                    ui.label(format!("Sample rate: {} Hz", loading.info.sample_rate));
+                    ui.label(format!("Channels: {}", loading.info.channels));
+                    ui.label(format!(
+                        "Row: {}",
+                        format_row_secs(self.timeline_row_secs())
+                    ));
+                    ui.label("Wave bins: analyzing");
+                    ui.label("Playback: available after decode");
+                    ui.separator();
+                    ui.heading("Perf");
+                    ui.label(format!(
+                        "Frame/UI: {:.1} / {:.1} ms",
+                        self.frame_stats.frame_ms, self.frame_stats.update_ms
+                    ));
+                    ui.label(format!("Log: {}", self.frame_stats.log_path().display()));
                 } else {
                     ui.label("Open or drop an audio/video file to inspect its audio track.");
                 }
@@ -787,7 +833,12 @@ impl MusicLabApp {
             .frame(app_panel_frame())
             .show(ctx, |ui| {
                 if self.track.is_none() {
-                    ui.centered_and_justified(|ui| ui.label("Spectrum analyzer placeholder"));
+                    let text = if self.loading_track.is_some() {
+                        "Spectrum analyzer will start after decode"
+                    } else {
+                        "Spectrum analyzer placeholder"
+                    };
+                    ui.centered_and_justified(|ui| ui.label(text));
                     return;
                 }
                 draw_spectrum(
@@ -819,10 +870,14 @@ impl MusicLabApp {
     }
 
     fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
-        self.load_status = format!("Loading {}", path.display());
+        if let Some(cancel) = self.load_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.load_status = format!("Probing {}", path.display());
         self.active_path = Some(path.clone());
         self.player = None;
         self.track = None;
+        self.loading_track = None;
         self.spectrum_bands.clear();
         self.spectrum_trail.clear();
         self.spectrum_prev_bands.clear();
@@ -838,16 +893,48 @@ impl MusicLabApp {
         self.timeline_cache.clear();
         let (tx, rx) = mpsc::channel();
         let load_path = path.clone();
-        std::thread::Builder::new()
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let spawn_result = std::thread::Builder::new()
             .name("music-lab-load".into())
             .spawn(move || {
-                let msg = match decode_audio_file(&load_path) {
+                match probe_audio_file(&load_path) {
+                    Ok(info) => {
+                        if tx
+                            .send(LoadMsg::Probed {
+                                path: load_path.clone(),
+                                info,
+                            })
+                            .is_err()
+                            || worker_cancel.load(Ordering::Relaxed)
+                        {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(LoadMsg::Failed(err));
+                        return;
+                    }
+                }
+                let _ = tx.send(LoadMsg::Status("Decoding audio samples...".to_string()));
+                let msg = match decode_audio_file(&load_path, &worker_cancel) {
                     Ok(decoded) => {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let _ = tx.send(LoadMsg::Probed {
+                            path: load_path.clone(),
+                            info: decoded.info,
+                        });
+                        let _ = tx.send(LoadMsg::Status("Analyzing timeline...".to_string()));
                         let analysis = analyze_stereo_timeline(
                             &decoded.stereo_samples,
                             decoded.info.sample_rate,
                             music_lab_analysis_config(),
                         );
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
                         LoadMsg::Loaded(Box::new(LoadedTrack {
                             path: load_path,
                             decoded: Arc::new(decoded),
@@ -857,40 +944,71 @@ impl MusicLabApp {
                     Err(err) => LoadMsg::Failed(err),
                 };
                 let _ = tx.send(msg);
-            })
-            .ok();
-        self.load_rx = Some(rx);
-        ctx.request_repaint();
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.load_rx = Some(rx);
+                self.load_cancel = Some(cancel);
+                ctx.request_repaint();
+            }
+            Err(err) => {
+                self.load_status = format!("Failed to start loader: {err}");
+                self.load_rx = None;
+            }
+        }
     }
 
     fn poll_loader(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.load_rx.as_ref() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(LoadMsg::Loaded(track)) => {
-                self.load_status = "Loaded".to_string();
-                let track = *track;
-                match LabPlayer::new(Arc::clone(&track.decoded)) {
-                    Ok(player) => self.player = Some(player),
-                    Err(err) => self.load_status = format!("Loaded; playback disabled: {err}"),
+        let mut clear_loader = false;
+        loop {
+            match rx.try_recv() {
+                Ok(LoadMsg::Probed { path, info }) => {
+                    self.loading_track = Some(LoadingTrack { path, info });
+                    self.load_status = "Decoding audio samples...".to_string();
+                    ctx.request_repaint();
                 }
-                self.start_spectrum_worker(Arc::clone(&track.decoded), ctx);
-                self.track = Some(track);
-                self.load_rx = None;
-                ctx.request_repaint();
+                Ok(LoadMsg::Status(status)) => {
+                    self.load_status = status;
+                    ctx.request_repaint();
+                }
+                Ok(LoadMsg::Loaded(track)) => {
+                    self.load_status = "Loaded".to_string();
+                    let track = *track;
+                    self.loading_track = None;
+                    match LabPlayer::new(Arc::clone(&track.decoded)) {
+                        Ok(player) => self.player = Some(player),
+                        Err(err) => self.load_status = format!("Loaded; playback disabled: {err}"),
+                    }
+                    self.start_spectrum_worker(Arc::clone(&track.decoded), ctx);
+                    self.track = Some(track);
+                    clear_loader = true;
+                    ctx.request_repaint();
+                    break;
+                }
+                Ok(LoadMsg::Failed(err)) => {
+                    self.load_status = err;
+                    self.loading_track = None;
+                    clear_loader = true;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.load_status = "Loader stopped".to_string();
+                    self.loading_track = None;
+                    clear_loader = true;
+                    break;
+                }
             }
-            Ok(LoadMsg::Failed(err)) => {
-                self.load_status = err;
-                self.load_rx = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.load_status = "Loader stopped".to_string();
-                self.load_rx = None;
-            }
+        }
+        if clear_loader {
+            self.load_rx = None;
+            self.load_cancel = None;
         }
     }
 
@@ -992,6 +1110,23 @@ impl MusicLabApp {
             .unwrap_or_default()
     }
 
+    fn display_duration_secs(&self) -> f64 {
+        self.player
+            .as_ref()
+            .map(|player| player.snapshot().duration_secs)
+            .or_else(|| {
+                self.track
+                    .as_ref()
+                    .map(|track| track.decoded.info.duration_secs)
+            })
+            .or_else(|| {
+                self.loading_track
+                    .as_ref()
+                    .map(|loading| loading.info.duration_secs)
+            })
+            .unwrap_or(0.0)
+    }
+
     fn timeline_row_secs(&self) -> f64 {
         if self.timeline_row_secs > 0.0 {
             self.timeline_row_secs
@@ -1046,9 +1181,7 @@ fn draw_timeline(
 ) -> TimelineDrawStats {
     let mut stats = TimelineDrawStats::default();
     let row_secs = row_secs.max(1.0);
-    let rows = (track.decoded.info.duration_secs / row_secs)
-        .ceil()
-        .max(1.0) as usize;
+    let rows = timeline_row_count(track.decoded.info.duration_secs, row_secs);
     let row_gap = TIMELINE_ROW_GAP;
     let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_METRICS_H;
     let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
@@ -1188,6 +1321,117 @@ fn draw_timeline(
         }
     }
     stats
+}
+
+fn draw_pending_timeline(
+    ui: &mut egui::Ui,
+    loading: &LoadingTrack,
+    row_secs: f64,
+    status: &str,
+) -> TimelineDrawStats {
+    let mut stats = TimelineDrawStats::default();
+    let row_secs = row_secs.max(1.0);
+    let rows = timeline_row_count(loading.info.duration_secs, row_secs);
+    let row_gap = TIMELINE_ROW_GAP;
+    let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_METRICS_H;
+    let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
+    let available = egui::vec2(ui.available_width(), ui.available_height().max(content_h));
+    let (rect, _response) = ui.allocate_exact_size(available, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, app_bg());
+
+    let label_w = 56.0;
+    let graph_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(label_w, 8.0),
+        egui::pos2(rect.max.x - 8.0, rect.min.y + content_h - 8.0),
+    );
+    let clip_rect = ui.clip_rect();
+    for row in 0..rows {
+        let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(graph_rect.min.x, row_top),
+            egui::vec2(graph_rect.width(), row_h),
+        );
+        if !clip_rect.intersects(row_rect.expand(row_gap)) {
+            continue;
+        }
+        stats.visible_rows += 1;
+        let waveform_rect = egui::Rect::from_min_size(
+            row_rect.min,
+            egui::vec2(row_rect.width(), TIMELINE_WAVEFORM_H),
+        );
+        let gap_rect = egui::Rect::from_min_size(
+            egui::pos2(row_rect.left(), waveform_rect.bottom()),
+            egui::vec2(row_rect.width(), TIMELINE_INNER_GAP),
+        );
+        let metrics_rect =
+            egui::Rect::from_min_max(egui::pos2(row_rect.left(), gap_rect.bottom()), row_rect.max);
+        painter.rect_filled(waveform_rect, 0.0, egui::Color32::BLACK);
+        painter.rect_filled(
+            gap_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(36, 48, 60, 120),
+        );
+        painter.rect_filled(metrics_rect, 0.0, egui::Color32::from_rgb(3, 5, 7));
+        painter.rect_stroke(
+            row_rect,
+            0.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(92, 112, 134, 112),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            waveform_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(74, 96, 120, 118)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            metrics_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(74, 96, 120, 88)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, row_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format_time(row as f64 * row_secs),
+            egui::FontId::monospace(12.0),
+            ui.visuals().text_color(),
+        );
+    }
+
+    let message = if loading.info.duration_secs > 0.0 {
+        format!(
+            "{}  {} rows reserved",
+            status,
+            timeline_row_count(loading.info.duration_secs, row_secs)
+        )
+    } else {
+        status.to_string()
+    };
+    painter.text(
+        graph_rect.min + egui::vec2(14.0, 16.0),
+        egui::Align2::LEFT_TOP,
+        message,
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_rgb(204, 214, 224),
+    );
+    stats
+}
+
+fn timeline_row_count(duration_secs: f64, row_secs: f64) -> usize {
+    if !duration_secs.is_finite()
+        || duration_secs <= 0.0
+        || !row_secs.is_finite()
+        || row_secs <= 0.0
+    {
+        1
+    } else {
+        (duration_secs / row_secs).ceil().max(1.0) as usize
+    }
 }
 
 fn clip_rect_vertically_contains(clip_rect: egui::Rect, target: egui::Rect) -> bool {
@@ -3018,7 +3262,69 @@ fn is_supported_media_path(path: &Path) -> bool {
         })
 }
 
-fn decode_audio_file(path: &Path) -> Result<DecodedAudio, String> {
+fn probe_audio_file(path: &Path) -> Result<AudioStreamInfo, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("probe: {e}"))?;
+    let format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|track| {
+            track.codec_params.codec != CODEC_TYPE_NULL
+                && track.codec_params.sample_rate.is_some()
+                && track.codec_params.channels.is_some()
+        })
+        .or_else(|| {
+            format.tracks().iter().find(|track| {
+                track.codec_params.codec != CODEC_TYPE_NULL
+                    && (track.codec_params.sample_rate.is_some()
+                        || track.codec_params.channels.is_some())
+            })
+        })
+        .or_else(|| {
+            format
+                .tracks()
+                .iter()
+                .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+        })
+        .ok_or_else(|| "no supported audio track".to_string())?;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let channels = track
+        .codec_params
+        .channels
+        .map(|channels| channels.count() as u16)
+        .unwrap_or(0);
+    let duration_secs = track
+        .codec_params
+        .n_frames
+        .and_then(|frames| {
+            if sample_rate > 0 {
+                Some(frames as f64 / sample_rate as f64)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0.0);
+    Ok(AudioStreamInfo {
+        sample_rate,
+        channels,
+        duration_secs,
+    })
+}
+
+fn decode_audio_file(path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -3065,6 +3371,9 @@ fn decode_audio_file(path: &Path) -> Result<DecodedAudio, String> {
     let mut stereo_samples = Vec::new();
     let mut stream_info = AudioStreamInfo::default();
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => break,
@@ -3388,6 +3697,16 @@ mod tests {
                 .take(segments.len().saturating_sub(1))
                 .all(|segment| (5..=10).contains(&(segment.end - segment.start)))
         );
+    }
+
+    #[test]
+    fn timeline_row_count_reserves_rows_from_probe_duration() {
+        assert_eq!(timeline_row_count(0.0, 30.0), 1);
+        assert_eq!(timeline_row_count(f64::NAN, 30.0), 1);
+        assert_eq!(timeline_row_count(29.9, 30.0), 1);
+        assert_eq!(timeline_row_count(30.0, 30.0), 1);
+        assert_eq!(timeline_row_count(30.1, 30.0), 2);
+        assert_eq!(timeline_row_count(121.0, 30.0), 5);
     }
 
     #[test]
