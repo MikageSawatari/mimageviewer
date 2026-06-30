@@ -621,7 +621,7 @@ impl MusicLabApp {
                         }
                     }
 
-                    let can_play = self.track.is_some();
+                    let can_play = self.player.is_some();
                     let playing = self.player.as_ref().is_some_and(|p| p.snapshot().playing);
                     if ui
                         .add_enabled(
@@ -813,7 +813,11 @@ impl MusicLabApp {
                         format_row_secs(self.timeline_row_secs())
                     ));
                     ui.label("Wave bins: analyzing");
-                    ui.label("Playback: available after decode");
+                    ui.label(if self.player.is_some() {
+                        "Playback: streaming during analysis"
+                    } else {
+                        "Playback: available after decode"
+                    });
                     ui.separator();
                     ui.heading("Perf");
                     ui.label(format!(
@@ -834,7 +838,7 @@ impl MusicLabApp {
             .show(ctx, |ui| {
                 if self.track.is_none() {
                     let text = if self.loading_track.is_some() {
-                        "Spectrum analyzer will start after decode"
+                        "Spectrum analyzer will start after timeline analysis"
                     } else {
                         "Spectrum analyzer placeholder"
                     };
@@ -891,6 +895,16 @@ impl MusicLabApp {
         self.last_spectrum_request = None;
         self.timeline_follow_playhead = false;
         self.timeline_cache.clear();
+        let streaming_sink = match LabPlayer::new_streaming(AudioStreamInfo::default(), true) {
+            Ok((player, sink)) => {
+                self.player = Some(player);
+                Some(sink)
+            }
+            Err(err) => {
+                self.load_status = format!("Probing {}; playback pending: {err}", path.display());
+                None
+            }
+        };
         let (tx, rx) = mpsc::channel();
         let load_path = path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -916,33 +930,44 @@ impl MusicLabApp {
                         return;
                     }
                 }
-                let _ = tx.send(LoadMsg::Status("Decoding audio samples...".to_string()));
-                let msg = match decode_audio_file(&load_path, &worker_cancel) {
-                    Ok(decoded) => {
-                        if worker_cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let _ = tx.send(LoadMsg::Probed {
-                            path: load_path.clone(),
-                            info: decoded.info,
-                        });
-                        let _ = tx.send(LoadMsg::Status("Analyzing timeline...".to_string()));
-                        let analysis = analyze_stereo_timeline(
-                            &decoded.stereo_samples,
-                            decoded.info.sample_rate,
-                            music_lab_analysis_config(),
-                        );
-                        if worker_cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        LoadMsg::Loaded(Box::new(LoadedTrack {
-                            path: load_path,
-                            decoded: Arc::new(decoded),
-                            analysis,
-                        }))
-                    }
-                    Err(err) => LoadMsg::Failed(err),
+                let decode_status = if streaming_sink.is_some() {
+                    "Streaming playback; decoding timeline samples..."
+                } else {
+                    "Decoding timeline samples; playback starts after decode..."
                 };
+                let _ = tx.send(LoadMsg::Status(decode_status.to_string()));
+                let msg =
+                    match decode_audio_file(&load_path, &worker_cancel, streaming_sink.as_ref()) {
+                        Ok(decoded) => {
+                            if worker_cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let _ = tx.send(LoadMsg::Probed {
+                                path: load_path.clone(),
+                                info: decoded.info,
+                            });
+                            let _ = tx.send(LoadMsg::Status("Analyzing timeline...".to_string()));
+                            let analysis = analyze_stereo_timeline(
+                                &decoded.stereo_samples,
+                                decoded.info.sample_rate,
+                                music_lab_analysis_config(),
+                            );
+                            if worker_cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            LoadMsg::Loaded(Box::new(LoadedTrack {
+                                path: load_path,
+                                decoded: Arc::new(decoded),
+                                analysis,
+                            }))
+                        }
+                        Err(err) => {
+                            if let Some(sink) = &streaming_sink {
+                                sink.fail();
+                            }
+                            LoadMsg::Failed(err)
+                        }
+                    };
                 let _ = tx.send(msg);
             });
         match spawn_result {
@@ -966,8 +991,16 @@ impl MusicLabApp {
         loop {
             match rx.try_recv() {
                 Ok(LoadMsg::Probed { path, info }) => {
+                    if let Some(player) = &self.player {
+                        player.set_duration_secs(info.duration_secs);
+                    }
                     self.loading_track = Some(LoadingTrack { path, info });
-                    self.load_status = "Decoding audio samples...".to_string();
+                    self.load_status = if self.player.is_some() {
+                        "Streaming playback; decoding timeline samples..."
+                    } else {
+                        "Decoding timeline samples; playback starts after decode..."
+                    }
+                    .to_string();
                     ctx.request_repaint();
                 }
                 Ok(LoadMsg::Status(status)) => {
@@ -978,9 +1011,13 @@ impl MusicLabApp {
                     self.load_status = "Loaded".to_string();
                     let track = *track;
                     self.loading_track = None;
-                    match LabPlayer::new(Arc::clone(&track.decoded)) {
-                        Ok(player) => self.player = Some(player),
-                        Err(err) => self.load_status = format!("Loaded; playback disabled: {err}"),
+                    if self.player.is_none() {
+                        match LabPlayer::new(Arc::clone(&track.decoded), true) {
+                            Ok(player) => self.player = Some(player),
+                            Err(err) => {
+                                self.load_status = format!("Loaded; playback disabled: {err}")
+                            }
+                        }
                     }
                     self.start_spectrum_worker(Arc::clone(&track.decoded), ctx);
                     self.track = Some(track);
@@ -1114,6 +1151,7 @@ impl MusicLabApp {
         self.player
             .as_ref()
             .map(|player| player.snapshot().duration_secs)
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
             .or_else(|| {
                 self.track
                     .as_ref()
@@ -3329,7 +3367,11 @@ fn probe_audio_file(path: &Path) -> Result<AudioStreamInfo, String> {
     })
 }
 
-fn decode_audio_file(path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, String> {
+fn decode_audio_file(
+    path: &Path,
+    cancel: &AtomicBool,
+    streaming_sink: Option<&StreamingAudioSink>,
+) -> Result<DecodedAudio, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -3402,17 +3444,25 @@ fn decode_audio_file(path: &Path, cancel: &AtomicBool) -> Result<DecodedAudio, S
         let samples = sample_buf.samples();
         stream_info.sample_rate = spec.rate;
         stream_info.channels = channels as u16;
+        let mut packet_stereo = Vec::with_capacity(samples.len() / channels * 2);
         for frame in samples.chunks(channels) {
             let left: f32 = frame.first().copied().unwrap_or(0.0).into_sample();
             let right: f32 = frame.get(1).copied().unwrap_or(left).into_sample();
-            stereo_samples.push(left.clamp(-1.0, 1.0));
-            stereo_samples.push(right.clamp(-1.0, 1.0));
+            packet_stereo.push(left.clamp(-1.0, 1.0));
+            packet_stereo.push(right.clamp(-1.0, 1.0));
         }
+        if let Some(sink) = streaming_sink {
+            sink.append_source_samples(&packet_stereo, spec.rate);
+        }
+        stereo_samples.extend_from_slice(&packet_stereo);
     }
     stream_info.duration_secs =
         stereo_samples.len() as f64 / 2.0 / stream_info.sample_rate.max(1) as f64;
     if stereo_samples.is_empty() {
         return Err("no decoded samples".to_string());
+    }
+    if let Some(sink) = streaming_sink {
+        sink.finish(stream_info.duration_secs);
     }
     Ok(DecodedAudio {
         info: stream_info,
@@ -3426,15 +3476,32 @@ struct LabPlayer {
 }
 
 struct PlayerShared {
-    samples: Arc<Vec<f32>>,
+    samples: Vec<f32>,
     sample_rate: u32,
     duration_secs: f64,
     position_frames: usize,
     playing: bool,
+    eof: bool,
+}
+
+#[derive(Clone)]
+struct StreamingAudioSink {
+    shared: Arc<Mutex<PlayerShared>>,
+    output_rate: u32,
 }
 
 impl LabPlayer {
-    fn new(decoded: Arc<DecodedAudio>) -> Result<Self, String> {
+    fn new(decoded: Arc<DecodedAudio>, autoplay: bool) -> Result<Self, String> {
+        let (player, sink) = Self::new_streaming(decoded.info, autoplay)?;
+        sink.append_source_samples(&decoded.stereo_samples, decoded.info.sample_rate);
+        sink.finish(decoded.info.duration_secs);
+        Ok(player)
+    }
+
+    fn new_streaming(
+        info: AudioStreamInfo,
+        autoplay: bool,
+    ) -> Result<(Self, StreamingAudioSink), String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -3447,22 +3514,13 @@ impl LabPlayer {
             ));
         }
         let output_rate = config.sample_rate().0;
-        let samples = if decoded.info.sample_rate == output_rate {
-            decoded.stereo_samples.clone()
-        } else {
-            resample_linear_stereo(
-                &decoded.stereo_samples,
-                decoded.info.sample_rate,
-                output_rate,
-            )
-        };
-        let samples = Arc::new(samples);
         let shared = Arc::new(Mutex::new(PlayerShared {
-            samples,
+            samples: Vec::new(),
             sample_rate: output_rate,
-            duration_secs: decoded.info.duration_secs,
+            duration_secs: info.duration_secs,
             position_frames: 0,
-            playing: false,
+            playing: autoplay,
+            eof: false,
         }));
         let stream_shared = Arc::clone(&shared);
         let stream_config: cpal::StreamConfig = config.into();
@@ -3476,10 +3534,17 @@ impl LabPlayer {
             )
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Self {
-            _stream: stream,
-            shared,
-        })
+        let sink = StreamingAudioSink {
+            shared: Arc::clone(&shared),
+            output_rate,
+        };
+        Ok((
+            Self {
+                _stream: stream,
+                shared,
+            },
+            sink,
+        ))
     }
 
     fn set_playing(&self, playing: bool) {
@@ -3491,7 +3556,20 @@ impl LabPlayer {
     fn seek_secs(&self, secs: f64) {
         if let Ok(mut s) = self.shared.lock() {
             let frame = (secs.max(0.0) * s.sample_rate as f64) as usize;
-            s.position_frames = frame.min(s.samples.len() / 2);
+            s.position_frames = if s.eof {
+                frame.min(s.samples.len() / 2)
+            } else {
+                frame
+            };
+        }
+    }
+
+    fn set_duration_secs(&self, duration_secs: f64) {
+        if duration_secs.is_finite()
+            && duration_secs > 0.0
+            && let Ok(mut s) = self.shared.lock()
+        {
+            s.duration_secs = duration_secs;
         }
     }
 
@@ -3509,18 +3587,56 @@ impl LabPlayer {
     }
 }
 
+impl StreamingAudioSink {
+    fn append_source_samples(&self, source_samples: &[f32], source_rate: u32) {
+        if source_samples.is_empty() {
+            return;
+        }
+        let output_samples = if source_rate == self.output_rate {
+            source_samples.to_vec()
+        } else {
+            resample_linear_stereo(source_samples, source_rate, self.output_rate)
+        };
+        if output_samples.is_empty() {
+            return;
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.samples.extend_from_slice(&output_samples);
+        }
+    }
+
+    fn finish(&self, duration_secs: f64) {
+        if let Ok(mut shared) = self.shared.lock() {
+            if duration_secs.is_finite() && duration_secs > 0.0 {
+                shared.duration_secs = duration_secs;
+            }
+            shared.eof = true;
+        }
+    }
+
+    fn fail(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.eof = true;
+            shared.playing = false;
+        }
+    }
+}
+
 fn fill_output(out: &mut [f32], out_channels: usize, shared: &Arc<Mutex<PlayerShared>>) {
     let Ok(mut state) = shared.lock() else {
         out.fill(0.0);
         return;
     };
     for frame in out.chunks_mut(out_channels) {
-        let (l, r) = if state.playing && state.position_frames < state.samples.len() / 2 {
+        let available_frames = state.samples.len() / 2;
+        let (l, r) = if state.playing && state.position_frames < available_frames {
             let i = state.position_frames * 2;
             state.position_frames += 1;
             (state.samples[i], state.samples[i + 1])
         } else {
-            state.playing = false;
+            if state.playing && state.eof {
+                state.playing = false;
+            }
             (0.0, 0.0)
         };
         for (ch, sample) in frame.iter_mut().enumerate() {
@@ -3657,6 +3773,44 @@ mod tests {
         let axis_x = spectrum_axis_x(rect, midi_to_hz(midi_c7));
 
         assert!((key.center().x - axis_x).abs() < 0.01);
+    }
+
+    #[test]
+    fn streaming_output_keeps_playing_during_buffer_underrun() {
+        let shared = Arc::new(Mutex::new(PlayerShared {
+            samples: Vec::new(),
+            sample_rate: 48_000,
+            duration_secs: 10.0,
+            position_frames: 0,
+            playing: true,
+            eof: false,
+        }));
+        let mut out = vec![1.0; 8];
+
+        fill_output(&mut out, 2, &shared);
+
+        assert!(out.iter().all(|sample| *sample == 0.0));
+        let state = shared.lock().unwrap();
+        assert!(state.playing);
+        assert_eq!(state.position_frames, 0);
+    }
+
+    #[test]
+    fn streaming_output_stops_after_eof_underrun() {
+        let shared = Arc::new(Mutex::new(PlayerShared {
+            samples: Vec::new(),
+            sample_rate: 48_000,
+            duration_secs: 10.0,
+            position_frames: 0,
+            playing: true,
+            eof: true,
+        }));
+        let mut out = vec![1.0; 8];
+
+        fill_output(&mut out, 2, &shared);
+
+        assert!(out.iter().all(|sample| *sample == 0.0));
+        assert!(!shared.lock().unwrap().playing);
     }
 
     #[test]

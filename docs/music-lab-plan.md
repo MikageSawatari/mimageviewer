@@ -88,8 +88,9 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - 音声ファイル、または動画ファイル内の音声トラックを開く
   - Open ダイアログとファイル D&D の両方で読み込みを開始する
   - probe 結果の duration / sample rate / channels で先に行枠を確保し、decode + timeline analysis は loader worker で継続する
+  - 再生は全尺解析完了を待たず、Open / D&D 直後に cpal stream を作り、loader worker が decode したチャンクを再生バッファへ順次流し込んで自動再生する
   - 新しいファイルを開いたら旧 loader へ cancel を立て、UI へ古い結果を書き戻さない
-  - 初期版は全尺 decode + timeline analysis 完了後に波形テクスチャを行単位で順次 raster する。解析自体の行単位 incremental 化は後続
+  - timeline / spectrum は全尺 decode + timeline analysis 完了後に表示し、波形テクスチャを行単位で順次 raster する。解析自体の行単位 incremental 化は後続
    - Play/Pause/Stop/seek 用の最小プレイヤー
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
