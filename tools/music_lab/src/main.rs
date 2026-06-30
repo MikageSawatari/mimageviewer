@@ -52,6 +52,8 @@ const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
 const TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME: usize = 1;
+const TIMELINE_PARTIAL_CHUNK_SECS: f64 = 5.0;
+const LOAD_MESSAGES_PER_FRAME: usize = 16;
 const TIMELINE_ROW_SECS_CHOICES: [f64; 8] = [5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
@@ -200,6 +202,10 @@ enum LoadMsg {
     Probed {
         path: PathBuf,
         info: AudioStreamInfo,
+    },
+    PartialTimeline {
+        bins: Vec<WaveformBin>,
+        decoded_duration_secs: f64,
     },
     Status(String),
     Loaded(Box<LoadedTrack>),
@@ -422,7 +428,6 @@ struct TimelineTextureCacheKey {
     metrics_h_px: usize,
     row_secs_millis: u32,
     rows: usize,
-    bins_len: usize,
     dark: bool,
 }
 
@@ -431,7 +436,7 @@ struct TimelineRasterRequest {
     row: usize,
     row_secs: f64,
     key: TimelineTextureCacheKey,
-    analysis: Arc<TimelineAnalysis>,
+    bins: Vec<WaveformBin>,
 }
 
 struct TimelineRasterResult {
@@ -484,6 +489,38 @@ impl TimelineTextureCache {
             self.raster_tx = Some(request_tx);
             self.raster_rx = Some(result_rx);
             self.raster_cancel = Some(cancel);
+        }
+    }
+
+    fn invalidate_all_rows(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        for row in &mut self.rows {
+            *row = None;
+        }
+        for pending in &mut self.pending {
+            *pending = None;
+        }
+    }
+
+    fn invalidate_time_range(&mut self, start_secs: f64, end_secs: f64, row_secs: f64) {
+        if self.rows.is_empty()
+            || !start_secs.is_finite()
+            || !end_secs.is_finite()
+            || row_secs <= 0.0
+        {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        for pending in &mut self.pending {
+            *pending = None;
+        }
+        let start_row = (start_secs.max(0.0) / row_secs).floor().max(0.0) as usize;
+        let end_row = (end_secs.max(start_secs).max(0.0) / row_secs)
+            .floor()
+            .max(start_row as f64) as usize;
+        let last_row = self.rows.len().saturating_sub(1);
+        for row in start_row.min(last_row)..=end_row.min(last_row) {
+            self.rows[row] = None;
         }
     }
 
@@ -544,7 +581,7 @@ impl TimelineTextureCache {
 
     fn row_texture(
         &mut self,
-        analysis: Arc<TimelineAnalysis>,
+        bins: &[WaveformBin],
         row: usize,
         row_secs: f64,
         key: TimelineTextureCacheKey,
@@ -562,12 +599,14 @@ impl TimelineTextureCache {
             let pending_current = self.pending[row]
                 .is_some_and(|pending| pending.key == key && pending.generation == self.generation);
             if !pending_current && let Some(tx) = self.raster_tx.as_ref() {
+                let row_start = row as f64 * row_secs;
+                let row_bins = timeline_bins_for_raster(bins, row_start, row_secs);
                 let request = TimelineRasterRequest {
                     generation: self.generation,
                     row,
                     row_secs,
                     key,
-                    analysis,
+                    bins: row_bins,
                 };
                 if tx.send(request).is_ok() {
                     self.pending[row] = Some(TimelinePendingRow {
@@ -619,7 +658,7 @@ fn run_timeline_raster_worker(
         let (image, represented_bins) = render_timeline_row_image(
             row_start,
             request.row_secs,
-            &request.analysis.bins,
+            &request.bins,
             request.key.width_px,
             request.key.waveform_h_px,
             request.key.gap_px,
@@ -655,6 +694,7 @@ struct MusicLabApp {
     active_path: Option<PathBuf>,
     track: Option<LoadedTrack>,
     loading_track: Option<LoadingTrack>,
+    partial_analysis: Option<TimelineAnalysis>,
     load_rx: Option<mpsc::Receiver<LoadMsg>>,
     load_cancel: Option<Arc<AtomicBool>>,
     load_status: String,
@@ -711,6 +751,7 @@ impl eframe::App for MusicLabApp {
         let mut timeline_stats = TimelineDrawStats::default();
         let track = self.track.as_ref();
         let loading_track = self.loading_track.as_ref();
+        let partial_analysis = self.partial_analysis.as_ref();
         let player = self.player.as_ref();
         let snap = self.player_snapshot();
         let row_secs = self.timeline_row_secs();
@@ -726,7 +767,28 @@ impl eframe::App for MusicLabApp {
                         .show(ui, |ui| {
                             timeline_stats = draw_timeline(
                                 ui,
-                                track,
+                                &track.analysis,
+                                track.decoded.info.duration_secs,
+                                player,
+                                snap,
+                                timeline_cache,
+                                row_secs,
+                                timeline_follow_playhead,
+                            );
+                        });
+                } else if let (Some(loading_track), Some(partial_analysis)) =
+                    (loading_track, partial_analysis)
+                {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            timeline_stats = draw_timeline(
+                                ui,
+                                partial_analysis,
+                                loading_track
+                                    .info
+                                    .duration_secs
+                                    .max(partial_analysis.stream.duration_secs),
                                 player,
                                 snap,
                                 timeline_cache,
@@ -967,7 +1029,11 @@ impl MusicLabApp {
                         "Row: {}",
                         format_row_secs(self.timeline_row_secs())
                     ));
-                    ui.label("Wave bins: analyzing");
+                    if let Some(partial) = &self.partial_analysis {
+                        ui.label(format!("Wave bins: {} loaded", partial.bins.len()));
+                    } else {
+                        ui.label("Wave bins: analyzing");
+                    }
                     ui.label(if self.player.is_some() {
                         "Playback: streaming during analysis"
                     } else {
@@ -1037,6 +1103,7 @@ impl MusicLabApp {
         self.player = None;
         self.track = None;
         self.loading_track = None;
+        self.partial_analysis = None;
         self.spectrum_bands.clear();
         self.spectrum_trail.clear();
         self.spectrum_prev_bands.clear();
@@ -1091,38 +1158,42 @@ impl MusicLabApp {
                     "Decoding timeline samples; playback starts after decode..."
                 };
                 let _ = tx.send(LoadMsg::Status(decode_status.to_string()));
-                let msg =
-                    match decode_audio_file(&load_path, &worker_cancel, streaming_sink.as_ref()) {
-                        Ok(decoded) => {
-                            if worker_cancel.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            let _ = tx.send(LoadMsg::Probed {
-                                path: load_path.clone(),
-                                info: decoded.info,
-                            });
-                            let _ = tx.send(LoadMsg::Status("Analyzing timeline...".to_string()));
-                            let analysis = analyze_stereo_timeline(
-                                &decoded.stereo_samples,
-                                decoded.info.sample_rate,
-                                music_lab_analysis_config(),
-                            );
-                            if worker_cancel.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            LoadMsg::Loaded(Box::new(LoadedTrack {
-                                path: load_path,
-                                decoded: Arc::new(decoded),
-                                analysis: Arc::new(analysis),
-                            }))
+                let msg = match decode_audio_file(
+                    &load_path,
+                    &worker_cancel,
+                    streaming_sink.as_ref(),
+                    Some(&tx),
+                ) {
+                    Ok(decoded) => {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
                         }
-                        Err(err) => {
-                            if let Some(sink) = &streaming_sink {
-                                sink.fail();
-                            }
-                            LoadMsg::Failed(err)
+                        let _ = tx.send(LoadMsg::Probed {
+                            path: load_path.clone(),
+                            info: decoded.info,
+                        });
+                        let _ = tx.send(LoadMsg::Status("Analyzing timeline...".to_string()));
+                        let analysis = analyze_stereo_timeline(
+                            &decoded.stereo_samples,
+                            decoded.info.sample_rate,
+                            music_lab_analysis_config(),
+                        );
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
                         }
-                    };
+                        LoadMsg::Loaded(Box::new(LoadedTrack {
+                            path: load_path,
+                            decoded: Arc::new(decoded),
+                            analysis: Arc::new(analysis),
+                        }))
+                    }
+                    Err(err) => {
+                        if let Some(sink) = &streaming_sink {
+                            sink.fail();
+                        }
+                        LoadMsg::Failed(err)
+                    }
+                };
                 let _ = tx.send(msg);
             });
         match spawn_result {
@@ -1143,11 +1214,26 @@ impl MusicLabApp {
             return;
         };
         let mut clear_loader = false;
+        let mut handled = 0usize;
         loop {
+            if handled >= LOAD_MESSAGES_PER_FRAME {
+                ctx.request_repaint_after(Duration::from_millis(1));
+                break;
+            }
+            handled += 1;
             match rx.try_recv() {
                 Ok(LoadMsg::Probed { path, info }) => {
                     if let Some(player) = &self.player {
                         player.set_duration_secs(info.duration_secs);
+                    }
+                    if let Some(partial) = self.partial_analysis.as_mut() {
+                        partial.stream = info;
+                    } else {
+                        self.partial_analysis = Some(TimelineAnalysis {
+                            stream: info,
+                            config: music_lab_analysis_config(),
+                            ..TimelineAnalysis::default()
+                        });
                     }
                     self.loading_track = Some(LoadingTrack { path, info });
                     self.load_status = if self.player.is_some() {
@@ -1162,10 +1248,46 @@ impl MusicLabApp {
                     self.load_status = status;
                     ctx.request_repaint();
                 }
+                Ok(LoadMsg::PartialTimeline {
+                    bins,
+                    decoded_duration_secs,
+                }) => {
+                    if !bins.is_empty() {
+                        let start_secs = bins
+                            .first()
+                            .map(|bin| bin.start_secs)
+                            .unwrap_or(decoded_duration_secs);
+                        let end_secs = bins
+                            .last()
+                            .map(|bin| bin.start_secs + bin.duration_secs)
+                            .unwrap_or(decoded_duration_secs);
+                        let partial =
+                            self.partial_analysis
+                                .get_or_insert_with(|| TimelineAnalysis {
+                                    stream: AudioStreamInfo {
+                                        duration_secs: decoded_duration_secs,
+                                        ..AudioStreamInfo::default()
+                                    },
+                                    config: music_lab_analysis_config(),
+                                    ..TimelineAnalysis::default()
+                                });
+                        partial.stream.duration_secs =
+                            partial.stream.duration_secs.max(decoded_duration_secs);
+                        partial.bins.extend(bins);
+                        self.timeline_cache.invalidate_time_range(
+                            start_secs,
+                            end_secs,
+                            self.timeline_row_secs(),
+                        );
+                        ctx.request_repaint();
+                    }
+                }
                 Ok(LoadMsg::Loaded(track)) => {
                     self.load_status = "Loaded".to_string();
                     let track = *track;
                     self.loading_track = None;
+                    self.partial_analysis = None;
+                    self.timeline_cache.invalidate_all_rows();
                     if self.player.is_none() {
                         match LabPlayer::new(Arc::clone(&track.decoded), true) {
                             Ok(player) => self.player = Some(player),
@@ -1183,6 +1305,7 @@ impl MusicLabApp {
                 Ok(LoadMsg::Failed(err)) => {
                     self.load_status = err;
                     self.loading_track = None;
+                    self.partial_analysis = None;
                     clear_loader = true;
                     break;
                 }
@@ -1193,6 +1316,7 @@ impl MusicLabApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.load_status = "Loader stopped".to_string();
                     self.loading_track = None;
+                    self.partial_analysis = None;
                     clear_loader = true;
                     break;
                 }
@@ -1365,7 +1489,8 @@ const TIMELINE_METRIC_KINDS: [TimelineMetricKind; TIMELINE_METRIC_LANE_COUNT] = 
 
 fn draw_timeline(
     ui: &mut egui::Ui,
-    track: &LoadedTrack,
+    analysis: &TimelineAnalysis,
+    duration_secs: f64,
     player: Option<&LabPlayer>,
     snap: PlaybackSnapshot,
     cache: &mut TimelineTextureCache,
@@ -1374,7 +1499,7 @@ fn draw_timeline(
 ) -> TimelineDrawStats {
     let mut stats = TimelineDrawStats::default();
     let row_secs = row_secs.max(1.0);
-    let rows = timeline_row_count(track.decoded.info.duration_secs, row_secs);
+    let rows = timeline_row_count(duration_secs, row_secs);
     let row_gap = TIMELINE_ROW_GAP;
     let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_METRICS_H;
     let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
@@ -1401,7 +1526,6 @@ fn draw_timeline(
         metrics_h_px,
         row_secs_millis: (row_secs * 1000.0).round() as u32,
         rows,
-        bins_len: track.analysis.bins.len(),
         dark: true,
     };
     cache.ensure(texture_key);
@@ -1449,7 +1573,7 @@ fn draw_timeline(
             pending_raster = true;
         }
         let (row_texture, request_sent) =
-            cache.row_texture(Arc::clone(&track.analysis), row, row_secs, texture_key);
+            cache.row_texture(&analysis.bins, row, row_secs, texture_key);
         if request_sent {
             pending_raster = true;
         }
@@ -1468,7 +1592,7 @@ fn draw_timeline(
             egui::FontId::monospace(12.0),
             ui.visuals().text_color(),
         );
-        draw_beat_grid(&painter, row_rect, row_start, row_secs, &track.analysis);
+        draw_beat_grid(&painter, row_rect, row_start, row_secs, analysis);
     }
     if pending_raster {
         ui.ctx().request_repaint_after(Duration::from_millis(1));
@@ -1492,7 +1616,7 @@ fn draw_timeline(
             row_h,
             row_gap,
             rows,
-            &track.analysis.bins,
+            &analysis.bins,
         );
     }
 
@@ -1796,6 +1920,27 @@ fn music_lab_analysis_config() -> AnalysisConfig {
         bin_secs: 0.010,
         ..AnalysisConfig::default()
     }
+}
+
+fn partial_timeline_analysis_config() -> AnalysisConfig {
+    music_lab_analysis_config()
+}
+
+fn timeline_bins_for_raster(
+    bins: &[WaveformBin],
+    row_start: f64,
+    row_secs: f64,
+) -> Vec<WaveformBin> {
+    if bins.is_empty() {
+        return Vec::new();
+    }
+    let row_end = row_start + row_secs;
+    let pad = TIMELINE_KEY_WINDOW_SECS * 0.5;
+    let copy_start = (row_start - pad).max(0.0);
+    let copy_end = row_end + pad;
+    let start_idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs < copy_start);
+    let end_idx = bins.partition_point(|bin| bin.start_secs <= copy_end);
+    bins[start_idx..end_idx].to_vec()
 }
 
 fn render_timeline_row_image(
@@ -3523,6 +3668,7 @@ fn decode_audio_file(
     path: &Path,
     cancel: &AtomicBool,
     streaming_sink: Option<&StreamingAudioSink>,
+    partial_tx: Option<&mpsc::Sender<LoadMsg>>,
 ) -> Result<DecodedAudio, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -3568,6 +3714,8 @@ fn decode_audio_file(
         .map_err(|e| format!("decoder: {e}"))?;
 
     let mut stereo_samples = Vec::new();
+    let mut partial_samples = Vec::new();
+    let mut partial_start_secs = 0.0_f64;
     let mut stream_info = AudioStreamInfo::default();
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -3606,12 +3754,31 @@ fn decode_audio_file(
         if let Some(sink) = streaming_sink {
             sink.append_source_samples(&packet_stereo, spec.rate);
         }
+        if partial_tx.is_some() {
+            partial_samples.extend_from_slice(&packet_stereo);
+            flush_ready_partial_timeline(
+                partial_tx,
+                &mut partial_samples,
+                &mut partial_start_secs,
+                spec.rate,
+                false,
+            );
+        }
         stereo_samples.extend_from_slice(&packet_stereo);
     }
     stream_info.duration_secs =
         stereo_samples.len() as f64 / 2.0 / stream_info.sample_rate.max(1) as f64;
     if stereo_samples.is_empty() {
         return Err("no decoded samples".to_string());
+    }
+    if partial_tx.is_some() {
+        flush_ready_partial_timeline(
+            partial_tx,
+            &mut partial_samples,
+            &mut partial_start_secs,
+            stream_info.sample_rate,
+            true,
+        );
     }
     if let Some(sink) = streaming_sink {
         sink.finish(stream_info.duration_secs);
@@ -3620,6 +3787,50 @@ fn decode_audio_file(
         info: stream_info,
         stereo_samples,
     })
+}
+
+fn flush_ready_partial_timeline(
+    partial_tx: Option<&mpsc::Sender<LoadMsg>>,
+    partial_samples: &mut Vec<f32>,
+    partial_start_secs: &mut f64,
+    sample_rate: u32,
+    force: bool,
+) {
+    let Some(tx) = partial_tx else {
+        return;
+    };
+    let sample_rate = sample_rate.max(1);
+    let chunk_frames = (TIMELINE_PARTIAL_CHUNK_SECS * sample_rate as f64)
+        .round()
+        .max(1.0) as usize;
+    loop {
+        let available_frames = partial_samples.len() / 2;
+        if available_frames < chunk_frames && !(force && available_frames > 0) {
+            break;
+        }
+        let take_frames = if force {
+            available_frames.min(chunk_frames).max(1)
+        } else {
+            chunk_frames
+        };
+        let take_samples = take_frames * 2;
+        let rest = partial_samples.split_off(take_samples);
+        let chunk = std::mem::replace(partial_samples, rest);
+        let decoded_duration_secs = *partial_start_secs + take_frames as f64 / sample_rate as f64;
+        let mut analysis =
+            analyze_stereo_timeline(&chunk, sample_rate, partial_timeline_analysis_config());
+        for bin in &mut analysis.bins {
+            bin.start_secs += *partial_start_secs;
+        }
+        *partial_start_secs = decoded_duration_secs;
+        let _ = tx.send(LoadMsg::PartialTimeline {
+            bins: analysis.bins,
+            decoded_duration_secs,
+        });
+        if force && partial_samples.is_empty() {
+            break;
+        }
+    }
 }
 
 struct LabPlayer {
@@ -3925,6 +4136,22 @@ mod tests {
         let axis_x = spectrum_axis_x(rect, midi_to_hz(midi_c7));
 
         assert!((key.center().x - axis_x).abs() < 0.01);
+    }
+
+    #[test]
+    fn timeline_raster_bins_include_key_window_padding() {
+        let bins: Vec<WaveformBin> = (0..20)
+            .map(|idx| WaveformBin {
+                start_secs: idx as f64,
+                duration_secs: 1.0,
+                ..WaveformBin::default()
+            })
+            .collect();
+
+        let row_bins = timeline_bins_for_raster(&bins, 10.0, 5.0);
+
+        assert!(row_bins.first().is_some_and(|bin| bin.start_secs <= 7.0));
+        assert!(row_bins.last().is_some_and(|bin| bin.start_secs >= 18.0));
     }
 
     #[test]

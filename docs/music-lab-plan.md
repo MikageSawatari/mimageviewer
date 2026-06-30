@@ -90,7 +90,8 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - probe 結果の duration / sample rate / channels で先に行枠を確保し、decode + timeline analysis は loader worker で継続する
   - 再生は全尺解析完了を待たず、Open / D&D 直後に cpal stream を作り、loader worker が decode したチャンクを再生バッファへ順次流し込んで自動再生する
   - 新しいファイルを開いたら旧 loader へ cancel を立て、UI へ古い結果を書き戻さない
-  - timeline / spectrum は全尺 decode + timeline analysis 完了後に表示する。timeline 行テクスチャの raster は worker で行い、UI thread は完成画像を少量ずつ texture upload する。解析自体の行単位 incremental 化は後続
+  - timeline は decode 中も約 5 秒単位の部分解析を受け取り、解析済み区間から順次表示する。完了後は全尺 timeline analysis の確定版で置き換える
+  - timeline 行テクスチャの raster は worker で行い、UI thread は完成画像を少量ずつ texture upload する。spectrum は全尺 decode 完了後に開始する
    - Play/Pause/Stop/seek 用の最小プレイヤー
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
