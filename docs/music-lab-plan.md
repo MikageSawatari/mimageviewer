@@ -55,6 +55,9 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - 曲冒頭シーク用途では音源分離ではなく、vocal activity 区間だけを検出する。
   - Clean MVP は数秒窓の mid-band energy、harmonicity、spectral flatness、onset density から
     vocal-likelihood を作り、歌い出し候補時刻だけをキャッシュする。
+  - 初期実装は `WaveformBin.vocal_score` として、軽量 DSP の中域比率 / zero-crossing /
+    crest / transient 抑制 / 約 1 秒の持続性から 0..1 のスコアを作る。ラウドネス下段は
+    `vocal_score` が高い区間だけ寒色へ寄せる。
   - All-In-One の demixed vocal stem や embeddings を利用できるか評価する。
   - Demucs / htdemucs は MIT だが重いため、必要なら任意のバックグラウンド高精度解析として扱う。
   - inaSpeechSegmenter は MIT だが singing voice は music 扱いなので、歌あり区間の検出にはそのまま使わない。

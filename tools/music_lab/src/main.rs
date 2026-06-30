@@ -1283,7 +1283,7 @@ fn render_timeline_row_image(
             loudness_bottom - loudness_value_h,
             loudness_x1,
             loudness_bottom,
-            loudness_color(loudness),
+            loudness_color(loudness, bin.vocal_score),
         );
     }
 
@@ -2171,9 +2171,9 @@ fn transient_color(band: [f32; 3], strength: f32) -> egui::Color32 {
     brighten_color(color, 1.0 + strength.clamp(0.0, 1.0) * 0.24)
 }
 
-fn loudness_color(value: f32) -> egui::Color32 {
+fn loudness_color(value: f32, vocal_score: f32) -> egui::Color32 {
     let value = value.clamp(0.0, 1.0);
-    let base = if value < 0.58 {
+    let warm = if value < 0.58 {
         lerp_color(
             egui::Color32::from_rgb(40, 190, 80),
             egui::Color32::from_rgb(215, 225, 54),
@@ -2186,7 +2186,21 @@ fn loudness_color(value: f32) -> egui::Color32 {
             (value - 0.58) / 0.42,
         )
     };
-    color_with_alpha(base, 210)
+    let cool = if value < 0.58 {
+        lerp_color(
+            egui::Color32::from_rgb(20, 155, 170),
+            egui::Color32::from_rgb(45, 220, 230),
+            value / 0.58,
+        )
+    } else {
+        lerp_color(
+            egui::Color32::from_rgb(45, 220, 230),
+            egui::Color32::from_rgb(94, 150, 255),
+            (value - 0.58) / 0.42,
+        )
+    };
+    let vocal = vocal_score.clamp(0.0, 1.0).powf(0.75) * 0.90;
+    color_with_alpha(lerp_color(warm, cool, vocal), 210)
 }
 
 fn spectrum_color(index: usize, total: usize, value: f32) -> egui::Color32 {

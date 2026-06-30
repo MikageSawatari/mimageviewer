@@ -119,6 +119,8 @@ pub struct WaveformBin {
     pub transient: f32,
     /// Normalized low / mid / high contribution to the transient accent.
     pub transient_band: [f32; 3],
+    /// 0..1 lightweight vocal-likelihood estimate for timeline coloring.
+    pub vocal_score: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -147,6 +149,7 @@ pub fn analyze_stereo_timeline(
     let mut prev_band_rms = [0.0_f32; 3];
     let low_alpha = one_pole_alpha(config.low_cut_hz, sample_rate);
     let mid_alpha = one_pole_alpha(config.mid_cut_hz, sample_rate);
+    let mut vocal_raw = Vec::with_capacity(frame_count.div_ceil(frames_per_bin));
 
     let mut frame_start = 0usize;
     while frame_start < frame_count {
@@ -156,6 +159,10 @@ pub fn analyze_stereo_timeline(
         let mut low_sum = 0.0_f64;
         let mut mid_sum = 0.0_f64;
         let mut high_sum = 0.0_f64;
+        let mut abs_sum = 0.0_f64;
+        let mut crossings = 0usize;
+        let mut prev_mono = 0.0_f32;
+        let mut have_prev_mono = false;
 
         for frame_idx in frame_start..frame_end {
             let l = stereo_samples[frame_idx * 2];
@@ -164,6 +171,15 @@ pub fn analyze_stereo_timeline(
             let abs = mono.abs();
             peak = peak.max(abs);
             square_sum += (mono as f64) * (mono as f64);
+            abs_sum += abs as f64;
+            if have_prev_mono
+                && mono.signum() != prev_mono.signum()
+                && abs.max(prev_mono.abs()) > 0.004
+            {
+                crossings += 1;
+            }
+            prev_mono = mono;
+            have_prev_mono = true;
 
             low_state += low_alpha * (mono - low_state);
             mid_state += mid_alpha * (mono - mid_state);
@@ -184,6 +200,11 @@ pub fn analyze_stereo_timeline(
             (mid_sum / n).sqrt() as f32,
             (high_sum / n).sqrt() as f32,
         ];
+        let band_energy = [
+            (low_sum / total_band) as f32,
+            (mid_sum / total_band) as f32,
+            (high_sum / total_band) as f32,
+        ];
         let transient_raw = [
             (band_rms[0] - prev_band_rms[0] - 0.006).max(0.0),
             (band_rms[1] - prev_band_rms[1] - 0.006).max(0.0),
@@ -200,19 +221,29 @@ pub fn analyze_stereo_timeline(
         } else {
             [0.0; 3]
         };
+        let crest = peak / rms.max(1.0e-6);
+        let zero_cross_rate = crossings as f32 / (frame_end - frame_start).max(1) as f32;
+        let mean_abs = (abs_sum / n) as f32;
+        let vocal_candidate = vocal_candidate_score(
+            loudness_db,
+            band_energy,
+            zero_cross_rate,
+            crest,
+            transient,
+            mean_abs,
+            rms,
+        );
+        vocal_raw.push(vocal_candidate);
         bins.push(WaveformBin {
             start_secs: frame_start as f64 / sample_rate as f64,
             duration_secs: (frame_end - frame_start) as f64 / sample_rate as f64,
             peak,
             rms,
             loudness_db,
-            band_energy: [
-                (low_sum / total_band) as f32,
-                (mid_sum / total_band) as f32,
-                (high_sum / total_band) as f32,
-            ],
+            band_energy,
             transient,
             transient_band,
+            vocal_score: 0.0,
         });
         prev_band_rms = [
             prev_band_rms[0] * 0.68 + band_rms[0] * 0.32,
@@ -222,6 +253,7 @@ pub fn analyze_stereo_timeline(
 
         frame_start = frame_end;
     }
+    apply_vocal_scores(&mut bins, &vocal_raw, config.bin_secs);
 
     let beat_grid = estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs);
 
@@ -546,6 +578,78 @@ fn linear_to_db(v: f32) -> f32 {
     }
 }
 
+fn vocal_candidate_score(
+    loudness_db: f32,
+    band_energy: [f32; 3],
+    zero_cross_rate: f32,
+    crest: f32,
+    transient: f32,
+    mean_abs: f32,
+    rms: f32,
+) -> f32 {
+    let loudness_gate = smoothstep(-48.0, -20.0, loudness_db);
+    let mid_score = smoothstep(0.20, 0.58, band_energy[1]);
+    let low_penalty = 1.0 - 0.65 * smoothstep(0.48, 0.78, band_energy[0]);
+    let high_penalty = 1.0 - 0.65 * smoothstep(0.43, 0.72, band_energy[2]);
+    let zcr_score = smoothstep(0.0035, 0.010, zero_cross_rate)
+        * (1.0 - smoothstep(0.08, 0.16, zero_cross_rate));
+    let abs_to_rms = mean_abs / rms.max(1.0e-6);
+    let fullness =
+        smoothstep(0.38, 0.64, abs_to_rms) * (1.0 - 0.35 * smoothstep(0.84, 0.96, abs_to_rms));
+    let crest_penalty = 1.0 - 0.75 * smoothstep(5.5, 14.0, crest);
+    let transient_penalty = 1.0 - 0.75 * smoothstep(0.28, 0.85, transient);
+
+    let spectral = (mid_score * low_penalty * high_penalty).sqrt();
+    let tonal = zcr_score * 0.64 + fullness * 0.36;
+    (loudness_gate * spectral * tonal * crest_penalty * transient_penalty).clamp(0.0, 1.0)
+}
+
+fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
+    if bins.is_empty() || raw.is_empty() {
+        return;
+    }
+    let radius = (0.45 / bin_secs.max(0.01)).round().max(1.0) as usize;
+    let mut smoothed = vec![0.0_f32; bins.len()];
+    for i in 0..bins.len() {
+        let start = i.saturating_sub(radius);
+        let end = (i + radius + 1).min(raw.len());
+        let mut score_sum = 0.0;
+        let mut transient_sum = 0.0;
+        let mut count = 0usize;
+        for j in start..end {
+            score_sum += raw[j];
+            transient_sum += bins[j].transient;
+            count += 1;
+        }
+        let count_f = count.max(1) as f32;
+        let local_score = score_sum / count_f;
+        let local_transient = transient_sum / count_f;
+        let sustain_gate = smoothstep(0.10, 0.38, local_score);
+        let transient_penalty = 1.0 - 0.55 * smoothstep(0.20, 0.75, local_transient);
+        smoothed[i] =
+            ((local_score * 0.78 + raw[i] * 0.22).powf(0.85) * sustain_gate * transient_penalty)
+                .clamp(0.0, 1.0);
+    }
+
+    let mut state = 0.0_f32;
+    for (bin, target) in bins.iter_mut().zip(smoothed) {
+        if target > state {
+            state = state * 0.78 + target * 0.22;
+        } else {
+            state = (state * 0.94).max(target * 0.55);
+        }
+        bin.vocal_score = state.clamp(0.0, 1.0);
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    if (edge1 - edge0).abs() <= f32::EPSILON {
+        return if value >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn estimate_simple_beat_grid(bins: &[WaveformBin], duration_secs: f64, bin_secs: f64) -> BeatGrid {
     if bins.len() < 32 || bin_secs <= 0.0 {
         return BeatGrid::empty();
@@ -629,6 +733,62 @@ mod tests {
         }
         let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
         assert!(analysis.bins.iter().any(|b| b.transient > 0.25));
+    }
+
+    #[test]
+    fn analysis_marks_sustained_midrange_as_vocal_candidate() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let t = i as f32 / 48_000.0;
+            let envelope = if t < 0.1 {
+                t / 0.1
+            } else if t > 1.9 {
+                (2.0 - t) / 0.1
+            } else {
+                1.0
+            }
+            .clamp(0.0, 1.0);
+            let x = envelope
+                * 0.20
+                * ((std::f32::consts::TAU * 220.0 * t).sin()
+                    + 0.55 * (std::f32::consts::TAU * 440.0 * t).sin()
+                    + 0.35 * (std::f32::consts::TAU * 660.0 * t).sin()
+                    + 0.18 * (std::f32::consts::TAU * 880.0 * t).sin());
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let max_vocal = analysis
+            .bins
+            .iter()
+            .map(|b| b.vocal_score)
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_vocal > 0.35, "max_vocal={max_vocal}");
+    }
+
+    #[test]
+    fn analysis_keeps_percussive_bursts_low_vocal_score() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let phase = i % 12_000;
+            let x = if phase < 220 {
+                let decay = 1.0 - phase as f32 / 220.0;
+                0.9 * decay
+            } else {
+                0.0
+            };
+            samples.extend([x, x]);
+        }
+
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let max_vocal = analysis
+            .bins
+            .iter()
+            .map(|b| b.vocal_score)
+            .fold(0.0_f32, f32::max);
+
+        assert!(max_vocal < 0.18, "max_vocal={max_vocal}");
     }
 
     #[test]
