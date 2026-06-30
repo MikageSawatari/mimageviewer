@@ -28,6 +28,22 @@ const TIMELINE_ROOT_MIN_SEGMENT_SECS: f64 = 0.050;
 const TIMELINE_ROOT_MAX_SEGMENT_SECS: f64 = 0.100;
 const TIMELINE_ROOT_TRANSIENT_THRESHOLD: f32 = 0.16;
 const TIMELINE_KEY_WINDOW_SECS: f64 = 6.0;
+const TIMELINE_KEY_TRANSIENT_PENALTY_START: f32 = 0.18;
+const TIMELINE_KEY_TRANSIENT_PENALTY_END: f32 = 0.72;
+const TIMELINE_KEY_DENSITY_PENALTY_START: f32 = 0.16;
+const TIMELINE_KEY_DENSITY_PENALTY_END: f32 = 0.62;
+const TIMELINE_KEY_KRUMHANSL_WEIGHT: f32 = 0.64;
+const TIMELINE_KEY_TEMPERLEY_WEIGHT: f32 = 0.36;
+const TIMELINE_KEY_KRUMHANSL_MAJOR_PROFILE: [f32; 12] = [
+    6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+];
+const TIMELINE_KEY_KRUMHANSL_MINOR_PROFILE: [f32; 12] = [
+    6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+];
+const TIMELINE_KEY_TEMPERLEY_MAJOR_PROFILE: [f32; 12] =
+    [5.0, 2.0, 3.5, 2.0, 4.5, 4.0, 2.0, 4.5, 2.0, 3.5, 1.5, 4.0];
+const TIMELINE_KEY_TEMPERLEY_MINOR_PROFILE: [f32; 12] =
+    [5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 1.5, 4.0];
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
@@ -1515,6 +1531,29 @@ struct TimelinePitchHint {
     confidence: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimelineKeyMode {
+    Major,
+    Minor,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineKeyHint {
+    pitch_class: u8,
+    mode: TimelineKeyMode,
+    confidence: f32,
+}
+
+impl Default for TimelineKeyHint {
+    fn default() -> Self {
+        Self {
+            pitch_class: 0,
+            mode: TimelineKeyMode::Major,
+            confidence: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TimelineRhythmSegment {
     start: usize,
@@ -1586,8 +1625,8 @@ fn build_key_display_hints(
     bins: &[WaveformBin],
     visible_bins: &[TimelineVisibleBin],
     rhythm_segments: &[TimelineRhythmSegment],
-) -> Vec<TimelinePitchHint> {
-    let mut hints = vec![TimelinePitchHint::default(); visible_bins.len()];
+) -> Vec<TimelineKeyHint> {
+    let mut hints = vec![TimelineKeyHint::default(); visible_bins.len()];
     for segment in rhythm_segments {
         if segment.start >= segment.end {
             continue;
@@ -1624,24 +1663,156 @@ fn vote_bass_root_hint(
     best_pitch_hint(votes, count)
 }
 
-fn vote_key_hint(bins: &[WaveformBin]) -> TimelinePitchHint {
-    let mut votes = [0.0_f32; 12];
+fn vote_key_hint(bins: &[WaveformBin]) -> TimelineKeyHint {
+    let mut chroma = [0.0_f32; 12];
+    let mut presence = [0.0_f32; 12];
+    let mut total_weight = 0.0_f32;
     for bin in bins {
-        let weight = (bin.key_confidence * timeline_loudness_value(bin).powf(0.72)).clamp(0.0, 1.0);
-        votes[bin.key_pitch_class as usize % 12] += weight;
+        let weight = key_chroma_bin_weight(bin);
+        if weight <= 1.0e-5 {
+            continue;
+        }
+        let bin_max = bin.chroma.iter().copied().fold(0.0_f32, f32::max);
+        for (pc, value) in bin.chroma.iter().copied().enumerate() {
+            let value = value.max(0.0);
+            chroma[pc] += value.powf(1.08) * weight;
+            if bin_max > 1.0e-6 {
+                presence[pc] += smoothstep(bin_max * 0.36, bin_max * 0.70, value) * weight.sqrt();
+            }
+        }
+        total_weight += weight;
     }
-    best_pitch_hint(votes, bins.len())
+    profile_key_hint(chroma, presence, total_weight)
 }
 
-fn key_hint_at_time(bins: &[WaveformBin], time_secs: f64) -> TimelinePitchHint {
+fn key_hint_at_time(bins: &[WaveformBin], time_secs: f64) -> TimelineKeyHint {
     if bins.is_empty() || !time_secs.is_finite() {
-        return TimelinePitchHint::default();
+        return TimelineKeyHint::default();
     }
     let window_start = time_secs - TIMELINE_KEY_WINDOW_SECS * 0.5;
     let window_end = time_secs + TIMELINE_KEY_WINDOW_SECS * 0.5;
     let start_idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
     let end_idx = bins.partition_point(|bin| bin.start_secs < window_end);
     vote_key_hint(&bins[start_idx..end_idx])
+}
+
+fn key_chroma_bin_weight(bin: &WaveformBin) -> f32 {
+    // Lightweight HPSS-style gate: keep sustained harmonic chroma and discount percussive bins.
+    let loudness = timeline_loudness_value(bin).powf(1.18);
+    let transient_keep = 1.0
+        - 0.82
+            * smoothstep(
+                TIMELINE_KEY_TRANSIENT_PENALTY_START,
+                TIMELINE_KEY_TRANSIENT_PENALTY_END,
+                bin.transient,
+            );
+    let density_keep = 1.0
+        - 0.48
+            * smoothstep(
+                TIMELINE_KEY_DENSITY_PENALTY_START,
+                TIMELINE_KEY_DENSITY_PENALTY_END,
+                bin.transient_density,
+            );
+    let confidence = 0.36 + bin.key_confidence.clamp(0.0, 1.0) * 0.64;
+    (loudness * transient_keep * density_keep * confidence).clamp(0.0, 1.0)
+}
+
+fn profile_key_hint(chroma: [f32; 12], presence: [f32; 12], total_weight: f32) -> TimelineKeyHint {
+    if total_weight <= 1.0e-6 || chroma.iter().copied().sum::<f32>() <= 1.0e-6 {
+        return TimelineKeyHint::default();
+    }
+
+    let mut best = TimelineKeyCandidate::default();
+    let mut second = TimelineKeyCandidate::default();
+    for root in 0..12 {
+        for mode in [TimelineKeyMode::Major, TimelineKeyMode::Minor] {
+            let score = blended_key_profile_score(&chroma, &presence, root, mode);
+            let candidate = TimelineKeyCandidate {
+                pitch_class: root as u8,
+                mode,
+                score,
+            };
+            if candidate.score > best.score {
+                second = best;
+                best = candidate;
+            } else if candidate.score > second.score {
+                second = candidate;
+            }
+        }
+    }
+
+    let energy =
+        (chroma.iter().copied().sum::<f32>() / total_weight.max(1.0e-6)).clamp(0.0, 4.0) / 4.0;
+    let margin = (best.score - second.score).max(0.0);
+    let confidence = (smoothstep(0.025, 0.18, margin)
+        * smoothstep(0.08, 0.36, best.score.max(0.0))
+        * (0.45 + 0.55 * energy.sqrt()))
+    .clamp(0.0, 1.0);
+
+    TimelineKeyHint {
+        pitch_class: best.pitch_class,
+        mode: best.mode,
+        confidence,
+    }
+}
+
+fn blended_key_profile_score(
+    chroma: &[f32; 12],
+    presence: &[f32; 12],
+    root: usize,
+    mode: TimelineKeyMode,
+) -> f32 {
+    let (krumhansl, temperley) = match mode {
+        TimelineKeyMode::Major => (
+            TIMELINE_KEY_KRUMHANSL_MAJOR_PROFILE,
+            TIMELINE_KEY_TEMPERLEY_MAJOR_PROFILE,
+        ),
+        TimelineKeyMode::Minor => (
+            TIMELINE_KEY_KRUMHANSL_MINOR_PROFILE,
+            TIMELINE_KEY_TEMPERLEY_MINOR_PROFILE,
+        ),
+    };
+    let chroma_score = profile_correlation(chroma, &krumhansl, root);
+    let presence_score = profile_correlation(presence, &temperley, root);
+    chroma_score * TIMELINE_KEY_KRUMHANSL_WEIGHT + presence_score * TIMELINE_KEY_TEMPERLEY_WEIGHT
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineKeyCandidate {
+    pitch_class: u8,
+    mode: TimelineKeyMode,
+    score: f32,
+}
+
+impl Default for TimelineKeyCandidate {
+    fn default() -> Self {
+        Self {
+            pitch_class: 0,
+            mode: TimelineKeyMode::Major,
+            score: f32::NEG_INFINITY,
+        }
+    }
+}
+
+fn profile_correlation(chroma: &[f32; 12], profile: &[f32; 12], root: usize) -> f32 {
+    let chroma_mean = chroma.iter().copied().sum::<f32>() / 12.0;
+    let profile_mean = profile.iter().copied().sum::<f32>() / 12.0;
+    let mut numerator = 0.0_f32;
+    let mut chroma_norm = 0.0_f32;
+    let mut profile_norm = 0.0_f32;
+    for pc in 0..12 {
+        let chroma_value = chroma[pc] - chroma_mean;
+        let degree = (pc + 12 - root) % 12;
+        let profile_value = profile[degree] - profile_mean;
+        numerator += chroma_value * profile_value;
+        chroma_norm += chroma_value * chroma_value;
+        profile_norm += profile_value * profile_value;
+    }
+    if chroma_norm <= 1.0e-8 || profile_norm <= 1.0e-8 {
+        0.0
+    } else {
+        numerator / (chroma_norm.sqrt() * profile_norm.sqrt())
+    }
 }
 
 fn best_pitch_hint(votes: [f32; 12], count: usize) -> TimelinePitchHint {
@@ -1676,7 +1847,7 @@ fn draw_timeline_metric_bins(
     x1: f32,
     bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
-    key_hint: TimelinePitchHint,
+    key_hint: TimelineKeyHint,
 ) {
     if metrics_h == 0 {
         return;
@@ -1745,7 +1916,7 @@ fn timeline_metric_display_value(
     kind: TimelineMetricKind,
     bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
-    key_hint: TimelinePitchHint,
+    key_hint: TimelineKeyHint,
 ) -> f32 {
     match kind {
         TimelineMetricKind::LoudnessBassRoot => {
@@ -1791,6 +1962,14 @@ fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
     ((value - low) / (high - low)).clamp(0.0, 1.0)
 }
 
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    if (edge1 - edge0).abs() <= f32::EPSILON {
+        return if value >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::LoudnessBassRoot => "Loudness+Bass",
@@ -1801,7 +1980,7 @@ fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::LoudnessBassRoot => "Height RMS, color bass root",
-        TimelineMetricKind::Key => "Long-window chroma",
+        TimelineMetricKind::Key => "Transient-suppressed chroma profile",
     }
 }
 
@@ -1818,7 +1997,11 @@ fn timeline_metric_extra(
         TimelineMetricKind::Key => {
             let hint = key_hint_at_time(bins, time_secs);
             if hint.confidence > 0.05 {
-                format!(" {}", pitch_class_name(hint.pitch_class))
+                format!(
+                    " {} {}",
+                    pitch_class_name(hint.pitch_class),
+                    key_mode_label(hint.mode)
+                )
             } else {
                 String::new()
             }
@@ -1832,7 +2015,7 @@ fn timeline_metric_color(
     value: f32,
     _bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
-    key_hint: TimelinePitchHint,
+    key_hint: TimelineKeyHint,
 ) -> egui::Color32 {
     let value = value.clamp(0.0, 1.0);
     let base = match kind {
@@ -1863,6 +2046,13 @@ fn timeline_metric_color(
         brighten_color(base, 0.42 + value * 0.72),
         (58.0 + value * 162.0) as u8,
     )
+}
+
+fn key_mode_label(mode: TimelineKeyMode) -> &'static str {
+    match mode {
+        TimelineKeyMode::Major => "maj",
+        TimelineKeyMode::Minor => "min",
+    }
 }
 
 fn draw_spectral_waveform_bin_pixels(
@@ -3034,6 +3224,36 @@ fn format_row_secs(secs: f64) -> String {
 mod tests {
     use super::*;
 
+    fn profile_chroma(root: usize, mode: TimelineKeyMode) -> [f32; 12] {
+        let profile = match mode {
+            TimelineKeyMode::Major => TIMELINE_KEY_KRUMHANSL_MAJOR_PROFILE,
+            TimelineKeyMode::Minor => TIMELINE_KEY_KRUMHANSL_MINOR_PROFILE,
+        };
+        let mut chroma = [0.0_f32; 12];
+        for (degree, value) in profile.into_iter().enumerate() {
+            chroma[(root + degree) % 12] = value / 6.35;
+        }
+        chroma
+    }
+
+    fn key_test_bin(
+        start_secs: f64,
+        chroma: [f32; 12],
+        transient: f32,
+        transient_density: f32,
+    ) -> WaveformBin {
+        WaveformBin {
+            start_secs,
+            duration_secs: 0.1,
+            loudness_db: -12.0,
+            transient,
+            transient_density,
+            key_confidence: 0.85,
+            chroma,
+            ..WaveformBin::default()
+        }
+    }
+
     #[test]
     fn keyboard_highlight_suppresses_flat_note_bed() {
         let notes = vec![0.45; 24];
@@ -3148,18 +3368,80 @@ mod tests {
         let mut bins = Vec::new();
         for idx in 0..100 {
             let first_key = idx < 55;
-            bins.push(WaveformBin {
-                start_secs: idx as f64 * 0.1,
-                duration_secs: 0.1,
-                loudness_db: -12.0,
-                key_pitch_class: if first_key { 2 } else { 7 },
-                key_confidence: 0.85,
-                ..WaveformBin::default()
-            });
+            let root = if first_key { 2 } else { 7 };
+            bins.push(key_test_bin(
+                idx as f64 * 0.1,
+                profile_chroma(root, TimelineKeyMode::Major),
+                0.05,
+                0.05,
+            ));
         }
 
-        assert_eq!(key_hint_at_time(&bins, 2.0).pitch_class, 2);
-        assert_eq!(key_hint_at_time(&bins, 8.0).pitch_class, 7);
+        let first = key_hint_at_time(&bins, 2.0);
+        let second = key_hint_at_time(&bins, 8.0);
+        assert_eq!(first.pitch_class, 2);
+        assert_eq!(first.mode, TimelineKeyMode::Major);
+        assert_eq!(second.pitch_class, 7);
+        assert_eq!(second.mode, TimelineKeyMode::Major);
+    }
+
+    #[test]
+    fn timeline_key_hint_matches_major_and_minor_profiles() {
+        let c_major = vote_key_hint(
+            &(0..24)
+                .map(|idx| {
+                    key_test_bin(
+                        idx as f64 * 0.1,
+                        profile_chroma(0, TimelineKeyMode::Major),
+                        0.04,
+                        0.04,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let a_minor = vote_key_hint(
+            &(0..24)
+                .map(|idx| {
+                    key_test_bin(
+                        idx as f64 * 0.1,
+                        profile_chroma(9, TimelineKeyMode::Minor),
+                        0.04,
+                        0.04,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(c_major.pitch_class, 0);
+        assert_eq!(c_major.mode, TimelineKeyMode::Major);
+        assert!(c_major.confidence > 0.4);
+        assert_eq!(a_minor.pitch_class, 9);
+        assert_eq!(a_minor.mode, TimelineKeyMode::Minor);
+        assert!(a_minor.confidence > 0.4);
+    }
+
+    #[test]
+    fn timeline_key_hint_downweights_transient_chroma() {
+        let mut bins = Vec::new();
+        for idx in 0..12 {
+            bins.push(key_test_bin(
+                idx as f64 * 0.1,
+                profile_chroma(0, TimelineKeyMode::Major),
+                0.04,
+                0.04,
+            ));
+            bins.push(key_test_bin(
+                idx as f64 * 0.1 + 0.05,
+                profile_chroma(6, TimelineKeyMode::Major),
+                1.0,
+                1.0,
+            ));
+        }
+
+        let hint = vote_key_hint(&bins);
+
+        assert_eq!(hint.pitch_class, 0);
+        assert_eq!(hint.mode, TimelineKeyMode::Major);
     }
 
     #[test]
