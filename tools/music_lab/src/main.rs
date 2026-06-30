@@ -313,7 +313,7 @@ impl FrameStats {
             .unwrap_or_else(perf_log_path)
     }
 
-    fn maybe_log(&mut self, playing: bool, spectrum_pending: bool) {
+    fn maybe_log(&mut self, playback: PlaybackSnapshot, spectrum_pending: bool) {
         let now = Instant::now();
         if self
             .last_log
@@ -341,7 +341,9 @@ impl FrameStats {
                 "central_ms={central_ms:.1} spectrum_compute_ms={spectrum_compute_ms:.1} ",
                 "timeline_rows={timeline_rows} timeline_bins={timeline_bins} ",
                 "timeline_cache_misses={timeline_cache_misses} ",
-                "playing={playing} spectrum_pending={spectrum_pending}"
+                "playing={playing} decoded_secs={decoded_secs:.3} ",
+                "buffer_ahead_secs={buffer_ahead_secs:.3} underruns={underruns} ",
+                "spectrum_pending={spectrum_pending}"
             ),
             ts_ms = ts_ms,
             fps = self.fps,
@@ -357,7 +359,10 @@ impl FrameStats {
             timeline_rows = self.timeline_rows,
             timeline_bins = self.timeline_bins,
             timeline_cache_misses = self.timeline_cache_misses,
-            playing = playing,
+            playing = playback.playing,
+            decoded_secs = playback.decoded_secs,
+            buffer_ahead_secs = playback.buffer_ahead_secs,
+            underruns = playback.underrun_count,
             spectrum_pending = spectrum_pending,
         );
         let _ = sink.tx.send(line);
@@ -833,8 +838,8 @@ impl eframe::App for MusicLabApp {
             .record_central(stage_start.elapsed(), timeline_stats);
         self.frame_stats.record_update(update_start.elapsed());
 
-        let playing = self.player.as_ref().is_some_and(|p| p.snapshot().playing);
-        self.frame_stats.maybe_log(playing, self.spectrum_pending);
+        let playing = snap.playing;
+        self.frame_stats.maybe_log(snap, self.spectrum_pending);
 
         if playing {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -1005,6 +1010,15 @@ impl MusicLabApp {
                         "Row: {}",
                         format_row_secs(self.timeline_row_secs())
                     ));
+                    if self.player.is_some() {
+                        let snap = self.player_snapshot();
+                        ui.label(format!(
+                            "Playback buffer: {:.1}s decoded, {:.1}s ahead, underruns {}",
+                            snap.decoded_secs,
+                            snap.buffer_ahead_secs.max(0.0),
+                            snap.underrun_count
+                        ));
+                    }
                     if let Some(bpm) = track.analysis.beat_grid.bpm {
                         let grid_visible =
                             track.analysis.beat_grid.confidence >= BEAT_GRID_MIN_CONFIDENCE;
@@ -1060,6 +1074,15 @@ impl MusicLabApp {
                         "Row: {}",
                         format_row_secs(self.timeline_row_secs())
                     ));
+                    if self.player.is_some() {
+                        let snap = self.player_snapshot();
+                        ui.label(format!(
+                            "Playback buffer: {:.1}s decoded, {:.1}s ahead, underruns {}",
+                            snap.decoded_secs,
+                            snap.buffer_ahead_secs.max(0.0),
+                            snap.underrun_count
+                        ));
+                    }
                     if let Some(partial) = &self.partial_analysis {
                         ui.label(format!("Wave bins: {} loaded", partial.bins.len()));
                         ui.label(format!(
@@ -3950,6 +3973,7 @@ struct PlayerShared {
     position_frames: usize,
     playing: bool,
     eof: bool,
+    underrun_count: u64,
 }
 
 #[derive(Clone)]
@@ -3989,6 +4013,7 @@ impl LabPlayer {
             position_frames: 0,
             playing: autoplay,
             eof: false,
+            underrun_count: 0,
         }));
         let stream_shared = Arc::clone(&shared);
         let stream_config: cpal::StreamConfig = config.into();
@@ -4029,6 +4054,7 @@ impl LabPlayer {
             } else {
                 frame
             };
+            s.underrun_count = 0;
         }
     }
 
@@ -4045,13 +4071,7 @@ impl LabPlayer {
         let Ok(s) = self.shared.lock() else {
             return PlaybackSnapshot::default();
         };
-        PlaybackSnapshot {
-            position_secs: s.position_frames as f64 / s.sample_rate.max(1) as f64,
-            duration_secs: s.duration_secs,
-            playing: s.playing,
-            effect_chain_active: false,
-            effect_latency_samples: 0,
-        }
+        playback_snapshot_from_state(&s)
     }
 
     fn spectrum_request(&self) -> Option<SpectrumRequest> {
@@ -4064,6 +4084,23 @@ impl LabPlayer {
             s.position_frames,
             SPECTRUM_SNAPSHOT_RADIUS_SECS,
         )
+    }
+}
+
+fn playback_snapshot_from_state(s: &PlayerShared) -> PlaybackSnapshot {
+    let sample_rate = s.sample_rate.max(1);
+    let decoded_frames = s.samples.len() / 2;
+    let decoded_secs = decoded_frames as f64 / sample_rate as f64;
+    let position_secs = s.position_frames as f64 / sample_rate as f64;
+    PlaybackSnapshot {
+        position_secs,
+        duration_secs: s.duration_secs,
+        playing: s.playing,
+        decoded_secs,
+        buffer_ahead_secs: decoded_secs - position_secs,
+        underrun_count: s.underrun_count,
+        effect_chain_active: false,
+        effect_latency_samples: 0,
     }
 }
 
@@ -4136,6 +4173,7 @@ fn fill_output(out: &mut [f32], out_channels: usize, shared: &Arc<Mutex<PlayerSh
         out.fill(0.0);
         return;
     };
+    let mut underrun = false;
     for frame in out.chunks_mut(out_channels) {
         let available_frames = state.samples.len() / 2;
         let (l, r) = if state.playing && state.position_frames < available_frames {
@@ -4145,6 +4183,8 @@ fn fill_output(out: &mut [f32], out_channels: usize, shared: &Arc<Mutex<PlayerSh
         } else {
             if state.playing && state.eof {
                 state.playing = false;
+            } else if state.playing {
+                underrun = true;
             }
             (0.0, 0.0)
         };
@@ -4155,6 +4195,9 @@ fn fill_output(out: &mut [f32], out_channels: usize, shared: &Arc<Mutex<PlayerSh
                 _ => (l + r) * 0.5,
             };
         }
+    }
+    if underrun {
+        state.underrun_count = state.underrun_count.saturating_add(1);
     }
 }
 
@@ -4395,6 +4438,7 @@ mod tests {
             position_frames: 0,
             playing: true,
             eof: false,
+            underrun_count: 0,
         }));
         let mut out = vec![1.0; 8];
 
@@ -4404,6 +4448,7 @@ mod tests {
         let state = shared.lock().unwrap();
         assert!(state.playing);
         assert_eq!(state.position_frames, 0);
+        assert_eq!(state.underrun_count, 1);
     }
 
     #[test]
@@ -4415,13 +4460,36 @@ mod tests {
             position_frames: 0,
             playing: true,
             eof: true,
+            underrun_count: 0,
         }));
         let mut out = vec![1.0; 8];
 
         fill_output(&mut out, 2, &shared);
 
         assert!(out.iter().all(|sample| *sample == 0.0));
-        assert!(!shared.lock().unwrap().playing);
+        let state = shared.lock().unwrap();
+        assert!(!state.playing);
+        assert_eq!(state.underrun_count, 0);
+    }
+
+    #[test]
+    fn playback_snapshot_reports_buffer_ahead_and_underruns() {
+        let state = PlayerShared {
+            samples: vec![0.0; 48_000 * 2],
+            sample_rate: 48_000,
+            duration_secs: 10.0,
+            position_frames: 12_000,
+            playing: true,
+            eof: false,
+            underrun_count: 3,
+        };
+
+        let snap = playback_snapshot_from_state(&state);
+
+        assert!((snap.decoded_secs - 1.0).abs() < f64::EPSILON);
+        assert!((snap.position_secs - 0.25).abs() < f64::EPSILON);
+        assert!((snap.buffer_ahead_secs - 0.75).abs() < f64::EPSILON);
+        assert_eq!(snap.underrun_count, 3);
     }
 
     #[test]

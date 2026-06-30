@@ -93,6 +93,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - timeline は decode 中も約 5 秒単位の部分解析を受け取り、解析済み区間から順次表示する。完了後は全尺 timeline analysis の確定版で置き換える
   - timeline 行テクスチャの raster は worker で行い、UI thread は完成画像を少量ずつ texture upload する。spectrum は全尺 decode 完了を待たず、再生バッファに溜まった短い窓を worker へ渡して表示する
   - Row 秒数変更などで timeline 行テクスチャを作り直すときは、再生カーソル行と現在の可視範囲を優先して raster 要求を出し、画面外の古い順処理で黒待ちが長くならないようにする
+  - 長尺ロード中の音切れは `PlaybackSnapshot.decoded_secs` / `buffer_ahead_secs` / `underrun_count` で計測し、perf log と右パネルに出す。mIV 本体統合時は既存 video audio pump 側の queue / normalize / VST latency 計測へ接続する
    - Play/Pause/Stop/seek 用の最小プレイヤー
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
