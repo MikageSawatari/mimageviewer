@@ -402,6 +402,7 @@ struct TimelineTextureCache {
     key: Option<TimelineTextureCacheKey>,
     rows: Vec<Option<TimelineRowTexture>>,
     pending: Vec<Option<TimelinePendingRow>>,
+    row_versions: Vec<u64>,
     generation: u64,
     raster_tx: Option<mpsc::Sender<TimelineRasterRequest>>,
     raster_rx: Option<mpsc::Receiver<TimelineRasterResult>>,
@@ -410,6 +411,7 @@ struct TimelineTextureCache {
 
 struct TimelineRowTexture {
     key: TimelineTextureCacheKey,
+    row_version: u64,
     texture: egui::TextureHandle,
     represented_bins: usize,
 }
@@ -418,6 +420,7 @@ struct TimelineRowTexture {
 struct TimelinePendingRow {
     key: TimelineTextureCacheKey,
     generation: u64,
+    row_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +436,7 @@ struct TimelineTextureCacheKey {
 
 struct TimelineRasterRequest {
     generation: u64,
+    row_version: u64,
     row: usize,
     row_secs: f64,
     key: TimelineTextureCacheKey,
@@ -441,6 +445,7 @@ struct TimelineRasterRequest {
 
 struct TimelineRasterResult {
     generation: u64,
+    row_version: u64,
     row: usize,
     key: TimelineTextureCacheKey,
     image: egui::ColorImage,
@@ -453,6 +458,7 @@ impl TimelineTextureCache {
         self.key = None;
         self.rows.clear();
         self.pending.clear();
+        self.row_versions.clear();
     }
 
     fn ensure(&mut self, key: TimelineTextureCacheKey) {
@@ -466,6 +472,8 @@ impl TimelineTextureCache {
         self.rows.resize_with(key.rows, || None);
         self.pending.clear();
         self.pending.resize_with(key.rows, || None);
+        self.row_versions.clear();
+        self.row_versions.resize(key.rows, 0);
         self.spawn_worker();
     }
 
@@ -493,12 +501,8 @@ impl TimelineTextureCache {
     }
 
     fn invalidate_all_rows(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        for row in &mut self.rows {
-            *row = None;
-        }
-        for pending in &mut self.pending {
-            *pending = None;
+        for version in &mut self.row_versions {
+            *version = version.wrapping_add(1);
         }
     }
 
@@ -510,17 +514,15 @@ impl TimelineTextureCache {
         {
             return;
         }
-        self.generation = self.generation.wrapping_add(1);
-        for pending in &mut self.pending {
-            *pending = None;
-        }
         let start_row = (start_secs.max(0.0) / row_secs).floor().max(0.0) as usize;
         let end_row = (end_secs.max(start_secs).max(0.0) / row_secs)
             .floor()
             .max(start_row as f64) as usize;
         let last_row = self.rows.len().saturating_sub(1);
         for row in start_row.min(last_row)..=end_row.min(last_row) {
-            self.rows[row] = None;
+            if let Some(version) = self.row_versions.get_mut(row) {
+                *version = version.wrapping_add(1);
+            }
         }
     }
 
@@ -547,19 +549,24 @@ impl TimelineTextureCache {
             let Some(slot) = self.rows.get_mut(result.row) else {
                 continue;
             };
-            if let Some(pending) = self.pending.get_mut(result.row) {
-                *pending = None;
+            if let Some(pending_slot) = self.pending.get_mut(result.row) {
+                if pending_slot.as_ref().is_some_and(|pending| {
+                    pending.generation == result.generation
+                        && pending.row_version <= result.row_version
+                }) {
+                    *pending_slot = None;
+                }
             }
-            if slot
-                .as_ref()
-                .is_some_and(|row_texture| row_texture.key == result.key)
-            {
+            if slot.as_ref().is_some_and(|row_texture| {
+                row_texture.key == result.key && row_texture.row_version > result.row_version
+            }) {
                 continue;
             }
             let texture = ctx.load_texture(
                 format!(
-                    "music_timeline_row_{}_{}_{}x{}_{}",
+                    "music_timeline_row_{}_{}_{}_{}x{}_{}",
                     result.generation,
+                    result.row_version,
                     result.row,
                     result.key.width_px,
                     result.key.height_px(),
@@ -570,6 +577,7 @@ impl TimelineTextureCache {
             );
             *slot = Some(TimelineRowTexture {
                 key: result.key,
+                row_version: result.row_version,
                 texture,
                 represented_bins: result.represented_bins,
             });
@@ -594,8 +602,12 @@ impl TimelineTextureCache {
             .as_ref()
             .is_some_and(|row_texture| row_texture.key != key);
         let missing = self.rows[row].is_none() || stale;
+        let row_version = self.row_versions.get(row).copied().unwrap_or(0);
         let mut request_sent = false;
-        if missing {
+        let needs_newer_texture = self.rows[row].as_ref().is_none_or(|row_texture| {
+            row_texture.key != key || row_texture.row_version < row_version
+        });
+        if missing || needs_newer_texture {
             let pending_current = self.pending[row]
                 .is_some_and(|pending| pending.key == key && pending.generation == self.generation);
             if !pending_current && let Some(tx) = self.raster_tx.as_ref() {
@@ -603,6 +615,7 @@ impl TimelineTextureCache {
                 let row_bins = timeline_bins_for_raster(bins, row_start, row_secs);
                 let request = TimelineRasterRequest {
                     generation: self.generation,
+                    row_version,
                     row,
                     row_secs,
                     key,
@@ -612,6 +625,7 @@ impl TimelineTextureCache {
                     self.pending[row] = Some(TimelinePendingRow {
                         key,
                         generation: self.generation,
+                        row_version,
                     });
                     request_sent = true;
                 }
@@ -628,10 +642,13 @@ impl TimelineTextureCache {
     }
 
     fn row_is_fresh(&self, row: usize, key: TimelineTextureCacheKey) -> bool {
+        let row_version = self.row_versions.get(row).copied().unwrap_or(0);
         self.rows
             .get(row)
             .and_then(Option::as_ref)
-            .is_some_and(|row_texture| row_texture.key == key)
+            .is_some_and(|row_texture| {
+                row_texture.key == key && row_texture.row_version >= row_version
+            })
     }
 }
 
@@ -671,6 +688,7 @@ fn run_timeline_raster_worker(
         if result_tx
             .send(TimelineRasterResult {
                 generation: request.generation,
+                row_version: request.row_version,
                 row: request.row,
                 key: request.key,
                 image,
@@ -4152,6 +4170,37 @@ mod tests {
 
         assert!(row_bins.first().is_some_and(|bin| bin.start_secs <= 7.0));
         assert!(row_bins.last().is_some_and(|bin| bin.start_secs >= 18.0));
+    }
+
+    #[test]
+    fn timeline_partial_invalidation_keeps_generation_stable() {
+        let key = TimelineTextureCacheKey {
+            width_px: 120,
+            waveform_h_px: 24,
+            gap_px: 2,
+            metrics_h_px: 8,
+            row_secs_millis: 5000,
+            rows: 3,
+            dark: true,
+        };
+        let mut cache = TimelineTextureCache::default();
+        cache.ensure(key);
+        let generation = cache.generation;
+
+        cache.invalidate_time_range(5.2, 9.8, 5.0);
+
+        assert_eq!(cache.generation, generation);
+        assert_eq!(cache.row_versions, vec![0, 1, 0]);
+
+        cache.invalidate_time_range(0.0, 5.1, 5.0);
+
+        assert_eq!(cache.generation, generation);
+        assert_eq!(cache.row_versions, vec![1, 2, 0]);
+
+        cache.invalidate_all_rows();
+
+        assert_eq!(cache.generation, generation);
+        assert_eq!(cache.row_versions, vec![2, 3, 1]);
     }
 
     #[test]
