@@ -1590,7 +1590,7 @@ fn draw_timeline(
         }
     }
 
-    let mut pending_raster = false;
+    let mut visible_rows = Vec::new();
     for row in 0..rows {
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
         let row_rect = egui::Rect::from_min_size(
@@ -1600,6 +1600,32 @@ fn draw_timeline(
         if !clip_rect.intersects(row_rect.expand(row_gap)) {
             continue;
         }
+        visible_rows.push((row, row_rect));
+    }
+
+    let focus_row = timeline_focus_row(snap.position_secs, row_secs, rows);
+    let include_offscreen_focus = snap.playing && *follow_playhead;
+    let visible_row_indices = visible_rows.iter().map(|(row, _)| *row).collect::<Vec<_>>();
+    let request_rows = prioritized_timeline_request_rows(
+        &visible_row_indices,
+        focus_row,
+        include_offscreen_focus,
+        rows,
+    );
+
+    let mut pending_raster = false;
+    for row in request_rows {
+        let fresh_before = cache.row_is_fresh(row, texture_key);
+        if !fresh_before {
+            pending_raster = true;
+        }
+        let (_, request_sent) = cache.row_texture(&analysis.bins, row, row_secs, texture_key);
+        if request_sent {
+            pending_raster = true;
+        }
+    }
+
+    for (row, row_rect) in visible_rows {
         let row_start = row as f64 * row_secs;
         stats.visible_rows += 1;
         let fresh_before = cache.row_is_fresh(row, texture_key);
@@ -1802,6 +1828,43 @@ fn timeline_manual_scroll_requested(
     })
 }
 
+fn timeline_focus_row(position_secs: f64, row_secs: f64, rows: usize) -> Option<usize> {
+    if row_secs <= 0.0 || rows == 0 || !position_secs.is_finite() {
+        return None;
+    }
+    Some(
+        (position_secs.max(0.0) / row_secs)
+            .floor()
+            .max(0.0)
+            .min(rows.saturating_sub(1) as f64) as usize,
+    )
+}
+
+fn prioritized_timeline_request_rows(
+    visible_rows: &[usize],
+    focus_row: Option<usize>,
+    include_offscreen_focus: bool,
+    rows: usize,
+) -> Vec<usize> {
+    let mut ordered = Vec::with_capacity(visible_rows.len() + usize::from(include_offscreen_focus));
+    if include_offscreen_focus && let Some(row) = focus_row.filter(|row| *row < rows) {
+        ordered.push(row);
+    }
+
+    let mut visible = visible_rows
+        .iter()
+        .copied()
+        .filter(|row| *row < rows && !ordered.contains(row))
+        .collect::<Vec<_>>();
+    if let Some(focus) = focus_row
+        && (include_offscreen_focus || visible_rows.contains(&focus))
+    {
+        visible.sort_by_key(|row| (row.abs_diff(focus), *row));
+    }
+    ordered.extend(visible);
+    ordered
+}
+
 fn timeline_playhead_row_rect(
     graph_rect: egui::Rect,
     position_secs: f64,
@@ -1810,13 +1873,7 @@ fn timeline_playhead_row_rect(
     row_gap: f32,
     rows: usize,
 ) -> Option<egui::Rect> {
-    if row_secs <= 0.0 || rows == 0 || !position_secs.is_finite() {
-        return None;
-    }
-    let row = (position_secs.max(0.0) / row_secs)
-        .floor()
-        .max(0.0)
-        .min(rows.saturating_sub(1) as f64) as usize;
+    let row = timeline_focus_row(position_secs, row_secs, rows)?;
     let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
     Some(egui::Rect::from_min_size(
         egui::pos2(graph_rect.min.x, row_top),
@@ -4258,6 +4315,34 @@ mod tests {
 
         assert_eq!(cache.generation, generation);
         assert_eq!(cache.row_versions, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn timeline_request_rows_prioritize_playhead_inside_visible_range() {
+        let rows = prioritized_timeline_request_rows(&[10, 11, 12, 13, 14], Some(13), false, 20);
+
+        assert_eq!(rows, vec![13, 12, 14, 11, 10]);
+    }
+
+    #[test]
+    fn timeline_request_rows_can_prioritize_offscreen_playhead() {
+        let rows = prioritized_timeline_request_rows(&[2, 3, 4], Some(10), true, 20);
+
+        assert_eq!(rows, vec![10, 4, 3, 2]);
+    }
+
+    #[test]
+    fn timeline_request_rows_keep_visible_order_when_manual_scroll_is_off_playhead() {
+        let rows = prioritized_timeline_request_rows(&[2, 3, 4], Some(10), false, 20);
+
+        assert_eq!(rows, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn timeline_focus_row_clamps_to_known_rows() {
+        assert_eq!(timeline_focus_row(12.4, 5.0, 4), Some(2));
+        assert_eq!(timeline_focus_row(99.0, 5.0, 4), Some(3));
+        assert_eq!(timeline_focus_row(f64::NAN, 5.0, 4), None);
     }
 
     #[test]
