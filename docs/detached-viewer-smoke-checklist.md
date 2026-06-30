@@ -74,7 +74,8 @@
 ## 2. 常に別ウィンドウモード (設定「画像を別ウィンドウで開く」= ON) ⚠️ 未検証重点
 
 > 画像を開くたびに新しいウィンドウ。古い窓は passive (frozen) として残る。
-> 既知制約: このモードの Ctrl+↑↓ は PDF を移動しない場合がある (許容)。
+> このモードの detached 窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown のフォルダ移動は行わない。
+> 入力は detached 窓側で消費し、短い案内だけ出す。静止画系の F12 detached 切替も無効。
 
 ### 2.1 複数ウィンドウ展開
 
@@ -85,9 +86,10 @@
 
 ### 2.2 ウィンドウ切替
 
-- [ ] passive 窓をクリック (アクティブ化) → その窓が active になり編集/送り操作の対象に
+- [ ] passive 窓をクリック (アクティブ化) → その窓が active になり送り / V / Shift+Z の対象に
 - [ ] active を切り替えても、他の窓の内容が**別画像へ化けない**
-- [ ] active 窓で folder-nav / ページ送り → その窓だけ切替、passive は不変
+- [ ] active 窓でページ送り → その窓だけ切替、passive は不変
+- [ ] active 窓で F12 / Ctrl+↓ / Ctrl+PageDown → 無効 toast。メイン一覧は動かない
 
 ### 2.3 メイン操作との干渉
 
@@ -128,7 +130,8 @@
 - [ ] 通常フルスクリーン (非 detached) の folder-nav が v2.2.0 同様に動く
 - [ ] PDF/ZIP の enumerate 待ち中の holdover (前ページ表示) が出る・黒フラッシュしない
 - [ ] スライドショーが detached/非 detached で動く
-- [ ] 補正/AI アップスケール/消しゴム等の編集が detached 窓で動く
+- [ ] 通常 F12 linked detached では補正/AI アップスケール/消しゴム等が動く
+- [ ] ピン / always-new detached では消しゴム等の編集入口が無効化され、全体補正/ポストフィルタ/V/Shift+Z は動く
 
 ---
 
@@ -137,3 +140,24 @@
 - NG が出たケースは「§番号 + 操作 + 観測 (小窓/ちらつき/閉じない 等)」を記載。
 - 可能なら NG 直後のログ (`mimageviewer.log` の該当時刻付近) を添付。
 - 成功マーカー (§0) のどれが崩れたかが分かると切り分けが速い。
+
+---
+
+## レビュー記録
+
+### 2026-06-29 Codex レビュー #1
+
+チェックリスト全体の構成は妥当です。通常モード OFF の K0 回帰点、F11 borderless、
+always-new の複数窓 / passive 切替 / close 整合、F12 OFF 退行まで、実機で見るべき面が
+優先度順に並んでいます。`MIV_DETACHED_WINDOW_DEBUG` の成功マーカーも、今回の小窓 /
+閉じ漏れ原因を確認するには有効です。
+
+1 点だけ注意があります。§0 の `session_closing` → `session_finish` は **active detached
+session を閉じる操作**の成功マーカーであり、always-new の **passive 窓を個別に閉じる**
+操作では必ずしも出ません。passive close は `passive_close ids=...` と viewport `Close`
+command、または対象 snapshot の消滅を主マーカーにしてください。したがって §2.4 の
+「各 close で session_closing/session_finish」は、active 窓 close では必須、passive 窓 close
+では `passive_close` と空窓 / backstop 残りなしを確認、という読み替えが必要です。
+
+実機確認の優先順位はこのままでよいです。まず §1.3 (F11) と §2.1〜2.4 (always-new) を重点確認し、
+NG が出た場合は §番号、操作、見た目、該当ログをセットで残してください。

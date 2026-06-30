@@ -298,6 +298,39 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detached() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("detached_pages");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("001.jpg"), b"dummy").unwrap();
+    std::fs::write(folder.join("002.png"), b"dummy").unwrap();
+
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.settings.detached_viewer_open_images_in_window = true;
+    app.pending_auto_fs_open = true;
+
+    app.load_folder(folder.clone());
+
+    assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert!(
+        app.detached_viewer_focus_requested,
+        "image-only folder auto fullscreen happens after enumeration, but it is still an explicit grid/open request and must focus the new detached window"
+    );
+    assert!(
+        app.detached_viewer_window_id.is_some(),
+        "always-new detached image folders should allocate a detached viewport instead of treating the open as continuation navigation"
+    );
+    assert!(
+        !app.fs_open_intent_from_grid,
+        "open_fullscreen consumes the restored grid intent"
+    );
+}
+
 #[test]
 fn auto_fullscreen_image_folder_ignores_mixed_folder_after_load() {
     let mut app = phase_c_support::setup_app();
@@ -16098,6 +16131,33 @@ mod still_window_mode_key_tests {
         crate::zip_tree::ZipNavState::new(tree)
     }
 
+    #[test]
+    fn independent_detached_still_blocks_navigation_to_video() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\mixed\001.png");
+        let video = push_video(&mut app, r"C:\mixed\002.mp4");
+
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+
+        assert!(app.should_block_detached_independent_still_navigation_to_video(video));
+        assert!(!app.should_block_detached_independent_still_navigation_to_video(image));
+    }
+
+    #[test]
+    fn linked_detached_still_allows_navigation_to_video() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\mixed\001.png");
+        let video = push_video(&mut app, r"C:\mixed\002.mp4");
+
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+
+        assert!(!app.should_block_detached_independent_still_navigation_to_video(video));
+    }
+
     fn begin_root_key_pass_with_modifiers(
         ctx: &egui::Context,
         key: egui::Key,
@@ -16351,6 +16411,414 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn always_new_detached_blocks_folder_nav_and_still_f12_toggle() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        assert!(
+            app.detached_independent_session_blocks_folder_nav(),
+            "always-new detached still windows must not start main-bundle folder navigation"
+        );
+        assert!(
+            app.detached_toggle_disabled_by_always_new_images(),
+            "F12 still toggle is disabled while always-new image windows are active"
+        );
+
+        app.fullscreen_idx = Some(video);
+
+        assert!(
+            app.detached_independent_session_blocks_folder_nav(),
+            "always-new detached video windows also consume folder navigation instead of moving the main window"
+        );
+        assert!(
+            !app.detached_toggle_disabled_by_always_new_images(),
+            "video keeps the legacy F12 host-migration toggle for now"
+        );
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.detached_viewer_independent_active = true;
+        assert!(
+            app.detached_independent_session_blocks_folder_nav(),
+            "a detached video that has been cut loose from the main context must also block folder navigation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_image_edit_tools_are_available_only_for_linked_viewer() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        assert!(
+            app.detached_viewer_image_edit_tools_disabled_reason()
+                .is_none(),
+            "a normal linked detached viewer keeps edit tools available"
+        );
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        assert!(
+            app.detached_viewer_image_edit_tools_disabled_reason()
+                .is_some(),
+            "always-new detached viewers disable edit tools"
+        );
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.detached_viewer_independent_active = true;
+        assert!(
+            app.detached_viewer_image_edit_tools_disabled_reason()
+                .is_some(),
+            "pinned/independent detached viewers disable edit tools"
+        );
+    }
+
+    #[test]
+    fn detached_pin_is_disabled_while_edit_mode_is_active() {
+        let mut app = setup_app();
+        assert!(app.detached_viewer_pin_disabled_reason().is_none());
+
+        app.erase_mode = true;
+        assert!(
+            app.detached_viewer_pin_disabled_reason().is_some(),
+            "pinning while an overlay edit session is active would otherwise discard work"
+        );
+
+        app.erase_mode = false;
+        app.view_trim_mode = true;
+        assert!(
+            app.detached_viewer_pin_disabled_reason().is_some(),
+            "view-trim is also a mutable foreground mode and must finish before pinning"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn always_new_detached_ctrl_nav_handler_consumes_without_folder_nav() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        app.current_folder = Some(PathBuf::from(r"C:\pics"));
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.slideshow_playing = true;
+        app.pending_folder_nav_steps = 3;
+        app.pending_folder_nav_mode = FolderNavMode::Fullscreen;
+        app.native_video_deferred_nav_delta = Some(1);
+
+        app.handle_fullscreen_ctrl_nav_context(&ctx, image, true, false);
+
+        assert!(
+            !app.slideshow_playing,
+            "manual Ctrl folder-nav input still stops slideshow even when detached no-ops"
+        );
+        assert_eq!(
+            app.pending_folder_nav_steps, 0,
+            "detached no-op must cancel stale accumulated folder nav"
+        );
+        assert_eq!(app.pending_folder_nav_mode.perf_tag(), "grid");
+        assert!(app.folder_nav_pending.is_none());
+        assert!(
+            app.native_video_deferred_nav_delta.is_none(),
+            "detached no-op must drop stale native video deferred nav"
+        );
+        assert!(matches!(
+            app.fs_boundary_hint,
+            Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
+                reason: crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mounted_active_detached_context_ctrl_nav_handler_consumes_without_folder_nav() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.current_folder = Some(PathBuf::from(r"C:\pinned"));
+        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\pinned\a.jpg"))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_pin_active = true;
+        bundle.detached_viewer_window_id = Some(11);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.pending_folder_nav_steps = -2;
+        app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
+        app.native_video_deferred_nav_delta = Some(-1);
+
+        app.with_active_detached_viewer_context(|mounted| {
+            assert!(
+                mounted.active_detached_viewer_context.is_none(),
+                "the active context is taken while mounted, so the mounted bundle must still block nav"
+            );
+
+            mounted.handle_fullscreen_sibling_nav_context(&ctx, 0, false, false);
+
+            assert_eq!(mounted.pending_folder_nav_steps, 0);
+            assert_eq!(mounted.pending_folder_nav_mode.perf_tag(), "grid");
+            assert!(mounted.folder_nav_pending.is_none());
+            assert!(mounted.native_video_deferred_nav_delta.is_none());
+            assert!(matches!(
+                mounted.fs_boundary_hint,
+                Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
+                    reason: crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent,
+                    ..
+                })
+            ));
+        })
+        .expect("active detached context should mount");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn independent_still_video_navigation_uses_detached_hint_not_global_toast() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\pics\b.mp4");
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+
+        app.open_fullscreen_from_fs_navigation(&ctx, video);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(image),
+            "independent still detached window must not navigate into video"
+        );
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "video-block feedback must stay inside the detached viewport, not leak to the main grid toast"
+        );
+        assert!(matches!(
+            app.fs_boundary_hint,
+            Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
+                reason: crate::ui_fullscreen::FsNavNoOpReason::DetachedVideoUnsupported,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn passive_window_activation_clears_previous_fullscreen_feedback() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "switch_feedback_first");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_open_intent_from_grid = true;
+
+        app.open_fullscreen(second);
+        let first_window_id = app.detached_image_windows[0].id;
+        app.fs_feedback_toast = Some((
+            "previous viewer toast".to_string(),
+            std::time::Instant::now(),
+            5.0,
+        ));
+        app.fs_feedback_toast_reveal_path = Some(PathBuf::from(r"C:\pics\saved.jpg"));
+        app.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
+            reason: crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent,
+            at: std::time::Instant::now(),
+        });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, first_window_id));
+
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.fs_feedback_toast_reveal_path.is_none());
+        assert!(app.fs_boundary_hint.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_window_skips_export_dialogs_while_detached_viewer_is_active() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+
+        assert!(
+            app.main_window_should_draw_export_dialogs(),
+            "grid/main idle state may draw export dialogs"
+        );
+
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(
+            !app.main_window_should_draw_export_dialogs(),
+            "main window must not draw fullscreen-owned export dialogs during embedded fullscreen"
+        );
+
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        assert!(
+            !app.main_window_should_draw_export_dialogs(),
+            "linked F12 detached export dialog is drawn in the detached viewport only"
+        );
+
+        app.fullscreen_idx = None;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        assert!(
+            !app.main_window_should_draw_export_dialogs(),
+            "active detached context export dialog is also owned by the detached viewport"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn always_new_detached_video_does_not_follow_main_selection() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_video(&mut app, r"C:\clips\a.mp4");
+        let second = push_video(&mut app, r"C:\clips\b.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.last_viewer_sync_stamp = app.viewer_sync_stamp_for_idx(first);
+        app.selected = Some(second);
+
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(first));
+        assert_eq!(
+            app.selected,
+            Some(second),
+            "main selection can move without retargeting an already detached video window"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn always_new_detached_video_survives_main_context_change() {
+        let mut app = setup_app();
+        let first = push_video(&mut app, r"C:\clips\a.mp4");
+        let window_id = 77;
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.selected = Some(first);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        let next_folder = app.tmp.path().join("favorite_video_survive");
+        let next_image = next_folder.join("next.jpg");
+        std::fs::create_dir_all(&next_folder).unwrap();
+        std::fs::write(&next_image, b"dummy").unwrap();
+        app.start_loading_items(
+            next_folder.clone(),
+            vec![GridItem::Image(next_image)],
+            vec![Some((1, 1))],
+            std::collections::HashSet::new(),
+            vec![],
+            Some(1),
+        );
+
+        assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "the main context should return to the grid after the detached video is moved out"
+        );
+        assert_ne!(
+            app.viewer_presentation,
+            ViewerPresentation::DetachedWindow,
+            "the main context must not keep owning the detached video presentation"
+        );
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached video should be preserved in an active detached context");
+        assert_eq!(active.bundle.fullscreen_idx, Some(first));
+        assert_eq!(active.bundle.detached_viewer_window_id, Some(window_id));
+        assert!(active.bundle.detached_viewer_independent_active);
+        assert!(matches!(
+            active.bundle.items.get(first),
+            Some(GridItem::Video(path)) if path.ends_with("a.mp4")
+        ));
+        let session = app
+            .active_detached_session
+            .expect("the detached video viewport should remain alive");
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(session.source, DetachedSource::Video);
+        assert!(!session.closing);
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "videos are kept as the active detached context, not converted into image snapshots"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn linked_detached_video_survives_main_context_change() {
+        let mut app = setup_app();
+        let first = push_video(&mut app, r"C:\clips\a.mp4");
+        let window_id = 78;
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.selected = Some(first);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        let next_folder = app.tmp.path().join("linked_video_survive");
+        let next_image = next_folder.join("next.jpg");
+        std::fs::create_dir_all(&next_folder).unwrap();
+        std::fs::write(&next_image, b"dummy").unwrap();
+        app.start_loading_items(
+            next_folder.clone(),
+            vec![GridItem::Image(next_image)],
+            vec![Some((1, 1))],
+            std::collections::HashSet::new(),
+            vec![],
+            Some(1),
+        );
+
+        assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
+        assert_eq!(app.fullscreen_idx, None);
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("linked detached video should be cut loose before main context closes");
+        assert_eq!(active.bundle.fullscreen_idx, Some(first));
+        assert_eq!(active.bundle.detached_viewer_window_id, Some(window_id));
+        assert!(
+            active.bundle.detached_viewer_independent_active,
+            "after the main context changes, the preserved video must stop following main selection"
+        );
+        let session = app
+            .active_detached_session
+            .expect("the detached video viewport should remain alive");
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(session.source, DetachedSource::Video);
+        assert!(!session.closing);
+    }
+
+    #[test]
     fn detached_pin_requests_next_still_open_as_detached_and_disables_sync() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -16444,6 +16912,30 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn stale_independent_flag_does_not_make_new_linked_window_independent() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\linked_again.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.detached_viewer_pin_active = false;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_open_next_still_detached_once = false;
+        app.fs_open_intent_from_grid = true;
+
+        app.open_fullscreen(idx);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(
+            !app.detached_viewer_independent_active,
+            "a stale independent flag from a previous window must not make a fresh linked open independent"
+        );
+        assert!(
+            !app.detached_viewer_pin_active,
+            "fresh linked open must not resurrect a stale pin state"
+        );
+    }
+
+    #[test]
     fn independent_detached_image_close_does_not_move_main_selection() {
         let mut app = setup_app();
         let first = push_image(&mut app, r"C:\pics\a.jpg");
@@ -16483,6 +16975,65 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_viewer_window_id, Some(2));
         assert!(!app.detached_viewer_recreate_on_next_render);
         assert!(!app.fs_viewport_shown);
+    }
+
+    #[test]
+    fn auto_fullscreen_image_folder_always_new_parks_existing_detached_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let existing = push_image(&mut app, r"C:\pics\existing.jpg");
+        insert_static_fs_entry(&mut app, &ctx, existing, "auto_folder_existing_window");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.fullscreen_idx = Some(existing);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(41);
+        app.begin_active_detached_session(41, DetachedSource::Image);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        let folder = app.tmp.path().join("auto_folder_always_new");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("001.jpg"), b"dummy").unwrap();
+        std::fs::write(folder.join("002.png"), b"dummy").unwrap();
+        app.pending_auto_fs_open = true;
+
+        app.load_folder(folder.clone());
+
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(
+            app.detached_viewer_focus_requested,
+            "image-only folder auto-open is still an explicit grid open and should focus the newly active detached window"
+        );
+        assert_eq!(
+            app.detached_image_windows.len(),
+            1,
+            "the previously active detached window should be preserved as passive"
+        );
+        assert_eq!(app.detached_image_windows[0].id, 41);
+        assert!(!app.detached_image_windows[0].pinned);
+        assert_eq!(
+            app.detached_image_windows[0].location_display,
+            "existing.jpg"
+        );
+        assert_ne!(
+            app.detached_viewer_window_id,
+            Some(41),
+            "always-new auto-open must not reuse the previous detached viewport as continuation navigation"
+        );
+        assert!(
+            app.detached_viewer_window_id.is_some(),
+            "a new active detached viewport should be allocated for the image-only folder"
+        );
+        assert!(
+            !app.fs_open_intent_from_grid,
+            "open_fullscreen consumes the restored grid intent"
+        );
     }
 
     #[test]
@@ -16619,6 +17170,36 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         assert!(!app.detached_image_windows[0].pinned);
         assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
+    }
+
+    #[test]
+    fn main_context_preserve_hands_off_active_viewport_to_passive() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        insert_static_fs_entry(&mut app, &ctx, idx, "main_context_handoff");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(7);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(7, DetachedSource::Image);
+
+        assert!(app.preserve_active_detached_image_window_for_main_context_change());
+
+        assert!(
+            app.active_detached_session.is_none(),
+            "the active session must be closed once the same window is represented as passive"
+        );
+        assert!(
+            !app.fs_viewport_shown,
+            "cleanup must not send Visible(false) to a viewport handed off to a passive window"
+        );
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 7);
+        assert!(app.detached_image_windows[0].can_activate());
     }
 
     #[test]
@@ -17356,6 +17937,224 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn reactivating_pinned_window_parks_current_linked_active_as_passive() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, second, "linked_active_second");
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.fullscreen_idx = Some(second);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(2);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(2, DetachedSource::Image);
+
+        let mut paused_bundle = ViewerContextBundle::empty();
+        paused_bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\pics\a.jpg"))];
+        paused_bundle.thumbnails = vec![ThumbnailState::Pending];
+        paused_bundle.image_metas = vec![None];
+        paused_bundle.visible_indices = vec![0];
+        paused_bundle.selected = Some(0);
+        paused_bundle.fullscreen_idx = Some(0);
+        paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        paused_bundle.detached_viewer_window_id = Some(1);
+        paused_bundle.detached_viewer_pin_active = true;
+        paused_bundle.detached_viewer_independent_active = true;
+        paused_bundle.current_folder = Some(PathBuf::from(r"C:\pics"));
+        paused_bundle.address = r"C:\pics".to_string();
+        paused_bundle.items_generation =
+            DETACHED_VIEWER_CONTEXT_GENERATION_BASE | DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE;
+
+        let texture = ctx.load_texture(
+            "pinned_passive_first",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 1,
+                texture,
+                title: "a.jpg - mimageviewer".to_string(),
+                location_display: "a.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0,
+                paused_bundle: Some(Box::new(paused_bundle)),
+            });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 1));
+
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("pinned window should become the active independent context");
+        assert_eq!(active.bundle.detached_viewer_window_id, Some(1));
+        assert!(
+            active.bundle.detached_viewer_pin_active,
+            "reactivated pinned windows must keep their pinned flag so later parking stays non-reusable"
+        );
+        assert!(active.bundle.detached_viewer_independent_active);
+        assert_eq!(app.active_detached_session.unwrap().window_id, 1);
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "main context should be back on the grid"
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let parked = &app.detached_image_windows[0];
+        assert_eq!(
+            parked.id, 2,
+            "the previously active linked window should remain as a passive window"
+        );
+        assert!(
+            !parked.pinned,
+            "the parked linked window must stay reusable/linked, not become pinned"
+        );
+        assert_eq!(parked.location_display, "b.jpg");
+        assert!(
+            parked.reopen_sync_stamp.is_some(),
+            "linked passive windows need a sync stamp so they can reactivate into the main context"
+        );
+        assert!(
+            parked.can_activate(),
+            "the parked linked passive window must be activatable"
+        );
+        assert!(
+            parked.paused_bundle.is_none(),
+            "linked passive windows should not steal the main bundle"
+        );
+        assert_eq!(app.selected, Some(second));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn pausing_linked_active_context_drops_bundle_for_main_link_reactivation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let mut main_context = app.take_current_viewer_context_bundle();
+
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 3,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(4);
+        app.detached_viewer_pin_active = false;
+        app.detached_viewer_independent_active = false;
+        insert_static_fs_entry(&mut app, &ctx, 0, "linked_context_pdf_page");
+
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(4, DetachedSource::Image);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+
+        assert!(app.pause_current_active_detached_viewer_context(&ctx));
+
+        assert!(app.active_detached_viewer_context.is_none());
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let snapshot = &app.detached_image_windows[0];
+        assert_eq!(snapshot.id, 4);
+        assert!(!snapshot.pinned);
+        assert!(
+            snapshot.reopen_sync_stamp.is_some(),
+            "linked passive context must keep a sync stamp for main-linked reactivation"
+        );
+        assert!(
+            snapshot.reopen_descriptor.is_some(),
+            "PDF/ZIP linked passive windows may still keep a descriptor as fallback metadata"
+        );
+        assert!(
+            snapshot.paused_bundle.is_none(),
+            "linked passive windows must not keep a paused bundle, otherwise reactivation resumes an independent context"
+        );
+    }
+
+    #[test]
+    fn linked_passive_pdf_snapshot_prefers_sync_stamp_over_descriptor() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.selected = Some(0);
+        let stamp = app
+            .viewer_sync_stamp_for_idx(0)
+            .expect("PDF page should produce a sync stamp");
+        let texture = ctx.load_texture(
+            "linked_passive_pdf_snapshot",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 4,
+                texture,
+                title: "Page 8 - mimageviewer".to_string(),
+                location_display: "Page 8".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: false,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
+                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    page_num: Some(7),
+                }),
+                reopen_sync_stamp: Some(stamp),
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0,
+                paused_bundle: None,
+            });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 4));
+
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "unpinned linked passive PDF pages should reactivate through the main context, not a detached book bundle"
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.detached_viewer_window_id, Some(4));
+        assert!(!app.detached_viewer_pin_active);
+        assert!(!app.detached_viewer_independent_active);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    }
+
+    #[test]
     fn paused_continuous_detached_window_keeps_visible_page_snapshot() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -17448,6 +18247,58 @@ mod still_window_mode_key_tests {
             .as_ref()
             .unwrap();
         assert!(paused.final_ai_pending.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pausing_detached_context_hands_viewport_to_passive_without_cleanup() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = false;
+
+        let mut main_context = app.take_current_viewer_context_bundle();
+        let idx = push_image(&mut app, r"C:\pics\pinned.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_pin_active = true;
+        app.detached_viewer_window_id = Some(10);
+        insert_static_fs_entry(&mut app, &ctx, idx, "pause_handoff_to_passive");
+        let active_context = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut main_context);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_context,
+        });
+        app.begin_active_detached_session(10, DetachedSource::Image);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.detached_viewer_host_hwnd = 0x1234;
+
+        assert!(app.pause_current_active_detached_viewer_context(&ctx));
+
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let snapshot = &app.detached_image_windows[0];
+        assert_eq!(snapshot.id, 10);
+        assert!(snapshot.pinned);
+        let paused = snapshot
+            .paused_bundle
+            .as_ref()
+            .expect("pause should keep the viewer bundle");
+        assert!(
+            paused.detached_viewer_pin_active,
+            "a pinned active context must remain pinned inside the paused bundle"
+        );
+        assert!(paused.detached_viewer_independent_active);
+        assert!(
+            app.active_detached_session.is_none(),
+            "active->passive handoff must end the active keep-alive session so cleanup does not hide the passive viewport"
+        );
+        assert!(
+            !app.fs_viewport_shown,
+            "active viewport runtime must be released without sending Visible(false)"
+        );
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert_eq!(app.detached_viewer_host_hwnd, 0);
     }
 
     #[test]
@@ -17845,6 +18696,328 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn main_window_clear_color_follows_theme_panel_fill() {
+        // 描画スキップフレーム (font atlas resync の defer / detached close 直後の
+        // no-surface) で見えるクリア色は、テーマのパネル背景 (= メニューバー背景) に
+        // 合わせる。eframe 既定の near-black 固定だとライトテーマで「一瞬黒」が目立つため。
+        let light = egui::Visuals::light();
+        let dark = egui::Visuals::dark();
+        assert_eq!(
+            main_window_clear_color(&light),
+            light.panel_fill.to_normalized_gamma_f32(),
+            "clear color must match the light theme panel (menu bar) background"
+        );
+        assert_eq!(
+            main_window_clear_color(&dark),
+            dark.panel_fill.to_normalized_gamma_f32(),
+            "clear color must match the dark theme panel (menu bar) background"
+        );
+        assert_ne!(
+            main_window_clear_color(&light),
+            main_window_clear_color(&dark),
+            "clear color must follow the theme, not be a fixed value"
+        );
+        // eframe 既定の near-black 固定 (12,12,12,a=180) に退行していないこと。
+        let eframe_default_near_black =
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32();
+        assert_ne!(
+            main_window_clear_color(&light),
+            eframe_default_near_black,
+            "light theme clear color must not regress to eframe's fixed near-black default"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pin_promote_moves_active_linked_still_to_independent_context() {
+        // ピン留め = Active・連動 → Active・連動なし (独自 bundle 昇格、案①)。
+        // docs/detached-viewer-implementation-plan.md §3.0 ③。
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(std::path::PathBuf::from(r"C:\imgs\a.jpg")),
+            GridItem::Image(std::path::PathBuf::from(r"C:\imgs\b.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.fullscreen_idx = Some(1);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(7);
+        let ctx = egui::Context::default();
+        let frame0 = egui::ColorImage::filled([1, 1], egui::Color32::RED);
+        let frame1 = egui::ColorImage::filled([1, 1], egui::Color32::GREEN);
+        let tex0 = ctx.load_texture(
+            "pin_promote_animated_0",
+            frame0.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let tex1 = ctx.load_texture(
+            "pin_promote_animated_1",
+            frame1.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            1,
+            FsCacheEntry::Animated {
+                frames: vec![(tex0, 0.1), (tex1, 0.2)],
+                frame_pixels: vec![std::sync::Arc::new(frame0), std::sync::Arc::new(frame1)],
+                current_frame: 1,
+                next_frame_at: 123.0,
+                load_seq: 77,
+            },
+        );
+        app.input_generation.insert(1, 42);
+        app.fs_margin_bbox_cache
+            .insert(1, (77, 123, Some(egui::Rect::EVERYTHING)));
+        let (cancel, rx) = std::sync::mpsc::channel();
+        drop(cancel);
+        app.fs_pending
+            .insert(1, (std::sync::Arc::new(AtomicBool::new(false)), rx, 88));
+        app.fs_early_dims.insert(1, [640, 480]);
+        app.fs_upload_backlog.push((
+            0,
+            FsLoadResult::DimsOnly {
+                source_dims: [1, 1],
+            },
+            1,
+        ));
+        app.fs_upload_backlog.push((1, FsLoadResult::Failed, 2));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.4, -0.2));
+        app.pano_toast_shown_for_current_fs = true;
+        app.analysis_mode = true;
+        app.analysis_zoom = 2.0;
+        app.analysis_pan = egui::vec2(5.0, -4.0);
+        app.erase_mode = true;
+        app.erase_mask = Some(vec![true, false]);
+        app.erase_mask_size = [2, 1];
+        assert!(app.active_detached_viewer_context.is_none());
+
+        assert!(
+            app.promote_active_still_to_independent(),
+            "active-linked detached still should promote to an independent context"
+        );
+
+        // メインは grid へ戻る (items は維持、fullscreen 状態だけ解除)。
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "main reverts to grid (no fullscreen idx)"
+        );
+        assert_eq!(app.items.len(), 2, "main keeps its grid items untouched");
+        assert_ne!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.active_detached_viewer_context.is_some());
+        // メインは detached 窓の所有権を手放す (次の open が新 window_id を割り当てる、
+        // Codex P1: ピン窓上書き防止)。
+        assert_eq!(
+            app.detached_viewer_window_id, None,
+            "main relinquishes the detached window id so a new open allocates a fresh one"
+        );
+
+        // 連動なし窓は独自 bundle を持ち、ピンした画像・前後移動用の order・items を保持し、
+        // 「ピン済み」(park 時に reuse されない passive になる) としてマークされている。
+        let snapshot = app
+            .with_active_detached_viewer_context(|a| {
+                (
+                    a.fullscreen_idx,
+                    a.items.len(),
+                    a.detached_viewer_independent_active,
+                    a.detached_viewer_window_id,
+                    a.visible_indices.len(),
+                    a.detached_viewer_pin_active,
+                    match a.fs_cache.get(&1) {
+                        Some(FsCacheEntry::Animated {
+                            frames,
+                            current_frame,
+                            next_frame_at,
+                            load_seq,
+                            ..
+                        }) => Some((frames.len(), *current_frame, *next_frame_at, *load_seq)),
+                        _ => None,
+                    },
+                    a.input_generation.get(&1).copied(),
+                    a.fs_margin_bbox_cache.contains_key(&1),
+                    a.fs_pending.contains_key(&1),
+                    a.fs_early_dims.get(&1).copied(),
+                    a.fs_upload_backlog
+                        .iter()
+                        .map(|(idx, _, seq)| (*idx, *seq))
+                        .collect::<Vec<_>>(),
+                    a.panorama_state.is_some(),
+                    a.pano_toast_shown_for_current_fs,
+                    a.analysis_mode,
+                    a.erase_mode,
+                )
+            })
+            .expect("active detached context present");
+        assert_eq!(snapshot.0, Some(1), "pinned context shows the pinned image");
+        assert_eq!(
+            snapshot.1, 2,
+            "pinned context cloned folder items for navigation"
+        );
+        assert!(
+            snapshot.2,
+            "pinned context is independent (decoupled from main)"
+        );
+        assert_eq!(
+            snapshot.3,
+            Some(7),
+            "pinned context keeps the same window id"
+        );
+        assert_eq!(
+            snapshot.4, 2,
+            "pinned context keeps visible_indices so prev/next has a target (Codex P1)"
+        );
+        assert!(
+            snapshot.5,
+            "pinned context is marked pinned so it parks as a non-reusable passive (Codex P1)"
+        );
+        assert_eq!(
+            snapshot.6,
+            Some((2, 1, 123.0, 77)),
+            "pin promotion keeps the current animated fs_cache entry alive"
+        );
+        assert_eq!(snapshot.7, Some(42));
+        assert!(
+            snapshot.8,
+            "margin cache for current page moves to the bundle"
+        );
+        assert!(
+            snapshot.9,
+            "pending load for current page moves to the bundle"
+        );
+        assert_eq!(snapshot.10, Some([640, 480]));
+        assert_eq!(
+            snapshot.11,
+            vec![(1, 2)],
+            "upload backlog for the current page moves to the bundle"
+        );
+        assert!(
+            !snapshot.12,
+            "pin promotion exits panorama so the independent window freezes normal image display"
+        );
+        assert!(!snapshot.13);
+        assert!(
+            !snapshot.14,
+            "pin promotion must not stash analysis mode into the independent bundle"
+        );
+        assert!(
+            !snapshot.15,
+            "pin promotion must not stash an in-progress erase mode into the independent bundle"
+        );
+        assert!(
+            app.panorama_state.is_none(),
+            "main context must not carry panorama into the next image opened after pinning"
+        );
+        assert!(!app.pano_toast_shown_for_current_fs);
+        assert!(!app.analysis_mode);
+        assert!(!app.erase_mode);
+        assert!(
+            !app.fs_cache.contains_key(&1),
+            "main must relinquish the moved fullscreen cache entry"
+        );
+        assert!(
+            !app.fs_pending.contains_key(&1),
+            "main must relinquish the moved pending load"
+        );
+        assert_eq!(
+            app.fs_upload_backlog
+                .iter()
+                .map(|(idx, _, seq)| (*idx, *seq))
+                .collect::<Vec<_>>(),
+            vec![(0, 1)],
+            "unrelated main upload backlog entries stay in main"
+        );
+
+        // 一方通行 (§3.0 ⑤): 既に独自 context があるので再昇格は no-op。
+        assert!(
+            !app.promote_active_still_to_independent(),
+            "pin is one-way; re-promotion must be a no-op"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn grid_open_does_not_close_pinned_context_when_pause_snapshot_is_unavailable() {
+        // ピン窓を passive 化するには表示 texture が必要。decode 前などで snapshot が
+        // 作れない場合、旧実装は close fallback に落ちてピン窓を消していた。新規 open
+        // は中断し、既存の active context を残す。
+        let mut app = setup_app();
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image(std::path::PathBuf::from(r"C:\imgs\a.jpg"))];
+        bundle.visible_indices = vec![0];
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_pin_active = true;
+        bundle.detached_viewer_window_id = Some(9);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        let ctx = egui::Context::default();
+        assert!(
+            !app.park_active_detached_context_for_new_grid_open(&ctx),
+            "without a display texture, parking must fail instead of closing the pinned context"
+        );
+        assert!(
+            app.active_detached_viewer_context.is_some(),
+            "failed parking must keep the pinned active context alive"
+        );
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "no passive snapshot is created when the texture is unavailable"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_cleanup_font_resync_waits_until_outer_detached_idle() {
+        // always-new クラッシュの根治 (Codex): passive close / active close finalize などの
+        // close 経路では即時 resync せず pending 化し、outer/main context が detached idle だと
+        // 確認できた時だけ main font-atlas resync を発火する。
+        let mut app = setup_app();
+        assert!(app.detached_image_windows.is_empty());
+
+        app.request_detached_cleanup_font_atlas_resync("test");
+
+        // active session が無くても、outer/main 側に detached fullscreen が戻る状態なら
+        // flush してはいけない。これは active context mount 中の `active_close_finalize` が
+        // 見落としていたクラッシュ条件 (resync 直後に main detached viewport が描かれる)。
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.flush_pending_detached_cleanup_font_atlas_resync();
+        assert!(
+            app.pending_detached_cleanup_font_atlas_resync,
+            "detached cleanup resync must remain pending while main detached fullscreen is active"
+        );
+        assert!(!app.main_font_atlas_resync_pending);
+
+        // active detached session が生きている間も flush しない。
+        app.fullscreen_idx = None;
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.begin_active_detached_session(7, DetachedSource::Image);
+        app.flush_pending_detached_cleanup_font_atlas_resync();
+        assert!(
+            app.pending_detached_cleanup_font_atlas_resync,
+            "pending resync must wait while an active detached session is alive"
+        );
+        assert!(!app.main_font_atlas_resync_pending);
+
+        // すべての detached renderer が idle になってから、初めて main resync を発火する。
+        app.begin_active_detached_session_close("test");
+        app.finish_active_detached_session_close("test");
+        app.flush_pending_detached_cleanup_font_atlas_resync();
+        assert!(
+            !app.pending_detached_cleanup_font_atlas_resync,
+            "pending request should be consumed once detached is fully idle"
+        );
+        assert!(
+            app.main_font_atlas_resync_pending,
+            "main font atlas resync is scheduled only after detached is fully idle"
+        );
+        assert_eq!(
+            app.main_font_atlas_resync_reason,
+            Some(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn finalized_active_detached_close_skips_hidden_cleanup_frame() {
         let mut app = setup_app();
@@ -17866,6 +19039,12 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fs_viewport_presentation, None);
         assert!(!app.fs_viewport_recreate_after_hide);
         assert_eq!(app.detached_viewer_host_hwnd, 0);
+        assert!(!app.main_font_atlas_resync_pending);
+        assert!(
+            app.pending_detached_cleanup_font_atlas_resync,
+            "active close finalize should defer detached cleanup font resync to the outer context"
+        );
+        app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(app.main_font_atlas_resync_pending);
         assert_eq!(
             app.main_font_atlas_resync_reason,

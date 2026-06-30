@@ -6,6 +6,14 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開くとき、メイン�
 この文書は `detached-viewer-implementation-plan.md` の複数画像ウィンドウ安定化方針を前提に、
 「本を別々のウィンドウで開く」要望を満たすための本対応を切り出す。
 
+> **ウィンドウ状態モデルの正本は [detached-viewer-implementation-plan.md §3.0](detached-viewer-implementation-plan.md)**
+> （Active・連動 / Active・連動なし / Passive と遷移①〜⑥、2026-06-29 確定）。本書が定義する
+> 「独自 context bundle を持つ active viewer」は、本（PDF/ZIP）だけでなく**ピン留めした静止画**も
+> 同じ `active_detached_viewer_context` へ昇格させて使う（§3.0 ③）。これにより連動なし窓は
+> メインの BS / Ctrl+↑↓ の影響を受けない（§3.0 ⑥）。ピンは**一方通行**（解除なし・閉じるのみ、§3.0 ⑤）。
+> Passive にも連動 / 連動なしの属性があり、別窓を Active 化するときは現在の Active を閉じずに
+> 対応する Passive へ落とす（Active・連動 → Passive・連動、Active・連動なし → Passive・連動なし、§3.0 ⑦）。
+
 ## 1. 解決したい問題
 
 現状の ZIP / PDF は仮想フォルダを開くと `App.items` をページ一覧 (`ZipImage` / `PdfPage`) へ
@@ -30,6 +38,9 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開くとき、メイン�
 - passive / paused window を再度アクティブ化した場合、現在 active viewer を paused 化し、
   AI / 先読み / 編集中 worker など active 専用処理を停止したうえで、その window が保持していた
   viewer context を active viewer として復帰する。PDF / ZIP を再列挙し直さない。
+- 通常モードの未ピン linked viewer も、別の passive window をアクティブ化するときは閉じずに
+  Passive・連動として残す。メインから次の画像を明示 open した場合は、その Passive・連動窓を
+  再利用して Active・連動へ戻せる。
 - active viewer だけがページ送り、見開き、スライドショー、先読み、AI アップスケール、編集を動かす。
   paused window は最後に見た画像を表示するだけで、処理対象ではない。ただし現在ページ、
   zoom / pan、表示中 texture、ページ列など復帰に必要な context は保持する。

@@ -7012,6 +7012,7 @@ fn draw_header_icon_button(
     enabled: bool,
     active: bool,
     tooltip: &str,
+    disabled_tooltip: Option<&str>,
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
 ) -> egui::Response {
     let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
@@ -7029,7 +7030,7 @@ fn draw_header_icon_button(
     if enabled {
         resp.on_hover_text(tooltip)
     } else {
-        resp.on_hover_text("画像を開いているときのみ使用できます")
+        resp.on_hover_text(disabled_tooltip.unwrap_or("画像を開いているときのみ使用できます"))
     }
 }
 
@@ -11510,6 +11511,8 @@ impl App {
                             | crate::grid_item::GridItem::PdfPage { .. }
                     )
                 );
+            let edit_tool_disabled_reason = self.detached_viewer_image_edit_tools_disabled_reason();
+            let can_start_edit_tool = can_overlay_edit && edit_tool_disabled_reason.is_none();
             // 右側 6 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト / エクスポート。
             // テキストは comic 注釈モード (最前面・パイプライン最終段) なので crop と export の間に置く。
             let btn_y = header_rect.min.y + 34.0;
@@ -11554,12 +11557,13 @@ impl App {
                 &mut child,
                 erase_rect,
                 "adjust_panel_erase_btn",
-                can_overlay_edit,
+                can_start_edit_tool,
                 false,
                 "消しゴム (E)",
+                edit_tool_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_eraser_icon,
             );
-            if can_overlay_edit && erase_resp.clicked() {
+            if can_start_edit_tool && erase_resp.clicked() {
                 activate_erase = true;
             }
 
@@ -11567,12 +11571,13 @@ impl App {
                 &mut child,
                 local_adjust_rect,
                 "adjust_panel_local_adjust_btn",
-                can_overlay_edit,
+                can_start_edit_tool,
                 false,
                 "補正レイヤー",
+                edit_tool_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_local_adjust_icon,
             );
-            if can_overlay_edit && local_adjust_resp.clicked() {
+            if can_start_edit_tool && local_adjust_resp.clicked() {
                 activate_local_adjust = true;
             }
 
@@ -11580,12 +11585,13 @@ impl App {
                 &mut child,
                 conceal_rect,
                 "adjust_panel_conceal_btn",
-                can_overlay_edit,
+                can_start_edit_tool,
                 false,
                 "隠蔽加工 (Ctrl+M)",
+                edit_tool_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_mosaic_icon,
             );
-            if can_overlay_edit && conceal_resp.clicked() {
+            if can_start_edit_tool && conceal_resp.clicked() {
                 activate_conceal = true;
             }
 
@@ -11593,12 +11599,13 @@ impl App {
                 &mut child,
                 crop_rect,
                 "adjust_panel_crop_btn",
-                can_overlay_edit,
+                can_start_edit_tool,
                 false,
                 "切り取り",
+                edit_tool_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_crop_icon,
             );
-            if can_overlay_edit && crop_resp.clicked() {
+            if can_start_edit_tool && crop_resp.clicked() {
                 activate_crop = true;
             }
 
@@ -11606,12 +11613,13 @@ impl App {
                 &mut child,
                 text_rect,
                 "adjust_panel_text_btn",
-                can_overlay_edit,
+                can_start_edit_tool,
                 false,
                 "テキスト注釈 (Ctrl+T)",
+                edit_tool_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_text_icon,
             );
-            if can_overlay_edit && text_resp.clicked() {
+            if can_start_edit_tool && text_resp.clicked() {
                 activate_text = true;
             }
 
@@ -11622,6 +11630,7 @@ impl App {
                 can_overlay_edit,
                 false,
                 "エクスポート",
+                None,
                 crate::ui_fullscreen::draw_icons::draw_export_icon,
             );
             if can_overlay_edit && export_resp.clicked() {

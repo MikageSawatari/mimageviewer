@@ -8,6 +8,10 @@
 関連:
 - 問題カタログ: [detached-viewer-lifecycle-redesign-proposal.md](detached-viewer-lifecycle-redesign-proposal.md)
 - v2.2.0 比較で確定した回帰の経緯は本書 §2。
+- **ウィンドウ状態モデル（Active・連動 / Active・連動なし / Passive と遷移）の正本**:
+  [detached-viewer-implementation-plan.md §3.0](detached-viewer-implementation-plan.md)。
+  本書は「Active 窓を毎フレーム描いて OS ウィンドウを破棄させない」**生存条件**だけを扱い、
+  linked / independent / passive の区別には踏み込まない（補完関係）。
 
 ---
 
@@ -128,7 +132,7 @@ detached 窓が「描かれないフレーム」を踏み、egui が破棄 → r
 真実にする:
 
 ```rust
-enum DetachedSource { Image, Book } // 再オープン経路の判別 (将来拡張)
+enum DetachedSource { Image, Video, Book } // 再オープン経路の判別 (将来拡張)
 
 struct ActiveDetachedSession {
     window_id: u64,   // 安定 ViewportId の素 (セッション中不変)
@@ -688,3 +692,61 @@ close 漏れを確認。小窓 + 閉じられないは、session 未 close → b
   close_to_page_list を個別に即時 close する必要が残るか (= catch-all + 保険で実害が無いか)。
 - 「session が在る間 `fullscreen_viewport_id()`=session.window_id 最優先」が、F12 トグルや
   passive↔active 切替で別の ViewportId 衝突を生まないか。
+
+### 2026-06-29 Codex レビュー #4
+
+K0 close 漏れ修正 (`22f653eb`) と F11 borderless 維持修正 (`b29bf0d5`) を確認しました。
+結論として、今回の修正方針は妥当で、追加のブロッカーは見つけていません。
+
+#### close を cleanup catch-all に寄せた判断
+
+妥当です。`keep_fullscreen_viewport_alive()` の cleanup 経路は
+`fullscreen_idx=None` / `fs_viewport_shown=true` / 非 deferred の「実際に viewport を隠すフレーム」
+なので、`pending_return_to_parent` / `close_to_page_list` / 親フォルダ復帰など、個別 intent から
+漏れやすい close を 1 箇所で回収できます。前回ログの
+`cleanup_visible_false` → `clear host` → 空 backstop 継続、という実害にも直接対応しています。
+
+folder-nav 誤 close についても、正常な folder-nav は deferred 分岐または同フレーム reopen 側に
+入り、cleanup 経路へ落ちない設計なので、catch-all が session を畳む条件としては自然です。
+さらに `fullscreen_idx=None && tex=None` の backstop 保険があるため、仮に close が 1 フレーム遅れても
+空小窓を描き続けない点も良いです。
+
+今後の退行防止としては、実機ログの成功条件を
+`cleanup_visible_false` の近傍で `session_closing ... keep_alive_cleanup` /
+`session_finish ... keep_alive_cleanup` が出ること、かつその後
+`keepalive_backstop window_id=Some(...)` が継続しないことに置くのが分かりやすいです。
+
+#### `fullscreen_viewport_id()` の session 優先化
+
+妥当です。K0 の最大の危険は、既存描画経路が `detached_viewer_window_id` / presentation 由来の
+ViewportId を描き、backstop が `active_detached_session.window_id` 由来の別 ViewportId を描くことでした。
+session 優先化により、session が存在する間は既存描画と backstop が同じ detached ViewportId を
+参照するため、2 枚目の小窓生成リスクを下げられています。
+
+closing 中も `fullscreen_viewport_id()` が session id を返す点は正しいです。Close / Visible(false)
+を送る teardown 中は、まさに閉じたい detached ViewportId へコマンドを送る必要があります。
+`finish_active_detached_session_close()` 後は通常 fullscreen id へ戻るため、閉じ終わった session が
+以後の通常 fullscreen / F12 OFF に残る構造にもなっていません。
+
+F12 トグルについても、still 分岐では F12 ON で begin、F12 OFF で begin_close+finish が入るため、
+session 優先 id が残って別 ViewportId 衝突を起こす可能性は低いです。passive↔active 切替も
+再 active 化時に snapshot id で begin しており、passive の ViewportId と active session id が一致する
+既存方針と整合しています。
+
+#### F11 borderless 修正
+
+`prepare_viewer_presentation_close()` の維持判定を `viewer_session_is_detached()` から
+`detached_active_window_alive_wanted()` へ変えたのは正しいです。`close_fullscreen()` は
+`fullscreen_idx=None` にしてから close 準備へ進むため、`fullscreen_idx.is_some()` に依存する旧判定では
+folder-nav 中に borderless 状態を誤クリアします。session alive を truth にしたことで、
+folder-nav 中は borderless / window id / placement を維持し、明示 close では session が先に
+closing/finish されるので通常 cleanup に落ちる、という設計になります。
+
+追加された `folder_nav_close_preserves_borderless_fullscreen_while_session_alive` は、この問題を直接固定する
+良い回帰テストです。実機では、F11 仮想フルスクリーン detached 窓で Ctrl+↓/↑ 後も
+装飾なし・同サイズのまま維持されることを確認してください。
+
+#### 残メモ
+
+K0 は実用上の安定化として承認できます。K1 (描画入口の単一化) は、今回の K0 が実機で安定しているなら
+急がず、今後の変更で描画入口の分岐が再び増えそうなタイミングで進めるのがよいと思います。

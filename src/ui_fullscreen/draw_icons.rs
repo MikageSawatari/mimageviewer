@@ -99,43 +99,48 @@ pub(crate) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
 }
 
 /// detached 画像ビューアのピン留めボタン。
+///
+/// 押しピンを正面から見た形にする (上に平たい頭、首、肩の横棒、まっすぐ下りる針)。
+/// 旧実装は針がジグザグに折れていて稲妻のように見えたため、針を直線にして可読性を上げた。
 pub(super) fn draw_pin_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, pinned: bool) {
     let white = egui::Color32::WHITE;
     let stroke = egui::Stroke::new(1.8, white);
-    let head = [
-        egui::pos2(c.x - r * 0.55, c.y - r * 0.72),
-        egui::pos2(c.x + r * 0.58, c.y - r * 0.72),
-        egui::pos2(c.x + r * 0.34, c.y - r * 0.18),
-        egui::pos2(c.x - r * 0.34, c.y - r * 0.18),
-    ];
+    // 頭 (押す部分): 平たい角丸の帽子。ピン中は薄く塗って状態を示す。
+    let head = egui::Rect::from_min_max(
+        egui::pos2(c.x - r * 0.6, c.y - r * 0.82),
+        egui::pos2(c.x + r * 0.6, c.y - r * 0.4),
+    );
     if pinned {
-        painter.add(egui::Shape::convex_polygon(
-            head.to_vec(),
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
-            egui::Stroke::NONE,
-        ));
+        painter.rect_filled(
+            head,
+            r * 0.18,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+        );
     }
-    painter.add(egui::Shape::closed_line(head.to_vec(), stroke));
+    painter.rect_stroke(head, r * 0.18, stroke, egui::StrokeKind::Middle);
+    // 首: 頭の下から肩へすぼまる台形。
+    let neck = [
+        egui::pos2(c.x - r * 0.4, c.y - r * 0.4),
+        egui::pos2(c.x + r * 0.4, c.y - r * 0.4),
+        egui::pos2(c.x + r * 0.24, c.y - r * 0.04),
+        egui::pos2(c.x - r * 0.24, c.y - r * 0.04),
+    ];
+    painter.add(egui::Shape::closed_line(neck.to_vec(), stroke));
+    // 肩: 横棒。
     painter.line_segment(
         [
-            egui::pos2(c.x - r * 0.20, c.y - r * 0.18),
-            egui::pos2(c.x + r * 0.20, c.y + r * 0.34),
+            egui::pos2(c.x - r * 0.5, c.y - r * 0.04),
+            egui::pos2(c.x + r * 0.5, c.y - r * 0.04),
         ],
         stroke,
     );
+    // 針: まっすぐ下へ。
     painter.line_segment(
         [
-            egui::pos2(c.x + r * 0.20, c.y + r * 0.34),
-            egui::pos2(c.x, c.y + r * 0.78),
+            egui::pos2(c.x, c.y - r * 0.04),
+            egui::pos2(c.x, c.y + r * 0.86),
         ],
         egui::Stroke::new(2.0, white),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(c.x - r * 0.45, c.y + r * 0.04),
-            egui::pos2(c.x + r * 0.45, c.y + r * 0.04),
-        ],
-        stroke,
     );
 }
 

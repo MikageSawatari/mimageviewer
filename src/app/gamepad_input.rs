@@ -3759,6 +3759,16 @@ impl App {
         forward: bool,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        if self.block_gamepad_grid_folder_nav_for_detached_foreground(
+            source,
+            if forward {
+                "history_forward"
+            } else {
+                "history_back"
+            },
+        ) {
+            return None;
+        }
         if self.is_snapshot_active() || self.items_are_drive_list {
             return None;
         }
@@ -3967,6 +3977,12 @@ impl App {
             );
             self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, forward, native_toast);
         } else {
+            if self.block_gamepad_grid_folder_nav_for_detached_foreground(
+                source,
+                if forward { "tree_forward" } else { "tree_back" },
+            ) {
+                return;
+            }
             self.handle_grid_tree_folder_nav(forward, source);
         }
     }
@@ -4019,6 +4035,16 @@ impl App {
             let native_toast = self.current_fullscreen_is_video(fs_idx);
             self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, forward, native_toast);
         } else {
+            if self.block_gamepad_grid_folder_nav_for_detached_foreground(
+                source,
+                if forward {
+                    "sibling_forward"
+                } else {
+                    "sibling_back"
+                },
+            ) {
+                return;
+            }
             self.bump_input_seq(
                 source,
                 Some(if forward {
@@ -4038,6 +4064,26 @@ impl App {
                 self.start_folder_nav(cur, forward, FolderNavMode::SiblingGrid);
             }
         }
+    }
+
+    fn block_gamepad_grid_folder_nav_for_detached_foreground(
+        &mut self,
+        source: &'static str,
+        detail: &'static str,
+    ) -> bool {
+        #[cfg(windows)]
+        if self.active_detached_viewer_has_foreground() {
+            self.bump_input_seq(source, Some(detail));
+            self.cancel_pending_folder_nav();
+            self.show_feedback_toast(
+                Self::nav_noop_title(crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent)
+                    .to_string(),
+            );
+            return true;
+        }
+
+        let _ = (source, detail);
+        false
     }
 
     fn apply_ring_action(
@@ -4952,6 +4998,12 @@ impl App {
     }
 
     fn handle_gamepad_grid_folder_nav(&mut self, forward: bool) {
+        if self.block_gamepad_grid_folder_nav_for_detached_foreground(
+            "gamepad_grid_folder_nav",
+            if forward { "forward" } else { "backward" },
+        ) {
+            return;
+        }
         self.bump_input_seq(
             "gamepad_grid_folder_nav",
             Some(if forward { "forward" } else { "backward" }),

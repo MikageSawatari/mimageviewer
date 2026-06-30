@@ -1573,6 +1573,12 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 `NativeVideoPlacement::DetachedViewerChild` として別ウィンドウ host の child HWND に出るが、
 main-window in-window active ではない。
 
+detached 動画を再生したままメイン一覧でフォルダ / お気に入りなどの context を切り替える場合、
+動画は `active_detached_viewer_context` 側へ切り離して再生を維持する。切り離し後は
+メイン一覧の選択変更に追従せず、動画窓内の前後移動は切り離し時に保持していた同一一覧内だけを
+対象にする。`Ctrl+↑↓` / `Ctrl+PageUp/PageDown` のフォルダ横断は、静止画のピン /
+always-new 窓と同じく no-op として扱う。
+
 ### 動画のライブ切り替え (デコーダ保持 placement switch)
 
 動画再生中にモードを切り替えるとき、`source` (デコーダ / 音声 / clock) を生かした

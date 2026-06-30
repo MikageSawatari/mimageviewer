@@ -336,6 +336,18 @@ begin_pass で新フォントが適用され、フル atlas アップロード�
 で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup も、メイン UI を stale
 font atlas のまま描くとフォント崩れが残ることがあるため、同じ保守経路へ乗せる。
 
+**緩和策: クリア色をテーマ連動にする (`App::clear_color` / `main_window_clear_color`)**。
+上記「1 フレーム黒」フォールバック、および detached 窓 close 直後の no-surface フレームで
+メインウィンドウ surface に見えるのは eframe 既定の `clear_color` 値だが、これは
+near-black `(12,12,12, a=180)` 固定。ダークテーマでは panel_fill と馴染むが、ライトテーマでは
+「一瞬黒」が目立つ (再現性が高いのは `auto_fullscreen_zip_pdf` ON で PDF を直接フルスクリーンに
+開き、Esc → `pending_return_to_parent` で親フォルダを `load_folder_or_convert_archive` 再読込する
+経路。重い再読込が描画スキップフレームを安定して踏む)。`eframe::App::clear_color` を
+オーバーライドして `visuals.panel_fill` (= メニューバー / パネル背景) を不透明で返すことで、
+ライト/ダークどちらでも地と馴染ませる。これは **font atlas resync の defer 自体には触れない緩和策**
+であり、上記の「stale font atlas で描かない = フォント崩れ回避」の保守トレードオフはそのまま維持する
+(= 根本修正ではなく、黒の視認性だけを下げる)。回帰ガードは `main_window_clear_color_follows_theme_panel_fill`。
+
 静止画の F11 / ホバーバーボタンで専用 fullscreen viewport から in-window 表示へ戻す経路は、
 最初の embedded 描画がメイン `egui::Context` で走る。古い fullscreen viewport を隠した後に
 resync を予約すると 1 フレームだけ stale font atlas でメイン UI を描いてしまうため、
@@ -386,7 +398,10 @@ items rebuild 後に、同じ idx が別項目を指しても再同期できる�
 有効な画像 / ZIP画像 / PDFページ session は、メイン一覧との自動同期を行わない。次の画像を
 開くとき、現在の active detached viewer は `TextureHandle` と表示位置だけを持つ passive
 detached image window として退避される。passive window は最後の画像を表示するだけで、active
-viewer cache / AI / 先読み / スライドショー / 編集状態は単一 active session のまま扱う。
+viewer cache / AI / 先読み / スライドショーは単一 active session のまま扱う。編集状態は
+detached bundle 間で保持・確定しない方針とし、always-new / ピン留めの連動なし窓では
+消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取り等の編集機能を起動できない。
+通常 F12 の linked detached viewer では従来どおり編集できるが、編集中はピン留めできない。
 未ピン留めの passive window がある場合は、設定 OFF でも次の画像 open にその window の配置を
 再利用する。メイン一覧側の Backspace / フォルダ移動 / 再読込で active detached 画像 session
 を閉じる場合も、画像専用の毎回新規設定または active ピン留めが有効なら先に passive window へ

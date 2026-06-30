@@ -130,6 +130,12 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         )
         .weak(),
     );
+    ui.label(
+        egui::RichText::new(
+            "※ この設定で開いた別ウィンドウでは、消しゴム・補正レイヤーなどの画像編集機能は利用できません。全体の色調補正やポストフィルタなどの表示調整は利用できます。",
+        )
+        .weak(),
+    );
 }
 
 pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

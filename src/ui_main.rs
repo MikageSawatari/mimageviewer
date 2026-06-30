@@ -2324,6 +2324,7 @@ impl App {
                                                         .to_string();
                                                     self.fav_add_name_input = default_name;
                                                     self.fav_add_target = Some(folder);
+                                                    self.fav_add_error = None;
                                                     self.show_fav_add_dialog = true;
                                                 }
                                                 ui.close();
@@ -8345,6 +8346,7 @@ impl App {
                                 .to_string();
                             self.fav_add_name_input = default_name;
                             self.fav_add_target = Some(folder);
+                            self.fav_add_error = None;
                             self.show_fav_add_dialog = true;
                         }
                     }
@@ -9135,9 +9137,14 @@ impl App {
                         self.drill_into_subfolder(p.clone());
                     } else {
                         let p = p.clone();
+                        let auto_fs = self.should_auto_fullscreen_grid_container(idx);
+                        #[cfg(windows)]
+                        if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx) {
+                            return nav;
+                        }
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
-                        if self.should_auto_fullscreen_grid_container(idx) {
+                        if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
                         nav = Some(p);
@@ -9146,10 +9153,15 @@ impl App {
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
                     // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
                     let p = p.clone();
+                    let auto_fs = self.should_auto_fullscreen_grid_container(idx);
+                    #[cfg(windows)]
+                    if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx) {
+                        return nav;
+                    }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
-                    if self.should_auto_fullscreen_grid_container(idx) {
+                    if auto_fs {
                         self.pending_auto_fs_open = true;
                     }
                     nav = Some(p);
@@ -9171,6 +9183,11 @@ impl App {
                         // playback back to paused.
                         self.fs_suppress_primary_until_release = true;
                         self.fs_focus_regained_at = Some(std::time::Instant::now());
+                    }
+                    // §3.0 ④: 連動なし窓があれば passive へ退避してから新規 open。
+                    #[cfg(windows)]
+                    if !self.park_active_detached_context_for_new_grid_open(ctx) {
+                        return nav;
                     }
                     self.fs_open_intent_from_grid = true;
                     // P10-1 follow-up: grid_action_open は Enter (および双クリック) からも

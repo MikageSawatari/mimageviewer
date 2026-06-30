@@ -261,6 +261,7 @@ struct ActiveDetachedViewerContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedSource {
     Image,
+    Video,
     Book,
 }
 
@@ -669,6 +670,15 @@ fn should_restore_fullscreen_focus_from_main_focus(
 
 fn should_defer_main_paint_for_font_atlas_resync(_reason: &str) -> bool {
     true
+}
+
+/// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
+/// テーマのパネル背景 (= メニューバー背景) に合わせ、描画スキップフレームの「一瞬黒」が
+/// ライトテーマで目立つのを緩和する。詳細は `eframe::App::clear_color` impl の doc を参照。
+fn main_window_clear_color(visuals: &egui::Visuals) -> [f32; 4] {
+    // `panel_fill` はメニューバー / 各パネルの既定背景色。メインウィンドウは
+    // transparent=false なので不透明色をそのまま返す。
+    visuals.panel_fill.to_normalized_gamma_f32()
 }
 
 /// Ctrl+↑↓ フォルダナビゲーションの発火元モード。DFS 完了後に mode に応じて
@@ -3229,6 +3239,13 @@ pub struct App {
     /// ためのセッション内状態として扱う。
     #[cfg(windows)]
     pub(crate) detached_viewer_pin_active: bool,
+    /// ピンボタン押下の遅延フラグ (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
+    /// ボタンは fullscreen 描画の最中に押されるため、その場で viewer 状態を書き換えると
+    /// 同フレームの描画と競合する。フラグだけ立て、描画 dispatch 直前の安全地点で
+    /// `process_pending_pin_promotion` が独自バンドルへの昇格を実行する。bundle には入れない
+    /// (per-context ではなくグローバルな UI アクション)。
+    #[cfg(windows)]
+    pub(crate) pending_pin_promotion: bool,
     /// ピン留めや既存の未ピン留め passive window の再利用で、次の画像 open だけを
     /// detached viewer にする one-shot。これは detached で開く指定だけを表し、
     /// メイン一覧と同期しない独立 session かどうかは
@@ -3475,6 +3492,7 @@ pub struct App {
     pub(crate) show_fav_add_dialog: bool,
     pub(crate) fav_add_name_input: String,
     pub(crate) fav_add_target: Option<PathBuf>,
+    pub(crate) fav_add_error: Option<String>,
     // v0.8.0: 追加時にチェックした自動インデックス対象
     // 既存お気に入りは全て false なので、ここもデフォルト false で一貫させる。
     // ユーザは後で「お気に入りの編集」からも切り替えられる。
@@ -4340,6 +4358,13 @@ pub struct App {
     pub(crate) main_font_atlas_resync_generation: u64,
     #[cfg(windows)]
     pub(crate) main_font_atlas_resync_reason: Option<&'static str>,
+    /// detached viewer の teardown 後にメイン font atlas resync が必要なことを表す pending。
+    ///
+    /// `active_detached_viewer_context` mount 中に即時 resync 判定をすると、outer/main context
+    /// に戻った後の detached viewport 生存を見落として Y-32 wgpu validation panic を起こす。
+    /// close 経路はこの flag だけを立て、outer/main context で安全判定してから flush する。
+    #[cfg(windows)]
+    pub(crate) pending_detached_cleanup_font_atlas_resync: bool,
     /// 閉じた後に次回表示用の ViewportId を更新するか。
     ///
     /// Win+Shift+Arrow など OS 側のモニター移動で eframe/winit の viewport state が
@@ -6124,6 +6149,8 @@ impl App {
             #[cfg(windows)]
             detached_viewer_pin_active: false,
             #[cfg(windows)]
+            pending_pin_promotion: false,
+            #[cfg(windows)]
             detached_viewer_open_next_still_detached_once: false,
             #[cfg(windows)]
             detached_viewer_folder_nav_reuse_window_once: false,
@@ -6211,6 +6238,7 @@ impl App {
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
+            fav_add_error: None,
             fav_add_auto_index_structure: false,
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
@@ -6532,6 +6560,8 @@ impl App {
             main_font_atlas_resync_generation: 0,
             #[cfg(windows)]
             main_font_atlas_resync_reason: None,
+            #[cfg(windows)]
+            pending_detached_cleanup_font_atlas_resync: false,
             fs_viewport_recreate_after_hide: false,
             fs_viewport_generation: 0,
             fs_opened_at: None,
@@ -8520,8 +8550,16 @@ impl App {
         }
         // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
         #[cfg(windows)]
-        self.preserve_active_detached_image_window_for_main_context_change();
-        self.close_fullscreen();
+        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
+        #[cfg(not(windows))]
+        let detached_video_preserved = false;
+        #[cfg(windows)]
+        if !detached_video_preserved {
+            self.preserve_active_detached_image_window_for_main_context_change();
+        }
+        if !detached_video_preserved {
+            self.close_fullscreen();
+        }
         None
     }
 
@@ -9538,8 +9576,16 @@ impl App {
         }
 
         #[cfg(windows)]
-        self.preserve_active_detached_image_window_for_main_context_change();
-        self.close_fullscreen();
+        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
+        #[cfg(not(windows))]
+        let detached_video_preserved = false;
+        #[cfg(windows)]
+        if !detached_video_preserved {
+            self.preserve_active_detached_image_window_for_main_context_change();
+        }
+        if !detached_video_preserved {
+            self.close_fullscreen();
+        }
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -10154,6 +10200,15 @@ impl App {
                 new_idx = self.find_fullscreen_nav_target_filtered(false);
             }
             if let Some(new_idx) = new_idx {
+                #[cfg(windows)]
+                {
+                    // `pending_auto_fs_open` はグリッド/外部からの明示的なフォルダ open に
+                    // 由来する one-shot。画像のみ通常フォルダは列挙後にここで初めて
+                    // open_fullscreen するため、ZIP/PDF の DeferredFsReopen と同様に
+                    // grid-origin の意図を復元してから開く。これを省くと always-new
+                    // detached で「継続ナビ」扱いになり、直前 active 窓を再利用してしまう。
+                    self.fs_open_intent_from_grid = true;
+                }
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
@@ -13830,8 +13885,16 @@ impl App {
             }
         }
         #[cfg(windows)]
-        self.preserve_active_detached_image_window_for_main_context_change();
-        self.close_fullscreen();
+        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
+        #[cfg(not(windows))]
+        let detached_video_preserved = false;
+        #[cfg(windows)]
+        if !detached_video_preserved {
+            self.preserve_active_detached_image_window_for_main_context_change();
+        }
+        if !detached_video_preserved {
+            self.close_fullscreen();
+        }
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
         // 計測する (nav cancel / items 割当 / キャッシュ clear)。UI が止まる潜在箇所を
@@ -19542,6 +19605,19 @@ impl App {
         if !main_has_focus {
             return None;
         }
+        if self.active_detached_viewer_has_foreground() {
+            let has_key_event = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+            });
+            if has_key_event {
+                self.log_detached_image_window_debug(
+                    "main_keyboard_suppressed_active_detached_foreground".to_string(),
+                );
+            }
+            return None;
+        }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
         if self.shortcuts_blocked_by_text_input() {
             return None;
@@ -19991,10 +20067,16 @@ impl App {
                         | Some(GridItem::PdfFile(p)) => {
                             // 環境設定 ON のとき ZIP/PDF、または画像だけの通常フォルダは
                             // ページ一覧を経由せずフルスクリーンで開く。
-                            if self.should_auto_fullscreen_grid_container(idx) {
+                            let p = p.clone();
+                            let auto_fs = self.should_auto_fullscreen_grid_container(idx);
+                            #[cfg(windows)]
+                            if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx)
+                            {
+                                return None;
+                            }
+                            if auto_fs {
                                 self.pending_auto_fs_open = true;
                             }
-                            let p = p.clone();
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             return Some(crate::ui_main::AddressBarNav::Direct(p));
@@ -20009,6 +20091,11 @@ impl App {
                         | Some(GridItem::Video(_)) => {
                             #[cfg(windows)]
                             if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
+                                return None;
+                            }
+                            // §3.0 ④: 連動なし窓があれば passive へ退避してから新規 open。
+                            #[cfg(windows)]
+                            if !self.park_active_detached_context_for_new_grid_open(ctx) {
                                 return None;
                             }
                             // 動画も画像と同じくフルスクリーン化 → インライン再生。
@@ -21800,8 +21887,33 @@ impl App {
         self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
     }
 
+    fn main_window_should_draw_export_dialogs(&self) -> bool {
+        !self.viewer_session_blocks_main_window() && !self.viewer_session_is_detached_or_switching()
+    }
+
+    #[cfg(windows)]
+    fn active_detached_viewer_has_foreground(&self) -> bool {
+        if !self.viewer_session_is_detached_or_switching()
+            && self.active_detached_viewer_context.is_none()
+        {
+            return false;
+        }
+        let Some(hwnd) = self.detached_viewer_host_hwnd_alive() else {
+            return false;
+        };
+        crate::video::native_window::foreground_hwnd() == hwnd
+    }
+
+    #[cfg(not(windows))]
+    fn active_detached_viewer_has_foreground(&self) -> bool {
+        false
+    }
+
     fn main_keyboard_should_drain_mouse_nav(&self, main_has_focus: bool) -> bool {
         if self.viewer_session_blocks_main_window() {
+            return false;
+        }
+        if self.active_detached_viewer_has_foreground() {
             return false;
         }
         if self.viewer_session_is_detached() && !main_has_focus {
@@ -21832,6 +21944,49 @@ impl App {
         if self.main_font_atlas_resync_reason.is_none() {
             self.main_font_atlas_resync_reason = Some(reason);
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn request_detached_cleanup_font_atlas_resync(&mut self, source: &'static str) {
+        if !self.pending_detached_cleanup_font_atlas_resync {
+            crate::logger::log(format!(
+                "[ui-fonts] defer detached cleanup font atlas resync: source={source}"
+            ));
+        }
+        self.pending_detached_cleanup_font_atlas_resync = true;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_cleanup_font_atlas_resync_is_safe(&self) -> bool {
+        self.detached_image_windows.is_empty()
+            && self.active_detached_viewer_context.is_none()
+            && self.active_detached_session.is_none()
+            && !self.viewer_session_is_detached_or_switching()
+            && !self.fs_viewport_shown
+            && self.fs_viewport_presentation != Some(ViewerPresentation::DetachedWindow)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn flush_pending_detached_cleanup_font_atlas_resync(&mut self) {
+        if !self.pending_detached_cleanup_font_atlas_resync {
+            return;
+        }
+        if !self.detached_cleanup_font_atlas_resync_is_safe() {
+            self.log_detached_image_window_debug(format!(
+                "font_resync_deferred_detached_alive active_context={} session={:?} \
+                 fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={}",
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session,
+                self.fullscreen_idx,
+                self.viewer_presentation,
+                self.fs_viewport_shown,
+                self.detached_image_windows.len()
+            ));
+            return;
+        }
+        self.pending_detached_cleanup_font_atlas_resync = false;
+        crate::logger::log("[ui-fonts] flush detached cleanup font atlas resync".to_string());
+        self.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP);
     }
 
     #[cfg(windows)]
@@ -22198,27 +22353,118 @@ impl App {
             return false;
         };
 
+        self.log_detached_image_window_debug(format!(
+            "pause_active_context_begin bundle_window_id={:?} bundle_fs_idx={:?} \
+             bundle_pinned={} bundle_independent={} bundle_pending={} bundle_cache={} \
+             bundle_passive_windows={}",
+            active.bundle.detached_viewer_window_id,
+            active.bundle.fullscreen_idx,
+            active.bundle.detached_viewer_pin_active,
+            active.bundle.detached_viewer_independent_active,
+            active.bundle.fs_pending.len(),
+            active.bundle.fs_cache.len(),
+            self.detached_image_windows.len()
+        ));
         self.swap_viewer_context_bundle(&mut active.bundle);
         if let Some(fs_idx) = self.fullscreen_idx {
             self.reset_detached_pause_foreground_modes(fs_idx);
         }
+        self.log_detached_image_window_debug(format!(
+            "pause_active_context_mounted window_id={:?} fs_idx={:?} pinned={} \
+             independent={} session_detached={} supported={} current_pending={} \
+             pending={} cache={} passive_windows={}",
+            self.detached_viewer_window_id,
+            self.fullscreen_idx,
+            self.detached_viewer_pin_active,
+            self.detached_viewer_independent_active,
+            self.viewer_session_is_detached(),
+            self.fullscreen_idx
+                .is_some_and(|idx| self.viewer_item_supports_detached_still(idx)),
+            self.fullscreen_idx
+                .is_some_and(|idx| self.fs_pending.contains_key(&idx)),
+            self.fs_pending.len(),
+            self.fs_cache.len(),
+            self.detached_image_windows.len()
+        ));
         let pinned =
             self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
+        let keep_paused_bundle =
+            self.detached_viewer_pin_active || self.detached_viewer_independent_active;
         let Some(mut snapshot) =
             self.build_active_detached_image_window_snapshot(Some(ctx), pinned)
         else {
+            self.log_detached_image_window_debug(format!(
+                "pause_active_context_snapshot_failed keep_active=true window_id={:?} \
+                 fs_idx={:?} pinned={} pending={} cache={}",
+                self.detached_viewer_window_id,
+                self.fullscreen_idx,
+                pinned,
+                self.fs_pending.len(),
+                self.fs_cache.len()
+            ));
             self.swap_viewer_context_bundle(&mut active.bundle);
             self.active_detached_viewer_context = Some(active);
             return false;
         };
-        self.detached_viewer_pin_active = false;
-        self.detached_viewer_open_next_still_detached_once = false;
+        let snapshot_id = snapshot.id;
+        let snapshot_title = snapshot.title.clone();
+        let snapshot_descriptor =
+            Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor);
+        let snapshot_has_stamp = snapshot.reopen_sync_stamp.is_some();
+        let snapshot_frozen_pages = snapshot.frozen_continuous_pages.len();
+        let snapshot_image_dims = snapshot.image_dims;
         let mut paused_bundle = self.take_current_viewer_context_bundle();
+        let paused_pending_before = paused_bundle.fs_pending.len();
+        let paused_cache_before = paused_bundle.fs_cache.len();
+        let paused_fs_idx = paused_bundle.fullscreen_idx;
         paused_bundle.pause_background_work_keep_current_frame();
+        let paused_pending_after = paused_bundle.fs_pending.len();
+        let paused_cache_after = paused_bundle.fs_cache.len();
         self.swap_viewer_context_bundle(&mut active.bundle);
-        snapshot.paused_bundle = Some(Box::new(paused_bundle));
+        if keep_paused_bundle {
+            snapshot.paused_bundle = Some(Box::new(paused_bundle));
+        }
         self.detached_image_windows.push(snapshot);
+        self.handoff_active_detached_viewport_to_passive("pause_active_context");
+        self.log_detached_image_window_debug(format!(
+            "pause_active_context_snapshot_pushed id={snapshot_id} pinned={pinned} \
+             title={snapshot_title:?} descriptor={snapshot_descriptor} stamp={} \
+             frozen_pages={snapshot_frozen_pages} image_dims={snapshot_image_dims:?} \
+             keep_bundle={keep_paused_bundle} \
+             paused_fs_idx={paused_fs_idx:?} paused_pending={paused_pending_before}->{paused_pending_after} \
+             paused_cache={paused_cache_before}->{paused_cache_after} passive_windows={}",
+            snapshot_has_stamp,
+            self.detached_image_windows.len()
+        ));
         true
+    }
+
+    #[cfg(windows)]
+    fn handoff_active_detached_viewport_to_passive(&mut self, reason: &'static str) {
+        let session_before = self.active_detached_session;
+        let shown_before = self.fs_viewport_shown;
+        let presentation_before = self.fs_viewport_presentation;
+        let host_before = self.detached_viewer_host_debug_state();
+
+        // Active -> Passive の切替では OS viewport 自体は閉じない。active session と
+        // runtime bookkeeping だけを手放し、次フレームから同じ ViewportId を passive
+        // renderer が描く。ここを通常 close と同じ cleanup に流すと Visible(false) が送られ、
+        // ユーザーには「ピン留め窓が消えた」ように見える。
+        self.begin_active_detached_session_close(reason);
+        self.finish_active_detached_session_close(reason);
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.fs_viewport_recreate_after_hide = false;
+        self.detached_viewer_recreate_on_next_render = false;
+        self.clear_detached_viewer_host_hwnd();
+        self.active_detached_viewer_live_placement = None;
+        self.detached_active_viewport_rendered_frame = u64::MAX;
+        self.log_detached_image_window_debug(format!(
+            "active_viewport_handoff_to_passive reason={reason} session_before={session_before:?} \
+             shown_before={shown_before} presentation_before={presentation_before:?} \
+             host_before={host_before} passive_windows={}",
+            self.detached_image_windows.len()
+        ));
     }
 
     #[cfg(windows)]
@@ -22337,6 +22583,17 @@ impl App {
     pub(crate) fn log_detached_image_window_debug(&self, message: impl AsRef<str>) {
         if Self::detached_image_window_debug_enabled() {
             crate::logger::log(format!("[detached-window-debug] {}", message.as_ref()));
+        }
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_descriptor_debug_kind(
+        descriptor: &Option<ViewerContextDescriptor>,
+    ) -> &'static str {
+        match descriptor {
+            Some(ViewerContextDescriptor::Pdf { .. }) => "pdf",
+            Some(ViewerContextDescriptor::Zip { .. }) => "zip",
+            None => "none",
         }
     }
 
@@ -22546,14 +22803,7 @@ impl App {
         // ここは should_drop (fullscreen_idx None + 列挙なし + !shown) 経路でのみ呼ばれ、
         // folder-nav reopen 中 (shown=true / 列挙中) は呼ばれないので session を畳んでよい。
         self.finish_active_detached_session_close("active_close_finalize");
-        if self.detached_image_windows.is_empty() {
-            self.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP);
-        } else {
-            self.log_detached_image_window_debug(format!(
-                "main_font_resync_deferred reason=active_close_finalize passive_windows={}",
-                self.detached_image_windows.len()
-            ));
-        }
+        self.request_detached_cleanup_font_atlas_resync("active_close_finalize");
         self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
             "active_close_finalize end viewport={viewport_id:?} shown={} presentation={:?} \
@@ -22568,10 +22818,48 @@ impl App {
     #[cfg(windows)]
     fn park_and_close_current_active_detached_viewer(&mut self, ctx: &egui::Context) -> bool {
         if self.pause_current_active_detached_viewer_context(ctx) {
+            self.log_detached_image_window_debug(format!(
+                "park_current_active_detached result=paused passive_windows={} \
+                 active_context={} session={:?}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session
+            ));
             return true;
         } else if self.active_detached_viewer_context.is_some() {
-            return self.close_current_active_detached_viewer_context(ctx);
+            let keep_pinned_active = self
+                .active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| active.bundle.detached_viewer_pin_active);
+            if !keep_pinned_active {
+                self.log_detached_image_window_debug(
+                    "park_current_active_detached result=close_unpinned_active_context".to_string(),
+                );
+                return self.close_current_active_detached_viewer_context(ctx);
+            }
+            self.log_detached_image_window_debug(
+                "park_active_context_failed_keep_existing_active".to_string(),
+            );
+            return false;
         } else if self.viewer_session_is_detached() {
+            if self.park_legacy_active_detached_image_window_for_active_switch() {
+                self.log_detached_image_window_debug(format!(
+                    "park_current_active_detached result=parked_legacy_linked passive_windows={} \
+                     active_context={} session={:?}",
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_session
+                ));
+                return true;
+            }
+            self.log_detached_image_window_debug(format!(
+                "park_current_active_detached result=close_legacy_detached fs_idx={:?} \
+                 pin_active={} independent={} passive_windows={}",
+                self.fullscreen_idx,
+                self.detached_viewer_pin_active,
+                self.detached_viewer_independent_active,
+                self.detached_image_windows.len()
+            ));
             self.preserve_active_detached_image_window_for_main_context_change();
             if self.fs_viewport_shown {
                 let fs_id = self.fullscreen_viewport_id();
@@ -22700,10 +22988,55 @@ impl App {
             return false;
         };
         let mut snapshot = self.detached_image_windows.remove(pos);
+        self.log_detached_image_window_debug(format!(
+            "passive_activate_begin id={id} pos={pos} pinned={} has_paused_bundle={} \
+             descriptor={} stamp={} passive_remaining={} active_context={} session={:?}",
+            snapshot.pinned,
+            snapshot.paused_bundle.is_some(),
+            Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
+            snapshot.reopen_sync_stamp.is_some(),
+            self.detached_image_windows.len(),
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session
+        ));
+        self.clear_fullscreen_feedback_for_viewer_switch();
+
+        if snapshot.paused_bundle.as_ref().is_some_and(|bundle| {
+            !bundle.detached_viewer_pin_active && !bundle.detached_viewer_independent_active
+        }) {
+            if let Some(bundle) = snapshot.paused_bundle.take() {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_drop_linked_paused_bundle id={} bundle_window_id={:?} \
+                     bundle_fs_idx={:?} descriptor={} stamp={} reason=restore_main_link",
+                    snapshot.id,
+                    bundle.detached_viewer_window_id,
+                    bundle.fullscreen_idx,
+                    Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
+                    snapshot.reopen_sync_stamp.is_some()
+                ));
+            }
+        }
 
         if let Some(mut paused_bundle) = snapshot.paused_bundle.take() {
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_resume_paused_bundle id={} bundle_window_id={:?} \
+                 bundle_fs_idx={:?} bundle_pinned={} bundle_independent={} \
+                 bundle_pending={} bundle_cache={} snapshot_title={:?}",
+                snapshot.id,
+                paused_bundle.detached_viewer_window_id,
+                paused_bundle.fullscreen_idx,
+                paused_bundle.detached_viewer_pin_active,
+                paused_bundle.detached_viewer_independent_active,
+                paused_bundle.fs_pending.len(),
+                paused_bundle.fs_cache.len(),
+                snapshot.title
+            ));
             let activate_placement = snapshot.placement;
             if !self.park_and_close_current_active_detached_viewer(ctx) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_resume_paused_bundle_aborted id={} reason=park_current_failed",
+                    snapshot.id
+                ));
                 snapshot.paused_bundle = Some(paused_bundle);
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
@@ -22722,17 +23055,40 @@ impl App {
             let _ = self.with_active_detached_viewer_context(|app| {
                 app.rearm_final_ai_prefetch_after_detached_resume();
             });
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_resume_paused_bundle_committed id={} active_context=true \
+                 session={:?}",
+                snapshot.id, self.active_detached_session
+            ));
             ctx.request_repaint();
             return true;
         }
 
-        if snapshot.reopen_descriptor.is_none()
+        let prefer_sync_stamp_for_linked = snapshot.reopen_sync_stamp.is_some()
+            && !snapshot.pinned
+            && !self.settings.detached_viewer_open_images_in_window;
+        if (snapshot.reopen_descriptor.is_none() || prefer_sync_stamp_for_linked)
             && let Some(stamp) = snapshot.reopen_sync_stamp.clone()
         {
             let Some(idx) = self.resolve_viewer_sync_stamp_idx(&stamp) else {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_still_aborted id={} reason=stamp_not_resolved",
+                    snapshot.id
+                ));
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             };
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_still_snapshot id={} idx={idx} pinned={} independent={} \
+                 descriptor={} prefer_sync={} zoom_pan={} free_rotation={:.3}",
+                snapshot.id,
+                snapshot.pinned,
+                self.settings.detached_viewer_open_images_in_window || snapshot.pinned,
+                Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
+                prefer_sync_stamp_for_linked,
+                snapshot.zoom_pan.is_some(),
+                snapshot.free_rotation
+            ));
             let activate_placement = snapshot.placement;
             let activate_window_id = snapshot.id;
             let activate_independent =
@@ -22740,6 +23096,10 @@ impl App {
             let activate_zoom_pan = snapshot.zoom_pan;
             let activate_free_rotation = snapshot.free_rotation;
             if !self.park_and_close_current_active_detached_viewer(ctx) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_still_aborted id={} reason=park_current_failed",
+                    activate_window_id
+                ));
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
@@ -22756,14 +23116,35 @@ impl App {
                 self.fs_pan = pan;
             }
             self.fs_free_rotation = activate_free_rotation;
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
+                 pin_active={} independent={} session={:?}",
+                activate_window_id,
+                self.active_detached_viewer_context.is_some(),
+                self.fullscreen_idx,
+                self.detached_viewer_pin_active,
+                self.detached_viewer_independent_active,
+                self.active_detached_session
+            ));
             ctx.request_repaint();
             return true;
         }
 
         let Some(descriptor) = snapshot.reopen_descriptor.clone() else {
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_aborted id={} reason=no_reopen_route",
+                snapshot.id
+            ));
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
+        self.log_detached_image_window_debug(format!(
+            "passive_activate_reopen_descriptor id={} descriptor={} pinned={} title={:?}",
+            snapshot.id,
+            Self::detached_viewer_descriptor_debug_kind(&Some(descriptor.clone())),
+            snapshot.pinned,
+            snapshot.title
+        ));
 
         ctx.send_viewport_cmd_to(
             Self::detached_image_window_viewport_id(snapshot.id),
@@ -22771,6 +23152,10 @@ impl App {
         );
         let activate_placement = snapshot.placement;
         if !self.park_and_close_current_active_detached_viewer(ctx) {
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_reopen_descriptor_aborted id={} reason=park_current_failed",
+                snapshot.id
+            ));
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         }
@@ -22789,6 +23174,30 @@ impl App {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
+                if Self::detached_image_window_debug_enabled() && app.frame_counter % 60 == 0 {
+                    app.log_detached_image_window_debug(format!(
+                        "active_context_state frame={} window_id={:?} fs_idx={:?} \
+                         pinned={} independent={} session={:?} fs_shown={} presentation={:?} \
+                         current_pending={} pending={} cache={} pdf_enum={} zip_enum={} \
+                         nav_wait={} passive_windows={}",
+                        app.frame_counter,
+                        app.detached_viewer_window_id,
+                        app.fullscreen_idx,
+                        app.detached_viewer_pin_active,
+                        app.detached_viewer_independent_active,
+                        app.active_detached_session,
+                        app.fs_viewport_shown,
+                        app.fs_viewport_presentation,
+                        app.fullscreen_idx
+                            .is_some_and(|idx| app.fs_pending.contains_key(&idx)),
+                        app.fs_pending.len(),
+                        app.fs_cache.len(),
+                        app.pdf_enumerate_pending.is_some(),
+                        app.zip_enumerate_pending.is_some(),
+                        app.fs_nav_deferred_reopen_wait_active(),
+                        app.detached_image_windows.len()
+                    ));
+                }
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
@@ -23023,12 +23432,47 @@ impl App {
         pinned: bool,
     ) -> Option<DetachedImageWindowSnapshot> {
         let Some(idx) = self.fullscreen_idx else {
+            self.log_detached_image_window_debug(format!(
+                "build_active_snapshot_failed reason=no_fullscreen_idx pinned={pinned} \
+                 window_id={:?} pending={} cache={}",
+                self.detached_viewer_window_id,
+                self.fs_pending.len(),
+                self.fs_cache.len()
+            ));
             return None;
         };
         if !self.viewer_session_is_detached() || !self.viewer_item_supports_detached_still(idx) {
+            self.log_detached_image_window_debug(format!(
+                "build_active_snapshot_failed reason=unsupported_or_not_detached idx={idx} \
+                 pinned={pinned} session_detached={} supported={} window_id={:?} \
+                 presentation={:?} pending={} cache={}",
+                self.viewer_session_is_detached(),
+                self.viewer_item_supports_detached_still(idx),
+                self.detached_viewer_window_id,
+                self.viewer_presentation,
+                self.fs_pending.len(),
+                self.fs_cache.len()
+            ));
             return None;
         }
         let Some(texture) = self.resolve_fs_display_tex(idx, true) else {
+            self.log_detached_image_window_debug(format!(
+                "build_active_snapshot_failed reason=no_display_texture idx={idx} \
+                 pinned={pinned} window_id={:?} current_pending={} pending={} \
+                 cache={} thumb_loaded={} descriptor={} stamp={}",
+                self.detached_viewer_window_id,
+                self.fs_pending.contains_key(&idx),
+                self.fs_pending.len(),
+                self.fs_cache.len(),
+                matches!(
+                    self.thumbnails.get(idx),
+                    Some(crate::grid_item::ThumbnailState::Loaded { .. })
+                ),
+                Self::detached_viewer_descriptor_debug_kind(
+                    &self.detached_viewer_context_descriptor_for_idx(idx)
+                ),
+                self.viewer_sync_stamp_for_idx(idx).is_some()
+            ));
             return None;
         };
         let texture_size = texture.size_vec2();
@@ -23039,6 +23483,19 @@ impl App {
         let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         let id = self.ensure_detached_viewer_window_id();
+        self.log_detached_image_window_debug(format!(
+            "build_active_snapshot_ok id={id} idx={idx} pinned={pinned} \
+             tex=({:.0}x{:.0}) descriptor={} stamp={} frozen_pages={} \
+             current_pending={} pending={} cache={} placement={placement:?}",
+            texture_size.x,
+            texture_size.y,
+            Self::detached_viewer_descriptor_debug_kind(&reopen_descriptor),
+            reopen_sync_stamp.is_some(),
+            frozen_continuous_pages.len(),
+            self.fs_pending.contains_key(&idx),
+            self.fs_pending.len(),
+            self.fs_cache.len()
+        ));
         Some(DetachedImageWindowSnapshot {
             id,
             texture,
@@ -23074,6 +23531,47 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn park_legacy_active_detached_image_window_for_active_switch(&mut self) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if !self.viewer_session_is_detached()
+            || self.fs_nav_is_locked()
+            || !self.viewer_item_supports_detached_still(idx)
+        {
+            return false;
+        }
+
+        let pinned =
+            self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
+        if !self.park_active_detached_image_window(pinned) {
+            return false;
+        }
+        let parked_id = self.detached_image_windows.last().map(|window| window.id);
+        let passive_count = self.detached_image_windows.len();
+
+        // Active 切替では OS window 自体を閉じない。現在の active session だけを終了し、
+        // 同じ window_id の passive renderer に次フレーム以降の描画を引き継がせる。
+        self.begin_active_detached_session_close("park_legacy_active_to_passive");
+        self.finish_active_detached_session_close("park_legacy_active_to_passive");
+        self.close_fullscreen();
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.fs_viewport_recreate_after_hide = false;
+        self.detached_viewer_recreate_on_next_render = false;
+        self.clear_detached_viewer_host_hwnd();
+        self.active_detached_viewer_live_placement = None;
+        self.detached_viewer_pin_active = false;
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        self.log_detached_image_window_debug(format!(
+            "park_legacy_active_to_passive id={parked_id:?} pinned={pinned} \
+             passive_windows={passive_count}"
+        ));
+        true
+    }
+
+    #[cfg(windows)]
     fn should_preserve_active_detached_image_window_for_main_context_change(&self) -> bool {
         let Some(idx) = self.fullscreen_idx else {
             return false;
@@ -23099,12 +23597,198 @@ impl App {
         let pinned =
             self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
         let parked = self.park_active_detached_image_window(pinned);
-        self.detached_viewer_pin_active = false;
         if parked {
+            self.handoff_active_detached_viewport_to_passive("main_context_change");
             self.detached_viewer_independent_active = false;
         }
+        self.detached_viewer_pin_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
         parked
+    }
+
+    #[cfg(windows)]
+    fn should_promote_active_detached_video_for_main_context_change(&self) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        self.active_detached_viewer_context.is_none()
+            && self.viewer_session_is_detached()
+            && !self.fs_nav_is_locked()
+            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+    }
+
+    #[cfg(windows)]
+    fn promote_active_detached_video_for_main_context_change(&mut self) -> bool {
+        if !self.should_promote_active_detached_video_for_main_context_change() {
+            return false;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        let window_id = self.ensure_detached_viewer_window_id();
+        let mut bundle = self.take_current_viewer_context_bundle();
+        bundle.selected = Some(idx);
+        bundle.fullscreen_idx = Some(idx);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_pin_active = false;
+        bundle.detached_viewer_open_next_still_detached_once = false;
+        bundle.detached_viewer_window_id = Some(window_id);
+        bundle.last_viewer_sync_stamp = None;
+        bundle.fs_open_intent_from_grid = false;
+        bundle.pending_auto_fs_open = false;
+        bundle.pending_return_to_parent = false;
+        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        self.fullscreen_idx = None;
+        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_pin_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        self.detached_viewer_focus_requested = false;
+        self.last_viewer_sync_stamp = None;
+        self.detached_viewer_window_id = None;
+        self.log_detached_image_window_debug(format!(
+            "promote_detached_video_for_main_context_change window_id={window_id} idx={idx}"
+        ));
+        true
+    }
+
+    /// ピン留め: 現在の active・連動 detached 静止画を、自分専用 bundle を持つ
+    /// active・連動なし (independent) へ昇格させる
+    /// (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
+    ///
+    /// items 等の clone 可能フィールドを複製して専用 bundle を組み立て、現在表示中
+    ///ページのフルスクリーン runtime (fs_cache / pending / upload backlog) だけを bundle
+    /// 側へ移す。メイン側は items / 選択 / スクロールを維持し、fullscreen 状態だけ解除
+    ///して grid へ戻す (= メインは触らない)。これ以降、メインの BS / Ctrl+↑↓ は
+    /// 連動なし窓に届かない (§3.0 ⑥)。一方通行 (解除なし、§3.0 ⑤)。昇格できたら true。
+    #[cfg(windows)]
+    fn promote_active_still_to_independent(&mut self) -> bool {
+        // 既に独自 context (book / 昇格済み) を持つ場合や detached 静止画でない場合は対象外。
+        if self.active_detached_viewer_context.is_some() || !self.viewer_session_is_detached() {
+            return false;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if !self.viewer_item_supports_detached_still(idx) {
+            return false;
+        }
+        let window_id = self.ensure_detached_viewer_window_id();
+        self.reset_detached_pause_foreground_modes(idx);
+
+        // 専用 bundle を empty() から組み立て、表示・前後移動に必要な clone 可能フィールド
+        // だけ self から複製する (self 側は維持されるのでメイン grid は不変)。
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = self.items.clone();
+        bundle.thumbnails = self.thumbnails.clone();
+        bundle.image_metas = self.image_metas.clone();
+        // フルスクリーンの前後移動 / 見開き / 連結読み / スライドショーは current_grid_order()
+        // 経由で visible_indices (Details では details_order) を参照する。これらを複製しないと
+        // 連動なし窓で →/← が空リスト扱いになり移動できない (Codex P1)。
+        bundle.visible_indices = self.visible_indices.clone();
+        bundle.details_order = self.details_order.clone();
+        bundle.current_folder = self.current_folder.clone();
+        bundle.address = self.address.clone();
+        bundle.archive_source_override = self.archive_source_override.clone();
+        bundle.zip_nav = self.zip_nav.clone();
+        bundle.items_generation = self.items_generation;
+        bundle.items_are_global_search_view = self.items_are_global_search_view;
+        bundle.items_are_tag_view = self.items_are_tag_view;
+        bundle.items_are_reading_history_view = self.items_are_reading_history_view;
+        bundle.items_are_rating_view = self.items_are_rating_view;
+        bundle.items_are_subfolder_expansion_view = self.items_are_subfolder_expansion_view;
+        bundle.items_are_drive_list = self.items_are_drive_list;
+        bundle.rotation_cache = self.rotation_cache.clone();
+        bundle.rating_cache = self.rating_cache.clone();
+        bundle.current_folder_rating_cache = self.current_folder_rating_cache;
+        bundle.selected = Some(idx);
+        bundle.fullscreen_idx = Some(idx);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        // 連動なし窓は「ピン済み」扱い。これがないと、後で別画像を open して
+        // pause_current_active_detached_viewer_context が走るとき pinned=false の passive に
+        // なり、prepare_detached_image_windows_for_open が同じ window を reuse → ピン窓が
+        // 上書き/消滅する (Codex P1、§3.0 ④)。pinned passive は reuse 対象外で残る。
+        bundle.detached_viewer_pin_active = true;
+        bundle.detached_viewer_window_id = Some(window_id);
+        bundle.last_viewer_sync_stamp = None;
+        // 表示状態の継続性 (ピンした瞬間の見た目を保つ)。
+        bundle.fs_zoom = self.fs_zoom;
+        bundle.fs_pan = self.fs_pan;
+        bundle.fs_zoom_active = self.fs_zoom_active;
+        bundle.fs_zoom_factor = self.fs_zoom_factor;
+        bundle.fs_free_rotation = self.fs_free_rotation;
+        bundle.spread_mode = self.spread_mode;
+        bundle.reading_flow = self.reading_flow;
+        bundle.reading_direction = self.reading_direction;
+        self.move_active_still_runtime_to_bundle(idx, &mut bundle);
+
+        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        // メインは grid へ戻す。items / selected / scroll は維持し fullscreen 状態だけ解除。
+        self.fullscreen_idx = None;
+        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_pin_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        self.last_viewer_sync_stamp = None;
+        // メインはこの detached 窓の所有権を手放す。これがないと次の grid open で
+        // ensure_detached_viewer_window_id / reuse 判定が同じ window_id を再利用し、
+        // 新規画像がピン窓 (= 独自 context の window) を上書きする (Codex P1、§3.0 ④)。
+        // window_id は active_detached_viewer_context の bundle が保持している。
+        self.detached_viewer_window_id = None;
+        // active_detached_session は同じ window_id のまま維持 (ViewportId 連続性、窓再生成回避)。
+        // この session は独自 context (= ピン窓) のもの。④ で別画像を open すると
+        // begin_active_detached_session が新 window_id で上書きし、ピン窓は passive へ退避する。
+        self.log_detached_image_window_debug(format!(
+            "pin_promote_to_independent window_id={window_id} idx={idx}"
+        ));
+        true
+    }
+
+    #[cfg(windows)]
+    fn move_active_still_runtime_to_bundle(
+        &mut self,
+        idx: usize,
+        bundle: &mut ViewerContextBundle,
+    ) {
+        if let Some(entry) = self.fs_cache.remove(&idx) {
+            bundle.fs_cache.insert(idx, entry);
+        }
+        if let Some(margin) = self.fs_margin_bbox_cache.remove(&idx) {
+            bundle.fs_margin_bbox_cache.insert(idx, margin);
+        }
+        if let Some(input_gen) = self.input_generation.remove(&idx) {
+            bundle.input_generation.insert(idx, input_gen);
+        }
+        if let Some(pending) = self.fs_pending.remove(&idx) {
+            bundle.fs_pending.insert(idx, pending);
+        }
+        if let Some(dims) = self.fs_early_dims.remove(&idx) {
+            bundle.fs_early_dims.insert(idx, dims);
+        }
+
+        let mut retained_backlog = Vec::with_capacity(self.fs_upload_backlog.len());
+        for item in self.fs_upload_backlog.drain(..) {
+            if item.0 == idx {
+                bundle.fs_upload_backlog.push(item);
+            } else {
+                retained_backlog.push(item);
+            }
+        }
+        self.fs_upload_backlog = retained_backlog;
+    }
+
+    /// ピンボタン押下の遅延フラグを安全地点で消化する (描画 dispatch 直前で呼ぶ)。
+    /// ボタンは fullscreen 描画の最中に押されるため、その場で昇格すると同フレームの
+    /// 描画と競合する。フラグ経由で安全地点まで遅延させる。
+    #[cfg(windows)]
+    pub(crate) fn process_pending_pin_promotion(&mut self) {
+        if std::mem::take(&mut self.pending_pin_promotion) {
+            self.promote_active_still_to_independent();
+        }
     }
 
     #[cfg(windows)]
@@ -23192,6 +23876,75 @@ impl App {
             && self
                 .fullscreen_idx
                 .is_some_and(|idx| self.viewer_item_supports_detached_still(idx))
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_independent_session(&self) -> bool {
+        self.viewer_session_is_detached() && self.detached_viewer_independent_active
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_independent_session_blocks_folder_nav(&self) -> bool {
+        if self.active_detached_viewer_context.is_some() {
+            return true;
+        }
+        if self.detached_viewer_independent_session() {
+            return true;
+        }
+        self.settings.detached_viewer_open_images_in_window && self.viewer_session_is_detached()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_image_edit_tools_disabled_reason(&self) -> Option<&'static str> {
+        if self.settings.detached_viewer_open_images_in_window
+            && self.viewer_session_is_detached_or_switching()
+        {
+            return Some("毎回新しい別ウィンドウで開く設定では、画像編集機能は利用できません");
+        }
+        if self.detached_viewer_independent_still_session() {
+            return Some("ピン留めした別ウィンドウでは、画像編集機能は利用できません");
+        }
+        if self.active_detached_viewer_context.is_some() {
+            return Some("切り離した別ウィンドウでは、画像編集機能は利用できません");
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn detached_viewer_image_edit_tools_disabled_reason(&self) -> Option<&'static str> {
+        None
+    }
+
+    pub(crate) fn detached_viewer_edit_mode_active(&self) -> bool {
+        self.is_overlay_edit_mode_active() || self.view_trim_mode
+    }
+
+    pub(crate) fn detached_viewer_pin_disabled_reason(&self) -> Option<&'static str> {
+        if self.detached_viewer_edit_mode_active() {
+            Some("編集中はピン留めできません。確定またはキャンセルしてから切り離してください")
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn detached_toggle_disabled_by_always_new_images(&self) -> bool {
+        if !self.settings.detached_viewer_open_images_in_window {
+            return false;
+        }
+        !matches!(
+            self.fullscreen_idx.and_then(|idx| self.items.get(idx)),
+            Some(GridItem::Video(_))
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn should_block_detached_independent_still_navigation_to_video(
+        &self,
+        idx: usize,
+    ) -> bool {
+        self.detached_viewer_independent_still_session()
+            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
     }
 
     #[cfg(windows)]
@@ -23958,6 +24711,9 @@ impl App {
         if self.detached_viewer_independent_still_session() {
             return;
         }
+        if self.settings.detached_viewer_open_images_in_window {
+            return;
+        }
         let Some(selected) = self.selected else {
             return;
         };
@@ -24028,6 +24784,30 @@ impl App {
         true
     }
 
+    /// §3.0 ④: 連動なし窓 (独自 `active_detached_viewer_context`) があるまま grid から別の
+    /// 画像/動画を明示 open するとき、現 active context を passive へ退避してから新しい
+    /// active・連動窓を開く。退避しないと `update_active_detached_viewer_context` が旧 context を
+    /// 描き続け、新規 open が描画されない。active context が無い通常の active・連動セッションは
+    /// 対象外 (= park せず従来どおり reuse / 追従)。
+    #[cfg(windows)]
+    pub(crate) fn park_active_detached_context_for_new_grid_open(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.active_detached_viewer_context.is_some() {
+            let ok = self.park_and_close_current_active_detached_viewer(ctx);
+            self.log_detached_image_window_debug(format!(
+                "park_active_context_for_grid_open result={ok} passive_windows={} \
+                 active_context={} session={:?}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session
+            ));
+            return ok;
+        }
+        true
+    }
+
     fn restore_fullscreen_focus_from_main(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.fullscreen_idx else {
             return;
@@ -24080,9 +24860,8 @@ impl App {
         let presentation = self.effective_viewer_presentation_for_open(idx);
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
-        let independent_detached_still = detached_still
-            && (self.detached_viewer_independent_active
-                || self.detached_still_open_is_independent(idx));
+        let independent_detached_still =
+            detached_still && self.detached_still_open_is_independent(idx);
         let focus_detached_from_grid = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.fs_open_intent_from_grid;
         self.viewer_presentation = presentation;
@@ -24092,6 +24871,8 @@ impl App {
             // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
             let source = if self.active_detached_viewer_context_present() {
                 DetachedSource::Book
+            } else if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+                DetachedSource::Video
             } else {
                 DetachedSource::Image
             };
@@ -35951,6 +36732,12 @@ impl App {
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
         #[cfg(windows)]
         {
+            if self.detached_toggle_disabled_by_always_new_images() {
+                self.show_feedback_toast(
+                    "毎回新しいウィンドウで開く設定ではF12切替は無効です".to_string(),
+                );
+                return;
+            }
             let now = std::time::Instant::now();
             let video_switch_in_flight = self
                 .native_video_mode_switch
@@ -36023,6 +36810,12 @@ impl App {
         self.show_native_video_overlay_toast(text.clone(), false);
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
         self.fs_feedback_toast_reveal_path = None;
+    }
+
+    pub(crate) fn clear_fullscreen_feedback_for_viewer_switch(&mut self) {
+        self.fs_feedback_toast = None;
+        self.fs_feedback_toast_reveal_path = None;
+        self.fs_boundary_hint = None;
     }
 
     /// native ファイル D&D 完了後のトーストをまとめて出す。
@@ -39472,6 +40265,25 @@ impl App {
 // -----------------------------------------------------------------------
 
 impl eframe::App for App {
+    /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
+    ///
+    /// eframe 既定は near-black `(12,12,12, a=180)` 固定 ([eframe epi.rs] `clear_color`)。
+    /// 通常フレームはパネルが全面を覆うので不可視だが、**描画を 1 フレーム飛ばす局面**
+    /// (font atlas resync の `request_discard` 予算切れ defer / detached 窓 close 直後の
+    /// no-surface フレーム) ではこのクリア色がそのまま見える。near-black 固定だと
+    /// ダークテーマでは地 (panel_fill) と馴染むが、**ライトテーマでは「一瞬黒」が目立つ**
+    /// (例: PDF を auto-fullscreen で開いて Esc → 親フォルダ再読込で 1 フレーム blank)。
+    ///
+    /// テーマのパネル背景 (= メニューバー背景) に合わせると、ライト/ダークどちらでも
+    /// 地と馴染んでちらつきが目立たなくなる。font atlas resync の defer 自体には触らないので、
+    /// `d48982e5`「Use conservative font atlas resync」で確定した「stale font atlas で描かない
+    /// = フォント崩れ回避」のトレードオフは維持される (緩和策であって根本修正ではない)。
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // eframe 既定の alpha=180 は transparent() 有効時用なので踏襲せず、不透明の
+        // パネル背景色を返す (純ロジックは free fn 化して unit test で回帰ガード)。
+        main_window_clear_color(visuals)
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
         // prefetch suppression gate: 同フレーム内の scroll 入力を即時に拾う。
@@ -39520,6 +40332,8 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        #[cfg(windows)]
+        self.flush_pending_detached_cleanup_font_atlas_resync();
         #[cfg(windows)]
         if self.maybe_defer_for_main_font_atlas_resync(ctx, "update_early") {
             return;
@@ -40274,6 +41088,12 @@ impl eframe::App for App {
         // 細分計装: フルスクリーンビューポート関連の 3 段階を個別計測する
         // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
+        // ピンボタン押下 (前フレーム) の遅延昇格を、描画 dispatch 直前のこの安全地点で消化する。
+        // ここで active・連動 detached 静止画を独自バンドルへ昇格させると、続く
+        // update_active_detached_viewer_context が同フレームでその context を描く
+        // (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
+        #[cfg(windows)]
+        self.process_pending_pin_promotion();
         #[cfg(windows)]
         let active_detached_context_updated = self.update_active_detached_viewer_context(ctx);
         #[cfg(not(windows))]
@@ -40308,6 +41128,8 @@ impl eframe::App for App {
         // 必ずアクティブ detached 描画経路すべての後 (= フルスクリーン区間末尾) で呼ぶ。
         #[cfg(windows)]
         self.render_active_detached_viewport_backstop(ctx);
+        #[cfg(windows)]
+        self.flush_pending_detached_cleanup_font_atlas_resync();
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
@@ -40590,7 +41412,7 @@ impl eframe::App for App {
         }
         self.show_toolbar_reset_confirm_dialog(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
-        if !main_viewer_blocked {
+        if self.main_window_should_draw_export_dialogs() {
             self.draw_export_dialog(ctx);
             self.draw_export_progress_dialog(ctx);
         }

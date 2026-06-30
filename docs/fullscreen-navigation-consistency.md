@@ -40,8 +40,9 @@ Ctrl+↑↓ でフォルダ横断しない。
 | --- | --- |
 | ホイール / ↑↓ / 画像の ←→ | `visible_indices` 内の前後アイテムへ移動。縦連結ではホイール / ↑↓ / PageUp/PageDown は縦スクロールし、←→ は従来どおり前後アイテムへ移動。横連結ではホイール / ←→ / PageUp/PageDown は横スクロールし、↑↓ は従来どおり前後アイテムへ移動 |
 | 同一一覧の先頭 / 末尾 | `FsBoundaryHint::Edge` を中央表示し、Home / End と Ctrl+↑↓ を案内。文言は「項目」表現 |
-| Ctrl+↑↓ | `FolderNavMode::Fullscreen` で DFS。現在は前後どちらの方向でも移動先フォルダの先頭 image-like に着地する |
-| Ctrl+PageUp/PageDown | `FolderNavMode::SiblingFullscreen` で同じ親の前後兄弟へ移動する。移動先に image-like があれば先頭 image-like に着地し、なければ一覧へ戻る |
+| Ctrl+↑↓ | `FolderNavMode::Fullscreen` で DFS。現在は前後どちらの方向でも移動先フォルダの先頭 image-like に着地する。切り離した detached / always-new 窓ではメイン bundle のフォルダ移動へは入らず no-op 案内 |
+| Ctrl+PageUp/PageDown | `FolderNavMode::SiblingFullscreen` で同じ親の前後兄弟へ移動する。移動先に image-like があれば先頭 image-like に着地し、なければ一覧へ戻る。切り離した detached / always-new 窓では no-op |
+| スライドショー「次のフォルダへ進む」 | 通常 linked viewer では `FolderNavMode::SlideshowNext` で次の静止画フォルダへ進む。切り離した detached / always-new 窓ではフォルダ横断せず、現一覧内ループ扱い |
 | 移動先に画像 / 動画が見つからない | `FsBoundaryHint::NoImageFolder` を表示 |
 | 兄弟が無い | `FsBoundaryHint::NoSiblingFolder` を表示 |
 | Ctrl+G DrilledInto 中の Ctrl+↑↓ | `global_search_ctrl_nav_fullscreen` で検索結果スコープ内を移動し、先頭 / 末尾で `SearchEnd` を表示。移動先は方向に関わらず先頭 image-like |
@@ -57,8 +58,9 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | ホイール / plain ↑↓ | 同一 `visible_indices` 内の前後アイテムへ移動 |
 | ←→ | seek。Ctrl+←→ は 30 秒 seek、Shift+←→ は 1 秒 seek。S タイルモード中は seek せずタイルカーソル移動、Ctrl+←→ は 1 行分移動、Enter でカーソル位置から再生 |
 | Shift+↑↓ | 音量を dB フェーダー目盛りの 1/4 幅で上下 |
-| Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動 |
-| Ctrl+PageUp/PageDown | `handle_fullscreen_sibling_nav_context` 経由で画像系と同じ兄弟限定移動 |
+| Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動。切り離した detached / always-new 窓では no-op |
+| Ctrl+PageUp/PageDown | `handle_fullscreen_sibling_nav_context` 経由で画像系と同じ兄弟限定移動。切り離した detached / always-new 窓では no-op |
+| メイン context 変更中の detached 動画 | フォルダ / お気に入り移動などで main context が入れ替わる場合は、detached 動画を active detached context 側へ切り離して再生を維持する。以後の前後移動は保持中の同一一覧内だけ |
 | マウス戻る / 進む | native window / HUD 側の XButton を App 側のマウスボタン割り当て経路へ接続。既定は履歴戻る / 進む、従来どおりを選んだ既存環境では Ctrl+↑↓ と同じ |
 | S | 動画タイルモード ON/OFF |
 | S タイルモード中のホイール | 前後アイテムへ移動。移動先も動画なら native presenter を保持して source 差し替え |
@@ -93,8 +95,8 @@ Ctrl+S / Ctrl+G はフルスクリーン側でも専用スコープを維持す�
 | plain ↑↓ | 前後アイテム | 前後アイテム | 既存どおり |
 | ←→ | 前後アイテム | seek | 動画プレイヤー慣例として差異を許容 |
 | Shift+↑↓ | 前後アイテム | 音量 | 動画プレイヤー慣例として差異を許容 |
-| Ctrl+↑↓ | 現在コンテキストの前後フォルダ / 前後検索結果 | 同左 | native 動画 / タイルモードでも有効にする |
-| Ctrl+PageUp/PageDown | 前後の兄弟フォルダ | 同左 | 空フォルダを skip しない。検索中は実フォルダの兄弟概念に戻さず no-op |
+| Ctrl+↑↓ | 現在コンテキストの前後フォルダ / 前後検索結果 | 同左 | native 動画 / タイルモードでも有効にする。ただし切り離した detached / always-new 窓では no-op |
+| Ctrl+PageUp/PageDown | 前後の兄弟フォルダ | 同左 | 空フォルダを skip しない。検索中は実フォルダの兄弟概念に戻さず no-op。切り離した detached / always-new 窓でも no-op |
 | マウス戻る / 進む | 環境設定「マウスボタン」の context 別割り当て | 同左 | 既定は履歴戻る / 進む。ツリー順を選んだ場合は Ctrl+↑↓ と同じ |
 
 Ctrl+↑↓ の「現在コンテキスト」は以下の優先順位で解釈する:
@@ -143,6 +145,7 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
 | Ctrl+G の検索結果末端 | 「最後/最初の検索結果です」 + 検索を閉じると通常移動に戻る案内 |
 | Ctrl+F active 中の Ctrl+↑↓ | 「Ctrl+F 検索中はフォルダ移動しません」などの no-op 案内 |
 | Ctrl+S / Ctrl+G の結果一覧で Ctrl+↑↓ | 「検索結果を開いてから Ctrl+↑↓ で移動できます」などの no-op 案内 |
+| 切り離した detached / always-new 窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内 |
 
 画像系の no-op 案内は中央の `FsBoundaryHint::NavNoOp` で表示する。native 動画の境界 /
 no-op 案内は段階を分ける:
@@ -202,6 +205,7 @@ no-op 案内は段階を分ける:
 - [x] Ctrl+G DrilledInto で、グリッド / フルスクリーン / 動画の Ctrl+↑↓ が検索結果スコープを維持する。
 - [x] Ctrl+G Aggregated / Ctrl+S 結果一覧では no-op でもよいが、必要なら案内を出す。
 - [x] Ctrl+PageUp/PageDown は通常フォルダで兄弟だけを移動し、空フォルダも skip せず、子や祖先の兄弟へ入らない。検索中は no-op。
+- [x] 切り離した detached / always-new 窓では Ctrl+↑↓ / Ctrl+PageUp/PageDown が main bundle を動かさず no-op になる。
 - [x] 検索バー / フルスクリーン / タイルなど scope が変わる操作では pending folder navigation を flush する。
 - [x] 境界文言は画像だけでなく動画も含む表現にする。
 - [x] native overlay はまず toast MVP とし、構造的な中央表示は別段階にする。

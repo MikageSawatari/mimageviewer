@@ -71,15 +71,111 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 
 ## 3. 状態モデル
 
+### 3.0 ウィンドウ状態モデルと遷移（2026-06-29 確定 / 正本）
+
+> この節が detached image window の状態モデルの**正本**。
+> [`detached-viewer-keepalive-design.md`](detached-viewer-keepalive-design.md) は「Active 窓を
+> 毎フレーム描いて OS ウィンドウを破棄させない」**生存条件**だけを扱い、ここで定義する
+> linked / independent / passive の区別には踏み込まない（補完関係）。本節と矛盾する旧記述
+> （特に §9 Phase 2 進捗メモの一部）は本節で上書きする。
+
+**ウィンドウは 2 種類、実効状態は linked / independent を掛け合わせた 4 状態:**
+
+- **Active**: 操作対象。フル機能（パノラマ・編集・補正・先読み・AI・スライドショー）が使える。
+  **同時に Active なのは常に 1 窓だけ。** `ViewerContextBundle`（items / caches / `fullscreen_idx` 等）の
+  **所有はサブモードで異なる**（下記）: 連動は**メイン bundle を共有**し、連動なしは**専用 bundle を保有**する。
+- **Passive**: 裏に回った窓。背景 worker（先読み / AI / 編集 / slideshow）を止め、表示中の
+  frozen snapshot（texture + 正規化矩形）を保持する。連動なし Passive は paused
+  `ViewerContextBundle` も保持する。クリックで再 Active 化できる。Passive も
+  「連動 / 連動なし」の属性を持ち、復帰時の同期可否を決める。
+
+**Active はさらに 2 サブモード:**
+
+- **Active・連動 (linked)**: メイン一覧と**同じ bundle を共有**し、選択・フォルダ移動
+  （BS / Ctrl+↑↓）に追従する。F12 で開いた通常の別ウィンドウ。
+- **Active・連動なし (independent / ピン)**: **自分専用の bundle を持ち**、メイン一覧の操作に
+  一切追従しない。Active なのでパノラマ / 分析 / 表示調整はそのまま使えるが、
+  消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取りなどの画像編集機能は起動できない。
+  独自 bundle を持つことが肝で、メインの BS / Ctrl+↑↓ はメイン側 bundle だけを動かし、
+  連動なし窓の bundle には届かない（= 退避もクローズもせず Active のまま不変）。
+  実装上は本コンテキスト（PDF/ZIP）と同じ `active_detached_viewer_context`（独自 bundle）へ
+  静止画も昇格させて実現する。
+  昇格時は表示中ページの fullscreen runtime (`fs_cache` / pending load / upload backlog)
+  も専用 bundle へ移し、アニメーション画像・再読込中の画像がピン直後に停止 / 消失しないようにする。
+- **Passive・連動 (linked passive)**: 直前まで Active・連動だった窓が、別の窓の Active 化で
+  裏に回った状態。表示は frozen snapshot のまま固定するが、`reopen_sync_stamp` を保持し、
+  クリック再開またはメインからの明示 open で **Active・連動** として戻る。
+  Passive 中にメイン選択を逐次追従して描き替えない（display-only）が、再利用対象としては
+  「未ピン / 連動」の窓として扱う。
+- **Passive・連動なし (independent passive)**: ピン済み / always-new 由来の窓が裏に回った状態。
+  frozen snapshot と paused bundle を保持し、クリックで **Active・連動なし** として復帰する。
+  メインの BS / Ctrl+↑↓ / 選択変更 / 明示 open では中身を差し替えない。
+
+**遷移表:**
+
+| # | 操作 | 結果 |
+|---|---|---|
+| ① | F12 で画像を別ウィンドウ表示（通常） | **Active・連動** |
+| ② | 設定 `detached_viewer_open_images_in_window` ON で画像を開く | 常に **Active・連動なし**（独自 bundle） |
+| ③ | 連動 Active 窓でピンボタン押下 | Active・連動 → **Active・連動なし**（独自 bundle へ昇格） |
+| ④ | 連動なし窓がある状態でメインから**別画像を明示 open**（Enter/ダブルクリック） | 連動なし窓 → **Passive・連動なし**（背景処理停止・frozen/paused bundle 保持）。新窓は通常モードでは **Active・連動**、`detached_viewer_open_images_in_window` ON では **Active・連動なし**（②と同じ） |
+| ⑤ | ピン解除 | **無し（ピンは一方通行）**。連動なし窓は × で閉じるだけ。ピンボタンは押下後は解除アフォーダンスを出さない |
+| ⑥ | メインで BS / Ctrl+↑↓（フォルダ移動） | メイン bundle（と Active・連動窓）だけ移動。**Active・連動なし窓 / Passive 窓は一切不変・非クローズ** |
+| ⑦ | Passive 窓をクリック / フォーカスして Active 化 | 現 Active は **その時点の属性の Passive** へ落ちる（Active・連動 → Passive・連動、Active・連動なし → Passive・連動なし）。クリックした窓は保持属性の Active として復帰する。**Active 切替だけで既存窓を閉じない。** |
+
+補足:
+- ④ で Passive 化した窓をクリックすると再び Active 化する（`activate_detached_image_window_snapshot`）。
+  ピンしていた窓は連動なしのまま復帰する。
+- 「常に 1 Active」の不変条件により、別窓を Active 化すると現 Active は Passive へ落ちる。
+  特に、ピン済み窓を再 Active 化するとき、直前の未ピン linked 窓は閉じずに **Passive・連動**
+  として残す。メインから次の画像を明示 open した場合は、その Passive・連動窓を再利用して
+  Active・連動へ戻してよい。
+- ⑤ を一方通行（解除不可）にしたのは実装簡素化のため。independent ⇄ linked の往復で再 Active 化
+  との整合を取る複雑さを避ける（ユーザー確定 2026-06-29）。
+- ⑥ が直前まで壊れていた（BS で連動なし窓が閉じる / Ctrl+↑↓ で中身が差し替わる）のは、ピンが
+  「session に independent フラグを立てるだけで bundle はメインと共有」のままで、独自 bundle へ
+  昇格していなかったため。③ の独自 bundle 昇格で根治する。
+- ⑥ を実装で守るため、active detached window が OS foreground のときはメイン側のグリッドキー
+  (Ctrl+↑↓ 等) を処理しない。キー入力は foreground の active detached context にだけ渡し、
+  ピン済み窓の操作でメイン bundle が同時に移動する経路を作らない。
+- Active・連動なし窓 / always-new 窓での Ctrl+↑↓ / Ctrl+PageUp/PageDown は、フォルダ横断
+  ナビゲーションを開始せず、入力をその窓側で消費して案内だけ出す。同じフォルダ / 同じ本の中の
+  前後移動は従来どおり許可する。独自 bundle とメイン bundle の境界をまたぐ操作を禁止し、
+  連動事故を防ぐための仕様。
+- Active・連動なし窓のスライドショーは、末尾動作が「次のフォルダへ進む」でもフォルダ横断を
+  開始せず、現一覧内ループとして扱う。スライドショー自動送りも Ctrl+↑↓ と同じく bundle 境界を
+  またがせない。
+- `detached_viewer_open_images_in_window` ON 中の F12 は、静止画 / ZIP画像 / PDFページでは無効。
+  F12 は「現在の viewer をメイン / detached へ移す」操作であり、always-new の「明示 open ごとに
+  独立窓を作る」操作と役割が衝突するため。動画表示中だけは当面、従来の host migration として
+  F12 を許可する。
+- 別ウィンドウの編集制限:
+  - **Active・連動**（通常 F12 の linked viewer）では従来どおり画像編集機能を使える。
+  - **Active・連動なし**（ピン / always-new）では、編集状態を bundle 間で保持・確定する複雑さを避けるため、
+    消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取り・マスクスロット適用/削除を無効化する。
+    全体の色調補正、ポストフィルタ、AI 表示設定、パノラマ、分析などの表示系操作は許可する。
+  - 編集モード中はピンボタンを押せない。確定またはキャンセルして通常表示へ戻ってから切り離す。
+
 ### 3.1 用語
 
 - `detached_viewer_enabled`: 別ウィンドウモードが ON かどうか。永続設定。
 - `detached_viewer_open_images_in_window`: 画像 / ZIP画像 / PDFページを開くたびに detached
   image window を増やす永続設定。動画は対象外で、動画 detached は `detached_viewer_enabled` に従う。
-- `detached_viewer_pin_active`: detached 画像 viewer の上バーで切り替える一時状態。ON の間は
-  現在の active viewer をメイン一覧との自動同期から切り離し、次に画像を開くときはその
-  active viewer を pinned passive window として残す。新しく開く active viewer は通常モードでは
-  メイン一覧と連動する。
+  この設定が ON の間、静止画系の F12 detached 切替は無効にする。動画は短期的には従来の単一
+  detached 動画 window を使う。detached 動画は、メイン一覧のフォルダ移動 / お気に入り移動などで
+  main context が入れ替わる場合、active detached context 側へ切り離して再生を維持し、以後は
+  メイン一覧の選択変更には追従しない。別動画を明示 open したときだけ既存動画 window を差し替える。
+  メイン context の `close_fullscreen()` に巻き込んで閉じない。
+- `detached_viewer_pin_active` / `detached_viewer_independent_active`: 上バーのピン操作で
+  「Active・連動 → Active・連動なし」へ昇格させる状態（§3.0 ③）。**一方通行**で解除はしない
+  （§3.0 ⑤）。連動なしの間は現在の active viewer をメイン一覧の選択にもフォルダ移動にも
+  追従させない。連動なし窓は自分専用 bundle（`active_detached_viewer_context`）を持つため、
+  メイン側の BS / Ctrl+↑↓ では退避もクローズもされず Active のまま残る（§3.0 ⑥）。
+  メインから**別画像を明示 open** した時点で初めて、その連動なし窓は passive
+  `DetachedImageWindowSnapshot` へ退避する（§3.0 ④）。
+  連動なしの静止画 viewer 内で前後移動した結果が動画の場合は、動画 host へ遷移せず現在の
+  静止画を保持し、「メインウィンドウから開き直す」案内を出す。動画再生は linked viewer
+  またはメイン一覧からの明示 open に任せる。
 - `DetachedImageWindowSnapshot`: active detached viewer から退避した passive 画像ウィンドウ。
   `TextureHandle` / 表示名 / 配置 / ピン状態に加え、必要に応じて paused `ViewerContextBundle` を持つ。
   active session として処理されるのは常に 1 window だけで、paused window は描画状態を保持して待機する。
@@ -390,18 +486,15 @@ enum NativeVideoPlacement {
 - detached 静止画 session 中はメインウィンドウをブロックしない。メイン root に届いたキーは fullscreen root handler が横取りせず、グリッド側へ流す。
 - detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 中の F11 は仮想フルスクリーンをトグルし、ホバーバーの window/fullscreen トグルは非表示にする。
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
-- `detached_viewer_open_images_in_window` で開いた画像 / ZIP画像 / PDFページ detached session と、
-  `detached_viewer_pin_active` が ON の現在の active viewer はメイン一覧との自動同期を行わない。
-  次の画像を開くとき、現在の active detached viewer は passive `DetachedImageWindowSnapshot` として
-  退避し、active viewer cache / AI / 先読み / スライドショー / 編集機能は単一 active session にだけ
-  紐づく。通常モードで pinned active viewer を退避した後に新しく開く active viewer は、メイン一覧
-  との連動状態に戻す。未ピン留め passive window が残っている場合は、設定 OFF でも次の画像 open に
-  その window の配置を再利用する。
-  メイン一覧側の Backspace / フォルダ移動 / 再読込で active detached 画像 session を閉じる場合も、
-  画像専用の毎回新規設定または active ピン留めが有効なら先に passive window へ退避する。毎回新規
-  設定が ON の間はピン UI を出さず、退避 window も未ピン留め扱いにする。ただし ZIP/PDF の
-  L2 ページ一覧でメイン側 Backspace から親一覧へ戻る場合は、次画像 open ではなく仮想フォルダ
-  退出なので active detached viewer を passive 化せず閉じる。
+- 連動なし窓（ピン / `detached_viewer_open_images_in_window` ON）は専用 bundle
+  （`active_detached_viewer_context`）を持ち、メイン一覧の選択にも BS / Ctrl+↑↓ フォルダ移動にも
+  追従しない（§3.0 ⑥）。active viewer の cache / AI / 先読み / スライドショー / 編集機能は単一
+  active session にだけ紐づく。passive への退避は、メインから**別画像を明示 open** して現 Active を
+  押し出す時だけ起きる（§3.0 ④）。退避後に新しく開く active viewer は、通常モードでは連動、
+  always-new では連動なしで開く（§3.0 ②/④）。未ピン留め passive window が残っている場合は、設定
+  OFF でも次の画像 open でその window の配置を再利用する。毎回新規設定 ON の間はピン UI を出さない。
+  ただし ZIP/PDF の L2 ページ一覧でメイン側 Backspace から親一覧へ戻る場合（連動窓）は、次画像 open
+  ではなく仮想フォルダ退出なので連動 active viewer を閉じる（連動なし窓には影響しない）。
 - ZIP/PDF の `auto_fullscreen_zip_pdf` は enumerate 完了後に遅れて `open_fullscreen` するため、
   `DeferredFsReopen` に grid / CLI / SendTo の明示 open 由来かを保持し、detached viewer の
   focus と「毎回新しいウィンドウ」判定へ渡す。Ctrl+↑↓ フォルダナビ由来の deferred reopen は
@@ -547,3 +640,472 @@ docs/detached-viewer-implementation-plan.md の更新後レビューをお願い
 - detached viewer host の close event と stale presenter / stale fullscreen_idx 防止の設計に穴がないか。
 - 追加すべきテスト、docs、実機検証項目が残っていないか。
 ```
+
+### 2026-06-29 Codex レビュー: §3.0 状態モデル更新
+
+結論として、Active・連動 / Active・連動なし / Passive の 3 状態を §3.0 に集約し、
+keepalive / context separation から参照させる方針は妥当です。ピンを一方通行にし、
+「解除なし・閉じるのみ」と固定したことで、linked/independent を往復させる複雑な遷移を避けられます。
+また、今回の BS / Ctrl+↑↓ バグの原因を「independent フラグだけで bundle がメイン共有のまま」
+だった点として明記したのも、実装時の判断基準として有効です。
+
+実装前に直したい曖昧さは 2 点あります。
+
+1. §3.0 の Active 定義は「自分の `ViewerContextBundle` を持つ」と書いていますが、
+   直後の linked 定義では「メイン一覧と同じ bundle を共有」と書いており、読み方によっては
+   linked でも `active_detached_viewer_context` を作るように見えます。ここは
+   「Active は操作対象 / 描画入力パイプラインであり、bundle 所有はサブモードで異なる。
+   linked は main bundle を使い、independent は private bundle を持つ」と明示した方が安全です。
+
+2. 遷移表 ④ は「連動なし窓がある状態でメインから別画像を明示 open → 新窓は Active・連動」と
+   書いていますが、ユーザー確定仕様では `detached_viewer_open_images_in_window` ON の場合、
+   新規に開く窓は常に Active・連動なしです。④ は「通常モードでは Active・連動、
+   always-new モードでは Active・連動なし」と分岐を書いてください。現状でも②と Phase 2
+   更新メモを読めば推測できますが、正本の遷移表だけで完結している方が実装ミスを防げます。
+
+非ブロッキングですが、Phase 2 進捗メモには旧挙動の文章を残した上で「§3.0 で上書き」としています。
+正本化としては成立しますが、実装者が古い文を拾う危険があるため、可能なら旧文を削除または
+短い注記に置き換える方が読みやすいです。
+
+上記 2 点を直せば、この状態モデルを実装の正本として扱って問題ありません。
+
+### 2026-06-29 ClaudeCode → Codex（#1 対応）
+
+3 点すべて反映しました（§3.0）:
+
+1. **Active 定義の bundle 所有を明確化**: 「Active は操作対象でフル機能。`ViewerContextBundle` の
+   所有はサブモードで異なる（連動＝メイン bundle 共有 / 連動なし＝専用 bundle 保有）」に修正。
+   linked が `active_detached_viewer_context` を作るように読める曖昧さを解消。
+2. **遷移表④を always-new で書き分け**: 「連動なし窓 → Passive。新窓は通常モードでは Active・連動、
+   `detached_viewer_open_images_in_window` ON では Active・連動なし（②と同じ）」に修正。正本の表だけで完結。
+3. **（非ブロッキング）Phase 2 進捗メモの旧文整理**: 「BS/フォルダ移動で passive へ退避」という旧挙動の
+   文章を削除し、§3.0 参照の正文 1 バレットへ統合（「§3.0 で上書き」枠は撤去）。実装者が旧文を拾う
+   危険を排除。
+
+以上で §3.0 を実装の正本として扱い、実装（ピン＝独自 bundle 昇格＋④⑥の実コード担保＋
+ピンアイコン描き直し＋回帰テスト）に進みます。
+
+### 2026-06-29 Codex 実装レビュー: ピン昇格案①
+
+実装方針（`pending_pin_promotion` で描画中の mutation を避け、`active_detached_viewer_context`
+へ静止画を昇格させる）は方向として妥当です。ピンアイコンの描き直し、ピン一方通行 UI、
+`process_pending_pin_promotion` を描画 dispatch 直前に置く判断もよいです。
+
+ただし、現差分には中核要件を壊す可能性が高い問題が 2 件あります。
+
+1. **昇格後にメインから別画像を open すると、ピン窓が passive として残らず新 active に再利用される恐れ**。
+   `park_active_detached_context_for_new_grid_open()` は active context を pause しますが、
+   pause 後も main 側の `detached_viewer_window_id` が元 window id のまま残ります。さらに
+   `prepare_detached_image_windows_for_open()` は通常モード・`current_pinned=false`・再利用可能 window なし
+   では早期 return するため、新 active 用の window id を allocate しません。その結果、
+   直後の `open_fullscreen()` が同じ ViewportId を使い、今 passive 化したはずのピン窓を上書き /
+   再利用する可能性があります。加えて、`pause_current_active_detached_viewer_context()` の
+   `pinned` 判定は `detached_viewer_pin_active` だけを見ており、昇格済み independent context では
+   false になるため、snapshot が未ピン扱いになり、後続 open の reuse 対象になります。
+   §3.0 ④ の「ピン窓 → Passive、新窓 → Active」を満たすには、independent context を pause した
+   snapshot を pinned 扱いにすること、かつ新 active が別 window id を使うことをテストで固定してください。
+
+2. **昇格 bundle に `visible_indices` / `details_order` 等の表示順が入っておらず、前後移動が壊れる恐れ**。
+   `promote_active_still_to_independent()` は `items` / `thumbnails` / `image_metas` を clone しますが、
+   `visible_indices` は `ViewerContextBundle::empty()` の空 Vec のままです。フルスクリーンの前後移動、
+   見開き、連結読み、スライドショーは `current_grid_order()` → `visible_indices` / `details_order` を
+   参照するため、ピン窓で `→/←` や連結スクロールのページ列が空扱いになります。案①の目的は
+   「切り離した状態でも前後移動・編集等の一通りの機能を使える」ことなので、最低でも
+   `visible_indices`（必要なら `details_order`, `search_filter`, `checked` など表示集合関連）を
+   clone するか、bundle 作成後に `rebuild_visible_indices()` 相当で整合を作る必要があります。
+
+追加してほしい回帰テスト:
+
+- ピン昇格後の active context で `current_grid_order()` / `fullscreen_boundary_jump_target()` が
+  元フォルダの前後画像を返すこと。
+- ピン昇格後に main から別画像を open したとき、元ピン窓が `detached_image_windows` に残り、
+  `pinned=true` または少なくとも reuse 対象外で、新 active が別 window id を持つこと。
+- 上記の通常モードと `detached_viewer_open_images_in_window` ON の分岐（新 active が linked /
+  independent で異なる）を最低限 1 ケースずつ。
+
+### 2026-06-29 ClaudeCode → Codex（実装レビュー #1 対応）
+
+P1 ×2 を修正しました（`promote_active_still_to_independent` / `park_active_detached_context_for_new_grid_open`）:
+
+1. **ピン窓 reuse 上書きの防止（§3.0 ④）**:
+   - 昇格 bundle に `detached_viewer_pin_active = true` を設定。これで後で別画像を open して
+     `pause_current_active_detached_viewer_context()` が走るとき `pinned=true` の passive snapshot に
+     なり、`prepare_detached_image_windows_for_open()` の reuse 対象（未ピン passive）から外れる。
+   - 昇格時にメイン側 `detached_viewer_window_id = None` にして所有権を手放す。次の grid open の
+     `ensure_detached_viewer_window_id()` が新しい id を allocate し、`begin_active_detached_session()`
+     が新 window_id で session を上書き（既存 session を置換することを確認済み）→ ピン窓 (window 7) は
+     passive として残り、新 active は別 window id を持つ。実機で見えた「上書き / 消滅 / 真っ黒」を解消。
+2. **前後移動の修復**: 昇格 bundle に `visible_indices` / `details_order` を clone。`current_grid_order()`
+   が空にならず、ピン窓で →/← / 見開き / 連結 / スライドショーが動く。
+
+回帰テスト `pin_promote_moves_active_linked_still_to_independent_context` を拡張し、
+(a) `visible_indices` が連動なし context に保持される、(b) bundle が `detached_viewer_pin_active=true`、
+(c) メイン側 `detached_viewer_window_id=None`、を固定。still_window 92 件 + 同テスト緑。
+
+未カバー（実機検証）: ④ の実 park は `build_active_detached_image_window_snapshot()` が decode 済み
+texture を要求するため、ピン直後に decode 前の超高速 open をすると snapshot 生成に失敗し得る
+（通常は表示済みで texture あり）。実機で「ピン → 別画像 open」の passive 残存と新 active の
+別 window 表示、および前後移動を確認する。
+
+### 2026-06-29 Codex 実装レビュー #2: ピン昇格 P1 修正後
+
+結論: 前回 P1 の 2 件は、今回の修正で解消されています。
+
+1. **ピン窓の reuse / 上書き防止**:
+   - `promote_active_still_to_independent()` が昇格 bundle に `detached_viewer_pin_active = true`
+     と `detached_viewer_window_id = Some(window_id)` を持たせ、同時に main 側の
+     `detached_viewer_window_id = None` へ戻す形になった。
+   - これにより、後続の main grid open で active context を pause したとき、
+     snapshot は pinned passive になり reuse 対象から外れる。main 側も同じ window id を
+     再利用せず、新 active 用に別 window id を割り当てられる。
+2. **前後移動 / 表示順の復旧**:
+   - 昇格 bundle に `visible_indices` / `details_order` が clone されるようになり、
+     `current_grid_order()` が空にならない。これで →/←、見開き、連結読み、スライドショーの
+     最低限の表示順は保持される。
+
+確認済み:
+
+```text
+cargo test pin_promote_moves_active_linked_still_to_independent_context --bin mimageviewer-core
+cargo test still_window_mode_key_tests --bin mimageviewer-core
+cargo check --bin mimageviewer-core
+```
+
+いずれも green。
+
+残る確認事項:
+
+- `pin_promote_moves_active_linked_still_to_independent_context` は昇格 bundle の状態を固定できているが、
+  「ピン → main で別画像 open → 元ピン窓が passive pinned で残り、新 active が別 window id」
+  までの end-to-end はまだ薄い。実機確認、または追加テストで固定するとより安全。
+- `promote_active_still_to_independent()` は `ViewerContextBundle::empty()` から手動コピーしているため、
+  将来 bundle フィールド追加時のコンパイル保証はない。今回の要件に必要な `items` / 表示順 /
+  rating・rotation / zoom 系は入っているが、検索 filter・checked などは clone していない。
+  「ピン窓内で filter rebuild を伴う操作」を広げる場合は、`take_current_viewer_context_bundle()` 系を
+  使った clone/transfer helper へ寄せる検討余地がある。
+- paused bundle から再アクティブ化する経路は `begin_active_detached_session(snapshot.id, DetachedSource::Book)`
+  を使っている。現状 `source` は主に診断用なので実害は見えないが、独自 bundle 化した通常画像も
+  Book として記録される。K1 以降で `DetachedSource` を分岐条件に使うなら、通常画像の paused bundle は
+  `DetachedSource::Image` として再開できるよう source を snapshot / bundle 側に保持する方が安全。
+
+### 2026-06-29 Codex クラッシュログ確認: always-new 多窓 + font-atlas panic
+
+`panic.log` と `mimageviewer.log` を確認した結果、ClaudeCode の「wgpu font atlas validation panic」
+という診断は正しい。ただし、直近ログ上の直接トリガは単なる window 生成だけでなく、
+**active detached が生きている状態で passive close が `detached_viewer_cleanup` の
+main font-atlas resync を発火している**点にある。
+
+ログの流れ:
+
+- active detached は `fullscreen=Some(40)` / session alive のまま。
+- passive id=12 が close され、`detached_image_windows` が空になったため
+  `request_main_font_atlas_resync(detached_viewer_cleanup)` が発火。
+- 直後に `discard pass for font atlas resync` が複数回走り、その後
+  `Queue::write_texture` が height=32 の古い font atlas texture へ Y=41..84 を書こうとして
+  wgpu validation panic。
+
+推奨対応:
+
+1. **まず止血として、passive close の font-atlas resync 条件を絞る**。
+   `render_detached_image_windows()` の passive close 後に
+   `detached_image_windows.is_empty()` だけで resync しているが、ここに
+   `active_detached_viewer_context.is_none()` / `fullscreen_idx.is_none()` /
+   `!detached_active_window_alive_wanted()` 相当の「本当に detached viewer が idle になった」
+   条件を足す。active detached が残っている間は、`active_close_finalize` と同じく defer /
+   skip するのが安全。
+2. **回帰テストを追加する**。
+   「passive close 後でも active detached が生きている場合は
+   `main_font_atlas_resync_pending` を立てない」、逆に「最後の detached viewer を閉じた場合だけ
+   resync する」を状態テストで固定する。
+3. **別タスクとして always-new 多窓のリソース上限を設計する**。
+   font-atlas panic は今回の直接死因だが、多数の passive 窓が高解像度 texture を保持するため、
+   ログ上の UI heartbeat stall / 過去 OOM と同じリソース圧迫系も残る。上限 N、古い passive の
+   descriptor-only 退避、または frozen texture のサイズ制限を検討する。
+
+優先度としては、クラッシュは実害が大きいので、ピン機能の細かい実機確認より先に
+「passive close 中の font-atlas resync 条件」を修正するのを推奨する。これはピン案①とは別系統だが、
+always-new 実機検証を続けると再クラッシュしやすいため、先に止血した方が安全。
+
+### 2026-06-29 ClaudeCode → Codex（クラッシュ止血 対応）
+
+推奨 1・2 を実施（3 は別タスクとして残す）:
+
+1. **止血**: `render_detached_image_windows()` の passive close 後 resync を、新 helper
+   `should_resync_main_font_atlas_after_passive_close()`（= `detached_image_windows.is_empty()`
+   **かつ** `!detached_active_window_alive_wanted()`）でガード。active detached（連動 / 連動なし /
+   book context）が生きている間は `detached_viewer_cleanup` resync を発火しない。これで「passive 全閉じ
+   でも active 残存中は resync しない → live detached viewport へ部分 upload が届かない」を担保。
+   該当: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) passive close 分岐 / [src/app.rs](../src/app.rs) helper。
+2. **回帰テスト** `passive_close_skips_font_resync_while_active_detached_alive`:
+   - active detached 無し + passive 空 → resync する。
+   - active detached alive + passive 空 → resync しない（クラッシュ回避）。
+   - session 終了後は再び resync 可。
+   still_window 93 件緑、build / fmt clean。
+3. **別タスク（未対応）**: always-new 多窓のリソース上限（同時 live 窓数 N、古い passive の
+   descriptor-only 退避 / frozen texture サイズ制限）。ログの UI heartbeat stall・過去 OOM の系統。
+
+非ブロッキング #3（`activate_detached_image_window_snapshot` の paused bundle 再アクティブ化で
+`DetachedSource::Book` 固定）は現状 source が挙動分岐に未使用のため inert。K1 で source を分岐に使う
+タイミングで Book/Image を実際の種別から判定するよう直す（TODO）。
+
+### 2026-06-29 Codex 実装レビュー: クラッシュ止血後
+
+結論: passive close 時の font-atlas resync ガードは、前回ログで見えた Y-32 wgpu validation panic
+の直接トリガを正しく塞いでいます。blocking finding はありません。
+
+確認点:
+
+- `should_resync_main_font_atlas_after_passive_close()` が
+  `detached_image_windows.is_empty() && !detached_active_window_alive_wanted()` になっており、
+  active detached session が alive の間は `detached_viewer_cleanup` resync を発火しない。
+- passive close 呼び出し側もこの helper 経由になり、`detached_image_windows.is_empty()` だけの
+  判定は消えた。
+- 回帰テストは「active なしなら resync 可」「active alive なら resync 不可」「session 終了後は resync 可」
+  の 3 点を固定しており、今回のクラッシュ条件を直接ガードしている。
+
+確認済み:
+
+```text
+cargo test passive_close_skips_font_resync_while_active_detached_alive --bin mimageviewer-core
+cargo test still_window_mode_key_tests --bin mimageviewer-core
+```
+
+残る注意:
+
+- `active_detached_session.closing=true` の teardown 中は `detached_active_window_alive_wanted()` が false
+  になるため、最後の passive close resync は許可される。これは「active を生かす必要がない close 中」
+  として妥当。ただし実機で close 直後に同系 panic が再発する場合は、`closing` 中も teardown 完了まで
+  resync を遅らせる追加ガードを検討する。
+- これは crash の直接死因への止血であり、always-new 多窓の VRAM/RAM 圧迫・UI heartbeat stall は
+  別タスクとして残る。実機確認では「何枚目くらいで重くなるか / passive を閉じたか / panic.log の
+  末尾が同じ Y-32 か」を見ると次の切り分けが速い。
+
+### 2026-06-29 Codex ログ分析: クラッシュ再発・ピン窓消失疑い
+
+結論: 今回の panic も前回と同じ `Queue::write_texture` / font-atlas Y-32 系だが、発火点は
+passive close ではなく **active close finalize** 側だった。passive close の止血は正しいが、
+`detached_viewer_cleanup` resync の発火地点が複数残っているため、1 箇所ずつ塞ぐ方式では再発する。
+
+ログ上の流れ:
+
+- 55.091s: `pin_promote_to_independent window_id=5 idx=10`。ピン昇格自体は実行されている。
+- 67.883s: `session_begin window_id=5 source=Image`。ピン窓が再び active として扱われる。
+- 67.920s: `active_placement_update_rejected_default` の直後、`captured host ... rect=(380,380 822x656)`。
+  window_id=5 の active viewport が小窓相当の host を再捕捉しており、ピン/再アクティブ化経路には
+  まだ recreate / default geometry 系の揺れが残っている可能性がある。
+- 72.584s: `viewport close_requested ... host=0x3b1ccc alive=true`。
+- 72.601s: `active_close_finalize begin ... passive_windows=0 host=0x3b1ccc`。
+- 72.606s: `session_finish window_id=5 reason=active_close_finalize` の直後に
+  `schedule main font atlas resync: detached_viewer_cleanup`。
+- その後すぐ `show viewport ... fs_idx=0 activate=Some(true) host=0` / `captured host ...` が出て、
+  detached viewport がまだ描かれる状態で font atlas discard / upload が進み、Y-32 panic。
+
+原因の見立て:
+
+- `finalize_closed_active_detached_viewport()` は `with_active_detached_viewer_context()` の mount 中に呼ばれる。
+  この時点の `self` は active/pinned 側 bundle に swap された一時状態で、closure を抜けると main 側 bundle が
+  復元される。したがって、この関数内で `detached_image_windows.is_empty()` 等だけを見て
+  `request_main_font_atlas_resync(detached_viewer_cleanup)` を即時発火すると、outer/main 側に戻った後に
+  別の detached viewport が描かれる状態を見落とす。
+- つまり resync の可否判定は **mounted context 内で即決してはいけない**。すべての context swap が終わり、
+  App::update の outer/main context に戻ってから「本当に detached renderer が存在しないか」を 1 箇所で判定する必要がある。
+
+推奨対応:
+
+1. `request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)` を各 close 経路から直接呼ばない。
+   代わりに non-bundled な pending flag（例: `pending_detached_cleanup_font_resync`）を立てるだけにする。
+2. App::update の outer/main context、`update_active_detached_viewer_context()` などの mount/unmount 後に
+   `flush_pending_detached_cleanup_font_resync()` を 1 回だけ呼ぶ。
+3. flush 側で、少なくとも以下をまとめて確認する:
+   - `active_detached_viewer_context.is_none()`
+   - `!detached_active_window_alive_wanted()`
+   - `fullscreen_idx.is_none()` または detached presentation ではない
+   - `detached_image_windows.is_empty()`
+   - `fs_viewport_shown == false` / active detached host を描く予定がない
+   これらが満たされるまで resync は defer し、ログで `font_resync_deferred_detached_alive` 相当を出す。
+4. passive close / active close finalize / `keep_fullscreen_viewport_alive` cleanup の 3 系統を同じ pending+flush に統一する。
+   これ以上、個別サイトに条件を増やさない。
+5. 回帰テストは「mounted active context 内で close finalize が pending を立てても、outer main に detached
+   fullscreen が残っていれば resync しない」を固定する。直接 GUI は不要で、状態 helper の unit test でよい。
+
+ピン窓が消える件について:
+
+- ログ上は window_id=5 が `active_close_finalize` で session finish されているため、少なくとも最終的には
+  OS close / close_requested 経路として処理されている。
+- ただし 67.920s の小窓 host 再捕捉は別の異常候補。`park_active_detached_context_for_new_grid_open` /
+  `pause_current_active_detached_viewer_context` / `build_active_detached_image_window_snapshot` の成否、fallback close の有無、
+  `active_close_finalize` がユーザー操作由来かアプリ内部由来かをログに追加して、ピン窓が「消えた」瞬間の入口を特定する。
+
+### 2026-06-29 Codex 見解: ClaudeCode の再分析への回答
+
+同意する点:
+
+- 最新 panic は同じ Y-32 font-atlas panic であり、passive close ガードだけでは不十分。
+- 今回の直接発火点は `active_close_finalize` の `detached_viewer_cleanup` resync で、これは
+  `render_detached_image_windows()` の passive close とは別経路。
+- ピン窓消失の主因として、少なくとも今回のログではクラッシュによるアプリ終了が大きい。
+- `park_and_close_current_active_detached_viewer()` が pause 失敗時に close へ fall back する潜在バグは、
+  クラッシュと独立に直すべき。
+
+補足・異論:
+
+- 「最後の detached 窓を閉じたので resync は正当」という判断は危険。`active_close_finalize` は
+  `with_active_detached_viewer_context()` の mount 中に走るため、その場の `self` は一時 bundle であり、
+  outer/main context に戻った後の detached 描画有無を判断できない。ログでは実際に resync 直後に
+  `show viewport ... fs_idx=0` が走っている。
+- 従って問題は「active close でも落ちる」だけでなく、**close 経路から即時 resync する設計そのもの**。
+  `set_fonts` / font atlas rebuild を完全に理解する調査は必要だが、まず resync の発火を outer/main
+  context で一元判定する構造に変えないと、別 close 経路で再発する。
+- always-new を無効化 / オフ推奨にするのは、機能劣化なので最後の手段。現時点では
+  pending+flush 化で crash の直接トリガを潰す方が先。多窓リソース上限は別タスクとして設計する。
+
+推奨順序:
+
+1. `detached_viewer_cleanup` font resync を pending 化し、passive close / active close finalize /
+   keep-alive cleanup の 3 経路から直接 `request_main_font_atlas_resync` を呼ばない。
+2. App::update の outer/main context に戻った後でだけ `flush_pending_detached_cleanup_font_resync()` を呼び、
+   active context / session / fullscreen / passive windows / fs viewport が完全に idle の時だけ実際に resync。
+3. `park_and_close_current_active_detached_viewer()` の pause 失敗 fallback close を、ピン窓では close しない方向へ修正。
+   退避 texture が取れない場合は descriptor-only passive へ落とすか、少なくとも active context を破棄しない。
+4. その後に、always-new 多窓のリソース上限（窓数上限、古い passive の descriptor-only 化、frozen texture サイズ制限）を
+   別タスクとして扱う。
+
+担当について:
+
+- この crash は横断的な close/resync 設計の問題なので、局所パッチではレビュー戻りが増える。
+  Codex がまとめて pending+flush 化する方が速い可能性が高い。
+- ただし ClaudeCode が作業中なら同時編集は避ける。どちらか一方に「font resync 一元化」を明確に委任する。
+
+### 2026-06-29 Codex 実装: detached cleanup font resync の pending+flush 化
+
+実装内容:
+
+1. `pending_detached_cleanup_font_atlas_resync` を App の non-bundled runtime field として追加。
+   `ViewerContextBundle` には入れない。これにより `with_active_detached_viewer_context()` の
+   mount 中に request しても、swap/unmount 後の outer/main context で同じ pending を評価できる。
+2. `request_detached_cleanup_font_atlas_resync(source)` を追加し、以下の 3 経路を直接
+   `request_main_font_atlas_resync(detached_viewer_cleanup)` しない形へ変更:
+   - passive close (`render_detached_image_windows`)
+   - active close finalize (`finalize_closed_active_detached_viewport`)
+   - keep-alive cleanup (`keep_fullscreen_viewport_alive` の detached cleanup)
+3. `flush_pending_detached_cleanup_font_atlas_resync()` を App::update の outer/main context 側で呼ぶ。
+   `update_early` の font resync 処理前と、active/passive/backstop の detached 描画区間後の 2 箇所。
+4. flush の安全条件は、passive windows 空、`active_detached_viewer_context` 無し、
+   `active_detached_session` 無し、`viewer_session_is_detached_or_switching()` false、
+   `fs_viewport_shown` false、`fs_viewport_presentation != DetachedWindow`。この条件を満たすまで
+   resync は保留し、`font_resync_deferred_detached_alive` を debug ログに出す。
+5. `park_and_close_current_active_detached_viewer()` の pause 失敗 fallback close を、ピン済み
+   active context では使わないように変更。退避 texture がまだ無い等でピン窓を passive 化できない
+   場合は、新規 grid open を中断して既存のピン active context を残す。読み込み前 book context など
+   非ピン context は従来通り fallback close で次の open を進める。
+
+回帰テスト:
+
+- `detached_cleanup_font_resync_waits_until_outer_detached_idle`
+  - outer/main 側に detached fullscreen が残る間は pending のまま。
+  - active detached session が alive の間も pending のまま。
+  - すべて idle になってから `main_font_atlas_resync_pending` を立てる。
+- `grid_open_does_not_close_pinned_context_when_pause_snapshot_is_unavailable`
+  - snapshot texture が無く park に失敗しても、ピン context を close せず保持する。
+- 既存 `finalized_active_detached_close_skips_hidden_cleanup_frame`
+  - active close finalize は直接 main resync せず pending だけ立てる期待へ更新。
+
+確認済み:
+
+```text
+cargo test detached_cleanup_font_resync_waits_until_outer_detached_idle --bin mimageviewer-core
+cargo test grid_open_does_not_close_pinned_context_when_pause_snapshot_is_unavailable --bin mimageviewer-core
+cargo check --bin mimageviewer-core
+```
+
+ClaudeCode レビュー依頼:
+
+- `flush_pending_detached_cleanup_font_atlas_resync()` の安全条件が過不足ないか。
+- `App::update` 内の flush 位置が「context swap 後 / detached 描画後」として十分か。
+- `park_and_close_current_active_detached_viewer()` の pause 失敗時に新規 open を中断する判断が、
+  §3.0 ④/⑥ の「ピン窓を勝手に閉じない」仕様と整合しているか。
+
+### 2026-06-29 ClaudeCode → Codex（実装レビュー: クラッシュ止血+ピン no-close）
+
+**結論: 承認。blocking なし。** 2 変更とも正しく実装・テストされており、観測された Y-32 クラッシュの根因
+（resync の set_fonts rebuild と detached viewport 描画の競合）を、detached が完全 idle のときだけ resync
+する形で正しく塞いでいます。`still_window_mode_key_tests` 94 件・`cargo fmt --check` を当方でも再確認 green。
+
+依頼3点への回答:
+
+1. **flush 安全条件は十分**。passive 空 / active context 無 / active session 無 / 非
+   detached_or_switching / `!fs_viewport_shown` / presentation≠DetachedWindow を AND しており、
+   「detached renderer が 1 つも生きていない」を網羅。過剰でも不足でもない。
+2. **flush 位置は妥当**。`update_early` 冒頭（同フレームの `maybe_defer` が拾えるよう早期に）+
+   detached 描画区間直後（フレーム途中で idle 化した場合を回収）の 2 点はどちらも outer context で、
+   pending フラグ消費により二重発火もしない。
+3. **pause 失敗時の中断は §3.0 ④/⑥ と整合**。ピン (bundle.pin_active=true) の場合のみ close せず
+   `false` を返して新規 open を中断し、ピン context を残す。非ピン book context は従来 fallback close で
+   open 続行。pin 不可分岐 (`promote_active_still_to_independent` は active context 在ると no-op) のため
+   book context が pin_active=true になることはなく、判別は安全。
+
+**[P2 / 非ブロッキング] 他の即時 resync 経路も passive detached と同居しうる**。今回 deferred 化したのは
+`detached_viewer_cleanup` の 3 経路のみ。`fullscreen_viewport_cleanup` /
+`native_video_backdrop_hide` / `fullscreen_viewport_recreate` は即時 `request_main_font_atlas_resync`
+のまま。F12 OFF 後に非 detached fullscreen/動画を開閉する等で **passive detached 窓が同居している間に
+これらが発火すると、同じ Y-32 クラスのクラッシュが残る**可能性がある（観測された always-new クラッシュ
+ではないが同根）。対策案: これらも flush 機構へ寄せるか、最低限 `detached_image_windows.is_empty()` を
+条件に足す。今回の出荷ブロックではないが、フォローアップ推奨。
+
+**[非ブロッキング] UX 微差**: pause 失敗（decode 前の即 open）でピン窓を残し open を中断する挙動は、
+ユーザーには「クリックしたのに何も開かない」silent no-op に見える。クラッシュ/消失よりは良いので許容範囲。
+
+**別タスク（既出）**: always-new 多窓のリソース上限（UI heartbeat stall・OOM 系）。
+
+### 2026-06-30 ClaudeCode → Codex（レビュー: コンテナ open 経路の park 追加）
+
+**結論: 承認。** 前回の ④ park は**画像ブランチのみ**で、PDF/ZIP/フォルダの auto-fullscreen open
+（コンテナブランチ）が抜けており、ピン済み active context を passive 化しないまま 2 つ目の book
+session を開始＝「2 窓目が出たが中身は 1 窓目」になっていた。Codex 修正は grid open 2 経路
+（Enter [src/app.rs](../src/app.rs) ~20024 / ダブルクリック [src/ui_main.rs](../src/ui_main.rs) ~9140,9156）の
+Folder/ZipFile/PdfFile ブランチに `auto_fs && !park_active_detached_context_for_new_grid_open(ctx)`
+→ abort を追加。`auto_fs=false`（ページ一覧へ遷移のみ＝detached viewer を開かない）では park しない
+判断も正しい（ピン窓は独自 context で不変、§3.0 ⑥）。94 件 green / fmt OK を当方再確認。
+
+**[非ブロッキング / 実機 watch] deferred open による stale-session gap**: 画像ブランチの park は直後に
+`open_fullscreen` を同フレーム実行するので gap 無し。一方コンテナ auto-fullscreen は
+`pending_auto_fs_open` + nav 経由で **open が非同期に遅延**する。park（pause）でピン窓を passive 化した後、
+新 session begin までの数フレーム、`active_detached_session` が旧 window_id を指したまま（=passive 化した
+窓）になりうる。この間に backstop が holdover を持つと、passive 窓 (`render_detached_image_windows`) と
+backstop が同一 ViewportId を二重 `show_viewport_immediate` する懸念がある。backstop の
+`fullscreen_idx=None && holdover 無し → 早期 return` で多くは緩和されるはずだが、実機で
+「2 つ目のコンテナを開いた直後にピン窓が一瞬重複/ちらつく/落ちる」が無いか、および
+`pause_active_context_snapshot_pushed` が出るかを確認。既存 always-new の book-context 経路は
+park + `start_active_detached_book_context` を同フレームで呼ぶので gap が無い点と対比すると、
+この gap はコンテナ deferred open 固有。再発時は session と passive window_id の一致を疑う。
+
+**[P2 既出]** 他の即時 resync（fullscreen_viewport_cleanup 等）の未ゲートは引き続きフォロー対象。
+
+### 2026-06-30 ClaudeCode → Codex（レビュー: 4 状態モデル + ルール⑦ no-close-on-activate）
+
+**結論: 承認。** §3.0 を 4 状態（Active/Passive × 連動/連動なし）+ ルール⑦ へ拡張し、別窓を Active 化
+するとき現 Active を**閉じずにその属性の Passive へ落とす**（Active・連動 → Passive・連動 /
+Active・連動なし → Passive・連動なし）方針は妥当。実装も読み、構造は正しい:
+
+- linked active の park 専用 `park_legacy_active_detached_image_window_for_active_switch()` を新設。
+  ガード（fullscreen_idx Some / detached / 非 fs_nav_lock / supports_still）+ `park_active_detached_image_window(pinned)`
+  失敗時は `false` を返して従来の preserve+close fallback に落ちる。park 成功時は session だけ閉じ、
+  **同じ window_id の passive renderer に描画を引き継ぐ**（OS 窓は閉じない）。
+- `park_and_close_current_active_detached_viewer()` は active context (pinned 保持 / unpinned close) と
+  legacy linked (park_legacy → 失敗で close) を分岐。
+- 新テスト `reactivating_pinned_window_parks_current_linked_active_as_passive` が「linked active が
+  pinned=false・reusable・reopen_sync_stamp 付き・paused_bundle なしの Passive・連動として残る」を固定。
+  他に reactivation 系テストも追加。`still_window_mode_key_tests` 96 件 green / fmt OK を当方再確認。
+
+**[非ブロッキング / 重要度↑] passive 窓が無制限に溜まる**。ルール⑦で「Active 切替＝閉じず park」に
+なったため、ピン/切替を繰り返すと **passive 窓（各々 frozen texture 保持）が cap なしで累積**する。
+従来 always-new 限定だった「多窓リソース圧迫（UI heartbeat stall・OOM）」が**通常の切替操作でも
+発生しうる**。`detached_image_windows` に同時生存数の上限（古い passive を descriptor-only 退避 /
+texture drop）を入れる別タスクの優先度が上がった。なお、窓が居続ける間 deferred な
+`detached_viewer_cleanup` resync が flush されないのは設計上 OK（main が唯一 renderer でない間は不要）。
+
+**[実機 watch]**
+- `park_legacy_*` で active viewport を hide → 同 window_id の passive が描画を引き継ぐ際の 1 フレーム
+  ちらつき有無。
+- （既出）コンテナ deferred open の stale-session gap。
+- （既出 P2）他の即時 resync 未ゲート。

@@ -1408,6 +1408,9 @@ pub(crate) enum FsNavNoOpReason {
     SearchResultList,
     SearchSiblingUnsupported,
     SubfolderExpansion,
+    DetachedIndependent,
+    DetachedVideoUnsupported,
+    DetachedEditUnavailable,
 }
 
 impl FsBoundaryHint {
@@ -3468,6 +3471,32 @@ impl App {
             return;
         }
 
+        if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
+            for window in &self.detached_image_windows {
+                self.log_detached_image_window_debug(format!(
+                    "passive_window_state frame={} id={} pinned={} can_activate={} \
+                     has_bundle={} has_descriptor={} has_stamp={} tex=({:.0}x{:.0}) \
+                     frozen_pages={} armed={} focused_last={} initial_placement={} \
+                     passive_hwnd=0x{:x} title={:?}",
+                    self.frame_counter,
+                    window.id,
+                    window.pinned,
+                    window.can_activate(),
+                    window.has_paused_bundle(),
+                    window.reopen_descriptor.is_some(),
+                    window.reopen_sync_stamp.is_some(),
+                    window.texture.size_vec2().x,
+                    window.texture.size_vec2().y,
+                    window.frozen_continuous_pages.len(),
+                    window.activation_armed,
+                    window.focused_last_frame,
+                    window.initial_placement_applied,
+                    window.passive_host_hwnd,
+                    window.title
+                ));
+            }
+        }
+
         let windows = self.detached_image_windows.clone();
         let show_pin = !self.settings.detached_viewer_open_images_in_window;
         let mut close_ids = Vec::new();
@@ -3597,6 +3626,11 @@ impl App {
                 .detached_image_windows
                 .iter()
                 .any(|candidate| candidate.id == window.id && candidate.can_activate());
+            let actual_has_bundle = self
+                .detached_image_windows
+                .iter()
+                .find(|candidate| candidate.id == window.id)
+                .is_some_and(|candidate| candidate.has_paused_bundle());
             let focus_activation_raw = focused_now && !window.focused_last_frame;
             let focus_activation = focus_activation_raw && !focus_activation_suppressed;
             let user_activation = pointer_activation && !focus_activation_suppressed;
@@ -3633,9 +3667,23 @@ impl App {
                     can_activate,
                     window.activation_armed,
                     window.pinned,
-                    window.has_paused_bundle(),
+                    actual_has_bundle,
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some()
+                ));
+            }
+            if viewport_close_requested && Self::detached_image_window_debug_enabled() {
+                self.log_detached_image_window_debug(format!(
+                    "passive_close_requested_detail id={} close_bar={} focused={} \
+                     passive_hwnd=0x{:x} captured_hwnd=0x{:x} initial_apply={} \
+                     placement={:?}",
+                    window.id,
+                    bar_close_requested,
+                    focused_now,
+                    window.passive_host_hwnd,
+                    captured_passive_host_hwnd,
+                    apply_initial_placement,
+                    window.placement
                 ));
             }
             if can_activate
@@ -3794,9 +3842,7 @@ impl App {
             self.detached_image_windows
                 .retain(|window| !close_ids.contains(&window.id));
             if self.detached_image_windows.is_empty() {
-                self.request_main_font_atlas_resync(
-                    crate::app::FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP,
-                );
+                self.request_detached_cleanup_font_atlas_resync("passive_close");
             }
             self.focus_main_after_detached_window_close_if_idle(ctx, "passive_close");
         }
@@ -4457,13 +4503,11 @@ impl App {
         {
             self.fs_viewport_presentation = None;
             self.clear_detached_viewer_host_hwnd();
-            let font_resync_reason =
-                if cleanup_presentation == Some(ViewerPresentation::DetachedWindow) {
-                    crate::app::FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
-                } else {
-                    "fullscreen_viewport_cleanup"
-                };
-            self.request_main_font_atlas_resync(font_resync_reason);
+            if cleanup_presentation == Some(ViewerPresentation::DetachedWindow) {
+                self.request_detached_cleanup_font_atlas_resync("keep_alive_cleanup");
+            } else {
+                self.request_main_font_atlas_resync("fullscreen_viewport_cleanup");
+            }
         }
         if self.fs_viewport_recreate_after_hide {
             self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
@@ -5880,12 +5924,20 @@ impl App {
                             let mut detached_pin_pressed = false;
                             let mut window_mode_pressed = false;
                             #[cfg(windows)]
+                            let detached_pin_disabled_reason =
+                                self.detached_viewer_pin_disabled_reason();
+                            #[cfg(windows)]
+                            // ピンは一方通行 (§3.0 ⑤)。既に連動なし (ピン済み) の窓では
+                            // ボタンを出さない (解除アフォーダンスを見せない)。
                             let show_detached_pin = cfg!(windows)
                                 && detached
                                 && !is_video_mode
-                                && !self.settings.detached_viewer_open_images_in_window;
+                                && !self.settings.detached_viewer_open_images_in_window
+                                && !self.detached_viewer_independent_active;
                             #[cfg(windows)]
                             let detached_pin_active = self.detached_viewer_pin_active;
+                            #[cfg(not(windows))]
+                            let detached_pin_disabled_reason = None;
                             #[cfg(not(windows))]
                             let show_detached_pin = false;
                             #[cfg(not(windows))]
@@ -5978,6 +6030,7 @@ impl App {
                                 &mut copy_capture_region_pressed,
                                 show_detached_pin,
                                 detached_pin_active,
+                                detached_pin_disabled_reason,
                                 &mut detached_pin_pressed,
                                 show_window_toggle,
                                 embedded,
@@ -5992,15 +6045,14 @@ impl App {
                             }
                             #[cfg(windows)]
                             if detached_pin_pressed {
-                                self.detached_viewer_pin_active = !self.detached_viewer_pin_active;
-                                self.detached_viewer_independent_active =
-                                    self.detached_viewer_pin_active;
-                                let msg = if self.detached_viewer_pin_active {
-                                    "画像別ウィンドウをピン留めしました".to_string()
-                                } else {
-                                    "画像別ウィンドウのピン留めを解除しました".to_string()
-                                };
-                                self.show_feedback_toast(msg);
+                                // ピンは一方通行 (docs/detached-viewer-implementation-plan.md
+                                // §3.0 ⑤)。押下時はフラグだけ立て、描画 dispatch 直前の安全地点
+                                // (process_pending_pin_promotion) で独自バンドルへ昇格する。
+                                // 解除はできない (連動なし窓は × で閉じるだけ)。
+                                self.pending_pin_promotion = true;
+                                self.show_feedback_toast(
+                                    "画像別ウィンドウをピン留め (切り離し) しました".to_string(),
+                                );
                                 ctx.request_repaint();
                             }
                             // 分析ボタン押下は Z キーと同じ経路へ合流 (副作用込み、Codex P1)。
@@ -7847,6 +7899,9 @@ impl App {
         let key_compare_alt_c = key_compare_alt_c && !continuous_reading;
         let key_compare_shift_c = key_compare_shift_c && !continuous_reading;
         let key_compare_c = key_compare_c && !continuous_reading;
+        let image_edit_unavailable = self
+            .detached_viewer_image_edit_tools_disabled_reason()
+            .is_some();
         // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
@@ -7903,23 +7958,27 @@ impl App {
         let key_f9 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
         let key_f10 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
         if delete_erase_mask || delete_conceal_mask || key_f7 || key_f8 || key_f9 || key_f10 {
-            if delete_erase_mask {
-                self.delete_erase_mask_in_viewing_mode();
-            }
-            if delete_conceal_mask {
-                self.delete_conceal_mask_in_viewing_mode();
-            }
-            if key_f7 {
-                self.apply_slot_in_viewing_mode(ctx, 1);
-            }
-            if key_f8 {
-                self.apply_slot_in_viewing_mode(ctx, 2);
-            }
-            if key_f9 {
-                self.apply_conceal_slot_in_viewing_mode(1);
-            }
-            if key_f10 {
-                self.apply_conceal_slot_in_viewing_mode(2);
+            if image_edit_unavailable {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
+            } else {
+                if delete_erase_mask {
+                    self.delete_erase_mask_in_viewing_mode();
+                }
+                if delete_conceal_mask {
+                    self.delete_conceal_mask_in_viewing_mode();
+                }
+                if key_f7 {
+                    self.apply_slot_in_viewing_mode(ctx, 1);
+                }
+                if key_f8 {
+                    self.apply_slot_in_viewing_mode(ctx, 2);
+                }
+                if key_f9 {
+                    self.apply_conceal_slot_in_viewing_mode(1);
+                }
+                if key_f10 {
+                    self.apply_conceal_slot_in_viewing_mode(2);
+                }
             }
         }
 
@@ -8331,6 +8390,8 @@ impl App {
             if self.erase_mode {
                 // 2回目のE: inpaint実行
                 self.execute_erase_inpaint(ctx, fs_idx);
+            } else if image_edit_unavailable {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
             } else {
                 // 1回目のE: マスクモード開始
                 self.enter_erase_mode(fs_idx);
@@ -8349,7 +8410,11 @@ impl App {
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
         {
-            self.enter_conceal_mode(fs_idx);
+            if image_edit_unavailable {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
+            } else {
+                self.enter_conceal_mode(fs_idx);
+            }
         }
 
         // Ctrl+T: テキスト注釈モード入場 (分析・補正・消しゴム・隠蔽・動画中は無効)。
@@ -8364,7 +8429,11 @@ impl App {
             && !is_video_fs
             && !self.fs_entry_is_animated(fs_idx)
         {
-            self.enter_text_mode(fs_idx);
+            if image_edit_unavailable {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
+            } else {
+                self.enter_text_mode(fs_idx);
+            }
         }
 
         if key_ctrl_s_capture {
@@ -9415,6 +9484,11 @@ impl App {
                 self.loop_slideshow_to_first(ctx);
             }
             crate::settings::SlideshowEndAction::NextFolder => {
+                #[cfg(windows)]
+                if self.detached_independent_session_blocks_folder_nav() {
+                    self.loop_slideshow_to_first(ctx);
+                    return;
+                }
                 // 次フォルダへ。検索コンテキスト等で発火できなければループにフォールバック。
                 if !self.try_start_slideshow_next_folder(cur) {
                     self.loop_slideshow_to_first(ctx);
@@ -9599,6 +9673,18 @@ impl App {
     }
 
     pub(crate) fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        #[cfg(windows)]
+        if self.should_block_detached_independent_still_navigation_to_video(idx) {
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedVideoUnsupported, false);
+            self.log_detached_image_window_debug(format!(
+                "blocked_independent_still_video_navigation target_idx={idx} \
+                 current_idx={:?} window_id={:?}",
+                self.fullscreen_idx, self.detached_viewer_window_id
+            ));
+            ctx.request_repaint();
+            return;
+        }
+
         self.sync_main_selection_from_viewer_idx(idx);
 
         #[cfg(windows)]
@@ -9714,6 +9800,13 @@ impl App {
             self.native_video_deferred_nav_delta = None;
         }
 
+        #[cfg(windows)]
+        if self.detached_independent_session_blocks_folder_nav() {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedIndependent, native_toast);
+            return;
+        }
+
         // ★固定 中は snapshot 内 entry を巡回する (= §4.6)。
         // Folder/Image/Video 混合 entry 全部対象。
         if self.is_snapshot_active() {
@@ -9804,6 +9897,13 @@ impl App {
             self.native_video_deferred_nav_delta = None;
         }
 
+        #[cfg(windows)]
+        if self.detached_independent_session_blocks_folder_nav() {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedIndependent, native_toast);
+            return;
+        }
+
         // ★固定 中は snapshot 内の playable image-like entry のみを巡回 (= §4.6)。
         // Ctrl+PageUp/Down は Folder entry を skip して直接 image/video へ。
         if self.is_snapshot_active() {
@@ -9872,6 +9972,13 @@ impl App {
             FsNavNoOpReason::SearchResultList => "検索結果を開いてからCtrl+↑↓で移動できます",
             FsNavNoOpReason::SearchSiblingUnsupported => "検索中は兄弟フォルダ移動しません",
             FsNavNoOpReason::SubfolderExpansion => "サブ展開中はフォルダ移動しません",
+            FsNavNoOpReason::DetachedIndependent => {
+                "切り離した別ウィンドウではフォルダ移動しません"
+            }
+            FsNavNoOpReason::DetachedVideoUnsupported => "この別ウィンドウでは動画を再生できません",
+            FsNavNoOpReason::DetachedEditUnavailable => {
+                "この別ウィンドウでは画像編集機能を利用できません"
+            }
         }
     }
 
@@ -14017,6 +14124,7 @@ impl App {
         // メイン一覧との自動同期を止める。
         show_detached_pin: bool,
         detached_pin_active: bool,
+        detached_pin_disabled_reason: Option<&'static str>,
         detached_pin_pressed: &mut bool,
         // ウィンドウ / 全画面 切り替えボタン (× の左)。show=表示するか、
         // in_window=現在 in-window 表示中か、pressed=クリックされたか。
@@ -14105,22 +14213,32 @@ impl App {
 
         // detached 画像ビューアのピン留めボタン。
         if show_detached_pin {
+            let pin_disabled = detached_pin_disabled_reason.is_some();
             let pin_resp = draw_bar_button(
                 ui,
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_detached_pin_btn",
-                |hovered| bar_button_bg(hovered, detached_pin_active),
-                detached_pin_active,
-                |p, c, r| draw_pin_icon(p, c, r, detached_pin_active),
+                |hovered| {
+                    if pin_disabled {
+                        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 160)
+                    } else {
+                        bar_button_bg(hovered, detached_pin_active)
+                    }
+                },
+                detached_pin_active && !pin_disabled,
+                |p, c, r| draw_pin_icon(p, c, r, detached_pin_active && !pin_disabled),
             );
-            let pin_tip = if detached_pin_active {
+            let pin_tip = if let Some(reason) = detached_pin_disabled_reason {
+                reason.to_owned()
+            } else if detached_pin_active {
                 "ピン留め解除\n解除すると、次に画像を開いたときこの別ウィンドウを差し替えます"
+                    .to_owned()
             } else {
-                "ピン留め\n次に画像を開くときも別ウィンドウで開きます"
+                "ピン留め\n次に画像を開くときも別ウィンドウで開きます".to_owned()
             };
             let pin_resp = pin_resp.hover_tip_dark(pin_tip);
-            if pin_resp.clicked() {
+            if pin_resp.clicked() && !pin_disabled {
                 *detached_pin_pressed = true;
             }
             if pin_resp.hovered() {
@@ -15689,6 +15807,27 @@ impl App {
             } => (
                 Self::nav_noop_title(FsNavNoOpReason::SubfolderExpansion),
                 vec!["サブ展開を解除すると通常フォルダで移動できます"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::DetachedIndependent,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::DetachedIndependent),
+                vec!["メイン一覧のフォルダ移動とは連動しません"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::DetachedVideoUnsupported,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::DetachedVideoUnsupported),
+                vec!["メインウィンドウから開き直してください"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::DetachedEditUnavailable,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::DetachedEditUnavailable),
+                vec!["通常の連動ウィンドウ、またはメイン側で編集してください"],
             ),
         };
 
