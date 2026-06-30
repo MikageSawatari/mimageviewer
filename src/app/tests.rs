@@ -1968,7 +1968,10 @@ mod folder_pane_open_nav_tests {
 
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
-    use crate::app::{QuickFolderSlotId, QuickFolderSwitchTarget};
+    use crate::app::{
+        QuickFolderSlotId, QuickFolderSwitchTarget, drive_current_key_for_letter,
+        drive_root_path_for_letter, location_root_for_path,
+    };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
 
@@ -2238,6 +2241,85 @@ mod phase_c_folder_nav_history_tests {
                 .forward_stack,
             vec![a_child]
         );
+    }
+
+    #[test]
+    fn drive_current_dirs_are_isolated_per_quick_folder_slot() {
+        let mut app = setup_app();
+        let a_d = PathBuf::from(r"D:\miv-test\a");
+        let b_d = PathBuf::from(r"D:\miv-test\b");
+        let a_e = PathBuf::from(r"E:\miv-test\a");
+        let d_key = drive_current_key_for_letter('d').unwrap();
+        let e_key = drive_current_key_for_letter('E').unwrap();
+
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        app.update_active_quick_folder_target(&a_d);
+        app.update_active_quick_folder_target(&a_e);
+
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
+        app.update_active_quick_folder_target(&b_d);
+
+        assert_eq!(app.active_drive_current_dir('D'), Some(b_d.clone()));
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .drive_current_dirs
+                .get(&d_key),
+            Some(&a_d)
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .drive_current_dirs
+                .get(&e_key),
+            Some(&a_e)
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .drive_current_dirs
+                .get(&d_key),
+            Some(&b_d)
+        );
+        assert_eq!(
+            app.settings.quick_folder_drive_current_dirs[QuickFolderSlotId::A.index()].get(&d_key),
+            Some(&a_d)
+        );
+        assert_eq!(
+            app.settings.quick_folder_drive_current_dirs[QuickFolderSlotId::B.index()].get(&d_key),
+            Some(&b_d)
+        );
+
+        app.clear_quick_folder_slot(QuickFolderSlotId::B);
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .drive_current_dirs
+                .is_empty()
+        );
+        assert!(
+            app.settings.quick_folder_drive_current_dirs[QuickFolderSlotId::B.index()].is_empty()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn location_root_helpers_use_drive_or_unc_share_root() {
+        assert_eq!(drive_root_path_for_letter('d'), Some(PathBuf::from(r"D:\")));
+        assert_eq!(
+            location_root_for_path(&PathBuf::from(r"E:\books\sample.zip")),
+            Some(PathBuf::from(r"E:\"))
+        );
+        assert_eq!(
+            location_root_for_path(&PathBuf::from(r"\\server\share\books\p001.jpg")),
+            Some(PathBuf::from(r"\\server\share\"))
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn current_location_root_uses_archive_source_override() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\miv-cache\converted.zip"));
+        app.archive_source_override = Some(PathBuf::from(r"E:\archives\book.rar"));
+
+        assert_eq!(app.current_location_root(), Some(PathBuf::from(r"E:\")));
     }
 
     #[test]

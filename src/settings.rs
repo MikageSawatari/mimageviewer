@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
@@ -1787,6 +1788,10 @@ pub struct Settings {
     pub quick_folder_recent_folders: [Vec<PathBuf>; 2],
     #[serde(default = "default_quick_folder_slots")]
     pub quick_folder_slots: [Option<PathBuf>; 2],
+    /// A/B クイックフォルダごとに保持するドライブ別の最後の場所。
+    /// キーは `"C:"` のような大文字ドライブ表記。
+    #[serde(default = "default_quick_folder_drive_current_dirs")]
+    pub quick_folder_drive_current_dirs: [BTreeMap<String, PathBuf>; 2],
     /// ウィンドウ左上座標 (outer rect)
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
@@ -3176,6 +3181,9 @@ fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
 fn default_quick_folder_recent_folders() -> [Vec<PathBuf>; 2] {
     [Vec::new(), Vec::new()]
 }
+fn default_quick_folder_drive_current_dirs() -> [BTreeMap<String, PathBuf>; 2] {
+    [BTreeMap::new(), BTreeMap::new()]
+}
 fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
     FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
 }
@@ -3408,6 +3416,7 @@ impl Default for Settings {
             recent_folders: Vec::new(),
             quick_folder_recent_folders: default_quick_folder_recent_folders(),
             quick_folder_slots: default_quick_folder_slots(),
+            quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
             parallelism: Parallelism::default(),
@@ -4928,6 +4937,8 @@ impl Settings {
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
+        self.quick_folder_drive_current_dirs =
+            std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
@@ -5368,6 +5379,10 @@ mod tests {
         );
         assert!(s.recent_folders.is_empty());
         assert_eq!(s.quick_folder_slots, [None, None]);
+        assert_eq!(
+            s.quick_folder_drive_current_dirs,
+            [BTreeMap::new(), BTreeMap::new()]
+        );
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
         assert_eq!(s.prefetch_back, 4);
@@ -5679,6 +5694,10 @@ mod tests {
             Some(PathBuf::from(r"D:\Images\Source")),
             Some(PathBuf::from(r"E:\Archive\Dest")),
         ];
+        original.quick_folder_drive_current_dirs[0]
+            .insert("D:".to_string(), PathBuf::from(r"D:\Images\Source\Nested"));
+        original.quick_folder_drive_current_dirs[1]
+            .insert("E:".to_string(), PathBuf::from(r"E:\Archive\Dest"));
         original.ring_shortcuts.mouse_flick_enabled = true;
         original.ring_shortcuts.gamepad_ring_enabled = false;
         original.ring_shortcuts.shift_wheel_pair =
@@ -5712,6 +5731,10 @@ mod tests {
         assert_eq!(loaded.startup_folder_path, original.startup_folder_path);
         assert_eq!(loaded.recent_folders, original.recent_folders);
         assert_eq!(loaded.quick_folder_slots, original.quick_folder_slots);
+        assert_eq!(
+            loaded.quick_folder_drive_current_dirs,
+            original.quick_folder_drive_current_dirs
+        );
         assert_eq!(loaded.ring_shortcuts, original.ring_shortcuts);
     }
 

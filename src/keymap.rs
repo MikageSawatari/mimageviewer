@@ -1193,6 +1193,31 @@ pub enum KeyAction {
     GridOpenDriveX,
     GridOpenDriveY,
     GridOpenDriveZ,
+    GridOpenCurrentDriveRoot,
+    GridSwitchDriveC,
+    GridSwitchDriveD,
+    GridSwitchDriveE,
+    GridSwitchDriveF,
+    GridSwitchDriveG,
+    GridSwitchDriveH,
+    GridSwitchDriveI,
+    GridSwitchDriveJ,
+    GridSwitchDriveK,
+    GridSwitchDriveL,
+    GridSwitchDriveM,
+    GridSwitchDriveN,
+    GridSwitchDriveO,
+    GridSwitchDriveP,
+    GridSwitchDriveQ,
+    GridSwitchDriveR,
+    GridSwitchDriveS,
+    GridSwitchDriveT,
+    GridSwitchDriveU,
+    GridSwitchDriveV,
+    GridSwitchDriveW,
+    GridSwitchDriveX,
+    GridSwitchDriveY,
+    GridSwitchDriveZ,
     GridOpenLocationDriveList,
     GridOpenLocationReadingHistory,
     GridOpenLocationRating1,
@@ -1556,6 +1581,31 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenDriveX,
     KeyAction::GridOpenDriveY,
     KeyAction::GridOpenDriveZ,
+    KeyAction::GridOpenCurrentDriveRoot,
+    KeyAction::GridSwitchDriveC,
+    KeyAction::GridSwitchDriveD,
+    KeyAction::GridSwitchDriveE,
+    KeyAction::GridSwitchDriveF,
+    KeyAction::GridSwitchDriveG,
+    KeyAction::GridSwitchDriveH,
+    KeyAction::GridSwitchDriveI,
+    KeyAction::GridSwitchDriveJ,
+    KeyAction::GridSwitchDriveK,
+    KeyAction::GridSwitchDriveL,
+    KeyAction::GridSwitchDriveM,
+    KeyAction::GridSwitchDriveN,
+    KeyAction::GridSwitchDriveO,
+    KeyAction::GridSwitchDriveP,
+    KeyAction::GridSwitchDriveQ,
+    KeyAction::GridSwitchDriveR,
+    KeyAction::GridSwitchDriveS,
+    KeyAction::GridSwitchDriveT,
+    KeyAction::GridSwitchDriveU,
+    KeyAction::GridSwitchDriveV,
+    KeyAction::GridSwitchDriveW,
+    KeyAction::GridSwitchDriveX,
+    KeyAction::GridSwitchDriveY,
+    KeyAction::GridSwitchDriveZ,
     KeyAction::GridOpenLocationDriveList,
     KeyAction::GridOpenLocationReadingHistory,
     KeyAction::GridOpenLocationRating1,
@@ -2515,6 +2565,33 @@ const DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
     KeyAction::GridOpenDriveZ,
 ];
 
+const SWITCH_DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
+    KeyAction::GridSwitchDriveC,
+    KeyAction::GridSwitchDriveD,
+    KeyAction::GridSwitchDriveE,
+    KeyAction::GridSwitchDriveF,
+    KeyAction::GridSwitchDriveG,
+    KeyAction::GridSwitchDriveH,
+    KeyAction::GridSwitchDriveI,
+    KeyAction::GridSwitchDriveJ,
+    KeyAction::GridSwitchDriveK,
+    KeyAction::GridSwitchDriveL,
+    KeyAction::GridSwitchDriveM,
+    KeyAction::GridSwitchDriveN,
+    KeyAction::GridSwitchDriveO,
+    KeyAction::GridSwitchDriveP,
+    KeyAction::GridSwitchDriveQ,
+    KeyAction::GridSwitchDriveR,
+    KeyAction::GridSwitchDriveS,
+    KeyAction::GridSwitchDriveT,
+    KeyAction::GridSwitchDriveU,
+    KeyAction::GridSwitchDriveV,
+    KeyAction::GridSwitchDriveW,
+    KeyAction::GridSwitchDriveX,
+    KeyAction::GridSwitchDriveY,
+    KeyAction::GridSwitchDriveZ,
+];
+
 const PINNED_TAG_ACTIONS_ARRAY: [KeyAction; 20] = [
     KeyAction::GridTogglePinnedTag1,
     KeyAction::GridTogglePinnedTag2,
@@ -2587,6 +2664,31 @@ pub const LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenDriveX,
     KeyAction::GridOpenDriveY,
     KeyAction::GridOpenDriveZ,
+    KeyAction::GridOpenCurrentDriveRoot,
+    KeyAction::GridSwitchDriveC,
+    KeyAction::GridSwitchDriveD,
+    KeyAction::GridSwitchDriveE,
+    KeyAction::GridSwitchDriveF,
+    KeyAction::GridSwitchDriveG,
+    KeyAction::GridSwitchDriveH,
+    KeyAction::GridSwitchDriveI,
+    KeyAction::GridSwitchDriveJ,
+    KeyAction::GridSwitchDriveK,
+    KeyAction::GridSwitchDriveL,
+    KeyAction::GridSwitchDriveM,
+    KeyAction::GridSwitchDriveN,
+    KeyAction::GridSwitchDriveO,
+    KeyAction::GridSwitchDriveP,
+    KeyAction::GridSwitchDriveQ,
+    KeyAction::GridSwitchDriveR,
+    KeyAction::GridSwitchDriveS,
+    KeyAction::GridSwitchDriveT,
+    KeyAction::GridSwitchDriveU,
+    KeyAction::GridSwitchDriveV,
+    KeyAction::GridSwitchDriveW,
+    KeyAction::GridSwitchDriveX,
+    KeyAction::GridSwitchDriveY,
+    KeyAction::GridSwitchDriveZ,
     KeyAction::GridOpenLocationDriveList,
     KeyAction::GridOpenLocationReadingHistory,
     KeyAction::GridOpenLocationRating1,
@@ -2646,6 +2748,23 @@ impl KeyAction {
 
     pub fn drive_letter(self) -> Option<char> {
         DRIVE_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| (b'C' + idx as u8) as char)
+    }
+
+    pub fn switch_drive_action(letter: char) -> Option<Self> {
+        let upper = letter.to_ascii_uppercase();
+        if !('C'..='Z').contains(&upper) {
+            return None;
+        }
+        SWITCH_DRIVE_LOCATION_ACTIONS
+            .get((upper as u8 - b'C') as usize)
+            .copied()
+    }
+
+    pub fn switch_drive_letter(self) -> Option<char> {
+        SWITCH_DRIVE_LOCATION_ACTIONS
             .iter()
             .position(|action| *action == self)
             .map(|idx| (b'C' + idx as u8) as char)
@@ -2733,6 +2852,35 @@ impl KeyAction {
                 _ => unreachable!("drive letter is constrained to C..=Z"),
             };
         }
+        if let Some(letter) = self.switch_drive_letter() {
+            return match letter {
+                'C' => "GridSwitchDriveC",
+                'D' => "GridSwitchDriveD",
+                'E' => "GridSwitchDriveE",
+                'F' => "GridSwitchDriveF",
+                'G' => "GridSwitchDriveG",
+                'H' => "GridSwitchDriveH",
+                'I' => "GridSwitchDriveI",
+                'J' => "GridSwitchDriveJ",
+                'K' => "GridSwitchDriveK",
+                'L' => "GridSwitchDriveL",
+                'M' => "GridSwitchDriveM",
+                'N' => "GridSwitchDriveN",
+                'O' => "GridSwitchDriveO",
+                'P' => "GridSwitchDriveP",
+                'Q' => "GridSwitchDriveQ",
+                'R' => "GridSwitchDriveR",
+                'S' => "GridSwitchDriveS",
+                'T' => "GridSwitchDriveT",
+                'U' => "GridSwitchDriveU",
+                'V' => "GridSwitchDriveV",
+                'W' => "GridSwitchDriveW",
+                'X' => "GridSwitchDriveX",
+                'Y' => "GridSwitchDriveY",
+                'Z' => "GridSwitchDriveZ",
+                _ => unreachable!("drive letter is constrained to C..=Z"),
+            };
+        }
         if let Some(slot) = self.pinned_tag_slot_number() {
             return match slot {
                 1 => "GridTogglePinnedTag1",
@@ -2765,6 +2913,7 @@ impl KeyAction {
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
+            GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
             GridFavoriteNext => "GridFavoriteNext",
             GridOpenFavorite1
@@ -2811,6 +2960,30 @@ impl KeyAction {
             | GridOpenDriveX
             | GridOpenDriveY
             | GridOpenDriveZ
+            | GridSwitchDriveC
+            | GridSwitchDriveD
+            | GridSwitchDriveE
+            | GridSwitchDriveF
+            | GridSwitchDriveG
+            | GridSwitchDriveH
+            | GridSwitchDriveI
+            | GridSwitchDriveJ
+            | GridSwitchDriveK
+            | GridSwitchDriveL
+            | GridSwitchDriveM
+            | GridSwitchDriveN
+            | GridSwitchDriveO
+            | GridSwitchDriveP
+            | GridSwitchDriveQ
+            | GridSwitchDriveR
+            | GridSwitchDriveS
+            | GridSwitchDriveT
+            | GridSwitchDriveU
+            | GridSwitchDriveV
+            | GridSwitchDriveW
+            | GridSwitchDriveX
+            | GridSwitchDriveY
+            | GridSwitchDriveZ
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
             | GridTogglePinnedTag3
@@ -3187,6 +3360,35 @@ impl KeyAction {
                 _ => unreachable!("drive letter is constrained to C..=Z"),
             };
         }
+        if let Some(letter) = self.switch_drive_letter() {
+            return match letter {
+                'C' => "C:の最後の場所へ切り替える",
+                'D' => "D:の最後の場所へ切り替える",
+                'E' => "E:の最後の場所へ切り替える",
+                'F' => "F:の最後の場所へ切り替える",
+                'G' => "G:の最後の場所へ切り替える",
+                'H' => "H:の最後の場所へ切り替える",
+                'I' => "I:の最後の場所へ切り替える",
+                'J' => "J:の最後の場所へ切り替える",
+                'K' => "K:の最後の場所へ切り替える",
+                'L' => "L:の最後の場所へ切り替える",
+                'M' => "M:の最後の場所へ切り替える",
+                'N' => "N:の最後の場所へ切り替える",
+                'O' => "O:の最後の場所へ切り替える",
+                'P' => "P:の最後の場所へ切り替える",
+                'Q' => "Q:の最後の場所へ切り替える",
+                'R' => "R:の最後の場所へ切り替える",
+                'S' => "S:の最後の場所へ切り替える",
+                'T' => "T:の最後の場所へ切り替える",
+                'U' => "U:の最後の場所へ切り替える",
+                'V' => "V:の最後の場所へ切り替える",
+                'W' => "W:の最後の場所へ切り替える",
+                'X' => "X:の最後の場所へ切り替える",
+                'Y' => "Y:の最後の場所へ切り替える",
+                'Z' => "Z:の最後の場所へ切り替える",
+                _ => unreachable!("drive letter is constrained to C..=Z"),
+            };
+        }
         if let Some(slot) = self.pinned_tag_slot_number() {
             return match slot {
                 1 => "ピン留めタグ1を付与/解除する",
@@ -3221,6 +3423,7 @@ impl KeyAction {
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
+            GridOpenCurrentDriveRoot => "現在位置のルートディレクトリを開く",
             GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -3265,6 +3468,30 @@ impl KeyAction {
             | GridOpenDriveX
             | GridOpenDriveY
             | GridOpenDriveZ
+            | GridSwitchDriveC
+            | GridSwitchDriveD
+            | GridSwitchDriveE
+            | GridSwitchDriveF
+            | GridSwitchDriveG
+            | GridSwitchDriveH
+            | GridSwitchDriveI
+            | GridSwitchDriveJ
+            | GridSwitchDriveK
+            | GridSwitchDriveL
+            | GridSwitchDriveM
+            | GridSwitchDriveN
+            | GridSwitchDriveO
+            | GridSwitchDriveP
+            | GridSwitchDriveQ
+            | GridSwitchDriveR
+            | GridSwitchDriveS
+            | GridSwitchDriveT
+            | GridSwitchDriveU
+            | GridSwitchDriveV
+            | GridSwitchDriveW
+            | GridSwitchDriveX
+            | GridSwitchDriveY
+            | GridSwitchDriveZ
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
             | GridTogglePinnedTag3
@@ -3633,6 +3860,31 @@ impl KeyAction {
             | GridOpenDriveX
             | GridOpenDriveY
             | GridOpenDriveZ
+            | GridOpenCurrentDriveRoot
+            | GridSwitchDriveC
+            | GridSwitchDriveD
+            | GridSwitchDriveE
+            | GridSwitchDriveF
+            | GridSwitchDriveG
+            | GridSwitchDriveH
+            | GridSwitchDriveI
+            | GridSwitchDriveJ
+            | GridSwitchDriveK
+            | GridSwitchDriveL
+            | GridSwitchDriveM
+            | GridSwitchDriveN
+            | GridSwitchDriveO
+            | GridSwitchDriveP
+            | GridSwitchDriveQ
+            | GridSwitchDriveR
+            | GridSwitchDriveS
+            | GridSwitchDriveT
+            | GridSwitchDriveU
+            | GridSwitchDriveV
+            | GridSwitchDriveW
+            | GridSwitchDriveX
+            | GridSwitchDriveY
+            | GridSwitchDriveZ
             | GridOpenLocationDriveList
             | GridOpenLocationReadingHistory
             | GridOpenLocationRating1
@@ -3958,6 +4210,31 @@ impl KeyAction {
             | GridOpenDriveX
             | GridOpenDriveY
             | GridOpenDriveZ
+            | GridOpenCurrentDriveRoot
+            | GridSwitchDriveC
+            | GridSwitchDriveD
+            | GridSwitchDriveE
+            | GridSwitchDriveF
+            | GridSwitchDriveG
+            | GridSwitchDriveH
+            | GridSwitchDriveI
+            | GridSwitchDriveJ
+            | GridSwitchDriveK
+            | GridSwitchDriveL
+            | GridSwitchDriveM
+            | GridSwitchDriveN
+            | GridSwitchDriveO
+            | GridSwitchDriveP
+            | GridSwitchDriveQ
+            | GridSwitchDriveR
+            | GridSwitchDriveS
+            | GridSwitchDriveT
+            | GridSwitchDriveU
+            | GridSwitchDriveV
+            | GridSwitchDriveW
+            | GridSwitchDriveX
+            | GridSwitchDriveY
+            | GridSwitchDriveZ
             | GridOpenLocationDriveList
             | GridOpenLocationReadingHistory
             | GridOpenLocationRating1
@@ -4318,6 +4595,31 @@ impl KeyAction {
             | GridOpenDriveX
             | GridOpenDriveY
             | GridOpenDriveZ
+            | GridOpenCurrentDriveRoot
+            | GridSwitchDriveC
+            | GridSwitchDriveD
+            | GridSwitchDriveE
+            | GridSwitchDriveF
+            | GridSwitchDriveG
+            | GridSwitchDriveH
+            | GridSwitchDriveI
+            | GridSwitchDriveJ
+            | GridSwitchDriveK
+            | GridSwitchDriveL
+            | GridSwitchDriveM
+            | GridSwitchDriveN
+            | GridSwitchDriveO
+            | GridSwitchDriveP
+            | GridSwitchDriveQ
+            | GridSwitchDriveR
+            | GridSwitchDriveS
+            | GridSwitchDriveT
+            | GridSwitchDriveU
+            | GridSwitchDriveV
+            | GridSwitchDriveW
+            | GridSwitchDriveX
+            | GridSwitchDriveY
+            | GridSwitchDriveZ
             | GridOpenLocationDriveList
             | GridOpenLocationReadingHistory
             | GridOpenLocationRating1
@@ -7321,6 +7623,16 @@ mod tests {
             KeyAction::drive_action('Z'),
             Some(KeyAction::GridOpenDriveZ)
         );
+        assert_eq!(KeyAction::GridSwitchDriveC.switch_drive_letter(), Some('C'));
+        assert_eq!(KeyAction::GridSwitchDriveZ.switch_drive_letter(), Some('Z'));
+        assert_eq!(
+            KeyAction::switch_drive_action('c'),
+            Some(KeyAction::GridSwitchDriveC)
+        );
+        assert_eq!(
+            KeyAction::switch_drive_action('Z'),
+            Some(KeyAction::GridSwitchDriveZ)
+        );
         assert_eq!(
             KeyAction::GridTogglePinnedTag1.pinned_tag_slot_number(),
             Some(1)
@@ -7355,6 +7667,8 @@ mod tests {
             r#"
             [Grid]
             GridOpenDriveC = Y
+            GridOpenCurrentDriveRoot = H
+            GridSwitchDriveD = I
             GridTogglePinnedTag1 = U
             "#,
         );
@@ -7366,6 +7680,22 @@ mod tests {
                 LOCATION_NAVIGATION_ACTIONS,
             ),
             Some(KeyAction::GridOpenDriveC)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::H),
+                GRID_ACTIVE_SCOPES,
+                LOCATION_NAVIGATION_ACTIONS,
+            ),
+            Some(KeyAction::GridOpenCurrentDriveRoot)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::I),
+                GRID_ACTIVE_SCOPES,
+                LOCATION_NAVIGATION_ACTIONS,
+            ),
+            Some(KeyAction::GridSwitchDriveD)
         );
         assert_eq!(
             keymap.resolve_first_action_for_chord(
@@ -8579,6 +8909,8 @@ mod tests {
             default_ini
                 .contains("# RatingContainerClear = Shift+F6 ; レーティングを解除する（コンテナ）")
         );
+        assert!(default_ini.contains("# GridOpenCurrentDriveRoot = none"));
+        assert!(default_ini.contains("# GridSwitchDriveD = none"));
         assert!(default_ini.contains("# GridToggleStackMode = none ; スタック表示を切り替える"));
         assert!(default_ini.contains("# FsSlideshow = S"));
         assert!(default_ini.contains("# TextRedo.1 = Ctrl+Y"));

@@ -3835,7 +3835,7 @@ impl App {
         if self.location_navigation_blocked() {
             return None;
         }
-        let path = std::path::PathBuf::from(format!("{}:\\", letter.to_ascii_uppercase()));
+        let path = super::drive_root_path_for_letter(letter)?;
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
             self.show_feedback_toast(format!("ドライブが見つかりません: {}", path.display()));
             return None;
@@ -3845,6 +3845,77 @@ impl App {
         }
         self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
         Some(AddressBarNav::Direct(resolved))
+    }
+
+    fn apply_current_drive_root(&mut self, source: &'static str) -> Option<AddressBarNav> {
+        if self.location_navigation_blocked() {
+            return None;
+        }
+        let Some(path) = self.current_location_root() else {
+            self.show_feedback_toast("現在位置のルートディレクトリが見つかりません".to_string());
+            return None;
+        };
+        let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
+            self.show_feedback_toast(format!(
+                "ルートディレクトリが見つかりません: {}",
+                path.display()
+            ));
+            return None;
+        };
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        self.bump_input_seq(
+            source,
+            Some(&format!("current_drive_root={}", path.display())),
+        );
+        Some(AddressBarNav::Direct(resolved))
+    }
+
+    fn apply_switch_drive_letter(
+        &mut self,
+        letter: char,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.location_navigation_blocked() {
+            return None;
+        }
+        let root = super::drive_root_path_for_letter(letter)?;
+        let drive_key = super::drive_current_key_for_letter(letter)?;
+        let remembered = self.active_drive_current_dir(letter);
+        let remembered_resolved = remembered.as_ref().and_then(|path| {
+            let resolved = crate::folder_tree::resolve_openable_path(path)?;
+            (super::drive_current_key_for_path(&resolved) == Some(drive_key.clone()))
+                .then_some(resolved)
+        });
+        let target = if let Some(path) = remembered_resolved {
+            path
+        } else {
+            if let Some(path) = remembered.as_ref() {
+                self.show_feedback_toast(format!(
+                    "{} の最後の場所が見つかりません。ルートへ移動します: {}",
+                    drive_key,
+                    path.display()
+                ));
+            }
+            let Some(resolved_root) = crate::folder_tree::resolve_openable_path(&root) else {
+                self.show_feedback_toast(format!("ドライブが見つかりません: {}", root.display()));
+                return None;
+            };
+            resolved_root
+        };
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        self.bump_input_seq(
+            source,
+            Some(&format!(
+                "switch_drive={} target={}",
+                drive_key,
+                target.display()
+            )),
+        );
+        Some(AddressBarNav::Direct(target))
     }
 
     fn apply_ring_location_action(
@@ -3895,6 +3966,12 @@ impl App {
         }
         if let Some(letter) = action.drive_letter() {
             return self.apply_ring_drive_letter(letter, source);
+        }
+        if action == KeyAction::GridOpenCurrentDriveRoot {
+            return self.apply_current_drive_root(source);
+        }
+        if let Some(letter) = action.switch_drive_letter() {
+            return self.apply_switch_drive_letter(letter, source);
         }
         if let Some(ring_action) = ring_location_action_for_key_action(action) {
             return self.apply_ring_location_action(ctx, &ring_action, source);

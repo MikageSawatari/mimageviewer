@@ -93,6 +93,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
     記憶済みの場所があればそこへ移動し、未訪問ならドライブ一覧を表示する。
   - 作業場所を開いた後のフォルダ / ZIP / PDF / 変換済みアーカイブ移動は、
     アクティブな A/B の「最後に見た場所」として自動保存する。
+    同時に、`C:` / `D:` などドライブ別の最後の場所も A/B 別に保存し、
+    操作カスタマイズで割り当てた `GridSwitchDriveC..Z` から呼び戻せる。
   - A/B 間の切り替え自体はフォルダ履歴に積まない。← / → 履歴ボタンは
     アクティブなスロットごとの戻る / 進む履歴を操作し、A で進んだ履歴と B で
     進んだ履歴は混ざらない。
@@ -706,7 +708,8 @@ popup の shortcut 表記も実割り当てに追従する。複数 chord を
 native 動画 overlay の top bar / bottom HUD /
 jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は実割り当てに追従する。
 グリッドの Backspace 親フォルダ移動、グリッド / フルスクリーンの F11 系ウィンドウ切り替え、
-お気に入りの前後移動・1〜20 番、`C:\`〜`Z:\`、場所▼で開ける固定項目も
+お気に入りの前後移動・1〜20 番、現在位置のルートディレクトリ、`C:\`〜`Z:\`、
+`C:`〜`Z:` の最後の場所への切り替え、場所▼で開ける固定項目も
 keymap 対象にする。ピン留めタグ 1〜20 番の付与/解除も、標準キーなしのサムネイル一覧コマンドとして割り当てできる。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、
 Ctrl+ホイールなど固定扱いの入力は従来どおり。
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
@@ -1049,6 +1052,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を読書履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 読書履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
+| `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
 | `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進むボタンの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |

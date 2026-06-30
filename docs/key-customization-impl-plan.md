@@ -475,7 +475,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   ToggleDetachedViewerMode `F12` (P) / HelpShowContextShortcuts `?` (P)
   - 検索・フォルダを開く系は dialog / address / search focus / fullscreen 中は既存ガードで無効化される。
   - ToggleDetachedViewerMode は dialog / text focus / IME 変換中 / 静止画 fullscreen 編集サブモードでは抑止し、fullscreen / native 動画では明示 consume する Global action。
-  - GridFavoritePrev/Next、GridOpenFavorite1..20、GridOpenDriveC..Z、
+  - GridFavoritePrev/Next、GridOpenFavorite1..20、GridOpenCurrentDriveRoot、
+    GridOpenDriveC..Z、GridSwitchDriveC..Z、
     GridOpenLocation*、GridTogglePinnedTag1..20 は既定未割り当て。設定名も `Grid...` に揃え、
     サムネイル一覧 (`Grid`) の一発操作として扱う。操作カスタマイズでキーを
     割り当てると、グリッド表示中に場所移動またはピン留めタグの付与/解除を実行する。

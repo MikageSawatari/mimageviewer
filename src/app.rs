@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -116,6 +116,8 @@ pub(crate) struct QuickFolderWorkspace {
     /// このスロットで最近開いたフォルダ一覧 (MRU)。スロットごとに独立し、
     /// 「履歴▼」メニューに表示される。`quick_folder_recent_folders` に永続化される。
     pub recent_folders: Vec<PathBuf>,
+    /// このスロットで最後に開いたドライブ別の場所。キーは `"C:"` のような大文字表記。
+    pub drive_current_dirs: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2780,6 +2782,59 @@ pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
         || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
         || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
         || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
+}
+
+pub(crate) fn drive_root_path_for_letter(letter: char) -> Option<PathBuf> {
+    let upper = letter.to_ascii_uppercase();
+    if !upper.is_ascii_uppercase() {
+        return None;
+    }
+    Some(PathBuf::from(format!("{upper}:\\")))
+}
+
+pub(crate) fn drive_current_key_for_letter(letter: char) -> Option<String> {
+    let upper = letter.to_ascii_uppercase();
+    if !upper.is_ascii_uppercase() {
+        return None;
+    }
+    Some(format!("{upper}:"))
+}
+
+pub(crate) fn drive_current_key_for_path(path: &Path) -> Option<String> {
+    let mut components = path.components();
+    let std::path::Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    match prefix.kind() {
+        std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+            drive_current_key_for_letter(letter as char)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn location_root_for_path(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    match components.next()? {
+        std::path::Component::Prefix(prefix) => match prefix.kind() {
+            std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+                drive_root_path_for_letter(letter as char)
+            }
+            std::path::Prefix::UNC(server, share) => Some(PathBuf::from(format!(
+                "\\\\{}\\{}\\",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ))),
+            std::path::Prefix::VerbatimUNC(server, share) => Some(PathBuf::from(format!(
+                "\\\\?\\UNC\\{}\\{}\\",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ))),
+            _ => None,
+        },
+        std::path::Component::RootDir => Some(PathBuf::from(std::path::MAIN_SEPARATOR.to_string())),
+        _ => None,
+    }
 }
 
 /// サムネイル色調補正の対象アイテムかどうか。
@@ -6055,6 +6110,7 @@ impl App {
                 target: settings.quick_folder_slots[idx].clone(),
                 history: FolderNavHistoryState::default(),
                 recent_folders: slot_recent,
+                drive_current_dirs: settings.quick_folder_drive_current_dirs[idx].clone(),
             }
         });
         let keymap = if cfg!(test) {
@@ -8321,6 +8377,18 @@ impl App {
             .or_else(|| self.current_folder.clone())
     }
 
+    pub(crate) fn current_location_root(&self) -> Option<PathBuf> {
+        location_root_for_path(&self.effective_folder()?)
+    }
+
+    pub(crate) fn active_drive_current_dir(&self, letter: char) -> Option<PathBuf> {
+        let key = drive_current_key_for_letter(letter)?;
+        self.active_quick_folder_workspace()?
+            .drive_current_dirs
+            .get(&key)
+            .cloned()
+    }
+
     /// アイテムの UI 表示用フルパス。変換キャッシュ閲覧中 (`archive_source_override`)
     /// は ZIP 内アイテムのコンテナ部分をユーザー視点の元アーカイブパスへ置き換える。
     #[cfg(test)]
@@ -8668,6 +8736,8 @@ impl App {
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
         self.settings.quick_folder_recent_folders =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].recent_folders.clone());
+        self.settings.quick_folder_drive_current_dirs =
+            std::array::from_fn(|idx| self.quick_folder_workspaces[idx].drive_current_dirs.clone());
         // 後方互換: 旧 `recent_folders` には主スロット A の一覧を残す
         // (旧バージョンへダウングレードしても最近フォルダが空にならないように)。
         self.settings.recent_folders = self.quick_folder_workspaces[QuickFolderSlotId::A.index()]
@@ -8728,7 +8798,11 @@ impl App {
         slot: QuickFolderSlotId,
         target: PathBuf,
     ) {
-        self.quick_folder_workspaces[slot.index()].target = Some(target);
+        let workspace = &mut self.quick_folder_workspaces[slot.index()];
+        workspace.target = Some(target.clone());
+        if let Some(key) = drive_current_key_for_path(&target) {
+            workspace.drive_current_dirs.insert(key, target);
+        }
         self.active_quick_folder_slot = Some(slot);
         self.sync_quick_folder_settings();
     }
@@ -8738,6 +8812,7 @@ impl App {
         let workspace = &mut self.quick_folder_workspaces[slot.index()];
         workspace.target = None;
         workspace.history = FolderNavHistoryState::default();
+        workspace.drive_current_dirs.clear();
         self.sync_quick_folder_settings();
     }
 
@@ -8776,7 +8851,13 @@ impl App {
 
     pub(crate) fn update_active_quick_folder_target(&mut self, target: &Path) {
         if let Some(slot) = self.active_quick_folder_slot {
-            self.quick_folder_workspaces[slot.index()].target = Some(target.to_path_buf());
+            let workspace = &mut self.quick_folder_workspaces[slot.index()];
+            workspace.target = Some(target.to_path_buf());
+            if let Some(key) = drive_current_key_for_path(target) {
+                workspace
+                    .drive_current_dirs
+                    .insert(key, target.to_path_buf());
+            }
             self.sync_quick_folder_settings();
         }
     }
