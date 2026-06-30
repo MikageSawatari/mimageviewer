@@ -4007,6 +4007,8 @@ dependencies = [
  "egui",
  "music-core",
  "rfd",
+ "serde",
+ "serde_json",
  "symphonia",
 ]
 
