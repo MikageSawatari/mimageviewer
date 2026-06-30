@@ -51,7 +51,7 @@ const TIMELINE_KEY_TEMPERLEY_MINOR_PROFILE: [f32; 12] =
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
-const TIMELINE_ROW_RASTER_BUDGET_PER_FRAME: usize = 1;
+const TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME: usize = 1;
 const TIMELINE_ROW_SECS_CHOICES: [f64; 8] = [5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
@@ -187,7 +187,7 @@ fn app_panel_frame() -> egui::Frame {
 struct LoadedTrack {
     path: PathBuf,
     decoded: Arc<DecodedAudio>,
-    analysis: TimelineAnalysis,
+    analysis: Arc<TimelineAnalysis>,
 }
 
 #[derive(Clone, Debug)]
@@ -395,12 +395,23 @@ impl PerfLogSink {
 struct TimelineTextureCache {
     key: Option<TimelineTextureCacheKey>,
     rows: Vec<Option<TimelineRowTexture>>,
+    pending: Vec<Option<TimelinePendingRow>>,
+    generation: u64,
+    raster_tx: Option<mpsc::Sender<TimelineRasterRequest>>,
+    raster_rx: Option<mpsc::Receiver<TimelineRasterResult>>,
+    raster_cancel: Option<Arc<AtomicBool>>,
 }
 
 struct TimelineRowTexture {
     key: TimelineTextureCacheKey,
     texture: egui::TextureHandle,
     represented_bins: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelinePendingRow {
+    key: TimelineTextureCacheKey,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -415,70 +426,166 @@ struct TimelineTextureCacheKey {
     dark: bool,
 }
 
+struct TimelineRasterRequest {
+    generation: u64,
+    row: usize,
+    row_secs: f64,
+    key: TimelineTextureCacheKey,
+    analysis: Arc<TimelineAnalysis>,
+}
+
+struct TimelineRasterResult {
+    generation: u64,
+    row: usize,
+    key: TimelineTextureCacheKey,
+    image: egui::ColorImage,
+    represented_bins: usize,
+}
+
 impl TimelineTextureCache {
     fn clear(&mut self) {
+        self.cancel_worker();
         self.key = None;
         self.rows.clear();
+        self.pending.clear();
     }
 
     fn ensure(&mut self, key: TimelineTextureCacheKey) {
         if self.key == Some(key) {
             return;
         }
+        self.cancel_worker();
+        self.generation = self.generation.wrapping_add(1);
         self.key = Some(key);
+        self.rows.clear();
         self.rows.resize_with(key.rows, || None);
-        self.rows.truncate(key.rows);
+        self.pending.clear();
+        self.pending.resize_with(key.rows, || None);
+        self.spawn_worker();
+    }
+
+    fn cancel_worker(&mut self) {
+        if let Some(cancel) = self.raster_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.raster_tx = None;
+        self.raster_rx = None;
+    }
+
+    fn spawn_worker(&mut self) {
+        let (request_tx, request_rx) = mpsc::channel::<TimelineRasterRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<TimelineRasterResult>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let spawned = std::thread::Builder::new()
+            .name("music-lab-timeline-raster".into())
+            .spawn(move || run_timeline_raster_worker(request_rx, result_tx, worker_cancel));
+        if spawned.is_ok() {
+            self.raster_tx = Some(request_tx);
+            self.raster_rx = Some(result_rx);
+            self.raster_cancel = Some(cancel);
+        }
+    }
+
+    fn poll_finished_rows(&mut self, ctx: &egui::Context, upload_budget: usize) -> (usize, usize) {
+        let Some(rx) = self.raster_rx.as_ref() else {
+            return (0, 0);
+        };
+        let mut uploaded = 0;
+        let mut represented_bins = 0;
+        while uploaded < upload_budget {
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.raster_tx = None;
+                    self.raster_rx = None;
+                    self.raster_cancel = None;
+                    break;
+                }
+            };
+            if Some(result.key) != self.key || result.generation != self.generation {
+                continue;
+            }
+            let Some(slot) = self.rows.get_mut(result.row) else {
+                continue;
+            };
+            if let Some(pending) = self.pending.get_mut(result.row) {
+                *pending = None;
+            }
+            if slot
+                .as_ref()
+                .is_some_and(|row_texture| row_texture.key == result.key)
+            {
+                continue;
+            }
+            let texture = ctx.load_texture(
+                format!(
+                    "music_timeline_row_{}_{}_{}x{}_{}",
+                    result.generation,
+                    result.row,
+                    result.key.width_px,
+                    result.key.height_px(),
+                    result.key.dark as u8
+                ),
+                result.image,
+                egui::TextureOptions::LINEAR,
+            );
+            *slot = Some(TimelineRowTexture {
+                key: result.key,
+                texture,
+                represented_bins: result.represented_bins,
+            });
+            uploaded += 1;
+            represented_bins += result.represented_bins;
+        }
+        (uploaded, represented_bins)
     }
 
     fn row_texture(
         &mut self,
-        ctx: &egui::Context,
-        track: &LoadedTrack,
+        analysis: Arc<TimelineAnalysis>,
         row: usize,
         row_secs: f64,
         key: TimelineTextureCacheKey,
-        raster_budget: &mut usize,
-    ) -> Option<(&egui::TextureHandle, usize, bool)> {
+    ) -> (Option<(&egui::TextureHandle, usize)>, bool) {
         self.ensure(key);
         if row >= self.rows.len() {
-            return None;
+            return (None, false);
         }
-        let mut cache_miss = false;
         let stale = self.rows[row]
             .as_ref()
             .is_some_and(|row_texture| row_texture.key != key);
-        if (self.rows[row].is_none() || stale) && *raster_budget > 0 {
-            *raster_budget -= 1;
-            let row_start = row as f64 * row_secs;
-            let (image, represented_bins) = render_timeline_row_image(
-                row_start,
-                row_secs,
-                &track.analysis.bins,
-                key.width_px,
-                key.waveform_h_px,
-                key.gap_px,
-                key.metrics_h_px,
-                key.dark,
-            );
-            let texture = ctx.load_texture(
-                format!(
-                    "music_timeline_row_{row}_{}x{}_{}",
-                    key.width_px,
-                    key.height_px(),
-                    key.dark as u8
-                ),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.rows[row] = Some(TimelineRowTexture {
-                key,
-                texture,
-                represented_bins,
-            });
-            cache_miss = true;
+        let missing = self.rows[row].is_none() || stale;
+        let mut request_sent = false;
+        if missing {
+            let pending_current = self.pending[row]
+                .is_some_and(|pending| pending.key == key && pending.generation == self.generation);
+            if !pending_current && let Some(tx) = self.raster_tx.as_ref() {
+                let request = TimelineRasterRequest {
+                    generation: self.generation,
+                    row,
+                    row_secs,
+                    key,
+                    analysis,
+                };
+                if tx.send(request).is_ok() {
+                    self.pending[row] = Some(TimelinePendingRow {
+                        key,
+                        generation: self.generation,
+                    });
+                    request_sent = true;
+                }
+            }
         }
-        let row = self.rows[row].as_ref()?;
-        Some((&row.texture, row.represented_bins, cache_miss))
+        let Some(row) = self.rows[row].as_ref() else {
+            return (None, request_sent);
+        };
+        if row.key == key {
+            (Some((&row.texture, row.represented_bins)), request_sent)
+        } else {
+            (None, request_sent)
+        }
     }
 
     fn row_is_fresh(&self, row: usize, key: TimelineTextureCacheKey) -> bool {
@@ -486,6 +593,54 @@ impl TimelineTextureCache {
             .get(row)
             .and_then(Option::as_ref)
             .is_some_and(|row_texture| row_texture.key == key)
+    }
+}
+
+impl Drop for TimelineTextureCache {
+    fn drop(&mut self) {
+        self.cancel_worker();
+    }
+}
+
+fn run_timeline_raster_worker(
+    request_rx: mpsc::Receiver<TimelineRasterRequest>,
+    result_tx: mpsc::Sender<TimelineRasterResult>,
+    cancel: Arc<AtomicBool>,
+) {
+    while !cancel.load(Ordering::Relaxed) {
+        let request = match request_rx.recv() {
+            Ok(request) => request,
+            Err(_) => break,
+        };
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let row_start = request.row as f64 * request.row_secs;
+        let (image, represented_bins) = render_timeline_row_image(
+            row_start,
+            request.row_secs,
+            &request.analysis.bins,
+            request.key.width_px,
+            request.key.waveform_h_px,
+            request.key.gap_px,
+            request.key.metrics_h_px,
+            request.key.dark,
+        );
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if result_tx
+            .send(TimelineRasterResult {
+                generation: request.generation,
+                row: request.row,
+                key: request.key,
+                image,
+                represented_bins,
+            })
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -958,7 +1113,7 @@ impl MusicLabApp {
                             LoadMsg::Loaded(Box::new(LoadedTrack {
                                 path: load_path,
                                 decoded: Arc::new(decoded),
-                                analysis,
+                                analysis: Arc::new(analysis),
                             }))
                         }
                         Err(err) => {
@@ -1250,6 +1405,10 @@ fn draw_timeline(
         dark: true,
     };
     cache.ensure(texture_key);
+    let (uploaded_rows, uploaded_bins) =
+        cache.poll_finished_rows(ui.ctx(), TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME);
+    stats.cache_misses += uploaded_rows;
+    stats.drawn_bins += uploaded_bins;
 
     let clip_rect = ui.clip_rect();
     if timeline_manual_scroll_requested(ui, &response, clip_rect) {
@@ -1273,7 +1432,6 @@ fn draw_timeline(
         }
     }
 
-    let mut raster_budget = TIMELINE_ROW_RASTER_BUDGET_PER_FRAME;
     let mut pending_raster = false;
     for row in 0..rows {
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
@@ -1290,24 +1448,18 @@ fn draw_timeline(
         if !fresh_before {
             pending_raster = true;
         }
-        if let Some((texture, represented_bins, cache_miss)) = cache.row_texture(
-            ui.ctx(),
-            track,
-            row,
-            row_secs,
-            texture_key,
-            &mut raster_budget,
-        ) {
+        let (row_texture, request_sent) =
+            cache.row_texture(Arc::clone(&track.analysis), row, row_secs, texture_key);
+        if request_sent {
+            pending_raster = true;
+        }
+        if let Some((texture, _represented_bins)) = row_texture {
             painter.image(
                 texture.id(),
                 row_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-            if cache_miss {
-                stats.cache_misses += 1;
-                stats.drawn_bins += represented_bins;
-            }
         }
         painter.text(
             egui::pos2(rect.min.x + 8.0, row_rect.center().y),
