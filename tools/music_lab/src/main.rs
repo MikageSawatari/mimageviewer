@@ -21,8 +21,13 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 const TIMELINE_WAVEFORM_H: f32 = 68.0;
-const TIMELINE_METRICS_H: f32 = 56.0;
-const TIMELINE_METRIC_LANE_COUNT: usize = 7;
+const TIMELINE_METRICS_H: f32 = 44.0;
+const TIMELINE_METRIC_LANE_COUNT: usize = 2;
+const TIMELINE_LOUDNESS_ROOT_LANE_FRACTION: f32 = 0.76;
+const TIMELINE_ROOT_MIN_SEGMENT_SECS: f64 = 0.050;
+const TIMELINE_ROOT_MAX_SEGMENT_SECS: f64 = 0.100;
+const TIMELINE_ROOT_TRANSIENT_THRESHOLD: f32 = 0.16;
+const TIMELINE_KEY_WINDOW_SECS: f64 = 6.0;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
@@ -1002,23 +1007,13 @@ struct TimelineDrawStats {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimelineMetricKind {
-    Loudness,
-    BassRoot,
-    Brightness,
-    DrumDensity,
+    LoudnessBassRoot,
     Key,
-    Change,
-    Vocal,
 }
 
 const TIMELINE_METRIC_KINDS: [TimelineMetricKind; TIMELINE_METRIC_LANE_COUNT] = [
-    TimelineMetricKind::Loudness,
-    TimelineMetricKind::BassRoot,
+    TimelineMetricKind::LoudnessBassRoot,
     TimelineMetricKind::Key,
-    TimelineMetricKind::Brightness,
-    TimelineMetricKind::DrumDensity,
-    TimelineMetricKind::Change,
-    TimelineMetricKind::Vocal,
 ];
 
 fn draw_timeline(
@@ -1252,10 +1247,9 @@ fn draw_timeline_metric_hover(
         return;
     }
 
-    let lane_h = metrics_rect.height() / TIMELINE_METRIC_KINDS.len() as f32;
-    let lane_idx = ((pos.y - metrics_rect.top()) / lane_h)
-        .floor()
-        .clamp(0.0, (TIMELINE_METRIC_KINDS.len() - 1) as f32) as usize;
+    let loudness_bottom =
+        metrics_rect.top() + metrics_rect.height() * TIMELINE_LOUDNESS_ROOT_LANE_FRACTION;
+    let lane_idx = if pos.y < loudness_bottom { 0 } else { 1 };
     let kind = TIMELINE_METRIC_KINDS[lane_idx];
     let row_start = row as f64 * row_secs;
     let frac = ((pos.x - graph_rect.left()) / graph_rect.width()).clamp(0.0, 1.0);
@@ -1263,17 +1257,13 @@ fn draw_timeline_metric_hover(
     let Some(bin) = timeline_bin_at_time(bins, time_secs) else {
         return;
     };
-    let value = timeline_metric_value(kind, bin).clamp(0.0, 1.0);
+    let value = timeline_metric_hover_value(kind, bins, bin, time_secs).clamp(0.0, 1.0);
     let x = graph_rect.left() + frac * graph_rect.width();
+    let (lane_top, lane_bottom) =
+        timeline_metric_lane_bounds_f32(metrics_rect.top(), metrics_rect.height(), lane_idx);
     let lane_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            metrics_rect.left(),
-            metrics_rect.top() + lane_idx as f32 * lane_h,
-        ),
-        egui::pos2(
-            metrics_rect.right(),
-            metrics_rect.top() + ((lane_idx + 1) as f32 * lane_h).min(metrics_rect.height()),
-        ),
+        egui::pos2(metrics_rect.left(), lane_top),
+        egui::pos2(metrics_rect.right(), lane_bottom),
     );
     painter.rect_stroke(
         lane_rect,
@@ -1298,7 +1288,7 @@ fn draw_timeline_metric_hover(
     let label = format!(
         "{}{} {:.0}%  {}  {}",
         timeline_metric_name(kind),
-        timeline_metric_extra(kind, bin),
+        timeline_metric_extra(kind, bins, bin, time_secs),
         value * 100.0,
         format_time(time_secs),
         timeline_metric_description(kind)
@@ -1403,19 +1393,28 @@ fn render_timeline_row_image(
     );
 
     let mut drawn_bins = 0;
-    for bin in bins {
+    let mut visible_bins = Vec::new();
+    for (index, bin) in bins.iter().enumerate() {
         let bin_end = bin.start_secs + bin.duration_secs;
         if bin_end < row_start || bin.start_secs > row_start + row_secs {
             continue;
         }
-        drawn_bins += 1;
         let visible_start = bin.start_secs.max(row_start);
         let visible_end = bin_end.min(row_start + row_secs);
-
         let x0 = ((visible_start - row_start) / row_secs) as f32 * width as f32;
         let x1 = (((visible_end - row_start) / row_secs) as f32 * width as f32)
             .max(x0 + 1.0)
             .min(width as f32);
+        visible_bins.push(TimelineVisibleBin { index, x0, x1 });
+    }
+
+    let rhythm_segments = build_timeline_rhythm_segments(bins, &visible_bins);
+    let bass_hints = build_bass_root_display_hints(bins, &visible_bins, &rhythm_segments);
+    let key_hints = build_key_display_hints(bins, &visible_bins, &rhythm_segments);
+
+    for (visible_idx, visible) in visible_bins.iter().copied().enumerate() {
+        let bin = &bins[visible.index];
+        drawn_bins += 1;
         let amp = (bin.peak.max(bin.rms * 2.0)).sqrt().clamp(0.025, 1.0);
         let outer_half_h = (waveform_h as f32 * 0.46 * amp).max(1.0);
         let core_scale = 0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45;
@@ -1425,8 +1424,8 @@ fn render_timeline_row_image(
             width,
             height,
             center_y,
-            x0,
-            x1,
+            visible.x0,
+            visible.x1,
             outer_half_h,
             core_half_h,
             bin.band_energy,
@@ -1436,8 +1435,9 @@ fn render_timeline_row_image(
                 .sqrt()
                 .clamp(0.0, 1.0);
             let accent_half_h = waveform_h as f32 * (0.12 + transient * 0.22);
-            let accent_center = ((x0 + x1) * 0.5).clamp(0.0, width as f32);
-            let accent_half_w = ((x1 - x0).max(1.5) * (0.30 + transient * 0.45)).min(6.0);
+            let accent_center = ((visible.x0 + visible.x1) * 0.5).clamp(0.0, width as f32);
+            let accent_half_w =
+                ((visible.x1 - visible.x0).max(1.5) * (0.30 + transient * 0.45)).min(6.0);
             let accent = transient_color(bin.transient_band, transient);
             fill_rect_f32(
                 &mut pixels,
@@ -1470,9 +1470,11 @@ fn render_timeline_row_image(
             height,
             metrics_top,
             metrics_h,
-            x0,
-            x1,
+            visible.x0,
+            visible.x1,
             bin,
+            bass_hints[visible_idx],
+            key_hints[visible_idx],
         );
     }
 
@@ -1500,6 +1502,170 @@ fn render_timeline_row_image(
     (egui::ColorImage::new([width, height], pixels), drawn_bins)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TimelineVisibleBin {
+    index: usize,
+    x0: f32,
+    x1: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TimelinePitchHint {
+    pitch_class: u8,
+    confidence: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineRhythmSegment {
+    start: usize,
+    end: usize,
+}
+
+fn build_timeline_rhythm_segments(
+    bins: &[WaveformBin],
+    visible_bins: &[TimelineVisibleBin],
+) -> Vec<TimelineRhythmSegment> {
+    let mut segments = Vec::new();
+    if visible_bins.is_empty() {
+        return segments;
+    }
+
+    let bin_secs = bins[visible_bins[0].index].duration_secs.max(0.005);
+    let min_bins = (TIMELINE_ROOT_MIN_SEGMENT_SECS / bin_secs).ceil().max(1.0) as usize;
+    let max_bins = (TIMELINE_ROOT_MAX_SEGMENT_SECS / bin_secs)
+        .ceil()
+        .max(min_bins as f64) as usize;
+
+    let mut start = 0usize;
+    while start < visible_bins.len() {
+        let min_end = (start + min_bins).min(visible_bins.len());
+        let max_end = (start + max_bins).min(visible_bins.len());
+        let mut end = max_end.max(start + 1).min(visible_bins.len());
+
+        if min_end < max_end {
+            let mut best_idx = None;
+            let mut best_score = TIMELINE_ROOT_TRANSIENT_THRESHOLD;
+            for idx in min_end..max_end {
+                let bin = &bins[visible_bins[idx].index];
+                let score =
+                    bin.transient * (0.55 + normalize_range(bin.band_energy[0], 0.05, 0.45) * 0.45);
+                if score > best_score {
+                    best_score = score;
+                    best_idx = Some(idx);
+                }
+            }
+            if let Some(idx) = best_idx {
+                end = (idx + 1).max(start + 1);
+            }
+        }
+
+        segments.push(TimelineRhythmSegment { start, end });
+        start = end;
+    }
+
+    segments
+}
+
+fn build_bass_root_display_hints(
+    bins: &[WaveformBin],
+    visible_bins: &[TimelineVisibleBin],
+    rhythm_segments: &[TimelineRhythmSegment],
+) -> Vec<TimelinePitchHint> {
+    let mut hints = vec![TimelinePitchHint::default(); visible_bins.len()];
+    for segment in rhythm_segments {
+        let hint = vote_bass_root_hint(bins, &visible_bins[segment.start..segment.end]);
+        for slot in &mut hints[segment.start..segment.end] {
+            *slot = hint;
+        }
+    }
+
+    hints
+}
+
+fn build_key_display_hints(
+    bins: &[WaveformBin],
+    visible_bins: &[TimelineVisibleBin],
+    rhythm_segments: &[TimelineRhythmSegment],
+) -> Vec<TimelinePitchHint> {
+    let mut hints = vec![TimelinePitchHint::default(); visible_bins.len()];
+    for segment in rhythm_segments {
+        if segment.start >= segment.end {
+            continue;
+        }
+        let center_visible = &visible_bins[(segment.start + segment.end - 1) / 2];
+        let center_bin = &bins[center_visible.index];
+        let center_secs = center_bin.start_secs + center_bin.duration_secs * 0.5;
+        let window_start = center_secs - TIMELINE_KEY_WINDOW_SECS * 0.5;
+        let window_end = center_secs + TIMELINE_KEY_WINDOW_SECS * 0.5;
+        let start_idx =
+            bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
+        let end_idx = bins.partition_point(|bin| bin.start_secs < window_end);
+        let hint = vote_key_hint(&bins[start_idx..end_idx]);
+        for slot in &mut hints[segment.start..segment.end] {
+            *slot = hint;
+        }
+    }
+
+    hints
+}
+
+fn vote_bass_root_hint(
+    bins: &[WaveformBin],
+    visible_bins: &[TimelineVisibleBin],
+) -> TimelinePitchHint {
+    let mut votes = [0.0_f32; 12];
+    let mut count = 0usize;
+    for visible in visible_bins {
+        let bin = &bins[visible.index];
+        let weight = timeline_metric_value(TimelineMetricKind::LoudnessBassRoot, bin).powi(2);
+        votes[bin.bass_pitch_class as usize % 12] += weight;
+        count += 1;
+    }
+    best_pitch_hint(votes, count)
+}
+
+fn vote_key_hint(bins: &[WaveformBin]) -> TimelinePitchHint {
+    let mut votes = [0.0_f32; 12];
+    for bin in bins {
+        let weight = (bin.key_confidence * timeline_loudness_value(bin).powf(0.72)).clamp(0.0, 1.0);
+        votes[bin.key_pitch_class as usize % 12] += weight;
+    }
+    best_pitch_hint(votes, bins.len())
+}
+
+fn key_hint_at_time(bins: &[WaveformBin], time_secs: f64) -> TimelinePitchHint {
+    if bins.is_empty() || !time_secs.is_finite() {
+        return TimelinePitchHint::default();
+    }
+    let window_start = time_secs - TIMELINE_KEY_WINDOW_SECS * 0.5;
+    let window_end = time_secs + TIMELINE_KEY_WINDOW_SECS * 0.5;
+    let start_idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
+    let end_idx = bins.partition_point(|bin| bin.start_secs < window_end);
+    vote_key_hint(&bins[start_idx..end_idx])
+}
+
+fn best_pitch_hint(votes: [f32; 12], count: usize) -> TimelinePitchHint {
+    let mut best_idx = 0usize;
+    let mut best = 0.0_f32;
+    let mut sum = 0.0_f32;
+    for (idx, value) in votes.iter().copied().enumerate() {
+        sum += value;
+        if value > best {
+            best = value;
+            best_idx = idx;
+        }
+    }
+    if sum <= 1.0e-6 || count == 0 {
+        return TimelinePitchHint::default();
+    }
+    let dominance = (best / sum).clamp(0.0, 1.0);
+    let support = (best / count as f32).sqrt().clamp(0.0, 1.0);
+    TimelinePitchHint {
+        pitch_class: best_idx as u8,
+        confidence: (support * (0.42 + dominance * 0.58)).clamp(0.0, 1.0),
+    }
+}
+
 fn draw_timeline_metric_bins(
     pixels: &mut [egui::Color32],
     width: usize,
@@ -1509,24 +1675,19 @@ fn draw_timeline_metric_bins(
     x0: f32,
     x1: f32,
     bin: &WaveformBin,
+    bass_hint: TimelinePitchHint,
+    key_hint: TimelinePitchHint,
 ) {
     if metrics_h == 0 {
         return;
     }
-    let lane_h = metrics_h as f32 / TIMELINE_METRIC_KINDS.len() as f32;
     for (idx, kind) in TIMELINE_METRIC_KINDS.into_iter().enumerate() {
-        let top = metrics_top as f32 + idx as f32 * lane_h;
-        let bottom = if idx + 1 == TIMELINE_METRIC_KINDS.len() {
-            (metrics_top + metrics_h) as f32
-        } else {
-            metrics_top as f32 + (idx + 1) as f32 * lane_h
-        };
+        let (top, bottom) = timeline_metric_lane_bounds(metrics_top, metrics_h, idx);
         let lane_bottom = bottom - 0.6;
         let lane_top = top + 0.6;
         let available_h = (lane_bottom - lane_top).max(1.0);
-        let value = timeline_metric_value(kind, bin).clamp(0.0, 1.0);
-        let full_pitch_lane =
-            matches!(kind, TimelineMetricKind::BassRoot | TimelineMetricKind::Key) && value > 0.03;
+        let value = timeline_metric_display_value(kind, bin, bass_hint, key_hint).clamp(0.0, 1.0);
+        let full_pitch_lane = matches!(kind, TimelineMetricKind::Key) && value > 0.03;
         let bar_top = if full_pitch_lane {
             lane_top
         } else {
@@ -1540,7 +1701,7 @@ fn draw_timeline_metric_bins(
             bar_top,
             x1,
             lane_bottom,
-            timeline_metric_color(kind, value, bin),
+            timeline_metric_color(kind, value, bin, bass_hint, key_hint),
         );
         if idx > 0 {
             fill_rect_f32(
@@ -1557,21 +1718,65 @@ fn draw_timeline_metric_bins(
     }
 }
 
+fn timeline_metric_lane_bounds(
+    metrics_top: usize,
+    metrics_h: usize,
+    lane_idx: usize,
+) -> (f32, f32) {
+    timeline_metric_lane_bounds_f32(metrics_top as f32, metrics_h as f32, lane_idx)
+}
+
+fn timeline_metric_lane_bounds_f32(
+    metrics_top: f32,
+    metrics_h: f32,
+    lane_idx: usize,
+) -> (f32, f32) {
+    let top = metrics_top;
+    let bottom = metrics_top + metrics_h;
+    let loudness_bottom = top + metrics_h * TIMELINE_LOUDNESS_ROOT_LANE_FRACTION;
+    if lane_idx == 0 {
+        (top, loudness_bottom)
+    } else {
+        (loudness_bottom, bottom)
+    }
+}
+
+fn timeline_metric_display_value(
+    kind: TimelineMetricKind,
+    bin: &WaveformBin,
+    bass_hint: TimelinePitchHint,
+    key_hint: TimelinePitchHint,
+) -> f32 {
+    match kind {
+        TimelineMetricKind::LoudnessBassRoot => {
+            timeline_loudness_value(bin) * (0.72 + 0.28 * bass_hint.confidence.clamp(0.0, 1.0))
+        }
+        TimelineMetricKind::Key => key_hint.confidence,
+    }
+}
+
+fn timeline_metric_hover_value(
+    kind: TimelineMetricKind,
+    bins: &[WaveformBin],
+    bin: &WaveformBin,
+    time_secs: f64,
+) -> f32 {
+    match kind {
+        TimelineMetricKind::LoudnessBassRoot => timeline_loudness_value(bin),
+        TimelineMetricKind::Key => key_hint_at_time(bins, time_secs).confidence,
+    }
+}
+
 fn timeline_metric_value(kind: TimelineMetricKind, bin: &WaveformBin) -> f32 {
     match kind {
-        TimelineMetricKind::Loudness => timeline_loudness_value(bin),
-        TimelineMetricKind::BassRoot => (bin.bass_pitch_confidence
+        TimelineMetricKind::LoudnessBassRoot => (bin.bass_pitch_confidence
             * normalize_range(bin.band_energy[0], 0.06, 0.48)
             * timeline_loudness_value(bin).powf(0.90))
         .sqrt()
         .clamp(0.0, 1.0),
-        TimelineMetricKind::Brightness => bin.brightness.clamp(0.0, 1.0),
-        TimelineMetricKind::DrumDensity => bin.transient_density.clamp(0.0, 1.0),
         TimelineMetricKind::Key => {
             (bin.key_confidence * timeline_loudness_value(bin).powf(0.72)).clamp(0.0, 1.0)
         }
-        TimelineMetricKind::Change => bin.novelty.clamp(0.0, 1.0),
-        TimelineMetricKind::Vocal => bin.vocal_score.clamp(0.0, 1.0),
     }
 }
 
@@ -1588,72 +1793,71 @@ fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
 
 fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
     match kind {
-        TimelineMetricKind::Loudness => "Loudness",
-        TimelineMetricKind::BassRoot => "Bass root",
-        TimelineMetricKind::Brightness => "Brightness",
-        TimelineMetricKind::DrumDensity => "Drums",
+        TimelineMetricKind::LoudnessBassRoot => "Loudness+Bass",
         TimelineMetricKind::Key => "Key",
-        TimelineMetricKind::Change => "Change",
-        TimelineMetricKind::Vocal => "Vocal hint",
     }
 }
 
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
-        TimelineMetricKind::Loudness => "RMS",
-        TimelineMetricKind::BassRoot => "Low pitch color",
-        TimelineMetricKind::Brightness => "High tilt/change",
-        TimelineMetricKind::DrumDensity => "Transient density",
-        TimelineMetricKind::Key => "Chroma color",
-        TimelineMetricKind::Change => "Local feature delta",
-        TimelineMetricKind::Vocal => "DSP vocal-like",
+        TimelineMetricKind::LoudnessBassRoot => "Height RMS, color bass root",
+        TimelineMetricKind::Key => "Long-window chroma",
     }
 }
 
-fn timeline_metric_extra(kind: TimelineMetricKind, bin: &WaveformBin) -> String {
+fn timeline_metric_extra(
+    kind: TimelineMetricKind,
+    bins: &[WaveformBin],
+    bin: &WaveformBin,
+    time_secs: f64,
+) -> String {
     match kind {
-        TimelineMetricKind::BassRoot if bin.bass_pitch_confidence > 0.08 => {
+        TimelineMetricKind::LoudnessBassRoot if bin.bass_pitch_confidence > 0.08 => {
             format!(" {}", pitch_class_name(bin.bass_pitch_class))
         }
-        TimelineMetricKind::Key if bin.key_confidence > 0.08 => {
-            format!(" {}", pitch_class_name(bin.key_pitch_class))
+        TimelineMetricKind::Key => {
+            let hint = key_hint_at_time(bins, time_secs);
+            if hint.confidence > 0.05 {
+                format!(" {}", pitch_class_name(hint.pitch_class))
+            } else {
+                String::new()
+            }
         }
         _ => String::new(),
     }
 }
 
-fn timeline_metric_color(kind: TimelineMetricKind, value: f32, bin: &WaveformBin) -> egui::Color32 {
+fn timeline_metric_color(
+    kind: TimelineMetricKind,
+    value: f32,
+    _bin: &WaveformBin,
+    bass_hint: TimelinePitchHint,
+    key_hint: TimelinePitchHint,
+) -> egui::Color32 {
     let value = value.clamp(0.0, 1.0);
     let base = match kind {
-        TimelineMetricKind::Loudness => egui::Color32::from_rgb(205, 220, 92),
-        TimelineMetricKind::BassRoot if bin.bass_pitch_confidence > 0.08 => {
-            let change = bin.novelty.clamp(0.0, 1.0);
-            let color_value = value.max(0.50);
+        TimelineMetricKind::LoudnessBassRoot if bass_hint.confidence > 0.06 => {
+            let color_value = bass_hint.confidence.max(0.54);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + bin.bass_pitch_class % 12, color_value),
-                    1.16 + value * 0.32 + change * 0.24,
+                    key_color(60 + bass_hint.pitch_class % 12, color_value),
+                    1.12 + value * 0.28 + bass_hint.confidence * 0.20,
                 ),
-                (116.0 + value * 108.0 + change * 28.0).min(245.0) as u8,
+                (112.0 + value * 96.0 + bass_hint.confidence * 36.0).min(245.0) as u8,
             );
         }
-        TimelineMetricKind::BassRoot => egui::Color32::from_rgb(224, 96, 54),
-        TimelineMetricKind::Brightness => egui::Color32::from_rgb(86, 196, 246),
-        TimelineMetricKind::DrumDensity => egui::Color32::from_rgb(252, 178, 48),
-        TimelineMetricKind::Key if bin.key_confidence > 0.08 => {
-            let change = bin.novelty.clamp(0.0, 1.0);
-            let color_value = value.max(0.68);
+        TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(188, 198, 92),
+        TimelineMetricKind::Key if key_hint.confidence > 0.05 => {
+            let color_value = key_hint.confidence.max(0.72);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + bin.key_pitch_class % 12, color_value),
-                    1.28 + value * 0.34 + change * 0.26,
+                    key_color(60 + key_hint.pitch_class % 12, color_value),
+                    1.20 + key_hint.confidence * 0.34,
                 ),
-                (132.0 + value * 94.0 + change * 30.0).min(248.0) as u8,
+                (126.0 + key_hint.confidence * 118.0).min(248.0) as u8,
             );
         }
         TimelineMetricKind::Key => egui::Color32::from_rgb(104, 214, 186),
-        TimelineMetricKind::Change => egui::Color32::from_rgb(176, 116, 250),
-        TimelineMetricKind::Vocal => egui::Color32::from_rgb(46, 224, 212),
     };
     color_with_alpha(
         brighten_color(base, 0.42 + value * 0.72),
@@ -2904,10 +3108,58 @@ mod tests {
             let value = timeline_metric_value(kind, &bin);
             assert!((0.0..=1.0).contains(&value), "{kind:?}={value}");
         }
-        assert!(timeline_metric_value(TimelineMetricKind::BassRoot, &bin) > 0.7);
-        assert!(timeline_metric_value(TimelineMetricKind::DrumDensity, &bin) > 0.5);
-        assert!(timeline_metric_value(TimelineMetricKind::Change, &bin) > 0.4);
-        assert!(timeline_metric_value(TimelineMetricKind::Vocal, &bin) > 0.4);
+        assert!(timeline_metric_value(TimelineMetricKind::LoudnessBassRoot, &bin) > 0.7);
+        assert!(timeline_metric_value(TimelineMetricKind::Key, &bin) > 0.4);
+    }
+
+    #[test]
+    fn timeline_rhythm_segments_snap_to_strong_transients() {
+        let mut bins = Vec::new();
+        let mut visible = Vec::new();
+        for idx in 0..20 {
+            bins.push(WaveformBin {
+                start_secs: idx as f64 * 0.01,
+                duration_secs: 0.01,
+                transient: if idx == 6 { 0.8 } else { 0.0 },
+                band_energy: [0.6, 0.3, 0.1],
+                ..WaveformBin::default()
+            });
+            visible.push(TimelineVisibleBin {
+                index: idx,
+                x0: idx as f32,
+                x1: idx as f32 + 1.0,
+            });
+        }
+
+        let segments = build_timeline_rhythm_segments(&bins, &visible);
+
+        assert_eq!(segments[0].start, 0);
+        assert_eq!(segments[0].end, 7);
+        assert!(
+            segments
+                .iter()
+                .take(segments.len().saturating_sub(1))
+                .all(|segment| (5..=10).contains(&(segment.end - segment.start)))
+        );
+    }
+
+    #[test]
+    fn timeline_key_hint_uses_long_window_vote() {
+        let mut bins = Vec::new();
+        for idx in 0..100 {
+            let first_key = idx < 55;
+            bins.push(WaveformBin {
+                start_secs: idx as f64 * 0.1,
+                duration_secs: 0.1,
+                loudness_db: -12.0,
+                key_pitch_class: if first_key { 2 } else { 7 },
+                key_confidence: 0.85,
+                ..WaveformBin::default()
+            });
+        }
+
+        assert_eq!(key_hint_at_time(&bins, 2.0).pitch_class, 2);
+        assert_eq!(key_hint_at_time(&bins, 8.0).pitch_class, 7);
     }
 
     #[test]

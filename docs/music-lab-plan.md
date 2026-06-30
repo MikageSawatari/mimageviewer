@@ -92,15 +92,11 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
      - 音量の縦ラインを低 / 中 / 高域で分割して塗り、強い立ち上がりだけ transient accent として重ねる
-     - 下段: Loudness / Bass root / Key / Brightness / Drums / Change / Vocal hint の
-       独立メトリクスレーン
+     - 下段: 大きめの Loudness+Bass root レーンと、小さめの Key レーン
+     - Loudness+Bass root は高さを loudness、色を bass root の pitch class とする
      - Bass root / Key は 12 音の pitch class を五度圏カラーで表示し、オクターブ違いは同じ色にする
-     - Bass root / Key は値の高さより色の比較を優先し、検出中はレーン高いっぱいに塗る。
-       値はホバー表示と透明度/明るさへ残し、Change が高い区間は少し強調する
-     - Brightness は高域量そのものだけでなく、周辺時間との差分も混ぜて構成変化のヒントにする
-     - Drums は単発 transient ではなく、短時間窓の transient density として表示する
-     - Change は loudness / bass / brightness / drum density / vocal hint / chroma の
-       前後差から section boundary 候補を示す
+     - Bass root / Key は transient から作る 50-100ms 程度の表示用リズムグリッド境界でだけ色を変える
+     - Key は短時間の chroma 変動ではなく、長めの周辺窓で投票した pitch class をリズムグリッドへスナップして表示する
      - メトリクスレーンはホバーでレーン名、値、時刻、意味、推定音名を表示する
      - 再生位置の行全体が表示中に見切れる / 画面外へ出る場合だけ自動スクロールし、手動スクロール中は追従しない
    - 下段 108-band analyzer + 減衰背景
