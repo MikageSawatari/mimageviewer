@@ -69,6 +69,13 @@ egui overlay path を使う。別ウィンドウの `WM_CLOSE` は egui detached
 Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する。native child 側の
 キー入力は App へ転送し、動画操作 / session close / F12 切替を同じ keymap 経路に通す。
 
+メインウィンドウでフォルダ移動や別フォルダ open が発生しても、表示中 detached 動画は
+`active_detached_viewer_context` に切り離して保持する。この状態では動画の `fs_cache` /
+`fullscreen_idx` / `items` は detached 側 bundle が正本になるため、`poll_video()` は
+その bundle を mount した `update_active_detached_viewer_context()` 内で走らせる。
+同時に main context 側の `poll_video()` は抑止し、native presenter のイベントや source
+swap pending を detached 動画ではない `fullscreen_idx` で処理しないようにする。
+
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
 
 VST3 プラグイン GUI がフルスクリーン動画再生中も最前面に維持されるため (= 動画を見ながら EQ

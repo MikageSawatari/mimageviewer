@@ -22724,6 +22724,44 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn viewer_context_bundle_contains_video(bundle: &ViewerContextBundle) -> bool {
+        let active_item_is_video = bundle
+            .fullscreen_idx
+            .and_then(|idx| bundle.items.get(idx))
+            .is_some_and(|item| matches!(item, GridItem::Video(_)));
+        active_item_is_video
+            || bundle
+                .fs_cache
+                .values()
+                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_detached_viewer_context_contains_video(&self) -> bool {
+        self.active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| Self::viewer_context_bundle_contains_video(&active.bundle))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn current_viewer_context_contains_video(&self) -> bool {
+        let active_item_is_video = self
+            .fullscreen_idx
+            .and_then(|idx| self.items.get(idx))
+            .is_some_and(|item| matches!(item, GridItem::Video(_)));
+        active_item_is_video
+            || self
+                .fs_cache
+                .values()
+                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn should_poll_main_video_context(&self) -> bool {
+        !self.active_detached_viewer_context_contains_video()
+    }
+
+    #[cfg(windows)]
     pub(crate) fn suppress_detached_image_window_focus_activation(&mut self, reason: &'static str) {
         self.detached_image_window_focus_activation_suppress_until =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
@@ -23282,6 +23320,9 @@ impl App {
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
+                if app.current_viewer_context_contains_video() {
+                    app.poll_video(ctx);
+                }
                 app.poll_ai_upscale(ctx);
                 app.poll_final_ai(ctx);
                 app.poll_erase_inpaint(ctx);
@@ -40900,7 +40941,27 @@ impl eframe::App for App {
         self.enqueue_visible_tag_prewarms();
 
         self.poll_prefetch(ctx);
-        self.poll_video(ctx);
+        let should_poll_main_video_context = {
+            #[cfg(windows)]
+            {
+                self.should_poll_main_video_context()
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        };
+        if should_poll_main_video_context {
+            self.poll_video(ctx);
+        } else {
+            #[cfg(windows)]
+            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
+                self.log_detached_image_window_debug(format!(
+                    "main_poll_video_deferred_to_active_context frame={}",
+                    self.frame_counter
+                ));
+            }
+        }
         self.poll_ai_upscale(ctx);
         self.poll_final_ai(ctx);
         self.poll_erase_inpaint(ctx);

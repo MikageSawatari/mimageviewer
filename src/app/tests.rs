@@ -16964,6 +16964,46 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn active_detached_video_context_owns_video_polling() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\detached.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_window_id = Some(91);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        assert!(app.active_detached_viewer_context_contains_video());
+        assert!(
+            !app.should_poll_main_video_context(),
+            "native video pending/events must be polled only while the detached video bundle is mounted"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn active_detached_still_context_does_not_steal_main_video_polling() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\pics\detached.jpg");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(image);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_window_id = Some(92);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        assert!(!app.active_detached_viewer_context_contains_video());
+        assert!(
+            app.should_poll_main_video_context(),
+            "still detached contexts must not suppress unrelated main video polling"
+        );
+    }
+
+    #[test]
     fn detached_pin_requests_next_still_open_as_detached_and_disables_sync() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
