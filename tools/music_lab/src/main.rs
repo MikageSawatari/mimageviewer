@@ -8,8 +8,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use music_core::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, MusicBookmark, PlaybackSnapshot,
-    TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
-    spectrum_bands_from_stereo_window,
+    SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, TimelineAnalysis,
+    WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
+    spectrum_analysis_from_stereo_window,
 };
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -27,7 +28,9 @@ const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.982;
-const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(75);
+const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
+const SPECTRUM_KEYBOARD_H: f32 = 34.0;
+const SPECTRUM_PANEL_GAP: f32 = 8.0;
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(2);
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
 const TRANSIENT_ACCENT_MIN: f32 = 0.42;
@@ -74,6 +77,7 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+    ctx.set_visuals(egui::Visuals::dark());
 }
 
 struct LoadedTrack {
@@ -88,7 +92,7 @@ enum LoadMsg {
 }
 
 struct SpectrumMsg {
-    bands: Vec<f32>,
+    analysis: SpectrumAnalysis,
     compute_ms: f32,
 }
 
@@ -368,6 +372,8 @@ struct MusicLabApp {
     selected_bookmark: Option<u64>,
     spectrum_bands: Vec<f32>,
     spectrum_trail: Vec<f32>,
+    spectrum_notes: Vec<f32>,
+    spectrum_note_trail: Vec<f32>,
     spectrum_rx: Option<mpsc::Receiver<SpectrumMsg>>,
     spectrum_pending: bool,
     last_spectrum_request: Option<Instant>,
@@ -616,13 +622,19 @@ impl MusicLabApp {
 
     fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("music_lab_bottom")
-            .exact_height(152.0)
+            .exact_height(190.0)
             .show(ctx, |ui| {
                 if self.track.is_none() {
                     ui.centered_and_justified(|ui| ui.label("Spectrum analyzer placeholder"));
                     return;
                 }
-                draw_spectrum(ui, &self.spectrum_bands, &mut self.spectrum_trail);
+                draw_spectrum(
+                    ui,
+                    &self.spectrum_bands,
+                    &mut self.spectrum_trail,
+                    &self.spectrum_notes,
+                    &mut self.spectrum_note_trail,
+                );
             });
     }
 
@@ -632,6 +644,8 @@ impl MusicLabApp {
         self.track = None;
         self.spectrum_bands.clear();
         self.spectrum_trail.clear();
+        self.spectrum_notes.clear();
+        self.spectrum_note_trail.clear();
         self.spectrum_rx = None;
         self.spectrum_pending = false;
         self.last_spectrum_request = None;
@@ -696,7 +710,8 @@ impl MusicLabApp {
             match rx.try_recv() {
                 Ok(msg) => {
                     self.frame_stats.record_spectrum_compute(msg.compute_ms);
-                    self.spectrum_bands = msg.bands;
+                    self.spectrum_bands = msg.analysis.bands;
+                    self.spectrum_notes = msg.analysis.notes;
                     self.spectrum_pending = false;
                     self.spectrum_rx = None;
                     ctx.request_repaint();
@@ -733,14 +748,17 @@ impl MusicLabApp {
             .name("music-lab-spectrum".into())
             .spawn(move || {
                 let compute_start = Instant::now();
-                let bands = spectrum_bands_from_stereo_window(
+                let analysis = spectrum_analysis_from_stereo_window(
                     &decoded.stereo_samples,
                     decoded.info.sample_rate,
                     position_secs,
                     SPECTRUM_BANDS,
                 );
                 let compute_ms = compute_start.elapsed().as_secs_f32() * 1000.0;
-                let _ = tx.send(SpectrumMsg { bands, compute_ms });
+                let _ = tx.send(SpectrumMsg {
+                    analysis,
+                    compute_ms,
+                });
                 repaint_ctx.request_repaint();
             });
         if spawned.is_ok() {
@@ -1349,12 +1367,29 @@ fn draw_playhead(
     );
 }
 
-fn draw_spectrum(ui: &mut egui::Ui, bands: &[f32], trail: &mut Vec<f32>) {
+fn draw_spectrum(
+    ui: &mut egui::Ui,
+    bands: &[f32],
+    trail: &mut Vec<f32>,
+    notes: &[f32],
+    note_trail: &mut Vec<f32>,
+) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+    painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
 
-    let plot = rect.shrink2(egui::vec2(18.0, 12.0));
+    let inner = rect.shrink2(egui::vec2(18.0, 12.0));
+    let keyboard_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), inner.bottom() - SPECTRUM_KEYBOARD_H),
+        inner.right_bottom(),
+    );
+    let plot = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(
+            inner.right(),
+            (keyboard_rect.top() - SPECTRUM_PANEL_GAP).max(inner.top()),
+        ),
+    );
     painter.rect_filled(plot, 0.0, egui::Color32::BLACK);
     painter.rect_stroke(
         plot,
@@ -1374,6 +1409,7 @@ fn draw_spectrum(ui: &mut egui::Ui, bands: &[f32], trail: &mut Vec<f32>) {
     );
 
     if bands.is_empty() {
+        draw_pitch_keyboard(&painter, keyboard_rect, notes, note_trail);
         return;
     }
     if trail.len() != bands.len() {
@@ -1408,6 +1444,135 @@ fn draw_spectrum(ui: &mut egui::Ui, bands: &[f32], trail: &mut Vec<f32>) {
             spectrum_color(i, bands.len(), value),
         );
     }
+    draw_pitch_keyboard(&painter, keyboard_rect, notes, note_trail);
+}
+
+fn draw_pitch_keyboard(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    notes: &[f32],
+    note_trail: &mut Vec<f32>,
+) {
+    painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+    let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+    if note_trail.len() != note_count {
+        note_trail.clear();
+        note_trail.resize(note_count, 0.0);
+    }
+
+    let white_keys = (SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI)
+        .filter(|midi| !is_black_key(*midi))
+        .count()
+        .max(1);
+    let white_w = rect.width() / white_keys as f32;
+    let mut white_index = 0usize;
+    for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
+        if is_black_key(midi) {
+            continue;
+        }
+        let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
+        let value = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        note_trail[idx] = (note_trail[idx] * 0.965).max(value);
+        let x0 = rect.left() + white_index as f32 * white_w;
+        let x1 = rect.left() + (white_index + 1) as f32 * white_w;
+        let key_rect = egui::Rect::from_min_max(
+            egui::pos2(x0 + 0.25, rect.top()),
+            egui::pos2(x1 - 0.25, rect.bottom()),
+        );
+        let base = egui::Color32::from_rgb(218, 222, 224);
+        let active = key_color(midi, note_trail[idx]);
+        let fill = lerp_color(
+            base,
+            active,
+            (0.15 + note_trail[idx] * 0.85).clamp(0.0, 1.0),
+        );
+        painter.rect_filled(key_rect, 0.0, fill);
+        painter.rect_stroke(
+            key_rect,
+            0.0,
+            egui::Stroke::new(0.75, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120)),
+            egui::StrokeKind::Inside,
+        );
+        white_index += 1;
+    }
+
+    let black_w = white_w * 0.58;
+    let black_h = rect.height() * 0.64;
+    for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
+        if !is_black_key(midi) {
+            continue;
+        }
+        let Some(left_white_count) = white_keys_before(midi) else {
+            continue;
+        };
+        let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
+        let value = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        note_trail[idx] = (note_trail[idx] * 0.965).max(value);
+        let x = rect.left() + left_white_count as f32 * white_w;
+        let key_rect = egui::Rect::from_min_max(
+            egui::pos2(x - black_w * 0.5, rect.top()),
+            egui::pos2(x + black_w * 0.5, rect.top() + black_h),
+        );
+        let base = egui::Color32::from_rgb(18, 20, 22);
+        let active = key_color(midi, note_trail[idx]);
+        let fill = lerp_color(base, active, (note_trail[idx] * 0.95).clamp(0.0, 1.0));
+        painter.rect_filled(key_rect, 1.0, fill);
+        painter.rect_stroke(
+            key_rect,
+            1.0,
+            egui::Stroke::new(
+                0.75,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+fn white_keys_before(midi: u8) -> Option<usize> {
+    if midi <= SPECTRUM_NOTE_MIN_MIDI {
+        return None;
+    }
+    Some(
+        (SPECTRUM_NOTE_MIN_MIDI..midi)
+            .filter(|candidate| !is_black_key(*candidate))
+            .count(),
+    )
+}
+
+fn is_black_key(midi: u8) -> bool {
+    matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
+}
+
+fn key_color(midi: u8, value: f32) -> egui::Color32 {
+    let pitch_class = midi % 12;
+    let fifth_index = ((pitch_class as usize * 7) % 12) as f32;
+    let hue = (fifth_index / 12.0 + 0.57) % 1.0;
+    let saturation = 0.62 + value.clamp(0.0, 1.0) * 0.28;
+    let brightness = 0.38 + value.clamp(0.0, 1.0) * 0.58;
+    hsv_to_rgb(hue, saturation, brightness)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let i = h.floor() as i32;
+    let f = h - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    egui::Color32::from_rgb(
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+    )
 }
 
 fn spectral_weights(band: [f32; 3]) -> [f32; 3] {

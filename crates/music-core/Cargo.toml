@@ -9,4 +9,5 @@ name = "music_core"
 path = "src/lib.rs"
 
 [dependencies]
+rustfft = "6"
 serde = { version = "1", features = ["derive"] }

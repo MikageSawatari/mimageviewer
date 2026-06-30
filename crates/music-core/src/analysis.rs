@@ -1,6 +1,57 @@
+use rustfft::{FftPlanner, num_complex::Complex32};
 use serde::{Deserialize, Serialize};
 
 use crate::beat::BeatGrid;
+
+pub const SPECTRUM_NOTE_MIN_MIDI: u8 = 21;
+pub const SPECTRUM_NOTE_MAX_MIDI: u8 = 108;
+const SPECTRUM_MIN_HZ: f32 = 40.0;
+const SPECTRUM_DISPLAY_MAX_HZ: f32 = 18_000.0;
+const SPECTRUM_DB_FLOOR: f32 = -78.0;
+const SPECTRUM_DB_CEIL: f32 = -12.0;
+const SPECTRUM_DB_GAMMA: f32 = 1.35;
+const SPECTRUM_BLEND_HALF_OCTAVES: f32 = 0.14;
+const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
+    MultiResolutionWindowSpec {
+        size: 32_768,
+        upper_hz: 90.0,
+    },
+    MultiResolutionWindowSpec {
+        size: 16_384,
+        upper_hz: 250.0,
+    },
+    MultiResolutionWindowSpec {
+        size: 8_192,
+        upper_hz: 1_000.0,
+    },
+    MultiResolutionWindowSpec {
+        size: 4_096,
+        upper_hz: 4_000.0,
+    },
+    MultiResolutionWindowSpec {
+        size: 1_024,
+        upper_hz: f32::INFINITY,
+    },
+];
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpectrumAnalysis {
+    pub bands: Vec<f32>,
+    pub notes: Vec<f32>,
+    pub note_min_midi: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MultiResolutionWindowSpec {
+    size: usize,
+    upper_hz: f32,
+}
+
+struct MultiResolutionSpectrum {
+    specs: Vec<MultiResolutionWindowSpec>,
+    powers: Vec<Vec<f32>>,
+    bin_hz: Vec<f32>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AudioStreamInfo {
@@ -197,44 +248,36 @@ pub fn spectrum_bands_from_stereo_window(
     center_secs: f64,
     bands: usize,
 ) -> Vec<f32> {
+    spectrum_analysis_from_stereo_window(stereo_samples, sample_rate, center_secs, bands).bands
+}
+
+pub fn spectrum_analysis_from_stereo_window(
+    stereo_samples: &[f32],
+    sample_rate: u32,
+    center_secs: f64,
+    bands: usize,
+) -> SpectrumAnalysis {
     let bands = bands.clamp(1, 128);
     let frame_count = stereo_samples.len() / 2;
     if sample_rate == 0 || frame_count == 0 {
-        return vec![0.0; bands];
+        return SpectrumAnalysis {
+            bands: vec![0.0; bands],
+            notes: vec![0.0; (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize],
+            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+        };
     }
 
-    let requested_window = if bands >= 96 {
-        (sample_rate as usize / 3).clamp(8192, 16_384)
+    let spectrum =
+        MultiResolutionSpectrum::from_stereo_window(stereo_samples, sample_rate, center_secs);
+    let max_hz = spectrum_max_hz(sample_rate);
+    let ratio = max_hz / SPECTRUM_MIN_HZ;
+    let step = if bands <= 1 {
+        2.0_f32.powf(1.0 / 12.0)
     } else {
-        (sample_rate as usize / 24).clamp(1024, 4096)
+        ratio.powf(1.0 / (bands - 1) as f32)
     };
-    let window_frames = requested_window.min(frame_count).max(1);
-    let max_start = frame_count.saturating_sub(window_frames);
-    let center_frame = if center_secs.is_finite() {
-        (center_secs.max(0.0) * sample_rate as f64).round() as usize
-    } else {
-        0
-    }
-    .min(frame_count.saturating_sub(1));
-    let start_frame = center_frame
-        .saturating_sub(window_frames / 2)
-        .min(max_start);
+    let edge_scale = step.sqrt();
 
-    let mut windowed = Vec::with_capacity(window_frames);
-    let denom = (window_frames.saturating_sub(1)).max(1) as f32;
-    for i in 0..window_frames {
-        let frame_idx = start_frame + i;
-        let l = stereo_samples[frame_idx * 2];
-        let r = stereo_samples[frame_idx * 2 + 1];
-        let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
-        let hann = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / denom).cos();
-        windowed.push(mono * hann);
-    }
-
-    let min_hz = 40.0_f32;
-    let nyquist = sample_rate as f32 * 0.5;
-    let max_hz = 18_000.0_f32.min(nyquist * 0.92).max(min_hz * 1.2);
-    let ratio = max_hz / min_hz;
     let mut values = Vec::with_capacity(bands);
     for band in 0..bands {
         let t = if bands == 1 {
@@ -242,32 +285,178 @@ pub fn spectrum_bands_from_stereo_window(
         } else {
             band as f32 / (bands - 1) as f32
         };
-        let hz = min_hz * ratio.powf(t);
-        values.push(goertzel_power(&windowed, sample_rate, hz));
+        let hz = SPECTRUM_MIN_HZ * ratio.powf(t);
+        let low_hz = (hz / edge_scale).max(SPECTRUM_MIN_HZ * 0.5);
+        let high_hz = (hz * edge_scale).min(max_hz);
+        let power = spectrum.power_for_range(hz, low_hz, high_hz);
+        values.push(power_to_display_value(power));
     }
 
-    let max_value = values.iter().copied().fold(0.0_f32, f32::max);
-    if max_value <= f32::EPSILON {
-        return values;
+    let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+    let mut notes = Vec::with_capacity(note_count);
+    for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
+        let hz = midi_to_hz(midi);
+        let low_hz = hz / 2.0_f32.powf(1.0 / 24.0);
+        let high_hz = hz * 2.0_f32.powf(1.0 / 24.0);
+        if high_hz < SPECTRUM_MIN_HZ || low_hz > max_hz {
+            notes.push(0.0);
+        } else {
+            let power = spectrum.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz));
+            notes.push(power_to_display_value(power));
+        }
     }
-    for value in &mut values {
-        *value = (*value / max_value).powf(0.28).clamp(0.0, 1.0);
+
+    SpectrumAnalysis {
+        bands: values,
+        notes,
+        note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
     }
-    values
 }
 
-fn goertzel_power(windowed_mono: &[f32], sample_rate: u32, hz: f32) -> f32 {
-    let omega = std::f32::consts::TAU * hz / sample_rate.max(1) as f32;
-    let coeff = 2.0 * omega.cos();
-    let mut q1 = 0.0_f32;
-    let mut q2 = 0.0_f32;
-    for sample in windowed_mono {
-        let q0 = coeff * q1 - q2 + *sample;
-        q2 = q1;
-        q1 = q0;
+impl MultiResolutionSpectrum {
+    fn from_stereo_window(stereo_samples: &[f32], sample_rate: u32, center_secs: f64) -> Self {
+        let frame_count = stereo_samples.len() / 2;
+        let center_frame = if center_secs.is_finite() {
+            (center_secs.max(0.0) * sample_rate.max(1) as f64).round() as usize
+        } else {
+            0
+        }
+        .min(frame_count.saturating_sub(1));
+        let mut planner = FftPlanner::<f32>::new();
+        let mut specs = Vec::with_capacity(MULTI_RES_WINDOWS.len());
+        let mut powers = Vec::with_capacity(MULTI_RES_WINDOWS.len());
+        let mut bin_hz = Vec::with_capacity(MULTI_RES_WINDOWS.len());
+        for spec in MULTI_RES_WINDOWS {
+            let size = spec.size.min(frame_count).max(1);
+            let power = fft_power_window(stereo_samples, center_frame, size, &mut planner);
+            specs.push(MultiResolutionWindowSpec {
+                size,
+                upper_hz: spec.upper_hz,
+            });
+            powers.push(power);
+            bin_hz.push(sample_rate.max(1) as f32 / size as f32);
+        }
+        Self {
+            specs,
+            powers,
+            bin_hz,
+        }
     }
-    let power = q1 * q1 + q2 * q2 - coeff * q1 * q2;
-    (power / windowed_mono.len().max(1) as f32).max(0.0)
+
+    fn power_for_range(&self, center_hz: f32, low_hz: f32, high_hz: f32) -> f32 {
+        let weights = self.window_weights(center_hz);
+        weights
+            .into_iter()
+            .map(|(idx, weight)| {
+                weight * range_power_from_fft(&self.powers[idx], self.bin_hz[idx], low_hz, high_hz)
+            })
+            .sum::<f32>()
+            .max(0.0)
+    }
+
+    fn window_weights(&self, hz: f32) -> Vec<(usize, f32)> {
+        let mut idx = 0;
+        while idx + 1 < self.specs.len() && hz >= self.specs[idx].upper_hz {
+            idx += 1;
+        }
+        if idx > 0 {
+            let boundary = self.specs[idx - 1].upper_hz;
+            if boundary.is_finite() {
+                let distance = (hz.max(1.0).log2() - boundary.log2()) / SPECTRUM_BLEND_HALF_OCTAVES;
+                if (-1.0..=1.0).contains(&distance) {
+                    let upper = ((distance + 1.0) * 0.5).clamp(0.0, 1.0);
+                    return vec![(idx - 1, 1.0 - upper), (idx, upper)];
+                }
+            }
+        }
+        if idx + 1 < self.specs.len() {
+            let boundary = self.specs[idx].upper_hz;
+            if boundary.is_finite() {
+                let distance = (hz.max(1.0).log2() - boundary.log2()) / SPECTRUM_BLEND_HALF_OCTAVES;
+                if (-1.0..=1.0).contains(&distance) {
+                    let upper = ((distance + 1.0) * 0.5).clamp(0.0, 1.0);
+                    return vec![(idx, 1.0 - upper), (idx + 1, upper)];
+                }
+            }
+        }
+        vec![(idx, 1.0)]
+    }
+}
+
+fn fft_power_window(
+    stereo_samples: &[f32],
+    center_frame: usize,
+    window_frames: usize,
+    planner: &mut FftPlanner<f32>,
+) -> Vec<f32> {
+    let frame_count = stereo_samples.len() / 2;
+    let max_start = frame_count.saturating_sub(window_frames);
+    let start_frame = center_frame
+        .saturating_sub(window_frames / 2)
+        .min(max_start);
+    let denom = (window_frames.saturating_sub(1)).max(1) as f32;
+    let mut hann_sum = 0.0_f32;
+    let mut samples = vec![Complex32::new(0.0, 0.0); window_frames];
+    for (i, sample) in samples.iter_mut().enumerate() {
+        let frame_idx = start_frame + i;
+        let l = stereo_samples[frame_idx * 2];
+        let r = stereo_samples[frame_idx * 2 + 1];
+        let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
+        let hann = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / denom).cos();
+        hann_sum += hann;
+        sample.re = mono * hann;
+    }
+    let fft = planner.plan_fft_forward(window_frames);
+    fft.process(&mut samples);
+
+    let half = window_frames / 2;
+    let mut powers = Vec::with_capacity(half + 1);
+    let scale = hann_sum.max(1.0);
+    for (idx, value) in samples.iter().take(half + 1).enumerate() {
+        let mirror_scale = if idx == 0 || (window_frames % 2 == 0 && idx == half) {
+            1.0
+        } else {
+            2.0
+        };
+        let amplitude = value.norm() * mirror_scale / scale;
+        powers.push(amplitude * amplitude);
+    }
+    powers
+}
+
+fn range_power_from_fft(powers: &[f32], bin_hz: f32, low_hz: f32, high_hz: f32) -> f32 {
+    if powers.is_empty() || bin_hz <= 0.0 || high_hz <= low_hz {
+        return 0.0;
+    }
+    let start = ((low_hz / bin_hz).floor() as usize).max(1);
+    let end = ((high_hz / bin_hz).ceil() as usize).min(powers.len().saturating_sub(1));
+    if end < start {
+        let idx = ((low_hz.max(0.0) / bin_hz).round() as usize).min(powers.len() - 1);
+        return powers[idx];
+    }
+    let slice = &powers[start..=end];
+    let sum = slice.iter().copied().sum::<f32>();
+    let peak = slice.iter().copied().fold(0.0_f32, f32::max);
+    let avg = sum / slice.len().max(1) as f32;
+    avg.max(peak * 0.35)
+}
+
+fn power_to_display_value(power: f32) -> f32 {
+    let db = 10.0 * power.max(1.0e-12).log10();
+    ((db - SPECTRUM_DB_FLOOR) / (SPECTRUM_DB_CEIL - SPECTRUM_DB_FLOOR))
+        .clamp(0.0, 1.0)
+        .powf(SPECTRUM_DB_GAMMA)
+}
+
+fn spectrum_max_hz(sample_rate: u32) -> f32 {
+    let nyquist = sample_rate.max(1) as f32 * 0.5;
+    SPECTRUM_DISPLAY_MAX_HZ
+        .min(nyquist * 0.92)
+        .max(SPECTRUM_MIN_HZ * 1.2)
+}
+
+fn midi_to_hz(midi: u8) -> f32 {
+    440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
 }
 
 fn one_pole_alpha(cut_hz: f32, sample_rate: u32) -> f32 {
@@ -381,5 +570,24 @@ mod tests {
         assert_eq!(bands.len(), 50);
         assert!(bands.iter().any(|v| *v > 0.5));
         assert!(bands.iter().all(|v| (0.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn spectrum_analysis_reports_pitch_note_strength() {
+        let mut samples = Vec::new();
+        for i in 0..48_000 {
+            let phase = std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0;
+            let x = phase.sin() * 0.6;
+            samples.extend([x, x]);
+        }
+
+        let spectrum = spectrum_analysis_from_stereo_window(&samples, 48_000, 0.5, 108);
+        assert_eq!(spectrum.bands.len(), 108);
+        assert_eq!(
+            spectrum.notes.len(),
+            (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize
+        );
+        let a4 = (69 - spectrum.note_min_midi) as usize;
+        assert!(spectrum.notes[a4] > 0.5);
     }
 }
