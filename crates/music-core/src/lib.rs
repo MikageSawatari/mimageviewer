@@ -12,7 +12,7 @@ pub mod timeline;
 
 pub use analysis::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI,
-    SpectrumAnalysis, TimelineAnalysis, WaveformBin, analyze_stereo_timeline,
+    SpectrumAnalysis, SpectrumAnalyzer, TimelineAnalysis, WaveformBin, analyze_stereo_timeline,
     resample_linear_stereo, spectrum_analysis_from_stereo_window,
     spectrum_bands_from_stereo_window,
 };

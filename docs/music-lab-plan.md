@@ -63,7 +63,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
 ## 初期スコープ
 
 1. `music-core`
-   - stereo waveform bin (lab default 25 ms)
+   - stereo waveform bin (lab default 10 ms)
    - low/mid/high energy
    - loudness/RMS/peak
    - 簡易 BPM / beat/bar grid
@@ -80,7 +80,8 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
    - 下段 108-band analyzer + 減衰背景
      - 40 Hz - 18 kHz を約 1 semitone 幅で分割する想定
      - 分解能優先のため、108-band 時は長めの解析窓で少し鈍い反応にする
-     - 解析は UI thread で直接行わず、直近結果をキャッシュして描画する
+     - 解析は UI thread で直接行わず、常駐 spectrum worker で FFT plan / buffer を再利用する
+     - 5 段階 FFT は高域を高頻度、低域を低頻度で更新し、直近結果を合成して描画する
    - Top bar に FPS / frame ms を表示して描画負荷を確認する
 
 ## 本体統合時の注意
