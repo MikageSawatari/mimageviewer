@@ -3010,13 +3010,7 @@ fn local_spectral_bed(values: &[f32], idx: usize) -> f32 {
 fn conventional_key_rect(rect: egui::Rect, midi: u8, black: bool) -> Option<egui::Rect> {
     let pc = midi % 12;
     let octave_c = midi - pc;
-    let x0 = spectrum_axis_x(rect, midi_to_hz(octave_c));
-    let x1 = spectrum_axis_x(rect, midi_to_hz(octave_c.saturating_add(12)));
-    let octave_w = x1 - x0;
-    if octave_w <= 1.0 {
-        return None;
-    }
-    let white_w = octave_w / 7.0;
+    let (x0, white_w) = conventional_octave_geometry(rect, octave_c)?;
     let (left, right, bottom) = if black {
         let center = match pc {
             1 => 1.0,
@@ -3058,6 +3052,17 @@ fn conventional_key_rect(rect: egui::Rect, midi: u8, black: bool) -> Option<egui
         egui::pos2(left, rect.top()),
         egui::pos2(right, bottom),
     ))
+}
+
+fn conventional_octave_geometry(rect: egui::Rect, octave_c: u8) -> Option<(f32, f32)> {
+    let c_x = spectrum_axis_x(rect, midi_to_hz(octave_c));
+    let next_c_x = spectrum_axis_x(rect, midi_to_hz(octave_c.saturating_add(12)));
+    let octave_w = next_c_x - c_x;
+    if octave_w <= 1.0 {
+        return None;
+    }
+    let white_w = octave_w / 7.0;
+    Some((c_x - white_w * 0.5, white_w))
 }
 
 fn spectrum_axis_x(rect: egui::Rect, hz: f32) -> f32 {
@@ -3641,6 +3646,17 @@ mod tests {
         }
 
         assert!(targets[10] > 0.65);
+    }
+
+    #[test]
+    fn conventional_keyboard_centers_c_on_spectrum_axis() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 40.0));
+        let midi_c7 = 96;
+
+        let key = conventional_key_rect(rect, midi_c7, false).expect("C7 key should be visible");
+        let axis_x = spectrum_axis_x(rect, midi_to_hz(midi_c7));
+
+        assert!((key.center().x - axis_x).abs() < 0.01);
     }
 
     #[test]
