@@ -1,8 +1,6 @@
 use std::fs::OpenOptions;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +11,6 @@ use music_core::{
     SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
     TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
 };
-use serde::Deserialize;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::conv::IntoSample;
@@ -24,7 +21,8 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 const TIMELINE_WAVEFORM_H: f32 = 68.0;
-const TIMELINE_LOUDNESS_H: f32 = 18.0;
+const TIMELINE_METRICS_H: f32 = 42.0;
+const TIMELINE_METRIC_LANE_COUNT: usize = 6;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
@@ -178,71 +176,6 @@ struct SpectrumMsg {
 
 struct SpectrumRequest {
     position_secs: f64,
-}
-
-#[derive(Clone, Debug)]
-struct VocalTeacherAnalysis {
-    json_path: PathBuf,
-    evaluation_audio: Option<PathBuf>,
-    vocal_stem: Option<PathBuf>,
-    segments: Vec<TimeSpan>,
-    ignore: Vec<TimeSpan>,
-}
-
-impl VocalTeacherAnalysis {
-    fn vocal_total_secs(&self) -> f64 {
-        self.segments.iter().map(TimeSpan::duration).sum()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-struct TimeSpan {
-    start: f64,
-    end: f64,
-}
-
-impl TimeSpan {
-    fn duration(&self) -> f64 {
-        (self.end - self.start).max(0.0)
-    }
-
-    fn overlaps(self, start: f64, end: f64) -> bool {
-        self.start < end && self.end > start
-    }
-}
-
-enum TeacherMsg {
-    Loaded {
-        media_path: PathBuf,
-        analysis: VocalTeacherAnalysis,
-        elapsed: Duration,
-    },
-    Failed {
-        media_path: PathBuf,
-        error: String,
-        elapsed: Duration,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-struct TeacherLabelSet {
-    #[serde(default)]
-    metadata: TeacherMetadata,
-    tracks: Vec<TeacherTrackLabels>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct TeacherMetadata {
-    evaluation_audio: Option<PathBuf>,
-    vocal_stem: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TeacherTrackLabels {
-    #[serde(default)]
-    vocal: Vec<TimeSpan>,
-    #[serde(default)]
-    ignore: Vec<TimeSpan>,
 }
 
 #[derive(Default)]
@@ -437,7 +370,7 @@ struct TimelineTextureCacheKey {
     width_px: usize,
     waveform_h_px: usize,
     gap_px: usize,
-    loudness_h_px: usize,
+    metrics_h_px: usize,
     row_secs_millis: u32,
     rows: usize,
     bins_len: usize,
@@ -481,7 +414,7 @@ impl TimelineTextureCache {
                 key.width_px,
                 key.waveform_h_px,
                 key.gap_px,
-                key.loudness_h_px,
+                key.metrics_h_px,
                 key.dark,
             );
             let texture = ctx.load_texture(
@@ -507,7 +440,7 @@ impl TimelineTextureCache {
 
 impl TimelineTextureCacheKey {
     fn height_px(self) -> usize {
-        self.waveform_h_px + self.gap_px + self.loudness_h_px
+        self.waveform_h_px + self.gap_px + self.metrics_h_px
     }
 }
 
@@ -517,10 +450,6 @@ struct MusicLabApp {
     track: Option<LoadedTrack>,
     load_rx: Option<mpsc::Receiver<LoadMsg>>,
     load_status: String,
-    teacher_analysis: Option<VocalTeacherAnalysis>,
-    teacher_rx: Option<mpsc::Receiver<TeacherMsg>>,
-    teacher_status: String,
-    teacher_started_at: Option<Instant>,
     player: Option<LabPlayer>,
     bookmarks: Vec<MusicBookmark>,
     next_bookmark_id: u64,
@@ -551,7 +480,6 @@ impl eframe::App for MusicLabApp {
         let stage_start = Instant::now();
         self.handle_dropped_files(ctx);
         self.poll_loader(ctx);
-        self.poll_teacher_analyzer(ctx);
         self.poll_spectrum_analyzer(ctx);
         self.frame_stats.record_poll(stage_start.elapsed());
 
@@ -575,7 +503,6 @@ impl eframe::App for MusicLabApp {
         let mut timeline_stats = TimelineDrawStats::default();
         let track = self.track.as_ref();
         let player = self.player.as_ref();
-        let teacher = self.teacher_analysis.as_ref();
         let snap = self.player_snapshot();
         let row_secs = self.timeline_row_secs();
         let load_status = self.load_status.clone();
@@ -592,7 +519,6 @@ impl eframe::App for MusicLabApp {
                                 ui,
                                 track,
                                 player,
-                                teacher,
                                 snap,
                                 timeline_cache,
                                 row_secs,
@@ -704,10 +630,6 @@ impl MusicLabApp {
                         ui.separator();
                         ui.label(&self.load_status);
                     }
-                    if !self.teacher_status.is_empty() {
-                        ui.separator();
-                        ui.label(&self.teacher_status);
-                    }
                 });
             });
     }
@@ -790,44 +712,6 @@ impl MusicLabApp {
                     } else {
                         ui.label("BPM: not estimated");
                     }
-                    ui.separator();
-                    ui.heading("Vocal teacher");
-                    if self.teacher_status.is_empty() {
-                        ui.label("Teacher: not started");
-                    } else {
-                        ui.label(&self.teacher_status);
-                    }
-                    if let Some(teacher) = &self.teacher_analysis {
-                        ui.label(format!(
-                            "Spans: {}, total {}",
-                            teacher.segments.len(),
-                            format_time(teacher.vocal_total_secs())
-                        ));
-                        ui.label(format!("JSON: {}", teacher.json_path.display()));
-                        if let Some(stem) = &teacher.vocal_stem {
-                            ui.label(format!("Stem: {}", stem.display()));
-                        }
-                        if let Some(audio) = &teacher.evaluation_audio {
-                            ui.label(format!("Eval audio: {}", audio.display()));
-                        }
-                        for (idx, span) in teacher.segments.iter().take(8).enumerate() {
-                            let label = format!(
-                                "{}  {} - {}",
-                                idx + 1,
-                                format_time(span.start),
-                                format_time(span.end)
-                            );
-                            if ui.button(label).clicked()
-                                && let Some(player) = &self.player
-                            {
-                                player.seek_secs(span.start);
-                            }
-                        }
-                        if teacher.segments.len() > 8 {
-                            ui.label(format!("... {} more", teacher.segments.len() - 8));
-                        }
-                    }
-                    ui.separator();
                     ui.heading("Tags");
                     ui.add_enabled(
                         false,
@@ -900,10 +784,6 @@ impl MusicLabApp {
         self.active_path = Some(path.clone());
         self.player = None;
         self.track = None;
-        self.teacher_analysis = None;
-        self.teacher_rx = None;
-        self.teacher_status.clear();
-        self.teacher_started_at = None;
         self.spectrum_bands.clear();
         self.spectrum_trail.clear();
         self.spectrum_prev_bands.clear();
@@ -941,7 +821,7 @@ impl MusicLabApp {
             })
             .ok();
         self.load_rx = Some(rx);
-        self.start_teacher_analysis(path, ctx);
+        ctx.request_repaint();
     }
 
     fn poll_loader(&mut self, ctx: &egui::Context) {
@@ -971,118 +851,6 @@ impl MusicLabApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.load_status = "Loader stopped".to_string();
                 self.load_rx = None;
-            }
-        }
-    }
-
-    fn start_teacher_analysis(&mut self, path: PathBuf, ctx: &egui::Context) {
-        let script_path = teacher_script_path();
-        if !script_path.exists() {
-            self.teacher_status = format!("Teacher: script not found: {}", script_path.display());
-            return;
-        }
-
-        let python = teacher_python_path();
-        let work_dir = teacher_work_dir();
-        let out_path = teacher_output_path(&path);
-        let (tx, rx) = mpsc::channel();
-        let repaint_ctx = ctx.clone();
-        self.teacher_status = "Teacher: Demucs queued".to_string();
-        self.teacher_started_at = Some(Instant::now());
-        let media_path = path.clone();
-        let thread_media_path = path;
-        let spawned = std::thread::Builder::new()
-            .name("music-lab-teacher".into())
-            .spawn(move || {
-                let started = Instant::now();
-                let msg = match run_teacher_sidecar(
-                    &thread_media_path,
-                    &python,
-                    &script_path,
-                    &work_dir,
-                    &out_path,
-                ) {
-                    Ok(analysis) => TeacherMsg::Loaded {
-                        media_path: thread_media_path,
-                        analysis,
-                        elapsed: started.elapsed(),
-                    },
-                    Err(error) => TeacherMsg::Failed {
-                        media_path: thread_media_path,
-                        error,
-                        elapsed: started.elapsed(),
-                    },
-                };
-                let _ = tx.send(msg);
-                repaint_ctx.request_repaint();
-            });
-        match spawned {
-            Ok(_) => {
-                self.teacher_rx = Some(rx);
-                let name = media_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("media");
-                self.teacher_status = format!("Teacher: analyzing {name}");
-            }
-            Err(err) => {
-                self.teacher_rx = None;
-                self.teacher_status = format!("Teacher: worker spawn failed: {err}");
-            }
-        }
-    }
-
-    fn poll_teacher_analyzer(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.teacher_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(TeacherMsg::Loaded {
-                media_path,
-                analysis,
-                elapsed,
-            }) => {
-                if self.active_path.as_ref() == Some(&media_path) {
-                    let count = analysis.segments.len();
-                    let total = analysis.vocal_total_secs();
-                    self.teacher_status = format!(
-                        "Teacher: {count} vocal spans, {:.1}s total ({:.1}s)",
-                        total,
-                        elapsed.as_secs_f32()
-                    );
-                    self.teacher_analysis = Some(analysis);
-                    self.timeline_cache.clear();
-                }
-                self.teacher_rx = None;
-                self.teacher_started_at = None;
-                ctx.request_repaint();
-            }
-            Ok(TeacherMsg::Failed {
-                media_path,
-                error,
-                elapsed,
-            }) => {
-                if self.active_path.as_ref() == Some(&media_path) {
-                    self.teacher_status = format!(
-                        "Teacher: failed after {:.1}s: {error}",
-                        elapsed.as_secs_f32()
-                    );
-                }
-                self.teacher_rx = None;
-                self.teacher_started_at = None;
-                ctx.request_repaint();
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                if let Some(started) = self.teacher_started_at {
-                    self.teacher_status =
-                        format!("Teacher: analyzing {:.0}s", started.elapsed().as_secs_f32());
-                }
-                ctx.request_repaint_after(Duration::from_millis(250));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.teacher_status = "Teacher: worker stopped".to_string();
-                self.teacher_rx = None;
-                self.teacher_started_at = None;
             }
         }
     }
@@ -1198,141 +966,6 @@ fn perf_log_path() -> PathBuf {
     std::env::temp_dir().join("miv_music_lab_perf.log")
 }
 
-fn teacher_work_dir() -> PathBuf {
-    std::env::temp_dir().join("miv_music_lab_teacher")
-}
-
-fn teacher_script_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("demucs_vocal_teacher.py")
-}
-
-fn teacher_python_path() -> PathBuf {
-    if let Ok(path) = std::env::var("MIV_MUSIC_TEACHER_PYTHON")
-        && !path.trim().is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    let temp_venv_python = std::env::temp_dir()
-        .join("miv_demucs_venv_py313")
-        .join("Scripts")
-        .join("python.exe");
-    if temp_venv_python.exists() {
-        return temp_venv_python;
-    }
-    PathBuf::from("python")
-}
-
-fn teacher_output_path(media_path: &Path) -> PathBuf {
-    let stem = media_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(sanitize_teacher_file_stem)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "media".to_string());
-    teacher_work_dir().join(format!(
-        "{}_{:016x}.demucs_teacher.json",
-        stem,
-        teacher_media_key(media_path)
-    ))
-}
-
-fn sanitize_teacher_file_stem(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(48)
-        .collect()
-}
-
-fn teacher_media_key(path: &Path) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.as_os_str().to_string_lossy().hash(&mut hasher);
-    if let Ok(metadata) = std::fs::metadata(path) {
-        metadata.len().hash(&mut hasher);
-        if let Ok(modified) = metadata.modified()
-            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
-        {
-            duration.as_secs().hash(&mut hasher);
-            duration.subsec_nanos().hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
-fn run_teacher_sidecar(
-    media_path: &Path,
-    python: &Path,
-    script_path: &Path,
-    work_dir: &Path,
-    out_path: &Path,
-) -> Result<VocalTeacherAnalysis, String> {
-    std::fs::create_dir_all(work_dir).map_err(|e| format!("create {}: {e}", work_dir.display()))?;
-    let output = Command::new(python)
-        .arg(script_path)
-        .arg(media_path)
-        .arg("--out")
-        .arg(out_path)
-        .arg("--work-dir")
-        .arg(work_dir)
-        .arg("--track-path")
-        .arg("input")
-        .arg("--reuse")
-        .output()
-        .map_err(|e| format!("run {}: {e}", python.display()))?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "{}\n{}",
-            format!("sidecar exited with {}", output.status),
-            trim_teacher_log(&format!("{stdout}\n{stderr}"))
-        ));
-    }
-    load_teacher_analysis(out_path)
-}
-
-fn load_teacher_analysis(path: &Path) -> Result<VocalTeacherAnalysis, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let labels: TeacherLabelSet =
-        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    let Some(track) = labels.tracks.into_iter().next() else {
-        return Err(format!("{} has no tracks", path.display()));
-    };
-    Ok(VocalTeacherAnalysis {
-        json_path: path.to_path_buf(),
-        evaluation_audio: labels.metadata.evaluation_audio,
-        vocal_stem: labels.metadata.vocal_stem,
-        segments: normalize_teacher_spans(track.vocal),
-        ignore: normalize_teacher_spans(track.ignore),
-    })
-}
-
-fn normalize_teacher_spans(mut spans: Vec<TimeSpan>) -> Vec<TimeSpan> {
-    spans.retain(|span| {
-        span.start.is_finite() && span.end.is_finite() && span.end > span.start && span.end >= 0.0
-    });
-    spans.sort_by(|a, b| a.start.total_cmp(&b.start));
-    spans
-}
-
-fn trim_teacher_log(value: &str) -> String {
-    let lines: Vec<&str> = value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let start = lines.len().saturating_sub(8);
-    lines[start..].join("\n")
-}
-
 fn draw_empty_state(ui: &mut egui::Ui, status: &str) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
@@ -1352,11 +985,29 @@ struct TimelineDrawStats {
     cache_misses: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimelineMetricKind {
+    Loudness,
+    Bass,
+    Brightness,
+    Transient,
+    Center,
+    Vocal,
+}
+
+const TIMELINE_METRIC_KINDS: [TimelineMetricKind; TIMELINE_METRIC_LANE_COUNT] = [
+    TimelineMetricKind::Loudness,
+    TimelineMetricKind::Bass,
+    TimelineMetricKind::Brightness,
+    TimelineMetricKind::Transient,
+    TimelineMetricKind::Center,
+    TimelineMetricKind::Vocal,
+];
+
 fn draw_timeline(
     ui: &mut egui::Ui,
     track: &LoadedTrack,
     player: Option<&LabPlayer>,
-    teacher: Option<&VocalTeacherAnalysis>,
     snap: PlaybackSnapshot,
     cache: &mut TimelineTextureCache,
     row_secs: f64,
@@ -1368,7 +1019,7 @@ fn draw_timeline(
         .ceil()
         .max(1.0) as usize;
     let row_gap = TIMELINE_ROW_GAP;
-    let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_LOUDNESS_H;
+    let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_METRICS_H;
     let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
     let available = egui::vec2(ui.available_width(), ui.available_height().max(content_h));
     let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
@@ -1385,12 +1036,12 @@ fn draw_timeline(
         ((graph_rect.width() * ppp).round() as usize).clamp(1, TIMELINE_TEXTURE_MAX_WIDTH);
     let waveform_h_px = ((TIMELINE_WAVEFORM_H * ppp).round() as usize).max(1);
     let gap_px = ((TIMELINE_INNER_GAP * ppp).round() as usize).max(1);
-    let loudness_h_px = ((TIMELINE_LOUDNESS_H * ppp).round() as usize).max(1);
+    let metrics_h_px = ((TIMELINE_METRICS_H * ppp).round() as usize).max(1);
     let texture_key = TimelineTextureCacheKey {
         width_px,
         waveform_h_px,
         gap_px,
-        loudness_h_px,
+        metrics_h_px,
         row_secs_millis: (row_secs * 1000.0).round() as u32,
         rows,
         bins_len: track.analysis.bins.len(),
@@ -1453,9 +1104,6 @@ fn draw_timeline(
             ui.visuals().text_color(),
         );
         draw_beat_grid(&painter, row_rect, row_start, row_secs, &track.analysis);
-        if let Some(teacher) = teacher {
-            draw_teacher_intervals(&painter, row_rect, row_start, row_secs, teacher);
-        }
     }
 
     draw_playhead(
@@ -1466,6 +1114,19 @@ fn draw_timeline(
         row_h,
         row_gap,
     );
+
+    if let Some(pos) = response.hover_pos() {
+        draw_timeline_metric_hover(
+            &painter,
+            pos,
+            graph_rect,
+            row_secs,
+            row_h,
+            row_gap,
+            rows,
+            &track.analysis.bins,
+        );
+    }
 
     if (response.clicked() || response.dragged())
         && let Some(pos) = response.interact_pointer_pos()
@@ -1526,6 +1187,135 @@ fn timeline_playhead_row_rect(
     ))
 }
 
+fn draw_timeline_metric_hover(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    graph_rect: egui::Rect,
+    row_secs: f64,
+    row_h: f32,
+    row_gap: f32,
+    rows: usize,
+    bins: &[WaveformBin],
+) {
+    if row_secs <= 0.0 || rows == 0 || bins.is_empty() || !graph_rect.contains(pos) {
+        return;
+    }
+    let row_stride = row_h + row_gap;
+    let local_y = pos.y - graph_rect.top();
+    if local_y < 0.0 {
+        return;
+    }
+    let row = (local_y / row_stride).floor() as usize;
+    if row >= rows {
+        return;
+    }
+    let row_top = graph_rect.top() + row as f32 * row_stride;
+    let metrics_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            graph_rect.left(),
+            row_top + TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP,
+        ),
+        egui::pos2(graph_rect.right(), row_top + row_h),
+    );
+    if !metrics_rect.contains(pos) {
+        return;
+    }
+
+    let lane_h = metrics_rect.height() / TIMELINE_METRIC_KINDS.len() as f32;
+    let lane_idx = ((pos.y - metrics_rect.top()) / lane_h)
+        .floor()
+        .clamp(0.0, (TIMELINE_METRIC_KINDS.len() - 1) as f32) as usize;
+    let kind = TIMELINE_METRIC_KINDS[lane_idx];
+    let row_start = row as f64 * row_secs;
+    let frac = ((pos.x - graph_rect.left()) / graph_rect.width()).clamp(0.0, 1.0);
+    let time_secs = row_start + frac as f64 * row_secs;
+    let Some(bin) = timeline_bin_at_time(bins, time_secs) else {
+        return;
+    };
+    let value = timeline_metric_value(kind, bin).clamp(0.0, 1.0);
+    let x = graph_rect.left() + frac * graph_rect.width();
+    let lane_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            metrics_rect.left(),
+            metrics_rect.top() + lane_idx as f32 * lane_h,
+        ),
+        egui::pos2(
+            metrics_rect.right(),
+            metrics_rect.top() + ((lane_idx + 1) as f32 * lane_h).min(metrics_rect.height()),
+        ),
+    );
+    painter.rect_stroke(
+        lane_rect,
+        0.0,
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(210, 230, 250, 150),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(x, lane_rect.top()),
+            egui::pos2(x, lane_rect.bottom()),
+        ],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(230, 240, 255, 150),
+        ),
+    );
+
+    let label = format!(
+        "{} {:.0}%  {}  {}",
+        timeline_metric_name(kind),
+        value * 100.0,
+        format_time(time_secs),
+        timeline_metric_description(kind)
+    );
+    let label_w = (label.chars().count() as f32 * 7.0 + 14.0).min(graph_rect.width() - 8.0);
+    let label_h = 22.0;
+    let label_x = if x + 10.0 + label_w <= graph_rect.right() {
+        x + 10.0
+    } else {
+        (x - 10.0 - label_w).max(graph_rect.left() + 4.0)
+    };
+    let label_y = if lane_rect.top() - label_h - 6.0 >= graph_rect.top() {
+        lane_rect.top() - label_h - 6.0
+    } else {
+        lane_rect.bottom() + 6.0
+    };
+    let label_rect =
+        egui::Rect::from_min_size(egui::pos2(label_x, label_y), egui::vec2(label_w, label_h));
+    painter.rect_filled(
+        label_rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(5, 8, 12, 230),
+    );
+    painter.rect_stroke(
+        label_rect,
+        3.0,
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(100, 150, 190, 180),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        label_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::monospace(11.0),
+        egui::Color32::from_rgb(234, 244, 252),
+    );
+}
+
+fn timeline_bin_at_time(bins: &[WaveformBin], time_secs: f64) -> Option<&WaveformBin> {
+    if bins.is_empty() || !time_secs.is_finite() {
+        return None;
+    }
+    let idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= time_secs);
+    bins.get(idx).or_else(|| bins.last())
+}
+
 fn music_lab_analysis_config() -> AnalysisConfig {
     AnalysisConfig {
         bin_secs: 0.010,
@@ -1540,10 +1330,10 @@ fn render_timeline_row_image(
     width: usize,
     waveform_h: usize,
     gap_h: usize,
-    loudness_h: usize,
+    metrics_h: usize,
     _dark: bool,
 ) -> (egui::ColorImage, usize) {
-    let height = waveform_h + gap_h + loudness_h;
+    let height = waveform_h + gap_h + metrics_h;
     let bg = app_bg();
     let mut pixels = vec![bg; width * height];
 
@@ -1557,16 +1347,16 @@ fn render_timeline_row_image(
         waveform_h,
         egui::Color32::BLACK,
     );
-    let loudness_top = waveform_h + gap_h;
+    let metrics_top = waveform_h + gap_h;
     fill_rect_px(
         &mut pixels,
         width,
         height,
         0,
-        loudness_top,
+        metrics_top,
         width,
         height,
-        bg,
+        egui::Color32::from_rgb(3, 5, 7),
     );
     let center_y = waveform_h as f32 * 0.5;
     fill_rect_f32(
@@ -1642,23 +1432,15 @@ fn render_timeline_row_image(
             );
         }
 
-        let loudness = ((bin.loudness_db + 52.0) / 52.0).clamp(0.0, 1.0);
-        let loudness_value_h =
-            (loudness_h.saturating_sub(2) as f32) * loudness.powf(0.72).max(0.02);
-        let loudness_x0 = ((visible_start - row_start) / row_secs) as f32 * width as f32;
-        let loudness_x1 = (((visible_end - row_start) / row_secs) as f32 * width as f32)
-            .max(loudness_x0 + 1.0)
-            .min(width as f32);
-        let loudness_bottom = height.saturating_sub(1) as f32;
-        fill_rect_f32(
+        draw_timeline_metric_bins(
             &mut pixels,
             width,
             height,
-            loudness_x0,
-            loudness_bottom - loudness_value_h,
-            loudness_x1,
-            loudness_bottom,
-            loudness_color(loudness, bin.vocal_score),
+            metrics_top,
+            metrics_h,
+            x0,
+            x1,
+            bin,
         );
     }
 
@@ -1677,13 +1459,124 @@ fn render_timeline_row_image(
         width,
         height,
         0,
-        loudness_top,
+        metrics_top,
         width,
         height,
         egui::Color32::from_rgba_unmultiplied(70, 92, 116, 90),
     );
 
     (egui::ColorImage::new([width, height], pixels), drawn_bins)
+}
+
+fn draw_timeline_metric_bins(
+    pixels: &mut [egui::Color32],
+    width: usize,
+    height: usize,
+    metrics_top: usize,
+    metrics_h: usize,
+    x0: f32,
+    x1: f32,
+    bin: &WaveformBin,
+) {
+    if metrics_h == 0 {
+        return;
+    }
+    let lane_h = metrics_h as f32 / TIMELINE_METRIC_KINDS.len() as f32;
+    for (idx, kind) in TIMELINE_METRIC_KINDS.into_iter().enumerate() {
+        let top = metrics_top as f32 + idx as f32 * lane_h;
+        let bottom = if idx + 1 == TIMELINE_METRIC_KINDS.len() {
+            (metrics_top + metrics_h) as f32
+        } else {
+            metrics_top as f32 + (idx + 1) as f32 * lane_h
+        };
+        let lane_bottom = bottom - 0.6;
+        let lane_top = top + 0.6;
+        let available_h = (lane_bottom - lane_top).max(1.0);
+        let value = timeline_metric_value(kind, bin).clamp(0.0, 1.0);
+        let bar_top = lane_bottom - available_h * value.max(0.025);
+        fill_rect_f32(
+            pixels,
+            width,
+            height,
+            x0,
+            bar_top,
+            x1,
+            lane_bottom,
+            timeline_metric_color(kind, value),
+        );
+        if idx > 0 {
+            fill_rect_f32(
+                pixels,
+                width,
+                height,
+                0.0,
+                top,
+                width as f32,
+                top + 0.5,
+                egui::Color32::from_rgba_unmultiplied(80, 98, 118, 42),
+            );
+        }
+    }
+}
+
+fn timeline_metric_value(kind: TimelineMetricKind, bin: &WaveformBin) -> f32 {
+    match kind {
+        TimelineMetricKind::Loudness => timeline_loudness_value(bin),
+        TimelineMetricKind::Bass => normalize_range(bin.band_energy[0], 0.08, 0.58).powf(0.82),
+        TimelineMetricKind::Brightness => normalize_range(bin.band_energy[2], 0.16, 0.74),
+        TimelineMetricKind::Transient => bin.transient.clamp(0.0, 1.0),
+        TimelineMetricKind::Center => normalize_range(bin.center_ratio, 0.48, 0.88),
+        TimelineMetricKind::Vocal => bin.vocal_score.clamp(0.0, 1.0),
+    }
+}
+
+fn timeline_loudness_value(bin: &WaveformBin) -> f32 {
+    ((bin.loudness_db + 52.0) / 52.0).clamp(0.0, 1.0).powf(0.72)
+}
+
+fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
+    if high <= low {
+        return if value >= high { 1.0 } else { 0.0 };
+    }
+    ((value - low) / (high - low)).clamp(0.0, 1.0)
+}
+
+fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
+    match kind {
+        TimelineMetricKind::Loudness => "Loudness",
+        TimelineMetricKind::Bass => "Bass",
+        TimelineMetricKind::Brightness => "Brightness",
+        TimelineMetricKind::Transient => "Transient",
+        TimelineMetricKind::Center => "Center",
+        TimelineMetricKind::Vocal => "Vocal hint",
+    }
+}
+
+fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
+    match kind {
+        TimelineMetricKind::Loudness => "RMS",
+        TimelineMetricKind::Bass => "Low energy",
+        TimelineMetricKind::Brightness => "High energy",
+        TimelineMetricKind::Transient => "Energy rise",
+        TimelineMetricKind::Center => "Stereo center",
+        TimelineMetricKind::Vocal => "DSP vocal-like",
+    }
+}
+
+fn timeline_metric_color(kind: TimelineMetricKind, value: f32) -> egui::Color32 {
+    let value = value.clamp(0.0, 1.0);
+    let base = match kind {
+        TimelineMetricKind::Loudness => egui::Color32::from_rgb(205, 220, 92),
+        TimelineMetricKind::Bass => egui::Color32::from_rgb(220, 92, 52),
+        TimelineMetricKind::Brightness => egui::Color32::from_rgb(86, 196, 246),
+        TimelineMetricKind::Transient => egui::Color32::from_rgb(252, 178, 48),
+        TimelineMetricKind::Center => egui::Color32::from_rgb(166, 128, 246),
+        TimelineMetricKind::Vocal => egui::Color32::from_rgb(46, 224, 212),
+    };
+    color_with_alpha(
+        brighten_color(base, 0.42 + value * 0.72),
+        (58.0 + value * 162.0) as u8,
+    )
 }
 
 fn draw_spectral_waveform_bin_pixels(
@@ -1959,98 +1852,6 @@ fn draw_beat_grid(
             last_bar_label_x = x;
         }
     }
-}
-
-fn draw_teacher_intervals(
-    painter: &egui::Painter,
-    row_rect: egui::Rect,
-    row_start: f64,
-    row_secs: f64,
-    teacher: &VocalTeacherAnalysis,
-) {
-    if row_secs <= 0.0 {
-        return;
-    }
-    let row_end = row_start + row_secs;
-    let loudness_rect = egui::Rect::from_min_max(
-        egui::pos2(row_rect.left(), row_rect.bottom() - TIMELINE_LOUDNESS_H),
-        row_rect.right_bottom(),
-    );
-    let waveform_marker = egui::Rect::from_min_max(
-        egui::pos2(row_rect.left(), row_rect.top() + TIMELINE_WAVEFORM_H - 3.0),
-        egui::pos2(row_rect.right(), row_rect.top() + TIMELINE_WAVEFORM_H),
-    );
-
-    for span in &teacher.ignore {
-        if !span.overlaps(row_start, row_end) {
-            continue;
-        }
-        let (x0, x1) = teacher_span_x(*span, row_rect, row_start, row_secs);
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x0, loudness_rect.top()),
-                egui::pos2(x1, loudness_rect.bottom()),
-            ),
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(170, 185, 200, 32),
-        );
-    }
-
-    for span in &teacher.segments {
-        if !span.overlaps(row_start, row_end) {
-            continue;
-        }
-        let (x0, x1) = teacher_span_x(*span, row_rect, row_start, row_secs);
-        let loudness_span = egui::Rect::from_min_max(
-            egui::pos2(x0, loudness_rect.top()),
-            egui::pos2(x1, loudness_rect.bottom()),
-        );
-        painter.rect_filled(
-            loudness_span,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(28, 168, 255, 92),
-        );
-        painter.rect_stroke(
-            loudness_span,
-            0.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(82, 220, 255, 165),
-            ),
-            egui::StrokeKind::Inside,
-        );
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x0, waveform_marker.top()),
-                egui::pos2(x1, waveform_marker.bottom()),
-            ),
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(48, 220, 255, 120),
-        );
-        if x1 - x0 > 56.0 && span.start >= row_start && span.start <= row_end {
-            painter.text(
-                egui::pos2(x0 + 4.0, loudness_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                "teacher vocal",
-                egui::FontId::monospace(10.0),
-                egui::Color32::from_rgba_unmultiplied(210, 246, 255, 220),
-            );
-        }
-    }
-}
-
-fn teacher_span_x(
-    span: TimeSpan,
-    row_rect: egui::Rect,
-    row_start: f64,
-    row_secs: f64,
-) -> (f32, f32) {
-    let row_end = row_start + row_secs;
-    let start = span.start.max(row_start).min(row_end);
-    let end = span.end.max(row_start).min(row_end);
-    let x0 = row_rect.left() + ((start - row_start) / row_secs) as f32 * row_rect.width();
-    let x1 = row_rect.left() + ((end - row_start) / row_secs) as f32 * row_rect.width();
-    (x0, x1.max(x0 + 1.0).min(row_rect.right()))
 }
 
 fn draw_playhead(
@@ -2636,38 +2437,6 @@ fn transient_color(band: [f32; 3], strength: f32) -> egui::Color32 {
     brighten_color(color, 1.0 + strength.clamp(0.0, 1.0) * 0.24)
 }
 
-fn loudness_color(value: f32, vocal_score: f32) -> egui::Color32 {
-    let value = value.clamp(0.0, 1.0);
-    let warm = if value < 0.58 {
-        lerp_color(
-            egui::Color32::from_rgb(40, 190, 80),
-            egui::Color32::from_rgb(215, 225, 54),
-            value / 0.58,
-        )
-    } else {
-        lerp_color(
-            egui::Color32::from_rgb(215, 225, 54),
-            egui::Color32::from_rgb(248, 72, 38),
-            (value - 0.58) / 0.42,
-        )
-    };
-    let cool = if value < 0.58 {
-        lerp_color(
-            egui::Color32::from_rgb(20, 155, 170),
-            egui::Color32::from_rgb(45, 220, 230),
-            value / 0.58,
-        )
-    } else {
-        lerp_color(
-            egui::Color32::from_rgb(45, 220, 230),
-            egui::Color32::from_rgb(94, 150, 255),
-            (value - 0.58) / 0.42,
-        )
-    };
-    let vocal = vocal_score.clamp(0.0, 1.0).powf(0.75) * 0.90;
-    color_with_alpha(lerp_color(warm, cool, vocal), 210)
-}
-
 fn spectrum_color(index: usize, total: usize, value: f32) -> egui::Color32 {
     let t = if total <= 1 {
         0.0
@@ -3023,5 +2792,44 @@ mod tests {
         }
 
         assert!(targets[10] > 0.65);
+    }
+
+    #[test]
+    fn timeline_metric_values_stay_normalized() {
+        let bin = WaveformBin {
+            loudness_db: -18.0,
+            band_energy: [0.62, 0.18, 0.72],
+            transient: 0.55,
+            center_ratio: 0.86,
+            vocal_score: 0.42,
+            ..WaveformBin::default()
+        };
+
+        for kind in TIMELINE_METRIC_KINDS {
+            let value = timeline_metric_value(kind, &bin);
+            assert!((0.0..=1.0).contains(&value), "{kind:?}={value}");
+        }
+        assert!(timeline_metric_value(TimelineMetricKind::Bass, &bin) > 0.9);
+        assert!(timeline_metric_value(TimelineMetricKind::Vocal, &bin) > 0.4);
+    }
+
+    #[test]
+    fn timeline_bin_lookup_uses_time_span() {
+        let bins = [
+            WaveformBin {
+                start_secs: 0.0,
+                duration_secs: 0.5,
+                ..WaveformBin::default()
+            },
+            WaveformBin {
+                start_secs: 0.5,
+                duration_secs: 0.5,
+                rms: 0.7,
+                ..WaveformBin::default()
+            },
+        ];
+
+        let bin = timeline_bin_at_time(&bins, 0.75).expect("bin");
+        assert_eq!(bin.rms, 0.7);
     }
 }

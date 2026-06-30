@@ -30,51 +30,16 @@ Use a JSON file with one or more tracks:
   noise, or model-generated labels that should not count as either positive or
   negative.
 
-## Generate Teacher Labels
+## Generate Labels
 
-Teacher labels should normally be generated from a stronger external tool rather
-than authored from scratch by hand. For the first lab pass, use Demucs to create
-a vocal stem and convert the stem envelope into `vocal` intervals:
+Labels may be drafted with stronger external tools, including tools that are too
+large or too license-sensitive to ship with mIV. The lab app no longer starts a
+heavy model sidecar by itself; generate or edit the JSON outside the Rust app,
+check the spans by ear, and pass the finished file to `vocal_eval`.
 
-```powershell
-$venv = "$env:TEMP\miv_demucs_venv"
-python -m venv --system-site-packages $venv
-& "$venv\Scripts\python.exe" -m pip install demucs soundfile
-& "$venv\Scripts\python.exe" tools/music_lab/scripts/demucs_vocal_teacher.py `
-  "C:\path\to\song-or-video.mp4" `
-  --out "$env:TEMP\miv_music_eval\song.demucs_teacher.json" `
-  --work-dir "$env:TEMP\miv_music_eval" `
-  --reuse
-```
-
-The helper intentionally runs outside the Rust application. Demucs, PyTorch,
-model weights, and Python runtime dependencies are only used to generate local
-teacher data and are not bundled with mIV.
-
-`demucs_vocal_teacher.py` writes:
-
-- `metadata.source_media`: original file used to create the teacher data.
-- `metadata.evaluation_audio`: extracted WAV used for repeatable evaluation.
-- `metadata.vocal_stem`: generated vocal stem.
-- `tracks[0].vocal`: generated vocal intervals.
-- `tracks[0].ignore`: small boundary spans excluded from scoring.
-
-When `vocal_eval` has trouble opening a Unicode-heavy video path on Windows, run
-the generator with `--track-path extracted`. The label JSON then points to the
-extracted WAV while keeping the original source path in metadata:
-
-```powershell
-& "$venv\Scripts\python.exe" tools/music_lab/scripts/demucs_vocal_teacher.py `
-  "C:\path\to\song-or-video.mp4" `
-  --out "$env:TEMP\miv_music_eval\song.demucs_teacher.eval_wav.json" `
-  --work-dir "$env:TEMP\miv_music_eval" `
-  --track-path extracted `
-  --reuse
-```
-
-Thresholds such as `--vocal-db` and `--ratio-db` are part of the teacher-data
-conversion from vocal stem to intervals. If the generated spans are too broad or
-too sparse, regenerate the JSON with adjusted thresholds and compare by ear.
+If an external tool has trouble with a Unicode-heavy video path on Windows,
+extract a temporary WAV and point `tracks[].path` at that WAV. Keep the original
+source path in your own notes or optional metadata if needed.
 
 ## Run Evaluation
 
@@ -107,31 +72,11 @@ The seconds columns are weighted by timeline bin duration, so longer errors coun
 more than short boundary errors.
 
 For the lightweight DSP detector, do not tune against teacher data as if it were
-perfect ground truth. Demucs teacher spans are useful and usually accurate, but
-they can include vocal-like effects, reverb tails, or extra sections. The target
-for the built-in DSP is a plausible, responsive hint: keep false positives low
-enough that instrumental gaps remain readable, and accept that strongly
-processed vocals, rap-like delivery, or demixed-teacher-only cues may be missed
-unless the optional high-accuracy sidecar is used.
-
-## music_lab UI Integration
-
-When `music_lab` opens an audio or video file, including file drag-and-drop, it
-also starts the Demucs teacher helper in a background worker when the script is
-available. The UI thread never waits for Demucs. While the sidecar is running,
-the top bar and right details panel show `Teacher: analyzing ...`; when it
-finishes, generated vocal spans are overlaid on the timeline loudness row in
-cyan and listed in the right panel.
-
-Python resolution order:
-
-1. `MIV_MUSIC_TEACHER_PYTHON`
-2. `%TEMP%\miv_demucs_venv_py313\Scripts\python.exe`
-3. `python` from `PATH`
-
-The generated JSON, extracted WAV, and vocal stem are stored under
-`%TEMP%\miv_music_lab_teacher`. This is lab-only cache data and should not be
-committed.
+perfect ground truth. Strong external labels are useful, but they can include
+vocal-like effects, reverb tails, or extra sections. The target for the built-in
+DSP is a plausible, responsive hint: keep false positives low enough that
+instrumental gaps remain readable, and accept that strongly processed vocals or
+rap-like delivery may be missed.
 
 ## Teacher Data Policy
 

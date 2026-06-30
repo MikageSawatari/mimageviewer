@@ -56,23 +56,22 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - Clean MVP は数秒窓の mid-band energy、harmonicity、spectral flatness、onset density から
     vocal-likelihood を作り、歌い出し候補時刻だけをキャッシュする。
   - 初期実装は `WaveformBin.vocal_score` として、軽量 DSP の中域比率 / zero-crossing /
-    crest / transient 抑制 / 約 1 秒の持続性から 0..1 のスコアを作る。ラウドネス下段は
-    `vocal_score` が高い区間だけ寒色へ寄せる。
+    crest / transient 抑制 / 約 1 秒の持続性から 0..1 のスコアを作る。
+    タイムライン下段はラウドネスと混色せず、vocal hint を独立レーンとして表示する。
   - 散発的な誤反応を避けるため、短い断片は捨て、約 2 秒以上まとまる候補だけを表示する。
     autocorrelation による有声音の周期性も加えて、ノイズ的な中域反応を抑える。
     倍音/周期性はギターやシンセにも出るため、軽量 DSP だけではインストとの完全分離は期待しない。
     次の改善候補は formant 風の中域包絡や YAMNet / PANNs sidecar との比較。
-    Demucs teacher は短いボーカルの途切れをフレーズ内の穴として扱う傾向が強いため、
-    軽量 DSP も短いギャップは bridge し、明確な終了では release を速める。
-    男性ボーカル / ラップ / 強い加工声では teacher と軽量 DSP のズレが大きくなりやすいので、
-    評価セットに含める。軽量 DSP は teacher 完全一致ではなく、低 FP 寄りの「それっぽいヒント」
-    を合格ラインにする。高精度が必要な曲は optional Demucs sidecar の結果をキャッシュする。
+    短いギャップは bridge し、明確な終了では release を速める。
+    男性ボーカル / ラップ / 強い加工声では高精度ラベルと軽量 DSP のズレが大きくなりやすいので、
+    評価セットに含める。軽量 DSP は完全一致ではなく、低 FP 寄りの「それっぽいヒント」
+    を合格ラインにする。
   - DSP の調整は [music-lab-vocal-eval.md](music-lab-vocal-eval.md) の教師ラベル JSON と
     `cargo run -p music_lab --bin vocal_eval -- labels.json` で precision / recall を見ながら進める。
-    教師ラベルは手入力を正本にせず、まず `tools/music_lab/scripts/demucs_vocal_teacher.py`
-    で外部 Demucs vocal stem 由来の JSON を生成し、耳で確認してから DSP の評価に使う。
+    教師ラベルは手入力を正本にせず外部高精度ツールで作ってよいが、重いモデルの起動コードは
+    lab 本体に持たせず、生成済み JSON を明示的に評価 CLI へ渡す。
   - All-In-One の demixed vocal stem や embeddings を利用できるか評価する。
-  - Demucs / htdemucs は MIT だが重いため、必要なら任意のバックグラウンド高精度解析として扱う。
+  - 重い音源分離 / 高精度モデルは lab 本体から起動せず、必要なら外部で評価ラベルを生成して持ち込む。
   - inaSpeechSegmenter は MIT だが singing voice は music 扱いなので、歌あり区間の検出にはそのまま使わない。
   - SingingVoiceDetection 系の MIT 実装や music tagging モデルを、ONNX 化できるか確認する。
 
@@ -88,14 +87,13 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
 2. `music_lab`
   - 音声ファイル、または動画ファイル内の音声トラックを開く
   - Open ダイアログとファイル D&D の両方で読み込みを開始する
-  - Open / D&D 時に外部 Demucs teacher sidecar が利用可能ならバックグラウンドで起動し、
-    生成された vocal 区間をタイムラインと右 details panel に重ねて表示する
   - 全尺 decode + timeline analysis
    - Play/Pause/Stop/seek 用の最小プレイヤー
    - 左 bookmark / 右 details / 中央 30 秒 1 行 timeline
      - 上段: 周波数色分けした DJ 風の塗り波形
      - 音量の縦ラインを低 / 中 / 高域で分割して塗り、強い立ち上がりだけ transient accent として重ねる
-     - 下段: ラウドネス面グラフ
+     - 下段: Loudness / Bass / Brightness / Transient / Center / Vocal hint の独立メトリクスレーン
+     - メトリクスレーンはホバーでレーン名、値、時刻、意味を表示する
      - 再生位置の行全体が表示中に見切れる / 画面外へ出る場合だけ自動スクロールし、手動スクロール中は追従しない
    - 下段 108-band analyzer + 減衰背景
      - 20 Hz - 18 kHz を約 1 semitone 幅で分割する想定
