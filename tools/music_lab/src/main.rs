@@ -2676,8 +2676,8 @@ fn spectrum_color(index: usize, total: usize, value: f32) -> egui::Color32 {
     };
     let base = if t < 0.20 {
         lerp_color(
-            egui::Color32::from_rgb(244, 42, 24),
-            egui::Color32::from_rgb(255, 154, 22),
+            egui::Color32::from_rgb(188, 58, 34),
+            egui::Color32::from_rgb(236, 132, 34),
             t / 0.20,
         )
     } else if t < 0.52 {
