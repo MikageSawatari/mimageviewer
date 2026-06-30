@@ -63,6 +63,7 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 const SPECTRUM_BANDS: usize = 108;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
+const SPECTRUM_SNAPSHOT_RADIUS_SECS: f64 = 1.0;
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
 const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
@@ -218,7 +219,9 @@ struct SpectrumMsg {
 }
 
 struct SpectrumRequest {
-    position_secs: f64,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    center_secs: f64,
 }
 
 #[derive(Default)]
@@ -1075,9 +1078,9 @@ impl MusicLabApp {
             .exact_height(190.0)
             .frame(app_panel_frame())
             .show(ctx, |ui| {
-                if self.track.is_none() {
+                if self.player.is_none() {
                     let text = if self.loading_track.is_some() {
-                        "Spectrum analyzer will start after timeline analysis"
+                        "Spectrum analyzer waiting for playback buffer"
                     } else {
                         "Spectrum analyzer placeholder"
                     };
@@ -1138,6 +1141,7 @@ impl MusicLabApp {
         let streaming_sink = match LabPlayer::new_streaming(AudioStreamInfo::default(), true) {
             Ok((player, sink)) => {
                 self.player = Some(player);
+                self.start_spectrum_worker(ctx);
                 Some(sink)
             }
             Err(err) => {
@@ -1308,13 +1312,15 @@ impl MusicLabApp {
                     self.timeline_cache.invalidate_all_rows();
                     if self.player.is_none() {
                         match LabPlayer::new(Arc::clone(&track.decoded), true) {
-                            Ok(player) => self.player = Some(player),
+                            Ok(player) => {
+                                self.player = Some(player);
+                                self.start_spectrum_worker(ctx);
+                            }
                             Err(err) => {
                                 self.load_status = format!("Loaded; playback disabled: {err}")
                             }
                         }
                     }
-                    self.start_spectrum_worker(Arc::clone(&track.decoded), ctx);
                     self.track = Some(track);
                     clear_loader = true;
                     ctx.request_repaint();
@@ -1386,8 +1392,15 @@ impl MusicLabApp {
         let Some(tx) = self.spectrum_tx.as_ref() else {
             return;
         };
-        let position_secs = self.player_snapshot().position_secs;
-        if tx.send(SpectrumRequest { position_secs }).is_ok() {
+        let Some(request) = self
+            .player
+            .as_ref()
+            .and_then(|player| player.spectrum_request())
+        else {
+            ctx.request_repaint_after(Duration::from_millis(20));
+            return;
+        };
+        if tx.send(request).is_ok() {
             self.spectrum_pending = true;
             self.last_spectrum_request = Some(Instant::now());
             ctx.request_repaint_after(SPECTRUM_REFRESH_INTERVAL);
@@ -1398,7 +1411,10 @@ impl MusicLabApp {
         }
     }
 
-    fn start_spectrum_worker(&mut self, decoded: Arc<DecodedAudio>, ctx: &egui::Context) {
+    fn start_spectrum_worker(&mut self, ctx: &egui::Context) {
+        if self.spectrum_tx.is_some() {
+            return;
+        }
         let (request_tx, request_rx) = mpsc::channel::<SpectrumRequest>();
         let (result_tx, result_rx) = mpsc::channel::<SpectrumMsg>();
         let repaint_ctx = ctx.clone();
@@ -1412,9 +1428,9 @@ impl MusicLabApp {
                     }
                     let compute_start = Instant::now();
                     let analysis = analyzer.analyze(
-                        &decoded.stereo_samples,
-                        decoded.info.sample_rate,
-                        request.position_secs,
+                        &request.samples,
+                        request.sample_rate,
+                        request.center_secs,
                     );
                     let compute_ms = compute_start.elapsed().as_secs_f32() * 1000.0;
                     if result_tx
@@ -3966,6 +3982,47 @@ impl LabPlayer {
             effect_latency_samples: 0,
         }
     }
+
+    fn spectrum_request(&self) -> Option<SpectrumRequest> {
+        let Ok(s) = self.shared.try_lock() else {
+            return None;
+        };
+        spectrum_request_from_samples(
+            &s.samples,
+            s.sample_rate,
+            s.position_frames,
+            SPECTRUM_SNAPSHOT_RADIUS_SECS,
+        )
+    }
+}
+
+fn spectrum_request_from_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    position_frames: usize,
+    radius_secs: f64,
+) -> Option<SpectrumRequest> {
+    let available_frames = samples.len() / 2;
+    if sample_rate == 0 || available_frames == 0 {
+        return None;
+    }
+    let center_frame = position_frames.min(available_frames.saturating_sub(1));
+    let radius_frames = (radius_secs.max(0.05) * sample_rate as f64)
+        .round()
+        .max(1.0) as usize;
+    let start_frame = center_frame.saturating_sub(radius_frames);
+    let end_frame = center_frame
+        .saturating_add(radius_frames)
+        .saturating_add(1)
+        .min(available_frames);
+    if end_frame <= start_frame {
+        return None;
+    }
+    Some(SpectrumRequest {
+        samples: samples[start_frame * 2..end_frame * 2].to_vec(),
+        sample_rate,
+        center_secs: (center_frame - start_frame) as f64 / sample_rate as f64,
+    })
 }
 
 impl StreamingAudioSink {
@@ -4201,6 +4258,33 @@ mod tests {
 
         assert_eq!(cache.generation, generation);
         assert_eq!(cache.row_versions, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn spectrum_request_uses_streaming_sample_window() {
+        let samples: Vec<f32> = (0..20).map(|idx| idx as f32).collect();
+
+        let request = spectrum_request_from_samples(&samples, 10, 6, 0.2)
+            .expect("streaming samples should produce a spectrum request");
+
+        assert_eq!(request.sample_rate, 10);
+        assert!((request.center_secs - 0.2).abs() < f64::EPSILON);
+        assert_eq!(
+            request.samples,
+            vec![8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]
+        );
+    }
+
+    #[test]
+    fn spectrum_request_clamps_to_available_streaming_samples() {
+        let samples: Vec<f32> = (0..8).map(|idx| idx as f32).collect();
+
+        let request = spectrum_request_from_samples(&samples, 10, 99, 1.0)
+            .expect("available samples should produce a clamped spectrum request");
+
+        assert_eq!(request.sample_rate, 10);
+        assert!((request.center_secs - 0.3).abs() < f64::EPSILON);
+        assert_eq!(request.samples, samples);
     }
 
     #[test]
