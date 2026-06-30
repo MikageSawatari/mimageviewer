@@ -1427,7 +1427,7 @@ impl MusicLabApp {
                         request = next;
                     }
                     let compute_start = Instant::now();
-                    let analysis = analyzer.analyze(
+                    let analysis = analyzer.analyze_moving_window(
                         &request.samples,
                         request.sample_rate,
                         request.center_secs,

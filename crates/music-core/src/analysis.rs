@@ -463,6 +463,24 @@ impl SpectrumAnalyzer {
         }
     }
 
+    /// Analyze a short sliding sample window whose contents can change even when
+    /// its length and local center position stay the same.
+    pub fn analyze_moving_window(
+        &mut self,
+        stereo_samples: &[f32],
+        sample_rate: u32,
+        center_secs: f64,
+    ) -> SpectrumAnalysis {
+        self.invalidate_cached_windows();
+        self.analyze(stereo_samples, sample_rate, center_secs)
+    }
+
+    fn invalidate_cached_windows(&mut self) {
+        for window in &mut self.windows {
+            window.last_center_frame = None;
+        }
+    }
+
     fn update_windows(&mut self, stereo_samples: &[f32], sample_rate: u32, center_secs: f64) {
         let frame_count = stereo_samples.len() / 2;
         let center_frame = if center_secs.is_finite() {
@@ -1623,6 +1641,34 @@ mod tests {
         );
         let a4 = (69 - spectrum.note_min_midi) as usize;
         assert!(spectrum.notes[a4] > 0.5);
+    }
+
+    #[test]
+    fn spectrum_moving_window_recomputes_when_samples_change_at_same_center() {
+        fn tone(hz: f32) -> Vec<f32> {
+            let mut samples = Vec::new();
+            for i in 0..96_000 {
+                let phase = std::f32::consts::TAU * hz * i as f32 / 48_000.0;
+                let x = phase.sin() * 0.6;
+                samples.extend([x, x]);
+            }
+            samples
+        }
+
+        let mut analyzer = SpectrumAnalyzer::new(108);
+        let a4_tone = analyzer.analyze_moving_window(&tone(440.0), 48_000, 1.0);
+        let a5_tone = analyzer.analyze_moving_window(&tone(880.0), 48_000, 1.0);
+        let a4 = (69 - a4_tone.note_min_midi) as usize;
+        let a5 = (81 - a4_tone.note_min_midi) as usize;
+
+        assert!(
+            a4_tone.notes[a4] > a4_tone.notes[a5] * 1.4,
+            "A4 note should dominate for 440 Hz"
+        );
+        assert!(
+            a5_tone.notes[a5] > a5_tone.notes[a4] * 1.4,
+            "A5 note should dominate after moving window content changes"
+        );
     }
 
     #[test]
