@@ -38,6 +38,8 @@ const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
 const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
 const KEY_HIGHLIGHT_MIN_PEAK: f32 = 0.035;
+const KEY_SUSTAIN_ATTACK: f32 = 0.18;
+const KEY_SUSTAIN_RELEASE: f32 = 0.965;
 const SPECTRUM_ANALYSIS_MIN_HZ: f32 = 20.0;
 const SPECTRUM_AXIS_MIN_HZ: f32 = SPECTRUM_ANALYSIS_MIN_HZ;
 const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
@@ -455,6 +457,7 @@ struct MusicLabApp {
     spectrum_prev_bands: Vec<f32>,
     spectrum_onsets: Vec<f32>,
     spectrum_notes: Vec<f32>,
+    spectrum_note_sustain: Vec<f32>,
     spectrum_note_trail: Vec<f32>,
     spectrum_tx: Option<mpsc::Sender<SpectrumRequest>>,
     spectrum_rx: Option<mpsc::Receiver<SpectrumMsg>>,
@@ -754,6 +757,7 @@ impl MusicLabApp {
                     &mut self.spectrum_prev_bands,
                     &mut self.spectrum_onsets,
                     &self.spectrum_notes,
+                    &mut self.spectrum_note_sustain,
                     &mut self.spectrum_note_trail,
                 );
             });
@@ -783,6 +787,7 @@ impl MusicLabApp {
         self.spectrum_prev_bands.clear();
         self.spectrum_onsets.clear();
         self.spectrum_notes.clear();
+        self.spectrum_note_sustain.clear();
         self.spectrum_note_trail.clear();
         self.spectrum_tx = None;
         self.spectrum_rx = None;
@@ -1033,9 +1038,12 @@ fn draw_timeline(
         row_gap,
         rows,
     ) {
-        if clip_rect.intersects(playhead_rect) {
+        let vertically_visible = clip_rect.intersects(playhead_rect);
+        let fully_visible = clip_rect_vertically_contains(clip_rect, playhead_rect);
+        if vertically_visible {
             *follow_playhead = true;
-        } else if snap.playing && *follow_playhead {
+        }
+        if snap.playing && *follow_playhead && !fully_visible {
             ui.scroll_to_rect(playhead_rect.expand(row_gap), None);
         }
     }
@@ -1099,6 +1107,10 @@ fn draw_timeline(
         }
     }
     stats
+}
+
+fn clip_rect_vertically_contains(clip_rect: egui::Rect, target: egui::Rect) -> bool {
+    target.top() >= clip_rect.top() && target.bottom() <= clip_rect.bottom()
 }
 
 fn timeline_manual_scroll_requested(
@@ -1612,6 +1624,7 @@ fn draw_spectrum(
     prev_bands: &mut Vec<f32>,
     onsets: &mut Vec<f32>,
     notes: &[f32],
+    note_sustain: &mut Vec<f32>,
     note_trail: &mut Vec<f32>,
 ) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
@@ -1649,7 +1662,7 @@ fn draw_spectrum(
     );
 
     if bands.is_empty() {
-        draw_pitch_keyboard(&painter, keyboard_rect, notes, note_trail);
+        draw_pitch_keyboard(&painter, keyboard_rect, notes, note_sustain, note_trail);
         return;
     }
     if trail.len() != bands.len() {
@@ -1725,7 +1738,7 @@ fn draw_spectrum(
     {
         draw_spectrum_hover(&painter, plot, pointer);
     }
-    draw_pitch_keyboard(&painter, keyboard_rect, notes, note_trail);
+    draw_pitch_keyboard(&painter, keyboard_rect, notes, note_sustain, note_trail);
 }
 
 fn draw_spectrum_hover(painter: &egui::Painter, plot: egui::Rect, pointer: egui::Pos2) {
@@ -1777,15 +1790,21 @@ fn draw_pitch_keyboard(
     painter: &egui::Painter,
     rect: egui::Rect,
     notes: &[f32],
+    note_sustain: &mut Vec<f32>,
     note_trail: &mut Vec<f32>,
 ) {
     painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
     let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+    if note_sustain.len() != note_count {
+        note_sustain.clear();
+        note_sustain.resize(note_count, 0.0);
+    }
     if note_trail.len() != note_count {
         note_trail.clear();
         note_trail.resize(note_count, 0.0);
     }
-    let highlight_targets = keyboard_highlight_targets(notes, note_count);
+    let sustained_notes = update_keyboard_sustain(notes, note_sustain);
+    let highlight_targets = keyboard_highlight_targets(&sustained_notes, note_count);
     for (trail, target) in note_trail.iter_mut().zip(highlight_targets) {
         *trail = (*trail * KEY_HIGHLIGHT_DECAY).max(target);
     }
@@ -1869,6 +1888,35 @@ fn draw_pitch_keyboard(
     }
 }
 
+fn update_keyboard_sustain(notes: &[f32], sustain: &mut [f32]) -> Vec<f32> {
+    let mut sustained = Vec::with_capacity(sustain.len());
+    let raw_peak = (0..sustain.len())
+        .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
+        .fold(0.0_f32, f32::max);
+    let broad_threshold = raw_peak * 0.42;
+    let broad_count = if raw_peak > KEY_HIGHLIGHT_MIN_PEAK {
+        (0..sustain.len())
+            .filter(|idx| notes.get(*idx).copied().unwrap_or(0.0).clamp(0.0, 1.0) > broad_threshold)
+            .count()
+    } else {
+        0
+    };
+    let broad_ratio = broad_count as f32 / sustain.len().max(1) as f32;
+    let attack_scale = if broad_ratio > 0.34 { 0.35 } else { 1.0 };
+
+    for (idx, slot) in sustain.iter_mut().enumerate() {
+        let current = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        if current >= *slot {
+            let attack = KEY_SUSTAIN_ATTACK * attack_scale;
+            *slot = *slot * (1.0 - attack) + current * attack;
+        } else {
+            *slot = (*slot * KEY_SUSTAIN_RELEASE).max(current);
+        }
+        sustained.push(*slot);
+    }
+    sustained
+}
+
 fn keyboard_highlight_targets(notes: &[f32], note_count: usize) -> Vec<f32> {
     let raw: Vec<f32> = (0..note_count)
         .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
@@ -1892,6 +1940,7 @@ fn keyboard_highlight_targets(notes: &[f32], note_count: usize) -> Vec<f32> {
         return vec![0.0; note_count];
     }
     let floor = (prominence_peak * 0.08).max(0.006);
+    let sustained_presence = ((peak - 0.06) / 0.28).clamp(0.0, 1.0).powf(0.7);
     prominence
         .into_iter()
         .zip(raw)
@@ -1900,7 +1949,7 @@ fn keyboard_highlight_targets(notes: &[f32], note_count: usize) -> Vec<f32> {
                 .clamp(0.0, 1.0)
                 .powf(1.35);
             let loudness = (raw_value / peak).clamp(0.0, 1.0).powf(0.20);
-            contrast * loudness
+            contrast * loudness * sustained_presence
         })
         .collect()
 }
@@ -2466,5 +2515,34 @@ mod tests {
         assert!(targets[14] > 0.45);
         assert!(targets[9] < 0.10);
         assert!(targets[11] < 0.10);
+    }
+
+    #[test]
+    fn keyboard_sustain_suppresses_broad_single_frame_transients() {
+        let mut sustain = vec![0.0; 24];
+        let mut transient = vec![0.0; 24];
+        for idx in 5..19 {
+            transient[idx] = 0.95;
+        }
+
+        let sustained = update_keyboard_sustain(&transient, &mut sustain);
+        let targets = keyboard_highlight_targets(&sustained, sustained.len());
+
+        assert!(targets.iter().all(|value| *value < 0.12));
+    }
+
+    #[test]
+    fn keyboard_sustain_brightens_continuing_tones() {
+        let mut sustain = vec![0.0; 24];
+        let mut notes = vec![0.02; 24];
+        notes[10] = 0.85;
+
+        let mut targets = Vec::new();
+        for _ in 0..8 {
+            let sustained = update_keyboard_sustain(&notes, &mut sustain);
+            targets = keyboard_highlight_targets(&sustained, sustained.len());
+        }
+
+        assert!(targets[10] > 0.65);
     }
 }
