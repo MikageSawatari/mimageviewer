@@ -26,6 +26,7 @@ const TIMELINE_METRIC_LANE_COUNT: usize = 7;
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
+const TIMELINE_ROW_RASTER_BUDGET_PER_FRAME: usize = 1;
 const TIMELINE_ROW_SECS_CHOICES: [f64; 8] = [5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
@@ -361,6 +362,7 @@ struct TimelineTextureCache {
 }
 
 struct TimelineRowTexture {
+    key: TimelineTextureCacheKey,
     texture: egui::TextureHandle,
     represented_bins: usize,
 }
@@ -388,8 +390,8 @@ impl TimelineTextureCache {
             return;
         }
         self.key = Some(key);
-        self.rows.clear();
         self.rows.resize_with(key.rows, || None);
+        self.rows.truncate(key.rows);
     }
 
     fn row_texture(
@@ -399,13 +401,18 @@ impl TimelineTextureCache {
         row: usize,
         row_secs: f64,
         key: TimelineTextureCacheKey,
+        raster_budget: &mut usize,
     ) -> Option<(&egui::TextureHandle, usize, bool)> {
         self.ensure(key);
         if row >= self.rows.len() {
             return None;
         }
         let mut cache_miss = false;
-        if self.rows[row].is_none() {
+        let stale = self.rows[row]
+            .as_ref()
+            .is_some_and(|row_texture| row_texture.key != key);
+        if (self.rows[row].is_none() || stale) && *raster_budget > 0 {
+            *raster_budget -= 1;
             let row_start = row as f64 * row_secs;
             let (image, represented_bins) = render_timeline_row_image(
                 row_start,
@@ -428,6 +435,7 @@ impl TimelineTextureCache {
                 egui::TextureOptions::LINEAR,
             );
             self.rows[row] = Some(TimelineRowTexture {
+                key,
                 texture,
                 represented_bins,
             });
@@ -435,6 +443,13 @@ impl TimelineTextureCache {
         }
         let row = self.rows[row].as_ref()?;
         Some((&row.texture, row.represented_bins, cache_miss))
+    }
+
+    fn row_is_fresh(&self, row: usize, key: TimelineTextureCacheKey) -> bool {
+        self.rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .is_some_and(|row_texture| row_texture.key == key)
     }
 }
 
@@ -1073,6 +1088,8 @@ fn draw_timeline(
         }
     }
 
+    let mut raster_budget = TIMELINE_ROW_RASTER_BUDGET_PER_FRAME;
+    let mut pending_raster = false;
     for row in 0..rows {
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
         let row_rect = egui::Rect::from_min_size(
@@ -1084,9 +1101,18 @@ fn draw_timeline(
         }
         let row_start = row as f64 * row_secs;
         stats.visible_rows += 1;
-        if let Some((texture, represented_bins, cache_miss)) =
-            cache.row_texture(ui.ctx(), track, row, row_secs, texture_key)
-        {
+        let fresh_before = cache.row_is_fresh(row, texture_key);
+        if !fresh_before {
+            pending_raster = true;
+        }
+        if let Some((texture, represented_bins, cache_miss)) = cache.row_texture(
+            ui.ctx(),
+            track,
+            row,
+            row_secs,
+            texture_key,
+            &mut raster_budget,
+        ) {
             painter.image(
                 texture.id(),
                 row_rect,
@@ -1106,6 +1132,9 @@ fn draw_timeline(
             ui.visuals().text_color(),
         );
         draw_beat_grid(&painter, row_rect, row_start, row_secs, &track.analysis);
+    }
+    if pending_raster {
+        ui.ctx().request_repaint_after(Duration::from_millis(1));
     }
 
     draw_playhead(
