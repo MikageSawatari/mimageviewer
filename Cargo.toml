@@ -136,6 +136,11 @@ local-adjust-core = { path = "crates/local-adjust-core" }
 # egui 非依存。bake_overlay_with_stamps / scale_scene 等を本体から呼ぶ (統合計画
 # docs/comic-integration-plan.md §2)。Inc 0 で配線、実使用は Inc 1 以降。
 comic-core = { path = "crates/comic-core" }
+# 音楽ビュー (音声再生・DJ 風タイムライン・スペクトラム解析) の純ロジック。
+# egui / cpal / FFmpeg / VST3 非依存 (rustfft + serde のみ)。analyze_stereo_timeline /
+# SpectrumAnalyzer / MediaVisualMode 等を本体から呼ぶ (統合計画
+# docs/music-integration-plan.md §2.1)。Inc 0 で配線、実使用は Inc 2 以降。
+music-core = { path = "crates/music-core" }
 # 絵文字スタンプ (Twemoji SVG) を表示時に RGBA へラスタライズする。純 Rust
 # (usvg + tiny-skia) なので crt-static と両立。SVG バイトは build.rs が
 # vendor/twemoji/svg/*.svg から include_bytes! で exe へ同梱する (Inc 4c、

@@ -106,6 +106,7 @@
 | [video-engine-redesign.md](video-engine-redesign.md) | エンジン側 (`AvClock` / `EngineActor` / `MasterClock` / `AudioBookkeeping`) のリデザイン経緯と各 Phase 詳細。Phase 8.K の pacing 仕様、Phase 9 の 3-thread 分離、Phase 9.A〜9.G の追加修正 (wall-rate cap / cpal warmup silence / forward seek backward+preroll / perf overlay seek freeze 等) を網羅 |
 | [audio-normalize-scan-bench.md](audio-normalize-scan-bench.md) | 音量ノーマライズ初回スキャン待ち時間の実測用 CLI (`normalize_scan_bench`) と、HDD 上の動画で逐次 / 並列スキャンを比較するときの読み方 |
 | [music-lab-plan.md](music-lab-plan.md) | 音楽ファイル対応の分離ラボ設計。`crates/music-core` / `tools/music_lab`、動画の音楽モード化、VST3 bridge 接続を見越した effect-chain 境界 |
+| [music-integration-plan.md](music-integration-plan.md) | **実装中 (Inc 0〜、2026-07-01 起案)**。music lab を本体へ統合する契約書。`VideoPlayer` 再利用で再生/VST3/normalize を得て、`GridItem::Audio` + 音楽ビュー (timeline/spectrum + 上下バー常時) + 左ブックマーク (動画機構 `video_bookmarks*` 再利用) + 動画→音声モードを段階実装。実装=Claude / レビュー=Codex。§7.9 に music 固有のサブシステム配線コントラクト |
 | [vst3-integration.md](vst3-integration.md) | VST3 プラグイン統合 (v0.9.0+) — C++ bridge プロセス + Rust IPC、audio-pump からの bridge 経由、プラグイン GUI のクロスプロセス attach、チェーン編集 UI、再生中 VST3 パネル、後段 safety limiter |
 | [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消 + VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |
 

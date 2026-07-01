@@ -3867,6 +3867,7 @@ dependencies = [
  "kamadak-exif",
  "local-adjust-core",
  "lopdf",
+ "music-core",
  "ndarray",
  "notify",
  "opener",
