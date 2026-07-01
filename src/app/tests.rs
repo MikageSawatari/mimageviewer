@@ -16685,13 +16685,13 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
 
+        let committed = app.native_video_committed_generation_for(video);
         assert_eq!(
-            app.native_video_committed_generation_for(video),
-            0,
+            committed, 0,
             "a player without a live presenter reports committed generation 0"
         );
         assert!(
-            app.native_video_close_generation_accepted(video, 1),
+            App::native_video_close_generation_is_current(1, committed),
             "the first window's generation-1 close must be honored against committed=0"
         );
     }

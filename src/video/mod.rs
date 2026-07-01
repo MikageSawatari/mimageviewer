@@ -847,7 +847,7 @@ impl NativeVideoOutput {
     }
 
     #[allow(dead_code)]
-    fn committed_generation(&self) -> u64 {
+    pub(crate) fn committed_generation(&self) -> u64 {
         self.committed_generation.load(Ordering::Acquire)
     }
 
@@ -855,7 +855,7 @@ impl NativeVideoOutput {
     /// stale (request mismatch / out-of-order) な PlacementSwitched でも、presenter の
     /// 現世代を追い越すことは無いので max で吸収する。
     #[allow(dead_code)]
-    fn bump_committed_generation(&self, generation: u64) {
+    pub(crate) fn bump_committed_generation(&self, generation: u64) {
         let cur = self.committed_generation.load(Ordering::Acquire);
         if generation > cur {
             self.committed_generation
@@ -2489,8 +2489,10 @@ fn run_native_video_output(
                         let new_height = (new_rect.bottom - new_rect.top).max(1) as u32;
                         let new_mode = native_window_mode_for_placement(placement, new_rect);
                         // window を rebuild するので presenter 世代を進める。旧 HWND から
-                        // 遅れて届く close は旧世代のまま → App が棄却できる。
-                        cur_generation = cur_generation.wrapping_add(1);
+                        // 遅れて届く close は旧世代のまま → App が棄却できる。単調増加を
+                        // 保つため saturating (wrap して 0 に戻すと live window の close が
+                        // 永久 stale 化する; u64::MAX 到達は現実には起きない)。
+                        cur_generation = cur_generation.saturating_add(1);
                         let new_window_result =
                             crate::video::native_window::NativeVideoWindow::create(
                                 crate::video::native_window::NativeVideoWindowConfig {

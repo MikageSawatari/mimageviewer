@@ -40334,15 +40334,13 @@ impl App {
             //
             // ただし **stale 世代の CloseFullscreen (= 旧 presenter window 由来)** は
             // 棄却して presenter を生かすため terminal 扱いにしない。terminal にすると
-            // 現世代の後続イベントを取りこぼす。世代照合は handler と同じ committed で行う。
-            let terminal = match &event {
-                crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
-                    self.native_video_close_generation_accepted(idx, *generation)
-                }
-                _ => false,
-            };
+            // 現世代の後続イベントを取りこぼす。handler が世代/idx/source_epoch のどの
+            // 理由で close を無視しても fullscreen_idx は Some のまま残るので、「close が
+            // 実際に honored されて fullscreen が終了した (Some→None)」ときだけ batch を
+            // 打ち切る (Codex P2: terminal を handler の実挙動と一致させる)。
+            let was_fullscreen = self.fullscreen_idx.is_some();
             self.handle_native_video_output_event(ctx, idx, epoch, event);
-            if terminal {
+            if was_fullscreen && self.fullscreen_idx.is_none() {
                 break;
             }
         }

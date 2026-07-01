@@ -720,20 +720,43 @@ impl App {
 
     #[cfg(windows)]
     fn drain_native_video_source_swap_pending_events(&mut self, ctx: &egui::Context) {
-        let Some((fs_idx, events)) =
-            self.native_video_source_swap_pending
-                .as_ref()
-                .map(|pending| {
-                    (
-                        self.fullscreen_idx.unwrap_or(pending.target_idx),
-                        pending.native_output.drain_events(),
-                    )
-                })
+        // committed 世代は fs_cache ではなく **退避中の native_output** から読む。source
+        // swap 中は presenter が pending 側にあり fs_cache の player は native_output を
+        // 持たないため、fs_cache 経由だと committed=0 と誤認して旧世代 close を誤受理する
+        // (Codex P1)。placement switch 直後に navigation が deferred swap へ入ったケース。
+        let Some((fs_idx, mut committed, events)) = self
+            .native_video_source_swap_pending
+            .as_ref()
+            .map(|pending| {
+                (
+                    self.fullscreen_idx.unwrap_or(pending.target_idx),
+                    pending.native_output.committed_generation(),
+                    pending.native_output.drain_events(),
+                )
+            })
         else {
             return;
         };
         for (_epoch, event) in events {
             match event {
+                // window close (× / Alt+F4) も退避中 committed で gate する。通常経路の
+                // `handle_native_video_window_event` は fs_cache committed を見るため
+                // この drain では使えない。
+                crate::video::NativeVideoOutputEvent::Window(
+                    crate::video::native_window::NativeVideoWindowEvent::CloseRequested {
+                        generation,
+                    },
+                ) => {
+                    if !Self::accept_native_video_close_with_committed(
+                        committed,
+                        generation,
+                        "source_swap_window_close",
+                    ) {
+                        continue;
+                    }
+                    self.close_fullscreen();
+                    return;
+                }
                 crate::video::NativeVideoOutputEvent::Window(event) => {
                     self.handle_native_video_window_event(ctx, fs_idx, event);
                 }
@@ -741,11 +764,24 @@ impl App {
                     self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
                 }
                 crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
-                    if !self.accept_native_video_close(fs_idx, generation, "source_swap_close") {
+                    if !Self::accept_native_video_close_with_committed(
+                        committed,
+                        generation,
+                        "source_swap_close",
+                    ) {
                         continue;
                     }
                     self.close_fullscreen();
                     return;
+                }
+                crate::video::NativeVideoOutputEvent::PlacementSwitched { generation, .. } => {
+                    // source swap 中の placement switch も committed を追随させる。退避中の
+                    // native_output atomic に write-through して、swap 完了で native_output が
+                    // fs_cache へ戻ったあとの通常 handler でも正しい committed が見えるようにする。
+                    committed = committed.max(generation);
+                    if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+                        pending.native_output.bump_committed_generation(generation);
+                    }
                 }
                 _ => {}
             }
@@ -1916,17 +1952,28 @@ impl App {
         generation >= committed
     }
 
-    /// 指定 fs_idx の player が持つ committed 世代を参照して close 世代を判定する。
-    /// player / native_output が無いとき committed=0 とみなす (= 初回 window は世代 1
-    /// なので必ず受理される)。
+    /// committed 世代 (呼び出し側が取得済み) と close の世代を照合し、受理すべきかを
+    /// ログ付きで返す。`accept_native_video_close` (fs_cache 経路) と source swap drain
+    /// (退避中 native_output 経路) の両方から使う共通ロジック。
     #[cfg(windows)]
-    pub(crate) fn native_video_close_generation_accepted(
-        &self,
-        fs_idx: usize,
+    fn accept_native_video_close_with_committed(
+        committed: u64,
         generation: u64,
+        source: &str,
     ) -> bool {
-        let committed = self.native_video_committed_generation_for(fs_idx);
-        Self::native_video_close_generation_is_current(generation, committed)
+        let accepted = Self::native_video_close_generation_is_current(generation, committed);
+        if accepted {
+            crate::logger::log(format!(
+                "[native-video] accept close source={source} \
+                 generation={generation} committed={committed}"
+            ));
+        } else {
+            crate::logger::log(format!(
+                "[native-video] reject stale close source={source} \
+                 generation={generation} committed={committed}"
+            ));
+        }
+        accepted
     }
 
     /// 指定 fs_idx の player の committed 世代 (無ければ 0)。
@@ -1950,24 +1997,12 @@ impl App {
         }
     }
 
-    /// close イベントを世代照合し、受理 (= 実際に閉じる) すべきかをログ付きで返す。
-    /// stale なら `[native-video] reject stale close` を残して false。
+    /// close イベントを (fs_cache の player が持つ) committed 世代と照合し、受理すべきかを
+    /// ログ付きで返す。stale なら `[native-video] reject stale close` を残して false。
     #[cfg(windows)]
     fn accept_native_video_close(&self, fs_idx: usize, generation: u64, source: &str) -> bool {
         let committed = self.native_video_committed_generation_for(fs_idx);
-        let accepted = Self::native_video_close_generation_is_current(generation, committed);
-        if accepted {
-            crate::logger::log(format!(
-                "[native-video] accept close source={source} idx={fs_idx} \
-                 generation={generation} committed={committed}"
-            ));
-        } else {
-            crate::logger::log(format!(
-                "[native-video] reject stale close source={source} idx={fs_idx} \
-                 generation={generation} committed={committed}"
-            ));
-        }
-        accepted
+        Self::accept_native_video_close_with_committed(committed, generation, source)
     }
 
     /// Plan B: presenter から `PlacementSwitchFailed` を受けたときに呼ぶ。presenter は
