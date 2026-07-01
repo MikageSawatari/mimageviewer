@@ -1638,6 +1638,33 @@ always-new 窓と同じく no-op として扱う。
   `PlacementSwitched` は共通 helper `apply_native_video_placement_switch_state` で
   presentation を反映する (通常経路と分岐させない)。
 
+#### detached host の再親付け (host capture race 対策)
+
+detached の egui viewport の OS window (host HWND) は main⇔detached 切替をまたぐと
+**作り直される**ことがある。presenter child (`DetachedViewerChild`, `WS_CHILD`) を旧 host の
+子のまま放置すると、旧 host 破棄で child が道連れ WM_DESTROY → WM_QUIT で presenter スレッド
+ごと死に、動画再生が終了してしまう (2026-07-01 実機バグ)。**常に現在の detached host へ
+child を追従させる**ことで防ぐ:
+
+- `capture_detached_viewer_host_hwnd_from_logical_rect` が host HWND の変化を lifecycle
+  event として扱い、`detached_viewer_host_generation` を +1 し、直前 host を置き換えたとき
+  (または host-lost 後の再取得) は `try_resync_detached_video_host` を**同フレームで即時**
+  呼んで presenter child を現 host へ再親付け (`sync_detached_video_child_presenter_rect` =
+  owner を新 host にした `SwitchPlacement`) する。即発行できなければ
+  `pending_detached_video_host_resync` に退避し、`poll_detached_video_host_resync` が
+  毎フレーム再試行する。適用可否は「detached で再生中 **または** detached へ切替中」で判定し
+  (`detached_video_presentation_active_or_targeted`)、initial main→detached の switch 進行中の
+  host 変更も取りこぼさない。
+- **安全網**: `DetachedViewerChild` の window だけ `post_quit_on_destroy=false` で生成する。
+  この child は borderless で正当な user close を受けず、正当な終了は
+  `NativeVideoOutput::Drop → cancel` (loop 冒頭の `while !cancel.load()`) 経由なので WM_QUIT は
+  不要。host teardown が再親付けより先に child を壊しても presenter を死なせず、次の rebuild で
+  回収する。fullscreen / main-window-child は host (`main_hwnd`) が安定なので従来どおり
+  `post_quit_on_destroy=true`。
+- 再親付け rebuild が失敗した (`PlacementSwitchFailed`) ときは
+  `revert_failed_video_presentation_switch` が `pending_detached_video_host_resync` を再セット
+  して retry する (WM_QUIT で回収されなくなった分の保険)。
+
 ### 静止画の embedded 描画
 
 in-window モードのとき、静止画 (Image / ZipImage / PdfPage / ZipSeparator) は
