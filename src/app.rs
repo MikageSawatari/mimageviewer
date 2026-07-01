@@ -5705,16 +5705,6 @@ pub struct App {
     /// `native_video_mode_switch` の `request_id` 採番用の単調増加カウンタ。
     native_video_mode_switch_seq: u64,
     #[cfg(windows)]
-    /// 動画 presentation 切替 (F12 detached ⇔ non-detached) が **完了した直後** の
-    /// settle 期限。この間 F12 トグルを無視する。placement 切替は presenter ウィンドウを
-    /// Plan B で作り直すため、単一の物理 F12 押下でも、旧 presenter が転送した F12 KeyDown
-    /// に加えて **再構築後の新 presenter が同じ F12 をもう一度転送**することがある
-    /// (実機ログで phantom F12:up が新 host で観測される)。この二重転送は
-    /// `native_video_mode_switch` in-flight ガードが切れた完了 37〜71ms 後に届くため
-    /// すり抜け、detached→main→detached の二重トグル (= main への一瞬フラッシュ + 再分離)
-    /// になる。実ユーザーの次の押下は完了 600ms 以降なので、短い settle で再配送だけを弾く。
-    native_video_presentation_settle_until: Option<std::time::Instant>,
-    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -7085,8 +7075,6 @@ impl App {
             native_video_mode_switch: None,
             #[cfg(windows)]
             native_video_mode_switch_seq: 0,
-            #[cfg(windows)]
-            native_video_presentation_settle_until: None,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -24127,19 +24115,6 @@ impl App {
         )
     }
 
-    /// 動画 presentation 切替 (F12) が完了した直後の settle 期間中か。settle 中の F12 は
-    /// presenter 再構築に伴う同一押下の二重転送とみなして無視する。現在の全画面アイテムが
-    /// 動画のときだけ true (stale な settle が静止画 F12 を巻き込まないよう item 種別で絞る)。
-    #[cfg(windows)]
-    fn native_video_toggle_within_settle(&self, now: std::time::Instant) -> bool {
-        matches!(
-            self.fullscreen_idx.and_then(|idx| self.items.get(idx)),
-            Some(GridItem::Video(_))
-        ) && self
-            .native_video_presentation_settle_until
-            .is_some_and(|until| now < until)
-    }
-
     #[cfg(windows)]
     pub(crate) fn always_new_video_f12_target_presentation(&self) -> Option<ViewerPresentation> {
         if !self.settings.detached_viewer_open_images_in_window {
@@ -36997,12 +36972,11 @@ impl App {
         {
             crate::logger::log(format!(
                 "[native-video][diag] toggle_detached_viewer_mode ENTER presentation={:?} \
-                 always_new_target={:?} mode_switch={} host_switch_pending={} settling={}",
+                 always_new_target={:?} mode_switch={} host_switch_pending={}",
                 self.viewer_presentation,
                 self.always_new_video_f12_target_presentation(),
                 self.native_video_mode_switch.is_some(),
                 self.pending_detached_video_host_switch.is_some(),
-                self.native_video_toggle_within_settle(std::time::Instant::now()),
             ));
             if self.detached_toggle_disabled_by_always_new_images() {
                 self.show_feedback_toast(
@@ -37017,15 +36991,10 @@ impl App {
             let detached_host_switch_in_flight = self
                 .pending_detached_video_host_switch
                 .is_some_and(|pending| now < pending.deadline);
-            // 直前の placement 切替が完了した直後の settle 中は、presenter 再構築に伴う
-            // F12 の二重転送 (main フラッシュ + 再分離) を弾く。現在の全画面アイテムが
-            // 動画のときだけ効かせる (stale な settle が静止画 F12 を巻き込まないように)。
-            let video_switch_settling = self.native_video_toggle_within_settle(now);
-            if video_switch_in_flight || detached_host_switch_in_flight || video_switch_settling {
+            if video_switch_in_flight || detached_host_switch_in_flight {
                 crate::logger::log(format!(
-                    "[detached-viewer] ignore F12 toggle: video placement switch \
-                     in_flight={video_switch_in_flight} host_switch_in_flight={detached_host_switch_in_flight} \
-                     settling={video_switch_settling}"
+                    "[detached-viewer] ignore F12 toggle while video placement switch is pending \
+                     in_flight={video_switch_in_flight} host_switch_in_flight={detached_host_switch_in_flight}"
                 ));
                 return;
             }

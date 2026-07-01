@@ -1,6 +1,20 @@
 use super::*;
 use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
 
+/// native presenter が転送してきた KeyDown の virtual key が **いま物理的に押下中か**を
+/// OS に問い合わせる。placement 切替 (Plan B) で presenter を作り直すと、既に離された
+/// F12 の KeyDown が数百 ms 遅れて再配送され (`repeat=false` でも stale)、detached→main→
+/// detached の二重トグルになる。`repeat` フラグは信用できない (stale でも false) ため、
+/// GetAsyncKeyState の high bit で「今まだ押されているか」を見て stale 再配送を弾く。
+#[cfg(windows)]
+fn native_video_key_physically_down(
+    key: &crate::video::native_window::NativeVideoKeyEvent,
+) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    // high bit (0x8000) = 現在押下中。呼び出し時点の物理状態を返す。
+    unsafe { (GetAsyncKeyState(key.virtual_key as i32) as u16 & 0x8000) != 0 }
+}
+
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
 ///
 /// ピン留めボタンが押されたが thumb worker キャッシュにそのフレームがまだ無い場合、
@@ -2048,12 +2062,6 @@ impl App {
             self.dsp_bridge.set_hud_hwnd(0);
             self.vst_geometry_tracker.clear();
         }
-        // 切替完了直後の settle を張る。Plan B のウィンドウ再構築で、単一の F12 押下でも
-        // 新 presenter が同じ F12 KeyDown をもう一度転送して二重トグル (main フラッシュ +
-        // 再分離) になることがある。in-flight ガードが切れた完了直後 (実測 37〜71ms) に届く
-        // ため、短い settle でこの再配送だけを無視する (実ユーザーの次押下は 600ms 以降)。
-        self.native_video_presentation_settle_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
         crate::logger::log(format!(
             "[native-video] presentation switch applied -> {presentation:?}"
         ));
@@ -5363,8 +5371,9 @@ impl App {
         // 転送する F12 (repeat 含む) を全て記録し、egui 側の [f12-diag] と突き合わせる。
         if key.virtual_key == 0x7B {
             crate::logger::log(format!(
-                "[native-video][diag] native F12 recv: repeat={} scan=0x{:x} ext={} ctrl={} shift={} alt={} presentation={:?} in_flight={} settling={}",
+                "[native-video][diag] native F12 recv: repeat={} os_down={} scan=0x{:x} ext={} ctrl={} shift={} alt={} presentation={:?} in_flight={}",
                 key.repeat,
+                native_video_key_physically_down(&key),
                 key.scan_code,
                 key.extended,
                 key.ctrl,
@@ -5372,8 +5381,6 @@ impl App {
                 key.alt,
                 self.viewer_presentation,
                 self.native_video_mode_switch.is_some(),
-                self.native_video_presentation_settle_until
-                    .is_some_and(|until| std::time::Instant::now() < until),
             ));
         }
         // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
@@ -5485,6 +5492,20 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::ToggleDetachedViewerMode, &key) =>
             {
+                // placement 切替 (Plan B) で presenter を作り直すと、既に離された F12 の
+                // KeyDown が数百 ms 遅れて再配送され、直前のトグルを打ち消す
+                // (detached→main→detached、= main への一瞬フラッシュ + 再分離)。`repeat` は
+                // stale でも false なので信用せず、OS に「今まだ F12 が押されているか」を
+                // 問い合わせて、離された後の stale 再配送を弾く。実押下は KeyDown 到着時点で
+                // まだ物理的に down なので通る (Codex 助言)。
+                if !native_video_key_physically_down(&key) {
+                    crate::logger::log(format!(
+                        "[native-video] ignore stale native F12 toggle: os_down=false \
+                         presentation={:?} (rebuild re-delivery of a released key)",
+                        self.viewer_presentation
+                    ));
+                    return;
+                }
                 self.toggle_detached_viewer_mode();
                 hud_activity = false;
             }
