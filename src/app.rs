@@ -4186,6 +4186,11 @@ pub struct App {
     /// 次に開く動画だけ resume 位置を無視して先頭から開く one-shot state。
     /// 連続再生の自動遷移では前回視聴位置ではなく 0 秒から再生する。
     pub(crate) fs_video_open_ignore_resume_once: bool,
+    /// 次に開く動画だけ presentation (Main/Fullscreen/Detached) を強制する one-shot state。
+    /// 連続再生の**自動**次送りでは「別ウィンドウで開く」設定を再適用せず、直前の動画の
+    /// presentation を維持する (ユーザー手動ナビは従来どおり設定に従うので None)。
+    #[cfg(windows)]
+    pub(crate) fs_video_open_forced_presentation: Option<ViewerPresentation>,
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
     /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
     pub(crate) video_thumb_overrides_dirty: bool,
@@ -6566,6 +6571,8 @@ impl App {
             fs_suppress_enter_close_until_release: false,
             fs_video_open_autoplay_override: None,
             fs_video_open_ignore_resume_once: false,
+            #[cfg(windows)]
+            fs_video_open_forced_presentation: None,
             video_thumb_overrides_dirty: false,
             #[cfg(windows)]
             pending_pin_thumb_refresh: None,
@@ -25074,9 +25081,26 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// open 時に採用する presentation を決める。連続再生の**自動**次送り
+    /// (`fs_video_open_forced_presentation` one-shot) では、直前の動画の presentation を
+    /// そのまま維持し、「別ウィンドウで開く」設定の再適用 (= detached 化) を抑止する。
+    /// それ以外 (ユーザー手動 open / 通常 nav) は従来の設定ベース判定に従う。one-shot は
+    /// 消費する。
+    #[cfg(windows)]
+    fn resolve_viewer_presentation_for_open(
+        &mut self,
+        idx: usize,
+        entering_native_video: bool,
+    ) -> ViewerPresentation {
+        match self.fs_video_open_forced_presentation.take() {
+            Some(p) if entering_native_video => p,
+            _ => self.effective_viewer_presentation_for_open(idx),
+        }
+    }
+
     #[cfg(windows)]
     fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
-        let presentation = self.effective_viewer_presentation_for_open(idx);
+        let presentation = self.resolve_viewer_presentation_for_open(idx, entering_native_video);
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
         let independent_detached_still =
@@ -40194,6 +40218,15 @@ impl App {
             return;
         }
 
+        // **自動**次送りでは「別ウィンドウで開く」設定を再適用せず、直前の動画の
+        // presentation (Main/Fullscreen/Detached) を維持する。設定 ON だと open 経路が
+        // 次の動画を detached で開いて「最初のフレームが別ウィンドウ→本編は元のウィンドウ」
+        // というちらつきになるため、現在の presentation を one-shot で強制する。ユーザー
+        // 手動ナビ (wheel / キー) はこの one-shot を立てないので従来どおり設定に従う。
+        #[cfg(windows)]
+        {
+            self.fs_video_open_forced_presentation = Some(self.viewer_presentation);
+        }
         #[cfg(windows)]
         self.open_native_video_fullscreen_from_navigation_with_options(
             ctx,

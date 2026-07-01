@@ -6633,10 +6633,16 @@ impl App {
     ) {
         self.sync_main_selection_from_viewer_idx(idx);
 
+        // fast-swap / tile-swap は presenter を再利用するので presentation は自然に維持される。
+        // その経路では open_fullscreen (→ prepare_viewer_presentation_open) を通らず forced
+        // presentation の one-shot が消費されないため、ここで確実にクリアして次の手動 open へ
+        // 漏らさない。
         if self.try_start_video_tile_fast_swap(ctx, idx) {
+            self.fs_video_open_forced_presentation = None;
             return;
         }
         if self.try_start_native_video_fast_swap(ctx, idx, autoplay_override, ignore_resume) {
+            self.fs_video_open_forced_presentation = None;
             return;
         }
         let started = std::time::Instant::now();

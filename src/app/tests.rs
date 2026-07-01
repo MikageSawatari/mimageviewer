@@ -16763,6 +16763,44 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn continuous_autoadvance_keeps_presentation_over_open_in_window_setting() {
+        // 「画像・動画を別ウィンドウで開く」ON でも、連続再生の自動次送りでは直前の動画の
+        // presentation を維持する (別ウィンドウのちらつきを出さない)。手動 open は従来どおり
+        // 設定に従う (one-shot 未セット)。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        // one-shot 未セット (= ユーザー手動 open 相当) は設定どおり detached。
+        assert_eq!(
+            app.resolve_viewer_presentation_for_open(video, true),
+            ViewerPresentation::DetachedWindow,
+            "manual open keeps the open-in-separate-window setting behavior"
+        );
+
+        // 自動次送りの one-shot (直前が MainWindow) は MainWindow を維持し、消費される。
+        app.fs_video_open_forced_presentation = Some(ViewerPresentation::MainWindow);
+        assert_eq!(
+            app.resolve_viewer_presentation_for_open(video, true),
+            ViewerPresentation::MainWindow,
+            "auto-advance keeps the previous presentation instead of re-opening detached"
+        );
+        assert!(
+            app.fs_video_open_forced_presentation.is_none(),
+            "the forced-presentation one-shot must be consumed"
+        );
+
+        // 直前が Detached なら Detached を維持する。
+        app.fs_video_open_forced_presentation = Some(ViewerPresentation::DetachedWindow);
+        assert_eq!(
+            app.resolve_viewer_presentation_for_open(video, true),
+            ViewerPresentation::DetachedWindow,
+            "auto-advance keeps a detached previous presentation too"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_video_host_resync_poll_clears_tracking_when_not_detached() {
         // detached 動画でなくなったら、次 session へ stale な child host / 再親付け要求を
         // 持ち越さないよう毎フレーム掃除する。
