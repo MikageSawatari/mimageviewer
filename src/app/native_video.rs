@@ -579,41 +579,63 @@ impl App {
     }
 
     /// detached 動画再生中に host HWND が変わったとき、presenter child を現 host へ
-    /// 再親付けする。`capture_detached_viewer_host_hwnd_from_logical_rect` が host 変更を
-    /// 検出して `pending_detached_video_host_resync` を立てる。detached の egui viewport は
-    /// 切替 (main⇔detached) をまたぐと OS window (host HWND) が作り直されることがあり、
-    /// 旧 host の子として残った presenter child (WS_CHILD) が旧 host 破棄で道連れ死 →
-    /// WM_QUIT → presenter 終了 → 再生終了 という既存バグ (host capture race) を、
-    /// **常に現在の detached host へ追従させる**ことで防ぐ。
+    /// 再親付けするための一連の仕組み (host capture race 対策)。detached の egui viewport は
+    /// 切替 (main⇔detached) をまたぐと OS window (host HWND) が作り直されることがあり、旧
+    /// host の子として残った presenter child (WS_CHILD) が旧 host 破棄で道連れ死 → WM_QUIT →
+    /// presenter 終了 → 再生終了 という既存バグを、**常に現在の detached host へ追従させる**
+    /// ことで防ぐ。
+    ///
+    /// detached 動画が現在の presentation か、または切替中の target になっているか。
+    /// host resync の適用可否判定に使う。**切替中 (target=DetachedWindow) も含める**のが
+    /// 肝で、initial main→detached の switch 進行中に host が変わったケースも取りこぼさない。
+    #[cfg(windows)]
+    pub(crate) fn detached_video_presentation_active_or_targeted(&self) -> bool {
+        let is_video = self
+            .fullscreen_idx
+            .map(|idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
+            .unwrap_or(false);
+        if !is_video {
+            return false;
+        }
+        matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            || self
+                .native_video_mode_switch
+                .map(|p| matches!(p.target_presentation, ViewerPresentation::DetachedWindow))
+                .unwrap_or(false)
+    }
+
+    /// detached host 変更に対する presenter child の再親付けを 1 回試みる。
+    /// 戻り値 `true` = 「解決した (再親付け発行 or そもそも不要)」→ 要求フラグを落としてよい。
+    /// `false` = 「保留 (mode switch 進行中 / host 未確定などで今は発行できない)」→ フラグを
+    /// 残して次フレーム以降に再試行する。旧 host 破棄で presenter が道連れ死する race 窓を
+    /// 最小化するため capture 時に即時呼び、取りこぼしを poll で拾う。
+    #[cfg(windows)]
+    pub(crate) fn try_resync_detached_video_host(&mut self) -> bool {
+        if !self.detached_video_presentation_active_or_targeted() {
+            return true; // 再親付け対象でない → 要求は破棄してよい
+        }
+        if self.native_video_mode_switch.is_some() {
+            return false; // 切替中は重ねられない。完了後に再試行
+        }
+        // host が未確定 (0 / 死んでいる) 等で発行できなければ false を返してフラグを保持し、
+        // 次に host が確定したフレームで再親付けする。
+        let queued = self.sync_detached_video_child_presenter_rect();
+        if queued {
+            crate::logger::log(format!(
+                "[native-video] detached host changed -> resync presenter child \
+                 host=0x{:x} host_generation={}",
+                self.detached_viewer_host_hwnd, self.detached_viewer_host_generation
+            ));
+        }
+        queued
+    }
+
+    /// capture / host-lost で立った再親付け要求を毎フレーム処理する。
     #[cfg(windows)]
     pub(super) fn poll_detached_video_host_resync(&mut self) {
-        if !self.pending_detached_video_host_resync {
-            return;
-        }
-        // detached 動画でない (画像 detached / 非 detached / 動画でない / fullscreen なし) なら
-        // 再親付けは不要。要求を破棄する。
-        let applicable = matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
-            && self.viewer_session_is_detached()
-            && self
-                .fullscreen_idx
-                .map(|idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
-                .unwrap_or(false);
-        if !applicable {
+        if self.pending_detached_video_host_resync && self.try_resync_detached_video_host() {
             self.pending_detached_video_host_resync = false;
-            return;
         }
-        // mode switch 進行中は placement switch を重ねられない。switch 完了後の
-        // フレームで再試行するためフラグは残す (host 変更を取りこぼさない)。
-        if self.native_video_mode_switch.is_some() {
-            return;
-        }
-        self.pending_detached_video_host_resync = false;
-        crate::logger::log(format!(
-            "[native-video] detached host changed -> resync presenter child \
-             host=0x{:x} host_generation={}",
-            self.detached_viewer_host_hwnd, self.detached_viewer_host_generation
-        ));
-        self.sync_detached_video_child_presenter_rect();
     }
 
     #[cfg(windows)]
@@ -1810,31 +1832,35 @@ impl App {
         ));
     }
 
+    /// detached の presenter child を現在の host / rect に合わせて再構築 (再親付け) する。
+    /// 実際に `SwitchPlacement` を発行できたら `true`、条件不成立 (非 detached / host 未確定
+    /// / player 不在 / mode switch 進行中) で何もしなかったら `false` を返す。呼び出し側
+    /// (`try_resync_detached_video_host`) は false のとき再同期要求を保持して再試行する。
     #[cfg(windows)]
-    pub(crate) fn sync_detached_video_child_presenter_rect(&mut self) {
+    pub(crate) fn sync_detached_video_child_presenter_rect(&mut self) -> bool {
         let Some(idx) = self.fullscreen_idx else {
-            return;
+            return false;
         };
         if !self.viewer_session_is_detached()
             || !matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
             || !matches!(self.items.get(idx), Some(GridItem::Video(_)))
             || self.native_video_mode_switch.is_some()
         {
-            return;
+            return false;
         }
         let Some((placement, rect, owner_hwnd)) =
             self.native_video_target_for_presentation(ViewerPresentation::DetachedWindow)
         else {
-            return;
+            return false;
         };
         if !matches!(
             placement,
             crate::video::NativeVideoPlacement::DetachedViewerChild
         ) {
-            return;
+            return false;
         }
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) else {
-            return;
+            return false;
         };
 
         self.native_video_mode_switch_seq = self.native_video_mode_switch_seq.wrapping_add(1);
@@ -1847,12 +1873,13 @@ impl App {
         });
         crate::logger::log(format!(
             "[native-video] sync detached child rect request={request_id} \
-             rect=({},{} {}x{})",
+             owner=0x{owner_hwnd:x} rect=({},{} {}x{})",
             rect.left,
             rect.top,
             rect.right - rect.left,
             rect.bottom - rect.top
         ));
+        true
     }
 
     pub(super) fn toggle_video_window_mode(&mut self) {

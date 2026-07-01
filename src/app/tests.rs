@@ -16730,13 +16730,53 @@ mod still_window_mode_key_tests {
             "resync must wait while a placement switch is in flight"
         );
 
-        // switch 完了後は要求を消費する (host/presenter 不在なので sync 自体は no-op)。
+        // 切替が終わっても、テストは live host / presenter を持たないため presenter child を
+        // 実際に再親付けできない。取りこぼし防止 (P2b) として要求は保持され続ける
+        // (host が確定したフレームで再親付け → そこで初めて消費される)。
         app.native_video_mode_switch = None;
         app.poll_detached_video_host_resync();
         assert!(
-            !app.pending_detached_video_host_resync,
-            "resync request is consumed once the in-flight switch settles"
+            app.pending_detached_video_host_resync,
+            "resync is retained until the presenter child can actually be re-parented"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_video_presentation_active_or_targeted_includes_in_flight_switch() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+
+        // 動画 fullscreen (非 detached, 切替なし) は対象外。
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.native_video_mode_switch = None;
+        assert!(!app.detached_video_presentation_active_or_targeted());
+
+        // detached で再生中は対象。
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        assert!(app.detached_video_presentation_active_or_targeted());
+
+        // **切替中 (target=DetachedWindow)** も対象 = initial main→detached 中の host 変更を
+        // 取りこぼさないための肝。
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 1,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+        assert!(
+            app.detached_video_presentation_active_or_targeted(),
+            "an in-flight switch toward detached must count so host changes are not missed"
+        );
+
+        // 切替 target が detached でなければ対象外。
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 2,
+            target_presentation: ViewerPresentation::MainWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+        assert!(!app.detached_video_presentation_active_or_targeted());
     }
 
     #[test]

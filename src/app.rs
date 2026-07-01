@@ -24283,6 +24283,13 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn handle_detached_viewer_host_lost_before_render(&mut self) {
         self.log_detached_viewer_host_lost_diagnostic("host_lost_before_render");
+        // detached 動画再生中に host が消えた場合、presenter child は失われた host の子の
+        // まま (= もうすぐ道連れ死)。次に新 host を capture したフレームで現 host へ
+        // 再親付けするよう要求を立てておく。clear 後は host=0 で即時 sync できないので、
+        // capture 時の `pending_detached_video_host_resync` 経路で拾わせる (P2a)。
+        if self.detached_video_presentation_active_or_targeted() {
+            self.pending_detached_video_host_resync = true;
+        }
         self.clear_detached_viewer_host_hwnd();
     }
 
@@ -24507,12 +24514,15 @@ impl App {
                 bottom
             ));
             self.detached_viewer_host_hwnd = hwnd_raw;
-            // 既存 host を **置き換えた** 場合 (初回 capture ではない)、native presenter の
-            // child は旧 host の子のまま残っている。旧 host が破棄されると child が道連れで
-            // 消え WM_QUIT → presenter 終了 → 再生終了になるため、現 host へ再親付けを要求する
-            // (実処理は `poll_detached_video_host_resync`。mode switch 進行中でも取りこぼさない)。
-            if previous_host != 0 {
-                self.pending_detached_video_host_resync = true;
+            // 既存 host を **置き換えた** 場合 (初回 capture ではない)、または host-lost で
+            // 一旦 0 に落ちて再取得したとき (`pending_detached_video_host_resync` が既に
+            // 立っている)、native presenter の child は旧 host の子のまま残っている。旧 host が
+            // 破棄されると child が道連れで消え WM_QUIT → presenter 終了 → 再生終了になるため、
+            // **同じフレームで即座に**現 host へ再親付けを試みる (race 窓の最小化)。mode switch
+            // 進行中などで今発行できなければフラグに退避し、`poll_detached_video_host_resync` が
+            // 次フレーム以降で拾う。
+            if previous_host != 0 || self.pending_detached_video_host_resync {
+                self.pending_detached_video_host_resync = !self.try_resync_detached_video_host();
             }
         }
     }
@@ -24755,7 +24765,7 @@ impl App {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
                     true
                 } else {
-                    self.sync_detached_video_child_presenter_rect();
+                    let _ = self.sync_detached_video_child_presenter_rect();
                     ctx.request_repaint();
                     false
                 }
