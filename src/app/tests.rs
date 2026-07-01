@@ -16815,6 +16815,84 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn manual_video_nav_keeps_main_window_over_open_in_window_setting() {
+        // 「画像・動画を別ウィンドウで開く」ON でも、F12 で main に出した動画を wheel/キーの
+        // 手動ナビで送ったら main のまま次の動画を再生する (別窓へ飛ばさない)。実機 FB
+        // 2026-07-02: 設定を再適用して次動画を別窓で開くと、別窓にサムネだけ一瞬出て本編は
+        // main、というちらつきになっていた。`open_fullscreen` 冒頭の一括ガードが viewer 内ナビの
+        // ときだけ現在の presentation を one-shot へ焼き付けることで維持する。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_video(&mut app, r"C:\clips\a.mp4");
+        let second = push_video(&mut app, r"C:\clips\b.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.video_in_window_mode = true;
+        app.selected = Some(first);
+        app.open_fullscreen(first);
+        // F12 で main に出している状態を再現 (設定既定は detached だが手動で main へ)。
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.native_video_in_window_active = true;
+
+        app.navigate_native_video_fullscreen(&ctx, first, 1);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(
+            app.viewer_presentation,
+            ViewerPresentation::MainWindow,
+            "manual nav must keep the F12'd main-window presentation, not re-detach per the setting"
+        );
+        assert!(
+            !app.viewer_session_is_detached(),
+            "the next video must not pop a detached window on manual nav"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn grid_open_still_detaches_video_under_open_in_window_setting() {
+        // 対 (対照): grid からの新規 open (Enter/ダブルクリック相当) は one-shot を立てないので、
+        // 「別ウィンドウで開く」設定どおり detached で開く。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.video_in_window_mode = false;
+        app.fs_open_intent_from_grid = true;
+        app.fs_video_open_forced_presentation = None;
+
+        assert_eq!(
+            app.resolve_viewer_presentation_for_open(video, true),
+            ViewerPresentation::DetachedWindow,
+            "a fresh grid open (no forced-presentation one-shot) honors the setting"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn open_fullscreen_grid_open_detaches_video_even_mid_viewer() {
+        // open_fullscreen 冒頭の一括ガード: grid からの新規 open (fs_open_intent_from_grid=true) は、
+        // 既にフルスクリーンで動画を main 表示中でも「別ウィンドウで開く」設定どおり detached に
+        // する (viewer 内の手動ナビだけ presentation を維持する = grid を除外)。
+        let mut app = setup_app();
+        let v1 = push_video(&mut app, r"C:\clips\a.mp4");
+        let v2 = push_video(&mut app, r"C:\clips\b.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.video_in_window_mode = false;
+        app.fullscreen_idx = Some(v1);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.fs_open_intent_from_grid = true;
+        app.fs_video_open_forced_presentation = None;
+
+        app.open_fullscreen(v2);
+
+        assert_eq!(
+            app.viewer_presentation,
+            ViewerPresentation::DetachedWindow,
+            "a fresh grid open must still honor the open-in-separate-window setting even mid-viewer"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_video_host_resync_poll_drops_request_when_not_detached() {
         // detached 動画でなくなったら、次 session へ再親付け要求を持ち越さないよう掃除する。
         let mut app = setup_app();
@@ -19079,6 +19157,75 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn fullscreen_viewport_id_is_stable_across_detach_switch() {
+        // MainWindow→DetachedWindow の切替中は、presentation がまだ非 detached でも
+        // detached の安定 ViewportId を返す。以前は fallback の `fullscreen_viewer` ID で host を
+        // 作り、PlacementSwitched で session が始まった瞬間に detached ID へ変わって egui が OS 窓を
+        // 破棄→再生成していた (= 「窓が一度消えてアニメで再表示」+ presenter child 道連れ死。
+        // Codex 実機 P1)。切替開始で window_id を確定し、id が切替の前後で不変であることを固定する。
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_viewer_window_id = Some(77);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 1,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+
+        assert!(!app.viewer_session_is_detached());
+        assert!(app.viewer_session_is_detached_or_switching());
+        let id_switching = app.fullscreen_viewport_id();
+        assert_eq!(
+            id_switching,
+            App::detached_image_window_viewport_id(77),
+            "the switching-to-detached host must already use the stable detached viewport id, \
+             not the fullscreen fallback"
+        );
+
+        // 切替確定 (同じ window_id で session 開始) 後も ViewportId は不変 = OS 窓の作り直しなし。
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(77, crate::app::DetachedSource::Video);
+        assert_eq!(
+            app.fullscreen_viewport_id(),
+            id_switching,
+            "viewport id must not change when the detached session commits (no OS window recreate)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullscreen_viewport_id_stays_detached_for_failed_switch_cleanup() {
+        // switch が失敗/timeout して presentation が非 detached へ戻っても、detached host を
+        // 表示済み (fs_viewport_presentation==DetachedWindow) の間は detached ID を返す。これで
+        // cleanup の Visible(false) が実際に出した detached host 窓を隠せる (fallback ID を返すと
+        // pre-commit detached host が宙に残る = Codex 実機 P2 失敗系 cleanup)。
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.fullscreen_idx = Some(idx);
+        // 失敗後: presentation は非 detached へ戻り、pending も消えている。
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.native_video_mode_switch = None;
+        app.detached_viewer_window_id = Some(88);
+        // だが detached host は実際に表示済み。
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        assert!(!app.viewer_session_is_detached());
+        assert!(
+            !app.viewer_session_is_detached_or_switching(),
+            "the failed switch cleared the pending, so this is no longer a switching frame"
+        );
+        assert_eq!(
+            app.fullscreen_viewport_id(),
+            App::detached_image_window_viewport_id(88),
+            "cleanup must target the detached host that was actually shown, not the fullscreen fallback"
+        );
+    }
+
+    #[test]
     fn detached_video_host_wait_counts_as_detached_for_lifecycle() {
         let mut app = setup_app();
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");
@@ -19711,17 +19858,21 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_inactive_builder_seeds_placement_only_before_host_capture() {
-        // holdover / cleanup 用 inactive builder は、新規 OS 窓 (host 未捕捉) のときだけ
-        // placement を seed してフラッシュを防ぎ、既存 window (host 捕捉済み) には geometry を
-        // 触らず drag/resize の引き戻しを防ぐ (Codex P2)。
+    fn detached_inactive_builder_seeds_placement_unless_host_is_alive() {
+        // holdover / cleanup 用 inactive builder は、host HWND が **生存していない**
+        // (= 窓が未生成 or 死んでいて egui が再生成する) ときだけ placement を seed して
+        // 既定サイズ 822x656 のフラッシュを防ぐ。host が生存しているときは geometry を触らず、
+        // enumerate 待ち中の drag/resize 引き戻しを防ぐ (Codex P2)。
+        // 判定は `== 0` ではなく `alive()` にする: stale (死んだ) HWND をまだ指している (!=0)
+        // 間に egui が窓を再生成すると、`== 0` では seed を取りこぼして既定サイズ窓が生えてしまう
+        // (2026-07-01 ハンドオフの疑い経路)。
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
 
-        // host 未捕捉 = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
+        // host 未捕捉 (== 0) = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
         app.detached_viewer_host_hwnd = 0;
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert!(
@@ -19729,16 +19880,142 @@ mod still_window_mode_key_tests {
             "fresh detached window must be created at the saved size, not the egui default"
         );
 
-        // host 捕捉済み = 既存 window → geometry を触らない。
+        // host が stale (死んだ HWND を !=0 で指している) = egui が窓を再生成する →
+        // 再生成された窓が既定サイズで一瞬出ないよう、seed し続ける (旧 `== 0` の取りこぼし修正)。
         app.detached_viewer_host_hwnd = 0x1234;
+        let builder = app.build_inactive_fullscreen_viewport_builder(idx);
+        assert!(
+            builder.inner_size.is_some(),
+            "a stale (dead) host HWND still means egui will recreate the OS window; it must be \
+             seeded at the saved size to avoid the default-size flash"
+        );
+
+        // host が生存している既存 window → geometry を触らない (Codex P2)。
+        // GetDesktopWindow は常に生存している実 HWND なので live host の代役に使う。
+        let live_hwnd =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow() }.0 as u64;
+        app.detached_viewer_host_hwnd = live_hwnd;
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert_eq!(
             builder.inner_size, None,
-            "existing detached window must not be force-resized while waiting on enumerate (Codex P2)"
+            "existing (alive) detached window must not be force-resized while waiting on enumerate (Codex P2)"
         );
         assert_eq!(
             builder.position, None,
-            "existing detached window must not be repositioned while waiting on enumerate (Codex P2)"
+            "existing (alive) detached window must not be repositioned while waiting on enumerate (Codex P2)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_viewer_should_seed_placement_tracks_host_liveness() {
+        // active / inactive / keep-alive backstop の 3 経路が共有する述語。host HWND が
+        // 生存していない (未捕捉 or stale) 間だけ placement を seed して既定サイズ 822x656 の
+        // フラッシュを防ぐ。生存している間は seed しない (Codex P2)。backstop 経路はこの述語で
+        // 覆われる (Codex P2 の `== 0` 取りこぼし修正)。
+        let mut app = setup_app();
+
+        // 未捕捉 (== 0) → seed。
+        app.detached_viewer_host_hwnd = 0;
+        assert!(app.detached_viewer_should_seed_placement());
+
+        // stale (死んだ HWND を !=0 で指したまま egui 再生成) → seed し続ける。
+        app.detached_viewer_host_hwnd = 0x1234;
+        assert!(
+            app.detached_viewer_should_seed_placement(),
+            "a nonzero-but-dead host HWND must still seed so egui recreation uses the saved size"
+        );
+
+        // 生存している既存窓 → seed しない。GetDesktopWindow は常に生存している実 HWND。
+        app.detached_viewer_host_hwnd =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow() }.0 as u64;
+        assert!(
+            !app.detached_viewer_should_seed_placement(),
+            "an alive captured host must not be force-resized (Codex P2)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_capture_rect_rejects_default_viewport_last_line_of_defense() {
+        // capture の「最後の防波堤」: 既定サイズ (outer ~822x656 physical) の過渡窓は、
+        // 十分大きい保存配置から hard shrink したとき host として採用しない (Codex 実機 P1/P2)。
+        // 判定は self からではなく **save より前の previous** を明示的に渡す (汚染防止)。
+        let substantial = crate::settings::DetachedViewerWindowPlacement {
+            x: 209.0,
+            y: 409.0,
+            w: 1013.0,
+            h: 880.0,
+            maximized: false,
+        };
+
+        // 既定サイズ outer (548x437 論理 @ ppp1.5 = 822x655 physical) → 弾く。
+        let default_outer =
+            egui::Rect::from_min_size(egui::pos2(101.0, 101.0), egui::vec2(548.0, 437.0));
+        assert!(
+            App::detached_capture_rect_looks_like_default_viewport(
+                Some(substantial),
+                default_outer,
+                1.5
+            ),
+            "the transient egui default-size viewport must be refused as host"
+        );
+
+        // 本来の大きい配置 (1029x918 論理 = 1543x1377 physical) → 採用する。
+        let substantial_outer =
+            egui::Rect::from_min_size(egui::pos2(209.0, 273.0), egui::vec2(1029.0, 918.0));
+        assert!(
+            !App::detached_capture_rect_looks_like_default_viewport(
+                Some(substantial),
+                substantial_outer,
+                1.5
+            ),
+            "the real saved-size window must still be captured"
+        );
+
+        // 保存配置が無ければ判定材料が無いので弾かない (初回 detach 等)。
+        assert!(
+            !App::detached_capture_rect_looks_like_default_viewport(None, default_outer, 1.5),
+            "without a substantial previous placement, do not reject (user may use a small window)"
+        );
+
+        // ユーザーが元から小さい窓を使っている (previous が substantial でない) → 弾かない。
+        let small_previous = crate::settings::DetachedViewerWindowPlacement {
+            x: 101.0,
+            y: 101.0,
+            w: 560.0,
+            h: 440.0,
+            maximized: false,
+        };
+        assert!(
+            !App::detached_capture_rect_looks_like_default_viewport(
+                Some(small_previous),
+                default_outer,
+                1.5
+            ),
+            "a genuinely small user window must not be refused"
+        );
+
+        // Codex P2: save が live/settings を default rect へ汚染しても、**save より前に**
+        // スナップショットした previous を渡せば防波堤は機能する。
+        let mut app = setup_app();
+        app.active_detached_viewer_live_placement = Some(substantial);
+        app.settings.detached_viewer_window_placement = Some(substantial);
+        let snapshot = app.detached_viewer_previous_placement_for_default_check();
+        assert_eq!(snapshot, Some(substantial));
+        // save が default で汚染したと仮定 (live/settings が default 小窓になった)。
+        let polluted = crate::settings::DetachedViewerWindowPlacement {
+            x: 101.0,
+            y: 101.0,
+            w: 365.0,
+            h: 291.0,
+            maximized: false,
+        };
+        app.active_detached_viewer_live_placement = Some(polluted);
+        app.settings.detached_viewer_window_placement = Some(polluted);
+        assert!(
+            App::detached_capture_rect_looks_like_default_viewport(snapshot, default_outer, 1.5),
+            "the pre-save snapshot must still reject the default window even after save pollution"
         );
     }
 
@@ -20375,6 +20652,54 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
         assert_eq!(restore, Some(previous));
+    }
+
+    #[test]
+    fn active_detached_default_viewport_geometry_is_rejected_during_detach_switch() {
+        // F12 で動画を detach する遷移中は presentation がまだ DetachedWindow に変わって
+        // おらず `viewer_session_is_detached()` は false だが、render は
+        // `viewer_session_is_detached_or_switching()` で detached viewport を描いている。
+        // この窓で egui が既定サイズを報告しても default-rejection が発火し、既定 placement を
+        // 保存せず OS-window restore を要求することを固定する (Codex P1)。
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        let previous = crate::settings::DetachedViewerWindowPlacement {
+            x: 420.0,
+            y: 160.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        app.fullscreen_idx = Some(idx);
+        // presentation はまだ Fullscreen (PlacementSwitched 未着) = detached "switching"。
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 7,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+        app.settings.detached_viewer_window_placement = Some(previous);
+        app.active_detached_viewer_live_placement = Some(previous);
+
+        assert!(!app.viewer_session_is_detached());
+        assert!(app.viewer_session_is_detached_or_switching());
+
+        let default_outer =
+            egui::Rect::from_min_size(egui::pos2(114.0, 114.0), egui::vec2(533.0, 400.0));
+        let restore =
+            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+
+        assert_eq!(
+            restore,
+            Some(previous),
+            "default geometry during the detach switch must be rejected and request an OS-window restore"
+        );
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(previous),
+            "the transient default size must not overwrite the saved placement mid-switch"
+        );
+        assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
     }
 
     #[test]

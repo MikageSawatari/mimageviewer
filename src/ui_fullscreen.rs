@@ -3268,9 +3268,41 @@ impl App {
         if let Some(session) = self.active_detached_session {
             return Self::detached_image_window_viewport_id(session.window_id);
         }
+        // presentation が確定 detached (folder-nav reopen で fullscreen_idx が一時 None でも
+        // 維持される内部遷移を含む)。fullscreen_idx に依存しない判定なのでこの分岐は残す。
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
             && let Some(window_id) = self.detached_viewer_window_id
+        {
+            return Self::detached_image_window_viewport_id(window_id);
+        }
+        // detached が **確定** (上の分岐) だけでなく、**切替中** (MainWindow→DetachedWindow の
+        // video placement switch 進行中) も安定 detached ViewportId を使う。切替中は render 側が
+        // `viewer_session_is_detached_or_switching()` で detached 扱いして host を出すが、以前は
+        // presentation がまだ MainWindow なので fallback の `fullscreen_viewer` ID で host が作られ、
+        // PlacementSwitched で session が始まった瞬間に detached ID へ変わって egui が OS 窓を
+        // 破棄→再生成していた (=「本来サイズの窓が出た後、一度消えてアニメで再表示」+ presenter
+        // child が道連れ死して resync で二枚目 presenter 窓。Codex 実機レビュー P1)。切替開始で
+        // window_id を確定 (switch_native_video_viewer_presentation) しておき、ここで最初から
+        // detached ID を返すことで OS 窓の作り直しを無くす。
+        #[cfg(windows)]
+        if self.viewer_session_is_detached_or_switching()
+            && let Some(window_id) = self.detached_viewer_window_id
+        {
+            return Self::detached_image_window_viewport_id(window_id);
+        }
+        // 現に detached host を **表示済み** (fs_viewport_presentation==DetachedWindow) の間は、
+        // たとえ switching が失敗/timeout して presentation が非 detached へ戻っても detached ID を
+        // 返し続ける。これで cleanup (`hide_current_fullscreen_viewport_for_recreate` /
+        // `keep_fullscreen_viewport_alive`) の `Visible(false)` が、実際に出した detached host 窓
+        // (detached ID) を正しく隠せる。fallback ID を返すと pre-commit detached host が閉じられず
+        // 宙に残る (Codex 実機レビュー P2 = 失敗系 cleanup)。cleanup が fs_viewport_presentation を
+        // None にした後はこの分岐は発火しない。
+        #[cfg(windows)]
+        if matches!(
+            self.fs_viewport_presentation,
+            Some(ViewerPresentation::DetachedWindow)
+        ) && let Some(window_id) = self.detached_viewer_window_id
         {
             return Self::detached_image_window_viewport_id(window_id);
         }
@@ -4617,9 +4649,11 @@ impl App {
             return;
         };
         // 既存の detached 描画と同じ builder を使う (decorations/transparent/taskbar が変わると
-        // egui が窓を作り直すため)。window が既に在る (host 捕捉済み) なら geometry は触らない。
+        // egui が窓を作り直すため)。host が生存している既存窓なら geometry は触らない。stale/未捕捉
+        // のときは placement を seed して、egui 再生成時の既定サイズ 822x656 フラッシュを防ぐ
+        // (`== 0` だと死んだ HWND を !=0 で指したまま再生成される取りこぼしを拾えない = Codex P2)。
         let title_idx = self.fullscreen_idx.unwrap_or(0);
-        let apply_placement = self.detached_viewer_host_hwnd == 0;
+        let apply_placement = self.detached_viewer_should_seed_placement();
         let builder = self.build_detached_viewer_viewport_builder(title_idx, None, apply_placement);
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
         let tex = self
@@ -4938,11 +4972,28 @@ impl App {
             && !embedded
             && !need_show
             && std::mem::take(&mut self.detached_viewer_focus_requested);
+        // egui は同じ ViewportId でも OS 窓を内部で teardown/再生成する。特に detached **動画**
+        // では、presenter child (WS_CHILD) を host に付け替える過程で egui が「別の既定位置 host 窓
+        // (822x656)」を一瞬作り直す挙動が既知 (src/app/native_video.rs の death-gate コメント参照。
+        // 実機で『拡大された古いフレームの小窓が一瞬』= この再生成窓)。その再生成は最後に渡した
+        // builder を使うため、seed しないと既定サイズで作られてから保存配置へリサイズされフラッシュ
+        // する。旧 host が **生存したまま** 新既定サイズ窓が生えるので host 生存判定だけでは
+        // 取りこぼす (Codex 実機レビュー P1)。detached 動画が active/切替中の間は毎フレーム
+        // placement を seed し、再生成窓を最初から保存配置サイズで作らせてフラッシュを消す
+        // (seed 元は live placement。Win32 のタイトルバー drag は modal loop で egui が builder を
+        // 再 diff しないため、ドラッグ中の引き戻しは起きない)。静止画の enumerate holdover は
+        // live placement を更新しないので従来どおり host 未生存時のみ seed する (Codex P2)。
+        #[cfg(windows)]
+        let detached_seed_placement = need_show
+            || self.detached_viewer_should_seed_placement()
+            || self.detached_video_presentation_active_or_targeted();
+        #[cfg(not(windows))]
+        let detached_seed_placement = need_show;
         let mut fs_builder = if detached {
             self.build_detached_viewer_viewport_builder(
                 fs_idx,
                 detached_activate_on_show,
-                need_show,
+                detached_seed_placement,
             )
         } else if state.is_video {
             self.build_fullscreen_viewport_builder()
@@ -5018,6 +5069,12 @@ impl App {
                                 rect,
                                 pixels_per_point,
                             );
+                            // capture の default 判定に使う previous は **save より前に**
+                            // スナップショットする。save が default rect を false-negative して
+                            // live/settings を上書きすると、capture が汚染後の値を見て防波堤が
+                            // 効かなくなる (Codex 実機レビュー P2)。
+                            let previous_placement_for_capture =
+                                self.detached_viewer_previous_placement_for_default_check();
                             let restore_placement = self
                                 .save_detached_viewer_placement_from_logical_rect(
                                     rect,
@@ -5040,10 +5097,20 @@ impl App {
                                 ));
                                 ctx.request_repaint();
                             }
-                            self.capture_detached_viewer_host_hwnd_from_logical_rect(
-                                rect,
-                                pixels_per_point,
-                            );
+                            // restore_placement=Some のフレームは outer_rect が egui 既定サイズ
+                            // (≈822x656 物理 = 533x400 論理) の過渡窓を指している。その rect で host
+                            // を capture すると、新規に生えた既定サイズ窓を host に掴み直し、
+                            // native presenter child をそこへ再親付けして動画が一瞬小窓へ寄る
+                            // (実機ログ 2026-07-01 の `captured host …822x656` → `synced …presenter`)。
+                            // リポジションコマンドは既に送ってあるので、次フレームに geometry が
+                            // 保存配置へ落ち着いてから (restore_placement=None) capture する。
+                            if restore_placement.is_none() {
+                                self.capture_detached_viewer_host_hwnd_from_logical_rect(
+                                    rect,
+                                    pixels_per_point,
+                                    previous_placement_for_capture,
+                                );
+                            }
                         }
                     }
                 }
@@ -6901,12 +6968,15 @@ impl App {
         match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => {
                 // holdover / cleanup 用の inactive builder。新規 OS 窓が生成される場合
-                // (= まだ host HWND を捕捉していない初回相当) だけ placement を seed し、
-                // 既定サイズ (822x656) で一瞬出るフラッシュを防ぐ。既に window がある
-                // (host!=0) ときは geometry を触らない: この経路は enumerate 待ち中に
-                // live_placement を更新しないため、待ちが長いときユーザーが detached 窓を
-                // drag/resize しても古い placement で引き戻さないようにする (Codex P2)。
-                let apply_placement = self.detached_viewer_host_hwnd == 0;
+                // (= host HWND が未捕捉 or 死んでいて再生成される) だけ placement を seed し、
+                // 既定サイズ (822x656) で一瞬出るフラッシュを防ぐ。host HWND が **生存している**
+                // ときは geometry を触らない: この経路は enumerate 待ち中に live_placement を
+                // 更新しないため、待ちが長いときユーザーが detached 窓を drag/resize しても
+                // 古い placement で引き戻さないようにする (Codex P2)。
+                // 判定は `== 0` ではなく `should_seed_placement()` (= host が生存していない)
+                // にする: stale (死んだ) HWND をまだ指している (!=0) 間に egui が窓を再生成すると、
+                // `== 0` では seed を取りこぼして既定サイズ窓が生えてしまう (2026-07-01 ハンドオフ)。
+                let apply_placement = self.detached_viewer_should_seed_placement();
                 self.build_detached_viewer_viewport_builder(fs_idx, None, apply_placement)
             }
             Some(ViewerPresentation::Fullscreen) if !self.fs_viewport_recreate_after_hide => {
@@ -10465,6 +10535,23 @@ impl App {
         }
     }
 
+    /// `draw_fs_image` が表示に使うテクスチャの選択。
+    ///
+    /// 静止画は「サムネ → 高画質」の progressive load に意味があるので、フル解像度 `tex` が
+    /// 無ければ `thumb_tex` にフォールバックする。**動画はフォールバックしない**: 動画サムネは
+    /// ポスターフレーム (ライブ再生位置とは別のフレーム) で、しかも aspect / 拡大率がズレて黒
+    /// レターボックスを溢れることがある。F12 でウィンドウ間を移す一瞬 (native presenter child が
+    /// 新ホストを覆う前) にこれが透けて「別ウィンドウに違うサイズの絵が一瞬出る」チラつきに
+    /// なっていた (実機 2026-07-01)。動画は native presenter が実フレームを描くので、それまでは
+    /// 黒 (CentralPanel) のままにする。
+    pub(crate) fn fs_display_texture_choice<'a>(
+        is_video: bool,
+        tex: Option<&'a egui::TextureHandle>,
+        thumb_tex: Option<&'a egui::TextureHandle>,
+    ) -> Option<&'a egui::TextureHandle> {
+        if is_video { tex } else { tex.or(thumb_tex) }
+    }
+
     /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_image(
@@ -10489,7 +10576,7 @@ impl App {
         content_bbox: Option<egui::Rect>,
     ) {
         let using_full_texture = tex.is_some();
-        let display_tex = tex.or(thumb_tex);
+        let display_tex = Self::fs_display_texture_choice(is_video, tex, thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
             let display_size = match rotation {
@@ -10604,12 +10691,15 @@ impl App {
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_gray(180),
             );
+        } else if is_video && !vst3_waiting_for_video {
+            // 動画は native presenter が実フレームを描く。サムネも「読込中」テキストも出さず
+            // 黒 (CentralPanel) のままにする。旧「動画サムネイル 読込中...」はサムネ表示前提の
+            // 文言だったが、動画サムネ自体を廃止したので出さない (VST3 初期化待ちだけは下の
+            // 分岐で専用表示する)。
         } else {
             let painter = ui.painter();
             let loading_label = if vst3_waiting_for_video {
                 "VST3 プラグインを初期化中..."
-            } else if is_video {
-                "動画サムネイル 読込中..."
             } else {
                 "読込中..."
             };
@@ -13553,6 +13643,13 @@ impl App {
             return;
         }
         if self.analysis_mode || self.adjustment_mode {
+            return;
+        }
+        // 動画は egui 側にテクスチャが無く、ルーペで拡大できるのはポスターサムネ (ライブ再生
+        // 位置とは別フレーム) だけになる。「動画ではサムネ表示自体をしない」方針に合わせ、動画
+        // ではルーペを無効にする (通常描画で `fs_display_texture_choice` が動画サムネを弾くのと
+        // 同じ整合。Codex P3)。
+        if matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
             return;
         }
         let (hover, focused) =
@@ -18812,6 +18909,42 @@ mod tests {
     }
     fn tz_cursor(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
         zip_cursor_image_px(band, egui::Vec2::ZERO, image, cursor)
+    }
+
+    #[test]
+    fn video_display_texture_never_falls_back_to_poster_thumbnail() {
+        // 動画は native presenter が実フレームを描くので、egui 側はサムネ (ポスターフレーム) を
+        // 表示物に使わない。ライブ再生位置とズレた別フレームが違う拡大率で一瞬出るチラつきを
+        // 防ぐ (実機 2026-07-01 の F12 切替で F250 が黒余白を溢れて見えた回帰の固定)。静止画は
+        // progressive load で thumb にフォールバックする。
+        let ctx = egui::Context::default();
+        let mk = |name: &str| {
+            let ci = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
+            ctx.load_texture(name, ci, egui::TextureOptions::LINEAR)
+        };
+        let full = mk("full");
+        let thumb = mk("thumb");
+
+        // 動画: フル tex があればそれ、無ければ None (サムネにフォールバックしない)。
+        assert!(App::fs_display_texture_choice(true, None, Some(&thumb)).is_none());
+        assert_eq!(
+            App::fs_display_texture_choice(true, Some(&full), Some(&thumb)).map(|t| t.id()),
+            Some(full.id()),
+            "動画でフル tex があればそれを使う"
+        );
+        assert!(App::fs_display_texture_choice(true, None, None).is_none());
+
+        // 静止画: フル tex 優先、無ければ thumb にフォールバック。
+        assert_eq!(
+            App::fs_display_texture_choice(false, None, Some(&thumb)).map(|t| t.id()),
+            Some(thumb.id()),
+            "静止画はサムネにフォールバックする (progressive load)"
+        );
+        assert_eq!(
+            App::fs_display_texture_choice(false, Some(&full), Some(&thumb)).map(|t| t.id()),
+            Some(full.id())
+        );
+        assert!(App::fs_display_texture_choice(false, None, None).is_none());
     }
 
     #[test]

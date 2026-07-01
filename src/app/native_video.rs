@@ -10,9 +10,21 @@ use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, Key
 fn native_video_key_physically_down(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    // high bit (0x8000) = 現在押下中。呼び出し時点の物理状態を返す。
-    unsafe { (GetAsyncKeyState(key.virtual_key as i32) as u16 & 0x8000) != 0 }
+    // headless な単体テストは合成 KeyDown を送るので実際には物理キーが押されておらず、
+    // GetAsyncKeyState が常に false を返して F12 トグルが走らない。この OS 問い合わせは
+    // 実機の stale 再配送弾き専用なので、テスト時は「押されている」とみなして production
+    // 分岐 (実機でのみ意味を持つ) を迂回する。
+    #[cfg(test)]
+    {
+        let _ = key;
+        true
+    }
+    #[cfg(not(test))]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        // high bit (0x8000) = 現在押下中。呼び出し時点の物理状態を返す。
+        unsafe { (GetAsyncKeyState(key.virtual_key as i32) as u16 & 0x8000) != 0 }
+    }
 }
 
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
@@ -1047,6 +1059,10 @@ impl App {
             },
         );
         self.init_normalize_state_for_opened_video(target_idx);
+        // deferred swap を確定する open_fullscreen は「viewer 内ナビ」相当なので、open_fullscreen
+        // 冒頭の一括ガードが現在の `viewer_presentation` (pending 中に F12 されていれば反映済み)
+        // から presentation 維持 one-shot を焼き付ける (Codex 実機 P1/P2)。ここで個別に復元する
+        // 必要はない。
         self.open_fullscreen(target_idx);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
         if start_normalize_scan_before_play {
@@ -1812,6 +1828,14 @@ impl App {
         }
         if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
             self.pending_detached_video_host_switch = None;
+        }
+        // DetachedWindow へ切り替えるときは、host を最初に出す **前に** window_id を確定する。
+        // これで `fullscreen_viewport_id()` が切替開始から確定後まで一貫して同じ detached
+        // ViewportId を返し、egui が OS 窓を作り直さない (= 再表示アニメ + presenter child 道連れ
+        // 死 + resync 二枚目窓を防ぐ。Codex 実機レビュー P1)。`apply_video_presentation_switched`
+        // も同じ `ensure_detached_viewer_window_id()` を呼ぶので id は一致する。
+        if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+            self.ensure_detached_viewer_window_id();
         }
         // 進行中のトグルがあれば無視する (連打防止 = Codex P2/P3)。deadline 超過は
         // presenter 無応答時の保険 — 過ぎていれば古い pending を捨てて続行する。
@@ -6180,6 +6204,9 @@ impl App {
             fs_idx,
             nav_delta,
         ) {
+            // presentation 維持 (「別ウィンドウで開く」設定を手動ナビで再適用しない) は
+            // `open_fullscreen` 冒頭の一括ガードで行う (Home/End / Ctrl+G / 検索ジャンプ / fast-swap
+            // deferred 経路も同じ経路に集約されるので一箇所で塞げる。実機 P1/P2)。
             self.open_native_video_fullscreen_from_navigation(ctx, new_idx);
         } else {
             self.show_native_video_boundary_toast(ctx, nav_delta > 0);
@@ -6669,10 +6696,11 @@ impl App {
     ) {
         self.sync_main_selection_from_viewer_idx(idx);
 
-        // fast-swap / tile-swap は presenter を再利用するので presentation は自然に維持される。
-        // その経路では open_fullscreen (→ prepare_viewer_presentation_open) を通らず forced
-        // presentation の one-shot が消費されないため、ここで確実にクリアして次の手動 open へ
-        // 漏らさない。
+        // fast-swap / tile-swap は presenter を再利用し、確定は deferred source-swap 完了時の
+        // open_fullscreen で行う。presentation 維持 (「別ウィンドウで開く」設定を手動ナビで再適用
+        // しない) は、その完了時 open_fullscreen 冒頭の一括ガードが現在の viewer_presentation から
+        // 焼き付けるので、ここでは live one-shot を clear して、この関数がすぐ return した後に
+        // auto-advance の明示 one-shot 等が別 open へ漏れるのを防ぐだけにする。
         if self.try_start_video_tile_fast_swap(ctx, idx) {
             self.fs_video_open_forced_presentation = None;
             return;

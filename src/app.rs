@@ -23602,6 +23602,58 @@ impl App {
         shrank_hard && previous_was_substantial
     }
 
+    /// capture の default 判定に使う「直前の正しい配置」を返す。**save より前に**取得すること
+    /// (save が live/settings を default rect へ false-negative 上書きすると capture の判定材料が
+    /// 汚染されるため = Codex 実機レビュー P2)。
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_previous_placement_for_default_check(
+        &self,
+    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+        self.active_detached_viewer_live_placement
+            .or(self.settings.detached_viewer_window_placement)
+            .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
+    }
+
+    /// capture の「最後の防波堤」(Codex 実機レビュー P1/P2)。egui が detached viewport を作り直す
+    /// 過程で生む既定サイズ (client 800x600 physical ≒ outer 822x656) の過渡窓を、host として
+    /// **絶対に採用しない**ための判定。呼び出し側 (render 経路の `restore_placement.is_none()`
+    /// gate) が状態差で漏れても、capture 関数自身が既定サイズ窓を弾く。
+    ///
+    /// `previous` は **save より前に**スナップショットした直前の正しい配置を渡すこと。self から
+    /// 読むと、同一フレームで先に走る save が live/settings を default rect へ上書き (false-negative)
+    /// した後の汚染値を見てしまい、防波堤が機能しない (Codex P2)。`outer_rect` は論理座標
+    /// (装飾込み outer)。previous と比べて「十分大きい配置から既定サイズへ hard shrink した」
+    /// 場合だけ default とみなす。ユーザーが元から小さい窓を使っている (previous が substantial
+    /// でない) 場合は弾かない。
+    #[cfg(windows)]
+    pub(crate) fn detached_capture_rect_looks_like_default_viewport(
+        previous: Option<crate::settings::DetachedViewerWindowPlacement>,
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) -> bool {
+        let Some(previous) = previous else {
+            return false;
+        };
+        if previous.maximized {
+            return false;
+        }
+        let scale = pixels_per_point.clamp(0.5, 4.0);
+        let phys_w = outer_rect.width() * scale;
+        let phys_h = outer_rect.height() * scale;
+        // egui/winit の既定 detached window は client 800x600 physical = outer ~822x656 physical。
+        // DPI・装飾でぶれるので上限を広めに取る (これ以上大きければ既定ではない)。
+        let near_default = phys_w <= 900.0 && phys_h <= 720.0;
+        if !near_default {
+            return false;
+        }
+        // outer_rect.width() は装飾込みで previous.w (inner) よりわずかに大きいが、hard-shrink
+        // 判定 (< 80%) には十分な余裕がある。
+        let shrank_hard =
+            outer_rect.width() < previous.w * 0.80 || outer_rect.height() < previous.h * 0.80;
+        let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
+        shrank_hard && previous_was_substantial
+    }
+
     #[cfg(windows)]
     fn build_active_detached_image_window_snapshot(
         &mut self,
@@ -24269,6 +24321,20 @@ impl App {
         }
     }
 
+    /// detached viewer の OS 窓を「新規生成 / 再生成する可能性があるフレームか」を返す。
+    ///
+    /// host HWND が生存していない (未捕捉= 0、または stale = 死んだ HWND を !=0 で指したまま)
+    /// なら、egui は次の `show_viewport_immediate` でその ViewportId の OS 窓を作り直す。その
+    /// 再生成は最後に渡した builder を使うため、placement を seed しないと既定サイズ 822x656 の
+    /// 小窓で生成されてから保存配置へリサイズされ、一瞬フラッシュする (2026-07-01 ハンドオフ)。
+    /// 生存しているときは既存窓なので geometry を触らない (enumerate 待ち中のユーザー
+    /// drag/resize を古い placement で引き戻さない = Codex P2)。active / inactive / keep-alive
+    /// backstop の 3 経路すべてがこの判定を共有する。
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_should_seed_placement(&self) -> bool {
+        self.detached_viewer_host_hwnd_alive().is_none()
+    }
+
     #[cfg(windows)]
     pub(crate) fn detached_viewer_host_lost(&self) -> bool {
         let hwnd_raw = self.detached_viewer_host_hwnd;
@@ -24501,7 +24567,27 @@ impl App {
         &mut self,
         outer_rect: egui::Rect,
         pixels_per_point: f32,
+        previous_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     ) {
+        // 最後の防波堤 (Codex 実機レビュー P1/P2): egui が detached viewport を作り直す過程で生む
+        // 既定サイズ (822x656) の過渡窓を、呼び出し側 gate が漏らしても host に採用しない。
+        // 採用すると presenter child を既定サイズ窓へ再親付けして動画が一瞬小窓へ寄る。previous は
+        // save より前にスナップショットした値を渡す (save の false-negative 上書き汚染を避ける)。
+        if Self::detached_capture_rect_looks_like_default_viewport(
+            previous_placement,
+            outer_rect,
+            pixels_per_point,
+        ) {
+            self.log_detached_image_window_debug(format!(
+                "capture_skipped_default_viewport outer=({:.0},{:.0} {:.0}x{:.0}) ppp={:.3}",
+                outer_rect.min.x,
+                outer_rect.min.y,
+                outer_rect.width(),
+                outer_rect.height(),
+                pixels_per_point
+            ));
+            return;
+        }
         let hwnd_raw = Self::find_detached_viewer_host_hwnd_from_logical_rect(
             self.main_hwnd,
             outer_rect,
@@ -24893,7 +24979,12 @@ impl App {
             h: size_rect.height(),
             maximized: false,
         };
-        if self.viewer_session_is_detached() {
+        // switching も含める: F12 で動画を detach する遷移中は presentation がまだ
+        // DetachedWindow に変わっておらず `viewer_session_is_detached()` が false になる窓がある。
+        // その間に egui が既定サイズ窓を報告すると、狭い判定では default-rejection が発火せず
+        // 既定 placement を保存 + 既定サイズ窓を capture してしまう (Codex P1)。render 側は
+        // `viewer_session_is_detached_or_switching()` を detached 判定に使っているので揃える。
+        if self.viewer_session_is_detached_or_switching() {
             let previous = self
                 .active_detached_viewer_live_placement
                 .or(self.settings.detached_viewer_window_placement)
@@ -25073,11 +25164,17 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// open 時に採用する presentation を決める。連続再生の**自動**次送り
-    /// (`fs_video_open_forced_presentation` one-shot) では、直前の動画の presentation を
-    /// そのまま維持し、「別ウィンドウで開く」設定の再適用 (= detached 化) を抑止する。
-    /// それ以外 (ユーザー手動 open / 通常 nav) は従来の設定ベース判定に従う。one-shot は
-    /// 消費する。
+    /// open 時に採用する presentation を決める。
+    ///
+    /// `fs_video_open_forced_presentation` one-shot が立っていれば直前の動画の presentation を
+    /// そのまま維持し、「別ウィンドウで開く」設定の再適用 (= detached 化) を抑止する。この
+    /// one-shot の主な発生源は `open_fullscreen` 冒頭の一括ガード: **grid からの新規 open では
+    /// なく (fs_open_intent_from_grid=false)、既にフルスクリーン中で、動画を開く** viewer 内ナビ
+    /// (矢印 / wheel / Home / End / Ctrl+G / 検索ジャンプ / fast-swap deferred 完了) のときだけ、
+    /// `viewer_presentation` が書き換わる前に現在値を焼き付ける (連続再生の自動次送りは加えて
+    /// 明示設定もする)。これにより、F12 で main に出した動画を手動ナビで送っても別窓へ飛ばさない
+    /// (実機 FB 2026-07-02)。one-shot が無い open (= grid からの新規 open: Enter / ダブルクリック)
+    /// だけが従来どおり設定ベース (`effective_...`) に従う。one-shot は消費する。
     #[cfg(windows)]
     fn resolve_viewer_presentation_for_open(
         &mut self,
@@ -25221,6 +25318,24 @@ impl App {
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
+        // viewer 内の手動ナビ (grid からの新規 open ではない = `fs_open_intent_from_grid` が false、
+        // かつ既にフルスクリーン中) で **動画** を開くときは、現在の presentation を維持する
+        // (one-shot 焼き付け)。「別ウィンドウで開く」設定は grid からの新規 open (Enter /
+        // ダブルクリック) だけに適用し、F12 で main に出した動画を矢印 / wheel / Home / End /
+        // Ctrl+G / 検索ジャンプで送っても別窓へ飛ばさない (実機 FB 2026-07-02、Codex 実機 P1/P2)。
+        // 全 nav 経路が open_fullscreen に集約するのでここ 1 箇所で塞ぐ。deferred source-swap は
+        // 完了時にこの open_fullscreen を通り、その時点の `viewer_presentation` (pending 中に F12
+        // されていれば反映済み) を読むので同じ規則で正しく維持される。auto-advance が明示 one-shot
+        // を立てている場合はそれを尊重する (is_none 判定)。この判定は `fullscreen_idx` を idx へ
+        // 更新する前・`prepare_viewer_presentation_open` が presentation を書き換える前に行う。
+        #[cfg(windows)]
+        if self.fs_video_open_forced_presentation.is_none()
+            && !self.fs_open_intent_from_grid
+            && self.fullscreen_idx.is_some()
+            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+        {
+            self.fs_video_open_forced_presentation = Some(self.viewer_presentation);
+        }
         #[cfg(windows)]
         let reuse_detached_window_for_folder_nav =
             self.take_detached_folder_nav_reuse_window_for_open(idx);
@@ -36997,12 +37112,10 @@ impl App {
                     }
                     self.switch_native_video_viewer_presentation(target_presentation, true);
                 }
-                self.show_feedback_toast(match target_presentation {
-                    ViewerPresentation::DetachedWindow => {
-                        "この動画を別ウィンドウへ切り替えます".to_string()
-                    }
-                    _ => "この動画をメインウィンドウへ切り替えます".to_string(),
-                });
+                // 切替トースト (「この動画を別ウィンドウへ/メインウィンドウへ切り替えます」) は
+                // 出さない。切替中は main と detached の両ビューポートがフィードバックトーストを
+                // 描くため右上に二重表示されてちらつく (実機 FB 2026-07-02)。切替自体は映像が
+                // 移動するので視覚的に自明。
                 return;
             }
         }
@@ -40213,8 +40326,9 @@ impl App {
         // **自動**次送りでは「別ウィンドウで開く」設定を再適用せず、直前の動画の
         // presentation (Main/Fullscreen/Detached) を維持する。設定 ON だと open 経路が
         // 次の動画を detached で開いて「最初のフレームが別ウィンドウ→本編は元のウィンドウ」
-        // というちらつきになるため、現在の presentation を one-shot で強制する。ユーザー
-        // 手動ナビ (wheel / キー) はこの one-shot を立てないので従来どおり設定に従う。
+        // というちらつきになるため、現在の presentation を one-shot で焼き付ける。
+        // (手動ナビも含め、確定は `open_fullscreen` 冒頭の一括ガードが未セット時に同値を立てるので
+        // 挙動は揃う。ここは自動次送りの意図を明示する冗長設定。)
         #[cfg(windows)]
         {
             self.fs_video_open_forced_presentation = Some(self.viewer_presentation);
