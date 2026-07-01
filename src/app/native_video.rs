@@ -5359,6 +5359,23 @@ impl App {
         fs_idx: usize,
         key: crate::video::native_window::NativeVideoKeyEvent,
     ) {
+        // [diag] F12 二重トグル (main フラッシュ + 再分離) の発生源特定用。native presenter が
+        // 転送する F12 (repeat 含む) を全て記録し、egui 側の [f12-diag] と突き合わせる。
+        if key.virtual_key == 0x7B {
+            crate::logger::log(format!(
+                "[native-video][diag] native F12 recv: repeat={} scan=0x{:x} ext={} ctrl={} shift={} alt={} presentation={:?} in_flight={} settling={}",
+                key.repeat,
+                key.scan_code,
+                key.extended,
+                key.ctrl,
+                key.shift,
+                key.alt,
+                self.viewer_presentation,
+                self.native_video_mode_switch.is_some(),
+                self.native_video_presentation_settle_until
+                    .is_some_and(|until| std::time::Instant::now() < until),
+            ));
+        }
         // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
         // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
         // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
