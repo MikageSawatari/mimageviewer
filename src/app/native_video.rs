@@ -2048,6 +2048,12 @@ impl App {
             self.dsp_bridge.set_hud_hwnd(0);
             self.vst_geometry_tracker.clear();
         }
+        // 切替完了直後の settle を張る。Plan B のウィンドウ再構築で、単一の F12 押下でも
+        // 新 presenter が同じ F12 KeyDown をもう一度転送して二重トグル (main フラッシュ +
+        // 再分離) になることがある。in-flight ガードが切れた完了直後 (実測 37〜71ms) に届く
+        // ため、短い settle でこの再配送だけを無視する (実ユーザーの次押下は 600ms 以降)。
+        self.native_video_presentation_settle_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
         crate::logger::log(format!(
             "[native-video] presentation switch applied -> {presentation:?}"
         ));

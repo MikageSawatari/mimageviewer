@@ -16628,6 +16628,50 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn native_video_f12_settle_suppresses_rebuild_duplicate_toggle() {
+        // F12 で detached ⇔ main を切替えると presenter を Plan B で作り直す。単一の物理
+        // F12 押下でも、再構築後の新 presenter が同じ F12 KeyDown をもう一度転送し、
+        // 完了直後 (in-flight ガードが切れた後) に届いて detached→main→detached の二重
+        // トグル (main への一瞬フラッシュ + 再分離) を起こしていた。placement 切替完了で
+        // 張る settle が、この完了直後の再配送だけを弾くことを確認する。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+
+        // 切替完了 (apply_video_presentation_switched) が settle を張る。
+        assert!(app.native_video_presentation_settle_until.is_none());
+        app.apply_video_presentation_switched(ViewerPresentation::MainWindow);
+        assert!(
+            app.native_video_presentation_settle_until.is_some(),
+            "a completed placement switch must arm the settle window"
+        );
+
+        // settle 中 (= 完了直後) の F12 は再配送とみなして無視する。
+        let now = std::time::Instant::now();
+        assert!(
+            app.native_video_toggle_within_settle(now),
+            "an F12 arriving during the post-switch settle is treated as a rebuild re-delivery"
+        );
+
+        // settle を過ぎれば (= 実ユーザーの次の押下) 通常どおり受け付ける。
+        let after = app.native_video_presentation_settle_until.unwrap()
+            + std::time::Duration::from_millis(1);
+        assert!(
+            !app.native_video_toggle_within_settle(after),
+            "once the settle window elapses a genuine re-press is honored again"
+        );
+
+        // 静止画に切り替わった後は、残存 settle が F12 を巻き込まない (item 種別で絞る)。
+        let image = push_image(&mut app, r"C:\pics\b.png");
+        app.fullscreen_idx = Some(image);
+        assert!(
+            !app.native_video_toggle_within_settle(now),
+            "a stale video settle must not suppress the F12 toggle for a still image"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn video_presentation_switch_updates_detached_session_lifecycle() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
