@@ -6774,6 +6774,7 @@ mod tests {
             "ToggleDetachedViewer".to_string(),
             "ToggleWindowMode".to_string(),
             "ToggleMaximize".to_string(),
+            "MinimizeWindow".to_string(),
             "CloseFullscreen".to_string(),
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),

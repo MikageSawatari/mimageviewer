@@ -452,6 +452,7 @@ pub enum RingActionId {
     ToggleDetachedViewer,
     ToggleWindowMode,
     ToggleMaximize,
+    MinimizeWindow,
     CloseFullscreen,
     CycleFavorite,
     OpenFavorite1,
@@ -833,6 +834,7 @@ impl RingActionId {
             Self::ToggleDetachedViewer => "toggle_detached_viewer",
             Self::ToggleWindowMode => "toggle_window_mode",
             Self::ToggleMaximize => "toggle_maximize",
+            Self::MinimizeWindow => "minimize_window",
             Self::CloseFullscreen => "close_fullscreen",
             Self::CycleFavorite => "cycle_favorite",
             Self::OpenFavorite1
@@ -963,6 +965,7 @@ impl RingActionId {
             "toggle_detached_viewer" => Self::ToggleDetachedViewer,
             "toggle_window_mode" => Self::ToggleWindowMode,
             "toggle_maximize" => Self::ToggleMaximize,
+            "minimize_window" => Self::MinimizeWindow,
             "close_fullscreen" => Self::CloseFullscreen,
             "cycle_favorite" => Self::CycleFavorite,
             "open_location_drive_list" => Self::OpenLocationDriveList,
@@ -1058,6 +1061,7 @@ impl RingActionId {
             Self::ToggleDetachedViewer => "別ウィンドウ ON/OFF",
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::ToggleMaximize => "ウィンドウ最大化/復元",
+            Self::MinimizeWindow => "ウィンドウ最小化",
             Self::CloseFullscreen => match context {
                 RingShortcutContext::ImageFullscreen => "画像フルスクリーンを閉じる",
                 RingShortcutContext::VideoFullscreen => "動画フルスクリーンを閉じる",
@@ -1180,6 +1184,7 @@ impl RingActionId {
                 self,
                 Self::None
                     | Self::ToggleMaximize
+                    | Self::MinimizeWindow
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
@@ -1212,6 +1217,7 @@ impl RingActionId {
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
+                    | Self::MinimizeWindow
                     | Self::CloseFullscreen
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
@@ -1247,6 +1253,7 @@ impl RingActionId {
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
+                    | Self::MinimizeWindow
                     | Self::CloseFullscreen
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
@@ -1277,6 +1284,7 @@ impl RingActionId {
             RingShortcutContext::Grid => vec![
                 Self::None,
                 Self::ToggleMaximize,
+                Self::MinimizeWindow,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
@@ -1308,6 +1316,7 @@ impl RingActionId {
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
+                Self::MinimizeWindow,
                 Self::CloseFullscreen,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
@@ -1342,6 +1351,7 @@ impl RingActionId {
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
+                Self::MinimizeWindow,
                 Self::CloseFullscreen,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
@@ -2535,6 +2545,29 @@ mod tests {
             RingActionId::ToggleMaximize.label_for_context(RingShortcutContext::Grid),
             "ウィンドウ最大化/復元"
         );
+    }
+
+    #[test]
+    fn minimize_window_action_round_trips_and_is_available_everywhere() {
+        let action = RingActionId::MinimizeWindow;
+        assert_eq!(action.as_str(), "minimize_window");
+        assert_eq!(
+            RingActionId::from_str("minimize_window"),
+            Some(action.clone())
+        );
+        assert_eq!(
+            action.label_for_context(RingShortcutContext::ImageFullscreen),
+            "ウィンドウ最小化"
+        );
+        for context in [
+            RingShortcutContext::Grid,
+            RingShortcutContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen,
+        ] {
+            assert!(action.is_valid_for_context(context));
+            assert!(RingActionId::available_for_context(context).contains(&action));
+            assert!(action.is_valid_for_mouse_button_context(context));
+        }
     }
 
     #[test]

@@ -2,6 +2,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+#[cfg(windows)]
+use super::ViewerPresentation;
 use super::{App, FolderNavMode};
 use crate::adjustment::PostFilter;
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -4264,6 +4266,10 @@ impl App {
                 self.toggle_main_window_maximized(ctx);
                 None
             }
+            RingActionId::MinimizeWindow => {
+                self.apply_ring_minimize_window(ctx, context);
+                None
+            }
             RingActionId::CloseFullscreen
                 if matches!(
                     context,
@@ -4617,6 +4623,61 @@ impl App {
             }
             RingShortcutContext::Grid => {}
         }
+    }
+
+    fn apply_ring_minimize_window(&mut self, ctx: &egui::Context, context: RingShortcutContext) {
+        #[cfg(windows)]
+        if let Some(hwnd) = self.ring_minimize_target_hwnd(context) {
+            crate::logger::log(format!(
+                "[input-nav] minimize_window context={context:?} hwnd=0x{hwnd:x}"
+            ));
+            let _ = crate::video::native_window::minimize_window(hwnd);
+            ctx.request_repaint();
+            return;
+        }
+
+        let target_viewport = match context {
+            RingShortcutContext::Grid => egui::ViewportId::ROOT,
+            RingShortcutContext::ImageFullscreen => self.fullscreen_ring_action_viewport_id(ctx),
+            RingShortcutContext::VideoFullscreen => self.fullscreen_ring_action_viewport_id(ctx),
+        };
+        ctx.send_viewport_cmd_to(target_viewport, egui::ViewportCommand::Minimized(true));
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn ring_minimize_target_hwnd(&self, context: RingShortcutContext) -> Option<u64> {
+        let live_main = || {
+            self.main_hwnd.and_then(|hwnd| {
+                let hwnd = hwnd as u64;
+                crate::video::native_window::is_window_alive(hwnd).then_some(hwnd)
+            })
+        };
+        match context {
+            RingShortcutContext::Grid => live_main(),
+            RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => {
+                if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+                    || self.active_detached_viewer_context.is_some()
+                {
+                    if let Some(hwnd) = self.detached_viewer_host_hwnd_alive() {
+                        return Some(hwnd);
+                    }
+                }
+                if matches!(self.viewer_presentation, ViewerPresentation::MainWindow)
+                    || context == RingShortcutContext::VideoFullscreen
+                {
+                    return live_main();
+                }
+                None
+            }
+        }
+    }
+
+    fn fullscreen_ring_action_viewport_id(&self, ctx: &egui::Context) -> egui::ViewportId {
+        if ctx.viewport_id() != egui::ViewportId::ROOT {
+            return ctx.viewport_id();
+        }
+        self.fullscreen_viewport_id()
     }
 
     fn visual_spread_shift_dir(&self, right: bool) -> i32 {
