@@ -578,6 +578,44 @@ impl App {
         }
     }
 
+    /// detached 動画再生中に host HWND が変わったとき、presenter child を現 host へ
+    /// 再親付けする。`capture_detached_viewer_host_hwnd_from_logical_rect` が host 変更を
+    /// 検出して `pending_detached_video_host_resync` を立てる。detached の egui viewport は
+    /// 切替 (main⇔detached) をまたぐと OS window (host HWND) が作り直されることがあり、
+    /// 旧 host の子として残った presenter child (WS_CHILD) が旧 host 破棄で道連れ死 →
+    /// WM_QUIT → presenter 終了 → 再生終了 という既存バグ (host capture race) を、
+    /// **常に現在の detached host へ追従させる**ことで防ぐ。
+    #[cfg(windows)]
+    pub(super) fn poll_detached_video_host_resync(&mut self) {
+        if !self.pending_detached_video_host_resync {
+            return;
+        }
+        // detached 動画でない (画像 detached / 非 detached / 動画でない / fullscreen なし) なら
+        // 再親付けは不要。要求を破棄する。
+        let applicable = matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            && self.viewer_session_is_detached()
+            && self
+                .fullscreen_idx
+                .map(|idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
+                .unwrap_or(false);
+        if !applicable {
+            self.pending_detached_video_host_resync = false;
+            return;
+        }
+        // mode switch 進行中は placement switch を重ねられない。switch 完了後の
+        // フレームで再試行するためフラグは残す (host 変更を取りこぼさない)。
+        if self.native_video_mode_switch.is_some() {
+            return;
+        }
+        self.pending_detached_video_host_resync = false;
+        crate::logger::log(format!(
+            "[native-video] detached host changed -> resync presenter child \
+             host=0x{:x} host_generation={}",
+            self.detached_viewer_host_hwnd, self.detached_viewer_host_generation
+        ));
+        self.sync_detached_video_child_presenter_rect();
+    }
+
     #[cfg(windows)]
     pub(super) fn defer_native_video_source_swap_until_decoder_free(
         &mut self,

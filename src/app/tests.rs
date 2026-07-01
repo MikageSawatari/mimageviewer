@@ -16698,6 +16698,49 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_video_host_change_resync_request_lifecycle() {
+        // host capture race 対策: detached 動画再生中に host HWND が変わったら presenter
+        // child を現 host へ再親付けする要求 (pending_detached_video_host_resync) を、
+        // 適用可否と mode switch 進行状況に応じて正しく処理する。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+
+        // 非 detached セッションの再同期要求は破棄される。
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.pending_detached_video_host_resync = true;
+        app.poll_detached_video_host_resync();
+        assert!(
+            !app.pending_detached_video_host_resync,
+            "a resync request for a non-detached session must be dropped"
+        );
+
+        // detached 動画 + placement switch 進行中は switch 完了まで要求を保持する
+        // (host 変更を取りこぼさない)。
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 7,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+        app.pending_detached_video_host_resync = true;
+        app.poll_detached_video_host_resync();
+        assert!(
+            app.pending_detached_video_host_resync,
+            "resync must wait while a placement switch is in flight"
+        );
+
+        // switch 完了後は要求を消費する (host/presenter 不在なので sync 自体は no-op)。
+        app.native_video_mode_switch = None;
+        app.poll_detached_video_host_resync();
+        assert!(
+            !app.pending_detached_video_host_resync,
+            "resync request is consumed once the in-flight switch settles"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_image_edit_tools_are_available_only_for_linked_viewer() {
         let mut app = setup_app();
         let image = push_image(&mut app, r"C:\pics\a.jpg");

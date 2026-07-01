@@ -4368,6 +4368,17 @@ pub struct App {
     /// UI スレッド上の window を列挙して捕捉する。
     #[cfg(windows)]
     pub(crate) detached_viewer_host_hwnd: u64,
+    /// detached viewer host HWND が変わるたびに +1 する世代。host capture を lifecycle
+    /// event として観測し、stale host 由来イベントを識別するための App 側カウンタ
+    /// (native presenter 世代とは別物)。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_host_generation: u64,
+    /// detached 動画再生中に host HWND が変わったが、mode switch 進行中で即座に
+    /// presenter child を再親付けできなかったときに立てるフラグ。switch 完了後の
+    /// フレームで `poll_detached_video_host_resync` が現 host へ再同期する。旧 host
+    /// 破棄で child (WS_CHILD) が道連れ死 → WM_QUIT → 再生終了する既存バグの根本対策。
+    #[cfg(windows)]
+    pub(crate) pending_detached_video_host_resync: bool,
     /// 直近に active detached viewer viewport 内で観測した outer rect。
     /// host_lost は次フレームの描画前に判定されるため、診断ログではこの値から
     /// 「今掴むならどの HWND か」を再探索する。
@@ -6599,6 +6610,10 @@ impl App {
             fs_viewport_virtual_desktop_synced_hwnd: 0,
             #[cfg(windows)]
             detached_viewer_host_hwnd: 0,
+            #[cfg(windows)]
+            detached_viewer_host_generation: 0,
+            #[cfg(windows)]
+            pending_detached_video_host_resync: false,
             #[cfg(windows)]
             detached_viewer_last_outer_rect: None,
             #[cfg(windows)]
@@ -24471,14 +24486,18 @@ impl App {
         )
         .unwrap_or(0);
         if hwnd_raw != 0 && hwnd_raw != self.detached_viewer_host_hwnd {
+            let previous_host = self.detached_viewer_host_hwnd;
             let scale = pixels_per_point.max(0.5);
             let left = (outer_rect.min.x * scale).round() as i32;
             let top = (outer_rect.min.y * scale).round() as i32;
             let right = (outer_rect.max.x * scale).round() as i32;
             let bottom = (outer_rect.max.y * scale).round() as i32;
+            self.detached_viewer_host_generation =
+                self.detached_viewer_host_generation.wrapping_add(1);
             crate::logger::log(format!(
-                "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} frame={} \
+                "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} host_generation={} frame={} \
                  old_host=\"{}\" new_state=\"{}\" rect=({},{})-({},{}) ppp={scale:.2}",
+                self.detached_viewer_host_generation,
                 self.frame_counter,
                 self.detached_viewer_host_debug_state(),
                 Self::win32_hwnd_debug_state(hwnd_raw),
@@ -24488,6 +24507,13 @@ impl App {
                 bottom
             ));
             self.detached_viewer_host_hwnd = hwnd_raw;
+            // 既存 host を **置き換えた** 場合 (初回 capture ではない)、native presenter の
+            // child は旧 host の子のまま残っている。旧 host が破棄されると child が道連れで
+            // 消え WM_QUIT → presenter 終了 → 再生終了になるため、現 host へ再親付けを要求する
+            // (実処理は `poll_detached_video_host_resync`。mode switch 進行中でも取りこぼさない)。
+            if previous_host != 0 {
+                self.pending_detached_video_host_resync = true;
+            }
         }
     }
 
@@ -40368,6 +40394,10 @@ impl App {
         self.poll_native_video_source_swap_pending(ctx);
         #[cfg(windows)]
         self.poll_detached_video_host_switch_pending(ctx);
+        // detached host HWND が変わったら presenter child を現 host へ再親付けする
+        // (host capture race で presenter が道連れ死 → 再生終了する既存バグの対策)。
+        #[cfg(windows)]
+        self.poll_detached_video_host_resync();
         #[cfg(windows)]
         self.poll_native_video_open_pending(ctx);
         // Plan B: presenter 無応答で placement 切替 pending が滞留すると VST owner /
