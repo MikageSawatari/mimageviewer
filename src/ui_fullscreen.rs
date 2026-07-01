@@ -7479,10 +7479,6 @@ impl App {
                 .keymap
                 .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
         {
-            crate::logger::log(format!(
-                "[native-video][diag] F12 toggle src=egui-fs-viewport-A presentation={:?}",
-                self.viewer_presentation
-            ));
             self.toggle_detached_viewer_mode();
             return action;
         }
@@ -18287,10 +18283,6 @@ impl App {
             .keymap
             .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
         {
-            crate::logger::log(format!(
-                "[native-video][diag] F12 toggle src=egui-fs-viewport-B presentation={:?}",
-                self.viewer_presentation
-            ));
             self.toggle_detached_viewer_mode();
             return;
         }

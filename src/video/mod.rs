@@ -2308,17 +2308,6 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetNavigationPreview { preview } => {
                     pending_navigation_preview_clear_at = None;
-                    crate::logger::log(format!(
-                        "[native-video][diag] SetNavigationPreview: {} placement={} cur_gen={cur_generation}",
-                        match &preview {
-                            Some(p) => format!(
-                                "Some(thumb={:?})",
-                                p.thumbnail.as_ref().map(|t| (t.width, t.height))
-                            ),
-                            None => "None".to_string(),
-                        },
-                        cur_placement.label(),
-                    ));
                     presenter.set_overlay_navigation_preview(preview);
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {

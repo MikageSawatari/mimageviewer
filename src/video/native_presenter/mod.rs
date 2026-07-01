@@ -5899,13 +5899,6 @@ impl NativeEguiOverlay {
                 return;
             }
             if let Some(preview) = navigation_preview.as_ref() {
-                crate::logger::log(format!(
-                    "[native-video][diag] overlay draws navigation_preview: overlay={overlay_width_points:.0}x{overlay_height_points:.0}pt \
-                     win_px={}x{} ppp={ppp:.2} thumb={:?} first_presented={first_frame_presented}",
-                    self.width,
-                    self.height,
-                    preview.thumbnail.as_ref().map(|t| (t.width, t.height)),
-                ));
                 draw_native_navigation_preview(
                     ctx,
                     overlay_width_points,

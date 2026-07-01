@@ -36970,14 +36970,6 @@ impl App {
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
         #[cfg(windows)]
         {
-            crate::logger::log(format!(
-                "[native-video][diag] toggle_detached_viewer_mode ENTER presentation={:?} \
-                 always_new_target={:?} mode_switch={} host_switch_pending={}",
-                self.viewer_presentation,
-                self.always_new_video_f12_target_presentation(),
-                self.native_video_mode_switch.is_some(),
-                self.pending_detached_video_host_switch.is_some(),
-            ));
             if self.detached_toggle_disabled_by_always_new_images() {
                 self.show_feedback_toast(
                     "毎回新しいウィンドウで開く設定ではF12切替は無効です".to_string(),
@@ -41782,10 +41774,6 @@ impl eframe::App for App {
                 .keymap
                 .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
         {
-            crate::logger::log(format!(
-                "[native-video][diag] F12 toggle src=egui-main-loop presentation={:?}",
-                self.viewer_presentation
-            ));
             self.toggle_detached_viewer_mode();
         }
 
