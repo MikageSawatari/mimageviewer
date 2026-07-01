@@ -274,6 +274,14 @@ impl NativeVideoPlacement {
         matches!(self, Self::FullscreenBorderless)
     }
 
+    /// detached viewer (F12 別ウィンドウ) の子として重ねる placement か。
+    /// この child の host (egui detached viewport) は main⇔detached 切替をまたぐと
+    /// 作り直されるため、host teardown で child が道連れ死しても presenter スレッドを
+    /// 殺さないよう `post_quit_on_destroy=false` にする (詳細は下の window 生成箇所)。
+    pub fn is_detached_viewer_child(&self) -> bool {
+        matches!(self, Self::DetachedViewerChild)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::MainWindowChild => "main-window-child",
@@ -1706,7 +1714,15 @@ fn run_native_video_output(
             close_on_escape: false,
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
-            post_quit_on_destroy: true,
+            //
+            // **detached-viewer-child だけは post_quit_on_destroy=false** にする。この
+            // child の host (egui detached viewport) は main⇔detached 切替で作り直され、
+            // 旧 host 破棄で child が道連れ WM_DESTROY される。post_quit=true だとそこで
+            // WM_QUIT が飛んで presenter スレッドごと死に、動画再生が終了してしまう。
+            // 正当な終了は NativeVideoOutput::Drop → cancel フラグ経由なので WM_QUIT は不要。
+            // host が変わったら App 側 (poll_detached_video_host_resync) が現 host へ
+            // 再親付け (rebuild) するため、child は死なせず生かしておけばよい。
+            post_quit_on_destroy: !config.placement.is_detached_viewer_child(),
             event_tx: Some(presenter_event_tx.clone()),
             generation: cur_generation,
         },
@@ -2068,33 +2084,9 @@ fn run_native_video_output(
             }
         }
 
-        // command は WM_QUIT の**前に**回収しておく。detached の host 再親付け
-        // (`SwitchPlacement`) が queue に居るのに、旧 host 破棄の巻き添えで子 presenter
-        // HWND が WM_DESTROY → PostQuitMessage を出すと、pump_thread_messages が先に
-        // WM_QUIT を拾って loop を抜け、再親付けを処理できないまま presenter が死ぬ
-        // (= detached 動画の再生終了バグの本質)。SwitchPlacement が pending なら WM_QUIT を
-        // fatal 扱いにせず、下の command 処理で rebuild する (rebuild 内の
-        // discard_pending_quit_messages_for_host_switch が残存 WM_QUIT を掃除する)。
-        let mut drained_commands: Vec<NativeVideoOutputCommand> = Vec::new();
-        while let Ok(command) = command_rx.try_recv() {
-            drained_commands.push(command);
-        }
-        let has_pending_placement_switch = drained_commands
-            .iter()
-            .any(|c| matches!(c, NativeVideoOutputCommand::SwitchPlacement { .. }));
-
         if crate::video::native_window::pump_thread_messages() {
-            if has_pending_placement_switch {
-                crate::logger::log(
-                    "[native-video] WM_QUIT observed but honoring pending SwitchPlacement \
-                     (detached host re-parent); presenter kept alive"
-                        .to_string(),
-                );
-                // break しない: 下の command 処理へ落として rebuild する。
-            } else {
-                closed.store(true, Ordering::Release);
-                break;
-            }
+            closed.store(true, Ordering::Release);
+            break;
         }
         let now = Instant::now();
         if crate::perf::is_enabled() {
@@ -2219,7 +2211,7 @@ fn run_native_video_output(
         }
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
-        for command in drained_commands {
+        while let Ok(command) = command_rx.try_recv() {
             match command {
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
                     presenter.set_overlay_hover_thumbnail(thumbnail);
@@ -2527,7 +2519,9 @@ fn run_native_video_output(
                                     initially_visible: false,
                                     activate_on_show,
                                     close_on_escape: false,
-                                    post_quit_on_destroy: true,
+                                    // detached-viewer-child は host teardown の巻き添え
+                                    // WM_QUIT で presenter を殺さない (初回生成箇所と同じ理由)。
+                                    post_quit_on_destroy: !placement.is_detached_viewer_child(),
                                     event_tx: Some(presenter_event_tx.clone()),
                                     generation: cur_generation,
                                 },
