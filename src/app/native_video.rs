@@ -2263,6 +2263,7 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
                 self.native_video_secondary_press_start = None;
+                self.native_video_middle_press_start = None;
                 let gesture_was_active = self.mouse_gesture.is_some();
                 self.cancel_mouse_ring_flick();
                 self.set_native_video_ring_guide_overlay(None);
@@ -6531,6 +6532,43 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if event.button == NativeVideoMouseButton::Middle {
+            self.native_video_pointer_down = None;
+            if event.double_click {
+                self.native_video_middle_press_start = None;
+                return;
+            }
+            if event.down {
+                self.native_video_middle_press_start = Some(super::NativeVideoMiddlePressStart {
+                    fs_idx,
+                    x: event.x,
+                    y: event.y,
+                    at: std::time::Instant::now(),
+                });
+                return;
+            }
+            let Some(start) = self.native_video_middle_press_start.take() else {
+                return;
+            };
+            if start.fs_idx != fs_idx {
+                return;
+            }
+            let dx = event.x - start.x;
+            let dy = event.y - start.y;
+            let moved_sq = dx.saturating_mul(dx) + dy.saturating_mul(dy);
+            let threshold = crate::ui_fullscreen::MIDDLE_DRAG_THRESHOLD_PX.ceil() as i32;
+            let click_like = moved_sq <= threshold.saturating_mul(threshold)
+                && start.at.elapsed() <= std::time::Duration::from_millis(500);
+            if click_like {
+                self.mouse_ring_nav = self.apply_mouse_button(
+                    ctx,
+                    crate::ring_shortcut::MouseButtonSlot::Middle,
+                    "native-video-middle-mouse",
+                );
+                ctx.request_repaint();
+            }
+            return;
         }
         if event.button != NativeVideoMouseButton::Left {
             return;

@@ -910,6 +910,15 @@ struct NativeVideoPointerDown {
     at: std::time::Instant,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct NativeVideoMiddlePressStart {
+    fs_idx: usize,
+    x: i32,
+    y: i32,
+    at: std::time::Instant,
+}
+
 /// `scroll_settle` イベント発火後の状態。次の scroll が始まるか `all_ready` まで保持。
 /// `visible_thumb_first_ready` / `visible_thumb_all_ready` の latency 計測に使う。
 /// (docs/scroll-visibility-priority-plan.md Phase 1)
@@ -3673,6 +3682,8 @@ pub struct App {
     /// スナップショットし、押している間は start 値からの差分でズームを計算する
     /// (累積誤差防止 + pivot 位置が安定)。マウスを右手だけで拡大縮小する用途。
     pub(crate) fs_middle_zoom_drag: Option<crate::ui_fullscreen::MiddleZoomDrag>,
+    /// 中ボタン短クリック候補。移動量がドラッグしきい値を超えた場合は cancel する。
+    pub(crate) mouse_middle_click_start: Option<(egui::Pos2, std::time::Instant, bool)>,
 
     // ── 削除確認ダイアログ ───────────────────────────────────────
     pub(crate) show_delete_confirm: bool,
@@ -5693,6 +5704,9 @@ pub struct App {
     /// 別に release 時の押下時間と移動量で close / 長押しメニューを判定する。
     native_video_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
     #[cfg(windows)]
+    /// Native fullscreen presenter 上の中ボタン短クリック候補。
+    native_video_middle_press_start: Option<NativeVideoMiddlePressStart>,
+    #[cfg(windows)]
     /// App へ転送された直近の native 動画 `MouseMove` の client 座標。実機修正
     /// (2026-06-06): navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変)
     /// move が `handle_native_video_window_event` の MouseMove → `mark_native_video_hud_activity`
@@ -6342,6 +6356,7 @@ impl App {
             show_context_shortcuts_help: false,
             fs_secondary_press_start: None,
             fs_middle_zoom_drag: None,
+            mouse_middle_click_start: None,
             fs_context_menu_idx: None,
             fs_context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
@@ -7039,6 +7054,8 @@ impl App {
             native_video_pointer_down: None,
             #[cfg(windows)]
             native_video_secondary_press_start: None,
+            #[cfg(windows)]
+            native_video_middle_press_start: None,
             #[cfg(windows)]
             native_video_last_move_client: None,
             last_ui_heartbeat_log: std::time::Instant::now(),
@@ -19829,6 +19846,13 @@ impl App {
         if mouse_nav_back || mouse_nav_forward {
             return self.apply_mouse_back_forward_button(ctx, mouse_nav_forward, "grid-mouse");
         }
+        if self.update_mouse_middle_short_click(ctx, true) {
+            return self.apply_mouse_button(
+                ctx,
+                crate::ring_shortcut::MouseButtonSlot::Middle,
+                "grid-middle-mouse",
+            );
+        }
         let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
         let open_selected_key = self.keymap.pressed_action(ctx, KeyAction::GridOpenSelected);
         let external_player_key = self
@@ -30757,6 +30781,7 @@ impl App {
         self.native_video_front_recover_after_external_foreground = false;
         self.native_video_pointer_down = None;
         self.native_video_secondary_press_start = None;
+        self.native_video_middle_press_start = None;
         self.schedule_native_video_main_chrome_restore();
         let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
         if native_video_was_active || self.native_video_main_cloaked {
@@ -31115,6 +31140,7 @@ impl App {
         #[cfg(windows)]
         {
             self.native_video_secondary_press_start = None;
+            self.native_video_middle_press_start = None;
         }
         self.mouse_ring_flick = None;
         self.mouse_gesture = None;
@@ -31125,6 +31151,7 @@ impl App {
         self.mouse_gesture_grid_target_idx = None;
         self.mouse_ring_suppress_context_menu_once = false;
         self.fs_middle_zoom_drag = None;
+        self.mouse_middle_click_start = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
         self.fs_context_menu_idx = None;

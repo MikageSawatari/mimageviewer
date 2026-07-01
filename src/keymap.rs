@@ -1338,6 +1338,8 @@ pub enum KeyAction {
     FsContinuousScrollBack,
     FsSpreadShiftLeft,
     FsSpreadShiftRight,
+    FsSpreadShiftPrev,
+    FsSpreadShiftNext,
     FsSlideshow,
     FsSpaceCheck,
     FsCapture,
@@ -1726,6 +1728,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsContinuousScrollBack,
     KeyAction::FsSpreadShiftLeft,
     KeyAction::FsSpreadShiftRight,
+    KeyAction::FsSpreadShiftPrev,
+    KeyAction::FsSpreadShiftNext,
     KeyAction::FsSlideshow,
     KeyAction::FsSpaceCheck,
     KeyAction::FsCapture,
@@ -3106,6 +3110,8 @@ impl KeyAction {
             FsContinuousScrollBack => "FsContinuousScrollBack",
             FsSpreadShiftLeft => "FsSpreadShiftLeft",
             FsSpreadShiftRight => "FsSpreadShiftRight",
+            FsSpreadShiftPrev => "FsSpreadShiftPrev",
+            FsSpreadShiftNext => "FsSpreadShiftNext",
             FsSlideshow => "FsSlideshow",
             FsSpaceCheck => "FsSpaceCheck",
             FsCapture => "FsCapture",
@@ -3614,6 +3620,8 @@ impl KeyAction {
             FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
             FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
             FsSpreadShiftRight => "見開き表示を右方向へ1ページずらす",
+            FsSpreadShiftPrev => "見開き表示を前のページ方向へ1ページずらす",
+            FsSpreadShiftNext => "見開き表示を次のページ方向へ1ページずらす",
             FsSlideshow => "スライドショーの再生または停止を切り替える",
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
             FsCapture => "現在の表示画像をキャプチャ保存する",
@@ -3982,6 +3990,8 @@ impl KeyAction {
             | FsClose
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
+            | FsSpreadShiftPrev
+            | FsSpreadShiftNext
             | FsPagePrev
             | FsPageNext
             | FsFixedJumpPrev
@@ -4355,6 +4365,8 @@ impl KeyAction {
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
+            | FsSpreadShiftPrev
+            | FsSpreadShiftNext
             | FsSlideshow
             | FsSpaceCheck
             | FsCapture
@@ -4739,6 +4751,7 @@ impl KeyAction {
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
             FsSpreadShiftRight => ChordList::one(Chord::ctrl(Right)),
+            FsSpreadShiftPrev | FsSpreadShiftNext => ChordList::EMPTY,
             FsSlideshow => ChordList::one(Chord::key(S)),
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
             FsCapture => ChordList::one(Chord::ctrl(S)),
@@ -6761,6 +6774,7 @@ mod tests {
             "ToggleDetachedViewer".to_string(),
             "ToggleWindowMode".to_string(),
             "ToggleMaximize".to_string(),
+            "CloseFullscreen".to_string(),
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),
             "GridSelectAll".to_string(),
@@ -6774,11 +6788,16 @@ mod tests {
             "ImageCapture".to_string(),
             "ImageToggleMetadata".to_string(),
             "ImageSlideshow".to_string(),
+            "ImageZoomMode".to_string(),
             "ImagePixelGrid".to_string(),
             "ImageBackgroundCycle".to_string(),
             "ImageComparePin".to_string(),
             "ImageHome".to_string(),
             "ImageEnd".to_string(),
+            "ImageSpreadShiftLeft".to_string(),
+            "ImageSpreadShiftRight".to_string(),
+            "ImageSpreadShiftPrev".to_string(),
+            "ImageSpreadShiftNext".to_string(),
             "VideoCapture".to_string(),
             "VideoMute".to_string(),
             "VideoLoop".to_string(),
@@ -6815,6 +6834,9 @@ mod tests {
             "ImageCopyToClipboard".to_string(),
             "ImageCopyPath".to_string(),
             "ImageCopyFileName".to_string(),
+            // PageUp/PageDown-style fixed direction for ring/mouse/gesture assignments.
+            "ImageSpreadShiftPrev".to_string(),
+            "ImageSpreadShiftNext".to_string(),
         ]);
 
         let mut classified = key_handled;

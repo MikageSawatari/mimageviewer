@@ -5708,6 +5708,8 @@ mod tests {
             crate::ring_shortcut::RingActionId::GridParentFolder;
         original.ring_shortcuts.mouse_buttons_image.forward =
             crate::ring_shortcut::RingActionId::ImageSlideshow;
+        original.ring_shortcuts.mouse_buttons_image.middle =
+            crate::ring_shortcut::RingActionId::ImageHome;
         original.ring_shortcuts.mouse_buttons_video.back =
             crate::ring_shortcut::RingActionId::VideoMute;
         original.ring_shortcuts.mouse_nav_prompt_done = true;
@@ -5804,6 +5806,10 @@ mod tests {
             loaded.ring_shortcuts.mouse_buttons_grid.forward,
             crate::ring_shortcut::RingActionId::GridHistoryForward
         );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_grid.middle,
+            crate::ring_shortcut::RingActionId::None
+        );
         assert!(!loaded.ring_shortcuts.mouse_nav_prompt_done);
         assert_eq!(
             loaded.ring_shortcuts.grid.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
@@ -5889,8 +5895,8 @@ mod tests {
                 "alt_wheel_pair": "zoom_in_out",
                 "mouse_back_forward_action": "future_mouse_nav",
                 "mouse_buttons_grid": { "back": "future_mouse_button", "forward": "grid_history_forward" },
-                "mouse_buttons_image": { "back": "grid_history_back", "forward": "video_capture" },
-                "mouse_buttons_video": { "back": "image_capture", "forward": "grid_history_forward" },
+                "mouse_buttons_image": { "back": "grid_history_back", "forward": "video_capture", "middle": "open_drive_c" },
+                "mouse_buttons_video": { "back": "image_capture", "forward": "grid_history_forward", "middle": "image_home" },
                 "grid": { "slots": ["future_action", "video_capture"] },
                 "image": { "slots": ["video_capture"] },
                 "video": { "slots": ["image_capture"] }
@@ -5922,7 +5928,15 @@ mod tests {
             crate::ring_shortcut::RingActionId::None
         );
         assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_image.middle,
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
             loaded.ring_shortcuts.mouse_buttons_video.back,
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.mouse_buttons_video.middle,
             crate::ring_shortcut::RingActionId::None
         );
         assert_eq!(
@@ -7525,6 +7539,8 @@ mod tests {
                 crate::ring_shortcut::RingActionId::GridParentFolder;
             s.ring_shortcuts.mouse_buttons_image.forward =
                 crate::ring_shortcut::RingActionId::ImageSlideshow;
+            s.ring_shortcuts.mouse_buttons_image.middle =
+                crate::ring_shortcut::RingActionId::ImageHome;
             s.ring_shortcuts.mouse_buttons_video.back =
                 crate::ring_shortcut::RingActionId::VideoMute;
             s.ring_shortcuts.mouse_nav_prompt_done = true;
@@ -7804,6 +7820,11 @@ mod tests {
                 loaded.ring_shortcuts.mouse_buttons_image.forward,
                 crate::ring_shortcut::RingActionId::ImageSlideshow,
                 "image mouse forward button action should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.mouse_buttons_image.middle,
+                crate::ring_shortcut::RingActionId::ImageHome,
+                "image mouse middle button action should survive roundtrip"
             );
             assert_eq!(
                 loaded.ring_shortcuts.mouse_buttons_video.back,

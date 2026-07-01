@@ -891,6 +891,21 @@ fn key_action_context_label(action: KeyAction) -> &'static str {
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
     match action {
         RingActionId::GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
+        RingActionId::ImageSpreadShiftLeft => {
+            "見開きを画面左方向へ1ページずらす。右→左の見開きでは前/次の意味を反転します"
+        }
+        RingActionId::ImageSpreadShiftRight => {
+            "見開きを画面右方向へ1ページずらす。右→左の見開きでは前/次の意味を反転します"
+        }
+        RingActionId::ImageSpreadShiftPrev => {
+            "見開きを前のページ方向へ1ページずらす。右→左の見開きでも前/次の意味を反転しません"
+        }
+        RingActionId::ImageSpreadShiftNext => {
+            "見開きを次のページ方向へ1ページずらす。右→左の見開きでも前/次の意味を反転しません"
+        }
+        RingActionId::ImageZoomMode => {
+            "全画面ズームモードを切り替えます。Zキー長押し時の照準表示はスキップし、現在のカーソル位置でズーム状態へ入ります"
+        }
         _ => action.label_for_context(context),
     }
 }
@@ -958,12 +973,18 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        KeyAction::FsClose => RingActionId::CloseFullscreen,
         KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
         KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
+        KeyAction::FsSpreadShiftLeft => RingActionId::ImageSpreadShiftLeft,
+        KeyAction::FsSpreadShiftRight => RingActionId::ImageSpreadShiftRight,
+        KeyAction::FsSpreadShiftPrev => RingActionId::ImageSpreadShiftPrev,
+        KeyAction::FsSpreadShiftNext => RingActionId::ImageSpreadShiftNext,
         KeyAction::FsRotateCw => RingActionId::ImageRotateRight,
         KeyAction::FsRotateCcw => RingActionId::ImageRotateLeft,
         KeyAction::FsCapture => RingActionId::ImageCapture,
         KeyAction::FsSlideshow => RingActionId::ImageSlideshow,
+        KeyAction::FsZoomMode => RingActionId::ImageZoomMode,
         KeyAction::FsPixelGrid => RingActionId::ImagePixelGrid,
         KeyAction::FsBgCycle => RingActionId::ImageBackgroundCycle,
         KeyAction::FsCompareToggle => RingActionId::ImageComparePin,
@@ -975,6 +996,7 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::VideoMarkerNext => RingActionId::VideoMarkerNext,
         KeyAction::VideoTileMode => RingActionId::VideoTileMode,
         KeyAction::VideoExternalPlayer => RingActionId::VideoExternalPlayer,
+        KeyAction::VideoCloseFullscreen => RingActionId::CloseFullscreen,
         _ => return out,
     };
     push_ring_binding_if_available(&mut out, context, ring_action);
@@ -1425,12 +1447,8 @@ fn operation_assignment_editor_title(target: &OperationAssignmentTarget) -> Stri
                 context.label()
             )
         }
-        OperationAssignmentTarget::MouseButton { context, forward } => {
-            format!(
-                "マウス{}ボタン割り当て: {}",
-                if *forward { "進む" } else { "戻る" },
-                context.label()
-            )
+        OperationAssignmentTarget::MouseButton { context, slot } => {
+            format!("マウス{}割り当て: {}", slot.label(), context.label())
         }
         OperationAssignmentTarget::MouseGesture { context, index } => {
             format!("マウスジェスチャ編集: {} / #{}", context.label(), index + 1)
@@ -1472,14 +1490,9 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
             );
             ui.small("この方向に実行するリングショートカットを選びます。");
         }
-        OperationAssignmentTarget::MouseButton { context, forward } => {
+        OperationAssignmentTarget::MouseButton { context, slot } => {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} / マウス{}ボタン",
-                    context.label(),
-                    if *forward { "進む" } else { "戻る" }
-                ))
-                .strong(),
+                egui::RichText::new(format!("{} / {}", context.label(), slot.label())).strong(),
             );
             ui.small("物理ボタン単体に実行する一発アクションを選びます。");
         }
@@ -1587,10 +1600,10 @@ fn draw_operation_assignment_editor_body(
             ring_slot_assignment_editor(ui, state, *context, *direction);
         }
         (
-            OperationAssignmentTarget::MouseButton { context, forward },
+            OperationAssignmentTarget::MouseButton { context, slot },
             OperationAssignmentTab::MouseButtons,
         ) => {
-            mouse_button_assignment_editor(ui, state, *context, *forward);
+            mouse_button_assignment_editor(ui, state, *context, *slot);
         }
         (
             OperationAssignmentTarget::MouseGesture { context, index },
@@ -2260,6 +2273,9 @@ fn mouse_assignment_labels(
     }
     if buttons.forward == *action {
         push_unique_label(&mut labels, "進むボタン".to_string());
+    }
+    if buttons.middle == *action {
+        push_unique_label(&mut labels, "ホイールクリック".to_string());
     }
 
     for &right_drag_context in RightDragContext::all() {
@@ -3336,8 +3352,9 @@ fn mouse_button_context_editor(
         .num_columns(3)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
-            mouse_button_row(ui, state, context, false, "戻るボタン");
-            mouse_button_row(ui, state, context, true, "進むボタン");
+            mouse_button_row(ui, state, context, MouseButtonSlot::Back);
+            mouse_button_row(ui, state, context, MouseButtonSlot::Forward);
+            mouse_button_row(ui, state, context, MouseButtonSlot::Middle);
         });
 }
 
@@ -3345,32 +3362,21 @@ fn mouse_button_row(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     context: RingShortcutContext,
-    forward: bool,
-    label: &'static str,
+    slot: MouseButtonSlot,
 ) {
-    let action = if forward {
-        state
-            .settings
-            .ring_shortcuts
-            .mouse_button_profile(context)
-            .forward
-            .clone()
-    } else {
-        state
-            .settings
-            .ring_shortcuts
-            .mouse_button_profile(context)
-            .back
-            .clone()
-    };
+    let action = state
+        .settings
+        .ring_shortcuts
+        .mouse_button_profile(context)
+        .action(slot);
     if ui.small_button("編集").clicked() {
         open_operation_assignment_editor(
             state,
-            OperationAssignmentTarget::MouseButton { context, forward },
+            OperationAssignmentTarget::MouseButton { context, slot },
             OperationAssignmentTab::MouseButtons,
         );
     }
-    ui.label(label);
+    ui.label(slot.label());
     ui.label(action.label_for_context(context))
         .on_hover_text(ring_action_detail_label(&action, context));
     ui.end_row();
@@ -3380,33 +3386,26 @@ fn mouse_button_assignment_editor(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     context: RingShortcutContext,
-    forward: bool,
+    slot: MouseButtonSlot,
 ) {
     let mut close_requested = false;
     ui.group(|ui| {
-        ui.label(
-            egui::RichText::new(format!(
-                "{} / マウス{}ボタン",
-                context.label(),
-                if forward { "進む" } else { "戻る" }
-            ))
-            .strong(),
-        );
+        ui.label(egui::RichText::new(format!("{} / {}", context.label(), slot.label())).strong());
         ui.small("なしを選ぶとこのボタン単体では何もしません。");
         ui.add_space(6.0);
 
-        let available = RingActionId::available_for_context(context);
+        let available = RingActionId::available_for_mouse_button_context(context);
         let profile = state
             .settings
             .ring_shortcuts
             .mouse_button_profile_mut(context);
         profile.sanitize(context);
-        let value = if forward {
-            &mut profile.forward
-        } else {
-            &mut profile.back
+        let value = match slot {
+            MouseButtonSlot::Back => &mut profile.back,
+            MouseButtonSlot::Forward => &mut profile.forward,
+            MouseButtonSlot::Middle => &mut profile.middle,
         };
-        egui::ComboBox::from_id_salt(("mouse_button_assignment_editor", context, forward))
+        egui::ComboBox::from_id_salt(("mouse_button_assignment_editor", context, slot))
             .width(300.0)
             .selected_text(value.label_for_context(context))
             .show_ui(ui, |ui| {
@@ -3693,11 +3692,16 @@ fn ring_action_mouse_button_editor(
     context: RingShortcutContext,
     action: RingActionId,
 ) {
-    ui.label(egui::RichText::new("マウス進む / 戻る").strong());
+    ui.label(egui::RichText::new("マウスボタン").strong());
     ui.small(
         "物理ボタンへこの操作を割り当てます。チェックを外すと、そのボタンは未割り当てになります。",
     );
     ui.add_space(6.0);
+
+    if !action.is_valid_for_mouse_button_context(context) {
+        ui.small("この操作はこの画面のマウスボタンには割り当てられません。");
+        return;
+    }
 
     let profile = state
         .settings
@@ -3713,7 +3717,15 @@ fn ring_action_mouse_button_editor(
     }
     let mut forward = profile.forward == action;
     if ui.checkbox(&mut forward, "進むボタン").changed() {
-        profile.forward = if forward { action } else { RingActionId::None };
+        profile.forward = if forward {
+            action.clone()
+        } else {
+            RingActionId::None
+        };
+    }
+    let mut middle = profile.middle == action;
+    if ui.checkbox(&mut middle, "ホイールクリック").changed() {
+        profile.middle = if middle { action } else { RingActionId::None };
     }
 }
 

@@ -214,16 +214,18 @@
 中ボタンドラッグ挙動は維持する。
 
 **今回の範囲 (カスタマイズ可)**:
-- **戻る/進むボタン** (`Extra1` / `Extra2`、`Browser_Back/Forward` 経由も)。物理戻る / 進むを
-  固定ペアにせず、グリッド / 画像フルスクリーン / 動画フルスクリーンごとの
-  `MouseButtonProfile { back, forward }` として保存する。候補はリングショートカットと同じ
-  `RingActionId::available_for_context(context)` を使うため、グリッドでは親フォルダ移動、画像では
-  スライドショー、動画ではミュートなども割り当てられる。既定はフォルダ履歴 戻る/進む
-  (ブラウザ / Explorer 慣習)。移行は §5.3。
+- **戻る/進む/ホイールクリック** (`Extra1` / `Extra2`、`Browser_Back/Forward`、中ボタン短クリック)。
+  物理戻る / 進む / ホイールクリックを固定ペアにせず、グリッド / 画像フルスクリーン / 動画フルスクリーンごとの
+  `MouseButtonProfile { back, forward, middle }` として保存する。候補は基本的にリングショートカットと同じだが、
+  画像 / 動画フルスクリーンのマウスボタンでは `C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系を
+  候補外にする。グリッドでは親フォルダ移動、画像ではスライドショー、動画ではミュートなども割り当てられる。
+  既定はフォルダ履歴 戻る/進む (ブラウザ / Explorer 慣習)、ホイールクリックは未割り当て。移行は §5.3。
   `FolderHistoryBack/Forward` は画像 FS / native video からも `AddressBarNav::HistoryBack/Forward`
   へ流し、履歴先のグリッドを開く挙動に統一する。
 - 発火は §7 の apply 層を流用。設定 UI はリングショートカットとは別の
-  `PreferencesPage::MouseButtons` (ラベル「マウスボタン」) に置く。戻る/進むは context ごとに 2 行表示する。
+  `PreferencesPage::MouseButtons` (ラベル「マウスボタン」) に置く。戻る/進む/ホイールクリックは
+  context ごとに 3 行表示する。ホイールクリックは 500ms 以内かつドラッグしきい値以下の短クリックだけ
+  発火し、画像フルスクリーンの中ボタンドラッグズームはしきい値を超えた時点で従来どおり優先する。
 
 **見送り**:
 - **Shift / Alt + ホイール**: 将来はグリッド / 画像フルスクリーン / 動画フルスクリーンを別々に設計し、
@@ -232,7 +234,9 @@
   `shift_wheel_pair` / `alt_wheel_pair` は互換読み込み用に残すが、現行 UI / 入力経路からは参照しない。
 - **横ホイール / チルト (delta.x)**: 現状未処理。**検証用ハードが無い**ため対象外。加えて Windows の
   マウス/ドライバは tilt と Shift+ホイールを相互変換することがある。実機検証が可能になるまで保留。
-- **中ボタンクリック**: 今回の範囲外 (将来候補)。
+- **中ボタン Z ズーム**: Z の `KeyHold` 相当を完全再現するのではなく、
+  `RingActionId::ImageZoomMode` を単発トグルとして追加する。押下中の照準表示はスキップし、
+  現在のカーソル位置でズーム状態へ入り、ズーム状態中の中ボタン上下ドラッグで倍率を変更する。
 
 ### 5.3 戻る/進む 既定変更の移行ダイアログ (アップグレード時のみ)
 
@@ -255,7 +259,7 @@ load meta を `Settings::load` から返す** (current で上書きする前に�
   保存前なら**次回再表示**でよい (Codex 第4回 P3)。
 
 追加フィールド: `mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video`
-(serde default = フォルダ履歴 戻る/進む)、旧 `mouse_back_forward_action` (migration 用)、
+(`MouseButtonProfile { back, forward, middle }`、serde default = 戻る/進むはフォルダ履歴、middle は未割り当て)、旧 `mouse_back_forward_action` (migration 用)、
 `mouse_nav_prompt_done: bool` (default false)。ダイアログ選択肢「標準 (フォルダ履歴 戻る/進む =
 ブラウザと同じ)」/「従来どおり (ツリー順 前/次フォルダ)」。選択 or 閉じる →
 3 context の profile を一括設定し、旧 `mouse_back_forward_action=None` + `prompt_done=true` を保存する。
@@ -528,7 +532,7 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
   - `shift_wheel_pair` / `alt_wheel_pair` (`WheelPairActionId`) — 互換読み込み用。§5.2 のとおり現行 UI /
     入力経路からは参照しない
   - `mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video`
-    (`MouseButtonProfile { back, forward }`) — §5.2
+    (`MouseButtonProfile { back, forward, middle }`) — §5.2
   - 旧 `mouse_back_forward_action` (migration 用) / `mouse_nav_prompt_done: bool` — §5.3
   - `x_picker_hint_shown: bool` (X 単体ピッカーの初回案内フラグ。§4.2)
 - **`RingActionId` / `WheelPairActionId` / `mouse_back_forward_action` は `Unknown` バリアントで、

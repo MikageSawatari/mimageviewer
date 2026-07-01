@@ -452,6 +452,7 @@ pub enum RingActionId {
     ToggleDetachedViewer,
     ToggleWindowMode,
     ToggleMaximize,
+    CloseFullscreen,
     CycleFavorite,
     OpenFavorite1,
     OpenFavorite2,
@@ -531,11 +532,16 @@ pub enum RingActionId {
     SiblingFolderNext,
     ImageHome,
     ImageEnd,
+    ImageSpreadShiftLeft,
+    ImageSpreadShiftRight,
+    ImageSpreadShiftPrev,
+    ImageSpreadShiftNext,
     ImageRotateLeft,
     ImageRotateRight,
     ImageCapture,
     ImageToggleMetadata,
     ImageSlideshow,
+    ImageZoomMode,
     ImagePixelGrid,
     ImageBackgroundCycle,
     ImageComparePin,
@@ -827,6 +833,7 @@ impl RingActionId {
             Self::ToggleDetachedViewer => "toggle_detached_viewer",
             Self::ToggleWindowMode => "toggle_window_mode",
             Self::ToggleMaximize => "toggle_maximize",
+            Self::CloseFullscreen => "close_fullscreen",
             Self::CycleFavorite => "cycle_favorite",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -906,11 +913,16 @@ impl RingActionId {
             Self::SiblingFolderNext => "sibling_folder_next",
             Self::ImageHome => "image_home",
             Self::ImageEnd => "image_end",
+            Self::ImageSpreadShiftLeft => "image_spread_shift_left",
+            Self::ImageSpreadShiftRight => "image_spread_shift_right",
+            Self::ImageSpreadShiftPrev => "image_spread_shift_prev",
+            Self::ImageSpreadShiftNext => "image_spread_shift_next",
             Self::ImageRotateLeft => "image_rotate_left",
             Self::ImageRotateRight => "image_rotate_right",
             Self::ImageCapture => "image_capture",
             Self::ImageToggleMetadata => "image_toggle_metadata",
             Self::ImageSlideshow => "image_slideshow",
+            Self::ImageZoomMode => "image_zoom_mode",
             Self::ImagePixelGrid => "image_pixel_grid",
             Self::ImageBackgroundCycle => "image_background_cycle",
             Self::ImageComparePin => "image_compare_pin",
@@ -951,6 +963,7 @@ impl RingActionId {
             "toggle_detached_viewer" => Self::ToggleDetachedViewer,
             "toggle_window_mode" => Self::ToggleWindowMode,
             "toggle_maximize" => Self::ToggleMaximize,
+            "close_fullscreen" => Self::CloseFullscreen,
             "cycle_favorite" => Self::CycleFavorite,
             "open_location_drive_list" => Self::OpenLocationDriveList,
             "open_location_reading_history" => Self::OpenLocationReadingHistory,
@@ -986,11 +999,16 @@ impl RingActionId {
             "sibling_folder_next" => Self::SiblingFolderNext,
             "image_home" => Self::ImageHome,
             "image_end" => Self::ImageEnd,
+            "image_spread_shift_left" => Self::ImageSpreadShiftLeft,
+            "image_spread_shift_right" => Self::ImageSpreadShiftRight,
+            "image_spread_shift_prev" => Self::ImageSpreadShiftPrev,
+            "image_spread_shift_next" => Self::ImageSpreadShiftNext,
             "image_rotate_left" => Self::ImageRotateLeft,
             "image_rotate_right" => Self::ImageRotateRight,
             "image_capture" => Self::ImageCapture,
             "image_toggle_metadata" => Self::ImageToggleMetadata,
             "image_slideshow" => Self::ImageSlideshow,
+            "image_zoom_mode" => Self::ImageZoomMode,
             "image_pixel_grid" => Self::ImagePixelGrid,
             "image_background_cycle" => Self::ImageBackgroundCycle,
             "image_compare_pin" => Self::ImageComparePin,
@@ -1040,6 +1058,11 @@ impl RingActionId {
             Self::ToggleDetachedViewer => "別ウィンドウ ON/OFF",
             Self::ToggleWindowMode => "ウィンドウ/全画面切替",
             Self::ToggleMaximize => "ウィンドウ最大化/復元",
+            Self::CloseFullscreen => match context {
+                RingShortcutContext::ImageFullscreen => "画像フルスクリーンを閉じる",
+                RingShortcutContext::VideoFullscreen => "動画フルスクリーンを閉じる",
+                RingShortcutContext::Grid => "閉じる",
+            },
             Self::CycleFavorite => "お気に入り巡回",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -1119,11 +1142,16 @@ impl RingActionId {
             Self::SiblingFolderNext => "兄弟フォルダ 次",
             Self::ImageHome => "先頭へ (Home)",
             Self::ImageEnd => "末尾へ (End)",
+            Self::ImageSpreadShiftLeft => "見開き 1Pずらし 左",
+            Self::ImageSpreadShiftRight => "見開き 1Pずらし 右",
+            Self::ImageSpreadShiftPrev => "見開き 1Pずらし 前",
+            Self::ImageSpreadShiftNext => "見開き 1Pずらし 次",
             Self::ImageRotateLeft => "回転 L",
             Self::ImageRotateRight => "回転 R",
             Self::ImageCapture => "キャプチャ保存",
             Self::ImageToggleMetadata => "メタデータ表示",
             Self::ImageSlideshow => "スライドショー",
+            Self::ImageZoomMode => "全画面ズームモード",
             Self::ImagePixelGrid => "ピクセルグリッド",
             Self::ImageBackgroundCycle => "背景色サイクル",
             Self::ImageComparePin => "比較ピン",
@@ -1184,6 +1212,7 @@ impl RingActionId {
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
+                    | Self::CloseFullscreen
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
@@ -1193,11 +1222,16 @@ impl RingActionId {
                     | Self::SiblingFolderNext
                     | Self::ImageHome
                     | Self::ImageEnd
+                    | Self::ImageSpreadShiftLeft
+                    | Self::ImageSpreadShiftRight
+                    | Self::ImageSpreadShiftPrev
+                    | Self::ImageSpreadShiftNext
                     | Self::ImageRotateLeft
                     | Self::ImageRotateRight
                     | Self::ImageCapture
                     | Self::ImageToggleMetadata
                     | Self::ImageSlideshow
+                    | Self::ImageZoomMode
                     | Self::ImagePixelGrid
                     | Self::ImageBackgroundCycle
                     | Self::ImageComparePin
@@ -1213,6 +1247,7 @@ impl RingActionId {
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
+                    | Self::CloseFullscreen
                     | Self::CycleFavorite
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
@@ -1230,6 +1265,11 @@ impl RingActionId {
                     | Self::VideoExternalPlayer
             ),
         }
+    }
+
+    pub fn is_valid_for_mouse_button_context(&self, context: RingShortcutContext) -> bool {
+        self.is_valid_for_context(context)
+            && (context == RingShortcutContext::Grid || !self.is_location_navigation_action())
     }
 
     pub fn available_for_context(context: RingShortcutContext) -> Vec<Self> {
@@ -1268,6 +1308,7 @@ impl RingActionId {
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
+                Self::CloseFullscreen,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
@@ -1277,11 +1318,16 @@ impl RingActionId {
                 Self::SiblingFolderNext,
                 Self::ImageHome,
                 Self::ImageEnd,
+                Self::ImageSpreadShiftLeft,
+                Self::ImageSpreadShiftRight,
+                Self::ImageSpreadShiftPrev,
+                Self::ImageSpreadShiftNext,
                 Self::ImageRotateLeft,
                 Self::ImageRotateRight,
                 Self::ImageCapture,
                 Self::ImageToggleMetadata,
                 Self::ImageSlideshow,
+                Self::ImageZoomMode,
                 Self::ImagePixelGrid,
                 Self::ImageBackgroundCycle,
                 Self::ImageComparePin,
@@ -1296,6 +1342,7 @@ impl RingActionId {
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
+                Self::CloseFullscreen,
                 Self::CycleFavorite,
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
@@ -1315,6 +1362,13 @@ impl RingActionId {
         };
         actions.extend(Self::location_navigation_actions());
         actions
+    }
+
+    pub fn available_for_mouse_button_context(context: RingShortcutContext) -> Vec<Self> {
+        Self::available_for_context(context)
+            .into_iter()
+            .filter(|action| action.is_valid_for_mouse_button_context(context))
+            .collect()
     }
 }
 
@@ -1419,27 +1473,61 @@ pub struct MouseButtonProfile {
     pub back: RingActionId,
     #[serde(default = "default_mouse_forward_button_action")]
     pub forward: RingActionId,
+    #[serde(default = "default_mouse_middle_button_action")]
+    pub middle: RingActionId,
 }
 
 impl MouseButtonProfile {
     pub fn new(back: RingActionId, forward: RingActionId) -> Self {
-        Self { back, forward }
+        Self {
+            back,
+            forward,
+            middle: default_mouse_middle_button_action(),
+        }
     }
 
-    pub fn action(&self, forward: bool) -> RingActionId {
-        if forward {
-            self.forward.clone()
-        } else {
-            self.back.clone()
+    pub fn action(&self, slot: MouseButtonSlot) -> RingActionId {
+        match slot {
+            MouseButtonSlot::Back => self.back.clone(),
+            MouseButtonSlot::Forward => self.forward.clone(),
+            MouseButtonSlot::Middle => self.middle.clone(),
         }
     }
 
     pub fn sanitize(&mut self, context: RingShortcutContext) {
-        if !self.back.is_valid_for_context(context) {
+        if !self.back.is_valid_for_mouse_button_context(context) {
             self.back = RingActionId::None;
         }
-        if !self.forward.is_valid_for_context(context) {
+        if !self.forward.is_valid_for_mouse_button_context(context) {
             self.forward = RingActionId::None;
+        }
+        if !self.middle.is_valid_for_mouse_button_context(context) {
+            self.middle = RingActionId::None;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MouseButtonSlot {
+    Back,
+    Forward,
+    Middle,
+}
+
+impl MouseButtonSlot {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Back => "戻るボタン",
+            Self::Forward => "進むボタン",
+            Self::Middle => "ホイールクリック",
+        }
+    }
+
+    pub fn log_name(self) -> &'static str {
+        match self {
+            Self::Back => "back",
+            Self::Forward => "forward",
+            Self::Middle => "middle",
         }
     }
 }
@@ -1456,6 +1544,10 @@ fn default_mouse_back_button_action() -> RingActionId {
 
 fn default_mouse_forward_button_action() -> RingActionId {
     RingActionId::GridHistoryForward
+}
+
+fn default_mouse_middle_button_action() -> RingActionId {
+    RingActionId::None
 }
 
 fn default_mouse_button_profile() -> MouseButtonProfile {
@@ -2275,6 +2367,7 @@ mod tests {
             let profile = defaults.mouse_button_profile(context);
             assert_eq!(profile.back, RingActionId::GridHistoryBack);
             assert_eq!(profile.forward, RingActionId::GridHistoryForward);
+            assert_eq!(profile.middle, RingActionId::None);
         }
         assert_eq!(defaults.mouse_nav_prompt_done, false);
         assert_eq!(defaults.x_picker_hint_shown, false);
@@ -2541,7 +2634,9 @@ mod tests {
             MouseBackForwardActionId::Unknown("future_mouse_nav".to_string());
         settings.mouse_buttons_grid.back = RingActionId::Unknown("future_mouse_button".to_string());
         settings.mouse_buttons_image.forward = RingActionId::VideoCapture;
+        settings.mouse_buttons_image.middle = RingActionId::OpenDriveC;
         settings.mouse_buttons_video.back = RingActionId::ImageCapture;
+        settings.mouse_buttons_video.middle = RingActionId::ImageHome;
         settings.right_drag_grid = Some(RightDragMode::Unknown("future_mode".to_string()));
         settings.right_drag_image = Some(RightDragMode::MouseGesture);
         settings
@@ -2570,7 +2665,9 @@ mod tests {
         );
         assert_eq!(settings.mouse_buttons_grid.back, RingActionId::None);
         assert_eq!(settings.mouse_buttons_image.forward, RingActionId::None);
+        assert_eq!(settings.mouse_buttons_image.middle, RingActionId::None);
         assert_eq!(settings.mouse_buttons_video.back, RingActionId::None);
+        assert_eq!(settings.mouse_buttons_video.middle, RingActionId::None);
         assert_eq!(
             settings.right_drag_mode(RightDragContext::Grid),
             RightDragMode::Disabled
@@ -2629,6 +2726,36 @@ mod tests {
     }
 
     #[test]
+    fn close_fullscreen_action_round_trips_and_is_fullscreen_only() {
+        let action = RingActionId::CloseFullscreen;
+        assert_eq!(action.as_str(), "close_fullscreen");
+        assert_eq!(
+            RingActionId::from_str("close_fullscreen"),
+            Some(action.clone())
+        );
+        assert!(!action.is_valid_for_context(RingShortcutContext::Grid));
+        assert!(action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+        assert!(action.is_valid_for_context(RingShortcutContext::VideoFullscreen));
+        assert!(!RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action));
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                .contains(&action)
+        );
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
+                .contains(&action)
+        );
+        assert_eq!(
+            action.label_for_context(RingShortcutContext::ImageFullscreen),
+            "画像フルスクリーンを閉じる"
+        );
+        assert_eq!(
+            action.label_for_context(RingShortcutContext::VideoFullscreen),
+            "動画フルスクリーンを閉じる"
+        );
+    }
+
+    #[test]
     fn image_boundary_actions_are_available_only_for_image_fullscreen() {
         for action in [RingActionId::ImageHome, RingActionId::ImageEnd] {
             assert!(!action.is_valid_for_context(RingShortcutContext::Grid));
@@ -2640,6 +2767,105 @@ mod tests {
             assert!(
                 RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
                     .contains(&action)
+            );
+            assert!(
+                !RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
+                    .contains(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn image_zoom_mode_action_round_trips_and_is_image_only() {
+        let action = RingActionId::ImageZoomMode;
+        assert_eq!(action.as_str(), "image_zoom_mode");
+        assert_eq!(
+            RingActionId::from_str("image_zoom_mode"),
+            Some(action.clone())
+        );
+        assert!(!action.is_valid_for_context(RingShortcutContext::Grid));
+        assert!(action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+        assert!(!action.is_valid_for_context(RingShortcutContext::VideoFullscreen));
+        assert!(!RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action));
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                .contains(&action)
+        );
+        assert!(
+            !RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
+                .contains(&action)
+        );
+        assert_eq!(
+            action.label_for_context(RingShortcutContext::ImageFullscreen),
+            "全画面ズームモード"
+        );
+    }
+
+    #[test]
+    fn mouse_button_candidates_exclude_fullscreen_location_navigation() {
+        let grid = RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid);
+        assert!(grid.contains(&RingActionId::OpenDriveC));
+        assert!(grid.contains(&RingActionId::OpenLocationRating1));
+        assert!(grid.contains(&RingActionId::OpenFavorite1));
+
+        let image =
+            RingActionId::available_for_mouse_button_context(RingShortcutContext::ImageFullscreen);
+        assert!(image.contains(&RingActionId::GridHistoryBack));
+        assert!(image.contains(&RingActionId::ImageZoomMode));
+        assert!(!image.contains(&RingActionId::OpenDriveC));
+        assert!(!image.contains(&RingActionId::OpenLocationRating1));
+        assert!(!image.contains(&RingActionId::OpenFavorite1));
+
+        let video =
+            RingActionId::available_for_mouse_button_context(RingShortcutContext::VideoFullscreen);
+        assert!(video.contains(&RingActionId::GridHistoryForward));
+        assert!(video.contains(&RingActionId::VideoMute));
+        assert!(!video.contains(&RingActionId::OpenDriveC));
+        assert!(!video.contains(&RingActionId::OpenLocationRating1));
+        assert!(!video.contains(&RingActionId::OpenFavorite1));
+    }
+
+    #[test]
+    fn image_spread_shift_actions_round_trip_and_are_image_only() {
+        let samples = [
+            (
+                RingActionId::ImageSpreadShiftLeft,
+                "image_spread_shift_left",
+                "見開き 1Pずらし 左",
+            ),
+            (
+                RingActionId::ImageSpreadShiftRight,
+                "image_spread_shift_right",
+                "見開き 1Pずらし 右",
+            ),
+            (
+                RingActionId::ImageSpreadShiftPrev,
+                "image_spread_shift_prev",
+                "見開き 1Pずらし 前",
+            ),
+            (
+                RingActionId::ImageSpreadShiftNext,
+                "image_spread_shift_next",
+                "見開き 1Pずらし 次",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(
+                action.label_for_context(RingShortcutContext::ImageFullscreen),
+                label
+            );
+            assert!(!action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+            assert!(!action.is_valid_for_context(RingShortcutContext::VideoFullscreen));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                    .contains(&action)
+            );
+            assert!(
+                !RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
             );
             assert!(
                 !RingActionId::available_for_context(RingShortcutContext::VideoFullscreen)
@@ -2665,6 +2891,7 @@ mod tests {
             let profile = settings.mouse_button_profile(context);
             assert_eq!(profile.back, RingActionId::TreeFolderPrev);
             assert_eq!(profile.forward, RingActionId::TreeFolderNext);
+            assert_eq!(profile.middle, RingActionId::None);
         }
     }
 

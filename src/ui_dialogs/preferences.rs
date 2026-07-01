@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::ring_shortcut::{
-    MouseGestureDirection, RightDragContext, RingActionId, RingDirection, RingShortcutContext,
+    MouseButtonSlot, MouseGestureDirection, RightDragContext, RingActionId, RingDirection,
+    RingShortcutContext,
 };
 use crate::settings::{Parallelism, Settings};
 
@@ -202,7 +203,7 @@ impl OperationSettingsTab {
         match self {
             Self::Behavior => "動作",
             Self::RightDrag => "右ドラッグ",
-            Self::MouseButtons => "マウス進む/戻る",
+            Self::MouseButtons => "マウスボタン",
         }
     }
 }
@@ -220,7 +221,7 @@ impl OperationAssignmentTab {
         match self {
             Self::Keyboard => "キー",
             Self::RingPad => "リング/パッド",
-            Self::MouseButtons => "進む/戻る",
+            Self::MouseButtons => "マウスボタン",
             Self::MouseGesture => "マウス",
         }
     }
@@ -240,7 +241,7 @@ pub(crate) enum OperationAssignmentTarget {
     },
     MouseButton {
         context: RingShortcutContext,
-        forward: bool,
+        slot: MouseButtonSlot,
     },
     MouseGesture {
         context: RightDragContext,

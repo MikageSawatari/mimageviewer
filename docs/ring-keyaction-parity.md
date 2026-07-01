@@ -1,13 +1,13 @@
 # RingActionId ↔ KeyAction パリティ棚卸し
 
-> ステータス: **棚卸し済み / 漏れ修正済み。⚠️ 13 件も triage 済みで、KeyAction 化 6 件・固定 5 件・ring 専用 13 件に分類済み** (2026-06-25)。
+> ステータス: **棚卸し済み / 漏れ修正済み。KeyAction 化・固定・ring 専用に分類済み** (2026-06-25)。
 > 目的: キー操作コマンドカタログ化 (`docs/key-command-catalog-plan.md`) の中で、
 > 「リング/パッド/ジェスチャ (`RingActionId`) には登録したが、キーボード (`KeyAction`) には
 > 登録し忘れた」操作を洗い出し、再発を防ぐための対応表。
 
 ## 背景
 
-`RingActionId` (116 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
+`RingActionId` (122 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
 を意味対応で突き合わせたところ、一部の操作が **ring/パッドには割り当てられるのにキーボードには
 割り当てられない**状態だった。キー側はハードコードの生キー処理で取り残されており、
 
@@ -25,11 +25,11 @@
 - ⚪ 設計上 ring/パッド専用 (場所ジャンプ等。キー化不要)
 - 固定: キーボード入力としては予約・OS/Shell 連携・マウス専用などの理由で keymap 対象外
 
-## 集計 (actionable 114 / `None`・`Unknown` 除く)
+## 集計 (actionable 120 / `None`・`Unknown` 除く)
 
 | 判定 | 件数 |
 |---|---|
-| ✅ 対応済み | 96 |
+| ✅ 対応済み | 102 |
 | 固定 (理由付き) | 5 |
 | ⚪ ring 専用 (意図的) | 13 |
 | ❌ / ⚠️ 未処理 | 0 |
@@ -61,12 +61,14 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 
 ## ✅ 対応済み (参考)
 
-ウィンドウ/本: `ToggleDetachedViewer`→`ToggleDetachedViewerMode`、`AddToBook`→`Grid/Fs/VideoAddToActiveBook`、
+ウィンドウ/本: `CloseFullscreen`→`FsClose`/`VideoCloseFullscreen`、`ToggleDetachedViewer`→`ToggleDetachedViewerMode`、`AddToBook`→`Grid/Fs/VideoAddToActiveBook`、
 `PinRepresentativeThumb`→`GridPin`。
 グリッド: `GridToggleDetails`→`GridToggleDetailsView`、`GridToggleCheck`、`GridSelectAll`、`GridColumnCount1..10`。
 画像 FS: `ImageRotateLeft/Right`→`FsRotateCcw/FsRotateCw`、`ImageCapture`→`FsCapture`、
 `ImageToggleMetadata`→`FsToggleMetadata`、`ImageSlideshow`→`FsSlideshow`、`ImagePixelGrid`→`FsPixelGrid`、
-`ImageBackgroundCycle`→`FsBgCycle`、`ImageComparePin`→`FsCompareToggle`(比較系・近似)。
+`ImageBackgroundCycle`→`FsBgCycle`、`ImageComparePin`→`FsCompareToggle`(比較系・近似)、
+`ImageSpreadShiftLeft/Right/Prev/Next`→`FsSpreadShiftLeft/Right/Prev/Next`、
+`ImageZoomMode`→`FsZoomMode` (KeyHold の照準表示は一発アクションではスキップ)。
 動画 FS: `VideoCapture/Mute/Loop/Bookmark/MarkerPrev/MarkerNext/TileMode/ExternalPlayer` は同名 `KeyAction` あり。
 
 ## ⚪ ring/パッド専用

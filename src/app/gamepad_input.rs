@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::{AdjustSpreadTarget, App, FolderNavMode};
+use super::{App, FolderNavMode};
 use crate::adjustment::PostFilter;
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
@@ -11,12 +11,12 @@ use crate::keymap::KeyAction;
 use crate::ring_shortcut::{
     GamepadFavoritePickerState, GamepadLocationEntry, GamepadLocationNav,
     GamepadLocationPickerState, GamepadVideoMarkerPickerState, MOUSE_FLICK_MOVE_THRESHOLD_PX,
-    MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX, MouseFlickOutcome,
-    MouseFlickState, MouseGestureDirection, MouseGestureState, PickerListMode, PickerListState,
-    RightDragContext, RightDragMode, RingActionId, RingDirection, RingPickerAnchor,
-    RingPickerOriginalState, RingPickerRowId, RingPickerState, RingShortcutContext,
-    format_mouse_gesture_pattern, mouse_flick_guide_delay, mouse_flick_menu_delay,
-    mouse_gesture_direction_from_delta,
+    MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX, MouseButtonSlot,
+    MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState, PickerListMode,
+    PickerListState, RightDragContext, RightDragMode, RingActionId, RingDirection,
+    RingPickerAnchor, RingPickerOriginalState, RingPickerRowId, RingPickerState,
+    RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
+    mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
@@ -3730,13 +3730,73 @@ impl App {
         forward: bool,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        self.apply_mouse_button(
+            ctx,
+            if forward {
+                MouseButtonSlot::Forward
+            } else {
+                MouseButtonSlot::Back
+            },
+            source,
+        )
+    }
+
+    pub(crate) fn update_mouse_middle_short_click(
+        &mut self,
+        ctx: &egui::Context,
+        allow_start: bool,
+    ) -> bool {
+        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
+            (
+                i.pointer.button_down(egui::PointerButton::Middle),
+                i.pointer.button_pressed(egui::PointerButton::Middle),
+                i.pointer.button_released(egui::PointerButton::Middle),
+                i.pointer.interact_pos(),
+            )
+        });
+
+        if is_pressed {
+            self.mouse_middle_click_start = if allow_start {
+                current_pos.map(|pos| (pos, Instant::now(), false))
+            } else {
+                None
+            };
+        }
+        if is_down || is_released {
+            if let Some((start, _, cancelled)) = self.mouse_middle_click_start.as_mut() {
+                if let Some(pos) = current_pos {
+                    if pos.distance(*start) > crate::ui_fullscreen::MIDDLE_DRAG_THRESHOLD_PX {
+                        *cancelled = true;
+                    }
+                }
+            }
+        }
+        if is_released {
+            return matches!(
+                self.mouse_middle_click_start.take(),
+                Some((_, started_at, false))
+                    if started_at.elapsed() <= Duration::from_millis(500)
+            );
+        }
+        if !is_down && !is_pressed {
+            self.mouse_middle_click_start = None;
+        }
+        false
+    }
+
+    pub(crate) fn apply_mouse_button(
+        &mut self,
+        ctx: &egui::Context,
+        slot: MouseButtonSlot,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
         let context = self.current_ring_shortcut_context();
         let action = self
             .settings
             .ring_shortcuts
             .mouse_button_profile(context)
-            .action(forward);
-        if !action.is_valid_for_context(context) {
+            .action(slot);
+        if !action.is_valid_for_mouse_button_context(context) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
                 action.as_str()
@@ -3748,7 +3808,7 @@ impl App {
         }
         crate::logger::log(format!(
             "[input-nav] source={source} mouse_button={} action={} context={context:?}",
-            if forward { "forward" } else { "back" },
+            slot.log_name(),
             action.as_str()
         ));
         self.apply_ring_action(ctx, context, action, source)
@@ -4204,6 +4264,15 @@ impl App {
                 self.toggle_main_window_maximized(ctx);
                 None
             }
+            RingActionId::CloseFullscreen
+                if matches!(
+                    context,
+                    RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen
+                ) =>
+            {
+                self.apply_ring_close_fullscreen(ctx, context);
+                None
+            }
             RingActionId::CycleFavorite => self.handle_gamepad_start(ctx),
             RingActionId::AddToBook => {
                 self.apply_ring_add_to_book(ctx, context);
@@ -4311,6 +4380,32 @@ impl App {
                 }
                 None
             }
+            RingActionId::ImageSpreadShiftLeft
+                if context == RingShortcutContext::ImageFullscreen =>
+            {
+                let dir = self.visual_spread_shift_dir(false);
+                self.apply_ring_image_spread_shift(ctx, dir, source);
+                None
+            }
+            RingActionId::ImageSpreadShiftRight
+                if context == RingShortcutContext::ImageFullscreen =>
+            {
+                let dir = self.visual_spread_shift_dir(true);
+                self.apply_ring_image_spread_shift(ctx, dir, source);
+                None
+            }
+            RingActionId::ImageSpreadShiftPrev
+                if context == RingShortcutContext::ImageFullscreen =>
+            {
+                self.apply_ring_image_spread_shift(ctx, -1, source);
+                None
+            }
+            RingActionId::ImageSpreadShiftNext
+                if context == RingShortcutContext::ImageFullscreen =>
+            {
+                self.apply_ring_image_spread_shift(ctx, 1, source);
+                None
+            }
             RingActionId::ImageRotateLeft if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
@@ -4354,6 +4449,12 @@ impl App {
             }
             RingActionId::ImageSlideshow if context == RingShortcutContext::ImageFullscreen => {
                 self.toggle_ring_slideshow();
+                None
+            }
+            RingActionId::ImageZoomMode if context == RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.toggle_fs_zoom_mode_action(ctx, fs_idx);
+                }
                 None
             }
             RingActionId::ImagePixelGrid if context == RingShortcutContext::ImageFullscreen => {
@@ -4497,6 +4598,59 @@ impl App {
                 self.toggle_video_window_mode_for_input(ctx);
             }
             RingShortcutContext::Grid => {}
+        }
+    }
+
+    fn apply_ring_close_fullscreen(&mut self, ctx: &egui::Context, context: RingShortcutContext) {
+        match context {
+            RingShortcutContext::ImageFullscreen => {
+                let detached = self.viewer_session_is_detached();
+                self.handle_fullscreen_close_request();
+                if !detached {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                ctx.request_repaint();
+            }
+            RingShortcutContext::VideoFullscreen => {
+                self.close_fullscreen();
+                ctx.request_repaint();
+            }
+            RingShortcutContext::Grid => {}
+        }
+    }
+
+    fn visual_spread_shift_dir(&self, right: bool) -> i32 {
+        let rtl = self.spread_mode.is_rtl();
+        match (right, rtl) {
+            (true, false) | (false, true) => 1,
+            (true, true) | (false, false) => -1,
+        }
+    }
+
+    fn apply_ring_image_spread_shift(
+        &mut self,
+        ctx: &egui::Context,
+        dir: i32,
+        source: &'static str,
+    ) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let mut action = crate::ui_fullscreen::FsKeyAction::default();
+        self.queue_spread_shift_action(fs_idx, dir, &mut action);
+        if action.nav_delta != 0 || action.jump_to.is_some() {
+            self.bump_input_seq(source, Some(&format!("spread_shift_dir={dir}")));
+            self.handle_fs_navigation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                action.nav_delta,
+                action.jump_to,
+                fs_idx,
+            );
         }
     }
 
@@ -4831,27 +4985,24 @@ impl App {
         let Some(nudge_dir) = nudge_dir else {
             return;
         };
-        if self.spread_mode.is_spread() {
-            if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, nudge_dir)
-            {
-                self.spread_shift_anchor_idx = Some(anchor_idx);
-                self.adjust_spread_target = AdjustSpreadTarget::Left;
-                self.bump_input_seq("gamepad_fs_nudge", Some(&format!("idx={new_idx}")));
-                self.handle_fs_navigation(
-                    ctx,
-                    false,
-                    false,
-                    None,
-                    None,
-                    None,
-                    0,
-                    Some(new_idx),
-                    fs_idx,
-                );
-                self.show_feedback_toast("見開きを1ページずらしました".to_string());
-            }
-        } else {
-            self.navigate_gamepad_still(ctx, fs_idx, nudge_dir);
+        let mut action = crate::ui_fullscreen::FsKeyAction::default();
+        self.queue_spread_shift_action(fs_idx, nudge_dir, &mut action);
+        if action.nav_delta != 0 || action.jump_to.is_some() {
+            self.bump_input_seq(
+                "gamepad_fs_nudge",
+                Some(&format!("spread_shift_dir={nudge_dir}")),
+            );
+            self.handle_fs_navigation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                action.nav_delta,
+                action.jump_to,
+                fs_idx,
+            );
         }
     }
 

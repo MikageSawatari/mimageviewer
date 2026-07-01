@@ -338,7 +338,7 @@ fn fullscreen_pointer_pos_or(
 const MIDDLE_DRAG_UNIT_PX: f32 = 100.0;
 /// 中ボタン押下から「ドラッグ開始」とみなす最小移動量。
 /// この距離以下ならズームは触らない (クリックのみとの区別 / 暴発防止)。
-const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
+pub(crate) const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 /// ズーム倍率の下限
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
@@ -1905,6 +1905,38 @@ impl App {
         self.fs_zoom_active || self.fs_zoom_aiming
     }
 
+    fn fs_zoom_mode_context_ok(&self, fs_idx: usize) -> bool {
+        self.reading_flow.is_paged()
+            && !self.is_panorama_mode_active(fs_idx)
+            && !self.analysis_mode
+            // 消しゴム / 補正レイヤー / 隠蔽 / 切り取り / 注釈 をまとめて除外 (Codex P2: 切り取り
+            // モード漏れ防止のため手書き列挙でなく is_overlay_edit_mode_active を使う)。
+            && !self.is_overlay_edit_mode_active()
+            // 比較表示中は通常閲覧外 (Double では比較描画が優先され入力と表示がずれるため、Codex P3)。
+            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+    }
+
+    /// Ring / mouse button などの一発操作から ZipPla 風ズームを切り替える。
+    /// KeyHold ではないので照準表示はスキップし、現在のカーソル位置で即ズーム状態に入る。
+    pub(crate) fn toggle_fs_zoom_mode_action(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if !self.fs_zoom_mode_context_ok(fs_idx) {
+            self.fs_zoom_reset();
+            self.show_feedback_toast("この表示では全画面ズームモードを使えません".to_string());
+            ctx.request_repaint();
+            return;
+        }
+        if self.fs_zoom_mode_engaged() {
+            self.fs_zoom_reset();
+        } else {
+            self.fs_zoom_active = true;
+            self.fs_zoom_aiming = false;
+            self.fs_zoom_exit_pending = false;
+            self.fs_zoom_z_was_down = false;
+        }
+        ctx.request_repaint();
+    }
+
     /// ズームモードを解除し、エッジ検出状態もリセットする (倍率はセッション保持のため残す)。
     pub(crate) fn fs_zoom_reset(&mut self) {
         self.fs_zoom_active = false;
@@ -1927,16 +1959,7 @@ impl App {
     /// OS 直読みのエッジで検出する。fit 状態で押下=照準開始、離す=ズーム確定、ズーム中の押下=解除。
     /// 通常閲覧 (単ページ / 見開き) で動く (連結/パノラマ/動画/分析/編集モードは対象外)。
     fn update_fs_zoom_mode_keys(&mut self, ctx: &egui::Context, fs_idx: usize) {
-        let context_ok = self.reading_flow.is_paged()
-            && !self.is_panorama_mode_active(fs_idx)
-            && !self.analysis_mode
-            // 消しゴム / 補正レイヤー / 隠蔽 / 切り取り / 注釈 をまとめて除外 (Codex P2: 切り取り
-            // モード漏れ防止のため手書き列挙でなく is_overlay_edit_mode_active を使う)。
-            && !self.is_overlay_edit_mode_active()
-            // 比較表示中は通常閲覧外 (Double では比較描画が優先され入力と表示がずれるため、Codex P3)。
-            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
-            && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        if !context_ok {
+        if !self.fs_zoom_mode_context_ok(fs_idx) {
             // コンテキスト外: ズーム解除し、エッジ状態もリセット
             // (Z 押しっぱで対象外へ移った時の誤発火を防ぐ)。
             self.fs_zoom_reset();
@@ -2191,10 +2214,9 @@ impl App {
     /// 呼び出し側はこの後の左クリック/右クリックの解釈をスキップしてよい。
     fn handle_middle_drag_zoom(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
         // ZipPla 風ズーム (照準中 / 確定中) は専用描画経路で fs_zoom/fs_pan を使わない。
-        // 中ボタンドラッグで不可視の fs_zoom を書き換えると、Z で抜けた瞬間に予期せぬ倍率で
-        // 表示されてしまうので、ズームモード中は中ボタンズームを無効化する。
+        // 中ボタンドラッグで不可視の fs_zoom を書き換えず、専用の fs_zoom_factor を動かす。
         if self.fs_zoom_mode_engaged() {
-            return false;
+            return self.handle_zoom_mode_middle_drag(ctx);
         }
         let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
             (
@@ -2277,6 +2299,49 @@ impl App {
                 }
                 return true;
             }
+        }
+
+        false
+    }
+
+    fn handle_zoom_mode_middle_drag(&mut self, ctx: &egui::Context) -> bool {
+        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
+            (
+                i.pointer.button_down(egui::PointerButton::Middle),
+                i.pointer.button_pressed(egui::PointerButton::Middle),
+                i.pointer.button_released(egui::PointerButton::Middle),
+                i.pointer.interact_pos(),
+            )
+        });
+
+        if is_pressed && self.fs_middle_zoom_drag.is_none() {
+            if let Some(pos) = current_pos {
+                self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
+                    pivot: pos,
+                    start_zoom: self.fs_zoom_factor,
+                    start_pan: egui::Vec2::ZERO,
+                    rect_center: egui::Pos2::ZERO,
+                    is_analysis: false,
+                });
+            }
+        }
+
+        if is_down {
+            if let (Some(drag), Some(pos)) = (self.fs_middle_zoom_drag.clone(), current_pos) {
+                let dy = pos.y - drag.pivot.y;
+                if dy.abs() < MIDDLE_DRAG_THRESHOLD_PX {
+                    return true;
+                }
+                let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
+                self.fs_zoom_factor = (drag.start_zoom * factor).clamp(0.05, 16.0);
+                ctx.request_repaint();
+                return true;
+            }
+        }
+
+        if is_released && self.fs_middle_zoom_drag.take().is_some() {
+            ctx.request_repaint();
+            return true;
         }
 
         false
@@ -7077,6 +7142,28 @@ impl App {
         spread_offset_nudge_from_units(&nav, &units, fs_idx, dir, &landscape_flags)
     }
 
+    pub(crate) fn queue_spread_shift_action(
+        &mut self,
+        fs_idx: usize,
+        dir: i32,
+        action: &mut FsKeyAction,
+    ) {
+        if dir == 0 {
+            return;
+        }
+        if self.spread_mode.is_spread() {
+            if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, dir) {
+                self.spread_shift_anchor_idx = Some(anchor_idx);
+                self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                action.jump_to = Some(new_idx);
+                self.show_feedback_toast("見開きを1ページずらしました".to_string());
+            }
+        } else {
+            // Single モード: 1 ページ移動にフォールバック (ユーザー要望)
+            action.nav_delta = dir;
+        }
+    }
+
     pub(crate) fn fullscreen_cursor_state(&self) -> FullscreenCursorState {
         FullscreenCursorState {
             last_activity: self.cursor_last_activity,
@@ -7699,6 +7786,14 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftRight);
+        let spread_shift_prev = !is_video_fs
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSpreadShiftPrev);
+        let spread_shift_next = !is_video_fs
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSpreadShiftNext);
         let ctrl_page_down = self.keymap.consume_action(ctx, KeyAction::FsSiblingNext);
         let ctrl_page_up = self.keymap.consume_action(ctx, KeyAction::FsSiblingPrev);
         // PageUp/Down のスクロール用 consume も、実際に連続描画している条件
@@ -8603,19 +8698,13 @@ impl App {
         // 1 ページぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
         let ctrl_nudge_next = (ctrl_right && !rtl) || (ctrl_left && rtl);
         let ctrl_nudge_prev = (ctrl_left && !rtl) || (ctrl_right && rtl);
-        if ctrl_nudge_next || ctrl_nudge_prev {
-            let dir = if ctrl_nudge_next { 1 } else { -1 };
-            if self.spread_mode.is_spread() {
-                if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, dir) {
-                    self.spread_shift_anchor_idx = Some(anchor_idx);
-                    self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                    action.jump_to = Some(new_idx);
-                    self.show_feedback_toast("見開きを1ページずらしました".to_string());
-                }
+        if ctrl_nudge_next || ctrl_nudge_prev || spread_shift_prev || spread_shift_next {
+            let dir = if spread_shift_next || ctrl_nudge_next {
+                1
             } else {
-                // Single モード: 1 ページ移動にフォールバック (ユーザー要望)
-                action.nav_delta = dir;
-            }
+                -1
+            };
+            self.queue_spread_shift_action(fs_idx, dir, &mut action);
         }
         let mouse_nav_forward = mouse_forward || browser_forward;
         let mouse_nav_back = mouse_back || browser_back;
@@ -9024,8 +9113,18 @@ impl App {
         // 分析モード中でも同じ操作感で動かす (書き戻し先はドラッグ開始時の mode で固定)。
         // パネル上で「開始」された中ボタンは無視して下流に流すが、既にドラッグが
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
+        let middle_short_click = self.update_mouse_middle_short_click(ctx, !cursor_in_panel);
         if !cursor_in_panel || self.fs_middle_zoom_drag.is_some() {
             self.handle_middle_drag_zoom(ctx, default_image_rect);
+        }
+        if middle_short_click {
+            if let Some(nav) = self.apply_mouse_button(
+                ctx,
+                crate::ring_shortcut::MouseButtonSlot::Middle,
+                "fullscreen-middle-mouse",
+            ) {
+                self.mouse_ring_nav = Some(nav);
+            }
         }
 
         // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。

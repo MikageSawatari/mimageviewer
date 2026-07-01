@@ -281,6 +281,8 @@
 # FsContinuousScrollBack = PageUp ; 連結表示中に前の画面分へスクロールする
 # FsSpreadShiftLeft = Ctrl+Left ; 見開き表示を左方向へ1ページずらす
 # FsSpreadShiftRight = Ctrl+Right ; 見開き表示を右方向へ1ページずらす
+# FsSpreadShiftPrev = none ; 見開き表示を前のページ方向へ1ページずらす
+# FsSpreadShiftNext = none ; 見開き表示を次のページ方向へ1ページずらす
 # FsSlideshow = S ; スライドショーの再生または停止を切り替える
 # FsSpaceCheck = Space ; 現在の画像のチェックを切り替える。スライドショー中は停止する
 # FsCapture = Ctrl+S ; 現在の表示画像をキャプチャ保存する

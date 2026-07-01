@@ -719,10 +719,13 @@ Ctrl+ホイールなど固定扱いの入力は従来どおり。
 Windows native 動画 overlay の表示は変更後のキーに追従する。動画フルスクリーンは egui 経路と
 Windows native 動画 overlay の両方で対応する。
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
-リング / ジェスチャ設定、マウス戻る / 進むボタン、ゲームパッド X リングは
+リング / ジェスチャ設定、マウス戻る / 進む / ホイールクリック、ゲームパッド X リングは
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
-画像・動画フルスクリーンでは、F11 相当のウィンドウ / 全画面切替と
+画像・動画フルスクリーンでは、フルスクリーンを閉じる操作、F11 相当のウィンドウ / 全画面切替、
 F12 相当の別ウィンドウ ON/OFF もこの候補に含める。
+画像フルスクリーンでは、見開き 1 ページずらしと全画面ズームモードも候補に含める。
+左 / 右アクションは Ctrl+←/→ と同じく右→左の見開きで前/次の意味を反転し、
+前 / 次アクションは PageUp/PageDown 系と同じく右→左でも前/次の意味を反転しない。
 同じお気に入り / ドライブ / 場所▼の固定項目は、リング / マウス / パッドの一発アクションとしても
 割り当てられる。未登録のお気に入り番号や存在しないドライブを実行した場合はトーストで通知して何もしない。
 設定メニュー「操作カスタマイズ…」のコマンド一覧では、キー / リング / マウス / パッドの
@@ -776,6 +779,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Ctrl + ↓ | ツリー順で次のフォルダ / コンテナへ |
 | マウス戻るボタン | `Settings.ring_shortcuts.mouse_buttons_grid.back` に従う。新規環境と既定リセットはフォルダ履歴を戻る（Alt+← と同じ）。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、従来互換のツリー順で前のフォルダ / コンテナへ（Ctrl+↑ と同じ）。XButton1 native / WM_APPCOMMAND / `Browser_Back` キーストロークの 3 経路に対応 |
 | マウス進むボタン | `Settings.ring_shortcuts.mouse_buttons_grid.forward` に従う。新規環境と既定リセットはフォルダ履歴を進む（Alt+→ と同じ）。既存環境は初回ダイアログで標準 / 従来どおりを選ぶまで、従来互換のツリー順で次のフォルダ / コンテナへ（Ctrl+↓ と同じ）。XButton2 native / WM_APPCOMMAND / `Browser_Forward` キーストロークの 3 経路に対応 |
+| マウスホイールクリック | `Settings.ring_shortcuts.mouse_buttons_grid.middle` に従う。既定は未割り当て。500ms 以内かつドラッグしきい値以下の短クリックだけ発火する |
 | Ctrl + マウスホイール | 列数を増減 |
 | Alt + 1〜9 | 列数を 1〜9 に切り替え |
 | Alt + 0 | 列数を 10 に切り替え |
@@ -806,6 +810,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | G | ピクセルグリッド表示 ON/OFF（ユーザーズームが等倍より拡大中、かつ高倍率時のみ、画像と同じ回転に追従してピクセル境界を表示） |
 | M / Shift | ルーペ表示。360 度パノラマモード中は無効 |
 | Z | ZipPla 風 全画面ズームモード。押している間はズーム範囲の枠を表示 (カーソルで移動 / ホイールで枠サイズ=倍率)、離すと枠の範囲を全画面に拡大してマウスでパン (元画像範囲内のみ、余白なし)。もう一度 Z で解除。前後ページへ移動してもズーム状態・倍率はセッション内で維持。単ページ通常閲覧専用。現行ルーペ (M / Shift) とは別物 |
+| ホイールクリックに全画面ズームモードを割り当て | 短クリックでズーム状態を ON/OFF する。Z キーの押下中照準表示は出さず、現在のカーソル位置でズーム状態へ入る。ズーム状態中は中ボタン押し込み + 上下ドラッグで倍率を変える |
 | Shift+Z | 画像分析モード (旧 Z) |
 | Space | スライドショー再生中：停止 ／ 停止中：チェック ON/OFF (画像のみ。動画フルスクリーンでは再生/一時停止トグルに割当) |
 | I / Tab | メタデータパネルの固定表示切替（画像フルスクリーンのみ） |
@@ -831,8 +836,9 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Ctrl + ↑ | ツリー順で前のフォルダ / コンテナへ移動し、その先頭画像 / 動画をフルスクリーンで表示 |
 | Ctrl + ↓ | ツリー順で次のフォルダ / コンテナへ移動し、その先頭画像 / 動画をフルスクリーンで表示 |
 | 右 Ctrl（押している間） / 左クリック長押し | 元画像プレビュー（mIV 側の補正/ポストフィルタ/AI/消しゴム補完/補正レイヤー/隠蔽加工/テキスト注釈を一時的に外す） |
-| マウス戻るボタン | `Settings.ring_shortcuts.mouse_buttons_image.back` / `mouse_buttons_video.back` に従う。新規環境と既定リセットはフォルダ履歴を戻る。従来どおりを選んだ既存環境は Ctrl+↑ と同じツリー順移動。画像フルスクリーンでは Home 相当の先頭移動も候補に含む。画像系 / 動画 native 経路とも有効 |
-| マウス進むボタン | `Settings.ring_shortcuts.mouse_buttons_image.forward` / `mouse_buttons_video.forward` に従う。新規環境と既定リセットはフォルダ履歴を進む。従来どおりを選んだ既存環境は Ctrl+↓ と同じツリー順移動。画像フルスクリーンでは End 相当の末尾移動も候補に含む。画像系 / 動画 native 経路とも有効 |
+| マウス戻るボタン | `Settings.ring_shortcuts.mouse_buttons_image.back` / `mouse_buttons_video.back` に従う。新規環境と既定リセットはフォルダ履歴を戻る。従来どおりを選んだ既存環境は Ctrl+↑ と同じツリー順移動。画像フルスクリーンでは Home 相当の先頭移動も候補に含む。画像 / 動画フルスクリーンのマウスボタン候補では、`C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系は表示しない。画像系 / 動画 native 経路とも有効 |
+| マウス進むボタン | `Settings.ring_shortcuts.mouse_buttons_image.forward` / `mouse_buttons_video.forward` に従う。新規環境と既定リセットはフォルダ履歴を進む。従来どおりを選んだ既存環境は Ctrl+↓ と同じツリー順移動。画像フルスクリーンでは End 相当の末尾移動も候補に含む。画像 / 動画フルスクリーンのマウスボタン候補では、`C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系は表示しない。画像系 / 動画 native 経路とも有効 |
+| マウスホイールクリック | `Settings.ring_shortcuts.mouse_buttons_image.middle` / `mouse_buttons_video.middle` に従う。既定は未割り当て。画像系 / 動画 native 経路とも 500ms 以内かつドラッグしきい値以下の短クリックだけ発火し、画像フルスクリーンの中ボタンドラッグズームは移動量がしきい値を超えた時点で従来どおり優先する。画像フルスクリーンでは全画面ズームモードを割り当てられる。画像 / 動画フルスクリーンのマウスボタン候補では場所移動系は表示しない |
 | ? (既定) | 動画フルスクリーンの場合、現在の動画コンテキストで使えるショートカット一覧を表示する。egui 経路と Windows native 動画 overlay の両方で対応 |
 | Enter | 動画の場合、フルスクリーンで自動再生する。動画フルスクリーン中の Space / Enter は再生/一時停止トグル (Phase 1: 旧 Space=チェックは削除) |
 | Ctrl + B | 動画の場合、現在の再生フレームを画像として追加先の本へ追加する |
@@ -851,7 +857,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | 画面右端のメタデータパネル幅内 | メタデータパネルをホバー表示 |
 | 画面上部 | ファイル情報バー + 操作ボタン |
 
-補足: Ctrl+↑↓ は従来どおりツリー順移動。マウス戻る / 進むボタンは設定により、
+補足: Ctrl+↑↓ は従来どおりツリー順移動。マウス戻る / 進む / ホイールクリックは設定により、
 グリッド / 画像フルスクリーン / 動画フルスクリーンごとに個別アクションを選べる。
 ツリー順に設定した場合の画像系 / Windows native 動画 / Ctrl+S / Ctrl+G のスコープ解決は Ctrl+↑↓ と共通化している。横断仕様は
 [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) を参照。
@@ -1054,7 +1060,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
-| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進むボタンの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
+| `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
