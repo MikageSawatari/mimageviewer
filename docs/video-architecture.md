@@ -1613,10 +1613,30 @@ always-new 窓と同じく no-op として扱う。
   checked / SAR) を移してから旧 window と入れ替え、`PlacementSwitched`
   / `PlacementSwitchFailed` を `request_id` 付きで返す。
 - App は `request_id` で遅延 / 連打イベントを弾く。`native_video_in_window_active`
-  と `viewer_presentation` は切り替え進行中は据え置き、`PlacementSwitched` 受信時に
-  `apply_video_presentation_switched` で更新する (= 旧 child HWND を fullscreen / VST owner と誤認しない)。
+  と `viewer_presentation` は切り替え進行中は据え置き、`PlacementSwitched` の
+  `request_id` が pending と一致 (または presenter が pending target へ収束) した
+  ときだけ `apply_video_presentation_switched` で更新する (= 旧 child HWND を
+  fullscreen / VST owner と誤認しない。stale/mismatch な成功通知で新状態を巻き戻さない)。
 - 切り替え進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
   VST owner 同期 / VST availability を全停止する。
+- **close の世代タグ化 (旧 HWND teardown 由来の stale close 対策)**: window を
+  rebuild するたびに presenter スレッドが単調増加の `cur_generation` を採番し
+  (初回 1、rebuild ごとに `saturating_add(1)`)、その値を新 window の
+  `WindowState.generation` に焼き込む。`WM_CLOSE` は
+  `NativeVideoWindowEvent::CloseRequested { generation }` を、overlay × / presenter
+  発火の close は `NativeVideoOutputEvent::CloseFullscreen { generation }` を、
+  `PlacementSwitched` は切替後 window の generation を stamp する。App 側は player
+  ごと (`NativeVideoOutput.committed_generation`、fast-swap の take/attach で presenter
+  と一緒に移動) に committed 世代を保持し、`PlacementSwitched` で単調非減少に進める。
+  `generation < committed` の close は「作り直された旧 window 由来」として棄却する
+  (`accept_native_video_close*` がログ `[native-video] accept/reject close ...` を残す)。
+  これは旧実装の 500ms 時間窓 (時間ベースで racy) を因果 (世代) ベースに置換したもの。
+  detached window の resize は同一 placement で window を rebuild しないため世代は
+  据え置きで、resize 中の正当な × close を誤って握り潰さない。
+- source swap (デコーダ待ちで `native_video_source_swap_pending` に native_output を
+  退避する経路) の drain でも、committed は退避中 native_output から読み、in-flight な
+  `PlacementSwitched` は共通 helper `apply_native_video_placement_switch_state` で
+  presentation を反映する (通常経路と分岐させない)。
 
 ### 静止画の embedded 描画
 
