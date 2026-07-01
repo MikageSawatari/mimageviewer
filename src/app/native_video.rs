@@ -740,8 +740,8 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { delta } => {
                     self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
                 }
-                crate::video::NativeVideoOutputEvent::CloseFullscreen => {
-                    if self.native_video_close_suppressed_after_switch("source_swap_close") {
+                crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
+                    if !self.accept_native_video_close(fs_idx, generation, "source_swap_close") {
                         continue;
                     }
                     self.close_fullscreen();
@@ -1863,9 +1863,6 @@ impl App {
     /// 「ユーザーが見ていない未確定モード」が次回起動時に持ち越される。
     #[cfg(windows)]
     pub(crate) fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
-        if self.native_video_mode_switch.is_some() {
-            self.suppress_native_video_close_after_placement_switch();
-        }
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
@@ -1908,31 +1905,69 @@ impl App {
         ));
     }
 
+    /// close イベントの世代トークンが現在の committed 世代以上かを判定する pure ロジック。
+    /// `generation < committed` = placement switch で作り直された旧 window 由来の
+    /// 遅延 close → stale として棄却する。時間窓 (旧 500ms band-aid) を置き換える因果判定。
     #[cfg(windows)]
-    pub(crate) fn suppress_native_video_close_after_placement_switch(&mut self) {
-        self.native_video_ignore_close_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    pub(crate) fn native_video_close_generation_is_current(
+        generation: u64,
+        committed: u64,
+    ) -> bool {
+        generation >= committed
     }
 
+    /// 指定 fs_idx の player が持つ committed 世代を参照して close 世代を判定する。
+    /// player / native_output が無いとき committed=0 とみなす (= 初回 window は世代 1
+    /// なので必ず受理される)。
     #[cfg(windows)]
-    pub(crate) fn native_video_close_suppressed_after_switch(
-        &mut self,
-        reason: &'static str,
+    pub(crate) fn native_video_close_generation_accepted(
+        &self,
+        fs_idx: usize,
+        generation: u64,
     ) -> bool {
-        let Some(until) = self.native_video_ignore_close_until else {
-            return false;
-        };
-        let now = std::time::Instant::now();
-        if now < until {
-            crate::logger::log(format!(
-                "[native-video] ignore stale close after placement switch: reason={reason} \
-                 remaining_ms={:.1}",
-                until.saturating_duration_since(now).as_secs_f64() * 1000.0
-            ));
-            return true;
+        let committed = self.native_video_committed_generation_for(fs_idx);
+        Self::native_video_close_generation_is_current(generation, committed)
+    }
+
+    /// 指定 fs_idx の player の committed 世代 (無ければ 0)。
+    #[cfg(windows)]
+    pub(crate) fn native_video_committed_generation_for(&self, fs_idx: usize) -> u64 {
+        self.fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => player.native_committed_generation(),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// 指定 fs_idx の player の committed 世代を単調非減少で進める。
+    /// `PlacementSwitched` 受信時に呼ぶ。player / native_output 不在なら no-op。
+    #[cfg(windows)]
+    pub(crate) fn bump_native_video_committed_generation(&self, fs_idx: usize, generation: u64) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.bump_native_committed_generation(generation);
         }
-        self.native_video_ignore_close_until = None;
-        false
+    }
+
+    /// close イベントを世代照合し、受理 (= 実際に閉じる) すべきかをログ付きで返す。
+    /// stale なら `[native-video] reject stale close` を残して false。
+    #[cfg(windows)]
+    fn accept_native_video_close(&self, fs_idx: usize, generation: u64, source: &str) -> bool {
+        let committed = self.native_video_committed_generation_for(fs_idx);
+        let accepted = Self::native_video_close_generation_is_current(generation, committed);
+        if accepted {
+            crate::logger::log(format!(
+                "[native-video] accept close source={source} idx={fs_idx} \
+                 generation={generation} committed={committed}"
+            ));
+        } else {
+            crate::logger::log(format!(
+                "[native-video] reject stale close source={source} idx={fs_idx} \
+                 generation={generation} committed={committed}"
+            ));
+        }
+        accepted
     }
 
     /// Plan B: presenter から `PlacementSwitchFailed` を受けたときに呼ぶ。presenter は
@@ -2033,8 +2068,8 @@ impl App {
                 self.toggle_native_video_vst3_gui();
                 self.mark_native_video_hud_activity(ctx);
             }
-            crate::video::NativeVideoOutputEvent::CloseFullscreen => {
-                if self.native_video_close_suppressed_after_switch("output_close") {
+            crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
+                if !self.accept_native_video_close(fs_idx, generation, "output_close") {
                     return;
                 }
                 self.close_fullscreen();
@@ -2045,30 +2080,51 @@ impl App {
             crate::video::NativeVideoOutputEvent::PlacementSwitched {
                 request_id,
                 placement,
+                generation,
             } => {
                 let presentation = Self::native_video_placement_to_viewer_presentation(placement);
-                self.apply_video_presentation_switched(presentation);
+                // committed 世代は apply の可否に関わらず単調非減少で進める。generation は
+                // presenter が焼いた「現 live window 世代」なので、これで close の stale
+                // 判定基準が常に最新に追随する (旧 window の close だけが古い世代で残る)。
+                self.bump_native_video_committed_generation(fs_idx, generation);
+                // **P1-1**: request_id 一致 (または pending target への収束) を先に判定し、
+                // 一致時だけ presentation/session/settings を反映する。旧実装は照合前に
+                // 無条件 apply していたため、stale/mismatch な成功通知が新状態を巻き戻した。
                 match self.native_video_mode_switch {
                     Some(p) if p.request_id == request_id => {
+                        self.apply_video_presentation_switched(presentation);
                         self.native_video_mode_switch = None;
+                        crate::logger::log(format!(
+                            "[native-video] PlacementSwitched request={request_id} matched pending; \
+                             applied {presentation:?} generation={generation}"
+                        ));
                     }
                     Some(p) if p.target_presentation == presentation => {
+                        // request_id はズレたが presenter が pending の目標に収束した。
+                        // 目標一致なので反映してよい (Codex 再 P2 の「収束」ケース)。
+                        self.apply_video_presentation_switched(presentation);
+                        self.native_video_mode_switch = None;
                         crate::logger::log(format!(
                             "[native-video] PlacementSwitched request={request_id} stale but \
-                             presenter converged to pending target {presentation:?}; clearing pending"
+                             presenter converged to pending target {presentation:?}; applied \
+                             generation={generation}"
                         ));
-                        self.native_video_mode_switch = None;
                     }
                     Some(_) => {
+                        // stale かつ pending target とも不一致: 反映しない (巻き戻し防止)。
+                        // committed 世代だけは上で進めているので close の stale 判定は正しい。
                         crate::logger::log(format!(
                             "[native-video] PlacementSwitched request={request_id} did not match \
-                             pending; applied actual presentation {presentation:?}; pending still active"
+                             pending; NOT applying {presentation:?} generation={generation}; \
+                             pending still active"
                         ));
                     }
                     None => {
+                        // pending 無し = presenter 主導の収束。現状に合わせて反映する。
+                        self.apply_video_presentation_switched(presentation);
                         crate::logger::log(format!(
                             "[native-video] PlacementSwitched request={request_id} arrived with \
-                             no pending; applied actual presentation {presentation:?}"
+                             no pending; applied {presentation:?} generation={generation}"
                         ));
                     }
                 }
@@ -2236,8 +2292,8 @@ impl App {
             return;
         }
         match event {
-            crate::video::native_window::NativeVideoWindowEvent::CloseRequested => {
-                if self.native_video_close_suppressed_after_switch("window_close_requested") {
+            crate::video::native_window::NativeVideoWindowEvent::CloseRequested { generation } => {
+                if !self.accept_native_video_close(fs_idx, generation, "window_close_requested") {
                     return;
                 }
                 self.close_fullscreen();

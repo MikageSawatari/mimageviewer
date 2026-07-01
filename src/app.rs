@@ -5682,10 +5682,6 @@ pub struct App {
     /// `native_video_mode_switch` の `request_id` 採番用の単調増加カウンタ。
     native_video_mode_switch_seq: u64,
     #[cfg(windows)]
-    /// Native presenter の placement switch 直後、旧 presenter teardown 由来で
-    /// 遅れて届く close を抑止する期限。
-    native_video_ignore_close_until: Option<std::time::Instant>,
-    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -7048,8 +7044,6 @@ impl App {
             native_video_mode_switch: None,
             #[cfg(windows)]
             native_video_mode_switch_seq: 0,
-            #[cfg(windows)]
-            native_video_ignore_close_until: None,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -40337,7 +40331,16 @@ impl App {
             // 古い epoch=0 のイベントと区別できないため)。
             // ToggleWindowMode (Plan B) は presenter を破棄せず `SwitchPlacement`
             // コマンドを送るだけで source_epoch も変わらないため terminal ではない。
-            let terminal = matches!(event, crate::video::NativeVideoOutputEvent::CloseFullscreen);
+            //
+            // ただし **stale 世代の CloseFullscreen (= 旧 presenter window 由来)** は
+            // 棄却して presenter を生かすため terminal 扱いにしない。terminal にすると
+            // 現世代の後続イベントを取りこぼす。世代照合は handler と同じ committed で行う。
+            let terminal = match &event {
+                crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
+                    self.native_video_close_generation_accepted(idx, *generation)
+                }
+                _ => false,
+            };
             self.handle_native_video_output_event(ctx, idx, epoch, event);
             if terminal {
                 break;

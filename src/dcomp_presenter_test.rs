@@ -117,6 +117,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         close_on_escape: true,
         post_quit_on_destroy: true,
         event_tx: Some(event_tx),
+        generation: 0,
     })?;
     let gpu = if config.force_sw {
         None

@@ -16653,28 +16653,46 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn video_presentation_switch_suppresses_stale_close_events() {
+    fn native_video_close_generation_gate_rejects_only_older_generations() {
+        // placement switch で作り直された旧 window 由来の遅延 close (= 現世代より小さい
+        // 世代トークン) だけを stale として棄却する。現世代 / 未来世代の close は受理。
+        // 時間窓 (旧 500ms band-aid) を置き換える因果ベース判定の核。
+        assert!(
+            App::native_video_close_generation_is_current(1, 1),
+            "close from the live generation must be accepted"
+        );
+        assert!(
+            App::native_video_close_generation_is_current(2, 1),
+            "a close newer than committed (skew before PlacementSwitched applies) must be accepted"
+        );
+        assert!(
+            !App::native_video_close_generation_is_current(1, 2),
+            "a close from the torn-down older window must be rejected"
+        );
+        assert!(
+            App::native_video_close_generation_is_current(0, 0),
+            "the initial (pre-switch) state accepts generation-1 closes against committed=0"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_video_close_generation_defaults_to_committed_zero_without_native_output() {
+        // テスト player は native_output を持たないので committed=0 とみなし、初回 window
+        // (世代 1) の close は必ず受理される。placement switch の実 rebuild を経ない限り
+        // 世代は進まない = 誤棄却しない。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 1,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-        });
 
-        app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
-
-        assert!(
-            app.native_video_close_suppressed_after_switch("test"),
-            "old native presenter teardown can emit a stale close just after placement switch"
+        assert_eq!(
+            app.native_video_committed_generation_for(video),
+            0,
+            "a player without a live presenter reports committed generation 0"
         );
-
-        app.native_video_ignore_close_until =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
         assert!(
-            !app.native_video_close_suppressed_after_switch("test_expired"),
-            "real close requests should be accepted after the short switch grace expires"
+            app.native_video_close_generation_accepted(video, 1),
+            "the first window's generation-1 close must be honored against committed=0"
         );
     }
 

@@ -348,12 +348,19 @@ pub enum NativeVideoOutputEvent {
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
-    CloseFullscreen,
+    /// フルスクリーン終了要求。`generation` は要求を出した presenter placement 世代。
+    /// placement switch 直後に旧世代由来で遅れて届く close を App 側が棄却するために使う。
+    CloseFullscreen {
+        generation: u64,
+    },
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
     PlacementSwitched {
         request_id: u64,
         placement: NativeVideoPlacement,
+        /// 切替後 (= 現在 live な) presenter window の placement 世代。App は
+        /// `committed_generation` をこの値まで進め、旧世代 close を棄却する。
+        generation: u64,
     },
     PlacementSwitchFailed {
         request_id: u64,
@@ -688,6 +695,12 @@ pub(crate) struct NativeVideoOutput {
     /// app/native_video.rs (bin 専属) からのみ参照されるため lib build では dead に見える。
     #[allow(dead_code)]
     source_epoch: Arc<AtomicU64>,
+    /// App 側が「信頼する」現在の presenter placement 世代。`PlacementSwitched` を
+    /// 受けるたびに単調非減少で進め、これより古い世代の close を stale として棄却する。
+    /// presenter thread とは共有しない (App = UI thread 専用) が、fast-swap の
+    /// `take/attach_native_output` で presenter と一緒に運ばれるため lifetime 正しい。
+    #[allow(dead_code)]
+    committed_generation: AtomicU64,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
@@ -792,6 +805,7 @@ impl NativeVideoOutput {
             closed,
             perf_overlay_visible,
             source_epoch,
+            committed_generation: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             command_tx,
@@ -830,6 +844,23 @@ impl NativeVideoOutput {
     #[allow(dead_code)]
     fn source_epoch(&self) -> u64 {
         self.source_epoch.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    fn committed_generation(&self) -> u64 {
+        self.committed_generation.load(Ordering::Acquire)
+    }
+
+    /// `PlacementSwitched` を受けたときに App が呼ぶ。世代は単調非減少 (max) で進める。
+    /// stale (request mismatch / out-of-order) な PlacementSwitched でも、presenter の
+    /// 現世代を追い越すことは無いので max で吸収する。
+    #[allow(dead_code)]
+    fn bump_committed_generation(&self, generation: u64) {
+        let cur = self.committed_generation.load(Ordering::Acquire);
+        if generation > cur {
+            self.committed_generation
+                .store(generation, Ordering::Release);
+        }
     }
 
     fn set_perf_overlay_visible(&self, visible: bool) {
@@ -1440,6 +1471,7 @@ fn send_native_output_event(
 fn send_native_overlay_command(
     tx: &std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
     source_epoch: u64,
+    generation: u64,
     command: crate::video::native_presenter::NativeOverlayCommand,
 ) {
     use crate::video::native_presenter::NativeOverlayCommand as Command;
@@ -1455,7 +1487,7 @@ fn send_native_overlay_command(
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
-        Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen,
+        Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen { generation },
         Command::ToggleWindowMode => NativeVideoOutputEvent::ToggleWindowMode,
         Command::SetVst3PanelVisible { visible } => {
             NativeVideoOutputEvent::SetVst3PanelVisible { visible }
@@ -1660,6 +1692,10 @@ fn run_native_video_output(
     let _com = NativeComApartment::init()?;
     let width = (config.rect.right - config.rect.left).max(1) as u32;
     let height = (config.rect.bottom - config.rect.top).max(1) as u32;
+    // placement switch で window を rebuild するたびに +1 する presenter 世代。
+    // 初回 window は世代 1。close イベント (`CloseFullscreen` / `CloseRequested`) に
+    // この値を焼き込み、App 側が「現世代より古い close」を stale として棄却する。
+    let mut cur_generation: u64 = 1;
     let (presenter_event_tx, presenter_event_rx) = std::sync::mpsc::channel();
     let mut window = crate::video::native_window::NativeVideoWindow::create(
         crate::video::native_window::NativeVideoWindowConfig {
@@ -1672,6 +1708,7 @@ fn run_native_video_output(
             // this loop and does not affect eframe's main event loop.
             post_quit_on_destroy: true,
             event_tx: Some(presenter_event_tx.clone()),
+            generation: cur_generation,
         },
     )?;
     if cancel.load(Ordering::Acquire) {
@@ -2437,17 +2474,23 @@ fn run_native_video_output(
                         if placement.is_child_window() {
                             last_parent_client_size = (new_width, new_height);
                         }
+                        // 同一 placement の rect 更新は window を rebuild しないので世代は
+                        // 据え置き (= detached resize で close 抑止が誤発火しない)。
                         let _ = ui_event_tx.send((
                             source.source_epoch,
                             NativeVideoOutputEvent::PlacementSwitched {
                                 request_id,
                                 placement,
+                                generation: cur_generation,
                             },
                         ));
                     } else {
                         let new_width = (new_rect.right - new_rect.left).max(1) as u32;
                         let new_height = (new_rect.bottom - new_rect.top).max(1) as u32;
                         let new_mode = native_window_mode_for_placement(placement, new_rect);
+                        // window を rebuild するので presenter 世代を進める。旧 HWND から
+                        // 遅れて届く close は旧世代のまま → App が棄却できる。
+                        cur_generation = cur_generation.wrapping_add(1);
                         let new_window_result =
                             crate::video::native_window::NativeVideoWindow::create(
                                 crate::video::native_window::NativeVideoWindowConfig {
@@ -2460,6 +2503,7 @@ fn run_native_video_output(
                                     close_on_escape: false,
                                     post_quit_on_destroy: true,
                                     event_tx: Some(presenter_event_tx.clone()),
+                                    generation: cur_generation,
                                 },
                             );
                         match new_window_result {
@@ -2683,7 +2727,8 @@ fn run_native_video_output(
                                             "[native-video] placement switched \
                                              placement={} hwnd=0x{:x} \
                                              {new_width}x{new_height} shown={shown} \
-                                             primed={primed}",
+                                             primed={primed} request={request_id} \
+                                             generation={cur_generation}",
                                             placement.label(),
                                             window.hwnd().0 as usize,
                                         ));
@@ -2692,6 +2737,7 @@ fn run_native_video_output(
                                             NativeVideoOutputEvent::PlacementSwitched {
                                                 request_id,
                                                 placement,
+                                                generation: cur_generation,
                                             },
                                         ));
                                     }
@@ -2944,7 +2990,9 @@ fn run_native_video_output(
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::CloseFullscreen,
+                                    NativeVideoOutputEvent::CloseFullscreen {
+                                        generation: cur_generation,
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleWindowMode => {
@@ -3294,7 +3342,12 @@ fn run_native_video_output(
             ) {
                 Ok(outcome) => {
                     for command in outcome.commands {
-                        send_native_overlay_command(&ui_event_tx, source.source_epoch, command);
+                        send_native_overlay_command(
+                            &ui_event_tx,
+                            source.source_epoch,
+                            cur_generation,
+                            command,
+                        );
                     }
                 }
                 Err(err) => {
@@ -5147,6 +5200,25 @@ impl VideoPlayer {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::source_epoch)
+    }
+
+    /// App が信頼する現在の presenter placement 世代 (native_output があるときのみ)。
+    /// close イベントの世代がこの値より小さければ stale として棄却する。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn native_committed_generation(&self) -> Option<u64> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::committed_generation)
+    }
+
+    /// `PlacementSwitched` 受信時に committed 世代を進める (単調非減少)。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn bump_native_committed_generation(&self, generation: u64) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.bump_committed_generation(generation);
+        }
     }
 
     #[cfg(windows)]

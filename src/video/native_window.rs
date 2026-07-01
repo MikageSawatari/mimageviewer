@@ -60,7 +60,12 @@ pub enum NativeVideoImeEvent {
 pub enum NativeVideoWindowEvent {
     /// 通常のウィンドウ操作 (`×` / Alt+F4 / taskbar close) による close request。
     /// App 側で viewer session close に接続し、stale `fullscreen_idx` を残さないために使う。
-    CloseRequested,
+    /// `generation` は close を出した HWND の placement 世代 (`WindowState.generation`)。
+    /// placement switch で旧 HWND が teardown されたあとに遅れて届く stale close を
+    /// App 側が現世代と比較して棄却するために焼き込む。
+    CloseRequested {
+        generation: u64,
+    },
     KeyDown(NativeVideoKeyEvent),
     KeyUp(NativeVideoKeyEvent),
     Text(char),
@@ -161,6 +166,11 @@ pub struct NativeVideoWindowConfig {
     pub close_on_escape: bool,
     pub post_quit_on_destroy: bool,
     pub event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
+    /// この HWND を生成した presenter placement 世代。placement switch で
+    /// window を rebuild するたびに presenter 側で +1 され、`WM_CLOSE` が
+    /// `CloseRequested { generation }` に焼き込む。App 側は「現世代より古い
+    /// close」を stale として棄却する (旧 HWND teardown 由来の遅延 close 対策)。
+    pub generation: u64,
 }
 
 impl NativeVideoWindowConfig {
@@ -173,6 +183,7 @@ impl NativeVideoWindowConfig {
             close_on_escape: true,
             post_quit_on_destroy: true,
             event_tx: None,
+            generation: 0,
         }
     }
 }
@@ -186,6 +197,9 @@ struct WindowState {
     post_quit_on_destroy: bool,
     event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
     ime_preediting: bool,
+    /// `NativeVideoWindowConfig.generation` の焼き込み。`WM_CLOSE` で
+    /// `CloseRequested { generation }` を stamp するために保持する。
+    generation: u64,
 }
 
 /// T31 (Codex P2 / 2026-05-16): クラス登録を 1 回に集約し、戻り値を見て
@@ -403,6 +417,7 @@ impl NativeVideoWindow {
                 post_quit_on_destroy: config.post_quit_on_destroy,
                 event_tx: config.event_tx,
                 ime_preediting: false,
+                generation: config.generation,
             });
             let state_ptr = Box::into_raw(state);
             let owner_hwnd = if config.owner_hwnd != 0 {
@@ -1133,8 +1148,12 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_CLOSE => {
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                let _ = tx.send(NativeVideoWindowEvent::CloseRequested);
+            if let Some(state) = window_state(hwnd)
+                && let Some(tx) = state.event_tx.as_ref()
+            {
+                let _ = tx.send(NativeVideoWindowEvent::CloseRequested {
+                    generation: state.generation,
+                });
             }
             unsafe {
                 let _ = DestroyWindow(hwnd);

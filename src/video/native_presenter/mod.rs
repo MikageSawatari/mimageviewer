@@ -1369,7 +1369,7 @@ impl NativeOverlayInputRouting {
                 !self.wants_pointer_input && !self.modal_dialog_active
             }
             // native viewer の close は App 側でセッション終了として扱う。
-            NativeEvent::CloseRequested => true,
+            NativeEvent::CloseRequested { .. } => true,
             // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
@@ -4224,7 +4224,7 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             // viewer close は App 側に転送し、overlay には流さない。
-            NativeEvent::CloseRequested => {}
+            NativeEvent::CloseRequested { .. } => {}
             // 内部処理イベント (presenter thread が直接消費する)。overlay には流さない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
