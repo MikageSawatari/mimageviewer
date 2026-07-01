@@ -774,7 +774,11 @@ impl App {
                     self.close_fullscreen();
                     return;
                 }
-                crate::video::NativeVideoOutputEvent::PlacementSwitched { generation, .. } => {
+                crate::video::NativeVideoOutputEvent::PlacementSwitched {
+                    request_id,
+                    placement,
+                    generation,
+                } => {
                     // source swap 中の placement switch も committed を追随させる。退避中の
                     // native_output atomic に write-through して、swap 完了で native_output が
                     // fs_cache へ戻ったあとの通常 handler でも正しい committed が見えるようにする。
@@ -782,6 +786,12 @@ impl App {
                     if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
                         pending.native_output.bump_committed_generation(generation);
                     }
+                    // presentation/session も通常経路と同じロジックで反映する。ここで落とすと
+                    // in-flight な F12 switch が native_video_mode_switch を取り残し、swap 完了
+                    // 後に viewer_presentation が古いまま divergence する (Codex 再レビュー)。
+                    self.apply_native_video_placement_switch_state(
+                        request_id, placement, generation,
+                    );
                 }
                 _ => {}
             }
@@ -1941,6 +1951,63 @@ impl App {
         ));
     }
 
+    /// `PlacementSwitched` の presentation 反映部分 (committed 世代の更新は呼び出し側が
+    /// path 別に済ませてから呼ぶ)。通常経路 (`handle_native_video_output_event`) と
+    /// source swap drain の両方から使い、placement 反映ロジックが分岐しないようにする
+    /// (Codex 再レビュー: source swap 中に PlacementSwitched が来ても presentation/session
+    /// を確実に反映し、`native_video_mode_switch` を取り残さない)。
+    ///
+    /// **P1-1**: request_id 一致 (または pending target への収束) を先に判定し、一致時だけ
+    /// presentation/session/settings を反映する。stale/mismatch な成功通知で新状態を巻き
+    /// 戻さないため。
+    #[cfg(windows)]
+    fn apply_native_video_placement_switch_state(
+        &mut self,
+        request_id: u64,
+        placement: crate::video::NativeVideoPlacement,
+        generation: u64,
+    ) {
+        let presentation = Self::native_video_placement_to_viewer_presentation(placement);
+        match self.native_video_mode_switch {
+            Some(p) if p.request_id == request_id => {
+                self.apply_video_presentation_switched(presentation);
+                self.native_video_mode_switch = None;
+                crate::logger::log(format!(
+                    "[native-video] PlacementSwitched request={request_id} matched pending; \
+                     applied {presentation:?} generation={generation}"
+                ));
+            }
+            Some(p) if p.target_presentation == presentation => {
+                // request_id はズレたが presenter が pending の目標に収束した。
+                // 目標一致なので反映してよい (Codex 再 P2 の「収束」ケース)。
+                self.apply_video_presentation_switched(presentation);
+                self.native_video_mode_switch = None;
+                crate::logger::log(format!(
+                    "[native-video] PlacementSwitched request={request_id} stale but \
+                     presenter converged to pending target {presentation:?}; applied \
+                     generation={generation}"
+                ));
+            }
+            Some(_) => {
+                // stale かつ pending target とも不一致: 反映しない (巻き戻し防止)。
+                // committed 世代だけは呼び出し側で進めているので close の stale 判定は正しい。
+                crate::logger::log(format!(
+                    "[native-video] PlacementSwitched request={request_id} did not match \
+                     pending; NOT applying {presentation:?} generation={generation}; \
+                     pending still active"
+                ));
+            }
+            None => {
+                // pending 無し = presenter 主導の収束。現状に合わせて反映する。
+                self.apply_video_presentation_switched(presentation);
+                crate::logger::log(format!(
+                    "[native-video] PlacementSwitched request={request_id} arrived with \
+                     no pending; applied {presentation:?} generation={generation}"
+                ));
+            }
+        }
+    }
+
     /// close イベントの世代トークンが現在の committed 世代以上かを判定する pure ロジック。
     /// `generation < committed` = placement switch で作り直された旧 window 由来の
     /// 遅延 close → stale として棄却する。時間窓 (旧 500ms band-aid) を置き換える因果判定。
@@ -2117,52 +2184,11 @@ impl App {
                 placement,
                 generation,
             } => {
-                let presentation = Self::native_video_placement_to_viewer_presentation(placement);
                 // committed 世代は apply の可否に関わらず単調非減少で進める。generation は
                 // presenter が焼いた「現 live window 世代」なので、これで close の stale
                 // 判定基準が常に最新に追随する (旧 window の close だけが古い世代で残る)。
                 self.bump_native_video_committed_generation(fs_idx, generation);
-                // **P1-1**: request_id 一致 (または pending target への収束) を先に判定し、
-                // 一致時だけ presentation/session/settings を反映する。旧実装は照合前に
-                // 無条件 apply していたため、stale/mismatch な成功通知が新状態を巻き戻した。
-                match self.native_video_mode_switch {
-                    Some(p) if p.request_id == request_id => {
-                        self.apply_video_presentation_switched(presentation);
-                        self.native_video_mode_switch = None;
-                        crate::logger::log(format!(
-                            "[native-video] PlacementSwitched request={request_id} matched pending; \
-                             applied {presentation:?} generation={generation}"
-                        ));
-                    }
-                    Some(p) if p.target_presentation == presentation => {
-                        // request_id はズレたが presenter が pending の目標に収束した。
-                        // 目標一致なので反映してよい (Codex 再 P2 の「収束」ケース)。
-                        self.apply_video_presentation_switched(presentation);
-                        self.native_video_mode_switch = None;
-                        crate::logger::log(format!(
-                            "[native-video] PlacementSwitched request={request_id} stale but \
-                             presenter converged to pending target {presentation:?}; applied \
-                             generation={generation}"
-                        ));
-                    }
-                    Some(_) => {
-                        // stale かつ pending target とも不一致: 反映しない (巻き戻し防止)。
-                        // committed 世代だけは上で進めているので close の stale 判定は正しい。
-                        crate::logger::log(format!(
-                            "[native-video] PlacementSwitched request={request_id} did not match \
-                             pending; NOT applying {presentation:?} generation={generation}; \
-                             pending still active"
-                        ));
-                    }
-                    None => {
-                        // pending 無し = presenter 主導の収束。現状に合わせて反映する。
-                        self.apply_video_presentation_switched(presentation);
-                        crate::logger::log(format!(
-                            "[native-video] PlacementSwitched request={request_id} arrived with \
-                             no pending; applied {presentation:?} generation={generation}"
-                        ));
-                    }
-                }
+                self.apply_native_video_placement_switch_state(request_id, placement, generation);
             }
             crate::video::NativeVideoOutputEvent::PlacementSwitchFailed { request_id } => {
                 match self.native_video_mode_switch {
