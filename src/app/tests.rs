@@ -16742,33 +16742,36 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_video_host_resync_only_reparents_when_child_host_lost() {
-        // death-gate: 現 child host が生きている間は (host が過渡ジオメトリでも) 再親付けせず
-        // 要求を破棄する。child host が破棄されて初めて、確定を待って再親付けする。
+    fn detached_video_host_resync_noop_without_live_presenter() {
+        // death-gate: 判定は presenter が publish している child HWND の生存で行う。テスト
+        // player は native_output を持たない (= publish HWND が 0) ので「presenter 未確立」
+        // 扱いになり、host が過渡ジオメトリでも再親付けせず要求を破棄する。実際の
+        // 「child 破棄 → 再親付け」経路は live な presenter が要るため実機/統合で検証する。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.native_video_mode_switch = None;
 
-        // child host 健在 (0 = 追跡なしも「死んでいない」扱い) → host 過渡でも追従せず破棄。
-        app.detached_video_child_host_hwnd = 0;
         app.detached_viewer_host_geometry_settled = false;
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
         assert!(
             !app.pending_detached_video_host_resync,
-            "a live/absent child host means no re-parent even on a transient host change"
+            "with no live presenter (published hwnd=0) there is nothing to re-parent; drop the request"
         );
 
-        // child host が死亡 (存在しない HWND) かつ host 未確定 → 確定待ちで要求を保持する。
-        app.detached_video_child_host_hwnd = 0xdead;
-        app.detached_viewer_host_geometry_settled = false;
+        // 切替進行中は (child 生存に関わらず) 保留する。
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 3,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
         assert!(
             app.pending_detached_video_host_resync,
-            "a dead child host with unsettled geometry waits for settle (retains the request)"
+            "a placement switch in flight retains the resync request"
         );
     }
 
@@ -16812,22 +16815,16 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_video_host_resync_poll_clears_tracking_when_not_detached() {
-        // detached 動画でなくなったら、次 session へ stale な child host / 再親付け要求を
-        // 持ち越さないよう毎フレーム掃除する。
+    fn detached_video_host_resync_poll_drops_request_when_not_detached() {
+        // detached 動画でなくなったら、次 session へ再親付け要求を持ち越さないよう掃除する。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.detached_video_child_host_hwnd = 0x1234;
         app.pending_detached_video_host_resync = true;
 
         app.poll_detached_video_host_resync();
 
-        assert_eq!(
-            app.detached_video_child_host_hwnd, 0,
-            "leaving detached must clear the tracked child host"
-        );
         assert!(
             !app.pending_detached_video_host_resync,
             "leaving detached must drop the pending resync request"

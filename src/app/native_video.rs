@@ -612,37 +612,46 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn try_resync_detached_video_host(&mut self) -> bool {
         if !self.detached_video_presentation_active_or_targeted() {
-            self.detached_video_child_host_hwnd = 0; // detached を離れた → 追跡クリア
             return true; // 再親付け対象でない → 要求は破棄してよい
         }
         if self.native_video_mode_switch.is_some() {
             return false; // 切替中は重ねられない。完了後に再試行
         }
-        // **child host が生きている間は再親付けしない (death-gate)**。egui は detached
+        // **presenter child が生きている間は再親付けしない (death-gate)**。egui は detached
         // viewport を作り直す過程で「別の既定位置 host 窓」を一瞬見せる (host_generation が
-        // 上がる) が、現 child の host が生きていれば映像はそこに正しく (fit で) 出ている。
-        // その live な host 変更を追って rebuild すると、追加の presenter 窓が一瞬「拡大された
-        // 古いフレーム」や黒を出す = 実機で見えていた乱れの主因。よって **旧 host が実際に
-        // 破棄されて映像が黒に落ちたときだけ**、現 host へ再親付けして復旧する。旧 host が
-        // 生き続ける限り追従しない (presenter は post_quit_on_destroy=false で生存)。
-        let child_host = self.detached_video_child_host_hwnd;
-        let child_host_dead =
-            child_host != 0 && !crate::video::native_window::is_window_alive(child_host);
-        if !child_host_dead {
-            // child host 健在 = 映像は正しく出ている → 追従不要。要求は破棄。
-            return true;
+        // 上がる) が、現 child が生きていれば映像はそこに正しく (fit で) 出ている。その live な
+        // host 変更を追って rebuild すると、追加の presenter 窓が一瞬「拡大された古いフレーム」
+        // や黒を出す = 実機で見えていた乱れの主因。よって **child (WS_CHILD) が host teardown で
+        // 道連れ破棄されて映像が黒に落ちたときだけ**、現 host へ再親付けして復旧する。
+        //
+        // 判定は presenter が publish している HWND の生存で行う (手動追跡フィールドは
+        // switch 送信時に楽観 set され rebuild 失敗/初回 open で stale になるため使わない
+        // = Codex 指摘。publish HWND は常に「今実際に出している窓」を指す committed 値)。
+        let child_hwnd = self
+            .fullscreen_idx
+            .and_then(|idx| match self.fs_cache.get(&idx) {
+                Some(FsCacheEntry::Video { player, .. }) => Some(player.native_presenter_hwnd()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if child_hwnd == 0 {
+            return true; // presenter 未確立 → 追従不要
         }
-        // child host が破棄された (映像が黒)。現 host が保存配置に確定してから再親付けする
+        if crate::video::native_window::is_window_alive(child_hwnd) {
+            return true; // child 健在 = 映像は出ている → 追従不要。要求は破棄。
+        }
+        // child が破棄された (映像が黒)。現 host が保存配置に確定してから再親付けする
         // (過渡的な小サイズ host へ移すと縮みちらつきになるため settled を待つ)。未確定なら
-        // フラグを保持して次フレーム再試行。
+        // フラグを保持して次フレーム再試行。rebuild 失敗時も child は dead のまま残るので
+        // 次フレームで再試行される (retry は取りこぼさない)。
         if !self.detached_viewer_host_geometry_settled {
             return false;
         }
         let queued = self.sync_detached_video_child_presenter_rect();
         if queued {
             crate::logger::log(format!(
-                "[native-video] detached child host lost -> resync presenter child to current \
-                 host=0x{:x} host_generation={}",
+                "[native-video] detached child (hwnd=0x{child_hwnd:x}) lost -> resync presenter \
+                 child to current host=0x{:x} host_generation={}",
                 self.detached_viewer_host_hwnd, self.detached_viewer_host_generation
             ));
         }
@@ -653,10 +662,8 @@ impl App {
     /// 現 host へ再親付けして黒表示を復旧する (death-gate)。child host 健在なら no-op。
     #[cfg(windows)]
     pub(super) fn poll_detached_video_host_resync(&mut self) {
-        // detached 動画でなくなったら追跡状態を毎フレーム掃除する (次 session へ stale な
-        // child host / 要求を持ち越さない)。
+        // detached 動画でなくなったら再親付け要求を掃除する (次 session へ持ち越さない)。
         if !self.detached_video_presentation_active_or_targeted() {
-            self.detached_video_child_host_hwnd = 0;
             self.pending_detached_video_host_resync = false;
             return;
         }
@@ -1855,14 +1862,6 @@ impl App {
                 target_presentation,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             });
-            // detached へ切り替えるときは child がぶら下がる host を記録する
-            // (settled 待ち bypass の「host 死亡」判定用)。detached 以外はクリア。
-            self.detached_video_child_host_hwnd =
-                if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                    owner_hwnd
-                } else {
-                    0
-                };
         }
         crate::logger::log(format!(
             "[native-video] switch placement request={request_id} \
@@ -1909,8 +1908,6 @@ impl App {
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
         });
-        // child がぶら下がる host を記録する (settled 待ち bypass の「host 死亡」判定用)。
-        self.detached_video_child_host_hwnd = owner_hwnd;
         crate::logger::log(format!(
             "[native-video] sync detached child rect request={request_id} \
              owner=0x{owner_hwnd:x} rect=({},{} {}x{})",
