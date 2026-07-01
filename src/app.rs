@@ -5682,6 +5682,10 @@ pub struct App {
     /// `native_video_mode_switch` の `request_id` 採番用の単調増加カウンタ。
     native_video_mode_switch_seq: u64,
     #[cfg(windows)]
+    /// Native presenter の placement switch 直後、旧 presenter teardown 由来で
+    /// 遅れて届く close を抑止する期限。
+    native_video_ignore_close_until: Option<std::time::Instant>,
+    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -7044,6 +7048,8 @@ impl App {
             native_video_mode_switch: None,
             #[cfg(windows)]
             native_video_mode_switch_seq: 0,
+            #[cfg(windows)]
+            native_video_ignore_close_until: None,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]

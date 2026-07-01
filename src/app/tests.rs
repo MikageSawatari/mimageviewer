@@ -16653,6 +16653,33 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn video_presentation_switch_suppresses_stale_close_events() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 1,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+
+        app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
+
+        assert!(
+            app.native_video_close_suppressed_after_switch("test"),
+            "old native presenter teardown can emit a stale close just after placement switch"
+        );
+
+        app.native_video_ignore_close_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert!(
+            !app.native_video_close_suppressed_after_switch("test_expired"),
+            "real close requests should be accepted after the short switch grace expires"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_image_edit_tools_are_available_only_for_linked_viewer() {
         let mut app = setup_app();
         let image = push_image(&mut app, r"C:\pics\a.jpg");

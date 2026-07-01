@@ -741,6 +741,9 @@ impl App {
                     self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
                 }
                 crate::video::NativeVideoOutputEvent::CloseFullscreen => {
+                    if self.native_video_close_suppressed_after_switch("source_swap_close") {
+                        continue;
+                    }
                     self.close_fullscreen();
                     return;
                 }
@@ -1860,6 +1863,9 @@ impl App {
     /// 「ユーザーが見ていない未確定モード」が次回起動時に持ち越される。
     #[cfg(windows)]
     pub(crate) fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
+        if self.native_video_mode_switch.is_some() {
+            self.suppress_native_video_close_after_placement_switch();
+        }
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
@@ -1900,6 +1906,33 @@ impl App {
         crate::logger::log(format!(
             "[native-video] presentation switch applied -> {presentation:?}"
         ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn suppress_native_video_close_after_placement_switch(&mut self) {
+        self.native_video_ignore_close_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_close_suppressed_after_switch(
+        &mut self,
+        reason: &'static str,
+    ) -> bool {
+        let Some(until) = self.native_video_ignore_close_until else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now < until {
+            crate::logger::log(format!(
+                "[native-video] ignore stale close after placement switch: reason={reason} \
+                 remaining_ms={:.1}",
+                until.saturating_duration_since(now).as_secs_f64() * 1000.0
+            ));
+            return true;
+        }
+        self.native_video_ignore_close_until = None;
+        false
     }
 
     /// Plan B: presenter から `PlacementSwitchFailed` を受けたときに呼ぶ。presenter は
@@ -2001,6 +2034,9 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::CloseFullscreen => {
+                if self.native_video_close_suppressed_after_switch("output_close") {
+                    return;
+                }
                 self.close_fullscreen();
             }
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
@@ -2201,6 +2237,9 @@ impl App {
         }
         match event {
             crate::video::native_window::NativeVideoWindowEvent::CloseRequested => {
+                if self.native_video_close_suppressed_after_switch("window_close_requested") {
+                    return;
+                }
                 self.close_fullscreen();
             }
             event if self.ime_input_active() => {
