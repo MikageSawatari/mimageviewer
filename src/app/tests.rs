@@ -166,6 +166,23 @@ fn scan_directory_keeps_source_when_upscaled_sidecar_is_missing() {
 }
 
 #[test]
+fn scan_directory_keeps_companion_audio_when_derivative_exists() {
+    // 音声はアップスケール動画の companion ではないので、同 stem でも隠さない (Codex P2)。
+    // 元動画 movie.mp4 と companion 画像 movie.jpg は隠れるが、音声 movie.mp3 は残る。
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+    std::fs::write(tmp.path().join("movie.jpg"), b"cover").unwrap();
+    std::fs::write(tmp.path().join("movie.mp3"), b"audio").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+    assert_eq!(
+        scan_media_names(tmp.path()),
+        vec!["movie.miv.mkv", "movie.mp3"]
+    );
+}
+
+#[test]
 fn scan_directory_keeps_sources_when_upscaled_stem_is_ambiguous() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("movie.mp4"), b"source-a").unwrap();

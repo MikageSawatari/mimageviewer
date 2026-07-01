@@ -14749,8 +14749,18 @@ impl App {
         self.persist_pending_view_trim_state();
         self.items = items;
         self.image_metas = image_metas;
-        self.thumbnails = (0..self.items.len())
-            .map(|_| ThumbnailState::Pending)
+        self.thumbnails = self
+            .items
+            .iter()
+            .map(|item| match item {
+                // 音声は固定の音楽アイコンで描画し、サムネイルをロードしない (D2)。
+                // Pending のままだと「読み込み中」に数えられて prefetch 抑制や毎フレーム
+                // repaint を誘発する (Codex P2)。初期状態を terminal (= 非ロード・非リクエスト)
+                // にして「これ以上ロードしない」と扱わせる。grid_paint の Audio アームは
+                // thumb 状態を無視してアイコンを描くので見た目に影響はない。
+                GridItem::Audio(_) => ThumbnailState::Failed,
+                _ => ThumbnailState::Pending,
+            })
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
         self.view_trim_mode = false;
@@ -28114,13 +28124,14 @@ impl App {
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
                 self.page_path_key(idx)
             }
-            // Video は単一ファイルだがパス正規化はコンテナと同じ規則 (DB キーは
+            // Video / Audio は単一ファイルだがパス正規化はコンテナと同じ規則 (DB キーは
             // フルパス normalize)。leaf vs container の分類は `is_rating_leaf` /
             // `is_container_ratable` で行う。
             GridItem::Folder(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p)
-            | GridItem::Video(p) => Some(crate::adjustment_db::normalize_path(p)),
+            | GridItem::Video(p)
+            | GridItem::Audio(p) => Some(crate::adjustment_db::normalize_path(p)),
             GridItem::ConvertibleArchive { path, .. } => {
                 Some(crate::adjustment_db::normalize_path(path))
             }

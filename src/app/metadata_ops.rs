@@ -183,6 +183,7 @@ pub(super) fn tag_item_path(item: &GridItem) -> Option<&Path> {
         GridItem::Folder(p)
         | GridItem::Image(p)
         | GridItem::Video(p)
+        | GridItem::Audio(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p)
         | GridItem::ConvertibleArchive { path: p, .. } => Some(p.as_path()),

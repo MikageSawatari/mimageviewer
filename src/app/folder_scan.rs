@@ -152,8 +152,14 @@ pub(super) fn filter_upscaled_video_pairs_fast(
         return;
     }
 
-    all_media.retain(|(path, _, _, _)| {
+    all_media.retain(|(path, kind, _, _)| {
         if is_miv_upscaled_derivative(path) {
+            return true;
+        }
+        // 音声はアップスケール動画の companion ではない (例: song.mp3 と song.miv.mkv は
+        // 別メディア) ので、同一 stem でも常に残す (Codex P2)。元動画と companion 画像
+        // (sidecar サムネ等) は従来どおり同一 stem のとき隠す。
+        if *kind == ScanMediaKind::Audio {
             return true;
         }
         file_stem_ci(path).is_none_or(|stem| !derivative_source_stems.contains(&stem))
