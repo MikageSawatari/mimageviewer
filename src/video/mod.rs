@@ -2068,9 +2068,33 @@ fn run_native_video_output(
             }
         }
 
+        // command は WM_QUIT の**前に**回収しておく。detached の host 再親付け
+        // (`SwitchPlacement`) が queue に居るのに、旧 host 破棄の巻き添えで子 presenter
+        // HWND が WM_DESTROY → PostQuitMessage を出すと、pump_thread_messages が先に
+        // WM_QUIT を拾って loop を抜け、再親付けを処理できないまま presenter が死ぬ
+        // (= detached 動画の再生終了バグの本質)。SwitchPlacement が pending なら WM_QUIT を
+        // fatal 扱いにせず、下の command 処理で rebuild する (rebuild 内の
+        // discard_pending_quit_messages_for_host_switch が残存 WM_QUIT を掃除する)。
+        let mut drained_commands: Vec<NativeVideoOutputCommand> = Vec::new();
+        while let Ok(command) = command_rx.try_recv() {
+            drained_commands.push(command);
+        }
+        let has_pending_placement_switch = drained_commands
+            .iter()
+            .any(|c| matches!(c, NativeVideoOutputCommand::SwitchPlacement { .. }));
+
         if crate::video::native_window::pump_thread_messages() {
-            closed.store(true, Ordering::Release);
-            break;
+            if has_pending_placement_switch {
+                crate::logger::log(
+                    "[native-video] WM_QUIT observed but honoring pending SwitchPlacement \
+                     (detached host re-parent); presenter kept alive"
+                        .to_string(),
+                );
+                // break しない: 下の command 処理へ落として rebuild する。
+            } else {
+                closed.store(true, Ordering::Release);
+                break;
+            }
         }
         let now = Instant::now();
         if crate::perf::is_enabled() {
@@ -2195,7 +2219,7 @@ fn run_native_video_output(
         }
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
-        while let Ok(command) = command_rx.try_recv() {
+        for command in drained_commands {
             match command {
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
                     presenter.set_overlay_hover_thumbnail(thumbnail);
