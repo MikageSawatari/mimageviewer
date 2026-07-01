@@ -2148,6 +2148,16 @@ impl App {
             "[native-video] placement switch failed (target={target_presentation:?}); \
              pending cleared (settings was never persisted, no revert needed)"
         ));
+        // detached child は post_quit_on_destroy=false なので、再親付け rebuild が失敗すると
+        // 旧 (host teardown で死にかけの) child を抱えたまま WM_QUIT でも回収されず stuck する。
+        // detached への switch 失敗時は再親付けを再要求し、poll が現 host で rebuild を再試行
+        // する (host が確定できなければ sync が no-op で待機、session 終了で applicability が
+        // 落ちて自然に破棄される)。
+        if matches!(target_presentation, ViewerPresentation::DetachedWindow)
+            && self.detached_video_presentation_active_or_targeted()
+        {
+            self.pending_detached_video_host_resync = true;
+        }
     }
 
     #[cfg(windows)]
