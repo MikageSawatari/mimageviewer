@@ -16510,7 +16510,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn image_only_detached_setting_uses_detached_for_still_images_not_videos() {
+    fn always_new_detached_setting_uses_detached_for_still_images_and_videos() {
         let mut app = setup_app();
         let image = push_image(&mut app, r"C:\pics\a.jpg");
         let video = push_video(&mut app, r"C:\clips\movie.mp4");
@@ -16528,11 +16528,11 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(
             app.requested_viewer_presentation_for_open(video),
-            ViewerPresentation::Fullscreen
+            ViewerPresentation::DetachedWindow
         );
         assert_eq!(
             app.effective_viewer_presentation_for_open(video),
-            ViewerPresentation::Fullscreen
+            ViewerPresentation::DetachedWindow
         );
     }
 
@@ -16590,6 +16590,64 @@ mod still_window_mode_key_tests {
         assert!(
             app.detached_independent_session_blocks_folder_nav(),
             "a detached video that has been cut loose from the main context must also block folder navigation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn always_new_video_f12_is_temporary_and_does_not_change_default_open_mode() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.detached_viewer_enabled = false;
+        app.settings.video_in_window_mode = true;
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        assert_eq!(
+            app.always_new_video_f12_target_presentation(),
+            Some(ViewerPresentation::MainWindow)
+        );
+
+        app.toggle_detached_viewer_mode();
+
+        assert!(
+            !app.settings.detached_viewer_enabled,
+            "F12 is a per-video temporary host migration while always-new media is enabled"
+        );
+        assert!(
+            app.settings.detached_viewer_open_images_in_window,
+            "the persistent default for the next video open remains detached"
+        );
+        assert_eq!(
+            app.requested_viewer_presentation_for_open(video),
+            ViewerPresentation::DetachedWindow,
+            "the next explicit video open should follow the persistent detached default"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_presentation_switch_updates_detached_session_lifecycle() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.detached_viewer_window_id = Some(123);
+
+        app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
+
+        let session = app
+            .active_detached_session
+            .expect("detached video switch should begin a detached session");
+        assert_eq!(session.window_id, 123);
+        assert_eq!(session.source, DetachedSource::Video);
+        assert!(!session.closing);
+
+        app.apply_video_presentation_switched(ViewerPresentation::MainWindow);
+
+        assert!(
+            app.active_detached_session.is_none(),
+            "switching the current video back to main/fullscreen must end the detached keep-alive session"
         );
     }
 

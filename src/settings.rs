@@ -2608,8 +2608,8 @@ pub struct Settings {
     /// Phase 1 では永続設定とキー操作だけを用意し、実際の detached host は後続で接続する。
     #[serde(default)]
     pub detached_viewer_enabled: bool,
-    /// 画像系アイテム (通常画像 / ZIP 内画像 / PDF ページ) を開くたびに
-    /// detached image window を増やす。動画は既存の動画表示設定 / F12 別ウィンドウモードに従う。
+    /// 画像/動画を別ウィンドウで開く。画像系アイテム (通常画像 / ZIP 内画像 / PDF ページ)
+    /// は開くたびに detached image window を残し、動画は単一の detached video window を再利用する。
     #[serde(default)]
     pub detached_viewer_open_images_in_window: bool,
     /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画

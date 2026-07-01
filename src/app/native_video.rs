@@ -1863,6 +1863,13 @@ impl App {
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
+        if matches!(presentation, ViewerPresentation::DetachedWindow) {
+            let id = self.ensure_detached_viewer_window_id();
+            self.begin_active_detached_session(id, super::DetachedSource::Video);
+        } else if self.active_detached_session.is_some() {
+            self.begin_active_detached_session_close("video_presentation_switched_non_detached");
+            self.finish_active_detached_session_close("video_presentation_switched_non_detached");
+        }
         self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
         {
             self.fullscreen_idx

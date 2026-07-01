@@ -116,7 +116,7 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 | # | 操作 | 結果 |
 |---|---|---|
 | ① | F12 で画像を別ウィンドウ表示（通常） | **Active・連動** |
-| ② | 設定 `detached_viewer_open_images_in_window` ON で画像を開く | 常に **Active・連動なし**（独自 bundle） |
+| ② | 設定 `detached_viewer_open_images_in_window` ON で画像/動画を開く | 画像系は常に **Active・連動なし**（独自 bundle）。動画は複数窓化せず、単一の detached 動画ウィンドウを再利用する |
 | ③ | 連動 Active 窓でピンボタン押下 | Active・連動 → **Active・連動なし**（独自 bundle へ昇格） |
 | ④ | 連動なし窓がある状態でメインから**別画像を明示 open**（Enter/ダブルクリック） | 連動なし窓 → **Passive・連動なし**（背景処理停止・frozen/paused bundle 保持）。新窓は通常モードでは **Active・連動**、`detached_viewer_open_images_in_window` ON では **Active・連動なし**（②と同じ） |
 | ⑤ | ピン解除 | **無し（ピンは一方通行）**。連動なし窓は × で閉じるだけ。ピンボタンは押下後は解除アフォーダンスを出さない |
@@ -147,8 +147,9 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
   またがせない。
 - `detached_viewer_open_images_in_window` ON 中の F12 は、静止画 / ZIP画像 / PDFページでは無効。
   F12 は「現在の viewer をメイン / detached へ移す」操作であり、always-new の「明示 open ごとに
-  独立窓を作る」操作と役割が衝突するため。動画表示中だけは当面、従来の host migration として
-  F12 を許可する。
+  独立窓を作る」操作と役割が衝突するため。動画表示中だけは現在の動画に対する一時 host migration
+  として F12 を許可する。F12 でメイン表示へ戻しても、次に動画を明示 open した場合はこの設定に従って
+  再び detached 動画ウィンドウで開く。
 - 別ウィンドウの編集制限:
   - **Active・連動**（通常 F12 の linked viewer）では従来どおり画像編集機能を使える。
   - **Active・連動なし**（ピン / always-new）では、編集状態を bundle 間で保持・確定する複雑さを避けるため、
@@ -160,9 +161,9 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 
 - `detached_viewer_enabled`: 別ウィンドウモードが ON かどうか。永続設定。
 - `detached_viewer_open_images_in_window`: 画像 / ZIP画像 / PDFページを開くたびに detached
-  image window を増やす永続設定。動画は対象外で、動画 detached は `detached_viewer_enabled` に従う。
-  この設定が ON の間、静止画系の F12 detached 切替は無効にする。動画は短期的には従来の単一
-  detached 動画 window を使う。detached 動画は、メイン一覧のフォルダ移動 / お気に入り移動などで
+  image window を増やす永続設定。動画は対象だが複数窓化せず、単一の detached 動画 window を再利用する。
+  この設定が ON の間、静止画系の F12 detached 切替は無効にする。動画表示中の F12 は現在の動画だけを
+  main / detached へ一時移動し、この永続設定は変更しない。detached 動画は、メイン一覧のフォルダ移動 / お気に入り移動などで
   main context が入れ替わる場合、active detached context 側へ切り離して再生を維持し、以後は
   メイン一覧の選択変更には追従しない。別動画を明示 open したときだけ既存動画 window を差し替える。
   メイン context の `close_fullscreen()` に巻き込んで閉じない。

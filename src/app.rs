@@ -24085,6 +24085,24 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn always_new_video_f12_target_presentation(&self) -> Option<ViewerPresentation> {
+        if !self.settings.detached_viewer_open_images_in_window {
+            return None;
+        }
+        let idx = self.fullscreen_idx?;
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return None;
+        }
+        Some(
+            if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow) {
+                self.non_detached_viewer_presentation()
+            } else {
+                ViewerPresentation::DetachedWindow
+            },
+        )
+    }
+
+    #[cfg(windows)]
     pub(crate) fn should_block_detached_independent_still_navigation_to_video(
         &self,
         idx: usize,
@@ -24139,6 +24157,8 @@ impl App {
         if (self.viewer_session_is_detached()
             && self.detached_viewer_independent_active
             && self.viewer_item_supports_detached_still(idx))
+            || (self.settings.detached_viewer_open_images_in_window
+                && matches!(self.items.get(idx), Some(GridItem::Video(_))))
             || (self.settings.detached_viewer_enabled && self.viewer_item_supports_session(idx))
             || self.detached_viewer_open_still_requested(idx)
         {
@@ -36899,6 +36919,21 @@ impl App {
                     "[detached-viewer] ignore F12 toggle while video placement switch is pending"
                         .to_string(),
                 );
+                return;
+            }
+            if let Some(target_presentation) = self.always_new_video_f12_target_presentation() {
+                if target_presentation != self.viewer_presentation {
+                    if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+                        self.clear_detached_viewer_borderless_fullscreen_state();
+                    }
+                    self.switch_native_video_viewer_presentation(target_presentation, true);
+                }
+                self.show_feedback_toast(match target_presentation {
+                    ViewerPresentation::DetachedWindow => {
+                        "この動画を別ウィンドウへ切り替えます".to_string()
+                    }
+                    _ => "この動画をメインウィンドウへ切り替えます".to_string(),
+                });
                 return;
             }
         }
