@@ -154,9 +154,13 @@ Status: 計画 v1（着手前レビュー用のドラフト）。
 - ワーカー内: **FFmpeg で PCM decode → インターリーブ stereo f32 → `analyze_stereo_timeline`**。
   decode は `src/video/decoder.rs` の FFmpeg 経路を「音声全尺 decode-to-PCM」モードで流用するか、
   軽量 avformat/avcodec decode を新設（**Inc 2 で確定、§11**）。
-- 永続化 = `src/audio_analysis_db.rs`（新設）。key = **path + size + mtime + duration +
-  sample_rate + channels + `analysis_version`**（ラボ計画の DB key 契約）。hit しても
-  `analysis_version` が古ければ再解析。
+- 永続化 = `src/audio_analysis_db.rs`。**実装した識別キー = path (PK) + size + mtime +
+  `analysis_version`**（size+mtime+path で内容を一意に識別できるので、duration / sample_rate /
+  channels はキーに含めない — これらは解析の派生値で `TimelineAnalysis.stream` に格納して表示に使う）。
+  size / mtime / version のいずれかがずれれば stale とみなして再解析。
+  ※ mtime は他キャッシュ（catalog / thumbnail）と同じ秒精度。同一秒内・同一サイズでの上書きは
+  既存キャッシュ同様のごく稀な取りこぼしを許容する（`docs/preset-and-adjustment.md` の
+  キャッシュ無効化と同水準）。
 - UI スレッドは受信を **1 frame 上限件数**で処理し、部分解析を merge、該当 row version だけ
   invalidate（`docs/ui-responsiveness.md` §4 準拠）。
 

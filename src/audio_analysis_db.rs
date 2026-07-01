@@ -54,6 +54,11 @@ impl AudioAnalysisDb {
     /// キャッシュされた解析結果を返す。`size` / `mtime` / `analysis_version` が現在の
     /// ファイルと一致する行だけを有効とみなす。不一致・no-row・壊れ JSON は `None`
     /// (= 要再解析)。
+    ///
+    /// 呼び出し側は set/get で **同じソースの `size` / `mtime`** を渡すこと (通常は
+    /// `folder_scan` と同じ秒精度 `mtime_secs` + ファイルサイズ)。mtime が秒精度なので、
+    /// 「同一秒内に同一サイズで上書き」された場合は false hit しうるが、これは catalog /
+    /// thumbnail など既存キャッシュと同水準の許容範囲 (Codex P3、恒久的にレアケース)。
     pub fn get(&self, path: &str, size: i64, mtime: i64) -> Option<TimelineAnalysis> {
         let mut stmt = self
             .conn

@@ -176,7 +176,7 @@ fn drain_decoder(
 /// 同じく「入力フレームごとに 1 回 run」する方式にし、最終 flush は行わない。
 fn append_resampled(
     resampler: &mut ResampleContext,
-    frame: &AudioFrame,
+    frame: &mut AudioFrame,
     out: &mut Vec<f32>,
     in_rate: u32,
 ) -> Result<(), String> {
@@ -184,13 +184,30 @@ fn append_resampled(
     if in_samples == 0 {
         return Ok(());
     }
-    // 出力バッファは (入力サンプル数 * out_rate / in_rate) + 余裕 で確保する。
-    let out_cap = (in_samples as u64 * OUT_RATE as u64 / in_rate.max(1) as u64) + 64;
+    // フレーム単位のレイアウト正規化 (Codex P2): resampler は正規化済みレイアウトで
+    // 構築されているが、各フレームの ch_layout が UNSPEC のままだと swr_convert_frame が
+    // 失敗する (古い WMA 等)。マスクを持たないフレームだけ差し替える
+    // (video/decoder.rs:5432-5435 と同じ手順)。
+    if frame.ch_layout().mask().is_none() {
+        let normalized = normalize_layout(frame.ch_layout());
+        frame.set_ch_layout(normalized);
+    }
+    // 出力バッファは標準 FFmpeg パターン ceil(in * out_rate / in_rate) + swr delay + safety
+    // で確保する (Codex P2)。floor + 固定 64 だと downsample や delay > 64 のときに
+    // サンプルが swr 内部 delay に取り残されたり run() error になる
+    // (video/decoder.rs:5376 resample_output_buffer_samples と同式)。
+    const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
+    let delay_out = resampler
+        .delay()
+        .map(|d| d.output.max(0) as u64)
+        .unwrap_or(0);
+    let rate_converted = (in_samples as u64 * OUT_RATE as u64).div_ceil(in_rate.max(1) as u64);
+    let out_cap = (rate_converted + delay_out + SWR_OUTPUT_SAFETY_SAMPLES) as usize;
     let mut resampled = AudioFrame::empty();
     unsafe {
         resampled.alloc(
             Sample::F32(SampleType::Packed),
-            out_cap as usize,
+            out_cap,
             ffmpeg::ChannelLayoutMask::STEREO,
         );
         resampled.set_rate(OUT_RATE);
@@ -209,6 +226,14 @@ fn append_resampled(
     // linesize パディングを避けるため data[0] を直接 f32 スライス化する
     // (video/decoder.rs と同じ手順)。
     let count = nb * OUT_CHANNELS;
+    // 長尺 / 巨大ファイルで Vec が GB 級に膨らんでも abort させず、確保失敗は Err で
+    // 上位ワーカーへ返す (Codex P2: extend_from_slice の暗黙 abort 回避)。
+    if out.try_reserve(count).is_err() {
+        return Err(format!(
+            "音声デコードのメモリ確保に失敗しました (ファイルが長すぎる可能性: {} samples)",
+            out.len() + count
+        ));
+    }
     unsafe {
         let ptr = (*resampled.as_ptr()).data[0] as *const f32;
         if ptr.is_null() {
