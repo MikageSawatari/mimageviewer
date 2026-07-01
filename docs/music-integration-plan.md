@@ -307,17 +307,32 @@ Status: 計画 v1（着手前レビュー用のドラフト）。
   - 受け入れ: 音声ファイルが一覧に音楽アイコンで出る / ソート・選択・★・タグ facet が Video 同等に動く。
     ダブルクリックは Inc 3 まで no-op で可。
 
-- **Inc 2: 解析ワーカー + `audio_analysis.db`（UI スレッド外）**
-  - FFmpeg decode → `analyze_stereo_timeline` → `TimelineAnalysis`。worker + cancel + mpsc。
-  - `audio_analysis.db`（key 契約、version gate）。
-  - **決定性テスト**: 固定 PCM バッファ → `analyze_stereo_timeline` が安定（`analysis_version` gate）。
-    FFmpeg decode PCM がラボ symphonia とほぼ一致（許容誤差、1 本）で「デコーダ差で解析がズレない」を担保。
-  - 受け入れ: 音声を開くと解析がバックグラウンドで走り DB 保存、再起動でキャッシュヒット。
-    UI スレッド同期 I/O なし（perf 計装 + `analyze_perf.py hitches`）。
+- **Inc 2: 解析データ層（decode + `analyze` + `audio_analysis.db`）** — ✅ **実装済み（2026-07-02）**
+  - ✅ `src/audio_decode.rs`: FFmpeg (avformat + avcodec + swresample) で 1 ファイルを全尺
+    デコードして 48kHz interleaved stereo f32 PCM を作る（`decode_audio_file_to_stereo_f32`）。
+    packed f32 抽出手順は `video/decoder.rs` の実績実装を踏襲。`analyze_audio_file` が
+    decode → `analyze_stereo_timeline` を合成。
+  - ✅ `src/audio_analysis_db.rs`: `TimelineAnalysis` の SQLite キャッシュ。key = path +
+    size + mtime + `analysis_version`（version/identity gate）。no-row / stale / 壊れ JSON は None。
+  - ✅ **決定性テスト**: 固定合成 PCM → `analyze_stereo_timeline` が安定（bins/version 一致）。
+    DB roundtrip / stale / version-gate / 壊れ JSON テスト計 7 本。
+  - **📌 増分境界の調整（2026-07-02）**: 当初 Inc 2 に含めた「解析ワーカー（背景スレッド +
+    cancel + poll）＋ トリガ」は **Inc 3 へ移動**した。理由 = 解析の起動契機は「音楽ビューを
+    開いたとき」で、その consumer（タイムライン表示）と open 経路は Inc 3 で作るため。フォルダ
+    閲覧のたびに全音声を pre-decode するのは無駄なので Inc 2 では起動しない。Inc 2 は
+    「decode + analyze + DB」の**データ層**（呼べば動く純関数群）に閉じる。
+  - ⚠️ FFmpeg decode の**実動作は実機検証項目**（DLL + 実ファイルが要る）。コンパイル・API
+    整合は確認済み、解析と DB は機械なしでテスト済み。
+  - 受け入れ（データ層）: build 緑 + DB/決定性テスト緑。ワーカー化・「開くと解析」・UI 応答性は
+    Inc 3 で担保する。
 
 - **Inc 3: 音楽ビュー骨格 — `VideoPlayer` 再生 + timeline canvas + 上情報バー/下シークバー常時**
   - 音声フルスクリーンで `VideoPlayer`（headless）を作り自動再生。egui viewport に timeline canvas
     （row raster worker、部分解析対応）+ 上情報バー常時 + 下シークバー常時。play/pause/seek/volume/mute。
+  - **解析ワーカー（Inc 2 から移動）**: 音楽ビューを開いた時に `audio_decode::analyze_audio_file`
+    を背景スレッド（cancel + mpsc + `poll_*`）で走らせ、`audio_analysis_db` を参照/保存する
+    (`docs/ui-responsiveness.md` §2 テンプレ)。cache hit は即表示、miss は解析完了まで待つ。
+    新ファイルで旧ワーカー cancel。UI スレッド同期 I/O なし（perf 計装）。
   - 受け入れ: 音声を開くと自動再生 + timeline 表示 + seek/play/pause + 上下バー常時。ラボと同じ見え/音。
 
 - **Inc 4: 108-band spectrum worker（下段）**
