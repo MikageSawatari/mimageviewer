@@ -139,6 +139,7 @@ pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItem
         GridItem::Folder(_) => FacetItemKind::Folder,
         GridItem::Image(_) => FacetItemKind::Image,
         GridItem::Video(_) => FacetItemKind::Video,
+        GridItem::Audio(_) => FacetItemKind::Audio,
         GridItem::ZipFile(_) => FacetItemKind::Zip,
         GridItem::PdfFile(_) => FacetItemKind::Pdf,
         GridItem::ConvertibleArchive { .. } => FacetItemKind::Archive,
@@ -161,6 +162,7 @@ pub(super) fn facet_ext_for_item(item: &GridItem) -> String {
         }
         GridItem::Image(p)
         | GridItem::Video(p)
+        | GridItem::Audio(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p)
         | GridItem::ConvertibleArchive { path: p, .. }
@@ -741,6 +743,7 @@ pub(super) fn details_created_time_path(item: &GridItem) -> Option<&Path> {
         GridItem::Folder(path)
         | GridItem::Image(path)
         | GridItem::Video(path)
+        | GridItem::Audio(path)
         | GridItem::ZipFile(path)
         | GridItem::PdfFile(path) => Some(path.as_path()),
         GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
@@ -911,6 +914,13 @@ pub(super) fn run_metadata_search(
             GridItem::Image(_) | GridItem::Video(_) => {
                 // Pass 2 で処理 (on-demand メタ読み取り)。
                 false
+            }
+            GridItem::Audio(_) => {
+                // 音声は画像/EXIF メタを持たないので Pass 1 でファイル名のみ照合する。
+                if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
+                    matches.insert(idx);
+                }
+                true
             }
             GridItem::ZipImage { entry_name, .. } => {
                 // §4.1.2: ZIP 内画像は常にファイル名 (エントリ basename) のみで照合。

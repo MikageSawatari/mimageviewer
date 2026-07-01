@@ -1920,6 +1920,7 @@ fn details_kind_label(item: &GridItem) -> String {
         GridItem::Folder(_) => "フォルダ".to_string(),
         GridItem::Image(path) => details_ext_kind(path, "画像"),
         GridItem::Video(path) => details_ext_kind(path, "動画"),
+        GridItem::Audio(path) => details_ext_kind(path, "音声"),
         GridItem::ZipFile(path) => details_ext_kind(path, "ZIP"),
         GridItem::PdfFile(path) => details_ext_kind(path, "PDF"),
         GridItem::ConvertibleArchive { format, .. } => format.label().to_string(),
@@ -1984,6 +1985,7 @@ fn selection_info_parent_location_label(item: &GridItem) -> Option<String> {
         GridItem::Folder(path)
         | GridItem::Image(path)
         | GridItem::Video(path)
+        | GridItem::Audio(path)
         | GridItem::ZipFile(path)
         | GridItem::PdfFile(path)
         | GridItem::SearchContainer { path, .. }
@@ -7602,6 +7604,7 @@ impl App {
                 kind,
                 FacetItemKind::Image
                     | FacetItemKind::Video
+                    | FacetItemKind::Audio
                     | FacetItemKind::Zip
                     | FacetItemKind::Pdf
                     | FacetItemKind::Archive
@@ -9165,6 +9168,11 @@ impl App {
                         self.pending_auto_fs_open = true;
                     }
                     nav = Some(p);
+                }
+                Some(GridItem::Audio(_)) => {
+                    // Inc 1: 音声のダブルクリックは暫定 no-op。フルスクリーン音楽ビュー
+                    // (自動再生 + タイムライン, D14) は Inc 3 で配線する
+                    // (docs/music-integration-plan.md)。
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })

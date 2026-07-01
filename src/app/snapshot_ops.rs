@@ -705,13 +705,15 @@ impl App {
         // 構造化 target を使う (Codex P1-1 fix): display 文字列の round-trip 破綻を回避
         let entry_target = entry.target.clone();
         match entry_kind {
-            SnapshotEntryKind::Image | SnapshotEntryKind::Video => {
+            SnapshotEntryKind::Image | SnapshotEntryKind::Video | SnapshotEntryKind::Audio => {
                 let SnapshotTarget::Fs(target_path) = entry_target.clone() else {
                     return false;
                 };
                 // 現在 items の中に同 path があれば直接 open
                 if let Some(idx) = self.items.iter().position(|it| match it {
-                    GridItem::Image(p) | GridItem::Video(p) => *p == target_path,
+                    GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
+                        *p == target_path
+                    }
                     _ => false,
                 }) {
                     self.open_fullscreen(idx);

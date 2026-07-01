@@ -2,6 +2,16 @@ use std::path::PathBuf;
 
 use crate::grid_item::GridItem;
 
+/// `all_media` の各要素がどの `GridItem` になるかのスキャン時分類。
+/// Image → `GridItem::Image`、Video → `GridItem::Video`、Audio → `GridItem::Audio`。
+/// 動画のアップスケール派生ペア除去 (`filter_upscaled_video_pairs_fast`) は Video のみ対象。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanMediaKind {
+    Image,
+    Video,
+    Audio,
+}
+
 /// ディレクトリ走査結果 (read_dir + 各エントリ metadata 取得の成果物)。
 ///
 /// Ctrl+↑↓ 移動時は DFS スレッドで事前に走査しておき、UI スレッドの
@@ -12,9 +22,9 @@ pub(crate) struct ScannedDir {
     /// (GridItem, (mtime, file_size)) の対。GridItem は Folder / ZipFile /
     /// PdfFile / ConvertibleArchive のいずれか。load_folder 内でソートされる。
     pub folders: Vec<(GridItem, Option<(i64, i64)>)>,
-    /// (path, is_video, mtime, file_size) のタプル。load_folder 内で sort_order
+    /// (path, kind, mtime, file_size) のタプル。load_folder 内で sort_order
     /// 設定に基づいてソートされる。
-    pub all_media: Vec<(PathBuf, bool, i64, i64)>,
+    pub all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)>,
 }
 
 /// ディレクトリ走査: `read_dir` + 各エントリの `file_type()` / `metadata()` 呼び出し。
@@ -45,7 +55,7 @@ pub(crate) fn scan_directory_with_convertible_archives(
     include_convertible_archives: bool,
 ) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
-    let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
+    let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
@@ -82,9 +92,11 @@ pub(crate) fn scan_directory_with_convertible_archives(
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
             let file_size = meta.map_or(0, |m| m.len() as i64);
             if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
-                all_media.push((p, false, mtime, file_size));
+                all_media.push((p, ScanMediaKind::Image, mtime, file_size));
             } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
-                all_media.push((p, true, mtime, file_size));
+                all_media.push((p, ScanMediaKind::Video, mtime, file_size));
+            } else if crate::folder_tree::is_audio_ext(&ext_lower) {
+                all_media.push((p, ScanMediaKind::Audio, mtime, file_size));
             } else if crate::folder_tree::is_zip_extension(&ext_lower) {
                 folders.push((GridItem::ZipFile(p), Some((mtime, file_size))));
             } else if ext_lower == "pdf" {
@@ -113,13 +125,13 @@ pub(crate) fn scan_directory_with_convertible_archives(
 }
 
 pub(super) fn filter_upscaled_video_pairs_fast(
-    all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
+    all_media: &mut Vec<(PathBuf, ScanMediaKind, i64, i64)>,
     entry_file_names_ci: &std::collections::HashSet<String>,
 ) {
     let mut source_stem_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for (path, is_video, _, _) in all_media.iter() {
-        if !*is_video || is_miv_upscaled_derivative(path) {
+    for (path, kind, _, _) in all_media.iter() {
+        if *kind != ScanMediaKind::Video || is_miv_upscaled_derivative(path) {
             continue;
         }
         if let Some(stem) = file_stem_ci(path) {
@@ -129,7 +141,7 @@ pub(super) fn filter_upscaled_video_pairs_fast(
 
     let derivative_source_stems: std::collections::HashSet<String> = all_media
         .iter()
-        .filter(|(_, is_video, _, _)| *is_video)
+        .filter(|(_, kind, _, _)| *kind == ScanMediaKind::Video)
         .filter_map(|(path, _, _, _)| {
             source_stem_for_miv_upscaled_derivative(path, entry_file_names_ci)
         })
@@ -202,8 +214,12 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
         let (mtime, size) = meta.unwrap_or((0, 0));
         entries.push((path, mtime, size, kind));
     }
-    for (p, is_video, mtime, size) in &scan.all_media {
-        let kind = if *is_video { "video" } else { "image" };
+    for (p, media_kind, mtime, size) in &scan.all_media {
+        let kind = match media_kind {
+            ScanMediaKind::Image => "image",
+            ScanMediaKind::Video => "video",
+            ScanMediaKind::Audio => "audio",
+        };
         entries.push((p.as_os_str(), *mtime, *size, kind));
     }
     entries.sort();

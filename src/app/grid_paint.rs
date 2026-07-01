@@ -332,6 +332,14 @@ pub(crate) fn draw_cell(
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark, 0.0);
         }
+        GridItem::Audio(path) => {
+            // 音声は固定の音楽アイコン (波形サムネは生成しない、D2)。サムネ状態に依らず
+            // 常に同じアイコンを描く。
+            painter.rect_filled(inner, 2.0, pending_placeholder_bg);
+            crate::ui_helpers::draw_music_icon(painter, inner, dark);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark, 0.0);
+        }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
             draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
         }

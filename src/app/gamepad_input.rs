@@ -5370,6 +5370,10 @@ impl App {
                 self.open_fullscreen(idx);
                 None
             }
+            Some(GridItem::Audio(_)) => {
+                // Inc 1: 音声の open は暫定 no-op。音楽ビューは Inc 3 で配線する。
+                None
+            }
             Some(GridItem::ConvertibleArchive { path, format }) => {
                 let auto_fs = self.settings.auto_fullscreen_zip_pdf;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);

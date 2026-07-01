@@ -267,7 +267,7 @@ fn scan_one_directory(
         }
     };
 
-    let mut media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
+    let mut media: Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)> = Vec::new();
     let mut entry_file_names_ci = HashSet::new();
 
     for entry_result in read_dir {
@@ -307,10 +307,12 @@ fn scan_one_directory(
             continue;
         };
         let ext_lower = ext.to_ascii_lowercase();
-        let is_video = if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
-            false
+        // サブ展開ビューは現状 画像 / 動画 のフラット一覧。音声 (GridItem::Audio) は
+        // 通常フォルダ一覧にのみ出し、サブ展開ビューへの取り込みは後続 Inc とする。
+        let kind = if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
+            super::folder_scan::ScanMediaKind::Image
         } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
-            true
+            super::folder_scan::ScanMediaKind::Video
         } else {
             continue;
         };
@@ -324,7 +326,7 @@ fn scan_one_directory(
         };
         media.push((
             path,
-            is_video,
+            kind,
             crate::ui_helpers::mtime_secs(&metadata),
             metadata.len() as i64,
         ));
@@ -335,18 +337,20 @@ fn scan_one_directory(
     result.diag.media_found += media.len();
     result
         .entries
-        .extend(media.into_iter().map(|(path, is_video, mtime, file_size)| {
-            SubfolderExpansionEntry {
-                path,
-                is_video,
-                mtime,
-                file_size,
-            }
-        }));
+        .extend(
+            media
+                .into_iter()
+                .map(|(path, kind, mtime, file_size)| SubfolderExpansionEntry {
+                    path,
+                    is_video: kind == super::folder_scan::ScanMediaKind::Video,
+                    mtime,
+                    file_size,
+                }),
+        );
 }
 
 fn apply_duplicate_filters_to_media(
-    media: &mut Vec<(PathBuf, bool, i64, i64)>,
+    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
     options: &SubfolderExpansionOptions,
     video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
@@ -363,13 +367,14 @@ fn apply_duplicate_filters_to_media(
 }
 
 fn filter_video_image_duplicates_for_subfolder(
-    media: &mut Vec<(PathBuf, bool, i64, i64)>,
+    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
     use_sidecar: bool,
     video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
+    use super::folder_scan::ScanMediaKind;
     let mut videos_by_stem: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    for (path, is_video, _, _) in media.iter() {
-        if *is_video {
+    for (path, kind, _, _) in media.iter() {
+        if *kind == ScanMediaKind::Video {
             videos_by_stem
                 .entry(stem_lower_local(path))
                 .or_default()
@@ -380,9 +385,11 @@ fn filter_video_image_duplicates_for_subfolder(
         return;
     }
 
+    // 動画とのサイドカー重複判定・除外は画像のみ対象 (音声は常に残す)。現状サブ展開の
+    // media は Image / Video のみだが、将来 Audio を含めても安全なよう `!= Image` で判定。
     if use_sidecar {
-        for (path, is_video, _, _) in media.iter() {
-            if *is_video {
+        for (path, kind, _, _) in media.iter() {
+            if *kind != ScanMediaKind::Image {
                 continue;
             }
             let stem = stem_lower_local(path);
@@ -396,15 +403,19 @@ fn filter_video_image_duplicates_for_subfolder(
         }
     }
 
-    media.retain(|(path, is_video, _, _)| {
-        *is_video || !videos_by_stem.contains_key(&stem_lower_local(path))
+    media.retain(|(path, kind, _, _)| {
+        *kind != ScanMediaKind::Image || !videos_by_stem.contains_key(&stem_lower_local(path))
     });
 }
 
-fn filter_image_ext_duplicates(media: &mut Vec<(PathBuf, bool, i64, i64)>, priority: &[String]) {
+fn filter_image_ext_duplicates(
+    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
+    priority: &[String],
+) {
+    use super::folder_scan::ScanMediaKind;
     let mut best: HashMap<String, (usize, usize)> = HashMap::new();
-    for (i, (path, is_video, _, _)) in media.iter().enumerate() {
-        if *is_video {
+    for (i, (path, kind, _, _)) in media.iter().enumerate() {
+        if *kind != ScanMediaKind::Image {
             continue;
         }
         let stem = stem_lower_local(path);
@@ -426,8 +437,8 @@ fn filter_image_ext_duplicates(media: &mut Vec<(PathBuf, bool, i64, i64)>, prior
     }
 
     let mut stem_counts: HashMap<String, usize> = HashMap::new();
-    for (path, is_video, _, _) in media.iter() {
-        if !*is_video {
+    for (path, kind, _, _) in media.iter() {
+        if *kind == ScanMediaKind::Image {
             *stem_counts.entry(stem_lower_local(path)).or_insert(0) += 1;
         }
     }
@@ -441,10 +452,10 @@ fn filter_image_ext_duplicates(media: &mut Vec<(PathBuf, bool, i64, i64)>, prior
     }
 
     let mut i = 0;
-    media.retain(|(path, is_video, _, _)| {
+    media.retain(|(path, kind, _, _)| {
         let current_i = i;
         i += 1;
-        if *is_video {
+        if *kind != ScanMediaKind::Image {
             return true;
         }
         let stem = stem_lower_local(path);
@@ -1350,9 +1361,13 @@ mod tests {
 
     #[test]
     fn duplicate_filter_is_scoped_to_one_parent() {
+        use crate::app::folder_scan::ScanMediaKind;
         let a = PathBuf::from(r"C:\root\a\same.jpg");
         let b = PathBuf::from(r"C:\root\b\same.png");
-        let mut media = vec![(a.clone(), false, 1, 10), (b.clone(), false, 2, 20)];
+        let mut media = vec![
+            (a.clone(), ScanMediaKind::Image, 1, 10),
+            (b.clone(), ScanMediaKind::Image, 2, 20),
+        ];
         let options = SubfolderExpansionOptions {
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
@@ -1365,8 +1380,8 @@ mod tests {
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].0, a);
 
-        let mut parent_a = vec![(a.clone(), false, 1, 10)];
-        let mut parent_b = vec![(b.clone(), false, 2, 20)];
+        let mut parent_a = vec![(a.clone(), ScanMediaKind::Image, 1, 10)];
+        let mut parent_b = vec![(b.clone(), ScanMediaKind::Image, 2, 20)];
         apply_duplicate_filters_to_media(&mut parent_a, &options, &mut overrides);
         apply_duplicate_filters_to_media(&mut parent_b, &options, &mut overrides);
         assert_eq!(parent_a[0].0, a);

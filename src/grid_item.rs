@@ -34,6 +34,11 @@ pub enum GridItem {
     Folder(PathBuf),
     Image(PathBuf),
     Video(PathBuf),
+    /// 音声ファイル (mp3 / flac / wav / m4a …)。フルスクリーンで音楽ビュー
+    /// (波形タイムライン + スペクトラム、`docs/music-integration-plan.md`) を開いて再生する。
+    /// サムネは固定の音楽アイコン (波形サムネは生成しない)。grid_item の各 helper では
+    /// **Video と同じ扱い** (実ファイル・レーティング可・ページ補正なし・heavy I/O なし)。
+    Audio(PathBuf),
     /// フォルダ一覧に表示される ZIP ファイル (1枚目のサムネイル + バッジ)
     ZipFile(PathBuf),
     /// フォルダ一覧に表示される PDF ファイル (1ページ目のサムネイル + バッジ)
@@ -157,7 +162,11 @@ impl GridItem {
     pub fn is_rating_leaf(&self) -> bool {
         matches!(
             self,
-            Self::Image(_) | Self::Video(_) | Self::ZipImage { .. } | Self::PdfPage { .. }
+            Self::Image(_)
+                | Self::Video(_)
+                | Self::Audio(_)
+                | Self::ZipImage { .. }
+                | Self::PdfPage { .. }
         )
     }
 
@@ -220,6 +229,7 @@ impl GridItem {
             GridItem::Folder(p)
             | GridItem::Image(p)
             | GridItem::Video(p)
+            | GridItem::Audio(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => path_display_name(p),
             GridItem::ConvertibleArchive { path, .. } => path_display_name(path),
@@ -244,6 +254,7 @@ impl GridItem {
             GridItem::Folder(p)
             | GridItem::Image(p)
             | GridItem::Video(p)
+            | GridItem::Audio(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => p.display().to_string(),
             GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
@@ -276,6 +287,7 @@ impl GridItem {
         match self {
             Self::Image(p)
             | Self::Video(p)
+            | Self::Audio(p)
             | Self::ZipFile(p)
             | Self::PdfFile(p)
             | Self::ConvertibleArchive { path: p, .. } => Some(p),
@@ -298,6 +310,7 @@ impl GridItem {
             Self::Folder(p)
             | Self::Image(p)
             | Self::Video(p)
+            | Self::Audio(p)
             | Self::ZipFile(p)
             | Self::PdfFile(p)
             | Self::ConvertibleArchive { path: p, .. } => Some(p),
@@ -321,7 +334,9 @@ impl GridItem {
     pub fn perf_key(&self) -> String {
         match self {
             GridItem::Folder(p) => format!("dir::{}", p.display()),
-            GridItem::Image(p) | GridItem::Video(p) => format!("{}", p.display()),
+            GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
+                format!("{}", p.display())
+            }
             GridItem::ZipFile(p) => format!("zipfile::{}", p.display()),
             GridItem::PdfFile(p) => format!("pdffile::{}", p.display()),
             GridItem::ZipImage {
@@ -482,6 +497,29 @@ mod tests {
     fn video_name() {
         let item = GridItem::Video(PathBuf::from(r"E:\videos\clip.mp4"));
         assert_eq!(item.name(), "clip.mp4");
+    }
+
+    #[test]
+    fn audio_name() {
+        let item = GridItem::Audio(PathBuf::from(r"E:\music\track.mp3"));
+        assert_eq!(item.name(), "track.mp3");
+    }
+
+    #[test]
+    fn audio_behaves_like_video_leaf() {
+        // 音声は grid_item の helper では Video と同じ扱い: 実ファイル・レーティング可・
+        // ページ補正データなし・コンテナでない。
+        let item = GridItem::Audio(PathBuf::from(r"E:\music\track.flac"));
+        assert!(item.is_rating_leaf());
+        assert!(item.accepts_rating());
+        assert!(!item.has_page_data());
+        assert!(!item.is_container_ratable());
+        assert!(!item.is_heavy_io());
+        assert!(item.is_checkable());
+        assert!(item.file_operation_path().is_some());
+        assert!(item.drag_source_path().is_some());
+        assert!(item.container_path().is_none());
+        assert_eq!(item.perf_key(), r"E:\music\track.flac");
     }
 
     #[test]

@@ -72,6 +72,38 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 ];
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 
+/// 標準サポートする音声拡張子 (フルスクリーン音楽ビューで再生する)。
+/// FFmpeg (LGPL build) がデコードできる主要なコンテナに絞る
+/// (`docs/music-integration-plan.md`)。動画コンテナと共有する拡張子 (mp4 等) は
+/// `SUPPORTED_VIDEO_EXTENSIONS` 側で動画として扱うので、ここには含めない。
+pub const SUPPORTED_AUDIO_EXTENSIONS: &[&str] =
+    &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma"];
+
+/// 拡張子 (小文字、先頭 `.` なし) が音声ファイルとして扱えるか判定する。
+pub fn is_audio_ext(ext_lower: &str) -> bool {
+    SUPPORTED_AUDIO_EXTENSIONS.contains(&ext_lower)
+}
+
+#[cfg(test)]
+mod audio_ext_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_common_audio_extensions() {
+        for ext in ["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma"] {
+            assert!(is_audio_ext(ext), "{ext} should be audio");
+        }
+    }
+
+    #[test]
+    fn rejects_non_audio_and_video_shared_extensions() {
+        // 画像・動画・非対応は false。動画と共有する mp4 は動画扱いなので音声にしない。
+        for ext in ["jpg", "png", "mp4", "mkv", "txt", "zip", "pdf"] {
+            assert!(!is_audio_ext(ext), "{ext} should not be audio");
+        }
+    }
+}
+
 /// 拡張子 (小文字、先頭 `.` なし) が画像として扱えるか判定する。
 ///
 /// ネイティブ対応の `SUPPORTED_EXTENSIONS` に加え、起動時にロードした Susie プラグイン

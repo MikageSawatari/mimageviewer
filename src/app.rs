@@ -10112,11 +10112,12 @@ impl App {
         let is_book_page_folder =
             crate::books::is_direct_book_folder(&self.book_root_path(), &path);
         if is_book_page_folder {
-            // 本の中は「番号付き画像だけ」が正本。ユーザーが手動で ZIP/PDF/フォルダ/動画を
+            // 本の中は「番号付き画像だけ」が正本。ユーザーが手動で ZIP/PDF/フォルダ/動画/音声を
             // 混ぜてもページとして扱わず、通常フォルダ閲覧のコンテナブロックも出さない。
             folders.clear();
             folder_metas.clear();
-            all_media.retain(|(_, is_video, _, _)| !*is_video);
+            all_media
+                .retain(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image);
         }
 
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
@@ -10188,15 +10189,24 @@ impl App {
         let mut image_metas: Vec<Option<(i64, i64)>> = folder_metas;
         let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
 
-        for (offset, (p, is_video, mtime, file_size)) in all_media.iter().enumerate() {
+        for (offset, (p, media_kind, mtime, file_size)) in all_media.iter().enumerate() {
             let item_idx = folder_count + offset;
-            if *is_video {
-                items.push(GridItem::Video(p.clone()));
-                image_metas.push(Some((*mtime, *file_size)));
-                video_items.push((item_idx, p.clone(), (*file_size).max(0) as u64));
-            } else {
-                items.push(GridItem::Image(p.clone()));
-                image_metas.push(Some((*mtime, *file_size)));
+            match media_kind {
+                crate::app::folder_scan::ScanMediaKind::Video => {
+                    items.push(GridItem::Video(p.clone()));
+                    image_metas.push(Some((*mtime, *file_size)));
+                    video_items.push((item_idx, p.clone(), (*file_size).max(0) as u64));
+                }
+                crate::app::folder_scan::ScanMediaKind::Audio => {
+                    // 音声はフルスクリーンで音楽ビューを開く。サムネは固定の音楽アイコン
+                    // (波形サムネは生成しないので video_items のようなサムネ要求は不要)。
+                    items.push(GridItem::Audio(p.clone()));
+                    image_metas.push(Some((*mtime, *file_size)));
+                }
+                crate::app::folder_scan::ScanMediaKind::Image => {
+                    items.push(GridItem::Image(p.clone()));
+                    image_metas.push(Some((*mtime, *file_size)));
+                }
             }
         }
         let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
@@ -20220,6 +20230,11 @@ impl App {
                         Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);
                         }
+                        Some(GridItem::Audio(_)) => {
+                            // Inc 1: 音声の Enter / ダブルクリックは暫定 no-op。フルスクリーン
+                            // 音楽ビュー (自動再生 + タイムライン, D14) は Inc 3 で配線する
+                            // (docs/music-integration-plan.md)。
+                        }
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
@@ -26473,7 +26488,7 @@ impl App {
         &mut self,
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
-        all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
+        all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
     ) {
         if self.settings.skip_zip_if_folder_exists {
             Self::filter_virtual_folder_duplicates(folders, folder_metas);
@@ -26534,10 +26549,14 @@ impl App {
     /// OFF のときは override を記録しない (= グリッドではシェル既定サムネのみ採用)
     /// が、画像ファイルの listing からの除外は維持する (= 同名画像が動画と並んで二重
     /// 表示されるのは望ましくないため)。
-    fn filter_video_image_duplicates(&mut self, all_media: &mut Vec<(PathBuf, bool, i64, i64)>) {
+    fn filter_video_image_duplicates(
+        &mut self,
+        all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
+    ) {
+        use crate::app::folder_scan::ScanMediaKind;
         let video_stems: std::collections::HashSet<String> = all_media
             .iter()
-            .filter(|(_, is_video, _, _)| *is_video)
+            .filter(|(_, kind, _, _)| *kind == ScanMediaKind::Video)
             .map(|(p, _, _, _)| stem_lower(p))
             .collect();
 
@@ -26545,9 +26564,11 @@ impl App {
             return;
         }
 
+        // 動画とのサイドカー重複判定・除外は画像のみ対象。音声 (Audio) は動画と同名でも
+        // 別メディアなので常に残す (= ここでは Image だけを処理する)。
         let use_sidecar = self.settings.video_thumb_use_sidecar_image;
-        for (p, is_video, _, _) in all_media.iter() {
-            if *is_video {
+        for (p, kind, _, _) in all_media.iter() {
+            if *kind != ScanMediaKind::Image {
                 continue;
             }
             let stem = stem_lower(p);
@@ -26556,20 +26577,23 @@ impl App {
             }
         }
 
-        all_media.retain(|(p, is_video, _, _)| *is_video || !video_stems.contains(&stem_lower(p)));
+        all_media.retain(|(p, kind, _, _)| {
+            *kind != ScanMediaKind::Image || !video_stems.contains(&stem_lower(p))
+        });
     }
 
     /// 同名画像の拡張子重複: 優先度リストに基づいてフィルタ。
     fn filter_image_ext_duplicates(
-        all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
+        all_media: &mut Vec<(PathBuf, crate::app::folder_scan::ScanMediaKind, i64, i64)>,
         priority: &[String],
     ) {
+        use crate::app::folder_scan::ScanMediaKind;
         // ステム → (最優先の拡張子の優先度, インデックス)
         let mut best: std::collections::HashMap<String, (usize, usize)> =
             std::collections::HashMap::new();
 
-        for (i, (p, is_video, _, _)) in all_media.iter().enumerate() {
-            if *is_video {
+        for (i, (p, kind, _, _)) in all_media.iter().enumerate() {
+            if *kind != ScanMediaKind::Image {
                 continue;
             }
             let stem = stem_lower(p);
@@ -26593,8 +26617,8 @@ impl App {
         // 同名ステムの画像が複数あるか判定
         let mut stem_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for (p, is_video, _, _) in all_media.iter() {
-            if *is_video {
+        for (p, kind, _, _) in all_media.iter() {
+            if *kind != ScanMediaKind::Image {
                 continue;
             }
             *stem_counts.entry(stem_lower(p)).or_insert(0) += 1;
@@ -26608,10 +26632,10 @@ impl App {
 
         if !keep_indices.is_empty() {
             let mut i = 0;
-            all_media.retain(|(p, is_video, _, _)| {
+            all_media.retain(|(p, kind, _, _)| {
                 let current_i = i;
                 i += 1;
-                if *is_video {
+                if *kind != ScanMediaKind::Image {
                     return true;
                 }
                 let stem = stem_lower(p);
@@ -26844,6 +26868,7 @@ impl App {
             GridItem::Folder(path) => Some(path.clone()),
             GridItem::Image(path)
             | GridItem::Video(path)
+            | GridItem::Audio(path)
             | GridItem::ZipFile(path)
             | GridItem::PdfFile(path)
             | GridItem::ConvertibleArchive { path, .. }
@@ -27716,6 +27741,7 @@ impl App {
             GridItem::Folder(_) => "0-folder".to_string(),
             GridItem::Image(p) => format!("1-image-{}", path_extension_lower(p)),
             GridItem::Video(p) => format!("2-video-{}", path_extension_lower(p)),
+            GridItem::Audio(p) => format!("2-video-audio-{}", path_extension_lower(p)),
             GridItem::ZipFile(p) => format!("3-zip-{}", path_extension_lower(p)),
             GridItem::PdfFile(p) => format!("4-pdf-{}", path_extension_lower(p)),
             GridItem::ConvertibleArchive { format, .. } => format!("5-{}", format.label()),

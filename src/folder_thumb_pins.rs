@@ -196,7 +196,10 @@ pub fn source_from_grid_item(
         // 知らない generic helper では作れない。App::folder_pin_selected_source 側で扱う。
         // Stack (ファイル名スタックの集約セル) は実パスを持たない仮想コンテナ。MVP では
         // 「丸ごと」操作非対応なので pin source にしない (メンバー展開後の実 Image でピンする)。
-        GridItem::SearchContainer { .. }
+        // Audio は固定の音楽アイコン表示で代表サムネ画像を持たないため、親フォルダの
+        // 代表サムネ pin source にはできない。
+        GridItem::Audio(_)
+        | GridItem::SearchContainer { .. }
         | GridItem::ZipSeparator { .. }
         | GridItem::ZipDir { .. }
         | GridItem::Stack { .. } => None,

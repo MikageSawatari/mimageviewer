@@ -94,6 +94,7 @@ pub enum SnapshotEntryKind {
     Folder,
     Image,
     Video,
+    Audio,
     ZipFile,
     PdfFile,
     ConvertibleArchive,
@@ -114,7 +115,7 @@ impl SnapshotEntryKind {
     pub fn is_playable_leaf(self) -> bool {
         matches!(
             self,
-            Self::Image | Self::Video | Self::ZipImage | Self::PdfPage
+            Self::Image | Self::Video | Self::Audio | Self::ZipImage | Self::PdfPage
         )
     }
 }
@@ -294,6 +295,7 @@ pub fn snapshot_key_from_grid_item(item: &GridItem) -> Option<SnapshotKey> {
         GridItem::Folder(p)
         | GridItem::Image(p)
         | GridItem::Video(p)
+        | GridItem::Audio(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p) => Some(SnapshotKey::Fs(normalize_fs(p))),
         GridItem::ConvertibleArchive { path, .. } => Some(SnapshotKey::Fs(normalize_fs(path))),
@@ -329,6 +331,7 @@ pub fn snapshot_entry_kind(item: &GridItem) -> Option<SnapshotEntryKind> {
         GridItem::Folder(_) => Some(SnapshotEntryKind::Folder),
         GridItem::Image(_) => Some(SnapshotEntryKind::Image),
         GridItem::Video(_) => Some(SnapshotEntryKind::Video),
+        GridItem::Audio(_) => Some(SnapshotEntryKind::Audio),
         GridItem::ZipFile(_) => Some(SnapshotEntryKind::ZipFile),
         GridItem::PdfFile(_) => Some(SnapshotEntryKind::PdfFile),
         GridItem::ConvertibleArchive { .. } => Some(SnapshotEntryKind::ConvertibleArchive),
@@ -362,6 +365,7 @@ pub fn snapshot_target_from_grid_item(item: &GridItem) -> Option<SnapshotTarget>
         GridItem::Folder(p)
         | GridItem::Image(p)
         | GridItem::Video(p)
+        | GridItem::Audio(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p) => Some(SnapshotTarget::Fs(p.clone())),
         GridItem::ConvertibleArchive { path, format } => Some(SnapshotTarget::ConvertibleArchive {
@@ -398,6 +402,7 @@ pub fn reconstruct_grid_item(entry: &SnapshotEntry) -> Option<GridItem> {
         (SnapshotTarget::Fs(p), SnapshotEntryKind::Folder) => Some(GridItem::Folder(p.clone())),
         (SnapshotTarget::Fs(p), SnapshotEntryKind::Image) => Some(GridItem::Image(p.clone())),
         (SnapshotTarget::Fs(p), SnapshotEntryKind::Video) => Some(GridItem::Video(p.clone())),
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::Audio) => Some(GridItem::Audio(p.clone())),
         (SnapshotTarget::Fs(p), SnapshotEntryKind::ZipFile) => Some(GridItem::ZipFile(p.clone())),
         (SnapshotTarget::Fs(p), SnapshotEntryKind::PdfFile) => Some(GridItem::PdfFile(p.clone())),
         // ConvertibleArchive: SnapshotTarget で format を保持しているので完全復元 (Codex P3 fix)

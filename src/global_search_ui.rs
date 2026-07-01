@@ -1076,10 +1076,14 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         GridItem::PdfPage {
             pdf_path, page_num, ..
         } => Some(ThumbReuseKey::PdfPage(pdf_path.clone(), *page_num)),
+        // Audio は固定の音楽アイコン表示でキャッシュテクスチャを持たないため reuse 不要。
         // ZipSeparator / ZipDir / Stack は Ctrl+G 検索結果には出ない (通常フォルダ閲覧専用)。
         // 検索 rebuild の reuse 対象外 (スタックの drill/back は install_new_items 経由で
         // この関数を通らない)。
-        GridItem::ZipSeparator { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
+        GridItem::Audio(_)
+        | GridItem::ZipSeparator { .. }
+        | GridItem::ZipDir { .. }
+        | GridItem::Stack { .. } => None,
     }
 }
 

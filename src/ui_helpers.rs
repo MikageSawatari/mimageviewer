@@ -699,6 +699,57 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
     ));
 }
 
+/// グリッドの音声セル用に、固定の音楽アイコン (2 連八分音符) をベクター描画する。
+///
+/// 絵文字グリフ (🎵 / 🎶 等) は環境依存フォントで tofu 化しうる (CLAUDE.md「UI 文字列の
+/// Unicode グリフ選定ルール」)。動画セルの再生アイコン (`draw_play_icon`) と同様に
+/// painter プリミティブで描いてフォント依存を避ける。
+pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
+    let side = inner.width().min(inner.height());
+    let s = (side * 0.34).clamp(22.0, 64.0);
+    let center = inner.center() - egui::vec2(0.0, side * 0.05);
+    let color = if dark {
+        egui::Color32::from_rgb(150, 182, 222)
+    } else {
+        egui::Color32::from_rgb(70, 112, 162)
+    };
+    let head_r = s * 0.22;
+    let stem_h = s * 0.92;
+    let gap = s * 0.72;
+    let stem_w = (s * 0.07).max(1.6);
+    let left_head = egui::pos2(center.x - gap * 0.5, center.y + stem_h * 0.32);
+    let right_head = egui::pos2(center.x + gap * 0.5, center.y + stem_h * 0.32);
+    let left_stem_x = left_head.x + head_r * 0.9;
+    let right_stem_x = right_head.x + head_r * 0.9;
+    let stem_top_y = left_head.y - stem_h;
+    // 符幹 (符頭の右端から上へ)
+    painter.line_segment(
+        [
+            egui::pos2(left_stem_x, left_head.y),
+            egui::pos2(left_stem_x, stem_top_y),
+        ],
+        egui::Stroke::new(stem_w, color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(right_stem_x, right_head.y),
+            egui::pos2(right_stem_x, stem_top_y),
+        ],
+        egui::Stroke::new(stem_w, color),
+    );
+    // 連桁 (2 本の符幹の上端をつなぐ太線)
+    painter.line_segment(
+        [
+            egui::pos2(left_stem_x - stem_w * 0.5, stem_top_y),
+            egui::pos2(right_stem_x + stem_w * 0.5, stem_top_y),
+        ],
+        egui::Stroke::new(stem_w * 1.9, color),
+    );
+    // 符頭
+    painter.circle_filled(left_head, head_r, color);
+    painter.circle_filled(right_head, head_r, color);
+}
+
 /// サムネイル左下にファイル種別バッジを描画する共通関数。
 fn draw_file_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str, bg: egui::Color32) {
     let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);

@@ -432,7 +432,7 @@ impl crate::app::App {
                 } else {
                     // ── 通常モード: 単一アイテムに対する操作 ──
                     match &item {
-                        GridItem::Image(p) | GridItem::Video(p) => {
+                        GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
                             if ui.button("パスをコピー").clicked() {
                                 copy_path_text(ctx, p);
                                 close = true;
@@ -745,6 +745,7 @@ impl crate::app::App {
         let text = match item {
             GridItem::Image(path)
             | GridItem::Video(path)
+            | GridItem::Audio(path)
             | GridItem::Folder(path)
             | GridItem::ZipFile(path)
             | GridItem::PdfFile(path) => native_path_text(&path),
@@ -815,6 +816,7 @@ impl crate::app::App {
         let path = match item {
             GridItem::Image(path)
             | GridItem::Video(path)
+            | GridItem::Audio(path)
             | GridItem::Folder(path)
             | GridItem::ZipFile(path)
             | GridItem::PdfFile(path) => path,
@@ -1293,7 +1295,7 @@ impl crate::app::App {
                 ui.set_min_width(200.0);
 
                 match &item {
-                    GridItem::Image(p) | GridItem::Video(p) => {
+                    GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
                         if ui.button("パスをコピー").clicked() {
                             copy_path_text(ctx, p);
                             close = true;
