@@ -617,6 +617,12 @@ impl App {
         if self.native_video_mode_switch.is_some() {
             return false; // 切替中は重ねられない。完了後に再試行
         }
+        if !self.detached_viewer_host_geometry_settled {
+            // host が既定 (過渡) ジオメトリの間は再親付けしない。ここで小サイズ host へ
+            // 移すと動画が一瞬 800x600 に縮んでから戻る = ちらつきの主因。保存配置に確定
+            // (フルサイズ) してから 1 回だけ再親付けする。要求フラグは保持して次フレーム再試行。
+            return false;
+        }
         // host が未確定 (0 / 死んでいる) 等で発行できなければ false を返してフラグを保持し、
         // 次に host が確定したフレームで再親付けする。
         let queued = self.sync_detached_video_child_presenter_rect();

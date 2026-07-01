@@ -4379,6 +4379,13 @@ pub struct App {
     /// 破棄で child (WS_CHILD) が道連れ死 → WM_QUIT → 再生終了する既存バグの根本対策。
     #[cfg(windows)]
     pub(crate) pending_detached_video_host_resync: bool,
+    /// 現在の detached host のジオメトリが保存配置に確定しているか。egui は
+    /// viewport を作り直すと一旦「既定サイズ・既定位置」で報告してから保存配置へ
+    /// リポジションするため、その**過渡的な小サイズ host には再親付けしない**
+    /// (= 動画が一瞬 800x600 に縮んでから戻るちらつき対策)。確定 (restore_placement が
+    /// None = リポジション不要) になってから 1 回だけ再親付けする。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_host_geometry_settled: bool,
     /// 直近に active detached viewer viewport 内で観測した outer rect。
     /// host_lost は次フレームの描画前に判定されるため、診断ログではこの値から
     /// 「今掴むならどの HWND か」を再探索する。
@@ -6614,6 +6621,8 @@ impl App {
             detached_viewer_host_generation: 0,
             #[cfg(windows)]
             pending_detached_video_host_resync: false,
+            #[cfg(windows)]
+            detached_viewer_host_geometry_settled: true,
             #[cfg(windows)]
             detached_viewer_last_outer_rect: None,
             #[cfg(windows)]

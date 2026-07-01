@@ -5025,6 +5025,11 @@ impl App {
                                     pixels_per_point,
                                     maximized,
                                 );
+                            // restore_placement=Some = 現ジオメトリが既定 (過渡) で、保存配置へ
+                            // リポジション中。None = 保存配置に確定。過渡の間は presenter child の
+                            // 再親付けを遅らせ、動画が一瞬小サイズに縮むちらつきを防ぐ。
+                            self.detached_viewer_host_geometry_settled =
+                                restore_placement.is_none();
                             if let Some(placement) = restore_placement {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(

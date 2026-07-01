@@ -16743,6 +16743,26 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_video_host_resync_waits_for_settled_geometry() {
+        // egui が viewport を作り直すと一旦既定 (小) ジオメトリで報告するため、その過渡の
+        // 間に再親付けすると動画が一瞬縮む。ジオメトリ確定 (settled) まで再親付けを保留する。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.native_video_mode_switch = None;
+
+        app.detached_viewer_host_geometry_settled = false;
+        app.pending_detached_video_host_resync = true;
+        app.poll_detached_video_host_resync();
+        assert!(
+            app.pending_detached_video_host_resync,
+            "re-parent must wait while the detached host geometry is still transient (default size)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_video_presentation_active_or_targeted_includes_in_flight_switch() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
