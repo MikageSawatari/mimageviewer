@@ -2148,11 +2148,16 @@ impl App {
             "[native-video] placement switch failed (target={target_presentation:?}); \
              pending cleared (settings was never persisted, no revert needed)"
         ));
-        // detached child は post_quit_on_destroy=false なので、再親付け rebuild が失敗すると
-        // 旧 (host teardown で死にかけの) child を抱えたまま WM_QUIT でも回収されず stuck する。
-        // detached への switch 失敗時は再親付けを再要求し、poll が現 host で rebuild を再試行
-        // する (host が確定できなければ sync が no-op で待機、session 終了で applicability が
-        // 落ちて自然に破棄される)。
+        // **主対象は「detached 再生中の再親付け rebuild 失敗」**。detached child は
+        // post_quit_on_destroy=false なので、再親付け rebuild が失敗すると旧 (host teardown で
+        // 死にかけの) child を抱えたまま WM_QUIT でも回収されず stuck する。そこで再親付けを
+        // 再要求し、poll が現 host で rebuild を再試行する (host が確定できなければ sync が
+        // no-op で待機、session 終了で applicability が落ちて自然に破棄される)。
+        //
+        // 一方 **初回 main→detached の switch 失敗** は、mode_switch を上で None にした後
+        // viewer_presentation が非 detached のまま残る (apply していない) ため
+        // `detached_video_presentation_active_or_targeted()` が false になり、ここでは
+        // 再試行しない (= 初回失敗の無限 retry を避ける。初回切替の再試行は別経路の責務)。
         if matches!(target_presentation, ViewerPresentation::DetachedWindow)
             && self.detached_video_presentation_active_or_targeted()
         {
