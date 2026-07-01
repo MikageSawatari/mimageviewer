@@ -4386,6 +4386,12 @@ pub struct App {
     /// None = リポジション不要) になってから 1 回だけ再親付けする。
     #[cfg(windows)]
     pub(crate) detached_viewer_host_geometry_settled: bool,
+    /// detached presenter child が現在ぶら下がっている host HWND (= 直近の detached
+    /// placement switch の owner)。この host が**死んでいる**ときは、動画が黒に落ちて
+    /// いる状態なので、host ジオメトリ確定を待たずに即座に再親付けする (settled 待ちの
+    /// bypass)。生きている間は確定を待って縮みちらつきを避ける。
+    #[cfg(windows)]
+    pub(crate) detached_video_child_host_hwnd: u64,
     /// 直近に active detached viewer viewport 内で観測した outer rect。
     /// host_lost は次フレームの描画前に判定されるため、診断ログではこの値から
     /// 「今掴むならどの HWND か」を再探索する。
@@ -6623,6 +6629,8 @@ impl App {
             pending_detached_video_host_resync: false,
             #[cfg(windows)]
             detached_viewer_host_geometry_settled: true,
+            #[cfg(windows)]
+            detached_video_child_host_hwnd: 0,
             #[cfg(windows)]
             detached_viewer_last_outer_rect: None,
             #[cfg(windows)]

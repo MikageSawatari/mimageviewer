@@ -16763,6 +16763,30 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_video_host_resync_poll_clears_tracking_when_not_detached() {
+        // detached 動画でなくなったら、次 session へ stale な child host / 再親付け要求を
+        // 持ち越さないよう毎フレーム掃除する。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_video_child_host_hwnd = 0x1234;
+        app.pending_detached_video_host_resync = true;
+
+        app.poll_detached_video_host_resync();
+
+        assert_eq!(
+            app.detached_video_child_host_hwnd, 0,
+            "leaving detached must clear the tracked child host"
+        );
+        assert!(
+            !app.pending_detached_video_host_resync,
+            "leaving detached must drop the pending resync request"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_video_presentation_active_or_targeted_includes_in_flight_switch() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
