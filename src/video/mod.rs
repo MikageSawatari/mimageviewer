@@ -2648,6 +2648,12 @@ fn run_native_video_output(
                                         // presenter ループ自体が終了してしまう)。
                                         old_window.destroy_silent();
                                         drop(old_presenter);
+                                        if crate::video::native_window::discard_pending_quit_messages_for_host_switch() {
+                                            crate::logger::log(
+                                                "[native-video] discarded stale WM_QUIT after placement host switch"
+                                                    .to_string(),
+                                            );
+                                        }
                                         // 残った present_retire エントリは旧 presenter の
                                         // copy fence で採番されている。新 presenter の
                                         // fence timeline とは無関係なので fence 値を 0

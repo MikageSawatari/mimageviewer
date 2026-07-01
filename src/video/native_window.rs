@@ -747,6 +747,24 @@ pub fn pump_thread_messages() -> bool {
     quit
 }
 
+/// Host migration 中の旧 HWND 破棄でメッセージキューへ残った `WM_QUIT` だけを捨てる。
+/// 通常の close 経路では呼ばず、placement switch の旧 host teardown 直後に限定する。
+pub fn discard_pending_quit_messages_for_host_switch() -> bool {
+    let mut discarded = false;
+    unsafe {
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
+                discarded = true;
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    discarded
+}
+
 /// `thread::sleep` の message 対応版。最大 `ms` ミリ秒待つが、呼び出しスレッドの
 /// メッセージキューに何か届いた時点でタイムアウト前でも即座に返る。これにより
 /// presenter スレッドのアイドル待機中に来た `WM_WINDOWPOSCHANGED` (リサイズ) 等を
