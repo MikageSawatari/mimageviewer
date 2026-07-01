@@ -16730,34 +16730,45 @@ mod still_window_mode_key_tests {
             "resync must wait while a placement switch is in flight"
         );
 
-        // 切替が終わっても、テストは live host / presenter を持たないため presenter child を
-        // 実際に再親付けできない。取りこぼし防止 (P2b) として要求は保持され続ける
-        // (host が確定したフレームで再親付け → そこで初めて消費される)。
+        // 切替が終わっても、child host が生きている (テストは追跡 host なし = 0) 限り
+        // 再親付けは不要なので要求は破棄される (death-gate: live な host 変更は追わない)。
         app.native_video_mode_switch = None;
         app.poll_detached_video_host_resync();
         assert!(
-            app.pending_detached_video_host_resync,
-            "resync is retained until the presenter child can actually be re-parented"
+            !app.pending_detached_video_host_resync,
+            "with a live/absent child host the video is fine; the resync request is dropped"
         );
     }
 
     #[test]
     #[cfg(windows)]
-    fn detached_video_host_resync_waits_for_settled_geometry() {
-        // egui が viewport を作り直すと一旦既定 (小) ジオメトリで報告するため、その過渡の
-        // 間に再親付けすると動画が一瞬縮む。ジオメトリ確定 (settled) まで再親付けを保留する。
+    fn detached_video_host_resync_only_reparents_when_child_host_lost() {
+        // death-gate: 現 child host が生きている間は (host が過渡ジオメトリでも) 再親付けせず
+        // 要求を破棄する。child host が破棄されて初めて、確定を待って再親付けする。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.native_video_mode_switch = None;
 
+        // child host 健在 (0 = 追跡なしも「死んでいない」扱い) → host 過渡でも追従せず破棄。
+        app.detached_video_child_host_hwnd = 0;
+        app.detached_viewer_host_geometry_settled = false;
+        app.pending_detached_video_host_resync = true;
+        app.poll_detached_video_host_resync();
+        assert!(
+            !app.pending_detached_video_host_resync,
+            "a live/absent child host means no re-parent even on a transient host change"
+        );
+
+        // child host が死亡 (存在しない HWND) かつ host 未確定 → 確定待ちで要求を保持する。
+        app.detached_video_child_host_hwnd = 0xdead;
         app.detached_viewer_host_geometry_settled = false;
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
         assert!(
             app.pending_detached_video_host_resync,
-            "re-parent must wait while the detached host geometry is still transient (default size)"
+            "a dead child host with unsettled geometry waits for settle (retains the request)"
         );
     }
 
