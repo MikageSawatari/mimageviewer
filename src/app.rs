@@ -28375,6 +28375,7 @@ impl App {
         let mut meta = match item {
             GridItem::Image(path) => RatingMeta::new(RatingItemKind::Image).with_source_path(path),
             GridItem::Video(path) => RatingMeta::new(RatingItemKind::Video).with_source_path(path),
+            GridItem::Audio(path) => RatingMeta::new(RatingItemKind::Audio).with_source_path(path),
             GridItem::Folder(path) => {
                 RatingMeta::new(RatingItemKind::Folder).with_source_path(path)
             }

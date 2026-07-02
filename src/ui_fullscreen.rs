@@ -8006,6 +8006,12 @@ impl App {
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        // 音声 (音楽ビュー) は画像編集/分析/回転/比較/AI/ポストフィルタ系のキーを一切受けない
+        // (Inc 5, Codex P2)。これらは画像の image_rect / 編集モードを変え、次の画像へ状態が
+        // 漏れる (例: 音声で Z → analysis_mode ON のまま次画像へ)。consume 自体を抑止するので、
+        // ブックマーク改名 / インポート / タグの TextEdit への文字入力 (例 B / E) も奪わない。
+        // メタデータ (I) は音楽情報パネルのトグルとして音声でも有効に残す。
+        let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
         let key_i =
             !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
@@ -8014,49 +8020,68 @@ impl App {
         // gate する** こと: `is_video_fs` は context menu 表示中に false になるため、それで
         // gate すると context menu open の動画で Space → 画像系チェックトグルへ流出する
         // (Codex Phase 1 P2 指摘)。
-        let key_space =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
+        let key_space = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
         let key_ctrl_s_capture = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCapture);
         let key_ctrl_b_book = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsAddToActiveBook);
         let key_ctrl_e_export = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
         let key_compare_x = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCompareToggle);
         let key_compare_alt_c = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCompareDiff);
         let key_compare_shift_c = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCompareWipe);
         let key_compare_c = !is_video_fs
+            && !current_item_is_audio
             && self.fs_context_menu_idx.is_none()
             && !key_compare_alt_c
             && !key_compare_shift_c
             && self.keymap.consume_action(ctx, KeyAction::FsCompareCycle);
-        // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)
-        let key_s = self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
-        let key_r = self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
-        let key_l = self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
-        let key_z_raw = self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
+        // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)。音声は
+        // 画像スライドショーに参加しない。
+        let key_s =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_r =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
+        let key_l =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
+        let key_z_raw =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
         // V: 360 度パノラマビューワーモード トグル (docs/panorama-360-view-plan.md)。
         // 消しゴムモード中は ui_erase 側が V (vertical line tool) を先に consume するので、
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
-        let key_v_panorama_raw = self.keymap.consume_action(ctx, KeyAction::FsPanorama);
-        let key_g = self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
-        let key_m = self
-            .keymap
-            .consume_action(ctx, KeyAction::FsLoupeLockToggle);
-        let key_e = self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
+        let key_v_panorama_raw =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsPanorama);
+        let key_g =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
+        let key_m = !current_item_is_audio
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsLoupeLockToggle);
+        let key_e =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
         // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
-        let key_b_bg = self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
+        // 音声では B はブックマーク追加 (先行処理済み)。
+        let key_b_bg =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
         // - 抑止対象: Z (分析) / S (スライドショー) / E (消しゴム) / M (ルーペ) / B (bg cycle)
         //   / I (メタデータ) / C 系 (比較)
@@ -8145,7 +8170,9 @@ impl App {
         // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
-        let key_p_pin = !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPin);
+        let key_p_pin = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsPin);
 
         // コンテナ★ (既定: Shift+F1〜F6): 開いている画像が属するコンテナ
         // (フォルダ / ZIP / PDF) にレーティング / 解除。
@@ -8282,7 +8309,7 @@ impl App {
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
         // Shift/Alt を伴う入力まで吸収する。具体的な修飾子から先に consume する必要がある。
-        let ai_direct_model = (!current_item_is_video)
+        let ai_direct_model = (!current_item_is_video && !current_item_is_audio)
             .then(|| {
                 FS_AI_MODEL_DIRECT_ACTIONS
                     .iter()
@@ -8293,20 +8320,24 @@ impl App {
                     })
             })
             .flatten();
-        let key_u_alt =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsAiModelReset);
-        let key_u_shift =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsAiModelPrev);
-        let key_u =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsAiModelNext);
+        let key_u_alt = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsAiModelReset);
+        let key_u_shift = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsAiModelPrev);
+        let key_u = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsAiModelNext);
         // N キー: AI デノイズサイクル
-        let key_n =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsDenoiseCycle);
+        let key_n = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsDenoiseCycle);
         // T / Shift+T / Alt+T: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
         // P はグリッド / 動画フルスクリーンのピン留めに統一する。F は動画の FPS/Perf 表示に
         // 使っているため、ポストフィルタは T (Tone / posT filter) に割り当てる。
         // 同様に Alt+T → Shift+T → T の順で consume (matches_logically 対策)。
-        let post_filter_direct = (!current_item_is_video)
+        let post_filter_direct = (!current_item_is_video && !current_item_is_audio)
             .then(|| {
                 FS_POST_FILTER_DIRECT_ACTIONS
                     .iter()
@@ -8316,13 +8347,16 @@ impl App {
             })
             .flatten();
         let key_t_alt = !current_item_is_video
+            && !current_item_is_audio
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsPostFilterReset);
-        let key_t_shift =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPostFilterPrev);
-        let key_t =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPostFilterNext);
+        let key_t_shift = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsPostFilterPrev);
+        let key_t = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsPostFilterNext);
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)

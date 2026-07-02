@@ -22,6 +22,7 @@ pub enum RatingItemKind {
     ZipImage,
     PdfPage,
     ZipDir,
+    Audio,
 }
 
 impl RatingItemKind {
@@ -36,6 +37,9 @@ impl RatingItemKind {
             Self::ZipImage => 6,
             Self::PdfPage => 7,
             Self::ZipDir => 8,
+            // Audio は Inc 5 (音楽ビュー) で追加。既存 0..=8 の後ろに足すだけなので、
+            // 既存行の判別子は不変 (未リリース機能だが後方互換で安全)。
+            Self::Audio => 9,
         }
     }
 
@@ -50,6 +54,7 @@ impl RatingItemKind {
             6 => Some(Self::ZipImage),
             7 => Some(Self::PdfPage),
             8 => Some(Self::ZipDir),
+            9 => Some(Self::Audio),
             _ => None,
         }
     }

@@ -175,6 +175,7 @@ fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
     match kind {
         RatingItemKind::Image => Some(GridItem::Image(existing_source_or_key_path(row)?)),
         RatingItemKind::Video => Some(GridItem::Video(existing_source_or_key_path(row)?)),
+        RatingItemKind::Audio => Some(GridItem::Audio(existing_source_or_key_path(row)?)),
         RatingItemKind::Folder => Some(GridItem::Folder(existing_source_or_key_path(row)?)),
         RatingItemKind::ZipFile => Some(GridItem::ZipFile(existing_source_or_key_path(row)?)),
         RatingItemKind::PdfFile => Some(GridItem::PdfFile(existing_source_or_key_path(row)?)),
@@ -263,6 +264,8 @@ fn item_from_plain_path(path: &Path) -> Option<GridItem> {
         Some(GridItem::Image(path.to_path_buf()))
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         Some(GridItem::Video(path.to_path_buf()))
+    } else if crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+        Some(GridItem::Audio(path.to_path_buf()))
     } else if crate::folder_tree::is_zip_extension(&ext) {
         Some(GridItem::ZipFile(path.to_path_buf()))
     } else if ext == "pdf" {

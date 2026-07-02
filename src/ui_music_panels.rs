@@ -208,19 +208,29 @@ impl App {
             .iter()
             .map(|e| (e.pts_secs, Some(e.title.as_str())))
             .collect();
-        let summary = self
+        // 成功したときだけ貼り付けテキストをクリアしてインポート欄を閉じる。DB エラー / DB
+        // 未オープンでは黙って捨てず、テキストを残してエラーを通知する (Codex P3)。
+        let result = self
             .video_bookmark_db
             .as_mut()
-            .and_then(|db| db.bulk_add_if_no_duplicate(&path, &refs, 1.0).ok());
-        self.reload_music_bookmarks(&path);
-        if let Some(s) = summary {
-            self.show_feedback_toast(format!(
-                "一括登録: {} 件追加 / 重複 {} / エラー {}",
-                s.added, s.skipped_duplicates, s.errors
-            ));
+            .map(|db| db.bulk_add_if_no_duplicate(&path, &refs, 1.0));
+        match result {
+            Some(Ok(s)) => {
+                self.reload_music_bookmarks(&path);
+                self.show_feedback_toast(format!(
+                    "一括登録: {} 件追加 / 重複 {} / エラー {}",
+                    s.added, s.skipped_duplicates, s.errors
+                ));
+                self.music_bookmark_import_text.clear();
+                self.music_bookmark_import_open = false;
+            }
+            Some(Err(e)) => {
+                self.show_feedback_toast(format!("ブックマークの保存に失敗しました: {e}"));
+            }
+            None => {
+                self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string());
+            }
         }
-        self.music_bookmark_import_text.clear();
-        self.music_bookmark_import_open = false;
     }
 
     /// ブックマークをクリップボードへエクスポートする (動画と同じ `format_chapter_lines`)。
@@ -293,6 +303,9 @@ impl App {
         *child.visuals_mut() = egui::Visuals::dark();
 
         let probe = self.music_probe.clone();
+        // probe がまだ届いていない理由が「解析ワーカーが動作中」か「終了したが probe 失敗」かで
+        // メッセージを変える (Codex P3: probe 失敗時に「取得しています…」で固着しないように)。
+        let still_probing = self.music_analysis_pending.is_some();
         let name = self
             .items
             .get(fs_idx)
@@ -337,11 +350,12 @@ impl App {
                         }
                     }
                 } else {
-                    ui.label(
-                        egui::RichText::new("情報を取得しています…")
-                            .color(LABEL_COLOR)
-                            .size(12.0),
-                    );
+                    let msg = if still_probing {
+                        "情報を取得しています…"
+                    } else {
+                        "情報を取得できませんでした"
+                    };
+                    ui.label(egui::RichText::new(msg).color(LABEL_COLOR).size(12.0));
                 }
 
                 ui.add_space(8.0);
