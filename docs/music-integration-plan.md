@@ -380,9 +380,24 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   - **未確定/フォロー**: 中央モーダルの中心決めは (0,0) 原点前提（fullscreen viewport / 埋め込みとも
     `full_rect.min≈(0,0)` を確認済み。検証で万一 window mode でズレたら shared fn に origin を渡す）。
     共有ジャンプ行の "BM" 種別ラベルは音声でも各行に出る（動画と同一 anatomy、冗長だが許容）。
-- **Inc 5c-B（下 HUD コントロール行）← 次はここ**: モノリスを state スナップショット + command sink
-  関数へ抽出。速度ポップアップ・音量スライダー(dB 表示)・各ボタンを共有。動画/音楽の両方が呼ぶ。②③解消。
-  現行の暫定 `draw_music_bottom_hud`（`ui_music_panels.rs`）をこの共有版へ置換する。
+- **Inc 5c-B（下 HUD コントロール行）← 次はここ。最重量・最高リスク**: モノリスを state スナップショット +
+  command sink 関数へ抽出。速度ポップアップ・音量スライダー(dB 表示)・各ボタンを共有。動画/音楽の両方が
+  呼ぶ。②③解消。現行の暫定 `draw_music_bottom_hud`（`ui_music_panels.rs`）をこの共有版へ置換する。
+  - **精査済みの正確な境界（2026-07-02）**: 下 HUD Area は `NativeEguiOverlay::run` 内
+    `src/video/native_presenter/mod.rs` **6187–7542**（`if bottom_hud_visible { egui::Area::new("native_video_seek_hud")…show(ctx,|ui|{…}) }`）に
+    インライン。この 1 closure に **シーク行（bar + hover サムネプレビュー = ピン/ブックマークの action 付き
+    ~6960-7130）**、**コンパクション階層 `CompactionTier`（幅でボタン間引き 6308-6336）**、**左クラスタ 4 グループ
+    （replay/play | loop/continuous/prev-next-file | prev-next-marker | capture palette 4 ボタン）**、**右クラスタ
+    （time / speed ボタン / mute / normalize / volume dB スライダー + label + limiter indicator）** が全部入り。
+    速度ポップアップ本体は別途 5214/6901 付近（`video_speed_popup_open` state）。
+  - **動画専用（音楽は無視）**: hover サムネプレビュー + RequestSeekThumbnail、CompactionTier、capture palette、
+    prev/next-file、normalize/limiter。→ 抽出関数は `show_*` フラグ + `Option<TextureId>` + tier で gate。
+  - **推奨サブ分割（各段バイト等価 + Codex）**: (5c-B1) 右クラスタの **volume dB スライダー**を
+    `pub(crate)` helper（`ui, rect, cur_vol, muted → Option<(volume, persist)>`）へ抽出し動画/音楽で共有 →
+    (5c-B2) **speed ボタン + popup**を共有 → (5c-B3) **各ボタン**（play/loop/mute/marker/head）を
+    `draw_overlay_*` icon + `draw_overlay_button_bg` の共有 primitive で音楽 HUD を描き直し →
+    (5c-B4) 余力があればコントロール行全体を snapshot+sink 関数へ。**一括抽出は 1350 行 released video の
+    バイト等価維持が困難なので必ず段階化**。
 - **Inc 5c-C（上バー）**: `draw_native_top_bar` を音楽の上バーに流用（音楽向けにボタン集合を調整。
   Row stepper は音楽専用で足す）。
 - **Inc 5c-D（シーク行）**: seek 行を共有関数へ。
