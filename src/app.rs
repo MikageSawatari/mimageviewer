@@ -28351,6 +28351,7 @@ impl App {
         match self.items.get(idx)? {
             GridItem::Image(p)
             | GridItem::Video(p)
+            | GridItem::Audio(p)
             | GridItem::Folder(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => Some(p.clone()),

@@ -8293,18 +8293,28 @@ impl App {
         self.handle_meta_undo_keys(ctx);
 
         // ページ構成 (1-5) / 連結方式 (6) / 横方向 (7) 切替
-        let key_1 = self.keymap.consume_action(ctx, KeyAction::FsSpreadSingle);
-        let key_2 = self.keymap.consume_action(ctx, KeyAction::FsSpreadLtr);
-        let key_3 = self.keymap.consume_action(ctx, KeyAction::FsSpreadLtrCover);
-        let key_4 = self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
-        let key_5 = self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
-        let key_6 = self
-            .keymap
-            .consume_action(ctx, KeyAction::FsReadingFlowCycle);
-        let key_7 = self
-            .keymap
-            .consume_action(ctx, KeyAction::FsReadingDirectionToggle);
-        let key_0 = self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
+        // 見開き / 読み方向 / フィット (1-7, 0) も画像系状態。音声では consume しない
+        // (次の画像へ spread/reading/fit が漏れるのを防ぐ、Codex P2)。
+        let key_1 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadSingle);
+        let key_2 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadLtr);
+        let key_3 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadLtrCover);
+        let key_4 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
+        let key_5 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
+        let key_6 = !current_item_is_audio
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsReadingFlowCycle);
+        let key_7 = !current_item_is_audio
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsReadingDirectionToggle);
+        let key_0 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
@@ -8360,22 +8370,29 @@ impl App {
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
-        let slot_keys: [bool; 10] = [
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot1),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot2),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot3),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot4),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot5),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot6),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot7),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot8),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot9),
-            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot10),
-        ];
+        // 補正スロットは画像編集操作。音声では consume しない (index-keyed page override が
+        // 音声 idx に書かれるのを防ぐ、Codex P2)。
+        let slot_keys: [bool; 10] = if current_item_is_audio {
+            [false; 10]
+        } else {
+            [
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot1),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot2),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot3),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot4),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot5),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot6),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot7),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot8),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot9),
+                self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot10),
+            ]
+        };
 
         // Ctrl+Backspace / Q: 現在ページの個別補正設定を解除 (標準値に戻す)
         // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
-        let clear_page_key = self.keymap.consume_action(ctx, KeyAction::FsClearAdjust);
+        let clear_page_key =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsClearAdjust);
 
         // 表示モード切替 + フィードバック表示
         let new_spread = if key_1 {

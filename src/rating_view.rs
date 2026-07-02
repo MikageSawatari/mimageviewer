@@ -319,6 +319,7 @@ fn source_path_for_item(item: &GridItem) -> Option<&Path> {
         GridItem::Folder(p)
         | GridItem::Image(p)
         | GridItem::Video(p)
+        | GridItem::Audio(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p) => Some(p),
         GridItem::ConvertibleArchive { path, .. } => Some(path),
