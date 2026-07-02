@@ -25508,6 +25508,14 @@ impl App {
         self.clear_meta_undo();
         self.capture_region_selection = None;
         self.fullscreen_idx = Some(idx);
+        // 音声以外を開いたら音楽ビュー (Inc 3b/4) の状態を破棄する。フルスクリーン内で
+        // 音声→画像/動画へ移動しても draw_fs_music_view は呼ばれず、放置すると旧音声の解析
+        // ワーカー / 常駐 PCM / parked な spectrum worker が次の音声 open か close まで残る
+        // (Codex Inc 4 P2)。音声→別音声は draw_fs_music_view の ensure_music_analysis が path
+        // 比較で処理するのでここでは触らない。
+        if !matches!(self.items.get(idx), Some(GridItem::Audio(_))) {
+            self.clear_music_view_state();
+        }
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
         // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
         self.record_book_resume(idx);
@@ -30247,6 +30255,20 @@ impl App {
         }
     }
 
+    /// 音楽ビュー (Inc 3b/4) の状態を全て破棄する: 解析ワーカー cancel + タイムライン raster +
+    /// spectrum worker + 常駐 PCM。フルスクリーンを抜けた / 音声以外へ移ったときに呼ぶ
+    /// (§7.9 grid/viewer lifecycle)。Inc 4 で spectrum worker が parked のまま + PCM が常駐する
+    /// ようになったため、音声→画像/動画への移動でも確実に teardown する必要がある (Codex P2)。
+    pub(crate) fn clear_music_view_state(&mut self) {
+        self.cancel_music_analysis();
+        self.music_timeline_cache.clear();
+        self.music_spectrum.clear();
+        self.music_analysis = None;
+        self.music_pcm = None;
+        self.music_analysis_error = None;
+        self.music_analysis_path = None;
+    }
+
     /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。
     ///
     /// 音楽ビュー (D3) は egui で描くので GPU 映像経路 (`gpu_video_device`) と native
@@ -31482,15 +31504,9 @@ impl App {
         self.slideshow_popup_open = false;
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
-        // 音楽ビュー (Inc 3b) の解析ワーカー + row raster worker を止めて状態を捨てる
+        // 音楽ビュー (Inc 3b/4) の解析ワーカー + row raster + spectrum worker + PCM を止めて捨てる
         // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
-        self.cancel_music_analysis();
-        self.music_timeline_cache.clear();
-        self.music_spectrum.clear();
-        self.music_analysis = None;
-        self.music_pcm = None;
-        self.music_analysis_error = None;
-        self.music_analysis_path = None;
+        self.clear_music_view_state();
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
         // 開いたとき分析モードのまま起動してしまう (fullscreen_idx がまだ有効なうちに呼ぶ)。
         if self.analysis_mode {

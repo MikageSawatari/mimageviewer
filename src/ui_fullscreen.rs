@@ -19001,21 +19001,31 @@ impl App {
         // 下部の再生ボタン + シークバー (後述) の上端。中央コンテンツはそこまでに収める。
         let controls_region_top = rect.bottom() - 90.0;
         // 中央領域の下端に 108-band spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
-        // タイムライン (or 解析中アイコン) の領域。
-        const MUSIC_SPECTRUM_H: f32 = 180.0;
+        // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
+        // 潰さないよう、帯高は「タイムライン領域を最低 MIN 残す」制約で伸縮させ、確保しても
+        // MIN_H 未満になる極端に短い窓では spectrum を出さない (Codex Inc 4 P3)。
+        const MUSIC_SPECTRUM_MAX_H: f32 = 180.0;
+        const MUSIC_SPECTRUM_MIN_H: f32 = 60.0;
+        const MUSIC_TIMELINE_MIN_H: f32 = 120.0;
         const MUSIC_SPECTRUM_GAP: f32 = 8.0;
-        let spectrum_bottom = controls_region_top - 4.0;
-        let spectrum_top = (spectrum_bottom - MUSIC_SPECTRUM_H).max(rect.top() + top_h + 1.0);
+        let band_top = rect.top() + top_h;
+        let band_bottom = controls_region_top - 4.0;
+        let band_h = (band_bottom - band_top).max(0.0);
+        let spectrum_h =
+            MUSIC_SPECTRUM_MAX_H.min((band_h - MUSIC_SPECTRUM_GAP - MUSIC_TIMELINE_MIN_H).max(0.0));
+        let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H;
         let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 8.0, spectrum_top),
-            egui::pos2(rect.right() - 8.0, spectrum_bottom),
+            egui::pos2(rect.left() + 8.0, band_bottom - spectrum_h),
+            egui::pos2(rect.right() - 8.0, band_bottom),
         );
+        let central_bottom = if show_spectrum {
+            (band_bottom - spectrum_h - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
+        } else {
+            controls_region_top.max(band_top + 1.0)
+        };
         let central_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top() + top_h),
-            egui::pos2(
-                rect.right(),
-                (spectrum_top - MUSIC_SPECTRUM_GAP).max(rect.top() + top_h + 1.0),
-            ),
+            egui::pos2(rect.left(), band_top),
+            egui::pos2(rect.right(), central_bottom),
         );
 
         let show_timeline = self
@@ -19089,9 +19099,12 @@ impl App {
         // ── 下段 108-band spectrum + ピッチ鍵盤 (Inc 4)。──
         // 再生位置周辺 ±1 秒の PCM をワーカーで FFT して描く。PCM 未着 (デコード中 / 上限超で
         // 無効) の間は空バンド = 鍵盤ベースラインのみ。Arc は clone で借用衝突を避ける。
-        let pcm = self.music_pcm.clone();
-        self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
-        self.music_spectrum.draw(ui, spectrum_rect);
+        // 縦窓が極端に短く帯を確保できない場合 (show_spectrum=false) は worker を回さず描かない。
+        if show_spectrum {
+            let pcm = self.music_pcm.clone();
+            self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
+            self.music_spectrum.draw(ui, spectrum_rect);
+        }
 
         // 上情報バー (常時): ファイル名 + 位置/長さ。
         let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
