@@ -280,6 +280,13 @@ impl App {
         let mut set_tag: Option<(String, bool, Vec<TagTarget>)> = None;
         let mut searched_tag: Option<String> = None;
         let mut clicked_palette_rgb: Option<[u8; 3]> = None;
+        // ★ レーティング (画像/動画/音声で統一。★ → タグ → 内容 の先頭)。レーティング可能な
+        // 単一アイテム (画像 / ZIP 内画像 / PDF ページ) でのみ行を出す。
+        let rating_idx = self
+            .fullscreen_idx
+            .filter(|&i| self.items.get(i).is_some_and(|it| it.accepts_rating()));
+        let rating_stars = rating_idx.map(|i| self.get_rating(i)).unwrap_or(0);
+        let mut set_rating: Option<u8> = None;
         let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
         let tag_picker_ime_active = self.ime_input_active();
@@ -323,7 +330,23 @@ impl App {
                     return;
                 }
 
-                // ── タグパネル (最上段) ──
+                // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序) ──
+                if rating_idx.is_some() {
+                    set_rating = crate::ui_helpers::draw_rating_stars(ui, rating_stars);
+                    if show_tag_panel
+                        || tweet_info.is_some()
+                        || ai_metadata.is_some()
+                        || exif_info.is_some()
+                        || sidecar_info.is_some()
+                        || current_palette.is_some()
+                    {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                }
+
+                // ── タグパネル ──
                 // ピン留めタグと、表示対象に付いている未ピン留めタグを ON/OFF ボタンで並べる。
                 if show_tag_panel {
                     draw_tag_panel(
@@ -417,18 +440,23 @@ impl App {
                     draw_sidecar_section(ui, sc);
                 }
 
-                // 何もない場合
+                // 何もない場合 (★ 行も出ていないとき)
                 if ai_metadata.is_none()
                     && exif_info.is_none()
                     && tweet_info.is_none()
                     && !show_tag_panel
                     && sidecar_info.is_none()
                     && current_palette.is_none()
+                    && rating_idx.is_none()
                 {
                     draw_no_metadata(ui);
                 }
             });
 
+        // ★ レーティングの後処理 (draw_rating_stars が「同★再クリック=0」を解決済み)。
+        if let (Some(idx), Some(new_stars)) = (rating_idx, set_rating) {
+            self.set_rating(idx, new_stars);
+        }
         // タグボタンクリックの後処理 (closure 外で self を可変借用する)
         if let Some((tag_name, targets)) = clicked_tag {
             self.request_tag_toggle_for_targets(&tag_name, targets);

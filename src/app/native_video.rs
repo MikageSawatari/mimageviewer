@@ -2466,6 +2466,11 @@ impl App {
             crate::video::NativeVideoOutputEvent::OpenExternalUrl { url } => {
                 self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
             }
+            crate::video::NativeVideoOutputEvent::SetRating { stars } => {
+                self.set_rating(fs_idx, stars);
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::ToggleTag { name } => {
                 self.request_tag_toggle_for_selection(&name);
                 self.sync_native_video_metadata(fs_idx);
@@ -4201,6 +4206,8 @@ impl App {
         let shortcut_tags = self.cached_native_overlay_shortcut_tags();
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
+        // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
+        let rating = self.get_rating(fs_idx);
 
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
@@ -4229,6 +4236,7 @@ impl App {
                 original_url: info.original_url.clone(),
                 description: info.description.clone(),
                 probe_info_available: true,
+                rating,
                 current_tags,
                 shortcut_tags,
                 tag_choices,
@@ -4261,6 +4269,7 @@ impl App {
                 original_url: None,
                 description: None,
                 probe_info_available: false,
+                rating,
                 current_tags,
                 shortcut_tags,
                 tag_choices,

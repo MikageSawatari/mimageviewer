@@ -750,6 +750,35 @@ pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
     painter.circle_filled(right_head, head_r, color);
 }
 
+/// フルスクリーン右パネル共通の ★ レーティング行を描く (画像 / 動画 / 音声で共有)。
+///
+/// クリックされたら**解決済みの新しい値**を `Some` で返す: 現在値と同じ★を再クリックした
+/// 場合は 0 (解除)、それ以外はクリックした★の数。呼び出し側はその値を保存経路
+/// (`set_rating` / `NativeOverlayCommand::SetRating` 等) に流すだけでよい。★ は Yu Gothic に
+/// 含まれフォント安全 (グリッドセルでも使用、CLAUDE.md グリフポリシー)。
+pub fn draw_rating_stars(ui: &mut egui::Ui, current: u8) -> Option<u8> {
+    let mut result: Option<u8> = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for star in 1..=5u8 {
+            let filled = star <= current;
+            let color = if filled {
+                egui::Color32::from_rgb(255, 205, 70)
+            } else {
+                egui::Color32::from_gray(96)
+            };
+            let resp = ui.add(
+                egui::Label::new(egui::RichText::new("★").color(color).size(20.0))
+                    .sense(egui::Sense::click()),
+            );
+            if resp.clicked() {
+                result = Some(if star == current { 0 } else { star });
+            }
+        }
+    });
+    result
+}
+
 /// サムネイル左下にファイル種別バッジを描画する共通関数。
 fn draw_file_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str, bg: egui::Color32) {
     let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);

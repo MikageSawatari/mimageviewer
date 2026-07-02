@@ -696,6 +696,8 @@ pub struct NativeOverlayMetadata {
     pub original_url: Option<String>,
     pub description: Option<String>,
     pub probe_info_available: bool,
+    /// ★ レーティング (0..=5)。右パネル先頭の★行に表示 (画像/動画/音声で統一、Inc 5 FB)。
+    pub rating: u8,
     pub current_tags: Vec<String>,
     // タグ候補カタログとピン留めタグは数十〜数百件になり得るうえ、overlay metadata は
     // フルスクリーン動画中 **毎フレーム** rebuild される (app::sync_native_video_metadata)。
@@ -1297,6 +1299,10 @@ pub enum NativeOverlayCommand {
     ClearAllBookmarksForCurrent,
     OpenExternalUrl {
         url: String,
+    },
+    /// 右パネル先頭の★行クリック。解決済みの新レーティング (0..=5、同★再クリックで 0)。
+    SetRating {
+        stars: u8,
     },
     ToggleTag {
         name: String,

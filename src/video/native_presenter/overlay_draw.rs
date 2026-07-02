@@ -3924,6 +3924,15 @@ pub(super) fn draw_native_metadata_panel(
                         );
                         return;
                     }
+                    // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序、Inc 5 FB) ──
+                    if let Some(new_stars) =
+                        crate::ui_helpers::draw_rating_stars(ui, metadata.rating)
+                    {
+                        commands.push(NativeOverlayCommand::SetRating { stars: new_stars });
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                     draw_native_tag_panel(
                         ui,
                         metadata,

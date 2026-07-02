@@ -3197,22 +3197,6 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
-/// 秒数を `M:SS` (1 時間以上は `H:MM:SS`) にフォーマットする (音楽ビューの時間表示)。
-fn music_fmt_time(secs: f64) -> String {
-    if !secs.is_finite() || secs < 0.0 {
-        return "0:00".to_string();
-    }
-    let total = secs as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
 /// フルスクリーンのキー入力結果。
 #[derive(Default)]
 pub(crate) struct FsKeyAction {
@@ -6831,6 +6815,10 @@ impl App {
                             | GridItem::ZipImage { .. }
                             | GridItem::PdfPage { .. }
                             | GridItem::ZipSeparator { .. }
+                            // 音声 (音楽ビュー) も egui 描画なので静止画と同じ embedded 経路で
+                            // ウィンドウ内表示できる (Inc 5 FB: F11 でウィンドウ化)。native
+                            // presenter を持たないので backdrop early-return には掛からない。
+                            | GridItem::Audio(_)
                     )
                 )
             })
@@ -19077,40 +19065,16 @@ impl App {
             return;
         }
 
-        // ── 中央領域: 解析が揃っていれば DJ 風タイムライン、無ければ音楽アイコン + 状態。──
+        // ── レイアウト (Inc 5 FB: 動画に合わせる) ──
+        // 上バー (常時) / 中央 (timeline + spectrum、全幅・縮小しない) / 下 HUD (常時、
+        // seek 行 + コントロール行)。左右パネルは端ホバーでオーバーレイ表示し、**中央は
+        // 縮小しない** (動画のジャンプ/メタパネルと同じ。ピン/トグルボタンは持たない)。
         let top_h = 34.0;
-        // 下部の再生ボタン + シークバー (後述) の上端。中央コンテンツはそこまでに収める。
-        let controls_region_top = rect.bottom() - 90.0;
-
-        // ── 左右パネル (Inc 5) の表示判定と中央コンテンツの横幅確定 ──
-        // パネルは上情報バーの下〜再生コントロールの上の帯だけを占め、上バー / 下シークバーは
-        // 常に全幅で残す (画像フルスクリーンの左右パネルと同じレイアウト思想)。パネルが開いて
-        // いる側は中央のタイムライン/スペクトラムを縮めて重なりを避ける (クリック競合回避)。
+        let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
+        let hud_top = rect.bottom() - hud_h;
         let panel_band_top = rect.top() + top_h;
-        let panel_band_bottom = controls_region_top;
-        let left_panel_open = self.music_bookmarks_panel_open;
-        // 右パネルは画像メタパネルと同じく show_metadata_panel (TAB/I ピン) or 右端ホバーで開く。
-        let right_hover = ctx.input(|i| {
-            if self.cursor_hidden {
-                return false;
-            }
-            i.pointer.hover_pos().is_some_and(|p| {
-                p.x >= rect.right() - crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
-                    && p.y >= panel_band_top
-                    && p.y <= panel_band_bottom
-            })
-        });
-        let right_panel_open = self.show_metadata_panel || right_hover;
-        let content_left = if left_panel_open {
-            rect.left() + crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH
-        } else {
-            rect.left()
-        };
-        let content_right = if right_panel_open {
-            rect.right() - crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
-        } else {
-            rect.right()
-        };
+        let panel_band_bottom = hud_top;
+
         // 中央領域の下端に 108-band spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
         // 潰さないよう、帯高は「タイムライン領域を最低 MIN 残す」制約で伸縮させ、確保しても
@@ -19120,23 +19084,23 @@ impl App {
         const MUSIC_TIMELINE_MIN_H: f32 = 120.0;
         const MUSIC_SPECTRUM_GAP: f32 = 8.0;
         let band_top = rect.top() + top_h;
-        let band_bottom = controls_region_top - 4.0;
+        let band_bottom = hud_top - 4.0;
         let band_h = (band_bottom - band_top).max(0.0);
         let spectrum_h =
             MUSIC_SPECTRUM_MAX_H.min((band_h - MUSIC_SPECTRUM_GAP - MUSIC_TIMELINE_MIN_H).max(0.0));
         let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H;
         let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(content_left + 8.0, band_bottom - spectrum_h),
-            egui::pos2(content_right - 8.0, band_bottom),
+            egui::pos2(rect.left() + 8.0, band_bottom - spectrum_h),
+            egui::pos2(rect.right() - 8.0, band_bottom),
         );
         let central_bottom = if show_spectrum {
             (band_bottom - spectrum_h - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
         } else {
-            controls_region_top.max(band_top + 1.0)
+            hud_top.max(band_top + 1.0)
         };
         let central_rect = egui::Rect::from_min_max(
-            egui::pos2(content_left, band_top),
-            egui::pos2(content_right, central_bottom),
+            egui::pos2(rect.left(), band_top),
+            egui::pos2(rect.right(), central_bottom),
         );
 
         let show_timeline = self
@@ -19217,121 +19181,49 @@ impl App {
             self.music_spectrum.draw(ui, spectrum_rect);
         }
 
-        // ── 左右パネル (Inc 5) ── 中央コンテンツは既に縮めてあるので帯に重ねて描く。
-        if left_panel_open {
+        // ── 左右パネル (Inc 5 FB) ── 端ホバーでオーバーレイ表示 (動画のジャンプ/メタパネルと
+        // 同じ)。中央は縮小しないので、中央 timeline/spectrum の上に重ねて描く (クリックは後描画
+        // のパネルが優先。ピン/トグルボタンは持たない)。左=ブックマーク、右=情報/タグ/★。
+        let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
+        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH;
+        let hover_pos = ctx.input(|i| {
+            if self.cursor_hidden {
+                None
+            } else {
+                i.pointer.hover_pos()
+            }
+        });
+        let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
+        let left_hover = hover_pos.is_some_and(|p| p.x <= rect.left() + left_w && in_band(p));
+        let right_hover = hover_pos.is_some_and(|p| p.x >= rect.right() - right_w && in_band(p));
+        if left_hover {
             let lp = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), panel_band_top),
-                egui::pos2(
-                    rect.left() + crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH,
-                    panel_band_bottom,
-                ),
+                egui::pos2(rect.left() + left_w, panel_band_bottom),
             );
             self.draw_fs_music_bookmarks_panel(ui, ctx, lp, fs_idx);
         }
-        if right_panel_open {
+        if right_hover {
             let rp = egui::Rect::from_min_max(
-                egui::pos2(
-                    rect.right() - crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH,
-                    panel_band_top,
-                ),
+                egui::pos2(rect.right() - right_w, panel_band_top),
                 egui::pos2(rect.right(), panel_band_bottom),
             );
             self.draw_fs_music_right_panel(ui, ctx, rp, fs_idx);
         }
 
-        // 上情報バー (常時): [ブックマーク] ファイル名 … 位置/長さ [情報]。
+        // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時)。
+        // 左右パネルは端ホバーで出すのでトグルボタンは置かない (Inc 5 FB、動画と同じ)。
+        // 位置/長さ・音量・再生などは下 HUD に集約 (動画のレイアウト思想)。
         let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
         painter.rect_filled(
             top_rect,
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, if dark { 90 } else { 30 }),
         );
-        let tb_btn = top_h - 12.0;
-        let tb_btn_bg = |active: bool, hovered: bool| {
-            if active {
-                accent
-            } else if hovered {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
-            }
-        };
-        // ── ブックマークパネルのトグル (左端、リボンアイコン) ──
-        let bm_rect = egui::Rect::from_min_size(
-            egui::pos2(top_rect.left() + 6.0, top_rect.center().y - tb_btn * 0.5),
-            egui::vec2(tb_btn, tb_btn),
-        );
-        let bm_resp = ui.interact(
-            bm_rect,
-            ui.id().with(("music_bookmark_toggle", fs_idx)),
-            egui::Sense::click(),
-        );
-        painter.rect_filled(
-            bm_rect,
-            4.0,
-            tb_btn_bg(self.music_bookmarks_panel_open, bm_resp.hovered()),
-        );
-        // リボン (下部に V ノッチ) を painter で描く (フォント非依存、CLAUDE.md グリフポリシー)。
-        {
-            let r = bm_rect.shrink(6.0);
-            let notch = r.height() * 0.32;
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    r.left_top(),
-                    r.right_top(),
-                    r.right_bottom(),
-                    egui::pos2(r.center().x, r.bottom() - notch),
-                    r.left_bottom(),
-                ],
-                fg,
-                egui::Stroke::NONE,
-            ));
-        }
-        let bm_resp = bm_resp.on_hover_text("ブックマーク一覧");
-        if bm_resp.clicked() {
-            self.music_bookmarks_panel_open = !self.music_bookmarks_panel_open;
-        }
-        // ── 情報パネルのトグル (右端、"i" アイコン) ──
-        let info_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                top_rect.right() - 6.0 - tb_btn,
-                top_rect.center().y - tb_btn * 0.5,
-            ),
-            egui::vec2(tb_btn, tb_btn),
-        );
-        let info_resp = ui.interact(
-            info_rect,
-            ui.id().with(("music_info_toggle", fs_idx)),
-            egui::Sense::click(),
-        );
-        painter.rect_filled(
-            info_rect,
-            4.0,
-            tb_btn_bg(self.show_metadata_panel, info_resp.hovered()),
-        );
         painter.text(
-            info_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "i",
-            egui::FontId::proportional(15.0),
-            fg,
-        );
-        let info_resp = info_resp.on_hover_text("音楽情報 / タグ [Tab]");
-        if info_resp.clicked() {
-            self.show_metadata_panel = !self.show_metadata_panel;
-        }
-        // ファイル名 (ブックマークボタンの右) / 位置・長さ (情報ボタンの左)。
-        painter.text(
-            egui::pos2(bm_rect.right() + 8.0, top_rect.center().y),
+            top_rect.left_center() + egui::vec2(12.0, 0.0),
             egui::Align2::LEFT_CENTER,
             &name,
-            egui::FontId::proportional(14.0),
-            fg,
-        );
-        painter.text(
-            egui::pos2(info_rect.left() - 8.0, top_rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            format!("{} / {}", music_fmt_time(pos), music_fmt_time(dur)),
             egui::FontId::proportional(14.0),
             fg,
         );
@@ -19420,118 +19312,11 @@ impl App {
             }
         }
 
-        // 下シークバー (常時、クリック/ドラッグでシーク)。
-        let bar_h = 10.0;
-        let bar_margin = 24.0;
-        let bar_top = rect.bottom() - 40.0;
-        let bar_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + bar_margin, bar_top),
-            egui::pos2(rect.right() - bar_margin, bar_top + bar_h),
-        );
-        painter.rect_filled(
-            bar_rect,
-            bar_h * 0.5,
-            if dark {
-                egui::Color32::from_gray(60)
-            } else {
-                egui::Color32::from_gray(190)
-            },
-        );
-        let frac = if dur > 0.0 {
-            (pos / dur).clamp(0.0, 1.0) as f32
-        } else {
-            0.0
-        };
-        if frac > 0.0 {
-            let filled = egui::Rect::from_min_max(
-                bar_rect.min,
-                egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),
-            );
-            painter.rect_filled(filled, bar_h * 0.5, accent);
-        }
-        // ブックマークマーカー (Inc 5): シークバー上に黄色の縦線で位置を示す。
-        if dur > 0.0 {
-            let marker_color = egui::Color32::from_rgb(255, 220, 82);
-            for bm in &self.music_bookmarks {
-                let f = (bm.pts_secs / dur).clamp(0.0, 1.0) as f32;
-                let x = bar_rect.left() + bar_rect.width() * f;
-                painter.line_segment(
-                    [
-                        egui::pos2(x, bar_rect.top() - 5.0),
-                        egui::pos2(x, bar_rect.bottom() + 5.0),
-                    ],
-                    egui::Stroke::new(2.0, marker_color),
-                );
-            }
-        }
-        let seek_resp = ui.interact(
-            bar_rect.expand2(egui::vec2(0.0, 8.0)),
-            ui.id().with(("music_seek", fs_idx)),
-            egui::Sense::click_and_drag(),
-        );
-        if (seek_resp.clicked() || seek_resp.dragged())
-            && dur > 0.0
-            && let Some(p) = seek_resp.interact_pointer_pos()
-        {
-            let f = ((p.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
-            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.seek(f * dur);
-            }
-        }
-
-        // 再生/一時停止ボタン (シークバー左上)。
-        let btn = 30.0;
-        let btn_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + bar_margin, bar_top - btn - 12.0),
-            egui::vec2(btn, btn),
-        );
-        let btn_resp = ui.interact(
-            btn_rect,
-            ui.id().with(("music_playpause", fs_idx)),
-            egui::Sense::click(),
-        );
-        painter.circle_filled(
-            btn_rect.center(),
-            btn * 0.5,
-            if btn_resp.hovered() {
-                accent
-            } else if dark {
-                egui::Color32::from_gray(70)
-            } else {
-                egui::Color32::from_gray(170)
-            },
-        );
-        let c = btn_rect.center();
-        if playing {
-            let bw = btn * 0.11;
-            let bh = btn * 0.34;
-            painter.rect_filled(
-                egui::Rect::from_center_size(c - egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
-                1.0,
-                egui::Color32::WHITE,
-            );
-            painter.rect_filled(
-                egui::Rect::from_center_size(c + egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
-                1.0,
-                egui::Color32::WHITE,
-            );
-        } else {
-            let t = btn * 0.16;
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    c + egui::vec2(-t * 0.8, -t),
-                    c + egui::vec2(-t * 0.8, t),
-                    c + egui::vec2(t * 1.2, 0.0),
-                ],
-                egui::Color32::WHITE,
-                egui::Stroke::NONE,
-            ));
-        }
-        if btn_resp.clicked()
-            && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
-        {
-            player.toggle_play();
-        }
+        // ── 下 HUD (常時): seek 行 + コントロール行 (Inc 5 FB、動画のレイアウトに寄せる) ──
+        // 頭出し / 再生・一時停止 / ループ / ブックマーク前後ジャンプ / 位置・長さ / 再生速度 /
+        // ミュート / 音量スライダー + シークバー上のブックマークマーカー。
+        let hud_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), hud_top), rect.max);
+        self.draw_music_bottom_hud(ui, hud_rect, fs_idx, pos, dur, playing, dark);
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
         if playing {

@@ -454,6 +454,10 @@ pub enum NativeVideoOutputEvent {
     OpenExternalUrl {
         url: String,
     },
+    /// 右パネル先頭の★行クリック。解決済みの新レーティング (0..=5)。
+    SetRating {
+        stars: u8,
+    },
     ToggleTag {
         name: String,
     },
@@ -1549,6 +1553,7 @@ fn send_native_overlay_command(
         }
         Command::ClearAllBookmarksForCurrent => NativeVideoOutputEvent::ClearAllBookmarksForCurrent,
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
+        Command::SetRating { stars } => NativeVideoOutputEvent::SetRating { stars },
         Command::ToggleTag { name } => NativeVideoOutputEvent::ToggleTag { name },
         Command::AddTag { name } => NativeVideoOutputEvent::AddTag { name },
         Command::RemoveTag { name } => NativeVideoOutputEvent::RemoveTag { name },
@@ -3260,6 +3265,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::OpenExternalUrl { url },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetRating {
+                                stars,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetRating { stars },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTag {

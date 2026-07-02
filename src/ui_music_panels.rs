@@ -21,6 +21,10 @@ use crate::grid_item::GridItem;
 pub(crate) const MUSIC_LEFT_PANEL_WIDTH: f32 = 292.0;
 /// 右パネル (音楽情報 + タグ) の幅。
 pub(crate) const MUSIC_RIGHT_PANEL_WIDTH: f32 = 340.0;
+/// 下 HUD の高さ (seek 行 + コントロール行、常時表示、Inc 5 FB で動画寄りに)。
+pub(crate) const MUSIC_HUD_HEIGHT: f32 = 62.0;
+/// 再生速度プリセット (コントロール行の速度ボタンで巡回)。
+const MUSIC_SPEED_PRESETS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 const PANEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(16, 16, 20, 235);
 const PANEL_DIVIDER: egui::Color32 = egui::Color32::from_rgba_premultiplied(255, 255, 255, 40);
@@ -320,7 +324,23 @@ impl App {
             .show(&mut child, |ui| {
                 ui.set_width(ui.available_width());
 
-                // ── 音楽情報セクション ──
+                // 統一順序 (画像/動画/音声共通): ★ → タグ → 内容 (★ は固定高で先頭、
+                // 可変高のタグを中間に置く。ユーザー確定 2026-07-02)。
+                // ── ★ レーティング ──
+                set_rating = crate::ui_helpers::draw_rating_stars(ui, stars);
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // ── タグ (画像パネルと同一 UI を再利用) ──
+                self.draw_music_tag_section(ui, ctx);
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // ── 内容 (音楽情報) ──
                 ui.label(
                     egui::RichText::new(&name)
                         .color(VALUE_COLOR)
@@ -357,37 +377,10 @@ impl App {
                     };
                     ui.label(egui::RichText::new(msg).color(LABEL_COLOR).size(12.0));
                 }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // ── ★ レーティング ──
-                ui.label(
-                    egui::RichText::new("レーティング")
-                        .color(LABEL_COLOR)
-                        .size(12.0),
-                );
-                ui.add_space(2.0);
-                set_rating = draw_rating_row(ui, stars);
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // ── タグ (画像パネルと同一 UI を再利用) ──
-                ui.label(egui::RichText::new("タグ").color(LABEL_COLOR).size(12.0));
-                ui.add_space(2.0);
-                self.draw_music_tag_section(ui, ctx);
             });
 
-        if let Some(stars) = set_rating {
-            // 同じ★を再クリックしたら解除 (0)、それ以外はその値に設定。
-            let new_stars = if stars == self.get_rating(fs_idx) {
-                0
-            } else {
-                stars
-            };
+        if let Some(new_stars) = set_rating {
+            // draw_rating_stars が「同★再クリック=0」を解決済み。
             self.set_rating(fs_idx, new_stars);
         }
     }
@@ -630,31 +623,514 @@ impl App {
             None => {}
         }
     }
-}
 
-/// ★ レーティング行を描く。クリックされた★の値 (1..=5) を返す。呼び出し側で
-/// 「同じ値の再クリック → 0 (解除)」を判定する。
-fn draw_rating_row(ui: &mut egui::Ui, current: u8) -> Option<u8> {
-    let mut clicked: Option<u8> = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        for star in 1..=5u8 {
-            let filled = star <= current;
-            let color = if filled {
-                egui::Color32::from_rgb(255, 205, 70)
-            } else {
-                egui::Color32::from_gray(96)
-            };
-            let resp = ui.add(
-                egui::Label::new(egui::RichText::new("★").color(color).size(20.0))
-                    .sense(egui::Sense::click()),
+    // ───────────────────────── 下 HUD (seek 行 + コントロール行) ─────────────────────────
+
+    /// 音楽ビュー下 HUD (Inc 5 FB): seek 行 + コントロール行 (動画のレイアウトに寄せる)。
+    /// 頭出し / 再生・一時停止 / 前後ブックマークジャンプ / ループ / 位置・長さ / 再生速度 /
+    /// ミュート / 音量スライダー + シークバー上のブックマークマーカー。常時表示。
+    ///
+    /// (音量ノーマライズは動画のようなスキャン UI が必要なため、この HUD には載せていない。
+    /// 音量正規化は開いた時点で `audio_normalize_db` キャッシュ値が適用される。)
+    pub(crate) fn draw_music_bottom_hud(
+        &mut self,
+        ui: &mut egui::Ui,
+        hud_rect: egui::Rect,
+        fs_idx: usize,
+        pos: f64,
+        dur: f64,
+        playing: bool,
+        dark: bool,
+    ) {
+        // 現在状態を先に読む (player 借用を短く保つ)。
+        let (cur_vol, muted) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (player.volume(), player.is_muted()),
+            _ => (1.0, false),
+        };
+        let speed = self.video_playback_speed;
+        let loop_on = self.music_loop_enabled;
+        // マーカー / ジャンプ用に pts をスナップショット (self.music_bookmarks の借用回避)。
+        let marker_secs: Vec<f64> = self.music_bookmarks.iter().map(|b| b.pts_secs).collect();
+
+        let accent = egui::Color32::from_rgb(90, 150, 220);
+        let fg = egui::Color32::from_gray(220);
+        let dim = egui::Color32::from_gray(150);
+        let painter = ui.painter_at(hud_rect);
+        painter.rect_filled(
+            hud_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, if dark { 150 } else { 60 }),
+        );
+
+        let seek_row_h = 22.0;
+        let controls_cy = (hud_rect.top() + seek_row_h + hud_rect.bottom()) * 0.5;
+
+        // 収集する操作 (描画中は self を可変借用しないため、末尾でまとめて適用)。
+        let mut seek_to: Option<f64> = None;
+        let mut toggle_play = false;
+        let mut seek_start = false;
+        let mut toggle_loop = false;
+        let mut cycle_speed = false;
+        let mut toggle_mute = false;
+        let mut set_vol: Option<f64> = None;
+
+        // ── seek 行 (バー + ブックマークマーカー + クリック/ドラッグ seek) ──
+        let bar_margin = 16.0;
+        let bar_h = 6.0;
+        let bar_cy = hud_rect.top() + seek_row_h * 0.5;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(hud_rect.left() + bar_margin, bar_cy - bar_h * 0.5),
+            egui::pos2(hud_rect.right() - bar_margin, bar_cy + bar_h * 0.5),
+        );
+        painter.rect_filled(bar_rect, bar_h * 0.5, egui::Color32::from_gray(70));
+        let frac = if dur > 0.0 {
+            (pos / dur).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        if frac > 0.0 {
+            let filled = egui::Rect::from_min_max(
+                bar_rect.min,
+                egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),
             );
-            if resp.clicked() {
-                clicked = Some(star);
+            painter.rect_filled(filled, bar_h * 0.5, accent);
+        }
+        if dur > 0.0 {
+            let marker_color = egui::Color32::from_rgb(255, 220, 82);
+            for &s in &marker_secs {
+                let f = (s / dur).clamp(0.0, 1.0) as f32;
+                let mx = bar_rect.left() + bar_rect.width() * f;
+                painter.line_segment(
+                    [
+                        egui::pos2(mx, bar_rect.top() - 4.0),
+                        egui::pos2(mx, bar_rect.bottom() + 4.0),
+                    ],
+                    egui::Stroke::new(2.0, marker_color),
+                );
             }
         }
-    });
-    clicked
+        let seek_resp = ui.interact(
+            bar_rect.expand2(egui::vec2(0.0, 7.0)),
+            ui.id().with(("music_hud_seek", fs_idx)),
+            egui::Sense::click_and_drag(),
+        );
+        if (seek_resp.clicked() || seek_resp.dragged())
+            && dur > 0.0
+            && let Some(p) = seek_resp.interact_pointer_pos()
+        {
+            let f = ((p.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
+            seek_to = Some(f * dur);
+        }
+
+        // ── コントロール行: 左クラスタ (頭出し / 再生 / 前後ブックマーク / ループ) ──
+        let bsz = 26.0;
+        let mut x = hud_rect.left() + 14.0;
+        let alloc = |x: &mut f32, w: f32| -> egui::Rect {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(*x, controls_cy - bsz * 0.5),
+                egui::vec2(w, bsz),
+            );
+            *x += w + 6.0;
+            r
+        };
+        let btn_bg = |r: egui::Rect, hovered: bool, active: bool| {
+            let c = if active {
+                accent
+            } else if hovered {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+            };
+            painter.rect_filled(r, 4.0, c);
+        };
+
+        // 頭出し (|◀)
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_start", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text("頭出し");
+        btn_bg(r, resp.hovered(), false);
+        {
+            let c = r.center();
+            let t = bsz * 0.16;
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    egui::pos2(c.x - t * 1.4, c.y),
+                    egui::vec2(bsz * 0.08, t * 2.0),
+                ),
+                1.0,
+                fg,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(t * 0.9, -t),
+                    c + egui::vec2(t * 0.9, t),
+                    c + egui::vec2(-t * 0.5, 0.0),
+                ],
+                fg,
+                egui::Stroke::NONE,
+            ));
+        }
+        if resp.clicked() {
+            seek_start = true;
+        }
+
+        // 再生 / 一時停止
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_play", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(if playing { "一時停止" } else { "再生" });
+        btn_bg(r, resp.hovered(), false);
+        {
+            let c = r.center();
+            if playing {
+                let bw = bsz * 0.09;
+                let bh = bsz * 0.3;
+                painter.rect_filled(
+                    egui::Rect::from_center_size(c - egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
+                    1.0,
+                    fg,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_center_size(c + egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
+                    1.0,
+                    fg,
+                );
+            } else {
+                let t = bsz * 0.18;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        c + egui::vec2(-t * 0.7, -t),
+                        c + egui::vec2(-t * 0.7, t),
+                        c + egui::vec2(t, 0.0),
+                    ],
+                    fg,
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+        if resp.clicked() {
+            toggle_play = true;
+        }
+
+        // 前ブックマーク (◀◀)
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_prevbm", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text("前のブックマーク");
+        btn_bg(r, resp.hovered(), false);
+        draw_double_triangle(&painter, r, false, fg);
+        if resp.clicked() {
+            if let Some(&t) = marker_secs.iter().rev().find(|&&s| s < pos - 0.3) {
+                seek_to = Some(t);
+            } else if !marker_secs.is_empty() {
+                seek_to = Some(0.0);
+            }
+        }
+
+        // 次ブックマーク (▶▶)
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_nextbm", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text("次のブックマーク");
+        btn_bg(r, resp.hovered(), false);
+        draw_double_triangle(&painter, r, true, fg);
+        if resp.clicked()
+            && let Some(&t) = marker_secs.iter().find(|&&s| s > pos + 0.3)
+        {
+            seek_to = Some(t);
+        }
+
+        // ループ
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_loop", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text("ループ");
+        btn_bg(r, resp.hovered(), loop_on);
+        draw_loop_icon(
+            &painter,
+            r,
+            if loop_on { egui::Color32::WHITE } else { dim },
+        );
+        if resp.clicked() {
+            toggle_loop = true;
+        }
+
+        // ── コントロール行: 右クラスタ (右寄せ: 音量 / ミュート / 速度 / 時間) ──
+        let mut rx = hud_rect.right() - 14.0;
+        // 音量スライダー (dB 空間 [-48, +12] にマップ)。
+        const VMIN_DB: f64 = -48.0;
+        const VMAX_DB: f64 = 12.0;
+        let vol_w = 120.0;
+        let vol_rect = egui::Rect::from_min_max(
+            egui::pos2(rx - vol_w, controls_cy - 4.0),
+            egui::pos2(rx, controls_cy + 4.0),
+        );
+        rx -= vol_w + 10.0;
+        let cur_db = if cur_vol <= 1e-4 {
+            VMIN_DB
+        } else {
+            (20.0 * cur_vol.log10()).clamp(VMIN_DB, VMAX_DB)
+        };
+        let vol_frac = ((cur_db - VMIN_DB) / (VMAX_DB - VMIN_DB)).clamp(0.0, 1.0) as f32;
+        painter.rect_filled(vol_rect, 3.0, egui::Color32::from_gray(70));
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                vol_rect.min,
+                egui::pos2(
+                    vol_rect.left() + vol_rect.width() * vol_frac,
+                    vol_rect.bottom(),
+                ),
+            ),
+            3.0,
+            accent,
+        );
+        painter.circle_filled(
+            egui::pos2(
+                vol_rect.left() + vol_rect.width() * vol_frac,
+                vol_rect.center().y,
+            ),
+            6.0,
+            fg,
+        );
+        let vol_resp = ui.interact(
+            vol_rect.expand2(egui::vec2(0.0, 8.0)),
+            ui.id().with(("music_hud_vol", fs_idx)),
+            egui::Sense::click_and_drag(),
+        );
+        if (vol_resp.clicked() || vol_resp.dragged())
+            && let Some(p) = vol_resp.interact_pointer_pos()
+        {
+            let f = ((p.x - vol_rect.left()) / vol_rect.width()).clamp(0.0, 1.0) as f64;
+            let v = if f <= 0.001 {
+                0.0
+            } else {
+                10f64.powf((VMIN_DB + f * (VMAX_DB - VMIN_DB)) / 20.0)
+            };
+            set_vol = Some(crate::settings::clamp_video_volume(v));
+        }
+        // ミュート
+        let mute_r = egui::Rect::from_min_size(
+            egui::pos2(rx - bsz, controls_cy - bsz * 0.5),
+            egui::vec2(bsz, bsz),
+        );
+        rx -= bsz + 8.0;
+        let mresp = ui
+            .interact(
+                mute_r,
+                ui.id().with(("music_hud_mute", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(if muted {
+                "ミュート解除"
+            } else {
+                "ミュート"
+            });
+        btn_bg(mute_r, mresp.hovered(), muted);
+        draw_speaker_icon(
+            &painter,
+            mute_r,
+            muted,
+            if muted {
+                egui::Color32::from_rgb(255, 150, 150)
+            } else {
+                fg
+            },
+        );
+        if mresp.clicked() {
+            toggle_mute = true;
+        }
+        // 速度 (クリックでプリセット巡回)
+        let spd_w = 46.0;
+        let spd_r = egui::Rect::from_min_size(
+            egui::pos2(rx - spd_w, controls_cy - bsz * 0.5),
+            egui::vec2(spd_w, bsz),
+        );
+        rx -= spd_w + 8.0;
+        let sresp = ui
+            .interact(
+                spd_r,
+                ui.id().with(("music_hud_speed", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text("再生速度");
+        btn_bg(spd_r, sresp.hovered(), (speed - 1.0).abs() > 1e-3);
+        painter.text(
+            spd_r.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{}x", format_speed(speed)),
+            egui::FontId::proportional(12.0),
+            fg,
+        );
+        if sresp.clicked() {
+            cycle_speed = true;
+        }
+        // 時間 (速度ボタンの左に右寄せ)
+        painter.text(
+            egui::pos2(rx, controls_cy),
+            egui::Align2::RIGHT_CENTER,
+            format!("{} / {}", format_hms(pos), format_hms(dur)),
+            egui::FontId::proportional(13.0),
+            fg,
+        );
+
+        // ── 操作を適用 (self / player の可変借用を分離) ──
+        let next_speed = if cycle_speed {
+            let i = MUSIC_SPEED_PRESETS
+                .iter()
+                .position(|&s| (s - speed).abs() < 1e-3)
+                .unwrap_or(2);
+            MUSIC_SPEED_PRESETS[(i + 1) % MUSIC_SPEED_PRESETS.len()]
+        } else {
+            speed
+        };
+        if seek_start {
+            seek_to = Some(0.0);
+        }
+        if toggle_loop {
+            self.music_loop_enabled = !loop_on;
+        }
+        if cycle_speed {
+            self.video_playback_speed = next_speed;
+        }
+        if toggle_mute {
+            self.video_session_muted = !muted;
+        }
+        if let Some(v) = set_vol {
+            self.settings.video_volume = v;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if let Some(s) = seek_to {
+                player.seek(s);
+            }
+            if seek_start {
+                player.set_playing(true);
+            }
+            if toggle_play {
+                player.toggle_play();
+            }
+            if toggle_loop {
+                player.set_loop_enabled(!loop_on);
+            }
+            if cycle_speed {
+                player.set_playback_speed(next_speed);
+            }
+            if toggle_mute {
+                player.set_muted(!muted);
+            }
+            if let Some(v) = set_vol {
+                player.set_volume(v);
+            }
+        }
+    }
+}
+
+/// 二重三角形 (◀◀ / ▶▶) を painter で描く (前後ブックマークジャンプ用、フォント非依存)。
+fn draw_double_triangle(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    right: bool,
+    color: egui::Color32,
+) {
+    let c = rect.center();
+    let t = rect.width() * 0.14;
+    let dir = if right { 1.0 } else { -1.0 };
+    for k in [-1.0f32, 1.0] {
+        let ox = k * t * 1.05 * dir;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                c + egui::vec2(ox - t * dir, -t),
+                c + egui::vec2(ox - t * dir, t),
+                c + egui::vec2(ox + t * dir, 0.0),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
+/// ループアイコン (円 + 矢先) を painter で描く (フォント非依存、絵文字 tofu 回避)。
+fn draw_loop_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = rect.width() * 0.24;
+    painter.circle_stroke(c, r, egui::Stroke::new(2.0, color));
+    // 上部右に小さな矢先 (回転を示唆)。
+    let tip = egui::pos2(c.x + r, c.y - r * 0.15);
+    let s = r * 0.42;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            tip + egui::vec2(-s, -s * 0.2),
+            tip + egui::vec2(-s * 0.2, s),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// スピーカーアイコン (ミュート時は赤い斜線) を painter で描く。
+fn draw_speaker_icon(painter: &egui::Painter, rect: egui::Rect, muted: bool, color: egui::Color32) {
+    let c = rect.center();
+    let s = rect.width() * 0.16;
+    // スピーカー本体 (小さな四角 + 三角のホーン)。
+    painter.rect_filled(
+        egui::Rect::from_center_size(egui::pos2(c.x - s * 1.1, c.y), egui::vec2(s, s * 1.1)),
+        1.0,
+        color,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - s * 0.6, c.y - s * 0.9),
+            egui::pos2(c.x - s * 0.6, c.y + s * 0.9),
+            egui::pos2(c.x + s * 0.3, c.y),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+    if muted {
+        painter.line_segment(
+            [
+                egui::pos2(c.x + s * 0.5, c.y - s * 0.9),
+                egui::pos2(c.x + s * 1.3, c.y + s * 0.9),
+            ],
+            egui::Stroke::new(2.0, color),
+        );
+    } else {
+        // 音波 (小さな 2 本の弧の代わりに短い縦 dash)。
+        painter.line_segment(
+            [
+                egui::pos2(c.x + s * 0.8, c.y - s * 0.5),
+                egui::pos2(c.x + s * 0.8, c.y + s * 0.5),
+            ],
+            egui::Stroke::new(2.0, color),
+        );
+    }
+}
+
+/// 再生速度を "0.5" / "1" / "1.25" 風に整形する (末尾ゼロを落とす)。
+fn format_speed(speed: f64) -> String {
+    let s = format!("{speed:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[cfg(test)]

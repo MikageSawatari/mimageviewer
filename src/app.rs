@@ -5219,10 +5219,11 @@ pub struct App {
     pub(crate) music_spectrum: crate::ui_music_spectrum::MusicSpectrumState,
     /// 右パネル (Inc 5) の音楽情報。解析ワーカーが軽量 probe で追送。ファイル変更で破棄。
     pub(crate) music_probe: Option<crate::audio_decode::AudioProbe>,
-    /// 左パネル (Inc 5): ブックマーク一覧の表示トグル。上バーのブックマークボタンで開閉。
-    pub(crate) music_bookmarks_panel_open: bool,
+    /// 音楽ビュー下 HUD のループトグル (簡易全曲ループ、Inc 5 FB)。セッション設定。
+    pub(crate) music_loop_enabled: bool,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
+    /// 左パネルは端ホバーで出す (動画のジャンプパネルと同じ、Inc 5 FB。トグルボタンは廃止)。
     pub(crate) music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
     /// `music_bookmarks` をどの path 用に読んだか。fs のファイルが変わったら再取得する。
     pub(crate) music_bookmarks_loaded_for: Option<PathBuf>,
@@ -7042,7 +7043,7 @@ impl App {
             music_pcm: None,
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
             music_probe: None,
-            music_bookmarks_panel_open: false,
+            music_loop_enabled: false,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             music_bookmark_rename: None,
@@ -30312,7 +30313,8 @@ impl App {
         self.music_analysis_error = None;
         self.music_analysis_path = None;
         // ブックマークの一時状態 (キャッシュ / 改名中 / インポート欄) は破棄する。
-        // パネルの開閉 (`music_bookmarks_panel_open`) と export トグルはセッション設定として保持。
+        // export トグル / ループ設定はセッション設定として保持 (パネルは端ホバーで出すので
+        // 開閉トグル状態は持たない)。
         self.music_bookmarks.clear();
         self.music_bookmarks_loaded_for = None;
         self.music_bookmark_rename = None;
