@@ -1015,10 +1015,12 @@ impl App {
         }
         if let Some(v) = set_vol {
             self.settings.video_volume = v;
-            // 動画の音量経路と同じく、確定時のみ永続化する (ドラッグ中の毎フレーム save を回避)。
-            if vol_persist {
-                self.settings.save();
-            }
+        }
+        // 確定時 (drag_stopped / click) のみ save する (毎フレーム save を回避)。release frame は
+        // set_vol=None だが settings.video_volume は直前 frame までに更新済みなので、ここで
+        // save すればドラッグ確定分も永続化される (Codex P3)。
+        if vol_persist {
+            self.settings.save();
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if let Some(s) = seek_to {
