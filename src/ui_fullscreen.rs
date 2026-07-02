@@ -7823,6 +7823,13 @@ impl App {
         // (I) だけは音楽情報パネルのトグルとして音声でも残す。spread-shift (Ctrl+←→) はこの
         // 判定を先に使うため is_video_fs 直後で定義する。
         let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
+        // 音楽ビューのパネル内 TextEdit (ブックマーク改名 / インポート / タグピッカー) に
+        // フォーカスがある / IME 変換中は、フルスクリーンのナビ・ショートカットキーを一切
+        // 消費しない (Inc 5 FB)。矢印 (IME 候補選択) や Enter/Space/文字キーが奪われて日本語
+        // 変換が壊れるのを防ぐ (動画は native presenter 側で入力するので同問題は無い)。
+        if current_item_is_audio && (ctx.wants_keyboard_input() || self.ime_input_active()) {
+            return action;
+        }
         if !self.ime_input_active()
             && self.fs_context_menu_idx.is_none()
             && self.consume_context_shortcuts_help_key(ctx)

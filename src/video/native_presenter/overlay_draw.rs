@@ -3925,9 +3925,15 @@ pub(super) fn draw_native_metadata_panel(
                         return;
                     }
                     // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序、Inc 5 FB) ──
-                    if let Some(new_stars) =
-                        crate::ui_helpers::draw_rating_stars(ui, metadata.rating)
-                    {
+                    // タイトル/タグ/メタ行と同じ 14px の左インデントを付ける (Inc 5 FB: 動画は
+                    // ★行だけ左余白が無く音楽ビューと食い違っていた)。
+                    let star_cmd = ui
+                        .horizontal(|ui| {
+                            ui.add_space(14.0);
+                            crate::ui_helpers::draw_rating_stars(ui, metadata.rating)
+                        })
+                        .inner;
+                    if let Some(new_stars) = star_cmd {
                         commands.push(NativeOverlayCommand::SetRating { stars: new_stars });
                     }
                     ui.add_space(8.0);
