@@ -108,7 +108,7 @@ fn should_claim_text_input_focus(
         && foreground_is_current_process
 }
 
-fn format_video_volume_db_compact(volume: f64) -> String {
+pub(crate) fn format_video_volume_db_compact(volume: f64) -> String {
     let db = crate::settings::video_volume_linear_to_db(volume);
     if db <= crate::settings::VIDEO_VOLUME_MUTE_DB + 0.05 {
         "-∞dB".to_string()

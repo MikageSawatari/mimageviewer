@@ -779,8 +779,26 @@ impl App {
             toggle_loop = true;
         }
 
-        // ── コントロール行: 右クラスタ (右寄せ: 音量 / ミュート / 速度 / 時間) ──
+        // ── コントロール行: 右クラスタ (右寄せ: dB ラベル / 音量 / ミュート / 速度 / 時間) ──
         let mut rx = hud_rect.right() - 14.0;
+        // 現在音量の dB 表示ラベル (最右、動画 HUD の「スライダーの右」配置に合わせる)。
+        // ミュート状態に関わらず実効音量を dB で示す。共有の
+        // `format_video_volume_db_compact` を使い動画と表記を揃える (-∞dB / 0.0dB / +3.0dB)。
+        let vol_label_w = 52.0;
+        let vol_db_label = crate::video::native_presenter::format_video_volume_db_compact(cur_vol);
+        let vol_label_color = if cur_vol > 1.0 {
+            egui::Color32::from_rgb(255, 210, 80)
+        } else {
+            fg
+        };
+        painter.text(
+            egui::pos2(rx, controls_cy),
+            egui::Align2::RIGHT_CENTER,
+            vol_db_label,
+            egui::FontId::proportional(13.0),
+            vol_label_color,
+        );
+        rx -= vol_label_w + 8.0;
         // 音量 dB フェーダーは動画/音楽共有の `draw_overlay_volume_slider` を使う
         // (Inc 5c-B1)。トラック + fill (0dB 未満グレー / 0dB 超ブースト黄) + dB 目盛り +
         // クリック/ドラッグ/ダブルクリック (0dB リセット) が動画 HUD と完全に揃う。
@@ -793,6 +811,23 @@ impl App {
             egui::pos2(rx, controls_cy + 4.0),
         );
         rx -= vol_w + 10.0;
+        // 音量ツールチップに Shift+↑↓ (`VideoVolumeUp/Down`) のショートカットを併記する
+        // (動画 HUD と揃える、実機 FB 2026-07-02)。`&mut self` を握る `vol_target` より前に
+        // owned String を作っておき、借用衝突を避ける。
+        let vol_shortcut = {
+            let up = self
+                .keymap
+                .first_chord_label(crate::keymap::KeyAction::VideoVolumeUp);
+            let down = self
+                .keymap
+                .first_chord_label(crate::keymap::KeyAction::VideoVolumeDown);
+            match (up, down) {
+                (Some(u), Some(d)) => format!(" [{u} / {d}]"),
+                (Some(s), None) | (None, Some(s)) => format!(" [{s}]"),
+                (None, None) => String::new(),
+            }
+        };
+        let vol_tooltip = format!("音量 (ダブルクリックで 0dB){vol_shortcut}");
         let mut vol_persist = false;
         // モーダル表示中 (`!interactive`) は HUD 操作を一切自 state に反映しない不変条件を
         // 守るため、ドラッグ確定用の frame 跨ぎ state をダミーに逃がす (Codex 5c-B1 P3)。
@@ -810,7 +845,7 @@ impl App {
             vol_rect,
             cur_vol,
             ui.id().with(("music_hud_vol", fs_idx)),
-            Some("音量 (ダブルクリックで 0dB)".to_string()),
+            Some(vol_tooltip),
             vol_target,
         ) {
             set_vol = Some(crate::settings::clamp_video_volume(v));

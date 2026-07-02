@@ -7878,6 +7878,37 @@ impl App {
             self.add_music_bookmark_at_current(fs_idx);
         }
 
+        // 音楽ビュー (Inc 5c-B): Shift+↑↓ で音量調整 (動画の VideoVolumeUp/Down を共有)。
+        // 動画は native presenter 経路で処理するが、音楽は egui フルスクリーン経路なのでここで
+        // 消費する。フェーダー刻みは `step_video_volume_by_fader_key_step` を共有し、下 HUD の
+        // 音量スライダーと挙動を揃える。モーダル / IME / TextEdit フォーカス中は消費しない。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+        {
+            let vol_up = self.keymap.consume_action(ctx, KeyAction::VideoVolumeUp);
+            let vol_down = self.keymap.consume_action(ctx, KeyAction::VideoVolumeDown);
+            if vol_up || vol_down {
+                let new_v = if let Some(FsCacheEntry::Video { player, .. }) =
+                    self.fs_cache.get(&fs_idx)
+                {
+                    let dir = if vol_up { 1 } else { -1 };
+                    let v =
+                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), dir);
+                    player.set_volume(v);
+                    Some(v)
+                } else {
+                    None
+                };
+                if let Some(v) = new_v {
+                    self.settings.video_volume = v;
+                    self.settings.save();
+                }
+            }
+        }
+
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
