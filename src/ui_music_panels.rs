@@ -18,7 +18,10 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
-    draw_native_jump_panel_body, draw_overlay_speed_control, draw_overlay_volume_slider,
+    draw_native_jump_panel_body, draw_overlay_button_bg, draw_overlay_loop_icon,
+    draw_overlay_pause_icon, draw_overlay_play_icon, draw_overlay_replay_icon,
+    draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon, draw_overlay_speed_control,
+    draw_overlay_volume_slider,
 };
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
@@ -680,18 +683,13 @@ impl App {
             *x += w + 6.0;
             r
         };
-        let btn_bg = |r: egui::Rect, hovered: bool, active: bool| {
-            let c = if active {
-                accent
-            } else if hovered {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)
-            };
-            painter.rect_filled(r, 4.0, c);
-        };
+        // ボタン描画は動画 HUD と共有の primitive を使う (Inc 5c-B3):
+        // 背景 = `draw_overlay_button_bg` (hover / active blue)、アイコン = 各
+        // `draw_overlay_*_icon`。これで頭出し / 再生 / 前後マーカー / ループの見た目が
+        // 動画 HUD と揃う (頭出し = 動画 replay ↺、前後 = |◀ / ▶| skip-to-marker)。
+        let markers_present = !marker_secs.is_empty();
 
-        // 頭出し (|◀)
+        // 頭出し (動画 replay = 頭出し + 即再生と同義)
         let r = alloc(&mut x, bsz);
         let resp = ui
             .interact(
@@ -700,28 +698,8 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text("頭出し");
-        btn_bg(r, resp.hovered(), false);
-        {
-            let c = r.center();
-            let t = bsz * 0.16;
-            painter.rect_filled(
-                egui::Rect::from_center_size(
-                    egui::pos2(c.x - t * 1.4, c.y),
-                    egui::vec2(bsz * 0.08, t * 2.0),
-                ),
-                1.0,
-                fg,
-            );
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    c + egui::vec2(t * 0.9, -t),
-                    c + egui::vec2(t * 0.9, t),
-                    c + egui::vec2(-t * 0.5, 0.0),
-                ],
-                fg,
-                egui::Stroke::NONE,
-            ));
-        }
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_replay_icon(&painter, r.center(), bsz * 0.36);
         if resp.clicked() {
             seek_start = true;
         }
@@ -735,40 +713,17 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text(if playing { "一時停止" } else { "再生" });
-        btn_bg(r, resp.hovered(), false);
-        {
-            let c = r.center();
-            if playing {
-                let bw = bsz * 0.09;
-                let bh = bsz * 0.3;
-                painter.rect_filled(
-                    egui::Rect::from_center_size(c - egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
-                    1.0,
-                    fg,
-                );
-                painter.rect_filled(
-                    egui::Rect::from_center_size(c + egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
-                    1.0,
-                    fg,
-                );
-            } else {
-                let t = bsz * 0.18;
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        c + egui::vec2(-t * 0.7, -t),
-                        c + egui::vec2(-t * 0.7, t),
-                        c + egui::vec2(t, 0.0),
-                    ],
-                    fg,
-                    egui::Stroke::NONE,
-                ));
-            }
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        if playing {
+            draw_overlay_pause_icon(&painter, r.center(), bsz * 0.30);
+        } else {
+            draw_overlay_play_icon(&painter, r.center(), bsz * 0.38);
         }
         if resp.clicked() {
             toggle_play = true;
         }
 
-        // 前ブックマーク (◀◀)
+        // 前ブックマーク (|◀)
         let r = alloc(&mut x, bsz);
         let resp = ui
             .interact(
@@ -777,17 +732,17 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text("前のブックマーク");
-        btn_bg(r, resp.hovered(), false);
-        draw_double_triangle(&painter, r, false, fg);
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_skip_to_marker_icon(&painter, r, -1, markers_present);
         if resp.clicked() {
             if let Some(&t) = marker_secs.iter().rev().find(|&&s| s < pos - 0.3) {
                 seek_to = Some(t);
-            } else if !marker_secs.is_empty() {
+            } else if markers_present {
                 seek_to = Some(0.0);
             }
         }
 
-        // 次ブックマーク (▶▶)
+        // 次ブックマーク (▶|)
         let r = alloc(&mut x, bsz);
         let resp = ui
             .interact(
@@ -796,8 +751,8 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text("次のブックマーク");
-        btn_bg(r, resp.hovered(), false);
-        draw_double_triangle(&painter, r, true, fg);
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_skip_to_marker_icon(&painter, r, 1, markers_present);
         if resp.clicked()
             && let Some(&t) = marker_secs.iter().find(|&&s| s > pos + 0.3)
         {
@@ -813,10 +768,11 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text("ループ");
-        btn_bg(r, resp.hovered(), loop_on);
-        draw_loop_icon(
+        draw_overlay_button_bg(&painter, r, resp.hovered(), loop_on);
+        draw_overlay_loop_icon(
             &painter,
-            r,
+            r.center(),
+            bsz * 0.36,
             if loop_on { egui::Color32::WHITE } else { dim },
         );
         if resp.clicked() {
@@ -877,17 +833,8 @@ impl App {
             } else {
                 "ミュート"
             });
-        btn_bg(mute_r, mresp.hovered(), muted);
-        draw_speaker_icon(
-            &painter,
-            mute_r,
-            muted,
-            if muted {
-                egui::Color32::from_rgb(255, 150, 150)
-            } else {
-                fg
-            },
-        );
+        draw_overlay_button_bg(&painter, mute_r, mresp.hovered(), muted);
+        draw_overlay_speaker_icon(&painter, mute_r.center(), bsz * 0.46, muted);
         if mresp.clicked() {
             toggle_mute = true;
         }
@@ -982,88 +929,6 @@ impl App {
                 player.set_volume(v);
             }
         }
-    }
-}
-
-/// 二重三角形 (◀◀ / ▶▶) を painter で描く (前後ブックマークジャンプ用、フォント非依存)。
-fn draw_double_triangle(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    right: bool,
-    color: egui::Color32,
-) {
-    let c = rect.center();
-    let t = rect.width() * 0.14;
-    let dir = if right { 1.0 } else { -1.0 };
-    for k in [-1.0f32, 1.0] {
-        let ox = k * t * 1.05 * dir;
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                c + egui::vec2(ox - t * dir, -t),
-                c + egui::vec2(ox - t * dir, t),
-                c + egui::vec2(ox + t * dir, 0.0),
-            ],
-            color,
-            egui::Stroke::NONE,
-        ));
-    }
-}
-
-/// ループアイコン (円 + 矢先) を painter で描く (フォント非依存、絵文字 tofu 回避)。
-fn draw_loop_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let c = rect.center();
-    let r = rect.width() * 0.24;
-    painter.circle_stroke(c, r, egui::Stroke::new(2.0, color));
-    // 上部右に小さな矢先 (回転を示唆)。
-    let tip = egui::pos2(c.x + r, c.y - r * 0.15);
-    let s = r * 0.42;
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            tip,
-            tip + egui::vec2(-s, -s * 0.2),
-            tip + egui::vec2(-s * 0.2, s),
-        ],
-        color,
-        egui::Stroke::NONE,
-    ));
-}
-
-/// スピーカーアイコン (ミュート時は赤い斜線) を painter で描く。
-fn draw_speaker_icon(painter: &egui::Painter, rect: egui::Rect, muted: bool, color: egui::Color32) {
-    let c = rect.center();
-    let s = rect.width() * 0.16;
-    // スピーカー本体 (小さな四角 + 三角のホーン)。
-    painter.rect_filled(
-        egui::Rect::from_center_size(egui::pos2(c.x - s * 1.1, c.y), egui::vec2(s, s * 1.1)),
-        1.0,
-        color,
-    );
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(c.x - s * 0.6, c.y - s * 0.9),
-            egui::pos2(c.x - s * 0.6, c.y + s * 0.9),
-            egui::pos2(c.x + s * 0.3, c.y),
-        ],
-        color,
-        egui::Stroke::NONE,
-    ));
-    if muted {
-        painter.line_segment(
-            [
-                egui::pos2(c.x + s * 0.5, c.y - s * 0.9),
-                egui::pos2(c.x + s * 1.3, c.y + s * 0.9),
-            ],
-            egui::Stroke::new(2.0, color),
-        );
-    } else {
-        // 音波 (小さな 2 本の弧の代わりに短い縦 dash)。
-        painter.line_segment(
-            [
-                egui::pos2(c.x + s * 0.8, c.y - s * 0.5),
-                egui::pos2(c.x + s * 0.8, c.y + s * 0.5),
-            ],
-            egui::Stroke::new(2.0, color),
-        );
     }
 }
 

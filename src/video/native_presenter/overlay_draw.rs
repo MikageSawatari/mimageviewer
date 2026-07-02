@@ -1527,7 +1527,7 @@ pub(super) fn draw_native_frame_step_button(
 /// `direction < 0` で `|◀` (前マーカー、prev)、`direction > 0` で `▶|` (次マーカー、next)。
 /// 縦バー + 三角の組み合わせ。CD プレイヤーや YouTube のチャプター移動慣習に合わせる。
 /// `enabled=false` (= マーカー無し) のときは半透明グレーで描く。
-pub(super) fn draw_overlay_skip_to_marker_icon(
+pub(crate) fn draw_overlay_skip_to_marker_icon(
     painter: &egui::Painter,
     rect: egui::Rect,
     direction: i32,
@@ -4603,7 +4603,7 @@ pub(super) fn draw_timeline_marker(
     );
 }
 
-pub(super) fn draw_overlay_button_bg(
+pub(crate) fn draw_overlay_button_bg(
     painter: &egui::Painter,
     rect: egui::Rect,
     hovered: bool,
@@ -4619,7 +4619,7 @@ pub(super) fn draw_overlay_button_bg(
     painter.rect_filled(rect, 4.0, bg);
 }
 
-pub(super) fn draw_overlay_play_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+pub(crate) fn draw_overlay_play_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     painter.add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(c.x - r * 0.45, c.y - r * 0.70),
@@ -4631,7 +4631,7 @@ pub(super) fn draw_overlay_play_icon(painter: &egui::Painter, c: egui::Pos2, r: 
     ));
 }
 
-pub(super) fn draw_overlay_pause_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+pub(crate) fn draw_overlay_pause_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let stroke = egui::Stroke::new((r * 0.34).max(2.0), egui::Color32::WHITE);
     painter.line_segment(
         [
@@ -4649,7 +4649,7 @@ pub(super) fn draw_overlay_pause_icon(painter: &egui::Painter, c: egui::Pos2, r:
     );
 }
 
-pub(super) fn draw_overlay_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+pub(crate) fn draw_overlay_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     use std::f32::consts::PI;
 
     let white = egui::Color32::WHITE;
@@ -4711,7 +4711,7 @@ pub(super) fn draw_overlay_replay_icon(painter: &egui::Painter, c: egui::Pos2, r
     ));
 }
 
-pub(super) fn draw_overlay_loop_icon(
+pub(crate) fn draw_overlay_loop_icon(
     painter: &egui::Painter,
     c: egui::Pos2,
     r: f32,
@@ -4970,7 +4970,7 @@ pub(super) fn draw_overlay_pin_icon(
     );
 }
 
-pub(super) fn draw_overlay_speaker_icon(
+pub(crate) fn draw_overlay_speaker_icon(
     painter: &egui::Painter,
     c: egui::Pos2,
     r: f32,

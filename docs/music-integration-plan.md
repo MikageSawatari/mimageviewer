@@ -413,8 +413,14 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
     （"x1.5"）に、選択肢が動画と同じ 11 段に揃う。App に `music_speed_popup_open` を追加。popup 位置は
     `hud_rect.left()/width()/top()` を渡す。`!interactive`（モーダル中）は dummy popup_open に逃がす
     （B1 と同じ多層防御）。popup X clamp を正規化して狭幅 panic を防止（Codex P2、正常幅では挙動不変）。→
-    (5c-B3) **各ボタン**（play/loop/mute/marker/head）を
-    `draw_overlay_*` icon + `draw_overlay_button_bg` の共有 primitive で音楽 HUD を描き直し →
+    (5c-B3) ✅ **完了（2026-07-02、Codex P1/P2/P3 なし、test 3117 green）** 各ボタン
+    （頭出し/再生/前後マーカー/ループ/ミュート）を `draw_overlay_*_icon` + `draw_overlay_button_bg` の
+    共有 primitive で音楽 HUD を描き直し。7 関数（button_bg / play / pause / replay / loop / speaker /
+    skip_to_marker icon）を `pub(super)` → `pub(crate)` に広げる（可視性拡大のみ = 動画は挙動不変）。
+    音楽の暫定ローカル（`draw_double_triangle` / `draw_loop_icon` / `draw_speaker_icon` / `btn_bg` closure）を
+    撤去。マッピング: 頭出し = replay ↺（seek-to-start+play で動画 replay と同義）、前後ブックマーク =
+    skip-to-marker |◀ / ▶|（`markers_present` で淡色）、ループ = active blue bg + loop icon、
+    ミュート = speaker icon。背景が動画同様「idle 透明 / hover / active blue」に、アイコンが白系に揃う。→
     (5c-B4) 余力があればコントロール行全体を snapshot+sink 関数へ。**一括抽出は 1350 行 released video の
     バイト等価維持が困難なので必ず段階化**。
 - **Inc 5c-C（上バー）**: `draw_native_top_bar` を音楽の上バーに流用（音楽向けにボタン集合を調整。
