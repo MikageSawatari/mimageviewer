@@ -7829,6 +7829,12 @@ impl App {
         // 選択操作を優先、Codex Phase 5.1 P2 反映)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.fs_context_menu_idx.is_none();
+        // 音声 (音楽ビュー) は画像の編集/分析/見開き/回転/比較/AI/ポストフィルタ系ショートカットを
+        // 一切受けない (Inc 5, Codex P2)。consume 自体を抑止するので、これらの状態が次の画像へ
+        // 漏れず、ブックマーク改名/インポート/タグの TextEdit への文字入力も奪わない。メタデータ
+        // (I) だけは音楽情報パネルのトグルとして音声でも残す。spread-shift (Ctrl+←→) はこの
+        // 判定を先に使うため is_video_fs 直後で定義する。
+        let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
         if !self.ime_input_active()
             && self.fs_context_menu_idx.is_none()
             && self.consume_context_shortcuts_help_key(ctx)
@@ -7903,18 +7909,22 @@ impl App {
         // Ctrl+←/→: 見開き「1 ページずらし」(応急補正)。Single モードでは 1 ページ移動に
         // フォールバックする。動画は Ctrl+←/→ が 30 秒シークなので画像 (= !is_video_fs) のみ消費。
         let ctrl_left = !is_video_fs
+            && !current_item_is_audio
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftLeft);
         let ctrl_right = !is_video_fs
+            && !current_item_is_audio
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftRight);
         let spread_shift_prev = !is_video_fs
+            && !current_item_is_audio
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftPrev);
         let spread_shift_next = !is_video_fs
+            && !current_item_is_audio
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftNext);
@@ -8006,12 +8016,7 @@ impl App {
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        // 音声 (音楽ビュー) は画像編集/分析/回転/比較/AI/ポストフィルタ系のキーを一切受けない
-        // (Inc 5, Codex P2)。これらは画像の image_rect / 編集モードを変え、次の画像へ状態が
-        // 漏れる (例: 音声で Z → analysis_mode ON のまま次画像へ)。consume 自体を抑止するので、
-        // ブックマーク改名 / インポート / タグの TextEdit への文字入力 (例 B / E) も奪わない。
-        // メタデータ (I) は音楽情報パネルのトグルとして音声でも有効に残す。
-        let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
+        // `current_item_is_audio` は is_video_fs 直後で定義済み (spread-shift で先に使うため)。
         let key_i =
             !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
