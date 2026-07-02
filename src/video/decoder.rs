@@ -1518,6 +1518,11 @@ pub struct VideoInfo {
     /// 0 のときは未知 (Opus / FLAC や VBR 設定でコンテナに記録されていないケース)。
     pub audio_bit_rate_bps: i64,
     pub has_audio: bool,
+    /// timed playable video stream を持つか。audio-only ファイル (映像トラック無し /
+    /// 添付画像 = cover art のみ) では false。false のとき width/height/avg_fps は 0、
+    /// video_codec/video_decoder は "none"。engine 側の readiness gate
+    /// (`ReadinessLatch::is_ready`) と、UI の映像有無判定に使う。
+    pub has_video: bool,
     /// HW デコードが実際に有効化されたか (sw / hw_d3d11va)。
     pub hw_decode_active: bool,
     /// GPU 経路 (D3D11 video processor blit) が利用可能か (環境としての能力)。
@@ -1826,6 +1831,44 @@ impl Drop for DemuxPriorityBoost {
     }
 }
 
+/// audio-only 対応 (2026-07-02): `run_decoder` (demux thread) が video stream の
+/// 有無を Option で扱うための束。映像トラックがあれば `Some`、audio-only ファイル
+/// (映像トラック無し / 添付画像 = cover art のみ) では `None`。
+///
+/// `Some` の中身のうち `decoder` / `hw_format_probe` / `hw_device` / `params_owned` /
+/// `codec_id` は video decode thread へ **move** される (= 通常運用では VideoSetup 自体は
+/// drop されず destructure で消費される)。フィールド宣言順は `decoder` → `hw_format_probe`
+/// → `hw_device` とし、万一 drop される経路でも `run_video_decode` と同じ安全な drop 順
+/// (decoder を HW helper より先に落とす) を保つ。
+struct VideoSetup {
+    // ── video decode thread へ move する所有物 (drop 順のため先頭) ──
+    decoder: ffmpeg_the_third::decoder::Video,
+    hw_format_probe: Option<Arc<HwFormatProbeState>>,
+    hw_device: Option<HwDevice>,
+    params_owned: ffmpeg_the_third::codec::Parameters,
+    codec_id: ffmpeg_the_third::codec::Id,
+    // ── VideoInfo / perf / thread spawn / demux で参照する値 ──
+    stream_idx: usize,
+    tb_num_i32: i32,
+    tb_den_i32: i32,
+    fps_num: u32,
+    fps_den: u32,
+    sar_num: u32,
+    sar_den: u32,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    avg_fps: f64,
+    codec_name: String,
+    decoder_name: String,
+    /// `format!("{field_order:?}")` 済みの文字列 (log / perf 用。型依存を避ける)。
+    field_order_debug: String,
+    stream_interlaced: bool,
+    hw_active_initially: bool,
+    hw_probe: D3d11vaProbe,
+}
+
 fn run_decoder(
     path: PathBuf,
     clock: Arc<AvClock>,
@@ -1915,125 +1958,174 @@ fn run_decoder(
         open_phase_t0.elapsed().as_secs_f64() * 1000.0
     ));
 
-    // ── 動画ストリーム選択 ──
-    let video_stream = match input.streams().best(MediaType::Video) {
-        Some(s) => s,
-        None => {
-            let _ = info_tx.send(Err("動画ストリームが見つかりません".into()));
-            return;
-        }
-    };
-    let video_stream_idx = video_stream.index();
-    let video_time_base = video_stream.time_base();
-    let video_params = video_stream.parameters();
-    let (video_fps_num, video_fps_den) =
-        selected_video_rate(video_stream.avg_frame_rate(), video_stream.rate())
-            .map(|(n, d)| (n as u32, d as u32))
-            .unwrap_or((0u32, 0u32));
-    // SAR (= sample aspect ratio) は AVCodecParameters から読む。container 側
-    // (MP4 / MKV / MOV / AVI) の値が正、raw H.264 ストリーム等では未指定 (0/0)
-    // で 1:1 にフォールバック。アナモフィック動画 (NTSC DVD 等) は SAR != 1:1。
-    let video_sar_rational = video_params.sample_aspect_ratio();
-    let (video_sar_num, video_sar_den) = normalize_sar(
-        video_sar_rational.numerator(),
-        video_sar_rational.denominator(),
-    );
-    let video_avg_fps = if video_fps_num == 0 || video_fps_den == 0 {
-        0.0
-    } else {
-        video_fps_num as f64 / video_fps_den as f64
-    };
-    // VPP ContentDesc に渡す raw 分数 (= num/den のまま渡すことで丸め誤差を排除)。
-    // 0 の場合は VPP 側で 60/1 にフォールバックされる。
-    let video_params_owned = match clone_codec_parameters(&video_params) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = info_tx.send(Err(format!("video codec parameters clone: {e}")));
-            return;
-        }
-    };
-    let video_field_order = video_params_owned.field_order();
-    let video_stream_interlaced = field_order_is_interlaced(video_field_order);
-    // ── HW デコード初期化 (D3D11VA) ──
-    // D3D11VA config を持つ decoder は HW 経路だけを試し、HW 初期化 / open 失敗を
-    // アプリ側不具合として表面化させる。D3D11VA config がそもそも無い codec は
-    // 通常の SW decoder で開く。
+    // ── 動画ストリーム選択 (任意) ──
     //
-    // gpu_video_device が利用可能な場合は **mIV 側で作成した D3D11 デバイス** を
-    // FFmpeg に渡して共有する (= HW デコーダの NV12 出力と ID3D11VideoProcessor が
-    // 同じデバイス上で動き、CreateVideoProcessorInputView で受け渡せる)。
-    // gpu_video_device 不在 / 失敗時は従来通り FFmpeg が新デバイスを作成し、
-    // 出力は av_hwframe_transfer_data で CPU readback する旧経路。
-    let codec_id = video_params_owned.id();
-    let stream_codec_name = codec_id.name().to_string();
-    let effective_hw_decode_requested = hw_decode_requested;
-    // open_video_decoder_with_candidates の elapsed を log (2026-05-12「動画を準備中…」
-    // 遅延解析: format::input と HW attach のどちらが遅いかを切り分けるため)。
-    let decoder_open_t0 = std::time::Instant::now();
-    let opened_video_result = if effective_hw_decode_requested {
-        #[cfg(windows)]
-        {
-            open_video_decoder_with_candidates(
-                &video_params_owned,
-                codec_id,
-                true,
-                gpu_video_device.as_ref(),
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            open_video_decoder_with_candidates(&video_params_owned, codec_id, true)
-        }
-    } else {
-        #[cfg(windows)]
-        {
-            open_video_decoder_with_candidates(
-                &video_params_owned,
-                codec_id,
-                false,
-                gpu_video_device.as_ref(),
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            open_video_decoder_with_candidates(&video_params_owned, codec_id, false)
-        }
+    // audio-only 対応 (2026-07-02): 映像トラックが無ければ `None` (= 素の音声ファイル)。
+    // 音声トラックもここより後で判定し、両方無ければ初めてエラーにする。
+    //
+    // **添付画像 (cover art) の除外**: MP3/FLAC/M4A の埋め込みジャケットは FFmpeg 上
+    // `AV_DISPOSITION_ATTACHED_PIC` の video stream として見える。これを video とみなすと
+    // 大半の音楽ファイルが「映像あり」誤判定になり、静止画 1 枚を HW decode しに行くので
+    // 除外する (= timed playable video のみを video とする)。
+    //
+    // 選択は「非 attached-pic の video stream から選ぶ」形にする (Codex P2, round 2):
+    // `best(Video)` が万一 attached-pic を返しても、その裏に本物の video があれば拾えるよう
+    // find() で再探索する。`best()` を単に filter するだけだと、real video + cover art で
+    // best が attached-pic を返した場合に real video を取り逃す。
+    let is_real_video_stream = |s: &ffmpeg::format::stream::Stream| {
+        s.parameters().medium() == MediaType::Video
+            && !s
+                .disposition()
+                .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
     };
-    let opened_video = match opened_video_result {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = info_tx.send(Err(format!("video decoder open: {e}")));
-            return;
+    let selected_video_stream = input
+        .streams()
+        .best(MediaType::Video)
+        .filter(&is_real_video_stream)
+        .or_else(|| input.streams().find(&is_real_video_stream));
+    let video_setup: Option<VideoSetup> = match selected_video_stream {
+        Some(video_stream) => {
+            let video_stream_idx = video_stream.index();
+            let video_time_base = video_stream.time_base();
+            let video_params = video_stream.parameters();
+            let (video_fps_num, video_fps_den) =
+                selected_video_rate(video_stream.avg_frame_rate(), video_stream.rate())
+                    .map(|(n, d)| (n as u32, d as u32))
+                    .unwrap_or((0u32, 0u32));
+            // SAR (= sample aspect ratio) は AVCodecParameters から読む。container 側
+            // (MP4 / MKV / MOV / AVI) の値が正、raw H.264 ストリーム等では未指定 (0/0)
+            // で 1:1 にフォールバック。アナモフィック動画 (NTSC DVD 等) は SAR != 1:1。
+            let video_sar_rational = video_params.sample_aspect_ratio();
+            let (video_sar_num, video_sar_den) = normalize_sar(
+                video_sar_rational.numerator(),
+                video_sar_rational.denominator(),
+            );
+            let video_avg_fps = if video_fps_num == 0 || video_fps_den == 0 {
+                0.0
+            } else {
+                video_fps_num as f64 / video_fps_den as f64
+            };
+            // VPP ContentDesc に渡す raw 分数 (= num/den のまま渡すことで丸め誤差を排除)。
+            // 0 の場合は VPP 側で 60/1 にフォールバックされる。
+            let video_params_owned = match clone_codec_parameters(&video_params) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = info_tx.send(Err(format!("video codec parameters clone: {e}")));
+                    return;
+                }
+            };
+            let video_field_order = video_params_owned.field_order();
+            let video_stream_interlaced = field_order_is_interlaced(video_field_order);
+            // ── HW デコード初期化 (D3D11VA) ──
+            // D3D11VA config を持つ decoder は HW 経路だけを試し、HW 初期化 / open 失敗を
+            // アプリ側不具合として表面化させる。D3D11VA config がそもそも無い codec は
+            // 通常の SW decoder で開く。
+            //
+            // gpu_video_device が利用可能な場合は **mIV 側で作成した D3D11 デバイス** を
+            // FFmpeg に渡して共有する (= HW デコーダの NV12 出力と ID3D11VideoProcessor が
+            // 同じデバイス上で動き、CreateVideoProcessorInputView で受け渡せる)。
+            // gpu_video_device 不在 / 失敗時は従来通り FFmpeg が新デバイスを作成し、
+            // 出力は av_hwframe_transfer_data で CPU readback する旧経路。
+            let codec_id = video_params_owned.id();
+            let stream_codec_name = codec_id.name().to_string();
+            let effective_hw_decode_requested = hw_decode_requested;
+            // open_video_decoder_with_candidates の elapsed を log (2026-05-12「動画を準備中…」
+            // 遅延解析: format::input と HW attach のどちらが遅いかを切り分けるため)。
+            let decoder_open_t0 = std::time::Instant::now();
+            let opened_video_result = if effective_hw_decode_requested {
+                #[cfg(windows)]
+                {
+                    open_video_decoder_with_candidates(
+                        &video_params_owned,
+                        codec_id,
+                        true,
+                        gpu_video_device.as_ref(),
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    open_video_decoder_with_candidates(&video_params_owned, codec_id, true)
+                }
+            } else {
+                #[cfg(windows)]
+                {
+                    open_video_decoder_with_candidates(
+                        &video_params_owned,
+                        codec_id,
+                        false,
+                        gpu_video_device.as_ref(),
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    open_video_decoder_with_candidates(&video_params_owned, codec_id, false)
+                }
+            };
+            let opened_video = match opened_video_result {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = info_tx.send(Err(format!("video decoder open: {e}")));
+                    return;
+                }
+            };
+            crate::logger::log(format!(
+                "[demux] open_video_decoder done in {:.1}ms hw_requested={effective_hw_decode_requested} codec={stream_codec_name} (cumulative {:.1}ms)",
+                decoder_open_t0.elapsed().as_secs_f64() * 1000.0,
+                open_phase_t0.elapsed().as_secs_f64() * 1000.0
+            ));
+            let video_decoder = opened_video.decoder;
+            let video_decoder_name = opened_video.decoder_name;
+            let hw_probe = opened_video.hw_probe;
+            let hw_format_probe = opened_video.hw_format_probe;
+            let hw_active_initially = opened_video.hw_device.is_some();
+            let _hw_device = opened_video.hw_device;
+            let src_w = video_decoder.width();
+            let src_h = video_decoder.height();
+
+            // 出力サイズは GPU テクスチャ上限に合わせて縮める
+            let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
+            let (dst_w, dst_h) = clamp_dims(src_w, src_h, max_dim);
+
+            // **scaler は lazy 構築**。
+            // HW デコード時は `frame.format()` が `AV_PIX_FMT_D3D11` で、av_hwframe_transfer_data
+            // で SW 取り出した結果は通常 NV12 (10-bit HEVC なら P010)。SW デコードでも `format()`
+            // は decoder の出力フォーマットに依存する (yuv420p / yuvj420p / 等)。最初の 1 フレームを
+            // 受け取った時点の **実際の入力フォーマット + 寸法** で初期化する。
+            // (key に width/height を含めるのは、HW のサーフェス内部寸法と display 寸法が
+            // 異なる場合や mid-stream で resolution change が起きた場合に
+            // ScaleContext::run が `InputChanged` で全 frame skip に陥るのを防ぐため。)
+            // Phase B: scaler / scaler_key / first_frame_event_logged はすべて
+            // run_video_decode のローカル変数として所有される (= デコーダ + GPU パスは別 thread)。
+
+            Some(VideoSetup {
+                decoder: video_decoder,
+                hw_format_probe,
+                hw_device: _hw_device,
+                params_owned: video_params_owned,
+                codec_id,
+                stream_idx: video_stream_idx,
+                tb_num_i32: video_time_base.numerator(),
+                tb_den_i32: video_time_base.denominator(),
+                fps_num: video_fps_num,
+                fps_den: video_fps_den,
+                sar_num: video_sar_num,
+                sar_den: video_sar_den,
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+                avg_fps: video_avg_fps,
+                codec_name: stream_codec_name,
+                decoder_name: video_decoder_name,
+                field_order_debug: format!("{video_field_order:?}"),
+                stream_interlaced: video_stream_interlaced,
+                hw_active_initially,
+                hw_probe,
+            })
         }
+        None => None,
     };
-    crate::logger::log(format!(
-        "[demux] open_video_decoder done in {:.1}ms hw_requested={effective_hw_decode_requested} codec={stream_codec_name} (cumulative {:.1}ms)",
-        decoder_open_t0.elapsed().as_secs_f64() * 1000.0,
-        open_phase_t0.elapsed().as_secs_f64() * 1000.0
-    ));
-    let video_decoder = opened_video.decoder;
-    let video_decoder_name = opened_video.decoder_name;
-    let hw_probe = opened_video.hw_probe;
-    let hw_format_probe = opened_video.hw_format_probe;
-    let hw_active_initially = opened_video.hw_device.is_some();
-    let _hw_device = opened_video.hw_device;
-    let src_w = video_decoder.width();
-    let src_h = video_decoder.height();
-
-    // 出力サイズは GPU テクスチャ上限に合わせて縮める
-    let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
-    let (dst_w, dst_h) = clamp_dims(src_w, src_h, max_dim);
-
-    // **scaler は lazy 構築**。
-    // HW デコード時は `frame.format()` が `AV_PIX_FMT_D3D11` で、av_hwframe_transfer_data
-    // で SW 取り出した結果は通常 NV12 (10-bit HEVC なら P010)。SW デコードでも `format()`
-    // は decoder の出力フォーマットに依存する (yuv420p / yuvj420p / 等)。最初の 1 フレームを
-    // 受け取った時点の **実際の入力フォーマット + 寸法** で初期化する。
-    // (key に width/height を含めるのは、HW のサーフェス内部寸法と display 寸法が
-    // 異なる場合や mid-stream で resolution change が起きた場合に
-    // ScaleContext::run が `InputChanged` で全 frame skip に陥るのを防ぐため。)
-    // Phase B: scaler / scaler_key / first_frame_event_logged はすべて
-    // run_video_decode のローカル変数として所有される (= デコーダ + GPU パスは別 thread)。
+    let has_video = video_setup.is_some();
 
     // ── 音声ストリーム選択 (任意) ──
     let audio_setup = match input.streams().best(MediaType::Audio) {
@@ -2157,6 +2249,56 @@ fn run_decoder(
         clock.mark_audio_inactive();
     }
 
+    // audio-only 対応: video も audio も無ければ再生できるものが無い。ここで初めて
+    // エラーにする (= 添付画像だけの MP3 で映像も音声も開けなかった等の異常時)。
+    if !has_video && !has_audio {
+        let _ = info_tx.send(Err("再生可能なストリームが見つかりません".into()));
+        return;
+    }
+
+    // VideoInfo / interlace / log で使う映像 scalar 値を default 付きで取り出す
+    // (audio-only は width/height=0・codec/decoder="none"・sar=1:1)。
+    let (
+        vi_width,
+        vi_height,
+        vi_video_codec,
+        vi_video_decoder,
+        vi_d3d11va_supported,
+        vi_d3d11va_config,
+        vi_hw_active,
+        vi_avg_fps,
+        vi_sar_num,
+        vi_sar_den,
+        vi_stream_interlaced,
+    ) = match video_setup.as_ref() {
+        Some(v) => (
+            v.src_w,
+            v.src_h,
+            v.codec_name.clone(),
+            v.decoder_name.clone(),
+            v.hw_probe.d3d11va_supported,
+            v.hw_probe.d3d11va_config.clone(),
+            v.hw_active_initially,
+            v.avg_fps,
+            v.sar_num,
+            v.sar_den,
+            v.stream_interlaced,
+        ),
+        None => (
+            0,
+            0,
+            "none".to_string(),
+            "none".to_string(),
+            false,
+            String::new(),
+            false,
+            0.0,
+            1,
+            1,
+            false,
+        ),
+    };
+
     // ── 動画情報を通知 ──
     let duration_secs = duration_to_secs(input.duration());
     #[cfg(windows)]
@@ -2223,21 +2365,22 @@ fn run_decoder(
     let bit_rate_bps = input.bit_rate();
     // ストリーム interlaced 判定を `dynamic.interlace_detected` の初期値として記録。
     // フレームごとの latched 更新 (frame_interlaced=true で立つ) は run_video_decode 内で行う。
-    if video_stream_interlaced {
+    if vi_stream_interlaced {
         dynamic.interlace_detected.store(true, Ordering::Release);
     }
     let info = VideoInfo {
-        width: src_w,
-        height: src_h,
+        width: vi_width,
+        height: vi_height,
         duration_secs,
-        video_codec: stream_codec_name.clone(),
-        video_decoder: video_decoder_name.clone(),
-        d3d11va_supported: hw_probe.d3d11va_supported,
-        d3d11va_config: hw_probe.d3d11va_config.clone(),
+        video_codec: vi_video_codec,
+        video_decoder: vi_video_decoder,
+        d3d11va_supported: vi_d3d11va_supported,
+        d3d11va_config: vi_d3d11va_config,
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         audio_bit_rate_bps: audio_setup.as_ref().map(|a| a.bit_rate_bps).unwrap_or(0),
         has_audio,
-        hw_decode_active: hw_active_initially,
+        has_video,
+        hw_decode_active: vi_hw_active,
         gpu_path_active,
         effective_deinterlace_mode: deinterlace,
         dynamic: Arc::clone(&dynamic),
@@ -2245,21 +2388,45 @@ fn run_decoder(
         artist,
         original_url,
         description,
-        avg_fps: video_avg_fps,
+        avg_fps: vi_avg_fps,
         bit_rate_bps,
         chapters,
-        sar_num: video_sar_num,
-        sar_den: video_sar_den,
+        sar_num: vi_sar_num,
+        sar_den: vi_sar_den,
     };
     let _ = info_tx.send(Ok(info));
 
-    crate::logger::log(format!(
-        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} hw_effective={effective_hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} field_order={video_field_order:?} stream_interlaced={video_stream_interlaced} sar={video_sar_num}/{video_sar_den} d3d11va_config={}",
-        hw_probe.d3d11va_supported, hw_probe.d3d11va_config
-    ));
+    if let Some(v) = video_setup.as_ref() {
+        crate::logger::log(format!(
+            "video decoder: codec={} decoder={} hw_requested={hw_decode_requested} hw_effective={hw_decode_requested} d3d11va_supported={} hw_active_initially={} gpu_path={gpu_path_active} field_order={} stream_interlaced={} sar={}/{} d3d11va_config={}",
+            v.codec_name,
+            v.decoder_name,
+            v.hw_probe.d3d11va_supported,
+            v.hw_active_initially,
+            v.field_order_debug,
+            v.stream_interlaced,
+            v.sar_num,
+            v.sar_den,
+            v.hw_probe.d3d11va_config
+        ));
+    }
 
-    // perf: 動画特性を 1 行に記録 (解析時の最初の手がかり)。
-    if crate::perf::is_enabled() {
+    // perf: 動画特性を 1 行に記録 (解析時の最初の手がかり)。audio-only では映像特性が
+    // 無いので video_setup 有り時のみ emit する。
+    if let (true, Some(v)) = (crate::perf::is_enabled(), video_setup.as_ref()) {
+        // 以降の perf body を字面等価に保つための rebind (旧 setup ローカル名へ再束縛)。
+        let video_decoder = &v.decoder;
+        let hw_active_initially = v.hw_active_initially;
+        let src_w = v.src_w;
+        let src_h = v.src_h;
+        let dst_w = v.dst_w;
+        let dst_h = v.dst_h;
+        let stream_codec_name = v.codec_name.clone();
+        let video_decoder_name = v.decoder_name.clone();
+        let hw_probe = &v.hw_probe;
+        let video_field_order_dbg = v.field_order_debug.clone();
+        let video_stream_interlaced = v.stream_interlaced;
+        let video_avg_fps = v.avg_fps;
         let pix_fmt = format!("{:?}", video_decoder.format());
         let decode_path = if hw_active_initially {
             "hw_d3d11va"
@@ -2340,11 +2507,11 @@ fn run_decoder(
                 ),
                 (
                     "d3d11va_config",
-                    serde_json::Value::from(hw_probe.d3d11va_config),
+                    serde_json::Value::from(hw_probe.d3d11va_config.clone()),
                 ),
                 (
                     "field_order",
-                    serde_json::Value::from(format!("{video_field_order:?}")),
+                    serde_json::Value::from(video_field_order_dbg),
                 ),
                 (
                     "stream_interlaced",
@@ -2448,11 +2615,41 @@ fn run_decoder(
     // separate control channel below so it cannot be buried behind old packets.
     // Sustained compressed-video burst absorption is handled by the demux-side
     // bounded overflow queue.
-    let video_tb_num = video_time_base.numerator() as f64;
-    let video_tb_den = video_time_base.denominator() as f64;
+    // audio-only 対応: 映像の stream index / time_base は video_setup から取り出す。
+    // audio-only では demux ループの video routing が Some(idx) 判定で unreachable に
+    // なるので値は unused だが、型と参照を揃えるため常に用意する。
+    let video_stream_idx: Option<usize> = video_setup.as_ref().map(|v| v.stream_idx);
+    let (video_tb_num, video_tb_den) = match video_setup.as_ref() {
+        Some(v) => (v.tb_num_i32 as f64, v.tb_den_i32 as f64),
+        None => (1.0, 1.0),
+    };
+    // video packet / control channel は **常に生成** する (demux ループの video routing
+    // block を字面等価に保ち、動画リグレッションを避けるため)。audio-only では下の else で
+    // rx と frame sender を drop して disconnect させ、video decode thread は spawn しない。
+    // ⚠ audio-only で video_pkt_tx / video_ctl_tx へ送る経路は「死んだ receiver への send」に
+    // なるので、seek Flush / EOF / packet routing の 3 経路すべてを `video_stream_idx.is_some()`
+    // または Some(idx) 判定で gate してある (新たな video send を足すときも同じ gate を通すこと)。
     let (video_pkt_tx, video_pkt_rx) = bounded::<VideoPacketMsg>(VIDEO_PACKET_QUEUE_CAP);
     let (video_ctl_tx, video_ctl_rx) = bounded::<VideoControlMsg>(VIDEO_CONTROL_QUEUE_CAP);
-    let video_decode_handle: std::thread::JoinHandle<()> = {
+    let video_decode_handle: Option<std::thread::JoinHandle<()>> = if let Some(v) = video_setup {
+        let VideoSetup {
+            decoder: video_decoder,
+            hw_format_probe,
+            hw_device: _hw_device,
+            params_owned: video_params_owned,
+            codec_id,
+            tb_num_i32,
+            tb_den_i32,
+            fps_num: video_fps_num,
+            fps_den: video_fps_den,
+            sar_num: video_sar_num,
+            sar_den: video_sar_den,
+            dst_w,
+            dst_h,
+            stream_interlaced: video_stream_interlaced,
+            hw_active_initially,
+            ..
+        } = v;
         let clock_v = clock.clone();
         let cancel_v = cancel.clone();
         let engine_state_v = engine_state.clone();
@@ -2465,50 +2662,60 @@ fn run_decoder(
         // Arc は move で thread 跨ぎ OK。
         #[cfg(windows)]
         let gpu_video_device_v = gpu_video_device;
-        std::thread::Builder::new()
-            .name("video-decode".into())
-            .spawn(move || {
-                run_video_decode(
-                    // gpu_video_device を **最初**に渡すことで、関数内 drop 順を
-                    // `_hw_device → video_decoder → hw_format_probe → gpu_video_device`
-                    // (= 反転で最後) にする。FFmpeg cleanup が CS を握る間 Arc と
-                    // get_format probe を生かす (Codex P1 2026-05-16)。詳細は
-                    // run_video_decode 冒頭のコメント参照。
-                    #[cfg(windows)]
-                    gpu_video_device_v,
-                    hw_format_probe,
-                    video_decoder,
-                    _hw_device,
-                    video_params_owned,
-                    codec_id,
-                    video_pkt_rx,
-                    video_ctl_rx,
-                    video_tx_for_thread,
-                    clock_v,
-                    cancel_v,
-                    engine_state_v,
-                    skipped_frame_count_v,
-                    dst_w,
-                    dst_h,
-                    video_time_base.numerator(),
-                    video_time_base.denominator(),
-                    video_tb_num,
-                    video_tb_den,
-                    video_fps_num,
-                    video_fps_den,
-                    video_sar_num,
-                    video_sar_den,
-                    hw_active_initially,
-                    deinterlace,
-                    video_stream_interlaced,
-                    dynamic_v,
-                )
-            })
-            .expect("spawn video-decode thread")
+        Some(
+            std::thread::Builder::new()
+                .name("video-decode".into())
+                .spawn(move || {
+                    run_video_decode(
+                        // gpu_video_device を **最初**に渡すことで、関数内 drop 順を
+                        // `_hw_device → video_decoder → hw_format_probe → gpu_video_device`
+                        // (= 反転で最後) にする。FFmpeg cleanup が CS を握る間 Arc と
+                        // get_format probe を生かす (Codex P1 2026-05-16)。詳細は
+                        // run_video_decode 冒頭のコメント参照。
+                        #[cfg(windows)]
+                        gpu_video_device_v,
+                        hw_format_probe,
+                        video_decoder,
+                        _hw_device,
+                        video_params_owned,
+                        codec_id,
+                        video_pkt_rx,
+                        video_ctl_rx,
+                        video_tx_for_thread,
+                        clock_v,
+                        cancel_v,
+                        engine_state_v,
+                        skipped_frame_count_v,
+                        dst_w,
+                        dst_h,
+                        tb_num_i32,
+                        tb_den_i32,
+                        video_tb_num,
+                        video_tb_den,
+                        video_fps_num,
+                        video_fps_den,
+                        video_sar_num,
+                        video_sar_den,
+                        hw_active_initially,
+                        deinterlace,
+                        video_stream_interlaced,
+                        dynamic_v,
+                    )
+                })
+                .expect("spawn video-decode thread"),
+        )
+    } else {
+        // audio-only: video decode thread は spawn しない。video 系 channel の rx と
+        // frame sender (video_tx) を drop して disconnect させる (= tick / native
+        // presenter 側は video_rx が空のまま、future_frames も空)。
+        drop(video_pkt_rx);
+        drop(video_ctl_rx);
+        drop(video_tx);
+        None
     };
     // この時点で run_decoder = demux thread として再構成される。video_decoder /
     // _hw_device / hw_format_probe / gpu_video_device / video_tx はすべて video decode
-    // thread が所有。
+    // thread が所有 (audio-only では上記いずれも存在しない)。
     // 以下のループは demux + seek 調停 + EOF idle wait に専念する。
 
     // ── デコードループ (demux thread) ──
@@ -2708,18 +2915,22 @@ fn run_decoder(
                 pending_video_packet_bytes = 0;
                 next_video_overflow_log_bytes = 0;
             }
-            if !send_demux_msg_cancel_aware(
-                &video_ctl_tx,
-                VideoControlMsg::Flush {
-                    serial,
-                    trim_before_secs: video_trim_before,
-                    frame_step,
-                },
-                &cancel,
-                "video",
-                "flush",
-                VIDEO_CONTROL_QUEUE_CAP,
-            ) {
+            // audio-only では video decode thread が無い (video_ctl_rx は drop 済み)。
+            // gate せずに送ると disconnect を cancel と誤解して demux が break してしまう。
+            if video_stream_idx.is_some()
+                && !send_demux_msg_cancel_aware(
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial,
+                        trim_before_secs: video_trim_before,
+                        frame_step,
+                    },
+                    &cancel,
+                    "video",
+                    "flush",
+                    VIDEO_CONTROL_QUEUE_CAP,
+                )
+            {
                 break 'outer;
             }
             if audio_stream_idx_for_demux.is_some() {
@@ -2788,7 +2999,7 @@ fn run_decoder(
             if cancel.load(Ordering::Acquire) {
                 break 'outer;
             }
-            if stream.index() == video_stream_idx {
+            if Some(stream.index()) == video_stream_idx {
                 // Phase B: video packet は decode せず video decode thread に転送する。
                 // pre-decode preroll trim (= drop_before_secs check) と pacing logic は
                 // すべて video decode thread 側に移管。
@@ -2997,14 +3208,17 @@ fn run_decoder(
             }
             // Phase B: video decode thread にも Eof を通知。動画は内部残フレームを
             // 失っても許容なので drain しないが、Eof 自体は送って状態を伝える。
-            let _ = send_demux_msg_cancel_aware(
-                &video_pkt_tx,
-                VideoPacketMsg::Eof,
-                &cancel,
-                "video",
-                "eof",
-                VIDEO_PACKET_QUEUE_CAP,
-            );
+            // audio-only では video thread が無い (rx は drop 済み) ので送らない。
+            if video_stream_idx.is_some() {
+                let _ = send_demux_msg_cancel_aware(
+                    &video_pkt_tx,
+                    VideoPacketMsg::Eof,
+                    &cancel,
+                    "video",
+                    "eof",
+                    VIDEO_PACKET_QUEUE_CAP,
+                );
+            }
             loop {
                 if cancel.load(Ordering::Acquire) {
                     crate::logger::log(format!("video decoder finished: {}", path.display()));
@@ -3032,8 +3246,11 @@ fn run_decoder(
     }
     drop(video_pkt_tx);
     drop(video_ctl_tx);
-    if let Err(e) = video_decode_handle.join() {
-        crate::logger::log(format!("video-decode thread panicked: {e:?}"));
+    // audio-only では video decode thread を spawn していない (= None)。
+    if let Some(handle) = video_decode_handle {
+        if let Err(e) = handle.join() {
+            crate::logger::log(format!("video-decode thread panicked: {e:?}"));
+        }
     }
 }
 

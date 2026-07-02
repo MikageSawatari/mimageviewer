@@ -5512,11 +5512,25 @@ impl VideoPlayer {
                             // BufferReady を永久に待ち Buffering で固まる (= audio が決して
                             // 再生されないため audio.rs から BufferReady が出ない)。
                             let has_audio_effective = info.has_audio && self.audio.is_some();
+                            // audio-only ファイル (映像トラック無し) は `has_video=false`。
+                            // engine は has_video で `FirstFrameReady` 待ちを gate する
+                            // (映像 thread が無く FirstFrameReady が来ないため)。
+                            let has_video_effective = info.has_video;
+                            // audio-only で audio 出力も起動できなかった (self.audio=None) →
+                            // 再生できる出力がゼロ。engine は is_ready(false,false) で永久
+                            // Buffering になるので、open エラーとして表面化し worker を畳む
+                            // (無音のまま preparing で回り続けるのを防ぐ)。
+                            if !has_video_effective && !has_audio_effective {
+                                self.error = Some("音声出力を初期化できませんでした".to_string());
+                                self.shutdown_workers_for_error();
+                                return None;
+                            }
                             let _ = self.engine_event_tx.try_send(EngineEvent::Decoder(
                                 engine::state::DecoderEvent::InfoReceived {
                                     epoch: self.engine.lock().unwrap().current_seek_epoch(),
                                     duration_secs: info.duration_secs,
                                     has_audio: has_audio_effective,
+                                    has_video: has_video_effective,
                                 },
                             ));
                             self.info_event_emitted = true;
@@ -5885,13 +5899,43 @@ impl VideoPlayer {
         // EOF 処理: clock.is_eof_reached() (= decoder が EOF wait に入った)
         // + queue 空 + 今 tick 表示なし + 進行中の seek なし → 本当に最後と判定。
         // 「seek 進行中」は seek_target_override が立っている時。
+        //
+        // **音声 drain gate** (2026-07-02, audio-only 対応): この非 native 経路は
+        // headless audio (native_output=None) が必ず通る。audio-only では future_frames /
+        // latest_renderable が常に空なので、drain gate 無しだと demux が読み切った瞬間
+        // (= pump にまだ数秒の buffered audio が残る時点) に EofReached が発火して
+        // **末尾音声が切れる**。native 経路 (上の early-return ブロック) と同じく、
+        // audio 有効時は audio buffer が quiet になり連続 EOF_DRAIN_QUIET_TICKS 回
+        // 観測してから EOF を確定する。audio 無し (video のみ / 非 native transient) は
+        // 即 quiet 扱い。閾値の意味は native 側 doc コメント参照。
+        const EOF_DRAIN_AUDIO_QUIET_TOL: f64 = 0.020;
+        const EOF_DRAIN_QUIET_TICKS: u32 = 3;
+        let audio_active_for_eof =
+            self.audio.is_some() && self.info.as_ref().map(|i| i.has_audio).unwrap_or(false);
+        let audio_drained = !audio_active_for_eof
+            || (self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                && self.audio_rx_len() == 0);
         let seek_in_flight = self.clock.is_seeking();
-        if self.clock.is_eof_reached()
+        let eof_ready_now = self.clock.is_eof_reached()
             && self.future_frames.is_empty()
             && latest_renderable.is_none()
             && !seek_in_flight
             && self.is_playing()
-        {
+            && audio_drained;
+        let eof_quiet_ticks = if eof_ready_now {
+            self.eof_loop_quiet_ticks
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1
+        } else {
+            self.eof_loop_quiet_ticks
+                .store(0, std::sync::atomic::Ordering::Release);
+            0
+        };
+        if eof_ready_now && eof_quiet_ticks >= EOF_DRAIN_QUIET_TICKS {
+            self.eof_loop_quiet_ticks
+                .store(0, std::sync::atomic::Ordering::Release);
             if self.loop_enabled.load(std::sync::atomic::Ordering::Acquire) {
                 // ループ再生 ON: `loop_target_bits` (= app が書き戻している
                 // 「現区間の開始秒」 / Full ループでは 0.0) にシークし続行。
@@ -6129,8 +6173,14 @@ impl VideoPlayer {
         // (= 体感は十分滑らか、CPU 負担も無視できる)。
         // **engine_state も含む** (Codex P1 2026-05-17、上記 native 経路と同じ理由):
         // 1 枚目表示済みでも engine が Loading/Buffering/Seeking なら preparing 扱い。
-        let preparing =
-            self.displayed_frame_seq.load(Ordering::Relaxed) == 0 || self.is_engine_preparing();
+        //
+        // **audio-only では displayed_frame_seq が永久に 0** (映像 frame を表示しない)
+        // なので、`==0` を無条件に preparing 扱いすると Paused/Eof でも 50ms repaint を
+        // 返し続け egui がスリープできない (Codex P2, round 2)。has_video のときだけ
+        // frame 未表示を preparing に含め、audio-only は engine state だけで判定する。
+        let has_video = self.info.as_ref().map(|i| i.has_video).unwrap_or(true);
+        let preparing = (has_video && self.displayed_frame_seq.load(Ordering::Relaxed) == 0)
+            || self.is_engine_preparing();
         if self.is_playing() || seek_in_flight_for_display || preparing {
             let mut due = next_due.unwrap_or_else(|| std::time::Duration::from_millis(33));
             if seek_in_flight_for_display && displayed_pts.is_none() {

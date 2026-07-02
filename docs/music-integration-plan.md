@@ -63,9 +63,95 @@ Status: 計画 v1（着手前レビュー用のドラフト）。
 - `tools/music_lab`（egui アプリ、158KB の `main.rs`）は **UI 参照実装**。mIV 側 UI は mIV 作法で
   書き直す。**symphonia は本体に入れない**（lab 専用。本体のデコードは FFmpeg。§2.2）。
 
-### 2.2 本体 `VideoPlayer` を再利用（再生・VST3・normalize）— **最大の de-risk 発見**
+### 2.2 本体 `VideoPlayer` を再利用（再生・VST3・normalize）
 
-調査で判明した最重要点: **本体の `VideoPlayer` は既に音声のみファイルを再生できる**。
+> ⚠️ **2026-07-02 訂正（重要）**: 当初「`VideoPlayer` は音声のみファイルをそのまま再生できる」と
+> 記載したが**誤り**だった。`run_decoder`（demux thread、`src/video/decoder.rs:1919`）は
+> `input.streams().best(Video)` が None だと `"動画ストリームが見つかりません"` で即エラー終了する。
+> 素の音声ファイル（映像トラック無し）は現状の engine では再生できない。**再生前提として
+> engine の audio-only 対応が必要**（下記 §2.2.1）。それ以外（audio pump / VST3 / normalize /
+> clock の wall・audio フォールバック / position・duration・seek）は既に audio-only を許容する。
+
+#### 2.2.1 engine の audio-only 対応（Inc 3 の前提・実装方針確定 2026-07-02）
+
+engine は **音声側は既に Option 設計**（`audio_setup: Option<AudioSetup>`、`has_audio` で
+clock を wall/audio 切替、無音動画で `mark_audio_inactive()`）。**映像側に同じ Option 設計を
+入れる**のが確定方針（案A・in-place 統一。ユーザー承認 2026-07-02）:
+
+- `run_decoder` 冒頭で `video_stream` を **Option 化**（None でも即エラーにしない）。video も
+  audio も無ければそこで初めてエラー。
+- 映像セットアップ（`decoder.rs:1926-2036`: params / HW decode open / src・dst 寸法 / fps / sar /
+  interlaced）を **`Option<VideoSetup>` にまとめる**（既存 `Option<AudioSetup>` と対称。
+  video 有り = Some、audio-only = None）。
+- 映像 decode thread spawn（`2455-2508`）、demux ループの video packet routing、join/cleanup、
+  `VideoInfo`（width/height/fps/sar は None 時 0、codec は "none"）、perf ログを **`video_setup`
+  の有無で gate**。`video_setup=Some` の分岐は現状と**バイト等価**に保つ（動画リグレッション回避）。
+- **統一の効能（Inc 7 と一本化）**: gate を `video_active = video_setup.is_some() && !video_output_disabled`
+  にすれば、**「映像トラック無し（audio-only ファイル）」と「Inc 7 の映像 OFF トグル」が同一機構**に
+  なる。Inc 7 は video_stream を持つファイルに `video_output_disabled` フラグを立てるだけで、
+  映像 decode/描画をスキップして音声継続（＝audio-only と同じコード経路）。
+- **リスクと担保**: コア動画経路への in-place 改修なので、① Some 分岐を現状等価に保つ ②
+  Codex レビュー（decoder 差分を重点）③ ユーザー実機で「音声が鳴る」＋「既存動画が無傷」を検証。
+  実機テストできないため盲目実装。native presenter は audio では使わない（`native_output_config=None`）
+  ので presenter の frame 依存問題は回避される。
+- 影響ファイル: `src/video/decoder.rs`（run_decoder 1919/1926-2036/2229-2253/2455-2508/demux loop/
+  join）、`src/video/mod.rs`（VideoInfo `has_video`、InfoReceived 配線、headless EOF drain、
+  audio-only の output 失敗をエラー化）、`src/video/engine/state.rs` + `engine/actor.rs`（下記
+  ReadinessLatch 対称化）。clock / audio.rs は変更不要（既に audio-only 許容）。
+
+##### 2.2.1a 設計レビュー反映（2026-07-02、Codex round 1 + 自己調査）
+
+decoder.rs の Option 化だけでは**再生が開始しない/末尾が切れる/音楽ファイルが誤判定される**。
+設計レビューで判明した追加の video-mandatory 結合と対応（実装対象に追加）:
+
+- **【P1】engine の ReadinessLatch が FirstFrameReady 必須**（最重要）。
+  `engine/state.rs` の `ReadinessLatch::is_ready(has_audio)` は has_audio に関係なく常に
+  `first_frame`(=FirstFrameReady) を要求する。FirstFrameReady は表示済み video frame 由来
+  （`mod.rs` の `flush_first_frame_ready`）なので、映像 thread の無い audio-only では永久に
+  来ない → engine が Buffering から抜けず**再生開始しない**（buffering timeout の抜け道も無い）。
+  対応 = `has_audio` と対称に **`has_video` を導入**: `DecoderEvent::InfoReceived` に `has_video`
+  を載せ、`EngineActor.has_video`（既定 true で既存経路は不変）を保持、
+  `is_ready(has_audio, has_video)` を「has_video のときだけ first_frame 要求 / has_audio のときだけ
+  buffer_ready+anchor 要求 / どちらも無ければ false」に。`try_transition_from_buffering` の
+  anchor 選択は既存の「has_audio→audio anchor / else→first_frame anchor」で audio-only は
+  audio anchor を選ぶ（is_ready 以外は変更不要）。
+- **【P1】添付画像(cover art)を video stream と誤認**。MP3/FLAC/M4A の埋め込みジャケットは
+  FFmpeg で `AV_DISPOSITION_ATTACHED_PIC` の video stream として見える。`best(Video).is_some()`
+  だと**大半の音楽ファイルが「映像あり」と誤判定**され、静止画 1 枚を HW decode しに行く。
+  対応 = video stream 選択時に `ATTACHED_PIC` disposition を除外する（= 「timed playable video」
+  だけを video とみなす）。除外後に video が無ければ audio-only 扱い。
+- **【P1】headless(non-native) EOF が audio drain を待たない**。native 経路（`mod.rs:5688-`）は
+  `audio_drained`+`quiet_ticks` で末尾音声を出し切るが、audio-only が通る non-native 経路
+  （`mod.rs:5885-`）は `is_eof_reached() && future_frames.is_empty() && latest_renderable.is_none()`
+  で**即** EofReached を発火する。audio-only では後者 2 条件が常に true なので、demux が読み切った
+  瞬間（＝pump にまだ数秒の buffered audio が残る時点）に停止し**末尾が切れる**。対応 = non-native
+  EOF 条件に native と同じ audio-drain gate を足す（has_audio 有効時のみ）。
+- **【P2/対応】audio-only で audio output 起動失敗**（`self.audio.is_none()`）は has_video=false と
+  重なると playable output ゼロ。Buffering 固着より **open エラー**として表面化させる
+  （player error/`DecoderEvent::Failed`）。
+- **【P2/留意・実機検証項目】paused-seek / frame-step**: 表示 frame が無い audio-only では seek
+  override 解消が video と別経路。seek-while-playing は BufferReady 再 promote で成立見込み。
+  frame-step は音声では無意味操作。Inc 3 では seek/一時停止を実機検証し、paused-seek が固着する
+  場合のみ追加対応（当面は video と同一 readiness 経路に委ねる）。
+- **構造判断**: Codex は `Option<VideoRuntime>`（sender/queue/join を束ねる）を推奨したが、
+  「Some 経路をバイト等価に保ち動画リグレッションを避ける」を最優先し、**video routing block
+  （最ホットな ~130 行）を字面等価に保つ**ため、video 用 channel は常に生成し、audio-only では
+  rx を drop して thread を spawn しない構成にする（`video_stream_idx: Option<usize>` で routing を
+  自然に unreachable 化 + seek Flush / EOF send / join の 3 箇所だけ gate）。「死んだ receiver への
+  send」は上記 gate と routing block の unreachable 化で封じ、その旨コメントを残す。
+
+**実装完了 (2026-07-02)**: 上記方針で `src/video/{decoder.rs,mod.rs,engine/state.rs,engine/actor.rs}`
+を改修。build 緑 + lib 2009 / engine 104 / bin 3109 test 緑 + fmt clean。Codex code review
+(round 2) = **P1 なし**、video 経路のバイト等価・engine 対称化・gate・drop 順を確認済み。P2 2 件を
+反映: ① attached-pic 除外は `best(Video)` filter だけでなく非 attached-pic stream を find() で
+再探索する形に強化 (real video + cover art で real を取り逃さない) ② audio-only は
+`displayed_frame_seq==0` を preparing 扱いしない (has_video gate、Paused/Eof での 50ms repaint spin
+を回避)。P3 (headless EOF drain が compressed audio_pkt_rx の消費完了までは観測しない) は既存 native
+gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 一時停止 / 既存動画無傷) はユーザー担当。
+
+以下は audio-only engine 対応が入った後に成立する再利用のまとめ:
+
+調査で判明した最重要点: engine を audio-only 対応にすれば **`VideoPlayer` が音声のみファイルも再生できる**。
 
 - `VideoPlayer::open(...)`（`src/video/mod.rs:4031`）は FFmpeg で開き、`EngineActor.has_audio`
   （`src/video/engine/actor.rs:92`）で音声トラック有無を追跡。音声は

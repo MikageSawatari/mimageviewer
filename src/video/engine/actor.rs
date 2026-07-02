@@ -90,6 +90,11 @@ pub struct EngineActor {
     /// 動画 metadata。`InfoReceived` で初期化される。
     duration_secs: Option<f64>,
     has_audio: bool,
+    /// timed playable video stream を持つか。`InfoReceived` で確定。
+    /// 既定 true (= 従来の動画経路と等価)。audio-only ファイル (映像トラック無し /
+    /// 添付画像のみ) では false になり、`ReadinessLatch::is_ready` が FirstFrameReady を
+    /// 待たなくなる (映像 decode thread が無く FirstFrameReady が永久に来ないため)。
+    has_video: bool,
 
     /// 現在の seek 世代。`AvClock::request_seek` で bump され、`SeekCompleted` /
     /// `enter_buffering` では進めない。
@@ -161,6 +166,8 @@ impl EngineActor {
             published_state: Arc::new(AtomicU8::new(state_code::IDLE)),
             duration_secs: None,
             has_audio: false,
+            // 既定 true: `InfoReceived` 到着までは従来の動画経路と等価に振る舞う。
+            has_video: true,
             seek_serial,
             av_clock,
             last_observed_serial: initial_serial,
@@ -504,11 +511,13 @@ impl EngineActor {
                 epoch: _,
                 duration_secs,
                 has_audio,
+                has_video,
             } => {
                 // metadata は **epoch 関係なく常に保存** する (= pre-info user seek が
-                // 走った場合でも duration/has_audio は捨てない)。
+                // 走った場合でも duration/has_audio/has_video は捨てない)。
                 self.duration_secs = Some(duration_secs);
                 self.has_audio = has_audio;
+                self.has_video = has_video;
                 // 状態遷移は state=Loading のときだけ行う。
                 // pre-info で user seek が走って既に Seeking に入っている場合は、
                 // resume_secs を消費せずに残し、次回ファイル open でも作用させない。
@@ -656,7 +665,7 @@ impl EngineActor {
         if self.state != EngineState::Buffering {
             return;
         }
-        if !self.latch.is_ready(self.has_audio) {
+        if !self.latch.is_ready(self.has_audio, self.has_video) {
             return;
         }
         // anchor source の選択: audio あり → Audio anchor、なし → Wall anchor。
@@ -822,6 +831,48 @@ mod tests {
     }
 
     #[test]
+    fn try_transition_buffering_to_playing_audio_only_no_video() {
+        // audio-only ファイル (has_video=false, has_audio=true): 映像 thread が無く
+        // FirstFrameReady が来ないので、first_frame 無しでも BufferReady + audio anchor
+        // だけで Playing (audio anchor) に遷移する。これが無いと Buffering 固着で
+        // 「音声ファイルを開いても再生開始しない」バグになる。
+        let mut a = fresh_actor();
+        a.has_audio = true;
+        a.has_video = false;
+        a.transition_to_buffering(0.0);
+
+        // first_frame は **意図的に立てない** (audio-only では届かない)。
+        a.latch.buffer_ready = true;
+        a.latch.audio_anchor = Some((1.5, Instant::now()));
+
+        a.try_transition_from_buffering();
+        assert_eq!(
+            a.state,
+            EngineState::Playing,
+            "audio-only: first_frame 無しでも Playing へ"
+        );
+        assert_eq!(a.clock().anchor().source, ClockSource::Audio);
+        assert!(
+            !a.latch.first_frame,
+            "audio-only は first_frame を前提にしない"
+        );
+    }
+
+    #[test]
+    fn info_received_sets_has_video_false_for_audio_only() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: a.current_seek_epoch(),
+            duration_secs: 42.0,
+            has_audio: true,
+            has_video: false,
+        });
+        assert!(!a.has_video, "InfoReceived が has_video=false を反映する");
+        assert!(a.has_audio);
+    }
+
+    #[test]
     fn try_transition_paused_when_autoplay_disabled() {
         let mut a = fresh_actor_with_opts(OpenOptions {
             autoplay: false,
@@ -910,19 +961,22 @@ mod tests {
         let mut l = ReadinessLatch::new(0);
         l.first_frame = true;
         l.first_frame_pts = None;
-        assert!(!l.is_ready(false), "first_frame_pts=None blocks readiness");
+        assert!(
+            !l.is_ready(false, true),
+            "first_frame_pts=None blocks readiness"
+        );
         l.first_frame_pts = Some(0.0);
-        assert!(l.is_ready(false));
+        assert!(l.is_ready(false, true));
 
         // has_audio=true で buffer_ready=true でも audio_anchor=None なら blocked
         l.buffer_ready = true;
         l.audio_anchor = None;
         assert!(
-            !l.is_ready(true),
+            !l.is_ready(true, true),
             "audio_anchor=None blocks readiness with audio"
         );
         l.audio_anchor = Some((0.05, std::time::Instant::now()));
-        assert!(l.is_ready(true));
+        assert!(l.is_ready(true, true));
     }
 
     #[test]
@@ -965,6 +1019,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         // resume なし → Loading → Buffering
         assert_eq!(a.state, EngineState::Buffering);
@@ -982,6 +1037,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         // first_frame だけでは Playing には行かない (buffer_ready 待ち)
@@ -1004,6 +1060,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         a.handle_seek_request(10.0);
         a.handle_decoder_event(DecoderEvent::SeekCompleted {
@@ -1038,6 +1095,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         // resume が消費されて Seeking に遷移
         assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
@@ -1071,6 +1129,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         // resume=28 > duration=30 - 5 (= END_GUARD) → 末尾近くなので無視 → 通常 Buffering
         assert_eq!(a.state, EngineState::Buffering);
@@ -1085,6 +1144,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         // resume=0.5 < MIN(1.0) → 無視 → 通常 Buffering
         assert_eq!(a.state, EngineState::Buffering);
@@ -1099,6 +1159,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         // ユーザーが手動 seek
         a.handle_seek_request(10.0);
@@ -1119,6 +1180,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         // Buffering 中: AudioRendered が来ても anchor は Frozen のまま
         a.handle_audio_event(AudioEvent::AudioRendered {
@@ -1157,6 +1219,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_audio_event(AudioEvent::BufferReady {
@@ -1194,6 +1257,7 @@ mod tests {
             epoch: 0,
             duration_secs: 60.0,
             has_audio: true,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_audio_event(AudioEvent::BufferReady {
@@ -1241,6 +1305,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         assert_eq!(a.state, EngineState::Playing);
@@ -1258,6 +1323,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.apply_command(TransportCommand::Pause);
@@ -1279,6 +1345,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         // Buffering、autoplay=false
         assert_eq!(a.state, EngineState::Buffering);
@@ -1298,6 +1365,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         assert_eq!(a.state, EngineState::Buffering);
         a.apply_command(TransportCommand::Pause);
@@ -1315,6 +1383,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_decoder_event(DecoderEvent::EofReached {
@@ -1336,6 +1405,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_decoder_event(DecoderEvent::EofReached {
@@ -1354,6 +1424,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_decoder_event(DecoderEvent::EofReached {
@@ -1375,6 +1446,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_audio_event(AudioEvent::BufferReady {
@@ -1411,6 +1483,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         // first_frame だけでは Playing に行かない
@@ -1431,6 +1504,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 5.0 });
         // anchor は Wall 5.0 になっている。+10 で seek
@@ -1448,6 +1522,7 @@ mod tests {
             epoch: 0,
             duration_secs: 60.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         assert_eq!(a.state, EngineState::Playing);
@@ -1478,6 +1553,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.apply_command(TransportCommand::Pause);
@@ -1520,6 +1596,7 @@ mod tests {
             epoch: 0,
             duration_secs: 45.0,
             has_audio: true,
+            has_video: true,
         });
         assert_eq!(a.duration_secs, Some(45.0), "duration must be saved");
         assert!(a.has_audio, "has_audio must be saved");
@@ -1538,6 +1615,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.apply_command(TransportCommand::SeekAbsolute { target_secs: 100.0 });
         assert_eq!(a.state, EngineState::Seeking { target_secs: 30.0 });
@@ -1566,6 +1644,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
 
         // handle_seek_request で epoch=1 / state=Seeking に
@@ -1600,6 +1679,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_decoder_event(DecoderEvent::EofReached {
@@ -1647,6 +1727,7 @@ mod tests {
                 epoch: 0,
                 duration_secs: 30.0,
                 has_audio: false,
+                has_video: true,
             });
             a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
             a.apply_command(TransportCommand::Pause);
@@ -1663,6 +1744,7 @@ mod tests {
                 epoch: 0,
                 duration_secs: 30.0,
                 has_audio: false,
+                has_video: true,
             });
             a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
             a.handle_decoder_event(DecoderEvent::EofReached {
@@ -1692,6 +1774,7 @@ mod tests {
             epoch: 0,
             duration_secs: 100.0,
             has_audio: false,
+            has_video: true,
         });
         for i in 1..=5 {
             a.handle_seek_request(i as f64 * 10.0);
@@ -1715,6 +1798,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         // 新世代に
         a.handle_seek_request(15.0);
@@ -1743,6 +1827,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         assert_eq!(a.state, EngineState::Playing);
@@ -1777,6 +1862,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
 
@@ -1815,6 +1901,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
         a.handle_decoder_event(DecoderEvent::EofReached {
@@ -1849,6 +1936,7 @@ mod tests {
             epoch: 0,
             duration_secs: 60.0,
             has_audio: false,
+            has_video: true,
         });
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
 
@@ -1896,6 +1984,7 @@ mod tests {
             epoch: 0,
             duration_secs: 60.0,
             has_audio: false,
+            has_video: true,
         });
         // 初期状態: counter=0
         assert_eq!(seek_serial.load(Ordering::Acquire), 0);
@@ -1939,6 +2028,7 @@ mod tests {
             epoch: 0,
             duration_secs: 60.0,
             has_audio: false,
+            has_video: true,
         });
         assert_eq!(seek_serial.load(Ordering::Acquire), 0);
 
@@ -2094,6 +2184,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         // Buffering: 依然 AvClock は frozen at 0
         assert!(!av_clock.is_playing());
@@ -2235,6 +2326,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         // この時点で Buffering 入場、AvClock は Frozen
         assert_eq!(actor.state, EngineState::Buffering);
@@ -2262,6 +2354,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         assert!(actor.autoplay_intent());
         actor.apply_command(TransportCommand::Pause);
@@ -2293,6 +2386,7 @@ mod tests {
             epoch: 0,
             duration_secs: 30.0,
             has_audio: true,
+            has_video: true,
         });
         assert!(!actor.autoplay_intent());
         actor.apply_command(TransportCommand::Play);
