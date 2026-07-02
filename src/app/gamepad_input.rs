@@ -5364,14 +5364,11 @@ impl App {
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::ZipSeparator { .. })
             | Some(GridItem::PdfPage { .. })
-            | Some(GridItem::Video(_)) => {
+            | Some(GridItem::Video(_))
+            | Some(GridItem::Audio(_)) => {
                 self.bump_input_seq_for_item("gamepad_grid_open", idx);
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(idx);
-                None
-            }
-            Some(GridItem::Audio(_)) => {
-                // Inc 1: 音声の open は暫定 no-op。音楽ビューは Inc 3 で配線する。
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {

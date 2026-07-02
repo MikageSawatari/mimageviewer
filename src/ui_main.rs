@@ -9169,12 +9169,8 @@ impl App {
                     }
                     nav = Some(p);
                 }
-                Some(GridItem::Audio(_)) => {
-                    // Inc 1: 音声のダブルクリックは暫定 no-op。フルスクリーン音楽ビュー
-                    // (自動再生 + タイムライン, D14) は Inc 3 で配線する
-                    // (docs/music-integration-plan.md)。
-                }
                 Some(GridItem::Image(_))
+                | Some(GridItem::Audio(_))
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::ZipSeparator { .. })
                 | Some(GridItem::PdfPage { .. })

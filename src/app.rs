@@ -20240,16 +20240,12 @@ impl App {
                         Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);
                         }
-                        Some(GridItem::Audio(_)) => {
-                            // Inc 1: 音声の Enter / ダブルクリックは暫定 no-op。フルスクリーン
-                            // 音楽ビュー (自動再生 + タイムライン, D14) は Inc 3 で配線する
-                            // (docs/music-integration-plan.md)。
-                        }
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
                         | Some(GridItem::PdfPage { .. })
-                        | Some(GridItem::Video(_)) => {
+                        | Some(GridItem::Video(_))
+                        | Some(GridItem::Audio(_)) => {
                             #[cfg(windows)]
                             if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
                                 return None;
@@ -25578,6 +25574,19 @@ impl App {
                     self.start_fs_load(idx);
                 }
             }
+            Some(GridItem::Audio(_)) => {
+                // 音声: headless プレイヤーで音楽ビュー再生 (D3、Inc 3)。
+                // cache があれば再生再開、無ければ start_fs_load が headless player を作る。
+                if self.fs_cache.contains_key(&idx) {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                        player.set_playing(true);
+                    }
+                    crate::logger::log(format!("  audio cache hit idx={idx} → resume playback"));
+                } else {
+                    crate::logger::log(format!("  audio idx={idx} → start music view playback"));
+                    self.start_fs_load(idx);
+                }
+            }
             Some(GridItem::ZipSeparator { dir_display }) => {
                 // セパレータはテキスト表示のみ (デコード不要)
                 crate::logger::log(format!(
@@ -29984,6 +29993,47 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
+    /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。
+    ///
+    /// 音楽ビュー (D3) は egui で描くので GPU 映像経路 (`gpu_video_device`) と native
+    /// presenter (`native_output_config`) は使わない。VST3 (`dsp_bridge`) は Inc 6 で配線
+    /// する。音量ノーマライズは既存 `audio_normalize_db` の cache 値があれば適用するが、
+    /// スキャン起動はしない (Inc 3a; スキャン連携は後続)。再生は先頭から自動開始。
+    fn build_audio_player_for_open(&self, path: PathBuf) -> crate::video::VideoPlayer {
+        let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
+        let normalize_gain = if self.settings.audio_normalize_enabled {
+            let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
+            self.audio_normalize_db
+                .as_ref()
+                .and_then(|db| db.lookup(&path, target_milli))
+                .map(|r| 10.0_f64.powf(r.gain_db as f64 / 20.0))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let player = crate::video::VideoPlayer::open(
+            path,
+            vol,
+            normalize_gain,
+            false, // audio_preroll_suspended
+            true,  // autoplay
+            None,  // resume (Inc 3a: 先頭から)
+            false, // hw_decode (音声のみ、GPU 不要)
+            self.settings.video_deinterlace,
+            #[cfg(windows)]
+            None, // gpu_video_device (headless)
+            #[cfg(windows)]
+            None, // dsp_bridge (VST3 は Inc 6)
+            #[cfg(windows)]
+            None, // native_output_config (headless = 音楽ビューは egui 描画)
+        );
+        player.set_playback_speed(self.video_playback_speed);
+        if self.video_session_muted {
+            player.set_muted(true);
+        }
+        player
+    }
+
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG (通常画像) と WebP (通常画像 / ZIP 内画像) は
@@ -30127,6 +30177,40 @@ impl App {
                 } else {
                     self.maybe_start_normalize_scan_for_play_intent(idx);
                 }
+            }
+            return;
+        }
+
+        // 音声も専用パス: headless VideoPlayer を作って音楽ビュー (egui) で再生する。
+        // native presenter は使わない (D3)。fs_cache は動画と同じ FsCacheEntry::Video を
+        // 再利用する (中身は VideoPlayer なので identical)。通常の画像デコードは起動しない。
+        if let Some(GridItem::Audio(ap)) = self.items.get(idx).cloned() {
+            // 1 メディア = 1 cpal stream。既存の Video/Audio プレイヤー (= FsCacheEntry::Video)
+            // を畳んでから開く (動画と同じ singleton 規約)。
+            let other_player_idxs: Vec<usize> = self
+                .fs_cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    (*k != idx && matches!(v, FsCacheEntry::Video { .. })).then_some(*k)
+                })
+                .collect();
+            for k in other_player_idxs {
+                #[cfg(windows)]
+                self.cleanup_normalize_state_for_fs_idx(k);
+                self.fs_cache.remove(&k);
+                self.fs_margin_bbox_cache.remove(&k);
+            }
+            if !self.fs_cache.contains_key(&idx) {
+                self.activity_gate.bump();
+                let player = self.build_audio_player_for_open(ap);
+                self.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: self.input_seq,
+                    },
+                );
+                self.fs_margin_bbox_cache.remove(&idx);
             }
             return;
         }

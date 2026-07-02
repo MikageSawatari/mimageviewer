@@ -3197,6 +3197,22 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
+/// 秒数を `M:SS` (1 時間以上は `H:MM:SS`) にフォーマットする (音楽ビューの時間表示)。
+fn music_fmt_time(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "0:00".to_string();
+    }
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// フルスクリーンのキー入力結果。
 #[derive(Default)]
 pub(crate) struct FsKeyAction {
@@ -5374,7 +5390,15 @@ impl App {
                                     } else {
                                         false
                                     };
-                                    if panorama_painted {
+                                    if matches!(
+                                        self.items.get(fs_idx),
+                                        Some(GridItem::Audio(_))
+                                    ) {
+                                        // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
+                                        // 比較/回転経路はスキップする。
+                                        self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
+                                        self.fs_spread_layout = None;
+                                    } else if panorama_painted {
                                         self.fs_spread_layout = None;
                                     } else if self.fs_zoom_mode_engaged()
                                         && !state.is_video
@@ -18885,6 +18909,207 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
             );
             painter.galley(pos, galley, egui::Color32::from_rgb(255, 120, 120));
+        }
+    }
+
+    /// 音声フルスクリーンの音楽ビュー (Inc 3a: 最小構成)。
+    ///
+    /// headless `VideoPlayer` が音声を再生し、ここでは egui で「音楽アイコン + ファイル名 +
+    /// 再生位置/長さ + シークバー + 再生/一時停止ボタン」を描く。タイムライン波形 /
+    /// スペクトラム / 左右パネルの作り込みは Inc 3b / Inc 5。native presenter は使わない (D3)。
+    pub(crate) fn draw_fs_music_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        let dark = ui.visuals().dark_mode;
+        let painter = ui.painter_at(rect);
+        let bg = if dark {
+            egui::Color32::from_gray(18)
+        } else {
+            egui::Color32::from_gray(236)
+        };
+        painter.rect_filled(rect, 0.0, bg);
+
+        let (pos, dur, playing, err) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.position().max(0.0),
+                player.duration().max(0.0),
+                player.is_playing(),
+                player.error().map(|s| s.to_string()),
+            ),
+            _ => (0.0, 0.0, false, None),
+        };
+        let name = self
+            .items
+            .get(fs_idx)
+            .map(|it| it.name().to_string())
+            .unwrap_or_default();
+
+        let fg = if dark {
+            egui::Color32::from_gray(220)
+        } else {
+            egui::Color32::from_gray(40)
+        };
+        let accent = if dark {
+            egui::Color32::from_rgb(90, 150, 220)
+        } else {
+            egui::Color32::from_rgb(60, 110, 180)
+        };
+
+        // デコード失敗などのエラーは中央に出して終了。
+        if let Some(e) = err {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("音声を再生できません: {e}"),
+                egui::FontId::proportional(20.0),
+                egui::Color32::from_rgb(255, 120, 120),
+            );
+            return;
+        }
+
+        // 中央: 音楽アイコン + ファイル名。
+        let icon_side = rect.width().min(rect.height()) * 0.3;
+        let icon_rect = egui::Rect::from_center_size(
+            rect.center() - egui::vec2(0.0, rect.height() * 0.08),
+            egui::vec2(icon_side, icon_side),
+        );
+        crate::ui_helpers::draw_music_icon(&painter, icon_rect, dark);
+        painter.text(
+            egui::pos2(rect.center().x, icon_rect.bottom() + 26.0),
+            egui::Align2::CENTER_CENTER,
+            &name,
+            egui::FontId::proportional(20.0),
+            fg,
+        );
+
+        // 上情報バー (常時): ファイル名 + 位置/長さ。
+        let top_h = 34.0;
+        let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
+        painter.rect_filled(
+            top_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, if dark { 90 } else { 30 }),
+        );
+        painter.text(
+            top_rect.left_center() + egui::vec2(12.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &name,
+            egui::FontId::proportional(14.0),
+            fg,
+        );
+        painter.text(
+            top_rect.right_center() - egui::vec2(12.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            format!("{} / {}", music_fmt_time(pos), music_fmt_time(dur)),
+            egui::FontId::proportional(14.0),
+            fg,
+        );
+
+        // 下シークバー (常時、クリック/ドラッグでシーク)。
+        let bar_h = 10.0;
+        let bar_margin = 24.0;
+        let bar_top = rect.bottom() - 40.0;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + bar_margin, bar_top),
+            egui::pos2(rect.right() - bar_margin, bar_top + bar_h),
+        );
+        painter.rect_filled(
+            bar_rect,
+            bar_h * 0.5,
+            if dark {
+                egui::Color32::from_gray(60)
+            } else {
+                egui::Color32::from_gray(190)
+            },
+        );
+        let frac = if dur > 0.0 {
+            (pos / dur).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        if frac > 0.0 {
+            let filled = egui::Rect::from_min_max(
+                bar_rect.min,
+                egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),
+            );
+            painter.rect_filled(filled, bar_h * 0.5, accent);
+        }
+        let seek_resp = ui.interact(
+            bar_rect.expand2(egui::vec2(0.0, 8.0)),
+            ui.id().with(("music_seek", fs_idx)),
+            egui::Sense::click_and_drag(),
+        );
+        if (seek_resp.clicked() || seek_resp.dragged())
+            && dur > 0.0
+            && let Some(p) = seek_resp.interact_pointer_pos()
+        {
+            let f = ((p.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.seek(f * dur);
+            }
+        }
+
+        // 再生/一時停止ボタン (シークバー左上)。
+        let btn = 30.0;
+        let btn_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + bar_margin, bar_top - btn - 12.0),
+            egui::vec2(btn, btn),
+        );
+        let btn_resp = ui.interact(
+            btn_rect,
+            ui.id().with(("music_playpause", fs_idx)),
+            egui::Sense::click(),
+        );
+        painter.circle_filled(
+            btn_rect.center(),
+            btn * 0.5,
+            if btn_resp.hovered() {
+                accent
+            } else if dark {
+                egui::Color32::from_gray(70)
+            } else {
+                egui::Color32::from_gray(170)
+            },
+        );
+        let c = btn_rect.center();
+        if playing {
+            let bw = btn * 0.11;
+            let bh = btn * 0.34;
+            painter.rect_filled(
+                egui::Rect::from_center_size(c - egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
+                1.0,
+                egui::Color32::WHITE,
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(c + egui::vec2(bw * 1.5, 0.0), egui::vec2(bw, bh)),
+                1.0,
+                egui::Color32::WHITE,
+            );
+        } else {
+            let t = btn * 0.16;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(-t * 0.8, -t),
+                    c + egui::vec2(-t * 0.8, t),
+                    c + egui::vec2(t * 1.2, 0.0),
+                ],
+                egui::Color32::WHITE,
+                egui::Stroke::NONE,
+            ));
+        }
+        if btn_resp.clicked()
+            && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+        {
+            player.toggle_play();
+        }
+
+        // 再生中は毎フレーム再描画して位置/シークバーを更新する。
+        if playing {
+            ctx.request_repaint();
         }
     }
 }
