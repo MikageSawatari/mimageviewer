@@ -1901,13 +1901,25 @@ fn format_time(secs: f64) -> String {
     }
 }
 
-/// Row 秒数を次の選択肢へ巡回する (上情報バーの Row 切替)。
+/// Row 秒数を次の選択肢へ巡回する (旧クリック巡回、後方互換用に残す)。
 pub fn next_row_secs(current: f64) -> f64 {
     let idx = MUSIC_ROW_SECS_CHOICES
         .iter()
         .position(|c| (c - current).abs() < 0.5)
         .unwrap_or(0);
     MUSIC_ROW_SECS_CHOICES[(idx + 1) % MUSIC_ROW_SECS_CHOICES.len()]
+}
+
+/// Row 秒数を `delta` (±1) 段ずつ選択肢内で動かす (端でクランプ、巡回しない)。
+/// 上情報バーの − / + ステッパー用。`delta < 0` で短く (詳細寄り)、`delta > 0` で長く。
+pub fn step_row_secs(current: f64, delta: i32) -> f64 {
+    let idx = MUSIC_ROW_SECS_CHOICES
+        .iter()
+        .position(|c| (c - current).abs() < 0.5)
+        .unwrap_or(0) as i32;
+    let n = MUSIC_ROW_SECS_CHOICES.len() as i32;
+    let new_idx = (idx + delta).clamp(0, n - 1) as usize;
+    MUSIC_ROW_SECS_CHOICES[new_idx]
 }
 
 /// Row 秒数の表示ラベル ("30s" / "2m")。
@@ -1942,6 +1954,15 @@ mod tests {
         assert_eq!(next_row_secs(120.0), 10.0);
         // 未知の値は先頭 → 2 番目へ。
         assert_eq!(next_row_secs(999.0), MUSIC_ROW_SECS_CHOICES[1]);
+    }
+
+    #[test]
+    fn step_row_secs_clamps_at_ends() {
+        assert_eq!(step_row_secs(30.0, 1), 60.0);
+        assert_eq!(step_row_secs(30.0, -1), 15.0);
+        // 端でクランプ (巡回しない)。
+        assert_eq!(step_row_secs(10.0, -1), 10.0);
+        assert_eq!(step_row_secs(120.0, 1), 120.0);
     }
 
     #[test]

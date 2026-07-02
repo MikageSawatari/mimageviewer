@@ -18943,13 +18943,12 @@ impl App {
         rect: egui::Rect,
         fs_idx: usize,
     ) {
-        let dark = ui.visuals().dark_mode;
+        // 音楽ビューは動画フルスクリーンと同じく黒背景ベースで統一する。App テーマが Light でも
+        // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
+        // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
+        let dark = true;
         let painter = ui.painter_at(rect);
-        let bg = if dark {
-            egui::Color32::from_gray(18)
-        } else {
-            egui::Color32::from_gray(236)
-        };
+        let bg = egui::Color32::from_gray(18);
         painter.rect_filled(rect, 0.0, bg);
 
         // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
@@ -19099,41 +19098,87 @@ impl App {
             fg,
         );
 
-        // Row 秒数切替 (タイムライン表示中のみ、上バー中央)。クリックで次の選択肢へ巡回。
-        // row_secs が変わると texture_key が変わり raster cache が自動で作り直される。
+        // Row 秒数切替 (タイムライン表示中のみ、上バー中央)。− / [Row 30s] / + のステッパー。
+        // − で 1 行あたりの秒数を短く (横に詳細)、+ で長くする。row_secs が変わると
+        // texture_key が変わり raster cache が自動で作り直される。グリフはフォント非依存に
+        // painter で線を引く (絵文字 tofu 回避、CLAUDE.md グリフポリシー)。
         if show_timeline {
-            let label = format!(
-                "Row {}",
-                crate::ui_music_timeline::format_row_secs(self.music_timeline_row_secs)
+            let row_secs = self.music_timeline_row_secs;
+            let btn = top_h - 12.0;
+            let gap = 6.0;
+            let label_w = 84.0;
+            let group_w = btn * 2.0 + gap * 2.0 + label_w;
+            let cx = top_rect.center().x;
+            let cy = top_rect.center().y;
+            let minus_rect = egui::Rect::from_center_size(
+                egui::pos2(cx - group_w * 0.5 + btn * 0.5, cy),
+                egui::vec2(btn, btn),
             );
-            let row_rect = egui::Rect::from_center_size(
-                egui::pos2(top_rect.center().x, top_rect.center().y),
-                egui::vec2(92.0, top_h - 10.0),
+            let plus_rect = egui::Rect::from_center_size(
+                egui::pos2(cx + group_w * 0.5 - btn * 0.5, cy),
+                egui::vec2(btn, btn),
             );
-            let resp = ui.interact(
-                row_rect,
-                ui.id().with(("music_row_secs", fs_idx)),
+            let minus_resp = ui.interact(
+                minus_rect,
+                ui.id().with(("music_row_minus", fs_idx)),
                 egui::Sense::click(),
             );
-            painter.rect_filled(
-                row_rect,
-                4.0,
-                if resp.hovered() {
+            let plus_resp = ui.interact(
+                plus_rect,
+                ui.id().with(("music_row_plus", fs_idx)),
+                egui::Sense::click(),
+            );
+            let btn_bg = |hovered: bool| {
+                if hovered {
                     accent
                 } else {
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, if dark { 20 } else { 36 })
-                },
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                }
+            };
+            // − ボタン (横線 1 本)。
+            painter.rect_filled(minus_rect, 4.0, btn_bg(minus_resp.hovered()));
+            let m = minus_rect.center();
+            painter.line_segment(
+                [
+                    egui::pos2(m.x - btn * 0.22, m.y),
+                    egui::pos2(m.x + btn * 0.22, m.y),
+                ],
+                egui::Stroke::new(2.0, fg),
             );
+            // ラベル "Row 30s"。
             painter.text(
-                row_rect.center(),
+                egui::pos2(cx, cy),
                 egui::Align2::CENTER_CENTER,
-                label,
+                format!(
+                    "Row {}",
+                    crate::ui_music_timeline::format_row_secs(row_secs)
+                ),
                 egui::FontId::proportional(13.0),
                 fg,
             );
-            if resp.clicked() {
+            // + ボタン (横線 + 縦線)。
+            painter.rect_filled(plus_rect, 4.0, btn_bg(plus_resp.hovered()));
+            let p = plus_rect.center();
+            painter.line_segment(
+                [
+                    egui::pos2(p.x - btn * 0.22, p.y),
+                    egui::pos2(p.x + btn * 0.22, p.y),
+                ],
+                egui::Stroke::new(2.0, fg),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(p.x, p.y - btn * 0.22),
+                    egui::pos2(p.x, p.y + btn * 0.22),
+                ],
+                egui::Stroke::new(2.0, fg),
+            );
+            if minus_resp.clicked() {
                 self.music_timeline_row_secs =
-                    crate::ui_music_timeline::next_row_secs(self.music_timeline_row_secs);
+                    crate::ui_music_timeline::step_row_secs(row_secs, -1);
+            }
+            if plus_resp.clicked() {
+                self.music_timeline_row_secs = crate::ui_music_timeline::step_row_secs(row_secs, 1);
             }
         }
 
