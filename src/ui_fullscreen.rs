@@ -8005,8 +8005,12 @@ impl App {
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         // `current_item_is_audio` は is_video_fs 直後で定義済み (spread-shift で先に使うため)。
-        let key_i =
-            !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
+        // 音声も除外する (Inc 5 FB, Codex P3): 音楽ビューの右パネルは端ホバー式で
+        // show_metadata_panel を使わなくなったので、音声で I を押すと隠れたグローバルフラグだけ
+        // トグルされ、次に画像へ移ると意図せず画像メタパネルがピン表示される事故になる。
+        let key_i = !current_item_is_video
+            && !current_item_is_audio
+            && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
         // 動画モードでは `handle_video_input` 側で play/pause として消費するため、ここでは
         // 画像系処理に流さない。**`is_video_fs` ではなく純粋な「現在アイテムが Video か」で
@@ -19103,6 +19107,24 @@ impl App {
             egui::pos2(rect.right(), central_bottom),
         );
 
+        // ── 左右パネル (端ホバー) の判定を timeline より先に確定する ──
+        // パネルは中央 timeline に重ねて描く (縮小しない)。timeline のクリック seek は
+        // egui の z-order 上はパネルが優先するはずだが、ポインタがパネル上にあるフレームは
+        // 念のため seek を抑止して二重反応を防ぐ (Codex P2)。
+        let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
+        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH;
+        let hover_pos = ctx.input(|i| {
+            if self.cursor_hidden {
+                None
+            } else {
+                i.pointer.hover_pos()
+            }
+        });
+        let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
+        let left_hover = hover_pos.is_some_and(|p| p.x <= rect.left() + left_w && in_band(p));
+        let right_hover = hover_pos.is_some_and(|p| p.x >= rect.right() - right_w && in_band(p));
+        let pointer_over_panel = left_hover || right_hover;
+
         let show_timeline = self
             .music_analysis
             .as_ref()
@@ -19131,6 +19153,7 @@ impl App {
                     );
                 });
             if let Some(s) = seek_req
+                && !pointer_over_panel
                 && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
                 player.seek(s);
@@ -19184,18 +19207,7 @@ impl App {
         // ── 左右パネル (Inc 5 FB) ── 端ホバーでオーバーレイ表示 (動画のジャンプ/メタパネルと
         // 同じ)。中央は縮小しないので、中央 timeline/spectrum の上に重ねて描く (クリックは後描画
         // のパネルが優先。ピン/トグルボタンは持たない)。左=ブックマーク、右=情報/タグ/★。
-        let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
-        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH;
-        let hover_pos = ctx.input(|i| {
-            if self.cursor_hidden {
-                None
-            } else {
-                i.pointer.hover_pos()
-            }
-        });
-        let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
-        let left_hover = hover_pos.is_some_and(|p| p.x <= rect.left() + left_w && in_band(p));
-        let right_hover = hover_pos.is_some_and(|p| p.x >= rect.right() - right_w && in_band(p));
+        // ホバー判定 (left_hover / right_hover) は timeline seek 抑止のため上で計算済み。
         if left_hover {
             let lp = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), panel_band_top),

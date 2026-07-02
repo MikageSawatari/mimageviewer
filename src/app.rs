@@ -30360,6 +30360,11 @@ impl App {
         if self.video_session_muted {
             player.set_muted(true);
         }
+        // ループ設定 (音楽 HUD のトグル、Inc 5 FB) を新プレイヤーにも引き継ぐ。これを忘れると
+        // 曲移動後に HUD が「ループ ON」を表示していても実際は末尾でループしない (Codex P2)。
+        if self.music_loop_enabled {
+            player.set_loop_enabled(true);
+        }
         player
     }
 

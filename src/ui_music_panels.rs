@@ -878,21 +878,17 @@ impl App {
 
         // ── コントロール行: 右クラスタ (右寄せ: 音量 / ミュート / 速度 / 時間) ──
         let mut rx = hud_rect.right() - 14.0;
-        // 音量スライダー (dB 空間 [-48, +12] にマップ)。
-        const VMIN_DB: f64 = -48.0;
-        const VMAX_DB: f64 = 12.0;
+        // 音量スライダー。動画と同じフェーダーマッピング (`video_volume_*_fader_pos`) を使い、
+        // -80..+18dB の全域を一貫して扱う (Codex P3: 独自 dB マップだと高ブースト/微小音量が
+        // つぶれ、動画のフェーダーと挙動が食い違う)。永続化はドラッグ確定時のみ (毎フレーム save 回避)。
         let vol_w = 120.0;
         let vol_rect = egui::Rect::from_min_max(
             egui::pos2(rx - vol_w, controls_cy - 4.0),
             egui::pos2(rx, controls_cy + 4.0),
         );
         rx -= vol_w + 10.0;
-        let cur_db = if cur_vol <= 1e-4 {
-            VMIN_DB
-        } else {
-            (20.0 * cur_vol.log10()).clamp(VMIN_DB, VMAX_DB)
-        };
-        let vol_frac = ((cur_db - VMIN_DB) / (VMAX_DB - VMIN_DB)).clamp(0.0, 1.0) as f32;
+        let vol_frac =
+            crate::settings::video_volume_linear_to_fader_pos(cur_vol).clamp(0.0, 1.0) as f32;
         painter.rect_filled(vol_rect, 3.0, egui::Color32::from_gray(70));
         painter.rect_filled(
             egui::Rect::from_min_max(
@@ -918,16 +914,17 @@ impl App {
             ui.id().with(("music_hud_vol", fs_idx)),
             egui::Sense::click_and_drag(),
         );
+        let mut vol_persist = false;
         if (vol_resp.clicked() || vol_resp.dragged())
             && let Some(p) = vol_resp.interact_pointer_pos()
         {
             let f = ((p.x - vol_rect.left()) / vol_rect.width()).clamp(0.0, 1.0) as f64;
-            let v = if f <= 0.001 {
-                0.0
-            } else {
-                10f64.powf((VMIN_DB + f * (VMAX_DB - VMIN_DB)) / 20.0)
-            };
-            set_vol = Some(crate::settings::clamp_video_volume(v));
+            set_vol = Some(crate::settings::clamp_video_volume(
+                crate::settings::video_volume_fader_pos_to_linear(f),
+            ));
+        }
+        if vol_resp.drag_stopped() || vol_resp.clicked() {
+            vol_persist = true;
         }
         // ミュート
         let mute_r = egui::Rect::from_min_size(
@@ -1018,6 +1015,10 @@ impl App {
         }
         if let Some(v) = set_vol {
             self.settings.video_volume = v;
+            // 動画の音量経路と同じく、確定時のみ永続化する (ドラッグ中の毎フレーム save を回避)。
+            if vol_persist {
+                self.settings.save();
+            }
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if let Some(s) = seek_to {
