@@ -3107,30 +3107,43 @@ pub(crate) struct GridEditBadges {
     pub rotation: bool,
 }
 
+/// 音楽ビュー解析ワーカー → UI スレッドのメッセージ (Inc 3b timeline + Inc 4 spectrum PCM)。
+pub(crate) enum MusicAnalysisMsg {
+    /// タイムライン解析結果 (成功=TimelineAnalysis / 失敗=メッセージ)。cache hit なら即送る。
+    Timeline(Result<music_core::TimelineAnalysis, String>),
+    /// 下段スペクトラム (Inc 4) 用の全尺デコード PCM。UI が再生位置周辺 ±1 秒を切り出して
+    /// `SpectrumAnalyzer` に食わせる。cpal ring buffer は約 100ms 分しか無く ±1 秒窓に足りない
+    /// ため、ラボと同じく展開済み PCM をスライスする (§11「ring buffer tap の口」= 案A)。
+    Pcm(std::sync::Arc<crate::ui_music_spectrum::MusicPcm>),
+}
+
 /// 音楽ビュー (Inc 3b) のタイムライン解析ワーカーのハンドル。
-/// `analyze_audio_file_with_config` を背景スレッドで走らせ、`audio_analysis.db` を参照/保存する
+/// `run_music_analysis` を背景スレッドで走らせ、`audio_analysis.db` を参照/保存する
 /// (docs/music-integration-plan.md §5.3 / D9)。UI スレッドは `poll_music_analysis` で受信するだけ。
 pub(crate) struct MusicAnalysisPending {
     /// 解析対象パス (完了時の取り違え防止に使う)。
     pub(crate) path: PathBuf,
     /// キャンセルトークン。新しいファイルを開いたら旧ワーカーを止める。
     pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 解析結果 (成功=TimelineAnalysis / 失敗=メッセージ) を受け取るチャネル。
-    pub(crate) rx: std::sync::mpsc::Receiver<Result<music_core::TimelineAnalysis, String>>,
+    /// 解析結果 (timeline + spectrum PCM) を受け取るチャネル。ワーカーは複数メッセージを送り、
+    /// 送り終えると tx を drop する (受信側は Disconnected で完了を知る)。
+    pub(crate) rx: std::sync::mpsc::Receiver<MusicAnalysisMsg>,
 }
 
 /// 音楽ビュー解析ワーカーの本体 (背景スレッドで実行、UI 非依存)。
 ///
-/// `audio_analysis.db` のキャッシュ参照 → miss なら FFmpeg decode + `analyze_stereo_timeline`
-/// → DB 保存の順。`std::fs::metadata` と SQLite open はここ (worker) で行うので UI スレッドは
-/// 触らない。`cancel` は decode 中と各節目で確認する。
+/// `audio_analysis.db` のキャッシュ参照 → cache hit なら timeline を即送る。その後 spectrum
+/// (Inc 4) 用に全尺 PCM を **1 回だけ**デコードし、cache miss ならそこから解析して DB 保存、
+/// 最後に PCM を追送する。`std::fs::metadata` と SQLite open と decode はここ (worker) で行うので
+/// UI スレッドは触らない。`cancel` は decode 中と各節目で確認する。
 fn run_music_analysis(
     path: &std::path::Path,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<music_core::TimelineAnalysis, String> {
+    tx: &std::sync::mpsc::Sender<MusicAnalysisMsg>,
+) {
     use std::sync::atomic::Ordering;
     if cancel.load(Ordering::Relaxed) {
-        return Err("cancelled".to_string());
+        return;
     }
     // DB キー用の size / mtime (folder_scan と同じ秒精度)。取得できなければ cache を諦めて
     // 解析だけ行う (size==0 を「キャッシュ不可」の印にする)。
@@ -3141,29 +3154,62 @@ fn run_music_analysis(
     let path_str = path.to_string_lossy().to_string();
     let db = crate::audio_analysis_db::AudioAnalysisDb::open().ok();
 
-    // cache hit なら decode せず即返す。
+    // cache hit なら timeline を即送る (spectrum 用 PCM はこの後デコードして追送)。
+    let mut timeline_sent = false;
     if size != 0
         && let Some(db) = db.as_ref()
         && let Some(ta) = db.get(&path_str, size, mtime)
     {
-        return Ok(ta);
+        let _ = tx.send(MusicAnalysisMsg::Timeline(Ok(ta)));
+        timeline_sent = true;
     }
     if cancel.load(Ordering::Relaxed) {
-        return Err("cancelled".to_string());
+        return;
     }
 
-    let config = music_core::AnalysisConfig {
-        bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
-        ..music_core::AnalysisConfig::default()
+    // spectrum 用 (Inc 4) と cache miss 時の解析入力を兼ねて、全尺 PCM を 1 回だけデコードする。
+    let decoded = match crate::audio_decode::decode_audio_file_to_stereo_f32(path, cancel) {
+        Ok(d) => d,
+        Err(e) => {
+            // timeline 未送信 (cache miss) なら失敗として通知。送信済み (cache hit) なら timeline は
+            // 既に有効なので spectrum を諦めるだけ。
+            if !timeline_sent {
+                let _ = tx.send(MusicAnalysisMsg::Timeline(Err(e)));
+            }
+            return;
+        }
     };
-    let ta = crate::audio_decode::analyze_audio_file_with_config(path, cancel, config)?;
-
-    if size != 0
-        && let Some(db) = db.as_ref()
-    {
-        let _ = db.set(&path_str, size, mtime, &ta);
+    if cancel.load(Ordering::Relaxed) {
+        return;
     }
-    Ok(ta)
+
+    // cache miss: デコード済み PCM から解析して DB に保存し、timeline を送る。
+    if !timeline_sent {
+        let config = music_core::AnalysisConfig {
+            bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
+            ..music_core::AnalysisConfig::default()
+        };
+        let ta = music_core::analyze_stereo_timeline(
+            &decoded.stereo_samples,
+            decoded.info.sample_rate,
+            config,
+        );
+        if size != 0
+            && let Some(db) = db.as_ref()
+        {
+            let _ = db.set(&path_str, size, mtime, &ta);
+        }
+        let _ = tx.send(MusicAnalysisMsg::Timeline(Ok(ta)));
+    }
+
+    // spectrum 用 PCM を追送する (上限超の長尺は常駐させず spectrum 無効。timeline は上限なし)。
+    if decoded.stereo_samples.len() <= crate::ui_music_spectrum::MUSIC_SPECTRUM_MAX_PCM_SAMPLES {
+        let pcm = crate::ui_music_spectrum::MusicPcm {
+            samples: decoded.stereo_samples,
+            sample_rate: decoded.info.sample_rate,
+        };
+        let _ = tx.send(MusicAnalysisMsg::Pcm(std::sync::Arc::new(pcm)));
+    }
 }
 
 pub struct App {
@@ -5154,6 +5200,11 @@ pub struct App {
     pub(crate) music_timeline_row_secs: f64,
     /// 再生カーソル行の自動追従。手動スクロールで false、可視復帰で true。
     pub(crate) music_timeline_follow: bool,
+    /// 下段スペクトラム (Inc 4) 用の全尺デコード PCM。解析ワーカーが追送し、UI が再生位置
+    /// 周辺 ±1 秒を切り出して `SpectrumAnalyzer` に食わせる。開くファイルが変わったら破棄。
+    pub(crate) music_pcm: Option<std::sync::Arc<crate::ui_music_spectrum::MusicPcm>>,
+    /// 下段スペクトラム (Inc 4) の常駐ワーカー + 描画状態。開くファイルが変わったら clear。
+    pub(crate) music_spectrum: crate::ui_music_spectrum::MusicSpectrumState,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -6959,6 +7010,8 @@ impl App {
             music_timeline_cache: crate::ui_music_timeline::TimelineTextureCache::default(),
             music_timeline_row_secs: crate::ui_music_timeline::MUSIC_ROW_SECS_DEFAULT,
             music_timeline_follow: true,
+            music_pcm: None,
+            music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -30091,21 +30144,23 @@ impl App {
         // ── ファイルが変わった: 旧状態を全て捨てる ──
         self.cancel_music_analysis();
         self.music_timeline_cache.clear();
+        self.music_spectrum.clear();
         self.music_timeline_follow = true;
         self.music_analysis = None;
+        self.music_pcm = None;
         self.music_analysis_error = None;
         self.music_analysis_path = Some(path.to_path_buf());
 
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel::<Result<music_core::TimelineAnalysis, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<MusicAnalysisMsg>();
         let worker_cancel = std::sync::Arc::clone(&cancel);
         let worker_path = path.to_path_buf();
         let spawned = std::thread::Builder::new()
             .name("miv-music-analysis".into())
             .spawn(move || {
-                let result = run_music_analysis(&worker_path, &worker_cancel);
-                // cancel 済みなら受信側は既に rx を drop しているので send 失敗は無視。
-                let _ = tx.send(result);
+                // ワーカーは timeline / PCM を複数メッセージで送る。送り終えると tx を drop し、
+                // 受信側は Disconnected で完了を知る。cancel 済みなら send 失敗は無視される。
+                run_music_analysis(&worker_path, &worker_cancel, &tx);
             });
         if spawned.is_ok() {
             self.music_analysis_pending = Some(MusicAnalysisPending {
@@ -30120,41 +30175,65 @@ impl App {
     }
 
     /// 解析ワーカーの結果を 1 フレームで取り込む (UI スレッド)。pending 中は repaint を要求。
+    ///
+    /// ワーカーは timeline / spectrum PCM を複数メッセージで送るので、届いている分を全て drain
+    /// してから pending を戻す。全メッセージ送信後にワーカーが tx を drop すると Disconnected を
+    /// 検出して pending をクリアする。
     pub(crate) fn poll_music_analysis(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.music_analysis_pending.as_ref() else {
+        // pending を一旦 self から取り出す (drain ループ中に self.music_* を書き換えるため、
+        // pending 経由の self 借用と衝突させない)。まだ続くなら末尾で戻す。
+        let Some(pending) = self.music_analysis_pending.take() else {
             return;
         };
-        match pending.rx.try_recv() {
-            Ok(result) => {
-                // 取り違え防止: 完了したワーカーのパスが現在の対象と一致するときだけ採用。
-                let matches = self.music_analysis_path.as_deref() == Some(pending.path.as_path());
-                self.music_analysis_pending = None;
-                if matches {
-                    match result {
-                        Ok(analysis) => {
-                            self.music_analysis = Some(std::sync::Arc::new(analysis));
-                            self.music_analysis_error = None;
-                        }
-                        Err(e) => {
-                            self.music_analysis = None;
-                            self.music_analysis_error = Some(e);
+        // 取り違え防止: 完了したワーカーのパスが現在の対象と一致するときだけ採用。
+        let matches = self.music_analysis_path.as_deref() == Some(pending.path.as_path());
+        let mut got_any = false;
+        let mut disconnected = false;
+        loop {
+            match pending.rx.try_recv() {
+                Ok(msg) => {
+                    got_any = true;
+                    if matches {
+                        match msg {
+                            MusicAnalysisMsg::Timeline(Ok(analysis)) => {
+                                self.music_analysis = Some(std::sync::Arc::new(analysis));
+                                self.music_analysis_error = None;
+                            }
+                            MusicAnalysisMsg::Timeline(Err(e)) => {
+                                self.music_analysis = None;
+                                self.music_analysis_error = Some(e);
+                            }
+                            MusicAnalysisMsg::Pcm(pcm) => {
+                                self.music_pcm = Some(pcm);
+                            }
                         }
                     }
                 }
-                ctx.request_repaint();
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // まだ解析中: busy repaint を避けるため軽い間隔で再ポーリングする (Codex P3)。
-                // 再生中は VideoPlayer 側が毎フレーム repaint を駆動するので、これは pause 中の
-                // 全速 spin を防ぐためのもの。
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // ワーカーが結果を送らず切断 (パニック等)。「解析中」で固まらないよう印を残す。
-                self.music_analysis_pending = None;
-                if self.music_analysis.is_none() {
-                    self.music_analysis_error = Some("解析ワーカーが異常終了しました".to_string());
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
+            }
+        }
+
+        if disconnected {
+            // ワーカーが全メッセージを送り終えて終了した。結果もエラーも無ければ異常終了扱い
+            // (「解析中」で固まらないよう印を残す、Codex P3)。pending は戻さない (= クリア)。
+            if matches && self.music_analysis.is_none() && self.music_analysis_error.is_none() {
+                self.music_analysis_error = Some("解析ワーカーが異常終了しました".to_string());
+            }
+            ctx.request_repaint();
+        } else {
+            // まだ解析中: pending を戻して待つ。
+            self.music_analysis_pending = Some(pending);
+            if got_any {
+                ctx.request_repaint();
+            } else {
+                // busy repaint を避けるため軽い間隔で再ポーリングする (Codex P3)。再生中は
+                // VideoPlayer 側が毎フレーム repaint を駆動するので、これは pause 中の全速 spin
+                // を防ぐためのもの。
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
     }
@@ -31407,7 +31486,9 @@ impl App {
         // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
         self.cancel_music_analysis();
         self.music_timeline_cache.clear();
+        self.music_spectrum.clear();
         self.music_analysis = None;
+        self.music_pcm = None;
         self.music_analysis_error = None;
         self.music_analysis_path = None;
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを

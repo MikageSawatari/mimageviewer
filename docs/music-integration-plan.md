@@ -327,10 +327,10 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - [x] 再生カーソル行の自動スクロール（手動スクロール中は追従しない）（Inc 3b、follow_playhead）
 
 ### 7.2 108-band spectrum（下段）
-- [ ] 20Hz–18kHz / 約1 semitone 幅、多解像度 FFT（`SpectrumAnalyzer`）
-- [ ] 鍵盤ハイライト（相対突出評価、A0–C8 明色/範囲外グレー）
-- [ ] ホバーで周波数 Hz + 近似音名
-- [ ] 再生バッファ短窓 tap（全尺解析を待たない）
+- [x] 20Hz–18kHz / 約1 semitone 幅、多解像度 FFT（`SpectrumAnalyzer`）（Inc 4、常駐ワーカー）
+- [x] 鍵盤ハイライト（相対突出評価、A0–C8 明色/範囲外グレー）（Inc 4、`draw_pitch_keyboard`）
+- [x] ホバーで周波数 Hz + 近似音名（Inc 4、`draw_spectrum_hover`）
+- [x] 再生位置周辺 ±1s の PCM 窓を tap（Inc 4、案A = 展開済み PCM をスライス。§11 参照）
 
 ### 7.3 beat/bar grid
 - [x] `BeatGrid` 表示（低 confidence は非表示 or 淡色、`BeatTrackingStatus`）（Inc 3b、draw_beat_grid）
@@ -373,7 +373,7 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 | 再生 | cpal 簡易プレイヤー | `VideoPlayer`(headless) + audio pump | [x] seek/volume/mute/normalize が動く / 映像 decode を走らせない（Inc 3a、engine audio-only） |
 | VST3 | `NoopEffectChain` | `DspBridge`(audio pump 既存) | [ ] realtime callback で直接呼ばない / 失敗時 auto-disable / 動画と同一 state（Inc 6） |
 | row raster | raster worker | 移植 raster worker | [x] cache key+generation+row version / 1 frame 少量 upload / 古い結果を採用側で破棄（Inc 3b） |
-| spectrum | spectrum worker | 常駐 spectrum worker + ring buffer tap | [ ] 全尺解析と独立 / pending 中は旧結果保持（Inc 4） |
+| spectrum | spectrum worker | 常駐 spectrum worker + 展開済み PCM スライス | [x] 全尺解析と独立の常駐ワーカー / pending 中は旧 bands 保持 / 高々 1 in-flight で coalesce（Inc 4、案A。ring buffer では ±1s 窓に足りず PCM をスライス、§11） |
 | repaint | — | `request_repaint_after` | [x] pending worker は request_repaint_after(50ms) / 再生中は VideoPlayer が駆動（Inc 3b、busy spin 回避） |
 | grid/viewer lifecycle | — | GridItem::Audio / fs_cache / detached | [x] 新ファイルで旧 worker cancel / close_fullscreen で worker+raster cache 破棄（Inc 3b） |
 
@@ -455,9 +455,19 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   - **残り（Inc 3 の未実装）**: 部分解析ストリーミング（先出し）は入れていない
     （miss は全尺完了まで待つ方針）。vocal hint 独立レーン / 手動 BPM 補正は未着手。
 
-- **Inc 4: 108-band spectrum worker（下段）**
-  - `SpectrumAnalyzer` 常駐 worker + playback ring buffer tap。
-  - 受け入れ: 下段アナライザがラボと同じ挙動。全尺解析を待たない。
+- **Inc 4: 108-band spectrum worker（下段）** — ✅ **実装済み（2026-07-02）**
+  - `SpectrumAnalyzer` 常駐 worker + 展開済み PCM の playhead ±1s スライス（案A、§11 で確定）。
+  - ✅ `src/ui_music_spectrum.rs`（新規）: `MusicSpectrumState`（常駐ワーカー + 描画状態を封じる）+
+    `MusicPcm`（Arc 共有 PCM）+ ラボの `draw_spectrum` / `draw_pitch_keyboard` / spectrum color helper
+    移植。窓切り出し（`spectrum_window_range`）はワーカー側でゼロコピー。高々 1 in-flight + coalesce。
+  - ✅ `run_music_analysis`（app.rs）: 全尺 PCM を **1 回だけ**デコードして timeline と spectrum で共有。
+    `MusicAnalysisMsg::{Timeline, Pcm}` の 2 メッセージ化（cache hit は timeline 即送 → PCM 追送）。
+    `poll_music_analysis` は Disconnected まで drain。close/新ファイルで `music_spectrum.clear()` + `music_pcm=None`。
+  - ✅ `draw_fs_music_view`: 中央領域の下端に spectrum 帯（180px）を確保、`update` + `draw` を配線。
+  - ✅ ビルド緑 + bin test 3122 緑（spectrum 単体 7 本）+ fmt clean + clippy 新規警告なし。
+  - **⚠️ 実機未検証**: 実際に音が鳴る中でのスペクトラム挙動 / 鍵盤ハイライト / ホバーはユーザー GUI 目視待ち
+    （FFmpeg DLL + 実ファイルが要る）。テスト音源 = `c:\home\youtube\movie\youtube\audio\`（115 ファイル）。
+  - 受け入れ: 下段アナライザがラボと同じ挙動。長尺ロード中でも（PCM デコード完了後は）全尺 timeline 解析を待たない。
 
 - **Inc 5: 右パネル（タグ+設定+音楽情報）+ 左パネル（ブックマーク）**
   - 右: 動画のタグ/★/設定経路ミラー + 音楽情報ブロック。左: ブックマーク一覧（命名/追加/削除/改名/
@@ -523,8 +533,19 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   `video_bookmarks.rs`）をそのまま再利用（D5.1）。新規フォーマット判断は不要。
 - **動画→音声モードの presenter 戦略**（Inc 7 / §5.7）: native presenter 残置 overlay 案 vs 切替案。
   着手前に Codex 設計相談。
-- **playback ring buffer tap の口**（Inc 4）: `src/video/audio.rs` の `AudioBuffer` を read-only で
-  覗く安全な経路。
+- ~~**playback ring buffer tap の口**（Inc 4）~~: **確定（2026-07-02、案A・ユーザー承認）**。
+  調査の結果、スペクトラムは再生位置周辺 **±1 秒（2 秒幅・約 96k サンプル）** の PCM 窓を必要とする
+  （多解像度 FFT の最大窓 32768）。一方 `src/video/audio.rs` の `AudioBuffer.processed` は約 100ms 分
+  しか保持しないため **cpal ring buffer tap は窓幅が全く足りず不成立**。ラボ実装も実は cpal ring
+  buffer を tap しておらず、**ストリーミング展開した全 PCM を playhead 周辺でスライス**していた
+  （`spectrum_request_from_samples`）。よって本体でも **解析ワーカーが全尺デコードした 48kHz stereo PCM を
+  `Arc<MusicPcm>` で保持し、playhead ±1s をスライスして `SpectrumAnalyzer` に渡す**（`audio.rs` の
+  hot path は無改変 = 動画リグレッションリスクゼロ）。D9 の「playback ring buffer から短窓 tap」は
+  この記述に読み替える。トレードオフ = 開いている 1 曲分の PCM が常駐（約 12MB/分、上限
+  `MUSIC_SPECTRUM_MAX_PCM_SAMPLES` = 30 分を超えると spectrum 無効）。cache hit 時は timeline は
+  即表示のまま、spectrum 用 PCM だけ背景デコードで後追い（mIV は既に timeline が全尺デコード待ちの
+  ため挙動は一貫）。実装 = `src/ui_music_spectrum.rs`（`MusicSpectrumState` / `MusicPcm` / 常駐ワーカー）+
+  `run_music_analysis` の PCM 追送（`MusicAnalysisMsg::{Timeline,Pcm}`）。
 - **音量 normalize と音楽ビューの関係**（Inc 3/6）: 動画と同じ normalize スキャンを音声にも適用するか。
 
 ---

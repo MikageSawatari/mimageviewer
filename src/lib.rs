@@ -129,6 +129,7 @@ pub mod tags_db;
 pub mod thumb_loader;
 pub mod ui_fonts;
 pub mod ui_helpers;
+pub mod ui_music_spectrum;
 pub mod ui_music_timeline;
 pub mod ui_susie_diagnostic;
 pub mod ui_text_links;

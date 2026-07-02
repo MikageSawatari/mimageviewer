@@ -18998,13 +18998,23 @@ impl App {
 
         // ── 中央領域: 解析が揃っていれば DJ 風タイムライン、無ければ音楽アイコン + 状態。──
         let top_h = 34.0;
-        // 下部の再生ボタン + シークバー (後述) の上端。タイムラインはそこまでに収める。
+        // 下部の再生ボタン + シークバー (後述) の上端。中央コンテンツはそこまでに収める。
         let controls_region_top = rect.bottom() - 90.0;
+        // 中央領域の下端に 108-band spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
+        // タイムライン (or 解析中アイコン) の領域。
+        const MUSIC_SPECTRUM_H: f32 = 180.0;
+        const MUSIC_SPECTRUM_GAP: f32 = 8.0;
+        let spectrum_bottom = controls_region_top - 4.0;
+        let spectrum_top = (spectrum_bottom - MUSIC_SPECTRUM_H).max(rect.top() + top_h + 1.0);
+        let spectrum_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, spectrum_top),
+            egui::pos2(rect.right() - 8.0, spectrum_bottom),
+        );
         let central_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left(), rect.top() + top_h),
             egui::pos2(
                 rect.right(),
-                controls_region_top.max(rect.top() + top_h + 1.0),
+                (spectrum_top - MUSIC_SPECTRUM_GAP).max(rect.top() + top_h + 1.0),
             ),
         );
 
@@ -19075,6 +19085,13 @@ impl App {
                 );
             }
         }
+
+        // ── 下段 108-band spectrum + ピッチ鍵盤 (Inc 4)。──
+        // 再生位置周辺 ±1 秒の PCM をワーカーで FFT して描く。PCM 未着 (デコード中 / 上限超で
+        // 無効) の間は空バンド = 鍵盤ベースラインのみ。Arc は clone で借用衝突を避ける。
+        let pcm = self.music_pcm.clone();
+        self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
+        self.music_spectrum.draw(ui, spectrum_rect);
 
         // 上情報バー (常時): ファイル名 + 位置/長さ。
         let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
