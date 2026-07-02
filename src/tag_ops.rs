@@ -24,6 +24,7 @@ fn tag_target_for_item(item: &GridItem, fullscreen: bool) -> Option<TagTarget> {
         GridItem::Folder(p)
         | GridItem::Image(p)
         | GridItem::Video(p)
+        | GridItem::Audio(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p) => (p.clone(), !matches!(item, GridItem::Folder(_))),
         GridItem::ConvertibleArchive { path: p, .. } => (p.clone(), true),
@@ -915,6 +916,18 @@ fn format_legacy_xmp_import_toast(
 mod tests {
     use super::{format_completion_toast, format_legacy_xmp_import_toast};
     use crate::tag_legacy_xmp_worker::{LegacyXmpImportMode, LegacyXmpImportReport};
+
+    #[test]
+    fn audio_is_a_tag_target() {
+        use crate::grid_item::GridItem;
+        use std::path::PathBuf;
+        // 音声は実ファイルなのでタグ付与対象 (Video と同じ扱い、sidecar あり)。
+        // 「タグ対象なし」トーストで付与できなかった退行の回帰テスト。
+        let audio = GridItem::Audio(PathBuf::from(r"C:\music\a.mp3"));
+        let target = super::tag_target_for_item(&audio, false);
+        assert!(target.is_some(), "audio should be a tag target");
+        assert_eq!(target.unwrap().path, PathBuf::from(r"C:\music\a.mp3"));
+    }
 
     #[test]
     fn toast_single_add() {
