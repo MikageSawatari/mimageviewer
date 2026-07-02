@@ -8219,16 +8219,22 @@ impl App {
         // (消しゴムモードに入らず、1 キーで inpaint までを一気に実行)
         // F9/F10: 隠蔽マスクスロット 1/2 を現ページに適用
         // Shift+F7/F8/F9/F10: 適用済みマスクを削除
-        let delete_erase_mask = self
-            .keymap
-            .consume_action(ctx, KeyAction::FsDeleteEraseMask);
-        let delete_conceal_mask = self
-            .keymap
-            .consume_action(ctx, KeyAction::FsDeleteConcealMask);
-        let key_f7 = self.keymap.consume_action(ctx, KeyAction::FsApplyErase1);
-        let key_f8 = self.keymap.consume_action(ctx, KeyAction::FsApplyErase2);
-        let key_f9 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
-        let key_f10 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
+        let delete_erase_mask = !current_item_is_audio
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsDeleteEraseMask);
+        let delete_conceal_mask = !current_item_is_audio
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsDeleteConcealMask);
+        let key_f7 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyErase1);
+        let key_f8 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyErase2);
+        let key_f9 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
+        let key_f10 =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
         if delete_erase_mask || delete_conceal_mask || key_f7 || key_f8 || key_f9 || key_f10 {
             if image_edit_unavailable {
                 self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
@@ -8697,7 +8703,8 @@ impl App {
         // Ctrl+M: 隠蔽加工モード入退場 (分析・補正中は無効)。Phase 1。
         // 見開き / 動画 / モーダル状態は `enter_conceal_mode` 側で適切に分岐する。
         // (Conceal モード中の Ctrl+M / Esc は本関数冒頭の早期 return で処理済み。)
-        let key_ctrl_m = self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
+        let key_ctrl_m =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
         if key_ctrl_m
             && !self.analysis_mode
             && !self.adjustment_mode
@@ -8715,7 +8722,8 @@ impl App {
 
         // Ctrl+T: テキスト注釈モード入場 (分析・補正・消しゴム・隠蔽・動画中は無効)。
         // テキストモード中の Ctrl+T / Esc は本関数冒頭の早期 return で処理済み。
-        let key_ctrl_t = self.keymap.consume_action(ctx, KeyAction::FsTextMode);
+        let key_ctrl_t =
+            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsTextMode);
         if key_ctrl_t
             && !self.analysis_mode
             && !self.adjustment_mode
