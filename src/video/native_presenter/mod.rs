@@ -7273,7 +7273,7 @@ impl NativeEguiOverlay {
                             shortcut_labels.and_then(|s| s.volume_down.as_deref()),
                         ]);
                         let vol_tooltip = native_label_with_shortcut(
-                            "音量 (右クリック / ダブルクリックで 0dB)",
+                            "音量 (ダブルクリックで 0dB)",
                             volume_shortcuts.as_deref(),
                         );
                         if let Some((value, persist)) = draw_overlay_volume_slider(

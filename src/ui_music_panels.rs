@@ -783,10 +783,10 @@ impl App {
         let mut rx = hud_rect.right() - 14.0;
         // 音量 dB フェーダーは動画/音楽共有の `draw_overlay_volume_slider` を使う
         // (Inc 5c-B1)。トラック + fill (0dB 未満グレー / 0dB 超ブースト黄) + dB 目盛り +
-        // クリック/ドラッグ/右クリック (0dB リセット) が動画 HUD と完全に揃う。
+        // クリック/ドラッグ/ダブルクリック (0dB リセット) が動画 HUD と完全に揃う。
         // フェーダーマッピングは `video_volume_*_fader_pos` (-80..+18dB) を共有し、独自 dB
         // マップだと高ブースト/微小音量がつぶれる問題 (Codex P3) も解消済み。永続化は
-        // ドラッグ確定 / クリック / 右クリック時のみ (`persist=true`、毎フレーム save 回避)。
+        // ドラッグ確定 / クリック / ダブルクリック時のみ (`persist=true`、毎フレーム save 回避)。
         let vol_w = 120.0;
         let vol_rect = egui::Rect::from_min_max(
             egui::pos2(rx - vol_w, controls_cy - 4.0),
@@ -810,7 +810,7 @@ impl App {
             vol_rect,
             cur_vol,
             ui.id().with(("music_hud_vol", fs_idx)),
-            Some("音量 (右クリック / ダブルクリックで 0dB)".to_string()),
+            Some("音量 (ダブルクリックで 0dB)".to_string()),
             vol_target,
         ) {
             set_vol = Some(crate::settings::clamp_video_volume(v));

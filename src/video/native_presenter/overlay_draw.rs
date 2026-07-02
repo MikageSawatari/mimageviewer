@@ -5047,11 +5047,12 @@ pub(super) fn finite_video_volume(value: f64) -> f64 {
 ///
 /// `vol_rect` にトラック背景 + fill (0dB 未満 = グレー / 0dB 超 = ブースト黄) +
 /// `VIDEO_VOLUME_FADER_DB_MARKS` の目盛りを painter だけで描き、クリック / ドラッグ /
-/// 右クリック / ダブルクリックを解釈する。フェーダーマッピングは
+/// ダブルクリック (= 0dB リセット) を解釈する。右クリックは扱わず、フルスクリーンの通常
+/// 右クリック挙動に譲る (実機 FB 2026-07-02)。フェーダーマッピングは
 /// `crate::settings::video_volume_*_fader_pos` (= -80..+18dB) を使う。
 ///
 /// 返り値 `Some((volume, persist))` = 呼び出し側が発行すべき音量変更 (`persist` は
-/// `settings` へ保存すべきかどうか = ドラッグ確定 / クリック / 右クリックで true、
+/// `settings` へ保存すべきかどうか = ドラッグ確定 / クリック / ダブルクリックで true、
 /// ドラッグ中は false)。動画は `NativeOverlayCommand::SetVolume` へ、音楽は
 /// `settings.video_volume` + `player.set_volume` へ翻訳する。
 ///
@@ -5133,7 +5134,11 @@ pub(crate) fn draw_overlay_volume_slider(
         None => vol_resp,
     };
     let mut out = None;
-    if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
+    // リセットはダブルクリックのみ。右クリック (secondary) はフルスクリーンの通常
+    // 右クリック挙動 (リング/ジェスチャ/閉じる) に譲り、ここでは扱わない。以前は
+    // secondary_clicked でも 0dB リセットしていたが、同じ右クリックが背後のフルスクリーン
+    // ハンドラにも届いて「リセット後に再生終了」する二重動作になっていた (実機 FB 2026-07-02)。
+    if vol_resp.double_clicked() {
         *last_volume_target = Some(1.0);
         out = Some((1.0, true));
     } else if (vol_resp.clicked() || vol_resp.dragged())
@@ -5155,9 +5160,10 @@ pub(crate) fn draw_overlay_volume_slider(
 /// 再生速度ボタン + プリセット popup (動画 HUD / 音楽 HUD 共有、Inc 5c-B2)。
 ///
 /// `speed_rect` にボタン背景 (`draw_overlay_button_bg`) + 現在速度ラベル
-/// (`format_playback_speed`) を描き、左クリックで popup をトグル、右クリック /
-/// ダブルクリックで x1 リセット。`popup_open` が true の間は `speed_rect` の上に
-/// `PLAYBACK_SPEED_CHOICES` の選択 popup を Area で出す。popup 外クリックで閉じる。
+/// (`format_playback_speed`) を描き、左クリックで popup をトグル、ダブルクリックで x1
+/// リセット。右クリックは扱わず、フルスクリーンの通常右クリック挙動に譲る (実機 FB
+/// 2026-07-02)。`popup_open` が true の間は `speed_rect` の上に `PLAYBACK_SPEED_CHOICES`
+/// の選択 popup を Area で出す。popup 外クリックで閉じる。
 ///
 /// 返り値: 速度変更を発行すべきなら `Some(speed)` (呼び出し側が `SetPlaybackSpeed` /
 /// `player.set_playback_speed` へ翻訳)。x1 リセットは `Some(1.0)`、選択は clamp 済み速度。
@@ -5196,14 +5202,16 @@ pub(crate) fn draw_overlay_speed_control(
         egui::FontId::proportional(12.0),
         egui::Color32::from_rgb(238, 238, 238),
     );
-    if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
+    // リセットはダブルクリックのみ (音量スライダーと同じ理由。右クリックは背後の
+    // フルスクリーン右クリック挙動に譲る。実機 FB 2026-07-02)。
+    if speed_resp.double_clicked() {
         *popup_open = false;
         result = Some(1.0);
     } else if speed_resp.clicked() {
         *popup_open = !*popup_open;
     }
     if !*popup_open {
-        speed_resp = speed_resp.hover_tip_dark("再生速度 (右クリック / ダブルクリックで x1)");
+        speed_resp = speed_resp.hover_tip_dark("再生速度 (ダブルクリックで x1)");
     }
     if *popup_open {
         let popup_w = 356.0_f32.min((container_width - 16.0).max(180.0));
@@ -5222,6 +5230,11 @@ pub(crate) fn draw_overlay_speed_control(
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(popup_x, popup_y))
             .show(ctx, |ui| {
+                // popup は `ctx` 直下の独立 Area なので、コンテキストの既定 visuals を継承する。
+                // 音楽ビューのフルスクリーンコンテキストは os_theme で light になり得るため、
+                // 選択ボタンの `interact_selectable` 色が崩れる (実機 FB 2026-07-02)。dark 固定に
+                // することで動画 (既定 dark) と音楽で見た目を揃える。
+                *ui.visuals_mut() = egui::Visuals::dark();
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))
