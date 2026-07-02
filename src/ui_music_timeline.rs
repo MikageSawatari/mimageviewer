@@ -112,7 +112,10 @@ struct TimelineRasterRequest {
     row: usize,
     row_secs: f64,
     key: TimelineTextureCacheKey,
-    bins: Vec<WaveformBin>,
+    /// 解析結果全体を `Arc` で共有する。UI スレッドは refcount を +1 するだけで、行ウィンドウの
+    /// 切り出し (`timeline_bins_for_raster` 相当) はワーカー側で行う (Codex P2: UI スレッドで
+    /// 数千 bin をコピーしない)。
+    analysis: Arc<TimelineAnalysis>,
 }
 
 struct TimelineRasterResult {
@@ -242,7 +245,7 @@ impl TimelineTextureCache {
 
     fn row_texture(
         &mut self,
-        bins: &[WaveformBin],
+        analysis: &Arc<TimelineAnalysis>,
         row: usize,
         row_secs: f64,
         key: TimelineTextureCacheKey,
@@ -264,15 +267,13 @@ impl TimelineTextureCache {
             let pending_current = self.pending[row]
                 .is_some_and(|pending| pending.key == key && pending.generation == self.generation);
             if !pending_current && let Some(tx) = self.raster_tx.as_ref() {
-                let row_start = row as f64 * row_secs;
-                let row_bins = timeline_bins_for_raster(bins, row_start, row_secs);
                 let request = TimelineRasterRequest {
                     generation: self.generation,
                     row_version,
                     row,
                     row_secs,
                     key,
-                    bins: row_bins,
+                    analysis: Arc::clone(analysis),
                 };
                 if tx.send(request).is_ok() {
                     self.pending[row] = Some(TimelinePendingRow {
@@ -325,10 +326,14 @@ fn run_timeline_raster_worker(
             break;
         }
         let row_start = request.row as f64 * request.row_secs;
+        // 行ウィンドウの切り出しはワーカー側で行う (UI スレッドは Arc を渡すだけ)。
+        // 全 bin をコピーせず、部分スライスを直接 render に渡す (ゼロコピー)。
+        let (start_idx, end_idx) =
+            timeline_bins_window_range(&request.analysis.bins, row_start, request.row_secs);
         let (image, represented_bins) = render_timeline_row_image(
             row_start,
             request.row_secs,
-            &request.bins,
+            &request.analysis.bins[start_idx..end_idx],
             request.key.width_px,
             request.key.waveform_h_px,
             request.key.gap_px,
@@ -364,7 +369,7 @@ fn run_timeline_raster_worker(
 #[allow(clippy::too_many_arguments)]
 pub fn draw_music_timeline(
     ui: &mut egui::Ui,
-    analysis: &TimelineAnalysis,
+    analysis: &Arc<TimelineAnalysis>,
     duration_secs: f64,
     position_secs: f64,
     playing: bool,
@@ -453,7 +458,7 @@ pub fn draw_music_timeline(
         if !cache.row_is_fresh(row, texture_key) {
             pending_raster = true;
         }
-        let (_, request_sent) = cache.row_texture(&analysis.bins, row, row_secs, texture_key);
+        let (_, request_sent) = cache.row_texture(analysis, row, row_secs, texture_key);
         if request_sent {
             pending_raster = true;
         }
@@ -464,8 +469,7 @@ pub fn draw_music_timeline(
         if !cache.row_is_fresh(row, texture_key) {
             pending_raster = true;
         }
-        let (row_texture, request_sent) =
-            cache.row_texture(&analysis.bins, row, row_secs, texture_key);
+        let (row_texture, request_sent) = cache.row_texture(analysis, row, row_secs, texture_key);
         if request_sent {
             pending_raster = true;
         }
@@ -738,13 +742,16 @@ fn timeline_bin_at_time(bins: &[WaveformBin], time_secs: f64) -> Option<&Wavefor
     bins.get(idx).or_else(|| bins.last())
 }
 
-fn timeline_bins_for_raster(
+/// 1 行 (row) をラスタライズするのに必要な bin スライスの範囲 `[start, end)` を返す。
+/// 行の秒範囲 + key 検出用の前後パディングを含む。ワーカー側でこの範囲を使って全 bin から
+/// 部分スライスを取り、コピーせずに render へ渡す。
+fn timeline_bins_window_range(
     bins: &[WaveformBin],
     row_start: f64,
     row_secs: f64,
-) -> Vec<WaveformBin> {
+) -> (usize, usize) {
     if bins.is_empty() {
-        return Vec::new();
+        return (0, 0);
     }
     let row_end = row_start + row_secs;
     let pad = TIMELINE_KEY_WINDOW_SECS * 0.5;
@@ -752,6 +759,16 @@ fn timeline_bins_for_raster(
     let copy_end = row_end + pad;
     let start_idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs < copy_start);
     let end_idx = bins.partition_point(|bin| bin.start_secs <= copy_end);
+    (start_idx, end_idx)
+}
+
+#[cfg(test)]
+fn timeline_bins_for_raster(
+    bins: &[WaveformBin],
+    row_start: f64,
+    row_secs: f64,
+) -> Vec<WaveformBin> {
+    let (start_idx, end_idx) = timeline_bins_window_range(bins, row_start, row_secs);
     bins[start_idx..end_idx].to_vec()
 }
 

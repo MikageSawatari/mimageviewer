@@ -5142,7 +5142,8 @@ pub struct App {
     /// 音楽ビュー (Inc 3b) の解析対象パス。開いているファイルが変わったら worker を作り直す。
     pub(crate) music_analysis_path: Option<PathBuf>,
     /// 音楽ビューのタイムライン解析結果 (cache hit または worker 完了で埋まる)。
-    pub(crate) music_analysis: Option<music_core::TimelineAnalysis>,
+    /// `Arc` で保持し、row raster worker へは refcount のクローンだけ渡す (Codex P2)。
+    pub(crate) music_analysis: Option<std::sync::Arc<music_core::TimelineAnalysis>>,
     /// 解析に失敗したときのエラーメッセージ (中央に表示)。
     pub(crate) music_analysis_error: Option<String>,
     /// 実行中の解析ワーカー (cancel + mpsc)。
@@ -30112,6 +30113,9 @@ impl App {
                 cancel,
                 rx,
             });
+        } else {
+            // スレッド生成に失敗したら「解析中」で固まらないようエラーを出す (Codex P3)。
+            self.music_analysis_error = Some("解析ワーカーを起動できませんでした".to_string());
         }
     }
 
@@ -30128,7 +30132,7 @@ impl App {
                 if matches {
                     match result {
                         Ok(analysis) => {
-                            self.music_analysis = Some(analysis);
+                            self.music_analysis = Some(std::sync::Arc::new(analysis));
                             self.music_analysis_error = None;
                         }
                         Err(e) => {
@@ -30140,11 +30144,17 @@ impl App {
                 ctx.request_repaint();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // まだ解析中: 次フレームで再ポーリングする。
-                ctx.request_repaint();
+                // まだ解析中: busy repaint を避けるため軽い間隔で再ポーリングする (Codex P3)。
+                // 再生中は VideoPlayer 側が毎フレーム repaint を駆動するので、これは pause 中の
+                // 全速 spin を防ぐためのもの。
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // ワーカーが結果を送らず切断 (パニック等)。「解析中」で固まらないよう印を残す。
                 self.music_analysis_pending = None;
+                if self.music_analysis.is_none() {
+                    self.music_analysis_error = Some("解析ワーカーが異常終了しました".to_string());
+                }
             }
         }
     }
