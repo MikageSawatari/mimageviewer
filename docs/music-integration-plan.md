@@ -358,18 +358,38 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 `NativeOverlayCommand` 定義を参照）。
 
 **推奨増分順（各段: build + test + Codex、動画側はバイト等価維持）**:
-- **Inc 5c-A（左ブックマークパネル + 一括ダイアログ + IME）**: 最も自己完結 + IME 修正を兼ねる。
-  `draw_native_jump_panel`/`draw_native_jump_row`/`draw_native_bulk_bookmark_dialog` を共有化
-  （サムネ列・ピン/チャプター欄を出す/出さないのフラグを追加 = 音声はブックマークのみ）。音楽ビューの
-  現行 `draw_fs_music_bookmarks_panel` を置換。IME は動画同様 egui TextEdit + paste 経路に揃う。
-- **Inc 5c-B（下 HUD コントロール行）**: モノリスを state スナップショット + command sink 関数へ抽出。
-  速度ポップアップ・音量スライダー(dB 表示)・各ボタンを共有。動画/音楽の両方が呼ぶ。②③解消。
+- **Inc 5c-A（左ブックマークパネル + 一括ダイアログ + IME）✅ 完了（2026-07-02、commit 518c00b6 +
+  P2 fix fa714a40、Codex P1/P2/P3 クリア、test 3126 green）**:
+  - `draw_native_jump_panel` の本体を `draw_native_jump_panel_body(ui, panel_rect, opts, ...)` に抽出。
+    `NativeJumpPanelOptions`（title/empty_text/show_pin_button/show_bulk_button/show_pins/
+    show_chapters/show_section_headers/show_thumbnails）で音声=ブックマークのみに切替。動画は
+    `VIDEO_JUMP_PANEL_OPTIONS`（全 true）で呼ぶだけ＝バイト等価。`draw_native_jump_row` に
+    `show_thumbnail` 追加（false=サムネ列省略・行高 52px・テキスト +12px）。
+  - `NativeBulkBookmarkDialog`/`NativeBookmarkTitleEdit` と body/bulk dialog/title editor/size fn を
+    `pub(crate)` 化、`overlay_draw` を `pub(crate) mod` 化。
+  - 音楽側は `draw_fs_music_bookmarks_panel` → `draw_music_bookmark_ui` に置換。共有 body を音声 opts で
+    呼び、独自インライン import 欄を廃止。改名・一括登録は動画と同一の中央モーダル
+    （`draw_native_bookmark_title_editor` / `draw_native_bulk_bookmark_dialog`）を使い IME・貼り付けが
+    動画実装に揃う（Inc 5 FB ⑤ 解消）。発行 `NativeOverlayCommand` を music 実操作へ翻訳
+    （Seek/AddBookmarkAt/DeleteBookmark/SetBookmarkTitle/BulkAddBookmarks/Export/ClearAll）。
+  - App フィールド: `music_bookmark_rename/import_open/import_text/export_seconds_only` を撤去し
+    `music_bookmark_title_edit` / `music_bulk_bookmark_dialog`（動画と同型）を追加。
+  - モーダル表示中は端ホバーパネル非表示 + timeline seek 抑止 + FS ショートカット抑止
+    （`music_bookmark_modal_open()`）+ 半透明バックドロップ（`Order::Middle`）で背後クリック吸収 +
+    HUD 操作を `interactive=false` で明示停止（多層防御、Codex P2）。
+  - **未確定/フォロー**: 中央モーダルの中心決めは (0,0) 原点前提（fullscreen viewport / 埋め込みとも
+    `full_rect.min≈(0,0)` を確認済み。検証で万一 window mode でズレたら shared fn に origin を渡す）。
+    共有ジャンプ行の "BM" 種別ラベルは音声でも各行に出る（動画と同一 anatomy、冗長だが許容）。
+- **Inc 5c-B（下 HUD コントロール行）← 次はここ**: モノリスを state スナップショット + command sink
+  関数へ抽出。速度ポップアップ・音量スライダー(dB 表示)・各ボタンを共有。動画/音楽の両方が呼ぶ。②③解消。
+  現行の暫定 `draw_music_bottom_hud`（`ui_music_panels.rs`）をこの共有版へ置換する。
 - **Inc 5c-C（上バー）**: `draw_native_top_bar` を音楽の上バーに流用（音楽向けにボタン集合を調整。
   Row stepper は音楽専用で足す）。
 - **Inc 5c-D（シーク行）**: seek 行を共有関数へ。
 
-現行の音楽ビュー暫定 UI（`ui_music_panels.rs` の `draw_music_bottom_hud` / `draw_fs_music_*_panel`）は
-この共有版へ順次置換していく。置換完了までは暫定 UI が動く（ユーザー「仮なら可」）。
+残る音楽ビュー暫定 UI（`ui_music_panels.rs` の `draw_music_bottom_hud`）は 5c-B/C/D で共有版へ
+順次置換していく。置換完了までは暫定 UI が動く（ユーザー「仮なら可」）。左ブックマーク UI は
+5c-A で共有版に置換済み。
 
 ---
 
@@ -418,11 +438,11 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 - [x] Open / D&D 直後の自動再生（全尺解析を待たない）（Inc 3a）
 - [x] normalize gain（既存 audio pump）（build_audio_player_for_open で cache 値適用）
 
-### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1）
-- [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5、左パネル）
-- [x] 現在位置に追加（`KeyAction::VideoBookmark`、既定 `B`）/ 削除 / 改名（ユーザー命名）/ クリックでジャンプ（Inc 5）
-- [x] インポート（動画と同一の `parse_chapter_text` + 一括 add、左パネル内の貼り付け欄 + プレビュー）（Inc 5）
-- [x] エクスポート（クリップボード、`format_chapter_lines` + `seconds_only` トグル）（Inc 5）
+### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1。5c-A で動画 UI を共有）
+- [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5 → 5c-A で `draw_native_jump_panel_body` 共有）
+- [x] 現在位置に追加（`KeyAction::VideoBookmark`、既定 `B`）/ 削除 / 改名（中央モーダル改名ダイアログ）/ クリックでジャンプ（Inc 5 / 5c-A）
+- [x] インポート（動画と同一の中央モーダル一括登録ダイアログ = `draw_native_bulk_bookmark_dialog`、`parse_chapter_text` + プレビュー。IME・貼り付けが動画実装に揃う）（5c-A）
+- [x] エクスポート（一括ダイアログ内、`format_chapter_lines` + `seconds_only` トグル）（Inc 5 / 5c-A）
 - [x] シークバー上のマーカー表示（Inc 5、黄色縦線）
 
 ### 7.6 右パネル
