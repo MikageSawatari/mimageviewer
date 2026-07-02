@@ -318,13 +318,13 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 ## 7. 機能パリティ・チェックリスト（2枚: モデル項目 §7.1-7.8 + 配線コントラクト §7.9）
 
 ### 7.1 タイムライン表示（`WaveformBin` ベース）
-- [ ] 上段 DJ 風カラー波形（`band_energy` / `transient` / `transient_band`）
-- [ ] loudness+bass root レーン（高さ=loudness、色=`bass_pitch_class` 五度圏）
-- [ ] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）
-- [ ] vocal hint 独立レーン（`vocal_score` / `center_ratio`）
-- [ ] Row 秒数切替（解析キャッシュ再生成せず raster のみ作り直し）
-- [ ] メトリクスレーンのホバー（レーン名/値/時刻/推定音名）
-- [ ] 再生カーソル行の自動スクロール（手動スクロール中は追従しない）
+- [x] 上段 DJ 風カラー波形（`band_energy` / `transient` / `transient_band`）（Inc 3b、実機目視待ち）
+- [x] loudness+bass root レーン（高さ=loudness、色=`bass_pitch_class` 五度圏）（Inc 3b）
+- [x] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）（Inc 3b）
+- [ ] vocal hint 独立レーン（`vocal_score` / `center_ratio`）（未着手）
+- [x] Row 秒数切替（解析キャッシュ再生成せず raster のみ作り直し）（Inc 3b、上バー巡回）
+- [x] メトリクスレーンのホバー（レーン名/値/時刻/推定音名）（Inc 3b）
+- [x] 再生カーソル行の自動スクロール（手動スクロール中は追従しない）（Inc 3b、follow_playhead）
 
 ### 7.2 108-band spectrum（下段）
 - [ ] 20Hz–18kHz / 約1 semitone 幅、多解像度 FFT（`SpectrumAnalyzer`）
@@ -333,14 +333,14 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - [ ] 再生バッファ短窓 tap（全尺解析を待たない）
 
 ### 7.3 beat/bar grid
-- [ ] `BeatGrid` 表示（低 confidence は非表示 or 淡色、`BeatTrackingStatus`）
-- [ ] 手動 BPM / first beat 補正の永続化（`UserCorrected`）
+- [x] `BeatGrid` 表示（低 confidence は非表示 or 淡色、`BeatTrackingStatus`）（Inc 3b、draw_beat_grid）
+- [ ] 手動 BPM / first beat 補正の永続化（`UserCorrected`）（未着手）
 
 ### 7.4 再生制御
-- [ ] Play / Pause / Stop / seek / volume / mute（`VideoPlayer` メソッド）
-- [ ] 上情報バー常時表示 / 下シークバー常時表示（D3）
-- [ ] Open / D&D 直後の自動再生（全尺解析を待たない）
-- [ ] normalize gain（既存 audio pump）
+- [x] Play / Pause / Stop / seek / volume / mute（`VideoPlayer` メソッド）（Inc 3a/3b）
+- [x] 上情報バー常時表示 / 下シークバー常時表示（D3）（Inc 3a/3b）
+- [x] Open / D&D 直後の自動再生（全尺解析を待たない）（Inc 3a）
+- [x] normalize gain（既存 audio pump）（build_audio_player_for_open で cache 値適用）
 
 ### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1）
 - [ ] 一覧表示（代表サムネ・チャプターなし）
@@ -369,13 +369,13 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 
 | 境界 | ラボ | 本体接続先 | チェック観点 |
 |---|---|---|---|
-| decode/timeline 解析 | loader worker(symphonia) | 新解析ワーカー(FFmpeg→`analyze_stereo_timeline`) | [ ] UI スレッド非同期 / cancel 3 箇所 / 部分解析 merge / path+generation で stale 破棄 |
-| 再生 | cpal 簡易プレイヤー | `VideoPlayer`(headless) + audio pump | [ ] seek/volume/mute/normalize が動く / 映像 decode を走らせない |
-| VST3 | `NoopEffectChain` | `DspBridge`(audio pump 既存) | [ ] realtime callback で直接呼ばない / 失敗時 auto-disable / 動画と同一 state |
-| row raster | raster worker | 移植 raster worker | [ ] cache key+generation+row version / 1 frame 少量 upload / 古い結果を採用側で破棄 |
-| spectrum | spectrum worker | 常駐 spectrum worker + ring buffer tap | [ ] 全尺解析と独立 / pending 中は旧結果保持 |
-| repaint | — | `request_repaint_after` | [ ] pending worker / 再生中のみ。待ち無しで busy repaint しない |
-| grid/viewer lifecycle | — | GridItem::Audio / fs_cache / detached | [ ] 新ファイルで旧 worker cancel / フォルダ移動・close で漏れなし |
+| decode/timeline 解析 | loader worker(symphonia) | 新解析ワーカー(FFmpeg→`analyze_stereo_timeline`) | [x] UI スレッド非同期 / cancel(新ファイル+close) / path 一致で stale 破棄（Inc 3b。部分解析 merge は未実装=miss は全尺待ち） |
+| 再生 | cpal 簡易プレイヤー | `VideoPlayer`(headless) + audio pump | [x] seek/volume/mute/normalize が動く / 映像 decode を走らせない（Inc 3a、engine audio-only） |
+| VST3 | `NoopEffectChain` | `DspBridge`(audio pump 既存) | [ ] realtime callback で直接呼ばない / 失敗時 auto-disable / 動画と同一 state（Inc 6） |
+| row raster | raster worker | 移植 raster worker | [x] cache key+generation+row version / 1 frame 少量 upload / 古い結果を採用側で破棄（Inc 3b） |
+| spectrum | spectrum worker | 常駐 spectrum worker + ring buffer tap | [ ] 全尺解析と独立 / pending 中は旧結果保持（Inc 4） |
+| repaint | — | `request_repaint_after` | [x] pending worker は request_repaint_after(50ms) / 再生中は VideoPlayer が駆動（Inc 3b、busy spin 回避） |
+| grid/viewer lifecycle | — | GridItem::Audio / fs_cache / detached | [x] 新ファイルで旧 worker cancel / close_fullscreen で worker+raster cache 破棄（Inc 3b） |
 
 ---
 
@@ -424,6 +424,36 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
     (`docs/ui-responsiveness.md` §2 テンプレ)。cache hit は即表示、miss は解析完了まで待つ。
     新ファイルで旧ワーカー cancel。UI スレッド同期 I/O なし（perf 計装）。
   - 受け入れ: 音声を開くと自動再生 + timeline 表示 + seek/play/pause + 上下バー常時。ラボと同じ見え/音。
+
+  **✅ Inc 3b 実装済み（2026-07-02、commit b89d779a + Codex 修正 7575071c）**:
+  - **解析ワーカー**: `src/app.rs` に `MusicAnalysisPending` + `ensure_music_analysis` /
+    `poll_music_analysis` / `cancel_music_analysis`。`run_music_analysis`（背景スレッド）が
+    `std::fs::metadata` → `audio_analysis_db` 参照 → miss なら FFmpeg decode + analyze + DB 保存を
+    **全て UI スレッド外**で行う。cache hit は 1 poll で表示、新ファイルで旧ワーカー cancel、
+    `close_fullscreen` で worker + raster cache を破棄。解析 config は `bin_secs=0.010`
+    （ラボと同じ、`audio_decode::analyze_audio_file_with_config`）。
+  - **row raster worker + DJ 波形描画**: `src/ui_music_timeline.rs`（新規）にラボの
+    `TimelineTextureCache` + raster worker + `render_timeline_row_image`（spectral 波形 /
+    transient アクセント / Loudness+Bass root・Key メトリクスレーン / beat grid / playhead）+
+    key/bass root 検出 + color helper を移植。`draw_music_timeline` は `ScrollArea` 子 UI 向けに
+    適応し seek 要求を返す。**Codex P2 対応**: raster request は `Arc<TimelineAnalysis>` を渡し、
+    行ウィンドウ切り出し（`timeline_bins_window_range`）はワーカー側で zero-copy 実施
+    （UI スレッドで数千 bin をコピーしない）。`App.music_analysis` も `Arc` 保持。
+  - **`draw_fs_music_view` 統合**: 解析が揃えば中央領域に `ScrollArea` + timeline
+    （縦スクロール・follow-playhead・クリック/ドラッグ seek）、未了は音楽アイコン + 「解析中」。
+    上情報バーに Row 秒数切替（クリック巡回、`next_row_secs`）を追加、上下バー常時維持。
+  - **Codex 修正 (7575071c)**: P2 = 上記 Arc 化。P3 = spawn 失敗 / worker 切断で
+    `music_analysis_error` をセット（「解析中」固着回避）、pending 中の repaint は
+    `request_repaint_after(50ms)`（busy spin 回避）。
+  - **据え置き（意図的、文書化）**: (a) raster FIFO 優先度 — 1 曲の row 数は 10〜30 と小さく
+    各 raster も小画像のためサムネグリッド規模の問題にならない。(b) 解析フェーズの
+    キャンセル — 支配的な全尺 decode は既にキャンセル可、`analyze_stereo_timeline` を
+    cancel 対応にすると music-core の書き換えになるため（§2.1 で禁止）。
+  - **⚠️ 実機未検証**: 実際の音が鳴る中でのタイムライン表示 / seek 追従 / Row 切替は
+    ユーザーの GUI 目視待ち（FFmpeg DLL + 実ファイルが要る）。ビルド + 単体テスト緑 + fmt clean +
+    Codex code review (P1/P2/P3 なし) 済み。
+  - **残り（Inc 3 の未実装）**: 部分解析ストリーミング（先出し）は入れていない
+    （miss は全尺完了まで待つ方針）。vocal hint 独立レーン / 手動 BPM 補正は未着手。
 
 - **Inc 4: 108-band spectrum worker（下段）**
   - `SpectrumAnalyzer` 常駐 worker + playback ring buffer tap。
