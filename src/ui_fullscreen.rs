@@ -7823,11 +7823,17 @@ impl App {
         // (I) だけは音楽情報パネルのトグルとして音声でも残す。spread-shift (Ctrl+←→) はこの
         // 判定を先に使うため is_video_fs 直後で定義する。
         let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
-        // 音楽ビューのパネル内 TextEdit (ブックマーク改名 / インポート / タグピッカー) に
-        // フォーカスがある / IME 変換中は、フルスクリーンのナビ・ショートカットキーを一切
-        // 消費しない (Inc 5 FB)。矢印 (IME 候補選択) や Enter/Space/文字キーが奪われて日本語
-        // 変換が壊れるのを防ぐ (動画は native presenter 側で入力するので同問題は無い)。
-        if current_item_is_audio && (ctx.wants_keyboard_input() || self.ime_input_active()) {
+        // 音楽ビューのパネル内 TextEdit (ブックマーク改名 / 一括登録 / タグピッカー) に
+        // フォーカスがある / IME 変換中 / 中央モーダル (改名・一括登録) 表示中は、フルスクリーンの
+        // ナビ・ショートカットキーを一切消費しない (Inc 5 FB / 5c-A)。矢印 (IME 候補選択) や
+        // Enter/Space/文字キー/Ctrl+V が奪われて日本語変換や貼り付けが壊れるのを防ぐ
+        // (動画は native presenter 側で入力するので同問題は無い)。モーダル表示中は ESC/Space 等の
+        // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
+        if current_item_is_audio
+            && (ctx.wants_keyboard_input()
+                || self.ime_input_active()
+                || self.music_bookmark_modal_open())
+        {
             return action;
         }
         if !self.ime_input_active()
@@ -19120,6 +19126,9 @@ impl App {
         // 念のため seek を抑止して二重反応を防ぐ (Codex P2)。
         let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
         let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH;
+        // 改名 / 一括登録の中央モーダルを開いている間は端ホバーのパネルを出さず、timeline
+        // seek も抑止する (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A)。
+        let music_modal_open = self.music_bookmark_modal_open();
         let hover_pos = ctx.input(|i| {
             if self.cursor_hidden {
                 None
@@ -19128,9 +19137,11 @@ impl App {
             }
         });
         let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
-        let left_hover = hover_pos.is_some_and(|p| p.x <= rect.left() + left_w && in_band(p));
-        let right_hover = hover_pos.is_some_and(|p| p.x >= rect.right() - right_w && in_band(p));
-        let pointer_over_panel = left_hover || right_hover;
+        let left_hover = !music_modal_open
+            && hover_pos.is_some_and(|p| p.x <= rect.left() + left_w && in_band(p));
+        let right_hover = !music_modal_open
+            && hover_pos.is_some_and(|p| p.x >= rect.right() - right_w && in_band(p));
+        let pointer_over_panel = left_hover || right_hover || music_modal_open;
 
         let show_timeline = self
             .music_analysis
@@ -19215,12 +19226,15 @@ impl App {
         // 同じ)。中央は縮小しないので、中央 timeline/spectrum の上に重ねて描く (クリックは後描画
         // のパネルが優先。ピン/トグルボタンは持たない)。左=ブックマーク、右=情報/タグ/★。
         // ホバー判定 (left_hover / right_hover) は timeline seek 抑止のため上で計算済み。
-        if left_hover {
+        // 左ブックマーク UI: 一覧パネル本体は左端ホバー時のみ、中央モーダル (改名 / 一括登録)
+        // は開いている間常に描く (draw_music_bookmark_ui 内で分岐)。動画のジャンプ/ブックマーク
+        // パネルと同一コードを共有 (Inc 5c-A)。
+        {
             let lp = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), panel_band_top),
                 egui::pos2(rect.left() + left_w, panel_band_bottom),
             );
-            self.draw_fs_music_bookmarks_panel(ui, ctx, lp, fs_idx);
+            self.draw_music_bookmark_ui(ctx, lp, rect, fs_idx, left_hover);
         }
         if right_hover {
             let rp = egui::Rect::from_min_max(

@@ -16,6 +16,13 @@ use std::path::Path;
 use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
+use crate::video::native_presenter::overlay_draw::{
+    NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
+    draw_native_jump_panel_body,
+};
+use crate::video::native_presenter::{
+    NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
+};
 
 /// 左パネル (ブックマーク) の幅。画像補正パネル (`LEFT_PANEL_WIDTH`) と揃える。
 pub(crate) const MUSIC_LEFT_PANEL_WIDTH: f32 = 292.0;
@@ -88,19 +95,6 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(2.0);
 }
 
-/// 左パネル (ブックマーク) の 1 フレームで発生する操作。リスト描画中に self を可変借用
-/// できないので、収集してからクロージャ外で適用する。
-enum BmAction {
-    Seek(f64),
-    Delete(i64),
-    StartRename(i64, String),
-    CommitRename,
-    Add,
-    Import,
-    Export,
-    ToggleImport,
-}
-
 impl App {
     // ───────────────────────── ブックマークのデータ操作 ─────────────────────────
 
@@ -120,11 +114,11 @@ impl App {
             .map(|db| db.list_marker_entries(path))
             .unwrap_or_default();
         self.music_bookmarks_loaded_for = Some(path.to_path_buf());
-        // 改名中の項目が消えていたら編集状態を解除する。
-        if let Some((id, _)) = self.music_bookmark_rename.as_ref()
-            && !self.music_bookmarks.iter().any(|b| b.id == *id)
+        // 改名ダイアログ中の項目が消えていたら編集状態を解除する。
+        if let Some(edit) = self.music_bookmark_title_edit.as_ref()
+            && !self.music_bookmarks.iter().any(|b| b.id == edit.id)
         {
-            self.music_bookmark_rename = None;
+            self.music_bookmark_title_edit = None;
         }
     }
 
@@ -148,14 +142,21 @@ impl App {
         }
     }
 
-    /// 現在の再生位置にブックマークを追加する (B キー / パネルボタン)。近接重複 (±1s) は避ける。
+    /// 現在の再生位置にブックマークを追加する (B キー)。近接重複 (±1s) は避ける。
     pub(crate) fn add_music_bookmark_at_current(&mut self, fs_idx: usize) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
-            return;
-        };
         let Some(pos) = self.music_player_position(fs_idx) else {
             return;
         };
+        self.add_music_bookmark_at(fs_idx, pos);
+    }
+
+    /// 指定秒にブックマークを追加する。近接重複 (±1s) は避ける。パネルヘッダの
+    /// ブックマークボタン (`AddBookmarkAt { target_secs }` コマンド) からも使う。
+    fn add_music_bookmark_at(&mut self, fs_idx: usize, secs: f64) {
+        let Some(path) = self.music_audio_path(fs_idx) else {
+            return;
+        };
+        let pos = secs.max(0.0);
         let added = self
             .video_bookmark_db
             .as_ref()
@@ -175,8 +176,8 @@ impl App {
         if let Some(db) = self.video_bookmark_db.as_ref() {
             let _ = db.remove(id);
         }
-        if self.music_bookmark_rename.as_ref().map(|(rid, _)| *rid) == Some(id) {
-            self.music_bookmark_rename = None;
+        if self.music_bookmark_title_edit.as_ref().map(|e| e.id) == Some(id) {
+            self.music_bookmark_title_edit = None;
         }
         self.reload_music_bookmarks(&path);
     }
@@ -197,23 +198,21 @@ impl App {
         self.reload_music_bookmarks(&path);
     }
 
-    /// インポート欄のテキストを一括登録する (動画と同じ `parse_chapter_text` + 一括 add)。
-    fn import_music_bookmarks(&mut self, fs_idx: usize) {
+    /// 一括ブックマーク登録 (中央モーダルの `BulkAddBookmarks { entries }` コマンドを翻訳)。
+    /// 動画と同じ重複判定 (±1s) で追加する。
+    fn bulk_add_music_bookmarks(&mut self, fs_idx: usize, entries: Vec<(f64, String)>) {
         let Some(path) = self.music_audio_path(fs_idx) else {
             return;
         };
-        let text = self.music_bookmark_import_text.clone();
-        let (entries, _errors) = crate::video_bookmarks_parser::parse_chapter_text(&text);
         if entries.is_empty() {
             self.show_feedback_toast("登録できる行がありません".to_string());
             return;
         }
         let refs: Vec<(f64, Option<&str>)> = entries
             .iter()
-            .map(|e| (e.pts_secs, Some(e.title.as_str())))
+            .map(|(secs, title)| (*secs, Some(title.as_str())))
             .collect();
-        // 成功したときだけ貼り付けテキストをクリアしてインポート欄を閉じる。DB エラー / DB
-        // 未オープンでは黙って捨てず、テキストを残してエラーを通知する (Codex P3)。
+        // DB エラー / DB 未オープンは黙って捨てずに通知する (Codex P3、動画と同流儀)。
         let result = self
             .video_bookmark_db
             .as_mut()
@@ -225,8 +224,6 @@ impl App {
                     "一括登録: {} 件追加 / 重複 {} / エラー {}",
                     s.added, s.skipped_duplicates, s.errors
                 ));
-                self.music_bookmark_import_text.clear();
-                self.music_bookmark_import_open = false;
             }
             Some(Err(e)) => {
                 self.show_feedback_toast(format!("ブックマークの保存に失敗しました: {e}"));
@@ -237,8 +234,9 @@ impl App {
         }
     }
 
-    /// ブックマークをクリップボードへエクスポートする (動画と同じ `format_chapter_lines`)。
-    fn export_music_bookmarks(&mut self, fs_idx: usize, ctx: &egui::Context) {
+    /// ブックマークをクリップボードへエクスポート (`ExportBookmarksToClipboard { seconds_only }`
+    /// コマンドを翻訳、動画と同じ `format_chapter_lines`)。
+    fn export_music_bookmarks(&mut self, fs_idx: usize, ctx: &egui::Context, seconds_only: bool) {
         let Some(path) = self.music_audio_path(fs_idx) else {
             return;
         };
@@ -251,15 +249,32 @@ impl App {
             self.show_feedback_toast("ブックマークがありません".to_string());
             return;
         }
-        let text = crate::video_bookmarks_parser::format_chapter_lines(
-            &entries,
-            self.music_bookmark_export_seconds_only,
-        );
+        let text = crate::video_bookmarks_parser::format_chapter_lines(&entries, seconds_only);
         ctx.copy_text(text);
         self.show_feedback_toast(format!(
             "{} 件をクリップボードへコピーしました",
             entries.len()
         ));
+    }
+
+    /// この音声のブックマークを全削除 (`ClearAllBookmarksForCurrent` コマンドを翻訳)。
+    fn clear_all_music_bookmarks(&mut self, fs_idx: usize) {
+        let Some(path) = self.music_audio_path(fs_idx) else {
+            return;
+        };
+        let result = self
+            .video_bookmark_db
+            .as_ref()
+            .map(|db| db.clear_for(&path));
+        self.music_bookmark_title_edit = None;
+        self.reload_music_bookmarks(&path);
+        match result {
+            Some(Ok(())) => {
+                self.show_feedback_toast("ブックマークをすべて削除しました".to_string())
+            }
+            Some(Err(e)) => self.show_feedback_toast(format!("削除に失敗しました: {e}")),
+            None => self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string()),
+        }
     }
 
     // ───────────────────────── 右パネル (音楽情報 + ★ + タグ) ─────────────────────────
@@ -387,241 +402,164 @@ impl App {
 
     // ───────────────────────── 左パネル (ブックマーク一覧) ─────────────────────────
 
-    /// 音楽ビュー左パネル (ブックマーク一覧) を描く。命名 / 追加 / 削除 / 改名 / ジャンプ /
-    /// インポート / エクスポート。
-    pub(crate) fn draw_fs_music_bookmarks_panel(
+    /// 音楽ビューのブックマーク UI (Inc 5c-A、動画のジャンプ/ブックマークパネルを共有)。
+    ///
+    /// - 左端ホバーで出す一覧パネル本体 (`show_panel`) は `draw_native_jump_panel_body` を
+    ///   音声オプション (ピン/チャプター/サムネなし・種別見出しなし) で呼ぶ。
+    /// - 改名ダイアログ / 一括登録ダイアログは動画と同一の中央モーダル
+    ///   (`draw_native_bookmark_title_editor` / `draw_native_bulk_bookmark_dialog`) を使う。
+    ///   IME・貼り付けも動画実装に揃う (Inc 5 FB のインポート欄 IME 不具合を解消)。
+    /// - パネル本体・ダイアログが発行する `NativeOverlayCommand` を music の実操作へ翻訳する。
+    ///
+    /// `panel_rect` = 左端ホバー領域。`full_rect` = 音楽ビュー全域 (中央モーダルの中心決めと、
+    /// 背後 timeline/パネルへのクリック漏れを防ぐバックドロップ用)。改名/一括ダイアログは
+    /// ホバーに依らず開いている間常に描画する。
+    pub(crate) fn draw_music_bookmark_ui(
         &mut self,
-        ui: &mut egui::Ui,
         ctx: &egui::Context,
         panel_rect: egui::Rect,
+        full_rect: egui::Rect,
         fs_idx: usize,
+        show_panel: bool,
     ) {
         let Some(path) = self.music_audio_path(fs_idx) else {
             return;
         };
         self.ensure_music_bookmarks_loaded(&path);
 
-        // 背景 + 右端区切り線 (左寄せパネル)。
-        ui.painter().rect_filled(panel_rect, 0.0, PANEL_BG);
-        ui.painter().line_segment(
-            [panel_rect.right_top(), panel_rect.right_bottom()],
-            egui::Stroke::new(1.0, PANEL_DIVIDER),
-        );
-        let _ = ui.interact(
-            panel_rect,
-            ui.id().with(("music_left_bg", fs_idx)),
-            egui::Sense::click_and_drag(),
-        );
-
-        let title_rect =
-            egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), TITLE_H));
-        ui.painter().rect_filled(title_rect, 0.0, TITLE_BG);
-        ui.painter().text(
-            title_rect.left_center() + egui::vec2(10.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            "ブックマーク",
-            egui::FontId::proportional(13.0),
-            egui::Color32::from_gray(205),
-        );
-
-        let content_rect = egui::Rect::from_min_max(
-            egui::pos2(panel_rect.left(), title_rect.bottom()),
-            panel_rect.max,
-        );
-        let inner = content_rect.shrink2(egui::vec2(10.0, 8.0));
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-        child.set_clip_rect(content_rect);
-        *child.visuals_mut() = egui::Visuals::dark();
-
-        // リスト描画中に self を可変借用できないので、行はスナップショットしてから描く。
-        let rows: Vec<(i64, f64, Option<String>)> = self
+        let position_secs = self.music_player_position(fs_idx).unwrap_or(0.0);
+        // 一覧 → 共有 body 用のジャンプエントリ (全て Bookmark 種別、サムネなし)。
+        let entries: Vec<NativeOverlayJumpEntry> = self
             .music_bookmarks
             .iter()
-            .map(|b| (b.id, b.pts_secs, b.title.clone()))
+            .map(|b| NativeOverlayJumpEntry {
+                pts_secs: b.pts_secs,
+                kind: NativeOverlayTimelineMarkerKind::Bookmark,
+                title: b.title.clone(),
+                bookmark_id: Some(b.id),
+                thumbnail: None,
+            })
             .collect();
-        let import_open = self.music_bookmark_import_open;
-        let mut seconds_only = self.music_bookmark_export_seconds_only;
-        // 改名バッファを取り出してクロージャ内で編集、末尾で書き戻す。
-        let mut rename = self.music_bookmark_rename.take();
-        let mut import_text = std::mem::take(&mut self.music_bookmark_import_text);
-        // インポートプレビュー用に事前パース。
-        let (parsed_entries, parse_errors) = if import_open {
-            crate::video_bookmarks_parser::parse_chapter_text(&import_text)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let mut act: Option<BmAction> = None;
 
-        egui::ScrollArea::vertical()
-            .id_salt(("music_bookmarks_scroll", fs_idx))
-            .auto_shrink([false, false])
-            .show(&mut child, |ui| {
-                ui.set_width(ui.available_width());
+        // 借用衝突を避けるためダイアログ state を self から取り出し、末尾で書き戻す。
+        let mut title_edit = self.music_bookmark_title_edit.take();
+        let mut bulk = self.music_bulk_bookmark_dialog.take();
+        let mut commands: Vec<NativeOverlayCommand> = Vec::new();
+        // 音声はサムネを持たないので空の texture マップを渡す (show_thumbnails=false で未参照)。
+        let empty_tex: std::collections::HashMap<usize, egui::TextureId> =
+            std::collections::HashMap::new();
 
-                // ── 操作ボタン ──
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button("＋ 現在位置")
-                        .on_hover_text("再生位置にブックマークを追加 [B]")
-                        .clicked()
-                    {
-                        act = Some(BmAction::Add);
-                    }
-                    if ui.selectable_label(import_open, "インポート").clicked() {
-                        act = Some(BmAction::ToggleImport);
-                    }
-                    if ui
-                        .button("エクスポート")
-                        .on_hover_text("一覧をクリップボードへコピー")
-                        .clicked()
-                    {
-                        act = Some(BmAction::Export);
-                    }
+        // ── 左端ホバー一覧パネル本体 ──
+        if show_panel {
+            let opts = NativeJumpPanelOptions {
+                title: "ブックマーク",
+                empty_text: "ブックマークはありません",
+                show_pin_button: false,
+                show_bulk_button: true,
+                show_pins: false,
+                show_chapters: false,
+                show_section_headers: false,
+                show_thumbnails: false,
+            };
+            egui::Area::new(egui::Id::new(("music_jump_panel", fs_idx)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel_rect.min)
+                .show(ctx, |ui| {
+                    ui.set_min_size(panel_rect.size());
+                    draw_native_jump_panel_body(
+                        ui,
+                        panel_rect,
+                        &opts,
+                        position_secs,
+                        &entries,
+                        &empty_tex,
+                        None,
+                        &mut title_edit,
+                        &mut bulk,
+                        &mut commands,
+                    );
                 });
-                ui.add_space(6.0);
-
-                // ── インポート欄 ──
-                if import_open {
-                    ui.label(
-                        egui::RichText::new("mm:ss タイトル (1 行 1 件) を貼り付け")
-                            .color(LABEL_COLOR)
-                            .size(11.0),
-                    );
-                    ui.add(
-                        egui::TextEdit::multiline(&mut import_text)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("0:13 イントロ\n1:02 サビ"),
-                    );
-                    ui.horizontal(|ui| {
-                        let n = parsed_entries.len();
-                        let e = parse_errors.len();
-                        let msg = if e > 0 {
-                            format!("{n} 件 / エラー {e} 行")
-                        } else {
-                            format!("{n} 件")
-                        };
-                        ui.label(egui::RichText::new(msg).color(LABEL_COLOR).size(11.0));
-                        if ui.add_enabled(n > 0, egui::Button::new("登録")).clicked() {
-                            act = Some(BmAction::Import);
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                }
-
-                // ── 一覧 ──
-                if rows.is_empty() {
-                    ui.label(
-                        egui::RichText::new("ブックマークはありません")
-                            .color(LABEL_COLOR)
-                            .size(12.0),
-                    );
-                }
-                for (id, secs, title) in &rows {
-                    let editing = rename.as_ref().map(|(rid, _)| *rid) == Some(*id);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // 時刻ボタン (クリックでジャンプ)。
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new(format_hms(*secs))
-                                    .color(egui::Color32::from_rgb(150, 200, 245))
-                                    .size(12.0),
-                            ))
-                            .on_hover_text("この位置へジャンプ")
-                            .clicked()
-                        {
-                            act = Some(BmAction::Seek(*secs));
-                        }
-                        // タイトル (クリックで改名) / 改名中は TextEdit。
-                        if editing {
-                            if let Some((_, buf)) = rename.as_mut() {
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(buf)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text("名称"),
-                                );
-                                if !resp.has_focus() && !resp.lost_focus() {
-                                    resp.request_focus();
-                                }
-                                // Enter (フォーカス喪失) / 別の場所クリックで確定。IME 変換中の
-                                // Enter は lost_focus を発火しないので破壊しない。
-                                if resp.lost_focus() {
-                                    act = Some(BmAction::CommitRename);
-                                }
-                            }
-                        } else {
-                            let label = title.clone().unwrap_or_else(|| "(名称なし)".to_string());
-                            let color = if title.is_some() {
-                                VALUE_COLOR
-                            } else {
-                                egui::Color32::from_gray(140)
-                            };
-                            if ui
-                                .add(
-                                    egui::Label::new(
-                                        egui::RichText::new(label).color(color).size(12.0),
-                                    )
-                                    .sense(egui::Sense::click())
-                                    .truncate(),
-                                )
-                                .on_hover_text("クリックで名称を編集")
-                                .clicked()
-                            {
-                                act = Some(BmAction::StartRename(
-                                    *id,
-                                    title.clone().unwrap_or_default(),
-                                ));
-                            }
-                        }
-                        // 削除 (右寄せ)。
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(egui::Button::new(
-                                    egui::RichText::new("×").color(egui::Color32::from_gray(200)),
-                                ))
-                                .on_hover_text("削除")
-                                .clicked()
-                            {
-                                act = Some(BmAction::Delete(*id));
-                            }
-                        });
-                    });
-                }
-
-                // 秒単位トグル (エクスポート形式)。
-                if !rows.is_empty() {
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut seconds_only, "エクスポートは秒単位 (mm:ss)");
-                }
-            });
-
-        // ── クロージャ外で状態を書き戻し + 操作を適用 ──
-        self.music_bookmark_rename = rename;
-        self.music_bookmark_import_text = import_text;
-        self.music_bookmark_export_seconds_only = seconds_only;
-
-        match act {
-            Some(BmAction::Seek(s)) => self.music_seek_to(fs_idx, s),
-            Some(BmAction::Delete(id)) => self.delete_music_bookmark(fs_idx, id),
-            Some(BmAction::StartRename(id, t)) => {
-                self.music_bookmark_rename = Some((id, t));
-            }
-            Some(BmAction::CommitRename) => {
-                if let Some((id, text)) = self.music_bookmark_rename.take() {
-                    self.rename_music_bookmark(fs_idx, id, &text);
-                }
-            }
-            Some(BmAction::Add) => self.add_music_bookmark_at_current(fs_idx),
-            Some(BmAction::Import) => self.import_music_bookmarks(fs_idx),
-            Some(BmAction::Export) => self.export_music_bookmarks(fs_idx, ctx),
-            Some(BmAction::ToggleImport) => {
-                self.music_bookmark_import_open = !self.music_bookmark_import_open;
-            }
-            None => {}
         }
+
+        // ── 中央モーダル (改名 / 一括登録) は開いている間常に描く ──
+        // 背後 timeline / パネルへクリックが漏れないよう半透明バックドロップで吸収する。
+        // バックドロップは `Order::Middle` (base の timeline/HUD より上、ダイアログの
+        // `Order::Foreground` より下) に置き、ダイアログのクリックを塞がないようにする。
+        let modal_open = title_edit.is_some() || bulk.is_some();
+        if modal_open {
+            egui::Area::new(egui::Id::new(("music_modal_backdrop", fs_idx)))
+                .order(egui::Order::Middle)
+                .fixed_pos(full_rect.min)
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        full_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                    );
+                    let _ = ui.interact(
+                        full_rect,
+                        egui::Id::new(("music_modal_backdrop_sink", fs_idx)),
+                        egui::Sense::click_and_drag(),
+                    );
+                });
+        }
+        if title_edit.is_some() {
+            draw_native_bookmark_title_editor(
+                ctx,
+                full_rect.width(),
+                full_rect.height(),
+                &mut title_edit,
+                &mut commands,
+            );
+        }
+        if bulk.is_some() {
+            draw_native_bulk_bookmark_dialog(
+                ctx,
+                full_rect.width(),
+                full_rect.height(),
+                &mut bulk,
+                &mut commands,
+            );
+        }
+
+        // 書き戻し。
+        self.music_bookmark_title_edit = title_edit;
+        self.music_bulk_bookmark_dialog = bulk;
+
+        // ── 発行コマンドを music の実操作へ翻訳する ──
+        for cmd in commands {
+            match cmd {
+                NativeOverlayCommand::Seek { target_secs } => {
+                    self.music_seek_to(fs_idx, target_secs)
+                }
+                NativeOverlayCommand::AddBookmarkAt { target_secs } => {
+                    self.add_music_bookmark_at(fs_idx, target_secs)
+                }
+                NativeOverlayCommand::DeleteBookmark { id } => {
+                    self.delete_music_bookmark(fs_idx, id)
+                }
+                NativeOverlayCommand::SetBookmarkTitle { id, title } => {
+                    self.rename_music_bookmark(fs_idx, id, &title)
+                }
+                NativeOverlayCommand::BulkAddBookmarks { entries } => {
+                    self.bulk_add_music_bookmarks(fs_idx, entries)
+                }
+                NativeOverlayCommand::ExportBookmarksToClipboard { seconds_only } => {
+                    self.export_music_bookmarks(fs_idx, ctx, seconds_only)
+                }
+                NativeOverlayCommand::ClearAllBookmarksForCurrent => {
+                    self.clear_all_music_bookmarks(fs_idx)
+                }
+                // ピン留めや動画専用コマンドは音声パネルでは発行されない。
+                _ => {}
+            }
+        }
+    }
+
+    /// 音楽ビューでブックマーク改名 / 一括登録の中央モーダルが開いているか
+    /// (キー・シーク入力を抑止するモーダル判定用)。
+    pub(crate) fn music_bookmark_modal_open(&self) -> bool {
+        self.music_bookmark_title_edit.is_some() || self.music_bulk_bookmark_dialog.is_some()
     }
 
     // ───────────────────────── 下 HUD (seek 行 + コントロール行) ─────────────────────────

@@ -387,6 +387,45 @@ pub(super) fn draw_native_perf_overlay(
         });
 }
 
+/// ジャンプ / ブックマークパネル本体 (`draw_native_jump_panel_body`) の描画オプション。
+///
+/// 動画は全機能 (ピン / チャプター / サムネイル) を出す。音楽ビュー (Inc 5c-A) は
+/// **ブックマークのみ** を出すため `show_pins` / `show_chapters` / `show_thumbnails` /
+/// `show_pin_button` を false にして同じ本体を共有する。これにより動画↔音声で
+/// パネルの見た目・行レイアウト・一括登録ダイアログが同一コードで揃う (Inc 7 の
+/// 動画→音声モードで切替前後の視覚ジャンプを防ぐ、docs §5.8)。
+pub(crate) struct NativeJumpPanelOptions<'a> {
+    /// パネル左上のタイトル ("ジャンプ" / "ブックマーク")。
+    pub title: &'a str,
+    /// エントリが空のときの案内文。
+    pub empty_text: &'a str,
+    /// ヘッダのピン留めボタンを出すか (音声は false)。
+    pub show_pin_button: bool,
+    /// ヘッダの一括登録ボタンを出すか。
+    pub show_bulk_button: bool,
+    /// ピン留めセクションを出すか (音声は false)。
+    pub show_pins: bool,
+    /// チャプターセクションを出すか (音声は false)。
+    pub show_chapters: bool,
+    /// 種別セクション見出し ("ブックマーク" 等) を出すか。音声はブックマークのみで
+    /// 見出しが冗長なので false にしてフラットな一覧にする。
+    pub show_section_headers: bool,
+    /// 行の代表サムネイル列を出すか (音声は false)。
+    pub show_thumbnails: bool,
+}
+
+/// 動画 native overlay 用のパネルオプション (従来挙動と完全一致)。
+const VIDEO_JUMP_PANEL_OPTIONS: NativeJumpPanelOptions<'static> = NativeJumpPanelOptions {
+    title: "ジャンプ",
+    empty_text: "ピン・ブックマーク・チャプターはまだありません",
+    show_pin_button: true,
+    show_bulk_button: true,
+    show_pins: true,
+    show_chapters: true,
+    show_section_headers: true,
+    show_thumbnails: true,
+};
+
 pub(super) fn draw_native_jump_panel(
     ctx: &egui::Context,
     overlay_height_points: f32,
@@ -405,189 +444,235 @@ pub(super) fn draw_native_jump_panel(
         .fixed_pos(panel_rect.min)
         .show(ctx, |ui| {
             ui.set_min_size(panel_rect.size());
-            let rect = ui.min_rect();
-            let painter = ui.painter().clone();
-            painter.rect_filled(
-                rect,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(14, 14, 18, 232),
+            draw_native_jump_panel_body(
+                ui,
+                panel_rect,
+                &VIDEO_JUMP_PANEL_OPTIONS,
+                position_secs,
+                entries,
+                jump_texture_ids,
+                shortcut_labels,
+                bookmark_title_edit,
+                bulk_bookmark_dialog,
+                commands,
             );
-            painter.line_segment(
-                [rect.right_top(), rect.right_bottom()],
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
-                ),
-            );
-            let _ = ui.interact(
-                rect,
-                egui::Id::new("native_video_jump_panel_bg"),
-                egui::Sense::click(),
-            );
-            painter.text(
-                rect.min + egui::vec2(10.0, 10.0),
-                egui::Align2::LEFT_TOP,
-                "ジャンプ",
-                egui::FontId::proportional(13.0),
-                egui::Color32::from_rgb(238, 238, 238),
-            );
-
-            // 一括ブックマーク登録ダイアログを開くボタン。
-            // 配置 (実機フィードバック反映 2026-05-26): 左から右に「Pin (- 100pt) →
-            // Bookmark (- 68pt) → 一括 Bookmark (- 36pt)」。ユーザー要求: ピン留めを左端、
-            // ブックマーク系を右側にまとめる。一括は低頻度なので右端維持。
-            let bulk_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 36.0, 6.0),
-                egui::vec2(26.0, 24.0),
-            );
-            let bulk_resp = ui.interact(
-                bulk_rect,
-                egui::Id::new("native_jump_bulk_bookmark"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, bulk_rect, bulk_resp.hovered(), false);
-            draw_overlay_bulk_bookmark_icon(
-                &painter,
-                bulk_rect.center(),
-                7.5,
-                egui::Color32::from_rgb(255, 220, 82),
-            );
-            let bulk_resp = bulk_resp.hover_tip_dark(
-                "ブックマークを一括登録 (動画コメント等のチャプター形式の貼り付け)",
-            );
-            if bulk_resp.clicked() && bulk_bookmark_dialog.is_none() {
-                *bulk_bookmark_dialog = Some(NativeBulkBookmarkDialog {
-                    request_focus: true,
-                    ..Default::default()
-                });
-            }
-
-            let pin_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 100.0, 6.0),
-                egui::vec2(26.0, 24.0),
-            );
-            let pin_resp = ui.interact(
-                pin_rect,
-                egui::Id::new("native_jump_pin_here"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, pin_rect, pin_resp.hovered(), false);
-            draw_overlay_pin_icon(
-                &painter,
-                pin_rect.center(),
-                7.0,
-                egui::Color32::from_rgb(140, 245, 170),
-            );
-            let pin_resp = pin_resp.hover_tip_dark(native_label_with_shortcut(
-                "現在位置をピン留め",
-                shortcut_labels.and_then(|s| s.pin.as_deref()),
-            ));
-            if pin_resp.clicked() {
-                commands.push(NativeOverlayCommand::SetPinAt {
-                    target_secs: position_secs,
-                });
-            }
-
-            let bm_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 68.0, 6.0),
-                egui::vec2(26.0, 24.0),
-            );
-            let bm_resp = ui.interact(
-                bm_rect,
-                egui::Id::new("native_jump_bookmark_here"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, bm_rect, bm_resp.hovered(), false);
-            draw_overlay_bookmark_icon(
-                &painter,
-                bm_rect.center(),
-                7.0,
-                egui::Color32::from_rgb(255, 220, 82),
-            );
-            let bm_resp = bm_resp.hover_tip_dark(native_label_with_shortcut(
-                "現在位置をブックマーク",
-                shortcut_labels.and_then(|s| s.bookmark.as_deref()),
-            ));
-            if bm_resp.clicked() {
-                commands.push(NativeOverlayCommand::AddBookmarkAt {
-                    target_secs: position_secs,
-                });
-            }
-
-            let content_rect = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 34.0), rect.max);
-            let mut content_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(content_rect)
-                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
-            );
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .max_height(content_rect.height())
-                .show(&mut content_ui, |ui| {
-                    ui.add_space(6.0);
-                    if entries.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.colored_label(
-                                egui::Color32::from_gray(170),
-                                "ピン・ブックマーク・チャプターはまだありません",
-                            );
-                        });
-                        return;
-                    }
-
-                    for kind in [
-                        NativeOverlayTimelineMarkerKind::Pin,
-                        NativeOverlayTimelineMarkerKind::Bookmark,
-                        NativeOverlayTimelineMarkerKind::Chapter,
-                    ] {
-                        let section_entries: Vec<_> = entries
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, entry)| entry.kind == kind)
-                            .collect();
-                        if section_entries.is_empty() {
-                            continue;
-                        }
-                        let (label, color) = match kind {
-                            NativeOverlayTimelineMarkerKind::Pin => {
-                                ("ピン留め", egui::Color32::from_rgb(140, 245, 170))
-                            }
-                            NativeOverlayTimelineMarkerKind::Bookmark => {
-                                ("ブックマーク", egui::Color32::from_rgb(255, 220, 82))
-                            }
-                            NativeOverlayTimelineMarkerKind::Chapter => {
-                                ("チャプター", egui::Color32::from_rgb(115, 210, 255))
-                            }
-                        };
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.colored_label(color, egui::RichText::new(label).size(12.0));
-                        });
-                        ui.add_space(3.0);
-                        for (idx, entry) in section_entries {
-                            let time_text = format_native_jump_entry_time(entry, entries);
-                            draw_native_jump_row(
-                                ui,
-                                idx,
-                                entry,
-                                &time_text,
-                                jump_texture_ids,
-                                bookmark_title_edit,
-                                commands,
-                            );
-                        }
-                        ui.add_space(8.0);
-                    }
-                });
         });
 }
 
+/// ジャンプ / ブックマークパネルの本体描画 (背景 + ヘッダボタン + スクロール一覧)。
+///
+/// `panel_rect` は呼び出し側が確定した実 rect (動画は `native_jump_panel_rect`、音楽ビューは
+/// 端ホバーの overlay rect)。動画は自前の `egui::Area` の中でこれを呼び、音楽ビューも
+/// 同様に Area を作ってから呼ぶ。発行される `NativeOverlayCommand` を、音楽側は music の
+/// 実操作へ翻訳するアダプタで受ける (docs §5.8)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_native_jump_panel_body(
+    ui: &mut egui::Ui,
+    panel_rect: egui::Rect,
+    opts: &NativeJumpPanelOptions,
+    position_secs: f64,
+    entries: &[NativeOverlayJumpEntry],
+    jump_texture_ids: &HashMap<usize, egui::TextureId>,
+    shortcut_labels: Option<&NativeOverlayShortcutLabels>,
+    bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
+    bulk_bookmark_dialog: &mut Option<NativeBulkBookmarkDialog>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let rect = panel_rect;
+    let painter = ui.painter().clone();
+    painter.rect_filled(
+        rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(14, 14, 18, 232),
+    );
+    painter.line_segment(
+        [rect.right_top(), rect.right_bottom()],
+        egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
+        ),
+    );
+    let _ = ui.interact(
+        rect,
+        egui::Id::new("native_video_jump_panel_bg"),
+        egui::Sense::click(),
+    );
+    painter.text(
+        rect.min + egui::vec2(10.0, 10.0),
+        egui::Align2::LEFT_TOP,
+        opts.title,
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_rgb(238, 238, 238),
+    );
+
+    // 一括ブックマーク登録ダイアログを開くボタン。
+    // 配置 (実機フィードバック反映 2026-05-26): 左から右に「Pin (- 100pt) →
+    // Bookmark (- 68pt) → 一括 Bookmark (- 36pt)」。ユーザー要求: ピン留めを左端、
+    // ブックマーク系を右側にまとめる。一括は低頻度なので右端維持。
+    if opts.show_bulk_button {
+        let bulk_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(rect.width() - 36.0, 6.0),
+            egui::vec2(26.0, 24.0),
+        );
+        let bulk_resp = ui.interact(
+            bulk_rect,
+            egui::Id::new("native_jump_bulk_bookmark"),
+            egui::Sense::click(),
+        );
+        draw_overlay_button_bg(&painter, bulk_rect, bulk_resp.hovered(), false);
+        draw_overlay_bulk_bookmark_icon(
+            &painter,
+            bulk_rect.center(),
+            7.5,
+            egui::Color32::from_rgb(255, 220, 82),
+        );
+        let bulk_resp = bulk_resp
+            .hover_tip_dark("ブックマークを一括登録 (動画コメント等のチャプター形式の貼り付け)");
+        if bulk_resp.clicked() && bulk_bookmark_dialog.is_none() {
+            *bulk_bookmark_dialog = Some(NativeBulkBookmarkDialog {
+                request_focus: true,
+                ..Default::default()
+            });
+        }
+    }
+
+    if opts.show_pin_button {
+        let pin_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(rect.width() - 100.0, 6.0),
+            egui::vec2(26.0, 24.0),
+        );
+        let pin_resp = ui.interact(
+            pin_rect,
+            egui::Id::new("native_jump_pin_here"),
+            egui::Sense::click(),
+        );
+        draw_overlay_button_bg(&painter, pin_rect, pin_resp.hovered(), false);
+        draw_overlay_pin_icon(
+            &painter,
+            pin_rect.center(),
+            7.0,
+            egui::Color32::from_rgb(140, 245, 170),
+        );
+        let pin_resp = pin_resp.hover_tip_dark(native_label_with_shortcut(
+            "現在位置をピン留め",
+            shortcut_labels.and_then(|s| s.pin.as_deref()),
+        ));
+        if pin_resp.clicked() {
+            commands.push(NativeOverlayCommand::SetPinAt {
+                target_secs: position_secs,
+            });
+        }
+    }
+
+    let bm_rect = egui::Rect::from_min_size(
+        rect.min + egui::vec2(rect.width() - 68.0, 6.0),
+        egui::vec2(26.0, 24.0),
+    );
+    let bm_resp = ui.interact(
+        bm_rect,
+        egui::Id::new("native_jump_bookmark_here"),
+        egui::Sense::click(),
+    );
+    draw_overlay_button_bg(&painter, bm_rect, bm_resp.hovered(), false);
+    draw_overlay_bookmark_icon(
+        &painter,
+        bm_rect.center(),
+        7.0,
+        egui::Color32::from_rgb(255, 220, 82),
+    );
+    let bm_resp = bm_resp.hover_tip_dark(native_label_with_shortcut(
+        "現在位置をブックマーク",
+        shortcut_labels.and_then(|s| s.bookmark.as_deref()),
+    ));
+    if bm_resp.clicked() {
+        commands.push(NativeOverlayCommand::AddBookmarkAt {
+            target_secs: position_secs,
+        });
+    }
+
+    let content_rect = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 34.0), rect.max);
+    let mut content_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .max_height(content_rect.height())
+        .show(&mut content_ui, |ui| {
+            ui.add_space(6.0);
+            if entries.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.colored_label(egui::Color32::from_gray(170), opts.empty_text);
+                });
+                return;
+            }
+
+            for kind in [
+                NativeOverlayTimelineMarkerKind::Pin,
+                NativeOverlayTimelineMarkerKind::Bookmark,
+                NativeOverlayTimelineMarkerKind::Chapter,
+            ] {
+                let show_kind = match kind {
+                    NativeOverlayTimelineMarkerKind::Pin => opts.show_pins,
+                    NativeOverlayTimelineMarkerKind::Bookmark => true,
+                    NativeOverlayTimelineMarkerKind::Chapter => opts.show_chapters,
+                };
+                if !show_kind {
+                    continue;
+                }
+                let section_entries: Vec<_> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.kind == kind)
+                    .collect();
+                if section_entries.is_empty() {
+                    continue;
+                }
+                if opts.show_section_headers {
+                    let (label, color) = match kind {
+                        NativeOverlayTimelineMarkerKind::Pin => {
+                            ("ピン留め", egui::Color32::from_rgb(140, 245, 170))
+                        }
+                        NativeOverlayTimelineMarkerKind::Bookmark => {
+                            ("ブックマーク", egui::Color32::from_rgb(255, 220, 82))
+                        }
+                        NativeOverlayTimelineMarkerKind::Chapter => {
+                            ("チャプター", egui::Color32::from_rgb(115, 210, 255))
+                        }
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.colored_label(color, egui::RichText::new(label).size(12.0));
+                    });
+                    ui.add_space(3.0);
+                }
+                for (idx, entry) in section_entries {
+                    let time_text = format_native_jump_entry_time(entry, entries);
+                    draw_native_jump_row(
+                        ui,
+                        idx,
+                        entry,
+                        &time_text,
+                        opts.show_thumbnails,
+                        jump_texture_ids,
+                        bookmark_title_edit,
+                        commands,
+                    );
+                }
+                ui.add_space(8.0);
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_native_jump_row(
     ui: &mut egui::Ui,
     idx: usize,
     entry: &NativeOverlayJumpEntry,
     time_text: &str,
+    show_thumbnail: bool,
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -596,16 +681,22 @@ pub(super) fn draw_native_jump_row(
     // まで row を縦に伸ばす。ホバー時はツールチップで全文を表示する。
     // 旧版は固定 76pt + 1 行 truncate (`…`) だったが、PHASE 表記付きチャプター等の
     // 長いタイトルが見切れていた (実機 fb 2026-05-26)。
-    let row_h_min: f32 = 76.0;
+    //
+    // サムネ表示時は左に 120pt のサムネ列があり、テキストはその右 (+136pt) から始まる。
+    // 音声ビュー (show_thumbnail=false, Inc 5c-A) はサムネ列が無いので、テキストを左端
+    // (+12pt) から始めて行高も詰める。
+    let row_h_min: f32 = if show_thumbnail { 76.0 } else { 52.0 };
     let row_w = (ui.available_width() - 12.0).max(260.0);
     let title_color = egui::Color32::from_rgb(205, 205, 205);
     let title_font = egui::FontId::proportional(12.0);
     let title_y_offset = 38.0; // BM ラベル (y +14) の下、サムネ下端 (y +72) より少し上から
     let title_bottom_pad = 6.0;
     let title_max_lines = 5;
-    // text_x = thumb_rect.max.x + 10 = row_rect.min.x + 6 + 120 + 10 = +136
-    // title_max_w = row_rect.max.x - text_x - 6 = row_w - 142
-    let title_max_w = (row_w - 142.0).max(40.0);
+    // text_x = (サムネ有) thumb_rect.max.x + 10 = row.min.x + 6 + 120 + 10 = +136
+    //          (サムネ無) row.min.x + 12
+    // title_max_w = row_rect.max.x - text_x - 6
+    let text_x_offset = if show_thumbnail { 136.0 } else { 12.0 };
+    let title_max_w = (row_w - text_x_offset - 6.0).max(40.0);
     // タイトルをここで一度 layout してその高さで行の縦サイズを決める。
     // painter 取得のためだけに ui.painter() を借りる (allocate 前の参照は OK)。
     let title_layout = entry
@@ -639,33 +730,37 @@ pub(super) fn draw_native_jump_row(
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
             );
         }
-        let thumb_rect =
-            egui::Rect::from_min_size(row_rect.min + egui::vec2(6.0, 4.0), egui::vec2(120.0, 68.0));
-        painter.rect_filled(thumb_rect, 3.0, egui::Color32::from_rgb(30, 30, 35));
-        if let Some(texture_id) = jump_texture_ids.get(&idx) {
-            painter.image(
-                *texture_id,
-                thumb_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
+        if show_thumbnail {
+            let thumb_rect = egui::Rect::from_min_size(
+                row_rect.min + egui::vec2(6.0, 4.0),
+                egui::vec2(120.0, 68.0),
             );
-        } else {
-            painter.text(
-                thumb_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "...",
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_gray(140),
+            painter.rect_filled(thumb_rect, 3.0, egui::Color32::from_rgb(30, 30, 35));
+            if let Some(texture_id) = jump_texture_ids.get(&idx) {
+                painter.image(
+                    *texture_id,
+                    thumb_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                painter.text(
+                    thumb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "...",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_gray(140),
+                );
+            }
+            painter.rect_stroke(
+                thumb_rect,
+                3.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
+                egui::StrokeKind::Inside,
             );
         }
-        painter.rect_stroke(
-            thumb_rect,
-            3.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
-            egui::StrokeKind::Inside,
-        );
 
-        let text_x = thumb_rect.max.x + 10.0;
+        let text_x = row_rect.min.x + text_x_offset;
         let (kind_label, kind_color) = match entry.kind {
             NativeOverlayTimelineMarkerKind::Pin => ("PIN", egui::Color32::from_rgb(140, 245, 170)),
             NativeOverlayTimelineMarkerKind::Bookmark => {
@@ -804,7 +899,7 @@ pub(super) fn draw_native_jump_row(
 
 /// 戻り値は実際に描画したダイアログ rect。呼び出し側は `SetWindowRgn` の region に
 /// この rect を使う (中央固定の概算 region だとダイアログ上端がクリップされるため)。
-pub(super) fn draw_native_bookmark_title_editor(
+pub(crate) fn draw_native_bookmark_title_editor(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
@@ -887,7 +982,7 @@ pub(super) fn draw_native_bookmark_title_editor(
 ///
 /// 実描画と HUD region 計算 (compute_hud_regions) の両方からこの関数を呼び、両者が
 /// 食い違って下部ボタンが SetWindowRgn 外に落ちる事故を防ぐ。
-pub(super) fn native_bulk_bookmark_dialog_size(
+pub(crate) fn native_bulk_bookmark_dialog_size(
     overlay_width_points: f32,
     overlay_height_points: f32,
 ) -> (f32, f32) {
@@ -1056,7 +1151,7 @@ pub(super) fn draw_native_shortcut_help_dialog(
 ///   下部の「登録」「キャンセル」ボタンが画面外に逃げないようにする。
 /// - textarea は ScrollArea で囲い、`max_height` 制約をかけて中身がはみ出たら
 ///   textarea 内側でスクロールさせる。
-pub(super) fn draw_native_bulk_bookmark_dialog(
+pub(crate) fn draw_native_bulk_bookmark_dialog(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,

@@ -5227,14 +5227,15 @@ pub struct App {
     pub(crate) music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
     /// `music_bookmarks` をどの path 用に読んだか。fs のファイルが変わったら再取得する。
     pub(crate) music_bookmarks_loaded_for: Option<PathBuf>,
-    /// インライン改名中のブックマーク (id, 編集中テキスト)。
-    pub(crate) music_bookmark_rename: Option<(i64, String)>,
-    /// 左パネル内のインポート欄 (貼り付け → 一括登録) の開閉。
-    pub(crate) music_bookmark_import_open: bool,
-    /// インポート欄のテキストバッファ (`mm:ss タイトル` を貼り付け)。
-    pub(crate) music_bookmark_import_text: String,
-    /// エクスポート (クリップボード) の秒単位トグル (動画の `seconds_only` と同義)。
-    pub(crate) music_bookmark_export_seconds_only: bool,
+    /// ブックマーク名の編集ダイアログ (動画と共有、Inc 5c-A)。左パネルの行の鉛筆ボタンで
+    /// 開き、中央モーダルで改名する。`draw_native_bookmark_title_editor` が描画する。
+    pub(crate) music_bookmark_title_edit:
+        Option<crate::video::native_presenter::NativeBookmarkTitleEdit>,
+    /// 一括ブックマーク登録ダイアログ (動画と共有、Inc 5c-A)。左パネルヘッダの一括ボタンで
+    /// 開き、中央モーダルで貼り付け一括登録 / エクスポート / 全削除する。`Some` の間描画される。
+    /// 動画の `draw_native_bulk_bookmark_dialog` をそのまま流用し、IME・貼り付けも動画と揃う。
+    pub(crate) music_bulk_bookmark_dialog:
+        Option<crate::video::native_presenter::NativeBulkBookmarkDialog>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -7046,10 +7047,8 @@ impl App {
             music_loop_enabled: false,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
-            music_bookmark_rename: None,
-            music_bookmark_import_open: false,
-            music_bookmark_import_text: String::new(),
-            music_bookmark_export_seconds_only: false,
+            music_bookmark_title_edit: None,
+            music_bulk_bookmark_dialog: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -30336,14 +30335,12 @@ impl App {
         self.music_probe = None;
         self.music_analysis_error = None;
         self.music_analysis_path = None;
-        // ブックマークの一時状態 (キャッシュ / 改名中 / インポート欄) は破棄する。
-        // export トグル / ループ設定はセッション設定として保持 (パネルは端ホバーで出すので
-        // 開閉トグル状態は持たない)。
+        // ブックマークの一時状態 (キャッシュ / 改名ダイアログ / 一括登録ダイアログ) は破棄する。
+        // ループ設定はセッション設定として保持 (パネルは端ホバーで出すので開閉トグル状態は持たない)。
         self.music_bookmarks.clear();
         self.music_bookmarks_loaded_for = None;
-        self.music_bookmark_rename = None;
-        self.music_bookmark_import_open = false;
-        self.music_bookmark_import_text.clear();
+        self.music_bookmark_title_edit = None;
+        self.music_bulk_bookmark_dialog = None;
     }
 
     /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。

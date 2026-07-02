@@ -47,7 +47,9 @@ use windows_numerics::Matrix3x2;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 
-mod overlay_draw;
+// 音楽ビュー (Inc 5c-A) がジャンプ/ブックマークパネル本体・一括登録ダイアログを共有するため
+// crate 内に公開する。動画専用の `pub(super)` ヘルパは従来どおり parent 限定のまま。
+pub(crate) mod overlay_draw;
 use self::overlay_draw::*;
 
 pub mod hud_window;
@@ -490,28 +492,28 @@ struct NativeFrameStepHold {
 }
 
 #[derive(Clone, Debug)]
-struct NativeBookmarkTitleEdit {
-    id: i64,
-    title: String,
-    request_focus: bool,
+pub(crate) struct NativeBookmarkTitleEdit {
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) request_focus: bool,
 }
 
 /// 一括ブックマーク登録ダイアログの永続 state。
 /// `Some` の間ダイアログが描画される。`textarea` にユーザーがペーストした
 /// チャプターテキストが入り、登録ボタンで `BulkAddBookmarks` コマンドを発行する。
 #[derive(Clone, Debug)]
-pub(super) struct NativeBulkBookmarkDialog {
-    pub(super) textarea: String,
-    pub(super) request_focus: bool,
-    pub(super) confirm_clear_all: bool,
+pub(crate) struct NativeBulkBookmarkDialog {
+    pub(crate) textarea: String,
+    pub(crate) request_focus: bool,
+    pub(crate) confirm_clear_all: bool,
     /// Ctrl+V で読み出したテキストの first-paste 救済 (Codex C8)。`Some` のとき、
     /// 次の draw で textarea のカーソル位置に挿入する (Event::Paste が focus を
     /// 持たない TextEdit に届いて捨てられる race を回避)。挿入後 `None` に戻す。
-    pub(super) pending_paste: Option<String>,
+    pub(crate) pending_paste: Option<String>,
     /// エクスポートチェックボックス: 「秒単位にする」。`true` のとき整数秒へ floor、
     /// `false` のとき小数 3 桁 (ms 精度) で出力する。ダイアログを閉じると消える
     /// (= 次回開いたときは既定値 `true` に戻る、永続化しない設計)。
-    pub(super) export_seconds_only: bool,
+    pub(crate) export_seconds_only: bool,
 }
 
 impl Default for NativeBulkBookmarkDialog {
