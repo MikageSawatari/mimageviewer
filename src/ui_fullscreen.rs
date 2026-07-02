@@ -5917,7 +5917,15 @@ impl App {
 
                         // ── 分析パネル（分析モード時、見開き中は無効）──
                         let panels_t0 = std::time::Instant::now();
-                        if analysis_active {
+                        // 音声 (音楽ビュー) は画像フルスクリーンの左右パネル (補正 / メタデータ /
+                        // 表示トリム / 分析 / パノラマ等) を一切描かない。draw_fs_music_view が
+                        // 自前の UI (上情報バー + 下シークバー) を描くので、動画が native presenter に
+                        // 委ねてここでパネルを描かないのと同じ扱いにする (Inc 3、右左パネル漏れ修正)。
+                        let is_music_view =
+                            matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
+                        if is_music_view {
+                            // 画像用パネルは描画しない (音楽ビュー専用パネルは今後 Inc 3c/5 で追加)。
+                        } else if analysis_active {
                             let pixels = match self.fs_cache.get(&fs_idx) {
                                 Some(FsCacheEntry::Static { pixels, .. }) => {
                                     Some(std::sync::Arc::clone(pixels))
@@ -6058,8 +6066,11 @@ impl App {
                         };
 
                         // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
+                        // 音楽ビューも画像用の上部ホバーバーは出さない (music view が自前で
+                        // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
                         if !self.is_overlay_edit_mode_active()
                             && self.capture_region_selection.is_none()
+                            && !is_music_view
                         {
                             let saved_nav = nav_delta;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
@@ -9141,6 +9152,14 @@ impl App {
             self.adjustment_mode = false;
         } else if self.fs_zoom_mode_engaged() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
+            self.adjustment_mode = false;
+        } else if self
+            .fullscreen_idx
+            .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Audio(_))))
+        {
+            // 音楽ビュー: 画面端ホバーで画像用の補正パネルを開かない。パネル描画自体は
+            // 抑制済みだが、adjustment_mode フラグを立てると画像に戻った瞬間まで残るので
+            // ここで OFF に固定する (Inc 3 パネル漏れ修正)。
             self.adjustment_mode = false;
         } else {
             let edge_hover = passive_hover_enabled
