@@ -8031,8 +8031,13 @@ impl App {
         };
         let stack_jump_next = stack_jump == Some(KeyAction::FsStackJumpNext);
         let stack_jump_prev = stack_jump == Some(KeyAction::FsStackJumpPrev);
+        // 音声 (音楽ビュー) は汎用の前/次項目ナビ対象外 (adjacent_navigable_idx が Audio を
+        // 含まない)。矢印を消費すると境界ヒントトーストが出るだけで、さらに Shift+↑↓ は
+        // 音量調整 (native path 消費) と二重発火してしまう。よって音声では矢印ナビを無効化する
+        // (Inc 5c-B 実機FB 2026-07-03)。音声のファイル間移動は今後 HUD の前/次ボタンで実装予定。
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
             || (!is_video_fs
+                && !current_item_is_audio
                 && ctx.input_mut(|i| {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
                         || (!stack_flat_nav
@@ -8040,6 +8045,7 @@ impl App {
                 }));
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
             || (!is_video_fs
+                && !current_item_is_audio
                 && ctx.input_mut(|i| {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
                         || (!stack_flat_nav
