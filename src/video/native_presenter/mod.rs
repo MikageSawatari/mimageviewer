@@ -438,6 +438,14 @@ struct NativeEguiOverlay {
     top_bar_visible: bool,
     right_panel_visible: bool,
     jump_panel_visible: bool,
+    /// 右パネル (情報/★/タグ) の端ホバー開閉ラッチ。画面右端 5% の細いトリガで開き、
+    /// パネル矩形 + ヒステリシス余白から出るまで維持する。パネル幅ぶんの広い当たり判定が
+    /// 中央のクリック (右クリックページ送り等) を食う問題への対策 (実機 FB 2026-07)。
+    /// egui / 音楽ビュー側の二段ラッチと挙動を揃える。`update_side_panel_hover_latches` が
+    /// フレーム先頭で更新し、`right_panel_visible()` が読む。
+    right_panel_hover_latched: bool,
+    /// 左ジャンプ・情報パネルの端ホバー開閉ラッチ。右と同じ二段判定。
+    jump_panel_hover_latched: bool,
     /// 実機修正 (2026-05-12): 外部 drag (= HUD region 外で left button down 中、典型的には VST window
     /// のドラッグ) を検出するフラグ。`NativeVideoPresenter::cursor_polling_tick` で `GetAsyncKeyState
     /// (VK_LBUTTON)` の結果と egui の `pointer.any_down()` の差から判定して set する。
@@ -3927,6 +3935,8 @@ impl NativeEguiOverlay {
             top_bar_visible: false,
             right_panel_visible: false,
             jump_panel_visible: false,
+            right_panel_hover_latched: false,
+            jump_panel_hover_latched: false,
             external_drag_in_progress: false,
             pending_overlay_commands: Vec::new(),
             last_volume_target: None,
@@ -4199,6 +4209,11 @@ impl NativeEguiOverlay {
                 let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, false);
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
+                // 端パネルの開閉ラッチは render_once 冒頭でしか更新されないため、同一イベント
+                // バッチ内で端へ移動→即ホイールすると latch が stale のまま pointer_over_scroll_panel
+                // が誤判定し、パネル上ホイールが前後アイテム切替に化ける (Codex P2)。ここで現在の
+                // wheel 座標で latch を更新してから判定する。
+                self.update_side_panel_hover_latches();
                 let over_scroll_panel = self.pointer_over_scroll_panel(pos);
                 // テキスト入力中央モーダル (一括ブックマーク登録ダイアログ / 名称編集) が
                 // 出ているときは、ホイールで前後の動画に飛ばない (テキストや ScrollArea の
@@ -5500,6 +5515,42 @@ impl NativeEguiOverlay {
         self.vst3_panel.as_ref().is_some_and(|panel| panel.visible)
     }
 
+    /// 左右パネルの端ホバー開閉ラッチをフレーム先頭で更新する (実機 FB 2026-07)。
+    ///  - 開くトリガ = 画面端 5% (`panel_edge_trigger_px`) の細いストリップ。パネル幅ぶん
+    ///    (右 430 / 左 320pt) の広い当たり判定は中央のクリックを食うため。
+    ///  - 維持 = 描画パネル矩形 + ヒステリシス余白 (`panel_hover_sustain_px`)。パネル内端を
+    ///    わずかに越えても即閉じない (項目クリックへ移動する動線を確保)。
+    /// egui / 音楽ビュー側の二段ラッチと同じモデル。`render_once` の先頭で 1 回だけ呼ぶ。
+    fn update_side_panel_hover_latches(&mut self) {
+        let overlay_width_points = self.width as f32 / self.pixels_per_point;
+        let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        let hover_bottom = native_panel_hover_bottom(overlay_height_points);
+        let trigger = crate::ui_helpers::panel_edge_trigger_px(overlay_width_points);
+        let margin = crate::ui_helpers::panel_hover_sustain_px(overlay_width_points);
+        let in_band = |p: egui::Pos2| p.y >= 0.0 && p.y <= hover_bottom;
+
+        let right_panel = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
+        let right_open = self
+            .pointer_pos
+            .is_some_and(|p| p.x >= overlay_width_points - trigger && in_band(p));
+        let right_sustain = self.right_panel_hover_latched
+            && self
+                .pointer_pos
+                .is_some_and(|p| right_panel.expand(margin).contains(p));
+        self.right_panel_hover_latched =
+            self.pointer_pos.is_some() && (right_open || right_sustain);
+
+        let left_panel = native_jump_panel_rect(overlay_height_points);
+        let left_open = self
+            .pointer_pos
+            .is_some_and(|p| p.x <= trigger && in_band(p));
+        let left_sustain = self.jump_panel_hover_latched
+            && self
+                .pointer_pos
+                .is_some_and(|p| left_panel.expand(margin).contains(p));
+        self.jump_panel_hover_latched = self.pointer_pos.is_some() && (left_open || left_sustain);
+    }
+
     fn right_panel_visible(&self) -> bool {
         let Some(metadata) = self.video_metadata.as_ref() else {
             return false;
@@ -5508,19 +5559,7 @@ impl NativeEguiOverlay {
             || !metadata.shortcut_tags.is_empty()
             || !metadata.current_tags.is_empty()
             || !metadata.tag_choices.is_empty();
-        let pointer_in_hover_rect = self.pointer_pos.is_some_and(|pos| {
-            let overlay_width_points = self.width as f32 / self.pixels_per_point;
-            let overlay_height_points = self.height as f32 / self.pixels_per_point;
-            let panel_w =
-                native_metadata_panel_rect(overlay_width_points, overlay_height_points).width();
-            let x_min = overlay_width_points - panel_w;
-            native_panel_hover_rect(
-                egui::pos2(x_min, 0.0),
-                egui::vec2(overlay_width_points - x_min, overlay_height_points),
-                overlay_height_points,
-            )
-            .contains(pos)
-        });
+        // 端ホバー判定は二段ラッチ (update_side_panel_hover_latches がフレーム先頭で更新)。
         native_right_panel_visible_from_inputs(NativeRightPanelVisibilityInputs {
             shortcut_help_open: self.shortcut_help_open,
             external_drag_in_progress: self.external_drag_in_progress,
@@ -5529,27 +5568,18 @@ impl NativeEguiOverlay {
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             tag_picker_open: self.tag_picker_open,
-            pointer_in_hover_rect,
+            pointer_in_hover_rect: self.right_panel_hover_latched,
         })
     }
 
     fn jump_panel_visible(&self) -> bool {
-        let pointer_in_hover_rect = self.pointer_pos.is_some_and(|pos| {
-            let overlay_height_points = self.height as f32 / self.pixels_per_point;
-            let x_max = native_jump_panel_width();
-            native_panel_hover_rect(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(x_max, overlay_height_points),
-                overlay_height_points,
-            )
-            .contains(pos)
-        });
+        // 端ホバー判定は二段ラッチ (update_side_panel_hover_latches がフレーム先頭で更新)。
         native_jump_panel_visible_from_inputs(NativeJumpPanelVisibilityInputs {
             shortcut_help_open: self.shortcut_help_open,
             vst3_panel_visible: self.vst3_panel_visible(),
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
-            pointer_in_hover_rect,
+            pointer_in_hover_rect: self.jump_panel_hover_latched,
         })
     }
 
@@ -5636,6 +5666,9 @@ impl NativeEguiOverlay {
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
+        // 左右パネルの端ホバー開閉ラッチをフレーム先頭で更新する (実機 FB 2026-07)。以降の
+        // jump_panel_visible() / right_panel_visible() はこのラッチを読む。
+        self.update_side_panel_hover_latches();
         // hover_preview_target_secs はシークバー Area (= bottom_hud_visible) 内でしか
         // 更新されない。pointer が hud 領域から外れた状態で Some が居座ると
         // jump_panel_visible() / right_panel_visible() を false に固定し続ける

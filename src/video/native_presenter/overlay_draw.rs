@@ -4414,15 +4414,6 @@ pub(super) fn native_panel_hover_bottom(overlay_height_points: f32) -> f32 {
         .max(native_panel_top())
 }
 
-pub(super) fn native_panel_hover_rect(
-    min: egui::Pos2,
-    size: egui::Vec2,
-    overlay_height_points: f32,
-) -> egui::Rect {
-    let bottom = native_panel_hover_bottom(overlay_height_points);
-    egui::Rect::from_min_max(egui::pos2(min.x, 0.0), egui::pos2(min.x + size.x, bottom))
-}
-
 pub(super) fn native_jump_panel_rect(overlay_height_points: f32) -> egui::Rect {
     let top = native_panel_top();
     // 動画 HUD 2 段化リデザイン (Phase 3): パネル底辺 = HUD top - 2pt の隙間

@@ -99,8 +99,13 @@ impl App {
             });
 
             let hover_in_right = pointer_pos.is_some_and(|p| activation_rect.contains(p));
+            // 開いた後の維持は panel_rect + ヒステリシス余白。内端をわずかに越えた瞬間に
+            // 閉じるちらつきを防ぐ (実機 FB 2026-07)。開くトリガ (activation_rect) は右端の
+            // 細いストリップなので、維持はこちらで広めに取る二段判定になる。
+            let sustain_rect =
+                panel_rect.expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
             let hover_in_open_panel = self.metadata_panel_hover_active
-                && pointer_pos.is_some_and(|p| panel_rect.contains(p));
+                && pointer_pos.is_some_and(|p| sustain_rect.contains(p));
             let hover_visible = hover_in_right || hover_in_open_panel;
 
             let visible =

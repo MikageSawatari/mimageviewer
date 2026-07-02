@@ -5230,6 +5230,12 @@ pub struct App {
     /// `video_speed_popup_open` と同じ役割。共有の `draw_overlay_speed_control` が
     /// トグルし、選択 / popup 外クリックで閉じる。
     pub(crate) music_speed_popup_open: bool,
+    /// 音楽ビュー左パネル (ブックマーク) の端ホバー開閉ラッチ。画面端の細いトリガ
+    /// ストリップで開き、パネル矩形 + ヒステリシス余白から出るまで維持する。パネル幅
+    /// ぶんの広い当たり判定が中央波形の seek を食う問題への対策 (実機 FB 2026-07)。
+    pub(crate) music_left_panel_active: bool,
+    /// 音楽ビュー右パネル (情報/★/タグ) の端ホバー開閉ラッチ。左と同じ二段判定。
+    pub(crate) music_right_panel_active: bool,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
     /// 左パネルは端ホバーで出す (動画のジャンプパネルと同じ、Inc 5 FB。トグルボタンは廃止)。
@@ -7056,6 +7062,8 @@ impl App {
             music_loop_enabled: false,
             music_hud_last_volume_target: None,
             music_speed_popup_open: false,
+            music_left_panel_active: false,
+            music_right_panel_active: false,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             music_bookmark_title_edit: None,
@@ -30346,6 +30354,11 @@ impl App {
         self.music_probe = None;
         self.music_analysis_error = None;
         self.music_analysis_path = None;
+        // 端ホバーパネルの開閉ラッチは transient hover state なので teardown でリセットする。
+        // 残すと次に音声を開いた際、5% edge trigger を踏まずカーソルが panel+sustain 内にある
+        // だけでパネルが再表示される (Codex P3)。
+        self.music_left_panel_active = false;
+        self.music_right_panel_active = false;
         // ブックマークの一時状態 (キャッシュ / 改名ダイアログ / 一括登録ダイアログ) は破棄する。
         // ループ設定はセッション設定として保持 (パネルは端ホバーで出すので開閉トグル状態は持たない)。
         self.music_bookmarks.clear();

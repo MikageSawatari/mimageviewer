@@ -67,6 +67,11 @@ fn timeline_bg() -> egui::Color32 {
     egui::Color32::BLACK
 }
 
+/// 音楽ビュー全体の背景色 (左右の隙間・ラベル列と揃える灰色)。ui_fullscreen の
+/// `draw_fs_music_view` の背景と同値。タイムライン左の時間ラベル列をこの色で塗り、
+/// 左右の gutter 隙間 (= 音楽ビュー背景が透ける部分) と色を揃える (実機 FB 2026-07)。
+pub const MUSIC_VIEW_BG: egui::Color32 = egui::Color32::from_gray(18);
+
 // ── row raster cache + worker ──
 
 #[derive(Default)]
@@ -377,6 +382,10 @@ pub fn draw_music_timeline(
     cache: &mut TimelineTextureCache,
     row_secs: f64,
     dark: bool,
+    // 左の時間ラベル (0:30 等) 列の幅 (px)。呼び出し側が「左 5% gutter」を渡すことで、
+    // ラベルをパネルトリガ帯 (= seek 不要領域) に載せ、波形は中央領域を全幅使う
+    // (実機 FB 2026-07)。ラベルは波形左端に右寄せで描く。
+    left_label_w: f32,
 ) -> Option<f64> {
     let mut seek_request = None;
     let row_secs = row_secs.max(1.0);
@@ -389,11 +398,20 @@ pub fn draw_music_timeline(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, timeline_bg());
 
-    let label_w = 56.0;
+    let label_w = left_label_w.max(0.0);
     let graph_rect = egui::Rect::from_min_max(
         rect.min + egui::vec2(label_w, 8.0),
         egui::pos2(rect.max.x - 8.0, rect.min.y + content_h - 8.0),
     );
+    // 左の時間ラベル列 (gutter) は音楽ビュー背景の灰色で塗り、左右の隙間と色を揃える
+    // (実機 FB 2026-07)。波形グラフ部 (graph_rect 以降) は timeline_bg (黒) のまま。
+    if label_w > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(graph_rect.left(), rect.max.y)),
+            0.0,
+            MUSIC_VIEW_BG,
+        );
+    }
     let ppp = ui.ctx().pixels_per_point().clamp(1.0, 3.0);
     let width_px =
         ((graph_rect.width() * ppp).round() as usize).clamp(1, TIMELINE_TEXTURE_MAX_WIDTH);
@@ -481,9 +499,11 @@ pub fn draw_music_timeline(
                 egui::Color32::WHITE,
             );
         }
+        // 時間ラベルは波形左端 (graph_rect.left) の直左に右寄せで描く。左 gutter が広くても
+        // ラベルが波形に隣接して読みやすく、seek 帯 (graph_rect) には食い込まない。
         painter.text(
-            egui::pos2(rect.min.x + 8.0, row_rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(graph_rect.min.x - 6.0, row_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
             format_time(row_start),
             egui::FontId::monospace(12.0),
             text_color,
@@ -523,7 +543,14 @@ pub fn draw_music_timeline(
         let local_y = pos.y - graph_rect.min.y;
         let row = (local_y / (row_h + row_gap)).floor().max(0.0) as usize;
         let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
-        if pos.y >= row_top && pos.y <= row_top + row_h {
+        // seek は波形 graph_rect の x 範囲内でのみ受け付ける (Codex P2)。左のラベル列 / 左右の
+        // gutter 隙間をクリックしても frac が 0/1 に張り付いて行頭/行末へ飛ばないようにする
+        // (隙間は「seek にも パネルにも使わない安全帯」という設計を守る)。
+        if pos.y >= row_top
+            && pos.y <= row_top + row_h
+            && pos.x >= graph_rect.left()
+            && pos.x <= graph_rect.right()
+        {
             let frac = ((pos.x - graph_rect.min.x) / graph_rect.width()).clamp(0.0, 1.0);
             seek_request = Some(row as f64 * row_secs + frac as f64 * row_secs);
         }

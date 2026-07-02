@@ -28,6 +28,24 @@ pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 #[allow(dead_code)]
 pub(crate) const PROGRESS_LABEL_COLOR: eframe::egui::Color32 =
     eframe::egui::Color32::from_rgb(235, 240, 250);
+
+/// 端ホバーで左右パネル (補正 / メタデータ / 音楽ブックマーク・情報 / 動画ジャンプ・情報) を
+/// 「開く」トリガ帯の幅 (px)。**ビュー幅の 5%** に統一する。補正パネル (左) が元々「左端 5%」で
+/// 発火していたので、機能ごとにバラバラだった当たり判定を全てこれに揃える (実機 FB 2026-07)。
+/// パネル幅ぶん (292〜430px) の広い当たり判定にすると、画像の右クリックページ送りや音楽の
+/// 全幅波形 seek を恒常的に食う。固定 40px はウィンドウモードで細すぎるという実機 FB もあり、
+/// 幅比例 (5%) にすると小窓でも当てやすさが保たれる。lib (動画 native presenter) と bin
+/// (静止画/音楽 fullscreen) の両方から参照するため、共有の `ui_helpers` に置く。
+pub(crate) fn panel_edge_trigger_px(view_width: f32) -> f32 {
+    view_width.max(0.0) * 0.05
+}
+
+/// 一度開いた左右パネルを「維持」するヒステリシス余白 (px)。トリガと同じく **ビュー幅の 5%**。
+/// 描画パネル矩形をこの分だけ広げた範囲から出るまで閉じない。パネル内端をわずかに越えた瞬間に
+/// パネルが消えるちらつきを防ぐ。
+pub(crate) fn panel_hover_sustain_px(view_width: f32) -> f32 {
+    view_width.max(0.0) * 0.05
+}
 /// 進捗バーの背景色（ポップアップ Frame の fill）。
 #[allow(dead_code)]
 pub(crate) const PROGRESS_BG_COLOR: eframe::egui::Color32 =

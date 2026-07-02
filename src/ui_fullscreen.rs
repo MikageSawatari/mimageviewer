@@ -243,11 +243,16 @@ pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// メタデータパネルを「開く」ホバートリガ矩形。画面右端の細いストリップ
+/// (`PANEL_EDGE_TRIGGER_WIDTH`) だけを判定に使う。縦方向は従来どおり全高 (上バー / シーク
+/// バー帯でも右端ホバーで開ける)。一度開いた後の「維持」判定は `draw_metadata_panel` 側で
+/// `panel_rect` + `PANEL_HOVER_SUSTAIN_MARGIN` が担う。
 pub(crate) fn metadata_panel_hover_activation_rect(full_rect: egui::Rect) -> egui::Rect {
-    let panel = metadata_panel_rect(full_rect);
+    let strip =
+        crate::ui_helpers::panel_edge_trigger_px(full_rect.width()).min(full_rect.width().max(0.0));
     egui::Rect::from_min_max(
-        egui::pos2(panel.left(), full_rect.top()),
-        egui::pos2(panel.right(), full_rect.bottom()),
+        egui::pos2(full_rect.max.x - strip, full_rect.top()),
+        egui::pos2(full_rect.max.x, full_rect.bottom()),
     )
 }
 
@@ -9287,9 +9292,12 @@ impl App {
                     i.pointer
                         .hover_pos()
                         .map(|p| {
+                            // 端 5% ホバーで補正パネル (+上バー) を開く。トリガ幅は左右メタ
+                            // パネル / 音楽パネルと共通の panel_edge_trigger_px に統一 (実機 FB 2026-07)。
+                            let edge = crate::ui_helpers::panel_edge_trigger_px(full_rect.width());
                             p.y < 60.0  // 上端
-                    || p.x < full_rect.min.x + full_rect.width() * 0.05  // 左端5%
-                    || p.x > full_rect.max.x - full_rect.width() * 0.05 // 右端5%
+                    || p.x < full_rect.min.x + edge  // 左端
+                    || p.x > full_rect.max.x - edge // 右端
                         })
                         .unwrap_or(false)
                 });
@@ -19068,7 +19076,8 @@ impl App {
         // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
         let dark = true;
         let painter = ui.painter_at(rect);
-        let bg = egui::Color32::from_gray(18);
+        // 背景色はタイムラインのラベル列 / 左右隙間と共有 (実機 FB 2026-07、色の不揃い解消)。
+        let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
         painter.rect_filled(rect, 0.0, bg);
 
         // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
@@ -19129,6 +19138,19 @@ impl App {
         let panel_band_top = rect.top() + top_h;
         let panel_band_bottom = hud_top;
 
+        // 中央コンテンツ (波形 timeline + spectrum) は左右にトリガ幅ぶんの gutter を空ける
+        // (実機 FB 2026-07)。この gutter が左右パネルの端ホバートリガ帯と重なるので、gutter
+        // 内は「パネルを開く帯」= 波形 seek には使わない。結果、**表示されている波形は端まで
+        // すべて seek 可能**になり (旧: パネル幅ぶんの左右端が seek 不能だった)、かつ端ホバーで
+        // パネルを開ける。
+        // gutter = トリガ帯 (端 5%) + 隙間 (3%) にする (実機 FB 2026-07)。端から「5% パネル領域 →
+        // 3% 隙間 → グラフ」の構成。トリガと同じ 5% だとグラフ端 / 右スクロールバーがトリガ境界に
+        // 接し、グラフ端をクリックしようとして僅かにはみ出すとパネルが出てしまう。3% の隙間を挟む
+        // ことでその誤爆を防ぐ (トリガ自体は 5% のまま = パネルの開けやすさをウィンドウモードでも
+        // 維持)。gutter (= 5%+3% = 8%) は最低 8px。
+        let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(rect.width());
+        let content_gutter = (edge_trigger + rect.width() * 0.03).max(8.0);
+
         // 中央領域の下端に 108-band spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
         // 潰さないよう、帯高は「タイムライン領域を最低 MIN 残す」制約で伸縮させ、確保しても
@@ -19144,8 +19166,8 @@ impl App {
             MUSIC_SPECTRUM_MAX_H.min((band_h - MUSIC_SPECTRUM_GAP - MUSIC_TIMELINE_MIN_H).max(0.0));
         let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H;
         let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 8.0, band_bottom - spectrum_h),
-            egui::pos2(rect.right() - 8.0, band_bottom),
+            egui::pos2(rect.left() + content_gutter, band_bottom - spectrum_h),
+            egui::pos2(rect.right() - content_gutter, band_bottom),
         );
         let central_bottom = if show_spectrum {
             (band_bottom - spectrum_h - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
@@ -19153,8 +19175,8 @@ impl App {
             hud_top.max(band_top + 1.0)
         };
         let central_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), band_top),
-            egui::pos2(rect.right(), central_bottom),
+            egui::pos2(rect.left() + content_gutter, band_top),
+            egui::pos2(rect.right() - content_gutter, central_bottom),
         );
 
         // ── 左右パネル (端ホバー) の判定を timeline より先に確定する ──
@@ -19173,11 +19195,35 @@ impl App {
                 i.pointer.hover_pos()
             }
         });
+        // 左右パネルは二段判定 (実機 FB 2026-07):
+        //  - 開くトリガ = 画面端の細いストリップ (PANEL_EDGE_TRIGGER_WIDTH)。パネル幅ぶんの
+        //    広い当たり判定にすると中央の全幅波形 seek の左右端 (left_w / right_w) が押せなく
+        //    なる catch-22 が起きる。細ストリップなら seek 不能域が端の数十 px に縮む。
+        //  - 維持 = 描画パネル矩形 + PANEL_HOVER_SUSTAIN_MARGIN。内端をわずかに越えても即
+        //    閉じないヒステリシス (ブックマーク項目クリックへ移動する動線を確保)。
+        //  ラッチ state は music_left/right_panel_active。モーダル中は両方 OFF に固定する。
         let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
-        let left_hover = !music_modal_open
-            && hover_pos.is_some_and(|p| p.x <= rect.left() + left_w && in_band(p));
-        let right_hover = !music_modal_open
-            && hover_pos.is_some_and(|p| p.x >= rect.right() - right_w && in_band(p));
+        let trigger_w =
+            crate::ui_helpers::panel_edge_trigger_px(rect.width()).min(rect.width().max(0.0));
+        let sustain_margin = crate::ui_helpers::panel_hover_sustain_px(rect.width());
+        let left_panel_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), panel_band_top),
+            egui::pos2(rect.left() + left_w, panel_band_bottom),
+        );
+        let right_panel_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - right_w, panel_band_top),
+            egui::pos2(rect.right(), panel_band_bottom),
+        );
+        let left_open = hover_pos.is_some_and(|p| p.x <= rect.left() + trigger_w && in_band(p));
+        let right_open = hover_pos.is_some_and(|p| p.x >= rect.right() - trigger_w && in_band(p));
+        let left_sustain = self.music_left_panel_active
+            && hover_pos.is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
+        let right_sustain = self.music_right_panel_active
+            && hover_pos.is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
+        self.music_left_panel_active = !music_modal_open && (left_open || left_sustain);
+        self.music_right_panel_active = !music_modal_open && (right_open || right_sustain);
+        let left_hover = self.music_left_panel_active;
+        let right_hover = self.music_right_panel_active;
         let pointer_over_panel = left_hover || right_hover || music_modal_open;
 
         let show_timeline = self
@@ -19187,12 +19233,20 @@ impl App {
         if show_timeline {
             // タイムラインは複数行 (row) になり中央領域より高くなるので ScrollArea で縦スクロール。
             // 子 UI は常に DARK visuals (フルスクリーン内は黒背景ベース統一)。
+            // 時間ラベル (0:30 等) は左 gutter (パネルトリガ帯 = seek 不要領域) に載せるため、子 UI を
+            // **左 gutter ぶん広げる** (右は central_rect のまま)。draw_music_timeline に
+            // label_w=content_gutter を渡すと波形左端が central_rect.left に揃い (spectrum と同じ)、
+            // 旧 56px ラベル列ぶん波形が広がる (実機 FB 2026-07)。
+            let timeline_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), central_rect.top()),
+                egui::pos2(central_rect.right(), central_rect.bottom()),
+            );
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
-                    .max_rect(central_rect)
+                    .max_rect(timeline_rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
-            child.set_clip_rect(central_rect);
+            child.set_clip_rect(timeline_rect);
             *child.visuals_mut() = egui::Visuals::dark();
             let row_secs = self.music_timeline_row_secs;
             let analysis = self.music_analysis.as_ref().unwrap();
@@ -19204,7 +19258,16 @@ impl App {
                 .id_salt(("music_timeline", fs_idx))
                 .show(&mut child, |ui| {
                     seek_req = crate::ui_music_timeline::draw_music_timeline(
-                        ui, analysis, dur, pos, playing, follow, cache, row_secs, dark,
+                        ui,
+                        analysis,
+                        dur,
+                        pos,
+                        playing,
+                        follow,
+                        cache,
+                        row_secs,
+                        dark,
+                        content_gutter,
                     );
                 });
             if let Some(s) = seek_req
@@ -19266,19 +19329,10 @@ impl App {
         // 左ブックマーク UI: 一覧パネル本体は左端ホバー時のみ、中央モーダル (改名 / 一括登録)
         // は開いている間常に描く (draw_music_bookmark_ui 内で分岐)。動画のジャンプ/ブックマーク
         // パネルと同一コードを共有 (Inc 5c-A)。
-        {
-            let lp = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), panel_band_top),
-                egui::pos2(rect.left() + left_w, panel_band_bottom),
-            );
-            self.draw_music_bookmark_ui(ctx, lp, rect, fs_idx, left_hover);
-        }
+        // パネル矩形は上のホバー判定で使ったものを再利用する (発火/維持と描画のずれ防止)。
+        self.draw_music_bookmark_ui(ctx, left_panel_rect, rect, fs_idx, left_hover);
         if right_hover {
-            let rp = egui::Rect::from_min_max(
-                egui::pos2(rect.right() - right_w, panel_band_top),
-                egui::pos2(rect.right(), panel_band_bottom),
-            );
-            self.draw_fs_music_right_panel(ui, ctx, rp, fs_idx);
+            self.draw_fs_music_right_panel(ui, ctx, right_panel_rect, fs_idx);
         }
 
         // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時)。
@@ -19464,19 +19518,29 @@ mod tests {
     }
 
     #[test]
-    fn metadata_panel_activation_uses_drawn_panel_width_not_view_fraction() {
+    fn metadata_panel_activation_is_thin_edge_strip_not_panel_width() {
+        // パネルを「開く」トリガは画面右端の細いストリップ (PANEL_EDGE_TRIGGER_WIDTH)。
+        // パネル幅ぶんの広い当たり判定にすると画像の右クリックページ送りを食うため
+        // (実機 FB 2026-07)。維持はこの帯より広く panel_rect + margin が担う (別テスト不要)。
         let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3840.0, 1080.0));
         let panel = metadata_panel_rect(wide);
         let activation = metadata_panel_hover_activation_rect(wide);
-        assert!((panel.width() - METADATA_PANEL_WIDTH).abs() < 0.01);
-        assert_eq!(activation.left(), panel.left());
-        assert_eq!(activation.right(), panel.right());
+        let trigger = crate::ui_helpers::panel_edge_trigger_px(wide.width());
+        // ストリップ幅 = ビュー幅 5% トリガ、右端に接する、縦は全高。
+        assert!((trigger - 3840.0 * 0.05).abs() < 0.01, "5% = 192px");
+        assert!((activation.width() - trigger).abs() < 0.01);
+        assert_eq!(activation.right(), wide.right());
+        assert_eq!(activation.left(), wide.right() - trigger);
         assert_eq!(activation.top(), wide.top());
         assert_eq!(activation.bottom(), wide.bottom());
+        // 画面最右端では開く。
         assert!(activation.contains(egui::pos2(3839.0, 120.0)));
+        // 描画パネルの内側 (右端から 380px の帯) でも、ストリップ (5%) より内側なら
+        // 開かない = そこは画像クリック/ホイールに使える。
+        assert!(panel.width() > trigger);
         assert!(
-            !activation.contains(egui::pos2(3840.0 - 960.0 + 1.0, 120.0)),
-            "旧 right 25% 帯の左端付近では開かない"
+            !activation.contains(egui::pos2(panel.left() + 1.0, 120.0)),
+            "パネル本体の左寄り (ストリップ外) では開かない"
         );
     }
 
