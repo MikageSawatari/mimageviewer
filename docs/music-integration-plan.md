@@ -500,6 +500,17 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   - **パネルレイアウト**: 上情報バーの下〜再生コントロールの上の帯にパネルを描き、中央の
     タイムライン/スペクトラムはパネル幅ぶん横に縮める (クリック競合回避)。上バー・下シークバーは全幅維持。
   - build 緑 + bin test 3126 緑 (ui_music_panels helper 4 本) + fmt clean + glyph lint clean。
+  - **Codex レビュー完了 (5 ラウンド、P1 ゼロ)**: 反映した指摘 —
+    (P2) 音声★を一等市民化 (`RatingItemKind::Audio`=db 9 / `rating_meta_for_idx` /
+    `item_from_kind` / `item_from_plain_path` 拡張子 / `source_path_for_item` /
+    `rating_source_path` = レーティング一覧表示 + undo capture)。
+    (P2) 音声フルスクリーンで画像系ショートカット (分析/消しゴム/隠蔽/テキスト/回転/見開き 1-7,0/
+    補正スロット Ctrl+1..0/clear/比較/AI/デノイズ/ポストフィルタ/pin/capture/book/export/
+    slideshow/space/bg/spread-shift Ctrl+←→) を `!current_item_is_audio` で consume 抑止
+    (状態が次画像へ漏れる + ブックマーク改名/インポート/タグ TextEdit への文字入力奪取を防止)。
+    `I` (音楽情報パネル) と `B` (ブックマーク) は音声でも有効に残す。
+    (P3) probe 失敗時に右パネルが「取得しています…」で固着しない (worker 終了後は「取得できません
+    でした」)。(P3) インポートは成功時のみ欄をクリア/クローズ、DB 失敗ではテキストを残しエラー通知。
   - **⚠️ 実機未検証**: 実ファイル再生中のタグ編集 / ★ / ブックマーク追加・ジャンプ・改名・
     インポート/エクスポート / 音楽情報表示はユーザーの GUI 目視待ち（FFmpeg DLL + 実ファイル要）。
   - **未リリース = マイグレーション不要**（新機能。動画ブックマーク DB へ path キーで相乗り）。
