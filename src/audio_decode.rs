@@ -44,6 +44,17 @@ pub fn analyze_audio_file(
     path: &Path,
     cancel: &AtomicBool,
 ) -> Result<music_core::TimelineAnalysis, String> {
+    analyze_audio_file_with_config(path, cancel, music_core::AnalysisConfig::default())
+}
+
+/// `analyze_audio_file` の解析 config を明示する版。音楽ビュー (Inc 3) はラボと同じ
+/// 細かい bin (`bin_secs = 0.010`) でタイムラインを描くため、default より高解像度の
+/// config を渡す。decode → `analyze_stereo_timeline` の合成は共通。
+pub fn analyze_audio_file_with_config(
+    path: &Path,
+    cancel: &AtomicBool,
+    config: music_core::AnalysisConfig,
+) -> Result<music_core::TimelineAnalysis, String> {
     let decoded = decode_audio_file_to_stereo_f32(path, cancel)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".to_string());
@@ -51,7 +62,7 @@ pub fn analyze_audio_file(
     Ok(music_core::analyze_stereo_timeline(
         &decoded.stereo_samples,
         decoded.info.sample_rate,
-        music_core::AnalysisConfig::default(),
+        config,
     ))
 }
 

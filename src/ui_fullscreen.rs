@@ -18952,6 +18952,13 @@ impl App {
         };
         painter.rect_filled(rect, 0.0, bg);
 
+        // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
+        if let Some(GridItem::Audio(p)) = self.items.get(fs_idx) {
+            let p = p.clone();
+            self.ensure_music_analysis(&p);
+        }
+        self.poll_music_analysis(ctx);
+
         let (pos, dur, playing, err) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => (
                 player.position().max(0.0),
@@ -18990,23 +18997,87 @@ impl App {
             return;
         }
 
-        // 中央: 音楽アイコン + ファイル名。
-        let icon_side = rect.width().min(rect.height()) * 0.3;
-        let icon_rect = egui::Rect::from_center_size(
-            rect.center() - egui::vec2(0.0, rect.height() * 0.08),
-            egui::vec2(icon_side, icon_side),
-        );
-        crate::ui_helpers::draw_music_icon(&painter, icon_rect, dark);
-        painter.text(
-            egui::pos2(rect.center().x, icon_rect.bottom() + 26.0),
-            egui::Align2::CENTER_CENTER,
-            &name,
-            egui::FontId::proportional(20.0),
-            fg,
+        // ── 中央領域: 解析が揃っていれば DJ 風タイムライン、無ければ音楽アイコン + 状態。──
+        let top_h = 34.0;
+        // 下部の再生ボタン + シークバー (後述) の上端。タイムラインはそこまでに収める。
+        let controls_region_top = rect.bottom() - 90.0;
+        let central_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + top_h),
+            egui::pos2(
+                rect.right(),
+                controls_region_top.max(rect.top() + top_h + 1.0),
+            ),
         );
 
+        let show_timeline = self
+            .music_analysis
+            .as_ref()
+            .is_some_and(|a| !a.bins.is_empty());
+        if show_timeline {
+            // タイムラインは複数行 (row) になり中央領域より高くなるので ScrollArea で縦スクロール。
+            // 子 UI は常に DARK visuals (フルスクリーン内は黒背景ベース統一)。
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(central_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            child.set_clip_rect(central_rect);
+            *child.visuals_mut() = egui::Visuals::dark();
+            let row_secs = self.music_timeline_row_secs;
+            let analysis = self.music_analysis.as_ref().unwrap();
+            let cache = &mut self.music_timeline_cache;
+            let follow = &mut self.music_timeline_follow;
+            let mut seek_req = None;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .id_salt(("music_timeline", fs_idx))
+                .show(&mut child, |ui| {
+                    seek_req = crate::ui_music_timeline::draw_music_timeline(
+                        ui, analysis, dur, pos, playing, follow, cache, row_secs, dark,
+                    );
+                });
+            if let Some(s) = seek_req
+                && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+            {
+                player.seek(s);
+            }
+        } else {
+            // 中央: 音楽アイコン + ファイル名 + 状態 (解析中 / エラー)。
+            let icon_side = rect.width().min(rect.height()) * 0.3;
+            let icon_rect = egui::Rect::from_center_size(
+                central_rect.center() - egui::vec2(0.0, central_rect.height() * 0.06),
+                egui::vec2(icon_side, icon_side),
+            );
+            crate::ui_helpers::draw_music_icon(&painter, icon_rect, dark);
+            painter.text(
+                egui::pos2(central_rect.center().x, icon_rect.bottom() + 26.0),
+                egui::Align2::CENTER_CENTER,
+                &name,
+                egui::FontId::proportional(20.0),
+                fg,
+            );
+            let status = if let Some(e) = self.music_analysis_error.as_deref() {
+                Some((
+                    format!("解析に失敗しました: {e}"),
+                    egui::Color32::from_rgb(230, 140, 140),
+                ))
+            } else if self.music_analysis_pending.is_some() || self.music_analysis.is_none() {
+                Some(("波形を解析しています…".to_string(), fg))
+            } else {
+                None
+            };
+            if let Some((text, color)) = status {
+                painter.text(
+                    egui::pos2(central_rect.center().x, icon_rect.bottom() + 52.0),
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    egui::FontId::proportional(15.0),
+                    color,
+                );
+            }
+        }
+
         // 上情報バー (常時): ファイル名 + 位置/長さ。
-        let top_h = 34.0;
         let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
         painter.rect_filled(
             top_rect,
@@ -19027,6 +19098,44 @@ impl App {
             egui::FontId::proportional(14.0),
             fg,
         );
+
+        // Row 秒数切替 (タイムライン表示中のみ、上バー中央)。クリックで次の選択肢へ巡回。
+        // row_secs が変わると texture_key が変わり raster cache が自動で作り直される。
+        if show_timeline {
+            let label = format!(
+                "Row {}",
+                crate::ui_music_timeline::format_row_secs(self.music_timeline_row_secs)
+            );
+            let row_rect = egui::Rect::from_center_size(
+                egui::pos2(top_rect.center().x, top_rect.center().y),
+                egui::vec2(92.0, top_h - 10.0),
+            );
+            let resp = ui.interact(
+                row_rect,
+                ui.id().with(("music_row_secs", fs_idx)),
+                egui::Sense::click(),
+            );
+            painter.rect_filled(
+                row_rect,
+                4.0,
+                if resp.hovered() {
+                    accent
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, if dark { 20 } else { 36 })
+                },
+            );
+            painter.text(
+                row_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(13.0),
+                fg,
+            );
+            if resp.clicked() {
+                self.music_timeline_row_secs =
+                    crate::ui_music_timeline::next_row_secs(self.music_timeline_row_secs);
+            }
+        }
 
         // 下シークバー (常時、クリック/ドラッグでシーク)。
         let bar_h = 10.0;

@@ -3107,6 +3107,65 @@ pub(crate) struct GridEditBadges {
     pub rotation: bool,
 }
 
+/// 音楽ビュー (Inc 3b) のタイムライン解析ワーカーのハンドル。
+/// `analyze_audio_file_with_config` を背景スレッドで走らせ、`audio_analysis.db` を参照/保存する
+/// (docs/music-integration-plan.md §5.3 / D9)。UI スレッドは `poll_music_analysis` で受信するだけ。
+pub(crate) struct MusicAnalysisPending {
+    /// 解析対象パス (完了時の取り違え防止に使う)。
+    pub(crate) path: PathBuf,
+    /// キャンセルトークン。新しいファイルを開いたら旧ワーカーを止める。
+    pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 解析結果 (成功=TimelineAnalysis / 失敗=メッセージ) を受け取るチャネル。
+    pub(crate) rx: std::sync::mpsc::Receiver<Result<music_core::TimelineAnalysis, String>>,
+}
+
+/// 音楽ビュー解析ワーカーの本体 (背景スレッドで実行、UI 非依存)。
+///
+/// `audio_analysis.db` のキャッシュ参照 → miss なら FFmpeg decode + `analyze_stereo_timeline`
+/// → DB 保存の順。`std::fs::metadata` と SQLite open はここ (worker) で行うので UI スレッドは
+/// 触らない。`cancel` は decode 中と各節目で確認する。
+fn run_music_analysis(
+    path: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<music_core::TimelineAnalysis, String> {
+    use std::sync::atomic::Ordering;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    // DB キー用の size / mtime (folder_scan と同じ秒精度)。取得できなければ cache を諦めて
+    // 解析だけ行う (size==0 を「キャッシュ不可」の印にする)。
+    let (size, mtime) = match std::fs::metadata(path) {
+        Ok(m) => (m.len() as i64, crate::ui_helpers::mtime_secs(&m)),
+        Err(_) => (0, 0),
+    };
+    let path_str = path.to_string_lossy().to_string();
+    let db = crate::audio_analysis_db::AudioAnalysisDb::open().ok();
+
+    // cache hit なら decode せず即返す。
+    if size != 0
+        && let Some(db) = db.as_ref()
+        && let Some(ta) = db.get(&path_str, size, mtime)
+    {
+        return Ok(ta);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+
+    let config = music_core::AnalysisConfig {
+        bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
+        ..music_core::AnalysisConfig::default()
+    };
+    let ta = crate::audio_decode::analyze_audio_file_with_config(path, cancel, config)?;
+
+    if size != 0
+        && let Some(db) = db.as_ref()
+    {
+        let _ = db.set(&path_str, size, mtime, &ta);
+    }
+    Ok(ta)
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -5080,6 +5139,20 @@ pub struct App {
     /// 動画ミュートのセッション内状態。HUD 操作時は settings.video_muted に保存し、
     /// 次の VideoPlayer 作成時にも引き継ぐ。
     pub(crate) video_session_muted: bool,
+    /// 音楽ビュー (Inc 3b) の解析対象パス。開いているファイルが変わったら worker を作り直す。
+    pub(crate) music_analysis_path: Option<PathBuf>,
+    /// 音楽ビューのタイムライン解析結果 (cache hit または worker 完了で埋まる)。
+    pub(crate) music_analysis: Option<music_core::TimelineAnalysis>,
+    /// 解析に失敗したときのエラーメッセージ (中央に表示)。
+    pub(crate) music_analysis_error: Option<String>,
+    /// 実行中の解析ワーカー (cancel + mpsc)。
+    pub(crate) music_analysis_pending: Option<MusicAnalysisPending>,
+    /// row raster worker + texture cache。開くファイルが変わったら clear。
+    pub(crate) music_timeline_cache: crate::ui_music_timeline::TimelineTextureCache,
+    /// タイムライン 1 行あたりの秒数 (Row 切替で巡回)。
+    pub(crate) music_timeline_row_secs: f64,
+    /// 再生カーソル行の自動追従。手動スクロールで false、可視復帰で true。
+    pub(crate) music_timeline_follow: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -6878,6 +6951,13 @@ impl App {
             cursor_hidden: false,
             video_playback_speed,
             video_session_muted,
+            music_analysis_path: None,
+            music_analysis: None,
+            music_analysis_error: None,
+            music_analysis_pending: None,
+            music_timeline_cache: crate::ui_music_timeline::TimelineTextureCache::default(),
+            music_timeline_row_secs: crate::ui_music_timeline::MUSIC_ROW_SECS_DEFAULT,
+            music_timeline_follow: true,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -29993,6 +30073,91 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
+    /// 音楽ビューを開いている間、対象パスのタイムライン解析を確実に走らせる (Inc 3b)。
+    ///
+    /// 契機は「音楽ビューを開いたとき」。フォルダ閲覧のたびに全音声を pre-decode するのは
+    /// 無駄なので、ここで初めて起動する (docs/music-integration-plan.md Inc 3)。開いている
+    /// ファイルが変わったら旧ワーカーを cancel し、row raster cache を clear して作り直す。
+    ///
+    /// DB 参照 (`audio_analysis.db`) と `std::fs::metadata` の同期 I/O は **ワーカー内**で行う
+    /// (UI スレッド同期 I/O 禁止、docs/ui-responsiveness.md §4)。cache hit なら 1 poll で即表示、
+    /// miss なら decode+analyze 完了まで待つ。
+    pub(crate) fn ensure_music_analysis(&mut self, path: &std::path::Path) {
+        if self.music_analysis_path.as_deref() == Some(path) {
+            return; // 同じファイル: worker/結果を保持したまま。
+        }
+
+        // ── ファイルが変わった: 旧状態を全て捨てる ──
+        self.cancel_music_analysis();
+        self.music_timeline_cache.clear();
+        self.music_timeline_follow = true;
+        self.music_analysis = None;
+        self.music_analysis_error = None;
+        self.music_analysis_path = Some(path.to_path_buf());
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<Result<music_core::TimelineAnalysis, String>>();
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let worker_path = path.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("miv-music-analysis".into())
+            .spawn(move || {
+                let result = run_music_analysis(&worker_path, &worker_cancel);
+                // cancel 済みなら受信側は既に rx を drop しているので send 失敗は無視。
+                let _ = tx.send(result);
+            });
+        if spawned.is_ok() {
+            self.music_analysis_pending = Some(MusicAnalysisPending {
+                path: path.to_path_buf(),
+                cancel,
+                rx,
+            });
+        }
+    }
+
+    /// 解析ワーカーの結果を 1 フレームで取り込む (UI スレッド)。pending 中は repaint を要求。
+    pub(crate) fn poll_music_analysis(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.music_analysis_pending.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(result) => {
+                // 取り違え防止: 完了したワーカーのパスが現在の対象と一致するときだけ採用。
+                let matches = self.music_analysis_path.as_deref() == Some(pending.path.as_path());
+                self.music_analysis_pending = None;
+                if matches {
+                    match result {
+                        Ok(analysis) => {
+                            self.music_analysis = Some(analysis);
+                            self.music_analysis_error = None;
+                        }
+                        Err(e) => {
+                            self.music_analysis = None;
+                            self.music_analysis_error = Some(e);
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // まだ解析中: 次フレームで再ポーリングする。
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.music_analysis_pending = None;
+            }
+        }
+    }
+
+    /// 実行中の解析ワーカーを cancel する (music ビューを閉じる / 別ファイルに移るとき)。
+    pub(crate) fn cancel_music_analysis(&mut self) {
+        if let Some(pending) = self.music_analysis_pending.take() {
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。
     ///
     /// 音楽ビュー (D3) は egui で描くので GPU 映像経路 (`gpu_video_device`) と native
@@ -31228,6 +31393,13 @@ impl App {
         self.slideshow_popup_open = false;
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
+        // 音楽ビュー (Inc 3b) の解析ワーカー + row raster worker を止めて状態を捨てる
+        // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
+        self.cancel_music_analysis();
+        self.music_timeline_cache.clear();
+        self.music_analysis = None;
+        self.music_analysis_error = None;
+        self.music_analysis_path = None;
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
         // 開いたとき分析モードのまま起動してしまう (fullscreen_idx がまだ有効なうちに呼ぶ)。
         if self.analysis_mode {
