@@ -319,6 +319,58 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - **Inc 7 との関係**: 共通化しておくと Inc 7（動画→音声モード）で映像をカットして音声モードに
   切り替えても HUD/パネルが同一コードで描かれ、切替前後の視覚ジャンプが起きない。
 
+#### 5.8.1 実装 handoff（2026-07-02、動画HUD描画のマップ結果 = 次セッションの着手点）
+
+動画 native overlay の描画構造を調査した結果。共有モジュール（新設 `src/video/hud_drawing/`（仮）
+または `src/ui_music_panels.rs` から呼べる `pub(crate)` 群）へ抽出する際の起点。
+
+**すでに独立関数（純 egui・そのまま共有しやすい）**（`src/video/native_presenter/overlay_draw.rs`）:
+- `draw_native_top_bar(...)`（:2520 付近）+ `draw_native_top_button(...)`（:1344）+ 各 `draw_overlay_*_icon`
+  （play/pause/replay/loop/continuous/skip_to_marker/arrow/save/camera/close/window_toggle/tile/perf/vst3、
+  `draw_overlay_button_bg`）。アイコンは全部 painter だけの純関数。
+- `draw_native_jump_panel(...)`（:390）+ `draw_native_jump_row(...)`（:586）= 左ジャンプ/ブックマークパネル。
+  per-row = サムネ + 種別ラベル(PIN/BM/CH) + 時刻 + タイトル + 編集/削除ボタン。クリックで `Seek`。
+- `draw_native_bulk_bookmark_dialog(...)`（:1059、サイズ計算 `native_bulk_bookmark_dialog_size` :890）= 一括登録
+  ダイアログ。egui `TextEdit::multiline` + `parse_chapter_text` プレビュー + 登録/エクスポート/全削除。
+  **IME は標準 egui TextEdit + `pending_paste` フィールド経由**（presenter 非依存）。
+- コマンドは全部 `commands: &mut Vec<NativeOverlayCommand>` に push する分離構造 → 音楽側は同じ関数を
+  呼び、発行 command を music の実操作（`music_seek_to`/`add_music_bookmark_at_current`/`delete_music_bookmark`/
+  `rename_music_bookmark`/`import_music_bookmarks`/`export_music_bookmarks`）へ翻訳するアダプタを書くだけ。
+
+**モノリシック（inline、要抽出）**: 下 HUD コントロール行（replay/play/loop/continuous/prev-next file/
+prev-next marker/capture palette + 右クラスタ: 時間 / 速度ボタン+ポップアップ / mute / normalize /
+音量スライダー(dB 表示)）は `src/video/native_presenter/mod.rs` の `NativeEguiOverlay::run` に
+**ベタ書き（おおよそ :6184-7587）**。シーク行（バー + マーカー + ホバーサムネ）も同 Area 内 inline。
+→ 抽出が最重量。state スナップショット（position/duration/is_playing/volume/muted/playback_speed/
+loop_mode/continuous_mode）+ command sink を取る関数へ切り出す。速度ポップアップと音量スライダーは
+inline のカスタム描画（標準 egui slider ではない）。
+
+**共有しないバリア（動画専用＝音楽側は無視/省略）**: コンパクション階層（幅でボタン間引き。純関数
+`calc_tier(width)` に切り出し、音楽は常に Full か指定 tier）/ `last_drawn_*_rect`（native HWND の
+SetWindowRgn 用。関数は rect を返し、呼び出し側が使うか無視するか決める）/ ホバーサムネ texture
+（native の wgpu surface 依存。`Option<TextureId>` を渡し音楽は None）/ Perf グラフ / VST3 パネル /
+normalize 進捗ダイアログ / 動画のみの prev-next file・capture palette。
+
+**⚠️ command 名は実 enum で要確認**（マップ調査は近似名を報告）。実際は `ToggleLoop`/`ToggleContinuous`/
+`JumpMarker{next}`/`NavigateItem{delta}`/`SetPlaybackSpeed`/`SetVolume{volume,persist}`/`ToggleMute`/
+`SetRating`/`AddBookmarkAt`/`DeleteBookmark`/`SetBookmarkTitle`/`BulkAddBookmarks`/
+`ExportBookmarksToClipboard`/`ClearAllBookmarksForCurrent` 等（`src/video/native_presenter/mod.rs` の
+`NativeOverlayCommand` 定義を参照）。
+
+**推奨増分順（各段: build + test + Codex、動画側はバイト等価維持）**:
+- **Inc 5c-A（左ブックマークパネル + 一括ダイアログ + IME）**: 最も自己完結 + IME 修正を兼ねる。
+  `draw_native_jump_panel`/`draw_native_jump_row`/`draw_native_bulk_bookmark_dialog` を共有化
+  （サムネ列・ピン/チャプター欄を出す/出さないのフラグを追加 = 音声はブックマークのみ）。音楽ビューの
+  現行 `draw_fs_music_bookmarks_panel` を置換。IME は動画同様 egui TextEdit + paste 経路に揃う。
+- **Inc 5c-B（下 HUD コントロール行）**: モノリスを state スナップショット + command sink 関数へ抽出。
+  速度ポップアップ・音量スライダー(dB 表示)・各ボタンを共有。動画/音楽の両方が呼ぶ。②③解消。
+- **Inc 5c-C（上バー）**: `draw_native_top_bar` を音楽の上バーに流用（音楽向けにボタン集合を調整。
+  Row stepper は音楽専用で足す）。
+- **Inc 5c-D（シーク行）**: seek 行を共有関数へ。
+
+現行の音楽ビュー暫定 UI（`ui_music_panels.rs` の `draw_music_bottom_hud` / `draw_fs_music_*_panel`）は
+この共有版へ順次置換していく。置換完了までは暫定 UI が動く（ユーザー「仮なら可」）。
+
 ---
 
 ## 6. 永続化設計（D8 / D11）
