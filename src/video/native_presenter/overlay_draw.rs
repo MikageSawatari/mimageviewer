@@ -923,6 +923,11 @@ pub(crate) fn draw_native_bookmark_title_editor(
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
+            // ボタン / TextEdit など ambient テーマ依存ウィジェットをダーク配色で描く。
+            // 動画 native overlay は egui 既定 (= ダーク) の ctx なので no-op = バイト等価。
+            // 音楽ビューはメイン ctx でアプリテーマが Light だと既定 Light になり、暗い
+            // ダイアログ枠に白ボタン/白 TextEdit が乗る不具合になるため明示する (Inc 5c-A FB)。
+            *ui.visuals_mut() = egui::Visuals::dark();
             egui::Frame::new()
                 .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
@@ -1155,6 +1160,9 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
+    // 「現在の{subject_noun}に登録されている…」「この{subject_noun}のブックマークをすべて削除」で
+    // 使う対象メディアの名詞。動画は "動画" (従来どおり = バイト等価)、音楽ビューは "音声"。
+    subject_noun: &str,
     dialog: &mut Option<NativeBulkBookmarkDialog>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> Option<egui::Rect> {
@@ -1198,6 +1206,10 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
+            // ボタン / TextEdit / checkbox など ambient テーマ依存ウィジェットをダーク配色で
+            // 描く。動画は egui 既定 (ダーク) ctx なので no-op = バイト等価。音楽ビューは
+            // メイン ctx で Light テーマだと白ウィジェットになるため明示する (Inc 5c-A FB)。
+            *ui.visuals_mut() = egui::Visuals::dark();
             egui::Frame::new()
                 .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
@@ -1348,10 +1360,10 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
                     ui.horizontal(|ui| {
                         if ui
                             .button("一覧をクリップボードにコピー")
-                            .on_hover_text(
-                                "現在の動画に登録されているブックマークを「mm:ss タイトル」\n\
-                                 形式の行ごとにクリップボードへコピーします。",
-                            )
+                            .on_hover_text(format!(
+                                "現在の{subject_noun}に登録されているブックマークを「mm:ss タイトル」\n\
+                                 形式の行ごとにクリップボードへコピーします。"
+                            ))
                             .clicked()
                         {
                             request_export = true;
@@ -1373,7 +1385,8 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
                     );
                     ui.add_space(4.0);
                     if !state.confirm_clear_all {
-                        let resp = ui.button("この動画のブックマークをすべて削除");
+                        let resp =
+                            ui.button(format!("この{subject_noun}のブックマークをすべて削除"));
                         if resp.clicked() {
                             request_clear_all = true;
                         }

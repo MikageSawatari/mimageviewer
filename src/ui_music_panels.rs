@@ -466,6 +466,10 @@ impl App {
                 .fixed_pos(panel_rect.min)
                 .show(ctx, |ui| {
                     ui.set_min_size(panel_rect.size());
+                    // ScrollArea スクロールバー等の ambient テーマ依存要素を、動画 overlay
+                    // (既定ダーク ctx) と揃えてダーク描画する。メイン ctx が Light テーマでも
+                    // 暗いパネル上に明色スクロールバーが出ないようにする。
+                    *ui.visuals_mut() = egui::Visuals::dark();
                     draw_native_jump_panel_body(
                         ui,
                         panel_rect,
@@ -517,6 +521,7 @@ impl App {
                 ctx,
                 full_rect.width(),
                 full_rect.height(),
+                "音声",
                 &mut bulk,
                 &mut commands,
             );
