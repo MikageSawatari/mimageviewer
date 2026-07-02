@@ -166,6 +166,143 @@ fn normalize_layout(layout: ffmpeg::ChannelLayout<'_>) -> ffmpeg::ChannelLayout<
     }
 }
 
+/// 音声ファイルのソースメタ情報 (avformat probe)。
+///
+/// 再生用デコード (`decode_audio_file_to_stereo_f32`) は 48kHz stereo に正規化するので、
+/// そこから取れる sample_rate / channels は**ソース値ではない**。右パネルの「音楽情報」
+/// 表示にはソースの container / codec / 実 sample rate / channels / bitrate / duration /
+/// 埋め込みメタタグが要るため、デコードとは別にこの軽量 probe (ヘッダ読みのみ・PCM
+/// デコードしない) で取る。埋め込みメタは FFmpeg avformat の標準メタデータ
+/// (CLAUDE.md「外部ツール名の非言及」に従い実装詳細のみ)。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioProbe {
+    /// コンテナ形式の説明 (取れなければ短縮名)。
+    pub format_name: String,
+    /// 音声コーデック名。
+    pub codec_name: String,
+    /// ソースのサンプルレート (Hz)。
+    pub sample_rate: u32,
+    /// ソースのチャンネル数。
+    pub channels: u16,
+    /// 平均ビットレート (bps)。コンテナ値優先、無ければストリーム値。
+    pub bit_rate_bps: i64,
+    /// 長さ (秒)。
+    pub duration_secs: f64,
+    /// 埋め込みメタタグ (表示ラベル, 値) を表示順で保持。
+    pub tags: Vec<(String, String)>,
+}
+
+/// 表示する埋め込みメタの (メタキー小文字, 日本語ラベル) を表示順で並べたもの。
+const AUDIO_PROBE_TAG_KEYS: &[(&str, &str)] = &[
+    ("title", "タイトル"),
+    ("artist", "アーティスト"),
+    ("album", "アルバム"),
+    ("album_artist", "アルバムアーティスト"),
+    ("composer", "作曲"),
+    ("date", "年"),
+    ("genre", "ジャンル"),
+    ("track", "トラック"),
+    ("disc", "ディスク"),
+    ("publisher", "発行"),
+    ("comment", "コメント"),
+];
+
+/// 音声ファイルのソースメタ情報を probe する (PCM デコードしない軽量読み)。
+///
+/// UI スレッドから直接呼ばず、解析ワーカー (`run_music_analysis`) の背景スレッドで実行する
+/// こと (avformat の open + ヘッダ読みはブロッキング I/O)。
+pub fn probe_audio_file(path: &Path) -> Result<AudioProbe, String> {
+    ensure_ffmpeg_init();
+
+    let pb = path.to_path_buf();
+    let ictx = ffmpeg::format::input(&pb).map_err(|e| format!("format::input: {e}"))?;
+
+    // メタデータ (キー小文字, 値) を format-level + audio stream-level から集める。
+    // FLAC / OGG などはタグをストリーム側に持つので両方拾う。format が優先されるよう
+    // format-level を先に入れ、重複キーは最初の値を採用する。
+    let mut meta: Vec<(String, String)> = Vec::new();
+    let mut push_meta = |k: &str, v: &str| {
+        let key = k.trim().to_lowercase();
+        if key.is_empty() || v.trim().is_empty() {
+            return;
+        }
+        if meta.iter().any(|(existing, _)| existing == &key) {
+            return;
+        }
+        meta.push((key, v.trim().to_string()));
+    };
+    for (k, v) in ictx.metadata().iter() {
+        push_meta(k, v);
+    }
+
+    // 音声ストリームから codec / sample rate / channels / stream bitrate を取る。
+    let (codec_name, sample_rate, channels, stream_bit_rate) = {
+        let stream = ictx
+            .streams()
+            .best(ffmpeg::media::Type::Audio)
+            .ok_or_else(|| "音声ストリームが見つかりません".to_string())?;
+        for (k, v) in stream.metadata().iter() {
+            push_meta(k, v);
+        }
+        let params = stream.parameters();
+        let stream_bit_rate = params.bit_rate();
+        let ctx = ffmpeg::codec::context::Context::from_parameters(params)
+            .map_err(|e| format!("codec context: {e}"))?;
+        let codec_name = ctx.id().name().to_string();
+        let dec = ctx
+            .decoder()
+            .audio()
+            .map_err(|e| format!("audio decoder: {e}"))?;
+        (
+            codec_name,
+            dec.rate(),
+            dec.ch_layout().channels() as u16,
+            stream_bit_rate,
+        )
+    };
+
+    let format_name = {
+        let f = ictx.format();
+        let desc = f.description();
+        if desc.is_empty() {
+            f.name().to_string()
+        } else {
+            desc.to_string()
+        }
+    };
+    let duration = ictx.duration();
+    let duration_secs = if duration > 0 {
+        duration as f64 / 1_000_000.0
+    } else {
+        0.0
+    };
+    let container_bit_rate = ictx.bit_rate();
+    let bit_rate_bps = if container_bit_rate > 0 {
+        container_bit_rate
+    } else {
+        stream_bit_rate
+    };
+
+    let tags = AUDIO_PROBE_TAG_KEYS
+        .iter()
+        .filter_map(|(key, label)| {
+            meta.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| (label.to_string(), v.clone()))
+        })
+        .collect();
+
+    Ok(AudioProbe {
+        format_name,
+        codec_name,
+        sample_rate,
+        channels,
+        bit_rate_bps,
+        duration_secs,
+        tags,
+    })
+}
+
 /// decoder に溜まったフレームを `receive_frame` で全て取り出し、resample して `out` へ。
 fn drain_decoder(
     decoder: &mut ffmpeg::decoder::Audio,

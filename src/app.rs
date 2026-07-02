@@ -3115,6 +3115,9 @@ pub(crate) enum MusicAnalysisMsg {
     /// `SpectrumAnalyzer` に食わせる。cpal ring buffer は約 100ms 分しか無く ±1 秒窓に足りない
     /// ため、ラボと同じく展開済み PCM をスライスする (§11「ring buffer tap の口」= 案A)。
     Pcm(std::sync::Arc<crate::ui_music_spectrum::MusicPcm>),
+    /// 右パネルの「音楽情報」表示用のソースメタ (Inc 5)。container / codec / 実 sample rate /
+    /// channels / bitrate / duration / 埋め込みメタ。デコードより先に軽量 probe で送る。
+    Probe(crate::audio_decode::AudioProbe),
 }
 
 /// 音楽ビュー (Inc 3b) のタイムライン解析ワーカーのハンドル。
@@ -3153,6 +3156,15 @@ fn run_music_analysis(
     };
     let path_str = path.to_string_lossy().to_string();
     let db = crate::audio_analysis_db::AudioAnalysisDb::open().ok();
+
+    // 右パネルの音楽情報 (Inc 5) 用に軽量 probe を先に送る。ヘッダ読みだけで PCM デコード
+    // しないので decode の完了を待たず情報を出せる。失敗しても解析は続ける。
+    if let Ok(probe) = crate::audio_decode::probe_audio_file(path) {
+        let _ = tx.send(MusicAnalysisMsg::Probe(probe));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
 
     // cache hit なら timeline を即送る (spectrum 用 PCM はこの後デコードして追送)。
     let mut timeline_sent = false;
@@ -5205,6 +5217,23 @@ pub struct App {
     pub(crate) music_pcm: Option<std::sync::Arc<crate::ui_music_spectrum::MusicPcm>>,
     /// 下段スペクトラム (Inc 4) の常駐ワーカー + 描画状態。開くファイルが変わったら clear。
     pub(crate) music_spectrum: crate::ui_music_spectrum::MusicSpectrumState,
+    /// 右パネル (Inc 5) の音楽情報。解析ワーカーが軽量 probe で追送。ファイル変更で破棄。
+    pub(crate) music_probe: Option<crate::audio_decode::AudioProbe>,
+    /// 左パネル (Inc 5): ブックマーク一覧の表示トグル。上バーのブックマークボタンで開閉。
+    pub(crate) music_bookmarks_panel_open: bool,
+    /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
+    /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
+    pub(crate) music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+    /// `music_bookmarks` をどの path 用に読んだか。fs のファイルが変わったら再取得する。
+    pub(crate) music_bookmarks_loaded_for: Option<PathBuf>,
+    /// インライン改名中のブックマーク (id, 編集中テキスト)。
+    pub(crate) music_bookmark_rename: Option<(i64, String)>,
+    /// 左パネル内のインポート欄 (貼り付け → 一括登録) の開閉。
+    pub(crate) music_bookmark_import_open: bool,
+    /// インポート欄のテキストバッファ (`mm:ss タイトル` を貼り付け)。
+    pub(crate) music_bookmark_import_text: String,
+    /// エクスポート (クリップボード) の秒単位トグル (動画の `seconds_only` と同義)。
+    pub(crate) music_bookmark_export_seconds_only: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -7012,6 +7041,14 @@ impl App {
             music_timeline_follow: true,
             music_pcm: None,
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
+            music_probe: None,
+            music_bookmarks_panel_open: false,
+            music_bookmarks: Vec::new(),
+            music_bookmarks_loaded_for: None,
+            music_bookmark_rename: None,
+            music_bookmark_import_open: false,
+            music_bookmark_import_text: String::new(),
+            music_bookmark_export_seconds_only: false,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -30156,6 +30193,7 @@ impl App {
         self.music_timeline_follow = true;
         self.music_analysis = None;
         self.music_pcm = None;
+        self.music_probe = None;
         self.music_analysis_error = None;
         self.music_analysis_path = Some(path.to_path_buf());
 
@@ -30214,6 +30252,9 @@ impl App {
                             MusicAnalysisMsg::Pcm(pcm) => {
                                 self.music_pcm = Some(pcm);
                             }
+                            MusicAnalysisMsg::Probe(probe) => {
+                                self.music_probe = Some(probe);
+                            }
                         }
                     }
                 }
@@ -30265,8 +30306,16 @@ impl App {
         self.music_spectrum.clear();
         self.music_analysis = None;
         self.music_pcm = None;
+        self.music_probe = None;
         self.music_analysis_error = None;
         self.music_analysis_path = None;
+        // ブックマークの一時状態 (キャッシュ / 改名中 / インポート欄) は破棄する。
+        // パネルの開閉 (`music_bookmarks_panel_open`) と export トグルはセッション設定として保持。
+        self.music_bookmarks.clear();
+        self.music_bookmarks_loaded_for = None;
+        self.music_bookmark_rename = None;
+        self.music_bookmark_import_open = false;
+        self.music_bookmark_import_text.clear();
     }
 
     /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。

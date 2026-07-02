@@ -450,6 +450,123 @@ impl App {
         true
     }
 
+    /// 音楽ビュー右パネル (Inc 5) 用のタグセクションを描く。
+    ///
+    /// 画像メタデータパネル (`draw_metadata_panel_inner`) と**同じ**タグ ON/OFF ボタン +
+    /// ピッカー UI を再利用する (`draw_tag_panel` / `draw_fullscreen_tag_picker_panel` は
+    /// 本モジュール private なのでこのメソッドを本モジュールに置く)。対象は現在のフルスク
+    /// リーンアイテム (= 音声ファイル) のタグ。呼び出し側 (`ui_music_panels`) が右パネル内の
+    /// 適切な `ui` (ダークスタイル + スクロール可) を渡す。IME (改名/ピッカー入力の Enter/
+    /// Escape) は `dialog_*_pressed` 経由で画像パネルと同一の扱い。
+    pub(crate) fn draw_music_tag_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // タグ行 (単一 audio target) + カタログ + ピン留めタグ + 可視選択肢を集める
+        // (draw_metadata_panel_inner と同じ構築)。
+        let tag_rows = self.collect_fullscreen_tag_panel_rows();
+        self.sync_fullscreen_tag_panel_state(&tag_rows);
+        let tag_catalog: Vec<_> = self
+            .cached_tag_choice_catalog()
+            .into_iter()
+            .map(|tag| TagPanelChoice {
+                name: tag.name,
+                tag_key: tag.tag_key,
+                count: tag.count,
+                pinned: tag.pinned,
+                last_applied_at: tag.last_applied_at,
+            })
+            .collect();
+        let pinned_tags: Vec<_> = self
+            .settings
+            .tags
+            .iter()
+            .filter(|tag| tag.show_shortcut)
+            .map(|tag| TagPanelChoice {
+                name: tag.name.clone(),
+                tag_key: tag.tag_key.clone(),
+                count: tag_catalog
+                    .iter()
+                    .find(|choice| choice.tag_key == tag.tag_key)
+                    .map(|choice| choice.count)
+                    .unwrap_or(0),
+                pinned: true,
+                last_applied_at: tag_catalog
+                    .iter()
+                    .find(|choice| choice.tag_key == tag.tag_key)
+                    .map(|choice| choice.last_applied_at)
+                    .unwrap_or(0),
+            })
+            .collect();
+        let visible_tag_choices = tag_panel_visible_choices(
+            &pinned_tags,
+            &tag_rows,
+            &self.fullscreen_tag_panel_sticky_tags,
+            &tag_catalog,
+        );
+        let show_tag_panel =
+            !visible_tag_choices.is_empty() || tag_rows.iter().any(|row| !row.targets.is_empty());
+        if !show_tag_panel {
+            return;
+        }
+
+        let mut clicked_tag: Option<(String, Vec<TagTarget>)> = None;
+        let mut set_tag: Option<(String, bool, Vec<TagTarget>)> = None;
+        let mut searched_tag: Option<String> = None;
+        let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
+        let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
+        let tag_picker_ime_active = self.ime_input_active();
+        if self.fullscreen_tag_picker_open && tag_picker_escape_pressed {
+            self.fullscreen_tag_picker_open = false;
+            self.fullscreen_tag_picker_input.clear();
+            self.fullscreen_tag_picker_row_key = None;
+            self.fullscreen_tag_picker_focus_request = false;
+            self.fullscreen_tag_picker_recent_tab = false;
+        }
+
+        apply_metadata_panel_dark_widget_style(ui);
+        if self.fullscreen_tag_picker_open {
+            draw_fullscreen_tag_picker_panel(
+                ui,
+                &tag_catalog,
+                &tag_rows,
+                &mut self.fullscreen_tag_picker_open,
+                &mut self.fullscreen_tag_picker_input,
+                &mut self.fullscreen_tag_picker_row_key,
+                &mut self.fullscreen_tag_picker_focus_request,
+                &mut self.fullscreen_tag_picker_recent_tab,
+                tag_picker_enter_pressed,
+                tag_picker_ime_active,
+                &mut set_tag,
+            );
+        } else {
+            draw_tag_panel(
+                ui,
+                &visible_tag_choices,
+                &tag_rows,
+                &mut self.fullscreen_tag_picker_open,
+                &mut self.fullscreen_tag_picker_input,
+                &mut self.fullscreen_tag_picker_row_key,
+                &mut self.fullscreen_tag_picker_focus_request,
+                &mut self.fullscreen_tag_picker_recent_tab,
+                &mut clicked_tag,
+                &mut searched_tag,
+            );
+        }
+
+        // タグボタンクリックの後処理 (closure 外で self を可変借用、画像パネルと同一経路)。
+        if let Some((tag_name, targets)) = clicked_tag {
+            self.request_tag_toggle_for_targets(&tag_name, targets);
+        }
+        if let Some((tag_name, add, targets)) = set_tag {
+            if add {
+                self.request_tag_add_for_targets(&tag_name, targets);
+            } else {
+                self.request_tag_remove_for_targets(&tag_name, targets);
+            }
+        }
+        if let Some(tag_name) = searched_tag {
+            self.open_tag_view_for_tag(&tag_name);
+        }
+    }
+
     /// 現在のフルスクリーン画像の AI メタデータを取得する。
     fn get_current_ai_metadata(&self) -> Option<AiMetadata> {
         let idx = self.fullscreen_idx?;

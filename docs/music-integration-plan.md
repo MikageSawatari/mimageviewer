@@ -343,15 +343,15 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - [x] normalize gain（既存 audio pump）（build_audio_player_for_open で cache 値適用）
 
 ### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1）
-- [ ] 一覧表示（代表サムネ・チャプターなし）
-- [ ] 現在位置に追加（`KeyAction::VideoBookmark`、既定 `B`）/ 削除 / 改名（ユーザー命名）/ クリックでジャンプ
-- [ ] インポート（動画と同一の一括登録ダイアログ + `parse_chapter_text`、`mm:ss タイトル`）
-- [ ] エクスポート（クリップボード、`format_chapter_lines` + `seconds_only` トグル）
-- [ ] シークバー上のマーカー表示
+- [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5、左パネル）
+- [x] 現在位置に追加（`KeyAction::VideoBookmark`、既定 `B`）/ 削除 / 改名（ユーザー命名）/ クリックでジャンプ（Inc 5）
+- [x] インポート（動画と同一の `parse_chapter_text` + 一括 add、左パネル内の貼り付け欄 + プレビュー）（Inc 5）
+- [x] エクスポート（クリップボード、`format_chapter_lines` + `seconds_only` トグル）（Inc 5）
+- [x] シークバー上のマーカー表示（Inc 5、黄色縦線）
 
 ### 7.6 右パネル
-- [ ] タグ chips（動画経路ミラー）/ ★ レーティング / 設定部分
-- [ ] 音楽情報（format/duration/sample rate/channels/bitrate/埋め込みメタ）
+- [x] タグ chips（画像パネルと同一 UI を再利用 `draw_music_tag_section`）/ ★ レーティング（`get_rating`/`set_rating`）（Inc 5）
+- [x] 音楽情報（format/duration/sample rate/channels/bitrate/埋め込みメタ = avformat probe）（Inc 5）
 
 ### 7.7 VST3
 - [ ] audio pump チェーン共有（normalize→VST3→limiter）
@@ -473,6 +473,37 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   - 右: 動画のタグ/★/設定経路ミラー + 音楽情報ブロック。左: ブックマーク一覧（命名/追加/削除/改名/
     ジャンプ/インポート、シークバーマーカー）。ブックマーク永続化。
   - 受け入れ: 右にタグ+設定+音楽情報、左にブックマーク一覧、命名/ジャンプ/インポート動作。
+
+  **✅ Inc 5 実装済み（2026-07-02）**:
+  - **音楽情報プローブ**: `src/audio_decode.rs::probe_audio_file` を新設。デコード
+    (`decode_audio_file_to_stereo_f32`) は 48kHz stereo に正規化してしまい `TimelineAnalysis.stream`
+    がソース値を持たないため、別途 avformat の軽量ヘッダ読みで container / codec / 実 sample rate /
+    channels / bitrate / duration / 埋め込みメタ (title/artist/album/... を curated 順) を取る
+    (`AudioProbe`)。解析ワーカー (`run_music_analysis`) が decode より先に `MusicAnalysisMsg::Probe`
+    で追送し、`App.music_probe` に保持 (ファイル変更 / `clear_music_view_state` で破棄)。
+  - **右パネル** (`src/ui_music_panels.rs::draw_fs_music_right_panel`): 音楽情報セクション + ★
+    レーティング (`get_rating`/`set_rating`、音声は `is_rating_leaf`。同じ★再クリックで解除) +
+    タグセクション。タグは**画像メタデータパネルと同一 UI を再利用**するため
+    `ui_metadata_panel.rs` に `App::draw_music_tag_section` を追加し、`draw_tag_panel` /
+    `draw_fullscreen_tag_picker_panel` / `collect_fullscreen_tag_panel_rows` /
+    `fullscreen_tag_picker_*` state をそのまま共有 (IME 扱いも画像と同一)。トグルは画像メタパネルと
+    同じ `show_metadata_panel`（上バーの "i" ボタン / 右端ホバー）。
+  - **左パネル** (`draw_fs_music_bookmarks_panel`): 動画の `VideoBookmarkDb` を path キーで共有
+    (D5.1、別テーブルを作らない)。一覧 (時刻クリックでジャンプ) / ＋現在位置 / インライン改名
+    (lost_focus で確定、IME 安全) / 削除 / インポート (貼り付け欄 + `parse_chapter_text` プレビュー +
+    一括 add) / エクスポート (`format_chapter_lines` + 秒単位トグル)。上バー左のリボンボタンで開閉。
+  - **シークバーマーカー**: 現在ファイルのブックマークを黄色縦線で表示 (左パネルが閉じていても
+    `ensure_music_bookmarks_loaded` で常時ロード)。
+  - **B キー**: `handle_video_input` は `GridItem::Video` 限定なので、音声は `handle_fs_key_input` に
+    `KeyAction::VideoBookmark`（既定 `B`）分岐を追加。TextEdit フォーカス中 (`wants_keyboard_input`) /
+    IME 中 / コンテキストメニュー中は無効化。
+  - **パネルレイアウト**: 上情報バーの下〜再生コントロールの上の帯にパネルを描き、中央の
+    タイムライン/スペクトラムはパネル幅ぶん横に縮める (クリック競合回避)。上バー・下シークバーは全幅維持。
+  - build 緑 + bin test 3126 緑 (ui_music_panels helper 4 本) + fmt clean + glyph lint clean。
+  - **⚠️ 実機未検証**: 実ファイル再生中のタグ編集 / ★ / ブックマーク追加・ジャンプ・改名・
+    インポート/エクスポート / 音楽情報表示はユーザーの GUI 目視待ち（FFmpeg DLL + 実ファイル要）。
+  - **未リリース = マイグレーション不要**（新機能。動画ブックマーク DB へ path キーで相乗り）。
+  - **据え置き**: 「動画→音声モード」の右左パネル (Inc 7 で `VideoAudioOnly` を通す)。
 
 - **Inc 6: VST3 共有 + 上バー切替**
   - `VideoPlayer::open` に `dsp_bridge` を渡す（既存 pump が VST3 適用）。上バーに VST3 トグル + GUI トグル。

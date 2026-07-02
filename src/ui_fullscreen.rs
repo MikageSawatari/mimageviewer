@@ -5924,7 +5924,8 @@ impl App {
                         let is_music_view =
                             matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
                         if is_music_view {
-                            // 画像用パネルは描画しない (音楽ビュー専用パネルは今後 Inc 3c/5 で追加)。
+                            // 画像用パネルは描画しない。音楽ビュー専用の左右パネル (ブックマーク /
+                            // 音楽情報+タグ、Inc 5) は draw_fs_music_view が自前で描く。
                         } else if analysis_active {
                             let pixels = match self.fs_cache.get(&fs_idx) {
                                 Some(FsCacheEntry::Static { pixels, .. }) => {
@@ -7855,6 +7856,19 @@ impl App {
                 None
             };
             self.handle_video_input(ctx, fs_idx, video_path.as_deref());
+        }
+
+        // 音楽ビュー (Inc 5): B キーで現在の再生位置にブックマークを追加する
+        // (動画の `KeyAction::VideoBookmark` を共有)。ブックマーク改名 / インポート /
+        // タグピッカーの TextEdit にフォーカスがあるとき・IME 変換中・コンテキスト
+        // メニュー表示中は無効 (B の文字入力を奪わない)。
+        if matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && self.keymap.consume_action(ctx, KeyAction::VideoBookmark)
+        {
+            self.add_music_bookmark_at_current(fs_idx);
         }
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
@@ -18952,9 +18966,12 @@ impl App {
         painter.rect_filled(rect, 0.0, bg);
 
         // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
+        // ブックマーク (Inc 5) も現在ファイル用にロードしておく (左パネルが閉じていても
+        // シークバーのマーカー表示に使う)。
         if let Some(GridItem::Audio(p)) = self.items.get(fs_idx) {
             let p = p.clone();
             self.ensure_music_analysis(&p);
+            self.ensure_music_bookmarks_loaded(&p);
         }
         self.poll_music_analysis(ctx);
 
@@ -19000,6 +19017,36 @@ impl App {
         let top_h = 34.0;
         // 下部の再生ボタン + シークバー (後述) の上端。中央コンテンツはそこまでに収める。
         let controls_region_top = rect.bottom() - 90.0;
+
+        // ── 左右パネル (Inc 5) の表示判定と中央コンテンツの横幅確定 ──
+        // パネルは上情報バーの下〜再生コントロールの上の帯だけを占め、上バー / 下シークバーは
+        // 常に全幅で残す (画像フルスクリーンの左右パネルと同じレイアウト思想)。パネルが開いて
+        // いる側は中央のタイムライン/スペクトラムを縮めて重なりを避ける (クリック競合回避)。
+        let panel_band_top = rect.top() + top_h;
+        let panel_band_bottom = controls_region_top;
+        let left_panel_open = self.music_bookmarks_panel_open;
+        // 右パネルは画像メタパネルと同じく show_metadata_panel (TAB/I ピン) or 右端ホバーで開く。
+        let right_hover = ctx.input(|i| {
+            if self.cursor_hidden {
+                return false;
+            }
+            i.pointer.hover_pos().is_some_and(|p| {
+                p.x >= rect.right() - crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
+                    && p.y >= panel_band_top
+                    && p.y <= panel_band_bottom
+            })
+        });
+        let right_panel_open = self.show_metadata_panel || right_hover;
+        let content_left = if left_panel_open {
+            rect.left() + crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH
+        } else {
+            rect.left()
+        };
+        let content_right = if right_panel_open {
+            rect.right() - crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
+        } else {
+            rect.right()
+        };
         // 中央領域の下端に 108-band spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
         // 潰さないよう、帯高は「タイムライン領域を最低 MIN 残す」制約で伸縮させ、確保しても
@@ -19015,8 +19062,8 @@ impl App {
             MUSIC_SPECTRUM_MAX_H.min((band_h - MUSIC_SPECTRUM_GAP - MUSIC_TIMELINE_MIN_H).max(0.0));
         let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H;
         let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 8.0, band_bottom - spectrum_h),
-            egui::pos2(rect.right() - 8.0, band_bottom),
+            egui::pos2(content_left + 8.0, band_bottom - spectrum_h),
+            egui::pos2(content_right - 8.0, band_bottom),
         );
         let central_bottom = if show_spectrum {
             (band_bottom - spectrum_h - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
@@ -19024,8 +19071,8 @@ impl App {
             controls_region_top.max(band_top + 1.0)
         };
         let central_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), band_top),
-            egui::pos2(rect.right(), central_bottom),
+            egui::pos2(content_left, band_top),
+            egui::pos2(content_right, central_bottom),
         );
 
         let show_timeline = self
@@ -19106,22 +19153,119 @@ impl App {
             self.music_spectrum.draw(ui, spectrum_rect);
         }
 
-        // 上情報バー (常時): ファイル名 + 位置/長さ。
+        // ── 左右パネル (Inc 5) ── 中央コンテンツは既に縮めてあるので帯に重ねて描く。
+        if left_panel_open {
+            let lp = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), panel_band_top),
+                egui::pos2(
+                    rect.left() + crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH,
+                    panel_band_bottom,
+                ),
+            );
+            self.draw_fs_music_bookmarks_panel(ui, ctx, lp, fs_idx);
+        }
+        if right_panel_open {
+            let rp = egui::Rect::from_min_max(
+                egui::pos2(
+                    rect.right() - crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH,
+                    panel_band_top,
+                ),
+                egui::pos2(rect.right(), panel_band_bottom),
+            );
+            self.draw_fs_music_right_panel(ui, ctx, rp, fs_idx);
+        }
+
+        // 上情報バー (常時): [ブックマーク] ファイル名 … 位置/長さ [情報]。
         let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
         painter.rect_filled(
             top_rect,
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, if dark { 90 } else { 30 }),
         );
+        let tb_btn = top_h - 12.0;
+        let tb_btn_bg = |active: bool, hovered: bool| {
+            if active {
+                accent
+            } else if hovered {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+            }
+        };
+        // ── ブックマークパネルのトグル (左端、リボンアイコン) ──
+        let bm_rect = egui::Rect::from_min_size(
+            egui::pos2(top_rect.left() + 6.0, top_rect.center().y - tb_btn * 0.5),
+            egui::vec2(tb_btn, tb_btn),
+        );
+        let bm_resp = ui.interact(
+            bm_rect,
+            ui.id().with(("music_bookmark_toggle", fs_idx)),
+            egui::Sense::click(),
+        );
+        painter.rect_filled(
+            bm_rect,
+            4.0,
+            tb_btn_bg(self.music_bookmarks_panel_open, bm_resp.hovered()),
+        );
+        // リボン (下部に V ノッチ) を painter で描く (フォント非依存、CLAUDE.md グリフポリシー)。
+        {
+            let r = bm_rect.shrink(6.0);
+            let notch = r.height() * 0.32;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    egui::pos2(r.center().x, r.bottom() - notch),
+                    r.left_bottom(),
+                ],
+                fg,
+                egui::Stroke::NONE,
+            ));
+        }
+        let bm_resp = bm_resp.on_hover_text("ブックマーク一覧");
+        if bm_resp.clicked() {
+            self.music_bookmarks_panel_open = !self.music_bookmarks_panel_open;
+        }
+        // ── 情報パネルのトグル (右端、"i" アイコン) ──
+        let info_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                top_rect.right() - 6.0 - tb_btn,
+                top_rect.center().y - tb_btn * 0.5,
+            ),
+            egui::vec2(tb_btn, tb_btn),
+        );
+        let info_resp = ui.interact(
+            info_rect,
+            ui.id().with(("music_info_toggle", fs_idx)),
+            egui::Sense::click(),
+        );
+        painter.rect_filled(
+            info_rect,
+            4.0,
+            tb_btn_bg(self.show_metadata_panel, info_resp.hovered()),
+        );
         painter.text(
-            top_rect.left_center() + egui::vec2(12.0, 0.0),
+            info_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "i",
+            egui::FontId::proportional(15.0),
+            fg,
+        );
+        let info_resp = info_resp.on_hover_text("音楽情報 / タグ [Tab]");
+        if info_resp.clicked() {
+            self.show_metadata_panel = !self.show_metadata_panel;
+        }
+        // ファイル名 (ブックマークボタンの右) / 位置・長さ (情報ボタンの左)。
+        painter.text(
+            egui::pos2(bm_rect.right() + 8.0, top_rect.center().y),
             egui::Align2::LEFT_CENTER,
             &name,
             egui::FontId::proportional(14.0),
             fg,
         );
         painter.text(
-            top_rect.right_center() - egui::vec2(12.0, 0.0),
+            egui::pos2(info_rect.left() - 8.0, top_rect.center().y),
             egui::Align2::RIGHT_CENTER,
             format!("{} / {}", music_fmt_time(pos), music_fmt_time(dur)),
             egui::FontId::proportional(14.0),
@@ -19240,6 +19384,21 @@ impl App {
                 egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),
             );
             painter.rect_filled(filled, bar_h * 0.5, accent);
+        }
+        // ブックマークマーカー (Inc 5): シークバー上に黄色の縦線で位置を示す。
+        if dur > 0.0 {
+            let marker_color = egui::Color32::from_rgb(255, 220, 82);
+            for bm in &self.music_bookmarks {
+                let f = (bm.pts_secs / dur).clamp(0.0, 1.0) as f32;
+                let x = bar_rect.left() + bar_rect.width() * f;
+                painter.line_segment(
+                    [
+                        egui::pos2(x, bar_rect.top() - 5.0),
+                        egui::pos2(x, bar_rect.bottom() + 5.0),
+                    ],
+                    egui::Stroke::new(2.0, marker_color),
+                );
+            }
         }
         let seek_resp = ui.interact(
             bar_rect.expand2(egui::vec2(0.0, 8.0)),
