@@ -19349,7 +19349,17 @@ impl App {
         // 頭出し / 再生・一時停止 / ループ / ブックマーク前後ジャンプ / 位置・長さ / 再生速度 /
         // ミュート / 音量スライダー + シークバー上のブックマークマーカー。
         let hud_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), hud_top), rect.max);
-        self.draw_music_bottom_hud(ui, hud_rect, fs_idx, pos, dur, playing, dark);
+        // 中央モーダル (改名 / 一括登録) 表示中は HUD 操作を止める (Codex 5c-A P2)。
+        self.draw_music_bottom_hud(
+            ui,
+            hud_rect,
+            fs_idx,
+            pos,
+            dur,
+            playing,
+            dark,
+            !music_modal_open,
+        );
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
         if playing {

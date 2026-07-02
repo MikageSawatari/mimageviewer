@@ -570,6 +570,7 @@ impl App {
     ///
     /// (音量ノーマライズは動画のようなスキャン UI が必要なため、この HUD には載せていない。
     /// 音量正規化は開いた時点で `audio_normalize_db` キャッシュ値が適用される。)
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_music_bottom_hud(
         &mut self,
         ui: &mut egui::Ui,
@@ -579,6 +580,10 @@ impl App {
         dur: f64,
         playing: bool,
         dark: bool,
+        // 改名 / 一括登録の中央モーダル表示中は false。HUD の見た目は描くが、操作 (seek /
+        // play / volume / bookmark ジャンプ) は適用しない。半透明バックドロップも入力を吸収
+        // するが、モーダル仕様として HUD 側でも明示的に止める (Codex 5c-A P2、多層防御)。
+        interactive: bool,
     ) {
         // 現在状態を先に読む (player 借用を短く保つ)。
         let (cur_vol, muted) = match self.fs_cache.get(&fs_idx) {
@@ -930,6 +935,10 @@ impl App {
         );
 
         // ── 操作を適用 (self / player の可変借用を分離) ──
+        // モーダル表示中は上で描いたホバー/レスポンスを無視し、一切適用しない。
+        if !interactive {
+            return;
+        }
         let next_speed = if cycle_speed {
             let i = MUSIC_SPEED_PRESETS
                 .iter()
