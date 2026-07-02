@@ -18,7 +18,7 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
-    draw_native_jump_panel_body, draw_overlay_volume_slider,
+    draw_native_jump_panel_body, draw_overlay_speed_control, draw_overlay_volume_slider,
 };
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
@@ -30,8 +30,6 @@ pub(crate) const MUSIC_LEFT_PANEL_WIDTH: f32 = 292.0;
 pub(crate) const MUSIC_RIGHT_PANEL_WIDTH: f32 = 340.0;
 /// 下 HUD の高さ (seek 行 + コントロール行、常時表示、Inc 5 FB で動画寄りに)。
 pub(crate) const MUSIC_HUD_HEIGHT: f32 = 62.0;
-/// 再生速度プリセット (コントロール行の速度ボタンで巡回)。
-const MUSIC_SPEED_PRESETS: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 const PANEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(16, 16, 20, 235);
 const PANEL_DIVIDER: egui::Color32 = egui::Color32::from_rgba_premultiplied(255, 255, 255, 40);
@@ -618,9 +616,10 @@ impl App {
         let mut toggle_play = false;
         let mut seek_start = false;
         let mut toggle_loop = false;
-        let mut cycle_speed = false;
         let mut toggle_mute = false;
         let mut set_vol: Option<f64> = None;
+        // `set_speed` は速度ボタン描画時に `draw_overlay_speed_control` の返り値で一度だけ
+        // 束縛する (他フラグと違い条件付き更新ではないため、代入時点で宣言する)。
 
         // ── seek 行 (バー + ブックマークマーカー + クリック/ドラッグ seek) ──
         let bar_margin = 16.0;
@@ -892,31 +891,39 @@ impl App {
         if mresp.clicked() {
             toggle_mute = true;
         }
-        // 速度 (クリックでプリセット巡回)
+        // 再生速度: 動画/音楽共有の speed ボタン + プリセット popup (Inc 5c-B2)。
+        // 左クリックで popup をトグル、右クリック / ダブルクリックで x1。動画と同じ 11
+        // プリセット (`PLAYBACK_SPEED_CHOICES`) / ラベル形式 (`format_playback_speed`) に揃う。
         let spd_w = 46.0;
         let spd_r = egui::Rect::from_min_size(
             egui::pos2(rx - spd_w, controls_cy - bsz * 0.5),
             egui::vec2(spd_w, bsz),
         );
         rx -= spd_w + 8.0;
-        let sresp = ui
-            .interact(
-                spd_r,
-                ui.id().with(("music_hud_speed", fs_idx)),
-                egui::Sense::click(),
-            )
-            .on_hover_text("再生速度");
-        btn_bg(spd_r, sresp.hovered(), (speed - 1.0).abs() > 1e-3);
-        painter.text(
-            spd_r.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("{}x", format_speed(speed)),
-            egui::FontId::proportional(12.0),
-            fg,
+        // モーダル中 (`!interactive`) は popup 開閉 (自 state) を汚さないようダミーに逃がす
+        // (B1 の音量と同趣旨、多層防御)。popup rect は音楽では使わないので sink に捨てる。
+        let mut dummy_speed_popup = false;
+        let speed_popup_open = if interactive {
+            &mut self.music_speed_popup_open
+        } else {
+            &mut dummy_speed_popup
+        };
+        let mut speed_popup_rect_sink = None;
+        let set_speed = draw_overlay_speed_control(
+            ui.ctx(),
+            ui,
+            &painter,
+            spd_r,
+            spd_r.center().y,
+            speed,
+            ui.id().with(("music_hud_speed", fs_idx)),
+            ui.id().with(("music_hud_speed_popup", fs_idx)),
+            hud_rect.left(),
+            hud_rect.width(),
+            hud_rect.top(),
+            speed_popup_open,
+            &mut speed_popup_rect_sink,
         );
-        if sresp.clicked() {
-            cycle_speed = true;
-        }
         // 時間 (速度ボタンの左に右寄せ)
         painter.text(
             egui::pos2(rx, controls_cy),
@@ -931,23 +938,14 @@ impl App {
         if !interactive {
             return;
         }
-        let next_speed = if cycle_speed {
-            let i = MUSIC_SPEED_PRESETS
-                .iter()
-                .position(|&s| (s - speed).abs() < 1e-3)
-                .unwrap_or(2);
-            MUSIC_SPEED_PRESETS[(i + 1) % MUSIC_SPEED_PRESETS.len()]
-        } else {
-            speed
-        };
         if seek_start {
             seek_to = Some(0.0);
         }
         if toggle_loop {
             self.music_loop_enabled = !loop_on;
         }
-        if cycle_speed {
-            self.video_playback_speed = next_speed;
+        if let Some(s) = set_speed {
+            self.video_playback_speed = s;
         }
         if toggle_mute {
             self.video_session_muted = !muted;
@@ -974,8 +972,8 @@ impl App {
             if toggle_loop {
                 player.set_loop_enabled(!loop_on);
             }
-            if cycle_speed {
-                player.set_playback_speed(next_speed);
+            if let Some(s) = set_speed {
+                player.set_playback_speed(s);
             }
             if toggle_mute {
                 player.set_muted(!muted);
@@ -1067,12 +1065,6 @@ fn draw_speaker_icon(painter: &egui::Painter, rect: egui::Rect, muted: bool, col
             egui::Stroke::new(2.0, color),
         );
     }
-}
-
-/// 再生速度を "0.5" / "1" / "1.25" 風に整形する (末尾ゼロを落とす)。
-fn format_speed(speed: f64) -> String {
-    let s = format!("{speed:.2}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[cfg(test)]

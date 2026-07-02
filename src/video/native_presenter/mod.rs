@@ -7151,125 +7151,27 @@ impl NativeEguiOverlay {
                             }
                         }
 
-                        let mut speed_resp = ui.interact(
+                        // Inc 5c-B2: speed ボタン + プリセット popup は動画/音楽共有の
+                        // `draw_overlay_speed_control` (`overlay_draw`) へ抽出。popup 位置は
+                        // overlay 座標 (left=0, width=overlay 幅, top=hud_rect.min.y) を渡す。
+                        // popup rect は native HWND の SetWindowRgn 用に
+                        // `last_drawn_speed_popup_rect` へ受け取る。
+                        if let Some(speed) = draw_overlay_speed_control(
+                            ctx,
+                            ui,
+                            painter,
                             speed_rect,
+                            text_center_y,
+                            playback_speed,
                             egui::Id::new("native_video_speed"),
-                            egui::Sense::click(),
-                        );
-                        draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
-                        painter.text(
-                            egui::pos2(speed_rect.center().x, text_center_y),
-                            egui::Align2::CENTER_CENTER,
-                            crate::video::clock::format_playback_speed(playback_speed),
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::from_rgb(238, 238, 238),
-                        );
-                        if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
-                            video_speed_popup_open = false;
-                            commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed: 1.0 });
-                        } else if speed_resp.clicked() {
-                            video_speed_popup_open = !video_speed_popup_open;
-                        }
-                        if !video_speed_popup_open {
-                            speed_resp = speed_resp
-                                .hover_tip_dark("再生速度 (右クリック / ダブルクリックで x1)");
-                        }
-                        if video_speed_popup_open {
-                            use crate::video::clock::{
-                                PLAYBACK_SPEED_CHOICES, format_playback_speed,
-                            };
-
-                            let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
-                            let speed_choice_size = egui::vec2(46.0, 24.0);
-                            let speed_choice_text_y = 4.0;
-                            let popup_h = speed_choice_size.y + 12.0;
-                            let popup_x = (speed_rect.center().x - popup_w * 0.5)
-                                .clamp(8.0, overlay_width_points - popup_w - 8.0);
-                            let popup_y = (hud_rect.min.y - popup_h - 6.0).max(8.0);
-                            let mut selected_speed = None;
-                            let popup_inner =
-                                egui::Area::new(egui::Id::new("native_video_speed_popup"))
-                                    .order(egui::Order::Foreground)
-                                    .fixed_pos(egui::pos2(popup_x, popup_y))
-                                    .show(ctx, |ui| {
-                                        egui::Frame::new()
-                                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                                0, 0, 0, 225,
-                                            ))
-                                            .stroke(egui::Stroke::new(
-                                                1.0,
-                                                egui::Color32::from_gray(110),
-                                            ))
-                                            .corner_radius(egui::CornerRadius::same(4))
-                                            .inner_margin(egui::Margin::same(6))
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(popup_w - 12.0);
-                                                ui.horizontal_wrapped(|ui| {
-                                                    for speed in PLAYBACK_SPEED_CHOICES {
-                                                        let selected =
-                                                            (playback_speed - speed).abs() < 1.0e-6;
-                                                        let label = format_playback_speed(speed);
-                                                        let (button_rect, button_resp) = ui
-                                                            .allocate_exact_size(
-                                                                speed_choice_size,
-                                                                egui::Sense::click(),
-                                                            );
-                                                        if button_resp.hovered() {
-                                                            ui.ctx().set_cursor_icon(
-                                                                egui::CursorIcon::PointingHand,
-                                                            );
-                                                        }
-                                                        let visuals =
-                                                            ui.style().interact_selectable(
-                                                                &button_resp,
-                                                                selected,
-                                                            );
-                                                        let painter = ui.painter();
-                                                        painter.rect_filled(
-                                                            button_rect,
-                                                            3.0,
-                                                            visuals.weak_bg_fill,
-                                                        );
-                                                        painter.rect_stroke(
-                                                            button_rect,
-                                                            3.0,
-                                                            visuals.bg_stroke,
-                                                            egui::StrokeKind::Inside,
-                                                        );
-                                                        painter.text(
-                                                            button_rect.center()
-                                                                + egui::vec2(
-                                                                    0.0,
-                                                                    speed_choice_text_y,
-                                                                ),
-                                                            egui::Align2::CENTER_CENTER,
-                                                            label,
-                                                            egui::TextStyle::Button
-                                                                .resolve(ui.style()),
-                                                            visuals.fg_stroke.color,
-                                                        );
-                                                        if button_resp.clicked() {
-                                                            selected_speed = Some(speed);
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                    });
-                            let popup_rect = popup_inner.response.rect;
-                            last_drawn_speed_popup_rect = Some(popup_rect);
-                            if ui.ctx().input(|i| i.pointer.any_click())
-                                && !speed_resp.hovered()
-                                && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-                            {
-                                if !popup_rect.contains(pos) {
-                                    video_speed_popup_open = false;
-                                }
-                            }
-                            if let Some(speed) = selected_speed {
-                                let speed = crate::video::clock::clamp_playback_speed(speed);
-                                video_speed_popup_open = false;
-                                commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed });
-                            }
+                            egui::Id::new("native_video_speed_popup"),
+                            0.0,
+                            overlay_width_points,
+                            hud_rect.min.y,
+                            &mut video_speed_popup_open,
+                            &mut last_drawn_speed_popup_rect,
+                        ) {
+                            commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed });
                         }
 
                         let mute_resp = ui.interact(

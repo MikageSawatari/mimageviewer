@@ -402,7 +402,18 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
     フェーダーマッピングが動画と一致。App に `music_hud_last_volume_target` を追加（drag 確定用の
     frame 跨ぎ state）。`!interactive`（モーダル中）は dummy target に逃がして自 state を汚さない
     （Codex P3）。→
-    (5c-B2) **speed ボタン + popup**を共有 → (5c-B3) **各ボタン**（play/loop/mute/marker/head）を
+    (5c-B2) ✅ **完了（2026-07-02、Codex P1/P3 なし・P2 fix 済み、test 3117 green）** speed ボタン +
+    プリセット popup を `pub(crate)` helper `draw_overlay_speed_control(ctx, ui, painter, speed_rect,
+    text_center_y, playback_speed, button_id, popup_area_id, container_left, container_width, hud_top,
+    &mut popup_open, &mut popup_rect_out) -> Option<speed>`（`overlay_draw.rs`）へ抽出。動画は inline
+    （button bg + ラベル + 左クリック toggle / 右クリック x1 reset + `PLAYBACK_SPEED_CHOICES` popup +
+    外クリック close + HWND rect 記録）を丸ごと helper 呼び出しへ置換しバイト等価（`video_speed_popup_open`
+    と `last_drawn_speed_popup_rect` のローカルを `&mut` で渡す）。音楽は暫定の「クリックで巡回」
+    （`MUSIC_SPEED_PRESETS` / `format_speed`）を撤去し共有 popup に統一 → ラベルが `format_playback_speed`
+    （"x1.5"）に、選択肢が動画と同じ 11 段に揃う。App に `music_speed_popup_open` を追加。popup 位置は
+    `hud_rect.left()/width()/top()` を渡す。`!interactive`（モーダル中）は dummy popup_open に逃がす
+    （B1 と同じ多層防御）。popup X clamp を正規化して狭幅 panic を防止（Codex P2、正常幅では挙動不変）。→
+    (5c-B3) **各ボタン**（play/loop/mute/marker/head）を
     `draw_overlay_*` icon + `draw_overlay_button_bg` の共有 primitive で音楽 HUD を描き直し →
     (5c-B4) 余力があればコントロール行全体を snapshot+sink 関数へ。**一括抽出は 1350 行 released video の
     バイト等価維持が困難なので必ず段階化**。

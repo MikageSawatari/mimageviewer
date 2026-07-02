@@ -5152,6 +5152,134 @@ pub(crate) fn draw_overlay_volume_slider(
     out
 }
 
+/// 再生速度ボタン + プリセット popup (動画 HUD / 音楽 HUD 共有、Inc 5c-B2)。
+///
+/// `speed_rect` にボタン背景 (`draw_overlay_button_bg`) + 現在速度ラベル
+/// (`format_playback_speed`) を描き、左クリックで popup をトグル、右クリック /
+/// ダブルクリックで x1 リセット。`popup_open` が true の間は `speed_rect` の上に
+/// `PLAYBACK_SPEED_CHOICES` の選択 popup を Area で出す。popup 外クリックで閉じる。
+///
+/// 返り値: 速度変更を発行すべきなら `Some(speed)` (呼び出し側が `SetPlaybackSpeed` /
+/// `player.set_playback_speed` へ翻訳)。x1 リセットは `Some(1.0)`、選択は clamp 済み速度。
+/// `popup_open` は helper が直接書き換える (frame 跨ぎ state、呼び出し側が所有)。popup を
+/// 描いた frame はその rect を `popup_rect_out` へ書く (native HWND の SetWindowRgn 用。
+/// 使わない呼び出し側 = 音楽は `&mut None` を渡して無視してよい)。
+///
+/// popup の位置は `container_left`/`container_width` (= 描画コンテナの左端 + 幅) と
+/// `hud_top` (= HUD 上端 Y) から算出する。動画は overlay 座標 (left=0, width=overlay 幅)、
+/// 音楽は `hud_rect` の座標をそのまま渡す。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_overlay_speed_control(
+    ctx: &egui::Context,
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    speed_rect: egui::Rect,
+    text_center_y: f32,
+    playback_speed: f64,
+    button_id: egui::Id,
+    popup_area_id: egui::Id,
+    container_left: f32,
+    container_width: f32,
+    hud_top: f32,
+    popup_open: &mut bool,
+    popup_rect_out: &mut Option<egui::Rect>,
+) -> Option<f64> {
+    use crate::video::clock::{PLAYBACK_SPEED_CHOICES, format_playback_speed};
+
+    let mut result = None;
+    let mut speed_resp = ui.interact(speed_rect, button_id, egui::Sense::click());
+    draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
+    painter.text(
+        egui::pos2(speed_rect.center().x, text_center_y),
+        egui::Align2::CENTER_CENTER,
+        format_playback_speed(playback_speed),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(238, 238, 238),
+    );
+    if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
+        *popup_open = false;
+        result = Some(1.0);
+    } else if speed_resp.clicked() {
+        *popup_open = !*popup_open;
+    }
+    if !*popup_open {
+        speed_resp = speed_resp.hover_tip_dark("再生速度 (右クリック / ダブルクリックで x1)");
+    }
+    if *popup_open {
+        let popup_w = 356.0_f32.min((container_width - 16.0).max(180.0));
+        let speed_choice_size = egui::vec2(46.0, 24.0);
+        let speed_choice_text_y = 4.0;
+        let popup_h = speed_choice_size.y + 12.0;
+        // clamp 範囲を正規化する: 極端に狭いコンテナ (`container_width < popup_w + 16`) では
+        // `max_x < min_x` になり `f32::clamp` が panic するため、`max_x` を `min_x` 以上に
+        // 押し上げる。正常幅では `max_x` は元の式と一致し挙動不変 (Codex 5c-B2 P2)。
+        let popup_min_x = container_left + 8.0;
+        let popup_max_x = (container_left + container_width - popup_w - 8.0).max(popup_min_x);
+        let popup_x = (speed_rect.center().x - popup_w * 0.5).clamp(popup_min_x, popup_max_x);
+        let popup_y = (hud_top - popup_h - 6.0).max(8.0);
+        let mut selected_speed = None;
+        let popup_inner = egui::Area::new(popup_area_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(popup_x, popup_y))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(popup_w - 12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for speed in PLAYBACK_SPEED_CHOICES {
+                                let selected = (playback_speed - speed).abs() < 1.0e-6;
+                                let label = format_playback_speed(speed);
+                                let (button_rect, button_resp) =
+                                    ui.allocate_exact_size(speed_choice_size, egui::Sense::click());
+                                if button_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                let visuals =
+                                    ui.style().interact_selectable(&button_resp, selected);
+                                let painter = ui.painter();
+                                painter.rect_filled(button_rect, 3.0, visuals.weak_bg_fill);
+                                painter.rect_stroke(
+                                    button_rect,
+                                    3.0,
+                                    visuals.bg_stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                                painter.text(
+                                    button_rect.center() + egui::vec2(0.0, speed_choice_text_y),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    visuals.fg_stroke.color,
+                                );
+                                if button_resp.clicked() {
+                                    selected_speed = Some(speed);
+                                }
+                            }
+                        });
+                    });
+            });
+        let popup_rect = popup_inner.response.rect;
+        *popup_rect_out = Some(popup_rect);
+        if ctx.input(|i| i.pointer.any_click())
+            && !speed_resp.hovered()
+            && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+            && !popup_rect.contains(pos)
+        {
+            *popup_open = false;
+        }
+        if let Some(speed) = selected_speed {
+            let speed = crate::video::clock::clamp_playback_speed(speed);
+            *popup_open = false;
+            result = Some(speed);
+        }
+    }
+    result
+}
+
 pub(super) fn format_overlay_time(secs: f64) -> String {
     let total = finite_nonnegative(secs).round() as u64;
     let h = total / 3600;

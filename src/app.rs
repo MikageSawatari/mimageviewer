@@ -5226,6 +5226,10 @@ pub struct App {
     /// `draw_overlay_volume_slider` がドラッグ中に最後の目標値を書き、`drag_stopped`
     /// で取り出して永続化する。
     pub(crate) music_hud_last_volume_target: Option<f64>,
+    /// 音楽 HUD 速度ボタンのプリセット popup 開閉 (Inc 5c-B2)。動画 overlay の
+    /// `video_speed_popup_open` と同じ役割。共有の `draw_overlay_speed_control` が
+    /// トグルし、選択 / popup 外クリックで閉じる。
+    pub(crate) music_speed_popup_open: bool,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
     /// 左パネルは端ホバーで出す (動画のジャンプパネルと同じ、Inc 5 FB。トグルボタンは廃止)。
@@ -7051,6 +7055,7 @@ impl App {
             music_probe: None,
             music_loop_enabled: false,
             music_hud_last_volume_target: None,
+            music_speed_popup_open: false,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             music_bookmark_title_edit: None,
