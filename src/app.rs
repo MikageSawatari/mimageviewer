@@ -28565,6 +28565,30 @@ impl App {
         }
     }
 
+    /// 任意のフォルダパスの★ (コンテナレーティング) を DB から読む (Inc 5 FB)。
+    /// フルスクリーンでは対象フォルダがグリッドアイテムでない (idx がない) ので、
+    /// idx ベースの `get_rating` ではなくパスキー直読みで取得する。
+    pub(crate) fn folder_rating_by_path(&self, folder: &std::path::Path) -> u8 {
+        let key = crate::adjustment_db::normalize_path(folder);
+        self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
+    }
+
+    /// 任意のフォルダパスの★ (コンテナレーティング) を設定する (Inc 5 FB)。
+    /// `set_rating` のコンテナ分岐と同じキャッシュ無効化を行う (idx キャッシュはフォルダに
+    /// エントリを持たないので触らない。グリッド復帰時に DB から読み直される)。
+    pub(crate) fn set_folder_rating_by_path(&mut self, folder: &std::path::Path, stars: u8) {
+        let stars = stars.min(5);
+        let key = crate::adjustment_db::normalize_path(folder);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Folder)
+            .with_source_path(folder);
+        self.user_set_rating_keys.insert(key.clone());
+        if let Some(db) = self.rating_db.as_ref() {
+            let _ = db.set_user_rating(&key, stars, Some(&meta));
+        }
+        self.invalidate_rating_counts_cache();
+        self.current_folder_rating_cache = None;
+    }
+
     /// レーティング XMP 書き込み worker を必要なら起動する (遅延初期化)。
     pub(crate) fn ensure_rating_write_handle(&mut self) {
         if self.rating_write_handle.is_none() {

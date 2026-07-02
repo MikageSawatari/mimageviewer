@@ -281,12 +281,25 @@ impl App {
         let mut searched_tag: Option<String> = None;
         let mut clicked_palette_rgb: Option<[u8; 3]> = None;
         // ★ レーティング (画像/動画/音声で統一。★ → タグ → 内容 の先頭)。レーティング可能な
-        // 単一アイテム (画像 / ZIP 内画像 / PDF ページ) でのみ行を出す。
+        // 単一アイテム (画像 / ZIP 内画像 / PDF ページ) でページ★を出す。
         let rating_idx = self
             .fullscreen_idx
             .filter(|&i| self.items.get(i).is_some_and(|it| it.accepts_rating()));
         let rating_stars = rating_idx.map(|i| self.get_rating(i)).unwrap_or(0);
         let mut set_rating: Option<u8> = None;
+        // タグがフォルダ・ページ両方に付くページでは★も両方出す (Inc 5 FB)。タグパネルの
+        // 「フォルダ」行の対象パス = 共有親フォルダなので、そのパスの★ (コンテナレーティング)
+        // をパスキー直読みで出す。
+        let folder_rating_path: Option<PathBuf> = tag_rows
+            .iter()
+            .find(|r| r.label.as_deref() == Some("フォルダ"))
+            .and_then(|r| r.targets.first())
+            .map(|t| t.path.clone());
+        let folder_rating_stars = folder_rating_path
+            .as_ref()
+            .map(|p| self.folder_rating_by_path(p))
+            .unwrap_or(0);
+        let mut set_folder_rating: Option<u8> = None;
         let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
         let tag_picker_ime_active = self.ime_input_active();
@@ -331,8 +344,25 @@ impl App {
                 }
 
                 // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序) ──
-                if rating_idx.is_some() {
-                    set_rating = crate::ui_helpers::draw_rating_stars(ui, rating_stars);
+                // タグと同じく、フォルダ★ と ページ★ を両方出す (フォルダ行があるとき)。
+                let show_rating = rating_idx.is_some() || folder_rating_path.is_some();
+                if show_rating {
+                    if folder_rating_path.is_some() {
+                        ui.label(
+                            egui::RichText::new("フォルダ")
+                                .color(LABEL_COLOR)
+                                .size(11.0),
+                        );
+                        set_folder_rating =
+                            crate::ui_helpers::draw_rating_stars(ui, folder_rating_stars);
+                        if rating_idx.is_some() {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("ページ").color(LABEL_COLOR).size(11.0));
+                        }
+                    }
+                    if rating_idx.is_some() {
+                        set_rating = crate::ui_helpers::draw_rating_stars(ui, rating_stars);
+                    }
                     if show_tag_panel
                         || tweet_info.is_some()
                         || ai_metadata.is_some()
@@ -448,6 +478,7 @@ impl App {
                     && sidecar_info.is_none()
                     && current_palette.is_none()
                     && rating_idx.is_none()
+                    && folder_rating_path.is_none()
                 {
                     draw_no_metadata(ui);
                 }
@@ -456,6 +487,9 @@ impl App {
         // ★ レーティングの後処理 (draw_rating_stars が「同★再クリック=0」を解決済み)。
         if let (Some(idx), Some(new_stars)) = (rating_idx, set_rating) {
             self.set_rating(idx, new_stars);
+        }
+        if let (Some(folder), Some(new_stars)) = (folder_rating_path.as_ref(), set_folder_rating) {
+            self.set_folder_rating_by_path(folder, new_stars);
         }
         // タグボタンクリックの後処理 (closure 外で self を可変借用する)
         if let Some((tag_name, targets)) = clicked_tag {
