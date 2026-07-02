@@ -392,8 +392,16 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
     速度ポップアップ本体は別途 5214/6901 付近（`video_speed_popup_open` state）。
   - **動画専用（音楽は無視）**: hover サムネプレビュー + RequestSeekThumbnail、CompactionTier、capture palette、
     prev/next-file、normalize/limiter。→ 抽出関数は `show_*` フラグ + `Option<TextureId>` + tier で gate。
-  - **推奨サブ分割（各段バイト等価 + Codex）**: (5c-B1) 右クラスタの **volume dB スライダー**を
-    `pub(crate)` helper（`ui, rect, cur_vol, muted → Option<(volume, persist)>`）へ抽出し動画/音楽で共有 →
+  - **推奨サブ分割（各段バイト等価 + Codex）**: (5c-B1) ✅ **完了（2026-07-02、Codex P1/P2/P3
+    クリア、test 3121 green）** 右クラスタの **volume dB スライダー**を `pub(crate)` helper
+    `draw_overlay_volume_slider(ui, painter, vol_rect, volume, id, tooltip, &mut last_volume_target)
+    -> Option<(volume, persist)>`（`overlay_draw.rs`）へ抽出し動画/音楽で共有。動画側はインライン
+    （track + fill + dB tick + click/drag/right-click reset + drag_stopped persist）を丸ごと helper 呼び出しへ
+    置換しバイト等価（`volume` の finite シャドウは呼び出し側で維持しラベルへ伝播）。音楽側は暫定
+    slider（accent fill + circle handle のみ）を共有版へ置換 → dB 目盛り・0dB 右クリックリセット・
+    フェーダーマッピングが動画と一致。App に `music_hud_last_volume_target` を追加（drag 確定用の
+    frame 跨ぎ state）。`!interactive`（モーダル中）は dummy target に逃がして自 state を汚さない
+    （Codex P3）。→
     (5c-B2) **speed ボタン + popup**を共有 → (5c-B3) **各ボタン**（play/loop/mute/marker/head）を
     `draw_overlay_*` icon + `draw_overlay_button_bg` の共有 primitive で音楽 HUD を描き直し →
     (5c-B4) 余力があればコントロール行全体を snapshot+sink 関数へ。**一括抽出は 1350 行 released video の

@@ -5043,6 +5043,115 @@ pub(super) fn finite_video_volume(value: f64) -> f64 {
     }
 }
 
+/// 音量 dB フェーダースライダー (動画 HUD / 音楽 HUD 共有、Inc 5c-B1)。
+///
+/// `vol_rect` にトラック背景 + fill (0dB 未満 = グレー / 0dB 超 = ブースト黄) +
+/// `VIDEO_VOLUME_FADER_DB_MARKS` の目盛りを painter だけで描き、クリック / ドラッグ /
+/// 右クリック / ダブルクリックを解釈する。フェーダーマッピングは
+/// `crate::settings::video_volume_*_fader_pos` (= -80..+18dB) を使う。
+///
+/// 返り値 `Some((volume, persist))` = 呼び出し側が発行すべき音量変更 (`persist` は
+/// `settings` へ保存すべきかどうか = ドラッグ確定 / クリック / 右クリックで true、
+/// ドラッグ中は false)。動画は `NativeOverlayCommand::SetVolume` へ、音楽は
+/// `settings.video_volume` + `player.set_volume` へ翻訳する。
+///
+/// `last_volume_target` はドラッグ確定 (`drag_stopped`) 時に最後のドラッグ値を
+/// 永続化するための frame 跨ぎ state。呼び出し側 (App / overlay) が所有する。
+/// `tooltip` が `Some` ならダーク配色のホバーチップを付ける (`None` = 付けない)。
+pub(crate) fn draw_overlay_volume_slider(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    vol_rect: egui::Rect,
+    volume: f64,
+    id: egui::Id,
+    tooltip: Option<String>,
+    last_volume_target: &mut Option<f64>,
+) -> Option<(f64, bool)> {
+    painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
+    let volume = finite_video_volume(volume);
+    let volume_pos = crate::settings::video_volume_linear_to_fader_pos(volume) as f32;
+    let zero_frac = crate::settings::video_volume_db_to_fader_pos(0.0) as f32;
+    let normal_fill_frac = volume_pos.min(zero_frac);
+    if normal_fill_frac > 0.0 {
+        let normal_fill = egui::Rect::from_min_max(
+            vol_rect.min,
+            egui::pos2(
+                vol_rect.min.x + vol_rect.width() * normal_fill_frac,
+                vol_rect.max.y,
+            ),
+        );
+        painter.rect_filled(normal_fill, 2.0, egui::Color32::from_rgb(220, 220, 220));
+    }
+    if volume_pos > zero_frac {
+        let boost_fill = egui::Rect::from_min_max(
+            egui::pos2(
+                vol_rect.min.x + vol_rect.width() * zero_frac,
+                vol_rect.min.y,
+            ),
+            egui::pos2(
+                vol_rect.min.x + vol_rect.width() * volume_pos,
+                vol_rect.max.y,
+            ),
+        );
+        painter.rect_filled(boost_fill, 2.0, egui::Color32::from_rgb(255, 198, 62));
+    }
+    for &db in &crate::settings::VIDEO_VOLUME_FADER_DB_MARKS {
+        let frac = crate::settings::video_volume_db_to_fader_pos(db) as f32;
+        let x = vol_rect.min.x + vol_rect.width() * frac;
+        let tick_h = if db == 0.0 {
+            8.0
+        } else if db > 0.0 {
+            6.0
+        } else {
+            4.0
+        };
+        let color = if db == 0.0 {
+            egui::Color32::from_gray(170)
+        } else if db > 0.0 {
+            egui::Color32::from_rgb(220, 170, 70)
+        } else {
+            egui::Color32::from_gray(118)
+        };
+        painter.line_segment(
+            [
+                egui::pos2(x, vol_rect.center().y - tick_h * 0.5),
+                egui::pos2(x, vol_rect.center().y + tick_h * 0.5),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+    let vol_resp = ui.interact(
+        vol_rect.expand2(egui::vec2(0.0, 10.0)),
+        id,
+        egui::Sense::click_and_drag(),
+    );
+    if vol_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    let vol_resp = match tooltip {
+        Some(text) => vol_resp.hover_tip_dark(text),
+        None => vol_resp,
+    };
+    let mut out = None;
+    if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
+        *last_volume_target = Some(1.0);
+        out = Some((1.0, true));
+    } else if (vol_resp.clicked() || vol_resp.dragged())
+        && let Some(pos) = vol_resp.interact_pointer_pos()
+    {
+        let value = crate::settings::video_volume_fader_pos_to_linear(
+            ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0) as f64,
+        );
+        *last_volume_target = Some(value);
+        out = Some((value, vol_resp.clicked() && !vol_resp.dragged()));
+    }
+    if vol_resp.drag_stopped() {
+        let value = last_volume_target.take().unwrap_or(volume);
+        out = Some((value, true));
+    }
+    out
+}
+
 pub(super) fn format_overlay_time(secs: f64) -> String {
     let total = finite_nonnegative(secs).round() as u64;
     let h = total / 3600;

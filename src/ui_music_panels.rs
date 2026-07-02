@@ -18,7 +18,7 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
-    draw_native_jump_panel_body,
+    draw_native_jump_panel_body, draw_overlay_volume_slider,
 };
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
@@ -826,53 +826,40 @@ impl App {
 
         // ── コントロール行: 右クラスタ (右寄せ: 音量 / ミュート / 速度 / 時間) ──
         let mut rx = hud_rect.right() - 14.0;
-        // 音量スライダー。動画と同じフェーダーマッピング (`video_volume_*_fader_pos`) を使い、
-        // -80..+18dB の全域を一貫して扱う (Codex P3: 独自 dB マップだと高ブースト/微小音量が
-        // つぶれ、動画のフェーダーと挙動が食い違う)。永続化はドラッグ確定時のみ (毎フレーム save 回避)。
+        // 音量 dB フェーダーは動画/音楽共有の `draw_overlay_volume_slider` を使う
+        // (Inc 5c-B1)。トラック + fill (0dB 未満グレー / 0dB 超ブースト黄) + dB 目盛り +
+        // クリック/ドラッグ/右クリック (0dB リセット) が動画 HUD と完全に揃う。
+        // フェーダーマッピングは `video_volume_*_fader_pos` (-80..+18dB) を共有し、独自 dB
+        // マップだと高ブースト/微小音量がつぶれる問題 (Codex P3) も解消済み。永続化は
+        // ドラッグ確定 / クリック / 右クリック時のみ (`persist=true`、毎フレーム save 回避)。
         let vol_w = 120.0;
         let vol_rect = egui::Rect::from_min_max(
             egui::pos2(rx - vol_w, controls_cy - 4.0),
             egui::pos2(rx, controls_cy + 4.0),
         );
         rx -= vol_w + 10.0;
-        let vol_frac =
-            crate::settings::video_volume_linear_to_fader_pos(cur_vol).clamp(0.0, 1.0) as f32;
-        painter.rect_filled(vol_rect, 3.0, egui::Color32::from_gray(70));
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                vol_rect.min,
-                egui::pos2(
-                    vol_rect.left() + vol_rect.width() * vol_frac,
-                    vol_rect.bottom(),
-                ),
-            ),
-            3.0,
-            accent,
-        );
-        painter.circle_filled(
-            egui::pos2(
-                vol_rect.left() + vol_rect.width() * vol_frac,
-                vol_rect.center().y,
-            ),
-            6.0,
-            fg,
-        );
-        let vol_resp = ui.interact(
-            vol_rect.expand2(egui::vec2(0.0, 8.0)),
-            ui.id().with(("music_hud_vol", fs_idx)),
-            egui::Sense::click_and_drag(),
-        );
         let mut vol_persist = false;
-        if (vol_resp.clicked() || vol_resp.dragged())
-            && let Some(p) = vol_resp.interact_pointer_pos()
-        {
-            let f = ((p.x - vol_rect.left()) / vol_rect.width()).clamp(0.0, 1.0) as f64;
-            set_vol = Some(crate::settings::clamp_video_volume(
-                crate::settings::video_volume_fader_pos_to_linear(f),
-            ));
-        }
-        if vol_resp.drag_stopped() || vol_resp.clicked() {
-            vol_persist = true;
+        // モーダル表示中 (`!interactive`) は HUD 操作を一切自 state に反映しない不変条件を
+        // 守るため、ドラッグ確定用の frame 跨ぎ state をダミーに逃がす (Codex 5c-B1 P3)。
+        // set_vol / vol_persist は末尾の early-return で捨てられるが、`last_volume_target` は
+        // 自 state なので明示的にガードしないと汚れる (5c-A の多層防御と同趣旨)。
+        let mut dummy_vol_target = None;
+        let vol_target = if interactive {
+            &mut self.music_hud_last_volume_target
+        } else {
+            &mut dummy_vol_target
+        };
+        if let Some((v, persist)) = draw_overlay_volume_slider(
+            ui,
+            &painter,
+            vol_rect,
+            cur_vol,
+            ui.id().with(("music_hud_vol", fs_idx)),
+            Some("音量 (右クリック / ダブルクリックで 0dB)".to_string()),
+            vol_target,
+        ) {
+            set_vol = Some(crate::settings::clamp_video_volume(v));
+            vol_persist = persist;
         }
         // ミュート
         let mute_r = egui::Rect::from_min_size(

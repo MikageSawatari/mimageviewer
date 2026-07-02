@@ -7361,109 +7361,31 @@ impl NativeEguiOverlay {
                             }
                         }
 
-                        painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
+                        // Inc 5c-B1: 音量 dB フェーダーは動画/音楽共有の
+                        // `draw_overlay_volume_slider` (`overlay_draw`) へ抽出。
+                        // `volume` を finite 化した値でシャドウし、後段の音量ラベル
+                        // (`format_video_volume_db_compact`) にも同じ値を渡す。
                         let volume = finite_video_volume(volume);
-                        let volume_pos =
-                            crate::settings::video_volume_linear_to_fader_pos(volume) as f32;
-                        let zero_frac = crate::settings::video_volume_db_to_fader_pos(0.0) as f32;
-                        let normal_fill_frac = volume_pos.min(zero_frac);
-                        if normal_fill_frac > 0.0 {
-                            let normal_fill = egui::Rect::from_min_max(
-                                vol_rect.min,
-                                egui::pos2(
-                                    vol_rect.min.x + vol_rect.width() * normal_fill_frac,
-                                    vol_rect.max.y,
-                                ),
-                            );
-                            painter.rect_filled(
-                                normal_fill,
-                                2.0,
-                                egui::Color32::from_rgb(220, 220, 220),
-                            );
-                        }
-                        if volume_pos > zero_frac {
-                            let boost_fill = egui::Rect::from_min_max(
-                                egui::pos2(
-                                    vol_rect.min.x + vol_rect.width() * zero_frac,
-                                    vol_rect.min.y,
-                                ),
-                                egui::pos2(
-                                    vol_rect.min.x + vol_rect.width() * volume_pos,
-                                    vol_rect.max.y,
-                                ),
-                            );
-                            painter.rect_filled(
-                                boost_fill,
-                                2.0,
-                                egui::Color32::from_rgb(255, 198, 62),
-                            );
-                        }
-                        for &db in &crate::settings::VIDEO_VOLUME_FADER_DB_MARKS {
-                            let frac = crate::settings::video_volume_db_to_fader_pos(db) as f32;
-                            let x = vol_rect.min.x + vol_rect.width() * frac;
-                            let tick_h = if db == 0.0 {
-                                8.0
-                            } else if db > 0.0 {
-                                6.0
-                            } else {
-                                4.0
-                            };
-                            let color = if db == 0.0 {
-                                egui::Color32::from_gray(170)
-                            } else if db > 0.0 {
-                                egui::Color32::from_rgb(220, 170, 70)
-                            } else {
-                                egui::Color32::from_gray(118)
-                            };
-                            painter.line_segment(
-                                [
-                                    egui::pos2(x, vol_rect.center().y - tick_h * 0.5),
-                                    egui::pos2(x, vol_rect.center().y + tick_h * 0.5),
-                                ],
-                                egui::Stroke::new(1.0, color),
-                            );
-                        }
-                        let vol_resp = ui.interact(
-                            vol_rect.expand2(egui::vec2(0.0, 10.0)),
-                            egui::Id::new("native_video_volume"),
-                            egui::Sense::click_and_drag(),
-                        );
-                        if vol_resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        }
                         let volume_shortcuts = native_joined_shortcuts(&[
                             shortcut_labels.and_then(|s| s.volume_up.as_deref()),
                             shortcut_labels.and_then(|s| s.volume_down.as_deref()),
                         ]);
-                        let vol_resp =
-                            vol_resp.hover_tip_dark(native_label_with_shortcut(
-                                "音量 (右クリック / ダブルクリックで 0dB)",
-                                volume_shortcuts.as_deref(),
-                            ));
-                        if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
-                            self.last_volume_target = Some(1.0);
-                            commands.push(NativeOverlayCommand::SetVolume {
-                                volume: 1.0,
-                                persist: true,
-                            });
-                        } else if (vol_resp.clicked() || vol_resp.dragged())
-                            && let Some(pos) = vol_resp.interact_pointer_pos()
-                        {
-                            let value = crate::settings::video_volume_fader_pos_to_linear(
-                                ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0)
-                                    as f64,
-                            );
-                            self.last_volume_target = Some(value);
+                        let vol_tooltip = native_label_with_shortcut(
+                            "音量 (右クリック / ダブルクリックで 0dB)",
+                            volume_shortcuts.as_deref(),
+                        );
+                        if let Some((value, persist)) = draw_overlay_volume_slider(
+                            ui,
+                            painter,
+                            vol_rect,
+                            volume,
+                            egui::Id::new("native_video_volume"),
+                            Some(vol_tooltip),
+                            &mut self.last_volume_target,
+                        ) {
                             commands.push(NativeOverlayCommand::SetVolume {
                                 volume: value,
-                                persist: vol_resp.clicked() && !vol_resp.dragged(),
-                            });
-                        }
-                        if vol_resp.drag_stopped() {
-                            let value = self.last_volume_target.take().unwrap_or(volume);
-                            commands.push(NativeOverlayCommand::SetVolume {
-                                volume: value,
-                                persist: true,
+                                persist,
                             });
                         }
                         // 動画 HUD 2 段化リデザイン (実機フィードバック反映): 最小窓

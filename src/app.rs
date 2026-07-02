@@ -5221,6 +5221,11 @@ pub struct App {
     pub(crate) music_probe: Option<crate::audio_decode::AudioProbe>,
     /// 音楽ビュー下 HUD のループトグル (簡易全曲ループ、Inc 5 FB)。セッション設定。
     pub(crate) music_loop_enabled: bool,
+    /// 音楽 HUD 音量フェーダーのドラッグ確定用の frame 跨ぎ state (Inc 5c-B1)。
+    /// 動画 overlay の `last_volume_target` と同じ役割。共有の
+    /// `draw_overlay_volume_slider` がドラッグ中に最後の目標値を書き、`drag_stopped`
+    /// で取り出して永続化する。
+    pub(crate) music_hud_last_volume_target: Option<f64>,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
     /// 左パネルは端ホバーで出す (動画のジャンプパネルと同じ、Inc 5 FB。トグルボタンは廃止)。
@@ -7045,6 +7050,7 @@ impl App {
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
             music_probe: None,
             music_loop_enabled: false,
+            music_hud_last_volume_target: None,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             music_bookmark_title_edit: None,
