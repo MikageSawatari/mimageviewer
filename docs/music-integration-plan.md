@@ -235,18 +235,22 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 
 ### 5.3 解析ワーカー + in-memory LRU（UI スレッド外）
 - `docs/async-architecture.md` のワーカーテンプレ（`XxxPending { cancel, rx }` + `start_xxx` /
-  `poll_xxx` + cancel 3 箇所）で **解析ワーカー**を新設。入力 = path + cancel + `want_analysis`、
-  出力 = `Probe` / `Timeline`（progressive 部分解析、display 専用）/ `TimelineComplete`（全尺確定・
-  LRU に載せる）/ `Pcm`（spectrum 用）。
+  `poll_xxx` + cancel 3 箇所）で **解析ワーカー**を新設。入力 = path + cancel + `want_analysis` +
+  `hit_meta`、出力 = `Probe` / `Timeline`（progressive 部分解析、display 専用）/
+  `TimelineComplete { analysis, meta }`（全尺確定・LRU に載せる。`meta` = ワーカー検証済み
+  (mtime,size)）/ `Pcm`（spectrum 用）。
 - ワーカー内: **FFmpeg で PCM decode → インターリーブ stereo f32 → `analyze_stereo_timeline`**。
   decode = `src/audio_decode.rs`（`decode_audio_file_to_stereo_f32_streaming`、48kHz stereo）。
 - **永続化はしない（2026-07-03 方針転換、D8）**。旧 `src/audio_analysis_db.rs`（SQLite）は削除。
   代わりに UI スレッドが `Arc<TimelineAnalysis>` を **in-memory LRU**（`music_analysis_lru`）で保持
-  する。LRU キー = path (正規化) + size + mtime（`image_metas` から供給、UI スレッド stat 不要）。
-  `ensure_music_analysis` が LRU を lookup し、ヒットならタイムラインを即セット + ワーカーを
-  `want_analysis=false`（spectrum PCM だけデコード）で起動、miss なら `want_analysis=true`。
-  `TimelineComplete` 受信時のみ LRU へ挿入（progressive partial は載せない）。size 不明のビューは
-  LRU を使わない（stale hit 回避）。
+  する。LRU キー = path (正規化) + size + mtime。
+  `ensure_music_analysis` が **`image_metas` の (mtime,size) で楽観的に LRU を lookup**（UI スレッド
+  stat しない）。ヒットならタイムラインを即セット + ワーカーを `want_analysis=false` で起動、miss なら
+  `want_analysis=true`。**ワーカーは背景で実ファイルを fresh stat** し、`want_analysis=false` でも
+  ヒットに使った `hit_meta` と食い違えば（外部更新）解析し直す（stale ヒット補正、Codex code P2）。
+  LRU への挿入キーは**ワーカーが返す検証済み (mtime,size)** を使う（`image_metas` スナップショットが
+  stale でも正しい key）。`TimelineComplete` 受信時のみ LRU へ挿入（progressive partial は載せない）。
+  `meta=None`（stat 失敗 / size=0）はキャッシュしない。
 - UI スレッドは受信を **1 frame 上限件数**で処理し、progressive 部分解析で該当 row version を
   invalidate（`docs/ui-responsiveness.md` §4 準拠）。
 
@@ -444,8 +448,10 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
     済み（件数/予算/超過スキップ/move-to-front）。
   - `TimelineComplete`（全尺確定）だけを LRU に載せる。progressive partial は display 専用で
     載せない（途中 prefix を確定版として誤キャッシュしない）。
-  - キーは `image_metas`（フォルダスキャン済み (mtime,size)）から作るので UI スレッド stat 不要。
-    size 不明のビューでは LRU を使わない（stale hit 回避、Codex P2）。
+  - ルックアップは `image_metas`（フォルダスキャン済み (mtime,size)）で楽観的に行い UI スレッド
+    stat を避ける（設計 Codex P2）。ただし `image_metas` は stale になり得るので、**ワーカーが
+    背景で fresh stat して検証**し、ヒットに使った値と食い違えば解析し直す + LRU 挿入キーは検証済み
+    (mtime,size) を使う（外部更新時の stale ヒット補正、code Codex P2）。size 不明は LRU 不使用。
   - **なぜ永続 DB をやめたか**: spectrum が再生位置 ±1 秒窓のため全尺 PCM を毎回デコードする
     ので、永続キャッシュが節約するのは解析パスだけで実利が薄い。progressive 表示で miss 体験
     も滑らか。→ セッション内の A/B 切替を即時にする in-memory LRU で十分。

@@ -3270,8 +3270,14 @@ pub(crate) enum MusicAnalysisMsg {
     /// LRU には入れない (途中まで解析した prefix なので確定版ではない)。
     Timeline(Result<music_core::TimelineAnalysis, String>),
     /// 全尺デコード後の確定タイムライン解析。これだけを in-memory LRU にキャッシュする
-    /// (partial を誤って確定版としてキャッシュしないため専用メッセージに分ける)。
-    TimelineComplete(music_core::TimelineAnalysis),
+    /// (partial を誤って確定版としてキャッシュしないため専用メッセージに分ける)。`meta` =
+    /// ワーカーが実ファイルを fresh stat した (mtime, size)。UI はこの**検証済み**キーで LRU に
+    /// 載せるので、`image_metas` スナップショットが stale でも正しい key になる (Codex code P2)。
+    /// stat 失敗 / size=0 は `None` = キャッシュしない。
+    TimelineComplete {
+        analysis: music_core::TimelineAnalysis,
+        meta: Option<(i64, i64)>,
+    },
     /// 下段スペクトラム (Inc 4) 用の全尺デコード PCM。UI が再生位置周辺 ±1 秒を切り出して
     /// `SpectrumAnalyzer` に食わせる。cpal ring buffer は約 100ms 分しか無く ±1 秒窓に足りない
     /// ため、ラボと同じく展開済み PCM をスライスする (§11「ring buffer tap の口」= 案A)。
@@ -3296,17 +3302,20 @@ pub(crate) struct MusicAnalysisPending {
 
 /// 音楽ビュー解析ワーカーの本体 (背景スレッドで実行、UI 非依存)。
 ///
-/// 全尺 PCM を **1 回だけ**デコードし、`want_analysis` が true なら progressive にタイムラインを
-/// 先出ししつつ最終確定版 (`TimelineComplete`) を送り、最後に spectrum (Inc 4) 用 PCM を追送する。
-/// 永続 DB (旧 `audio_analysis.db`) はやめたので DB open / stat はしない。`want_analysis=false` は
-/// UI 側の in-memory LRU がヒット済み (= タイムラインは既に表示済み) の場合で、spectrum 用 PCM を
-/// デコードするためだけに走る。LRU キー用の size/mtime は UI スレッドが `image_metas` から供給する
-/// のでワーカーは stat しない。`cancel` は decode 中と各節目で確認する。
+/// 全尺 PCM を **1 回だけ**デコードし、解析が必要なら progressive にタイムラインを先出ししつつ
+/// 最終確定版 (`TimelineComplete`) を送り、最後に spectrum (Inc 4) 用 PCM を追送する。
+/// `want_analysis=false` は UI 側の in-memory LRU がヒット済み (= タイムラインは既に表示済み) の
+/// 場合で、通常は spectrum 用 PCM をデコードするためだけに走る。ただしワーカーは背景で実ファイルを
+/// **fresh stat** し、ヒットに使われた `hit_meta` と (mtime,size) が食い違う場合 (= フォルダ再読込
+/// 前に外部更新された) は stale ヒットと判断して解析し直す (Codex code P2)。UI スレッド stat は
+/// 避けたまま、キャッシュ正しさは背景 stat で担保する。`TimelineComplete.meta` にこの検証済み
+/// (mtime,size) を載せ、UI はそれで LRU を keying する。`cancel` は decode 中と各節目で確認する。
 fn run_music_analysis(
     path: &std::path::Path,
     cancel: &std::sync::atomic::AtomicBool,
     tx: &std::sync::mpsc::Sender<MusicAnalysisMsg>,
     want_analysis: bool,
+    hit_meta: Option<(i64, i64)>,
 ) {
     use std::sync::atomic::Ordering;
     if cancel.load(Ordering::Relaxed) {
@@ -3325,10 +3334,20 @@ fn run_music_analysis(
         return;
     }
 
+    // 実ファイルを背景 stat して検証済み (mtime,size) を得る (UI スレッドは stat しない)。
+    // size=0 / 失敗は「キャッシュ不可」= None。LRU ヒット (want_analysis=false) でも、この値が
+    // ヒットに使った hit_meta と食い違えば外部更新されているので解析し直す (stale ヒット補正)。
+    let fresh_meta: Option<(i64, i64)> = std::fs::metadata(path).ok().and_then(|m| {
+        let size = m.len() as i64;
+        (size > 0).then(|| (crate::ui_helpers::mtime_secs(&m), size))
+    });
+    let should_analyze = want_analysis || hit_meta != fresh_meta;
+
     // 解析入力 + spectrum 用 (Inc 4) を兼ねて全尺 PCM を 1 回だけデコードする。
-    // want_analysis のときはデコードの進行に合わせて progressive partial timeline を先出しし、
-    // 全尺完了を待たずに波形を順次表示する (Inc 3 ストリーミング)。LRU ヒット (want_analysis=false)
-    // は timeline 済みなので partial は出さず、spectrum 用 PCM のためだけにデコードする。
+    // should_analyze のときはデコードの進行に合わせて progressive partial timeline を先出しし、
+    // 全尺完了を待たずに波形を順次表示する (Inc 3 ストリーミング)。有効な LRU ヒット
+    // (should_analyze=false) は timeline 済みなので partial は出さず、spectrum 用 PCM のためだけに
+    // デコードする。
     let config = music_core::AnalysisConfig {
         bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
         ..music_core::AnalysisConfig::default()
@@ -3337,12 +3356,12 @@ fn run_music_analysis(
     let decode_result = crate::audio_decode::decode_audio_file_to_stereo_f32_streaming(
         path,
         cancel,
-        // LRU ヒットは partial 不要なので 50% 抑制ヒントも渡す意味は無いが、closure 側で早期
-        // return するため total_dur をそのまま渡してよい。
+        // 有効な LRU ヒットは partial 不要なので 50% 抑制ヒントも渡す意味は無いが、closure 側で
+        // 早期 return するため total_dur をそのまま渡してよい。
         total_dur,
         |prefix, rate| {
-            // LRU ヒット (timeline 済み) では partial 不要。cancel 済みも skip。
-            if !want_analysis || cancel.load(Ordering::Relaxed) {
+            // 有効な LRU ヒット (timeline 済み) では partial 不要。cancel 済みも skip。
+            if !should_analyze || cancel.load(Ordering::Relaxed) {
                 return;
             }
             // analyze_stereo_timeline は cancel 不可なので前後で cancel を確認する (Codex P3)。
@@ -3358,10 +3377,10 @@ fn run_music_analysis(
     let decoded = match decode_result {
         Ok(d) => d,
         Err(e) => {
-            // decode 失敗。LRU ヒット (timeline 済み) や partial 送信済みなら既に有効な波形が出て
-            // いるので、破壊的な Timeline(Err) は送らず spectrum を諦めるだけにする (Codex P3:
+            // decode 失敗。有効な LRU ヒット (timeline 済み) や partial 送信済みなら既に有効な波形が
+            // 出ているので、破壊的な Timeline(Err) は送らず spectrum を諦めるだけにする (Codex P3:
             // 途中まで出た波形を消さない)。解析中でどちらも無い純粋な失敗のみエラー通知する。
-            if want_analysis && !partial_sent {
+            if should_analyze && !partial_sent {
                 let _ = tx.send(MusicAnalysisMsg::Timeline(Err(e)));
             }
             return;
@@ -3371,15 +3390,19 @@ fn run_music_analysis(
         return;
     }
 
-    // want_analysis: デコード済み全尺 PCM から最終フル解析を作り、確定版 (TimelineComplete) を送る
-    // (progressive partial を確定版で置換 + UI 側が LRU に載せる)。LRU ヒットは既に確定済み。
-    if want_analysis {
+    // should_analyze: デコード済み全尺 PCM から最終フル解析を作り、確定版 (TimelineComplete) を
+    // 送る (progressive partial を確定版で置換 + UI 側が検証済み meta で LRU に載せる)。有効な
+    // LRU ヒットは既に確定済みなので送らない (stale ヒットはここで補正済みの新解析を送る)。
+    if should_analyze {
         let ta = music_core::analyze_stereo_timeline(
             &decoded.stereo_samples,
             decoded.info.sample_rate,
             config,
         );
-        let _ = tx.send(MusicAnalysisMsg::TimelineComplete(ta));
+        let _ = tx.send(MusicAnalysisMsg::TimelineComplete {
+            analysis: ta,
+            meta: fresh_meta,
+        });
     }
 
     // spectrum 用 PCM を追送する。timeline が全尺デコードしたのと同じ PCM を move で渡すだけ
@@ -5373,11 +5396,6 @@ pub struct App {
     /// 音楽ビューのタイムライン解析結果 (LRU hit または worker 完了で埋まる)。
     /// `Arc` で保持し、row raster worker へは refcount のクローンだけ渡す (Codex P2)。
     pub(crate) music_analysis: Option<std::sync::Arc<music_core::TimelineAnalysis>>,
-    /// 現在ファイルの LRU キー (`ensure_music_analysis` が `image_metas` から作る)。
-    /// worker が `TimelineComplete` を返したときに、このキーで LRU に載せる。size 不明 (=0) の
-    /// ビューでは None にして LRU を使わない (Codex P2: UI スレッド stat を避け、信頼できる
-    /// size があるときだけキャッシュする)。
-    pub(crate) music_analysis_key: Option<MusicAnalysisKey>,
     /// 直近 N 曲のタイムライン解析結果を保持する in-memory LRU (先頭が最新)。永続 DB
     /// (旧 `audio_analysis.db`) はやめた: どのみち spectrum 用に毎回全尺デコードするので永続
     /// キャッシュの実利は薄く、セッション内の A/B 切替を即時にする効果だけで十分 (§D9)。
@@ -7241,7 +7259,6 @@ impl App {
             video_session_muted,
             music_analysis_path: None,
             music_analysis: None,
-            music_analysis_key: None,
             music_analysis_lru: Vec::new(),
             music_analysis_error: None,
             music_analysis_pending: None,
@@ -30433,10 +30450,13 @@ impl App {
     /// 無駄なので、ここで初めて起動する (docs/music-integration-plan.md Inc 3)。開いている
     /// ファイルが変わったら旧ワーカーを cancel し、row raster cache を clear して作り直す。
     ///
-    /// `meta` は `image_metas[idx]` の (mtime, size)。LRU キーに使う。in-memory LRU が
-    /// ヒットすればタイムラインを即表示 (`want_analysis=false`)、miss なら decode+analyze
-    /// 完了まで待つ。永続 DB (旧 `audio_analysis.db`) と `std::fs::metadata` の UI スレッド
-    /// 同期 I/O はやめた (LRU キーは既に持っている `image_metas` から作る、Codex P2)。
+    /// `meta` は `image_metas[idx]` の (mtime, size)。in-memory LRU のルックアップ (楽観的な即
+    /// 表示) に使う。ヒットすればタイムラインを即表示 (`want_analysis=false`)、miss なら
+    /// decode+analyze 完了まで待つ。UI スレッドでは `std::fs::metadata` しない (Codex 設計 P2):
+    /// ルックアップキーは既に持っている `image_metas` から作る。ただし `image_metas` は
+    /// フォルダスキャン時点のスナップショットなので、ワーカーが背景で fresh stat して検証し、
+    /// ヒットに使った (mtime,size) と食い違えば解析し直す (Codex code P2 = 外部更新の stale ヒット
+    /// 補正)。LRU への挿入キーはワーカーが返す検証済み (mtime,size) を使う。
     /// spectrum 用 PCM のデコードは LRU ヒットでも走る (全尺 PCM は毎回必要)。
     pub(crate) fn ensure_music_analysis(
         &mut self,
@@ -30461,8 +30481,8 @@ impl App {
         self.music_analysis_error = None;
         self.music_analysis_path = Some(path.to_path_buf());
 
-        // LRU キー: size>0 (信頼できる) のときだけ作る。size 不明のビュー (mtime のみ等) では
-        // None にして LRU を使わない (stale hit を避ける、Codex P2)。
+        // ルックアップキー: size>0 (信頼できる) のときだけ作る。size 不明のビュー (mtime のみ等)
+        // では LRU を使わない。
         let key = meta.and_then(|(mtime, size)| {
             (size > 0).then(|| MusicAnalysisKey {
                 path: crate::adjustment_db::normalize_path(path),
@@ -30470,15 +30490,18 @@ impl App {
                 mtime,
             })
         });
-        self.music_analysis_key = key.clone();
 
-        // LRU ヒットならタイムラインを即セット (worker は spectrum PCM のためだけに走らせる)。
+        // LRU ヒットならタイムラインを即セット (worker は spectrum PCM + 検証のために走らせる)。
+        // hit_meta = ヒットに使った (mtime,size)。worker はこれと fresh stat を突き合わせて
+        // stale なら解析し直す。
         let mut want_analysis = true;
+        let mut hit_meta: Option<(i64, i64)> = None;
         if let Some(k) = key.as_ref()
             && let Some(arc) = self.music_analysis_lru_get(k)
         {
             self.music_analysis = Some(arc);
             want_analysis = false;
+            hit_meta = Some((k.mtime, k.size));
         }
 
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -30490,7 +30513,7 @@ impl App {
             .spawn(move || {
                 // ワーカーは timeline / PCM を複数メッセージで送る。送り終えると tx を drop し、
                 // 受信側は Disconnected で完了を知る。cancel 済みなら send 失敗は無視される。
-                run_music_analysis(&worker_path, &worker_cancel, &tx, want_analysis);
+                run_music_analysis(&worker_path, &worker_cancel, &tx, want_analysis, hit_meta);
             });
         if spawned.is_ok() {
             self.music_analysis_pending = Some(MusicAnalysisPending {
@@ -30556,11 +30579,19 @@ impl App {
                                 self.music_analysis_error = Some(e);
                             }
                             // 全尺デコード後の確定版: 表示更新 + in-memory LRU に載せる。
-                            MusicAnalysisMsg::TimelineComplete(analysis) => {
+                            // キーはワーカーが実ファイルを fresh stat した検証済み (mtime,size)
+                            // を使う (image_metas スナップショットが stale でも正しい key、Codex
+                            // code P2)。meta が None (stat 失敗 / size=0) ならキャッシュしない。
+                            MusicAnalysisMsg::TimelineComplete { analysis, meta } => {
                                 let arc = std::sync::Arc::new(analysis);
                                 self.music_analysis = Some(arc.clone());
                                 self.music_analysis_error = None;
-                                if let Some(key) = self.music_analysis_key.clone() {
+                                if let Some((mtime, size)) = meta {
+                                    let key = MusicAnalysisKey {
+                                        path: crate::adjustment_db::normalize_path(&pending.path),
+                                        size,
+                                        mtime,
+                                    };
                                     self.music_analysis_lru_insert(key, arc);
                                 }
                             }
@@ -30620,9 +30651,8 @@ impl App {
         self.music_timeline_cache.clear();
         self.music_spectrum.clear();
         self.music_analysis = None;
-        // 現在ファイルの LRU キーは破棄するが、LRU 本体 (直近 N 曲) はセッション中保持して
-        // 音声への再入を即時にする (キーは path+size+mtime なので stale hit は起きない)。
-        self.music_analysis_key = None;
+        // LRU 本体 (直近 N 曲) はセッション中保持して音声への再入を即時にする。キーは
+        // path+size+mtime + ワーカーの fresh stat 検証なので stale hit は起きない。
         self.music_pcm = None;
         self.music_probe = None;
         self.music_analysis_error = None;
