@@ -502,7 +502,18 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   を新設（`open()` の spawn と同じ self フィールドを再利用＝clock/video_rx/pump/decoder/dsp/
   normalize/解析を作り直さない）。detach は既存 `take_native_output()`（drop で presenter
   スレッド cancel+join、音声不触）。dead-code プリミティブ（呼び出し元は②-3）。
-- **②-3**: App 側 enter/exit ライフサイクル（HWND owner/HUD 一般化・イベント gate・close=モード離脱）。
+- **②-3** ✅: App 側 enter/exit ライフサイクル。`App.music_vst_shell: Option<MusicVstShell>` を新設。
+  重要発見＝`ensure_native_video_front`・イベント drain・owner 同期は**既にプレイヤー種別非依存で
+  毎フレーム audio player 上を走っており**（native 出力が無いので no-op）、attach した瞬間に自動作動
+  ＝「HWND owner/HUD 一般化」はほぼ無償。`enter_music_vst_shell`（attach のみ、GUI 表示は遅延）/
+  `tick_music_vst_shell`（`native_video_front_synced_hwnd==hwnd` で owner 登録済みを待って GUI 表示・
+  `show_vst3_manager`、pending 中 repaint）/ `exit_music_vst_shell`（GUI を main へ re-owner+hide →
+  owner/HUD 明示クリア → `take_native_output` drop、音楽状態保持、冪等）。close=離脱: soft
+  （`CloseFullscreen`/`Window(CloseRequested)`/`ToggleVst3Gui`）はイベントで離脱+batch break、hard
+  （`native_closed_idx`）は `music_shell_before` で idempotent 離脱。非 Fullscreen は toast 拒否。
+  イベント gate（再生/VST/normalize/Window は通す、`MouseButton`/`MouseWheel`・動画専用・
+  bookmark/tag/★/nav・loop/continuous は no-op、Esc=離脱）。呼び出し元は②-4。Codex 設計相談
+  ＋コードレビュー2ラウンド（High×3, Medium×4, Low×1 すべて対応、最終 PASS）。
 - **②-4**: UI（音楽 HUD の VST トグル＋グラフ抑止）。
 
 **Inc 7 との相乗り**: ②-1 の「native presenter を frameless で回す」capability は Inc 7（動画→音声

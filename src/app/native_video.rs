@@ -2255,6 +2255,27 @@ impl App {
             ));
             return;
         }
+        // 音声 VST シェル (Inc 6 ②-3): close / VST トグルはモード離脱に振り、動画専用イベントは
+        // no-op にする。attach した native 出力は epoch=0 の単一 source なので epoch チェックの
+        // 前に処理してよい (source swap を使わない)。
+        if self
+            .music_vst_shell
+            .as_ref()
+            .is_some_and(|s| s.fs_idx == fs_idx)
+        {
+            use crate::video::NativeVideoOutputEvent as Ev;
+            use crate::video::native_window::NativeVideoWindowEvent as WinEv;
+            let leave = matches!(event, Ev::CloseFullscreen { .. } | Ev::ToggleVst3Gui)
+                || matches!(&event, Ev::Window(w) if matches!(w, WinEv::CloseRequested { .. }));
+            if leave {
+                self.exit_music_vst_shell();
+                ctx.request_repaint();
+                return;
+            }
+            if !Self::native_event_allowed_in_music_shell(&event) {
+                return;
+            }
+        }
         let current_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
             _ => None,
@@ -2510,6 +2531,22 @@ impl App {
         event: crate::video::native_window::NativeVideoWindowEvent,
     ) {
         if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        // 音声 VST シェル (Inc 6 ②-3): マウスホイール (動画の前/次ナビ) とマウスボタン
+        // (右クリック close / ジェスチャ / タイル) は audio シェルに不適なので無視する。
+        // CloseRequested は handle_native_video_output_event が既にシェル離脱へ振っており
+        // ここには渡らない。MouseMove/Leave/キーは通す (HUD hover / Esc 離脱)。
+        if self
+            .music_vst_shell
+            .as_ref()
+            .is_some_and(|s| s.fs_idx == fs_idx)
+            && matches!(
+                event,
+                crate::video::native_window::NativeVideoWindowEvent::MouseButton(_)
+                    | crate::video::native_window::NativeVideoWindowEvent::MouseWheel(_)
+            )
+        {
             return;
         }
         match event {
@@ -5400,6 +5437,19 @@ impl App {
         fs_idx: usize,
         key: crate::video::native_window::NativeVideoKeyEvent,
     ) {
+        // 音声 VST シェル (Inc 6 ②-3): Escape はモード離脱、他キーは動画専用 (tile / frame step 等)
+        // が多く audio に不適なので無視する。再生操作は HUD のマウス操作で行う。
+        if self
+            .music_vst_shell
+            .as_ref()
+            .is_some_and(|s| s.fs_idx == fs_idx)
+        {
+            if key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt {
+                self.exit_music_vst_shell();
+                self.request_native_video_hud_repaint(ctx);
+            }
+            return;
+        }
         // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
         // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
         // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
@@ -5983,6 +6033,214 @@ impl App {
                 self.dsp_bridge.state()
             ));
         }
+    }
+
+    /// 音声 VST シェルに入る (music Inc 6 ②-3、B-prime)。走行中の headless audio player に
+    /// native presenter を live-attach する。owner/HUD 登録とプラグイン GUI 表示は presenter
+    /// HWND が publish されて fullscreen owner 登録が済んでから `tick_music_vst_shell` が行う
+    /// (HWND 未確定で GUI を出すと editor が main HWND に生成され z-order が壊れる、Codex High)。
+    /// 音声スレッド・音楽解析状態には触れないので無中断。呼び出し元は VST ボタン (②-4)。
+    #[cfg(windows)]
+    #[allow(dead_code)] // 呼び出し元 (音楽 HUD の VST ボタン) は Inc 6 ②-4 で配線する。
+    pub(crate) fn enter_music_vst_shell(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.music_vst_shell.is_some() {
+            return;
+        }
+        // 音声アイテムのみ。
+        if !matches!(self.items.get(fs_idx), Some(GridItem::Audio(_))) {
+            return;
+        }
+        // VST owner/HUD 機構はフルスクリーン borderless presenter 前提 (§5.9)。video-in-window
+        // 等で presentation が Fullscreen でないと owner/HUD 同期が発火しないので拒否する (Codex)。
+        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
+            self.show_feedback_toast("VST 設定はフルスクリーン表示中のみ利用できます".to_string());
+            return;
+        }
+        if !self.settings.vst3_enabled
+            || !matches!(
+                self.dsp_bridge.state(),
+                crate::video::dsp::DspState::Enabled
+            )
+        {
+            self.show_feedback_toast("VST3 が有効ではありません".to_string());
+            return;
+        }
+        let Some((placement, rect, owner_hwnd)) =
+            self.native_video_target_for_presentation(ViewerPresentation::Fullscreen)
+        else {
+            return;
+        };
+        let file_name = match self.items.get(fs_idx) {
+            Some(GridItem::Audio(path)) => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("audio")
+                .to_string(),
+            _ => "audio".to_string(),
+        };
+        let Some(config) = super::native_video_presenter_config(
+            owner_hwnd,
+            rect,
+            placement,
+            true, // activate_on_show (fullscreen)
+            file_name,
+            self.video_perf_overlay_visible,
+            false, // initial_tile_overlay: 音声は preparing タイルを出さない
+            true,  // vst3_available
+            self.checked.contains(&fs_idx), // checked: グリッドのチェック状態 (動画 HUD と同じ)
+            self.settings.fullscreen_cursor_hide_delay_secs,
+            Some(self.dsp_bridge.editor_hwnds_snapshot()),
+            self.main_hwnd.unwrap_or(0) as u64,
+            true, // audio_only (frameless present、Inc 6 ②-1)
+        ) else {
+            return;
+        };
+        let attach = match self.fs_cache.get_mut(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.attach_native_output_from_config(config)
+            }
+            _ => Err("音声プレイヤーが見つかりません".to_string()),
+        };
+        match attach {
+            Ok(()) => {
+                self.music_vst_shell = Some(super::MusicVstShell {
+                    fs_idx,
+                    activated: false,
+                });
+                // presenter HWND publish → owner 登録 → tick で GUI 表示、と数フレームかかる。
+                // 一時停止中の音声はアイドルで repaint が止まるので、activation に到達するよう
+                // ここで明示的に起こす (tick も pending 中は継続 repaint する、Codex Medium)。
+                ctx.request_repaint();
+                crate::logger::log(format!("[music-vst] entered VST shell for fs_idx={fs_idx}"));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("VST 画面を開けません: {err}"));
+                crate::logger::log(format!("[music-vst] attach failed: {err}"));
+            }
+        }
+    }
+
+    /// 音声 VST シェルの per-frame 駆動 (Inc 6 ②-3)。**`ensure_native_video_front` の後**に呼ぶ。
+    /// presenter HWND が publish されて fullscreen owner 登録が済んだら
+    /// (= `native_video_front_synced_hwnd == hwnd`)、プラグイン GUI を表示 + topmost にして
+    /// `show_vst3_manager` を立てる。owner 登録前に GUI を出すと editor が main HWND に生成
+    /// されるので必ず synced を待つ (Codex High)。`show_vst3_manager` もここで初めて立てる
+    /// ことで、egui VST マネージャ窓が native 被覆前に音楽ビューへ 1 フレちらつくのを防ぐ。
+    #[cfg(windows)]
+    pub(crate) fn tick_music_vst_shell(&mut self, ctx: &egui::Context) {
+        let Some(shell) = self.music_vst_shell else {
+            return;
+        };
+        if shell.activated {
+            return;
+        }
+        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
+            return;
+        }
+        let hwnd = match self.fs_cache.get(&shell.fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_hwnd(),
+            _ => 0,
+        };
+        // owner 登録済み (ensure_native_video_front が synced=hwnd をセット + register_fullscreen_owner)
+        // を待つ。まだなら pending 継続なので、一時停止中でも次フレームを起こして polling を
+        // 続ける (Codex Medium: 一時停止音声だと自然な repaint が来ない)。
+        if hwnd == 0 || self.native_video_front_synced_hwnd != hwnd {
+            ctx.request_repaint();
+            return;
+        }
+        self.dsp_bridge.set_existing_guis_owner_to_hwnd(hwnd);
+        self.native_video_owner_synced_hwnd = hwnd;
+        self.show_vst3_manager = true;
+        self.dsp_bridge.set_all_guis_topmost(true);
+        std::sync::Arc::clone(&self.dsp_bridge).set_all_guis_visible_async(true);
+        if matches!(
+            self.dsp_bridge.state(),
+            crate::video::dsp::DspState::Enabled
+        ) && !self.settings.vst3_gui_visible
+        {
+            self.settings.vst3_gui_visible = true;
+            self.settings.save();
+        }
+        if let Some(s) = self.music_vst_shell.as_mut() {
+            s.activated = true;
+        }
+        crate::logger::log(format!(
+            "[music-vst] activated VST GUIs for fs_idx={} hwnd=0x{:x}",
+            shell.fs_idx, hwnd
+        ));
+    }
+
+    /// 音声 VST シェルを抜けて egui 音楽ビューへ戻る (Inc 6 ②-3)。presenter HWND が生きて
+    /// いるうちに VST GUI を main へ re-owner + hide (dying HWND に owner された孤児 window を
+    /// 防ぐ) → owner/HUD 登録を明示クリア → native 出力だけ drop (presenter スレッド
+    /// cancel+join)。音声スレッド・音楽解析状態 (解析/spectrum/bookmark/normalize) には
+    /// 触れない (無中断・状態保持)。冪等 (シェル未在なら no-op)。
+    #[cfg(windows)]
+    pub(crate) fn exit_music_vst_shell(&mut self) {
+        let Some(shell) = self.music_vst_shell.take() else {
+            return;
+        };
+        // close_fullscreen の VST cleanup と同じ順序で GUI を main へ戻して隠す。
+        self.dsp_bridge.set_existing_guis_owner_to_main();
+        self.dsp_bridge.set_all_guis_visible(false);
+        self.dsp_bridge.set_all_guis_topmost(false);
+        self.show_vst3_manager = false;
+        self.native_video_owner_synced_hwnd = 0;
+        if self.settings.vst3_gui_visible {
+            self.settings.vst3_gui_visible = false;
+            self.settings.save();
+        }
+        // owner/HUD 登録を明示クリア。native 出力の drop は非同期 join なので、次フレームの
+        // ensure_native_video_front (hwnd==0 経路) を待たずここで外す (§5.9)。
+        self.dsp_bridge.set_hud_hwnd(0);
+        self.dsp_bridge.unregister_fullscreen_owner();
+        self.vst_geometry_tracker.clear();
+        self.native_video_front_synced_hwnd = 0;
+        self.native_video_front_last_raise = None;
+        self.native_video_front_recover_after_external_foreground = false;
+        // native 出力だけ drop (presenter スレッド cancel+join)。音声は不触。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&shell.fs_idx) {
+            let _ = player.take_native_output();
+        }
+        // clear_music_view_state は呼ばない (解析/spectrum/bookmark/normalize を保持)。
+        crate::logger::log(format!(
+            "[music-vst] exited VST shell for fs_idx={}",
+            shell.fs_idx
+        ));
+    }
+
+    /// 音声 VST シェル中に native presenter イベントを通してよいか (Inc 6 ②-3)。再生・音量・
+    /// VST パネル/スロット・normalize・perf・Window (キーは key handler 側で個別 gate) は通す。
+    /// 動画フレーム専用 (tile / frame step / サムネ / フレームコピー / 保存 / compact) と、
+    /// 動画ブックマーク・タグ/★・ナビ・placement は audio に不適なので no-op。close と
+    /// ToggleVst3Gui は呼び出し側で「シェル離脱」に振るのでここには渡らない。
+    #[cfg(windows)]
+    fn native_event_allowed_in_music_shell(event: &crate::video::NativeVideoOutputEvent) -> bool {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        matches!(
+            event,
+            Ev::Window(_)
+                | Ev::Seek { .. }
+                | Ev::SeekToStartAndPlay
+                | Ev::TogglePlay
+                | Ev::ToggleMute
+                // ToggleLoop / ToggleContinuous は動画用 helper (chapter/freshness gate の意味が
+                // audio とずれる) に流れるので no-op。ループ/連続は egui 音楽ビューで設定する
+                // (Codex Medium)。
+                | Ev::SetVolume { .. }
+                | Ev::SetPlaybackSpeed { .. }
+                | Ev::TogglePerfOverlay
+                | Ev::SetVst3PanelVisible { .. }
+                | Ev::SetVst3PanelPos { .. }
+                | Ev::Vst3ShowSlotGui { .. }
+                | Ev::Vst3HideSlotGui { .. }
+                | Ev::Vst3SetBypass { .. }
+                | Ev::Vst3LoadChainSlot { .. }
+                | Ev::Vst3SaveChainSlot { .. }
+                | Ev::ToggleNormalize
+                | Ev::DisableNormalize
+                | Ev::CancelNormalizeScan
+        )
     }
 
     #[cfg(windows)]

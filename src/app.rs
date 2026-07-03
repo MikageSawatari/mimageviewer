@@ -3073,6 +3073,18 @@ pub(crate) struct NativeVideoModeSwitchPending {
     pub deadline: std::time::Instant,
 }
 
+/// 音声 VST シェル (music Inc 6 ②-3、B-prime)。音楽ビュー (headless audio player) に
+/// native presenter を live-attach して、動画と同じ黒画面 + HUD + VST パネル + プラグイン
+/// GUI を出すモードの状態。`fs_idx` は attach 対象の fullscreen アイテム。`activated` は
+/// presenter HWND が publish されて fullscreen owner 登録が済み、プラグイン GUI を
+/// 表示済みかどうか (二度出しを防ぐラッチ)。詳細は docs/music-integration-plan.md §5.9。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct MusicVstShell {
+    pub fs_idx: usize,
+    pub activated: bool,
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 pub(crate) struct DetachedVideoHostSwitchPending {
@@ -5475,6 +5487,12 @@ pub struct App {
     /// 動画の `draw_native_bulk_bookmark_dialog` をそのまま流用し、IME・貼り付けも動画と揃う。
     pub(crate) music_bulk_bookmark_dialog:
         Option<crate::video::native_presenter::NativeBulkBookmarkDialog>,
+    /// 音声 VST シェル (Inc 6 ②-3、B-prime)。`Some` の間、音楽ビューは native presenter を
+    /// live-attach して動画と同じ VST 画面 (黒画面 + HUD + プラグイン GUI) を出す。
+    /// 音楽グラフは抑止する (②-4)。VST ボタン / Esc / native close で離脱すると音楽ビューへ
+    /// 戻る (音声は無中断)。詳細は docs/music-integration-plan.md §5.9。
+    #[cfg(windows)]
+    pub(crate) music_vst_shell: Option<MusicVstShell>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -7297,6 +7315,8 @@ impl App {
             music_bookmarks_loaded_for: None,
             music_bookmark_title_edit: None,
             music_bulk_bookmark_dialog: None,
+            #[cfg(windows)]
+            music_vst_shell: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -30894,6 +30914,8 @@ impl App {
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
                             self.main_hwnd.unwrap_or(0) as u64,
+                            // 動画経路: 常に映像フレームを持つ。
+                            false,
                         )
                     })
                 };
@@ -32027,6 +32049,13 @@ impl App {
         // 音楽ビュー (Inc 3b/4) の解析ワーカー + row raster + spectrum worker + PCM を止めて捨てる
         // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
         self.clear_music_view_state();
+        // 音声 VST シェル (Inc 6 ②-3): フルスクリーンを完全に閉じるならシェル状態も落とす。
+        // VST GUI の hide/re-owner は下の VST cleanup (show_vst3_manager 経路) が、native 出力の
+        // drop は fs_cache.clear() が行うので、ここではフラグを落とすだけでよい。
+        #[cfg(windows)]
+        {
+            self.music_vst_shell = None;
+        }
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
         // 開いたとき分析モードのまま起動してしまう (fullscreen_idx がまだ有効なうちに呼ぶ)。
         if self.analysis_mode {
@@ -41550,6 +41579,11 @@ impl App {
         let mut native_close_error: Option<String> = None;
         #[cfg(windows)]
         let mut native_owner_hwnd: u64 = 0;
+        // 音声 VST シェル (Inc 6 ②-3): フレーム開始時点のシェル対象 fs_idx。close race
+        // (soft close イベントで exit 済み ↔ hard close の native_closed_idx) を安全に判定する
+        // ため、イベント処理で music_vst_shell が変わる前に焼き付ける。
+        #[cfg(windows)]
+        let music_shell_before = self.music_vst_shell.as_ref().map(|s| s.fs_idx);
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
@@ -41710,8 +41744,15 @@ impl App {
             // 実際に honored されて fullscreen が終了した (Some→None)」ときだけ batch を
             // 打ち切る (Codex P2: terminal を handler の実挙動と一致させる)。
             let was_fullscreen = self.fullscreen_idx.is_some();
+            let shell_before_event = self.music_vst_shell.is_some();
             self.handle_native_video_output_event(ctx, idx, epoch, event);
             if was_fullscreen && self.fullscreen_idx.is_none() {
+                break;
+            }
+            // 音声 VST シェルをこのイベントで抜けた (close/ToggleVst3Gui) 場合、以降のイベントは
+            // 既に drop した native 出力由来なので、fullscreen のままでも batch を打ち切る
+            // (Codex High: stale イベントが still-fullscreen の audio に動画操作を当てない)。
+            if shell_before_event && self.music_vst_shell.is_none() {
                 break;
             }
         }
@@ -41786,6 +41827,18 @@ impl App {
             // 音量ノーマライズの完了 poll + overlay 状態同期
             self.poll_normalize_scan(ctx);
             self.sync_native_video_normalize_state(fs_idx);
+        }
+        // 音声 VST シェル (Inc 6 ②-3): シェルの presenter が hard close した (window 破棄) 場合は
+        // フルスクリーンを閉じず VST モードだけ抜けて egui 音楽ビューへ戻す。music_shell_before で
+        // 判定するので、soft close イベントで既に exit 済み (music_vst_shell=None) でも idempotent
+        // な exit_music_vst_shell に落ちて close_fullscreen を誤発火しない (Codex High)。
+        #[cfg(windows)]
+        if let Some(closed_idx) = native_closed_idx
+            && music_shell_before == Some(closed_idx)
+        {
+            self.exit_music_vst_shell();
+            ctx.request_repaint();
+            return;
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
@@ -42752,6 +42805,11 @@ impl eframe::App for App {
         let still_viewport_enter_suppressed = self.still_fullscreen_viewport_enter_suppressed();
         #[cfg(windows)]
         self.ensure_native_video_front();
+        // 音声 VST シェル (Inc 6 ②-3): ensure_native_video_front が presenter HWND を
+        // fullscreen owner 登録した後に呼ぶ。owner 登録済みを待ってからプラグイン GUI を
+        // 表示する (早いと editor が main HWND に生成される、Codex High)。
+        #[cfg(windows)]
+        self.tick_music_vst_shell(ctx);
         #[cfg(windows)]
         self.sync_native_video_iconic_thumbnail();
         #[cfg(windows)]
@@ -45625,6 +45683,9 @@ fn native_video_presenter_config(
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
     >,
     main_hwnd_for_raise: u64,
+    // 音声のみ native シェル (music Inc 6 ②) は true。present ループが frameless で回る
+    // (§5.9 / Inc 6 ②-1)。動画経路は false。
+    audio_only: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     let in_main_window = placement.is_main_window_child();
     let sync_interval = std::env::var("MIV_NATIVE_VIDEO_SYNC_INTERVAL")
@@ -45655,9 +45716,7 @@ fn native_video_presenter_config(
         placement,
         activate_on_show,
         in_main_window,
-        // 動画経路は常に映像フレームを持つ。音声のみ native シェル (Inc 6 ②) は
-        // 別経路で `audio_only=true` の config を組む。
-        audio_only: false,
+        audio_only,
     })
 }
 
