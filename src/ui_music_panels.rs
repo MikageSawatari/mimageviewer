@@ -168,6 +168,9 @@ impl App {
             .and_then(|db| db.add_if_no_duplicate(&path, pos, None, 1.0).ok())
             .flatten();
         self.reload_music_bookmarks(&path);
+        // 境界集合が変わったのでブックマーク区間ループの target / baseline を再計算する
+        // (でないと初回ブックマーク追加時に stale baseline で誤ループする、Codex P2)。
+        self.apply_music_loop_mode(fs_idx);
         match added {
             Some(_) => self.show_feedback_toast(format!("ブックマークを追加: {}", format_hms(pos))),
             None => self.show_feedback_toast("既存のブックマークと近すぎます".to_string()),
@@ -185,6 +188,7 @@ impl App {
             self.music_bookmark_title_edit = None;
         }
         self.reload_music_bookmarks(&path);
+        self.apply_music_loop_mode(fs_idx);
     }
 
     fn rename_music_bookmark(&mut self, fs_idx: usize, id: i64, title: &str) {
@@ -225,6 +229,7 @@ impl App {
         match result {
             Some(Ok(s)) => {
                 self.reload_music_bookmarks(&path);
+                self.apply_music_loop_mode(fs_idx);
                 self.show_feedback_toast(format!(
                     "一括登録: {} 件追加 / 重複 {} / エラー {}",
                     s.added, s.skipped_duplicates, s.errors
@@ -273,6 +278,7 @@ impl App {
             .map(|db| db.clear_for(&path));
         self.music_bookmark_title_edit = None;
         self.reload_music_bookmarks(&path);
+        self.apply_music_loop_mode(fs_idx);
         match result {
             Some(Ok(())) => {
                 self.show_feedback_toast("ブックマークをすべて削除しました".to_string())

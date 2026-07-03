@@ -358,8 +358,12 @@ impl App {
             return ShortcutHelpContext::Crop;
         }
         if let Some(fs_idx) = self.fullscreen_idx
-            && matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && matches!(
+                self.items.get(fs_idx),
+                Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+            )
         {
+            // 音声 (映像なし動画) は動画スコープの Video* アクションを共有する。
             return ShortcutHelpContext::FsVideo;
         }
         if let Some(fs_idx) = self.fullscreen_idx

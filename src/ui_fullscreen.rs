@@ -7362,7 +7362,11 @@ impl App {
             self.show_context_shortcuts_help = true;
             return true;
         }
-        let active_scopes = if matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
+        // 音声 (映像なし動画) は動画スコープの Video* アクションを共有するので動画スコープで probe。
+        let active_scopes = if matches!(
+            self.items.get(fs_idx),
+            Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+        ) {
             FS_VIDEO_ACTIVE_SCOPES
         } else {
             FS_IMAGE_ACTIVE_SCOPES
