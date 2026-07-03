@@ -19397,10 +19397,22 @@ impl App {
             // (ドラッグ中に playhead へ引き戻されるのを防ぐ、実機 FB)。
             let new_offset = sa_output.state.offset.y;
             let offset_changed = (new_offset - self.music_timeline_last_scroll_offset).abs() > 0.5;
-            let programmatic_scroll = pending_scroll != 0.0 || outcome.auto_scrolled;
             self.music_timeline_last_scroll_offset = new_offset;
+            // プログラム起因スクロール (追従 / ▲▼) を発行したら 150ms の猶予を張る。egui は
+            // ScrollAnimation::none でも offset 反映が発行フレーム〜次フレームに跨り得るので、
+            // 発行フレームだけ除外すると翌フレームの offset 変化を scrollbar ドラッグに誤検出して
+            // 追従が stop-start する (Codex P2)。猶予期間中は offset 変化を無視する。
+            let programmatic_now = pending_scroll != 0.0 || outcome.auto_scrolled;
+            if programmatic_now {
+                self.music_timeline_programmatic_scroll_until =
+                    Some(now + std::time::Duration::from_millis(150));
+            }
+            let in_programmatic_grace = programmatic_now
+                || self
+                    .music_timeline_programmatic_scroll_until
+                    .is_some_and(|t| now < t);
             // ホイール手動スクロール / scrollbar ドラッグが起きたら 1 秒間は追従を止める。
-            if outcome.manual_scroll || (offset_changed && !programmatic_scroll) {
+            if outcome.manual_scroll || (offset_changed && !in_programmatic_grace) {
                 self.music_timeline_scroll_cooldown_until = Some(now + SCROLL_COOLDOWN);
             }
             if let Some(s) = outcome.seek_request
