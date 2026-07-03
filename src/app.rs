@@ -30716,8 +30716,11 @@ impl App {
     /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。
     ///
     /// 音楽ビュー (D3) は egui で描くので GPU 映像経路 (`gpu_video_device`) と native
-    /// presenter (`native_output_config`) は使わない。VST3 (`dsp_bridge`) は Inc 6 で配線
-    /// する。音量ノーマライズは既存 `audio_normalize_db` の cache 値があれば適用するが、
+    /// presenter (`native_output_config`) は使わない。VST3 (`dsp_bridge`) は動画と同じく常に
+    /// 渡し、audio pump が `normalize -> VST3 -> limiter` を通す (Inc 6、「音声=映像なし動画」
+    /// パリティ)。有効化・チェーン定義はプロセス共有の `DspBridge` singleton に従うので、
+    /// 環境設定/動画側で設定したチェーンがそのまま音声にも効く (音楽ビュー自体に VST UI は
+    /// 持たない = 追加の HWND 配線なし)。音量ノーマライズは既存 `audio_normalize_db` の cache 値があれば適用するが、
     /// スキャン起動はしない (Inc 3a; スキャン連携は後続)。再生位置の復元は音声の resume 設定
     /// (`music_open_resume` / `music_nav_resume`、既定=最初から) に従う。位置は動画と同じ
     /// `video_resume_positions` に path キーで保存済み (poll_video)。
@@ -30784,7 +30787,7 @@ impl App {
             #[cfg(windows)]
             None, // gpu_video_device (headless)
             #[cfg(windows)]
-            None, // dsp_bridge (VST3 は Inc 6)
+            Some(self.dsp_bridge.clone()), // dsp_bridge: 動画と同じ VST3 チェーンを共有 (Inc 6)
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)
         );
