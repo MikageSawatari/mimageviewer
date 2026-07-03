@@ -570,22 +570,52 @@ pub fn draw_music_timeline(
     if (response.clicked() || response.dragged())
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let local_y = pos.y - graph_rect.min.y;
-        let row = (local_y / (row_h + row_gap)).floor().max(0.0) as usize;
-        let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
-        // seek は波形 graph_rect の x 範囲内でのみ受け付ける (Codex P2)。左のラベル列 / 左右の
-        // gutter 隙間をクリックしても frac が 0/1 に張り付いて行頭/行末へ飛ばないようにする
-        // (隙間は「seek にも パネルにも使わない安全帯」という設計を守る)。
-        if pos.y >= row_top
-            && pos.y <= row_top + row_h
-            && pos.x >= graph_rect.left()
-            && pos.x <= graph_rect.right()
-        {
-            let frac = ((pos.x - graph_rect.min.x) / graph_rect.width()).clamp(0.0, 1.0);
-            seek_request = Some(row as f64 * row_secs + frac as f64 * row_secs);
-        }
+        seek_request = timeline_seek_target_secs(
+            pos,
+            graph_rect,
+            row_h,
+            row_gap,
+            rows,
+            row_secs,
+            duration_secs,
+        );
     }
     seek_request
+}
+
+/// タイムライン上のクリック/ドラッグ位置 `pos` から seek 先秒を計算する。**グラフ範囲外は
+/// `None`** (= seek しない)。棄却するケース:
+/// - x が波形 `graph_rect` の外 (左ラベル列 / 左右 gutter 隙間) → frac が 0/1 に張り付くのを防ぐ。
+/// - `row >= rows` (最終行より下の余白。viewport > content の空き領域や row_gap)。
+/// - 部分行 (曲末尾が行途中) の末尾以降空白 → 計算 seek 秒が `duration_secs` 以上。
+///
+/// これらを弾かないと余白/末尾余白クリックで曲末尾へ飛び、連続再生でも次曲に進まず停止する
+/// (実機 FB 2026-07-03)。
+fn timeline_seek_target_secs(
+    pos: egui::Pos2,
+    graph_rect: egui::Rect,
+    row_h: f32,
+    row_gap: f32,
+    rows: usize,
+    row_secs: f64,
+    duration_secs: f64,
+) -> Option<f64> {
+    let local_y = pos.y - graph_rect.min.y;
+    let row = (local_y / (row_h + row_gap)).floor().max(0.0) as usize;
+    let row_top = graph_rect.min.y + row as f32 * (row_h + row_gap);
+    if row < rows
+        && pos.y >= row_top
+        && pos.y <= row_top + row_h
+        && pos.x >= graph_rect.left()
+        && pos.x <= graph_rect.right()
+    {
+        let frac = ((pos.x - graph_rect.min.x) / graph_rect.width()).clamp(0.0, 1.0);
+        let t = row as f64 * row_secs + frac as f64 * row_secs;
+        if t < duration_secs {
+            return Some(t);
+        }
+    }
+    None
 }
 
 fn timeline_row_count(duration_secs: f64, row_secs: f64) -> usize {
@@ -2002,6 +2032,33 @@ mod tests {
         assert_eq!(timeline_row_count(f64::NAN, 30.0), 1);
         assert_eq!(timeline_row_count(90.0, 30.0), 3);
         assert_eq!(timeline_row_count(91.0, 30.0), 4);
+    }
+
+    #[test]
+    fn timeline_seek_rejects_outside_graph() {
+        // graph_rect: x=[100,300] (幅200), y=[0..]。row_h=40, row_gap=4, stride=44。
+        // row_secs=30, duration=50 → rows=2 (0-30, 30-60。ただし曲は 50s で 2 行目は部分行)。
+        let g = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(300.0, 400.0));
+        let (row_h, row_gap, rows, row_secs, dur) = (40.0_f32, 4.0_f32, 2usize, 30.0_f64, 50.0_f64);
+        let seek = |x: f32, y: f32| {
+            timeline_seek_target_secs(egui::pos2(x, y), g, row_h, row_gap, rows, row_secs, dur)
+        };
+        // 行 0 の中央 (x=200 → frac 0.5) → 15s。
+        assert_eq!(seek(200.0, 20.0), Some(15.0));
+        // 行 0 の左端 → 0s。
+        assert_eq!(seek(100.0, 20.0), Some(0.0));
+        // x がラベル列側 (graph_rect 左端より左) → None。
+        assert_eq!(seek(80.0, 20.0), None);
+        // x が右 gutter 側 (graph_rect 右端より右) → None。
+        assert_eq!(seek(320.0, 20.0), None);
+        // 最終行より下の余白 (row=3 相当、y=140) → row >= rows で None。
+        assert_eq!(seek(200.0, 140.0), None);
+        // 行間 gap (row 0 の下端 40〜44) → pos.y > row_top+row_h で None。
+        assert_eq!(seek(200.0, 42.0), None);
+        // 部分行 (行 1 = 30-60s、曲は 50s)。行 1 の右端 (frac→1.0 → 60s ≥ duration 50) → None。
+        assert_eq!(seek(300.0, 44.0 + 20.0), None);
+        // 部分行の曲内 (行 1 の左端 x=100 → 30s < 50) → Some(30)。
+        assert_eq!(seek(100.0, 44.0 + 20.0), Some(30.0));
     }
 
     #[test]

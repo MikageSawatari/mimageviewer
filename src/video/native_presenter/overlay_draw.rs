@@ -4838,7 +4838,7 @@ pub(crate) fn draw_overlay_continuous_icon(
     }
 }
 
-pub(super) fn draw_overlay_bookmark_icon(
+pub(crate) fn draw_overlay_bookmark_icon(
     painter: &egui::Painter,
     c: egui::Pos2,
     r: f32,

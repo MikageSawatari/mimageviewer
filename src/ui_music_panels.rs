@@ -18,10 +18,10 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
-    draw_native_jump_panel_body, draw_overlay_button_bg, draw_overlay_continuous_icon,
-    draw_overlay_loop_icon, draw_overlay_pause_icon, draw_overlay_play_icon,
-    draw_overlay_replay_icon, draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon,
-    draw_overlay_speed_control, draw_overlay_volume_slider,
+    draw_native_jump_panel_body, draw_overlay_bookmark_icon, draw_overlay_button_bg,
+    draw_overlay_continuous_icon, draw_overlay_loop_icon, draw_overlay_pause_icon,
+    draw_overlay_play_icon, draw_overlay_replay_icon, draw_overlay_skip_to_marker_icon,
+    draw_overlay_speaker_icon, draw_overlay_speed_control, draw_overlay_volume_slider,
 };
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
@@ -618,7 +618,6 @@ impl App {
 
         let accent = egui::Color32::from_rgb(90, 150, 220);
         let fg = egui::Color32::from_gray(220);
-        let dim = egui::Color32::from_gray(150);
         let painter = ui.painter_at(hud_rect);
         painter.rect_filled(
             hud_rect,
@@ -775,28 +774,27 @@ impl App {
             seek_to = Some(t);
         }
 
-        // ループ (Off → 全体 → ブックマーク間 → Off で循環、動画 L キーと共有)。
-        // 連続再生中は動画同様に無効表示 (クリックは no-op + トースト)。
-        let loop_active = !matches!(loop_eff, crate::settings::VideoLoopMode::Off);
-        let loop_color = if continuous_mode.is_enabled() {
-            egui::Color32::from_gray(90)
+        // ループ (Off → 全体 → ブックマーク間 → Off で循環、動画 L キーと共有)。アイコン描画・
+        // 配色は動画 HUD (native_presenter) と揃える: 連続再生中は淡色 + no-op、mode_active は
+        // 水色、ブックマークモードは「ブックマークアイコン + 小さめループアイコン」の合成表示。
+        use crate::settings::VideoLoopMode;
+        let continuous_active = continuous_mode.is_enabled();
+        let mode_active = !continuous_active && !matches!(loop_eff, VideoLoopMode::Off);
+        let loop_icon_color = if continuous_active {
+            egui::Color32::from_gray(120)
+        } else if mode_active {
+            egui::Color32::from_rgb(170, 230, 255)
         } else {
-            match loop_eff {
-                crate::settings::VideoLoopMode::Off => dim,
-                crate::settings::VideoLoopMode::Bookmark => {
-                    egui::Color32::from_rgb(255, 220, 82) // ブックマークマーカーと同色
-                }
-                _ => egui::Color32::WHITE, // Full (Chapter は音声で Full 降格)
-            }
+            egui::Color32::from_rgb(238, 238, 238)
         };
-        let loop_tooltip = if continuous_mode.is_enabled() {
-            "ループ (連続再生中は無効)"
+        let loop_tooltip = if continuous_active {
+            "連続再生中はループ無効"
         } else {
             match loop_eff {
-                crate::settings::VideoLoopMode::Off => "ループしない",
-                crate::settings::VideoLoopMode::Full => "全体ループ",
-                crate::settings::VideoLoopMode::Bookmark => "ブックマークループ",
-                crate::settings::VideoLoopMode::Chapter => "全体ループ",
+                VideoLoopMode::Off => "ループ再生",
+                VideoLoopMode::Full => "ループ: 全体",
+                VideoLoopMode::Bookmark => "ループ: ブックマーク",
+                VideoLoopMode::Chapter => "ループ: 全体",
             }
         };
         let r = alloc(&mut x, bsz);
@@ -810,10 +808,31 @@ impl App {
         draw_overlay_button_bg(
             &painter,
             r,
-            resp.hovered(),
-            loop_active && !continuous_mode.is_enabled(),
+            resp.hovered() && !continuous_active,
+            mode_active,
         );
-        draw_overlay_loop_icon(&painter, r.center(), bsz * 0.36, loop_color);
+        let ir = bsz * 0.36;
+        let ic = r.center();
+        match loop_eff {
+            VideoLoopMode::Bookmark => {
+                // 動画 HUD と同じ「上=ブックマーク / 下=小さめループ」の合成 (Chapter は音声に無い)。
+                draw_overlay_loop_icon(
+                    &painter,
+                    egui::pos2(ic.x, ic.y + ir * 0.18),
+                    ir * 0.65,
+                    loop_icon_color,
+                );
+                draw_overlay_bookmark_icon(
+                    &painter,
+                    egui::pos2(ic.x, ic.y - ir * 0.55),
+                    ir * 0.32,
+                    egui::Color32::from_rgb(255, 220, 82),
+                );
+            }
+            _ => {
+                draw_overlay_loop_icon(&painter, ic, ir, loop_icon_color);
+            }
+        }
         if resp.clicked() {
             cycle_loop = true;
         }
