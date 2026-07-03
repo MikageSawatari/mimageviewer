@@ -16,6 +16,10 @@ use std::path::Path;
 use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
+// 音楽ビューはメイン egui ctx (アプリテーマ = Light になり得る) に描くため、egui 既定の
+// `on_hover_text` はツールチップが明色になる。動画 native HUD (専用ダーク ctx) と見た目を
+// 揃えるため、ctx テーマに依らずダーク枠で描く `hover_tip_dark` を使う。
+use crate::ui_helpers::HoverTipExt;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
     draw_native_jump_panel_body, draw_overlay_bookmark_icon, draw_overlay_button_bg,
@@ -733,6 +737,11 @@ impl App {
 
         let seek_row_h = 22.0;
         let controls_cy = (hud_rect.top() + seek_row_h + hud_rect.bottom()) * 0.5;
+        // 動画 native HUD と同じ 2 系統: アイコン/ドット/スライダーは幾何中心 (controls_cy)、
+        // テキストは +4.0 した baseline (text_center_y) に置く。egui の CENTER 揃えは text bbox の
+        // 中心を合わせるので、13px フォントだと光学的に上寄りに見え、ドット/アイコンと縦がずれる。
+        // 動画側 `text_center_y = center_y + 4.0` (native_presenter/mod.rs) と同値。
+        let text_center_y = controls_cy + 4.0;
 
         // 収集する操作 (描画中は self を可変借用しないため、末尾でまとめて適用)。
         let mut seek_to: Option<f64> = None;
@@ -824,7 +833,7 @@ impl App {
                 ui.id().with(("music_hud_start", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text("頭出し");
+            .hover_tip_dark("頭出し");
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_replay_icon(&painter, r.center(), bsz * 0.36);
         if resp.clicked() {
@@ -839,7 +848,7 @@ impl App {
                 ui.id().with(("music_hud_play", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text(if playing { "一時停止" } else { "再生" });
+            .hover_tip_dark(if playing { "一時停止" } else { "再生" });
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         if playing {
             draw_overlay_pause_icon(&painter, r.center(), bsz * 0.30);
@@ -858,7 +867,7 @@ impl App {
                 ui.id().with(("music_hud_prevbm", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text("前のブックマーク");
+            .hover_tip_dark("前のブックマーク");
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_skip_to_marker_icon(&painter, r, -1, markers_present);
         if resp.clicked() {
@@ -877,7 +886,7 @@ impl App {
                 ui.id().with(("music_hud_nextbm", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text("次のブックマーク");
+            .hover_tip_dark("次のブックマーク");
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_skip_to_marker_icon(&painter, r, 1, markers_present);
         if resp.clicked()
@@ -916,7 +925,7 @@ impl App {
                 ui.id().with(("music_hud_loop", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text(loop_tooltip);
+            .hover_tip_dark(loop_tooltip);
         draw_overlay_button_bg(
             &painter,
             r,
@@ -962,7 +971,7 @@ impl App {
                 ui.id().with(("music_hud_continuous", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text(cont_tooltip);
+            .hover_tip_dark(cont_tooltip);
         draw_overlay_button_bg(&painter, r, resp.hovered(), continuous_mode.is_enabled());
         draw_overlay_continuous_icon(&painter, r, continuous_mode);
         if resp.clicked() {
@@ -989,10 +998,13 @@ impl App {
                     if lim_resp.hovered() { 4.5 } else { 4.0 },
                     egui::Color32::from_rgb(255, 72, 72),
                 );
-                lim_resp.on_hover_text("出力リミッターが作動しました");
+                lim_resp.hover_tip_dark("出力リミッターが作動しました");
                 ui.ctx().request_repaint(); // 点灯期限まで消灯を反映するため repaint
             }
-            rx -= limiter_slot_w + 6.0;
+            // ドット中心は rx - limiter_slot_w*0.5。スロットぶん詰めると dB ラベル右端が
+            // ドット中心の limiter_slot_w*0.5 (=7px) 左に来て、動画 HUD の vol_label→limiter
+            // 間隔と一致する。
+            rx -= limiter_slot_w;
         }
         // 現在音量の dB 表示ラベル (最右、動画 HUD の「スライダーの右」配置に合わせる)。
         // ミュート状態に関わらず実効音量を dB で示す。共有の
@@ -1005,7 +1017,7 @@ impl App {
             fg
         };
         painter.text(
-            egui::pos2(rx, controls_cy),
+            egui::pos2(rx, text_center_y),
             egui::Align2::RIGHT_CENTER,
             vol_db_label,
             egui::FontId::proportional(13.0),
@@ -1108,7 +1120,7 @@ impl App {
                     ui.id().with(("music_hud_normalize", fs_idx)),
                     egui::Sense::click(),
                 )
-                .on_hover_text(norm_tooltip);
+                .hover_tip_dark(norm_tooltip);
             draw_overlay_button_bg(
                 &painter,
                 norm_rect,
@@ -1129,7 +1141,7 @@ impl App {
                 egui::Color32::from_gray(180)
             };
             painter.text(
-                norm_rect.center(),
+                egui::pos2(norm_rect.center().x, text_center_y),
                 egui::Align2::CENTER_CENTER,
                 "Norm",
                 egui::FontId::proportional(11.0),
@@ -1154,7 +1166,7 @@ impl App {
                 ui.id().with(("music_hud_mute", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text(if muted {
+            .hover_tip_dark(if muted {
                 "ミュート解除"
             } else {
                 "ミュート"
@@ -1187,7 +1199,7 @@ impl App {
             ui,
             &painter,
             spd_r,
-            spd_r.center().y,
+            text_center_y,
             speed,
             ui.id().with(("music_hud_speed", fs_idx)),
             ui.id().with(("music_hud_speed_popup", fs_idx)),
@@ -1199,7 +1211,7 @@ impl App {
         );
         // 時間 (速度ボタンの左に右寄せ)
         painter.text(
-            egui::pos2(rx, controls_cy),
+            egui::pos2(rx, text_center_y),
             egui::Align2::RIGHT_CENTER,
             format!("{} / {}", format_hms(pos), format_hms(dur)),
             egui::FontId::proportional(13.0),
@@ -1400,7 +1412,7 @@ impl App {
                 ui.id().with(("music_normalize_cancel", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text("キャンセル [ESC]");
+            .hover_tip_dark("キャンセル [ESC]");
         let cancel_color = if cancel_resp.hovered() {
             egui::Color32::from_rgb(255, 120, 120)
         } else {
