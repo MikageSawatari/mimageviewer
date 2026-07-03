@@ -202,7 +202,7 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 | D5.1 | ブックマーク import/export | **動画のブックマーク機構をそのまま再利用**（ユーザー確定 2026-07-01「フォーマットは動画と同じ」）。フォーマットは純関数モジュール `src/video_bookmarks_parser.rs`（`parse_chapter_text` / `format_chapter_lines`）= `mm:ss タイトル` / `h:mm:ss タイトル`（markdown リンク耐性・ms 精度・秒 floor の互換モード）。import = 動画と同じ一括登録ダイアログ（貼り付け→プレビュー→エラー行表示）、export = クリップボード（`seconds_only` トグル）、現在位置に追加 = 動画の `KeyAction::VideoBookmark`（既定 `B`）と同系。保存も動画のブックマーク保存経路を音声 path key で共有（別テーブルを作らず動画機構に相乗り、`music-core::MusicBookmark` は左パネル表示用の変換型）。 |
 | D6 | VST3 | **既存 audio pump のチェーンを共有**。`VideoPlayer::open(...)` に `dsp_bridge` を渡すだけで normalize→VST3→limiter を通る。上バーに VST3 トグル（`overlay_draw.rs` の `NativeOverlayCommand::ToggleVst3Gui` / `NativeTopButtonGlyph::Vst3` を音楽ビューにも）。追加配線はほぼ不要。 |
 | D7 | 動画→音声モード | `MediaVisualMode::Music` + `MusicModeSource::VideoAudioOnly`。**同一 `VideoPlayer` の映像面のみ停止/隠蔽**し、音声は継続。位置・音量・VST を引き継ぐ。逆トグルで映像復帰。**状態は記憶しない（セッション中の一時トグル、永続スキーマ無し）**（ユーザー確定 2026-07-01）。**最難関につき単独 Inc（§8 Inc 7）に隔離**。 |
-| D8 | 永続化 | 正本 = 中央 `audio_analysis.db`（SQLite）。`TimelineAnalysis` + `BeatGrid` + ブックマーク + ユーザー補正を保存。row texture / spectrum frame / playback buffer は transient（保存しない）。 |
+| D8 | 永続化 | **タイムライン解析は永続化しない = in-memory LRU（2026-07-03 方針転換）**。当初は中央 `audio_analysis.db`（SQLite）に `TimelineAnalysis` を保存する設計だったが、**spectrum が再生位置 ±1 秒窓のため全尺 PCM を毎回デコードする**ので、永続キャッシュが節約するのは解析パスだけで実利が薄い（progressive 表示で miss 体験も滑らか）。→ 直近 N 曲（`MUSIC_ANALYSIS_LRU_MAX=6` 件 or `MUSIC_ANALYSIS_LRU_MAX_BINS=150万` bin 予算のどちらか先）だけ `Arc<TimelineAnalysis>` をメモリ保持し、セッション内の A/B 切替を即時にする（`src/app.rs` `music_analysis_lru`）。ブックマークは動画 `video_bookmarks.rs` 経路に相乗り（別テーブル無し、D5.1）。row texture / spectrum frame / playback buffer は transient。 |
 | D9 | 解析経路 | **再生と独立した解析ワーカー**が FFmpeg でファイルを PCM decode → `analyze_stereo_timeline`。再生 pacing と非同期。spectrum は playback ring buffer から短窓を tap。UI スレッドで解析しない。 |
 | D10 | ロジック | `music-core` を再利用（§2.1）。加法ヘルパーのみ許容。 |
 | D11 | マイグレーション | **新機能＝未リリース**。旧 mIV データからの移行は不要（コミットにその旨記載）。ラボ `.music.json` からの取り込みは別途指示があるまで行わない。 |
@@ -233,21 +233,21 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   （映像デコード/アップロードを走らせない）。`dsp_bridge` は VST3 用に渡す（D6）。
 - 再生制御は §2.2 の公開メソッドをそのまま呼ぶ。`step_frame` は音声では使わない（seek で代替）。
 
-### 5.3 解析ワーカー + `audio_analysis.db`（UI スレッド外）
+### 5.3 解析ワーカー + in-memory LRU（UI スレッド外）
 - `docs/async-architecture.md` のワーカーテンプレ（`XxxPending { cancel, rx }` + `start_xxx` /
-  `poll_xxx` + cancel 3 箇所）で **解析ワーカー**を新設。入力 = path + cancel、出力 =
-  `Probed` / `PartialTimeline`（約5秒単位の部分解析）/ `Loaded`（全尺確定）/ `Failed`。
+  `poll_xxx` + cancel 3 箇所）で **解析ワーカー**を新設。入力 = path + cancel + `want_analysis`、
+  出力 = `Probe` / `Timeline`（progressive 部分解析、display 専用）/ `TimelineComplete`（全尺確定・
+  LRU に載せる）/ `Pcm`（spectrum 用）。
 - ワーカー内: **FFmpeg で PCM decode → インターリーブ stereo f32 → `analyze_stereo_timeline`**。
-  decode は `src/video/decoder.rs` の FFmpeg 経路を「音声全尺 decode-to-PCM」モードで流用するか、
-  軽量 avformat/avcodec decode を新設（**Inc 2 で確定、§11**）。
-- 永続化 = `src/audio_analysis_db.rs`。**実装した識別キー = path (PK) + size + mtime +
-  `analysis_version`**（size+mtime+path で内容を一意に識別できるので、duration / sample_rate /
-  channels はキーに含めない — これらは解析の派生値で `TimelineAnalysis.stream` に格納して表示に使う）。
-  size / mtime / version のいずれかがずれれば stale とみなして再解析。
-  ※ mtime は他キャッシュ（catalog / thumbnail）と同じ秒精度。同一秒内・同一サイズでの上書きは
-  既存キャッシュ同様のごく稀な取りこぼしを許容する（`docs/preset-and-adjustment.md` の
-  キャッシュ無効化と同水準）。
-- UI スレッドは受信を **1 frame 上限件数**で処理し、部分解析を merge、該当 row version だけ
+  decode = `src/audio_decode.rs`（`decode_audio_file_to_stereo_f32_streaming`、48kHz stereo）。
+- **永続化はしない（2026-07-03 方針転換、D8）**。旧 `src/audio_analysis_db.rs`（SQLite）は削除。
+  代わりに UI スレッドが `Arc<TimelineAnalysis>` を **in-memory LRU**（`music_analysis_lru`）で保持
+  する。LRU キー = path (正規化) + size + mtime（`image_metas` から供給、UI スレッド stat 不要）。
+  `ensure_music_analysis` が LRU を lookup し、ヒットならタイムラインを即セット + ワーカーを
+  `want_analysis=false`（spectrum PCM だけデコード）で起動、miss なら `want_analysis=true`。
+  `TimelineComplete` 受信時のみ LRU へ挿入（progressive partial は載せない）。size 不明のビューは
+  LRU を使わない（stale hit 回避）。
+- UI スレッドは受信を **1 frame 上限件数**で処理し、progressive 部分解析で該当 row version を
   invalidate（`docs/ui-responsiveness.md` §4 準拠）。
 
 ### 5.4 音楽ビュー（フルスクリーン）— timeline canvas + 上情報バー + 下シークバー
@@ -435,32 +435,29 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 
 ## 6. 永続化設計（D8 / D11）
 
-- **正本 = `audio_analysis.db`**（`src/audio_analysis_db.rs`、新設）:
-  - `audio_analysis` テーブル: key（path/size/mtime/analysis_version）+ `doc BLOB`。
-    **保存形式 = u16 量子化バイナリ + deflate（v2、2026-07-03）**。旧 v1 は `TimelineAnalysis`
-    を JSON TEXT で持っていたが、10ms bin × 長尺曲（数時間のコンサート/メガミックス）で
-    **1 曲 400MB 超・DB 全体 1.4GB** に肥大したため置き換えた（684B/bin → 84B/bin + deflate
-    ≒ 23x 削減、実測 13 曲 1.43GB → 推定 ~62MB）。波形 bin は表示専用なので 0..1 値を u16
-    （65535 段階）、loudness を i16（0.01dB）、pitch class を u8 に量子化し、`start_secs` /
-    `duration_secs` は `sample_rate` + `bin_secs` + bin index から復元（冗長なので保存しない）。
-    `beat_grid` / `stream` / `config` は小さいので JSON で正確に持つ。`PRAGMA user_version` +
-    BLOB 内 `analysis_version` の二重ガード。
-  - `bookmarks`（= 動画機構を再利用、別テーブルは作らない、D5.1）。
-  - 壊れ BLOB / no-row = 空扱い（クラッシュさせない、comic §6.1 と同流儀）。
-  - **削除 UI**: 環境設定 → 動画ページの「音量ノーマライズ測定値」の隣に「オーディオ解析
-    キャッシュ」節（サイズ表示 + 削除）を追加（2026-07-03）。削除は `delete_cache_files`
-    （DB ファイルを unlink）で行う: `DELETE + VACUUM` は UI をブロックしうる（Codex P2）ため
-    避け、ファイルごと削除して全容量を即解放する（SQLite ロックも介さない = `database is
-    locked` を回避、Codex P3）。
-- **キー生成**: 実ファイルは path そのもの。動画→音声モード（`VideoAudioOnly`）は動画 path を key に。
-  **ZIP/PDF 内の音声は対象外**（初期スコープ = **実ファイル音声 + 実ファイル動画のみ**。ユーザー確定 2026-07-01）。
-- **未リリース = マイグレーション不要**（D11）。v1（JSON）→ v2（量子化 BLOB）も移行コードを
-  書かず、`open_at` が `user_version != 2` を検出したら **DB ファイルごと削除して作り直す**
-  （`needs_reset`、旧 1.4GB を確実に解放）。開発中に溜まったテスト DB は手動削除で足りる。
+- **正本 = in-memory LRU（永続化しない、2026-07-03 方針転換、D8）**:
+  - `src/app.rs` の `music_analysis_lru: Vec<(MusicAnalysisKey, Arc<TimelineAnalysis>)>`。
+    キー = path（正規化）+ size + mtime。件数上限 `MUSIC_ANALYSIS_LRU_MAX=6` と bin 総数予算
+    `MUSIC_ANALYSIS_LRU_MAX_BINS=150万` のどちらか先に達した方で古い方から追い出す。単曲が
+    予算超（数時間コンサート ~67 万 bin は入るが桁違いの巨大曲）なら LRU に載せない（小さい
+    有用エントリを追い出さない、Codex P2）。`music_analysis_lru_insert_bounded` はユニットテスト
+    済み（件数/予算/超過スキップ/move-to-front）。
+  - `TimelineComplete`（全尺確定）だけを LRU に載せる。progressive partial は display 専用で
+    載せない（途中 prefix を確定版として誤キャッシュしない）。
+  - キーは `image_metas`（フォルダスキャン済み (mtime,size)）から作るので UI スレッド stat 不要。
+    size 不明のビューでは LRU を使わない（stale hit 回避、Codex P2）。
+  - **なぜ永続 DB をやめたか**: spectrum が再生位置 ±1 秒窓のため全尺 PCM を毎回デコードする
+    ので、永続キャッシュが節約するのは解析パスだけで実利が薄い。progressive 表示で miss 体験
+    も滑らか。→ セッション内の A/B 切替を即時にする in-memory LRU で十分。
+  - **旧 `audio_analysis.db`（`src/audio_analysis_db.rs`、u16 量子化 BLOB + deflate、削除 UI）は
+    撤去（superseded）**。未リリースにつきマイグレーション不要（D11）。旧経緯は git 履歴参照
+    （commit b00b26f8/47584c44 で 23x 縮小したが、上記の理由で永続化自体をやめた）。
 - **ブックマークは動画機構を再利用**（D5.1、ユーザー確定 2026-07-01「フォーマットは動画と同じ」）:
-  保存 = `src/video_bookmarks.rs` の経路を音声 path key で共有（`audio_analysis.db` に別テーブルは作らない）。
+  保存 = `src/video_bookmarks.rs` の経路を音声 path key で共有（専用テーブルは作らない）。
   import/export フォーマット = `src/video_bookmarks_parser.rs`（`mm:ss タイトル`）。埋め込みチャプター
   からの取り込みは初期スコープ外（動画側にも無いので揃える）。
+- **対象範囲**: 実ファイル音声 + 実ファイル動画のみ。動画→音声モード（`VideoAudioOnly`）は動画
+  path を key に。**ZIP/PDF 内の音声は対象外**（ユーザー確定 2026-07-01）。
 
 ---
 
@@ -551,8 +548,11 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
     デコードして 48kHz interleaved stereo f32 PCM を作る（`decode_audio_file_to_stereo_f32`）。
     packed f32 抽出手順は `video/decoder.rs` の実績実装を踏襲。`analyze_audio_file` が
     decode → `analyze_stereo_timeline` を合成。
-  - ✅ `src/audio_analysis_db.rs`: `TimelineAnalysis` の SQLite キャッシュ。key = path +
-    size + mtime + `analysis_version`（version/identity gate）。no-row / stale / 壊れ JSON は None。
+  - ~~`src/audio_analysis_db.rs`: `TimelineAnalysis` の SQLite キャッシュ~~ **→ 撤去（2026-07-03、
+    §6/D8 参照）**。当初は path+size+mtime+`analysis_version` の SQLite キャッシュだったが、
+    永続化自体をやめて in-memory LRU（`music_analysis_lru`）に置き換えた（spectrum が全尺 PCM を
+    毎回デコードするので永続キャッシュの実利が薄い）。以降の Inc 3b/4/5 の記述で
+    `audio_analysis_db` 参照/保存とあるのは、この LRU 経路に読み替える。
   - ✅ **決定性テスト**: 固定合成 PCM → `analyze_stereo_timeline` が安定（bins/version 一致）。
     DB roundtrip / stale / version-gate / 壊れ JSON テスト計 7 本。
   - **📌 増分境界の調整（2026-07-02）**: 当初 Inc 2 に含めた「解析ワーカー（背景スレッド +

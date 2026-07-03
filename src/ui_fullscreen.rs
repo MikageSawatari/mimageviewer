@@ -19140,7 +19140,9 @@ impl App {
         // シークバーのマーカー表示に使う)。
         if let Some(GridItem::Audio(p)) = self.items.get(fs_idx) {
             let p = p.clone();
-            self.ensure_music_analysis(&p);
+            // LRU キー用の (mtime, size)。フォルダスキャンで image_metas に入っている。
+            let meta = self.image_metas.get(fs_idx).copied().flatten();
+            self.ensure_music_analysis(&p, meta);
             self.ensure_music_bookmarks_loaded(&p);
         }
         self.poll_music_analysis(ctx);

@@ -5463,7 +5463,6 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 
     draw_audio_normalize_cache_controls(ui, state);
-    draw_audio_analysis_cache_controls(ui, state);
 
     ui.add_space(12.0);
     ui.separator();
@@ -5553,73 +5552,6 @@ fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut Preference
             });
         if !open {
             state.audio_normalize_clear_confirm_open = false;
-        }
-    }
-}
-
-/// 音楽ビューの波形解析キャッシュ (`audio_analysis.db`) のサイズ表示 + 削除。音量ノーマライズ
-/// 測定値の削除と同じ音声系の管理操作としてまとめる (ユーザー要望 2026-07-03)。実際の削除は
-/// `preferences.rs` の `audio_analysis_clear_requested` one-shot で実行する。
-fn draw_audio_analysis_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    ui.add_space(12.0);
-    ui.label(egui::RichText::new("オーディオ解析キャッシュ").strong());
-    ui.add_space(4.0);
-
-    let size = state.audio_analysis_size_bytes;
-    ui.label(format!(
-        "音楽ビューの波形解析キャッシュ (audio_analysis.db) の現在のサイズ: {}",
-        crate::ui_helpers::format_bytes(size)
-    ));
-    ui.label(
-        egui::RichText::new(
-            "削除しても再生には影響しません。次に開いた音声は波形が再解析されます。",
-        )
-        .small()
-        .weak(),
-    );
-    ui.add_space(4.0);
-    if ui
-        .add_enabled(
-            size > 0,
-            egui::Button::new("オーディオ解析キャッシュを削除"),
-        )
-        .clicked()
-    {
-        state.audio_analysis_clear_result = None;
-        state.audio_analysis_clear_confirm_open = true;
-    }
-
-    if let Some(msg) = state.audio_analysis_clear_result.as_deref() {
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(msg).small());
-    }
-
-    if state.audio_analysis_clear_confirm_open {
-        let mut open = true;
-        let size_str = crate::ui_helpers::format_bytes(state.audio_analysis_size_bytes);
-        egui::Window::new("オーディオ解析キャッシュの削除")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "オーディオ解析キャッシュ ({size_str}) をすべて削除しますか？"
-                ));
-                ui.label("次回以降、必要な音声は波形が再解析されます。");
-                ui.label("この操作は元に戻せません。");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("削除").clicked() {
-                        state.audio_analysis_clear_requested = true;
-                        state.audio_analysis_clear_confirm_open = false;
-                    }
-                    if ui.button("キャンセル").clicked() {
-                        state.audio_analysis_clear_confirm_open = false;
-                    }
-                });
-            });
-        if !open {
-            state.audio_analysis_clear_confirm_open = false;
         }
     }
 }

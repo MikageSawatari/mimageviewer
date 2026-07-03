@@ -23,7 +23,6 @@ pub mod adjustment_db;
 pub mod ai;
 pub mod archive_cache;
 pub mod archive_converter;
-pub mod audio_analysis_db;
 pub mod audio_decode;
 pub mod audio_normalize_db;
 pub mod auto_aspect;

@@ -186,6 +186,8 @@ music lab の非同期処理は、mIV 本体の `docs/async-architecture.md` と
 - ラボ単体の実機確認は [music-lab-validation-checklist.md](music-lab-validation-checklist.md) を使う。
 - 解析 / DB / waveform 生成は UI thread で行わない。
 - 解析結果は `audio_analysis.db` へ path + size + mtime + duration + sample_rate + channels + analysis_version で保存する。
+  （※ **本体統合では永続 DB をやめ in-memory LRU に変更**。spectrum が全尺 PCM を毎回デコードする
+  ので永続化の実利が薄いため。詳細は [music-integration-plan.md](music-integration-plan.md) §6/D8。）
 - 小節頭と BPM は誤検出がある前提で、手動補正を永続化する。
 - lab の簡易ビート推定は低信頼度ならグリッドを描かず、本体統合時は
   beat/downbeat 専用エンジンか手動補正 UI に置き換える。
