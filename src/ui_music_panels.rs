@@ -18,10 +18,10 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
-    draw_native_jump_panel_body, draw_overlay_button_bg, draw_overlay_loop_icon,
-    draw_overlay_pause_icon, draw_overlay_play_icon, draw_overlay_replay_icon,
-    draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon, draw_overlay_speed_control,
-    draw_overlay_volume_slider,
+    draw_native_jump_panel_body, draw_overlay_button_bg, draw_overlay_continuous_icon,
+    draw_overlay_loop_icon, draw_overlay_pause_icon, draw_overlay_play_icon,
+    draw_overlay_replay_icon, draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon,
+    draw_overlay_speed_control, draw_overlay_volume_slider,
 };
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
@@ -130,10 +130,14 @@ impl App {
         }
     }
 
-    fn music_seek_to(&self, fs_idx: usize, secs: f64) {
+    /// 音楽ビューの全 seek はこの helper に集約する (HUD シークバー / ブックマークジャンプ /
+    /// timeline クリック / コマンド翻訳)。seek 後にブックマーク区間ループの `loop_target_secs`
+    /// を再計算するため `apply_music_loop_mode` を必ず通す (旧区間の target 残留を防ぐ、Codex P2)。
+    pub(crate) fn music_seek_to(&mut self, fs_idx: usize, secs: f64) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.seek(secs.max(0.0));
         }
+        self.apply_music_loop_mode(fs_idx);
     }
 
     fn music_audio_path(&self, fs_idx: usize) -> Option<std::path::PathBuf> {
@@ -597,9 +601,14 @@ impl App {
             _ => (1.0, false),
         };
         let speed = self.video_playback_speed;
-        let loop_on = self.music_loop_enabled;
+        // ループ / 連続再生モードは動画と共有 (video_loop_mode / video_continuous_mode)。
+        // 音声はチャプター無しなので effective は Off/Full/Bookmark のみ。
+        let continuous_mode = self.video_continuous_mode;
         // マーカー / ジャンプ用に pts をスナップショット (self.music_bookmarks の借用回避)。
         let marker_secs: Vec<f64> = self.music_bookmarks.iter().map(|b| b.pts_secs).collect();
+        let has_bm_now = self.music_bookmarks_loaded_for.is_some() && !marker_secs.is_empty();
+        let loop_eff =
+            crate::settings::effective_loop_mode(self.settings.video_loop_mode, false, has_bm_now);
 
         let accent = egui::Color32::from_rgb(90, 150, 220);
         let fg = egui::Color32::from_gray(220);
@@ -618,7 +627,8 @@ impl App {
         let mut seek_to: Option<f64> = None;
         let mut toggle_play = false;
         let mut seek_start = false;
-        let mut toggle_loop = false;
+        let mut cycle_loop = false;
+        let mut cycle_continuous = false;
         let mut toggle_mute = false;
         let mut set_vol: Option<f64> = None;
         // `set_speed` は速度ボタン描画時に `draw_overlay_speed_control` の返り値で一度だけ
@@ -759,7 +769,30 @@ impl App {
             seek_to = Some(t);
         }
 
-        // ループ
+        // ループ (Off → 全体 → ブックマーク間 → Off で循環、動画 L キーと共有)。
+        // 連続再生中は動画同様に無効表示 (クリックは no-op + トースト)。
+        let loop_active = !matches!(loop_eff, crate::settings::VideoLoopMode::Off);
+        let loop_color = if continuous_mode.is_enabled() {
+            egui::Color32::from_gray(90)
+        } else {
+            match loop_eff {
+                crate::settings::VideoLoopMode::Off => dim,
+                crate::settings::VideoLoopMode::Bookmark => {
+                    egui::Color32::from_rgb(255, 220, 82) // ブックマークマーカーと同色
+                }
+                _ => egui::Color32::WHITE, // Full (Chapter は音声で Full 降格)
+            }
+        };
+        let loop_tooltip = if continuous_mode.is_enabled() {
+            "ループ (連続再生中は無効)"
+        } else {
+            match loop_eff {
+                crate::settings::VideoLoopMode::Off => "ループしない",
+                crate::settings::VideoLoopMode::Full => "全体ループ",
+                crate::settings::VideoLoopMode::Bookmark => "ブックマークループ",
+                crate::settings::VideoLoopMode::Chapter => "全体ループ",
+            }
+        };
         let r = alloc(&mut x, bsz);
         let resp = ui
             .interact(
@@ -767,16 +800,36 @@ impl App {
                 ui.id().with(("music_hud_loop", fs_idx)),
                 egui::Sense::click(),
             )
-            .on_hover_text("ループ");
-        draw_overlay_button_bg(&painter, r, resp.hovered(), loop_on);
-        draw_overlay_loop_icon(
+            .on_hover_text(loop_tooltip);
+        draw_overlay_button_bg(
             &painter,
-            r.center(),
-            bsz * 0.36,
-            if loop_on { egui::Color32::WHITE } else { dim },
+            r,
+            resp.hovered(),
+            loop_active && !continuous_mode.is_enabled(),
         );
+        draw_overlay_loop_icon(&painter, r.center(), bsz * 0.36, loop_color);
         if resp.clicked() {
-            toggle_loop = true;
+            cycle_loop = true;
+        }
+
+        // 連続再生 (Off → 連続 → 連続+ループ で循環、動画と共有)。
+        let cont_tooltip = match continuous_mode {
+            crate::video::VideoContinuousMode::Off => "連続再生: OFF",
+            crate::video::VideoContinuousMode::Continuous => "連続再生",
+            crate::video::VideoContinuousMode::ContinuousLoop => "連続再生 + ループ",
+        };
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_continuous", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(cont_tooltip);
+        draw_overlay_button_bg(&painter, r, resp.hovered(), continuous_mode.is_enabled());
+        draw_overlay_continuous_icon(&painter, r, continuous_mode);
+        if resp.clicked() {
+            cycle_continuous = true;
         }
 
         // ── コントロール行: 右クラスタ (右寄せ: dB ラベル / 音量 / ミュート / 速度 / 時間) ──
@@ -920,11 +973,9 @@ impl App {
         if !interactive {
             return;
         }
+        let ctx = ui.ctx().clone();
         if seek_start {
             seek_to = Some(0.0);
-        }
-        if toggle_loop {
-            self.music_loop_enabled = !loop_on;
         }
         if let Some(s) = set_speed {
             self.video_playback_speed = s;
@@ -941,18 +992,13 @@ impl App {
         if vol_persist {
             self.settings.save();
         }
+        // player 直操作 (seek はループ target 再計算のため music_seek_to に集約するので除く)。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            if let Some(s) = seek_to {
-                player.seek(s);
-            }
             if seek_start {
                 player.set_playing(true);
             }
             if toggle_play {
                 player.toggle_play();
-            }
-            if toggle_loop {
-                player.set_loop_enabled(!loop_on);
             }
             if let Some(s) = set_speed {
                 player.set_playback_speed(s);
@@ -963,6 +1009,18 @@ impl App {
             if let Some(v) = set_vol {
                 player.set_volume(v);
             }
+        }
+        // seek はブックマーク区間ループの target 再計算を伴うので専用 helper に寄せる
+        // (全 seek 経路を単一化、Codex 設計 P2)。
+        if let Some(s) = seek_to {
+            self.music_seek_to(fs_idx, s);
+        }
+        // ループ / 連続再生の切替 (共有 video_loop_mode / video_continuous_mode)。
+        if cycle_loop {
+            self.cycle_music_loop_mode(&ctx, fs_idx);
+        }
+        if cycle_continuous {
+            self.cycle_music_continuous_mode(&ctx, fs_idx);
         }
     }
 }

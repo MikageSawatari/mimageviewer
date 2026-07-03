@@ -615,6 +615,47 @@ fn next_video_search_uses_display_order_and_skips_non_video_items() {
 }
 
 #[test]
+fn next_audio_search_uses_display_order_and_skips_non_audio_items() {
+    use crate::grid_item::GridItem;
+
+    // 音声を挟んだ混在リスト。連続再生は display 順で次の Audio だけを拾う。
+    let items = vec![
+        GridItem::Audio(PathBuf::from("c:/1.flac")),
+        GridItem::Image(PathBuf::from("c:/a.jpg")),
+        GridItem::Video(PathBuf::from("c:/b.mp4")),
+        GridItem::Audio(PathBuf::from("c:/2.m4a")),
+        GridItem::Folder(PathBuf::from("c:/sub")),
+    ];
+    let order = vec![0, 1, 2, 3, 4];
+
+    assert_eq!(
+        App::find_next_audio_in_display_order_from(&items, &order, 0, false),
+        Some(3),
+        "画像 / 動画 / フォルダを飛ばして次の音声を選ぶ"
+    );
+    assert_eq!(
+        App::find_next_audio_in_display_order_from(&items, &order, 3, false),
+        None,
+        "末尾側に音声が無ければ連続再生は停止する"
+    );
+    assert_eq!(
+        App::find_next_audio_in_display_order_from(&items, &order, 3, true),
+        Some(0),
+        "連続 + ループは display_order の先頭側へ wrap する"
+    );
+    assert_eq!(
+        App::find_next_audio_in_display_order_from(&items, &[0], 0, true),
+        Some(0),
+        "表示リストに音声 1 本だけなら同じ音声を繰り返す"
+    );
+    assert_eq!(
+        App::find_next_audio_in_display_order_from(&items, &[1, 2, 4], 0, true),
+        None,
+        "現在音声が表示リスト外で、wrap しても音声候補が無ければ None"
+    );
+}
+
+#[test]
 fn fullscreen_keep_set_keeps_current_image_when_filtered_out() {
     use crate::grid_item::GridItem;
 

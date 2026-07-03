@@ -5253,12 +5253,16 @@ impl App {
                         let input_t0 = std::time::Instant::now();
 
                         // ── キー入力 ──
-                        let active_scopes =
-                            if matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
-                                FS_VIDEO_ACTIVE_SCOPES
-                            } else {
-                                FS_IMAGE_ACTIVE_SCOPES
-                            };
+                        // 音声 (映像なし動画) は動画スコープの Video* アクション (L / B / 音量 /
+                        // 前後ファイル) を共有するので、ショートカット一覧も動画スコープを使う。
+                        let active_scopes = if matches!(
+                            self.items.get(fs_idx),
+                            Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+                        ) {
+                            FS_VIDEO_ACTIVE_SCOPES
+                        } else {
+                            FS_IMAGE_ACTIVE_SCOPES
+                        };
                         if let Some(keys) =
                             fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes)
                         {
@@ -7881,6 +7885,19 @@ impl App {
             && self.keymap.consume_action(ctx, KeyAction::VideoBookmark)
         {
             self.add_music_bookmark_at_current(fs_idx);
+        }
+
+        // 音楽ビュー: L キーでループモード切替 (動画の `KeyAction::VideoLoop` を共有、
+        // Off → 全体 → ブックマーク間 → Off で循環)。連続再生中は cycle_music_loop_mode 内で
+        // no-op + トースト。モーダル / IME / TextEdit フォーカス中は消費しない。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            && self.keymap.consume_action(ctx, KeyAction::VideoLoop)
+        {
+            self.cycle_music_loop_mode(ctx, fs_idx);
         }
 
         // 音楽ビュー (Inc 5c-B): Shift+↑↓ で音量調整 (動画の VideoVolumeUp/Down を共有)。
@@ -19364,9 +19381,9 @@ impl App {
             if let Some(s) = seek_req
                 && !pointer_over_panel
                 && !pointer_over_scroll_btn
-                && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
-                player.seek(s);
+                // 全 seek を music_seek_to に集約 (ブックマーク区間ループ target 再計算のため)。
+                self.music_seek_to(fs_idx, s);
             }
             // ▲▼ ボタンを timeline に重ねて描く (ScrollArea の後 = 前面)。押されたら次フレームの
             // ScrollArea 内 scroll_with_delta に反映する。手動スクロール扱いなので follow を切る。

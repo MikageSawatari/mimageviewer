@@ -4746,7 +4746,7 @@ pub(crate) fn draw_overlay_loop_icon(
     ));
 }
 
-pub(super) fn draw_overlay_continuous_icon(
+pub(crate) fn draw_overlay_continuous_icon(
     painter: &egui::Painter,
     rect: egui::Rect,
     mode: crate::video::VideoContinuousMode,

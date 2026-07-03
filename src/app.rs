@@ -5427,8 +5427,6 @@ pub struct App {
     pub(crate) music_spectrum: crate::ui_music_spectrum::MusicSpectrumState,
     /// 右パネル (Inc 5) の音楽情報。解析ワーカーが軽量 probe で追送。ファイル変更で破棄。
     pub(crate) music_probe: Option<crate::audio_decode::AudioProbe>,
-    /// 音楽ビュー下 HUD のループトグル (簡易全曲ループ、Inc 5 FB)。セッション設定。
-    pub(crate) music_loop_enabled: bool,
     /// 音楽 HUD 音量フェーダーのドラッグ確定用の frame 跨ぎ state (Inc 5c-B1)。
     /// 動画 overlay の `last_volume_target` と同じ役割。共有の
     /// `draw_overlay_volume_slider` がドラッグ中に最後の目標値を書き、`drag_stopped`
@@ -7269,7 +7267,6 @@ impl App {
             music_pcm: None,
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
             music_probe: None,
-            music_loop_enabled: false,
             music_hud_last_volume_target: None,
             music_speed_popup_open: false,
             music_left_panel_active: false,
@@ -8071,6 +8068,12 @@ impl App {
     }
 
     fn fullscreen_video_marker_path(&self, fs_idx: usize) -> Option<PathBuf> {
+        // 音声 (映像なし動画) は FsCacheEntry::Video で再生されるが、ブックマークは
+        // music_bookmarks 正本で管理する。動画マーカー cache / サムネ decode worker を
+        // 音声に走らせないよう、ここで None を返して除外する (Codex 設計 P2)。
+        if matches!(self.items.get(fs_idx), Some(GridItem::Audio(_))) {
+            return None;
+        }
         self.fs_video_player(fs_idx)
             .map(|player| player.path().clone())
             .or_else(|| match self.items.get(fs_idx) {
@@ -30710,11 +30713,8 @@ impl App {
         if self.video_session_muted {
             player.set_muted(true);
         }
-        // ループ設定 (音楽 HUD のトグル、Inc 5 FB) を新プレイヤーにも引き継ぐ。これを忘れると
-        // 曲移動後に HUD が「ループ ON」を表示していても実際は末尾でループしない (Codex P2)。
-        if self.music_loop_enabled {
-            player.set_loop_enabled(true);
-        }
+        // ループ/連続の設定は共有 video_loop_mode / video_continuous_mode に従い、
+        // fs_cache へ insert した後に apply_music_loop_mode で反映する (start_fs_load 音声 branch)。
         player
     }
 
@@ -30883,6 +30883,8 @@ impl App {
                 self.cleanup_normalize_state_for_fs_idx(k);
                 self.fs_cache.remove(&k);
                 self.fs_margin_bbox_cache.remove(&k);
+                // ループ境界 baseline を掃除 (player を畳んだので stale entry を残さない、Codex P3)。
+                self.last_loop_pos.remove(&k);
             }
             if !self.fs_cache.contains_key(&idx) {
                 self.activity_gate.bump();
@@ -30895,6 +30897,8 @@ impl App {
                     },
                 );
                 self.fs_margin_bbox_cache.remove(&idx);
+                // 共有 video_loop_mode / video_continuous_mode を新プレイヤーへ反映。
+                self.apply_music_loop_mode(idx);
             }
             return;
         }
@@ -41004,27 +41008,29 @@ impl App {
         }
     }
 
-    pub(crate) fn find_next_video_in_display_order_from(
-        items: &[GridItem],
+    /// `display_order` 上で `current_idx` の **次** に `pred` を満たす idx を返す (連続再生の
+    /// 次項目探索)。`wrap` で末尾折り返し。`current_idx` が order に無ければ wrap 時のみ
+    /// 先頭から最初の該当を返す。動画は `is_video`、音声は `is_audio` の述語で共有する。
+    pub(crate) fn find_next_matching_in_display_order_from(
         display_order: &[usize],
         current_idx: usize,
         wrap: bool,
+        pred: impl Fn(usize) -> bool,
     ) -> Option<usize> {
-        let is_video = |idx: usize| matches!(items.get(idx), Some(GridItem::Video(_)));
         let Some(pos) = display_order.iter().position(|&idx| idx == current_idx) else {
             return wrap
-                .then(|| display_order.iter().copied().find(|&idx| is_video(idx)))
+                .then(|| display_order.iter().copied().find(|&idx| pred(idx)))
                 .flatten();
         };
 
         for &idx in display_order.iter().skip(pos + 1) {
-            if is_video(idx) {
+            if pred(idx) {
                 return Some(idx);
             }
         }
         if wrap {
             for &idx in display_order.iter().take(pos + 1) {
-                if is_video(idx) {
+                if pred(idx) {
                     return Some(idx);
                 }
             }
@@ -41032,8 +41038,40 @@ impl App {
         None
     }
 
+    pub(crate) fn find_next_video_in_display_order_from(
+        items: &[GridItem],
+        display_order: &[usize],
+        current_idx: usize,
+        wrap: bool,
+    ) -> Option<usize> {
+        Self::find_next_matching_in_display_order_from(display_order, current_idx, wrap, |i| {
+            matches!(items.get(i), Some(GridItem::Video(_)))
+        })
+    }
+
+    /// 連続再生 (音声) の次曲探索: display 順で次の `GridItem::Audio` を返す。
+    pub(crate) fn find_next_audio_in_display_order_from(
+        items: &[GridItem],
+        display_order: &[usize],
+        current_idx: usize,
+        wrap: bool,
+    ) -> Option<usize> {
+        Self::find_next_matching_in_display_order_from(display_order, current_idx, wrap, |i| {
+            matches!(items.get(i), Some(GridItem::Audio(_)))
+        })
+    }
+
     fn find_next_video_in_display_order(&self, current_idx: usize, wrap: bool) -> Option<usize> {
         Self::find_next_video_in_display_order_from(
+            &self.items,
+            self.current_grid_order(),
+            current_idx,
+            wrap,
+        )
+    }
+
+    fn find_next_audio_in_display_order(&self, current_idx: usize, wrap: bool) -> Option<usize> {
+        Self::find_next_audio_in_display_order_from(
             &self.items,
             self.current_grid_order(),
             current_idx,
@@ -41157,6 +41195,217 @@ impl App {
         }
     }
 
+    /// 現在の音声 fs_idx に対して有効なブックマーク境界秒 (区間先頭) を返す。
+    /// `music_bookmarks` が **現在の再生 path 用** に読み込まれている場合のみ非空を返す。
+    /// 曲切替直後に前曲のブックマークで区間ループを組んでしまう race を防ぐ (Codex 設計 P1)。
+    fn music_bookmark_starts_for(&self, fs_idx: usize) -> Vec<f64> {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return Vec::new();
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return Vec::new();
+        };
+        if self.music_bookmarks_loaded_for.as_deref() != Some(player.path().as_path()) {
+            return Vec::new();
+        }
+        crate::video_bookmarks::boundary_starts_from_bookmarks(&self.music_bookmarks)
+    }
+
+    /// 音声プレイヤーに現在の `video_loop_mode` (共有) + ブックマーク状況からループ設定を反映
+    /// (映像側 `apply_loop_mode_to_player` の音声版)。音声はチャプター無し = has_ch 常に false。
+    /// 連続再生中はループ無効。open / ループ切替 / seek / ブックマーク CRUD 後に呼ぶ。
+    pub(crate) fn apply_music_loop_mode(&mut self, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        if self.video_continuous_mode.is_enabled() {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_loop_enabled(false);
+            }
+            return;
+        }
+        let bookmark_starts = self.music_bookmark_starts_for(fs_idx);
+        let has_bm = !bookmark_starts.is_empty();
+        let display_mode = self.settings.video_loop_mode;
+        let eff = crate::settings::effective_loop_mode(display_mode, false, has_bm);
+        let (pos, serial) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                (player.position_secs(), player.current_seek_serial())
+            }
+            _ => return,
+        };
+        let target = match eff {
+            crate::settings::VideoLoopMode::Bookmark => {
+                crate::settings::start_at(&bookmark_starts, pos).unwrap_or(0.0)
+            }
+            // Off / Full / (Chapter は音声で Full に降格) はすべて先頭ループ (target=0.0)。
+            _ => 0.0,
+        };
+        let enabled = !matches!(eff, crate::settings::VideoLoopMode::Off);
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_loop_enabled(enabled);
+            player.set_loop_target_secs(target);
+        }
+        self.last_loop_pos.insert(fs_idx, (pos, serial));
+    }
+
+    /// 音声のブックマーク区間ループの境界跨ぎ tick (映像 `tick_native_video_loop_boundary` の
+    /// 音声版)。`poll_video` の入力反映後に呼ぶ。音声はチャプター無しなので Bookmark モード
+    /// のみ実効。一時停止 / scrub 中は baseline のみ更新して誤爆 seek を防ぐ。cfg 不問
+    /// (音声は egui 経路なので非 Windows でも動く)。
+    pub(crate) fn tick_music_loop_boundary(&mut self, fs_idx: usize) {
+        if self.video_continuous_mode.is_enabled() {
+            return;
+        }
+        let starts = self.music_bookmark_starts_for(fs_idx);
+        let has_bm = !starts.is_empty();
+        let eff =
+            crate::settings::effective_loop_mode(self.settings.video_loop_mode, false, has_bm);
+        if !matches!(eff, crate::settings::VideoLoopMode::Bookmark) {
+            return;
+        }
+        let (cur, serial, is_playing) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.position_secs(),
+                player.current_seek_serial(),
+                player.is_playing(),
+            ),
+            _ => return,
+        };
+        if !is_playing {
+            self.last_loop_pos.insert(fs_idx, (cur, serial));
+            return;
+        }
+        let (prev_pos, prev_serial) = self
+            .last_loop_pos
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or((cur, serial));
+        // 境界判定は prev_pos 側の区間で計算 (映像側 Codex P1 と同じ)。
+        let prev_start = crate::settings::start_at(&starts, prev_pos).unwrap_or(0.0);
+        let next_boundary = crate::settings::first_boundary_after(&starts, prev_start);
+        const LOOP_BOUNDARY_TOL: f64 = 0.020;
+        match crate::settings::decide_boundary_action(
+            prev_pos,
+            prev_serial,
+            cur,
+            serial,
+            prev_start,
+            next_boundary,
+            LOOP_BOUNDARY_TOL,
+        ) {
+            crate::settings::BoundaryDecision::BaselineUpdate => {
+                let new_target = crate::settings::start_at(&starts, cur).unwrap_or(0.0);
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_loop_target_secs(new_target);
+                }
+                self.last_loop_pos.insert(fs_idx, (cur, serial));
+            }
+            crate::settings::BoundaryDecision::Loop { seek_to } => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.seek(seek_to);
+                    player.set_loop_target_secs(seek_to);
+                }
+                self.last_loop_pos.insert(fs_idx, (seek_to, serial));
+            }
+            crate::settings::BoundaryDecision::Continue => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_loop_target_secs(prev_start);
+                }
+                self.last_loop_pos.insert(fs_idx, (cur, serial));
+            }
+        }
+    }
+
+    /// 音楽ビューのループモード切替 (L キー / HUD ループボタン)。共有 `video_loop_mode` を
+    /// Off → Full → Bookmark → Off で循環 (音声はチャプター無しなので Chapter を自動スキップ)。
+    /// 連続再生中は映像同様 no-op + トースト。
+    pub(crate) fn cycle_music_loop_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let _ = ctx;
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if self.video_continuous_mode.is_enabled() {
+            self.show_feedback_toast("連続再生中はループ無効".to_string());
+            return;
+        }
+        let has_bm = !self.music_bookmark_starts_for(fs_idx).is_empty();
+        let next = crate::settings::cycle_loop_mode(self.settings.video_loop_mode, false, has_bm);
+        self.settings.video_loop_mode = next;
+        // 旧 bool を in-memory でも同期 (映像 `cycle_native_video_loop_common` と同じ)。
+        self.settings.video_loop = !matches!(next, crate::settings::VideoLoopMode::Off);
+        self.settings.save();
+        self.apply_music_loop_mode(fs_idx);
+        self.show_feedback_toast(format!("ループ: {}", next.label()));
+    }
+
+    /// 音楽ビューの連続再生モード切替 (HUD の連続再生ボタン)。共有 `video_continuous_mode`。
+    pub(crate) fn cycle_music_continuous_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let mode = self.video_continuous_mode.cycle();
+        self.set_music_continuous_mode(ctx, fs_idx, mode);
+    }
+
+    /// 映像 `set_video_continuous_mode_common` の音声版 (native overlay トースト無し)。
+    pub(crate) fn set_music_continuous_mode(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        mode: crate::video::VideoContinuousMode,
+    ) {
+        let _ = ctx;
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        self.video_continuous_mode = mode;
+        self.video_continuous_last_eof = None;
+        if self.settings.video_continuous_mode != mode {
+            self.settings.video_continuous_mode = mode;
+            self.settings.save();
+        }
+        if mode.is_enabled() {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_loop_enabled(false);
+            }
+        } else {
+            self.apply_music_loop_mode(fs_idx);
+        }
+        self.show_feedback_toast(mode.label().to_string());
+    }
+
+    /// 音声の連続再生 EOF ハンドラ (映像 `handle_video_continuous_eof` の音声版)。
+    /// EOF で display 順の次 `GridItem::Audio` を音楽ビューで開き直す (autoplay)。
+    fn handle_music_continuous_eof(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seek_serial: u64,
+    ) {
+        let mode = self.video_continuous_mode;
+        if !mode.is_enabled() || self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        let eof_key = (fs_idx, seek_serial);
+        if self.video_continuous_last_eof == Some(eof_key) {
+            return;
+        }
+        self.video_continuous_last_eof = Some(eof_key);
+
+        let Some(next_idx) = self.find_next_audio_in_display_order(fs_idx, mode.wraps()) else {
+            self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
+            return;
+        };
+        if next_idx == fs_idx {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.seek(0.0);
+                player.set_playing(true);
+            }
+            return;
+        }
+        // 手動の音声前/次ファイルナビと同じ着地経路 (open_fullscreen が Audio → 音楽ビューへ
+        // dispatch、build_audio_player_for_open は autoplay=true)。
+        self.open_fullscreen_from_fs_navigation(ctx, next_idx);
+    }
+
     pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
         let poll_started = std::time::Instant::now();
         let mut next_repaint: Option<std::time::Duration> = None;
@@ -41196,20 +41445,34 @@ impl App {
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
-        let mut continuous_eof_events: Vec<(usize, u64)> = Vec::new();
+        // (fs_idx, seek_serial, is_audio): is_audio で映像/音声の連続再生ハンドラを振り分ける。
+        let mut continuous_eof_events: Vec<(usize, u64, bool)> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
+                // 音声 (映像なし動画) は headless 再生。ループ/連続の判定材料が動画と違う
+                // (チャプター無し・ブックマークは music_bookmarks 正本)。native presenter は
+                // 持たないので set_native_* は no-op だが、判定だけ音声用に分岐する。
+                let is_audio = matches!(self.items.get(*idx), Some(GridItem::Audio(_)));
                 // チャプター / ブックマーク有無を判定 (cache 直読み、DB クエリ無し)
-                let has_ch = player
-                    .info()
-                    .map(|i| !i.chapters.is_empty())
-                    .unwrap_or(false);
-                let has_bm = self
-                    .fullscreen_video_marker_cache
-                    .as_ref()
-                    .filter(|c| c.fs_idx == *idx)
-                    .map(|c| !c.bookmarks.is_empty())
-                    .unwrap_or(false);
+                let has_ch = !is_audio
+                    && player
+                        .info()
+                        .map(|i| !i.chapters.is_empty())
+                        .unwrap_or(false);
+                let has_bm = if is_audio {
+                    // 音声は music_bookmarks 正本。現在の再生 path 用に読み込まれている
+                    // 場合のみ有効 (前曲のブックマークで区間ループを組む race を防ぐ、Codex P1)。
+                    self.fullscreen_idx == Some(*idx)
+                        && self.music_bookmarks_loaded_for.as_deref()
+                            == Some(player.path().as_path())
+                        && !self.music_bookmarks.is_empty()
+                } else {
+                    self.fullscreen_video_marker_cache
+                        .as_ref()
+                        .filter(|c| c.fs_idx == *idx)
+                        .map(|c| !c.bookmarks.is_empty())
+                        .unwrap_or(false)
+                };
                 let eff = crate::settings::effective_loop_mode(display_mode, has_ch, has_bm);
                 let enabled =
                     !continuous_enabled && !matches!(eff, crate::settings::VideoLoopMode::Off);
@@ -41302,7 +41565,7 @@ impl App {
                     && !continuous_tile_active
                     && player.engine_state_code() == crate::video::engine::actor::state_code::EOF
                 {
-                    continuous_eof_events.push((*idx, player.current_seek_serial()));
+                    continuous_eof_events.push((*idx, player.current_seek_serial(), is_audio));
                 }
             }
         }
@@ -41344,16 +41607,26 @@ impl App {
                 break;
             }
         }
-        for (idx, serial) in continuous_eof_events {
-            self.handle_video_continuous_eof(ctx, idx, serial);
+        for (idx, serial, is_audio) in continuous_eof_events {
+            if is_audio {
+                self.handle_music_continuous_eof(ctx, idx, serial);
+            } else {
+                self.handle_video_continuous_eof(ctx, idx, serial);
+            }
         }
         // Phase 3: 入力イベント (= seek / ToggleLoop / pause) 反映後に CH/BM ループ境界 tick。
         // 順序が重要 (Codex P2 第4ラウンド): native_events を先に処理することで、
         // 直近の手動 seek が serial 変化として可視化され、誤爆 seek を防げる。
-        #[cfg(windows)]
+        // 音声はブックマーク区間ループ tick を全プラットフォームで走らせる (egui 経路)。
+        // 動画は従来どおり Windows native のみ。
         if !self.video_continuous_mode.is_enabled() {
             for idx in &active_video_indices {
-                self.tick_native_video_loop_boundary(*idx);
+                if matches!(self.items.get(*idx), Some(GridItem::Audio(_))) {
+                    self.tick_music_loop_boundary(*idx);
+                } else {
+                    #[cfg(windows)]
+                    self.tick_native_video_loop_boundary(*idx);
+                }
             }
         }
         // ピン留め時に thumb worker キャッシュが空だった場合、後続フレームで完了を
