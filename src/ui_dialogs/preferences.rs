@@ -461,6 +461,15 @@ pub(crate) struct PreferencesState {
     /// 直近の音量ノーマライズ測定値削除結果。
     pub audio_normalize_clear_result: Option<String>,
 
+    /// 環境設定を開いた時点 / 削除後の audio_analysis.db ファイルサイズ (bytes)。表示用。
+    pub audio_analysis_size_bytes: u64,
+    /// オーディオ解析キャッシュ削除の確認ダイアログ表示中フラグ。
+    pub audio_analysis_clear_confirm_open: bool,
+    /// 確認ダイアログで削除が確定されたことを App 側へ伝える one-shot フラグ。
+    pub audio_analysis_clear_requested: bool,
+    /// 直近のオーディオ解析キャッシュ削除結果。
+    pub audio_analysis_clear_result: Option<String>,
+
     // ── 履歴と復元ページ用 ─────────────────────────────────────
     /// 環境設定を開いた時点 / 削除後の ZIP/PDF 読書位置の記憶件数。
     pub book_resume_entry_count: usize,
@@ -672,6 +681,14 @@ impl PreferencesState {
             audio_normalize_clear_confirm_open: false,
             audio_normalize_clear_requested: false,
             audio_normalize_clear_result: None,
+            audio_analysis_size_bytes: std::fs::metadata(
+                crate::audio_analysis_db::AudioAnalysisDb::path(),
+            )
+            .map(|m| m.len())
+            .unwrap_or(0),
+            audio_analysis_clear_confirm_open: false,
+            audio_analysis_clear_requested: false,
+            audio_analysis_clear_result: None,
             book_resume_entry_count,
             book_resume_clear_requested: false,
             book_resume_clear_result: None,
@@ -1230,6 +1247,32 @@ impl App {
                             Some(format!("音量ノーマライズ測定値の削除に失敗しました: {err}"));
                     }
                 }
+            }
+        }
+
+        // 動画ページ: オーディオ解析キャッシュ (audio_analysis.db) クリア (one-shot)。
+        let mut clear_audio_analysis_requested = false;
+        if let Some(ps) = self.pref_state.as_mut()
+            && ps.audio_analysis_clear_requested
+        {
+            ps.audio_analysis_clear_requested = false;
+            clear_audio_analysis_requested = true;
+        }
+        if clear_audio_analysis_requested {
+            // open() が旧スキーマ (v1 巨大 JSON) を検出したらファイルごと作り直すので、ここを
+            // 通るだけでも旧 1.4GB は解放される。その後 clear_all (DELETE + VACUUM) で残行を消す。
+            let result = crate::audio_analysis_db::AudioAnalysisDb::open()
+                .and_then(|db| db.clear_all())
+                .map_err(|e| format!("{e}"));
+            if let Some(ps) = self.pref_state.as_mut() {
+                ps.audio_analysis_size_bytes =
+                    std::fs::metadata(crate::audio_analysis_db::AudioAnalysisDb::path())
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                ps.audio_analysis_clear_result = Some(match result {
+                    Ok(()) => "オーディオ解析キャッシュを削除しました。".to_string(),
+                    Err(e) => format!("オーディオ解析キャッシュの削除に失敗しました: {e}"),
+                });
             }
         }
 

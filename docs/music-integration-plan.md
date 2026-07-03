@@ -436,14 +436,24 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 ## 6. 永続化設計（D8 / D11）
 
 - **正本 = `audio_analysis.db`**（`src/audio_analysis_db.rs`、新設）:
-  - `analysis` テーブル: key（path/size/mtime/duration/sample_rate/channels/analysis_version）+
-    `TimelineAnalysis` JSON（`BeatGrid` 含む）。`PRAGMA user_version` + JSON `analysis_version`。
-  - `bookmarks` テーブル: `MusicBookmark { id, position_secs, title }` を音声 path key ごとに保持。
-    ユーザー命名・並べ替え・削除・改名。
-  - 壊れ JSON / no-row = 空扱い（クラッシュさせない、comic §6.1 と同流儀）。
+  - `audio_analysis` テーブル: key（path/size/mtime/analysis_version）+ `doc BLOB`。
+    **保存形式 = u16 量子化バイナリ + deflate（v2、2026-07-03）**。旧 v1 は `TimelineAnalysis`
+    を JSON TEXT で持っていたが、10ms bin × 長尺曲（数時間のコンサート/メガミックス）で
+    **1 曲 400MB 超・DB 全体 1.4GB** に肥大したため置き換えた（684B/bin → 84B/bin + deflate
+    ≒ 23x 削減、実測 13 曲 1.43GB → 推定 ~62MB）。波形 bin は表示専用なので 0..1 値を u16
+    （65535 段階）、loudness を i16（0.01dB）、pitch class を u8 に量子化し、`start_secs` /
+    `duration_secs` は `sample_rate` + `bin_secs` + bin index から復元（冗長なので保存しない）。
+    `beat_grid` / `stream` / `config` は小さいので JSON で正確に持つ。`PRAGMA user_version` +
+    BLOB 内 `analysis_version` の二重ガード。
+  - `bookmarks`（= 動画機構を再利用、別テーブルは作らない、D5.1）。
+  - 壊れ BLOB / no-row = 空扱い（クラッシュさせない、comic §6.1 と同流儀）。
+  - **削除 UI**: 環境設定 → 動画ページの「音量ノーマライズ測定値」の隣に「オーディオ解析
+    キャッシュ」節（サイズ表示 + 削除、`clear_all` = DELETE + VACUUM）を追加（2026-07-03）。
 - **キー生成**: 実ファイルは path そのもの。動画→音声モード（`VideoAudioOnly`）は動画 path を key に。
   **ZIP/PDF 内の音声は対象外**（初期スコープ = **実ファイル音声 + 実ファイル動画のみ**。ユーザー確定 2026-07-01）。
-- **未リリース = マイグレーション不要**（D11）。開発中に溜まったテスト DB は手動削除で足りる。
+- **未リリース = マイグレーション不要**（D11）。v1（JSON）→ v2（量子化 BLOB）も移行コードを
+  書かず、`open_at` が `user_version != 2` を検出したら **DB ファイルごと削除して作り直す**
+  （`needs_reset`、旧 1.4GB を確実に解放）。開発中に溜まったテスト DB は手動削除で足りる。
 - **ブックマークは動画機構を再利用**（D5.1、ユーザー確定 2026-07-01「フォーマットは動画と同じ」）:
   保存 = `src/video_bookmarks.rs` の経路を音声 path key で共有（`audio_analysis.db` に別テーブルは作らない）。
   import/export フォーマット = `src/video_bookmarks_parser.rs`（`mm:ss タイトル`）。埋め込みチャプター
