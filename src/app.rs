@@ -45655,6 +45655,9 @@ fn native_video_presenter_config(
         placement,
         activate_on_show,
         in_main_window,
+        // 動画経路は常に映像フレームを持つ。音声のみ native シェル (Inc 6 ②) は
+        // 別経路で `audio_only=true` の config を組む。
+        audio_only: false,
     })
 }
 

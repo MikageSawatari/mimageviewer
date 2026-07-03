@@ -330,6 +330,16 @@ pub struct NativeVideoOutputConfig {
     /// (`WS_CHILD`) として生成し、owner のクライアント領域に重ねて in-window
     /// 再生する。`false` のとき従来どおりモニタ全面の borderless popup。
     pub in_main_window: bool,
+    /// 音声のみ (映像トラック無し) のプレイヤーに native presenter を attach する
+    /// モード (music VST シェル、Inc 6 ②-1)。`true` のとき present ループは
+    /// **フレームが永久に来ない前提**で回る:
+    /// - `first_presented` を startup 直後に立てて `native_presenter_pending()` が
+    ///   「準備中」で永久固着しないようにする (映像 first frame を待たない)。
+    /// - `waiting_for_first_frame` を常に false 扱いにする。
+    /// - フレーム待ちアイドルの sleep を frame pacing 用 1ms でなく HUD periodic
+    ///   tick に十分な間隔にして無駄なスピンを避ける。
+    /// `false` のとき従来の動画経路と**バイト等価**。
+    pub audio_only: bool,
 }
 
 #[cfg(windows)]
@@ -1964,6 +1974,13 @@ fn run_native_video_output(
         },
         &mut presenter_window_published,
     );
+    // 音声のみ native シェル (Inc 6 ②-1): 映像 first frame が永久に来ないので、window を
+    // publish できた時点で presenter を「表示準備完了」とみなす。これをしないと
+    // `native_presenter_pending()` (= `!first_presented`) が永久に true のままになり、
+    // UI 側が「準備中」表示で固着する。動画経路 (audio_only=false) には触れない。
+    if config.audio_only {
+        first_presented_out.store(true, Ordering::Release);
+    }
 
     let mut source = PresenterSourceState::new(SwitchSourcePayload {
         video_rx,
@@ -3424,8 +3441,10 @@ fn run_native_video_output(
             source.queue.push_back(frame);
         }
 
-        let waiting_for_first_frame =
-            source.first_frame_event_last_epoch != Some(source.last_seen_serial);
+        // 音声のみ native シェル (Inc 6 ②-1): 待つべき映像 first frame が存在しないので
+        // 常に false。動画経路は従来どおり first-frame event の到達で判定する。
+        let waiting_for_first_frame = !config.audio_only
+            && source.first_frame_event_last_epoch != Some(source.last_seen_serial);
         if crate::perf::is_enabled() && last_source_state_probe.elapsed() >= Duration::from_secs(1)
         {
             last_source_state_probe = Instant::now();
@@ -3877,12 +3896,20 @@ fn run_native_video_output(
                 }
             }
         } else {
-            let speed = source.clock.playback_speed().max(clock::MIN_PLAYBACK_SPEED);
-            let wait_ms = source
-                .queue
-                .front()
-                .map(|front| (((front.pts_secs - now) / speed) * 500.0).clamp(1.0, 8.0) as u64)
-                .unwrap_or(1);
+            let wait_ms = if config.audio_only {
+                // 音声のみ native シェル (Inc 6 ②-1): 映像フレームが永久に来ないので、
+                // frame pacing 用の 1ms スピンではなく HUD periodic tick (250ms) に十分な
+                // 16ms で休む。`sleep_until_message` なので mouse/resize 等の WM では即起床し
+                // 入力応答性は保たれる。
+                16u64
+            } else {
+                let speed = source.clock.playback_speed().max(clock::MIN_PLAYBACK_SPEED);
+                source
+                    .queue
+                    .front()
+                    .map(|front| (((front.pts_secs - now) / speed) * 500.0).clamp(1.0, 8.0) as u64)
+                    .unwrap_or(1)
+            };
             // message 対応待機: フレーム待ちのアイドル中でもリサイズ等のメッセージで
             // 即起床し、presenter ループが素早く WM を処理できるようにする。
             crate::video::native_window::sleep_until_message(wait_ms as u32);
