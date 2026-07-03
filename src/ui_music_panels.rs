@@ -1065,8 +1065,10 @@ impl App {
             vol_persist = persist;
         }
         // 音量ノーマライズボタン (Norm、音量スライダーとミュートの間)。動画 native HUD と
-        // 同じ 5 状態・配色・ラベル・ツールチップで、左クリックで ON/OFF・未測定時はスキャン
-        // 起動、右クリックで OFF (救済経路)。スキャン機構が windows 限定のため windows でのみ描く。
+        // 同じ 5 状態・配色・ラベルで描く。左クリックのみ (右クリックは背後 FS と二重動作の
+        // ため不使用): Off→ON / OnApplied・ProvisionalApplied→OFF / OnUnmeasured→OFF (末尾の
+        // apply 参照)。測定は open 時の自動スキャンが担う。スキャン機構が windows 限定のため
+        // windows でのみ描く。
         #[cfg(windows)]
         {
             use crate::video::normalize_types::NormalizeUiState;

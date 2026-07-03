@@ -496,7 +496,30 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 - [x] Play / Pause / Stop / seek / volume / mute（`VideoPlayer` メソッド）（Inc 3a/3b）
 - [x] 上情報バー常時表示 / 下シークバー常時表示（D3）（Inc 3a/3b）
 - [x] Open / D&D 直後の自動再生（全尺解析を待たない）（Inc 3a）
-- [x] normalize gain（既存 audio pump）（build_audio_player_for_open で cache 値適用）
+- [x] **音量ノーマライズ（Norm 系）**（2026-07-03 Inc 6 Norm）。**「音声＝映像なし動画」で動画の
+  normalize サブシステムを丸ごと共有**（音声は `FsCacheEntry::Video` の headless `VideoPlayer` なので
+  `handle_toggle_normalize` / `start_normalize_scan_inner` / `poll_normalize_scan` /
+  `init_normalize_state_for_opened_video` / `maybe_start_normalize_scan_for_play_intent` /
+  `start_normalize_scan_for_deferred_play_intent` / `disable_normalize_globally` がそのまま動く）。
+  - **挙動（D13）**: `build_audio_player_for_open` を動画 `build_video_player_for_open` と同型化。
+    ON + 未測定 + autoplay のとき `start_normalize_scan_before_play=true` で preroll suspended +
+    autoplay off で開き、無補正音の一瞬の burst を避ける。`start_fs_load` 音声分岐で
+    `init_normalize_state_for_opened_video` +（再生前スキャン=deferred / それ以外=intent）を動画分岐と
+    同型に呼ぶ。DB ヒット=gain 即適用 + OnApplied、ミス=初回スキャンして音量を揃える。専用トグルは
+    新設せず動画と同じグローバル設定 `audio_normalize_enabled` に従う。cache-hit 再生では
+    `init_normalize_state_for_opened_video` を再度呼び HUD state を再同期。
+  - **HUD**: 下 HUD 右クラスタに Norm ボタン（動画 native HUD と同じ 5 状態・配色・ラベル）+ limiter
+    インジケータ（`player.limiter_ceiling_hit_seq` の増加で赤ドット点灯、normalize 有効時のみスロット確保、
+    seq 巻き戻りで消灯）。**左クリックのみ**（右クリックは背後 FS 右クリックと二重動作するため不使用、
+    音量/速度と同方針）: Off→ON / OnApplied・ProvisionalApplied→OFF / **OnUnmeasured→OFF**（動画の
+    右クリック救済が無いため左クリックを OFF に割当、再測定は OFF→ON で未測定判定→再スキャン）。
+  - **再生前スキャンモーダル**: `draw_music_normalize_modal`（動画 native `draw_native_normalize_progress`
+    の egui 版）を最前面描画。× / ESC でキャンセル。`music_normalize_modal_active` でパネル / timeline
+    seek / HUD / FS ショートカットを抑止（`music_modal_open` に統合、`handle_fs_key_input` 音声ガード追加）。
+    デコードエラーがモーダル中に出たら err early-return でスキャンを cancel して入力ロックを解く。
+  - インフラ: `VideoPlayer::limiter_ceiling_hit_seq()` 公開 getter 追加。normalize ハンドラ 3 つを
+    `pub(crate)` 化。スキャン機構は windows 限定なので Norm ボタン / モーダル / deferred は `#[cfg(windows)]`。
+  - ⚠️ VST3 チェーン共有（normalize→VST3→limiter）は Inc 6 VST3（別増分）。本項は normalize/limiter のみ。
 - [x] **ループ 3 モード**（Off / 全体 / ブックマーク間）（2026-07-03 Inc 5c-C）。**状態は動画と共有**
   （`settings.video_loop_mode`、ユーザー確定「音声＝映像なし動画」）。音声はチャプター無しなので
   `cycle_loop_mode(has_ch=false)` が自然に Off→全体→ブックマーク間を巡回。`L` キー
