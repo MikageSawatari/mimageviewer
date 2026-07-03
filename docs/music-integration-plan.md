@@ -497,6 +497,19 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 - [x] 上情報バー常時表示 / 下シークバー常時表示（D3）（Inc 3a/3b）
 - [x] Open / D&D 直後の自動再生（全尺解析を待たない）（Inc 3a）
 - [x] normalize gain（既存 audio pump）（build_audio_player_for_open で cache 値適用）
+- [x] **ループ 3 モード**（Off / 全体 / ブックマーク間）（2026-07-03 Inc 5c-C）。**状態は動画と共有**
+  （`settings.video_loop_mode`、ユーザー確定「音声＝映像なし動画」）。音声はチャプター無しなので
+  `cycle_loop_mode(has_ch=false)` が自然に Off→全体→ブックマーク間を巡回。`L` キー
+  （`KeyAction::VideoLoop` 共有）/ 下 HUD ループボタンで切替。ブックマーク区間ループの境界 seek は
+  `tick_music_loop_boundary`（映像 `tick_native_video_loop_boundary` の音声版・egui 経路なので cfg 不問）。
+  ⚠️ **旧 `music_loop_enabled`（2 値トグル）は `poll_video` が音声のループ設定を毎フレーム
+  `video_loop_mode`（既定 Off）で上書きしていたため実質機能していなかった**（音声ガード追加で修正）。
+- [x] **連続再生**（Off / 連続 / 連続+ループ）（2026-07-03 Inc 5c-C）。**状態は動画と共有**
+  （`video_continuous_mode`）。下 HUD の連続再生ボタンで巡回。EOF で display 順の次 `GridItem::Audio` を
+  `open_fullscreen_from_fs_navigation` で自動再生（`find_next_audio_in_display_order` /
+  `handle_music_continuous_eof`、映像 `handle_video_continuous_eof` の音声版）。連続再生中はループ無効。
+  seek は全経路を `music_seek_to`（&mut self 化）へ集約し `apply_music_loop_mode` を内包
+  （ブックマーク区間ループ target の再計算漏れを防ぐ）。ブックマーク CRUD 後も `apply_music_loop_mode`。
 
 ### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1。5c-A で動画 UI を共有）
 - [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5 → 5c-A で `draw_native_jump_panel_body` 共有）
