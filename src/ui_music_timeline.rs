@@ -477,7 +477,29 @@ pub fn draw_music_timeline(
     let text_color = ui.visuals().text_color();
     let clip_rect = ui.clip_rect();
     // ホイール手動スクロールを検出 (scrollbar ドラッグは呼び出し側が offset 変化で拾う)。
-    let manual_scroll = timeline_manual_scroll_requested(ui, &response, clip_rect);
+    let mut manual_scroll = timeline_manual_scroll_requested(ui, &response, clip_rect);
+    // ホイール (中) ボタンをドラッグしたらグラフを縦パンする (ハンドツール、実機 FB)。左クリック
+    // シークとは別ボタンなので誤爆しない。egui の drag-sense がどのボタンを拾うかに依存せず、
+    // 中ボタン押下 + ポインタがタイムライン上 + 移動、をポインタ状態から直接判定する。パン中は
+    // クールダウンを張るため manual_scroll 扱いにする。
+    let middle_pan = ui.input(|i| {
+        i.pointer.button_down(egui::PointerButton::Middle)
+            && i.pointer
+                .hover_pos()
+                .is_some_and(|p| rect.contains(p) || clip_rect.contains(p))
+    });
+    if middle_pan {
+        let dy = ui.input(|i| i.pointer.delta().y);
+        if dy != 0.0 {
+            // 正の delta.y = 先頭方向 (上) へスクロール = ドラッグ下方向で内容が下に動く (ハンドパン)。
+            ui.scroll_with_delta_animation(
+                egui::vec2(0.0, dy),
+                egui::style::ScrollAnimation::none(),
+            );
+            manual_scroll = true;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
     let mut auto_scrolled = false;
     if let Some(playhead_rect) =
         timeline_playhead_row_rect(graph_rect, position_secs, row_secs, row_h, row_gap, rows)
@@ -592,7 +614,10 @@ pub fn draw_music_timeline(
         );
     }
 
-    if (response.clicked() || response.dragged())
+    // シークは **左クリック / 左ドラッグのみ** (実機 FB)。右クリック・ホイール(中)クリックは
+    // egui の `dragged()` が全ボタンで true になり、わずかな移動でシーク誤爆 → 不快音が出ていた。
+    // `dragged_by(Primary)` に限定する (中ボタンは上のパン、右はメニュー等でシークしない)。
+    if (response.clicked() || response.dragged_by(egui::PointerButton::Primary))
         && let Some(pos) = response.interact_pointer_pos()
     {
         seek_request = timeline_seek_target_secs(

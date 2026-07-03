@@ -7935,6 +7935,35 @@ impl App {
             }
         }
 
+        // 音楽ビュー: Ctrl+ホイール上下で Row 秒数 (タイムライン解像度) を切り替える (実機 FB)。
+        // 通常ホイールは前後ファイル移動なので、Ctrl 付きのときだけここで横取りして消費し、下流の
+        // 一般ホイールハンドラ (9400 付近) / 前後移動 / ScrollArea へ渡さない。ホイール上 (wheel_y>0)
+        // = 解像度を上げる (Row 秒数を減らす)。上バーの − / + ステッパーと同じ step_row_secs。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.music_bookmark_modal_open()
+        {
+            let (wheel_y, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
+            if ctrl_held && wheel_y.abs() > 0.5 {
+                let delta = if wheel_y > 0.0 { -1 } else { 1 };
+                let new_secs =
+                    crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
+                if new_secs != self.music_timeline_row_secs {
+                    self.music_timeline_row_secs = new_secs;
+                    self.show_feedback_toast(format!(
+                        "Row {}",
+                        crate::ui_music_timeline::format_row_secs(new_secs)
+                    ));
+                }
+                ctx.input_mut(|i| {
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+                });
+            }
+        }
+
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
