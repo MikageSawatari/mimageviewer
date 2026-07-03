@@ -19364,7 +19364,7 @@ impl App {
                 .is_none_or(|t| now >= t);
             let cache = &mut self.music_timeline_cache;
             let mut outcome = crate::ui_music_timeline::MusicTimelineOutcome::default();
-            egui::ScrollArea::vertical()
+            let sa_output = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .id_salt(("music_timeline", fs_idx))
                 .show(&mut child, |ui| {
@@ -19387,8 +19387,16 @@ impl App {
                     );
                 });
             const SCROLL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
-            // ホイール手動スクロールが起きたら 1 秒間は追従を止める (playhead へ引き戻さない)。
-            if outcome.manual_scroll {
+            // scrollbar ドラッグ検出: ScrollArea の縦 offset が前フレームから変化し、かつ
+            // その変化がプログラム起因 (▲▼ の scroll_with_delta / 追従の scroll_to_rect) でない
+            // なら、ユーザーの scrollbar ドラッグ (またはホイール) とみなしてクールダウンを張る
+            // (ドラッグ中に playhead へ引き戻されるのを防ぐ、実機 FB)。
+            let new_offset = sa_output.state.offset.y;
+            let offset_changed = (new_offset - self.music_timeline_last_scroll_offset).abs() > 0.5;
+            let programmatic_scroll = pending_scroll != 0.0 || outcome.auto_scrolled;
+            self.music_timeline_last_scroll_offset = new_offset;
+            // ホイール手動スクロール / scrollbar ドラッグが起きたら 1 秒間は追従を止める。
+            if outcome.manual_scroll || (offset_changed && !programmatic_scroll) {
                 self.music_timeline_scroll_cooldown_until = Some(now + SCROLL_COOLDOWN);
             }
             if let Some(s) = outcome.seek_request

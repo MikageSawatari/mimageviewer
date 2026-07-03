@@ -398,9 +398,12 @@ fn run_timeline_raster_worker(
 pub struct MusicTimelineOutcome {
     /// クリック/ドラッグでシークを要求した位置 (呼び出し側が `player.seek`)。
     pub seek_request: Option<f64>,
-    /// この frame にホイール/ドラッグ/scrollbar で手動スクロールがあった。呼び出し側は
-    /// これを見て「追従クールダウン」を張る (手動閲覧中に playhead へ引き戻さない)。
+    /// この frame にホイールで手動スクロールがあった。呼び出し側はこれを見て「追従クール
+    /// ダウン」を張る (手動閲覧中に playhead へ引き戻さない)。
     pub manual_scroll: bool,
+    /// この frame に追従 (`scroll_to_rect`) を発行した。呼び出し側が「offset 変化はプログラム
+    /// 起因か scrollbar ドラッグか」を切り分けるのに使う (follow 由来の offset 変化を除外)。
+    pub auto_scrolled: bool,
 }
 
 /// 音楽ビュー中央のタイムラインを描画する。ラボの `draw_timeline` を本体向けに移植した
@@ -473,8 +476,9 @@ pub fn draw_music_timeline(
 
     let text_color = ui.visuals().text_color();
     let clip_rect = ui.clip_rect();
-    // 手動スクロール (ホイール/ドラッグ/scrollbar) を検出。呼び出し側がこれを見てクールダウンを張る。
+    // ホイール手動スクロールを検出 (scrollbar ドラッグは呼び出し側が offset 変化で拾う)。
     let manual_scroll = timeline_manual_scroll_requested(ui, &response, clip_rect);
+    let mut auto_scrolled = false;
     if let Some(playhead_rect) =
         timeline_playhead_row_rect(graph_rect, position_secs, row_secs, row_h, row_gap, rows)
     {
@@ -486,6 +490,7 @@ pub fn draw_music_timeline(
         // しない (fully_visible の間は何もしない)。
         if playing && auto_scroll && vertically_visible && !fully_visible {
             ui.scroll_to_rect(playhead_rect.expand(row_gap), None);
+            auto_scrolled = true;
         }
     }
 
@@ -596,6 +601,7 @@ pub fn draw_music_timeline(
     MusicTimelineOutcome {
         seek_request,
         manual_scroll,
+        auto_scrolled,
     }
 }
 

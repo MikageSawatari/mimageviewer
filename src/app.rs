@@ -5418,6 +5418,10 @@ pub struct App {
     /// 邪魔しない、実機 FB 2026-07-03)。期限経過後、playhead が画面内にあって画面外へ出かけて
     /// いるときだけ追従を再開する。`None` = クールダウンなし (通常の追従)。
     pub(crate) music_timeline_scroll_cooldown_until: Option<std::time::Instant>,
+    /// 前フレームのタイムライン ScrollArea 縦オフセット。scrollbar ドラッグ (ホイールでも
+    /// ▲▼ボタンでもない offset 変化) を検出してクールダウンを張るのに使う。プログラム起因
+    /// (追従 `scroll_to_rect` / ▲▼ の `scroll_with_delta`) の変化は除外する。
+    pub(crate) music_timeline_last_scroll_offset: f32,
     /// タイムラインの▲▼スクロールボタンが押されたときの保留スクロール量 (points、0=なし)。
     /// ボタンは ScrollArea の外に描くので、次フレームの ScrollArea 内で `scroll_with_delta`
     /// に適用してからクリアする。↓↑ をファイル移動に使うため (動画と統一)、タイムライン縦
@@ -7266,6 +7270,7 @@ impl App {
             music_timeline_cache: crate::ui_music_timeline::TimelineTextureCache::default(),
             music_timeline_row_secs: crate::ui_music_timeline::MUSIC_ROW_SECS_DEFAULT,
             music_timeline_scroll_cooldown_until: None,
+            music_timeline_last_scroll_offset: 0.0,
             music_timeline_scroll_req: 0.0,
             music_pcm: None,
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
@@ -30483,6 +30488,7 @@ impl App {
         self.music_spectrum.clear();
         // 新ファイルは先頭再生 = playhead が上端に来るので追従クールダウンは解除しておく。
         self.music_timeline_scroll_cooldown_until = None;
+        self.music_timeline_last_scroll_offset = 0.0;
         // ▲▼ ボタンの保留スクロール量は前ファイル向けなので破棄する (Codex P3: クリック直後に
         // 別ファイルへ移動すると古い delta が次のタイムラインに適用されてしまう)。
         self.music_timeline_scroll_req = 0.0;
@@ -30671,6 +30677,7 @@ impl App {
         // ▲▼ ボタンの保留スクロール量も teardown で破棄する (Codex P3、上記 path 変更と同じ理由)。
         self.music_timeline_scroll_req = 0.0;
         self.music_timeline_scroll_cooldown_until = None;
+        self.music_timeline_last_scroll_offset = 0.0;
         // 端ホバーパネルの開閉ラッチは transient hover state なので teardown でリセットする。
         // 残すと次に音声を開いた際、5% edge trigger を踏まずカーソルが panel+sustain 内にある
         // だけでパネルが再表示される (Codex P3)。
