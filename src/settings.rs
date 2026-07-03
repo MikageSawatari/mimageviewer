@@ -2573,6 +2573,14 @@ pub struct Settings {
     /// (位置復元マトリクス「ZIP/PDF × Ctrl+↑↓ 移動」。既定 = 先頭から = 従来「フォルダ先頭着地」)
     #[serde(default = "default_resume_from_start")]
     pub book_nav_resume: ResumeMode,
+    /// 音声 (音楽ビュー) を一覧から明示的に開いたとき、続きから再生するか最初からか。
+    /// (位置復元マトリクス「音声 × 一覧から開く」。既定 = 最初から = 従来「常に先頭再生」)
+    #[serde(default = "default_resume_from_start")]
+    pub music_open_resume: ResumeMode,
+    /// 音声を ↓↑ / ホイール / Ctrl+↑↓ / キーで移動したとき、続きから再生するか最初からか。
+    /// (位置復元マトリクス「音声 × 移動」。既定 = 最初から。誤って別曲へ行って戻っても頭から)
+    #[serde(default = "default_resume_from_start")]
+    pub music_nav_resume: ResumeMode,
     /// フルスクリーンで開いた本 (フォルダ / ZIP / PDF) を読書履歴に記録するか。
     #[serde(default = "default_true")]
     pub reading_history_enabled: bool,
@@ -3605,6 +3613,8 @@ impl Default for Settings {
             video_nav_resume: ResumeMode::Resume,
             book_open_resume: ResumeMode::Resume,
             book_nav_resume: ResumeMode::FromStart,
+            music_open_resume: ResumeMode::FromStart,
+            music_nav_resume: ResumeMode::FromStart,
             reading_history_enabled: true,
             reading_history_limit: default_reading_history_limit(),
             video_hw_decode: true,

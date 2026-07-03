@@ -30685,8 +30685,14 @@ impl App {
     /// 音楽ビュー (D3) は egui で描くので GPU 映像経路 (`gpu_video_device`) と native
     /// presenter (`native_output_config`) は使わない。VST3 (`dsp_bridge`) は Inc 6 で配線
     /// する。音量ノーマライズは既存 `audio_normalize_db` の cache 値があれば適用するが、
-    /// スキャン起動はしない (Inc 3a; スキャン連携は後続)。再生は先頭から自動開始。
-    fn build_audio_player_for_open(&self, path: PathBuf) -> crate::video::VideoPlayer {
+    /// スキャン起動はしない (Inc 3a; スキャン連携は後続)。再生位置の復元は音声の resume 設定
+    /// (`music_open_resume` / `music_nav_resume`、既定=最初から) に従う。位置は動画と同じ
+    /// `video_resume_positions` に path キーで保存済み (poll_video)。
+    fn build_audio_player_for_open(
+        &self,
+        path: PathBuf,
+        from_grid: bool,
+    ) -> crate::video::VideoPlayer {
         let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
         let normalize_gain = if self.settings.audio_normalize_enabled {
             let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
@@ -30698,14 +30704,28 @@ impl App {
         } else {
             1.0
         };
+        // 一覧から開いた (`fs_open_intent_from_grid`) か移動 (↓↑/ホイール/Ctrl+↑↓) かで
+        // 音声 resume 設定を選び、保存済み位置を使うか先頭からかを決める (動画の
+        // `video_resume_for_open` を音声設定で共有)。
+        let path_key = crate::adjustment_db::normalize_path(&path);
+        let saved_resume = self.settings.video_resume_positions.get(&path_key).copied();
+        let resume = video_resume_for_open(
+            saved_resume,
+            from_grid,
+            matches!(
+                self.settings.music_open_resume,
+                crate::settings::ResumeMode::FromStart
+            ),
+            self.settings.music_nav_resume,
+        );
         let player = crate::video::VideoPlayer::open(
             path,
             vol,
             normalize_gain,
-            false, // audio_preroll_suspended
-            true,  // autoplay
-            None,  // resume (Inc 3a: 先頭から)
-            false, // hw_decode (音声のみ、GPU 不要)
+            false,  // audio_preroll_suspended
+            true,   // autoplay
+            resume, // 音声 resume 設定に従う (既定=最初から)
+            false,  // hw_decode (音声のみ、GPU 不要)
             self.settings.video_deinterlace,
             #[cfg(windows)]
             None, // gpu_video_device (headless)
@@ -30893,7 +30913,10 @@ impl App {
             }
             if !self.fs_cache.contains_key(&idx) {
                 self.activity_gate.bump();
-                let player = self.build_audio_player_for_open(ap);
+                // 一覧から開いた (grid) か移動 (nav) かのワンショットフラグを消費する
+                // (動画分岐と同じ std::mem::take 規約)。resume 設定の選択に使う。
+                let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
+                let player = self.build_audio_player_for_open(ap, from_grid);
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {

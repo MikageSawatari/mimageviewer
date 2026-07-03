@@ -6597,9 +6597,10 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     let s = &mut state.settings;
 
     ui.label(
-        "動画と ZIP/PDF (本) の位置復元と、読書履歴を管理します。\n\
-         一覧から開いたとき / Ctrl+↑↓ で移動したときに、前回の位置 (続きから) で\n\
-         開くか、最初/先頭から開くかを選べます。保存された位置が無いときは自動的に先頭になります。",
+        "動画・音声・ZIP/PDF (本) の位置復元と、読書履歴を管理します。\n\
+         一覧から開いたとき / 移動したとき (Ctrl+↑↓ や ↓↑・ホイールでの前後移動) に、前回の\n\
+         位置 (続きから) で開くか、最初/先頭から開くかを選べます。保存された位置が無いときは\n\
+         自動的に先頭になります。",
     );
     ui.add_space(10.0);
 
@@ -6609,6 +6610,8 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     let mut video_nav = s.video_nav_resume;
     let mut book_open = s.book_open_resume;
     let mut book_nav = s.book_nav_resume;
+    let mut music_open = s.music_open_resume;
+    let mut music_nav = s.music_nav_resume;
 
     let combo = |ui: &mut egui::Ui, id: &str, val: &mut ResumeMode| {
         egui::ComboBox::from_id_salt(id)
@@ -6627,7 +6630,7 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         .show(ui, |ui| {
             ui.label("");
             ui.strong("一覧から開く");
-            ui.strong("Ctrl+↑↓ で移動");
+            ui.strong("移動 (↓↑ / ホイール / Ctrl+↑↓)");
             ui.end_row();
 
             ui.strong("動画");
@@ -6639,19 +6642,27 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
             combo(ui, "pr_book_open", &mut book_open);
             combo(ui, "pr_book_nav", &mut book_nav);
             ui.end_row();
+
+            ui.strong("音声");
+            combo(ui, "pr_music_open", &mut music_open);
+            combo(ui, "pr_music_nav", &mut music_nav);
+            ui.end_row();
         });
 
     s.set_video_open_resume(video_open);
     s.video_nav_resume = video_nav;
     s.book_open_resume = book_open;
     s.book_nav_resume = book_nav;
+    s.music_open_resume = music_open;
+    s.music_nav_resume = music_nav;
 
     ui.add_space(12.0);
     ui.label(
         egui::RichText::new(
-            "既定: 動画は「一覧から開く=続きから」「Ctrl+↑↓=続きから」。\n\
-             ZIP/PDF は「一覧から開く=続きから」「Ctrl+↑↓=先頭から」。\n\
-             例えば「Ctrl+↑↓ は続き・開いたら先頭」のように、セルごとに自由に組み合わせられます。",
+            "既定: 動画は「一覧から開く=続きから」「移動=続きから」。\n\
+             ZIP/PDF は「一覧から開く=続きから」「移動=先頭から」。\n\
+             音声は「一覧から開く=最初から」「移動=最初から」(誤って別曲へ行って戻っても頭から)。\n\
+             例えば「移動は続き・開いたら先頭」のように、セルごとに自由に組み合わせられます。",
         )
         .size(11.0)
         .color(egui::Color32::from_gray(150)),
