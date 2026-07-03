@@ -45,6 +45,15 @@ const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 168, 205);
 const VALUE_COLOR: egui::Color32 = egui::Color32::from_rgb(228, 230, 236);
 const TITLE_H: f32 = 30.0;
 
+/// ツールチップにショートカットを併記する ("ミュート" + Some("M") → "ミュート [M]")。
+/// 動画 native HUD の `native_label_with_shortcut` 相当。未割り当て (None / 空) はラベルのみ。
+fn label_with_shortcut(label: &str, chord: Option<&str>) -> String {
+    match chord {
+        Some(c) if !c.trim().is_empty() => format!("{label} [{c}]"),
+        _ => label.to_string(),
+    }
+}
+
 /// 秒を `mm:ss` / `h:mm:ss` に整形する (負値は 0)。
 fn format_hms(secs: f64) -> String {
     let total = secs.max(0.0).floor() as u64;
@@ -716,6 +725,26 @@ impl App {
             .music_limiter_visible_until
             .is_some_and(|until| now < until);
         let show_limiter_slot = self.settings.audio_normalize_enabled;
+        // 各ボタンのツールチップに併記するショートカット (動画 HUD と同じく共有 Video* アクションの
+        // keymap chord を使う)。連続再生/速度/limiter/Norm はキーボードショートカットが無いので対象外。
+        let sc_seek_start = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoSeekStart);
+        let sc_play = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoPlayPause);
+        let sc_marker_prev = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoMarkerPrev);
+        let sc_marker_next = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoMarkerNext);
+        let sc_loop = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoLoop);
+        let sc_mute = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoMute);
         let speed = self.video_playback_speed;
         // ループ / 連続再生モードは動画と共有 (video_loop_mode / video_continuous_mode)。
         // 音声はチャプター無しなので effective は Off/Full/Bookmark のみ。
@@ -833,7 +862,7 @@ impl App {
                 ui.id().with(("music_hud_start", fs_idx)),
                 egui::Sense::click(),
             )
-            .hover_tip_dark("頭出し");
+            .hover_tip_dark(label_with_shortcut("頭出し", sc_seek_start.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_replay_icon(&painter, r.center(), bsz * 0.36);
         if resp.clicked() {
@@ -848,7 +877,10 @@ impl App {
                 ui.id().with(("music_hud_play", fs_idx)),
                 egui::Sense::click(),
             )
-            .hover_tip_dark(if playing { "一時停止" } else { "再生" });
+            .hover_tip_dark(label_with_shortcut(
+                if playing { "一時停止" } else { "再生" },
+                sc_play.as_deref(),
+            ));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         if playing {
             draw_overlay_pause_icon(&painter, r.center(), bsz * 0.30);
@@ -867,7 +899,10 @@ impl App {
                 ui.id().with(("music_hud_prevbm", fs_idx)),
                 egui::Sense::click(),
             )
-            .hover_tip_dark("前のブックマーク");
+            .hover_tip_dark(label_with_shortcut(
+                "前のブックマーク",
+                sc_marker_prev.as_deref(),
+            ));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_skip_to_marker_icon(&painter, r, -1, markers_present);
         if resp.clicked() {
@@ -886,7 +921,10 @@ impl App {
                 ui.id().with(("music_hud_nextbm", fs_idx)),
                 egui::Sense::click(),
             )
-            .hover_tip_dark("次のブックマーク");
+            .hover_tip_dark(label_with_shortcut(
+                "次のブックマーク",
+                sc_marker_next.as_deref(),
+            ));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_skip_to_marker_icon(&painter, r, 1, markers_present);
         if resp.clicked()
@@ -925,7 +963,7 @@ impl App {
                 ui.id().with(("music_hud_loop", fs_idx)),
                 egui::Sense::click(),
             )
-            .hover_tip_dark(loop_tooltip);
+            .hover_tip_dark(label_with_shortcut(loop_tooltip, sc_loop.as_deref()));
         draw_overlay_button_bg(
             &painter,
             r,
@@ -1166,11 +1204,14 @@ impl App {
                 ui.id().with(("music_hud_mute", fs_idx)),
                 egui::Sense::click(),
             )
-            .hover_tip_dark(if muted {
-                "ミュート解除"
-            } else {
-                "ミュート"
-            });
+            .hover_tip_dark(label_with_shortcut(
+                if muted {
+                    "ミュート解除"
+                } else {
+                    "ミュート"
+                },
+                sc_mute.as_deref(),
+            ));
         draw_overlay_button_bg(&painter, mute_r, mresp.hovered(), muted);
         draw_overlay_speaker_icon(&painter, mute_r.center(), bsz * 0.46, muted);
         if mresp.clicked() {
