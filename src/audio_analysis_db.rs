@@ -331,13 +331,30 @@ impl AudioAnalysisDb {
         Ok(())
     }
 
-    /// 全行を削除してファイルを縮小する (環境設定の「オーディオ解析キャッシュの削除」)。
-    /// VACUUM で解放ページを回収するので、削除後はファイルサイズが実際に縮む。UI スレッド
-    /// から呼ばず背景スレッドで実行すること (VACUUM はファイル全体を書き換える)。
-    pub fn clear_all(&self) -> rusqlite::Result<()> {
-        self.conn
-            .execute_batch("DELETE FROM audio_analysis; VACUUM;")?;
-        Ok(())
+    /// キャッシュ DB ファイル (+ wal/shm) を削除する (環境設定の「オーディオ解析キャッシュの
+    /// 削除」)。`DELETE + VACUUM` はファイル全体を書き換えて UI をブロックしうる (Codex P2) ため、
+    /// ファイルごと unlink する: 1.4GB でも metadata 操作なので高速、かつ全容量を即解放する。
+    /// SQLite ロックも介さないので `database is locked` は起きない (Codex P3)。次に音声を開くと
+    /// `open_at` が空 DB を作り直す。背景に解析ワーカーが DB を開いている最中は Windows で削除に
+    /// 失敗しうる (その場合 `Err`)。UI スレッドから呼んでよい。
+    pub fn delete_cache_files() -> std::io::Result<()> {
+        Self::delete_cache_files_at(&Self::db_path())
+    }
+
+    fn delete_cache_files_at(path: &Path) -> std::io::Result<()> {
+        let mut result = Ok(());
+        for f in [
+            path.to_path_buf(),
+            path.with_extension("db-wal"),
+            path.with_extension("db-shm"),
+        ] {
+            if f.exists()
+                && let Err(e) = std::fs::remove_file(&f)
+            {
+                result = Err(e);
+            }
+        }
+        result
     }
 }
 
@@ -488,13 +505,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_removes_everything() {
+    fn delete_cache_files_removes_db() {
         let (db, p) = tmp_db();
         db.set("a", 1, 2, &sample_analysis()).unwrap();
-        db.set("b", 3, 4, &sample_analysis()).unwrap();
-        db.clear_all().unwrap();
-        assert!(db.get("a", 1, 2).is_none());
-        assert!(db.get("b", 3, 4).is_none());
+        drop(db); // Windows: 開いている接続があると remove_file が失敗しうるので閉じる。
+        assert!(p.exists());
+        AudioAnalysisDb::delete_cache_files_at(&p).unwrap();
+        assert!(!p.exists());
+        // 削除後に開き直すと空 DB が作られ、旧行は無い。
+        let db2 = AudioAnalysisDb::open_at(&p).unwrap();
+        assert!(db2.get("a", 1, 2).is_none());
         let _ = std::fs::remove_file(&p);
     }
 

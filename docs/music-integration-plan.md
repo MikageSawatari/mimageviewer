@@ -448,7 +448,10 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   - `bookmarks`（= 動画機構を再利用、別テーブルは作らない、D5.1）。
   - 壊れ BLOB / no-row = 空扱い（クラッシュさせない、comic §6.1 と同流儀）。
   - **削除 UI**: 環境設定 → 動画ページの「音量ノーマライズ測定値」の隣に「オーディオ解析
-    キャッシュ」節（サイズ表示 + 削除、`clear_all` = DELETE + VACUUM）を追加（2026-07-03）。
+    キャッシュ」節（サイズ表示 + 削除）を追加（2026-07-03）。削除は `delete_cache_files`
+    （DB ファイルを unlink）で行う: `DELETE + VACUUM` は UI をブロックしうる（Codex P2）ため
+    避け、ファイルごと削除して全容量を即解放する（SQLite ロックも介さない = `database is
+    locked` を回避、Codex P3）。
 - **キー生成**: 実ファイルは path そのもの。動画→音声モード（`VideoAudioOnly`）は動画 path を key に。
   **ZIP/PDF 内の音声は対象外**（初期スコープ = **実ファイル音声 + 実ファイル動画のみ**。ユーザー確定 2026-07-01）。
 - **未リリース = マイグレーション不要**（D11）。v1（JSON）→ v2（量子化 BLOB）も移行コードを
