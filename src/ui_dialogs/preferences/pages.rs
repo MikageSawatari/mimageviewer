@@ -1681,25 +1681,36 @@ fn command_editor_source_chord_section(
         });
 
         let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("現在の割り当て:");
-            if matches.is_empty() {
+        if matches.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("現在の割り当て:");
                 ui.label(egui::RichText::new("割り当てなし").weak());
-            } else {
-                for action in matches {
-                    let label = if state.operation_keyboard_context.is_none() {
-                        format!(
-                            "{}: {}",
-                            key_action_context_label(action),
-                            compact_key_action_label(action)
-                        )
-                    } else {
+            });
+        } else if state.operation_keyboard_context.is_none() {
+            // 場所「すべて」: 場所ごとに 1 行ずつ改行して表示する (横に連結すると複数割り当て時に
+            // 読みにくい、実機 FB)。各行は「場所: 操作」で、場所名ぶん軽くインデントする。
+            ui.label("現在の割り当て:");
+            for action in matches {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(format!(
+                        "{}: {}",
+                        key_action_context_label(action),
                         compact_key_action_label(action)
-                    };
-                    ui.label(label).on_hover_text(action.description());
-                }
+                    ))
+                    .on_hover_text(action.description());
+                });
             }
-        });
+        } else {
+            // 特定の場所を選んでいる場合は 1 場所ぶん (通常 1 件) なので横並びで足りる。
+            ui.horizontal_wrapped(|ui| {
+                ui.label("現在の割り当て:");
+                for action in matches {
+                    ui.label(compact_key_action_label(action))
+                        .on_hover_text(action.description());
+                }
+            });
+        }
     });
 
     ui.add_space(8.0);

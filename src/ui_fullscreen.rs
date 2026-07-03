@@ -7883,6 +7883,26 @@ impl App {
             self.handle_video_input(ctx, fs_idx, video_path.as_deref());
         }
 
+        // 音楽ビュー: 「動画フルスクリーンを閉じて一覧へ戻る」(VideoCloseFullscreen) を音声でも
+        // 動画と同じ扱いで処理する (「映像なし動画」パリティ)。動画は native 経路
+        // (native_video.rs) で VideoCloseFullscreen を VideoPlayPause より前に判定するので、
+        // 音声も再生/一時停止より前に置いて優先順位を揃える (例: Enter を VideoCloseFullscreen に
+        // 割り当てた場合、動画同様「閉じて一覧へ戻る」が勝つ)。既定は未割り当てなので通常は no-op。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::VideoCloseFullscreen)
+        {
+            // この egui 経路では close は `action.close` で呼び出し側に伝える (esc と同じ方式、
+            // 8838 参照)。close_fullscreen を直接呼ばない。
+            action.close = true;
+            return action;
+        }
+
         // 音楽ビュー: Space / Enter で再生・一時停止 (動画の VideoPlayPause = Space+Enter を共有)。
         // 動画の handle_video_input と同じく esc/FsClose 判定より前でここで Enter を先取り consume
         // するので、音声でも動画と同じく Enter = 再生トグル / Esc = 閉じる になる (FsClose の
