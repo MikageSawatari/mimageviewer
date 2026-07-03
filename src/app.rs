@@ -26014,6 +26014,12 @@ impl App {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.set_playing(true);
                     }
+                    // ノーマライズ UI 状態は close_fullscreen で normalize_ui_states が cleanup
+                    // されるので、キャッシュ再生で戻ってきたら再同期する (でないと player には
+                    // gain 適用済みなのに HUD ボタンが Off 表示になり不整合、Codex P3)。DB
+                    // ヒットなら gain 再適用 + OnApplied、ミスなら OnUnmeasured、OFF なら Off。
+                    #[cfg(windows)]
+                    self.init_normalize_state_for_opened_video(idx);
                     crate::logger::log(format!("  audio cache hit idx={idx} → resume playback"));
                 } else {
                     crate::logger::log(format!("  audio idx={idx} → start music view playback"));

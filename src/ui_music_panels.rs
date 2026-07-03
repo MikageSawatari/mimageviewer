@@ -702,6 +702,10 @@ impl App {
         if cur_limiter_seq > self.music_limiter_last_seq {
             self.music_limiter_visible_until =
                 now.checked_add(std::time::Duration::from_millis(1500));
+        } else if cur_limiter_seq < self.music_limiter_last_seq {
+            // 別プレイヤー (曲切替) で seq が 0 に巻き戻ったら stale な赤ドットを消灯する
+            // (動画 native HUD と同じ、Codex P3)。
+            self.music_limiter_visible_until = None;
         }
         self.music_limiter_last_seq = cur_limiter_seq;
         let limiter_visible = self
@@ -1092,7 +1096,7 @@ impl App {
                     format!("音量ノーマライズ ON (仮 {gain_db:+.1}dB / 確定測定中)。クリックで OFF")
                 }
                 NormalizeUiState::OnUnmeasured => {
-                    "音量ノーマライズが有効です。クリックして測定".to_string()
+                    "音量ノーマライズ ON (未測定)。クリックで OFF".to_string()
                 }
                 NormalizeUiState::Scanning => "ノーマライズ中…".to_string(),
             };
@@ -1251,11 +1255,25 @@ impl App {
         if cycle_continuous {
             self.cycle_music_continuous_mode(&ctx, fs_idx);
         }
-        // 音量ノーマライズ (Norm ボタン、左クリックのみ)。動画と共有のハンドラをそのまま
-        // 呼ぶ (音声も FsCacheEntry::Video なので lookup / gain 適用 / スキャンが同じ経路で動く)。
+        // 音量ノーマライズ (Norm ボタン、左クリックのみ)。動画と共有のハンドラを呼ぶ
+        // (音声も FsCacheEntry::Video なので lookup / gain 適用 / スキャンが同じ経路で動く)。
+        // ただし音楽 HUD は右クリックが使えない (背後 FS 右クリックと二重動作) ため、動画の
+        // 「右クリックで OFF」救済経路が無い。そこで OnUnmeasured からの左クリックは測定ではなく
+        // OFF にする (測定は open 時の自動スキャンで走る。再測定したいときは一度 OFF→ON すれば
+        // 未測定判定で再スキャンされる)。それ以外の状態は動画共有ハンドラに委ねる (Codex P2)。
         #[cfg(windows)]
         if toggle_normalize {
-            self.handle_toggle_normalize(&ctx, fs_idx);
+            use crate::video::normalize_types::NormalizeUiState;
+            let st = self
+                .normalize_ui_states
+                .get(&fs_idx)
+                .copied()
+                .unwrap_or_default();
+            if matches!(st, NormalizeUiState::OnUnmeasured) {
+                self.handle_disable_normalize(&ctx, fs_idx);
+            } else {
+                self.handle_toggle_normalize(&ctx, fs_idx);
+            }
         }
     }
 

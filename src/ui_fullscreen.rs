@@ -19355,6 +19355,14 @@ impl App {
 
         // デコード失敗などのエラーは中央に出して終了。
         if let Some(e) = err {
+            // スキャンモーダル中にデコードエラーが出ると、モーダルは (この early-return で)
+            // 描かれないのに `music_normalize_modal_active` が入力抑止だけ残し、ESC / 閉じるが
+            // 効かなくなる。壊れたファイルのスキャンは無意味なのでここでキャンセルして入力
+            // ロックを解く (Codex P2)。
+            #[cfg(windows)]
+            if self.music_normalize_modal_active(fs_idx) {
+                self.handle_cancel_normalize_scan(ctx, fs_idx);
+            }
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
