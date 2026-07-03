@@ -489,7 +489,14 @@ pub fn draw_music_timeline(
         // 画面外 (ユーザーが離れて閲覧中) のときは引き戻さない。毎フレーム再センタリングも
         // しない (fully_visible の間は何もしない)。
         if playing && auto_scroll && vertically_visible && !fully_visible {
-            ui.scroll_to_rect(playhead_rect.expand(row_gap), None);
+            // 即時スクロール (ScrollAnimation::none)。既定の 0.1-0.3s アニメだと offset が数フレーム
+            // かけて変化し、その末尾フレームが「scrollbar ドラッグ」に誤検出されて追従が jerky 化
+            // する (Codex P2、egui 0.33.3)。即時なら offset 変化が当フレームに収まり除外できる。
+            ui.scroll_to_rect_animation(
+                playhead_rect.expand(row_gap),
+                None,
+                egui::style::ScrollAnimation::none(),
+            );
             auto_scrolled = true;
         }
     }

@@ -19370,8 +19370,12 @@ impl App {
                 .show(&mut child, |ui| {
                     if pending_scroll != 0.0 {
                         // egui 0.33: 正の delta.y = 先頭方向 (上) へスクロール (Codex 確認済)。
-                        // ▲=正 (page) / ▼=負 (-page)。
-                        ui.scroll_with_delta(egui::vec2(0.0, pending_scroll));
+                        // ▲=正 (page) / ▼=負 (-page)。即時スクロール (ScrollAnimation::none) で
+                        // offset 変化を当フレームに収め、アニメ末尾の scrollbar ドラッグ誤検出を防ぐ。
+                        ui.scroll_with_delta_animation(
+                            egui::vec2(0.0, pending_scroll),
+                            egui::style::ScrollAnimation::none(),
+                        );
                     }
                     outcome = crate::ui_music_timeline::draw_music_timeline(
                         ui,
