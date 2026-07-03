@@ -69,6 +69,9 @@ enum MusicMarkerJump {
 /// - `forward=false` (J): 前ブックマーク (pos-EPS 未満)、無ければ、まだ先頭でなければ `Start`
 ///   (= 先頭 0.0 へ)、既に先頭なら `None`。
 fn music_marker_target(starts: &[f64], pos: f64, forward: bool) -> Option<MusicMarkerJump> {
+    // 「現在マーカーで足踏み」を防ぐ許容。音声は下 HUD の前後ブックマークボタン (0.3s) と
+    // 揃える (= J/K キーとボタンで同じジャンプ挙動)。動画 J/K は NAV_MARKER_EPSILON=0.5 だが、
+    // 音声は HUD との内部一貫性を優先して 0.3 にする (0.3-0.5s の差は実用上ほぼ不可視、Codex P3)。
     const EPSILON: f64 = 0.3;
     const ALREADY_AT_START_TOL: f64 = 0.05;
     if forward {

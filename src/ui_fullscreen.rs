@@ -558,7 +558,11 @@ fn shift_held_via_os() -> bool {
 /// 動作を成立させる。Esc も同じ位置に居るので、Enter は Esc の **追加** 選択肢。
 ///
 /// 除外条件 (= false を返す):
-/// - 動画モード: Enter は `handle_video_input` で「再生/一時停止」として既に消費中
+/// - 動画/音声モード: Enter は再生/一時停止 (VideoPlayPause) として既に消費中なので
+///   image 用 FsClose 経路で close させない (「映像なし動画」パリティ: 動画も音声も
+///   Enter=トグル / Esc=閉じる)。既定キーでは VideoPlayPause が Enter を先取り消費
+///   するので此処に来ないが、キーカスタマイズで VideoPlayPause から Enter を外す /
+///   FsClose を別キーに変える等でも音声が image 経路で閉じないよう明示除外する (Codex P2)。
 /// - IME 変換中: Enter は IME 確定キーなので奪わない
 /// - フルスクリーン context menu 表示中: メニュー側の Enter 選択操作を優先
 /// - グリッド Enter で open した直後の押下: `suppress_until_release` が立っている間は
@@ -568,12 +572,12 @@ fn shift_held_via_os() -> bool {
 /// サブモード (補正レイヤー/消しゴム/隠蔽/export crop) は caller 側で早期 return
 /// 済みなのでここでは判定しない (= caller の責任)。
 pub(crate) fn should_close_fullscreen_on_enter(
-    is_video_item: bool,
+    is_media_item: bool,
     ime_active: bool,
     context_menu_open: bool,
     suppress_until_release: bool,
 ) -> bool {
-    !is_video_item && !ime_active && !context_menu_open && !suppress_until_release
+    !is_media_item && !ime_active && !context_menu_open && !suppress_until_release
 }
 
 /// `local_adjust_mode` 中にどのテクスチャ経路を採用するかを表す純粋な決定型。
@@ -8098,9 +8102,12 @@ impl App {
         if !enter_currently_down {
             self.fs_suppress_enter_close_until_release = false;
         }
-        let is_video_item = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        // 動画・音声は Enter を再生/一時停止 (VideoPlayPause) に使うので image 用 FsClose
+        // 経路で閉じさせない (音声も current_item_is_audio で除外、Codex P2 / 「映像なし動画」)。
+        let is_media_item =
+            matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) || current_item_is_audio;
         let enter_consume_ok = should_close_fullscreen_on_enter(
-            is_video_item,
+            is_media_item,
             self.ime_input_active(),
             self.fs_context_menu_idx.is_some(),
             self.fs_suppress_enter_close_until_release,
@@ -21434,9 +21441,10 @@ mod tests {
         assert!(should_close_fullscreen_on_enter(false, false, false, false));
     }
 
-    /// 動画モードでは Enter は「再生/停止」なので消費しない。
+    /// 動画・音声モードでは Enter は「再生/停止」(VideoPlayPause) なので image 用 FsClose
+    /// 経路で消費しない (第 1 引数 is_media_item = 動画 OR 音声、Codex P2)。
     #[test]
-    fn enter_does_not_close_fs_for_video() {
+    fn enter_does_not_close_fs_for_media() {
         assert!(!should_close_fullscreen_on_enter(true, false, false, false));
     }
 
