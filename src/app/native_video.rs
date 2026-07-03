@@ -6039,9 +6039,9 @@ impl App {
     /// native presenter を live-attach する。owner/HUD 登録とプラグイン GUI 表示は presenter
     /// HWND が publish されて fullscreen owner 登録が済んでから `tick_music_vst_shell` が行う
     /// (HWND 未確定で GUI を出すと editor が main HWND に生成され z-order が壊れる、Codex High)。
-    /// 音声スレッド・音楽解析状態には触れないので無中断。呼び出し元は VST ボタン (②-4)。
+    /// 音声スレッド・音楽解析状態には触れないので無中断。呼び出し元は音楽 HUD の VST ボタン
+    /// (`draw_music_bottom_hud`、Inc 6 ②-4)。
     #[cfg(windows)]
-    #[allow(dead_code)] // 呼び出し元 (音楽 HUD の VST ボタン) は Inc 6 ②-4 で配線する。
     pub(crate) fn enter_music_vst_shell(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.music_vst_shell.is_some() {
             return;

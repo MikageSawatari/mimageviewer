@@ -786,6 +786,9 @@ impl App {
         // 実機 FB 2026-07-02)。
         #[cfg(windows)]
         let mut toggle_normalize = false;
+        // VST プラグイン画面 (音声 native シェル、Inc 6 ②-4) を開く intent。windows + vst3 有効時のみ。
+        #[cfg(windows)]
+        let mut open_vst_shell = false;
         // `set_speed` は速度ボタン描画時に `draw_overlay_speed_control` の返り値で一度だけ
         // 束縛する (他フラグと違い条件付き更新ではないため、代入時点で宣言する)。
 
@@ -1114,6 +1117,37 @@ impl App {
             set_vol = Some(crate::settings::clamp_video_volume(v));
             vol_persist = persist;
         }
+        // VST プラグイン画面ボタン (VST、Norm の右)。クリックで動画と同じ黒画面 native シェルへ
+        // 切替 (音声はそのまま鳴り続ける)。プラグイン GUI 表示中は native HUD の VST ボタン /
+        // Esc で戻る。スキャンと同じく windows + vst3 有効時のみ描く。押すだけの momentary
+        // ボタンなので active 状態は持たない (押した瞬間 native シェルが egui ビューを覆う)。
+        #[cfg(windows)]
+        if self.settings.vst3_enabled {
+            let vst_w = 40.0;
+            let vst_rect = egui::Rect::from_min_size(
+                egui::pos2(rx - vst_w, controls_cy - bsz * 0.5),
+                egui::vec2(vst_w, bsz),
+            );
+            rx -= vst_w + 8.0;
+            let vst_resp = ui
+                .interact(
+                    vst_rect,
+                    ui.id().with(("music_hud_vst", fs_idx)),
+                    egui::Sense::click(),
+                )
+                .hover_tip_dark("VST プラグイン画面を開く".to_string());
+            draw_overlay_button_bg(&painter, vst_rect, vst_resp.hovered(), false);
+            painter.text(
+                egui::pos2(vst_rect.center().x, text_center_y),
+                egui::Align2::CENTER_CENTER,
+                "VST",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(180),
+            );
+            if vst_resp.clicked() {
+                open_vst_shell = true;
+            }
+        }
         // 音量ノーマライズボタン (Norm、音量スライダーとミュートの間)。動画 native HUD と
         // 同じ 5 状態・配色・ラベルで描く。左クリックのみ (右クリックは背後 FS と二重動作の
         // ため不使用): Off→ON / OnApplied・ProvisionalApplied→OFF / OnUnmeasured→OFF (末尾の
@@ -1329,6 +1363,13 @@ impl App {
             } else {
                 self.handle_toggle_normalize(&ctx, fs_idx);
             }
+        }
+        // VST プラグイン画面を開く (音声 native シェル、Inc 6 ②-4)。走行中の音声プレイヤーに
+        // native presenter を live-attach する (音途切れなし)。非 Fullscreen / vst3 未有効時は
+        // enter 側が toast で拒否する。
+        #[cfg(windows)]
+        if open_vst_shell {
+            self.enter_music_vst_shell(&ctx, fs_idx);
         }
     }
 

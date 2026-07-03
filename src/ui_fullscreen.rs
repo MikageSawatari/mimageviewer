@@ -19429,7 +19429,13 @@ impl App {
         let band_h = (band_bottom - band_top).max(0.0);
         let spectrum_h =
             MUSIC_SPECTRUM_MAX_H.min((band_h - MUSIC_SPECTRUM_GAP - MUSIC_TIMELINE_MIN_H).max(0.0));
-        let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H;
+        // 音声 VST シェル (Inc 6 ②-4): native presenter が egui ビューを覆うので、音楽グラフ
+        // (timeline / spectrum) は描かず spectrum worker も回さない (§5.9)。
+        #[cfg(windows)]
+        let music_shell_active = self.music_vst_shell.is_some();
+        #[cfg(not(windows))]
+        let music_shell_active = false;
+        let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H && !music_shell_active;
         let spectrum_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left() + content_gutter, band_bottom - spectrum_h),
             egui::pos2(rect.right() - content_gutter, band_bottom),
@@ -19493,10 +19499,11 @@ impl App {
         let right_hover = self.music_right_panel_active;
         let pointer_over_panel = left_hover || right_hover || music_modal_open;
 
-        let show_timeline = self
-            .music_analysis
-            .as_ref()
-            .is_some_and(|a| !a.bins.is_empty());
+        let show_timeline = !music_shell_active
+            && self
+                .music_analysis
+                .as_ref()
+                .is_some_and(|a| !a.bins.is_empty());
         if show_timeline {
             // タイムラインは複数行 (row) になり中央領域より高くなるので ScrollArea で縦スクロール。
             // 子 UI は常に DARK visuals (フルスクリーン内は黒背景ベース統一)。

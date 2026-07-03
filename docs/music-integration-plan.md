@@ -514,7 +514,14 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   イベント gate（再生/VST/normalize/Window は通す、`MouseButton`/`MouseWheel`・動画専用・
   bookmark/tag/★/nav・loop/continuous は no-op、Esc=離脱）。呼び出し元は②-4。Codex 設計相談
   ＋コードレビュー2ラウンド（High×3, Medium×4, Low×1 すべて対応、最終 PASS）。
-- **②-4**: UI（音楽 HUD の VST トグル＋グラフ抑止）。
+- **②-4** ✅: UI。音楽下 HUD の右クラスタ（Norm の右）に「VST」ボタンを追加（Norm ボタンと
+  同じ rx レイアウト・windows + vst3 有効時のみ・momentary）。クリックで `enter_music_vst_shell`。
+  `draw_fs_music_view` は `music_vst_shell` が Some の間 `show_timeline` / `show_spectrum` を false に
+  して音楽グラフと spectrum worker を止める（native presenter が覆う、§5.9）。
+
+**Inc 6 ② 完了** ✅（②-1〜②-4）: 音声 VST native シェルが実機で使える状態。VST ボタン → 動画と同じ
+黒画面 + HUD + プラグイン GUI（音途切れなし）、VST ボタン / Esc / native close で音楽ビューへ復帰。
+**実機目視はユーザー**（VST3 有効 + プラグイン読込 → 音楽 FS で VST ボタン → GUI 表示・音継続・離脱）。
 
 **Inc 7 との相乗り**: ②-1 の「native presenter を frameless で回す」capability は Inc 7（動画→音声
 モード）の中核 building block。②で先に入れておくと Inc 7 が楽になる。
