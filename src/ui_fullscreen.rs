@@ -19064,6 +19064,56 @@ impl App {
         }
     }
 
+    /// 音楽タイムラインの縦スクロール用▲/▼ボタンを 1 個描く。押されたら `true`。
+    /// `up=true` で上向き三角 (前へスクロール)、false で下向き三角 (後ろへ)。中央領域に重ねて
+    /// 描くので、glyph 非依存に三角を painter で描く (UI グリフ選定ルール)。呼び出し側は
+    /// このボタン矩形を seek 抑止にも使う。
+    fn draw_music_scroll_button(ui: &egui::Ui, rect: egui::Rect, up: bool) -> bool {
+        let id = ui.id().with(("music_tl_scroll", up));
+        let resp = ui.interact(rect, id, egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        let bg = if resp.is_pointer_button_down_on() {
+            egui::Color32::from_rgba_unmultiplied(64, 96, 128, 230)
+        } else if resp.hovered() {
+            egui::Color32::from_rgba_unmultiplied(52, 70, 94, 205)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(28, 36, 48, 150)
+        };
+        painter.rect_filled(rect, 5.0, bg);
+        painter.rect_stroke(
+            rect,
+            5.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(120, 150, 180, 130),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let c = rect.center();
+        let hw = rect.width() * 0.24;
+        let hh = rect.height() * 0.18;
+        let tri = if up {
+            vec![
+                egui::pos2(c.x, c.y - hh),
+                egui::pos2(c.x - hw, c.y + hh),
+                egui::pos2(c.x + hw, c.y + hh),
+            ]
+        } else {
+            vec![
+                egui::pos2(c.x - hw, c.y - hh),
+                egui::pos2(c.x + hw, c.y - hh),
+                egui::pos2(c.x, c.y + hh),
+            ]
+        };
+        let col = if resp.hovered() {
+            egui::Color32::from_rgb(236, 244, 252)
+        } else {
+            egui::Color32::from_rgb(198, 212, 228)
+        };
+        painter.add(egui::Shape::convex_polygon(tri, col, egui::Stroke::NONE));
+        resp.clicked()
+    }
+
     /// 音声フルスクリーンの音楽ビュー (Inc 3a: 最小構成)。
     ///
     /// headless `VideoPlayer` が音声を再生し、ここでは egui で「音楽アイコン + ファイル名 +
@@ -19246,6 +19296,24 @@ impl App {
                 egui::pos2(rect.left(), central_rect.top()),
                 egui::pos2(central_rect.right(), central_rect.bottom()),
             );
+            // ▲▼ 縦スクロールボタン (ユーザー確定 2026-07-03「動画統一 + ▲▼追加」)。↓↑ を
+            // ファイル移動に使うぶん、タイムライン縦スクロールをボタンでも行える。中央寄り
+            // (右スクロールバーの左、左右パネルトリガ帯 gutter は避ける) に上下を離して置く。
+            let sbtn = 26.0_f32;
+            let sbtn_x = (central_rect.right() - sbtn - 16.0).max(central_rect.left());
+            let up_btn_rect = egui::Rect::from_min_size(
+                egui::pos2(sbtn_x, timeline_rect.top() + 10.0),
+                egui::vec2(sbtn, sbtn),
+            );
+            let down_btn_rect = egui::Rect::from_min_size(
+                egui::pos2(sbtn_x, timeline_rect.bottom() - sbtn - 10.0),
+                egui::vec2(sbtn, sbtn),
+            );
+            let pointer_over_scroll_btn =
+                hover_pos.is_some_and(|p| up_btn_rect.contains(p) || down_btn_rect.contains(p));
+            // 前フレームのボタンクリックで保留したスクロール量を取り出し、下の ScrollArea 内で
+            // 適用する (borrow 衝突回避のため analysis/cache/follow を借りる前に take)。
+            let pending_scroll = std::mem::take(&mut self.music_timeline_scroll_req);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(timeline_rect)
@@ -19273,6 +19341,11 @@ impl App {
                 .auto_shrink([false, false])
                 .id_salt(("music_timeline", fs_idx))
                 .show(&mut child, |ui| {
+                    if pending_scroll != 0.0 {
+                        // egui 規約: 正の delta.y = 先頭方向 (上) へスクロール。▲=正 / ▼=負。
+                        // (実機で上下が逆なら符号を反転する)。
+                        ui.scroll_with_delta(egui::vec2(0.0, pending_scroll));
+                    }
                     seek_req = crate::ui_music_timeline::draw_music_timeline(
                         ui,
                         analysis,
@@ -19288,9 +19361,23 @@ impl App {
                 });
             if let Some(s) = seek_req
                 && !pointer_over_panel
+                && !pointer_over_scroll_btn
                 && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
                 player.seek(s);
+            }
+            // ▲▼ ボタンを timeline に重ねて描く (ScrollArea の後 = 前面)。押されたら次フレームの
+            // ScrollArea 内 scroll_with_delta に反映する。手動スクロール扱いなので follow を切る。
+            let page = (timeline_rect.height() * 0.85).max(40.0);
+            if Self::draw_music_scroll_button(ui, up_btn_rect, true) {
+                self.music_timeline_scroll_req = page;
+                self.music_timeline_follow = false;
+                ctx.request_repaint();
+            }
+            if Self::draw_music_scroll_button(ui, down_btn_rect, false) {
+                self.music_timeline_scroll_req = -page;
+                self.music_timeline_follow = false;
+                ctx.request_repaint();
             }
         } else {
             // 中央: 音楽アイコン + ファイル名 + 状態 (解析中 / エラー)。

@@ -5245,6 +5245,11 @@ pub struct App {
     pub(crate) music_timeline_row_secs: f64,
     /// 再生カーソル行の自動追従。手動スクロールで false、可視復帰で true。
     pub(crate) music_timeline_follow: bool,
+    /// タイムラインの▲▼スクロールボタンが押されたときの保留スクロール量 (points、0=なし)。
+    /// ボタンは ScrollArea の外に描くので、次フレームの ScrollArea 内で `scroll_with_delta`
+    /// に適用してからクリアする。↓↑ をファイル移動に使うため (動画と統一)、タイムライン縦
+    /// スクロールはこのボタン + ホイール + ドラッグで行う。
+    pub(crate) music_timeline_scroll_req: f32,
     /// 下段スペクトラム (Inc 4) 用の全尺デコード PCM。解析ワーカーが追送し、UI が再生位置
     /// 周辺 ±1 秒を切り出して `SpectrumAnalyzer` に食わせる。開くファイルが変わったら破棄。
     pub(crate) music_pcm: Option<std::sync::Arc<crate::ui_music_spectrum::MusicPcm>>,
@@ -7089,6 +7094,7 @@ impl App {
             music_timeline_cache: crate::ui_music_timeline::TimelineTextureCache::default(),
             music_timeline_row_secs: crate::ui_music_timeline::MUSIC_ROW_SECS_DEFAULT,
             music_timeline_follow: true,
+            music_timeline_scroll_req: 0.0,
             music_pcm: None,
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
             music_probe: None,
