@@ -6676,12 +6676,13 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     ui.label(egui::RichText::new("保存済み位置の管理").strong());
     ui.add_space(4.0);
 
-    // 動画 (再生位置は settings 内の HashMap。クリアは OK 適用時に反映)。
+    // 動画・音声 (再生位置は settings 内の同じ HashMap を path キーで共有。クリアは OK 適用時に反映)。
     let video_count = state.settings.video_resume_positions.len();
     ui.label(format!(
-        "動画の再生位置: {video_count} 件を記憶 (3 秒以上再生・末尾 5 秒以内に未到達のときのみ保存)。"
+        "動画・音声の再生位置: {video_count} 件を記憶 (3 秒以上再生・末尾 5 秒以内に未到達のときのみ保存)。"
     ));
-    if video_count > 0 && ui.button("動画の再生位置をすべてクリア").clicked() {
+    if video_count > 0 && ui.button("動画・音声の再生位置をすべてクリア").clicked()
+    {
         state.settings.video_resume_positions.clear();
     }
 

@@ -25998,6 +25998,10 @@ impl App {
                     crate::logger::log(format!("  audio cache hit idx={idx} → resume playback"));
                 } else {
                     crate::logger::log(format!("  audio idx={idx} → start music view playback"));
+                    // open_fullscreen 冒頭で take した grid/nav ワンショットを start_fs_load の
+                    // 音声分岐が再度 take するので、動画分岐 (25987) と同じく戻してから呼ぶ。
+                    // これで「音声 × 一覧から開く」設定 (music_open_resume) が効く (Codex P2)。
+                    self.fs_open_intent_from_grid = grid_open_intent;
                     self.start_fs_load(idx);
                 }
             }
@@ -30903,6 +30907,11 @@ impl App {
                     (*k != idx && matches!(v, FsCacheEntry::Video { .. })).then_some(*k)
                 })
                 .collect();
+            if !other_player_idxs.is_empty() {
+                // 畳む前に現在位置を保存する (動画分岐と同じ)。poll_video の 5 秒周期保存より
+                // 前に素早く曲を切り替えると直近位置が失われ、resume=続きから が効かない (Codex P2)。
+                self.save_all_video_resume_positions();
+            }
             for k in other_player_idxs {
                 #[cfg(windows)]
                 self.cleanup_normalize_state_for_fs_idx(k);
