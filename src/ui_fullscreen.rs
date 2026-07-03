@@ -7878,6 +7878,22 @@ impl App {
             self.handle_video_input(ctx, fs_idx, video_path.as_deref());
         }
 
+        // 音楽ビュー: Space / Enter で再生・一時停止 (動画の VideoPlayPause = Space+Enter を共有)。
+        // 動画の handle_video_input と同じく esc/FsClose 判定より前でここで Enter を先取り consume
+        // するので、音声でも動画と同じく Enter = 再生トグル / Esc = 閉じる になる (FsClose の
+        // 既定 Enter へは流れない、「映像なし動画」パリティ)。モーダル / IME / TextEdit フォーカス中は
+        // 消費しない。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
+            && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+        {
+            player.toggle_play();
+        }
+
         // 音楽ビュー (Inc 5): B キーで現在の再生位置にブックマークを追加する
         // (動画の `KeyAction::VideoBookmark` を共有)。ブックマーク改名 / インポート /
         // タグピッカーの TextEdit にフォーカスがあるとき・IME 変換中・コンテキスト
@@ -7902,6 +7918,37 @@ impl App {
             && self.keymap.consume_action(ctx, KeyAction::VideoLoop)
         {
             self.cycle_music_loop_mode(ctx, fs_idx);
+        }
+
+        // 音楽ビュー: W キーで頭出し (先頭へ seek + 即再生、動画の VideoSeekStart を共有)。
+        // 下 HUD の 頭出しボタンと実体 (`music_seek_start`) を共有。モーダル / IME / TextEdit
+        // フォーカス中は消費しない。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            && self.keymap.consume_action(ctx, KeyAction::VideoSeekStart)
+        {
+            self.music_seek_start(fs_idx);
+        }
+
+        // 音楽ビュー: J/K で前後のブックマークへジャンプ (動画の VideoMarkerPrev/VideoMarkerNext を
+        // 共有)。音声はチャプター/ピン無しなのでブックマークのみ対象。J=前 (無ければ先頭)、K=次。
+        // モーダル / IME / TextEdit フォーカス中は消費しない。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+        {
+            let prev_marker = self.keymap.consume_action(ctx, KeyAction::VideoMarkerPrev);
+            let next_marker = self.keymap.consume_action(ctx, KeyAction::VideoMarkerNext);
+            if prev_marker {
+                self.music_marker_jump(fs_idx, false);
+            } else if next_marker {
+                self.music_marker_jump(fs_idx, true);
+            }
         }
 
         // 音楽ビュー (Inc 5c-B): Shift+↑↓ で音量調整 (動画の VideoVolumeUp/Down を共有)。
@@ -7935,6 +7982,19 @@ impl App {
             }
         }
 
+        // 音楽ビュー: M キーでミュート切替 (動画の VideoMute を共有)。セッションミュート +
+        // settings.video_muted を反転し、下 HUD のミュートボタンと挙動を揃える。モーダル / IME /
+        // TextEdit フォーカス中は消費しない。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            && self.keymap.consume_action(ctx, KeyAction::VideoMute)
+        {
+            self.toggle_video_session_mute_for_fs_idx(fs_idx);
+        }
+
         // 音楽ビュー: Ctrl+ホイール上下で Row 秒数 (タイムライン解像度) を切り替える (実機 FB)。
         // 通常ホイールは前後ファイル移動なので、Ctrl 付きのときだけここで横取りして消費し、下流の
         // 一般ホイールハンドラ (9400 付近) / 前後移動 / ScrollArea へ渡さない。ホイール上 (wheel_y>0)
@@ -7961,6 +8021,64 @@ impl App {
                     i.events
                         .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
                 });
+            }
+        }
+
+        // 音楽ビュー: ←→ でシーク (動画と同じ粒度: ←→=∓5s, Shift+←→=∓1s, Ctrl+←→=∓30s)。
+        // 動画は handle_video_input で処理するが音声は egui 経路なのでここで消費する。プレーン ←→
+        // は固定 chord、Shift/Ctrl 版は VideoSeekBack/Forward の Small/Large を共有 (操作カスタマイズ
+        // 対応)。ここで先取り消費して、下段の一般矢印処理 (音声では前後ファイル移動へ流れる) から
+        // 音声 ←→ を分離する (「映像なし動画」パリティ: 従来 ←→ もファイル移動だったが動画同様
+        // シークにする。前後ファイル移動は ↑↓ = VideoPrevFile/NextFile が担う)。
+        if current_item_is_audio
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+        {
+            let shift_left = self
+                .keymap
+                .consume_action(ctx, KeyAction::VideoSeekBackSmall);
+            let shift_right = self
+                .keymap
+                .consume_action(ctx, KeyAction::VideoSeekForwardSmall);
+            let ctrl_left = self
+                .keymap
+                .consume_action(ctx, KeyAction::VideoSeekBackLarge);
+            let ctrl_right = self
+                .keymap
+                .consume_action(ctx, KeyAction::VideoSeekForwardLarge);
+            let plain_left = !shift_left
+                && !shift_right
+                && !ctrl_left
+                && !ctrl_right
+                && self
+                    .keymap
+                    .consume_fixed_chord(ctx, Chord::key(KeyName::Left));
+            let plain_right = !shift_left
+                && !shift_right
+                && !ctrl_left
+                && !ctrl_right
+                && self
+                    .keymap
+                    .consume_fixed_chord(ctx, Chord::key(KeyName::Right));
+            let delta = if plain_left {
+                -5.0
+            } else if plain_right {
+                5.0
+            } else if shift_left {
+                -1.0
+            } else if shift_right {
+                1.0
+            } else if ctrl_left {
+                -30.0
+            } else if ctrl_right {
+                30.0
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                self.music_seek_relative(fs_idx, delta);
             }
         }
 
@@ -8065,16 +8183,20 @@ impl App {
         } else {
             None
         };
-        let arrow_right = ctx.input_mut(|i| {
-            !video_horizontal_arrow_key
-                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight))
-        });
-        let arrow_left = ctx.input_mut(|i| {
-            !video_horizontal_arrow_key
-                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
-        });
+        // 音声は ←→ を上のシークブロックで消費済み (「映像なし動画」パリティ)。ここでは file-nav へ
+        // 流さないよう明示的に除外する (残留 ←→ が前後ファイル移動を誤発火するのを防ぐ)。
+        let arrow_right = !current_item_is_audio
+            && ctx.input_mut(|i| {
+                !video_horizontal_arrow_key
+                    && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight))
+            });
+        let arrow_left = !current_item_is_audio
+            && ctx.input_mut(|i| {
+                !video_horizontal_arrow_key
+                    && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
+            });
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
         // ジャンプ」に割り当てる。動画再生中は Video* action (音量 / 前後ファイル) が優先。
         // 非スタック / 非フラットでは従来どおり Shift+↓↑ はプレーン ↓↑ のエイリアス (ページ送り)。

@@ -54,6 +54,38 @@ fn format_hms(secs: f64) -> String {
     }
 }
 
+/// J/K マーカーナビの seek 結果。`Marker` = 具体的なブックマーク秒へ、`Start` = 前ブックマークが
+/// 無い J キーのフォールバックで先頭 0.0 へ。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MusicMarkerJump {
+    Marker(f64),
+    Start,
+}
+
+/// J/K マーカーナビの seek 先を決める純関数 (副作用なし・テスト用)。`starts` は昇順・filter/dedup
+/// 済みのブックマーク秒。現在位置 `pos` の ± epsilon を境にした最近接探索で「現在マーカーで足踏み」
+/// を防ぐ (動画 J/K と同じ規約)。返り値 `None` は no-op。
+/// - `forward=true` (K): 次ブックマーク (pos+EPS 超)、無ければ `None`。
+/// - `forward=false` (J): 前ブックマーク (pos-EPS 未満)、無ければ、まだ先頭でなければ `Start`
+///   (= 先頭 0.0 へ)、既に先頭なら `None`。
+fn music_marker_target(starts: &[f64], pos: f64, forward: bool) -> Option<MusicMarkerJump> {
+    const EPSILON: f64 = 0.3;
+    const ALREADY_AT_START_TOL: f64 = 0.05;
+    if forward {
+        starts
+            .iter()
+            .copied()
+            .find(|&s| s > pos + EPSILON)
+            .map(MusicMarkerJump::Marker)
+    } else if let Some(t) = starts.iter().copied().rev().find(|&s| s < pos - EPSILON) {
+        Some(MusicMarkerJump::Marker(t))
+    } else if pos > ALREADY_AT_START_TOL {
+        Some(MusicMarkerJump::Start)
+    } else {
+        None
+    }
+}
+
 /// bitrate (bps) を "320 kbps" / "1.4 Mbps" 風に整形する。
 fn format_bitrate(bit_rate_bps: i64) -> String {
     if bit_rate_bps <= 0 {
@@ -138,6 +170,55 @@ impl App {
             player.seek(secs.max(0.0));
         }
         self.apply_music_loop_mode(fs_idx);
+    }
+
+    /// 相対シーク (現在位置 + delta を [0, duration] にクランプして seek)。←→ シークキーの実体で、
+    /// 動画 `seek_relative` の音声版。seek 後のループ target 再計算のため `music_seek_to` に集約する。
+    pub(crate) fn music_seek_relative(&mut self, fs_idx: usize, delta_secs: f64) {
+        let (pos, dur) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                (player.position().max(0.0), player.duration().max(0.0))
+            }
+            _ => return,
+        };
+        let target = if dur > 0.0 {
+            (pos + delta_secs).clamp(0.0, dur)
+        } else {
+            (pos + delta_secs).max(0.0)
+        };
+        self.music_seek_to(fs_idx, target);
+    }
+
+    /// 頭出し (先頭 0.0 へ seek + 即再生)。下 HUD の 頭出しボタンと W キー (VideoSeekStart) の
+    /// 共通実体。動画の rewind (= seek(0.0) + play) の音声版で、明示 `set_playing(true)` で
+    /// 一時停止中でも頭から再生を開始する (seek 自体の autoplay intent に依存しない)。
+    pub(crate) fn music_seek_start(&mut self, fs_idx: usize) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_playing(true);
+        }
+        self.music_seek_to(fs_idx, 0.0);
+    }
+
+    /// J/K マーカーナビ (ブックマーク間の前後ジャンプ)。動画 `VideoMarkerPrev`/`VideoMarkerNext`
+    /// の音声版。音声はチャプター/ピンを持たないのでブックマークのみ対象。seek 先の決定は副作用
+    /// ゼロの純関数 `music_marker_target` に集約 (= unit test 可能)。マーカー集合は freshness gate
+    /// 付きの `music_bookmark_starts_for` (現在の音声パスに読み込み済みのブックマークだけ、昇順・
+    /// filter/dedup 済み) を使う。
+    pub(crate) fn music_marker_jump(&mut self, fs_idx: usize, forward: bool) {
+        let starts = self.music_bookmark_starts_for(fs_idx);
+        let pos = self.music_player_position(fs_idx).unwrap_or(0.0);
+        match music_marker_target(&starts, pos, forward) {
+            Some(MusicMarkerJump::Marker(t)) => {
+                self.music_seek_to(fs_idx, t);
+                let dir = if forward { "次の" } else { "前の" };
+                self.show_feedback_toast(format!("{} {dir}ブックマーク", format_hms(t)));
+            }
+            Some(MusicMarkerJump::Start) => {
+                self.music_seek_to(fs_idx, 0.0);
+                self.show_feedback_toast(format!("{} 先頭", format_hms(0.0)));
+            }
+            None => {}
+        }
     }
 
     fn music_audio_path(&self, fs_idx: usize) -> Option<std::path::PathBuf> {
@@ -999,9 +1080,6 @@ impl App {
             return;
         }
         let ctx = ui.ctx().clone();
-        if seek_start {
-            seek_to = Some(0.0);
-        }
         if let Some(s) = set_speed {
             self.video_playback_speed = s;
         }
@@ -1019,9 +1097,6 @@ impl App {
         }
         // player 直操作 (seek はループ target 再計算のため music_seek_to に集約するので除く)。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            if seek_start {
-                player.set_playing(true);
-            }
             if toggle_play {
                 player.toggle_play();
             }
@@ -1036,8 +1111,11 @@ impl App {
             }
         }
         // seek はブックマーク区間ループの target 再計算を伴うので専用 helper に寄せる
-        // (全 seek 経路を単一化、Codex 設計 P2)。
-        if let Some(s) = seek_to {
+        // (全 seek 経路を単一化、Codex 設計 P2)。頭出し (seek_start) は seek(0.0) + 即再生を
+        // 束ねた `music_seek_start` に寄せ、W キー (VideoSeekStart) と実体を共有する。
+        if seek_start {
+            self.music_seek_start(fs_idx);
+        } else if let Some(s) = seek_to {
             self.music_seek_to(fs_idx, s);
         }
         // ループ / 連続再生の切替 (共有 video_loop_mode / video_continuous_mode)。
@@ -1083,5 +1161,58 @@ mod tests {
         assert_eq!(format_channels(2), "2 (ステレオ)");
         assert_eq!(format_channels(6), "6 ch");
         assert_eq!(format_channels(0), "-");
+    }
+
+    #[test]
+    fn marker_target_next_finds_first_after_pos() {
+        let starts = [10.0, 30.0, 60.0];
+        // 15s から K → 次は 30s
+        assert_eq!(
+            music_marker_target(&starts, 15.0, true),
+            Some(MusicMarkerJump::Marker(30.0))
+        );
+        // 直前 (epsilon 内) のマーカーでは足踏みしない: 30.0 ちょうどから K → 60s
+        assert_eq!(
+            music_marker_target(&starts, 30.0, true),
+            Some(MusicMarkerJump::Marker(60.0))
+        );
+        // 末尾以降は no-op
+        assert_eq!(music_marker_target(&starts, 60.0, true), None);
+        assert_eq!(music_marker_target(&starts, 100.0, true), None);
+    }
+
+    #[test]
+    fn marker_target_prev_finds_last_before_pos() {
+        let starts = [10.0, 30.0, 60.0];
+        // 45s から J → 前は 30s
+        assert_eq!(
+            music_marker_target(&starts, 45.0, false),
+            Some(MusicMarkerJump::Marker(30.0))
+        );
+        // 30.0 ちょうどから J → 足踏みせず 10s
+        assert_eq!(
+            music_marker_target(&starts, 30.0, false),
+            Some(MusicMarkerJump::Marker(10.0))
+        );
+    }
+
+    #[test]
+    fn marker_target_prev_falls_back_to_start() {
+        let starts = [10.0, 30.0];
+        // 最初のマーカーより手前 (かつ先頭でない) → 先頭へ
+        assert_eq!(
+            music_marker_target(&starts, 5.0, false),
+            Some(MusicMarkerJump::Start)
+        );
+        // 既に先頭 (許容 0.05 以内) → no-op
+        assert_eq!(music_marker_target(&starts, 0.0, false), None);
+        assert_eq!(music_marker_target(&starts, 0.02, false), None);
+        // ブックマーク皆無 + 先頭でない → 先頭へ
+        assert_eq!(
+            music_marker_target(&[], 42.0, false),
+            Some(MusicMarkerJump::Start)
+        );
+        // ブックマーク皆無 + 先頭 → no-op
+        assert_eq!(music_marker_target(&[], 0.0, false), None);
     }
 }

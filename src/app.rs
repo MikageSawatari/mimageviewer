@@ -41249,7 +41249,7 @@ impl App {
     /// 現在の音声 fs_idx に対して有効なブックマーク境界秒 (区間先頭) を返す。
     /// `music_bookmarks` が **現在の再生 path 用** に読み込まれている場合のみ非空を返す。
     /// 曲切替直後に前曲のブックマークで区間ループを組んでしまう race を防ぐ (Codex 設計 P1)。
-    fn music_bookmark_starts_for(&self, fs_idx: usize) -> Vec<f64> {
+    pub(crate) fn music_bookmark_starts_for(&self, fs_idx: usize) -> Vec<f64> {
         if self.fullscreen_idx != Some(fs_idx) {
             return Vec::new();
         }
