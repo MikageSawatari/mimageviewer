@@ -910,10 +910,18 @@ fn render_timeline_row_image(
     for (visible_idx, visible) in visible_bins.iter().copied().enumerate() {
         let bin = &bins[visible.index];
         drawn_bins += 1;
-        let amp = (bin.peak.max(bin.rms * 2.0)).sqrt().clamp(0.025, 1.0);
-        let outer_half_h = (waveform_h as f32 * 0.46 * amp).max(1.0);
-        let core_scale = 0.42 + bin.rms.sqrt().clamp(0.0, 1.0) * 0.45;
-        let core_half_h = (outer_half_h * core_scale).max(1.0).min(outer_half_h);
+        // L=上 / R=下 のステレオ波形。L/R が全てゼロ (既定構築 / 旧 bin) で mono があるなら
+        // mono にフォールバックして従来どおり対称に描く (Codex P2: 既定 bin が無音/非対称に
+        // ならないように)。
+        let (peak_up, rms_up, peak_down, rms_down) =
+            if bin.peak_l == 0.0 && bin.rms_l == 0.0 && bin.peak_r == 0.0 && bin.rms_r == 0.0 {
+                (bin.peak, bin.rms, bin.peak, bin.rms)
+            } else {
+                (bin.peak_l, bin.rms_l, bin.peak_r, bin.rms_r)
+            };
+        let (outer_up, core_up) = spectral_waveform_half_heights(waveform_h, peak_up, rms_up);
+        let (outer_down, core_down) =
+            spectral_waveform_half_heights(waveform_h, peak_down, rms_down);
         draw_spectral_waveform_bin_pixels(
             &mut pixels,
             width,
@@ -921,8 +929,10 @@ fn render_timeline_row_image(
             center_y,
             visible.x0,
             visible.x1,
-            outer_half_h,
-            core_half_h,
+            outer_up,
+            core_up,
+            outer_down,
+            core_down,
             bin.band_energy,
         );
         if bin.transient > TRANSIENT_ACCENT_MIN {
@@ -1571,6 +1581,20 @@ const TIMELINE_METRIC_KINDS: [TimelineMetricKind; TIMELINE_METRIC_LANE_COUNT] = 
 ];
 
 #[allow(clippy::too_many_arguments)]
+/// 1 チャンネル分の (outer, core) 波形高さ (px) を peak / rms から求める。左右で同じスケール
+/// を使うため関数化した。従来の mono 計算 (`amp=(peak.max(rms*2)).sqrt()`、core=0.42+rms.sqrt()*0.45)
+/// をそのまま片チャンネルに適用する。
+fn spectral_waveform_half_heights(waveform_h: usize, peak: f32, rms: f32) -> (f32, f32) {
+    let amp = (peak.max(rms * 2.0)).sqrt().clamp(0.025, 1.0);
+    let outer = (waveform_h as f32 * 0.46 * amp).max(1.0);
+    let core_scale = 0.42 + rms.sqrt().clamp(0.0, 1.0) * 0.45;
+    let core = (outer * core_scale).max(1.0).min(outer);
+    (outer, core)
+}
+
+/// 上半分 = 左チャンネル (`outer_up` / `core_up`)、下半分 = 右チャンネル (`outer_down` /
+/// `core_down`) の非対称波形を描く。モノラル素材は L==R で対称になり従来と同じ見た目になる。
+#[allow(clippy::too_many_arguments)]
 fn draw_spectral_waveform_bin_pixels(
     pixels: &mut [egui::Color32],
     width: usize,
@@ -1578,8 +1602,10 @@ fn draw_spectral_waveform_bin_pixels(
     center_y: f32,
     x0: f32,
     x1: f32,
-    outer_half_h: f32,
-    core_half_h: f32,
+    outer_up: f32,
+    core_up: f32,
+    outer_down: f32,
+    core_down: f32,
     band: [f32; 3],
 ) {
     let weights = spectral_weights(band);
@@ -1590,59 +1616,24 @@ fn draw_spectral_waveform_bin_pixels(
         width,
         height,
         x0,
-        center_y - outer_half_h,
+        center_y - outer_up,
         x1,
-        center_y + outer_half_h,
+        center_y + outer_down,
         egui::Color32::from_rgba_unmultiplied(126, 104, 62, 52),
     );
 
+    // 上 = L (direction -1.0)、下 = R (direction +1.0)。outer → core の順で重ねる。
     draw_spectral_half_pixels(
-        pixels,
-        width,
-        height,
-        x0,
-        x1,
-        center_y,
-        -1.0,
-        outer_half_h,
-        weights,
-        88,
+        pixels, width, height, x0, x1, center_y, -1.0, outer_up, weights, 88,
     );
     draw_spectral_half_pixels(
-        pixels,
-        width,
-        height,
-        x0,
-        x1,
-        center_y,
-        1.0,
-        outer_half_h,
-        weights,
-        88,
+        pixels, width, height, x0, x1, center_y, 1.0, outer_down, weights, 88,
     );
     draw_spectral_half_pixels(
-        pixels,
-        width,
-        height,
-        x0,
-        x1,
-        center_y,
-        -1.0,
-        core_half_h,
-        weights,
-        218,
+        pixels, width, height, x0, x1, center_y, -1.0, core_up, weights, 218,
     );
     draw_spectral_half_pixels(
-        pixels,
-        width,
-        height,
-        x0,
-        x1,
-        center_y,
-        1.0,
-        core_half_h,
-        weights,
-        218,
+        pixels, width, height, x0, x1, center_y, 1.0, core_down, weights, 218,
     );
 }
 

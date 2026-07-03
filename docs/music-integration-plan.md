@@ -465,6 +465,10 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 
 ### 7.1 タイムライン表示（`WaveformBin` ベース）
 - [x] 上段 DJ 風カラー波形（`band_energy` / `transient` / `transient_band`）（Inc 3b、実機目視待ち）
+- [x] **上段波形を L/R ステレオ表示**（上半分=左ch / 下半分=右ch、2026-07-03 Inc 5c-C）。
+  `WaveformBin` に `peak_l/rms_l/peak_r/rms_r` を additive 追加（music-core §2.1、`#[serde(default)]`）。
+  mono 素材は L==R で従来どおり対称。L/R が全ゼロの既定/旧 bin は mono にフォールバック描画。
+  in-memory 化 (§6/D8) 済みなのでディスク増はゼロ。
 - [x] loudness+bass root レーン（高さ=loudness、色=`bass_pitch_class` 五度圏）（Inc 3b）
 - [x] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）（Inc 3b）
 - [ ] vocal hint 独立レーン（`vocal_score` / `center_ratio`）（未着手）

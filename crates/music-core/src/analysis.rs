@@ -128,6 +128,17 @@ pub struct WaveformBin {
     pub duration_secs: f64,
     pub peak: f32,
     pub rms: f32,
+    /// 左チャンネルの peak / RMS。DJ タイムラインの上半分に描く (L/R ステレオ波形)。
+    /// 既存 mono `peak` / `rms` は他メトリクス (band / chroma 等) が使い続けるので残す。
+    #[serde(default)]
+    pub peak_l: f32,
+    #[serde(default)]
+    pub rms_l: f32,
+    /// 右チャンネルの peak / RMS。下半分に描く。
+    #[serde(default)]
+    pub peak_r: f32,
+    #[serde(default)]
+    pub rms_r: f32,
     pub loudness_db: f32,
     /// Normalized low / mid / high energy. Used for DJ-style color mapping.
     pub band_energy: [f32; 3],
@@ -238,6 +249,11 @@ pub fn analyze_stereo_timeline(
         let frame_end = (frame_start + frames_per_bin).min(frame_count);
         let mut peak = 0.0_f32;
         let mut square_sum = 0.0_f64;
+        // 左右チャンネル別の peak / RMS (L/R ステレオ波形表示用)。mono とは別に集計する。
+        let mut peak_l = 0.0_f32;
+        let mut peak_r = 0.0_f32;
+        let mut square_sum_l = 0.0_f64;
+        let mut square_sum_r = 0.0_f64;
         let mut side_square_sum = 0.0_f64;
         let mut low_sum = 0.0_f64;
         let mut mid_sum = 0.0_f64;
@@ -260,6 +276,12 @@ pub fn analyze_stereo_timeline(
             let abs = mono.abs();
             peak = peak.max(abs);
             square_sum += (mono as f64) * (mono as f64);
+            let lc = l.clamp(-1.0, 1.0);
+            let rc = r.clamp(-1.0, 1.0);
+            peak_l = peak_l.max(lc.abs());
+            peak_r = peak_r.max(rc.abs());
+            square_sum_l += (lc as f64) * (lc as f64);
+            square_sum_r += (rc as f64) * (rc as f64);
             side_square_sum += (side as f64) * (side as f64);
             abs_sum += abs as f64;
             if have_prev_mono
@@ -283,6 +305,8 @@ pub fn analyze_stereo_timeline(
 
         let n = (frame_end - frame_start).max(1) as f64;
         let rms = (square_sum / n).sqrt() as f32;
+        let rms_l = (square_sum_l / n).sqrt() as f32;
+        let rms_r = (square_sum_r / n).sqrt() as f32;
         let side_rms = (side_square_sum / n).sqrt() as f32;
         let center_ratio = (rms / (rms + side_rms + 1.0e-6)).clamp(0.0, 1.0);
         let loudness_db = linear_to_db(rms);
@@ -334,6 +358,10 @@ pub fn analyze_stereo_timeline(
             duration_secs: (frame_end - frame_start) as f64 / sample_rate as f64,
             peak,
             rms,
+            peak_l,
+            rms_l,
+            peak_r,
+            rms_r,
             loudness_db,
             band_energy,
             transient,
@@ -1436,6 +1464,27 @@ mod tests {
         assert!(analysis.is_current_version());
         assert!(!analysis.bins.is_empty());
         assert!(analysis.bins.iter().any(|b| b.peak > 0.5));
+    }
+
+    #[test]
+    fn analysis_separates_left_right_channels() {
+        // 左に強い信号、右は無音。per-channel の peak/rms が分離され、mono はその平均になる。
+        let mut samples = Vec::new();
+        for _ in 0..48_000 {
+            samples.extend([0.8_f32, 0.0_f32]); // L=0.8, R=0.0
+        }
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        let bin = analysis
+            .bins
+            .iter()
+            .find(|b| b.peak_l > 0.1)
+            .expect("a bin with left-channel energy");
+        assert!(bin.peak_l > 0.7, "peak_l={}", bin.peak_l);
+        assert!(bin.peak_r < 0.01, "peak_r={}", bin.peak_r);
+        assert!(bin.rms_l > 0.7, "rms_l={}", bin.rms_l);
+        assert!(bin.rms_r < 0.01, "rms_r={}", bin.rms_r);
+        // mono は (L+R)/2 = 0.4 相当。
+        assert!(bin.peak > 0.3 && bin.peak < 0.5, "mono peak={}", bin.peak);
     }
 
     #[test]
