@@ -533,6 +533,27 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   微小移動が誤シーク→不快音 → `dragged_by(Primary)` 限定)、**中ボタンドラッグでグラフ縦パン** (ハンド
   ツール、ポインタ状態直読み)、**Ctrl+ホイール上下で Row 秒数 (解像度) 切替** (handle_fs_key_input の
   音声セクションで一般ホイールハンドラより前に横取り消費、通常ホイールは前後移動へ流す)。
+- [x] **キーボード操作パリティ**（2026-07-03 Inc 5c-C、commit 4d762bb2 + 3d6b0454、Codex 2 ラウンド
+  P1/P2/P3 ゼロ）。音声フルスクリーンで未配線だった Video\* キーを「映像なし動画」で系統的に配線
+  （すべて動画の共有 `KeyAction` を `handle_fs_key_input` の音声セクションで `consume_action`）:
+  - **再生/一時停止**（`VideoPlayPause` = Space/Enter）。esc/FsClose 判定より前で Enter を先取り消費
+    するので、動画同様 **Enter = 再生トグル / Esc = 閉じる**。robust 化のため
+    `should_close_fullscreen_on_enter` の第 1 引数を `is_video_item` → `is_media_item`（動画 OR 音声）
+    に一般化し、キーカスタマイズで VideoPlayPause から Enter を外す / FsClose を別キーに変えても音声が
+    image 用 close 経路で閉じないようにした（Codex P2）。
+  - **頭出し**（`VideoSeekStart` = W）。先頭 seek + 即再生。下 HUD の頭出しボタンと実体
+    `music_seek_start` を共有（HUD 側もこれに寄せて単一化）。
+  - **シーク**（plain ←→ 固定 chord = ∓5s、Shift+←→ = `VideoSeekBack/ForwardSmall` = ∓1s、
+    Ctrl+←→ = 同 `Large` = ∓30s）。実体 `music_seek_relative`（pos+delta を [0,dur] にクランプして
+    `music_seek_to`）。**従来 ←→ はファイル移動だったが動画同様シークに変更**、前後ファイル移動は
+    ↑↓（`VideoPrevFile/NextFile`）へ集約（generic arrow consume に `!current_item_is_audio` ガード）。
+  - **前後ブックマーク**（`VideoMarkerPrev/Next` = J/K）。seek 先決定は純関数
+    `music_marker_target(starts, pos, forward) -> Option<MusicMarkerJump>`（unit test 3 本）。マーカー集合は
+    freshness gate 付き `music_bookmark_starts_for`（path 一致 + 昇順 filter/dedup）。EPSILON = 0.3 は
+    HUD 前後ボタンと揃える（動画 J/K の 0.5 とは音声 UI 内一貫性を優先して意図的に別、Codex P3）。
+  - **ミュート**（`VideoMute` = M）。`toggle_video_session_mute_for_fs_idx`（音声 player set_muted +
+    settings.video_muted）。
+  - 全 seek / 頭出しは `music_seek_to` 経由でブックマーク区間ループ target を再計算。
 
 ### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1。5c-A で動画 UI を共有）
 - [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5 → 5c-A で `draw_native_jump_panel_body` 共有）
