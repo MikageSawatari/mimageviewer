@@ -494,8 +494,14 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 
 **リスク**: 音声途切れ＝低（音声側不触）／ライフサイクル＝中（released presenter の HWND 順序）。
 **段階化（各段 build＋test＋Codex、動画側バイト等価維持）**:
-- **②-1**: present ループの overlay-only tick（frameless 耐性）＝土台。
-- **②-2**: `VideoPlayer` の native 出力 attach/detach。
+- **②-1** ✅: present ループの overlay-only tick（frameless 耐性）＝土台。commit 07bf2644。
+  `NativeVideoOutputConfig.audio_only` を新設し、frameless 時に (a) startup で `first_presented`
+  を立てて `native_presenter_pending()` の永久固着を防止、(b) `waiting_for_first_frame=false`、
+  (c) アイドル sleep を 16ms 化。全て audio_only ガードで動画側バイト等価。Codex P1-3 ゼロ。
+- **②-2** ✅: `VideoPlayer` の native 出力 attach/detach。`attach_native_output_from_config(config)`
+  を新設（`open()` の spawn と同じ self フィールドを再利用＝clock/video_rx/pump/decoder/dsp/
+  normalize/解析を作り直さない）。detach は既存 `take_native_output()`（drop で presenter
+  スレッド cancel+join、音声不触）。dead-code プリミティブ（呼び出し元は②-3）。
 - **②-3**: App 側 enter/exit ライフサイクル（HWND owner/HUD 一般化・イベント gate・close=モード離脱）。
 - **②-4**: UI（音楽 HUD の VST トグル＋グラフ抑止）。
 

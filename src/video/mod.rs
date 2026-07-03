@@ -5301,6 +5301,45 @@ impl VideoPlayer {
         self.native_output = Some(output);
     }
 
+    /// 走行中の (headless で open した) プレイヤーに native presenter を新規 spawn して
+    /// attach する (music VST シェル、Inc 6 ②-2)。`open()` が初回に native 出力を spawn
+    /// するのと**同じ内部フィールド**を再利用するので、既存の `clock` / `video_rx` /
+    /// `engine_event_tx` / audio pump / decoder / `DspBridge` / normalize / 解析状態を
+    /// 一切作り直さない (= 音声無中断)。detach は既存の `take_native_output()` で行い、
+    /// 返った `NativeVideoOutput` を drop すると presenter スレッドが cancel+join されて
+    /// window が破棄される (音声スレッドには触れない)。
+    ///
+    /// 音声のみ (映像トラック無し) のプレイヤーで使う想定なので、`config.audio_only=true`
+    /// を渡すこと (present ループが frameless で回る。§5.9 / Inc 6 ②-1)。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn attach_native_output_from_config(
+        &mut self,
+        config: NativeVideoOutputConfig,
+    ) -> Result<(), String> {
+        if self.native_output.is_some() {
+            return Err("native output is already attached".to_string());
+        }
+        match NativeVideoOutput::spawn(
+            self.decode.video_rx.clone(),
+            Arc::clone(&self.clock),
+            self.engine_event_tx.clone(),
+            Arc::clone(&self.displayed_frame_seq),
+            Arc::clone(&self.last_displayed_pts_bits),
+            Arc::clone(&self.frame_step_active),
+            Arc::clone(&self.duration_secs_bits),
+            config,
+            Arc::clone(&self.dynamic),
+            Arc::clone(&self.audio_diagnostics),
+        ) {
+            Some(output) => {
+                self.native_output = Some(output);
+                Ok(())
+            }
+            None => Err("ネイティブプレゼンターのスレッド生成に失敗しました".to_string()),
+        }
+    }
+
     #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) fn build_switch_source_payload(
