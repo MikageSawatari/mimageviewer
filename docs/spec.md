@@ -454,14 +454,16 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - Windows のタスクバーで mIV アイコンを hover したときは、動画フルスクリーン中も
   現在位置近傍のフレームをアプリのプレビューサムネイルとして表示する。
 - 保存済み再生位置がある動画は通常、前回位置からレジューム再生する。挙動は
-  **位置復元マトリクス**(環境設定「ライブラリ → 履歴と復元」)で「メディア (動画 / ZIP・PDF・対応アーカイブ) ×
-  エントリ方法 (一覧から開く / Ctrl+↑↓ 移動)」のセル単位に [続きから / 最初から] を選べる:
+  **位置復元マトリクス**(環境設定「ライブラリ → 履歴と復元」)で「メディア (動画 / 音声 / ZIP・PDF・対応アーカイブ) ×
+  エントリ方法 (一覧から開く / 移動 = ↓↑・ホイール・Ctrl+↑↓)」のセル単位に [続きから / 最初から] を選べる:
   - 動画 × 一覧から開く: `video_open_resume`(= 互換維持のため旧 bool
     `video_grid_open_starts_from_beginning` を保存先に流用、accessor 経由)。
-  - 動画 × Ctrl+↑↓ 移動: `video_nav_resume`(既定 = 続きから)。
+  - 動画 × 移動: `video_nav_resume`(既定 = 続きから)。
+  - 音声 × 一覧から開く: `music_open_resume`(既定 = 最初から)。
+  - 音声 × 移動: `music_nav_resume`(既定 = 最初から)。位置は動画と同じ `video_resume_positions` を path キーで共有。
   - ZIP/PDF/対応アーカイブ × 一覧から開く: `book_open_resume`(既定 = 続きから)。
   - ZIP/PDF/対応アーカイブ × Ctrl+↑↓ 移動: `book_nav_resume`(既定 = 先頭から = 従来のフォルダ先頭着地)。
-  video の判定は `video_resume_for_open`、本の判定は `DeferredFsReopen.resume_to_last_page`
+  video / 音声の判定は `video_resume_for_open`、本の判定は `DeferredFsReopen.resume_to_last_page`
   (grid 経路は book_open_resume / nav 経路は book_nav_resume) で行う。
 - 動画フルスクリーン中にホイール / ↑↓ / Home / End などで別の動画へ移動する場合、
   native presenter の HWND / D3D11 presenter / overlay を保持したまま動画 source だけを
@@ -1131,6 +1133,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `video_nav_resume` | ResumeMode | Resume | 位置復元マトリクス「動画 × Ctrl+↑↓ 移動 (ホイール/キー含む)」。Resume=続きから / FromStart=先頭から |
 | `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF/対応アーカイブ/画像のみ通常フォルダ × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |
 | `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
+| `music_open_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 一覧から開く」。既定 FromStart=最初から / Resume=続き。位置は動画と同じ `video_resume_positions` に path キーで保存 |
+| `music_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 移動 (↓↑/ホイールの前後ファイル移動 + Ctrl+↑↓/キー)」。既定 FromStart=最初から (誤って別曲へ行って戻っても頭から) |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |

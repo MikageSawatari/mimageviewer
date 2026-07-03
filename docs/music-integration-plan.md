@@ -510,6 +510,23 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   `handle_music_continuous_eof`、映像 `handle_video_continuous_eof` の音声版）。連続再生中はループ無効。
   seek は全経路を `music_seek_to`（&mut self 化）へ集約し `apply_music_loop_mode` を内包
   （ブックマーク区間ループ target の再計算漏れを防ぐ）。ブックマーク CRUD 後も `apply_music_loop_mode`。
+- [x] **再生位置の resume 設定**（2026-07-03 Inc 5c-C）。`music_open_resume`（一覧から開く）+
+  `music_nav_resume`（移動 = ↓↑/ホイール/Ctrl+↑↓）、両方 `ResumeMode` で**既定=最初から**
+  （誤って別曲へ行って戻っても頭から / 従来「常に先頭」を維持）。`build_audio_player_for_open` が
+  `from_grid`（start_fs_load 音声分岐で `std::mem::take`、grid open 直後の移動でスティッキー true が
+  残らないよう `open_fullscreen` の grid_open_intent を音声分岐でも戻す）+ 設定から動画共有の純関数
+  `video_resume_for_open` で resume 秒を決める。位置は動画と同じ `video_resume_positions` に path キー
+  保存（音声→音声の eviction 前に `save_all_video_resume_positions`）。環境設定「履歴と復元」に音声行を追加。
+  ⚠️ **follow-up**: resume=続き で保存位置が初期ビューポート外の音声を開いたとき、タイムラインが
+  playhead へ自動で寄らない（既定 FromStart では非発生のオプトイン事象。cache hit 時の resume seek
+  非同期タイミングを扱う状態管理が要るため保留）。
+- [x] **タイムライン UX 実機 FB**（2026-07-03 Inc 5c-C）: ①グラフ範囲外クリック（最終行より下の余白 /
+  部分行の末尾余白）で曲末尾へシークする不具合を、純関数 `timeline_seek_target_secs` で `row>=rows` /
+  `t>=duration_secs` を棄却して修正。②▲▼ボタンでスクロールしても再生位置へ即引き戻される不具合を、
+  「playhead 可視で毎フレ follow 再ON」を廃止し `music_timeline_scroll_cooldown_until`（1 秒）+「再生中 &&
+  クールダウン経過 && playhead 画面内 && 画面外へ出かけている」ときだけ追従、に変更。③ループボタンの
+  ブックマークモードアイコンを動画 native HUD と同じ「ブックマーク+ループ」合成表示に統一。
+  ※ ホイールは前後ファイル移動に割当済なのでタイムラインスクロールは▲▼ボタン+スクロールバー担当。
 
 ### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1。5c-A で動画 UI を共有）
 - [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5 → 5c-A で `draw_native_jump_panel_body` 共有）
