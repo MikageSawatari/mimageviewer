@@ -907,7 +907,7 @@ impl DetailsColumn {
             Self::Created => "作成日時",
             Self::State => "状態",
             Self::ImageDimensions => "解像度",
-            Self::VideoDuration => "動画長さ",
+            Self::VideoDuration => "長さ",
             Self::VideoDimensions => "動画解像度",
             Self::VideoCodec => "コーデック",
         }
@@ -10184,22 +10184,19 @@ impl App {
             .on_hover_text("必要な値をバックグラウンドで読み込みます")
             .changed();
         changed |= ui
-            .checkbox(&mut self.settings.details_show_video_duration, "動画長さ")
-            .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
+            .checkbox(&mut self.settings.details_show_video_duration, "長さ")
+            .on_hover_text("動画・音声の長さをバックグラウンドで読み込みます")
             .changed();
         changed |= ui
             .checkbox(
                 &mut self.settings.details_show_video_dimensions,
                 "動画解像度",
             )
-            .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
+            .on_hover_text("動画の解像度をバックグラウンドで読み込みます")
             .changed();
         changed |= ui
-            .checkbox(
-                &mut self.settings.details_show_video_codec,
-                "動画コーデック",
-            )
-            .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
+            .checkbox(&mut self.settings.details_show_video_codec, "コーデック")
+            .on_hover_text("動画・音声のコーデックをバックグラウンドで読み込みます")
             .changed();
 
         ui.separator();
@@ -10973,7 +10970,9 @@ impl App {
             };
             fields.push(format!("画像 {text}"));
         }
-        if self.settings.thumb_tooltip_show_video_duration && matches!(item, GridItem::Video(_)) {
+        if self.settings.thumb_tooltip_show_video_duration
+            && matches!(item, GridItem::Video(_) | GridItem::Audio(_))
+        {
             let duration_text = self.details_video_duration_text(idx);
             let display = if duration_text.is_empty() {
                 "..."
@@ -10991,7 +10990,9 @@ impl App {
             };
             fields.push(format!("動画 {text}"));
         }
-        if self.settings.thumb_tooltip_show_video_codec && matches!(item, GridItem::Video(_)) {
+        if self.settings.thumb_tooltip_show_video_codec
+            && matches!(item, GridItem::Video(_) | GridItem::Audio(_))
+        {
             let codec_text = self.details_video_codec_text(idx);
             let display = if codec_text.is_empty() {
                 "..."

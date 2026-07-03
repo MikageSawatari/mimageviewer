@@ -594,13 +594,20 @@ pub(super) fn run_details_meta_load(
             dims = Some((*w, *h));
         }
 
-        if target.load_video_meta
-            && let GridItem::Video(path) = &target.item
-        {
-            video_probe = {
-                let _permit = io_sem.acquire(target.priority);
-                probe_video_details(path, &cancel)
-            };
+        if target.load_video_meta {
+            if let GridItem::Video(path) = &target.item {
+                video_probe = {
+                    let _permit = io_sem.acquire(target.priority);
+                    probe_video_details(path, &cancel)
+                };
+            } else if let GridItem::Audio(path) = &target.item {
+                // 音声は長さ / コーデックだけを cancel・deadline 対応の probe で取る
+                // (解像度は無い)。DetailsVideoProbe の dims=None で流用する。
+                video_probe = {
+                    let _permit = io_sem.acquire(target.priority);
+                    probe_audio_details(path, &cancel)
+                };
+            }
         }
 
         let image_dims_failed = matches!(
@@ -609,7 +616,7 @@ pub(super) fn run_details_meta_load(
         ) && target.load_image_dims
             && dims.is_none();
         let video_meta_failed = target.load_video_meta
-            && matches!(target.item, GridItem::Video(_))
+            && matches!(target.item, GridItem::Video(_) | GridItem::Audio(_))
             && video_probe.is_none();
         let created_at_failed = target.load_created_at && created_at.is_none();
         failed += usize::from(image_dims_failed || video_meta_failed || created_at_failed);
@@ -789,6 +796,40 @@ pub(super) fn probe_video_details(path: &Path, cancel: &AtomicBool) -> Option<De
         duration_secs,
         dims,
         codec: (!codec.is_empty()).then_some(codec),
+    })
+}
+
+/// 詳細ビューの遅延メタ用に音声ファイルの長さ / コーデックだけを probe する
+/// (`probe_video_details` の音声版)。`probe_audio_file` と違い cancel トークン +
+/// 10 秒 deadline を持つ (`input_with_interrupt`) ので、詳細ワーカーがフォルダ移動で
+/// cancel された際に stale なワーカー + I/O セマフォ permit を掴んだままにならない
+/// (Codex P2)。解像度は音声に無いので `dims = None`。長さもコーデックも取れなければ
+/// 表示できる値が無いので `None` を返し、呼び出し側で `video_meta_failed` が立って
+/// "-" に落ちる (Codex P3、"..." で固着しない)。
+pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> Option<DetailsVideoProbe> {
+    use ffmpeg::media::Type as MediaType;
+    use ffmpeg_the_third as ffmpeg;
+
+    ffmpeg::init().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let input = ffmpeg::format::input_with_interrupt(path, move || {
+        cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline
+    })
+    .ok()?;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let duration_secs = details_duration_to_secs(input.duration());
+    let audio_stream = input.streams().best(MediaType::Audio)?;
+    let codec = audio_stream.parameters().id().name().to_string();
+    let codec = (!codec.is_empty()).then_some(codec);
+    if duration_secs.is_none() && codec.is_none() {
+        return None;
+    }
+    Some(DetailsVideoProbe {
+        duration_secs,
+        dims: None,
+        codec,
     })
 }
 

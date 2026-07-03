@@ -25841,15 +25841,18 @@ impl App {
 
     /// メタデータ / EXIF / XMP キャッシュ用の正規化キーを返す。
     ///
-    /// `Image` / `Video` は正規化パス、`ZipImage` は `zip_path::entry_name`、
+    /// `Image` / `Video` / `Audio` は正規化パス、`ZipImage` は `zip_path::entry_name`、
     /// `PdfPage` は `pdf_path::page_N` の形式で、ZIP エントリ・PDF ページごとに
     /// 衝突しないキーを返す ([`App::page_path_key`] と同じ規約)。
     /// 動画は EXIF/AI metadata は持たないが、mXD が埋めた XMP (X ツイート情報)
-    /// を表示する必要があるため、メタデータキーを発行する。
+    /// を表示する必要があるため、メタデータキーを発行する。音声も詳細ビューの
+    /// 遅延メタ (長さ / コーデック) の格納キーとしてこのキーを使う。
     pub(crate) fn metadata_cache_key(&self, idx: usize) -> Option<String> {
         let item = self.items.get(idx)?;
         let key = match item {
-            GridItem::Image(p) | GridItem::Video(p) => crate::adjustment_db::normalize_path(p),
+            GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
+                crate::adjustment_db::normalize_path(p)
+            }
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
@@ -26187,19 +26190,25 @@ impl App {
     }
 
     fn lazy_load_video_meta_for_idx(&self, idx: usize) -> bool {
-        let requested = match self.settings.grid_view_mode {
-            crate::settings::GridViewMode::Details => {
-                self.settings.details_show_video_duration
-                    || self.settings.details_show_video_dimensions
-                    || self.settings.details_show_video_codec
-            }
-            crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_video_duration
-                    || self.settings.thumb_tooltip_show_video_dimensions
-                    || self.settings.thumb_tooltip_show_video_codec
-            }
+        let (want_duration, want_dims, want_codec) = match self.settings.grid_view_mode {
+            crate::settings::GridViewMode::Details => (
+                self.settings.details_show_video_duration,
+                self.settings.details_show_video_dimensions,
+                self.settings.details_show_video_codec,
+            ),
+            crate::settings::GridViewMode::Thumbnail => (
+                self.settings.thumb_tooltip_show_video_duration,
+                self.settings.thumb_tooltip_show_video_dimensions,
+                self.settings.thumb_tooltip_show_video_codec,
+            ),
         };
-        requested && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+        match self.items.get(idx) {
+            Some(GridItem::Video(_)) => want_duration || want_dims || want_codec,
+            // 音声は解像度を持たないので、長さ / コーデックのどちらかが要求されたときだけ
+            // probe する (解像度トグルだけ ON では音声に表示できる値が無く probe が無駄)。
+            Some(GridItem::Audio(_)) => want_duration || want_codec,
+            _ => false,
+        }
     }
 
     fn lazy_load_ai_metadata_for_idx(&self, idx: usize) -> bool {
@@ -26295,7 +26304,11 @@ impl App {
     }
 
     pub(crate) fn details_video_duration_text(&self, idx: usize) -> String {
-        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+        // 長さは動画・音声の両方が持つ (音声も詳細ビューで長さを表示する)。
+        if !matches!(
+            self.items.get(idx),
+            Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+        ) {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
@@ -26337,7 +26350,11 @@ impl App {
     }
 
     pub(crate) fn details_video_codec_text(&self, idx: usize) -> String {
-        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+        // コーデックは動画・音声の両方が持つ。
+        if !matches!(
+            self.items.get(idx),
+            Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+        ) {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {

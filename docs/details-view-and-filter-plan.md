@@ -802,6 +802,14 @@ ClaudeCode 案の Ph1〜Ph5 をベースに、遅延列の枠組みを早める�
 5. **Ph5 遅延列の中身を順次追加**:
    作成日時、画像解像度、動画長さ/解像度/コーデックは実装済み。残りは
    EXIF → PDF ページ数 → アーカイブ内枚数の順で追加する。
+   - **音声対応 (2026-07、music 統合)**: `長さ` / `コーデック` 列は動画に加えて音声
+     (`GridItem::Audio`) も対象にした。ラベルは動画専用の「動画長さ / 動画コーデック」から
+     汎用の「長さ / コーデック」に改名 (解像度は音声に無いので「動画解像度」据え置き=音声は空欄)。
+     音声は cancel/deadline 対応の `metadata_ops::probe_audio_details` (FFmpeg ヘッダ読み) で
+     長さ / コーデックを取得し、`DetailsLazyMeta.video_duration_secs` / `video_codec` に相乗り
+     する。probe が長さもコーデックも取れない場合は `video_meta_failed` を立てて "-" に落とす。
+     `metadata_cache_key` に `GridItem::Audio` アームを追加済 (でないと target が生成されず列が
+     "-" のまま固着する)。
 6. **Ph6 テスト/スナップショット/ドキュメント**:
    `spec.md`、manual、製品ページ、`search-architecture.md`、本書を更新。
 

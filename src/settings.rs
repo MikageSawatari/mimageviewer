@@ -316,9 +316,9 @@ impl DetailsSortKey {
             Self::Created => "作成日時",
             Self::State => "状態",
             Self::ImageDimensions => "画像解像度",
-            Self::VideoDuration => "動画長さ",
+            Self::VideoDuration => "長さ",
             Self::VideoDimensions => "動画解像度",
-            Self::VideoCodec => "動画コーデック",
+            Self::VideoCodec => "コーデック",
         }
     }
 }

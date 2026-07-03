@@ -353,18 +353,18 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.label(egui::RichText::new("サムネイル情報ツールチップ").strong());
     ui.label(
-        "サムネイル表示で選択中セルの下に表示する内容です。動画長さなどは必要なときにバックグラウンドで読み込みます。",
+        "サムネイル表示で選択中セルの下に表示する内容です。長さなどは必要なときにバックグラウンドで読み込みます。",
     );
     ui.add_space(4.0);
     ui.checkbox(&mut s.thumb_tooltip_show_filename, "ファイル名");
     ui.checkbox(&mut s.thumb_tooltip_show_image_dimensions, "画像解像度");
-    ui.checkbox(&mut s.thumb_tooltip_show_video_duration, "動画長さ");
+    ui.checkbox(&mut s.thumb_tooltip_show_video_duration, "長さ");
     ui.checkbox(&mut s.thumb_tooltip_show_kind, "種類");
     ui.checkbox(&mut s.thumb_tooltip_show_file_size, "サイズ");
     ui.checkbox(&mut s.thumb_tooltip_show_modified, "更新日時");
     ui.checkbox(&mut s.thumb_tooltip_show_created, "作成日時");
     ui.checkbox(&mut s.thumb_tooltip_show_video_dimensions, "動画解像度");
-    ui.checkbox(&mut s.thumb_tooltip_show_video_codec, "動画コーデック");
+    ui.checkbox(&mut s.thumb_tooltip_show_video_codec, "コーデック");
     ui.checkbox(&mut s.thumb_tooltip_show_location, "親フォルダ名");
     ui.checkbox(&mut s.thumb_tooltip_show_full_location, "場所");
     ui.checkbox(
