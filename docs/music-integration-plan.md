@@ -435,6 +435,73 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 順次置換していく。置換完了までは暫定 UI が動く（ユーザー「仮なら可」）。左ブックマーク UI は
 5c-A で共有版に置換済み。
 
+### 5.9 音声 VST モード（native シェル、Inc 6 ②、B-prime）
+
+Inc 6 は 2 部構成。**① チェーン通過**は済み（§7.7、commit b32e6805）。**② VST GUI/設定パネルの
+音声対応**は、当初計画（「上バーに egui `show_vst3_manager` を出す」）を **HWND リスク調査の結果、
+native presenter を再利用する方式に転換**した（ユーザー承認 2026-07-03 + Codex 設計相談）。
+
+**なぜ egui パネル直載せをやめたか**: プラグイン editor GUI は bridge プロセス所有の native Win32
+ウィンドウ。その owner/z-order/focus のハードニング（`fullscreen_owner_hwnd` 強制 owner
+= `dsp/mod.rs:317/425`、HUD overlay HWND、focus handoff、editor_hwnds allowlist、raise burst）は
+**すべて native presenter HWND 前提**。音楽ビューは egui フルスクリーンビューポート（別 HWND）で
+描くため、そこへ GUI を載せると `fullscreen_owner_hwnd` 未設定 → cursor/foreground フォールバック
+（＝動画で不安定だった経路）に落ち、presenter スレッド不在で topmost 再アサートも駆動されない。
+＝動画で苦労した z-order/focus 作業をやり直す高リスク。
+
+**採用＝案 B-prime（走行中の同一プレイヤーに native 出力を attach/detach）**:
+VST ボタンで、**同じ `VideoPlayer` / `AudioOutput` / CPAL stream / decoder / audio pump / `DspBridge`
+/ normalize 状態 / 音楽解析状態を全て生かしたまま**、`NativeVideoOutput`（presenter）だけを生成
+（enter）・破棄（exit）する。音声スレッドに一切触れないので**原理的に無中断**。native シェル中は
+黒画面＋動画と同一の HUD/VST パネル/プラグイン GUI を出し、音楽グラフ（timeline/spectrum）は
+出さない（ユーザー確定「グラフ非表示・プラグインは動画と同一レイアウト」）。
+
+**却下案**: (A) 開き直し（`VideoPlayer::open` 再呼び → decoder/pump/CPAL 作り直しで音声途切れ、
+無中断要件違反）。(B) SwitchPlacement 拡張（presenter↔presenter 専用＝既存 presenter を別
+placement に作り直す経路。headless→native の「presenter 無し→有り」は表現できない）。
+
+**Codex が特定した統合点（B-prime、着手起点。行番号は目安）**:
+- `src/video/mod.rs`（`VideoPlayer::open` 近傍）: `attach_native_output_from_config(config)` を新設。
+  open が初回に native 出力を spawn するのと同じ内部フィールドを再利用。exit は `take_native_output()`
+  を再利用/拡張して native 出力だけ drop。
+- `src/video/mod.rs` present ループ（フレーム無しで sleep する箇所）: **overlay-only render/tick**
+  パスを足し、フレーム無しでも HUD/VST パネルが更新されるように。**Inc 7 の地ならしにもなる。**
+- `src/video/mod.rs`（`native_presenter_pending` 相当）: frameless 音声 native を「準備中で永久固着」
+  にしない（first video frame を永遠に待たない）。
+- `src/app.rs`（`native_video_presenter_config` = :45613 付近）: 同 config を再利用しつつ
+  audio-only / native-VST モードのフラグ or config 経路を足す。
+- `src/app/native_video.rs`（:1149 付近）: フルスクリーン HWND owner / HUD 同期を「動画専用」から
+  「native フルスクリーンメディア全般」へ一般化。
+- `src/app/native_video.rs`（:2244 付近、native presenter イベント処理）: 音声用に gate。
+  play/seek/volume/VST/normalize/close は通す、動画専用コマンド（tile 等）は no-op/reroute。
+- `src/ui_fullscreen.rs`（`draw_fs_music_view` = :19322）: VST トグル追加＋native VST モード中は
+  音楽グラフを抑止。
+
+**ライフサイクル順序（正しさの核）**:
+- **enter**: 音声＋生きたプレイヤーを検証 → native 出力 attach → presenter HWND 生成待ち →
+  **editor 表示より前に** `register_fullscreen_owner(presenter_hwnd)` → `set_hud_hwnd(overlay)` →
+  `editor_hwnds_snapshot` 更新 → VST editor/パネルを show/topmost。
+- **exit**: presenter HWND が生きているうちに VST GUI を hide/re-owner → topmost/editor 状態クリア →
+  `set_hud_hwnd(0)` → `unregister_fullscreen_owner()` → native front / VST geometry 追跡クリア →
+  **native 出力だけ drop** → **音楽状態は消さず** egui 音楽ビューへ復帰。
+- **close**: native VST モード中の native close イベントは「VST モードを抜ける」意味にする
+  （フルスクリーンを閉じない）。`accept_native_video_close` の generation ガードは、新 attach 出力が
+  独自 generation 列を持つので、旧 presenter の stale 状態と混同しないよう注意。
+- **teardown 非対象**: `clear_music_view_state` / normalize cleanup は **toggle では呼ばない**
+  （解析・spectrum・ブックマーク・normalize scan を生かしたまま）。real フルスクリーン close /
+  player unload 時のみ。normalize scan は native VST モード中も poll を続け、native overlay の
+  normalize コントロールを同一 state に同期する。
+
+**リスク**: 音声途切れ＝低（音声側不触）／ライフサイクル＝中（released presenter の HWND 順序）。
+**段階化（各段 build＋test＋Codex、動画側バイト等価維持）**:
+- **②-1**: present ループの overlay-only tick（frameless 耐性）＝土台。
+- **②-2**: `VideoPlayer` の native 出力 attach/detach。
+- **②-3**: App 側 enter/exit ライフサイクル（HWND owner/HUD 一般化・イベント gate・close=モード離脱）。
+- **②-4**: UI（音楽 HUD の VST トグル＋グラフ抑止）。
+
+**Inc 7 との相乗り**: ②-1 の「native presenter を frameless で回す」capability は Inc 7（動画→音声
+モード）の中核 building block。②で先に入れておくと Inc 7 が楽になる。
+
 ---
 
 ## 6. 永続化設計（D8 / D11）
@@ -590,9 +657,13 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 - [x] 音楽情報（format/duration/sample rate/channels/bitrate/埋め込みメタ = avformat probe）（Inc 5）
 
 ### 7.7 VST3
-- [ ] audio pump チェーン共有（normalize→VST3→limiter）
-- [ ] 上バーで切替（`ToggleVst3Gui`）/ GUI トグル
-- [ ] 動画と同じ plugin state / チェーン管理
+- [x] audio pump チェーン共有（normalize→VST3→limiter）（Inc 6 ①、commit b32e6805）。
+  `build_audio_player_for_open` が動画と同じく `dsp_bridge` を渡すだけ。有効化/チェーン定義は
+  プロセス共有 `DspBridge` singleton に従い、環境設定/動画側で組んだチェーンがそのまま音声にも
+  効く。音楽ビュー自体に VST UI は持たない＝**追加の HWND 配線ゼロ**。
+- [ ] VST GUI / 設定パネルの音声対応（Inc 6 ②、**B-prime = native presenter を走行中の音声
+  プレイヤーに attach/detach**。§5.9 参照。上バーの VST ボタンで native シェルへ切替）
+- [ ] 動画と同じ plugin state / チェーン管理（②で presenter を共有すれば動画と同一経路になる）
 
 ### 7.8 動画→音声モード
 - [ ] 上バーで音声モードトグル（映像カット）
@@ -762,10 +833,19 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   - **未リリース = マイグレーション不要**（新機能。動画ブックマーク DB へ path キーで相乗り）。
   - **据え置き**: 「動画→音声モード」の右左パネル (Inc 7 で `VideoAudioOnly` を通す)。
 
-- **Inc 6: VST3 共有 + 上バー切替**
-  - `VideoPlayer::open` に `dsp_bridge` を渡す（既存 pump が VST3 適用）。上バーに VST3 トグル + GUI トグル。
-  - 受け入れ: 音声再生で VST3 チェーンを通る / 上バー切替 / GUI トグル。動画と同じ挙動。
-  - 注: audio pump は既に VST3 対応なので配線確認が主。
+- **Inc 6: VST3 共有**（2 部構成）
+  - **① チェーン通過（✅ 完了、commit b32e6805）**: `build_audio_player_for_open` に
+    `dsp_bridge` を渡す（動画 call site と同型）。既存 audio pump が normalize→VST3→limiter を
+    音声にも適用。有効化/チェーンはプロセス共有 `DspBridge` singleton。音楽ビューに VST UI 無し
+    ＝HWND 配線ゼロ。build/fmt/glyph/bin test 3134 緑。
+    - 受け入れ: VST3 有効＋プラグインロードで音声がチェーンを通る（実機: EQ 等が音声に効く）。
+  - **② VST GUI/設定パネルの音声対応（B-prime、native シェル、§5.9）**: VST ボタンで走行中の
+    音声プレイヤーに native presenter を attach（黒画面＋動画同一 HUD/VST パネル/プラグイン GUI、
+    音楽グラフ非表示）。detach で音楽ビューへ復帰。**音声無中断が必須要件**なので同一プレイヤー
+    /pump/CPAL を生かし NativeVideoOutput だけ生成・破棄。段階 ②-1〜②-4（§5.9）。
+    - 受け入れ: VST ボタンで native シェルへ切替（音途切れなし）/ プラグイン GUI が動画と同一
+      レイアウト / VST モード離脱で音楽ビュー復帰（解析・ブックマーク・normalize 維持）。
+    - 着手前に Codex 設計相談済み（案A 却下・B-prime 採用、2026-07-03）。
 
 - **Inc 7: 動画→音声モード（映像カット + 引き継ぎ）— 最難関、単独隔離**
   - 着手前に §5.7 の 2 案を **Codex に設計相談**。native presenter video surface の停止/隠蔽 +
