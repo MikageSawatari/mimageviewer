@@ -8002,7 +8002,11 @@ impl App {
         // 詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
-        let video_file_nav = if is_video_fs {
+        // 音声も「映像なし動画」として動画と同じ前/次ファイルキー (VideoPrevFile/NextFile =
+        // 既定 plain ↑↓) を共有する (ユーザー確定 2026-07-03: 操作カスタマイズ上は動画フルスクリーン
+        // と音声を共通スコープ扱い)。音声は 7837 の早期 return で modal/IME/TextEdit フォーカス中は
+        // ここへ来ないので追加ガード不要。
+        let video_file_nav = if is_video_fs || current_item_is_audio {
             self.keymap.consume_first_action(
                 ctx,
                 FS_VIDEO_ACTIVE_SCOPES,
@@ -8036,10 +8040,11 @@ impl App {
         };
         let stack_jump_next = stack_jump == Some(KeyAction::FsStackJumpNext);
         let stack_jump_prev = stack_jump == Some(KeyAction::FsStackJumpPrev);
-        // 音声 (音楽ビュー) は汎用の前/次項目ナビ対象外 (adjacent_navigable_idx が Audio を
-        // 含まない)。矢印を消費すると境界ヒントトーストが出るだけで、さらに Shift+↑↓ は
-        // 音量調整 (native path 消費) と二重発火してしまう。よって音声では矢印ナビを無効化する
-        // (Inc 5c-B 実機FB 2026-07-03)。音声のファイル間移動は今後 HUD の前/次ボタンで実装予定。
+        // 音声の前/次ファイル移動は上の `video_file_nav` (VideoNextFile/PrevFile = plain ↓↑) で
+        // 処理する (adjacent_navigable_idx に Audio を含め、動画と統一)。下の `!current_item_is_audio`
+        // ガードは残す: 音声は plain/Shift 矢印をこの image 経路では消費せず、plain ↓↑ は
+        // video_file_nav 経由、Shift+↓↑ は音量 (VideoVolumeUp/Down) に振り分けるため
+        // (二重発火防止、Inc 5c-B 実機FB 2026-07-03)。
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
             || (!is_video_fs
                 && !current_item_is_audio

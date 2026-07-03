@@ -16,10 +16,15 @@
 | 検索スコープ移動 | Ctrl+S / Ctrl+G の検索結果範囲から外に出ない前後移動 |
 | 境界ヒント | 先頭 / 末尾に達したとき、次に使える操作を中央または native overlay に出す案内 |
 
-`adjacent_navigable_idx` は現在、`Image` / `Video` / `ZipImage` /
+`adjacent_navigable_idx` は現在、`Image` / `Video` / `Audio` / `ZipImage` /
 `ZipSeparator` / `PdfPage` を同一フォルダ内の前後移動対象に含める。
-フルスクリーンとして実際に開く対象は主に `Image` / `Video` /
+`Audio` は「映像なし動画」として動画と同じ前/次項目ナビの対象で、フルスクリーン
+(音楽ビュー) では plain ↓↑ = `VideoNextFile`/`VideoPrevFile` で移動する
+(2026-07-03、操作は動画フルスクリーンと共通スコープ)。
+フルスクリーンとして実際に開く対象は主に `Image` / `Video` / `Audio` /
 `ZipImage` / `PdfPage` で、検索結果の遷移先判定もこの image-like 集合を使う。
+スライドショー送り (`adjacent_slideshow_idx`) と Home/End ページジャンプ
+(`page_jump_nav_indices`) は `Audio` を除外する (音声はスライドショー / ページ送り対象外)。
 
 ## 2. 現状
 

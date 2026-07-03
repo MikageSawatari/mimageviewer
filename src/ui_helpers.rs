@@ -1037,7 +1037,11 @@ pub fn adjacent_navigable_idx(
     current: usize,
     delta: i32,
 ) -> Option<usize> {
-    // display_order の中でナビゲーション可能なもの (画像・動画・セパレータ)
+    // display_order の中でナビゲーション可能なもの (画像・動画・音声・セパレータ)。
+    // 音声 (Audio) は「映像なし動画」として動画と同じ前/次項目ナビの対象にする
+    // (plain ↓↑ = VideoNextFile/PrevFile で移動、2026-07-03 実機FB)。スライドショー送り
+    // (adjacent_slideshow_idx) と Home/End ページジャンプ (page_jump_nav_indices) は
+    // 別フィルタで Audio を除外済み (音声はスライドショー/ページ送り対象外)。
     let nav_indices: Vec<usize> = display_order
         .iter()
         .copied()
@@ -1046,6 +1050,7 @@ pub fn adjacent_navigable_idx(
                 items.get(i),
                 Some(GridItem::Image(_))
                     | Some(GridItem::Video(_))
+                    | Some(GridItem::Audio(_))
                     | Some(GridItem::ZipImage { .. })
                     | Some(GridItem::ZipSeparator { .. })
                     | Some(GridItem::PdfPage { .. })
@@ -1875,6 +1880,27 @@ mod tests {
             ),
             Some(2)
         );
+    }
+
+    /// 音声 (Audio) は「映像なし動画」として前/次項目ナビの対象に含める:
+    /// image(0) - audio(1) - image(2) で 0 から +1 すると audio(1) に止まれる。
+    /// スライドショー送りは音声を飛ばす (画像のみ対象)。
+    #[test]
+    fn adjacent_navigable_idx_includes_audio_slideshow_skips_it() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::from("/a/0.jpg")),
+            GridItem::Audio(std::path::PathBuf::from("/a/1.mp3")),
+            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
+        ];
+        let vi = vec![0, 1, 2];
+        // 通常ナビは audio(1) に止まれる (前後どちらからも)。
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 0, 1), Some(1));
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 2, -1), Some(1));
+        // audio 自身からの前後移動も可能。
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 1, 1), Some(2));
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 1, -1), Some(0));
+        // スライドショー送りは audio(1) を飛ばして image(2)。
+        assert_eq!(adjacent_slideshow_idx(&items, &vi, 0, 1), Some(2));
     }
 
     /// スライドショー送りは Video を飛ばす: image(0) - video(1) - image(2) で
