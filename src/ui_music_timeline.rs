@@ -393,11 +393,22 @@ fn run_timeline_raster_worker(
 
 // ── タイムライン描画エントリ ──
 
+/// `draw_music_timeline` の結果。
+#[derive(Default)]
+pub struct MusicTimelineOutcome {
+    /// クリック/ドラッグでシークを要求した位置 (呼び出し側が `player.seek`)。
+    pub seek_request: Option<f64>,
+    /// この frame にホイール/ドラッグ/scrollbar で手動スクロールがあった。呼び出し側は
+    /// これを見て「追従クールダウン」を張る (手動閲覧中に playhead へ引き戻さない)。
+    pub manual_scroll: bool,
+}
+
 /// 音楽ビュー中央のタイムラインを描画する。ラボの `draw_timeline` を本体向けに移植した
 /// もの (再生は `VideoPlayer` に委ねるので、この関数はシーク要求を返すだけに留める)。
 ///
-/// `ui` は音楽ビュー中央領域に張った `ScrollArea` 内の子 UI。戻り値 `Some(secs)` は
-/// ユーザーがクリック/ドラッグでシークを要求した位置 (呼び出し側が `player.seek` する)。
+/// `ui` は音楽ビュー中央領域に張った `ScrollArea` 内の子 UI。`auto_scroll` が true かつ
+/// 再生中で、playhead 行が画面内にあって画面外へ出かけている (部分クリップ) ときだけ追従
+/// スクロールする。手動スクロール中 (呼び出し側のクールダウン) は false で渡される。
 #[allow(clippy::too_many_arguments)]
 pub fn draw_music_timeline(
     ui: &mut egui::Ui,
@@ -405,7 +416,7 @@ pub fn draw_music_timeline(
     duration_secs: f64,
     position_secs: f64,
     playing: bool,
-    follow_playhead: &mut bool,
+    auto_scroll: bool,
     cache: &mut TimelineTextureCache,
     row_secs: f64,
     dark: bool,
@@ -413,7 +424,7 @@ pub fn draw_music_timeline(
     // ラベルをパネルトリガ帯 (= seek 不要領域) に載せ、波形は中央領域を全幅使う
     // (実機 FB 2026-07)。ラベルは波形左端に右寄せで描く。
     left_label_w: f32,
-) -> Option<f64> {
+) -> MusicTimelineOutcome {
     let mut seek_request = None;
     let row_secs = row_secs.max(1.0);
     let rows = timeline_row_count(duration_secs, row_secs);
@@ -462,18 +473,18 @@ pub fn draw_music_timeline(
 
     let text_color = ui.visuals().text_color();
     let clip_rect = ui.clip_rect();
-    if timeline_manual_scroll_requested(ui, &response, clip_rect) {
-        *follow_playhead = false;
-    }
+    // 手動スクロール (ホイール/ドラッグ/scrollbar) を検出。呼び出し側がこれを見てクールダウンを張る。
+    let manual_scroll = timeline_manual_scroll_requested(ui, &response, clip_rect);
     if let Some(playhead_rect) =
         timeline_playhead_row_rect(graph_rect, position_secs, row_secs, row_h, row_gap, rows)
     {
         let vertically_visible = clip_rect.intersects(playhead_rect);
         let fully_visible = clip_rect_vertically_contains(clip_rect, playhead_rect);
-        if vertically_visible {
-            *follow_playhead = true;
-        }
-        if playing && *follow_playhead && !fully_visible {
+        // 追従スクロールは「再生中 + クールダウンなし(auto_scroll) + playhead が画面内にあって
+        // 画面外へ出かけている(部分クリップ)」ときだけ発火する (実機 FB 2026-07-03)。完全に
+        // 画面外 (ユーザーが離れて閲覧中) のときは引き戻さない。毎フレーム再センタリングも
+        // しない (fully_visible の間は何もしない)。
+        if playing && auto_scroll && vertically_visible && !fully_visible {
             ui.scroll_to_rect(playhead_rect.expand(row_gap), None);
         }
     }
@@ -492,7 +503,9 @@ pub fn draw_music_timeline(
     }
 
     let focus_row = timeline_focus_row(position_secs, row_secs, rows);
-    let include_offscreen_focus = playing && *follow_playhead;
+    // 追従中 (auto_scroll) は playhead 行を off-screen でも先読みラスタしておく (じき画面内へ)。
+    // 手動閲覧中 (クールダウン) は可視行を優先し、off-screen の playhead 行は競合させない。
+    let include_offscreen_focus = playing && auto_scroll;
     let visible_row_indices = visible_rows.iter().map(|(row, _)| *row).collect::<Vec<_>>();
     let request_rows = prioritized_timeline_request_rows(
         &visible_row_indices,
@@ -580,7 +593,10 @@ pub fn draw_music_timeline(
             duration_secs,
         );
     }
-    seek_request
+    MusicTimelineOutcome {
+        seek_request,
+        manual_scroll,
+    }
 }
 
 /// タイムライン上のクリック/ドラッグ位置 `pos` から seek 先秒を計算する。**グラフ範囲外は

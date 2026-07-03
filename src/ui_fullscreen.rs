@@ -19357,9 +19357,13 @@ impl App {
                     .filter(|d| *d > 0.0)
                     .unwrap_or_else(|| analysis.stream.duration_secs)
             };
+            // 追従スクロールのクールダウン: now < until なら自動スクロールしない (手動閲覧中)。
+            let now = std::time::Instant::now();
+            let auto_scroll = self
+                .music_timeline_scroll_cooldown_until
+                .is_none_or(|t| now >= t);
             let cache = &mut self.music_timeline_cache;
-            let follow = &mut self.music_timeline_follow;
-            let mut seek_req = None;
+            let mut outcome = crate::ui_music_timeline::MusicTimelineOutcome::default();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .id_salt(("music_timeline", fs_idx))
@@ -19369,20 +19373,25 @@ impl App {
                         // ▲=正 (page) / ▼=負 (-page)。
                         ui.scroll_with_delta(egui::vec2(0.0, pending_scroll));
                     }
-                    seek_req = crate::ui_music_timeline::draw_music_timeline(
+                    outcome = crate::ui_music_timeline::draw_music_timeline(
                         ui,
                         analysis,
                         timeline_dur,
                         pos,
                         playing,
-                        follow,
+                        auto_scroll,
                         cache,
                         row_secs,
                         dark,
                         content_gutter,
                     );
                 });
-            if let Some(s) = seek_req
+            const SCROLL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+            // ホイール手動スクロールが起きたら 1 秒間は追従を止める (playhead へ引き戻さない)。
+            if outcome.manual_scroll {
+                self.music_timeline_scroll_cooldown_until = Some(now + SCROLL_COOLDOWN);
+            }
+            if let Some(s) = outcome.seek_request
                 && !pointer_over_panel
                 && !pointer_over_scroll_btn
             {
@@ -19390,16 +19399,16 @@ impl App {
                 self.music_seek_to(fs_idx, s);
             }
             // ▲▼ ボタンを timeline に重ねて描く (ScrollArea の後 = 前面)。押されたら次フレームの
-            // ScrollArea 内 scroll_with_delta に反映する。手動スクロール扱いなので follow を切る。
+            // ScrollArea 内 scroll_with_delta に反映する。1 秒間は追従を止めて前後を閲覧できる。
             let page = (timeline_rect.height() * 0.85).max(40.0);
             if Self::draw_music_scroll_button(ui, up_btn_rect, true) {
                 self.music_timeline_scroll_req = page;
-                self.music_timeline_follow = false;
+                self.music_timeline_scroll_cooldown_until = Some(now + SCROLL_COOLDOWN);
                 ctx.request_repaint();
             }
             if Self::draw_music_scroll_button(ui, down_btn_rect, false) {
                 self.music_timeline_scroll_req = -page;
-                self.music_timeline_follow = false;
+                self.music_timeline_scroll_cooldown_until = Some(now + SCROLL_COOLDOWN);
                 ctx.request_repaint();
             }
         } else {
