@@ -7849,7 +7849,8 @@ impl App {
         if current_item_is_audio
             && (ctx.wants_keyboard_input()
                 || self.ime_input_active()
-                || self.music_bookmark_modal_open())
+                || self.music_bookmark_modal_open()
+                || self.music_normalize_modal_active(fs_idx))
         {
             return action;
         }
@@ -19421,9 +19422,11 @@ impl App {
         // 念のため seek を抑止して二重反応を防ぐ (Codex P2)。
         let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
         let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH;
-        // 改名 / 一括登録の中央モーダルを開いている間は端ホバーのパネルを出さず、timeline
-        // seek も抑止する (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A)。
-        let music_modal_open = self.music_bookmark_modal_open();
+        // 改名 / 一括登録の中央モーダル、または再生前ノーマライズスキャンのモーダルを開いて
+        // いる間は端ホバーのパネルを出さず、timeline seek も抑止し、HUD も非操作にする
+        // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
+        let music_modal_open =
+            self.music_bookmark_modal_open() || self.music_normalize_modal_active(fs_idx);
         let hover_pos = ctx.input(|i| {
             if self.cursor_hidden {
                 None
@@ -19768,6 +19771,13 @@ impl App {
             dark,
             !music_modal_open,
         );
+
+        // 再生前ノーマライズスキャン中は最前面にモーダル進捗パネルを描く (windows 限定)。
+        // 上の music_modal_open で背後操作は抑止済み。
+        #[cfg(windows)]
+        if self.music_normalize_modal_active(fs_idx) {
+            self.draw_music_normalize_modal(ui, ctx, rect, fs_idx);
+        }
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
         if playing {

@@ -5447,6 +5447,13 @@ pub struct App {
     /// `video_speed_popup_open` と同じ役割。共有の `draw_overlay_speed_control` が
     /// トグルし、選択 / popup 外クリックで閉じる。
     pub(crate) music_speed_popup_open: bool,
+    /// 音楽 HUD リミッターインジケータ用: 直近に読んだ player の
+    /// `limiter_ceiling_hit_seq`。増加を検知したら `music_limiter_visible_until` を
+    /// 一定時間先に延ばして赤ドットを点灯する (動画 native HUD の
+    /// `video_limiter_ceiling_hit_seq` / `video_limiter_visible_until` と同じ役割)。
+    pub(crate) music_limiter_last_seq: u64,
+    /// リミッターインジケータの点灯期限。`None` or 期限切れで消灯。
+    pub(crate) music_limiter_visible_until: Option<std::time::Instant>,
     /// 音楽ビュー左パネル (ブックマーク) の端ホバー開閉ラッチ。画面端の細いトリガ
     /// ストリップで開き、パネル矩形 + ヒステリシス余白から出るまで維持する。パネル幅
     /// ぶんの広い当たり判定が中央波形の seek を食う問題への対策 (実機 FB 2026-07)。
@@ -7282,6 +7289,8 @@ impl App {
             music_probe: None,
             music_hud_last_volume_target: None,
             music_speed_popup_open: false,
+            music_limiter_last_seq: 0,
+            music_limiter_visible_until: None,
             music_left_panel_active: false,
             music_right_panel_active: false,
             music_bookmarks: Vec::new(),
@@ -30710,18 +30719,39 @@ impl App {
         &self,
         path: PathBuf,
         from_grid: bool,
-    ) -> crate::video::VideoPlayer {
+    ) -> (crate::video::VideoPlayer, bool) {
         let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
-        let normalize_gain = if self.settings.audio_normalize_enabled {
+        // 音量ノーマライズ (D13、「映像なし動画」パリティ): グローバル ON なら DB を引き、
+        // ヒットすれば gain を即適用する。ミスなら動画と同じく「再生前スキャン」に入るため
+        // ここでは gain=1.0 のまま開き、preroll を suspended + autoplay off で開始して、
+        // start_fs_load 側でスキャンを起動→完了時に補正 gain 付きで再生を始める
+        // (未補正音の一瞬の burst を避ける)。スキャン機構は windows 限定。
+        let normalize_lookup = if self.settings.audio_normalize_enabled {
             let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
             self.audio_normalize_db
                 .as_ref()
                 .and_then(|db| db.lookup(&path, target_milli))
-                .map(|r| 10.0_f64.powf(r.gain_db as f64 / 20.0))
-                .unwrap_or(1.0)
         } else {
-            1.0
+            None
         };
+        let normalize_gain = normalize_lookup
+            .as_ref()
+            .map(|r| 10.0_f64.powf(r.gain_db as f64 / 20.0))
+            .unwrap_or(1.0);
+        let autoplay = true;
+        // ON + 未測定 + autoplay のときだけ再生前スキャンする (動画 build_video_player_for_open と同型)。
+        let start_normalize_scan_before_play = {
+            #[cfg(windows)]
+            {
+                self.settings.audio_normalize_enabled && normalize_lookup.is_none() && autoplay
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = &normalize_lookup;
+                false
+            }
+        };
+        let open_autoplay = autoplay && !start_normalize_scan_before_play;
         // 一覧から開いた (`fs_open_intent_from_grid`) か移動 (↓↑/ホイール/Ctrl+↑↓) かで
         // 音声 resume 設定を選び、保存済み位置を使うか先頭からかを決める (動画の
         // `video_resume_for_open` を音声設定で共有)。
@@ -30740,10 +30770,10 @@ impl App {
             path,
             vol,
             normalize_gain,
-            false,  // audio_preroll_suspended
-            true,   // autoplay
-            resume, // 音声 resume 設定に従う (既定=最初から)
-            false,  // hw_decode (音声のみ、GPU 不要)
+            start_normalize_scan_before_play, // audio_preroll_suspended (スキャン完了まで先読み停止)
+            open_autoplay,                    // 再生前スキャン時は false = 補正確定後に再生開始
+            resume,                           // 音声 resume 設定に従う (既定=最初から)
+            false,                            // hw_decode (音声のみ、GPU 不要)
             self.settings.video_deinterlace,
             #[cfg(windows)]
             None, // gpu_video_device (headless)
@@ -30758,7 +30788,7 @@ impl App {
         }
         // ループ/連続の設定は共有 video_loop_mode / video_continuous_mode に従い、
         // fs_cache へ insert した後に apply_music_loop_mode で反映する (start_fs_load 音声 branch)。
-        player
+        (player, start_normalize_scan_before_play)
     }
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
@@ -30939,7 +30969,8 @@ impl App {
                 // 一覧から開いた (grid) か移動 (nav) かのワンショットフラグを消費する
                 // (動画分岐と同じ std::mem::take 規約)。resume 設定の選択に使う。
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let player = self.build_audio_player_for_open(ap, from_grid);
+                let (player, start_normalize_scan_before_play) =
+                    self.build_audio_player_for_open(ap, from_grid);
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {
@@ -30950,6 +30981,23 @@ impl App {
                 self.fs_margin_bbox_cache.remove(&idx);
                 // 共有 video_loop_mode / video_continuous_mode を新プレイヤーへ反映。
                 self.apply_music_loop_mode(idx);
+                // 音量ノーマライズ (D13、「映像なし動画」パリティ): 動画の start_fs_load 分岐
+                // (init_normalize_state_for_opened_video + 再生前 / 再生 intent スキャン) と同型に
+                // 揃える。DB ヒットなら build 時に gain 適用済み + ここで OnApplied 表示、ミスなら
+                // OnUnmeasured → 初回スキャン (再生前スキャンなら deferred、それ以外は intent 経路)。
+                #[cfg(windows)]
+                {
+                    self.init_normalize_state_for_opened_video(idx);
+                    if start_normalize_scan_before_play {
+                        if !self.start_normalize_scan_for_deferred_play_intent(idx) {
+                            self.resume_deferred_normalize_playback_without_scan(idx);
+                        }
+                    } else {
+                        self.maybe_start_normalize_scan_for_play_intent(idx);
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = start_normalize_scan_before_play;
             }
             return;
         }

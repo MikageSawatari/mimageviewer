@@ -5087,6 +5087,13 @@ impl VideoPlayer {
         self.clock.normalize_gain()
     }
 
+    /// 出力セーフティリミッターが天井 (0 dBFS) を叩いた累積回数。
+    /// native HUD は内部の `clock` から直接読むが、音楽ビュー (egui) はこの
+    /// 公開 getter で seq の増加を検知してリミッター作動インジケータを点灯する。
+    pub fn limiter_ceiling_hit_seq(&self) -> u64 {
+        self.clock.limiter_ceiling_hit_seq()
+    }
+
     /// 音量ノーマライズの線形ゲインを設定 (内部で ±24dB にクランプ)。
     ///
     /// 再生中の動画に呼んでも安全。新しい gain は次に `raw_pending` から `processed` へ

@@ -3024,7 +3024,7 @@ impl App {
     /// 音量ノーマライズ ボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
     /// OnUnmeasured → スキャン起動)。
     #[cfg(windows)]
-    pub(super) fn handle_toggle_normalize(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn handle_toggle_normalize(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
@@ -3094,7 +3094,7 @@ impl App {
 
     /// 音量ノーマライズ ボタン右クリック (どの状態からでもグローバル OFF 化、救済経路)。
     #[cfg(windows)]
-    pub(super) fn handle_disable_normalize(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn handle_disable_normalize(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
@@ -3105,7 +3105,7 @@ impl App {
     /// 進捗パネル × ボタン or ESC でキャンセル。
     /// take() で state を捨てて新規スキャン即開始可能にする。
     #[cfg(windows)]
-    pub(super) fn handle_cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn handle_cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let should_drop = self
             .normalize_state
             .as_ref()

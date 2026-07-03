@@ -690,6 +690,24 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => (player.volume(), player.is_muted()),
             _ => (1.0, false),
         };
+        // リミッター作動インジケータ (動画 native HUD と同じ挙動): player の
+        // limiter_ceiling_hit_seq の増加を検知したら赤ドットを一定時間点灯する。
+        // normalize が有効なときだけ右クラスタにスロットを確保する (点灯有無で幅が
+        // ジッタしないように、有効時は常にスロット確保・ドットは作動時のみ描画)。
+        let now = std::time::Instant::now();
+        let cur_limiter_seq = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.limiter_ceiling_hit_seq(),
+            _ => self.music_limiter_last_seq,
+        };
+        if cur_limiter_seq > self.music_limiter_last_seq {
+            self.music_limiter_visible_until =
+                now.checked_add(std::time::Duration::from_millis(1500));
+        }
+        self.music_limiter_last_seq = cur_limiter_seq;
+        let limiter_visible = self
+            .music_limiter_visible_until
+            .is_some_and(|until| now < until);
+        let show_limiter_slot = self.settings.audio_normalize_enabled;
         let speed = self.video_playback_speed;
         // ループ / 連続再生モードは動画と共有 (video_loop_mode / video_continuous_mode)。
         // 音声はチャプター無しなので effective は Off/Full/Bookmark のみ。
@@ -720,6 +738,12 @@ impl App {
         let mut cycle_continuous = false;
         let mut toggle_mute = false;
         let mut set_vol: Option<f64> = None;
+        // 音量ノーマライズボタン (Norm) の左クリック intent。スキャン機構が windows 限定の
+        // ため windows でのみ収集・適用する。右クリックは音楽 HUD では使わない (背後の
+        // フルスクリーン右クリックハンドラにも届いて二重動作するため。音量/速度と同方針、
+        // 実機 FB 2026-07-02)。
+        #[cfg(windows)]
+        let mut toggle_normalize = false;
         // `set_speed` は速度ボタン描画時に `draw_overlay_speed_control` の返り値で一度だけ
         // 束縛する (他フラグと違い条件付き更新ではないため、代入時点で宣言する)。
 
@@ -941,8 +965,31 @@ impl App {
             cycle_continuous = true;
         }
 
-        // ── コントロール行: 右クラスタ (右寄せ: dB ラベル / 音量 / ミュート / 速度 / 時間) ──
+        // ── コントロール行: 右クラスタ (右寄せ: リミッター / dB ラベル / 音量 / Norm /
+        // ミュート / 速度 / 時間) ──
         let mut rx = hud_rect.right() - 14.0;
+        // リミッター作動ドット (最右、動画 HUD の vol_label の右に置くのと同じ)。normalize
+        // 有効時のみスロットを確保し、直近作動時だけ赤ドットを描く。
+        let limiter_slot_w = 14.0;
+        if show_limiter_slot {
+            if limiter_visible {
+                let dot_c = egui::pos2(rx - limiter_slot_w * 0.5, controls_cy);
+                let lim_rect = egui::Rect::from_center_size(dot_c, egui::vec2(limiter_slot_w, bsz));
+                let lim_resp = ui.interact(
+                    lim_rect,
+                    ui.id().with(("music_hud_limiter", fs_idx)),
+                    egui::Sense::hover(),
+                );
+                painter.circle_filled(
+                    dot_c,
+                    if lim_resp.hovered() { 4.5 } else { 4.0 },
+                    egui::Color32::from_rgb(255, 72, 72),
+                );
+                lim_resp.on_hover_text("出力リミッターが作動しました");
+                ui.ctx().request_repaint(); // 点灯期限まで消灯を反映するため repaint
+            }
+            rx -= limiter_slot_w + 6.0;
+        }
         // 現在音量の dB 表示ラベル (最右、動画 HUD の「スライダーの右」配置に合わせる)。
         // ミュート状態に関わらず実効音量を dB で示す。共有の
         // `format_video_volume_db_compact` を使い動画と表記を揃える (-∞dB / 0.0dB / +3.0dB)。
@@ -1012,6 +1059,82 @@ impl App {
         ) {
             set_vol = Some(crate::settings::clamp_video_volume(v));
             vol_persist = persist;
+        }
+        // 音量ノーマライズボタン (Norm、音量スライダーとミュートの間)。動画 native HUD と
+        // 同じ 5 状態・配色・ラベル・ツールチップで、左クリックで ON/OFF・未測定時はスキャン
+        // 起動、右クリックで OFF (救済経路)。スキャン機構が windows 限定のため windows でのみ描く。
+        #[cfg(windows)]
+        {
+            use crate::video::normalize_types::NormalizeUiState;
+            let norm_ui_state = self
+                .normalize_ui_states
+                .get(&fs_idx)
+                .copied()
+                .unwrap_or_default();
+            let norm_w = 44.0;
+            let norm_rect = egui::Rect::from_min_size(
+                egui::pos2(rx - norm_w, controls_cy - bsz * 0.5),
+                egui::vec2(norm_w, bsz),
+            );
+            rx -= norm_w + 8.0;
+            let is_scanning = matches!(norm_ui_state, NormalizeUiState::Scanning);
+            let norm_active = matches!(
+                norm_ui_state,
+                NormalizeUiState::OnApplied { .. } | NormalizeUiState::ProvisionalApplied { .. }
+            );
+            let norm_unmeasured = matches!(norm_ui_state, NormalizeUiState::OnUnmeasured);
+            let norm_tooltip = match norm_ui_state {
+                NormalizeUiState::Off => "音量ノーマライズ (-14 LUFS)。クリックで ON".to_string(),
+                NormalizeUiState::OnApplied { gain_db } => {
+                    format!("音量ノーマライズ ON ({gain_db:+.1}dB / -14 LUFS)。クリックで OFF")
+                }
+                NormalizeUiState::ProvisionalApplied { gain_db } => {
+                    format!("音量ノーマライズ ON (仮 {gain_db:+.1}dB / 確定測定中)。クリックで OFF")
+                }
+                NormalizeUiState::OnUnmeasured => {
+                    "音量ノーマライズが有効です。クリックして測定".to_string()
+                }
+                NormalizeUiState::Scanning => "ノーマライズ中…".to_string(),
+            };
+            let norm_resp = ui
+                .interact(
+                    norm_rect,
+                    ui.id().with(("music_hud_normalize", fs_idx)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(norm_tooltip);
+            draw_overlay_button_bg(
+                &painter,
+                norm_rect,
+                norm_resp.hovered() && !is_scanning,
+                norm_active,
+            );
+            let norm_color = if is_scanning {
+                egui::Color32::from_gray(120)
+            } else if norm_active {
+                egui::Color32::from_rgb(255, 198, 62)
+            } else if norm_unmeasured {
+                // 半透明 blink (時間ベースで alpha 変動、動画と同じ)。
+                let t = ui.ctx().input(|i| i.time);
+                let blink = (((t * 2.0).sin() + 1.0) * 0.5) as f32;
+                let alpha = (180.0 + blink * 75.0) as u8;
+                egui::Color32::from_rgba_unmultiplied(255, 150, 60, alpha)
+            } else {
+                egui::Color32::from_gray(180)
+            };
+            painter.text(
+                norm_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Norm",
+                egui::FontId::proportional(11.0),
+                norm_color,
+            );
+            if !is_scanning && norm_resp.clicked() {
+                toggle_normalize = true;
+            }
+            if norm_unmeasured {
+                ui.ctx().request_repaint(); // blink アニメーション
+            }
         }
         // ミュート
         let mute_r = egui::Rect::from_min_size(
@@ -1127,6 +1250,154 @@ impl App {
         }
         if cycle_continuous {
             self.cycle_music_continuous_mode(&ctx, fs_idx);
+        }
+        // 音量ノーマライズ (Norm ボタン、左クリックのみ)。動画と共有のハンドラをそのまま
+        // 呼ぶ (音声も FsCacheEntry::Video なので lookup / gain 適用 / スキャンが同じ経路で動く)。
+        #[cfg(windows)]
+        if toggle_normalize {
+            self.handle_toggle_normalize(&ctx, fs_idx);
+        }
+    }
+
+    /// 再生前ノーマライズスキャンがモーダル段階 (= 仮 gain 適用前) で、かつ現在の音楽ビュー
+    /// (fs_idx) のスキャンかどうか。true の間は左右パネル / timeline seek / HUD 操作 / FS
+    /// ショートカットを抑止し、中央にモーダル進捗を出す。スキャン機構は windows 限定なので
+    /// 非 windows では常に false。
+    pub(crate) fn music_normalize_modal_active(&self, fs_idx: usize) -> bool {
+        #[cfg(windows)]
+        {
+            self.normalize_scan_is_modal_for_current_player(fs_idx)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = fs_idx;
+            false
+        }
+    }
+
+    /// 音楽ビューの再生前スキャン中に出すモーダル進捗パネル (動画 native の
+    /// `draw_native_normalize_progress` の egui 版)。背後の操作は
+    /// `music_normalize_modal_active` 経由で別途抑止済みだが、ここでも全面 backdrop で
+    /// 入力を吸収し、× / ESC でキャンセルできる。`draw_fs_music_view` の最後 (最前面) で呼ぶ。
+    #[cfg(windows)]
+    pub(crate) fn draw_music_normalize_modal(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        use crate::video::normalize_types::NormalizeProgressSnapshot;
+        use std::sync::atomic::Ordering;
+        if !self.normalize_scan_is_modal_for_current_player(fs_idx) {
+            return;
+        }
+        let progress = self
+            .normalize_state
+            .as_ref()
+            .filter(|s| s.fs_idx == fs_idx)
+            .map(|s| NormalizeProgressSnapshot {
+                pts_processed_ms: s.progress.pts_processed_ms.load(Ordering::Acquire),
+                duration_ms: s.progress.duration_ms.load(Ordering::Acquire),
+                indeterminate: s.progress.indeterminate.load(Ordering::Acquire),
+            })
+            .unwrap_or_default();
+
+        let painter = ui.painter_at(rect);
+        // 全面 backdrop: 背後の HUD / timeline / パネルへの click / hover を吸収する。
+        let _block = ui.interact(
+            rect,
+            ui.id().with(("music_normalize_backdrop", fs_idx)),
+            egui::Sense::click_and_drag(),
+        );
+        painter.rect_filled(
+            rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+        );
+
+        // 中央パネル
+        let panel_w = 420.0_f32.min((rect.width() - 40.0).max(120.0));
+        let panel_h = 110.0_f32;
+        let panel_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(panel_w, panel_h));
+        painter.rect_filled(
+            panel_rect,
+            10.0,
+            egui::Color32::from_rgba_unmultiplied(20, 20, 24, 236),
+        );
+        painter.text(
+            egui::pos2(panel_rect.center().x, panel_rect.min.y + 22.0),
+            egui::Align2::CENTER_CENTER,
+            "音量ノーマライズ中…",
+            egui::FontId::proportional(16.0),
+            egui::Color32::from_rgb(238, 238, 238),
+        );
+        // プログレスバー / スピナー
+        let bar_pad_x = 24.0;
+        let bar_y = panel_rect.center().y + 6.0;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(panel_rect.min.x + bar_pad_x, bar_y - 4.0),
+            egui::pos2(panel_rect.max.x - bar_pad_x, bar_y + 4.0),
+        );
+        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(60));
+        if progress.indeterminate || progress.duration_ms == 0 {
+            let t = ctx.input(|i| i.time as f32);
+            let frac = (t * 0.7).fract().clamp(0.0, 1.0);
+            let lo = (frac - 0.18).clamp(0.0, 1.0);
+            let hi = (frac + 0.18).clamp(0.0, 1.0);
+            let chunk = egui::Rect::from_min_max(
+                egui::pos2(bar_rect.min.x + bar_rect.width() * lo, bar_rect.min.y),
+                egui::pos2(bar_rect.min.x + bar_rect.width() * hi, bar_rect.max.y),
+            );
+            painter.rect_filled(chunk, 2.0, egui::Color32::from_rgb(255, 198, 62));
+        } else {
+            let frac =
+                (progress.pts_processed_ms as f32 / progress.duration_ms as f32).clamp(0.0, 1.0);
+            let filled = egui::Rect::from_min_max(
+                bar_rect.min,
+                egui::pos2(bar_rect.min.x + bar_rect.width() * frac, bar_rect.max.y),
+            );
+            painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(255, 198, 62));
+            painter.text(
+                egui::pos2(panel_rect.center().x, bar_y + 18.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{:.0}%", frac * 100.0),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(200),
+            );
+        }
+        // スキャン中はプログレス更新のため毎フレーム repaint。
+        ctx.request_repaint();
+        // キャンセル × (右上)
+        let cancel_size = 24.0;
+        let cancel_rect = egui::Rect::from_min_size(
+            egui::pos2(panel_rect.max.x - cancel_size - 8.0, panel_rect.min.y + 8.0),
+            egui::vec2(cancel_size, cancel_size),
+        );
+        let cancel_resp = ui
+            .interact(
+                cancel_rect,
+                ui.id().with(("music_normalize_cancel", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text("キャンセル [ESC]");
+        let cancel_color = if cancel_resp.hovered() {
+            egui::Color32::from_rgb(255, 120, 120)
+        } else {
+            egui::Color32::from_gray(180)
+        };
+        painter.text(
+            cancel_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "\u{00D7}", // U+00D7 multiplication sign (ANSI 安全、glyph lint 通過)
+            egui::FontId::proportional(20.0),
+            cancel_color,
+        );
+        // ESC は消費して背後の FS 閉じ経路へ流さない (音声キー入力側でもモーダル中は
+        // early-return するが、二重防御で consume する)。
+        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if cancel_resp.clicked() || esc {
+            self.handle_cancel_normalize_scan(ctx, fs_idx);
         }
     }
 }
