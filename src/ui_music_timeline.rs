@@ -486,7 +486,10 @@ pub fn draw_music_timeline(
         i.pointer.button_down(egui::PointerButton::Middle)
             && i.pointer
                 .hover_pos()
-                .is_some_and(|p| rect.contains(p) || clip_rect.contains(p))
+                // 可視 viewport (clip_rect) かつ content (rect) 内 = 可視タイムライン上のみ。
+                // rect は content rect でスクロール後は viewport 外まで伸びるので clip_rect と AND
+                // を取る (上バー / 下 HUD で誤発火しない、Codex P3)。
+                .is_some_and(|p| clip_rect.contains(p) && rect.contains(p))
     });
     if middle_pan {
         let dy = ui.input(|i| i.pointer.delta().y);
