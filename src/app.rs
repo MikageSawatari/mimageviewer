@@ -3159,7 +3159,10 @@ fn run_music_analysis(
 
     // 右パネルの音楽情報 (Inc 5) 用に軽量 probe を先に送る。ヘッダ読みだけで PCM デコード
     // しないので decode の完了を待たず情報を出せる。失敗しても解析は続ける。
+    // duration は progressive partial の 50% 抑制ヒント (下記) にも使う。
+    let mut total_dur = 0.0_f64;
     if let Ok(probe) = crate::audio_decode::probe_audio_file(path) {
+        total_dur = probe.duration_secs;
         let _ = tx.send(MusicAnalysisMsg::Probe(probe));
     }
     if cancel.load(Ordering::Relaxed) {
@@ -3179,13 +3182,43 @@ fn run_music_analysis(
         return;
     }
 
-    // spectrum 用 (Inc 4) と cache miss 時の解析入力を兼ねて、全尺 PCM を 1 回だけデコードする。
-    let decoded = match crate::audio_decode::decode_audio_file_to_stereo_f32(path, cancel) {
+    // cache miss 時の解析入力 + spectrum 用 (Inc 4) を兼ねて全尺 PCM を 1 回だけデコードする。
+    // cache miss ではデコードの進行に合わせて progressive partial timeline を先出しし、全尺完了を
+    // 待たずに波形を順次表示する (Inc 3 ストリーミング)。cache hit は timeline 済みなので partial
+    // は出さず、spectrum 用 PCM のためだけにデコードする。
+    let config = music_core::AnalysisConfig {
+        bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
+        ..music_core::AnalysisConfig::default()
+    };
+    let mut partial_sent = false;
+    let decode_result = crate::audio_decode::decode_audio_file_to_stereo_f32_streaming(
+        path,
+        cancel,
+        // cache hit は partial 不要なので 50% 抑制ヒントも渡す意味は無いが、closure 側で早期
+        // return するため total_dur をそのまま渡してよい。
+        total_dur,
+        |prefix, rate| {
+            // cache hit (timeline 済み) では partial 不要。cancel 済みも skip。
+            if timeline_sent || cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            // analyze_stereo_timeline は cancel 不可なので前後で cancel を確認する (Codex P3)。
+            let ta = music_core::analyze_stereo_timeline(prefix, rate, config);
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if tx.send(MusicAnalysisMsg::Timeline(Ok(ta))).is_ok() {
+                partial_sent = true;
+            }
+        },
+    );
+    let decoded = match decode_result {
         Ok(d) => d,
         Err(e) => {
-            // timeline 未送信 (cache miss) なら失敗として通知。送信済み (cache hit) なら timeline は
-            // 既に有効なので spectrum を諦めるだけ。
-            if !timeline_sent {
+            // decode 失敗。cache hit (timeline 済み) や partial 送信済みなら既に有効な波形が出て
+            // いるので、破壊的な Timeline(Err) は送らず spectrum を諦めるだけにする (Codex P3:
+            // 途中まで出た波形を消さない)。どちらも無い純粋な失敗のみエラー通知する。
+            if !timeline_sent && !partial_sent {
                 let _ = tx.send(MusicAnalysisMsg::Timeline(Err(e)));
             }
             return;
@@ -3195,12 +3228,9 @@ fn run_music_analysis(
         return;
     }
 
-    // cache miss: デコード済み PCM から解析して DB に保存し、timeline を送る。
+    // cache miss: デコード済み全尺 PCM から最終フル解析を作り、DB 保存して確定版 timeline を送る
+    // (progressive partial を確定版で置換する)。cache hit は既に確定済み。
     if !timeline_sent {
-        let config = music_core::AnalysisConfig {
-            bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
-            ..music_core::AnalysisConfig::default()
-        };
         let ta = music_core::analyze_stereo_timeline(
             &decoded.stereo_samples,
             decoded.info.sample_rate,

@@ -588,8 +588,15 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   - **⚠️ 実機未検証**: 実際の音が鳴る中でのタイムライン表示 / seek 追従 / Row 切替は
     ユーザーの GUI 目視待ち（FFmpeg DLL + 実ファイルが要る）。ビルド + 単体テスト緑 + fmt clean +
     Codex code review (P1/P2/P3 なし) 済み。
-  - **残り（Inc 3 の未実装）**: 部分解析ストリーミング（先出し）は入れていない
-    （miss は全尺完了まで待つ方針）。vocal hint 独立レーン / 手動 BPM 補正は未着手。
+  - **部分解析ストリーミング（先出し）**: ✅ **実装済み（2026-07-03、Inc 5c-C）**。cache miss 時、
+    `decode_audio_file_to_stereo_f32_streaming` がデコード進行に合わせて蓄積プレフィックス PCM を
+    `on_partial` で渡し、`run_music_analysis` が `analyze_stereo_timeline(prefix)` を **幾何級数
+    スケジュール**（初回 ~2 秒 → 倍々、wall-clock 150ms throttle、全長 50% 超で抑制）で先出し。
+    poll が `Timeline` を置換するので波形が順次埋まる。x 軸幅は player duration（→ probe → 解析）
+    基準で安定。timeline cache は解析 `Arc` identity 変化時に全 `row_version` を進めて既存 tile を
+    再ラスタ（playhead→可視の優先描画はそのまま再利用）。partial 後に decode 失敗しても波形は消さ
+    ない。music-core は無改変。Codex 設計レビュー（P1×1 / P2×4 / P3×2 すべて反映）+ code review 済み。
+  - **残り（Inc 3 の未実装）**: vocal hint 独立レーン / 手動 BPM 補正は未着手。
 
 - **Inc 4: 108-band spectrum worker（下段）** — ✅ **実装済み（2026-07-02）**
   - `SpectrumAnalyzer` 常駐 worker + 展開済み PCM の playhead ±1s スライス（案A、§11 で確定）。
@@ -701,9 +708,11 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
 
 ## 11. 未確定の実装詳細（該当 Inc で確定）
 
-- **解析デコード経路**（Inc 2）: `src/video/decoder.rs` の FFmpeg 経路を「音声全尺 decode-to-PCM」
-  モードで流用するか、軽量 avformat/avcodec decode を新設するか。全尺 decode のメモリ（長尺曲）と
-  部分解析ストリーミングの両立方法。
+- ~~**解析デコード経路**（Inc 2）~~: **確定**。軽量 avformat/avcodec decode を新設
+  （`src/audio_decode.rs`）。全尺 decode のメモリと部分解析ストリーミングの両立は Inc 5c-C
+  （2026-07-03）で決着: **1 回のストリーミングデコード**が最終 PCM を蓄積しつつ、幾何級数
+  マイルストーンで蓄積プレフィックスを都度解析して先出しする（二重デコードなし。partial の
+  再解析総コストは全長 50% 抑制 + 倍々で約 2x 以内）。
 - **`SUPPORTED_AUDIO_EXTENSIONS` の確定**（Inc 1）: FFmpeg LGPL build が確実に開ける範囲。
 - **右パネルのタグ/設定経路**（Inc 5 / §11）: 動画アイテムがタグ chips / ★ / 設定をどこで描いているか
   （`ui_metadata_panel.rs` は画像のみなので別経路の可能性）。実装時に確認して音声もミラー。

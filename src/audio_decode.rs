@@ -16,6 +16,7 @@
 use std::path::Path;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use ffmpeg::format::sample::{Sample, Type as SampleType};
 use ffmpeg::software::resampling::Context as ResampleContext;
@@ -66,12 +67,50 @@ pub fn analyze_audio_file_with_config(
     ))
 }
 
+/// progressive partial emit の最小 wall-clock 間隔。デコードが realtime より速いと 2/4/8 秒の
+/// マイルストーンが一気に来るので、これで 1 emit/interval に間引く。
+const PARTIAL_EMIT_MIN_INTERVAL: Duration = Duration::from_millis(150);
+
+/// 最初の progressive partial を emit する蓄積秒数。これ以降は倍々。
+const PARTIAL_INITIAL_SECS: f64 = 2.0;
+
+/// 次に progressive partial を emit すべき蓄積 frame 数（幾何級数 = 倍々）を返す純関数。
+/// `last_emit_frames` = 直近 emit 時の frame 数（初回 emit 前は 0）。初回は `initial_frames`、
+/// 以降は前回の 2 倍。これで partial の再解析総コストが「全長の約 2 倍」で頭打ちになる
+/// （線形に毎 N 秒だと O(n^2)）。
+fn next_partial_threshold_frames(last_emit_frames: usize, initial_frames: usize) -> usize {
+    if last_emit_frames == 0 {
+        initial_frames.max(1)
+    } else {
+        last_emit_frames.saturating_mul(2)
+    }
+}
+
 /// 音声ファイルを全尺デコードして 48kHz interleaved stereo f32 PCM を返す。
 ///
 /// `cancel` が立ったら途中で `Err` を返して打ち切る (呼び出し側ワーカーが結果を破棄する)。
 pub fn decode_audio_file_to_stereo_f32(
     path: &Path,
     cancel: &AtomicBool,
+) -> Result<DecodedAudio, String> {
+    decode_audio_file_to_stereo_f32_streaming(path, cancel, 0.0, |_, _| {})
+}
+
+/// `decode_audio_file_to_stereo_f32` の progressive 版。デコードが進むたびに、蓄積した
+/// プレフィックス PCM を `on_partial(&prefix, sample_rate)` で呼び出し側へ渡す。音楽ビューの
+/// タイムラインを「全尺デコード完了を待たず順次表示」するために使う
+/// （docs/music-integration-plan.md Inc 3 ストリーミング）。
+///
+/// 呼び出し頻度は **幾何級数マイルストーン**（最初 `PARTIAL_INITIAL_SECS` 秒、以降 frame 数を
+/// 倍々）+ wall-clock throttle（`PARTIAL_EMIT_MIN_INTERVAL`）で間引く。`total_duration_secs > 0.0`
+/// のとき、蓄積が全長の 50% を超えたら on_partial 呼び出しを止める（final フル解析がすぐ後を
+/// 追うため。partial の再解析総コストを約 2x に抑える）。`on_partial` に渡す `&[f32]` は蓄積中の
+/// buffer への借用（ゼロコピー）。呼び出し側はここで解析して即 send し、借用を跨いで保持しない。
+pub fn decode_audio_file_to_stereo_f32_streaming(
+    path: &Path,
+    cancel: &AtomicBool,
+    total_duration_secs: f64,
+    mut on_partial: impl FnMut(&[f32], u32),
 ) -> Result<DecodedAudio, String> {
     ensure_ffmpeg_init();
 
@@ -116,6 +155,17 @@ pub fn decode_audio_file_to_stereo_f32(
     let mut out: Vec<f32> = Vec::new();
     let mut frame = AudioFrame::empty();
 
+    // progressive partial emit のスケジュール状態。
+    let initial_partial_frames = (PARTIAL_INITIAL_SECS * OUT_RATE as f64) as usize;
+    // 全長の 50% を超えたら partial を止める（final がすぐ後を追うため）。全長不明なら抑制なし。
+    let half_frames = if total_duration_secs > 0.0 {
+        (total_duration_secs * 0.5 * OUT_RATE as f64) as usize
+    } else {
+        usize::MAX
+    };
+    let mut last_emit_frames = 0usize;
+    let mut last_emit_at: Option<Instant> = None;
+
     for res in ictx.packets() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_string());
@@ -129,6 +179,18 @@ pub fn decode_audio_file_to_stereo_f32(
             continue;
         }
         drain_decoder(&mut decoder, &mut frame, &mut resampler, &mut out, in_rate)?;
+
+        // progressive partial: 幾何級数マイルストーン + wall-clock throttle + 50% 抑制。
+        let frames = out.len() / OUT_CHANNELS;
+        let threshold = next_partial_threshold_frames(last_emit_frames, initial_partial_frames);
+        if frames >= threshold
+            && frames < half_frames
+            && last_emit_at.is_none_or(|t| t.elapsed() >= PARTIAL_EMIT_MIN_INTERVAL)
+        {
+            on_partial(&out, OUT_RATE);
+            last_emit_frames = frames;
+            last_emit_at = Some(Instant::now());
+        }
     }
 
     // EOF: decoder に溜まった残りフレームを drain する。
@@ -390,4 +452,58 @@ fn append_resampled(
         out.extend_from_slice(std::slice::from_raw_parts(ptr, count));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_threshold_is_geometric() {
+        let initial = 96_000; // 2 秒 @ 48kHz
+        // 初回 emit 前は initial。
+        assert_eq!(next_partial_threshold_frames(0, initial), initial);
+        // 以降は倍々。
+        assert_eq!(next_partial_threshold_frames(initial, initial), initial * 2);
+        assert_eq!(
+            next_partial_threshold_frames(initial * 2, initial),
+            initial * 4
+        );
+        assert_eq!(
+            next_partial_threshold_frames(initial * 4, initial),
+            initial * 8
+        );
+    }
+
+    #[test]
+    fn partial_threshold_initial_never_zero() {
+        // initial=0 でも 1 を返し、以降 saturating_mul で無限ループにならない。
+        assert_eq!(next_partial_threshold_frames(0, 0), 1);
+        assert_eq!(next_partial_threshold_frames(1, 0), 2);
+    }
+
+    #[test]
+    fn partial_threshold_total_work_bounded_by_2x() {
+        // 幾何級数の閾値を全長の半分まで積み上げ、partial 解析総 frame 数が全長の約 2 倍以内で
+        // 頭打ちになることを確認する（50% 抑制 + 倍々スケジュールの効果）。
+        let initial = 96_000usize;
+        let total_frames = 48_000 * 60 * 60; // 1 時間
+        let half = total_frames / 2;
+        let mut last = 0usize;
+        let mut sum_prefix = 0usize;
+        loop {
+            let threshold = next_partial_threshold_frames(last, initial);
+            if threshold >= half {
+                break;
+            }
+            // partial は threshold 到達時点のプレフィックス（≈ threshold frame）を解析する。
+            sum_prefix += threshold;
+            last = threshold;
+        }
+        // partial 総解析量 < total（50% 抑制で最後の partial < half、倍々なので総和 < 2*half = total）。
+        assert!(
+            sum_prefix < total_frames,
+            "partial 総解析 {sum_prefix} が全長 {total_frames} を超えている"
+        );
+    }
 }

@@ -19250,6 +19250,17 @@ impl App {
             *child.visuals_mut() = egui::Visuals::dark();
             let row_secs = self.music_timeline_row_secs;
             let analysis = self.music_analysis.as_ref().unwrap();
+            // x 軸幅は player duration を優先。まだ 0 (player 未 open) の間は probe → 解析結果の
+            // duration で全幅を安定させる (Codex P2: progressive ロード中に幅が 0→伸びるのを防ぐ)。
+            let timeline_dur = if dur > 0.0 {
+                dur
+            } else {
+                self.music_probe
+                    .as_ref()
+                    .map(|p| p.duration_secs)
+                    .filter(|d| *d > 0.0)
+                    .unwrap_or_else(|| analysis.stream.duration_secs)
+            };
             let cache = &mut self.music_timeline_cache;
             let follow = &mut self.music_timeline_follow;
             let mut seek_req = None;
@@ -19260,7 +19271,7 @@ impl App {
                     seek_req = crate::ui_music_timeline::draw_music_timeline(
                         ui,
                         analysis,
-                        dur,
+                        timeline_dur,
                         pos,
                         playing,
                         follow,

@@ -84,6 +84,9 @@ pub struct TimelineTextureCache {
     raster_tx: Option<mpsc::Sender<TimelineRasterRequest>>,
     raster_rx: Option<mpsc::Receiver<TimelineRasterResult>>,
     raster_cancel: Option<Arc<AtomicBool>>,
+    /// 直近フレームで描いた解析 `Arc` の identity (`Arc::as_ptr as usize`、0 = 未取得)。
+    /// progressive partial で解析が差し替わったら全 row を再ラスタするために使う。
+    last_analysis_ptr: usize,
 }
 
 struct TimelineRowTexture {
@@ -146,6 +149,23 @@ impl TimelineTextureCache {
         self.rows.clear();
         self.pending.clear();
         self.row_versions.clear();
+        self.last_analysis_ptr = 0;
+    }
+
+    /// 解析結果 `Arc` の identity が変わったら（progressive partial → 成長 / partial → final）、
+    /// 既存の全 row を再ラスタ対象にする。`TimelineTextureCacheKey` は x 軸幅（= player duration）
+    /// が不変なら同一なので、`ensure` の key 差分だけでは無効化されない（Codex P1）。key を保った
+    /// まま全 `row_version` を進めて古い row texture を stale 化する（worker は残す）。partial は
+    /// 幾何級数で高々十数回なので再ラスタ総コストは有界。`analysis_ptr` = `Arc::as_ptr as usize`、
+    /// 0 は「未取得」sentinel。
+    fn note_analysis_identity(&mut self, analysis_ptr: usize) {
+        if analysis_ptr == 0 || self.last_analysis_ptr == analysis_ptr {
+            return;
+        }
+        self.last_analysis_ptr = analysis_ptr;
+        for v in self.row_versions.iter_mut() {
+            *v = v.wrapping_add(1);
+        }
     }
 
     fn ensure(&mut self, key: TimelineTextureCacheKey) {
@@ -428,6 +448,9 @@ pub fn draw_music_timeline(
         dark,
     };
     cache.ensure(texture_key);
+    // progressive partial で解析が差し替わっていたら全 row を再ラスタ対象にする（key は
+    // player duration 基準の全幅なので変わらず、ensure では無効化されない。Codex P1）。
+    cache.note_analysis_identity(Arc::as_ptr(analysis) as usize);
     cache.poll_finished_rows(ui.ctx(), TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME);
 
     let text_color = ui.visuals().text_color();
@@ -763,6 +786,14 @@ fn draw_timeline_metric_hover(
 
 fn timeline_bin_at_time(bins: &[WaveformBin], time_secs: f64) -> Option<&WaveformBin> {
     if bins.is_empty() || !time_secs.is_finite() {
+        return None;
+    }
+    // progressive ロード中、まだ解析されていない未来領域（最終 bin の終端より先）を hover
+    // したとき、`bins.last()` を返すと古い metric が未来位置に表示される（Codex P2）。
+    // 最終 bin の終端より先は None にする。
+    if let Some(last) = bins.last()
+        && time_secs > last.start_secs + last.duration_secs
+    {
         return None;
     }
     let idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= time_secs);
