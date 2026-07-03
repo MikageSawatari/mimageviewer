@@ -104,8 +104,11 @@ pub fn decode_audio_file_to_stereo_f32(
 /// 呼び出し頻度は **幾何級数マイルストーン**（最初 `PARTIAL_INITIAL_SECS` 秒、以降 frame 数を
 /// 倍々）+ wall-clock throttle（`PARTIAL_EMIT_MIN_INTERVAL`）で間引く。`total_duration_secs > 0.0`
 /// のとき、蓄積が全長の 50% を超えたら on_partial 呼び出しを止める（final フル解析がすぐ後を
-/// 追うため。partial の再解析総コストを約 2x に抑える）。`on_partial` に渡す `&[f32]` は蓄積中の
-/// buffer への借用（ゼロコピー）。呼び出し側はここで解析して即 send し、借用を跨いで保持しない。
+/// 追うため）。再解析総コスト（呼び出し側が各 partial を解析する場合）: duration 既知時は
+/// partial 合計 `<T` + final `T` = 全長の **約 2x 以内**、duration 未知（`<= 0.0`、抑制なし）時は
+/// partial 合計 `<2T` + final `T` = **最悪 約 3x**（Codex P3）。実運用は probe で duration が取れる
+/// ため通常は 2x 側。`on_partial` に渡す `&[f32]` は蓄積中の buffer への借用（ゼロコピー）。
+/// 呼び出し側はここで解析して即 send し、借用を跨いで保持しない。
 pub fn decode_audio_file_to_stereo_f32_streaming(
     path: &Path,
     cancel: &AtomicBool,

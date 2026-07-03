@@ -289,8 +289,15 @@ impl TimelineTextureCache {
             row_texture.key != key || row_texture.row_version < row_version
         });
         if missing || needs_newer_texture {
-            let pending_current = self.pending[row]
-                .is_some_and(|pending| pending.key == key && pending.generation == self.generation);
+            // `row_version` を含めて判定する: progressive partial で `note_analysis_identity` が
+            // row_version を進めた直後、古い prefix 用 request が pending のままだと、それだけを
+            // 見て「pending 済み」と誤判定して新 analysis 用 request が出ず、progressive 追従が
+            // 古い raster 完了待ちになる (Codex P2)。pending が目標より古い version なら再要求する。
+            let pending_current = self.pending[row].is_some_and(|pending| {
+                pending.key == key
+                    && pending.generation == self.generation
+                    && pending.row_version >= row_version
+            });
             if !pending_current && let Some(tx) = self.raster_tx.as_ref() {
                 let request = TimelineRasterRequest {
                     generation: self.generation,
