@@ -30275,6 +30275,9 @@ impl App {
         self.music_timeline_cache.clear();
         self.music_spectrum.clear();
         self.music_timeline_follow = true;
+        // ▲▼ ボタンの保留スクロール量は前ファイル向けなので破棄する (Codex P3: クリック直後に
+        // 別ファイルへ移動すると古い delta が次のタイムラインに適用されてしまう)。
+        self.music_timeline_scroll_req = 0.0;
         self.music_analysis = None;
         self.music_pcm = None;
         self.music_probe = None;
@@ -30393,6 +30396,8 @@ impl App {
         self.music_probe = None;
         self.music_analysis_error = None;
         self.music_analysis_path = None;
+        // ▲▼ ボタンの保留スクロール量も teardown で破棄する (Codex P3、上記 path 変更と同じ理由)。
+        self.music_timeline_scroll_req = 0.0;
         // 端ホバーパネルの開閉ラッチは transient hover state なので teardown でリセットする。
         // 残すと次に音声を開いた際、5% edge trigger を踏まずカーソルが panel+sustain 内にある
         // だけでパネルが再表示される (Codex P3)。

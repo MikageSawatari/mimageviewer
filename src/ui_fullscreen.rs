@@ -19342,8 +19342,8 @@ impl App {
                 .id_salt(("music_timeline", fs_idx))
                 .show(&mut child, |ui| {
                     if pending_scroll != 0.0 {
-                        // egui 規約: 正の delta.y = 先頭方向 (上) へスクロール。▲=正 / ▼=負。
-                        // (実機で上下が逆なら符号を反転する)。
+                        // egui 0.33: 正の delta.y = 先頭方向 (上) へスクロール (Codex 確認済)。
+                        // ▲=正 (page) / ▼=負 (-page)。
                         ui.scroll_with_delta(egui::vec2(0.0, pending_scroll));
                     }
                     seek_req = crate::ui_music_timeline::draw_music_timeline(
