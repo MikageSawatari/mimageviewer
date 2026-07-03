@@ -19313,8 +19313,8 @@ impl App {
         }
 
         // ── 下段 108-band spectrum + ピッチ鍵盤 (Inc 4)。──
-        // 再生位置周辺 ±1 秒の PCM をワーカーで FFT して描く。PCM 未着 (デコード中 / 上限超で
-        // 無効) の間は空バンド = 鍵盤ベースラインのみ。Arc は clone で借用衝突を避ける。
+        // 再生位置周辺 ±1 秒の PCM をワーカーで FFT して描く。PCM 未着 (デコード中) の間は
+        // 空バンド = 鍵盤ベースラインのみ。Arc は clone で借用衝突を避ける。
         // 縦窓が極端に短く帯を確保できない場合 (show_spectrum=false) は worker を回さず描かない。
         if show_spectrum {
             let pcm = self.music_pcm.clone();

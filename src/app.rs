@@ -3214,14 +3214,17 @@ fn run_music_analysis(
         let _ = tx.send(MusicAnalysisMsg::Timeline(Ok(ta)));
     }
 
-    // spectrum 用 PCM を追送する (上限超の長尺は常駐させず spectrum 無効。timeline は上限なし)。
-    if decoded.stereo_samples.len() <= crate::ui_music_spectrum::MUSIC_SPECTRUM_MAX_PCM_SAMPLES {
-        let pcm = crate::ui_music_spectrum::MusicPcm {
-            samples: decoded.stereo_samples,
-            sample_rate: decoded.info.sample_rate,
-        };
-        let _ = tx.send(MusicAnalysisMsg::Pcm(std::sync::Arc::new(pcm)));
-    }
+    // spectrum 用 PCM を追送する。timeline が全尺デコードしたのと同じ PCM を move で渡すだけ
+    // なので追加のピーク確保は無い (長さ上限は設けない)。timeline が解析できたファイルは長さに
+    // 依らず spectrum も動く (ラボと同挙動)。巨大ファイルでデコード自体が確保失敗した場合は
+    // decode_audio_file_to_stereo_f32 が Err を返し timeline/spectrum とも出ない (決定的)。
+    // spectrum ワーカーは再生位置 ±1 秒窓をスライスするだけ (O(窓)) で、常駐 PCM 全体を毎フレーム
+    // 走査するわけではない。
+    let pcm = crate::ui_music_spectrum::MusicPcm {
+        samples: decoded.stereo_samples,
+        sample_rate: decoded.info.sample_rate,
+    };
+    let _ = tx.send(MusicAnalysisMsg::Pcm(std::sync::Arc::new(pcm)));
 }
 
 pub struct App {

@@ -49,11 +49,6 @@ const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 /// 過剰リクエストを抑える (1 フレーム 1 リクエストが上限)。
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
 
-/// spectrum 用に常駐保持する PCM の上限サンプル数 (= 30 分 @ 48kHz stereo)。これを超える
-/// 長尺ファイルは PCM を常駐させず spectrum を無効化する (決定的な固定上限。空きメモリ等の
-/// 実行時状態には依存しない)。タイムライン解析自体は上限なしで動く。
-pub const MUSIC_SPECTRUM_MAX_PCM_SAMPLES: usize = 48_000 * 2 * 60 * 30;
-
 /// 音楽ビューの再生位置周辺スペクトラム用に、解析ワーカーが全尺デコードした PCM。
 /// 48kHz interleaved stereo f32。再生エンジン (`VideoPlayer`) とは独立した、時刻でインデクス
 /// できる並行コピー (再生バッファそのものではない)。
@@ -174,7 +169,7 @@ impl MusicSpectrumState {
 
     /// 1 フレーム分の更新: ワーカー結果を取り込み、必要なら新しいリクエストを送る。
     ///
-    /// `pcm` が None (まだデコード中 / 上限超で spectrum 無効) の間は何もリクエストしない
+    /// `pcm` が None (まだデコード中) の間は何もリクエストしない
     /// (描画は空バンド = 鍵盤ベースラインのみ)。再生中 or 結果待ちの間は軽い間隔で repaint を要求。
     pub fn update(
         &mut self,

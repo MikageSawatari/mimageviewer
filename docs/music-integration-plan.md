@@ -719,10 +719,16 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   （`spectrum_request_from_samples`）。よって本体でも **解析ワーカーが全尺デコードした 48kHz stereo PCM を
   `Arc<MusicPcm>` で保持し、playhead ±1s をスライスして `SpectrumAnalyzer` に渡す**（`audio.rs` の
   hot path は無改変 = 動画リグレッションリスクゼロ）。D9 の「playback ring buffer から短窓 tap」は
-  この記述に読み替える。トレードオフ = 開いている 1 曲分の PCM が常駐（約 12MB/分、上限
-  `MUSIC_SPECTRUM_MAX_PCM_SAMPLES` = 30 分を超えると spectrum 無効）。cache hit 時は timeline は
-  即表示のまま、spectrum 用 PCM だけ背景デコードで後追い（mIV は既に timeline が全尺デコード待ちの
-  ため挙動は一貫）。実装 = `src/ui_music_spectrum.rs`（`MusicSpectrumState` / `MusicPcm` / 常駐ワーカー）+
+  この記述に読み替える。トレードオフ = 開いている 1 曲分の PCM が常駐（約 12MB/分）。**当初は
+  `MUSIC_SPECTRUM_MAX_PCM_SAMPLES` = 30 分の常駐上限を設け、超過ファイルは spectrum を無効化して
+  いたが撤廃した（2026-07-03）**: timeline はそもそも上限なしで全尺デコードしており（この関数の
+  支配的コスト）、spectrum 用 PCM はその Vec を `move` で渡すだけで追加のピーク確保が無い。上限が
+  あると「timeline は解析できるのに 30 分超で spectrum だけ黒枠」という不整合（実機 FB で NG）を
+  生むため、timeline と同じく全尺 PCM を長さに依らず渡す（ラボと同挙動）。巨大ファイルでデコード
+  自体が確保失敗した場合は `decode_audio_file_to_stereo_f32` の `try_reserve` が Err を返し
+  timeline/spectrum とも出ない（決定的な失敗）。spectrum ワーカーは playhead ±1s 窓をスライスする
+  だけ（O(窓)）で常駐 PCM 全体を毎フレーム走査しない。cache hit 時は timeline は即表示のまま、
+  spectrum 用 PCM だけ背景デコードで後追い（mIV は既に timeline が全尺デコード待ちのため挙動は一貫）。実装 = `src/ui_music_spectrum.rs`（`MusicSpectrumState` / `MusicPcm` / 常駐ワーカー）+
   `run_music_analysis` の PCM 追送（`MusicAnalysisMsg::{Timeline,Pcm}`）。
 - **音量 normalize と音楽ビューの関係**（Inc 3/6）: 動画と同じ normalize スキャンを音声にも適用するか。
 
