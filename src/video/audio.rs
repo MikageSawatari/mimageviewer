@@ -833,6 +833,15 @@ fn run_pump(
     normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
 
     let mut activated = false;
+    // preroll 解除エッジ検出。preroll 中 (測定前待機) は毎ブロック snap_to_target するが、
+    // UI スレッドは「set_normalize_gain(確定 gain) → set_audio_preroll_suspended(false)」を
+    // 連続で store するため、pump が preroll=true のまま新 gain を snap するブロックを
+    // 挟めないことがある (race)。すると解除後の最初の可聴ブロックで旧 gain (=1.0) から
+    // 確定 gain へ 4 秒 ramp してしまい、同期スキャンしたのに音量が徐々に上がる。
+    // 解除エッジ (true→false) の最初のブロックで確実に snap し、確定 gain で即開始する。
+    // preroll=false を Acquire 観測した時点で、直前に Release された新 gain は必ず可視
+    // (clock.rs の set_normalize_gain / set_audio_preroll_suspended は共に Release store)。
+    let mut was_preroll_suspended = false;
     let mut last_seen_seek_serial: u64 = 0;
     // T07 (v0.9.0): VST3 bridge wedge auto-disable のための連続失敗カウンタ。
     // `process_block` が連続 N 回 (= 約 N * block_duration ms の停滞) 失敗したら
@@ -1129,10 +1138,17 @@ fn run_pump(
 
         if clock.audio_preroll_suspended() {
             normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
+            was_preroll_suspended = true;
             if let Ok(buf) = buffer.lock() {
                 publish_buffer_secs(&buf, &clock);
             }
             continue;
+        }
+        if was_preroll_suspended {
+            // preroll 解除エッジ: 測定確定 gain で即再生開始する (4 秒 ramp を避ける)。
+            // ここで snap しておけば直後の apply_to_samples は target 一致で ramp を arm しない。
+            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
+            was_preroll_suspended = false;
         }
 
         // ── raw → VST process → processed loop ──
@@ -2061,6 +2077,34 @@ mod tests {
         assert_eq!(ramp.remaining_frames(), 0);
         assert!((max_gain - 0.5).abs() < 1.0e-6);
         assert!(samples.iter().all(|s| (*s - 0.5).abs() < 1.0e-6));
+    }
+
+    /// 再生前スキャン (deferred normalize) の解除エッジで snap すれば、確定 gain で
+    /// 最初のブロックから始まり 4 秒 ramp しない、という pump の不変条件を検証する。
+    /// pump は preroll 中 old gain を snap し続け (race で確定 gain を捕まえ損ねうる)、
+    /// 解除エッジで確定 gain を snap する。そのシーケンスを再現する。
+    #[test]
+    fn normalize_gain_snap_on_preroll_release_edge_avoids_ramp() {
+        let mut ramp = NormalizeGainRamp::new(48_000, 2);
+        ramp.snap_to_target(1.0); // pump 起動時の初期 snap
+        // preroll 中: old gain (=1.0) を snap し続ける (確定前)。
+        ramp.snap_to_target(1.0);
+        // 解除エッジ: UI が set_normalize_gain(2.0) → preroll 解除。pump は解除ブロックで
+        // 確定 gain=2.0 を snap する。
+        ramp.snap_to_target(2.0);
+        // 解除後の最初の可聴ブロック: target=2.0 を適用しても snap 済みなので ramp を arm しない。
+        let mut samples = vec![1.0_f32; 32];
+        let max_gain = ramp.apply_to_samples(&mut samples, 2.0);
+        assert_eq!(
+            ramp.remaining_frames(),
+            0,
+            "解除エッジ snap 後は ramp しない"
+        );
+        assert!((max_gain - 2.0).abs() < 1.0e-4);
+        assert!(
+            samples.iter().all(|s| (*s - 2.0).abs() < 1.0e-4),
+            "最初のブロックから確定 gain で始まる (徐々に上がらない)"
+        );
     }
 
     #[test]
