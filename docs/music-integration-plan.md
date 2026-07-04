@@ -302,6 +302,46 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   視覚的にジャンプしないよう、**動画 HUD と音楽 HUD の描画コードを共通化する**（下記 §5.8）。
   これにより Inc 7 が (a)/(b) どちらの presenter 戦略でも見た目は同一コードで揃う。
 
+#### 5.7.0 exit 音切れ解消 = hidden presenter 方式（ユーザー確定 2026-07-04、Codex 設計相談済み）
+
+**ユーザー決定**: 音楽→動画に戻るときの exit 音切れ（現行の detach + re-attach + seek 方式は seek が
+audio buffer を clear するため発生）を **完全シームレス**にする。そのため **presenter を drop せず、
+「非表示 + デコード継続」モード**にする（動画+音声モードの decode 負荷はユーザーが許容と明言）。
+
+**設計（Codex 検証済みの concrete plan、次セッションで実装）**:
+- **enter**: 現行の VST/owner/HUD teardown はそのまま → `video_audio_mode = Some(fs_idx)`（egui 経路を
+  有効化）→ presenter に **hide command** を送る（drop しない）。`set_video_output_disabled` は**使わない**。
+- **exit**: presenter に **show command** を送り、ack（または短い timeout）後に `video_audio_mode = None`。
+  **seek も audio 操作もしない**。owner/HUD は `ensure_native_video_front` が再登録。
+  順序が重要（Codex Q4）: **show 確認 → `video_audio_mode=None`**（逆順だと egui viewport が先に畳まれ
+  hidden presenter も未表示の 1 フレーム穴が空く）。
+- **presenter 側 hidden/drain mode**（Codex Q1、核心）: 現 present ループは毎回 `video_rx.try_recv()` で
+  consume するが、`present()` が frame-latency waitable を最大 100ms 待つので、hidden 時は
+  **consume-and-hold** にする＝`present()` は呼ばず、drain + frame selection は継続して最新 1 枚を
+  `hidden_latest_frame` に hold。**present 成功時の再生状態更新（FirstFrameReady / last_displayed_pts_bits /
+  seek override clear）は hidden 中も実行**（でないと音声モード中 seek で engine が映像 ready 待ちに戻る）。
+  show 時は hold フレームを 1 回 present してから `show_and_raise()`。
+- **owner-sync ゲート**（Codex Q2）: `ensure_native_video_front` 冒頭 + `poll_video` 末尾の
+  `set_existing_guis_owner_to_hwnd` + `hud_raise_rx` drain + `native_video_presenter_hwnd_for_focus_guard`
+  を **`video_audio_mode == Some(idx)` で native presenter 非アクティブ扱い**にする。
+- **HUD overlay HWND**（Codex Q5）: presenter HWND とは別 top-level なので、hide command で HUD overlay も
+  明示 hide、overlay tick / cursor polling / HUD raise burst を抑止。perf overlay は show 時に history reset。
+- **`video_output_disabled`（7a）+ engine の `effective_has_video`（#5 修正）は削除**（未リリース、この方式では
+  映像を止めないので不要）。ただし audio-only ファイル用の `has_video=false` + ReadinessLatch video gate は残す。
+  #5（音声モード seek で停止）は「映像を生かすので seek 後 FirstFrameReady が来る」で解消（consume-and-hold が
+  present 成功時 bookkeeping を出す前提）。
+- **10 ステップ実装計画**（Codex）: (1)`NativeVideoOutputCommand::SetWindowVisible{visible,request_id}` + ack
+  event (2)`NativeVideoOutput::set_window_visible()` + `PostMessage(WM_NULL)` wake (3)presenter loop に
+  `presenter_hidden` + `hidden_latest_frame` (4)hidden 中も drain + frame selection 継続 + present 成功時
+  bookkeeping (5)show で held frame present → `show_and_raise()` → ack (6)`ensure_native_video_front` /
+  `poll_video` owner sync を `video_audio_mode==Some` で early clear (7)enter = teardown → `video_audio_mode=Some`
+  → hide (8)exit = show → ack/timeout → `video_audio_mode=None`（seek/audio 触らない）(9)`video_output_disabled`
+  + effective-has-video 削除 (10)手動検証 = playing/paused/EOF/seek-in-audio/fullscreen/in-window/VST GUI 表示済み
+  各ケース + perf log で hidden 中 `video_rx_len`/`source_queue_len` が増え続けないこと。
+- **⚠️ 大きめ + delicate（presenter thread / HUD / owner sync）。着手は次セッション（本セッションが長く
+  reliability guidance に従い checkpoint）。現行の detach 方式は動作している（切替 OK・#5/#6 修正済み）ので、
+  exit 音切れだけが残課題。**
+
 #### 5.7.1 実装ステージ 7a〜7e（Codex 設計相談で確定、2026-07-04）
 
 着手前の Codex 設計相談（`Approach B` 採用）で確定した段階。各段は build + test + Codex レビュー、
