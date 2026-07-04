@@ -237,7 +237,13 @@ impl App {
         }
     }
 
-    fn music_audio_path(&self, fs_idx: usize) -> Option<std::path::PathBuf> {
+    /// 音楽ビューで解析 / タイムライン / スペクトラム / ブックマークの対象にする「音源」のパス
+    /// (3 概念分離のうち解析ソース、[`Self::fs_music_view_active`] は表示/ゲート判定)。
+    ///
+    /// 音声ファイルはそのパスを返す。Inc 7 (動画→音声モード) では、音声モードにトグルされた
+    /// 動画の場合にその動画ファイルのパスを返すよう拡張する (その動画の音声トラックを解析する)。
+    /// 名前が「audio_path」ではなく「source」なのは、将来動画パスも返し得るため。
+    pub(crate) fn fs_music_source_for_idx(&self, fs_idx: usize) -> Option<std::path::PathBuf> {
         match self.items.get(fs_idx) {
             Some(GridItem::Audio(p)) => Some(p.clone()),
             _ => None,
@@ -255,7 +261,7 @@ impl App {
     /// 指定秒にブックマークを追加する。近接重複 (±1s) は避ける。パネルヘッダの
     /// ブックマークボタン (`AddBookmarkAt { target_secs }` コマンド) からも使う。
     fn add_music_bookmark_at(&mut self, fs_idx: usize, secs: f64) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         let pos = secs.max(0.0);
@@ -275,7 +281,7 @@ impl App {
     }
 
     fn delete_music_bookmark(&mut self, fs_idx: usize, id: i64) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         if let Some(db) = self.video_bookmark_db.as_ref() {
@@ -289,7 +295,7 @@ impl App {
     }
 
     fn rename_music_bookmark(&mut self, fs_idx: usize, id: i64, title: &str) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         let trimmed = title.trim();
@@ -307,7 +313,7 @@ impl App {
     /// 一括ブックマーク登録 (中央モーダルの `BulkAddBookmarks { entries }` コマンドを翻訳)。
     /// 動画と同じ重複判定 (±1s) で追加する。
     fn bulk_add_music_bookmarks(&mut self, fs_idx: usize, entries: Vec<(f64, String)>) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         if entries.is_empty() {
@@ -344,7 +350,7 @@ impl App {
     /// ブックマークをクリップボードへエクスポート (`ExportBookmarksToClipboard { seconds_only }`
     /// コマンドを翻訳、動画と同じ `format_chapter_lines`)。
     fn export_music_bookmarks(&mut self, fs_idx: usize, ctx: &egui::Context, seconds_only: bool) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         let entries: Vec<(f64, Option<String>)> = self
@@ -366,7 +372,7 @@ impl App {
 
     /// この音声のブックマークを全削除 (`ClearAllBookmarksForCurrent` コマンドを翻訳)。
     fn clear_all_music_bookmarks(&mut self, fs_idx: usize) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         let result = self
@@ -530,7 +536,7 @@ impl App {
         fs_idx: usize,
         show_panel: bool,
     ) {
-        let Some(path) = self.music_audio_path(fs_idx) else {
+        let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
         self.ensure_music_bookmarks_loaded(&path);

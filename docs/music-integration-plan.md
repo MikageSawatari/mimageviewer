@@ -302,6 +302,45 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   視覚的にジャンプしないよう、**動画 HUD と音楽 HUD の描画コードを共通化する**（下記 §5.8）。
   これにより Inc 7 が (a)/(b) どちらの presenter 戦略でも見た目は同一コードで揃う。
 
+#### 5.7.1 実装ステージ 7a〜7e（Codex 設計相談で確定、2026-07-04）
+
+着手前の Codex 設計相談（`Approach B` 採用）で確定した段階。各段は build + test + Codex レビュー、
+**フィーチャ OFF 時は動画経路をバイト等価に保つ**。
+
+- **Approach B**: enter 時に native presenter を detach（`take_native_output`）し、音声ファイルが
+  既に使う egui `draw_fs_music_view` をそのまま再利用。Approach A（native overlay に timeline/
+  spectrum を移植）は audio-file path と分岐して保守負債が大きく却下。
+- **video 生産を止める仕組み**: 「detach だけ」では video decoder が消費者不在で回り続ける
+  （`pending_video_packets` は 64MiB 上限ありなので無限リークではないが、隠れデコード + demux が
+  video に引かれ audio 供給に悪影響）。→ demux レベルの `video_output_disabled` atomic で video
+  packet routing を破棄（audio routing は無改変 = 無中断）。復帰は「flag clear + 現在位置 seek」で
+  既存 seek/flush/serial/keyframe 経路に乗せる（独自 re-prime は作らない）。
+- **`current_item_is_audio` の 3 概念分離（blanket 置換禁止、Codex Q4）**: 従来 ui_fullscreen.rs の
+  約 70 箇所が `current_item_is_audio` で gate していたのを 3 つに分ける:
+  - `fs_music_view_active(fs_idx)` — 音楽ビューが出ているか（表示 dispatch / 画像パネル抑止 /
+    音楽ビュー用キーゲート）。7c で `video_audio_mode == Some(fs_idx)` を OR して拡張。
+  - `fs_music_source_for_idx(fs_idx)` — 解析/timeline/spectrum/bookmark の音源パス（旧
+    `music_audio_path` を改名）。7c で音声モードの動画パスも返す。
+  - `GridItem::Audio(_)` 直判定 — ファイル種別 / 前後ナビ / rating / resume / 永続 semantics は
+    そのまま残す（音楽ビュー内では `is_media_item`(Enter=media) と `video_file_nav` の 2 箇所のみ）。
+- **段階**:
+  - **7a** ✅（commit 5cf3d25c、2026-07-04）: demux `video_output_disabled` flag（OFF = バイト等価、
+    per-iteration snapshot で mid-iteration race 消去）+ `VideoPlayer::set_video_output_disabled`
+    API + unit test。実機確認 OK（OFF 時バイト等価につき動画/音声とも無退行）。
+  - **7b** ✅（2026-07-04）: `fs_music_view_active` / `fs_music_source_for_idx` predicate を導入し
+    ui_fullscreen.rs の約 70 gate + display dispatch + is_music_view + 解析ソース抽出を経路変更。
+    `video_audio_mode` はまだ無く両 predicate は `GridItem::Audio` と同値 = **挙動完全不変**。
+    bin test 3135 緑・fmt/glyph クリーン。（7c で `handle_video_input` を音声モード中は gate する
+    必要がある点をメモ: 現状 video-in-audio-mode は is_video_fs のまま handle_video_input へ入るため。）
+  - **7c**: enter/exit ライフサイクル + re-attach + seek 再同期。enter = VST/native owner 整理 →
+    detach → `set_video_output_disabled(true)` → music view active。exit = disable clear →
+    `attach_native_output_from_config` → 現在位置 seek。`App.video_audio_mode: Option<usize>`
+    （transient、非永続）。
+  - **7d**: トグル配線（キー / HUD ボタン — **どちらにするかは 7d 着手時にユーザー確認**）+ 解析
+    ワーカー start/stop。
+  - **7e**: 仕上げ（VST 状態引き継ぎ、EOF / 音声モード中 seek / close from audio mode / file nav /
+    long video の memory・audio 継続の smoke）。
+
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 
 ユーザー実機 FB（倍速/音量/下バーボタン/ブックマークパネルが動画と違う）を受けて、

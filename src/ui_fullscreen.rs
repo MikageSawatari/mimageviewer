@@ -5387,10 +5387,7 @@ impl App {
                                     } else {
                                         false
                                     };
-                                    if matches!(
-                                        self.items.get(fs_idx),
-                                        Some(GridItem::Audio(_))
-                                    ) {
+                                    if self.fs_music_view_active(fs_idx) {
                                         // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
                                         // 比較/回転経路はスキップする。
                                         self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
@@ -5923,8 +5920,7 @@ impl App {
                         // 表示トリム / 分析 / パノラマ等) を一切描かない。draw_fs_music_view が
                         // 自前の UI (上情報バー + 下シークバー) を描くので、動画が native presenter に
                         // 委ねてここでパネルを描かないのと同じ扱いにする (Inc 3、右左パネル漏れ修正)。
-                        let is_music_view =
-                            matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
+                        let is_music_view = self.fs_music_view_active(fs_idx);
                         if is_music_view {
                             // 画像用パネルは描画しない。音楽ビュー専用の左右パネル (ブックマーク /
                             // 音楽情報+タグ、Inc 5) は draw_fs_music_view が自前で描く。
@@ -7839,19 +7835,27 @@ impl App {
         // 選択操作を優先、Codex Phase 5.1 P2 反映)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.fs_context_menu_idx.is_none();
-        // 音声 (音楽ビュー) は画像の編集/分析/見開き/回転/比較/AI/ポストフィルタ系ショートカットを
+        // 音楽ビューは画像の編集/分析/見開き/回転/比較/AI/ポストフィルタ系ショートカットを
         // 一切受けない (Inc 5, Codex P2)。consume 自体を抑止するので、これらの状態が次の画像へ
         // 漏れず、ブックマーク改名/インポート/タグの TextEdit への文字入力も奪わない。メタデータ
-        // (I) だけは音楽情報パネルのトグルとして音声でも残す。spread-shift (Ctrl+←→) はこの
+        // (I) だけは音楽情報パネルのトグルとして音楽ビューでも残す。spread-shift (Ctrl+←→) はこの
         // 判定を先に使うため is_video_fs 直後で定義する。
+        //
+        // 3 概念分離 (Inc 7 動画→音声モードの布石):
+        //  - `fs_music_view_active`: 音楽ビューが出ているか (キーゲート / 音楽キー有効化)。
+        //    Inc 7 で音声モードにトグルした動画も true になる。抑止/有効化ゲートはこちらを使う。
+        //  - `current_item_is_audio`: 純粋に「アイテムが音声ファイルか」。Enter=media 判定
+        //    (`is_media_item`) と前後ファイルナビ (`video_file_nav`) だけこちらを残す (どちらも
+        //    Video アームで別途カバーされるので、音声ファイル特有ぶんだけを表す)。
         let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
+        let fs_music_view_active = self.fs_music_view_active(fs_idx);
         // 音楽ビューのパネル内 TextEdit (ブックマーク改名 / 一括登録 / タグピッカー) に
         // フォーカスがある / IME 変換中 / 中央モーダル (改名・一括登録) 表示中は、フルスクリーンの
         // ナビ・ショートカットキーを一切消費しない (Inc 5 FB / 5c-A)。矢印 (IME 候補選択) や
         // Enter/Space/文字キー/Ctrl+V が奪われて日本語変換や貼り付けが壊れるのを防ぐ
         // (動画は native presenter 側で入力するので同問題は無い)。モーダル表示中は ESC/Space 等の
         // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
-        if current_item_is_audio
+        if fs_music_view_active
             && (ctx.wants_keyboard_input()
                 || self.ime_input_active()
                 || self.music_bookmark_modal_open()
@@ -7893,7 +7897,7 @@ impl App {
         // (native_video.rs) で VideoCloseFullscreen を VideoPlayPause より前に判定するので、
         // 音声も再生/一時停止より前に置いて優先順位を揃える (例: Enter を VideoCloseFullscreen に
         // 割り当てた場合、動画同様「閉じて一覧へ戻る」が勝つ)。既定は未割り当てなので通常は no-op。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -7913,7 +7917,7 @@ impl App {
         // するので、音声でも動画と同じく Enter = 再生トグル / Esc = 閉じる になる (FsClose の
         // 既定 Enter へは流れない、「映像なし動画」パリティ)。モーダル / IME / TextEdit フォーカス中は
         // 消費しない。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -7928,7 +7932,7 @@ impl App {
         // (動画の `KeyAction::VideoBookmark` を共有)。ブックマーク改名 / インポート /
         // タグピッカーの TextEdit にフォーカスがあるとき・IME 変換中・コンテキスト
         // メニュー表示中は無効 (B の文字入力を奪わない)。
-        if matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -7940,7 +7944,7 @@ impl App {
         // 音楽ビュー: L キーでループモード切替 (動画の `KeyAction::VideoLoop` を共有、
         // Off → 全体 → ブックマーク間 → Off で循環)。連続再生中は cycle_music_loop_mode 内で
         // no-op + トースト。モーダル / IME / TextEdit フォーカス中は消費しない。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -7953,7 +7957,7 @@ impl App {
         // 音楽ビュー: W キーで頭出し (先頭へ seek + 即再生、動画の VideoSeekStart を共有)。
         // 下 HUD の 頭出しボタンと実体 (`music_seek_start`) を共有。モーダル / IME / TextEdit
         // フォーカス中は消費しない。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -7966,7 +7970,7 @@ impl App {
         // 音楽ビュー: J/K で前後のブックマークへジャンプ (動画の VideoMarkerPrev/VideoMarkerNext を
         // 共有)。音声はチャプター/ピン無しなのでブックマークのみ対象。J=前 (無ければ先頭)、K=次。
         // モーダル / IME / TextEdit フォーカス中は消費しない。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -7985,7 +7989,7 @@ impl App {
         // 動画は native presenter 経路で処理するが、音楽は egui フルスクリーン経路なのでここで
         // 消費する。フェーダー刻みは `step_video_volume_by_fader_key_step` を共有し、下 HUD の
         // 音量スライダーと挙動を揃える。モーダル / IME / TextEdit フォーカス中は消費しない。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -8015,7 +8019,7 @@ impl App {
         // 音楽ビュー: M キーでミュート切替 (動画の VideoMute を共有)。セッションミュート +
         // settings.video_muted を反転し、下 HUD のミュートボタンと挙動を揃える。モーダル / IME /
         // TextEdit フォーカス中は消費しない。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -8029,7 +8033,7 @@ impl App {
         // 通常ホイールは前後ファイル移動なので、Ctrl 付きのときだけここで横取りして消費し、下流の
         // 一般ホイールハンドラ (9400 付近) / 前後移動 / ScrollArea へ渡さない。ホイール上 (wheel_y>0)
         // = 解像度を上げる (Row 秒数を減らす)。上バーの − / + ステッパーと同じ step_row_secs。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.music_bookmark_modal_open()
         {
@@ -8060,7 +8064,7 @@ impl App {
         // 対応)。ここで先取り消費して、下段の一般矢印処理 (音声では前後ファイル移動へ流れる) から
         // 音声 ←→ を分離する (「映像なし動画」パリティ: 従来 ←→ もファイル移動だったが動画同様
         // シークにする。前後ファイル移動は ↑↓ = VideoPrevFile/NextFile が担う)。
-        if current_item_is_audio
+        if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active()
             && !ctx.wants_keyboard_input()
@@ -8147,22 +8151,22 @@ impl App {
         // Ctrl+←/→: 見開き「1 ページずらし」(応急補正)。Single モードでは 1 ページ移動に
         // フォールバックする。動画は Ctrl+←/→ が 30 秒シークなので画像 (= !is_video_fs) のみ消費。
         let ctrl_left = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftLeft);
         let ctrl_right = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftRight);
         let spread_shift_prev = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftPrev);
         let spread_shift_next = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsSpreadShiftNext);
@@ -8218,13 +8222,13 @@ impl App {
         };
         // 音声は ←→ を上のシークブロックで消費済み (「映像なし動画」パリティ)。ここでは file-nav へ
         // 流さないよう明示的に除外する (残留 ←→ が前後ファイル移動を誤発火するのを防ぐ)。
-        let arrow_right = !current_item_is_audio
+        let arrow_right = !fs_music_view_active
             && ctx.input_mut(|i| {
                 !video_horizontal_arrow_key
                     && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
                         || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight))
             });
-        let arrow_left = !current_item_is_audio
+        let arrow_left = !fs_music_view_active
             && ctx.input_mut(|i| {
                 !video_horizontal_arrow_key
                     && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
@@ -8246,13 +8250,13 @@ impl App {
         let stack_jump_next = stack_jump == Some(KeyAction::FsStackJumpNext);
         let stack_jump_prev = stack_jump == Some(KeyAction::FsStackJumpPrev);
         // 音声の前/次ファイル移動は上の `video_file_nav` (VideoNextFile/PrevFile = plain ↓↑) で
-        // 処理する (adjacent_navigable_idx に Audio を含め、動画と統一)。下の `!current_item_is_audio`
+        // 処理する (adjacent_navigable_idx に Audio を含め、動画と統一)。下の `!fs_music_view_active`
         // ガードは残す: 音声は plain/Shift 矢印をこの image 経路では消費せず、plain ↓↑ は
         // video_file_nav 経由、Shift+↓↑ は音量 (VideoVolumeUp/Down) に振り分けるため
         // (二重発火防止、Inc 5c-B 実機FB 2026-07-03)。
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
             || (!is_video_fs
-                && !current_item_is_audio
+                && !fs_music_view_active
                 && ctx.input_mut(|i| {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
                         || (!stack_flat_nav
@@ -8260,7 +8264,7 @@ impl App {
                 }));
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
             || (!is_video_fs
-                && !current_item_is_audio
+                && !fs_music_view_active
                 && ctx.input_mut(|i| {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
                         || (!stack_flat_nav
@@ -8269,12 +8273,12 @@ impl App {
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        // `current_item_is_audio` は is_video_fs 直後で定義済み (spread-shift で先に使うため)。
-        // 音声も除外する (Inc 5 FB, Codex P3): 音楽ビューの右パネルは端ホバー式で
+        // `fs_music_view_active` は is_video_fs 直後で定義済み (spread-shift で先に使うため)。
+        // 音楽ビューも除外する (Inc 5 FB, Codex P3): 音楽ビューの右パネルは端ホバー式で
         // show_metadata_panel を使わなくなったので、音声で I を押すと隠れたグローバルフラグだけ
         // トグルされ、次に画像へ移ると意図せず画像メタパネルがピン表示される事故になる。
         let key_i = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
         // 動画モードでは `handle_video_input` 側で play/pause として消費するため、ここでは
@@ -8283,36 +8287,36 @@ impl App {
         // gate すると context menu open の動画で Space → 画像系チェックトグルへ流出する
         // (Codex Phase 1 P2 指摘)。
         let key_space = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
         let key_ctrl_s_capture = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCapture);
         let key_ctrl_b_book = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsAddToActiveBook);
         let key_ctrl_e_export = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
         let key_compare_x = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCompareToggle);
         let key_compare_alt_c = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCompareDiff);
         let key_compare_shift_c = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCompareWipe);
         let key_compare_c = !is_video_fs
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !key_compare_alt_c
             && !key_compare_shift_c
@@ -8320,30 +8324,29 @@ impl App {
         // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)。音声は
         // 画像スライドショーに参加しない。
         let key_s =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
-        let key_r =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_r = !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
         let key_l =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
         let key_z_raw =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsImageAnalysis);
         // V: 360 度パノラマビューワーモード トグル (docs/panorama-360-view-plan.md)。
         // 消しゴムモード中は ui_erase 側が V (vertical line tool) を先に consume するので、
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
         let key_v_panorama_raw =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsPanorama);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsPanorama);
         let key_g =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
-        let key_m = !current_item_is_audio
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
+        let key_m = !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsLoupeLockToggle);
         let key_e =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
         // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
         // 音声では B はブックマーク追加 (先行処理済み)。
         let key_b_bg =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
         // - 抑止対象: Z (分析) / S (スライドショー) / E (消しゴム) / M (ルーペ) / B (bg cycle)
         //   / I (メタデータ) / C 系 (比較)
@@ -8433,7 +8436,7 @@ impl App {
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
         let key_p_pin = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsPin);
 
         // コンテナ★ (既定: Shift+F1〜F6): 開いている画像が属するコンテナ
@@ -8476,22 +8479,22 @@ impl App {
         // (消しゴムモードに入らず、1 キーで inpaint までを一気に実行)
         // F9/F10: 隠蔽マスクスロット 1/2 を現ページに適用
         // Shift+F7/F8/F9/F10: 適用済みマスクを削除
-        let delete_erase_mask = !current_item_is_audio
+        let delete_erase_mask = !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsDeleteEraseMask);
-        let delete_conceal_mask = !current_item_is_audio
+        let delete_conceal_mask = !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsDeleteConcealMask);
         let key_f7 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyErase1);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsApplyErase1);
         let key_f8 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyErase2);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsApplyErase2);
         let key_f9 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
         let key_f10 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
         if delete_erase_mask || delete_conceal_mask || key_f7 || key_f8 || key_f9 || key_f10 {
             if image_edit_unavailable {
                 self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
@@ -8564,30 +8567,30 @@ impl App {
         // 見開き / 読み方向 / フィット (1-7, 0) も画像系状態。音声では consume しない
         // (次の画像へ spread/reading/fit が漏れるのを防ぐ、Codex P2)。
         let key_1 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadSingle);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadSingle);
         let key_2 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadLtr);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadLtr);
         let key_3 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadLtrCover);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadLtrCover);
         let key_4 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
         let key_5 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
-        let key_6 = !current_item_is_audio
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
+        let key_6 = !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsReadingFlowCycle);
-        let key_7 = !current_item_is_audio
+        let key_7 = !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsReadingDirectionToggle);
         let key_0 =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
         // Shift/Alt を伴う入力まで吸収する。具体的な修飾子から先に consume する必要がある。
-        let ai_direct_model = (!current_item_is_video && !current_item_is_audio)
+        let ai_direct_model = (!current_item_is_video && !fs_music_view_active)
             .then(|| {
                 FS_AI_MODEL_DIRECT_ACTIONS
                     .iter()
@@ -8599,23 +8602,23 @@ impl App {
             })
             .flatten();
         let key_u_alt = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsAiModelReset);
         let key_u_shift = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsAiModelPrev);
         let key_u = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsAiModelNext);
         // N キー: AI デノイズサイクル
         let key_n = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsDenoiseCycle);
         // T / Shift+T / Alt+T: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
         // P はグリッド / 動画フルスクリーンのピン留めに統一する。F は動画の FPS/Perf 表示に
         // 使っているため、ポストフィルタは T (Tone / posT filter) に割り当てる。
         // 同様に Alt+T → Shift+T → T の順で consume (matches_logically 対策)。
-        let post_filter_direct = (!current_item_is_video && !current_item_is_audio)
+        let post_filter_direct = (!current_item_is_video && !fs_music_view_active)
             .then(|| {
                 FS_POST_FILTER_DIRECT_ACTIONS
                     .iter()
@@ -8625,22 +8628,22 @@ impl App {
             })
             .flatten();
         let key_t_alt = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsPostFilterReset);
         let key_t_shift = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsPostFilterPrev);
         let key_t = !current_item_is_video
-            && !current_item_is_audio
+            && !fs_music_view_active
             && self.keymap.consume_action(ctx, KeyAction::FsPostFilterNext);
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
         // 補正スロットは画像編集操作。音声では consume しない (index-keyed page override が
         // 音声 idx に書かれるのを防ぐ、Codex P2)。
-        let slot_keys: [bool; 10] = if current_item_is_audio {
+        let slot_keys: [bool; 10] = if fs_music_view_active {
             [false; 10]
         } else {
             [
@@ -8660,7 +8663,7 @@ impl App {
         // Ctrl+Backspace / Q: 現在ページの個別補正設定を解除 (標準値に戻す)
         // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
         let clear_page_key =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsClearAdjust);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsClearAdjust);
 
         // 表示モード切替 + フィードバック表示
         let new_spread = if key_1 {
@@ -8961,7 +8964,7 @@ impl App {
         // 見開き / 動画 / モーダル状態は `enter_conceal_mode` 側で適切に分岐する。
         // (Conceal モード中の Ctrl+M / Esc は本関数冒頭の早期 return で処理済み。)
         let key_ctrl_m =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
         if key_ctrl_m
             && !self.analysis_mode
             && !self.adjustment_mode
@@ -8980,7 +8983,7 @@ impl App {
         // Ctrl+T: テキスト注釈モード入場 (分析・補正・消しゴム・隠蔽・動画中は無効)。
         // テキストモード中の Ctrl+T / Esc は本関数冒頭の早期 return で処理済み。
         let key_ctrl_t =
-            !current_item_is_audio && self.keymap.consume_action(ctx, KeyAction::FsTextMode);
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsTextMode);
         if key_ctrl_t
             && !self.analysis_mode
             && !self.adjustment_mode
@@ -9490,7 +9493,7 @@ impl App {
             self.adjustment_mode = false;
         } else if self
             .fullscreen_idx
-            .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Audio(_))))
+            .is_some_and(|idx| self.fs_music_view_active(idx))
         {
             // 音楽ビュー: 画面端ホバーで画像用の補正パネルを開かない。パネル描画自体は
             // 抑制済みだが、adjustment_mode フラグを立てると画像に戻った瞬間まで残るので
@@ -19319,6 +19322,19 @@ impl App {
         resp.clicked()
     }
 
+    /// fs_idx で「音楽ビュー」(DJ 波形タイムライン + スペクトラム + 上下バー/左右パネル) が
+    /// 表示されているか。用途 = 表示 dispatch / 画像用パネルの抑止 / 音楽ビュー用のキーゲート
+    /// (画像・動画ショートカットの consume 抑止と音楽キーの有効化)。
+    ///
+    /// 現状は音声ファイル (`GridItem::Audio`) のみ。Inc 7 (動画→音声モード) で、この idx が
+    /// 音声モードにトグルされた動画 (`video_audio_mode == Some(fs_idx)`) も含めるよう拡張する。
+    /// その拡張を 1 箇所に閉じ込めるため、「音楽ビューが出ているか」を意味する判定はすべて
+    /// この述語を通す (3 概念分離: これは表示/ゲート、[`Self::fs_music_source_for_idx`] は
+    /// 解析ソース、`GridItem::Audio` 直判定はファイル種別/ナビ/永続 semantics のまま残す)。
+    pub(crate) fn fs_music_view_active(&self, fs_idx: usize) -> bool {
+        matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
+    }
+
     /// 音声フルスクリーンの音楽ビュー (Inc 3a: 最小構成)。
     ///
     /// headless `VideoPlayer` が音声を再生し、ここでは egui で「音楽アイコン + ファイル名 +
@@ -19343,8 +19359,9 @@ impl App {
         // 音楽ビューを開いている間はタイムライン解析を確実に走らせ、結果を取り込む (Inc 3b)。
         // ブックマーク (Inc 5) も現在ファイル用にロードしておく (左パネルが閉じていても
         // シークバーのマーカー表示に使う)。
-        if let Some(GridItem::Audio(p)) = self.items.get(fs_idx) {
-            let p = p.clone();
+        // 解析 / ブックマークの対象は「音源」パス経由で取る (fs_music_source_for_idx)。音声ファイルは
+        // 自身のパス、Inc 7 の動画→音声モードでは動画ファイルのパスを返す (その音声トラックを解析)。
+        if let Some(p) = self.fs_music_source_for_idx(fs_idx) {
             // LRU キー用の (mtime, size)。フォルダスキャンで image_metas に入っている。
             let meta = self.image_metas.get(fs_idx).copied().flatten();
             self.ensure_music_analysis(&p, meta);
