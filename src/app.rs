@@ -845,7 +845,7 @@ impl StartupInitPending {
 ///
 /// `rx` は worker の完了通知、`progress` は `add_plugin` 中の表示テキスト、
 /// `started_at` は完了ログ用の所要時間計測に使う。`Some` の間は動画 open だけを
-/// `vst3_deferred_video_open` で保留し、画像閲覧や通常 UI は先に進める。
+/// `vst3_deferred_media_open` で保留し、画像閲覧や通常 UI は先に進める。
 #[cfg(windows)]
 pub(crate) struct Vst3StartupLoadPending {
     rx: mpsc::Receiver<()>,
@@ -5493,6 +5493,10 @@ pub struct App {
     /// 戻る (音声は無中断)。詳細は docs/music-integration-plan.md §5.9。
     #[cfg(windows)]
     pub(crate) music_vst_shell: Option<MusicVstShell>,
+    /// 音楽ビュー上バーの閉じる× ボタンが押されたフラグ。描画中に close_fullscreen を直呼び
+    /// すると fs_cache clear で stale 参照になるため、draw_fs_music_view の後で close_fs に
+    /// 合流させて遅延処理する (動画の close_requested と同じ遅延パターン)。
+    pub(crate) music_view_close_requested: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -6226,7 +6230,7 @@ pub struct App {
     pub(crate) vst3_startup_load: Option<Vst3StartupLoadPending>,
     /// VST3 起動ロードが終わるまで動画開始を保留している fullscreen idx。
     #[cfg(windows)]
-    pub(crate) vst3_deferred_video_open: Option<usize>,
+    pub(crate) vst3_deferred_media_open: Option<usize>,
     /// 直前フレームでフルスクリーンモードだったか (= TOPMOST 切替検出用)。
     /// 状態が遷移したら `dsp_bridge.set_all_guis_topmost` を呼んでプラグイン GUI の
     /// z-order を調整する (= 動画再生中だけ手前)。
@@ -7317,6 +7321,7 @@ impl App {
             music_bulk_bookmark_dialog: None,
             #[cfg(windows)]
             music_vst_shell: None,
+            music_view_close_requested: false,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -7555,7 +7560,7 @@ impl App {
             #[cfg(windows)]
             vst3_startup_load: None,
             #[cfg(windows)]
-            vst3_deferred_video_open: None,
+            vst3_deferred_media_open: None,
             #[cfg(windows)]
             vst3_was_fullscreen: false,
             #[cfg(windows)]
@@ -11020,14 +11025,18 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn resume_deferred_vst3_video_open(&mut self, ctx: &egui::Context) {
-        if let Some(idx) = self.vst3_deferred_video_open.take() {
+    pub(crate) fn resume_deferred_vst3_media_open(&mut self, ctx: &egui::Context) {
+        if let Some(idx) = self.vst3_deferred_media_open.take() {
+            // 動画 / 音声どちらの遅延 open も再開する (start_fs_load が種別を分岐)。
             if self.fullscreen_idx == Some(idx)
-                && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                && matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                )
                 && !self.fs_cache.contains_key(&idx)
             {
                 crate::logger::log(format!(
-                    "[VST3 startup] deferred video open resumes idx={idx}"
+                    "[VST3 startup] deferred media open resumes idx={idx}"
                 ));
                 self.start_fs_load(idx);
                 ctx.request_repaint();
@@ -11047,7 +11056,7 @@ impl App {
                     pending.elapsed_ms()
                 ));
                 self.vst3_startup_load = None;
-                self.resume_deferred_vst3_video_open(ctx);
+                self.resume_deferred_vst3_media_open(ctx);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -11055,7 +11064,7 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => {
                 crate::logger::log("[VST3 startup] background load worker disconnected");
                 self.vst3_startup_load = None;
-                self.resume_deferred_vst3_video_open(ctx);
+                self.resume_deferred_vst3_media_open(ctx);
             }
         }
     }
@@ -25810,8 +25819,8 @@ impl App {
             self.prepare_detached_image_windows_for_open(idx);
         }
         #[cfg(windows)]
-        if self.vst3_deferred_video_open.is_some() && self.vst3_deferred_video_open != Some(idx) {
-            self.vst3_deferred_video_open = None;
+        if self.vst3_deferred_media_open.is_some() && self.vst3_deferred_media_open != Some(idx) {
+            self.vst3_deferred_media_open = None;
         }
         // フルスクリーン側ではページ単位 (= 1 ファイル/1 ページ) 操作中心になるため、
         // グリッド側で積み上げた Undo は破棄する。フルスクリーン中の操作は新しい
@@ -25982,7 +25991,7 @@ impl App {
                     self.fs_video_open_ignore_resume_once = false;
                     #[cfg(windows)]
                     {
-                        self.vst3_deferred_video_open = None;
+                        self.vst3_deferred_media_open = None;
                     }
                     if video_ignore_resume_once {
                         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
@@ -26019,7 +26028,7 @@ impl App {
                             "[VST3 startup] defer video open idx={idx} until background load completes"
                         ));
                         self.fs_open_intent_from_grid = grid_open_intent;
-                        self.vst3_deferred_video_open = Some(idx);
+                        self.vst3_deferred_media_open = Some(idx);
                         return;
                     }
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
@@ -26042,6 +26051,20 @@ impl App {
                     self.init_normalize_state_for_opened_video(idx);
                     crate::logger::log(format!("  audio cache hit idx={idx} → resume playback"));
                 } else {
+                    // 起動時 VST3 チェーンロード中に音声を再生開始すると、まだ不安定な
+                    // (add_plugin のリセットで in/out ring drain 中の) チェーンに pump が小ブロックを
+                    // push → process_block が 100ms timeout、3 回連続で VST3 チェーンが auto-disable
+                    // され、動画 VST まで巻き添えでセッション全体死ぬ (実害 2026-07-04)。動画 open と
+                    // 同じくロード完了まで遅延する (Inc 6 ① で音声が VST を通るようになって顕在化)。
+                    #[cfg(windows)]
+                    if self.vst3_startup_load_pending() {
+                        crate::logger::log(format!(
+                            "[VST3 startup] defer audio open idx={idx} until background load completes"
+                        ));
+                        self.fs_open_intent_from_grid = grid_open_intent;
+                        self.vst3_deferred_media_open = Some(idx);
+                        return;
+                    }
                     crate::logger::log(format!("  audio idx={idx} → start music view playback"));
                     // open_fullscreen 冒頭で take した grid/nav ワンショットを start_fs_load の
                     // 音声分岐が再度 take するので、動画分岐 (25987) と同じく戻してから呼ぶ。
@@ -31918,7 +31941,7 @@ impl App {
             self.fs_viewport_virtual_desktop_synced_hwnd = 0;
             self.clear_detached_viewer_borderless_fullscreen_state();
         }
-        self.vst3_deferred_video_open = None;
+        self.vst3_deferred_media_open = None;
         self.native_video_front_synced_hwnd = 0;
         self.native_video_front_last_raise = None;
         self.native_video_front_recover_after_external_foreground = false;

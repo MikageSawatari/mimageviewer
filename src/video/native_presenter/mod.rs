@@ -340,6 +340,9 @@ struct NativeEguiOverlay {
     video_continuous_mode: crate::video::VideoContinuousMode,
     video_checked: bool,
     vst3_available: bool,
+    /// 音声のみ native シェル (music Inc 6 ②)。上バーで動画専用ボタン (タイル一覧 / Perf
+    /// グラフ) を出さず、音楽ビューと同じ VST・フルスクリーン切替・閉じるだけにする。
+    audio_only: bool,
     vst3_panel: Option<NativeOverlayVst3Panel>,
     first_frame_presented: bool,
     video_error: Option<String>,
@@ -3144,6 +3147,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_audio_only(&mut self, audio_only: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_audio_only(audio_only);
+        }
+    }
+
     pub fn set_overlay_vst3_panel(&mut self, panel: Option<NativeOverlayVst3Panel>) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_vst3_panel(panel);
@@ -3878,6 +3887,7 @@ impl NativeEguiOverlay {
             video_continuous_mode: crate::video::VideoContinuousMode::Off,
             video_checked: false,
             vst3_available: false,
+            audio_only: false,
             vst3_panel: None,
             first_frame_presented: false,
             video_error: None,
@@ -4525,6 +4535,14 @@ impl NativeEguiOverlay {
             self.vst3_panel = None;
             self.last_emitted_vst3_panel_pos = None;
         }
+        self.dirty = true;
+    }
+
+    fn set_audio_only(&mut self, audio_only: bool) {
+        if self.audio_only == audio_only {
+            return;
+        }
+        self.audio_only = audio_only;
         self.dirty = true;
     }
 
@@ -5733,6 +5751,7 @@ impl NativeEguiOverlay {
             .collect();
         let perf_visible = self.perf_visible;
         let vst3_available = self.vst3_available;
+        let audio_only = self.audio_only;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let perf_latest = self.perf_latest;
         let perf_history: Vec<_> = self.perf_history.iter().copied().collect();
@@ -6026,6 +6045,7 @@ impl NativeEguiOverlay {
                     perf_visible,
                     vst3_available,
                     vst3_panel_visible,
+                    audio_only,
                     &mut commands,
                 );
             }

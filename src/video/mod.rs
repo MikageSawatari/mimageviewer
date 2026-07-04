@@ -1908,6 +1908,7 @@ fn run_native_video_output(
     }
     let run_started = Instant::now();
     presenter.set_overlay_vst3_available(config.vst3_available);
+    presenter.set_overlay_audio_only(config.audio_only);
     presenter.set_overlay_checked(config.checked);
     presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
     if config.initial_tile_overlay {

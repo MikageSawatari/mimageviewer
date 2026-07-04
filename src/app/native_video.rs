@@ -2265,9 +2265,25 @@ impl App {
         {
             use crate::video::NativeVideoOutputEvent as Ev;
             use crate::video::native_window::NativeVideoWindowEvent as WinEv;
-            let leave = matches!(event, Ev::CloseFullscreen { .. } | Ev::ToggleVst3Gui)
-                || matches!(&event, Ev::Window(w) if matches!(w, WinEv::CloseRequested { .. }));
-            if leave {
+            // フルスクリーン / ウィンドウ 切替ボタン: 動画と同じく「ウィンドウモードに切替 +
+            // VST モードを抜ける」。シェルを抜けて egui 音楽ビューへ戻り、ウィンドウ表示に切替える。
+            if matches!(event, Ev::ToggleWindowMode) {
+                self.exit_music_vst_shell();
+                self.toggle_still_window_mode();
+                ctx.request_repaint();
+                return;
+            }
+            // × / native close: 動画と同じくフルスクリーンを閉じて一覧へ戻る (VST ボタンは
+            // 「VST モードを抜けて音楽ビューへ戻る」で役割分担。× は完全に閉じる)。
+            if matches!(event, Ev::CloseFullscreen { .. })
+                || matches!(&event, Ev::Window(w) if matches!(w, WinEv::CloseRequested { .. }))
+            {
+                self.close_fullscreen();
+                ctx.request_repaint();
+                return;
+            }
+            // VST ボタン: VST モードを抜けて音楽ビューへ戻る (フルスクリーンは維持)。
+            if matches!(event, Ev::ToggleVst3Gui) {
                 self.exit_music_vst_shell();
                 ctx.request_repaint();
                 return;

@@ -5394,6 +5394,11 @@ impl App {
                                         // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
                                         // 比較/回転経路はスキップする。
                                         self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
+                                        // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
+                                        // ここで close_fs に合流させる (動画の close_requested と同じ)。
+                                        if std::mem::take(&mut self.music_view_close_requested) {
+                                            close_fs = true;
+                                        }
                                         self.fs_spread_layout = None;
                                     } else if panorama_painted {
                                         self.fs_spread_layout = None;
@@ -6753,7 +6758,7 @@ impl App {
             !is_video && !is_separator && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
         #[cfg(windows)]
         let vst3_waiting_for_video = is_video
-            && self.vst3_deferred_video_open == Some(fs_idx)
+            && self.vst3_deferred_media_open == Some(fs_idx)
             && self.vst3_startup_load.is_some();
         #[cfg(not(windows))]
         let vst3_waiting_for_video = false;
@@ -19347,20 +19352,28 @@ impl App {
         }
         self.poll_music_analysis(ctx);
 
-        let (pos, dur, playing, err) = match self.fs_cache.get(&fs_idx) {
+        let (pos, dur, playing, err, info_title) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => (
                 player.position().max(0.0),
                 player.duration().max(0.0),
                 player.is_playing(),
                 player.error().map(|s| s.to_string()),
+                // 上バーのタイトルは動画 native 上バーと同じく埋め込みメタデータのタイトル
+                // (info.title) を優先する (拡張子 / [動画ID] 付きの生ファイル名ではなく)。
+                player
+                    .info()
+                    .and_then(|i| i.title.clone())
+                    .filter(|t| !t.trim().is_empty()),
             ),
-            _ => (0.0, 0.0, false, None),
+            _ => (0.0, 0.0, false, None, None),
         };
-        let name = self
-            .items
-            .get(fs_idx)
-            .map(|it| it.name().to_string())
-            .unwrap_or_default();
+        // info.title が無ければファイル名にフォールバック (動画 native 上バーと同じ優先順)。
+        let name = info_title.unwrap_or_else(|| {
+            self.items
+                .get(fs_idx)
+                .map(|it| it.name().to_string())
+                .unwrap_or_default()
+        });
 
         let fg = if dark {
             egui::Color32::from_gray(220)
@@ -19397,7 +19410,9 @@ impl App {
         // 上バー (常時) / 中央 (timeline + spectrum、全幅・縮小しない) / 下 HUD (常時、
         // seek 行 + コントロール行)。左右パネルは端ホバーでオーバーレイ表示し、**中央は
         // 縮小しない** (動画のジャンプ/メタパネルと同じ。ピン/トグルボタンは持たない)。
-        let top_h = 34.0;
+        // 上バー高さは動画 native 上バー (draw_top_bar_background = 54px) に合わせる。これで
+        // 音楽ビューと VST 画面 (native シェル) でボタン / タイトルの縦位置が揃う (ユーザー要望)。
+        let top_h = 54.0;
         let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
         let hud_top = rect.bottom() - hud_h;
         let panel_band_top = rect.top() + top_h;
@@ -19699,25 +19714,119 @@ impl App {
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, if dark { 90 } else { 30 }),
         );
+        // 動画 native 上バーの title (x=14, y=20, 15px) に位置・サイズを合わせる。
         painter.text(
-            top_rect.left_center() + egui::vec2(12.0, 0.0),
+            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
             egui::Align2::LEFT_CENTER,
             &name,
-            egui::FontId::proportional(14.0),
+            egui::FontId::proportional(15.0),
             fg,
         );
 
-        // Row 秒数切替 (タイムライン表示中のみ、上バー中央)。− / [Row 30s] / + のステッパー。
+        // 上バー右クラスタ (動画上バーと同じ配置): 右から 閉じる× → フルスクリーン切替 → VST。
+        // native シェル (VST 画面) の上バーと同じ x 位置・同じアイコン (native の描画関数を共有)
+        // にして、同じ場所で VST を on/off できるようにする (ユーザー要望)。幾何は native の
+        // draw_native_top_bar と揃える (28px, gap 8px, 右端 -12px)。Row ステッパーは VST の左に
+        // 右詰めで並べる (下記)。
+        use crate::video::native_presenter::overlay_draw::{
+            draw_overlay_close_icon, draw_overlay_vst3_top_icon, draw_overlay_window_toggle_icon,
+        };
+        const TOP_BTN: f32 = 28.0;
+        const TOP_BTN_GAP: f32 = 8.0;
+        let top_btn_cy = top_rect.center().y;
+        let top_btn_bg = |hovered: bool| {
+            if hovered {
+                accent
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+            }
+        };
+        let mut top_rx = top_rect.right() - 12.0;
+        // 閉じる × (最右)
+        let close_rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
+            egui::vec2(TOP_BTN, TOP_BTN),
+        );
+        top_rx -= TOP_BTN + TOP_BTN_GAP;
+        let close_resp = ui
+            .interact(
+                close_rect,
+                ui.id().with(("music_top_close", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark("閉じる".to_string());
+        painter.rect_filled(close_rect, 4.0, top_btn_bg(close_resp.hovered()));
+        draw_overlay_close_icon(&painter, close_rect);
+        // フルスクリーン / ウィンドウ 切り替え
+        let win_rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
+            egui::vec2(TOP_BTN, TOP_BTN),
+        );
+        top_rx -= TOP_BTN + TOP_BTN_GAP;
+        let win_resp = ui
+            .interact(
+                win_rect,
+                ui.id().with(("music_top_window", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
+        painter.rect_filled(win_rect, 4.0, top_btn_bg(win_resp.hovered()));
+        draw_overlay_window_toggle_icon(&painter, win_rect);
+        // VST (windows + vst3 有効 + フルスクリーン表示時のみ)。VST native シェルはフルスクリーン
+        // borderless 前提なので、ウィンドウモードでは動画と同じくボタン自体を出さない (ユーザー
+        // 要望)。VST 画面 (native シェル) でも同じ位置に VST ボタンが出るので同じ場所で on/off できる。
+        #[cfg(windows)]
+        let (vst_left, vst_clicked) = if self.settings.vst3_enabled
+            && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+        {
+            let vst_rect = egui::Rect::from_center_size(
+                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            let vst_resp = ui
+                .interact(
+                    vst_rect,
+                    ui.id().with(("music_top_vst", fs_idx)),
+                    egui::Sense::click(),
+                )
+                .hover_tip_dark("VST プラグイン画面を開く".to_string());
+            painter.rect_filled(vst_rect, 4.0, top_btn_bg(vst_resp.hovered()));
+            draw_overlay_vst3_top_icon(&painter, vst_rect);
+            (top_rx, vst_resp.clicked())
+        } else {
+            (top_rx, false)
+        };
+        #[cfg(not(windows))]
+        let vst_left = top_rx;
+        // クリック適用 (描画後・borrow 分離)。閉じるは描画中の close_fullscreen 直呼びを避け、
+        // 遅延フラグ経由で draw_fs_music_view 後に close_fs へ合流させる。
+        if close_resp.clicked() {
+            self.music_view_close_requested = true;
+        }
+        if win_resp.clicked() {
+            self.toggle_still_window_mode();
+        }
+        #[cfg(windows)]
+        if vst_clicked {
+            self.enter_music_vst_shell(ctx, fs_idx);
+        }
+
+        // Row 秒数切替 (タイムライン表示中のみ、上バー右詰め = VST ボタンの左)。− / [Row 30s] / +
+        // のステッパー。
         // − で 1 行あたりの秒数を短く (横に詳細)、+ で長くする。row_secs が変わると
         // texture_key が変わり raster cache が自動で作り直される。グリフはフォント非依存に
         // painter で線を引く (絵文字 tofu 回避、CLAUDE.md グリフポリシー)。
         if show_timeline {
             let row_secs = self.music_timeline_row_secs;
-            let btn = top_h - 12.0;
+            let btn = 26.0;
             let gap = 6.0;
             let label_w = 84.0;
             let group_w = btn * 2.0 + gap * 2.0 + label_w;
-            let cx = top_rect.center().x;
+            // 右詰め: ステッパーグループを VST ボタンの左に置く。ただし VST との間はボタン
+            // 1 個分 (約 28px) 空けて、− Row 30s ＋ が 1 つのまとまりに見えるようにする
+            // (ユーザー要望。vst_left は VST 左端 − 8px なので、あと 20px 引くと計 28px)。
+            let cx = vst_left - 20.0 - group_w * 0.5;
             let cy = top_rect.center().y;
             let minus_rect = egui::Rect::from_center_size(
                 egui::pos2(cx - group_w * 0.5 + btn * 0.5, cy),
@@ -19782,11 +19891,13 @@ impl App {
                 ],
                 egui::Stroke::new(2.0, fg),
             );
-            if minus_resp.clicked() {
+            // ＋ = ズーム (1 行あたりの秒数を短く: 30s→15s→10s、波形が横に広がる)、
+            // − = 縮小 (秒数を長く: 30s→60s→120s)。ユーザー要望で +/− の向きを直感に合わせる。
+            if plus_resp.clicked() {
                 self.music_timeline_row_secs =
                     crate::ui_music_timeline::step_row_secs(row_secs, -1);
             }
-            if plus_resp.clicked() {
+            if minus_resp.clicked() {
                 self.music_timeline_row_secs = crate::ui_music_timeline::step_row_secs(row_secs, 1);
             }
         }

@@ -1733,7 +1733,7 @@ pub(super) fn draw_overlay_perf_graph_icon(painter: &egui::Painter, rect: egui::
     ));
 }
 
-pub(super) fn draw_overlay_vst3_top_icon(painter: &egui::Painter, rect: egui::Rect) {
+pub(crate) fn draw_overlay_vst3_top_icon(painter: &egui::Painter, rect: egui::Rect) {
     // 3 文字を等幅・gap 固定で並べることで proportional font 風の重なりを回避する。
     // 旧実装は V/S/T それぞれ独立座標だったため stroke 込みで S と T が重なっていた。
     let color = egui::Color32::from_rgb(238, 238, 238);
@@ -1776,7 +1776,7 @@ pub(super) fn draw_overlay_vst3_top_icon(painter: &egui::Painter, rect: egui::Re
     painter.line_segment([egui::pos2(t_xc, top), egui::pos2(t_xc, bot)], stroke);
 }
 
-pub(super) fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect) {
+pub(crate) fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect) {
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.26;
     let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(242, 242, 242));
@@ -1786,7 +1786,7 @@ pub(super) fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect)
 
 /// ウィンドウ / 全画面 切り替えボタンのアイコン。タイトルバー付きの矩形 (= 一般的な
 /// 「ウィンドウ」表現) を線で描く。トグルなので状態非依存の固定アイコン。
-pub(super) fn draw_overlay_window_toggle_icon(painter: &egui::Painter, rect: egui::Rect) {
+pub(crate) fn draw_overlay_window_toggle_icon(painter: &egui::Painter, rect: egui::Rect) {
     let c = rect.center();
     let s = rect.width().min(rect.height()) * 0.30;
     let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(242, 242, 242));
@@ -2635,6 +2635,9 @@ pub(super) fn draw_native_top_bar(
     perf_visible: bool,
     vst3_available: bool,
     vst3_panel_visible: bool,
+    // 音声のみ native シェル (music Inc 6 ②): タイル一覧 / Perf グラフ (動画専用) を出さず、
+    // 音楽ビュー上バーと同じ VST・フルスクリーン切替・閉じるだけにする。
+    audio_only: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_top_bar"))
@@ -2665,7 +2668,11 @@ pub(super) fn draw_native_top_bar(
                         fallback
                     }
                 });
-            let sub = if let Some(m) = metadata {
+            // 音声のみ native シェル (music Inc 6 ②): 2 行目は動画専用情報 (解像度 / fps /
+            // コーデック) で音声には無意味なので出さない (ユーザー要望、音楽ビュー上バーと揃える)。
+            let sub = if audio_only {
+                String::new()
+            } else if let Some(m) = metadata {
                 format!(
                     "{}x{}  {}  {}  {}",
                     m.width,
@@ -2722,42 +2729,46 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );
-            draw_native_top_button(
-                ui,
-                &painter,
-                &mut x,
-                y,
-                btn_size,
-                btn_size,
-                gap,
-                "native_top_tile",
-                NativeTopButtonGlyph::TileGrid,
-                false,
-                &native_label_with_shortcut(
-                    "サムネイル一覧",
-                    shortcuts.and_then(|s| s.tile_mode.as_deref()),
-                ),
-                NativeOverlayCommand::ToggleTileMode,
-                commands,
-            );
-            draw_native_top_button(
-                ui,
-                &painter,
-                &mut x,
-                y,
-                btn_size,
-                btn_size,
-                gap,
-                "native_top_perf",
-                NativeTopButtonGlyph::PerfGraph,
-                perf_visible,
-                &native_label_with_shortcut(
-                    "Perfグラフ",
-                    shortcuts.and_then(|s| s.perf_overlay.as_deref()),
-                ),
-                NativeOverlayCommand::TogglePerfOverlay,
-                commands,
-            );
+            // タイル一覧 / Perf グラフは動画専用。音声のみ native シェルでは出さない
+            // (music Inc 6 ②、音楽ビュー上バーと内容を揃える)。
+            if !audio_only {
+                draw_native_top_button(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_tile",
+                    NativeTopButtonGlyph::TileGrid,
+                    false,
+                    &native_label_with_shortcut(
+                        "サムネイル一覧",
+                        shortcuts.and_then(|s| s.tile_mode.as_deref()),
+                    ),
+                    NativeOverlayCommand::ToggleTileMode,
+                    commands,
+                );
+                draw_native_top_button(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_perf",
+                    NativeTopButtonGlyph::PerfGraph,
+                    perf_visible,
+                    &native_label_with_shortcut(
+                        "Perfグラフ",
+                        shortcuts.and_then(|s| s.perf_overlay.as_deref()),
+                    ),
+                    NativeOverlayCommand::TogglePerfOverlay,
+                    commands,
+                );
+            }
             if vst3_available {
                 draw_native_top_button(
                     ui,
