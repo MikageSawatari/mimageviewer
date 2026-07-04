@@ -545,9 +545,16 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
   - **7-③④** ✅（2026-07-04）: 下 HUD（シークバー色 / ボタン寸法 / dB ラベル色 / 再生時間位置）と右パネル幅を
     動画 native HUD に揃えた（§5.7 の ③④ 注記が正本、§5.8 HUD 共有の続き）。build + test 3136 green +
     Codex レビュー（P3 = 右パネル幅クランプ修正、P2 = 狭幅 overlap は §5.8 の no-compaction 方針で許容）。実機確認待ち。
+  - **7-navfix** ✅（2026-07-05）: 音声モード中の file-nav（前後ファイル）が回帰していたのを修正。前後ファイル
+    ボタン（③④で追加）とキーボード ↑↓ はどちらも `open_fullscreen_from_fs_navigation` を通るが、そこの既定
+    fast-swap が keep_audio_mode=false で hidden presenter の source だけ差し替え、音声だけ次へ進んで映像が
+    前フレームで固着していた。同経路に音声モード判定を追加し、音声モード中に隣の**動画**へ移るときは 7-eof と
+    同じ keep_audio_mode source-swap（`source_swap_keep_audio_mode` + `try_start_native_video_fast_swap(Some(true),
+    true)`）で音声モードのまま継続。非動画へ移るときは `open_fullscreen` が video_audio_mode=None にして通常表示。
+    Codex レビュー指摘なし・test 3136 green・実機 OK。これで 7e の「file nav」は解消。
   - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、DetachedWindow(F12) の
-    音声モード対応 / close from audio mode / file nav / long video の memory・audio 継続の smoke。① seek 音切れ
-    は 7-hidden で、連続再生 EOF は 7-eof で解消済み）。
+    音声モード対応 / close from audio mode / long video の memory・audio 継続の smoke。① seek 音切れは 7-hidden、
+    連続再生 EOF は 7-eof、file nav は 7-navfix で解消済み）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

@@ -10279,6 +10279,31 @@ impl App {
 
         self.sync_main_selection_from_viewer_idx(idx);
 
+        // 動画→音声モード (Inc 7): 音声モードのまま隣の動画へ file-nav (前後ファイルボタン /
+        // キーボード ↑↓) したときは、hidden presenter を音声モードのまま source-swap で再利用する
+        // (7-eof = handle_video_audio_mode_continuous_eof と同じ経路)。これを入れないと、下の通常
+        // fast-swap が keep_audio_mode=false で presenter を hidden のまま source だけ差し替え、
+        // 音声だけ次へ進んで映像が前フレームで固着する (回帰バグ 2026-07-05)。target が動画のときのみ。
+        // 非動画へ移るときは下へフォールスルーし、`open_fullscreen` が video_audio_mode=None にして
+        // 通常表示に戻す。ボタン (`music_navigate_file`) とキーボード ↑↓ の両経路がここを通る。
+        #[cfg(windows)]
+        if self.video_audio_mode.is_some()
+            && self.video_audio_mode == self.fullscreen_idx
+            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+        {
+            self.source_swap_keep_audio_mode = true;
+            let started = self.try_start_native_video_fast_swap(ctx, idx, Some(true), true);
+            self.source_swap_keep_audio_mode = false;
+            if started {
+                return;
+            }
+            // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
+            let cursor_state = self.fullscreen_cursor_state();
+            self.open_fullscreen(idx);
+            self.restore_fullscreen_cursor_state(ctx, cursor_state);
+            return;
+        }
+
         #[cfg(windows)]
         if self.try_start_video_tile_fast_swap(ctx, idx) {
             return;
