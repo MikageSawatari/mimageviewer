@@ -19759,7 +19759,8 @@ impl App {
         // draw_native_top_bar と揃える (28px, gap 8px, 右端 -12px)。Row ステッパーは VST の左に
         // 右詰めで並べる (下記)。
         use crate::video::native_presenter::overlay_draw::{
-            draw_overlay_close_icon, draw_overlay_vst3_top_icon, draw_overlay_window_toggle_icon,
+            draw_overlay_close_icon, draw_overlay_video_icon, draw_overlay_vst3_top_icon,
+            draw_overlay_window_toggle_icon,
         };
         const TOP_BTN: f32 = 28.0;
         const TOP_BTN_GAP: f32 = 8.0;
@@ -19802,11 +19803,36 @@ impl App {
             .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
         painter.rect_filled(win_rect, 4.0, top_btn_bg(win_resp.hovered()));
         draw_overlay_window_toggle_icon(&painter, win_rect);
+        // 「動画に戻る」ボタン (Inc 7): 音声モードにトグルした動画のときだけ出す。映像を再開して
+        // native presenter を re-attach する。音声ファイルでは出さない (戻る先の動画が無い)。
+        #[cfg(windows)]
+        let back_to_video_clicked = if self.video_audio_mode == Some(fs_idx) {
+            let v_rect = egui::Rect::from_center_size(
+                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            let v_resp = ui
+                .interact(
+                    v_rect,
+                    ui.id().with(("music_top_back_to_video", fs_idx)),
+                    egui::Sense::click(),
+                )
+                .hover_tip_dark("動画表示に戻る".to_string());
+            painter.rect_filled(v_rect, 4.0, top_btn_bg(v_resp.hovered()));
+            draw_overlay_video_icon(&painter, v_rect);
+            v_resp.clicked()
+        } else {
+            false
+        };
         // VST (windows + vst3 有効 + フルスクリーン表示時のみ)。VST native シェルはフルスクリーン
         // borderless 前提なので、ウィンドウモードでは動画と同じくボタン自体を出さない (ユーザー
         // 要望)。VST 画面 (native シェル) でも同じ位置に VST ボタンが出るので同じ場所で on/off できる。
+        // 音声モードにトグルした動画では VST シェル (enter_music_vst_shell) が Audio 限定で no-op に
+        // なるので出さない (7e で video-in-audio-mode の VST 対応を検討、Codex 7c note)。
         #[cfg(windows)]
         let (vst_left, vst_clicked) = if self.settings.vst3_enabled
+            && self.video_audio_mode.is_none()
             && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
         {
             let vst_rect = egui::Rect::from_center_size(
@@ -19836,6 +19862,13 @@ impl App {
         }
         if win_resp.clicked() {
             self.toggle_still_window_mode();
+        }
+        #[cfg(windows)]
+        if back_to_video_clicked {
+            // 動画表示へ戻る (Inc 7): 映像出力再開 + presenter re-attach + 現在位置 seek。
+            // VST ボタン (enter_music_vst_shell) と同じく draw 中の直呼びで OK (native attach は
+            // 次フレームから presenter が描画を引き継ぐ)。
+            self.exit_video_audio_mode(ctx, fs_idx);
         }
         #[cfg(windows)]
         if vst_clicked {

@@ -1228,6 +1228,9 @@ pub enum NativeOverlayCommand {
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
+    /// 動画 HUD の「音声モード」ボタン: 映像を切って音楽ビュー (DJ 波形 + spectrum) へ切り替える
+    /// (Inc 7、動画→音声モード)。App が `enter_video_audio_mode` を呼ぶ。音声は無中断。
+    ToggleAudioMode,
     CloseFullscreen,
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,

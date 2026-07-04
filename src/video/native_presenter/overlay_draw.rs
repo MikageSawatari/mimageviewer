@@ -1447,6 +1447,8 @@ pub(super) enum NativeTopButtonGlyph {
     Vst3,
     Close,
     WindowToggle,
+    /// 音符 (♪): 動画→音声モードのトグルボタン (Inc 7)。
+    AudioMode,
 }
 
 pub(super) fn draw_native_top_button(
@@ -1475,6 +1477,7 @@ pub(super) fn draw_native_top_button(
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
         NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
         NativeTopButtonGlyph::WindowToggle => draw_overlay_window_toggle_icon(painter, rect),
+        NativeTopButtonGlyph::AudioMode => draw_overlay_music_note_icon(painter, rect),
     }
     let resp = resp.hover_tip_dark(tooltip);
     if resp.clicked() {
@@ -1803,6 +1806,51 @@ pub(crate) fn draw_overlay_window_toggle_icon(painter: &egui::Painter, rect: egu
         ],
         stroke,
     );
+}
+
+/// 「音声モード」ボタンのアイコン: 8 分音符 (♪)。動画→音声モード (Inc 7) のトグル。
+/// フォント非依存に painter で描く (絵文字 tofu 回避、CLAUDE.md グリフポリシー)。
+pub(crate) fn draw_overlay_music_note_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let color = egui::Color32::from_rgb(242, 242, 242);
+    let stroke = egui::Stroke::new(2.0, color);
+    let c = rect.center();
+    // 符頭 (塗りつぶし円、左下)。
+    let head = egui::pos2(c.x - 3.5, c.y + 5.0);
+    painter.circle_filled(head, 3.5, color);
+    // 符幹 (符頭の右端から上へ)。
+    let stem_x = head.x + 3.0;
+    let stem_top = egui::pos2(stem_x, c.y - 7.0);
+    painter.line_segment([egui::pos2(stem_x, head.y), stem_top], stroke);
+    // 旗 (符幹の頂点から右下へ)。
+    painter.line_segment(
+        [stem_top, egui::pos2(stem_top.x + 5.0, stem_top.y + 5.5)],
+        stroke,
+    );
+}
+
+/// 「動画に戻る」ボタンのアイコン: 画面枠 + 中央の再生三角 (= 映像)。音声モード (Inc 7) の
+/// 音楽ビュー上バーから動画表示へ戻すのに使う。フォント非依存に painter で描く。
+/// (native HUD 側には「動画に戻る」概念が無く bin の音楽ビューからのみ使うので、lib 側の
+/// コピーでは未使用になる = dead_code 抑止。)
+#[allow(dead_code)]
+pub(crate) fn draw_overlay_video_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let color = egui::Color32::from_rgb(242, 242, 242);
+    let stroke = egui::Stroke::new(2.0, color);
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.30;
+    let screen = egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 1.5));
+    painter.line_segment([screen.left_top(), screen.right_top()], stroke);
+    painter.line_segment([screen.right_top(), screen.right_bottom()], stroke);
+    painter.line_segment([screen.right_bottom(), screen.left_bottom()], stroke);
+    painter.line_segment([screen.left_bottom(), screen.left_top()], stroke);
+    // 中央に小さな再生三角 (▶)。
+    let tr = s * 0.5;
+    let tri = vec![
+        egui::pos2(c.x - tr * 0.5, c.y - tr),
+        egui::pos2(c.x - tr * 0.5, c.y + tr),
+        egui::pos2(c.x + tr * 0.7, c.y),
+    ];
+    painter.add(egui::Shape::convex_polygon(tri, color, egui::Stroke::NONE));
 }
 
 pub(super) fn draw_overlay_vst3_gui_icon(
@@ -2729,9 +2777,25 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );
-            // タイル一覧 / Perf グラフは動画専用。音声のみ native シェルでは出さない
+            // タイル一覧 / Perf グラフ / 音声モードは動画専用。音声のみ native シェルでは出さない
             // (music Inc 6 ②、音楽ビュー上バーと内容を揃える)。
             if !audio_only {
+                // 音声モード (Inc 7): 映像を切って音楽ビュー (DJ 波形 + spectrum) へ。音声は無中断。
+                draw_native_top_button(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_audio_mode",
+                    NativeTopButtonGlyph::AudioMode,
+                    false,
+                    "音声モード (映像を切って波形表示)",
+                    NativeOverlayCommand::ToggleAudioMode,
+                    commands,
+                );
                 draw_native_top_button(
                     ui,
                     &painter,

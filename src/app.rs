@@ -41808,6 +41808,7 @@ impl App {
             // 打ち切る (Codex P2: terminal を handler の実挙動と一致させる)。
             let was_fullscreen = self.fullscreen_idx.is_some();
             let shell_before_event = self.music_vst_shell.is_some();
+            let audio_mode_before_event = self.video_audio_mode.is_none();
             self.handle_native_video_output_event(ctx, idx, epoch, event);
             if was_fullscreen && self.fullscreen_idx.is_none() {
                 break;
@@ -41816,6 +41817,12 @@ impl App {
             // 既に drop した native 出力由来なので、fullscreen のままでも batch を打ち切る
             // (Codex High: stale イベントが still-fullscreen の audio に動画操作を当てない)。
             if shell_before_event && self.music_vst_shell.is_none() {
+                break;
+            }
+            // 「音声モード」ボタン (Inc 7) をこのイベントで入った場合、enter_video_audio_mode が
+            // native presenter を detach したので、以降のイベントは drop した presenter 由来で
+            // stale。fullscreen のままでも batch を打ち切る (VST シェルと同じ理由、Codex 7c 設計)。
+            if audio_mode_before_event && self.video_audio_mode.is_some() {
                 break;
             }
         }

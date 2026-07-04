@@ -370,10 +370,24 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
       - **音楽 HUD の VST ボタン**は現状 `enter_music_vst_shell` が `GridItem::Audio` 限定なので、音声モードの
         動画では no-op になる。7d/7e で video-in-audio-mode も VST シェルへ入れるか、動画では隠すかを決める
         （Codex 7c code note）。
-  - **7d**: トグル配線（キー / HUD ボタン — **どちらにするかは 7d 着手時にユーザー確認**）+ 解析
-    ワーカー start/stop + 実機検証。
-  - **7e**: 仕上げ（VST 状態引き継ぎ、上記の seek 音切れ仕様 / 連続再生 EOF / F11 / close from audio
-    mode / file nav / long video の memory・audio 継続の smoke）。
+  - **7d** ✅（2026-07-04、**トグル配線・ここから挙動が起動**、ユーザー選択 = **HUD ボタン**）:
+    - **入場（動画→音声）= 動画 native HUD 上バーの音符ボタン (♪)**: `NativeTopButtonGlyph::AudioMode`
+      (`draw_overlay_music_note_icon`) を `draw_native_top_bar` の `!audio_only` ブロックに追加 →
+      `NativeOverlayCommand::ToggleAudioMode` → `NativeVideoOutputEvent::ToggleAudioMode`（2 mapping
+      site: `send_native_overlay_command` + inline drain）→ `handle_native_video_output_event` →
+      `enter_video_audio_mode`。enter が presenter を detach するので、`poll_video` の native event batch を
+      `video_audio_mode` の None→Some 遷移で打ち切る（VST シェルと同じ、stale イベント誤適用防止）。
+    - **退場（音声→動画）= 音楽ビュー上バーの動画ボタン (▶ in 画面枠)**: `draw_overlay_video_icon` を
+      `draw_music_top_bar` に追加（`video_audio_mode == Some(fs_idx)` のときだけ表示）→ `exit_video_audio_mode`
+      を draw 中に直呼び（VST ボタンと同じパターン）。音声モードの動画では VST ボタンは非表示
+      （`enter_music_vst_shell` が Audio 限定で no-op のため、7e で対応を検討）。
+    - **解析ワーカー**: enter で音楽ビューが描かれると `draw_fs_music_view` → `fs_music_source_for_idx`（動画
+      パスを返す）→ `ensure_music_analysis` が自動起動。stop は close/nav の `clear_music_view_state`。
+    - bin test 3135 緑・fmt/glyph クリーン。**⚠️ここから実機検証が必要（初の挙動起動）**: 動画再生中に
+      ♪ボタン→音声継続で波形表示 / ▶ボタン→動画復帰（seek 音切れは仕様どおり短い） / タグ・★・
+      ブックマーク・ループ・音量が音声モードで動く / long video で音声継続。
+  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、上記の seek 音切れ仕様 /
+    連続再生 EOF / F11 / close from audio mode / file nav / long video の memory・audio 継続の smoke）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

@@ -2362,6 +2362,13 @@ impl App {
                 self.toggle_native_video_vst3_gui();
                 self.mark_native_video_hud_activity(ctx);
             }
+            crate::video::NativeVideoOutputEvent::ToggleAudioMode => {
+                // 動画 HUD の「音声モード」ボタン (Inc 7): 映像を切って音楽ビューへ。enter は
+                // native presenter を detach するので、このイベントを処理した後は同バッチの残り
+                // イベントが stale になる → poll_video 側で batch を打ち切る (video_audio_mode の
+                // None→Some 遷移を検出)。fs_idx / fullscreen 前提の guard は enter 側で行う。
+                self.enter_video_audio_mode(ctx, fs_idx);
+            }
             crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
                 if !self.accept_native_video_close(fs_idx, generation, "output_close") {
                     return;
@@ -6265,9 +6272,9 @@ impl App {
     /// 一切触れないので **音声は無中断**。owner/HUD/VST GUI の後始末は presenter HWND が生きて
     /// いるうちに `exit_music_vst_shell` と同じ順序で行い、孤児 VST window を防ぐ (Codex 7c 設計)。
     ///
-    /// **7c 時点では呼び出し元が無い (dead_code)。7d でキー / HUD ボタンから配線する。**
+    /// 呼び出し元 = 動画 HUD の「音声モード」ボタン (`NativeVideoOutputEvent::ToggleAudioMode` →
+    /// `handle_native_video_output_event`、7d で配線)。
     #[cfg(windows)]
-    #[allow(dead_code)]
     pub(crate) fn enter_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_audio_mode.is_some() {
             return;
@@ -6344,9 +6351,8 @@ impl App {
     /// 途切れが起き得る (enter 側の「映像カットで音声無中断」とは非対称)。完全な無音断が要るなら
     /// video-only reprime API が要る (7d/7e の仕様確認事項、docs §5.7.1)。
     ///
-    /// **7c 時点では呼び出し元が無い (dead_code)。7d でキー / HUD ボタンから配線する。**
+    /// 呼び出し元 = 音楽ビュー上バーの「動画に戻る」ボタン (draw_music_top_bar、7d で配線)。
     #[cfg(windows)]
-    #[allow(dead_code)]
     pub(crate) fn exit_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_audio_mode != Some(fs_idx) {
             return;
