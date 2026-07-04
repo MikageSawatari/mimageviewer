@@ -303,6 +303,9 @@ fn send_audio_packet_with_video_drain(
     pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: &mut usize,
     video_pkt_tx: &Sender<VideoPacketMsg>,
+    // music「動画→音声モード」(Inc 7): audio wait 中の video drain も、demux iteration 冒頭で
+    // snapshot した停止フラグに従い、停止中は drain ではなく discard する。
+    video_output_disabled: bool,
 ) -> DemuxPacketSend {
     let wait_started = std::time::Instant::now();
     let mut last_wait_log = wait_started;
@@ -324,12 +327,13 @@ fn send_audio_packet_with_video_drain(
                 if !pending_video_packets.is_empty() {
                     let before_packets = pending_video_packets.len();
                     let before_bytes = *pending_video_packet_bytes;
-                    if !drain_pending_video_packets(
+                    if !drain_or_discard_pending_video_packets(
                         pending_video_packets,
                         pending_video_packet_bytes,
                         video_pkt_tx,
                         clock,
                         cancel,
+                        video_output_disabled,
                     ) {
                         return DemuxPacketSend::Cancelled;
                     }
@@ -1289,6 +1293,38 @@ fn drain_pending_video_packets(
     true
 }
 
+/// music「動画→音声モード」(Inc 7): pending video backlog を「映像出力停止中なら破棄、
+/// そうでなければ従来どおり drain」する共通ゲート。`video_output_disabled` は demux
+/// iteration 冒頭で 1 回だけ snapshot した bool を渡す (全 drain 経路 = loop-top /
+/// pre-packet / audio-wait timeout がこの同一 snapshot を使うので、flag が iteration
+/// 途中で立っても、その iteration の後続 drain が古い pending を video decode thread へ
+/// 流してしまう race が起きない。Codex High)。返り値 false = cancel/disconnect で
+/// 呼び出し側は 'outer break。OFF snapshot なら従来 `drain_pending_video_packets` と等価。
+fn drain_or_discard_pending_video_packets(
+    pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
+    pending_video_packet_bytes: &mut usize,
+    video_pkt_tx: &Sender<VideoPacketMsg>,
+    clock: &AvClock,
+    cancel: &AtomicBool,
+    video_output_disabled: bool,
+) -> bool {
+    if pending_video_packets.is_empty() {
+        return true;
+    }
+    if video_output_disabled {
+        pending_video_packets.clear();
+        *pending_video_packet_bytes = 0;
+        return true;
+    }
+    drain_pending_video_packets(
+        pending_video_packets,
+        pending_video_packet_bytes,
+        video_pkt_tx,
+        clock,
+        cancel,
+    )
+}
+
 /// Phase A (3-thread split): demux + video decode thread から audio decode thread に
 /// 流すメッセージ。
 ///
@@ -1452,6 +1488,15 @@ pub struct VideoDynamicState {
     /// なったら再生中ずっと latched (= プログレッシブ素材内に少数 interlaced
     /// フレームが混ざるケースの表示安定化)。
     pub interlace_detected: AtomicBool,
+    /// music「動画→音声モード」(Inc 7): true の間、demux は映像パケットを routing / spill
+    /// せず破棄する。音声パケットは通常どおり流すので audio は無中断。動画再生中に
+    /// native presenter を detach して音声モードへ切り替えると映像フレームの消費者が
+    /// 居なくなり、pending video backlog が 64MiB 上限 (`VIDEO_PACKET_OVERFLOW_MAX_BYTES`)
+    /// まで膨らんで demux が stall → audio starvation に至る。加えて隠れた映像デコードが
+    /// HW/GPU/CPU を浪費し続ける。このフラグでその両方を断つ。復帰時は false に戻して
+    /// 現在位置へ seek すると通常の Flush/keyframe 再取得経路で映像が再同期する。
+    /// 通常再生 (audio-only ファイル含む) では常に false = 挙動バイト等価。
+    pub video_output_disabled: AtomicBool,
 }
 
 pub const PRESENT_PATH_PENDING: u8 = 0;
@@ -1607,6 +1652,22 @@ mod chapter_tests {
             },
         ];
         assert_eq!(boundary_starts_from_chapters(&chs), vec![5.0]);
+    }
+
+    // music「動画→音声モード」(Inc 7、7a): 映像出力停止フラグは既定 false
+    // (= 通常再生・audio-only とも映像 routing はバイト等価) で、store/load でトグルできる。
+    #[test]
+    fn video_output_disabled_defaults_false_and_toggles() {
+        let dyn_state = VideoDynamicState::default();
+        assert!(!dyn_state.video_output_disabled.load(Ordering::Acquire));
+        dyn_state
+            .video_output_disabled
+            .store(true, Ordering::Release);
+        assert!(dyn_state.video_output_disabled.load(Ordering::Acquire));
+        dyn_state
+            .video_output_disabled
+            .store(false, Ordering::Release);
+        assert!(!dyn_state.video_output_disabled.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2732,15 +2793,26 @@ fn run_decoder(
             break;
         }
 
-        if !pending_video_packets.is_empty()
-            && !drain_pending_video_packets(
-                &mut pending_video_packets,
-                &mut pending_video_packet_bytes,
-                &video_pkt_tx,
-                &clock,
-                &cancel,
-            )
-        {
+        // music「動画→音声モード」(Inc 7): この iteration の映像出力停止状態を **1 回だけ**
+        // snapshot する。loop-top / pre-packet / audio-wait / video branch drop の全経路が
+        // この同一 snapshot を使うので、UI スレッドが iteration 途中で flag を立てても、
+        // その iteration の後続 drain が古い pending を video decode thread へ流す race が
+        // 起きない (flag 変化は次 iteration から反映)。OFF では load 1 回のみで挙動は
+        // バイト等価 (すべての gate が false になり既存経路へ落ちる)。
+        let video_output_disabled = dynamic.video_output_disabled.load(Ordering::Acquire);
+
+        // loop-top の pending drain。停止 snapshot が true なら drain せず discard する
+        // 共通ゲート経由 (drain_or_discard_*)。これで flag ON 時に古い pending が video
+        // decode thread へ流れ続ける経路と、以後 video packet が来ずに pending が残って
+        // EOF 経路 (!pending.is_empty() で sleep/continue) が回り続ける経路を断つ (Codex High)。
+        if !drain_or_discard_pending_video_packets(
+            &mut pending_video_packets,
+            &mut pending_video_packet_bytes,
+            &video_pkt_tx,
+            &clock,
+            &cancel,
+            video_output_disabled,
+        ) {
             break 'outer;
         }
         if pending_video_packets.is_empty() {
@@ -2969,16 +3041,15 @@ fn run_decoder(
             ));
         }
 
-        // 1 パケット読み込み
-        if !pending_video_packets.is_empty()
-            && !drain_pending_video_packets(
-                &mut pending_video_packets,
-                &mut pending_video_packet_bytes,
-                &video_pkt_tx,
-                &clock,
-                &cancel,
-            )
-        {
+        // 1 パケット読み込み。pending drain は Inc 7 の共通ゲート経由 (映像出力停止中は discard)。
+        if !drain_or_discard_pending_video_packets(
+            &mut pending_video_packets,
+            &mut pending_video_packet_bytes,
+            &video_pkt_tx,
+            &clock,
+            &cancel,
+            video_output_disabled,
+        ) {
             break 'outer;
         }
 
@@ -3000,6 +3071,16 @@ fn run_decoder(
                 break 'outer;
             }
             if Some(stream.index()) == video_stream_idx {
+                // music「動画→音声モード」(Inc 7): 音声モード中 (iteration 冒頭の snapshot が
+                // true) は映像パケットを routing / spill せず破棄する。demux は下の分岐で音声
+                // パケットを取り続けるので audio は無中断。pending は loop-top / pre-packet の
+                // 共通ゲートで既に空なので、ここでは新規パケットを捨てて break するだけ。
+                // OFF snapshot なら以下の既存 routing へそのまま流れる = バイト等価。
+                if video_output_disabled {
+                    // このパケットは捨て、ループ先頭で seek をチェックしてから次を読む
+                    // (video/audio 各分岐と同じ「1 パケット消費で break」カデンス)。
+                    break;
+                }
                 // Phase B: video packet は decode せず video decode thread に転送する。
                 // pre-decode preroll trim (= drop_before_secs check) と pacing logic は
                 // すべて video decode thread 側に移管。
@@ -3158,6 +3239,7 @@ fn run_decoder(
                         &mut pending_video_packets,
                         &mut pending_video_packet_bytes,
                         &video_pkt_tx,
+                        video_output_disabled,
                     ) {
                         DemuxPacketSend::Sent => {}
                         // audio decode thread が既に終了している (= disconnect)。
