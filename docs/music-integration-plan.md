@@ -390,11 +390,27 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
       が届かず pending stale 化するのを防ぐ）。(P3) **音声トラック無し動画は入場拒否**（`VideoInfo::has_audio`
       を見てトースト表示、button 側の非表示化は has_audio を native overlay metadata に流す必要があり 7e）。
       batch break / 2-mapping / mid-draw exit は Codex 確認済み（追加 generation guard 不要）。
+    - **実機 FB 第 1 弾（2026-07-04、Codex 検証済み）= 切替が動かない / 画面が消える + ウィンドウモード
+      非対応を修正**: ①**動画→音声で画面が消えて音だけ残る根本原因** = video-in-audio-mode も
+      `GridItem::Video` なので **2 つの動画 backdrop ゲートが音楽ビュー描画を skip + main HWND を cloak**
+      していた。両方に `!fs_music_view_active(fs_idx)` 例外を追加: `native_video_backdrop_target_for_fs`
+      (render_fullscreen_viewport 冒頭 early-return)/`native_video_fullscreen_active_for_main_backdrop`
+      (update ループの cloak + early-return)。これで音声ファイルと同じ経路（フルスクリーンは専用 viewport /
+      ウィンドウは embedded main ctx）で音楽ビューが描かれ、main は un-cloak される。②**ウィンドウモード対応**
+      = enter の Fullscreen 限定を撤廃し `Fullscreen | MainWindow` 許可（DetachedWindow は 7e）。exit を
+      **現在の presentation** で再 attach（`native_video_target_for_presentation(self.viewer_presentation)`、
+      ウィンドウ⇔全画面を音声モード中に切り替えても正しく復帰）。→ これで P1 が正しく解消したので **window
+      ボタンの非表示を撤回**（音声モードでも window ボタン表示）。F11 キーも `!current_is_video ||
+      fs_music_view_active` で still 経路に通し、ボタンとキーを揃える。③**byte-identical 化**（Codex 助言）:
+      viewport builder を video-in-audio-mode では still 側に / `sync_native_video_iconic_thumbnail` は None。
+      bin test 3135 緑・fmt/glyph クリーン。**⚠️再実機検証待ち**（フルスクリーン + ウィンドウ両方で ♪→波形 /
+      ▶→動画復帰 / タグ★ブックマークループ音量 / long video 音声継続）。
     - bin test 3135 緑・fmt/glyph クリーン。**⚠️ここから実機検証が必要（初の挙動起動）**: 動画再生中に
       ♪ボタン→音声継続で波形表示 / ▶ボタン→動画復帰（seek 音切れは仕様どおり短い） / タグ・★・
       ブックマーク・ループ・音量が音声モードで動く / long video で音声継続。
-  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、上記の seek 音切れ仕様 /
-    連続再生 EOF / F11 / close from audio mode / file nav / long video の memory・audio 継続の smoke）。
+  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、seek 音切れ仕様 /
+    連続再生 EOF / DetachedWindow(F12) の音声モード対応 / close from audio mode / file nav /
+    long video の memory・audio 継続の smoke）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

@@ -1584,7 +1584,11 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
+        // 音声モードにトグルした動画 (Inc 7) は音楽ビュー (egui) を描くので、動画 backdrop 扱いに
+        // しない。これを外さないと update ループが backdrop 分岐に入って main HWND を cloak したまま
+        // early-return し、音だけ残って画面が消える (実機バグ、Codex 7d 検証)。
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && !self.fs_music_view_active(fs_idx)
     }
 
     #[cfg(windows)]
@@ -1594,6 +1598,11 @@ impl App {
         };
         let source = self.fullscreen_idx.and_then(|fs_idx| {
             if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
+                return None;
+            }
+            // 音声モードにトグルした動画 (Inc 7) は音声ファイル扱いなので DWM タスクバー
+            // サムネイル (動画フレーム) を出さない (Codex 7d 検証)。
+            if self.fs_music_view_active(fs_idx) {
                 return None;
             }
             if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
@@ -6285,10 +6294,11 @@ impl App {
         {
             return;
         }
-        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
-            self.show_feedback_toast(
-                "音声モードはフルスクリーン表示中のみ利用できます".to_string(),
-            );
+        // フルスクリーン / ウィンドウ内 (MainWindow) 両方で使える (ユーザー要望: フルスクリーン限定は
+        // VST の方)。別ウィンドウ (F12 DetachedWindow) は open path 同等の detached defer が要るので
+        // 現状は未対応 (7e)。
+        if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow) {
+            self.show_feedback_toast("別ウィンドウ表示では音声モードは未対応です".to_string());
             return;
         }
         // placement switch / source-swap 進行中は presenter HWND が作り直される最中。ここで
@@ -6376,9 +6386,11 @@ impl App {
             return;
         }
         self.video_audio_mode = None;
-        // presenter config は動画オープン経路 (app.rs) と同じパラメータで組む。音声モードは
-        // フルスクリーン限定なので Fullscreen で target を取る (F11 中の音声モードは 7e 課題)。
-        let target = self.native_video_target_for_presentation(ViewerPresentation::Fullscreen);
+        // presenter config は動画オープン経路 (app.rs ~30905) と同じく **現在の presentation** で組む
+        // (フルスクリーン ⇔ ウィンドウ内を音声モード中に切り替えていても正しく復帰する、Codex 7d 検証)。
+        // 別ウィンドウ (DetachedWindow) は enter 側で拒否済みなので Fullscreen / MainWindow のみ。
+        let presentation = self.viewer_presentation;
+        let target = self.native_video_target_for_presentation(presentation);
         let config = target.and_then(|(placement, rect, owner_hwnd)| {
             let file_name = match self.items.get(fs_idx) {
                 Some(GridItem::Video(path)) => path
@@ -6392,7 +6404,8 @@ impl App {
                 owner_hwnd,
                 rect,
                 placement,
-                true, // activate_on_show (fullscreen)
+                // activate_on_show: open path と同じく非 detached は true (Fullscreen / MainWindow)。
+                true,
                 file_name,
                 self.video_perf_overlay_visible,
                 false, // initial_tile_overlay: 復帰時はタイルを出さない

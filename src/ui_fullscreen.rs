@@ -5004,9 +5004,11 @@ impl App {
                 detached_activate_on_show,
                 detached_seed_placement,
             )
-        } else if state.is_video {
+        } else if state.is_video && !self.fs_music_view_active(fs_idx) {
             self.build_fullscreen_viewport_builder()
         } else {
+            // 音声ファイルおよび音声モードにトグルした動画 (Inc 7) は still/audio 側の viewport
+            // builder に寄せる (taskbar 属性を音声ファイルと揃える、Codex 7d 検証)。
             self.build_still_fullscreen_viewport_builder()
         };
         if need_show && !embedded {
@@ -6802,7 +6804,11 @@ impl App {
 
     #[cfg(windows)]
     fn native_video_backdrop_target_for_fs(&self, fs_idx: usize) -> bool {
+        // 音声モードにトグルした動画 (Inc 7) は native presenter を detach 済みで egui 音楽ビューを
+        // 描くので、動画 backdrop 対象から外す。これを外さないと render_fullscreen_viewport が
+        // 冒頭で early-return して音楽ビューを描かず、画面が消える (実機バグ、Codex 7d 検証)。
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && !self.fs_music_view_active(fs_idx)
     }
 
     /// in-window モードで静止画 (= 非動画) フルスクリーンを表示中かどうか。
@@ -8544,7 +8550,10 @@ impl App {
         #[cfg(windows)]
         {
             let current_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-            if !current_is_video
+            // 音声モードにトグルした動画 (Inc 7) は音楽ビュー (egui) を描くので、still 経路の F11 で
+            // ウィンドウ / 全画面 を切り替える (HUD の window ボタンとキー操作を揃える、Codex 7d 検証)。
+            // 通常の動画は native presenter が F11 を native VK 経路で拾う。
+            if (!current_is_video || fs_music_view_active)
                 && self
                     .keymap
                     .consume_action_no_repeat(ctx, KeyAction::FsToggleWindowMode)
@@ -19788,30 +19797,24 @@ impl App {
             .hover_tip_dark("閉じる".to_string());
         painter.rect_filled(close_rect, 4.0, top_btn_bg(close_resp.hovered()));
         draw_overlay_close_icon(&painter, close_rect);
-        // フルスクリーン / ウィンドウ 切り替え。**音声モードにトグルした動画では隠す** (Codex 7d P1):
-        // window mode にすると exit_video_audio_mode の presenter 再生成が常に Fullscreen target に
-        // なり、アプリ状態 (in-window) と presenter (fullscreen) が不整合になる。F11/window mode の
-        // 音声モード対応は 7e。音声ファイルでは従来どおり表示 (embedded 音楽ビューのウィンドウ化)。
-        let show_window_btn = self.video_audio_mode != Some(fs_idx);
-        let win_clicked = if show_window_btn {
-            let win_rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
-                egui::vec2(TOP_BTN, TOP_BTN),
-            );
-            top_rx -= TOP_BTN + TOP_BTN_GAP;
-            let win_resp = ui
-                .interact(
-                    win_rect,
-                    ui.id().with(("music_top_window", fs_idx)),
-                    egui::Sense::click(),
-                )
-                .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
-            painter.rect_filled(win_rect, 4.0, top_btn_bg(win_resp.hovered()));
-            draw_overlay_window_toggle_icon(&painter, win_rect);
-            win_resp.clicked()
-        } else {
-            false
-        };
+        // フルスクリーン / ウィンドウ 切り替え。音声モードにトグルした動画でも表示する
+        // (exit_video_audio_mode が現在の presentation で presenter を再生成するので不整合に
+        // ならない、Codex 7d 検証)。音声ファイルでも従来どおり表示。
+        let win_rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
+            egui::vec2(TOP_BTN, TOP_BTN),
+        );
+        top_rx -= TOP_BTN + TOP_BTN_GAP;
+        let win_resp = ui
+            .interact(
+                win_rect,
+                ui.id().with(("music_top_window", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
+        painter.rect_filled(win_rect, 4.0, top_btn_bg(win_resp.hovered()));
+        draw_overlay_window_toggle_icon(&painter, win_rect);
+        let win_clicked = win_resp.clicked();
         // 「動画に戻る」ボタン (Inc 7): 音声モードにトグルした動画のときだけ出す。映像を再開して
         // native presenter を re-attach する。音声ファイルでは出さない (戻る先の動画が無い)。
         #[cfg(windows)]
