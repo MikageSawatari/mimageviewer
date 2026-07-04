@@ -5546,6 +5546,13 @@ pub struct App {
     /// フォールバックへ回す。
     #[cfg(windows)]
     pub(crate) video_audio_exit_pending: Option<VideoAudioExitPending>,
+    /// Inc 7: 音声モードの動画が連続再生 EOF で次動画へ送られるときに立てる one-shot。
+    /// `handle_video_audio_mode_continuous_eof` が `try_start_native_video_fast_swap` を呼ぶ
+    /// 直前に true にし、`defer_native_video_source_swap_until_decoder_free` が pending の
+    /// `audio_mode_after_swap` へ焼き込み + deferral 開始時から `video_audio_mode=Some(target)`
+    /// を維持する。呼び出し直後にハンドラが false へ戻す (通常ナビ経路の swap には影響させない)。
+    #[cfg(windows)]
+    pub(crate) source_swap_keep_audio_mode: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -7376,6 +7383,8 @@ impl App {
             video_audio_mode_entry_target: None,
             #[cfg(windows)]
             video_audio_exit_pending: None,
+            #[cfg(windows)]
+            source_swap_keep_audio_mode: false,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -41429,6 +41438,88 @@ impl App {
         }
     }
 
+    /// 音声モードにトグルした動画 (`video_audio_mode == Some(fs_idx)`) が連続再生 EOF に達した
+    /// ときのハンドラ (`handle_video_continuous_eof` の音声モード版、§5.7.1)。次の動画へ
+    /// **音声モードのまま**送る: hidden presenter を source-swap で再利用し、映像を出さず音声だけ
+    /// 継続する。ユーザー確定 = 音声モードは「音楽プレイヤー」的に使うので、末尾でも映像に戻さず
+    /// 次曲の音声を聴き続ける (2026-07-04)。
+    ///
+    /// source-swap は presenter を drop せず再利用するので音切れせず、`SwitchSource` は window
+    /// 可視性を変えない (presenter は hidden のまま consume-and-hold)。swap 完了時に
+    /// `poll_native_video_source_swap_pending` が `enter_video_audio_mode` を呼んで音声モード状態を
+    /// 再確立する (`audio_mode_after_swap` フラグ経由)。`open_native_video_fullscreen_from_navigation_
+    /// with_options` は fast-swap 不成立時に可視 open (open_fullscreen) へ落ちるため使わず、
+    /// `try_start_native_video_fast_swap` を直接呼び、不成立時は現在曲を先頭へ戻して継続する
+    /// (可視動画で開かない = フラッシュ / 前フレーム固着を避ける)。
+    #[cfg(windows)]
+    fn handle_video_audio_mode_continuous_eof(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seek_serial: u64,
+    ) {
+        let mode = self.video_continuous_mode;
+        if !mode.is_enabled() || self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        // 呼び出し時点で音声モードが解除されていたら (exit ボタン等) 何もしない。
+        if self.video_audio_mode != Some(fs_idx) {
+            return;
+        }
+        // 進行中の swap / placement 切替中は多重起動しない (enter_video_audio_mode と同じ保護、
+        // stale pending の混線を避ける)。
+        if self.native_video_mode_switch.is_some()
+            || self.native_video_source_swap_pending.is_some()
+            || self.native_video_fast_swap_pending.is_some()
+            || self.video_tile_swap_pending.is_some()
+        {
+            return;
+        }
+        let eof_key = (fs_idx, seek_serial);
+        if self.video_continuous_last_eof == Some(eof_key) {
+            return;
+        }
+        self.video_continuous_last_eof = Some(eof_key);
+
+        let Some(next_idx) = self.find_next_video_in_display_order(fs_idx, mode.wraps()) else {
+            self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
+            return;
+        };
+        if next_idx == fs_idx {
+            // フォルダ内に動画が 1 本だけ: 先頭へ戻して再生継続 (音声モード維持)。
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.seek(0.0);
+                player.set_playing(true);
+            }
+            return;
+        }
+
+        // 次動画へ音声モードのまま送る: source-swap で hidden presenter を再利用する。
+        self.sync_main_selection_from_viewer_idx(next_idx);
+        // presentation 維持 (現在の Fullscreen / MainWindow を次動画にも使う) は、swap 完了時の
+        // `open_fullscreen` 冒頭ガードが `fs_video_open_forced_presentation` 未セット時に
+        // 現在の `viewer_presentation` から焼き付けるので、ここでは明示設定しない
+        // (設定すると deferred swap が timeout / presenter close で `open_fullscreen` に到達
+        //  しなかったとき one-shot がリークして次の別 open に漏れる、Codex P3)。
+        // one-shot: defer が pending.audio_mode_after_swap へ焼き込み + deferral 開始時から
+        // video_audio_mode=Some(next) を維持する。呼び出し直後に必ず戻す。
+        self.source_swap_keep_audio_mode = true;
+        let swap_started = self.try_start_native_video_fast_swap(ctx, next_idx, Some(true), true);
+        self.source_swap_keep_audio_mode = false;
+        if !swap_started {
+            // source-swap を開始できない稀ケース (native 出力が取れない等)。可視動画で開くと
+            // フラッシュ / 前フレーム固着になるので、現在の音声モード動画を先頭へ戻して継続する。
+            crate::logger::log(format!(
+                "[video-audio] continuous EOF fs_idx={fs_idx}: source-swap unavailable; \
+                 restarting current in audio mode"
+            ));
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.seek(0.0);
+                player.set_playing(true);
+            }
+        }
+    }
+
     /// 現在の音声 fs_idx に対して有効なブックマーク境界秒 (区間先頭) を返す。
     /// `music_bookmarks` が **現在の再生 path 用** に読み込まれている場合のみ非空を返す。
     /// 曲切替直後に前曲のブックマークで区間ループを組んでしまう race を防ぐ (Codex 設計 P1)。
@@ -41689,8 +41780,21 @@ impl App {
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
-        // (fs_idx, seek_serial, is_audio): is_audio で映像/音声の連続再生ハンドラを振り分ける。
-        let mut continuous_eof_events: Vec<(usize, u64, bool)> = Vec::new();
+        // 連続再生 EOF の振り分け種別 (Inc 7):
+        //   - AudioFile     = 純粋な音声ファイル (`GridItem::Audio`) → 次の音声へ。
+        //   - VideoAudioMode = 音声モードにトグルした動画 (`video_audio_mode==Some(idx)`) →
+        //                      次の動画へ**音声モードのまま**送る (映像を出さない、§5.7.1)。
+        //   - Video         = 通常の動画 → 次の動画を動画表示で開く。
+        // 音声モードの動画を raw の `is_audio_file` (=false) だけで振り分けると
+        // `handle_video_continuous_eof` (可視動画で開く) に落ち、hidden presenter と衝突して
+        // 前フレーム固着する (実機バグ 2026-07-04)。
+        #[derive(Clone, Copy)]
+        enum ContinuousEofKind {
+            AudioFile,
+            VideoAudioMode,
+            Video,
+        }
+        let mut continuous_eof_events: Vec<(usize, u64, ContinuousEofKind)> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 // 音声 (映像なし動画) は headless 再生。ループ/連続の判定材料が動画と違う
@@ -41821,9 +41925,18 @@ impl App {
                     && !continuous_tile_active
                     && player.engine_state_code() == crate::video::engine::actor::state_code::EOF
                 {
-                    // 連続再生 EOF は raw の音声ファイル判定で振り分ける: 音声モードにトグルした
-                    // 動画は「次の動画へ」= 動画の連続再生を維持する (次の音声へ飛ばさない、§5.7.1)。
-                    continuous_eof_events.push((*idx, player.current_seek_serial(), is_audio_file));
+                    // 連続再生 EOF の振り分け: 音声ファイル → AudioFile、音声モードにトグルした
+                    // 動画 → VideoAudioMode (次の動画へ音声モードのまま送る、§5.7.1)、それ以外の
+                    // 動画 → Video。`is_audio_file` は raw のファイル種別、`video_audio_mode` は
+                    // このフレーム冒頭のスナップショット。
+                    let kind = if is_audio_file {
+                        ContinuousEofKind::AudioFile
+                    } else if video_audio_mode == Some(*idx) {
+                        ContinuousEofKind::VideoAudioMode
+                    } else {
+                        ContinuousEofKind::Video
+                    };
+                    continuous_eof_events.push((*idx, player.current_seek_serial(), kind));
                 }
             }
         }
@@ -41882,11 +41995,23 @@ impl App {
                 break;
             }
         }
-        for (idx, serial, is_audio) in continuous_eof_events {
-            if is_audio {
-                self.handle_music_continuous_eof(ctx, idx, serial);
-            } else {
-                self.handle_video_continuous_eof(ctx, idx, serial);
+        for (idx, serial, kind) in continuous_eof_events {
+            match kind {
+                ContinuousEofKind::AudioFile => {
+                    self.handle_music_continuous_eof(ctx, idx, serial);
+                }
+                ContinuousEofKind::VideoAudioMode => {
+                    // 音声モードの動画: 次動画も音声モードのまま開く (hidden presenter を
+                    // source-swap で再利用)。非 Windows では video_audio_mode が常に None なので
+                    // この分岐には到達しないが、コンパイルのため通常動画ハンドラへ回す。
+                    #[cfg(windows)]
+                    self.handle_video_audio_mode_continuous_eof(ctx, idx, serial);
+                    #[cfg(not(windows))]
+                    self.handle_video_continuous_eof(ctx, idx, serial);
+                }
+                ContinuousEofKind::Video => {
+                    self.handle_video_continuous_eof(ctx, idx, serial);
+                }
             }
         }
         // Phase 3: 入力イベント (= seek / ToggleLoop / pause) 反映後に CH/BM ループ境界 tick。

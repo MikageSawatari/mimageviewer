@@ -428,8 +428,26 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
       - **exit の seek は「音声も再同期する seek」= 短い音切れが起き得る**（`VideoPlayer::seek()` が
         audio buffer clear + flush を伴うため）。enter 側の「映像カットで音声無中断」とは非対称。7d/7e で
         「戻る瞬間の短い再同期ギャップを許容」か「完全無音断（= video-only reprime API が要る）」を仕様化。
-      - **連続再生 EOF**: 音声モードの動画は raw `is_audio_file=false` なので `handle_video_continuous_eof`
-        （次の動画へ）に流れる。次を音声モードで開くか、音声モード中は連続を止めるかは 7e で確定。
+      - **連続再生 EOF → ✅ 実装済み（2026-07-04、Option A = 音声モードのまま次へ）**: ユーザー確定＝
+        音声モードは「音楽プレイヤー」的に使うので、末尾でも映像に戻さず**次の動画の音声を音声モードの
+        まま継続再生**する。実装は Codex 案Z（source-swap を音声モード対応化）:
+        - 振り分けを raw `is_audio_file` から `ContinuousEofKind{AudioFile, VideoAudioMode, Video}` の
+          3 分岐へ（`poll_video`）。`video_audio_mode==Some(idx)` は専用
+          `handle_video_audio_mode_continuous_eof` へ。
+        - 専用ハンドラは次動画を `try_start_native_video_fast_swap` で source-swap（hidden presenter を
+          再利用、映像を出さない）。one-shot `source_swap_keep_audio_mode` を立て、
+          `defer_native_video_source_swap_until_decoder_free` が `pending.audio_mode_after_swap` へ焼き込み
+          + deferral 開始時から `video_audio_mode=Some(target)` を維持（音楽ビュー無切れ、Codex #5）。
+        - swap 完了時（`poll_native_video_source_swap_pending`）に `open_fullscreen` 後
+          `enter_video_audio_mode(target)` を再利用して音声モード状態を再確立（presenter は既に hidden、
+          teardown / entry_target / music_bookmarks 再ロードを 1 経路に集約）。
+        - `SwitchSource` は hidden 中に `hidden_latest_frame` を破棄（前 source の古フレームを exit-to-video
+          で present しない、Codex #4）。update branch は進行中 audio-mode intent を維持（Codex P1）、
+          exit は swap 進行中ブロック（Codex P2）、forced_presentation は completion の open_fullscreen に
+          再焼き付けを委ねてリーク回避（Codex P3）。
+        - swap 開始不可の稀ケースは可視動画で開かず現在曲を先頭へ戻して継続（フラッシュ / 固着回避）。
+        - **⚠️ 実機で「音声モード再生中に末尾→次曲がシームレスに音声モードのまま切り替わる」ことを
+          ユーザー確認待ち**（旧バグ = 前フレーム固着の解消確認）。
       - **F11 / window-mode を音声モード中に押した場合**の挙動（no-op か embedded 音楽ビュー切替か）は 7e。
         現状: `handle_video_input` が gate off + still F11 経路は `GridItem::Video` を除外するので音声モード中の
         F11 は実質 no-op、音楽上バーの window ボタン (`toggle_still_window_mode`) は動く（Codex 7c code note）。
@@ -501,9 +519,11 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
         パネルサイズが動画とズレ**（未対応 = 次の作業）: 動画を基準に音声側を寄せる（動画はリリース済み）。
         §5.8 の HUD 共有の続き。右パネルは情報の中身が違うのは可、★ ラベルとパネル幅を動画に合わせる。
   - **7-hidden** ✅（2026-07-04）: ① の hidden presenter 実装（§5.7.0 の「実装完了」注記が正本）。
-  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、連続再生 EOF / DetachedWindow(F12) の
+  - **7-eof** ✅（2026-07-04）: 連続再生 EOF の音声モード対応（Option A = 音声モードのまま次動画の音声へ、
+    Codex 案Z）。§5.7.1 の「連続再生 EOF → ✅ 実装済み」注記が正本。実機確認待ち。
+  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、DetachedWindow(F12) の
     音声モード対応 / close from audio mode / file nav / long video の memory・audio 継続の smoke。① seek 音切れ
-    は 7-hidden で解消済みなので video-only reprime 判断は不要になった）。
+    は 7-hidden で、連続再生 EOF は 7-eof で解消済み）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

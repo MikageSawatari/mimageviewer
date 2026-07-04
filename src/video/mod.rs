@@ -2499,6 +2499,15 @@ fn run_native_video_output(
                         present_retire.len(),
                     );
                     native_drain_unpresented_queue(&mut source.queue);
+                    // Inc 7 hidden presenter (Codex #4、音声モード連続再生 EOF): hidden 中の
+                    // source-swap では旧 source の hold フレームを破棄する。残すと B の first
+                    // hidden frame 到達前に「動画へ戻る」(SetWindowVisible(true)) を押したとき、
+                    // 前 source (A) の古いフレームを present してしまう。破棄後は B の hidden
+                    // first-frame が hidden_latest_frame を埋め直す。presenter_hidden=false の
+                    // 通常 source-swap には影響しない (hidden_latest_frame は常に None)。
+                    if presenter_hidden && let Some(prev) = hidden_latest_frame.take() {
+                        native_reset_unpresented_frame(prev);
+                    }
                     // present_retire の OLD source 由来エントリのうち fence が完了したものを
                     // 解放する (rapid swap で旧 slot が retire に滞留して共有出力プールを
                     // 圧迫するのを防ぐ)。fence ゲート付きなので未完コピーは解放しない (安全)。
@@ -3771,7 +3780,19 @@ fn run_native_video_output(
                     .last_displayed_pts_bits
                     .store(pts.to_bits(), Ordering::Release);
                 source.displayed_frame_seq.fetch_add(1, Ordering::Release);
-                let _ = first_presented_out.swap(true, Ordering::AcqRel);
+                let first_hidden_present_for_source =
+                    !first_presented_out.swap(true, Ordering::AcqRel);
+                // Inc 7 (音声モード連続再生 EOF): source-swap 直後は navigation preview
+                // (「プレビュー未保存 - 再生準備中...」+ 最小 HUD) が被さっている。通常 present の
+                // Ok アームは初フレーム present 時にこれの clear を予約するが、hidden 中は present を
+                // 通らないので clear されず、exit で presenter を表示した瞬間に stale な preview が
+                // 見える (実機 FB 2026-07-04: ×ボタンだけ + 「再生準備中」)。hidden では window が
+                // 隠れていて旧 source を一瞬晒す compositor pass の心配が無いので、新 source の初
+                // hold フレームで即クリアする (通常 present 経路はバイト等価: この分岐に入らない)。
+                if first_hidden_present_for_source {
+                    pending_navigation_preview_clear_at = None;
+                    presenter.set_overlay_navigation_preview(None);
+                }
                 let should_emit_first_frame_ready =
                     source.first_frame_event_last_epoch != Some(serial);
                 if should_emit_first_frame_ready {

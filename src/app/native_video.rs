@@ -144,6 +144,10 @@ pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
     pub(crate) cursor_state: crate::ui_fullscreen::FullscreenCursorState,
+    /// Inc 7: この swap 完了後に「動画→音声モード」を再確立する (音声モードの動画が連続
+    /// 再生 EOF で次動画へ送られたケース)。true なら completion の `open_fullscreen` 後に
+    /// `enter_video_audio_mode` を呼び、hidden presenter を維持したまま音楽ビューへ戻す。
+    pub(crate) audio_mode_after_swap: bool,
 }
 
 #[cfg(windows)]
@@ -721,6 +725,10 @@ impl App {
             }
         };
         let now = std::time::Instant::now();
+        // Inc 7: 音声モードの動画が連続再生 EOF で次動画へ送られた swap かどうか
+        // (`handle_video_audio_mode_continuous_eof` が直前に立てる one-shot)。true なら
+        // presenter を hidden のまま再利用し、swap 完了後に音声モードを再確立する。
+        let keep_audio_mode = self.source_swap_keep_audio_mode;
         let navigation_preview = if reason == "navigation" {
             Some(self.native_video_navigation_preview_for_path(&target_path))
         } else {
@@ -732,6 +740,22 @@ impl App {
         }
         if self.native_video_source_swap_pending.is_some() {
             self.fullscreen_idx = Some(target_idx);
+            // Inc 7: 進行中の swap が既に音声モード維持 (audio_mode_after_swap=true) なら、
+            // 通常ナビによる update でもその intent を維持する。keep_audio_mode(=この update の
+            // 要求) だけで上書きすると、音声モードの swap 完了前に別ナビが入ったとき
+            // audio_mode_after_swap が false に潰れ、completion が可視動画を開いて元バグ
+            // (黒画面 / 前フレーム固着) に戻る (Codex P1)。通常 swap 同士 (両方 false) は不変。
+            let keep_audio_after_update = keep_audio_mode
+                || self
+                    .native_video_source_swap_pending
+                    .as_ref()
+                    .is_some_and(|p| p.audio_mode_after_swap);
+            // 音声モード維持 swap は fullscreen_idx を target へ進めた瞬間から video_audio_mode も
+            // target に合わせる (でないと fs_music_view_active(target) が false になり音楽ビューが
+            // 一瞬消える、Codex #5)。
+            if keep_audio_after_update {
+                self.video_audio_mode = Some(target_idx);
+            }
             self.refresh_fullscreen_video_marker_cache(target_idx);
             let pending = self
                 .native_video_source_swap_pending
@@ -746,6 +770,7 @@ impl App {
             pending.requested_at = now;
             pending.deadline = now + std::time::Duration::from_secs(10);
             pending.input_seq = self.input_seq;
+            pending.audio_mode_after_swap = keep_audio_after_update;
             pending
                 .native_output
                 .set_navigation_preview(navigation_preview);
@@ -806,6 +831,13 @@ impl App {
         }
         self.native_video_open_pending = None;
         self.fullscreen_idx = Some(target_idx);
+        // Inc 7: 音声モード維持 swap は fullscreen_idx を target へ進めた瞬間から
+        // video_audio_mode も target に合わせて音楽ビューを継続表示する (Codex #5)。旧 idx の
+        // player は上で remove 済み、新 player は completion で insert されるが、
+        // draw_fs_music_view は player 不在でも空状態で描けるので穴は空かない。
+        if keep_audio_mode {
+            self.video_audio_mode = Some(target_idx);
+        }
         self.refresh_fullscreen_video_marker_cache(target_idx);
         self.native_video_source_swap_pending = Some(NativeVideoSourceSwapPending {
             from_idx,
@@ -820,6 +852,7 @@ impl App {
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
             cursor_state: self.fullscreen_cursor_state(),
+            audio_mode_after_swap: keep_audio_mode,
         });
         crate::logger::log(format!(
             "[native-video] defer source swap: reason={reason} from_idx={from_idx} -> target_idx={target_idx}"
@@ -1033,6 +1066,7 @@ impl App {
             requested_at,
             input_seq,
             cursor_state,
+            audio_mode_after_swap,
             ..
         } = pending;
 
@@ -1095,6 +1129,17 @@ impl App {
         self.sync_native_video_timeline_markers(target_idx);
         self.sync_native_video_vst3_available(target_idx);
         self.sync_native_video_vst3_panel(target_idx);
+
+        // Inc 7 (音声モード連続再生 EOF): この swap は音声モードの動画から次動画への送りだった
+        // ので、動画セットアップ (上の sync 群) を終えた直後に「動画→音声モード」を再確立する。
+        // 再利用した presenter は既に hidden なので、`enter_video_audio_mode` は VST/owner/HUD の
+        // 後始末 + entry_target 捕捉 + video_audio_mode=Some(target) + music_bookmarks 再ロード
+        // フラグを行い、set_native_window_visible(false) は既 hidden への冪等 no-op になる。
+        // `open_fullscreen(target_idx)` が video_audio_mode を一旦 None にした後この 1 箇所で
+        // 戻すので、音楽ビュー ⇔ 動画表示の切替はこの poll 内で完結し描画フレームは跨がない。
+        if audio_mode_after_swap {
+            self.enter_video_audio_mode(ctx, target_idx);
+        }
 
         if reason == "tile" {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
@@ -6436,6 +6481,19 @@ impl App {
         }
         // 既に exit 進行中なら二重起動しない (ボタンが複数フレーム描かれる間の連打対策)。
         if self.video_audio_exit_pending.is_some() {
+            return;
+        }
+        // 音声モードの連続再生 EOF による source-swap 進行中は exit を受け付けない (Codex P2)。
+        // この間は旧 player が既に外され新 player 未挿入で `fs_cache[fs_idx]` が無く、show /
+        // SwitchPlacement の対象 presenter が pending 内に退避しているため、ここで exit すると
+        // `poll_video_audio_exit_pending` が player-gone で video_audio_mode を落としても、swap の
+        // `audio_mode_after_swap=true` で completion がまた音声モードに戻す = exit が失われる。
+        // swap 完了 (= 数百 ms) 後に再度ボタンを押せば通常経路で正しく動画表示へ戻れる。enter 側も
+        // 同じ理由で swap 中は entry をブロックしている (対称)。
+        if self.native_video_source_swap_pending.is_some() {
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx} ignored: source-swap in flight (retry after swap)"
+            ));
             return;
         }
         // saw_hidden を「今 hidden か」でシードする (Codex P2 検証): 音声モードでは presenter は既に
