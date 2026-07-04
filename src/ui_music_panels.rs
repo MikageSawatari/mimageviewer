@@ -241,11 +241,18 @@ impl App {
     /// (3 概念分離のうち解析ソース、[`Self::fs_music_view_active`] は表示/ゲート判定)。
     ///
     /// 音声ファイルはそのパスを返す。Inc 7 (動画→音声モード) では、音声モードにトグルされた
-    /// 動画の場合にその動画ファイルのパスを返すよう拡張する (その動画の音声トラックを解析する)。
-    /// 名前が「audio_path」ではなく「source」なのは、将来動画パスも返し得るため。
+    /// 動画 (`video_audio_mode == Some(fs_idx)`) の場合にその動画ファイルのパスを返す
+    /// (その動画の音声トラックを解析する)。名前が「audio_path」ではなく「source」なのは、
+    /// 動画パスも返し得るため。stale index 対策で動画アームは `fullscreen_idx == Some(fs_idx)`
+    /// も確認する ([`Self::fs_music_view_active`] と揃える、Codex 7c 設計レビュー)。
     pub(crate) fn fs_music_source_for_idx(&self, fs_idx: usize) -> Option<std::path::PathBuf> {
         match self.items.get(fs_idx) {
             Some(GridItem::Audio(p)) => Some(p.clone()),
+            Some(GridItem::Video(p))
+                if self.video_audio_mode == Some(fs_idx) && self.fullscreen_idx == Some(fs_idx) =>
+            {
+                Some(p.clone())
+            }
             _ => None,
         }
     }

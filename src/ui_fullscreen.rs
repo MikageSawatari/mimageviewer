@@ -7884,7 +7884,10 @@ impl App {
                     )
                 })
             });
-        if is_video_fs {
+        // 音声モードにトグルされた動画 (Inc 7) は native presenter が detach 済みで、キーは音楽
+        // ビュー側 (下記の fs_music_view_active ブロック) が処理する。handle_video_input を走らせると
+        // 動画キーが音楽キーを横取りし、存在しない presenter を触るので gate off する。
+        if is_video_fs && !fs_music_view_active {
             let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
                 Some(p.clone())
             } else {
@@ -19332,8 +19335,17 @@ impl App {
     /// その拡張を 1 箇所に閉じ込めるため、「音楽ビューが出ているか」を意味する判定はすべて
     /// この述語を通す (3 概念分離: これは表示/ゲート、[`Self::fs_music_source_for_idx`] は
     /// 解析ソース、`GridItem::Audio` 直判定はファイル種別/ナビ/永続 semantics のまま残す)。
+    ///
+    /// Inc 7 (動画→音声モード) では、音声モードにトグルされた動画 (`video_audio_mode ==
+    /// Some(fs_idx)`) も音楽ビュー扱いにする。`video_audio_mode` は fs_idx だけを持つ transient
+    /// 状態なので、stale index (フルスクリーン close / ナビ / item 差し替えで同 idx が別 item を
+    /// 指す) で誤って別アイテムを音楽ビュー扱いしないよう、`fullscreen_idx == Some(fs_idx)` かつ
+    /// item が `GridItem::Video` であることも確認する (Codex 7c 設計レビュー)。
     pub(crate) fn fs_music_view_active(&self, fs_idx: usize) -> bool {
         matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
+            || (self.video_audio_mode == Some(fs_idx)
+                && self.fullscreen_idx == Some(fs_idx)
+                && matches!(self.items.get(fs_idx), Some(GridItem::Video(_))))
     }
 
     /// 音声フルスクリーンの音楽ビュー (Inc 3a: 最小構成)。

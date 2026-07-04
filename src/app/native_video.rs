@@ -6259,6 +6259,156 @@ impl App {
         )
     }
 
+    /// 「動画→音声モード」に入る (Inc 7 / stage 7c)。走行中の動画プレイヤーから native presenter を
+    /// detach し、映像出力を止めて (`set_video_output_disabled(true)`) egui 音楽ビューを表示する。
+    /// 音声スレッド (pump / CPAL / decoder の audio 経路 / `DspBridge` / normalize / 解析状態) には
+    /// 一切触れないので **音声は無中断**。owner/HUD/VST GUI の後始末は presenter HWND が生きて
+    /// いるうちに `exit_music_vst_shell` と同じ順序で行い、孤児 VST window を防ぐ (Codex 7c 設計)。
+    ///
+    /// **7c 時点では呼び出し元が無い (dead_code)。7d でキー / HUD ボタンから配線する。**
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn enter_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.video_audio_mode.is_some() {
+            return;
+        }
+        // 動画アイテムのみ・現在フルスクリーンで開いている idx・borderless presenter 前提。
+        if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            || self.fullscreen_idx != Some(fs_idx)
+        {
+            return;
+        }
+        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
+            self.show_feedback_toast(
+                "音声モードはフルスクリーン表示中のみ利用できます".to_string(),
+            );
+            return;
+        }
+        // presenter が実際に上がっている (HWND publish 済み) ことを確認する。まだ preparing の
+        // 動画で音声モードに入るのは無意味なので弾く。
+        let has_presenter = matches!(
+            self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hwnd() != 0
+        );
+        if !has_presenter {
+            return;
+        }
+        // ── VST/owner/HUD teardown (exit_music_vst_shell と同じ順序、presenter HWND 生存中に) ──
+        self.dsp_bridge.set_existing_guis_owner_to_main();
+        self.dsp_bridge.set_all_guis_visible(false);
+        self.dsp_bridge.set_all_guis_topmost(false);
+        self.show_vst3_manager = false;
+        self.native_video_owner_synced_hwnd = 0;
+        if self.settings.vst3_gui_visible {
+            self.settings.vst3_gui_visible = false;
+            self.settings.save();
+        }
+        self.dsp_bridge.set_hud_hwnd(0);
+        self.dsp_bridge.unregister_fullscreen_owner();
+        self.vst_geometry_tracker.clear();
+        self.native_video_front_synced_hwnd = 0;
+        self.native_video_front_last_raise = None;
+        self.native_video_front_recover_after_external_foreground = false;
+        // タイルモードは音声モードに無関係なので畳む。
+        self.video_tile_mode_active = false;
+        self.video_tile_state = None;
+        self.video_tile_reopen_pending = false;
+        self.video_tile_reopen_deadline = None;
+        // ── 映像停止 → モード確定 → presenter drop ──
+        // `set_video_output_disabled(true)` を `take_native_output()` より前に立てて、drop の
+        // cancel+join 中に新規映像フレームが presenter へ流れる race window を最小化する
+        // (Codex 7c 設計)。音声 routing は不変なので無中断。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_video_output_disabled(true);
+        }
+        self.video_audio_mode = Some(fs_idx);
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&fs_idx) {
+            let _ = player.take_native_output();
+        }
+        ctx.request_repaint();
+        crate::logger::log(format!(
+            "[video-audio] entered audio mode for fs_idx={fs_idx}"
+        ));
+    }
+
+    /// 「動画→音声モード」を抜けて動画表示へ戻る (Inc 7 / stage 7c)。映像出力を再開し、native
+    /// presenter を re-attach して現在位置へ seek して映像を再同期する。owner/HUD は次フレームの
+    /// `ensure_native_video_front` が presenter HWND 出現を検出して自動再登録する。
+    ///
+    /// 順序は Codex 7c 設計に従い **flag clear → seek(現在位置) → attach**:
+    /// - flag clear を seek より先に: そうしないと seek 後に routing すべき映像パケットが落ちる。
+    /// - seek を attach より先に: 新 presenter が seek serial 更新前の古い `video_rx` フレームを
+    ///   一瞬表示するのを防ぐ。
+    ///
+    /// ⚠ 現行 `VideoPlayer::seek()` は audio buffer clear + flush を伴うので、戻る瞬間に短い音の
+    /// 途切れが起き得る (enter 側の「映像カットで音声無中断」とは非対称)。完全な無音断が要るなら
+    /// video-only reprime API が要る (7d/7e の仕様確認事項、docs §5.7.1)。
+    ///
+    /// **7c 時点では呼び出し元が無い (dead_code)。7d でキー / HUD ボタンから配線する。**
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn exit_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.video_audio_mode != Some(fs_idx) {
+            return;
+        }
+        self.video_audio_mode = None;
+        // presenter config は動画オープン経路 (app.rs) と同じパラメータで組む。音声モードは
+        // フルスクリーン限定なので Fullscreen で target を取る (F11 中の音声モードは 7e 課題)。
+        let target = self.native_video_target_for_presentation(ViewerPresentation::Fullscreen);
+        let config = target.and_then(|(placement, rect, owner_hwnd)| {
+            let file_name = match self.items.get(fs_idx) {
+                Some(GridItem::Video(path)) => path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("video")
+                    .to_string(),
+                _ => "video".to_string(),
+            };
+            super::native_video_presenter_config(
+                owner_hwnd,
+                rect,
+                placement,
+                true, // activate_on_show (fullscreen)
+                file_name,
+                self.video_perf_overlay_visible,
+                false, // initial_tile_overlay: 復帰時はタイルを出さない
+                self.settings.vst3_enabled,
+                self.checked.contains(&fs_idx),
+                self.settings.fullscreen_cursor_hide_delay_secs,
+                Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                self.main_hwnd.unwrap_or(0) as u64,
+                false, // audio_only: 動画復帰なので通常の映像 present
+            )
+        });
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&fs_idx) {
+            // config が取れなくても最低限モード解除と映像再開はする (映像は次フレームの
+            // ensure/open に委ねる)。
+            player.set_video_output_disabled(false);
+            let pos = player.position().max(0.0);
+            player.seek(pos);
+            if let Some(config) = config {
+                match player.attach_native_output_from_config(config) {
+                    Ok(()) => {
+                        crate::logger::log(format!(
+                            "[video-audio] exited audio mode for fs_idx={fs_idx}: re-attached presenter, seek={pos:.3}"
+                        ));
+                    }
+                    Err(err) => {
+                        crate::logger::log(format!(
+                            "[video-audio] exit re-attach failed for fs_idx={fs_idx}: {err}"
+                        ));
+                        self.show_feedback_toast(format!("動画表示に戻れませんでした: {err}"));
+                    }
+                }
+            } else {
+                crate::logger::log(format!(
+                    "[video-audio] exit for fs_idx={fs_idx}: presenter target unavailable, video output re-enabled only"
+                ));
+            }
+        }
+        ctx.request_repaint();
+    }
+
     #[cfg(windows)]
     pub(super) fn set_native_video_vst3_panel_visible(&mut self, visible: bool) {
         self.show_vst3_manager = visible;

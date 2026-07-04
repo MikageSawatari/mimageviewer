@@ -5497,6 +5497,16 @@ pub struct App {
     /// すると fs_cache clear で stale 参照になるため、draw_fs_music_view の後で close_fs に
     /// 合流させて遅延処理する (動画の close_requested と同じ遅延パターン)。
     pub(crate) music_view_close_requested: bool,
+    /// 「動画→音声モード」(Inc 7)。`Some(fs_idx)` の間、その fs_idx の動画は native presenter を
+    /// detach + 映像出力を停止し (`set_video_output_disabled`)、音声を鳴らしたまま egui 音楽ビュー
+    /// (`draw_fs_music_view`) を表示する。逆トグルで presenter を re-attach + 現在位置 seek で映像
+    /// を復帰する。**transient (非永続)**: セッション中の一時トグルで、スキーマには保存しない。
+    /// stale index 事故 (フルスクリーン close / ナビ / item 差し替えで同 idx が別 item を指す) を
+    /// 避けるため、`close_fullscreen` / `open_fullscreen` で必ず None に戻し、predicate 側でも
+    /// `fullscreen_idx == Some(idx)` かつ item が `GridItem::Video` であることを確認する
+    /// (Codex 7c 設計レビュー)。enter/exit は `enter_video_audio_mode` / `exit_video_audio_mode`
+    /// (app/native_video.rs)。詳細は docs/music-integration-plan.md §5.7 / §5.7.1。
+    pub(crate) video_audio_mode: Option<usize>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -7322,6 +7332,7 @@ impl App {
             #[cfg(windows)]
             music_vst_shell: None,
             music_view_close_requested: false,
+            video_audio_mode: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -8118,7 +8129,10 @@ impl App {
         // 音声 (映像なし動画) は FsCacheEntry::Video で再生されるが、ブックマークは
         // music_bookmarks 正本で管理する。動画マーカー cache / サムネ decode worker を
         // 音声に走らせないよう、ここで None を返して除外する (Codex 設計 P2)。
-        if matches!(self.items.get(fs_idx), Some(GridItem::Audio(_))) {
+        // 音声モードにトグルされた動画 (Inc 7) も音楽ビュー扱いなので同様に除外する。
+        if matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
+            || self.video_audio_mode == Some(fs_idx)
+        {
             return None;
         }
         self.fs_video_player(fs_idx)
@@ -25793,6 +25807,10 @@ impl App {
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
+        // 別アイテムへナビ / 新規オープンする時点で、前アイテムの「動画→音声モード」(Inc 7) は
+        // 終わる。stale index (同 idx が別 item を指す) 事故を避けるため必ずクリアする
+        // (Codex 7c 設計)。前アイテムの動画プレイヤーはこの後 evict されるので再 attach は不要。
+        self.video_audio_mode = None;
         // viewer 内の手動ナビ (grid からの新規 open ではない = `fs_open_intent_from_grid` が false、
         // かつ既にフルスクリーン中) で **動画** を開くときは、現在の presentation を維持する
         // (one-shot 焼き付け)。「別ウィンドウで開く」設定は grid からの新規 open (Enter /
@@ -32072,6 +32090,9 @@ impl App {
         // 音楽ビュー (Inc 3b/4) の解析ワーカー + row raster + spectrum worker + PCM を止めて捨てる
         // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
         self.clear_music_view_state();
+        // 「動画→音声モード」(Inc 7) はフルスクリーンを閉じたら終わる。動画プレイヤーはこの後
+        // fs_cache.clear() で drop されるので、ここではフラグを落とすだけでよい (Codex 7c 設計)。
+        self.video_audio_mode = None;
         // 音声 VST シェル (Inc 6 ②-3): フルスクリーンを完全に閉じるならシェル状態も落とす。
         // VST GUI の hide/re-owner は下の VST cleanup (show_vst3_manager 経路) が、native 出力の
         // drop は fs_cache.clear() が行うので、ここではフラグを落とすだけでよい。
@@ -41591,6 +41612,11 @@ impl App {
         let display_mode = self.settings.video_loop_mode;
         let continuous_mode = self.video_continuous_mode;
         let continuous_enabled = continuous_mode.is_enabled();
+        // 「動画→音声モード」(Inc 7): `fs_cache.iter_mut()` 中の disjoint field borrow を避けるため
+        // スナップショット。`Some(idx)` の動画はループ境界 / ブックマーク / resume 保存を音声
+        // (music) 扱いにする。連続再生 EOF だけは raw の音声ファイル判定を使う (音声モードの動画は
+        // 動画の連続再生 = 次の動画へ、で維持する。§5.7.1 / Codex 7c 設計)。
+        let video_audio_mode = self.video_audio_mode;
         #[cfg(windows)]
         let continuous_tile_active = self.video_tile_mode_active;
         #[cfg(not(windows))]
@@ -41617,14 +41643,18 @@ impl App {
                 // 音声 (映像なし動画) は headless 再生。ループ/連続の判定材料が動画と違う
                 // (チャプター無し・ブックマークは music_bookmarks 正本)。native presenter は
                 // 持たないので set_native_* は no-op だが、判定だけ音声用に分岐する。
-                let is_audio = matches!(self.items.get(*idx), Some(GridItem::Audio(_)));
+                // `is_audio_file` = 純粋な音声ファイル判定 (連続再生 EOF の振り分け用)。
+                // `is_music_mode` = 音楽ビュー表示中 (音声ファイル or 音声モードの動画、Inc 7)。
+                // ループ境界 / ブックマーク / resume 保存は music 扱いにする。
+                let is_audio_file = matches!(self.items.get(*idx), Some(GridItem::Audio(_)));
+                let is_music_mode = is_audio_file || video_audio_mode == Some(*idx);
                 // チャプター / ブックマーク有無を判定 (cache 直読み、DB クエリ無し)
-                let has_ch = !is_audio
+                let has_ch = !is_music_mode
                     && player
                         .info()
                         .map(|i| !i.chapters.is_empty())
                         .unwrap_or(false);
-                let has_bm = if is_audio {
+                let has_bm = if is_music_mode {
                     // 音声は music_bookmarks 正本。現在の再生 path 用に読み込まれている
                     // 場合のみ有効 (前曲のブックマークで区間ループを組む race を防ぐ、Codex P1)。
                     self.fullscreen_idx == Some(*idx)
@@ -41721,16 +41751,26 @@ impl App {
                 }
                 if do_save {
                     let path_key = crate::adjustment_db::normalize_path(player.path());
-                    let pos = player
-                        .last_displayed_pts_secs()
-                        .unwrap_or_else(|| player.position());
+                    // 音声モードにトグルした動画 (Inc 7) は映像フレームが進まず `last_displayed_pts`
+                    // が detach 時点で固着するので、音声クロックの `position()` を保存位置に使う。
+                    // 音声ファイルは従来どおり (last_displayed_pts は None なので実質 position、Codex 7c
+                    // で byte-equivalent を維持するため video_audio_mode 限定で分岐)。
+                    let pos = if video_audio_mode == Some(*idx) {
+                        player.position()
+                    } else {
+                        player
+                            .last_displayed_pts_secs()
+                            .unwrap_or_else(|| player.position())
+                    };
                     updates.push((path_key, pos, player.duration()));
                 }
                 if continuous_enabled
                     && !continuous_tile_active
                     && player.engine_state_code() == crate::video::engine::actor::state_code::EOF
                 {
-                    continuous_eof_events.push((*idx, player.current_seek_serial(), is_audio));
+                    // 連続再生 EOF は raw の音声ファイル判定で振り分ける: 音声モードにトグルした
+                    // 動画は「次の動画へ」= 動画の連続再生を維持する (次の音声へ飛ばさない、§5.7.1)。
+                    continuous_eof_events.push((*idx, player.current_seek_serial(), is_audio_file));
                 }
             }
         }
@@ -41793,7 +41833,11 @@ impl App {
         // 動画は従来どおり Windows native のみ。
         if !self.video_continuous_mode.is_enabled() {
             for idx in &active_video_indices {
-                if matches!(self.items.get(*idx), Some(GridItem::Audio(_))) {
+                // 音声ファイル、および音声モードにトグルした動画 (Inc 7) は egui 経路の
+                // ブックマーク区間ループ tick を使う。それ以外の動画は native ループ tick。
+                if matches!(self.items.get(*idx), Some(GridItem::Audio(_)))
+                    || video_audio_mode == Some(*idx)
+                {
                     self.tick_music_loop_boundary(*idx);
                 } else {
                     #[cfg(windows)]

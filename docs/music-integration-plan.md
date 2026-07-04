@@ -332,26 +332,41 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
     `video_audio_mode` はまだ無く両 predicate は `GridItem::Audio` と同値 = **挙動完全不変**。
     bin test 3135 緑・fmt/glyph クリーン。（7c で `handle_video_input` を音声モード中は gate する
     必要がある点をメモ: 現状 video-in-audio-mode は is_video_fs のまま handle_video_input へ入るため。）
-  - **7c**: enter/exit ライフサイクル + re-attach + seek 再同期。enter = VST/native owner 整理 →
-    detach → `set_video_output_disabled(true)` → music view active。exit = disable clear →
-    `attach_native_output_from_config` → 現在位置 seek。`App.video_audio_mode: Option<usize>`
-    （transient、非永続）。**7c で追加対応が要る「予測される非局所ゲート」（7b Codex レビュー指摘、
-    現状は動画のまま = 挙動不変）**:
-    - `handle_fs_key_input` 冒頭の `if is_video_fs { handle_video_input }`（ui_fullscreen.rs）:
-      video-in-audio-mode も `is_video_fs` が true のまま handle_video_input に入る（native
-      presenter は detach 済みで音声モード中）。音声モード中は gate するか no-op を保証する。
-    - `poll_video` の音声分岐（app.rs ~41620 `is_audio` / ~41796 の loop・bookmark・continuous
-      振り分け）: 現状 `GridItem::Audio` のみ音声扱い。video-in-audio-mode は `GridItem::Video`
-      なので、音楽 HUD のループ/連続再生/マーカーと整合させるにはここも音声モードを考慮する
-      （同一 `VideoPlayer` を presenter detach + video 無効で回すので「headless 音声プレイヤー」
-      とは別物 = 単純な predicate 差し替えでなく runtime 設計が要る）。
-    - `fullscreen_video_marker_path`（app.rs ~8121）: video-in-audio-mode は動画パスを返すので
-      seek バーの動画マーカー cache / サムネ decode worker が走る。音声モード中は抑止する。
-    - （`fullscreen_embedded_still_active` は 7b で `fs_music_view_active` 経由に一般化済み。）
+  - **7c** ✅（2026-07-04、**dormant infrastructure・挙動不変**）: enter/exit ライフサイクル + re-attach
+    + seek 再同期 + 非局所ゲートを実装。**トリガはまだ無い**（= `App.video_audio_mode` は常に None →
+    全ゲートが no-op → 7a/7b と同じくバイト等価）。7d でトグルを配線して初めて起動 + ユーザー実機検証。
+    Codex 7c 設計レビュー済み（下記の順序・分割はレビュー反映）。
+    - `App.video_audio_mode: Option<usize>`（transient、非永続）。predicate（`fs_music_view_active` /
+      `fs_music_source_for_idx`）に `video_audio_mode == Some(idx)` アームを追加。stale index 対策で
+      `fullscreen_idx == Some(idx)` かつ item が `GridItem::Video` も確認。`open_fullscreen` /
+      `close_fullscreen` で必ず None にクリア。
+    - `enter_video_audio_mode`（app/native_video.rs、`exit_music_vst_shell` を鏡写し）: VST/owner/HUD
+      teardown（presenter HWND 生存中に re-owner→hide→unregister→clear）→ `set_video_output_disabled(true)`
+      → `video_audio_mode = Some` → `take_native_output()`。**flag ON を take より前**にして drop の
+      cancel+join 中に新規映像フレームが流れる race を最小化（Codex）。タイルモードも畳む。
+    - `exit_video_audio_mode`: **flag clear → seek(現在位置) → attach** の順（Codex 修正: seek を attach
+      より先にして新 presenter が古い video_rx フレームを一瞬出すのを防ぐ / flag clear を seek より先に
+      して flush 後の映像パケットが落ちないように）。config は動画オープン経路と同じ
+      `native_video_presenter_config(..., audio_only=false)`。owner/HUD は次フレームの
+      `ensure_native_video_front` が自動再登録。
+    - 非局所ゲート（すべて `video_audio_mode==Some` guard で 7c はバイト等価）: (a)`handle_fs_key_input`
+      の `if is_video_fs && !fs_music_view_active { handle_video_input }`（動画キーが音楽キーを横取り
+      + 不在 presenter を触るのを防ぐ）(b)`poll_video`: `is_music_mode`（loop 境界 / bookmark / resume
+      位置＝音声クロック `position()`）と raw `is_audio_file`（連続再生 EOF）を分離 (c)`~41796` loop 境界
+      dispatch を `tick_music_loop_boundary` へ (d)`fullscreen_video_marker_path` で動画マーカー cache 抑止。
+    - （`fullscreen_embedded_still_active` は 7b で一般化済み。）
+    - **⚠️ 7d/7e へ持ち越す設計事項（Codex 7c 指摘）**:
+      - **exit の seek は「音声も再同期する seek」= 短い音切れが起き得る**（`VideoPlayer::seek()` が
+        audio buffer clear + flush を伴うため）。enter 側の「映像カットで音声無中断」とは非対称。7d/7e で
+        「戻る瞬間の短い再同期ギャップを許容」か「完全無音断（= video-only reprime API が要る）」を仕様化。
+      - **連続再生 EOF**: 音声モードの動画は raw `is_audio_file=false` なので `handle_video_continuous_eof`
+        （次の動画へ）に流れる。次を音声モードで開くか、音声モード中は連続を止めるかは 7e で確定。
+      - **F11 / window-mode を音声モード中に押した場合**の挙動（no-op か embedded 音楽ビュー切替か）は 7e。
+      - native event batch 打ち切り（音声モードへ入ったフレームの stale イベント）はトリガ実装時（7d）に確認。
   - **7d**: トグル配線（キー / HUD ボタン — **どちらにするかは 7d 着手時にユーザー確認**）+ 解析
-    ワーカー start/stop。
-  - **7e**: 仕上げ（VST 状態引き継ぎ、EOF / 音声モード中 seek / close from audio mode / file nav /
-    long video の memory・audio 継続の smoke）。
+    ワーカー start/stop + 実機検証。
+  - **7e**: 仕上げ（VST 状態引き継ぎ、上記の seek 音切れ仕様 / 連続再生 EOF / F11 / close from audio
+    mode / file nav / long video の memory・audio 継続の smoke）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 
