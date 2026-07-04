@@ -54,6 +54,30 @@ always-active guidance.
   editing. Bug fixes should preserve the intended feature set unless the user has
   approved the functional change.
 
+## Bug Fix Policy
+
+- Before changing code for a bug, identify the observed failure, the expected
+  invariant, and the code path that violates it. Use logs, traces, tests, and
+  source inspection to confirm the root cause instead of patching the most
+  visible symptom.
+- Fix the root cause at the ownership boundary where the incorrect state or
+  transition is created. Avoid adding guards, delays, retries, extra repaint
+  calls, blanket resets, or silent fallbacks unless they are part of the root
+  cause fix and their invariants are documented.
+- If the investigation shows that the correct fix is larger than the current
+  scope, stop and explain the trade-off to the user before editing further.
+  Offer coherent options, such as spending more time on the architectural fix,
+  splitting the work into reviewed phases, or explicitly changing the
+  user-facing specification to avoid the problematic behavior.
+- Do not land a temporary behavior change, feature restriction, or partial
+  workaround just to pass one manual smoke test unless the user explicitly
+  approves that trade-off. When an approved mitigation is necessary, document
+  what remains unresolved and how the final fix should replace it.
+- Add regression coverage at the level where the bug happened whenever practical:
+  pure state-transition tests for state bugs, handler-level tests for input
+  routing bugs, and focused integration or log-based checks for lifecycle and
+  multi-window behavior that cannot be reproduced in unit tests.
+
 ## UI And Tests
 
 - For display, scroll, fullscreen, dialog, or layout changes, check
@@ -65,6 +89,26 @@ always-active guidance.
   when practical. See the UI snapshot test section in `CLAUDE.md`.
 - Run the narrowest relevant tests first, then broaden when the change touches
   shared behavior.
+
+## Verification Builds (Windows native features)
+
+- When a change affects Windows-native behavior that unit tests cannot cover
+  (native video presenter, fullscreen, video->audio mode, VST, D3D11, HWND
+  owner/focus/z-order, real IME behavior, multi-monitor DPI), do not merely ask
+  the user to verify on real hardware. First run `.\scripts\build-release.ps1`
+  yourself to produce the verification binary (`target\release\mimageviewer.exe`
+  launcher + `target\release\mimageviewer-core.exe`), then ask with concrete
+  steps to run.
+- Prerequisite: `cargo build` / `cargo test` green, `cargo fmt --check` clean,
+  and (for UI string changes) `python scripts/check_ui_glyphs.py` reporting zero.
+  Do not build a verification binary on top of a non-compiling tree.
+- Use `build-release.ps1` (fast, incremental; it auto-stops a resident mIV to
+  avoid LNK1104), not the distribution `build-dist.ps1`. Do not append `*>&1`
+  when invoking it from a tool: PowerShell `-ErrorAction Stop` turns cargo stderr
+  into a terminating error and fails instantly. Call the script plainly, or run
+  the two `cargo build` stages (core, then launcher) directly.
+- For these native features, commit after the user confirms on real hardware,
+  following the git rules below.
 
 ## Documentation And Release Notes
 

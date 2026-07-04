@@ -1673,6 +1673,33 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 `-c model="<name>"` で 1 回限りの override も可能。デフォルト設定を書き換える前に
 ユーザーに相談すること (config はユーザーの個人設定で、勝手に変えない)。
 
+## 実機検証用バイナリの準備 (Windows ネイティブ機能)
+
+**ユニットテストで再現できない Windows ネイティブ挙動を変更したら、ユーザーに実機検証を
+依頼する前に、こちら側で `.\scripts\build-release.ps1` を実行して検証用バイナリを用意する。**
+「実機で確認してください」と口頭で頼むだけで済ませず、その時点で起動できるビルドまで揃えてから
+依頼する (対象例: 動画 native presenter / フルスクリーン / 動画→音声モード / VST / D3D11 /
+HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI など)。
+
+- **前提**: `cargo build` / `cargo test` が緑・`cargo fmt --check` 済み・(UI 文言を触ったなら)
+  `python scripts/check_ui_glyphs.py` が 0 件であること。**コンパイルが通らない状態で検証
+  バイナリを作らない**。
+- **実行**: `.\scripts\build-release.ps1` (内部で core → launcher の 2 段 cargo build を回す。
+  常駐 mIV を自動停止して LNK1104 を回避する)。出力は `target\release\mimageviewer.exe`
+  (launcher) と `target\release\mimageviewer-core.exe` (本体)。
+- **配布ではないので `build-dist.ps1` ではなく `build-release.ps1` を使う** (速い・incremental)。
+  配布物 (リリース) を作るときだけ clean-first の `build-dist.ps1`。
+- **⚠️ エージェントのツールから呼ぶときは `*>&1` を付けない**。PowerShell の `-ErrorAction Stop`
+  下で cargo の stderr が terminating error 化して即失敗する (詳細はメモリ
+  `feedback_release_build_stderr_trap`)。PowerShell ツールは stderr を自前で拾うので、素の
+  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → launcher の 2 段 cargo build を
+  直接叩く。
+- **依頼のしかた**: ビルド完了後に「`target\release\mimageviewer.exe` を起動して <具体的な手順>
+  を確認してください」と、検証すべきシナリオを具体的に添える。
+- **コミットのタイミング**: この種のネイティブ機能はユーザーが実機で確認してからコミットする
+  運用 (ユーザーが「OK、コミットして」と言ってから)。検証で不具合が出たら修正 → 再ビルド →
+  再依頼を繰り返す。
+
 ## Formatting
 
 - **コミット前に必ずワークスペース全体へ `cargo fmt` をかける** (引数なし)。
@@ -1833,13 +1860,44 @@ reparse point 共有しない**。個別サブディレクトリ単位でも禁�
 - Has RTX 4090, Windows 11
 - AI-assisted development workflow: Claude generates code, user reviews and tests
 
-## Claude Code tool call reliability rules
+## Claude Code tool call reliability rules（ツール呼び出しの生テキスト漏れ対策）
 
-- Before using Read/Edit/Write/Bash, do not write explanatory prose in the same assistant message.
-- Emit the tool call as the first and only action in the message whenever possible.
-- Use one tool call at a time. Do not batch many Read/Edit/Bash calls in one response.
-- Keep tool arguments short.
-- For long or complex shell commands, write a temporary script file first, then run the script.
-- Prefer small targeted Edit calls over large full-file Write calls.
+**症状**: ツール呼び出しの直前に `call` / `court` / `<invoke name="...">` /
+`<parameter name="...">` のような生テキストが出て、ツールが実行されずに失敗する。
+
+**根本原因 (2 段構え)**:
+1. **制御トークン破損** — ツール呼び出しの開始タグが、サンプリング時に語彙的に隣接する
+   別トークン (`call` / `court` 等) に化ける。ハーネスがパースできず生テキストとして漏れる。
+2. **自己汚染 (in-context few-shot poisoning)** — 壊れた呼び出しが会話履歴に残ると、
+   モデルがそれを「正しい例」と誤認し、以降の呼び出しでも決定論的に同じ壊れ方を繰り返す。
+   → **セッション内でリトライを重ねても直らない。むしろ悪化する。**
+
+### 発生確率を下げる (予防)
+
+- **ツール呼び出しはメッセージの先頭・単独で出す**。同じメッセージ内で呼び出し前に説明文を
+  書かない (説明はツール結果が返ってから書く)。
+- **1 メッセージ 1 ツール呼び出し**。多数の Read/Edit/Bash を 1 応答にまとめて撃たない。
+- **ツール引数は短く保つ**。段落級の長い引数は避ける。長い / 複雑なシェルコマンドは一旦
+  スクリプトファイルに書いてから実行する。
+- 大きな全文 Write より、小さな targeted Edit を優先する。
+- **セッションを長く引きずらない**。複数日 resume や 1M トークン級の巨大文脈で発生率が上がる。
+  区切りごとに git / メモに状態を保存し、必要なら新セッションに移る。
+- マークアップ密度の高い大型 skill は途中ロードを避け、セッション冒頭で読み込む。
+- 同時起動の MCP サーバや background Bash を増やしすぎない。
+
+### 発生してしまったときの対応 (最重要)
+
+- 生テキストが出たら、そのツール呼び出しは**実行されていない**とみなす。
+- **リトライは最大 1〜2 回まで**。それで直らなければ**それ以上リトライしない** (履歴汚染が
+  進み、決定論的に失敗し続けるため。粘るほど悪化する)。
+- 直らない場合は**ユーザーに「新しいセッションを開始 (`/clear`) してほしい」と平文で伝える**。
+  セッション内で確実に回復する手段は `/clear` (汚染履歴の切り離し) だけ。
+- **`/compact` を回復手段にしない** (compact 直後に再発する)。フルな新セッションを選ぶ。
+- 「もっと注意して」系の自己叱咤・追加指示は効かない (注意の問題ではなく文脈アンカーの問題)。
+- 更新で直る保証はない (公式修正は未出荷の時期がある) が、Claude Code は最新版に保つ。
+- (未確認の回避策) Opus 4.8 で頻発する場合、モデルを Opus 4.7 / Sonnet に切り替えると
+  減るという報告がある。確実ではないので、まずは上記の `/clear` を優先する。
+
+### 一般の後処理
+
 - After any Write/Edit, verify with Read or git diff that the file actually changed.
-- If raw text like `<invoke name="...">` or `<parameter name="...">` appears, assume the tool did not run. Re-issue only that tool call with no prose.
