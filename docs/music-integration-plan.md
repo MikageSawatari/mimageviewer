@@ -521,7 +521,20 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 
 **Inc 6 ② 完了** ✅（②-1〜②-4）: 音声 VST native シェルが実機で使える状態。VST ボタン → 動画と同じ
 黒画面 + HUD + プラグイン GUI（音途切れなし）、VST ボタン / Esc / native close で音楽ビューへ復帰。
-**実機目視はユーザー**（VST3 有効 + プラグイン読込 → 音楽 FS で VST ボタン → GUI 表示・音継続・離脱）。
+
+**Inc 6 ② 実機検証 OK + 実機 FB 対応完了** ✅（2026-07-04、commit 7f0611c2）:
+- **起動時 VST3 wedge 回帰を修正**: Inc 6 ① で音声が VST チェーンを通るようになり、起動時の自動音声再生が
+  バックグラウンド VST3 チェーンロード中（add_plugin リセット中）に小ブロックを push → `process_block`
+  100ms timeout ×3 → セッション全体 auto-disable（動画 VST も巻き添え死）。修正 = 音声 open も
+  `vst3_startup_load_pending()` で遅延（動画をミラー、`vst3_deferred_video_open` → `vst3_deferred_media_open`
+  へ rename + resume guard を Video|Audio 化）。本物 wedge の auto-disable 安全装置は不変。Codex 診断確定。
+- **上バーを動画 native と一致**: 音楽ビュー egui 上バーを native（54px 高 / title y=20 15px = `info.title`
+  埋込メタ優先 / ボタン center y=27）に合わせ、右クラスタ `[閉じる×][フルスクリーン切替][VST]` は native
+  アイコン描画 fn を共有（pub(crate) 化）＝同形状・同 X 位置。VST ボタンはフルスクリーン時のみ表示。
+  Row +/− 反転（+=ズーム）+ VST との隙間。native シェル上バーは audio_only で Tile/Perf ボタンと 2 行目
+  動画情報を非表示。
+- **シェル離脱モデル（動画一致）**: VST ボタン→VST 抜け音楽ビュー（FS 維持）/ フルスクリーン切替→ウィンドウ
+  モード + VST 抜け / ×→close_fullscreen（一覧）/ Esc→音楽ビュー。close は遅延フラグで描画後に close_fs 合流。
 
 **Inc 7 との相乗り**: ②-1 の「native presenter を frameless で回す」capability は Inc 7（動画→音声
 モード）の中核 building block。②で先に入れておくと Inc 7 が楽になる。
