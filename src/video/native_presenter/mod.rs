@@ -2534,6 +2534,16 @@ impl NativeVideoPresenter {
             .unwrap_or(0)
     }
 
+    /// HUD overlay ウィンドウの表示 / 非表示を切り替える (Inc 7 hidden presenter)。
+    /// presenter ウィンドウを hide/show するのと合わせて呼び、bar / VST click-through
+    /// region が egui 音楽ビュー上に残らないようにする。HUD HWND が無い (フォールバック
+    /// 経路) なら no-op。
+    pub fn set_hud_window_visible(&self, visible: bool) {
+        if let Some(hud) = self.hud_window.as_ref() {
+            hud.set_visible(visible);
+        }
+    }
+
     /// HUD overlay HWND を最前面に上げ直す。**allowlist 判定なしの low-level API**。
     /// 通常は `try_raise_hud_to_top` を使って allowlist 判定を通すこと。
     /// このメソッドは内部 (= `try_raise_hud_to_top`) からのみ呼ばれる想定で `pub` にしているが、

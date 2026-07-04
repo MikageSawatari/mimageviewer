@@ -1160,6 +1160,24 @@ impl App {
             self.native_video_front_recover_after_external_foreground = false;
             return;
         }
+        // Inc 7 hidden presenter (動画→音声モード): presenter は生存しているが hide されて
+        // いる (egui 音楽ビュー表示中)。presenter HWND は非 0 のままなので、明示的に
+        // 「非アクティブ」扱いにして owner / HUD 登録を外す (現行 detach 方式で hwnd=0
+        // だったときと同じ挙動)。exit で video_audio_mode=None に戻ると次フレームの
+        // 通常経路が presenter HWND を再登録する。cloak は update ループ側の
+        // `native_video_fullscreen_active_for_main_backdrop`(!fs_music_view_active) が
+        // 制御するのでここでは触らない (hwnd==0 分岐と同じ)。
+        if self.video_audio_mode.is_some() {
+            if self.native_video_front_synced_hwnd != 0 {
+                self.dsp_bridge.unregister_fullscreen_owner();
+                self.dsp_bridge.set_hud_hwnd(0);
+                self.vst_geometry_tracker.clear();
+            }
+            self.native_video_front_synced_hwnd = 0;
+            self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
+            return;
+        }
         // Plan B: presentation 切替の進行中は presenter HWND が作り直される最中。新 HWND が
         // publish 済みでも `PlacementSwitched` 未処理のフレームでは実 presentation
         // (`native_video_in_window_active`) が旧いままなので、ここで owner / HUD を
@@ -1522,6 +1540,13 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
+        // Inc 7 hidden presenter: 音声モード中は presenter が hide されていて egui 音楽ビューが
+        // main viewport / embedded で描かれる。presenter HWND は非 0 だが「アクティブな
+        // native presenter」ではないので false を返す (= 音声ファイル / 現行 detach 方式と
+        // 同じ挙動で、main focus guard が音楽ビューを誤って閉じない)。
+        if self.video_audio_mode.is_some() {
+            return false;
+        }
         self.fullscreen_idx.is_some_and(|idx| {
             self.pending_native_video_output_active_for_fs(idx)
                 || self.fs_cache.get(&idx).is_some_and(|entry| match entry {
@@ -6275,11 +6300,13 @@ impl App {
         )
     }
 
-    /// 「動画→音声モード」に入る (Inc 7 / stage 7c)。走行中の動画プレイヤーから native presenter を
-    /// detach し、映像出力を止めて (`set_video_output_disabled(true)`) egui 音楽ビューを表示する。
-    /// 音声スレッド (pump / CPAL / decoder の audio 経路 / `DspBridge` / normalize / 解析状態) には
-    /// 一切触れないので **音声は無中断**。owner/HUD/VST GUI の後始末は presenter HWND が生きて
-    /// いるうちに `exit_music_vst_shell` と同じ順序で行い、孤児 VST window を防ぐ (Codex 7c 設計)。
+    /// 「動画→音声モード」に入る (Inc 7 hidden presenter、docs §5.7.0)。走行中の動画プレイヤーの
+    /// native presenter を **drop せず hide** し (`set_native_window_visible(false)`)、presenter は
+    /// consume-and-hold でデコードを続けたまま egui 音楽ビューを表示する。音声スレッド (pump / CPAL /
+    /// decoder の audio 経路 / `DspBridge` / normalize / 解析状態) には一切触れないので **音声は
+    /// 無中断**。presenter を生かすので exit も show するだけで済み、seek せず音切れが起きない。
+    /// owner/HUD/VST GUI の後始末は presenter HWND が生きているうちに `exit_music_vst_shell` と同じ
+    /// 順序で行い、孤児 VST window を防ぐ (Codex 7c 設計)。
     ///
     /// 呼び出し元 = 動画 HUD の「音声モード」ボタン (`NativeVideoOutputEvent::ToggleAudioMode` →
     /// `handle_native_video_output_event`、7d で配線)。
@@ -6349,13 +6376,17 @@ impl App {
         self.video_tile_state = None;
         self.video_tile_reopen_pending = false;
         self.video_tile_reopen_deadline = None;
-        // ── 映像停止 → モード確定 → presenter drop ──
-        // `set_video_output_disabled(true)` を `take_native_output()` より前に立てて、drop の
-        // cancel+join 中に新規映像フレームが presenter へ流れる race window を最小化する
-        // (Codex 7c 設計)。音声 routing は不変なので無中断。
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_video_output_disabled(true);
-        }
+        // ── hidden presenter 方式 (docs §5.7.0): presenter は drop せず「hide + デコード継続
+        // (consume-and-hold)」にする。これで exit は show するだけで映像復帰でき、seek / audio
+        // を触らないので音切れが起きない (現行 detach + re-attach + seek の弱点だった)。
+        //
+        // exit で placement 復帰の判定に使うため、enter 時点の物理ターゲット
+        // (placement / rect / owner_hwnd) を捕捉する。音声モード中に全画面⇔ウィンドウを切り替えて
+        // から戻ったとき、これと現在ターゲットを比較して「そのまま show」か「SwitchPlacement で
+        // 作り直し」かを選ぶ (Codex 案D)。
+        self.video_audio_mode_entry_target =
+            self.native_video_target_for_presentation(self.viewer_presentation);
+        self.video_audio_exit_pending = None;
         self.video_audio_mode = Some(fs_idx);
         // 動画モードで追加/改名/削除したブックマークを音楽ビューへ確実に反映する (#6 修正)。
         // 動画側は video_bookmark_db + fullscreen_video_marker_cache を更新するが、音楽ビューの
@@ -6363,38 +6394,190 @@ impl App {
         // キャッシュを保持したまま動画側で書き換えると stale になる。enter でロード済みフラグを
         // 落として、次の draw_fs_music_view で DB から再ロードさせる。
         self.music_bookmarks_loaded_for = None;
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&fs_idx) {
-            let _ = player.take_native_output();
+        // presenter に hide コマンドを送る (drop しない)。presenter スレッドは以降
+        // consume-and-hold に入り、映像を present せず最新フレームだけ hold する。音声 routing は
+        // 無改変なので無中断。`video_audio_mode` を Some にした **後** に hide を送ることで、
+        // 次フレームには egui 音楽ビューが描かれ、presenter ウィンドウが隠れても穴が空かない
+        // (むしろ 1 フレーム映像が残るだけで視覚的に自然)。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_window_visible(false);
         }
         ctx.request_repaint();
         crate::logger::log(format!(
-            "[video-audio] entered audio mode for fs_idx={fs_idx}"
+            "[video-audio] entered audio mode (hidden presenter) for fs_idx={fs_idx}"
         ));
     }
 
-    /// 「動画→音声モード」を抜けて動画表示へ戻る (Inc 7 / stage 7c)。映像出力を再開し、native
-    /// presenter を re-attach して現在位置へ seek して映像を再同期する。owner/HUD は次フレームの
-    /// `ensure_native_video_front` が presenter HWND 出現を検出して自動再登録する。
+    /// 「動画→音声モード」を抜けて動画表示へ戻る (Inc 7 hidden presenter、docs §5.7.0)。
+    /// presenter は enter で drop せず hide しただけなので、基本は **show するだけ**で映像復帰でき、
+    /// seek / audio を触らない = **音切れ無し**。exit は非同期 (presenter の再表示を confirm する
+    /// まで `video_audio_mode` を Some に保って音楽ビューを描き続け、`poll_video_audio_exit_pending`
+    /// が None に落とす。逆順だと 1 フレーム映像が出ない穴が空く = Codex Q4)。
     ///
-    /// 順序は Codex 7c 設計に従い **flag clear → seek(現在位置) → attach**:
-    /// - flag clear を seek より先に: そうしないと seek 後に routing すべき映像パケットが落ちる。
-    /// - seek を attach より先に: 新 presenter が seek serial 更新前の古い `video_rx` フレームを
-    ///   一瞬表示するのを防ぐ。
+    /// 分岐 (Codex 案D): enter 時点の物理ターゲット (placement / owner_hwnd) と現在ターゲットを
+    /// 比較し、
+    /// - **一致** → presenter を show するだけ (完全シームレス)。
+    /// - **不一致** (音声モード中に全画面⇔ウィンドウを切り替えた) → `SwitchPlacement` で正しい
+    ///   placement へ作り直して復帰 (source を保持するので音声は無中断、presenter 側 rebuild が
+    ///   hold フレームで prime + show + hidden 解除)。
+    /// - **ターゲット取得不可** (通常起きない) → 従来の detach + attach + seek に同期フォールバック。
     ///
-    /// ⚠ 現行 `VideoPlayer::seek()` は audio buffer clear + flush を伴うので、戻る瞬間に短い音の
-    /// 途切れが起き得る (enter 側の「映像カットで音声無中断」とは非対称)。完全な無音断が要るなら
-    /// video-only reprime API が要る (7d/7e の仕様確認事項、docs §5.7.1)。
+    /// 比較は物理ターゲット `(placement, rect, owner)` の**フル tuple** で行う (Codex P3): 全画面⇔
+    /// ウィンドウの往復だけでなく、同一 placement の rect 変化 (ウィンドウ resize / fullscreen の
+    /// モニタ rect 変更) も検出して SwitchPlacement へ流す。SwitchPlacement の同一 placement resize
+    /// 分岐も hidden 対応済み (rect 変更後に hold フレームで show + hidden 解除) なので、どちらの
+    /// 変化でもシームレスに復帰できる。
     ///
-    /// 呼び出し元 = 音楽ビュー上バーの「動画に戻る」ボタン (draw_music_top_bar、7d で配線)。
+    /// 呼び出し元 = 音楽ビュー上バーの「動画に戻る」ボタン (draw_music_top_bar、draw 中の直呼び)。
     #[cfg(windows)]
     pub(crate) fn exit_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_audio_mode != Some(fs_idx) {
             return;
         }
+        // 既に exit 進行中なら二重起動しない (ボタンが複数フレーム描かれる間の連打対策)。
+        if self.video_audio_exit_pending.is_some() {
+            return;
+        }
+        // saw_hidden を「今 hidden か」でシードする (Codex P2 検証): 音声モードでは presenter は既に
+        // hide 済み (でないと音楽ビューが見えずこのボタンも押せない) なので通常 true になる。これで
+        // show / SwitchPlacement を送ったあと、次の poll より前に presenter が hidden→表示 を処理して
+        // しまっても (= UI が hidden==true を観測し損ねる race)、seed 済み saw_hidden により
+        // `!native_presenter_hidden()` で正しく完了できる。万一 hide 未処理 (= 今 false) なら seed も
+        // false で、その稀ケースは timeout フォールバックに委ねる。
+        let seed_saw_hidden = matches!(
+            self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hidden()
+        );
+        let cur_target = self.native_video_target_for_presentation(self.viewer_presentation);
+        // 物理ターゲット (placement, rect, owner) が完全一致するか。RECT の PartialEq に依存せず
+        // フィールド比較する。
+        let placement_matches = match (cur_target, self.video_audio_mode_entry_target) {
+            (Some((cur_pl, cur_rect, cur_owner)), Some((entry_pl, entry_rect, entry_owner))) => {
+                cur_pl == entry_pl
+                    && cur_owner == entry_owner
+                    && cur_rect.left == entry_rect.left
+                    && cur_rect.top == entry_rect.top
+                    && cur_rect.right == entry_rect.right
+                    && cur_rect.bottom == entry_rect.bottom
+            }
+            _ => false,
+        };
+        if placement_matches {
+            // 高速 show (シームレス)。presenter が再表示 (`!native_presenter_hidden()`) を
+            // confirm するまで video_audio_mode は Some のまま保つ。
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_native_window_visible(true);
+            }
+            self.video_audio_exit_pending = Some(super::VideoAudioExitPending {
+                fs_idx,
+                deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
+                saw_hidden: seed_saw_hidden,
+            });
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx}: fast show (placement unchanged)"
+            ));
+            ctx.request_repaint();
+        } else if cur_target.is_some() {
+            // placement / rect 変更を伴う復帰: SwitchPlacement で presenter を作り直す / resize する
+            // (source 保持 = 音声無中断)。presenter は hidden なので、rebuild / same-placement resize
+            // が hold フレームで prime + show + presenter_hidden 解除する (video/mod.rs)。owner/HUD は
+            // switch 完了後の ensure_native_video_front が再登録する。
+            self.switch_native_video_viewer_presentation(self.viewer_presentation, true);
+            self.video_audio_exit_pending = Some(super::VideoAudioExitPending {
+                fs_idx,
+                // rebuild は show より時間がかかるので長めの保険。
+                deadline: std::time::Instant::now() + std::time::Duration::from_millis(1200),
+                saw_hidden: seed_saw_hidden,
+            });
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx}: placement changed, re-placing via SwitchPlacement"
+            ));
+            ctx.request_repaint();
+        } else {
+            // ターゲット取得不可 (通常起きない): 同期フォールバック。
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx}: target unavailable, fallback detach+attach+seek"
+            ));
+            self.exit_video_audio_mode_fallback(ctx, fs_idx);
+        }
+    }
+
+    /// hidden presenter からの exit 完了待ちをポーリングする (`poll_video` から毎フレーム)。
+    /// presenter が再表示された (`!native_presenter_hidden()`) ら `video_audio_mode` を None に
+    /// 落として音楽ビュー描画を止め、動画表示へ戻す。deadline 超過 (presenter 無応答 /
+    /// SwitchPlacement 失敗) は detach+attach+seek フォールバックへ回す。
+    #[cfg(windows)]
+    pub(crate) fn poll_video_audio_exit_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.video_audio_exit_pending else {
+            return;
+        };
+        // モードが既に別経路 (close_fullscreen / open_fullscreen) でクリアされていたら pending も捨てる。
+        if self.video_audio_mode != Some(pending.fs_idx) {
+            self.video_audio_exit_pending = None;
+            return;
+        }
+        let (player_present, hidden) = match self.fs_cache.get(&pending.fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (true, player.native_presenter_hidden()),
+            _ => (false, false),
+        };
+        if !player_present {
+            // player が消えた (evict 等): stuck を避けるため即完了扱いにしてモードを畳む。
+            // mismatch 経路で張った SwitchPlacement pending が居ても PlacementSwitched は届かない
+            // ので明示クリアする (Codex P3、fallback と同様)。
+            self.video_audio_mode = None;
+            self.video_audio_mode_entry_target = None;
+            self.video_audio_exit_pending = None;
+            self.native_video_mode_switch = None;
+            ctx.request_repaint();
+            return;
+        }
+        // hidden を一度でも観測してからでないと「再表示」を完了とみなさない (Codex P2)。
+        // 通常 exit は enter で hide 済み = 最初の poll で saw_hidden が立ち、その後 show /
+        // SwitchPlacement が処理されて hidden=false になった時点で完了する。
+        if hidden && !pending.saw_hidden {
+            if let Some(p) = self.video_audio_exit_pending.as_mut() {
+                p.saw_hidden = true;
+            }
+        }
+        let saw_hidden = pending.saw_hidden || hidden;
+        if saw_hidden && !hidden {
+            // 再表示済み: 音楽ビューを畳んで動画表示へ (owner/HUD は次フレームの
+            // ensure_native_video_front が再登録)。
+            self.video_audio_mode = None;
+            self.video_audio_mode_entry_target = None;
+            self.video_audio_exit_pending = None;
+            ctx.request_repaint();
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={} complete (presenter shown)",
+                pending.fs_idx
+            ));
+        } else if std::time::Instant::now() >= pending.deadline {
+            // presenter が無応答 / switch 失敗: フォールバックで確実に復帰させる。
+            self.video_audio_exit_pending = None;
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={} timed out; falling back to detach+attach+seek",
+                pending.fs_idx
+            ));
+            self.exit_video_audio_mode_fallback(ctx, pending.fs_idx);
+        } else {
+            // まだ hidden: 再描画を回して次フレームで再判定。
+            ctx.request_repaint();
+        }
+    }
+
+    /// 音声モード exit のフォールバック (placement ターゲット不可 / presenter 無応答時)。旧
+    /// detach 方式と同じく presenter を drop → 現在 presentation で attach → 現在位置へ seek して
+    /// 映像復帰する。**この経路だけ seek が audio buffer を flush するので短い音切れが起き得る**が、
+    /// 通常経路 (hidden show / SwitchPlacement) はシームレスで、これは異常時の保険。
+    #[cfg(windows)]
+    fn exit_video_audio_mode_fallback(&mut self, ctx: &egui::Context, fs_idx: usize) {
         self.video_audio_mode = None;
-        // presenter config は動画オープン経路 (app.rs ~30905) と同じく **現在の presentation** で組む
-        // (フルスクリーン ⇔ ウィンドウ内を音声モード中に切り替えていても正しく復帰する、Codex 7d 検証)。
-        // 別ウィンドウ (DetachedWindow) は enter 側で拒否済みなので Fullscreen / MainWindow のみ。
+        self.video_audio_mode_entry_target = None;
+        self.video_audio_exit_pending = None;
+        // フォールバックは presenter を drop → 新規 attach するので、進行中の SwitchPlacement
+        // (exit-mismatch 経路が張った pending) が居ても PlacementSwitched は届かない。stale pending
+        // を明示クリアして owner/availability 同期が固まらないようにする (Codex P2)。
+        self.native_video_mode_switch = None;
         let presentation = self.viewer_presentation;
         let target = self.native_video_target_for_presentation(presentation);
         let config = target.and_then(|(placement, rect, owner_hwnd)| {
@@ -6410,42 +6593,39 @@ impl App {
                 owner_hwnd,
                 rect,
                 placement,
-                // activate_on_show: open path と同じく非 detached は true (Fullscreen / MainWindow)。
                 true,
                 file_name,
                 self.video_perf_overlay_visible,
-                false, // initial_tile_overlay: 復帰時はタイルを出さない
+                false,
                 self.settings.vst3_enabled,
                 self.checked.contains(&fs_idx),
                 self.settings.fullscreen_cursor_hide_delay_secs,
                 Some(self.dsp_bridge.editor_hwnds_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,
-                false, // audio_only: 動画復帰なので通常の映像 present
+                false,
             )
         });
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&fs_idx) {
-            // config が取れなくても最低限モード解除と映像再開はする (映像は次フレームの
-            // ensure/open に委ねる)。
-            player.set_video_output_disabled(false);
             let pos = player.position().max(0.0);
+            let _ = player.take_native_output();
             player.seek(pos);
             if let Some(config) = config {
                 match player.attach_native_output_from_config(config) {
                     Ok(()) => {
                         crate::logger::log(format!(
-                            "[video-audio] exited audio mode for fs_idx={fs_idx}: re-attached presenter, seek={pos:.3}"
+                            "[video-audio] fallback exit fs_idx={fs_idx}: re-attached presenter, seek={pos:.3}"
                         ));
                     }
                     Err(err) => {
                         crate::logger::log(format!(
-                            "[video-audio] exit re-attach failed for fs_idx={fs_idx}: {err}"
+                            "[video-audio] fallback exit re-attach failed fs_idx={fs_idx}: {err}"
                         ));
                         self.show_feedback_toast(format!("動画表示に戻れませんでした: {err}"));
                     }
                 }
             } else {
                 crate::logger::log(format!(
-                    "[video-audio] exit for fs_idx={fs_idx}: presenter target unavailable, video output re-enabled only"
+                    "[video-audio] fallback exit fs_idx={fs_idx}: presenter target unavailable"
                 ));
             }
         }

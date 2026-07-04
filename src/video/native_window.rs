@@ -23,17 +23,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, IsZoomed,
     LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -507,6 +507,24 @@ impl NativeVideoWindow {
         true
     }
 
+    /// ウィンドウを非表示にする (`SW_HIDE`)。破棄はせず、後で `show_and_raise` /
+    /// `show_no_activate` で再表示できる (Inc 7 hidden presenter: 動画→音声モード中は
+    /// presenter ウィンドウを hide して egui 音楽ビューを見せる)。
+    pub fn hide(&self) -> bool {
+        if self.hwnd.0.is_null() {
+            return false;
+        }
+        unsafe {
+            if !IsWindow(Some(self.hwnd)).as_bool() {
+                return false;
+            }
+            crate::dwm_transitions::disable_transitions_for_window(self.hwnd);
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        log_window_state("hidden", self.hwnd);
+        true
+    }
+
     pub fn destroy(&mut self) {
         if self.hwnd.0.is_null() {
             return;
@@ -559,6 +577,23 @@ pub fn bring_to_front(hwnd_raw: u64) -> bool {
             return false;
         }
         bring_hwnd_to_front(hwnd)
+    }
+}
+
+/// presenter スレッドの `sleep_until_message` / メッセージループを即時に起こすため、
+/// 良性の `WM_NULL` を post する (Inc 7 hidden presenter: hide/show コマンドを
+/// アイドル中の presenter に素早く反映させる)。`WM_NULL` は wndproc で `DefWindowProcW`
+/// に落ちるだけなので副作用は無い。
+pub fn post_wake(hwnd_raw: u64) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return;
+        }
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     }
 }
 

@@ -66,7 +66,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
     DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
+    IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
@@ -285,6 +285,21 @@ impl HudOverlayWindow {
                 h.max(1) as i32,
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
             );
+        }
+    }
+
+    /// HUD overlay ウィンドウの表示 / 非表示を切り替える (Inc 7 hidden presenter:
+    /// 動画→音声モード中は presenter ウィンドウと一緒に HUD overlay も hide して、
+    /// bar / VST click-through region が egui 音楽ビュー上に残らないようにする)。
+    /// `SW_SHOWNA` は foreground を奪わずに表示する (= `WS_EX_NOACTIVATE` の意図と整合)。
+    /// region は `SetWindowRgn` 状態が保持されるので、show 後の次フレームの
+    /// `apply_regions` (hash gate) が現行 UI rect を再適用する。
+    pub fn set_visible(&self, visible: bool) {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
         }
     }
 

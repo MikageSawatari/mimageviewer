@@ -639,6 +639,18 @@ enum NativeVideoOutputCommand {
     /// `SetWindowPos` / `SetForegroundWindow` すると DWM / presenter thread 待ちで
     /// 固まるリスクがあるため、command 経由で HWND 所有スレッドに再アサートさせる。
     RaisePresenterToFront,
+    /// Inc 7 hidden presenter (動画→音声モード): presenter ウィンドウと HUD overlay を
+    /// 表示 / 非表示にする。`visible=false` = presenter ループが「consume-and-hold」モードに
+    /// 入り、present() を呼ばず drain + frame selection + present 成功時 bookkeeping だけを
+    /// 続けて最新フレームを hold する (音声は無改変 = 無中断)。`visible=true` = hold して
+    /// いたフレームを 1 回 present してから show_and_raise で復帰する。処理後に presenter
+    /// スレッドが共有 atomic (`NativeVideoOutput.presenter_hidden`) を更新し、App が
+    /// exit 完了 (= ウィンドウ再表示済み) を検知できるようにする。
+    // App (bin 専属) からのみ構築される。lib build では app が stub のため dead に見える。
+    #[allow(dead_code)]
+    SetWindowVisible {
+        visible: bool,
+    },
 }
 
 #[cfg(windows)]
@@ -716,6 +728,13 @@ pub(crate) struct NativeVideoOutput {
     hud_hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    /// Inc 7 hidden presenter: presenter ウィンドウが hide (consume-and-hold) 中かを示す
+    /// 共有フラグ。presenter スレッドが `SetWindowVisible` 処理後に更新し、App
+    /// (`exit_video_audio_mode` の async 待ち) が「show 完了 = 再表示済み」を検知する。
+    /// 初期値 false (= 通常の可視 presenter)。
+    /// App (bin 専属) からのみ読まれる。lib build では app が stub のため dead に見える。
+    #[allow(dead_code)]
+    presenter_hidden: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
     /// app/native_video.rs (bin 専属) からのみ参照されるため lib build では dead に見える。
     #[allow(dead_code)]
@@ -757,6 +776,7 @@ impl NativeVideoOutput {
         let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
+        let presenter_hidden = Arc::new(AtomicBool::new(false));
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
@@ -769,6 +789,7 @@ impl NativeVideoOutput {
         let thread_hud_hwnd = Arc::clone(&hud_hwnd);
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_closed = Arc::clone(&closed);
+        let thread_presenter_hidden = Arc::clone(&presenter_hidden);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread_init_error = Arc::clone(&init_error);
         let thread = match std::thread::Builder::new()
@@ -790,6 +811,7 @@ impl NativeVideoOutput {
                     Arc::clone(&thread_hud_hwnd),
                     thread_first_presented,
                     Arc::clone(&thread_closed),
+                    thread_presenter_hidden,
                     thread_perf_overlay_visible,
                     dynamic,
                     audio_diagnostics,
@@ -828,6 +850,7 @@ impl NativeVideoOutput {
             hud_hwnd,
             first_presented,
             closed,
+            presenter_hidden,
             perf_overlay_visible,
             source_epoch,
             committed_generation: AtomicU64::new(0),
@@ -857,6 +880,27 @@ impl NativeVideoOutput {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Inc 7 hidden presenter: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
+    /// 要求する。command を送ったあと `WM_NULL` を post して presenter スレッドの
+    /// アイドル待ち (`sleep_until_message`) を即座に起こす。App は `is_presenter_hidden`
+    /// で反映完了 (= show 済み) をポーリングする。
+    /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
+    #[allow(dead_code)]
+    pub(crate) fn set_window_visible(&self, visible: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetWindowVisible { visible });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    /// presenter ウィンドウが現在 hide (consume-and-hold) 中か。exit の async 待ちで
+    /// 「show コマンドが反映されて再表示済みか」を検知するのに使う。
+    /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
+    #[allow(dead_code)]
+    pub(crate) fn is_presenter_hidden(&self) -> bool {
+        self.presenter_hidden.load(Ordering::Acquire)
     }
 
     /// presenter thread 内で起きた fatal init error を 1 度だけ取り出す。
@@ -1710,6 +1754,7 @@ fn run_native_video_output(
     hud_hwnd_out: Arc<AtomicU64>,
     first_presented_out: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    presenter_hidden_out: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
@@ -2090,6 +2135,14 @@ fn run_native_video_output(
     /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
     /// 30fps で約 270ms 分 = pacing 上は十分。
     const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
+    // Inc 7 hidden presenter (動画→音声モード): `SetWindowVisible{visible:false}` で
+    // presenter を「consume-and-hold」モードに入れる。hidden 中は present() を呼ばず
+    // (frame-latency waitable の 100ms 待ちを避ける)、drain + frame selection + present
+    // 成功時 bookkeeping だけ続けて最新フレームを `hidden_latest_frame` に保持する。
+    // show 時にこのフレームを 1 回 present してから再表示する。音声 routing は全経路で
+    // 無改変なので音は途切れない。
+    let mut presenter_hidden = false;
+    let mut hidden_latest_frame: Option<VideoFrame> = None;
     emit_native_vram_trace(
         "native_presenter_started",
         "after_presenter_init",
@@ -2374,6 +2427,69 @@ fn run_native_video_output(
                         report.set_focus_ok,
                     ));
                 }
+                NativeVideoOutputCommand::SetWindowVisible { visible } => {
+                    if visible {
+                        // Inc 7 hidden presenter show (音声モード→動画): hold していた最新
+                        // フレームを 1 回 present してから再表示する。これで音声モード中に
+                        // seek していても正しい位置の映像で復帰し、hide 前の古いフレームが
+                        // 一瞬見える flash を防ぐ。present は通常経路と同じ retire 管理を通す。
+                        if let Some(frame) = hidden_latest_frame.take() {
+                            match presenter.present(&frame, config.sync_interval) {
+                                Ok(outcome) => {
+                                    source
+                                        .last_displayed_pts_bits
+                                        .store(frame.pts_secs.to_bits(), Ordering::Release);
+                                    present_retire.push_back((frame, outcome.copy_fence_value));
+                                    if let Some(completed) = presenter.copy_fence_completed_value()
+                                    {
+                                        while present_retire.front().is_some_and(|(_, value)| {
+                                            *value != 0 && *value <= completed
+                                        }) {
+                                            present_retire.pop_front();
+                                        }
+                                    }
+                                    while present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
+                                        present_retire.pop_front();
+                                    }
+                                }
+                                Err(err) => {
+                                    crate::logger::log(format!(
+                                        "[native-video] hidden-show present failed: {err}"
+                                    ));
+                                    native_reset_unpresented_frame(frame);
+                                }
+                            }
+                        }
+                        let shown = if config.activate_on_show {
+                            window.show_and_raise()
+                        } else {
+                            window.show_no_activate()
+                        };
+                        if native_child_should_set_focus(cur_placement, config.activate_on_show) {
+                            unsafe {
+                                use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+                                let _ = SetFocus(Some(window.hwnd()));
+                            }
+                        }
+                        presenter.set_hud_window_visible(true);
+                        presenter_hidden = false;
+                        presenter_hidden_out.store(false, Ordering::Release);
+                        crate::logger::log(format!(
+                            "[native-video] presenter shown from hidden (audio-mode exit) shown={shown}"
+                        ));
+                    } else {
+                        // Inc 7 hidden presenter hide (動画→音声モード): presenter ウィンドウと
+                        // HUD overlay を隠す。以降の present ループは consume-and-hold に入り、
+                        // present() を呼ばず最新フレームだけ hold する (音声は無中断)。
+                        let _ = window.hide();
+                        presenter.set_hud_window_visible(false);
+                        presenter_hidden = true;
+                        presenter_hidden_out.store(true, Ordering::Release);
+                        crate::logger::log(
+                            "[native-video] presenter hidden (audio-mode enter)".to_string(),
+                        );
+                    }
+                }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     emit_native_vram_trace(
                         "switch_source_begin",
@@ -2516,6 +2632,37 @@ fn run_native_video_output(
                         }
                         if placement.is_child_window() {
                             last_parent_client_size = (new_width, new_height);
+                        }
+                        // Inc 7 hidden presenter (Codex P3): 同一 placement の rect 変更を伴う exit
+                        // (音声モード中にウィンドウ resize / fullscreen のモニタ rect 変更をしてから
+                        // 戻る) では、resize 後に hold フレームで present してから window を show して
+                        // hidden を抜ける (rebuild 分岐と同じ役割)。`presenter_hidden=false` のとき
+                        // (= 通常動画の detached 仮想フルスクリーン resize 等) はこのブロックを skip
+                        // するのでバイト等価。
+                        if presenter_hidden {
+                            if let Some(frame) = hidden_latest_frame.take() {
+                                // fence=0: この present の GPU コピー完了まで depth cap で保持 (P1 同様)。
+                                let _ = presenter.present(&frame, config.sync_interval);
+                                present_retire.push_back((frame, 0));
+                            }
+                            let shown = if activate_on_show {
+                                window.show_and_raise()
+                            } else {
+                                window.show_no_activate()
+                            };
+                            if native_child_should_set_focus(placement, activate_on_show) {
+                                unsafe {
+                                    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+                                    let _ = SetFocus(Some(window.hwnd()));
+                                }
+                            }
+                            presenter.set_hud_window_visible(true);
+                            presenter_hidden = false;
+                            presenter_hidden_out.store(false, Ordering::Release);
+                            crate::logger::log(format!(
+                                "[native-video] presenter un-hidden via same-placement resize \
+                                 (audio-mode exit) shown={shown}"
+                            ));
                         }
                         // 同一 placement の rect 更新は window を rebuild しないので世代は
                         // 据え置き (= detached resize で close 抑止が誤発火しない)。
@@ -2671,8 +2818,31 @@ fn run_native_video_output(
                                         // 表示前に 1 フレーム present して新ウィンドウを
                                         // 現在フレームで埋める (黒画面 / 別フレーム混入の
                                         // 防止 = Codex #3 二段階スワップの prime 相当)。
-                                        let primed = if let Some((frame, _)) = present_retire.back()
+                                        let primed = if let Some(frame) = hidden_latest_frame.take()
                                         {
+                                            // Inc 7 hidden presenter からの exit (placement 変更を
+                                            // 伴う SwitchPlacement 復帰): consume-and-hold で保持して
+                                            // いた最新フレームで新 presenter を prime する。hidden 中は
+                                            // present していないので present_retire / source.queue は
+                                            // 空 / stale。prime の GPU コピー完了まで frame を保持する
+                                            // ため present_retire へ積むが、**fence 値は 0** にする
+                                            // (Codex P1): この直後の retire 掃除は旧 presenter の
+                                            // `copy_fence_completed_value()` で pop するので、新 presenter
+                                            // の fence 値 (別 timeline) を入れると、旧完了値との大小比較で
+                                            // GPU コピー未完了の frame を誤解放し得る。fence=0 は旧 fence
+                                            // 掃除の対象外 (`*value != 0` gate) で、下の zero-out と同義に
+                                            // depth cap でのみ解放される (= 数フレーム後、新 presenter の
+                                            // コピー完了後)。
+                                            let ok = new_presenter
+                                                .present(&frame, config.sync_interval)
+                                                .is_ok();
+                                            if ok {
+                                                present_retire.push_back((frame, 0));
+                                            } else {
+                                                native_reset_unpresented_frame(frame);
+                                            }
+                                            ok
+                                        } else if let Some((frame, _)) = present_retire.back() {
                                             new_presenter
                                                 .present(frame, config.sync_interval)
                                                 .is_ok()
@@ -2759,6 +2929,18 @@ fn run_native_video_output(
                                         cur_placement = placement;
                                         cur_owner_hwnd = owner_hwnd;
                                         last_parent_client_size = (new_width, new_height);
+                                        // Inc 7 hidden presenter: placement 変更を伴う exit
+                                        // (SwitchPlacement 経由の復帰) では rebuild + show で
+                                        // hidden モードを抜ける。hold フレームは上の prime で消費済み。
+                                        if presenter_hidden {
+                                            presenter_hidden = false;
+                                            presenter_hidden_out.store(false, Ordering::Release);
+                                            crate::logger::log(
+                                                "[native-video] presenter un-hidden via placement \
+                                                 switch (audio-mode exit)"
+                                                    .to_string(),
+                                            );
+                                        }
                                         // 旧ウィンドウ由来の stale な native event /
                                         // HUD raise / cursor polling 状態を破棄する
                                         // (Codex #6: source_epoch が同じため epoch
@@ -2906,9 +3088,12 @@ fn run_native_video_output(
         // CP6: 50ms 周期 cursor polling。`presenter.cursor_polling_tick` が
         // 「raise を要求するか」を返す。raise 必要なら helper 経由で retry burst を
         // 起動 (= helper 内で 200ms 抑制も効かせる)。
-        let cursor_poll_due = last_cursor_poll
-            .map(|t| now.duration_since(t) >= Duration::from_millis(50))
-            .unwrap_or(true);
+        // Inc 7 hidden presenter: hide 中は cursor polling / HUD raise を止める
+        // (ウィンドウ非表示なので activation zone / raise は不要 + z-order を触らない)。
+        let cursor_poll_due = !presenter_hidden
+            && last_cursor_poll
+                .map(|t| now.duration_since(t) >= Duration::from_millis(50))
+                .unwrap_or(true);
         if cursor_poll_due {
             last_cursor_poll = Some(now);
             let presenter_hwnd = window.hwnd().0 as u64;
@@ -2932,14 +3117,20 @@ fn run_native_video_output(
         // raise が skip される。`raise_hud_to_top()` (allowlist 判定なし) を直接呼んで
         // はいけない (= popup 埋葬の regression を起こす)。
         let presenter_hwnd_val = window.hwnd().0 as u64;
-        hud_raise_deadlines.retain(|deadline| {
-            if *deadline <= now {
-                let _ = presenter.try_raise_hud_to_top(presenter_hwnd_val);
-                false // 削除
-            } else {
-                true // 残す
-            }
-        });
+        if presenter_hidden {
+            // Inc 7 hidden presenter: hide 中は raise burst を発火しない。溜まった
+            // deadline は show 後に自然に処理されるが、hidden の間は z-order を触らない。
+            hud_raise_deadlines.retain(|deadline| *deadline > now);
+        } else {
+            hud_raise_deadlines.retain(|deadline| {
+                if *deadline <= now {
+                    let _ = presenter.try_raise_hud_to_top(presenter_hwnd_val);
+                    false // 削除
+                } else {
+                    true // 残す
+                }
+            });
+        }
 
         if !native_events.is_empty() {
             presenter.update_overlay_video_state(
@@ -3383,13 +3574,14 @@ fn run_native_video_output(
                 }
             }
             last_overlay_tick = Instant::now();
-        } else if perf_visibility_changed
-            || presenter.overlay_needs_render()
-            || presenter.overlay_repaint_due(Instant::now())
-            || (source.clock.is_seeking()
-                && last_overlay_tick.elapsed() >= Duration::from_millis(50))
-            || (presenter.overlay_wants_periodic_tick()
-                && last_overlay_tick.elapsed() >= Duration::from_millis(250))
+        } else if !presenter_hidden
+            && (perf_visibility_changed
+                || presenter.overlay_needs_render()
+                || presenter.overlay_repaint_due(Instant::now())
+                || (source.clock.is_seeking()
+                    && last_overlay_tick.elapsed() >= Duration::from_millis(50))
+                || (presenter.overlay_wants_periodic_tick()
+                    && last_overlay_tick.elapsed() >= Duration::from_millis(250)))
         {
             match presenter.tick_overlay_video_state(
                 source.clock.now_secs(),
@@ -3568,6 +3760,50 @@ fn run_native_video_output(
         if let Some(frame) = latest_renderable {
             let pts = frame.pts_secs;
             let serial = frame.seek_serial;
+            if presenter_hidden {
+                // Inc 7 hidden presenter (consume-and-hold): present() は呼ばず、選択した
+                // フレームを hold するだけ。ただし **present 成功時と同じ再生状態 bookkeeping**
+                // (last_displayed_pts_bits / displayed_frame_seq / first_presented /
+                // FirstFrameReady / seek override clear) は続ける。でないと音声モード中に
+                // seek すると engine が映像 FirstFrameReady 待ちで Buffering 固着する。
+                // ここは下の通常 present の Ok アームの該当部分と一致させること。
+                source
+                    .last_displayed_pts_bits
+                    .store(pts.to_bits(), Ordering::Release);
+                source.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                let _ = first_presented_out.swap(true, Ordering::AcqRel);
+                let should_emit_first_frame_ready =
+                    source.first_frame_event_last_epoch != Some(serial);
+                if should_emit_first_frame_ready {
+                    if try_send_native_first_frame_ready(&source.engine_event_tx, serial, pts) {
+                        source.first_frame_event_last_epoch = Some(serial);
+                        source.pending_first_frame_event = None;
+                    } else {
+                        source.pending_first_frame_event = Some((serial, pts));
+                    }
+                }
+                let now_for_clear = source.clock.now_secs();
+                let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
+                if source.clock.is_seeking()
+                    && clock::pts_clears_seek_override(pts, now_for_clear)
+                    && (frame_step_active || !source.clock.is_playing())
+                {
+                    source.clock.set_paused_position(pts);
+                    source.clock.clear_seek_target_override(serial);
+                } else if clock::pts_clears_seek_override(pts, now_for_clear)
+                    && !frame_step_active
+                    && !source.clock.is_audio_active()
+                {
+                    source.clock.set_fallback_anchor(pts);
+                    source.clock.clear_seek_target_override(serial);
+                }
+                // 最新フレームを 1 枚だけ hold し、前回 hold を解放する (共有出力 slot を
+                // 溜め込まない)。show 時にこれを present してから再表示する。
+                if let Some(prev) = hidden_latest_frame.replace(frame) {
+                    native_reset_unpresented_frame(prev);
+                }
+                continue;
+            }
             let present_t0 = Instant::now();
             match presenter.present(&frame, config.sync_interval) {
                 Ok(outcome) => {
@@ -5214,6 +5450,29 @@ impl VideoPlayer {
             .as_ref()
             .map(NativeVideoOutput::hwnd)
             .unwrap_or(0)
+    }
+
+    /// Inc 7 hidden presenter (動画→音声モード): presenter ウィンドウ (+ HUD overlay) の
+    /// 表示 / 非表示を要求する。native output が無い (音声ファイル等) ときは no-op。
+    /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn set_native_window_visible(&self, visible: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_window_visible(visible);
+        }
+    }
+
+    /// presenter ウィンドウが hide (consume-and-hold) 中か。exit の async 待ちで使う。
+    /// native output が無いときは false。
+    /// App (bin 専属) からのみ呼ばれる。lib build では app が stub のため dead に見える。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn native_presenter_hidden(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::is_presenter_hidden)
+            .unwrap_or(false)
     }
 
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。

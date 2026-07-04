@@ -338,9 +338,38 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
   → hide (8)exit = show → ack/timeout → `video_audio_mode=None`（seek/audio 触らない）(9)`video_output_disabled`
   + effective-has-video 削除 (10)手動検証 = playing/paused/EOF/seek-in-audio/fullscreen/in-window/VST GUI 表示済み
   各ケース + perf log で hidden 中 `video_rx_len`/`source_queue_len` が増え続けないこと。
-- **⚠️ 大きめ + delicate（presenter thread / HUD / owner sync）。着手は次セッション（本セッションが長く
-  reliability guidance に従い checkpoint）。現行の detach 方式は動作している（切替 OK・#5/#6 修正済み）ので、
-  exit 音切れだけが残課題。**
+- **✅ 実装完了（2026-07-04、hidden presenter 方式）**。上記 10 ステップをほぼその通りに実装。差分/決定:
+  - **exit の placement 復帰 = Codex 案D**（設計相談で確定）。enter 時に物理ターゲット
+    `(placement, rect, owner)` を `video_audio_mode_entry_target` に捕捉し、exit で現在ターゲットとフル
+    tuple 比較（RECT はフィールド比較）。**一致 → 高速 show**（`set_native_window_visible(true)`、
+    シームレス）／**不一致 → `SwitchPlacement`**（source 保持で音声無中断、presenter rebuild または
+    same-placement resize が hold フレームで prime + show + `presenter_hidden` 解除）／**ターゲット不可 →
+    `exit_video_audio_mode_fallback`**（detach+attach+seek、この経路だけ短い音切れ = 異常時の保険）。
+    SwitchPlacement の **rebuild 分岐と同一 placement resize 分岐の両方**を hidden 対応（`if presenter_hidden`
+    guard でバイト等価）。
+  - **ack は共有 atomic + saw_hidden ラッチ**（ack event ではなく）。`NativeVideoOutput.presenter_hidden`
+    (AtomicBool) を presenter が show/hide 処理後に更新、App の `poll_video_audio_exit_pending` が
+    `saw_hidden`（hidden を一度観測）+ `!native_presenter_hidden()` で完了判定 → `video_audio_mode=None`。
+    deadline 超過は fallback。show / SwitchPlacement 両経路とも `presenter_hidden=false` を出すので完了判定は共通。
+  - **hidden 中の consume-and-hold**: present() を呼ばず drain + frame selection を継続し、present 成功時
+    bookkeeping（`last_displayed_pts_bits` / `displayed_frame_seq` / `first_presented` / FirstFrameReady /
+    seek override clear）を実行、最新 1 枚を `hidden_latest_frame` に hold（前回 hold は
+    `native_reset_unpresented_frame` で解放）。cursor polling / HUD raise burst / periodic overlay tick は
+    `!presenter_hidden` で抑止。
+  - **owner-sync ゲート**（step 6）: `ensure_native_video_front` / poll_video VST owner 同期 /
+    `native_video_presenter_hwnd_for_focus_guard` / hud_raise drain を `video_audio_mode.is_some()` で
+    「presenter 非アクティブ扱い」にして、現行 detach 方式（hwnd=0）と同じ挙動を再現。
+  - **step 9（`video_output_disabled` 7a + `effective_has_video` #5 削除）は focused follow-up に延期**。
+    enter/exit が `set_video_output_disabled` を呼ばなくなったので flag は常に false = demux gate / readiness
+    latch とも **inert（通常動画とバイト等価）**。この方式は映像を止めず、seek 後の FirstFrameReady は生きた
+    presenter の consume-and-hold が発行するので `effective_has_video` の OFF 経路は不要。decoder demux +
+    engine latch という delicate な箇所を長いセッションで触るのを避けた。mod.rs のラッパーは既に
+    `#[allow(dead_code)]`。Codex コードレビュー（設計→実装→検証の 3 ラウンド、P1/P2/P3 対応）済み: P1=hidden
+    prime frame を fence=0 で retire（旧 fence timeline での誤解放防止）/ P2=saw_hidden ラッチ + fallback で
+    pending switch クリア / P3=フル tuple 比較 + same-placement resize 分岐 hidden 対応。lib 2024 + bin 3136
+    test green・fmt/glyph clean。
+  - **⚠️ 実機未検証**（ユーザー GUI 確認待ち）: 動画再生中 ♪ → 音声継続 + 波形 → ▶ → **音切れ無しで**動画復帰 /
+    音声モード中に seek / pause / 全画面⇔ウィンドウ切替してから戻る / long video で音声継続 / VST GUI 表示済み。
 
 #### 5.7.1 実装ステージ 7a〜7e（Codex 設計相談で確定、2026-07-04）
 
@@ -463,16 +492,18 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
         (`video_bookmark_db`) 自体は動画側 `update_title` で更新済みなので、`enter_video_audio_mode` で
         `music_bookmarks_loaded_for = None` にして次 draw で DB 再ロード。逆方向（音声→動画）は enter 時に
         `fullscreen_video_marker_cache = None` されるので exit で rebuild = 問題なし。
-      - **① 音声→動画で音切れ（7e で仕様確定、Codex 助言で今回は許容）**: exit の `seek(現在位置)` が audio
-        buffer clear + flush を伴う（enter 側の映像カット無中断とは非対称）。完全無音断には audio を触らない
-        **video-only reprime / control plane** が要り Inc 7 応急修正の範囲外。7e で「短い exit gap を許容」か
-        「video-only reprime 新設」を確定。
+      - **① 音声→動画で音切れ → ✅ hidden presenter 方式で解消（2026-07-04、§5.7.0 参照）**: 旧 detach 方式は
+        exit の `seek(現在位置)` が audio buffer を flush して音切れしていた。hidden presenter 方式では presenter
+        を drop せず hide + consume-and-hold にし、exit は show するだけ（seek/audio を触らない）なので**完全
+        シームレス**。placement 変化を伴う exit も SwitchPlacement（source 保持）で音声無中断（Codex 案D）。
+        video-only reprime API は不要になった。**⚠️ 実機で音切れ解消をユーザー確認待ち**。
       - **③ 下 HUD の見た目（シークバー色 / Norm ボタン / 再生時間位置）が動画とズレ**、**④ 右パネルの ★ 説明・
         パネルサイズが動画とズレ**（未対応 = 次の作業）: 動画を基準に音声側を寄せる（動画はリリース済み）。
         §5.8 の HUD 共有の続き。右パネルは情報の中身が違うのは可、★ ラベルとパネル幅を動画に合わせる。
-  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、① seek 音切れ仕様（video-only
-    reprime 判断）/ 連続再生 EOF / DetachedWindow(F12) の音声モード対応 / close from audio mode / file nav /
-    long video の memory・audio 継続の smoke）。
+  - **7-hidden** ✅（2026-07-04）: ① の hidden presenter 実装（§5.7.0 の「実装完了」注記が正本）。
+  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、連続再生 EOF / DetachedWindow(F12) の
+    音声モード対応 / close from audio mode / file nav / long video の memory・audio 継続の smoke。① seek 音切れ
+    は 7-hidden で解消済みなので video-only reprime 判断は不要になった）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

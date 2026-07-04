@@ -3073,6 +3073,25 @@ pub(crate) struct NativeVideoModeSwitchPending {
     pub deadline: std::time::Instant,
 }
 
+/// Inc 7 hidden presenter: exit (音声モード→動画) の非同期完了待ち 1 件。
+/// `exit_video_audio_mode` が show / SwitchPlacement を要求したときに生成し、
+/// `poll_video_audio_exit_pending` が presenter の再表示 (`!native_presenter_hidden()`) を
+/// 検知したら `video_audio_mode` を None に落として消す。`deadline` は presenter 無応答時の
+/// 保険 (超過で detach+attach+seek フォールバック)。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct VideoAudioExitPending {
+    /// 音声モードから戻る対象の fullscreen アイテム。
+    pub fs_idx: usize,
+    /// 保険 deadline。超過したら fallback exit へ回す。
+    pub deadline: std::time::Instant,
+    /// presenter が hidden 状態だったことを一度でも観測したか (Codex P2)。show / SwitchPlacement
+    /// が実際に処理されて hidden→表示 に遷移したことを確実にするためのラッチ。これが true に
+    /// なる前に `!native_presenter_hidden()` を「完了」と誤認しない (hide コマンド未処理のまま
+    /// exit した稀なケースで、show/switch 実処理前に `video_audio_mode` を落とすのを防ぐ)。
+    pub saw_hidden: bool,
+}
+
 /// 音声 VST シェル (music Inc 6 ②-3、B-prime)。音楽ビュー (headless audio player) に
 /// native presenter を live-attach して、動画と同じ黒画面 + HUD + VST パネル + プラグイン
 /// GUI を出すモードの状態。`fs_idx` は attach 対象の fullscreen アイテム。`activated` は
@@ -5498,15 +5517,35 @@ pub struct App {
     /// 合流させて遅延処理する (動画の close_requested と同じ遅延パターン)。
     pub(crate) music_view_close_requested: bool,
     /// 「動画→音声モード」(Inc 7)。`Some(fs_idx)` の間、その fs_idx の動画は native presenter を
-    /// detach + 映像出力を停止し (`set_video_output_disabled`)、音声を鳴らしたまま egui 音楽ビュー
-    /// (`draw_fs_music_view`) を表示する。逆トグルで presenter を re-attach + 現在位置 seek で映像
-    /// を復帰する。**transient (非永続)**: セッション中の一時トグルで、スキーマには保存しない。
-    /// stale index 事故 (フルスクリーン close / ナビ / item 差し替えで同 idx が別 item を指す) を
-    /// 避けるため、`close_fullscreen` / `open_fullscreen` で必ず None に戻し、predicate 側でも
-    /// `fullscreen_idx == Some(idx)` かつ item が `GridItem::Video` であることを確認する
+    /// **hide (consume-and-hold)** して、音声を鳴らしたまま egui 音楽ビュー (`draw_fs_music_view`)
+    /// を表示する。presenter は drop せず生かしたままなので、逆トグル (exit) は presenter を
+    /// **show するだけ**で映像を復帰でき、seek / audio を触らない = 音切れ無し (hidden presenter
+    /// 方式、docs §5.7.0)。**transient (非永続)**: セッション中の一時トグルで、スキーマには
+    /// 保存しない。stale index 事故 (フルスクリーン close / ナビ / item 差し替えで同 idx が別 item
+    /// を指す) を避けるため、`close_fullscreen` / `open_fullscreen` で必ず None に戻し、predicate
+    /// 側でも `fullscreen_idx == Some(idx)` かつ item が `GridItem::Video` であることを確認する
     /// (Codex 7c 設計レビュー)。enter/exit は `enter_video_audio_mode` / `exit_video_audio_mode`
     /// (app/native_video.rs)。詳細は docs/music-integration-plan.md §5.7 / §5.7.1。
     pub(crate) video_audio_mode: Option<usize>,
+    /// Inc 7 hidden presenter: enter 時点の presenter 物理ターゲット
+    /// `(placement, rect, owner_hwnd)`。exit で現在の presentation の物理ターゲットと比較し、
+    /// 一致すれば hidden の高速 show (シームレス)、不一致 (音声モード中に全画面⇔ウィンドウを
+    /// 切り替えた) なら SwitchPlacement で正しい placement へ作り直して復帰する (それも source を
+    /// 保持するので音声無中断、Codex 案D)。`viewer_presentation` だけでなく物理 tuple で比較する
+    /// のは、同一モードでの host/rect 変化を取りこぼさないため (Codex)。
+    #[cfg(windows)]
+    pub(crate) video_audio_mode_entry_target: Option<(
+        crate::video::NativeVideoPlacement,
+        windows::Win32::Foundation::RECT,
+        u64,
+    )>,
+    /// Inc 7 hidden presenter: exit の非同期完了待ち。show / SwitchPlacement を要求したあと、
+    /// presenter が実際に再表示 (`!native_presenter_hidden()`) するまで `video_audio_mode` を
+    /// Some に保って音楽ビューを描き続け、確認後に None へ落とす (逆順だと 1 フレーム映像が
+    /// 出ない穴が空く、Codex Q4)。deadline 超過は presenter 無応答時の保険で detach+attach+seek
+    /// フォールバックへ回す。
+    #[cfg(windows)]
+    pub(crate) video_audio_exit_pending: Option<VideoAudioExitPending>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -7333,6 +7372,10 @@ impl App {
             music_vst_shell: None,
             music_view_close_requested: false,
             video_audio_mode: None,
+            #[cfg(windows)]
+            video_audio_mode_entry_target: None,
+            #[cfg(windows)]
+            video_audio_exit_pending: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -25811,6 +25854,11 @@ impl App {
         // 終わる。stale index (同 idx が別 item を指す) 事故を避けるため必ずクリアする
         // (Codex 7c 設計)。前アイテムの動画プレイヤーはこの後 evict されるので再 attach は不要。
         self.video_audio_mode = None;
+        #[cfg(windows)]
+        {
+            self.video_audio_mode_entry_target = None;
+            self.video_audio_exit_pending = None;
+        }
         // viewer 内の手動ナビ (grid からの新規 open ではない = `fs_open_intent_from_grid` が false、
         // かつ既にフルスクリーン中) で **動画** を開くときは、現在の presentation を維持する
         // (one-shot 焼き付け)。「別ウィンドウで開く」設定は grid からの新規 open (Enter /
@@ -32093,6 +32141,11 @@ impl App {
         // 「動画→音声モード」(Inc 7) はフルスクリーンを閉じたら終わる。動画プレイヤーはこの後
         // fs_cache.clear() で drop されるので、ここではフラグを落とすだけでよい (Codex 7c 設計)。
         self.video_audio_mode = None;
+        #[cfg(windows)]
+        {
+            self.video_audio_mode_entry_target = None;
+            self.video_audio_exit_pending = None;
+        }
         // 音声 VST シェル (Inc 6 ②-3): フルスクリーンを完全に閉じるならシェル状態も落とす。
         // VST GUI の hide/re-owner は下の VST cleanup (show_vst3_manager 経路) が、native 出力の
         // drop は fs_cache.clear() が行うので、ここではフラグを落とすだけでよい。
@@ -41784,6 +41837,9 @@ impl App {
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
             && self.native_video_mode_switch.is_none()
+            // Inc 7 hidden presenter: 音声モード中は presenter を非アクティブ扱いにして
+            // VST owner 同期を止める (presenter は hide されていて owner にしない)。
+            && self.video_audio_mode.is_none()
             && native_owner_hwnd != 0
             && native_owner_hwnd != self.native_video_owner_synced_hwnd
         {
@@ -41862,6 +41918,9 @@ impl App {
         }
         #[cfg(windows)]
         self.poll_native_video_source_swap_pending(ctx);
+        // Inc 7 hidden presenter: 音声モード exit の非同期完了 (presenter 再表示待ち) をポーリング。
+        #[cfg(windows)]
+        self.poll_video_audio_exit_pending(ctx);
         #[cfg(windows)]
         self.poll_detached_video_host_switch_pending(ctx);
         // detached host HWND が変わったら presenter child を現 host へ再親付けする
@@ -42892,7 +42951,9 @@ impl eframe::App for App {
             // 1 件以上来てれば fullscreen 中の VideoPlayer に 1 回だけ `request_hud_raise` を呼ぶ
             // (= coalesce、Codex プラン Step 10)。`try_iter().count()` で要素を消費して個数を取る。
             let pending = self.hud_raise_rx.try_iter().count();
-            if pending > 0 {
+            // Inc 7 hidden presenter: 音声モード中は presenter (+ HUD) が hide されている
+            // ので raise 要求は無視する (HUD teardown 済み)。
+            if pending > 0 && self.video_audio_mode.is_none() {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.request_hud_raise();
