@@ -6822,19 +6822,20 @@ impl App {
     pub(crate) fn fullscreen_embedded_still_active(&self) -> bool {
         self.native_video_in_window_active
             && self.fullscreen_idx.is_some_and(|idx| {
-                matches!(
-                    self.items.get(idx),
-                    Some(
-                        GridItem::Image(_)
-                            | GridItem::ZipImage { .. }
-                            | GridItem::PdfPage { .. }
-                            | GridItem::ZipSeparator { .. }
-                            // 音声 (音楽ビュー) も egui 描画なので静止画と同じ embedded 経路で
-                            // ウィンドウ内表示できる (Inc 5 FB: F11 でウィンドウ化)。native
-                            // presenter を持たないので backdrop early-return には掛からない。
-                            | GridItem::Audio(_)
+                // 音楽ビュー (音声、および Inc 7 で音声モードにした動画) も egui 描画なので静止画と
+                // 同じ embedded 経路でウィンドウ内表示できる (Inc 5 FB: F11 でウィンドウ化)。native
+                // presenter を持たない (音声モードでは detach 済み) ので backdrop early-return には
+                // 掛からない。これは表示/描画経路のゲートなので fs_music_view_active を通す (3 概念分離)。
+                self.fs_music_view_active(idx)
+                    || matches!(
+                        self.items.get(idx),
+                        Some(
+                            GridItem::Image(_)
+                                | GridItem::ZipImage { .. }
+                                | GridItem::PdfPage { .. }
+                                | GridItem::ZipSeparator { .. }
+                        )
                     )
-                )
             })
     }
 

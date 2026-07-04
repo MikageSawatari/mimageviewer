@@ -335,7 +335,19 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   - **7c**: enter/exit ライフサイクル + re-attach + seek 再同期。enter = VST/native owner 整理 →
     detach → `set_video_output_disabled(true)` → music view active。exit = disable clear →
     `attach_native_output_from_config` → 現在位置 seek。`App.video_audio_mode: Option<usize>`
-    （transient、非永続）。
+    （transient、非永続）。**7c で追加対応が要る「予測される非局所ゲート」（7b Codex レビュー指摘、
+    現状は動画のまま = 挙動不変）**:
+    - `handle_fs_key_input` 冒頭の `if is_video_fs { handle_video_input }`（ui_fullscreen.rs）:
+      video-in-audio-mode も `is_video_fs` が true のまま handle_video_input に入る（native
+      presenter は detach 済みで音声モード中）。音声モード中は gate するか no-op を保証する。
+    - `poll_video` の音声分岐（app.rs ~41620 `is_audio` / ~41796 の loop・bookmark・continuous
+      振り分け）: 現状 `GridItem::Audio` のみ音声扱い。video-in-audio-mode は `GridItem::Video`
+      なので、音楽 HUD のループ/連続再生/マーカーと整合させるにはここも音声モードを考慮する
+      （同一 `VideoPlayer` を presenter detach + video 無効で回すので「headless 音声プレイヤー」
+      とは別物 = 単純な predicate 差し替えでなく runtime 設計が要る）。
+    - `fullscreen_video_marker_path`（app.rs ~8121）: video-in-audio-mode は動画パスを返すので
+      seek バーの動画マーカー cache / サムネ decode worker が走る。音声モード中は抑止する。
+    - （`fullscreen_embedded_still_active` は 7b で `fs_music_view_active` 経由に一般化済み。）
   - **7d**: トグル配線（キー / HUD ボタン — **どちらにするかは 7d 着手時にユーザー確認**）+ 解析
     ワーカー start/stop。
   - **7e**: 仕上げ（VST 状態引き継ぎ、EOF / 音声モード中 seek / close from audio mode / file nav /
