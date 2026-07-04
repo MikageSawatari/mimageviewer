@@ -6291,6 +6291,14 @@ impl App {
             );
             return;
         }
+        // placement switch / source-swap 進行中は presenter HWND が作り直される最中。ここで
+        // detach すると `PlacementSwitched` / swap 完了イベントが届かず pending が stale 化して
+        // owner/VST 同期が止まる (Codex 7d P2、docs §5.7.1「switch 中は entry block」)。
+        if self.native_video_mode_switch.is_some()
+            || self.native_video_source_swap_pending.is_some()
+        {
+            return;
+        }
         // presenter が実際に上がっている (HWND publish 済み) ことを確認する。まだ preparing の
         // 動画で音声モードに入るのは無意味なので弾く。
         let has_presenter = matches!(
@@ -6298,6 +6306,16 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hwnd() != 0
         );
         if !has_presenter {
+            return;
+        }
+        // 音声トラックが無い動画は音声モードにしても無音 + 空波形なので弾く (Codex 7d P3)。
+        // info 未取得 (稀、presenter 起動済みなら通常取得済み) のときは許可する。
+        let no_audio_track = matches!(
+            self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if player.info().is_some_and(|i| !i.has_audio)
+        );
+        if no_audio_track {
+            self.show_feedback_toast("この動画には音声トラックがありません".to_string());
             return;
         }
         // ── VST/owner/HUD teardown (exit_music_vst_shell と同じ順序、presenter HWND 生存中に) ──

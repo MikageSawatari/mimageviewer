@@ -383,6 +383,13 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
       （`enter_music_vst_shell` が Audio 限定で no-op のため、7e で対応を検討）。
     - **解析ワーカー**: enter で音楽ビューが描かれると `draw_fs_music_view` → `fs_music_source_for_idx`（動画
       パスを返す）→ `ensure_music_analysis` が自動起動。stop は close/nav の `clear_music_view_state`。
+    - **Codex 7d コードレビュー対応**（P1/P2/P3、修正済み）: (P1) 音声モードの動画では音楽ビュー上バーの
+      **window ボタンを隠す** — window mode にすると exit の presenter 再生成が常に Fullscreen target で
+      不整合になるため（F11/window の音声モード対応は 7e）。(P2) `enter_video_audio_mode` に
+      **placement switch / source-swap 進行中は入場拒否**のガードを追加（detach で `PlacementSwitched`
+      が届かず pending stale 化するのを防ぐ）。(P3) **音声トラック無し動画は入場拒否**（`VideoInfo::has_audio`
+      を見てトースト表示、button 側の非表示化は has_audio を native overlay metadata に流す必要があり 7e）。
+      batch break / 2-mapping / mid-draw exit は Codex 確認済み（追加 generation guard 不要）。
     - bin test 3135 緑・fmt/glyph クリーン。**⚠️ここから実機検証が必要（初の挙動起動）**: 動画再生中に
       ♪ボタン→音声継続で波形表示 / ▶ボタン→動画復帰（seek 音切れは仕様どおり短い） / タグ・★・
       ブックマーク・ループ・音量が音声モードで動く / long video で音声継続。

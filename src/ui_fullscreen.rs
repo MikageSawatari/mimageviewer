@@ -19788,21 +19788,30 @@ impl App {
             .hover_tip_dark("閉じる".to_string());
         painter.rect_filled(close_rect, 4.0, top_btn_bg(close_resp.hovered()));
         draw_overlay_close_icon(&painter, close_rect);
-        // フルスクリーン / ウィンドウ 切り替え
-        let win_rect = egui::Rect::from_center_size(
-            egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
-            egui::vec2(TOP_BTN, TOP_BTN),
-        );
-        top_rx -= TOP_BTN + TOP_BTN_GAP;
-        let win_resp = ui
-            .interact(
-                win_rect,
-                ui.id().with(("music_top_window", fs_idx)),
-                egui::Sense::click(),
-            )
-            .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
-        painter.rect_filled(win_rect, 4.0, top_btn_bg(win_resp.hovered()));
-        draw_overlay_window_toggle_icon(&painter, win_rect);
+        // フルスクリーン / ウィンドウ 切り替え。**音声モードにトグルした動画では隠す** (Codex 7d P1):
+        // window mode にすると exit_video_audio_mode の presenter 再生成が常に Fullscreen target に
+        // なり、アプリ状態 (in-window) と presenter (fullscreen) が不整合になる。F11/window mode の
+        // 音声モード対応は 7e。音声ファイルでは従来どおり表示 (embedded 音楽ビューのウィンドウ化)。
+        let show_window_btn = self.video_audio_mode != Some(fs_idx);
+        let win_clicked = if show_window_btn {
+            let win_rect = egui::Rect::from_center_size(
+                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            let win_resp = ui
+                .interact(
+                    win_rect,
+                    ui.id().with(("music_top_window", fs_idx)),
+                    egui::Sense::click(),
+                )
+                .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
+            painter.rect_filled(win_rect, 4.0, top_btn_bg(win_resp.hovered()));
+            draw_overlay_window_toggle_icon(&painter, win_rect);
+            win_resp.clicked()
+        } else {
+            false
+        };
         // 「動画に戻る」ボタン (Inc 7): 音声モードにトグルした動画のときだけ出す。映像を再開して
         // native presenter を re-attach する。音声ファイルでは出さない (戻る先の動画が無い)。
         #[cfg(windows)]
@@ -19860,7 +19869,7 @@ impl App {
         if close_resp.clicked() {
             self.music_view_close_requested = true;
         }
-        if win_resp.clicked() {
+        if win_clicked {
             self.toggle_still_window_mode();
         }
         #[cfg(windows)]
