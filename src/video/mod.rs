@@ -5363,6 +5363,16 @@ impl VideoPlayer {
         self.dynamic
             .video_output_disabled
             .store(disabled, Ordering::Release);
+        // engine actor にも同期反映する (Inc 7 / Codex 7d 設計)。demux は atomic を読んで映像
+        // パケットを捨てるが、engine の readiness latch は別途「映像を待つか」を判断するので、
+        // ここで actor field を更新しないと、音声モードで seek したとき映像 FirstFrameReady を
+        // 永久に待って Buffering で停止する。bounded channel の try_send は drop され得るので
+        // 使わず、actor を直接 lock して同期更新する (flag→actor→seek の順序を固定して exit race
+        // も防ぐ)。
+        self.engine
+            .lock()
+            .unwrap()
+            .set_video_output_disabled(disabled);
     }
 
     /// 現在の映像出力停止状態 (Inc 7)。

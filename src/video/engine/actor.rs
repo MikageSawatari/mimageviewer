@@ -94,7 +94,16 @@ pub struct EngineActor {
     /// 既定 true (= 従来の動画経路と等価)。audio-only ファイル (映像トラック無し /
     /// 添付画像のみ) では false になり、`ReadinessLatch::is_ready` が FirstFrameReady を
     /// 待たなくなる (映像 decode thread が無く FirstFrameReady が永久に来ないため)。
+    /// これは **ファイルの metadata** (timed video stream の有無) であり、Inc 7 の runtime
+    /// 映像 OFF トグルとは混ぜない (`effective_has_video` で合成する)。
     has_video: bool,
+
+    /// Inc 7 (動画→音声モード) の runtime 映像出力停止フラグ。`true` の間 demux は映像
+    /// パケットを捨てるので FirstFrameReady が来ない。readiness latch でも映像を待たない
+    /// よう `effective_has_video()` で `has_video && !video_output_disabled` に合成する。
+    /// `VideoPlayer::set_video_output_disabled` が atomic store と同時に actor lock 経由で
+    /// **同期更新** する (bounded channel の try_send は drop され得るので使わない、Codex 7d 設計)。
+    video_output_disabled: bool,
 
     /// 現在の seek 世代。`AvClock::request_seek` で bump され、`SeekCompleted` /
     /// `enter_buffering` では進めない。
@@ -168,6 +177,7 @@ impl EngineActor {
             has_audio: false,
             // 既定 true: `InfoReceived` 到着までは従来の動画経路と等価に振る舞う。
             has_video: true,
+            video_output_disabled: false,
             seek_serial,
             av_clock,
             last_observed_serial: initial_serial,
@@ -661,11 +671,33 @@ impl EngineActor {
     /// readiness latch を再評価し、揃っていれば Playing/Paused に遷移する。
     /// `handle_decoder_event(FirstFrameReady)` / `handle_audio_event(BufferReady)` /
     /// `handle_audio_event(AudioInactive)` の各ハンドラ末尾から呼ぶ。
+    /// readiness 判定用の実効的な has_video。ファイル metadata の `has_video` から Inc 7 の
+    /// runtime 映像 OFF (`video_output_disabled`) を差し引く。映像 OFF 中は FirstFrameReady が
+    /// 来ないので、seek 後の Buffering→Playing 遷移で映像を待たない (= 音声だけで復帰する)。
+    fn effective_has_video(&self) -> bool {
+        self.has_video && !self.video_output_disabled
+    }
+
+    /// Inc 7 の runtime 映像出力停止フラグを更新する。`VideoPlayer::set_video_output_disabled`
+    /// から actor lock 経由で **同期呼び出し** される。既に Buffering で映像待ちのまま詰まって
+    /// いる状態を即座に再評価するため `try_transition_from_buffering` を呼ぶ (音声モードで seek
+    /// して停止した状態を、この呼び出し順 (flag→actor→seek) で確実に解消する、Codex 7d 設計)。
+    pub fn set_video_output_disabled(&mut self, disabled: bool) {
+        if self.video_output_disabled == disabled {
+            return;
+        }
+        self.video_output_disabled = disabled;
+        self.try_transition_from_buffering();
+    }
+
     pub(super) fn try_transition_from_buffering(&mut self) {
         if self.state != EngineState::Buffering {
             return;
         }
-        if !self.latch.is_ready(self.has_audio, self.has_video) {
+        if !self
+            .latch
+            .is_ready(self.has_audio, self.effective_has_video())
+        {
             return;
         }
         // anchor source の選択: audio あり → Audio anchor、なし → Wall anchor。
@@ -856,6 +888,36 @@ mod tests {
             !a.latch.first_frame,
             "audio-only は first_frame を前提にしない"
         );
+    }
+
+    #[test]
+    fn video_output_disabled_unsticks_buffering_without_first_frame() {
+        // Inc 7 (動画→音声モード) の #5 回帰: 映像 stream を持つファイル (has_video=true) を
+        // 音声モードで再生中に seek すると Buffering に入るが、映像出力停止中は FirstFrameReady が
+        // 来ないので first_frame 無しで詰まる。set_video_output_disabled(true) で effective_has_video
+        // が false になり、audio anchor + BufferReady だけで Playing へ復帰することを確認する。
+        let mut a = fresh_actor();
+        a.has_audio = true;
+        a.has_video = true; // 映像 stream は「ある」ファイル
+        a.transition_to_buffering(0.0);
+        a.latch.buffer_ready = true;
+        a.latch.audio_anchor = Some((2.0, Instant::now()));
+        // first_frame は来ない (映像出力停止中)。
+        a.try_transition_from_buffering();
+        assert_eq!(
+            a.state,
+            EngineState::Buffering,
+            "映像出力有効のままなら first_frame 待ちで Buffering 固着"
+        );
+        // 音声モード = 映像出力 OFF を同期反映すると、その場で再評価されて Playing へ。
+        a.set_video_output_disabled(true);
+        assert_eq!(
+            a.state,
+            EngineState::Playing,
+            "映像 OFF 反映で first_frame 無しでも Playing へ (#5 修正)"
+        );
+        assert_eq!(a.clock().anchor().source, ClockSource::Audio);
+        assert!(a.has_video, "has_video metadata 自体は保持する");
     }
 
     #[test]
