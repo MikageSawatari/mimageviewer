@@ -22,10 +22,11 @@ use crate::grid_item::GridItem;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
-    draw_native_jump_panel_body, draw_overlay_bookmark_icon, draw_overlay_button_bg,
-    draw_overlay_continuous_icon, draw_overlay_loop_icon, draw_overlay_pause_icon,
-    draw_overlay_play_icon, draw_overlay_replay_icon, draw_overlay_skip_to_marker_icon,
-    draw_overlay_speaker_icon, draw_overlay_speed_control, draw_overlay_volume_slider,
+    draw_native_jump_panel_body, draw_overlay_arrow_icon, draw_overlay_bookmark_icon,
+    draw_overlay_button_bg, draw_overlay_continuous_icon, draw_overlay_loop_icon,
+    draw_overlay_pause_icon, draw_overlay_play_icon, draw_overlay_replay_icon,
+    draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon, draw_overlay_speed_control,
+    draw_overlay_volume_slider,
 };
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
@@ -33,8 +34,10 @@ use crate::video::native_presenter::{
 
 /// 左パネル (ブックマーク) の幅。画像補正パネル (`LEFT_PANEL_WIDTH`) と揃える。
 pub(crate) const MUSIC_LEFT_PANEL_WIDTH: f32 = 292.0;
-/// 右パネル (音楽情報 + タグ) の幅。
-pub(crate) const MUSIC_RIGHT_PANEL_WIDTH: f32 = 340.0;
+/// 右パネル (音楽情報 + タグ) の幅。動画 native の右メタデータパネル
+/// (`native_metadata_panel_width()` = 430) に揃え、video↔audio 切替で幅が
+/// ジャンプしないようにする (Inc 7 ④)。
+pub(crate) const MUSIC_RIGHT_PANEL_WIDTH: f32 = 430.0;
 /// 下 HUD の高さ (seek 行 + コントロール行、常時表示、Inc 5 FB で動画寄りに)。
 pub(crate) const MUSIC_HUD_HEIGHT: f32 = 62.0;
 
@@ -213,6 +216,29 @@ impl App {
             player.set_playing(true);
         }
         self.music_seek_to(fs_idx, 0.0);
+    }
+
+    /// 音楽ビューの下 HUD の前/次ファイルボタンの実体。動画 HUD の ↑↓ ボタン
+    /// (`VideoPrevFile` / `VideoNextFile`) およびキーボードの ↑↓ と同一挙動で、表示順
+    /// (`current_grid_order`) の隣接する移動可能アイテム (画像 / 動画 / 音声) へ移動する。
+    /// キーボード経路 (ui_fullscreen.rs の `nav_delta` → `adjacent_navigable_idx` →
+    /// `open_fullscreen_from_fs_navigation`) をそのまま踏襲する。境界では中央にヒントを出す。
+    /// `delta`: -1 = 前, +1 = 次。
+    pub(crate) fn music_navigate_file(&mut self, ctx: &egui::Context, fs_idx: usize, delta: i32) {
+        // ユーザー入力起点のナビなので input_seq を bump する (キーボード nav の "fs_key" と同様、
+        // perf 帰属 / last_input_at ベースの idle 判定を今回の操作に紐付ける、Codex P3)。
+        self.bump_input_seq("music_nav_file", Some(&format!("delta={delta}")));
+        let display_order = self.current_grid_order().to_vec();
+        if let Some(new_idx) =
+            crate::ui_helpers::adjacent_navigable_idx(&self.items, &display_order, fs_idx, delta)
+        {
+            self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+        } else {
+            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                at_end: delta > 0,
+                at: std::time::Instant::now(),
+            });
+        }
     }
 
     /// J/K マーカーナビ (ブックマーク間の前後ジャンプ)。動画 `VideoMarkerPrev`/`VideoMarkerNext`
@@ -758,6 +784,12 @@ impl App {
         let sc_mute = self
             .keymap
             .first_chord_label(crate::keymap::KeyAction::VideoMute);
+        let sc_prev_file = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoPrevFile);
+        let sc_next_file = self
+            .keymap
+            .first_chord_label(crate::keymap::KeyAction::VideoNextFile);
         let speed = self.video_playback_speed;
         // ループ / 連続再生モードは動画と共有 (video_loop_mode / video_continuous_mode)。
         // 音声はチャプター無しなので effective は Off/Full/Bookmark のみ。
@@ -768,8 +800,6 @@ impl App {
         let loop_eff =
             crate::settings::effective_loop_mode(self.settings.video_loop_mode, false, has_bm_now);
 
-        let accent = egui::Color32::from_rgb(90, 150, 220);
-        let fg = egui::Color32::from_gray(220);
         let painter = ui.painter_at(hud_rect);
         painter.rect_filled(
             hud_rect,
@@ -784,6 +814,12 @@ impl App {
         // 中心を合わせるので、13px フォントだと光学的に上寄りに見え、ドット/アイコンと縦がずれる。
         // 動画側 `text_center_y = center_y + 4.0` (native_presenter/mod.rs) と同値。
         let text_center_y = controls_cy + 4.0;
+        // レイアウト寸法は動画 native HUD (native_presenter/mod.rs) と同値にする (Inc 7 ③):
+        // 端 padding = side_pad、ボタン間 = gap、グループ境界 = gap + group_gap_extra。
+        // シークバー・左クラスタ・右クラスタの端揃え / グループ間隔を動画に一致させる。
+        let side_pad = 10.0;
+        let gap = 8.0;
+        let group_gap_extra = 8.0;
 
         // 収集する操作 (描画中は self を可変借用しないため、末尾でまとめて適用)。
         let mut seek_to: Option<f64> = None;
@@ -793,6 +829,9 @@ impl App {
         let mut cycle_continuous = false;
         let mut toggle_mute = false;
         let mut set_vol: Option<f64> = None;
+        // 前/次ファイル移動 intent (-1 = 前, +1 = 次)。動画 HUD の ↑↓ = VideoPrevFile/NextFile
+        // と同一挙動 (末尾でまとめて適用)。
+        let mut nav_file: Option<i32> = None;
         // 音量ノーマライズボタン (Norm) の左クリック intent。スキャン機構が windows 限定の
         // ため windows でのみ収集・適用する。右クリックは音楽 HUD では使わない (背後の
         // フルスクリーン右クリックハンドラにも届いて二重動作するため。音量/速度と同方針、
@@ -803,14 +842,17 @@ impl App {
         // 束縛する (他フラグと違い条件付き更新ではないため、代入時点で宣言する)。
 
         // ── seek 行 (バー + ブックマークマーカー + クリック/ドラッグ seek) ──
-        let bar_margin = 16.0;
-        let bar_h = 6.0;
+        // シークバーの見た目は動画 native HUD (native_presenter/mod.rs) に揃える (Inc 7 ③):
+        // トラック gray(74) / 角丸 2.0 / 太さ 8、fill は白 (228,228,228)。動画と video↔audio
+        // 切替で視覚ジャンプしないようにする。
+        let bar_margin = side_pad;
+        let bar_h = 8.0;
         let bar_cy = hud_rect.top() + seek_row_h * 0.5;
         let bar_rect = egui::Rect::from_min_max(
             egui::pos2(hud_rect.left() + bar_margin, bar_cy - bar_h * 0.5),
             egui::pos2(hud_rect.right() - bar_margin, bar_cy + bar_h * 0.5),
         );
-        painter.rect_filled(bar_rect, bar_h * 0.5, egui::Color32::from_gray(70));
+        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
         let frac = if dur > 0.0 {
             (pos / dur).clamp(0.0, 1.0) as f32
         } else {
@@ -821,7 +863,7 @@ impl App {
                 bar_rect.min,
                 egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),
             );
-            painter.rect_filled(filled, bar_h * 0.5, accent);
+            painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(228, 228, 228));
         }
         if dur > 0.0 {
             let marker_color = egui::Color32::from_rgb(255, 220, 82);
@@ -850,15 +892,20 @@ impl App {
             seek_to = Some(f * dur);
         }
 
-        // ── コントロール行: 左クラスタ (頭出し / 再生 / 前後ブックマーク / ループ) ──
-        let bsz = 26.0;
-        let mut x = hud_rect.left() + 14.0;
+        // ── コントロール行: 左クラスタ ──
+        // 並び順・グループ間隔・左端揃えを動画 native HUD に完全一致させる (Inc 7 ③ 実機 FB):
+        //   [頭出し][再生] | [ループ][連続][前ファイル][次ファイル] | [前マーカー][次マーカー]
+        // 前/次ファイル (↑↓ = VideoPrevFile/NextFile) は音声でも表示する (実機 FB: 動画と揃える)。
+        // 動画のキャプチャパレット (コマ送り ◀▶ / スクショ / 保存) だけは音声では非表示
+        // (§5.8「音楽は無視」)。グループ内 = gap、境界 = gap + group_gap_extra、始点 = side_pad。
+        let bsz = 28.0;
+        let mut x = hud_rect.left() + side_pad;
         let alloc = |x: &mut f32, w: f32| -> egui::Rect {
             let r = egui::Rect::from_min_size(
                 egui::pos2(*x, controls_cy - bsz * 0.5),
                 egui::vec2(w, bsz),
             );
-            *x += w + 6.0;
+            *x += w + gap;
             r
         };
         // ボタン描画は動画 HUD と共有の primitive を使う (Inc 5c-B3):
@@ -904,47 +951,8 @@ impl App {
             toggle_play = true;
         }
 
-        // 前ブックマーク (|◀)
-        let r = alloc(&mut x, bsz);
-        let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_prevbm", fs_idx)),
-                egui::Sense::click(),
-            )
-            .hover_tip_dark(label_with_shortcut(
-                "前のブックマーク",
-                sc_marker_prev.as_deref(),
-            ));
-        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
-        draw_overlay_skip_to_marker_icon(&painter, r, -1, markers_present);
-        if resp.clicked() {
-            if let Some(&t) = marker_secs.iter().rev().find(|&&s| s < pos - 0.3) {
-                seek_to = Some(t);
-            } else if markers_present {
-                seek_to = Some(0.0);
-            }
-        }
-
-        // 次ブックマーク (▶|)
-        let r = alloc(&mut x, bsz);
-        let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_nextbm", fs_idx)),
-                egui::Sense::click(),
-            )
-            .hover_tip_dark(label_with_shortcut(
-                "次のブックマーク",
-                sc_marker_next.as_deref(),
-            ));
-        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
-        draw_overlay_skip_to_marker_icon(&painter, r, 1, markers_present);
-        if resp.clicked()
-            && let Some(&t) = marker_secs.iter().find(|&&s| s > pos + 0.3)
-        {
-            seek_to = Some(t);
-        }
+        // グループ境界: [頭出し][再生] | [ループ][連続]
+        x += group_gap_extra;
 
         // ループ (Off → 全体 → ブックマーク間 → Off で循環、動画 L キーと共有)。アイコン描画・
         // 配色は動画 HUD (native_presenter) と揃える: 連続再生中は淡色 + no-op、mode_active は
@@ -1029,9 +1037,86 @@ impl App {
             cycle_continuous = true;
         }
 
+        // 前ファイル (↑ = 前の項目、動画 HUD の ↑ = VideoPrevFile と同一)。continuous と同じ
+        // group B に含める (gap のみ、境界なし)。前/次フレーム (コマ送り) とキャプチャは非表示。
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_prevfile", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark(label_with_shortcut("前の項目", sc_prev_file.as_deref()));
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_arrow_icon(&painter, r, -1);
+        if resp.clicked() {
+            nav_file = Some(-1);
+        }
+
+        // 次ファイル (↓ = 次の項目、動画 HUD の ↓ = VideoNextFile と同一)。
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_nextfile", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark(label_with_shortcut("次の項目", sc_next_file.as_deref()));
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_arrow_icon(&painter, r, 1);
+        if resp.clicked() {
+            nav_file = Some(1);
+        }
+
+        // グループ境界: [ループ][連続][前ファイル][次ファイル] | [前マーカー][次マーカー]
+        x += group_gap_extra;
+
+        // 前ブックマーク (|◀)
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_prevbm", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark(label_with_shortcut(
+                "前のブックマーク",
+                sc_marker_prev.as_deref(),
+            ));
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_skip_to_marker_icon(&painter, r, -1, markers_present);
+        if resp.clicked() {
+            if let Some(&t) = marker_secs.iter().rev().find(|&&s| s < pos - 0.3) {
+                seek_to = Some(t);
+            } else if markers_present {
+                seek_to = Some(0.0);
+            }
+        }
+
+        // 次ブックマーク (▶|)
+        let r = alloc(&mut x, bsz);
+        let resp = ui
+            .interact(
+                r,
+                ui.id().with(("music_hud_nextbm", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark(label_with_shortcut(
+                "次のブックマーク",
+                sc_marker_next.as_deref(),
+            ));
+        draw_overlay_button_bg(&painter, r, resp.hovered(), false);
+        draw_overlay_skip_to_marker_icon(&painter, r, 1, markers_present);
+        if resp.clicked()
+            && let Some(&t) = marker_secs.iter().find(|&&s| s > pos + 0.3)
+        {
+            seek_to = Some(t);
+        }
+
         // ── コントロール行: 右クラスタ (右寄せ: リミッター / dB ラベル / 音量 / Norm /
         // ミュート / 速度 / 時間) ──
-        let mut rx = hud_rect.right() - 14.0;
+        // 右端 padding は動画 native HUD の side_pad に揃える (旧 14 → 10、音量バー位置ズレ修正)。
+        let mut rx = hud_rect.right() - side_pad;
         // リミッター作動ドット (最右、動画 HUD の vol_label の右に置くのと同じ)。normalize
         // 有効時のみスロットを確保し、直近作動時だけ赤ドットを描く。
         let limiter_slot_w = 14.0;
@@ -1060,12 +1145,12 @@ impl App {
         // 現在音量の dB 表示ラベル (最右、動画 HUD の「スライダーの右」配置に合わせる)。
         // ミュート状態に関わらず実効音量を dB で示す。共有の
         // `format_video_volume_db_compact` を使い動画と表記を揃える (-∞dB / 0.0dB / +3.0dB)。
-        let vol_label_w = 52.0;
+        let vol_label_w = 60.0;
         let vol_db_label = crate::video::native_presenter::format_video_volume_db_compact(cur_vol);
         let vol_label_color = if cur_vol > 1.0 {
             egui::Color32::from_rgb(255, 210, 80)
         } else {
-            fg
+            egui::Color32::from_rgb(238, 238, 238)
         };
         painter.text(
             egui::pos2(rx, text_center_y),
@@ -1081,12 +1166,12 @@ impl App {
         // フェーダーマッピングは `video_volume_*_fader_pos` (-80..+18dB) を共有し、独自 dB
         // マップだと高ブースト/微小音量がつぶれる問題 (Codex P3) も解消済み。永続化は
         // ドラッグ確定 / クリック / ダブルクリック時のみ (`persist=true`、毎フレーム save 回避)。
-        let vol_w = 120.0;
+        let vol_w = 144.0;
         let vol_rect = egui::Rect::from_min_max(
             egui::pos2(rx - vol_w, controls_cy - 4.0),
             egui::pos2(rx, controls_cy + 4.0),
         );
-        rx -= vol_w + 10.0;
+        rx -= vol_w + 8.0;
         // 音量ツールチップに Shift+↑↓ (`VideoVolumeUp/Down`) のショートカットを併記する
         // (動画 HUD と揃える、実機 FB 2026-07-02)。`&mut self` を握る `vol_target` より前に
         // owned String を作っておき、借用衝突を避ける。
@@ -1140,7 +1225,8 @@ impl App {
                 .get(&fs_idx)
                 .copied()
                 .unwrap_or_default();
-            let norm_w = 44.0;
+            // Norm ボタン幅は動画 native HUD の norm_w (= btn_size) に揃える (Inc 7 ③)。
+            let norm_w = bsz;
             let norm_rect = egui::Rect::from_min_size(
                 egui::pos2(rx - norm_w, controls_cy - bsz * 0.5),
                 egui::vec2(norm_w, bsz),
@@ -1233,7 +1319,8 @@ impl App {
         // 再生速度: 動画/音楽共有の speed ボタン + プリセット popup (Inc 5c-B2)。
         // 左クリックで popup をトグル、右クリック / ダブルクリックで x1。動画と同じ 11
         // プリセット (`PLAYBACK_SPEED_CHOICES`) / ラベル形式 (`format_playback_speed`) に揃う。
-        let spd_w = 46.0;
+        // 速度ボタン幅は動画 native HUD の speed_w (= btn_size * 1.55) に揃える (Inc 7 ③)。
+        let spd_w = bsz * 1.55;
         let spd_r = egui::Rect::from_min_size(
             egui::pos2(rx - spd_w, controls_cy - bsz * 0.5),
             egui::vec2(spd_w, bsz),
@@ -1263,13 +1350,16 @@ impl App {
             speed_popup_open,
             &mut speed_popup_rect_sink,
         );
-        // 時間 (速度ボタンの左に右寄せ)
+        // 時間表示は動画 native HUD に揃える (Inc 7 ③): 速度ボタンの左に time_w=132 の固定
+        // スロットを取り、その左端に LEFT_CENTER・14px・白(238) で置く。旧実装は速度ボタンに
+        // 右寄せで密着していて、動画 (左寄せ・スロット左端) と再生時間の x がズレていた。
+        let time_w = 132.0;
         painter.text(
-            egui::pos2(rx, text_center_y),
-            egui::Align2::RIGHT_CENTER,
+            egui::pos2(rx - time_w, text_center_y),
+            egui::Align2::LEFT_CENTER,
             format!("{} / {}", format_hms(pos), format_hms(dur)),
-            egui::FontId::proportional(13.0),
-            fg,
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_rgb(238, 238, 238),
         );
 
         // ── 操作を適用 (self / player の可変借用を分離) ──
@@ -1342,6 +1432,13 @@ impl App {
             } else {
                 self.handle_toggle_normalize(&ctx, fs_idx);
             }
+        }
+
+        // 前/次ファイル移動 (動画 HUD の ↑↓ = VideoPrevFile/NextFile と同じ経路)。表示順の
+        // 隣接する移動可能アイテム (Audio/Video/画像) へ移動する。ビューを切り替えるので他 intent
+        // とは排他 (単一クリック)。
+        if let Some(delta) = nav_file {
+            self.music_navigate_file(&ctx, fs_idx, delta);
         }
     }
 

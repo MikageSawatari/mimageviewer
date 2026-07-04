@@ -515,12 +515,36 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
         を drop せず hide + consume-and-hold にし、exit は show するだけ（seek/audio を触らない）なので**完全
         シームレス**。placement 変化を伴う exit も SwitchPlacement（source 保持）で音声無中断（Codex 案D）。
         video-only reprime API は不要になった。**⚠️ 実機で音切れ解消をユーザー確認待ち**。
-      - **③ 下 HUD の見た目（シークバー色 / Norm ボタン / 再生時間位置）が動画とズレ**、**④ 右パネルの ★ 説明・
-        パネルサイズが動画とズレ**（未対応 = 次の作業）: 動画を基準に音声側を寄せる（動画はリリース済み）。
-        §5.8 の HUD 共有の続き。右パネルは情報の中身が違うのは可、★ ラベルとパネル幅を動画に合わせる。
+      - **③ 下 HUD の見た目（シークバー色 / Norm ボタン / 再生時間位置） → ✅ 実装済み（2026-07-04）**:
+        `draw_music_bottom_hud`（`ui_music_panels.rs`）を動画 native HUD 値に揃えた。シークバー =
+        トラック gray(74) / 角丸 2.0 / 太さ 8 / fill 白(228,228,228)（旧: 青 accent・角丸・太さ 6）。
+        ボタン bsz 26→28・gap 6→8、右クラスタ幅（vol 120→144 / dB ラベル 52→60 / Norm 44→28 =
+        btn_size / 速度 46→btn_size×1.55）、dB ラベル色 gray(220)→白(238)、再生時間 = 速度ボタン左に
+        time_w=132 の固定スロットを取り LEFT_CENTER・14px・白(238)（旧: 右寄せ・13px・gray220、動画と x が
+        ズレていた）。Norm ボタンの配色/5 状態は 5c-B3 で既に一致済み（幅のみ調整）。
+        - **左クラスタの並び順・グループ間隔・前後ファイル（実機 FB 2026-07-04 の続き）**: 旧実装は
+          `頭出し・再生・前M・次M・ループ・連続` の順で gap も均一だった。動画 native HUD に完全一致させ、
+          並びを `[頭出し][再生] | [ループ][連続][前ファイル][次ファイル] | [前マーカー][次マーカー]` に、
+          グループ内 gap=8 / グループ境界 = gap + group_gap_extra=16、左右端 padding = side_pad=10 にした。
+          **前/次ファイル（↑↓ = VideoPrevFile/NextFile）は音声でも表示**し、`music_navigate_file`
+          （キーボード ↑↓ と同じ `adjacent_navigable_idx` → `open_fullscreen_from_fs_navigation`）に配線。
+          動画のキャプチャパレット（コマ送り ◀▶ / スクショ / 保存）と前/次フレームだけ非表示（§5.8「音楽は
+          無視」）。右クラスタの右端 padding も 14→10（side_pad）にして音量バー位置を動画に一致させた。
+      - **④ 右パネルの ★・パネル幅 → ✅ 実装済み（2026-07-04）**: `MUSIC_RIGHT_PANEL_WIDTH` 340→430
+        （動画 `native_metadata_panel_width()` に一致）。呼び出し側（`ui_fullscreen.rs`）で
+        `min(430, view_width×0.5)` にクランプ（動画 `native_metadata_panel_rect` と同じ、Codex P3）。★ は
+        共有 `draw_rating_stars` で描いており動画と同一（幅を揃えたことでタグ chips の窮屈さも解消）。
+        - **既知の制限（§5.8 の方針どおり）**: 音楽 HUD は動画の `CompactionTier` を共有しない（プランで
+          「音楽は常に Full」と決定済み）ため、ビュー幅が狭いと右クラスタ + 時間スロットが左ボタン群と
+          重なりうる（Codex P2）。前/次ファイルボタン追加で重なり閾値は ~814px（limiter 表示時）まで広がったが、
+          フルスクリーン音楽ビューの実幅は通常 1280px 以上でこの領域に入らないので許容。将来 compaction を
+          共有する場合は 5c-B4 で対応する。
   - **7-hidden** ✅（2026-07-04）: ① の hidden presenter 実装（§5.7.0 の「実装完了」注記が正本）。
   - **7-eof** ✅（2026-07-04）: 連続再生 EOF の音声モード対応（Option A = 音声モードのまま次動画の音声へ、
     Codex 案Z）。§5.7.1 の「連続再生 EOF → ✅ 実装済み」注記が正本。実機確認待ち。
+  - **7-③④** ✅（2026-07-04）: 下 HUD（シークバー色 / ボタン寸法 / dB ラベル色 / 再生時間位置）と右パネル幅を
+    動画 native HUD に揃えた（§5.7 の ③④ 注記が正本、§5.8 HUD 共有の続き）。build + test 3136 green +
+    Codex レビュー（P3 = 右パネル幅クランプ修正、P2 = 狭幅 overlap は §5.8 の no-compaction 方針で許容）。実機確認待ち。
   - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、DetachedWindow(F12) の
     音声モード対応 / close from audio mode / file nav / long video の memory・audio 継続の smoke。① seek 音切れ
     は 7-hidden で、連続再生 EOF は 7-eof で解消済み）。

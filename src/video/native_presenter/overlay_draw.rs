@@ -1608,7 +1608,7 @@ pub(super) fn draw_overlay_frame_step_icon(
 /// ファイル切替は上下キーに対応する操作なので、左右矢印 (= シーク操作の慣習) ではなく
 /// 上下三角を使う。同じ HUD 行に並ぶ `|◀ ▶|` (skip marker) や `◀ ▶` (frame step) との
 /// 衝突を避けつつ、「上=前、下=次」のキーボード規約と一致させる。
-pub(super) fn draw_overlay_arrow_icon(painter: &egui::Painter, rect: egui::Rect, direction: i32) {
+pub(crate) fn draw_overlay_arrow_icon(painter: &egui::Painter, rect: egui::Rect, direction: i32) {
     let color = egui::Color32::from_rgb(238, 238, 238);
     let c = rect.center();
     let sign = if direction < 0 { -1.0 } else { 1.0 };

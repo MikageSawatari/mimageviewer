@@ -19509,7 +19509,10 @@ impl App {
         // egui の z-order 上はパネルが優先するはずだが、ポインタがパネル上にあるフレームは
         // 念のため seek を抑止して二重反応を防ぐ (Codex P2)。
         let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
-        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH;
+        // 動画 native の右メタデータパネル (`native_metadata_panel_rect`) と同じく幅を
+        // ビュー幅の半分でクランプする (Inc 7 ④ / Codex P3)。狭幅ウィンドウで右パネルが
+        // timeline の半分超を覆わないようにする。
+        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(rect.width() * 0.5);
         // 改名 / 一括登録の中央モーダル、または再生前ノーマライズスキャンのモーダルを開いて
         // いる間は端ホバーのパネルを出さず、timeline seek も抑止し、HUD も非操作にする
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
