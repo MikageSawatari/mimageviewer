@@ -6357,6 +6357,12 @@ impl App {
             player.set_video_output_disabled(true);
         }
         self.video_audio_mode = Some(fs_idx);
+        // 動画モードで追加/改名/削除したブックマークを音楽ビューへ確実に反映する (#6 修正)。
+        // 動画側は video_bookmark_db + fullscreen_video_marker_cache を更新するが、音楽ビューの
+        // music_bookmarks は別キャッシュ (music_bookmarks_loaded_for でゲート) なので、exit で
+        // キャッシュを保持したまま動画側で書き換えると stale になる。enter でロード済みフラグを
+        // 落として、次の draw_fs_music_view で DB から再ロードさせる。
+        self.music_bookmarks_loaded_for = None;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get_mut(&fs_idx) {
             let _ = player.take_native_output();
         }

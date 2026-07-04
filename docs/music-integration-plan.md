@@ -408,8 +408,30 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
     - bin test 3135 緑・fmt/glyph クリーン。**⚠️ここから実機検証が必要（初の挙動起動）**: 動画再生中に
       ♪ボタン→音声継続で波形表示 / ▶ボタン→動画復帰（seek 音切れは仕様どおり短い） / タグ・★・
       ブックマーク・ループ・音量が音声モードで動く / long video で音声継続。
-  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、seek 音切れ仕様 /
-    連続再生 EOF / DetachedWindow(F12) の音声モード対応 / close from audio mode / file nav /
+    - **実機 FB 第 2 弾（2026-07-04）= 切替 OK。追加で 6 点 FB**（①⑤⑥=機能バグ / ③④=見た目 / ①=音切れ）:
+      - **⑤ 音声モードで seek すると再生停止（修正済み、commit ab64e8dc、Codex 設計）**: engine actor の
+        readiness latch が `has_video`（= 映像 stream の有無、metadata）で first_frame を待つため、映像出力
+        OFF 中の seek 後 Buffering に FirstFrameReady が来ず永久固着。actor に runtime `video_output_disabled`
+        を持たせ `effective_has_video = has_video && !video_output_disabled` で latch を判定（映像 OFF 中は
+        音声だけで Playing 復帰）。`VideoPlayer::set_video_output_disabled` が atomic store と同時に actor を
+        直接 lock して同期更新（bounded channel の try_send は drop され得るので不可 / flag→actor→seek 順を固定
+        して exit race も防ぐ）。unit test 追加。**has_video metadata 自体は不変**（Codex 確認、is_ready の
+        1 箇所のみ effective 化、anchor は has_audio 優先で不変）。
+      - **⑥ 動画モードで付けたブックマーク名が音声モードに反映されない（修正済み）**: `exit_video_audio_mode`
+        は解析キャッシュ保持のため `music_bookmarks_loaded_for` を残すので、動画側で bookmark を書き換えると
+        音楽ビューの `music_bookmarks` キャッシュが stale になる（同 path key で reload されない）。DB
+        (`video_bookmark_db`) 自体は動画側 `update_title` で更新済みなので、`enter_video_audio_mode` で
+        `music_bookmarks_loaded_for = None` にして次 draw で DB 再ロード。逆方向（音声→動画）は enter 時に
+        `fullscreen_video_marker_cache = None` されるので exit で rebuild = 問題なし。
+      - **① 音声→動画で音切れ（7e で仕様確定、Codex 助言で今回は許容）**: exit の `seek(現在位置)` が audio
+        buffer clear + flush を伴う（enter 側の映像カット無中断とは非対称）。完全無音断には audio を触らない
+        **video-only reprime / control plane** が要り Inc 7 応急修正の範囲外。7e で「短い exit gap を許容」か
+        「video-only reprime 新設」を確定。
+      - **③ 下 HUD の見た目（シークバー色 / Norm ボタン / 再生時間位置）が動画とズレ**、**④ 右パネルの ★ 説明・
+        パネルサイズが動画とズレ**（未対応 = 次の作業）: 動画を基準に音声側を寄せる（動画はリリース済み）。
+        §5.8 の HUD 共有の続き。右パネルは情報の中身が違うのは可、★ ラベルとパネル幅を動画に合わせる。
+  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、① seek 音切れ仕様（video-only
+    reprime 判断）/ 連続再生 EOF / DetachedWindow(F12) の音声モード対応 / close from audio mode / file nav /
     long video の memory・audio 継続の smoke）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
