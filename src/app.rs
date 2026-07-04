@@ -8129,10 +8129,10 @@ impl App {
         // 音声 (映像なし動画) は FsCacheEntry::Video で再生されるが、ブックマークは
         // music_bookmarks 正本で管理する。動画マーカー cache / サムネ decode worker を
         // 音声に走らせないよう、ここで None を返して除外する (Codex 設計 P2)。
-        // 音声モードにトグルされた動画 (Inc 7) も音楽ビュー扱いなので同様に除外する。
-        if matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
-            || self.video_audio_mode == Some(fs_idx)
-        {
+        // 音声モードにトグルされた動画 (Inc 7) も音楽ビュー扱いなので同様に除外する。判定は
+        // predicate 経由にして stale index ガード (fullscreen_idx / Video 種別) も揃える
+        // (Codex 7c code review forward note)。
+        if self.fs_music_view_active(fs_idx) {
             return None;
         }
         self.fs_video_player(fs_idx)

@@ -362,7 +362,14 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
       - **連続再生 EOF**: 音声モードの動画は raw `is_audio_file=false` なので `handle_video_continuous_eof`
         （次の動画へ）に流れる。次を音声モードで開くか、音声モード中は連続を止めるかは 7e で確定。
       - **F11 / window-mode を音声モード中に押した場合**の挙動（no-op か embedded 音楽ビュー切替か）は 7e。
+        現状: `handle_video_input` が gate off + still F11 経路は `GridItem::Video` を除外するので音声モード中の
+        F11 は実質 no-op、音楽上バーの window ボタン (`toggle_still_window_mode`) は動く（Codex 7c code note）。
       - native event batch 打ち切り（音声モードへ入ったフレームの stale イベント）はトリガ実装時（7d）に確認。
+      - **音声モードへのトグル入場は deferred source-swap / native-event batch 進行中はブロックする**
+        （`fullscreen_idx = Some` を直接書く経路 app/native_video.rs ~734/~808 と競合させない、7d、Codex note）。
+      - **音楽 HUD の VST ボタン**は現状 `enter_music_vst_shell` が `GridItem::Audio` 限定なので、音声モードの
+        動画では no-op になる。7d/7e で video-in-audio-mode も VST シェルへ入れるか、動画では隠すかを決める
+        （Codex 7c code note）。
   - **7d**: トグル配線（キー / HUD ボタン — **どちらにするかは 7d 着手時にユーザー確認**）+ 解析
     ワーカー start/stop + 実機検証。
   - **7e**: 仕上げ（VST 状態引き継ぎ、上記の seek 音切れ仕様 / 連続再生 EOF / F11 / close from audio
