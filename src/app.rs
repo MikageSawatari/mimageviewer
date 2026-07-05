@@ -38182,6 +38182,19 @@ impl App {
     }
 
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        // Inc 7 (7e): 動画→音声モード中は native presenter が hide されている (または VST ホストとして
+        // 流用中)。F12 の presentation 切替は動画の場合 presenter を能動 rebuild する (下の video 分岐)
+        // ので、hidden presenter × active host migration という未対応の組み合わせになる。F12 は
+        // egui fs (handle_fs_key_input) / native presenter / main window / VST サブモードの複数入口から
+        // ここに合流するので、どの経路でも確実に弾けるよう入口を 1 箇所に集約してガードする
+        // (fs_music_view_active は VST 中 false なので入口側の判定では VST サブモードを取りこぼす、
+        // Codex 7e P2)。音声モードを抜けてから切り替える運用にする。
+        if self.video_audio_mode.is_some() {
+            self.show_feedback_toast(
+                "音声モードを終了してから別ウィンドウ表示に切り替えてください".to_string(),
+            );
+            return;
+        }
         #[cfg(windows)]
         {
             if self.detached_toggle_disabled_by_always_new_images() {

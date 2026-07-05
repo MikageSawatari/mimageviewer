@@ -621,9 +621,35 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
       intercept、EOF/window/presenter-close guard）+ **コードレビュー 3 ラウンド**（P1 native-nav bypass →
       funnel teardown、P2 tick teardown gaps ×2 → helper 共有 + Active 前 hwnd チェック、P1v2 re-hide で
       次動画真っ黒 → native 経路は可視維持、最終「全解消」）。build + test 3136 green + fmt/glyph clean。
-  - **7e-残り**: DetachedWindow(F12) の音声モード対応 / long video の memory・audio 継続 smoke（① seek
-    音切れは 7-hidden、連続再生 EOF は 7-eof、file nav は 7-navfix、右クリック/リング/close は 7-rclick、
-    音声モード切替キー（既定 Z）は 7-audiomode-key、VST 引き継ぎは 7e-vst で解消済み）。
+  - **7e-detached** ✅（2026-07-05、実機 OK = ①主機能 / ②ゲート / ④regression）: **DetachedWindow(F12)
+    の音声モード対応**（動画を別ウィンドウ表示のまま ♪/Z で音声モードへ、▶/Z で動画復帰）。描画/backdrop/
+    host-resync 経路は既に `fs_music_view_active` 述語で音楽ビューへ追随するので、enter の DetachedWindow
+    reject を撤廃するだけでほぼ成立（Explore マップ + Codex Q1 で確認。`native_video_target_for_presentation`
+    は元から detached host hwnd + client rect を返す）。追加防御 3 点（Codex 設計 1R + コードレビュー 3R）:
+    - **enter で detached は entry_target 確定を必須化**: `video_audio_mode_entry_target` を teardown 前に
+      先取りし、DetachedWindow で `None`（別ウィンドウ生成中 / host 未捕捉の過渡フレーム）なら toast + no-op。
+      None のまま進むと exit が fallback（detach+attach+seek = 短い音切れ）へ劣化するのを防ぐ。
+    - **音声モード中の detached host-resync を defer**（`try_resync_detached_video_host` 先頭で
+      `video_audio_mode.is_some() && video_audio_vst.is_none()` なら `return false`）: death-gate は child
+      生存中だけ保護するので、音声モード中に host teardown で child 死亡 →
+      `sync_detached_video_child_presenter_rect` の SwitchPlacement が hidden presenter を audio-mode exit と
+      同様に un-hide し「音声モードなのに動画が出る」のを防ぐ。child が死んでも exit 側の SwitchPlacement /
+      fast-show が作り直す（VST ホスト中は presenter を意図的に出しているので通常経路）。
+    - **音声モード中の F12（presentation 切替）は gate off**（②はゲート維持で決着）: `toggle_detached_viewer_mode`
+      先頭の単一チョークポイントで `video_audio_mode.is_some()` を弾く（egui fs / native / main window / VST
+      サブモードの全入口が合流。`fs_music_view_active` は VST 中 false なので入口側判定では submode を取りこぼす
+      → チョークポイントに集約、Codex P2）。トースト「音声モードを終了してから別ウィンドウ表示に切り替えて
+      ください」。加えて遅延 F12 detach migration（`pending_detached_video_host_switch`）中は enter を
+      in-flight switch 扱いでブロック（Codex P2）。
+    - 回帰テスト: `detached_video_host_resync_defers_during_audio_mode` /
+      `f12_toggle_is_blocked_during_video_audio_mode`。build + test 3138 green + fmt/glyph clean。
+  - **7e-残り**: **③ 音声ファイルの F12 別ウィンドウ化**（音声モードは動画専用だが、`GridItem::Audio` 単体も
+    F12 で別ウィンドウに音楽ビューを出せるようにする。現状 `viewer_item_supports_session` に Audio 未追加の
+    ため F12 が設定フラグ + トーストだけ動いて切り替わらない = 誤トースト。ユーザー選択 = ③のみフル対応、
+    2026-07-05）/ long video の memory・audio 継続 smoke（① seek 音切れは 7-hidden、連続再生 EOF は 7-eof、
+    file nav は 7-navfix、右クリック/リング/close は 7-rclick、音声モード切替キー（既定 Z）は 7-audiomode-key、
+    VST 引き継ぎは 7e-vst、DetachedWindow(動画) は 7e-detached で解消済み）。② 音声モード中の F12 は
+    7e-detached でゲート維持決着（hidden presenter のウィンドウ跨ぎ移送を要するため本 increment ではスコープ外）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

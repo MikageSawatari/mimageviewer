@@ -7598,6 +7598,10 @@ impl App {
                 .keymap
                 .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
         {
+            // 動画→音声モード中の F12 は toggle_detached_viewer_mode 内の一括ガードで弾く
+            // (音声モードでは presenter を能動 rebuild する video 切替は未対応、7e)。egui fs /
+            // native / main window / VST サブモードのどの入口から来ても同じチョークポイントで
+            // 止めるため、ここでは特別扱いしない (Codex 7e P2)。
             self.toggle_detached_viewer_mode();
             return action;
         }

@@ -16835,6 +16835,92 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_video_host_resync_defers_during_audio_mode() {
+        // Inc 7 (7e): 動画→音声モード (presenter は hide されているだけで生存) 中は、host teardown
+        // 検出時の再親付け (SwitchPlacement) を保留する。さもないと presenter が hidden な
+        // SwitchPlacement を audio-mode exit と同様に「un-hide して映像復帰」扱いし、「音声モード
+        // なのに動画が出る」ため (Codex 7e 助言)。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.native_video_mode_switch = None;
+
+        // 音声モード中は resync を保留する (pending を残して retry)。
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = None;
+        app.pending_detached_video_host_resync = true;
+        app.poll_detached_video_host_resync();
+        assert!(
+            app.pending_detached_video_host_resync,
+            "resync must be deferred (request retained) while in audio mode"
+        );
+        assert!(
+            !app.try_resync_detached_video_host(),
+            "try_resync returns false (deferred) during audio mode"
+        );
+
+        // 音声モードを抜けたら通常の death-gate 判定に戻る (テスト player は publish HWND=0 =
+        // presenter 未確立なので再親付け不要 → 要求は破棄される)。
+        app.video_audio_mode = None;
+        app.poll_detached_video_host_resync();
+        assert!(
+            !app.pending_detached_video_host_resync,
+            "after leaving audio mode the resync request resolves via the normal death-gate"
+        );
+
+        // VST ホスト表示中 (presenter を意図的に un-hide) は保留せず通常経路に任せる。
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = Some(VideoAudioVstState {
+            fs_idx: video,
+            phase: VideoAudioVstPhase::Active,
+        });
+        app.pending_detached_video_host_resync = true;
+        app.poll_detached_video_host_resync();
+        assert!(
+            !app.pending_detached_video_host_resync,
+            "with the VST host visible the presenter is intentionally shown; resync follows the normal path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn f12_toggle_is_blocked_during_video_audio_mode() {
+        // Inc 7 (7e): 動画→音声モード中の F12 (別ウィンドウ切替) は toggle_detached_viewer_mode 内の
+        // 一括ガードで弾く。egui fs / native / main window / VST サブモードのどの入口から来ても、
+        // presenter の能動 rebuild を伴う presentation 切替は音声モード中は行わない (Codex 7e P2)。
+        // ガードは関数先頭で即 return するので、native 切替経路には一切入らない。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        let before = app.settings.detached_viewer_enabled;
+
+        // 音声モード中はガードで即 return し、detached_viewer_enabled 設定は変わらない。
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = None;
+        app.toggle_detached_viewer_mode();
+        assert_eq!(
+            app.settings.detached_viewer_enabled, before,
+            "during audio mode F12 must be blocked (guard returns before flipping the setting)"
+        );
+
+        // VST サブモード (video_audio_vst Some、video_audio_mode も Some) でも弾かれる。
+        // fs_music_view_active は VST 中 false なので入口側の判定だけでは取りこぼすが、
+        // ここの一括ガードは video_audio_mode.is_some() を見るので確実に止まる。
+        app.video_audio_vst = Some(VideoAudioVstState {
+            fs_idx: video,
+            phase: VideoAudioVstPhase::Active,
+        });
+        app.toggle_detached_viewer_mode();
+        assert_eq!(
+            app.settings.detached_viewer_enabled, before,
+            "during the VST-host submode F12 must also be blocked"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn continuous_autoadvance_keeps_presentation_over_open_in_window_setting() {
         // 「画像・動画を別ウィンドウで開く」ON でも、連続再生の自動次送りでは直前の動画の
         // presentation を維持する (別ウィンドウのちらつきを出さない)。手動 open は従来どおり

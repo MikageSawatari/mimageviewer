@@ -644,6 +644,17 @@ impl App {
         if !self.detached_video_presentation_active_or_targeted() {
             return true; // 再親付け対象でない → 要求は破棄してよい
         }
+        // Inc 7 (動画→音声モード): presenter は hide されているだけで生存している。ここで host
+        // teardown による child 死亡を検出して `sync_detached_video_child_presenter_rect` の
+        // `SwitchPlacement` を走らせると、presenter 側が hidden な SwitchPlacement を audio-mode
+        // exit と同様に「un-hide して映像復帰」扱いしてしまい、「video_audio_mode は Some なのに
+        // 動画が出る」ことがある。音声モード中は resync を保留し (pending を残して retry)、child が
+        // 死んでいれば exit 側の SwitchPlacement / fast-show が正しく作り直す (Codex 7e 助言)。
+        // VST ホスト表示中 (video_audio_vst Some) は presenter を意図的に un-hide しているので
+        // 通常経路に任せる。
+        if self.video_audio_mode.is_some() && self.video_audio_vst.is_none() {
+            return false; // 保留 = pending を残し、音声モードを抜けてから再評価する
+        }
         if self.native_video_mode_switch.is_some() {
             return false; // 切替中は重ねられない。完了後に再試行
         }
@@ -6422,18 +6433,26 @@ impl App {
         {
             return;
         }
-        // フルスクリーン / ウィンドウ内 (MainWindow) 両方で使える (ユーザー要望: フルスクリーン限定は
-        // VST の方)。別ウィンドウ (F12 DetachedWindow) は open path 同等の detached defer が要るので
-        // 現状は未対応 (7e)。
-        if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow) {
-            self.show_feedback_toast("別ウィンドウ表示では音声モードは未対応です".to_string());
-            return;
-        }
+        // フルスクリーン / ウィンドウ内 (MainWindow) / 別ウィンドウ (F12 DetachedWindow) の
+        // いずれでも使える。DetachedWindow は presenter child が detached viewport host に
+        // ぶら下がるが、描画/backdrop/host-resync 経路は既に fs_music_view_active 述語を通して
+        // 音楽ビューへ追随する (7e、docs §5.7.1)。ただし detached では下の entry_target 捕捉を
+        // 必須にして、host 過渡フレームでの劣化 (exit fallback = 音切れ) を防ぐ。なお音声モード中の
+        // F12 (presentation 切替) は hidden presenter の rebuild を伴うため gate off にしている
+        // (ui_fullscreen.rs の handle_fs_key_input、Codex 7e 助言)。
         // placement switch / source-swap 進行中は presenter HWND が作り直される最中。ここで
         // detach すると `PlacementSwitched` / swap 完了イベントが届かず pending が stale 化して
         // owner/VST 同期が止まる (Codex 7d P2、docs §5.7.1「switch 中は entry block」)。
+        //
+        // 7e: 遅延 F12 detach migration (`pending_detached_video_host_switch`) も in-flight な
+        // placement switch として扱い入場をブロックする。F12 で detach を試みて detached host が
+        // 未 ready のまま音声モードに入ると、後で host ready 時に `poll_detached_video_host_switch_pending`
+        // が `switch_native_video_viewer_presentation` を走らせ、hidden presenter を un-hide して
+        // 「音声モードなのに動画が出る」ことがあるため (Codex 7e P2)。migration 完了後に再度
+        // ♪/Z を押せば通常経路で音声モードへ入れる。
         if self.native_video_mode_switch.is_some()
             || self.native_video_source_swap_pending.is_some()
+            || self.detached_video_host_switch_pending()
         {
             return;
         }
@@ -6454,6 +6473,21 @@ impl App {
         );
         if no_audio_track {
             self.show_feedback_toast("この動画には音声トラックがありません".to_string());
+            return;
+        }
+        // exit で placement 復帰の判定に使う enter 時点の物理ターゲット (placement / rect /
+        // owner_hwnd) を先に捕捉する。DetachedWindow では host HWND / client rect が取れない
+        // 過渡フレーム (別ウィンドウ生成中 / host 未捕捉) がある。target が None のまま進むと
+        // exit が fallback (detach+attach+seek = 短い音切れ) に劣化するので、detached では
+        // target 確定を必須にして、取れなければ teardown 前に no-op で抜ける (Codex 7e 助言)。
+        // Fullscreen / MainWindow は main_hwnd 前提なので通常 Some。
+        let entry_target = self.native_video_target_for_presentation(self.viewer_presentation);
+        if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            && entry_target.is_none()
+        {
+            self.show_feedback_toast(
+                "別ウィンドウの準備中です。少し待ってからもう一度お試しください".to_string(),
+            );
             return;
         }
         // ── VST/owner/HUD teardown (exit_music_vst_shell と同じ順序、presenter HWND 生存中に) ──
@@ -6481,12 +6515,10 @@ impl App {
         // (consume-and-hold)」にする。これで exit は show するだけで映像復帰でき、seek / audio
         // を触らないので音切れが起きない (現行 detach + re-attach + seek の弱点だった)。
         //
-        // exit で placement 復帰の判定に使うため、enter 時点の物理ターゲット
-        // (placement / rect / owner_hwnd) を捕捉する。音声モード中に全画面⇔ウィンドウを切り替えて
-        // から戻ったとき、これと現在ターゲットを比較して「そのまま show」か「SwitchPlacement で
-        // 作り直し」かを選ぶ (Codex 案D)。
-        self.video_audio_mode_entry_target =
-            self.native_video_target_for_presentation(self.viewer_presentation);
+        // 上で捕捉した enter 時点の物理ターゲットを保存する。音声モード中に全画面⇔ウィンドウ⇔
+        // 別ウィンドウを切り替えてから戻ったとき、これと現在ターゲットを比較して「そのまま show」か
+        // 「SwitchPlacement で作り直し」かを選ぶ (Codex 案D)。
+        self.video_audio_mode_entry_target = entry_target;
         self.video_audio_exit_pending = None;
         self.video_audio_mode = Some(fs_idx);
         // 動画モードで追加/改名/削除したブックマークを音楽ビューへ確実に反映する (#6 修正)。
