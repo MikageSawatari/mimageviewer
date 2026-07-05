@@ -3104,6 +3104,35 @@ pub(crate) struct MusicVstShell {
     pub activated: bool,
 }
 
+/// 「動画→音声モード」中に VST プラグイン GUI を出すためのサブ状態 (Inc 7 / 7e)。
+/// 音声モードでは動画 presenter が hide されているが、VST エディタ窓は presenter HWND に
+/// owner されるため hidden 中は出せない。そこでこの state が Some の間だけ presenter を
+/// **一時的に un-hide** して VST ホストにする (映像は GUI の背後に見える = ユーザー選択の
+/// approach A、docs §5.7.1 7e)。`music_vst_shell` (プレーン音声の新規 presenter 方式) とは
+/// 別機構で、presenter を drop せず re-hide で音声モードへ戻す。`fs_idx` は対象アイテム、
+/// `phase` は GUI 表示の遅延ラッチ (owner 登録前に GUI を出すと editor が main HWND に
+/// 生成される、§5.9 と同じ理由で `Opening` → owner 同期後に `tick_video_audio_vst` が
+/// `Active` へ)。VST チェーン (プラグイン/パラメータ) は app グローバルな `dsp_bridge` 共有
+/// なので音への効果は元から引き継がれ、この state は GUI 表示だけを司る。
+///
+/// **非 windows** (lib stub 想定) では enter/tick/exit が cfg(windows) のため常に None。
+#[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct VideoAudioVstState {
+    pub fs_idx: usize,
+    pub phase: VideoAudioVstPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum VideoAudioVstPhase {
+    /// presenter を un-hide 済み。owner 登録 (`native_video_front_synced_hwnd==hwnd`) を
+    /// 待って GUI を表示する。
+    Opening,
+    /// プラグイン GUI 表示済み (二度出し防止ラッチ)。
+    Active,
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 pub(crate) struct DetachedVideoHostSwitchPending {
@@ -5527,6 +5556,14 @@ pub struct App {
     /// (Codex 7c 設計レビュー)。enter/exit は `enter_video_audio_mode` / `exit_video_audio_mode`
     /// (app/native_video.rs)。詳細は docs/music-integration-plan.md §5.7 / §5.7.1。
     pub(crate) video_audio_mode: Option<usize>,
+    /// Inc 7 / 7e: 「動画→音声モード」中に VST GUI を出しているサブ状態。`Some` の間だけ
+    /// presenter を un-hide して VST ホストにし、`fs_music_view_active` はこの idx を音楽ビュー
+    /// 扱いにせず (= 動画扱いに戻す) presenter を前面 + owner 登録する。予測不能な stale を避ける
+    /// ため `close_fullscreen` / `open_fullscreen` / file-nav で必ず None に戻す。enter/exit/tick は
+    /// `enter_video_audio_vst` / `exit_video_audio_vst` / `tick_video_audio_vst`
+    /// (app/native_video.rs)。`video_audio_mode == Some(idx)` を **音楽ビュー表示中**の意味で
+    /// 読む箇所は `&& video_audio_vst_active_for(idx) == false` で分ける (Codex 設計レビュー)。
+    pub(crate) video_audio_vst: Option<VideoAudioVstState>,
     /// Inc 7 hidden presenter: enter 時点の presenter 物理ターゲット
     /// `(placement, rect, owner_hwnd)`。exit で現在の presentation の物理ターゲットと比較し、
     /// 一致すれば hidden の高速 show (シームレス)、不一致 (音声モード中に全画面⇔ウィンドウを
@@ -7379,6 +7416,7 @@ impl App {
             music_vst_shell: None,
             music_view_close_requested: false,
             video_audio_mode: None,
+            video_audio_vst: None,
             #[cfg(windows)]
             video_audio_mode_entry_target: None,
             #[cfg(windows)]
@@ -25863,6 +25901,8 @@ impl App {
         // 終わる。stale index (同 idx が別 item を指す) 事故を避けるため必ずクリアする
         // (Codex 7c 設計)。前アイテムの動画プレイヤーはこの後 evict されるので再 attach は不要。
         self.video_audio_mode = None;
+        // 7e: 別アイテムへ open するなら VST ホスト状態も落とす (stale idx 防止)。
+        self.video_audio_vst = None;
         #[cfg(windows)]
         {
             self.video_audio_mode_entry_target = None;
@@ -32150,6 +32190,10 @@ impl App {
         // 「動画→音声モード」(Inc 7) はフルスクリーンを閉じたら終わる。動画プレイヤーはこの後
         // fs_cache.clear() で drop されるので、ここではフラグを落とすだけでよい (Codex 7c 設計)。
         self.video_audio_mode = None;
+        // 7e: VST ホスト状態も落とす。VST GUI の hide/re-owner は下の VST cleanup
+        // (show_vst3_manager 経路) が、presenter の drop は fs_cache.clear() が行うので、
+        // ここではフラグを落とすだけでよい (re-hide 不要 = presenter ごと drop される)。
+        self.video_audio_vst = None;
         #[cfg(windows)]
         {
             self.video_audio_mode_entry_target = None;
@@ -41761,6 +41805,9 @@ impl App {
         // (music) 扱いにする。連続再生 EOF だけは raw の音声ファイル判定を使う (音声モードの動画は
         // 動画の連続再生 = 次の動画へ、で維持する。§5.7.1 / Codex 7c 設計)。
         let video_audio_mode = self.video_audio_mode;
+        // 7e: VST ホスト表示中の idx。この idx は presenter を un-hide して「動画扱い」にしている
+        // ので、音楽ビュー扱い (ループ/ブックマーク/EOF/resume の music 分岐) からは除外する。
+        let video_audio_vst_idx = self.video_audio_vst.as_ref().map(|s| s.fs_idx);
         #[cfg(windows)]
         let continuous_tile_active = self.video_tile_mode_active;
         #[cfg(not(windows))]
@@ -41804,7 +41851,10 @@ impl App {
                 // `is_music_mode` = 音楽ビュー表示中 (音声ファイル or 音声モードの動画、Inc 7)。
                 // ループ境界 / ブックマーク / resume 保存は music 扱いにする。
                 let is_audio_file = matches!(self.items.get(*idx), Some(GridItem::Audio(_)));
-                let is_music_mode = is_audio_file || video_audio_mode == Some(*idx);
+                // 7e: VST ホスト表示中 (presenter un-hide) の音声モード動画は music 扱いから外す
+                // (映像フレームが進み native video と同じ挙動 = ループ/ブックマーク/resume は video 側)。
+                let is_music_mode = is_audio_file
+                    || (video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx));
                 // チャプター / ブックマーク有無を判定 (cache 直読み、DB クエリ無し)
                 let has_ch = !is_music_mode
                     && player
@@ -41912,7 +41962,10 @@ impl App {
                     // が detach 時点で固着するので、音声クロックの `position()` を保存位置に使う。
                     // 音声ファイルは従来どおり (last_displayed_pts は None なので実質 position、Codex 7c
                     // で byte-equivalent を維持するため video_audio_mode 限定で分岐)。
-                    let pos = if video_audio_mode == Some(*idx) {
+                    // 7e: VST ホスト表示中は映像フレームが進むので last_displayed_pts を使う
+                    // (native video と同じ)。純粋な音声モード (映像固着) のときだけ position()。
+                    let pos = if video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx)
+                    {
                         player.position()
                     } else {
                         player
@@ -41931,9 +41984,13 @@ impl App {
                     // このフレーム冒頭のスナップショット。
                     let kind = if is_audio_file {
                         ContinuousEofKind::AudioFile
-                    } else if video_audio_mode == Some(*idx) {
+                    } else if video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx) {
+                        // 純粋な音声モード (presenter hidden): 音声モード維持で次動画へ (§5.7.1)。
                         ContinuousEofKind::VideoAudioMode
                     } else {
+                        // 7e: VST ホスト表示中 (presenter un-hide) はここに落ちて通常動画 EOF
+                        // (次動画を映像表示で開く)。hidden source-swap 前提の
+                        // handle_video_audio_mode_continuous_eof と衝突させない。
                         ContinuousEofKind::Video
                     };
                     continuous_eof_events.push((*idx, player.current_seek_serial(), kind));
@@ -41952,7 +42009,8 @@ impl App {
             && self.native_video_mode_switch.is_none()
             // Inc 7 hidden presenter: 音声モード中は presenter を非アクティブ扱いにして
             // VST owner 同期を止める (presenter は hide されていて owner にしない)。
-            && self.video_audio_mode.is_none()
+            // ただし 7e の VST ホスト表示中は presenter を un-hide して VST owner にするので許可する。
+            && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some())
             && native_owner_hwnd != 0
             && native_owner_hwnd != self.native_video_owner_synced_hwnd
         {
@@ -41978,6 +42036,7 @@ impl App {
             let was_fullscreen = self.fullscreen_idx.is_some();
             let shell_before_event = self.music_vst_shell.is_some();
             let audio_mode_before_event = self.video_audio_mode.is_none();
+            let vst_host_before_event = self.video_audio_vst.is_some();
             self.handle_native_video_output_event(ctx, idx, epoch, event);
             if was_fullscreen && self.fullscreen_idx.is_none() {
                 break;
@@ -41986,6 +42045,13 @@ impl App {
             // 既に drop した native 出力由来なので、fullscreen のままでも batch を打ち切る
             // (Codex High: stale イベントが still-fullscreen の audio に動画操作を当てない)。
             if shell_before_event && self.music_vst_shell.is_none() {
+                break;
+            }
+            // 7e: このイベントで VST ホストを抜けた (ToggleVst3Gui / ToggleAudioMode /
+            // ToggleWindowMode) 場合、exit_video_audio_vst が presenter を re-hide して owner を
+            // 外す。以降のイベントは状態が大きく変わった後なので念のためバッチを打ち切る
+            // (music_vst_shell 離脱と同じ保守的扱い)。
+            if vst_host_before_event && self.video_audio_vst.is_none() {
                 break;
             }
             // 「音声モード」ボタン (Inc 7) をこのイベントで入った場合、enter_video_audio_mode が
@@ -42024,7 +42090,7 @@ impl App {
                 // 音声ファイル、および音声モードにトグルした動画 (Inc 7) は egui 経路の
                 // ブックマーク区間ループ tick を使う。それ以外の動画は native ループ tick。
                 if matches!(self.items.get(*idx), Some(GridItem::Audio(_)))
-                    || video_audio_mode == Some(*idx)
+                    || (video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx))
                 {
                     self.tick_music_loop_boundary(*idx);
                 } else {
@@ -43068,6 +43134,10 @@ impl eframe::App for App {
         // 表示する (早いと editor が main HWND に生成される、Codex High)。
         #[cfg(windows)]
         self.tick_music_vst_shell(ctx);
+        // 7e: 「動画→音声モード」の VST ホストも同じく owner 登録後に GUI を出す
+        // (Opening → Active。tick_music_vst_shell と同じ理由で ensure_native_video_front の後)。
+        #[cfg(windows)]
+        self.tick_video_audio_vst(ctx);
         #[cfg(windows)]
         self.sync_native_video_iconic_thumbnail();
         #[cfg(windows)]
@@ -43077,8 +43147,9 @@ impl eframe::App for App {
             // (= coalesce、Codex プラン Step 10)。`try_iter().count()` で要素を消費して個数を取る。
             let pending = self.hud_raise_rx.try_iter().count();
             // Inc 7 hidden presenter: 音声モード中は presenter (+ HUD) が hide されている
-            // ので raise 要求は無視する (HUD teardown 済み)。
-            if pending > 0 && self.video_audio_mode.is_none() {
+            // ので raise 要求は無視する (HUD teardown 済み)。7e の VST ホスト表示中は presenter を
+            // un-hide して HUD も出しているので raise を許可する。
+            if pending > 0 && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.request_hud_raise();

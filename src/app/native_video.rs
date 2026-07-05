@@ -1212,7 +1212,10 @@ impl App {
         // 通常経路が presenter HWND を再登録する。cloak は update ループ側の
         // `native_video_fullscreen_active_for_main_backdrop`(!fs_music_view_active) が
         // 制御するのでここでは触らない (hwnd==0 分岐と同じ)。
-        if self.video_audio_mode.is_some() {
+        //
+        // 7e: VST ホスト表示中 (`video_audio_vst` Some) は presenter を un-hide して VST owner に
+        // するので、この early-return を通さず下の通常 owner 登録経路へ落とす。
+        if self.video_audio_mode.is_some() && self.video_audio_vst.is_none() {
             if self.native_video_front_synced_hwnd != 0 {
                 self.dsp_bridge.unregister_fullscreen_owner();
                 self.dsp_bridge.set_hud_hwnd(0);
@@ -1589,7 +1592,9 @@ impl App {
         // main viewport / embedded で描かれる。presenter HWND は非 0 だが「アクティブな
         // native presenter」ではないので false を返す (= 音声ファイル / 現行 detach 方式と
         // 同じ挙動で、main focus guard が音楽ビューを誤って閉じない)。
-        if self.video_audio_mode.is_some() {
+        // 7e: VST ホスト表示中は presenter を un-hide して前面 native presenter として扱うので、
+        // focus guard も通常動画と同じく presenter を保護する (early-return しない)。
+        if self.video_audio_mode.is_some() && self.video_audio_vst.is_none() {
             return false;
         }
         self.fullscreen_idx.is_some_and(|idx| {
@@ -2369,6 +2374,29 @@ impl App {
             }
             if !Self::native_event_allowed_in_music_shell(&event) {
                 return;
+            }
+        }
+        // 7e: 「動画→音声モード」の VST ホスト表示中 (presenter を un-hide して VST owner に
+        // している) は、VST ボタン / ♪ (音声モード) ボタン / ウィンドウ切替を「VST ホストを畳んで
+        // 音楽ビュー (波形) へ戻る」に振る。× / close は下の通常 close 経路へフォールスルーして
+        // フルスクリーンを閉じる。他の再生系イベント (seek/volume/nav 等) は通常動画として処理する。
+        // これらは source 非依存の UI トグルなので epoch チェックの前に処理してよい (music_vst_shell
+        // と同じ)。exit_video_audio_vst は presenter を re-hide するだけで drop しない。
+        if self.video_audio_vst_active_for(fs_idx) {
+            use crate::video::NativeVideoOutputEvent as Ev;
+            match &event {
+                Ev::ToggleVst3Gui | Ev::ToggleAudioMode => {
+                    self.exit_video_audio_vst(ctx, fs_idx);
+                    ctx.request_repaint();
+                    return;
+                }
+                Ev::ToggleWindowMode => {
+                    self.exit_video_audio_vst(ctx, fs_idx);
+                    self.toggle_still_window_mode();
+                    ctx.request_repaint();
+                    return;
+                }
+                _ => {}
             }
         }
         let current_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -5555,6 +5583,22 @@ impl App {
             }
             return;
         }
+        // 7e: 「動画→音声モード」の VST ホスト表示中は Escape / Z (音声モードトグル) で VST ホストを
+        // 畳んで波形ビュー (音声モード) へ戻る。他キーは通常動画として処理する (presenter 前面で
+        // native focus のため)。native presenter (プラグイン GUI 非フォーカス) にキーが来たときの
+        // ゲート (music_vst_shell の Escape 離脱と対を成す)。
+        if self.video_audio_vst_active_for(fs_idx) {
+            let esc = key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt;
+            let toggle = !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoToggleAudioMode, &key);
+            if esc || toggle {
+                self.exit_video_audio_vst(ctx, fs_idx);
+                self.request_native_video_hud_repaint(ctx);
+                return;
+            }
+        }
         // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
         // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
         // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
@@ -6702,6 +6746,177 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// VST ホストの GUI/owner/HUD 後始末だけを行う (presenter の re-hide と `video_audio_vst` の
+    /// clear は**しない**)。`exit_video_audio_vst` (通常離脱、re-hide 付き) と `tick_video_audio_vst`
+    /// の mismatch フォールバック (presenter は遷移先経路が扱うので re-hide しない) で共有する
+    /// (Codex P2: どちらの経路でも GUI を確実に畳んで孤児 editor / topmost 残留を防ぐ)。
+    #[cfg(windows)]
+    fn teardown_video_audio_vst_gui(&mut self) {
+        // GUI を main へ戻して隠す (close_fullscreen / exit_music_vst_shell と同じ順序)。
+        self.dsp_bridge.set_existing_guis_owner_to_main();
+        self.dsp_bridge.set_all_guis_visible(false);
+        self.dsp_bridge.set_all_guis_topmost(false);
+        self.show_vst3_manager = false;
+        self.native_video_owner_synced_hwnd = 0;
+        if self.settings.vst3_gui_visible {
+            self.settings.vst3_gui_visible = false;
+            self.settings.save();
+        }
+        self.dsp_bridge.set_hud_hwnd(0);
+        self.dsp_bridge.unregister_fullscreen_owner();
+        self.vst_geometry_tracker.clear();
+        self.native_video_front_synced_hwnd = 0;
+        self.native_video_front_last_raise = None;
+        self.native_video_front_recover_after_external_foreground = false;
+    }
+
+    /// 「動画→音声モード」で VST プラグイン GUI を出す (7e、approach A = 映像プレゼンター流用)。
+    /// 音声モードでは presenter が hide されていて VST エディタ窓 (presenter owner) を出せないので、
+    /// presenter を **un-hide** して VST ホストにする (映像は GUI の背後に見える = ユーザー選択)。
+    /// presenter は drop せず、`exit_video_audio_vst` の re-hide で音声モード (波形) へ戻れる。
+    /// VST チェーン (プラグイン/パラメータ) は app グローバル `dsp_bridge` 共有なので音への効果は
+    /// 元から引き継がれ、ここは GUI 表示だけを司る。GUI 表示自体は owner 登録を待って
+    /// `tick_video_audio_vst` が行う (早いと editor が main HWND に生成される、§5.9)。
+    /// 呼び出し元 = 音楽ビュー上バーの VST ボタン (`draw_music_top_bar`、draw 中の直呼び)。
+    #[cfg(windows)]
+    pub(crate) fn enter_video_audio_vst(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.video_audio_vst.is_some() {
+            return;
+        }
+        // 音声モードにトグルした当該動画で・フルスクリーン表示中のみ。
+        if self.video_audio_mode != Some(fs_idx) || self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        // 「動画に戻る」exit の非同期完了待ち中は presenter が show/SwitchPlacement 進行中なので拒否。
+        if self.video_audio_exit_pending.is_some() {
+            return;
+        }
+        // VST owner/HUD 機構はフルスクリーン borderless presenter 前提 (§5.9)。
+        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
+            self.show_feedback_toast("VST 設定はフルスクリーン表示中のみ利用できます".to_string());
+            return;
+        }
+        if !self.settings.vst3_enabled
+            || !matches!(
+                self.dsp_bridge.state(),
+                crate::video::dsp::DspState::Enabled
+            )
+        {
+            self.show_feedback_toast("VST3 が有効ではありません".to_string());
+            return;
+        }
+        // presenter が上がっている (HWND publish 済み) こと。音声モードなら通常 hidden で存在する。
+        let has_presenter = matches!(
+            self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hwnd() != 0
+        );
+        if !has_presenter {
+            return;
+        }
+        // presenter を un-hide して VST ホストにする (consume-and-hold 解除、映像は GUI の背後に
+        // 見える)。音声スレッドは無改変なので音切れなし。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_window_visible(true);
+        }
+        self.video_audio_vst = Some(super::VideoAudioVstState {
+            fs_idx,
+            phase: super::VideoAudioVstPhase::Opening,
+        });
+        // owner 登録 → GUI 表示は tick_video_audio_vst が担う。一時停止中はアイドルで repaint が
+        // 来ないので明示的に起こす (tick も pending 中は継続 repaint)。
+        ctx.request_repaint();
+        crate::logger::log(format!(
+            "[video-audio-vst] entered VST host (un-hid presenter) for fs_idx={fs_idx}"
+        ));
+    }
+
+    /// VST ホストの per-frame 駆動 (7e)。**`ensure_native_video_front` の後**に呼ぶ。presenter HWND
+    /// が fullscreen owner 登録済み (`native_video_front_synced_hwnd==hwnd`) になったらプラグイン
+    /// GUI を表示 + topmost にして `show_vst3_manager` を立てる (owner 登録前だと editor が main
+    /// HWND に生成される、§5.9)。bridge 死亡 / VST 無効化 / フルスクリーン離脱 / presenter 消失を
+    /// 検出したら VST ホストを畳む (`tick_music_vst_shell` と同じ遅延ラッチ + guard 構造)。
+    #[cfg(windows)]
+    pub(crate) fn tick_video_audio_vst(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.video_audio_vst else {
+            return;
+        };
+        let fs_idx = state.fs_idx;
+        // 音声モードから外れた / フルスクリーンでなくなった (別経路が既に video_audio_mode を落とした
+        // 稀ケース): presenter は遷移先経路が扱うので re-hide はしないが、GUI 後始末は必ず行って
+        // 孤児 editor を残さない (Codex P2)。
+        if self.video_audio_mode != Some(fs_idx) || self.fullscreen_idx != Some(fs_idx) {
+            self.teardown_video_audio_vst_gui();
+            self.video_audio_vst = None;
+            return;
+        }
+        // presenter HWND は Active 早期 return より前に取得して、Active 中に presenter が消えた
+        // (close/evict) ケースも畳めるようにする (Codex P2)。
+        let hwnd = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_hwnd(),
+            _ => 0,
+        };
+        // bridge 死亡 / VST 無効化 / 非フルスクリーン化 / presenter 消失: VST ホストを畳んで波形
+        // ビューへ戻す (Codex P2)。
+        if !self.settings.vst3_enabled
+            || !matches!(
+                self.dsp_bridge.state(),
+                crate::video::dsp::DspState::Enabled
+            )
+            || !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+            || hwnd == 0
+        {
+            self.exit_video_audio_vst(ctx, fs_idx);
+            return;
+        }
+        if matches!(state.phase, super::VideoAudioVstPhase::Active) {
+            return;
+        }
+        // owner 登録済みを待つ (ensure_native_video_front が synced=hwnd + register_fullscreen_owner)。
+        // まだなら pending 継続 (一時停止中でも次フレームを起こして polling する、Codex Medium)。
+        if self.native_video_front_synced_hwnd != hwnd {
+            ctx.request_repaint();
+            return;
+        }
+        self.dsp_bridge.set_existing_guis_owner_to_hwnd(hwnd);
+        self.native_video_owner_synced_hwnd = hwnd;
+        self.show_vst3_manager = true;
+        self.dsp_bridge.set_all_guis_topmost(true);
+        std::sync::Arc::clone(&self.dsp_bridge).set_all_guis_visible_async(true);
+        if !self.settings.vst3_gui_visible {
+            self.settings.vst3_gui_visible = true;
+            self.settings.save();
+        }
+        if let Some(s) = self.video_audio_vst.as_mut() {
+            s.phase = super::VideoAudioVstPhase::Active;
+        }
+        crate::logger::log(format!(
+            "[video-audio-vst] activated VST GUIs for fs_idx={fs_idx} hwnd=0x{hwnd:x}"
+        ));
+    }
+
+    /// VST ホストを畳んで「動画→音声モード」(波形ビュー) へ戻す (7e)。presenter は **drop せず
+    /// re-hide** して consume-and-hold へ戻す (音声無中断)。GUI を main へ re-owner + hide し
+    /// (dying HWND に owner された孤児窓を防ぐ)、owner/HUD 登録を明示クリアする。冪等
+    /// (VST ホスト未在なら no-op)。呼び出し元 = native HUD の VST/♪/ウィンドウ切替/Esc/Z、
+    /// bridge 死亡・非フルスクリーン化・presenter 消失時の tick からのフォールバック。
+    #[cfg(windows)]
+    pub(crate) fn exit_video_audio_vst(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.video_audio_vst.as_ref().map(|s| s.fs_idx) != Some(fs_idx) {
+            return;
+        }
+        // GUI/owner/HUD を畳む (tick の mismatch フォールバックと共有)。
+        self.teardown_video_audio_vst_gui();
+        // presenter を re-hide して音声モード (consume-and-hold) へ戻す。音声は無改変 = 音切れなし。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_window_visible(false);
+        }
+        self.video_audio_vst = None;
+        ctx.request_repaint();
+        crate::logger::log(format!(
+            "[video-audio-vst] exited VST host (re-hid presenter) for fs_idx={fs_idx}"
+        ));
+    }
+
     #[cfg(windows)]
     pub(super) fn set_native_video_vst3_panel_visible(&mut self, visible: bool) {
         self.show_vst3_manager = visible;
@@ -7421,6 +7636,27 @@ impl App {
         ignore_resume: bool,
     ) {
         self.sync_main_selection_from_viewer_idx(idx);
+
+        // 7e: VST ホスト表示中に native ナビ (native HUD の前後ファイル / NavigateItem / wheel) で別
+        // 動画へ移るとき、下の fast-swap が presenter を再利用 / `take_native_output` で破棄する前に
+        // VST ホストを畳む。さもないと VST editor / topmost / owner が dying/再利用 presenter に残る
+        // (Codex P1)。**ただし exit_video_audio_vst は presenter を re-hide してしまう** — この native
+        // 経路は直後に**通常動画**の fast-swap が同 presenter を再利用して次動画を**映像表示**するので、
+        // re-hide すると次動画が hidden presenter で開いて真っ黒になる (Codex P1 v2)。よって GUI/owner
+        // だけ畳んで presenter は**可視のまま**にし、音声モードも抜ける (open_fullscreen 完了時にも
+        // None 化されるが、swap 中フレームで音楽ビュー扱いにならないよう先に落とす)。
+        if let Some(cur) = self.fullscreen_idx
+            && self.video_audio_vst_active_for(cur)
+        {
+            self.teardown_video_audio_vst_gui();
+            self.video_audio_vst = None;
+            self.video_audio_mode = None;
+            self.video_audio_mode_entry_target = None;
+            self.video_audio_exit_pending = None;
+            crate::logger::log(format!(
+                "[video-audio-vst] left VST host for native video nav (presenter kept visible) fs_idx={cur}"
+            ));
+        }
 
         // fast-swap / tile-swap は presenter を再利用し、確定は deferred source-swap 完了時の
         // open_fullscreen で行う。presentation 維持 (「別ウィンドウで開く」設定を手動ナビで再適用

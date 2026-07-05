@@ -591,10 +591,39 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
       default_chords=Z / `docs/keymap.ini.default`）。tooltip は ♪ ボタン（native、`NativeOverlayShortcutLabels`
       に `toggle_audio_mode` 追加）と「動画表示に戻る」ボタン（egui）の両方に実効ショートカットを併記（Codex P3）。
     - Codex レビュー 2 ラウンド（P2 no_repeat / P3 tooltip 対応後、新規指摘なし）・test 3136 green。
-  - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、DetachedWindow(F12) の
-    音声モード対応 / long video の memory・audio 継続の smoke。① seek 音切れは 7-hidden、
-    連続再生 EOF は 7-eof、file nav は 7-navfix、右クリック/リング/close は 7-rclick、
-    音声モード切替キー（既定 Z）は 7-audiomode-key で解消済み）。
+  - **7e-vst** ✅（2026-07-05、実機 OK）: **VST 状態引き継ぎ**（動画→音声モードの VST ボタン）。
+    approach A = **映像プレゼンター流用**（ユーザー選択）: 音声モードでは presenter が hidden で
+    VST エディタ窓（presenter owner）を出せないので、VST ボタンで presenter を **un-hide** して VST
+    ホストにする（映像は GUI の背後に見える）。VST チェーンは app グローバル `dsp_bridge` 共有なので
+    音への効果は元から引き継がれ、追加したのは GUI 表示制御のみ。プレーン音声の `music_vst_shell`
+    （新規 presenter 方式）とは**別機構**。
+    - 新 state `App.video_audio_vst: Option<VideoAudioVstState { fs_idx, phase: Opening|Active }>`。
+      中央述語 `fs_music_view_active(fs_idx)` を VST 表示中は false にして「動画扱い」に一括追随
+      （backdrop/cloak/front/描画 dispatch/ring/right-click/キーゲート = ~98 sites が自動追随）。
+    - `enter_video_audio_vst`（guard 後 presenter を un-hide → phase=Opening、GUI はまだ出さない）/
+      `tick_video_audio_vst`（`ensure_native_video_front` の後に呼び、owner 登録 = `native_video_front_synced_hwnd
+      ==hwnd` を待って GUI 表示 → phase=Active。§5.9 と同じ遅延ラッチ。bridge 死亡 / VST 無効化 /
+      非フルスクリーン化 / presenter 消失で自動撤収）/ `exit_video_audio_vst`（GUI/owner を畳んで
+      presenter を **re-hide** = drop せず音声モードへ戻す、音切れなし）。GUI 後始末は
+      `teardown_video_audio_vst_gui` helper に共通化（exit と tick の mismatch フォールバックで共有）。
+    - 直接 `video_audio_mode` 読みの gate（poll_video）: `is_music_mode` / resume 保存位置 /
+      連続 EOF 種別（VST 中は通常 Video EOF）/ VST owner 同期許可 / 音楽ループ境界 tick / HUD raise、
+      および `ensure_native_video_front` early-return・focus guard を `&& video_audio_vst.is_none()` で分離。
+    - native HUD 経路（`handle_native_video_output_event`、epoch チェック前）: VST 中は `ToggleVst3Gui`
+      / `ToggleAudioMode`（♪）→ exit、`ToggleWindowMode` → exit + window 切替、× は通常 close へ
+      フォールスルー。native key 経路: VST 中は Esc / Z → exit。egui 音楽上バーの VST ボタンは音声
+      モードでも表示し `enter_video_audio_vst` へ振る（プレーン音声は従来 `enter_music_vst_shell`）。
+    - file-nav: **native 経路**（`open_native_video_fullscreen_from_navigation_with_options`）は fast-swap
+      前に GUI/owner だけ畳んで presenter は**可視のまま**（次動画が通常映像で開く、真っ黒回避、Codex P1v2）。
+      **egui 経路**（音楽ビュー ↑↓）は `exit_video_audio_vst`（re-hide）→ keep-audio source-swap（7-navfix）。
+    - `close_fullscreen` / `open_fullscreen` で `video_audio_vst` も clear。
+    - **Codex 設計相談 1 ラウンド**（bool→Option{phase}、GUI 表示 defer、直接読み gate 監査、native key
+      intercept、EOF/window/presenter-close guard）+ **コードレビュー 3 ラウンド**（P1 native-nav bypass →
+      funnel teardown、P2 tick teardown gaps ×2 → helper 共有 + Active 前 hwnd チェック、P1v2 re-hide で
+      次動画真っ黒 → native 経路は可視維持、最終「全解消」）。build + test 3136 green + fmt/glyph clean。
+  - **7e-残り**: DetachedWindow(F12) の音声モード対応 / long video の memory・audio 継続 smoke（① seek
+    音切れは 7-hidden、連続再生 EOF は 7-eof、file nav は 7-navfix、右クリック/リング/close は 7-rclick、
+    音声モード切替キー（既定 Z）は 7-audiomode-key、VST 引き継ぎは 7e-vst で解消済み）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

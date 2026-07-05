@@ -10313,6 +10313,16 @@ impl App {
 
         self.sync_main_selection_from_viewer_idx(idx);
 
+        // 7e: VST ホスト表示中に file-nav したら、まず VST ホストを畳んでクリーンな音声モード
+        // (presenter re-hide) へ戻す。以降は下の音声モード keep 分岐が hidden presenter を
+        // source-swap するので、通常の音声モード継続ナビになる (VST GUI は閉じる)。
+        #[cfg(windows)]
+        if let Some(cur) = self.fullscreen_idx
+            && self.video_audio_vst_active_for(cur)
+        {
+            self.exit_video_audio_vst(ctx, cur);
+        }
+
         // 動画→音声モード (Inc 7): 音声モードのまま隣の動画へ file-nav (前後ファイルボタン /
         // キーボード ↑↓) したときは、hidden presenter を音声モードのまま source-swap で再利用する
         // (7-eof = handle_video_audio_mode_continuous_eof と同じ経路)。これを入れないと、下の通常
@@ -19413,7 +19423,20 @@ impl App {
         matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
             || (self.video_audio_mode == Some(fs_idx)
                 && self.fullscreen_idx == Some(fs_idx)
-                && matches!(self.items.get(fs_idx), Some(GridItem::Video(_))))
+                && matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+                // 7e: VST ホスト表示中は presenter を un-hide して VST GUI を出しているので、
+                // egui 音楽ビューは描かず「動画扱い」に戻す (backdrop/cloak/front/描画 dispatch/
+                // ring/right-click/キーゲートがこの述語を通して一括で追随する)。
+                && !self.video_audio_vst_active_for(fs_idx))
+    }
+
+    /// 7e: 「動画→音声モード」で VST ホスト (un-hid presenter + プラグイン GUI) を表示中か。
+    /// enter/exit/tick は `enter_video_audio_vst` / `exit_video_audio_vst` / `tick_video_audio_vst`
+    /// (app/native_video.rs)。非 windows では常に None なので false。
+    pub(crate) fn video_audio_vst_active_for(&self, fs_idx: usize) -> bool {
+        self.video_audio_vst
+            .as_ref()
+            .is_some_and(|s| s.fs_idx == fs_idx)
     }
 
     /// 音声フルスクリーンの音楽ビュー (Inc 3a: 最小構成)。
@@ -19910,11 +19933,12 @@ impl App {
         // VST (windows + vst3 有効 + フルスクリーン表示時のみ)。VST native シェルはフルスクリーン
         // borderless 前提なので、ウィンドウモードでは動画と同じくボタン自体を出さない (ユーザー
         // 要望)。VST 画面 (native シェル) でも同じ位置に VST ボタンが出るので同じ場所で on/off できる。
-        // 音声モードにトグルした動画では VST シェル (enter_music_vst_shell) が Audio 限定で no-op に
-        // なるので出さない (7e で video-in-audio-mode の VST 対応を検討、Codex 7c note)。
+        // 音声モードにトグルした動画 (`video_audio_mode == Some(fs_idx)`) でも表示し、7e の
+        // `enter_video_audio_vst` (presenter を un-hide して VST ホスト化) へ振る。プレーン音声は
+        // 従来どおり `enter_music_vst_shell` (新規 presenter)。
         #[cfg(windows)]
         let (vst_left, vst_clicked) = if self.settings.vst3_enabled
-            && self.video_audio_mode.is_none()
+            && (self.video_audio_mode.is_none() || self.video_audio_mode == Some(fs_idx))
             && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
         {
             let vst_rect = egui::Rect::from_center_size(
@@ -19954,7 +19978,12 @@ impl App {
         }
         #[cfg(windows)]
         if vst_clicked {
-            self.enter_music_vst_shell(ctx, fs_idx);
+            if self.video_audio_mode == Some(fs_idx) {
+                // 7e: 音声モードにトグルした動画 → presenter を un-hide して VST ホスト化。
+                self.enter_video_audio_vst(ctx, fs_idx);
+            } else {
+                self.enter_music_vst_shell(ctx, fs_idx);
+            }
         }
 
         // Row 秒数切替 (タイムライン表示中のみ、上バー右詰め = VST ボタンの左)。− / [Row 30s] / +
