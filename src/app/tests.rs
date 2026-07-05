@@ -16920,7 +16920,10 @@ mod still_window_mode_key_tests {
             .expect("detached video switch should begin a detached session");
         assert_eq!(session.window_id, 123);
         assert_eq!(session.source, DetachedSource::Video);
-        assert!(!session.closing);
+        assert_eq!(
+            app.detached_window_state(session.window_id),
+            Some(DetachedWindowState::Active)
+        );
 
         app.apply_video_presentation_switched(ViewerPresentation::MainWindow);
 
@@ -17626,7 +17629,10 @@ mod still_window_mode_key_tests {
             .expect("the detached video viewport should remain alive");
         assert_eq!(session.window_id, window_id);
         assert_eq!(session.source, DetachedSource::Video);
-        assert!(!session.closing);
+        assert_eq!(
+            app.detached_window_state(session.window_id),
+            Some(DetachedWindowState::Active)
+        );
         assert!(
             app.detached_image_windows.is_empty(),
             "videos are kept as the active detached context, not converted into image snapshots"
@@ -17679,7 +17685,10 @@ mod still_window_mode_key_tests {
             .expect("the detached video viewport should remain alive");
         assert_eq!(session.window_id, window_id);
         assert_eq!(session.source, DetachedSource::Video);
-        assert!(!session.closing);
+        assert_eq!(
+            app.detached_window_state(session.window_id),
+            Some(DetachedWindowState::Active)
+        );
     }
 
     #[test]
@@ -19145,7 +19154,10 @@ mod still_window_mode_key_tests {
             .expect("main page navigation must not finish the active detached session");
         assert_eq!(session.window_id, window_id);
         assert_eq!(session.source, DetachedSource::Book);
-        assert!(!session.closing);
+        assert_eq!(
+            app.detached_window_state(session.window_id),
+            Some(DetachedWindowState::Active)
+        );
     }
 
     #[test]
@@ -20798,6 +20810,65 @@ mod still_window_mode_key_tests {
         app.finish_active_detached_session_close("test");
         assert!(!app.detached_active_window_alive_wanted());
         assert_eq!(app.active_detached_session_viewport_id(), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_window_runtime_reducer_representative_sequence() {
+        // R2b Part 1: active session の closing bool を廃止し、runtime.state を
+        // reducer の正にした代表列を固定する。
+        let mut app = setup_app();
+        let window_id = 31;
+
+        app.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Opening,
+            "test_opening",
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening)
+        );
+
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+        assert!(app.detached_active_window_alive_wanted());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+
+        app.transition_detached_window_state(window_id, DetachedWindowState::Parked, "test_parked");
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Parked)
+        );
+
+        app.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Resuming,
+            "test_resuming",
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Resuming)
+        );
+
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+
+        app.begin_active_detached_session_close("test_closing");
+        assert!(!app.detached_active_window_alive_wanted());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing)
+        );
+        app.finish_active_detached_session_close("test_finish");
+        let removed = app.remove_detached_window_runtime(window_id, "test_removed");
+        assert!(removed.is_some());
+        assert_eq!(app.detached_window_state(window_id), None);
     }
 
     #[test]

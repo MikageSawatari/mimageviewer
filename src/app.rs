@@ -445,6 +445,29 @@ impl App {
         ));
     }
 
+    pub(crate) fn detached_window_state(&self, window_id: u64) -> Option<DetachedWindowState> {
+        self.detached_window_runtimes
+            .get(&window_id)
+            .map(|runtime| runtime.state)
+    }
+
+    pub(crate) fn active_detached_window_id(&self) -> Option<u64> {
+        self.active_detached_session
+            .map(|session| session.window_id)
+    }
+
+    pub(crate) fn active_detached_window_state(&self) -> Option<DetachedWindowState> {
+        let window_id = self.active_detached_window_id()?;
+        self.detached_window_state(window_id)
+    }
+
+    pub(crate) fn active_detached_window_is_closing(&self) -> bool {
+        matches!(
+            self.active_detached_window_state(),
+            Some(DetachedWindowState::Closing)
+        )
+    }
+
     pub(crate) fn update_detached_window_runtime_flags(
         &mut self,
         window_id: u64,
@@ -518,7 +541,8 @@ pub(crate) enum DetachedSource {
 
 /// 「この detached 窓を生かす意思」を表す単一の明示状態。
 /// 詳細は docs/detached-viewer-keepalive-design.md §3.1 / §3.7。
-/// - `Some{closing:false}` の間だけ keep-alive (毎フレーム描画) する。
+/// - session が存在し、対応する `DetachedWindowRuntime.state != Closing` の間だけ
+///   keep-alive (毎フレーム描画) する。
 /// - close は「真にセッションを畳む」明示経路でのみ `closing=true` → teardown 後に `None`。
 /// - folder-nav reopen / PDF/ZIP 列挙待ち / context swap では据え置き (close_fullscreen で
 ///   推測クリアしない)。
@@ -526,7 +550,6 @@ pub(crate) enum DetachedSource {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ActiveDetachedSession {
     pub(crate) window_id: u64,
-    pub(crate) closing: bool,
     pub(crate) source: DetachedSource,
 }
 
@@ -3995,9 +4018,9 @@ pub struct App {
     /// 跨いで持続させる必要があるため)。
     #[cfg(windows)]
     pub(crate) last_active_detached_window_id: Option<u64>,
-    /// keep-alive 設計 (docs/detached-viewer-keepalive-design.md §3.1) の単一真実。
-    /// `Some{closing:false}` の間、アクティブ detached 窓を毎フレーム描画して egui に
-    /// 破棄させない。helper 5 つ (begin/closing/finish/mark/rendered) 経由でのみ触る。
+    /// keep-alive 設計 (docs/detached-viewer-keepalive-design.md §3.1) の active identity。
+    /// 生存可否は対応する `DetachedWindowRuntime.state != Closing` を正とし、
+    /// helper 5 つ (begin/closing/finish/mark/rendered) 経由でのみ触る。
     #[cfg(windows)]
     pub(crate) active_detached_session: Option<ActiveDetachedSession>,
     /// アクティブ detached の `show_viewport_immediate` を最後に呼んだ frame_counter。
@@ -23446,18 +23469,18 @@ impl App {
     // session state と marker は必ずこの helper 経由で触る (直接書き換え禁止)。
 
     /// アクティブ detached セッションを開始 / 更新する (set)。既に同じ window_id の
-    /// セッションがあれば `closing` を解除して据え置く (passive→active 再開や F12 再 ON)。
+    /// セッションがあれば runtime state を Active に戻して据え置く (passive→active 再開や F12 再 ON)。
     #[cfg(windows)]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
         let changed = self
             .active_detached_session
-            .map(|s| s.window_id != window_id || s.closing || s.source != source)
+            .map(|s| {
+                s.window_id != window_id
+                    || self.detached_window_state(window_id) == Some(DetachedWindowState::Closing)
+                    || s.source != source
+            })
             .unwrap_or(true);
-        self.active_detached_session = Some(ActiveDetachedSession {
-            window_id,
-            closing: false,
-            source,
-        });
+        self.active_detached_session = Some(ActiveDetachedSession { window_id, source });
         self.transition_detached_window_state(
             window_id,
             DetachedWindowState::Active,
@@ -23474,14 +23497,9 @@ impl App {
     /// 状態自体は finish まで残す。`reason` は診断用。
     #[cfg(windows)]
     pub(crate) fn begin_active_detached_session_close(&mut self, reason: &'static str) {
-        let mut closing_window_id = None;
-        if let Some(session) = self.active_detached_session.as_mut() {
-            if !session.closing {
-                session.closing = true;
-                closing_window_id = Some(session.window_id);
-            }
-        }
-        if let Some(window_id) = closing_window_id {
+        if let Some(window_id) = self.active_detached_window_id()
+            && self.detached_window_state(window_id) != Some(DetachedWindowState::Closing)
+        {
             self.transition_detached_window_state(window_id, DetachedWindowState::Closing, reason);
             self.log_detached_image_window_debug(format!(
                 "session_closing window_id={window_id} reason={reason}"
@@ -23503,9 +23521,7 @@ impl App {
     /// 今フレーム detached 窓を生かすべきか = 唯一の述語 (§3.1)。
     #[cfg(windows)]
     pub(crate) fn detached_active_window_alive_wanted(&self) -> bool {
-        self.active_detached_session
-            .as_ref()
-            .is_some_and(|s| !s.closing)
+        self.active_detached_window_id().is_some() && !self.active_detached_window_is_closing()
     }
 
     /// `fullscreen_viewport_id()` は active detached session が生きている間、その session の
