@@ -16298,6 +16298,39 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    fn push_audio(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Audio(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.items.len() - 1
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn f12_on_audio_is_noop_not_misleading_toggle() {
+        // 音声ファイルは egui music view (live 描画) を別 viewport で回すと wgpu クラッシュするため
+        // 別ウィンドウ非対応 (docs 参照)。F12 は誤解を招く「別ウィンドウモード ON/OFF」トーストや
+        // グローバル設定 flip をせず no-op にする (以前は設定 flip + 誤トーストで「切り替わったように
+        // 見えて切り替わらない」バグだった)。
+        let mut app = setup_app();
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.fullscreen_idx = Some(audio);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        let before_enabled = app.settings.detached_viewer_enabled;
+        let before_presentation = app.viewer_presentation;
+
+        app.toggle_detached_viewer_mode();
+
+        assert_eq!(
+            app.settings.detached_viewer_enabled, before_enabled,
+            "F12 on an audio file must not flip the global detached-viewer setting"
+        );
+        assert_eq!(
+            app.viewer_presentation, before_presentation,
+            "F12 on an audio file must not change the presentation (audio is not detachable)"
+        );
+    }
+
     fn insert_static_fs_entry(app: &mut App, ctx: &egui::Context, idx: usize, label: &str) {
         let pixels = egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]);
         let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);

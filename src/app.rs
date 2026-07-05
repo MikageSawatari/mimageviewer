@@ -38195,6 +38195,20 @@ impl App {
             );
             return;
         }
+        // 音声ファイル (GridItem::Audio) の音楽ビューは egui の live 描画 (連続 repaint + 波形/
+        // スペクトラムのテクスチャ生成) なので、別ウィンドウ (別 egui viewport) で回すと eframe/wgpu の
+        // マルチビューポート texture/font atlas 管理と競合して wgpu Validation Error でクラッシュする
+        // (実機再現、Codex 診断)。静止画は静的描画 (連続 repaint なし)、動画は native presenter (egui
+        // 非依存) なので別ウィンドウ可。音声は現状「別ウィンドウ表示に非対応」とし、F12 は誤解を招く
+        // 「別ウィンドウモード ON/OFF」トーストや設定 flip をせず no-op にする (別ウィンドウ化は
+        // egui multi-viewport 安定化を伴う別 increment、docs/music-integration-plan.md 参照)。
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Audio(_))))
+        {
+            self.show_feedback_toast("音声は別ウィンドウ表示に対応していません".to_string());
+            return;
+        }
         #[cfg(windows)]
         {
             if self.detached_toggle_disabled_by_always_new_images() {

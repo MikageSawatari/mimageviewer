@@ -643,13 +643,25 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
       in-flight switch 扱いでブロック（Codex P2）。
     - 回帰テスト: `detached_video_host_resync_defers_during_audio_mode` /
       `f12_toggle_is_blocked_during_video_audio_mode`。build + test 3138 green + fmt/glyph clean。
-  - **7e-残り**: **③ 音声ファイルの F12 別ウィンドウ化**（音声モードは動画専用だが、`GridItem::Audio` 単体も
-    F12 で別ウィンドウに音楽ビューを出せるようにする。現状 `viewer_item_supports_session` に Audio 未追加の
-    ため F12 が設定フラグ + トーストだけ動いて切り替わらない = 誤トースト。ユーザー選択 = ③のみフル対応、
-    2026-07-05）/ long video の memory・audio 継続 smoke（① seek 音切れは 7-hidden、連続再生 EOF は 7-eof、
+  - **③ 音声ファイルの F12 別ウィンドウ化 = 見送り（2026-07-05、実機クラッシュのため revert）**: 一度
+    実装した（`viewer_item_supports_session` に Audio 追加 + egui-flip 分岐 + DetachedSource::Audio +
+    always-new 除外 + Codex 設計/コードレビュー・test green）が、**実機で wgpu Validation Error クラッシュ**。
+    根本原因（Codex 診断）= 音声の音楽ビューは **egui の live 描画**（`VideoPlayer::tick` の連続 repaint +
+    spectrum 16ms + timeline raster 1ms + 波形テクスチャ `ctx.load_texture`）で、これを**別ウィンドウ
+    （別 egui viewport）**で回すと eframe/wgpu の **マルチビューポート texture/font atlas 管理と競合**して
+    落ちる。単一の別ウィンドウでも**通常再生中にクラッシュ**（F12 連打に限らない）。**静止画は静的描画
+    （連続 repaint / 継続テクスチャ upload なし）**、**動画は native presenter（egui 非依存）**なので別ウィンドウ可
+    ＝ここが audio との差分。font-atlas resync の deferral 等の focused fix では直せず（deferral は
+    detached idle まで flush されず持続 audio 窓でフォント破損 + crash も止まらない）、egui/eframe multi-viewport
+    の live-repaint × texture/font delta を診断・再設計する**別タスク**が要る（Codex 推奨 = defer）。
+    **現状の実装 = 音声の F12 は no-op + 「音声は別ウィンドウ表示に対応していません」トースト**（設定 flip も
+    誤トーストもしない。元の「切り替わったように見えて切り替わらない」誤トーストバグは解消）。回帰テスト
+    `f12_on_audio_is_noop_not_misleading_toggle`。**再挑戦の前提** = egui multi-viewport の live view 安定化。
+  - **7e-残り**: long video の memory・audio 継続 smoke（① seek 音切れは 7-hidden、連続再生 EOF は 7-eof、
     file nav は 7-navfix、右クリック/リング/close は 7-rclick、音声モード切替キー（既定 Z）は 7-audiomode-key、
-    VST 引き継ぎは 7e-vst、DetachedWindow(動画) は 7e-detached で解消済み）。② 音声モード中の F12 は
-    7e-detached でゲート維持決着（hidden presenter のウィンドウ跨ぎ移送を要するため本 increment ではスコープ外）。
+    VST 引き継ぎは 7e-vst、DetachedWindow(動画) は 7e-detached で解消済み。③ 音声ファイル別ウィンドウ化は上記の
+    とおり実機クラッシュで見送り）。② 音声モード中の F12 は 7e-detached でゲート維持決着（hidden presenter の
+    ウィンドウ跨ぎ移送を要するため本 increment ではスコープ外）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 
