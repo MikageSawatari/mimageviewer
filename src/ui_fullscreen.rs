@@ -271,6 +271,18 @@ fn should_handle_fullscreen_wheel(
         && (ctrl_held || !cursor_in_panel)
 }
 
+fn fullscreen_cursor_in_panel_for_wheel(
+    cursor_in_panel: bool,
+    cursor_in_seek_panel: bool,
+    seek_drag_active: bool,
+) -> bool {
+    if cursor_in_seek_panel && !seek_drag_active {
+        false
+    } else {
+        cursor_in_panel
+    }
+}
+
 fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 {
     let ltr_base = if pos_x > center_x { 1 } else { -1 };
     if rtl { -ltr_base } else { ltr_base }
@@ -9454,6 +9466,12 @@ impl App {
         // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、当たり判定でもパネル領域を
         // 無効化する。さもないと右ホバー帯 / ピン留めメタデータ等でホイール (倍率変更) や
         // クリック (ページ送り) が奪われる (Codex P2)。
+        let cursor_in_seek_panel = passive_hover_enabled
+            && ctx.input(|i| {
+                i.pointer
+                    .hover_pos()
+                    .is_some_and(|p| seek_panel_interactive && seek_panel_rect.contains(p))
+            });
         let cursor_in_panel = passive_hover_enabled
             && !self.fs_zoom_mode_engaged()
             && ctx.input(|i| {
@@ -9489,7 +9507,6 @@ impl App {
                         let in_text_panel = self.text_mode
                             && (self.text_panel_rect(full_rect).contains(p)
                                 || self.text_detail_panel_rect(full_rect).contains(p));
-                        let in_seek_panel = seek_panel_interactive && seek_panel_rect.contains(p);
                         in_right
                             || in_left
                             || in_erase_panel
@@ -9498,7 +9515,7 @@ impl App {
                             || in_export_crop_panel
                             || in_view_trim_panel
                             || in_text_panel
-                            || in_seek_panel
+                            || cursor_in_seek_panel
                     })
                     .unwrap_or(false)
             });
@@ -9644,8 +9661,15 @@ impl App {
         // 抑止する。state.source 等が snapshot 時点で固定されているので、idx だけ
         // 移動すると間違った画像が export される (Codex review CONFIRMED)。
         let modal_for_keys = self.any_modal_dialog_open_for_fullscreen_keys();
-        let handle_wheel_here = should_handle_fullscreen_wheel(
+        // 下部ページシークバーはスクロール可能パネルではないので、hover 中の wheel は通常の
+        // 前後ページ移動 / 連結スクロールへ流す。ドラッグ中だけはシーク操作を優先して抑制する。
+        let cursor_in_panel_for_wheel = fullscreen_cursor_in_panel_for_wheel(
             cursor_in_panel,
+            cursor_in_seek_panel,
+            self.fs_seek_drag_active,
+        );
+        let handle_wheel_here = should_handle_fullscreen_wheel(
+            cursor_in_panel_for_wheel,
             in_video_tile,
             ctrl_held,
             modal_for_keys,
@@ -20651,6 +20675,33 @@ mod tests {
         // 表示モード / フィットのポップアップ表示中は Ctrl+ホイールでも抑制する。
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
+        ));
+    }
+
+    #[test]
+    fn seek_bar_hover_does_not_block_plain_wheel_navigation() {
+        let seek_hover = fullscreen_cursor_in_panel_for_wheel(true, true, false);
+        assert!(
+            !seek_hover,
+            "シークバー hover はスクロール可能パネル扱いせず、plain wheel をページ移動へ流す"
+        );
+        assert!(should_handle_fullscreen_wheel(
+            seek_hover, false, false, false, false
+        ));
+
+        let seek_drag = fullscreen_cursor_in_panel_for_wheel(true, true, true);
+        assert!(
+            seek_drag,
+            "シークバードラッグ中だけは wheel による二重操作を抑制する"
+        );
+        assert!(!should_handle_fullscreen_wheel(
+            seek_drag, false, false, false, false
+        ));
+
+        let side_panel = fullscreen_cursor_in_panel_for_wheel(true, false, false);
+        assert!(side_panel);
+        assert!(!should_handle_fullscreen_wheel(
+            side_panel, false, false, false, false
         ));
     }
 
