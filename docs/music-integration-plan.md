@@ -359,12 +359,20 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
   - **owner-sync ゲート**（step 6）: `ensure_native_video_front` / poll_video VST owner 同期 /
     `native_video_presenter_hwnd_for_focus_guard` / hud_raise drain を `video_audio_mode.is_some()` で
     「presenter 非アクティブ扱い」にして、現行 detach 方式（hwnd=0）と同じ挙動を再現。
-  - **step 9（`video_output_disabled` 7a + `effective_has_video` #5 削除）は focused follow-up に延期**。
+  - **step 9（`video_output_disabled` 7a + `effective_has_video` #5 削除）実施済み（2026-07-05）**。
     enter/exit が `set_video_output_disabled` を呼ばなくなったので flag は常に false = demux gate / readiness
     latch とも **inert（通常動画とバイト等価）**。この方式は映像を止めず、seek 後の FirstFrameReady は生きた
-    presenter の consume-and-hold が発行するので `effective_has_video` の OFF 経路は不要。decoder demux +
-    engine latch という delicate な箇所を長いセッションで触るのを避けた。mod.rs のラッパーは既に
-    `#[allow(dead_code)]`。Codex コードレビュー（設計→実装→検証の 3 ラウンド、P1/P2/P3 対応）済み: P1=hidden
+    presenter の consume-and-hold が発行するので `effective_has_video` の OFF 経路は不要だった。削除内容:
+    ① decoder.rs = `VideoDynamicState::video_output_disabled` field + `drain_or_discard_pending_video_packets`
+    helper（3 呼び出し元は `drain_pending_video_packets` へ直結、empty-guard は `while let` no-op と等価で冗長）
+    + `run_decoder` の per-iteration snapshot と video-packet discard 分岐 + `send_audio_packet_with_video_drain`
+    の同名引数 + トグルテスト。② actor.rs = `EngineActor::video_output_disabled` field + `set_video_output_disabled`
+    + `effective_has_video`（唯一の呼び出しは `self.has_video` へ）+ 該当テスト。**audio-only の `has_video=false`
+    ReadinessLatch gate と `info_received_sets_has_video_false_for_audio_only` テストは保持**。③ mod.rs =
+    `VideoPlayer::set_video_output_disabled` / `video_output_disabled`（両方 `#[allow(dead_code)]`・呼び出し元無し）。
+    flag=false 前提で完全 byte-equivalent。build + `cargo test --bin mimageviewer-core` 3137 green・fmt clean・
+    Codex read-only レビュー clean（P1/P2/P3 無し、dangling 参照無し、empty-guard 削除も安全確認）。実機検証不要
+    （runtime 挙動不変）。Codex コードレビュー（設計→実装→検証の 3 ラウンド、P1/P2/P3 対応）済み: P1=hidden
     prime frame を fence=0 で retire（旧 fence timeline での誤解放防止）/ P2=saw_hidden ラッチ + fallback で
     pending switch クリア / P3=フル tuple 比較 + same-placement resize 分岐 hidden 対応。lib 2024 + bin 3136
     test green・fmt/glyph clean。

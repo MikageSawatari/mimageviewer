@@ -5632,35 +5632,6 @@ impl VideoPlayer {
         }
     }
 
-    /// music「動画→音声モード」(Inc 7): demux の映像パケット破棄を切り替える。
-    /// `true` にすると demux は以降の映像パケットを routing / spill せず捨てる (音声は
-    /// 無中断)。これは新規 packet の供給を止めるだけで、既に `video_pkt_tx` / decoder
-    /// 内部に入っている packet/frame の decode は即座には止まらない (数フレームぶんは
-    /// 走り切ってから枯れる)。`false` に戻したら通常は現在位置へ `seek` して映像を
-    /// 再同期させる (Flush + keyframe 再取得)。atomic を App から直接触らせないためのラッパ。
-    #[allow(dead_code)]
-    pub(crate) fn set_video_output_disabled(&self, disabled: bool) {
-        self.dynamic
-            .video_output_disabled
-            .store(disabled, Ordering::Release);
-        // engine actor にも同期反映する (Inc 7 / Codex 7d 設計)。demux は atomic を読んで映像
-        // パケットを捨てるが、engine の readiness latch は別途「映像を待つか」を判断するので、
-        // ここで actor field を更新しないと、音声モードで seek したとき映像 FirstFrameReady を
-        // 永久に待って Buffering で停止する。bounded channel の try_send は drop され得るので
-        // 使わず、actor を直接 lock して同期更新する (flag→actor→seek の順序を固定して exit race
-        // も防ぐ)。
-        self.engine
-            .lock()
-            .unwrap()
-            .set_video_output_disabled(disabled);
-    }
-
-    /// 現在の映像出力停止状態 (Inc 7)。
-    #[allow(dead_code)]
-    pub(crate) fn video_output_disabled(&self) -> bool {
-        self.dynamic.video_output_disabled.load(Ordering::Acquire)
-    }
-
     #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) fn build_switch_source_payload(
