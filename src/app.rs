@@ -336,6 +336,7 @@ struct ViewerContextBundle {
     fullscreen_idx: Option<usize>,
     viewer_presentation: ViewerPresentation,
     last_viewer_sync_stamp: Option<ViewerSyncStamp>,
+    native_video_in_window_active: bool,
     detached_viewer_independent_active: bool,
     detached_viewer_pin_active: bool,
     detached_viewer_open_next_still_detached_once: bool,
@@ -502,6 +503,7 @@ impl ViewerContextBundle {
             fullscreen_idx: None,
             viewer_presentation: ViewerPresentation::Fullscreen,
             last_viewer_sync_stamp: None,
+            native_video_in_window_active: false,
             detached_viewer_independent_active: false,
             detached_viewer_pin_active: false,
             detached_viewer_open_next_still_detached_once: false,
@@ -686,6 +688,14 @@ fn should_restore_fullscreen_focus_from_main_focus(
 
 fn should_defer_main_paint_for_font_atlas_resync(_reason: &str) -> bool {
     true
+}
+
+fn should_render_main_fullscreen_viewport_after_detached_context(
+    active_detached_context_updated: bool,
+    embedded_fs_active: bool,
+    embedded_fs_pending: bool,
+) -> bool {
+    !active_detached_context_updated || embedded_fs_active || embedded_fs_pending
 }
 
 /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
@@ -8685,6 +8695,7 @@ impl App {
             fullscreen_idx,
             viewer_presentation,
             last_viewer_sync_stamp,
+            native_video_in_window_active,
             detached_viewer_independent_active,
             detached_viewer_pin_active,
             detached_viewer_open_next_still_detached_once,
@@ -8830,6 +8841,7 @@ impl App {
         swap_field!(fullscreen_idx);
         swap_field!(viewer_presentation);
         swap_field!(last_viewer_sync_stamp);
+        swap_field!(native_video_in_window_active);
         swap_field!(detached_viewer_independent_active);
         swap_field!(detached_viewer_pin_active);
         swap_field!(detached_viewer_open_next_still_detached_once);
@@ -23221,6 +23233,14 @@ impl App {
             .is_some_and(|s| !s.closing)
     }
 
+    /// `fullscreen_viewport_id()` は active detached session が生きている間、その session の
+    /// ViewportId を最優先で返す。したがってこの状態で backdrop cleanup を走らせると、
+    /// 古い main/fullscreen viewport ではなく **生きている detached 窓** を隠してしまう。
+    #[cfg(windows)]
+    pub(crate) fn active_detached_session_owns_visible_fullscreen_viewport(&self) -> bool {
+        self.detached_active_window_alive_wanted() && self.fs_viewport_shown
+    }
+
     /// アクティブ detached の `show_viewport_immediate(detached_id, …)` を実際に呼んだ直後に
     /// 立てる marker (§3.6)。これ以外 (passive / cleanup / Close / backdrop) では呼ばない。
     #[cfg(windows)]
@@ -23545,6 +23565,26 @@ impl App {
             Some(ViewerContextDescriptor::Pdf { .. }) => "pdf",
             Some(ViewerContextDescriptor::Zip { .. }) => "zip",
             None => "none",
+        }
+    }
+
+    #[cfg(windows)]
+    fn grid_item_debug_kind(&self, idx: usize) -> &'static str {
+        match self.items.get(idx) {
+            Some(GridItem::Image(_)) => "image",
+            Some(GridItem::ZipImage { .. }) => "zip-image",
+            Some(GridItem::PdfPage { .. }) => "pdf-page",
+            Some(GridItem::Video(_)) => "video",
+            Some(GridItem::Audio(_)) => "audio",
+            Some(GridItem::Folder(_)) => "folder",
+            Some(GridItem::ZipFile(_)) => "zip-file",
+            Some(GridItem::PdfFile(_)) => "pdf-file",
+            Some(GridItem::ZipDir { .. }) => "zip-dir",
+            Some(GridItem::Stack { .. }) => "stack",
+            Some(GridItem::SearchContainer { .. }) => "search-container",
+            Some(GridItem::ZipSeparator { .. }) => "zip-separator",
+            Some(GridItem::ConvertibleArchive { .. }) => "convertible-archive",
+            None => "missing",
         }
     }
 
@@ -24657,11 +24697,34 @@ impl App {
     #[cfg(windows)]
     fn preserve_active_detached_image_window_for_main_context_change(&mut self) -> bool {
         if !self.should_preserve_active_detached_image_window_for_main_context_change() {
+            self.log_detached_image_window_debug(format!(
+                "preserve_active_detached_for_main_change skipped fs_idx={:?} \
+                 session_detached={} pin_active={} independent={} active_context={} \
+                 window_id={:?} passive_windows={} fs_nav_locked={}",
+                self.fullscreen_idx,
+                self.viewer_session_is_detached(),
+                self.detached_viewer_pin_active,
+                self.detached_viewer_independent_active,
+                self.active_detached_viewer_context.is_some(),
+                self.detached_viewer_window_id,
+                self.detached_image_windows.len(),
+                self.fs_nav_is_locked()
+            ));
             return false;
         }
         let pinned =
             self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
         let parked = self.park_active_detached_image_window(pinned);
+        self.log_detached_image_window_debug(format!(
+            "preserve_active_detached_for_main_change result={parked} pinned={pinned} \
+             fs_idx={:?} window_id={:?} passive_windows={} active_context={} \
+             session_before_handoff={:?}",
+            self.fullscreen_idx,
+            self.detached_viewer_window_id,
+            self.detached_image_windows.len(),
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session
+        ));
         if parked {
             self.handoff_active_detached_viewport_to_passive("main_context_change");
             self.detached_viewer_independent_active = false;
@@ -24695,6 +24758,7 @@ impl App {
         bundle.selected = Some(idx);
         bundle.fullscreen_idx = Some(idx);
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.native_video_in_window_active = false;
         bundle.detached_viewer_independent_active = true;
         bundle.detached_viewer_pin_active = false;
         bundle.detached_viewer_open_next_still_detached_once = false;
@@ -24771,6 +24835,7 @@ impl App {
         bundle.selected = Some(idx);
         bundle.fullscreen_idx = Some(idx);
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.native_video_in_window_active = false;
         bundle.detached_viewer_independent_active = true;
         // 連動なし窓は「ピン済み」扱い。これがないと、後で別画像を open して
         // pause_current_active_detached_viewer_context が走るとき pinned=false の passive に
@@ -25939,6 +26004,19 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> bool {
+        self.log_detached_image_window_debug(format!(
+            "park_active_context_for_grid_open begin active_context={} session={:?} \
+             fs_idx={:?} presentation={:?} window_id={:?} pin_active={} independent={} \
+             passive_windows={}",
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.detached_viewer_window_id,
+            self.detached_viewer_pin_active,
+            self.detached_viewer_independent_active,
+            self.detached_image_windows.len()
+        ));
         if self.active_detached_viewer_context.is_some() {
             let ok = self.park_and_close_current_active_detached_viewer(ctx);
             self.log_detached_image_window_debug(format!(
@@ -26032,6 +26110,27 @@ impl App {
             detached_still && self.detached_still_open_is_independent(idx);
         let focus_detached_from_grid = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.fs_open_intent_from_grid;
+        self.log_detached_image_window_debug(format!(
+            "prepare_viewer_presentation_open_begin idx={idx} entering_video={entering_native_video} \
+             item_kind={} resolved={presentation:?} detached_still={detached_still} \
+             independent_still={independent_detached_still} fs_idx_before={:?} \
+             current_presentation={:?} enabled={} always_new={} open_next_once={} \
+             grid_intent={} active_context={} session={:?} window_id={:?} \
+             pin_active={} independent={} passive_windows={}",
+            self.grid_item_debug_kind(idx),
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.settings.detached_viewer_enabled,
+            self.settings.detached_viewer_open_images_in_window,
+            self.detached_viewer_open_next_still_detached_once,
+            self.fs_open_intent_from_grid,
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session,
+            self.detached_viewer_window_id,
+            self.detached_viewer_pin_active,
+            self.detached_viewer_independent_active,
+            self.detached_image_windows.len()
+        ));
         self.viewer_presentation = presentation;
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
@@ -26048,7 +26147,13 @@ impl App {
         } else {
             // 非 detached を開いた (動画 fullscreen / detached 非対応アイテム等) =
             // detached セッションは終了。明示遷移なので session を畳む (§3.7)。
-            if self.active_detached_session.is_some() {
+            //
+            // ただし active_detached_viewer_context が外側に存在する状態でここへ来た場合、
+            // これは **メイン context 側** の open であり、active detached session の所有者ではない。
+            // その session を畳むと、ピン留め PDF などの別ウィンドウ context が main 側の
+            // ページ切替に巻き込まれ、同じ ViewportId / bundle が混線する。
+            let owns_active_detached_session = self.active_detached_viewer_context.is_none();
+            if owns_active_detached_session && self.active_detached_session.is_some() {
                 self.begin_active_detached_session_close("open_non_detached");
                 self.finish_active_detached_session_close("open_non_detached");
             }
@@ -26083,6 +26188,20 @@ impl App {
         self.native_video_in_window_active = matches!(presentation, ViewerPresentation::MainWindow);
         // 新しい fullscreen を開くので、進行中だったトグル切替 pending は破棄する。
         self.native_video_mode_switch = None;
+        self.log_detached_image_window_debug(format!(
+            "prepare_viewer_presentation_open_state idx={idx} presentation={:?} \
+             fs_idx={:?} session={:?} window_id={:?} pin_active={} independent={} \
+             focus_requested={} last_stamp={} passive_windows={}",
+            self.viewer_presentation,
+            self.fullscreen_idx,
+            self.active_detached_session,
+            self.detached_viewer_window_id,
+            self.detached_viewer_pin_active,
+            self.detached_viewer_independent_active,
+            self.detached_viewer_focus_requested,
+            self.last_viewer_sync_stamp.is_some(),
+            self.detached_image_windows.len()
+        ));
 
         if entering_native_video {
             // Video-to-video source swaps keep the native presenter HWND alive.
@@ -38439,6 +38558,23 @@ impl App {
     }
 
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        #[cfg(windows)]
+        self.log_detached_image_window_debug(format!(
+            "toggle_detached_viewer_mode_begin enabled={} fs_idx={:?} presentation={:?} \
+             active_context={} session={:?} window_id={:?} pin_active={} independent={} \
+             passive_windows={} open_next_detached_once={} grid_intent={}",
+            self.settings.detached_viewer_enabled,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session,
+            self.detached_viewer_window_id,
+            self.detached_viewer_pin_active,
+            self.detached_viewer_independent_active,
+            self.detached_image_windows.len(),
+            self.detached_viewer_open_next_still_detached_once,
+            self.fs_open_intent_from_grid
+        ));
         // Inc 7 (7e): 動画→音声モード中は native presenter が hide されている (または VST ホストとして
         // 流用中)。F12 の presentation 切替は動画の場合 presenter を能動 rebuild する (下の video 分岐)
         // ので、hidden presenter × active host migration という未対応の組み合わせになる。F12 は
@@ -38506,6 +38642,20 @@ impl App {
         self.settings.save();
         #[cfg(windows)]
         {
+            self.log_detached_image_window_debug(format!(
+                "toggle_detached_viewer_mode_flipped enabled={} fs_idx={:?} presentation={:?} \
+                 active_context={} session={:?} window_id={:?} pin_active={} independent={} \
+                 passive_windows={}",
+                self.settings.detached_viewer_enabled,
+                self.fullscreen_idx,
+                self.viewer_presentation,
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session,
+                self.detached_viewer_window_id,
+                self.detached_viewer_pin_active,
+                self.detached_viewer_independent_active,
+                self.detached_image_windows.len()
+            ));
             if !self.settings.detached_viewer_enabled {
                 self.pending_detached_video_host_switch = None;
                 self.clear_detached_viewer_borderless_fullscreen_state();
@@ -38540,6 +38690,19 @@ impl App {
                             self.begin_active_detached_session_close("f12_off");
                             self.finish_active_detached_session_close("f12_off");
                         }
+                        self.log_detached_image_window_debug(format!(
+                            "toggle_detached_viewer_mode_still_applied idx={idx} \
+                             target={target_presentation:?} fs_idx={:?} presentation={:?} \
+                             session={:?} window_id={:?} pin_active={} independent={} \
+                             passive_windows={}",
+                            self.fullscreen_idx,
+                            self.viewer_presentation,
+                            self.active_detached_session,
+                            self.detached_viewer_window_id,
+                            self.detached_viewer_pin_active,
+                            self.detached_viewer_independent_active,
+                            self.detached_image_windows.len()
+                        ));
                     }
                 }
             }
@@ -43364,17 +43527,23 @@ impl eframe::App for App {
         // (描画後だと handle_fs_navigation の close で fullscreen_idx が None になり
         //  判定が崩れるため、呼び出し直前にキャプチャする)。
         #[cfg(windows)]
-        let embedded_fs_active_before_render =
-            !active_detached_context_updated && self.fullscreen_embedded_still_active();
+        let embedded_fs_active_before_render = self.fullscreen_embedded_still_active();
+        #[cfg(not(windows))]
+        let embedded_fs_active_before_render = false;
         // PDF/ZIP enumerate defer または確認なしアーカイブ変換待ち中は
         // fullscreen_idx = None でも in-window 用 holdover を main ctx に描いているので、
         // 続くグリッド描画は同じく抑止する必要がある
         // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
         #[cfg(windows)]
-        let embedded_fs_pending = !active_detached_context_updated
-            && self.native_video_in_window_active
-            && self.fs_nav_deferred_reopen_wait_active();
-        if !active_detached_context_updated {
+        let embedded_fs_pending =
+            self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+        #[cfg(not(windows))]
+        let embedded_fs_pending = false;
+        if should_render_main_fullscreen_viewport_after_detached_context(
+            active_detached_context_updated,
+            embedded_fs_active_before_render,
+            embedded_fs_pending,
+        ) {
             self.render_fullscreen_viewport(ctx);
         }
         #[cfg(windows)]

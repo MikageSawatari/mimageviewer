@@ -18757,6 +18757,214 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn reactivating_pinned_pdf_keeps_detached_context_out_of_embedded_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        // Main can legitimately be in embedded/main-window mode after the user opens a
+        // different PDF there. A pinned detached context must not inherit that flag on
+        // reactivation, or it will render into the main window and hide its viewport.
+        app.native_video_in_window_active = true;
+        app.fullscreen_idx = Some(0);
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\main.pdf"),
+            page_num: 1,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+
+        let mut paused_bundle = ViewerContextBundle::empty();
+        paused_bundle.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\pinned.pdf"),
+            page_num: 1,
+            content_type: None,
+        }];
+        paused_bundle.thumbnails = vec![ThumbnailState::Pending];
+        paused_bundle.image_metas = vec![None];
+        paused_bundle.visible_indices = vec![0];
+        paused_bundle.selected = Some(0);
+        paused_bundle.fullscreen_idx = Some(0);
+        paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        paused_bundle.native_video_in_window_active = false;
+        paused_bundle.detached_viewer_window_id = Some(1);
+        paused_bundle.detached_viewer_pin_active = true;
+        paused_bundle.detached_viewer_independent_active = true;
+        paused_bundle.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
+        paused_bundle.address = r"C:\books\pinned.pdf".to_string();
+
+        let texture = ctx.load_texture(
+            "pinned_pdf_passive",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 1,
+                texture,
+                title: "pinned.pdf - mimageviewer".to_string(),
+                location_display: "pinned.pdf".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0,
+                paused_bundle: Some(Box::new(paused_bundle)),
+            });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 1));
+        assert!(app.native_video_in_window_active);
+        assert!(
+            !app.active_detached_viewer_context
+                .as_ref()
+                .unwrap()
+                .bundle
+                .native_video_in_window_active
+        );
+
+        app.with_active_detached_viewer_context(|mounted| {
+            assert!(!mounted.native_video_in_window_active);
+            assert!(
+                !mounted.fullscreen_embedded_still_active(),
+                "pinned detached PDF must render through the detached viewport after reactivation"
+            );
+        });
+    }
+
+    #[test]
+    fn main_embedded_fullscreen_still_renders_while_detached_context_is_active() {
+        assert!(
+            !should_render_main_fullscreen_viewport_after_detached_context(true, false, false),
+            "a normal detached active context frame should still suppress the unrelated main fullscreen viewport"
+        );
+        assert!(
+            should_render_main_fullscreen_viewport_after_detached_context(true, true, false),
+            "main embedded fullscreen content must still paint even when a pinned detached context rendered"
+        );
+        assert!(
+            should_render_main_fullscreen_viewport_after_detached_context(true, false, true),
+            "main embedded fullscreen holdover/pending content must also paint during detached context frames"
+        );
+        assert!(
+            should_render_main_fullscreen_viewport_after_detached_context(false, false, false),
+            "without an active detached context frame, keep the original fullscreen render behavior"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn active_detached_session_owns_visible_viewport_until_closed() {
+        let mut app = setup_app();
+        let window_id = 42;
+
+        app.begin_active_detached_session(window_id, DetachedSource::Book);
+        assert!(
+            !app.active_detached_session_owns_visible_fullscreen_viewport(),
+            "a session with no shown viewport does not own anything hideable yet"
+        );
+
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        assert!(
+            app.active_detached_session_owns_visible_fullscreen_viewport(),
+            "main embedded paint must not hide an active detached session viewport"
+        );
+
+        app.begin_active_detached_session_close("test");
+        assert!(
+            !app.active_detached_session_owns_visible_fullscreen_viewport(),
+            "explicit close hands teardown ownership back to the cleanup path"
+        );
+        app.finish_active_detached_session_close("test");
+
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        assert!(
+            !app.active_detached_session_owns_visible_fullscreen_viewport(),
+            "a stale detached viewport without an active session may still be hidden"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_non_detached_open_does_not_close_active_detached_context_session() {
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\main.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\main.pdf"),
+                page_num: 2,
+                content_type: None,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        app.visible_indices = vec![0, 1];
+        let first_main = 0;
+        let second_main = 1;
+
+        app.settings.video_in_window_mode = true;
+        app.fullscreen_idx = Some(first_main);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.native_video_in_window_active = true;
+
+        let window_id = 91;
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\pinned.pdf"),
+            page_num: 1,
+            content_type: None,
+        }];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.image_metas = vec![None];
+        bundle.visible_indices = vec![0];
+        bundle.selected = Some(0);
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(window_id);
+        bundle.detached_viewer_pin_active = true;
+        bundle.detached_viewer_independent_active = true;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.begin_active_detached_session(window_id, DetachedSource::Book);
+
+        app.open_fullscreen(second_main);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(second_main),
+            "the main context should advance to its own PDF page"
+        );
+        assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+        assert!(
+            app.native_video_in_window_active,
+            "main PDF stays in embedded/main-window presentation"
+        );
+        assert!(
+            app.active_detached_viewer_context.is_some(),
+            "main page navigation must not drop the pinned detached context"
+        );
+        let session = app
+            .active_detached_session
+            .expect("main page navigation must not finish the active detached session");
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(session.source, DetachedSource::Book);
+        assert!(!session.closing);
+    }
+
+    #[test]
     fn pausing_linked_active_context_drops_bundle_for_main_link_reactivation() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

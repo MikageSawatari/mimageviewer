@@ -4933,7 +4933,9 @@ impl App {
         let detached = false;
         let main_ctx = ctx;
         #[cfg(windows)]
-        let hide_viewport_after_embedded_paint = embedded && self.fs_viewport_shown;
+        let hide_viewport_after_embedded_paint = embedded
+            && self.fs_viewport_shown
+            && !self.active_detached_session_owns_visible_fullscreen_viewport();
         #[cfg(windows)]
         let desired_viewport_presentation = if detached {
             ViewerPresentation::DetachedWindow
@@ -6886,6 +6888,12 @@ impl App {
     #[cfg(windows)]
     fn hide_native_video_black_backdrop_if_shown(&mut self, ctx: &egui::Context) {
         if !self.fs_viewport_shown {
+            return;
+        }
+        if self.active_detached_session_owns_visible_fullscreen_viewport() {
+            self.log_detached_image_window_debug(
+                "skip_backdrop_hide_active_detached_session".to_string(),
+            );
             return;
         }
         let fs_id = self.fullscreen_viewport_id();
