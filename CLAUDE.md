@@ -34,8 +34,23 @@
 | 補正レイヤー / ローカル調整 / レイヤー合成 | [docs/local-adjustment-layer-v1.1.0-plan.md](docs/local-adjustment-layer-v1.1.0-plan.md) と [docs/local-adjust-filter-candidates.md](docs/local-adjust-filter-candidates.md) |
 | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 | [docs/keymap-spec.md](docs/keymap-spec.md) と [docs/key-customization-impl-plan.md](docs/key-customization-impl-plan.md)。新しいキー操作は原則 `KeyAction` + keymap helper 経由にする |
 | UI の見た目・配色を変える修正 | [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) (egui_kittest スナップショットの更新手順) |
+| **detached viewer / F12 別ウィンドウ / 複数ウィンドウ** | [docs/detached-rework-plan.md](docs/detached-rework-plan.md) ⚠️ **リワーク中につき凍結ルールあり** (下の「Detached viewer リワーク中の凍結ルール」参照) |
 
 **設計を変えたら該当ドキュメントも同時に更新する** (下の「コード修正時のドキュメント同時更新」参照)。
+
+## Detached viewer リワーク中の凍結ルール (2026-07-05〜)
+
+detached viewer (F12 別ウィンドウ / 複数ウィンドウ) は構造リワーク中
+(正本: [docs/detached-rework-plan.md](docs/detached-rework-plan.md)、実装 = Codex /
+検収 = ClaudeCode Fable)。リワーク完了までの間:
+
+- **detached 周りへの症状パッチを新規に入れない**。バグを見つけたら、プラン §2 (憲法)
+  に従い BA 番号 (壊れた前提の分類) に対応付けて報告する。緊急の応急処置が必要な
+  場合はプラン §8 の形式 (stopgap 明記 + 撤去予定ステージ記載) でのみ許可。
+- **リワークのステージ外で detached 関連コード・テストを触らない** (他機能の修正が
+  detached 述語や viewport 経路に触れる場合は、着手前にプラン §2 を読み最小限にする)。
+- リワーク作業自体は `detached-rework` ブランチで行い、他セッションと並行して
+  detached を触らない。
 
 キー操作を追加・変更するときは、ユーザーが明示していなくても keymap 対応を検討する。
 閲覧・編集・動画の通常ショートカットは `KeyAction` に追加し、`ini_name()` / `context()` /
