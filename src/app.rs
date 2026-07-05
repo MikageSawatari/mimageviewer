@@ -4027,12 +4027,18 @@ pub struct App {
     /// backstop の二重描画/描き漏れ防止 (§3.6)。
     #[cfg(windows)]
     pub(crate) detached_active_viewport_rendered_frame: u64,
-    /// ParkedLive の動画を passive として tick している間だけ true。
+    /// ParkedLive の動画を passive として tick している window_id。
     ///
     /// 再生は継続するが、passive 窓上のキー・ホイール・HUD 操作は仕様上 no-op にする。
-    /// bundle には入れない outer runtime flag。
+    /// 左クリックだけはこの window_id の復帰要求へ変換する。bundle には入れない outer runtime。
     #[cfg(windows)]
-    native_video_parked_live_input_suppressed: bool,
+    native_video_parked_live_input_window_id: Option<u64>,
+    /// ParkedLive native presenter 上で左ボタン down を受けた window_id。
+    #[cfg(windows)]
+    native_video_parked_live_left_down_window_id: Option<u64>,
+    /// ParkedLive native presenter から届いた復帰要求。poll 後、snapshot を戻してから処理する。
+    #[cfg(windows)]
+    native_video_parked_live_activation_requests: Vec<u64>,
     #[cfg(windows)]
     next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
@@ -7064,7 +7070,11 @@ impl App {
             #[cfg(windows)]
             detached_active_viewport_rendered_frame: u64::MAX,
             #[cfg(windows)]
-            native_video_parked_live_input_suppressed: false,
+            native_video_parked_live_input_window_id: None,
+            #[cfg(windows)]
+            native_video_parked_live_left_down_window_id: None,
+            #[cfg(windows)]
+            native_video_parked_live_activation_requests: Vec::new(),
             #[cfg(windows)]
             next_detached_viewer_context_serial: 1,
             fs_cache: std::collections::HashMap::new(),
@@ -24247,11 +24257,11 @@ impl App {
             ));
             self.swap_viewer_context_bundle(&mut bundle);
             let saved_continuous_mode = self.video_continuous_mode;
-            let saved_input_suppressed = self.native_video_parked_live_input_suppressed;
+            let saved_input_window_id = self.native_video_parked_live_input_window_id;
             self.video_continuous_mode = crate::video::VideoContinuousMode::Off;
-            self.native_video_parked_live_input_suppressed = true;
+            self.native_video_parked_live_input_window_id = Some(id);
             self.poll_video(ctx);
-            self.native_video_parked_live_input_suppressed = saved_input_suppressed;
+            self.native_video_parked_live_input_window_id = saved_input_window_id;
             self.video_continuous_mode = saved_continuous_mode;
             self.swap_viewer_context_bundle(&mut bundle);
             if let Some(window) = self
@@ -24260,6 +24270,19 @@ impl App {
                 .find(|window| window.id == id)
             {
                 window.paused_bundle = Some(bundle);
+            }
+        }
+        let mut activation_requests =
+            std::mem::take(&mut self.native_video_parked_live_activation_requests);
+        let mut seen_activation_requests = std::collections::HashSet::new();
+        activation_requests.retain(|id| seen_activation_requests.insert(*id));
+        for id in activation_requests {
+            if self.detached_window_state_is_parked_live(id) {
+                self.log_detached_image_window_debug(format!(
+                    "parked_live_native_activate_request id={id}"
+                ));
+                let _ = self.activate_detached_image_window_snapshot(ctx, id);
+                break;
             }
         }
     }

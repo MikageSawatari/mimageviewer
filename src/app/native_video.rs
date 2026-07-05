@@ -2382,6 +2382,43 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn native_video_output_event_is_parked_live_left_button(
+        event: &crate::video::NativeVideoOutputEvent,
+        down: bool,
+    ) -> bool {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoWindowEvent as WinEv,
+        };
+
+        matches!(
+            event,
+            Ev::Window(WinEv::MouseButton(button))
+                if button.button == NativeVideoMouseButton::Left
+                    && button.down == down
+                    && !button.double_click
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_output_event_blocked_while_parked_live(
+        event: &crate::video::NativeVideoOutputEvent,
+    ) -> bool {
+        !Self::native_video_output_event_allowed_while_parked_live(event)
+            && !Self::native_video_output_event_is_parked_live_left_button(event, true)
+            && !Self::native_video_output_event_is_parked_live_left_button(event, false)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_event_blocked_by_parked_live_filter(
+        &self,
+        event: &crate::video::NativeVideoOutputEvent,
+    ) -> bool {
+        self.native_video_parked_live_input_window_id.is_some()
+            && Self::native_video_output_event_blocked_while_parked_live(event)
+    }
+
+    #[cfg(windows)]
     pub(super) fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -2396,13 +2433,36 @@ impl App {
             ));
             return;
         }
-        if self.native_video_parked_live_input_suppressed
-            && !Self::native_video_output_event_allowed_while_parked_live(&event)
-        {
-            crate::logger::log(format!(
-                "[native-video] parked-live passive event ignored: idx={fs_idx} event={event:?}"
-            ));
-            return;
+        if let Some(window_id) = self.native_video_parked_live_input_window_id {
+            if Self::native_video_output_event_is_parked_live_left_button(&event, true) {
+                self.native_video_parked_live_left_down_window_id = Some(window_id);
+                crate::logger::log(format!(
+                    "[native-video] parked-live left-down captured: idx={fs_idx} window_id={window_id}"
+                ));
+                return;
+            }
+            if Self::native_video_output_event_is_parked_live_left_button(&event, false) {
+                if self.native_video_parked_live_left_down_window_id == Some(window_id)
+                    && !self
+                        .native_video_parked_live_activation_requests
+                        .contains(&window_id)
+                {
+                    self.native_video_parked_live_activation_requests
+                        .push(window_id);
+                    ctx.request_repaint();
+                    crate::logger::log(format!(
+                        "[native-video] parked-live activation queued: idx={fs_idx} window_id={window_id}"
+                    ));
+                }
+                self.native_video_parked_live_left_down_window_id = None;
+                return;
+            }
+            if self.native_video_event_blocked_by_parked_live_filter(&event) {
+                crate::logger::log(format!(
+                    "[native-video] parked-live passive event ignored: idx={fs_idx} window_id={window_id} event={event:?}"
+                ));
+                return;
+            }
         }
         // 音声 VST シェル (Inc 6 ②-3): close / VST トグルはモード離脱に振り、動画専用イベントは
         // no-op にする。attach した native 出力は epoch=0 の単一 source なので epoch チェックの

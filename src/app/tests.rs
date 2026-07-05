@@ -20902,6 +20902,11 @@ mod still_window_mode_key_tests {
     #[test]
     #[cfg(windows)]
     fn activating_parked_live_media_restores_video_session() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
+        };
+
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\live.mp4");
@@ -20970,6 +20975,17 @@ mod still_window_mode_key_tests {
         assert_eq!(active.bundle.address, "parked-live://sentinel");
         assert_eq!(active.bundle.detached_viewer_window_id, Some(61));
         assert_eq!(active.bundle.fullscreen_idx, Some(video));
+        let wheel = Ev::Window(WinEv::MouseWheel(NativeVideoMouseWheelEvent {
+            delta: -120,
+            x: 10,
+            y: 10,
+            shift: false,
+            ctrl: false,
+        }));
+        assert!(
+            !app.native_video_event_blocked_by_parked_live_filter(&wheel),
+            "after ParkedLive restore, native wheel must return to the normal active-video path"
+        );
     }
 
     #[test]
@@ -20977,7 +20993,8 @@ mod still_window_mode_key_tests {
     fn parked_live_native_key_and_wheel_events_are_noop() {
         use crate::video::NativeVideoOutputEvent as Ev;
         use crate::video::native_window::{
-            NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
+            NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
+            NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
         };
 
         let key = NativeVideoKeyEvent {
@@ -20996,6 +21013,19 @@ mod still_window_mode_key_tests {
             shift: false,
             ctrl: false,
         };
+        let left_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Left,
+            down: true,
+            double_click: false,
+            x: 10,
+            y: 10,
+            shift: false,
+            ctrl: false,
+        };
+        let left_up = NativeVideoMouseButtonEvent {
+            down: false,
+            ..left_down
+        };
 
         assert!(!App::native_video_output_event_allowed_while_parked_live(
             &Ev::Window(WinEv::KeyDown(key))
@@ -21009,6 +21039,78 @@ mod still_window_mode_key_tests {
         assert!(!App::native_video_output_event_allowed_while_parked_live(
             &Ev::TogglePlay
         ));
+        assert!(App::native_video_output_event_is_parked_live_left_button(
+            &Ev::Window(WinEv::MouseButton(left_down)),
+            true
+        ));
+        assert!(App::native_video_output_event_is_parked_live_left_button(
+            &Ev::Window(WinEv::MouseButton(left_up)),
+            false
+        ));
+        assert!(!App::native_video_output_event_blocked_while_parked_live(
+            &Ev::Window(WinEv::MouseButton(left_down))
+        ));
+        assert!(!App::native_video_output_event_blocked_while_parked_live(
+            &Ev::Window(WinEv::MouseButton(left_up))
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_left_click_queues_activation_request() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoMouseButtonEvent, NativeVideoMouseWheelEvent,
+            NativeVideoWindowEvent as WinEv,
+        };
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        app.fullscreen_idx = Some(video);
+        app.native_video_parked_live_input_window_id = Some(91);
+
+        let left_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Left,
+            down: true,
+            double_click: false,
+            x: 12,
+            y: 34,
+            shift: false,
+            ctrl: false,
+        };
+        let left_up = NativeVideoMouseButtonEvent {
+            down: false,
+            ..left_down
+        };
+        let wheel = NativeVideoMouseWheelEvent {
+            delta: -120,
+            x: 12,
+            y: 34,
+            shift: false,
+            ctrl: false,
+        };
+
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::Window(WinEv::MouseWheel(wheel)));
+        assert!(app.native_video_parked_live_activation_requests.is_empty());
+
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::Window(WinEv::MouseButton(left_down)),
+        );
+        assert_eq!(app.native_video_parked_live_left_down_window_id, Some(91));
+        assert!(app.native_video_parked_live_activation_requests.is_empty());
+
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::Window(WinEv::MouseButton(left_up)),
+        );
+        assert_eq!(app.native_video_parked_live_left_down_window_id, None);
+        assert_eq!(app.native_video_parked_live_activation_requests, vec![91]);
     }
 
     #[test]
