@@ -258,14 +258,6 @@ impl DetachedImageWindowSnapshot {
 }
 
 #[cfg(windows)]
-#[derive(Debug, Default)]
-pub(crate) struct DetachedWindowHwndRegistry {
-    hwnd_by_window_id: std::collections::HashMap<u64, u64>,
-    #[cfg(test)]
-    live_hwnds_for_test: Option<std::collections::HashSet<u64>>,
-}
-
-#[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DetachedWindowHwndDiff {
     Created(u64),
@@ -274,59 +266,114 @@ pub(crate) enum DetachedWindowHwndDiff {
 }
 
 #[cfg(windows)]
-impl DetachedWindowHwndRegistry {
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachedWindowState {
+    Opening,
+    Active,
+    Parked,
+    ParkedLive,
+    Resuming,
+    Closing,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub(crate) struct DetachedWindowRuntime {
+    pub(crate) window_id: u64,
+    pub(crate) state: DetachedWindowState,
+    pub(crate) hwnd: u64,
+    pub(crate) pinned: bool,
+    pub(crate) linked: bool,
+}
+
+#[cfg(windows)]
+impl DetachedWindowRuntime {
+    fn new(window_id: u64, pinned: bool, linked: bool) -> Self {
+        Self {
+            window_id,
+            state: DetachedWindowState::Opening,
+            hwnd: 0,
+            pinned,
+            linked,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl App {
     const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
 
-    fn get_raw(&self, window_id: u64) -> Option<u64> {
-        self.hwnd_by_window_id
+    fn detached_window_runtime_defaults(&self) -> (bool, bool) {
+        (
+            self.detached_viewer_pin_active,
+            !self.detached_viewer_independent_active,
+        )
+    }
+
+    fn detached_window_runtime_entry_mut(&mut self, window_id: u64) -> &mut DetachedWindowRuntime {
+        let (pinned, linked) = self.detached_window_runtime_defaults();
+        self.detached_window_runtimes
+            .entry(window_id)
+            .or_insert_with(|| DetachedWindowRuntime::new(window_id, pinned, linked))
+    }
+
+    fn detached_window_hwnd_get_raw(&self, window_id: u64) -> Option<u64> {
+        self.detached_window_runtimes
             .get(&window_id)
-            .copied()
+            .map(|runtime| runtime.hwnd)
             .filter(|hwnd| *hwnd != 0)
     }
 
-    fn hwnd_alive(&self, window_id: u64) -> Option<u64> {
-        let hwnd = self.get_raw(window_id)?;
-        self.hwnd_is_alive(hwnd).then_some(hwnd)
+    fn detached_window_hwnd_alive(&self, window_id: u64) -> Option<u64> {
+        let hwnd = self.detached_window_hwnd_get_raw(window_id)?;
+        self.detached_window_hwnd_is_alive(hwnd).then_some(hwnd)
     }
 
-    fn hwnd_is_alive(&self, hwnd: u64) -> bool {
+    fn detached_window_hwnd_is_alive(&self, hwnd: u64) -> bool {
         #[cfg(test)]
-        if let Some(live) = &self.live_hwnds_for_test {
-            return live.contains(&hwnd);
-        }
+        return self.detached_window_live_hwnds_for_test.contains(&hwnd);
+        #[cfg(not(test))]
         crate::video::native_window::is_window_alive(hwnd)
     }
 
-    fn clear(&mut self, window_id: u64) -> Option<u64> {
-        self.hwnd_by_window_id.remove(&window_id)
+    fn detached_window_hwnd_clear(&mut self, window_id: u64) -> Option<u64> {
+        let runtime = self.detached_window_runtimes.get_mut(&window_id)?;
+        let hwnd = std::mem::take(&mut runtime.hwnd);
+        (hwnd != 0).then_some(hwnd)
     }
 
-    fn clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
-        let hwnd = self.get_raw(window_id)?;
-        if self.hwnd_is_alive(hwnd) {
+    fn detached_window_hwnd_clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
+        let hwnd = self.detached_window_hwnd_get_raw(window_id)?;
+        if self.detached_window_hwnd_is_alive(hwnd) {
             None
         } else {
-            self.hwnd_by_window_id.remove(&window_id);
+            if let Some(runtime) = self.detached_window_runtimes.get_mut(&window_id) {
+                runtime.hwnd = 0;
+            }
             Some(hwnd)
         }
     }
 
-    fn set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
+    fn detached_window_hwnd_set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
         if hwnd == 0 {
-            return self.clear(window_id);
+            return self.detached_window_hwnd_clear(window_id);
         }
-        self.hwnd_by_window_id.insert(window_id, hwnd)
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
+        runtime.hwnd = hwnd;
+        previous
     }
 
-    fn registered_hwnds(&self) -> std::collections::HashSet<u64> {
-        self.hwnd_by_window_id
+    fn detached_window_registered_hwnds(&self) -> std::collections::HashSet<u64> {
+        self.detached_window_runtimes
             .values()
-            .copied()
+            .map(|runtime| runtime.hwnd)
             .filter(|hwnd| *hwnd != 0)
             .collect()
     }
 
-    fn select_created_hwnd(
+    fn select_detached_created_hwnd(
         before: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
         after: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
     ) -> DetachedWindowHwndDiff {
@@ -348,7 +395,7 @@ impl DetachedWindowHwndRegistry {
         }
     }
 
-    fn select_unclaimed_hwnd(
+    fn select_detached_unclaimed_hwnd(
         after: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
         claimed: &std::collections::HashSet<u64>,
     ) -> DetachedWindowHwndDiff {
@@ -371,11 +418,73 @@ impl DetachedWindowHwndRegistry {
     }
 
     #[cfg(test)]
-    fn set_live_hwnds_for_test<I>(&mut self, hwnds: I)
+    pub(crate) fn set_detached_window_live_hwnds_for_test<I>(&mut self, hwnds: I)
     where
         I: IntoIterator<Item = u64>,
     {
-        self.live_hwnds_for_test = Some(hwnds.into_iter().collect());
+        self.detached_window_live_hwnds_for_test = hwnds.into_iter().collect();
+    }
+
+    pub(crate) fn transition_detached_window_state(
+        &mut self,
+        window_id: u64,
+        new_state: DetachedWindowState,
+        reason: &'static str,
+    ) {
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        let from = runtime.state;
+        runtime.state = new_state;
+        let runtime_window_id = runtime.window_id;
+        let hwnd = runtime.hwnd;
+        let pinned = runtime.pinned;
+        let linked = runtime.linked;
+        self.log_detached_image_window_debug(format!(
+            "state_transition window_id={runtime_window_id} from={from:?} to={new_state:?} \
+             reason={reason} hwnd=0x{:x} pinned={} linked={}",
+            hwnd, pinned, linked
+        ));
+    }
+
+    pub(crate) fn update_detached_window_runtime_flags(
+        &mut self,
+        window_id: u64,
+        pinned: bool,
+        linked: bool,
+        reason: &'static str,
+    ) {
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        let old_pinned = runtime.pinned;
+        let old_linked = runtime.linked;
+        runtime.pinned = pinned;
+        runtime.linked = linked;
+        self.log_detached_image_window_debug(format!(
+            "runtime_flags window_id={window_id} pinned={old_pinned}->{pinned} \
+             linked={old_linked}->{linked} reason={reason}"
+        ));
+    }
+
+    pub(crate) fn remove_detached_window_runtime(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> Option<DetachedWindowRuntime> {
+        let runtime = self.detached_window_runtimes.remove(&window_id);
+        if let Some(runtime) = runtime.as_ref() {
+            if runtime.state != DetachedWindowState::Closing {
+                self.log_detached_image_window_debug(format!(
+                    "state_transition_unexpected window_id={} \
+                     from={:?} to=Removed reason={reason} hwnd=0x{:x} pinned={} linked={}",
+                    runtime.window_id, runtime.state, runtime.hwnd, runtime.pinned, runtime.linked
+                ));
+            } else {
+                self.log_detached_image_window_debug(format!(
+                    "state_transition window_id={} from=Closing to=Removed \
+                     reason={reason} hwnd=0x{:x} pinned={} linked={}",
+                    runtime.window_id, runtime.hwnd, runtime.pinned, runtime.linked
+                ));
+            }
+        }
+        runtime
     }
 }
 
@@ -4889,7 +4998,9 @@ pub struct App {
     /// eframe は child viewport の HWND を公開しないため、`show_viewport_immediate`
     /// の前後で UI スレッド上の window 差分を取り、生成された HWND を window_id 単位で保持する。
     #[cfg(windows)]
-    pub(crate) detached_window_hwnd_registry: DetachedWindowHwndRegistry,
+    pub(crate) detached_window_runtimes: std::collections::HashMap<u64, DetachedWindowRuntime>,
+    #[cfg(test)]
+    pub(crate) detached_window_live_hwnds_for_test: std::collections::HashSet<u64>,
     /// detached viewer host HWND が変わるたびに +1 する世代。host capture を lifecycle
     /// event として観測し、stale host 由来イベントを識別するための App 側カウンタ
     /// (native presenter 世代とは別物)。
@@ -7277,7 +7388,9 @@ impl App {
             #[cfg(windows)]
             fs_viewport_virtual_desktop_synced_hwnd: 0,
             #[cfg(windows)]
-            detached_window_hwnd_registry: DetachedWindowHwndRegistry::default(),
+            detached_window_runtimes: std::collections::HashMap::new(),
+            #[cfg(test)]
+            detached_window_live_hwnds_for_test: std::collections::HashSet::new(),
             #[cfg(windows)]
             detached_viewer_host_generation: 0,
             #[cfg(windows)]
@@ -9327,8 +9440,14 @@ impl App {
             // virtual page list (本の中の親) から detached を閉じる = セッション終了 (§3.7)。
             #[cfg(windows)]
             {
+                let closing_window_id = self
+                    .active_detached_session
+                    .map(|session| session.window_id);
                 self.begin_active_detached_session_close("virtual_page_list_parent_nav");
                 self.finish_active_detached_session_close("virtual_page_list_parent_nav");
+                if let Some(window_id) = closing_window_id {
+                    self.remove_detached_window_runtime(window_id, "virtual_page_list_parent_nav");
+                }
             }
             self.close_fullscreen();
         }
@@ -23339,6 +23458,11 @@ impl App {
             closing: false,
             source,
         });
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Active,
+            "session_begin",
+        );
         if changed {
             self.log_detached_image_window_debug(format!(
                 "session_begin window_id={window_id} source={source:?}"
@@ -23350,14 +23474,18 @@ impl App {
     /// 状態自体は finish まで残す。`reason` は診断用。
     #[cfg(windows)]
     pub(crate) fn begin_active_detached_session_close(&mut self, reason: &'static str) {
+        let mut closing_window_id = None;
         if let Some(session) = self.active_detached_session.as_mut() {
             if !session.closing {
                 session.closing = true;
-                let window_id = session.window_id;
-                self.log_detached_image_window_debug(format!(
-                    "session_closing window_id={window_id} reason={reason}"
-                ));
+                closing_window_id = Some(session.window_id);
             }
+        }
+        if let Some(window_id) = closing_window_id {
+            self.transition_detached_window_state(window_id, DetachedWindowState::Closing, reason);
+            self.log_detached_image_window_debug(format!(
+                "session_closing window_id={window_id} reason={reason}"
+            ));
         }
     }
 
@@ -23450,6 +23578,11 @@ impl App {
                 self.detached_viewer_folder_nav_reuse_window_once
             ));
             self.detached_viewer_window_id = Some(prev);
+            self.transition_detached_window_state(
+                prev,
+                DetachedWindowState::Opening,
+                "ensure_detached_viewer_window_id_reuse",
+            );
             return prev;
         }
         let id = self.allocate_detached_viewer_window_id();
@@ -23462,6 +23595,11 @@ impl App {
         ));
         self.detached_viewer_window_id = Some(id);
         self.last_active_detached_window_id = Some(id);
+        self.transition_detached_window_state(
+            id,
+            DetachedWindowState::Opening,
+            "ensure_detached_viewer_window_id_allocate",
+        );
         id
     }
 
@@ -23543,7 +23681,18 @@ impl App {
             snapshot.paused_bundle = Some(Box::new(paused_bundle));
         }
         self.detached_image_windows.push(snapshot);
+        self.update_detached_window_runtime_flags(
+            snapshot_id,
+            pinned,
+            !keep_paused_bundle,
+            "pause_active_context",
+        );
         self.handoff_active_detached_viewport_to_passive("pause_active_context");
+        self.transition_detached_window_state(
+            snapshot_id,
+            DetachedWindowState::Parked,
+            "pause_active_context",
+        );
         self.log_detached_image_window_debug(format!(
             "pause_active_context_snapshot_pushed id={snapshot_id} pinned={pinned} \
              title={snapshot_title:?} descriptor={snapshot_descriptor} stamp={} \
@@ -23678,6 +23827,9 @@ impl App {
         // book context の明示 close = detached セッション終了 (§3.7 closing)。Close 送信前に
         // closing を立て、teardown 後に finish して backstop が窓を復活させないようにする。
         self.begin_active_detached_session_close("close_active_detached_viewer_context");
+        let closing_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id);
         self.swap_viewer_context_bundle(&mut active.bundle);
         if self.fs_viewport_shown {
             let fs_id = self.fullscreen_viewport_id();
@@ -23687,6 +23839,9 @@ impl App {
         let _closed_context = self.take_current_viewer_context_bundle();
         self.swap_viewer_context_bundle(&mut active.bundle);
         self.finish_active_detached_session_close("close_active_detached_viewer_context");
+        if let Some(window_id) = closing_window_id {
+            self.remove_detached_window_runtime(window_id, "close_active_detached_viewer_context");
+        }
         true
     }
 
@@ -23718,7 +23873,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_window_hwnd_alive_for_window_id(&self, window_id: u64) -> Option<u64> {
-        self.detached_window_hwnd_registry.hwnd_alive(window_id)
+        self.detached_window_hwnd_alive(window_id)
     }
 
     #[cfg(windows)]
@@ -23726,14 +23881,12 @@ impl App {
         &mut self,
         window_id: u64,
     ) -> Option<u64> {
-        self.detached_window_hwnd_registry.clear(window_id)
+        self.detached_window_hwnd_clear(window_id)
     }
 
     #[cfg(windows)]
     pub(crate) fn detached_window_hwnd_raw_for_window_id(&self, window_id: u64) -> u64 {
-        self.detached_window_hwnd_registry
-            .get_raw(window_id)
-            .unwrap_or(0)
+        self.detached_window_hwnd_get_raw(window_id).unwrap_or(0)
     }
 
     #[cfg(windows)]
@@ -23750,14 +23903,10 @@ impl App {
         label: &'static str,
         viewport_id: egui::ViewportId,
     ) -> Option<Vec<crate::dwm_transitions::ThreadWindowSnapshotEntry>> {
-        if self
-            .detached_window_hwnd_registry
-            .hwnd_alive(window_id)
-            .is_some()
-        {
+        if self.detached_window_hwnd_alive(window_id).is_some() {
             return None;
         }
-        if let Some(dead_hwnd) = self.detached_window_hwnd_registry.clear_if_dead(window_id) {
+        if let Some(dead_hwnd) = self.detached_window_hwnd_clear_if_dead(window_id) {
             self.log_detached_image_window_debug(format!(
                 "detached_hwnd_dead window_id={window_id} hwnd=0x{dead_hwnd:x} \
                  label={label} viewport={viewport_id:?}"
@@ -23766,6 +23915,7 @@ impl App {
                 self.pending_detached_video_host_resync = true;
             }
         }
+        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, label);
         let main_hwnd = self.main_hwnd?;
         let snapshot = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
@@ -23800,9 +23950,15 @@ impl App {
         let after = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
-        match DetachedWindowHwndRegistry::select_created_hwnd(before, &after) {
+        match Self::select_detached_created_hwnd(before, &after) {
             DetachedWindowHwndDiff::Created(hwnd) => {
-                let previous = self.detached_window_hwnd_registry.set(window_id, hwnd);
+                let previous = self.detached_window_hwnd_set(window_id, hwnd);
+                let state = if label == "passive" {
+                    DetachedWindowState::Parked
+                } else {
+                    DetachedWindowState::Active
+                };
+                self.transition_detached_window_state(window_id, state, "hwnd_registered");
                 self.detached_viewer_host_generation =
                     self.detached_viewer_host_generation.saturating_add(1);
                 crate::logger::log(format!(
@@ -23853,16 +24009,14 @@ impl App {
         label: &'static str,
         viewport_id: egui::ViewportId,
     ) {
-        let Some(previous_hwnd) = self.detached_window_hwnd_registry.get_raw(window_id) else {
+        let Some(previous_hwnd) = self.detached_window_hwnd_get_raw(window_id) else {
             return;
         };
-        if self
-            .detached_window_hwnd_registry
-            .hwnd_is_alive(previous_hwnd)
-        {
+        if self.detached_window_hwnd_is_alive(previous_hwnd) {
             return;
         }
-        self.detached_window_hwnd_registry.clear(window_id);
+        self.detached_window_hwnd_clear(window_id);
+        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, label);
         self.log_detached_image_window_debug(format!(
             "detached_hwnd_dead_after_show window_id={window_id} hwnd=0x{previous_hwnd:x} \
              label={label} viewport={viewport_id:?}"
@@ -23883,10 +24037,16 @@ impl App {
         let after = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
-        let claimed = self.detached_window_hwnd_registry.registered_hwnds();
-        match DetachedWindowHwndRegistry::select_unclaimed_hwnd(&after, &claimed) {
+        let claimed = self.detached_window_registered_hwnds();
+        match Self::select_detached_unclaimed_hwnd(&after, &claimed) {
             DetachedWindowHwndDiff::Created(hwnd) => {
-                self.detached_window_hwnd_registry.set(window_id, hwnd);
+                self.detached_window_hwnd_set(window_id, hwnd);
+                let state = if label == "passive" {
+                    DetachedWindowState::Parked
+                } else {
+                    DetachedWindowState::Active
+                };
+                self.transition_detached_window_state(window_id, state, "hwnd_adopted_unclaimed");
                 self.detached_viewer_host_generation =
                     self.detached_viewer_host_generation.saturating_add(1);
                 crate::logger::log(format!(
@@ -24147,6 +24307,9 @@ impl App {
             self.detached_viewer_host_debug_state()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
+        let closing_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id);
         ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
@@ -24157,6 +24320,9 @@ impl App {
         // ここは should_drop (fullscreen_idx None + 列挙なし + !shown) 経路でのみ呼ばれ、
         // folder-nav reopen 中 (shown=true / 列挙中) は呼ばれないので session を畳んでよい。
         self.finish_active_detached_session_close("active_close_finalize");
+        if let Some(window_id) = closing_window_id {
+            self.remove_detached_window_runtime(window_id, "active_close_finalize");
+        }
         self.request_detached_cleanup_font_atlas_resync("active_close_finalize");
         self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
@@ -24246,6 +24412,11 @@ impl App {
         ));
         self.detached_viewer_window_id = Some(window_id);
         self.last_active_detached_window_id = Some(window_id);
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Opening,
+            "start_active_detached_book_context",
+        );
         self.detached_viewer_folder_nav_reuse_window_once = false;
         // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
         // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
@@ -24363,6 +24534,17 @@ impl App {
             return false;
         };
         let mut snapshot = self.detached_image_windows.remove(pos);
+        self.update_detached_window_runtime_flags(
+            snapshot.id,
+            snapshot.pinned,
+            !snapshot.pinned && !self.settings.detached_viewer_open_images_in_window,
+            "passive_activate_begin",
+        );
+        self.transition_detached_window_state(
+            snapshot.id,
+            DetachedWindowState::Resuming,
+            "passive_activate_begin",
+        );
         self.log_detached_image_window_debug(format!(
             "passive_activate_begin id={id} pos={pos} pinned={} has_paused_bundle={} \
              descriptor={} stamp={} passive_remaining={} active_context={} session={:?}",
@@ -24413,6 +24595,11 @@ impl App {
                     snapshot.id
                 ));
                 snapshot.paused_bundle = Some(paused_bundle);
+                self.transition_detached_window_state(
+                    snapshot.id,
+                    DetachedWindowState::Parked,
+                    "passive_activate_resume_paused_bundle_aborted",
+                );
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
@@ -24450,6 +24637,11 @@ impl App {
                     "passive_activate_still_aborted id={} reason=stamp_not_resolved",
                     snapshot.id
                 ));
+                self.transition_detached_window_state(
+                    snapshot.id,
+                    DetachedWindowState::Parked,
+                    "passive_activate_still_aborted",
+                );
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             };
@@ -24475,6 +24667,11 @@ impl App {
                     "passive_activate_still_aborted id={} reason=park_current_failed",
                     activate_window_id
                 ));
+                self.transition_detached_window_state(
+                    activate_window_id,
+                    DetachedWindowState::Parked,
+                    "passive_activate_still_aborted",
+                );
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
@@ -24510,6 +24707,11 @@ impl App {
                 "passive_activate_aborted id={} reason=no_reopen_route",
                 snapshot.id
             ));
+            self.transition_detached_window_state(
+                snapshot.id,
+                DetachedWindowState::Parked,
+                "passive_activate_aborted",
+            );
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
@@ -24521,6 +24723,11 @@ impl App {
             snapshot.title
         ));
 
+        self.transition_detached_window_state(
+            snapshot.id,
+            DetachedWindowState::Closing,
+            "passive_activate_reopen_descriptor",
+        );
         ctx.send_viewport_cmd_to(
             Self::detached_image_window_viewport_id(snapshot.id),
             egui::ViewportCommand::Close,
@@ -24531,9 +24738,15 @@ impl App {
                 "passive_activate_reopen_descriptor_aborted id={} reason=park_current_failed",
                 snapshot.id
             ));
+            self.transition_detached_window_state(
+                snapshot.id,
+                DetachedWindowState::Parked,
+                "passive_activate_reopen_descriptor_aborted",
+            );
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         }
+        self.remove_detached_window_runtime(snapshot.id, "passive_activate_reopen_descriptor");
         self.settings.detached_viewer_window_placement = Some(activate_placement);
         self.start_active_detached_book_context_from_descriptor(descriptor, ctx)
     }
@@ -24903,7 +25116,19 @@ impl App {
         let Some(snapshot) = self.build_active_detached_image_window_snapshot(None, pinned) else {
             return false;
         };
+        let snapshot_id = snapshot.id;
         self.detached_image_windows.push(snapshot);
+        self.update_detached_window_runtime_flags(
+            snapshot_id,
+            pinned,
+            !self.detached_viewer_independent_active && !pinned,
+            "park_active_detached_image_window",
+        );
+        self.transition_detached_window_state(
+            snapshot_id,
+            DetachedWindowState::Parked,
+            "park_active_detached_image_window",
+        );
         true
     }
 
@@ -25039,6 +25264,17 @@ impl App {
         bundle.pending_auto_fs_open = false;
         bundle.pending_return_to_parent = false;
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        self.update_detached_window_runtime_flags(
+            window_id,
+            false,
+            false,
+            "promote_detached_video_for_main_context_change",
+        );
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Active,
+            "promote_detached_video_for_main_context_change",
+        );
 
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
@@ -25143,6 +25379,17 @@ impl App {
         // active_detached_session は同じ window_id のまま維持 (ViewportId 連続性、窓再生成回避)。
         // この session は独自 context (= ピン窓) のもの。④ で別画像を open すると
         // begin_active_detached_session が新 window_id で上書きし、ピン窓は passive へ退避する。
+        self.update_detached_window_runtime_flags(
+            window_id,
+            true,
+            false,
+            "pin_promote_to_independent",
+        );
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Active,
+            "pin_promote_to_independent",
+        );
         self.log_detached_image_window_debug(format!(
             "pin_promote_to_independent window_id={window_id} idx={idx}"
         ));
@@ -25237,6 +25484,11 @@ impl App {
                 self.detached_viewer_folder_nav_reuse_window_once
             ));
             self.detached_viewer_window_id = Some(reusable.id);
+            self.transition_detached_window_state(
+                reusable.id,
+                DetachedWindowState::Resuming,
+                "prepare_detached_image_windows_for_open_reuse",
+            );
             self.settings.detached_viewer_window_placement = Some(reusable.placement);
             self.detached_viewer_open_next_still_detached_once = true;
             should_recreate_active_viewport = true;
@@ -25250,6 +25502,11 @@ impl App {
                 self.fs_open_intent_from_grid, self.detached_viewer_folder_nav_reuse_window_once
             ));
             self.detached_viewer_window_id = Some(window_id);
+            self.transition_detached_window_state(
+                window_id,
+                DetachedWindowState::Opening,
+                "prepare_detached_image_windows_for_open_allocate",
+            );
             self.settings.detached_viewer_window_placement =
                 Some(self.offset_detached_image_window_placement(base_placement));
             self.detached_viewer_open_next_still_detached_once = current_pinned && !always_new;
@@ -25477,7 +25734,7 @@ impl App {
         let Some(window_id) = self.active_detached_hwnd_window_id() else {
             return;
         };
-        if let Some(hwnd) = self.detached_window_hwnd_registry.clear(window_id) {
+        if let Some(hwnd) = self.detached_window_hwnd_clear(window_id) {
             crate::logger::log(format!(
                 "[detached-viewer] clear host window_id={window_id} hwnd=0x{hwnd:x}",
             ));
@@ -25487,7 +25744,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn detached_viewer_host_hwnd_alive(&self) -> Option<u64> {
         let window_id = self.active_detached_hwnd_window_id()?;
-        self.detached_window_hwnd_registry.hwnd_alive(window_id)
+        self.detached_window_hwnd_alive(window_id)
     }
 
     /// detached viewer の OS 窓を「新規生成 / 再生成する可能性があるフレームか」を返す。
@@ -26307,12 +26564,28 @@ impl App {
             // ページ切替に巻き込まれ、同じ ViewportId / bundle が混線する。
             let owns_active_detached_session = self.active_detached_viewer_context.is_none();
             if owns_active_detached_session && self.active_detached_session.is_some() {
+                let closing_window_id = self
+                    .active_detached_session
+                    .map(|session| session.window_id);
                 self.begin_active_detached_session_close("open_non_detached");
                 self.finish_active_detached_session_close("open_non_detached");
+                if let Some(window_id) = closing_window_id {
+                    self.remove_detached_window_runtime(window_id, "open_non_detached");
+                }
             }
             self.detached_viewer_window_id = None;
         }
         self.detached_viewer_independent_active = independent_detached_still;
+        if matches!(presentation, ViewerPresentation::DetachedWindow)
+            && let Some(window_id) = self.detached_viewer_window_id
+        {
+            self.update_detached_window_runtime_flags(
+                window_id,
+                self.detached_viewer_pin_active,
+                !independent_detached_still,
+                "prepare_viewer_presentation_open",
+            );
+        }
         if focus_detached_from_grid {
             self.detached_viewer_focus_requested = true;
         }
@@ -32539,8 +32812,14 @@ impl App {
         // 内部 close とは別経路なので、ここでは確実に session を畳んでよい。
         #[cfg(windows)]
         {
+            let closing_window_id = self
+                .active_detached_session
+                .map(|session| session.window_id);
             self.begin_active_detached_session_close("handle_fullscreen_close_request");
             self.finish_active_detached_session_close("handle_fullscreen_close_request");
+            if let Some(window_id) = closing_window_id {
+                self.remove_detached_window_runtime(window_id, "handle_fullscreen_close_request");
+            }
         }
         self.close_fullscreen();
     }
@@ -38837,9 +39116,21 @@ impl App {
                         if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                             let id = self.ensure_detached_viewer_window_id();
                             self.begin_active_detached_session(id, DetachedSource::Image);
+                            self.update_detached_window_runtime_flags(
+                                id,
+                                self.detached_viewer_pin_active,
+                                !self.detached_viewer_independent_active,
+                                "f12_on",
+                            );
                         } else {
+                            let closing_window_id = self
+                                .active_detached_session
+                                .map(|session| session.window_id);
                             self.begin_active_detached_session_close("f12_off");
                             self.finish_active_detached_session_close("f12_off");
+                            if let Some(window_id) = closing_window_id {
+                                self.remove_detached_window_runtime(window_id, "f12_off");
+                            }
                         }
                         self.log_detached_image_window_debug(format!(
                             "toggle_detached_viewer_mode_still_applied idx={idx} \

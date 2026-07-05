@@ -4015,6 +4015,7 @@ impl App {
                 window.initial_placement_applied = false;
             }
         }
+        let mut pin_flag_updates = Vec::new();
         for id in &toggle_pin_ids {
             if let Some(window) = self
                 .detached_image_windows
@@ -4022,7 +4023,11 @@ impl App {
                 .find(|window| window.id == *id)
             {
                 window.pinned = !window.pinned;
+                pin_flag_updates.push((*id, window.pinned));
             }
+        }
+        for (id, pinned) in pin_flag_updates {
+            self.update_detached_window_runtime_flags(id, pinned, !pinned, "passive_toggle_pin");
         }
         if !close_ids.is_empty() {
             self.log_detached_image_window_debug(format!(
@@ -4034,6 +4039,11 @@ impl App {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
             }
             for id in &close_ids {
+                self.transition_detached_window_state(
+                    *id,
+                    crate::app::DetachedWindowState::Closing,
+                    "passive_close",
+                );
                 if let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(*id) {
                     self.log_detached_image_window_debug(format!(
                         "passive_close_clear_host id={id} hwnd=0x{hwnd:x}"
@@ -4046,6 +4056,9 @@ impl App {
             }
             self.detached_image_windows
                 .retain(|window| !close_ids.contains(&window.id));
+            for id in &close_ids {
+                self.remove_detached_window_runtime(*id, "passive_close");
+            }
             if self.detached_image_windows.is_empty() {
                 self.request_detached_cleanup_font_atlas_resync("passive_close");
             }
@@ -4675,8 +4688,14 @@ impl App {
                 // deferred holdover 中の Esc / × は detached viewer を閉じる明示操作。
                 // 同フレームの backstop より前に session を畳んで空窓の再描画を防ぐ
                 // (Codex レビュー #3 site 3)。
+                let closing_window_id = self
+                    .active_detached_session
+                    .map(|session| session.window_id);
                 self.begin_active_detached_session_close("deferred_holdover_cancel");
                 self.finish_active_detached_session_close("deferred_holdover_cancel");
+                if let Some(window_id) = closing_window_id {
+                    self.remove_detached_window_runtime(window_id, "deferred_holdover_cancel");
+                }
                 ctx.request_repaint();
             }
             return;
@@ -4695,8 +4714,14 @@ impl App {
         // 明示 close 経路 (handle_fullscreen_close_request 等) と二重でも idempotent。
         #[cfg(windows)]
         if self.active_detached_session.is_some() {
+            let closing_window_id = self
+                .active_detached_session
+                .map(|session| session.window_id);
             self.begin_active_detached_session_close("keep_alive_cleanup");
             self.finish_active_detached_session_close("keep_alive_cleanup");
+            if let Some(window_id) = closing_window_id {
+                self.remove_detached_window_runtime(window_id, "keep_alive_cleanup");
+            }
         }
         // ここに来るのは close_fullscreen 直後の 1 フレーム。
         // show_viewport_immediate を 1 回呼んで viewport を alive にし、

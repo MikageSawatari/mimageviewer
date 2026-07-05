@@ -16307,10 +16307,9 @@ mod still_window_mode_key_tests {
 
     fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
         app.detached_viewer_window_id = Some(window_id);
-        app.detached_window_hwnd_registry.set(window_id, hwnd);
+        app.detached_window_hwnd_set(window_id, hwnd);
         let live_hwnds = if live { vec![hwnd] } else { Vec::new() };
-        app.detached_window_hwnd_registry
-            .set_live_hwnds_for_test(live_hwnds);
+        app.set_detached_window_live_hwnds_for_test(live_hwnds);
     }
 
     fn thread_window_entry(
@@ -16344,7 +16343,7 @@ mod still_window_mode_key_tests {
         ];
 
         assert_eq!(
-            DetachedWindowHwndRegistry::select_created_hwnd(&before, &after),
+            App::select_detached_created_hwnd(&before, &after),
             DetachedWindowHwndDiff::Created(0x20)
         );
     }
@@ -16354,7 +16353,7 @@ mod still_window_mode_key_tests {
         let before = vec![thread_window_entry(0x10, true, "Window Class")];
         let no_change = before.clone();
         assert_eq!(
-            DetachedWindowHwndRegistry::select_created_hwnd(&before, &no_change),
+            App::select_detached_created_hwnd(&before, &no_change),
             DetachedWindowHwndDiff::NoChange
         );
 
@@ -16364,7 +16363,7 @@ mod still_window_mode_key_tests {
             thread_window_entry(0x30, false, "Window Class"),
         ];
         assert_eq!(
-            DetachedWindowHwndRegistry::select_created_hwnd(&before, &ambiguous),
+            App::select_detached_created_hwnd(&before, &ambiguous),
             DetachedWindowHwndDiff::Ambiguous(vec![0x20, 0x30])
         );
 
@@ -16373,22 +16372,22 @@ mod still_window_mode_key_tests {
             thread_window_entry(0x40, false, "Other Class"),
         ];
         assert_eq!(
-            DetachedWindowHwndRegistry::select_created_hwnd(&before, &wrong_class),
+            App::select_detached_created_hwnd(&before, &wrong_class),
             DetachedWindowHwndDiff::NoChange
         );
     }
 
     #[test]
     fn detached_hwnd_registry_clears_dead_hwnd_and_retries_generation_diff() {
-        let mut registry = DetachedWindowHwndRegistry::default();
-        registry.set(7, 0x700);
-        registry.set_live_hwnds_for_test([0x700]);
-        assert_eq!(registry.hwnd_alive(7), Some(0x700));
+        let mut app = setup_app();
+        app.detached_window_hwnd_set(7, 0x700);
+        app.set_detached_window_live_hwnds_for_test([0x700]);
+        assert_eq!(app.detached_window_hwnd_alive(7), Some(0x700));
 
-        registry.set_live_hwnds_for_test(Vec::<u64>::new());
-        assert_eq!(registry.hwnd_alive(7), None);
-        assert_eq!(registry.clear_if_dead(7), Some(0x700));
-        assert_eq!(registry.get_raw(7), None);
+        app.set_detached_window_live_hwnds_for_test(Vec::<u64>::new());
+        assert_eq!(app.detached_window_hwnd_alive(7), None);
+        assert_eq!(app.detached_window_hwnd_clear_if_dead(7), Some(0x700));
+        assert_eq!(app.detached_window_hwnd_get_raw(7), None);
     }
 
     #[test]
@@ -16425,21 +16424,21 @@ mod still_window_mode_key_tests {
 
     #[test]
     fn detached_hwnd_unclaimed_adopts_single_unregistered_egui_window() {
-        let mut registry = DetachedWindowHwndRegistry::default();
-        registry.set(7, 0x700);
-        registry.set(8, 0x800);
-        registry.set_live_hwnds_for_test([0x800]);
-        assert_eq!(registry.clear_if_dead(7), Some(0x700));
+        let mut app = setup_app();
+        app.detached_window_hwnd_set(7, 0x700);
+        app.detached_window_hwnd_set(8, 0x800);
+        app.set_detached_window_live_hwnds_for_test([0x800]);
+        assert_eq!(app.detached_window_hwnd_clear_if_dead(7), Some(0x700));
 
         let after = vec![
             thread_window_entry(0x10, true, "Window Class"),
             thread_window_entry(0x800, false, "Window Class"),
             thread_window_entry(0x900, false, "Window Class"),
         ];
-        let claimed = registry.registered_hwnds();
+        let claimed = app.detached_window_registered_hwnds();
 
         assert_eq!(
-            DetachedWindowHwndRegistry::select_unclaimed_hwnd(&after, &claimed),
+            App::select_detached_unclaimed_hwnd(&after, &claimed),
             DetachedWindowHwndDiff::Created(0x900)
         );
     }
@@ -16453,7 +16452,7 @@ mod still_window_mode_key_tests {
             thread_window_entry(0x800, false, "Window Class"),
         ];
         assert_eq!(
-            DetachedWindowHwndRegistry::select_unclaimed_hwnd(&none, &claimed),
+            App::select_detached_unclaimed_hwnd(&none, &claimed),
             DetachedWindowHwndDiff::NoChange
         );
 
@@ -16464,7 +16463,7 @@ mod still_window_mode_key_tests {
             thread_window_entry(0xb00, false, "Other Class"),
         ];
         assert_eq!(
-            DetachedWindowHwndRegistry::select_unclaimed_hwnd(&ambiguous, &claimed),
+            App::select_detached_unclaimed_hwnd(&ambiguous, &claimed),
             DetachedWindowHwndDiff::Ambiguous(vec![0x900, 0xa00])
         );
     }
@@ -20578,7 +20577,7 @@ mod still_window_mode_key_tests {
 
         // host 未捕捉 (== 0) = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
         app.detached_viewer_window_id = Some(12);
-        app.detached_window_hwnd_registry.clear(12);
+        app.detached_window_hwnd_clear(12);
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert!(
             builder.inner_size.is_some(),
@@ -20619,7 +20618,7 @@ mod still_window_mode_key_tests {
 
         // 未捕捉 (== 0) → seed。
         app.detached_viewer_window_id = Some(12);
-        app.detached_window_hwnd_registry.clear(12);
+        app.detached_window_hwnd_clear(12);
         assert!(app.detached_viewer_should_seed_placement());
 
         // stale (死んだ HWND を !=0 で指したまま egui 再生成) → seed し続ける。
