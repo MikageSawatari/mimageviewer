@@ -23969,7 +23969,9 @@ impl App {
         match Self::select_detached_created_hwnd(before, &after) {
             DetachedWindowHwndDiff::Created(hwnd) => {
                 let previous = self.detached_window_hwnd_set(window_id, hwnd);
-                let state = if label == "passive" {
+                let state = if self.detached_window_state_is_parked_live(window_id) {
+                    DetachedWindowState::ParkedLive
+                } else if label == "passive" {
                     DetachedWindowState::Parked
                 } else {
                     DetachedWindowState::Active
@@ -24057,7 +24059,9 @@ impl App {
         match Self::select_detached_unclaimed_hwnd(&after, &claimed) {
             DetachedWindowHwndDiff::Created(hwnd) => {
                 self.detached_window_hwnd_set(window_id, hwnd);
-                let state = if label == "passive" {
+                let state = if self.detached_window_state_is_parked_live(window_id) {
+                    DetachedWindowState::ParkedLive
+                } else if label == "passive" {
                     DetachedWindowState::Parked
                 } else {
                     DetachedWindowState::Active
@@ -24189,6 +24193,85 @@ impl App {
                 .fs_cache
                 .values()
                 .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_window_state_is_parked_live(&self, window_id: u64) -> bool {
+        self.detached_window_state(window_id) == Some(DetachedWindowState::ParkedLive)
+    }
+
+    #[cfg(windows)]
+    fn parked_live_media_window_ids(&self) -> Vec<u64> {
+        self.detached_image_windows
+            .iter()
+            .filter(|window| {
+                self.detached_window_state_is_parked_live(window.id)
+                    && window
+                        .paused_bundle
+                        .as_deref()
+                        .is_some_and(Self::viewer_context_bundle_contains_video)
+            })
+            .map(|window| window.id)
+            .collect()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn poll_parked_live_detached_windows(&mut self, ctx: &egui::Context) {
+        let ids = self.parked_live_media_window_ids();
+        for id in ids {
+            let Some(pos) = self
+                .detached_image_windows
+                .iter()
+                .position(|window| window.id == id)
+            else {
+                continue;
+            };
+            let Some(mut bundle) = self.detached_image_windows[pos].paused_bundle.take() else {
+                continue;
+            };
+            if !Self::viewer_context_bundle_contains_video(&bundle) {
+                self.detached_image_windows[pos].paused_bundle = Some(bundle);
+                continue;
+            }
+            self.log_detached_image_window_debug(format!(
+                "parked_live_poll_begin id={id} bundle_fs_idx={:?}",
+                bundle.fullscreen_idx
+            ));
+            self.swap_viewer_context_bundle(&mut bundle);
+            let saved_continuous_mode = self.video_continuous_mode;
+            self.video_continuous_mode = crate::video::VideoContinuousMode::Off;
+            self.poll_video(ctx);
+            self.video_continuous_mode = saved_continuous_mode;
+            self.swap_viewer_context_bundle(&mut bundle);
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.paused_bundle = Some(bundle);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn close_parked_live_media_windows_for_new_media(&mut self, reason: &'static str) {
+        let ids = self.parked_live_media_window_ids();
+        if ids.is_empty() {
+            return;
+        }
+        self.log_detached_image_window_debug(format!(
+            "parked_live_close_for_new_media ids={ids:?} reason={reason}"
+        ));
+        for id in &ids {
+            self.transition_detached_window_state(*id, DetachedWindowState::Closing, reason);
+            self.detached_image_window_close_pending.push(*id);
+            self.clear_detached_window_hwnd_for_window_id(*id);
+        }
+        self.detached_image_windows
+            .retain(|window| !ids.contains(&window.id));
+        for id in ids {
+            self.remove_detached_window_runtime(id, reason);
+        }
     }
 
     #[cfg(windows)]
@@ -24353,6 +24436,32 @@ impl App {
 
     #[cfg(windows)]
     fn park_and_close_current_active_detached_viewer(&mut self, ctx: &egui::Context) -> bool {
+        if self.active_detached_viewer_context_contains_video()
+            && self
+                .park_active_detached_context_as_live_media(ctx, "park_active_context_live_media")
+        {
+            self.log_detached_image_window_debug(format!(
+                "park_current_active_detached result=parked_live_active_context passive_windows={} \
+                 active_context={} session={:?}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session
+            ));
+            return true;
+        }
+        if self.viewer_session_is_detached()
+            && self.current_viewer_context_contains_video()
+            && self.park_current_viewer_context_as_live_media(ctx, "park_legacy_live_media")
+        {
+            self.log_detached_image_window_debug(format!(
+                "park_current_active_detached result=parked_live_legacy passive_windows={} \
+                 active_context={} session={:?}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session
+            ));
+            return true;
+        }
         if self.pause_current_active_detached_viewer_context(ctx) {
             self.log_detached_image_window_debug(format!(
                 "park_current_active_detached result=paused passive_windows={} \
@@ -24626,7 +24735,12 @@ impl App {
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
             self.last_active_detached_window_id = Some(snapshot.id);
-            self.begin_active_detached_session(snapshot.id, DetachedSource::Book);
+            let source = if Self::viewer_context_bundle_contains_video(&paused_bundle) {
+                DetachedSource::Video
+            } else {
+                DetachedSource::Book
+            };
+            self.begin_active_detached_session(snapshot.id, source);
             self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
                 bundle: *paused_bundle,
             });
@@ -25122,6 +25236,109 @@ impl App {
             initial_placement_applied: false,
             paused_bundle: None,
         })
+    }
+
+    #[cfg(windows)]
+    fn build_parked_live_media_window_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<DetachedImageWindowSnapshot> {
+        let idx = self.fullscreen_idx?;
+        if !self.viewer_session_is_detached() || !self.current_viewer_context_contains_video() {
+            return None;
+        }
+        let id = self.ensure_detached_viewer_window_id();
+        let placement = self.active_detached_viewer_current_placement();
+        let texture = ctx.load_texture(
+            format!("parked_live_media_backdrop_{id}"),
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        let title = self.detached_image_snapshot_title_for_idx(idx);
+        let location_display = self.detached_image_snapshot_location_for_idx(idx);
+        self.log_detached_image_window_debug(format!(
+            "build_parked_live_media_snapshot_ok id={id} idx={idx} title={title:?} \
+             placement={placement:?}"
+        ));
+        Some(DetachedImageWindowSnapshot {
+            id,
+            texture,
+            title,
+            location_display,
+            image_dims: None,
+            pinned: true,
+            rotation: crate::rotation_db::Rotation::None,
+            zoom_pan: None,
+            free_rotation: 0.0,
+            placement,
+            frozen_continuous_pages: Vec::new(),
+            reopen_descriptor: None,
+            reopen_sync_stamp: None,
+            activation_armed: false,
+            focused_last_frame: false,
+            initial_placement_applied: false,
+            paused_bundle: None,
+        })
+    }
+
+    #[cfg(windows)]
+    fn park_current_viewer_context_as_live_media(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+    ) -> bool {
+        let Some(mut snapshot) = self.build_parked_live_media_window_snapshot(ctx) else {
+            return false;
+        };
+        let snapshot_id = snapshot.id;
+        let mut parked_bundle = self.take_current_viewer_context_bundle();
+        if !Self::viewer_context_bundle_contains_video(&parked_bundle) {
+            self.swap_viewer_context_bundle(&mut parked_bundle);
+            return false;
+        }
+        parked_bundle.detached_viewer_window_id = Some(snapshot_id);
+        parked_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        parked_bundle.detached_viewer_independent_active = true;
+        parked_bundle.detached_viewer_pin_active = false;
+        parked_bundle.detached_viewer_open_next_still_detached_once = false;
+        snapshot.paused_bundle = Some(Box::new(parked_bundle));
+        self.detached_image_windows.push(snapshot);
+        self.update_detached_window_runtime_flags(snapshot_id, false, false, reason);
+        self.handoff_active_detached_viewport_to_passive(reason);
+        self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
+        self.fullscreen_idx = None;
+        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_pin_active = false;
+        self.detached_viewer_window_id = None;
+        self.last_viewer_sync_stamp = None;
+        self.log_detached_image_window_debug(format!(
+            "parked_live_media_committed id={snapshot_id} reason={reason} passive_windows={}",
+            self.detached_image_windows.len()
+        ));
+        true
+    }
+
+    #[cfg(windows)]
+    fn park_active_detached_context_as_live_media(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+    ) -> bool {
+        let Some(mut active) = self.active_detached_viewer_context.take() else {
+            return false;
+        };
+        if !Self::viewer_context_bundle_contains_video(&active.bundle) {
+            self.active_detached_viewer_context = Some(active);
+            return false;
+        }
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        let parked = self.park_current_viewer_context_as_live_media(ctx, reason);
+        self.swap_viewer_context_bundle(&mut active.bundle);
+        if !parked {
+            self.active_detached_viewer_context = Some(active);
+        }
+        parked
     }
 
     #[cfg(windows)]
@@ -26529,6 +26746,9 @@ impl App {
 
     #[cfg(windows)]
     fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
+        if entering_native_video || matches!(self.items.get(idx), Some(GridItem::Audio(_))) {
+            self.close_parked_live_media_windows_for_new_media("new_media_open");
+        }
         let presentation = self.resolve_viewer_presentation_for_open(idx, entering_native_video);
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
@@ -43976,6 +44196,8 @@ impl eframe::App for App {
         let active_detached_context_updated = self.update_active_detached_viewer_context(ctx);
         #[cfg(not(windows))]
         let active_detached_context_updated = false;
+        #[cfg(windows)]
+        self.poll_parked_live_detached_windows(ctx);
         if !active_detached_context_updated {
             self.keep_fullscreen_viewport_alive(ctx);
         }

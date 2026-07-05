@@ -3765,6 +3765,7 @@ impl App {
 
         for window in windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            let window_show_pin = show_pin && !self.detached_window_state_is_parked_live(window.id);
             let apply_initial_placement = !window.initial_placement_applied;
             let builder =
                 Self::build_detached_image_window_builder(&window, apply_initial_placement);
@@ -3852,7 +3853,7 @@ impl App {
                             vp_ctx,
                             full_rect,
                             &window,
-                            show_pin,
+                            window_show_pin,
                             &mut bar_close_requested,
                             &mut pin_toggle_requested,
                         );

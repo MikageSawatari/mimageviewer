@@ -110,6 +110,18 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 - **Passive・連動なし (independent passive)**: ピン済み / always-new 由来の窓が裏に回った状態。
   frozen snapshot と paused bundle を保持し、クリックで **Active・連動なし** として復帰する。
   メインの BS / Ctrl+↑↓ / 選択変更 / 明示 open では中身を差し替えない。
+- **ParkedLive (メディア live-park)**: 再生中の動画 / 音声を持つ detached 窓が裏に回った状態。
+  frozen 画像にはせず、paused bundle 内の `VideoPlayer` / native presenter / audio output を生かしたまま
+  egui host viewport だけを passive として維持する。非アクティブ中は映像と音声の継続だけを許可し、
+  HUD / キー操作 / シークなどの操作はクリックで Active 復帰してから有効化する。別の動画 / 音声を
+  新しく開く場合、既存の ParkedLive 窓は閉じる（再生エンジンは 1 本）。
+
+ParkedLive 駆動ノート（R2b）:
+- present loop / audio output は `VideoPlayer` / native presenter 側の既存スレッドが継続する。
+- App 側は毎フレーム ParkedLive の paused bundle を短時間 mount し、`poll_video` で tick / native event /
+  resume 位置保存を進める。非アクティブ中の自動フォルダ横断は行わない。
+- passive egui viewport は黒 backdrop と close 用の最小 UI を描くだけで、映像本体は presenter child が覆う。
+- ParkedLive クリック時は既存の paused_bundle resume 経路で `Resuming → Active` に戻す。
 
 **遷移表:**
 
@@ -122,6 +134,7 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 | ⑤ | ピン解除 | **無し（ピンは一方通行）**。連動なし窓は × で閉じるだけ。ピンボタンは押下後は解除アフォーダンスを出さない |
 | ⑥ | メインで BS / Ctrl+↑↓（フォルダ移動） | メイン bundle（と Active・連動窓）だけ移動。**Active・連動なし窓 / Passive 窓は一切不変・非クローズ** |
 | ⑦ | Passive 窓をクリックして Active 化 | 現 Active は **その時点の属性の Passive** へ落ちる（Active・連動 → Passive・連動、Active・連動なし → Passive・連動なし）。クリックした窓は保持属性の Active として復帰する。**Active 切替だけで既存窓を閉じない。** フォーカス到着だけ（Alt+Tab / OS の自動フォーカス移譲）は表示状態の更新に留め、Active 化しない（2026-07-05 focus ping-pong 対策）。 |
+| ⑧ | 再生中メディア detached 窓が Active から外れる | **ParkedLive** として残し、映像 / 音声を継続。クリックで Active 復帰。別メディアの明示 open では旧 ParkedLive を閉じる。 |
 
 補足:
 - ④ で Passive 化した窓をクリックすると再び Active 化する（`activate_detached_image_window_snapshot`）。

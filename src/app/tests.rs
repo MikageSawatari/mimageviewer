@@ -20873,6 +20873,204 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn live_media_park_creates_parked_live_snapshot_without_closing() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let window_id = 52;
+        app.settings.detached_viewer_enabled = true;
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+
+        assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_live_park"));
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let parked = &app.detached_image_windows[0];
+        assert_eq!(parked.id, window_id);
+        assert!(parked.paused_bundle.is_some());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::ParkedLive)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activating_parked_live_media_restores_video_session() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_window_id = Some(61);
+        let tex = ctx.load_texture(
+            "parked_live_resume",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 61,
+                texture: tex,
+                title: "live".to_owned(),
+                location_display: "live".to_owned(),
+                image_dims: None,
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement: crate::settings::DetachedViewerWindowPlacement {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 640.0,
+                    h: 480.0,
+                    maximized: false,
+                },
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 61));
+
+        let session = app
+            .active_detached_session
+            .expect("parked live media should resume as active detached video");
+        assert_eq!(session.window_id, 61);
+        assert_eq!(session.source, DetachedSource::Video);
+        assert_eq!(
+            app.detached_window_state(61),
+            Some(DetachedWindowState::Active)
+        );
+        assert!(app.active_detached_viewer_context_contains_video());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn new_media_open_closes_existing_parked_live_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_video = push_video(&mut app, r"C:\clips\old.mp4");
+        let new_video = push_video(&mut app, r"C:\clips\new.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(old_video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(71);
+        let tex = ctx.load_texture(
+            "parked_live_close",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 71,
+                texture: tex,
+                title: "old".to_owned(),
+                location_display: "old".to_owned(),
+                image_dims: None,
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement: crate::settings::DetachedViewerWindowPlacement {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 640.0,
+                    h: 480.0,
+                    maximized: false,
+                },
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(71, DetachedWindowState::ParkedLive, "test_setup");
+
+        app.prepare_viewer_presentation_open(new_video, true);
+
+        assert!(app.detached_image_windows.is_empty());
+        assert_eq!(app.detached_window_state(71), None);
+        assert_eq!(app.detached_image_window_close_pending, vec![71]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_poll_restores_continuous_mode_after_suppressing_auto_advance() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(81);
+        app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
+        let tex = ctx.load_texture(
+            "parked_live_continuous",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 81,
+                texture: tex,
+                title: "live".to_owned(),
+                location_display: "live".to_owned(),
+                image_dims: None,
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement: crate::settings::DetachedViewerWindowPlacement {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 640.0,
+                    h: 480.0,
+                    maximized: false,
+                },
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(81, DetachedWindowState::ParkedLive, "test_setup");
+
+        app.poll_parked_live_detached_windows(&ctx);
+
+        assert_eq!(
+            app.video_continuous_mode,
+            crate::video::VideoContinuousMode::ContinuousLoop,
+            "ParkedLive suppresses auto-advance only while polling and restores the global setting"
+        );
+        assert!(
+            app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 81)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn keepalive_rendered_marker_tracks_frame_and_id() {
         // marker (§3.6): 現セッションの detached id を描いたフレームだけ立ち、frame_counter で
         // 自動リセットされる。別 id では立たない (backstop の二重描画/描き漏れ防止)。
