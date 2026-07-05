@@ -20907,6 +20907,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\live.mp4");
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = app.items.clone();
+        bundle.address = "parked-live://sentinel".to_owned();
         bundle.fullscreen_idx = Some(video);
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         bundle.detached_viewer_independent_active = true;
@@ -20956,6 +20957,58 @@ mod still_window_mode_key_tests {
             Some(DetachedWindowState::Active)
         );
         assert!(app.active_detached_viewer_context_contains_video());
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 61),
+            "ParkedLive restore must atomically remove the passive snapshot"
+        );
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("parked live bundle should become the active context");
+        assert_eq!(active.bundle.address, "parked-live://sentinel");
+        assert_eq!(active.bundle.detached_viewer_window_id, Some(61));
+        assert_eq!(active.bundle.fullscreen_idx, Some(video));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_key_and_wheel_events_are_noop() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
+        };
+
+        let key = NativeVideoKeyEvent {
+            virtual_key: 0x28,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let wheel = NativeVideoMouseWheelEvent {
+            delta: -120,
+            x: 10,
+            y: 10,
+            shift: false,
+            ctrl: false,
+        };
+
+        assert!(!App::native_video_output_event_allowed_while_parked_live(
+            &Ev::Window(WinEv::KeyDown(key))
+        ));
+        assert!(!App::native_video_output_event_allowed_while_parked_live(
+            &Ev::Window(WinEv::MouseWheel(wheel))
+        ));
+        assert!(!App::native_video_output_event_allowed_while_parked_live(
+            &Ev::NavigateItem { delta: 1 }
+        ));
+        assert!(!App::native_video_output_event_allowed_while_parked_live(
+            &Ev::TogglePlay
+        ));
     }
 
     #[test]

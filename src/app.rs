@@ -4027,6 +4027,12 @@ pub struct App {
     /// backstop の二重描画/描き漏れ防止 (§3.6)。
     #[cfg(windows)]
     pub(crate) detached_active_viewport_rendered_frame: u64,
+    /// ParkedLive の動画を passive として tick している間だけ true。
+    ///
+    /// 再生は継続するが、passive 窓上のキー・ホイール・HUD 操作は仕様上 no-op にする。
+    /// bundle には入れない outer runtime flag。
+    #[cfg(windows)]
+    native_video_parked_live_input_suppressed: bool,
     #[cfg(windows)]
     next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
@@ -7057,6 +7063,8 @@ impl App {
             active_detached_session: None,
             #[cfg(windows)]
             detached_active_viewport_rendered_frame: u64::MAX,
+            #[cfg(windows)]
+            native_video_parked_live_input_suppressed: false,
             #[cfg(windows)]
             next_detached_viewer_context_serial: 1,
             fs_cache: std::collections::HashMap::new(),
@@ -24239,8 +24247,11 @@ impl App {
             ));
             self.swap_viewer_context_bundle(&mut bundle);
             let saved_continuous_mode = self.video_continuous_mode;
+            let saved_input_suppressed = self.native_video_parked_live_input_suppressed;
             self.video_continuous_mode = crate::video::VideoContinuousMode::Off;
+            self.native_video_parked_live_input_suppressed = true;
             self.poll_video(ctx);
+            self.native_video_parked_live_input_suppressed = saved_input_suppressed;
             self.video_continuous_mode = saved_continuous_mode;
             self.swap_viewer_context_bundle(&mut bundle);
             if let Some(window) = self
@@ -24286,6 +24297,113 @@ impl App {
         pointer_activation: bool,
     ) -> bool {
         can_activate && activation_armed && pointer_activation
+    }
+
+    #[cfg(windows)]
+    fn activate_parked_live_media_window_snapshot(&mut self, ctx: &egui::Context, id: u64) -> bool {
+        let Some(pos) = self
+            .detached_image_windows
+            .iter()
+            .position(|window| window.id == id)
+        else {
+            return false;
+        };
+        if !self.detached_window_state_is_parked_live(id) {
+            return false;
+        }
+        if !self.detached_image_windows[pos]
+            .paused_bundle
+            .as_deref()
+            .is_some_and(Self::viewer_context_bundle_contains_video)
+        {
+            self.log_detached_image_window_debug(format!(
+                "parked_live_activate_aborted id={id} reason=no_video_bundle"
+            ));
+            return false;
+        }
+        let activate_placement = self.detached_image_windows[pos].placement;
+        self.log_detached_image_window_debug(format!(
+            "parked_live_activate_begin id={id} pos={pos} active_context={} session={:?}",
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session
+        ));
+        self.clear_fullscreen_feedback_for_viewer_switch();
+
+        if !self.park_and_close_current_active_detached_viewer(ctx) {
+            self.log_detached_image_window_debug(format!(
+                "parked_live_activate_aborted id={id} reason=park_current_failed"
+            ));
+            return false;
+        }
+
+        let Some(pos) = self
+            .detached_image_windows
+            .iter()
+            .position(|window| window.id == id)
+        else {
+            self.log_detached_image_window_debug(format!(
+                "parked_live_activate_aborted id={id} reason=snapshot_missing_after_park"
+            ));
+            return false;
+        };
+        let mut snapshot = self.detached_image_windows.remove(pos);
+        let Some(mut paused_bundle) = snapshot.paused_bundle.take() else {
+            self.log_detached_image_window_debug(format!(
+                "parked_live_activate_aborted id={id} reason=bundle_missing_after_remove"
+            ));
+            self.transition_detached_window_state(
+                id,
+                DetachedWindowState::ParkedLive,
+                "parked_live_activate_aborted",
+            );
+            self.detached_image_windows.insert(pos, snapshot);
+            return false;
+        };
+        if !Self::viewer_context_bundle_contains_video(&paused_bundle) {
+            self.log_detached_image_window_debug(format!(
+                "parked_live_activate_aborted id={id} reason=bundle_not_video_after_remove"
+            ));
+            snapshot.paused_bundle = Some(paused_bundle);
+            self.transition_detached_window_state(
+                id,
+                DetachedWindowState::ParkedLive,
+                "parked_live_activate_aborted",
+            );
+            self.detached_image_windows.insert(pos, snapshot);
+            return false;
+        }
+
+        paused_bundle.detached_viewer_window_id = Some(id);
+        paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        paused_bundle.detached_viewer_independent_active = true;
+        paused_bundle.detached_viewer_pin_active = false;
+        paused_bundle.detached_viewer_open_next_still_detached_once = false;
+        paused_bundle.fs_open_intent_from_grid = false;
+        paused_bundle.pending_auto_fs_open = false;
+        paused_bundle.pending_return_to_parent = false;
+        paused_bundle.pdf_prefetch_grace_until = None;
+
+        self.update_detached_window_runtime_flags(id, false, false, "parked_live_activate_commit");
+        self.transition_detached_window_state(
+            id,
+            DetachedWindowState::Resuming,
+            "parked_live_activate_commit",
+        );
+        self.settings.detached_viewer_window_placement = Some(activate_placement);
+        self.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
+        self.last_active_detached_window_id = Some(id);
+        self.begin_active_detached_session(id, DetachedSource::Video);
+        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: *paused_bundle,
+        });
+        self.log_detached_image_window_debug(format!(
+            "parked_live_activate_committed id={id} passive_remaining={} active_context=true \
+             session={:?}",
+            self.detached_image_windows.len(),
+            self.active_detached_session
+        ));
+        ctx.request_repaint();
+        true
     }
 
     #[cfg(windows)]
@@ -24651,6 +24769,9 @@ impl App {
         ctx: &egui::Context,
         id: u64,
     ) -> bool {
+        if self.detached_window_state_is_parked_live(id) {
+            return self.activate_parked_live_media_window_snapshot(ctx, id);
+        }
         let Some(pos) = self
             .detached_image_windows
             .iter()

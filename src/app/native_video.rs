@@ -2358,6 +2358,30 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn native_video_output_event_allowed_while_parked_live(
+        event: &crate::video::NativeVideoOutputEvent,
+    ) -> bool {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::NativeVideoWindowEvent as WinEv;
+
+        match event {
+            // Placement completion/failure is lifecycle bookkeeping from an in-flight presenter
+            // operation, not user input. Dropping it can leave pending switch state stale.
+            Ev::PlacementSwitched { .. } | Ev::PlacementSwitchFailed { .. } => true,
+            // Passive/ParkedLive windows must not react to keys, wheel, or mouse buttons. Geometry
+            // maintenance is harmless and keeps the presenter in sync if it reports DPI/rect data.
+            Ev::Window(
+                WinEv::GeometryChanged { .. }
+                | WinEv::DpiChanged { .. }
+                | WinEv::RequestRaiseHud
+                | WinEv::MouseLeave,
+            ) => true,
+            Ev::Window(_) => false,
+            _ => false,
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -2369,6 +2393,14 @@ impl App {
             crate::logger::log(format!(
                 "[native-video] stale overlay event ignored: event_idx={fs_idx} current={:?}",
                 self.fullscreen_idx
+            ));
+            return;
+        }
+        if self.native_video_parked_live_input_suppressed
+            && !Self::native_video_output_event_allowed_while_parked_live(&event)
+        {
+            crate::logger::log(format!(
+                "[native-video] parked-live passive event ignored: idx={fs_idx} event={event:?}"
             ));
             return;
         }
