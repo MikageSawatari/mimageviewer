@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>音楽再生 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>音楽再生</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html" class="active">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">音楽再生</h1>
+    <p class="page-desc">mImageViewer は音声ファイルをフルスクリーンの「音楽ビュー」で再生できます。
+    波形タイムラインとスペクトラム表示で曲の構造を見ながら聴けるほか、動画を再生中に映像を消して
+    音声だけを聴く「音声モード」にも切り替えられます。本ページでは音楽ビューの開き方・画面構成・
+    再生操作・ブックマーク・VST3 プラグイン処理をまとめて説明します。</p>
+
+    <h2 id="open">音楽ビューを開く</h2>
+
+    <h3>音声ファイルを開く</h3>
+    <p>MP3 / FLAC / WAV / M4A / AAC / OGG / Opus / WMA の音声ファイルは、グリッド一覧に画像や動画と
+    一緒に並びます。音声ファイルをダブルクリック（または <kbd>Enter</kbd>）で開くと、フルスクリーンの
+    音楽ビューが開いて自動再生します。前後のファイルへの移動やフォルダ内の連続再生も、動画と同じ操作で
+    行えます。</p>
+
+    <h3 id="audio-mode">動画→音声モード</h3>
+    <p>動画を再生しているとき、映像を消して音声だけを音楽ビューで聴けます。作業用 BGM として動画を
+    流したいときや、波形・スペクトラムで音を確認したいときに便利です。</p>
+    <ul>
+      <li>動画再生中に上部バーの <strong>♪ ボタン</strong>、または <kbd>Z</kbd> キーで音声モードへ切り替わります</li>
+      <li>映像が消えて波形・スペクトラムの音楽ビューになります。<strong>音は途切れず</strong>、再生位置・音量・
+      音量自動調整・VST3 の状態はそのまま引き継がれます</li>
+      <li>上部バーの <strong>▶ ボタン</strong>、または再度 <kbd>Z</kbd> キーで動画表示へ戻ります</li>
+      <li>音声モードのまま前後のファイルへ移動でき、連続再生の途中でも音声モードを保ちます。移動先が
+      映像付きの動画でも、音声モードのままなら映像は表示しません</li>
+    </ul>
+
+    <h2 id="layout">画面構成</h2>
+
+    <h3>波形タイムライン（中央）</h3>
+    <p>画面中央には曲全体を「行」に分けた DJ スタイルの波形が表示されます。ステレオの左右チャンネルを
+    上下に分け、盛り上がりや打点（トランジェント）が一目で分かります。</p>
+    <ul>
+      <li>1 行あたりの長さ（10 / 15 / 30 / 60 / 120 秒）を上部バーのセレクタで切り替えられます</li>
+      <li>再生位置には縦線（プレイヘッド）、ブックマーク位置には縦マーカーが表示されます</li>
+      <li>波形の下には行ごとの簡易な分析レーンを併記します（音量とベース音の目安 / 推定キーとボーカルの目安）。
+      解析は自動で行われ、あくまで目安として色分け表示します</li>
+    </ul>
+
+    <h3>スペクトラム（下部）</h3>
+    <p>画面下部には再生位置周辺の周波数スペクトラム（20Hz〜18kHz）をリアルタイム表示します。
+    88 鍵のピアノ鍵盤が音の内容にあわせて発光し、どの音域が鳴っているかを視覚的に確認できます。
+    表示にマウスを重ねると、その位置の周波数・最も近い音名・音程のずれ（セント）が表示されます。</p>
+
+    <h3>情報パネル（右）</h3>
+    <p>画面右端にカーソルを近づけると情報パネルが表示されます。</p>
+    <ul>
+      <li><strong>★ レーティング：</strong>画像・動画と共通の★1〜★5。絞り込みにも使えます</li>
+      <li><strong>タグ：</strong>画像・動画と共通のタグ機能。曲にタグを付けて検索できます</li>
+      <li><strong>音声情報：</strong>形式・コーデック・長さ・サンプルレート・チャンネル数・ビットレート。
+      ファイルに埋め込まれたタイトル・アーティスト・アルバムなどの情報があれば併せて表示します</li>
+    </ul>
+    <p><kbd>I</kbd> または <kbd>Tab</kbd> でパネルを固定表示に切り替えられます。</p>
+
+    <h3>ブックマークパネル（左）</h3>
+    <p>画面左端にカーソルを近づけるとブックマーク一覧が表示されます。各行をクリックするとその位置へ
+    移動でき、名称の編集（✏）や個別削除（×）もできます。パネル上部のボタンから現在位置への
+    ブックマーク追加と、一覧の一括登録・書き出しができます（<a href="#bookmark">ブックマーク</a>参照）。</p>
+
+    <h3>上部バー・下部 HUD</h3>
+    <p>上部バーにはファイル名・再生位置・総時間・音量・行長セレクタ・VST3 ボタン（有効時のみ）が並びます。
+    下部 HUD には <strong>シークバー</strong>（クリック / ドラッグで頭出し）と再生コントロール
+    （頭出し / 再生・一時停止 / ループ / 連続再生 / 前後ファイル / 前後ブックマーク / ミュート /
+    音量スライダー / 再生速度）が並びます。再生中は数秒間操作がないと自動的に隠れ、マウスを動かすと
+    再表示されます。</p>
+
+    <h2 id="controls">再生操作</h2>
+    <p>音楽ビューのキーボード操作は動画再生と共通です。主な操作は次のとおりです。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Space</kbd> / <kbd>Enter</kbd></td><td>再生 / 一時停止をトグル</td></tr>
+          <tr><td><kbd>W</kbd></td><td>先頭へ移動して再生</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>1 秒シーク（細かい）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>30 秒シーク（大きい）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd></td><td>音量を上げる / 下げる</td></tr>
+          <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>前 / 次のファイルへ移動</td></tr>
+          <tr><td><kbd>M</kbd></td><td>ミュートのトグル</td></tr>
+          <tr><td><kbd>L</kbd></td><td>ループモードの切り替え</td></tr>
+          <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>前 / 次のブックマークへ移動</td></tr>
+          <tr><td><kbd>B</kbd></td><td>現在位置にブックマークを追加</td></tr>
+          <tr><td><kbd>Z</kbd></td><td>音声モードの切り替え（動画再生中は映像を消す / 音声モード中は動画表示へ戻す）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>これらのキー割り当ては、設定メニュー →「操作カスタマイズ…」で変更できます。
+    再生速度は下部 HUD の速度ボタンから変更でき、ピッチ（音の高さ）は保ったまま速く / 遅く再生します。</p>
+
+    <h2 id="loop">ループ・連続再生</h2>
+    <h3>ループモード</h3>
+    <p><kbd>L</kbd> キーまたは下部 HUD のループボタンで、ループなし → 全体ループ → ブックマーク区間ループ
+    の順に切り替えられます。ブックマーク区間ループには隣り合うブックマークが必要です。</p>
+    <h3>連続再生</h3>
+    <p>下部 HUD の連続再生ボタンで、フォルダ内のファイルを順番に再生できます。曲の末尾まで再生すると、
+    一覧内の次のファイルを自動的に再生します。音声モードで聴いているときは、次のファイルも音声モードのまま
+    続けて再生します（映像付きの動画でも映像は表示しません）。曲の末尾は最後まで鳴らし切ってから次へ
+    進むので、末尾が途切れません。</p>
+
+    <h2 id="bookmark">ブックマーク</h2>
+    <p><kbd>B</kbd> キー、または左パネル上部のボタンで現在位置にブックマークを追加できます。
+    <kbd>J</kbd> / <kbd>K</kbd> で前 / 次のブックマークへ移動します。既存のブックマークと ±1 秒以内の
+    位置には重複して追加されません。ブックマークは動画と共通の仕組みで保存され、同じファイルを
+    音声・動画のどちらで開いても同じブックマークが見えます。</p>
+    <p>左パネルの一括登録ボタンから、<code>mm:ss タイトル</code> または <code>hh:mm:ss タイトル</code> 形式の
+    リストをまとめて貼り付けてブックマーク化できます。同じダイアログから現在のブックマーク一覧を
+    クリップボードへ書き出すこともできます。詳しい書式は<a href="video.html#loop">動画再生のブックマーク</a>と
+    共通です。</p>
+
+    <h2 id="vst3">VST3 プラグイン処理</h2>
+    <p>音楽ビューの音声も、動画と同じように VST3 プラグインのチェーンに通してから再生できます。
+    LUFS 測定・EQ・コンプなどを、波形やスペクトラムを見ながらリアルタイムに適用・確認できます。
+    有効化・プラグインのスキャン・チェーンの管理は動画と共通で、
+    <a href="settings.html#vst3">環境設定 → 動画・音声 → VST3 プラグイン</a> で行います。</p>
+    <p>音声モード中も上部バーの「VST」ボタンからプラグインの GUI を表示でき、動画→音声モードに
+    切り替えても VST の設定はそのまま引き継がれます。詳細は
+    <a href="video.html#vst3">動画再生 → VST3 プラグイン処理</a>を参照してください。</p>
+
+    <h2 id="rating">レーティング・タグ</h2>
+    <p>音声ファイルにも <kbd>F1</kbd>〜<kbd>F5</kbd> で★1〜★5、<kbd>F6</kbd> で解除を設定でき、
+    画像・動画と同じ★フィルタで絞り込めます。タグも共通の仕組みで、曲にタグを付けて
+    <a href="tags.html">タグ機能</a>や<a href="search.html">検索機能</a>から探せます。</p>
+
+    <h2 id="settings">関連する環境設定</h2>
+    <p>音声の音量自動調整（ラウドネス ノーマライズ）は動画と共通の設定です。有効にすると、
+    ファイルを開くたびに音量を測定して曲ごとの音量差をそろえます。設定項目は
+    <a href="settings.html#video-settings">設定リファレンス → 動画・音声</a> にまとめてあります。</p>
+    <p>音声を「一覧から開く」ときと前後移動で開くときに、続きから再生するか最初から再生するかは、
+    <a href="settings.html#playback-resume">環境設定 → ライブラリ → 履歴と復元</a> で選べます。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
