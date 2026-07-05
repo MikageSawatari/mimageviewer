@@ -430,6 +430,7 @@
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する
 # VideoCapture = Ctrl+S ; 現在の動画フレームをキャプチャ保存する
 # VideoAddToActiveBook = Ctrl+B ; 現在の動画フレームを追加先の本へ追加する
+# VideoToggleAudioMode = Z ; 映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す
 
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する

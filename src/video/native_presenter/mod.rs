@@ -762,6 +762,7 @@ pub struct NativeOverlayShortcutLabels {
     pub tile_mode: Option<String>,
     pub bookmark: Option<String>,
     pub capture: Option<String>,
+    pub toggle_audio_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

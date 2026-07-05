@@ -320,7 +320,7 @@ impl App {
         if self.is_overlay_edit_mode_active() {
             RightDragContext::EditMode
         } else if let Some(fs_idx) = self.fullscreen_idx {
-            if self.current_fullscreen_is_video(fs_idx) {
+            if self.fullscreen_uses_video_ring_context(fs_idx) {
                 RightDragContext::VideoFullscreen
             } else {
                 RightDragContext::ImageFullscreen
@@ -3098,7 +3098,14 @@ impl App {
         #[cfg(windows)]
         {
             let context = self.current_ring_shortcut_context();
-            let overlay = (context == RingShortcutContext::VideoFullscreen)
+            // 音楽ビュー (音声ファイル or Inc 7 動画→音声モード) は VideoFullscreen context だが
+            // native video presenter/HUD が無い / hidden なので、native ガイドは出さず egui
+            // オーバーレイ (draw_mouse_ring_flick_overlay) が音楽ビュー上に直接リングを描く。
+            // ここでは何も出さない (None で既存ガイドもクリア)。実 native 動画のときだけ HUD に描く。
+            let music_view = self
+                .fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx));
+            let overlay = (context == RingShortcutContext::VideoFullscreen && !music_view)
                 .then(|| self.native_video_ring_guide_overlay(context))
                 .flatten();
             self.set_native_video_ring_guide_overlay(overlay);
@@ -3121,7 +3128,13 @@ impl App {
     fn sync_native_video_mouse_gesture_overlay(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         {
-            if !self.settings.ring_shortcuts.mouse_gesture_help_visible {
+            // 音楽ビュー (音声ファイル or 動画→音声モード) は native HUD が無い / hidden なので
+            // native ジェスチャガイドは出さず、egui オーバーレイ (draw_mouse_gesture_overlay) に
+            // 任せる (ring guide と同じ)。
+            let music_view = self
+                .fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx));
+            if !self.settings.ring_shortcuts.mouse_gesture_help_visible || music_view {
                 self.set_native_video_ring_picker_overlay(None);
                 self.request_native_video_hud_repaint(ctx);
                 return;
@@ -3716,7 +3729,7 @@ impl App {
 
     pub(crate) fn current_ring_shortcut_context(&self) -> RingShortcutContext {
         if let Some(fs_idx) = self.fullscreen_idx {
-            if self.current_fullscreen_is_video(fs_idx) {
+            if self.fullscreen_uses_video_ring_context(fs_idx) {
                 RingShortcutContext::VideoFullscreen
             } else {
                 RingShortcutContext::ImageFullscreen
@@ -4536,28 +4549,60 @@ impl App {
             }
             RingActionId::VideoLoop if context == RingShortcutContext::VideoFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
-                    self.cycle_native_video_loop_common(ctx, fs_idx);
+                    // 音楽ビュー (音声ファイル / 動画→音声モード) は loop target 再計算を伴う
+                    // 音楽用 helper を通す。native helper だと music_bookmarks / loop_target が
+                    // stale になりブックマークループ判定が崩れる (Codex P2)。
+                    if self.fs_music_view_active(fs_idx) {
+                        self.cycle_music_loop_mode(ctx, fs_idx);
+                    } else {
+                        self.cycle_native_video_loop_common(ctx, fs_idx);
+                    }
                 }
                 None
             }
             RingActionId::VideoBookmark if context == RingShortcutContext::VideoFullscreen => {
-                self.add_ring_video_bookmark(ctx);
+                // 音楽ビューは music_bookmarks が正本。native bookmark 経路は音楽パネル /
+                // タイムラインへ反映されないので音楽 helper に分岐する (Codex P2)。
+                if let Some(fs_idx) = self.fullscreen_idx
+                    && self.fs_music_view_active(fs_idx)
+                {
+                    self.add_music_bookmark_at_current(fs_idx);
+                } else {
+                    self.add_ring_video_bookmark(ctx);
+                }
                 None
             }
             RingActionId::VideoMarkerPrev if context == RingShortcutContext::VideoFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
-                    self.jump_ring_video_marker(fs_idx, false);
+                    if self.fs_music_view_active(fs_idx) {
+                        self.music_marker_jump(fs_idx, false);
+                    } else {
+                        self.jump_ring_video_marker(fs_idx, false);
+                    }
                 }
                 None
             }
             RingActionId::VideoMarkerNext if context == RingShortcutContext::VideoFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
-                    self.jump_ring_video_marker(fs_idx, true);
+                    if self.fs_music_view_active(fs_idx) {
+                        self.music_marker_jump(fs_idx, true);
+                    } else {
+                        self.jump_ring_video_marker(fs_idx, true);
+                    }
                 }
                 None
             }
             RingActionId::VideoTileMode if context == RingShortcutContext::VideoFullscreen => {
-                self.toggle_ring_video_tile_mode(ctx);
+                // タイル表示は native presenter 前提。音楽ビュー (音声 / 動画→音声モード) では
+                // presenter が無い / hidden なので無効化する (Codex P3)。
+                if self
+                    .fullscreen_idx
+                    .is_some_and(|i| self.fs_music_view_active(i))
+                {
+                    self.show_feedback_toast("タイル表示は動画のみ対応です".to_string());
+                } else {
+                    self.toggle_ring_video_tile_mode(ctx);
+                }
                 None
             }
             RingActionId::VideoExternalPlayer
@@ -4743,7 +4788,19 @@ impl App {
                     self.toggle_folder_pin_for_idx(fs_idx);
                 }
             }
-            RingShortcutContext::VideoFullscreen => self.pin_ring_video_frame(ctx),
+            RingShortcutContext::VideoFullscreen => {
+                // 音楽ビュー (音声ファイル / 動画→音声モード) は代表サムネのフレームピン対象外。
+                // 音声パスに video pin メタデータを残さない / 音声モード中の held フレームを
+                // 誤ってピンしない (Codex P3)。ピンしたいときは動画表示に戻ってから行う。
+                if self
+                    .fullscreen_idx
+                    .is_some_and(|i| self.fs_music_view_active(i))
+                {
+                    self.show_feedback_toast("代表サムネのピン留めは動画のみ対応です".to_string());
+                } else {
+                    self.pin_ring_video_frame(ctx);
+                }
+            }
         }
     }
 
@@ -5457,6 +5514,15 @@ impl App {
 
     fn current_fullscreen_is_video(&self, fs_idx: usize) -> bool {
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+    }
+
+    /// リング / 右ドラッグの context を `VideoFullscreen` にすべき面か。
+    /// 動画そのもの (`current_fullscreen_is_video`) に加えて、**音楽ビュー**
+    /// (音声ファイル or 動画→音声モード、`fs_music_view_active`) も動画（メディア）リング
+    /// = 再生/一時停止・シーク・マーカー・ミュート・ループ を使う。音楽ビューで画像リング
+    /// (回転/コピー/ズーム 等) が出ても意味を成さないため (実機 FB 2026-07)。
+    fn fullscreen_uses_video_ring_context(&self, fs_idx: usize) -> bool {
+        self.current_fullscreen_is_video(fs_idx) || self.fs_music_view_active(fs_idx)
     }
 
     fn jump_ring_video_marker(&mut self, fs_idx: usize, next: bool) {

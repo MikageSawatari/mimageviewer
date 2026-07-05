@@ -2792,7 +2792,10 @@ pub(super) fn draw_native_top_bar(
                     "native_top_audio_mode",
                     NativeTopButtonGlyph::AudioMode,
                     false,
-                    "音声モード (映像を切って波形表示)",
+                    &native_label_with_shortcut(
+                        "音声モード (映像を切って波形表示)",
+                        shortcuts.and_then(|s| s.toggle_audio_mode.as_deref()),
+                    ),
                     NativeOverlayCommand::ToggleAudioMode,
                     commands,
                 );

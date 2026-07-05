@@ -1467,6 +1467,9 @@ pub enum KeyAction {
     VideoCompareCycle,
     VideoCompareWipe,
     VideoCompareDiff,
+    /// 動画→音声モード (映像を消して音楽ビューで聴く、Inc 7) のトグル。動画では enter、
+    /// 音声モード中は exit。音声ファイル単体では対象外 (映像が無いので no-op)。
+    VideoToggleAudioMode,
     EraseConfirm,
     EraseConfirmPolygon,
     EraseUndo,
@@ -1857,6 +1860,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoCompareCycle,
     KeyAction::VideoCompareWipe,
     KeyAction::VideoCompareDiff,
+    KeyAction::VideoToggleAudioMode,
     KeyAction::EraseConfirm,
     KeyAction::EraseConfirmPolygon,
     KeyAction::EraseUndo,
@@ -3239,6 +3243,7 @@ impl KeyAction {
             VideoCompareCycle => "VideoCompareCycle",
             VideoCompareWipe => "VideoCompareWipe",
             VideoCompareDiff => "VideoCompareDiff",
+            VideoToggleAudioMode => "VideoToggleAudioMode",
             EraseConfirm => "EraseConfirm",
             EraseConfirmPolygon => "EraseConfirmPolygon",
             EraseUndo => "EraseUndo",
@@ -3749,6 +3754,9 @@ impl KeyAction {
             VideoCompareCycle => "動画では比較切り替えキーを何もしない操作として消費する",
             VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
             VideoCompareDiff => "動画では差分比較キーを何もしない操作として消費する",
+            VideoToggleAudioMode => {
+                "映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す"
+            }
             EraseConfirm => "消しゴム処理を実行して終了する",
             EraseConfirmPolygon => "消しゴム多角形を確定する",
             EraseUndo => "消しゴム編集を元に戻す",
@@ -4126,7 +4134,8 @@ impl KeyAction {
             | VideoCompareToggle
             | VideoCompareCycle
             | VideoCompareWipe
-            | VideoCompareDiff => KeyContext::FsVideo,
+            | VideoCompareDiff
+            | VideoToggleAudioMode => KeyContext::FsVideo,
             EraseConfirm | EraseConfirmPolygon | EraseUndo | EraseDeleteShape | EraseToolSelect
             | EraseToolBrush | EraseToolLasso | EraseToolPolygon | EraseToolVLine
             | EraseToolHLine | EraseToolLine | EraseToolRect | EraseToolEllipse
@@ -4492,6 +4501,7 @@ impl KeyAction {
             | VideoCompareCycle
             | VideoCompareWipe
             | VideoCompareDiff
+            | VideoToggleAudioMode
             | EraseConfirm
             | EraseConfirmPolygon
             | EraseUndo
@@ -4882,6 +4892,8 @@ impl KeyAction {
             VideoCompareCycle => ChordList::one(Chord::key(C)),
             VideoCompareWipe => ChordList::one(Chord::shift(C)),
             VideoCompareDiff => ChordList::one(Chord::alt(C)),
+            // Z: 動画→音声モードのトグル。画像の Z (FsZoomMode) とは別コンテキスト (FsVideo) なので競合しない。
+            VideoToggleAudioMode => ChordList::one(Chord::key(Z)),
             EraseConfirm => ChordList::one(Chord::key(E)),
             EraseConfirmPolygon => ChordList::one(Chord::key(Enter)),
             EraseUndo => ChordList::one(Chord::ctrl(Z)),

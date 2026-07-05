@@ -552,9 +552,49 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
     同じ keep_audio_mode source-swap（`source_swap_keep_audio_mode` + `try_start_native_video_fast_swap(Some(true),
     true)`）で音声モードのまま継続。非動画へ移るときは `open_fullscreen` が video_audio_mode=None にして通常表示。
     Codex レビュー指摘なし・test 3136 green・実機 OK。これで 7e の「file nav」は解消。
+  - **7-rclick** ✅（2026-07-05）: 音声モード中の**右クリック（再生終了）とリングショートカット**が効かない
+    のを修正。原因は `handle_fs_wheel_and_click`（ui_fullscreen.rs）の egui right-drag ブロックが
+    `!state.is_video` で gate されており、Video アイテムが音声モード（presenter は SW_HIDE で egui 音楽ビューが
+    前面）でも走らなかったこと。native 経路（`handle_video_input` / presenter WndProc）は音声モードで gate off
+    ＋ hidden window に OS マウスが来ないため、**どちらも右クリックを処理していなかった**。
+    - 修正①: gate を `!state.is_video || video_in_audio_mode` に拡張（`video_in_audio_mode = state.is_video
+      && fs_music_view_active(idx)`）。context は `current_right_drag_context()` = VideoFullscreen（アイテムが
+      Video）なので、**動画リング**が出る（画像リングではない）。短タップ → close = 動画/音声ファイルと同じ再生終了。
+    - 修正②: native ガイド抑止を **音楽ビュー全般**（`fs_music_view_active`）に広げた。`sync_native_video_ring_guide_overlay`
+      は `context==VideoFullscreen && !music_view` のときだけ native HUD ガイドを出し、`sync_native_video_mouse_gesture_overlay`
+      も music view では出さない。presenter HUD が無い（音声ファイル）/ hidden（動画→音声モード）なので、egui の
+      `draw_mouse_ring_flick_overlay` / `draw_mouse_gesture_overlay` が音楽ビュー上に直接リングを描く。
+    - 修正③（実機 FB 2 回目）: **音声ファイル単体**の右クリックリングも画像リングのままだったので、リング context の
+      判定を統一。新 helper `fullscreen_uses_video_ring_context(fs_idx) = current_fullscreen_is_video || fs_music_view_active`
+      を `current_ring_shortcut_context` / `current_right_drag_context` が使う。これで **音声ファイル / 動画→音声モード /
+      通常動画すべてが VideoFullscreen（メディア）リング**になる（再生・シーク・マーカー・ミュート・ループ）。
+      `current_fullscreen_is_video` 自体は不変なので native 動画の backdrop / focus / owner 判定には影響しない。
+    - 修正④（Codex P2/P3）: 音楽ビューで VideoFullscreen リングアクションを撃ったとき、状態が別管理のものは
+      **音楽 helper に分岐**する: `VideoLoop`→`cycle_music_loop_mode`、`VideoBookmark`→`add_music_bookmark_at_current`、
+      `VideoMarkerPrev/Next`→`music_marker_jump`（いずれも `music_bookmarks` / loop target を再計算し音楽パネルと整合）。
+      `VideoMute` は `toggle_video_session_mute_for_fs_idx` が音楽 HUD と同じ `video_session_muted`+player を触るので分岐不要。
+      presenter 前提の `VideoTileMode` と、音声パスに video pin を残す `PinRepresentativeThumb` は music view では
+      トースト表示して no-op。`VideoCapture` は音声では worker 側で失敗トースト（無害）。
+    - close teardown（Issue A）は既存 `close_fullscreen`（clear_music_view_state + video_audio_mode=None +
+      fs_cache.clear() で hidden VideoPlayer を drop）で完結しており、右クリック close がその経路に合流する
+      ことで一貫。**元から ×/Esc の teardown は正しく、壊れていたのは右クリック経路だけ**だった。
+      Codex レビュー 3 ラウンド（P2 = 音楽 helper 分岐で解消、P3 = tile/pin を guard、最終ラウンド新規指摘なし）・test 3136 green。
+  - **7-audiomode-key** ✅（2026-07-05）: 音声モード切替を**操作カスタマイズ（keymap）対応**にした（実機 FB）。
+    従来は ♪ HUD ボタン（`NativeVideoOutputEvent::ToggleAudioMode`）のみ。新 `KeyAction::VideoToggleAudioMode`
+    を追加し既定キー = **Z**（`FsVideo` context。画像の Z=`FsZoomMode` は `FsImage` で scope 分離のため非競合）。
+    - enter: `handle_native_video_key_event`（native presenter key 経路、非 detached / detached 両方）に
+      `matches_vk_action → enter_video_audio_mode` を追加。detached は enter 側の reject でトースト。
+    - exit: 音楽ビューの egui キー経路に `consume_action_no_repeat → exit_video_audio_mode`（`video_audio_mode
+      == Some(fs_idx)` のときだけ。音声ファイル単体は consume して no-op）。no_repeat は native の `!key.repeat` と
+      揃え、Z 押しっぱなしで enter 直後に即 exit するのを防止（Codex P2）。
+    - keymap plumbing 一式（enum / ALL_ACTIONS / ini_name / description / context=FsVideo / trigger=Press /
+      default_chords=Z / `docs/keymap.ini.default`）。tooltip は ♪ ボタン（native、`NativeOverlayShortcutLabels`
+      に `toggle_audio_mode` 追加）と「動画表示に戻る」ボタン（egui）の両方に実効ショートカットを併記（Codex P3）。
+    - Codex レビュー 2 ラウンド（P2 no_repeat / P3 tooltip 対応後、新規指摘なし）・test 3136 green。
   - **7e**: 仕上げ（VST 状態引き継ぎ = video-in-audio-mode の VST ボタン、DetachedWindow(F12) の
-    音声モード対応 / close from audio mode / long video の memory・audio 継続の smoke。① seek 音切れは 7-hidden、
-    連続再生 EOF は 7-eof、file nav は 7-navfix で解消済み）。
+    音声モード対応 / long video の memory・audio 継続の smoke。① seek 音切れは 7-hidden、
+    連続再生 EOF は 7-eof、file nav は 7-navfix、右クリック/リング/close は 7-rclick、
+    音声モード切替キー（既定 Z）は 7-audiomode-key で解消済み）。
 
 ### 5.8 動画/音楽 HUD・パネルの描画コード共通化（Inc 5 FB、B 案）
 

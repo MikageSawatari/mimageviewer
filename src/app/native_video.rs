@@ -4227,6 +4227,9 @@ impl App {
             tile_mode: self.keymap.first_chord_label(KeyAction::VideoTileMode),
             bookmark: self.keymap.first_chord_label(KeyAction::VideoBookmark),
             capture: self.keymap.first_chord_label(KeyAction::VideoCapture),
+            toggle_audio_mode: self
+                .keymap
+                .first_chord_label(KeyAction::VideoToggleAudioMode),
         }
     }
 
@@ -5980,6 +5983,15 @@ impl App {
                     .matches_vk_action(KeyAction::VideoBookmark, &key) =>
             {
                 self.add_native_video_bookmark(fs_idx, None);
+            }
+            // Z (default): 動画→音声モードへ切り替え (映像を消して音楽ビューで聴く、Inc 7)。
+            // enter_video_audio_mode 内で音声トラック無し / detached / switch 中などは弾かれる。
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoToggleAudioMode, &key) =>
+            {
+                self.enter_video_audio_mode(ctx, fs_idx);
             }
             _ => {
                 hud_activity = false;

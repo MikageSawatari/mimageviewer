@@ -7922,6 +7922,28 @@ impl App {
             return action;
         }
 
+        // 音楽ビュー: Z (VideoToggleAudioMode) で動画表示へ戻す (Inc 7)。動画→音声モードの動画
+        // (`video_audio_mode == Some(fs_idx)`) のときだけ exit する。音声ファイル単体は戻る映像が
+        // 無いので consume して no-op (Z が別操作へ漏れないように)。モーダル / IME / TextEdit
+        // フォーカス中は消費しない (VideoCloseFullscreen と同じガード)。
+        if fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active()
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            // no_repeat: native enter 側も !key.repeat。Z を押しっぱなしで enter した直後、
+            // focus が egui 音楽ビューへ移ってからの repeat Z で即 exit するのを防ぐ (Codex P2)。
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::VideoToggleAudioMode)
+        {
+            #[cfg(windows)]
+            if self.video_audio_mode == Some(fs_idx) {
+                self.exit_video_audio_mode(ctx, fs_idx);
+            }
+            return action;
+        }
+
         // 音楽ビュー: Space / Enter で再生・一時停止 (動画の VideoPlayPause = Space+Enter を共有)。
         // 動画の handle_video_input と同じく esc/FsClose 判定より前でここで Enter を先取り consume
         // するので、音声でも動画と同じく Enter = 再生トグル / Esc = 閉じる になる (FsClose の
@@ -9919,13 +9941,25 @@ impl App {
         // `secondary_down == false` every frame and cancel the presenter-created flick. In
         // the non-detached path `render_fullscreen_viewport` early-returns before reaching
         // here; in the detached path the egui body runs, so we must skip video explicitly.
+        //
+        // Exception (Inc 7 動画→音声モード): a video toggled into audio mode has its native
+        // presenter *hidden* (SW_HIDE, consume-and-hold) with the egui music view on top, so
+        // this viewport DOES receive the right-click and `handle_video_input` is gated off
+        // (see `fs_music_view_active` at handle_fs_keyboard). The native path never runs, so we
+        // must run this egui block instead — otherwise right-click (close) and the right-drag
+        // ring shortcut do nothing (実機 FB 2026-07). The context is `current_right_drag_context()`
+        // = VideoFullscreen (item is Video), so it shows the video ring, not the image ring.
         let dialog_open_for_right_drag = self.any_dialog_open();
         if dialog_open_for_right_drag {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             self.fs_secondary_press_start = None;
         }
-        if !state.is_video
+        let video_in_audio_mode = state.is_video
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx));
+        if (!state.is_video || video_in_audio_mode)
             && !self.analysis_mode
             && !dialog_open_for_right_drag
             && self.fs_context_menu_idx.is_none()
@@ -19852,13 +19886,21 @@ impl App {
                 egui::vec2(TOP_BTN, TOP_BTN),
             );
             top_rx -= TOP_BTN + TOP_BTN_GAP;
+            // 実効ショートカット (既定 Z = VideoToggleAudioMode) を tooltip に併記する。
+            let back_tip = match self
+                .keymap
+                .first_chord_label(KeyAction::VideoToggleAudioMode)
+            {
+                Some(chord) => format!("動画表示に戻る ({chord})"),
+                None => "動画表示に戻る".to_string(),
+            };
             let v_resp = ui
                 .interact(
                     v_rect,
                     ui.id().with(("music_top_back_to_video", fs_idx)),
                     egui::Sense::click(),
                 )
-                .hover_tip_dark("動画表示に戻る".to_string());
+                .hover_tip_dark(back_tip);
             painter.rect_filled(v_rect, 4.0, top_btn_bg(v_resp.hovered()));
             draw_overlay_video_icon(&painter, v_rect);
             v_resp.clicked()
