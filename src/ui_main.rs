@@ -84,6 +84,7 @@ pub(crate) enum AddressBarNav {
     Direct(PathBuf),
     DriveList(Option<PathBuf>),
     ReadingHistory,
+    RatingViewBack,
     BooksRoot,
     HistoryBack,
     HistoryForward,
@@ -7891,6 +7892,13 @@ impl App {
                                     Some(AddressBarNav::ReadingHistory) => {
                                         "読書履歴へ戻る [BS]".to_string()
                                     }
+                                    Some(AddressBarNav::RatingViewBack) => {
+                                        if self.rating_view_nav_stack.is_empty() {
+                                            "レーティング一覧を閉じる [BS]".to_string()
+                                        } else {
+                                            "レーティング一覧へ戻る [BS]".to_string()
+                                        }
+                                    }
                                     Some(AddressBarNav::BooksRoot) => {
                                         "本棚フォルダへ".to_string()
                                     }
@@ -9147,6 +9155,7 @@ impl App {
                         }
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
+                        self.record_rating_view_nav_open(&p);
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
@@ -9163,6 +9172,7 @@ impl App {
                     }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
+                    self.record_rating_view_nav_open(&p);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
                     if auto_fs {
                         self.pending_auto_fs_open = true;
@@ -9205,7 +9215,10 @@ impl App {
                     let pf = path.clone();
                     let fmt = *format;
                     let auto_fs = self.settings.auto_fullscreen_zip_pdf;
-                    let search_rollback = if self.favsearch.active || self.tag_view.active {
+                    let search_rollback = if self.favsearch.active
+                        || self.tag_view.active
+                        || self.rating_view_nav_context_active()
+                    {
                         Some(self.folder_nav_history_snapshot())
                     } else {
                         None
@@ -9216,6 +9229,7 @@ impl App {
                     if self.tag_view.active {
                         self.record_tag_view_nav_open(&pf);
                     }
+                    self.record_rating_view_nav_open(&pf);
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     let open_outcome = if self.settings.archive_file_handling_ignores_convertible()

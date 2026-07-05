@@ -21187,6 +21187,92 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn install_flat_stack_view(app: &mut App) {
+        use crate::filename_stack::{StackMember, StackView};
+
+        let dir = PathBuf::from(r"C:\stack");
+        let media = vec![
+            StackMember {
+                path: dir.join("post_0.jpg"),
+                mtime: 0,
+                size: 1,
+                is_video: false,
+            },
+            StackMember {
+                path: dir.join("post_1.jpg"),
+                mtime: 0,
+                size: 1,
+                is_video: false,
+            },
+            StackMember {
+                path: dir.join("solo.jpg"),
+                mtime: 0,
+                size: 1,
+                is_video: false,
+            },
+        ];
+        let stack_view = StackView::build(
+            dir.clone(),
+            Vec::new(),
+            Vec::new(),
+            media,
+            '_',
+            crate::settings::SortOrder::FileName,
+        );
+        let (items, _metas) = stack_view.materialize_flat();
+        app.current_folder = Some(dir);
+        app.items = items;
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.stack_view = Some(stack_view);
+        app.stack_showing_flat = true;
+        app.rebuild_visible_indices();
+    }
+
+    #[test]
+    fn stack_flat_fullscreen_shift_down_jumps_to_next_stack_head() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_flat_stack_view(&mut app);
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+
+        begin_root_key_pass_with_modifiers(
+            &ctx,
+            egui::Key::ArrowDown,
+            false,
+            egui::Modifiers::SHIFT,
+        );
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(2),
+            "Shift+Down in flat stack fullscreen should skip member 1 and jump to the next stack head"
+        );
+    }
+
+    #[test]
+    fn stack_flat_fullscreen_shift_up_jumps_to_previous_stack_head() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_flat_stack_view(&mut app);
+        app.fullscreen_idx = Some(2);
+        app.selected = Some(2);
+
+        begin_root_key_pass_with_modifiers(&ctx, egui::Key::ArrowUp, false, egui::Modifiers::SHIFT);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "Shift+Up in flat stack fullscreen should jump to the previous stack head instead of moving one item"
+        );
+    }
+
     #[test]
     fn still_image_root_backspace_closes_to_grid() {
         let mut app = setup_app();
@@ -21641,6 +21727,121 @@ mod tag_view_navigation_tests {
                 .collect::<Vec<_>>(),
             vec!["tag20"]
         );
+    }
+}
+
+#[cfg(test)]
+mod rating_view_navigation_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    #[test]
+    fn rating_view_nav_open_dedupes_and_close_clears_stack() {
+        let mut app = setup_app();
+        let path = PathBuf::from("C:/books/a.zip");
+
+        app.record_rating_view_nav_open(&path);
+        assert!(
+            app.rating_view_nav_stack.is_empty(),
+            "レーティング一覧の文脈外では戻り先を積まない"
+        );
+
+        app.items_are_rating_view = true;
+        app.record_rating_view_nav_open(&path);
+        app.record_rating_view_nav_open(&path);
+
+        assert_eq!(app.rating_view_nav_stack, vec![path]);
+
+        app.close_rating_view();
+
+        assert!(
+            app.rating_view_nav_stack.is_empty(),
+            "レーティング一覧を閉じたら仮想階層スタックも破棄する"
+        );
+    }
+
+    #[test]
+    fn rating_view_back_from_opened_container_returns_to_result_grid() {
+        let mut app = setup_app();
+        let opened = app.tmp.path().join("books").join("a.zip");
+        app.rating_view_stars = 4;
+        app.rating_view_saved_folder = Some(app.tmp.path().join("before"));
+        app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
+            key: "container".to_string(),
+            item: GridItem::ZipFile(opened.clone()),
+            image_meta: Some((1, 10)),
+            rated_at_ms: Some(100),
+        }];
+        app.rating_view_nav_stack.push(opened.clone());
+        app.items_are_rating_view = false;
+        app.current_folder = Some(opened.clone());
+
+        app.rating_view_back();
+
+        assert!(app.rating_view_nav_stack.is_empty());
+        assert!(app.items_are_rating_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&crate::app::rating_view_synthetic_path())
+        );
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.rating_view_saved_folder,
+            Some(app.tmp.path().join("before"))
+        );
+    }
+
+    #[test]
+    fn rating_view_back_from_nested_container_loads_previous_stack_entry() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books").join("a");
+        let child = root.join("chapter");
+        std::fs::create_dir_all(&child).unwrap();
+        app.rating_view_nav_stack.push(root.clone());
+        app.rating_view_nav_stack.push(child.clone());
+        app.current_folder = Some(child);
+
+        app.rating_view_back();
+
+        assert_eq!(app.rating_view_nav_stack, vec![root.clone()]);
+        assert_eq!(app.current_folder.as_ref(), Some(&root));
+    }
+
+    #[test]
+    fn rating_view_parent_target_uses_rating_back_nav() {
+        let mut app = setup_app();
+        app.rating_view_nav_stack
+            .push(PathBuf::from("C:/books/a.zip"));
+
+        assert!(matches!(
+            app.grid_parent_nav_target(),
+            Some(crate::ui_main::AddressBarNav::RatingViewBack)
+        ));
+        assert!(matches!(
+            app.resolve_return_to_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::RatingViewBack)
+        ));
+    }
+
+    #[test]
+    fn folder_nav_history_snapshot_restores_rating_view_stack() {
+        let mut app = setup_app();
+        let root = PathBuf::from("C:/books/a.zip");
+        let pending = crate::app::PendingRatingViewZipDirOpen {
+            source_path: root.clone(),
+            dir_prefix: "chapter/".to_string(),
+        };
+        app.rating_view_nav_stack.push(root.clone());
+        app.pending_rating_view_zipdir_open = Some(pending.clone());
+
+        let snapshot = app.folder_nav_history_snapshot();
+        app.rating_view_nav_stack
+            .push(PathBuf::from("C:/books/b.zip"));
+        app.pending_rating_view_zipdir_open = None;
+        app.restore_folder_nav_history(snapshot);
+
+        assert_eq!(app.rating_view_nav_stack, vec![root]);
+        assert_eq!(app.pending_rating_view_zipdir_open, Some(pending));
     }
 }
 

@@ -69,6 +69,8 @@ pub(crate) struct FolderNavHistorySnapshot {
     active_quick_folder_slot: Option<QuickFolderSlotId>,
     favsearch_nav_stack: Vec<PathBuf>,
     tag_view_nav_stack: Vec<PathBuf>,
+    rating_view_nav_stack: Vec<PathBuf>,
+    pending_rating_view_zipdir_open: Option<PendingRatingViewZipDirOpen>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,7 +771,7 @@ impl Drop for ZipEnumeratePending {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingRatingViewZipDirOpen {
     pub(crate) source_path: PathBuf,
     pub(crate) dir_prefix: String,
@@ -9134,6 +9136,9 @@ impl App {
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
         }
+        if self.rating_view_parent_nav_available() {
+            return Some(crate::ui_main::AddressBarNav::RatingViewBack);
+        }
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
         }
@@ -9148,6 +9153,9 @@ impl App {
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
+        }
+        if self.rating_view_parent_nav_available() {
+            return Some(crate::ui_main::AddressBarNav::RatingViewBack);
         }
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
@@ -9196,6 +9204,9 @@ impl App {
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         if let Some(nav) = self.reading_history_back_nav() {
             return Some(nav);
+        }
+        if self.rating_view_parent_nav_available() {
+            return Some(crate::ui_main::AddressBarNav::RatingViewBack);
         }
         if let Some(nav) = self.subfolder_expansion_back_nav() {
             return Some(nav);
@@ -9254,6 +9265,10 @@ impl App {
             }
             crate::ui_main::AddressBarNav::ReadingHistory => {
                 self.enter_reading_history();
+                true
+            }
+            crate::ui_main::AddressBarNav::RatingViewBack => {
+                self.rating_view_parent_nav();
                 true
             }
             crate::ui_main::AddressBarNav::BooksRoot => {
@@ -9574,6 +9589,8 @@ impl App {
             active_quick_folder_slot: self.active_quick_folder_slot,
             favsearch_nav_stack: self.favsearch.nav_stack.clone(),
             tag_view_nav_stack: self.tag_view.nav_stack.clone(),
+            rating_view_nav_stack: self.rating_view_nav_stack.clone(),
+            pending_rating_view_zipdir_open: self.pending_rating_view_zipdir_open.clone(),
         }
     }
 
@@ -9589,6 +9606,8 @@ impl App {
         self.sync_quick_folder_settings();
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
         self.tag_view.nav_stack = snapshot.tag_view_nav_stack;
+        self.rating_view_nav_stack = snapshot.rating_view_nav_stack;
+        self.pending_rating_view_zipdir_open = snapshot.pending_rating_view_zipdir_open;
     }
 
     pub(crate) fn attach_archive_convert_nav_history_rollback(
@@ -12531,6 +12550,7 @@ impl App {
         self.rating_view_rows.clear();
         self.rating_view_skipped = 0;
         self.rating_view_nav_stack.clear();
+        self.pending_rating_view_zipdir_open = None;
         if !self.items_are_rating_view {
             self.rating_view_saved_folder = self.current_folder.clone();
             self.rating_view_subfolder_restore = None;
@@ -12575,6 +12595,7 @@ impl App {
         self.rating_view_rows.clear();
         self.rating_view_skipped = 0;
         self.rating_view_nav_stack.clear();
+        self.pending_rating_view_zipdir_open = None;
         self.items_are_rating_view = false;
         let restore_state = self.rating_view_subfolder_restore.take();
         if let Some(saved) = self.rating_view_saved_folder.take() {
@@ -12584,6 +12605,77 @@ impl App {
                 self.suppress_nav_record_for_search_restore = false;
             } else {
                 self.load_folder(saved);
+            }
+        }
+    }
+
+    pub(crate) fn rating_view_nav_context_active(&self) -> bool {
+        self.items_are_rating_view || !self.rating_view_nav_stack.is_empty()
+    }
+
+    pub(crate) fn rating_view_parent_nav_available(&self) -> bool {
+        self.rating_view_nav_context_active() || self.rating_view_pending.is_some()
+    }
+
+    pub(crate) fn record_rating_view_nav_open(&mut self, path: &Path) {
+        if !self.rating_view_nav_context_active() || is_synthetic_view_path(path) {
+            return;
+        }
+        Self::push_folder_nav_stack(&mut self.rating_view_nav_stack, path.to_path_buf());
+    }
+
+    pub(crate) fn rating_view_parent_nav(&mut self) {
+        if !self.rating_view_nav_stack.is_empty() {
+            self.rating_view_back();
+            return;
+        }
+        if self.items_are_rating_view || self.rating_view_pending.is_some() {
+            self.close_rating_view();
+        }
+    }
+
+    pub(crate) fn rating_view_back(&mut self) {
+        if self.zip_nav_back() {
+            return;
+        }
+        if self.rating_view_nav_stack.is_empty() {
+            return;
+        }
+        let popped = self.rating_view_nav_stack.pop();
+        self.cancel_pending_folder_nav();
+        self.pending_rating_view_zipdir_open = None;
+        if let Some(popped_path) = popped.as_ref()
+            && let Some(name) = popped_path.file_name().and_then(|n| n.to_str())
+        {
+            self.select_after_load = Some(name.to_string());
+        }
+        if let Some(top) = self.rating_view_nav_stack.last().cloned() {
+            let _ = self.load_folder_or_convert_archive(top);
+        } else {
+            self.install_rating_view_rows();
+            if let Some(popped_path) = popped.as_ref() {
+                self.select_rating_view_row_for_opened_path(popped_path);
+            }
+        }
+    }
+
+    fn select_rating_view_row_for_opened_path(&mut self, path: &Path) {
+        for idx in self.visible_indices.iter().copied() {
+            let Some(item) = self.items.get(idx) else {
+                continue;
+            };
+            let matches_path = item
+                .container_path()
+                .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, path))
+                || matches!(
+                    item,
+                    GridItem::ZipDir { zip_path, .. }
+                        if crate::folder_tree::path_eq(zip_path, path)
+                );
+            if matches_path {
+                self.selected = Some(idx);
+                self.scroll_to_selected = true;
+                return;
             }
         }
     }
@@ -13435,15 +13527,27 @@ impl App {
         if dir_prefix.is_empty() {
             return;
         }
+        let rollback = self
+            .rating_view_nav_context_active()
+            .then(|| self.folder_nav_history_snapshot());
+        self.record_rating_view_nav_open(&zip_path);
         self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
             source_path: zip_path.clone(),
             dir_prefix,
         });
-        if matches!(
-            self.load_folder_or_convert_archive(zip_path),
-            FolderOpenOutcome::Ignored
-        ) {
-            self.pending_rating_view_zipdir_open = None;
+        match self.load_folder_or_convert_archive(zip_path) {
+            FolderOpenOutcome::Ignored => {
+                self.pending_rating_view_zipdir_open = None;
+                if let Some(snapshot) = rollback {
+                    self.restore_folder_nav_history(snapshot);
+                }
+            }
+            FolderOpenOutcome::ConversionDialogOpened => {
+                if let Some(snapshot) = rollback {
+                    self.attach_archive_convert_nav_history_rollback(snapshot);
+                }
+            }
+            FolderOpenOutcome::Loaded => {}
         }
     }
 
@@ -20793,6 +20897,7 @@ impl App {
                             }
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
+                            self.record_rating_view_nav_open(&p);
                             return Some(crate::ui_main::AddressBarNav::Direct(p));
                         }
                         Some(GridItem::Video(p)) if external_player_video => {
@@ -20831,7 +20936,10 @@ impl App {
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             let auto_fs = self.settings.auto_fullscreen_zip_pdf;
-                            let search_rollback = if self.favsearch.active || self.tag_view.active {
+                            let search_rollback = if self.favsearch.active
+                                || self.tag_view.active
+                                || self.rating_view_nav_context_active()
+                            {
                                 Some(self.folder_nav_history_snapshot())
                             } else {
                                 None
@@ -20842,6 +20950,7 @@ impl App {
                             if self.tag_view.active {
                                 self.record_tag_view_nav_open(&pf);
                             }
+                            self.record_rating_view_nav_open(&pf);
                             let open_outcome =
                                 if self.settings.archive_file_handling_ignores_convertible() {
                                     self.show_feedback_toast(
@@ -20962,8 +21071,8 @@ impl App {
                 self.tag_view_back();
                 return None;
             }
-            if self.items_are_rating_view || self.rating_view_pending.is_some() {
-                self.close_rating_view();
+            if self.rating_view_parent_nav_available() {
+                self.rating_view_parent_nav();
                 return None;
             }
             if self.local_search_blocks_parent_nav() {
@@ -43220,7 +43329,10 @@ impl eframe::App for App {
                 // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` / `gamepad_nav` は
                 // 早期 return より前で確定済みなので使える。
                 if let Some(crate::ui_main::AddressBarNav::Direct(path)) = gamepad_nav {
-                    let search_rollback = if self.favsearch.active || self.tag_view.active {
+                    let search_rollback = if self.favsearch.active
+                        || self.tag_view.active
+                        || self.rating_view_nav_context_active()
+                    {
                         Some(self.folder_nav_history_snapshot())
                     } else {
                         None
@@ -43231,6 +43343,7 @@ impl eframe::App for App {
                     if self.tag_view.active {
                         self.record_tag_view_nav_open(&path);
                     }
+                    self.record_rating_view_nav_open(&path);
                     let open_target = path.clone();
                     let open_outcome = self.load_folder_or_convert_archive(path);
                     if matches!(open_outcome, FolderOpenOutcome::Loaded) {
@@ -43811,6 +43924,10 @@ impl eframe::App for App {
                         self.enter_reading_history();
                         None
                     }
+                    crate::ui_main::AddressBarNav::RatingViewBack => {
+                        self.rating_view_parent_nav();
+                        None
+                    }
                     crate::ui_main::AddressBarNav::BooksRoot => {
                         self.open_books_root();
                         None
@@ -43855,7 +43972,10 @@ impl eframe::App for App {
                 grid_nav
             };
             if let Some(p) = navigate {
-                let search_rollback = if self.favsearch.active || self.tag_view.active {
+                let search_rollback = if self.favsearch.active
+                    || self.tag_view.active
+                    || self.rating_view_nav_context_active()
+                {
                     Some(self.folder_nav_history_snapshot())
                 } else {
                     None
@@ -43868,6 +43988,7 @@ impl eframe::App for App {
                 if self.tag_view.active {
                     self.record_tag_view_nav_open(&p);
                 }
+                self.record_rating_view_nav_open(&p);
                 let open_target = p.clone();
                 let open_outcome = match navigate_pre_scan.take() {
                     Some(scan) => self.load_folder_nav_target(p, Some(scan)),

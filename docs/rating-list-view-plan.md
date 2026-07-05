@@ -1,6 +1,6 @@
 # レーティング一覧ビュー 設計計画 (rating-list-view)
 
-**状態: Phase 1 実装済み (2026-06-23 起案 / 同日実装)**
+**状態: Phase 1 実装済み (2026-06-23 起案 / 同日実装、2026-07-05 戻る導線を追加)**
 
 ファイルメニューと「場所▼」に ★1〜★5 の項目を足し、選んだ★レーティングの付いた
 アイテム/コンテナを、場所をまたいでフラットに一覧表示する仮想ビュー。通常ソートに加えて
@@ -51,9 +51,13 @@ Phase 1 として、場所横断の ★1〜★5 レーティング一覧ビュ�
 - `search_results_synthetic_path` / `reading_history_synthetic_path` と同じ分類で扱う
   汎用ガードは `is_synthetic_view_path` に集約した。検索固有の復元・favsearch 経路には
   レーティングビューを混ぜない。
+- レーティング一覧からフォルダ / ZIP / PDF / 変換アーカイブ / ZipDir を開くと、
+  `rating_view_nav_stack` に開いたコンテナを記録する。Backspace / フォルダバーの親ボタン /
+  fullscreen の return-to-parent 予約は `AddressBarNav::RatingViewBack` を経由し、コンテナ内では
+  まず ZIP 階層を 1 段戻り、スタックが空になった時点で保持済み `rating_view_rows` から
+  レーティング一覧を再インストールする。再検索・再 stat は行わない。
 
-後続候補: 詳細表示の専用 `★設定時刻` 列、結果からコンテナへ入った後に一覧へ戻る
-専用 nav stack、存在しない行の明示的な整理 UI。
+後続候補: 詳細表示の専用 `★設定時刻` 列、存在しない行の明示的な整理 UI。
 
 ---
 
@@ -238,17 +242,20 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
 
 ### 3.3 クリック / 戻る導線
 
-Phase 1 では、レーティング一覧からアイテムやコンテナを開く動作は既存の通常ナビゲーションに
-任せる。専用の「一覧へ戻る」スタックは後続候補として残す。
+コンテナ (Folder/Zip/Pdf/Archive/ZipDir) を開く直前に `record_rating_view_nav_open` を呼び、
+タグビューの `nav_stack` と同型の `rating_view_nav_stack` に戻り先を積む。変換アーカイブで
+変換ダイアログが開いた場合は、キャンセル / ブロック時に `FolderNavHistorySnapshot` から
+このスタックと `pending_rating_view_zipdir_open` も復元する。
 
-後続で専用復帰を入れる場合の方針:
-
-- コンテナ (Folder/Zip/Pdf/Archive) を開く → 通常 `load_folder`。開く前に
-  `record_rating_view_nav_open` を呼び、タグビューの `nav_stack` に近い専用戻り導線を持つ。
-  読書履歴の `reading_history_return_from` は「読んだ本から読書履歴へ戻る」意味が強いので、
-  そのまま共用しない方が安全。
-- ページ (Image/Video/ZipImage/PdfPage) を開く → フルスクリーン。閉じたらビューへ復帰。
-- 抜ける → Esc / 実フォルダへナビゲートで通常表示 (他ビューと同じ復帰機構)。
+- Backspace / フォルダバーの親ボタン / fullscreen の return-to-parent 予約は
+  `AddressBarNav::RatingViewBack` に解決する。
+- ZIP ツリーナビ内では `zip_nav_back()` を先に消化し、ZIP ルートに戻った後で
+  `rating_view_nav_stack` を pop する。
+- スタックに親コンテナが残っていれば `load_folder_or_convert_archive(top)` で 1 段戻る。
+  空になったら `install_rating_view_rows()` で保持済み行から一覧を再表示する。
+- ページ (Image/Video/ZipImage/PdfPage) を開く → フルスクリーン。閉じたら通常のグリッド復帰。
+- 抜ける → レーティング一覧最上位で Backspace、または Esc / 実フォルダへナビゲートで通常表示
+  (他ビューと同じ復帰機構)。
 
 ### 3.4 サムネイル
 
