@@ -7,7 +7,7 @@
 
 ## 背景
 
-`RingActionId` (122 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
+`RingActionId` (124 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
 を意味対応で突き合わせたところ、一部の操作が **ring/パッドには割り当てられるのにキーボードには
 割り当てられない**状態だった。キー側はハードコードの生キー処理で取り残されており、
 
@@ -25,11 +25,11 @@
 - ⚪ 設計上 ring/パッド専用 (場所ジャンプ等。キー化不要)
 - 固定: キーボード入力としては予約・OS/Shell 連携・マウス専用などの理由で keymap 対象外
 
-## 集計 (actionable 120 / `None`・`Unknown` 除く)
+## 集計 (actionable 122 / `None`・`Unknown` 除く)
 
 | 判定 | 件数 |
 |---|---|
-| ✅ 対応済み | 102 |
+| ✅ 対応済み | 104 |
 | 固定 (理由付き) | 5 |
 | ⚪ ring 専用 (意図的) | 13 |
 | ❌ / ⚠️ 未処理 | 0 |
@@ -63,7 +63,7 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 
 ウィンドウ/本: `CloseFullscreen`→`FsClose`/`VideoCloseFullscreen`、`ToggleDetachedViewer`→`ToggleDetachedViewerMode`、`AddToBook`→`Grid/Fs/VideoAddToActiveBook`、
 `PinRepresentativeThumb`→`GridPin`。
-グリッド: `GridToggleDetails`→`GridToggleDetailsView`、`GridToggleCheck`、`GridSelectAll`、`GridColumnCount1..10`。
+グリッド: `GridToggleDetails`→`GridToggleDetailsView`、`GridToggleCheck`、`GridSelectAll`、`GridOpenSelectedAsPage/List`、`GridColumnCount1..10`。
 画像 FS: `ImageRotateLeft/Right`→`FsRotateCcw/FsRotateCw`、`ImageCapture`→`FsCapture`、
 `ImageToggleMetadata`→`FsToggleMetadata`、`ImageSlideshow`→`FsSlideshow`、`ImagePixelGrid`→`FsPixelGrid`、
 `ImageBackgroundCycle`→`FsBgCycle`、`ImageComparePin`→`FsCompareToggle`(比較系・近似)、

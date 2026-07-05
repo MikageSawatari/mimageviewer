@@ -21824,6 +21824,46 @@ mod rating_view_navigation_tests {
     }
 
     #[test]
+    fn explicit_zip_pdf_open_modes_record_rating_view_nav() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let zip = app.tmp.path().join("books").join("a.zip");
+        let pdf = app.tmp.path().join("books").join("b.pdf");
+        app.items_are_rating_view = true;
+
+        app.items = vec![GridItem::ZipFile(zip.clone())];
+        app.selected = Some(0);
+        let nav = app.open_grid_container_with_mode(
+            &ctx,
+            0,
+            GridContainerOpenMode::PageFullscreen,
+            "test",
+        );
+        assert!(matches!(
+            nav,
+            Some(crate::ui_main::AddressBarNav::Direct(path)) if path == zip
+        ));
+        assert!(app.pending_auto_fs_open);
+        assert_eq!(app.rating_view_nav_stack, vec![zip.clone()]);
+
+        app.items = vec![GridItem::PdfFile(pdf.clone())];
+        app.selected = Some(0);
+        app.pending_auto_fs_open = true;
+        app.rating_view_nav_stack.clear();
+        let nav =
+            app.open_grid_container_with_mode(&ctx, 0, GridContainerOpenMode::PageList, "test");
+        assert!(matches!(
+            nav,
+            Some(crate::ui_main::AddressBarNav::Direct(path)) if path == pdf
+        ));
+        assert!(
+            !app.pending_auto_fs_open,
+            "PageList must clear a previous direct-page one-shot"
+        );
+        assert_eq!(app.rating_view_nav_stack, vec![pdf]);
+    }
+
+    #[test]
     fn folder_nav_history_snapshot_restores_rating_view_stack() {
         let mut app = setup_app();
         let root = PathBuf::from("C:/books/a.zip");

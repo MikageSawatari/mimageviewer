@@ -514,6 +514,8 @@ pub enum RingActionId {
     GridToggleSnapshotLock,
     GridToggleCheck,
     GridSelectAll,
+    GridOpenSelectedAsPage,
+    GridOpenSelectedAsList,
     GridColumnCount1,
     GridColumnCount2,
     GridColumnCount3,
@@ -896,6 +898,8 @@ impl RingActionId {
             Self::GridToggleSnapshotLock => "grid_toggle_snapshot_lock",
             Self::GridToggleCheck => "grid_toggle_check",
             Self::GridSelectAll => "grid_select_all",
+            Self::GridOpenSelectedAsPage => "grid_open_selected_as_page",
+            Self::GridOpenSelectedAsList => "grid_open_selected_as_list",
             Self::GridColumnCount1 => "grid_column_count_1",
             Self::GridColumnCount2 => "grid_column_count_2",
             Self::GridColumnCount3 => "grid_column_count_3",
@@ -983,6 +987,8 @@ impl RingActionId {
             "grid_toggle_snapshot_lock" => Self::GridToggleSnapshotLock,
             "grid_toggle_check" => Self::GridToggleCheck,
             "grid_select_all" => Self::GridSelectAll,
+            "grid_open_selected_as_page" => Self::GridOpenSelectedAsPage,
+            "grid_open_selected_as_list" => Self::GridOpenSelectedAsList,
             "grid_column_count_1" => Self::GridColumnCount1,
             "grid_column_count_2" => Self::GridColumnCount2,
             "grid_column_count_3" => Self::GridColumnCount3,
@@ -1127,6 +1133,8 @@ impl RingActionId {
             Self::GridToggleSnapshotLock => "★固定",
             Self::GridToggleCheck => "チェック ON/OFF",
             Self::GridSelectAll => "表示中を全チェック",
+            Self::GridOpenSelectedAsPage => "ページを開く",
+            Self::GridOpenSelectedAsList => "一覧を開く",
             Self::GridColumnCount1 => "サムネイル 1列",
             Self::GridColumnCount2 => "サムネイル 2列",
             Self::GridColumnCount3 => "サムネイル 3列",
@@ -1192,6 +1200,8 @@ impl RingActionId {
                     | Self::GridToggleSnapshotLock
                     | Self::GridToggleCheck
                     | Self::GridSelectAll
+                    | Self::GridOpenSelectedAsPage
+                    | Self::GridOpenSelectedAsList
                     | Self::GridColumnCount1
                     | Self::GridColumnCount2
                     | Self::GridColumnCount3
@@ -1292,6 +1302,8 @@ impl RingActionId {
                 Self::GridToggleSnapshotLock,
                 Self::GridToggleCheck,
                 Self::GridSelectAll,
+                Self::GridOpenSelectedAsPage,
+                Self::GridOpenSelectedAsList,
                 Self::GridColumnCount1,
                 Self::GridColumnCount2,
                 Self::GridColumnCount3,
@@ -2567,6 +2579,34 @@ mod tests {
             assert!(action.is_valid_for_context(context));
             assert!(RingActionId::available_for_context(context).contains(&action));
             assert!(action.is_valid_for_mouse_button_context(context));
+        }
+    }
+
+    #[test]
+    fn explicit_container_open_actions_are_grid_candidates() {
+        let samples = [
+            (
+                RingActionId::GridOpenSelectedAsPage,
+                "grid_open_selected_as_page",
+                "ページを開く",
+            ),
+            (
+                RingActionId::GridOpenSelectedAsList,
+                "grid_open_selected_as_list",
+                "一覧を開く",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            assert!(!action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+            assert!(!action.is_valid_for_context(RingShortcutContext::VideoFullscreen));
         }
     }
 

@@ -166,6 +166,8 @@
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
 # GridOpenSelected = Enter ; 選択中の項目を開く
+# GridOpenSelectedAsPage = none ; 選択中の ZIP/PDF/対応アーカイブをページで開く
+# GridOpenSelectedAsList = none ; 選択中の ZIP/PDF/対応アーカイブを一覧で開く
 # GridOpenExternalPlayer = Shift+Enter ; 選択中の動画を外部プレイヤーで開く
 # GridParentFolder.1 = Backspace ; 親フォルダへ移動する
 # GridParentFolder.2 = Alt+Up ; 親フォルダへ移動する

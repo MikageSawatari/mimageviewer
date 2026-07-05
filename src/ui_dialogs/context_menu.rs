@@ -20,15 +20,11 @@ pub(crate) enum ContextMenuAction {
     /// 履歴に積んで `suppress_folder_nav_record_once` を立てる遷移。実適用は
     /// `apply_jump_from_search_to`。
     JumpFromSearch(PathBuf),
-}
-
-impl ContextMenuAction {
-    /// アクションのナビゲーション先パスを取り出す。
-    pub(crate) fn into_path(self) -> PathBuf {
-        match self {
-            ContextMenuAction::JumpFromSearch(p) => p,
-        }
-    }
+    /// ZIP/PDF/対応アーカイブを、グローバル設定ではなく明示モードで開く。
+    OpenGridContainer {
+        idx: usize,
+        mode: crate::app::GridContainerOpenMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,6 +557,22 @@ impl crate::app::App {
                                 ctx.copy_text(name);
                                 close = true;
                             }
+                            ui.separator();
+                            if ui.button("ページを開く").clicked() {
+                                nav = Some(ContextMenuAction::OpenGridContainer {
+                                    idx,
+                                    mode: crate::app::GridContainerOpenMode::PageFullscreen,
+                                });
+                                close = true;
+                            }
+                            if ui.button("一覧を開く").clicked() {
+                                nav = Some(ContextMenuAction::OpenGridContainer {
+                                    idx,
+                                    mode: crate::app::GridContainerOpenMode::PageList,
+                                });
+                                close = true;
+                            }
+                            ui.separator();
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(p);
                                 close = true;
@@ -673,6 +685,22 @@ impl crate::app::App {
                                 ctx.copy_text(name);
                                 close = true;
                             }
+                            ui.separator();
+                            if ui.button("ページを開く").clicked() {
+                                nav = Some(ContextMenuAction::OpenGridContainer {
+                                    idx,
+                                    mode: crate::app::GridContainerOpenMode::PageFullscreen,
+                                });
+                                close = true;
+                            }
+                            if ui.button("一覧を開く").clicked() {
+                                nav = Some(ContextMenuAction::OpenGridContainer {
+                                    idx,
+                                    mode: crate::app::GridContainerOpenMode::PageList,
+                                });
+                                close = true;
+                            }
+                            ui.separator();
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(path);
                                 close = true;
@@ -1031,6 +1059,22 @@ impl crate::app::App {
                 label: "画像をクリップボードにコピー".to_string(),
             });
         }
+        if !target.is_folder_context
+            && !target.has_checked
+            && matches!(
+                target.item,
+                GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. }
+            )
+        {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::OpenContainerAsPage,
+                label: "ページを開く".to_string(),
+            });
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::OpenContainerAsList,
+                label: "一覧を開く".to_string(),
+            });
+        }
         if in_search && !target.is_folder_context {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::JumpToFolder,
@@ -1166,6 +1210,22 @@ impl crate::app::App {
                     .and_then(|path| parent_folder_for_nav(path))
                     .map(ContextMenuAction::JumpFromSearch),
             },
+            NativeMivCommand::OpenContainerAsPage => {
+                target
+                    .item_index
+                    .map(|idx| ContextMenuAction::OpenGridContainer {
+                        idx,
+                        mode: crate::app::GridContainerOpenMode::PageFullscreen,
+                    })
+            }
+            NativeMivCommand::OpenContainerAsList => {
+                target
+                    .item_index
+                    .map(|idx| ContextMenuAction::OpenGridContainer {
+                        idx,
+                        mode: crate::app::GridContainerOpenMode::PageList,
+                    })
+            }
             NativeMivCommand::RotateLeft => {
                 if target.has_checked {
                     for idx in self.checked.clone() {

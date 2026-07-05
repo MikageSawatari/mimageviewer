@@ -31,6 +31,8 @@ pub enum NativeMivCommand {
     CopyFileName,
     CopyImageToClipboard,
     JumpToFolder,
+    OpenContainerAsPage,
+    OpenContainerAsList,
     RotateLeft,
     RotateRight,
     ToggleRepresentativeThumb,

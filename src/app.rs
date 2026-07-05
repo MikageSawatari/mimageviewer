@@ -130,6 +130,18 @@ pub(crate) enum FolderOpenOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GridContainerOpenMode {
+    PageFullscreen,
+    PageList,
+}
+
+impl GridContainerOpenMode {
+    pub(crate) fn auto_fullscreen(self) -> bool {
+        matches!(self, Self::PageFullscreen)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViewerPresentation {
     /// メインウィンドウ内にビューアを重ねる表示。
     MainWindow,
@@ -20568,6 +20580,12 @@ impl App {
         }
         let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
         let open_selected_key = self.keymap.pressed_action(ctx, KeyAction::GridOpenSelected);
+        let open_selected_as_page_key = self
+            .keymap
+            .pressed_action(ctx, KeyAction::GridOpenSelectedAsPage);
+        let open_selected_as_list_key = self
+            .keymap
+            .pressed_action(ctx, KeyAction::GridOpenSelectedAsList);
         let external_player_key = self
             .keymap
             .pressed_action(ctx, KeyAction::GridOpenExternalPlayer);
@@ -20849,6 +20867,19 @@ impl App {
                         app.clear_page_params_for_selection()
                     });
                 }
+            }
+
+            if open_selected_as_page_key || open_selected_as_list_key {
+                let mode = if open_selected_as_page_key {
+                    GridContainerOpenMode::PageFullscreen
+                } else {
+                    GridContainerOpenMode::PageList
+                };
+                return self.open_selected_grid_container_with_mode(
+                    ctx,
+                    mode,
+                    "grid_open_container_mode",
+                );
             }
 
             let external_player_video = external_player_key
@@ -21600,6 +21631,102 @@ impl App {
             }
             Some(GridItem::Folder(_)) => self.settings.auto_fullscreen_image_folders_enabled(),
             _ => false,
+        }
+    }
+
+    pub(crate) fn open_selected_grid_container_with_mode(
+        &mut self,
+        ctx: &egui::Context,
+        mode: GridContainerOpenMode,
+        source: &'static str,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let Some(idx) = self.selected else {
+            self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
+            return None;
+        };
+        self.open_grid_container_with_mode(ctx, idx, mode, source)
+    }
+
+    pub(crate) fn open_grid_container_with_mode(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        mode: GridContainerOpenMode,
+        _source: &'static str,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let Some(item) = self.items.get(idx).cloned() else {
+            self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
+            return None;
+        };
+        if !matches!(
+            item,
+            GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. }
+        ) {
+            self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
+            return None;
+        }
+        if !self.guard_reading_history_open(idx) {
+            return None;
+        }
+        self.note_reading_history_open(idx);
+
+        let auto_fs = mode.auto_fullscreen();
+        match item {
+            GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                #[cfg(windows)]
+                if self.open_grid_container_in_detached_book_context_with_auto_fullscreen(
+                    ctx, idx, auto_fs,
+                ) {
+                    return None;
+                }
+                #[cfg(windows)]
+                if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx) {
+                    return None;
+                }
+                self.pending_auto_fs_open = auto_fs;
+                self.maybe_suppress_rating_filter_for_opened_container(idx);
+                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                self.record_rating_view_nav_open(&p);
+                Some(crate::ui_main::AddressBarNav::Direct(p))
+            }
+            GridItem::ConvertibleArchive { path, .. } => {
+                self.maybe_suppress_rating_filter_for_opened_container(idx);
+                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                let search_rollback = if self.favsearch.active
+                    || self.tag_view.active
+                    || self.rating_view_nav_context_active()
+                {
+                    Some(self.folder_nav_history_snapshot())
+                } else {
+                    None
+                };
+                if self.favsearch.active {
+                    self.favsearch.nav_stack.push(path.clone());
+                }
+                if self.tag_view.active {
+                    self.record_tag_view_nav_open(&path);
+                }
+                self.record_rating_view_nav_open(&path);
+                let open_outcome =
+                    self.load_folder_or_convert_archive_with_auto_fullscreen(path, auto_fs);
+                match (open_outcome, search_rollback) {
+                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                        self.attach_archive_convert_nav_history_rollback(snapshot);
+                    }
+                    (FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                        self.restore_folder_nav_history(snapshot);
+                    }
+                    _ => {}
+                }
+                if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    self.update_favsearch_address();
+                }
+                if self.tag_view.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    self.update_tag_view_address();
+                }
+                None
+            }
+            _ => unreachable!("explicit container mode is gated above"),
         }
     }
 
@@ -23798,9 +23925,13 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn should_open_grid_container_in_detached_book_context(&self, idx: usize) -> bool {
+    fn should_open_grid_container_in_detached_book_context_with_auto_fullscreen(
+        &self,
+        idx: usize,
+        auto_fullscreen: bool,
+    ) -> bool {
         self.settings.detached_viewer_open_images_in_window
-            && self.should_auto_fullscreen_grid_container(idx)
+            && auto_fullscreen
             && matches!(
                 self.items.get(idx),
                 Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_))
@@ -23813,7 +23944,24 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
-        if !self.should_open_grid_container_in_detached_book_context(idx) {
+        self.open_grid_container_in_detached_book_context_with_auto_fullscreen(
+            ctx,
+            idx,
+            self.should_auto_fullscreen_grid_container(idx),
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_grid_container_in_detached_book_context_with_auto_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        auto_fullscreen: bool,
+    ) -> bool {
+        if !self.should_open_grid_container_in_detached_book_context_with_auto_fullscreen(
+            idx,
+            auto_fullscreen,
+        ) {
             return false;
         }
         let Some(descriptor) = self.detached_book_context_descriptor_for_grid_idx(idx) else {
@@ -43955,9 +44103,38 @@ impl eframe::App for App {
                 // context_nav が実際に勝ったときだけ副作用 (検索終了 + 履歴 push +
                 // suppress フラグ) を適用する。show_context_menu 内で副作用を起こすと
                 // 別 nav 源が同フレームで勝ったときに順序が脆くなる (Codex P3)。
-                let path = action.into_path();
-                self.apply_jump_from_search_to(&path);
-                Some(path)
+                match action {
+                    crate::ui_dialogs::context_menu::ContextMenuAction::JumpFromSearch(path) => {
+                        self.apply_jump_from_search_to(&path);
+                        Some(path)
+                    }
+                    crate::ui_dialogs::context_menu::ContextMenuAction::OpenGridContainer {
+                        idx,
+                        mode,
+                    } => self
+                        .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
+                        .and_then(|nav| match nav {
+                            crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                            crate::ui_main::AddressBarNav::DriveList(origin) => {
+                                self.enter_drive_list(origin);
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::ReadingHistory => {
+                                self.enter_reading_history();
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::RatingViewBack => {
+                                self.rating_view_parent_nav();
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::BooksRoot => {
+                                self.open_books_root();
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::HistoryBack
+                            | crate::ui_main::AddressBarNav::HistoryForward => None,
+                        }),
+                }
             } else if let Some(p) = folder_pane_nav {
                 // フォルダツリーペインのクリック/Enter ナビは worker で scan_directory を
                 // 済ませてから開く (UI スレッドの read_dir が大/遅/ネットワークフォルダで

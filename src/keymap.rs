@@ -1254,6 +1254,8 @@ pub enum KeyAction {
     GridToggleCheck,
     GridDelete,
     GridOpenSelected,
+    GridOpenSelectedAsPage,
+    GridOpenSelectedAsList,
     GridOpenExternalPlayer,
     GridParentFolder,
     GridHistoryBack,
@@ -1647,6 +1649,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridOpenSelected,
+    KeyAction::GridOpenSelectedAsPage,
+    KeyAction::GridOpenSelectedAsList,
     KeyAction::GridOpenExternalPlayer,
     KeyAction::GridParentFolder,
     KeyAction::GridHistoryBack,
@@ -3030,6 +3034,8 @@ impl KeyAction {
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridOpenSelected => "GridOpenSelected",
+            GridOpenSelectedAsPage => "GridOpenSelectedAsPage",
+            GridOpenSelectedAsList => "GridOpenSelectedAsList",
             GridOpenExternalPlayer => "GridOpenExternalPlayer",
             GridParentFolder => "GridParentFolder",
             GridHistoryBack => "GridHistoryBack",
@@ -3541,6 +3547,8 @@ impl KeyAction {
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridOpenSelected => "選択中の項目を開く",
+            GridOpenSelectedAsPage => "選択中の ZIP/PDF/対応アーカイブをページで開く",
+            GridOpenSelectedAsList => "選択中の ZIP/PDF/対応アーカイブを一覧で開く",
             GridOpenExternalPlayer => "選択中の動画を外部プレイヤーで開く",
             GridParentFolder => "親フォルダへ移動する",
             GridHistoryBack => "フォルダ履歴を戻る",
@@ -3937,6 +3945,8 @@ impl KeyAction {
             | GridToggleCheck
             | GridDelete
             | GridOpenSelected
+            | GridOpenSelectedAsPage
+            | GridOpenSelectedAsList
             | GridOpenExternalPlayer
             | GridParentFolder
             | GridHistoryBack
@@ -4290,6 +4300,8 @@ impl KeyAction {
             | GridToggleCheck
             | GridDelete
             | GridOpenSelected
+            | GridOpenSelectedAsPage
+            | GridOpenSelectedAsList
             | GridOpenExternalPlayer
             | GridParentFolder
             | GridHistoryBack
@@ -4678,6 +4690,7 @@ impl KeyAction {
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridOpenSelected => ChordList::one(Chord::key(Enter)),
+            GridOpenSelectedAsPage | GridOpenSelectedAsList => ChordList::EMPTY,
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
             GridParentFolder => ChordList::two(Chord::key(Backspace), Chord::alt(Up)),
             GridHistoryBack => ChordList::one(Chord::alt(Left)),
@@ -6791,6 +6804,8 @@ mod tests {
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),
             "GridSelectAll".to_string(),
+            "GridOpenSelectedAsPage".to_string(),
+            "GridOpenSelectedAsList".to_string(),
             "GridParentFolder".to_string(),
             "TreeFolderPrev".to_string(),
             "TreeFolderNext".to_string(),

@@ -4,7 +4,7 @@ use eframe::egui;
 
 #[cfg(windows)]
 use super::ViewerPresentation;
-use super::{App, FolderNavMode};
+use super::{App, FolderNavMode, GridContainerOpenMode};
 use crate::adjustment::PostFilter;
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
@@ -4326,6 +4326,18 @@ impl App {
                 }
                 None
             }
+            RingActionId::GridOpenSelectedAsPage if context == RingShortcutContext::Grid => self
+                .open_selected_grid_container_with_mode(
+                    ctx,
+                    GridContainerOpenMode::PageFullscreen,
+                    source,
+                ),
+            RingActionId::GridOpenSelectedAsList if context == RingShortcutContext::Grid => self
+                .open_selected_grid_container_with_mode(
+                    ctx,
+                    GridContainerOpenMode::PageList,
+                    source,
+                ),
             RingActionId::GridColumnCount1 if context == RingShortcutContext::Grid => {
                 self.apply_ring_grid_column_count(1);
                 None
