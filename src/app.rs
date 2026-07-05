@@ -166,6 +166,12 @@ pub(crate) enum DetachedViewerBorderlessTransitionPhase {
 
 pub(crate) const FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP: &str = "detached_viewer_cleanup";
 pub(crate) const FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE: &str = "still_window_mode";
+pub(crate) const FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_CLEANUP: &str =
+    "fullscreen_viewport_cleanup";
+pub(crate) const FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE: &str =
+    "native_video_backdrop_hide";
+pub(crate) const FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_RECREATE: &str =
+    "fullscreen_viewport_recreate";
 /// フォント atlas full upload を何フレーム連続で再発行するか。fullscreen close 直後は
 /// メインウィンドウ (ROOT viewport) の wgpu surface が 1 フレームだけ消え、その frame の
 /// full(realloc) upload が `paint_and_update_textures` の no-surface early return で捨てられる。
@@ -4964,7 +4970,7 @@ pub struct App {
     /// に戻った後の detached viewport 生存を見落として Y-32 wgpu validation panic を起こす。
     /// close 経路はこの flag だけを立て、outer/main context で安全判定してから flush する。
     #[cfg(windows)]
-    pub(crate) pending_detached_cleanup_font_atlas_resync: bool,
+    pub(crate) pending_detached_cleanup_font_atlas_resync: Option<&'static str>,
     /// 閉じた後に次回表示用の ViewportId を更新するか。
     ///
     /// Win+Shift+Arrow など OS 側のモニター移動で eframe/winit の viewport state が
@@ -7311,7 +7317,7 @@ impl App {
             #[cfg(windows)]
             main_font_atlas_resync_reason: None,
             #[cfg(windows)]
-            pending_detached_cleanup_font_atlas_resync: false,
+            pending_detached_cleanup_font_atlas_resync: None,
             fs_viewport_recreate_after_hide: false,
             fs_viewport_generation: 0,
             fs_opened_at: None,
@@ -23008,6 +23014,15 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn request_main_font_atlas_resync(&mut self, reason: &'static str) {
+        if self.detached_font_atlas_resync_should_wait() {
+            self.defer_main_font_atlas_resync(reason, "detached_alive");
+            return;
+        }
+        self.request_main_font_atlas_resync_now(reason);
+    }
+
+    #[cfg(windows)]
+    fn request_main_font_atlas_resync_now(&mut self, reason: &'static str) {
         if !self.main_font_atlas_resync_pending {
             crate::logger::log(format!(
                 "[ui-fonts] schedule main font atlas resync: {reason}"
@@ -23025,12 +23040,28 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn request_detached_cleanup_font_atlas_resync(&mut self, source: &'static str) {
-        if !self.pending_detached_cleanup_font_atlas_resync {
+        self.defer_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP, source);
+    }
+
+    #[cfg(windows)]
+    fn defer_main_font_atlas_resync(&mut self, reason: &'static str, source: &'static str) {
+        if self.pending_detached_cleanup_font_atlas_resync.is_none() {
             crate::logger::log(format!(
-                "[ui-fonts] defer detached cleanup font atlas resync: source={source}"
+                "[ui-fonts] defer main font atlas resync: reason={reason} source={source}"
             ));
         }
-        self.pending_detached_cleanup_font_atlas_resync = true;
+        if self.pending_detached_cleanup_font_atlas_resync.is_none() {
+            self.pending_detached_cleanup_font_atlas_resync = Some(reason);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_font_atlas_resync_should_wait(&self) -> bool {
+        !self.detached_image_windows.is_empty()
+            || self.active_detached_viewer_context.is_some()
+            || self.active_detached_session.is_some()
+            || self.viewer_session_is_detached_or_switching()
+            || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
     }
 
     #[cfg(windows)]
@@ -23045,13 +23076,13 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn flush_pending_detached_cleanup_font_atlas_resync(&mut self) {
-        if !self.pending_detached_cleanup_font_atlas_resync {
+        let Some(reason) = self.pending_detached_cleanup_font_atlas_resync else {
             return;
-        }
+        };
         if !self.detached_cleanup_font_atlas_resync_is_safe() {
             self.log_detached_image_window_debug(format!(
                 "font_resync_deferred_detached_alive active_context={} session={:?} \
-                 fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={}",
+                 fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={} reason={reason}",
                 self.active_detached_viewer_context.is_some(),
                 self.active_detached_session,
                 self.fullscreen_idx,
@@ -23061,9 +23092,11 @@ impl App {
             ));
             return;
         }
-        self.pending_detached_cleanup_font_atlas_resync = false;
-        crate::logger::log("[ui-fonts] flush detached cleanup font atlas resync".to_string());
-        self.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP);
+        self.pending_detached_cleanup_font_atlas_resync = None;
+        crate::logger::log(format!(
+            "[ui-fonts] flush deferred main font atlas resync: reason={reason}"
+        ));
+        self.request_main_font_atlas_resync_now(reason);
     }
 
     #[cfg(windows)]
@@ -24823,7 +24856,7 @@ impl App {
         let texture_size = texture.size_vec2();
         let placement = self.active_detached_viewer_current_placement();
         let frozen_continuous_pages = ctx
-            .map(|ctx| self.detached_continuous_frozen_pages_for_snapshot(ctx, idx, placement))
+            .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, idx, placement))
             .unwrap_or_default();
         let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);

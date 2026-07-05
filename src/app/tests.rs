@@ -19302,6 +19302,81 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn paused_spread_detached_window_keeps_both_visible_pages() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(11);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            });
+        let left = push_image(&mut app, r"C:\pics\spread-left.jpg");
+        let right = push_image(&mut app, r"C:\pics\spread-right.jpg");
+        for (idx, label) in [(left, "spread_left"), (right, "spread_right")] {
+            let pixels = egui::ColorImage::new([1, 2], vec![egui::Color32::WHITE; 2]);
+            let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([1, 2]),
+                    load_seq: 0,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(left);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .expect("spread detached viewer should build a snapshot");
+
+        assert_eq!(
+            snapshot.frozen_continuous_pages.len(),
+            2,
+            "spread passive windows must freeze both visible pages"
+        );
+        assert!(
+            snapshot.frozen_continuous_pages[0].rect_norm
+                != snapshot.frozen_continuous_pages[1].rect_norm,
+            "left/right spread pages must keep separate frozen layout rects"
+        );
+    }
+
+    #[test]
+    fn paused_single_page_detached_window_does_not_use_multi_page_frozen_snapshot() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(12);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        let first = push_image(&mut app, r"C:\pics\single-a.jpg");
+        let second = push_image(&mut app, r"C:\pics\single-b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "single_a");
+        insert_static_fs_entry(&mut app, &ctx, second, "single_b");
+        app.fullscreen_idx = Some(first);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .expect("single detached viewer should build a snapshot");
+
+        assert!(
+            snapshot.frozen_continuous_pages.is_empty(),
+            "single-page passive windows keep the existing one-texture snapshot path"
+        );
+    }
+
+    #[test]
     fn pausing_detached_context_cancels_final_ai_pending() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -19871,7 +19946,9 @@ mod still_window_mode_key_tests {
             "normal fullscreen cleanup keeps the conservative font-atlas reset path"
         );
         assert!(
-            should_defer_main_paint_for_font_atlas_resync("native_video_backdrop_hide"),
+            should_defer_main_paint_for_font_atlas_resync(
+                FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE
+            ),
             "native fullscreen backdrop cleanup keeps the conservative font-atlas reset path"
         );
     }
@@ -20164,7 +20241,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
-            app.pending_detached_cleanup_font_atlas_resync,
+            app.pending_detached_cleanup_font_atlas_resync.is_some(),
             "detached cleanup resync must remain pending while main detached fullscreen is active"
         );
         assert!(!app.main_font_atlas_resync_pending);
@@ -20175,7 +20252,7 @@ mod still_window_mode_key_tests {
         app.begin_active_detached_session(7, DetachedSource::Image);
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
-            app.pending_detached_cleanup_font_atlas_resync,
+            app.pending_detached_cleanup_font_atlas_resync.is_some(),
             "pending resync must wait while an active detached session is alive"
         );
         assert!(!app.main_font_atlas_resync_pending);
@@ -20185,7 +20262,7 @@ mod still_window_mode_key_tests {
         app.finish_active_detached_session_close("test");
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
-            !app.pending_detached_cleanup_font_atlas_resync,
+            app.pending_detached_cleanup_font_atlas_resync.is_none(),
             "pending request should be consumed once detached is fully idle"
         );
         assert!(
@@ -20195,6 +20272,69 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.main_font_atlas_resync_reason,
             Some(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_font_resync_waits_while_passive_detached_window_exists() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "passive_resync_guard",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 22,
+                texture: tex,
+                title: "passive".to_owned(),
+                location_display: "passive".to_owned(),
+                image_dims: Some((1, 1)),
+                pinned: false,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement: crate::settings::DetachedViewerWindowPlacement {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 640.0,
+                    h: 480.0,
+                    maximized: false,
+                },
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: None,
+            });
+
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+
+        assert!(!app.main_font_atlas_resync_pending);
+        assert_eq!(
+            app.pending_detached_cleanup_font_atlas_resync,
+            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE),
+            "native video backdrop resync must be deferred while a passive detached viewport exists"
+        );
+
+        app.flush_pending_detached_cleanup_font_atlas_resync();
+        assert!(!app.main_font_atlas_resync_pending);
+        assert_eq!(
+            app.pending_detached_cleanup_font_atlas_resync,
+            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
+        );
+
+        app.detached_image_windows.clear();
+        app.flush_pending_detached_cleanup_font_atlas_resync();
+        assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
+        assert!(app.main_font_atlas_resync_pending);
+        assert_eq!(
+            app.main_font_atlas_resync_reason,
+            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
         );
     }
 
@@ -20222,7 +20362,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(42), 0);
         assert!(!app.main_font_atlas_resync_pending);
         assert!(
-            app.pending_detached_cleanup_font_atlas_resync,
+            app.pending_detached_cleanup_font_atlas_resync.is_some(),
             "active close finalize should defer detached cleanup font resync to the outer context"
         );
         app.flush_pending_detached_cleanup_font_atlas_resync();

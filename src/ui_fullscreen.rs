@@ -3436,6 +3436,125 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn detached_frozen_pages_for_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+    ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
+        let continuous = self.detached_continuous_frozen_pages_for_snapshot(ctx, idx, placement);
+        if !continuous.is_empty() {
+            return continuous;
+        }
+        self.detached_spread_frozen_pages_for_snapshot(idx, placement)
+    }
+
+    #[cfg(windows)]
+    fn detached_spread_frozen_pages_for_snapshot(
+        &mut self,
+        idx: usize,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+    ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
+        let SpreadPair::Double { left, right } = self.resolve_visible_spread_pair(idx) else {
+            return Vec::new();
+        };
+        let Some(left_texture) = self.resolve_fs_display_tex(left, true) else {
+            self.log_detached_image_window_debug(format!(
+                "detached_spread_frozen_fallback reason=missing_left idx={idx} left={left} \
+                 right={right}"
+            ));
+            return Vec::new();
+        };
+        let Some(right_texture) = self.resolve_fs_display_tex(right, true) else {
+            self.log_detached_image_window_debug(format!(
+                "detached_spread_frozen_fallback reason=missing_right idx={idx} left={left} \
+                 right={right}"
+            ));
+            return Vec::new();
+        };
+
+        let full_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+        );
+        let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
+        let left_rot = self.get_rotation(left);
+        let right_rot = self.get_rotation(right);
+        let left_size = rotated_display_size(left_texture.size_vec2(), left_rot);
+        let right_size = rotated_display_size(right_texture.size_vec2(), right_rot);
+        if left_size.x <= 0.0 || left_size.y <= 0.0 || right_size.x <= 0.0 || right_size.y <= 0.0 {
+            self.log_detached_image_window_debug(format!(
+                "detached_spread_frozen_fallback reason=invalid_size idx={idx} left={left} \
+                 right={right} left_size={left_size:?} right_size={right_size:?}"
+            ));
+            return Vec::new();
+        }
+
+        let content_left = if left_rot.is_none() {
+            self.view_trim_spread_content_bbox(left, crate::view_trim::ViewTrimSpreadSide::Left)
+        } else {
+            None
+        };
+        let content_right = if right_rot.is_none() {
+            self.view_trim_spread_content_bbox(right, crate::view_trim::ViewTrimSpreadSide::Right)
+        } else {
+            None
+        };
+        let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let left_bbox = content_left.unwrap_or(full_bbox);
+        let right_bbox = content_right.unwrap_or(full_bbox);
+        let content_active = content_left.is_some() || content_right.is_some();
+        let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
+        let combined_h = left_size.y.max(right_size.y);
+        let left_w = left_size.x * (combined_h / left_size.y);
+        let right_w = right_size.x * (combined_h / right_size.y);
+        let left_visible_w = (left_bbox.width() * left_w).max(1.0);
+        let right_visible_w = (right_bbox.width() * right_w).max(1.0);
+        let (fit_w, fit_h, content_center_offset) = if content_active {
+            let cy0 = (left_bbox.min.y * combined_h).min(right_bbox.min.y * combined_h);
+            let cy1 = (left_bbox.max.y * combined_h).max(right_bbox.max.y * combined_h);
+            (
+                left_visible_w + right_visible_w,
+                (cy1 - cy0).max(1.0),
+                egui::vec2(0.0, ((cy0 + cy1) * 0.5) - (combined_h * 0.5)),
+            )
+        } else {
+            (left_w + right_w, combined_h, egui::Vec2::ZERO)
+        };
+        let fit_scale =
+            ((image_rect.width() - spread_gap).max(1.0) / fit_w).min(image_rect.height() / fit_h);
+        let center = image_rect.center() - content_center_offset * fit_scale;
+        let rects = layout_spread_page_rects(
+            center,
+            left_w,
+            right_w,
+            combined_h,
+            fit_scale,
+            spread_gap,
+            left_bbox,
+            right_bbox,
+            content_active,
+        );
+
+        vec![
+            crate::app::DetachedImageWindowFrozenPage {
+                texture: left_texture,
+                rect_norm: Self::normalize_rect_to_full_rect(rects.left_rect, full_rect),
+                rotation: left_rot,
+                location_display: self.location_display_for_loading(left),
+                content_bbox: content_left,
+            },
+            crate::app::DetachedImageWindowFrozenPage {
+                texture: right_texture,
+                rect_norm: Self::normalize_rect_to_full_rect(rects.right_rect, full_rect),
+                rotation: right_rot,
+                location_display: self.location_display_for_loading(right),
+                content_bbox: content_right,
+            },
+        ]
+    }
+
+    #[cfg(windows)]
     fn draw_detached_image_window_snapshot(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
@@ -4611,7 +4730,9 @@ impl App {
             if cleanup_presentation == Some(ViewerPresentation::DetachedWindow) {
                 self.request_detached_cleanup_font_atlas_resync("keep_alive_cleanup");
             } else {
-                self.request_main_font_atlas_resync("fullscreen_viewport_cleanup");
+                self.request_main_font_atlas_resync(
+                    crate::app::FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_CLEANUP,
+                );
             }
         }
         if self.fs_viewport_recreate_after_hide {
@@ -6889,7 +7010,9 @@ impl App {
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
-        self.request_main_font_atlas_resync("native_video_backdrop_hide");
+        self.request_main_font_atlas_resync(
+            crate::app::FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE,
+        );
     }
 
     #[cfg(windows)]
@@ -6916,7 +7039,9 @@ impl App {
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
         self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
-        self.request_main_font_atlas_resync("fullscreen_viewport_recreate");
+        self.request_main_font_atlas_resync(
+            crate::app::FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_RECREATE,
+        );
     }
 
     #[cfg(windows)]

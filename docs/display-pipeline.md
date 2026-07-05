@@ -336,6 +336,16 @@ begin_pass で新フォントが適用され、フル atlas アップロード�
 で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup も、メイン UI を stale
 font atlas のまま描くとフォント崩れが残ることがあるため、同じ保守経路へ乗せる。
 
+ただし `request_discard` を使う font atlas resync は、その pass で描かれた
+`show_viewport_immediate` の child viewport を egui 側で未描画扱いにし、passive detached
+window の OS 窓を破棄→再生成させることがある。したがって active / passive detached viewport
+が 1 つでも生きている間は、`detached_viewer_cleanup` だけでなく
+`fullscreen_viewport_cleanup` / `native_video_backdrop_hide` /
+`fullscreen_viewport_recreate` / `still_window_mode` も同じ pending resync に合流させ、
+`detached_cleanup_font_atlas_resync_is_safe()` が真になるまで実際の resync を遅延する。
+pending は最初の reason を保持し、detached が完全 idle になった時点でその reason のまま
+`request_main_font_atlas_resync` を発火する。
+
 **緩和策: クリア色をテーマ連動にする (`App::clear_color` / `main_window_clear_color`)**。
 上記「1 フレーム黒」フォールバック、および detached 窓 close 直後の no-surface フレームで
 メインウィンドウ surface に見えるのは eframe 既定の `clear_color` 値だが、これは
@@ -402,6 +412,11 @@ viewer cache / AI / 先読み / スライドショーは単一 active session �
 detached bundle 間で保持・確定しない方針とし、always-new / ピン留めの連動なし窓では
 消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取り等の編集機能を起動できない。
 通常 F12 の linked detached viewer では従来どおり編集できるが、編集中はピン留めできない。
+passive snapshot は単ページでは 1 枚の texture を保持する。縦連結読みと見開き表示では、
+pause 時点で可視だった各ページの `TextureHandle` と正規化済み表示矩形を frozen page list に
+保持し、passive window 側で同じレイアウトを再描画する。見開きの片側がまだ未デコードで
+texture を取得できない場合は multi-page frozen を作らず、従来の現在ページ 1 枚 snapshot へ
+フォールバックする。
 未ピン留めの passive window がある場合は、設定 OFF でも次の画像 open にその window の配置を
 再利用する。メイン一覧側の Backspace / フォルダ移動 / 再読込で active detached 画像 session
 を閉じる場合も、画像専用の毎回新規設定または active ピン留めが有効なら先に passive window へ
