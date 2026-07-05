@@ -17983,6 +17983,88 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn active_host_matching_passive_window_is_cleared_before_capture() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let texture = ctx.load_texture(
+            "passive_host_collision",
+            pixels,
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 4,
+                texture,
+                title: "passive.jpg - mimageviewer".to_string(),
+                location_display: "passive.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: false,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: false,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0xc807da,
+                paused_bundle: None,
+            });
+        app.detached_viewer_host_hwnd = 0xc807da;
+        app.begin_active_detached_session(5, DetachedSource::Book);
+
+        assert!(app.clear_detached_viewer_host_if_matches_passive_window("test"));
+        assert_eq!(app.detached_viewer_host_hwnd, 0);
+        assert!(app.active_detached_session.is_some());
+    }
+
+    #[test]
+    fn closing_passive_window_clears_matching_active_host() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let texture = ctx.load_texture(
+            "closing_passive_host_collision",
+            pixels,
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 4,
+                texture,
+                title: "passive.jpg - mimageviewer".to_string(),
+                location_display: "passive.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: false,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: false,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                passive_host_hwnd: 0xc807da,
+                paused_bundle: None,
+            });
+        app.detached_viewer_host_hwnd = 0xc807da;
+        app.begin_active_detached_session(5, DetachedSource::Book);
+
+        assert!(!app.clear_detached_viewer_host_if_closing_passive_window(&[99], "test"));
+        assert_eq!(app.detached_viewer_host_hwnd, 0xc807da);
+        assert!(app.clear_detached_viewer_host_if_closing_passive_window(&[4], "test"));
+        assert_eq!(app.detached_viewer_host_hwnd, 0);
+        assert!(app.active_detached_session.is_some());
+    }
+
+    #[test]
     fn explicit_pdf_deferred_reopen_keeps_grid_open_intent_for_detached_viewer() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;

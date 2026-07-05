@@ -3970,6 +3970,7 @@ impl App {
             if !close_command_ids.is_empty() {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
             }
+            self.clear_detached_viewer_host_if_closing_passive_window(&close_ids, "passive_close");
             for id in &close_command_ids {
                 let viewport_id = Self::detached_image_window_viewport_id(*id);
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);

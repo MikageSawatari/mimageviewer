@@ -117,9 +117,19 @@ pub fn move_window_to_desktop_of(owner_hwnd: HWND, target_hwnd: HWND) -> Result<
 }
 
 pub fn find_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {
+    find_visible_thread_window_matching_rect_excluding(main_hwnd, expected, &[])
+}
+
+pub fn find_visible_thread_window_matching_rect_excluding(
+    main_hwnd: HWND,
+    expected: RECT,
+    excluded_hwnds: &[u64],
+) -> Option<HWND> {
     let mut state = RaiseWindowState {
         main_hwnd,
         expected,
+        excluded_hwnds: excluded_hwnds.as_ptr(),
+        excluded_hwnds_len: excluded_hwnds.len(),
         best_hwnd: HWND::default(),
         best_score: i64::MAX,
     };
@@ -202,6 +212,8 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
 struct RaiseWindowState {
     main_hwnd: HWND,
     expected: RECT,
+    excluded_hwnds: *const u64,
+    excluded_hwnds_len: usize,
     best_hwnd: HWND,
     best_score: i64,
 }
@@ -253,7 +265,15 @@ impl DebugWindowEntry {
 
 unsafe extern "system" fn raise_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut RaiseWindowState) };
-    if hwnd.0 == state.main_hwnd.0 || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+    let hwnd_raw = hwnd.0 as usize as u64;
+    let excluded = if state.excluded_hwnds.is_null() || state.excluded_hwnds_len == 0 {
+        false
+    } else {
+        let excluded_hwnds =
+            unsafe { std::slice::from_raw_parts(state.excluded_hwnds, state.excluded_hwnds_len) };
+        excluded_hwnds.contains(&hwnd_raw)
+    };
+    if hwnd.0 == state.main_hwnd.0 || excluded || !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return BOOL(1);
     }
 
