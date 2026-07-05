@@ -2072,6 +2072,27 @@ impl App {
     }
 
     pub(crate) fn toggle_video_window_mode_for_input(&mut self, ctx: &egui::Context) {
+        // 7e: 「動画→音声モード」の VST ホスト表示中 (video_audio_vst) にキーボード / リング /
+        // ゲームパッドの窓・全画面切替が来たら、presenter を再構築せず VST を畳んで音楽ビュー
+        // (波形) へ戻してから still-window toggle に振る。native HUD の ToggleWindowMode 分岐
+        // (handle_native_video_output_event) と同じ整合経路にそろえる。これをしないと VST 中は
+        // fs_music_view_active=false のため本メソッドが presenter 再構築経路
+        // (toggle_video_window_mode) へ流れ、しかも VST を exit しないので、presenter placement /
+        // viewer_presentation / video_audio_vst が相互不整合になり、入力ルーティングが詰まって
+        // freeze したり、viewer_presentation が Fullscreen 以外に固着して VST ボタンが消えたりする
+        // (2026-07-05 実機 fb)。stale な video_audio_vst は fullscreen_idx 一致で弾く。
+        #[cfg(windows)]
+        if let Some(fs_idx) = self.video_audio_vst.as_ref().map(|s| s.fs_idx) {
+            if self.fullscreen_idx == Some(fs_idx) {
+                crate::logger::log(format!(
+                    "[video-audio-vst] window toggle -> exit VST + still-window toggle (fs_idx={fs_idx})"
+                ));
+                self.exit_video_audio_vst(ctx, fs_idx);
+                self.toggle_still_window_mode();
+                ctx.request_repaint();
+                return;
+            }
+        }
         if self.viewer_session_is_detached() {
             if self.video_tile_mode_active {
                 return;
