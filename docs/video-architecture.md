@@ -1696,6 +1696,41 @@ viewport へ切り替わる間に新 viewport がフォーカスを取るまで�
 トグル UI: 動画は native HUD のトグルボタン (× の左)、静止画は egui ホバーバーの
 ⊞ ボタン (× の左)。
 
+### 動画→音声モード (音楽ビュー)
+
+音声ファイル (`GridItem::Audio`) の再生と、動画再生中に映像をカットして音声だけ聴く
+「動画→音声モード」は、どちらも同じ再生エンジンを使い、映像面を egui の音楽ビュー overlay
+(波形 / スペクトラム / 各種パネル) に差し替える。ユーザー視点の画面構成は
+[spec.md](spec.md) § 4.3、解析ワーカーは [async-architecture.md](async-architecture.md) を参照。
+
+**presenter を drop せず hide する (consume-and-hold)**。動画→音声モードへ入るとき native
+D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{visible:false}` で
+`SW_HIDE` して生かしたままにする。理由:
+
+- **映像を止めない**。demux / decode は通常どおり回り、hidden presenter は届いたフレームを
+  consume して present 成功時の bookkeeping (FirstFrameReady 等) を出し続ける。これで音声モード
+  中に seek しても、生きた presenter が FirstFrameReady を発行するので engine の readiness latch が
+  Buffering→Playing に復帰できる (映像を止める旧案では runtime の映像 OFF フラグで latch を
+  合成する必要があったが、この方式では不要。step 9 で当該フラグは削除済み)。
+- **音切れを作らない**。presenter を drop して作り直すと音声パイプラインも一度畳む必要があり
+  数百 ms の無音が入る。hide/show だけならオーディオリングは無停止。
+- **exit race を避ける**。presenter HWND を生かすことで、hide→show の順序と owner / focus guard の
+  再取得を決定的に扱える。
+
+hide 中は HUD overlay HWND も明示 hide し、overlay tick / cursor polling / HUD raise burst を
+抑止する。音声モードの owner 同期・focus guard・`ensure_native_video_front` は
+`video_audio_mode == Some(idx)` を「presenter 非アクティブ扱い」の gate にして、現行 detach
+(hwnd=0) と同じ挙動を再現する。
+
+**ファイル移動は音声モードを維持する**。音声モード中に前後ファイルへ移動すると、hidden
+presenter の source だけを差し替える keep-audio-mode の source-swap を使い、遷移先が映像を持つ
+動画でも映像を出さずに音声モードのまま連続再生する。**VST は引き継ぐ**。動画→音声モードでも
+VST チェーンは `dsp_bridge` 共有で維持され、音声モード中に VST GUI を出すときだけ hidden
+presenter を一時的に un-hide して VST ホスト化する (音効果自体は元から通っている)。
+
+実装の詳細な段階計画 (10 ステップ)・Codex 設計レビュー履歴は
+[music-integration-plan.md](music-integration-plan.md) § 5.7 を参照。
+
 ## 設定との関係
 
 整理後、削除する設定項目:

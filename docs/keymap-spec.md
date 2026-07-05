@@ -62,6 +62,14 @@ seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当て�
 ナビゲーション、グリッド / フルスクリーンの <kbd>F11</kbd> 系ウィンドウ切り替えも
 keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
+**動画→音声モード / 音楽ビュー**: 音声ファイル (`GridItem::Audio`) の再生と、動画再生中に映像を
+消して音声だけ聴くモードは、どちらも `[FsVideo]` のキーをそのまま流用する。映像 ↔ 音声の切り替えは
+`VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
+`VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
+動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` は音楽ビューでは無効
+(キャプチャパレット / コマ送り UI を出さない)。メタデータパネルの <kbd>I</kbd> / <kbd>Tab</kbd> と
+`[Rating]` グループは静止画・動画と同じく音楽ビューでも使える。
+
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
 `docs/key-customization-impl-plan.md` の「新しいキー操作を追加するとき」に従って
