@@ -174,7 +174,7 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 ### 3.1 ラボで完成済み（`music-core` + `music_lab`）
 - stereo waveform bin / low-mid-high energy / loudness / 簡易 BPM・beat/bar grid（`WaveformBin`/`BeatGrid`）
 - 30〜60秒 1 行の DJ 風カラー波形タイムライン + メトリクスレーン（loudness+bass root / key / vocal hint）
-- 108-band spectrum analyzer（`SpectrumAnalyzer`、多解像度 FFT）
+- MIDI 半音 spectrum analyzer（`SpectrumAnalyzer`、多解像度 FFT）
 - 部分解析ストリーミング（decode 中に約5秒単位で timeline を先出し）
 
 ### 3.2 本体でのユーザー要件（2026-07-01 確定）
@@ -203,7 +203,7 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 | D6 | VST3 | **既存 audio pump のチェーンを共有**。`VideoPlayer::open(...)` に `dsp_bridge` を渡すだけで normalize→VST3→limiter を通る。上バーに VST3 トグル（`overlay_draw.rs` の `NativeOverlayCommand::ToggleVst3Gui` / `NativeTopButtonGlyph::Vst3` を音楽ビューにも）。追加配線はほぼ不要。 |
 | D7 | 動画→音声モード | `MediaVisualMode::Music` + `MusicModeSource::VideoAudioOnly`。**同一 `VideoPlayer` の映像面のみ停止/隠蔽**し、音声は継続。位置・音量・VST を引き継ぐ。逆トグルで映像復帰。**状態は記憶しない（セッション中の一時トグル、永続スキーマ無し）**（ユーザー確定 2026-07-01）。**最難関につき単独 Inc（§8 Inc 7）に隔離**。 |
 | D8 | 永続化 | **タイムライン解析は永続化しない = in-memory LRU（2026-07-03 方針転換）**。当初は中央 `audio_analysis.db`（SQLite）に `TimelineAnalysis` を保存する設計だったが、**spectrum が再生位置 ±1 秒窓のため全尺 PCM を毎回デコードする**ので、永続キャッシュが節約するのは解析パスだけで実利が薄い（progressive 表示で miss 体験も滑らか）。→ 直近 N 曲（`MUSIC_ANALYSIS_LRU_MAX=6` 件 or `MUSIC_ANALYSIS_LRU_MAX_BINS=150万` bin 予算のどちらか先）だけ `Arc<TimelineAnalysis>` をメモリ保持し、セッション内の A/B 切替を即時にする（`src/app.rs` `music_analysis_lru`）。ブックマークは動画 `video_bookmarks.rs` 経路に相乗り（別テーブル無し、D5.1）。row texture / spectrum frame / playback buffer は transient。 |
-| D9 | 解析経路 | **再生と独立した解析ワーカー**が FFmpeg でファイルを PCM decode → `analyze_stereo_timeline`。再生 pacing と非同期。spectrum は playback ring buffer から短窓を tap。UI スレッドで解析しない。 |
+| D9 | 解析経路 | **再生と独立した解析ワーカー**が FFmpeg でファイルを PCM decode → `analyze_stereo_timeline`。再生 pacing と非同期。spectrum は同じ全尺 PCM から再生位置周辺 ±1 秒をスライスする。UI スレッドで解析しない。 |
 | D10 | ロジック | `music-core` を再利用（§2.1）。加法ヘルパーのみ許容。 |
 | D11 | マイグレーション | **新機能＝未リリース**。旧 mIV データからの移行は不要（コミットにその旨記載）。ラボ `.music.json` からの取り込みは別途指示があるまで行わない。 |
 | D12 | 運用 | 実装 = Claude Code、レビュー = Codex（各 Inc、read-only、同一 Inc は resume）、仕上げ実機 = ユーザー GUI。 |
@@ -263,7 +263,7 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   - **中央 timeline canvas**: row raster worker（下記）が焼いた行画像を 1 frame 少量ずつ
     texture upload。再生カーソル行 → 可視範囲 → 近傍 の順で raster 要求（黒待ち回避）。
   - **下シークバー（常時）**: 再生位置表示 + クリック/ドラッグ seek + ブックマーク位置マーカー。
-  - **下段 108-band spectrum**（§5.6）。
+  - **下段 MIDI 半音 spectrum**（§5.6）。
 - **row raster worker**: `TimelineAnalysis` + row index + row secs + cache key + generation +
   row version → row `ColorImage`。ラボの raster worker をそのまま移植（`docs/async-architecture.md`
   テンプレ）。古い key / generation / row version の結果は UI 採用側で捨てる（最終防衛線）。
@@ -284,10 +284,10 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
     現在位置追加 `KeyAction::VideoBookmark`（既定 `B`）。**音声はこれらを path key で共有**し、
     左パネルは同じブックマークデータを一覧描画するだけ（動画はシークバー/HUD 上に出す差だけ）。
 
-### 5.6 108-band spectrum（下段アナライザ）
-- `SpectrumAnalyzer` 常駐 worker。再生位置周辺の短い PCM window を **playback ring buffer から
-  取得**（`src/video/audio.rs` の `AudioBuffer` を read-only で覗く経路を用意）。全尺 timeline
-  解析の完了を待たない（長尺ロード中でも動く）。
+### 5.6 MIDI 半音 spectrum（下段アナライザ）
+- `SpectrumAnalyzer` 常駐 worker。解析ワーカーが保持する全尺 PCM から、再生位置周辺 ±1 秒の
+  window をスライスして取得する（`src/video/audio.rs` の playback ring buffer は窓幅不足のため
+  使わない。§11 参照）。全尺 timeline 解析の完了を待たない（PCM デコード後に動く）。
 
 ### 5.7 動画→音声モード（映像カット + 引き継ぎ）
 - `MediaVisualMode`（現状 **本体未参照**、music-core にのみ存在）を本体で初めて使う。
@@ -955,8 +955,8 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 - [x] メトリクスレーンのホバー（レーン名/値/時刻/推定音名）（Inc 3b）
 - [x] 再生カーソル行の自動スクロール（手動スクロール中は追従しない）（Inc 3b、follow_playhead）
 
-### 7.2 108-band spectrum（下段）
-- [x] 20Hz–18kHz / 約1 semitone 幅、多解像度 FFT（`SpectrumAnalyzer`）（Inc 4、常駐ワーカー）
+### 7.2 MIDI 半音 spectrum（下段）
+- [x] E0–C#10 / MIDI 半音ごとのバー、多解像度 FFT（`SpectrumAnalyzer`）（Inc 4、常駐ワーカー。2026-07-05 に 20Hz–18kHz の等比分割から変更）
 - [x] 鍵盤ハイライト（相対突出評価、A0–C8 明色/範囲外グレー）（Inc 4、`draw_pitch_keyboard`）
 - [x] ホバーで周波数 Hz + 近似音名（Inc 4、`draw_spectrum_hover`）
 - [x] 再生位置周辺 ±1s の PCM 窓を tap（Inc 4、案A = 展開済み PCM をスライス。§11 参照）
@@ -1178,7 +1178,7 @@ placement に作り直す経路。headless→native の「presenter 無し→有
     ない。music-core は無改変。Codex 設計レビュー（P1×1 / P2×4 / P3×2 すべて反映）+ code review 済み。
   - **残り（Inc 3 の未実装）**: vocal hint 独立レーン / 手動 BPM 補正は未着手。
 
-- **Inc 4: 108-band spectrum worker（下段）** — ✅ **実装済み（2026-07-02）**
+- **Inc 4: MIDI 半音 spectrum worker（下段）** — ✅ **実装済み（2026-07-02、半音バー化 2026-07-05）**
   - `SpectrumAnalyzer` 常駐 worker + 展開済み PCM の playhead ±1s スライス（案A、§11 で確定）。
   - ✅ `src/ui_music_spectrum.rs`（新規）: `MusicSpectrumState`（常駐ワーカー + 描画状態を封じる）+
     `MusicPcm`（Arc 共有 PCM）+ ラボの `draw_spectrum` / `draw_pitch_keyboard` / spectrum color helper
@@ -1316,8 +1316,8 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   buffer を tap しておらず、**ストリーミング展開した全 PCM を playhead 周辺でスライス**していた
   （`spectrum_request_from_samples`）。よって本体でも **解析ワーカーが全尺デコードした 48kHz stereo PCM を
   `Arc<MusicPcm>` で保持し、playhead ±1s をスライスして `SpectrumAnalyzer` に渡す**（`audio.rs` の
-  hot path は無改変 = 動画リグレッションリスクゼロ）。D9 の「playback ring buffer から短窓 tap」は
-  この記述に読み替える。トレードオフ = 開いている 1 曲分の PCM が常駐（約 12MB/分）。**当初は
+  hot path は無改変 = 動画リグレッションリスクゼロ）。トレードオフ = 開いている 1 曲分の PCM が
+  常駐（約 12MB/分）。**当初は
   `MUSIC_SPECTRUM_MAX_PCM_SAMPLES` = 30 分の常駐上限を設け、超過ファイルは spectrum を無効化して
   いたが撤廃した（2026-07-03）**: timeline はそもそも上限なしで全尺デコードしており（この関数の
   支配的コスト）、spectrum 用 PCM はその Vec を `move` で渡すだけで追加のピーク確保が無い。上限が

@@ -9,9 +9,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use music_core::{
     AnalysisConfig, AudioStreamInfo, DecodedAudio, MusicBookmark, PlaybackSnapshot,
-    SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
-    TIMELINE_ANALYSIS_VERSION, TimelineAnalysis, WaveformBin, analyze_stereo_timeline,
-    resample_linear_stereo,
+    SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MAX_MIDI,
+    SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer, TIMELINE_ANALYSIS_VERSION,
+    TimelineAnalysis, WaveformBin, analyze_stereo_timeline, resample_linear_stereo,
 };
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -61,7 +61,7 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
 const MEDIA_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac", "mp4", "m4v", "mov", "mkv", "webm",
 ];
-const SPECTRUM_BANDS: usize = 108;
+const SPECTRUM_BANDS: usize = SPECTRUM_BAND_COUNT;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(5);
 const SPECTRUM_SNAPSHOT_RADIUS_SECS: f64 = 1.0;
@@ -3562,28 +3562,25 @@ fn spectrum_axis_hz(rect: egui::Rect, x: f32) -> f32 {
     2.0_f32.powf(min.log2() + t * (max.log2() - min.log2()))
 }
 
-fn spectrum_band_hz(index: usize, total: usize) -> f32 {
-    if total <= 1 {
-        return SPECTRUM_ANALYSIS_MIN_HZ;
-    }
-    let ratio = SPECTRUM_VIEW_MAX_HZ / SPECTRUM_ANALYSIS_MIN_HZ;
-    let t = index as f32 / (total - 1) as f32;
-    SPECTRUM_ANALYSIS_MIN_HZ * ratio.powf(t)
-}
-
 fn spectrum_band_hz_range(index: usize, total: usize) -> (f32, f32) {
-    if total <= 1 {
+    let Some(midi) = spectrum_band_midi(index, total) else {
         let half = 2.0_f32.powf(1.0 / 24.0);
         return (
             SPECTRUM_ANALYSIS_MIN_HZ / half,
             SPECTRUM_ANALYSIS_MIN_HZ * half,
         );
+    };
+    let center = midi_to_hz(midi);
+    let half_step = 2.0_f32.powf(1.0 / 24.0);
+    (center / half_step, center * half_step)
+}
+
+fn spectrum_band_midi(index: usize, total: usize) -> Option<u8> {
+    if total == 0 || index >= total {
+        return None;
     }
-    let center = spectrum_band_hz(index, total);
-    let ratio = SPECTRUM_VIEW_MAX_HZ / SPECTRUM_ANALYSIS_MIN_HZ;
-    let step = ratio.powf(1.0 / (total - 1) as f32);
-    let edge_scale = step.sqrt();
-    (center / edge_scale, center * edge_scale)
+    let midi = SPECTRUM_BAND_MIN_MIDI as usize + index;
+    (midi <= SPECTRUM_BAND_MAX_MIDI as usize).then_some(midi as u8)
 }
 
 fn midi_to_hz(midi: u8) -> f32 {

@@ -1,4 +1,4 @@
-//! 音楽ビュー下段の 108-band spectrum アナライザ + ピッチ鍵盤描画 (Inc 4)。
+//! 音楽ビュー下段の MIDI-semitone spectrum アナライザ + ピッチ鍵盤描画 (Inc 4)。
 //!
 //! ラボ (`tools/music_lab`) の `draw_spectrum` / `draw_pitch_keyboard` + spectrum worker を
 //! 本体へ移植したもの。設計はラボと同じ:
@@ -22,12 +22,13 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use music_core::{
-    SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
+    SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MAX_MIDI,
+    SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
 };
 
 // ── レイアウト・解析定数 (ラボと同値) ──
-/// スペクトラムのバンド数 (108 = 20Hz〜18kHz を約 1 半音幅で刻む)。
-const SPECTRUM_BANDS: usize = 108;
+/// スペクトラムのバンド数 (E0-C#10、MIDI 半音ごと)。
+const SPECTRUM_BANDS: usize = SPECTRUM_BAND_COUNT;
 /// 下段ピッチ鍵盤の高さ (px)。
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 /// スペクトラムプロットと鍵盤の間の余白 (px)。
@@ -778,28 +779,30 @@ fn spectrum_axis_hz(rect: egui::Rect, x: f32) -> f32 {
     2.0_f32.powf(min.log2() + t * (max.log2() - min.log2()))
 }
 
+#[cfg(test)]
 fn spectrum_band_hz(index: usize, total: usize) -> f32 {
-    if total <= 1 {
-        return SPECTRUM_ANALYSIS_MIN_HZ;
-    }
-    let ratio = SPECTRUM_VIEW_MAX_HZ / SPECTRUM_ANALYSIS_MIN_HZ;
-    let t = index as f32 / (total - 1) as f32;
-    SPECTRUM_ANALYSIS_MIN_HZ * ratio.powf(t)
+    spectrum_band_midi(index, total).map_or(SPECTRUM_ANALYSIS_MIN_HZ, midi_to_hz)
 }
 
 fn spectrum_band_hz_range(index: usize, total: usize) -> (f32, f32) {
-    if total <= 1 {
+    let Some(midi) = spectrum_band_midi(index, total) else {
         let half = 2.0_f32.powf(1.0 / 24.0);
         return (
             SPECTRUM_ANALYSIS_MIN_HZ / half,
             SPECTRUM_ANALYSIS_MIN_HZ * half,
         );
+    };
+    let center = midi_to_hz(midi);
+    let half_step = 2.0_f32.powf(1.0 / 24.0);
+    (center / half_step, center * half_step)
+}
+
+fn spectrum_band_midi(index: usize, total: usize) -> Option<u8> {
+    if total == 0 || index >= total {
+        return None;
     }
-    let center = spectrum_band_hz(index, total);
-    let ratio = SPECTRUM_VIEW_MAX_HZ / SPECTRUM_ANALYSIS_MIN_HZ;
-    let step = ratio.powf(1.0 / (total - 1) as f32);
-    let edge_scale = step.sqrt();
-    (center / edge_scale, center * edge_scale)
+    let midi = SPECTRUM_BAND_MIN_MIDI as usize + index;
+    (midi <= SPECTRUM_BAND_MAX_MIDI as usize).then_some(midi as u8)
 }
 
 fn midi_to_hz(midi: u8) -> f32 {
@@ -963,16 +966,20 @@ mod tests {
         let (lo_last, hi_last) = spectrum_band_hz_range(SPECTRUM_BANDS - 1, SPECTRUM_BANDS);
         assert!(lo0 < hi0);
         assert!(lo_last < hi_last);
-        // 低域は 20Hz 付近、高域は 18kHz 付近。
+        // 低域は E0 の下端 (20Hz 付近)、高域は C#10 の上端 (18kHz 付近)。
         assert!(lo0 < 25.0);
         assert!(hi_last > 15_000.0);
-        // バンド中心は単調増加。
+        // バンド中心は MIDI 半音ごとに単調増加。
         let mut prev = 0.0;
         for i in 0..SPECTRUM_BANDS {
             let center = spectrum_band_hz(i, SPECTRUM_BANDS);
             assert!(center > prev);
             prev = center;
         }
+        assert!(
+            (spectrum_band_hz(69 - SPECTRUM_BAND_MIN_MIDI as usize, SPECTRUM_BANDS) - 440.0).abs()
+                < 0.01
+        );
     }
 
     #[test]

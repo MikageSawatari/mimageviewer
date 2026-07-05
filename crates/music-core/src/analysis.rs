@@ -7,6 +7,12 @@ use crate::beat::BeatGrid;
 
 pub const SPECTRUM_NOTE_MIN_MIDI: u8 = 21;
 pub const SPECTRUM_NOTE_MAX_MIDI: u8 = 108;
+pub const SPECTRUM_NOTE_BANDS: usize =
+    (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+pub const SPECTRUM_BAND_MIN_MIDI: u8 = 16; // E0, the first semitone band above 20Hz.
+pub const SPECTRUM_BAND_MAX_MIDI: u8 = 133; // C#10, whose upper edge covers 18kHz.
+pub const SPECTRUM_BAND_COUNT: usize =
+    (SPECTRUM_BAND_MAX_MIDI - SPECTRUM_BAND_MIN_MIDI + 1) as usize;
 pub const TIMELINE_ANALYSIS_VERSION: u32 = 1;
 const SPECTRUM_MIN_HZ: f32 = 20.0;
 const SPECTRUM_DISPLAY_MAX_HZ: f32 = 18_000.0;
@@ -37,12 +43,12 @@ const MULTI_RES_WINDOWS: [MultiResolutionWindowSpec; 5] = [
     },
     MultiResolutionWindowSpec {
         size: 16_384,
-        upper_hz: 250.0,
+        upper_hz: 1_000.0,
         refresh_secs: 0.018,
     },
     MultiResolutionWindowSpec {
         size: 8_192,
-        upper_hz: 1_000.0,
+        upper_hz: 2_000.0,
         refresh_secs: 0.010,
     },
     MultiResolutionWindowSpec {
@@ -474,44 +480,37 @@ impl SpectrumAnalyzer {
         if sample_rate == 0 || frame_count == 0 {
             return SpectrumAnalysis {
                 bands: vec![0.0; bands],
-                notes: vec![0.0; (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize],
+                notes: vec![0.0; SPECTRUM_NOTE_BANDS],
                 note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
             };
         }
 
         self.update_windows(stereo_samples, sample_rate, center_secs);
         let max_hz = spectrum_max_hz(sample_rate);
-        let ratio = max_hz / SPECTRUM_MIN_HZ;
-        let step = if bands <= 1 {
-            2.0_f32.powf(1.0 / 12.0)
-        } else {
-            ratio.powf(1.0 / (bands - 1) as f32)
-        };
-        let edge_scale = step.sqrt();
 
         let mut values = Vec::with_capacity(bands);
         for band in 0..bands {
-            let t = if bands == 1 {
-                0.0
+            if let Some(midi) = spectrum_band_midi(band, bands) {
+                let hz = midi_to_hz(midi);
+                let (low_hz, high_hz) = midi_note_hz_range(midi);
+                if high_hz < SPECTRUM_MIN_HZ || low_hz > max_hz {
+                    values.push(0.0);
+                } else {
+                    let power = self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz));
+                    values.push(power_to_display_value(
+                        power,
+                        spectrum_display_weight_db(hz),
+                    ));
+                }
             } else {
-                band as f32 / (bands - 1) as f32
-            };
-            let hz = SPECTRUM_MIN_HZ * ratio.powf(t);
-            let low_hz = (hz / edge_scale).max(SPECTRUM_MIN_HZ * 0.5);
-            let high_hz = (hz * edge_scale).min(max_hz);
-            let power = self.power_for_range(hz, low_hz, high_hz);
-            values.push(power_to_display_value(
-                power,
-                spectrum_display_weight_db(hz),
-            ));
+                values.push(0.0);
+            }
         }
 
-        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-        let mut notes = Vec::with_capacity(note_count);
+        let mut notes = Vec::with_capacity(SPECTRUM_NOTE_BANDS);
         for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
             let hz = midi_to_hz(midi);
-            let low_hz = hz / 2.0_f32.powf(1.0 / 24.0);
-            let high_hz = hz * 2.0_f32.powf(1.0 / 24.0);
+            let (low_hz, high_hz) = midi_note_hz_range(midi);
             if high_hz < SPECTRUM_MIN_HZ || low_hz > max_hz {
                 notes.push(0.0);
             } else {
@@ -715,10 +714,11 @@ fn range_power_from_fft(powers: &[f32], bin_hz: f32, low_hz: f32, high_hz: f32) 
     if powers.is_empty() || bin_hz <= 0.0 || high_hz <= low_hz {
         return 0.0;
     }
-    let start = ((low_hz / bin_hz).floor() as usize).max(1);
-    let end = ((high_hz / bin_hz).ceil() as usize).min(powers.len().saturating_sub(1));
+    let start = ((low_hz / bin_hz).ceil() as usize).max(1);
+    let end = ((high_hz / bin_hz).floor() as usize).min(powers.len().saturating_sub(1));
     if end < start {
-        let idx = ((low_hz.max(0.0) / bin_hz).round() as usize).min(powers.len() - 1);
+        let center_hz = (low_hz + high_hz) * 0.5;
+        let idx = ((center_hz.max(0.0) / bin_hz).round() as usize).min(powers.len() - 1);
         return powers[idx];
     }
     let slice = &powers[start..=end];
@@ -762,8 +762,22 @@ fn spectrum_max_hz(sample_rate: u32) -> f32 {
         .max(SPECTRUM_MIN_HZ * 1.2)
 }
 
+fn spectrum_band_midi(index: usize, total: usize) -> Option<u8> {
+    if total == 0 || index >= total {
+        return None;
+    }
+    let midi = SPECTRUM_BAND_MIN_MIDI as usize + index;
+    (midi <= SPECTRUM_BAND_MAX_MIDI as usize).then_some(midi as u8)
+}
+
 fn midi_to_hz(midi: u8) -> f32 {
     440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+fn midi_note_hz_range(midi: u8) -> (f32, f32) {
+    let hz = midi_to_hz(midi);
+    let half_step = 2.0_f32.powf(1.0 / 24.0);
+    (hz / half_step, hz * half_step)
 }
 
 fn one_pole_alpha(cut_hz: f32, sample_rate: u32) -> f32 {
@@ -1719,7 +1733,7 @@ mod tests {
     fn spectrum_window_returns_requested_band_count() {
         let mut samples = Vec::new();
         for i in 0..48_000 {
-            let phase = std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0;
+            let phase = std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0;
             let x = phase.sin() * 0.5;
             samples.extend([x, x]);
         }
@@ -1739,14 +1753,47 @@ mod tests {
             samples.extend([x, x]);
         }
 
-        let spectrum = spectrum_analysis_from_stereo_window(&samples, 48_000, 0.5, 108);
-        assert_eq!(spectrum.bands.len(), 108);
-        assert_eq!(
-            spectrum.notes.len(),
-            (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize
-        );
+        let spectrum =
+            spectrum_analysis_from_stereo_window(&samples, 48_000, 0.5, SPECTRUM_BAND_COUNT);
+        assert_eq!(spectrum.bands.len(), SPECTRUM_BAND_COUNT);
+        assert_eq!(spectrum.notes.len(), SPECTRUM_NOTE_BANDS);
         let a4 = (69 - spectrum.note_min_midi) as usize;
         assert!(spectrum.notes[a4] > 0.5);
+    }
+
+    #[test]
+    fn spectrum_bands_are_centered_on_midi_semitones() {
+        fn tone(midi: u8) -> Vec<f32> {
+            let hz = midi_to_hz(midi);
+            let mut samples = Vec::new();
+            for i in 0..96_000 {
+                let phase = std::f32::consts::TAU * hz * i as f32 / 48_000.0;
+                let x = phase.sin() * 0.6;
+                samples.extend([x, x]);
+            }
+            samples
+        }
+
+        for midi in [60_u8, 69, 81] {
+            let spectrum =
+                spectrum_analysis_from_stereo_window(&tone(midi), 48_000, 1.0, SPECTRUM_BAND_COUNT);
+            let band = (midi - SPECTRUM_BAND_MIN_MIDI) as usize;
+            let center = spectrum.bands[band];
+            let left = spectrum.bands[band - 1];
+            let right = spectrum.bands[band + 1];
+            assert!(
+                center > 0.5,
+                "midi {midi} center band should be visible, got {center}"
+            );
+            assert!(
+                center > left * 2.5,
+                "midi {midi} center {center} should dominate left {left}"
+            );
+            assert!(
+                center > right * 2.5,
+                "midi {midi} center {center} should dominate right {right}"
+            );
+        }
     }
 
     #[test]
@@ -1761,7 +1808,7 @@ mod tests {
             samples
         }
 
-        let mut analyzer = SpectrumAnalyzer::new(108);
+        let mut analyzer = SpectrumAnalyzer::new(SPECTRUM_BAND_COUNT);
         let a4_tone = analyzer.analyze_moving_window(&tone(440.0), 48_000, 1.0);
         let a5_tone = analyzer.analyze_moving_window(&tone(880.0), 48_000, 1.0);
         let a4 = (69 - a4_tone.note_min_midi) as usize;

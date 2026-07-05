@@ -19580,7 +19580,7 @@ impl App {
         let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(rect.width());
         let content_gutter = (edge_trigger + rect.width() * 0.03).max(8.0);
 
-        // 中央領域の下端に 108-band spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
+        // 中央領域の下端に MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
         // 潰さないよう、帯高は「タイムライン領域を最低 MIN 残す」制約で伸縮させ、確保しても
         // MIN_H 未満になる極端に短い窓では spectrum を出さない (Codex Inc 4 P3)。
@@ -19834,7 +19834,7 @@ impl App {
             }
         }
 
-        // ── 下段 108-band spectrum + ピッチ鍵盤 (Inc 4)。──
+        // ── 下段 MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4)。──
         // 再生位置周辺 ±1 秒の PCM をワーカーで FFT して描く。PCM 未着 (デコード中) の間は
         // 空バンド = 鍵盤ベースラインのみ。Arc は clone で借用衝突を避ける。
         // 縦窓が極端に短く帯を確保できない場合 (show_spectrum=false) は worker を回さず描かない。

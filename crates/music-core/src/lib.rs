@@ -11,8 +11,9 @@ pub mod playback;
 pub mod timeline;
 
 pub use analysis::{
-    AnalysisConfig, AudioStreamInfo, DecodedAudio, SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI,
-    SpectrumAnalysis, SpectrumAnalyzer, TIMELINE_ANALYSIS_VERSION, TimelineAnalysis, WaveformBin,
+    AnalysisConfig, AudioStreamInfo, DecodedAudio, SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI,
+    SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis,
+    SpectrumAnalyzer, TIMELINE_ANALYSIS_VERSION, TimelineAnalysis, WaveformBin,
     analyze_stereo_timeline, resample_linear_stereo, spectrum_analysis_from_stereo_window,
     spectrum_bands_from_stereo_window,
 };
