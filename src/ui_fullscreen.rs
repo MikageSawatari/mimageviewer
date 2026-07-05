@@ -3594,7 +3594,6 @@ impl App {
                 self.detached_image_windows.len(),
                 self.active_detached_viewer_context_present()
             ));
-            self.suppress_detached_image_window_focus_activation("pending_passive_close");
             crate::dwm_transitions::disable_transitions_for_thread_windows();
         }
         for id in pending_close_ids {
@@ -3644,8 +3643,6 @@ impl App {
         let mut focus_updates = Vec::new();
         let mut initial_placement_applied_ids = Vec::new();
         let mut placement_seed_reset_ids = Vec::new();
-        let focus_activation_suppressed =
-            self.detached_image_window_focus_activation_suppressed(std::time::Instant::now());
 
         for window in windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
@@ -3769,8 +3766,7 @@ impl App {
                 .find(|candidate| candidate.id == window.id)
                 .is_some_and(|candidate| candidate.has_paused_bundle());
             let focus_activation_raw = focused_now && !window.focused_last_frame;
-            let focus_activation = focus_activation_raw && !focus_activation_suppressed;
-            let user_activation = pointer_activation && !focus_activation_suppressed;
+            let user_activation = pointer_activation;
             let focus_edge = focused_now != window.focused_last_frame;
             if (viewport_close_requested
                 || bar_close_requested
@@ -3785,7 +3781,7 @@ impl App {
                 crate::logger::log(format!(
                     "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
                      pin_toggle={} focused={} focused_prev={} focus_edge={} \
-                     focus_suppressed={} pointer_activation={} scroll_candidate={} \
+                     focus_activation_candidate={} pointer_activation={} scroll_candidate={} \
                      key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
                      armed={} pinned={} has_bundle={} has_descriptor={} has_stamp={}",
                     window.id,
@@ -3795,7 +3791,7 @@ impl App {
                     focused_now,
                     window.focused_last_frame,
                     focus_edge,
-                    focus_activation_suppressed,
+                    focus_activation_raw,
                     pointer_activation,
                     scroll_activation_candidate,
                     key_activation_candidate,
@@ -3823,44 +3819,14 @@ impl App {
                     window.placement
                 ));
             }
-            if can_activate
-                && window.activation_armed
-                && focus_activation_raw
-                && focus_activation_suppressed
-            {
+            if Self::detached_passive_window_should_activate(
+                can_activate,
+                window.activation_armed,
+                user_activation,
+            ) {
                 self.log_detached_image_window_debug(format!(
-                    "passive_focus_activation_suppressed id={} passive_windows={} \
-                     active_context={}",
+                    "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
                     window.id,
-                    self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
-                ));
-            }
-            if can_activate
-                && window.activation_armed
-                && focus_activation_suppressed
-                && (pointer_activation
-                    || scroll_activation_candidate
-                    || key_activation_candidate
-                    || wheel_activation_candidate)
-            {
-                self.log_detached_image_window_debug(format!(
-                    "passive_user_activation_suppressed id={} pointer={} scroll={} key={} \
-                     wheel={} passive_windows={} active_context={}",
-                    window.id,
-                    pointer_activation,
-                    scroll_activation_candidate,
-                    key_activation_candidate,
-                    wheel_activation_candidate,
-                    self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
-                ));
-            }
-            if can_activate && window.activation_armed && (focus_activation || user_activation) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_queued id={} via={} passive_windows={} active_context={}",
-                    window.id,
-                    if focus_activation { "focus" } else { "pointer" },
                     self.detached_image_windows.len(),
                     self.active_detached_viewer_context_present()
                 ));
@@ -3945,7 +3911,6 @@ impl App {
                  passive_before={} activate_ids={activate_ids:?}",
                 self.detached_image_windows.len()
             ));
-            self.suppress_detached_image_window_focus_activation("passive_close");
             if !close_command_ids.is_empty() {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
             }

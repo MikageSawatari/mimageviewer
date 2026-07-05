@@ -16424,6 +16424,77 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_hwnd_unclaimed_adopts_single_unregistered_egui_window() {
+        let mut registry = DetachedWindowHwndRegistry::default();
+        registry.set(7, 0x700);
+        registry.set(8, 0x800);
+        registry.set_live_hwnds_for_test([0x800]);
+        assert_eq!(registry.clear_if_dead(7), Some(0x700));
+
+        let after = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x800, false, "Window Class"),
+            thread_window_entry(0x900, false, "Window Class"),
+        ];
+        let claimed = registry.registered_hwnds();
+
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_unclaimed_hwnd(&after, &claimed),
+            DetachedWindowHwndDiff::Created(0x900)
+        );
+    }
+
+    #[test]
+    fn detached_hwnd_unclaimed_retries_on_zero_or_multiple_unregistered_egui_windows() {
+        let mut claimed = std::collections::HashSet::new();
+        claimed.insert(0x800);
+        let none = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x800, false, "Window Class"),
+        ];
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_unclaimed_hwnd(&none, &claimed),
+            DetachedWindowHwndDiff::NoChange
+        );
+
+        let ambiguous = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x900, false, "Window Class"),
+            thread_window_entry(0xa00, false, "Window Class"),
+            thread_window_entry(0xb00, false, "Other Class"),
+        ];
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_unclaimed_hwnd(&ambiguous, &claimed),
+            DetachedWindowHwndDiff::Ambiguous(vec![0x900, 0xa00])
+        );
+    }
+
+    #[test]
+    fn passive_focus_edge_without_pointer_does_not_activate() {
+        let focus_edge = true;
+        let pointer_activation = false;
+        assert!(focus_edge, "test models a focused_now edge");
+        assert!(!App::detached_passive_window_should_activate(
+            true,
+            true,
+            pointer_activation
+        ));
+    }
+
+    #[test]
+    fn passive_pointer_click_queues_activation() {
+        assert!(App::detached_passive_window_should_activate(
+            true, true, true
+        ));
+        assert!(!App::detached_passive_window_should_activate(
+            false, true, true
+        ));
+        assert!(!App::detached_passive_window_should_activate(
+            true, false, true
+        ));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn f12_on_audio_is_noop_not_misleading_toggle() {
         // 音声ファイルは egui music view (live 描画) を別 viewport で回すと wgpu クラッシュするため
@@ -20159,16 +20230,6 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.main_font_atlas_resync_reason,
             Some(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)
-        );
-        assert!(
-            app.detached_image_window_focus_activation_suppressed(std::time::Instant::now()),
-            "OS focus handoff after close must not immediately reactivate another detached window"
-        );
-        assert!(
-            !app.detached_image_window_focus_activation_suppressed(
-                std::time::Instant::now() + std::time::Duration::from_secs(1)
-            ),
-            "the focus handoff guard is only a short close-time grace"
         );
     }
 

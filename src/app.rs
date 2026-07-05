@@ -312,6 +312,14 @@ impl DetachedWindowHwndRegistry {
         self.hwnd_by_window_id.insert(window_id, hwnd)
     }
 
+    fn registered_hwnds(&self) -> std::collections::HashSet<u64> {
+        self.hwnd_by_window_id
+            .values()
+            .copied()
+            .filter(|hwnd| *hwnd != 0)
+            .collect()
+    }
+
     fn select_created_hwnd(
         before: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
         after: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
@@ -331,6 +339,28 @@ impl DetachedWindowHwndRegistry {
             [hwnd] => DetachedWindowHwndDiff::Created(*hwnd),
             [] => DetachedWindowHwndDiff::NoChange,
             _ => DetachedWindowHwndDiff::Ambiguous(created),
+        }
+    }
+
+    fn select_unclaimed_hwnd(
+        after: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
+        claimed: &std::collections::HashSet<u64>,
+    ) -> DetachedWindowHwndDiff {
+        let mut unclaimed = after
+            .iter()
+            .filter(|entry| {
+                !entry.is_main
+                    && entry.class_name == Self::EGUI_VIEWPORT_CLASS
+                    && !claimed.contains(&entry.hwnd_raw)
+            })
+            .map(|entry| entry.hwnd_raw)
+            .collect::<Vec<_>>();
+        unclaimed.sort_unstable();
+        unclaimed.dedup();
+        match unclaimed.as_slice() {
+            [hwnd] => DetachedWindowHwndDiff::Created(*hwnd),
+            [] => DetachedWindowHwndDiff::NoChange,
+            _ => DetachedWindowHwndDiff::Ambiguous(unclaimed),
         }
     }
 
@@ -3840,10 +3870,6 @@ pub struct App {
     /// 次の描画フレームで該当 viewport へ明示 close を送るためのキュー。
     #[cfg(windows)]
     pub(crate) detached_image_window_close_pending: Vec<u64>,
-    /// detached window close 直後に OS が残り窓へ自動フォーカスを渡すことがある。
-    /// そのフォーカス遷移を「ユーザーが passive 窓を選んだ」と誤認しないための短い抑止。
-    #[cfg(windows)]
-    detached_image_window_focus_activation_suppress_until: Option<std::time::Instant>,
     #[cfg(windows)]
     pub(crate) next_detached_image_window_id: u64,
     /// 直近にアクティブだった detached ウィンドウの window_id。`detached_viewer_window_id`
@@ -6883,8 +6909,6 @@ impl App {
             detached_viewer_main_history_suppression_depth: 0,
             #[cfg(windows)]
             detached_image_window_close_pending: Vec::new(),
-            #[cfg(windows)]
-            detached_image_window_focus_activation_suppress_until: None,
             #[cfg(windows)]
             next_detached_image_window_id: 1,
             #[cfg(windows)]
@@ -23734,6 +23758,7 @@ impl App {
         before: Option<&[crate::dwm_transitions::ThreadWindowSnapshotEntry]>,
     ) {
         let Some(before) = before else {
+            self.recover_detached_window_hwnd_after_skipped_snapshot(window_id, label, viewport_id);
             return;
         };
         let Some(main_hwnd) = self.main_hwnd else {
@@ -23782,6 +23807,87 @@ impl App {
                     self.frame_counter,
                     before.len(),
                     after.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn recover_detached_window_hwnd_after_skipped_snapshot(
+        &mut self,
+        window_id: u64,
+        label: &'static str,
+        viewport_id: egui::ViewportId,
+    ) {
+        let Some(previous_hwnd) = self.detached_window_hwnd_registry.get_raw(window_id) else {
+            return;
+        };
+        if self
+            .detached_window_hwnd_registry
+            .hwnd_is_alive(previous_hwnd)
+        {
+            return;
+        }
+        self.detached_window_hwnd_registry.clear(window_id);
+        self.log_detached_image_window_debug(format!(
+            "detached_hwnd_dead_after_show window_id={window_id} hwnd=0x{previous_hwnd:x} \
+             label={label} viewport={viewport_id:?}"
+        ));
+        if self.detached_video_presentation_active_or_targeted() {
+            self.pending_detached_video_host_resync = true;
+        }
+
+        let Some(main_hwnd) = self.main_hwnd else {
+            self.log_detached_image_window_debug(format!(
+                "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
+                 viewport={viewport_id:?} reason=no_main_hwnd old=0x{previous_hwnd:x} host={}",
+                self.frame_counter,
+                self.detached_viewer_host_debug_state()
+            ));
+            return;
+        };
+        let after = crate::dwm_transitions::thread_window_snapshot(
+            windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+        );
+        let claimed = self.detached_window_hwnd_registry.registered_hwnds();
+        match DetachedWindowHwndRegistry::select_unclaimed_hwnd(&after, &claimed) {
+            DetachedWindowHwndDiff::Created(hwnd) => {
+                self.detached_window_hwnd_registry.set(window_id, hwnd);
+                self.detached_viewer_host_generation =
+                    self.detached_viewer_host_generation.saturating_add(1);
+                crate::logger::log(format!(
+                    "[detached-viewer] hwnd_adopted_unclaimed hwnd=0x{hwnd:x} \
+                     host_generation={} frame={} window_id={window_id} label={label} \
+                     viewport={viewport_id:?} old=0x{previous_hwnd:x} new_state=\"{}\"",
+                    self.detached_viewer_host_generation,
+                    self.frame_counter,
+                    Self::win32_hwnd_debug_state(hwnd)
+                ));
+                if self.pending_detached_video_host_resync {
+                    self.pending_detached_video_host_resync =
+                        !self.try_resync_detached_video_host();
+                }
+            }
+            DetachedWindowHwndDiff::NoChange => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
+                     viewport={viewport_id:?} reason=no_unclaimed old=0x{previous_hwnd:x} \
+                     after_count={} claimed_count={} host={}",
+                    self.frame_counter,
+                    after.len(),
+                    claimed.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+            }
+            DetachedWindowHwndDiff::Ambiguous(candidates) => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
+                     viewport={viewport_id:?} reason=ambiguous candidates={candidates:x?} \
+                     old=0x{previous_hwnd:x} after_count={} claimed_count={} host={}",
+                    self.frame_counter,
+                    after.len(),
+                    claimed.len(),
                     self.detached_viewer_host_debug_state()
                 ));
             }
@@ -23882,34 +23988,12 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn suppress_detached_image_window_focus_activation(&mut self, reason: &'static str) {
-        self.detached_image_window_focus_activation_suppress_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
-        self.log_detached_image_window_debug(format!(
-            "focus_activation_suppress reason={reason} passive_windows={} active_context={} \
-             fs_idx={:?} shown={} presentation={:?}",
-            self.detached_image_windows.len(),
-            self.active_detached_viewer_context.is_some(),
-            self.fullscreen_idx,
-            self.fs_viewport_shown,
-            self.fs_viewport_presentation
-        ));
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_image_window_focus_activation_suppressed(
-        &mut self,
-        now: std::time::Instant,
+    pub(crate) fn detached_passive_window_should_activate(
+        can_activate: bool,
+        activation_armed: bool,
+        pointer_activation: bool,
     ) -> bool {
-        let Some(until) = self.detached_image_window_focus_activation_suppress_until else {
-            return false;
-        };
-        if now < until {
-            true
-        } else {
-            self.detached_image_window_focus_activation_suppress_until = None;
-            false
-        }
+        can_activate && activation_armed && pointer_activation
     }
 
     #[cfg(windows)]
@@ -24029,7 +24113,6 @@ impl App {
             self.detached_image_windows.len(),
             self.detached_viewer_host_debug_state()
         ));
-        self.suppress_detached_image_window_focus_activation("active_close_finalize");
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
         self.fs_viewport_shown = false;

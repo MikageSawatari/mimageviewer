@@ -121,7 +121,7 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 | ④ | 連動なし窓がある状態でメインから**別画像を明示 open**（Enter/ダブルクリック） | 連動なし窓 → **Passive・連動なし**（背景処理停止・frozen/paused bundle 保持）。新窓は通常モードでは **Active・連動**、`detached_viewer_open_images_in_window` ON では **Active・連動なし**（②と同じ） |
 | ⑤ | ピン解除 | **無し（ピンは一方通行）**。連動なし窓は × で閉じるだけ。ピンボタンは押下後は解除アフォーダンスを出さない |
 | ⑥ | メインで BS / Ctrl+↑↓（フォルダ移動） | メイン bundle（と Active・連動窓）だけ移動。**Active・連動なし窓 / Passive 窓は一切不変・非クローズ** |
-| ⑦ | Passive 窓をクリック / フォーカスして Active 化 | 現 Active は **その時点の属性の Passive** へ落ちる（Active・連動 → Passive・連動、Active・連動なし → Passive・連動なし）。クリックした窓は保持属性の Active として復帰する。**Active 切替だけで既存窓を閉じない。** |
+| ⑦ | Passive 窓をクリックして Active 化 | 現 Active は **その時点の属性の Passive** へ落ちる（Active・連動 → Passive・連動、Active・連動なし → Passive・連動なし）。クリックした窓は保持属性の Active として復帰する。**Active 切替だけで既存窓を閉じない。** フォーカス到着だけ（Alt+Tab / OS の自動フォーカス移譲）は表示状態の更新に留め、Active 化しない（2026-07-05 focus ping-pong 対策）。 |
 
 補足:
 - ④ で Passive 化した窓をクリックすると再び Active 化する（`activate_detached_image_window_snapshot`）。
