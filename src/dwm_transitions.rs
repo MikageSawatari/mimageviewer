@@ -117,19 +117,9 @@ pub fn move_window_to_desktop_of(owner_hwnd: HWND, target_hwnd: HWND) -> Result<
 }
 
 pub fn find_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {
-    find_visible_thread_window_matching_rect_excluding(main_hwnd, expected, &[])
-}
-
-pub fn find_visible_thread_window_matching_rect_excluding(
-    main_hwnd: HWND,
-    expected: RECT,
-    excluded_hwnds: &[u64],
-) -> Option<HWND> {
     let mut state = RaiseWindowState {
         main_hwnd,
         expected,
-        excluded_hwnds: excluded_hwnds.as_ptr(),
-        excluded_hwnds_len: excluded_hwnds.len(),
         best_hwnd: HWND::default(),
         best_score: i64::MAX,
     };
@@ -169,13 +159,9 @@ pub fn debug_thread_windows_for_rect(main_hwnd: HWND, expected: RECT, limit: usi
         .join("; ")
 }
 
-/// Stage R0 diagnostic: snapshot all top-level windows owned by the current UI
-/// thread without using geometry matching. The caller compares two snapshots
-/// around `show_viewport_immediate` to see whether a child viewport HWND is
-/// created synchronously in that call.
-///
-/// This is debug-only infrastructure. It must not become an ownership source
-/// for detached HWNDs before R1 replaces the rect-capture path.
+/// Snapshot all top-level windows owned by the current UI thread without using
+/// geometry matching. Detached viewport ownership uses before/after diffs of
+/// this snapshot around `show_viewport_immediate`.
 #[derive(Clone, Debug)]
 pub struct ThreadWindowSnapshotEntry {
     pub hwnd_raw: u64,
@@ -214,7 +200,7 @@ impl ThreadWindowSnapshotEntry {
     }
 }
 
-pub fn debug_thread_window_snapshot(main_hwnd: HWND) -> Vec<ThreadWindowSnapshotEntry> {
+pub fn thread_window_snapshot(main_hwnd: HWND) -> Vec<ThreadWindowSnapshotEntry> {
     let mut state = ThreadWindowSnapshotState {
         main_hwnd,
         entries: Vec::new(),
@@ -224,7 +210,7 @@ pub fn debug_thread_window_snapshot(main_hwnd: HWND) -> Vec<ThreadWindowSnapshot
         let state_ptr = &mut state as *mut ThreadWindowSnapshotState;
         let _ = EnumThreadWindows(
             tid,
-            Some(debug_thread_window_snapshot_enum_proc),
+            Some(thread_window_snapshot_enum_proc),
             LPARAM(state_ptr as isize),
         );
     }
@@ -275,8 +261,6 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
 struct RaiseWindowState {
     main_hwnd: HWND,
     expected: RECT,
-    excluded_hwnds: *const u64,
-    excluded_hwnds_len: usize,
     best_hwnd: HWND,
     best_score: i64,
 }
@@ -331,10 +315,7 @@ impl DebugWindowEntry {
     }
 }
 
-unsafe extern "system" fn debug_thread_window_snapshot_enum_proc(
-    hwnd: HWND,
-    lparam: LPARAM,
-) -> BOOL {
+unsafe extern "system" fn thread_window_snapshot_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut ThreadWindowSnapshotState) };
     let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
     let iconic = unsafe { IsIconic(hwnd).as_bool() };
@@ -373,15 +354,7 @@ fn window_text(hwnd: HWND) -> String {
 
 unsafe extern "system" fn raise_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = unsafe { &mut *(lparam.0 as *mut RaiseWindowState) };
-    let hwnd_raw = hwnd.0 as usize as u64;
-    let excluded = if state.excluded_hwnds.is_null() || state.excluded_hwnds_len == 0 {
-        false
-    } else {
-        let excluded_hwnds =
-            unsafe { std::slice::from_raw_parts(state.excluded_hwnds, state.excluded_hwnds_len) };
-        excluded_hwnds.contains(&hwnd_raw)
-    };
-    if hwnd.0 == state.main_hwnd.0 || excluded || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+    if hwnd.0 == state.main_hwnd.0 || !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return BOOL(1);
     }
 

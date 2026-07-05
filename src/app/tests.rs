@@ -16305,6 +16305,124 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
+        app.detached_viewer_window_id = Some(window_id);
+        app.detached_window_hwnd_registry.set(window_id, hwnd);
+        let live_hwnds = if live { vec![hwnd] } else { Vec::new() };
+        app.detached_window_hwnd_registry
+            .set_live_hwnds_for_test(live_hwnds);
+    }
+
+    fn thread_window_entry(
+        hwnd_raw: u64,
+        is_main: bool,
+        class_name: &str,
+    ) -> crate::dwm_transitions::ThreadWindowSnapshotEntry {
+        crate::dwm_transitions::ThreadWindowSnapshotEntry {
+            hwnd_raw,
+            is_main,
+            visible: true,
+            iconic: false,
+            rect_ok: true,
+            rect: windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: 800,
+                bottom: 600,
+            },
+            class_name: class_name.to_string(),
+            title: String::new(),
+        }
+    }
+
+    #[test]
+    fn detached_hwnd_diff_accepts_single_created_egui_window() {
+        let before = vec![thread_window_entry(0x10, true, "Window Class")];
+        let after = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x20, false, "Window Class"),
+        ];
+
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_created_hwnd(&before, &after),
+            DetachedWindowHwndDiff::Created(0x20)
+        );
+    }
+
+    #[test]
+    fn detached_hwnd_diff_retries_on_no_change_or_ambiguous_created_windows() {
+        let before = vec![thread_window_entry(0x10, true, "Window Class")];
+        let no_change = before.clone();
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_created_hwnd(&before, &no_change),
+            DetachedWindowHwndDiff::NoChange
+        );
+
+        let ambiguous = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x20, false, "Window Class"),
+            thread_window_entry(0x30, false, "Window Class"),
+        ];
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_created_hwnd(&before, &ambiguous),
+            DetachedWindowHwndDiff::Ambiguous(vec![0x20, 0x30])
+        );
+
+        let wrong_class = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x40, false, "Other Class"),
+        ];
+        assert_eq!(
+            DetachedWindowHwndRegistry::select_created_hwnd(&before, &wrong_class),
+            DetachedWindowHwndDiff::NoChange
+        );
+    }
+
+    #[test]
+    fn detached_hwnd_registry_clears_dead_hwnd_and_retries_generation_diff() {
+        let mut registry = DetachedWindowHwndRegistry::default();
+        registry.set(7, 0x700);
+        registry.set_live_hwnds_for_test([0x700]);
+        assert_eq!(registry.hwnd_alive(7), Some(0x700));
+
+        registry.set_live_hwnds_for_test(Vec::<u64>::new());
+        assert_eq!(registry.hwnd_alive(7), None);
+        assert_eq!(registry.clear_if_dead(7), Some(0x700));
+        assert_eq!(registry.get_raw(7), None);
+    }
+
+    #[test]
+    fn detached_hwnd_snapshot_is_skipped_while_registered_hwnd_is_alive() {
+        let mut app = setup_app();
+        set_detached_host_for_test(&mut app, 12, 0x1200, true);
+        app.main_hwnd = None;
+
+        assert!(
+            app.detached_window_hwnd_snapshot_before_show(
+                12,
+                "test",
+                App::detached_image_window_viewport_id(12),
+            )
+            .is_none(),
+            "live registry entries must avoid per-frame thread-window snapshots"
+        );
+    }
+
+    #[test]
+    fn detached_hwnd_registry_is_shared_by_active_and_passive_window_id() {
+        let mut app = setup_app();
+        set_detached_host_for_test(&mut app, 42, 0x4200, true);
+        app.begin_active_detached_session(42, DetachedSource::Image);
+        assert_eq!(app.detached_viewer_host_hwnd_alive(), Some(0x4200));
+
+        app.finish_active_detached_session_close("test");
+        app.detached_viewer_window_id = None;
+        assert_eq!(
+            app.detached_window_hwnd_alive_for_window_id(42),
+            Some(0x4200)
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn f12_on_audio_is_noop_not_misleading_toggle() {
@@ -17967,7 +18085,6 @@ mod still_window_mode_key_tests {
                 activation_armed: false,
                 focused_last_frame: false,
                 initial_placement_applied: false,
-                passive_host_hwnd: 0,
                 paused_bundle: None,
             });
         app.selected = Some(first);
@@ -17980,88 +18097,6 @@ mod still_window_mode_key_tests {
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(app.detached_viewer_window_id, Some(1));
         assert!(app.detached_image_window_close_pending.is_empty());
-    }
-
-    #[test]
-    fn active_host_matching_passive_window_is_cleared_before_capture() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
-        let texture = ctx.load_texture(
-            "passive_host_collision",
-            pixels,
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 4,
-                texture,
-                title: "passive.jpg - mimageviewer".to_string(),
-                location_display: "passive.jpg".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: false,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                placement,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: None,
-                activation_armed: false,
-                focused_last_frame: false,
-                initial_placement_applied: false,
-                passive_host_hwnd: 0xc807da,
-                paused_bundle: None,
-            });
-        app.detached_viewer_host_hwnd = 0xc807da;
-        app.begin_active_detached_session(5, DetachedSource::Book);
-
-        assert!(app.clear_detached_viewer_host_if_matches_passive_window("test"));
-        assert_eq!(app.detached_viewer_host_hwnd, 0);
-        assert!(app.active_detached_session.is_some());
-    }
-
-    #[test]
-    fn closing_passive_window_clears_matching_active_host() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
-        let texture = ctx.load_texture(
-            "closing_passive_host_collision",
-            pixels,
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 4,
-                texture,
-                title: "passive.jpg - mimageviewer".to_string(),
-                location_display: "passive.jpg".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: false,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                placement,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: None,
-                activation_armed: false,
-                focused_last_frame: false,
-                initial_placement_applied: false,
-                passive_host_hwnd: 0xc807da,
-                paused_bundle: None,
-            });
-        app.detached_viewer_host_hwnd = 0xc807da;
-        app.begin_active_detached_session(5, DetachedSource::Book);
-
-        assert!(!app.clear_detached_viewer_host_if_closing_passive_window(&[99], "test"));
-        assert_eq!(app.detached_viewer_host_hwnd, 0xc807da);
-        assert!(app.clear_detached_viewer_host_if_closing_passive_window(&[4], "test"));
-        assert_eq!(app.detached_viewer_host_hwnd, 0);
-        assert!(app.active_detached_session.is_some());
     }
 
     #[test]
@@ -18476,7 +18511,6 @@ mod still_window_mode_key_tests {
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
-                passive_host_hwnd: 0,
                 paused_bundle: None,
             });
 
@@ -18576,7 +18610,6 @@ mod still_window_mode_key_tests {
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
-                passive_host_hwnd: 0,
                 paused_bundle: None,
             });
 
@@ -18684,7 +18717,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_generation = 202;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_host_hwnd = 0x1234;
+        set_detached_host_for_test(&mut app, 20, 0x1234, false);
         app.fs_viewport_recreate_after_hide = true;
         app.detached_viewer_recreate_on_next_render = true;
         insert_static_fs_entry(&mut app, &ctx, 0, "paused_book_b_page");
@@ -18709,8 +18742,9 @@ mod still_window_mode_key_tests {
             Some(ViewerPresentation::DetachedWindow)
         );
         assert_eq!(
-            app.detached_viewer_host_hwnd, 0,
-            "reactivation must not restore a stale HWND from the paused bundle"
+            app.detached_window_hwnd_raw_for_window_id(10),
+            0,
+            "reactivation must not restore a stale HWND into the target window registry entry"
         );
         assert!(
             !app.detached_viewer_host_lost(),
@@ -18790,7 +18824,6 @@ mod still_window_mode_key_tests {
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
-                passive_host_hwnd: 0,
                 paused_bundle: Some(Box::new(paused_bundle)),
             });
 
@@ -18899,7 +18932,6 @@ mod still_window_mode_key_tests {
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
-                passive_host_hwnd: 0,
                 paused_bundle: Some(Box::new(paused_bundle)),
             });
 
@@ -19143,7 +19175,6 @@ mod still_window_mode_key_tests {
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
-                passive_host_hwnd: 0,
                 paused_bundle: None,
             });
 
@@ -19278,7 +19309,7 @@ mod still_window_mode_key_tests {
         app.begin_active_detached_session(10, DetachedSource::Image);
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_host_hwnd = 0x1234;
+        set_detached_host_for_test(&mut app, 10, 0x1234, true);
 
         assert!(app.pause_current_active_detached_viewer_context(&ctx));
 
@@ -19304,7 +19335,11 @@ mod still_window_mode_key_tests {
             "active viewport runtime must be released without sending Visible(false)"
         );
         assert_eq!(app.fs_viewport_presentation, None);
-        assert_eq!(app.detached_viewer_host_hwnd, 0);
+        assert_eq!(
+            app.detached_window_hwnd_raw_for_window_id(10),
+            0x1234,
+            "active->passive handoff keeps the same OS window registered for the passive renderer"
+        );
     }
 
     #[test]
@@ -20100,7 +20135,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_viewport_recreate_after_hide = true;
-        app.detached_viewer_host_hwnd = 0x1234;
+        set_detached_host_for_test(&mut app, 42, 0x1234, true);
 
         app.finalize_closed_active_detached_viewport(
             &ctx,
@@ -20113,7 +20148,7 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.fs_viewport_presentation, None);
         assert!(!app.fs_viewport_recreate_after_hide);
-        assert_eq!(app.detached_viewer_host_hwnd, 0);
+        assert_eq!(app.detached_window_hwnd_raw_for_window_id(42), 0);
         assert!(!app.main_font_atlas_resync_pending);
         assert!(
             app.pending_detached_cleanup_font_atlas_resync,
@@ -20176,8 +20211,8 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.detached_viewer_host_hwnd = 0x1234;
         app.detached_viewer_window_id = Some(12);
+        set_detached_host_for_test(&mut app, 12, 0x1234, true);
         app.active_detached_viewer_live_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
                 x: 10.0,
@@ -20208,7 +20243,7 @@ mod still_window_mode_key_tests {
             app.fs_viewport_presentation,
             Some(ViewerPresentation::DetachedWindow)
         );
-        assert_eq!(app.detached_viewer_host_hwnd, 0x1234);
+        assert_eq!(app.detached_window_hwnd_raw_for_window_id(12), 0x1234);
         assert_eq!(app.detached_viewer_window_id, Some(12));
         assert_eq!(
             app.fullscreen_viewport_id(),
@@ -20299,13 +20334,14 @@ mod still_window_mode_key_tests {
         app.detached_viewer_window_id = Some(12);
         app.fs_viewport_generation = 7;
         // 解放済み等で IsWindow=false になる stale hwnd を模す。
-        app.detached_viewer_host_hwnd = 0x1234;
+        set_detached_host_for_test(&mut app, 12, 0x1234, false);
 
         let viewport_id_before = app.fullscreen_viewport_id();
         app.handle_detached_viewer_host_lost_before_render();
 
         assert_eq!(
-            app.detached_viewer_host_hwnd, 0,
+            app.detached_window_hwnd_raw_for_window_id(12),
+            0,
             "stale hwnd must be dropped so the next frame can recapture the live window"
         );
         assert_eq!(
@@ -20340,7 +20376,8 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
 
         // host 未捕捉 (== 0) = 新規生成相当 → 保存済みサイズで生成 (既定 822x656 で出さない)。
-        app.detached_viewer_host_hwnd = 0;
+        app.detached_viewer_window_id = Some(12);
+        app.detached_window_hwnd_registry.clear(12);
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert!(
             builder.inner_size.is_some(),
@@ -20349,7 +20386,7 @@ mod still_window_mode_key_tests {
 
         // host が stale (死んだ HWND を !=0 で指している) = egui が窓を再生成する →
         // 再生成された窓が既定サイズで一瞬出ないよう、seed し続ける (旧 `== 0` の取りこぼし修正)。
-        app.detached_viewer_host_hwnd = 0x1234;
+        set_detached_host_for_test(&mut app, 12, 0x1234, false);
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert!(
             builder.inner_size.is_some(),
@@ -20358,10 +20395,7 @@ mod still_window_mode_key_tests {
         );
 
         // host が生存している既存 window → geometry を触らない (Codex P2)。
-        // GetDesktopWindow は常に生存している実 HWND なので live host の代役に使う。
-        let live_hwnd =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow() }.0 as u64;
-        app.detached_viewer_host_hwnd = live_hwnd;
+        set_detached_host_for_test(&mut app, 12, 0x5678, true);
         let builder = app.build_inactive_fullscreen_viewport_builder(idx);
         assert_eq!(
             builder.inner_size, None,
@@ -20383,106 +20417,22 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
 
         // 未捕捉 (== 0) → seed。
-        app.detached_viewer_host_hwnd = 0;
+        app.detached_viewer_window_id = Some(12);
+        app.detached_window_hwnd_registry.clear(12);
         assert!(app.detached_viewer_should_seed_placement());
 
         // stale (死んだ HWND を !=0 で指したまま egui 再生成) → seed し続ける。
-        app.detached_viewer_host_hwnd = 0x1234;
+        set_detached_host_for_test(&mut app, 12, 0x1234, false);
         assert!(
             app.detached_viewer_should_seed_placement(),
             "a nonzero-but-dead host HWND must still seed so egui recreation uses the saved size"
         );
 
-        // 生存している既存窓 → seed しない。GetDesktopWindow は常に生存している実 HWND。
-        app.detached_viewer_host_hwnd =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow() }.0 as u64;
+        // 生存している既存窓 → seed しない。
+        set_detached_host_for_test(&mut app, 12, 0x5678, true);
         assert!(
             !app.detached_viewer_should_seed_placement(),
             "an alive captured host must not be force-resized (Codex P2)"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_capture_rect_rejects_default_viewport_last_line_of_defense() {
-        // capture の「最後の防波堤」: 既定サイズ (outer ~822x656 physical) の過渡窓は、
-        // 十分大きい保存配置から hard shrink したとき host として採用しない (Codex 実機 P1/P2)。
-        // 判定は self からではなく **save より前の previous** を明示的に渡す (汚染防止)。
-        let substantial = crate::settings::DetachedViewerWindowPlacement {
-            x: 209.0,
-            y: 409.0,
-            w: 1013.0,
-            h: 880.0,
-            maximized: false,
-        };
-
-        // 既定サイズ outer (548x437 論理 @ ppp1.5 = 822x655 physical) → 弾く。
-        let default_outer =
-            egui::Rect::from_min_size(egui::pos2(101.0, 101.0), egui::vec2(548.0, 437.0));
-        assert!(
-            App::detached_capture_rect_looks_like_default_viewport(
-                Some(substantial),
-                default_outer,
-                1.5
-            ),
-            "the transient egui default-size viewport must be refused as host"
-        );
-
-        // 本来の大きい配置 (1029x918 論理 = 1543x1377 physical) → 採用する。
-        let substantial_outer =
-            egui::Rect::from_min_size(egui::pos2(209.0, 273.0), egui::vec2(1029.0, 918.0));
-        assert!(
-            !App::detached_capture_rect_looks_like_default_viewport(
-                Some(substantial),
-                substantial_outer,
-                1.5
-            ),
-            "the real saved-size window must still be captured"
-        );
-
-        // 保存配置が無ければ判定材料が無いので弾かない (初回 detach 等)。
-        assert!(
-            !App::detached_capture_rect_looks_like_default_viewport(None, default_outer, 1.5),
-            "without a substantial previous placement, do not reject (user may use a small window)"
-        );
-
-        // ユーザーが元から小さい窓を使っている (previous が substantial でない) → 弾かない。
-        let small_previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 101.0,
-            y: 101.0,
-            w: 560.0,
-            h: 440.0,
-            maximized: false,
-        };
-        assert!(
-            !App::detached_capture_rect_looks_like_default_viewport(
-                Some(small_previous),
-                default_outer,
-                1.5
-            ),
-            "a genuinely small user window must not be refused"
-        );
-
-        // Codex P2: save が live/settings を default rect へ汚染しても、**save より前に**
-        // スナップショットした previous を渡せば防波堤は機能する。
-        let mut app = setup_app();
-        app.active_detached_viewer_live_placement = Some(substantial);
-        app.settings.detached_viewer_window_placement = Some(substantial);
-        let snapshot = app.detached_viewer_previous_placement_for_default_check();
-        assert_eq!(snapshot, Some(substantial));
-        // save が default で汚染したと仮定 (live/settings が default 小窓になった)。
-        let polluted = crate::settings::DetachedViewerWindowPlacement {
-            x: 101.0,
-            y: 101.0,
-            w: 365.0,
-            h: 291.0,
-            maximized: false,
-        };
-        app.active_detached_viewer_live_placement = Some(polluted);
-        app.settings.detached_viewer_window_placement = Some(polluted);
-        assert!(
-            App::detached_capture_rect_looks_like_default_viewport(snapshot, default_outer, 1.5),
-            "the pre-save snapshot must still reject the default window even after save pollution"
         );
     }
 

@@ -693,7 +693,8 @@ impl App {
             crate::logger::log(format!(
                 "[native-video] detached child (hwnd=0x{child_hwnd:x}) lost -> resync presenter \
                  child to current host=0x{:x} host_generation={}",
-                self.detached_viewer_host_hwnd, self.detached_viewer_host_generation
+                self.detached_viewer_host_hwnd_raw(),
+                self.detached_viewer_host_generation
             ));
         }
         queued

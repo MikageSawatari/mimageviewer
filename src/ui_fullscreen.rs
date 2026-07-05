@@ -3610,9 +3610,9 @@ impl App {
             for window in &self.detached_image_windows {
                 self.log_detached_image_window_debug(format!(
                     "passive_window_state frame={} id={} pinned={} can_activate={} \
-                     has_bundle={} has_descriptor={} has_stamp={} tex=({:.0}x{:.0}) \
-                     frozen_pages={} armed={} focused_last={} initial_placement={} \
-                     passive_hwnd=0x{:x} title={:?}",
+                 has_bundle={} has_descriptor={} has_stamp={} tex=({:.0}x{:.0}) \
+                 frozen_pages={} armed={} focused_last={} initial_placement={} \
+                 host={} title={:?}",
                     self.frame_counter,
                     window.id,
                     window.pinned,
@@ -3626,7 +3626,9 @@ impl App {
                     window.activation_armed,
                     window.focused_last_frame,
                     window.initial_placement_applied,
-                    window.passive_host_hwnd,
+                    self.detached_window_hwnd_alive_for_window_id(window.id)
+                        .map(|hwnd| Self::win32_hwnd_debug_state(hwnd))
+                        .unwrap_or_else(|| "none".to_string()),
                     window.title
                 ));
             }
@@ -3642,8 +3644,6 @@ impl App {
         let mut focus_updates = Vec::new();
         let mut initial_placement_applied_ids = Vec::new();
         let mut placement_seed_reset_ids = Vec::new();
-        let mut passive_host_updates = Vec::new();
-        let main_hwnd = self.main_hwnd;
         let focus_activation_suppressed =
             self.detached_image_window_focus_activation_suppressed(std::time::Instant::now());
 
@@ -3658,14 +3658,14 @@ impl App {
             let mut placement_update = None;
             let mut focused_now = false;
             let mut pixels_per_point = 1.0_f32;
-            let mut captured_passive_host_hwnd = 0_u64;
             let mut pointer_activation = false;
             let mut scroll_activation_candidate = false;
             let mut key_activation_candidate = false;
             let mut wheel_activation_candidate = false;
 
             #[cfg(windows)]
-            let r0_hwnd_before = self.r0_detached_viewport_hwnd_snapshot("passive", viewport_id);
+            let hwnd_before =
+                self.detached_window_hwnd_snapshot_before_show(window.id, "passive", viewport_id);
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
                     vp_ctx.input(|i| {
@@ -3682,13 +3682,6 @@ impl App {
                 focused_now = focused;
                 pixels_per_point = ppp;
                 if !minimized && let Some(outer) = outer_rect {
-                    captured_passive_host_hwnd =
-                        Self::find_detached_viewer_host_hwnd_from_logical_rect(
-                            main_hwnd,
-                            outer,
-                            pixels_per_point,
-                        )
-                        .unwrap_or(0);
                     let mut placement = window.placement;
                     placement.x = outer.min.x;
                     placement.y = outer.min.y;
@@ -3750,10 +3743,11 @@ impl App {
                     });
             });
             #[cfg(windows)]
-            self.log_r0_detached_viewport_hwnd_diff(
+            self.register_detached_window_hwnd_after_show(
+                window.id,
                 "passive",
                 viewport_id,
-                r0_hwnd_before.as_deref(),
+                hwnd_before.as_deref(),
             );
 
             if bar_close_requested {
@@ -3818,13 +3812,13 @@ impl App {
             if viewport_close_requested && Self::detached_image_window_debug_enabled() {
                 self.log_detached_image_window_debug(format!(
                     "passive_close_requested_detail id={} close_bar={} focused={} \
-                     passive_hwnd=0x{:x} captured_hwnd=0x{:x} initial_apply={} \
-                     placement={:?}",
+                     host={} initial_apply={} placement={:?}",
                     window.id,
                     bar_close_requested,
                     focused_now,
-                    window.passive_host_hwnd,
-                    captured_passive_host_hwnd,
+                    self.detached_window_hwnd_alive_for_window_id(window.id)
+                        .map(|hwnd| Self::win32_hwnd_debug_state(hwnd))
+                        .unwrap_or_else(|| "none".to_string()),
                     apply_initial_placement,
                     window.placement
                 ));
@@ -3903,20 +3897,6 @@ impl App {
                     placements.push((window.id, placement));
                 }
             }
-            if captured_passive_host_hwnd != 0
-                && captured_passive_host_hwnd != window.passive_host_hwnd
-            {
-                self.log_detached_image_window_debug(format!(
-                    "passive_hwnd_changed id={} old=0x{:x} new=0x{:x} initial_apply={} \
-                     placement={:?}",
-                    window.id,
-                    window.passive_host_hwnd,
-                    captured_passive_host_hwnd,
-                    apply_initial_placement,
-                    window.placement
-                ));
-                passive_host_updates.push((window.id, captured_passive_host_hwnd));
-            }
             if apply_initial_placement {
                 initial_placement_applied_ids.push(window.id);
             }
@@ -3939,15 +3919,6 @@ impl App {
                 .find(|window| window.id == id)
             {
                 window.initial_placement_applied = true;
-            }
-        }
-        for (id, hwnd) in passive_host_updates {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.passive_host_hwnd = hwnd;
             }
         }
         for id in placement_seed_reset_ids {
@@ -3978,7 +3949,13 @@ impl App {
             if !close_command_ids.is_empty() {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
             }
-            self.clear_detached_viewer_host_if_closing_passive_window(&close_ids, "passive_close");
+            for id in &close_ids {
+                if let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(*id) {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_close_clear_host id={id} hwnd=0x{hwnd:x}"
+                    ));
+                }
+            }
             for id in &close_command_ids {
                 let viewport_id = Self::detached_image_window_viewport_id(*id);
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
@@ -4537,8 +4514,15 @@ impl App {
             // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
             let holdover = self.fs_nav_holdover_tex_for_draw();
             #[cfg(windows)]
-            let r0_hwnd_before =
-                self.r0_detached_viewport_hwnd_snapshot("keep_alive_holdover", fs_id);
+            let keep_alive_window_id = self.active_detached_hwnd_window_id();
+            #[cfg(windows)]
+            let hwnd_before = keep_alive_window_id.and_then(|window_id| {
+                self.detached_window_hwnd_snapshot_before_show(
+                    window_id,
+                    "keep_alive_holdover",
+                    fs_id,
+                )
+            });
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
                 // 列挙が重い / ワーカー異常停止などで待ちが長くなったときに
                 // ユーザーが黒画面に閉じ込められないよう、Esc とウィンドウ
@@ -4581,11 +4565,14 @@ impl App {
                     });
             });
             #[cfg(windows)]
-            self.log_r0_detached_viewport_hwnd_diff(
-                "keep_alive_holdover",
-                fs_id,
-                r0_hwnd_before.as_deref(),
-            );
+            if let Some(window_id) = keep_alive_window_id {
+                self.register_detached_window_hwnd_after_show(
+                    window_id,
+                    "keep_alive_holdover",
+                    fs_id,
+                    hwnd_before.as_deref(),
+                );
+            }
             // keep-alive marker: deferred holdover で描いた fs_id が現セッションの detached id と
             // 一致するときだけ marker を立てる (§3.6/§3.7)。
             #[cfg(windows)]
@@ -4716,8 +4703,14 @@ impl App {
             tex.is_some(),
             self.detached_viewer_host_debug_state()
         ));
-        let r0_hwnd_before =
-            self.r0_detached_viewport_hwnd_snapshot("keepalive_backstop", viewport_id);
+        let backstop_window_id = self.active_detached_session.map(|s| s.window_id);
+        let hwnd_before = backstop_window_id.and_then(|window_id| {
+            self.detached_window_hwnd_snapshot_before_show(
+                window_id,
+                "keepalive_backstop",
+                viewport_id,
+            )
+        });
         ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
@@ -4744,11 +4737,14 @@ impl App {
                     }
                 });
         });
-        self.log_r0_detached_viewport_hwnd_diff(
-            "keepalive_backstop",
-            viewport_id,
-            r0_hwnd_before.as_deref(),
-        );
+        if let Some(window_id) = backstop_window_id {
+            self.register_detached_window_hwnd_after_show(
+                window_id,
+                "keepalive_backstop",
+                viewport_id,
+                hwnd_before.as_deref(),
+            );
+        }
         self.mark_active_detached_viewport_rendered();
     }
 
@@ -5072,11 +5068,15 @@ impl App {
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
         let fs_state_gpu_video = false;
         #[cfg(windows)]
-        let r0_active_render_hwnd_before = if detached && !embedded {
-            self.r0_detached_viewport_hwnd_snapshot("active_render", fs_id)
+        let active_render_window_id = if detached && !embedded {
+            self.active_detached_hwnd_window_id()
         } else {
             None
         };
+        #[cfg(windows)]
+        let active_render_hwnd_before = active_render_window_id.and_then(|window_id| {
+            self.detached_window_hwnd_snapshot_before_show(window_id, "active_render", fs_id)
+        });
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
@@ -5125,12 +5125,6 @@ impl App {
                                 rect,
                                 pixels_per_point,
                             );
-                            // capture の default 判定に使う previous は **save より前に**
-                            // スナップショットする。save が default rect を false-negative して
-                            // live/settings を上書きすると、capture が汚染後の値を見て防波堤が
-                            // 効かなくなる (Codex 実機レビュー P2)。
-                            let previous_placement_for_capture =
-                                self.detached_viewer_previous_placement_for_default_check();
                             let restore_placement = self
                                 .save_detached_viewer_placement_from_logical_rect(
                                     rect,
@@ -5152,20 +5146,6 @@ impl App {
                                     egui::vec2(placement.w, placement.h),
                                 ));
                                 ctx.request_repaint();
-                            }
-                            // restore_placement=Some のフレームは outer_rect が egui 既定サイズ
-                            // (≈822x656 物理 = 533x400 論理) の過渡窓を指している。その rect で host
-                            // を capture すると、新規に生えた既定サイズ窓を host に掴み直し、
-                            // native presenter child をそこへ再親付けして動画が一瞬小窓へ寄る
-                            // (実機ログ 2026-07-01 の `captured host …822x656` → `synced …presenter`)。
-                            // リポジションコマンドは既に送ってあるので、次フレームに geometry が
-                            // 保存配置へ落ち着いてから (restore_placement=None) capture する。
-                            if restore_placement.is_none() {
-                                self.capture_detached_viewer_host_hwnd_from_logical_rect(
-                                    rect,
-                                    pixels_per_point,
-                                    previous_placement_for_capture,
-                                );
                             }
                         }
                     }
@@ -6546,11 +6526,12 @@ impl App {
             }
         }
         #[cfg(windows)]
-        if detached && !embedded {
-            self.log_r0_detached_viewport_hwnd_diff(
+        if let Some(window_id) = active_render_window_id {
+            self.register_detached_window_hwnd_after_show(
+                window_id,
                 "active_render",
                 fs_id,
-                r0_active_render_hwnd_before.as_deref(),
+                active_render_hwnd_before.as_deref(),
             );
         }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;

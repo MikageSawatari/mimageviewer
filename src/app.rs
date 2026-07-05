@@ -202,7 +202,6 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) activation_armed: bool,
     pub(crate) focused_last_frame: bool,
     pub(crate) initial_placement_applied: bool,
-    pub(crate) passive_host_hwnd: u64,
     paused_bundle: Option<Box<ViewerContextBundle>>,
 }
 
@@ -234,7 +233,6 @@ impl Clone for DetachedImageWindowSnapshot {
             activation_armed: self.activation_armed,
             focused_last_frame: self.focused_last_frame,
             initial_placement_applied: self.initial_placement_applied,
-            passive_host_hwnd: self.passive_host_hwnd,
             paused_bundle: None,
         }
     }
@@ -250,6 +248,98 @@ impl DetachedImageWindowSnapshot {
     #[cfg(windows)]
     pub(crate) fn has_paused_bundle(&self) -> bool {
         self.paused_bundle.is_some()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+pub(crate) struct DetachedWindowHwndRegistry {
+    hwnd_by_window_id: std::collections::HashMap<u64, u64>,
+    #[cfg(test)]
+    live_hwnds_for_test: Option<std::collections::HashSet<u64>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DetachedWindowHwndDiff {
+    Created(u64),
+    NoChange,
+    Ambiguous(Vec<u64>),
+}
+
+#[cfg(windows)]
+impl DetachedWindowHwndRegistry {
+    const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
+
+    fn get_raw(&self, window_id: u64) -> Option<u64> {
+        self.hwnd_by_window_id
+            .get(&window_id)
+            .copied()
+            .filter(|hwnd| *hwnd != 0)
+    }
+
+    fn hwnd_alive(&self, window_id: u64) -> Option<u64> {
+        let hwnd = self.get_raw(window_id)?;
+        self.hwnd_is_alive(hwnd).then_some(hwnd)
+    }
+
+    fn hwnd_is_alive(&self, hwnd: u64) -> bool {
+        #[cfg(test)]
+        if let Some(live) = &self.live_hwnds_for_test {
+            return live.contains(&hwnd);
+        }
+        crate::video::native_window::is_window_alive(hwnd)
+    }
+
+    fn clear(&mut self, window_id: u64) -> Option<u64> {
+        self.hwnd_by_window_id.remove(&window_id)
+    }
+
+    fn clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
+        let hwnd = self.get_raw(window_id)?;
+        if self.hwnd_is_alive(hwnd) {
+            None
+        } else {
+            self.hwnd_by_window_id.remove(&window_id);
+            Some(hwnd)
+        }
+    }
+
+    fn set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
+        if hwnd == 0 {
+            return self.clear(window_id);
+        }
+        self.hwnd_by_window_id.insert(window_id, hwnd)
+    }
+
+    fn select_created_hwnd(
+        before: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
+        after: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
+    ) -> DetachedWindowHwndDiff {
+        let mut created = after
+            .iter()
+            .filter(|entry| {
+                !entry.is_main
+                    && entry.class_name == Self::EGUI_VIEWPORT_CLASS
+                    && !before.iter().any(|old| old.hwnd_raw == entry.hwnd_raw)
+            })
+            .map(|entry| entry.hwnd_raw)
+            .collect::<Vec<_>>();
+        created.sort_unstable();
+        created.dedup();
+        match created.as_slice() {
+            [hwnd] => DetachedWindowHwndDiff::Created(*hwnd),
+            [] => DetachedWindowHwndDiff::NoChange,
+            _ => DetachedWindowHwndDiff::Ambiguous(created),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_live_hwnds_for_test<I>(&mut self, hwnds: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.live_hwnds_for_test = Some(hwnds.into_iter().collect());
     }
 }
 
@@ -4764,10 +4854,10 @@ pub struct App {
     /// egui detached viewer viewport の top-level HWND。
     ///
     /// 動画は別 top-level window を作らず、この HWND の子ウィンドウとして重ねる。
-    /// eframe は child viewport の HWND を公開しないため、viewport の outer rect から
-    /// UI スレッド上の window を列挙して捕捉する。
+    /// eframe は child viewport の HWND を公開しないため、`show_viewport_immediate`
+    /// の前後で UI スレッド上の window 差分を取り、生成された HWND を window_id 単位で保持する。
     #[cfg(windows)]
-    pub(crate) detached_viewer_host_hwnd: u64,
+    pub(crate) detached_window_hwnd_registry: DetachedWindowHwndRegistry,
     /// detached viewer host HWND が変わるたびに +1 する世代。host capture を lifecycle
     /// event として観測し、stale host 由来イベントを識別するための App 側カウンタ
     /// (native presenter 世代とは別物)。
@@ -7157,7 +7247,7 @@ impl App {
             #[cfg(windows)]
             fs_viewport_virtual_desktop_synced_hwnd: 0,
             #[cfg(windows)]
-            detached_viewer_host_hwnd: 0,
+            detached_window_hwnd_registry: DetachedWindowHwndRegistry::default(),
             #[cfg(windows)]
             detached_viewer_host_generation: 0,
             #[cfg(windows)]
@@ -23427,7 +23517,6 @@ impl App {
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
-        self.clear_detached_viewer_host_hwnd();
         self.active_detached_viewer_live_placement = None;
         self.detached_active_viewport_rendered_frame = u64::MAX;
         self.log_detached_image_window_debug(format!(
@@ -23558,22 +23647,76 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn r0_detached_viewport_hwnd_snapshot(
-        &self,
+    pub(crate) fn active_detached_hwnd_window_id(&self) -> Option<u64> {
+        self.active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)
+            .or_else(|| {
+                (self.viewer_session_is_detached_or_switching()
+                    || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
+                .then_some(self.last_active_detached_window_id)
+                .flatten()
+            })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_window_hwnd_alive_for_window_id(&self, window_id: u64) -> Option<u64> {
+        self.detached_window_hwnd_registry.hwnd_alive(window_id)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn clear_detached_window_hwnd_for_window_id(
+        &mut self,
+        window_id: u64,
+    ) -> Option<u64> {
+        self.detached_window_hwnd_registry.clear(window_id)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_window_hwnd_raw_for_window_id(&self, window_id: u64) -> u64 {
+        self.detached_window_hwnd_registry
+            .get_raw(window_id)
+            .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_host_hwnd_raw(&self) -> u64 {
+        self.active_detached_hwnd_window_id()
+            .map(|window_id| self.detached_window_hwnd_raw_for_window_id(window_id))
+            .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_window_hwnd_snapshot_before_show(
+        &mut self,
+        window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
     ) -> Option<Vec<crate::dwm_transitions::ThreadWindowSnapshotEntry>> {
-        if !Self::detached_image_window_debug_enabled() {
+        if self
+            .detached_window_hwnd_registry
+            .hwnd_alive(window_id)
+            .is_some()
+        {
             return None;
         }
+        if let Some(dead_hwnd) = self.detached_window_hwnd_registry.clear_if_dead(window_id) {
+            self.log_detached_image_window_debug(format!(
+                "detached_hwnd_dead window_id={window_id} hwnd=0x{dead_hwnd:x} \
+                 label={label} viewport={viewport_id:?}"
+            ));
+            if self.detached_video_presentation_active_or_targeted() {
+                self.pending_detached_video_host_resync = true;
+            }
+        }
         let main_hwnd = self.main_hwnd?;
-        let snapshot = crate::dwm_transitions::debug_thread_window_snapshot(
+        let snapshot = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
-        if self.frame_counter % 60 == 0 {
-            crate::logger::log(format!(
-                "[detached-r0] before label={label} frame={} viewport={viewport_id:?} \
-                 count={} host={}",
+        if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
+            self.log_detached_image_window_debug(format!(
+                "hwnd_diff_before label={label} frame={} window_id={window_id} \
+                 viewport={viewport_id:?} count={} host={}",
                 self.frame_counter,
                 snapshot.len(),
                 self.detached_viewer_host_debug_state()
@@ -23583,63 +23726,66 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn log_r0_detached_viewport_hwnd_diff(
-        &self,
+    pub(crate) fn register_detached_window_hwnd_after_show(
+        &mut self,
+        window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
         before: Option<&[crate::dwm_transitions::ThreadWindowSnapshotEntry]>,
     ) {
-        if !Self::detached_image_window_debug_enabled() {
-            return;
-        }
         let Some(before) = before else {
             return;
         };
         let Some(main_hwnd) = self.main_hwnd else {
             return;
         };
-        let after = crate::dwm_transitions::debug_thread_window_snapshot(
+        let after = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
-        let created = after
-            .iter()
-            .filter(|entry| !before.iter().any(|old| old.hwnd_raw == entry.hwnd_raw))
-            .collect::<Vec<_>>();
-        let removed = before
-            .iter()
-            .filter(|entry| !after.iter().any(|new| new.hwnd_raw == entry.hwnd_raw))
-            .collect::<Vec<_>>();
-        if created.is_empty()
-            && removed.is_empty()
-            && self.detached_viewer_host_hwnd != 0
-            && self.frame_counter % 60 != 0
-        {
-            return;
-        }
-        let fmt_entries = |entries: &[&crate::dwm_transitions::ThreadWindowSnapshotEntry]| {
-            if entries.is_empty() {
-                "none".to_string()
-            } else {
-                entries
-                    .iter()
-                    .map(|entry| entry.format_compact())
-                    .collect::<Vec<_>>()
-                    .join("; ")
+        match DetachedWindowHwndRegistry::select_created_hwnd(before, &after) {
+            DetachedWindowHwndDiff::Created(hwnd) => {
+                let previous = self.detached_window_hwnd_registry.set(window_id, hwnd);
+                self.detached_viewer_host_generation =
+                    self.detached_viewer_host_generation.saturating_add(1);
+                crate::logger::log(format!(
+                    "[detached-viewer] registered host hwnd=0x{hwnd:x} \
+                     host_generation={} frame={} window_id={window_id} label={label} \
+                     viewport={viewport_id:?} old={} new_state=\"{}\"",
+                    self.detached_viewer_host_generation,
+                    self.frame_counter,
+                    previous
+                        .map(|old| format!("0x{old:x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    Self::win32_hwnd_debug_state(hwnd)
+                ));
+                if self.pending_detached_video_host_resync {
+                    self.pending_detached_video_host_resync =
+                        !self.try_resync_detached_video_host();
+                }
             }
-        };
-        crate::logger::log(format!(
-            "[detached-r0] diff label={label} frame={} viewport={viewport_id:?} \
-             before_count={} after_count={} created_count={} removed_count={} \
-             created=[{}] removed=[{}] host={}",
-            self.frame_counter,
-            before.len(),
-            after.len(),
-            created.len(),
-            removed.len(),
-            fmt_entries(&created),
-            fmt_entries(&removed),
-            self.detached_viewer_host_debug_state()
-        ));
+            DetachedWindowHwndDiff::NoChange => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_diff_retry label={label} frame={} window_id={window_id} \
+                     viewport={viewport_id:?} reason=no_new_window before_count={} \
+                     after_count={} host={}",
+                    self.frame_counter,
+                    before.len(),
+                    after.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+            }
+            DetachedWindowHwndDiff::Ambiguous(candidates) => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_diff_retry label={label} frame={} window_id={window_id} \
+                     viewport={viewport_id:?} reason=ambiguous candidates={candidates:x?} \
+                     before_count={} after_count={} host={}",
+                    self.frame_counter,
+                    before.len(),
+                    after.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -23686,30 +23832,9 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_viewer_expected_physical_rect(
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) -> windows::Win32::Foundation::RECT {
-        let scale = pixels_per_point.max(0.5);
-        windows::Win32::Foundation::RECT {
-            left: (outer_rect.min.x * scale).round() as i32,
-            top: (outer_rect.min.y * scale).round() as i32,
-            right: (outer_rect.max.x * scale).round() as i32,
-            bottom: (outer_rect.max.y * scale).round() as i32,
-        }
-    }
-
-    #[cfg(windows)]
     fn format_optional_duration_ms(value: Option<std::time::Duration>) -> String {
         value
             .map(|duration| format!("{:.1}", duration.as_secs_f64() * 1000.0))
-            .unwrap_or_else(|| "none".to_string())
-    }
-
-    #[cfg(windows)]
-    fn format_optional_hwnd(value: Option<u64>) -> String {
-        value
-            .map(|hwnd| format!("0x{hwnd:x}"))
             .unwrap_or_else(|| "none".to_string())
     }
 
@@ -23841,7 +23966,6 @@ impl App {
         self.fs_viewport_shown = true;
         self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         self.fs_viewport_virtual_desktop_synced_hwnd = 0;
-        self.clear_detached_viewer_host_hwnd();
         self.active_detached_viewer_live_placement = Some(seed_placement);
         self.detached_viewer_borderless_fullscreen = false;
         self.detached_viewer_restore_placement = None;
@@ -24563,58 +24687,6 @@ impl App {
         shrank_hard && previous_was_substantial
     }
 
-    /// capture の default 判定に使う「直前の正しい配置」を返す。**save より前に**取得すること
-    /// (save が live/settings を default rect へ false-negative 上書きすると capture の判定材料が
-    /// 汚染されるため = Codex 実機レビュー P2)。
-    #[cfg(windows)]
-    pub(crate) fn detached_viewer_previous_placement_for_default_check(
-        &self,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
-        self.active_detached_viewer_live_placement
-            .or(self.settings.detached_viewer_window_placement)
-            .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
-    }
-
-    /// capture の「最後の防波堤」(Codex 実機レビュー P1/P2)。egui が detached viewport を作り直す
-    /// 過程で生む既定サイズ (client 800x600 physical ≒ outer 822x656) の過渡窓を、host として
-    /// **絶対に採用しない**ための判定。呼び出し側 (render 経路の `restore_placement.is_none()`
-    /// gate) が状態差で漏れても、capture 関数自身が既定サイズ窓を弾く。
-    ///
-    /// `previous` は **save より前に**スナップショットした直前の正しい配置を渡すこと。self から
-    /// 読むと、同一フレームで先に走る save が live/settings を default rect へ上書き (false-negative)
-    /// した後の汚染値を見てしまい、防波堤が機能しない (Codex P2)。`outer_rect` は論理座標
-    /// (装飾込み outer)。previous と比べて「十分大きい配置から既定サイズへ hard shrink した」
-    /// 場合だけ default とみなす。ユーザーが元から小さい窓を使っている (previous が substantial
-    /// でない) 場合は弾かない。
-    #[cfg(windows)]
-    pub(crate) fn detached_capture_rect_looks_like_default_viewport(
-        previous: Option<crate::settings::DetachedViewerWindowPlacement>,
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) -> bool {
-        let Some(previous) = previous else {
-            return false;
-        };
-        if previous.maximized {
-            return false;
-        }
-        let scale = pixels_per_point.clamp(0.5, 4.0);
-        let phys_w = outer_rect.width() * scale;
-        let phys_h = outer_rect.height() * scale;
-        // egui/winit の既定 detached window は client 800x600 physical = outer ~822x656 physical。
-        // DPI・装飾でぶれるので上限を広めに取る (これ以上大きければ既定ではない)。
-        let near_default = phys_w <= 900.0 && phys_h <= 720.0;
-        if !near_default {
-            return false;
-        }
-        // outer_rect.width() は装飾込みで previous.w (inner) よりわずかに大きいが、hard-shrink
-        // 判定 (< 80%) には十分な余裕がある。
-        let shrank_hard =
-            outer_rect.width() < previous.w * 0.80 || outer_rect.height() < previous.h * 0.80;
-        let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
-        shrank_hard && previous_was_substantial
-    }
-
     #[cfg(windows)]
     fn build_active_detached_image_window_snapshot(
         &mut self,
@@ -24703,7 +24775,6 @@ impl App {
             activation_armed: false,
             focused_last_frame: false,
             initial_placement_applied: false,
-            passive_host_hwnd: self.detached_viewer_host_hwnd_alive().unwrap_or(0),
             paused_bundle: None,
         })
     }
@@ -24749,7 +24820,6 @@ impl App {
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
-        self.clear_detached_viewer_host_hwnd();
         self.active_detached_viewer_live_placement = None;
         self.detached_viewer_pin_active = false;
         self.detached_viewer_independent_active = false;
@@ -25288,97 +25358,20 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn clear_detached_viewer_host_hwnd(&mut self) {
-        if self.detached_viewer_host_hwnd != 0 {
+        let Some(window_id) = self.active_detached_hwnd_window_id() else {
+            return;
+        };
+        if let Some(hwnd) = self.detached_window_hwnd_registry.clear(window_id) {
             crate::logger::log(format!(
-                "[detached-viewer] clear host hwnd=0x{:x}",
-                self.detached_viewer_host_hwnd
+                "[detached-viewer] clear host window_id={window_id} hwnd=0x{hwnd:x}",
             ));
         }
-        self.detached_viewer_host_hwnd = 0;
     }
 
     #[cfg(windows)]
     pub(crate) fn detached_viewer_host_hwnd_alive(&self) -> Option<u64> {
-        let hwnd = self.detached_viewer_host_hwnd;
-        if crate::video::native_window::is_window_alive(hwnd) {
-            Some(hwnd)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(windows)]
-    fn passive_detached_host_hwnds(&self) -> Vec<u64> {
-        self.detached_image_windows
-            .iter()
-            .filter_map(|window| {
-                (window.passive_host_hwnd != 0).then_some(window.passive_host_hwnd)
-            })
-            .collect()
-    }
-
-    #[cfg(windows)]
-    fn passive_detached_window_id_for_host(&self, hwnd: u64) -> Option<u64> {
-        if hwnd == 0 {
-            return None;
-        }
-        self.detached_image_windows
-            .iter()
-            .find(|window| window.passive_host_hwnd == hwnd)
-            .map(|window| window.id)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn clear_detached_viewer_host_if_matches_passive_window(
-        &mut self,
-        reason: &'static str,
-    ) -> bool {
-        let hwnd = self.detached_viewer_host_hwnd;
-        let Some(passive_id) = self.passive_detached_window_id_for_host(hwnd) else {
-            return false;
-        };
-        self.log_detached_image_window_debug(format!(
-            "active_host_matches_passive_window reason={reason} passive_id={passive_id} \
-             host=0x{hwnd:x} active_session={:?} passive_windows={}",
-            self.active_detached_session,
-            self.detached_image_windows.len()
-        ));
-        if self.detached_video_presentation_active_or_targeted() {
-            self.pending_detached_video_host_resync = true;
-        }
-        self.clear_detached_viewer_host_hwnd();
-        true
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn clear_detached_viewer_host_if_closing_passive_window(
-        &mut self,
-        close_ids: &[u64],
-        reason: &'static str,
-    ) -> bool {
-        let hwnd = self.detached_viewer_host_hwnd;
-        if hwnd == 0 {
-            return false;
-        }
-        let Some(passive_id) = self
-            .detached_image_windows
-            .iter()
-            .find(|window| close_ids.contains(&window.id) && window.passive_host_hwnd == hwnd)
-            .map(|window| window.id)
-        else {
-            return false;
-        };
-        self.log_detached_image_window_debug(format!(
-            "active_host_matches_closing_passive_window reason={reason} passive_id={passive_id} \
-             host=0x{hwnd:x} active_session={:?} close_ids={close_ids:?} passive_windows={}",
-            self.active_detached_session,
-            self.detached_image_windows.len()
-        ));
-        if self.detached_video_presentation_active_or_targeted() {
-            self.pending_detached_video_host_resync = true;
-        }
-        self.clear_detached_viewer_host_hwnd();
-        true
+        let window_id = self.active_detached_hwnd_window_id()?;
+        self.detached_window_hwnd_registry.hwnd_alive(window_id)
     }
 
     /// detached viewer の OS 窓を「新規生成 / 再生成する可能性があるフレームか」を返す。
@@ -25397,7 +25390,10 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_viewer_host_lost(&self) -> bool {
-        let hwnd_raw = self.detached_viewer_host_hwnd;
+        let Some(window_id) = self.active_detached_hwnd_window_id() else {
+            return false;
+        };
+        let hwnd_raw = self.detached_window_hwnd_raw_for_window_id(window_id);
         if hwnd_raw == 0 {
             return false;
         }
@@ -25472,7 +25468,11 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_viewer_host_debug_state(&self) -> String {
-        Self::win32_hwnd_debug_state(self.detached_viewer_host_hwnd)
+        let hwnd = self
+            .active_detached_hwnd_window_id()
+            .map(|window_id| self.detached_window_hwnd_raw_for_window_id(window_id))
+            .unwrap_or(0);
+        Self::win32_hwnd_debug_state(hwnd)
     }
 
     #[cfg(windows)]
@@ -25494,35 +25494,10 @@ impl App {
         self.detached_viewer_last_host_lost_frame = self.frame_counter;
         self.detached_viewer_last_host_lost_at = Some(now);
 
-        let captured_hwnd = self.detached_viewer_host_hwnd;
-        let mut current_rect_candidate = None;
-        let mut expected_rect_text = "none".to_string();
-        let mut thread_windows = "none".to_string();
-        if let (Some(main_hwnd), Some(rect)) =
-            (self.main_hwnd, self.detached_viewer_last_outer_rect)
-        {
-            use windows::Win32::Foundation::HWND;
-
-            let ppp = self.detached_viewer_last_pixels_per_point;
-            let expected = Self::detached_viewer_expected_physical_rect(rect, ppp);
-            expected_rect_text = format!(
-                "({},{} {}x{})",
-                expected.left,
-                expected.top,
-                expected.right - expected.left,
-                expected.bottom - expected.top
-            );
-            current_rect_candidate =
-                Self::find_detached_viewer_host_hwnd_from_logical_rect(self.main_hwnd, rect, ppp);
-            thread_windows = crate::dwm_transitions::debug_thread_windows_for_rect(
-                HWND(main_hwnd as *mut _),
-                expected,
-                12,
-            );
-        }
-        let candidate_state = current_rect_candidate
-            .map(Self::win32_hwnd_debug_state)
-            .unwrap_or_else(|| "none".to_string());
+        let window_id = self.active_detached_hwnd_window_id();
+        let captured_hwnd = window_id
+            .map(|id| self.detached_window_hwnd_raw_for_window_id(id))
+            .unwrap_or(0);
         let last_outer_text = self
             .detached_viewer_last_outer_rect
             .map(|rect| {
@@ -25545,10 +25520,9 @@ impl App {
              last_render_frame={} frames_since_render={} since_render_ms={} \
              prev_lost_frame={} frames_since_prev_lost={} since_prev_lost_ms={} \
              fullscreen_idx={:?} viewer_presentation={:?} fs_presentation={:?} \
-             generation={} detached_window_id={:?} captured_hwnd=0x{:x} \
-             captured_state=\"{}\" current_rect_candidate={} candidate_state=\"{}\" \
-             main_hwnd={} expected_rect={} last_outer=\"{}\" last_ppp={:.2} \
-             thread_windows=[{}]",
+             generation={} detached_window_id={:?} registry_window_id={:?} \
+             captured_hwnd=0x{:x} captured_state=\"{}\" main_hwnd={} \
+             last_outer=\"{}\" last_ppp={:.2}",
             self.frame_counter,
             self.detached_viewer_last_render_frame,
             self.frame_counter
@@ -25562,15 +25536,12 @@ impl App {
             self.fs_viewport_presentation,
             self.fs_viewport_generation,
             self.detached_viewer_window_id,
+            window_id,
             captured_hwnd,
             self.detached_viewer_host_debug_state(),
-            Self::format_optional_hwnd(current_rect_candidate),
-            candidate_state,
             main_hwnd_text,
-            expected_rect_text,
             last_outer_text,
             self.detached_viewer_last_pixels_per_point,
-            thread_windows
         ));
     }
 
@@ -25594,151 +25565,6 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn detached_viewer_video_host_ready(&self) -> bool {
         self.detached_viewer_client_rect_physical().is_some()
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn find_detached_viewer_host_hwnd_from_logical_rect(
-        main_hwnd: Option<isize>,
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) -> Option<u64> {
-        use windows::Win32::Foundation::{HWND, RECT};
-
-        let main_hwnd = main_hwnd?;
-        let scale = pixels_per_point.max(0.5);
-        let expected = RECT {
-            left: (outer_rect.min.x * scale).round() as i32,
-            top: (outer_rect.min.y * scale).round() as i32,
-            right: (outer_rect.max.x * scale).round() as i32,
-            bottom: (outer_rect.max.y * scale).round() as i32,
-        };
-        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect(
-            HWND(main_hwnd as *mut _),
-            expected,
-        ) else {
-            return None;
-        };
-        let hwnd_raw = hwnd.0 as usize as u64;
-        (hwnd_raw != 0).then_some(hwnd_raw)
-    }
-
-    #[cfg(windows)]
-    fn find_active_detached_viewer_host_hwnd_from_logical_rect(
-        &self,
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) -> Option<u64> {
-        use windows::Win32::Foundation::{HWND, RECT};
-
-        let main_hwnd = self.main_hwnd?;
-        let scale = pixels_per_point.max(0.5);
-        let expected = RECT {
-            left: (outer_rect.min.x * scale).round() as i32,
-            top: (outer_rect.min.y * scale).round() as i32,
-            right: (outer_rect.max.x * scale).round() as i32,
-            bottom: (outer_rect.max.y * scale).round() as i32,
-        };
-        let excluded = self.passive_detached_host_hwnds();
-        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect_excluding(
-            HWND(main_hwnd as *mut _),
-            expected,
-            &excluded,
-        ) else {
-            if !excluded.is_empty() {
-                self.log_detached_image_window_debug(format!(
-                    "active_host_capture_no_candidate_after_excluding_passive excluded={excluded:x?}"
-                ));
-            }
-            return None;
-        };
-        let hwnd_raw = hwnd.0 as usize as u64;
-        (hwnd_raw != 0).then_some(hwnd_raw)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn capture_detached_viewer_host_hwnd_from_logical_rect(
-        &mut self,
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-        previous_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
-    ) {
-        // 最後の防波堤 (Codex 実機レビュー P1/P2): egui が detached viewport を作り直す過程で生む
-        // 既定サイズ (822x656) の過渡窓を、呼び出し側 gate が漏らしても host に採用しない。
-        // 採用すると presenter child を既定サイズ窓へ再親付けして動画が一瞬小窓へ寄る。previous は
-        // save より前にスナップショットした値を渡す (save の false-negative 上書き汚染を避ける)。
-        if Self::detached_capture_rect_looks_like_default_viewport(
-            previous_placement,
-            outer_rect,
-            pixels_per_point,
-        ) {
-            self.log_detached_image_window_debug(format!(
-                "capture_skipped_default_viewport outer=({:.0},{:.0} {:.0}x{:.0}) ppp={:.3}",
-                outer_rect.min.x,
-                outer_rect.min.y,
-                outer_rect.width(),
-                outer_rect.height(),
-                pixels_per_point
-            ));
-            return;
-        }
-        self.clear_detached_viewer_host_if_matches_passive_window("before_active_capture");
-        let rect_candidate = self
-            .find_active_detached_viewer_host_hwnd_from_logical_rect(outer_rect, pixels_per_point);
-        let hwnd_raw = rect_candidate.unwrap_or(0);
-        if Self::detached_image_window_debug_enabled() {
-            let scale = pixels_per_point.max(0.5);
-            let left = (outer_rect.min.x * scale).round() as i32;
-            let top = (outer_rect.min.y * scale).round() as i32;
-            let right = (outer_rect.max.x * scale).round() as i32;
-            let bottom = (outer_rect.max.y * scale).round() as i32;
-            crate::logger::log(format!(
-                "[detached-r0] rect_capture_result frame={} candidate={} state=\"{}\" \
-                 expected_rect=({},{})-({},{}) ppp={scale:.3} host={}",
-                self.frame_counter,
-                Self::format_optional_hwnd(rect_candidate),
-                rect_candidate
-                    .map(Self::win32_hwnd_debug_state)
-                    .unwrap_or_else(|| "none".to_string()),
-                left,
-                top,
-                right,
-                bottom,
-                self.detached_viewer_host_debug_state()
-            ));
-        }
-        if hwnd_raw != 0 && hwnd_raw != self.detached_viewer_host_hwnd {
-            let previous_host = self.detached_viewer_host_hwnd;
-            let scale = pixels_per_point.max(0.5);
-            let left = (outer_rect.min.x * scale).round() as i32;
-            let top = (outer_rect.min.y * scale).round() as i32;
-            let right = (outer_rect.max.x * scale).round() as i32;
-            let bottom = (outer_rect.max.y * scale).round() as i32;
-            self.detached_viewer_host_generation =
-                self.detached_viewer_host_generation.wrapping_add(1);
-            crate::logger::log(format!(
-                "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} host_generation={} frame={} \
-                 old_host=\"{}\" new_state=\"{}\" rect=({},{})-({},{}) ppp={scale:.2}",
-                self.detached_viewer_host_generation,
-                self.frame_counter,
-                self.detached_viewer_host_debug_state(),
-                Self::win32_hwnd_debug_state(hwnd_raw),
-                left,
-                top,
-                right,
-                bottom
-            ));
-            self.detached_viewer_host_hwnd = hwnd_raw;
-            // 既存 host を **置き換えた** 場合 (初回 capture ではない)、または host-lost で
-            // 一旦 0 に落ちて再取得したとき (`pending_detached_video_host_resync` が既に
-            // 立っている)、native presenter の child は旧 host の子のまま残っている。旧 host が
-            // 破棄されると child が道連れで消え WM_QUIT → presenter 終了 → 再生終了になるため、
-            // **同じフレームで即座に**現 host へ再親付けを試みる (race 窓の最小化)。mode switch
-            // 進行中などで今発行できなければフラグに退避し、`poll_detached_video_host_resync` が
-            // 次フレーム以降で拾う。
-            if previous_host != 0 || self.pending_detached_video_host_resync {
-                self.pending_detached_video_host_resync = !self.try_resync_detached_video_host();
-            }
-        }
     }
 
     #[cfg(windows)]
@@ -32705,7 +32531,6 @@ impl App {
             if preserve_detached_viewport {
                 let viewer_presentation = self.viewer_presentation;
                 let fs_viewport_presentation = self.fs_viewport_presentation;
-                let detached_viewer_host_hwnd = self.detached_viewer_host_hwnd;
                 let detached_viewer_window_id = self.detached_viewer_window_id;
                 let detached_viewer_borderless_fullscreen =
                     self.detached_viewer_borderless_fullscreen;
@@ -32726,7 +32551,6 @@ impl App {
                 self.fs_viewport_shown = true;
                 self.viewer_presentation = viewer_presentation;
                 self.fs_viewport_presentation = fs_viewport_presentation;
-                self.detached_viewer_host_hwnd = detached_viewer_host_hwnd;
                 self.detached_viewer_window_id = detached_viewer_window_id;
                 self.detached_viewer_borderless_fullscreen = detached_viewer_borderless_fullscreen;
                 self.detached_viewer_restore_placement = detached_viewer_restore_placement;
