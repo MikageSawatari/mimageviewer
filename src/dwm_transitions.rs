@@ -24,8 +24,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, GetWindowRect, HWND_TOP, IsIconic, IsWindowVisible, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    EnumThreadWindows, GetClassNameW, GetWindowRect, GetWindowTextW, HWND_TOP, IsIconic,
+    IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
 };
 use windows::core::{BOOL, Result};
 
@@ -169,6 +169,69 @@ pub fn debug_thread_windows_for_rect(main_hwnd: HWND, expected: RECT, limit: usi
         .join("; ")
 }
 
+/// Stage R0 diagnostic: snapshot all top-level windows owned by the current UI
+/// thread without using geometry matching. The caller compares two snapshots
+/// around `show_viewport_immediate` to see whether a child viewport HWND is
+/// created synchronously in that call.
+///
+/// This is debug-only infrastructure. It must not become an ownership source
+/// for detached HWNDs before R1 replaces the rect-capture path.
+#[derive(Clone, Debug)]
+pub struct ThreadWindowSnapshotEntry {
+    pub hwnd_raw: u64,
+    pub is_main: bool,
+    pub visible: bool,
+    pub iconic: bool,
+    pub rect_ok: bool,
+    pub rect: RECT,
+    pub class_name: String,
+    pub title: String,
+}
+
+impl ThreadWindowSnapshotEntry {
+    pub fn format_compact(&self) -> String {
+        let rect = if self.rect_ok {
+            format!(
+                "({},{} {}x{})",
+                self.rect.left,
+                self.rect.top,
+                self.rect.right - self.rect.left,
+                self.rect.bottom - self.rect.top
+            )
+        } else {
+            "<err>".to_string()
+        };
+        format!(
+            "hwnd=0x{:x} main={} visible={} iconic={} rect={} class={:?} title={:?}",
+            self.hwnd_raw,
+            self.is_main,
+            self.visible,
+            self.iconic,
+            rect,
+            self.class_name,
+            self.title
+        )
+    }
+}
+
+pub fn debug_thread_window_snapshot(main_hwnd: HWND) -> Vec<ThreadWindowSnapshotEntry> {
+    let mut state = ThreadWindowSnapshotState {
+        main_hwnd,
+        entries: Vec::new(),
+    };
+    unsafe {
+        let tid = GetCurrentThreadId();
+        let state_ptr = &mut state as *mut ThreadWindowSnapshotState;
+        let _ = EnumThreadWindows(
+            tid,
+            Some(debug_thread_window_snapshot_enum_proc),
+            LPARAM(state_ptr as isize),
+        );
+    }
+    state.entries.sort_by_key(|entry| entry.hwnd_raw);
+    state.entries
+}
+
 pub fn set_window_chrome_black(hwnd: HWND) {
     set_window_chrome_color(hwnd, 0x000000);
 }
@@ -236,6 +299,11 @@ struct DebugWindowEntry {
     covers_most_expected: bool,
 }
 
+struct ThreadWindowSnapshotState {
+    main_hwnd: HWND,
+    entries: Vec<ThreadWindowSnapshotEntry>,
+}
+
 impl DebugWindowEntry {
     fn format(&self) -> String {
         if self.rect_ok {
@@ -261,6 +329,46 @@ impl DebugWindowEntry {
             )
         }
     }
+}
+
+unsafe extern "system" fn debug_thread_window_snapshot_enum_proc(
+    hwnd: HWND,
+    lparam: LPARAM,
+) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut ThreadWindowSnapshotState) };
+    let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+    let iconic = unsafe { IsIconic(hwnd).as_bool() };
+    let mut rect = RECT::default();
+    let rect_ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
+    state.entries.push(ThreadWindowSnapshotEntry {
+        hwnd_raw: hwnd.0 as usize as u64,
+        is_main: hwnd.0 == state.main_hwnd.0,
+        visible,
+        iconic,
+        rect_ok,
+        rect,
+        class_name: window_class_name(hwnd),
+        title: window_text(hwnd),
+    });
+    BOOL(1)
+}
+
+fn window_class_name(hwnd: HWND) -> String {
+    let mut buf = [0_u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+fn window_text(hwnd: HWND) -> String {
+    let mut buf = [0_u16; 256];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    if len <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..len as usize])
 }
 
 unsafe extern "system" fn raise_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {

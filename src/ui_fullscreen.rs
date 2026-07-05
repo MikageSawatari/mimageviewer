@@ -3664,6 +3664,8 @@ impl App {
             let mut key_activation_candidate = false;
             let mut wheel_activation_candidate = false;
 
+            #[cfg(windows)]
+            let r0_hwnd_before = self.r0_detached_viewport_hwnd_snapshot("passive", viewport_id);
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
                     vp_ctx.input(|i| {
@@ -3747,6 +3749,12 @@ impl App {
                         );
                     });
             });
+            #[cfg(windows)]
+            self.log_r0_detached_viewport_hwnd_diff(
+                "passive",
+                viewport_id,
+                r0_hwnd_before.as_deref(),
+            );
 
             if bar_close_requested {
                 close_command_ids.push(window.id);
@@ -4528,6 +4536,9 @@ impl App {
             let mut cancel = false;
             // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
             let holdover = self.fs_nav_holdover_tex_for_draw();
+            #[cfg(windows)]
+            let r0_hwnd_before =
+                self.r0_detached_viewport_hwnd_snapshot("keep_alive_holdover", fs_id);
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
                 // 列挙が重い / ワーカー異常停止などで待ちが長くなったときに
                 // ユーザーが黒画面に閉じ込められないよう、Esc とウィンドウ
@@ -4569,6 +4580,12 @@ impl App {
                         }
                     });
             });
+            #[cfg(windows)]
+            self.log_r0_detached_viewport_hwnd_diff(
+                "keep_alive_holdover",
+                fs_id,
+                r0_hwnd_before.as_deref(),
+            );
             // keep-alive marker: deferred holdover で描いた fs_id が現セッションの detached id と
             // 一致するときだけ marker を立てる (§3.6/§3.7)。
             #[cfg(windows)]
@@ -4699,6 +4716,8 @@ impl App {
             tex.is_some(),
             self.detached_viewer_host_debug_state()
         ));
+        let r0_hwnd_before =
+            self.r0_detached_viewport_hwnd_snapshot("keepalive_backstop", viewport_id);
         ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
@@ -4725,6 +4744,11 @@ impl App {
                     }
                 });
         });
+        self.log_r0_detached_viewport_hwnd_diff(
+            "keepalive_backstop",
+            viewport_id,
+            r0_hwnd_before.as_deref(),
+        );
         self.mark_active_detached_viewport_rendered();
     }
 
@@ -5047,6 +5071,12 @@ impl App {
         // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
         let fs_state_gpu_video = false;
+        #[cfg(windows)]
+        let r0_active_render_hwnd_before = if detached && !embedded {
+            self.r0_detached_viewport_hwnd_snapshot("active_render", fs_id)
+        } else {
+            None
+        };
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
@@ -6514,6 +6544,14 @@ impl App {
                 #[cfg(windows)]
                 self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             }
+        }
+        #[cfg(windows)]
+        if detached && !embedded {
+            self.log_r0_detached_viewport_hwnd_diff(
+                "active_render",
+                fs_id,
+                r0_active_render_hwnd_before.as_deref(),
+            );
         }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {

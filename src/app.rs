@@ -23558,6 +23558,91 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn r0_detached_viewport_hwnd_snapshot(
+        &self,
+        label: &'static str,
+        viewport_id: egui::ViewportId,
+    ) -> Option<Vec<crate::dwm_transitions::ThreadWindowSnapshotEntry>> {
+        if !Self::detached_image_window_debug_enabled() {
+            return None;
+        }
+        let main_hwnd = self.main_hwnd?;
+        let snapshot = crate::dwm_transitions::debug_thread_window_snapshot(
+            windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+        );
+        if self.frame_counter % 60 == 0 {
+            crate::logger::log(format!(
+                "[detached-r0] before label={label} frame={} viewport={viewport_id:?} \
+                 count={} host={}",
+                self.frame_counter,
+                snapshot.len(),
+                self.detached_viewer_host_debug_state()
+            ));
+        }
+        Some(snapshot)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn log_r0_detached_viewport_hwnd_diff(
+        &self,
+        label: &'static str,
+        viewport_id: egui::ViewportId,
+        before: Option<&[crate::dwm_transitions::ThreadWindowSnapshotEntry]>,
+    ) {
+        if !Self::detached_image_window_debug_enabled() {
+            return;
+        }
+        let Some(before) = before else {
+            return;
+        };
+        let Some(main_hwnd) = self.main_hwnd else {
+            return;
+        };
+        let after = crate::dwm_transitions::debug_thread_window_snapshot(
+            windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+        );
+        let created = after
+            .iter()
+            .filter(|entry| !before.iter().any(|old| old.hwnd_raw == entry.hwnd_raw))
+            .collect::<Vec<_>>();
+        let removed = before
+            .iter()
+            .filter(|entry| !after.iter().any(|new| new.hwnd_raw == entry.hwnd_raw))
+            .collect::<Vec<_>>();
+        if created.is_empty()
+            && removed.is_empty()
+            && self.detached_viewer_host_hwnd != 0
+            && self.frame_counter % 60 != 0
+        {
+            return;
+        }
+        let fmt_entries = |entries: &[&crate::dwm_transitions::ThreadWindowSnapshotEntry]| {
+            if entries.is_empty() {
+                "none".to_string()
+            } else {
+                entries
+                    .iter()
+                    .map(|entry| entry.format_compact())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+        };
+        crate::logger::log(format!(
+            "[detached-r0] diff label={label} frame={} viewport={viewport_id:?} \
+             before_count={} after_count={} created_count={} removed_count={} \
+             created=[{}] removed=[{}] host={}",
+            self.frame_counter,
+            before.len(),
+            after.len(),
+            created.len(),
+            removed.len(),
+            fmt_entries(&created),
+            fmt_entries(&removed),
+            self.detached_viewer_host_debug_state()
+        ));
+    }
+
+    #[cfg(windows)]
     fn detached_viewer_descriptor_debug_kind(
         descriptor: &Option<ViewerContextDescriptor>,
     ) -> &'static str {
@@ -25597,9 +25682,30 @@ impl App {
             return;
         }
         self.clear_detached_viewer_host_if_matches_passive_window("before_active_capture");
-        let hwnd_raw = self
-            .find_active_detached_viewer_host_hwnd_from_logical_rect(outer_rect, pixels_per_point)
-            .unwrap_or(0);
+        let rect_candidate = self
+            .find_active_detached_viewer_host_hwnd_from_logical_rect(outer_rect, pixels_per_point);
+        let hwnd_raw = rect_candidate.unwrap_or(0);
+        if Self::detached_image_window_debug_enabled() {
+            let scale = pixels_per_point.max(0.5);
+            let left = (outer_rect.min.x * scale).round() as i32;
+            let top = (outer_rect.min.y * scale).round() as i32;
+            let right = (outer_rect.max.x * scale).round() as i32;
+            let bottom = (outer_rect.max.y * scale).round() as i32;
+            crate::logger::log(format!(
+                "[detached-r0] rect_capture_result frame={} candidate={} state=\"{}\" \
+                 expected_rect=({},{})-({},{}) ppp={scale:.3} host={}",
+                self.frame_counter,
+                Self::format_optional_hwnd(rect_candidate),
+                rect_candidate
+                    .map(Self::win32_hwnd_debug_state)
+                    .unwrap_or_else(|| "none".to_string()),
+                left,
+                top,
+                right,
+                bottom,
+                self.detached_viewer_host_debug_state()
+            ));
+        }
         if hwnd_raw != 0 && hwnd_raw != self.detached_viewer_host_hwnd {
             let previous_host = self.detached_viewer_host_hwnd;
             let scale = pixels_per_point.max(0.5);
