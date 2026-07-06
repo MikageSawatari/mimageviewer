@@ -386,6 +386,20 @@ const BAR_BUTTON_SIZE: f32 = 32.0;
 const BAR_BUTTON_MARGIN: f32 = 6.0;
 /// バー内ボタン間の隙間
 const BAR_BUTTON_GAP: f32 = 4.0;
+
+#[cfg(windows)]
+#[derive(Default)]
+struct DetachedImageWindowEventBatch {
+    close_ids: Vec<u64>,
+    close_command_ids: Vec<u64>,
+    toggle_pin_ids: Vec<u64>,
+    activate_ids: Vec<u64>,
+    placements: Vec<(u64, crate::settings::DetachedViewerWindowPlacement)>,
+    focus_updates: Vec<(u64, bool)>,
+    initial_placement_applied_ids: Vec<u64>,
+    placement_seed_reset_ids: Vec<u64>,
+}
+
 /// チェックマーク円の半径
 const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
@@ -3559,7 +3573,7 @@ impl App {
     fn draw_detached_image_window_snapshot(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
-        window: &crate::app::DetachedImageWindowSnapshot,
+        window: &crate::app::DeferredDetachedImageWindowView,
     ) {
         if !window.frozen_continuous_pages.is_empty() {
             let painter = ui.painter().with_clip_rect(full_rect);
@@ -3607,8 +3621,7 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-        window: &crate::app::DetachedImageWindowSnapshot,
-        show_pin: bool,
+        window: &crate::app::DeferredDetachedImageWindowView,
         close_requested: &mut bool,
         pin_toggle_requested: &mut bool,
     ) {
@@ -3662,7 +3675,7 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        if show_pin {
+        if window.show_pin {
             let pin_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -3705,6 +3718,316 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn queue_deferred_detached_image_window_event(
+        &mut self,
+        ctx: &egui::Context,
+        event: crate::app::DeferredDetachedImageWindowEvent,
+        batch: &mut DetachedImageWindowEventBatch,
+    ) {
+        match event {
+            crate::app::DeferredDetachedImageWindowEvent::FirstCallback { id } => {
+                if self
+                    .detached_image_windows
+                    .iter()
+                    .any(|window| window.id == id)
+                {
+                    let viewport_id = Self::detached_image_window_viewport_id(id);
+                    self.adopt_deferred_detached_window_hwnd_after_callback(id, viewport_id);
+                }
+            }
+            crate::app::DeferredDetachedImageWindowEvent::Frame {
+                id,
+                viewport_close_requested,
+                bar_close_requested,
+                pin_toggle_requested,
+                focused,
+                pointer_activation,
+                scroll_candidate,
+                key_candidate,
+                wheel_candidate,
+                placement_update,
+                pixels_per_point,
+                apply_initial_placement,
+            } => {
+                let Some(window_pos) = self
+                    .detached_image_windows
+                    .iter()
+                    .position(|window| window.id == id)
+                else {
+                    return;
+                };
+                if self.detached_window_hwnd_alive_for_window_id(id).is_none() {
+                    let viewport_id = Self::detached_image_window_viewport_id(id);
+                    self.adopt_deferred_detached_window_hwnd_after_callback(id, viewport_id);
+                }
+                let window = self.detached_image_windows[window_pos].clone();
+                let window_placement =
+                    self.ensure_detached_window_runtime_placement(id, "deferred_passive_event");
+                if bar_close_requested {
+                    batch.close_command_ids.push(id);
+                    batch.close_ids.push(id);
+                } else if viewport_close_requested {
+                    batch.close_ids.push(id);
+                }
+                if pin_toggle_requested {
+                    batch.toggle_pin_ids.push(id);
+                }
+
+                let can_activate = window.can_activate();
+                let focus_activation_raw = focused && !window.focused_last_frame;
+                let user_activation = pointer_activation;
+                let focus_edge = focused != window.focused_last_frame;
+                if (viewport_close_requested
+                    || bar_close_requested
+                    || pin_toggle_requested
+                    || focus_edge
+                    || pointer_activation
+                    || scroll_candidate
+                    || key_candidate
+                    || wheel_candidate)
+                    && Self::detached_image_window_debug_enabled()
+                {
+                    crate::logger::log(format!(
+                        "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
+                         pin_toggle={} focused={} focused_prev={} focus_edge={} \
+                         focus_activation_candidate={} pointer_activation={} scroll_candidate={} \
+                         key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
+                         armed={} pinned={} has_bundle={} has_descriptor={} has_stamp={} source=deferred",
+                        id,
+                        viewport_close_requested,
+                        bar_close_requested,
+                        pin_toggle_requested,
+                        focused,
+                        window.focused_last_frame,
+                        focus_edge,
+                        focus_activation_raw,
+                        pointer_activation,
+                        scroll_candidate,
+                        key_candidate,
+                        wheel_candidate,
+                        user_activation,
+                        can_activate,
+                        window.activation_armed,
+                        window.pinned,
+                        window.has_paused_bundle(),
+                        window.reopen_descriptor.is_some(),
+                        window.reopen_sync_stamp.is_some()
+                    ));
+                }
+                if viewport_close_requested && Self::detached_image_window_debug_enabled() {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_close_requested_detail id={} close_bar={} focused={} \
+                         host={} initial_apply={} placement={:?} source=deferred",
+                        id,
+                        bar_close_requested,
+                        focused,
+                        self.detached_window_hwnd_alive_for_window_id(id)
+                            .map(|hwnd| Self::win32_hwnd_debug_state(hwnd))
+                            .unwrap_or_else(|| "none".to_string()),
+                        apply_initial_placement,
+                        window_placement
+                    ));
+                }
+                if Self::detached_passive_window_should_activate(
+                    can_activate,
+                    window.activation_armed,
+                    user_activation,
+                ) {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_activate_queued id={} via=pointer passive_windows={} \
+                         active_context={} source=deferred",
+                        id,
+                        self.detached_image_windows.len(),
+                        self.active_detached_viewer_context_present()
+                    ));
+                    batch.activate_ids.push(id);
+                }
+                if let Some(placement) = placement_update {
+                    if Self::detached_passive_placement_update_looks_like_default_viewport(
+                        window_placement,
+                        placement,
+                        pixels_per_point,
+                        apply_initial_placement,
+                    ) {
+                        self.log_detached_image_window_debug(format!(
+                            "passive_placement_update_rejected_default id={} initial_apply={} \
+                             ppp={:.2} from={:?} to={:?} source=deferred",
+                            id,
+                            apply_initial_placement,
+                            pixels_per_point,
+                            window_placement,
+                            placement
+                        ));
+                        batch.placement_seed_reset_ids.push(id);
+                        ctx.request_repaint();
+                    } else if placement != window_placement {
+                        self.log_detached_image_window_debug(format!(
+                            "passive_placement_update id={} initial_apply={} ppp={:.2} \
+                             from={:?} to={:?} source=deferred",
+                            id,
+                            apply_initial_placement,
+                            pixels_per_point,
+                            window_placement,
+                            placement
+                        ));
+                        batch.placements.push((id, placement));
+                    }
+                }
+                if apply_initial_placement {
+                    batch.initial_placement_applied_ids.push(id);
+                }
+                batch.focus_updates.push((id, focused));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn apply_detached_image_window_event_batch(
+        &mut self,
+        ctx: &egui::Context,
+        mut batch: DetachedImageWindowEventBatch,
+    ) {
+        for (id, placement) in batch.placements.drain(..) {
+            self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
+        }
+        for id in batch.initial_placement_applied_ids.drain(..) {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.initial_placement_applied = true;
+            }
+        }
+        for id in batch.placement_seed_reset_ids.drain(..) {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.initial_placement_applied = false;
+            }
+        }
+        let mut pin_flag_updates = Vec::new();
+        for id in &batch.toggle_pin_ids {
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == *id)
+            {
+                window.pinned = !window.pinned;
+                pin_flag_updates.push((*id, window.pinned));
+            }
+        }
+        for (id, pinned) in pin_flag_updates {
+            self.update_detached_window_runtime_flags(id, pinned, !pinned, "passive_toggle_pin");
+        }
+        batch.close_ids.sort_unstable();
+        batch.close_ids.dedup();
+        batch.close_command_ids.sort_unstable();
+        batch.close_command_ids.dedup();
+        if !batch.close_ids.is_empty() {
+            self.log_detached_image_window_debug(format!(
+                "passive_close ids={:?} command_ids={:?} passive_before={} activate_ids={:?}",
+                batch.close_ids,
+                batch.close_command_ids,
+                self.detached_image_windows.len(),
+                batch.activate_ids
+            ));
+            if !batch.close_command_ids.is_empty() {
+                crate::dwm_transitions::disable_transitions_for_thread_windows();
+            }
+            for id in &batch.close_ids {
+                self.transition_detached_window_state(
+                    *id,
+                    crate::app::DetachedWindowState::Closing,
+                    "passive_close",
+                );
+                if let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(*id) {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_close_clear_host id={id} hwnd=0x{hwnd:x}"
+                    ));
+                }
+            }
+            for id in &batch.close_command_ids {
+                let viewport_id = Self::detached_image_window_viewport_id(*id);
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            }
+            self.detached_image_windows
+                .retain(|window| !batch.close_ids.contains(&window.id));
+            for id in &batch.close_ids {
+                self.remove_detached_window_runtime(*id, "passive_close");
+                self.deferred_detached_image_window_views.remove(id);
+            }
+            if self.detached_image_windows.is_empty() {
+                self.request_detached_cleanup_font_atlas_resync("passive_close");
+            }
+            self.focus_main_after_detached_window_close_if_idle(ctx, "passive_close");
+        }
+        for (id, focused) in batch.focus_updates.drain(..) {
+            if batch.close_ids.contains(&id) || batch.activate_ids.contains(&id) {
+                continue;
+            }
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                if !focused {
+                    window.activation_armed = true;
+                }
+                window.focused_last_frame = focused;
+            }
+        }
+        batch.activate_ids.sort_unstable();
+        batch.activate_ids.dedup();
+        for id in batch.activate_ids {
+            if batch.close_ids.contains(&id) || batch.toggle_pin_ids.contains(&id) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_skipped id={id} close={} toggle={}",
+                    batch.close_ids.contains(&id),
+                    batch.toggle_pin_ids.contains(&id)
+                ));
+                continue;
+            }
+            if self.activate_detached_image_window_snapshot(ctx, id) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_committed id={id} passive_windows={} active_context={}",
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
+                break;
+            } else {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_failed id={id} passive_windows={} active_context={}",
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context_present()
+                ));
+            }
+        }
+        self.prune_deferred_detached_image_window_views();
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn process_deferred_detached_image_window_events_for_test(
+        &mut self,
+        ctx: &egui::Context,
+    ) {
+        let mut batch = DetachedImageWindowEventBatch::default();
+        let shared_views = self
+            .deferred_detached_image_window_views
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for shared in shared_views {
+            for event in shared.drain_events() {
+                self.queue_deferred_detached_image_window_event(ctx, event, &mut batch);
+            }
+        }
+        self.apply_detached_image_window_event_batch(ctx, batch);
+    }
+
+    #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
         let pending_close_ids: Vec<u64> =
             self.detached_image_window_close_pending.drain(..).collect();
@@ -3722,6 +4045,7 @@ impl App {
         }
 
         if self.detached_image_windows.is_empty() {
+            self.prune_deferred_detached_image_window_views();
             return;
         }
 
@@ -3753,18 +4077,180 @@ impl App {
             }
         }
 
-        let windows = self.detached_image_windows.clone();
-        let show_pin = !self.settings.detached_viewer_open_images_in_window;
-        let mut close_ids = Vec::new();
-        let mut close_command_ids = Vec::new();
-        let mut toggle_pin_ids = Vec::new();
-        let mut activate_ids = Vec::new();
-        let mut placements = Vec::new();
-        let mut focus_updates = Vec::new();
-        let mut initial_placement_applied_ids = Vec::new();
-        let mut placement_seed_reset_ids = Vec::new();
+        let mut deferred_batch = DetachedImageWindowEventBatch::default();
+        let shared_views = self
+            .deferred_detached_image_window_views
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for shared in shared_views {
+            for event in shared.drain_events() {
+                self.queue_deferred_detached_image_window_event(ctx, event, &mut deferred_batch);
+            }
+        }
+        self.apply_detached_image_window_event_batch(ctx, deferred_batch);
 
+        if self.detached_image_windows.is_empty() {
+            self.prune_deferred_detached_image_window_views();
+            return;
+        }
+
+        let windows = self.detached_image_windows.clone();
+        let mut deferred_windows = Vec::new();
+        let mut parked_live_windows = Vec::new();
         for window in windows {
+            if self.detached_window_state_is_parked_live(window.id) {
+                parked_live_windows.push(window);
+            } else {
+                deferred_windows.push(window);
+            }
+        }
+        let show_pin = !self.settings.detached_viewer_open_images_in_window;
+        let mut render_batch = DetachedImageWindowEventBatch::default();
+        let mut unconfirmed_deferred_registered = false;
+
+        for window in &deferred_windows {
+            let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            if !self.deferred_detached_window_registration_allowed(
+                window.id,
+                &mut unconfirmed_deferred_registered,
+            ) {
+                self.log_detached_image_window_debug(format!(
+                    "deferred_registration_delayed id={} reason=unconfirmed_hwnd_serialized \
+                     passive_windows={}",
+                    window.id,
+                    self.detached_image_windows.len()
+                ));
+                continue;
+            }
+            let window_show_pin = show_pin;
+            let apply_initial_placement = !window.initial_placement_applied;
+            let window_placement =
+                self.ensure_detached_window_runtime_placement(window.id, "deferred_passive_seed");
+            let builder = Self::build_detached_image_window_builder(
+                window,
+                window_placement,
+                apply_initial_placement,
+            );
+            let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
+                window,
+                window_show_pin,
+                window_placement,
+                apply_initial_placement,
+            );
+            let shared = self.deferred_detached_image_window_shared(view);
+            ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx, _class| {
+                let Some(view) = shared.view() else {
+                    return;
+                };
+                if shared.push_first_callback_once(view.id) {
+                    vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
+                    vp_ctx.input(|i| {
+                        let vp = i.viewport();
+                        (
+                            vp.outer_rect,
+                            vp.inner_rect,
+                            vp.minimized.unwrap_or(false),
+                            vp.maximized.unwrap_or(false),
+                            vp.focused.unwrap_or(false),
+                            i.pixels_per_point,
+                        )
+                    });
+                let mut placement_update = None;
+                if !minimized && let Some(outer) = outer_rect {
+                    let mut placement = view.placement;
+                    placement.x = outer.min.x;
+                    placement.y = outer.min.y;
+                    if let Some(inner) = inner_rect {
+                        placement.w = inner.width();
+                        placement.h = inner.height();
+                    } else {
+                        placement.w = outer.width();
+                        placement.h = outer.height();
+                    }
+                    placement.maximized = maximized;
+                    if placement.is_sane()
+                        && crate::monitor::title_bar_on_some_monitor(
+                            placement.x,
+                            placement.y,
+                            placement.w,
+                        )
+                    {
+                        placement_update = Some(placement);
+                    }
+                }
+                let viewport_close_requested = vp_ctx.input(|i| i.viewport().close_requested());
+                let (
+                    pointer_activation,
+                    scroll_activation_candidate,
+                    key_activation_candidate,
+                    wheel_activation_candidate,
+                ) = vp_ctx.input(|i| {
+                    let pointer = i.pointer.any_pressed();
+                    let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
+                        || i.smooth_scroll_delta != egui::Vec2::ZERO;
+                    let key = i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }));
+                    let wheel = i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
+                    (pointer, scroll, key, wheel)
+                });
+                let mut bar_close_requested = false;
+                let mut pin_toggle_requested = false;
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                    .show(vp_ctx, |ui| {
+                        let full_rect = ui.max_rect();
+                        Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                        Self::draw_detached_image_window_bar(
+                            ui,
+                            vp_ctx,
+                            full_rect,
+                            &view,
+                            &mut bar_close_requested,
+                            &mut pin_toggle_requested,
+                        );
+                    });
+                // Passive deferred still windows are display-only. They contain no text input,
+                // so IME state remains owned by the root App pass.
+                shared.push_event(crate::app::DeferredDetachedImageWindowEvent::Frame {
+                    id: view.id,
+                    viewport_close_requested,
+                    bar_close_requested,
+                    pin_toggle_requested,
+                    focused,
+                    pointer_activation,
+                    scroll_candidate: scroll_activation_candidate,
+                    key_candidate: key_activation_candidate,
+                    wheel_candidate: wheel_activation_candidate,
+                    placement_update,
+                    pixels_per_point: ppp,
+                    apply_initial_placement: view.apply_initial_placement,
+                });
+                if viewport_close_requested
+                    || bar_close_requested
+                    || pin_toggle_requested
+                    || pointer_activation
+                    || scroll_activation_candidate
+                    || key_activation_candidate
+                    || wheel_activation_candidate
+                    || placement_update.is_some()
+                {
+                    vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            });
+            if apply_initial_placement {
+                render_batch.initial_placement_applied_ids.push(window.id);
+            }
+        }
+
+        for window in parked_live_windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let window_show_pin = show_pin && !self.detached_window_state_is_parked_live(window.id);
             let apply_initial_placement = !window.initial_placement_applied;
@@ -3789,6 +4275,12 @@ impl App {
             #[cfg(windows)]
             let hwnd_before =
                 self.detached_window_hwnd_snapshot_before_show(window.id, "passive", viewport_id);
+            let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
+                &window,
+                window_show_pin,
+                window_placement,
+                apply_initial_placement,
+            );
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
                     vp_ctx.input(|i| {
@@ -3853,13 +4345,12 @@ impl App {
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(vp_ctx, |ui| {
                         let full_rect = ui.max_rect();
-                        Self::draw_detached_image_window_snapshot(ui, full_rect, &window);
+                        Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
                         Self::draw_detached_image_window_bar(
                             ui,
                             vp_ctx,
                             full_rect,
-                            &window,
-                            window_show_pin,
+                            &view,
                             &mut bar_close_requested,
                             &mut pin_toggle_requested,
                         );
@@ -3874,13 +4365,13 @@ impl App {
             );
 
             if bar_close_requested {
-                close_command_ids.push(window.id);
-                close_ids.push(window.id);
+                render_batch.close_command_ids.push(window.id);
+                render_batch.close_ids.push(window.id);
             } else if viewport_close_requested {
-                close_ids.push(window.id);
+                render_batch.close_ids.push(window.id);
             }
             if pin_toggle_requested {
-                toggle_pin_ids.push(window.id);
+                render_batch.toggle_pin_ids.push(window.id);
             }
             let can_activate = self
                 .detached_image_windows
@@ -3956,7 +4447,7 @@ impl App {
                     self.detached_image_windows.len(),
                     self.active_detached_viewer_context_present()
                 ));
-                activate_ids.push(window.id);
+                render_batch.activate_ids.push(window.id);
             }
             if let Some(placement) = placement_update {
                 if Self::detached_passive_placement_update_looks_like_default_viewport(
@@ -3974,7 +4465,7 @@ impl App {
                         window_placement,
                         placement
                     ));
-                    placement_seed_reset_ids.push(window.id);
+                    render_batch.placement_seed_reset_ids.push(window.id);
                     ctx.request_repaint();
                 } else if placement != window_placement {
                     self.log_detached_image_window_debug(format!(
@@ -3986,106 +4477,20 @@ impl App {
                         window_placement,
                         placement
                     ));
-                    placements.push((window.id, placement));
+                    render_batch.placements.push((window.id, placement));
                 }
             }
             if apply_initial_placement {
-                initial_placement_applied_ids.push(window.id);
+                render_batch.initial_placement_applied_ids.push(window.id);
             }
-            focus_updates.push((window.id, focused_now));
-        }
-
-        for (id, placement) in placements {
-            self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
-        }
-        for id in initial_placement_applied_ids {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.initial_placement_applied = true;
-            }
-        }
-        for id in placement_seed_reset_ids {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.initial_placement_applied = false;
-            }
-        }
-        let mut pin_flag_updates = Vec::new();
-        for id in &toggle_pin_ids {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == *id)
-            {
-                window.pinned = !window.pinned;
-                pin_flag_updates.push((*id, window.pinned));
-            }
-        }
-        for (id, pinned) in pin_flag_updates {
-            self.update_detached_window_runtime_flags(id, pinned, !pinned, "passive_toggle_pin");
-        }
-        if !close_ids.is_empty() {
-            self.log_detached_image_window_debug(format!(
-                "passive_close ids={close_ids:?} command_ids={close_command_ids:?} \
-                 passive_before={} activate_ids={activate_ids:?}",
-                self.detached_image_windows.len()
-            ));
-            if !close_command_ids.is_empty() {
-                crate::dwm_transitions::disable_transitions_for_thread_windows();
-            }
-            for id in &close_ids {
-                self.transition_detached_window_state(
-                    *id,
-                    crate::app::DetachedWindowState::Closing,
-                    "passive_close",
-                );
-                if let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(*id) {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_close_clear_host id={id} hwnd=0x{hwnd:x}"
-                    ));
-                }
-            }
-            for id in &close_command_ids {
-                let viewport_id = Self::detached_image_window_viewport_id(*id);
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-            }
-            self.detached_image_windows
-                .retain(|window| !close_ids.contains(&window.id));
-            for id in &close_ids {
-                self.remove_detached_window_runtime(*id, "passive_close");
-            }
-            if self.detached_image_windows.is_empty() {
-                self.request_detached_cleanup_font_atlas_resync("passive_close");
-            }
-            self.focus_main_after_detached_window_close_if_idle(ctx, "passive_close");
-        }
-        for (id, focused) in focus_updates {
-            if close_ids.contains(&id) || activate_ids.contains(&id) {
-                continue;
-            }
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                if !focused {
-                    window.activation_armed = true;
-                }
-                window.focused_last_frame = focused;
-            }
+            render_batch.focus_updates.push((window.id, focused_now));
         }
         for id in self.take_parked_live_activation_requests_after_passive_render() {
             if self.detached_window_state_is_parked_live(id) {
                 self.log_detached_image_window_debug(format!(
                     "parked_live_native_activate_request_after_passive_render id={id}"
                 ));
-                activate_ids.push(id);
+                render_batch.activate_ids.push(id);
             } else {
                 self.log_detached_image_window_debug(format!(
                     "parked_live_native_activate_request_dropped id={id} state={:?}",
@@ -4093,32 +4498,7 @@ impl App {
                 ));
             }
         }
-        activate_ids.sort_unstable();
-        activate_ids.dedup();
-        for id in activate_ids {
-            if close_ids.contains(&id) || toggle_pin_ids.contains(&id) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_skipped id={id} close={} toggle={}",
-                    close_ids.contains(&id),
-                    toggle_pin_ids.contains(&id)
-                ));
-                continue;
-            }
-            if self.activate_detached_image_window_snapshot(ctx, id) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_committed id={id} passive_windows={} active_context={}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
-                ));
-                break;
-            } else {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_failed id={id} passive_windows={} active_context={}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
-                ));
-            }
-        }
+        self.apply_detached_image_window_event_batch(ctx, render_batch);
     }
 
     #[cfg(windows)]

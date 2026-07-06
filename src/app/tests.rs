@@ -22205,6 +22205,116 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn deferred_detached_registration_serializes_unconfirmed_hwnds_per_frame() {
+        let mut app = setup_app();
+        app.detached_window_hwnd_set(10, 0x1010);
+        app.set_detached_window_live_hwnds_for_test([0x1010]);
+
+        let mut unconfirmed_claimed = false;
+        assert!(
+            app.deferred_detached_window_registration_allowed(10, &mut unconfirmed_claimed),
+            "an already confirmed deferred viewport may be registered even after another unknown one"
+        );
+        assert!(!unconfirmed_claimed);
+        assert!(
+            app.deferred_detached_window_registration_allowed(11, &mut unconfirmed_claimed),
+            "the first unknown deferred viewport in a frame is allowed to create its HWND"
+        );
+        assert!(unconfirmed_claimed);
+        assert!(
+            !app.deferred_detached_window_registration_allowed(12, &mut unconfirmed_claimed),
+            "a second unknown deferred viewport in the same frame would make unclaimed HWND adoption ambiguous"
+        );
+
+        let mut next_frame_claim = false;
+        assert!(
+            app.deferred_detached_window_registration_allowed(12, &mut next_frame_claim),
+            "serialization is per-frame; the delayed viewport is allowed on the next root pass"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn deferred_placement_event_rejects_default_geometry_on_app_side() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "deferred-placement",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let previous = crate::settings::DetachedViewerWindowPlacement {
+            x: 502.0,
+            y: 138.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        let default_candidate = crate::settings::DetachedViewerWindowPlacement {
+            x: 152.0,
+            y: 152.0,
+            w: 533.3333,
+            h: 400.0,
+            maximized: false,
+        };
+        let snapshot = DetachedImageWindowSnapshot {
+            id: 7,
+            texture,
+            title: "deferred.jpg - mimageviewer".to_string(),
+            location_display: "deferred.jpg".to_string(),
+            image_dims: Some((1, 1)),
+            pinned: false,
+            rotation: crate::rotation_db::Rotation::None,
+            zoom_pan: None,
+            free_rotation: 0.0,
+            frozen_continuous_pages: Vec::new(),
+            reopen_descriptor: None,
+            reopen_sync_stamp: None,
+            activation_armed: true,
+            focused_last_frame: false,
+            initial_placement_applied: true,
+            paused_bundle: None,
+        };
+        app.detached_image_windows.push(snapshot);
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_deferred");
+        app.set_detached_window_runtime_placement(7, previous, "test_deferred_previous");
+        let view = DeferredDetachedImageWindowView::from_snapshot(
+            &app.detached_image_windows[0],
+            true,
+            previous,
+            false,
+        );
+        let shared = app.deferred_detached_image_window_shared(view);
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            pin_toggle_requested: false,
+            focused: false,
+            pointer_activation: false,
+            scroll_candidate: false,
+            key_candidate: false,
+            wheel_candidate: false,
+            placement_update: Some(default_candidate),
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+
+        assert_eq!(
+            app.detached_window_runtime_placement(7),
+            Some(previous),
+            "deferred PlacementObserved must pass through the same default-geometry rejection as immediate passive windows"
+        );
+        assert!(
+            !app.detached_image_windows[0].initial_placement_applied,
+            "rejecting a default geometry observation asks the next deferred registration to re-seed placement"
+        );
+    }
+
+    #[test]
     fn detached_viewer_maximized_save_preserves_restore_placement() {
         let mut app = setup_app();
         let seed = crate::settings::DetachedViewerWindowPlacement {

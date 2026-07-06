@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -217,6 +217,124 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) location_display: String,
     pub(crate) content_bbox: Option<egui::Rect>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct DeferredDetachedImageWindowView {
+    pub(crate) id: u64,
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) location_display: String,
+    pub(crate) image_dims: Option<(u32, u32)>,
+    pub(crate) pinned: bool,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
+    pub(crate) free_rotation: f32,
+    pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
+    pub(crate) show_pin: bool,
+    pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
+    pub(crate) apply_initial_placement: bool,
+}
+
+#[cfg(windows)]
+impl DeferredDetachedImageWindowView {
+    pub(crate) fn from_snapshot(
+        window: &DetachedImageWindowSnapshot,
+        show_pin: bool,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+        apply_initial_placement: bool,
+    ) -> Self {
+        Self {
+            id: window.id,
+            texture: window.texture.clone(),
+            location_display: window.location_display.clone(),
+            image_dims: window.image_dims,
+            pinned: window.pinned,
+            rotation: window.rotation,
+            zoom_pan: window.zoom_pan,
+            free_rotation: window.free_rotation,
+            frozen_continuous_pages: window.frozen_continuous_pages.clone(),
+            show_pin,
+            placement,
+            apply_initial_placement,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub(crate) enum DeferredDetachedImageWindowEvent {
+    FirstCallback {
+        id: u64,
+    },
+    Frame {
+        id: u64,
+        viewport_close_requested: bool,
+        bar_close_requested: bool,
+        pin_toggle_requested: bool,
+        focused: bool,
+        pointer_activation: bool,
+        scroll_candidate: bool,
+        key_candidate: bool,
+        wheel_candidate: bool,
+        placement_update: Option<crate::settings::DetachedViewerWindowPlacement>,
+        pixels_per_point: f32,
+        apply_initial_placement: bool,
+    },
+}
+
+#[cfg(windows)]
+pub(crate) struct DeferredDetachedImageWindowShared {
+    view: Mutex<DeferredDetachedImageWindowView>,
+    events: Mutex<Vec<DeferredDetachedImageWindowEvent>>,
+    first_callback_sent: AtomicBool,
+}
+
+#[cfg(windows)]
+impl DeferredDetachedImageWindowShared {
+    pub(crate) fn new(view: DeferredDetachedImageWindowView) -> Self {
+        Self {
+            view: Mutex::new(view),
+            events: Mutex::new(Vec::new()),
+            first_callback_sent: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn set_view(&self, view: DeferredDetachedImageWindowView) {
+        if let Ok(mut guard) = self.view.lock() {
+            *guard = view;
+        }
+    }
+
+    pub(crate) fn view(&self) -> Option<DeferredDetachedImageWindowView> {
+        self.view.lock().ok().map(|guard| guard.clone())
+    }
+
+    pub(crate) fn push_event(&self, event: DeferredDetachedImageWindowEvent) {
+        if let Ok(mut guard) = self.events.lock() {
+            guard.push(event);
+        }
+    }
+
+    pub(crate) fn push_first_callback_once(&self, id: u64) -> bool {
+        if self
+            .first_callback_sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.push_event(DeferredDetachedImageWindowEvent::FirstCallback { id });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn drain_events(&self) -> Vec<DeferredDetachedImageWindowEvent> {
+        self.events
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
+    }
 }
 
 impl Clone for DetachedImageWindowSnapshot {
@@ -4079,6 +4197,11 @@ pub struct App {
     /// 操作系・先読み・編集・AI は持たず、最後に表示したテクスチャだけを保持する。
     #[cfg(windows)]
     pub(crate) detached_image_windows: Vec<DetachedImageWindowSnapshot>,
+    /// deferred viewport callback と root App pass の間で passive frozen still の
+    /// 表示 DTO と入力イベントを受け渡す共有状態。
+    #[cfg(windows)]
+    pub(crate) deferred_detached_image_window_views:
+        HashMap<u64, Arc<DeferredDetachedImageWindowShared>>,
     /// メイン一覧から独立して動く active detached viewer の item/cache context。
     ///
     /// `App` の既存 fullscreen 実装は `self.items[self.fullscreen_idx]` 前提が広いため、
@@ -7141,6 +7264,8 @@ impl App {
             detached_viewer_window_id: None,
             #[cfg(windows)]
             detached_image_windows: Vec::new(),
+            #[cfg(windows)]
+            deferred_detached_image_window_views: HashMap::new(),
             #[cfg(windows)]
             active_detached_viewer_context: None,
             #[cfg(windows)]
@@ -24402,6 +24527,128 @@ impl App {
         pointer_activation: bool,
     ) -> bool {
         can_activate && activation_armed && pointer_activation
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn deferred_detached_image_window_shared(
+        &mut self,
+        view: DeferredDetachedImageWindowView,
+    ) -> Arc<DeferredDetachedImageWindowShared> {
+        let id = view.id;
+        let shared = self
+            .deferred_detached_image_window_views
+            .entry(id)
+            .or_insert_with(|| Arc::new(DeferredDetachedImageWindowShared::new(view.clone())))
+            .clone();
+        shared.set_view(view);
+        shared
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn prune_deferred_detached_image_window_views(&mut self) {
+        let live_ids: HashSet<u64> = self
+            .detached_image_windows
+            .iter()
+            .filter(|window| !self.detached_window_state_is_parked_live(window.id))
+            .map(|window| window.id)
+            .collect();
+        self.deferred_detached_image_window_views
+            .retain(|id, _| live_ids.contains(id));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn deferred_detached_window_registration_allowed(
+        &self,
+        window_id: u64,
+        unconfirmed_claimed_this_frame: &mut bool,
+    ) -> bool {
+        if self.detached_window_hwnd_alive(window_id).is_some() {
+            return true;
+        }
+        if *unconfirmed_claimed_this_frame {
+            return false;
+        }
+        *unconfirmed_claimed_this_frame = true;
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn adopt_deferred_detached_window_hwnd_after_callback(
+        &mut self,
+        window_id: u64,
+        viewport_id: egui::ViewportId,
+    ) {
+        if self.detached_window_hwnd_alive(window_id).is_some() {
+            return;
+        }
+        let previous_hwnd = self.detached_window_hwnd_clear_if_dead(window_id);
+        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, "deferred");
+        let Some(main_hwnd) = self.main_hwnd else {
+            self.log_detached_image_window_debug(format!(
+                "hwnd_deferred_retry frame={} window_id={window_id} viewport={viewport_id:?} \
+                 reason=no_main_hwnd old={}",
+                self.frame_counter,
+                previous_hwnd
+                    .map(|old| format!("0x{old:x}"))
+                    .unwrap_or_else(|| "none".to_string())
+            ));
+            return;
+        };
+        let after = crate::dwm_transitions::thread_window_snapshot(
+            windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+        );
+        let claimed = self.detached_window_registered_hwnds();
+        match Self::select_detached_unclaimed_hwnd(&after, &claimed) {
+            DetachedWindowHwndDiff::Created(hwnd) => {
+                let old = self
+                    .detached_window_hwnd_set(window_id, hwnd)
+                    .or(previous_hwnd);
+                self.transition_detached_window_state(
+                    window_id,
+                    DetachedWindowState::Parked,
+                    "hwnd_adopted_deferred",
+                );
+                self.detached_viewer_host_generation =
+                    self.detached_viewer_host_generation.saturating_add(1);
+                crate::logger::log(format!(
+                    "[detached-viewer] hwnd_adopted_deferred hwnd=0x{hwnd:x} \
+                     host_generation={} frame={} window_id={window_id} viewport={viewport_id:?} \
+                     old={} new_state=\"{}\"",
+                    self.detached_viewer_host_generation,
+                    self.frame_counter,
+                    old.map(|value| format!("0x{value:x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    Self::win32_hwnd_debug_state(hwnd)
+                ));
+            }
+            DetachedWindowHwndDiff::NoChange => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_deferred_retry frame={} window_id={window_id} viewport={viewport_id:?} \
+                     reason=no_unclaimed old={} after_count={} claimed_count={} host={}",
+                    self.frame_counter,
+                    previous_hwnd
+                        .map(|old| format!("0x{old:x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    after.len(),
+                    claimed.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+            }
+            DetachedWindowHwndDiff::Ambiguous(candidates) => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_deferred_retry frame={} window_id={window_id} viewport={viewport_id:?} \
+                     reason=ambiguous candidates={candidates:x?} old={} after_count={} \
+                     claimed_count={} host={}",
+                    self.frame_counter,
+                    previous_hwnd
+                        .map(|old| format!("0x{old:x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    after.len(),
+                    claimed.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]

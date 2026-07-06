@@ -123,6 +123,22 @@ ParkedLive 駆動ノート（R2b）:
 - passive egui viewport は黒 backdrop と close 用の最小 UI を描くだけで、映像本体は presenter child が覆う。
 - ParkedLive クリック時は既存の paused_bundle resume 経路で `Resuming → Active` に戻す。
 
+Passive frozen still 駆動ノート（R2d）:
+- Passive・連動 / Passive・連動なしの **静止画 frozen 窓のみ** `show_viewport_deferred`
+  で描く。描画 DTO は texture / 表示名 / rotation / zoom / free rotation に加え、
+  見開き・連結スクロール凍結用の `frozen_continuous_pages` を持つ。`paused_bundle` は
+  deferred callback に渡さない。
+- root pass は単一ループで deferred viewport を登録し、callback は `Arc<Mutex<...>>`
+  の DTO と一方向イベントキュー（Close / Pin / Activate / PlacementObserved /
+  FirstCallbackSeen）だけを介して App と通信する。
+- HWND 未確定の deferred viewport は 1 frame に 1 つだけ登録し、初回 callback 後に
+  App 側で未請求 HWND を採用する。geometry / rect 照合は追加しない。
+- `PlacementObserved` は App 側で既存の default geometry rejection を通してから
+  runtime placement に反映する。deferred callback は text input を持たず、IME 状態は
+  root App pass が所有する。
+- ParkedLive は native presenter child の親 HWND と毎フレーム tick が必要なため、
+  R2d では immediate viewport を継続する。
+
 **遷移表:**
 
 | # | 操作 | 結果 |
