@@ -598,6 +598,86 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn detached_window_state_for_show_label(
+        &self,
+        window_id: u64,
+        label: &'static str,
+    ) -> DetachedWindowState {
+        if self.detached_window_state_is_parked_live(window_id) {
+            DetachedWindowState::ParkedLive
+        } else if label == "passive" {
+            DetachedWindowState::Parked
+        } else {
+            DetachedWindowState::Active
+        }
+    }
+
+    #[cfg(windows)]
+    fn adopt_unclaimed_detached_window_hwnd_after_show(
+        &mut self,
+        window_id: u64,
+        label: &'static str,
+        viewport_id: egui::ViewportId,
+        after: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
+        old: Option<u64>,
+    ) -> bool {
+        let claimed = self.detached_window_registered_hwnds();
+        match Self::select_detached_unclaimed_hwnd(after, &claimed) {
+            DetachedWindowHwndDiff::Created(hwnd) => {
+                self.detached_window_hwnd_set(window_id, hwnd);
+                let state = self.detached_window_state_for_show_label(window_id, label);
+                self.transition_detached_window_state(window_id, state, "hwnd_adopted_unclaimed");
+                self.detached_viewer_host_generation =
+                    self.detached_viewer_host_generation.saturating_add(1);
+                let old_text = old
+                    .map(|hwnd| format!("0x{hwnd:x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                crate::logger::log(format!(
+                    "[detached-viewer] hwnd_adopted_unclaimed hwnd=0x{hwnd:x} \
+                     host_generation={} frame={} window_id={window_id} label={label} \
+                     viewport={viewport_id:?} old={old_text} new_state=\"{}\"",
+                    self.detached_viewer_host_generation,
+                    self.frame_counter,
+                    Self::win32_hwnd_debug_state(hwnd)
+                ));
+                if self.pending_detached_video_host_resync {
+                    self.pending_detached_video_host_resync =
+                        !self.try_resync_detached_video_host();
+                }
+                true
+            }
+            DetachedWindowHwndDiff::NoChange => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
+                     viewport={viewport_id:?} reason=no_unclaimed old={} \
+                     after_count={} claimed_count={} host={}",
+                    self.frame_counter,
+                    old.map(|hwnd| format!("0x{hwnd:x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    after.len(),
+                    claimed.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+                false
+            }
+            DetachedWindowHwndDiff::Ambiguous(candidates) => {
+                self.log_detached_image_window_debug(format!(
+                    "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
+                     viewport={viewport_id:?} reason=ambiguous candidates={candidates:x?} \
+                     old={} after_count={} claimed_count={} host={}",
+                    self.frame_counter,
+                    old.map(|hwnd| format!("0x{hwnd:x}"))
+                        .unwrap_or_else(|| "none".to_string()),
+                    after.len(),
+                    claimed.len(),
+                    self.detached_viewer_host_debug_state()
+                ));
+                false
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_detached_window_live_hwnds_for_test<I>(&mut self, hwnds: I)
     where
@@ -23464,6 +23544,25 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn defer_pending_main_font_atlas_resync_for_detached_session(&mut self, source: &'static str) {
+        if !self.main_font_atlas_resync_pending {
+            return;
+        }
+        let reason = self
+            .main_font_atlas_resync_reason
+            .take()
+            .unwrap_or("unknown");
+        self.main_font_atlas_resync_pending = false;
+        self.main_font_atlas_resync_repeats_left = 0;
+        self.main_font_atlas_resync_last_fire_frame = u64::MAX;
+        crate::logger::log(format!(
+            "[ui-fonts] move pending main font atlas resync to detached-deferred: \
+             reason={reason} source={source}"
+        ));
+        self.defer_main_font_atlas_resync(reason, source);
+    }
+
+    #[cfg(windows)]
     pub(crate) fn detached_font_atlas_resync_should_wait(&self) -> bool {
         !self.detached_image_windows.is_empty()
             || self.active_detached_viewer_context.is_some()
@@ -23761,6 +23860,7 @@ impl App {
                 "session_begin window_id={window_id} source={source:?}"
             ));
         }
+        self.defer_pending_main_font_atlas_resync_for_detached_session("session_begin");
     }
 
     /// セッション終了処理を開始する (closing=true)。teardown 中は keep-alive を止めるが、
@@ -24391,13 +24491,7 @@ impl App {
         match Self::select_detached_created_hwnd(before, &after) {
             DetachedWindowHwndDiff::Created(hwnd) => {
                 let previous = self.detached_window_hwnd_set(window_id, hwnd);
-                let state = if self.detached_window_state_is_parked_live(window_id) {
-                    DetachedWindowState::ParkedLive
-                } else if label == "passive" {
-                    DetachedWindowState::Parked
-                } else {
-                    DetachedWindowState::Active
-                };
+                let state = self.detached_window_state_for_show_label(window_id, label);
                 self.transition_detached_window_state(window_id, state, "hwnd_registered");
                 self.detached_viewer_host_generation =
                     self.detached_viewer_host_generation.saturating_add(1);
@@ -24418,6 +24512,15 @@ impl App {
                 }
             }
             DetachedWindowHwndDiff::NoChange => {
+                if self.adopt_unclaimed_detached_window_hwnd_after_show(
+                    window_id,
+                    label,
+                    viewport_id,
+                    &after,
+                    None,
+                ) {
+                    return;
+                }
                 self.log_detached_image_window_debug(format!(
                     "hwnd_diff_retry label={label} frame={} window_id={window_id} \
                      viewport={viewport_id:?} reason=no_new_window before_count={} \
@@ -24477,56 +24580,13 @@ impl App {
         let after = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
-        let claimed = self.detached_window_registered_hwnds();
-        match Self::select_detached_unclaimed_hwnd(&after, &claimed) {
-            DetachedWindowHwndDiff::Created(hwnd) => {
-                self.detached_window_hwnd_set(window_id, hwnd);
-                let state = if self.detached_window_state_is_parked_live(window_id) {
-                    DetachedWindowState::ParkedLive
-                } else if label == "passive" {
-                    DetachedWindowState::Parked
-                } else {
-                    DetachedWindowState::Active
-                };
-                self.transition_detached_window_state(window_id, state, "hwnd_adopted_unclaimed");
-                self.detached_viewer_host_generation =
-                    self.detached_viewer_host_generation.saturating_add(1);
-                crate::logger::log(format!(
-                    "[detached-viewer] hwnd_adopted_unclaimed hwnd=0x{hwnd:x} \
-                     host_generation={} frame={} window_id={window_id} label={label} \
-                     viewport={viewport_id:?} old=0x{previous_hwnd:x} new_state=\"{}\"",
-                    self.detached_viewer_host_generation,
-                    self.frame_counter,
-                    Self::win32_hwnd_debug_state(hwnd)
-                ));
-                if self.pending_detached_video_host_resync {
-                    self.pending_detached_video_host_resync =
-                        !self.try_resync_detached_video_host();
-                }
-            }
-            DetachedWindowHwndDiff::NoChange => {
-                self.log_detached_image_window_debug(format!(
-                    "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
-                     viewport={viewport_id:?} reason=no_unclaimed old=0x{previous_hwnd:x} \
-                     after_count={} claimed_count={} host={}",
-                    self.frame_counter,
-                    after.len(),
-                    claimed.len(),
-                    self.detached_viewer_host_debug_state()
-                ));
-            }
-            DetachedWindowHwndDiff::Ambiguous(candidates) => {
-                self.log_detached_image_window_debug(format!(
-                    "hwnd_unclaimed_retry label={label} frame={} window_id={window_id} \
-                     viewport={viewport_id:?} reason=ambiguous candidates={candidates:x?} \
-                     old=0x{previous_hwnd:x} after_count={} claimed_count={} host={}",
-                    self.frame_counter,
-                    after.len(),
-                    claimed.len(),
-                    self.detached_viewer_host_debug_state()
-                ));
-            }
-        }
+        self.adopt_unclaimed_detached_window_hwnd_after_show(
+            window_id,
+            label,
+            viewport_id,
+            &after,
+            Some(previous_hwnd),
+        );
     }
 
     #[cfg(windows)]

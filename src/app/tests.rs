@@ -16444,6 +16444,37 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn detached_hwnd_no_change_path_adopts_single_unclaimed_egui_window() {
+        let mut app = setup_app();
+        app.detached_window_hwnd_set(8, 0x800);
+        app.set_detached_window_live_hwnds_for_test([0x800]);
+
+        let after = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x800, false, "Window Class"),
+            thread_window_entry(0x900, false, "Window Class"),
+        ];
+
+        assert!(app.adopt_unclaimed_detached_window_hwnd_after_show(
+            7,
+            "active_render",
+            App::detached_image_window_viewport_id(7),
+            &after,
+            None,
+        ));
+        assert_eq!(
+            app.detached_window_hwnd_raw_for_window_id(7),
+            0x900,
+            "a no-diff show frame must still claim the one unregistered egui viewport"
+        );
+        assert_eq!(
+            app.detached_window_state(7),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[test]
     fn detached_hwnd_unclaimed_retries_on_zero_or_multiple_unregistered_egui_windows() {
         let mut claimed = std::collections::HashSet::new();
         claimed.insert(0x800);
@@ -19669,6 +19700,41 @@ mod still_window_mode_key_tests {
         app.detached_image_windows.clear();
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
+        assert!(app.main_font_atlas_resync_pending);
+        assert_eq!(
+            app.main_font_atlas_resync_reason,
+            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pending_main_font_resync_moves_to_deferred_when_detached_session_starts() {
+        let mut app = setup_app();
+
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        assert!(app.main_font_atlas_resync_pending);
+        assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
+
+        app.begin_active_detached_session(33, DetachedSource::Image);
+
+        assert!(
+            !app.main_font_atlas_resync_pending,
+            "main font-atlas resync must not keep firing after a detached session starts"
+        );
+        assert_eq!(
+            app.pending_detached_cleanup_font_atlas_resync,
+            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
+        );
+        app.flush_pending_detached_cleanup_font_atlas_resync();
+        assert!(
+            !app.main_font_atlas_resync_pending,
+            "deferred resync must wait while the detached session remains alive"
+        );
+
+        app.begin_active_detached_session_close("test");
+        app.finish_active_detached_session_close("test");
+        app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(app.main_font_atlas_resync_pending);
         assert_eq!(
             app.main_font_atlas_resync_reason,
