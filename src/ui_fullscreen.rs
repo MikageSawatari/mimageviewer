@@ -3886,6 +3886,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         mut batch: DetachedImageWindowEventBatch,
+        defer_activations: bool,
     ) {
         for (id, placement) in batch.placements.drain(..) {
             self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
@@ -3990,6 +3991,11 @@ impl App {
                 ));
                 continue;
             }
+            if defer_activations {
+                self.queue_deferred_detached_window_activation(id, "deferred_passive_activate");
+                ctx.request_repaint();
+                break;
+            }
             if self.activate_detached_image_window_snapshot(ctx, id) {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_committed id={id} passive_windows={} active_context={}",
@@ -4024,7 +4030,7 @@ impl App {
                 self.queue_deferred_detached_image_window_event(ctx, event, &mut batch);
             }
         }
-        self.apply_detached_image_window_event_batch(ctx, batch);
+        self.apply_detached_image_window_event_batch(ctx, batch, true);
     }
 
     #[cfg(windows)]
@@ -4088,7 +4094,7 @@ impl App {
                 self.queue_deferred_detached_image_window_event(ctx, event, &mut deferred_batch);
             }
         }
-        self.apply_detached_image_window_event_batch(ctx, deferred_batch);
+        self.apply_detached_image_window_event_batch(ctx, deferred_batch, true);
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();
@@ -4498,7 +4504,7 @@ impl App {
                 ));
             }
         }
-        self.apply_detached_image_window_event_batch(ctx, render_batch);
+        self.apply_detached_image_window_event_batch(ctx, render_batch, false);
     }
 
     #[cfg(windows)]

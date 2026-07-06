@@ -22236,6 +22236,107 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn deferred_activation_queues_until_next_root_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.frame_counter = 40;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.selected = Some(0);
+        let stamp = app
+            .viewer_sync_stamp_for_idx(0)
+            .expect("PDF page should produce a sync stamp");
+
+        let texture = ctx.load_texture(
+            "deferred-activation",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        let snapshot = DetachedImageWindowSnapshot {
+            id: 7,
+            texture,
+            title: "a.jpg - mimageviewer".to_string(),
+            location_display: "a.jpg".to_string(),
+            image_dims: Some((1, 1)),
+            pinned: false,
+            rotation: crate::rotation_db::Rotation::None,
+            zoom_pan: None,
+            free_rotation: 0.0,
+            frozen_continuous_pages: Vec::new(),
+            reopen_descriptor: None,
+            reopen_sync_stamp: Some(stamp),
+            activation_armed: true,
+            focused_last_frame: false,
+            initial_placement_applied: true,
+            paused_bundle: None,
+        };
+        app.detached_image_windows.push(snapshot);
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_deferred");
+        app.set_detached_window_runtime_placement(7, placement, "test_deferred_activation");
+
+        let view = DeferredDetachedImageWindowView::from_snapshot(
+            &app.detached_image_windows[0],
+            true,
+            placement,
+            false,
+        );
+        let shared = app.deferred_detached_image_window_shared(view);
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            pin_toggle_requested: false,
+            focused: true,
+            pointer_activation: true,
+            scroll_candidate: false,
+            key_candidate: false,
+            wheel_candidate: false,
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+
+        assert_eq!(
+            app.detached_image_windows.len(),
+            1,
+            "the queued frame must keep the deferred snapshot registered"
+        );
+        assert!(
+            app.detached_window_deferred_activation_pending(7),
+            "deferred callback activation should only queue during the callback/root handoff frame"
+        );
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "activation must not commit after active immediate rendering already ran in this root frame"
+        );
+
+        app.frame_counter += 1;
+        assert!(app.commit_pending_deferred_detached_window_activation(&ctx));
+
+        assert!(app.detached_image_windows.is_empty());
+        assert!(
+            !app.detached_window_deferred_activation_pending(7),
+            "commit consumes the queued activation"
+        );
+        assert_eq!(app.active_detached_session.unwrap().window_id, 7);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.detached_viewer_window_id, Some(7));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn deferred_placement_event_rejects_default_geometry_on_app_side() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

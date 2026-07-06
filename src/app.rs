@@ -402,6 +402,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) pinned: bool,
     pub(crate) linked: bool,
+    pub(crate) pending_deferred_activation: bool,
 }
 
 #[cfg(windows)]
@@ -414,6 +415,7 @@ impl DetachedWindowRuntime {
             placement: None,
             pinned,
             linked,
+            pending_deferred_activation: false,
         }
     }
 }
@@ -676,6 +678,84 @@ impl App {
             "runtime_flags window_id={window_id} pinned={old_pinned}->{pinned} \
              linked={old_linked}->{linked} reason={reason}"
         ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn queue_deferred_detached_window_activation(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) {
+        let frame = self.frame_counter;
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        let was_pending = runtime.pending_deferred_activation;
+        runtime.pending_deferred_activation = true;
+        let state = runtime.state;
+        self.log_detached_image_window_debug(format!(
+            "deferred_activate_queued frame={frame} id={window_id} reason={reason} \
+             duplicate={was_pending} state={:?}",
+            state
+        ));
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn detached_window_deferred_activation_pending(&self, window_id: u64) -> bool {
+        self.detached_window_runtimes
+            .get(&window_id)
+            .is_some_and(|runtime| runtime.pending_deferred_activation)
+    }
+
+    #[cfg(windows)]
+    fn take_pending_deferred_detached_window_activation(&mut self) -> Option<u64> {
+        let mut ids = self
+            .detached_window_runtimes
+            .iter()
+            .filter(|(_, runtime)| {
+                runtime.pending_deferred_activation && runtime.state != DetachedWindowState::Closing
+            })
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let id = ids.into_iter().next()?;
+        if let Some(runtime) = self.detached_window_runtimes.get_mut(&id) {
+            runtime.pending_deferred_activation = false;
+        }
+        Some(id)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn commit_pending_deferred_detached_window_activation(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(id) = self.take_pending_deferred_detached_window_activation() else {
+            return false;
+        };
+        let frame = self.frame_counter;
+        self.log_detached_image_window_debug(format!(
+            "deferred_activate_commit frame={frame} id={id} before_active_dispatch=true \
+             passive_windows={} active_context={}",
+            self.detached_image_windows.len(),
+            self.active_detached_viewer_context_present()
+        ));
+        if self.activate_detached_image_window_snapshot(ctx, id) {
+            self.log_detached_image_window_debug(format!(
+                "deferred_activate_commit_succeeded frame={frame} id={id} \
+                 passive_windows={} active_context={} session={:?}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context_present(),
+                self.active_detached_session
+            ));
+            true
+        } else {
+            self.log_detached_image_window_debug(format!(
+                "deferred_activate_commit_failed frame={frame} id={id} \
+                 passive_windows={} active_context={}",
+                self.detached_image_windows.len(),
+                self.active_detached_viewer_context_present()
+            ));
+            false
+        }
     }
 
     pub(crate) fn remove_detached_window_runtime(
@@ -23767,6 +23847,14 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn mark_active_detached_viewport_rendered(&mut self) {
         self.detached_active_viewport_rendered_frame = self.frame_counter;
+        if let Some(session) = self.active_detached_session {
+            self.log_detached_image_window_debug(format!(
+                "active_detached_immediate_rendered frame={} window_id={} viewport={:?}",
+                self.frame_counter,
+                session.window_id,
+                Self::detached_image_window_viewport_id(session.window_id)
+            ));
+        }
     }
 
     /// 今フレーム既にアクティブ detached を描画済みか (backstop の二重描画防止)。
@@ -44734,6 +44822,8 @@ impl eframe::App for App {
         // (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
         #[cfg(windows)]
         self.process_pending_pin_promotion();
+        #[cfg(windows)]
+        self.commit_pending_deferred_detached_window_activation(ctx);
         #[cfg(windows)]
         let active_detached_context_updated = self.update_active_detached_viewer_context(ctx);
         #[cfg(not(windows))]
