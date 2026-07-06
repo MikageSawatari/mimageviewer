@@ -22033,197 +22033,219 @@ mod still_window_mode_key_tests {
     }
 
     #[cfg(windows)]
-    fn install_deferred_activation_test_window(
-        app: &mut App,
-        ctx: &egui::Context,
-        id: u64,
-        ready_frame: u64,
-        activation_armed: bool,
-        focused_last_frame: bool,
-    ) -> std::sync::Arc<DeferredDetachedImageWindowShared> {
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
-            page_num: 7,
-            content_type: None,
-        }];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![None];
-        app.visible_indices = vec![0];
-        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
-        app.selected = Some(0);
-        let stamp = app
-            .viewer_sync_stamp_for_idx(0)
-            .expect("PDF page should produce a sync stamp");
-        let texture = ctx.load_texture(
-            format!("deferred-activation-{id}"),
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id,
-                texture,
-                title: "a.jpg - mimageviewer".to_string(),
-                location_display: "a.jpg".to_string(),
-                image_dims: Some((1, 1)),
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: Some(stamp),
-                activation_ready_frame: ready_frame,
-                activation_armed,
-                focused_last_frame,
-                initial_placement_applied: true,
-                paused_bundle: None,
-            });
-        app.transition_detached_window_state(id, DetachedWindowState::Parked, "test_deferred");
-        app.set_detached_window_runtime_placement(id, placement, "test_deferred_activation");
-
-        let view = DeferredDetachedImageWindowView::from_snapshot(
-            &app.detached_image_windows[0],
-            placement,
-            false,
-        );
-        app.deferred_detached_image_window_shared(view)
+    fn activation_target_rect(eligible: bool) -> DetachedActivationWatchTargetRect {
+        DetachedActivationWatchTargetRect {
+            window_id: 7,
+            hwnd: 0x1000,
+            eligible,
+            left: 100,
+            top: 100,
+            right: 300,
+            bottom: 240,
+        }
     }
 
     #[test]
     #[cfg(windows)]
-    fn focused_parked_window_reactivates_from_physical_click_release() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        app.frame_counter = 50;
-        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 50, false, false);
+    fn activation_watcher_commits_click_release_inside_passive_window() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
 
-        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
-            id: 7,
-            viewport_close_requested: false,
-            bar_close_requested: false,
-            focused: true,
-            physical_left_button_down: true,
-            physical_cursor_pos: Some((100, 120)),
-            placement_update: None,
-            pixels_per_point: 1.5,
-            apply_initial_placement: false,
-        });
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
-        assert!(!app.detached_window_deferred_activation_pending(7));
         assert_eq!(
-            app.detached_window_runtimes
-                .get(&7)
-                .and_then(|runtime| runtime.physical_activation_click)
-                .map(|click| click.start_screen_pos),
-            Some(Some((100, 120))),
-            "focused parked windows should track the physical click even when egui pointer events are absent"
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &targets,
+            ),
+            None
         );
-
-        app.frame_counter += 1;
-        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((102, 121)));
-
-        assert!(
-            app.detached_window_deferred_activation_pending(7),
-            "physical release after a focused click must queue activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn deferred_focus_without_physical_left_button_does_not_activate() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        app.frame_counter = 55;
-        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 55, false, false);
-
-        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
-            id: 7,
-            viewport_close_requested: false,
-            bar_close_requested: false,
-            focused: true,
-            physical_left_button_down: false,
-            physical_cursor_pos: Some((100, 120)),
-            placement_update: None,
-            pixels_per_point: 1.5,
-            apply_initial_placement: false,
-        });
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
-        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((100, 120)));
-
-        assert!(!app.detached_window_deferred_activation_pending(7));
-        assert!(
-            app.detached_window_runtimes
-                .get(&7)
-                .and_then(|runtime| runtime.physical_activation_click)
-                .is_none(),
-            "Alt+Tab-style focus must not start click activation"
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: false,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((123, 132)),
+                },
+                &targets,
+            ),
+            Some(7),
+            "down/up with a small movement inside the passive HWND should activate"
         );
     }
 
     #[test]
     #[cfg(windows)]
-    fn deferred_physical_drag_does_not_activate() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        app.frame_counter = 60;
-        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 60, false, false);
+    fn activation_watcher_ignores_alt_tab_focus_without_mouse_down() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
 
-        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
-            id: 7,
-            viewport_close_requested: false,
-            bar_close_requested: false,
-            focused: true,
-            physical_left_button_down: true,
-            physical_cursor_pos: Some((100, 120)),
-            placement_update: None,
-            pixels_per_point: 1.5,
-            apply_initial_placement: false,
-        });
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
-        app.poll_deferred_detached_physical_activations_with_state(&ctx, true, Some((140, 120)));
-        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((140, 120)));
-
-        assert!(!app.detached_window_deferred_activation_pending(7));
-        assert!(
-            app.detached_window_runtimes
-                .get(&7)
-                .and_then(|runtime| runtime.physical_activation_click)
-                .is_none(),
-            "drag release must clear tracking without activation"
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: false,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &targets,
+            ),
+            None,
+            "focus changes without a physical left-button down edge must not activate"
         );
     }
 
     #[test]
     #[cfg(windows)]
-    fn park_origin_click_does_not_start_physical_activation_same_frame() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        app.frame_counter = 65;
-        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 66, false, false);
+    fn activation_watcher_drops_drag_release() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
 
-        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
-            id: 7,
-            viewport_close_requested: false,
-            bar_close_requested: false,
-            focused: true,
-            physical_left_button_down: true,
-            physical_cursor_pos: Some((100, 120)),
-            placement_update: None,
-            pixels_per_point: 1.5,
-            apply_initial_placement: false,
-        });
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
-        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((100, 120)));
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((160, 130)),
+                },
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: false,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((160, 130)),
+                },
+                &targets,
+            ),
+            None,
+            "large movement while pressed is treated as a drag, not activation"
+        );
+    }
 
-        assert!(!app.detached_window_deferred_activation_pending(7));
-        assert!(
-            app.detached_window_runtimes
-                .get(&7)
-                .and_then(|runtime| runtime.physical_activation_click)
-                .is_none(),
-            "the click that caused park must not start activation before ready_frame"
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_ignores_down_edge_outside_passive_hwnd() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x2000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: false,
+                    foreground_hwnd: 0x2000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &targets,
+            ),
+            None,
+            "clicks whose foreground HWND is not a passive window are ignored"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_consumes_park_origin_click_while_ineligible() {
+        let mut state = DetachedActivationWatchState::default();
+        let ineligible = [activation_target_rect(false)];
+        let eligible = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &ineligible,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: false,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &eligible,
+            ),
+            None,
+            "the click that caused park is consumed before activation becomes eligible"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_resets_when_no_passive_targets_exist() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &targets,
+            ),
+            None
+        );
+        assert!(state.left_button_was_down);
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                DetachedActivationWatchSample {
+                    left_button_down: true,
+                    foreground_hwnd: 0x1000,
+                    cursor_pos: Some((120, 130)),
+                },
+                &[],
+            ),
+            None
+        );
+        assert_eq!(
+            state,
+            DetachedActivationWatchState::default(),
+            "passive zero stops the watcher state instead of carrying a stale press"
         );
     }
 
@@ -22287,15 +22309,13 @@ mod still_window_mode_key_tests {
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
-            physical_left_button_down: true,
-            physical_cursor_pos: Some((80, 90)),
             placement_update: None,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
         });
 
         app.process_deferred_detached_image_window_events_for_test(&ctx);
-        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((80, 90)));
+        app.queue_deferred_detached_window_activation(7, "test_watcher");
 
         assert_eq!(
             app.detached_image_windows.len(),
@@ -22381,8 +22401,6 @@ mod still_window_mode_key_tests {
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: false,
-            physical_left_button_down: false,
-            physical_cursor_pos: None,
             placement_update: Some(default_candidate),
             pixels_per_point: 1.5,
             apply_initial_placement: false,

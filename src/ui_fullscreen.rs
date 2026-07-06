@@ -3718,8 +3718,6 @@ impl App {
                 viewport_close_requested,
                 bar_close_requested,
                 focused,
-                physical_left_button_down,
-                physical_cursor_pos,
                 placement_update,
                 pixels_per_point,
                 apply_initial_placement,
@@ -3753,9 +3751,8 @@ impl App {
                     crate::logger::log(format!(
                         "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
                          focused={} focused_prev={} focus_edge={} \
-                         focus_activation_candidate={} physical_left_down={} physical_pos={:?} \
-                         can_activate={} armed={} ready_frame={} frame={} has_bundle={} \
-                         has_descriptor={} has_stamp={} source=deferred",
+                         focus_activation_candidate={} can_activate={} armed={} ready_frame={} \
+                         frame={} has_bundle={} has_descriptor={} has_stamp={} source=deferred",
                         id,
                         viewport_close_requested,
                         bar_close_requested,
@@ -3763,8 +3760,6 @@ impl App {
                         window.focused_last_frame,
                         focus_edge,
                         focus_activation_raw,
-                        physical_left_button_down,
-                        physical_cursor_pos,
                         can_activate,
                         window.activation_armed,
                         window.activation_ready_frame,
@@ -3788,15 +3783,6 @@ impl App {
                         window_placement
                     ));
                 }
-                self.begin_deferred_detached_physical_activation_if_clicked(
-                    id,
-                    can_activate,
-                    focus_edge,
-                    window.activation_ready_frame,
-                    physical_left_button_down,
-                    physical_cursor_pos,
-                    "deferred_focus",
-                );
                 if let Some(placement) = placement_update {
                     if Self::detached_passive_placement_update_looks_like_default_viewport(
                         window_placement,
@@ -4132,8 +4118,6 @@ impl App {
                     }
                 }
                 let viewport_close_requested = vp_ctx.input(|i| i.viewport().close_requested());
-                let (physical_left_button_down, physical_cursor_pos) =
-                    Self::detached_physical_left_button_state();
                 let mut bar_close_requested = false;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
@@ -4155,17 +4139,11 @@ impl App {
                     viewport_close_requested,
                     bar_close_requested,
                     focused,
-                    physical_left_button_down,
-                    physical_cursor_pos,
                     placement_update,
                     pixels_per_point: ppp,
                     apply_initial_placement: view.apply_initial_placement,
                 });
-                if viewport_close_requested
-                    || bar_close_requested
-                    || placement_update.is_some()
-                    || (focused && physical_left_button_down)
-                {
+                if viewport_close_requested || bar_close_requested || placement_update.is_some() {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             });

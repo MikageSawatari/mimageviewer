@@ -114,6 +114,55 @@ ON モードで複数窓を切り替え中、窓をクリックしてもアク�
    (大きなカーソル移動) → 復帰しない。
 5. コミットに `(detached-rework findings-8 A1v2)` を含める。
 
+## A1-v3 (2026-07-07): 速いクリックの全滅 — 検出を専用 OS ポーリングへ
+
+### 実機ログの事実 (bug-20260707-a1v2-partial.log、Fable 解析)
+
+- `focus_edge=true ... physical_left_down=false` → `passive_activate_focus_ignored`
+  が **170 回**。focus_edge がドレインされる時点で物理ボタンが既に上がっている =
+  **速いクリックは全て棄却**。長押し気味のクリックのみ 11 回検出 (8 commit /
+  3 drop)。「先程よりは動くが何度か操作できない」と完全に一致。
+- 同一 ms に同一イベント 12 連の重複が再発 = deferred callback の実行はバースト的に
+  遅延する。**どの観測点でサンプリングしても遅延競合が残る**。
+
+### 修正方針: egui のイベント/repaint スケジューリングから検出を完全に切り離す
+
+1. **専用ウォッチャ** (実装は専用スレッド or root フレームポーリング +
+   `request_repaint_after` keep-alive のどちらか。トレードオフを完了報告に書く。
+   スレッド案が egui スケジューリング非依存で確実):
+   - passive 窓が 1 つ以上存在する間だけ稼働 (ゼロなら停止 = 常時コスト回避)
+   - `GetAsyncKeyState(VK_LBUTTON)` の **down エッジを自前検出** (前回状態との比較)
+   - down エッジ時に `GetForegroundWindow` + `GetCursorPos` を取得し、
+     runtime registry の passive 窓 hwnd + rect と照合 → 一致すればクリック開始
+   - **up エッジ** (自前検出) で、移動 < 8px なら activation commit を
+     チャネルで root へ送信 + `request_repaint` (root が次フレームで適用)
+2. focus_edge / deferred callback からの activation 系検出は撤去 (focus 情報は
+   診断ログのみに)。A1-v2 のドラッグ判別 (8px) と park 同フレーム誤発火防止は維持。
+3. テスト: エッジ検出とヒットテストを純関数化して固定 (down→up move<8px →
+   commit / 移動大 → drop / down 時 foreground が passive 外 → 無視 /
+   passive ゼロでウォッチャ停止)。
+4. コミットに `(detached-rework findings-8 A1v3)` を含める。
+
+### A1-v3 実装メモ (Codex, 2026-07-07)
+
+- A1-v2 の `focus_edge + GetAsyncKeyState` サンプリングは撤去。deferred callback は
+  close / focus 診断 / placement だけを root pass へ渡し、activation 判定には使わない。
+- 実装は専用 watcher thread を採用した。root frame polling では短いクリックが
+  次フレーム前に down→up 完了する競合を再導入するため、`GetAsyncKeyState(VK_LBUTTON)`
+  の down/up edge を watcher 側で継続監視する。
+- watcher は passive target が 0 件なら `recv()` でブロックし、target がある間だけ
+  8ms 間隔で `GetForegroundWindow` / `GetCursorPos` / `GetWindowRect` を読む。
+  App 側は root frame ごとに Parked + can_activate + registered HWND の target を渡す。
+- park 起点クリックの誤発火防止は、target に `eligible` を持たせて維持する。
+  `activation_ready_frame` 前でも target は watcher に渡すが `eligible=false` なので、
+  watcher は押下状態だけを消費し、次フレームで eligible になっても同じ押下を
+  new down edge として扱わない。
+- reducer / hit-test は純関数化した:
+  down edge 時に foreground HWND と cursor が eligible target rect に一致した場合だけ
+  candidate を作り、up edge 時に移動距離が 8px 以下なら activation request を channel
+  送信する。Alt+Tab (down edge なし)、foreground 外、ドラッグ、passive zero を
+  headless test で固定。
+
 ### A1-v2 実装メモ / egui 0.33 ソース確認 (Codex, 2026-07-07)
 
 - `egui-0.33.3/src/viewport.rs` の viewport 概説では、deferred viewport は

@@ -267,8 +267,6 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
         viewport_close_requested: bool,
         bar_close_requested: bool,
         focused: bool,
-        physical_left_button_down: bool,
-        physical_cursor_pos: Option<(i32, i32)>,
         placement_update: Option<crate::settings::DetachedViewerWindowPlacement>,
         pixels_per_point: f32,
         apply_initial_placement: bool,
@@ -387,9 +385,210 @@ pub(crate) enum DetachedWindowState {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedPhysicalActivationClick {
+pub(crate) struct DetachedActivationWatchTarget {
+    pub(crate) window_id: u64,
+    pub(crate) hwnd: u64,
+    pub(crate) eligible: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedActivationWatchTargetRect {
+    pub(crate) window_id: u64,
+    pub(crate) hwnd: u64,
+    pub(crate) eligible: bool,
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DetachedActivationWatchSample {
+    pub(crate) left_button_down: bool,
+    pub(crate) foreground_hwnd: u64,
+    pub(crate) cursor_pos: Option<(i32, i32)>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedActivationClickCandidate {
+    pub(crate) window_id: u64,
+    pub(crate) hwnd: u64,
     pub(crate) start_screen_pos: Option<(i32, i32)>,
     pub(crate) moved_too_far: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DetachedActivationWatchState {
+    pub(crate) left_button_was_down: bool,
+    pub(crate) active_click: Option<DetachedActivationClickCandidate>,
+}
+
+#[cfg(all(windows, not(test)))]
+struct DetachedActivationWatchCommand {
+    targets: Vec<DetachedActivationWatchTarget>,
+    repaint_ctx: egui::Context,
+}
+
+#[cfg(windows)]
+pub(crate) struct DetachedActivationWatcher {
+    #[cfg(not(test))]
+    command_tx: std::sync::mpsc::Sender<DetachedActivationWatchCommand>,
+    activation_rx: std::sync::mpsc::Receiver<u64>,
+}
+
+#[cfg(windows)]
+impl DetachedActivationWatcher {
+    fn new() -> Self {
+        let (activation_tx, activation_rx) = std::sync::mpsc::channel();
+        #[cfg(not(test))]
+        {
+            let (command_tx, command_rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("detached-activation-watch".to_string())
+                .spawn(move || {
+                    Self::watch_thread(command_rx, activation_tx);
+                })
+                .expect("failed to spawn detached activation watcher");
+            Self {
+                command_tx,
+                activation_rx,
+            }
+        }
+        #[cfg(test)]
+        {
+            let _ = activation_tx;
+            Self { activation_rx }
+        }
+    }
+
+    fn update_targets(&self, targets: Vec<DetachedActivationWatchTarget>, ctx: &egui::Context) {
+        #[cfg(not(test))]
+        {
+            let _ = self.command_tx.send(DetachedActivationWatchCommand {
+                targets,
+                repaint_ctx: ctx.clone(),
+            });
+        }
+        #[cfg(test)]
+        {
+            let _ = (targets, ctx);
+        }
+    }
+
+    fn drain_activation_requests(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        loop {
+            match self.activation_rx.try_recv() {
+                Ok(id) => ids.push(id),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        ids
+    }
+
+    #[cfg(not(test))]
+    fn watch_thread(
+        command_rx: std::sync::mpsc::Receiver<DetachedActivationWatchCommand>,
+        activation_tx: std::sync::mpsc::Sender<u64>,
+    ) {
+        let mut targets = Vec::new();
+        let mut repaint_ctx: Option<egui::Context> = None;
+        let mut state = DetachedActivationWatchState::default();
+        loop {
+            if targets.is_empty() {
+                match command_rx.recv() {
+                    Ok(command) => {
+                        targets = command.targets;
+                        repaint_ctx = Some(command.repaint_ctx);
+                        state = DetachedActivationWatchState::default();
+                    }
+                    Err(_) => break,
+                }
+                continue;
+            }
+
+            while let Ok(command) = command_rx.try_recv() {
+                targets = command.targets;
+                repaint_ctx = Some(command.repaint_ctx);
+                if targets.is_empty() {
+                    state = DetachedActivationWatchState::default();
+                    break;
+                }
+            }
+            if targets.is_empty() {
+                continue;
+            }
+
+            let rects = Self::os_target_rects(&targets);
+            let sample = Self::os_sample();
+            if let Some(window_id) = App::detached_activation_watch_step(&mut state, sample, &rects)
+            {
+                let _ = activation_tx.send(window_id);
+                if let Some(ctx) = repaint_ctx.as_ref() {
+                    ctx.request_repaint();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+    }
+
+    #[cfg(not(test))]
+    fn os_sample() -> DetachedActivationWatchSample {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
+
+        let left_button_down =
+            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+        let foreground_hwnd = unsafe { GetForegroundWindow().0 as u64 };
+        let mut point = POINT::default();
+        let cursor_pos = unsafe { GetCursorPos(&mut point) }
+            .ok()
+            .map(|_| (point.x, point.y));
+        DetachedActivationWatchSample {
+            left_button_down,
+            foreground_hwnd,
+            cursor_pos,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn os_target_rects(
+        targets: &[DetachedActivationWatchTarget],
+    ) -> Vec<DetachedActivationWatchTargetRect> {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow};
+
+        targets
+            .iter()
+            .filter_map(|target| {
+                let hwnd = HWND(target.hwnd as *mut _);
+                unsafe {
+                    if !IsWindow(Some(hwnd)).as_bool() {
+                        return None;
+                    }
+                    let mut rect = RECT::default();
+                    if GetWindowRect(hwnd, &mut rect).is_err() {
+                        return None;
+                    }
+                    Some(DetachedActivationWatchTargetRect {
+                        window_id: target.window_id,
+                        hwnd: target.hwnd,
+                        eligible: target.eligible,
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    })
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(windows)]
@@ -401,7 +600,6 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) linked: bool,
     pub(crate) pending_deferred_activation: bool,
-    pub(crate) physical_activation_click: Option<DetachedPhysicalActivationClick>,
 }
 
 #[cfg(windows)]
@@ -414,7 +612,6 @@ impl DetachedWindowRuntime {
             placement: None,
             linked,
             pending_deferred_activation: false,
-            physical_activation_click: None,
         }
     }
 }
@@ -772,25 +969,6 @@ impl App {
         ));
     }
 
-    #[cfg(all(windows, not(test)))]
-    pub(crate) fn detached_physical_left_button_state() -> (bool, Option<(i32, i32)>) {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-
-        let down = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
-        let mut point = POINT::default();
-        let pos = unsafe { GetCursorPos(&mut point) }
-            .ok()
-            .map(|_| (point.x, point.y));
-        (down, pos)
-    }
-
-    #[cfg(all(windows, test))]
-    pub(crate) fn detached_physical_left_button_state() -> (bool, Option<(i32, i32)>) {
-        (false, None)
-    }
-
     #[cfg(windows)]
     fn detached_physical_activation_dragged_too_far(
         start: Option<(i32, i32)>,
@@ -806,128 +984,122 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn begin_deferred_detached_physical_activation_if_clicked(
-        &mut self,
-        window_id: u64,
-        can_activate: bool,
-        focus_edge: bool,
-        activation_ready_frame: u64,
-        physical_left_button_down: bool,
-        physical_cursor_pos: Option<(i32, i32)>,
-        reason: &'static str,
-    ) {
-        if !can_activate || !focus_edge || self.frame_counter < activation_ready_frame {
-            return;
-        }
-        if !physical_left_button_down {
-            self.log_detached_image_window_debug(format!(
-                "passive_activate_focus_ignored id={window_id} reason=no_physical_left_button \
-                 source={reason} frame={}",
-                self.frame_counter
-            ));
-            return;
-        }
-        let runtime = self.detached_window_runtime_entry_mut(window_id);
-        if runtime.physical_activation_click.is_some() {
-            return;
-        }
-        runtime.physical_activation_click = Some(DetachedPhysicalActivationClick {
-            start_screen_pos: physical_cursor_pos,
-            moved_too_far: false,
-        });
-        self.log_detached_image_window_debug(format!(
-            "passive_activate_physical_click_started id={window_id} source={reason} \
-             start={physical_cursor_pos:?} frame={}",
-            self.frame_counter
-        ));
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn poll_deferred_detached_physical_activations(&mut self, ctx: &egui::Context) {
-        let (left_button_down, cursor_pos) = Self::detached_physical_left_button_state();
-        self.poll_deferred_detached_physical_activations_with_state(
-            ctx,
-            left_button_down,
-            cursor_pos,
-        );
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn poll_deferred_detached_physical_activations_with_state(
-        &mut self,
-        ctx: &egui::Context,
-        left_button_down: bool,
+    pub(crate) fn detached_activation_hit_test(
+        targets: &[DetachedActivationWatchTargetRect],
+        foreground_hwnd: u64,
         cursor_pos: Option<(i32, i32)>,
-    ) {
-        let ids = self
-            .detached_window_runtimes
-            .iter()
-            .filter(|(_, runtime)| runtime.physical_activation_click.is_some())
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        let mut activate_ids = Vec::new();
-        let mut log_lines = Vec::new();
-        for id in ids {
-            let Some(runtime) = self.detached_window_runtimes.get_mut(&id) else {
-                continue;
-            };
-            if runtime.state == DetachedWindowState::Closing {
-                runtime.physical_activation_click = None;
-                continue;
-            }
-            let Some(click) = runtime.physical_activation_click.as_mut() else {
-                continue;
-            };
-            if left_button_down {
-                if !click.moved_too_far
-                    && Self::detached_physical_activation_dragged_too_far(
-                        click.start_screen_pos,
-                        cursor_pos,
-                    )
-                {
-                    click.moved_too_far = true;
-                    log_lines.push(format!(
-                        "passive_activate_physical_click_dragged id={id} start={:?} \
-                         current={cursor_pos:?} frame={}",
-                        click.start_screen_pos, self.frame_counter
-                    ));
-                }
-                continue;
-            }
-            let click = runtime.physical_activation_click.take().unwrap();
+    ) -> Option<DetachedActivationWatchTargetRect> {
+        let (x, y) = cursor_pos?;
+        targets.iter().copied().find(|target| {
+            target.eligible
+                && target.hwnd == foreground_hwnd
+                && x >= target.left
+                && x < target.right
+                && y >= target.top
+                && y < target.bottom
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_activation_watch_step(
+        state: &mut DetachedActivationWatchState,
+        sample: DetachedActivationWatchSample,
+        targets: &[DetachedActivationWatchTargetRect],
+    ) -> Option<u64> {
+        if targets.is_empty() {
+            *state = DetachedActivationWatchState::default();
+            return None;
+        }
+
+        let down_edge = sample.left_button_down && !state.left_button_was_down;
+        let up_edge = !sample.left_button_down && state.left_button_was_down;
+
+        if down_edge {
+            state.active_click = Self::detached_activation_hit_test(
+                targets,
+                sample.foreground_hwnd,
+                sample.cursor_pos,
+            )
+            .map(|target| DetachedActivationClickCandidate {
+                window_id: target.window_id,
+                hwnd: target.hwnd,
+                start_screen_pos: sample.cursor_pos,
+                moved_too_far: false,
+            });
+        } else if sample.left_button_down
+            && let Some(click) = state.active_click.as_mut()
+            && !click.moved_too_far
+            && Self::detached_physical_activation_dragged_too_far(
+                click.start_screen_pos,
+                sample.cursor_pos,
+            )
+        {
+            click.moved_too_far = true;
+        }
+
+        let mut activate = None;
+        if up_edge && let Some(click) = state.active_click.take() {
+            let target_still_exists = targets
+                .iter()
+                .any(|target| target.window_id == click.window_id && target.hwnd == click.hwnd);
             let dragged = click.moved_too_far
                 || Self::detached_physical_activation_dragged_too_far(
                     click.start_screen_pos,
-                    cursor_pos,
+                    sample.cursor_pos,
                 );
-            if dragged {
-                log_lines.push(format!(
-                    "passive_activate_physical_click_dropped id={id} reason=drag \
-                     start={:?} current={cursor_pos:?} frame={}",
-                    click.start_screen_pos, self.frame_counter
-                ));
-                continue;
+            if target_still_exists && !dragged {
+                activate = Some(click.window_id);
             }
-            let can_activate = self
-                .detached_image_windows
-                .iter()
-                .any(|window| window.id == id && window.can_activate());
+        }
+
+        state.left_button_was_down = sample.left_button_down;
+        activate
+    }
+
+    #[cfg(windows)]
+    fn deferred_detached_activation_watch_targets(&self) -> Vec<DetachedActivationWatchTarget> {
+        self.detached_image_windows
+            .iter()
+            .filter(|window| window.can_activate())
+            .filter_map(|window| {
+                let runtime = self.detached_window_runtimes.get(&window.id)?;
+                if runtime.state != DetachedWindowState::Parked {
+                    return None;
+                }
+                let hwnd = self.detached_window_hwnd_alive_for_window_id(window.id)?;
+                Some(DetachedActivationWatchTarget {
+                    window_id: window.id,
+                    hwnd,
+                    eligible: self.frame_counter >= window.activation_ready_frame,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_deferred_detached_activation_watcher(&self, ctx: &egui::Context) {
+        self.detached_activation_watcher
+            .update_targets(self.deferred_detached_activation_watch_targets(), ctx);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn drain_deferred_detached_activation_watcher(&mut self, ctx: &egui::Context) {
+        for id in self.detached_activation_watcher.drain_activation_requests() {
+            let can_activate = self.detached_image_windows.iter().any(|window| {
+                window.id == id
+                    && window.can_activate()
+                    && self.detached_window_state(id) == Some(DetachedWindowState::Parked)
+            });
             if can_activate {
-                activate_ids.push(id);
+                self.queue_deferred_detached_window_activation(id, "watcher_left_release");
+                ctx.request_repaint();
             } else {
-                log_lines.push(format!(
-                    "passive_activate_physical_click_dropped id={id} reason=no_reopen_route \
+                self.log_detached_image_window_debug(format!(
+                    "deferred_activate_watcher_dropped id={id} reason=no_reopen_route \
                      frame={}",
                     self.frame_counter
                 ));
             }
-        }
-        for line in log_lines {
-            self.log_detached_image_window_debug(line);
-        }
-        for id in activate_ids {
-            self.queue_deferred_detached_window_activation(id, "physical_left_release");
-            ctx.request_repaint();
         }
     }
 
@@ -4494,6 +4666,8 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) deferred_detached_image_window_views:
         HashMap<u64, Arc<DeferredDetachedImageWindowShared>>,
+    #[cfg(windows)]
+    pub(crate) detached_activation_watcher: DetachedActivationWatcher,
     /// メイン一覧から独立して動く active detached viewer の item/cache context。
     ///
     /// `App` の既存 fullscreen 実装は `self.items[self.fullscreen_idx]` 前提が広いため、
@@ -7554,6 +7728,8 @@ impl App {
             detached_image_windows: Vec::new(),
             #[cfg(windows)]
             deferred_detached_image_window_views: HashMap::new(),
+            #[cfg(windows)]
+            detached_activation_watcher: DetachedActivationWatcher::new(),
             #[cfg(windows)]
             active_detached_viewer_context: None,
             #[cfg(windows)]
@@ -45067,7 +45243,9 @@ impl eframe::App for App {
         // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
         #[cfg(windows)]
-        self.poll_deferred_detached_physical_activations(ctx);
+        self.sync_deferred_detached_activation_watcher(ctx);
+        #[cfg(windows)]
+        self.drain_deferred_detached_activation_watcher(ctx);
         #[cfg(windows)]
         self.commit_pending_deferred_detached_window_activation(ctx);
         #[cfg(windows)]
