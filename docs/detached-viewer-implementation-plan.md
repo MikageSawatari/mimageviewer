@@ -79,36 +79,26 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
 > linked / independent / passive の区別には踏み込まない（補完関係）。本節と矛盾する旧記述
 > （特に §9 Phase 2 進捗メモの一部）は本節で上書きする。
 
-**ウィンドウは 2 種類、実効状態は linked / independent を掛け合わせた 4 状態:**
+**CUT 後の detached viewer は、設定 1 つで linked / independent の 2 モードに分ける:**
 
 - **Active**: 操作対象。フル機能（パノラマ・編集・補正・先読み・AI・スライドショー）が使える。
-  **同時に Active なのは常に 1 窓だけ。** `ViewerContextBundle`（items / caches / `fullscreen_idx` 等）の
-  **所有はサブモードで異なる**（下記）: 連動は**メイン bundle を共有**し、連動なしは**専用 bundle を保有**する。
-- **Passive**: 裏に回った窓。背景 worker（先読み / AI / 編集 / slideshow）を止め、表示中の
-  frozen snapshot（texture + 正規化矩形）を保持する。連動なし Passive は paused
-  `ViewerContextBundle` も保持する。クリックで再 Active 化できる。Passive も
-  「連動 / 連動なし」の属性を持ち、復帰時の同期可否を決める。
+  **同時に Active なのは常に 1 窓だけ。**
+- **Passive**: 裏に回った independent 窓。背景 worker（先読み / AI / 編集 / slideshow）を止め、
+  表示中の frozen snapshot（texture + 正規化矩形）と paused `ViewerContextBundle` を保持する。
+  クリックで再 Active 化できる。**CUT 後、linked 窓は Passive にならない。**
 
-**Active はさらに 2 サブモード:**
+**モード:**
 
-- **Active・連動 (linked)**: メイン一覧と**同じ bundle を共有**し、選択・フォルダ移動
-  （BS / Ctrl+↑↓）に追従する。F12 で開いた通常の別ウィンドウ。
-- **Active・連動なし (independent / ピン)**: **自分専用の bundle を持ち**、メイン一覧の操作に
-  一切追従しない。Active なのでパノラマ / 分析 / 表示調整はそのまま使えるが、
-  消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取りなどの画像編集機能は起動できない。
-  独自 bundle を持つことが肝で、メインの BS / Ctrl+↑↓ はメイン側 bundle だけを動かし、
-  連動なし窓の bundle には届かない（= 退避もクローズもせず Active のまま不変）。
-  実装上は本コンテキスト（PDF/ZIP）と同じ `active_detached_viewer_context`（独自 bundle）へ
-  静止画も昇格させて実現する。
-  昇格時は表示中ページの fullscreen runtime (`fs_cache` / pending load / upload backlog)
-  も専用 bundle へ移し、アニメーション画像・再読込中の画像がピン直後に停止 / 消失しないようにする。
-- **Passive・連動 (linked passive)**: 直前まで Active・連動だった窓が、別の窓の Active 化で
-  裏に回った状態。表示は frozen snapshot のまま固定するが、`reopen_sync_stamp` を保持し、
-  クリック再開またはメインからの明示 open で **Active・連動** として戻る。
-  Passive 中にメイン選択を逐次追従して描き替えない（display-only）が、再利用対象としては
-  「未ピン / 連動」の窓として扱う。
-- **Passive・連動なし (independent passive)**: ピン済み / always-new 由来の窓が裏に回った状態。
-  frozen snapshot と paused bundle を保持し、クリックで **Active・連動なし** として復帰する。
+- **OFF（通常 / linked）**: F12 で開く別ウィンドウは最大 1 枚。メイン一覧と同じ bundle を共有し、
+  選択・フォルダ移動（BS / Ctrl+↑↓）に追従する。別の independent / ParkedLive 窓を Active 化する場合、
+  linked 窓は passive へ退避せず閉じる。
+- **ON（always-new / independent）**: 画像 / ZIP画像 / PDFページは開くたびに独立した別ウィンドウとして残る。
+  各窓は専用 bundle を持ち、メイン一覧の操作に追従しない。動画は複数窓化せず、単一の detached
+  動画ウィンドウを再利用する。F12 は静止画系では無効、動画では現在の動画だけをメイン表示へ一時移動する。
+- **設定切替時**: 旧モードの窓を生かすと ON と OFF の状態が混在するため、開いている detached
+  窓（active / passive / ParkedLive）はすべて閉じる。窓があった場合だけ toast で通知する。
+- **Independent passive**: always-new 由来の窓が裏に回った状態。
+  frozen snapshot と paused bundle を保持し、クリックで independent Active として復帰する。
   メインの BS / Ctrl+↑↓ / 選択変更 / 明示 open では中身を差し替えない。
 - **ParkedLive (メディア live-park)**: 再生中の動画 / 音声を持つ detached 窓が裏に回った状態。
   frozen 画像にはせず、paused bundle 内の `VideoPlayer` / native presenter / audio output を生かしたまま
@@ -124,7 +114,7 @@ ParkedLive 駆動ノート（R2b）:
 - ParkedLive クリック時は既存の paused_bundle resume 経路で `Resuming → Active` に戻す。
 
 Passive frozen still 駆動ノート（R2d）:
-- Passive・連動 / Passive・連動なしの **静止画 frozen 窓のみ** `show_viewport_deferred`
+- Passive・連動なしの **静止画 frozen 窓のみ** `show_viewport_deferred`
   で描く。描画 DTO は texture / 表示名 / rotation / zoom / free rotation に加え、
   見開き・連結スクロール凍結用の `frozen_continuous_pages` を持つ。`paused_bundle` は
   deferred callback に渡さない。
@@ -145,33 +135,24 @@ Passive frozen still 駆動ノート（R2d）:
 |---|---|---|
 | ① | F12 で画像を別ウィンドウ表示（通常） | **Active・連動** |
 | ② | 設定 `detached_viewer_open_images_in_window` ON で画像/動画を開く | 画像系は常に **Active・連動なし**（独自 bundle）。動画は複数窓化せず、単一の detached 動画ウィンドウを再利用する |
-| ③ | 連動 Active 窓でピンボタン押下 | Active・連動 → **Active・連動なし**（独自 bundle へ昇格） |
-| ④ | 連動なし窓がある状態でメインから**別画像を明示 open**（Enter/ダブルクリック） | 連動なし窓 → **Passive・連動なし**（背景処理停止・frozen/paused bundle 保持）。新窓は通常モードでは **Active・連動**、`detached_viewer_open_images_in_window` ON では **Active・連動なし**（②と同じ） |
-| ⑤ | ピン解除 | **無し（ピンは一方通行）**。連動なし窓は × で閉じるだけ。ピンボタンは押下後は解除アフォーダンスを出さない |
-| ⑥ | メインで BS / Ctrl+↑↓（フォルダ移動） | メイン bundle（と Active・連動窓）だけ移動。**Active・連動なし窓 / Passive 窓は一切不変・非クローズ** |
-| ⑦ | Passive 窓をクリックして Active 化 | 現 Active は **その時点の属性の Passive** へ落ちる（Active・連動 → Passive・連動、Active・連動なし → Passive・連動なし）。クリックした窓は保持属性の Active として復帰する。**Active 切替だけで既存窓を閉じない。** フォーカス到着だけ（Alt+Tab / OS の自動フォーカス移譲）は表示状態の更新に留め、Active 化しない（2026-07-05 focus ping-pong 対策）。 |
+| ③ | 設定 `detached_viewer_open_images_in_window` ON/OFF を切替 | 開いている detached 窓（active / passive / ParkedLive）をすべて閉じる。混在状態を作らない |
+| ④ | independent 窓がある状態でメインから**別画像を明示 open**（Enter/ダブルクリック） | independent 窓 → **Passive**（背景処理停止・frozen/paused bundle 保持）。新窓は設定 ON なら independent、OFF なら linked |
+| ⑤ | メインで BS / Ctrl+↑↓（フォルダ移動） | メイン bundle（と Active・連動窓）だけ移動。**independent Active / Passive / ParkedLive は一切不変・非クローズ** |
+| ⑥ | Passive 窓をクリックして Active 化 | 現 Active が linked なら閉じる。現 Active が independent なら Passive へ落とす。クリックした窓は independent Active として復帰する。フォーカス到着だけ（Alt+Tab / OS の自動フォーカス移譲）は表示状態の更新に留め、Active 化しない（2026-07-05 focus ping-pong 対策）。 |
 | ⑧ | 再生中メディア detached 窓が Active から外れる | **ParkedLive** として残し、映像 / 音声を継続。クリックで Active 復帰。別メディアの明示 open では旧 ParkedLive を閉じる。 |
 
 補足:
-- ④ で Passive 化した窓をクリックすると再び Active 化する（`activate_detached_image_window_snapshot`）。
-  ピンしていた窓は連動なしのまま復帰する。
-- 「常に 1 Active」の不変条件により、別窓を Active 化すると現 Active は Passive へ落ちる。
-  特に、ピン済み窓を再 Active 化するとき、直前の未ピン linked 窓は閉じずに **Passive・連動**
-  として残す。メインから次の画像を明示 open した場合は、その Passive・連動窓を再利用して
-  Active・連動へ戻してよい。
-- ⑤ を一方通行（解除不可）にしたのは実装簡素化のため。independent ⇄ linked の往復で再 Active 化
-  との整合を取る複雑さを避ける（ユーザー確定 2026-06-29）。
-- ⑥ が直前まで壊れていた（BS で連動なし窓が閉じる / Ctrl+↑↓ で中身が差し替わる）のは、ピンが
-  「session に independent フラグを立てるだけで bundle はメインと共有」のままで、独自 bundle へ
-  昇格していなかったため。③ の独自 bundle 昇格で根治する。
-- ⑥ を実装で守るため、active detached window が OS foreground のときはメイン側のグリッドキー
+- ④ で Passive 化した窓をクリックすると再び independent Active 化する（`activate_detached_image_window_snapshot`）。
+- 「常に 1 Active」の不変条件により、別窓を Active 化すると現 Active は状態に応じて処理する。
+  linked Active は閉じ、independent Active は Passive へ落とす。CUT 後、linked Passive は存在しない。
+- ⑤ を実装で守るため、active detached window が OS foreground のときはメイン側のグリッドキー
   (Ctrl+↑↓ 等) を処理しない。キー入力は foreground の active detached context にだけ渡し、
-  ピン済み窓の操作でメイン bundle が同時に移動する経路を作らない。
-- Active・連動なし窓 / always-new 窓での Ctrl+↑↓ / Ctrl+PageUp/PageDown は、フォルダ横断
+  independent 窓の操作でメイン bundle が同時に移動する経路を作らない。
+- independent 窓 / always-new 窓での Ctrl+↑↓ / Ctrl+PageUp/PageDown は、フォルダ横断
   ナビゲーションを開始せず、入力をその窓側で消費して案内だけ出す。同じフォルダ / 同じ本の中の
   前後移動は従来どおり許可する。独自 bundle とメイン bundle の境界をまたぐ操作を禁止し、
   連動事故を防ぐための仕様。
-- Active・連動なし窓のスライドショーは、末尾動作が「次のフォルダへ進む」でもフォルダ横断を
+- independent 窓のスライドショーは、末尾動作が「次のフォルダへ進む」でもフォルダ横断を
   開始せず、現一覧内ループとして扱う。スライドショー自動送りも Ctrl+↑↓ と同じく bundle 境界を
   またがせない。
 - `detached_viewer_open_images_in_window` ON 中の F12 は、静止画 / ZIP画像 / PDFページでは無効。
@@ -181,10 +162,9 @@ Passive frozen still 駆動ノート（R2d）:
   再び detached 動画ウィンドウで開く。
 - 別ウィンドウの編集制限:
   - **Active・連動**（通常 F12 の linked viewer）では従来どおり画像編集機能を使える。
-  - **Active・連動なし**（ピン / always-new）では、編集状態を bundle 間で保持・確定する複雑さを避けるため、
+  - **Active・連動なし**（always-new）では、編集状態を bundle 間で保持・確定する複雑さを避けるため、
     消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取り・マスクスロット適用/削除を無効化する。
     全体の色調補正、ポストフィルタ、AI 表示設定、パノラマ、分析などの表示系操作は許可する。
-  - 編集モード中はピンボタンを押せない。確定またはキャンセルして通常表示へ戻ってから切り離す。
 
 ### 3.0.1 入力経路表（R2c code verified）
 
@@ -195,9 +175,9 @@ R2c 時点の入力処理は「表示状態」だけでなく「所有してい�
 | 状態 | 主要入力経路 | 有効な入力 | 無効 / no-op | 実装メモ |
 |---|---|---|---|---|
 | Active・連動（静止画 / ZIP / PDF） | detached fullscreen viewport の egui `ctx` → `handle_fs_key_input` / wheel / mouse | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正、通常 linked で許可される編集 | 特になし。Ctrl+↑↓ は linked としてメイン bundle と同じ文脈を動かす | root/main 側の fullscreen key fallback は detached 中 `handle_fullscreen_root_key_input` が false で返すため、foreground detached viewport 側が本線 |
-| Active・連動なし（ピン / always-new 静止画） | detached fullscreen viewport の egui `ctx` | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正 | Ctrl+↑↓ / Ctrl+PageUp/Down は no-op toast。E / Ctrl+M / Ctrl+T / F7-F10 など編集系は案内して no-op | `detached_independent_session_blocks_folder_nav` と `detached_viewer_image_edit_tools_disabled_reason` で bundle 境界を越える操作を止める |
+| Active・連動なし（always-new 静止画） | detached fullscreen viewport の egui `ctx` | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正 | Ctrl+↑↓ / Ctrl+PageUp/Down は no-op toast。E / Ctrl+M / Ctrl+T / F7-F10 など編集系は案内して no-op | `detached_independent_session_blocks_folder_nav` と `detached_viewer_image_edit_tools_disabled_reason` で bundle 境界を越える操作を止める |
 | Active detached 動画 | native presenter HWND → `handle_native_video_output_event` / `handle_native_video_window_event` | 再生、シーク、音量、ホイール前後移動、F12 host migration、F11 仮想 fullscreen | always-new でも Ctrl+↑↓ / Ctrl+PageUp/Down は detached 側では folder-nav しない。別動画の明示 open だけ既存動画 window を差し替える | egui 親 viewport へ漏れる wheel は `should_suppress_egui_wheel_for_native_detached_video` で消費し、native presenter を唯一の動画入力経路にする |
-| Passive・連動 / Passive・連動なし（静止画 frozen） | `render_detached_image_windows` の passive egui viewport | 左クリック（pointer press）で Active 化、× / バー close、ピン表示が許可される場合の pin toggle | キー、ホイール、スクロールは表示だけで no-op。focus edge だけでは Active 化しない | focus ping-pong 対策で `detached_passive_window_should_activate` は pointer activation のみ |
+| Passive・連動なし（静止画 frozen） | `render_detached_image_windows` の passive egui viewport | 左クリック（pointer press）で Active 化、× / バー close | キー、ホイール、スクロールは表示だけで no-op。focus edge だけでは Active 化しない | CUT 後、linked passive は存在しない。focus ping-pong 対策で `detached_passive_window_should_activate` は pointer activation のみ |
 | ParkedLive（動画 / 音声 live-park） | native presenter HWND を tick するため毎フレーム短時間 mount | 左クリック down→up の組だけ Active 復帰要求に変換。Geometry / DPI / PlacementSwitched は lifecycle として通す | キー、ホイール、右/中クリック、ダブルクリックは no-op。復帰前にシークや HUD 操作へ貫通しない | `native_video_parked_live_input_window_id` 中の filter で左クリックだけ activation queue。復帰後は通常 native 入力に戻る |
 | Resuming / Closing | runtime state + close / resume 処理 | lifecycle event、Close command、placement / hwnd bookkeeping | ユーザー入力は基本的に次の安定状態まで no-op | `DetachedWindowRuntime.state` と active session が keep-alive / backstop の単一真実 |
 | ⚠ Active 音声モード | 現状は detached audio viewport としては扱わない | メイン / 既存音声ビュー側の操作 | F12 detached 化は no-op | 状態モデル上は「動画 / 音声 live media」として ParkedLive を許容しているが、実装上の audio 専用 detached host は未提供。音声を detached の独立ウィンドウとして扱う場合は別ステージで設計が必要 |
@@ -212,19 +192,19 @@ R2c 時点の入力処理は「表示状態」だけでなく「所有してい�
   main / detached へ一時移動し、この永続設定は変更しない。detached 動画は、メイン一覧のフォルダ移動 / お気に入り移動などで
   main context が入れ替わる場合、active detached context 側へ切り離して再生を維持し、以後は
   メイン一覧の選択変更には追従しない。別動画を明示 open したときだけ既存動画 window を差し替える。
-  メイン context の `close_fullscreen()` に巻き込んで閉じない。
-- `detached_viewer_pin_active` / `detached_viewer_independent_active`: 上バーのピン操作で
-  「Active・連動 → Active・連動なし」へ昇格させる状態（§3.0 ③）。**一方通行**で解除はしない
-  （§3.0 ⑤）。連動なしの間は現在の active viewer をメイン一覧の選択にもフォルダ移動にも
-  追従させない。連動なし窓は自分専用 bundle（`active_detached_viewer_context`）を持つため、
-  メイン側の BS / Ctrl+↑↓ では退避もクローズもされず Active のまま残る（§3.0 ⑥）。
-  メインから**別画像を明示 open** した時点で初めて、その連動なし窓は passive
+  メイン context の `close_fullscreen()` に巻き込んで閉じない。この設定を切り替えると、
+  モード混在を避けるため開いている detached 窓をすべて閉じる。
+- `detached_viewer_independent_active`: 現在の detached session がメイン一覧に追従しない
+  independent session かどうかを示す runtime flag。CUT 後は always-new / ParkedLive 復帰など
+  専用 bundle を持つ経路でのみ true になり、通常 F12 linked session では false のまま。
+  linked session は passive 化しない。
+  メインから**別画像を明示 open**した時点で、independent active は passive
   `DetachedImageWindowSnapshot` へ退避する（§3.0 ④）。
   連動なしの静止画 viewer 内で前後移動した結果が動画の場合は、動画 host へ遷移せず現在の
   静止画を保持し、「メインウィンドウから開き直す」案内を出す。動画再生は linked viewer
   またはメイン一覧からの明示 open に任せる。
 - `DetachedImageWindowSnapshot`: active detached viewer から退避した passive 画像ウィンドウ。
-  `TextureHandle` / 表示名 / 配置 / ピン状態に加え、必要に応じて paused `ViewerContextBundle` を持つ。
+  `TextureHandle` / 表示名 / 配置に加え、必要に応じて paused `ViewerContextBundle` を持つ。
   active session として処理されるのは常に 1 window だけで、paused window は描画状態を保持して待機する。
 - `ViewerSession`: 現在開いている画像・動画ビューアのセッション。`×` / `Esc` などで終了する。
 - `ViewerPresentation`: 同じセッションをどこに表示しているか。
@@ -533,13 +513,12 @@ enum NativeVideoPlacement {
 - detached 静止画 session 中はメインウィンドウをブロックしない。メイン root に届いたキーは fullscreen root handler が横取りせず、グリッド側へ流す。
 - detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 中の F11 は仮想フルスクリーンをトグルし、ホバーバーの window/fullscreen トグルは非表示にする。
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
-- 連動なし窓（ピン / `detached_viewer_open_images_in_window` ON）は専用 bundle
+- 連動なし窓（`detached_viewer_open_images_in_window` ON）は専用 bundle
   （`active_detached_viewer_context`）を持ち、メイン一覧の選択にも BS / Ctrl+↑↓ フォルダ移動にも
-  追従しない（§3.0 ⑥）。active viewer の cache / AI / 先読み / スライドショー / 編集機能は単一
+  追従しない（§3.0 ⑤）。active viewer の cache / AI / 先読み / スライドショー / 編集機能は単一
   active session にだけ紐づく。passive への退避は、メインから**別画像を明示 open** して現 Active を
-  押し出す時だけ起きる（§3.0 ④）。退避後に新しく開く active viewer は、通常モードでは連動、
-  always-new では連動なしで開く（§3.0 ②/④）。未ピン留め passive window が残っている場合は、設定
-  OFF でも次の画像 open でその window の配置を再利用する。毎回新規設定 ON の間はピン UI を出さない。
+  押し出す時だけ起きる（§3.0 ④）。退避後に新しく開く active viewer は、設定 ON なら連動なし、
+  設定 OFF なら連動で開く。CUT 後、linked passive window は存在しない。
   ただし ZIP/PDF の L2 ページ一覧でメイン側 Backspace から親一覧へ戻る場合（連動窓）は、次画像 open
   ではなく仮想フォルダ退出なので連動 active viewer を閉じる（連動なし窓には影響しない）。
 - ZIP/PDF の `auto_fullscreen_zip_pdf` は enumerate 完了後に遅れて `open_fullscreen` するため、
@@ -548,10 +527,10 @@ enum NativeVideoPlacement {
   従来どおり focus を奪わず、always-new 判定にも grid open としては扱わない。
 - 独立 detached 静止画 session かどうかは、open 時の one-shot フラグではなく
   `detached_viewer_independent_active` として session に保持する。これは現在の active viewer の状態であり、
-  pinned active viewer を passive window へ退避した時点で新しい active viewer へは引き継がない。
+  independent active viewer を passive window へ退避した時点で新しい active viewer へは引き継がない。
   別の画像 window を明示操作でアクティブにしてから戻ってきても、この linked / independent 状態は
-  変えない。切り離しはピン留め操作でだけ発生する。
-- passive `DetachedImageWindowSnapshot` は表示用 texture / 表示名 / ピン状態に加え、
+  変えない。
+- passive `DetachedImageWindowSnapshot` は表示用 texture / 表示名に加え、
   paused `ViewerContextBundle` を持てる。active / passive は同じ stable `detached_viewer_window_id`
   の viewport を使い、明示 pointer 操作で active viewer へ戻すときも passive viewport を閉じて
   別 viewport を開き直さない。paused 中は先読み / AI / 編集 worker / slideshow を止めるが、表示中の 1 枚、
