@@ -197,7 +197,6 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) title: String,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
-    pub(crate) pinned: bool,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
     pub(crate) free_rotation: f32,
@@ -226,12 +225,10 @@ pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) texture: egui::TextureHandle,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
-    pub(crate) pinned: bool,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
     pub(crate) free_rotation: f32,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
-    pub(crate) show_pin: bool,
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) apply_initial_placement: bool,
 }
@@ -240,7 +237,6 @@ pub(crate) struct DeferredDetachedImageWindowView {
 impl DeferredDetachedImageWindowView {
     pub(crate) fn from_snapshot(
         window: &DetachedImageWindowSnapshot,
-        show_pin: bool,
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
     ) -> Self {
@@ -249,12 +245,10 @@ impl DeferredDetachedImageWindowView {
             texture: window.texture.clone(),
             location_display: window.location_display.clone(),
             image_dims: window.image_dims,
-            pinned: window.pinned,
             rotation: window.rotation,
             zoom_pan: window.zoom_pan,
             free_rotation: window.free_rotation,
             frozen_continuous_pages: window.frozen_continuous_pages.clone(),
-            show_pin,
             placement,
             apply_initial_placement,
         }
@@ -271,7 +265,6 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
         id: u64,
         viewport_close_requested: bool,
         bar_close_requested: bool,
-        pin_toggle_requested: bool,
         focused: bool,
         pointer_activation: bool,
         scroll_candidate: bool,
@@ -345,7 +338,6 @@ impl Clone for DetachedImageWindowSnapshot {
             title: self.title.clone(),
             location_display: self.location_display.clone(),
             image_dims: self.image_dims,
-            pinned: self.pinned,
             rotation: self.rotation,
             zoom_pan: self.zoom_pan,
             free_rotation: self.free_rotation,
@@ -400,20 +392,18 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
-    pub(crate) pinned: bool,
     pub(crate) linked: bool,
     pub(crate) pending_deferred_activation: bool,
 }
 
 #[cfg(windows)]
 impl DetachedWindowRuntime {
-    fn new(window_id: u64, pinned: bool, linked: bool) -> Self {
+    fn new(window_id: u64, linked: bool) -> Self {
         Self {
             window_id,
             state: DetachedWindowState::Opening,
             hwnd: 0,
             placement: None,
-            pinned,
             linked,
             pending_deferred_activation: false,
         }
@@ -424,18 +414,15 @@ impl DetachedWindowRuntime {
 impl App {
     const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
 
-    fn detached_window_runtime_defaults(&self) -> (bool, bool) {
-        (
-            self.detached_viewer_pin_active,
-            !self.detached_viewer_independent_active,
-        )
+    fn detached_window_runtime_default_linked(&self) -> bool {
+        !self.detached_viewer_independent_active
     }
 
     fn detached_window_runtime_entry_mut(&mut self, window_id: u64) -> &mut DetachedWindowRuntime {
-        let (pinned, linked) = self.detached_window_runtime_defaults();
+        let linked = self.detached_window_runtime_default_linked();
         self.detached_window_runtimes
             .entry(window_id)
-            .or_insert_with(|| DetachedWindowRuntime::new(window_id, pinned, linked))
+            .or_insert_with(|| DetachedWindowRuntime::new(window_id, linked))
     }
 
     fn detached_window_runtime_placement_is_usable(
@@ -630,12 +617,11 @@ impl App {
         runtime.state = new_state;
         let runtime_window_id = runtime.window_id;
         let hwnd = runtime.hwnd;
-        let pinned = runtime.pinned;
         let linked = runtime.linked;
         self.log_detached_image_window_debug(format!(
             "state_transition window_id={runtime_window_id} from={from:?} to={new_state:?} \
-             reason={reason} hwnd=0x{:x} pinned={} linked={}",
-            hwnd, pinned, linked
+             reason={reason} hwnd=0x{:x} linked={}",
+            hwnd, linked
         ));
     }
 
@@ -665,19 +651,15 @@ impl App {
     pub(crate) fn update_detached_window_runtime_flags(
         &mut self,
         window_id: u64,
-        pinned: bool,
         linked: bool,
         reason: &'static str,
     ) {
         let runtime = self.detached_window_runtime_entry_mut(window_id);
-        let old_pinned = runtime.pinned;
         let old_linked = runtime.linked;
-        runtime.pinned = pinned;
         runtime.linked = linked;
-        if old_pinned != pinned || old_linked != linked {
+        if old_linked != linked {
             self.log_detached_image_window_debug(format!(
-                "runtime_flags window_id={window_id} pinned={old_pinned}->{pinned} \
-                 linked={old_linked}->{linked} reason={reason}"
+                "runtime_flags window_id={window_id} linked={old_linked}->{linked} reason={reason}"
             ));
         }
     }
@@ -781,24 +763,19 @@ impl App {
             if runtime.state != DetachedWindowState::Closing {
                 self.log_detached_image_window_debug(format!(
                     "state_transition_unexpected window_id={} \
-                     from={:?} to=Removed reason={reason} hwnd=0x{:x} pinned={} linked={} \
+                     from={:?} to=Removed reason={reason} hwnd=0x{:x} linked={} \
                      placement={:?}",
                     runtime.window_id,
                     runtime.state,
                     runtime.hwnd,
-                    runtime.pinned,
                     runtime.linked,
                     runtime.placement
                 ));
             } else {
                 self.log_detached_image_window_debug(format!(
                     "state_transition window_id={} from=Closing to=Removed \
-                     reason={reason} hwnd=0x{:x} pinned={} linked={} placement={:?}",
-                    runtime.window_id,
-                    runtime.hwnd,
-                    runtime.pinned,
-                    runtime.linked,
-                    runtime.placement
+                     reason={reason} hwnd=0x{:x} linked={} placement={:?}",
+                    runtime.window_id, runtime.hwnd, runtime.linked, runtime.placement
                 ));
             }
         }
@@ -891,7 +868,6 @@ struct ViewerContextBundle {
     last_viewer_sync_stamp: Option<ViewerSyncStamp>,
     native_video_in_window_active: bool,
     detached_viewer_independent_active: bool,
-    detached_viewer_pin_active: bool,
     detached_viewer_open_next_still_detached_once: bool,
     detached_viewer_window_id: Option<u64>,
     panorama_state: Option<crate::panorama::PanoramaState>,
@@ -1058,7 +1034,6 @@ impl ViewerContextBundle {
             last_viewer_sync_stamp: None,
             native_video_in_window_active: false,
             detached_viewer_independent_active: false,
-            detached_viewer_pin_active: false,
             detached_viewer_open_next_still_detached_once: false,
             detached_viewer_window_id: None,
             panorama_state: None,
@@ -4233,32 +4208,18 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) detached_viewer_focus_requested: bool,
     /// 次の detached 静止画描画で active viewer viewport を作り直す one-shot。
-    /// 既存 active window を passive snapshot として退避した後や、未ピン留め passive
-    /// window の配置を再利用する時は、同じ OS window の中身差し替えではなく
+    /// 既存 independent active window を passive snapshot として退避した後は、
+    /// 同じ OS window の中身差し替えではなく
     /// 新しい top-level viewport として表示する必要がある。
     #[cfg(windows)]
     pub(crate) detached_viewer_recreate_on_next_render: bool,
     /// 現在の detached 静止画セッションがメイン一覧と独立しているか。
     ///
-    /// 「毎回新しいウィンドウ」や active viewer のピン留め中は、open 時点の one-shot
+    /// 「毎回新しいウィンドウ」では、open 時点の one-shot
     /// フラグを消費した後も同期停止を継続する必要があるため、セッション状態として持つ。
     #[cfg(windows)]
     pub(crate) detached_viewer_independent_active: bool,
-    /// 現在の画像 detached viewer をピン留め扱いにする一時状態。
-    ///
-    /// 現状の detached viewer は単一 active session なので、ピン留めは「現在の active
-    /// viewer をメイン選択から切り離し、次に画像を開くと passive window として残す」
-    /// ためのセッション内状態として扱う。
-    #[cfg(windows)]
-    pub(crate) detached_viewer_pin_active: bool,
-    /// ピンボタン押下の遅延フラグ (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
-    /// ボタンは fullscreen 描画の最中に押されるため、その場で viewer 状態を書き換えると
-    /// 同フレームの描画と競合する。フラグだけ立て、描画 dispatch 直前の安全地点で
-    /// `process_pending_pin_promotion` が独自バンドルへの昇格を実行する。bundle には入れない
-    /// (per-context ではなくグローバルな UI アクション)。
-    #[cfg(windows)]
-    pub(crate) pending_pin_promotion: bool,
-    /// ピン留めや既存の未ピン留め passive window の再利用で、次の画像 open だけを
+    /// Passive から独立窓を復帰させるとき、次の画像 open だけを
     /// detached viewer にする one-shot。これは detached で開く指定だけを表し、
     /// メイン一覧と同期しない独立 session かどうかは
     /// `detached_viewer_independent_active` で別に管理する。
@@ -7335,10 +7296,6 @@ impl App {
             #[cfg(windows)]
             detached_viewer_independent_active: false,
             #[cfg(windows)]
-            detached_viewer_pin_active: false,
-            #[cfg(windows)]
-            pending_pin_promotion: false,
-            #[cfg(windows)]
             detached_viewer_open_next_still_detached_once: false,
             #[cfg(windows)]
             detached_viewer_folder_nav_reuse_window_once: false,
@@ -9264,7 +9221,6 @@ impl App {
             last_viewer_sync_stamp,
             native_video_in_window_active,
             detached_viewer_independent_active,
-            detached_viewer_pin_active,
             detached_viewer_open_next_still_detached_once,
             detached_viewer_window_id,
             panorama_state,
@@ -9410,7 +9366,6 @@ impl App {
         swap_field!(last_viewer_sync_stamp);
         swap_field!(native_video_in_window_active);
         swap_field!(detached_viewer_independent_active);
-        swap_field!(detached_viewer_pin_active);
         swap_field!(detached_viewer_open_next_still_detached_once);
         swap_field!(detached_viewer_window_id);
         swap_field!(panorama_state);
@@ -23950,11 +23905,10 @@ impl App {
 
         self.log_detached_image_window_debug(format!(
             "pause_active_context_begin bundle_window_id={:?} bundle_fs_idx={:?} \
-             bundle_pinned={} bundle_independent={} bundle_pending={} bundle_cache={} \
+             bundle_independent={} bundle_pending={} bundle_cache={} \
              bundle_passive_windows={}",
             active.bundle.detached_viewer_window_id,
             active.bundle.fullscreen_idx,
-            active.bundle.detached_viewer_pin_active,
             active.bundle.detached_viewer_independent_active,
             active.bundle.fs_pending.len(),
             active.bundle.fs_cache.len(),
@@ -23965,12 +23919,11 @@ impl App {
             self.reset_detached_pause_foreground_modes(fs_idx);
         }
         self.log_detached_image_window_debug(format!(
-            "pause_active_context_mounted window_id={:?} fs_idx={:?} pinned={} \
+            "pause_active_context_mounted window_id={:?} fs_idx={:?} \
              independent={} session_detached={} supported={} current_pending={} \
              pending={} cache={} passive_windows={}",
             self.detached_viewer_window_id,
             self.fullscreen_idx,
-            self.detached_viewer_pin_active,
             self.detached_viewer_independent_active,
             self.viewer_session_is_detached(),
             self.fullscreen_idx
@@ -23981,19 +23934,13 @@ impl App {
             self.fs_cache.len(),
             self.detached_image_windows.len()
         ));
-        let pinned =
-            self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
-        let keep_paused_bundle =
-            self.detached_viewer_pin_active || self.detached_viewer_independent_active;
-        let Some(mut snapshot) =
-            self.build_active_detached_image_window_snapshot(Some(ctx), pinned)
-        else {
+        let keep_paused_bundle = true;
+        let Some(mut snapshot) = self.build_active_detached_image_window_snapshot(Some(ctx)) else {
             self.log_detached_image_window_debug(format!(
                 "pause_active_context_snapshot_failed keep_active=true window_id={:?} \
-                 fs_idx={:?} pinned={} pending={} cache={}",
+                 fs_idx={:?} pending={} cache={}",
                 self.detached_viewer_window_id,
                 self.fullscreen_idx,
-                pinned,
                 self.fs_pending.len(),
                 self.fs_cache.len()
             ));
@@ -24022,7 +23969,6 @@ impl App {
         self.detached_image_windows.push(snapshot);
         self.update_detached_window_runtime_flags(
             snapshot_id,
-            pinned,
             !keep_paused_bundle,
             "pause_active_context",
         );
@@ -24033,7 +23979,7 @@ impl App {
             "pause_active_context",
         );
         self.log_detached_image_window_debug(format!(
-            "pause_active_context_snapshot_pushed id={snapshot_id} pinned={pinned} \
+            "pause_active_context_snapshot_pushed id={snapshot_id} \
              title={snapshot_title:?} descriptor={snapshot_descriptor} stamp={} \
              frozen_pages={snapshot_frozen_pages} image_dims={snapshot_image_dims:?} \
              keep_bundle={keep_paused_bundle} \
@@ -24180,6 +24126,160 @@ impl App {
         if let Some(window_id) = closing_window_id {
             self.remove_detached_window_runtime(window_id, "close_active_detached_viewer_context");
         }
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_all_detached_viewers_for_mode_change(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let had_detached = self.active_detached_viewer_context.is_some()
+            || self.active_detached_session.is_some()
+            || self.viewer_session_is_detached_or_switching()
+            || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
+            || self.fs_viewport_shown
+            || !self.detached_image_windows.is_empty()
+            || !self.detached_window_runtimes.is_empty()
+            || self.pending_detached_video_host_switch.is_some()
+            || self.pending_detached_video_host_resync;
+        if !had_detached {
+            return false;
+        }
+
+        self.log_detached_image_window_debug(format!(
+            "mode_change_close_all begin active_context={} session={:?} fs_idx={:?} \
+             presentation={:?} shown={} passive_windows={} runtimes={} pending_host_switch={}",
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.fs_viewport_shown,
+            self.detached_image_windows.len(),
+            self.detached_window_runtimes.len(),
+            self.pending_detached_video_host_switch.is_some()
+        ));
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
+
+        let active_context_window_id = self
+            .active_detached_viewer_context
+            .as_ref()
+            .and_then(|active| active.bundle.detached_viewer_window_id);
+        if let Some(window_id) = active_context_window_id {
+            ctx.send_viewport_cmd_to(
+                Self::detached_image_window_viewport_id(window_id),
+                egui::ViewportCommand::Close,
+            );
+        }
+        if self.active_detached_viewer_context.is_some() {
+            let _ = self.close_current_active_detached_viewer_context(ctx);
+        }
+
+        let active_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)
+            .or(self.last_active_detached_window_id);
+        if self.viewer_session_is_detached_or_switching()
+            || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
+            || self.fs_viewport_shown
+        {
+            let viewport_id = active_window_id
+                .map(Self::detached_image_window_viewport_id)
+                .unwrap_or_else(|| self.fullscreen_viewport_id());
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            if let Some(window_id) = active_window_id {
+                self.transition_detached_window_state(
+                    window_id,
+                    DetachedWindowState::Closing,
+                    "mode_change_close_all_active",
+                );
+                self.clear_detached_window_hwnd_for_window_id(window_id);
+            }
+            self.begin_active_detached_session_close("mode_change_close_all_active");
+            self.finish_active_detached_session_close("mode_change_close_all_active");
+            if self.fullscreen_idx.is_some() {
+                self.close_fullscreen();
+            } else {
+                self.fs_viewport_shown = false;
+                self.fs_viewport_presentation = None;
+                self.fs_viewport_recreate_after_hide = false;
+                self.detached_viewer_recreate_on_next_render = false;
+                self.clear_detached_viewer_host_hwnd();
+            }
+        }
+
+        let passive_ids = self
+            .detached_image_windows
+            .iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+        for id in &passive_ids {
+            self.transition_detached_window_state(
+                *id,
+                DetachedWindowState::Closing,
+                "mode_change_close_all_passive",
+            );
+            self.clear_detached_window_hwnd_for_window_id(*id);
+            ctx.send_viewport_cmd_to(
+                Self::detached_image_window_viewport_id(*id),
+                egui::ViewportCommand::Close,
+            );
+        }
+        self.detached_image_windows.clear();
+        self.deferred_detached_image_window_views.clear();
+        self.native_video_parked_live_activation_requests.clear();
+        self.native_video_parked_live_left_down_window_id = None;
+        self.native_video_parked_live_input_window_id = None;
+
+        let runtime_ids = self
+            .detached_window_runtimes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in runtime_ids {
+            if self.detached_window_state(id) != Some(DetachedWindowState::Closing) {
+                self.transition_detached_window_state(
+                    id,
+                    DetachedWindowState::Closing,
+                    "mode_change_close_all_runtime",
+                );
+            }
+            self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
+        }
+
+        self.active_detached_session = None;
+        self.active_detached_viewer_context = None;
+        self.pending_detached_video_host_switch = None;
+        self.pending_detached_video_host_resync = false;
+        self.detached_viewer_window_id = None;
+        self.last_active_detached_window_id = None;
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        self.detached_viewer_folder_nav_reuse_window_once = false;
+        self.detached_viewer_focus_requested = false;
+        self.detached_viewer_no_activate_once = false;
+        self.fs_open_intent_from_grid = false;
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.fs_viewport_recreate_after_hide = false;
+        self.detached_viewer_recreate_on_next_render = false;
+        self.clear_detached_viewer_host_hwnd();
+        self.clear_detached_viewer_borderless_fullscreen_state();
+        self.request_detached_cleanup_font_atlas_resync("mode_change_close_all");
+        self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
+        ctx.request_repaint();
+        self.log_detached_image_window_debug(format!(
+            "mode_change_close_all end active_context={} session={:?} fs_idx={:?} \
+             presentation={:?} shown={} passive_windows={} runtimes={}",
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.fs_viewport_shown,
+            self.detached_image_windows.len(),
+            self.detached_window_runtimes.len()
+        ));
         true
     }
 
@@ -24823,14 +24923,14 @@ impl App {
         paused_bundle.detached_viewer_window_id = Some(id);
         paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         paused_bundle.detached_viewer_independent_active = true;
-        paused_bundle.detached_viewer_pin_active = false;
         paused_bundle.detached_viewer_open_next_still_detached_once = false;
         paused_bundle.fs_open_intent_from_grid = false;
         paused_bundle.pending_auto_fs_open = false;
         paused_bundle.pending_return_to_parent = false;
         paused_bundle.pdf_prefetch_grace_until = None;
 
-        self.update_detached_window_runtime_flags(id, false, false, "parked_live_activate_commit");
+        self.detached_viewer_window_id = Some(id);
+        self.update_detached_window_runtime_flags(id, false, "parked_live_activate_commit");
         self.transition_detached_window_state(
             id,
             DetachedWindowState::Resuming,
@@ -25033,45 +25133,33 @@ impl App {
             ));
             return true;
         } else if self.active_detached_viewer_context.is_some() {
-            let keep_pinned_active = self
-                .active_detached_viewer_context
-                .as_ref()
-                .is_some_and(|active| active.bundle.detached_viewer_pin_active);
-            if !keep_pinned_active {
-                self.log_detached_image_window_debug(
-                    "park_current_active_detached result=close_unpinned_active_context".to_string(),
-                );
-                return self.close_current_active_detached_viewer_context(ctx);
-            }
             self.log_detached_image_window_debug(
-                "park_active_context_failed_keep_existing_active".to_string(),
+                "park_current_active_detached result=close_active_context".to_string(),
             );
-            return false;
+            return self.close_current_active_detached_viewer_context(ctx);
         } else if self.viewer_session_is_detached() {
-            if self.park_legacy_active_detached_image_window_for_active_switch() {
-                self.log_detached_image_window_debug(format!(
-                    "park_current_active_detached result=parked_legacy_linked passive_windows={} \
-                     active_context={} session={:?}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_viewer_context.is_some(),
-                    self.active_detached_session
-                ));
-                return true;
-            }
             self.log_detached_image_window_debug(format!(
                 "park_current_active_detached result=close_legacy_detached fs_idx={:?} \
-                 pin_active={} independent={} passive_windows={}",
+                 independent={} passive_windows={}",
                 self.fullscreen_idx,
-                self.detached_viewer_pin_active,
                 self.detached_viewer_independent_active,
                 self.detached_image_windows.len()
             ));
             self.preserve_active_detached_image_window_for_main_context_change();
+            let closing_window_id = self
+                .active_detached_session
+                .map(|session| session.window_id)
+                .or(self.detached_viewer_window_id);
+            let fs_id = self.fullscreen_viewport_id();
+            self.begin_active_detached_session_close("park_close_legacy_detached");
             if self.fs_viewport_shown {
-                let fs_id = self.fullscreen_viewport_id();
                 ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
             }
+            self.finish_active_detached_session_close("park_close_legacy_detached");
             self.close_fullscreen();
+            if let Some(window_id) = closing_window_id {
+                self.remove_detached_window_runtime(window_id, "park_close_legacy_detached");
+            }
             return true;
         }
         self.active_detached_viewer_context.is_none()
@@ -25228,21 +25316,15 @@ impl App {
             return false;
         };
         let mut snapshot = self.detached_image_windows.remove(pos);
-        self.update_detached_window_runtime_flags(
-            snapshot.id,
-            snapshot.pinned,
-            !snapshot.pinned && !self.settings.detached_viewer_open_images_in_window,
-            "passive_activate_begin",
-        );
+        self.update_detached_window_runtime_flags(snapshot.id, false, "passive_activate_begin");
         self.transition_detached_window_state(
             snapshot.id,
             DetachedWindowState::Resuming,
             "passive_activate_begin",
         );
         self.log_detached_image_window_debug(format!(
-            "passive_activate_begin id={id} pos={pos} pinned={} has_paused_bundle={} \
+            "passive_activate_begin id={id} pos={pos} has_paused_bundle={} \
              descriptor={} stamp={} passive_remaining={} active_context={} session={:?}",
-            snapshot.pinned,
             snapshot.paused_bundle.is_some(),
             Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
             snapshot.reopen_sync_stamp.is_some(),
@@ -25252,31 +25334,14 @@ impl App {
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
 
-        if snapshot.paused_bundle.as_ref().is_some_and(|bundle| {
-            !bundle.detached_viewer_pin_active && !bundle.detached_viewer_independent_active
-        }) {
-            if let Some(bundle) = snapshot.paused_bundle.take() {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_drop_linked_paused_bundle id={} bundle_window_id={:?} \
-                     bundle_fs_idx={:?} descriptor={} stamp={} reason=restore_main_link",
-                    snapshot.id,
-                    bundle.detached_viewer_window_id,
-                    bundle.fullscreen_idx,
-                    Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
-                    snapshot.reopen_sync_stamp.is_some()
-                ));
-            }
-        }
-
         if let Some(mut paused_bundle) = snapshot.paused_bundle.take() {
             self.log_detached_image_window_debug(format!(
                 "passive_activate_resume_paused_bundle id={} bundle_window_id={:?} \
-                 bundle_fs_idx={:?} bundle_pinned={} bundle_independent={} \
+                 bundle_fs_idx={:?} bundle_independent={} \
                  bundle_pending={} bundle_cache={} snapshot_title={:?}",
                 snapshot.id,
                 paused_bundle.detached_viewer_window_id,
                 paused_bundle.fullscreen_idx,
-                paused_bundle.detached_viewer_pin_active,
                 paused_bundle.detached_viewer_independent_active,
                 paused_bundle.fs_pending.len(),
                 paused_bundle.fs_cache.len(),
@@ -25298,6 +25363,10 @@ impl App {
                 return false;
             }
             paused_bundle.detached_viewer_window_id = Some(snapshot.id);
+            paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            paused_bundle.detached_viewer_independent_active = true;
+            paused_bundle.detached_viewer_open_next_still_detached_once = false;
+            paused_bundle.fs_open_intent_from_grid = false;
             paused_bundle.pdf_prefetch_grace_until = None;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
@@ -25324,10 +25393,7 @@ impl App {
             return true;
         }
 
-        let prefer_sync_stamp_for_linked = snapshot.reopen_sync_stamp.is_some()
-            && !snapshot.pinned
-            && !self.settings.detached_viewer_open_images_in_window;
-        if (snapshot.reopen_descriptor.is_none() || prefer_sync_stamp_for_linked)
+        if snapshot.reopen_descriptor.is_none()
             && let Some(stamp) = snapshot.reopen_sync_stamp.clone()
         {
             let Some(idx) = self.resolve_viewer_sync_stamp_idx(&stamp) else {
@@ -25344,13 +25410,10 @@ impl App {
                 return false;
             };
             self.log_detached_image_window_debug(format!(
-                "passive_activate_still_snapshot id={} idx={idx} pinned={} independent={} \
-                 descriptor={} prefer_sync={} zoom_pan={} free_rotation={:.3}",
+                "passive_activate_still_snapshot id={} idx={idx} independent=true \
+                 descriptor={} zoom_pan={} free_rotation={:.3}",
                 snapshot.id,
-                snapshot.pinned,
-                self.settings.detached_viewer_open_images_in_window || snapshot.pinned,
                 Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
-                prefer_sync_stamp_for_linked,
                 snapshot.zoom_pan.is_some(),
                 snapshot.free_rotation
             ));
@@ -25359,8 +25422,6 @@ impl App {
                 activate_window_id,
                 "resume_still_snapshot",
             );
-            let activate_independent =
-                self.settings.detached_viewer_open_images_in_window || snapshot.pinned;
             let activate_zoom_pan = snapshot.zoom_pan;
             let activate_free_rotation = snapshot.free_rotation;
             if !self.park_and_close_current_active_detached_viewer(ctx) {
@@ -25377,8 +25438,7 @@ impl App {
                 return false;
             }
             self.detached_viewer_window_id = Some(activate_window_id);
-            self.detached_viewer_independent_active = activate_independent;
-            self.detached_viewer_pin_active = false;
+            self.detached_viewer_independent_active = true;
             self.detached_viewer_open_next_still_detached_once = true;
             self.fs_open_intent_from_grid = false;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
@@ -25390,11 +25450,10 @@ impl App {
             self.fs_free_rotation = activate_free_rotation;
             self.log_detached_image_window_debug(format!(
                 "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
-                 pin_active={} independent={} session={:?}",
+                 independent={} session={:?}",
                 activate_window_id,
                 self.active_detached_viewer_context.is_some(),
                 self.fullscreen_idx,
-                self.detached_viewer_pin_active,
                 self.detached_viewer_independent_active,
                 self.active_detached_session
             ));
@@ -25416,10 +25475,9 @@ impl App {
             return false;
         };
         self.log_detached_image_window_debug(format!(
-            "passive_activate_reopen_descriptor id={} descriptor={} pinned={} title={:?}",
+            "passive_activate_reopen_descriptor id={} descriptor={} title={:?}",
             snapshot.id,
             Self::detached_viewer_descriptor_debug_kind(&Some(descriptor.clone())),
-            snapshot.pinned,
             snapshot.title
         ));
 
@@ -25464,13 +25522,12 @@ impl App {
                 if Self::detached_image_window_debug_enabled() && app.frame_counter % 60 == 0 {
                     app.log_detached_image_window_debug(format!(
                         "active_context_state frame={} window_id={:?} fs_idx={:?} \
-                         pinned={} independent={} session={:?} fs_shown={} presentation={:?} \
+                         independent={} session={:?} fs_shown={} presentation={:?} \
                          current_pending={} pending={} cache={} pdf_enum={} zip_enum={} \
                          nav_wait={} passive_windows={}",
                         app.frame_counter,
                         app.detached_viewer_window_id,
                         app.fullscreen_idx,
-                        app.detached_viewer_pin_active,
                         app.detached_viewer_independent_active,
                         app.active_detached_session,
                         app.fs_viewport_shown,
@@ -25604,19 +25661,14 @@ impl App {
     fn detached_viewer_open_still_requested(&self, idx: usize) -> bool {
         self.viewer_item_supports_detached_still(idx)
             && (self.settings.detached_viewer_open_images_in_window
-                || self.detached_viewer_pin_active
-                || self.detached_viewer_open_next_still_detached_once
-                || self
-                    .detached_image_windows
-                    .iter()
-                    .any(|window| !window.pinned))
+                || self.detached_viewer_open_next_still_detached_once)
     }
 
     #[cfg(windows)]
     fn detached_still_open_is_independent(&self, idx: usize) -> bool {
         self.viewer_item_supports_detached_still(idx)
             && (self.settings.detached_viewer_open_images_in_window
-                || self.detached_viewer_pin_active)
+                || self.detached_viewer_open_next_still_detached_once)
     }
 
     #[cfg(windows)]
@@ -25717,11 +25769,10 @@ impl App {
     fn build_active_detached_image_window_snapshot(
         &mut self,
         ctx: Option<&egui::Context>,
-        pinned: bool,
     ) -> Option<DetachedImageWindowSnapshot> {
         let Some(idx) = self.fullscreen_idx else {
             self.log_detached_image_window_debug(format!(
-                "build_active_snapshot_failed reason=no_fullscreen_idx pinned={pinned} \
+                "build_active_snapshot_failed reason=no_fullscreen_idx \
                  window_id={:?} pending={} cache={}",
                 self.detached_viewer_window_id,
                 self.fs_pending.len(),
@@ -25732,7 +25783,7 @@ impl App {
         if !self.viewer_session_is_detached() || !self.viewer_item_supports_detached_still(idx) {
             self.log_detached_image_window_debug(format!(
                 "build_active_snapshot_failed reason=unsupported_or_not_detached idx={idx} \
-                 pinned={pinned} session_detached={} supported={} window_id={:?} \
+                 session_detached={} supported={} window_id={:?} \
                  presentation={:?} pending={} cache={}",
                 self.viewer_session_is_detached(),
                 self.viewer_item_supports_detached_still(idx),
@@ -25746,7 +25797,7 @@ impl App {
         let Some(texture) = self.resolve_fs_display_tex(idx, true) else {
             self.log_detached_image_window_debug(format!(
                 "build_active_snapshot_failed reason=no_display_texture idx={idx} \
-                 pinned={pinned} window_id={:?} current_pending={} pending={} \
+                 window_id={:?} current_pending={} pending={} \
                  cache={} thumb_loaded={} descriptor={} stamp={}",
                 self.detached_viewer_window_id,
                 self.fs_pending.contains_key(&idx),
@@ -25772,7 +25823,7 @@ impl App {
         let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         self.log_detached_image_window_debug(format!(
-            "build_active_snapshot_ok id={id} idx={idx} pinned={pinned} \
+            "build_active_snapshot_ok id={id} idx={idx} \
              tex=({:.0}x{:.0}) descriptor={} stamp={} frozen_pages={} \
              current_pending={} pending={} cache={} placement={placement:?}",
             texture_size.x,
@@ -25790,7 +25841,6 @@ impl App {
             title: self.detached_image_snapshot_title_for_idx(idx),
             location_display: self.detached_image_snapshot_location_for_idx(idx),
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
-            pinned,
             rotation: self.get_rotation(idx),
             zoom_pan: self.fs_zoom_pan(),
             free_rotation: self.fs_free_rotation,
@@ -25833,7 +25883,6 @@ impl App {
             title,
             location_display,
             image_dims: None,
-            pinned: true,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
@@ -25885,17 +25934,15 @@ impl App {
         parked_bundle.detached_viewer_window_id = Some(snapshot_id);
         parked_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         parked_bundle.detached_viewer_independent_active = true;
-        parked_bundle.detached_viewer_pin_active = false;
         parked_bundle.detached_viewer_open_next_still_detached_once = false;
         snapshot.paused_bundle = Some(Box::new(parked_bundle));
         self.detached_image_windows.push(snapshot);
-        self.update_detached_window_runtime_flags(snapshot_id, false, false, reason);
+        self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
-        self.detached_viewer_pin_active = false;
         self.detached_viewer_window_id = None;
         self.last_viewer_sync_stamp = None;
         self.log_detached_image_window_debug(format!(
@@ -25945,7 +25992,6 @@ impl App {
         bundle.viewer_presentation = self.non_detached_viewer_presentation();
         bundle.native_video_in_window_active = false;
         bundle.detached_viewer_independent_active = false;
-        bundle.detached_viewer_pin_active = false;
         bundle.detached_viewer_open_next_still_detached_once = false;
         bundle.detached_viewer_window_id = None;
         bundle.last_viewer_sync_stamp = None;
@@ -25978,19 +26024,18 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn park_active_detached_image_window(&mut self, pinned: bool) -> bool {
+    fn park_active_detached_image_window(&mut self) -> bool {
         if let Some(fs_idx) = self.fullscreen_idx {
             self.reset_detached_pause_foreground_modes(fs_idx);
         }
-        let Some(snapshot) = self.build_active_detached_image_window_snapshot(None, pinned) else {
+        let Some(snapshot) = self.build_active_detached_image_window_snapshot(None) else {
             return false;
         };
         let snapshot_id = snapshot.id;
         self.detached_image_windows.push(snapshot);
         self.update_detached_window_runtime_flags(
             snapshot_id,
-            pinned,
-            !self.detached_viewer_independent_active && !pinned,
+            false,
             "park_active_detached_image_window",
         );
         self.transition_detached_window_state(
@@ -25998,45 +26043,6 @@ impl App {
             DetachedWindowState::Parked,
             "park_active_detached_image_window",
         );
-        true
-    }
-
-    #[cfg(windows)]
-    fn park_legacy_active_detached_image_window_for_active_switch(&mut self) -> bool {
-        let Some(idx) = self.fullscreen_idx else {
-            return false;
-        };
-        if !self.viewer_session_is_detached()
-            || self.fs_nav_is_locked()
-            || !self.viewer_item_supports_detached_still(idx)
-        {
-            return false;
-        }
-
-        let pinned =
-            self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
-        if !self.park_active_detached_image_window(pinned) {
-            return false;
-        }
-        let parked_id = self.detached_image_windows.last().map(|window| window.id);
-        let passive_count = self.detached_image_windows.len();
-
-        // Active 切替では OS window 自体を閉じない。現在の active session だけを終了し、
-        // 同じ window_id の passive renderer に次フレーム以降の描画を引き継がせる。
-        self.begin_active_detached_session_close("park_legacy_active_to_passive");
-        self.finish_active_detached_session_close("park_legacy_active_to_passive");
-        self.close_fullscreen();
-        self.fs_viewport_shown = false;
-        self.fs_viewport_presentation = None;
-        self.fs_viewport_recreate_after_hide = false;
-        self.detached_viewer_recreate_on_next_render = false;
-        self.detached_viewer_pin_active = false;
-        self.detached_viewer_independent_active = false;
-        self.detached_viewer_open_next_still_detached_once = false;
-        self.log_detached_image_window_debug(format!(
-            "park_legacy_active_to_passive id={parked_id:?} pinned={pinned} \
-             passive_windows={passive_count}"
-        ));
         true
     }
 
@@ -26054,8 +26060,7 @@ impl App {
         }
         self.viewer_session_is_detached()
             && self.viewer_item_supports_detached_still(idx)
-            && (self.settings.detached_viewer_open_images_in_window
-                || self.detached_viewer_pin_active)
+            && self.settings.detached_viewer_open_images_in_window
     }
 
     #[cfg(windows)]
@@ -26063,11 +26068,10 @@ impl App {
         if !self.should_preserve_active_detached_image_window_for_main_context_change() {
             self.log_detached_image_window_debug(format!(
                 "preserve_active_detached_for_main_change skipped fs_idx={:?} \
-                 session_detached={} pin_active={} independent={} active_context={} \
+                 session_detached={} independent={} active_context={} \
                  window_id={:?} passive_windows={} fs_nav_locked={}",
                 self.fullscreen_idx,
                 self.viewer_session_is_detached(),
-                self.detached_viewer_pin_active,
                 self.detached_viewer_independent_active,
                 self.active_detached_viewer_context.is_some(),
                 self.detached_viewer_window_id,
@@ -26076,11 +26080,9 @@ impl App {
             ));
             return false;
         }
-        let pinned =
-            self.detached_viewer_pin_active && !self.settings.detached_viewer_open_images_in_window;
-        let parked = self.park_active_detached_image_window(pinned);
+        let parked = self.park_active_detached_image_window();
         self.log_detached_image_window_debug(format!(
-            "preserve_active_detached_for_main_change result={parked} pinned={pinned} \
+            "preserve_active_detached_for_main_change result={parked} \
              fs_idx={:?} window_id={:?} passive_windows={} active_context={} \
              session_before_handoff={:?}",
             self.fullscreen_idx,
@@ -26093,7 +26095,6 @@ impl App {
             self.handoff_active_detached_viewport_to_passive("main_context_change");
             self.detached_viewer_independent_active = false;
         }
-        self.detached_viewer_pin_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
         parked
     }
@@ -26124,7 +26125,6 @@ impl App {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         bundle.native_video_in_window_active = false;
         bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_pin_active = false;
         bundle.detached_viewer_open_next_still_detached_once = false;
         bundle.detached_viewer_window_id = Some(window_id);
         bundle.last_viewer_sync_stamp = None;
@@ -26135,7 +26135,6 @@ impl App {
         self.update_detached_window_runtime_flags(
             window_id,
             false,
-            false,
             "promote_detached_video_for_main_context_change",
         );
         self.transition_detached_window_state(
@@ -26147,7 +26146,6 @@ impl App {
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
-        self.detached_viewer_pin_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
         self.detached_viewer_focus_requested = false;
         self.last_viewer_sync_stamp = None;
@@ -26158,152 +26156,13 @@ impl App {
         true
     }
 
-    /// ピン留め: 現在の active・連動 detached 静止画を、自分専用 bundle を持つ
-    /// active・連動なし (independent) へ昇格させる
-    /// (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
-    ///
-    /// items 等の clone 可能フィールドを複製して専用 bundle を組み立て、現在表示中
-    ///ページのフルスクリーン runtime (fs_cache / pending / upload backlog) だけを bundle
-    /// 側へ移す。メイン側は items / 選択 / スクロールを維持し、fullscreen 状態だけ解除
-    ///して grid へ戻す (= メインは触らない)。これ以降、メインの BS / Ctrl+↑↓ は
-    /// 連動なし窓に届かない (§3.0 ⑥)。一方通行 (解除なし、§3.0 ⑤)。昇格できたら true。
-    #[cfg(windows)]
-    fn promote_active_still_to_independent(&mut self) -> bool {
-        // 既に独自 context (book / 昇格済み) を持つ場合や detached 静止画でない場合は対象外。
-        if self.active_detached_viewer_context.is_some() || !self.viewer_session_is_detached() {
-            return false;
-        }
-        let Some(idx) = self.fullscreen_idx else {
-            return false;
-        };
-        if !self.viewer_item_supports_detached_still(idx) {
-            return false;
-        }
-        let window_id = self.ensure_detached_viewer_window_id();
-        self.reset_detached_pause_foreground_modes(idx);
-
-        // 専用 bundle を empty() から組み立て、表示・前後移動に必要な clone 可能フィールド
-        // だけ self から複製する (self 側は維持されるのでメイン grid は不変)。
-        let mut bundle = ViewerContextBundle::empty();
-        // フルスクリーンの前後移動 / 見開き / 連結読み / スライドショーは current_grid_order()
-        // 経由で visible_indices (Details では details_order) を参照する。これらを複製しないと
-        // 連動なし窓で →/← が空リスト扱いになり移動できない (Codex P1)。
-        self.clone_current_viewer_context_grid_fields_into(&mut bundle);
-        bundle.selected = Some(idx);
-        bundle.fullscreen_idx = Some(idx);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.native_video_in_window_active = false;
-        bundle.detached_viewer_independent_active = true;
-        // 連動なし窓は「ピン済み」扱い。これがないと、後で別画像を open して
-        // pause_current_active_detached_viewer_context が走るとき pinned=false の passive に
-        // なり、prepare_detached_image_windows_for_open が同じ window を reuse → ピン窓が
-        // 上書き/消滅する (Codex P1、§3.0 ④)。pinned passive は reuse 対象外で残る。
-        bundle.detached_viewer_pin_active = true;
-        bundle.detached_viewer_window_id = Some(window_id);
-        bundle.last_viewer_sync_stamp = None;
-        // 表示状態の継続性 (ピンした瞬間の見た目を保つ)。
-        bundle.fs_zoom = self.fs_zoom;
-        bundle.fs_pan = self.fs_pan;
-        bundle.fs_zoom_active = self.fs_zoom_active;
-        bundle.fs_zoom_factor = self.fs_zoom_factor;
-        bundle.fs_free_rotation = self.fs_free_rotation;
-        bundle.spread_mode = self.spread_mode;
-        bundle.reading_flow = self.reading_flow;
-        bundle.reading_direction = self.reading_direction;
-        self.move_active_fullscreen_runtime_to_bundle(idx, &mut bundle);
-
-        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
-
-        // メインは grid へ戻す。items / selected / scroll は維持し fullscreen 状態だけ解除。
-        self.fullscreen_idx = None;
-        self.viewer_presentation = self.non_detached_viewer_presentation();
-        self.detached_viewer_independent_active = false;
-        self.detached_viewer_pin_active = false;
-        self.detached_viewer_open_next_still_detached_once = false;
-        self.last_viewer_sync_stamp = None;
-        // メインはこの detached 窓の所有権を手放す。これがないと次の grid open で
-        // ensure_detached_viewer_window_id / reuse 判定が同じ window_id を再利用し、
-        // 新規画像がピン窓 (= 独自 context の window) を上書きする (Codex P1、§3.0 ④)。
-        // window_id は active_detached_viewer_context の bundle が保持している。
-        self.detached_viewer_window_id = None;
-        // active_detached_session は同じ window_id のまま維持 (ViewportId 連続性、窓再生成回避)。
-        // この session は独自 context (= ピン窓) のもの。④ で別画像を open すると
-        // begin_active_detached_session が新 window_id で上書きし、ピン窓は passive へ退避する。
-        self.update_detached_window_runtime_flags(
-            window_id,
-            true,
-            false,
-            "pin_promote_to_independent",
-        );
-        self.transition_detached_window_state(
-            window_id,
-            DetachedWindowState::Active,
-            "pin_promote_to_independent",
-        );
-        self.log_detached_image_window_debug(format!(
-            "pin_promote_to_independent window_id={window_id} idx={idx}"
-        ));
-        true
-    }
-
-    #[cfg(windows)]
-    fn move_active_fullscreen_runtime_to_bundle(
-        &mut self,
-        idx: usize,
-        bundle: &mut ViewerContextBundle,
-    ) {
-        if let Some(entry) = self.fs_cache.remove(&idx) {
-            bundle.fs_cache.insert(idx, entry);
-        }
-        if let Some(margin) = self.fs_margin_bbox_cache.remove(&idx) {
-            bundle.fs_margin_bbox_cache.insert(idx, margin);
-        }
-        if let Some(input_gen) = self.input_generation.remove(&idx) {
-            bundle.input_generation.insert(idx, input_gen);
-        }
-        if let Some(pending) = self.fs_pending.remove(&idx) {
-            bundle.fs_pending.insert(idx, pending);
-        }
-        if let Some(dims) = self.fs_early_dims.remove(&idx) {
-            bundle.fs_early_dims.insert(idx, dims);
-        }
-
-        let mut retained_backlog = Vec::with_capacity(self.fs_upload_backlog.len());
-        for item in self.fs_upload_backlog.drain(..) {
-            if item.0 == idx {
-                bundle.fs_upload_backlog.push(item);
-            } else {
-                retained_backlog.push(item);
-            }
-        }
-        self.fs_upload_backlog = retained_backlog;
-    }
-
-    /// ピンボタン押下の遅延フラグを安全地点で消化する (描画 dispatch 直前で呼ぶ)。
-    /// ボタンは fullscreen 描画の最中に押されるため、その場で昇格すると同フレームの
-    /// 描画と競合する。フラグ経由で安全地点まで遅延させる。
-    #[cfg(windows)]
-    pub(crate) fn process_pending_pin_promotion(&mut self) {
-        if std::mem::take(&mut self.pending_pin_promotion) {
-            self.promote_active_still_to_independent();
-        }
-    }
-
     #[cfg(windows)]
     fn prepare_detached_image_windows_for_open(&mut self, idx: usize) {
         if !self.fs_open_intent_from_grid || !self.viewer_item_supports_detached_still(idx) {
             return;
         }
         let always_new = self.settings.detached_viewer_open_images_in_window;
-        let current_pinned = self.detached_viewer_pin_active;
-        let reusable_pos = (!always_new)
-            .then(|| {
-                self.detached_image_windows
-                    .iter()
-                    .position(|window| !window.pinned)
-            })
-            .flatten();
-        if !always_new && !current_pinned && reusable_pos.is_none() {
+        if !always_new {
             return;
         }
 
@@ -26311,10 +26170,10 @@ impl App {
         let should_park_active = current_idx != Some(idx)
             && self.viewer_session_is_detached()
             && current_idx.is_some_and(|current| self.viewer_item_supports_detached_still(current))
-            && (always_new || current_pinned);
+            && always_new;
         let base_placement = self.active_detached_viewer_current_placement();
         let parked = if should_park_active {
-            self.park_active_detached_image_window(current_pinned && !always_new)
+            self.park_active_detached_image_window()
         } else {
             false
         };
@@ -26323,34 +26182,12 @@ impl App {
         }
         let mut should_recreate_active_viewport = false;
 
-        if let Some(pos) = reusable_pos {
-            let reusable = self.detached_image_windows.remove(pos);
-            self.log_detached_image_window_debug(format!(
-                "reuse_window_id reason=prepare_detached_image_windows_for_open id={} \
-                 idx={idx} current_idx={current_idx:?} always_new={always_new} \
-                 grid_intent={} folder_nav_reuse_once={}",
-                reusable.id,
-                self.fs_open_intent_from_grid,
-                self.detached_viewer_folder_nav_reuse_window_once
-            ));
-            self.detached_viewer_window_id = Some(reusable.id);
-            self.transition_detached_window_state(
-                reusable.id,
-                DetachedWindowState::Resuming,
-                "prepare_detached_image_windows_for_open_reuse",
-            );
-            self.ensure_detached_window_runtime_placement(
-                reusable.id,
-                "prepare_detached_image_windows_for_open_reuse",
-            );
-            self.detached_viewer_open_next_still_detached_once = true;
-            should_recreate_active_viewport = true;
-        } else if parked {
+        if parked {
             let window_id = self.allocate_detached_viewer_window_id();
             self.log_detached_image_window_debug(format!(
                 "allocate_window_id reason=prepare_detached_image_windows_for_open id={window_id} \
                  idx={idx} current_idx={current_idx:?} always_new={always_new} \
-                 pinned={current_pinned} grid_intent={} folder_nav_reuse_once={} \
+                 grid_intent={} folder_nav_reuse_once={} \
                  base_placement={base_placement:?}",
                 self.fs_open_intent_from_grid, self.detached_viewer_folder_nav_reuse_window_once
             ));
@@ -26366,13 +26203,10 @@ impl App {
                 offset_placement,
                 "prepare_detached_image_windows_for_open_allocate",
             );
-            self.detached_viewer_open_next_still_detached_once = current_pinned && !always_new;
+            self.detached_viewer_open_next_still_detached_once = false;
             should_recreate_active_viewport = true;
         }
 
-        if parked && (current_pinned || always_new) {
-            self.detached_viewer_pin_active = false;
-        }
         if should_recreate_active_viewport
             && self.fs_viewport_shown
             && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
@@ -26417,7 +26251,7 @@ impl App {
             return Some("毎回新しい別ウィンドウで開く設定では、画像編集機能は利用できません");
         }
         if self.detached_viewer_independent_still_session() {
-            return Some("ピン留めした別ウィンドウでは、画像編集機能は利用できません");
+            return Some("独立した別ウィンドウでは、画像編集機能は利用できません");
         }
         if self.active_detached_viewer_context.is_some() {
             return Some("切り離した別ウィンドウでは、画像編集機能は利用できません");
@@ -26428,18 +26262,6 @@ impl App {
     #[cfg(not(windows))]
     pub(crate) fn detached_viewer_image_edit_tools_disabled_reason(&self) -> Option<&'static str> {
         None
-    }
-
-    pub(crate) fn detached_viewer_edit_mode_active(&self) -> bool {
-        self.is_overlay_edit_mode_active() || self.view_trim_mode
-    }
-
-    pub(crate) fn detached_viewer_pin_disabled_reason(&self) -> Option<&'static str> {
-        if self.detached_viewer_edit_mode_active() {
-            Some("編集中はピン留めできません。確定またはキャンセルしてから切り離してください")
-        } else {
-            None
-        }
     }
 
     #[cfg(windows)]
@@ -27279,11 +27101,9 @@ impl App {
         true
     }
 
-    /// §3.0 ④: 連動なし窓 (独自 `active_detached_viewer_context`) があるまま grid から別の
-    /// 画像/動画を明示 open するとき、現 active context を passive へ退避してから新しい
-    /// active・連動窓を開く。退避しないと `update_active_detached_viewer_context` が旧 context を
-    /// 描き続け、新規 open が描画されない。active context が無い通常の active・連動セッションは
-    /// 対象外 (= park せず従来どおり reuse / 追従)。
+    /// grid から別の画像/動画を明示 open するとき、独立 active context は passive /
+    /// ParkedLive へ退避する。通常の linked detached セッションは CUT 後の仕様では passive
+    /// にならないため、ここでは対象外 (= 従来どおり reuse / 追従)。
     #[cfg(windows)]
     pub(crate) fn park_active_detached_context_for_new_grid_open(
         &mut self,
@@ -27291,14 +27111,13 @@ impl App {
     ) -> bool {
         self.log_detached_image_window_debug(format!(
             "park_active_context_for_grid_open begin active_context={} session={:?} \
-             fs_idx={:?} presentation={:?} window_id={:?} pin_active={} independent={} \
+             fs_idx={:?} presentation={:?} window_id={:?} independent={} \
              passive_windows={}",
             self.active_detached_viewer_context.is_some(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
             self.detached_viewer_window_id,
-            self.detached_viewer_pin_active,
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
@@ -27404,7 +27223,7 @@ impl App {
              independent_still={independent_detached_still} fs_idx_before={:?} \
              current_presentation={:?} enabled={} always_new={} open_next_once={} \
              grid_intent={} active_context={} session={:?} window_id={:?} \
-             pin_active={} independent={} passive_windows={}",
+             independent={} passive_windows={}",
             self.grid_item_debug_kind(idx),
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -27415,7 +27234,6 @@ impl App {
             self.active_detached_viewer_context.is_some(),
             self.active_detached_session,
             self.detached_viewer_window_id,
-            self.detached_viewer_pin_active,
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
@@ -27438,7 +27256,7 @@ impl App {
             //
             // ただし active_detached_viewer_context が外側に存在する状態でここへ来た場合、
             // これは **メイン context 側** の open であり、active detached session の所有者ではない。
-            // その session を畳むと、ピン留め PDF などの別ウィンドウ context が main 側の
+            // その session を畳むと、独立 PDF などの別ウィンドウ context が main 側の
             // ページ切替に巻き込まれ、同じ ViewportId / bundle が混線する。
             let owns_active_detached_session = self.active_detached_viewer_context.is_none();
             if owns_active_detached_session && self.active_detached_session.is_some() {
@@ -27459,7 +27277,6 @@ impl App {
         {
             self.update_detached_window_runtime_flags(
                 window_id,
-                self.detached_viewer_pin_active,
                 !independent_detached_still,
                 "prepare_viewer_presentation_open",
             );
@@ -27473,7 +27290,6 @@ impl App {
         if !matches!(presentation, ViewerPresentation::DetachedWindow)
             || !self.viewer_item_supports_detached_still(idx)
         {
-            self.detached_viewer_pin_active = false;
             self.detached_viewer_independent_active = false;
             self.detached_viewer_focus_requested = false;
         }
@@ -27493,13 +27309,12 @@ impl App {
         self.native_video_mode_switch = None;
         self.log_detached_image_window_debug(format!(
             "prepare_viewer_presentation_open_state idx={idx} presentation={:?} \
-             fs_idx={:?} session={:?} window_id={:?} pin_active={} independent={} \
+             fs_idx={:?} session={:?} window_id={:?} independent={} \
              focus_requested={} last_stamp={} passive_windows={}",
             self.viewer_presentation,
             self.fullscreen_idx,
             self.active_detached_session,
             self.detached_viewer_window_id,
-            self.detached_viewer_pin_active,
             self.detached_viewer_independent_active,
             self.detached_viewer_focus_requested,
             self.last_viewer_sync_stamp.is_some(),
@@ -33733,7 +33548,6 @@ impl App {
             self.detached_viewer_focus_requested = false;
             self.detached_viewer_recreate_on_next_render = false;
             self.detached_viewer_independent_active = false;
-            self.detached_viewer_pin_active = false;
             self.detached_viewer_open_next_still_detached_once = false;
             self.detached_viewer_folder_nav_reuse_window_once = false;
             self.detached_viewer_window_id = None;
@@ -33807,7 +33621,6 @@ impl App {
                     self.detached_viewer_borderless_fullscreen;
                 let detached_viewer_restore_placement = self.detached_viewer_restore_placement;
                 let detached_viewer_independent_active = self.detached_viewer_independent_active;
-                let detached_viewer_pin_active = self.detached_viewer_pin_active;
                 let detached_viewer_open_next_still_detached_once =
                     self.detached_viewer_open_next_still_detached_once;
                 let fs_viewport_generation = self.fs_viewport_generation;
@@ -33824,7 +33637,6 @@ impl App {
                 self.detached_viewer_borderless_fullscreen = detached_viewer_borderless_fullscreen;
                 self.detached_viewer_restore_placement = detached_viewer_restore_placement;
                 self.detached_viewer_independent_active = detached_viewer_independent_active;
-                self.detached_viewer_pin_active = detached_viewer_pin_active;
                 self.detached_viewer_open_next_still_detached_once =
                     detached_viewer_open_next_still_detached_once;
                 self.fs_viewport_generation = fs_viewport_generation;
@@ -39864,7 +39676,7 @@ impl App {
         #[cfg(windows)]
         self.log_detached_image_window_debug(format!(
             "toggle_detached_viewer_mode_begin enabled={} fs_idx={:?} presentation={:?} \
-             active_context={} session={:?} window_id={:?} pin_active={} independent={} \
+             active_context={} session={:?} window_id={:?} independent={} \
              passive_windows={} open_next_detached_once={} grid_intent={}",
             self.settings.detached_viewer_enabled,
             self.fullscreen_idx,
@@ -39872,7 +39684,6 @@ impl App {
             self.active_detached_viewer_context.is_some(),
             self.active_detached_session,
             self.detached_viewer_window_id,
-            self.detached_viewer_pin_active,
             self.detached_viewer_independent_active,
             self.detached_image_windows.len(),
             self.detached_viewer_open_next_still_detached_once,
@@ -39947,7 +39758,7 @@ impl App {
         {
             self.log_detached_image_window_debug(format!(
                 "toggle_detached_viewer_mode_flipped enabled={} fs_idx={:?} presentation={:?} \
-                 active_context={} session={:?} window_id={:?} pin_active={} independent={} \
+                 active_context={} session={:?} window_id={:?} independent={} \
                  passive_windows={}",
                 self.settings.detached_viewer_enabled,
                 self.fullscreen_idx,
@@ -39955,7 +39766,6 @@ impl App {
                 self.active_detached_viewer_context.is_some(),
                 self.active_detached_session,
                 self.detached_viewer_window_id,
-                self.detached_viewer_pin_active,
                 self.detached_viewer_independent_active,
                 self.detached_image_windows.len()
             ));
@@ -39967,7 +39777,6 @@ impl App {
                 let target_presentation = self.effective_viewer_presentation_for_open(idx);
                 if target_presentation != self.viewer_presentation {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                        self.detached_viewer_pin_active = false;
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
@@ -39991,7 +39800,6 @@ impl App {
                             self.begin_active_detached_session(id, DetachedSource::Image);
                             self.update_detached_window_runtime_flags(
                                 id,
-                                self.detached_viewer_pin_active,
                                 !self.detached_viewer_independent_active,
                                 "f12_on",
                             );
@@ -40008,13 +39816,12 @@ impl App {
                         self.log_detached_image_window_debug(format!(
                             "toggle_detached_viewer_mode_still_applied idx={idx} \
                              target={target_presentation:?} fs_idx={:?} presentation={:?} \
-                             session={:?} window_id={:?} pin_active={} independent={} \
+                             session={:?} window_id={:?} independent={} \
                              passive_windows={}",
                             self.fullscreen_idx,
                             self.viewer_presentation,
                             self.active_detached_session,
                             self.detached_viewer_window_id,
-                            self.detached_viewer_pin_active,
                             self.detached_viewer_independent_active,
                             self.detached_image_windows.len()
                         ));
@@ -44823,12 +44630,6 @@ impl eframe::App for App {
         // 細分計装: フルスクリーンビューポート関連の 3 段階を個別計測する
         // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
-        // ピンボタン押下 (前フレーム) の遅延昇格を、描画 dispatch 直前のこの安全地点で消化する。
-        // ここで active・連動 detached 静止画を独自バンドルへ昇格させると、続く
-        // update_active_detached_viewer_context が同フレームでその context を描く
-        // (docs/detached-viewer-implementation-plan.md §3.0 ③、案①)。
-        #[cfg(windows)]
-        self.process_pending_pin_promotion();
         #[cfg(windows)]
         self.commit_pending_deferred_detached_window_activation(ctx);
         #[cfg(windows)]

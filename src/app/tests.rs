@@ -16864,7 +16864,7 @@ mod still_window_mode_key_tests {
             "video keeps the legacy F12 host-migration toggle for now"
         );
 
-        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.detached_viewer_open_images_in_window = true;
         app.detached_viewer_independent_active = true;
         assert!(
             app.detached_independent_session_blocks_folder_nav(),
@@ -17346,25 +17346,6 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_pin_is_disabled_while_edit_mode_is_active() {
-        let mut app = setup_app();
-        assert!(app.detached_viewer_pin_disabled_reason().is_none());
-
-        app.erase_mode = true;
-        assert!(
-            app.detached_viewer_pin_disabled_reason().is_some(),
-            "pinning while an overlay edit session is active would otherwise discard work"
-        );
-
-        app.erase_mode = false;
-        app.view_trim_mode = true;
-        assert!(
-            app.detached_viewer_pin_disabled_reason().is_some(),
-            "view-trim is also a mutable foreground mode and must finish before pinning"
-        );
-    }
-
-    #[test]
     #[cfg(windows)]
     fn always_new_detached_ctrl_nav_handler_consumes_without_folder_nav() {
         let mut app = setup_app();
@@ -17417,7 +17398,6 @@ mod still_window_mode_key_tests {
         bundle.fullscreen_idx = Some(0);
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_pin_active = true;
         bundle.detached_viewer_window_id = Some(11);
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.pending_folder_nav_steps = -2;
@@ -17732,105 +17712,11 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_pin_requests_next_still_open_as_detached_and_disables_sync() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        app.settings.detached_viewer_enabled = false;
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.fullscreen_idx = Some(first);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_pin_active = true;
-        app.detached_viewer_independent_active = true;
-
-        assert_eq!(
-            app.requested_viewer_presentation_for_open(second),
-            ViewerPresentation::DetachedWindow
-        );
-
-        app.settings.detached_viewer_enabled = true;
-        app.selected = Some(second);
-        app.sync_detached_viewer_to_selected(&ctx);
-
-        assert_eq!(app.fullscreen_idx, Some(first));
-        assert_eq!(app.selected, Some(second));
-    }
-
-    #[test]
-    fn pinned_active_detached_image_is_parked_when_next_image_opens() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        insert_static_fs_entry(&mut app, &ctx, first, "pinned_active_first");
-        app.fullscreen_idx = Some(first);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_pin_active = true;
-        app.detached_viewer_independent_active = true;
-        app.fs_open_intent_from_grid = true;
-
-        app.open_fullscreen(second);
-
-        assert_eq!(app.fullscreen_idx, Some(second));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(!app.detached_viewer_pin_active);
-        assert!(
-            !app.detached_viewer_independent_active,
-            "pinning should detach only the parked window; the follow-up active viewer stays linked to the grid"
-        );
-        assert_eq!(app.detached_image_windows.len(), 1);
-        assert!(app.detached_image_windows[0].pinned);
-        assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
-    }
-
-    #[test]
-    fn pinned_followup_detached_image_rejoins_grid_sync_after_one_shot_is_consumed() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        let third = push_image(&mut app, r"C:\pics\c.jpg");
-        insert_static_fs_entry(&mut app, &ctx, first, "pinned_independent_first");
-        app.settings.detached_viewer_enabled = true;
-        app.fullscreen_idx = Some(first);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_pin_active = true;
-        app.detached_viewer_independent_active = true;
-        app.fs_open_intent_from_grid = true;
-
-        app.open_fullscreen(second);
-
-        assert_eq!(app.fullscreen_idx, Some(second));
-        assert!(!app.detached_viewer_independent_active);
-        assert!(!app.detached_viewer_open_next_still_detached_once);
-
-        app.selected = Some(third);
-        app.sync_detached_viewer_to_selected(&ctx);
-
-        assert_eq!(app.fullscreen_idx, Some(third));
-        assert_eq!(app.selected, Some(third));
-
-        app.selected = Some(first);
-        app.open_fullscreen_from_fs_navigation(&ctx, second);
-
-        assert_eq!(app.fullscreen_idx, Some(second));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(!app.detached_viewer_independent_active);
-        assert_eq!(
-            app.selected,
-            Some(second),
-            "linked active viewer navigation should continue syncing back to the grid"
-        );
-    }
-
-    #[test]
     fn stale_independent_flag_does_not_make_new_linked_window_independent() {
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\linked_again.jpg");
         app.settings.detached_viewer_enabled = true;
         app.settings.detached_viewer_open_images_in_window = false;
-        app.detached_viewer_pin_active = false;
         app.detached_viewer_independent_active = true;
         app.detached_viewer_open_next_still_detached_once = false;
         app.fs_open_intent_from_grid = true;
@@ -17841,10 +17727,6 @@ mod still_window_mode_key_tests {
         assert!(
             !app.detached_viewer_independent_active,
             "a stale independent flag from a previous window must not make a fresh linked open independent"
-        );
-        assert!(
-            !app.detached_viewer_pin_active,
-            "fresh linked open must not resurrect a stale pin state"
         );
     }
 
@@ -17865,7 +17747,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn image_only_detached_setting_parks_previous_window_as_unpinned() {
+    fn image_only_detached_setting_parks_previous_window_as_independent() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let first = push_image(&mut app, r"C:\pics\a.jpg");
@@ -17883,8 +17765,14 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(app.detached_image_windows.len(), 1);
-        assert!(!app.detached_image_windows[0].pinned);
         assert_eq!(app.detached_image_windows[0].id, 1);
+        assert_eq!(
+            app.detached_window_runtimes
+                .get(&1)
+                .map(|runtime| runtime.linked),
+            Some(false),
+            "always-new passive snapshots must be independent; linked snapshots are forbidden after CUT"
+        );
         assert_eq!(app.detached_viewer_window_id, Some(2));
         assert!(!app.detached_viewer_recreate_on_next_render);
         assert!(!app.fs_viewport_shown);
@@ -17929,7 +17817,6 @@ mod still_window_mode_key_tests {
             "the previously active detached window should be preserved as passive"
         );
         assert_eq!(app.detached_image_windows[0].id, 41);
-        assert!(!app.detached_image_windows[0].pinned);
         assert_eq!(
             app.detached_image_windows[0].location_display,
             "existing.jpg"
@@ -18036,34 +17923,6 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn image_only_detached_setting_ignores_stale_pin_when_parking_next_image() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        insert_static_fs_entry(&mut app, &ctx, first, "always_new_stale_pin_first");
-        app.settings.detached_viewer_open_images_in_window = true;
-        app.fullscreen_idx = Some(first);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_pin_active = true;
-        app.fs_viewport_shown = true;
-        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.fs_open_intent_from_grid = true;
-
-        app.open_fullscreen(second);
-
-        assert_eq!(app.fullscreen_idx, Some(second));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(!app.detached_viewer_pin_active);
-        assert_eq!(app.detached_image_windows.len(), 1);
-        assert!(!app.detached_image_windows[0].pinned);
-        assert_eq!(app.detached_image_windows[0].id, 1);
-        assert_eq!(app.detached_viewer_window_id, Some(2));
-        assert!(!app.detached_viewer_recreate_on_next_render);
-        assert!(!app.fs_viewport_shown);
-    }
-
-    #[test]
     fn image_only_detached_setting_preserves_active_window_on_main_context_change() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -18072,16 +17931,13 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_pin_active = true;
 
         assert!(app.should_preserve_active_detached_image_window_for_main_context_change());
         assert!(app.preserve_active_detached_image_window_for_main_context_change());
         app.close_fullscreen();
 
         assert_eq!(app.fullscreen_idx, None);
-        assert!(!app.detached_viewer_pin_active);
         assert_eq!(app.detached_image_windows.len(), 1);
-        assert!(!app.detached_image_windows[0].pinned);
         assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
     }
 
@@ -18113,69 +17969,6 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 7);
         assert!(app.detached_image_windows[0].can_activate());
-    }
-
-    #[test]
-    fn detached_pin_preserves_active_window_on_main_context_change() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let idx = push_image(&mut app, r"C:\pics\a.jpg");
-        insert_static_fs_entry(&mut app, &ctx, idx, "pinned_main_context");
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.fullscreen_idx = Some(idx);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_pin_active = true;
-
-        assert!(app.should_preserve_active_detached_image_window_for_main_context_change());
-        assert!(app.preserve_active_detached_image_window_for_main_context_change());
-        app.close_fullscreen();
-
-        assert_eq!(app.fullscreen_idx, None);
-        assert!(!app.detached_viewer_pin_active);
-        assert_eq!(app.detached_image_windows.len(), 1);
-        assert!(app.detached_image_windows[0].pinned);
-        assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
-    }
-
-    #[test]
-    fn unpinned_passive_window_requests_detached_for_next_image() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
-        let texture = ctx.load_texture("passive_reuse", pixels, egui::TextureOptions::LINEAR);
-        let placement = app.detached_viewer_window_placement();
-        app.set_detached_window_runtime_placement(1, placement, "test_passive_reuse");
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 1,
-                texture,
-                title: "a.jpg - mimageviewer".to_string(),
-                location_display: "a.jpg".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: false,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: None,
-                activation_armed: false,
-                focused_last_frame: false,
-                initial_placement_applied: false,
-                paused_bundle: None,
-            });
-        app.selected = Some(first);
-        app.fs_open_intent_from_grid = true;
-
-        app.open_fullscreen(second);
-
-        assert_eq!(app.fullscreen_idx, Some(second));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(app.detached_image_windows.is_empty());
-        assert_eq!(app.detached_viewer_window_id, Some(1));
-        assert!(app.detached_image_window_close_pending.is_empty());
     }
 
     #[test]
@@ -18581,7 +18374,6 @@ mod still_window_mode_key_tests {
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -18680,7 +18472,6 @@ mod still_window_mode_key_tests {
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -18854,305 +18645,12 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn reactivating_pinned_window_parks_current_linked_active_as_passive() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let first = push_image(&mut app, r"C:\pics\a.jpg");
-        let second = push_image(&mut app, r"C:\pics\b.jpg");
-        insert_static_fs_entry(&mut app, &ctx, second, "linked_active_second");
-
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.fullscreen_idx = Some(second);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(2);
-        app.fs_viewport_shown = true;
-        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.begin_active_detached_session(2, DetachedSource::Image);
-
-        let mut paused_bundle = ViewerContextBundle::empty();
-        paused_bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\pics\a.jpg"))];
-        paused_bundle.thumbnails = vec![ThumbnailState::Pending];
-        paused_bundle.image_metas = vec![None];
-        paused_bundle.visible_indices = vec![0];
-        paused_bundle.selected = Some(0);
-        paused_bundle.fullscreen_idx = Some(0);
-        paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        paused_bundle.detached_viewer_window_id = Some(1);
-        paused_bundle.detached_viewer_pin_active = true;
-        paused_bundle.detached_viewer_independent_active = true;
-        paused_bundle.current_folder = Some(PathBuf::from(r"C:\pics"));
-        paused_bundle.address = r"C:\pics".to_string();
-        paused_bundle.items_generation =
-            DETACHED_VIEWER_CONTEXT_GENERATION_BASE | DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE;
-
-        let texture = ctx.load_texture(
-            "pinned_passive_first",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.set_detached_window_runtime_placement(1, placement, "test_pinned_resume");
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 1,
-                texture,
-                title: "a.jpg - mimageviewer".to_string(),
-                location_display: "a.jpg".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: true,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: None,
-                activation_armed: true,
-                focused_last_frame: false,
-                initial_placement_applied: false,
-                paused_bundle: Some(Box::new(paused_bundle)),
-            });
-
-        assert!(app.activate_detached_image_window_snapshot(&ctx, 1));
-
-        let active = app
-            .active_detached_viewer_context
-            .as_ref()
-            .expect("pinned window should become the active independent context");
-        assert_eq!(active.bundle.detached_viewer_window_id, Some(1));
-        assert!(
-            active.bundle.detached_viewer_pin_active,
-            "reactivated pinned windows must keep their pinned flag so later parking stays non-reusable"
-        );
-        assert!(active.bundle.detached_viewer_independent_active);
-        assert_eq!(app.active_detached_session.unwrap().window_id, 1);
-        assert_eq!(
-            app.fullscreen_idx, None,
-            "main context should be back on the grid"
-        );
-        assert_eq!(app.detached_image_windows.len(), 1);
-        let parked = &app.detached_image_windows[0];
-        assert_eq!(
-            parked.id, 2,
-            "the previously active linked window should remain as a passive window"
-        );
-        assert!(
-            !parked.pinned,
-            "the parked linked window must stay reusable/linked, not become pinned"
-        );
-        assert_eq!(parked.location_display, "b.jpg");
-        assert!(
-            parked.reopen_sync_stamp.is_some(),
-            "linked passive windows need a sync stamp so they can reactivate into the main context"
-        );
-        assert!(
-            parked.can_activate(),
-            "the parked linked passive window must be activatable"
-        );
-        assert!(
-            parked.paused_bundle.is_none(),
-            "linked passive windows should not steal the main bundle"
-        );
-        assert_eq!(app.selected, Some(second));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn reactivating_linked_pdf_after_pinned_pdf_restores_linked_active() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
-        app.address = r"C:\books\a.pdf".to_string();
-        app.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
-            page_num: 1,
-            content_type: None,
-        }];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![None];
-        app.visible_indices = vec![0];
-        app.selected = Some(0);
-        app.fullscreen_idx = Some(0);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(1);
-        app.detached_viewer_pin_active = true;
-        app.detached_viewer_independent_active = true;
-        insert_static_fs_entry(&mut app, &ctx, 0, "pinned_pdf_a");
-        let pinned_bundle = app.take_current_viewer_context_bundle();
-
-        app.current_folder = Some(PathBuf::from(r"C:\books\b.pdf"));
-        app.address = r"C:\books\b.pdf".to_string();
-        app.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\b.pdf"),
-            page_num: 7,
-            content_type: None,
-        }];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![None];
-        app.visible_indices = vec![0];
-        app.selected = Some(0);
-        app.fullscreen_idx = Some(0);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(2);
-        app.detached_viewer_pin_active = false;
-        app.detached_viewer_independent_active = false;
-        app.fs_viewport_shown = true;
-        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        insert_static_fs_entry(&mut app, &ctx, 0, "linked_pdf_b");
-        app.begin_active_detached_session(2, DetachedSource::Book);
-
-        let texture = ctx.load_texture(
-            "pinned_pdf_a_passive",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.set_detached_window_runtime_placement(1, placement, "test_pinned_pdf_a");
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 1,
-                texture,
-                title: "a.pdf - mimageviewer".to_string(),
-                location_display: "a.pdf".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: true,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: None,
-                activation_armed: true,
-                focused_last_frame: false,
-                initial_placement_applied: false,
-                paused_bundle: Some(Box::new(pinned_bundle)),
-            });
-
-        assert!(app.activate_detached_image_window_snapshot(&ctx, 1));
-        assert_eq!(app.active_detached_session.unwrap().window_id, 1);
-        assert_eq!(app.detached_image_windows.len(), 1);
-        let linked_passive = &app.detached_image_windows[0];
-        assert_eq!(linked_passive.id, 2);
-        assert!(!linked_passive.pinned);
-        assert!(linked_passive.reopen_sync_stamp.is_some());
-        assert!(
-            linked_passive.paused_bundle.is_none(),
-            "Passive・連動 is specified to keep a sync stamp, not a paused bundle"
-        );
-
-        assert!(app.activate_detached_image_window_snapshot(&ctx, 2));
-
-        assert!(
-            app.active_detached_viewer_context.is_none(),
-            "linked PDF must reactivate through the main/shared context"
-        );
-        assert_eq!(app.active_detached_session.unwrap().window_id, 2);
-        assert_eq!(app.fullscreen_idx, Some(0));
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert_eq!(app.detached_viewer_window_id, Some(2));
-        assert!(!app.detached_viewer_pin_active);
-        assert!(!app.detached_viewer_independent_active);
-        assert_eq!(app.selected, Some(0));
-        assert_eq!(app.detached_image_windows.len(), 1);
-        assert_eq!(app.detached_image_windows[0].id, 1);
-        assert!(app.detached_image_windows[0].paused_bundle.is_some());
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn passive_linked_pdf_pin_toggle_is_ignored() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\b.pdf"),
-            page_num: 7,
-            content_type: None,
-        }];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![None];
-        app.visible_indices = vec![0];
-        app.current_folder = Some(PathBuf::from(r"C:\books\b.pdf"));
-        app.selected = Some(0);
-        let stamp = app
-            .viewer_sync_stamp_for_idx(0)
-            .expect("PDF page should produce a sync stamp");
-        let texture = ctx.load_texture(
-            "linked_pdf_pin_ignored",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 2,
-                texture,
-                title: "b.pdf - mimageviewer".to_string(),
-                location_display: "b.pdf".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: false,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
-                    path: PathBuf::from(r"C:\books\b.pdf"),
-                    page_num: Some(7),
-                }),
-                reopen_sync_stamp: Some(stamp),
-                activation_armed: true,
-                focused_last_frame: false,
-                initial_placement_applied: true,
-                paused_bundle: None,
-            });
-        app.transition_detached_window_state(2, DetachedWindowState::Parked, "test_linked_pdf");
-        app.update_detached_window_runtime_flags(2, false, true, "test_linked_pdf");
-        app.set_detached_window_runtime_placement(2, placement, "test_linked_pdf");
-
-        let view = DeferredDetachedImageWindowView::from_snapshot(
-            &app.detached_image_windows[0],
-            true,
-            placement,
-            false,
-        );
-        let shared = app.deferred_detached_image_window_shared(view);
-        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
-            id: 2,
-            viewport_close_requested: false,
-            bar_close_requested: false,
-            pin_toggle_requested: true,
-            focused: false,
-            pointer_activation: false,
-            scroll_candidate: false,
-            key_candidate: false,
-            wheel_candidate: false,
-            placement_update: None,
-            pixels_per_point: 1.5,
-            apply_initial_placement: false,
-        });
-
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
-
-        assert!(
-            !app.detached_image_windows[0].pinned,
-            "passive linked windows cannot be converted to independent without a paused bundle"
-        );
-        let runtime = app
-            .detached_window_runtimes
-            .get(&2)
-            .expect("runtime should stay registered");
-        assert!(!runtime.pinned);
-        assert!(runtime.linked);
-    }
-
-    #[test]
-    fn reactivating_pinned_pdf_keeps_detached_context_out_of_embedded_mode() {
+    fn reactivating_independent_pdf_keeps_detached_context_out_of_embedded_mode() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
 
         // Main can legitimately be in embedded/main-window mode after the user opens a
-        // different PDF there. A pinned detached context must not inherit that flag on
+        // different PDF there. An independent detached context must not inherit that flag on
         // reactivation, or it will render into the main window and hide its viewport.
         app.native_video_in_window_active = true;
         app.fullscreen_idx = Some(0);
@@ -19178,13 +18676,12 @@ mod still_window_mode_key_tests {
         paused_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         paused_bundle.native_video_in_window_active = false;
         paused_bundle.detached_viewer_window_id = Some(1);
-        paused_bundle.detached_viewer_pin_active = true;
         paused_bundle.detached_viewer_independent_active = true;
         paused_bundle.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
         paused_bundle.address = r"C:\books\pinned.pdf".to_string();
 
         let texture = ctx.load_texture(
-            "pinned_pdf_passive",
+            "independent_pdf_passive",
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
@@ -19197,7 +18694,6 @@ mod still_window_mode_key_tests {
                 title: "pinned.pdf - mimageviewer".to_string(),
                 location_display: "pinned.pdf".to_string(),
                 image_dims: Some((1, 1)),
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -19224,7 +18720,7 @@ mod still_window_mode_key_tests {
             assert!(!mounted.native_video_in_window_active);
             assert!(
                 !mounted.fullscreen_embedded_still_active(),
-                "pinned detached PDF must render through the detached viewport after reactivation"
+                "independent detached PDF must render through the detached viewport after reactivation"
             );
         });
     }
@@ -19324,7 +18820,6 @@ mod still_window_mode_key_tests {
         bundle.fullscreen_idx = Some(0);
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         bundle.detached_viewer_window_id = Some(window_id);
-        bundle.detached_viewer_pin_active = true;
         bundle.detached_viewer_independent_active = true;
         app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         app.begin_active_detached_session(window_id, DetachedSource::Book);
@@ -19343,7 +18838,7 @@ mod still_window_mode_key_tests {
         );
         assert!(
             app.active_detached_viewer_context.is_some(),
-            "main page navigation must not drop the pinned detached context"
+            "main page navigation must not drop the independent detached context"
         );
         let session = app
             .active_detached_session
@@ -19354,119 +18849,6 @@ mod still_window_mode_key_tests {
             app.detached_window_state(session.window_id),
             Some(DetachedWindowState::Active)
         );
-    }
-
-    #[test]
-    fn pausing_linked_active_context_drops_bundle_for_main_link_reactivation() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        let mut main_context = app.take_current_viewer_context_bundle();
-
-        app.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
-            page_num: 3,
-            content_type: None,
-        }];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![None];
-        app.visible_indices = vec![0];
-        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
-        app.fullscreen_idx = Some(0);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(4);
-        app.detached_viewer_pin_active = false;
-        app.detached_viewer_independent_active = false;
-        insert_static_fs_entry(&mut app, &ctx, 0, "linked_context_pdf_page");
-
-        let active_context = app.take_current_viewer_context_bundle();
-        app.swap_viewer_context_bundle(&mut main_context);
-        app.fs_viewport_shown = true;
-        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-        app.begin_active_detached_session(4, DetachedSource::Image);
-        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-            bundle: active_context,
-        });
-
-        assert!(app.pause_current_active_detached_viewer_context(&ctx));
-
-        assert!(app.active_detached_viewer_context.is_none());
-        assert_eq!(app.detached_image_windows.len(), 1);
-        let snapshot = &app.detached_image_windows[0];
-        assert_eq!(snapshot.id, 4);
-        assert!(!snapshot.pinned);
-        assert!(
-            snapshot.reopen_sync_stamp.is_some(),
-            "linked passive context must keep a sync stamp for main-linked reactivation"
-        );
-        assert!(
-            snapshot.reopen_descriptor.is_some(),
-            "PDF/ZIP linked passive windows may still keep a descriptor as fallback metadata"
-        );
-        assert!(
-            snapshot.paused_bundle.is_none(),
-            "linked passive windows must not keep a paused bundle, otherwise reactivation resumes an independent context"
-        );
-    }
-
-    #[test]
-    fn linked_passive_pdf_snapshot_prefers_sync_stamp_over_descriptor() {
-        let mut app = setup_app();
-        let ctx = egui::Context::default();
-        app.settings.detached_viewer_open_images_in_window = false;
-        app.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
-            page_num: 7,
-            content_type: None,
-        }];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![None];
-        app.visible_indices = vec![0];
-        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
-        app.selected = Some(0);
-        let stamp = app
-            .viewer_sync_stamp_for_idx(0)
-            .expect("PDF page should produce a sync stamp");
-        let texture = ctx.load_texture(
-            "linked_passive_pdf_snapshot",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-        let placement = app.detached_viewer_window_placement();
-        app.set_detached_window_runtime_placement(4, placement, "test_linked_pdf_snapshot");
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 4,
-                texture,
-                title: "Page 8 - mimageviewer".to_string(),
-                location_display: "Page 8".to_string(),
-                image_dims: Some((1, 1)),
-                pinned: false,
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
-                    path: PathBuf::from(r"C:\books\a.pdf"),
-                    page_num: Some(7),
-                }),
-                reopen_sync_stamp: Some(stamp),
-                activation_armed: true,
-                focused_last_frame: false,
-                initial_placement_applied: false,
-                paused_bundle: None,
-            });
-
-        assert!(app.activate_detached_image_window_snapshot(&ctx, 4));
-
-        assert!(
-            app.active_detached_viewer_context.is_none(),
-            "unpinned linked passive PDF pages should reactivate through the main context, not a detached book bundle"
-        );
-        assert_eq!(app.fullscreen_idx, Some(0));
-        assert_eq!(app.detached_viewer_window_id, Some(4));
-        assert!(!app.detached_viewer_pin_active);
-        assert!(!app.detached_viewer_independent_active);
-        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
     }
 
     #[test]
@@ -19499,7 +18881,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(second);
 
         let snapshot = app
-            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .build_active_detached_image_window_snapshot(Some(&ctx))
             .expect("continuous detached viewer should build a snapshot");
 
         assert!(
@@ -19543,7 +18925,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(left);
 
         let snapshot = app
-            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .build_active_detached_image_window_snapshot(Some(&ctx))
             .expect("spread detached viewer should build a snapshot");
 
         assert_eq!(
@@ -19574,7 +18956,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
 
         let snapshot = app
-            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .build_active_detached_image_window_snapshot(Some(&ctx))
             .expect("single detached viewer should build a snapshot");
 
         assert!(
@@ -19641,17 +19023,16 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn pausing_detached_context_hands_viewport_to_passive_without_cleanup() {
+    fn pausing_independent_detached_context_hands_viewport_to_passive_without_cleanup() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.detached_viewer_open_images_in_window = true;
 
         let mut main_context = app.take_current_viewer_context_bundle();
-        let idx = push_image(&mut app, r"C:\pics\pinned.jpg");
+        let idx = push_image(&mut app, r"C:\pics\independent.jpg");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.detached_viewer_pin_active = true;
         app.detached_viewer_window_id = Some(10);
         insert_static_fs_entry(&mut app, &ctx, idx, "pause_handoff_to_passive");
         let active_context = app.take_current_viewer_context_bundle();
@@ -19669,15 +19050,10 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         let snapshot = &app.detached_image_windows[0];
         assert_eq!(snapshot.id, 10);
-        assert!(snapshot.pinned);
         let paused = snapshot
             .paused_bundle
             .as_ref()
             .expect("pause should keep the viewer bundle");
-        assert!(
-            paused.detached_viewer_pin_active,
-            "a pinned active context must remain pinned inside the paused bundle"
-        );
         assert!(paused.detached_viewer_independent_active);
         assert!(
             app.active_detached_session.is_none(),
@@ -20194,243 +19570,6 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn pin_promote_moves_active_linked_still_to_independent_context() {
-        // ピン留め = Active・連動 → Active・連動なし (独自 bundle 昇格、案①)。
-        // docs/detached-viewer-implementation-plan.md §3.0 ③。
-        let mut app = setup_app();
-        app.items = vec![
-            GridItem::Image(std::path::PathBuf::from(r"C:\imgs\a.jpg")),
-            GridItem::Image(std::path::PathBuf::from(r"C:\imgs\b.jpg")),
-        ];
-        app.visible_indices = vec![0, 1];
-        app.fullscreen_idx = Some(1);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.detached_viewer_window_id = Some(7);
-        let ctx = egui::Context::default();
-        let frame0 = egui::ColorImage::filled([1, 1], egui::Color32::RED);
-        let frame1 = egui::ColorImage::filled([1, 1], egui::Color32::GREEN);
-        let tex0 = ctx.load_texture(
-            "pin_promote_animated_0",
-            frame0.clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        let tex1 = ctx.load_texture(
-            "pin_promote_animated_1",
-            frame1.clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        app.fs_cache.insert(
-            1,
-            FsCacheEntry::Animated {
-                frames: vec![(tex0, 0.1), (tex1, 0.2)],
-                frame_pixels: vec![std::sync::Arc::new(frame0), std::sync::Arc::new(frame1)],
-                current_frame: 1,
-                next_frame_at: 123.0,
-                load_seq: 77,
-            },
-        );
-        app.input_generation.insert(1, 42);
-        app.fs_margin_bbox_cache
-            .insert(1, (77, 123, Some(egui::Rect::EVERYTHING)));
-        let (cancel, rx) = std::sync::mpsc::channel();
-        drop(cancel);
-        app.fs_pending
-            .insert(1, (std::sync::Arc::new(AtomicBool::new(false)), rx, 88));
-        app.fs_early_dims.insert(1, [640, 480]);
-        app.fs_upload_backlog.push((
-            0,
-            FsLoadResult::DimsOnly {
-                source_dims: [1, 1],
-            },
-            1,
-        ));
-        app.fs_upload_backlog.push((1, FsLoadResult::Failed, 2));
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.4, -0.2));
-        app.pano_toast_shown_for_current_fs = true;
-        app.analysis_mode = true;
-        app.analysis_zoom = 2.0;
-        app.analysis_pan = egui::vec2(5.0, -4.0);
-        app.erase_mode = true;
-        app.erase_mask = Some(vec![true, false]);
-        app.erase_mask_size = [2, 1];
-        assert!(app.active_detached_viewer_context.is_none());
-
-        assert!(
-            app.promote_active_still_to_independent(),
-            "active-linked detached still should promote to an independent context"
-        );
-
-        // メインは grid へ戻る (items は維持、fullscreen 状態だけ解除)。
-        assert_eq!(
-            app.fullscreen_idx, None,
-            "main reverts to grid (no fullscreen idx)"
-        );
-        assert_eq!(app.items.len(), 2, "main keeps its grid items untouched");
-        assert_ne!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(app.active_detached_viewer_context.is_some());
-        // メインは detached 窓の所有権を手放す (次の open が新 window_id を割り当てる、
-        // Codex P1: ピン窓上書き防止)。
-        assert_eq!(
-            app.detached_viewer_window_id, None,
-            "main relinquishes the detached window id so a new open allocates a fresh one"
-        );
-
-        // 連動なし窓は独自 bundle を持ち、ピンした画像・前後移動用の order・items を保持し、
-        // 「ピン済み」(park 時に reuse されない passive になる) としてマークされている。
-        let snapshot = app
-            .with_active_detached_viewer_context(|a| {
-                (
-                    a.fullscreen_idx,
-                    a.items.len(),
-                    a.detached_viewer_independent_active,
-                    a.detached_viewer_window_id,
-                    a.visible_indices.len(),
-                    a.detached_viewer_pin_active,
-                    match a.fs_cache.get(&1) {
-                        Some(FsCacheEntry::Animated {
-                            frames,
-                            current_frame,
-                            next_frame_at,
-                            load_seq,
-                            ..
-                        }) => Some((frames.len(), *current_frame, *next_frame_at, *load_seq)),
-                        _ => None,
-                    },
-                    a.input_generation.get(&1).copied(),
-                    a.fs_margin_bbox_cache.contains_key(&1),
-                    a.fs_pending.contains_key(&1),
-                    a.fs_early_dims.get(&1).copied(),
-                    a.fs_upload_backlog
-                        .iter()
-                        .map(|(idx, _, seq)| (*idx, *seq))
-                        .collect::<Vec<_>>(),
-                    a.panorama_state.is_some(),
-                    a.pano_toast_shown_for_current_fs,
-                    a.analysis_mode,
-                    a.erase_mode,
-                )
-            })
-            .expect("active detached context present");
-        assert_eq!(snapshot.0, Some(1), "pinned context shows the pinned image");
-        assert_eq!(
-            snapshot.1, 2,
-            "pinned context cloned folder items for navigation"
-        );
-        assert!(
-            snapshot.2,
-            "pinned context is independent (decoupled from main)"
-        );
-        assert_eq!(
-            snapshot.3,
-            Some(7),
-            "pinned context keeps the same window id"
-        );
-        assert_eq!(
-            snapshot.4, 2,
-            "pinned context keeps visible_indices so prev/next has a target (Codex P1)"
-        );
-        assert!(
-            snapshot.5,
-            "pinned context is marked pinned so it parks as a non-reusable passive (Codex P1)"
-        );
-        assert_eq!(
-            snapshot.6,
-            Some((2, 1, 123.0, 77)),
-            "pin promotion keeps the current animated fs_cache entry alive"
-        );
-        assert_eq!(snapshot.7, Some(42));
-        assert!(
-            snapshot.8,
-            "margin cache for current page moves to the bundle"
-        );
-        assert!(
-            snapshot.9,
-            "pending load for current page moves to the bundle"
-        );
-        assert_eq!(snapshot.10, Some([640, 480]));
-        assert_eq!(
-            snapshot.11,
-            vec![(1, 2)],
-            "upload backlog for the current page moves to the bundle"
-        );
-        assert!(
-            !snapshot.12,
-            "pin promotion exits panorama so the independent window freezes normal image display"
-        );
-        assert!(!snapshot.13);
-        assert!(
-            !snapshot.14,
-            "pin promotion must not stash analysis mode into the independent bundle"
-        );
-        assert!(
-            !snapshot.15,
-            "pin promotion must not stash an in-progress erase mode into the independent bundle"
-        );
-        assert!(
-            app.panorama_state.is_none(),
-            "main context must not carry panorama into the next image opened after pinning"
-        );
-        assert!(!app.pano_toast_shown_for_current_fs);
-        assert!(!app.analysis_mode);
-        assert!(!app.erase_mode);
-        assert!(
-            !app.fs_cache.contains_key(&1),
-            "main must relinquish the moved fullscreen cache entry"
-        );
-        assert!(
-            !app.fs_pending.contains_key(&1),
-            "main must relinquish the moved pending load"
-        );
-        assert_eq!(
-            app.fs_upload_backlog
-                .iter()
-                .map(|(idx, _, seq)| (*idx, *seq))
-                .collect::<Vec<_>>(),
-            vec![(0, 1)],
-            "unrelated main upload backlog entries stay in main"
-        );
-
-        // 一方通行 (§3.0 ⑤): 既に独自 context があるので再昇格は no-op。
-        assert!(
-            !app.promote_active_still_to_independent(),
-            "pin is one-way; re-promotion must be a no-op"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn grid_open_does_not_close_pinned_context_when_pause_snapshot_is_unavailable() {
-        // ピン窓を passive 化するには表示 texture が必要。decode 前などで snapshot が
-        // 作れない場合、旧実装は close fallback に落ちてピン窓を消していた。新規 open
-        // は中断し、既存の active context を残す。
-        let mut app = setup_app();
-        let mut bundle = ViewerContextBundle::empty();
-        bundle.items = vec![GridItem::Image(std::path::PathBuf::from(r"C:\imgs\a.jpg"))];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
-        bundle.detached_viewer_independent_active = true;
-        bundle.detached_viewer_pin_active = true;
-        bundle.detached_viewer_window_id = Some(9);
-        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
-
-        let ctx = egui::Context::default();
-        assert!(
-            !app.park_active_detached_context_for_new_grid_open(&ctx),
-            "without a display texture, parking must fail instead of closing the pinned context"
-        );
-        assert!(
-            app.active_detached_viewer_context.is_some(),
-            "failed parking must keep the pinned active context alive"
-        );
-        assert!(
-            app.detached_image_windows.is_empty(),
-            "no passive snapshot is created when the texture is unavailable"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
     fn detached_cleanup_font_resync_waits_until_outer_detached_idle() {
         // always-new クラッシュの根治 (Codex): passive close / active close finalize などの
         // close 経路では即時 resync せず pending 化し、outer/main context が detached idle だと
@@ -20499,7 +19638,6 @@ mod still_window_mode_key_tests {
                 title: "passive".to_owned(),
                 location_display: "passive".to_owned(),
                 image_dims: Some((1, 1)),
-                pinned: false,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -21177,7 +20315,6 @@ mod still_window_mode_key_tests {
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
-                pinned: false,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -21236,6 +20373,101 @@ mod still_window_mode_key_tests {
             app.detached_window_state(window_id),
             Some(DetachedWindowState::ParkedLive)
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_mode_change_closes_active_passive_and_parked_live_windows() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\active.jpg");
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(101);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_active_detached_session(101, DetachedSource::Image);
+
+        let texture = ctx.load_texture(
+            "mode_change_close_all",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 102,
+                texture: texture.clone(),
+                title: "passive.jpg - mimageviewer".to_owned(),
+                location_display: "passive.jpg".to_owned(),
+                image_dims: Some((1, 1)),
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: None,
+            });
+        app.transition_detached_window_state(102, DetachedWindowState::Parked, "test_setup");
+        app.update_detached_window_runtime_flags(102, false, "test_setup");
+
+        let mut live_bundle = ViewerContextBundle::empty();
+        live_bundle.fullscreen_idx = Some(push_video(&mut app, r"C:\clips\live.mp4"));
+        live_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        live_bundle.detached_viewer_window_id = Some(103);
+        live_bundle.detached_viewer_independent_active = true;
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 103,
+                texture,
+                title: "live.mp4 - mimageviewer".to_owned(),
+                location_display: "live.mp4".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(live_bundle)),
+            });
+        app.transition_detached_window_state(103, DetachedWindowState::ParkedLive, "test_setup");
+        app.update_detached_window_runtime_flags(103, false, "test_setup");
+
+        assert!(app.close_all_detached_viewers_for_mode_change(&ctx));
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(
+            app.viewer_presentation,
+            app.non_detached_viewer_presentation()
+        );
+        assert!(app.active_detached_session.is_none());
+        assert!(app.active_detached_viewer_context.is_none());
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.detached_window_runtimes.is_empty());
+        assert_eq!(app.detached_viewer_window_id, None);
+        assert_eq!(app.last_active_detached_window_id, None);
+        assert!(!app.detached_viewer_independent_active);
+        assert!(!app.detached_viewer_open_next_still_detached_once);
+        assert!(app.pending_detached_cleanup_font_atlas_resync.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_mode_change_without_windows_is_noop() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        assert!(!app.close_all_detached_viewers_for_mode_change(&ctx));
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.detached_window_runtimes.is_empty());
     }
 
     #[test]
@@ -21355,7 +20587,6 @@ mod still_window_mode_key_tests {
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -21404,6 +20635,71 @@ mod still_window_mode_key_tests {
         assert!(
             !app.native_video_event_blocked_by_parked_live_filter(&wheel),
             "after ParkedLive restore, native wheel must return to the normal active-video path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activating_parked_live_media_closes_linked_active_window_in_off_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let linked = push_image(&mut app, r"C:\pics\linked.jpg");
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.fullscreen_idx = Some(linked);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(71);
+        app.begin_active_detached_session(71, DetachedSource::Image);
+        app.update_detached_window_runtime_flags(71, true, "test_linked_active");
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(72);
+        bundle.detached_viewer_independent_active = true;
+        let texture = ctx.load_texture(
+            "parked_live_closes_linked",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 72,
+                texture,
+                title: "live.mp4 - mimageviewer".to_owned(),
+                location_display: "live.mp4".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
+        app.update_detached_window_runtime_flags(72, false, "test_setup");
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 72));
+
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "OFF-mode linked active window must close rather than become a passive snapshot"
+        );
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.detached_viewer_window_id, Some(72));
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(72)
+        );
+        assert_eq!(app.detached_window_state(71), None);
+        assert_eq!(
+            app.detached_window_state(72),
+            Some(DetachedWindowState::Active)
         );
     }
 
@@ -21556,7 +20852,6 @@ mod still_window_mode_key_tests {
                 title: "old".to_owned(),
                 location_display: "old".to_owned(),
                 image_dims: None,
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -21601,7 +20896,6 @@ mod still_window_mode_key_tests {
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -21652,7 +20946,6 @@ mod still_window_mode_key_tests {
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
-                pinned: true,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
@@ -22335,7 +21628,7 @@ mod still_window_mode_key_tests {
         app.set_detached_window_runtime_placement(9, live_placement, "test_snapshot_runtime");
 
         let snapshot = app
-            .build_active_detached_image_window_snapshot(Some(&ctx), false)
+            .build_active_detached_image_window_snapshot(Some(&ctx))
             .expect("detached still snapshot should be built");
 
         assert_eq!(
@@ -22457,7 +21750,6 @@ mod still_window_mode_key_tests {
             title: "a.jpg - mimageviewer".to_string(),
             location_display: "a.jpg".to_string(),
             image_dims: Some((1, 1)),
-            pinned: false,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
@@ -22475,7 +21767,6 @@ mod still_window_mode_key_tests {
 
         let view = DeferredDetachedImageWindowView::from_snapshot(
             &app.detached_image_windows[0],
-            true,
             placement,
             false,
         );
@@ -22484,7 +21775,6 @@ mod still_window_mode_key_tests {
             id: 7,
             viewport_close_requested: false,
             bar_close_requested: false,
-            pin_toggle_requested: false,
             focused: true,
             pointer_activation: true,
             scroll_candidate: false,
@@ -22555,7 +21845,6 @@ mod still_window_mode_key_tests {
             title: "deferred.jpg - mimageviewer".to_string(),
             location_display: "deferred.jpg".to_string(),
             image_dims: Some((1, 1)),
-            pinned: false,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
@@ -22572,7 +21861,6 @@ mod still_window_mode_key_tests {
         app.set_detached_window_runtime_placement(7, previous, "test_deferred_previous");
         let view = DeferredDetachedImageWindowView::from_snapshot(
             &app.detached_image_windows[0],
-            true,
             previous,
             false,
         );
@@ -22581,7 +21869,6 @@ mod still_window_mode_key_tests {
             id: 7,
             viewport_close_requested: false,
             bar_close_requested: false,
-            pin_toggle_requested: false,
             focused: false,
             pointer_activation: false,
             scroll_candidate: false,

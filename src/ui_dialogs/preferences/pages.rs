@@ -126,7 +126,13 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.label(
         egui::RichText::new(
-            "画像は開くたびに別ウィンドウを残します。動画は専用の動画ウィンドウを再利用し、F12 で現在の動画だけメイン表示へ一時切替できます。",
+            "ON: 画像は開くたびに独立した別ウィンドウを残し、動画は専用の動画ウィンドウを再利用します。OFF: F12 で開く別ウィンドウは一覧の選択に連動する 1 枚だけです。",
+        )
+        .weak(),
+    );
+    ui.label(
+        egui::RichText::new(
+            "この設定を切り替えると、混在状態を避けるため開いている別ウィンドウは自動で閉じます。",
         )
         .weak(),
     );

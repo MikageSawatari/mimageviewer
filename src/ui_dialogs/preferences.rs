@@ -1042,6 +1042,9 @@ impl App {
                     .iter()
                     .map(|e| e.path.clone())
                     .collect();
+                #[cfg(windows)]
+                let old_detached_open_images_in_window =
+                    self.settings.detached_viewer_open_images_in_window;
                 // VST3 ページで再スキャンした候補を App 側に反映
                 #[cfg(windows)]
                 let new_vst3_discovered = state.vst3_discovered.clone();
@@ -1070,6 +1073,16 @@ impl App {
                     }
                     keymap.install_global_native_video_shortcuts();
                     self.keymap = keymap;
+                }
+                #[cfg(windows)]
+                if old_detached_open_images_in_window
+                    != self.settings.detached_viewer_open_images_in_window
+                    && self.close_all_detached_viewers_for_mode_change(ctx)
+                {
+                    self.show_feedback_toast(
+                        "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"
+                            .to_string(),
+                    );
                 }
                 // (フォルダ履歴 / A・B 記憶のクリアは v2.0.0 でフォルダバーの右クリック
                 //  メニューへ移動。環境設定 OK 経路でのクリア要求は廃止。)

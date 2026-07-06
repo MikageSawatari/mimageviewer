@@ -392,7 +392,6 @@ const BAR_BUTTON_GAP: f32 = 4.0;
 struct DetachedImageWindowEventBatch {
     close_ids: Vec<u64>,
     close_command_ids: Vec<u64>,
-    toggle_pin_ids: Vec<u64>,
     activate_ids: Vec<u64>,
     placements: Vec<(u64, crate::settings::DetachedViewerWindowPlacement)>,
     focus_updates: Vec<(u64, bool)>,
@@ -3623,7 +3622,6 @@ impl App {
         full_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
         close_requested: &mut bool,
-        pin_toggle_requested: &mut bool,
     ) {
         let hover_in_top = ctx.input(|i| {
             i.pointer
@@ -3675,27 +3673,6 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        if window.show_pin {
-            let pin_resp = draw_bar_button(
-                ui,
-                next_x,
-                bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "detached_image_pin_btn",
-                |hovered| bar_button_bg(hovered, window.pinned),
-                window.pinned,
-                |p, c, r| draw_pin_icon(p, c, r, window.pinned),
-            );
-            let pin_resp = pin_resp.hover_tip_dark(if window.pinned {
-                "ピン留め解除"
-            } else {
-                "ピン留め"
-            });
-            if pin_resp.clicked() {
-                *pin_toggle_requested = true;
-            }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-        }
-
         let text_rect = egui::Rect::from_min_max(
             bar_rect.min + egui::vec2(12.0, 0.0),
             egui::pos2(next_x - 8.0, bar_rect.max.y),
@@ -3739,7 +3716,6 @@ impl App {
                 id,
                 viewport_close_requested,
                 bar_close_requested,
-                pin_toggle_requested,
                 focused,
                 pointer_activation,
                 scroll_candidate,
@@ -3769,17 +3745,12 @@ impl App {
                 } else if viewport_close_requested {
                     batch.close_ids.push(id);
                 }
-                if pin_toggle_requested {
-                    batch.toggle_pin_ids.push(id);
-                }
-
                 let can_activate = window.can_activate();
                 let focus_activation_raw = focused && !window.focused_last_frame;
                 let user_activation = pointer_activation;
                 let focus_edge = focused != window.focused_last_frame;
                 if (viewport_close_requested
                     || bar_close_requested
-                    || pin_toggle_requested
                     || focus_edge
                     || pointer_activation
                     || scroll_candidate
@@ -3789,14 +3760,13 @@ impl App {
                 {
                     crate::logger::log(format!(
                         "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
-                         pin_toggle={} focused={} focused_prev={} focus_edge={} \
+                         focused={} focused_prev={} focus_edge={} \
                          focus_activation_candidate={} pointer_activation={} scroll_candidate={} \
                          key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
-                         armed={} pinned={} has_bundle={} has_descriptor={} has_stamp={} source=deferred",
+                         armed={} has_bundle={} has_descriptor={} has_stamp={} source=deferred",
                         id,
                         viewport_close_requested,
                         bar_close_requested,
-                        pin_toggle_requested,
                         focused,
                         window.focused_last_frame,
                         focus_edge,
@@ -3808,7 +3778,6 @@ impl App {
                         user_activation,
                         can_activate,
                         window.activation_armed,
-                        window.pinned,
                         window.has_paused_bundle(),
                         window.reopen_descriptor.is_some(),
                         window.reopen_sync_stamp.is_some()
@@ -3909,11 +3878,6 @@ impl App {
                 window.initial_placement_applied = false;
             }
         }
-        for id in &batch.toggle_pin_ids {
-            self.log_detached_image_window_debug(format!(
-                "passive_pin_toggle_ignored id={id} reason=pin_only_promotes_active_linked_window"
-            ));
-        }
         batch.close_ids.sort_unstable();
         batch.close_ids.dedup();
         batch.close_command_ids.sort_unstable();
@@ -3974,11 +3938,9 @@ impl App {
         batch.activate_ids.sort_unstable();
         batch.activate_ids.dedup();
         for id in batch.activate_ids {
-            if batch.close_ids.contains(&id) || batch.toggle_pin_ids.contains(&id) {
+            if batch.close_ids.contains(&id) {
                 self.log_detached_image_window_debug(format!(
-                    "passive_activate_skipped id={id} close={} toggle={}",
-                    batch.close_ids.contains(&id),
-                    batch.toggle_pin_ids.contains(&id)
+                    "passive_activate_skipped id={id} close=true",
                 ));
                 continue;
             }
@@ -4049,13 +4011,12 @@ impl App {
         if Self::detached_image_window_debug_enabled() && self.frame_counter % 600 == 0 {
             for window in &self.detached_image_windows {
                 self.log_detached_image_window_debug(format!(
-                    "passive_window_state frame={} id={} pinned={} can_activate={} \
+                    "passive_window_state frame={} id={} can_activate={} \
                  has_bundle={} has_descriptor={} has_stamp={} tex=({:.0}x{:.0}) \
                  frozen_pages={} armed={} focused_last={} initial_placement={} \
                  host={} title={:?}",
                     self.frame_counter,
                     window.id,
-                    window.pinned,
                     window.can_activate(),
                     window.has_paused_bundle(),
                     window.reopen_descriptor.is_some(),
@@ -4102,7 +4063,6 @@ impl App {
                 deferred_windows.push(window);
             }
         }
-        let show_pin = false;
         let mut render_batch = DetachedImageWindowEventBatch::default();
         let mut unconfirmed_deferred_registered = false;
 
@@ -4120,7 +4080,6 @@ impl App {
                 ));
                 continue;
             }
-            let window_show_pin = show_pin;
             let apply_initial_placement = !window.initial_placement_applied;
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "deferred_passive_seed");
@@ -4131,7 +4090,6 @@ impl App {
             );
             let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
                 window,
-                window_show_pin,
                 window_placement,
                 apply_initial_placement,
             );
@@ -4199,7 +4157,6 @@ impl App {
                     (pointer, scroll, key, wheel)
                 });
                 let mut bar_close_requested = false;
-                let mut pin_toggle_requested = false;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(vp_ctx, |ui| {
@@ -4211,7 +4168,6 @@ impl App {
                             full_rect,
                             &view,
                             &mut bar_close_requested,
-                            &mut pin_toggle_requested,
                         );
                     });
                 // Passive deferred still windows are display-only. They contain no text input,
@@ -4220,7 +4176,6 @@ impl App {
                     id: view.id,
                     viewport_close_requested,
                     bar_close_requested,
-                    pin_toggle_requested,
                     focused,
                     pointer_activation,
                     scroll_candidate: scroll_activation_candidate,
@@ -4232,7 +4187,6 @@ impl App {
                 });
                 if viewport_close_requested
                     || bar_close_requested
-                    || pin_toggle_requested
                     || pointer_activation
                     || scroll_activation_candidate
                     || key_activation_candidate
@@ -4249,7 +4203,6 @@ impl App {
 
         for window in parked_live_windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
-            let window_show_pin = show_pin && !self.detached_window_state_is_parked_live(window.id);
             let apply_initial_placement = !window.initial_placement_applied;
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
@@ -4260,7 +4213,6 @@ impl App {
             );
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
-            let mut pin_toggle_requested = false;
             let mut placement_update = None;
             let mut focused_now = false;
             let mut pixels_per_point = 1.0_f32;
@@ -4274,7 +4226,6 @@ impl App {
                 self.detached_window_hwnd_snapshot_before_show(window.id, "passive", viewport_id);
             let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
                 &window,
-                window_show_pin,
                 window_placement,
                 apply_initial_placement,
             );
@@ -4349,7 +4300,6 @@ impl App {
                             full_rect,
                             &view,
                             &mut bar_close_requested,
-                            &mut pin_toggle_requested,
                         );
                     });
             });
@@ -4367,9 +4317,6 @@ impl App {
             } else if viewport_close_requested {
                 render_batch.close_ids.push(window.id);
             }
-            if pin_toggle_requested {
-                render_batch.toggle_pin_ids.push(window.id);
-            }
             let can_activate = self
                 .detached_image_windows
                 .iter()
@@ -4384,7 +4331,6 @@ impl App {
             let focus_edge = focused_now != window.focused_last_frame;
             if (viewport_close_requested
                 || bar_close_requested
-                || pin_toggle_requested
                 || focus_edge
                 || pointer_activation
                 || scroll_activation_candidate
@@ -4394,14 +4340,13 @@ impl App {
             {
                 crate::logger::log(format!(
                     "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
-                     pin_toggle={} focused={} focused_prev={} focus_edge={} \
+                     focused={} focused_prev={} focus_edge={} \
                      focus_activation_candidate={} pointer_activation={} scroll_candidate={} \
                      key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
-                     armed={} pinned={} has_bundle={} has_descriptor={} has_stamp={}",
+                     armed={} has_bundle={} has_descriptor={} has_stamp={}",
                     window.id,
                     viewport_close_requested,
                     bar_close_requested,
-                    pin_toggle_requested,
                     focused_now,
                     window.focused_last_frame,
                     focus_edge,
@@ -4413,7 +4358,6 @@ impl App {
                     user_activation,
                     can_activate,
                     window.activation_armed,
-                    window.pinned,
                     actual_has_bundle,
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some()
@@ -6638,27 +6582,7 @@ impl App {
                             let mut vst3_pressed = false;
                             let mut copy_capture_pressed = false;
                             let mut copy_capture_region_pressed = false;
-                            let mut detached_pin_pressed = false;
                             let mut window_mode_pressed = false;
-                            #[cfg(windows)]
-                            let detached_pin_disabled_reason =
-                                self.detached_viewer_pin_disabled_reason();
-                            #[cfg(windows)]
-                            // ピンは一方通行 (§3.0 ⑤)。既に連動なし (ピン済み) の窓では
-                            // ボタンを出さない (解除アフォーダンスを見せない)。
-                            let show_detached_pin = cfg!(windows)
-                                && detached
-                                && !is_video_mode
-                                && !self.settings.detached_viewer_open_images_in_window
-                                && !self.detached_viewer_independent_active;
-                            #[cfg(windows)]
-                            let detached_pin_active = self.detached_viewer_pin_active;
-                            #[cfg(not(windows))]
-                            let detached_pin_disabled_reason = None;
-                            #[cfg(not(windows))]
-                            let show_detached_pin = false;
-                            #[cfg(not(windows))]
-                            let detached_pin_active = false;
                             // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
@@ -6745,10 +6669,6 @@ impl App {
                                 &mut vst3_pressed,
                                 &mut copy_capture_pressed,
                                 &mut copy_capture_region_pressed,
-                                show_detached_pin,
-                                detached_pin_active,
-                                detached_pin_disabled_reason,
-                                &mut detached_pin_pressed,
                                 show_window_toggle,
                                 embedded,
                                 &mut window_mode_pressed,
@@ -6759,18 +6679,6 @@ impl App {
                             }
                             if copy_capture_region_pressed {
                                 self.begin_capture_region_selection(ctx, fs_idx);
-                            }
-                            #[cfg(windows)]
-                            if detached_pin_pressed {
-                                // ピンは一方通行 (docs/detached-viewer-implementation-plan.md
-                                // §3.0 ⑤)。押下時はフラグだけ立て、描画 dispatch 直前の安全地点
-                                // (process_pending_pin_promotion) で独自バンドルへ昇格する。
-                                // 解除はできない (連動なし窓は × で閉じるだけ)。
-                                self.pending_pin_promotion = true;
-                                self.show_feedback_toast(
-                                    "画像別ウィンドウをピン留め (切り離し) しました".to_string(),
-                                );
-                                ctx.request_repaint();
                             }
                             // 分析ボタン押下は Z キーと同じ経路へ合流 (副作用込み、Codex P1)。
                             if bar_analysis_pressed && !is_spread_double {
@@ -15370,12 +15278,6 @@ impl App {
         vst3_pressed: &mut bool,
         copy_capture_pressed: &mut bool,
         copy_capture_region_pressed: &mut bool,
-        // detached 画像ビューアのピン留めボタン。ON の間は画像を detached で開き、
-        // メイン一覧との自動同期を止める。
-        show_detached_pin: bool,
-        detached_pin_active: bool,
-        detached_pin_disabled_reason: Option<&'static str>,
-        detached_pin_pressed: &mut bool,
         // ウィンドウ / 全画面 切り替えボタン (× の左)。show=表示するか、
         // in_window=現在 in-window 表示中か、pressed=クリックされたか。
         show_window_toggle: bool,
@@ -15460,42 +15362,6 @@ impl App {
             *nav_delta = 0;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-
-        // detached 画像ビューアのピン留めボタン。
-        if show_detached_pin {
-            let pin_disabled = detached_pin_disabled_reason.is_some();
-            let pin_resp = draw_bar_button(
-                ui,
-                next_x,
-                bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "fs_detached_pin_btn",
-                |hovered| {
-                    if pin_disabled {
-                        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 160)
-                    } else {
-                        bar_button_bg(hovered, detached_pin_active)
-                    }
-                },
-                detached_pin_active && !pin_disabled,
-                |p, c, r| draw_pin_icon(p, c, r, detached_pin_active && !pin_disabled),
-            );
-            let pin_tip = if let Some(reason) = detached_pin_disabled_reason {
-                reason.to_owned()
-            } else if detached_pin_active {
-                "ピン留め解除\n解除すると、次に画像を開いたときこの別ウィンドウを差し替えます"
-                    .to_owned()
-            } else {
-                "ピン留め\n次に画像を開くときも別ウィンドウで開きます".to_owned()
-            };
-            let pin_resp = pin_resp.hover_tip_dark(pin_tip);
-            if pin_resp.clicked() && !pin_disabled {
-                *detached_pin_pressed = true;
-            }
-            if pin_resp.hovered() {
-                *nav_delta = 0;
-            }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-        }
 
         // ⊞ ウィンドウ / 全画面 切り替えボタン (× の左)。
         // native 動画 HUD のトグルボタンと同じ役割を、静止画フルスクリーンの
