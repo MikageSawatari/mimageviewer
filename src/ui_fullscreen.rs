@@ -4080,6 +4080,19 @@ impl App {
                 window.focused_last_frame = focused;
             }
         }
+        for id in self.take_parked_live_activation_requests_after_passive_render() {
+            if self.detached_window_state_is_parked_live(id) {
+                self.log_detached_image_window_debug(format!(
+                    "parked_live_native_activate_request_after_passive_render id={id}"
+                ));
+                activate_ids.push(id);
+            } else {
+                self.log_detached_image_window_debug(format!(
+                    "parked_live_native_activate_request_dropped id={id} state={:?}",
+                    self.detached_window_state(id)
+                ));
+            }
+        }
         activate_ids.sort_unstable();
         activate_ids.dedup();
         for id in activate_ids {

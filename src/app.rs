@@ -24272,19 +24272,15 @@ impl App {
                 window.paused_bundle = Some(bundle);
             }
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn take_parked_live_activation_requests_after_passive_render(&mut self) -> Vec<u64> {
         let mut activation_requests =
             std::mem::take(&mut self.native_video_parked_live_activation_requests);
         let mut seen_activation_requests = std::collections::HashSet::new();
         activation_requests.retain(|id| seen_activation_requests.insert(*id));
-        for id in activation_requests {
-            if self.detached_window_state_is_parked_live(id) {
-                self.log_detached_image_window_debug(format!(
-                    "parked_live_native_activate_request id={id}"
-                ));
-                let _ = self.activate_detached_image_window_snapshot(ctx, id);
-                break;
-            }
-        }
+        activation_requests
     }
 
     #[cfg(windows)]
@@ -25431,13 +25427,33 @@ impl App {
         ctx: &egui::Context,
         reason: &'static str,
     ) -> bool {
+        self.park_current_viewer_context_as_live_media_inner(ctx, reason, true)
+    }
+
+    #[cfg(windows)]
+    fn park_current_viewer_context_as_live_media_inner(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+        preserve_main_context: bool,
+    ) -> bool {
         let Some(mut snapshot) = self.build_parked_live_media_window_snapshot(ctx) else {
             return false;
         };
         let snapshot_id = snapshot.id;
-        let mut parked_bundle = self.take_current_viewer_context_bundle();
+        let mut parked_bundle = if preserve_main_context {
+            let mut main_restore_bundle =
+                self.cloned_main_viewer_context_after_detached_live_media_park();
+            let parked_bundle = self.take_current_viewer_context_bundle();
+            self.swap_viewer_context_bundle(&mut main_restore_bundle);
+            parked_bundle
+        } else {
+            self.take_current_viewer_context_bundle()
+        };
         if !Self::viewer_context_bundle_contains_video(&parked_bundle) {
-            self.swap_viewer_context_bundle(&mut parked_bundle);
+            if !preserve_main_context {
+                self.swap_viewer_context_bundle(&mut parked_bundle);
+            }
             return false;
         }
         parked_bundle.detached_viewer_window_id = Some(snapshot_id);
@@ -25464,6 +25480,56 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn clone_current_viewer_context_grid_fields_into(&self, bundle: &mut ViewerContextBundle) {
+        bundle.items = self.items.clone();
+        bundle.thumbnails = self.thumbnails.clone();
+        bundle.image_metas = self.image_metas.clone();
+        bundle.visible_indices = self.visible_indices.clone();
+        bundle.details_order = self.details_order.clone();
+        bundle.current_folder = self.current_folder.clone();
+        bundle.address = self.address.clone();
+        bundle.archive_source_override = self.archive_source_override.clone();
+        bundle.zip_nav = self.zip_nav.clone();
+        bundle.items_generation = self.items_generation;
+        bundle.items_are_global_search_view = self.items_are_global_search_view;
+        bundle.items_are_tag_view = self.items_are_tag_view;
+        bundle.items_are_reading_history_view = self.items_are_reading_history_view;
+        bundle.items_are_rating_view = self.items_are_rating_view;
+        bundle.items_are_subfolder_expansion_view = self.items_are_subfolder_expansion_view;
+        bundle.items_are_drive_list = self.items_are_drive_list;
+        bundle.rotation_cache = self.rotation_cache.clone();
+        bundle.rating_cache = self.rating_cache.clone();
+        bundle.current_folder_rating_cache = self.current_folder_rating_cache;
+        bundle.selected = self.selected;
+        bundle.scroll_offset_y = self.scroll_offset_y;
+        bundle.scroll_to_selected = self.scroll_to_selected;
+        bundle.keep_range = self.keep_range;
+        bundle.keep_set = self.keep_set.clone();
+        bundle.checked = self.checked.clone();
+        bundle.reading_history_return_from = self.reading_history_return_from.clone();
+        bundle.search_filter = self.search_filter.clone();
+        bundle.search_filter_origin_folder = self.search_filter_origin_folder.clone();
+    }
+
+    #[cfg(windows)]
+    fn cloned_main_viewer_context_after_detached_live_media_park(&self) -> ViewerContextBundle {
+        let mut bundle = ViewerContextBundle::empty();
+        self.clone_current_viewer_context_grid_fields_into(&mut bundle);
+        bundle.fullscreen_idx = None;
+        bundle.viewer_presentation = self.non_detached_viewer_presentation();
+        bundle.native_video_in_window_active = false;
+        bundle.detached_viewer_independent_active = false;
+        bundle.detached_viewer_pin_active = false;
+        bundle.detached_viewer_open_next_still_detached_once = false;
+        bundle.detached_viewer_window_id = None;
+        bundle.last_viewer_sync_stamp = None;
+        bundle.fs_open_intent_from_grid = false;
+        bundle.pending_auto_fs_open = false;
+        bundle.pending_return_to_parent = false;
+        bundle
+    }
+
+    #[cfg(windows)]
     fn park_active_detached_context_as_live_media(
         &mut self,
         ctx: &egui::Context,
@@ -25477,7 +25543,7 @@ impl App {
             return false;
         }
         self.swap_viewer_context_bundle(&mut active.bundle);
-        let parked = self.park_current_viewer_context_as_live_media(ctx, reason);
+        let parked = self.park_current_viewer_context_as_live_media_inner(ctx, reason, false);
         self.swap_viewer_context_bundle(&mut active.bundle);
         if !parked {
             self.active_detached_viewer_context = Some(active);
@@ -25694,28 +25760,10 @@ impl App {
         // 専用 bundle を empty() から組み立て、表示・前後移動に必要な clone 可能フィールド
         // だけ self から複製する (self 側は維持されるのでメイン grid は不変)。
         let mut bundle = ViewerContextBundle::empty();
-        bundle.items = self.items.clone();
-        bundle.thumbnails = self.thumbnails.clone();
-        bundle.image_metas = self.image_metas.clone();
         // フルスクリーンの前後移動 / 見開き / 連結読み / スライドショーは current_grid_order()
         // 経由で visible_indices (Details では details_order) を参照する。これらを複製しないと
         // 連動なし窓で →/← が空リスト扱いになり移動できない (Codex P1)。
-        bundle.visible_indices = self.visible_indices.clone();
-        bundle.details_order = self.details_order.clone();
-        bundle.current_folder = self.current_folder.clone();
-        bundle.address = self.address.clone();
-        bundle.archive_source_override = self.archive_source_override.clone();
-        bundle.zip_nav = self.zip_nav.clone();
-        bundle.items_generation = self.items_generation;
-        bundle.items_are_global_search_view = self.items_are_global_search_view;
-        bundle.items_are_tag_view = self.items_are_tag_view;
-        bundle.items_are_reading_history_view = self.items_are_reading_history_view;
-        bundle.items_are_rating_view = self.items_are_rating_view;
-        bundle.items_are_subfolder_expansion_view = self.items_are_subfolder_expansion_view;
-        bundle.items_are_drive_list = self.items_are_drive_list;
-        bundle.rotation_cache = self.rotation_cache.clone();
-        bundle.rating_cache = self.rating_cache.clone();
-        bundle.current_folder_rating_cache = self.current_folder_rating_cache;
+        self.clone_current_viewer_context_grid_fields_into(&mut bundle);
         bundle.selected = Some(idx);
         bundle.fullscreen_idx = Some(idx);
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
@@ -25737,7 +25785,7 @@ impl App {
         bundle.spread_mode = self.spread_mode;
         bundle.reading_flow = self.reading_flow;
         bundle.reading_direction = self.reading_direction;
-        self.move_active_still_runtime_to_bundle(idx, &mut bundle);
+        self.move_active_fullscreen_runtime_to_bundle(idx, &mut bundle);
 
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
 
@@ -25774,7 +25822,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn move_active_still_runtime_to_bundle(
+    fn move_active_fullscreen_runtime_to_bundle(
         &mut self,
         idx: usize,
         bundle: &mut ViewerContextBundle,

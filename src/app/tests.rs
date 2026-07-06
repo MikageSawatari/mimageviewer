@@ -20901,6 +20901,93 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn linked_live_media_park_keeps_main_grid_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.current_folder = Some(PathBuf::from(r"C:\clips"));
+        app.address = r"C:\clips".to_owned();
+        let still = push_image(&mut app, r"C:\clips\cover.jpg");
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let window_id = 53;
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(video);
+        app.scroll_offset_y = 123.0;
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+
+        assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_linked_live_park"));
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\clips")));
+        assert_eq!(app.address, r"C:\clips");
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.selected, Some(video));
+        assert_eq!(app.scroll_offset_y, 123.0);
+        assert_eq!(app.visible_indices, vec![still, video]);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let parked = &app.detached_image_windows[0];
+        assert_eq!(parked.id, window_id);
+        let bundle = parked
+            .paused_bundle
+            .as_ref()
+            .expect("ParkedLive snapshot keeps its independent video bundle");
+        assert_eq!(bundle.fullscreen_idx, Some(video));
+        assert_eq!(bundle.current_folder, Some(PathBuf::from(r"C:\clips")));
+        assert_eq!(bundle.items.len(), 2);
+        assert!(
+            bundle.detached_viewer_independent_active,
+            "legacy linked live-park must promote the video window to its own bundle"
+        );
+
+        app.transition_detached_window_state(window_id, DetachedWindowState::Closing, "test_close");
+        app.detached_image_windows.clear();
+        app.remove_detached_window_runtime(window_id, "test_close");
+
+        assert_eq!(
+            app.current_folder,
+            Some(PathBuf::from(r"C:\clips")),
+            "dropping the parked live window must not drop the main folder"
+        );
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.selected, Some(video));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn linked_live_media_restore_then_close_keeps_main_grid_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.current_folder = Some(PathBuf::from(r"C:\clips"));
+        app.address = r"C:\clips".to_owned();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let window_id = 54;
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(video);
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+
+        assert!(
+            app.park_current_viewer_context_as_live_media(&ctx, "test_linked_live_park_restore")
+        );
+        assert!(app.activate_detached_image_window_snapshot(&ctx, window_id));
+        assert!(app.active_detached_viewer_context_contains_video());
+        assert!(app.close_current_active_detached_viewer_context(&ctx));
+
+        assert_eq!(
+            app.current_folder,
+            Some(PathBuf::from(r"C:\clips")),
+            "closing a restored linked live media window must not drop the main folder"
+        );
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.selected, Some(video));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn activating_parked_live_media_restores_video_session() {
         use crate::video::NativeVideoOutputEvent as Ev;
         use crate::video::native_window::{
@@ -21221,6 +21308,74 @@ mod still_window_mode_key_tests {
             app.detached_image_windows
                 .iter()
                 .any(|window| window.id == 81)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_activation_waits_until_passive_render_handoff() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(82);
+        let tex = ctx.load_texture(
+            "parked_live_delayed_activation",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 82,
+                texture: tex,
+                title: "live".to_owned(),
+                location_display: "live".to_owned(),
+                image_dims: None,
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                placement: crate::settings::DetachedViewerWindowPlacement {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 640.0,
+                    h: 480.0,
+                    maximized: false,
+                },
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
+        app.native_video_parked_live_activation_requests.push(82);
+
+        app.poll_parked_live_detached_windows(&ctx);
+
+        assert!(
+            app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 82),
+            "native ParkedLive click must not remove the passive owner before it has rendered"
+        );
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "activation is committed only after the passive render handoff point"
+        );
+        let pending = app.take_parked_live_activation_requests_after_passive_render();
+        assert_eq!(pending, vec![82]);
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 82));
+        assert!(app.active_detached_viewer_context_contains_video());
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 82)
         );
     }
 
