@@ -18146,6 +18146,7 @@ mod still_window_mode_key_tests {
         let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let texture = ctx.load_texture("passive_reuse", pixels, egui::TextureOptions::LINEAR);
         let placement = app.detached_viewer_window_placement();
+        app.set_detached_window_runtime_placement(1, placement, "test_passive_reuse");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
@@ -18157,7 +18158,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -18407,7 +18407,9 @@ mod still_window_mode_key_tests {
             .bundle
             .detached_viewer_window_id
             .expect("first detached book context should have a window id");
-        let first_placement = app.detached_viewer_window_placement();
+        let first_placement = app
+            .detached_window_runtime_placement(first_window_id)
+            .expect("first detached book context should seed runtime placement");
 
         app.selected = Some(1);
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
@@ -18424,7 +18426,9 @@ mod still_window_mode_key_tests {
             "each detached book active context must use a distinct fullscreen viewport id so opening a second book creates a new OS window"
         );
         assert!(second_window_id > first_window_id);
-        let second_placement = app.detached_viewer_window_placement();
+        let second_placement = app
+            .detached_window_runtime_placement(second_window_id)
+            .expect("second detached book context should seed runtime placement");
         assert_eq!(
             second_placement,
             app.offset_detached_image_window_placement(first_placement),
@@ -18569,6 +18573,7 @@ mod still_window_mode_key_tests {
             egui::TextureOptions::LINEAR,
         );
         let placement = app.detached_viewer_window_placement();
+        app.set_detached_window_runtime_placement(42, placement, "test_passive_book_reactivate");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 42,
@@ -18580,7 +18585,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -18668,6 +18672,7 @@ mod still_window_mode_key_tests {
             h: second_placement.h,
             maximized: false,
         };
+        app.set_detached_window_runtime_placement(42, first_placement, "test_passive_book_first");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 42,
@@ -18679,7 +18684,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement: first_placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -18700,8 +18704,10 @@ mod still_window_mode_key_tests {
             "reactivated window should open at its own saved placement"
         );
         assert_eq!(app.detached_image_windows.len(), 1);
+        let parked_id = app.detached_image_windows[0].id;
         assert_eq!(
-            app.detached_image_windows[0].placement, second_placement,
+            app.detached_window_runtime_placement(parked_id),
+            Some(second_placement),
             "parking the previously active window must not inherit the reactivated window placement"
         );
         assert!(matches!(
@@ -18885,6 +18891,7 @@ mod still_window_mode_key_tests {
             egui::TextureOptions::LINEAR,
         );
         let placement = app.detached_viewer_window_placement();
+        app.set_detached_window_runtime_placement(1, placement, "test_pinned_resume");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
@@ -18896,7 +18903,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -18993,6 +18999,7 @@ mod still_window_mode_key_tests {
             egui::TextureOptions::LINEAR,
         );
         let placement = app.detached_viewer_window_placement();
+        app.set_detached_window_runtime_placement(1, placement, "test_pinned_audio_resume");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
@@ -19004,7 +19011,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -19236,6 +19242,7 @@ mod still_window_mode_key_tests {
             egui::TextureOptions::LINEAR,
         );
         let placement = app.detached_viewer_window_placement();
+        app.set_detached_window_runtime_placement(4, placement, "test_linked_pdf_snapshot");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 4,
@@ -19247,7 +19254,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -20307,13 +20313,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement: crate::settings::DetachedViewerWindowPlacement {
-                    x: 10.0,
-                    y: 20.0,
-                    w: 640.0,
-                    h: 480.0,
-                    maximized: false,
-                },
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -20425,14 +20424,17 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.detached_viewer_window_id = Some(12);
         set_detached_host_for_test(&mut app, 12, 0x1234, true);
-        app.active_detached_viewer_live_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
+        app.set_detached_window_runtime_placement(
+            12,
+            crate::settings::DetachedViewerWindowPlacement {
                 x: 10.0,
                 y: 20.0,
                 w: 800.0,
                 h: 600.0,
                 maximized: false,
-            });
+            },
+            "test_folder_nav_reopen",
+        );
         app.fs_viewport_generation = 77;
         app.fs_viewport_recreate_after_hide = false;
         app.pending_main_foreground_reclaim = true;
@@ -20463,8 +20465,8 @@ mod still_window_mode_key_tests {
             "folder-nav reopen must keep using the same detached ViewportId while fullscreen_idx is temporarily None"
         );
         assert!(
-            app.active_detached_viewer_live_placement.is_some(),
-            "live detached placement should survive the internal close->reopen transition"
+            app.detached_window_runtime_placement(12).is_some(),
+            "runtime detached placement should survive the internal close->reopen transition"
         );
         assert_eq!(app.fs_viewport_generation, 77);
         assert!(
@@ -20500,14 +20502,17 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.detached_viewer_window_id = Some(12);
         app.next_detached_image_window_id = 13;
-        app.active_detached_viewer_live_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
+        app.set_detached_window_runtime_placement(
+            12,
+            crate::settings::DetachedViewerWindowPlacement {
                 x: 10.0,
                 y: 20.0,
                 w: 800.0,
                 h: 600.0,
                 maximized: false,
-            });
+            },
+            "test_folder_nav_reuse",
+        );
         app.fs_open_intent_from_grid = true;
         app.detached_viewer_folder_nav_reuse_window_once = true;
         let viewport_id_before = app.fullscreen_viewport_id();
@@ -20873,6 +20878,150 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_runtime_placement_seeds_from_settings_then_overrides_with_runtime() {
+        let mut app = setup_app();
+        let seed = crate::settings::DetachedViewerWindowPlacement {
+            x: 100.0,
+            y: 120.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        let runtime = crate::settings::DetachedViewerWindowPlacement {
+            x: 320.0,
+            y: 220.0,
+            w: 1180.0,
+            h: 760.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_window_placement = Some(seed);
+
+        app.begin_active_detached_session(41, DetachedSource::Image);
+        assert_eq!(app.detached_window_runtime_placement(41), Some(seed));
+        assert_eq!(app.active_detached_viewer_current_placement(), seed);
+
+        app.set_detached_window_runtime_placement(41, runtime, "test_runtime_override");
+        assert_eq!(app.active_detached_viewer_current_placement(), runtime);
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(seed),
+            "live placement updates must not rewrite settings before close"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_runtime_placement_persists_to_settings_on_remove() {
+        let mut app = setup_app();
+        let seed = crate::settings::DetachedViewerWindowPlacement {
+            x: 100.0,
+            y: 120.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        let final_placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 400.0,
+            y: 240.0,
+            w: 1200.0,
+            h: 820.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_window_placement = Some(seed);
+        app.begin_active_detached_session(42, DetachedSource::Image);
+        app.set_detached_window_runtime_placement(42, final_placement, "test_final");
+        app.begin_active_detached_session_close("test_close");
+        app.finish_active_detached_session_close("test_close");
+        let removed = app.remove_detached_window_runtime(42, "test_remove");
+
+        assert!(removed.is_some());
+        assert_eq!(
+            app.settings.detached_viewer_window_placement,
+            Some(final_placement),
+            "closing/removing a detached runtime persists the final OS placement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_runtime_placement_tracks_park_resume_park() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.selected = Some(idx);
+        let stamp = app
+            .viewer_sync_stamp_for_idx(idx)
+            .expect("plain image should produce a viewer sync stamp");
+        let texture = ctx.load_texture(
+            "runtime_placement_park_resume",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let first = crate::settings::DetachedViewerWindowPlacement {
+            x: 120.0,
+            y: 130.0,
+            w: 900.0,
+            h: 700.0,
+            maximized: false,
+        };
+        let second = crate::settings::DetachedViewerWindowPlacement {
+            x: 260.0,
+            y: 180.0,
+            w: 1000.0,
+            h: 760.0,
+            maximized: false,
+        };
+        let third = crate::settings::DetachedViewerWindowPlacement {
+            x: 340.0,
+            y: 220.0,
+            w: 1100.0,
+            h: 780.0,
+            maximized: false,
+        };
+        app.set_detached_window_runtime_placement(43, first, "test_first");
+        app.transition_detached_window_state(43, DetachedWindowState::Parked, "test_parked");
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 43,
+                texture,
+                title: "a.jpg - mimageviewer".to_string(),
+                location_display: "a.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: false,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: Some(stamp),
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                paused_bundle: None,
+            });
+
+        assert_eq!(app.detached_window_runtime_placement(43), Some(first));
+        app.set_detached_window_runtime_placement(43, second, "test_passive_move");
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 43));
+        assert_eq!(app.detached_viewer_window_id, Some(43));
+        assert_eq!(
+            app.active_detached_viewer_current_placement(),
+            second,
+            "resuming the passive window must use its runtime placement"
+        );
+
+        app.set_detached_window_runtime_placement(43, third, "test_active_move");
+        app.transition_detached_window_state(43, DetachedWindowState::Parked, "test_park_again");
+        assert_eq!(
+            app.detached_window_runtime_placement(43),
+            Some(third),
+            "parking again must keep tracking the same window runtime placement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn live_media_park_creates_parked_live_snapshot_without_closing() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -21020,13 +21169,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement: crate::settings::DetachedViewerWindowPlacement {
-                    x: 10.0,
-                    y: 20.0,
-                    w: 640.0,
-                    h: 480.0,
-                    maximized: false,
-                },
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21228,13 +21370,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement: crate::settings::DetachedViewerWindowPlacement {
-                    x: 10.0,
-                    y: 20.0,
-                    w: 640.0,
-                    h: 480.0,
-                    maximized: false,
-                },
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21280,13 +21415,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement: crate::settings::DetachedViewerWindowPlacement {
-                    x: 10.0,
-                    y: 20.0,
-                    w: 640.0,
-                    h: 480.0,
-                    maximized: false,
-                },
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21338,13 +21466,6 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
-                placement: crate::settings::DetachedViewerWindowPlacement {
-                    x: 10.0,
-                    y: 20.0,
-                    w: 640.0,
-                    h: 480.0,
-                    maximized: false,
-                },
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21769,6 +21890,8 @@ mod still_window_mode_key_tests {
     #[test]
     fn detached_viewer_placement_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
+        app.detached_viewer_window_id = Some(12);
+        app.begin_active_detached_session(12, DetachedSource::Image);
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
 
@@ -21777,14 +21900,17 @@ mod still_window_mode_key_tests {
         assert!(restore.is_none());
 
         let placement = app
-            .settings
-            .detached_viewer_window_placement
-            .expect("logical placement should be saved");
+            .detached_window_runtime_placement(12)
+            .expect("logical placement should be saved in the detached runtime");
         assert_eq!(placement.x, 120.0);
         assert_eq!(placement.y, 140.0);
         assert_eq!(placement.w, 860.0);
         assert_eq!(placement.h, 640.0);
         assert!(!placement.maximized);
+        assert_eq!(
+            app.settings.detached_viewer_window_placement, None,
+            "settings should not be updated until the detached runtime is removed"
+        );
     }
 
     #[test]
@@ -21801,7 +21927,9 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now());
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.active_detached_viewer_live_placement = Some(previous);
+        app.detached_viewer_window_id = Some(12);
+        app.begin_active_detached_session(12, DetachedSource::Image);
+        app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(420.0, 160.0), egui::vec2(533.0, 400.0));
@@ -21812,7 +21940,7 @@ mod still_window_mode_key_tests {
             app.settings.detached_viewer_window_placement,
             Some(previous)
         );
-        assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
+        assert_eq!(app.detached_window_runtime_placement(12), Some(previous));
         assert_eq!(
             restore,
             Some(previous),
@@ -21834,7 +21962,9 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.active_detached_viewer_live_placement = Some(previous);
+        app.detached_viewer_window_id = Some(12);
+        app.begin_active_detached_session(12, DetachedSource::Image);
+        app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(202.0, 202.0), egui::vec2(533.0, 400.0));
@@ -21846,7 +21976,7 @@ mod still_window_mode_key_tests {
             Some(previous),
             "egui's default detached viewport size must never become the saved placement just because the open grace elapsed"
         );
-        assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
+        assert_eq!(app.detached_window_runtime_placement(12), Some(previous));
         assert_eq!(restore, Some(previous));
     }
 
@@ -21875,7 +22005,9 @@ mod still_window_mode_key_tests {
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
         });
         app.settings.detached_viewer_window_placement = Some(previous);
-        app.active_detached_viewer_live_placement = Some(previous);
+        app.detached_viewer_window_id = Some(12);
+        app.begin_active_detached_session(12, DetachedSource::Video);
+        app.set_detached_window_runtime_placement(12, previous, "test_switch_default_reject");
 
         assert!(!app.viewer_session_is_detached());
         assert!(app.viewer_session_is_detached_or_switching());
@@ -21895,12 +22027,14 @@ mod still_window_mode_key_tests {
             Some(previous),
             "the transient default size must not overwrite the saved placement mid-switch"
         );
-        assert_eq!(app.active_detached_viewer_live_placement, Some(previous));
+        assert_eq!(app.detached_window_runtime_placement(12), Some(previous));
     }
 
     #[test]
     fn detached_viewer_logical_rect_saves_outer_position_and_inner_size() {
         let mut app = setup_app();
+        app.detached_viewer_window_id = Some(12);
+        app.begin_active_detached_session(12, DetachedSource::Image);
 
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
         let inner = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(640.0, 360.0));
@@ -21909,14 +22043,17 @@ mod still_window_mode_key_tests {
         assert!(restore.is_none());
 
         let placement = app
-            .settings
-            .detached_viewer_window_placement
-            .expect("logical placement should be saved");
+            .detached_window_runtime_placement(12)
+            .expect("logical placement should be saved in the detached runtime");
         assert_eq!(placement.x, 120.0);
         assert_eq!(placement.y, 140.0);
         assert_eq!(placement.w, 640.0);
         assert_eq!(placement.h, 360.0);
         assert!(!placement.maximized);
+        assert_eq!(
+            app.settings.detached_viewer_window_placement, None,
+            "settings should not be updated until the detached runtime is removed"
+        );
     }
 
     #[test]
@@ -22004,15 +22141,17 @@ mod still_window_mode_key_tests {
             h: 840.0,
             maximized: false,
         };
-        app.active_detached_viewer_live_placement = Some(live_placement);
+        app.begin_active_detached_session(9, DetachedSource::Image);
+        app.set_detached_window_runtime_placement(9, live_placement, "test_snapshot_runtime");
 
         let snapshot = app
             .build_active_detached_image_window_snapshot(Some(&ctx), false)
             .expect("detached still snapshot should be built");
 
         assert_eq!(
-            snapshot.placement, live_placement,
-            "pause/snapshot must preserve the active viewport's live placement, not the shared setting seed"
+            app.detached_window_runtime_placement(snapshot.id),
+            Some(live_placement),
+            "pause/snapshot must preserve the active viewport's runtime placement, not the shared setting seed"
         );
     }
 
@@ -22068,28 +22207,31 @@ mod still_window_mode_key_tests {
     #[test]
     fn detached_viewer_maximized_save_preserves_restore_placement() {
         let mut app = setup_app();
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 120.0,
-                y: 140.0,
-                w: 860.0,
-                h: 640.0,
-                maximized: false,
-            });
+        let seed = crate::settings::DetachedViewerWindowPlacement {
+            x: 120.0,
+            y: 140.0,
+            w: 860.0,
+            h: 640.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_window_placement = Some(seed);
+        app.detached_viewer_window_id = Some(12);
+        app.begin_active_detached_session(12, DetachedSource::Image);
+        app.set_detached_window_runtime_placement(12, seed, "test_maximized");
 
         let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
         let restore = app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true);
         assert!(restore.is_none());
 
         let placement = app
-            .settings
-            .detached_viewer_window_placement
-            .expect("maximized placement should be saved");
+            .detached_window_runtime_placement(12)
+            .expect("maximized placement should be saved in runtime");
         assert_eq!(placement.x, 120.0);
         assert_eq!(placement.y, 140.0);
         assert_eq!(placement.w, 860.0);
         assert_eq!(placement.h, 640.0);
         assert!(placement.maximized);
+        assert_eq!(app.settings.detached_viewer_window_placement, Some(seed));
     }
 
     #[test]

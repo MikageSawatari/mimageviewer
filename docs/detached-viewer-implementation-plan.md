@@ -170,6 +170,23 @@ ParkedLive 駆動ノート（R2b）:
     全体の色調補正、ポストフィルタ、AI 表示設定、パノラマ、分析などの表示系操作は許可する。
   - 編集モード中はピンボタンを押せない。確定またはキャンセルして通常表示へ戻ってから切り離す。
 
+### 3.0.1 入力経路表（R2c code verified）
+
+R2c 時点の入力処理は「表示状態」だけでなく「所有している入力経路」で決まる。実装確認先は
+主に `src/ui_fullscreen.rs`（egui fullscreen / passive viewport）、
+`src/app/native_video.rs`（native presenter）、`src/app/gamepad_input.rs`。
+
+| 状態 | 主要入力経路 | 有効な入力 | 無効 / no-op | 実装メモ |
+|---|---|---|---|---|
+| Active・連動（静止画 / ZIP / PDF） | detached fullscreen viewport の egui `ctx` → `handle_fs_key_input` / wheel / mouse | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正、通常 linked で許可される編集 | 特になし。Ctrl+↑↓ は linked としてメイン bundle と同じ文脈を動かす | root/main 側の fullscreen key fallback は detached 中 `handle_fullscreen_root_key_input` が false で返すため、foreground detached viewport 側が本線 |
+| Active・連動なし（ピン / always-new 静止画） | detached fullscreen viewport の egui `ctx` | 同一フォルダ・同一本内の前後移動、V、Shift+Z、全体補正 | Ctrl+↑↓ / Ctrl+PageUp/Down は no-op toast。E / Ctrl+M / Ctrl+T / F7-F10 など編集系は案内して no-op | `detached_independent_session_blocks_folder_nav` と `detached_viewer_image_edit_tools_disabled_reason` で bundle 境界を越える操作を止める |
+| Active detached 動画 | native presenter HWND → `handle_native_video_output_event` / `handle_native_video_window_event` | 再生、シーク、音量、ホイール前後移動、F12 host migration、F11 仮想 fullscreen | always-new でも Ctrl+↑↓ / Ctrl+PageUp/Down は detached 側では folder-nav しない。別動画の明示 open だけ既存動画 window を差し替える | egui 親 viewport へ漏れる wheel は `should_suppress_egui_wheel_for_native_detached_video` で消費し、native presenter を唯一の動画入力経路にする |
+| Passive・連動 / Passive・連動なし（静止画 frozen） | `render_detached_image_windows` の passive egui viewport | 左クリック（pointer press）で Active 化、× / バー close、ピン表示が許可される場合の pin toggle | キー、ホイール、スクロールは表示だけで no-op。focus edge だけでは Active 化しない | focus ping-pong 対策で `detached_passive_window_should_activate` は pointer activation のみ |
+| ParkedLive（動画 / 音声 live-park） | native presenter HWND を tick するため毎フレーム短時間 mount | 左クリック down→up の組だけ Active 復帰要求に変換。Geometry / DPI / PlacementSwitched は lifecycle として通す | キー、ホイール、右/中クリック、ダブルクリックは no-op。復帰前にシークや HUD 操作へ貫通しない | `native_video_parked_live_input_window_id` 中の filter で左クリックだけ activation queue。復帰後は通常 native 入力に戻る |
+| Resuming / Closing | runtime state + close / resume 処理 | lifecycle event、Close command、placement / hwnd bookkeeping | ユーザー入力は基本的に次の安定状態まで no-op | `DetachedWindowRuntime.state` と active session が keep-alive / backstop の単一真実 |
+| ⚠ Active 音声モード | 現状は detached audio viewport としては扱わない | メイン / 既存音声ビュー側の操作 | F12 detached 化は no-op | 状態モデル上は「動画 / 音声 live media」として ParkedLive を許容しているが、実装上の audio 専用 detached host は未提供。音声を detached の独立ウィンドウとして扱う場合は別ステージで設計が必要 |
+| ⚠ Gamepad folder-nav | `gamepad_input.rs` の grid/fullscreen dispatch | fullscreen 側は通常の viewer nav、grid 側は foreground detached 判定で no-op toast | foreground 判定に依存するため、OS foreground が取れない環境では grid nav 側へ落ちる可能性がある | keyboard/egui 経路より OS foreground 依存が強い。実機検証では detached foreground 中の gamepad Ctrl 相当操作を確認する |
+
 ### 3.1 用語
 
 - `detached_viewer_enabled`: 別ウィンドウモードが ON かどうか。永続設定。
@@ -518,7 +535,7 @@ enum NativeVideoPlacement {
   pinned active viewer を passive window へ退避した時点で新しい active viewer へは引き継がない。
   別の画像 window を明示操作でアクティブにしてから戻ってきても、この linked / independent 状態は
   変えない。切り離しはピン留め操作でだけ発生する。
-- passive `DetachedImageWindowSnapshot` は表示用 texture / 表示名 / 配置 / ピン状態に加え、
+- passive `DetachedImageWindowSnapshot` は表示用 texture / 表示名 / ピン状態に加え、
   paused `ViewerContextBundle` を持てる。active / passive は同じ stable `detached_viewer_window_id`
   の viewport を使い、明示 pointer 操作で active viewer へ戻すときも passive viewport を閉じて
   別 viewport を開き直さない。paused 中は先読み / AI / 編集 worker / slideshow を止めるが、表示中の 1 枚、
@@ -529,9 +546,9 @@ enum NativeVideoPlacement {
   active window 専用とする。active viewer を paused 化する直前に通常画像表示へ戻し、paused
   bundle へツール起動状態を持ち越さない。未確定の消しゴムマスクは自動 inpaint せず既存の
   reset 経路で破棄し、隠蔽加工 / テキストなど既存の終了時保存を持つツールはその終了処理に従う。
-- passive window の `ViewportBuilder` は初回生成時だけ placement を適用し、その後の位置 / サイズは
-  OS 側の live geometry を読み取って保存する。毎フレーム `with_position` / `with_inner_size` を
-  再適用して drag 中の窓と競合させない。
+- passive window の `ViewportBuilder` は初回生成時だけ runtime placement を適用し、その後の位置 /
+  サイズは OS 側の live geometry を読み取って同じ `DetachedWindowRuntime.placement` へ保存する。
+  毎フレーム `with_position` / `with_inner_size` を再適用して drag 中の窓と競合させない。
 - detached window close 後に active detached context が残らない場合は、main/root viewport へ
   focus を 1 回だけ戻して、残存 passive window 間で OS focus が渡り歩く見た目のちらつきを抑える。
 - paused 化で止める final AI / 編集 / 消しゴム worker は pending entry を単に捨てず cancel flag を
@@ -541,10 +558,13 @@ enum NativeVideoPlacement {
 - detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
 - 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native child HWND を作り直す。
 - 同期由来の detached open / 画像/動画切替は no-activate で表示し、通常の open / F12 操作では必要に応じて前面化する。
-- detached window placement は `detached_viewer_window_placement` に保存する。意味は「outer position + inner/client size + maximized flag」。最大化中は restore placement を上書きせず、`maximized` だけを更新する。
+- detached window placement は window_id ごとの `DetachedWindowRuntime.placement` に保存する。意味は
+  「outer position + inner/client size + maximized flag」。`settings.detached_viewer_window_placement` は
+  新規 window の seed と、runtime remove/close 時の最終永続化だけに使う。最大化中は restore placement を
+  上書きせず、runtime placement の `maximized` だけを更新する。
 - 静止画 detached viewport の `ViewportBuilder` が placement を再 seed する場合は、保存済み settings
-  ではなく現在の live geometry (`active_detached_viewer_live_placement`) を優先する。F12 の旧来単一窓経路でも、
-  ページ遷移や表示先切り替えで egui の既定 800x600 相当が一瞬通知された場合は保存済み配置を潰さない。
+  ではなく window_id の runtime placement を優先する。F12 の旧来単一窓経路でも、ページ遷移や表示先
+  切り替えで egui の既定 800x600 相当が一瞬通知された場合は runtime placement を潰さない。
 - close-to-tray 中に detached session が開いている場合は、`release_media_session_for_tray` で `close_fullscreen()` を呼ばず、UI heartbeat と active viewer cache を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に閉じる。
 - 静止画/PDF detached と fullscreen の egui viewport を閉じる/作り直す経路では、メイン viewport の font atlas resync を one-shot 予約する。複数 viewport 後に日本語 glyph の部分更新だけが古い高さ 32 の renderer texture へ届くと wgpu validation panic になるため、メイン UI 描画前に 1 フレーム送って `configure_fonts_for_texture_resync` で font atlas full upload を強制する。
 
@@ -563,8 +583,8 @@ enum NativeVideoPlacement {
 - `NativeVideoPlacement::DetachedViewerChild`、`SwitchPlacement` / `PlacementSwitched` / `PlacementSwitchFailed` を追加済み。
 - detached 動画は egui detached viewport の child HWND として作成し、F11 は detached host の仮想フルスクリーンをトグル、F12 は再生を維持した host migration として扱う。
 - detached 動画の `GeometryChanged` は child presenter HWND の矩形であり、host window の outer / inner
-  placement ではないため、`detached_viewer_window_placement` へ保存しない。host の位置・サイズは
-  egui detached viewport 側の live geometry 保存を正とする。
+  placement ではないため、detached window placement へ保存しない。host の位置・サイズは
+  egui detached viewport 側が `DetachedWindowRuntime.placement` へ保存した値を正とする。
 - 動画の host migration / placement switch が進行中の F12 は無視する。同じ物理キーが native video
   HWND と main/root egui 経路の両方へ届いても、二重トグルで detached mode が戻ったり window が閉じたりしないようにする。
 - detached viewer window の `WM_CLOSE` は egui viewport close request として App へ届き、`close_fullscreen()` で session 終了・動画停止に寄せる。detached 動画の Esc / Enter も同じ close 経路に入る。

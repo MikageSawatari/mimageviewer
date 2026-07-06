@@ -201,7 +201,6 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
     pub(crate) free_rotation: f32,
-    pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
     pub(crate) reopen_sync_stamp: Option<ViewerSyncStamp>,
@@ -232,7 +231,6 @@ impl Clone for DetachedImageWindowSnapshot {
             rotation: self.rotation,
             zoom_pan: self.zoom_pan,
             free_rotation: self.free_rotation,
-            placement: self.placement,
             frozen_continuous_pages: self.frozen_continuous_pages.clone(),
             reopen_descriptor: self.reopen_descriptor.clone(),
             reopen_sync_stamp: self.reopen_sync_stamp.clone(),
@@ -283,6 +281,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
+    pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) pinned: bool,
     pub(crate) linked: bool,
 }
@@ -294,6 +293,7 @@ impl DetachedWindowRuntime {
             window_id,
             state: DetachedWindowState::Opening,
             hwnd: 0,
+            placement: None,
             pinned,
             linked,
         }
@@ -316,6 +316,80 @@ impl App {
         self.detached_window_runtimes
             .entry(window_id)
             .or_insert_with(|| DetachedWindowRuntime::new(window_id, pinned, linked))
+    }
+
+    fn detached_window_runtime_placement_is_usable(
+        placement: crate::settings::DetachedViewerWindowPlacement,
+    ) -> bool {
+        placement.is_sane()
+            && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
+    }
+
+    pub(crate) fn detached_window_runtime_placement(
+        &self,
+        window_id: u64,
+    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+        self.detached_window_runtimes
+            .get(&window_id)
+            .and_then(|runtime| runtime.placement)
+            .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
+    }
+
+    pub(crate) fn set_detached_window_runtime_placement(
+        &mut self,
+        window_id: u64,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+        reason: &'static str,
+    ) {
+        if !Self::detached_window_runtime_placement_is_usable(placement) {
+            self.log_detached_image_window_debug(format!(
+                "runtime_placement_rejected window_id={window_id} reason={reason} \
+                 placement={placement:?}"
+            ));
+            return;
+        }
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        let previous = runtime.placement;
+        runtime.placement = Some(placement);
+        self.log_detached_image_window_debug(format!(
+            "runtime_placement window_id={window_id} reason={reason} \
+             from={previous:?} to={placement:?}"
+        ));
+    }
+
+    pub(crate) fn detached_window_seed_placement(
+        &self,
+        window_id: u64,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        self.detached_window_runtime_placement(window_id)
+            .unwrap_or_else(|| self.detached_viewer_window_placement())
+    }
+
+    pub(crate) fn ensure_detached_window_runtime_placement(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        if let Some(placement) = self.detached_window_runtime_placement(window_id) {
+            return placement;
+        }
+        let seed = self.detached_viewer_window_placement();
+        self.set_detached_window_runtime_placement(window_id, seed, reason);
+        seed
+    }
+
+    pub(crate) fn active_detached_runtime_placement(
+        &self,
+    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+        self.active_detached_hwnd_window_id()
+            .and_then(|window_id| self.detached_window_runtime_placement(window_id))
+    }
+
+    pub(crate) fn active_detached_seed_placement(
+        &self,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        self.active_detached_runtime_placement()
+            .unwrap_or_else(|| self.detached_viewer_window_placement())
     }
 
     fn detached_window_hwnd_get_raw(&self, window_id: u64) -> Option<u64> {
@@ -493,17 +567,38 @@ impl App {
     ) -> Option<DetachedWindowRuntime> {
         let runtime = self.detached_window_runtimes.remove(&window_id);
         if let Some(runtime) = runtime.as_ref() {
+            if let Some(placement) = runtime
+                .placement
+                .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
+            {
+                self.settings.detached_viewer_window_placement = Some(placement);
+                self.log_detached_image_window_debug(format!(
+                    "runtime_placement_persisted window_id={} reason={reason} \
+                     placement={placement:?}",
+                    runtime.window_id
+                ));
+            }
             if runtime.state != DetachedWindowState::Closing {
                 self.log_detached_image_window_debug(format!(
                     "state_transition_unexpected window_id={} \
-                     from={:?} to=Removed reason={reason} hwnd=0x{:x} pinned={} linked={}",
-                    runtime.window_id, runtime.state, runtime.hwnd, runtime.pinned, runtime.linked
+                     from={:?} to=Removed reason={reason} hwnd=0x{:x} pinned={} linked={} \
+                     placement={:?}",
+                    runtime.window_id,
+                    runtime.state,
+                    runtime.hwnd,
+                    runtime.pinned,
+                    runtime.linked,
+                    runtime.placement
                 ));
             } else {
                 self.log_detached_image_window_debug(format!(
                     "state_transition window_id={} from=Closing to=Removed \
-                     reason={reason} hwnd=0x{:x} pinned={} linked={}",
-                    runtime.window_id, runtime.hwnd, runtime.pinned, runtime.linked
+                     reason={reason} hwnd=0x{:x} pinned={} linked={} placement={:?}",
+                    runtime.window_id,
+                    runtime.hwnd,
+                    runtime.pinned,
+                    runtime.linked,
+                    runtime.placement
                 ));
             }
         }
@@ -3980,13 +4075,6 @@ pub struct App {
     /// close/create を避けるために context bundle と一緒に swap する。
     #[cfg(windows)]
     pub(crate) detached_viewer_window_id: Option<u64>,
-    /// active detached viewer で最後に実測した OS viewport の配置。
-    ///
-    /// `settings.detached_viewer_window_placement` は次に開く窓の seed と永続化を兼ねるため、
-    /// active 窓を pause/snapshot 化するときはこの runtime 値を優先する。
-    #[cfg(windows)]
-    pub(crate) active_detached_viewer_live_placement:
-        Option<crate::settings::DetachedViewerWindowPlacement>,
     /// active viewer から退避した静止画像の passive detached windows。
     /// 操作系・先読み・編集・AI は持たず、最後に表示したテクスチャだけを保持する。
     #[cfg(windows)]
@@ -7051,8 +7139,6 @@ impl App {
             detached_viewer_folder_nav_reuse_window_once: false,
             #[cfg(windows)]
             detached_viewer_window_id: None,
-            #[cfg(windows)]
-            active_detached_viewer_live_placement: None,
             #[cfg(windows)]
             detached_image_windows: Vec::new(),
             #[cfg(windows)]
@@ -23504,6 +23590,7 @@ impl App {
             DetachedWindowState::Active,
             "session_begin",
         );
+        self.ensure_detached_window_runtime_placement(window_id, "session_begin_seed");
         if changed {
             self.log_detached_image_window_debug(format!(
                 "session_begin window_id={window_id} source={source:?}"
@@ -23757,7 +23844,6 @@ impl App {
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
-        self.active_detached_viewer_live_placement = None;
         self.detached_active_viewport_rendered_frame = u64::MAX;
         self.log_detached_image_window_debug(format!(
             "active_viewport_handoff_to_passive reason={reason} session_before={session_before:?} \
@@ -24340,7 +24426,7 @@ impl App {
             ));
             return false;
         }
-        let activate_placement = self.detached_image_windows[pos].placement;
+        self.ensure_detached_window_runtime_placement(id, "parked_live_activate_begin");
         self.log_detached_image_window_debug(format!(
             "parked_live_activate_begin id={id} pos={pos} active_context={} session={:?}",
             self.active_detached_viewer_context.is_some(),
@@ -24408,7 +24494,6 @@ impl App {
             DetachedWindowState::Resuming,
             "parked_live_activate_commit",
         );
-        self.settings.detached_viewer_window_placement = Some(activate_placement);
         self.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
         self.last_active_detached_window_id = Some(id);
         self.begin_active_detached_session(id, DetachedSource::Video);
@@ -24431,20 +24516,17 @@ impl App {
         generation: u64,
         reason: &'static str,
     ) {
-        let seed_placement = self.detached_viewer_window_placement();
         self.log_detached_image_window_debug(format!(
             "active_viewport_runtime_reset_new reason={reason} generation={generation} \
-             old_shown={} old_presentation={:?} old_host={} seed_placement={:?}",
+             old_shown={} old_presentation={:?} old_host={}",
             self.fs_viewport_shown,
             self.fs_viewport_presentation,
-            self.detached_viewer_host_debug_state(),
-            seed_placement
+            self.detached_viewer_host_debug_state()
         ));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.fs_viewport_virtual_desktop_synced_hwnd = 0;
         self.clear_detached_viewer_host_hwnd();
-        self.active_detached_viewer_live_placement = Some(seed_placement);
         self.detached_viewer_borderless_fullscreen = false;
         self.detached_viewer_restore_placement = None;
         self.detached_viewer_borderless_transition = None;
@@ -24467,7 +24549,9 @@ impl App {
 
     #[cfg(windows)]
     fn adopt_active_detached_viewport_runtime_from_passive(&mut self, reason: &'static str) {
-        let seed_placement = self.detached_viewer_window_placement();
+        let seed_placement = self
+            .active_detached_hwnd_window_id()
+            .map(|window_id| self.ensure_detached_window_runtime_placement(window_id, reason));
         self.log_detached_image_window_debug(format!(
             "active_viewport_runtime_adopt_passive reason={reason} old_shown={} \
              old_presentation={:?} old_host={} seed_placement={:?}",
@@ -24479,7 +24563,6 @@ impl App {
         self.fs_viewport_shown = true;
         self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         self.fs_viewport_virtual_desktop_synced_hwnd = 0;
-        self.active_detached_viewer_live_placement = Some(seed_placement);
         self.detached_viewer_borderless_fullscreen = false;
         self.detached_viewer_restore_placement = None;
         self.detached_viewer_borderless_transition = None;
@@ -24551,7 +24634,6 @@ impl App {
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
         self.clear_detached_viewer_host_hwnd();
-        self.active_detached_viewer_live_placement = None;
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
         // ここは should_drop (fullscreen_idx None + 列挙なし + !shown) 経路でのみ呼ばれ、
         // folder-nav reopen 中 (shown=true / 列挙中) は呼ばれないので session を畳んでよい。
@@ -24658,6 +24740,7 @@ impl App {
         &mut self,
         descriptor: ViewerContextDescriptor,
         ctx: &egui::Context,
+        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
     ) -> bool {
         let target = Self::detached_book_context_target(&descriptor);
         let mut main_context = self.take_current_viewer_context_bundle();
@@ -24674,6 +24757,12 @@ impl App {
         ));
         self.detached_viewer_window_id = Some(window_id);
         self.last_active_detached_window_id = Some(window_id);
+        let seed = placement_seed.unwrap_or_else(|| self.detached_viewer_window_placement());
+        self.set_detached_window_runtime_placement(
+            window_id,
+            seed,
+            "start_active_detached_book_context",
+        );
         self.transition_detached_window_state(
             window_id,
             DetachedWindowState::Opening,
@@ -24775,11 +24864,9 @@ impl App {
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return false;
         }
-        if had_active_detached {
-            self.settings.detached_viewer_window_placement =
-                Some(self.offset_detached_image_window_placement(base_placement));
-        }
-        self.start_active_detached_book_context_from_descriptor(descriptor, ctx)
+        let placement_seed = had_active_detached
+            .then(|| self.offset_detached_image_window_placement(base_placement));
+        self.start_active_detached_book_context_from_descriptor(descriptor, ctx, placement_seed)
     }
 
     #[cfg(windows)]
@@ -24853,7 +24940,7 @@ impl App {
                 paused_bundle.fs_cache.len(),
                 snapshot.title
             ));
-            let activate_placement = snapshot.placement;
+            self.ensure_detached_window_runtime_placement(snapshot.id, "resume_paused_bundle");
             if !self.park_and_close_current_active_detached_viewer(ctx) {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_resume_paused_bundle_aborted id={} reason=park_current_failed",
@@ -24870,7 +24957,6 @@ impl App {
             }
             paused_bundle.detached_viewer_window_id = Some(snapshot.id);
             paused_bundle.pdf_prefetch_grace_until = None;
-            self.settings.detached_viewer_window_placement = Some(activate_placement);
             self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
@@ -24926,8 +25012,11 @@ impl App {
                 snapshot.zoom_pan.is_some(),
                 snapshot.free_rotation
             ));
-            let activate_placement = snapshot.placement;
             let activate_window_id = snapshot.id;
+            self.ensure_detached_window_runtime_placement(
+                activate_window_id,
+                "resume_still_snapshot",
+            );
             let activate_independent =
                 self.settings.detached_viewer_open_images_in_window || snapshot.pinned;
             let activate_zoom_pan = snapshot.zoom_pan;
@@ -24946,7 +25035,6 @@ impl App {
                 return false;
             }
             self.detached_viewer_window_id = Some(activate_window_id);
-            self.settings.detached_viewer_window_placement = Some(activate_placement);
             self.detached_viewer_independent_active = activate_independent;
             self.detached_viewer_pin_active = false;
             self.detached_viewer_open_next_still_detached_once = true;
@@ -25002,7 +25090,7 @@ impl App {
             Self::detached_image_window_viewport_id(snapshot.id),
             egui::ViewportCommand::Close,
         );
-        let activate_placement = snapshot.placement;
+        self.ensure_detached_window_runtime_placement(snapshot.id, "passive_activate_descriptor");
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.log_detached_image_window_debug(format!(
                 "passive_activate_reopen_descriptor_aborted id={} reason=park_current_failed",
@@ -25017,8 +25105,7 @@ impl App {
             return false;
         }
         self.remove_detached_window_runtime(snapshot.id, "passive_activate_reopen_descriptor");
-        self.settings.detached_viewer_window_placement = Some(activate_placement);
-        self.start_active_detached_book_context_from_descriptor(descriptor, ctx)
+        self.start_active_detached_book_context_from_descriptor(descriptor, ctx, None)
     }
 
     #[cfg(windows)]
@@ -25234,9 +25321,7 @@ impl App {
     pub(crate) fn active_detached_viewer_current_placement(
         &self,
     ) -> crate::settings::DetachedViewerWindowPlacement {
-        self.active_detached_viewer_live_placement
-            .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
-            .unwrap_or_else(|| self.detached_viewer_window_placement())
+        self.active_detached_seed_placement()
     }
 
     #[cfg(windows)]
@@ -25337,13 +25422,13 @@ impl App {
             return None;
         };
         let texture_size = texture.size_vec2();
-        let placement = self.active_detached_viewer_current_placement();
+        let id = self.ensure_detached_viewer_window_id();
+        let placement = self.ensure_detached_window_runtime_placement(id, "build_active_snapshot");
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, idx, placement))
             .unwrap_or_default();
         let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
-        let id = self.ensure_detached_viewer_window_id();
         self.log_detached_image_window_debug(format!(
             "build_active_snapshot_ok id={id} idx={idx} pinned={pinned} \
              tex=({:.0}x{:.0}) descriptor={} stamp={} frozen_pages={} \
@@ -25367,7 +25452,6 @@ impl App {
             rotation: self.get_rotation(idx),
             zoom_pan: self.fs_zoom_pan(),
             free_rotation: self.fs_free_rotation,
-            placement,
             frozen_continuous_pages,
             reopen_descriptor,
             reopen_sync_stamp,
@@ -25388,7 +25472,8 @@ impl App {
             return None;
         }
         let id = self.ensure_detached_viewer_window_id();
-        let placement = self.active_detached_viewer_current_placement();
+        let placement =
+            self.ensure_detached_window_runtime_placement(id, "build_parked_live_media_snapshot");
         let texture = ctx.load_texture(
             format!("parked_live_media_backdrop_{id}"),
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -25410,7 +25495,6 @@ impl App {
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
-            placement,
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
@@ -25604,7 +25688,6 @@ impl App {
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
-        self.active_detached_viewer_live_placement = None;
         self.detached_viewer_pin_active = false;
         self.detached_viewer_independent_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
@@ -25914,7 +25997,10 @@ impl App {
                 DetachedWindowState::Resuming,
                 "prepare_detached_image_windows_for_open_reuse",
             );
-            self.settings.detached_viewer_window_placement = Some(reusable.placement);
+            self.ensure_detached_window_runtime_placement(
+                reusable.id,
+                "prepare_detached_image_windows_for_open_reuse",
+            );
             self.detached_viewer_open_next_still_detached_once = true;
             should_recreate_active_viewport = true;
         } else if parked {
@@ -25932,8 +26018,12 @@ impl App {
                 DetachedWindowState::Opening,
                 "prepare_detached_image_windows_for_open_allocate",
             );
-            self.settings.detached_viewer_window_placement =
-                Some(self.offset_detached_image_window_placement(base_placement));
+            let offset_placement = self.offset_detached_image_window_placement(base_placement);
+            self.set_detached_window_runtime_placement(
+                window_id,
+                offset_placement,
+                "prepare_detached_image_windows_for_open_allocate",
+            );
             self.detached_viewer_open_next_still_detached_once = current_pinned && !always_new;
             should_recreate_active_viewport = true;
         }
@@ -26473,7 +26563,7 @@ impl App {
             }
         }
 
-        let placement = self.detached_viewer_window_placement();
+        let placement = self.active_detached_viewer_current_placement();
         let scale = self.last_pixels_per_point.max(0.5);
         let x = (placement.x + placement.w * 0.5) * scale;
         let y = (placement.y + placement.h * 0.5) * scale;
@@ -26484,7 +26574,7 @@ impl App {
     pub(crate) fn detached_viewer_borderless_target_rect(&self) -> egui::Rect {
         self.detached_viewer_monitor_rect_logical()
             .unwrap_or_else(|| {
-                let placement = self.detached_viewer_window_placement();
+                let placement = self.active_detached_viewer_current_placement();
                 egui::Rect::from_min_size(
                     egui::pos2(placement.x, placement.y),
                     egui::vec2(placement.w, placement.h),
@@ -26509,7 +26599,8 @@ impl App {
         }
         let target_borderless = !self.detached_viewer_borderless_fullscreen;
         if target_borderless {
-            self.detached_viewer_restore_placement = Some(self.detached_viewer_window_placement());
+            self.detached_viewer_restore_placement =
+                Some(self.active_detached_viewer_current_placement());
         }
         self.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
             target_borderless,
@@ -26545,9 +26636,15 @@ impl App {
             let placement = self
                 .detached_viewer_restore_placement
                 .take()
-                .unwrap_or_else(|| self.detached_viewer_window_placement());
+                .unwrap_or_else(|| self.active_detached_viewer_current_placement());
             self.detached_viewer_borderless_fullscreen = false;
-            self.settings.detached_viewer_window_placement = Some(placement);
+            if let Some(window_id) = self.active_detached_hwnd_window_id() {
+                self.set_detached_window_runtime_placement(
+                    window_id,
+                    placement,
+                    "borderless_restore",
+                );
+            }
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd_to(
@@ -26613,7 +26710,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_viewer_rect_physical(&self) -> windows::Win32::Foundation::RECT {
-        let placement = self.detached_viewer_window_placement();
+        let placement = self.active_detached_viewer_current_placement();
         let scale = self.last_pixels_per_point.max(0.5);
         windows::Win32::Foundation::RECT {
             left: (placement.x * scale).round() as i32,
@@ -26682,11 +26779,20 @@ impl App {
         {
             return None;
         }
+        let Some(window_id) = self.active_detached_hwnd_window_id() else {
+            self.log_detached_image_window_debug(
+                "active_placement_update_skipped reason=no_window_id".to_string(),
+            );
+            return None;
+        };
         if maximized {
-            let mut placement = self.detached_viewer_window_placement();
+            let mut placement = self.detached_window_seed_placement(window_id);
             placement.maximized = true;
-            self.settings.detached_viewer_window_placement = Some(placement);
-            self.active_detached_viewer_live_placement = Some(placement);
+            self.set_detached_window_runtime_placement(
+                window_id,
+                placement,
+                "active_placement_update_maximized",
+            );
             return None;
         }
         let size_rect = inner_rect.unwrap_or(outer_rect);
@@ -26722,7 +26828,7 @@ impl App {
         // `viewer_session_is_detached_or_switching()` を detached 判定に使っているので揃える。
         if self.viewer_session_is_detached_or_switching() {
             let previous = self
-                .active_detached_viewer_live_placement
+                .detached_window_runtime_placement(window_id)
                 .or(self.settings.detached_viewer_window_placement)
                 .filter(|p| {
                     p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w)
@@ -26738,13 +26844,15 @@ impl App {
                     "active_placement_update_rejected_default previous={previous:?} \
                      candidate={placement:?} ppp={pixels_per_point:.3}"
                 ));
-                self.settings.detached_viewer_window_placement = Some(previous);
-                self.active_detached_viewer_live_placement = Some(previous);
+                self.set_detached_window_runtime_placement(
+                    window_id,
+                    previous,
+                    "active_placement_update_rejected_default",
+                );
                 return Some(previous);
             }
         }
-        self.settings.detached_viewer_window_placement = Some(placement);
-        self.active_detached_viewer_live_placement = Some(placement);
+        self.set_detached_window_runtime_placement(window_id, placement, "active_placement_update");
         None
     }
 
@@ -27026,7 +27134,6 @@ impl App {
             self.detached_viewer_pin_active = false;
             self.detached_viewer_independent_active = false;
             self.detached_viewer_focus_requested = false;
-            self.active_detached_viewer_live_placement = None;
         }
         self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
         {
@@ -33288,7 +33395,6 @@ impl App {
             self.detached_viewer_open_next_still_detached_once = false;
             self.detached_viewer_folder_nav_reuse_window_once = false;
             self.detached_viewer_window_id = None;
-            self.active_detached_viewer_live_placement = None;
             self.fs_viewport_virtual_desktop_synced_hwnd = 0;
             self.clear_detached_viewer_borderless_fullscreen_state();
         }
@@ -33362,8 +33468,6 @@ impl App {
                 let detached_viewer_pin_active = self.detached_viewer_pin_active;
                 let detached_viewer_open_next_still_detached_once =
                     self.detached_viewer_open_next_still_detached_once;
-                let active_detached_viewer_live_placement =
-                    self.active_detached_viewer_live_placement;
                 let fs_viewport_generation = self.fs_viewport_generation;
                 self.close_fullscreen();
                 // Ctrl+↑↓ is an internal viewer-to-viewer reopen. If a stale
@@ -33381,7 +33485,6 @@ impl App {
                 self.detached_viewer_pin_active = detached_viewer_pin_active;
                 self.detached_viewer_open_next_still_detached_once =
                     detached_viewer_open_next_still_detached_once;
-                self.active_detached_viewer_live_placement = active_detached_viewer_live_placement;
                 self.fs_viewport_generation = fs_viewport_generation;
                 self.fs_viewport_recreate_after_hide = false;
                 self.detached_viewer_folder_nav_reuse_window_once =

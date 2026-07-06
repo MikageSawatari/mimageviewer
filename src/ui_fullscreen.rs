@@ -3338,6 +3338,7 @@ impl App {
     #[cfg(windows)]
     fn build_detached_image_window_builder(
         window: &crate::app::DetachedImageWindowSnapshot,
+        placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
     ) -> egui::ViewportBuilder {
         let builder = egui::ViewportBuilder::default()
@@ -3348,9 +3349,9 @@ impl App {
 
         if apply_initial_placement {
             builder
-                .with_inner_size([window.placement.w, window.placement.h])
-                .with_position(egui::pos2(window.placement.x, window.placement.y))
-                .with_maximized(window.placement.maximized)
+                .with_inner_size([placement.w, placement.h])
+                .with_position(egui::pos2(placement.x, placement.y))
+                .with_maximized(placement.maximized)
         } else {
             builder
         }
@@ -3767,8 +3768,13 @@ impl App {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let window_show_pin = show_pin && !self.detached_window_state_is_parked_live(window.id);
             let apply_initial_placement = !window.initial_placement_applied;
-            let builder =
-                Self::build_detached_image_window_builder(&window, apply_initial_placement);
+            let window_placement =
+                self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
+            let builder = Self::build_detached_image_window_builder(
+                &window,
+                window_placement,
+                apply_initial_placement,
+            );
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
             let mut pin_toggle_requested = false;
@@ -3799,7 +3805,7 @@ impl App {
                 focused_now = focused;
                 pixels_per_point = ppp;
                 if !minimized && let Some(outer) = outer_rect {
-                    let mut placement = window.placement;
+                    let mut placement = window_placement;
                     placement.x = outer.min.x;
                     placement.y = outer.min.y;
                     if let Some(inner) = inner_rect {
@@ -3936,7 +3942,7 @@ impl App {
                         .map(|hwnd| Self::win32_hwnd_debug_state(hwnd))
                         .unwrap_or_else(|| "none".to_string()),
                     apply_initial_placement,
-                    window.placement
+                    window_placement
                 ));
             }
             if Self::detached_passive_window_should_activate(
@@ -3954,7 +3960,7 @@ impl App {
             }
             if let Some(placement) = placement_update {
                 if Self::detached_passive_placement_update_looks_like_default_viewport(
-                    window.placement,
+                    window_placement,
                     placement,
                     pixels_per_point,
                     apply_initial_placement,
@@ -3965,19 +3971,19 @@ impl App {
                         window.id,
                         apply_initial_placement,
                         pixels_per_point,
-                        window.placement,
+                        window_placement,
                         placement
                     ));
                     placement_seed_reset_ids.push(window.id);
                     ctx.request_repaint();
-                } else if placement != window.placement {
+                } else if placement != window_placement {
                     self.log_detached_image_window_debug(format!(
                         "passive_placement_update id={} initial_apply={} ppp={:.2} \
                          from={:?} to={:?}",
                         window.id,
                         apply_initial_placement,
                         pixels_per_point,
-                        window.placement,
+                        window_placement,
                         placement
                     ));
                     placements.push((window.id, placement));
@@ -3990,13 +3996,7 @@ impl App {
         }
 
         for (id, placement) in placements {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.placement = placement;
-            }
+            self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
         }
         for id in initial_placement_applied_ids {
             if let Some(window) = self
