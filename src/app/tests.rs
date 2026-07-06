@@ -21171,6 +21171,40 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn keepalive_backstop_does_not_create_first_detached_host() {
+        // K0 backstop は既存 host の描き漏れを救う保険であり、F12 ON / fresh open の
+        // 初回 OS window 生成を担当しない。backstop が先に host を作ると、次の active render が
+        // 別 host を採用して DWM の再表示アニメーションがちらつきとして見える。
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(5, crate::app::DetachedSource::Image);
+        app.frame_counter = 10;
+
+        assert!(app.active_detached_session_waiting_for_first_host());
+        assert!(!app.active_detached_viewport_rendered_this_frame());
+        app.render_active_detached_viewport_backstop(&egui::Context::default());
+
+        assert!(
+            !app.active_detached_viewport_rendered_this_frame(),
+            "backstop must not mark/render the first host; normal active render owns creation"
+        );
+        assert_eq!(
+            app.detached_window_state(5),
+            Some(crate::app::DetachedWindowState::Active),
+            "skipped backstop must not move the runtime into Opening"
+        );
+
+        set_detached_host_for_test(&mut app, 5, 0x5000, true);
+        assert!(
+            !app.active_detached_session_waiting_for_first_host(),
+            "once a host exists, normal keep-alive gap handling may run"
+        );
+    }
+
+    #[test]
     fn fullscreen_folder_nav_close_preserves_still_viewport_for_reopen() {
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");

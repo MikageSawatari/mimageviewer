@@ -5120,6 +5120,15 @@ impl App {
         let Some(viewport_id) = self.active_detached_session_viewport_id() else {
             return;
         };
+        if self.active_detached_session_waiting_for_first_host() {
+            self.log_detached_image_window_debug(format!(
+                "keepalive_backstop skip: waiting for active render to create first host \
+                 window_id={:?} fs_idx={:?}",
+                self.active_detached_session.map(|s| s.window_id),
+                self.fullscreen_idx
+            ));
+            return;
+        }
         // 既存の detached 描画と同じ builder を使う (decorations/transparent/taskbar が変わると
         // egui が窓を作り直すため)。host が生存している既存窓なら geometry は触らない。stale/未捕捉
         // のときは placement を seed して、egui 再生成時の既定サイズ 822x656 フラッシュを防ぐ

@@ -24102,6 +24102,18 @@ impl App {
             .map(|s| Self::detached_image_window_viewport_id(s.window_id))
     }
 
+    /// K0 backstop は「既存の detached OS ウィンドウを描き漏れから守る」ための保険であり、
+    /// F12 ON / fresh open の最初の host 生成を担当しない。初回生成は通常の active render
+    /// 経路に任せないと、backstop が作った短命 host と active render が採用する host の
+    /// 2 段生成になり、DWM の表示アニメーションがちらつきとして見える。
+    #[cfg(windows)]
+    pub(crate) fn active_detached_session_waiting_for_first_host(&self) -> bool {
+        let Some(window_id) = self.active_detached_window_id() else {
+            return false;
+        };
+        self.detached_window_hwnd_raw_for_window_id(window_id) == 0
+    }
+
     #[cfg(windows)]
     fn ensure_detached_viewer_window_id(&mut self) -> u64 {
         if let Some(id) = self.detached_viewer_window_id {
