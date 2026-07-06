@@ -203,6 +203,7 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
     pub(crate) reopen_sync_stamp: Option<ViewerSyncStamp>,
+    pub(crate) activation_ready_frame: u64,
     pub(crate) activation_armed: bool,
     pub(crate) focused_last_frame: bool,
     pub(crate) initial_placement_applied: bool,
@@ -266,7 +267,8 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
         viewport_close_requested: bool,
         bar_close_requested: bool,
         focused: bool,
-        pointer_activation: bool,
+        pointer_pressed: bool,
+        pointer_released: bool,
         scroll_candidate: bool,
         key_candidate: bool,
         wheel_candidate: bool,
@@ -344,6 +346,7 @@ impl Clone for DetachedImageWindowSnapshot {
             frozen_continuous_pages: self.frozen_continuous_pages.clone(),
             reopen_descriptor: self.reopen_descriptor.clone(),
             reopen_sync_stamp: self.reopen_sync_stamp.clone(),
+            activation_ready_frame: self.activation_ready_frame,
             activation_armed: self.activation_armed,
             focused_last_frame: self.focused_last_frame,
             initial_placement_applied: self.initial_placement_applied,
@@ -24944,12 +24947,25 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn detached_passive_window_should_activate(
+    pub(crate) fn detached_passive_window_update_activation(
         can_activate: bool,
-        activation_armed: bool,
-        pointer_activation: bool,
+        activation_ready_frame: u64,
+        current_frame: u64,
+        activation_armed: &mut bool,
+        pointer_pressed: bool,
+        pointer_released: bool,
     ) -> bool {
-        can_activate && activation_armed && pointer_activation
+        if current_frame < activation_ready_frame {
+            return false;
+        }
+        if pointer_pressed {
+            *activation_armed = true;
+        }
+        let should_activate = can_activate && *activation_armed && pointer_released;
+        if pointer_released {
+            *activation_armed = false;
+        }
+        should_activate
     }
 
     #[cfg(windows)]
@@ -26099,6 +26115,7 @@ impl App {
             frozen_continuous_pages,
             reopen_descriptor,
             reopen_sync_stamp,
+            activation_ready_frame: self.frame_counter.saturating_add(1),
             activation_armed: false,
             focused_last_frame: false,
             initial_placement_applied: false,
@@ -26141,6 +26158,7 @@ impl App {
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
+            activation_ready_frame: self.frame_counter.saturating_add(1),
             activation_armed: false,
             focused_last_frame: false,
             initial_placement_applied: false,

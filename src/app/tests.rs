@@ -16500,27 +16500,46 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn passive_focus_edge_without_pointer_does_not_activate() {
+    fn passive_focus_edge_without_release_does_not_activate() {
         let focus_edge = true;
-        let pointer_activation = false;
+        let mut armed = false;
         assert!(focus_edge, "test models a focused_now edge");
-        assert!(!App::detached_passive_window_should_activate(
-            true,
-            true,
-            pointer_activation
+        assert!(!App::detached_passive_window_update_activation(
+            true, 10, 10, &mut armed, false, false
         ));
     }
 
     #[test]
-    fn passive_pointer_click_queues_activation() {
-        assert!(App::detached_passive_window_should_activate(
-            true, true, true
+    fn passive_pointer_press_release_queues_activation_after_ready_frame() {
+        let mut armed = false;
+        assert!(!App::detached_passive_window_update_activation(
+            true, 10, 9, &mut armed, true, true
         ));
-        assert!(!App::detached_passive_window_should_activate(
-            false, true, true
+        assert!(
+            !armed,
+            "the click that created the parked window must not arm activation"
+        );
+
+        assert!(!App::detached_passive_window_update_activation(
+            true, 10, 10, &mut armed, true, false
         ));
-        assert!(!App::detached_passive_window_should_activate(
-            true, false, true
+        assert!(armed, "a post-park press arms activation");
+        assert!(App::detached_passive_window_update_activation(
+            true, 10, 10, &mut armed, false, true
+        ));
+        assert!(
+            !armed,
+            "release consumes the click so a failed activation needs a fresh press"
+        );
+
+        let mut missing_route_armed = false;
+        assert!(!App::detached_passive_window_update_activation(
+            false,
+            10,
+            10,
+            &mut missing_route_armed,
+            true,
+            true
         ));
     }
 
@@ -18529,6 +18548,7 @@ mod still_window_mode_key_tests {
                     page_num: Some(5),
                 }),
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
@@ -18627,6 +18647,7 @@ mod still_window_mode_key_tests {
                     page_num: Some(5),
                 }),
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
@@ -18846,6 +18867,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
@@ -19783,6 +19805,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -20571,6 +20594,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: Some(stamp),
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: false,
@@ -20656,6 +20680,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -20682,6 +20707,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -20843,6 +20869,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -20926,6 +20953,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -21108,6 +21136,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -21152,6 +21181,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -21202,6 +21232,7 @@ mod still_window_mode_key_tests {
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
+                activation_ready_frame: 0,
                 activation_armed: true,
                 focused_last_frame: false,
                 initial_placement_applied: true,
@@ -22001,6 +22032,148 @@ mod still_window_mode_key_tests {
         );
     }
 
+    #[cfg(windows)]
+    fn install_deferred_activation_test_window(
+        app: &mut App,
+        ctx: &egui::Context,
+        id: u64,
+        ready_frame: u64,
+        activation_armed: bool,
+        focused_last_frame: bool,
+    ) -> std::sync::Arc<DeferredDetachedImageWindowShared> {
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.selected = Some(0);
+        let stamp = app
+            .viewer_sync_stamp_for_idx(0)
+            .expect("PDF page should produce a sync stamp");
+        let texture = ctx.load_texture(
+            format!("deferred-activation-{id}"),
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id,
+                texture,
+                title: "a.jpg - mimageviewer".to_string(),
+                location_display: "a.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: Some(stamp),
+                activation_ready_frame: ready_frame,
+                activation_armed,
+                focused_last_frame,
+                initial_placement_applied: true,
+                paused_bundle: None,
+            });
+        app.transition_detached_window_state(id, DetachedWindowState::Parked, "test_deferred");
+        app.set_detached_window_runtime_placement(id, placement, "test_deferred_activation");
+
+        let view = DeferredDetachedImageWindowView::from_snapshot(
+            &app.detached_image_windows[0],
+            placement,
+            false,
+        );
+        app.deferred_detached_image_window_shared(view)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn focused_parked_window_reactivates_with_one_post_park_click() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.frame_counter = 50;
+        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 50, false, true);
+
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            focused: true,
+            pointer_pressed: true,
+            pointer_released: false,
+            scroll_candidate: false,
+            key_candidate: false,
+            wheel_candidate: false,
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        assert!(!app.detached_window_deferred_activation_pending(7));
+        assert!(
+            app.detached_image_windows[0].activation_armed,
+            "focused parked windows should arm on the first post-park press"
+        );
+
+        app.frame_counter += 1;
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            focused: true,
+            pointer_pressed: false,
+            pointer_released: true,
+            scroll_candidate: false,
+            key_candidate: false,
+            wheel_candidate: false,
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+
+        assert!(
+            app.detached_window_deferred_activation_pending(7),
+            "a post-park press/release click must queue activation even if focus never changed"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn park_origin_click_does_not_reactivate_same_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.frame_counter = 60;
+        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 61, false, true);
+
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            focused: true,
+            pointer_pressed: true,
+            pointer_released: true,
+            scroll_candidate: false,
+            key_candidate: false,
+            wheel_candidate: false,
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+
+        assert!(!app.detached_window_deferred_activation_pending(7));
+        assert!(
+            !app.detached_image_windows[0].activation_armed,
+            "the click that caused park must be ignored instead of arming activation"
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn deferred_activation_queues_until_next_root_frame() {
@@ -22040,6 +22213,7 @@ mod still_window_mode_key_tests {
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: Some(stamp),
+            activation_ready_frame: 0,
             activation_armed: true,
             focused_last_frame: false,
             initial_placement_applied: true,
@@ -22060,7 +22234,8 @@ mod still_window_mode_key_tests {
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
-            pointer_activation: true,
+            pointer_pressed: false,
+            pointer_released: true,
             scroll_candidate: false,
             key_candidate: false,
             wheel_candidate: false,
@@ -22135,6 +22310,7 @@ mod still_window_mode_key_tests {
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
+            activation_ready_frame: 0,
             activation_armed: true,
             focused_last_frame: false,
             initial_placement_applied: true,
@@ -22154,7 +22330,8 @@ mod still_window_mode_key_tests {
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: false,
-            pointer_activation: false,
+            pointer_pressed: false,
+            pointer_released: false,
             scroll_candidate: false,
             key_candidate: false,
             wheel_candidate: false,

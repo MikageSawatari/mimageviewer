@@ -395,6 +395,7 @@ struct DetachedImageWindowEventBatch {
     activate_ids: Vec<u64>,
     placements: Vec<(u64, crate::settings::DetachedViewerWindowPlacement)>,
     focus_updates: Vec<(u64, bool)>,
+    activation_armed_updates: Vec<(u64, bool)>,
     initial_placement_applied_ids: Vec<u64>,
     placement_seed_reset_ids: Vec<u64>,
 }
@@ -3717,7 +3718,8 @@ impl App {
                 viewport_close_requested,
                 bar_close_requested,
                 focused,
-                pointer_activation,
+                pointer_pressed,
+                pointer_released,
                 scroll_candidate,
                 key_candidate,
                 wheel_candidate,
@@ -3739,6 +3741,7 @@ impl App {
                 let window = self.detached_image_windows[window_pos].clone();
                 let window_placement =
                     self.ensure_detached_window_runtime_placement(id, "deferred_passive_event");
+                let mut activation_armed = window.activation_armed;
                 if bar_close_requested {
                     batch.close_command_ids.push(id);
                     batch.close_ids.push(id);
@@ -3747,12 +3750,13 @@ impl App {
                 }
                 let can_activate = window.can_activate();
                 let focus_activation_raw = focused && !window.focused_last_frame;
-                let user_activation = pointer_activation;
+                let user_activation = pointer_released;
                 let focus_edge = focused != window.focused_last_frame;
                 if (viewport_close_requested
                     || bar_close_requested
                     || focus_edge
-                    || pointer_activation
+                    || pointer_pressed
+                    || pointer_released
                     || scroll_candidate
                     || key_candidate
                     || wheel_candidate)
@@ -3761,9 +3765,10 @@ impl App {
                     crate::logger::log(format!(
                         "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
                          focused={} focused_prev={} focus_edge={} \
-                         focus_activation_candidate={} pointer_activation={} scroll_candidate={} \
-                         key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
-                         armed={} has_bundle={} has_descriptor={} has_stamp={} source=deferred",
+                         focus_activation_candidate={} pointer_pressed={} pointer_released={} \
+                         scroll_candidate={} key_candidate={} wheel_candidate={} \
+                         user_activation={} can_activate={} armed={} ready_frame={} frame={} \
+                         has_bundle={} has_descriptor={} has_stamp={} source=deferred",
                         id,
                         viewport_close_requested,
                         bar_close_requested,
@@ -3771,13 +3776,16 @@ impl App {
                         window.focused_last_frame,
                         focus_edge,
                         focus_activation_raw,
-                        pointer_activation,
+                        pointer_pressed,
+                        pointer_released,
                         scroll_candidate,
                         key_candidate,
                         wheel_candidate,
                         user_activation,
                         can_activate,
                         window.activation_armed,
+                        window.activation_ready_frame,
+                        self.frame_counter,
                         window.has_paused_bundle(),
                         window.reopen_descriptor.is_some(),
                         window.reopen_sync_stamp.is_some()
@@ -3797,10 +3805,13 @@ impl App {
                         window_placement
                     ));
                 }
-                if Self::detached_passive_window_should_activate(
+                if Self::detached_passive_window_update_activation(
                     can_activate,
-                    window.activation_armed,
-                    user_activation,
+                    window.activation_ready_frame,
+                    self.frame_counter,
+                    &mut activation_armed,
+                    pointer_pressed,
+                    pointer_released,
                 ) {
                     self.log_detached_image_window_debug(format!(
                         "passive_activate_queued id={} via=pointer passive_windows={} \
@@ -3811,6 +3822,7 @@ impl App {
                     ));
                     batch.activate_ids.push(id);
                 }
+                batch.activation_armed_updates.push((id, activation_armed));
                 if let Some(placement) = placement_update {
                     if Self::detached_passive_placement_update_looks_like_default_viewport(
                         window_placement,
@@ -3929,10 +3941,19 @@ impl App {
                 .iter_mut()
                 .find(|window| window.id == id)
             {
-                if !focused {
-                    window.activation_armed = true;
-                }
                 window.focused_last_frame = focused;
+            }
+        }
+        for (id, activation_armed) in batch.activation_armed_updates.drain(..) {
+            if batch.close_ids.contains(&id) || batch.activate_ids.contains(&id) {
+                continue;
+            }
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
+            {
+                window.activation_armed = activation_armed;
             }
         }
         batch.activate_ids.sort_unstable();
@@ -4138,12 +4159,14 @@ impl App {
                 }
                 let viewport_close_requested = vp_ctx.input(|i| i.viewport().close_requested());
                 let (
-                    pointer_activation,
+                    pointer_pressed,
+                    pointer_released,
                     scroll_activation_candidate,
                     key_activation_candidate,
                     wheel_activation_candidate,
                 ) = vp_ctx.input(|i| {
-                    let pointer = i.pointer.any_pressed();
+                    let pointer_pressed = i.pointer.any_pressed();
+                    let pointer_released = i.pointer.any_released();
                     let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO;
                     let key = i
@@ -4154,7 +4177,7 @@ impl App {
                         .events
                         .iter()
                         .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
-                    (pointer, scroll, key, wheel)
+                    (pointer_pressed, pointer_released, scroll, key, wheel)
                 });
                 let mut bar_close_requested = false;
                 egui::CentralPanel::default()
@@ -4177,7 +4200,8 @@ impl App {
                     viewport_close_requested,
                     bar_close_requested,
                     focused,
-                    pointer_activation,
+                    pointer_pressed,
+                    pointer_released,
                     scroll_candidate: scroll_activation_candidate,
                     key_candidate: key_activation_candidate,
                     wheel_candidate: wheel_activation_candidate,
@@ -4187,7 +4211,8 @@ impl App {
                 });
                 if viewport_close_requested
                     || bar_close_requested
-                    || pointer_activation
+                    || pointer_pressed
+                    || pointer_released
                     || scroll_activation_candidate
                     || key_activation_candidate
                     || wheel_activation_candidate
@@ -4216,7 +4241,8 @@ impl App {
             let mut placement_update = None;
             let mut focused_now = false;
             let mut pixels_per_point = 1.0_f32;
-            let mut pointer_activation = false;
+            let mut pointer_pressed = false;
+            let mut pointer_released = false;
             let mut scroll_activation_candidate = false;
             let mut key_activation_candidate = false;
             let mut wheel_activation_candidate = false;
@@ -4270,12 +4296,14 @@ impl App {
                     viewport_close_requested = true;
                 }
                 (
-                    pointer_activation,
+                    pointer_pressed,
+                    pointer_released,
                     scroll_activation_candidate,
                     key_activation_candidate,
                     wheel_activation_candidate,
                 ) = vp_ctx.input(|i| {
-                    let pointer = i.pointer.any_pressed();
+                    let pointer_pressed = i.pointer.any_pressed();
+                    let pointer_released = i.pointer.any_released();
                     let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO;
                     let key = i
@@ -4286,7 +4314,7 @@ impl App {
                         .events
                         .iter()
                         .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
-                    (pointer, scroll, key, wheel)
+                    (pointer_pressed, pointer_released, scroll, key, wheel)
                 });
 
                 egui::CentralPanel::default()
@@ -4327,12 +4355,13 @@ impl App {
                 .find(|candidate| candidate.id == window.id)
                 .is_some_and(|candidate| candidate.has_paused_bundle());
             let focus_activation_raw = focused_now && !window.focused_last_frame;
-            let user_activation = pointer_activation;
+            let user_activation = pointer_released;
             let focus_edge = focused_now != window.focused_last_frame;
             if (viewport_close_requested
                 || bar_close_requested
                 || focus_edge
-                || pointer_activation
+                || pointer_pressed
+                || pointer_released
                 || scroll_activation_candidate
                 || key_activation_candidate
                 || wheel_activation_candidate)
@@ -4341,9 +4370,10 @@ impl App {
                 crate::logger::log(format!(
                     "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
                      focused={} focused_prev={} focus_edge={} \
-                     focus_activation_candidate={} pointer_activation={} scroll_candidate={} \
-                     key_candidate={} wheel_candidate={} user_activation={} can_activate={} \
-                     armed={} has_bundle={} has_descriptor={} has_stamp={}",
+                     focus_activation_candidate={} pointer_pressed={} pointer_released={} \
+                     scroll_candidate={} key_candidate={} wheel_candidate={} user_activation={} \
+                     can_activate={} armed={} ready_frame={} frame={} \
+                     has_bundle={} has_descriptor={} has_stamp={}",
                     window.id,
                     viewport_close_requested,
                     bar_close_requested,
@@ -4351,13 +4381,16 @@ impl App {
                     window.focused_last_frame,
                     focus_edge,
                     focus_activation_raw,
-                    pointer_activation,
+                    pointer_pressed,
+                    pointer_released,
                     scroll_activation_candidate,
                     key_activation_candidate,
                     wheel_activation_candidate,
                     user_activation,
                     can_activate,
                     window.activation_armed,
+                    window.activation_ready_frame,
+                    self.frame_counter,
                     actual_has_bundle,
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some()
@@ -4377,10 +4410,14 @@ impl App {
                     window_placement
                 ));
             }
-            if Self::detached_passive_window_should_activate(
+            let mut activation_armed = window.activation_armed;
+            if Self::detached_passive_window_update_activation(
                 can_activate,
-                window.activation_armed,
-                user_activation,
+                window.activation_ready_frame,
+                self.frame_counter,
+                &mut activation_armed,
+                pointer_pressed,
+                pointer_released,
             ) {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
@@ -4390,6 +4427,9 @@ impl App {
                 ));
                 render_batch.activate_ids.push(window.id);
             }
+            render_batch
+                .activation_armed_updates
+                .push((window.id, activation_armed));
             if let Some(placement) = placement_update {
                 if Self::detached_passive_placement_update_looks_like_default_viewport(
                     window_placement,
@@ -5488,6 +5528,36 @@ impl App {
             || self.detached_video_presentation_active_or_targeted();
         #[cfg(not(windows))]
         let detached_seed_placement = need_show;
+        #[cfg(windows)]
+        let (
+            detached_open_display_ready,
+            detached_open_cache_state,
+            detached_open_thumb_ready,
+            detached_open_pending,
+            detached_open_holdover_ready,
+        ) = if detached && !embedded {
+            let display_ready = self.resolve_fs_display_tex(fs_idx, true).is_some();
+            let cache_state = match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Static { .. }) => "static",
+                Some(FsCacheEntry::Animated { .. }) => "animated",
+                Some(FsCacheEntry::Video { .. }) => "video",
+                Some(FsCacheEntry::Failed) => "failed",
+                None => "none",
+            };
+            let thumb_ready = matches!(
+                self.thumbnails.get(fs_idx),
+                Some(crate::grid_item::ThumbnailState::Loaded { .. })
+            );
+            (
+                display_ready,
+                cache_state,
+                thumb_ready,
+                self.fs_pending.contains_key(&fs_idx),
+                self.fs_nav_holdover_tex_for_draw().is_some(),
+            )
+        } else {
+            (false, "not-detached", false, false, false)
+        };
         let mut fs_builder = if detached {
             self.build_detached_viewer_viewport_builder(
                 fs_idx,
@@ -5532,6 +5602,22 @@ impl App {
         let active_render_hwnd_before = active_render_window_id.and_then(|window_id| {
             self.detached_window_hwnd_snapshot_before_show(window_id, "active_render", fs_id)
         });
+        #[cfg(windows)]
+        if detached && !embedded && need_show && Self::detached_image_window_debug_enabled() {
+            self.log_detached_image_window_debug(format!(
+                "open_visibility_probe stage=before_show label=active_render fs_idx={fs_idx} \
+                 viewport={fs_id:?} display_ready={} cache_state={} thumb_ready={} pending={} \
+                 holdover_ready={} seed_placement={} host={} frame={}",
+                detached_open_display_ready,
+                detached_open_cache_state,
+                detached_open_thumb_ready,
+                detached_open_pending,
+                detached_open_holdover_ready,
+                detached_seed_placement,
+                self.detached_viewer_host_debug_state(),
+                self.frame_counter
+            ));
+        }
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
@@ -5649,10 +5735,17 @@ impl App {
                     if detached {
                         crate::logger::log(format!(
                             "[detached-viewer] show viewport: fs_idx={fs_idx} activate={:?} \
-                             generation={} host={}",
+                             generation={} host={} display_ready={} cache_state={} \
+                             thumb_ready={} pending={} holdover_ready={} frame={}",
                             detached_activate_on_show,
                             self.fs_viewport_generation,
-                            self.detached_viewer_host_debug_state()
+                            self.detached_viewer_host_debug_state(),
+                            detached_open_display_ready,
+                            detached_open_cache_state,
+                            detached_open_thumb_ready,
+                            detached_open_pending,
+                            detached_open_holdover_ready,
+                            self.frame_counter
                         ));
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -6952,6 +7045,21 @@ impl App {
                 fs_id,
                 active_render_hwnd_before.as_deref(),
             );
+            if need_show && Self::detached_image_window_debug_enabled() {
+                self.log_detached_image_window_debug(format!(
+                    "open_visibility_probe stage=after_show label=active_render window_id={} \
+                     fs_idx={fs_idx} viewport={fs_id:?} display_ready={} cache_state={} \
+                     thumb_ready={} pending={} holdover_ready={} host={} frame={}",
+                    window_id,
+                    detached_open_display_ready,
+                    detached_open_cache_state,
+                    detached_open_thumb_ready,
+                    detached_open_pending,
+                    detached_open_holdover_ready,
+                    self.detached_viewer_host_debug_state(),
+                    self.frame_counter
+                ));
+            }
         }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
