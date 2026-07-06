@@ -22045,6 +22045,21 @@ mod still_window_mode_key_tests {
         }
     }
 
+    #[cfg(windows)]
+    fn activation_sample(
+        left_button_down: bool,
+        foreground_hwnd: u64,
+        cursor_root_hwnd: u64,
+        cursor_pos: Option<(i32, i32)>,
+    ) -> DetachedActivationWatchSample {
+        DetachedActivationWatchSample {
+            left_button_down,
+            foreground_hwnd,
+            cursor_root_hwnd,
+            cursor_pos,
+        }
+    }
+
     #[test]
     #[cfg(windows)]
     fn activation_watcher_commits_click_release_inside_passive_window() {
@@ -22054,11 +22069,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
                 &targets,
             ),
             None
@@ -22066,11 +22077,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: false,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((123, 132)),
-                },
+                activation_sample(false, 0x1000, 0x1000, Some((123, 132))),
                 &targets,
             ),
             Some(7),
@@ -22087,11 +22094,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: false,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(false, 0x1000, 0x1000, Some((120, 130))),
                 &targets,
             ),
             None,
@@ -22108,11 +22111,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
                 &targets,
             ),
             None
@@ -22120,11 +22119,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((160, 130)),
-                },
+                activation_sample(true, 0x1000, 0x1000, Some((160, 130))),
                 &targets,
             ),
             None
@@ -22132,11 +22127,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: false,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((160, 130)),
-                },
+                activation_sample(false, 0x1000, 0x1000, Some((160, 130))),
                 &targets,
             ),
             None,
@@ -22153,11 +22144,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x2000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(true, 0x2000, 0x2000, Some((120, 130))),
                 &targets,
             ),
             None
@@ -22165,15 +22152,64 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: false,
-                    foreground_hwnd: 0x2000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(false, 0x2000, 0x2000, Some((120, 130))),
                 &targets,
             ),
             None,
-            "clicks whose foreground HWND is not a passive window are ignored"
+            "clicks whose cursor root HWND is not a passive window are ignored"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_allows_foreground_lag_on_down_edge() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x2000, 0x1000, Some((120, 130))),
+                &targets,
+            ),
+            None,
+            "down edge should use the cursor root HWND, not the still-stale foreground HWND"
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(false, 0x1000, 0x1000, Some((122, 131))),
+                &targets,
+            ),
+            Some(7),
+            "up edge validates foreground after Windows has completed activation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_rejects_when_foreground_never_moves_to_target() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x2000, 0x1000, Some((120, 130))),
+                &targets,
+            ),
+            None
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample(false, 0x2000, 0x1000, Some((122, 131))),
+            &targets,
+        );
+        assert_eq!(result.activation, None);
+        assert_eq!(
+            result.diagnostic.map(|diagnostic| diagnostic.reason),
+            Some("up_foreground_mismatch"),
+            "up edge remains the safety gate when foreground did not settle on the clicked window"
         );
     }
 
@@ -22187,11 +22223,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
                 &ineligible,
             ),
             None
@@ -22199,11 +22231,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: false,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(false, 0x1000, 0x1000, Some((120, 130))),
                 &eligible,
             ),
             None,
@@ -22219,11 +22247,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
                 &targets,
             ),
             None
@@ -22233,11 +22257,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                DetachedActivationWatchSample {
-                    left_button_down: true,
-                    foreground_hwnd: 0x1000,
-                    cursor_pos: Some((120, 130)),
-                },
+                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
                 &[],
             ),
             None
