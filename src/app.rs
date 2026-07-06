@@ -674,10 +674,12 @@ impl App {
         let old_linked = runtime.linked;
         runtime.pinned = pinned;
         runtime.linked = linked;
-        self.log_detached_image_window_debug(format!(
-            "runtime_flags window_id={window_id} pinned={old_pinned}->{pinned} \
-             linked={old_linked}->{linked} reason={reason}"
-        ));
+        if old_pinned != pinned || old_linked != linked {
+            self.log_detached_image_window_debug(format!(
+                "runtime_flags window_id={window_id} pinned={old_pinned}->{pinned} \
+                 linked={old_linked}->{linked} reason={reason}"
+            ));
+        }
     }
 
     #[cfg(windows)]
@@ -23781,21 +23783,24 @@ impl App {
     /// セッションがあれば runtime state を Active に戻して据え置く (passive→active 再開や F12 再 ON)。
     #[cfg(windows)]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
+        let current_state = self.detached_window_state(window_id);
         let changed = self
             .active_detached_session
             .map(|s| {
                 s.window_id != window_id
-                    || self.detached_window_state(window_id) == Some(DetachedWindowState::Closing)
+                    || current_state == Some(DetachedWindowState::Closing)
                     || s.source != source
             })
             .unwrap_or(true);
         self.active_detached_session = Some(ActiveDetachedSession { window_id, source });
-        self.transition_detached_window_state(
-            window_id,
-            DetachedWindowState::Active,
-            "session_begin",
-        );
-        self.ensure_detached_window_runtime_placement(window_id, "session_begin_seed");
+        if changed || current_state != Some(DetachedWindowState::Active) {
+            self.transition_detached_window_state(
+                window_id,
+                DetachedWindowState::Active,
+                "session_begin",
+            );
+            self.ensure_detached_window_runtime_placement(window_id, "session_begin_seed");
+        }
         if changed {
             self.log_detached_image_window_debug(format!(
                 "session_begin window_id={window_id} source={source:?}"
@@ -24550,10 +24555,12 @@ impl App {
                 self.detached_image_windows[pos].paused_bundle = Some(bundle);
                 continue;
             }
-            self.log_detached_image_window_debug(format!(
-                "parked_live_poll_begin id={id} bundle_fs_idx={:?}",
-                bundle.fullscreen_idx
-            ));
+            if Self::detached_image_window_debug_enabled() && self.frame_counter % 600 == 0 {
+                self.log_detached_image_window_debug(format!(
+                    "parked_live_poll_begin frame={} id={id} bundle_fs_idx={:?}",
+                    self.frame_counter, bundle.fullscreen_idx
+                ));
+            }
             self.swap_viewer_context_bundle(&mut bundle);
             let saved_continuous_mode = self.video_continuous_mode;
             let saved_input_window_id = self.native_video_parked_live_input_window_id;

@@ -3909,19 +3909,10 @@ impl App {
                 window.initial_placement_applied = false;
             }
         }
-        let mut pin_flag_updates = Vec::new();
         for id in &batch.toggle_pin_ids {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == *id)
-            {
-                window.pinned = !window.pinned;
-                pin_flag_updates.push((*id, window.pinned));
-            }
-        }
-        for (id, pinned) in pin_flag_updates {
-            self.update_detached_window_runtime_flags(id, pinned, !pinned, "passive_toggle_pin");
+            self.log_detached_image_window_debug(format!(
+                "passive_pin_toggle_ignored id={id} reason=pin_only_promotes_active_linked_window"
+            ));
         }
         batch.close_ids.sort_unstable();
         batch.close_ids.dedup();
@@ -4055,7 +4046,7 @@ impl App {
             return;
         }
 
-        if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
+        if Self::detached_image_window_debug_enabled() && self.frame_counter % 600 == 0 {
             for window in &self.detached_image_windows {
                 self.log_detached_image_window_debug(format!(
                     "passive_window_state frame={} id={} pinned={} can_activate={} \
@@ -4111,7 +4102,7 @@ impl App {
                 deferred_windows.push(window);
             }
         }
-        let show_pin = !self.settings.detached_viewer_open_images_in_window;
+        let show_pin = false;
         let mut render_batch = DetachedImageWindowEventBatch::default();
         let mut unconfirmed_deferred_registered = false;
 

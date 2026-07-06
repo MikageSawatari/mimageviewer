@@ -18957,6 +18957,196 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn reactivating_linked_pdf_after_pinned_pdf_restores_linked_active() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.current_folder = Some(PathBuf::from(r"C:\books\a.pdf"));
+        app.address = r"C:\books\a.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+            page_num: 1,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(1);
+        app.detached_viewer_pin_active = true;
+        app.detached_viewer_independent_active = true;
+        insert_static_fs_entry(&mut app, &ctx, 0, "pinned_pdf_a");
+        let pinned_bundle = app.take_current_viewer_context_bundle();
+
+        app.current_folder = Some(PathBuf::from(r"C:\books\b.pdf"));
+        app.address = r"C:\books\b.pdf".to_string();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\b.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(2);
+        app.detached_viewer_pin_active = false;
+        app.detached_viewer_independent_active = false;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        insert_static_fs_entry(&mut app, &ctx, 0, "linked_pdf_b");
+        app.begin_active_detached_session(2, DetachedSource::Book);
+
+        let texture = ctx.load_texture(
+            "pinned_pdf_a_passive",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.set_detached_window_runtime_placement(1, placement, "test_pinned_pdf_a");
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 1,
+                texture,
+                title: "a.pdf - mimageviewer".to_string(),
+                location_display: "a.pdf".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: true,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+                paused_bundle: Some(Box::new(pinned_bundle)),
+            });
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 1));
+        assert_eq!(app.active_detached_session.unwrap().window_id, 1);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        let linked_passive = &app.detached_image_windows[0];
+        assert_eq!(linked_passive.id, 2);
+        assert!(!linked_passive.pinned);
+        assert!(linked_passive.reopen_sync_stamp.is_some());
+        assert!(
+            linked_passive.paused_bundle.is_none(),
+            "Passive・連動 is specified to keep a sync stamp, not a paused bundle"
+        );
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 2));
+
+        assert!(
+            app.active_detached_viewer_context.is_none(),
+            "linked PDF must reactivate through the main/shared context"
+        );
+        assert_eq!(app.active_detached_session.unwrap().window_id, 2);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(app.detached_viewer_window_id, Some(2));
+        assert!(!app.detached_viewer_pin_active);
+        assert!(!app.detached_viewer_independent_active);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 1);
+        assert!(app.detached_image_windows[0].paused_bundle.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn passive_linked_pdf_pin_toggle_is_ignored() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\b.pdf"),
+            page_num: 7,
+            content_type: None,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(PathBuf::from(r"C:\books\b.pdf"));
+        app.selected = Some(0);
+        let stamp = app
+            .viewer_sync_stamp_for_idx(0)
+            .expect("PDF page should produce a sync stamp");
+        let texture = ctx.load_texture(
+            "linked_pdf_pin_ignored",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 2,
+                texture,
+                title: "b.pdf - mimageviewer".to_string(),
+                location_display: "b.pdf".to_string(),
+                image_dims: Some((1, 1)),
+                pinned: false,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
+                    path: PathBuf::from(r"C:\books\b.pdf"),
+                    page_num: Some(7),
+                }),
+                reopen_sync_stamp: Some(stamp),
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: None,
+            });
+        app.transition_detached_window_state(2, DetachedWindowState::Parked, "test_linked_pdf");
+        app.update_detached_window_runtime_flags(2, false, true, "test_linked_pdf");
+        app.set_detached_window_runtime_placement(2, placement, "test_linked_pdf");
+
+        let view = DeferredDetachedImageWindowView::from_snapshot(
+            &app.detached_image_windows[0],
+            true,
+            placement,
+            false,
+        );
+        let shared = app.deferred_detached_image_window_shared(view);
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 2,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            pin_toggle_requested: true,
+            focused: false,
+            pointer_activation: false,
+            scroll_candidate: false,
+            key_candidate: false,
+            wheel_candidate: false,
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+
+        assert!(
+            !app.detached_image_windows[0].pinned,
+            "passive linked windows cannot be converted to independent without a paused bundle"
+        );
+        let runtime = app
+            .detached_window_runtimes
+            .get(&2)
+            .expect("runtime should stay registered");
+        assert!(!runtime.pinned);
+        assert!(runtime.linked);
+    }
+
+    #[test]
     fn reactivating_pinned_pdf_keeps_detached_context_out_of_embedded_mode() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
