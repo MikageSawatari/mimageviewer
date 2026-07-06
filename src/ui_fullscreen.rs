@@ -300,6 +300,34 @@ fn should_suppress_egui_wheel_for_native_detached_video(
     is_video && detached && native_presenter_active
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedInitialVisibilityRelease {
+    Content,
+    DarkLoading,
+}
+
+impl DetachedInitialVisibilityRelease {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::DarkLoading => "dark_loading",
+        }
+    }
+}
+
+pub(crate) fn detached_initial_visibility_release(
+    content_ready: bool,
+    dark_loading_drawn: bool,
+) -> Option<DetachedInitialVisibilityRelease> {
+    if content_ready {
+        Some(DetachedInitialVisibilityRelease::Content)
+    } else if dark_loading_drawn {
+        Some(DetachedInitialVisibilityRelease::DarkLoading)
+    } else {
+        None
+    }
+}
+
 fn fullscreen_pointer_pos_from_viewport(
     raw_pos: egui::Pos2,
     viewport_inner: Option<egui::Rect>,
@@ -5484,6 +5512,11 @@ impl App {
         } else {
             (false, "not-detached", false, false, false)
         };
+        #[cfg(windows)]
+        let detached_open_content_ready = detached_open_display_ready
+            || detached_open_thumb_ready
+            || detached_open_holdover_ready
+            || detached_open_cache_state == "failed";
         let mut fs_builder = if detached {
             self.build_detached_viewer_viewport_builder(
                 fs_idx,
@@ -5655,6 +5688,9 @@ impl App {
                 if need_show && !embedded {
                     // embedded のときは専用 viewport を作らないので Visible/Focus は
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
+                    // ここでは white client が露出しないよう Visible(true) はまだ送らない。
+                    // この後で CentralPanel の黒背景/内容を描いたフレームだけ、描画後に
+                    // 初回可視化する (A2)。
                     #[cfg(windows)]
                     crate::dwm_transitions::disable_transitions_for_thread_windows();
                     #[cfg(windows)]
@@ -5674,11 +5710,6 @@ impl App {
                             self.frame_counter
                         ));
                     }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    if !detached || detached_activate_on_show.unwrap_or(false) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
                 }
                 #[cfg(windows)]
                 if detached_focus_existing {
@@ -5768,6 +5799,76 @@ impl App {
                         } else {
                             FS_IMAGE_ACTIVE_SCOPES
                         };
+                        #[cfg(windows)]
+                        if detached && Self::detached_image_window_debug_enabled() {
+                            let (
+                                focused,
+                                raw_scroll,
+                                smooth_scroll,
+                                event_count,
+                                key_pressed_count,
+                                wheel_event_count,
+                            ) = ctx.input(|i| {
+                                let key_pressed_count = i
+                                    .events
+                                    .iter()
+                                    .filter(|event| {
+                                        matches!(
+                                            event,
+                                            egui::Event::Key {
+                                                pressed: true,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                    .count();
+                                let wheel_event_count = i
+                                    .events
+                                    .iter()
+                                    .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                                    .count();
+                                (
+                                    i.viewport().focused.unwrap_or(false),
+                                    i.raw_scroll_delta,
+                                    i.smooth_scroll_delta,
+                                    i.events.len(),
+                                    key_pressed_count,
+                                    wheel_event_count,
+                                )
+                            });
+                            let wants_keyboard = ctx.wants_keyboard_input();
+                            if key_pressed_count > 0
+                                || wheel_event_count > 0
+                                || raw_scroll != egui::Vec2::ZERO
+                                || smooth_scroll != egui::Vec2::ZERO
+                            {
+                                let foreground = current_foreground_hwnd();
+                                let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
+                                self.log_detached_image_window_debug(format!(
+                                    "active_input_probe stage=pre_key fs_idx={fs_idx} \
+                                     window_id={:?} focused={} wants_keyboard={} \
+                                     modal_keys={} foreground=0x{foreground:x} \
+                                     active_hwnd=0x{active_hwnd:x} foreground_matches={} \
+                                     prev_foreground=0x{:x} events={} key_pressed={} \
+                                     wheel_events={} raw_scroll=({:.1},{:.1}) \
+                                     smooth_scroll=({:.1},{:.1}) frame={}",
+                                    self.active_detached_window_id(),
+                                    focused,
+                                    wants_keyboard,
+                                    self.any_modal_dialog_open_for_fullscreen_keys(),
+                                    foreground != 0 && foreground == active_hwnd,
+                                    prev_foreground_hwnd,
+                                    event_count,
+                                    key_pressed_count,
+                                    wheel_event_count,
+                                    raw_scroll.x,
+                                    raw_scroll.y,
+                                    smooth_scroll.x,
+                                    smooth_scroll.y,
+                                    self.frame_counter
+                                ));
+                            }
+                        }
                         if let Some(keys) =
                             fullscreen_shortcut_event_summary(ctx, &self.keymap, active_scopes)
                         {
@@ -6870,6 +6971,44 @@ impl App {
                         }
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
+
+                #[cfg(windows)]
+                if need_show && !embedded {
+                    // The viewport was created hidden above. Release visibility only after
+                    // this frame has painted either real content (full/thumb/holdover) or the
+                    // dark loading surface. This keeps DWM from ever presenting the unpainted
+                    // white client area that `open_visibility_probe` caught on first open.
+                    let release = if detached {
+                        detached_initial_visibility_release(detached_open_content_ready, true)
+                    } else {
+                        Some(DetachedInitialVisibilityRelease::Content)
+                    };
+                    if let Some(release) = release {
+                        if detached && Self::detached_image_window_debug_enabled() {
+                            self.log_detached_image_window_debug(format!(
+                                "open_visibility_probe stage=visibility_release \
+                                 label=active_render fs_idx={fs_idx} viewport={fs_id:?} \
+                                 reason={} display_ready={} cache_state={} thumb_ready={} \
+                                 pending={} holdover_ready={} content_ready={} frame={}",
+                                release.as_str(),
+                                detached_open_display_ready,
+                                detached_open_cache_state,
+                                detached_open_thumb_ready,
+                                detached_open_pending,
+                                detached_open_holdover_ready,
+                                detached_open_content_ready,
+                                self.frame_counter
+                            ));
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        if !detached || detached_activate_on_show.unwrap_or(false) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                    } else {
+                        ctx.request_repaint();
+                    }
+                }
 
                 // パネル / HUD が全て非表示で設定秒数以上アイドルならカーソルを隠す。
                 // 動画 native presenter 経路は `update_cursor_icon` で
@@ -10188,6 +10327,68 @@ impl App {
             modal_for_keys,
             self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open,
         );
+        #[cfg(windows)]
+        if self.viewer_session_is_detached_or_switching()
+            && Self::detached_image_window_debug_enabled()
+        {
+            let (focused, raw_scroll, smooth_scroll, wheel_event_count, event_count) =
+                ctx.input(|i| {
+                    (
+                        i.viewport().focused.unwrap_or(false),
+                        i.raw_scroll_delta,
+                        i.smooth_scroll_delta,
+                        i.events
+                            .iter()
+                            .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                            .count(),
+                        i.events.len(),
+                    )
+                });
+            if wheel_y.abs() > 0.5
+                || wheel_event_count > 0
+                || raw_scroll != egui::Vec2::ZERO
+                || smooth_scroll != egui::Vec2::ZERO
+            {
+                let foreground = current_foreground_hwnd();
+                let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
+                self.log_detached_image_window_debug(format!(
+                    "active_input_probe stage=wheel_gate fs_idx={:?} focused={} \
+                     foreground=0x{foreground:x} active_hwnd=0x{active_hwnd:x} \
+                     foreground_matches={} prev_foreground=0x{:x} events={} \
+                     wheel_events={} raw_scroll=({:.1},{:.1}) smooth_scroll=({:.1},{:.1}) \
+                     wheel_y={:.1} ctrl={} cursor_in_panel={} cursor_in_seek_panel={} \
+                     cursor_in_panel_for_wheel={} in_video_tile={} modal_keys={} \
+                     popup_open={} suppress_egui_wheel={} handle_wheel_here={} \
+                     zoom_aiming={} zoom_active={} overlay_edit={} continuous_active={} \
+                     frame={}",
+                    self.fullscreen_idx,
+                    focused,
+                    foreground != 0 && foreground == active_hwnd,
+                    prev_foreground_hwnd,
+                    event_count,
+                    wheel_event_count,
+                    raw_scroll.x,
+                    raw_scroll.y,
+                    smooth_scroll.x,
+                    smooth_scroll.y,
+                    wheel_y,
+                    ctrl_held,
+                    cursor_in_panel,
+                    cursor_in_seek_panel,
+                    cursor_in_panel_for_wheel,
+                    in_video_tile,
+                    modal_for_keys,
+                    self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open,
+                    suppress_egui_wheel,
+                    handle_wheel_here,
+                    self.fs_zoom_aiming,
+                    self.fs_zoom_active,
+                    self.is_overlay_edit_mode_active(),
+                    continuous_active,
+                    self.frame_counter
+                ));
+            }
+        }
         if wheel_y.abs() > 0.5 && suppress_egui_wheel {
             // F12 detached 動画では native presenter child HWND がホイールを
             // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
@@ -21147,6 +21348,24 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn detached_initial_visibility_waits_until_content_or_dark_loading_is_drawn() {
+        assert_eq!(detached_initial_visibility_release(false, false), None);
+        assert_eq!(
+            detached_initial_visibility_release(true, false),
+            Some(DetachedInitialVisibilityRelease::Content)
+        );
+        assert_eq!(
+            detached_initial_visibility_release(false, true),
+            Some(DetachedInitialVisibilityRelease::DarkLoading)
+        );
+        assert_eq!(
+            detached_initial_visibility_release(true, true),
+            Some(DetachedInitialVisibilityRelease::Content),
+            "real content is the preferred release reason when both are available"
+        );
     }
 
     #[test]
