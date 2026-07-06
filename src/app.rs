@@ -267,11 +267,8 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
         viewport_close_requested: bool,
         bar_close_requested: bool,
         focused: bool,
-        pointer_pressed: bool,
-        pointer_released: bool,
-        scroll_candidate: bool,
-        key_candidate: bool,
-        wheel_candidate: bool,
+        physical_left_button_down: bool,
+        physical_cursor_pos: Option<(i32, i32)>,
         placement_update: Option<crate::settings::DetachedViewerWindowPlacement>,
         pixels_per_point: f32,
         apply_initial_placement: bool,
@@ -389,6 +386,13 @@ pub(crate) enum DetachedWindowState {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedPhysicalActivationClick {
+    pub(crate) start_screen_pos: Option<(i32, i32)>,
+    pub(crate) moved_too_far: bool,
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
@@ -397,6 +401,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) linked: bool,
     pub(crate) pending_deferred_activation: bool,
+    pub(crate) physical_activation_click: Option<DetachedPhysicalActivationClick>,
 }
 
 #[cfg(windows)]
@@ -409,6 +414,7 @@ impl DetachedWindowRuntime {
             placement: None,
             linked,
             pending_deferred_activation: false,
+            physical_activation_click: None,
         }
     }
 }
@@ -416,6 +422,7 @@ impl DetachedWindowRuntime {
 #[cfg(windows)]
 impl App {
     const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
+    const DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX: i32 = 8;
 
     fn detached_window_runtime_default_linked(&self) -> bool {
         !self.detached_viewer_independent_active
@@ -763,6 +770,165 @@ impl App {
              duplicate={was_pending} state={:?}",
             state
         ));
+    }
+
+    #[cfg(all(windows, not(test)))]
+    pub(crate) fn detached_physical_left_button_state() -> (bool, Option<(i32, i32)>) {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+        let down = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+        let mut point = POINT::default();
+        let pos = unsafe { GetCursorPos(&mut point) }
+            .ok()
+            .map(|_| (point.x, point.y));
+        (down, pos)
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn detached_physical_left_button_state() -> (bool, Option<(i32, i32)>) {
+        (false, None)
+    }
+
+    #[cfg(windows)]
+    fn detached_physical_activation_dragged_too_far(
+        start: Option<(i32, i32)>,
+        current: Option<(i32, i32)>,
+    ) -> bool {
+        let (Some((sx, sy)), Some((cx, cy))) = (start, current) else {
+            return false;
+        };
+        let dx = i64::from(cx) - i64::from(sx);
+        let dy = i64::from(cy) - i64::from(sy);
+        let limit = i64::from(Self::DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX);
+        dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) > limit.saturating_mul(limit)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn begin_deferred_detached_physical_activation_if_clicked(
+        &mut self,
+        window_id: u64,
+        can_activate: bool,
+        focus_edge: bool,
+        activation_ready_frame: u64,
+        physical_left_button_down: bool,
+        physical_cursor_pos: Option<(i32, i32)>,
+        reason: &'static str,
+    ) {
+        if !can_activate || !focus_edge || self.frame_counter < activation_ready_frame {
+            return;
+        }
+        if !physical_left_button_down {
+            self.log_detached_image_window_debug(format!(
+                "passive_activate_focus_ignored id={window_id} reason=no_physical_left_button \
+                 source={reason} frame={}",
+                self.frame_counter
+            ));
+            return;
+        }
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        if runtime.physical_activation_click.is_some() {
+            return;
+        }
+        runtime.physical_activation_click = Some(DetachedPhysicalActivationClick {
+            start_screen_pos: physical_cursor_pos,
+            moved_too_far: false,
+        });
+        self.log_detached_image_window_debug(format!(
+            "passive_activate_physical_click_started id={window_id} source={reason} \
+             start={physical_cursor_pos:?} frame={}",
+            self.frame_counter
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn poll_deferred_detached_physical_activations(&mut self, ctx: &egui::Context) {
+        let (left_button_down, cursor_pos) = Self::detached_physical_left_button_state();
+        self.poll_deferred_detached_physical_activations_with_state(
+            ctx,
+            left_button_down,
+            cursor_pos,
+        );
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn poll_deferred_detached_physical_activations_with_state(
+        &mut self,
+        ctx: &egui::Context,
+        left_button_down: bool,
+        cursor_pos: Option<(i32, i32)>,
+    ) {
+        let ids = self
+            .detached_window_runtimes
+            .iter()
+            .filter(|(_, runtime)| runtime.physical_activation_click.is_some())
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        let mut activate_ids = Vec::new();
+        let mut log_lines = Vec::new();
+        for id in ids {
+            let Some(runtime) = self.detached_window_runtimes.get_mut(&id) else {
+                continue;
+            };
+            if runtime.state == DetachedWindowState::Closing {
+                runtime.physical_activation_click = None;
+                continue;
+            }
+            let Some(click) = runtime.physical_activation_click.as_mut() else {
+                continue;
+            };
+            if left_button_down {
+                if !click.moved_too_far
+                    && Self::detached_physical_activation_dragged_too_far(
+                        click.start_screen_pos,
+                        cursor_pos,
+                    )
+                {
+                    click.moved_too_far = true;
+                    log_lines.push(format!(
+                        "passive_activate_physical_click_dragged id={id} start={:?} \
+                         current={cursor_pos:?} frame={}",
+                        click.start_screen_pos, self.frame_counter
+                    ));
+                }
+                continue;
+            }
+            let click = runtime.physical_activation_click.take().unwrap();
+            let dragged = click.moved_too_far
+                || Self::detached_physical_activation_dragged_too_far(
+                    click.start_screen_pos,
+                    cursor_pos,
+                );
+            if dragged {
+                log_lines.push(format!(
+                    "passive_activate_physical_click_dropped id={id} reason=drag \
+                     start={:?} current={cursor_pos:?} frame={}",
+                    click.start_screen_pos, self.frame_counter
+                ));
+                continue;
+            }
+            let can_activate = self
+                .detached_image_windows
+                .iter()
+                .any(|window| window.id == id && window.can_activate());
+            if can_activate {
+                activate_ids.push(id);
+            } else {
+                log_lines.push(format!(
+                    "passive_activate_physical_click_dropped id={id} reason=no_reopen_route \
+                     frame={}",
+                    self.frame_counter
+                ));
+            }
+        }
+        for line in log_lines {
+            self.log_detached_image_window_debug(line);
+        }
+        for id in activate_ids {
+            self.queue_deferred_detached_window_activation(id, "physical_left_release");
+            ctx.request_repaint();
+        }
     }
 
     #[cfg(all(windows, test))]
@@ -44900,6 +45066,8 @@ impl eframe::App for App {
         // 細分計装: フルスクリーンビューポート関連の 3 段階を個別計測する
         // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
+        #[cfg(windows)]
+        self.poll_deferred_detached_physical_activations(ctx);
         #[cfg(windows)]
         self.commit_pending_deferred_detached_window_activation(ctx);
         #[cfg(windows)]

@@ -3718,11 +3718,8 @@ impl App {
                 viewport_close_requested,
                 bar_close_requested,
                 focused,
-                pointer_pressed,
-                pointer_released,
-                scroll_candidate,
-                key_candidate,
-                wheel_candidate,
+                physical_left_button_down,
+                physical_cursor_pos,
                 placement_update,
                 pixels_per_point,
                 apply_initial_placement,
@@ -3741,7 +3738,6 @@ impl App {
                 let window = self.detached_image_windows[window_pos].clone();
                 let window_placement =
                     self.ensure_detached_window_runtime_placement(id, "deferred_passive_event");
-                let mut activation_armed = window.activation_armed;
                 if bar_close_requested {
                     batch.close_command_ids.push(id);
                     batch.close_ids.push(id);
@@ -3750,25 +3746,16 @@ impl App {
                 }
                 let can_activate = window.can_activate();
                 let focus_activation_raw = focused && !window.focused_last_frame;
-                let user_activation = pointer_released;
                 let focus_edge = focused != window.focused_last_frame;
-                if (viewport_close_requested
-                    || bar_close_requested
-                    || focus_edge
-                    || pointer_pressed
-                    || pointer_released
-                    || scroll_candidate
-                    || key_candidate
-                    || wheel_candidate)
+                if (viewport_close_requested || bar_close_requested || focus_edge)
                     && Self::detached_image_window_debug_enabled()
                 {
                     crate::logger::log(format!(
                         "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
                          focused={} focused_prev={} focus_edge={} \
-                         focus_activation_candidate={} pointer_pressed={} pointer_released={} \
-                         scroll_candidate={} key_candidate={} wheel_candidate={} \
-                         user_activation={} can_activate={} armed={} ready_frame={} frame={} \
-                         has_bundle={} has_descriptor={} has_stamp={} source=deferred",
+                         focus_activation_candidate={} physical_left_down={} physical_pos={:?} \
+                         can_activate={} armed={} ready_frame={} frame={} has_bundle={} \
+                         has_descriptor={} has_stamp={} source=deferred",
                         id,
                         viewport_close_requested,
                         bar_close_requested,
@@ -3776,12 +3763,8 @@ impl App {
                         window.focused_last_frame,
                         focus_edge,
                         focus_activation_raw,
-                        pointer_pressed,
-                        pointer_released,
-                        scroll_candidate,
-                        key_candidate,
-                        wheel_candidate,
-                        user_activation,
+                        physical_left_button_down,
+                        physical_cursor_pos,
                         can_activate,
                         window.activation_armed,
                         window.activation_ready_frame,
@@ -3805,24 +3788,15 @@ impl App {
                         window_placement
                     ));
                 }
-                if Self::detached_passive_window_update_activation(
+                self.begin_deferred_detached_physical_activation_if_clicked(
+                    id,
                     can_activate,
+                    focus_edge,
                     window.activation_ready_frame,
-                    self.frame_counter,
-                    &mut activation_armed,
-                    pointer_pressed,
-                    pointer_released,
-                ) {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_activate_queued id={} via=pointer passive_windows={} \
-                         active_context={} source=deferred",
-                        id,
-                        self.detached_image_windows.len(),
-                        self.active_detached_viewer_context_present()
-                    ));
-                    batch.activate_ids.push(id);
-                }
-                batch.activation_armed_updates.push((id, activation_armed));
+                    physical_left_button_down,
+                    physical_cursor_pos,
+                    "deferred_focus",
+                );
                 if let Some(placement) = placement_update {
                     if Self::detached_passive_placement_update_looks_like_default_viewport(
                         window_placement,
@@ -4158,27 +4132,8 @@ impl App {
                     }
                 }
                 let viewport_close_requested = vp_ctx.input(|i| i.viewport().close_requested());
-                let (
-                    pointer_pressed,
-                    pointer_released,
-                    scroll_activation_candidate,
-                    key_activation_candidate,
-                    wheel_activation_candidate,
-                ) = vp_ctx.input(|i| {
-                    let pointer_pressed = i.pointer.any_pressed();
-                    let pointer_released = i.pointer.any_released();
-                    let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
-                        || i.smooth_scroll_delta != egui::Vec2::ZERO;
-                    let key = i
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }));
-                    let wheel = i
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
-                    (pointer_pressed, pointer_released, scroll, key, wheel)
-                });
+                let (physical_left_button_down, physical_cursor_pos) =
+                    Self::detached_physical_left_button_state();
                 let mut bar_close_requested = false;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
@@ -4200,23 +4155,16 @@ impl App {
                     viewport_close_requested,
                     bar_close_requested,
                     focused,
-                    pointer_pressed,
-                    pointer_released,
-                    scroll_candidate: scroll_activation_candidate,
-                    key_candidate: key_activation_candidate,
-                    wheel_candidate: wheel_activation_candidate,
+                    physical_left_button_down,
+                    physical_cursor_pos,
                     placement_update,
                     pixels_per_point: ppp,
                     apply_initial_placement: view.apply_initial_placement,
                 });
                 if viewport_close_requested
                     || bar_close_requested
-                    || pointer_pressed
-                    || pointer_released
-                    || scroll_activation_candidate
-                    || key_activation_candidate
-                    || wheel_activation_candidate
                     || placement_update.is_some()
+                    || (focused && physical_left_button_down)
                 {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }

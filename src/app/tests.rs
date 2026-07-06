@@ -22093,84 +22093,137 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn focused_parked_window_reactivates_with_one_post_park_click() {
+    fn focused_parked_window_reactivates_from_physical_click_release() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.frame_counter = 50;
-        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 50, false, true);
+        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 50, false, false);
 
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
             id: 7,
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
-            pointer_pressed: true,
-            pointer_released: false,
-            scroll_candidate: false,
-            key_candidate: false,
-            wheel_candidate: false,
+            physical_left_button_down: true,
+            physical_cursor_pos: Some((100, 120)),
             placement_update: None,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
         });
         app.process_deferred_detached_image_window_events_for_test(&ctx);
         assert!(!app.detached_window_deferred_activation_pending(7));
-        assert!(
-            app.detached_image_windows[0].activation_armed,
-            "focused parked windows should arm on the first post-park press"
+        assert_eq!(
+            app.detached_window_runtimes
+                .get(&7)
+                .and_then(|runtime| runtime.physical_activation_click)
+                .map(|click| click.start_screen_pos),
+            Some(Some((100, 120))),
+            "focused parked windows should track the physical click even when egui pointer events are absent"
         );
 
         app.frame_counter += 1;
-        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
-            id: 7,
-            viewport_close_requested: false,
-            bar_close_requested: false,
-            focused: true,
-            pointer_pressed: false,
-            pointer_released: true,
-            scroll_candidate: false,
-            key_candidate: false,
-            wheel_candidate: false,
-            placement_update: None,
-            pixels_per_point: 1.5,
-            apply_initial_placement: false,
-        });
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((102, 121)));
 
         assert!(
             app.detached_window_deferred_activation_pending(7),
-            "a post-park press/release click must queue activation even if focus never changed"
+            "physical release after a focused click must queue activation"
         );
     }
 
     #[test]
     #[cfg(windows)]
-    fn park_origin_click_does_not_reactivate_same_frame() {
+    fn deferred_focus_without_physical_left_button_does_not_activate() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        app.frame_counter = 60;
-        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 61, false, true);
+        app.frame_counter = 55;
+        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 55, false, false);
 
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
             id: 7,
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
-            pointer_pressed: true,
-            pointer_released: true,
-            scroll_candidate: false,
-            key_candidate: false,
-            wheel_candidate: false,
+            physical_left_button_down: false,
+            physical_cursor_pos: Some((100, 120)),
             placement_update: None,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
         });
         app.process_deferred_detached_image_window_events_for_test(&ctx);
+        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((100, 120)));
 
         assert!(!app.detached_window_deferred_activation_pending(7));
         assert!(
-            !app.detached_image_windows[0].activation_armed,
-            "the click that caused park must be ignored instead of arming activation"
+            app.detached_window_runtimes
+                .get(&7)
+                .and_then(|runtime| runtime.physical_activation_click)
+                .is_none(),
+            "Alt+Tab-style focus must not start click activation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn deferred_physical_drag_does_not_activate() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.frame_counter = 60;
+        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 60, false, false);
+
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            focused: true,
+            physical_left_button_down: true,
+            physical_cursor_pos: Some((100, 120)),
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        app.poll_deferred_detached_physical_activations_with_state(&ctx, true, Some((140, 120)));
+        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((140, 120)));
+
+        assert!(!app.detached_window_deferred_activation_pending(7));
+        assert!(
+            app.detached_window_runtimes
+                .get(&7)
+                .and_then(|runtime| runtime.physical_activation_click)
+                .is_none(),
+            "drag release must clear tracking without activation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn park_origin_click_does_not_start_physical_activation_same_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.frame_counter = 65;
+        let shared = install_deferred_activation_test_window(&mut app, &ctx, 7, 66, false, false);
+
+        shared.push_event(DeferredDetachedImageWindowEvent::Frame {
+            id: 7,
+            viewport_close_requested: false,
+            bar_close_requested: false,
+            focused: true,
+            physical_left_button_down: true,
+            physical_cursor_pos: Some((100, 120)),
+            placement_update: None,
+            pixels_per_point: 1.5,
+            apply_initial_placement: false,
+        });
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((100, 120)));
+
+        assert!(!app.detached_window_deferred_activation_pending(7));
+        assert!(
+            app.detached_window_runtimes
+                .get(&7)
+                .and_then(|runtime| runtime.physical_activation_click)
+                .is_none(),
+            "the click that caused park must not start activation before ready_frame"
         );
     }
 
@@ -22234,17 +22287,15 @@ mod still_window_mode_key_tests {
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
-            pointer_pressed: false,
-            pointer_released: true,
-            scroll_candidate: false,
-            key_candidate: false,
-            wheel_candidate: false,
+            physical_left_button_down: true,
+            physical_cursor_pos: Some((80, 90)),
             placement_update: None,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
         });
 
         app.process_deferred_detached_image_window_events_for_test(&ctx);
+        app.poll_deferred_detached_physical_activations_with_state(&ctx, false, Some((80, 90)));
 
         assert_eq!(
             app.detached_image_windows.len(),
@@ -22330,11 +22381,8 @@ mod still_window_mode_key_tests {
             viewport_close_requested: false,
             bar_close_requested: false,
             focused: false,
-            pointer_pressed: false,
-            pointer_released: false,
-            scroll_candidate: false,
-            key_candidate: false,
-            wheel_candidate: false,
+            physical_left_button_down: false,
+            physical_cursor_pos: None,
             placement_update: Some(default_candidate),
             pixels_per_point: 1.5,
             apply_initial_placement: false,
