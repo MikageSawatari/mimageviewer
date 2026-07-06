@@ -25470,17 +25470,29 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn should_open_grid_container_in_detached_book_context_with_auto_fullscreen(
+    fn detached_book_context_descriptor_for_grid_item(
+        &self,
+        idx: usize,
+        auto_fullscreen: bool,
+    ) -> Option<ViewerContextDescriptor> {
+        if auto_fullscreen {
+            if let Some(descriptor) = self.detached_book_context_descriptor_for_grid_idx(idx) {
+                return Some(descriptor);
+            }
+        }
+        self.detached_viewer_context_descriptor_for_idx(idx)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn should_open_grid_item_in_detached_book_context_with_auto_fullscreen(
         &self,
         idx: usize,
         auto_fullscreen: bool,
     ) -> bool {
         self.settings.detached_viewer_open_images_in_window
-            && auto_fullscreen
-            && matches!(
-                self.items.get(idx),
-                Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_))
-            )
+            && self
+                .detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
+                .is_some()
     }
 
     #[cfg(windows)]
@@ -25489,7 +25501,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
-        self.open_grid_container_in_detached_book_context_with_auto_fullscreen(
+        self.open_grid_item_in_detached_book_context_with_auto_fullscreen(
             ctx,
             idx,
             self.should_auto_fullscreen_grid_container(idx),
@@ -25503,13 +25515,25 @@ impl App {
         idx: usize,
         auto_fullscreen: bool,
     ) -> bool {
-        if !self.should_open_grid_container_in_detached_book_context_with_auto_fullscreen(
+        self.open_grid_item_in_detached_book_context_with_auto_fullscreen(ctx, idx, auto_fullscreen)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_grid_item_in_detached_book_context_with_auto_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        auto_fullscreen: bool,
+    ) -> bool {
+        if !self.should_open_grid_item_in_detached_book_context_with_auto_fullscreen(
             idx,
             auto_fullscreen,
         ) {
             return false;
         }
-        let Some(descriptor) = self.detached_book_context_descriptor_for_grid_idx(idx) else {
+        let Some(descriptor) =
+            self.detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
+        else {
             return false;
         };
 

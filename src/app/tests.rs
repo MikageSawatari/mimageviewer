@@ -18060,6 +18060,96 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn always_new_pdf_book_open_mode_covers_direct_open_four_quadrants() {
+        let ctx = egui::Context::default();
+
+        for use_zip in [false, true] {
+            let book_label = if use_zip { "zip" } else { "pdf" };
+            for direct_open in [false, true] {
+                for always_new in [false, true] {
+                    let mut app = setup_app();
+                    app.settings.detached_viewer_enabled = true;
+                    app.settings.detached_viewer_open_images_in_window = always_new;
+                    app.settings.auto_fullscreen_zip_pdf = direct_open;
+                    app.current_folder = Some(PathBuf::from(r"C:\books"));
+                    app.address = r"C:\books".to_string();
+
+                    if direct_open {
+                        app.items = if use_zip {
+                            vec![GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip"))]
+                        } else {
+                            vec![GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf"))]
+                        };
+                    } else {
+                        app.items = if use_zip {
+                            vec![GridItem::ZipImage {
+                                zip_path: PathBuf::from(r"C:\books\a.zip"),
+                                entry_name: "p001.jpg".to_string(),
+                            }]
+                        } else {
+                            vec![GridItem::PdfPage {
+                                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                                page_num: 0,
+                                content_type: None,
+                            }]
+                        };
+                    }
+                    app.thumbnails = vec![ThumbnailState::Pending];
+                    app.image_metas = vec![None];
+                    app.visible_indices = vec![0];
+                    app.selected = Some(0);
+
+                    let handled = app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                        &ctx,
+                        0,
+                        direct_open,
+                    );
+                    assert_eq!(
+                        handled, always_new,
+                        "{book_label}: always_new={always_new} direct_open={direct_open} must be the single switch for detached book context"
+                    );
+
+                    if always_new {
+                        assert!(
+                            app.active_detached_viewer_context.is_some(),
+                            "{book_label}: ON mode must create an independent active context for both direct-open ON/OFF"
+                        );
+                        assert!(
+                            app.active_detached_session.is_some(),
+                            "{book_label}: ON mode detached book context must own a keep-alive session"
+                        );
+                        assert_eq!(
+                            app.fullscreen_idx, None,
+                            "{book_label}: main context must remain on the page/container list"
+                        );
+                        let active = app.active_detached_viewer_context.as_ref().unwrap();
+                        assert!(
+                            active.bundle.fs_nav_after_pdf_enumerate.is_some(),
+                            "{book_label}: detached book context should reopen the selected page inside its own bundle"
+                        );
+                    } else if direct_open {
+                        assert!(
+                            app.active_detached_viewer_context.is_none(),
+                            "{book_label}: OFF mode direct-open keeps the legacy linked/open path"
+                        );
+                    } else {
+                        app.open_fullscreen(0);
+                        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+                        assert!(
+                            !app.detached_viewer_independent_active,
+                            "{book_label}: OFF mode page-list open remains a linked detached window"
+                        );
+                        assert!(
+                            app.active_detached_viewer_context.is_none(),
+                            "{book_label}: OFF mode page-list open must not create an independent context"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
