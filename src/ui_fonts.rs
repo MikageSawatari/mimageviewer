@@ -161,6 +161,16 @@ pub fn configure_fonts_for_texture_resync(ctx: &egui::Context, generation: u64) 
     // 呼ばれる (app.rs `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`)。毎回 `mimageviewer_font_definitions`
     // を作ると Yu Gothic 等の font ファイルを毎フレーム std::fs::read してしまうため、
     // 定義は不変 (固定パス + 決定的メトリクス) なので一度だけ構築して clone で使い回す。
+    if std::env::var_os("MIV_DETACHED_WINDOW_DEBUG").is_some() {
+        crate::logger::log(format!(
+            "[ui-fonts][diag] configure_fonts_for_texture_resync generation={generation} \
+             egui_frame={} egui_pass={} pass_index={} will_discard={}",
+            ctx.cumulative_frame_nr(),
+            ctx.cumulative_pass_nr(),
+            ctx.current_pass_index(),
+            ctx.will_discard()
+        ));
+    }
     let mut fonts = base_font_definitions_cached();
     add_font_texture_resync_marker(&mut fonts, generation);
     ctx.set_fonts(fonts);

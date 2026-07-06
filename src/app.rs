@@ -23502,15 +23502,28 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn request_main_font_atlas_resync(&mut self, reason: &'static str) {
-        if self.detached_font_atlas_resync_should_wait() {
-            self.defer_main_font_atlas_resync(reason, "detached_alive");
-            return;
-        }
         self.request_main_font_atlas_resync_now(reason);
     }
 
     #[cfg(windows)]
     fn request_main_font_atlas_resync_now(&mut self, reason: &'static str) {
+        if Self::detached_image_window_debug_enabled() {
+            crate::logger::log(format!(
+                "[ui-fonts][diag] request_now reason={reason} pending_before={} \
+                 repeats={} detached_wait={} detached_safe={} active_context={} \
+                 session={:?} fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={}",
+                self.main_font_atlas_resync_pending,
+                self.main_font_atlas_resync_repeats_left,
+                self.detached_font_atlas_resync_should_wait(),
+                self.detached_cleanup_font_atlas_resync_is_safe(),
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session,
+                self.fullscreen_idx,
+                self.viewer_presentation,
+                self.fs_viewport_shown,
+                self.detached_image_windows.len()
+            ));
+        }
         if !self.main_font_atlas_resync_pending {
             crate::logger::log(format!(
                 "[ui-fonts] schedule main font atlas resync: {reason}"
@@ -23533,6 +23546,22 @@ impl App {
 
     #[cfg(windows)]
     fn defer_main_font_atlas_resync(&mut self, reason: &'static str, source: &'static str) {
+        if Self::detached_image_window_debug_enabled() {
+            crate::logger::log(format!(
+                "[ui-fonts][diag] defer_request reason={reason} source={source} \
+                 existing={:?} detached_wait={} detached_safe={} active_context={} \
+                 session={:?} fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={}",
+                self.pending_detached_cleanup_font_atlas_resync,
+                self.detached_font_atlas_resync_should_wait(),
+                self.detached_cleanup_font_atlas_resync_is_safe(),
+                self.active_detached_viewer_context.is_some(),
+                self.active_detached_session,
+                self.fullscreen_idx,
+                self.viewer_presentation,
+                self.fs_viewport_shown,
+                self.detached_image_windows.len()
+            ));
+        }
         if self.pending_detached_cleanup_font_atlas_resync.is_none() {
             crate::logger::log(format!(
                 "[ui-fonts] defer main font atlas resync: reason={reason} source={source}"
@@ -23563,22 +23592,86 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn log_font_atlas_pass_probe(&self, ctx: &egui::Context, phase: &'static str) {
+        if !Self::detached_image_window_debug_enabled() {
+            return;
+        }
+        let detached_wait = self.detached_font_atlas_resync_should_wait();
+        let interesting = self.main_font_atlas_resync_pending
+            || self.pending_detached_cleanup_font_atlas_resync.is_some()
+            || detached_wait
+            || ctx.current_pass_index() > 0
+            || ctx.will_discard();
+        if !interesting {
+            return;
+        }
+        crate::logger::log(format!(
+            "[ui-fonts][diag] pass_probe phase={phase} egui_frame={} egui_pass={} \
+             pass_index={} will_discard={} main_pending={} main_reason={} repeats={} \
+             last_fire={} generation={} deferred_reason={} detached_wait={} detached_safe={} \
+             active_context={} session={:?} fullscreen_idx={:?} presentation={:?} \
+             fs_presentation={:?} fs_shown={} passive_windows={} embedded_still={} main_blocked={}",
+            ctx.cumulative_frame_nr(),
+            ctx.cumulative_pass_nr(),
+            ctx.current_pass_index(),
+            ctx.will_discard(),
+            self.main_font_atlas_resync_pending,
+            self.main_font_atlas_resync_reason.unwrap_or("none"),
+            self.main_font_atlas_resync_repeats_left,
+            self.main_font_atlas_resync_last_fire_frame,
+            self.main_font_atlas_resync_generation,
+            self.pending_detached_cleanup_font_atlas_resync
+                .unwrap_or("none"),
+            detached_wait,
+            self.detached_cleanup_font_atlas_resync_is_safe(),
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.fs_viewport_presentation,
+            self.fs_viewport_shown,
+            self.detached_image_windows.len(),
+            self.fullscreen_embedded_still_active(),
+            self.viewer_session_blocks_main_window()
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn main_font_atlas_resync_settled_frame(&self) -> bool {
+        !self.main_font_atlas_resync_video_switch_pending()
+            && !self.main_font_atlas_resync_backdrop_or_cloak_active()
+            && !self.detached_window_runtime_has_state(DetachedWindowState::Opening)
+            && !self.detached_window_runtime_has_state(DetachedWindowState::Closing)
+    }
+
+    #[cfg(windows)]
+    fn main_font_atlas_resync_video_switch_pending(&self) -> bool {
+        self.native_video_mode_switch.is_some()
+            || self.pending_detached_video_host_switch.is_some()
+            || self.pending_detached_video_host_resync
+            || self.native_video_source_swap_pending.is_some()
+    }
+
+    #[cfg(windows)]
+    fn main_font_atlas_resync_backdrop_or_cloak_active(&self) -> bool {
+        self.native_video_main_cloaked || self.native_video_fullscreen_active_for_main_backdrop()
+    }
+
+    #[cfg(windows)]
+    fn detached_window_runtime_has_state(&self, state: DetachedWindowState) -> bool {
+        self.detached_window_runtimes
+            .values()
+            .any(|runtime| runtime.state == state)
+    }
+
+    #[cfg(windows)]
     pub(crate) fn detached_font_atlas_resync_should_wait(&self) -> bool {
-        !self.detached_image_windows.is_empty()
-            || self.active_detached_viewer_context.is_some()
-            || self.active_detached_session.is_some()
-            || self.viewer_session_is_detached_or_switching()
-            || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
+        !self.main_font_atlas_resync_settled_frame()
     }
 
     #[cfg(windows)]
     pub(crate) fn detached_cleanup_font_atlas_resync_is_safe(&self) -> bool {
-        self.detached_image_windows.is_empty()
-            && self.active_detached_viewer_context.is_none()
-            && self.active_detached_session.is_none()
-            && !self.viewer_session_is_detached_or_switching()
-            && !self.fs_viewport_shown
-            && self.fs_viewport_presentation != Some(ViewerPresentation::DetachedWindow)
+        self.main_font_atlas_resync_settled_frame()
     }
 
     #[cfg(windows)]
@@ -23612,10 +23705,51 @@ impl App {
         ctx: &egui::Context,
         phase: &'static str,
     ) -> bool {
+        self.log_font_atlas_pass_probe(ctx, phase);
         if !self.main_font_atlas_resync_pending {
             return false;
         }
+        if !self.main_font_atlas_resync_settled_frame() {
+            if Self::detached_image_window_debug_enabled() {
+                crate::logger::log(format!(
+                    "[ui-fonts][diag] resync_wait_settled phase={phase} reason={} \
+                     egui_frame={} egui_pass={} pass_index={} switch_pending={} \
+                     cloak_or_backdrop={} opening={} closing={} fullscreen_idx={:?} \
+                     presentation={:?} fs_presentation={:?} fs_shown={} passive_windows={} \
+                     active_context={} session={:?}",
+                    self.main_font_atlas_resync_reason.unwrap_or("none"),
+                    ctx.cumulative_frame_nr(),
+                    ctx.cumulative_pass_nr(),
+                    ctx.current_pass_index(),
+                    self.main_font_atlas_resync_video_switch_pending(),
+                    self.main_font_atlas_resync_backdrop_or_cloak_active(),
+                    self.detached_window_runtime_has_state(DetachedWindowState::Opening),
+                    self.detached_window_runtime_has_state(DetachedWindowState::Closing),
+                    self.fullscreen_idx,
+                    self.viewer_presentation,
+                    self.fs_viewport_presentation,
+                    self.fs_viewport_shown,
+                    self.detached_image_windows.len(),
+                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_session
+                ));
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return false;
+        }
         if self.viewer_session_blocks_main_window() && !self.fullscreen_embedded_still_active() {
+            if Self::detached_image_window_debug_enabled() {
+                crate::logger::log(format!(
+                    "[ui-fonts][diag] resync_wait_main_blocked phase={phase} reason={} \
+                     egui_frame={} egui_pass={} pass_index={} fullscreen_idx={:?} presentation={:?}",
+                    self.main_font_atlas_resync_reason.unwrap_or("none"),
+                    ctx.cumulative_frame_nr(),
+                    ctx.cumulative_pass_nr(),
+                    ctx.current_pass_index(),
+                    self.fullscreen_idx,
+                    self.viewer_presentation
+                ));
+            }
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return false;
         }
@@ -23647,6 +23781,17 @@ impl App {
         } else {
             self.main_font_atlas_resync_reason.unwrap_or("unknown")
         };
+        if Self::detached_image_window_debug_enabled() {
+            crate::logger::log(format!(
+                "[ui-fonts][diag] set_fonts_for_resync phase={phase} reason={reason} \
+                 generation={generation} final_fire={final_fire} repeats_left={repeats_left} \
+                 egui_frame={} egui_pass={} pass_index={} will_discard_before={}",
+                ctx.cumulative_frame_nr(),
+                ctx.cumulative_pass_nr(),
+                ctx.current_pass_index(),
+                ctx.will_discard()
+            ));
+        }
         crate::ui_fonts::configure_fonts_for_texture_resync(ctx, generation);
         if !final_fire {
             // 次フレームでも再発行する。surface が戻るまで full upload を出し続ける。
@@ -23658,7 +23803,10 @@ impl App {
             // 予約しただけで、この pass はそのままメイン UI を描く。
             crate::logger::log(format!(
                 "[ui-fonts] resync main font atlas without paint defer: phase={phase} \
-                 reason={reason} generation={generation}"
+                 reason={reason} generation={generation} egui_frame={} egui_pass={} pass_index={}",
+                ctx.cumulative_frame_nr(),
+                ctx.cumulative_pass_nr(),
+                ctx.current_pass_index()
             ));
             ctx.request_repaint();
             return false;
@@ -23678,7 +23826,11 @@ impl App {
         if ctx.will_discard() {
             crate::logger::log(format!(
                 "[ui-fonts] discard pass for font atlas resync (same-frame repass): \
-                 phase={phase} reason={reason} generation={generation}"
+                 phase={phase} reason={reason} generation={generation} egui_frame={} \
+                 egui_pass={} pass_index={}",
+                ctx.cumulative_frame_nr(),
+                ctx.cumulative_pass_nr(),
+                ctx.current_pass_index()
             ));
             // 同一フレーム内で次 pass が走るので request_repaint は不要。
             return true;
@@ -23689,7 +23841,11 @@ impl App {
         // バック (= 1 フレーム黒)。通常運用ではここには来ない想定。
         crate::logger::log(format!(
             "[ui-fonts] defer main paint for font atlas resync (no discard budget): \
-             phase={phase} reason={reason} generation={generation}"
+             phase={phase} reason={reason} generation={generation} egui_frame={} \
+             egui_pass={} pass_index={}",
+            ctx.cumulative_frame_nr(),
+            ctx.cumulative_pass_nr(),
+            ctx.current_pass_index()
         ));
         ctx.request_repaint();
         true

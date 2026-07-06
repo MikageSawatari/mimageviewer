@@ -16719,6 +16719,31 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn embedded_still_viewport_hide_does_not_request_video_backdrop_resync() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        app.hide_embedded_still_viewport_if_shown(&ctx);
+
+        assert!(
+            !app.fs_viewport_shown,
+            "embedded still cleanup should hide the stale fullscreen viewport"
+        );
+        assert_eq!(app.fs_viewport_presentation, None);
+        assert!(
+            !app.main_font_atlas_resync_pending,
+            "static/PDF cleanup must not reuse native-video backdrop font resync"
+        );
+        assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
+    }
+
+    #[test]
     fn font_resync_is_not_blocked_by_embedded_still_viewer() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -19601,50 +19626,43 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_cleanup_font_resync_waits_until_outer_detached_idle() {
-        // always-new クラッシュの根治 (Codex): passive close / active close finalize などの
-        // close 経路では即時 resync せず pending 化し、outer/main context が detached idle だと
-        // 確認できた時だけ main font-atlas resync を発火する。
+    fn detached_cleanup_font_resync_waits_until_settled_frame() {
+        // CUT fix2: cleanup resync は「detached が完全 idle」まで待つのではなく、
+        // Opening/Closing や動画 placement/backdrop churn が無い settled frame で発火する。
         let mut app = setup_app();
         assert!(app.detached_image_windows.is_empty());
 
         app.request_detached_cleanup_font_atlas_resync("test");
 
-        // active session が無くても、outer/main 側に detached fullscreen が戻る状態なら
-        // flush してはいけない。これは active context mount 中の `active_close_finalize` が
-        // 見落としていたクラッシュ条件 (resync 直後に main detached viewport が描かれる)。
-        let idx = push_image(&mut app, r"C:\pics\a.jpg");
-        app.fullscreen_idx = Some(idx);
-        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        // 新規/再生成中の detached 窓があるフレームでは full-upload が backend へ届かず
+        // 消費される恐れがあるので、pending のまま保持する。
+        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test_opening");
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
             app.pending_detached_cleanup_font_atlas_resync.is_some(),
-            "detached cleanup resync must remain pending while main detached fullscreen is active"
+            "detached cleanup resync must remain pending while any detached window is opening"
         );
         assert!(!app.main_font_atlas_resync_pending);
 
-        // active detached session が生きている間も flush しない。
-        app.fullscreen_idx = None;
-        app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.begin_active_detached_session(7, DetachedSource::Image);
+        app.transition_detached_window_state(7, DetachedWindowState::Closing, "test_closing");
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
             app.pending_detached_cleanup_font_atlas_resync.is_some(),
-            "pending resync must wait while an active detached session is alive"
+            "detached cleanup resync must remain pending while any detached window is closing"
         );
         assert!(!app.main_font_atlas_resync_pending);
 
-        // すべての detached renderer が idle になってから、初めて main resync を発火する。
-        app.begin_active_detached_session_close("test");
-        app.finish_active_detached_session_close("test");
+        // Stable な parked/active/passive の存在だけでは待たない。これにより OFF モードで
+        // detached 窓が残っていても main atlas を修復できる。
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_parked");
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
             app.pending_detached_cleanup_font_atlas_resync.is_none(),
-            "pending request should be consumed once detached is fully idle"
+            "pending request should be consumed once the frame is settled"
         );
         assert!(
             app.main_font_atlas_resync_pending,
-            "main font atlas resync is scheduled only after detached is fully idle"
+            "main font atlas resync is scheduled on the first settled frame"
         );
         assert_eq!(
             app.main_font_atlas_resync_reason,
@@ -19654,7 +19672,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn main_font_resync_waits_while_passive_detached_window_exists() {
+    fn main_font_resync_allows_stable_passive_detached_window() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let tex = ctx.load_texture(
@@ -19683,27 +19701,87 @@ mod still_window_mode_key_tests {
 
         app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
 
-        assert!(!app.main_font_atlas_resync_pending);
+        assert!(
+            app.main_font_atlas_resync_pending,
+            "a stable passive detached window is not itself an unsafe frame"
+        );
         assert_eq!(
-            app.pending_detached_cleanup_font_atlas_resync,
-            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE),
-            "native video backdrop resync must be deferred while a passive detached viewport exists"
+            app.pending_detached_cleanup_font_atlas_resync, None,
+            "direct main resync requests are gated at flush time, not moved to detached-idle wait"
         );
 
-        app.flush_pending_detached_cleanup_font_atlas_resync();
-        assert!(!app.main_font_atlas_resync_pending);
+        assert!(app.main_font_atlas_resync_settled_frame());
+        assert!(app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"));
         assert_eq!(
-            app.pending_detached_cleanup_font_atlas_resync,
-            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
+            app.main_font_atlas_resync_generation, 1,
+            "stable passive windows must not prevent the full atlas upload"
         );
+    }
 
-        app.detached_image_windows.clear();
-        app.flush_pending_detached_cleanup_font_atlas_resync();
-        assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
-        assert!(app.main_font_atlas_resync_pending);
+    #[test]
+    #[cfg(windows)]
+    fn main_font_resync_settled_frame_tracks_video_and_window_churn() {
+        let mut app = setup_app();
+        let now = std::time::Instant::now();
+        assert!(app.main_font_atlas_resync_settled_frame());
+
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 1,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: now + std::time::Duration::from_secs(1),
+        });
+        assert!(!app.main_font_atlas_resync_settled_frame());
+        app.native_video_mode_switch = None;
+
+        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
+            target_presentation: ViewerPresentation::DetachedWindow,
+            activate_on_show: true,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(1),
+        });
+        assert!(!app.main_font_atlas_resync_settled_frame());
+        app.pending_detached_video_host_switch = None;
+
+        app.pending_detached_video_host_resync = true;
+        assert!(!app.main_font_atlas_resync_settled_frame());
+        app.pending_detached_video_host_resync = false;
+
+        app.native_video_main_cloaked = true;
+        assert!(!app.main_font_atlas_resync_settled_frame());
+        app.native_video_main_cloaked = false;
+
+        app.transition_detached_window_state(51, DetachedWindowState::Opening, "test_opening");
+        assert!(!app.main_font_atlas_resync_settled_frame());
+
+        app.transition_detached_window_state(51, DetachedWindowState::Parked, "test_parked");
+        assert!(app.main_font_atlas_resync_settled_frame());
+
+        app.transition_detached_window_state(51, DetachedWindowState::Closing, "test_closing");
+        assert!(!app.main_font_atlas_resync_settled_frame());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_font_resync_does_not_consume_repeats_until_settled() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        app.transition_detached_window_state(52, DetachedWindowState::Opening, "test_opening");
+
+        let repeats_before = app.main_font_atlas_resync_repeats_left;
+        assert!(
+            !app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"),
+            "unsafe frames must keep the pending request for a later frame"
+        );
+        assert_eq!(app.main_font_atlas_resync_repeats_left, repeats_before);
+        assert_eq!(app.main_font_atlas_resync_generation, 0);
+
+        app.transition_detached_window_state(52, DetachedWindowState::Parked, "test_settled");
+        assert!(app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"));
+        assert_eq!(app.main_font_atlas_resync_generation, 1);
         assert_eq!(
-            app.main_font_atlas_resync_reason,
-            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
+            app.main_font_atlas_resync_repeats_left,
+            repeats_before.saturating_sub(1)
         );
     }
 
@@ -19728,12 +19806,27 @@ mod still_window_mode_key_tests {
         );
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
-            !app.main_font_atlas_resync_pending,
-            "deferred resync must wait while the detached session remains alive"
+            app.main_font_atlas_resync_pending,
+            "active detached sessions no longer block resync once the frame is settled"
+        );
+        assert_eq!(
+            app.main_font_atlas_resync_reason,
+            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
         );
 
-        app.begin_active_detached_session_close("test");
-        app.finish_active_detached_session_close("test");
+        app.main_font_atlas_resync_pending = false;
+        app.main_font_atlas_resync_reason = None;
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        app.transition_detached_window_state(33, DetachedWindowState::Closing, "test_closing");
+        assert!(app.detached_font_atlas_resync_should_wait());
+        let repeats_before = app.main_font_atlas_resync_repeats_left;
+        assert!(!app.maybe_defer_for_main_font_atlas_resync(&egui::Context::default(), "test"));
+        assert_eq!(
+            app.main_font_atlas_resync_repeats_left, repeats_before,
+            "unsafe frames must not consume resync repeat budget"
+        );
+
+        app.transition_detached_window_state(33, DetachedWindowState::Parked, "test_settled");
         app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(app.main_font_atlas_resync_pending);
         assert_eq!(
@@ -19751,6 +19844,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_viewport_recreate_after_hide = true;
         set_detached_host_for_test(&mut app, 42, 0x1234, true);
+        app.begin_active_detached_session(42, DetachedSource::Image);
 
         app.finalize_closed_active_detached_viewport(
             &ctx,

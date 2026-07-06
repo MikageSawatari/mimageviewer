@@ -6922,7 +6922,7 @@ impl App {
                 if hide_viewport_after_embedded_paint {
                     // 先に main 側へ画像を描いてから古い専用 viewport を隠す。
                     // これで背面の一覧が DWM に露出する隙間を作らない。
-                    self.hide_native_video_black_backdrop_if_shown(main_ctx);
+                    self.hide_embedded_still_viewport_if_shown(main_ctx);
                 }
             } else {
                 // 従来: 専用フルスクリーン viewport を出してそこに描画する。
@@ -7336,6 +7336,34 @@ impl App {
         self.clear_detached_viewer_host_hwnd();
         self.request_main_font_atlas_resync(
             crate::app::FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE,
+        );
+    }
+
+    /// in-window 静止画/PDF へ戻るときに、残っている専用 fullscreen/detached
+    /// viewport だけを隠す。動画 backdrop の cleanup とは違い、ここではフォント
+    /// atlas の再同期を発火しない。静止画/PDF の F12 OFF はフォント定義を変えず、
+    /// 実機ログでは動画 backdrop 用 resync の相乗りが main atlas 破損の発火源だった。
+    #[cfg(windows)]
+    pub(crate) fn hide_embedded_still_viewport_if_shown(&mut self, ctx: &egui::Context) {
+        if !self.fs_viewport_shown {
+            return;
+        }
+        if self.active_detached_session_owns_visible_fullscreen_viewport() {
+            self.log_detached_image_window_debug(
+                "skip_embedded_still_viewport_hide_active_detached_session".to_string(),
+            );
+            return;
+        }
+        let fs_id = self.fullscreen_viewport_id();
+        let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
+        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.clear_detached_viewer_host_hwnd();
+        self.log_detached_image_window_debug(
+            "embedded_still_viewport_hidden_without_font_resync".to_string(),
         );
     }
 
