@@ -10560,6 +10560,92 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.auto_aspect.switches_done, 1);
     }
 
+    #[test]
+    fn viewer_context_bundle_preserves_auto_aspect_state() {
+        use crate::settings::ThumbAspect;
+
+        let mut app = setup_app();
+        let now = std::time::Instant::now();
+        app.auto_aspect.items_generation = 42;
+        app.auto_aspect
+            .samples
+            .insert(3, ThumbAspect::Portrait3x4.height_ratio());
+        app.auto_aspect.current = Some(ThumbAspect::Portrait3x4);
+        app.auto_aspect.cached_sample_gate = Some(9);
+        app.auto_aspect.switches_done = 1;
+        app.auto_aspect.last_switch_at = Some(now);
+        app.auto_aspect.streak = Some((ThumbAspect::Portrait3x4, now, 4));
+
+        let mut bundle = app.take_current_viewer_context_bundle();
+        app.auto_aspect.current = Some(ThumbAspect::Square);
+        app.auto_aspect.samples.clear();
+        app.auto_aspect.switches_done = 2;
+
+        app.swap_viewer_context_bundle(&mut bundle);
+
+        assert_eq!(app.auto_aspect.items_generation, 42);
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(9));
+        assert_eq!(app.auto_aspect.switches_done, 1);
+        assert_eq!(app.auto_aspect.last_switch_at, Some(now));
+        assert_eq!(
+            app.auto_aspect.streak,
+            Some((ThumbAspect::Portrait3x4, now, 4))
+        );
+        assert_eq!(
+            app.auto_aspect.samples.get(&3).copied(),
+            Some(ThumbAspect::Portrait3x4.height_ratio())
+        );
+    }
+
+    #[test]
+    fn restored_viewer_context_clears_stale_thumbnail_request_markers_and_requeues() {
+        use crate::grid_item::GridItem;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let mut app = setup_app();
+        let image = app.tmp.path().join("bundle-requeue.jpg");
+        std::fs::write(&image, b"not decoded in this test").unwrap();
+
+        app.items = vec![GridItem::Image(image)];
+        app.image_metas = vec![Some((1, 24))];
+        app.thumbnails = vec![ThumbnailState::Evicted];
+        app.visible_indices = vec![0];
+        app.settings.grid_cols = 1;
+        app.last_cell_size = 120.0;
+        app.last_cell_h = 120.0;
+        app.last_viewport_h = 120.0;
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.requested.insert(0, false);
+        app.pending_finalize.insert(0);
+
+        let mut bundle = app.take_current_viewer_context_bundle();
+        app.swap_viewer_context_bundle(&mut bundle);
+
+        assert!(
+            app.requested.is_empty(),
+            "restored bundle must not inherit stale request markers from an old worker queue"
+        );
+        assert!(
+            app.pending_finalize.is_empty(),
+            "restored bundle must not inherit stale finalize markers from an old worker queue"
+        );
+
+        app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
+
+        assert!(
+            app.requested.contains_key(&0),
+            "Evicted visible thumbnail should be requeued after stale markers are cleared"
+        );
+        let queue_len = app
+            .reload_queue
+            .as_ref()
+            .map(|queue| queue.0.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(queue_len, 1);
+    }
+
     /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
     /// が PDF 自身の catalog に `page_0000` として seed されることを確認する回帰
     /// テスト。これによって PDFium による初回 1 ページ目レンダリング (200-500ms)

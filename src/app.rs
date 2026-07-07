@@ -1644,6 +1644,7 @@ struct ViewerContextBundle {
     items: Vec<GridItem>,
     thumbnails: Vec<ThumbnailState>,
     image_metas: Vec<Option<(i64, i64)>>,
+    auto_aspect: crate::auto_aspect::AutoAspectState,
     selected: Option<usize>,
     scroll_offset_y: f32,
     scroll_to_selected: bool,
@@ -1810,6 +1811,7 @@ impl ViewerContextBundle {
             items: Vec::new(),
             thumbnails: Vec::new(),
             image_metas: Vec::new(),
+            auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             selected: None,
             scroll_offset_y: 0.0,
             scroll_to_selected: false,
@@ -10001,6 +10003,7 @@ impl App {
             items,
             thumbnails,
             image_metas,
+            auto_aspect,
             selected,
             scroll_offset_y,
             scroll_to_selected,
@@ -10146,6 +10149,7 @@ impl App {
         swap_field!(items);
         swap_field!(thumbnails);
         swap_field!(image_metas);
+        swap_field!(auto_aspect);
         swap_field!(selected);
         swap_field!(scroll_offset_y);
         swap_field!(scroll_to_selected);
@@ -10282,6 +10286,12 @@ impl App {
         swap_field!(normalize_ui_states);
         swap_field!(normalize_auto_scan_suppressed);
         swap_field!(last_loop_pos);
+
+        // The worker queues are App-global, so thumbnail request bookkeeping restored from a
+        // parked viewer context cannot be trusted after a swap. Let the active context rebuild
+        // requests from its current keep range instead of inheriting stale in-flight markers.
+        self.requested.clear();
+        self.pending_finalize.clear();
     }
 
     #[cfg(windows)]
