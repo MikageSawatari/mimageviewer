@@ -515,7 +515,12 @@ impl SpectrumAnalyzer {
                 notes.push(0.0);
             } else {
                 let power = self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz));
-                notes.push(power_to_display_value(power, 0.0));
+                // Layer ① 知覚補正: 鍵盤 notes にも棒グラフ同等の等ラウドネス dB カーブを掛け、
+                // 低域偏重を解消してボーカル帯を見えやすくする (棒グラフだけ重み付けだった非対称を是正)。
+                notes.push(power_to_display_value(
+                    power,
+                    spectrum_display_weight_db(hz),
+                ));
             }
         }
 
