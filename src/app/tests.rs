@@ -16436,6 +16436,50 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn watcher_repair_rejects_when_target_hwnd_is_still_alive() {
+        let mut app = setup_app();
+        app.detached_window_hwnd_set(7, 0x7000);
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_repair");
+        app.set_detached_window_live_hwnds_for_test([0x7000, 0x9000]);
+        let snapshot = [
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x9000, false, App::EGUI_VIEWPORT_CLASS),
+        ];
+
+        assert!(
+            !app.repair_detached_window_hwnd_from_watcher_with_snapshot(7, 0x9000, &snapshot),
+            "watcher repair must not replace a live registered HWND with a geometry-derived one"
+        );
+        assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
+        assert_eq!(
+            app.detached_window_state(7),
+            Some(DetachedWindowState::Parked)
+        );
+    }
+
+    #[test]
+    fn watcher_repair_adopts_observed_hwnd_when_registered_hwnd_is_dead() {
+        let mut app = setup_app();
+        app.detached_window_hwnd_set(7, 0x7000);
+        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test_repair");
+        app.set_detached_window_live_hwnds_for_test([0x9000]);
+        let snapshot = [
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x9000, false, App::EGUI_VIEWPORT_CLASS),
+        ];
+
+        assert!(
+            app.repair_detached_window_hwnd_from_watcher_with_snapshot(7, 0x9000, &snapshot),
+            "watcher repair remains valid when the registered HWND is genuinely stale"
+        );
+        assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x9000);
+        assert_eq!(
+            app.detached_window_state(7),
+            Some(DetachedWindowState::Parked)
+        );
+    }
+
+    #[test]
     fn active_to_passive_handoff_preserves_live_registered_hwnd() {
         let mut app = setup_app();
         app.detached_viewer_window_id = Some(42);

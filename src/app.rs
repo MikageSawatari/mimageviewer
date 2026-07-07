@@ -1257,6 +1257,9 @@ impl App {
         window_id: u64,
         hwnd: u64,
     ) -> bool {
+        if self.detached_window_hwnd_alive(window_id).is_some() {
+            return false;
+        }
         if hwnd == 0 {
             return false;
         }
@@ -1276,6 +1279,34 @@ impl App {
         let windows = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
+        self.detached_hwnd_is_unclaimed_egui_viewport_for_window_in_snapshot(
+            window_id, hwnd, &windows,
+        )
+    }
+
+    #[cfg(windows)]
+    fn detached_hwnd_is_unclaimed_egui_viewport_for_window_in_snapshot(
+        &self,
+        window_id: u64,
+        hwnd: u64,
+        windows: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
+    ) -> bool {
+        if self.detached_window_hwnd_alive(window_id).is_some() {
+            return false;
+        }
+        if hwnd == 0 {
+            return false;
+        }
+        if !self.detached_window_hwnd_is_alive(hwnd) {
+            return false;
+        }
+        if self
+            .detached_window_runtimes
+            .iter()
+            .any(|(&id, runtime)| id != window_id && runtime.hwnd == hwnd)
+        {
+            return false;
+        }
         windows.iter().any(|entry| {
             entry.hwnd_raw == hwnd
                 && !entry.is_main
@@ -1288,6 +1319,15 @@ impl App {
         if !self.detached_hwnd_is_unclaimed_egui_viewport_for_window(window_id, hwnd) {
             return false;
         }
+        self.repair_detached_window_hwnd_from_watcher_unchecked(window_id, hwnd)
+    }
+
+    #[cfg(windows)]
+    fn repair_detached_window_hwnd_from_watcher_unchecked(
+        &mut self,
+        window_id: u64,
+        hwnd: u64,
+    ) -> bool {
         let previous = self.detached_window_hwnd_set(window_id, hwnd);
         self.transition_detached_window_state(
             window_id,
@@ -1310,6 +1350,21 @@ impl App {
             self.pending_detached_video_host_resync = !self.try_resync_detached_video_host();
         }
         true
+    }
+
+    #[cfg(all(windows, test))]
+    fn repair_detached_window_hwnd_from_watcher_with_snapshot(
+        &mut self,
+        window_id: u64,
+        hwnd: u64,
+        windows: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
+    ) -> bool {
+        if !self.detached_hwnd_is_unclaimed_egui_viewport_for_window_in_snapshot(
+            window_id, hwnd, windows,
+        ) {
+            return false;
+        }
+        self.repair_detached_window_hwnd_from_watcher_unchecked(window_id, hwnd)
     }
 
     #[cfg(windows)]
