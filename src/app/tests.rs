@@ -17383,29 +17383,33 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_video_host_resync_defers_during_audio_mode() {
-        // Inc 7 (7e): 動画→音声モード (presenter は hide されているだけで生存) 中は、host teardown
-        // 検出時の再親付け (SwitchPlacement) を保留する。さもないと presenter が hidden な
-        // SwitchPlacement を audio-mode exit と同様に「un-hide して映像復帰」扱いし、「音声モード
-        // なのに動画が出る」ため (Codex 7e 助言)。
+    fn detached_video_host_resync_is_noop_during_audio_mode() {
+        // Stage AUDIO fix2b: 動画→音声モード (presenter は hidden で生存、表示は egui 音楽ビュー)
+        // 中は host teardown/resync の SwitchPlacement を発行しない。保留して後続 frame で retry
+        // しても、F11 の borderless settle 等から presenter を再表示してしまうため、要求は
+        // 「不要」として消費する。映像復帰は Z/Esc/♪ の正規 exit だけの責務。
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.native_video_mode_switch = None;
 
-        // 音声モード中は resync を保留する (pending を残して retry)。
+        // 音声モード中は resync を消費し、native switch は発行しない。
         app.video_audio_mode = Some(video);
         app.video_audio_vst = None;
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
         assert!(
-            app.pending_detached_video_host_resync,
-            "resync must be deferred (request retained) while in audio mode"
+            !app.pending_detached_video_host_resync,
+            "hidden presenter audio mode consumes detached host resync without retrying"
         );
         assert!(
-            !app.try_resync_detached_video_host(),
-            "try_resync returns false (deferred) during audio mode"
+            app.try_resync_detached_video_host(),
+            "try_resync resolves as a no-op during hidden presenter audio mode"
+        );
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "hidden presenter audio mode must not issue SwitchPlacement"
         );
 
         // 音声モードを抜けたら通常の death-gate 判定に戻る (テスト player は publish HWND=0 =
@@ -17428,6 +17432,31 @@ mod still_window_mode_key_tests {
         assert!(
             !app.pending_detached_video_host_resync,
             "with the VST host visible the presenter is intentionally shown; resync follows the normal path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_video_audio_mode_blocks_direct_presenter_rect_sync() {
+        // Stage AUDIO fix2b: detached borderless settle は直接
+        // sync_detached_video_child_presenter_rect() を呼ぶ。poll 経由の resync だけ止めても、
+        // ここが hidden presenter に SwitchPlacement を投げると F11 後に動画表示へ戻る。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(11, DetachedSource::Video);
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = None;
+
+        assert!(
+            app.sync_detached_video_child_presenter_rect(),
+            "audio mode treats direct detached host sync as resolved no-op"
+        );
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "direct detached host sync must not un-hide or re-place the presenter"
         );
     }
 
@@ -17575,6 +17604,23 @@ mod still_window_mode_key_tests {
                 .as_ref()
                 .map(|t| t.target_borderless),
             Some(true)
+        );
+
+        app.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
+            target_borderless: true,
+            phase: DetachedViewerBorderlessTransitionPhase::Settle {
+                until: std::time::Instant::now() - std::time::Duration::from_millis(1),
+            },
+        });
+        app.step_detached_viewer_borderless_transition(&ctx);
+        assert_eq!(
+            app.video_audio_mode,
+            Some(video),
+            "audio mode must survive the borderless transition settle frame"
+        );
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "settle must not issue a presenter placement switch while audio mode owns display"
         );
     }
 

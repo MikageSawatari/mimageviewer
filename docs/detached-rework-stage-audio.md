@@ -199,6 +199,51 @@ supports_session / F12 / メディア 1 本 / music_* 非 bundle 化 invariant /
 - 音楽 VST shell / 動画→音声 VST shell の window-toggle も同 helper に寄せ、detached 音声の
   VST 中 F11 でも MainWindow へ戻さない。
 
+## 3.8 検収指摘 fix2b (実機 2026-07-07): 症状 B が残存 — F11 の presentation 遷移が音声モードを落とす
+
+fix2 (27704d25) の実機確認: **症状 A は解消**。症状 B は残存 —
+「♪ (音声モード) 中に F11 → フルスクリーンになると同時に動画表示へ戻る」。
+
+### Fable の分析
+
+- fix2 の dispatch 集約自体は正しく、audio-mode F11 は
+  `toggle_egui_viewer_window_mode_for_input` に到達している
+  (`[video-audio] window toggle while in audio mode` ログで確認可能)。
+- 問題は非 detached 分岐の先: `toggle_still_window_mode()` が `viewer_presentation` を
+  MainWindow⇄Fullscreen に切り替える際、**動画 item の presentation 遷移機構
+  (prepare/open 系・native presenter の placement switch・exit_video_audio_mode の
+  いずれか) が `video_audio_mode` をリセットしている**。fix2 のテストは dispatch
+  直後の状態しか検証しておらず、遷移完了後のリセットを検出できていない。
+
+### fix2b 要件
+
+1. まず計装/ログで「F11 後に `video_audio_mode` を落としている呼び出し元」を特定して
+   報告する (exit 経路の関数名まで)。
+2. 音声モード中の F11 (非 detached) は「音楽ビューの表示先が embedded main ⇄
+   fullscreen viewport に変わるだけ」とし、**`video_audio_mode` と hidden presenter の
+   状態を維持**する (presenter を un-hide しない)。正規 exit (Z/Esc/♪) の経路は
+   変更しない。
+3. 回帰テスト: dispatch 直後ではなく **presentation 遷移の完了後**に
+   `video_audio_mode` が維持されていることを検証するシーケンステスト
+   (F11 → Fullscreen 化後も Some(fs_idx) → 再 F11 → MainWindow 化後も Some(fs_idx) →
+   ♪/Z で正規 exit 可能)。
+4. コミット `(detached-rework stage-audio fix2b)`。
+
+### fix2b 実装メモ (Codex 2026-07-07)
+
+- 実際に `video_audio_mode = None` を直接実行していたのではなく、F11 後の detached
+  borderless settle / host resync が `sync_detached_video_child_presenter_rect()` 経由で
+  hidden presenter に `SwitchPlacement` を投げ、presenter 側が再表示されることで
+  「音声モードが落ちたように見える」状態になっていた。
+- `video_audio_mode_hides_native_presenter_for(fs_idx)` を追加し、動画→音声モード中
+  (VST ホスト表示中を除く) は native presenter の表示責務を持たないことを明示。
+  `try_resync_detached_video_host()` と `sync_detached_video_child_presenter_rect()` はこの状態の
+  host resync を **resolved no-op** として扱い、pending retry も `SwitchPlacement` も発行しない。
+  正規の映像復帰は従来どおり `exit_video_audio_mode()` / `poll_video_audio_exit_pending()` のみ。
+- 回帰テストは、poll 経由の resync no-op、direct settle 経由の
+  `sync_detached_video_child_presenter_rect()` no-op、detached F11 の borderless settle 後も
+  `video_audio_mode` と `native_video_mode_switch=None` が維持されることを固定。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)

@@ -634,6 +634,14 @@ impl App {
                 .unwrap_or(false)
     }
 
+    /// Inc 7 (動画→音声モード): この動画の native presenter は hidden のまま保持され、
+    /// egui の音楽ビューが表示の責務を持つ。VST ホスト表示中だけは presenter を
+    /// intentionally un-hide して使うため、通常の native presenter 経路へ戻す。
+    #[cfg(windows)]
+    pub(crate) fn video_audio_mode_hides_native_presenter_for(&self, fs_idx: usize) -> bool {
+        self.video_audio_mode == Some(fs_idx) && !self.video_audio_vst_active_for(fs_idx)
+    }
+
     /// detached host 変更に対する presenter child の再親付けを 1 回試みる。
     /// 戻り値 `true` = 「解決した (再親付け発行 or そもそも不要)」→ 要求フラグを落としてよい。
     /// `false` = 「保留 (mode switch 進行中 / host 未確定などで今は発行できない)」→ フラグを
@@ -644,16 +652,21 @@ impl App {
         if !self.detached_video_presentation_active_or_targeted() {
             return true; // 再親付け対象でない → 要求は破棄してよい
         }
-        // Inc 7 (動画→音声モード): presenter は hide されているだけで生存している。ここで host
-        // teardown による child 死亡を検出して `sync_detached_video_child_presenter_rect` の
-        // `SwitchPlacement` を走らせると、presenter 側が hidden な SwitchPlacement を audio-mode
-        // exit と同様に「un-hide して映像復帰」扱いしてしまい、「video_audio_mode は Some なのに
-        // 動画が出る」ことがある。音声モード中は resync を保留し (pending を残して retry)、child が
-        // 死んでいれば exit 側の SwitchPlacement / fast-show が正しく作り直す (Codex 7e 助言)。
-        // VST ホスト表示中 (video_audio_vst Some) は presenter を意図的に un-hide しているので
-        // 通常経路に任せる。
-        if self.video_audio_mode.is_some() && self.video_audio_vst.is_none() {
-            return false; // 保留 = pending を残し、音声モードを抜けてから再評価する
+        // Inc 7 (動画→音声モード): presenter は hidden のまま保持され、表示の責務は egui 音楽
+        // ビューに移っている。この状態で host resync / SwitchPlacement を走らせると presenter が
+        // 再表示され、「video_audio_mode は Some なのに動画が出る」不整合になる。音声モード中の
+        // host resync は不要として解決済みにし、正規 exit (Z/Esc/♪) だけが presenter を
+        // un-hide / re-place できるようにする。VST ホスト表示中は presenter を意図的に使うため
+        // 通常経路へ戻す。
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.video_audio_mode_hides_native_presenter_for(idx))
+        {
+            crate::logger::log(
+                "[video-audio] skip detached host resync while hidden presenter audio mode is active"
+                    .to_string(),
+            );
+            return true;
         }
         if self.native_video_mode_switch.is_some() {
             return false; // 切替中は重ねられない。完了後に再試行
@@ -2033,6 +2046,13 @@ impl App {
             || self.native_video_mode_switch.is_some()
         {
             return false;
+        }
+        if self.video_audio_mode_hides_native_presenter_for(idx) {
+            crate::logger::log(format!(
+                "[video-audio] skip sync_detached_video_child_presenter_rect while hidden presenter \
+                 audio mode is active fs_idx={idx}"
+            ));
+            return true;
         }
         let Some((placement, rect, owner_hwnd)) =
             self.native_video_target_for_presentation(ViewerPresentation::DetachedWindow)
