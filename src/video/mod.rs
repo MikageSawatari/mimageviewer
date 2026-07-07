@@ -354,6 +354,7 @@ pub enum NativeVideoOutputEvent {
     },
     NavigateItem {
         delta: i32,
+        via_wheel: bool,
     },
     TileColumnsDelta {
         delta: i32,
@@ -1556,7 +1557,9 @@ fn send_native_overlay_command(
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
-        Command::NavigateItem { delta } => NativeVideoOutputEvent::NavigateItem { delta },
+        Command::NavigateItem { delta, via_wheel } => {
+            NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
+        }
         Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
         Command::RequestSeekThumbnail { target_secs } => {
             NativeVideoOutputEvent::RequestSeekThumbnail { target_secs }
@@ -3248,11 +3251,12 @@ fn run_native_video_output(
                             }
                             crate::video::native_presenter::NativeOverlayCommand::NavigateItem {
                                 delta,
+                                via_wheel,
                             } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::NavigateItem { delta },
+                                    NativeVideoOutputEvent::NavigateItem { delta, via_wheel },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileColumnsDelta {

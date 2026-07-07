@@ -1217,6 +1217,7 @@ pub enum NativeOverlayCommand {
     },
     NavigateItem {
         delta: i32,
+        via_wheel: bool,
     },
     TileColumnsDelta {
         delta: i32,
@@ -4263,6 +4264,7 @@ impl NativeEguiOverlay {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::NavigateItem {
                             delta: if wheel.delta < 0 { 1 } else { -1 },
+                            via_wheel: true,
                         });
                 }
                 self.pending_events.push(egui::Event::PointerMoved(pos));
@@ -6630,7 +6632,10 @@ impl NativeEguiOverlay {
                                     shortcut_labels.and_then(|s| s.prev_file.as_deref()),
                                 ));
                             if prev_file_resp.clicked() {
-                                commands.push(NativeOverlayCommand::NavigateItem { delta: -1 });
+                                commands.push(NativeOverlayCommand::NavigateItem {
+                                    delta: -1,
+                                    via_wheel: false,
+                                });
                             }
                             x = prev_file_rect.max.x + gap;
 
@@ -6656,7 +6661,10 @@ impl NativeEguiOverlay {
                                     shortcut_labels.and_then(|s| s.next_file.as_deref()),
                                 ));
                             if next_file_resp.clicked() {
-                                commands.push(NativeOverlayCommand::NavigateItem { delta: 1 });
+                                commands.push(NativeOverlayCommand::NavigateItem {
+                                    delta: 1,
+                                    via_wheel: false,
+                                });
                             }
                             // グループ境界: [L][⤴][↑][↓] | (次にマーカー or キャプチャ がある場合のみ)
                             x = next_file_rect.max.x + gap;

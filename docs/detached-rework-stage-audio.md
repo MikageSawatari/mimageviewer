@@ -711,6 +711,18 @@ SwitchPlacement 再構築時の再適用あり・dim は top bar 54px + bottom H
   `src/app/tests.rs`、本 doc。
 - コミット `(detached-rework stage-audio fix6c-2)`。
 
+### fix6c-2 実装メモ (Codex 2026-07-08)
+
+- `NativeOverlayCommand::NavigateItem` / `NativeVideoOutputEvent::NavigateItem` に
+  `via_wheel` を追加し、native presenter のホイール変換は `true`、HUD の前/次項目
+  ボタンは `false` として伝搬する。
+- active 窓の通常処理は `via_wheel` を無視して既存どおり動作する。ParkedLive filter
+  だけが origin を読み、`via_wheel=true` は no-op、`via_wheel=false` は HUD クリック
+  として復帰要求に変換する。
+- `TileColumnsDelta` は Ctrl+ホイール由来のため ParkedLive では activation 対象外にした。
+- 回帰テストでは `NavigateItem { via_wheel: true }` / `TileColumnsDelta` が復帰しないこと、
+  `NavigateItem { via_wheel: false }` が復帰要求になることを固定した。
+
 ## 3.15 実機 FB (2026-07-08): fix6d = 音楽 chrome の parked/active パリティ + fix6b-2 = native 下 HUD 減光が効かない
 
 fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーンショット 4 枚):

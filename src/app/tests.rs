@@ -21839,7 +21839,10 @@ mod still_window_mode_key_tests {
             &Ev::Window(WinEv::MouseWheel(wheel))
         ));
         assert!(!App::native_video_output_event_allowed_while_parked_live(
-            &Ev::NavigateItem { delta: 1 }
+            &Ev::NavigateItem {
+                delta: 1,
+                via_wheel: true
+            }
         ));
         assert!(!App::native_video_output_event_allowed_while_parked_live(
             &Ev::TogglePlay
@@ -21900,6 +21903,25 @@ mod still_window_mode_key_tests {
                 volume: 0.5,
                 persist: true
             })
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::NavigateItem {
+                delta: 1,
+                via_wheel: false
+            })
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::NavigateItem {
+                    delta: 1,
+                    via_wheel: true
+                }
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::TileColumnsDelta { delta: 1 }
+            )
         );
         assert!(
             !App::native_video_output_event_is_parked_live_hud_click_activation(
@@ -21963,6 +21985,37 @@ mod still_window_mode_key_tests {
             app.native_video_parked_live_activation_requests,
             vec![92],
             "activation requests are deduplicated while parked"
+        );
+
+        app.native_video_parked_live_activation_requests.clear();
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::NavigateItem {
+                delta: 1,
+                via_wheel: true,
+            },
+        );
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::TileColumnsDelta { delta: 1 });
+        assert!(
+            app.native_video_parked_live_activation_requests.is_empty(),
+            "parked wheel-origin native commands stay inert and must not activate"
+        );
+
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::NavigateItem {
+                delta: 1,
+                via_wheel: false,
+            },
+        );
+        assert_eq!(
+            app.native_video_parked_live_activation_requests,
+            vec![92],
+            "parked HUD prev/next button commands request activation"
         );
     }
 

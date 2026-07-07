@@ -941,7 +941,7 @@ impl App {
                 crate::video::NativeVideoOutputEvent::Window(event) => {
                     self.handle_native_video_window_event(ctx, fs_idx, event);
                 }
-                crate::video::NativeVideoOutputEvent::NavigateItem { delta } => {
+                crate::video::NativeVideoOutputEvent::NavigateItem { delta, .. } => {
                     self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
                 }
                 crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
@@ -2487,7 +2487,12 @@ impl App {
             | Ev::PlacementSwitched { .. }
             | Ev::PlacementSwitchFailed { .. }
             | Ev::RequestSeekThumbnail { .. }
-            | Ev::ClearSeekThumbnail => false,
+            | Ev::ClearSeekThumbnail
+            | Ev::TileColumnsDelta { .. } => false,
+            // Native presenter converts plain wheel into NavigateItem. Keep wheel-origin
+            // navigation inert while parked, but treat the HUD prev/next buttons as clicks
+            // that request activation.
+            Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
             // Every other event is produced by a native HUD command. While ParkedLive, button
             // functions stay inert; the click itself requests activation instead.
             _ => true,
@@ -2665,7 +2670,7 @@ impl App {
             // stamp されて発射されるが、player 側の current_epoch は既に新 epoch に
             // 進んでいるため epoch mismatch で silent drop されていた。
             //
-            // `NavigateItem { delta }` は source 非依存の汎用コマンドで、現在の
+            // `NavigateItem { delta, .. }` は source 非依存の汎用コマンドで、現在の
             // fullscreen_idx (= 既にチェック済み) + delta だけで意味が完結する。
             // epoch mismatch があっても安全に dispatch 可能なので bypass する。
             // 他の source-specific コマンド (Seek / SetVolume / SetPlaybackSpeed 等) は
@@ -2692,7 +2697,7 @@ impl App {
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
             }
-            crate::video::NativeVideoOutputEvent::NavigateItem { delta } => {
+            crate::video::NativeVideoOutputEvent::NavigateItem { delta, .. } => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
             }
             crate::video::NativeVideoOutputEvent::TileColumnsDelta { delta } => {
