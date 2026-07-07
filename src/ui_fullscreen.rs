@@ -4165,6 +4165,17 @@ impl App {
             let apply_initial_placement = !window.initial_placement_applied;
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "deferred_passive_seed");
+            if apply_initial_placement {
+                self.log_detached_viewport_placement_event(
+                    "passive_deferred",
+                    "builder_with_position",
+                    format!(
+                        "window_id={} viewport={viewport_id:?} placement={window_placement:?} \
+                         maximized={}",
+                        window.id, window_placement.maximized
+                    ),
+                );
+            }
             let builder = Self::build_detached_image_window_builder(
                 window,
                 window_placement,
@@ -4259,6 +4270,17 @@ impl App {
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
             let parked_live_audio_title = self.parked_live_audio_title_for_window_id(window.id);
+            if apply_initial_placement {
+                self.log_detached_viewport_placement_event(
+                    "passive_parked_live",
+                    "builder_with_position",
+                    format!(
+                        "window_id={} viewport={viewport_id:?} placement={window_placement:?} \
+                         maximized={}",
+                        window.id, window_placement.maximized
+                    ),
+                );
+            }
             let builder = Self::build_detached_image_window_builder(
                 &window,
                 window_placement,
@@ -5011,7 +5033,8 @@ impl App {
         // 体感を緩和する。
         if self.fs_viewport_shown && self.fs_nav_deferred_reopen_wait_active() {
             #[cfg(windows)]
-            let fs_builder = self.build_inactive_fullscreen_viewport_builder(0);
+            let fs_builder = self
+                .build_inactive_fullscreen_viewport_builder_with_source(0, "keep_alive_holdover");
             #[cfg(not(windows))]
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
@@ -5137,7 +5160,7 @@ impl App {
         // 送信直前に DWM トランジションを無効化して Win11 のフェードアウトを抑止する。
         #[cfg(windows)]
         let fs_builder = self
-            .build_inactive_fullscreen_viewport_builder(0)
+            .build_inactive_fullscreen_viewport_builder_with_source(0, "keep_alive_cleanup")
             .with_visible(false);
         #[cfg(not(windows))]
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
@@ -5211,7 +5234,12 @@ impl App {
         // (`== 0` だと死んだ HWND を !=0 で指したまま再生成される取りこぼしを拾えない = Codex P2)。
         let title_idx = self.fullscreen_idx.unwrap_or(0);
         let apply_placement = self.detached_viewer_should_seed_placement();
-        let builder = self.build_detached_viewer_viewport_builder(title_idx, None, apply_placement);
+        let builder = self.build_detached_viewer_viewport_builder(
+            title_idx,
+            None,
+            apply_placement,
+            "keepalive_backstop",
+        );
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
         let tex = self
             .fullscreen_idx
@@ -5604,6 +5632,7 @@ impl App {
                 fs_idx,
                 detached_activate_on_show,
                 detached_seed_placement,
+                "active_render",
             )
         } else if state.is_video && !self.fs_music_view_active(fs_idx) {
             self.build_fullscreen_viewport_builder()
@@ -5708,7 +5737,8 @@ impl App {
                                 pixels_per_point,
                             );
                             let restore_placement = self
-                                .save_detached_viewer_placement_from_logical_rect(
+                                .save_detached_viewer_placement_from_logical_rect_with_source(
+                                    "active_render",
                                     rect,
                                     inner_rect,
                                     pixels_per_point,
@@ -5720,6 +5750,14 @@ impl App {
                             self.detached_viewer_host_geometry_settled =
                                 restore_placement.is_none();
                             if let Some(placement) = restore_placement {
+                                self.log_detached_viewport_placement_event(
+                                    "active_render_restore_default",
+                                    "viewport_cmd",
+                                    format!(
+                                        "viewport=current command=OuterPosition/InnerSize \
+                                         placement={placement:?}"
+                                    ),
+                                );
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                                     egui::pos2(placement.x, placement.y),
@@ -7650,9 +7688,13 @@ impl App {
         }
         let fs_id = self.fullscreen_viewport_id();
         let builder = match self.fs_viewport_presentation {
-            Some(ViewerPresentation::DetachedWindow) => {
-                self.build_detached_viewer_viewport_builder(fs_idx, None, false)
-            }
+            Some(ViewerPresentation::DetachedWindow) => self
+                .build_detached_viewer_viewport_builder(
+                    fs_idx,
+                    None,
+                    false,
+                    "fullscreen_viewport_recreate",
+                ),
             _ => self.build_fullscreen_viewport_builder(),
         }
         .with_visible(false);
@@ -7763,10 +7805,19 @@ impl App {
         self.build_fullscreen_viewport_builder_with_transparency_and_taskbar(true, true)
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     pub(crate) fn build_inactive_fullscreen_viewport_builder(
         &self,
         fs_idx: usize,
+    ) -> egui::ViewportBuilder {
+        self.build_inactive_fullscreen_viewport_builder_with_source(fs_idx, "unspecified")
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn build_inactive_fullscreen_viewport_builder_with_source(
+        &self,
+        fs_idx: usize,
+        source: &'static str,
     ) -> egui::ViewportBuilder {
         match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => {
@@ -7780,7 +7831,7 @@ impl App {
                 // にする: stale (死んだ) HWND をまだ指している (!=0) 間に egui が窓を再生成すると、
                 // `== 0` では seed を取りこぼして既定サイズ窓が生えてしまう (2026-07-01 ハンドオフ)。
                 let apply_placement = self.detached_viewer_should_seed_placement();
-                self.build_detached_viewer_viewport_builder(fs_idx, None, apply_placement)
+                self.build_detached_viewer_viewport_builder(fs_idx, None, apply_placement, source)
             }
             Some(ViewerPresentation::Fullscreen) if !self.fs_viewport_recreate_after_hide => {
                 // Ctrl+↑↓ の PDF/ZIP deferred reopen は既存の静止画 fullscreen viewport
@@ -7801,6 +7852,7 @@ impl App {
         fs_idx: usize,
         active: Option<bool>,
         apply_placement: bool,
+        source: &'static str,
     ) -> egui::ViewportBuilder {
         let name = self
             .items
@@ -7823,17 +7875,49 @@ impl App {
         if apply_placement {
             if borderless {
                 let rect = self.detached_viewer_borderless_target_rect();
+                self.log_detached_viewport_placement_event(
+                    source,
+                    "builder_with_position",
+                    format!(
+                        "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
+                         borderless=true seed_now={} pos=({:.3},{:.3}) size={:.3}x{:.3}",
+                        self.detached_viewer_should_seed_placement(),
+                        rect.min.x,
+                        rect.min.y,
+                        rect.width(),
+                        rect.height()
+                    ),
+                );
                 builder = builder
                     .with_inner_size([rect.width(), rect.height()])
                     .with_position(rect.min)
                     .with_maximized(false);
             } else {
                 let placement = self.active_detached_viewer_current_placement();
+                self.log_detached_viewport_placement_event(
+                    source,
+                    "builder_with_position",
+                    format!(
+                        "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
+                         borderless=false seed_now={} placement={placement:?}",
+                        self.detached_viewer_should_seed_placement()
+                    ),
+                );
                 builder = builder
                     .with_inner_size([placement.w, placement.h])
                     .with_position(egui::pos2(placement.x, placement.y))
                     .with_maximized(placement.maximized);
             }
+        } else {
+            self.log_detached_viewport_placement_event(
+                source,
+                "builder_no_position",
+                format!(
+                    "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
+                     borderless={borderless} seed_now={}",
+                    self.detached_viewer_should_seed_placement()
+                ),
+            );
         }
         if let Some(active) = active {
             builder = builder.with_active(active);

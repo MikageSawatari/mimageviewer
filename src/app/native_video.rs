@@ -1497,6 +1497,7 @@ impl App {
 
         let now = Instant::now();
         let debug = crate::video::native_presenter::hud_debug_enabled();
+        let detached_debug = Self::detached_image_window_debug_enabled();
 
         for raw in normalized {
             let hwnd = Win32Hwnd(raw as *mut _);
@@ -1574,6 +1575,20 @@ impl App {
             };
             if let Some(t) = target_top {
                 if t != rect.top {
+                    if detached_debug {
+                        self.log_detached_viewport_placement_event(
+                            "vst_overlap_clamp",
+                            "native_set_window_pos",
+                            format!(
+                                "hwnd=0x{raw:x} old=({},{} {}x{}) new_top={t} \
+                                 overlaps_top={overlaps_top_band} overlaps_bottom={overlaps_bottom_band}",
+                                rect.left,
+                                rect.top,
+                                rect.right - rect.left,
+                                rect.bottom - rect.top
+                            ),
+                        );
+                    }
                     let ok = unsafe {
                         SetWindowPos(
                             hwnd,
@@ -2036,6 +2051,19 @@ impl App {
 
         self.native_video_mode_switch_seq = self.native_video_mode_switch_seq.wrapping_add(1);
         let request_id = self.native_video_mode_switch_seq;
+        let presenter_hwnd = player.native_presenter_hwnd();
+        self.log_detached_viewport_placement_event(
+            "sync_detached_video_child_presenter_rect",
+            "native_switch_placement",
+            format!(
+                "request={request_id} owner=0x{owner_hwnd:x} presenter=0x{presenter_hwnd:x} \
+                 rect=({},{} {}x{})",
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top
+            ),
+        );
         player.switch_native_placement(request_id, placement, owner_hwnd, rect, false);
         self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
             request_id,

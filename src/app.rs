@@ -25409,6 +25409,29 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn log_detached_viewport_placement_event(
+        &self,
+        source: &'static str,
+        event: &'static str,
+        detail: impl AsRef<str>,
+    ) {
+        if !Self::detached_image_window_debug_enabled() {
+            return;
+        }
+        self.log_detached_image_window_debug(format!(
+            "placement_trace source={source} event={event} frame={} fs_idx={:?} \
+             presentation={:?} fs_presentation={:?} session={:?} host=\"{}\" {}",
+            self.frame_counter,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.fs_viewport_presentation,
+            self.active_detached_session,
+            self.detached_viewer_host_debug_state(),
+            detail.as_ref()
+        ));
+    }
+
+    #[cfg(windows)]
     pub(crate) fn main_flash_probe_interesting(&self) -> bool {
         Self::detached_image_window_debug_enabled()
             && (self.fullscreen_idx.is_some()
@@ -28025,6 +28048,13 @@ impl App {
                     "borderless_restore",
                 );
             }
+            self.log_detached_viewport_placement_event(
+                "borderless_restore",
+                "viewport_cmd",
+                format!(
+                    "viewport={viewport_id:?} command=OuterPosition/InnerSize placement={placement:?}"
+                ),
+            );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd_to(
@@ -28041,6 +28071,18 @@ impl App {
         } else {
             let rect = self.detached_viewer_borderless_target_rect();
             self.detached_viewer_borderless_fullscreen = true;
+            self.log_detached_viewport_placement_event(
+                "borderless_enter",
+                "viewport_cmd",
+                format!(
+                    "viewport={viewport_id:?} command=OuterPosition/InnerSize \
+                     rect=({:.3},{:.3} {:.3}x{:.3})",
+                    rect.min.x,
+                    rect.min.y,
+                    rect.width(),
+                    rect.height()
+                ),
+            );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::OuterPosition(rect.min));
@@ -28146,9 +28188,27 @@ impl App {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     pub(crate) fn save_detached_viewer_placement_from_logical_rect(
         &mut self,
+        outer_rect: egui::Rect,
+        inner_rect: Option<egui::Rect>,
+        pixels_per_point: f32,
+        maximized: bool,
+    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+        self.save_detached_viewer_placement_from_logical_rect_with_source(
+            "unspecified",
+            outer_rect,
+            inner_rect,
+            pixels_per_point,
+            maximized,
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn save_detached_viewer_placement_from_logical_rect_with_source(
+        &mut self,
+        source: &'static str,
         outer_rect: egui::Rect,
         inner_rect: Option<egui::Rect>,
         pixels_per_point: f32,
@@ -28160,14 +28220,29 @@ impl App {
             return None;
         }
         let Some(window_id) = self.active_detached_hwnd_window_id() else {
-            self.log_detached_image_window_debug(
-                "active_placement_update_skipped reason=no_window_id".to_string(),
+            self.log_detached_viewport_placement_event(
+                source,
+                "active_placement_update_skipped",
+                "reason=no_window_id".to_string(),
             );
             return None;
         };
         if maximized {
             let mut placement = self.detached_window_seed_placement(window_id);
             placement.maximized = true;
+            self.log_detached_viewport_placement_event(
+                source,
+                "active_placement_update_maximized",
+                format!(
+                    "window_id={window_id} outer=({:.3},{:.3} {:.3}x{:.3}) ppp={pixels_per_point:.3} \
+                     seed_now={}",
+                    outer_rect.min.x,
+                    outer_rect.min.y,
+                    outer_rect.width(),
+                    outer_rect.height(),
+                    self.detached_viewer_should_seed_placement()
+                ),
+            );
             self.set_detached_window_runtime_placement(
                 window_id,
                 placement,
@@ -28220,10 +28295,15 @@ impl App {
                     pixels_per_point,
                 )
             {
-                self.log_detached_image_window_debug(format!(
-                    "active_placement_update_rejected_default previous={previous:?} \
-                     candidate={placement:?} ppp={pixels_per_point:.3}"
-                ));
+                self.log_detached_viewport_placement_event(
+                    source,
+                    "active_placement_update_rejected_default",
+                    format!(
+                        "window_id={window_id} previous={previous:?} candidate={placement:?} \
+                         ppp={pixels_per_point:.3} seed_now={}",
+                        self.detached_viewer_should_seed_placement()
+                    ),
+                );
                 self.set_detached_window_runtime_placement(
                     window_id,
                     previous,
@@ -28232,6 +28312,29 @@ impl App {
                 return Some(previous);
             }
         }
+        self.log_detached_viewport_placement_event(
+            source,
+            "active_placement_update",
+            format!(
+                "window_id={window_id} outer=({:.3},{:.3} {:.3}x{:.3}) inner={} \
+                 placement={placement:?} ppp={pixels_per_point:.3} maximized={maximized} \
+                 seed_now={}",
+                outer_rect.min.x,
+                outer_rect.min.y,
+                outer_rect.width(),
+                outer_rect.height(),
+                inner_rect
+                    .map(|rect| format!(
+                        "({:.3},{:.3} {:.3}x{:.3})",
+                        rect.min.x,
+                        rect.min.y,
+                        rect.width(),
+                        rect.height()
+                    ))
+                    .unwrap_or_else(|| "none".to_string()),
+                self.detached_viewer_should_seed_placement()
+            ),
+        );
         self.set_detached_window_runtime_placement(window_id, placement, "active_placement_update");
         None
     }

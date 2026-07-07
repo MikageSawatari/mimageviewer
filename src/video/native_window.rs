@@ -269,6 +269,11 @@ pub fn install_in_window_resize_subclass(main_hwnd: u64) -> bool {
     }
 }
 
+fn detached_window_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MIV_DETACHED_WINDOW_DEBUG").is_some())
+}
+
 /// main window サブクラスプロシージャ。`WM_SIZE` を受けたら登録済みの in-window
 /// child を親クライアント領域へリサイズする。`SWP_ASYNCWINDOWPOS` で UI スレッドを
 /// ブロックせずに presenter スレッドへ要求を post する。それ以外のメッセージは素通し。
@@ -294,6 +299,15 @@ unsafe extern "system" fn in_window_resize_subclass_proc(
                     if GetClientRect(hwnd, &mut rc).is_ok() {
                         let w = (rc.right - rc.left).max(1);
                         let h = (rc.bottom - rc.top).max(1);
+                        if detached_window_debug_enabled() {
+                            crate::logger::log(format!(
+                                "[detached-window-debug] placement_trace \
+                                 source=in_window_resize_subclass \
+                                 event=native_set_window_pos hwnd=0x{:x} parent=0x{:x} \
+                                 pos=(0,0) size={}x{}",
+                                child_hwnd.0 as usize, hwnd.0 as usize, w, h
+                            ));
+                        }
                         let _ = SetWindowPos(
                             child_hwnd,
                             None,

@@ -1623,6 +1623,33 @@ fn send_native_overlay_command(
     send_native_output_event(tx, source_epoch, event);
 }
 
+#[cfg(windows)]
+fn detached_window_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MIV_DETACHED_WINDOW_DEBUG").is_some())
+}
+
+#[cfg(windows)]
+fn log_detached_native_set_window_pos(
+    source: &'static str,
+    hwnd: windows::Win32::Foundation::HWND,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    detail: impl AsRef<str>,
+) {
+    if !detached_window_debug_enabled() {
+        return;
+    }
+    crate::logger::log(format!(
+        "[detached-window-debug] placement_trace source={source} \
+         event=native_set_window_pos hwnd=0x{:x} pos=({x},{y}) size={w}x{h} {}",
+        hwnd.0 as usize,
+        detail.as_ref()
+    ));
+}
+
 /// Phase 0 in-window モード: child presenter HWND を親 (main HWND) のクライアント
 /// 領域へ貼り直す。child は親の移動・最小化には自動追従するが**リサイズには
 /// 追従しない**ため、親クライアントサイズを polling してここで `SetWindowPos`
@@ -1654,6 +1681,18 @@ fn reflow_child_to_parent_client(
     if w == 0 || h == 0 || (w, h) == current {
         return current;
     }
+    log_detached_native_set_window_pos(
+        "reflow_child_to_parent_client",
+        child,
+        0,
+        0,
+        w as i32,
+        h as i32,
+        format!(
+            "parent=0x{parent_hwnd_raw:x} current={}x{}",
+            current.0, current.1
+        ),
+    );
     unsafe {
         let _ = SetWindowPos(
             child,
@@ -1682,6 +1721,21 @@ fn resize_existing_native_window_to_rect(
     } else {
         (rect.left, rect.top)
     };
+    log_detached_native_set_window_pos(
+        "resize_existing_native_window_to_rect",
+        hwnd,
+        x,
+        y,
+        w as i32,
+        h as i32,
+        format!(
+            "placement={placement:?} rect=({},{} {}x{})",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        ),
+    );
     unsafe {
         let _ = SetWindowPos(
             hwnd,
