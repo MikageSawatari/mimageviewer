@@ -16435,6 +16435,7 @@ mod fullscreen_main_focus_guard_tests {
 mod still_window_mode_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;
+    use crate::settings::ThumbAspect;
 
     fn push_image(app: &mut App, path: &str) -> usize {
         app.items.push(GridItem::Image(PathBuf::from(path)));
@@ -21559,6 +21560,43 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.selected, Some(video));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn live_media_park_preserves_main_auto_aspect_state() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let now = std::time::Instant::now();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        let window_id = 55;
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(video);
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+        app.auto_aspect.items_generation = 77;
+        app.auto_aspect.samples.insert(0, 1.5);
+        app.auto_aspect.current = Some(ThumbAspect::Portrait3x4);
+        app.auto_aspect.cached_sample_gate = Some(12);
+        app.auto_aspect.switches_done = 1;
+        app.auto_aspect.last_switch_at = Some(now);
+        app.auto_aspect.streak = Some((ThumbAspect::Portrait3x4, now, 5));
+
+        assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_live_park_auto_aspect"));
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.auto_aspect.items_generation, 77);
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(12));
+        assert_eq!(app.auto_aspect.switches_done, 1);
+        assert_eq!(app.auto_aspect.last_switch_at, Some(now));
+        assert_eq!(
+            app.auto_aspect.streak,
+            Some((ThumbAspect::Portrait3x4, now, 5))
+        );
+        assert_eq!(app.auto_aspect.samples.get(&0).copied(), Some(1.5));
     }
 
     #[test]

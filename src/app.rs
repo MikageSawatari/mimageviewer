@@ -27556,6 +27556,7 @@ impl App {
         bundle.archive_source_override = self.archive_source_override.clone();
         bundle.zip_nav = self.zip_nav.clone();
         bundle.items_generation = self.items_generation;
+        bundle.auto_aspect = self.auto_aspect.clone();
         bundle.items_are_global_search_view = self.items_are_global_search_view;
         bundle.items_are_tag_view = self.items_are_tag_view;
         bundle.items_are_reading_history_view = self.items_are_reading_history_view;

@@ -33,3 +33,12 @@
 1. 比率=自動のフォルダ (2:3 に定まるもの) で動画を別窓再生 → メイングリッドの
    セル比率が変わらない
 2. park/復帰を数往復しても変わらない
+
+## 実装メモ (Codex 2026-07-08)
+
+- `AutoAspectState` を `Clone` 化し、`clone_current_viewer_context_grid_fields_into`
+  で `auto_aspect` を main 復元 bundle へコピーするようにした。
+- 回帰テスト
+  `live_media_park_preserves_main_auto_aspect_state` を追加し、動画 live-park
+  (preserve_main_context=true) 後も main 側の `auto_aspect` の samples /
+  cache gate / streak が維持されることを固定した。

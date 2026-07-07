@@ -29,7 +29,7 @@ use std::time::Instant;
 ///
 /// App 構造体に 1 つ保持し、フォルダ切替で `reset_for_new_generation()` を呼ぶ。
 /// 行動 (sample 取り込み・切替判定・cooldown 管理) は `App` の impl 側で行う。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AutoAspectState {
     /// このフォルダの items 世代。世代が変わったら全リセット。
     pub items_generation: u64,
