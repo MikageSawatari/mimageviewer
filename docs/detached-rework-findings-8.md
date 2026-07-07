@@ -143,6 +143,48 @@ ON モードで複数窓を切り替え中、窓をクリックしてもアク�
    passive ゼロでウォッチャ停止)。
 4. コミットに `(detached-rework findings-8 A1v3)` を含める。
 
+## A1-v4 (2026-07-07): 初回クリックの取りこぼしは down エッジの foreground 競合
+
+### 実機ログの事実 (bug-20260707-0128-input-probe.log、Fable 解析)
+
+- `active_input_probe stage=wheel_gate`: ホイールイベントが届いた **114 フレーム全てで
+  foreground_matches=true かつゲート通過** = active 側の受理ゲートは無実。
+- 失敗時はホイールが active 側に**そもそも届いていない** = 最初のクリックの
+  activation 自体が成立していない (窓は Parked のまま。フォーカスだけ来るので
+  ユーザーには「フォーカスしたのに動かない」に見える)。
+- watcher は down エッジを棄却したとき**何も記録しない**ため沈黙していた。
+
+### 機構 (確定度高)
+
+watcher の down エッジ判定は「**down エッジのサンプリング瞬間に
+`GetForegroundWindow()` == 対象窓**」を要求する。しかし未フォーカスの passive 窓を
+クリックした場合、**OS の foreground 切替はボタン down の数 ms 後**に完了するため、
+8ms ポーリングの down エッジ時点では foreground がまだ前の窓を指す → 候補にならず
+**初回クリックが黙って捨てられる**。2 回目のクリックは foreground が既に対象窓なので
+必ず成功 — 「もう 1 回クリックすると動く」と完全に一致。成功ログが全て
+foreground 一致なのも当然 (一致したものだけ成功するため)。
+
+### 修正指示
+
+1. down エッジの窓同定を **`WindowFromPoint(cursor)` → root HWND 化 → registry 照合**
+   に変更する (クリックされた窓の真実はカーソル下の窓であり、foreground の切替
+   タイミングに依存しない)。
+2. **foreground 一致の検証は up エッジ側へ移す** (クリック完了時点なら OS の
+   フォーカス切替は済んでいる。up 時に foreground ≠ 対象窓なら破棄 = クリックが
+   別窓に取られたケースの安全弁)。
+3. **watcher の棄却ログを追加**: down エッジでカーソルが passive 窓 rect 内なのに
+   候補化しなかった場合、理由付きで App へ診断イベントを送る (今回のような沈黙を
+   二度と起こさない)。
+4. テスト: 「down 時 foreground=旧窓・カーソル=対象窓 → up 時 foreground=対象窓」
+   のシーケンスで commit されることを純関数テストで固定 (今回の競合の再現)。
+5. コミットに `(detached-rework findings-8 A1v4)` を含める。
+
+### 監視項目 (未再現 1 回)
+
+窓 close 時に「ウィンドウの位置がおかしくちらつく」が 1 回発生 (2026-07-07 01:2x、
+その後未再現、動画 01-28-43.mkv には未収録の可能性大)。A2 可視化ゲートまたは
+close 時 placement 永続化との関連が候補。再発時に録画 + 即ログ退避で捕捉する。
+
 ### A1-v3 実装メモ (Codex, 2026-07-07)
 
 - A1-v2 の `focus_edge + GetAsyncKeyState` サンプリングは撤去。deferred callback は

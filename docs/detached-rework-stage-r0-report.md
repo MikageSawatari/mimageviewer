@@ -1,4 +1,4 @@
-# detached-rework Stage R0 report
+﻿# detached-rework Stage R0 report
 
 Stage instruction: [detached-rework-stage-r0.md](detached-rework-stage-r0.md)  
 Plan constitution: [detached-rework-plan.md §2](detached-rework-plan.md#2-%E6%86%B2%E6%B3%95-%E5%85%A8%E3%82%B9%E3%83%86%E3%83%BC%E3%82%B8%E5%85%B1%E9%80%9A%E3%81%AE%E4%B8%8D%E5%A4%89%E6%9D%A1%E4%BB%B6%E7%A6%81%E6%AD%A2%E4%BA%8B%E9%A0%85--%E6%9C%80%E9%87%8D%E8%A6%81)
@@ -126,9 +126,41 @@ Release build 後、`MIV_DETACHED_WINDOW_DEBUG=1` を付けて次を実行する
 - `[detached-r0] rect_capture_result`
 - 既存の `[detached-viewer] captured host`
 
+## Real-machine log findings (2026-07-05, Fable 解析)
+
+ログ: 約 90 秒のセッション、`[detached-r0]` 11,994 行。
+
+### 差分法の判定: **合格**
+
+- 窓生成イベント 8 件すべてで `created_count=1` (0 件でも 2 件以上でもない)。
+  class は全件 `"Window Class"` (winit)、title は内容を正しく反映
+  (`Page 17 - mimageviewer` 等)。副次窓 (IME / tooltip) の混入ゼロ。
+- `show_viewport_immediate` と**同一フレーム内**で after snapshot に新窓が現れる
+  (= 同期生成)。生成直後は `visible=false` で、後続フレームで可視化される。
+- `removed_count` は全件 0 = 旧窓は非同期に遅れて破棄される (既知の
+  「旧 host 生存のまま新窓が生える」挙動と一致)。生成時 diff には影響しない。
+- egui の窓再生成 (30.6s、keepalive_backstop → active_render の連続 2 生成) も
+  各生成が個別に `created_count=1` で捕捉できている。
+
+### 旧方式 (rect 捕捉) の破綻の実測: 振動バグの直接証拠
+
+- **同一 rect `(1443,383 2394x1514)` に異なる HWND が 9 個** (セッション累計) 観測
+  された。全 detached 窓が同じ保存 placement から seed されるため、複数窓が同一
+  矩形に重なるのは**常態**であり、rect 一致は原理的に窓を区別できない (BA-1)。
+- その帰結として `captured host` が **1 フレームごとに別 HWND を交互に捕捉**
+  (frame 4902: 0xe1062a → 4903: 0x1050a7e、以後 6331/6332、8257/8258、10313/10314
+  でも同パターン)。85 秒で host_generation が 17 まで増加。
+- stopgap (`active_host_matches_passive_window` → clear → 再捕捉) は誤捕捉を
+  検出するたびに clear + 再探索するが、再探索も同じ曖昧さの上にあるため
+  **clear→誤捕捉→clear のチャーンループ**になる。動画では host が入れ替わる
+  たびに presenter child の付け替え/placement 適用が起き、これが
+  「小刻みな左右振動」の力学。
+- 実機 smoke 中の「色々おかしい動き」は R0 計装 (ログのみ) の副作用ではなく、
+  この既存バグクラスそのもの。R1 で rect 捕捉ごと撤去されることで根治する見込み。
+
 ## Current status
 
 - Public API investigation: complete.
 - Prototype code: implemented as log-only instrumentation.
-- Real hardware log summary: pending user smoke.
-- R1 readiness: pending confirmation that `S1 - S0` is stable in the four smoke cases.
+- Real hardware log summary: **complete (上記)**。
+- R1 readiness: **確定** — `S1 - S0` 差分法を R1 の実装方式として採用する (ゲート A 通過)。
