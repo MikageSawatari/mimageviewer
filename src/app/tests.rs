@@ -19234,8 +19234,8 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fs_viewport_presentation, None);
         assert_eq!(
             app.detached_window_hwnd_raw_for_window_id(10),
-            0x1234,
-            "active->passive handoff keeps the same OS window registered for the passive renderer"
+            0,
+            "active->passive handoff must force the deferred renderer to re-confirm the HWND instead of trusting the immediate registry"
         );
     }
 
@@ -22144,7 +22144,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                activation_sample(true, 0x2000, 0x2000, Some((120, 130))),
+                activation_sample(true, 0x2000, 0x2000, Some((20, 30))),
                 &targets,
             ),
             None
@@ -22152,7 +22152,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                activation_sample(false, 0x2000, 0x2000, Some((120, 130))),
+                activation_sample(false, 0x2000, 0x2000, Some((20, 30))),
                 &targets,
             ),
             None,
@@ -22215,6 +22215,36 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn activation_watcher_requests_hwnd_repair_for_stale_registry() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x2000, 0x3000, Some((120, 130))),
+                &targets,
+            ),
+            None,
+            "down edge may see a newly recreated HWND under the cursor before the registry updates"
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample(false, 0x3000, 0x3000, Some((122, 131))),
+            &targets,
+        );
+        assert_eq!(
+            result.activation,
+            Some(DetachedActivationRequest {
+                window_id: 7,
+                repair_hwnd: Some(0x3000),
+            }),
+            "up edge should preserve activation and carry the observed HWND for App-side validation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn activation_watcher_consumes_park_origin_click_while_ineligible() {
         let mut state = DetachedActivationWatchState::default();
         let ineligible = [activation_target_rect(false)];
@@ -22266,6 +22296,50 @@ mod still_window_mode_key_tests {
             state,
             DetachedActivationWatchState::default(),
             "passive zero stops the watcher state instead of carrying a stale press"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_hwnd_liveness_clears_dead_registry_entry() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "parked-liveness",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let placement = app.detached_viewer_window_placement();
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 7,
+                texture,
+                title: "a.jpg - mimageviewer".to_string(),
+                location_display: "a.jpg".to_string(),
+                image_dims: Some((1, 1)),
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: None,
+            });
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_liveness");
+        app.set_detached_window_runtime_placement(7, placement, "test_liveness");
+        set_detached_host_for_test(&mut app, 7, 0x7000, false);
+
+        app.refresh_parked_detached_window_hwnd_liveness();
+
+        assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0);
+        assert_eq!(
+            app.detached_window_state(7),
+            Some(DetachedWindowState::Opening),
+            "dead parked HWNDs should re-enter Opening so the deferred callback can re-adopt"
         );
     }
 

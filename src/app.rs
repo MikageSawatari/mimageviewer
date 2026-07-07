@@ -417,6 +417,7 @@ pub(crate) struct DetachedActivationWatchSample {
 pub(crate) struct DetachedActivationClickCandidate {
     pub(crate) window_id: u64,
     pub(crate) hwnd: u64,
+    pub(crate) repair_hwnd: Option<u64>,
     pub(crate) start_screen_pos: Option<(i32, i32)>,
     pub(crate) moved_too_far: bool,
 }
@@ -440,9 +441,16 @@ pub(crate) struct DetachedActivationWatchDiagnostic {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedActivationRequest {
+    pub(crate) window_id: u64,
+    pub(crate) repair_hwnd: Option<u64>,
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DetachedActivationWatchStepResult {
-    pub(crate) activation: Option<u64>,
+    pub(crate) activation: Option<DetachedActivationRequest>,
     pub(crate) diagnostic: Option<DetachedActivationWatchDiagnostic>,
 }
 
@@ -456,7 +464,7 @@ struct DetachedActivationWatchCommand {
 pub(crate) struct DetachedActivationWatcher {
     #[cfg(not(test))]
     command_tx: std::sync::mpsc::Sender<DetachedActivationWatchCommand>,
-    activation_rx: std::sync::mpsc::Receiver<u64>,
+    activation_rx: std::sync::mpsc::Receiver<DetachedActivationRequest>,
     diagnostic_rx: std::sync::mpsc::Receiver<DetachedActivationWatchDiagnostic>,
 }
 
@@ -504,16 +512,16 @@ impl DetachedActivationWatcher {
         }
     }
 
-    fn drain_activation_requests(&self) -> Vec<u64> {
-        let mut ids = Vec::new();
+    fn drain_activation_requests(&self) -> Vec<DetachedActivationRequest> {
+        let mut requests = Vec::new();
         loop {
             match self.activation_rx.try_recv() {
-                Ok(id) => ids.push(id),
+                Ok(request) => requests.push(request),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        ids
+        requests
     }
 
     fn drain_diagnostics(&self) -> Vec<DetachedActivationWatchDiagnostic> {
@@ -531,7 +539,7 @@ impl DetachedActivationWatcher {
     #[cfg(not(test))]
     fn watch_thread(
         command_rx: std::sync::mpsc::Receiver<DetachedActivationWatchCommand>,
-        activation_tx: std::sync::mpsc::Sender<u64>,
+        activation_tx: std::sync::mpsc::Sender<DetachedActivationRequest>,
         diagnostic_tx: std::sync::mpsc::Sender<DetachedActivationWatchDiagnostic>,
     ) {
         let mut targets = Vec::new();
@@ -568,8 +576,8 @@ impl DetachedActivationWatcher {
             if let Some(diagnostic) = result.diagnostic {
                 let _ = diagnostic_tx.send(diagnostic);
             }
-            if let Some(window_id) = result.activation {
-                let _ = activation_tx.send(window_id);
+            if let Some(request) = result.activation {
+                let _ = activation_tx.send(request);
                 if let Some(ctx) = repaint_ctx.as_ref() {
                     ctx.request_repaint();
                 }
@@ -1057,6 +1065,36 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_activation_candidate_for_down_edge(
+        targets: &[DetachedActivationWatchTargetRect],
+        sample: DetachedActivationWatchSample,
+    ) -> Option<DetachedActivationClickCandidate> {
+        if let Some(target) =
+            Self::detached_activation_hit_test(targets, sample.cursor_root_hwnd, sample.cursor_pos)
+        {
+            return Some(DetachedActivationClickCandidate {
+                window_id: target.window_id,
+                hwnd: target.hwnd,
+                repair_hwnd: None,
+                start_screen_pos: sample.cursor_pos,
+                moved_too_far: false,
+            });
+        }
+        let target =
+            Self::detached_activation_target_containing_cursor(targets, sample.cursor_pos)?;
+        if !target.eligible || sample.cursor_root_hwnd == 0 {
+            return None;
+        }
+        Some(DetachedActivationClickCandidate {
+            window_id: target.window_id,
+            hwnd: sample.cursor_root_hwnd,
+            repair_hwnd: Some(sample.cursor_root_hwnd),
+            start_screen_pos: sample.cursor_pos,
+            moved_too_far: false,
+        })
+    }
+
+    #[cfg(windows)]
     fn detached_activation_target_containing_cursor(
         targets: &[DetachedActivationWatchTargetRect],
         cursor_pos: Option<(i32, i32)>,
@@ -1125,17 +1163,7 @@ impl App {
         let mut diagnostic = None;
 
         if down_edge {
-            state.active_click = Self::detached_activation_hit_test(
-                targets,
-                sample.cursor_root_hwnd,
-                sample.cursor_pos,
-            )
-            .map(|target| DetachedActivationClickCandidate {
-                window_id: target.window_id,
-                hwnd: target.hwnd,
-                start_screen_pos: sample.cursor_pos,
-                moved_too_far: false,
-            });
+            state.active_click = Self::detached_activation_candidate_for_down_edge(targets, sample);
             if state.active_click.is_none() {
                 diagnostic = Self::detached_activation_down_rejection_diagnostic(targets, sample);
             }
@@ -1154,7 +1182,7 @@ impl App {
         if up_edge && let Some(click) = state.active_click.take() {
             let target_still_exists = targets
                 .iter()
-                .any(|target| target.window_id == click.window_id && target.hwnd == click.hwnd);
+                .any(|target| target.window_id == click.window_id);
             let dragged = click.moved_too_far
                 || Self::detached_physical_activation_dragged_too_far(
                     click.start_screen_pos,
@@ -1179,7 +1207,10 @@ impl App {
                     sample,
                 ));
             } else {
-                activate = Some(click.window_id);
+                activate = Some(DetachedActivationRequest {
+                    window_id: click.window_id,
+                    repair_hwnd: click.repair_hwnd,
+                });
             }
         }
 
@@ -1196,7 +1227,70 @@ impl App {
         sample: DetachedActivationWatchSample,
         targets: &[DetachedActivationWatchTargetRect],
     ) -> Option<u64> {
-        Self::detached_activation_watch_step_result(state, sample, targets).activation
+        Self::detached_activation_watch_step_result(state, sample, targets)
+            .activation
+            .map(|request| request.window_id)
+    }
+
+    #[cfg(windows)]
+    fn detached_hwnd_is_unclaimed_egui_viewport_for_window(
+        &self,
+        window_id: u64,
+        hwnd: u64,
+    ) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        if !self.detached_window_hwnd_is_alive(hwnd) {
+            return false;
+        }
+        if self
+            .detached_window_runtimes
+            .iter()
+            .any(|(&id, runtime)| id != window_id && runtime.hwnd == hwnd)
+        {
+            return false;
+        }
+        let Some(main_hwnd) = self.main_hwnd else {
+            return false;
+        };
+        let windows = crate::dwm_transitions::thread_window_snapshot(
+            windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+        );
+        windows.iter().any(|entry| {
+            entry.hwnd_raw == hwnd
+                && !entry.is_main
+                && entry.class_name == Self::EGUI_VIEWPORT_CLASS
+        })
+    }
+
+    #[cfg(windows)]
+    fn repair_detached_window_hwnd_from_watcher(&mut self, window_id: u64, hwnd: u64) -> bool {
+        if !self.detached_hwnd_is_unclaimed_egui_viewport_for_window(window_id, hwnd) {
+            return false;
+        }
+        let previous = self.detached_window_hwnd_set(window_id, hwnd);
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Parked,
+            "watcher_repair_hwnd",
+        );
+        self.detached_viewer_host_generation =
+            self.detached_viewer_host_generation.saturating_add(1);
+        crate::logger::log(format!(
+            "[detached-viewer] hwnd_adopted_watcher hwnd=0x{hwnd:x} \
+             host_generation={} frame={} window_id={window_id} old={} new_state=\"{}\"",
+            self.detached_viewer_host_generation,
+            self.frame_counter,
+            previous
+                .map(|old| format!("0x{old:x}"))
+                .unwrap_or_else(|| "none".to_string()),
+            Self::win32_hwnd_debug_state(hwnd)
+        ));
+        if self.pending_detached_video_host_resync {
+            self.pending_detached_video_host_resync = !self.try_resync_detached_video_host();
+        }
+        true
     }
 
     #[cfg(windows)]
@@ -1217,6 +1311,36 @@ impl App {
                 })
             })
             .collect()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn refresh_parked_detached_window_hwnd_liveness(&mut self) {
+        let ids = self
+            .detached_image_windows
+            .iter()
+            .filter(|window| {
+                self.detached_window_state(window.id) == Some(DetachedWindowState::Parked)
+            })
+            .filter_map(|window| {
+                let hwnd = self.detached_window_hwnd_raw_for_window_id(window.id);
+                (hwnd != 0 && !self.detached_window_hwnd_is_alive(hwnd))
+                    .then_some((window.id, hwnd))
+            })
+            .collect::<Vec<_>>();
+        for (window_id, hwnd) in ids {
+            let cleared = self.clear_detached_window_hwnd_for_window_id(window_id);
+            self.transition_detached_window_state(
+                window_id,
+                DetachedWindowState::Opening,
+                "parked_hwnd_liveness",
+            );
+            self.log_detached_image_window_debug(format!(
+                "parked_hwnd_liveness_clear window_id={window_id} hwnd=0x{hwnd:x} \
+                 cleared={} frame={}",
+                cleared.is_some(),
+                self.frame_counter
+            ));
+        }
     }
 
     #[cfg(windows)]
@@ -1252,7 +1376,18 @@ impl App {
                 self.frame_counter
             ));
         }
-        for id in self.detached_activation_watcher.drain_activation_requests() {
+        for request in self.detached_activation_watcher.drain_activation_requests() {
+            let id = request.window_id;
+            if let Some(repair_hwnd) = request.repair_hwnd
+                && !self.repair_detached_window_hwnd_from_watcher(id, repair_hwnd)
+            {
+                self.log_detached_image_window_debug(format!(
+                    "deferred_activate_watcher_dropped id={id} reason=repair_failed \
+                     observed_hwnd=0x{repair_hwnd:x} frame={}",
+                    self.frame_counter
+                ));
+                continue;
+            }
             let can_activate = self.detached_image_windows.iter().any(|window| {
                 window.id == id
                     && window.can_activate()
@@ -24775,6 +24910,7 @@ impl App {
     #[cfg(windows)]
     fn handoff_active_detached_viewport_to_passive(&mut self, reason: &'static str) {
         let session_before = self.active_detached_session;
+        let handoff_window_id = session_before.map(|session| session.window_id);
         let shown_before = self.fs_viewport_shown;
         let presentation_before = self.fs_viewport_presentation;
         let host_before = self.detached_viewer_host_debug_state();
@@ -24790,6 +24926,14 @@ impl App {
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
         self.detached_active_viewport_rendered_frame = u64::MAX;
+        if let Some(window_id) = handoff_window_id
+            && let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(window_id)
+        {
+            self.log_detached_image_window_debug(format!(
+                "active_viewport_handoff_clear_host_for_deferred reason={reason} \
+                 window_id={window_id} hwnd=0x{hwnd:x}"
+            ));
+        }
         self.log_detached_image_window_debug(format!(
             "active_viewport_handoff_to_passive reason={reason} session_before={session_before:?} \
              shown_before={shown_before} presentation_before={presentation_before:?} \
@@ -45410,6 +45554,8 @@ impl eframe::App for App {
         // 細分計装: フルスクリーンビューポート関連の 3 段階を個別計測する
         // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
+        #[cfg(windows)]
+        self.refresh_parked_detached_window_hwnd_liveness();
         #[cfg(windows)]
         self.sync_deferred_detached_activation_watcher(ctx);
         #[cfg(windows)]
