@@ -650,6 +650,67 @@ fix4 の「操作系は非表示」をここで改訂)。② は **HUD ボタン
 - 回帰テスト: parked layout の spectrum rect、CloseOnly bar 分岐、HUD event 分類と
   activation 変換 (ToggleAudioMode が音声モードを実行しないこと) を固定。
 
+### fix6b/fix6c 検収 (Fable 2026-07-08): fix6b 合格 / fix6c は 1 点差し戻し → fix6c-2
+
+**fix6b (317ac6f2) = 合格**。承認条件 5 点すべて充足を確認: App 新規フィールドなし
+(`native_video_hud_dimmed_for_current_poll()` = 既存 `native_video_parked_live_input_window_id`
+からの導出のみ)・毎 poll 冪等送信で set/unset 対称 (parked poll 区間=true / 通常 poll=false)・
+SwitchPlacement 再構築時の再適用あり・dim は top bar 54px + bottom HUD 帯のみで
+`interactable(false)` = hit-test/挙動不変・時間窓なし・別コミット。
+(P3 polish、非ブロッキング: `set_hud_dimmed` は `set_checked` の `last_*` AtomicBool dedup
+パターンを持たず毎 poll channel 送信する。overlay 側 early-return で実害なし。fix6c-2 の
+ついでに直してよいが必須ではない。)
+
+**fix6c (3d87e253) = レイアウト一致 / 単一ヘッダ / CloseOnly / 簡易 HUD はすべて指示どおり。
+1 点差し戻し**:
+
+- **指摘: catch-all 分類がホイールをアクティブ化に変換してしまう**。presenter overlay は
+  **無修飾ホイールを `NavigateItem` に、Ctrl+ホイールを `TileColumnsDelta` に変換する**
+  ([native_presenter/mod.rs:4257-4267](../src/video/native_presenter/mod.rs))。このとき
+  `consumed_wheel` ([mod.rs:987-993](../src/video/native_presenter/mod.rs)) が raw
+  `Window(MouseWheel)` の二重転送を抑止するため、**実機のホイールは semantic イベント
+  だけが App に届く**。fix6c の分類 (`_ => true`) はこれを HUD クリック扱いにするので、
+  parked 動画窓上のホイールがアクティブ化に化ける = fix6c 要件 4「wheel/key は破棄のみ」
+  違反 (R2b F5 以来の「クリックのみ復帰」規則の退行)。fix6c 以前は `NavigateItem` が
+  blocked 側に落ちて no-op だった (= 従来の parked ホイール no-op の実体)。
+  追加したテストは `Window(MouseWheel)` しか検証しておらず、この実経路を検出できない。
+
+### fix6c-2 要件
+
+1. **推奨 (案 B): `NavigateItem` に起源を持たせて事実で判定する** (憲法 §5 の「事実で判定」)。
+   - `NativeOverlayCommand::NavigateItem` / `NativeVideoOutputEvent::NavigateItem` に
+     `via_wheel: bool` (または origin enum) を追加。発火点は 3 箇所のみ:
+     ホイール変換 ([native_presenter/mod.rs:4264](../src/video/native_presenter/mod.rs)) =
+     wheel、HUD 前/次項目ボタン ([mod.rs:6633 / 6659](../src/video/native_presenter/mod.rs)) =
+     button。マッピング ([video/mod.rs:1559](../src/video/mod.rs) /
+     [video/mod.rs:3249-3257](../src/video/mod.rs)) は素通しで伝搬。
+   - 既存 consumer ([native_video.rs:944 / 2695](../src/app/native_video.rs)) は origin を
+     無視して従来どおり動作 (アクティブ窓の挙動不変)。
+   - 分類関数: `NavigateItem { via_wheel: false, .. }` → activation / `via_wheel: true` →
+     破棄 (no-op)。`TileColumnsDelta` は **ホイール由来のみ** (Ctrl+ホイール) なので無条件で
+     activation 対象外 (false 側) に移す。
+   - 配管が予想外に大きくなる場合は代替 (案 A): `NavigateItem` / `TileColumnsDelta` を
+     両方 false 側に移す (= parked 中は前/次ボタンのクリックでアクティブ化しない制限を
+     実装メモに明記)。案 A を選ぶ場合は先に一言報告する。
+2. **テスト**: 実経路で書く —
+   - `NavigateItem { via_wheel: true }` (parked 中) → activation **されない** + 機能も実行
+     されない (no-op)。
+   - `NavigateItem { via_wheel: false }` (parked 中) → activation 変換 (案 B の場合)。
+   - `TileColumnsDelta` (parked 中) → activation されない。
+   - 既存の fix6c テスト (`parked_live_native_hud_commands_request_activation_only`) は維持
+     しつつ、上記を追加。
+3. (任意) fix6b の `set_hud_dimmed` に `last_*` dedup を追加 (上記 P3)。
+4. **既知の限界 (修正不要、実装メモに記載のみ)**: ブックマーク名編集モーダルの Enter 確定
+   (`SetBookmarkTitle`) はキー由来だがクリック起源 (OK ボタン) と共用のため activation 側の
+   まま。parked 窓でモーダルが開いたまま、という経路自体が事実上ない。
+
+### fix6c-2 の触ってよいファイル / コミット
+
+- `src/video/native_presenter/mod.rs` (NavigateItem 発火点への origin 付与のみ)、
+  `src/video/mod.rs` (enum + マッピング)、`src/app/native_video.rs` (分類)、
+  `src/app/tests.rs`、本 doc。
+- コミット `(detached-rework stage-audio fix6c-2)`。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
