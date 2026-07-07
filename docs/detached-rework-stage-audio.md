@@ -711,6 +711,67 @@ SwitchPlacement 再構築時の再適用あり・dim は top bar 54px + bottom H
   `src/app/tests.rs`、本 doc。
 - コミット `(detached-rework stage-audio fix6c-2)`。
 
+## 3.15 実機 FB (2026-07-08): fix6d = 音楽 chrome の parked/active パリティ + fix6b-2 = native 下 HUD 減光が効かない
+
+fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーンショット 4 枚):
+
+- **①** 音声 (音楽ビュー) 窓の parked と active で **上下 HUD の項目が違う**。
+  上部: active は [−][Row 30s][+][VST][表示切替][×] 等のボタン列 + タイトル (「タイトル /
+  ファイル名 (拡張子なし)」形式)、parked は タイトル (拡張子付きファイル名) + 「再生中」+ ×
+  のみ。下部: active はフル HUD (シークバー + 頭出し/再生/ループ/連続/前後マーカー/前後
+  ファイル + 時間 + 速度 + 音量 + Norm + dB)、parked は fix6c の簡易 HUD (R/||/L/C プレース
+  ホルダ)。**ユーザー意図 = 同じ項目構成を減光して表示** (fix6c-1 の「減光して表示」決定の
+  趣旨。簡易 HUD では不足)。
+- **②** 動画 parked 窓: **上バーは減光されるが下 HUD が減光されない** (fix6b の
+  `draw_native_hud_dim_overlay` は top/bottom 両方に dim 帯を重ねる実装で、コード上は
+  bottom も同座標・同フラグで描くはずのため、机上では原因未確定 → Phase 1 調査)。
+
+### fix6d 要件 (①、egui 側)
+
+1. **音楽ビュー chrome の単一ソース化**: active 音楽ビューの上部バー / 下部 HUD の描画を
+   「表示状態 struct (+ inert/dimmed flag)」を受け取る描画関数に切り出し、active
+   (`draw_fs_music_view`) と parked (`draw_parked_live_music_window`) の**両方から同じ関数を
+   呼ぶ** (今後項目が増えても構造的に乖離しない)。
+   - fix4 以来の「`draw_fs_music_view` の bundle 引き剥がしリファクタ禁止」は、**この
+     chrome 2 段の切り出しに限り解除**する (関数は bundle 非依存の入力 struct のみ受け取る
+     形に限る。timeline/パネル/入力処理の切り出しはしない)。
+2. parked 側の入力値: position/duration/playing は既存 info、再生速度など player 由来の
+   表示値が必要なら `ParkedLiveMusicWindowInfo` に read-only で追加 (position と同じ
+   bundle 読みパターン)。ループ/連続/音量/Norm は global (`video_loop_mode` /
+   `video_continuous_mode` / settings) から。
+3. parked 描画は **同項目・減光・inert** (クリックは復帰のみ、既存 activation 経路不変)。
+   タイトル表記も active と同形式に揃える。
+4. **× の重複回避**: parked の × は既存 CloseOnly ボタン
+   (`detached_image_window_bar_close_button_rect` 由来、watcher と単一ソース) を維持し、
+   パリティ chrome 側の × は parked では描かない (`show_close: false` 等の引数)。
+5. 中央領域は現状のまま (タイムライン非表示 + アイコン + クリック復帰ヒント、fix6 決定)。
+6. テスト: chrome 描画関数が active/parked で同じ入力 struct を使うことを型で保証した上で、
+   parked 側の状態値マッピング (global 設定 → struct) を純関数テストで固定。
+
+### fix6b-2 要件 (②、native 側 — Phase 1 調査 → 報告 → 修正)
+
+1. **Phase 1**: `hud_dimmed=true` で top 帯は効き bottom 帯が効かない機構を特定する。
+   候補: (a) `native_video_seek_hud` Area と dim Area の z-order が Area order memory で
+   期待と逆 (b) bottom 帯の rect / 座標系ズレ (c) `bottom_hud_visible` が render 時点で
+   false になる timing (d) HUD child window (hud_window.rs) 側の present 経路の関与
+   (e) そもそも parked presenter に dim=true が届いていない (top の「減光して見える」が
+   別要因)。必要なら dim 描画箇所に一時 debug ログ (hud_dimmed / top_visible /
+   bottom_visible / rect) を入れて実機 1 回で確定してよい。
+2. 特定後に修正。**dim 帯の重ね描きに固執しない** — HUD 描画色に dim 係数を直接適用する
+   方式への変更も可 (fix6d の音楽側と見た目の一貫性が出る)。挙動 (hit-test / command /
+   filter) は不変のまま。
+3. コミットは fix6d と分ける: `(detached-rework stage-audio fix6b-2)`。
+
+### fix6d/fix6b-2 の触ってよいファイル
+
+- fix6d: `src/ui_fullscreen.rs` (chrome 切り出し + parked 呼び出し)、`src/ui_music_panels.rs`
+  (HUD 描画の切り出し先がこちらの場合)、`src/app.rs` (`ParkedLiveMusicWindowInfo` 拡張)、
+  `src/app/tests.rs`、本 doc。
+- fix6b-2: `src/video/native_presenter/mod.rs` / `overlay_draw.rs`、(必要なら)
+  `src/app/native_video.rs` の診断ログ、`src/app/tests.rs`、本 doc。
+- fix6c-2 (NavigateItem origin) が未完なら**先に fix6c-2 を完了**してから着手する
+  (native_video.rs / mod.rs の同時編集を避ける)。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
@@ -729,13 +790,14 @@ SwitchPlacement 再構築時の再適用あり・dim は top bar 54px + bottom H
 3. 音声再生中に別窓クリック (park) → 再生継続 → クリック復帰 → 操作有効
 4. 音声窓がある状態で動画を開く → メディア窓が動画に差し替わる (逆も)
 5. VST ON で音声 detached → 音にチェーンが効いている / V キーの挙動が破綻しない
-6. (fix6/fix6c) 音声モード parked 窓: 別窓で PDF ホイール → 上グラフがちらつかない /
+6. (fix6/fix6c/fix6d) 音声モード parked 窓: 別窓で PDF ホイール → 上グラフがちらつかない /
    下 spectrum は動く / ヘッダ文字が二重にならない (タイトル 1 本 + × のみ) / spectrum の
-   位置が park⇄active で動かない / 下 HUD が減光表示されている / クリックでアクティブ化して
-   操作復帰
-7. (fix6b/fix6c) 映像 parked 窓: HUD が減光している (fix6b) / HUD ボタン (♪ 等) の上を
-   クリックしてもアクティブ化する (fix6c、機能は実行されない) / HUD 外クリックでも
-   アクティブ化する
+   位置が park⇄active で動かない / **上下 HUD の項目構成が active と同じで減光表示**
+   (fix6d) / クリックでアクティブ化して操作復帰
+7. (fix6b/fix6b-2/fix6c) 映像 parked 窓: **上バーと下 HUD の両方**が減光している / HUD
+   ボタン (♪ 等) の上をクリックしてもアクティブ化する (fix6c、機能は実行されない) /
+   HUD 外クリックでもアクティブ化する / **parked 窓上のホイールではアクティブ化しない**
+   (fix6c-2)
 8. (fix7) 本をアクティブにしたまま parked 音声/動画: 連続再生 ON で末尾 → 次へ自動進行 /
    連続再生 OFF → 停止 / どちらでもメイン (本) の一覧・フォルダが無傷
 6. OFF モード: 音声 F12 の 1 枚 detached が動作
