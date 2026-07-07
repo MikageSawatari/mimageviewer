@@ -2117,10 +2117,20 @@ impl App {
                     "[video-audio-vst] window toggle -> exit VST + still-window toggle (fs_idx={fs_idx})"
                 ));
                 self.exit_video_audio_vst(ctx, fs_idx);
-                self.toggle_still_window_mode();
+                self.toggle_egui_viewer_window_mode_for_input(ctx);
                 ctx.request_repaint();
                 return;
             }
+        }
+        #[cfg(windows)]
+        if let Some(fs_idx) = self.video_audio_mode
+            && self.fullscreen_idx == Some(fs_idx)
+        {
+            crate::logger::log(format!(
+                "[video-audio] window toggle while in audio mode -> egui viewer toggle (fs_idx={fs_idx})"
+            ));
+            self.toggle_egui_viewer_window_mode_for_input(ctx);
+            return;
         }
         if self.viewer_session_is_detached() {
             if self.video_tile_mode_active {
@@ -2178,6 +2188,22 @@ impl App {
         crate::logger::log(format!(
             "[fs] still-image window mode toggled -> in_window={in_window}"
         ));
+    }
+
+    /// egui で描く fullscreen viewer (静止画 / 音楽ビュー / 動画→音声モードの波形) の
+    /// F11/window ボタンを処理する。
+    ///
+    /// detached session 中は presentation を MainWindow/Fullscreen へ再解決せず、動画 detached と
+    /// 同じく detached 窓自体の borderless を切り替える。非 detached では従来どおり
+    /// embedded main window と fullscreen viewport を切り替える。
+    #[cfg(windows)]
+    pub(crate) fn toggle_egui_viewer_window_mode_for_input(&mut self, ctx: &egui::Context) {
+        if self.viewer_session_is_detached() {
+            self.toggle_detached_viewer_borderless_fullscreen(ctx);
+        } else {
+            self.toggle_still_window_mode();
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
     }
 
     /// Plan B: presenter から `PlacementSwitched` (切替成功) を受けたときに呼ぶ。
@@ -2506,7 +2532,7 @@ impl App {
             // VST モードを抜ける」。シェルを抜けて egui 音楽ビューへ戻り、ウィンドウ表示に切替える。
             if matches!(event, Ev::ToggleWindowMode) {
                 self.exit_music_vst_shell();
-                self.toggle_still_window_mode();
+                self.toggle_egui_viewer_window_mode_for_input(ctx);
                 ctx.request_repaint();
                 return;
             }
@@ -2545,7 +2571,7 @@ impl App {
                 }
                 Ev::ToggleWindowMode => {
                     self.exit_video_audio_vst(ctx, fs_idx);
-                    self.toggle_still_window_mode();
+                    self.toggle_egui_viewer_window_mode_for_input(ctx);
                     ctx.request_repaint();
                     return;
                 }

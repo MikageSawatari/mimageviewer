@@ -146,6 +146,59 @@ supports_session / F12 / メディア 1 本 / music_* 非 bundle 化 invariant /
   press→release のクリックだけで復帰する。key / wheel は activation 入力に渡さない
   設計をテストで固定。
 
+## 3.7 検収指摘 fix2 (実機 2026-07-07): F11 相互作用の 2 バグ
+
+実機 (b2063ef3 ビルド) で新規 2 件。いずれも F11 との相互作用。
+
+### 症状 A: 複数ウィンドウモードの音声窓が F11 往復でメインウィンドウ内に戻る
+
+- ON モードで音声をダブルクリック → メディア窓 (detached) で再生開始 = 正常。
+- その窓で **F11 → F11 (フルスクリーン往復) すると、音声がメインウィンドウ内の
+  表示に変わってしまう**。同じ操作を動画で行うと detached のまま = 動画は正しい。
+- Fable の初期調査: detached 中の F11 は本来
+  `toggle_detached_viewer_borderless_fullscreen` (detached 窓自体のボーダレス化、
+  presentation 不変) に行くべき。音声 (音楽ビュー) のキー配線がこの dispatch に
+  乗らず、main fullscreen 系の経路 (presentation 再解決) に流れている疑い。
+  音楽ビューのキー処理は歴史的に「main viewport 前提」だった (Phase S 指摘の
+  fs_music_view_active 系) ので、F11 の分岐がその残りである可能性が高い。
+- 修正方針: **音声 detached 中の F11 を動画と同じ dispatch に合流させる**
+  (presentation を再解決しない)。音声専用分岐・新フラグを足さない (憲法 3)。
+
+### 症状 B: 動画の音声モード (♪) × F11 で音声モードが壊れる
+
+- 動画再生中に ♪ (音声モード、Inc7) → 音楽ビュー表示 = 正常。
+- そこで **F11 を押すと動画表示に戻り、以後 ♪ を押しても音声モードに切り替え
+  できなくなる** (トグル不能の固着)。
+- 候補: F11 の遷移が `video_audio_mode` (hidden presenter 方式) の enter/exit
+  状態機械を経由せずに presenter を un-hide し、内部状態 (video_audio_mode /
+  hidden presenter / fs_music_view_active 前提) が desync している。
+  Inc7 の enter gate が「既に音声モード扱い」等で弾いている可能性。
+- 修正方針: F11 は音声モードを**維持したまま** borderless/fullscreen を切り替えるか、
+  exit するなら正規の exit 経路 (Z/Esc と同じ teardown) を通す。どちらの仕様に
+  するかは実装前に一言提案してよい (Fable 承認は不要、報告のみ。ただし
+  「固着して再入不能」は必ず解消)。
+- 注意: これは音楽統合 (Inc7) の状態機械に触れる。docs/music-integration-plan.md の
+  該当節 (7-hidden / 7e-vst) を読み、hidden presenter の enter/exit 対称性を壊さない。
+
+### fix2 要件
+
+1. 症状 A: 音声 detached 中の F11 往復で presentation が DetachedWindow のまま。
+   回帰テスト (音声 + F11 往復で presentation 不変。動画の既存挙動も不変)。
+2. 症状 B: ♪ → F11 → ♪ の往復が何度でも成立 (固着なし)。回帰テスト
+   (video_audio_mode の enter/exit が F11 を挟んでも対称)。
+3. コミット `(detached-rework stage-audio fix2)` (fix1 と別コミットでよい)。
+
+### fix2 実装メモ (Codex 2026-07-07)
+
+- F11 / 音楽ビュー上バーの window ボタンを `toggle_egui_viewer_window_mode_for_input` に集約。
+  detached session 中は presentation を再解決せず `toggle_detached_viewer_borderless_fullscreen`、
+  非 detached では従来どおり `toggle_still_window_mode`。
+- 動画→音声モード (`video_audio_mode`) 中の F11 は hidden presenter の placement switch へ流さず、
+  egui 音楽ビューの window-mode 切替として処理する。`video_audio_mode` は保持し、映像復帰は
+  `exit_video_audio_mode` だけが行う。
+- 音楽 VST shell / 動画→音声 VST shell の window-toggle も同 helper に寄せ、detached 音声の
+  VST 中 F11 でも MainWindow へ戻さない。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)

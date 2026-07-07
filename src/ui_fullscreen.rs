@@ -9459,15 +9459,7 @@ impl App {
                     .keymap
                     .consume_action_no_repeat(ctx, KeyAction::FsToggleWindowMode)
             {
-                if self.viewer_session_is_detached() {
-                    self.toggle_detached_viewer_borderless_fullscreen(ctx);
-                } else {
-                    self.toggle_still_window_mode();
-                    // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの
-                    // render_fullscreen_viewport で起きる。ホバーバーボタンと
-                    // 同じく ROOT ビューポートの再描画を明示要求する。
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
-                }
+                self.toggle_egui_viewer_window_mode_for_input(ctx);
             }
         }
 
@@ -20894,7 +20886,7 @@ impl App {
             self.music_view_close_requested = true;
         }
         if win_clicked {
-            self.toggle_still_window_mode();
+            self.toggle_egui_viewer_window_mode_for_input(ctx);
         }
         #[cfg(windows)]
         if back_to_video_clicked {

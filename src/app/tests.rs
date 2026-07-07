@@ -17469,6 +17469,117 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn audio_detached_f11_toggles_borderless_without_leaving_detached() {
+        // Stage AUDIO fix2: 音声ファイルの detached 音楽ビューで F11 / 上バーの window ボタンを
+        // 押しても MainWindow/Fullscreen へ再解決せず、detached 窓自体の borderless を切り替える。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.fullscreen_idx = Some(audio);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(9, DetachedSource::Audio);
+        app.settings.video_in_window_mode = false;
+
+        app.toggle_egui_viewer_window_mode_for_input(&ctx);
+
+        assert_eq!(
+            app.viewer_presentation,
+            ViewerPresentation::DetachedWindow,
+            "audio detached F11 must keep the detached presentation"
+        );
+        assert!(
+            !app.settings.video_in_window_mode,
+            "detached F11 must not flip the main/fullscreen preference"
+        );
+        assert_eq!(
+            app.detached_viewer_borderless_transition
+                .as_ref()
+                .map(|t| t.target_borderless),
+            Some(true),
+            "first F11 should request borderless enter on the detached window"
+        );
+
+        app.detached_viewer_borderless_transition = None;
+        app.detached_viewer_borderless_fullscreen = true;
+        app.toggle_egui_viewer_window_mode_for_input(&ctx);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(
+            app.detached_viewer_borderless_transition
+                .as_ref()
+                .map(|t| t.target_borderless),
+            Some(false),
+            "second F11 should request borderless exit without changing presentation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_audio_mode_f11_keeps_audio_mode_and_avoids_native_switch() {
+        // Stage AUDIO fix2: 動画→音声モードでは F11 を hidden presenter の rebuild 経路へ流さず、
+        // egui 音楽ビューの window-mode 切替として処理する。video_audio_mode は保持され、後続の
+        // ♪/Z で exit/enter を繰り返せる状態のままにする。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.video_in_window_mode = false;
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = None;
+
+        app.toggle_video_window_mode_for_input(&ctx);
+
+        assert_eq!(
+            app.video_audio_mode,
+            Some(video),
+            "F11 must not exit or corrupt video audio mode"
+        );
+        assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+        assert!(app.settings.video_in_window_mode);
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "audio-mode F11 must not start a native presenter placement switch"
+        );
+
+        app.toggle_video_window_mode_for_input(&ctx);
+
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+        assert!(!app.settings.video_in_window_mode);
+        assert!(app.native_video_mode_switch.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_video_audio_mode_f11_toggles_borderless_without_unhiding_presenter() {
+        // DetachedWindow の動画→音声モードでも F11 は presentation 切替ではなく、detached 窓の
+        // borderless 切替に寄せる。hidden presenter を show / SwitchPlacement するのは
+        // exit_video_audio_mode だけの責務。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(11, DetachedSource::Video);
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = None;
+
+        app.toggle_video_window_mode_for_input(&ctx);
+
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.native_video_mode_switch.is_none());
+        assert_eq!(
+            app.detached_viewer_borderless_transition
+                .as_ref()
+                .map(|t| t.target_borderless),
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn continuous_autoadvance_keeps_presentation_over_open_in_window_setting() {
         // 「画像・動画を別ウィンドウで開く」ON でも、連続再生の自動次送りでは直前の動画の
         // presentation を維持する (別ウィンドウのちらつきを出さない)。手動 open は従来どおり
