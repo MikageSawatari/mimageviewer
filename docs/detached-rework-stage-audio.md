@@ -348,6 +348,276 @@ FB。音楽機能は次リリースの目玉なので、park 中の表示を通�
 - ParkedLive 中の操作は引き続き有効化しない。timeline の seek outcome は無視し、
   クリック復帰のみの規則を維持する。
 
+## 3.12 検収指摘 fix6 (実機 2026-07-08): 非アクティブ窓の合図がなく、音声 parked のタイムラインがちらつく
+
+実機 (ゲート C smoke) で 3 症状:
+
+- **①** 動画を音声モードにして別窓で PDF を開き、PDF 窓でホイールすると、音声モード
+  parked 窓の上側グラフが一瞬「縦に太い波形」に化ける。原因 =
+  `draw_parked_live_music_window` ([ui_fullscreen.rs:3875-3887](../src/ui_fullscreen.rs)) の
+  `draw_parked_live_music_timeline() || draw_parked_live_music_waveform()` で、timeline が
+  `displayed_texture_rows == 0` の frame に静的波形フォールバックへ落ちる (fix5 の副作用)。
+- **②** 音声モード窓に戻る (アクティブ化) と中身のレイアウトが変わって気になる。上部 HUD の
+  内容が変わるのは可だが、ヘッダのサイズは固定にしたい。
+- **④** 複数窓で映像窓をタスクバー等で前面化して ♪ を押しても効かない。実機機構 = parked
+  映像窓は presenter イベントが `native_video_event_blocked_by_parked_live_filter`
+  ([native_video.rs:2487](../src/app/native_video.rs)) で左クリック (= アクティブ化) 以外
+  破棄され、既に「1 クリックでアクティブ化してから操作」モデルだが**視覚的な合図がない**
+  だけ (= ユーザーは「効かない」と誤認する)。
+
+**ユーザー決定 (2026-07-08)**: 非アクティブ窓は HUD を減光して「1 クリックで有効化」を
+視覚化する。**全体グレーではなく HUD 部分 / ボタンの明度を下げる**。音声 parked 窓は
+上側タイムラインを隠すが、**下側スペクトラムは動かし続ける** (再生中が分かる)。
+アクティブ化ロジック (watcher / parked-live filter) は変えない = **視覚のみの修正**。
+
+### fix6 要件
+
+**"非アクティブ" の位置づけ (述語不要)**: passive/parked 窓の描画経路
+`draw_parked_live_music_window` / `draw_detached_image_window_bar` は本質的に**非アクティブ
+窓の描画** (アクティブ窓は active viewport = `draw_fs_music_view` / native presenter で描く)。
+よって egui 側は「アクティブか」の述語や新規 bool を足さず (憲法 §3)、これらの描画関数は
+常時 dim + タイムライン非表示でよい。
+
+1. **音声モード parked 窓 (`draw_parked_live_music_window`, egui)**:
+   - 上側タイムライン (`draw_parked_live_music_timeline` と静的波形フォールバック
+     `draw_parked_live_music_waveform`) を **parked 中は描画しない** → **① のちらつきが
+     構造的に消える** (フォールバック経路そのものが無くなる)。中央領域は暗色 +
+     「クリックで操作に戻る」等のヒントのみ。
+   - 下側スペクトラム (`music_spectrum.draw`) は**継続描画**。poll 側の解析更新
+     (`update_parked_live_audio_music_view_state`) は不変で spectrum が動き続けること
+     (アクティブ化した瞬間タイムラインも即出せるよう、解析は止めない)。
+   - 上部情報バー (ヘッダ) は減光 (テキスト/背景の明度を下げる)。**ヘッダ高さ (54px) は
+     固定** (parked/active でヘッダ配置が動かない)。クリック復帰ヒントは維持。
+2. **画像/本 passive 窓 (`draw_detached_image_window_bar`, egui)**:
+   - passive バー / ボタンの明度を下げる (一貫性のため)。バーの高さ・配置は不変。
+3. **映像再生中 parked 窓 (native presenter HUD)** — **Phase 0 調査 → Fable 承認 → 実装**:
+   - presenter の HUD は presenter 内の HUD ウィンドウで egui 描画される。以下を調査して
+     報告する: (a) active/parked を presenter へどう伝えるか (既存 `set_native_*` パターンに
+     dim flag を足せるか)、(b) parked 中に HUD が実際に描かれるか、(c) dim を HUD の egui
+     描画側で色/alpha に反映する最小の差し込み点。
+   - 承認後、HUD を減光する dim 経路を追加 (**全体でなく HUD 部分 / ボタン明度**)。ボタンは
+     既に inert (parked-live filter) なので**挙動は変えない = 視覚のみ**。
+   - **承認前に `src/video/native_presenter/` を触らない** (native は Phase 0 制、憲法 §7)。
+
+### 禁止 / 注意
+
+- 減光は「アクティブか否か」の状態ベース。**時間窓 / フェードで競合を吸収しない** (憲法 §5)。
+  見た目のフェードは競合吸収目的でないなら任意だが、まずは即切替で実装する (混乱回避)。
+- `draw_fs_music_view` の bundle 引き剥がしリファクタは禁止 (fix4 と同方針)。
+- スコープは dimming + parked タイムライン非表示のみ。activation ロジックは変えない (§7)。
+
+### テスト
+
+- 音声 parked 窓の描画分岐: parked 中は timeline 描画を呼ばず spectrum のみ、が分かる形で
+  検証する (「timeline を描くか」の導出を純関数に切り出してテスト、または描画呼び出しの
+  有無を検証)。
+- 既存の fix1/fix3/fix4 テスト (音声識別・クリックのみ復帰・video_audio_mode 維持) を維持。
+- (native dim は Phase 0 承認後、可能なら dim flag 導出をユニットテスト)
+
+### 触ってよいファイル
+
+- `src/ui_fullscreen.rs` (`draw_parked_live_music_window`, `draw_detached_image_window_bar`)
+- `src/app.rs` (描画分岐 helper が必要な場合)
+- `src/app/tests.rs`
+- (Phase 0 承認後) `src/video/native_presenter/`, `src/app/native_video.rs`
+- `docs/detached-rework-stage-audio.md` (実装メモ)
+
+### コミット
+
+`(detached-rework stage-audio fix6)`。native presenter dim は承認後に別コミット `fix6b` へ
+分けてよい (egui 分を先に出す)。
+
+### fix6 実装結果 (Codex 2026-07-08) + 検収 (Fable 2026-07-08、机上合格 → 実機 NG は §3.14 fix6c へ)
+
+コミット = `a5c5fa50` (src/ui_fullscreen.rs のみ)。
+
+- `draw_parked_live_music_timeline` / `draw_parked_live_music_waveform` を**関数ごと削除**
+  (残参照 0 件確認) → ① のフォールバック経路が構造的に消滅。
+- レイアウト導出を純関数 `parked_live_music_window_layout` に切り出し
+  (`draw_timeline` / `draw_waveform_fallback` は常に false を返す構造で不変条件を明文化、
+  描画側 debug_assert + テスト 2 本で固定)。
+- ヘッダは `PARKED_LIVE_MUSIC_TOP_H = 54.0` 定数で固定 (テストで assert) + 減光
+  (タイトル gray 220→160、ラベル/ヒント減光、背景 alpha 90→132)。
+- 中央領域 = 音符アイコン + 「クリックで操作に戻る」+ 再生位置 (`format_duration_mm_ss`)。
+- 下側 spectrum は継続描画 (`show_spectrum` 時、band の 34% / max 180px)。poll 側
+  (`update_parked_live_audio_music_view_state`) は不変 = 解析継続。
+- passive バー (`draw_detached_image_window_bar`) = 背景 alpha 200→150・区切り線 60→34・
+  × ボタン (150,42,42,205 / 48,48,48,160)・タイトル文字 235→168 に減光。高さ・配置不変。
+- 検収確認: 憲法 §3 (App 新規 bool なし・layout 構造体はローカル値のみ) / §5 (時間窓・
+  フェードなし、即切替) / §7 (スコープ内 1 ファイルのみ) / §8 (fix1/fix3/fix4 テスト無傷、
+  src/app/tests.rs の parked_live 系 7 本不変)。tests/ui_snapshot.rs に detached/parked 系
+  スナップショットは無く配色変更の snapshot 回帰なし。テスト 3224 pass (--bin)。
+
+### fix6b Phase 0 承認 (Fable 2026-07-08): native presenter HUD 減光
+
+Codex の Phase 0 報告 (parked 状態は App 側 `native_video_parked_live_input_window_id` から
+導出し、既存 `set_native_*` / overlay 系で dim flag を presenter へ渡す。parked 中も
+presenter/HUD は生きており、ボタンは filter で既に inert = 視覚のみで実現可能) を**承認**。
+実装条件:
+
+1. **App に新規フィールドを作らない** (憲法 §3)。dim は既存 parked 状態からの導出のみ。
+   flag の保存先は presenter/overlay 側 (`set_native_loop_enabled` 等と同じパターン)。
+2. **set/unset の対称性に注意**: `native_video_parked_live_input_window_id` は parked poll
+   区間だけ Some になる一時フィールド。parked poll 区間で dim=true、アクティブ側の通常
+   poll / 復帰遷移で dim=false を冪等に送る (毎 poll set で可)。**復帰後に dim が残る /
+   アクティブ窓が dim になる取りこぼしがないこと**をテストまたはログで確認する。
+3. 減光は HUD 部分/ボタンの明度のみ (映像フレームは減光しない)。hit-test・イベント挙動は
+   不変 (視覚のみ)。
+4. 時間窓/フェードで切替を吸収しない (憲法 §5)。即切替。
+5. 別コミット `(detached-rework stage-audio fix6b)`。
+
+## 3.13 検収指摘 fix7 (実機 2026-07-08): parked 中のメディアが EOF で次へ進まない
+
+実機: 画像 (本) をアクティブにしたまま別窓で音声/動画を parked 再生していると、末尾に
+達しても次のメディアへ進まない。ユーザー要望 = 「動画/音楽を聞きながら本を読む」用途に
+対応したい。
+
+**機構**: `poll_parked_live_detached_windows` ([app.rs:26220-26227](../src/app.rs)) が parked
+poll の間 `video_continuous_mode = Off` を強制 → `poll_video` 内の連続再生 EOF ハンドラが
+発火しない。これは R2b の「ParkedLive は EOF 自動進行なし」仕様。
+
+**ユーザー決定 (2026-07-08)**: **連続再生設定が ON のときだけ** parked 窓でも次メディアへ
+進める (アクティブ窓と同じ挙動)。設定 OFF なら従来どおり停止。
+
+### fix7 要件 — **Phase 0 調査 → Fable 承認 → 実装** (挙動変更・リスクあり)
+
+1. **Phase 0 調査 (先に報告)**: parked bundle を swap-in した状態
+   (`swap_viewer_context_bundle`) で連続再生 EOF ハンドラ
+   (`handle_video_audio_mode_continuous_eof` / `handle_music_continuous_eof` /
+   `handle_video_continuous_eof`) を走らせたときに:
+   - (a) 次メディアへの source-swap が **parked 窓内で完結**するか (音声モードの hidden
+     presenter source-swap が parked 状態でも成立するか)。
+   - (b) アクティブ (本) 文脈 (`items` / `current_folder` / `auto_aspect` / `fullscreen_idx`)
+     を**汚さない**か。
+   - (c) parked 状態 (`ParkedLive`) と音声モード (`video_audio_mode`) が**維持**されるか。
+   - (d) `video_continuous_mode = Off` 強制を外す/条件化したときの影響範囲。
+   を調査し、安全に実装できる形を報告する。危険なら代替 (parked 専用の軽量 EOF 進行 helper)
+   を提案する。
+
+2. **実装 (承認後)**: parked poll で `video_continuous_mode` をユーザー設定尊重にし
+   (無条件 Off をやめる)、parked 窓の EOF で次の表示順メディア (動画/音声) を parked
+   bundle の player へ source-swap する。窓は `ParkedLive` のまま、音声モードなら音声モード
+   維持。**連続再生 ON のときのみ**進行。アクティブ窓の EOF (Inc7-eof) は不変。
+
+### 禁止 / 注意
+
+- 進行の要否は `video_continuous_mode` 設定 + EOF 状態から導出 (新規 bool 禁止、憲法 §3)。
+- アクティブ (本) 文脈を奪わない (findings-6/12/17 と同じ不変条件)。
+- スコープは parked EOF 進行のみ (§7)。
+
+### テスト
+
+- シーケンス: parked 音声窓 + 連続再生 ON → EOF → 次メディアへ source-swap
+  (`ParkedLive` 維持・音声モード維持・アクティブ本文脈の `items`/`current_folder`/
+  `auto_aspect` 不変)。
+- 連続再生 OFF → EOF → 停止 (進まない)。
+- アクティブ側文脈不変の回帰 (findings-12/17 と同型)。
+
+### 触ってよいファイル
+
+- `src/app.rs` (`poll_parked_live_detached_windows`、parked EOF 進行 helper)
+- `src/app/native_video.rs` (parked source-swap が必要な場合)
+- `src/app/tests.rs`
+- `docs/detached-rework-stage-audio.md` (実装メモ)
+
+### コミット
+
+`(detached-rework stage-audio fix7)`。fix6 とは**別コミット必須** (挙動変更)。
+
+## 3.14 検収指摘 fix6c (実機 2026-07-08): fix6 の実機 NG 3 件 — 多重ヘッダ / スペクトラム位置ずれ / HUD クリック不発
+
+fix6 (a5c5fa50) の実機 smoke で 3 症状。①②は fix6 が顕在化させた構造問題、③は fix6 指示書の
+前提誤り (Fable の診断漏れ)。いずれも機構確定済み:
+
+- **①-1 音声 parked の上部文字が多重表示 (減光も知覚されない)**: ParkedLive 窓の描画
+  ([ui_fullscreen.rs:4514-4530](../src/ui_fullscreen.rs)) は `draw_parked_live_music_window`
+  (54px ヘッダ = メタデータタイトル + 再生中 + 右端ヒント) の**上に**
+  `draw_detached_image_window_bar` (44px バー = ファイル名 + ×) を**無条件で重ね描き**する。
+  ヘッダ 2 枚 + 別文字列 2 本。fix4 当時からの潜在問題だが、旧バー背景 alpha 200 が下の
+  文字を隠していた。fix6 の減光 (alpha 150) で透けて顕在化した退行。
+- **①-2 スペクトラム位置ずれ + 下 HUD 消失**: アクティブ音楽ビュー
+  ([ui_fullscreen.rs:20583-20634](../src/ui_fullscreen.rs)) は spectrum を
+  「窓下端 − `MUSIC_HUD_HEIGHT`(62) − 4」に置くが、parked layout は「窓下端 − 24」+
+  高さ式も別 (band 34% vs 「timeline 120px を残して伸縮」)。park の瞬間に spectrum が
+  約 42px 下へジャンプ。fix4 の目的 (park で見た目を変えない) に反する。
+- **② 映像 parked 窓の HUD クリック (♪ 等) でアクティブ化しない**: activation capture は
+  生の左クリック `Window(MouseButton(Left))` ([native_video.rs:2459](../src/app/native_video.rs))
+  のみ。HUD ボタン上のクリックは HUD 側 egui が消費し**セマンティックイベント**
+  (ToggleAudioMode 等) として届くため、filter ([native_video.rs:2478](../src/app/native_video.rs))
+  が黙って破棄するだけで activation に変換されない。fix6 指示書の「1 クリックで
+  アクティブ化モデルは既に動いている」は HUD 領域については誤りだった。
+- (参考) 「映像窓の HUD 減光が効かない」は fix6b 未実装のため期待どおり。fix6c の対象外。
+
+**ユーザー決定 (2026-07-08)**: ①-2 は**下 HUD を減光して表示** (帯確保だけでなく描画する。
+fix4 の「操作系は非表示」をここで改訂)。② は **HUD ボタン上のクリックも 1 クリックで
+アクティブ化に変換** (ボタンの機能は実行しない。キー/ホイールは従来どおり無視 =
+クリックのみ復帰の規則は維持)。
+
+### fix6c 要件
+
+1. **多重ヘッダ解消 (単一ヘッダ化)**:
+   - ParkedLive 音楽窓 (call site [ui_fullscreen.rs:4518-4529](../src/ui_fullscreen.rs)) では
+     `draw_detached_image_window_bar` の**バー背景 + ファイル名テキストを描かず、× ボタン
+     のみ**描画する (引数 or 別 helper 切り出し。App の新規フィールドではないので憲法 §3 OK)。
+   - × ボタンの rect は引き続き `detached_image_window_bar_close_button_rect()` から導出
+     (watcher の × hit 判定との単一ソース、findings-15 G2 のテストを壊さない)。
+   - 音楽ヘッダ右端のヒントテキストは × ボタンと重なるため**削除** (中央の
+     「クリックで操作に戻る」ヒントは fix6 で入っており維持)。
+   - 画像/PDF passive 窓 (音楽表示なし) のバーは fix6 のまま不変。
+2. **parked レイアウトをアクティブ音楽ビューと一致させる**:
+   - `parked_live_music_window_layout` を active 側 (20583-20634) と同じ式に:
+     `band_top = top + 54` (fix6 の +8 を撤去)、`band_bottom = bottom − MUSIC_HUD_HEIGHT − 4`、
+     `spectrum_h = 180.min(band_h − 8 − 120)` (TIMELINE_MIN_H 予約を含め**完全同一** =
+     同一窓サイズで spectrum rect が active と画素一致)。gutter 式は既に同一。
+   - 可能なら式を小さな共有 helper / 共有 const に切り出して両者から使う (draw_fs_music_view
+     の bundle 引き剥がし大規模リファクタは引き続き禁止。式の共有だけにする)。
+3. **下 HUD を減光して描画** (①-2 のユーザー決定):
+   - parked 音楽窓の下端 `MUSIC_HUD_HEIGHT` 帯に HUD を減光描画する。シークバー位置は
+     info (position/duration) から。操作は不能のまま (クリックは復帰動作、変更しない)。
+   - 既存の音楽 HUD 描画が info + 設定だけで描けるなら流用 + dim。bundle/player への依存が
+     強く引き剥がしが必要なら、**見た目相当の簡易 HUD** (シークバー + 主要ボタンの減光
+     描画) で可 (fix4 の簡易描画と同じ路線)。どちらを選んだか実装メモに記載する。
+4. **HUD クリック → アクティブ化** (② のユーザー決定、`src/app/native_video.rs` = App 側のみ):
+   - `NativeVideoOutputEvent` の variant を棚卸しし、(a) ライフサイクル/ステータス系
+     (PlacementSwitched 系は既に allowed。FirstFramePresented / エラー通知等があれば
+     **絶対に activation にしない**) と (b) **ユーザーのクリック起点で発生する HUD 操作
+     イベント**に分類する。分類は純関数にしてテストで固定。
+   - parked-live filter で (b) を破棄する際に activation 要求へ変換する (既存の
+     `native_video_parked_live_activation_requests` push + dedup を流用。機能自体は実行しない)。
+   - wheel / key / hover 由来のイベントは従来どおり破棄のみ (クリックのみ復帰の規則維持)。
+   - presenter (`src/video/native_presenter/`) は触らない (fix6b の範囲)。
+
+### 禁止 / 注意
+
+- App に新規 bool / Option フィールドを足さない (憲法 §3)。描画分岐は関数引数 / ローカルで。
+- 時間窓禁止 (憲法 §5)。
+- スコープは上記 4 点のみ (憲法 §7)。fix6b (native HUD dim) は別コミットのまま独立。
+- 既存テスト (fix1/fix3/fix4/fix6/findings-15) を弱体化しない (憲法 §8)。
+
+### テスト
+
+- レイアウト一致: 同一 rect 入力で parked layout の spectrum rect が active 式の値と一致
+  することを固定 (共有 helper 化した場合はその helper のテスト)。
+- 単一ヘッダ: ParkedLive 音楽窓ではバー背景/テキストを描かず × のみ、の分岐を引数/純関数
+  レベルで固定。`detached_image_window_bar_close_button_rect` 由来の × rect が不変であること。
+- HUD イベント分類: クリック由来 → activation 変換 / ステータス系 → 変換しない /
+  wheel・key → 変換しない、を variant 網羅でテスト。
+- 既存の parked_live 系テスト 7 本 + fix6 layout テスト 2 本を維持 (fix6 テストは
+  レイアウト式変更に合わせた期待値更新のみ可)。
+
+### 触ってよいファイル
+
+- `src/ui_fullscreen.rs` (`draw_parked_live_music_window` / `parked_live_music_window_layout` /
+  `draw_detached_image_window_bar` とその call site / 共有レイアウト helper)
+- `src/app/native_video.rs` (イベント分類 + activation 変換)
+- `src/app.rs` (helper が必要な場合)
+- `src/app/tests.rs`
+- `docs/detached-rework-stage-audio.md` (実装メモ)
+
+### コミット
+
+`(detached-rework stage-audio fix6c)`。fix6b (native presenter HUD dim) とは別コミット。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
@@ -366,4 +636,13 @@ FB。音楽機能は次リリースの目玉なので、park 中の表示を通�
 3. 音声再生中に別窓クリック (park) → 再生継続 → クリック復帰 → 操作有効
 4. 音声窓がある状態で動画を開く → メディア窓が動画に差し替わる (逆も)
 5. VST ON で音声 detached → 音にチェーンが効いている / V キーの挙動が破綻しない
+6. (fix6/fix6c) 音声モード parked 窓: 別窓で PDF ホイール → 上グラフがちらつかない /
+   下 spectrum は動く / ヘッダ文字が二重にならない (タイトル 1 本 + × のみ) / spectrum の
+   位置が park⇄active で動かない / 下 HUD が減光表示されている / クリックでアクティブ化して
+   操作復帰
+7. (fix6b/fix6c) 映像 parked 窓: HUD が減光している (fix6b) / HUD ボタン (♪ 等) の上を
+   クリックしてもアクティブ化する (fix6c、機能は実行されない) / HUD 外クリックでも
+   アクティブ化する
+8. (fix7) 本をアクティブにしたまま parked 音声/動画: 連続再生 ON で末尾 → 次へ自動進行 /
+   連続再生 OFF → 停止 / どちらでもメイン (本) の一覧・フォルダが無傷
 6. OFF モード: 音声 F12 の 1 枚 detached が動作
