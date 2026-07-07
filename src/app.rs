@@ -25354,6 +25354,43 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn main_flash_probe_interesting(&self) -> bool {
+        Self::detached_image_window_debug_enabled()
+            && (self.fullscreen_idx.is_some()
+                || self.fs_viewport_shown
+                || self.viewer_session_is_detached_or_switching()
+                || self.pending_detached_video_host_switch.is_some()
+                || self.native_video_mode_switch.is_some()
+                || self.active_detached_viewer_context.is_some()
+                || !self.detached_image_windows.is_empty())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn log_main_flash_probe(&self, stage: &'static str, detail: impl AsRef<str>) {
+        if !self.main_flash_probe_interesting() {
+            return;
+        }
+        self.log_detached_image_window_debug(format!(
+            "main_flash_probe stage={stage} frame={} fs_idx={:?} presentation={:?} \
+             fs_shown={} fs_viewport_presentation={:?} session={:?} active_context={} \
+             passive_windows={} native_backdrop={} main_cloaked={} window_visible={} \
+             details={}",
+            self.frame_counter,
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation,
+            self.active_detached_session,
+            self.active_detached_viewer_context.is_some(),
+            self.detached_image_windows.len(),
+            self.native_video_fullscreen_active_for_main_backdrop(),
+            self.native_video_main_cloaked,
+            self.window_visible,
+            detail.as_ref()
+        ));
+    }
+
+    #[cfg(windows)]
     pub(crate) fn active_detached_hwnd_window_id(&self) -> Option<u64> {
         self.active_detached_session
             .map(|session| session.window_id)
@@ -44923,6 +44960,10 @@ impl eframe::App for App {
         self.flush_pending_detached_cleanup_font_atlas_resync();
         #[cfg(windows)]
         if self.maybe_defer_for_main_font_atlas_resync(ctx, "update_early") {
+            self.log_main_flash_probe(
+                "early_return",
+                "reason=font_resync_update_early main_ui=false detached_render_before_return=true",
+            );
             self.log_detached_image_window_debug(format!(
                 "font_resync_update_early_render_detached_before_return passive_windows={} frame={}",
                 self.detached_image_windows.len(),
@@ -45035,6 +45076,8 @@ impl eframe::App for App {
 
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
+        #[cfg(windows)]
+        self.log_main_flash_probe("update_begin", "after_frame_counter_increment");
         if crate::perf::is_enabled() {
             let frame_begin_now = std::time::Instant::now();
             if let Some(prev_begin) = self.perf_last_frame_begin {
@@ -45736,11 +45779,25 @@ impl eframe::App for App {
             self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
         #[cfg(not(windows))]
         let embedded_fs_pending = false;
-        if should_render_main_fullscreen_viewport_after_detached_context(
-            active_detached_context_updated,
-            embedded_fs_active_before_render,
-            embedded_fs_pending,
-        ) {
+        let should_render_main_fullscreen_viewport =
+            should_render_main_fullscreen_viewport_after_detached_context(
+                active_detached_context_updated,
+                embedded_fs_active_before_render,
+                embedded_fs_pending,
+            );
+        #[cfg(windows)]
+        self.log_main_flash_probe(
+            "fullscreen_dispatch",
+            format!(
+                "active_context_updated={} embedded_active_before={} embedded_pending={} \
+                 render_main_fullscreen={}",
+                active_detached_context_updated,
+                embedded_fs_active_before_render,
+                embedded_fs_pending,
+                should_render_main_fullscreen_viewport
+            ),
+        );
+        if should_render_main_fullscreen_viewport {
             self.render_fullscreen_viewport(ctx);
         }
         #[cfg(windows)]
@@ -45891,6 +45948,10 @@ impl eframe::App for App {
                 // above the fullscreen backdrop, a black client area makes the
                 // normal DWM title bar stand out as a visible flicker.
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                self.log_main_flash_probe(
+                    "early_return",
+                    "reason=native_main_backdrop main_ui=false repaint_after=16ms",
+                );
                 return;
             }
             self.sync_native_video_main_cloak(false);
@@ -45898,6 +45959,10 @@ impl eframe::App for App {
 
             if still_viewport_enter_suppressed {
                 self.render_still_fullscreen_viewport_enter_holdover(ctx);
+                self.log_main_flash_probe(
+                    "early_return",
+                    "reason=still_viewport_enter_suppressed main_ui=holdover",
+                );
                 return;
             }
 
@@ -45952,12 +46017,30 @@ impl eframe::App for App {
                 {
                     ctx.request_repaint();
                 }
+                self.log_main_flash_probe(
+                    "early_return",
+                    format!(
+                        "reason=embedded_fullscreen_or_pending main_ui=embedded_holdover \
+                         embedded_active={} embedded_pending={} folder_nav_pending={} \
+                         pdf_pending={} zip_pending={} fs_nav_wait={}",
+                        embedded_fs_active,
+                        embedded_fs_pending,
+                        self.folder_nav_pending.is_some(),
+                        self.pdf_enumerate_pending.is_some(),
+                        self.zip_enumerate_pending.is_some(),
+                        self.fs_nav_deferred_reopen_wait_active()
+                    ),
+                );
                 return;
             }
         }
 
         #[cfg(windows)]
         if self.maybe_defer_for_main_font_atlas_resync(ctx, "pre_main_ui") {
+            self.log_main_flash_probe(
+                "early_return",
+                "reason=font_resync_pre_main_ui main_ui=false",
+            );
             return;
         }
 
@@ -46353,6 +46436,18 @@ impl eframe::App for App {
         let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
+        #[cfg(windows)]
+        self.log_main_flash_probe(
+            "main_ui_drawn",
+            format!(
+                "menubar=true grid=true main_viewer_blocked={} grid_nav={} t_pre_grid_ms={} \
+                 t_grid_ms={}",
+                main_viewer_blocked,
+                grid_nav.is_some(),
+                t_pre_grid.as_millis(),
+                t_grid.as_millis()
+            ),
+        );
 
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
             self.poll_details_meta_load(ctx);

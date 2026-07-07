@@ -5075,6 +5075,10 @@ impl App {
         ));
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
+        self.log_main_flash_probe(
+            "fs_visible_false",
+            format!("reason=keep_alive_cleanup viewport={fs_id:?}"),
+        );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
         #[cfg(windows)]
@@ -7512,6 +7516,10 @@ impl App {
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
+        self.log_main_flash_probe(
+            "fs_visible_false",
+            format!("reason=native_video_backdrop_hide viewport={fs_id:?}"),
+        );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
@@ -7540,6 +7548,10 @@ impl App {
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
+        self.log_main_flash_probe(
+            "fs_visible_false",
+            format!("reason=embedded_still_viewport_hide viewport={fs_id:?}"),
+        );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
@@ -7568,6 +7580,10 @@ impl App {
         .with_visible(false);
         ctx.show_viewport_immediate(fs_id, builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
+        self.log_main_flash_probe(
+            "fs_visible_false",
+            format!("reason=fullscreen_viewport_recreate viewport={fs_id:?} fs_idx={fs_idx}"),
+        );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
