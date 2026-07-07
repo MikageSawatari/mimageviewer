@@ -892,6 +892,28 @@ impl App {
         placement
     }
 
+    pub(crate) fn refresh_detached_builder_placement_latch_for_active_entry(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        let live = self.ensure_detached_window_runtime_placement(window_id, reason);
+        let previous = {
+            let runtime = self.detached_window_runtime_entry_mut(window_id);
+            let previous = runtime.builder_placement_latch;
+            runtime.builder_placement_latch = Some(live);
+            previous
+        };
+        if Self::detached_image_window_debug_enabled() {
+            self.log_detached_viewport_placement_event(
+                reason,
+                "builder_placement_latch_active_entry",
+                format!("window_id={window_id} previous={previous:?} live={live:?}"),
+            );
+        }
+        live
+    }
+
     fn detached_window_hwnd_get_raw(&self, window_id: u64) -> Option<u64> {
         self.detached_window_runtimes
             .get(&window_id)
@@ -1091,11 +1113,19 @@ impl App {
         let runtime_window_id = runtime.window_id;
         let hwnd = runtime.hwnd;
         let linked = runtime.linked;
+        let entering_active =
+            from != DetachedWindowState::Active && new_state == DetachedWindowState::Active;
         self.log_detached_image_window_debug(format!(
             "state_transition window_id={runtime_window_id} from={from:?} to={new_state:?} \
              reason={reason} hwnd=0x{:x} linked={}",
             hwnd, linked
         ));
+        if entering_active {
+            self.refresh_detached_builder_placement_latch_for_active_entry(
+                window_id,
+                "state_active_entry",
+            );
+        }
     }
 
     pub(crate) fn detached_window_state(&self, window_id: u64) -> Option<DetachedWindowState> {

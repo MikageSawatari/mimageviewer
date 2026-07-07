@@ -21130,6 +21130,50 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_builder_placement_latch_refreshes_on_active_reentry() {
+        let mut app = setup_app();
+        let first = crate::settings::DetachedViewerWindowPlacement {
+            x: 87.3,
+            y: 71.3,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        let moved = crate::settings::DetachedViewerWindowPlacement {
+            x: 680.0,
+            y: 220.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+
+        app.begin_active_detached_session(46, DetachedSource::Video);
+        app.set_detached_window_runtime_placement(46, first, "test_first_active");
+        assert_eq!(
+            app.active_detached_builder_placement_latch(true, "test_initial_seed"),
+            first
+        );
+
+        app.set_detached_window_runtime_placement(46, moved, "test_active_move");
+        assert_eq!(
+            app.active_detached_builder_placement_latch(false, "test_drag_latch_stable"),
+            first,
+            "while continuously active, the latch must not follow live drag placement"
+        );
+
+        app.transition_detached_window_state(46, DetachedWindowState::Parked, "test_park");
+        app.transition_detached_window_state(46, DetachedWindowState::Resuming, "test_resume");
+        app.begin_active_detached_session(46, DetachedSource::Video);
+
+        assert_eq!(
+            app.active_detached_builder_placement_latch(false, "test_after_resume"),
+            moved,
+            "non-active -> active reentry refreshes the latch from the current runtime placement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_runtime_placement_persists_to_settings_on_remove() {
         let mut app = setup_app();
         let seed = crate::settings::DetachedViewerWindowPlacement {

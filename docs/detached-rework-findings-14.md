@@ -126,3 +126,36 @@ position/size の「値」を live placement 追従にしない**:
 - stage-audio fix2 (F11 2 バグ) と作業が重なる場合は fix2 を先に完了させてから着手
   (同一ファイル域)。
 - 本件は見た目が派手な P1 級 (窓が永続的に振動) なので、リリース前に必ず解消する。
+
+
+## Phase 2b (実機 2026-07-08 未明): ラッチが復帰境界で更新されず、フォーカスで窓がジャンプする
+
+### 実測 (jump_cur.log)
+
+- active 中に窓を移動 → live placement は追従、ラッチは (87.3, 71.3) のまま (設計どおり)。
+- park 中の passive/parked-live 描画の builder は **live 値**を使う → egui の builder
+  キャッシュが live 値になる。
+- 復帰すると active 描画の builder が**古いラッチ値**を渡す → egui が差分適用 →
+  **窓がラッチ位置 (87.3, 71.3) へジャンプ** (t=881.3 / 976.1 / 980.1 の 3 回実測、
+  いずれも実位置 → ちょうどラッチ値へ)。
+
+### 修正要件 (Phase 2b)
+
+- ラッチの refresh 契機に「**アクティブ描画への遷移境界**」を追加する:
+  park からの復帰 commit (Resuming→Active) / adopt_passive / active 描画が非 active
+  状態から最初のフレームを描くとき、に live placement でラッチを更新する。
+  イベント (状態遷移) ベースで判定し、時間窓は使わない。
+- 連続 active 中はラッチ据え置き (Phase 2 の echo 防止特性を維持)。
+- テスト: active 中に live placement を動かす → park → 復帰、のシーケンスで
+  復帰後の builder 渡し値が**復帰時点の live 値**であること (ジャンプしない)。
+  既存の echo 防止テスト (drag A/B 非追従) は不変。
+- コミット `(detached-rework findings-14 fix2)`。
+
+### Phase 2b 実装メモ (Codex 2026-07-08)
+
+- `transition_detached_window_state()` の非 Active → Active 境界で
+  `refresh_detached_builder_placement_latch_for_active_entry()` を呼び、runtime の現在
+  placement を builder latch に再同期する。
+- 連続 Active 中の `active_detached_builder_placement_latch(false, ..)` は従来どおり
+  latch を更新しないため、Phase 2 のドラッグ後 echo 防止は維持される。
+- 回帰テスト `detached_builder_placement_latch_refreshes_on_active_reentry` を追加。
