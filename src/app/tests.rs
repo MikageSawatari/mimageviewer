@@ -22789,14 +22789,14 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn activation_watcher_drops_drag_release() {
+    fn activation_watcher_drops_title_bar_drag_release() {
         let mut state = DetachedActivationWatchState::default();
         let targets = [activation_target_rect(true)];
 
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
+                activation_sample(true, 0x1000, 0x1000, Some((120, 112))),
                 &targets,
             ),
             None
@@ -22804,7 +22804,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((160, 130))),
+                activation_sample(true, 0x1000, 0x1000, Some((160, 112))),
                 &targets,
             ),
             None
@@ -22812,12 +22812,114 @@ mod still_window_mode_key_tests {
         assert_eq!(
             App::detached_activation_watch_step(
                 &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((160, 130))),
+                activation_sample(false, 0x1000, 0x1000, Some((160, 112))),
                 &targets,
             ),
             None,
-            "large movement while pressed is treated as a drag, not activation"
+            "large movement from the passive title bar is treated as a window drag, not activation"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_commits_content_drag_release() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x1000, 0x1000, Some((120, 170))),
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x1000, 0x1000, Some((190, 210))),
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(false, 0x1000, 0x1000, Some((190, 210))),
+                &targets,
+            ),
+            Some(7),
+            "content-area pointer movement is still an activation click because passive content has no drag operation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_close_button_sends_close_not_activation() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step_result(
+                &mut state,
+                activation_sample(true, 0x1000, 0x1000, Some((270, 120))),
+                &targets,
+            ),
+            DetachedActivationWatchStepResult::default()
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample(false, 0x1000, 0x1000, Some((270, 120))),
+            &targets,
+        );
+        assert_eq!(result.activation, None);
+        assert_eq!(result.close, Some(DetachedCloseRequest { window_id: 7 }));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_close_button_release_outside_is_ignored() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step_result(
+                &mut state,
+                activation_sample(true, 0x1000, 0x1000, Some((270, 120))),
+                &targets,
+            ),
+            DetachedActivationWatchStepResult::default()
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample(false, 0x1000, 0x1000, Some((250, 120))),
+            &targets,
+        );
+        assert_eq!(result.activation, None);
+        assert_eq!(result.close, None);
+        assert_eq!(
+            result.diagnostic.map(|diagnostic| diagnostic.reason),
+            Some("up_close_outside"),
+            "a close-button press released outside the button is a canceled button click"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_window_close_button_hit_uses_bar_layout_rect() {
+        let target = activation_target_rect(true);
+        assert!(App::detached_activation_close_button_contains(
+            target,
+            Some((target.right - 10, target.top + 10))
+        ));
+        assert!(!App::detached_activation_close_button_contains(
+            target,
+            Some((target.right - 50, target.top + 10))
+        ));
+        assert!(!App::detached_activation_close_button_contains(
+            target,
+            Some((target.right - 10, target.top + 50))
+        ));
     }
 
     #[test]
@@ -22842,6 +22944,46 @@ mod still_window_mode_key_tests {
             ),
             None,
             "clicks whose cursor root HWND is not a passive window are ignored"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_rejects_repair_candidate_claimed_by_other_runtime() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+        let result = App::detached_activation_watch_step_result_with_context(
+            &mut state,
+            activation_sample(true, 0x4000, 0x4000, Some((120, 170))),
+            &targets,
+            0,
+            &[0x4000],
+        );
+        assert_eq!(result.activation, None);
+        assert_eq!(
+            result.diagnostic.map(|diagnostic| diagnostic.reason),
+            Some("down_claimed_window"),
+            "rect fallback must not attribute clicks on an already-claimed HWND to another parked window"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_rejects_repair_candidate_on_main_window() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+        let result = App::detached_activation_watch_step_result_with_context(
+            &mut state,
+            activation_sample(true, 0x5000, 0x5000, Some((120, 170))),
+            &targets,
+            0x5000,
+            &[],
+        );
+        assert_eq!(result.activation, None);
+        assert_eq!(
+            result.diagnostic.map(|diagnostic| diagnostic.reason),
+            Some("down_main_window"),
+            "rect fallback must not treat a main-window click as a parked-window repair candidate"
         );
     }
 

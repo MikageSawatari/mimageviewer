@@ -409,11 +409,24 @@ const TRANSFORM_EPSILON: f32 = 0.001;
 /// パンがゼロとみなせるしきい値（length_sq）
 const PAN_EPSILON_SQ: f32 = 0.25;
 /// バー内ボタンのサイズ
-const BAR_BUTTON_SIZE: f32 = 32.0;
+pub(crate) const BAR_BUTTON_SIZE: f32 = 32.0;
 /// バー内ボタンの上下マージン
-const BAR_BUTTON_MARGIN: f32 = 6.0;
+pub(crate) const BAR_BUTTON_MARGIN: f32 = 6.0;
 /// バー内ボタン間の隙間
 const BAR_BUTTON_GAP: f32 = 4.0;
+
+#[cfg(windows)]
+pub(crate) fn detached_image_window_bar_close_button_rect(full_rect: egui::Rect) -> egui::Rect {
+    let bar_rect =
+        egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), TOP_BAR_HEIGHT));
+    egui::Rect::from_min_size(
+        egui::pos2(
+            bar_rect.max.x - BAR_BUTTON_SIZE - BAR_BUTTON_MARGIN,
+            bar_rect.min.y + BAR_BUTTON_MARGIN,
+        ),
+        egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
+    )
+}
 
 #[cfg(windows)]
 #[derive(Default)]
@@ -3883,11 +3896,12 @@ impl App {
             ),
         );
 
-        let mut next_x = bar_rect.max.x - BAR_BUTTON_SIZE - BAR_BUTTON_MARGIN;
+        let close_rect = detached_image_window_bar_close_button_rect(full_rect);
+        let mut next_x = close_rect.left();
         let close_resp = draw_bar_button(
             ui,
             next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
+            close_rect.top(),
             "detached_image_close_btn",
             |hovered| {
                 if hovered {
@@ -4086,42 +4100,13 @@ impl App {
         batch.close_command_ids.sort_unstable();
         batch.close_command_ids.dedup();
         if !batch.close_ids.is_empty() {
-            self.log_detached_image_window_debug(format!(
-                "passive_close ids={:?} command_ids={:?} passive_before={} activate_ids={:?}",
-                batch.close_ids,
-                batch.close_command_ids,
-                self.detached_image_windows.len(),
-                batch.activate_ids
-            ));
-            if !batch.close_command_ids.is_empty() {
-                crate::dwm_transitions::disable_transitions_for_thread_windows();
-            }
-            for id in &batch.close_ids {
-                self.transition_detached_window_state(
-                    *id,
-                    crate::app::DetachedWindowState::Closing,
-                    "passive_close",
-                );
-                if let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(*id) {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_close_clear_host id={id} hwnd=0x{hwnd:x}"
-                    ));
-                }
-            }
-            for id in &batch.close_command_ids {
-                let viewport_id = Self::detached_image_window_viewport_id(*id);
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-            }
-            self.detached_image_windows
-                .retain(|window| !batch.close_ids.contains(&window.id));
-            for id in &batch.close_ids {
-                self.remove_detached_window_runtime(*id, "passive_close");
-                self.deferred_detached_image_window_views.remove(id);
-            }
-            if self.detached_image_windows.is_empty() {
-                self.request_detached_cleanup_font_atlas_resync("passive_close");
-            }
-            self.focus_main_after_detached_window_close_if_idle(ctx, "passive_close");
+            self.close_detached_image_windows_by_ids(
+                ctx,
+                &batch.close_ids,
+                &batch.close_command_ids,
+                "passive_close",
+                Some(&batch.activate_ids),
+            );
         }
         for (id, focused) in batch.focus_updates.drain(..) {
             if batch.close_ids.contains(&id) || batch.activate_ids.contains(&id) {
@@ -4177,6 +4162,63 @@ impl App {
             }
         }
         self.prune_deferred_detached_image_window_views();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_detached_image_windows_by_ids(
+        &mut self,
+        ctx: &egui::Context,
+        close_ids: &[u64],
+        close_command_ids: &[u64],
+        reason: &'static str,
+        activate_ids: Option<&[u64]>,
+    ) {
+        if close_ids.is_empty() {
+            return;
+        }
+        let mut close_ids = close_ids.to_vec();
+        close_ids.sort_unstable();
+        close_ids.dedup();
+        let mut close_command_ids = close_command_ids.to_vec();
+        close_command_ids.sort_unstable();
+        close_command_ids.dedup();
+        let activate_ids = activate_ids.unwrap_or(&[]);
+        self.log_detached_image_window_debug(format!(
+            "{reason} ids={:?} command_ids={:?} passive_before={} activate_ids={:?}",
+            close_ids,
+            close_command_ids,
+            self.detached_image_windows.len(),
+            activate_ids
+        ));
+        if !close_command_ids.is_empty() {
+            crate::dwm_transitions::disable_transitions_for_thread_windows();
+        }
+        for id in &close_ids {
+            self.transition_detached_window_state(
+                *id,
+                crate::app::DetachedWindowState::Closing,
+                reason,
+            );
+            if let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(*id) {
+                self.log_detached_image_window_debug(format!(
+                    "{reason}_clear_host id={id} hwnd=0x{hwnd:x}"
+                ));
+            }
+        }
+        for id in &close_command_ids {
+            let viewport_id = Self::detached_image_window_viewport_id(*id);
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+        }
+        self.detached_image_windows
+            .retain(|window| !close_ids.contains(&window.id));
+        for id in &close_ids {
+            self.remove_detached_window_runtime(*id, reason);
+            self.deferred_detached_image_window_views.remove(id);
+        }
+        if self.detached_image_windows.is_empty() {
+            self.request_detached_cleanup_font_atlas_resync(reason);
+        }
+        self.focus_main_after_detached_window_close_if_idle(ctx, reason);
     }
 
     #[cfg(all(windows, test))]
