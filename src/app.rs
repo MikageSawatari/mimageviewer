@@ -25311,7 +25311,16 @@ impl App {
         &mut self,
         window_id: u64,
     ) -> Option<u64> {
-        self.detached_window_hwnd_clear(window_id)
+        let cleared = self.detached_window_hwnd_clear(window_id);
+        if cleared.is_some()
+            && let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == window_id)
+        {
+            window.initial_placement_applied = false;
+        }
+        cleared
     }
 
     #[cfg(windows)]
@@ -44849,6 +44858,12 @@ impl eframe::App for App {
         self.flush_pending_detached_cleanup_font_atlas_resync();
         #[cfg(windows)]
         if self.maybe_defer_for_main_font_atlas_resync(ctx, "update_early") {
+            self.log_detached_image_window_debug(format!(
+                "font_resync_update_early_render_detached_before_return passive_windows={} frame={}",
+                self.detached_image_windows.len(),
+                self.frame_counter
+            ));
+            self.render_detached_image_windows(ctx);
             return;
         }
 

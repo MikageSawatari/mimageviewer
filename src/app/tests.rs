@@ -22404,6 +22404,10 @@ mod still_window_mode_key_tests {
         app.refresh_parked_detached_window_hwnd_liveness();
 
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0);
+        assert!(
+            !app.detached_image_windows[0].initial_placement_applied,
+            "clearing a parked HWND must re-seed placement if egui recreates the OS window"
+        );
         assert_eq!(
             app.detached_window_state(7),
             Some(DetachedWindowState::Opening),
