@@ -48,6 +48,11 @@ Stage SETTINGS 以後、S3 (複数ウィンドウ) では ZIP/PDF/対応アー�
 | R6 | 動画を F12 別窓 → メイン窓クリック (park) → 再生継続を確認 → 動画窓クリックで復帰 → ホイールでファイル切替 → 閉じる | 全手順が滑らか・close 後メインのフォルダ/一覧が無傷 | R2b live-park |
 | R7 | ON⇔OFF 設定切替 (窓を開いた状態で) | 全窓自動クローズ + トースト | CUT §6 |
 | R8 | セッション終了後に `panic.log` を確認 | 新規 panic なし (Y-32 / OOM 含む) | プラン §7 |
+| R9 | 動画 detached 窓を再生中にドラッグで移動 (速めに離す・別位置で数回) | ドラッグ終了後に窓が振動しない。`placement_trace` の builder_placement_latch が live 追従しない | findings-14 |
+| R10 | ON モードで音声を開く → 別窓クリック (park) → タイトル+スペクトラム表示のまま音が継続 → クリック復帰 | 黒窓にならない・復帰はクリックのみ | stage-audio fix1 |
+| R11 | ON モードの音声メディア窓で F11 → F11 (往復) | detached のまま (メイン窓内に戻らない)。動画でも同様 | stage-audio fix2 |
+| R12 | 動画再生中に ♪ (音声モード) → F11 → F11 → ♪/Z | F11 で音声モードが維持される (動画に戻らない)・♪/Z の正規 exit が常に効く | stage-audio fix2b |
+| R13 | ON モードで音声を開く → 音声窓がある状態で動画を開く (逆も) | メディア窓が差し替わる (2 本にならない)・音切れ/固着なし | stage-audio §1 |
 
 既知・対象外: OFF モード F12 切り離し瞬間の「黒い線」(キャプチャに写らない、
 scanout レベル、findings-13 でクローズ済み)。これは NG に数えない。
@@ -67,12 +72,12 @@ Select-String -Path $log -Pattern 'passive_activate|passive_close|active_context
 - `deferred_registration_delayed` (初回 open 以外で出る) = 直列化スキップ
 - `down_window_from_point_mismatch` = stale hwnd 棄却
 
-## 5. 出荷までの残りステップ (プラン §7)
+## 5. 出荷までの残りステップ (ユーザー決定 2026-07-07 で soak 短縮)
 
-1. [ ] 本チェックリスト (smoke 2 周 + R1-R8 × 2) グリーン
-2. [ ] `detached-rework` → ローカル `master` へ merge (チェック通過後すぐでよい)
-3. [ ] **2 週間の実機常用で新規 P1 ゼロ** (P2 以下は backlog 化で出荷可。
-       常用は master ビルドで行い、`MIV_DETACHED_WINDOW_DEBUG=1` は付けたままを推奨 =
-       もし P1 が出ても証拠が自動で残る)
+1. [x] `detached-rework` → ローカル `master` へ merge (2026-07-07 実施済み)
+2. [ ] 本チェックリスト (smoke 2 周 + R1-R13 × 2) グリーン
+3. [ ] **1 日程度の実機常用で新規 P1 ゼロ** (2 週間 soak はユーザー判断で短縮。
+       `MIV_DETACHED_WINDOW_DEBUG=1` は付けたままを推奨 = P1 が出ても証拠が自動で残る。
+       以後はリリース後のユーザーフィードバック頼りの運用)
 4. [ ] リリース作業 (CLAUDE.md「リリース手順チェックリスト」Phase 0 から)。
-       README 更新履歴に detached リワークの要約 (ユーザー向け表現) を含める
+       README 更新履歴に detached リワーク + 音楽機能初公開の要約 (ユーザー向け表現) を含める
