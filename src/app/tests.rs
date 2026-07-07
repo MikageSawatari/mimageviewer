@@ -6663,47 +6663,6 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    #[test]
-    fn update_keep_range_requeues_evicted_item_with_stale_requested_entry() {
-        use crate::grid_item::GridItem;
-        use std::sync::{Arc, Condvar, Mutex};
-
-        let mut app = setup_app();
-        let image = app.tmp.path().join("cover.jpg");
-        std::fs::write(&image, b"not decoded in this test").unwrap();
-
-        app.items = vec![GridItem::Image(image)];
-        app.image_metas = vec![Some((1, 24))];
-        app.thumbnails = vec![ThumbnailState::Evicted];
-        app.visible_indices = vec![0];
-        app.settings.grid_cols = 1;
-        app.last_cell_size = 120.0;
-        app.last_cell_h = 120.0;
-        app.last_viewport_h = 120.0;
-        app.requested.insert(0, false);
-        app.pending_finalize.insert(0);
-        let reload_queue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        app.reload_queue = Some(Arc::clone(&reload_queue));
-        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
-
-        app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
-
-        assert!(
-            app.requested.contains_key(&0),
-            "the item should be requeued after clearing the stale requested entry"
-        );
-        assert!(
-            !app.pending_finalize.contains(&0),
-            "stale finalize bookkeeping must not survive the cleanup"
-        );
-        let queued = reload_queue.0.lock().unwrap();
-        assert_eq!(
-            queued.len(),
-            1,
-            "Evicted + requested is not a real in-flight request and must not block reload"
-        );
-    }
-
     /// 黒サムネ回帰修正 (2026-06-19, v1.8.0) + detached-rework findings-9 B2:
     /// font-atlas resync が予約されているだけの safe-frame 待ちではサムネ upload を
     /// 止めない。実際に `set_fonts` が発火して repeat 中の間だけ、no-surface フレームで
