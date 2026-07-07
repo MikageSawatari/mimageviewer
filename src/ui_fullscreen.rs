@@ -1408,6 +1408,15 @@ pub(crate) fn paint_transparent_bg(
         }
     }
 }
+
+#[cfg(windows)]
+fn format_duration_mm_ss(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let minutes = total / 60;
+    let seconds = total % 60;
+    format!("{minutes}:{seconds:02}")
+}
+
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
@@ -1427,6 +1436,26 @@ const NAV_MARKER_EPSILON: f64 = 0.5;
 /// フルスクリーンで上部ホバーバーが表示される画面上端からの距離 (ピクセル)。
 /// `draw_fs_hover_bar` の hover 判定と、`fs_ui_is_clean` のクリーン判定で共有する。
 const TOP_BAR_HOVER_Y: f32 = 60.0;
+
+#[cfg(windows)]
+const PARKED_LIVE_MUSIC_TOP_H: f32 = 54.0;
+#[cfg(windows)]
+const PARKED_LIVE_MUSIC_SPECTRUM_MAX_H: f32 = 180.0;
+#[cfg(windows)]
+const PARKED_LIVE_MUSIC_SPECTRUM_MIN_H: f32 = 60.0;
+#[cfg(windows)]
+const PARKED_LIVE_MUSIC_SPECTRUM_GAP: f32 = 8.0;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct ParkedLiveMusicWindowLayout {
+    top_rect: egui::Rect,
+    central_rect: egui::Rect,
+    spectrum_rect: egui::Rect,
+    show_spectrum: bool,
+    draw_timeline: bool,
+    draw_waveform_fallback: bool,
+}
 
 /// 動画のチャプター・ブックマーク・ピンを 1 本の Vec に集約するための種別タグ。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3658,132 +3687,46 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn draw_parked_live_music_waveform(
-        &self,
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        position_secs: f64,
-        duration_secs: f64,
-    ) -> bool {
-        let Some(analysis) = self.music_analysis.as_ref() else {
-            return false;
-        };
-        if analysis.bins.is_empty() || rect.width() < 120.0 || rect.height() < 80.0 {
-            return false;
+    fn parked_live_music_window_layout(
+        full_rect: egui::Rect,
+        edge_trigger: f32,
+    ) -> Option<ParkedLiveMusicWindowLayout> {
+        if full_rect.width() <= 64.0 || full_rect.height() <= 64.0 {
+            return None;
         }
 
-        let bg = crate::ui_music_timeline::timeline_bg();
-        painter.rect_filled(rect, 0.0, bg);
-        let center_y = rect.center().y;
-        let top_h = (rect.height() * 0.48).max(1.0);
-        let bottom_h = (rect.height() * 0.48).max(1.0);
-        let max_cols = (rect.width() / 2.0).floor().max(1.0) as usize;
-        let bins = &analysis.bins;
-        let cols = bins.len().min(max_cols).max(1);
-        let step = (bins.len() as f32 / cols as f32).max(1.0);
-        let col_w = (rect.width() / cols as f32).max(1.0);
-        let stroke_w = col_w.clamp(1.0, 3.0);
-        for col in 0..cols {
-            let start = (col as f32 * step).floor() as usize;
-            let end = (((col + 1) as f32 * step).ceil() as usize).min(bins.len());
-            let mut peak_l = 0.0_f32;
-            let mut peak_r = 0.0_f32;
-            let mut transient = 0.0_f32;
-            for bin in &bins[start..end.max(start + 1).min(bins.len())] {
-                peak_l = peak_l.max(bin.peak_l.max(bin.peak));
-                peak_r = peak_r.max(bin.peak_r.max(bin.peak));
-                transient = transient.max(bin.transient);
-            }
-            let x = rect.left() + col as f32 * col_w + col_w * 0.5;
-            let brightness = (95.0 + transient.clamp(0.0, 1.0) * 95.0) as u8;
-            let color = egui::Color32::from_rgb(80, brightness, 210);
-            let l_h = (peak_l.sqrt().clamp(0.02, 1.0) * top_h).max(1.0);
-            let r_h = (peak_r.sqrt().clamp(0.02, 1.0) * bottom_h).max(1.0);
-            painter.line_segment(
-                [egui::pos2(x, center_y - l_h), egui::pos2(x, center_y)],
-                egui::Stroke::new(stroke_w, color),
-            );
-            painter.line_segment(
-                [egui::pos2(x, center_y), egui::pos2(x, center_y + r_h)],
-                egui::Stroke::new(stroke_w, color.gamma_multiply(0.72)),
-            );
-        }
-
-        painter.line_segment(
-            [
-                egui::pos2(rect.left(), center_y),
-                egui::pos2(rect.right(), center_y),
-            ],
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
-            ),
+        let top_rect = egui::Rect::from_min_size(
+            full_rect.min,
+            egui::vec2(full_rect.width(), PARKED_LIVE_MUSIC_TOP_H),
         );
-        let timeline_duration = if duration_secs > 0.0 {
-            duration_secs
-        } else {
-            analysis.stream.duration_secs
-        };
-        if timeline_duration > 0.0 {
-            let frac = (position_secs / timeline_duration).clamp(0.0, 1.0) as f32;
-            let x = egui::lerp(rect.left()..=rect.right(), frac);
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 245, 245)),
-            );
-        }
-        true
-    }
-
-    #[cfg(windows)]
-    fn draw_parked_live_music_timeline(
-        &mut self,
-        ui: &mut egui::Ui,
-        rect: egui::Rect,
-        position_secs: f64,
-        duration_secs: f64,
-        playing: bool,
-        left_label_w: f32,
-    ) -> bool {
-        let Some(analysis) = self.music_analysis.clone() else {
-            return false;
-        };
-        if analysis.bins.is_empty() || rect.width() < 120.0 || rect.height() < 80.0 {
-            return false;
-        }
-
-        let timeline_duration = if duration_secs > 0.0 {
-            duration_secs
-        } else {
-            analysis.stream.duration_secs
-        };
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
+        let content_gutter = (edge_trigger + full_rect.width() * 0.03).max(8.0);
+        let band_top = full_rect.top() + PARKED_LIVE_MUSIC_TOP_H + 8.0;
+        let band_bottom = full_rect.bottom() - 24.0;
+        let band_h = (band_bottom - band_top).max(0.0);
+        let spectrum_h = PARKED_LIVE_MUSIC_SPECTRUM_MAX_H.min((band_h * 0.34).max(0.0));
+        let show_spectrum = spectrum_h >= PARKED_LIVE_MUSIC_SPECTRUM_MIN_H;
+        let spectrum_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left() + content_gutter, band_bottom - spectrum_h),
+            egui::pos2(full_rect.right() - content_gutter, band_bottom),
         );
-        child.set_clip_rect(rect);
-        *child.visuals_mut() = egui::Visuals::dark();
-        let cache = &mut self.music_timeline_cache;
-        let mut outcome = crate::ui_music_timeline::MusicTimelineOutcome::default();
-        let _ = egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .id_salt("parked_live_music_timeline")
-            .show(&mut child, |ui| {
-                outcome = crate::ui_music_timeline::draw_music_timeline(
-                    ui,
-                    &analysis,
-                    timeline_duration,
-                    position_secs,
-                    playing,
-                    playing,
-                    cache,
-                    self.music_timeline_row_secs,
-                    true,
-                    left_label_w,
-                );
-            });
-        outcome.displayed_texture_rows > 0
+        let central_bottom = if show_spectrum {
+            (spectrum_rect.top() - PARKED_LIVE_MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
+        } else {
+            band_bottom.max(band_top + 1.0)
+        };
+        let central_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left() + content_gutter, band_top),
+            egui::pos2(full_rect.right() - content_gutter, central_bottom),
+        );
+
+        Some(ParkedLiveMusicWindowLayout {
+            top_rect,
+            central_rect,
+            spectrum_rect,
+            show_spectrum,
+            draw_timeline: false,
+            draw_waveform_fallback: false,
+        })
     }
 
     #[cfg(windows)]
@@ -3798,24 +3741,22 @@ impl App {
         let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
         painter.rect_filled(full_rect, 0.0, bg);
 
-        if full_rect.width() <= 64.0 || full_rect.height() <= 64.0 {
+        let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(full_rect.width());
+        let Some(layout) = Self::parked_live_music_window_layout(full_rect, edge_trigger) else {
             return;
-        }
-
-        let top_h = 54.0;
-        let top_rect =
-            egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), top_h));
+        };
+        let top_rect = layout.top_rect;
         painter.rect_filled(
             top_rect,
             0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 132),
         );
         painter.text(
             egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
             egui::Align2::LEFT_CENTER,
             &info.title,
             egui::FontId::proportional(15.0),
-            egui::Color32::from_gray(220),
+            egui::Color32::from_gray(160),
         );
         let mode_label = if info.playing {
             "再生中"
@@ -3832,81 +3773,49 @@ impl App {
             egui::Align2::LEFT_CENTER,
             mode_label,
             egui::FontId::proportional(12.0),
-            egui::Color32::from_rgba_unmultiplied(190, 204, 220, 175),
+            egui::Color32::from_rgba_unmultiplied(145, 156, 170, 165),
         );
         painter.text(
             egui::pos2(top_rect.right() - 14.0, top_rect.top() + 20.0),
             egui::Align2::RIGHT_CENTER,
             hint,
             egui::FontId::proportional(13.0),
-            egui::Color32::from_rgba_unmultiplied(190, 204, 220, 190),
+            egui::Color32::from_rgba_unmultiplied(155, 168, 184, 185),
         );
 
-        let edge_trigger = crate::ui_helpers::panel_edge_trigger_px(full_rect.width());
-        let content_gutter = (edge_trigger + full_rect.width() * 0.03).max(8.0);
-        const MUSIC_SPECTRUM_MAX_H: f32 = 180.0;
-        const MUSIC_SPECTRUM_MIN_H: f32 = 60.0;
-        const MUSIC_SPECTRUM_GAP: f32 = 8.0;
-        const TIMELINE_MIN_H: f32 = 120.0;
-        let band_top = full_rect.top() + top_h + 8.0;
-        let band_bottom = full_rect.bottom() - 24.0;
-        let band_h = (band_bottom - band_top).max(0.0);
-        let spectrum_h =
-            MUSIC_SPECTRUM_MAX_H.min((band_h - MUSIC_SPECTRUM_GAP - TIMELINE_MIN_H).max(0.0));
-        let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H;
-        let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left() + content_gutter, band_bottom - spectrum_h),
-            egui::pos2(full_rect.right() - content_gutter, band_bottom),
-        );
-        let central_bottom = if show_spectrum {
-            (spectrum_rect.top() - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
-        } else {
-            band_bottom.max(band_top + 1.0)
-        };
-        let central_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left() + content_gutter, band_top),
-            egui::pos2(full_rect.right() - content_gutter, central_bottom),
-        );
-        let timeline_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left(), central_rect.top()),
-            egui::pos2(central_rect.right(), central_rect.bottom()),
-        );
-
-        let waveform_drawn = self.draw_parked_live_music_timeline(
-            ui,
-            timeline_rect,
-            info.position_secs,
-            info.duration_secs,
-            info.playing,
-            content_gutter,
-        ) || self.draw_parked_live_music_waveform(
-            &painter,
-            central_rect,
-            info.position_secs,
-            info.duration_secs,
-        );
-        if !waveform_drawn {
-            let icon_side = central_rect.width().min(central_rect.height()) * 0.28;
+        let central_rect = layout.central_rect;
+        debug_assert!(!layout.draw_timeline);
+        debug_assert!(!layout.draw_waveform_fallback);
+        let icon_side = central_rect.width().min(central_rect.height()) * 0.22;
+        if icon_side >= 24.0 {
             let icon_rect = egui::Rect::from_center_size(
                 central_rect.center() - egui::vec2(0.0, central_rect.height() * 0.08),
                 egui::vec2(icon_side, icon_side),
             );
-            crate::ui_helpers::draw_music_icon(&painter, icon_rect, true);
-            let status = if self.music_analysis_error.is_some() {
-                "波形を表示できません"
-            } else {
-                "波形を解析しています…"
-            };
+            crate::ui_helpers::draw_music_icon(&painter, icon_rect, false);
             painter.text(
                 egui::pos2(central_rect.center().x, icon_rect.bottom() + 28.0),
                 egui::Align2::CENTER_CENTER,
-                status,
+                "クリックで操作に戻る",
                 egui::FontId::proportional(15.0),
-                egui::Color32::from_gray(220),
+                egui::Color32::from_gray(168),
             );
+            if info.duration_secs > 0.0 {
+                let position = format_duration_mm_ss(info.position_secs);
+                let duration = format_duration_mm_ss(info.duration_secs);
+                painter.text(
+                    egui::pos2(central_rect.center().x, icon_rect.bottom() + 50.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{position} / {duration}"),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgba_unmultiplied(145, 156, 170, 170),
+                );
+            }
         }
 
-        if show_spectrum && spectrum_rect.width() >= 180.0 && spectrum_rect.height() >= 60.0 {
+        let spectrum_rect = layout.spectrum_rect;
+        if layout.show_spectrum && spectrum_rect.width() >= 180.0 && spectrum_rect.height() >= 60.0
+        {
             let bass_marker = self.music_analysis.as_ref().and_then(|analysis| {
                 let idx =
                     (info.position_secs.max(0.0) / analysis.config.bin_secs.max(1.0e-3)) as usize;
@@ -3945,7 +3854,7 @@ impl App {
         ui.painter().rect_filled(
             bar_rect,
             0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
         );
         ui.painter().line_segment(
             [
@@ -3954,7 +3863,7 @@ impl App {
             ],
             egui::Stroke::new(
                 1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 34),
             ),
         );
 
@@ -3967,9 +3876,9 @@ impl App {
             "detached_image_close_btn",
             |hovered| {
                 if hovered {
-                    egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
+                    egui::Color32::from_rgba_unmultiplied(150, 42, 42, 205)
                 } else {
-                    egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+                    egui::Color32::from_rgba_unmultiplied(48, 48, 48, 160)
                 }
             },
             false,
@@ -3997,7 +3906,7 @@ impl App {
                 egui::Align2::LEFT_CENTER,
                 display_text,
                 egui::FontId::proportional(13.0),
-                egui::Color32::from_rgb(235, 238, 242),
+                egui::Color32::from_rgb(168, 174, 184),
             );
         }
     }
@@ -21316,6 +21225,41 @@ mod tests {
             Some(full.id())
         );
         assert!(App::fs_display_texture_choice(false, None, None).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_music_layout_uses_spectrum_without_timeline_or_waveform() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let layout = App::parked_live_music_window_layout(rect, 64.0)
+            .expect("normal parked music window should have a layout");
+
+        assert!(
+            !layout.draw_timeline,
+            "ParkedLive music windows must not draw the active timeline"
+        );
+        assert!(
+            !layout.draw_waveform_fallback,
+            "ParkedLive music windows must not fall back to the static waveform"
+        );
+        assert!(
+            layout.show_spectrum,
+            "ParkedLive music windows should keep the lower spectrum alive"
+        );
+        assert_eq!(layout.top_rect.height(), PARKED_LIVE_MUSIC_TOP_H);
+        assert!(layout.central_rect.bottom() <= layout.spectrum_rect.top());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_music_layout_keeps_timeline_off_for_tiny_windows() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 90.0));
+        let layout = App::parked_live_music_window_layout(rect, 12.0)
+            .expect("tiny but usable parked music window should still have a layout");
+
+        assert!(!layout.draw_timeline);
+        assert!(!layout.draw_waveform_fallback);
+        assert!(!layout.show_spectrum);
     }
 
     #[test]
