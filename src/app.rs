@@ -4702,9 +4702,12 @@ pub(crate) enum MusicAnalysisMsg {
         analysis: music_core::TimelineAnalysis,
         meta: Option<(i64, i64)>,
     },
-    /// 下段スペクトラム (Inc 4) 用の全尺デコード PCM。UI が再生位置周辺 ±1 秒を切り出して
-    /// `SpectrumAnalyzer` に食わせる。cpal ring buffer は約 100ms 分しか無く ±1 秒窓に足りない
-    /// ため、ラボと同じく展開済み PCM をスライスする (§11「ring buffer tap の口」= 案A)。
+    /// 下段スペクトラム (Inc 4) 用の共有 progressive PCM。UI が再生位置周辺 ±1 秒を切り出して
+    /// `SpectrumAnalyzer` に食わせる。解析ワーカーは **デコード開始前にこの (空の) Arc を送り**、
+    /// 以降デコード差分を末尾 append するので、UI は全尺デコード完了を待たず、再生位置がデコード
+    /// 済み範囲にあれば下段グラフを描ける (長尺ファイルの下段グラフ出現遅延を解消、§5.6)。
+    /// cpal ring buffer は約 100ms 分しか無く ±1 秒窓に足りないため、ラボと同じく展開済み PCM を
+    /// スライスする (§11「ring buffer tap の口」= 案A)。
     Pcm(std::sync::Arc<crate::ui_music_spectrum::MusicPcm>),
     /// 右パネルの「音楽情報」表示用のソースメタ (Inc 5)。container / codec / 実 sample rate /
     /// channels / bitrate / duration / 埋め込みメタ。デコードより先に軽量 probe で送る。
@@ -4724,10 +4727,19 @@ pub(crate) struct MusicAnalysisPending {
     pub(crate) rx: std::sync::mpsc::Receiver<MusicAnalysisMsg>,
 }
 
+/// progressive spectrum PCM の容量先取り上限 (フレーム数)。probe duration からバッファ容量を
+/// 先取りするが、壊れファイルが巨大な duration を報告した場合の即時 OOM を避けるためクランプする。
+/// 4 時間分 = 4*3600*48000 フレーム (~5.5GB の interleaved f32)。これを超える実ファイルは append の
+/// 倍々成長で伸ばす (稀なので数回の realloc を許容)。
+const MUSIC_PCM_RESERVE_MAX_FRAMES: usize = 4 * 3600 * 48_000;
+
 /// 音楽ビュー解析ワーカーの本体 (背景スレッドで実行、UI 非依存)。
 ///
-/// 全尺 PCM を **1 回だけ**デコードし、解析が必要なら progressive にタイムラインを先出ししつつ
-/// 最終確定版 (`TimelineComplete`) を送り、最後に spectrum (Inc 4) 用 PCM を追送する。
+/// 全尺 PCM を **1 回だけ** progressive デコードし、デコード差分を共有 `MusicPcm` バッファへ
+/// 末尾 append する。この共有バッファはデコード開始前に `Pcm` メッセージで UI へ渡すので、下段
+/// スペクトラムは全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば即描画できる
+/// (長尺ファイルの下段グラフ出現遅延を解消、§5.6)。解析が必要なら同じ共有バッファのプレフィックス
+/// から progressive にタイムラインを先出ししつつ、最終確定版 (`TimelineComplete`) を送る。
 /// `want_analysis=false` は UI 側の in-memory LRU がヒット済み (= タイムラインは既に表示済み) の
 /// 場合で、通常は spectrum 用 PCM をデコードするためだけに走る。ただしワーカーは背景で実ファイルを
 /// **fresh stat** し、ヒットに使われた `hit_meta` と (mtime,size) が食い違う場合 (= フォルダ再読込
@@ -4767,79 +4779,96 @@ fn run_music_analysis(
     });
     let should_analyze = want_analysis || hit_meta != fresh_meta;
 
-    // 解析入力 + spectrum 用 (Inc 4) を兼ねて全尺 PCM を 1 回だけデコードする。
-    // should_analyze のときはデコードの進行に合わせて progressive partial timeline を先出しし、
-    // 全尺完了を待たずに波形を順次表示する (Inc 3 ストリーミング)。有効な LRU ヒット
-    // (should_analyze=false) は timeline 済みなので partial は出さず、spectrum 用 PCM のためだけに
-    // デコードする。
+    // 共有 progressive PCM を作り、デコード開始前に UI へ渡す。以降デコード差分を末尾 append する
+    // ので、下段スペクトラムは全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば即描画
+    // できる (§5.6)。容量は probe duration から先取りして追記中の再確保 (長尺で数百 MB 級 memcpy)
+    // を避ける。bogus probe (壊れファイルの巨大 duration) での OOM を避けるため上限クランプ。
+    let reserve_frames = if total_dur > 0.0 {
+        ((total_dur * crate::audio_decode::OUT_RATE as f64) as usize)
+            .min(MUSIC_PCM_RESERVE_MAX_FRAMES)
+    } else {
+        0
+    };
+    let pcm = std::sync::Arc::new(crate::ui_music_spectrum::MusicPcm::with_capacity(
+        crate::audio_decode::OUT_RATE,
+        reserve_frames,
+    ));
+    let _ = tx.send(MusicAnalysisMsg::Pcm(std::sync::Arc::clone(&pcm)));
+
+    // 全尺 PCM を 1 回だけ progressive デコードし、差分を共有バッファへ append する。
+    // should_analyze のときは同じ共有バッファのプレフィックスから progressive partial timeline を
+    // 先出しし、全尺完了を待たずに波形を順次表示する (Inc 3 ストリーミング)。有効な LRU ヒット
+    // (should_analyze=false) は timeline 済みなので partial は出さず、spectrum 用 PCM を溜めるだけ。
     let config = music_core::AnalysisConfig {
         bin_secs: crate::ui_music_timeline::MUSIC_ANALYSIS_BIN_SECS,
         ..music_core::AnalysisConfig::default()
     };
     let mut partial_sent = false;
-    let decode_result = crate::audio_decode::decode_audio_file_to_stereo_f32_streaming(
+    let mut schedule = crate::audio_decode::PartialEmitSchedule::new(total_dur);
+    let decode_result = crate::audio_decode::decode_audio_file_progressive(
         path,
         cancel,
-        // 有効な LRU ヒットは partial 不要なので 50% 抑制ヒントも渡す意味は無いが、closure 側で
-        // 早期 return するため total_dur をそのまま渡してよい。
-        total_dur,
-        |prefix, rate| {
+        |delta, _rate| -> Result<(), String> {
+            // デコード差分を共有バッファへ追記 (spectrum worker が即スライスできるようになる)。
+            // 確保失敗 (長尺 OOM) は Err で返してデコードを打ち切る (abort させない)。
+            pcm.append(delta).map_err(|_| {
+                "音声デコードのメモリ確保に失敗しました (ファイルが長すぎる可能性)".to_string()
+            })?;
             // 有効な LRU ヒット (timeline 済み) では partial 不要。cancel 済みも skip。
             if !should_analyze || cancel.load(Ordering::Relaxed) {
-                return;
+                return Ok(());
             }
-            // analyze_stereo_timeline は cancel 不可なので前後で cancel を確認する (Codex P3)。
-            let ta = music_core::analyze_stereo_timeline(prefix, rate, config);
+            let frames = pcm.decoded_frames();
+            if !schedule.should_emit(frames) {
+                return Ok(());
+            }
+            // 共有バッファのプレフィックスを lock 下で解析する (analyze_stereo_timeline は cancel
+            // 不可なので前後で cancel を確認する、Codex P3)。lock 保持は partial のときだけ =
+            // 幾何級数で稀 (全長 50% で停止) なので spectrum worker の窓コピーへの影響は限定的。
+            let ta = pcm.with_prefix(|prefix, rate| {
+                music_core::analyze_stereo_timeline(prefix, rate, config)
+            });
             if cancel.load(Ordering::Relaxed) {
-                return;
+                return Ok(());
             }
             if tx.send(MusicAnalysisMsg::Timeline(Ok(ta))).is_ok() {
                 partial_sent = true;
             }
+            // on_partial 完了後に throttle 起点を進める (旧挙動を保つ)。
+            schedule.record_emitted(frames);
+            Ok(())
         },
     );
-    let decoded = match decode_result {
-        Ok(d) => d,
-        Err(e) => {
-            // decode 失敗。有効な LRU ヒット (timeline 済み) や partial 送信済みなら既に有効な波形が
-            // 出ているので、破壊的な Timeline(Err) は送らず spectrum を諦めるだけにする (Codex P3:
-            // 途中まで出た波形を消さない)。解析中でどちらも無い純粋な失敗のみエラー通知する。
-            if should_analyze && !partial_sent {
-                let _ = tx.send(MusicAnalysisMsg::Timeline(Err(e)));
-            }
-            return;
+    // これ以上 append しないことを表明する (UI 下段の「解析中」表示を止める)。cancel / error 時も
+    // 立てるが、その場合 UI は既にこの Arc を手放している (music_pcm=None) ので実害はない。
+    pcm.mark_complete();
+
+    if let Err(e) = decode_result {
+        // decode 失敗。有効な LRU ヒット (timeline 済み) や partial 送信済みなら既に有効な波形が
+        // 出ているので、破壊的な Timeline(Err) は送らず spectrum を諦めるだけにする (Codex P3:
+        // 途中まで出た波形を消さない)。解析中でどちらも無い純粋な失敗のみエラー通知する。
+        if should_analyze && !partial_sent {
+            let _ = tx.send(MusicAnalysisMsg::Timeline(Err(e)));
         }
-    };
+        return;
+    }
     if cancel.load(Ordering::Relaxed) {
         return;
     }
 
-    // should_analyze: デコード済み全尺 PCM から最終フル解析を作り、確定版 (TimelineComplete) を
-    // 送る (progressive partial を確定版で置換 + UI 側が検証済み meta で LRU に載せる)。有効な
-    // LRU ヒットは既に確定済みなので送らない (stale ヒットはここで補正済みの新解析を送る)。
+    // should_analyze: デコード済み全尺 PCM (共有バッファ) から最終フル解析を作り、確定版
+    // (TimelineComplete) を送る (progressive partial を確定版で置換 + UI 側が検証済み meta で LRU に
+    // 載せる)。有効な LRU ヒットは既に確定済みなので送らない (stale ヒットはここで補正済みの新解析を
+    // 送る)。final 解析は共有バッファを lock 下で 1 回走査するだけ (spectrum を一時ブロックするが 1 回)。
     if should_analyze {
-        let ta = music_core::analyze_stereo_timeline(
-            &decoded.stereo_samples,
-            decoded.info.sample_rate,
-            config,
-        );
+        let ta = pcm
+            .with_prefix(|prefix, rate| music_core::analyze_stereo_timeline(prefix, rate, config));
         let _ = tx.send(MusicAnalysisMsg::TimelineComplete {
             analysis: ta,
             meta: fresh_meta,
         });
     }
-
-    // spectrum 用 PCM を追送する。timeline が全尺デコードしたのと同じ PCM を move で渡すだけ
-    // なので追加のピーク確保は無い (長さ上限は設けない)。timeline が解析できたファイルは長さに
-    // 依らず spectrum も動く (ラボと同挙動)。巨大ファイルでデコード自体が確保失敗した場合は
-    // decode_audio_file_to_stereo_f32 が Err を返し timeline/spectrum とも出ない (決定的)。
-    // spectrum ワーカーは再生位置 ±1 秒窓をスライスするだけ (O(窓)) で、常駐 PCM 全体を毎フレーム
-    // 走査するわけではない。
-    let pcm = crate::ui_music_spectrum::MusicPcm {
-        samples: decoded.stereo_samples,
-        sample_rate: decoded.info.sample_rate,
-    };
-    let _ = tx.send(MusicAnalysisMsg::Pcm(std::sync::Arc::new(pcm)));
+    // Pcm は既にデコード開始前に送信済み (共有 Arc に append してきた)。ここでは再送しない。
 }
 
 pub struct App {

@@ -25,7 +25,8 @@ use ffmpeg_the_third as ffmpeg;
 use music_core::{AudioStreamInfo, DecodedAudio};
 
 /// 解析用の出力サンプルレート (Hz)。動画音声パイプラインと揃えて 48kHz stereo にする。
-const OUT_RATE: u32 = 48_000;
+/// progressive spectrum PCM の容量先取り (`run_music_analysis`) でも参照するため crate 公開。
+pub(crate) const OUT_RATE: u32 = 48_000;
 const OUT_CHANNELS: usize = 2;
 
 static FFMPEG_INIT: Once = Once::new();
@@ -86,6 +87,116 @@ fn next_partial_threshold_frames(last_emit_frames: usize, initial_frames: usize)
     }
 }
 
+/// progressive partial timeline emit のスケジューラ。幾何級数マイルストーン
+/// (最初 `PARTIAL_INITIAL_SECS`、以降 frame 数を倍々) + wall-clock throttle
+/// (`PARTIAL_EMIT_MIN_INTERVAL`) + 全長 50% 抑制。デコード関数の内側と、共有バッファへ
+/// 追記しながら partial を出す解析ワーカー (`run_music_analysis`) の両方から使えるよう、
+/// スケジュール状態を 1 構造体に閉じる (docs/music-integration-plan.md §11)。
+pub(crate) struct PartialEmitSchedule {
+    initial_frames: usize,
+    /// 全長の 50% を超えたら partial を止める閾値 (final がすぐ後を追うため)。全長不明なら MAX。
+    half_frames: usize,
+    last_emit_frames: usize,
+    last_emit_at: Option<Instant>,
+}
+
+impl PartialEmitSchedule {
+    pub(crate) fn new(total_duration_secs: f64) -> Self {
+        let initial_frames = (PARTIAL_INITIAL_SECS * OUT_RATE as f64) as usize;
+        let half_frames = if total_duration_secs > 0.0 {
+            (total_duration_secs * 0.5 * OUT_RATE as f64) as usize
+        } else {
+            usize::MAX
+        };
+        Self {
+            initial_frames,
+            half_frames,
+            last_emit_frames: 0,
+            last_emit_at: None,
+        }
+    }
+
+    /// `frames` 蓄積時点で partial を emit すべきか (純検査、状態は進めない)。true を返したら
+    /// 呼び出し側は on_partial (解析 + 送信) を実行し、**その完了直後**に `record_emitted(frames)`
+    /// を呼ぶ。throttle 起点を「emit 完了時刻」にすることで、解析が重い場合でも旧挙動 (on_partial の
+    /// 後で 150ms 計測) を保つ。
+    pub(crate) fn should_emit(&self, frames: usize) -> bool {
+        let threshold = next_partial_threshold_frames(self.last_emit_frames, self.initial_frames);
+        frames >= threshold
+            && frames < self.half_frames
+            && self
+                .last_emit_at
+                .is_none_or(|t| t.elapsed() >= PARTIAL_EMIT_MIN_INTERVAL)
+    }
+
+    /// on_partial 実行直後に呼び、次マイルストーン基準と throttle 起点を進める。
+    pub(crate) fn record_emitted(&mut self, frames: usize) {
+        self.last_emit_frames = frames;
+        self.last_emit_at = Some(Instant::now());
+    }
+}
+
+/// 開いた音声デコーダ一式 (input context + 選択ストリーム + decoder + resampler)。
+/// `decode_audio_file_to_stereo_f32_streaming` と `decode_audio_file_progressive` で共有する
+/// セットアップ (avformat open → best audio stream → decoder → 48kHz stereo resampler)。
+struct AudioDecodeCtx {
+    ictx: ffmpeg::format::context::Input,
+    stream_index: usize,
+    decoder: ffmpeg::decoder::Audio,
+    resampler: ResampleContext,
+    in_rate: u32,
+}
+
+/// 音声ファイルを開き、最良の音声ストリーム向けに decoder と 48kHz stereo f32 packed への
+/// resampler を構築する。レイアウト未指定 (古い WMA 等) は `normalize_layout` で差し替える。
+fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, String> {
+    ensure_ffmpeg_init();
+
+    let pb = path.to_path_buf();
+    let ictx = ffmpeg::format::input(&pb).map_err(|e| format!("format::input: {e}"))?;
+
+    // 最良の音声ストリームを選ぶ。`stream.parameters()` は stream を借用するので、
+    // codec context の構築まで stream スコープ内で済ませてから owned な context を取り出す。
+    let (stream_index, codec_ctx) = {
+        let stream = ictx
+            .streams()
+            .best(ffmpeg::media::Type::Audio)
+            .ok_or_else(|| "音声ストリームが見つかりません".to_string())?;
+        let idx = stream.index();
+        let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| format!("codec context: {e}"))?;
+        (idx, ctx)
+    };
+    let decoder = codec_ctx
+        .decoder()
+        .audio()
+        .map_err(|e| format!("audio decoder open: {e}"))?;
+
+    let in_fmt = decoder.format();
+    let in_rate = decoder.rate();
+    // レイアウト未指定 (AV_CHANNEL_ORDER_UNSPEC、古い WMA 等) だと swresample::get2 が
+    // 内部の mask().unwrap() で panic するので、チャンネル数から既定レイアウトへ差し替える。
+    let in_layout = normalize_layout(decoder.ch_layout());
+
+    let resampler = ResampleContext::get2(
+        in_fmt,
+        in_layout,
+        in_rate,
+        Sample::F32(SampleType::Packed),
+        ffmpeg::ChannelLayout::STEREO,
+        OUT_RATE,
+    )
+    .map_err(|e| format!("swresample init: {e}"))?;
+
+    Ok(AudioDecodeCtx {
+        ictx,
+        stream_index,
+        decoder,
+        resampler,
+        in_rate,
+    })
+}
+
 /// 音声ファイルを全尺デコードして 48kHz interleaved stereo f32 PCM を返す。
 ///
 /// `cancel` が立ったら途中で `Err` を返して打ち切る (呼び出し側ワーカーが結果を破棄する)。
@@ -115,59 +226,19 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
     total_duration_secs: f64,
     mut on_partial: impl FnMut(&[f32], u32),
 ) -> Result<DecodedAudio, String> {
-    ensure_ffmpeg_init();
-
-    let pb = path.to_path_buf();
-    let mut ictx = ffmpeg::format::input(&pb).map_err(|e| format!("format::input: {e}"))?;
-
-    // 最良の音声ストリームを選ぶ。`stream.parameters()` は stream を借用するので、
-    // codec context の構築まで stream スコープ内で済ませてから owned な context を取り出す
-    // (この後 ictx.packets() が ictx を可変借用するため)。
-    let (stream_index, codec_ctx) = {
-        let stream = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Audio)
-            .ok_or_else(|| "音声ストリームが見つかりません".to_string())?;
-        let idx = stream.index();
-        let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|e| format!("codec context: {e}"))?;
-        (idx, ctx)
-    };
-    let mut decoder = codec_ctx
-        .decoder()
-        .audio()
-        .map_err(|e| format!("audio decoder open: {e}"))?;
-
-    let in_fmt = decoder.format();
-    let in_rate = decoder.rate();
-    // レイアウト未指定 (AV_CHANNEL_ORDER_UNSPEC、古い WMA 等) だと swresample::get2 が
-    // 内部の mask().unwrap() で panic するので、チャンネル数から既定レイアウトへ差し替える
-    // (video/decoder.rs の normalize_audio_input_layout と同じ手順)。
-    let in_layout = normalize_layout(decoder.ch_layout());
-
-    let mut resampler = ResampleContext::get2(
-        in_fmt,
-        in_layout,
+    let AudioDecodeCtx {
+        mut ictx,
+        stream_index,
+        mut decoder,
+        mut resampler,
         in_rate,
-        Sample::F32(SampleType::Packed),
-        ffmpeg::ChannelLayout::STEREO,
-        OUT_RATE,
-    )
-    .map_err(|e| format!("swresample init: {e}"))?;
+    } = open_audio_decode(path)?;
 
     let mut out: Vec<f32> = Vec::new();
     let mut frame = AudioFrame::empty();
 
-    // progressive partial emit のスケジュール状態。
-    let initial_partial_frames = (PARTIAL_INITIAL_SECS * OUT_RATE as f64) as usize;
-    // 全長の 50% を超えたら partial を止める（final がすぐ後を追うため）。全長不明なら抑制なし。
-    let half_frames = if total_duration_secs > 0.0 {
-        (total_duration_secs * 0.5 * OUT_RATE as f64) as usize
-    } else {
-        usize::MAX
-    };
-    let mut last_emit_frames = 0usize;
-    let mut last_emit_at: Option<Instant> = None;
+    // progressive partial emit のスケジュール状態 (幾何級数 + wall-clock throttle + 50% 抑制)。
+    let mut schedule = PartialEmitSchedule::new(total_duration_secs);
 
     for res in ictx.packets() {
         if cancel.load(Ordering::Relaxed) {
@@ -183,16 +254,11 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
         }
         drain_decoder(&mut decoder, &mut frame, &mut resampler, &mut out, in_rate)?;
 
-        // progressive partial: 幾何級数マイルストーン + wall-clock throttle + 50% 抑制。
+        // progressive partial: 蓄積プレフィックス全体を呼び出し側へ渡す (ゼロコピー借用)。
         let frames = out.len() / OUT_CHANNELS;
-        let threshold = next_partial_threshold_frames(last_emit_frames, initial_partial_frames);
-        if frames >= threshold
-            && frames < half_frames
-            && last_emit_at.is_none_or(|t| t.elapsed() >= PARTIAL_EMIT_MIN_INTERVAL)
-        {
+        if schedule.should_emit(frames) {
             on_partial(&out, OUT_RATE);
-            last_emit_frames = frames;
-            last_emit_at = Some(Instant::now());
+            schedule.record_emitted(frames);
         }
     }
 
@@ -210,6 +276,86 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
             duration_secs,
         },
         stereo_samples: out,
+    })
+}
+
+/// 音楽ビュー下段スペクトラム (Inc 4) 用の progressive デコード。
+///
+/// `decode_audio_file_to_stereo_f32_streaming` と違い、最終 PCM をこの関数内に蓄積して返さず、
+/// フレーム drain ごとに **新たにデコードした差分**だけを `on_delta(&new_samples, sample_rate)`
+/// で呼び出し側へ渡す (ゼロコピー借用、`&[f32]` は次の drain まで有効)。呼び出し側
+/// (`run_music_analysis`) はこの差分を共有 `MusicPcm` バッファへ末尾 append するので、全尺
+/// デコード完了を待たず、再生位置がデコード済み範囲にあれば下段スペクトラムが即描画できる
+/// (docs/music-integration-plan.md §5.6/§11)。この関数は PCM を保持しない (= 呼び出し側の
+/// 共有バッファと二重常駐しない)。timeline の progressive 先出し / 最終確定は呼び出し側が共有
+/// バッファのプレフィックスから行う (二重デコードなし)。`cancel` は decode 中に確認する。
+///
+/// `on_delta` が `Err` を返したら (呼び出し側の共有バッファ確保失敗など) その場でデコードを
+/// 打ち切り、その `Err` をこの関数の `Err` として返す (長尺 OOM を abort させず上位へ返す)。
+/// 返り値 (`Ok`) は `AudioStreamInfo` (実サンプル数から算出した長さ等)。
+pub fn decode_audio_file_progressive(
+    path: &Path,
+    cancel: &AtomicBool,
+    mut on_delta: impl FnMut(&[f32], u32) -> Result<(), String>,
+) -> Result<AudioStreamInfo, String> {
+    let AudioDecodeCtx {
+        mut ictx,
+        stream_index,
+        mut decoder,
+        mut resampler,
+        in_rate,
+    } = open_audio_decode(path)?;
+
+    let mut frame = AudioFrame::empty();
+    // drain した差分だけを載せる再利用スクラッチ (差分を on_delta へ渡すたび clear)。
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut total_frames = 0usize;
+
+    for res in ictx.packets() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        let (stream, packet) = res.map_err(|e| format!("demux: {e}"))?;
+        if stream.index() != stream_index {
+            continue;
+        }
+        if decoder.send_packet(&packet).is_err() {
+            // 1 packet の decode 失敗は致命的でない (壊れフレーム等) ので継続。
+            continue;
+        }
+        scratch.clear();
+        drain_decoder(
+            &mut decoder,
+            &mut frame,
+            &mut resampler,
+            &mut scratch,
+            in_rate,
+        )?;
+        if !scratch.is_empty() {
+            total_frames += scratch.len() / OUT_CHANNELS;
+            on_delta(&scratch, OUT_RATE)?;
+        }
+    }
+
+    // EOF: decoder に溜まった残りフレームを drain する。
+    let _ = decoder.send_eof();
+    scratch.clear();
+    drain_decoder(
+        &mut decoder,
+        &mut frame,
+        &mut resampler,
+        &mut scratch,
+        in_rate,
+    )?;
+    if !scratch.is_empty() {
+        total_frames += scratch.len() / OUT_CHANNELS;
+        on_delta(&scratch, OUT_RATE)?;
+    }
+
+    Ok(AudioStreamInfo {
+        sample_rate: OUT_RATE,
+        channels: OUT_CHANNELS as u16,
+        duration_secs: total_frames as f64 / OUT_RATE as f64,
     })
 }
 

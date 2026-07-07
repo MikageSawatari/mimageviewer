@@ -7,18 +7,22 @@
 //!   が所有し、UI から `MusicSpectrumRequest` を受けて `analyze_moving_window` を回す。
 //! - 解析窓は再生位置周辺 **±1 秒** の PCM。この窓幅 (~96k サンプル) は cpal ring buffer
 //!   (`src/video/audio.rs` の `AudioBuffer.processed`、約 100ms 分) では全く足りないため、
-//!   ラボと同じく **展開済み全尺 PCM を playhead 周辺でスライス** する
+//!   ラボと同じく **展開済み PCM を playhead 周辺でスライス** する
 //!   (`docs/music-integration-plan.md` 案A、§11 の「ring buffer tap の口」に決着)。
-//! - PCM は解析ワーカー (`app.rs` の `run_music_analysis`) が全尺デコードした 48kHz interleaved
-//!   stereo f32 を `Arc<MusicPcm>` で保持したもの。UI スレッドは `Arc` を渡すだけで、窓の
-//!   切り出しはワーカー側で行う (ゼロコピー)。
+//! - PCM は解析ワーカー (`app.rs` の `run_music_analysis`) がデコードした 48kHz interleaved
+//!   stereo f32 を `Arc<MusicPcm>` で保持したもの。**progressive**: `MusicPcm` は追記式共有バッファ
+//!   (`RwLock<Vec<f32>>`) で、ワーカーがデコード開始前に空の `Arc` を UI へ渡し、以降差分を末尾
+//!   `append` する。UI スレッドは `Arc` を渡すだけで、窓の切り出し (`copy_window`) はワーカー側で
+//!   行う。これで全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば下段グラフが出る
+//!   (§5.6、長尺ファイルの出現遅延対策)。`RwLock` は解析 read と窓コピー read を並行させ spectrum を
+//!   固まらせないため (詳細は `MusicPcm` の doc)。
 //!
 //! 描画 (`draw`) のピクセル/カラー計算はラボ実装を字面どおり移植している (ラボが機能の正本、
 //! §2.1「再利用する」原則)。egui 依存があるため music-core には置けず本体側モジュールとして持つ。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use music_core::{
@@ -72,14 +76,124 @@ const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 /// 過剰リクエストを抑える (1 フレーム 1 リクエストが上限)。
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
 
-/// 音楽ビューの再生位置周辺スペクトラム用に、解析ワーカーが全尺デコードした PCM。
-/// 48kHz interleaved stereo f32。再生エンジン (`VideoPlayer`) とは独立した、時刻でインデクス
-/// できる並行コピー (再生バッファそのものではない)。
+/// 音楽ビューの再生位置周辺スペクトラム用に、解析ワーカーがデコードした PCM を保持する
+/// 共有バッファ。48kHz interleaved stereo f32。再生エンジン (`VideoPlayer`) とは独立した、
+/// 時刻でインデクスできる並行コピー (再生バッファそのものではない)。
+///
+/// **progressive**: 解析ワーカーはデコード開始前にこの (空の) バッファを `Arc` で UI へ渡し、
+/// 以降デコード差分を末尾 `append` する。spectrum worker は再生位置 ±1 秒窓だけを読み取ってコピー
+/// し FFT に渡すので、全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば下段グラフを描ける
+/// (docs/music-integration-plan.md §5.6)。`Vec` を丸ごと clone しないので常駐は 1 曲分 1×。
+///
+/// `samples` を **`RwLock`** で包む理由: timeline の partial/最終確定解析 (`with_prefix` が
+/// `analyze_stereo_timeline` を回す = **長い読み取り**) と、spectrum worker の窓コピー
+/// (`copy_window` = **短い読み取り**) は共に read なので **同時に走れる**。`Mutex` だと解析中に
+/// spectrum が固まる (実機 FB 2026-07-07) が、`RwLock` なら長い解析 read と並行して spectrum read が
+/// 進むので固まらない。追記 (`append` = write) だけが短時間 read を排他する (追記は解析と同じデコード
+/// スレッド上で逐次実行なので、解析中に write は来ない)。UI スレッドは `is_complete` の atomic 読みと
+/// `Arc` clone しかせず lock を取らない。
 pub struct MusicPcm {
-    /// interleaved stereo f32 サンプル (`[-1.0, 1.0]`)。
-    pub samples: Vec<f32>,
-    /// サンプルレート (Hz)。`audio_decode` の出力なので通常 48000。
+    /// interleaved stereo f32 サンプル (`[-1.0, 1.0]`)。デコード進行に合わせて末尾追記される。
+    samples: RwLock<Vec<f32>>,
+    /// サンプルレート (Hz)。`audio_decode` の出力なので通常 48000。デコード中は不変。
     pub sample_rate: u32,
+    /// デコード完了フラグ (true = これ以上 `append` されない)。ローディング表示の抑制に使う。
+    complete: AtomicBool,
+}
+
+impl MusicPcm {
+    /// 空の共有 PCM を作る。`reserve_frames` (フレーム数) 分だけ容量を **best-effort で**先取りし、
+    /// 追記中の再確保 (長尺では数百 MB 級 memcpy → latency スパイク) を避ける。先取りは `try_reserve`
+    /// なので、巨大 / bogus な reserve でも abort せず、失敗時は空容量で始める (`append` が incremental
+    /// に `try_reserve` して確保失敗を Err で返す)。
+    pub fn with_capacity(sample_rate: u32, reserve_frames: usize) -> Self {
+        let mut samples: Vec<f32> = Vec::new();
+        let _ = samples.try_reserve(reserve_frames.saturating_mul(2));
+        Self {
+            samples: RwLock::new(samples),
+            sample_rate,
+            complete: AtomicBool::new(false),
+        }
+    }
+
+    /// 中毒 (poison) を無視して read/write ロックする。窓コピー / 追記 / プレフィックス解析の
+    /// いずれも `Vec` を壊さないので、稀な panic 後も残データで続行してよい。
+    fn read_samples(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+        self.samples.read().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn write_samples(&self) -> RwLockWriteGuard<'_, Vec<f32>> {
+        self.samples.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// デコード済みサンプル (interleaved stereo f32) を末尾追記する (解析ワーカー専用、write ロック)。
+    /// 長尺で GB 級に膨らんでも abort させないよう `try_reserve` で確保し、失敗時は `TryReserveError`
+    /// を返す (呼び出し側がデコードを打ち切る。旧 `append_resampled` の try_reserve 方針を共有バッファ
+    /// でも維持)。
+    pub fn append(&self, delta: &[f32]) -> Result<(), std::collections::TryReserveError> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.write_samples();
+        guard.try_reserve(delta.len())?;
+        guard.extend_from_slice(delta);
+        Ok(())
+    }
+
+    /// これ以上追記しないことを表明する (デコード完了 / 打ち切り時)。
+    pub fn mark_complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+
+    /// デコードが完了しているか。
+    pub fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    /// これまでにデコード済みのフレーム数 (= interleaved サンプル数 / 2)。partial のマイルストーン
+    /// 判定に使う (read ロック)。
+    pub fn decoded_frames(&self) -> usize {
+        self.read_samples().len() / 2
+    }
+
+    /// 現在のデコード済みプレフィックス全体を **read ロック**下で `f` に渡す。timeline の progressive
+    /// 先出し / 最終確定解析で使う。`f` (= `analyze_stereo_timeline`) の実行中も read ロックなので、
+    /// spectrum worker の窓コピー (同じく read) は **並行して進める** (固まらない)。追記 (write) だけは
+    /// この read が終わるまで待つが、追記は同じデコードスレッド上で逐次実行なので競合しない。
+    pub fn with_prefix<R>(&self, f: impl FnOnce(&[f32], u32) -> R) -> R {
+        let guard = self.read_samples();
+        f(&guard, self.sample_rate)
+    }
+
+    /// 再生位置 `center_frame` ±`radius_secs` の窓を **read ロック**下でコピーして返す (spectrum
+    /// worker 用)。デコード済み範囲に窓が取れなければ `None` (= まだ描けない)。窓は最大でも ~96k
+    /// フレーム (2 秒幅) なのでコピーは 1MB 未満、read ロック保持は sub-ms。read なので `with_prefix`
+    /// の長い解析 read とも並行して進める (固まらない)。
+    ///
+    /// progressive 特有: デコード**未完了**で、再生位置が窓半径を超えてデコード済み先端より先を指す
+    /// (= 窓がデコード済み領域と全く重ならない。seek forward で未デコード領域へ飛んだ等) 場合は、
+    /// `spectrum_window_range` の末尾クランプによる **stale な末尾窓**を返さず `None` にして「解析中」
+    /// を維持する。窓が一部でもデコード済み領域に重なる (再生が先端に追いつきかけ) 場合や、デコード
+    /// 完了後は従来どおりクランプに委ねる (末尾 ±1s の spectrum は妥当)。
+    fn copy_window(&self, center_frame: usize, radius_secs: f64) -> Option<(Vec<f32>, f64)> {
+        let guard = self.read_samples();
+        let available_frames = guard.len() / 2;
+        if !self.is_complete() {
+            // spectrum_window_range と同じ半径換算で「重なりなし」を判定する。
+            let radius_frames = (radius_secs.max(0.05) * self.sample_rate.max(1) as f64)
+                .round()
+                .max(1.0) as usize;
+            if center_frame.saturating_sub(radius_frames) >= available_frames {
+                return None;
+            }
+        }
+        let (start_frame, end_frame, local_center) = spectrum_window_range(
+            available_frames,
+            self.sample_rate,
+            center_frame,
+            radius_secs,
+        )?;
+        Some((guard[start_frame * 2..end_frame * 2].to_vec(), local_center))
+    }
 }
 
 struct MusicSpectrumRequest {
@@ -114,6 +228,11 @@ pub struct MusicSpectrumState {
     note_even: Vec<f32>,
     /// 縦グラデ用: 奇数倍音サポート (鍵の上方向の伸び) を平滑保持。
     note_odd: Vec<f32>,
+    /// 直近 `update` で PCM (`Arc<MusicPcm>`) が渡っていたか。false = まだ解析ワーカー起動待ち。
+    source_present: bool,
+    /// 直近 `update` で PCM のデコードが完了していたか。バンドが空でこれが false の間は
+    /// 「解析中」表示を出す (progressive で下段グラフが出るまで無反応に見せない)。
+    source_complete: bool,
 }
 
 impl Default for MusicSpectrumState {
@@ -134,6 +253,8 @@ impl Default for MusicSpectrumState {
             note_trail: Vec::new(),
             note_even: Vec::new(),
             note_odd: Vec::new(),
+            source_present: false,
+            source_complete: false,
         }
     }
 }
@@ -160,6 +281,8 @@ impl MusicSpectrumState {
         self.pending = false;
         self.last_request = None;
         self.last_center = f64::NEG_INFINITY;
+        self.source_present = false;
+        self.source_complete = false;
     }
 
     fn cancel_worker(&mut self) {
@@ -200,8 +323,11 @@ impl MusicSpectrumState {
 
     /// 1 フレーム分の更新: ワーカー結果を取り込み、必要なら新しいリクエストを送る。
     ///
-    /// `pcm` が None (まだデコード中) の間は何もリクエストしない
-    /// (描画は空バンド = 鍵盤ベースラインのみ)。再生中 or 結果待ちの間は軽い間隔で repaint を要求。
+    /// `pcm` が None (まだ解析ワーカー起動待ち) の間は何もリクエストしない。progressive では
+    /// `pcm` はデコード開始前から Some (中身は追記中) なので、再生位置がデコード済み範囲に入り
+    /// 次第 spectrum worker が窓を返す。まだ窓が取れない (未デコード領域) 間はバンド空 = 鍵盤
+    /// ベースライン + 「解析中」表示。再生中 or 結果待ちの間は軽い間隔で repaint を要求
+    /// (デコード進行中の repaint は `poll_music_analysis` の 50ms tick が駆動する)。
     pub fn update(
         &mut self,
         ctx: &egui::Context,
@@ -210,6 +336,9 @@ impl MusicSpectrumState {
         playing: bool,
     ) {
         self.poll();
+
+        self.source_present = pcm.is_some();
+        self.source_complete = pcm.is_some_and(|p| p.is_complete());
 
         let Some(pcm) = pcm else {
             return;
@@ -319,6 +448,17 @@ impl MusicSpectrumState {
                 &mut self.note_even,
                 &mut self.note_odd,
             );
+            // まだデコード中 (窓が取れない) 間はプロット領域に「解析中」を出し、無反応に見せない。
+            // デコード完了後にバンドが空 = 無音区間なので、その場合はラベルを出さない。
+            if self.source_present && !self.source_complete {
+                painter.text(
+                    plot.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "スペクトラム解析中…",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgba_unmultiplied(180, 200, 220, 170),
+                );
+            }
             return;
         }
         let band_len = self.bands.len();
@@ -436,20 +576,13 @@ fn compute_spectrum(
     request: &MusicSpectrumRequest,
 ) -> SpectrumAnalysis {
     let pcm = &request.pcm;
-    let available_frames = pcm.samples.len() / 2;
     let center_frame =
         (request.center_secs.max(0.0) * pcm.sample_rate.max(1) as f64).round() as usize;
-    match spectrum_window_range(
-        available_frames,
-        pcm.sample_rate,
-        center_frame,
-        SPECTRUM_SNAPSHOT_RADIUS_SECS,
-    ) {
-        Some((start_frame, end_frame, local_center)) => analyzer.analyze_moving_window(
-            &pcm.samples[start_frame * 2..end_frame * 2],
-            pcm.sample_rate,
-            local_center,
-        ),
+    // デコード済みプレフィックスから窓をコピー (progressive: 未デコード領域を中心に指すと None)。
+    match pcm.copy_window(center_frame, SPECTRUM_SNAPSHOT_RADIUS_SECS) {
+        Some((window, local_center)) => {
+            analyzer.analyze_moving_window(&window, pcm.sample_rate, local_center)
+        }
         None => SpectrumAnalysis::default(),
     }
 }
@@ -1058,6 +1191,63 @@ mod tests {
     fn window_range_rejects_empty() {
         assert!(spectrum_window_range(0, 48_000, 0, 1.0).is_none());
         assert!(spectrum_window_range(100, 0, 0, 1.0).is_none());
+    }
+
+    #[test]
+    fn music_pcm_progressive_append_grows_and_windows() {
+        // progressive: 空バッファは窓が取れない → None (下段は「解析中」表示のまま)。
+        let pcm = MusicPcm::with_capacity(10, 0);
+        assert_eq!(pcm.decoded_frames(), 0);
+        assert!(!pcm.is_complete());
+        assert!(pcm.copy_window(0, 1.0).is_none());
+
+        // 10Hz で 10 フレーム (interleaved stereo = 20 サンプル) 追記。
+        let delta: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        pcm.append(&delta).unwrap();
+        assert_eq!(pcm.decoded_frames(), 10);
+
+        // frame 6 中心 / radius 0.2s @10Hz → [4,9) の窓 (spectrum_window_range と一致)。
+        let (window, center) = pcm
+            .copy_window(6, 0.2)
+            .expect("window available after append");
+        assert_eq!(window.len(), (9 - 4) * 2);
+        // 窓先頭は frame 4 → interleaved index 8。
+        assert_eq!(window[0], 8.0);
+        assert!((center - 0.2).abs() < 1.0e-9);
+
+        // さらに追記するとデコード済みフレームが伸びる (progressive)。
+        pcm.append(&delta).unwrap();
+        assert_eq!(pcm.decoded_frames(), 20);
+
+        pcm.mark_complete();
+        assert!(pcm.is_complete());
+    }
+
+    #[test]
+    fn music_pcm_ahead_of_frontier_returns_none_until_complete() {
+        // 10Hz、10 フレームだけデコード済み (先端 = frame 10)。
+        let pcm = MusicPcm::with_capacity(10, 0);
+        pcm.append(&(0..20).map(|i| i as f32).collect::<Vec<f32>>())
+            .unwrap();
+
+        // 未完了で、再生位置が先端より窓半径 (0.2s @10Hz = 2 フレーム) を超えて先 (frame 50) →
+        // 窓がデコード済み領域と重ならないので stale 末尾窓を返さず None (「解析中」維持)。
+        assert!(pcm.copy_window(50, 0.2).is_none());
+        // 先端付近 (frame 11、半径内で重なる) はクランプされた窓を返す (追いつきかけの許容)。
+        assert!(pcm.copy_window(11, 0.2).is_some());
+
+        // デコード完了後は seek forward でも従来どおり末尾クランプ窓を返す (末尾 spectrum は妥当)。
+        pcm.mark_complete();
+        assert!(pcm.copy_window(50, 0.2).is_some());
+    }
+
+    #[test]
+    fn music_pcm_with_prefix_sees_current_samples() {
+        let pcm = MusicPcm::with_capacity(48_000, 4);
+        pcm.append(&[1.0, 2.0, 3.0, 4.0]).unwrap(); // 2 frames
+        let (len, rate) = pcm.with_prefix(|prefix, rate| (prefix.len(), rate));
+        assert_eq!(len, 4);
+        assert_eq!(rate, 48_000);
     }
 
     #[test]

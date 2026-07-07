@@ -285,9 +285,24 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
     左パネルは同じブックマークデータを一覧描画するだけ（動画はシークバー/HUD 上に出す差だけ）。
 
 ### 5.6 MIDI 半音 spectrum（下段アナライザ）
-- `SpectrumAnalyzer` 常駐 worker。解析ワーカーが保持する全尺 PCM から、再生位置周辺 ±1 秒の
+- `SpectrumAnalyzer` 常駐 worker。解析ワーカーが保持する PCM から、再生位置周辺 ±1 秒の
   window をスライスして取得する（`src/video/audio.rs` の playback ring buffer は窓幅不足のため
-  使わない。§11 参照）。全尺 timeline 解析の完了を待たない（PCM デコード後に動く）。
+  使わない。§11 参照）。
+- **progressive PCM（長尺の下段グラフ出現遅延対策、2026-07-07）**: `MusicPcm` は
+  `RwLock<Vec<f32>>` の**追記式共有バッファ**。解析ワーカーは**デコード開始前に空の
+  `Arc<MusicPcm>` を `Pcm` メッセージで UI へ渡し**、以降デコード差分を末尾 `append`（write）する。
+  spectrum worker は再生位置 ±1 秒窓だけを read でコピー（`copy_window`、~1MB 未満）して FFT に
+  渡すので、**全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば下段グラフが即描く**。
+  `RwLock` にするのは、timeline の partial/最終確定解析（`with_prefix` = `analyze_stereo_timeline`
+  を回す**長い read**）と spectrum の窓コピー（**短い read**）を**同時に走らせて spectrum を固まらせ
+  ない**ため（`Mutex` だと解析中に spectrum がフリーズする実機 FB → RwLock で解消）。追記（write）は
+  解析と同じデコードスレッド上で逐次なので競合しない。
+  未デコード領域が中心のときは窓 `None` = 鍵盤ベースライン + 「解析中」表示。以前は全尺デコード
+  完了後に PCM を 1 回だけ送っていたため、74 分級で下段グラフが数十秒出なかった（timeline は
+  progressive 先出しで早いのに下段だけ遅れる不整合）。バッファ容量は probe duration から先取り
+  （追記中の数百 MB 級 realloc memcpy 回避、bogus probe の OOM 予防に上限クランプ）。常駐は
+  1 曲分 1×（clone しないので従来と同じ、§11）。timeline の progressive partial / 最終確定も同じ
+  共有バッファのプレフィックス（`with_prefix` で lock 下解析）から作る（二重デコードなし）。
 
 ### 5.7 動画→音声モード（映像カット + 引き継ぎ）
 - `MediaVisualMode`（現状 **本体未参照**、music-core にのみ存在）を本体で初めて使う。
@@ -1182,10 +1197,15 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   - `SpectrumAnalyzer` 常駐 worker + 展開済み PCM の playhead ±1s スライス（案A、§11 で確定）。
   - ✅ `src/ui_music_spectrum.rs`（新規）: `MusicSpectrumState`（常駐ワーカー + 描画状態を封じる）+
     `MusicPcm`（Arc 共有 PCM）+ ラボの `draw_spectrum` / `draw_pitch_keyboard` / spectrum color helper
-    移植。窓切り出し（`spectrum_window_range`）はワーカー側でゼロコピー。高々 1 in-flight + coalesce。
+    移植。窓切り出し（`spectrum_window_range`）はワーカー側で行う。高々 1 in-flight + coalesce。
   - ✅ `run_music_analysis`（app.rs）: 全尺 PCM を **1 回だけ**デコードして timeline と spectrum で共有。
     `MusicAnalysisMsg::{Timeline, Pcm}` の 2 メッセージ化（cache hit は timeline 即送 → PCM 追送）。
     `poll_music_analysis` は Disconnected まで drain。close/新ファイルで `music_spectrum.clear()` + `music_pcm=None`。
+  - ✅ **progressive spectrum PCM（2026-07-07）**: `MusicPcm` を `Mutex<Vec<f32>>` の追記式共有バッファに
+    変更し、`Pcm` メッセージをデコード**開始前**に送る（`decode_audio_file_progressive` が差分を
+    `append`、spectrum worker は `copy_window` で ±1s 窓をコピー）。74 分級で下段グラフが数十秒出ない
+    問題を解消（§5.6 / §11）。下段に「解析中…」ローディング表示を追加。unit test =
+    `music_pcm_progressive_append_grows_and_windows` / `music_pcm_with_prefix_sees_current_samples`。
   - ✅ `draw_fs_music_view`: 中央領域の下端に spectrum 帯（180px）を確保、`update` + `draw` を配線。
   - ✅ ビルド緑 + bin test 3122 緑（spectrum 単体 7 本）+ fmt clean + clippy 新規警告なし。
   - **⚠️ 実機未検証**: 実際に音が鳴る中でのスペクトラム挙動 / 鍵盤ハイライト / ホバーはユーザー GUI 目視待ち
@@ -1328,6 +1348,30 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   だけ（O(窓)）で常駐 PCM 全体を毎フレーム走査しない。cache hit 時は timeline は即表示のまま、
   spectrum 用 PCM だけ背景デコードで後追い（mIV は既に timeline が全尺デコード待ちのため挙動は一貫）。実装 = `src/ui_music_spectrum.rs`（`MusicSpectrumState` / `MusicPcm` / 常駐ワーカー）+
   `run_music_analysis` の PCM 追送（`MusicAnalysisMsg::{Timeline,Pcm}`）。
+  - **progressive 化（2026-07-07、下段グラフ出現遅延の解消）**: 上記は「全尺デコード完了後に PCM を
+    1 回 `move` で渡す」方式だったため、74 分級（~1.7GB）では下段スペクトラムが数十秒出ない（timeline は
+    progressive 先出しで早いのに下段だけ全尺完了待ちの不整合、実機 FB で NG）。対策として `MusicPcm` を
+    **追記式共有バッファ**（`RwLock<Vec<f32>>` + `complete: AtomicBool`）に変更し、`Pcm` メッセージを
+    **デコード開始前**に送る。デコードは `src/audio_decode.rs` の新 API `decode_audio_file_progressive`
+    （差分 `on_delta` を渡す・PCM を関数内に保持しない = 二重常駐なし）で回し、`run_music_analysis` が
+    差分を `append`（write）。spectrum worker は `copy_window` で再生位置 ±1s 窓だけを read でコピー
+    （~1MB 未満、sub-ms）。**`RwLock` にした理由（実機 FB 2026-07-07）**: 当初 `Mutex` で試したところ、
+    partial/最終確定解析（`with_prefix` が `analyze_stereo_timeline` を回す間ロック保持）が spectrum の
+    `copy_window` をブロックし、**分割ロード中に spectrum がときどき固まった**。partial/spectrum は共に
+    read なので `RwLock` にすると長い解析 read と spectrum read が並行し、固まらない（append=write だけが
+    短時間排他、かつ解析と同じデコードスレッド上で逐次なので競合しない）。**メモリは 1× のまま**（従来も全尺 PCM 常駐で、clone は増やしていない。むしろ probe
+    duration からの容量先取りで追記中の realloc memcpy を消した）。timeline の partial / 最終確定も同じ
+    共有バッファのプレフィックス（`with_prefix`）から作る。`decode_audio_file_to_stereo_f32_streaming`
+    と共通のセットアップ（`open_audio_decode`）・partial スケジュール（`PartialEmitSchedule`）は抽出して
+    共有。下段プロットに「解析中…」ローディング表示を追加（`MusicSpectrumState.source_complete`）。
+    メモリ削減（ダウンサンプル別 PCM 等）は spectrum が 18kHz まで見るため 48kHz を落とせず、instant-seek
+    のため全尺常駐が必要なので**据え置き**（1× のまま。長尺の 1.7GB 常駐は instant-seek + フル帯域の対価）。
+    共有バッファの容量先取り（`with_capacity`）と追記（`append`）は旧 `append_resampled` と同じく
+    **`try_reserve`** を使い、長尺 OOM を abort させず `Err`（→ timeline は破壊せず spectrum を諦める）で
+    返す（Codex P1）。再生位置がデコード先端を窓半径超で追い越した場合（seek forward で未デコード領域）は
+    `copy_window` が stale 末尾窓を返さず `None`（=「解析中」維持、デコード完了後は従来クランプ、Codex P2）。
+    `PartialEmitSchedule` の throttle 起点は `record_emitted`（on_partial 完了後）で進め、重い partial 解析
+    でも旧スケジュールを保つ（Codex P2）。
 - **音量 normalize と音楽ビューの関係**（Inc 3/6）: 動画と同じ normalize スキャンを音声にも適用するか。
 
 ---
