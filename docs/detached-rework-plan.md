@@ -186,7 +186,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | R1c | **完了** (727507e8、検収合格 + 実機で見開き/動画 F12 の解消確認 = **ゲート B 通過**) | [stage-r1c](detached-rework-stage-r1c.md) | 全 resync を gated wrapper に一本化 (遅延不可 reason なし)、見開き 2 ページ凍結。方針変更: 既定サイズ拒否ヒューリスティックは BA-5 根治まで残す |
 | R2a | **完了** (807dbbf7、Fable 検収合格 2026-07-06) | [stage-r2a](detached-rework-stage-r2a.md) | Runtime 導入 + registry 吸収 + shadow state。state の読み取りは診断ログ 1 箇所のみ = 挙動不変を確認。hwnd テスト 7 本緑 |
 | R2b | **fix3 (c192a09a) まで適用済み・Fable 検収合格。実機 gate は帰宅後バッチで** | [stage-r2b](detached-rework-stage-r2b.md) | 所見履歴: [findings-1](detached-rework-stage-r2b-findings-1.md) F1〜F4 → fix1 (76f36d94) / [findings-2](detached-rework-stage-r2b-findings-2.md) F5 クリック復帰不能 → fix2 (bfc6f530、実機確認済) / [findings-3](detached-rework-stage-r2b-findings-3.md) F6 メイン文脈持ち逃げ + F7 復帰時窓再生成 → fix3 (preserve_main_context clone 戻し + 復帰 commit を passive render 後に遅延、テスト固定)。F7 は **BA-5 gap フレームと確定 (実害 3 件目) → エスカレーション条件成立、R2d 新設** |
-| R2c | **完了** (5858e391、Fable 検収合格 2026-07-06) | [stage-r2c](detached-rework-stage-r2c.md) | placement 旧フィールド grep 0 件・既定サイズ拒否は runtime 付け替えで温存・入力経路表 (§3.0.1) 追加。⚠ 報告 2 件は既知/backlog: 音声 F12 detached は意図的 no-op (音楽 Inc7 で先送り済み)、gamepad folder-nav の foreground 依存は rework 外 backlog |
+| R2c | **完了** (5858e391、Fable 検収合格 2026-07-06) | [stage-r2c](detached-rework-stage-r2c.md) | placement 旧フィールド grep 0 件・既定サイズ拒否は runtime 付け替えで温存・入力経路表 (§3.0.1) 追加。⚠ 報告 2 件は既知/backlog: 当時は音声 F12 detached が意図的 no-op (音楽 Inc7 で先送り、後続 stage-audio で解除)、gamepad folder-nav の foreground 依存は rework 外 backlog |
 | R2d | **完了** (本体 55643b7b + fix1 67996621、実機確認済み 2026-07-06 夜) | [stage-r2d](detached-rework-stage-r2d.md) | 実機バッチで live-park 通し・メイン文脈無傷・動画窓 HWND 安定を確認。fix1 = deferred→immediate 復帰の未登録フレームを「activation commit の次 root frame 遅延」で解消 (実機でちらつき消失確認)。**残リスク: ParkedLive は BA-5 非免疫** (ゲート C / R4 で再評価) |
 
 | findings-4 | fix (5a130ec9) 適用も **F8-v2 実機 NG** → CUT で経路ごと削除する方針に転換 | [findings-4](detached-rework-findings-4.md) | ログ確定: 連動窓の park が `park_legacy_active_to_passive` で Parked→Closing に上書きされ、Closing ガードが復帰要求を無限に無視。F9 (session_begin ストーム) / F10 (ログ間引き) は 5a130ec9 で対応済み |
@@ -197,19 +197,17 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | findings-10 | **完了** (4901ac4f、実機で切替/PDF サムネ/別窓 PDF の解消確認 2026-07-07) | [findings-10](detached-rework-findings-10.md) | **B1 の clear-on-park (`handoff_clear_host_for_deferred`) を撤去**。park のたびに登録 hwnd を捨てる → 未確定化 → R2d 直列化が `show_viewport_deferred` をスキップ → egui が OS 窓を破棄・再生成する多窓 churn (実機 4 症状の主因)。証拠 = id=2 の park→再採用が短間隔では同一 HWND (窓生存)・多窓競合の 4.4s 間隔でのみ HWND 変化。B1 の生存監視/watcher 修復・B2 は残す |
 | findings-11 | **指示書作成済み・実装待ち** (Fable 診断 2026-07-07) | [findings-11](detached-rework-findings-11.md) | C1 = **fa09cc5a (サムネ stale 掃除) の revert**: requested+Evicted は enqueue 後の正常 in-flight 状態で、stale と誤判定して毎フレーム remove→重複 requeue のループ (同一 idx に 2842 回/68s、55 idx)。ログ spam 16MB/68s が close 問題の証拠をローテートで破壊。C2 = 窓 close 時の別窓 消失/突然表示/再表示 (churn とは別機構)。C1/C3 適用後に MIV_DETACHED_WINDOW_DEBUG=1 で再現→機構確定 (修正は Fable 承認制)。C3 = logger デバッグ保持モード (デバッグ env フラグ時のみ 256MB × .bak1-4 の 4 世代、通常 16MB×1 は不変) = 手動ログ退避の廃止 (証拠喪失 2 回の再発防止、ユーザー承認 2026-07-07)。**C1 (c12d721b) / C3 (0a795d64) 完了・検収合格**。C2 の再現ログは C3 初回稼働で完全取得 → findings-12 で機構確定 |
 | findings-12 | **完了** (D1=322c37a8 / D2=2a9f9a4e / D3=e362f3d7、検収合格。実機確認 4 点すべてクリア 2026-07-07: 複数窓切替/close OK・book open 時のグリッド静止 OK・読み込み中 book open のサムネ継続 OK) | [findings-12](detached-rework-findings-12.md) | D1 = close 時フラッシュ: font resync 発火の early-return (update_early, app.rs:44851) が render_detached_image_windows (45667) より前で return し deferred 登録ゼロの pass が発生 → egui が parked 窓を破棄 (BA-5 実害 4 件目)。再生成は initial_placement_applied=true のため既定 533x400 小窓で出現 = フラッシュ。修正 = early-return 前に deferred 登録 + hwnd clear 時に placement 再適用リセット。D2 = watcher repair が close 直後の dying hwnd (未請求化直後・生存中) を隣の窓に geometry 根拠で養子縁組 + 同一クリック二重解釈 (× 押下で隣窓 activate)。修正 = repair は対象窓の登録 hwnd が 0/死亡のときのみ。D3 = book open が main context 経由で load するため bundle 外グローバル (auto_aspect / queue+worker) が汚染 → ①メイングリッドのアスペクトリフロー = 「スクロールする」の正体 ②bundle 復元で requested が孤児化 = 元の「サムネ停止」の真の leak point (Codex の観測は実在、fa09cc5a は検出方法だけが誤り)。修正 = auto_aspect を bundle に追加 + swap-in で requested/pending_finalize クリア |
-| findings-13 | **Phase 1 完了・クローズ** (計装 3bc9ce77、Fable 解析 2026-07-07: 全 2681 フレームで paint 欠落なし + 録画の合成結果クリーン = 消去法で scanout/DWM flip 遷移レベル [アプリ外] と確定。Phase 2 実施せず P3 環境依存としてクローズ、出荷ブロッカーにしない) | [findings-13](detached-rework-findings-13.md) | E1 = OFF モード F12 切り離し瞬間のメイン窓側 1 フレーム白フラッシュ (2026-07-06 のフレーム解析で確定済みのクリア色フレーム、リワーク退行ではない polish)。今回ログ (F12 ×58) で lifecycle 機構はクリーン = 描画/present レベルの穴。Phase 1 = 計装で発生源特定 (メイン pass の paint スキップ present / fs viewport hide 後の swapchain 再構成) → Phase 2 = Fable 承認後に holdover / 順序保証で修正 |
+| findings-13 | **Phase 1 完了・クローズ** (計装 3bc9ce77、Fable 解析 2026-07-07: 全 2681 フレームで paint 欠落なし + 録画の合成結果クリーン = 消去法で scanout/DWM flip 遷移レベル [アプリ外] と確定。Phase 2 実施せず P3 環境依存としてクローズ、出荷ブロッカーにしない) |
+| stage-settings | **完了** (e4e8535e、検収合格 2026-07-07。実機は ship-checklist と合流) | [stage-settings](detached-rework-stage-settings.md) | 設定 UI を「ビューワモード」(フル機能ウィンドウ / 複数ウィンドウ) の 1 構造に再構成。**複数ウィンドウモードは ZIP/PDF/本を常に直開きに固定** (ON×ページ一覧の組み合わせを設計から削除 = 検証パターン削減)。保存キー 3 つは不変 (auto_fullscreen_zip_pdf は v2.2.0 リリース済みのため実効値ヘルパーで override、マイグレーション不要)。findings-7 の ON×直開きOFF 象限テストのみ書き換え許可 |
+| stage-audio | **Phase I 完了** (実装・テスト・release build 完了 2026-07-07、実機 smoke 待ち) | [stage-audio](detached-rework-stage-audio.md) | 音声 detached の no-op 制限解除 (F12 含む)。仕様 = メディア窓は動画と共用 1 本 (VST チェーン 1 本のため)・live-park 同規則・新メディア open で差し替え。`music_*` は bundle 化せず、メディア窓 1 本規則で main との混線を構造的に排除する。音楽機能は次リリース初公開のため非対称を出荷前に解消 (案 A)。 | [findings-13](detached-rework-findings-13.md) | E1 = OFF モード F12 切り離し瞬間のメイン窓側 1 フレーム白フラッシュ (2026-07-06 のフレーム解析で確定済みのクリア色フレーム、リワーク退行ではない polish)。今回ログ (F12 ×58) で lifecycle 機構はクリーン = 描画/present レベルの穴。Phase 1 = 計装で発生源特定 (メイン pass の paint スキップ present / fs viewport hide 後の swapchain 再構成) → Phase 2 = Fable 承認後に holdover / 順序保証で修正 |
 
 **→ R2 全サブステージ完了。ゲート C (2026-07-06 到達)。スコープ決定 = CUT (2026-07-07)。findings-10 で多窓 churn 根治済み。残 = findings-11 (C1 revert + close 挙動の証拠再採取)。**
 
 ## 10. ゲート C 後の候補ステージ (別機能、リワーク出荷スコープ外)
 
-- **音声ファイルの detached 対応** (ユーザー質問 2026-07-06): 現在は意図的 no-op
-  (app.rs の toast 2 種、コミット ce6b757f)。当時のブロッカーだった font atlas 競合
-  (Y-32 系) は R1c の resync gate 統一で根治済みの見込みで、**制限解除は現実的に
-  なった**。ただしリスクは detached 基盤側ではなく音楽ビュー側の配線
-  (`fs_music_view_active` 述語群のメイン viewport 前提 / VST native shell の owner /
-  ParkedLive 中の spectrum 表示仕様)。進め方: ①30 分スパイク (no-op gate を外して
-  実機で font 症状再発を確認) → ②見通し良ければ独立ステージとして仕様確定 + 実装。
+- **音声ファイルの detached 対応** (stage-audio): Phase S 検収合格後、Phase I で実装。
+  音声も単一メディアウィンドウへ合流し、F12 / always-new open を動画と対称に扱う。
+  `music_*` は bundle 化せず global のまま維持し、メディア窓 1 本規則で main 側との混線を排除する。
 | R2 | 未着手 | — | |
 | R3 | 未着手 | — | |
 | R4 | 実施判断待ち (ゲート C) | — | |

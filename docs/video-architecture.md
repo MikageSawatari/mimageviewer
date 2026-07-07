@@ -1559,10 +1559,10 @@ viewer session の表示先は `ViewerPresentation::{MainWindow, Fullscreen, Det
 `Settings.detached_viewer_enabled` は F12 で切り替える「別ウィンドウモード」設定。
 detached が有効なときは画像・動画とも `DetachedWindow` を優先し、閉じた session は
 Enter / ダブルクリック等で次に開くまで再表示しない。
-`Settings.detached_viewer_open_images_in_window` が ON のときも、動画の新規 open は
-`DetachedWindow` を既定にする。ただし動画は静止画 always-new のように複数 window を増やさず、
-既存の detached 動画 host を再利用して source を差し替える。動画表示中の F12 は現在の動画だけの
-一時的な host migration で、この永続既定は変更しない。
+`Settings.detached_viewer_open_images_in_window` が ON のときも、動画 / 音声の新規 open は
+`DetachedWindow` を既定にする。ただしメディアは静止画 always-new のように複数 window を増やさず、
+既存の detached メディア host を再利用して source を差し替える。動画 / 音声表示中の F12 は現在のメディアだけの
+一時的な migration で、この永続既定は変更しない。
 
 | | Fullscreen | MainWindow | DetachedWindow |
 | --- | --- | --- | --- |
@@ -1584,9 +1584,9 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 `NativeVideoPlacement::DetachedViewerChild` として別ウィンドウ host の child HWND に出るが、
 main-window in-window active ではない。
 
-detached 動画を再生したままメイン一覧でフォルダ / お気に入りなどの context を切り替える場合、
-動画は `active_detached_viewer_context` 側へ切り離して再生を維持する。切り離し後は
-メイン一覧の選択変更に追従せず、動画窓内の前後移動は切り離し時に保持していた同一一覧内だけを
+detached メディアを再生したままメイン一覧でフォルダ / お気に入りなどの context を切り替える場合、
+メディアは `active_detached_viewer_context` 側へ切り離して再生を維持する。切り離し後は
+メイン一覧の選択変更に追従せず、メディア窓内の前後移動は切り離し時に保持していた同一一覧内だけを
 対象にする。`Ctrl+↑↓` / `Ctrl+PageUp/PageDown` のフォルダ横断は、静止画のピン /
 always-new 窓と同じく no-op として扱う。
 
@@ -1601,8 +1601,8 @@ always-new 窓と同じく no-op として扱う。
 - F12 の detached mode 切替や main 側同期による host migration は、
   `switch_native_video_viewer_presentation` が `request_id` 付きの
   `NativeVideoOutputCommand::SwitchPlacement` を presenter スレッドへ送る。
-- `detached_viewer_open_images_in_window` ON 中の動画 F12 は、現在の動画だけを
-  MainWindow / Fullscreen と DetachedWindow の間で一時移動する。次に動画を明示 open した場合は、
+- `detached_viewer_open_images_in_window` ON 中の動画 / 音声 F12 は、現在のメディアだけを
+  MainWindow / Fullscreen と DetachedWindow の間で一時移動する。次に動画 / 音声を明示 open した場合は、
   永続設定に従って再び DetachedWindow へ戻る。
 - DetachedWindow へ移行する場合、まず egui detached viewport を作成し、その HWND を
   `find_visible_thread_window_matching_rect` で捕捉する。host が未取得なら open / placement

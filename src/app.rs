@@ -1618,6 +1618,7 @@ struct ActiveDetachedViewerContext {
 pub(crate) enum DetachedSource {
     Image,
     Video,
+    Audio,
     Book,
 }
 
@@ -5944,11 +5945,12 @@ pub struct App {
     /// 次に開く動画だけ resume 位置を無視して先頭から開く one-shot state。
     /// 連続再生の自動遷移では前回視聴位置ではなく 0 秒から再生する。
     pub(crate) fs_video_open_ignore_resume_once: bool,
-    /// 次に開く動画だけ presentation (Main/Fullscreen/Detached) を強制する one-shot state。
+    /// 次に開くメディア (動画/音声) だけ presentation (Main/Fullscreen/Detached) を強制する
+    /// one-shot state。
     /// 連続再生の**自動**次送りでは「別ウィンドウで開く」設定を再適用せず、直前の動画の
     /// presentation を維持する (ユーザー手動ナビは従来どおり設定に従うので None)。
     #[cfg(windows)]
-    pub(crate) fs_video_open_forced_presentation: Option<ViewerPresentation>,
+    pub(crate) fs_media_open_forced_presentation: Option<ViewerPresentation>,
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
     /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
     pub(crate) video_thumb_overrides_dirty: bool,
@@ -8467,7 +8469,7 @@ impl App {
             fs_video_open_autoplay_override: None,
             fs_video_open_ignore_resume_once: false,
             #[cfg(windows)]
-            fs_video_open_forced_presentation: None,
+            fs_media_open_forced_presentation: None,
             video_thumb_overrides_dirty: false,
             #[cfg(windows)]
             pending_pin_thumb_refresh: None,
@@ -24199,7 +24201,31 @@ impl App {
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::PdfPage { .. })
                 | Some(GridItem::Video(_))
+                | Some(GridItem::Audio(_))
         )
+    }
+
+    #[cfg(windows)]
+    fn viewer_item_is_media(&self, idx: usize) -> bool {
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+        )
+    }
+
+    #[cfg(windows)]
+    fn viewer_item_supports_egui_detached_viewport(&self, idx: usize) -> bool {
+        self.viewer_item_supports_detached_still(idx)
+            || matches!(self.items.get(idx), Some(GridItem::Audio(_)))
+    }
+
+    #[cfg(windows)]
+    fn detached_source_for_idx(&self, idx: usize) -> DetachedSource {
+        match self.items.get(idx) {
+            Some(GridItem::Video(_)) => DetachedSource::Video,
+            Some(GridItem::Audio(_)) => DetachedSource::Audio,
+            _ => DetachedSource::Image,
+        }
     }
 
     pub(crate) fn viewer_session_is_detached(&self) -> bool {
@@ -25690,6 +25716,16 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn viewer_context_bundle_detached_source(bundle: &ViewerContextBundle) -> DetachedSource {
+        match bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)) {
+            Some(GridItem::Audio(_)) => DetachedSource::Audio,
+            Some(GridItem::Video(_)) => DetachedSource::Video,
+            _ if Self::viewer_context_bundle_contains_video(bundle) => DetachedSource::Video,
+            _ => DetachedSource::Book,
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn active_detached_viewer_context_contains_video(&self) -> bool {
         self.active_detached_viewer_context
             .as_ref()
@@ -26043,7 +26079,8 @@ impl App {
         );
         self.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
         self.last_active_detached_window_id = Some(id);
-        self.begin_active_detached_session(id, DetachedSource::Video);
+        let source = Self::viewer_context_bundle_detached_source(&paused_bundle);
+        self.begin_active_detached_session(id, source);
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
             bundle: *paused_bundle,
         });
@@ -26501,11 +26538,7 @@ impl App {
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
             self.last_active_detached_window_id = Some(snapshot.id);
-            let source = if Self::viewer_context_bundle_contains_video(&paused_bundle) {
-                DetachedSource::Video
-            } else {
-                DetachedSource::Book
-            };
+            let source = Self::viewer_context_bundle_detached_source(&paused_bundle);
             self.begin_active_detached_session(snapshot.id, source);
             self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
                 bundle: *paused_bundle,
@@ -27400,19 +27433,18 @@ impl App {
         if !self.settings.detached_viewer_open_images_in_window {
             return false;
         }
-        !matches!(
-            self.fullscreen_idx.and_then(|idx| self.items.get(idx)),
-            Some(GridItem::Video(_))
-        )
+        !self
+            .fullscreen_idx
+            .is_some_and(|idx| self.viewer_item_is_media(idx))
     }
 
     #[cfg(windows)]
-    pub(crate) fn always_new_video_f12_target_presentation(&self) -> Option<ViewerPresentation> {
+    pub(crate) fn always_new_media_f12_target_presentation(&self) -> Option<ViewerPresentation> {
         if !self.settings.detached_viewer_open_images_in_window {
             return None;
         }
         let idx = self.fullscreen_idx?;
-        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+        if !self.viewer_item_is_media(idx) {
             return None;
         }
         Some(
@@ -27429,8 +27461,7 @@ impl App {
         &self,
         idx: usize,
     ) -> bool {
-        self.detached_viewer_independent_still_session()
-            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+        self.detached_viewer_independent_still_session() && self.viewer_item_is_media(idx)
     }
 
     #[cfg(windows)]
@@ -27480,7 +27511,7 @@ impl App {
             && self.detached_viewer_independent_active
             && self.viewer_item_supports_detached_still(idx))
             || (self.settings.detached_viewer_open_images_in_window
-                && matches!(self.items.get(idx), Some(GridItem::Video(_))))
+                && self.viewer_item_is_media(idx))
             || (self.settings.detached_viewer_enabled && self.viewer_item_supports_session(idx))
             || self.detached_viewer_open_still_requested(idx)
         {
@@ -28315,7 +28346,7 @@ impl App {
 
     /// open 時に採用する presentation を決める。
     ///
-    /// `fs_video_open_forced_presentation` one-shot が立っていれば直前の動画の presentation を
+    /// `fs_media_open_forced_presentation` one-shot が立っていれば直前のメディアの presentation を
     /// そのまま維持し、「別ウィンドウで開く」設定の再適用 (= detached 化) を抑止する。この
     /// one-shot の主な発生源は `open_fullscreen` 冒頭の一括ガード: **grid からの新規 open では
     /// なく (fs_open_intent_from_grid=false)、既にフルスクリーン中で、動画を開く** viewer 内ナビ
@@ -28328,20 +28359,22 @@ impl App {
     fn resolve_viewer_presentation_for_open(
         &mut self,
         idx: usize,
-        entering_native_video: bool,
+        entering_media: bool,
     ) -> ViewerPresentation {
-        match self.fs_video_open_forced_presentation.take() {
-            Some(p) if entering_native_video => p,
+        match self.fs_media_open_forced_presentation.take() {
+            Some(p) if entering_media => p,
             _ => self.effective_viewer_presentation_for_open(idx),
         }
     }
 
     #[cfg(windows)]
     fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
-        if entering_native_video || matches!(self.items.get(idx), Some(GridItem::Audio(_))) {
+        let entering_media =
+            entering_native_video || matches!(self.items.get(idx), Some(GridItem::Audio(_)));
+        if entering_media {
             self.close_parked_live_media_windows_for_new_media("new_media_open");
         }
-        let presentation = self.resolve_viewer_presentation_for_open(idx, entering_native_video);
+        let presentation = self.resolve_viewer_presentation_for_open(idx, entering_media);
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
         let independent_detached_still =
@@ -28375,10 +28408,8 @@ impl App {
             // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
             let source = if self.active_detached_viewer_context_present() {
                 DetachedSource::Book
-            } else if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
-                DetachedSource::Video
             } else {
-                DetachedSource::Image
+                self.detached_source_for_idx(idx)
             };
             self.begin_active_detached_session(id, source);
         } else {
@@ -28415,11 +28446,11 @@ impl App {
         if focus_detached_from_grid {
             self.detached_viewer_focus_requested = true;
         }
-        if self.viewer_item_supports_detached_still(idx) {
+        if self.viewer_item_supports_egui_detached_viewport(idx) {
             self.detached_viewer_open_next_still_detached_once = false;
         }
         if !matches!(presentation, ViewerPresentation::DetachedWindow)
-            || !self.viewer_item_supports_detached_still(idx)
+            || !self.viewer_item_supports_egui_detached_viewport(idx)
         {
             self.detached_viewer_independent_active = false;
             self.detached_viewer_focus_requested = false;
@@ -28534,7 +28565,7 @@ impl App {
             self.video_audio_exit_pending = None;
         }
         // viewer 内の手動ナビ (grid からの新規 open ではない = `fs_open_intent_from_grid` が false、
-        // かつ既にフルスクリーン中) で **動画** を開くときは、現在の presentation を維持する
+        // かつ既にフルスクリーン中) で **メディア (動画/音声)** を開くときは、現在の presentation を維持する
         // (one-shot 焼き付け)。「別ウィンドウで開く」設定は grid からの新規 open (Enter /
         // ダブルクリック) だけに適用し、F12 で main に出した動画を矢印 / wheel / Home / End /
         // Ctrl+G / 検索ジャンプで送っても別窓へ飛ばさない (実機 FB 2026-07-02、Codex 実機 P1/P2)。
@@ -28544,12 +28575,12 @@ impl App {
         // を立てている場合はそれを尊重する (is_none 判定)。この判定は `fullscreen_idx` を idx へ
         // 更新する前・`prepare_viewer_presentation_open` が presentation を書き換える前に行う。
         #[cfg(windows)]
-        if self.fs_video_open_forced_presentation.is_none()
+        if self.fs_media_open_forced_presentation.is_none()
             && !self.fs_open_intent_from_grid
             && self.fullscreen_idx.is_some()
-            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+            && self.viewer_item_is_media(idx)
         {
-            self.fs_video_open_forced_presentation = Some(self.viewer_presentation);
+            self.fs_media_open_forced_presentation = Some(self.viewer_presentation);
         }
         #[cfg(windows)]
         let reuse_detached_window_for_folder_nav =
@@ -40803,6 +40834,56 @@ impl App {
         self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
     }
 
+    #[cfg(windows)]
+    fn apply_egui_viewer_presentation_for_current_item(
+        &mut self,
+        idx: usize,
+        target_presentation: ViewerPresentation,
+        reason: &'static str,
+    ) {
+        self.viewer_presentation = target_presentation;
+        self.native_video_in_window_active =
+            matches!(target_presentation, ViewerPresentation::MainWindow);
+        self.last_viewer_sync_stamp =
+            if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+                self.viewer_sync_stamp_for_idx(idx)
+            } else {
+                None
+            };
+        self.fs_opened_at = Some(std::time::Instant::now());
+        self.fs_focus_grace_elapsed = false;
+
+        if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+            let id = self.ensure_detached_viewer_window_id();
+            self.begin_active_detached_session(id, self.detached_source_for_idx(idx));
+            self.update_detached_window_runtime_flags(
+                id,
+                !self.detached_viewer_independent_active,
+                reason,
+            );
+        } else {
+            let closing_window_id = self
+                .active_detached_session
+                .map(|session| session.window_id);
+            self.begin_active_detached_session_close(reason);
+            self.finish_active_detached_session_close(reason);
+            if let Some(window_id) = closing_window_id {
+                self.remove_detached_window_runtime(window_id, reason);
+            }
+        }
+        self.log_detached_image_window_debug(format!(
+            "apply_egui_viewer_presentation idx={idx} target={target_presentation:?} \
+             reason={reason} fs_idx={:?} presentation={:?} session={:?} \
+             window_id={:?} independent={} passive_windows={}",
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.active_detached_session,
+            self.detached_viewer_window_id,
+            self.detached_viewer_independent_active,
+            self.detached_image_windows.len()
+        ));
+    }
+
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
         #[cfg(windows)]
         self.log_detached_image_window_debug(format!(
@@ -40833,20 +40914,6 @@ impl App {
             );
             return;
         }
-        // 音声ファイル (GridItem::Audio) の音楽ビューは egui の live 描画 (連続 repaint + 波形/
-        // スペクトラムのテクスチャ生成) なので、別ウィンドウ (別 egui viewport) で回すと eframe/wgpu の
-        // マルチビューポート texture/font atlas 管理と競合して wgpu Validation Error でクラッシュする
-        // (実機再現、Codex 診断)。静止画は静的描画 (連続 repaint なし)、動画は native presenter (egui
-        // 非依存) なので別ウィンドウ可。音声は現状「別ウィンドウ表示に非対応」とし、F12 は誤解を招く
-        // 「別ウィンドウモード ON/OFF」トーストや設定 flip をせず no-op にする (別ウィンドウ化は
-        // egui multi-viewport 安定化を伴う別 increment、docs/music-integration-plan.md 参照)。
-        if self
-            .fullscreen_idx
-            .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Audio(_))))
-        {
-            self.show_feedback_toast("音声は別ウィンドウ表示に対応していません".to_string());
-            return;
-        }
         #[cfg(windows)]
         {
             if self.detached_toggle_disabled_by_always_new_images() {
@@ -40869,14 +40936,27 @@ impl App {
                 ));
                 return;
             }
-            if let Some(target_presentation) = self.always_new_video_f12_target_presentation() {
+            if let Some(target_presentation) = self.always_new_media_f12_target_presentation() {
                 if target_presentation != self.viewer_presentation {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
-                    self.switch_native_video_viewer_presentation(target_presentation, true);
+                    if self
+                        .fullscreen_idx
+                        .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
+                    {
+                        self.switch_native_video_viewer_presentation(target_presentation, true);
+                    } else if let Some(idx) = self.fullscreen_idx
+                        && self.viewer_item_supports_egui_detached_viewport(idx)
+                    {
+                        self.apply_egui_viewer_presentation_for_current_item(
+                            idx,
+                            target_presentation,
+                            "always_new_media_f12",
+                        );
+                    }
                 }
-                // 切替トースト (「この動画を別ウィンドウへ/メインウィンドウへ切り替えます」) は
+                // 切替トースト (「このメディアを別ウィンドウへ/メインウィンドウへ切り替えます」) は
                 // 出さない。切替中は main と detached の両ビューポートがフィードバックトーストを
                 // 描くため右上に二重表示されてちらつく (実機 FB 2026-07-02)。切替自体は映像が
                 // 移動するので視覚的に自明。
@@ -40912,50 +40992,16 @@ impl App {
                     }
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                         self.switch_native_video_viewer_presentation(target_presentation, true);
-                    } else if self.viewer_item_supports_detached_still(idx) {
-                        self.viewer_presentation = target_presentation;
-                        self.native_video_in_window_active =
-                            matches!(target_presentation, ViewerPresentation::MainWindow);
-                        self.last_viewer_sync_stamp =
+                    } else if self.viewer_item_supports_egui_detached_viewport(idx) {
+                        self.apply_egui_viewer_presentation_for_current_item(
+                            idx,
+                            target_presentation,
                             if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                                self.viewer_sync_stamp_for_idx(idx)
+                                "f12_on"
                             } else {
-                                None
-                            };
-                        self.fs_opened_at = Some(std::time::Instant::now());
-                        self.fs_focus_grace_elapsed = false;
-                        // keep-alive session (§3.7): F12 ON で detached へ → session 開始、
-                        // F12 OFF で detached を抜ける → session 終了。
-                        if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                            let id = self.ensure_detached_viewer_window_id();
-                            self.begin_active_detached_session(id, DetachedSource::Image);
-                            self.update_detached_window_runtime_flags(
-                                id,
-                                !self.detached_viewer_independent_active,
-                                "f12_on",
-                            );
-                        } else {
-                            let closing_window_id = self
-                                .active_detached_session
-                                .map(|session| session.window_id);
-                            self.begin_active_detached_session_close("f12_off");
-                            self.finish_active_detached_session_close("f12_off");
-                            if let Some(window_id) = closing_window_id {
-                                self.remove_detached_window_runtime(window_id, "f12_off");
-                            }
-                        }
-                        self.log_detached_image_window_debug(format!(
-                            "toggle_detached_viewer_mode_still_applied idx={idx} \
-                             target={target_presentation:?} fs_idx={:?} presentation={:?} \
-                             session={:?} window_id={:?} independent={} \
-                             passive_windows={}",
-                            self.fullscreen_idx,
-                            self.viewer_presentation,
-                            self.active_detached_session,
-                            self.detached_viewer_window_id,
-                            self.detached_viewer_independent_active,
-                            self.detached_image_windows.len()
-                        ));
+                                "f12_off"
+                            },
+                        );
                     }
                 }
             }
@@ -44164,7 +44210,7 @@ impl App {
         // 挙動は揃う。ここは自動次送りの意図を明示する冗長設定。)
         #[cfg(windows)]
         {
-            self.fs_video_open_forced_presentation = Some(self.viewer_presentation);
+            self.fs_media_open_forced_presentation = Some(self.viewer_presentation);
         }
         #[cfg(windows)]
         self.open_native_video_fullscreen_from_navigation_with_options(
@@ -44241,7 +44287,7 @@ impl App {
         // 次動画へ音声モードのまま送る: source-swap で hidden presenter を再利用する。
         self.sync_main_selection_from_viewer_idx(next_idx);
         // presentation 維持 (現在の Fullscreen / MainWindow を次動画にも使う) は、swap 完了時の
-        // `open_fullscreen` 冒頭ガードが `fs_video_open_forced_presentation` 未セット時に
+        // `open_fullscreen` 冒頭ガードが `fs_media_open_forced_presentation` 未セット時に
         // 現在の `viewer_presentation` から焼き付けるので、ここでは明示設定しない
         // (設定すると deferred swap が timeout / presenter close で `open_fullscreen` に到達
         //  しなかったとき one-shot がリークして次の別 open に漏れる、Codex P3)。

@@ -93,8 +93,8 @@ PDF / ZIP / 画像フォルダを別ウィンドウで開いてもメイン本�
   選択・フォルダ移動（BS / Ctrl+↑↓）に追従する。別の independent / ParkedLive 窓を Active 化する場合、
   linked 窓は passive へ退避せず閉じる。
 - **ON（always-new / independent）**: 画像 / ZIP画像 / PDFページは開くたびに独立した別ウィンドウとして残る。
-  各窓は専用 bundle を持ち、メイン一覧の操作に追従しない。動画は複数窓化せず、単一の detached
-  動画ウィンドウを再利用する。F12 は静止画系では無効、動画では現在の動画だけをメイン表示へ一時移動する。
+  各窓は専用 bundle を持ち、メイン一覧の操作に追従しない。動画 / 音声は複数窓化せず、単一の detached
+  メディアウィンドウを再利用する。F12 は静止画系では無効、動画 / 音声では現在のメディアだけをメイン表示へ一時移動する。
 - **設定切替時**: 旧モードの窓を生かすと ON と OFF の状態が混在するため、開いている detached
   窓（active / passive / ParkedLive）はすべて閉じる。窓があった場合だけ toast で通知する。
 - **Independent passive**: always-new 由来の窓が裏に回った状態。
@@ -134,7 +134,7 @@ Passive frozen still 駆動ノート（R2d）:
 | # | 操作 | 結果 |
 |---|---|---|
 | ① | F12 で画像を別ウィンドウ表示（通常） | **Active・連動** |
-| ② | 設定 `detached_viewer_open_images_in_window` ON で画像/動画を開く | 画像系は常に **Active・連動なし**（独自 bundle）。動画は複数窓化せず、単一の detached 動画ウィンドウを再利用する |
+| ② | 設定 `detached_viewer_open_images_in_window` ON で画像/動画/音声を開く | 画像系は常に **Active・連動なし**（独自 bundle）。動画 / 音声は複数窓化せず、単一の detached メディアウィンドウを再利用する |
 | ③ | 設定 `detached_viewer_open_images_in_window` ON/OFF を切替 | 開いている detached 窓（active / passive / ParkedLive）をすべて閉じる。混在状態を作らない |
 | ④ | independent 窓がある状態でメインから**別画像を明示 open**（Enter/ダブルクリック） | independent 窓 → **Passive**（背景処理停止・frozen/paused bundle 保持）。新窓は設定 ON なら independent、OFF なら linked |
 | ⑤ | メインで BS / Ctrl+↑↓（フォルダ移動） | メイン bundle（と Active・連動窓）だけ移動。**independent Active / Passive / ParkedLive は一切不変・非クローズ** |
@@ -157,9 +157,9 @@ Passive frozen still 駆動ノート（R2d）:
   またがせない。
 - `detached_viewer_open_images_in_window` ON 中の F12 は、静止画 / ZIP画像 / PDFページでは無効。
   F12 は「現在の viewer をメイン / detached へ移す」操作であり、always-new の「明示 open ごとに
-  独立窓を作る」操作と役割が衝突するため。動画表示中だけは現在の動画に対する一時 host migration
-  として F12 を許可する。F12 でメイン表示へ戻しても、次に動画を明示 open した場合はこの設定に従って
-  再び detached 動画ウィンドウで開く。
+  独立窓を作る」操作と役割が衝突するため。動画 / 音声表示中だけは現在のメディアに対する一時 migration
+  として F12 を許可する。F12 でメイン表示へ戻しても、次に動画 / 音声を明示 open した場合はこの設定に従って
+  再び detached メディアウィンドウで開く。
 - 別ウィンドウの編集制限:
   - **Active・連動**（通常 F12 の linked viewer）では従来どおり画像編集機能を使える。
   - **Active・連動なし**（always-new）では、編集状態を bundle 間で保持・確定する複雑さを避けるため、
@@ -180,18 +180,18 @@ R2c 時点の入力処理は「表示状態」だけでなく「所有してい�
 | Passive・連動なし（静止画 frozen） | `render_detached_image_windows` の passive egui viewport | 左クリック（pointer press）で Active 化、× / バー close | キー、ホイール、スクロールは表示だけで no-op。focus edge だけでは Active 化しない | CUT 後、linked passive は存在しない。focus ping-pong 対策で `detached_passive_window_should_activate` は pointer activation のみ |
 | ParkedLive（動画 / 音声 live-park） | native presenter HWND を tick するため毎フレーム短時間 mount | 左クリック down→up の組だけ Active 復帰要求に変換。Geometry / DPI / PlacementSwitched は lifecycle として通す | キー、ホイール、右/中クリック、ダブルクリックは no-op。復帰前にシークや HUD 操作へ貫通しない | `native_video_parked_live_input_window_id` 中の filter で左クリックだけ activation queue。復帰後は通常 native 入力に戻る |
 | Resuming / Closing | runtime state + close / resume 処理 | lifecycle event、Close command、placement / hwnd bookkeeping | ユーザー入力は基本的に次の安定状態まで no-op | `DetachedWindowRuntime.state` と active session が keep-alive / backstop の単一真実 |
-| ⚠ Active 音声モード | 現状は detached audio viewport としては扱わない | メイン / 既存音声ビュー側の操作 | F12 detached 化は no-op | 状態モデル上は「動画 / 音声 live media」として ParkedLive を許容しているが、実装上の audio 専用 detached host は未提供。音声を detached の独立ウィンドウとして扱う場合は別ステージで設計が必要 |
+| Active 音声 | detached 音声 viewport の egui `ctx` | 再生、シーク、音量、VST、F12 main/detached migration。ParkedLive 中はクリック復帰後に操作 | ParkedLive 復帰前のキー / ホイール / 右クリックは no-op | Stage AUDIO で音声も単一メディアウィンドウに合流。`music_*` は bundle 化せず global のまま、メディア窓 1 本規則で main 側との混線を排除する |
 | ⚠ Gamepad folder-nav | `gamepad_input.rs` の grid/fullscreen dispatch | fullscreen 側は通常の viewer nav、grid 側は foreground detached 判定で no-op toast | foreground 判定に依存するため、OS foreground が取れない環境では grid nav 側へ落ちる可能性がある | keyboard/egui 経路より OS foreground 依存が強い。実機検証では detached foreground 中の gamepad Ctrl 相当操作を確認する |
 
 ### 3.1 用語
 
 - `detached_viewer_enabled`: 別ウィンドウモードが ON かどうか。永続設定。
 - `detached_viewer_open_images_in_window`: 画像 / ZIP画像 / PDFページを開くたびに detached
-  image window を増やす永続設定。動画は対象だが複数窓化せず、単一の detached 動画 window を再利用する。
-  この設定が ON の間、静止画系の F12 detached 切替は無効にする。動画表示中の F12 は現在の動画だけを
-  main / detached へ一時移動し、この永続設定は変更しない。detached 動画は、メイン一覧のフォルダ移動 / お気に入り移動などで
+  image window を増やす永続設定。動画 / 音声は対象だが複数窓化せず、単一の detached メディア window を再利用する。
+  この設定が ON の間、静止画系の F12 detached 切替は無効にする。動画 / 音声表示中の F12 は現在のメディアだけを
+  main / detached へ一時移動し、この永続設定は変更しない。detached メディアは、メイン一覧のフォルダ移動 / お気に入り移動などで
   main context が入れ替わる場合、active detached context 側へ切り離して再生を維持し、以後は
-  メイン一覧の選択変更には追従しない。別動画を明示 open したときだけ既存動画 window を差し替える。
+  メイン一覧の選択変更には追従しない。別メディアを明示 open したときだけ既存メディア window を差し替える。
   メイン context の `close_fullscreen()` に巻き込んで閉じない。この設定を切り替えると、
   モード混在を避けるため開いている detached 窓をすべて閉じる。
 - `detached_viewer_independent_active`: 現在の detached session がメイン一覧に追従しない

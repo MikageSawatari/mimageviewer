@@ -7810,11 +7810,11 @@ impl App {
         // 焼き付けるので、ここでは live one-shot を clear して、この関数がすぐ return した後に
         // auto-advance の明示 one-shot 等が別 open へ漏れるのを防ぐだけにする。
         if self.try_start_video_tile_fast_swap(ctx, idx) {
-            self.fs_video_open_forced_presentation = None;
+            self.fs_media_open_forced_presentation = None;
             return;
         }
         if self.try_start_native_video_fast_swap(ctx, idx, autoplay_override, ignore_resume) {
-            self.fs_video_open_forced_presentation = None;
+            self.fs_media_open_forced_presentation = None;
             return;
         }
         let started = std::time::Instant::now();

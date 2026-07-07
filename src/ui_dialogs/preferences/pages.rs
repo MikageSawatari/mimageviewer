@@ -134,7 +134,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.indent("viewer_mode_multi_window", |ui| {
         ui.label(
             egui::RichText::new(
-                "画像を開くたびに、新しいウィンドウで開きます。閲覧中心の方のためのモードです。動画は 1 つの動画ウィンドウで再生します。フルスクリーンへの切り替え（F11）も可能です。",
+                "画像を開くたびに、新しいウィンドウで開きます。閲覧中心の方のためのモードです。動画/音声は 1 つのメディアウィンドウで再生します。フルスクリーンへの切り替え（F11）も可能です。",
             )
             .weak(),
         );

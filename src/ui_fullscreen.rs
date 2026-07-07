@@ -20660,17 +20660,19 @@ impl App {
         } else {
             false
         };
-        // VST (windows + vst3 有効 + フルスクリーン表示時のみ)。VST native シェルはフルスクリーン
-        // borderless 前提なので、ウィンドウモードでは動画と同じくボタン自体を出さない (ユーザー
-        // 要望)。VST 画面 (native シェル) でも同じ位置に VST ボタンが出るので同じ場所で on/off できる。
+        // VST (windows + vst3 有効 + フルスクリーン / detached 表示時)。Phase AUDIO では
+        // detached 音声でもチェーンを使えるようにし、GUI owner の相性問題があれば実機結果で判断する。
+        // VST 画面 (native シェル) でも同じ位置に VST ボタンが出るので同じ場所で on/off できる。
         // 音声モードにトグルした動画 (`video_audio_mode == Some(fs_idx)`) でも表示し、7e の
         // `enter_video_audio_vst` (presenter を un-hide して VST ホスト化) へ振る。プレーン音声は
         // 従来どおり `enter_music_vst_shell` (新規 presenter)。
         #[cfg(windows)]
         let (vst_left, vst_clicked) = if self.settings.vst3_enabled
             && (self.video_audio_mode.is_none() || self.video_audio_mode == Some(fs_idx))
-            && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
-        {
+            && matches!(
+                self.viewer_presentation,
+                ViewerPresentation::Fullscreen | ViewerPresentation::DetachedWindow
+            ) {
             let vst_rect = egui::Rect::from_center_size(
                 egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
                 egui::vec2(TOP_BTN, TOP_BTN),

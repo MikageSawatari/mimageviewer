@@ -16739,27 +16739,34 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn f12_on_audio_is_noop_not_misleading_toggle() {
-        // 音声ファイルは egui music view (live 描画) を別 viewport で回すと wgpu クラッシュするため
-        // 別ウィンドウ非対応 (docs 参照)。F12 は誤解を招く「別ウィンドウモード ON/OFF」トーストや
-        // グローバル設定 flip をせず no-op にする (以前は設定 flip + 誤トーストで「切り替わったように
-        // 見えて切り替わらない」バグだった)。
+    fn f12_on_audio_toggles_detached_viewer_mode() {
+        // Stage AUDIO: 音声ファイルも動画と同じ 1 本のメディア窓で detached 表示できる。
+        // F12 は no-op ではなく、通常モードのグローバル detached 設定を切り替えて音声 viewport
+        // を main/detached 間で移動する。
         let mut app = setup_app();
         let audio = push_audio(&mut app, r"C:\music\a.flac");
         app.fullscreen_idx = Some(audio);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        let before_enabled = app.settings.detached_viewer_enabled;
-        let before_presentation = app.viewer_presentation;
 
         app.toggle_detached_viewer_mode();
 
+        assert!(app.settings.detached_viewer_enabled);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(
-            app.settings.detached_viewer_enabled, before_enabled,
-            "F12 on an audio file must not flip the global detached-viewer setting"
+            app.active_detached_session.map(|session| session.source),
+            Some(DetachedSource::Audio)
         );
+
+        app.toggle_detached_viewer_mode();
+
+        assert!(!app.settings.detached_viewer_enabled);
         assert_eq!(
-            app.viewer_presentation, before_presentation,
-            "F12 on an audio file must not change the presentation (audio is not detachable)"
+            app.viewer_presentation,
+            app.non_detached_viewer_presentation()
+        );
+        assert!(
+            app.active_detached_session.is_none(),
+            "F12 OFF must close the audio detached session"
         );
     }
 
@@ -16804,12 +16811,14 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let image = push_image(&mut app, r"C:\mixed\001.png");
         let video = push_video(&mut app, r"C:\mixed\002.mp4");
+        let audio = push_audio(&mut app, r"C:\mixed\003.flac");
 
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
 
         assert!(app.should_block_detached_independent_still_navigation_to_video(video));
+        assert!(app.should_block_detached_independent_still_navigation_to_video(audio));
         assert!(!app.should_block_detached_independent_still_navigation_to_video(image));
     }
 
@@ -17109,6 +17118,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let image = push_image(&mut app, r"C:\pics\a.jpg");
         let video = push_video(&mut app, r"C:\clips\a.mp4");
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
@@ -17133,6 +17143,12 @@ mod still_window_mode_key_tests {
             "video keeps the legacy F12 host-migration toggle for now"
         );
 
+        app.fullscreen_idx = Some(audio);
+        assert!(
+            !app.detached_toggle_disabled_by_always_new_images(),
+            "audio also uses the shared media-window F12 migration toggle"
+        );
+
         app.settings.detached_viewer_open_images_in_window = true;
         app.detached_viewer_independent_active = true;
         assert!(
@@ -17143,9 +17159,10 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn always_new_video_f12_is_temporary_and_does_not_change_default_open_mode() {
+    fn always_new_media_f12_is_temporary_and_does_not_change_default_open_mode() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.detached_viewer_enabled = false;
         app.settings.video_in_window_mode = true;
@@ -17153,7 +17170,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
 
         assert_eq!(
-            app.always_new_video_f12_target_presentation(),
+            app.always_new_media_f12_target_presentation(),
             Some(ViewerPresentation::MainWindow)
         );
 
@@ -17171,6 +17188,24 @@ mod still_window_mode_key_tests {
             app.requested_viewer_presentation_for_open(video),
             ViewerPresentation::DetachedWindow,
             "the next explicit video open should follow the persistent detached default"
+        );
+
+        app.fullscreen_idx = Some(audio);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        assert_eq!(
+            app.always_new_media_f12_target_presentation(),
+            Some(ViewerPresentation::MainWindow)
+        );
+        app.toggle_detached_viewer_mode();
+        assert!(
+            !app.settings.detached_viewer_enabled,
+            "audio F12 in always-new mode must also stay a per-item migration"
+        );
+        assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+        assert_eq!(
+            app.requested_viewer_presentation_for_open(audio),
+            ViewerPresentation::DetachedWindow,
+            "the next explicit audio open should return to the shared media window"
         );
     }
 
@@ -17430,24 +17465,73 @@ mod still_window_mode_key_tests {
         );
 
         // 自動次送りの one-shot (直前が MainWindow) は MainWindow を維持し、消費される。
-        app.fs_video_open_forced_presentation = Some(ViewerPresentation::MainWindow);
+        app.fs_media_open_forced_presentation = Some(ViewerPresentation::MainWindow);
         assert_eq!(
             app.resolve_viewer_presentation_for_open(video, true),
             ViewerPresentation::MainWindow,
             "auto-advance keeps the previous presentation instead of re-opening detached"
         );
         assert!(
-            app.fs_video_open_forced_presentation.is_none(),
+            app.fs_media_open_forced_presentation.is_none(),
             "the forced-presentation one-shot must be consumed"
         );
 
         // 直前が Detached なら Detached を維持する。
-        app.fs_video_open_forced_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_media_open_forced_presentation = Some(ViewerPresentation::DetachedWindow);
         assert_eq!(
             app.resolve_viewer_presentation_for_open(video, true),
             ViewerPresentation::DetachedWindow,
             "auto-advance keeps a detached previous presentation too"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn audio_open_uses_shared_media_window_and_forced_presentation_one_shot() {
+        let mut app = setup_app();
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        assert_eq!(
+            app.resolve_viewer_presentation_for_open(audio, true),
+            ViewerPresentation::DetachedWindow,
+            "manual audio open in always-new mode uses the shared media window"
+        );
+
+        app.fs_media_open_forced_presentation = Some(ViewerPresentation::MainWindow);
+        assert_eq!(
+            app.resolve_viewer_presentation_for_open(audio, true),
+            ViewerPresentation::MainWindow,
+            "audio viewer navigation keeps the current main-window presentation"
+        );
+        assert!(app.fs_media_open_forced_presentation.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_state_is_not_moved_into_viewer_context_bundle() {
+        // Phase AUDIO §3.5: music_* は bundle 化しない。メディア窓は 1 本なので、
+        // 音楽状態は global のままにして、context swap で別 window bundle へ持ち出さない。
+        let mut app = setup_app();
+        let music_path = PathBuf::from(r"C:\music\a.flac");
+        app.music_analysis_path = Some(music_path.clone());
+        app.music_analysis_error = Some("keep-global".to_string());
+
+        let mut bundle = app.take_current_viewer_context_bundle();
+
+        assert_eq!(
+            app.music_analysis_path.as_deref(),
+            Some(music_path.as_path())
+        );
+        assert_eq!(app.music_analysis_error.as_deref(), Some("keep-global"));
+
+        app.swap_viewer_context_bundle(&mut bundle);
+
+        assert_eq!(
+            app.music_analysis_path.as_deref(),
+            Some(music_path.as_path())
+        );
+        assert_eq!(app.music_analysis_error.as_deref(), Some("keep-global"));
     }
 
     #[test]
@@ -17494,7 +17578,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.video_in_window_mode = false;
         app.fs_open_intent_from_grid = true;
-        app.fs_video_open_forced_presentation = None;
+        app.fs_media_open_forced_presentation = None;
 
         assert_eq!(
             app.resolve_viewer_presentation_for_open(video, true),
@@ -17517,7 +17601,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(v1);
         app.viewer_presentation = ViewerPresentation::MainWindow;
         app.fs_open_intent_from_grid = true;
-        app.fs_video_open_forced_presentation = None;
+        app.fs_media_open_forced_presentation = None;
 
         app.open_fullscreen(v2);
 
@@ -17525,6 +17609,32 @@ mod still_window_mode_key_tests {
             app.viewer_presentation,
             ViewerPresentation::DetachedWindow,
             "a fresh grid open must still honor the open-in-separate-window setting even mid-viewer"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn open_fullscreen_grid_open_detaches_audio_into_media_window() {
+        // Stage AUDIO: 音声も grid からの明示 open では「複数ウィンドウ」設定に従い、
+        // main 音楽ビューではなく detached メディアウィンドウの session として始まる。
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.video_in_window_mode = false;
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.fs_open_intent_from_grid = true;
+        app.fs_media_open_forced_presentation = None;
+
+        app.open_fullscreen(audio);
+
+        assert_eq!(app.fullscreen_idx, Some(audio));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert_eq!(
+            app.active_detached_session.map(|session| session.source),
+            Some(DetachedSource::Audio),
+            "audio must be classified as Audio, not Video, even though playback uses VideoPlayer"
         );
     }
 

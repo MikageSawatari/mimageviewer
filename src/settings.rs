@@ -2614,12 +2614,12 @@ pub struct Settings {
     /// 全画面トグルボタンで切り替え、ここに永続化する。
     #[serde(default)]
     pub video_in_window_mode: bool,
-    /// 画像・動画ビューアをメイン一覧から分離した別ウィンドウで開くモード。
+    /// 画像・動画・音声ビューアをメイン一覧から分離した別ウィンドウで開くモード。
     /// Phase 1 では永続設定とキー操作だけを用意し、実際の detached host は後続で接続する。
     #[serde(default)]
     pub detached_viewer_enabled: bool,
-    /// 画像/動画を別ウィンドウで開く。画像系アイテム (通常画像 / ZIP 内画像 / PDF ページ)
-    /// は開くたびに detached image window を残し、動画は単一の detached video window を再利用する。
+    /// 画像/動画/音声を別ウィンドウで開く。画像系アイテム (通常画像 / ZIP 内画像 / PDF ページ)
+    /// は開くたびに detached image window を残し、動画/音声は単一の detached media window を再利用する。
     #[serde(default)]
     pub detached_viewer_open_images_in_window: bool,
     /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画

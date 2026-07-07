@@ -132,7 +132,7 @@ detached 窓が「描かれないフレーム」を踏み、egui が破棄 → r
 真実にする:
 
 ```rust
-enum DetachedSource { Image, Video, Book } // 再オープン経路の判別 (将来拡張)
+enum DetachedSource { Image, Video, Audio, Book } // 再オープン経路の判別
 
 struct ActiveDetachedSession {
     window_id: u64,   // 安定 ViewportId の素 (セッション中不変)
