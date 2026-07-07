@@ -102,6 +102,50 @@ DetachedSource 追加) は**そのまま承認**。争点だった 3 (music_* �
 6. 過去の wgpu Validation revert 歴があるため、実装後の実機 smoke では起動直後に
    「文字消失 / Y-32 / texture delta 喪失」系ログの確認を最初に行う (Codex 提案どおり)。
 
+## 3.6 検収指摘 fix1 (Fable 2026-07-07): ParkedLive 音声窓が真っ黒になる
+
+Phase I (b2063ef3) の検収で 1 点差し戻し。他は合格 (DetachedSource::Audio /
+supports_session / F12 / メディア 1 本 / music_* 非 bundle 化 invariant / VST 条件 /
+文言 / one-shot presentation テストすべて指示書どおり)。
+
+### 指摘
+
+`build_parked_live_media_window_snapshot` ([app.rs:27032](../src/app.rs)) は backdrop に
+**1×1 の黒テクスチャ**を使う。動画は native presenter child が窓全面を覆うので問題に
+ならないが、**音声には presenter がないため、ParkedLive 音声窓は「真っ黒 + バーのみ」の
+窓になり、音だけ流れ続ける**。これは §3.5-3 の要求 (第 1 候補 = ライブ描画継続 /
+フォールバック = park 時点の見た目スナップショット) の**どちらも満たしていない**。
+また §3.5-3 の「どちらを採ったか完了報告に明記」も履行されていない。
+
+### 修正要件 (fix1)
+
+1. ParkedLive **音声**窓の表示を次のいずれかにする (動画の経路は変更しない):
+   - (a) 推奨: **global 状態からの最小ライブ描画** — トラックタイトル (park 時に
+     snapshot へ保持済み) + スペクトラム (global の spectrum 状態から bar 描画のみ)。
+     フル音楽ビュー (タイムライン/右パネル/シークバー) は不要。bundle 依存の値を
+     参照しないこと。
+   - (b) 代替: park 時点の**見た目スナップショット** (音楽ビューの最終フレームを
+     テクスチャ化)。実装コストが (a) より高ければ選ばなくてよい。
+   - どちらを採ったか完了報告に明記する (今回は必須)。
+2. 復帰規則の確認 (テスト or 報告): ParkedLive 音声窓は presenter がなく egui 経路で
+   入力が来る。**クリックで復帰 / ホイール・キーでは復帰しない** (passive のクリック
+   限定ルールと一貫) ことを確認し、ずれていれば揃える。
+3. コミット `(detached-rework stage-audio fix1)`。
+
+### fix1 実装結果 (Codex 2026-07-07)
+
+- 採用方式: **(a) global 状態からの最小ライブ描画**。ParkedLive 音声窓は paused
+  bundle から音声タイトルを識別し、黒 backdrop ではなく `MUSIC_VIEW_BG` 背景 +
+  音楽アイコン + タイトル + クリック復帰ヒント + global `music_spectrum` の簡易
+  スペクトラムを描く。
+- spectrum の更新は ParkedLive bundle を mount して `poll_video` している既存区間で
+  行う。`music_*` は bundle 化しないため、global の `music_pcm` / `music_spectrum`
+  をそのまま更新し、描画側は最後に更新された spectrum を読む。動画 ParkedLive は
+  従来どおり native presenter child が描くので変更しない。
+- 復帰規則: presenter を持たない音声 ParkedLive は egui passive 経路を使い、
+  press→release のクリックだけで復帰する。key / wheel は activation 入力に渡さない
+  設計をテストで固定。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)

@@ -25726,6 +25726,20 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn viewer_context_bundle_audio_title(bundle: &ViewerContextBundle) -> Option<String> {
+        let idx = bundle.fullscreen_idx?;
+        match bundle.items.get(idx)? {
+            GridItem::Audio(path) => Some(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| path.display().to_string()),
+            ),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn active_detached_viewer_context_contains_video(&self) -> bool {
         self.active_detached_viewer_context
             .as_ref()
@@ -25743,6 +25757,45 @@ impl App {
                 .fs_cache
                 .values()
                 .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+    }
+
+    #[cfg(windows)]
+    fn current_audio_fullscreen_idx(&self) -> Option<usize> {
+        let idx = self.fullscreen_idx?;
+        self.items
+            .get(idx)
+            .is_some_and(|item| matches!(item, GridItem::Audio(_)))
+            .then_some(idx)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn parked_live_audio_title_for_window_id(&self, window_id: u64) -> Option<String> {
+        self.detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .and_then(|window| window.paused_bundle.as_deref())
+            .and_then(Self::viewer_context_bundle_audio_title)
+    }
+
+    #[cfg(windows)]
+    fn update_parked_live_audio_music_view_state(&mut self, ctx: &egui::Context) {
+        let Some(fs_idx) = self.current_audio_fullscreen_idx() else {
+            return;
+        };
+        if let Some(path) = self.fs_music_source_for_idx(fs_idx) {
+            let meta = self.image_metas.get(fs_idx).copied().flatten();
+            self.ensure_music_analysis(&path, meta);
+            self.ensure_music_bookmarks_loaded(&path);
+        }
+        self.poll_music_analysis(ctx);
+        let (pos, playing) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                (player.position().max(0.0), player.is_playing())
+            }
+            _ => (0.0, false),
+        };
+        let pcm = self.music_pcm.clone();
+        self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
     }
 
     #[cfg(windows)]
@@ -25795,6 +25848,7 @@ impl App {
             self.video_continuous_mode = crate::video::VideoContinuousMode::Off;
             self.native_video_parked_live_input_window_id = Some(id);
             self.poll_video(ctx);
+            self.update_parked_live_audio_music_view_state(ctx);
             self.native_video_parked_live_input_window_id = saved_input_window_id;
             self.video_continuous_mode = saved_continuous_mode;
             self.swap_viewer_context_bundle(&mut bundle);

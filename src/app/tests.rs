@@ -16738,6 +16738,26 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn parked_live_egui_window_activates_only_on_click_release() {
+        // ParkedLive audio windows have no native presenter, so they use the egui passive path.
+        // That path intentionally has no key/wheel input channel: press arms, release restores.
+        let mut armed = false;
+        assert!(!App::detached_passive_window_update_activation(
+            true, 1, 1, &mut armed, false, false
+        ));
+        assert!(!armed);
+
+        assert!(!App::detached_passive_window_update_activation(
+            true, 1, 1, &mut armed, true, false
+        ));
+        assert!(armed);
+        assert!(App::detached_passive_window_update_activation(
+            true, 1, 1, &mut armed, false, true
+        ));
+        assert!(!armed);
+    }
+
+    #[test]
     #[cfg(windows)]
     fn f12_on_audio_toggles_detached_viewer_mode() {
         // Stage AUDIO: 音声ファイルも動画と同じ 1 本のメディア窓で detached 表示できる。
@@ -20969,6 +20989,50 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::ParkedLive)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_audio_window_is_identified_for_minimal_live_display() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let audio = push_audio(&mut app, r"C:\music\parked.flac");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(audio);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(62);
+
+        let texture = ctx.load_texture(
+            "parked_live_audio",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 62,
+                texture,
+                title: "parked.flac - mimageviewer".to_owned(),
+                location_display: "parked.flac".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(62, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert_eq!(
+            app.parked_live_audio_title_for_window_id(62).as_deref(),
+            Some("parked.flac")
         );
     }
 

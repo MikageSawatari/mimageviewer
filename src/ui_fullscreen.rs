@@ -3645,6 +3645,79 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn draw_parked_live_audio_window(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        title: &str,
+    ) {
+        let painter = ui.painter_at(full_rect);
+        let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
+        painter.rect_filled(full_rect, 0.0, bg);
+
+        let margin = full_rect.width().min(full_rect.height()).clamp(24.0, 56.0);
+        let content = full_rect.shrink2(egui::vec2(margin, margin * 0.75));
+        if content.width() <= 32.0 || content.height() <= 32.0 {
+            return;
+        }
+
+        let icon_size = (content.height() * 0.18).clamp(44.0, 86.0);
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(content.center().x, content.top() + icon_size * 0.65),
+            egui::vec2(icon_size, icon_size),
+        );
+        crate::ui_helpers::draw_music_icon(&painter, icon_rect, true);
+
+        let title_rect = egui::Rect::from_min_max(
+            egui::pos2(content.left(), icon_rect.bottom() + 18.0),
+            egui::pos2(content.right(), icon_rect.bottom() + 78.0),
+        );
+        let title_font = egui::FontId::proportional((full_rect.height() * 0.048).clamp(22.0, 38.0));
+        let title_galley = painter.layout(
+            title.to_owned(),
+            title_font,
+            egui::Color32::from_rgb(235, 238, 242),
+            title_rect.width(),
+        );
+        painter.galley(
+            egui::pos2(
+                title_rect.center().x - title_galley.size().x * 0.5,
+                title_rect.top(),
+            ),
+            title_galley,
+            egui::Color32::from_rgb(235, 238, 242),
+        );
+
+        let hint = "音声を再生中 - クリックで操作に戻る";
+        let hint_font = egui::FontId::proportional(14.0);
+        let hint_galley = painter.layout_no_wrap(
+            hint.to_string(),
+            hint_font,
+            egui::Color32::from_rgba_unmultiplied(190, 204, 220, 180),
+        );
+        painter.galley(
+            egui::pos2(
+                content.center().x - hint_galley.size().x * 0.5,
+                title_rect.bottom() + 8.0,
+            ),
+            hint_galley,
+            egui::Color32::from_rgba_unmultiplied(190, 204, 220, 180),
+        );
+
+        let spectrum_top = (title_rect.bottom() + 48.0).min(content.bottom() - 80.0);
+        let spectrum_rect = egui::Rect::from_min_max(
+            egui::pos2(content.left(), spectrum_top),
+            egui::pos2(content.right(), content.bottom()),
+        );
+        if spectrum_rect.width() >= 180.0 && spectrum_rect.height() >= 90.0 {
+            self.music_spectrum.draw(ui, spectrum_rect, 0.0, None);
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    #[cfg(windows)]
     fn draw_detached_image_window_bar(
         ui: &mut egui::Ui,
         ctx: &egui::Context,
@@ -4185,6 +4258,7 @@ impl App {
             let apply_initial_placement = !window.initial_placement_applied;
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
+            let parked_live_audio_title = self.parked_live_audio_title_for_window_id(window.id);
             let builder = Self::build_detached_image_window_builder(
                 &window,
                 window_placement,
@@ -4275,7 +4349,11 @@ impl App {
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(vp_ctx, |ui| {
                         let full_rect = ui.max_rect();
-                        Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                        if let Some(title) = parked_live_audio_title.as_deref() {
+                            self.draw_parked_live_audio_window(ui, vp_ctx, full_rect, title);
+                        } else {
+                            Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                        }
                         Self::draw_detached_image_window_bar(
                             ui,
                             vp_ctx,
