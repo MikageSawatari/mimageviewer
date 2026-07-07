@@ -82,6 +82,41 @@ fn scan_folder_names(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
+fn fullscreen_pdf_loads_are_not_pruned_by_grid_epoch() {
+    for priority in [
+        crate::pdf_loader::JobPriority::Critical,
+        crate::pdf_loader::JobPriority::HighNormal,
+        crate::pdf_loader::JobPriority::Normal,
+    ] {
+        assert_eq!(
+            App::fs_pdf_render_context_epoch(priority),
+            0,
+            "fullscreen fs_load PDF renders must be owned by fs_pending, not the main-grid epoch"
+        );
+    }
+}
+
+#[test]
+fn fullscreen_pdf_interrupted_render_is_cancel_like() {
+    let interrupted =
+        std::io::Error::new(std::io::ErrorKind::Interrupted, "context epoch advanced");
+    assert!(
+        App::fs_pdf_render_error_is_cancel_like(false, &interrupted),
+        "PDF render Interrupted must not publish FsLoadResult::Failed"
+    );
+
+    let real_error = std::io::Error::new(std::io::ErrorKind::Other, "pdfium failed");
+    assert!(
+        !App::fs_pdf_render_error_is_cancel_like(false, &real_error),
+        "real PDF render errors should still publish failure"
+    );
+    assert!(
+        App::fs_pdf_render_error_is_cancel_like(true, &real_error),
+        "explicit fs_pending cancel remains cancel-like regardless of error kind"
+    );
+}
+
+#[test]
 fn scan_directory_can_ignore_convertible_archives() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();

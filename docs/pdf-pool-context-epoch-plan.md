@@ -85,6 +85,17 @@ UI ナビゲーションで stale 化させてはいけない (Codex P2 の Roun
 epoch=0 は予約値 (= epoch チェックを無効化する sentinel)。`bump_render_context_epoch` は
 1 から始めて単調増加する。
 
+### findings-16 対応: fullscreen fs_load は epoch=0 に固定
+
+multi-window 化後、fullscreen / detached PDF の `fs_load` はメイングリッドとは独立した
+ビューアコンテキストの仕事になった。メイン側の folder navigation による
+`bump_render_context_epoch` で生きている detached PDF 窓のページレンダを prune すると、
+`FsLoadResult::Failed` が焼き付いて「デコードに失敗」表示になる。
+
+そのため `start_fs_load` 経由の PDF render は current / prefetch の priority に関係なく
+`context_epoch=0` に固定する。ライフサイクルは既存の `fs_pending` cancel token が持つ。
+grid thumbnail / `thumb_loader` 経路の epoch 運用は従来どおり維持する。
+
 ### Codex P1-3 / round 2 P1-2 対応: Interrupted の取り扱いは PDF render 経路に限定
 
 `load_one_cached` ([thumb_loader.rs:1820](../src/thumb_loader.rs)) で失敗時の処理:
@@ -444,22 +455,17 @@ pub fn render_page(
 | `thumb_loader.rs:1693` | `load_one_cached` (UI thumb worker) | `req.priority ? HighNormal : Normal` | `req.context_epoch` |
 | `thumb_loader.rs:1290` | `process_neighbor_prefetch` (CatchupQueue) | `Normal` | `0` (background) |
 | `thumb_loader.rs:2242` | `build_and_save_one_pdf` (batch cache 生成) | `Normal` | `0` (background) |
-| `app.rs:13517` | フルスクリーン (current=Critical / prefetch=Normal、`start_fs_load` 内で分岐 [app.rs:13411](../src/app.rs)) | 既存通り維持 | **current=`0` / prefetch=`current_render_context_epoch()`** |
+| `app.rs:13517` | フルスクリーン (current=Critical / prefetch=Normal、`start_fs_load` 内で分岐 [app.rs:13411](../src/app.rs)) | 既存通り維持 | **current=`0` / prefetch=`0`** (findings-16) |
 | `app.rs:17425` | bulk cache creator | `Normal` | `0` (background) |
 | `app.rs:17486` | bulk cache creator (別ジョブ種) | `Normal` | `0` (background) |
 
-**フルスクリーンの扱い** (`app.rs:13517`、**Codex round 3 P2-2 反映**):
-Critical 現在ページは epoch=0 (= epoch チェック対象外、`fs_pending.cancel` で制御)。
-**Normal 先読みは current epoch を使う** — フォルダ移動で stale 化したら pool 側で
-prune される方が cleanup が早い。`fs_pending.cancel` は functional には十分だが、
-epoch prune の方が in-queue ジョブを即解放できるので並列性が改善する。
-`start_fs_load` 内で priority に応じて使い分け:
+**フルスクリーンの扱い** (`app.rs:13517`、**findings-16 反映**):
+Critical 現在ページも Normal 先読みも epoch=0 (= epoch チェック対象外、`fs_pending.cancel`
+で制御) にする。fullscreen / detached PDF はメイングリッドの navigation とは独立した
+コンテキストなので、main-grid epoch bump で prune してはいけない。
+`start_fs_load` 内では priority に関係なく sentinel を使う:
 ```rust
-let context_epoch = if priority == JobPriority::Critical {
-    0
-} else {
-    crate::pdf_loader::current_render_context_epoch()
-};
+let context_epoch = 0;
 ```
 
 **bench `src/bin/bench_scroll.rs:293`**: `LoadRequest::default()` ベースで構築。

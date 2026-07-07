@@ -34092,6 +34092,19 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
+    pub(crate) fn fs_pdf_render_context_epoch(_priority: crate::pdf_loader::JobPriority) -> u64 {
+        // Fullscreen fs_load is scoped to the open viewer context, not to the main
+        // grid context. fs_pending cancel tokens own its lifetime.
+        0
+    }
+
+    pub(crate) fn fs_pdf_render_error_is_cancel_like(
+        cancel_flag_set: bool,
+        error: &std::io::Error,
+    ) -> bool {
+        cancel_flag_set || error.kind() == std::io::ErrorKind::Interrupted
+    }
+
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG (通常画像) と WebP (通常画像 / ZIP 内画像) は
@@ -34350,15 +34363,7 @@ impl App {
         } else {
             crate::pdf_loader::JobPriority::Normal
         };
-        // context_epoch: Critical は epoch チェック対象外なので 0。
-        // Normal 先読みは current epoch を焼き付け、フォルダ移動で stale 化したら
-        // pool 側で prune してもらう (fs_pending.cancel と二重で守る)。
-        let pdf_context_epoch = if matches!(pdf_priority, crate::pdf_loader::JobPriority::Critical)
-        {
-            0
-        } else {
-            crate::pdf_loader::current_render_context_epoch()
-        };
+        let pdf_context_epoch = Self::fs_pdf_render_context_epoch(pdf_priority);
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
@@ -34542,8 +34547,14 @@ impl App {
                         let _ = pdf_ct_tx.send((idx, content_type));
                     }
                     Err(e) => {
-                        if cancel.load(Ordering::Relaxed) {
-                            crate::logger::log(format!("  fs pdf render cancelled  {name}"));
+                        let cancel_like = Self::fs_pdf_render_error_is_cancel_like(
+                            cancel.load(Ordering::Relaxed),
+                            &e,
+                        );
+                        if cancel_like {
+                            crate::logger::log(format!(
+                                "  fs pdf render cancelled/interrupted  {name}"
+                            ));
                             if crate::perf::is_enabled() {
                                 crate::perf::event(
                                     "fs",
