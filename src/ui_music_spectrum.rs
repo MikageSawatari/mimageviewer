@@ -539,6 +539,8 @@ fn draw_pitch_keyboard(
     note_even: &mut Vec<f32>,
     note_odd: &mut Vec<f32>,
 ) {
+    // 鍵盤矩形でクリップし、均等幅で描いた鍵の軸外はみ出しを表示上でカットする。
+    let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
     let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
     for slot in [
@@ -564,7 +566,7 @@ fn draw_pitch_keyboard(
     }
 
     for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
-        let x = spectrum_axis_x(rect, midi_to_hz(c_midi));
+        let x = spectrum_axis_x_unclamped(rect, midi_to_hz(c_midi));
         if x > rect.left() && x < rect.right() {
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
@@ -597,7 +599,7 @@ fn draw_pitch_keyboard(
                 let mid_color = key_fill(midi, center_val, want_black);
                 let top_color = key_fill(midi, center_val * odd_factor, want_black);
                 let bottom_color = key_fill(midi, center_val * even_factor, want_black);
-                fill_key_gradient(painter, key_rect, top_color, mid_color, bottom_color);
+                fill_key_gradient(&painter, key_rect, top_color, mid_color, bottom_color);
             } else {
                 painter.rect_filled(key_rect, corner, unlit_key_base(want_black, false));
             }
@@ -824,9 +826,15 @@ fn conventional_key_rect(rect: egui::Rect, midi: u8, black: bool) -> Option<egui
             rect.bottom(),
         )
     };
-    let left = left.max(rect.left()) + 0.25;
-    let right = right.min(rect.right()) - 0.25;
+    // 鍵は自然な (横クランプしない) 幅のまま返す。端のはみ出しは呼び出し側の painter クリップで
+    // カットする (幅を切り詰めると枠線が表示端に残って縦線化するため)。
+    let left = left + 0.25;
+    let right = right - 0.25;
     if right <= left {
+        return None;
+    }
+    // 完全に表示外の鍵は描かない (無駄描画の削減、可視分はクリップ任せ)。
+    if right < rect.left() || left > rect.right() {
         return None;
     }
     Some(egui::Rect::from_min_max(
@@ -836,8 +844,10 @@ fn conventional_key_rect(rect: egui::Rect, midi: u8, black: bool) -> Option<egui
 }
 
 fn conventional_octave_geometry(rect: egui::Rect, octave_c: u8) -> Option<(f32, f32)> {
-    let c_x = spectrum_axis_x(rect, midi_to_hz(octave_c));
-    let next_c_x = spectrum_axis_x(rect, midi_to_hz(octave_c.saturating_add(12)));
+    // クランプしない log 座標を使う。これで全オクターブが均等幅になり、軸下限 (20Hz) 未満の最低
+    // オクターブだけ横方向に圧縮されて鍵が小さくなる現象が無くなる (端は painter クリップで切る)。
+    let c_x = spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c));
+    let next_c_x = spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c.saturating_add(12)));
     let octave_w = next_c_x - c_x;
     if octave_w <= 1.0 {
         return None;
@@ -851,6 +861,15 @@ fn spectrum_axis_x(rect: egui::Rect, hz: f32) -> f32 {
     let max = SPECTRUM_VIEW_MAX_HZ;
     let t = (hz.clamp(min, max).log2() - min.log2()) / (max.log2() - min.log2());
     rect.left() + t.clamp(0.0, 1.0) * rect.width()
+}
+
+/// `spectrum_axis_x` のクランプなし版 (鍵盤ジオメトリ用)。hz が軸レンジ外だと左端より左 / 右端より
+/// 右の座標を返す。均等幅で鍵を並べ、表示端は呼び出し側の painter クリップでカットする前提。
+fn spectrum_axis_x_unclamped(rect: egui::Rect, hz: f32) -> f32 {
+    let min = SPECTRUM_AXIS_MIN_HZ;
+    let max = SPECTRUM_VIEW_MAX_HZ;
+    let t = (hz.max(1.0).log2() - min.log2()) / (max.log2() - min.log2());
+    rect.left() + t * rect.width()
 }
 
 fn spectrum_axis_hz(rect: egui::Rect, x: f32) -> f32 {
