@@ -40,6 +40,18 @@ pub enum NormalizeUiState {
     Scanning,
 }
 
+impl NormalizeUiState {
+    /// 現在プレイヤーに適用中のゲイン (dB)。適用していない状態 (Off / Scanning / Unmeasured) は
+    /// 0.0 (= 等倍)。スペクトラム鍵盤の明るさ反映などに使う。
+    pub fn applied_gain_db(self) -> f32 {
+        match self {
+            NormalizeUiState::OnApplied { gain_db }
+            | NormalizeUiState::ProvisionalApplied { gain_db } => gain_db,
+            _ => 0.0,
+        }
+    }
+}
+
 impl Default for NormalizeUiState {
     fn default() -> Self {
         Self::Off

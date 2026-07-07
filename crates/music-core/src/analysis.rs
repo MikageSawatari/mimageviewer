@@ -496,7 +496,8 @@ impl SpectrumAnalyzer {
                 if high_hz < SPECTRUM_MIN_HZ || low_hz > max_hz {
                     values.push(0.0);
                 } else {
-                    let power = self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz));
+                    let power =
+                        self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz), true);
                     values.push(power_to_display_value(
                         power,
                         spectrum_display_weight_db(hz),
@@ -514,7 +515,8 @@ impl SpectrumAnalyzer {
             if high_hz < SPECTRUM_MIN_HZ || low_hz > max_hz {
                 notes.push(0.0);
             } else {
-                let power = self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz));
+                // Q1: 鍵盤 notes は低音セカンダリ混合を外す (半音分解能優先、低域クラッタ低減)。
+                let power = self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz), false);
                 // Layer ① 知覚補正: 鍵盤 notes にも棒グラフ同等の等ラウドネス dB カーブを掛け、
                 // 低域偏重を解消してボーカル帯を見えやすくする (棒グラフだけ重み付けだった非対称を是正)。
                 notes.push(power_to_display_value(
@@ -613,7 +615,13 @@ impl SpectrumAnalyzer {
         }
     }
 
-    fn power_for_range(&self, center_hz: f32, low_hz: f32, high_hz: f32) -> f32 {
+    fn power_for_range(
+        &self,
+        center_hz: f32,
+        low_hz: f32,
+        high_hz: f32,
+        use_low_secondary: bool,
+    ) -> f32 {
         let weights = self.window_weights(center_hz);
         let base = weights
             .into_iter()
@@ -625,6 +633,11 @@ impl SpectrumAnalyzer {
             .sum::<f32>()
             .max(0.0);
 
+        // 低域セカンダリ混合 (窓1 を低域に混ぜて反応を速くする) は bars 用。notes (鍵盤) は半音
+        // 分解能を優先して混合しない (窓1 は低域で bin が粗く、隣接半音を滲ませてクラッタの原因)。
+        if !use_low_secondary {
+            return base;
+        }
         let secondary_mix = low_secondary_mix(center_hz);
         if secondary_mix <= 0.0 {
             return base;
@@ -738,6 +751,18 @@ fn power_to_display_value(power: f32, display_gain_db: f32) -> f32 {
     ((db - SPECTRUM_DB_FLOOR) / (SPECTRUM_DB_CEIL - SPECTRUM_DB_FLOOR))
         .clamp(0.0, 1.0)
         .powf(SPECTRUM_DB_GAMMA)
+}
+
+/// 表示値 (0..1、dB 圧縮済み) に gain_db 分の dB シフトを掛け直す。ラウドネス正規化 (Norm) の
+/// gain を鍵盤の明るさ (presence) に反映する等に使う。gain_db=0 なら恒等。相対パターンを崩さない
+/// よう、明るさ判定に使う代表値 (peak) だけに適用する想定。
+pub fn apply_display_gain_db(value: f32, gain_db: f32) -> f32 {
+    if gain_db == 0.0 {
+        return value;
+    }
+    let span = SPECTRUM_DB_CEIL - SPECTRUM_DB_FLOOR;
+    let t = value.max(0.0).powf(1.0 / SPECTRUM_DB_GAMMA) + gain_db / span;
+    t.clamp(0.0, 1.0).powf(SPECTRUM_DB_GAMMA)
 }
 
 fn spectrum_display_weight_db(hz: f32) -> f32 {

@@ -20528,8 +20528,22 @@ impl App {
         // 縦窓が極端に短く帯を確保できない場合 (show_spectrum=false) は worker を回さず描かない。
         if show_spectrum {
             let pcm = self.music_pcm.clone();
+            // Norm (ラウドネス正規化) 適用中のゲインを鍵盤の明るさ (presence) に反映する。未適用は 0dB。
+            let norm_gain_db = self
+                .normalize_ui_states
+                .get(&fs_idx)
+                .map(|s| s.applied_gain_db())
+                .unwrap_or(0.0);
+            // 上の Bass グラフと同じ推定 (ピッチクラス + 信頼度) を playhead から取り、鍵盤上の ▼ に渡す。
+            let bass_marker = self.music_analysis.as_ref().and_then(|a| {
+                let idx = (pos.max(0.0) / a.config.bin_secs.max(1.0e-3)) as usize;
+                a.bins
+                    .get(idx)
+                    .map(|b| (b.bass_pitch_class, b.bass_pitch_confidence))
+            });
             self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
-            self.music_spectrum.draw(ui, spectrum_rect);
+            self.music_spectrum
+                .draw(ui, spectrum_rect, norm_gain_db, bass_marker);
         }
 
         // ── 左右パネル (Inc 5 FB) ── 端ホバーでオーバーレイ表示 (動画のジャンプ/メタパネルと
