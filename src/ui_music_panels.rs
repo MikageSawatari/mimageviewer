@@ -763,7 +763,6 @@ impl App {
         let limiter_visible = self
             .music_limiter_visible_until
             .is_some_and(|until| now < until);
-        let show_limiter_slot = self.settings.audio_normalize_enabled;
         // 各ボタンのツールチップに併記するショートカット (動画 HUD と同じく共有 Video* アクションの
         // keymap chord を使う)。連続再生/速度/limiter/Norm はキーボードショートカットが無いので対象外。
         let sc_seek_start = self
@@ -1117,31 +1116,30 @@ impl App {
         // ミュート / 速度 / 時間) ──
         // 右端 padding は動画 native HUD の side_pad に揃える (旧 14 → 10、音量バー位置ズレ修正)。
         let mut rx = hud_rect.right() - side_pad;
-        // リミッター作動ドット (最右、動画 HUD の vol_label の右に置くのと同じ)。normalize
-        // 有効時のみスロットを確保し、直近作動時だけ赤ドットを描く。
+        // リミッター作動ドット (最右、動画 HUD の vol_label の右に置くのと同じ)。
         let limiter_slot_w = 14.0;
-        if show_limiter_slot {
-            if limiter_visible {
-                let dot_c = egui::pos2(rx - limiter_slot_w * 0.5, controls_cy);
-                let lim_rect = egui::Rect::from_center_size(dot_c, egui::vec2(limiter_slot_w, bsz));
-                let lim_resp = ui.interact(
-                    lim_rect,
-                    ui.id().with(("music_hud_limiter", fs_idx)),
-                    egui::Sense::hover(),
-                );
-                painter.circle_filled(
-                    dot_c,
-                    if lim_resp.hovered() { 4.5 } else { 4.0 },
-                    egui::Color32::from_rgb(255, 72, 72),
-                );
-                lim_resp.hover_tip_dark("出力リミッターが作動しました");
-                ui.ctx().request_repaint(); // 点灯期限まで消灯を反映するため repaint
-            }
-            // ドット中心は rx - limiter_slot_w*0.5。スロットぶん詰めると dB ラベル右端が
-            // ドット中心の limiter_slot_w*0.5 (=7px) 左に来て、動画 HUD の vol_label→limiter
-            // 間隔と一致する。
-            rx -= limiter_slot_w;
+        // スロット幅は Norm ON/OFF に関わらず常に確保し、トグルで右クラスタのボタン位置がずれない
+        // ようにする。赤ドットは Norm の有無に関係なく「出力リミッターが作動したとき」に描く
+        // (リミッターは VST / 音量>100% / Norm+ で作動しうるので、Norm OFF でもブースト時に点灯する)。
+        if limiter_visible {
+            let dot_c = egui::pos2(rx - limiter_slot_w * 0.5, controls_cy);
+            let lim_rect = egui::Rect::from_center_size(dot_c, egui::vec2(limiter_slot_w, bsz));
+            let lim_resp = ui.interact(
+                lim_rect,
+                ui.id().with(("music_hud_limiter", fs_idx)),
+                egui::Sense::hover(),
+            );
+            painter.circle_filled(
+                dot_c,
+                if lim_resp.hovered() { 4.5 } else { 4.0 },
+                egui::Color32::from_rgb(255, 72, 72),
+            );
+            lim_resp.hover_tip_dark("出力リミッターが作動しました");
+            ui.ctx().request_repaint(); // 点灯期限まで消灯を反映するため repaint
         }
+        // ドット中心は rx - limiter_slot_w*0.5。スロットは常に詰めるので、dB ラベル右端が
+        // ドット中心の limiter_slot_w*0.5 (=7px) 左に来て、動画 HUD の vol_label→limiter 間隔と一致する。
+        rx -= limiter_slot_w;
         // 現在音量の dB 表示ラベル (最右、動画 HUD の「スライダーの右」配置に合わせる)。
         // ミュート状態に関わらず実効音量を dB で示す。共有の
         // `format_video_volume_db_compact` を使い動画と表記を揃える (-∞dB / 0.0dB / +3.0dB)。
