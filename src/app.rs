@@ -26193,6 +26193,11 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn native_video_hud_dimmed_for_current_poll(&self) -> bool {
+        self.native_video_parked_live_input_window_id.is_some()
+    }
+
+    #[cfg(windows)]
     pub(crate) fn poll_parked_live_detached_windows(&mut self, ctx: &egui::Context) {
         let ids = self.parked_live_media_window_ids();
         for id in ids {
@@ -45085,6 +45090,8 @@ impl App {
         let mut native_close_error: Option<String> = None;
         #[cfg(windows)]
         let mut native_owner_hwnd: u64 = 0;
+        #[cfg(windows)]
+        let native_hud_dimmed = self.native_video_hud_dimmed_for_current_poll();
         // 音声 VST シェル (Inc 6 ②-3): フレーム開始時点のシェル対象 fs_idx。close race
         // (soft close イベントで exit 済み ↔ hard close の native_closed_idx) を安全に判定する
         // ため、イベント処理で music_vst_shell が変わる前に焼き付ける。
@@ -45164,6 +45171,8 @@ impl App {
                 );
                 #[cfg(windows)]
                 player.set_native_checked(self.checked.contains(idx));
+                #[cfg(windows)]
+                player.set_native_hud_dimmed(native_hud_dimmed);
                 if let Some(d) = player.tick(ctx) {
                     let d = if player.is_playing() {
                         d.min(std::time::Duration::from_millis(16))

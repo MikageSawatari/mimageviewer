@@ -340,6 +340,7 @@ struct NativeEguiOverlay {
     video_continuous_mode: crate::video::VideoContinuousMode,
     video_checked: bool,
     vst3_available: bool,
+    hud_dimmed: bool,
     /// 音声のみ native シェル (music Inc 6 ②)。上バーで動画専用ボタン (タイル一覧 / Perf
     /// グラフ) を出さず、音楽ビューと同じ VST・フルスクリーン切替・閉じるだけにする。
     audio_only: bool,
@@ -3161,6 +3162,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_hud_dimmed(&mut self, dimmed: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_hud_dimmed(dimmed);
+        }
+    }
+
     pub fn set_overlay_audio_only(&mut self, audio_only: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_audio_only(audio_only);
@@ -3901,6 +3908,7 @@ impl NativeEguiOverlay {
             video_continuous_mode: crate::video::VideoContinuousMode::Off,
             video_checked: false,
             vst3_available: false,
+            hud_dimmed: false,
             audio_only: false,
             vst3_panel: None,
             first_frame_presented: false,
@@ -4549,6 +4557,14 @@ impl NativeEguiOverlay {
             self.vst3_panel = None;
             self.last_emitted_vst3_panel_pos = None;
         }
+        self.dirty = true;
+    }
+
+    fn set_hud_dimmed(&mut self, dimmed: bool) {
+        if self.hud_dimmed == dimmed {
+            return;
+        }
+        self.hud_dimmed = dimmed;
         self.dirty = true;
     }
 
@@ -5767,6 +5783,7 @@ impl NativeEguiOverlay {
         let vst3_available = self.vst3_available;
         let audio_only = self.audio_only;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
+        let hud_dimmed = self.hud_dimmed;
         let perf_latest = self.perf_latest;
         let perf_history: Vec<_> = self.perf_history.iter().copied().collect();
         let hud_visible = self.hud_visible();
@@ -7410,6 +7427,15 @@ impl NativeEguiOverlay {
                         }
                     });
             } // ← `if bottom_hud_visible {` の閉じ (Codex 4周目 P1)
+            if hud_dimmed {
+                draw_native_hud_dim_overlay(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    panel_chrome_visible,
+                    bottom_hud_visible,
+                );
+            }
             // Codex 3周目 P2 反映: 音量ノーマライズ進捗パネルは **すべての overlay UI
             // 描画の最後** に置く。同じ Order::Foreground の Area は描画順 = z-order なので、
             // metadata panel / jump panel / bookmark editor / bottom HUD より後に描けば

@@ -21715,6 +21715,20 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn native_video_hud_dimmed_only_during_parked_live_poll() {
+        let mut app = setup_app();
+
+        assert!(!app.native_video_hud_dimmed_for_current_poll());
+
+        app.native_video_parked_live_input_window_id = Some(91);
+        assert!(app.native_video_hud_dimmed_for_current_poll());
+
+        app.native_video_parked_live_input_window_id = None;
+        assert!(!app.native_video_hud_dimmed_for_current_poll());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn activating_parked_live_media_closes_linked_active_window_in_off_mode() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

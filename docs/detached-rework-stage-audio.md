@@ -466,6 +466,20 @@ presenter/HUD は生きており、ボタンは filter で既に inert = 視覚�
 4. 時間窓/フェードで切替を吸収しない (憲法 §5)。即切替。
 5. 別コミット `(detached-rework stage-audio fix6b)`。
 
+### fix6b 実装メモ (Codex 2026-07-08)
+
+- `NativeEguiOverlay` に HUD 専用の `hud_dimmed` 状態を追加し、既存の
+  `set_native_*` と同じ command 経路 (`SetHudDimmed`) で App から presenter thread へ
+  伝搬する。App 側には新規フィールドを追加せず、既存の
+  `native_video_parked_live_input_window_id.is_some()` から毎 poll 導出する。
+- parked poll 区間では `dimmed=true`、通常 active poll / 復帰後は `dimmed=false` を
+  冪等送信する。SwitchPlacement で presenter が再構築された場合も presenter thread 側で
+  現行値を保持し、新 presenter に再適用する。
+- 減光は top bar / bottom HUD の描画後に HUD 領域だけ半透明黒を重ねる方式。video frame
+  には重ねず、hit-test / command 発行 / parked-live filter は不変。
+- 回帰テスト: `native_video_hud_dimmed_only_during_parked_live_poll` で dim が parked poll
+  の一時状態だけから導出され、通常 poll へ戻ると false になることを固定。
+
 ## 3.13 検収指摘 fix7 (実機 2026-07-08): parked 中のメディアが EOF で次へ進まない
 
 実機: 画像 (本) をアクティブにしたまま別窓で音声/動画を parked 再生していると、末尾に

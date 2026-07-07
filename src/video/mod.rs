@@ -558,6 +558,9 @@ enum NativeVideoOutputCommand {
     SetVst3Available {
         available: bool,
     },
+    SetHudDimmed {
+        dimmed: bool,
+    },
     SetChecked {
         checked: bool,
     },
@@ -991,6 +994,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetVst3Available { available });
+    }
+
+    fn set_hud_dimmed(&self, dimmed: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetHudDimmed { dimmed });
     }
 
     fn set_checked(&self, checked: bool) {
@@ -1927,6 +1936,7 @@ fn run_native_video_output(
     let mut cur_owner_hwnd = config.owner_hwnd;
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
+    let mut cur_hud_dimmed = false;
     let mut cur_sar: Option<(u32, u32)> = None;
     // **review #12 対応**: SwitchPlacement で presenter を作り直したとき再適用が
     // 漏れていた現行値。App 側は loop / continuous / compact を「ユーザー操作時のみ
@@ -2378,6 +2388,10 @@ fn run_native_video_output(
                     cur_vst3_available = available;
                     presenter.set_overlay_vst3_available(available);
                 }
+                NativeVideoOutputCommand::SetHudDimmed { dimmed } => {
+                    cur_hud_dimmed = dimmed;
+                    presenter.set_overlay_hud_dimmed(dimmed);
+                }
                 NativeVideoOutputCommand::SetChecked { checked } => {
                     cur_checked = checked;
                     presenter.set_overlay_checked(checked);
@@ -2805,6 +2819,7 @@ fn run_native_video_output(
                                             cur_vst3_available
                                                 && placement.is_fullscreen_borderless(),
                                         );
+                                        new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
                                         new_presenter.set_overlay_checked(cur_checked);
                                         new_presenter.set_overlay_fallback_file_name(
                                             cur_fallback_file_name.clone(),
@@ -5821,6 +5836,13 @@ impl VideoPlayer {
     pub fn set_native_vst3_available(&self, available: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_vst3_available(available);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_hud_dimmed(&self, dimmed: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_hud_dimmed(dimmed);
         }
     }
 
