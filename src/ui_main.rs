@@ -9214,7 +9214,7 @@ impl App {
                 Some(GridItem::ConvertibleArchive { path, format }) => {
                     let pf = path.clone();
                     let fmt = *format;
-                    let auto_fs = self.settings.auto_fullscreen_zip_pdf;
+                    let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active
                         || self.tag_view.active
                         || self.rating_view_nav_context_active()

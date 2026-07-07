@@ -525,6 +525,9 @@ enum NativeVideoPlacement {
   `DeferredFsReopen` に grid / CLI / SendTo の明示 open 由来かを保持し、detached viewer の
   focus と「毎回新しいウィンドウ」判定へ渡す。Ctrl+↑↓ フォルダナビ由来の deferred reopen は
   従来どおり focus を奪わず、always-new 判定にも grid open としては扱わない。
+  Stage SETTINGS 以後、複数ウィンドウモードでは `auto_fullscreen_zip_pdf` の保存値を変更せず、
+  `effective_auto_fullscreen_zip_pdf()` を true として扱う。したがって ON×保存値 OFF でも
+  ZIP/PDF/対応アーカイブは直開きになる。
 - 独立 detached 静止画 session かどうかは、open 時の one-shot フラグではなく
   `detached_viewer_independent_active` として session に保持する。これは現在の active viewer の状態であり、
   independent active viewer を passive window へ退避した時点で新しい active viewer へは引き継がない。

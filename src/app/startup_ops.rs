@@ -245,7 +245,7 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     openable: &Path,
     kind: crate::folder_tree::OpenablePathKind,
 ) -> bool {
-    if !settings.auto_fullscreen_zip_pdf {
+    if !settings.effective_auto_fullscreen_zip_pdf() {
         return false;
     }
     match kind {

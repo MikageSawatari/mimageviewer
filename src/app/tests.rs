@@ -290,6 +290,24 @@ fn startup_archive_open_auto_fullscreen_follows_setting_and_file_kind() {
         ),
         "folder option is subordinate to the main direct-page setting"
     );
+
+    settings.detached_viewer_open_images_in_window = true;
+    assert!(
+        startup_openable_should_auto_fullscreen(
+            &settings,
+            &zip,
+            crate::folder_tree::OpenablePathKind::File,
+        ),
+        "multi-window viewer mode forces ZIP/PDF direct open without mutating the saved full-feature preference"
+    );
+    assert!(
+        startup_openable_should_auto_fullscreen(
+            &settings,
+            &folder,
+            crate::folder_tree::OpenablePathKind::Directory,
+        ),
+        "multi-window viewer mode also enables the image-only folder option when that checkbox is on"
+    );
 }
 
 #[test]
@@ -18260,16 +18278,17 @@ mod still_window_mode_key_tests {
 
         for use_zip in [false, true] {
             let book_label = if use_zip { "zip" } else { "pdf" };
-            for direct_open in [false, true] {
+            for saved_direct_open in [false, true] {
                 for always_new in [false, true] {
                     let mut app = setup_app();
                     app.settings.detached_viewer_enabled = true;
                     app.settings.detached_viewer_open_images_in_window = always_new;
-                    app.settings.auto_fullscreen_zip_pdf = direct_open;
+                    app.settings.auto_fullscreen_zip_pdf = saved_direct_open;
                     app.current_folder = Some(PathBuf::from(r"C:\books"));
                     app.address = r"C:\books".to_string();
+                    let effective_direct_open = app.settings.effective_auto_fullscreen_zip_pdf();
 
-                    if direct_open {
+                    if effective_direct_open {
                         app.items = if use_zip {
                             vec![GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip"))]
                         } else {
@@ -18297,11 +18316,11 @@ mod still_window_mode_key_tests {
                     let handled = app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
                         &ctx,
                         0,
-                        direct_open,
+                        effective_direct_open,
                     );
                     assert_eq!(
                         handled, always_new,
-                        "{book_label}: always_new={always_new} direct_open={direct_open} must be the single switch for detached book context"
+                        "{book_label}: always_new={always_new} saved_direct_open={saved_direct_open} effective_direct_open={effective_direct_open} must be the single switch for detached book context"
                     );
 
                     if always_new {
@@ -18322,7 +18341,7 @@ mod still_window_mode_key_tests {
                             active.bundle.fs_nav_after_pdf_enumerate.is_some(),
                             "{book_label}: detached book context should reopen the selected page inside its own bundle"
                         );
-                    } else if direct_open {
+                    } else if effective_direct_open {
                         assert!(
                             app.active_detached_viewer_context.is_none(),
                             "{book_label}: OFF mode direct-open keeps the legacy linked/open path"

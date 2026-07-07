@@ -87,46 +87,69 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(14.0);
     ui.separator();
     ui.add_space(8.0);
-    ui.label(egui::RichText::new("ZIP/PDF/対応アーカイブ").strong());
+    ui.label(egui::RichText::new("ビューワモード").strong());
     ui.add_space(4.0);
-    ui.radio_value(
-        &mut state.settings.auto_fullscreen_zip_pdf,
-        false,
-        "開いたとき、ページ一覧を表示",
-    );
-    ui.radio_value(
-        &mut state.settings.auto_fullscreen_zip_pdf,
-        true,
-        "開いたとき、ページをフルスクリーン表示",
-    );
-    ui.add_enabled_ui(state.settings.auto_fullscreen_zip_pdf, |ui| {
-        ui.checkbox(
-            &mut state.settings.auto_fullscreen_image_folders,
-            "画像のみの通常フォルダも、ページをフルスクリーン表示",
-        );
-    });
-    ui.label(
-        egui::RichText::new(
-            "ページをフルスクリーン表示する場合、開く位置 (1 ページ目 / 続きから) は\
-             「履歴と復元」設定に従います。フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
-             Backspace でその本またはフォルダのページ一覧を表示します。外部ファイラや SendTo から\
-             開いた本・画像のみの通常フォルダにも適用されます。",
-        )
-        .weak(),
-    );
 
-    ui.add_space(14.0);
-    ui.separator();
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("画像ビューア").strong());
-    ui.add_space(4.0);
-    ui.checkbox(
+    ui.radio_value(
         &mut state.settings.detached_viewer_open_images_in_window,
-        "画像/動画を別ウィンドウで開く",
+        false,
+        "フル機能ウィンドウ（編集機能あり）",
     );
+    ui.indent("viewer_mode_full_feature", |ui| {
+        ui.label(
+            egui::RichText::new(
+                "フル機能を使えますが、画像/動画はメインウィンドウまたは 1 つの別ウィンドウ表示（F12 で切り替え）します。フルスクリーンへの切り替え（F11）も可能です。",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("本の表示モード").strong());
+        let full_mode = !state.settings.detached_viewer_open_images_in_window;
+        ui.add_enabled_ui(full_mode, |ui| {
+            ui.radio_value(
+                &mut state.settings.auto_fullscreen_zip_pdf,
+                false,
+                "開いたとき、ページ一覧を表示",
+            );
+            ui.radio_value(
+                &mut state.settings.auto_fullscreen_zip_pdf,
+                true,
+                "開いたとき、ページを表示（1 ページ目・続きはライブラリ・履歴と復元から設定可能）",
+            );
+        });
+        ui.add_enabled_ui(full_mode && state.settings.auto_fullscreen_zip_pdf, |ui| {
+            ui.checkbox(
+                &mut state.settings.auto_fullscreen_image_folders,
+                "画像のみのフォルダは、PDF/ZIP のように本として扱う",
+            );
+        });
+    });
+
+    ui.add_space(8.0);
+    ui.radio_value(
+        &mut state.settings.detached_viewer_open_images_in_window,
+        true,
+        "複数ウィンドウ（編集機能なし）",
+    );
+    ui.indent("viewer_mode_multi_window", |ui| {
+        ui.label(
+            egui::RichText::new(
+                "画像を開くたびに、新しいウィンドウで開きます。閲覧中心の方のためのモードです。動画は 1 つの動画ウィンドウで再生します。フルスクリーンへの切り替え（F11）も可能です。",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.add_enabled_ui(state.settings.detached_viewer_open_images_in_window, |ui| {
+            ui.checkbox(
+                &mut state.settings.auto_fullscreen_image_folders,
+                "画像のみのフォルダは、PDF/ZIP のように本として扱う",
+            );
+        });
+    });
+
     ui.label(
         egui::RichText::new(
-            "ON: 画像は開くたびに独立した別ウィンドウを残し、動画は専用の動画ウィンドウを再利用します。OFF: F12 で開く別ウィンドウは一覧の選択に連動する 1 枚だけです。",
+            "ページを表示する場合、開く位置は「履歴と復元」設定に従います。複数ウィンドウでは、ZIP/PDF/対応アーカイブは常にページを直接表示します。",
         )
         .weak(),
     );
@@ -138,7 +161,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.label(
         egui::RichText::new(
-            "※ この設定で開いた別ウィンドウでは、消しゴム・補正レイヤーなどの画像編集機能は利用できません。全体の色調補正やポストフィルタなどの表示調整は利用できます。",
+            "※ 複数ウィンドウで開いた別ウィンドウでは、消しゴム・補正レイヤーなどの画像編集機能は利用できません。全体の色調補正やポストフィルタなどの表示調整は利用できます。",
         )
         .weak(),
     );

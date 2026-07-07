@@ -5441,7 +5441,7 @@ impl App {
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {
-                let auto_fs = self.settings.auto_fullscreen_zip_pdf;
+                let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 if self.settings.archive_file_handling_ignores_convertible() {

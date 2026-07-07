@@ -66,21 +66,39 @@ impl App {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("ZIP/PDF/対応アーカイブ").strong());
+            ui.label(egui::RichText::new("ビューワモード").strong());
             ui.radio_value(
-                &mut self.settings.auto_fullscreen_zip_pdf,
+                &mut self.settings.detached_viewer_open_images_in_window,
                 false,
-                "開いたとき、ページ一覧を表示",
+                "フル機能ウィンドウ（編集機能あり）",
             );
+            ui.add_enabled_ui(!self.settings.detached_viewer_open_images_in_window, |ui| {
+                ui.radio_value(
+                    &mut self.settings.auto_fullscreen_zip_pdf,
+                    false,
+                    "本はページ一覧を表示して開く",
+                );
+                ui.radio_value(
+                    &mut self.settings.auto_fullscreen_zip_pdf,
+                    true,
+                    "本はページを表示して開く",
+                );
+                ui.add_enabled_ui(self.settings.auto_fullscreen_zip_pdf, |ui| {
+                    ui.checkbox(
+                        &mut self.settings.auto_fullscreen_image_folders,
+                        "画像のみのフォルダは、PDF/ZIP のように本として扱う",
+                    );
+                });
+            });
             ui.radio_value(
-                &mut self.settings.auto_fullscreen_zip_pdf,
+                &mut self.settings.detached_viewer_open_images_in_window,
                 true,
-                "開いたとき、ページをフルスクリーン表示",
+                "複数ウィンドウ（編集機能なし）",
             );
-            ui.add_enabled_ui(self.settings.auto_fullscreen_zip_pdf, |ui| {
+            ui.add_enabled_ui(self.settings.detached_viewer_open_images_in_window, |ui| {
                 ui.checkbox(
                     &mut self.settings.auto_fullscreen_image_folders,
-                    "画像のみの通常フォルダも、ページをフルスクリーン表示",
+                    "画像のみのフォルダは、PDF/ZIP のように本として扱う",
                 );
             });
 

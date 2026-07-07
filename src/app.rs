@@ -22368,7 +22368,7 @@ impl App {
                             let fmt = *format;
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
-                            let auto_fs = self.settings.auto_fullscreen_zip_pdf;
+                            let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                             let search_rollback = if self.favsearch.active
                                 || self.tag_view.active
                                 || self.rating_view_nav_context_active()
@@ -23029,7 +23029,7 @@ impl App {
     pub(crate) fn should_auto_fullscreen_grid_container(&self, idx: usize) -> bool {
         match self.items.get(idx) {
             Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => {
-                self.settings.auto_fullscreen_zip_pdf
+                self.settings.effective_auto_fullscreen_zip_pdf()
             }
             Some(GridItem::Folder(_)) => self.settings.auto_fullscreen_image_folders_enabled(),
             _ => false,
@@ -23147,7 +23147,7 @@ impl App {
     /// 検索 (Ctrl+S / Ctrl+G) 中は、Esc が検索を抜けて実親フォルダへ飛ぶ想定外挙動を
     /// 避けるため適用しない。
     pub(crate) fn auto_open_for_current_container(&self) -> bool {
-        if !self.settings.auto_fullscreen_zip_pdf
+        if !self.settings.effective_auto_fullscreen_zip_pdf()
             || self.global_search.active
             || self.favsearch.active
             || self.tag_view.active

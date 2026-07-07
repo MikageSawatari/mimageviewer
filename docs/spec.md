@@ -339,7 +339,7 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   Enter / ダブルクリックなどの明示 open で再表示する。既に同じ項目を表示中の場合、メイン一覧側の
   Enter は再オープンせず、必要に応じて別ウィンドウを前面化する。見開き表示中は、同時表示中の相方ページが
   メイン一覧の可視範囲内にある場合だけ破線のサブカーソルを描画する。
-- **画像/動画を別ウィンドウで開く設定**: 通常画像 / ZIP 内画像 / PDF ページは、開くたびに
+- **ビューワモードの複数ウィンドウ設定**: 通常画像 / ZIP 内画像 / PDF ページは、開くたびに
   現在の active 画像ビューアを表示専用の別ウィンドウとして残し、
   次の画像を新しい active 別ウィンドウで開く。動画は複数窓化せず、専用の動画別ウィンドウを再利用する。
   メイン一覧側の Backspace / フォルダ移動 / 再読込でも、
@@ -901,7 +901,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Shift+F7 / Shift+F8 | 現在ページ、またはグリッドのチェック済み画像 / 選択中画像から消しゴムマスクを削除 |
 | Shift+F9 / Shift+F10 | 現在ページ、またはグリッドのチェック済み画像 / 選択中画像から隠蔽マスクを削除 |
 | F11 | フルスクリーンモード / ウィンドウ内モードを切り替える（Action: `FsToggleWindowMode`。別ウィンドウ表示中は無効） |
-| F12 | 別ウィンドウモード ON/OFF を切り替える。表示中セッションがあれば可能な限り再生位置・現在ページを維持して表示先を切り替える。F11 のフルスクリーン / ウィンドウ内選択は変更しない。設定「画像/動画を別ウィンドウで開く」が ON の間は静止画 / ZIP画像 / PDFページでは無効化し、動画表示中のみ現在の動画をメイン / detached へ一時 host migration する |
+| F12 | 別ウィンドウモード ON/OFF を切り替える。表示中セッションがあれば可能な限り再生位置・現在ページを維持して表示先を切り替える。F11 のフルスクリーン / ウィンドウ内選択は変更しない。ビューワモード「複数ウィンドウ」が ON の間は静止画 / ZIP画像 / PDFページでは無効化し、動画表示中のみ現在の動画をメイン / detached へ一時 host migration する |
 | Ctrl+Alt+Shift+D | 画像パイプラインのデバッグ出力。現在ページ (見開き時は左右ページ) の段階別 PNG と `manifest.json` を `%APPDATA%\mimageviewer\debug-pipeline\...` に保存 |
 | マウスホイール | 通常表示では前/次の画像へ。縦/横連結モードでは連結方向へスクロール。編集モードの画像上ではズーム |
 | Ctrl + マウスホイール | マウス位置中心にズーム（0.1〜50 倍）。編集パネル上でもズームを優先 |
@@ -1032,7 +1032,8 @@ CB7 / LZH / LHA は `archive_file_handling` が `Ignore` 以外なら本とし�
 そのファイルをフルスクリーンで開く。ショートカットへのドラッグ＆ドロップや
 SendTo は Windows が対象パスを位置引数として渡すため、この経路で処理する。
 
-`auto_fullscreen_zip_pdf` が ON の場合、起動引数 / SendTo / 外部ファイラ経由で
+`auto_fullscreen_zip_pdf` が ON の場合、または `detached_viewer_open_images_in_window` による
+複数ウィンドウモードが ON の場合、起動引数 / SendTo / 外部ファイラ経由で
 ZIP / CBZ / PDF / 対応アーカイブを直接開いたときも、一覧で Enter / ダブルクリックした
 場合と同じ明示オープンとして扱い、ページ一覧を経由せずフルスクリーン表示へ進む。
 RAR / CBR / 7z / CB7 / LZH / LHA は `archive_file_handling` に従い、`Ask` なら
@@ -1138,11 +1139,12 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
 | `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、読書履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
-| `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
+| `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ビューワモード) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
-| `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
-| `auto_fullscreen_image_folders` | bool | false | `auto_fullscreen_zip_pdf` が ON のとき、表示上の項目が 1 件以上かつ通常画像だけのフォルダも、ページ一覧を経由せずフルスクリーンで表示する。サブフォルダ、動画、ZIP/PDF、対応アーカイブが混ざるフォルダは対象外。開く位置は `book_open_resume` に従い、Esc/Enter は親一覧、Backspace はそのフォルダのページ一覧へ戻る |
+| `detached_viewer_open_images_in_window` | bool | false | 環境設定「ビューワモード」の複数ウィンドウ。ON のとき通常画像 / ZIP 内画像 / PDF ページを開くたびに新しい別ウィンドウで開き、動画は 1 つの動画別ウィンドウを再利用する。画像編集機能は複数ウィンドウ側では無効。ON の間は ZIP/PDF/対応アーカイブの直開き実効値も true になるが、`auto_fullscreen_zip_pdf` の保存値は変更しない |
+| `auto_fullscreen_zip_pdf` | bool | false | フル機能ウィンドウモードで、ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する保存値。複数ウィンドウモードではこの保存値に関わらず実効的に ON として扱う。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
+| `auto_fullscreen_image_folders` | bool | false | 直開きの実効値が ON のとき、表示上の項目が 1 件以上かつ通常画像だけのフォルダも、ページ一覧を経由せずフルスクリーンで表示する。サブフォルダ、動画、ZIP/PDF、対応アーカイブが混ざるフォルダは対象外。開く位置は `book_open_resume` に従い、Esc/Enter は親一覧、Backspace はそのフォルダのページ一覧へ戻る |
 | `fullscreen_fit_mode` | FullscreenFitMode | Page | フルスクリーンのズーム/フィット基準。ページ全体 / 横幅 / 縦幅 / 100%原寸。旧ページ全体+余白カットは表示トリムの自動余白カットへ移行する |
 | `fullscreen_fit_no_upscale` | bool | false | 自動フィット時に 100% を超える拡大をしない。手動ズームは制限しない |
 | `fullscreen_fit_no_downscale` | bool | false | 自動フィット時に 100% 未満へ縮小しない。ON の場合、画像が画面外へはみ出す表示でもパンできる |

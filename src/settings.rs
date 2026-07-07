@@ -4366,8 +4366,12 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    pub fn effective_auto_fullscreen_zip_pdf(&self) -> bool {
+        self.detached_viewer_open_images_in_window || self.auto_fullscreen_zip_pdf
+    }
+
     pub fn auto_fullscreen_image_folders_enabled(&self) -> bool {
-        self.auto_fullscreen_zip_pdf && self.auto_fullscreen_image_folders
+        self.effective_auto_fullscreen_zip_pdf() && self.auto_fullscreen_image_folders
     }
 
     pub fn books_root_path(&self) -> PathBuf {
@@ -5482,6 +5486,35 @@ mod tests {
         assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
+    }
+
+    #[test]
+    fn effective_auto_fullscreen_zip_pdf_truth_table_preserves_saved_value() {
+        for detached in [false, true] {
+            for saved_direct_open in [false, true] {
+                let mut s = Settings {
+                    detached_viewer_open_images_in_window: detached,
+                    auto_fullscreen_zip_pdf: saved_direct_open,
+                    ..Settings::default()
+                };
+
+                assert_eq!(
+                    s.effective_auto_fullscreen_zip_pdf(),
+                    detached || saved_direct_open,
+                    "detached={detached} saved_direct_open={saved_direct_open}"
+                );
+                assert_eq!(
+                    s.auto_fullscreen_zip_pdf, saved_direct_open,
+                    "effective mode must not mutate the persisted book display preference"
+                );
+
+                s.detached_viewer_open_images_in_window = !detached;
+                assert_eq!(
+                    s.auto_fullscreen_zip_pdf, saved_direct_open,
+                    "switching viewer mode must preserve the saved book display preference"
+                );
+            }
+        }
     }
 
     #[test]

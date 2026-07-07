@@ -230,12 +230,14 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
 
-環境設定 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
+環境設定のフル機能ウィンドウで「本をページ表示で開く」が ON、または複数ウィンドウモードが
+ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
 起動引数 / SendTo / 外部ファイラから ZIP/PDF/対応アーカイブを直接開くと、ページ一覧
 (L2) を経由せずページを直接フルスクリーン (L3) で開く**。追加設定
 `auto_fullscreen_image_folders` が ON の場合は、表示上の項目が通常画像だけのフォルダも
 同じくページ一覧をスキップして開く。MangaMeeya 風の「本棚 → 本を開く → 読む → 閉じて本棚」
 フロー。開く位置は `book_open_resume` (続きから / 先頭から) に従う。
+複数ウィンドウモードでは `auto_fullscreen_zip_pdf` の保存値は書き換えず、実効値だけを ON として扱う。
 
 - グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
   `pending_auto_fs_open` を立てる (ZipFile/PdfFile/ConvertibleArchive、追加設定 ON の
@@ -265,7 +267,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 「どう入ったか」を覚える一時フラグ (旧 `fs_zip_auto_opened` / `auto_opened_container`) は
 **廃止**。階層 (L1 ファイル一覧 > L2 ページ一覧 > フルスクリーン) の概念は変えず、
 モードB はあくまで **L2 を飛ばすショートカット**として扱う。判定は設定
-`auto_fullscreen_zip_pdf` と「いまコンテナ (ZIP/PDF/変換アーカイブ由来のキャッシュ ZIP、
+`effective_auto_fullscreen_zip_pdf()` と「いまコンテナ (ZIP/PDF/変換アーカイブ由来のキャッシュ ZIP、
 または追加設定 ON の画像のみ通常フォルダ) の中か」だけ。
 
 - **分岐するのは 2 箇所だけ:**
