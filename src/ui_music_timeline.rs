@@ -398,6 +398,9 @@ fn run_timeline_raster_worker(
 pub struct MusicTimelineOutcome {
     /// クリック/ドラッグでシークを要求した位置 (呼び出し側が `player.seek`)。
     pub seek_request: Option<f64>,
+    /// この frame に実際に描画できた timeline texture row 数。0 の場合、呼び出し側は
+    /// 解析済みでもまだ texture が無い初回 frame と判断できる。
+    pub displayed_texture_rows: usize,
     /// この frame にホイールで手動スクロールがあった。呼び出し側はこれを見て「追従クール
     /// ダウン」を張る (手動閲覧中に playhead へ引き戻さない)。
     pub manual_scroll: bool,
@@ -562,6 +565,7 @@ pub fn draw_music_timeline(
         }
     }
 
+    let mut displayed_texture_rows = 0_usize;
     for (row, row_rect) in visible_rows {
         let row_start = row as f64 * row_secs;
         if !cache.row_is_fresh(row, texture_key) {
@@ -572,6 +576,7 @@ pub fn draw_music_timeline(
             pending_raster = true;
         }
         if let Some((texture, _represented_bins)) = row_texture {
+            displayed_texture_rows += 1;
             painter.image(
                 texture.id(),
                 row_rect,
@@ -635,6 +640,7 @@ pub fn draw_music_timeline(
     }
     MusicTimelineOutcome {
         seek_request,
+        displayed_texture_rows,
         manual_scroll,
         auto_scrolled,
     }

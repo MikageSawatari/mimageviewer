@@ -3736,6 +3736,57 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn draw_parked_live_music_timeline(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        position_secs: f64,
+        duration_secs: f64,
+        playing: bool,
+        left_label_w: f32,
+    ) -> bool {
+        let Some(analysis) = self.music_analysis.clone() else {
+            return false;
+        };
+        if analysis.bins.is_empty() || rect.width() < 120.0 || rect.height() < 80.0 {
+            return false;
+        }
+
+        let timeline_duration = if duration_secs > 0.0 {
+            duration_secs
+        } else {
+            analysis.stream.duration_secs
+        };
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(rect);
+        *child.visuals_mut() = egui::Visuals::dark();
+        let cache = &mut self.music_timeline_cache;
+        let mut outcome = crate::ui_music_timeline::MusicTimelineOutcome::default();
+        let _ = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .id_salt("parked_live_music_timeline")
+            .show(&mut child, |ui| {
+                outcome = crate::ui_music_timeline::draw_music_timeline(
+                    ui,
+                    &analysis,
+                    timeline_duration,
+                    position_secs,
+                    playing,
+                    playing,
+                    cache,
+                    self.music_timeline_row_secs,
+                    true,
+                    left_label_w,
+                );
+            });
+        outcome.displayed_texture_rows > 0
+    }
+
+    #[cfg(windows)]
     fn draw_parked_live_music_window(
         &mut self,
         ui: &mut egui::Ui,
@@ -3816,8 +3867,19 @@ impl App {
             egui::pos2(full_rect.left() + content_gutter, band_top),
             egui::pos2(full_rect.right() - content_gutter, central_bottom),
         );
+        let timeline_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), central_rect.top()),
+            egui::pos2(central_rect.right(), central_rect.bottom()),
+        );
 
-        let waveform_drawn = self.draw_parked_live_music_waveform(
+        let waveform_drawn = self.draw_parked_live_music_timeline(
+            ui,
+            timeline_rect,
+            info.position_secs,
+            info.duration_secs,
+            info.playing,
+            content_gutter,
+        ) || self.draw_parked_live_music_waveform(
             &painter,
             central_rect,
             info.position_secs,

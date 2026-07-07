@@ -323,6 +323,31 @@ FB。音楽機能は次リリースの目玉なので、park 中の表示を通�
 - 再生位置は parked bundle 内の player から read-only で取得できる場合に playhead と
   spectrum marker へ反映する。取得できない場合は解析中表示へフォールバックする。
 
+## 3.11 検収指摘 fix5 (実機 2026-07-08 未明): park 中の上部グラフが通常表示と全く違う
+
+- ユーザー報告: 音声モード表示中に別窓を開く (park) と、**上側のグラフが普段と
+  全く違うものになる**。
+- fix4 の指示 (§3.10-1) は「タイムライン/DJ 波形は **global TimelineTextureCache**
+  を再利用」だったが、実装メモは「静的波形」= 独自描画になっており、通常ビューの
+  タイムラインと見た目が一致していない可能性が高い。
+- fix5 要件:
+  1. park 中の上部グラフは、**通常の音楽ビューが表示しているのと同じタイムライン
+     テクスチャ (global cache)** を描く。テクスチャが未生成のトラックのみ現行の
+     静的波形にフォールバック。
+  2. 描画スケール/配色も通常ビューと揃える (見た目の連続性が目的)。
+  3. もし既にテクスチャを再利用しているのに違って見える場合は、何を描いているか
+     (データソース・スケール) を調査して報告してから直す。
+  4. コミット `(detached-rework stage-audio fix5)`。
+
+### fix5 実装メモ (Codex 2026-07-08)
+
+- ParkedLive 音楽窓の上部グラフを、独自静的波形から通常音楽ビューと同じ
+  `draw_music_timeline()` + global `TimelineTextureCache` 経路へ変更した。
+- `MusicTimelineOutcome.displayed_texture_rows` を追加し、timeline texture がまだ 1 行も
+  表示できない初回 frame だけ従来の静的波形 fallback を重ねる。
+- ParkedLive 中の操作は引き続き有効化しない。timeline の seek outcome は無視し、
+  クリック復帰のみの規則を維持する。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
