@@ -20952,7 +20952,23 @@ impl App {
         let mut suppressed_heavy: usize = 0;
         for i in self.keep_set_sorted() {
             if self.requested.contains_key(&i) {
-                continue;
+                if matches!(
+                    self.thumbnails[i],
+                    ThumbnailState::Evicted | ThumbnailState::Failed
+                ) {
+                    let stale_state = match self.thumbnails[i] {
+                        ThumbnailState::Evicted => "Evicted",
+                        ThumbnailState::Failed => "Failed",
+                        _ => "unknown",
+                    };
+                    self.requested.remove(&i);
+                    self.pending_finalize.remove(&i);
+                    crate::logger::log(format!(
+                        "  [queue] cleanup stale requested idx={i} state={stale_state}"
+                    ));
+                } else {
+                    continue;
+                }
             }
             let need_load = matches!(
                 self.thumbnails[i],
