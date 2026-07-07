@@ -20855,6 +20855,89 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_builder_placement_latch_does_not_follow_live_drag_updates() {
+        let mut app = setup_app();
+        let initial = crate::settings::DetachedViewerWindowPlacement {
+            x: 1564.0,
+            y: 240.66667,
+            w: 1167.0,
+            h: 765.0,
+            maximized: false,
+        };
+        let alternate = crate::settings::DetachedViewerWindowPlacement {
+            x: 1578.6666,
+            y: 244.0,
+            w: 1167.0,
+            h: 765.0,
+            maximized: false,
+        };
+
+        app.begin_active_detached_session(44, DetachedSource::Video);
+        app.set_detached_window_runtime_placement(44, initial, "test_initial");
+
+        assert_eq!(
+            app.active_detached_builder_placement_latch(true, "test_need_show"),
+            initial,
+            "need_show/host-seed frames capture the current live placement into the builder latch"
+        );
+
+        for i in 0..8 {
+            let live = if i % 2 == 0 { alternate } else { initial };
+            app.set_detached_window_runtime_placement(44, live, "test_drag_report");
+            assert_eq!(
+                app.active_detached_viewer_current_placement(),
+                live,
+                "live runtime placement should continue to track the OS-reported drag position"
+            );
+            assert_eq!(
+                app.active_detached_builder_placement_latch(false, "test_video_per_frame_seed"),
+                initial,
+                "video's per-frame seed must reuse the latched builder placement instead of echoing live A/B reports"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_builder_placement_latch_refreshes_on_real_seed_frame() {
+        let mut app = setup_app();
+        let first = crate::settings::DetachedViewerWindowPlacement {
+            x: 420.0,
+            y: 160.0,
+            w: 1278.0,
+            h: 840.0,
+            maximized: false,
+        };
+        let latest = crate::settings::DetachedViewerWindowPlacement {
+            x: 740.0,
+            y: 260.0,
+            w: 1340.0,
+            h: 900.0,
+            maximized: false,
+        };
+
+        app.begin_active_detached_session(45, DetachedSource::Video);
+        app.set_detached_window_runtime_placement(45, first, "test_first");
+        assert_eq!(
+            app.active_detached_builder_placement_latch(true, "test_open_seed"),
+            first
+        );
+
+        app.set_detached_window_runtime_placement(45, latest, "test_live_move");
+        assert_eq!(
+            app.active_detached_builder_placement_latch(false, "test_video_seed"),
+            first,
+            "without a true seed trigger, the builder latch remains stable"
+        );
+        assert_eq!(
+            app.active_detached_builder_placement_latch(true, "test_recreate_seed"),
+            latest,
+            "a true seed trigger refreshes the latch from the latest live placement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_runtime_placement_persists_to_settings_on_remove() {
         let mut app = setup_app();
         let seed = crate::settings::DetachedViewerWindowPlacement {

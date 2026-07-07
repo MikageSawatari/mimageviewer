@@ -681,6 +681,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
+    pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) linked: bool,
     pub(crate) pending_deferred_activation: bool,
 }
@@ -693,6 +694,7 @@ impl DetachedWindowRuntime {
             state: DetachedWindowState::Opening,
             hwnd: 0,
             placement: None,
+            builder_placement_latch: None,
             linked,
             pending_deferred_activation: false,
         }
@@ -787,6 +789,46 @@ impl App {
     ) -> crate::settings::DetachedViewerWindowPlacement {
         self.active_detached_runtime_placement()
             .unwrap_or_else(|| self.detached_viewer_window_placement())
+    }
+
+    pub(crate) fn active_detached_builder_placement_latch(
+        &mut self,
+        refresh_latch: bool,
+        reason: &'static str,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        let live = self.active_detached_seed_placement();
+        let Some(window_id) = self.active_detached_hwnd_window_id() else {
+            return live;
+        };
+
+        let (previous, placement, refreshed) = {
+            let runtime = self.detached_window_runtime_entry_mut(window_id);
+            let previous = runtime.builder_placement_latch;
+            let latch_usable = runtime
+                .builder_placement_latch
+                .is_some_and(Self::detached_window_runtime_placement_is_usable);
+            let refreshed = refresh_latch || !latch_usable;
+            if refreshed {
+                runtime.builder_placement_latch = Some(live);
+            }
+            (
+                previous,
+                runtime.builder_placement_latch.unwrap_or(live),
+                refreshed,
+            )
+        };
+
+        if Self::detached_image_window_debug_enabled() {
+            self.log_detached_viewport_placement_event(
+                reason,
+                "builder_placement_latch",
+                format!(
+                    "window_id={window_id} refresh={refresh_latch} refreshed={refreshed} \
+                     previous={previous:?} live={live:?} latched={placement:?}"
+                ),
+            );
+        }
+        placement
     }
 
     fn detached_window_hwnd_get_raw(&self, window_id: u64) -> Option<u64> {

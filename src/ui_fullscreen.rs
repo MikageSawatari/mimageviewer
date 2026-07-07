@@ -5234,10 +5234,16 @@ impl App {
         // (`== 0` だと死んだ HWND を !=0 で指したまま再生成される取りこぼしを拾えない = Codex P2)。
         let title_idx = self.fullscreen_idx.unwrap_or(0);
         let apply_placement = self.detached_viewer_should_seed_placement();
+        let builder_placement = if apply_placement {
+            Some(self.active_detached_builder_placement_latch(true, "keepalive_backstop"))
+        } else {
+            None
+        };
         let builder = self.build_detached_viewer_viewport_builder(
             title_idx,
             None,
             apply_placement,
+            builder_placement,
             "keepalive_backstop",
         );
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
@@ -5582,16 +5588,32 @@ impl App {
         // builder を使うため、seed しないと既定サイズで作られてから保存配置へリサイズされフラッシュ
         // する。旧 host が **生存したまま** 新既定サイズ窓が生えるので host 生存判定だけでは
         // 取りこぼす (Codex 実機レビュー P1)。detached 動画が active/切替中の間は毎フレーム
-        // placement を seed し、再生成窓を最初から保存配置サイズで作らせてフラッシュを消す
-        // (seed 元は live placement。Win32 のタイトルバー drag は modal loop で egui が builder を
-        // 再 diff しないため、ドラッグ中の引き戻しは起きない)。静止画の enumerate holdover は
-        // live placement を更新しないので従来どおり host 未生存時のみ seed する (Codex P2)。
+        // placement を seed し、再生成窓を最初から保存配置サイズで作らせてフラッシュを消す。
+        // ただし seed 値を live placement に毎フレーム追従させると、drag 終了直後の 2 フレーム
+        // 差分が builder position の遅延フィードバックになり、窓が A/B の 2 値を永続往復する。
+        // そのため、live placement を builder へ渡す値へコピーするのは need_show / host 未生存の
+        // 真の seed 契機だけにし、動画 active の毎フレーム seed はラッチ値を再利用する。
+        // 静止画の enumerate holdover は live placement を更新しないので従来どおり host 未生存時
+        // のみ seed する (Codex P2)。
         #[cfg(windows)]
-        let detached_seed_placement = need_show
-            || self.detached_viewer_should_seed_placement()
+        let detached_refresh_builder_placement =
+            need_show || self.detached_viewer_should_seed_placement();
+        #[cfg(windows)]
+        let detached_seed_placement = detached_refresh_builder_placement
             || self.detached_video_presentation_active_or_targeted();
+        #[cfg(windows)]
+        let detached_builder_placement = if detached && !embedded && detached_seed_placement {
+            Some(self.active_detached_builder_placement_latch(
+                detached_refresh_builder_placement,
+                "active_render",
+            ))
+        } else {
+            None
+        };
         #[cfg(not(windows))]
         let detached_seed_placement = need_show;
+        #[cfg(not(windows))]
+        let detached_builder_placement = None;
         #[cfg(windows)]
         let (
             detached_open_display_ready,
@@ -5632,6 +5654,7 @@ impl App {
                 fs_idx,
                 detached_activate_on_show,
                 detached_seed_placement,
+                detached_builder_placement,
                 "active_render",
             )
         } else if state.is_video && !self.fs_music_view_active(fs_idx) {
@@ -7693,6 +7716,7 @@ impl App {
                     fs_idx,
                     None,
                     false,
+                    None,
                     "fullscreen_viewport_recreate",
                 ),
             _ => self.build_fullscreen_viewport_builder(),
@@ -7831,7 +7855,13 @@ impl App {
                 // にする: stale (死んだ) HWND をまだ指している (!=0) 間に egui が窓を再生成すると、
                 // `== 0` では seed を取りこぼして既定サイズ窓が生えてしまう (2026-07-01 ハンドオフ)。
                 let apply_placement = self.detached_viewer_should_seed_placement();
-                self.build_detached_viewer_viewport_builder(fs_idx, None, apply_placement, source)
+                self.build_detached_viewer_viewport_builder(
+                    fs_idx,
+                    None,
+                    apply_placement,
+                    None,
+                    source,
+                )
             }
             Some(ViewerPresentation::Fullscreen) if !self.fs_viewport_recreate_after_hide => {
                 // Ctrl+↑↓ の PDF/ZIP deferred reopen は既存の静止画 fullscreen viewport
@@ -7852,6 +7882,7 @@ impl App {
         fs_idx: usize,
         active: Option<bool>,
         apply_placement: bool,
+        builder_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
         source: &'static str,
     ) -> egui::ViewportBuilder {
         let name = self
@@ -7893,14 +7924,16 @@ impl App {
                     .with_position(rect.min)
                     .with_maximized(false);
             } else {
-                let placement = self.active_detached_viewer_current_placement();
+                let placement = builder_placement
+                    .unwrap_or_else(|| self.active_detached_viewer_current_placement());
                 self.log_detached_viewport_placement_event(
                     source,
                     "builder_with_position",
                     format!(
                         "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
-                         borderless=false seed_now={} placement={placement:?}",
-                        self.detached_viewer_should_seed_placement()
+                         borderless=false seed_now={} latched={} placement={placement:?}",
+                        self.detached_viewer_should_seed_placement(),
+                        builder_placement.is_some()
                     ),
                 );
                 builder = builder

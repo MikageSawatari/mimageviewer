@@ -65,6 +65,54 @@
 - writer が特定できたら、「placement の SSoT は runtime、position の適用はユーザー
   操作・明示遷移 (F11/F12/復元) のみ」の原則に合う形で該当経路を修正する。
 
+## Phase 1 結果 (Fable 解析 2026-07-07 夜): writer = active_render の毎フレーム builder position
+
+計装ログ (placement_trace) で確定:
+
+- `source=active_render event=builder_with_position` が**毎フレーム** (1080 回)、
+  `apply_placement=true` かつ **`seed_now=false`** で記録された。
+- 発生源 = [ui_fullscreen.rs:5590-5592](../src/ui_fullscreen.rs) の
+  `detached_seed_placement = need_show || should_seed_placement() ||`
+  **`detached_video_presentation_active_or_targeted()`** — 3 つ目の条件で
+  **detached 動画 active 中は毎フレーム builder に position/size が入る**。
+  これは「旧 host 生存のまま新既定サイズ窓が生える」フラッシュ対策 (Codex 実機
+  レビュー P1、BA-5 時代の防波堤) として意図的に入ったもの。
+- **振動の力学 (period-2 遅延フィードバック)**: builder の position 値 = 「前フレームに
+  保存した報告値」(1 フレーム遅れ)。egui は builder の値が変わると OuterPosition を
+  patch する。窓が静止していれば builder 値 = 現在位置で no-op だが、**ドラッグ終了
+  時点で「最後の 2 フレームの報告値 A, B」が異なると**: builder(N)=A を適用 →
+  報告(N+1)=A → 保存 → builder(N+2)=A…ではなく適用がコマンドキュー経由で 1 フレーム
+  遅れるため、報告が A,B,A,B… の**周期 2 軌道として固定**され、最後の 2 値の間を
+  永久に往復する。ドラッグを離す瞬間の 2 フレームがたまたま同値なら発火しない =
+  「毎回再現しない」と一致。コメントの「ドラッグ中は modal loop で再 diff しない」は
+  正しいが、**ドラッグ後**の echo が考慮漏れ。
+
+## Phase 2 指示 (Fable 承認済みの修正方針): builder に渡す placement 値をラッチする
+
+毎フレーム seed 自体 (= フラッシュ防波堤) は残してよいが、**builder に渡す
+position/size の「値」を live placement 追従にしない**:
+
+1. active 描画用の **builder placement ラッチ**を導入する (置き場所は
+   DetachedWindowRuntime か active viewport runtime の値フィールド。App 直下の
+   新規 bool ではない = 憲法 3 準拠)。
+2. ラッチの更新は **seed が本当に必要な契機のみ**: `need_show == true` または
+   `detached_viewer_should_seed_placement() == true` の評価時に、その時点の
+   live placement をラッチへコピー。
+3. `detached_video_presentation_active_or_targeted()` による毎フレーム seed では
+   **ラッチ値をそのまま builder に渡す** (live placement を読まない)。
+   → 窓の生存中は builder の position/size が定数になり、egui の patch が発火しない
+   = ドラッグ後の echo が構造的に消える。再生成契機 (need_show / seed) では
+   ラッチが更新されるので、フラッシュ防波堤の効果は維持される。
+4. **`with_inner_size` も同じラッチを使う** (リサイズでも同型の echo が起き得るため)。
+5. 禁止: 座標差の閾値・「静止したら追従」等のダンピング (憲法 5)。
+6. テスト:
+   - ドラッグ相当のシーケンス (保存 placement が毎フレーム変わる) で builder への
+     渡し値が不変であること (ラッチが live 追従しない)。
+   - need_show / should_seed 契機でラッチが最新 live placement に更新されること。
+   - 回帰: 保存 placement がドラッグ終了後 1 値に収束する (A/B 交互にならない)
+     シーケンステスト。
+7. コミット `(detached-rework findings-14)`。計装 (placement_trace) は残置してよい。
+
 ## 完了条件
 
 - [ ] Phase 1 計装 + 再現ログで writer 確定の報告。
