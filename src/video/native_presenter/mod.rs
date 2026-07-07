@@ -7433,6 +7433,13 @@ impl NativeEguiOverlay {
                                 egui::Color32::from_rgb(150, 150, 150),
                             );
                         }
+                        if hud_dimmed {
+                            painter.rect_filled(
+                                hud_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 86),
+                            );
+                        }
                     });
             } // ← `if bottom_hud_visible {` の閉じ (Codex 4周目 P1)
             if hud_dimmed {
@@ -7441,7 +7448,7 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     panel_chrome_visible,
-                    bottom_hud_visible,
+                    false,
                 );
             }
             // Codex 3周目 P2 反映: 音量ノーマライズ進捗パネルは **すべての overlay UI

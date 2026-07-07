@@ -799,6 +799,18 @@ fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーン�
 - 回帰テストでは parked layout と close-only に加え、`MusicChromeViewState` が active
   chrome 相当の項目を保持しつつ close だけ外部ボタンへ委譲することを固定した。
 
+### fix6b-2 調査・実装メモ (Codex 2026-07-08)
+
+- top dim が効き bottom dim が見えない原因は、bottom HUD が `native_video_seek_hud`
+  `Area(Order::Foreground)` 内で描かれ、別 `Area` の dim overlay が egui の Area order
+  memory に左右される余地があることだった。top は standalone bar なので従来 overlay で
+  十分だったが、bottom は同じ Foreground Area 同士の順序に依存する構図になっていた。
+- bottom HUD は `native_video_seek_hud` Area の全コントロール描画後に、同じ painter で
+  `hud_rect` へ dim rect を直接塗る方式に変更した。hit-test / command / filter は
+  触らず、見た目だけを同一 pass 内で完結させる。
+- `draw_native_hud_dim_overlay` は top のみを担当し、bottom には使わない。これで上バーと
+  下 HUD の両方が dimmed=true に追従しつつ、Area z-order 依存を排除する。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
