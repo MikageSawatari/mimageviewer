@@ -21862,6 +21862,112 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn parked_live_native_hud_commands_request_activation_only() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::NativeVideoPlacement;
+        use crate::video::native_window::{
+            NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
+        };
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live.mp4");
+        app.fullscreen_idx = Some(video);
+        app.native_video_parked_live_input_window_id = Some(92);
+
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::ToggleAudioMode
+            )
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::ToggleWindowMode
+            )
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::CloseFullscreen { generation: 1 }
+            )
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::Seek {
+                target_secs: 12.0
+            })
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::SetVolume {
+                volume: 0.5,
+                persist: true
+            })
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::RequestSeekThumbnail { target_secs: 12.0 }
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::ClearSeekThumbnail
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::PlacementSwitched {
+                    request_id: 1,
+                    placement: NativeVideoPlacement::DetachedWindow,
+                    generation: 1
+                }
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::PlacementSwitchFailed { request_id: 1 }
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::Window(
+                WinEv::KeyDown(NativeVideoKeyEvent {
+                    virtual_key: 0x28,
+                    scan_code: 0,
+                    extended: false,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    repeat: false,
+                })
+            ))
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::Window(
+                WinEv::MouseWheel(NativeVideoMouseWheelEvent {
+                    delta: -120,
+                    x: 10,
+                    y: 10,
+                    shift: false,
+                    ctrl: false,
+                })
+            ))
+        );
+
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::ToggleAudioMode);
+
+        assert_eq!(app.native_video_parked_live_activation_requests, vec![92]);
+        assert!(
+            app.video_audio_mode.is_none(),
+            "parked HUD commands must activate the window instead of executing their function"
+        );
+
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::TogglePlay);
+        assert_eq!(
+            app.native_video_parked_live_activation_requests,
+            vec![92],
+            "activation requests are deduplicated while parked"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn parked_live_native_left_click_queues_activation_request() {
         use crate::video::NativeVideoOutputEvent as Ev;
         use crate::video::native_window::{

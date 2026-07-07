@@ -1445,6 +1445,8 @@ const PARKED_LIVE_MUSIC_SPECTRUM_MAX_H: f32 = 180.0;
 const PARKED_LIVE_MUSIC_SPECTRUM_MIN_H: f32 = 60.0;
 #[cfg(windows)]
 const PARKED_LIVE_MUSIC_SPECTRUM_GAP: f32 = 8.0;
+#[cfg(windows)]
+const PARKED_LIVE_MUSIC_TIMELINE_MIN_H: f32 = 120.0;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
@@ -1455,6 +1457,13 @@ struct ParkedLiveMusicWindowLayout {
     show_spectrum: bool,
     draw_timeline: bool,
     draw_waveform_fallback: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetachedImageWindowBarMode {
+    Full,
+    CloseOnly,
 }
 
 /// 動画のチャプター・ブックマーク・ピンを 1 本の Vec に集約するための種別タグ。
@@ -3700,10 +3709,12 @@ impl App {
             egui::vec2(full_rect.width(), PARKED_LIVE_MUSIC_TOP_H),
         );
         let content_gutter = (edge_trigger + full_rect.width() * 0.03).max(8.0);
-        let band_top = full_rect.top() + PARKED_LIVE_MUSIC_TOP_H + 8.0;
-        let band_bottom = full_rect.bottom() - 24.0;
+        let band_top = full_rect.top() + PARKED_LIVE_MUSIC_TOP_H;
+        let band_bottom = full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT - 4.0;
         let band_h = (band_bottom - band_top).max(0.0);
-        let spectrum_h = PARKED_LIVE_MUSIC_SPECTRUM_MAX_H.min((band_h * 0.34).max(0.0));
+        let spectrum_h = PARKED_LIVE_MUSIC_SPECTRUM_MAX_H.min(
+            (band_h - PARKED_LIVE_MUSIC_SPECTRUM_GAP - PARKED_LIVE_MUSIC_TIMELINE_MIN_H).max(0.0),
+        );
         let show_spectrum = spectrum_h >= PARKED_LIVE_MUSIC_SPECTRUM_MIN_H;
         let spectrum_rect = egui::Rect::from_min_max(
             egui::pos2(full_rect.left() + content_gutter, band_bottom - spectrum_h),
@@ -3763,24 +3774,12 @@ impl App {
         } else {
             "一時停止"
         };
-        let hint = if info.video_audio_mode {
-            "動画の音声を再生中 - クリックで操作に戻る"
-        } else {
-            "音声を再生中 - クリックで操作に戻る"
-        };
         painter.text(
             egui::pos2(top_rect.left() + 14.0, top_rect.top() + 39.0),
             egui::Align2::LEFT_CENTER,
             mode_label,
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgba_unmultiplied(145, 156, 170, 165),
-        );
-        painter.text(
-            egui::pos2(top_rect.right() - 14.0, top_rect.top() + 20.0),
-            egui::Align2::RIGHT_CENTER,
-            hint,
-            egui::FontId::proportional(13.0),
-            egui::Color32::from_rgba_unmultiplied(155, 168, 184, 185),
         );
 
         let central_rect = layout.central_rect;
@@ -3793,10 +3792,15 @@ impl App {
                 egui::vec2(icon_side, icon_side),
             );
             crate::ui_helpers::draw_music_icon(&painter, icon_rect, false);
+            let activation_hint = if info.video_audio_mode {
+                "クリックで動画の音声操作に戻る"
+            } else {
+                "クリックで操作に戻る"
+            };
             painter.text(
                 egui::pos2(central_rect.center().x, icon_rect.bottom() + 28.0),
                 egui::Align2::CENTER_CENTER,
-                "クリックで操作に戻る",
+                activation_hint,
                 egui::FontId::proportional(15.0),
                 egui::Color32::from_gray(168),
             );
@@ -3828,7 +3832,121 @@ impl App {
                 .draw(ui, spectrum_rect, 0.0, bass_marker);
         }
 
+        Self::draw_parked_live_music_bottom_hud(ui, full_rect, info);
+
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    #[cfg(windows)]
+    fn draw_parked_live_music_bottom_hud(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        info: &crate::app::ParkedLiveMusicWindowInfo,
+    ) {
+        let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
+        let hud_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), full_rect.bottom() - hud_h),
+            full_rect.max,
+        );
+        let painter = ui.painter_at(hud_rect);
+        painter.rect_filled(
+            hud_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 132),
+        );
+
+        let side_pad = 10.0;
+        let seek_row_h = 22.0;
+        let bar_h = 8.0;
+        let bar_cy = hud_rect.top() + seek_row_h * 0.5;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(hud_rect.left() + side_pad, bar_cy - bar_h * 0.5),
+            egui::pos2(hud_rect.right() - side_pad, bar_cy + bar_h * 0.5),
+        );
+        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(54));
+        let frac = if info.duration_secs > 0.0 {
+            (info.position_secs / info.duration_secs).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        if frac > 0.0 {
+            let filled = egui::Rect::from_min_max(
+                bar_rect.min,
+                egui::pos2(bar_rect.left() + bar_rect.width() * frac, bar_rect.bottom()),
+            );
+            painter.rect_filled(filled, 2.0, egui::Color32::from_gray(132));
+        }
+
+        let center_y = (hud_rect.top() + seek_row_h + hud_rect.bottom()) * 0.5;
+        let text_center_y = center_y + 4.0;
+        let btn_size = 28.0;
+        let mut x = hud_rect.left() + side_pad;
+        let button_color = egui::Color32::from_rgba_unmultiplied(170, 176, 188, 125);
+        let bg_color = egui::Color32::from_rgba_unmultiplied(42, 46, 54, 118);
+        for label in ["R", if info.playing { "||" } else { ">" }, "L", "C"] {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, center_y - btn_size * 0.5),
+                egui::vec2(btn_size, btn_size),
+            );
+            painter.rect_filled(rect, 4.0, bg_color);
+            painter.text(
+                rect.center() + egui::vec2(0.0, 1.0),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(14.0),
+                button_color,
+            );
+            x = rect.right() + 8.0;
+        }
+
+        let position = format_duration_mm_ss(info.position_secs);
+        let duration = format_duration_mm_ss(info.duration_secs);
+        painter.text(
+            egui::pos2(hud_rect.right() - side_pad, text_center_y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{position} / {duration}"),
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgba_unmultiplied(170, 176, 188, 145),
+        );
+    }
+
+    #[cfg(windows)]
+    fn detached_image_window_bar_mode(parked_live_music: bool) -> DetachedImageWindowBarMode {
+        if parked_live_music {
+            DetachedImageWindowBarMode::CloseOnly
+        } else {
+            DetachedImageWindowBarMode::Full
+        }
+    }
+
+    #[cfg(windows)]
+    fn draw_detached_image_window_close_button(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        id: &'static str,
+        close_requested: &mut bool,
+    ) -> egui::Rect {
+        let close_rect = detached_image_window_bar_close_button_rect(full_rect);
+        let close_resp = draw_bar_button(
+            ui,
+            close_rect.left(),
+            close_rect.top(),
+            id,
+            |hovered| {
+                if hovered {
+                    egui::Color32::from_rgba_unmultiplied(150, 42, 42, 205)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(48, 48, 48, 160)
+                }
+            },
+            false,
+            |p, c, r| draw_close_icon(p, c, r),
+        )
+        .hover_tip_dark("閉じる");
+        if close_resp.clicked() {
+            *close_requested = true;
+        }
+        close_rect
     }
 
     #[cfg(windows)]
@@ -3867,27 +3985,13 @@ impl App {
             ),
         );
 
-        let close_rect = detached_image_window_bar_close_button_rect(full_rect);
-        let mut next_x = close_rect.left();
-        let close_resp = draw_bar_button(
+        let close_rect = Self::draw_detached_image_window_close_button(
             ui,
-            next_x,
-            close_rect.top(),
+            full_rect,
             "detached_image_close_btn",
-            |hovered| {
-                if hovered {
-                    egui::Color32::from_rgba_unmultiplied(150, 42, 42, 205)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(48, 48, 48, 160)
-                }
-            },
-            false,
-            |p, c, r| draw_close_icon(p, c, r),
-        )
-        .hover_tip_dark("閉じる");
-        if close_resp.clicked() {
-            *close_requested = true;
-        }
+            close_requested,
+        );
+        let mut next_x = close_rect.left();
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
         let text_rect = egui::Rect::from_min_max(
@@ -4520,13 +4624,26 @@ impl App {
                         } else {
                             Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
                         }
-                        Self::draw_detached_image_window_bar(
-                            ui,
-                            vp_ctx,
-                            full_rect,
-                            &view,
-                            &mut bar_close_requested,
-                        );
+                        match Self::detached_image_window_bar_mode(parked_live_music_info.is_some())
+                        {
+                            DetachedImageWindowBarMode::Full => {
+                                Self::draw_detached_image_window_bar(
+                                    ui,
+                                    vp_ctx,
+                                    full_rect,
+                                    &view,
+                                    &mut bar_close_requested,
+                                );
+                            }
+                            DetachedImageWindowBarMode::CloseOnly => {
+                                Self::draw_detached_image_window_close_button(
+                                    ui,
+                                    full_rect,
+                                    "detached_music_close_btn",
+                                    &mut bar_close_requested,
+                                );
+                            }
+                        }
                     });
             });
             #[cfg(windows)]
@@ -21231,7 +21348,8 @@ mod tests {
     #[cfg(windows)]
     fn parked_live_music_layout_uses_spectrum_without_timeline_or_waveform() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
-        let layout = App::parked_live_music_window_layout(rect, 64.0)
+        let edge_trigger = 64.0;
+        let layout = App::parked_live_music_window_layout(rect, edge_trigger)
             .expect("normal parked music window should have a layout");
 
         assert!(
@@ -21248,6 +21366,24 @@ mod tests {
         );
         assert_eq!(layout.top_rect.height(), PARKED_LIVE_MUSIC_TOP_H);
         assert!(layout.central_rect.bottom() <= layout.spectrum_rect.top());
+        let content_gutter = (edge_trigger + rect.width() * 0.03).max(8.0);
+        let band_top = rect.top() + PARKED_LIVE_MUSIC_TOP_H;
+        let band_bottom = rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT - 4.0;
+        let spectrum_h = PARKED_LIVE_MUSIC_SPECTRUM_MAX_H.min(
+            (band_bottom
+                - band_top
+                - PARKED_LIVE_MUSIC_SPECTRUM_GAP
+                - PARKED_LIVE_MUSIC_TIMELINE_MIN_H)
+                .max(0.0),
+        );
+        let expected = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + content_gutter, band_bottom - spectrum_h),
+            egui::pos2(rect.right() - content_gutter, band_bottom),
+        );
+        assert_eq!(
+            layout.spectrum_rect, expected,
+            "ParkedLive spectrum rect must match the active music-view band formula"
+        );
     }
 
     #[test]
@@ -21260,6 +21396,23 @@ mod tests {
         assert!(!layout.draw_timeline);
         assert!(!layout.draw_waveform_fallback);
         assert!(!layout.show_spectrum);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_music_uses_close_only_bar_mode() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        assert_eq!(
+            App::detached_image_window_bar_mode(true),
+            DetachedImageWindowBarMode::CloseOnly
+        );
+        assert_eq!(
+            App::detached_image_window_bar_mode(false),
+            DetachedImageWindowBarMode::Full
+        );
+        let close_rect = detached_image_window_bar_close_button_rect(full);
+        assert_eq!(close_rect.width(), BAR_BUTTON_SIZE);
+        assert_eq!(close_rect.height(), BAR_BUTTON_SIZE);
     }
 
     #[test]

@@ -632,6 +632,24 @@ fix4 の「操作系は非表示」をここで改訂)。② は **HUD ボタン
 
 `(detached-rework stage-audio fix6c)`。fix6b (native presenter HUD dim) とは別コミット。
 
+### fix6c 実装メモ (Codex 2026-07-08)
+
+- ParkedLive 音楽窓は `draw_parked_live_music_window` の 54px ヘッダを正本とし、
+  passive 共通バーは `CloseOnly` 分岐で × ボタンだけ描く。× rect は引き続き
+  `detached_image_window_bar_close_button_rect()` 由来で、画像/PDF passive の full bar は不変。
+- 右端ヒントは × と重なるため削除し、中央ヒントのみ維持。動画→音声モードの parked 窓では
+  中央ヒントを「動画の音声操作に戻る」に変える。
+- parked layout は active 音楽ビューの帯計算に合わせ、`band_top = top + 54`、
+  `band_bottom = bottom - MUSIC_HUD_HEIGHT - 4`、`spectrum_h = 180.min(band_h - 8 - 120)`。
+  下端の `MUSIC_HUD_HEIGHT` 帯には、操作不可の簡易 HUD (seek bar + 主要ボタン風表示 +
+  時刻) を減光表示する。`draw_music_bottom_hud` は入力・player 依存が強いため流用せず、
+  見た目相当の inert HUD にした。
+- native ParkedLive の HUD semantic event は App 側で分類する。`Window` / placement /
+  hover thumbnail 系は activation にせず、それ以外の HUD command は機能を実行せず
+  `native_video_parked_live_activation_requests` に dedup して積む。
+- 回帰テスト: parked layout の spectrum rect、CloseOnly bar 分岐、HUD event 分類と
+  activation 変換 (ToggleAudioMode が音声モードを実行しないこと) を固定。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)

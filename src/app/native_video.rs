@@ -2475,12 +2475,54 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn native_video_output_event_is_parked_live_hud_click_activation(
+        event: &crate::video::NativeVideoOutputEvent,
+    ) -> bool {
+        use crate::video::NativeVideoOutputEvent as Ev;
+
+        match event {
+            // Lifecycle/status/hover events keep parked state maintenance working and must not
+            // activate the media window.
+            Ev::Window(_)
+            | Ev::PlacementSwitched { .. }
+            | Ev::PlacementSwitchFailed { .. }
+            | Ev::RequestSeekThumbnail { .. }
+            | Ev::ClearSeekThumbnail => false,
+            // Every other event is produced by a native HUD command. While ParkedLive, button
+            // functions stay inert; the click itself requests activation instead.
+            _ => true,
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn native_video_output_event_blocked_while_parked_live(
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
         !Self::native_video_output_event_allowed_while_parked_live(event)
             && !Self::native_video_output_event_is_parked_live_left_button(event, true)
             && !Self::native_video_output_event_is_parked_live_left_button(event, false)
+    }
+
+    #[cfg(windows)]
+    fn queue_native_video_parked_live_activation_request(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        window_id: u64,
+        reason: &'static str,
+    ) {
+        if !self
+            .native_video_parked_live_activation_requests
+            .contains(&window_id)
+        {
+            self.native_video_parked_live_activation_requests
+                .push(window_id);
+            ctx.request_repaint();
+            crate::logger::log(format!(
+                "[native-video] parked-live activation queued: idx={fs_idx} \
+                 window_id={window_id} reason={reason}"
+            ));
+        }
     }
 
     #[cfg(windows)]
@@ -2516,19 +2558,29 @@ impl App {
                 return;
             }
             if Self::native_video_output_event_is_parked_live_left_button(&event, false) {
-                if self.native_video_parked_live_left_down_window_id == Some(window_id)
-                    && !self
-                        .native_video_parked_live_activation_requests
-                        .contains(&window_id)
-                {
-                    self.native_video_parked_live_activation_requests
-                        .push(window_id);
-                    ctx.request_repaint();
-                    crate::logger::log(format!(
-                        "[native-video] parked-live activation queued: idx={fs_idx} window_id={window_id}"
-                    ));
+                if self.native_video_parked_live_left_down_window_id == Some(window_id) {
+                    self.queue_native_video_parked_live_activation_request(
+                        ctx,
+                        fs_idx,
+                        window_id,
+                        "left_click",
+                    );
                 }
                 self.native_video_parked_live_left_down_window_id = None;
+                return;
+            }
+            if Self::native_video_output_event_is_parked_live_hud_click_activation(&event) {
+                self.native_video_parked_live_left_down_window_id = None;
+                self.queue_native_video_parked_live_activation_request(
+                    ctx,
+                    fs_idx,
+                    window_id,
+                    "hud_command",
+                );
+                crate::logger::log(format!(
+                    "[native-video] parked-live hud command converted to activation: \
+                     idx={fs_idx} window_id={window_id} event={event:?}"
+                ));
                 return;
             }
             if self.native_video_event_blocked_by_parked_live_filter(&event) {
