@@ -16477,6 +16477,39 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn active_to_passive_handoff_preserves_live_registered_hwnd() {
+        let mut app = setup_app();
+        app.detached_viewer_window_id = Some(42);
+        app.detached_window_hwnd_set(42, 0x4200);
+        app.detached_window_hwnd_set(77, 0x7700);
+        app.set_detached_window_live_hwnds_for_test([0x4200, 0x7700]);
+        app.begin_active_detached_session(42, DetachedSource::Image);
+        app.transition_detached_window_state(42, DetachedWindowState::Active, "test_handoff");
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+
+        app.handoff_active_detached_viewport_to_passive("test_handoff");
+
+        assert_eq!(
+            app.detached_window_hwnd_alive_for_window_id(42),
+            Some(0x4200),
+            "active->passive handoff keeps the same live OS window registered"
+        );
+        let mut another_unknown_already_claimed = true;
+        assert!(
+            app.deferred_detached_window_registration_allowed(
+                42,
+                &mut another_unknown_already_claimed
+            ),
+            "a parked window with a live HWND must never be delayed by deferred creation serialization"
+        );
+        assert!(
+            another_unknown_already_claimed,
+            "confirmed windows must not consume the per-frame unknown-window slot"
+        );
+    }
+
+    #[test]
     fn detached_hwnd_unclaimed_adopts_single_unregistered_egui_window() {
         let mut app = setup_app();
         app.detached_window_hwnd_set(7, 0x700);
@@ -19245,7 +19278,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn pausing_independent_detached_context_hands_viewport_to_passive_without_cleanup() {
+    fn pausing_independent_detached_context_hands_viewport_to_passive_preserves_hwnd() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -19288,8 +19321,8 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fs_viewport_presentation, None);
         assert_eq!(
             app.detached_window_hwnd_raw_for_window_id(10),
-            0,
-            "active->passive handoff must force the deferred renderer to re-confirm the HWND instead of trusting the immediate registry"
+            0x1234,
+            "active->passive handoff must keep the live OS window registered so deferred rendering does not skip a living viewport"
         );
     }
 
@@ -22092,6 +22125,10 @@ mod still_window_mode_key_tests {
             "the first unknown deferred viewport in a frame is allowed to create its HWND"
         );
         assert!(unconfirmed_claimed);
+        assert!(
+            app.deferred_detached_window_registration_allowed(10, &mut unconfirmed_claimed),
+            "confirmed deferred viewports must not be delayed even after another unknown viewport claimed the frame"
+        );
         assert!(
             !app.deferred_detached_window_registration_allowed(12, &mut unconfirmed_claimed),
             "a second unknown deferred viewport in the same frame would make unclaimed HWND adoption ambiguous"

@@ -1400,9 +1400,21 @@ impl App {
             if let Some(repair_hwnd) = request.repair_hwnd
                 && !self.repair_detached_window_hwnd_from_watcher(id, repair_hwnd)
             {
+                let known_hwnd = self.detached_window_hwnd_raw_for_window_id(id);
+                let known_state = self.detached_window_state(id);
+                let claimed_by =
+                    self.detached_window_runtimes
+                        .iter()
+                        .find_map(|(&other_id, runtime)| {
+                            (other_id != id && runtime.hwnd == repair_hwnd).then_some(other_id)
+                        });
                 self.log_detached_image_window_debug(format!(
                     "deferred_activate_watcher_dropped id={id} reason=repair_failed \
-                     observed_hwnd=0x{repair_hwnd:x} frame={}",
+                     observed_hwnd=0x{repair_hwnd:x} observed_state=\"{}\" \
+                     known_hwnd=0x{known_hwnd:x} known_state={known_state:?} \
+                     known_hwnd_state=\"{}\" claimed_by={claimed_by:?} frame={}",
+                    Self::win32_hwnd_debug_state(repair_hwnd),
+                    Self::win32_hwnd_debug_state(known_hwnd),
                     self.frame_counter
                 ));
                 continue;
@@ -24990,7 +25002,6 @@ impl App {
     #[cfg(windows)]
     fn handoff_active_detached_viewport_to_passive(&mut self, reason: &'static str) {
         let session_before = self.active_detached_session;
-        let handoff_window_id = session_before.map(|session| session.window_id);
         let shown_before = self.fs_viewport_shown;
         let presentation_before = self.fs_viewport_presentation;
         let host_before = self.detached_viewer_host_debug_state();
@@ -25006,14 +25017,6 @@ impl App {
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
         self.detached_active_viewport_rendered_frame = u64::MAX;
-        if let Some(window_id) = handoff_window_id
-            && let Some(hwnd) = self.clear_detached_window_hwnd_for_window_id(window_id)
-        {
-            self.log_detached_image_window_debug(format!(
-                "active_viewport_handoff_clear_host_for_deferred reason={reason} \
-                 window_id={window_id} hwnd=0x{hwnd:x}"
-            ));
-        }
         self.log_detached_image_window_debug(format!(
             "active_viewport_handoff_to_passive reason={reason} session_before={session_before:?} \
              shown_before={shown_before} presentation_before={presentation_before:?} \
