@@ -6663,27 +6663,13 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 黒サムネ回帰修正 (2026-06-19, v1.8.0): font-atlas-resync 窓
-    /// (`main_font_atlas_resync_pending`) の間は、フルスクリーン close 直後の no-surface
-    /// フレームで upload が捨てられるのを避けるため、サムネのテクスチャ化を
-    /// `texture_backlog` へ先送りする。pending が解除されたら通常どおり Loaded 化する。
+    /// 黒サムネ回帰修正 (2026-06-19, v1.8.0) + detached-rework findings-9 B2:
+    /// font-atlas resync が予約されているだけの safe-frame 待ちではサムネ upload を
+    /// 止めない。実際に `set_fonts` が発火して repeat 中の間だけ、no-surface フレームで
+    /// upload が捨てられるのを避けるため `texture_backlog` へ先送りする。
     #[test]
-    fn thumbnail_upload_deferred_during_font_atlas_resync() {
-        use crate::grid_item::GridItem;
-
-        let mut app = setup_app();
-        let img = app.tmp.path().join("p.jpg");
-        std::fs::write(&img, b"x").unwrap();
-        app.items = vec![GridItem::Image(img)];
-        app.thumbnails = vec![ThumbnailState::Pending];
-        app.image_metas = vec![Some((1, 1))];
-        app.keep_set.insert(0);
-        app.keep_range = (0, 1);
-        app.requested.insert(0, false);
-        let cur_gen = app.items_generation;
-
-        let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
-        let send = |app: &App| {
+    fn thumbnail_upload_deferred_only_during_active_font_atlas_resync_repeats() {
+        let send = |app: &App, color: &egui::ColorImage, cur_gen: u64| {
             app.tx
                 .send(crate::thumb_loader::ThumbMsg {
                     idx: 0,
@@ -6698,15 +6684,41 @@ mod favorite_adjustment_defaults_tests {
                 .unwrap();
         };
 
+        let mut app = setup_app();
+        let img = app.tmp.path().join("p.jpg");
+        std::fs::write(&img, b"x").unwrap();
+        app.items = vec![crate::grid_item::GridItem::Image(img)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![Some((1, 1))];
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.requested.insert(0, false);
+        let cur_gen = app.items_generation;
         let ctx = egui::Context::default();
+        let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
 
-        // resync 窓: テクスチャ化せず backlog へ先送り (黒サムネ化させない)。
-        app.main_font_atlas_resync_pending = true;
-        send(&app);
+        // resync 予約だけの safe-frame 待ち: upload は止めず、サムネを固着させない。
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        assert!(!app.main_font_atlas_resync_defers_texture_uploads());
+        send(&app, &color, cur_gen);
+        app.poll_thumbnails(&ctx);
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+            "pending safe-frame wait alone must not block thumbnail uploads"
+        );
+        assert!(app.texture_backlog.is_empty());
+
+        // resync repeat 開始後: テクスチャ化せず backlog へ先送り (黒サムネ化させない)。
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        app.main_font_atlas_resync_repeats_left = MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES - 1;
+        assert!(app.main_font_atlas_resync_defers_texture_uploads());
+        app.thumbnails[0] = ThumbnailState::Pending;
+        app.requested.insert(0, false);
+        send(&app, &color, cur_gen);
         app.poll_thumbnails(&ctx);
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Pending),
-            "during resync the thumbnail must not be uploaded (would be discarded -> black)"
+            "during active resync repeats the thumbnail must not be uploaded (would be discarded -> black)"
         );
         assert_eq!(
             app.texture_backlog.len(),
@@ -6716,6 +6728,7 @@ mod favorite_adjustment_defaults_tests {
 
         // resync 解除後: 次の poll で backlog から Loaded 化する。
         app.main_font_atlas_resync_pending = false;
+        app.main_font_atlas_resync_repeats_left = 0;
         app.poll_thumbnails(&ctx);
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
@@ -19865,12 +19878,30 @@ mod still_window_mode_key_tests {
 
         app.transition_detached_window_state(51, DetachedWindowState::Opening, "test_opening");
         assert!(!app.main_font_atlas_resync_settled_frame());
+        assert_eq!(
+            app.main_font_atlas_resync_frame_safety(),
+            MainFontAtlasResyncFrameSafety {
+                placement_pending: false,
+                cloak_or_backdrop_active: false,
+                opening_count: 1,
+                closing_count: 0,
+            }
+        );
 
         app.transition_detached_window_state(51, DetachedWindowState::Parked, "test_parked");
         assert!(app.main_font_atlas_resync_settled_frame());
 
         app.transition_detached_window_state(51, DetachedWindowState::Closing, "test_closing");
         assert!(!app.main_font_atlas_resync_settled_frame());
+        assert_eq!(
+            app.main_font_atlas_resync_frame_safety(),
+            MainFontAtlasResyncFrameSafety {
+                placement_pending: false,
+                cloak_or_backdrop_active: false,
+                opening_count: 0,
+                closing_count: 1,
+            }
+        );
     }
 
     #[test]

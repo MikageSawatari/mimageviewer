@@ -5837,11 +5837,11 @@ impl App {
                                 )
                             });
                             let wants_keyboard = ctx.wants_keyboard_input();
-                            if key_pressed_count > 0
+                            let input_interesting = key_pressed_count > 0
                                 || wheel_event_count > 0
                                 || raw_scroll != egui::Vec2::ZERO
-                                || smooth_scroll != egui::Vec2::ZERO
-                            {
+                                || smooth_scroll != egui::Vec2::ZERO;
+                            if input_interesting || self.frame_counter % 60 == 0 {
                                 let foreground = current_foreground_hwnd();
                                 let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
                                 self.log_detached_image_window_debug(format!(
@@ -10344,11 +10344,11 @@ impl App {
                         i.events.len(),
                     )
                 });
-            if wheel_y.abs() > 0.5
+            let input_interesting = wheel_y.abs() > 0.5
                 || wheel_event_count > 0
                 || raw_scroll != egui::Vec2::ZERO
-                || smooth_scroll != egui::Vec2::ZERO
-            {
+                || smooth_scroll != egui::Vec2::ZERO;
+            if input_interesting || self.frame_counter % 60 == 0 {
                 let foreground = current_foreground_hwnd();
                 let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
                 self.log_detached_image_window_debug(format!(

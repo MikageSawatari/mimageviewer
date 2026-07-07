@@ -385,6 +385,25 @@ pub(crate) enum DetachedWindowState {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainFontAtlasResyncFrameSafety {
+    pub(crate) placement_pending: bool,
+    pub(crate) cloak_or_backdrop_active: bool,
+    pub(crate) opening_count: usize,
+    pub(crate) closing_count: usize,
+}
+
+#[cfg(windows)]
+impl MainFontAtlasResyncFrameSafety {
+    pub(crate) fn is_settled(self) -> bool {
+        !self.placement_pending
+            && !self.cloak_or_backdrop_active
+            && self.opening_count == 0
+            && self.closing_count == 0
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DetachedActivationWatchTarget {
     pub(crate) window_id: u64,
     pub(crate) hwnd: u64,
@@ -20167,7 +20186,16 @@ impl App {
         // ~500ms 後まで固着)。対策: resync 窓の間はサムネのテクスチャ化を `texture_backlog` へ
         // 先送りし、surface が戻ってから upload する。ColorImage は破棄せず保持されるので
         // 数フレーム遅れて正しく表示される。
-        let defer_texture_uploads = self.main_font_atlas_resync_pending;
+        let defer_texture_uploads = {
+            #[cfg(windows)]
+            {
+                self.main_font_atlas_resync_defers_texture_uploads()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
         let mut deferred_for_resync = 0u32;
         let (keep_start, keep_end) = self.keep_range;
 
@@ -24244,7 +24272,8 @@ impl App {
         if !Self::detached_image_window_debug_enabled() {
             return;
         }
-        let detached_wait = self.detached_font_atlas_resync_should_wait();
+        let safety = self.main_font_atlas_resync_frame_safety();
+        let detached_wait = !safety.is_settled();
         let interesting = self.main_font_atlas_resync_pending
             || self.pending_detached_cleanup_font_atlas_resync.is_some()
             || detached_wait
@@ -24253,10 +24282,17 @@ impl App {
         if !interesting {
             return;
         }
+        let urgent = self.main_font_atlas_resync_defers_texture_uploads()
+            || ctx.current_pass_index() > 0
+            || ctx.will_discard();
+        if !urgent && self.frame_counter % 60 != 0 {
+            return;
+        }
         crate::logger::log(format!(
             "[ui-fonts][diag] pass_probe phase={phase} egui_frame={} egui_pass={} \
              pass_index={} will_discard={} main_pending={} main_reason={} repeats={} \
              last_fire={} generation={} deferred_reason={} detached_wait={} detached_safe={} \
+             placement_pending={} cloak_or_backdrop={} opening={} closing={} \
              active_context={} session={:?} fullscreen_idx={:?} presentation={:?} \
              fs_presentation={:?} fs_shown={} passive_windows={} embedded_still={} main_blocked={}",
             ctx.cumulative_frame_nr(),
@@ -24271,7 +24307,11 @@ impl App {
             self.pending_detached_cleanup_font_atlas_resync
                 .unwrap_or("none"),
             detached_wait,
-            self.detached_cleanup_font_atlas_resync_is_safe(),
+            safety.is_settled(),
+            safety.placement_pending,
+            safety.cloak_or_backdrop_active,
+            safety.opening_count,
+            safety.closing_count,
             self.active_detached_viewer_context.is_some(),
             self.active_detached_session,
             self.fullscreen_idx,
@@ -24286,10 +24326,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn main_font_atlas_resync_settled_frame(&self) -> bool {
-        !self.main_font_atlas_resync_video_switch_pending()
-            && !self.main_font_atlas_resync_backdrop_or_cloak_active()
-            && !self.detached_window_runtime_has_state(DetachedWindowState::Opening)
-            && !self.detached_window_runtime_has_state(DetachedWindowState::Closing)
+        self.main_font_atlas_resync_frame_safety().is_settled()
     }
 
     #[cfg(windows)]
@@ -24306,10 +24343,28 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_window_runtime_has_state(&self, state: DetachedWindowState) -> bool {
+    fn detached_window_runtime_state_count(&self, state: DetachedWindowState) -> usize {
         self.detached_window_runtimes
             .values()
-            .any(|runtime| runtime.state == state)
+            .filter(|runtime| runtime.state == state)
+            .count()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn main_font_atlas_resync_frame_safety(&self) -> MainFontAtlasResyncFrameSafety {
+        MainFontAtlasResyncFrameSafety {
+            placement_pending: self.main_font_atlas_resync_video_switch_pending(),
+            cloak_or_backdrop_active: self.main_font_atlas_resync_backdrop_or_cloak_active(),
+            opening_count: self.detached_window_runtime_state_count(DetachedWindowState::Opening),
+            closing_count: self.detached_window_runtime_state_count(DetachedWindowState::Closing),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn main_font_atlas_resync_defers_texture_uploads(&self) -> bool {
+        self.main_font_atlas_resync_pending
+            && self.main_font_atlas_resync_repeats_left > 0
+            && self.main_font_atlas_resync_repeats_left < MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES
     }
 
     #[cfg(windows)]
@@ -24327,17 +24382,25 @@ impl App {
         let Some(reason) = self.pending_detached_cleanup_font_atlas_resync else {
             return;
         };
-        if !self.detached_cleanup_font_atlas_resync_is_safe() {
-            self.log_detached_image_window_debug(format!(
-                "font_resync_deferred_detached_alive active_context={} session={:?} \
-                 fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={} reason={reason}",
-                self.active_detached_viewer_context.is_some(),
-                self.active_detached_session,
-                self.fullscreen_idx,
-                self.viewer_presentation,
-                self.fs_viewport_shown,
-                self.detached_image_windows.len()
-            ));
+        let safety = self.main_font_atlas_resync_frame_safety();
+        if !safety.is_settled() {
+            if self.frame_counter % 60 == 0 {
+                self.log_detached_image_window_debug(format!(
+                    "font_resync_deferred_detached_alive active_context={} session={:?} \
+                 fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={} \
+                 reason={reason} placement_pending={} cloak_or_backdrop={} opening={} closing={}",
+                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_session,
+                    self.fullscreen_idx,
+                    self.viewer_presentation,
+                    self.fs_viewport_shown,
+                    self.detached_image_windows.len(),
+                    safety.placement_pending,
+                    safety.cloak_or_backdrop_active,
+                    safety.opening_count,
+                    safety.closing_count
+                ));
+            }
             return;
         }
         self.pending_detached_cleanup_font_atlas_resync = None;
@@ -24357,11 +24420,12 @@ impl App {
         if !self.main_font_atlas_resync_pending {
             return false;
         }
-        if !self.main_font_atlas_resync_settled_frame() {
-            if Self::detached_image_window_debug_enabled() {
+        let safety = self.main_font_atlas_resync_frame_safety();
+        if !safety.is_settled() {
+            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
                 crate::logger::log(format!(
                     "[ui-fonts][diag] resync_wait_settled phase={phase} reason={} \
-                     egui_frame={} egui_pass={} pass_index={} switch_pending={} \
+                     egui_frame={} egui_pass={} pass_index={} placement_pending={} \
                      cloak_or_backdrop={} opening={} closing={} fullscreen_idx={:?} \
                      presentation={:?} fs_presentation={:?} fs_shown={} passive_windows={} \
                      active_context={} session={:?}",
@@ -24369,10 +24433,10 @@ impl App {
                     ctx.cumulative_frame_nr(),
                     ctx.cumulative_pass_nr(),
                     ctx.current_pass_index(),
-                    self.main_font_atlas_resync_video_switch_pending(),
-                    self.main_font_atlas_resync_backdrop_or_cloak_active(),
-                    self.detached_window_runtime_has_state(DetachedWindowState::Opening),
-                    self.detached_window_runtime_has_state(DetachedWindowState::Closing),
+                    safety.placement_pending,
+                    safety.cloak_or_backdrop_active,
+                    safety.opening_count,
+                    safety.closing_count,
                     self.fullscreen_idx,
                     self.viewer_presentation,
                     self.fs_viewport_presentation,
