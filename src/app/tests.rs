@@ -21270,9 +21270,63 @@ mod still_window_mode_key_tests {
             });
         app.transition_detached_window_state(62, DetachedWindowState::ParkedLive, "test_setup");
 
+        let info = app
+            .parked_live_music_window_info_for_window_id(62)
+            .expect("audio ParkedLive window should use the music display");
+        assert_eq!(info.title, "parked.flac");
+        assert!(!info.video_audio_mode);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_video_audio_mode_uses_music_display_and_preserves_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\music-video.mp4");
+        let window_id = 63;
+        app.settings.detached_viewer_enabled = true;
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = None;
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+
+        assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_video_audio_park"));
         assert_eq!(
-            app.parked_live_audio_title_for_window_id(62).as_deref(),
-            Some("parked.flac")
+            app.video_audio_mode, None,
+            "after parking, the main context must not keep the media window audio mode"
+        );
+        let info = app
+            .parked_live_music_window_info_for_window_id(window_id)
+            .expect("video audio mode ParkedLive should render with the music display");
+        assert_eq!(info.title, "music-video.mp4");
+        assert!(info.video_audio_mode);
+        let parked = app
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .expect("parked media snapshot must remain");
+        let bundle = parked
+            .paused_bundle
+            .as_ref()
+            .expect("parked media snapshot owns its context bundle");
+        assert_eq!(
+            bundle.video_audio_mode,
+            Some(video),
+            "video_audio_mode must move with the parked media bundle"
+        );
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, window_id));
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("reactivated ParkedLive media owns an active context");
+        assert_eq!(
+            active.bundle.video_audio_mode,
+            Some(video),
+            "reactivation must keep video audio mode for the active detached context"
         );
     }
 

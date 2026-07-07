@@ -1679,6 +1679,16 @@ pub(crate) struct ActiveDetachedSession {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(crate) struct ParkedLiveMusicWindowInfo {
+    pub(crate) title: String,
+    pub(crate) position_secs: f64,
+    pub(crate) duration_secs: f64,
+    pub(crate) playing: bool,
+    pub(crate) video_audio_mode: bool,
+}
+
+#[cfg(windows)]
 struct ViewerContextBundle {
     address: String,
     current_folder: Option<PathBuf>,
@@ -1721,6 +1731,14 @@ struct ViewerContextBundle {
     viewer_presentation: ViewerPresentation,
     last_viewer_sync_stamp: Option<ViewerSyncStamp>,
     native_video_in_window_active: bool,
+    video_audio_mode: Option<usize>,
+    video_audio_vst: Option<VideoAudioVstState>,
+    video_audio_mode_entry_target: Option<(
+        crate::video::NativeVideoPlacement,
+        windows::Win32::Foundation::RECT,
+        u64,
+    )>,
+    video_audio_exit_pending: Option<VideoAudioExitPending>,
     detached_viewer_independent_active: bool,
     detached_viewer_open_next_still_detached_once: bool,
     detached_viewer_window_id: Option<u64>,
@@ -1888,6 +1906,10 @@ impl ViewerContextBundle {
             viewer_presentation: ViewerPresentation::Fullscreen,
             last_viewer_sync_stamp: None,
             native_video_in_window_active: false,
+            video_audio_mode: None,
+            video_audio_vst: None,
+            video_audio_mode_entry_target: None,
+            video_audio_exit_pending: None,
             detached_viewer_independent_active: false,
             detached_viewer_open_next_still_detached_once: false,
             detached_viewer_window_id: None,
@@ -10110,6 +10132,10 @@ impl App {
             viewer_presentation,
             last_viewer_sync_stamp,
             native_video_in_window_active,
+            video_audio_mode,
+            video_audio_vst,
+            video_audio_mode_entry_target,
+            video_audio_exit_pending,
             detached_viewer_independent_active,
             detached_viewer_open_next_still_detached_once,
             detached_viewer_window_id,
@@ -10256,6 +10282,10 @@ impl App {
         swap_field!(viewer_presentation);
         swap_field!(last_viewer_sync_stamp);
         swap_field!(native_video_in_window_active);
+        swap_field!(video_audio_mode);
+        swap_field!(video_audio_vst);
+        swap_field!(video_audio_mode_entry_target);
+        swap_field!(video_audio_exit_pending);
         swap_field!(detached_viewer_independent_active);
         swap_field!(detached_viewer_open_next_still_detached_once);
         swap_field!(detached_viewer_window_id);
@@ -25791,17 +25821,35 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn viewer_context_bundle_audio_title(bundle: &ViewerContextBundle) -> Option<String> {
+    fn viewer_context_bundle_music_window_info(
+        bundle: &ViewerContextBundle,
+    ) -> Option<ParkedLiveMusicWindowInfo> {
         let idx = bundle.fullscreen_idx?;
-        match bundle.items.get(idx)? {
-            GridItem::Audio(path) => Some(
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| path.display().to_string()),
-            ),
-            _ => None,
+        let item = bundle.items.get(idx)?;
+        let video_audio_mode = bundle.video_audio_mode == Some(idx)
+            && !bundle
+                .video_audio_vst
+                .as_ref()
+                .is_some_and(|s| s.fs_idx == idx);
+        if !matches!(item, GridItem::Audio(_)) && !video_audio_mode {
+            return None;
         }
+        let title = item.name().to_string();
+        let (position_secs, duration_secs, playing) = match bundle.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.position().max(0.0),
+                player.duration().max(0.0),
+                player.is_playing(),
+            ),
+            _ => (0.0, 0.0, false),
+        };
+        Some(ParkedLiveMusicWindowInfo {
+            title,
+            position_secs,
+            duration_secs,
+            playing,
+            video_audio_mode,
+        })
     }
 
     #[cfg(windows)]
@@ -25825,26 +25873,30 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn current_audio_fullscreen_idx(&self) -> Option<usize> {
+    fn current_music_fullscreen_idx(&self) -> Option<usize> {
         let idx = self.fullscreen_idx?;
-        self.items
+        let is_audio_file = self
+            .items
             .get(idx)
-            .is_some_and(|item| matches!(item, GridItem::Audio(_)))
-            .then_some(idx)
+            .is_some_and(|item| matches!(item, GridItem::Audio(_)));
+        (is_audio_file || self.video_audio_mode_hides_native_presenter_for(idx)).then_some(idx)
     }
 
     #[cfg(windows)]
-    pub(crate) fn parked_live_audio_title_for_window_id(&self, window_id: u64) -> Option<String> {
+    pub(crate) fn parked_live_music_window_info_for_window_id(
+        &self,
+        window_id: u64,
+    ) -> Option<ParkedLiveMusicWindowInfo> {
         self.detached_image_windows
             .iter()
             .find(|window| window.id == window_id)
             .and_then(|window| window.paused_bundle.as_deref())
-            .and_then(Self::viewer_context_bundle_audio_title)
+            .and_then(Self::viewer_context_bundle_music_window_info)
     }
 
     #[cfg(windows)]
     fn update_parked_live_audio_music_view_state(&mut self, ctx: &egui::Context) {
-        let Some(fs_idx) = self.current_audio_fullscreen_idx() else {
+        let Some(fs_idx) = self.current_music_fullscreen_idx() else {
             return;
         };
         if let Some(path) = self.fs_music_source_for_idx(fs_idx) {

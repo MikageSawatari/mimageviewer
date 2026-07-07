@@ -63,7 +63,7 @@ pub const MUSIC_ROW_SECS_CHOICES: [f64; 5] = [10.0, 15.0, 30.0, 60.0, 120.0];
 /// 既定の Row 秒数。
 pub const MUSIC_ROW_SECS_DEFAULT: f64 = 30.0;
 
-fn timeline_bg() -> egui::Color32 {
+pub(crate) fn timeline_bg() -> egui::Color32 {
     egui::Color32::BLACK
 }
 

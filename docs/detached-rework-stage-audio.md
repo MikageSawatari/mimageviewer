@@ -244,6 +244,85 @@ fix2 (27704d25) の実機確認: **症状 A は解消**。症状 B は残存 —
   `sync_detached_video_child_presenter_rect()` no-op、detached F11 の borderless settle 後も
   `video_audio_mode` と `native_video_mode_switch=None` が維持されることを固定。
 
+## 3.9 検収指摘 fix3 (実機 2026-07-07): 動画の音声モード中に park すると窓が真っ黒
+
+### 症状
+
+動画を再生 → ♪ (音声モード) → **PDF ファイルを開く** (ON モードの book open =
+メディア窓が live-park される) → **音声モードのメディア窓が真っ黒**になる (音は継続)。
+
+### Fable の分析 (fix1 と同クラスの取り漏らし)
+
+- fix1 の ParkedLive 最小ライブ描画は `viewer_context_bundle_audio_title`
+  ([app.rs:25794](../src/app.rs)) が **`GridItem::Audio` のみ**を音声と判定する。
+- 「動画を音声モードにした状態」は item が **`GridItem::Video` のまま**なので動画経路
+  (黒 backdrop 1×1 + native presenter が覆う前提) に落ちる。しかし音声モード中は
+  fix2b の所有境界どおり **presenter が hidden** → 覆うものがない → 真っ黒。
+
+### fix3 要件
+
+1. ParkedLive 判定を「presenter が窓を覆うか」で行う: parked bundle の内容が
+   **音声モード中の動画 (= hidden presenter)** の場合も、fix1 の最小ライブ描画
+   (タイトル + spectrum) を使う。タイトルは動画ファイル名でよい。
+   判定は fix2b の `video_audio_mode_hides_native_presenter_for` と同じ意味論を
+   parked bundle 側に適用する (新規 bool を足さない)。
+2. park をまたいで `video_audio_mode` が維持されること (park で勝手に exit しない /
+   presenter を un-hide しない)。クリック復帰で音楽ビューに戻り、♪/Z の正規 exit が
+   引き続き機能する。
+3. 通常の動画 ParkedLive (音声モードでない) は従来どおり presenter 表示 = 変更しない。
+4. 回帰テスト: 音声モード中の park → 最小ライブ描画に分類される (黒 backdrop 経路に
+   落ちない) / 復帰後 video_audio_mode 維持、のシーケンステスト。
+5. コミット `(detached-rework stage-audio fix3)`。
+
+### fix3 実装メモ (Codex 2026-07-07)
+
+- `video_audio_mode` / `video_audio_vst` / audio-mode exit pending を
+  `ViewerContextBundle` の swap 対象に追加した。`music_*` 解析状態は §3.5 どおり bundle 化せず
+  global のまま、動画→音声モードという **メディア窓の文脈 state** だけを parked bundle が所有する。
+- `ParkedLiveMusicWindowInfo` DTO を追加し、`GridItem::Audio` だけでなく
+  `video_audio_mode == Some(fullscreen_idx)` かつ VST ホスト表示中でない `GridItem::Video` も
+  ParkedLive 音楽表示対象として扱う。通常動画 ParkedLive は従来どおり presenter 表示を前提にする。
+- 回帰テストで、動画→音声モードを park すると main 側の `video_audio_mode` は None に戻り、
+  parked bundle 側に Some(fs_idx) が保持され、再アクティブ化後の active context でも維持される
+  ことを固定。
+
+## 3.10 UX 改善 fix4 (ユーザー FB 2026-07-07): park 中の音声表示を通常音楽ビューのレイアウトに近づける
+
+### 背景
+
+fix1 の最小ライブ描画 (アイコン + タイトル + 簡易スペクトラム) は仕様どおりだが、
+実機でユーザーから「park のたびに見た目・サイズ感が大きく変わって違和感がある」と
+FB。音楽機能は次リリースの目玉なので、park 中の表示を通常の音楽ビューに近づける。
+
+### fix4 要件
+
+1. ParkedLive 音声窓 (fix3 の音声モード動画を含む) の表示を、**通常の音楽ビューと
+   同じレイアウトの主要ビジュアル**に拡張する。描画ソースは引き続き global 状態のみ:
+   - タイムライン/DJ 波形 (global TimelineTextureCache)
+   - 鍵盤スペクトラム (global MusicSpectrumState)
+   - 下部 PCM グラフ (global music_pcm 系)
+   - トラックタイトル (fix1 と同じ取得方法)
+   - 再生位置 (playhead): parked bundle 内の player から **read-only** で取得できるなら
+     使う (mount を毎フレーム化しない)。取得できない場合は playhead なしで波形のみ。
+2. **操作系は描かない or 不活性**: シークバー・右パネル・ボタン類は非表示とし、
+   クリック復帰ヒントは維持 (park の「クリック復帰のみ」規則と一貫)。
+3. 実装は「draw_fs_music_view の bundle 依存部分を引き剥がす大規模リファクタ」を
+   **しない**こと。global 状態から描けるコンポーネント描画の再利用・切り出しに留め、
+   引き剥がしが必要になったコンポーネントは省略して報告する (park 中は多少簡略でも
+   よい。目的はレイアウト・サイズ感の一貫性)。
+4. 回帰: fix1 のテスト (音声識別・クリックのみ復帰) を維持。
+5. コミット `(detached-rework stage-audio fix4)`。fix3 と同時実装でよい。
+
+### fix4 実装メモ (Codex 2026-07-07)
+
+- ParkedLive 音楽表示を、黒背景 + アイコン中心の最小ビューから、通常音楽ビューと同じ
+  `MUSIC_VIEW_BG` / 上情報バー / 中央波形 / 下段鍵盤スペクトラム構成へ変更した。
+- 操作系は置かない。中央波形は `music_analysis` から L/R peak を静的描画し、
+  `draw_music_timeline()` は seek/drag を持つため呼ばない。下段スペクトラムは global
+  `music_spectrum` を描くだけで、クリック復帰規則を壊さない。
+- 再生位置は parked bundle 内の player から read-only で取得できる場合に playhead と
+  spectrum marker へ反映する。取得できない場合は解析中表示へフォールバックする。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
