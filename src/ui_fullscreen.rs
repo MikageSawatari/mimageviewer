@@ -1460,6 +1460,28 @@ struct ParkedLiveMusicWindowLayout {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+struct MusicChromeViewState {
+    title: String,
+    position_secs: f64,
+    duration_secs: f64,
+    playing: bool,
+    video_audio_mode: bool,
+    playback_speed: f64,
+    volume: f64,
+    muted: bool,
+    loop_mode: crate::settings::VideoLoopMode,
+    continuous_mode: crate::video::VideoContinuousMode,
+    row_secs: f64,
+    normalize_enabled: bool,
+    show_row_stepper: bool,
+    show_back_to_video: bool,
+    show_vst: bool,
+    show_window_toggle: bool,
+    show_close: bool,
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetachedImageWindowBarMode {
     Full,
@@ -3741,6 +3763,77 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn active_music_chrome_view_state(
+        &self,
+        fs_idx: usize,
+        title: String,
+        position_secs: f64,
+        duration_secs: f64,
+        playing: bool,
+        show_row_stepper: bool,
+    ) -> MusicChromeViewState {
+        let (volume, muted) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (player.volume(), player.is_muted()),
+            _ => (1.0, false),
+        };
+        let video_audio_mode = self.video_audio_mode == Some(fs_idx);
+        let show_vst = self.settings.vst3_enabled
+            && (self.video_audio_mode.is_none() || video_audio_mode)
+            && matches!(
+                self.viewer_presentation,
+                ViewerPresentation::Fullscreen | ViewerPresentation::DetachedWindow
+            );
+        MusicChromeViewState {
+            title,
+            position_secs,
+            duration_secs,
+            playing,
+            video_audio_mode,
+            playback_speed: self.video_playback_speed,
+            volume,
+            muted,
+            loop_mode: self.settings.video_loop_mode,
+            continuous_mode: self.video_continuous_mode,
+            row_secs: self.music_timeline_row_secs,
+            normalize_enabled: self.settings.audio_normalize_enabled,
+            show_row_stepper,
+            show_back_to_video: video_audio_mode,
+            show_vst,
+            show_window_toggle: true,
+            show_close: true,
+        }
+    }
+
+    #[cfg(windows)]
+    fn parked_live_music_chrome_view_state(
+        info: &crate::app::ParkedLiveMusicWindowInfo,
+    ) -> MusicChromeViewState {
+        MusicChromeViewState {
+            title: info.title.clone(),
+            position_secs: info.position_secs,
+            duration_secs: info.duration_secs,
+            playing: info.playing,
+            video_audio_mode: info.video_audio_mode,
+            playback_speed: info.playback_speed,
+            volume: info.volume,
+            muted: info.muted,
+            loop_mode: info.loop_mode,
+            continuous_mode: info.continuous_mode,
+            row_secs: info.row_secs,
+            normalize_enabled: info.normalize_enabled,
+            // ParkedLive does not expose timeline input, but the chrome keeps the same visible
+            // row control slot as active music. It is dimmed and inert.
+            show_row_stepper: true,
+            show_back_to_video: info.video_audio_mode,
+            show_vst: true,
+            show_window_toggle: true,
+            // The parked window keeps the watcher-compatible close-only button outside this
+            // chrome, so the parity top chrome suppresses its own close button.
+            show_close: false,
+        }
+    }
+
+    #[cfg(windows)]
     fn draw_parked_live_music_window(
         &mut self,
         ui: &mut egui::Ui,
@@ -3756,31 +3849,8 @@ impl App {
         let Some(layout) = Self::parked_live_music_window_layout(full_rect, edge_trigger) else {
             return;
         };
-        let top_rect = layout.top_rect;
-        painter.rect_filled(
-            top_rect,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 132),
-        );
-        painter.text(
-            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
-            egui::Align2::LEFT_CENTER,
-            &info.title,
-            egui::FontId::proportional(15.0),
-            egui::Color32::from_gray(160),
-        );
-        let mode_label = if info.playing {
-            "再生中"
-        } else {
-            "一時停止"
-        };
-        painter.text(
-            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 39.0),
-            egui::Align2::LEFT_CENTER,
-            mode_label,
-            egui::FontId::proportional(12.0),
-            egui::Color32::from_rgba_unmultiplied(145, 156, 170, 165),
-        );
+        let chrome = Self::parked_live_music_chrome_view_state(info);
+        Self::draw_parked_live_music_top_chrome(ui, layout.top_rect, &chrome);
 
         let central_rect = layout.central_rect;
         debug_assert!(!layout.draw_timeline);
@@ -3832,17 +3902,168 @@ impl App {
                 .draw(ui, spectrum_rect, 0.0, bass_marker);
         }
 
-        Self::draw_parked_live_music_bottom_hud(ui, full_rect, info);
+        Self::draw_parked_live_music_bottom_hud(ui, full_rect, &chrome);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    #[cfg(windows)]
+    fn draw_parked_live_music_top_chrome(
+        ui: &mut egui::Ui,
+        top_rect: egui::Rect,
+        chrome: &MusicChromeViewState,
+    ) {
+        use crate::video::native_presenter::overlay_draw::{
+            draw_overlay_close_icon, draw_overlay_video_icon, draw_overlay_vst3_top_icon,
+            draw_overlay_window_toggle_icon,
+        };
+
+        let painter = ui.painter_at(top_rect);
+        painter.rect_filled(
+            top_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 132),
+        );
+        painter.text(
+            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
+            egui::Align2::LEFT_CENTER,
+            &chrome.title,
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_gray(160),
+        );
+        painter.text(
+            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 39.0),
+            egui::Align2::LEFT_CENTER,
+            if chrome.playing {
+                "再生中"
+            } else {
+                "一時停止"
+            },
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgba_unmultiplied(145, 156, 170, 165),
+        );
+
+        const TOP_BTN: f32 = 28.0;
+        const TOP_BTN_GAP: f32 = 8.0;
+        let cy = top_rect.center().y;
+        let mut rx = top_rect.right() - 12.0;
+        let draw_dim_button = |painter: &egui::Painter, rect: egui::Rect| {
+            painter.rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+            );
+        };
+
+        if chrome.show_close {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(rx - TOP_BTN * 0.5, cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            rx -= TOP_BTN + TOP_BTN_GAP;
+            draw_dim_button(&painter, rect);
+            draw_overlay_close_icon(&painter, rect);
+        }
+        if chrome.show_window_toggle {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(rx - TOP_BTN * 0.5, cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            rx -= TOP_BTN + TOP_BTN_GAP;
+            draw_dim_button(&painter, rect);
+            draw_overlay_window_toggle_icon(&painter, rect);
+        }
+        if chrome.show_back_to_video {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(rx - TOP_BTN * 0.5, cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            rx -= TOP_BTN + TOP_BTN_GAP;
+            draw_dim_button(&painter, rect);
+            draw_overlay_video_icon(&painter, rect);
+        }
+        let vst_left = if chrome.show_vst {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(rx - TOP_BTN * 0.5, cy),
+                egui::vec2(TOP_BTN, TOP_BTN),
+            );
+            rx -= TOP_BTN + TOP_BTN_GAP;
+            draw_dim_button(&painter, rect);
+            draw_overlay_vst3_top_icon(&painter, rect);
+            rx
+        } else {
+            rx
+        };
+
+        if chrome.show_row_stepper {
+            let btn = 22.0;
+            let label_w = 72.0;
+            let group_w = btn * 2.0 + label_w;
+            let cx = vst_left - 20.0 - group_w * 0.5;
+            let minus_rect = egui::Rect::from_center_size(
+                egui::pos2(cx - group_w * 0.5 + btn * 0.5, cy),
+                egui::vec2(btn, btn),
+            );
+            let plus_rect = egui::Rect::from_center_size(
+                egui::pos2(cx + group_w * 0.5 - btn * 0.5, cy),
+                egui::vec2(btn, btn),
+            );
+            for rect in [minus_rect, plus_rect] {
+                painter.rect_filled(
+                    rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+                );
+            }
+            let stroke = egui::Stroke::new(2.0, egui::Color32::from_gray(150));
+            let m = minus_rect.center();
+            painter.line_segment(
+                [
+                    egui::pos2(m.x - btn * 0.22, m.y),
+                    egui::pos2(m.x + btn * 0.22, m.y),
+                ],
+                stroke,
+            );
+            let p = plus_rect.center();
+            painter.line_segment(
+                [
+                    egui::pos2(p.x - btn * 0.22, p.y),
+                    egui::pos2(p.x + btn * 0.22, p.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(p.x, p.y - btn * 0.22),
+                    egui::pos2(p.x, p.y + btn * 0.22),
+                ],
+                stroke,
+            );
+            painter.text(
+                egui::pos2(cx, cy),
+                egui::Align2::CENTER_CENTER,
+                format!(
+                    "Row {}",
+                    crate::ui_music_timeline::format_row_secs(chrome.row_secs)
+                ),
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(150),
+            );
+        }
     }
 
     #[cfg(windows)]
     fn draw_parked_live_music_bottom_hud(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
-        info: &crate::app::ParkedLiveMusicWindowInfo,
+        chrome: &MusicChromeViewState,
     ) {
+        use crate::video::native_presenter::overlay_draw::{
+            draw_overlay_arrow_icon, draw_overlay_button_bg, draw_overlay_continuous_icon,
+            draw_overlay_loop_icon, draw_overlay_pause_icon, draw_overlay_play_icon,
+            draw_overlay_replay_icon, draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon,
+        };
+
         let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
         let hud_rect = egui::Rect::from_min_max(
             egui::pos2(full_rect.left(), full_rect.bottom() - hud_h),
@@ -3864,8 +4085,8 @@ impl App {
             egui::pos2(hud_rect.right() - side_pad, bar_cy + bar_h * 0.5),
         );
         painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(54));
-        let frac = if info.duration_secs > 0.0 {
-            (info.position_secs / info.duration_secs).clamp(0.0, 1.0) as f32
+        let frac = if chrome.duration_secs > 0.0 {
+            (chrome.position_secs / chrome.duration_secs).clamp(0.0, 1.0) as f32
         } else {
             0.0
         };
@@ -3877,34 +4098,135 @@ impl App {
             painter.rect_filled(filled, 2.0, egui::Color32::from_gray(132));
         }
 
-        let center_y = (hud_rect.top() + seek_row_h + hud_rect.bottom()) * 0.5;
-        let text_center_y = center_y + 4.0;
-        let btn_size = 28.0;
+        let controls_cy = (hud_rect.top() + seek_row_h + hud_rect.bottom()) * 0.5;
+        let text_center_y = controls_cy + 4.0;
+        let gap = 8.0;
+        let group_gap_extra = 8.0;
+        let bsz = 28.0;
         let mut x = hud_rect.left() + side_pad;
-        let button_color = egui::Color32::from_rgba_unmultiplied(170, 176, 188, 125);
-        let bg_color = egui::Color32::from_rgba_unmultiplied(42, 46, 54, 118);
-        for label in ["R", if info.playing { "||" } else { ">" }, "L", "C"] {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(x, center_y - btn_size * 0.5),
-                egui::vec2(btn_size, btn_size),
+        let alloc = |x: &mut f32, w: f32| {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(*x, controls_cy - bsz * 0.5),
+                egui::vec2(w, bsz),
             );
-            painter.rect_filled(rect, 4.0, bg_color);
-            painter.text(
-                rect.center() + egui::vec2(0.0, 1.0),
-                egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::proportional(14.0),
-                button_color,
-            );
-            x = rect.right() + 8.0;
+            *x = r.right() + gap;
+            r
+        };
+        let inactive = false;
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, inactive);
+        draw_overlay_replay_icon(&painter, r.center(), bsz * 0.36);
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, chrome.playing);
+        if chrome.playing {
+            draw_overlay_pause_icon(&painter, r.center(), bsz * 0.38);
+        } else {
+            draw_overlay_play_icon(&painter, r.center(), bsz * 0.42);
         }
+        x += group_gap_extra;
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(
+            &painter,
+            r,
+            false,
+            !matches!(chrome.loop_mode, crate::settings::VideoLoopMode::Off),
+        );
+        draw_overlay_loop_icon(
+            &painter,
+            r.center(),
+            bsz * 0.38,
+            egui::Color32::from_rgb(238, 238, 238),
+        );
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, chrome.continuous_mode.is_enabled());
+        draw_overlay_continuous_icon(&painter, r, chrome.continuous_mode);
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, inactive);
+        draw_overlay_arrow_icon(&painter, r, -1);
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, inactive);
+        draw_overlay_arrow_icon(&painter, r, 1);
+        x += group_gap_extra;
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, inactive);
+        draw_overlay_skip_to_marker_icon(&painter, r, -1, false);
+        let r = alloc(&mut x, bsz);
+        draw_overlay_button_bg(&painter, r, false, inactive);
+        draw_overlay_skip_to_marker_icon(&painter, r, 1, false);
 
-        let position = format_duration_mm_ss(info.position_secs);
-        let duration = format_duration_mm_ss(info.duration_secs);
+        let position = format_duration_mm_ss(chrome.position_secs);
+        let duration = format_duration_mm_ss(chrome.duration_secs);
         painter.text(
-            egui::pos2(hud_rect.right() - side_pad, text_center_y),
-            egui::Align2::RIGHT_CENTER,
+            egui::pos2(x + 2.0, text_center_y),
+            egui::Align2::LEFT_CENTER,
             format!("{position} / {duration}"),
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgba_unmultiplied(170, 176, 188, 145),
+        );
+
+        let mut rx = hud_rect.right() - side_pad;
+        let vol_db_label =
+            crate::video::native_presenter::format_video_volume_db_compact(chrome.volume);
+        painter.text(
+            egui::pos2(rx, text_center_y),
+            egui::Align2::RIGHT_CENTER,
+            vol_db_label,
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgba_unmultiplied(170, 176, 188, 145),
+        );
+        rx -= 68.0;
+        let vol_bar_w = 72.0;
+        let vol_rect = egui::Rect::from_min_max(
+            egui::pos2(rx - vol_bar_w, controls_cy - 3.0),
+            egui::pos2(rx, controls_cy + 3.0),
+        );
+        painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(54));
+        let vol_frac = chrome.volume.clamp(0.0, 2.0) as f32 / 2.0;
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                vol_rect.min,
+                egui::pos2(
+                    vol_rect.left() + vol_rect.width() * vol_frac,
+                    vol_rect.bottom(),
+                ),
+            ),
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(170, 176, 188, 130),
+        );
+        rx = vol_rect.left() - gap;
+        let r = egui::Rect::from_center_size(
+            egui::pos2(rx - bsz * 0.5, controls_cy),
+            egui::vec2(bsz, bsz),
+        );
+        rx -= bsz + gap;
+        draw_overlay_button_bg(&painter, r, false, chrome.muted);
+        draw_overlay_speaker_icon(&painter, r.center(), bsz * 0.46, chrome.muted);
+        let norm_w = 46.0;
+        let norm_rect = egui::Rect::from_center_size(
+            egui::pos2(rx - norm_w * 0.5, controls_cy),
+            egui::vec2(norm_w, bsz),
+        );
+        rx -= norm_w + gap;
+        painter.rect_filled(
+            norm_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(42, 46, 54, 118),
+        );
+        painter.text(
+            norm_rect.center() + egui::vec2(0.0, 1.0),
+            egui::Align2::CENTER_CENTER,
+            if chrome.normalize_enabled {
+                "Norm"
+            } else {
+                "Norm-"
+            },
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgba_unmultiplied(170, 176, 188, 125),
+        );
+        painter.text(
+            egui::pos2(rx, text_center_y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{:.2}x", chrome.playback_speed),
             egui::FontId::proportional(13.0),
             egui::Color32::from_rgba_unmultiplied(170, 176, 188, 145),
         );
@@ -20807,6 +21129,14 @@ impl App {
                 .music_analysis
                 .as_ref()
                 .is_some_and(|a| !a.bins.is_empty());
+        let active_chrome = self.active_music_chrome_view_state(
+            fs_idx,
+            name.clone(),
+            pos,
+            dur,
+            playing,
+            show_timeline,
+        );
         if show_timeline {
             // タイムラインは複数行 (row) になり中央領域より高くなるので ScrollArea で縦スクロール。
             // 子 UI は常に DARK visuals (フルスクリーン内は黒背景ベース統一)。
@@ -21020,7 +21350,7 @@ impl App {
         painter.text(
             egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
             egui::Align2::LEFT_CENTER,
-            &name,
+            &active_chrome.title,
             egui::FontId::proportional(15.0),
             fg,
         );
@@ -21081,7 +21411,7 @@ impl App {
         // 「動画に戻る」ボタン (Inc 7): 音声モードにトグルした動画のときだけ出す。映像を再開して
         // native presenter を re-attach する。音声ファイルでは出さない (戻る先の動画が無い)。
         #[cfg(windows)]
-        let back_to_video_clicked = if self.video_audio_mode == Some(fs_idx) {
+        let back_to_video_clicked = if active_chrome.show_back_to_video {
             let v_rect = egui::Rect::from_center_size(
                 egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
                 egui::vec2(TOP_BTN, TOP_BTN),
@@ -21115,12 +21445,7 @@ impl App {
         // `enter_video_audio_vst` (presenter を un-hide して VST ホスト化) へ振る。プレーン音声は
         // 従来どおり `enter_music_vst_shell` (新規 presenter)。
         #[cfg(windows)]
-        let (vst_left, vst_clicked) = if self.settings.vst3_enabled
-            && (self.video_audio_mode.is_none() || self.video_audio_mode == Some(fs_idx))
-            && matches!(
-                self.viewer_presentation,
-                ViewerPresentation::Fullscreen | ViewerPresentation::DetachedWindow
-            ) {
+        let (vst_left, vst_clicked) = if active_chrome.show_vst {
             let vst_rect = egui::Rect::from_center_size(
                 egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
                 egui::vec2(TOP_BTN, TOP_BTN),
@@ -21171,8 +21496,8 @@ impl App {
         // − で 1 行あたりの秒数を短く (横に詳細)、+ で長くする。row_secs が変わると
         // texture_key が変わり raster cache が自動で作り直される。グリフはフォント非依存に
         // painter で線を引く (絵文字 tofu 回避、CLAUDE.md グリフポリシー)。
-        if show_timeline {
-            let row_secs = self.music_timeline_row_secs;
+        if active_chrome.show_row_stepper {
+            let row_secs = active_chrome.row_secs;
             let btn = 26.0;
             let gap = 6.0;
             let label_w = 84.0;
@@ -21413,6 +21738,45 @@ mod tests {
         let close_rect = detached_image_window_bar_close_button_rect(full);
         assert_eq!(close_rect.width(), BAR_BUTTON_SIZE);
         assert_eq!(close_rect.height(), BAR_BUTTON_SIZE);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_music_chrome_state_keeps_active_controls_visible_but_inert() {
+        let info = crate::app::ParkedLiveMusicWindowInfo {
+            title: "Song Title".to_owned(),
+            position_secs: 12.0,
+            duration_secs: 60.0,
+            playing: true,
+            video_audio_mode: true,
+            playback_speed: 1.25,
+            volume: 0.75,
+            muted: false,
+            loop_mode: crate::settings::VideoLoopMode::Bookmark,
+            continuous_mode: crate::video::VideoContinuousMode::Continuous,
+            row_secs: 30.0,
+            normalize_enabled: true,
+        };
+
+        let chrome = App::parked_live_music_chrome_view_state(&info);
+
+        assert_eq!(chrome.title, "Song Title");
+        assert!(chrome.show_row_stepper);
+        assert!(chrome.show_back_to_video);
+        assert!(chrome.show_vst);
+        assert!(chrome.show_window_toggle);
+        assert!(
+            !chrome.show_close,
+            "ParkedLive keeps its watcher-compatible close-only button outside the music chrome"
+        );
+        assert_eq!(chrome.playback_speed, 1.25);
+        assert_eq!(chrome.volume, 0.75);
+        assert_eq!(chrome.loop_mode, crate::settings::VideoLoopMode::Bookmark);
+        assert_eq!(
+            chrome.continuous_mode,
+            crate::video::VideoContinuousMode::Continuous
+        );
+        assert!(chrome.normalize_enabled);
     }
 
     #[test]

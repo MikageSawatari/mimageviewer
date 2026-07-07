@@ -1943,6 +1943,13 @@ pub(crate) struct ParkedLiveMusicWindowInfo {
     pub(crate) duration_secs: f64,
     pub(crate) playing: bool,
     pub(crate) video_audio_mode: bool,
+    pub(crate) playback_speed: f64,
+    pub(crate) volume: f64,
+    pub(crate) muted: bool,
+    pub(crate) loop_mode: crate::settings::VideoLoopMode,
+    pub(crate) continuous_mode: crate::video::VideoContinuousMode,
+    pub(crate) row_secs: f64,
+    pub(crate) normalize_enabled: bool,
 }
 
 #[cfg(windows)]
@@ -26079,6 +26086,7 @@ impl App {
 
     #[cfg(windows)]
     fn viewer_context_bundle_music_window_info(
+        &self,
         bundle: &ViewerContextBundle,
     ) -> Option<ParkedLiveMusicWindowInfo> {
         let idx = bundle.fullscreen_idx?;
@@ -26091,21 +26099,35 @@ impl App {
         if !matches!(item, GridItem::Audio(_)) && !video_audio_mode {
             return None;
         }
-        let title = item.name().to_string();
-        let (position_secs, duration_secs, playing) = match bundle.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Video { player, .. }) => (
-                player.position().max(0.0),
-                player.duration().max(0.0),
-                player.is_playing(),
-            ),
-            _ => (0.0, 0.0, false),
-        };
+        let (position_secs, duration_secs, playing, title, volume, muted) =
+            match bundle.fs_cache.get(&idx) {
+                Some(FsCacheEntry::Video { player, .. }) => (
+                    player.position().max(0.0),
+                    player.duration().max(0.0),
+                    player.is_playing(),
+                    player
+                        .info()
+                        .and_then(|i| i.title.clone())
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| item.name().to_string()),
+                    player.volume(),
+                    player.is_muted(),
+                ),
+                _ => (0.0, 0.0, false, item.name().to_string(), 1.0, false),
+            };
         Some(ParkedLiveMusicWindowInfo {
             title,
             position_secs,
             duration_secs,
             playing,
             video_audio_mode,
+            playback_speed: self.video_playback_speed,
+            volume,
+            muted,
+            loop_mode: self.settings.video_loop_mode,
+            continuous_mode: self.video_continuous_mode,
+            row_secs: self.music_timeline_row_secs,
+            normalize_enabled: self.settings.audio_normalize_enabled,
         })
     }
 
@@ -26148,7 +26170,7 @@ impl App {
             .iter()
             .find(|window| window.id == window_id)
             .and_then(|window| window.paused_bundle.as_deref())
-            .and_then(Self::viewer_context_bundle_music_window_info)
+            .and_then(|bundle| self.viewer_context_bundle_music_window_info(bundle))
     }
 
     #[cfg(windows)]

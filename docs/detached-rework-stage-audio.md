@@ -784,6 +784,21 @@ fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーン�
 - fix6c-2 (NavigateItem origin) が未完なら**先に fix6c-2 を完了**してから着手する
   (native_video.rs / mod.rs の同時編集を避ける)。
 
+### fix6d 実装メモ (Codex 2026-07-08)
+
+- `MusicChromeViewState` を追加し、active/parked の音楽 chrome が同じ表示値
+  (タイトル、再生位置、速度、音量、loop/continuous、Row 秒、Norm 状態など) から
+  描けるようにした。parked の値は `ParkedLiveMusicWindowInfo` へ read-only で拡張。
+- ParkedLive 音楽窓の上部 chrome は active と同じボタン構成
+  (Row、VST、動画へ戻る、window toggle) を dim/inert で描く。× は既存の CloseOnly
+  ボタンを watcher と共有するため chrome 側では描かない。
+- ParkedLive 音楽窓の下 HUD は簡易プレースホルダをやめ、active と同じ項目構成
+  (seek、頭出し、再生、loop/continuous、前後項目、前後マーカー、時間、速度、
+  音量、Norm、dB) を dim/inert で描く。入力は従来どおり復帰経路に任せ、HUD 機能は
+  実行しない。
+- 回帰テストでは parked layout と close-only に加え、`MusicChromeViewState` が active
+  chrome 相当の項目を保持しつつ close だけ外部ボタンへ委譲することを固定した。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
