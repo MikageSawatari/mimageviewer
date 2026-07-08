@@ -649,3 +649,76 @@ detached image window の表示 (自動トリムレイアウト) が、**メイ�
   一度 bbox を焼き込んだ後に該当 idx の fs_cache と `fs_margin_bbox_cache` を消しても、
   thumbnail fallback で作る detached spread snapshot の `paint_rect_norm` / `clip_rect_norm`
   が変わらないことを固定した。
+
+### fix14 検収 + 実機 NG (Fable 2026-07-09)
+
+d4b1a236 を diff 検収: 指示どおり runtime 焼き込み + item_key 検証 + fallback 計装 + テスト。
+実装自体は指示 (bbox 供給の焼き込み) を満たすが、**実機で症状再発**。新再現 = ツールバーの
+お気に入りクリックでフォルダ移動した瞬間、live 表示中の detached PDF 窓がトリムなしへ退化。
+fix14 は「Auto 分岐内の bbox 供給」だけを守ったが、**分岐の入口 (apply mode) が App
+グローバルのまま**であり、そこが上書きされると焼き込み値は参照すらされない。fix15 へ。
+
+---
+
+## fix15: フォルダ移動で live の independent 窓のトリムが解除される (fix14 の穴)
+
+### 症状 (ユーザー実機 2026-07-09、fix14 適用後)
+
+自動トリム有効の PDF を detached 窓 (Book) で live 表示中、**メインウィンドウの
+ツールバーに固定したお気に入りをクリックしてフォルダ移動した瞬間**、PDF 窓の表示が
+トリムなしに変わる。
+
+### ログ事実 (scratchpad/trim-bug2-cur.log、推測ではない)
+
+1. 95.042s〜: window 1 が `ActiveDetachedSession { window_id: 1, source: Book }` のまま
+   `active_detached_immediate_rendered` を毎フレーム継続 (placement_trace は
+   `fs_idx=Some(104)`)。= **live のまま**。
+2. 95.136s `=== load_folder: G:\home\imagedl ===` (お気に入りクリック)。
+3. 同時刻の preserve 判定が skip:
+   `preserve_active_detached_for_main_change skipped fs_idx=None session_detached=false
+   independent=false active_context=true window_id=Some(2) passive_windows=0`
+   — 同フレームの `main_flash_probe` は `session=Some(ActiveDetachedSession { window_id: 1,
+   source: Book })` を出しており、**preserve 判定が見ている述語 (session_detached=false /
+   window_id=Some(2)) と実セッション (window 1, Book) が食い違っている**。
+4. load_folder 後も window 1 は live render を継続 (park されない)。`start_loading_items` が
+   `apply_view_trim_for_key(新フォルダ)` ([src/app.rs:16740](../src/app.rs)) で App グローバル
+   `view_trim_apply_mode` を新フォルダの保存値 (無ければ None) に上書き → live レイアウトの
+   入口 `effective_view_trim_apply_mode()` が None 分岐 → トリムなし。
+5. fix14 の焼き込み参照は `detached_view_trim_runtime_window_id()` =
+   `viewer_session_is_detached().then_some(detached_viewer_window_id)` 経由のため、この状態
+   (session_detached=false) では**一切呼ばれない**。95s 以降 `detached_trim_bbox_*` ログが
+   皆無なのが証拠。さらに items 入れ替えで idx=104 は別 item になり、item_key 検証も無効化
+   される (焼き込みが参照されたとしても外れる)。
+
+### 壊れた前提 (BA)
+
+- live の independent still 窓 (Book/Image) の表示決定 (トリム適用モード + 対象 items) が、
+  **メインフォルダ文脈でロードされる App グローバル状態を毎フレーム再解釈**している。
+  メイン側の load_folder が窓の見た目を変えられてしまう。
+- preserve (park) 判定と fix14 の窓判定が、実際に active な independent session
+  (window 1, Book) を見ていない (`session_detached` / `detached_viewer_window_id` が
+  別の窓 = window 2 を指している)。
+
+### 修正指示
+
+1. **述語不一致の調査から始める**: ログ 3 の状況 (independent Book session が active、
+   メインは grid) で `preserve_active_detached_for_main_change` の判定値が
+   `session_detached=false / window_id=Some(2)` になる経路を特定する。プラン §2 の統一述語で
+   判定すべき箇所が別の状態変数を見ていないか。調査結果を実装メモに記載。
+2. 構造修正 (症状パッチ禁止、以下のどちらかをプラン整合で選び、選定理由を実装メモに書く):
+   - **(a) 推奨: メイン context change 時に live の independent still 窓を確実に park する**。
+     お気に入り / フォルダ移動でメインを操作した時点で窓は非アクティブであり、park (frozen
+     bake) されれば以降はグローバル状態から切り離される。判定は load_folder が fullscreen /
+     session 状態をクリアする**前**に、実 session (window 1) に対して行う (TOCTOU 排除)。
+   - (b) live 維持が仕様なら、トリム決定全体 (apply mode 解決済みの最終 bbox、None 含む) を
+     窓 runtime に焼き込み、detached live 描画から `effective_view_trim_apply_mode()` と
+     メイン items への依存を断つ。fix14 の参照を None 分岐より前に引き上げ、判定述語も
+     session グローバルではなく「現在描画中の窓 runtime」を直接使う。
+3. 計装: preserve skip ログに実 session (`actual_session_window= source=`) を追記して残置。
+4. テスト: independent Book session active 中に load_folder 相当の状態変化 (view_trim_apply_mode
+   上書き + items 入れ替え) を起こしても、窓の spread レイアウト (paint/clip) が不変で
+   あることを固定する。
+5. 実機確認: (i) お気に入りクリックでフォルダ移動 → PDF 窓のトリム維持 (live / park /
+   再アクティブ化とも) (ii) fix14 のシナリオ (動画別窓 open) の回帰確認 (iii) メイン
+   fullscreen 側の自動トリムに退行なし。
+6. コミット `(detached-rework findings-19 fix15)`。
