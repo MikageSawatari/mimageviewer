@@ -511,3 +511,36 @@ fix13-2 (06eb05d8 = paint_rect_norm + uv_rect 焼き込み、指示どおりの�
 - 次の実機ログでは同一 `window_id` + `page_ord` の `frozen_page_bake` と
   `frozen_page_restore` を突き合わせ、(i) 正規化基準差、(ii) rect/uv 組み合わせ差、
   (iii) 背景塗り範囲差のどれかを数値で確定する。
+
+## fix13-4 (計装ログで確定 2026-07-09): 焼き込み不足は「clip」— フルページ矩形は重なる設計で、live は可視スパン clip で切っている
+
+**計装結果 (scratchpad/fix133-cur.log、bake/restore 3 往復 ×2 ページ)**:
+
+- **round-trip は完全一致**: basis (1243.33 vs 1243.34) / paint / norm / uv / ppp すべて
+  0.01px 級で bake == restore。fix13-2/13-3 の焼き込み・復元機構自体は正しい。
+- **決定的証拠**: page_ord=0 paint = x 73.66〜647.79、page_ord=1 paint = x 596.76〜1171.72
+  → **2 ページの矩形が x 596.76〜647.79 (~51px) で重なっている**。フルページ矩形は
+  `layout_spread_page_rects` がコンテンツ端を突き合わせる設計のため、余白ぶん必ず重なる。
+- live はこの重なり・外側余白を**ページごとの clip (可視スパン = content bbox の x 範囲)**
+  で切って描くため見えない。passive は uv 全面 + clip なしで painter.image するため:
+  page 1 の左余白 (白) が page 0 のコンテンツへ**上書き** (中央の白被り) + 各ページの
+  外側余白も露出 (左右の白柱)。スクリーンショットの症状と完全一致。
+
+### fix13-4 要件
+
+1. **live が実際に適用している per-page clip を特定し、同じものを焼き込む**:
+   live の見開き描画でページ paint に効いている clip rect (可視スパン。おそらく
+   x = content bbox 範囲、y = 全高。media_rect/エッジの扱い含め live の実装から取る) を
+   確認し、`DetachedImageWindowFrozenPage` に **clip rect (正規化)** を追加して park 時に
+   焼き込む。passive は `painter.with_clip_rect(復元 clip)` で同じ paint rect + uv を描く。
+   - 代替実装 (等価): clip の代わりに「clip 済み sub-rect + 対応する uv crop
+     (x を bbox 範囲に、y は全域)」を焼き込む。DTO を増やさないならこちらでも可。
+     どちらを採るかは live の clip 実装 (clip が矩形 1 個で表せるか) を見て判断し、
+     採った方を実装メモに記載。
+2. 計装 (`frozen_page_bake` / `frozen_page_restore`) に **clip も追記**して残置
+   (今回の教訓: paint/uv だけでは live との等価性を証明できなかった)。
+3. テスト: 「重なるフルページ矩形 + clip」で、隣接ページのコンテンツ領域に他ページの
+   余白が描画されないこと (clip 適用の純関数 or 描画矩形の交差判定)。
+4. 実機再確認: 同再現で (i) 中央の白被りなし (ii) 左右の白柱なし (iii) live で見えていた
+   上端の白余白 (ページ自身のピクセル) は見える、の 3 点。
+5. コミット `(detached-rework findings-19 fix13-4)`。
