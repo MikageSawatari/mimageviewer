@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
+use crate::ui_fullscreen::MusicChromeViewState;
 // 音楽ビューはメイン egui ctx (アプリテーマ = Light になり得る) に描くため、egui 既定の
 // `on_hover_text` はツールチップが明色になる。動画 native HUD (専用ダーク ctx) と見た目を
 // 揃えるため、ctx テーマに依らずダーク枠で描く `hover_tip_dark` を使う。
@@ -728,28 +729,31 @@ impl App {
         ui: &mut egui::Ui,
         hud_rect: egui::Rect,
         fs_idx: usize,
-        pos: f64,
-        dur: f64,
-        playing: bool,
+        chrome: &MusicChromeViewState,
         dark: bool,
         // 改名 / 一括登録の中央モーダル表示中は false。HUD の見た目は描くが、操作 (seek /
         // play / volume / bookmark ジャンプ) は適用しない。半透明バックドロップも入力を吸収
         // するが、モーダル仕様として HUD 側でも明示的に止める (Codex 5c-A P2、多層防御)。
         interactive: bool,
     ) {
+        let pos = chrome.position_secs;
+        let dur = chrome.duration_secs;
+        let playing = chrome.playing;
         // 現在状態を先に読む (player 借用を短く保つ)。
-        let (cur_vol, muted) = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => (player.volume(), player.is_muted()),
-            _ => (1.0, false),
-        };
+        let cur_vol = chrome.volume;
+        let muted = chrome.muted;
         // リミッター作動インジケータ (動画 native HUD と同じ挙動): player の
         // limiter_ceiling_hit_seq の増加を検知したら赤ドットを一定時間点灯する。
         // normalize が有効なときだけ右クラスタにスロットを確保する (点灯有無で幅が
         // ジッタしないように、有効時は常にスロット確保・ドットは作動時のみ描画)。
         let now = std::time::Instant::now();
-        let cur_limiter_seq = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.limiter_ceiling_hit_seq(),
-            _ => self.music_limiter_last_seq,
+        let cur_limiter_seq = if interactive {
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => player.limiter_ceiling_hit_seq(),
+                _ => self.music_limiter_last_seq,
+            }
+        } else {
+            self.music_limiter_last_seq
         };
         if cur_limiter_seq > self.music_limiter_last_seq {
             self.music_limiter_visible_until =
@@ -789,15 +793,14 @@ impl App {
         let sc_next_file = self
             .keymap
             .first_chord_label(crate::keymap::KeyAction::VideoNextFile);
-        let speed = self.video_playback_speed;
+        let speed = chrome.playback_speed;
         // ループ / 連続再生モードは動画と共有 (video_loop_mode / video_continuous_mode)。
         // 音声はチャプター無しなので effective は Off/Full/Bookmark のみ。
-        let continuous_mode = self.video_continuous_mode;
+        let continuous_mode = chrome.continuous_mode;
         // マーカー / ジャンプ用に pts をスナップショット (self.music_bookmarks の借用回避)。
-        let marker_secs: Vec<f64> = self.music_bookmarks.iter().map(|b| b.pts_secs).collect();
-        let has_bm_now = self.music_bookmarks_loaded_for.is_some() && !marker_secs.is_empty();
-        let loop_eff =
-            crate::settings::effective_loop_mode(self.settings.video_loop_mode, false, has_bm_now);
+        let marker_secs = chrome.bookmark_secs.clone();
+        let has_bm_now = chrome.bookmarks_loaded && !marker_secs.is_empty();
+        let loop_eff = crate::settings::effective_loop_mode(chrome.loop_mode, false, has_bm_now);
 
         let painter = ui.painter_at(hud_rect);
         painter.rect_filled(
@@ -819,6 +822,16 @@ impl App {
         let side_pad = 10.0;
         let gap = 8.0;
         let group_gap_extra = 8.0;
+        let button_sense = if interactive {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let seek_sense = if interactive {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::hover()
+        };
 
         // 収集する操作 (描画中は self を可変借用しないため、末尾でまとめて適用)。
         let mut seek_to: Option<f64> = None;
@@ -881,7 +894,7 @@ impl App {
         let seek_resp = ui.interact(
             bar_rect.expand2(egui::vec2(0.0, 7.0)),
             ui.id().with(("music_hud_seek", fs_idx)),
-            egui::Sense::click_and_drag(),
+            seek_sense,
         );
         if (seek_resp.clicked() || seek_resp.dragged())
             && dur > 0.0
@@ -916,11 +929,7 @@ impl App {
         // 頭出し (動画 replay = 頭出し + 即再生と同義)
         let r = alloc(&mut x, bsz);
         let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_start", fs_idx)),
-                egui::Sense::click(),
-            )
+            .interact(r, ui.id().with(("music_hud_start", fs_idx)), button_sense)
             .hover_tip_dark(label_with_shortcut("頭出し", sc_seek_start.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_replay_icon(&painter, r.center(), bsz * 0.36);
@@ -931,11 +940,7 @@ impl App {
         // 再生 / 一時停止
         let r = alloc(&mut x, bsz);
         let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_play", fs_idx)),
-                egui::Sense::click(),
-            )
+            .interact(r, ui.id().with(("music_hud_play", fs_idx)), button_sense)
             .hover_tip_dark(label_with_shortcut(
                 if playing { "一時停止" } else { "再生" },
                 sc_play.as_deref(),
@@ -978,11 +983,7 @@ impl App {
         };
         let r = alloc(&mut x, bsz);
         let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_loop", fs_idx)),
-                egui::Sense::click(),
-            )
+            .interact(r, ui.id().with(("music_hud_loop", fs_idx)), button_sense)
             .hover_tip_dark(label_with_shortcut(loop_tooltip, sc_loop.as_deref()));
         draw_overlay_button_bg(
             &painter,
@@ -1027,7 +1028,7 @@ impl App {
             .interact(
                 r,
                 ui.id().with(("music_hud_continuous", fs_idx)),
-                egui::Sense::click(),
+                button_sense,
             )
             .hover_tip_dark(cont_tooltip);
         draw_overlay_button_bg(&painter, r, resp.hovered(), continuous_mode.is_enabled());
@@ -1043,7 +1044,7 @@ impl App {
             .interact(
                 r,
                 ui.id().with(("music_hud_prevfile", fs_idx)),
-                egui::Sense::click(),
+                button_sense,
             )
             .hover_tip_dark(label_with_shortcut("前の項目", sc_prev_file.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
@@ -1058,7 +1059,7 @@ impl App {
             .interact(
                 r,
                 ui.id().with(("music_hud_nextfile", fs_idx)),
-                egui::Sense::click(),
+                button_sense,
             )
             .hover_tip_dark(label_with_shortcut("次の項目", sc_next_file.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
@@ -1073,11 +1074,7 @@ impl App {
         // 前ブックマーク (|◀)
         let r = alloc(&mut x, bsz);
         let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_prevbm", fs_idx)),
-                egui::Sense::click(),
-            )
+            .interact(r, ui.id().with(("music_hud_prevbm", fs_idx)), button_sense)
             .hover_tip_dark(label_with_shortcut(
                 "前のブックマーク",
                 sc_marker_prev.as_deref(),
@@ -1095,11 +1092,7 @@ impl App {
         // 次ブックマーク (▶|)
         let r = alloc(&mut x, bsz);
         let resp = ui
-            .interact(
-                r,
-                ui.id().with(("music_hud_nextbm", fs_idx)),
-                egui::Sense::click(),
-            )
+            .interact(r, ui.id().with(("music_hud_nextbm", fs_idx)), button_sense)
             .hover_tip_dark(label_with_shortcut(
                 "次のブックマーク",
                 sc_marker_next.as_deref(),
@@ -1218,11 +1211,7 @@ impl App {
         #[cfg(windows)]
         {
             use crate::video::normalize_types::NormalizeUiState;
-            let norm_ui_state = self
-                .normalize_ui_states
-                .get(&fs_idx)
-                .copied()
-                .unwrap_or_default();
+            let norm_ui_state = chrome.normalize_ui_state;
             // Norm ボタン幅は動画 native HUD の norm_w (= btn_size) に揃える (Inc 7 ③)。
             let norm_w = bsz;
             let norm_rect = egui::Rect::from_min_size(
@@ -1253,7 +1242,7 @@ impl App {
                 .interact(
                     norm_rect,
                     ui.id().with(("music_hud_normalize", fs_idx)),
-                    egui::Sense::click(),
+                    button_sense,
                 )
                 .hover_tip_dark(norm_tooltip);
             draw_overlay_button_bg(
@@ -1299,7 +1288,7 @@ impl App {
             .interact(
                 mute_r,
                 ui.id().with(("music_hud_mute", fs_idx)),
-                egui::Sense::click(),
+                button_sense,
             )
             .hover_tip_dark(label_with_shortcut(
                 if muted {
@@ -1363,6 +1352,11 @@ impl App {
         // ── 操作を適用 (self / player の可変借用を分離) ──
         // モーダル表示中は上で描いたホバー/レスポンスを無視し、一切適用しない。
         if !interactive {
+            painter.rect_filled(
+                hud_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 84),
+            );
             return;
         }
         let ctx = ui.ctx().clone();

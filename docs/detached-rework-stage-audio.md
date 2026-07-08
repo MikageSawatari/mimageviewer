@@ -884,6 +884,21 @@ fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーン�
    同時に HUD 入力窓も不活性化 (または同じ passthrough)。結果を実装メモに記載。
 4. コミット `(detached-rework stage-audio fix6e)`。
 
+### fix6d-2 実装メモ (2026-07-08)
+
+- 上バーは `draw_music_top_chrome(MusicChromeViewState, interactive)` に移動し、active
+  は response を適用、ParkedLive は `interactive=false` で同じ関数を呼ぶ。ParkedLive の
+  閉じる × は watcher と共有する外側ボタンを維持するため `show_close=false`。
+- 下 HUD は active 既存の `draw_music_bottom_hud` を `MusicChromeViewState` 入力に変更し、
+  ParkedLive も `interactive=false` で同じ関数を呼ぶ。旧 `draw_parked_live_music_top_chrome`
+  / `draw_parked_live_music_bottom_hud` は削除。
+- シークバー marker は `MusicChromeViewState.bookmark_secs` に載せる。ParkedLive では
+  global `music_bookmarks` ではなく、parked bundle 内の `music_bookmarks` /
+  `music_bookmarks_loaded_for` から read-only 取得するため、メイン側で別ファイルを開いても
+  parked 窓の marker がズレない。
+- `interactive=false` の chrome button sense は `hover` に落とし、click sense を作らない。
+  下 HUD は描画後に dim overlay を重ね、操作 intent は App/player に適用しない。
+
 ### fix7 開始 (②の根治を含む)
 
 fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 → 実装**。追加要件:

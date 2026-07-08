@@ -1938,6 +1938,7 @@ pub(crate) struct ActiveDetachedSession {
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub(crate) struct ParkedLiveMusicWindowInfo {
+    pub(crate) fs_idx: usize,
     pub(crate) title: String,
     pub(crate) position_secs: f64,
     pub(crate) duration_secs: f64,
@@ -1949,7 +1950,9 @@ pub(crate) struct ParkedLiveMusicWindowInfo {
     pub(crate) loop_mode: crate::settings::VideoLoopMode,
     pub(crate) continuous_mode: crate::video::VideoContinuousMode,
     pub(crate) row_secs: f64,
-    pub(crate) normalize_enabled: bool,
+    pub(crate) normalize_ui_state: crate::video::normalize_types::NormalizeUiState,
+    pub(crate) bookmark_secs: Vec<f64>,
+    pub(crate) bookmarks_loaded: bool,
 }
 
 #[cfg(windows)]
@@ -2122,6 +2125,8 @@ struct ViewerContextBundle {
     normalize_ui_states:
         std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
     normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
+    music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+    music_bookmarks_loaded_for: Option<PathBuf>,
     last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
 }
 
@@ -2276,6 +2281,8 @@ impl ViewerContextBundle {
             ai_classify_cache: std::collections::HashMap::new(),
             normalize_ui_states: std::collections::HashMap::new(),
             normalize_auto_scan_suppressed: std::collections::HashSet::new(),
+            music_bookmarks: Vec::new(),
+            music_bookmarks_loaded_for: None,
             last_loop_pos: std::collections::HashMap::new(),
         }
     }
@@ -10502,6 +10509,8 @@ impl App {
             ai_classify_cache,
             normalize_ui_states,
             normalize_auto_scan_suppressed,
+            music_bookmarks,
+            music_bookmarks_loaded_for,
             last_loop_pos,
         } = bundle;
 
@@ -10652,6 +10661,8 @@ impl App {
         swap_field!(ai_classify_cache);
         swap_field!(normalize_ui_states);
         swap_field!(normalize_auto_scan_suppressed);
+        swap_field!(music_bookmarks);
+        swap_field!(music_bookmarks_loaded_for);
         swap_field!(last_loop_pos);
 
         // The worker queues are App-global, so thumbnail request bookkeeping restored from a
@@ -26115,7 +26126,9 @@ impl App {
                 ),
                 _ => (0.0, 0.0, false, item.name().to_string(), 1.0, false),
             };
+        let bookmark_secs: Vec<f64> = bundle.music_bookmarks.iter().map(|b| b.pts_secs).collect();
         Some(ParkedLiveMusicWindowInfo {
+            fs_idx: idx,
             title,
             position_secs,
             duration_secs,
@@ -26127,7 +26140,13 @@ impl App {
             loop_mode: self.settings.video_loop_mode,
             continuous_mode: self.video_continuous_mode,
             row_secs: self.music_timeline_row_secs,
-            normalize_enabled: self.settings.audio_normalize_enabled,
+            normalize_ui_state: bundle
+                .normalize_ui_states
+                .get(&idx)
+                .copied()
+                .unwrap_or_default(),
+            bookmark_secs,
+            bookmarks_loaded: bundle.music_bookmarks_loaded_for.is_some(),
         })
     }
 
