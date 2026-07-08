@@ -371,3 +371,31 @@ passive 描画が live のトリム揃えを再現していない。候補:
 3. 連続表示 (continuous) の凍結ページも同じ入力源であることを確認。
 4. テスト: トリム量が左右で異なる見開きの rect + UV 一致 (純関数)、背景 fill の分岐。
 5. コミット `(detached-rework findings-19 fix13)`。
+
+### fix13 Phase 1 結果 + 実装メモ (Codex 2026-07-08)
+
+Phase 1 の突き合わせ結果:
+
+- (a) rect_norm: **欠落なし**。`detached_spread_frozen_pages_for_snapshot` は live の
+  `draw_fs_spread` と同じ `layout_spread_page_rects` / `content_center_offset` 系で
+  トリム後の配置を焼いている。見開きの内側 trim 分は rect 側に隠れたまま残る。
+- (b) UV crop: **欠落なし**。`DetachedImageWindowFrozenPage.content_bbox` は
+  `draw_detached_image_window_snapshot` → `draw_fs_spread_page` へ渡され、
+  `normalized_sub_rect(img_rect, bbox)` と `uv=bbox` で描かれている。
+- (c) 背景 fill: **欠落あり (根因)**。live は `transparent_bg_style(self.fs_transparent_bg_mode, ...)`
+  を使うが、passive の frozen pages は常に `FsBgStyle::Default` で描いていたため、
+  白/市松モードで live では白く見えていた trim 露出領域が passive では黒地に戻っていた。
+
+実装:
+
+- `DetachedImageWindowFrozenPage` に `DetachedImageWindowFrozenBackground` を追加し、
+  park 時に現在の透過背景モード (`Default` / `Solid(WHITE)` / `Checker(texture)`) を
+  per-page DTO へ焼き込む。
+- passive 描画は snapshot の `background` を `FsBgStyle` へ戻して `draw_fs_spread_page` に渡す。
+  現在のメイン context の背景設定を再解釈しない。
+- continuous と spread は同じ `DetachedImageWindowFrozenPage` を使うため、どちらも同じ背景入力を保持する。
+
+追加テスト:
+
+- `paused_continuous_detached_window_preserves_transparent_background`
+- `detached_spread_snapshot_preserves_trim_uv_and_background`

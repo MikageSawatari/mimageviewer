@@ -219,6 +219,14 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) location_display: String,
     pub(crate) content_bbox: Option<egui::Rect>,
+    pub(crate) background: DetachedImageWindowFrozenBackground,
+}
+
+#[derive(Clone)]
+pub(crate) enum DetachedImageWindowFrozenBackground {
+    Default,
+    Solid(egui::Color32),
+    Checker(egui::TextureHandle),
 }
 
 #[cfg(windows)]

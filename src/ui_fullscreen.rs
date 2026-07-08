@@ -3628,6 +3628,7 @@ impl App {
         ) else {
             return Vec::new();
         };
+        let background = self.detached_frozen_background_for_snapshot(ctx);
 
         pages
             .into_iter()
@@ -3644,6 +3645,7 @@ impl App {
                     rotation: self.get_rotation(page.idx),
                     location_display: self.location_display_for_loading(page.idx),
                     content_bbox: page.content_bbox,
+                    background: background.clone(),
                 })
             })
             .collect()
@@ -3660,7 +3662,7 @@ impl App {
         if !continuous.is_empty() {
             return continuous;
         }
-        self.detached_spread_frozen_pages_for_snapshot(idx, placement)
+        self.detached_spread_frozen_pages_for_snapshot(ctx, idx, placement)
     }
 
     #[cfg(windows)]
@@ -3699,6 +3701,7 @@ impl App {
     #[cfg(windows)]
     fn detached_spread_frozen_pages_for_snapshot(
         &mut self,
+        ctx: &egui::Context,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
@@ -3808,6 +3811,7 @@ impl App {
             right_bbox,
             content_active,
         );
+        let background = self.detached_frozen_background_for_snapshot(ctx);
 
         vec![
             crate::app::DetachedImageWindowFrozenPage {
@@ -3816,6 +3820,7 @@ impl App {
                 rotation: left_rot,
                 location_display: self.location_display_for_loading(left),
                 content_bbox: content_left,
+                background: background.clone(),
             },
             crate::app::DetachedImageWindowFrozenPage {
                 texture: right_texture,
@@ -3823,8 +3828,42 @@ impl App {
                 rotation: right_rot,
                 location_display: self.location_display_for_loading(right),
                 content_bbox: content_right,
+                background,
             },
         ]
+    }
+
+    #[cfg(windows)]
+    fn detached_frozen_background_for_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> crate::app::DetachedImageWindowFrozenBackground {
+        match self.fs_transparent_bg_mode {
+            1 => crate::app::DetachedImageWindowFrozenBackground::Solid(egui::Color32::WHITE),
+            2 => {
+                self.ensure_checker_texture(ctx);
+                self.fs_checker_texture
+                    .clone()
+                    .map(crate::app::DetachedImageWindowFrozenBackground::Checker)
+                    .unwrap_or(crate::app::DetachedImageWindowFrozenBackground::Default)
+            }
+            _ => crate::app::DetachedImageWindowFrozenBackground::Default,
+        }
+    }
+
+    #[cfg(windows)]
+    fn detached_frozen_background_style(
+        background: &crate::app::DetachedImageWindowFrozenBackground,
+    ) -> FsBgStyle<'_> {
+        match background {
+            crate::app::DetachedImageWindowFrozenBackground::Default => FsBgStyle::Default,
+            crate::app::DetachedImageWindowFrozenBackground::Solid(color) => {
+                FsBgStyle::Solid(*color)
+            }
+            crate::app::DetachedImageWindowFrozenBackground::Checker(texture) => {
+                FsBgStyle::Checker(texture)
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -3870,9 +3909,9 @@ impl App {
     ) {
         if !window.frozen_continuous_pages.is_empty() {
             let painter = ui.painter().with_clip_rect(full_rect);
-            let bg_style = FsBgStyle::Default;
             for page in &window.frozen_continuous_pages {
                 let rect = Self::rect_from_normalized(full_rect, page.rect_norm);
+                let bg_style = Self::detached_frozen_background_style(&page.background);
                 Self::draw_fs_spread_page(
                     &painter,
                     rect,

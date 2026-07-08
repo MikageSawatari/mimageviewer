@@ -16991,6 +16991,15 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn assert_frozen_background_white(background: &DetachedImageWindowFrozenBackground) {
+        match background {
+            DetachedImageWindowFrozenBackground::Solid(color) => {
+                assert_eq!(*color, egui::Color32::WHITE)
+            }
+            _ => panic!("expected frozen page to preserve white transparent background"),
+        }
+    }
+
     fn push_zip_separator(app: &mut App, label: &str) -> usize {
         app.items.push(GridItem::ZipSeparator {
             dir_display: label.to_owned(),
@@ -19909,6 +19918,44 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn paused_continuous_detached_window_preserves_transparent_background() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(20);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.fs_transparent_bg_mode = 1;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            });
+        let first = push_image(&mut app, r"C:\pics\continuous-bg-a.png");
+        let second = push_image(&mut app, r"C:\pics\continuous-bg-b.png");
+        for (idx, label) in [(first, "continuous_bg_a"), (second, "continuous_bg_b")] {
+            insert_static_fs_entry(&mut app, &ctx, idx, label);
+        }
+        app.fullscreen_idx = Some(first);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("continuous detached viewer should build a snapshot");
+
+        assert!(
+            !snapshot.frozen_continuous_pages.is_empty(),
+            "continuous passive windows use per-page frozen DTOs"
+        );
+        for page in &snapshot.frozen_continuous_pages {
+            assert_frozen_background_white(&page.background);
+        }
+    }
+
+    #[test]
     fn paused_spread_detached_window_keeps_both_visible_pages() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -20040,6 +20087,78 @@ mod still_window_mode_key_tests {
         assert_rect_close(
             snapshot.frozen_continuous_pages[1].rect_norm,
             egui::Rect::from_min_max(egui::pos2(0.5, -1.0 / 6.0), egui::pos2(1.0, 7.0 / 6.0)),
+        );
+    }
+
+    #[test]
+    fn detached_spread_snapshot_preserves_trim_uv_and_background() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 80.0,
+            y: 80.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        app.settings.spread_page_gap_px = 0;
+        app.settings.detached_viewer_window_placement = Some(placement);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(72);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fs_transparent_bg_mode = 1;
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_settings.enabled = true;
+        app.view_trim_book_settings.spread_separate = true;
+        app.view_trim_book_settings.spread_left = crate::view_trim::ViewTrimMargins {
+            left: 0.00,
+            top: 0.10,
+            right: 0.20,
+            bottom: 0.10,
+        };
+        app.view_trim_book_settings.spread_right = crate::view_trim::ViewTrimMargins {
+            left: 0.20,
+            top: 0.00,
+            right: 0.00,
+            bottom: 0.20,
+        };
+        let left = push_image(&mut app, r"C:\pics\spread-trim-left.png");
+        let right = push_image(&mut app, r"C:\pics\spread-trim-right.png");
+        for (idx, label) in [(left, "spread_trim_left"), (right, "spread_trim_right")] {
+            let pixels = egui::ColorImage::new([1, 2], vec![egui::Color32::WHITE; 2]);
+            let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([1, 2]),
+                    load_seq: 0,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(left);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("spread detached viewer should build a snapshot");
+
+        assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
+        let left_page = &snapshot.frozen_continuous_pages[0];
+        let right_page = &snapshot.frozen_continuous_pages[1];
+        let left_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.1), egui::pos2(0.8, 0.9));
+        let right_bbox = egui::Rect::from_min_max(egui::pos2(0.2, 0.0), egui::pos2(1.0, 0.8));
+        assert_eq!(left_page.content_bbox, Some(left_bbox));
+        assert_eq!(right_page.content_bbox, Some(right_bbox));
+        assert_frozen_background_white(&left_page.background);
+        assert_frozen_background_white(&right_page.background);
+
+        assert!(
+            left_page.rect_norm.right() > right_page.rect_norm.left(),
+            "frozen page rects must keep the hidden inner trim margins behind the cropped UVs"
         );
     }
 
