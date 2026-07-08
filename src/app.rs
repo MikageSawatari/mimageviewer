@@ -45125,9 +45125,59 @@ impl App {
             }
             return;
         }
+        #[cfg(windows)]
+        if self.native_video_parked_live_input_window_id.is_some() {
+            self.open_parked_live_audio_from_continuous_eof(ctx, next_idx);
+            return;
+        }
         // 手動の音声前/次ファイルナビと同じ着地経路 (open_fullscreen が Audio → 音楽ビューへ
         // dispatch、build_audio_player_for_open は autoplay=true)。
         self.open_fullscreen_from_fs_navigation(ctx, next_idx);
+    }
+
+    /// ParkedLive poll 中の音声 EOF 進行。通常の `open_fullscreen` 系へ入ると active session /
+    /// presentation を解決してしまうため、bundle 内の idx/cache だけを進める。
+    #[cfg(windows)]
+    fn open_parked_live_audio_from_continuous_eof(&mut self, ctx: &egui::Context, next_idx: usize) {
+        if !self.prepare_parked_live_audio_continuous_target(next_idx) {
+            return;
+        }
+
+        if self.fs_cache.contains_key(&next_idx) {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&next_idx) {
+                player.set_playing(true);
+            }
+            self.apply_music_loop_mode(next_idx);
+            self.init_normalize_state_for_opened_video(next_idx);
+            self.maybe_start_normalize_scan_for_play_intent(next_idx);
+        } else {
+            self.start_fs_load(next_idx);
+        }
+
+        crate::logger::log(format!(
+            "[native-video] parked audio EOF advanced without open_fullscreen: target_idx={next_idx} \
+             window_id={:?}",
+            self.native_video_parked_live_input_window_id
+        ));
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn prepare_parked_live_audio_continuous_target(&mut self, next_idx: usize) -> bool {
+        if !matches!(self.items.get(next_idx), Some(GridItem::Audio(_))) {
+            return false;
+        }
+        self.sync_main_selection_from_viewer_idx(next_idx);
+        self.fullscreen_idx = Some(next_idx);
+        self.video_audio_mode = None;
+        self.video_audio_vst = None;
+        self.video_audio_mode_entry_target = None;
+        self.video_audio_exit_pending = None;
+        self.video_continuous_last_eof = None;
+        self.fs_open_intent_from_grid = false;
+        self.fs_video_open_autoplay_override = None;
+        self.fs_video_open_ignore_resume_once = false;
+        true
     }
 
     pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {

@@ -144,6 +144,10 @@ pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
     pub(crate) cursor_state: crate::ui_fullscreen::FullscreenCursorState,
+    /// ParkedLive poll 中に enqueue された source-swap なら、その owner window id。
+    /// Completion が別フレームへずれても通常 `open_fullscreen` 経路へ漏らさないため、
+    /// enqueue 時点の事実として焼き込む。
+    pub(crate) parked_live_window_id: Option<u64>,
     /// Inc 7: この swap 完了後に「動画→音声モード」を再確立する (音声モードの動画が連続
     /// 再生 EOF で次動画へ送られたケース)。true なら completion の `open_fullscreen` 後に
     /// `enter_video_audio_mode` を呼び、hidden presenter を維持したまま音楽ビューへ戻す。
@@ -750,6 +754,7 @@ impl App {
             }
         };
         let now = std::time::Instant::now();
+        let parked_live_window_id = self.native_video_parked_live_input_window_id;
         // Inc 7: 音声モードの動画が連続再生 EOF で次動画へ送られた swap かどうか
         // (`handle_video_audio_mode_continuous_eof` が直前に立てる one-shot)。true なら
         // presenter を hidden のまま再利用し、swap 完了後に音声モードを再確立する。
@@ -795,12 +800,14 @@ impl App {
             pending.requested_at = now;
             pending.deadline = now + std::time::Duration::from_secs(10);
             pending.input_seq = self.input_seq;
+            pending.parked_live_window_id = parked_live_window_id.or(pending.parked_live_window_id);
             pending.audio_mode_after_swap = keep_audio_after_update;
             pending
                 .native_output
                 .set_navigation_preview(navigation_preview);
             crate::logger::log(format!(
-                "[native-video] update deferred source swap: reason={reason} target_idx={target_idx}"
+                "[native-video] update deferred source swap: reason={reason} target_idx={target_idx} parked_live_window_id={:?}",
+                pending.parked_live_window_id
             ));
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -877,10 +884,11 @@ impl App {
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
             cursor_state: self.fullscreen_cursor_state(),
+            parked_live_window_id,
             audio_mode_after_swap: keep_audio_mode,
         });
         crate::logger::log(format!(
-            "[native-video] defer source swap: reason={reason} from_idx={from_idx} -> target_idx={target_idx}"
+            "[native-video] defer source swap: reason={reason} from_idx={from_idx} -> target_idx={target_idx} parked_live_window_id={parked_live_window_id:?}"
         ));
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -905,13 +913,14 @@ impl App {
         // swap 中は presenter が pending 側にあり fs_cache の player は native_output を
         // 持たないため、fs_cache 経由だと committed=0 と誤認して旧世代 close を誤受理する
         // (Codex P1)。placement switch 直後に navigation が deferred swap へ入ったケース。
-        let Some((fs_idx, mut committed, events)) = self
+        let Some((fs_idx, mut committed, parked_live_window_id, events)) = self
             .native_video_source_swap_pending
             .as_ref()
             .map(|pending| {
                 (
                     self.fullscreen_idx.unwrap_or(pending.target_idx),
                     pending.native_output.committed_generation(),
+                    pending.parked_live_window_id,
                     pending.native_output.drain_events(),
                 )
             })
@@ -935,6 +944,16 @@ impl App {
                     ) {
                         continue;
                     }
+                    if let Some(window_id) = parked_live_window_id {
+                        if let Some(pending) = self.native_video_source_swap_pending.take() {
+                            pending.native_output.set_navigation_preview(None);
+                        }
+                        crate::logger::log(format!(
+                            "[native-video] parked deferred source swap close ignored: \
+                             window_id={window_id} fs_idx={fs_idx} source=window_close"
+                        ));
+                        return;
+                    }
                     self.close_fullscreen();
                     return;
                 }
@@ -951,6 +970,16 @@ impl App {
                         "source_swap_close",
                     ) {
                         continue;
+                    }
+                    if let Some(window_id) = parked_live_window_id {
+                        if let Some(pending) = self.native_video_source_swap_pending.take() {
+                            pending.native_output.set_navigation_preview(None);
+                        }
+                        crate::logger::log(format!(
+                            "[native-video] parked deferred source swap close ignored: \
+                             window_id={window_id} fs_idx={fs_idx} source=close_fullscreen"
+                        ));
+                        return;
                     }
                     self.close_fullscreen();
                     return;
@@ -995,6 +1024,7 @@ impl App {
         let deadline = pending.deadline;
         let input_seq = pending.input_seq;
         let reason = pending.reason;
+        let parked_live_window_id = pending.parked_live_window_id;
 
         if self.fullscreen_idx != Some(target_idx)
             || !matches!(self.items.get(target_idx), Some(GridItem::Video(path)) if path == &target_path)
@@ -1013,6 +1043,14 @@ impl App {
                 "[native-video] deferred source swap aborted: presenter closed target_idx={target_idx}"
             ));
             self.show_feedback_toast("動画プレゼンターが閉じられました".to_string());
+            if let Some(window_id) = parked_live_window_id {
+                crate::logger::log(format!(
+                    "[native-video] parked deferred source swap aborted without closing fullscreen: \
+                     window_id={window_id} target_idx={target_idx} reason=presenter_closed"
+                ));
+                ctx.request_repaint();
+                return;
+            }
             self.close_fullscreen();
             return;
         }
@@ -1064,6 +1102,14 @@ impl App {
                 self.show_feedback_toast(
                     "前の動画デコード終了待ちがタイムアウトしました".to_string(),
                 );
+                if let Some(window_id) = parked_live_window_id {
+                    crate::logger::log(format!(
+                        "[native-video] parked deferred source swap timed out without closing fullscreen: \
+                         window_id={window_id} target_idx={target_idx} reason={reason}"
+                    ));
+                    ctx.request_repaint();
+                    return;
+                }
                 self.close_fullscreen();
             } else {
                 ctx.request_repaint_after(
@@ -1091,6 +1137,7 @@ impl App {
             requested_at,
             input_seq,
             cursor_state,
+            parked_live_window_id,
             audio_mode_after_swap,
             ..
         } = pending;
@@ -1118,12 +1165,13 @@ impl App {
             },
         );
         self.init_normalize_state_for_opened_video(target_idx);
-        // deferred swap を確定する open_fullscreen は「viewer 内ナビ」相当なので、open_fullscreen
-        // 冒頭の一括ガードが現在の `viewer_presentation` (pending 中に F12 されていれば反映済み)
-        // から presentation 維持 one-shot を焼き付ける (Codex 実機 P1/P2)。ここで個別に復元する
-        // 必要はない。
-        self.open_fullscreen(target_idx);
-        self.restore_fullscreen_cursor_state(ctx, cursor_state);
+        let completed_via_open_fullscreen = self
+            .complete_native_video_deferred_source_swap_viewer_state(
+                ctx,
+                target_idx,
+                cursor_state,
+                parked_live_window_id,
+            );
         if start_normalize_scan_before_play {
             if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
                 self.resume_deferred_normalize_playback_without_scan(target_idx);
@@ -1160,9 +1208,10 @@ impl App {
         // 再利用した presenter は既に hidden なので、`enter_video_audio_mode` は VST/owner/HUD の
         // 後始末 + entry_target 捕捉 + video_audio_mode=Some(target) + music_bookmarks 再ロード
         // フラグを行い、set_native_window_visible(false) は既 hidden への冪等 no-op になる。
-        // `open_fullscreen(target_idx)` が video_audio_mode を一旦 None にした後この 1 箇所で
-        // 戻すので、音楽ビュー ⇔ 動画表示の切替はこの poll 内で完結し描画フレームは跨がない。
-        if audio_mode_after_swap {
+        // 通常 completion では `open_fullscreen(target_idx)` が video_audio_mode を一旦 None に
+        // した後この 1 箇所で戻す。ParkedLive completion は `open_fullscreen` を呼ばず、
+        // defer 開始時に video_audio_mode=Some(target) へ進めた bundle 内状態をそのまま保つ。
+        if audio_mode_after_swap && completed_via_open_fullscreen {
             self.enter_video_audio_mode(ctx, target_idx);
         }
 
@@ -1213,6 +1262,33 @@ impl App {
             );
         }
         ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn complete_native_video_deferred_source_swap_viewer_state(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+        cursor_state: crate::ui_fullscreen::FullscreenCursorState,
+        parked_live_window_id: Option<u64>,
+    ) -> bool {
+        if let Some(window_id) = parked_live_window_id {
+            self.video_continuous_last_eof = None;
+            self.refresh_fullscreen_video_marker_cache(target_idx);
+            crate::logger::log(format!(
+                "[native-video] parked deferred source swap committed without open_fullscreen: \
+                 window_id={window_id} target_idx={target_idx}"
+            ));
+            ctx.request_repaint();
+            return false;
+        }
+
+        // deferred swap を確定する open_fullscreen は「viewer 内ナビ」相当なので、
+        // open_fullscreen 冒頭の一括ガードが現在の `viewer_presentation` (pending 中に F12
+        // されていれば反映済み) から presentation 維持 one-shot を焼き付ける。
+        self.open_fullscreen(target_idx);
+        self.restore_fullscreen_cursor_state(ctx, cursor_state);
+        true
     }
 
     #[cfg(windows)]

@@ -22296,6 +22296,72 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn parked_video_deferred_swap_completion_does_not_open_fullscreen() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let active_image = push_image(&mut app, r"C:\pics\active.jpg");
+        let target_video = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(target_video);
+        app.selected = Some(active_image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.begin_active_detached_session(4, DetachedSource::Image);
+        app.transition_detached_window_state(81, DetachedWindowState::ParkedLive, "test_setup");
+
+        let cursor_state = app.fullscreen_cursor_state();
+        let completed_via_open = app.complete_native_video_deferred_source_swap_viewer_state(
+            &ctx,
+            target_video,
+            cursor_state,
+            Some(81),
+        );
+
+        assert!(
+            !completed_via_open,
+            "ParkedLive source-swap completion must not enter open_fullscreen"
+        );
+        let session = app
+            .active_detached_session
+            .expect("unrelated active session must remain intact");
+        assert_eq!(session.window_id, 4);
+        assert_eq!(session.source, DetachedSource::Image);
+        assert_eq!(
+            app.detached_window_state(81),
+            Some(DetachedWindowState::ParkedLive),
+            "parked media window must stay parked during deferred completion"
+        );
+        assert_eq!(app.fullscreen_idx, Some(target_video));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_audio_continuous_target_stays_inside_bundle() {
+        let mut app = setup_app();
+        let audio_a = push_audio(&mut app, r"C:\music\a.flac");
+        let audio_b = push_audio(&mut app, r"C:\music\b.flac");
+        app.fullscreen_idx = Some(audio_a);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.video_continuous_last_eof = Some((audio_a, 7));
+        app.native_video_parked_live_input_window_id = Some(82);
+        app.begin_active_detached_session(5, DetachedSource::Book);
+        app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.prepare_parked_live_audio_continuous_target(audio_b));
+
+        let session = app
+            .active_detached_session
+            .expect("active session must not be replaced by parked audio EOF");
+        assert_eq!(session.window_id, 5);
+        assert_eq!(session.source, DetachedSource::Book);
+        assert_eq!(app.fullscreen_idx, Some(audio_b));
+        assert_eq!(app.video_continuous_last_eof, None);
+        assert_eq!(
+            app.detached_window_state(82),
+            Some(DetachedWindowState::ParkedLive)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn parked_live_native_activation_waits_until_passive_render_handoff() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

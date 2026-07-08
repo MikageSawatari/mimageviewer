@@ -1249,6 +1249,26 @@ pointer は None 維持・suppress 分類テストで再確認)・可視性判�
    - 既存 fix7 テスト (ON 進行 / OFF 停止 / 本文脈不変) は維持。
 5. コミット `(detached-rework stage-audio fix7-2)`。fix6g-2 (× fallback 1 行) を同梱してよい。
 
+### fix7-2 実装メモ (Codex 2026-07-08)
+
+- `NativeVideoSourceSwapPending` に `parked_live_window_id` を追加し、enqueue 時点の
+  `native_video_parked_live_input_window_id` を焼き込む。これにより throttle / debounce で
+  completion が後続フレームへずれても、parked 由来かどうかを TOCTOU なしで判定できる。
+- pending completion は `poll_parked_live_detached_windows()` が bundle を `self` に mount し、
+  `native_video_parked_live_input_window_id=Some(window_id)` にした状態で `poll_video()` を呼ぶ
+  文脈で実行される。したがって parked 由来 completion では `open_fullscreen` /
+  `prepare_viewer_presentation_open` を呼ばず、bundle 内の `fullscreen_idx` / `fs_cache` /
+  native player source swap の確定だけで完結させる。
+- pending の presenter close / timeout / CloseFullscreen event も parked origin では
+  `close_fullscreen()` へ落とさず、pending を abort してログを残す。EOF 進行が active session /
+  runtime / presentation を触らない不変条件を維持するため。
+- 音声ファイル EOF (`handle_music_continuous_eof`) も `open_fullscreen_from_fs_navigation` に到達する
+  同種の穴があったため、ParkedLive poll 中だけ `open_parked_live_audio_from_continuous_eof` に分岐し、
+  bundle 内の idx/cache だけを進める。
+- 回帰テスト:
+  `parked_video_deferred_swap_completion_does_not_open_fullscreen` /
+  `parked_audio_continuous_target_stays_inside_bundle`。
+
 ### 保留中の実機 FB (fix7-2 の後に対応、未指示)
 
 - 音声モード上 HUD の右側ボタン群と、動画の上 HUD が減光されていない (fix6b の top dim
