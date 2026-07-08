@@ -1441,6 +1441,26 @@ parked EOF 進行 = 動画→次ファイル / 動画の音声モード / 音声
    右クリック入力を別配送へ寄せる。ただし parked watcher には触らず、Active immediate の
    input dispatch に限定する。
 
+### fix6h 検収合格 + fix9 Phase 1 承認 (Fable 2026-07-08)
+
+- **fix6h (82ff05ff) = 合格** (同梱の fix6g-2 / fix7-4 含む)。native top/tile dim は
+  `draw_native_hud_dim_overlay` 全撤去 + 描画関数への `hud_dimmed` 引数渡しで in-place 化
+  (`native_hud_dim_color()` 単一ソース)。music chrome は
+  `paint_music_chrome_button_dim` (0,0,0,77) を非 interactive 時に各ボタンへ適用。
+  fix6g-2 = `None => return false` (全窓 × 化の解消)。fix7-4 = runtime 削除時の
+  `discard_parked_source_swap_pending_for_window` (ログ付き) + update 分岐の owner を
+  「現在文脈で上書き」(`source_swap_owner_after_update`、stale 温存の解消)。テストあり。
+  実機でも動画 HUD の dim 表示 OK (ユーザー確認)。
+- **fix9 = Phase 1 報告を承認、計装 (方針 1) へ進んでよい**。条件:
+  - `right_drag_probe` は `MIV_DETACHED_WINDOW_DEBUG` ゲート内 + **イベントフレームのみ
+    出力** (secondary press/release/down の変化時と gate reject 時のみ。毎フレーム出力は
+    ローテートで証拠を流す既知の失敗 [findings-11 C1] があるため禁止)。
+  - 計装コミット `(detached-rework stage-audio fix9 probe)` → ユーザー実機 1 回 (ON モードの
+    静止画窓で右クリック/右ドラッグを数回) → Fable がログ解析して方針 2/3/4 の分岐を承認 →
+    実装。
+  - 方針 3 だった場合 (実は Parked/deferred 窓だった) は挙動変更なし = 「クリック復帰後に
+    右クリック操作」が仕様であることをユーザーに説明して確認する。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
