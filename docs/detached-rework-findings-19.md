@@ -631,3 +631,21 @@ detached image window の表示 (自動トリムレイアウト) が、**メイ�
    トリムあり表示のまま (park/live/再アクティブ化とも) (ii) 窓内ページめくり後も
    トリム維持 (iii) メイン fullscreen 側の自動トリム挙動に退行なし。
 6. コミット `(detached-rework findings-19 fix14)`。
+
+### fix14 実装メモ (Codex 2026-07-09)
+
+- `DetachedWindowRuntime` に `trim_bboxes: HashMap<idx, { item_key, bbox }>` を追加。
+  item_key は `GridItem::perf_key()` 由来で、同じ window_id 内で idx が別コンテンツに
+  再利用された場合に古い bbox を誤用しない。
+- `ViewTrimApplyMode::Auto` の detached 表示だけ、runtime 焼き込み値を優先する。
+  焼き込みが無い場合は `cached_margin_bbox(idx)` で初回計算し、**Static pixels が存在する
+  時だけ** `detached_trim_bbox_bake` として保存する。fs_cache miss / 動画 / アニメ等で
+  pixels が無い `None` は焼き込まず、後続フレームの再計算余地を残す。
+- 既存の `view_trim_single_content_bbox` / `view_trim_spread_content_bbox(es)` の Auto 分岐に
+  resolver を集約したため、active detached live 描画、continuous layout、snapshot / park bake、
+  capture 対象計算は同じ焼き込み値を読む。Book/Page/None と non-detached main fullscreen は
+  従来どおり。
+- 回帰テスト `detached_auto_trim_snapshot_uses_baked_runtime_bbox_after_fs_cache_eviction` で、
+  一度 bbox を焼き込んだ後に該当 idx の fs_cache と `fs_margin_bbox_cache` を消しても、
+  thumbnail fallback で作る detached spread snapshot の `paint_rect_norm` / `clip_rect_norm`
+  が変わらないことを固定した。

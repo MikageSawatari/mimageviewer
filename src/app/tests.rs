@@ -20184,6 +20184,107 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_auto_trim_snapshot_uses_baked_runtime_bbox_after_fs_cache_eviction() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 80.0,
+            y: 80.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        app.settings.spread_page_gap_px = 0;
+        app.settings.detached_viewer_window_placement = Some(placement);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(73);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        let left = push_image(&mut app, r"C:\pics\auto-trim-left.png");
+        let right = push_image(&mut app, r"C:\pics\auto-trim-right.png");
+
+        let make_margin_image = || {
+            let size = [20, 20];
+            let mut pixels = vec![egui::Color32::WHITE; size[0] * size[1]];
+            for y in 5..15 {
+                for x in 4..16 {
+                    pixels[y * size[0] + x] = egui::Color32::BLACK;
+                }
+            }
+            egui::ColorImage::new(size, pixels)
+        };
+
+        for (idx, label) in [(left, "auto_trim_left"), (right, "auto_trim_right")] {
+            let pixels = make_margin_image();
+            let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+            app.thumbnails.insert(
+                idx,
+                ThumbnailState::Loaded {
+                    tex: tex.clone(),
+                    from_cache: false,
+                    rendered_at_px: 20,
+                    source_dims: Some((20, 20)),
+                },
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([20, 20]),
+                    load_seq: 0,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(left);
+
+        let first = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("spread detached viewer should build a snapshot");
+        assert_eq!(first.frozen_continuous_pages.len(), 2);
+        assert!(
+            app.detached_window_runtime_trim_bbox(73, left)
+                .is_some_and(|bbox| bbox.is_some()),
+            "first display commit should bake the left page auto-trim bbox"
+        );
+        assert!(
+            app.detached_window_runtime_trim_bbox(73, right)
+                .is_some_and(|bbox| bbox.is_some()),
+            "first display commit should bake the right page auto-trim bbox"
+        );
+        let first_rects = first
+            .frozen_continuous_pages
+            .iter()
+            .map(|page| (page.paint_rect_norm, page.clip_rect_norm))
+            .collect::<Vec<_>>();
+
+        app.fs_cache.remove(&left);
+        app.fs_cache.remove(&right);
+        app.fs_margin_bbox_cache.clear();
+
+        let second = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("thumbnail fallback should still allow the detached snapshot to build");
+        assert_eq!(second.frozen_continuous_pages.len(), 2);
+        let second_rects = second
+            .frozen_continuous_pages
+            .iter()
+            .map(|page| (page.paint_rect_norm, page.clip_rect_norm))
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_rects.len(), second_rects.len());
+        for ((first_paint, first_clip), (second_paint, second_clip)) in
+            first_rects.into_iter().zip(second_rects)
+        {
+            assert_rect_close(first_paint, second_paint);
+            assert_rect_close(first_clip, second_clip);
+        }
+    }
+
+    #[test]
     fn paused_single_page_detached_window_does_not_use_multi_page_frozen_snapshot() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

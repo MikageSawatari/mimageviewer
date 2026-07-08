@@ -786,12 +786,20 @@ impl DetachedActivationWatcher {
 
 #[cfg(windows)]
 #[derive(Debug, Clone)]
+pub(crate) struct DetachedTrimBBoxEntry {
+    pub(crate) item_key: String,
+    pub(crate) bbox: Option<egui::Rect>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
 pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
+    pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
     pub(crate) linked: bool,
     pub(crate) pending_deferred_activation: bool,
 }
@@ -805,6 +813,7 @@ impl DetachedWindowRuntime {
             hwnd: 0,
             placement: None,
             builder_placement_latch: None,
+            trim_bboxes: std::collections::HashMap::new(),
             linked,
             pending_deferred_activation: false,
         }
@@ -885,6 +894,53 @@ impl App {
         let seed = self.detached_viewer_window_placement();
         self.set_detached_window_runtime_placement(window_id, seed, reason);
         seed
+    }
+
+    pub(crate) fn detached_window_runtime_trim_bbox(
+        &self,
+        window_id: u64,
+        idx: usize,
+    ) -> Option<Option<egui::Rect>> {
+        let item_key = self.items.get(idx)?.perf_key();
+        self.detached_window_runtimes
+            .get(&window_id)
+            .and_then(|runtime| runtime.trim_bboxes.get(&idx))
+            .filter(|entry| entry.item_key == item_key)
+            .map(|entry| entry.bbox)
+    }
+
+    pub(crate) fn set_detached_window_runtime_trim_bbox(
+        &mut self,
+        window_id: u64,
+        idx: usize,
+        bbox: Option<egui::Rect>,
+        reason: &'static str,
+    ) {
+        let Some(item_key) = self.items.get(idx).map(|item| item.perf_key()) else {
+            return;
+        };
+        let bbox_label = Self::format_detached_trim_bbox_for_log(bbox);
+        let runtime = self.detached_window_runtime_entry_mut(window_id);
+        runtime
+            .trim_bboxes
+            .insert(idx, DetachedTrimBBoxEntry { item_key, bbox });
+        self.log_detached_image_window_debug(format!(
+            "detached_trim_bbox_bake window_id={window_id} idx={idx} bbox={bbox_label} \
+             reason={reason}"
+        ));
+    }
+
+    pub(crate) fn format_detached_trim_bbox_for_log(bbox: Option<egui::Rect>) -> String {
+        match bbox {
+            Some(rect) => format!(
+                "({:.4},{:.4} {:.4}x{:.4})",
+                rect.min.x,
+                rect.min.y,
+                rect.width(),
+                rect.height()
+            ),
+            None => "none".to_string(),
+        }
     }
 
     pub(crate) fn active_detached_runtime_placement(

@@ -398,7 +398,7 @@ impl App {
         self.clear_stale_view_trim_page_apply();
         match self.effective_view_trim_apply_mode() {
             ViewTrimApplyMode::None => None,
-            ViewTrimApplyMode::Auto => self.cached_margin_bbox(idx),
+            ViewTrimApplyMode::Auto => self.view_trim_auto_content_bbox(idx, "single"),
             ViewTrimApplyMode::Book | ViewTrimApplyMode::Page => self.view_trim_single_bbox(idx),
         }
     }
@@ -411,7 +411,7 @@ impl App {
         self.clear_stale_view_trim_page_apply();
         match self.effective_view_trim_apply_mode() {
             ViewTrimApplyMode::None => None,
-            ViewTrimApplyMode::Auto => self.cached_margin_bbox(idx),
+            ViewTrimApplyMode::Auto => self.view_trim_auto_content_bbox(idx, "spread"),
             ViewTrimApplyMode::Book | ViewTrimApplyMode::Page => {
                 self.view_trim_spread_bbox(idx, side)
             }
@@ -427,14 +427,64 @@ impl App {
         match self.effective_view_trim_apply_mode() {
             ViewTrimApplyMode::None => (None, None),
             ViewTrimApplyMode::Auto => crate::view_trim::harmonize_spread_auto_bboxes(
-                self.cached_margin_bbox(left_idx),
-                self.cached_margin_bbox(right_idx),
+                self.view_trim_auto_content_bbox(left_idx, "spread_pair_left"),
+                self.view_trim_auto_content_bbox(right_idx, "spread_pair_right"),
             ),
             ViewTrimApplyMode::Book | ViewTrimApplyMode::Page => (
                 self.view_trim_spread_bbox(left_idx, ViewTrimSpreadSide::Left),
                 self.view_trim_spread_bbox(right_idx, ViewTrimSpreadSide::Right),
             ),
         }
+    }
+
+    fn view_trim_auto_content_bbox(
+        &mut self,
+        idx: usize,
+        reason: &'static str,
+    ) -> Option<egui::Rect> {
+        #[cfg(windows)]
+        if let Some(window_id) = self.detached_view_trim_runtime_window_id() {
+            return self.detached_view_trim_auto_content_bbox(window_id, idx, reason);
+        }
+        self.cached_margin_bbox(idx)
+    }
+
+    #[cfg(windows)]
+    fn detached_view_trim_runtime_window_id(&self) -> Option<u64> {
+        self.viewer_session_is_detached()
+            .then_some(self.detached_viewer_window_id)
+            .flatten()
+    }
+
+    #[cfg(windows)]
+    fn detached_view_trim_auto_content_bbox(
+        &mut self,
+        window_id: u64,
+        idx: usize,
+        reason: &'static str,
+    ) -> Option<egui::Rect> {
+        if let Some(baked) = self.detached_window_runtime_trim_bbox(window_id, idx) {
+            return baked;
+        }
+
+        self.log_detached_image_window_debug(format!(
+            "detached_trim_bbox_fallback window_id={window_id} idx={idx} reason={reason}"
+        ));
+
+        let has_static_pixels = matches!(
+            self.fs_cache.get(&idx),
+            Some(crate::fs_animation::FsCacheEntry::Static { .. })
+        );
+        let bbox = self.cached_margin_bbox(idx);
+        if has_static_pixels {
+            self.set_detached_window_runtime_trim_bbox(window_id, idx, bbox, reason);
+        } else {
+            self.log_detached_image_window_debug(format!(
+                "detached_trim_bbox_no_bake window_id={window_id} idx={idx} \
+                 reason={reason} cause=no_static_pixels"
+            ));
+        }
+        bbox
     }
 
     pub(crate) fn view_trim_active_for_display(
