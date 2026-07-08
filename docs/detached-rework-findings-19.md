@@ -498,3 +498,16 @@ fix13-2 (06eb05d8 = paint_rect_norm + uv_rect 焼き込み、指示どおりの�
   (fix10b 単一画像と同じ「同じ座標系で焼いて同じ座標系で戻す」)。
 - 回帰テスト: 基準 rect (placement/media/client) の変換を含めた rect/uv round-trip 一致。
 - 計装は debug ゲート内で残置可。コミット `(detached-rework findings-19 fix13-3)`。
+
+### fix13-3 Phase 1 計装メモ (Codex 2026-07-09)
+
+- `MIV_DETACHED_WINDOW_DEBUG=1` 配下で、park 時に `frozen_page_bake` を 1 ページ 1 行出す。
+  `phase=continuous|spread`、`window_id`、`idx`、`page_ord`、live 最終 `paint`、`uv`、
+  正規化基準 `basis` (`basis_kind=full_rect`, `basis_source=runtime_placement`)、
+  `media`、焼き込み後 `norm`、`content_bbox`、`ppp`、`placement` を記録する。
+- deferred passive の初回 callback で、`frozen_page_restore source=deferred_first_draw` を
+  1 ページ 1 行出す。実 client 由来の `basis` (`basis_source=passive_client`)、復元後
+  `paint`、焼き込み `norm` / `uv`、`ppp`、`placement` を記録する。
+- 次の実機ログでは同一 `window_id` + `page_ord` の `frozen_page_bake` と
+  `frozen_page_restore` を突き合わせ、(i) 正規化基準差、(ii) rect/uv 組み合わせ差、
+  (iii) 背景塗り範囲差のどれかを数値で確定する。

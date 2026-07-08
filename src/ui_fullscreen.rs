@@ -3601,9 +3601,93 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_frozen_debug_rect(rect: egui::Rect) -> String {
+        format!(
+            "({:.2},{:.2})-({:.2},{:.2})/{:.2}x{:.2}",
+            rect.min.x,
+            rect.min.y,
+            rect.max.x,
+            rect.max.y,
+            rect.width(),
+            rect.height()
+        )
+    }
+
+    #[cfg(windows)]
+    fn detached_frozen_debug_opt_rect(rect: Option<egui::Rect>) -> String {
+        rect.map(Self::detached_frozen_debug_rect)
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn log_detached_frozen_page_bake_debug(
+        &self,
+        phase: &'static str,
+        window_id: u64,
+        idx: usize,
+        page_ord: usize,
+        paint_rect: egui::Rect,
+        uv_rect: egui::Rect,
+        basis_rect: egui::Rect,
+        media_rect: egui::Rect,
+        paint_rect_norm: egui::Rect,
+        pixels_per_point: f32,
+        content_bbox: Option<egui::Rect>,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+    ) {
+        if !Self::detached_image_window_debug_enabled() {
+            return;
+        }
+        self.log_detached_image_window_debug(format!(
+            "frozen_page_bake phase={phase} window_id={window_id} idx={idx} page_ord={page_ord} \
+             basis_kind=full_rect basis_source=runtime_placement basis={} media={} paint={} \
+             norm={} uv={} content_bbox={} ppp={:.3} placement={:?}",
+            Self::detached_frozen_debug_rect(basis_rect),
+            Self::detached_frozen_debug_rect(media_rect),
+            Self::detached_frozen_debug_rect(paint_rect),
+            Self::detached_frozen_debug_rect(paint_rect_norm),
+            Self::detached_frozen_debug_rect(uv_rect),
+            Self::detached_frozen_debug_opt_rect(content_bbox),
+            pixels_per_point,
+            placement
+        ));
+    }
+
+    #[cfg(windows)]
+    fn log_detached_frozen_page_restore_debug(
+        window: &crate::app::DeferredDetachedImageWindowView,
+        full_rect: egui::Rect,
+        pixels_per_point: f32,
+        source: &'static str,
+    ) {
+        if !Self::detached_image_window_debug_enabled() || window.frozen_continuous_pages.is_empty()
+        {
+            return;
+        }
+        for (page_ord, page) in window.frozen_continuous_pages.iter().enumerate() {
+            let paint_rect = Self::rect_from_normalized(full_rect, page.paint_rect_norm);
+            crate::logger::log(format!(
+                "[detached-window-debug] frozen_page_restore source={source} window_id={} \
+                 page_ord={} basis_kind=full_rect basis_source=passive_client basis={} paint={} \
+                 norm={} uv={} ppp={:.3} placement={:?}",
+                window.id,
+                page_ord,
+                Self::detached_frozen_debug_rect(full_rect),
+                Self::detached_frozen_debug_rect(paint_rect),
+                Self::detached_frozen_debug_rect(page.paint_rect_norm),
+                Self::detached_frozen_debug_rect(page.uv_rect),
+                pixels_per_point,
+                window.placement
+            ));
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn detached_continuous_frozen_pages_for_snapshot(
         &mut self,
         ctx: &egui::Context,
+        window_id: u64,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
@@ -3629,10 +3713,13 @@ impl App {
             return Vec::new();
         };
         let background = self.detached_frozen_background_for_snapshot(ctx);
+        let pixels_per_point = ctx.pixels_per_point();
 
         pages
             .into_iter()
+            .enumerate()
             .filter_map(|page| {
+                let (page_ord, page) = page;
                 let texture = if self.analysis_mode {
                     self.resolve_original_preview_tex(page.idx)
                 } else {
@@ -3640,10 +3727,25 @@ impl App {
                         .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                 }?;
                 let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
+                let uv_rect = Self::full_uv_rect();
+                self.log_detached_frozen_page_bake_debug(
+                    "continuous",
+                    window_id,
+                    page.idx,
+                    page_ord,
+                    page.rect,
+                    uv_rect,
+                    full_rect,
+                    image_rect,
+                    rect_norm,
+                    pixels_per_point,
+                    page.content_bbox,
+                    placement,
+                );
                 Some(crate::app::DetachedImageWindowFrozenPage {
                     texture,
                     paint_rect_norm: rect_norm,
-                    uv_rect: Self::full_uv_rect(),
+                    uv_rect,
                     rotation: self.get_rotation(page.idx),
                     background: background.clone(),
                 })
@@ -3655,14 +3757,16 @@ impl App {
     pub(crate) fn detached_frozen_pages_for_snapshot(
         &mut self,
         ctx: &egui::Context,
+        window_id: u64,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
-        let continuous = self.detached_continuous_frozen_pages_for_snapshot(ctx, idx, placement);
+        let continuous =
+            self.detached_continuous_frozen_pages_for_snapshot(ctx, window_id, idx, placement);
         if !continuous.is_empty() {
             return continuous;
         }
-        self.detached_spread_frozen_pages_for_snapshot(ctx, idx, placement)
+        self.detached_spread_frozen_pages_for_snapshot(ctx, window_id, idx, placement)
     }
 
     #[cfg(windows)]
@@ -3702,6 +3806,7 @@ impl App {
     fn detached_spread_frozen_pages_for_snapshot(
         &mut self,
         ctx: &egui::Context,
+        window_id: u64,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
@@ -3814,19 +3919,50 @@ impl App {
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
         let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
+        let left_uv_rect = Self::full_uv_rect();
+        let right_uv_rect = Self::full_uv_rect();
+        let pixels_per_point = ctx.pixels_per_point();
+        self.log_detached_frozen_page_bake_debug(
+            "spread",
+            window_id,
+            left,
+            0,
+            rects.left_rect,
+            left_uv_rect,
+            full_rect,
+            image_rect,
+            left_rect_norm,
+            pixels_per_point,
+            content_left,
+            placement,
+        );
+        self.log_detached_frozen_page_bake_debug(
+            "spread",
+            window_id,
+            right,
+            1,
+            rects.right_rect,
+            right_uv_rect,
+            full_rect,
+            image_rect,
+            right_rect_norm,
+            pixels_per_point,
+            content_right,
+            placement,
+        );
 
         vec![
             crate::app::DetachedImageWindowFrozenPage {
                 texture: left_texture,
                 paint_rect_norm: left_rect_norm,
-                uv_rect: Self::full_uv_rect(),
+                uv_rect: left_uv_rect,
                 rotation: left_rot,
                 background: background.clone(),
             },
             crate::app::DetachedImageWindowFrozenPage {
                 texture: right_texture,
                 paint_rect_norm: right_rect_norm,
-                uv_rect: Self::full_uv_rect(),
+                uv_rect: right_uv_rect,
                 rotation: right_rot,
                 background,
             },
@@ -4937,7 +5073,8 @@ impl App {
                 let Some(view) = shared.view() else {
                     return;
                 };
-                if shared.push_first_callback_once(view.id) {
+                let first_callback = shared.push_first_callback_once(view.id);
+                if first_callback {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
@@ -4981,6 +5118,14 @@ impl App {
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(vp_ctx, |ui| {
                         let full_rect = ui.max_rect();
+                        if first_callback {
+                            Self::log_detached_frozen_page_restore_debug(
+                                &view,
+                                full_rect,
+                                ppp,
+                                "deferred_first_draw",
+                            );
+                        }
                         Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
                         Self::draw_detached_image_window_bar(
                             ui,

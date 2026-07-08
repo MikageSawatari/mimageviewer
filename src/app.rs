@@ -27587,7 +27587,7 @@ impl App {
             free_rotation,
         );
         let frozen_continuous_pages = ctx
-            .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, idx, placement))
+            .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();
         let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
