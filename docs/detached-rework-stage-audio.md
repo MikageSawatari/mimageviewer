@@ -1180,6 +1180,23 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
   `music_chrome_close_slot_rect` を使い、画像/PDF は従来の close-only bar rect のまま。
   close rect 選択は headless test で固定。
 
+### fix6g 検収合格 (Fable 2026-07-08) + 微修正 fix6g-2 (次回作業に同梱可)
+
+**fix6g (c3482bdb) = 合格**。①raw_hover_pos 分離 (dimmed 中のみ可視性判定に使用、egui
+pointer は None 維持・suppress 分類テストで再確認)・可視性判定を純関数化 (external_drag
+規則温存)・表示変化のエッジで dirty・MouseLeave/undim でクリア。②title clip は右側全要素
+(close/window/back/VST/Row ステッパー) の最左端を集約してから clip rect を導出、描画順も
+制御群の後に移動 = 共有 chrome で active/parked 両対応。③watcher は
+`DetachedActivationCloseHitTest::{ImageBar, MusicChrome}` を target に持ち、音楽窓は
+`parked_live_music_close_slot_rect` で判定 (選択テストあり)。実装メモも記載。
+
+**fix6g-2 (P3 微修正、次の作業コミットに同梱してよい)**:
+`detached_activation_close_button_contains` の MusicChrome 分岐が layout 不成立時
+(`full_rect` が 64px 以下 = 極端に小さい窓) に `.unwrap_or(full_rect)` で**窓全体を × 扱い**
+にする。この状態でクリックすると activation でなく close になる。フォールバックは
+「close hit = false」(= 通常の activation に落とす) へ変更し、None ケースのテストを 1 本
+追加する。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
