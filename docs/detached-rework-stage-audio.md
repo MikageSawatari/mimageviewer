@@ -1197,6 +1197,65 @@ pointer は None 維持・suppress 分類テストで再確認)・可視性判�
 「close hit = false」(= 通常の activation に落とす) へ変更し、None ケースのテストを 1 本
 追加する。
 
+## 3.20 fix7 退行 (実機 2026-07-08 13時): parked EOF 進行が deferred 完了経路で ParkedLive を破壊しセッションを奪う — fix7-2 (P1)
+
+**症状**: 動画再生テスト中に「メタデータ読み込み中」で固着、タイトルバーが「Page1」と
+動画タイトルで毎フレーム交互に点滅。
+
+**ログ確定 (scratchpad/freeze-cur.log、MIV_DETACHED_WINDOW_DEBUG=1)**:
+
+1. `364.054s` parked 窓 id=5 の動画 idx=14 が `engine_state=Eof` → fix7 の連続再生 EOF
+   進行が発火 (ユーザー入力なしを input probe で確認済み = EOF 起点)。
+2. `364.043s` `fast video swap throttled: live_video_decode_threads=1 max=1 target_idx=15`
+   → fast-swap が**多重デコーダ制限で throttle され deferred pending に降格**
+   (`defer source swap: reason=navigation from_idx=14 -> target_idx=15`)。
+3. `364.166-179s` pending 完了が fast-swap でなく **`open_fullscreen: idx=15` のフル経路**を
+   実行 → `prepare_viewer_presentation_open_begin ... always_new=true` が走り:
+   - `state_transition window_id=5 from=ParkedLive to=Active reason=session_begin`
+     (**ParkedLive 破壊**、activate 経由なし)
+   - `session_begin window_id=5 source=Book` (**source 誤分類**、動画なのに Book)
+   - `runtime_flags window_id=5 linked=false->true` (**ON モードの independent 剥奪**)
+   - **window 4 (Image) の active session を `session_finish` なしで上書き奪取**
+4. 以後、窓 5 = 「linked Book セッション + 動画 player」の二重人格。fs_idx が動画 (15) と
+   本 (0) で混線し、タイトル交互点滅 + メタデータ待ち固着。
+
+**Phase 0 の見落とし**: main poll 抑止 (`main_poll_video_deferred_to_active_context` は正常
+動作) で pending の abort は防いだが、**throttle → deferred pending の完了経路が
+`open_fullscreen` (presentation 解決 = session/runtime 改変) に到達する**ケースを想定して
+いなかった。fix7 要件 (c)「ParkedLive 維持」違反。
+
+### fix7-2 要件 (P1)
+
+1. **parked メディアの EOF 進行を「parked 完結」経路に隔離する**: EOF ハンドラから
+   source-swap 完了 (throttle → deferred 完了を含む**全経路**) まで、parked bundle 由来の
+   進行では `open_fullscreen` / `prepare_viewer_presentation_open` / session 遷移 /
+   `runtime_flags` 変更 / presentation 解決を**一切呼ばない**。bundle の
+   `items`/`fullscreen_idx`/`fs_cache` 更新 + player source swap のみで完結させる
+   (Phase 0 の代替案「parked 専用の軽量 EOF 進行 helper」の採用)。
+   - parked 由来かの判定は既存事実 (`native_video_parked_live_input_window_id` /
+     pending に焼き込む origin など) から導出。時間窓・新規 App bool 禁止 (憲法 §3/§5)。
+   - **pending に origin を焼き込む場合**は enqueue 時 (parked poll 中) に確定させる
+     (TOCTOU 防止、context epoch と同じ流儀)。
+2. Phase 0 で「同期的に完結する」と見込んだ**音声ファイル EOF (`handle_music_continuous_eof`
+   → `open_fullscreen`) も同じ穴がないか確認**し、presentation 解決に到達するなら同様に
+   隔離する (報告必須)。
+3. 調査報告: 今回 pending を完了させたのが**どの poll 文脈だったか** (parked poll mount 中
+   か、それ以外か) を特定して実装メモに記載する (364.117 の main poll 抑止と 364.166 の
+   実行文脈の関係)。
+4. 回帰テスト (シーケンス):
+   - parked 動画 + 連続再生 ON + **fast-swap が throttle される状況** → EOF → 窓は
+     `ParkedLive` のまま / active session (別窓) 不変 / `linked`/`independent` 不変 /
+     source 誤分類なし / main・active 窓のタイトル文脈不変。
+   - 既存 fix7 テスト (ON 進行 / OFF 停止 / 本文脈不変) は維持。
+5. コミット `(detached-rework stage-audio fix7-2)`。fix6g-2 (× fallback 1 行) を同梱してよい。
+
+### 保留中の実機 FB (fix7-2 の後に対応、未指示)
+
+- 音声モード上 HUD の右側ボタン群と、動画の上 HUD が減光されていない (fix6b の top dim
+  適用範囲もれの疑い、スクリーンショットあり 2026-07-08)。
+- 複数ウィンドウモードで「右クリックで画像が閉じない」「リングショートカット・マウス
+  ジェスチャが機能しない」(fix6f のポインタ配送停止 or 入力経路の対象窓判定の疑い、要調査)。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
