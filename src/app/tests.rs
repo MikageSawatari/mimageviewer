@@ -16980,6 +16980,17 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn assert_rect_close(actual: egui::Rect, expected: egui::Rect) {
+        let eps = 0.001;
+        assert!(
+            (actual.min.x - expected.min.x).abs() < eps
+                && (actual.min.y - expected.min.y).abs() < eps
+                && (actual.max.x - expected.max.x).abs() < eps
+                && (actual.max.y - expected.max.y).abs() < eps,
+            "actual={actual:?} expected={expected:?}"
+        );
+    }
+
     fn push_zip_separator(app: &mut App, label: &str) -> usize {
         app.items.push(GridItem::ZipSeparator {
             dir_display: label.to_owned(),
@@ -18469,6 +18480,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -18513,6 +18529,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -19314,6 +19335,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -19413,6 +19439,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
                     path: PathBuf::from(r"C:\books\a.pdf"),
@@ -19636,6 +19667,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -19877,6 +19913,91 @@ mod still_window_mode_key_tests {
             snapshot.frozen_continuous_pages[0].rect_norm
                 != snapshot.frozen_continuous_pages[1].rect_norm,
             "left/right spread pages must keep separate frozen layout rects"
+        );
+    }
+
+    #[test]
+    fn detached_single_snapshot_rect_matches_live_fit_input() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 80.0,
+            y: 80.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        app.settings.detached_viewer_window_placement = Some(placement);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(70);
+        app.begin_active_detached_session(70, DetachedSource::Image);
+        let idx = push_image(&mut app, r"C:\pics\single-fit.jpg");
+        insert_static_fs_entry(&mut app, &ctx, idx, "single_fit_rect");
+        app.fullscreen_idx = Some(idx);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("single detached viewer should build a snapshot");
+
+        assert_rect_close(
+            snapshot.image_rect_norm,
+            egui::Rect::from_min_max(egui::pos2(0.0, 1.0 / 6.0), egui::pos2(1.0, 5.0 / 6.0)),
+        );
+        assert_eq!(snapshot.image_content_bbox, None);
+    }
+
+    #[test]
+    fn detached_spread_snapshot_rects_match_live_fit_input() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 80.0,
+            y: 80.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        app.settings.spread_page_gap_px = 0;
+        app.settings.detached_viewer_window_placement = Some(placement);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(71);
+        app.begin_active_detached_session(71, DetachedSource::Image);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        let left = push_image(&mut app, r"C:\pics\spread-fit-left.jpg");
+        let right = push_image(&mut app, r"C:\pics\spread-fit-right.jpg");
+        for (idx, label) in [(left, "spread_fit_left"), (right, "spread_fit_right")] {
+            let pixels = egui::ColorImage::new([1, 2], vec![egui::Color32::WHITE; 2]);
+            let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([1, 2]),
+                    load_seq: 0,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(left);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("spread detached viewer should build a snapshot");
+
+        assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
+        assert_rect_close(
+            snapshot.frozen_continuous_pages[0].rect_norm,
+            egui::Rect::from_min_max(egui::pos2(0.0, -1.0 / 6.0), egui::pos2(0.5, 7.0 / 6.0)),
+        );
+        assert_rect_close(
+            snapshot.frozen_continuous_pages[1].rect_norm,
+            egui::Rect::from_min_max(egui::pos2(0.5, -1.0 / 6.0), egui::pos2(1.0, 7.0 / 6.0)),
         );
     }
 
@@ -20574,6 +20695,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21508,6 +21634,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: Some(stamp),
@@ -21593,6 +21724,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21692,6 +21828,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21719,6 +21860,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -21918,6 +22064,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -22016,6 +22167,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -22390,6 +22546,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -22435,6 +22596,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -22623,6 +22789,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -23939,6 +24110,11 @@ mod still_window_mode_key_tests {
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
                 free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: None,
                 reopen_sync_stamp: None,
@@ -24002,6 +24178,8 @@ mod still_window_mode_key_tests {
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
+            image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            image_content_bbox: None,
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: Some(stamp),
@@ -24095,6 +24273,8 @@ mod still_window_mode_key_tests {
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
+            image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            image_content_bbox: None,
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,

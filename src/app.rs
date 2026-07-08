@@ -200,6 +200,8 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
     pub(crate) free_rotation: f32,
+    pub(crate) image_rect_norm: egui::Rect,
+    pub(crate) image_content_bbox: Option<egui::Rect>,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
     pub(crate) reopen_sync_stamp: Option<ViewerSyncStamp>,
@@ -227,8 +229,9 @@ pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) rotation: crate::rotation_db::Rotation,
-    pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
     pub(crate) free_rotation: f32,
+    pub(crate) image_rect_norm: egui::Rect,
+    pub(crate) image_content_bbox: Option<egui::Rect>,
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) apply_initial_placement: bool,
@@ -247,8 +250,9 @@ impl DeferredDetachedImageWindowView {
             location_display: window.location_display.clone(),
             image_dims: window.image_dims,
             rotation: window.rotation,
-            zoom_pan: window.zoom_pan,
             free_rotation: window.free_rotation,
+            image_rect_norm: window.image_rect_norm,
+            image_content_bbox: window.image_content_bbox,
             frozen_continuous_pages: window.frozen_continuous_pages.clone(),
             placement,
             apply_initial_placement,
@@ -338,6 +342,8 @@ impl Clone for DetachedImageWindowSnapshot {
             rotation: self.rotation,
             zoom_pan: self.zoom_pan,
             free_rotation: self.free_rotation,
+            image_rect_norm: self.image_rect_norm,
+            image_content_bbox: self.image_content_bbox,
             frozen_continuous_pages: self.frozen_continuous_pages.clone(),
             reopen_descriptor: self.reopen_descriptor.clone(),
             reopen_sync_stamp: self.reopen_sync_stamp.clone(),
@@ -27532,8 +27538,19 @@ impl App {
             return None;
         };
         let texture_size = texture.size_vec2();
+        let rotation = self.get_rotation(idx);
+        let zoom_pan = self.fs_zoom_pan();
+        let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
         let placement = self.ensure_detached_window_runtime_placement(id, "build_active_snapshot");
+        let (image_rect_norm, image_content_bbox) = self.detached_single_image_snapshot_layout(
+            idx,
+            placement,
+            texture_size,
+            rotation,
+            zoom_pan,
+            free_rotation,
+        );
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, idx, placement))
             .unwrap_or_default();
@@ -27558,9 +27575,11 @@ impl App {
             title: self.detached_image_snapshot_title_for_idx(idx),
             location_display: self.detached_image_snapshot_location_for_idx(idx),
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
-            rotation: self.get_rotation(idx),
-            zoom_pan: self.fs_zoom_pan(),
-            free_rotation: self.fs_free_rotation,
+            rotation,
+            zoom_pan,
+            free_rotation,
+            image_rect_norm,
+            image_content_bbox,
             frozen_continuous_pages,
             reopen_descriptor,
             reopen_sync_stamp,
@@ -27604,6 +27623,8 @@ impl App {
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
             free_rotation: 0.0,
+            image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            image_content_bbox: None,
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,

@@ -1112,6 +1112,90 @@ impl FullscreenFitScaleLimits {
     }
 }
 
+fn fs_image_fit_bbox(
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+    content_bbox: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    content_bbox.filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON)
+}
+
+fn fs_image_draw_rect_for_size(
+    full_rect: egui::Rect,
+    tex_size: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+    zoom_pan: Option<(f32, egui::Vec2)>,
+    free_rotation_rad: f32,
+    fit_mode: FullscreenFitMode,
+    fit_scale_limits: FullscreenFitScaleLimits,
+    content_bbox: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+        return None;
+    }
+    let display_size = match rotation {
+        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+            egui::vec2(tex_size.y, tex_size.x)
+        }
+        _ => tex_size,
+    };
+    let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
+    let bbox_fit = fit_bbox.map(|bbox| {
+        let bbox_w = (bbox.width() * display_size.x).max(1.0);
+        let bbox_h = (bbox.height() * display_size.y).max(1.0);
+        let center_px = egui::vec2(
+            (bbox.center().x - 0.5) * display_size.x,
+            (bbox.center().y - 0.5) * display_size.y,
+        );
+        (bbox_w, bbox_h, center_px)
+    });
+    let page_fit = || (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
+    let (fit_scale, content_center_px) = match (fit_mode, bbox_fit) {
+        (FullscreenFitMode::Width, Some((bbox_w, _, center_px))) => {
+            (full_rect.width() / bbox_w, center_px)
+        }
+        (FullscreenFitMode::Width, None) => (full_rect.width() / display_size.x, egui::Vec2::ZERO),
+        (FullscreenFitMode::Height, Some((_, bbox_h, center_px))) => {
+            (full_rect.height() / bbox_h, center_px)
+        }
+        (FullscreenFitMode::Height, None) => {
+            (full_rect.height() / display_size.y, egui::Vec2::ZERO)
+        }
+        (FullscreenFitMode::Original, Some((_, _, center_px))) => (1.0, center_px),
+        (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
+        (_, Some((bbox_w, bbox_h, center_px))) => (
+            (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h),
+            center_px,
+        ),
+        (_, None) => (page_fit(), egui::Vec2::ZERO),
+    };
+    let fit_scale = fit_scale_limits.apply(fit_scale);
+    let (total_scale, base_center) = match zoom_pan {
+        Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
+        None => (fit_scale, full_rect.center()),
+    };
+    let center = base_center - content_center_px * total_scale;
+    Some(egui::Rect::from_center_size(
+        center,
+        display_size * total_scale,
+    ))
+}
+
+fn fs_image_paint_rect_and_uv(
+    img_rect: egui::Rect,
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+    content_bbox: Option<egui::Rect>,
+) -> (egui::Rect, egui::Rect) {
+    match fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox) {
+        Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
+        None => (
+            img_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        ),
+    }
+}
+
 fn continuous_reading_page_rects(
     unit_rect: egui::Rect,
     size: &ContinuousReadingUnitSize,
@@ -3580,6 +3664,39 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn detached_single_image_snapshot_layout(
+        &mut self,
+        idx: usize,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+        texture_size: egui::Vec2,
+        rotation: crate::rotation_db::Rotation,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        free_rotation: f32,
+    ) -> (egui::Rect, Option<egui::Rect>) {
+        let full_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+        );
+        let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
+        let content_bbox = self.view_trim_single_content_bbox(idx);
+        let draw_rect = fs_image_draw_rect_for_size(
+            image_rect,
+            texture_size,
+            rotation,
+            zoom_pan,
+            free_rotation,
+            self.effective_fullscreen_fit_mode(),
+            self.fullscreen_fit_scale_limits(),
+            content_bbox,
+        )
+        .unwrap_or(image_rect);
+        (
+            Self::normalize_rect_to_full_rect(draw_rect, full_rect),
+            content_bbox,
+        )
+    }
+
+    #[cfg(windows)]
     fn detached_spread_frozen_pages_for_snapshot(
         &mut self,
         idx: usize,
@@ -3638,6 +3755,9 @@ impl App {
         let combined_h = left_size.y.max(right_size.y);
         let left_w = left_size.x * (combined_h / left_size.y);
         let right_w = right_size.x * (combined_h / right_size.y);
+        let fit_mode = self.effective_fullscreen_fit_mode();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let zoom_pan = self.fs_zoom_pan();
         let left_visible_w = (left_bbox.width() * left_w).max(1.0);
         let right_visible_w = (right_bbox.width() * right_w).max(1.0);
         let (fit_w, fit_h, content_center_offset) = if content_active {
@@ -3651,15 +3771,38 @@ impl App {
         } else {
             (left_w + right_w, combined_h, egui::Vec2::ZERO)
         };
-        let fit_scale =
-            ((image_rect.width() - spread_gap).max(1.0) / fit_w).min(image_rect.height() / fit_h);
-        let center = image_rect.center() - content_center_offset * fit_scale;
+        let page_fit = || {
+            ((image_rect.width() - spread_gap).max(1.0) / (left_w + right_w))
+                .min(image_rect.height() / combined_h)
+        };
+        let content_fit = || {
+            ((image_rect.width() - spread_gap).max(1.0) / fit_w).min(image_rect.height() / fit_h)
+        };
+        let fit_scale = match fit_mode {
+            FullscreenFitMode::Width if content_active => {
+                (image_rect.width() - spread_gap).max(1.0) / fit_w
+            }
+            FullscreenFitMode::Width => {
+                (image_rect.width() - spread_gap).max(1.0) / (left_w + right_w)
+            }
+            FullscreenFitMode::Height if content_active => image_rect.height() / fit_h,
+            FullscreenFitMode::Height => image_rect.height() / combined_h,
+            FullscreenFitMode::Original => 1.0,
+            _ if content_active => content_fit(),
+            _ => page_fit(),
+        };
+        let fit_scale = fit_scale_limits.apply(fit_scale);
+        let (total_scale, base_center) = match zoom_pan {
+            Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
+            None => (fit_scale, image_rect.center()),
+        };
+        let center = base_center - content_center_offset * total_scale;
         let rects = layout_spread_page_rects(
             center,
             left_w,
             right_w,
             combined_h,
-            fit_scale,
+            total_scale,
             spread_gap,
             left_bbox,
             right_bbox,
@@ -3682,6 +3825,41 @@ impl App {
                 content_bbox: content_right,
             },
         ]
+    }
+
+    #[cfg(windows)]
+    fn draw_detached_frozen_image_at_rect(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        image_rect: egui::Rect,
+        window: &crate::app::DeferredDetachedImageWindowView,
+    ) {
+        let painter = ui.painter().with_clip_rect(full_rect);
+        let bg_style = FsBgStyle::Default;
+        let (paint_rect, uv_rect) = fs_image_paint_rect_and_uv(
+            image_rect,
+            window.rotation,
+            window.free_rotation,
+            window.image_content_bbox,
+        );
+        if window.rotation.is_none() && window.free_rotation.abs() <= TRANSFORM_EPSILON {
+            paint_transparent_bg(&painter, paint_rect, &bg_style);
+            painter.image(
+                window.texture.id(),
+                paint_rect,
+                uv_rect,
+                egui::Color32::WHITE,
+            );
+        } else {
+            crate::app::draw_rotated_image_ex(
+                &painter,
+                window.texture.id(),
+                image_rect,
+                window.rotation,
+                window.free_rotation,
+                image_rect.center(),
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -3711,24 +3889,8 @@ impl App {
             return;
         }
 
-        Self::draw_fs_image(
-            ui,
-            full_rect,
-            Some(&window.texture),
-            None,
-            false,
-            false,
-            false,
-            window.rotation,
-            window.zoom_pan,
-            window.free_rotation,
-            &FsBgStyle::Default,
-            &window.location_display,
-            false,
-            FullscreenFitMode::Page,
-            FullscreenFitScaleLimits::default(),
-            None,
-        );
+        let image_rect = Self::rect_from_normalized(full_rect, window.image_rect_norm);
+        Self::draw_detached_frozen_image_at_rect(ui, full_rect, image_rect, window);
     }
 
     #[cfg(windows)]
@@ -12654,55 +12816,26 @@ impl App {
                 }
                 _ => tex_size,
             };
-            let fit_bbox = content_bbox
-                .filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON);
-            let bbox_fit = fit_bbox.map(|bbox| {
-                let bbox_w = (bbox.width() * display_size.x).max(1.0);
-                let bbox_h = (bbox.height() * display_size.y).max(1.0);
-                let center_px = egui::vec2(
-                    (bbox.center().x - 0.5) * display_size.x,
-                    (bbox.center().y - 0.5) * display_size.y,
-                );
-                (bbox_w, bbox_h, center_px)
-            });
-            let page_fit =
-                || (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
-            let (fit_scale, content_center_px) = match (fit_mode, bbox_fit) {
-                (FullscreenFitMode::Width, Some((bbox_w, _, center_px))) => {
-                    (full_rect.width() / bbox_w, center_px)
-                }
-                (FullscreenFitMode::Width, None) => {
-                    (full_rect.width() / display_size.x, egui::Vec2::ZERO)
-                }
-                (FullscreenFitMode::Height, Some((_, bbox_h, center_px))) => {
-                    (full_rect.height() / bbox_h, center_px)
-                }
-                (FullscreenFitMode::Height, None) => {
-                    (full_rect.height() / display_size.y, egui::Vec2::ZERO)
-                }
-                (FullscreenFitMode::Original, Some((_, _, center_px))) => (1.0, center_px),
-                (FullscreenFitMode::Original, None) => (1.0, egui::Vec2::ZERO),
-                (_, Some((bbox_w, bbox_h, center_px))) => (
-                    (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h),
-                    center_px,
-                ),
-                (_, None) => (page_fit(), egui::Vec2::ZERO),
+            let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
+            let Some(img_rect) = fs_image_draw_rect_for_size(
+                full_rect,
+                tex_size,
+                rotation,
+                zoom_pan,
+                free_rotation_rad,
+                fit_mode,
+                fit_scale_limits,
+                content_bbox,
+            ) else {
+                return;
             };
-            let fit_scale = fit_scale_limits.apply(fit_scale);
-            let (total_scale, base_center) = match zoom_pan {
-                Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-                None => (fit_scale, full_rect.center()),
+            let total_scale = if display_size.x > 0.0 {
+                img_rect.width() / display_size.x
+            } else {
+                1.0
             };
-            // 中身 bbox の中心をウィンドウ中心へ寄せる (content_center_px=0 なら従来どおり)。
-            let center = base_center - content_center_px * total_scale;
-            let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
-            let (paint_rect, uv_rect) = match fit_bbox {
-                Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
-                None => (
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                ),
-            };
+            let (paint_rect, uv_rect) =
+                fs_image_paint_rect_and_uv(img_rect, rotation, free_rotation_rad, content_bbox);
             let needs_clip = zoom_pan.is_some()
                 || free_rotation_rad.abs() > TRANSFORM_EPSILON
                 || fit_bbox.is_some()
@@ -12727,7 +12860,7 @@ impl App {
                     img_rect,
                     rotation,
                     free_rotation_rad,
-                    center,
+                    img_rect.center(),
                 );
             }
             if fit_bbox.is_none()
@@ -12740,7 +12873,7 @@ impl App {
                     tex_size,
                     rotation,
                     free_rotation_rad,
-                    center,
+                    img_rect.center(),
                     total_scale,
                     ui.ctx().pixels_per_point(),
                 );
