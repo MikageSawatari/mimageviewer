@@ -811,6 +811,89 @@ fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーン�
 - `draw_native_hud_dim_overlay` は top のみを担当し、bottom には使わない。これで上バーと
   下 HUD の両方が dimmed=true に追従しつつ、Area z-order 依存を排除する。
 
+### fix6c-2 / fix6b-2 / fix6d 検収 (Fable 2026-07-08)
+
+- **fix6c-2 (62588a67) = 合格**。案 B どおり `via_wheel` を 3 発火点 (wheel 変換 4264 =
+  true / HUD 前後ボタン 6633・6661 = false) に付与、マッピング 2 箇所素通し、分類は
+  `NavigateItem { via_wheel } → !via_wheel` + `TileColumnsDelta → false`、既存 consumer は
+  `..` で不変。テストあり。
+- **fix6b-2 (a6d8f3e6) = 合格**。bottom を同一 Area 内の in-place dim に変更 (Area z-order
+  依存の排除)、top は従来 overlay。挙動不変。実機でも上下とも減光確認済み。
+- **fix6d (859207bc) = 差し戻し → fix6d-2 (§3.16)**。共有したのは state struct
+  (`MusicChromeViewState`) とアイコン関数のみで、**レイアウト描画は parked 専用の再実装**
+  (`draw_parked_live_music_top_chrome` / `draw_parked_live_music_bottom_hud`) のまま =
+  要件 1「同じ関数を両方から呼ぶ」未達。実機で乖離が残存 (§3.16 ③④)。
+
+## 3.16 実機 FB 第 2 ラウンド (2026-07-08): fix6d-2 (真の単一ソース化) / fix6e (parked raw click passthrough) / fix7 開始
+
+実機 FB 4 件と機構:
+
+- **① HUD の無ボタン領域・時間表示のクリックでアクティブ化しない**。機構確定 (native):
+  raw `MouseButton` の App 転送は `!wants_pointer_input` ゲート
+  ([native_presenter/mod.rs:1393-1395](../src/video/native_presenter/mod.rs)) を通るため、
+  HUD chrome 帯の上では egui overlay がポインタを要求して raw click が**転送されない**。
+  widget に当たれば semantic → fix6c 変換で activation ✓、**dead zone (時間表示・余白) では
+  何も App に届かない** = 報告どおり。→ fix6e。
+- **② 連続再生ボタンの active 青背景が parked で消える (Norm は正常)**。機構確定 (native):
+  parked poll の `video_continuous_mode = Off` 強制 (fix7 未実装の現行仕様) が、poll_video の
+  `player.set_native_continuous_mode(continuous_mode)` ([app.rs:45182](../src/app.rs)) 経由で
+  **HUD 表示にまで漏れる** (Norm は settings 直読みなので無事)。→ **根治 = fix7** (連続
+  再生 ON の尊重で強制自体が消える)。egui パリティ側は render 時の復元値を読むため理論上
+  正しい — 音声窓でも消える場合は fix7 Phase 0 で info 生成経路を確認して報告。
+- **③ 音声モード動画/通常音声とも parked の HUD 項目が active と違う** / **④ シークバーの
+  マーカー縦線が parked で消える** (動画 native は残る)。原因 = fix6d の再実装 (検収記載)。
+  速度表記 (`x1` vs `1.00x`)・Norm/音量の並び・再生ボタンの active 背景解釈・マーカー
+  非描画などが乖離。→ fix6d-2。
+
+### fix6d-2 要件 (差し戻し、egui 側)
+
+1. **レイアウトコードそのものを共有する**: active 音楽ビューの上部バー + 下部 HUD の
+   描画本体を `MusicChromeViewState` + `interactive: bool` を取る関数に**移動**し、active は
+   interactive=true (既存のクリック/ドラッグ/ツールチップ処理をそのまま内包 or 応答 rect を
+   返して呼び出し側処理)、parked は interactive=false + dim で**同じ関数**を呼ぶ。
+   アイコン関数単位の再利用は不可 (fix6d の轍)。
+2. **シークバーのマーカー縦線を共有描画に含める**: marker データ (music bookmarks 等、
+   active 側が描いているもの) を struct に載せる。parked 時に global `music_bookmarks` が
+   parked path のまま有効かを確認し、ズレる場合は bundle から read-only 取得 (取得元を
+   実装メモに明記)。
+3. ボタンの状態背景 (再生/ループ/連続/Norm/ミュート) の導出は active 側の既存解釈を共有
+   (parity 独自の「playing で青」等を持ち込まない — 共有化で自動的に一致する)。
+4. dim は共有関数内の色係数 (interactive=false 時) で行い、fix6b-2 と同じ in-place 方式。
+5. 完了条件: **同一 state を与えた active/parked の描画が dim 以外で画素一致することが
+   「同一関数」により構造的に保証**されていること。
+6. テスト: interactive=false が入力 (ui.interact の click sense) を発生させないこと +
+   既存 chrome state テスト維持。
+7. コミット `(detached-rework stage-audio fix6d-2)`。
+
+### fix6e 要件 (①、native 側 — 短い Phase 0 報告 → 実装)
+
+1. **parked (hud_dimmed) 中は raw `MouseButton` を App へ必ず転送する**:
+   [mod.rs:1393-1395](../src/video/native_presenter/mod.rs) のゲートに hud_dimmed
+   バイパスを追加 (`hud_dimmed || (!wants_pointer_input && !modal_dialog_active)` 相当)。
+   HUD は parked 中 inert (App filter) なので、egui が消費したクリックでも raw を流して
+   よい — 既存の左クリック down/up → activation 経路に乗る。active (dimmed=false) の
+   routing は不変。Phase 0 として影響範囲 (modal gate の扱い / 右クリック / wheel は
+   変えない) を一言報告してから実装。
+   - 注: hud_dimmed は fix6b で「視覚のみ」としたが、parked の inert 状態と同一の事実
+     由来なので、この入力 passthrough への利用は許容する (Fable 判断)。フラグ名/コメントで
+     「parked chrome 状態 (視覚 dim + raw passthrough)」であることを明示する。
+2. ボタンクリックが semantic 変換 (fix6c) と raw click の**二重経路**になるが、既存の
+   activation dedup で 1 回に収束することをテストで固定。
+3. **音声モード parked 窓の確認**: hidden presenter の HUD 入力窓 (hud_window) が生きて
+   egui 音楽ビューへのクリックを奪っていないか確認する。奪っている場合は presenter hide と
+   同時に HUD 入力窓も不活性化 (または同じ passthrough)。結果を実装メモに記載。
+4. コミット `(detached-rework stage-audio fix6e)`。
+
+### fix7 開始 (②の根治を含む)
+
+fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 → 実装**。追加要件:
+
+- parked 中の native HUD 連続再生表示が**ユーザー設定と一致**すること (loop の
+  「HUD は user intent」コメント [app.rs:45180](../src/app.rs) と同じ扱い)。設定 OFF なら
+  従来どおり停止 + 表示 Off。
+- Phase 0 で、egui パリティ chrome の連続再生状態が parked で正しいか (render 時復元値) も
+  確認し、実機で消えていた場合は info 生成経路を報告に含める。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
