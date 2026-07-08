@@ -1113,6 +1113,57 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
 5. コミット `(detached-rework stage-audio fix8)`。fix6f / fix7 と別コミット、着手順は
    fix6f → fix7 → fix8 (同一ファイルの並行編集を避ける)。
 
+### fix6f / fix7 / fix8 検収 (Fable 2026-07-08)
+
+- **fix6f (f4586a18) = 合格 (留保 2 点)**。× は chrome が両モードで描き
+  `music_chrome_close_slot_rect` 単一ソース + parked では close のみ interactive・CloseOnly
+  撤去・rect 相違テストあり。ポインタ配送停止は `push_native_event` 冒頭の suppress +
+  `set_hud_dimmed(true)` 時の PointerGone + 分類テスト。タイルモード top bar dim も追加。
+  留保: (1) **watcher の × hit 判定が legacy rect のまま** (app.rs:1237、指示 1 の未消化。
+  chrome × との不一致は数 px で実害は未発生 → fix6g-c で回収) (2) 実装メモが本 doc に
+  未記載 (fix6g でまとめて可)。
+- **fix7 (872f66b2) = 合格**。`parked_live_media_window_exists()` 導出述語 (新規 bool なし) +
+  `should_poll_main_video_context` 拡張 + Off 強制撤去。承認条件どおり。
+- **fix8 (e9946b01) = 合格**。Row ± ボタン (21308) と Ctrl+ホイール (9454) の両入口が
+  `set_music_timeline_row_secs_from_input` に合流し one-shot flag → 次 timeline 描画で消費、
+  ファイル変更/teardown でクリア、純関数 2 テスト。
+
+## 3.19 実機 FB 第 4 ラウンド (2026-07-08): fix6g = parked ホバーで HUD が出ない / タイトルと Row 30s の重なり
+
+実機 (fix6f/7/8 ビルド): タイル静止表示 OK・× スロット OK・その他改善確認。残 2 件:
+
+- **① 動画 parked 窓でホバーしても (減光された) HUD が出ない**。ユーザー期待 = 非アクティブ
+  でもホバーで dim HUD が出る。機構確定: `hud_visible()` は
+  `pointer_pos.is_some_and(|pos| pos.y >= h - 220)` ([native_presenter/mod.rs:5575-5586](../src/video/native_presenter/mod.rs))
+  で判定するが、fix6f の suppress が dimmed 中 `pointer_pos` を常時 None にする
+  (`clear_overlay_pointer_for_dimmed_hud`) ため **hud_visible が恒久 false**。さらに
+  suppress された MouseMove は `dirty` を立てず再描画も走らない。
+- **② 上部タイトルが Row 30s ステッパー/右ボタン群と重なる** (長いタイトルで発生、
+  active/parked 共通)。機構: `draw_music_top_chrome` の title 描画がクリップなしの
+  `painter.text` で、右側要素 (Row ステッパー・VST 等) の上に伸びる。
+
+### fix6g 要件
+
+1. **(①) HUD 可視性はホバー追従を維持、egui pointer だけ遮断する**: dimmed 中も
+   「可視性判定専用の raw カーソル位置」を更新し (`pointer_pos` とは別フィールド、または
+   suppress 前に可視性入力だけ更新する構造)、`hud_visible()` はそれを参照する。
+   suppress された MouseMove でも HUD の出入りが変わるときは `dirty` を立てて再描画する。
+   MouseLeave で raw 位置をクリア (カーソルが出たら HUD が消える、通常と同じ)。
+   egui への配送停止 (hover 反応なし・タイル静止) は fix6f のまま維持。
+   - 期待挙動: parked 窓にカーソルを乗せると**減光された HUD がフェードイン**し、ボタンは
+     無反応 (クリックは復帰)。カーソルを外すと通常どおり消える。
+2. **(②) タイトルのクリップ**: `draw_music_top_chrome` で title (と「再生中」ラベル) の
+   描画を右側要素の左端 (Row ステッパー群 or 右ボタン群の最左) − マージンでクリップする
+   (`painter.with_clip_rect` / truncate)。共有 chrome なので active/parked 両方で直る。
+3. **(c) watcher × rect の統一 (fix6f 留保の回収)**: parked 音楽窓の watch target に
+   close rect 情報を持たせ、`detached_activation_close_button_contains` (app.rs:1237) が
+   音楽窓では `music_chrome_close_slot_rect` を使うようにする (画像/PDF は従来どおり)。
+   rect 選択のテストを追加。
+4. テスト: ① の可視性判定 (dimmed 中の raw 位置で hud_visible が変わる / egui pointer は
+   None のまま) を純関数レベルで固定。② はクリップ rect 導出の検証。
+5. fix6f/6g の実装メモを本 doc に追記する (fix6f 分の後追い記載も含む)。
+6. コミット `(detached-rework stage-audio fix6g)`。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
@@ -1148,4 +1199,7 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
 10. (fix6f) 動画タイルモード中に park: 上 HUD が減光する / タイルはホバーに反応しない
     (静止表示) / クリックで復帰
 11. (fix8) 音楽ビューで Row − / + を押す → 再生カーソルが常に画面内に見える
+12. (fix6g) 動画 parked 窓にカーソルを乗せる → 減光された HUD がフェードイン (ボタンは
+    無反応、クリックで復帰) / カーソルを外すと消える
+13. (fix6g) 長いタイトルでも Row 30s / 右上ボタン群と重ならない (active / parked 両方)
 6. OFF モード: 音声 F12 の 1 枚 detached が動作
