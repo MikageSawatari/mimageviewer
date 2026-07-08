@@ -375,6 +375,8 @@
 # FsPostFilterPseudoColor4 = none ; ポストフィルタを疑似カラー（4色刷り）にする
 # FsPostFilterPseudoColorSkin = none ; ポストフィルタを疑似カラー（肌色）にする
 # FsPostFilterSharpen = none ; ポストフィルタをシャープ化にする
+# FsPostFilterDownscale2x = none ; ポストフィルタを1/2 縮小（モアレ低減）にする
+# FsPostFilterDownscale4x = none ; ポストフィルタを1/4 縮小（モアレ低減）にする
 # FsAdjustSlot1.1 = Ctrl+1 ; 補正プリセットスロット1を適用する
 # FsAdjustSlot1.2 = Ctrl+Numpad1 ; 補正プリセットスロット1を適用する
 # FsAdjustSlot2.1 = Ctrl+2 ; 補正プリセットスロット2を適用する

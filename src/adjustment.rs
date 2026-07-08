@@ -123,6 +123,10 @@ pub enum PostFilter {
     // ── 実用 ────────────────────────────────────────────────────────
     /// シャープ化 (アンシャープマスク)
     Sharpen,
+    /// 1/2 縮小 (モアレ低減用)
+    Downscale2x,
+    /// 1/4 縮小 (モアレ低減用)
+    Downscale4x,
 }
 
 impl PostFilter {
@@ -176,6 +180,8 @@ impl PostFilter {
         Self::PseudoColorSkin,
         // 実用
         Self::Sharpen,
+        Self::Downscale2x,
+        Self::Downscale4x,
     ];
 
     /// UI 表示用の日本語ラベル。
@@ -221,6 +227,8 @@ impl PostFilter {
             Self::PseudoColor4 => "疑似カラー（4色刷り）",
             Self::PseudoColorSkin => "疑似カラー（肌色）",
             Self::Sharpen => "シャープ化",
+            Self::Downscale2x => "1/2 縮小（モアレ低減）",
+            Self::Downscale4x => "1/4 縮小（モアレ低減）",
         }
     }
 

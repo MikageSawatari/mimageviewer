@@ -145,6 +145,8 @@ const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
         PostFilter::PseudoColorSkin,
     ),
     (KeyAction::FsPostFilterSharpen, PostFilter::Sharpen),
+    (KeyAction::FsPostFilterDownscale2x, PostFilter::Downscale2x),
+    (KeyAction::FsPostFilterDownscale4x, PostFilter::Downscale4x),
 ];
 
 const BOOK_GRID_VIDEO_HINT: &str = "動画は再生中に追加操作を行うと、そのフレームを本へ追加できます";

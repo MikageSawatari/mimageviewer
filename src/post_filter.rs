@@ -63,10 +63,34 @@ pub fn apply(src: &ColorImage, filter: PostFilter) -> ColorImage {
         PostFilter::PseudoColorSkin => pseudocolor::apply_skin(src),
         // ── 実用 ─────────────────────────────────────────────────
         PostFilter::Sharpen => photo::apply_sharpen(src),
+        PostFilter::Downscale2x => downscale(src, 2),
+        PostFilter::Downscale4x => downscale(src, 4),
     }
 }
 
 // ── 共通ユーティリティ ──────────────────────────────────────────
+
+const DOWNSCALE_MIN_LONG_EDGE: usize = 64;
+
+fn downscale(src: &ColorImage, factor: usize) -> ColorImage {
+    let [w, h] = src.size;
+    let factor = factor.max(1);
+    let new_w = (w / factor).max(1);
+    let new_h = (h / factor).max(1);
+    if new_w.max(new_h) < DOWNSCALE_MIN_LONG_EDGE {
+        return src.clone();
+    }
+
+    let src_rgba = image::RgbaImage::from_raw(w as u32, h as u32, src.as_raw().to_vec())
+        .expect("ColorImage raw buffer matches dimensions");
+    let resized = crate::fast_resize::resize_rgba8_exact(
+        &src_rgba,
+        new_w as u32,
+        new_h as u32,
+        crate::fast_resize::Quality::Lanczos3,
+    );
+    ColorImage::from_rgba_premultiplied([new_w, new_h], resized.as_raw())
+}
 
 /// 出力長辺のハードキャップ (CRT 系のメモリ暴走防止)。
 const CRT_OUTPUT_MAX: u32 = 4096;
@@ -1650,6 +1674,29 @@ mod tests {
         let out = apply(&src, PostFilter::Nearest);
         assert_eq!(out.size, src.size);
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn downscale_filters_resize_with_lanczos() {
+        let src = make_test_image(256, 128);
+        let half = apply(&src, PostFilter::Downscale2x);
+        assert_eq!(half.size, [128, 64]);
+
+        let quarter = apply(&src, PostFilter::Downscale4x);
+        assert_eq!(quarter.size, [64, 32]);
+    }
+
+    #[test]
+    fn downscale_filters_keep_tiny_images_original_size() {
+        let src = make_test_image(100, 80);
+        let half = apply(&src, PostFilter::Downscale2x);
+        assert_eq!(half.size, src.size);
+        assert_eq!(half.pixels, src.pixels);
+
+        let larger = make_test_image(200, 120);
+        let quarter = apply(&larger, PostFilter::Downscale4x);
+        assert_eq!(quarter.size, larger.size);
+        assert_eq!(quarter.pixels, larger.pixels);
     }
 
     #[test]

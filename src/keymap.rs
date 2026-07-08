@@ -1424,6 +1424,8 @@ pub enum KeyAction {
     FsPostFilterPseudoColor4,
     FsPostFilterPseudoColorSkin,
     FsPostFilterSharpen,
+    FsPostFilterDownscale2x,
+    FsPostFilterDownscale4x,
     FsAdjustSlot1,
     FsAdjustSlot2,
     FsAdjustSlot3,
@@ -1819,6 +1821,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPostFilterPseudoColor4,
     KeyAction::FsPostFilterPseudoColorSkin,
     KeyAction::FsPostFilterSharpen,
+    KeyAction::FsPostFilterDownscale2x,
+    KeyAction::FsPostFilterDownscale4x,
     KeyAction::FsAdjustSlot1,
     KeyAction::FsAdjustSlot2,
     KeyAction::FsAdjustSlot3,
@@ -3204,6 +3208,8 @@ impl KeyAction {
             FsPostFilterPseudoColor4 => "FsPostFilterPseudoColor4",
             FsPostFilterPseudoColorSkin => "FsPostFilterPseudoColorSkin",
             FsPostFilterSharpen => "FsPostFilterSharpen",
+            FsPostFilterDownscale2x => "FsPostFilterDownscale2x",
+            FsPostFilterDownscale4x => "FsPostFilterDownscale4x",
             FsAdjustSlot1 => "FsAdjustSlot1",
             FsAdjustSlot2 => "FsAdjustSlot2",
             FsAdjustSlot3 => "FsAdjustSlot3",
@@ -3717,6 +3723,8 @@ impl KeyAction {
             FsPostFilterPseudoColor4 => "ポストフィルタを疑似カラー（4色刷り）にする",
             FsPostFilterPseudoColorSkin => "ポストフィルタを疑似カラー（肌色）にする",
             FsPostFilterSharpen => "ポストフィルタをシャープ化にする",
+            FsPostFilterDownscale2x => "ポストフィルタを1/2 縮小（モアレ低減）にする",
+            FsPostFilterDownscale4x => "ポストフィルタを1/4 縮小（モアレ低減）にする",
             FsAdjustSlot1 => "補正プリセットスロット1を適用する",
             FsAdjustSlot2 => "補正プリセットスロット2を適用する",
             FsAdjustSlot3 => "補正プリセットスロット3を適用する",
@@ -4100,6 +4108,8 @@ impl KeyAction {
             | FsPostFilterPseudoColor4
             | FsPostFilterPseudoColorSkin
             | FsPostFilterSharpen
+            | FsPostFilterDownscale2x
+            | FsPostFilterDownscale4x
             | FsAdjustSlot1
             | FsAdjustSlot2
             | FsAdjustSlot3
@@ -4468,6 +4478,8 @@ impl KeyAction {
             | FsPostFilterPseudoColor4
             | FsPostFilterPseudoColorSkin
             | FsPostFilterSharpen
+            | FsPostFilterDownscale2x
+            | FsPostFilterDownscale4x
             | FsAdjustSlot1
             | FsAdjustSlot2
             | FsAdjustSlot3
@@ -4859,7 +4871,9 @@ impl KeyAction {
             | FsPostFilterSketch
             | FsPostFilterPseudoColor4
             | FsPostFilterPseudoColorSkin
-            | FsPostFilterSharpen => ChordList::EMPTY,
+            | FsPostFilterSharpen
+            | FsPostFilterDownscale2x
+            | FsPostFilterDownscale4x => ChordList::EMPTY,
             FsAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
             FsAdjustSlot2 => ctrl_digit_pair(Num2, Numpad2),
             FsAdjustSlot3 => ctrl_digit_pair(Num3, Numpad3),
@@ -7885,6 +7899,8 @@ mod tests {
             KeyAction::FsPostFilterPseudoColor4,
             KeyAction::FsPostFilterPseudoColorSkin,
             KeyAction::FsPostFilterSharpen,
+            KeyAction::FsPostFilterDownscale2x,
+            KeyAction::FsPostFilterDownscale4x,
         ];
 
         for action in actions {

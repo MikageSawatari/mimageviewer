@@ -162,7 +162,11 @@ const POST_FILTER_GROUP_DRAWING: &[PostFilter] = &[
 ];
 const POST_FILTER_GROUP_PSEUDO_COLOR: &[PostFilter] =
     &[PostFilter::PseudoColor4, PostFilter::PseudoColorSkin];
-const POST_FILTER_GROUP_UTILITY: &[PostFilter] = &[PostFilter::Sharpen];
+const POST_FILTER_GROUP_UTILITY: &[PostFilter] = &[
+    PostFilter::Sharpen,
+    PostFilter::Downscale2x,
+    PostFilter::Downscale4x,
+];
 
 const POST_FILTER_GROUPS: &[PostFilterGroup] = &[
     PostFilterGroup {
