@@ -86,6 +86,39 @@ close → descriptor から再作成 → 孤児 HWND 再採用**という往復�
    rect 一致を純関数で固定。
 5. コミット: `(detached-rework findings-19 fix10)` (A と B は別コミット可)。
 
+## Phase 1 調査結果 (Codex 2026-07-08)
+
+### A: active switch の close+reopen 経路
+
+実コード上の active switch は、`activate_detached_image_window_snapshot()` が対象 snapshot を一度取り出したあと、現在の active を `park_and_close_current_active_detached_viewer(ctx)` で退避してから対象を復帰する構造になっている。
+
+ON モードの静止画 legacy active では `active_detached_viewer_context` を持たず、`viewer_session_is_detached()` が真になるため、`park_and_close_current_active_detached_viewer()` の legacy 分岐に落ちる。この分岐は次の順で動く。
+
+1. `preserve_active_detached_image_window_for_main_context_change()` を呼ぶ。
+2. その中で `park_active_detached_image_window()` が snapshot を `detached_image_windows` へ追加し、`handoff_active_detached_viewport_to_passive("main_context_change")` で同じ ViewportId/HWND を Parked 側へ渡す。
+3. 呼び出し元の legacy 分岐へ戻ったあと、直ちに `begin_active_detached_session_close("park_close_legacy_detached")`、`ViewportCommand::Close`、`finish_active_detached_session_close("park_close_legacy_detached")`、`close_fullscreen()`、`remove_detached_window_runtime(window_id, "park_close_legacy_detached")` が走る。
+
+つまり、同じ関数内で「in-place park/handoff に成功した直後に、その viewport/session/runtime を close/remove する」矛盾した遷移になっている。これは `main_context_change` 用の legacy close 経路が、ON モードの independent active switch にも誤って適用されている状態であり、意図した仕様ではなく旧経路の misfire と判断する。
+
+再表示は snapshot 側の復帰情報で補償されている。
+
+- 通常静止画では `reopen_sync_stamp` を使う `resume_still_snapshot` 分岐が `adopt_active_detached_viewport_runtime_from_passive()` と `open_fullscreen(idx)` で同じ window id を復帰しようとする。
+- PDF/ZIP/book 系では `reopen_descriptor` 分岐が passive viewport を close し、descriptor から active detached context を作り直す。
+
+どちらも「close+reopen を正当化する設計」ではなく、先に壊した OS 窓/viewport lifetime を descriptor/stamp で復旧している補償経路である。正しい所有境界は、`pause_current_active_detached_viewer_context()` や `park_current_viewer_context_as_live_media_inner()` と同じく、Parked 化時に `handoff_active_detached_viewport_to_passive(...)` で OS 窓を保持し、close/remove を発生させない経路に寄せるべき。
+
+### B: snapshot rect と live active rect の不一致
+
+静止画 snapshot の描画経路は live active の描画経路と同じ入力を使っていない。
+
+`draw_detached_image_window_snapshot()` の単一画像 snapshot は、passive 側で `draw_fs_image(ui, full_rect, ..., FullscreenFitMode::Page, FullscreenFitScaleLimits::default(), None)` を直接呼ぶ。一方、live active 側の `render_fullscreen_viewport()` は、`fullscreen_media_rect(full_rect, fs_idx, is_video)` で seek panel 領域などを除外した `image_rect` を作り、`effective_fullscreen_fit_mode()`、`fullscreen_fit_scale_limits()`、content bbox/trim、zoom/pan/free-rotation などを含む live state で描画する。
+
+そのため、passive snapshot で見えていた画像が active 復帰時に live 描画へ切り替わると、同じ window placement でも fit 入力が数 px 単位で変わり得る。これが「active 切替のたびに画像が少し動く」直接候補である。
+
+見開き/連続表示 snapshot は `detached_spread_frozen_pages_for_snapshot()` / `detached_continuous_frozen_pages_for_snapshot()` で `fullscreen_media_rect(...)` から page rect を正規化しており、単一画像 snapshot より live 経路に近い。ただし snapshot 作成時の placement size と復帰後の実 `full_rect` が違う場合、または seek panel / fit state が変化した場合は同様にズレる余地が残る。
+
+Phase 2 では、A を先に in-place park/handoff へ直し、OS 窓の close+reopen を消したうえで、B は snapshot 側にも live と同じ rect/fit 入力を使わせる、または snapshot に live 描画で使った normalized image/page rect を保存して復帰前後で同一 rect を描く方向で修正するのがよい。回帰テストは、A は repeated active switch で window id/HWND runtime が close/remove されないこと、B は snapshot rect と live rect の純関数比較を固定する。
+
 ## 参考: ログ抽出
 
 ```powershell
