@@ -1461,6 +1461,42 @@ parked EOF 進行 = 動画→次ファイル / 動画の音声モード / 音声
   - 方針 3 だった場合 (実は Parked/deferred 窓だった) は挙動変更なし = 「クリック復帰後に
     右クリック操作」が仕様であることをユーザーに説明して確認する。
 
+### fix9 probe 実機ログ解析 → 真因確定 (Fable 2026-07-08): 共有 flick 状態の誤 cancel — fix9 実装指示
+
+**probe 結果 (scratchpad/fix9-cur.log、18 発火)**: すべて `window_state=Active` /
+`focused=true` / `foreground_matches=true` / `secondary_pressed/released` 正常到達 /
+`gate=ok` / `context=ImageFullscreen` / `mode=RingShortcut` — **候補 (a)(b)(c) は全否定**。
+block 到達 + 入力正常なのに close/リングが出ない = ハンドラ後段の問題。
+
+**真因 (コード照合で確定)**: リング/ジェスチャの状態 (`mouse_ring_flick` /
+`mouse_gesture`) は App 共有で、root (グリッド) pass が毎フレーム
+`update_grid_mouse_ring_flick` ([ui_main.rs:9436](../src/ui_main.rs)) →
+`update_mouse_ring_flick(root_ctx, Grid)` を回す。stale 判定の保護
+([gamepad_input.rs:491-506](../src/app/gamepad_input.rs)) は
+「`existing.context == current_ring_shortcut_context()` なら温存」だが、
+`current_ring_shortcut_context()` ([gamepad_input.rs:3734](../src/app/gamepad_input.rs)) は
+**root の `self.fullscreen_idx`** から導出する。ON モードでは active detached の bundle が
+root pass 中 swap-out されて `fullscreen_idx=None` → **Grid を返す** → 保護不成立 →
+`cancel_mouse_ring_flick()` が **detached の flick を press 直後に毎フレーム破壊** →
+release 時に state がなく ShortTap (close) / リング / ジェスチャすべて不発。
+非 detached F11 では fullscreen_idx が見えるため保護が効く (だから今まで顕在化しなかった)。
+findings-6/12/17 と同族の「bundle 外グローバル導出が root pass で別の顔になる」問題。
+
+**fix9 実装要件 (承認済み)**:
+
+1. **Grid updater は他 context の flick/gesture に触らない**: `update_mouse_ring_flick` /
+   `update_mouse_gesture` の context 不一致分岐を「常に `None` を返して温存」に変える
+   (`current_ring_shortcut_context()` による stale 判定 cancel を撤去)。
+2. **stale 掃除は所有サーフェスの終端イベントで明示的に行う**: fullscreen close /
+   detached 窓 close・park の既存 cleanup 経路で `cancel_mouse_ring_flick` /
+   `cancel_mouse_gesture` が呼ばれているかを確認し、漏れていれば追加 (時間窓や
+   ヒューリスティック判定は禁止、憲法 §5)。
+3. probe 計装 (`right_drag_probe`) は debug ゲート内なので残置してよい。
+4. テスト: 「ImageFullscreen context の flick が存在する状態で Grid updater を回しても
+   温存される」+「close/park cleanup で flick が掃除される」。実機確認は ON モード
+   静止画窓で 右クリック close / リング / ジェスチャ の 3 点。
+5. コミット `(detached-rework stage-audio fix9)`。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
