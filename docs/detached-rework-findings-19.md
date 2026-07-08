@@ -561,3 +561,73 @@ fix13-2 (06eb05d8 = paint_rect_norm + uv_rect 焼き込み、指示どおりの�
 - テストは `detached_spread_snapshot_preserves_trim_uv_and_background` で「full page rect は重なるが
   clip は重ならない」ことを固定し、`spread_page_horizontal_visible_clip_keeps_vertical_page_pixels`
   で y 方向を crop しないことを純関数で固定した。
+
+### fix13-4 検収 (Fable 2026-07-09)
+
+f6d07f19 を diff 検収。clip_rect_norm 焼き込み + `with_clip_rect` 復元、x 範囲のみ
+(y はフルページ温存)、`image_rect` intersect、continuous は clip=paint の no-op、
+計装追記残置、重なり非上書きテスト + 純関数テスト — 指示 5 項目すべて充足。憲法違反なし。
+実機: 白被り解消をユーザー確認済み。**fix13 系クローズ**。
+
+---
+
+## fix14: 自動トリム PDF の detached 窓が動画 open 後にトリムなし表示へ退化する
+
+### 症状 (ユーザー実機 2026-07-09)
+
+自動トリム有効の PDF 見開きを detached image window で表示 → グリッドから動画を
+別ウィンドウで開く → PDF 窓の表示が**トリムなし (余白付き) に変わる**ことがある。
+窓をアクティブにして自動トリムを設定し直すと以後は正しく表示される。
+
+### 機構 (ログで確定、推測ではない)
+
+`view_trim_apply_mode` (App 状態 / view_trim.db とも) は **Auto のまま変わっていない**。
+「設定が解除された」のではなく、**表示だけが bbox 供給断でトリムなしへ退化**している。
+
+- 自動トリムの content bbox は `cached_margin_bbox(idx)`
+  ([src/ui_fullscreen.rs:12890](../src/ui_fullscreen.rs)) で得るが、これは
+  **`fs_cache` (メイン fullscreen のページ pixel cache) に decoded pixels が
+  ある間だけ** 計算できる。fs_cache miss なら `None` を返し、bbox cache entry も
+  その場で削除する。
+- detached 窓の live spread レイアウトは毎フレーム
+  `view_trim_spread_content_bboxes` → (Auto) → `cached_margin_bbox` を呼ぶ
+  ([src/ui_fullscreen.rs:16227](../src/ui_fullscreen.rs) ほか)。
+- 動画を別窓で開くとメイン fullscreen 文脈が動画 idx へ移り、PDF ページの
+  fs_cache が page-based eviction で追い出される → detached 窓の bbox が None →
+  `layout_spread_page_rects` が**トリムなしレイアウト**で組む → park bake は
+  その退化済み live 値を忠実に焼くので、以後トリムなしで固定表示。
+- ログ証拠 (scratchpad/trim-bug-cur.log): 動画 open と同フレームの
+  `frozen_page_bake` (38.177s window 1 / 90.416s window 4) が
+  **`content_bbox=none` + paint 重なりなし** (= トリムなしレイアウト)。
+  ユーザーが再設定した後 (52.303s 以降) は content_bbox あり + 正しい clip。
+  「再設定で直る」のは、窓アクティブ化で PDF ページが fs_cache に再ロードされ
+  bbox が再計算できるようになるため (設定操作自体は本質ではない)。
+
+### 壊れた前提 (BA 分類)
+
+detached image window の表示 (自動トリムレイアウト) が、**メイン fullscreen の
+ページキャッシュ (`fs_cache`) を暗黙共有**している。独立窓はテクスチャを自前で
+持つのに、トリム bbox だけ毎フレーム fs_cache の pixels から再計算しており、
+メイン側のナビ / 動画 open による evict が独立窓の見た目を変えてしまう。
+
+### 修正指示 (park 時焼き込み原則の一般化 = 「表示確定時焼き込み」)
+
+1. detached image window が表示に使う **per-page content bbox を、表示を確定した
+   時点 (窓 open / 窓内ページナビ / trim 設定変更) で窓 runtime に焼き込み**、
+   以降 fs_cache の状態に依存しない。
+   - 保持先は `DetachedWindowRuntime` (still 側) の表示状態。App に新規フィールドを
+     足さない (憲法 3)。表示中ページ分だけでよい (idx→bbox の小マップ or ペア)。
+   - detached 窓向けの bbox 解決を「runtime 焼き込み値を優先、初回のみ
+     `cached_margin_bbox` で計算して焼き込む」にする。**メイン fullscreen 経路の
+     解決順は変えない** (スコープ外を触らない、憲法 7)。
+2. live 描画と park bake が**同じ焼き込み値**を使うこと (bake 時だけ補う症状
+   パッチにしない、憲法 6)。
+3. 計装: 焼き込み時に `detached_trim_bbox_bake window_id= idx= bbox=` 形式で
+   1 行ログ (残置可)。bbox 解決が fallback (焼き込み無し→再計算) した場合も
+   ログに出す。
+4. テスト: 表示確定後に fs_cache から該当 idx を除去しても、detached spread
+   レイアウト (paint rect) が変わらないことを固定する unit テスト。
+5. 実機確認: (i) 自動トリム PDF を detached 窓表示 → 動画別窓 open → PDF 窓が
+   トリムあり表示のまま (park/live/再アクティブ化とも) (ii) 窓内ページめくり後も
+   トリム維持 (iii) メイン fullscreen 側の自動トリム挙動に退行なし。
+6. コミット `(detached-rework findings-19 fix14)`。
