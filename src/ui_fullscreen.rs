@@ -3639,12 +3639,12 @@ impl App {
                     self.vertical_reading_cached_processed_texture(page.idx)
                         .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                 }?;
+                let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
                 Some(crate::app::DetachedImageWindowFrozenPage {
                     texture,
-                    rect_norm: Self::normalize_rect_to_full_rect(page.rect, full_rect),
+                    paint_rect_norm: rect_norm,
+                    uv_rect: Self::full_uv_rect(),
                     rotation: self.get_rotation(page.idx),
-                    location_display: self.location_display_for_loading(page.idx),
-                    content_bbox: page.content_bbox,
                     background: background.clone(),
                 })
             })
@@ -3812,25 +3812,30 @@ impl App {
             content_active,
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
+        let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
+        let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
 
         vec![
             crate::app::DetachedImageWindowFrozenPage {
                 texture: left_texture,
-                rect_norm: Self::normalize_rect_to_full_rect(rects.left_rect, full_rect),
+                paint_rect_norm: left_rect_norm,
+                uv_rect: Self::full_uv_rect(),
                 rotation: left_rot,
-                location_display: self.location_display_for_loading(left),
-                content_bbox: content_left,
                 background: background.clone(),
             },
             crate::app::DetachedImageWindowFrozenPage {
                 texture: right_texture,
-                rect_norm: Self::normalize_rect_to_full_rect(rects.right_rect, full_rect),
+                paint_rect_norm: right_rect_norm,
+                uv_rect: Self::full_uv_rect(),
                 rotation: right_rot,
-                location_display: self.location_display_for_loading(right),
-                content_bbox: content_right,
                 background,
             },
         ]
+    }
+
+    #[cfg(windows)]
+    fn full_uv_rect() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
     }
 
     #[cfg(windows)]
@@ -3910,20 +3915,24 @@ impl App {
         if !window.frozen_continuous_pages.is_empty() {
             let painter = ui.painter().with_clip_rect(full_rect);
             for page in &window.frozen_continuous_pages {
-                let rect = Self::rect_from_normalized(full_rect, page.rect_norm);
+                let paint_rect = Self::rect_from_normalized(full_rect, page.paint_rect_norm);
                 let bg_style = Self::detached_frozen_background_style(&page.background);
-                Self::draw_fs_spread_page(
-                    &painter,
-                    rect,
-                    0,
-                    page.rotation,
-                    &[],
-                    &bg_style,
-                    &page.location_display,
-                    None,
-                    Some(&page.texture),
-                    page.content_bbox,
-                );
+                if page.rotation.is_none() {
+                    paint_transparent_bg(&painter, paint_rect, &bg_style);
+                    painter.image(
+                        page.texture.id(),
+                        paint_rect,
+                        page.uv_rect,
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    crate::app::draw_rotated_image(
+                        &painter,
+                        page.texture.id(),
+                        paint_rect,
+                        page.rotation,
+                    );
+                }
             }
             return;
         }

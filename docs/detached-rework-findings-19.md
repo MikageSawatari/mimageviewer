@@ -446,3 +446,20 @@ fix13 (背景焼き込み) 後も実機 NG (同スクリーンショット)。�
 5. 実機再確認 (ユーザー): 同じ再現手順 (見開き + 自動トリム + 動画側アクティブ化) で
    白余白のまま揃って見えること。
 6. コミット `(detached-rework findings-19 fix13-2)`。
+
+### fix13-2 実装メモ (Codex 2026-07-08)
+
+- `DetachedImageWindowFrozenPage` に `paint_rect_norm` と `uv_rect` を追加し、park 時に
+  frozen page の最終描画入力を焼き込むようにした。見開き / continuous とも、
+  live layout が決めた page rect を `paint_rect_norm` として保存し、UV は全面
+  (`0..1`) を保存する。
+- passive 描画は `draw_fs_spread_page` を通さず、snapshot の
+  `paint_rect_norm` / `uv_rect` / `background` から `painter.image(...)` を直接呼ぶ。
+  これにより `fit_display_size_in_rect` の再フィットと `content_bbox` の再 crop が
+  frozen 経路から消え、ページ自身の白余白ピクセルを live と同じ矩形で描ける。
+- fix13 の `DetachedImageWindowFrozenBackground` は温存。透過画像や背景モードが
+  関係するケースでも、現在のメイン context を再解釈せず park 時の背景を使う。
+- `location_display` は frozen page direct paint では読込中 fallback を描かないため
+  DTO から削除した。
+- テストは既存 fix13 の 2 本を強化し、見開き/continuous の `paint_rect_norm` が
+  park 時の live layout を保持することと、`uv_rect == full_uv` を固定した。

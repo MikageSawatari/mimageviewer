@@ -19952,6 +19952,10 @@ mod still_window_mode_key_tests {
         );
         for page in &snapshot.frozen_continuous_pages {
             assert_frozen_background_white(&page.background);
+            assert_rect_close(
+                page.uv_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            );
         }
     }
 
@@ -19999,8 +20003,8 @@ mod still_window_mode_key_tests {
             "spread passive windows must freeze both visible pages"
         );
         assert!(
-            snapshot.frozen_continuous_pages[0].rect_norm
-                != snapshot.frozen_continuous_pages[1].rect_norm,
+            snapshot.frozen_continuous_pages[0].paint_rect_norm
+                != snapshot.frozen_continuous_pages[1].paint_rect_norm,
             "left/right spread pages must keep separate frozen layout rects"
         );
     }
@@ -20081,11 +20085,11 @@ mod still_window_mode_key_tests {
 
         assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
         assert_rect_close(
-            snapshot.frozen_continuous_pages[0].rect_norm,
+            snapshot.frozen_continuous_pages[0].paint_rect_norm,
             egui::Rect::from_min_max(egui::pos2(0.0, -1.0 / 6.0), egui::pos2(0.5, 7.0 / 6.0)),
         );
         assert_rect_close(
-            snapshot.frozen_continuous_pages[1].rect_norm,
+            snapshot.frozen_continuous_pages[1].paint_rect_norm,
             egui::Rect::from_min_max(egui::pos2(0.5, -1.0 / 6.0), egui::pos2(1.0, 7.0 / 6.0)),
         );
     }
@@ -20149,15 +20153,19 @@ mod still_window_mode_key_tests {
         assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
         let left_page = &snapshot.frozen_continuous_pages[0];
         let right_page = &snapshot.frozen_continuous_pages[1];
-        let left_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.1), egui::pos2(0.8, 0.9));
-        let right_bbox = egui::Rect::from_min_max(egui::pos2(0.2, 0.0), egui::pos2(1.0, 0.8));
-        assert_eq!(left_page.content_bbox, Some(left_bbox));
-        assert_eq!(right_page.content_bbox, Some(right_bbox));
         assert_frozen_background_white(&left_page.background);
         assert_frozen_background_white(&right_page.background);
+        assert_rect_close(
+            left_page.uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        );
+        assert_rect_close(
+            right_page.uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        );
 
         assert!(
-            left_page.rect_norm.right() > right_page.rect_norm.left(),
+            left_page.paint_rect_norm.right() > right_page.paint_rect_norm.left(),
             "frozen page rects must keep the hidden inner trim margins behind the cropped UVs"
         );
     }

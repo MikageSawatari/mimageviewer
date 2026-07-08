@@ -215,10 +215,9 @@ pub(crate) struct DetachedImageWindowSnapshot {
 #[derive(Clone)]
 pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) texture: egui::TextureHandle,
-    pub(crate) rect_norm: egui::Rect,
+    pub(crate) paint_rect_norm: egui::Rect,
+    pub(crate) uv_rect: egui::Rect,
     pub(crate) rotation: crate::rotation_db::Rotation,
-    pub(crate) location_display: String,
-    pub(crate) content_bbox: Option<egui::Rect>,
     pub(crate) background: DetachedImageWindowFrozenBackground,
 }
 
