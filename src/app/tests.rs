@@ -10652,6 +10652,72 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn viewer_context_bundle_preserves_flat_stack_state() {
+        use crate::filename_stack::{StackMember, StackView};
+
+        let mut app = setup_app();
+        let dir = PathBuf::from(r"C:\stack");
+        let stack_view = StackView::build(
+            dir.clone(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                StackMember {
+                    path: dir.join("post_0.jpg"),
+                    mtime: 0,
+                    size: 1,
+                    is_video: false,
+                },
+                StackMember {
+                    path: dir.join("post_1.jpg"),
+                    mtime: 0,
+                    size: 1,
+                    is_video: false,
+                },
+                StackMember {
+                    path: dir.join("solo.jpg"),
+                    mtime: 0,
+                    size: 1,
+                    is_video: false,
+                },
+            ],
+            '_',
+            crate::settings::SortOrder::FileName,
+        );
+        let (items, _metas) = stack_view.materialize_flat();
+        app.current_folder = Some(dir);
+        app.items = items;
+        app.stack_mode_requested = true;
+        app.stack_view = Some(stack_view);
+        app.stack_showing_flat = true;
+        app.stack_active_rule = Some("テストルール".to_string());
+        app.stack_script_error = Some("テストエラー".to_string());
+        app.stack_toggle_select_path = Some(PathBuf::from(r"C:\stack\post_0.jpg"));
+
+        let mut bundle = app.take_current_viewer_context_bundle();
+        app.stack_mode_requested = false;
+        app.stack_view = None;
+        app.stack_showing_flat = false;
+        app.stack_active_rule = None;
+        app.stack_script_error = None;
+        app.stack_toggle_select_path = None;
+
+        app.swap_viewer_context_bundle(&mut bundle);
+
+        assert!(app.stack_mode_requested);
+        assert!(app.stack_showing_flat);
+        assert_eq!(app.stack_active_rule.as_deref(), Some("テストルール"));
+        assert_eq!(app.stack_script_error.as_deref(), Some("テストエラー"));
+        assert_eq!(
+            app.stack_toggle_select_path,
+            Some(PathBuf::from(r"C:\stack\post_0.jpg"))
+        );
+        let restored_stack_view = app.stack_view.as_ref().expect("stack view restored");
+        assert_eq!(restored_stack_view.groups.len(), 2);
+        assert_eq!(restored_stack_view.stack_jump_target(0, true), Some(2));
+    }
+
+    #[test]
     fn restored_viewer_context_clears_stale_thumbnail_request_markers_and_requeues() {
         use crate::grid_item::GridItem;
         use std::sync::{Arc, Condvar, Mutex};

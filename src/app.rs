@@ -1993,6 +1993,12 @@ struct ViewerContextBundle {
     current_folder: Option<PathBuf>,
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
+    stack_mode_requested: bool,
+    stack_view: Option<crate::filename_stack::StackView>,
+    stack_showing_flat: bool,
+    stack_active_rule: Option<String>,
+    stack_script_error: Option<String>,
+    stack_toggle_select_path: Option<PathBuf>,
     items: Vec<GridItem>,
     thumbnails: Vec<ThumbnailState>,
     image_metas: Vec<Option<(i64, i64)>>,
@@ -2170,6 +2176,12 @@ impl ViewerContextBundle {
             current_folder: None,
             archive_source_override: None,
             zip_nav: None,
+            stack_mode_requested: false,
+            stack_view: None,
+            stack_showing_flat: false,
+            stack_active_rule: None,
+            stack_script_error: None,
+            stack_toggle_select_path: None,
             items: Vec::new(),
             thumbnails: Vec::new(),
             image_metas: Vec::new(),
@@ -10403,6 +10415,12 @@ impl App {
             current_folder,
             archive_source_override,
             zip_nav,
+            stack_mode_requested,
+            stack_view,
+            stack_showing_flat,
+            stack_active_rule,
+            stack_script_error,
+            stack_toggle_select_path,
             items,
             thumbnails,
             image_metas,
@@ -10555,6 +10573,12 @@ impl App {
         swap_field!(current_folder);
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
+        swap_field!(stack_mode_requested);
+        swap_field!(stack_view);
+        swap_field!(stack_showing_flat);
+        swap_field!(stack_active_rule);
+        swap_field!(stack_script_error);
+        swap_field!(stack_toggle_select_path);
         swap_field!(items);
         swap_field!(thumbnails);
         swap_field!(image_metas);
@@ -27648,6 +27672,12 @@ impl App {
         bundle.address = self.address.clone();
         bundle.archive_source_override = self.archive_source_override.clone();
         bundle.zip_nav = self.zip_nav.clone();
+        bundle.stack_mode_requested = self.stack_mode_requested;
+        bundle.stack_view = self.stack_view.clone();
+        bundle.stack_showing_flat = self.stack_showing_flat;
+        bundle.stack_active_rule = self.stack_active_rule.clone();
+        bundle.stack_script_error = self.stack_script_error.clone();
+        bundle.stack_toggle_select_path = self.stack_toggle_select_path.clone();
         bundle.items_generation = self.items_generation;
         bundle.auto_aspect = self.auto_aspect.clone();
         bundle.items_are_global_search_view = self.items_are_global_search_view;
