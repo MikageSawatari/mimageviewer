@@ -1014,6 +1014,79 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
      されず、parked bundle mount 中に処理されること (少なくとも main poll 抑止述語を固定)。
    - native HUD / egui chrome の continuous 表示がユーザー設定と一致すること。
 
+### fix6d-2 / fix6e 検収 + fix7 Phase 0 承認 (Fable 2026-07-08)
+
+- **fix6d-2 (16061659) = 合格**。`draw_music_top_chrome` / `draw_music_bottom_hud` を active
+  (21263/21291) と parked (4083/4148) の両方が呼ぶ真の単一ソース化 (正味 −258 行)。
+  `MusicChromeViewState` に `bookmark_secs` / `bookmarks_loaded` を含めマーカー縦線も共有、
+  dim は `music_chrome_dim_color`、入力は `music_chrome_click_sense` (interactive=false は
+  `Sense::hover`) でテスト固定。ただし parked の `show_close: false` が右端スロットを詰めて
+  しまい、CloseOnly × と window toggle の重なり + ボタン位置ずれを生んだ (実機 FB、
+  §3.17 fix6f-a で修正)。
+- **fix6e (fde0571e) = 合格**。routing gate に `hud_dimmed` バイパス (MouseButton のみ、
+  wheel/move は不変) + routing テスト + dedup テスト。
+- **fix7 Phase 0 = 承認 (実装案 1)**。`main 側 poll 抑止 + Off 強制撤去` を条件付きで承認
+  (§3.17 fix7 実装条件)。
+
+## 3.17 実機 FB 第 3 ラウンド (2026-07-08): fix6f (× スロット / タイルモード) + fix7 実装
+
+実機 FB と機構:
+
+- **① 動画 native HUD の連続再生 active 表示が減光時に消える (継続)**: 既知 (§3.16 ②)。
+  parked poll の Off 強制が `set_native_continuous_mode` で HUD 表示に漏れる。
+  **fix7 実装で解消する** (Off 強制撤去)。fix6f では触らない。
+- **② parked の × が window toggle (F11) ボタンと重なり、ボタン位置が active とずれる**
+  (音声モード動画 / 音声ファイル両方): fix6d-2 の `show_close: false` が close スロットを
+  詰めるため、chrome の右端に window toggle が来て、44px バー座標の CloseOnly × と重なる。
+- **③ タイルモード (サムネイルタイル表示) 中に park**: (b1) 上 HUD が減光されない。
+  (b2) タイル一覧が非アクティブでもホバー反応する。
+  **ユーザー決定 (Fable 提案 2026-07-08): タイルは非表示にせず「静止表示」にする** —
+  parked (hud_dimmed) 中は overlay egui へのポインタ配送を止め、ホバー反応を殺す。
+  クリックは fix6e の raw passthrough で復帰。音楽タイムラインの非表示はフォールバック
+  ちらつきの構造対策であってタイルには当てはまらない。見た目の文脈が保たれ実装も最小。
+
+### fix6f 要件
+
+1. **(②) × スロットの単一ソース化**: `draw_music_top_chrome` は parked でも close スロットを
+   **予約**し (レイアウトが active と画素一致)、× ボタンをそのスロットに置く。実装は
+   どちらでも可 (推奨 = chrome が × を描き、parked では × だけ interactive
+   [唯一の例外、クリックは既存の close 経路へ]。代替 = スロット rect を返す helper +
+   CloseOnly ボタンをその rect に配置)。いずれも:
+   - スロット rect は共有 helper (`music_chrome_close_slot_rect` 等) から導出し、
+     **watcher の × hit 判定も音楽窓ではこの rect を使う** (画像/PDF passive は従来の
+     `detached_image_window_bar_close_button_rect` のまま)。rect 不一致だと「window toggle を
+     クリックすると watcher が close する」誤爆になるため、テストで rect 一致を固定する。
+   - × クリックは close (activation ではない)。既存の close 優先処理は不変。
+2. **(③-b2) parked 中の overlay ポインタ配送停止**: `hud_dimmed` 中は overlay egui に
+   pointer move / hover を流さない (PointerGone 等)。ボタン hover・タイル hover・seek hover
+   サムネイルが全て静止する。クリックは raw passthrough (fix6e) で復帰、wheel は従来どおり
+   inert。タイル一覧・HUD の**表示自体は維持** (非表示化しない)。
+   - 実装位置は overlay への event 配送 (`push_native_event` / pending_events) か egui input
+     構築のどちらでもよいが、hud_dimmed=false への復帰で即座に通常配送へ戻ること。
+3. **(③-b1) タイルモードの上 HUD 減光**: タイル表示中の top bar が dim を通らない経路を
+   特定して減光を適用 (`draw_native_hud_dim_overlay` の gate / タイルモード専用 chrome の
+   どちらかにあるはず)。
+4. テスト: × スロット rect の一致 (chrome / close ボタン / watcher) + hud_dimmed 中は
+   overlay egui にポインタが渡らないこと (routing/配送の純関数レベルで可)。
+5. コミット `(detached-rework stage-audio fix6f)`。
+
+### fix7 実装条件 (Phase 0 承認、Fable 2026-07-08)
+
+実装案 1 (main 側 poll 抑止 + Off 強制撤去) を承認する。条件:
+
+1. 抑止述語は既存 runtime / snapshot からの導出のみ (新規 App bool 禁止、Codex 案どおり)。
+2. **安全条件 = メディア窓 1 本規則の構造保証をテストで固定**: 「ParkedLive media 窓が
+   存在する間に main 文脈で動画/音声の再生を開始すると、parked 窓が close/差し替えられる
+   (= main 再生と parked 窓が共存しない)」。既存テストがあれば参照を実装メモに記載、
+   なければ追加する。この不変条件が main poll 抑止の前提 (main に生きた player がいる状態で
+   poll を止めると main が固まるため)。
+3. main poll 抑止中も presenter イベント drain が滞らないこと (parked poll の `poll_video` が
+   毎フレーム走ることを確認)。
+4. EOF の次メディア選択は parked bundle の items (メディア窓自身のフォルダの表示順)。
+5. Phase 0 の回帰テスト 4 本 (連続 ON 進行 + 本文脈不変 / OFF 停止 / pending が parked
+   mount 中に処理 / HUD・chrome の連続再生表示一致) を実装。
+6. コミット `(detached-rework stage-audio fix7)`。fix6f と別コミット。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
@@ -1041,5 +1114,11 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
    HUD 外クリックでもアクティブ化する / **parked 窓上のホイールではアクティブ化しない**
    (fix6c-2)
 8. (fix7) 本をアクティブにしたまま parked 音声/動画: 連続再生 ON で末尾 → 次へ自動進行 /
-   連続再生 OFF → 停止 / どちらでもメイン (本) の一覧・フォルダが無傷
+   連続再生 OFF → 停止 / どちらでもメイン (本) の一覧・フォルダが無傷 / **parked 中の
+   連続再生ボタン表示がユーザー設定と一致** (青背景が消えない)
+9. (fix6f) parked 音楽窓の × が右端スロットに収まり window toggle と重ならない / ボタン
+   位置が active と一致 / × クリックで close (アクティブ化しない) / window toggle 位置の
+   クリックで close 誤爆しない
+10. (fix6f) 動画タイルモード中に park: 上 HUD が減光する / タイルはホバーに反応しない
+    (静止表示) / クリックで復帰
 6. OFF モード: 音声 F12 の 1 枚 detached が動作
