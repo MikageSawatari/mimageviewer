@@ -162,3 +162,28 @@ Phase 1 の判断 (A = legacy close 経路の誤発火、B = snapshot/live の f
    placement size 変化時のズレ余地を含めて検証)。
 3. テスト: snapshot rect と live rect の一致を純関数で固定 (単一画像 + 見開きの 2 ケース)。
 4. 実機確認: W2 (アクティブ化の瞬間に画像が動かない)。
+
+## fix10a / fix10b 検収合格 (Fable 2026-07-08)
+
+- **fix10a (2759c4e3) = 合格**。`park_current_active_detached_viewer` の legacy 分岐冒頭で
+  `preserve_active_detached_image_window_for_main_context_change()` 成功時に即 return =
+  handoff 後の close/remove 一式が発生しない。preserve のゲート
+  (`should_preserve_...` = `detached_viewer_open_images_in_window` 設定 + still 対応 idx +
+  fs_nav 非ロック) により **OFF (linked) は従来どおり close_legacy_detached に落ちる** =
+  条件 2 充足 (既存事実で分岐、新規 bool なし)。handoff 後に
+  `transition_detached_window_state(Parked, "main_context_change_handoff")` で状態機械も整合。
+  テスト = 切替後に旧窓が同 id で Parked・HWND 生存 (0x2222)・host_generation 不変。
+- **fix10b (adf65c62) = 合格**。**推奨案 (park 時に live の normalized rect を保存) を採用**:
+  `detached_single_image_snapshot_layout` が live 入力 (`fullscreen_media_rect` /
+  `effective_fullscreen_fit_mode` / `fullscreen_fit_scale_limits` / content bbox /
+  rotation / zoom_pan / free_rotation) から draw rect を計算して `image_rect_norm` +
+  `image_content_bbox` を snapshot に焼き込み、passive は
+  `draw_detached_frozen_image_at_rect` で同一 rect 描画。fit 数式は純関数
+  (`fs_image_draw_rect_for_size` 等) に切り出され live/passive の単一ソース。
+  deferred view から `zoom_pan` を撤去 (rect に焼き込み済み)。テスト = 単一 + 見開きの
+  rect 一致 (`detached_single_snapshot_rect_matches_live_fit_input` /
+  `detached_spread_snapshot_rects_match_live_fit_input`)。
+- 軽微指摘 (作業不要): 実装メモの本 doc 追記 (fix10a のデッドコード化範囲列挙) が未実施。
+  補償機構 (resume_still_snapshot / reopen_descriptor) の到達性整理はリリース後の
+  クリーンアップ候補としてここに記録する。
+- 実機確認 (ユーザー): W1/W2/W10 (高速切替・全閉じ) + アクティブ化瞬間の画像静止。
