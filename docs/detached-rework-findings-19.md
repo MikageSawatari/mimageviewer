@@ -305,3 +305,14 @@ VST 機能自体 (メイン fullscreen での チェーン / V キー GUI) は�
    stage-audio §5 項目 5 (音声 detached で VST) は本仕様変更で読み替え。
 5. テスト: `show_vst` 導出 (Fullscreen=true / DetachedWindow=false / parked=false)。
 6. コミット `(detached-rework findings-19 fix12)`。
+
+### fix12 訂正 (Fable 2026-07-08、ユーザー指摘): V キーショートカットは存在しない
+
+fix12 要件 3 の「V キー (keymap 経由の VST GUI toggle)」は**誤り** (stage-audio 時代の古い
+記述由来)。keymap に VST 系 KeyAction は無く、native の 0x56 参照はクリップボード Ctrl+V
+のみ。要件 3 は次のように読み替える: **キーではなく、ボタン以外に残る VST GUI 到達経路
+(native `ToggleVst3Gui` イベント等) を列挙し、detached 中に到達し得るものがあれば適切な
+no-op / トーストにする。現状ユーザーが見た「不適切なエラー」の正体の確認・記載は必須のまま**。
+なお「フル機能側で設定したチェーンの効果が ON モードの再生にも乗る」ことはユーザー実機で
+確認済み = 仕様どおり (チェーン共用 1 本、UI のみメイン fullscreen 限定)。
+ship-checklist V8 も同時訂正済み。
