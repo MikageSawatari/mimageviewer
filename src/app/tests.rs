@@ -23129,10 +23129,22 @@ mod still_window_mode_key_tests {
 
     #[cfg(windows)]
     fn activation_target_rect(eligible: bool) -> DetachedActivationWatchTargetRect {
+        activation_target_rect_with_close_hit_test(
+            eligible,
+            DetachedActivationCloseHitTest::ImageBar,
+        )
+    }
+
+    #[cfg(windows)]
+    fn activation_target_rect_with_close_hit_test(
+        eligible: bool,
+        close_hit_test: DetachedActivationCloseHitTest,
+    ) -> DetachedActivationWatchTargetRect {
         DetachedActivationWatchTargetRect {
             window_id: 7,
             hwnd: 0x1000,
             eligible,
+            close_hit_test,
             left: 100,
             top: 100,
             right: 300,
@@ -23330,6 +23342,36 @@ mod still_window_mode_key_tests {
             target,
             Some((target.right - 10, target.top + 50))
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_music_window_close_button_hit_uses_music_chrome_slot() {
+        let target = activation_target_rect_with_close_hit_test(
+            true,
+            DetachedActivationCloseHitTest::MusicChrome,
+        );
+        let full = egui::Rect::from_min_max(
+            egui::pos2(target.left as f32, target.top as f32),
+            egui::pos2(target.right as f32, target.bottom as f32),
+        );
+        let close = App::parked_live_music_close_slot_rect(
+            full,
+            crate::ui_helpers::panel_edge_trigger_px(full.width()),
+        )
+        .expect("normal music parked window should have a close slot");
+
+        assert!(App::detached_activation_close_button_contains(
+            target,
+            Some((close.center().x as i32, close.center().y as i32))
+        ));
+        assert!(
+            !App::detached_activation_close_button_contains(
+                target,
+                Some((target.right - 10, target.top + 10))
+            ),
+            "music parked windows must not reuse the legacy image close-bar hit rect"
+        );
     }
 
     #[test]

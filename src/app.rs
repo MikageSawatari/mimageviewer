@@ -404,10 +404,18 @@ impl MainFontAtlasResyncFrameSafety {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachedActivationCloseHitTest {
+    ImageBar,
+    MusicChrome,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DetachedActivationWatchTarget {
     pub(crate) window_id: u64,
     pub(crate) hwnd: u64,
     pub(crate) eligible: bool,
+    pub(crate) close_hit_test: DetachedActivationCloseHitTest,
 }
 
 #[cfg(windows)]
@@ -416,6 +424,7 @@ pub(crate) struct DetachedActivationWatchTargetRect {
     pub(crate) window_id: u64,
     pub(crate) hwnd: u64,
     pub(crate) eligible: bool,
+    pub(crate) close_hit_test: DetachedActivationCloseHitTest,
     pub(crate) left: i32,
     pub(crate) top: i32,
     pub(crate) right: i32,
@@ -724,6 +733,7 @@ impl DetachedActivationWatcher {
                         window_id: target.window_id,
                         hwnd: target.hwnd,
                         eligible: target.eligible,
+                        close_hit_test: target.close_hit_test,
                         left: rect.left,
                         top: rect.top,
                         right: rect.right,
@@ -1234,9 +1244,17 @@ impl App {
         let Some((x, y)) = cursor_pos else {
             return false;
         };
-        let rect = crate::ui_fullscreen::detached_image_window_bar_close_button_rect(
-            Self::detached_activation_target_full_rect(target),
-        );
+        let full_rect = Self::detached_activation_target_full_rect(target);
+        let rect = match target.close_hit_test {
+            DetachedActivationCloseHitTest::ImageBar => {
+                crate::ui_fullscreen::detached_image_window_bar_close_button_rect(full_rect)
+            }
+            DetachedActivationCloseHitTest::MusicChrome => Self::parked_live_music_close_slot_rect(
+                full_rect,
+                crate::ui_helpers::panel_edge_trigger_px(full_rect.width()),
+            )
+            .unwrap_or(full_rect),
+        };
         (x as f32) >= rect.left()
             && (x as f32) < rect.right()
             && (y as f32) >= rect.top()
@@ -1647,10 +1665,19 @@ impl App {
                     return None;
                 }
                 let hwnd = self.detached_window_hwnd_alive_for_window_id(window.id)?;
+                let close_hit_test = if self
+                    .parked_live_music_window_info_for_window_id(window.id)
+                    .is_some()
+                {
+                    DetachedActivationCloseHitTest::MusicChrome
+                } else {
+                    DetachedActivationCloseHitTest::ImageBar
+                };
                 Some(DetachedActivationWatchTarget {
                     window_id: window.id,
                     hwnd,
                     eligible: self.frame_counter >= window.activation_ready_frame,
+                    close_hit_test,
                 })
             })
             .collect()

@@ -457,6 +457,9 @@ struct NativeEguiOverlay {
     /// 強制 false にして、bar / panel が出ないようにする (= VST 上端帯にドラッグしても hover 表示で
     /// VST 入力が奪われないようにする)。
     external_drag_in_progress: bool,
+    /// parked/dimmed HUD では egui への pointer 配送を止めるが、HUD の fade in/out は
+    /// raw cursor hover に追従させる。`pointer_pos` は egui 入力、こちらは可視性判定専用。
+    raw_hover_pos: Option<egui::Pos2>,
     pending_overlay_commands: Vec<NativeOverlayCommand>,
     last_volume_target: Option<f64>,
     visual_attached: bool,
@@ -3977,6 +3980,7 @@ impl NativeEguiOverlay {
             right_panel_hover_latched: false,
             jump_panel_hover_latched: false,
             external_drag_in_progress: false,
+            raw_hover_pos: None,
             pending_overlay_commands: Vec::new(),
             last_volume_target: None,
             visual_attached: false,
@@ -4066,6 +4070,61 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn visibility_hover_pos(&self) -> Option<egui::Pos2> {
+        if self.hud_dimmed {
+            self.raw_hover_pos
+        } else {
+            self.pointer_pos
+        }
+    }
+
+    fn native_hud_bottom_visible_from_hover(
+        hover_pos: Option<egui::Pos2>,
+        overlay_height_points: f32,
+        external_drag_in_progress: bool,
+    ) -> bool {
+        if external_drag_in_progress {
+            return false;
+        }
+        hover_pos.is_some_and(|pos| pos.y >= (overlay_height_points - 220.0).max(0.0))
+    }
+
+    fn native_hud_top_visible_from_hover(
+        hover_pos: Option<egui::Pos2>,
+        currently_visible: bool,
+        external_drag_in_progress: bool,
+    ) -> bool {
+        if external_drag_in_progress {
+            return false;
+        }
+        hover_pos.is_some_and(|pos| {
+            let y_max = if currently_visible { 76.0 } else { 36.0 };
+            pos.y <= y_max
+        })
+    }
+
+    fn dimmed_hover_chrome_visible(&self) -> bool {
+        if !self.hud_dimmed {
+            return false;
+        }
+        self.hud_visible() || self.top_bar_visible()
+    }
+
+    fn update_raw_hover_pos_from_native_event(
+        &mut self,
+        event: &crate::video::native_window::NativeVideoWindowEvent,
+    ) {
+        use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
+
+        self.raw_hover_pos = match event {
+            NativeEvent::MouseMove(mouse) => Some(self.native_pos(mouse.x, mouse.y)),
+            NativeEvent::MouseButton(button) => Some(self.native_pos(button.x, button.y)),
+            NativeEvent::MouseWheel(wheel) => Some(self.native_pos(wheel.x, wheel.y)),
+            NativeEvent::MouseLeave => None,
+            _ => self.raw_hover_pos,
+        };
+    }
+
     fn push_native_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent) {
         use crate::video::native_window::{
             NativeVideoImeEvent, NativeVideoMouseButton, NativeVideoWindowEvent as NativeEvent,
@@ -4107,7 +4166,12 @@ impl NativeEguiOverlay {
             self.cursor_hidden = false;
         }
         if self.hud_dimmed && Self::hud_dimmed_suppresses_overlay_pointer_event(&event) {
+            let was_visible = self.dimmed_hover_chrome_visible();
+            self.update_raw_hover_pos_from_native_event(&event);
             self.clear_overlay_pointer_for_dimmed_hud();
+            if self.dimmed_hover_chrome_visible() != was_visible {
+                self.dirty = true;
+            }
             return;
         }
         match event {
@@ -4598,6 +4662,9 @@ impl NativeEguiOverlay {
             return;
         }
         self.hud_dimmed = dimmed;
+        if !dimmed {
+            self.raw_hover_pos = None;
+        }
         if dimmed {
             self.clear_overlay_pointer_for_dimmed_hud();
         }
@@ -5573,27 +5640,20 @@ impl NativeEguiOverlay {
     }
 
     fn hud_visible(&self) -> bool {
-        // 実機修正 (2026-05-12): 外部 drag (= VST window ドラッグ等) 中は hover bar / panel を
-        // 表示しない。さもないと VST を画面下にドラッグしたとき seek bar が出て VST に入力が
-        // 届かなくなる。
-        if self.external_drag_in_progress {
-            return false;
-        }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        self.pointer_pos
-            .is_some_and(|pos| pos.y >= (overlay_height_points - 220.0).max(0.0))
+        Self::native_hud_bottom_visible_from_hover(
+            self.visibility_hover_pos(),
+            overlay_height_points,
+            self.external_drag_in_progress,
+        )
     }
 
     fn top_bar_visible(&self) -> bool {
-        // 実機修正 (2026-05-12): 外部 drag 中は top bar を表示しない (= VST を画面上にドラッグ
-        // したとき top bar が出てウィンドウを戻せなくなる症状の対応)。
-        if self.external_drag_in_progress {
-            return false;
-        }
-        self.pointer_pos.is_some_and(|pos| {
-            let y_max = if self.top_bar_visible { 76.0 } else { 36.0 };
-            pos.y <= y_max
-        })
+        Self::native_hud_top_visible_from_hover(
+            self.visibility_hover_pos(),
+            self.top_bar_visible,
+            self.external_drag_in_progress,
+        )
     }
 
     fn vst3_panel_visible(&self) -> bool {
@@ -8456,6 +8516,49 @@ mod tests {
         assert!(
             !NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
                 &NativeVideoWindowEvent::CloseRequested { generation: 7 }
+            )
+        );
+    }
+
+    #[test]
+    fn dimmed_hud_visibility_uses_raw_hover_without_overlay_pointer_delivery() {
+        let bottom_hover = Some(egui::pos2(120.0, 650.0));
+        let upper_hover = Some(egui::pos2(120.0, 100.0));
+
+        assert!(
+            NativeEguiOverlay::native_hud_bottom_visible_from_hover(bottom_hover, 720.0, false),
+            "raw hover near the bottom should show the dimmed HUD"
+        );
+        assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            upper_hover,
+            720.0,
+            false
+        ));
+        assert!(
+            !NativeEguiOverlay::native_hud_bottom_visible_from_hover(bottom_hover, 720.0, true),
+            "external drag remains authoritative even for raw hover"
+        );
+        assert!(
+            NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(&mouse_move()),
+            "raw hover visibility must not re-enable egui pointer delivery while dimmed"
+        );
+    }
+
+    #[test]
+    fn dimmed_top_bar_visibility_uses_raw_hover_without_overlay_pointer_delivery() {
+        assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
+            Some(egui::pos2(40.0, 20.0)),
+            false,
+            false
+        ));
+        assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
+            Some(egui::pos2(40.0, 80.0)),
+            false,
+            false
+        ));
+        assert!(
+            NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
+                &NativeVideoWindowEvent::MouseLeave
             )
         );
     }

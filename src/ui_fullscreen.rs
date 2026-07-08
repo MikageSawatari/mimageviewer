@@ -3889,6 +3889,28 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn parked_live_music_close_slot_rect(
+        full_rect: egui::Rect,
+        edge_trigger: f32,
+    ) -> Option<egui::Rect> {
+        Self::parked_live_music_window_layout(full_rect, edge_trigger)
+            .map(|layout| Self::music_chrome_close_slot_rect(layout.top_rect))
+    }
+
+    #[cfg(windows)]
+    fn music_chrome_title_clip_rect(
+        top_rect: egui::Rect,
+        first_right_control_left: f32,
+    ) -> egui::Rect {
+        let left = top_rect.left() + 10.0;
+        let right = (first_right_control_left - 12.0).clamp(left, top_rect.right());
+        egui::Rect::from_min_max(
+            egui::pos2(left, top_rect.top()),
+            egui::pos2(right, top_rect.bottom()),
+        )
+    }
+
+    #[cfg(windows)]
     fn draw_music_top_chrome(
         &self,
         ui: &mut egui::Ui,
@@ -3912,13 +3934,6 @@ impl App {
         );
         let fg = Self::music_chrome_dim_color(fg, interactive);
         let accent = Self::music_chrome_dim_color(accent, interactive);
-        painter.text(
-            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
-            egui::Align2::LEFT_CENTER,
-            &chrome.title,
-            egui::FontId::proportional(15.0),
-            fg,
-        );
 
         let top_btn_cy = top_rect.center().y;
         let top_btn_bg = |hovered: bool| {
@@ -3936,9 +3951,11 @@ impl App {
         let sense = Self::music_chrome_click_sense(interactive);
         let mut response = MusicTopChromeResponse::default();
         let mut top_rx = top_rect.right() - MUSIC_CHROME_RIGHT_MARGIN;
+        let mut first_right_control_left = top_rx;
 
         if chrome.show_close {
             let rect = Self::music_chrome_close_slot_rect(top_rect);
+            first_right_control_left = first_right_control_left.min(rect.left());
             top_rx = rect.left() - MUSIC_CHROME_TOP_BUTTON_GAP;
             let resp = ui
                 .interact(
@@ -3957,6 +3974,7 @@ impl App {
                 egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
                 egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
             );
+            first_right_control_left = first_right_control_left.min(rect.left());
             top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
             let resp = ui
                 .interact(rect, ui.id().with(("music_top_window", fs_idx)), sense)
@@ -3971,6 +3989,7 @@ impl App {
                 egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
                 egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
             );
+            first_right_control_left = first_right_control_left.min(rect.left());
             top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
             let back_tip = match self
                 .keymap
@@ -3996,6 +4015,7 @@ impl App {
                 egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
                 egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
             );
+            first_right_control_left = first_right_control_left.min(rect.left());
             top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
             let resp = ui
                 .interact(rect, ui.id().with(("music_top_vst", fs_idx)), sense)
@@ -4015,6 +4035,7 @@ impl App {
             let group_w = btn * 2.0 + gap * 2.0 + label_w;
             let cx = vst_left - 20.0 - group_w * 0.5;
             let cy = top_rect.center().y;
+            first_right_control_left = first_right_control_left.min(cx - group_w * 0.5);
             let minus_rect = egui::Rect::from_center_size(
                 egui::pos2(cx - group_w * 0.5 + btn * 0.5, cy),
                 egui::vec2(btn, btn),
@@ -4068,6 +4089,15 @@ impl App {
                 response.row_delta = 1;
             }
         }
+
+        let title_clip = Self::music_chrome_title_clip_rect(top_rect, first_right_control_left);
+        painter.with_clip_rect(title_clip).text(
+            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
+            egui::Align2::LEFT_CENTER,
+            &chrome.title,
+            egui::FontId::proportional(15.0),
+            fg,
+        );
 
         response
     }
@@ -21465,6 +21495,22 @@ mod tests {
         assert_ne!(
             close_rect, legacy_close_rect,
             "ParkedLive music must not use the old close-only bar rect that overlaps the top chrome"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_chrome_title_clip_stops_before_right_controls() {
+        let top = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 42.0));
+        let first_right_control_left = 410.0;
+        let clip = App::music_chrome_title_clip_rect(top, first_right_control_left);
+
+        assert_eq!(clip.left(), top.left() + 10.0);
+        assert_eq!(clip.top(), top.top());
+        assert_eq!(clip.bottom(), top.bottom());
+        assert!(
+            clip.right() <= first_right_control_left - 12.0 + f32::EPSILON,
+            "title clip must leave a gap before Row/buttons"
         );
     }
 

@@ -1164,6 +1164,22 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
 5. fix6f/6g の実装メモを本 doc に追記する (fix6f 分の後追い記載も含む)。
 6. コミット `(detached-rework stage-audio fix6g)`。
 
+### fix6g 実装メモ (Codex 2026-07-08)
+
+- fix6f の意図は「parked/dimmed 中に egui HUD へ pointer を配送しない」ことで、これは
+  維持する。fix6g では `NativeEguiOverlay::raw_hover_pos` を追加し、dimmed 中の
+  MouseMove/Button/Wheel/Leave は raw hover だけ更新して `pointer_pos` は `None` のままにする。
+  `hud_visible()` / `top_bar_visible()` は dimmed 中だけ raw hover を読むため、ボタンは無反応のまま
+  上下 HUD の fade in/out だけがカーソルに追従する。MouseLeave で raw hover をクリアし、
+  表示状態が変わるイベントでは `dirty` を立てる。
+- `draw_music_top_chrome` は右側ボタン群・Row ステッパーの最左端を集約し、
+  `music_chrome_title_clip_rect` で title 描画をその左側へ clip する。共有 chrome なので
+  active / parked の両方で長いタイトルが Row 30s や右上ボタン群へ重ならない。
+- fix6f の留保だった watcher の × hit 判定は、`DetachedActivationCloseHitTest`
+  (`ImageBar` / `MusicChrome`) を target に持たせて解消した。ParkedLive music の watch target は
+  `music_chrome_close_slot_rect` を使い、画像/PDF は従来の close-only bar rect のまま。
+  close rect 選択は headless test で固定。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
