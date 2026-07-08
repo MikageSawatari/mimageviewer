@@ -925,6 +925,95 @@ fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 →
 - Phase 0 で、egui パリティ chrome の連続再生状態が parked で正しいか (render 時復元値) も
   確認し、実機で消えていた場合は info 生成経路を報告に含める。
 
+### fix7 Phase 0 調査結果 (Codex 2026-07-08)
+
+#### 現状の機構
+
+- `poll_parked_live_detached_windows` は parked bundle を `swap_viewer_context_bundle` で
+  App に mount してから `poll_video(ctx)` を呼ぶが、その直前に
+  `video_continuous_mode = Off` を一時適用している。したがって `poll_video` 内の
+  `continuous_enabled` が false になり、`handle_music_continuous_eof` /
+  `handle_video_audio_mode_continuous_eof` / `handle_video_continuous_eof` は発火しない。
+- parked 音楽 chrome の表示値は `viewer_context_bundle_music_window_info` が作る
+  `ParkedLiveMusicWindowInfo.continuous_mode` から描画される。この値は render 時の
+  `self.video_continuous_mode` (ユーザー設定) で、parked poll 中の一時 Off からは直接影響を
+  受けない。egui パリティ chrome は現在の実装では**表示だけならユーザー設定と一致する**。
+- native presenter HUD は `poll_video` が毎 tick `player.set_native_continuous_mode(continuous_mode)`
+  を送るため、parked poll 中は一時 Off が presenter 側へ渡る。従って **native parked HUD の
+  連続再生表示は現状 Off に倒れる**。
+
+#### (a) source-swap が parked 窓内で完結するか
+
+**そのまま Off 強制を外すだけでは安全ではない。**
+
+- 音声ファイル (`GridItem::Audio`) の EOF は `handle_music_continuous_eof` →
+  `open_fullscreen_from_fs_navigation` → `open_fullscreen` へ進む。これは mount 中の bundle
+  (`items` / `fullscreen_idx` / `fs_cache`) に対して同期的に完結するため、parked 窓内で
+  完結できる見込み。
+- 音声モード動画 / 通常動画の EOF は `try_start_native_video_fast_swap` 経由で
+  `native_video_source_swap_pending` を積む。`native_video_source_swap_pending` は
+  `ViewerContextBundle` の swap 対象ではなく App-global である。
+- 現在の update 順序は main 側 `poll_video` が先、`poll_parked_live_detached_windows` が後。
+  parked poll で積んだ source-swap pending は次 root frame の main 側 `poll_video` に先に
+  見える。このとき main 側の `fullscreen_idx` / `items` は parked bundle ではないため、
+  `poll_native_video_source_swap_pending` の
+  `fullscreen_idx != Some(target_idx)` / `items[target_idx] != target_path` 判定で pending が
+  abort され得る。
+
+したがって、fix7 実装では次のどちらかが必要:
+
+1. **推奨**: parked live media が存在する間は main 側 `poll_video` をスキップし、parked
+   bundle を mount した `poll_video` だけが media pending を処理する。メディア窓は 1 本規則
+   なので、main 側に同時に別 media が存在しない前提と整合する。
+2. 代替: `native_video_source_swap_pending` / fast-swap pending を `ViewerContextBundle` 側へ
+   移す。ただし影響範囲が大きく、fix7 の最小実装としては過剰。
+
+#### (b) アクティブ本文脈を汚さないか
+
+- `open_fullscreen` / `open_fullscreen_from_fs_navigation` 自体は mount 中なら bundle の
+  `items` / `current_folder` / `fullscreen_idx` / `fs_cache` を更新するため、基本文脈は
+  汚さない。
+- ただし上記の通り native source-swap pending が App-global であるため、main 側 poll が
+  先に触ると pending の abort / toast / close などが main 側状態に漏れる可能性がある。
+  これを防ぐには **parked media 中の main poll 抑止**を同時に入れる必要がある。
+- `fs_media_open_forced_presentation` は動画 EOF で一時的に立つが、
+  `open_native_video_fullscreen_from_navigation_with_options` が fast-swap 開始時に clear する。
+  現経路では one-shot リークの主因にはならない見込み。
+
+#### (c) ParkedLive / 音声モードが維持されるか
+
+- `poll_parked_live_detached_windows` は runtime state を変更せず bundle を poll して戻すだけなので、
+  `ParkedLive` 自体は維持される。
+- 音声モード動画は `handle_video_audio_mode_continuous_eof` が
+  `source_swap_keep_audio_mode=true` を焼き込み、pending completion で
+  `enter_video_audio_mode(ctx, target_idx)` を呼ぶ設計。pending を parked bundle mount 中に
+  完了させられれば、音声モード維持は成立する見込み。
+- pending が main 側で abort されると音声モード維持以前に次送りが成立しない。よって (a) の
+  main poll 抑止が前提。
+
+#### (d) Off 強制を外す/条件化したときの影響範囲
+
+- Off 強制を完全に外すと、連続再生 ON の parked media は EOF で次へ進む。ユーザー決定と一致。
+- 連続再生 OFF なら `video_continuous_mode.is_enabled()` が false のため従来どおり停止する。
+- native HUD の連続再生表示もユーザー設定と一致するようになる。
+- ただし実装時は main 側 `poll_video` 抑止をセットで入れること。Off 強制だけを外す単独修正は
+  source-swap pending abort の競合を作るため不可。
+
+#### 実装案 (承認待ち)
+
+1. `should_poll_main_video_context()` を拡張し、active detached context に加えて
+   **ParkedLive media window が存在する間も main 側 poll を止める**。判定は既存 runtime /
+   snapshot から導出し、新規 App bool は追加しない。
+2. `poll_parked_live_detached_windows` の `video_continuous_mode = Off` 強制を撤去し、ユーザー設定を
+   そのまま `poll_video` に渡す。
+3. 回帰テスト:
+   - ParkedLive 音声 + 連続再生 ON: EOF で次 audio へ進み、active 本文脈 (`items` /
+     `current_folder` / `fullscreen_idx` / `auto_aspect`) は不変。
+   - ParkedLive 音声 + 連続再生 OFF: EOF で進まない。
+   - ParkedLive 音声モード動画 + 連続再生 ON: source-swap pending が main 側 poll で abort
+     されず、parked bundle mount 中に処理されること (少なくとも main poll 抑止述語を固定)。
+   - native HUD / egui chrome の continuous 表示がユーザー設定と一致すること。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
