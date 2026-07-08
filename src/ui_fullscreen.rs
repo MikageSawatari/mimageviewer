@@ -11451,6 +11451,119 @@ impl App {
             && self
                 .fullscreen_idx
                 .is_some_and(|idx| self.fs_music_view_active(idx));
+        let right_drag_context = self.current_right_drag_context();
+        let right_drag_mode = self
+            .settings
+            .ring_shortcuts
+            .right_drag_mode(right_drag_context);
+        let secondary_down = ctx.input(|i| i.pointer.secondary_down());
+        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+        let secondary_released = ctx.input(|i| i.pointer.secondary_released());
+        let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
+        let secondary_in_seek_panel =
+            seek_panel_interactive && seek_panel_rect.contains(secondary_pos);
+        // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
+        // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
+        let popup_open = self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open;
+        let right_drag_gate_reject = if state.is_video && !video_in_audio_mode {
+            Some("native_video")
+        } else if self.analysis_mode {
+            Some("analysis")
+        } else if dialog_open_for_right_drag {
+            Some("dialog")
+        } else if self.fs_context_menu_idx.is_some() {
+            Some("context_menu")
+        } else if popup_open {
+            Some("popup")
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        if self.viewer_session_is_detached_or_switching()
+            && Self::detached_image_window_debug_enabled()
+        {
+            let (
+                focused,
+                event_count,
+                key_pressed_count,
+                wheel_event_count,
+                secondary_button_events,
+            ) = ctx.input(|i| {
+                let key_pressed_count = i
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+                    .count();
+                let wheel_event_count = i
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                    .count();
+                let secondary_button_events = i
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            egui::Event::PointerButton {
+                                button: egui::PointerButton::Secondary,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                (
+                    i.viewport().focused.unwrap_or(false),
+                    i.events.len(),
+                    key_pressed_count,
+                    wheel_event_count,
+                    secondary_button_events,
+                )
+            });
+            let right_drag_probe_event_frame =
+                secondary_pressed || secondary_released || secondary_button_events > 0;
+            if right_drag_probe_event_frame {
+                let foreground = current_foreground_hwnd();
+                let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
+                self.log_detached_image_window_debug(format!(
+                    "right_drag_probe fs_idx={:?} window_id={:?} window_state={:?} \
+                 session={:?} is_video={} video_audio_mode={} analysis={} \
+                 dialog={} popup={} context_menu={} focused={} \
+                 foreground=0x{foreground:x} active_hwnd=0x{active_hwnd:x} \
+                 foreground_matches={} prev_foreground=0x{:x} \
+                 secondary_down={} secondary_pressed={} secondary_released={} \
+                 secondary_pos=({:.1},{:.1}) secondary_in_seek_panel={} \
+                 right_drag_context={right_drag_context:?} right_drag_mode={right_drag_mode:?} \
+                 gate={} events={} key_pressed={} wheel_events={} secondary_button_events={} \
+                 frame={}",
+                    self.fullscreen_idx,
+                    self.active_detached_window_id(),
+                    self.active_detached_window_state(),
+                    self.active_detached_session,
+                    state.is_video,
+                    video_in_audio_mode,
+                    self.analysis_mode,
+                    dialog_open_for_right_drag,
+                    popup_open,
+                    self.fs_context_menu_idx.is_some(),
+                    focused,
+                    foreground != 0 && foreground == active_hwnd,
+                    prev_foreground_hwnd,
+                    secondary_down,
+                    secondary_pressed,
+                    secondary_released,
+                    secondary_pos.x,
+                    secondary_pos.y,
+                    secondary_in_seek_panel,
+                    right_drag_gate_reject.unwrap_or("ok"),
+                    event_count,
+                    key_pressed_count,
+                    wheel_event_count,
+                    secondary_button_events,
+                    self.frame_counter
+                ));
+            }
+        }
         if (!state.is_video || video_in_audio_mode)
             && !self.analysis_mode
             && !dialog_open_for_right_drag
@@ -11459,21 +11572,6 @@ impl App {
             && !self.fit_popup_open
             && !self.slideshow_popup_open
         {
-            let secondary_down = ctx.input(|i| i.pointer.secondary_down());
-            let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
-            let secondary_released = ctx.input(|i| i.pointer.secondary_released());
-            let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
-            let secondary_in_seek_panel =
-                seek_panel_interactive && seek_panel_rect.contains(secondary_pos);
-            // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
-            // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
-
-            let right_drag_context = self.current_right_drag_context();
-            let right_drag_mode = self
-                .settings
-                .ring_shortcuts
-                .right_drag_mode(right_drag_context);
-
             match right_drag_mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => {
                     let Some(ring_context) = right_drag_context.ring_context() else {
