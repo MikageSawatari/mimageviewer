@@ -7217,6 +7217,10 @@ pub struct App {
     /// に適用してからクリアする。↓↑ をファイル移動に使うため (動画と統一)、タイムライン縦
     /// スクロールはこのボタン + ホイール + ドラッグで行う。
     pub(crate) music_timeline_scroll_req: f32,
+    /// Row 秒数の変更直後に、再生カーソル行が画面内に入るよう 1 回だけ ScrollArea を寄せる。
+    /// Row ± / Ctrl+ホイールは描画タイミングが異なるため、次の timeline 描画で消費する one-shot
+    /// にする。通常の追従・手動スクロール cooldown はこのフラグでは変更しない。
+    pub(crate) music_timeline_reanchor_playhead_once: bool,
     /// 下段スペクトラム (Inc 4) 用の全尺デコード PCM。解析ワーカーが追送し、UI が再生位置
     /// 周辺 ±1 秒を切り出して `SpectrumAnalyzer` に食わせる。開くファイルが変わったら破棄。
     pub(crate) music_pcm: Option<std::sync::Arc<crate::ui_music_spectrum::MusicPcm>>,
@@ -9129,6 +9133,7 @@ impl App {
             music_timeline_last_scroll_offset: 0.0,
             music_timeline_programmatic_scroll_until: None,
             music_timeline_scroll_req: 0.0,
+            music_timeline_reanchor_playhead_once: false,
             music_pcm: None,
             music_spectrum: crate::ui_music_spectrum::MusicSpectrumState::default(),
             music_probe: None,
@@ -33891,6 +33896,7 @@ impl App {
         // ▲▼ ボタンの保留スクロール量は前ファイル向けなので破棄する (Codex P3: クリック直後に
         // 別ファイルへ移動すると古い delta が次のタイムラインに適用されてしまう)。
         self.music_timeline_scroll_req = 0.0;
+        self.music_timeline_reanchor_playhead_once = false;
         self.music_analysis = None;
         self.music_pcm = None;
         self.music_probe = None;
@@ -34075,6 +34081,7 @@ impl App {
         self.music_analysis_path = None;
         // ▲▼ ボタンの保留スクロール量も teardown で破棄する (Codex P3、上記 path 変更と同じ理由)。
         self.music_timeline_scroll_req = 0.0;
+        self.music_timeline_reanchor_playhead_once = false;
         self.music_timeline_scroll_cooldown_until = None;
         self.music_timeline_last_scroll_offset = 0.0;
         self.music_timeline_programmatic_scroll_until = None;

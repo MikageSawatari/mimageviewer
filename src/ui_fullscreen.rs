@@ -9451,8 +9451,7 @@ impl App {
                 let delta = if wheel_y > 0.0 { -1 } else { 1 };
                 let new_secs =
                     crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
-                if new_secs != self.music_timeline_row_secs {
-                    self.music_timeline_row_secs = new_secs;
+                if self.set_music_timeline_row_secs_from_input(new_secs) {
                     self.show_feedback_toast(format!(
                         "Row {}",
                         crate::ui_music_timeline::format_row_secs(new_secs)
@@ -20805,6 +20804,15 @@ impl App {
         resp.clicked()
     }
 
+    fn set_music_timeline_row_secs_from_input(&mut self, new_secs: f64) -> bool {
+        if (new_secs - self.music_timeline_row_secs).abs() < f64::EPSILON {
+            return false;
+        }
+        self.music_timeline_row_secs = new_secs;
+        self.music_timeline_reanchor_playhead_once = true;
+        true
+    }
+
     /// fs_idx で「音楽ビュー」(DJ 波形タイムライン + スペクトラム + 上下バー/左右パネル) が
     /// 表示されているか。用途 = 表示 dispatch / 画像用パネルの抑止 / 音楽ビュー用のキーゲート
     /// (画像・動画ショートカットの consume 抑止と音楽キーの有効化)。
@@ -21080,7 +21088,7 @@ impl App {
                 hover_pos.is_some_and(|p| up_btn_rect.contains(p) || down_btn_rect.contains(p));
             // 前フレームのボタンクリックで保留したスクロール量を取り出し、下の ScrollArea 内で
             // 適用する (borrow 衝突回避のため analysis/cache/follow を借りる前に take)。
-            let pending_scroll = std::mem::take(&mut self.music_timeline_scroll_req);
+            let mut pending_scroll = std::mem::take(&mut self.music_timeline_scroll_req);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(timeline_rect)
@@ -21101,6 +21109,22 @@ impl App {
                     .filter(|d| *d > 0.0)
                     .unwrap_or_else(|| analysis.stream.duration_secs)
             };
+            if self.music_timeline_reanchor_playhead_once {
+                self.music_timeline_reanchor_playhead_once = false;
+                if let Some(target_offset) =
+                    crate::ui_music_timeline::music_timeline_playhead_center_scroll_offset(
+                        pos,
+                        timeline_dur,
+                        row_secs,
+                        timeline_rect.height(),
+                    )
+                {
+                    let delta = self.music_timeline_last_scroll_offset - target_offset;
+                    if delta.abs() > 0.5 {
+                        pending_scroll = delta;
+                    }
+                }
+            }
             // 追従スクロールのクールダウン: now < until なら自動スクロールしない (手動閲覧中)。
             let now = std::time::Instant::now();
             let auto_scroll = self
@@ -21277,10 +21301,13 @@ impl App {
             }
         }
         if top_response.row_delta != 0 {
-            self.music_timeline_row_secs = crate::ui_music_timeline::step_row_secs(
+            let new_secs = crate::ui_music_timeline::step_row_secs(
                 active_chrome.row_secs,
                 top_response.row_delta,
             );
+            if self.set_music_timeline_row_secs_from_input(new_secs) {
+                ctx.request_repaint();
+            }
         }
 
         let hud_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), hud_top), rect.max);

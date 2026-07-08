@@ -50,6 +50,7 @@ const TIMELINE_KEY_TEMPERLEY_MINOR_PROFILE: [f32; 12] =
     [5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 1.5, 4.0];
 const TIMELINE_INNER_GAP: f32 = 4.0;
 const TIMELINE_ROW_GAP: f32 = 12.0;
+const TIMELINE_CONTENT_PADDING_Y: f32 = 8.0;
 const TIMELINE_TEXTURE_MAX_WIDTH: usize = 4096;
 const TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME: usize = 1;
 const BEAT_GRID_MIN_CONFIDENCE: f32 = 0.55;
@@ -436,7 +437,9 @@ pub fn draw_music_timeline(
     let rows = timeline_row_count(duration_secs, row_secs);
     let row_gap = TIMELINE_ROW_GAP;
     let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_METRICS_H;
-    let content_h = 16.0 + rows as f32 * row_h + rows.saturating_sub(1) as f32 * row_gap;
+    let content_h = TIMELINE_CONTENT_PADDING_Y * 2.0
+        + rows as f32 * row_h
+        + rows.saturating_sub(1) as f32 * row_gap;
     let available = egui::vec2(ui.available_width(), ui.available_height().max(content_h));
     let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -444,8 +447,11 @@ pub fn draw_music_timeline(
 
     let label_w = left_label_w.max(0.0);
     let graph_rect = egui::Rect::from_min_max(
-        rect.min + egui::vec2(label_w, 8.0),
-        egui::pos2(rect.max.x - 8.0, rect.min.y + content_h - 8.0),
+        rect.min + egui::vec2(label_w, TIMELINE_CONTENT_PADDING_Y),
+        egui::pos2(
+            rect.max.x - TIMELINE_CONTENT_PADDING_Y,
+            rect.min.y + content_h - TIMELINE_CONTENT_PADDING_Y,
+        ),
     );
     // 左の時間ラベル列 (gutter) は音楽ビュー背景の灰色で塗り、左右の隙間と色を揃える
     // (実機 FB 2026-07)。波形グラフ部 (graph_rect 以降) は timeline_bg (黒) のまま。
@@ -2071,6 +2077,46 @@ pub fn step_row_secs(current: f64, delta: i32) -> f64 {
     MUSIC_ROW_SECS_CHOICES[new_idx]
 }
 
+pub fn music_timeline_playhead_center_scroll_offset(
+    position_secs: f64,
+    duration_secs: f64,
+    row_secs: f64,
+    viewport_h: f32,
+) -> Option<f32> {
+    let row_h = TIMELINE_WAVEFORM_H + TIMELINE_INNER_GAP + TIMELINE_METRICS_H;
+    let rows = timeline_row_count(duration_secs, row_secs);
+    music_timeline_playhead_center_scroll_offset_for_layout(
+        position_secs,
+        row_secs,
+        viewport_h,
+        row_h,
+        TIMELINE_ROW_GAP,
+        rows,
+    )
+}
+
+pub fn music_timeline_playhead_center_scroll_offset_for_layout(
+    position_secs: f64,
+    row_secs: f64,
+    viewport_h: f32,
+    row_h: f32,
+    row_gap: f32,
+    rows: usize,
+) -> Option<f32> {
+    if rows == 0 || viewport_h <= 0.0 || row_h <= 0.0 || !viewport_h.is_finite() {
+        return None;
+    }
+    let row = timeline_focus_row(position_secs, row_secs, rows)?;
+    let stride = row_h + row_gap.max(0.0);
+    let row_top = TIMELINE_CONTENT_PADDING_Y + row as f32 * stride;
+    let row_center = row_top + row_h * 0.5;
+    let content_h = TIMELINE_CONTENT_PADDING_Y * 2.0
+        + rows as f32 * row_h
+        + rows.saturating_sub(1) as f32 * row_gap.max(0.0);
+    let max_offset = (content_h - viewport_h).max(0.0);
+    Some((row_center - viewport_h * 0.5).clamp(0.0, max_offset))
+}
+
 /// Row 秒数の表示ラベル ("30s" / "2m")。
 pub fn format_row_secs(secs: f64) -> String {
     if secs < 60.0 {
@@ -2139,6 +2185,49 @@ mod tests {
         // 端でクランプ (巡回しない)。
         assert_eq!(step_row_secs(10.0, -1), 10.0);
         assert_eq!(step_row_secs(120.0, 1), 120.0);
+    }
+
+    #[test]
+    fn playhead_center_scroll_offset_keeps_zoomed_row_visible() {
+        let row_h = 116.0;
+        let row_gap = 12.0;
+        let rows = 80;
+        let viewport_h = 180.0;
+        let position_secs = 305.0;
+        let row_secs = 10.0;
+        let offset = music_timeline_playhead_center_scroll_offset_for_layout(
+            position_secs,
+            row_secs,
+            viewport_h,
+            row_h,
+            row_gap,
+            rows,
+        )
+        .expect("valid playhead row");
+        let row = timeline_focus_row(position_secs, row_secs, rows).unwrap();
+        let row_top = TIMELINE_CONTENT_PADDING_Y + row as f32 * (row_h + row_gap);
+        let row_bottom = row_top + row_h;
+
+        assert!(
+            offset <= row_top && offset + viewport_h >= row_bottom,
+            "target offset {offset} should keep row {row} [{row_top}, {row_bottom}] inside viewport"
+        );
+    }
+
+    #[test]
+    fn playhead_center_scroll_offset_clamps_edges() {
+        let first = music_timeline_playhead_center_scroll_offset_for_layout(
+            0.0, 10.0, 240.0, 116.0, 12.0, 5,
+        )
+        .unwrap();
+        assert_eq!(first, 0.0);
+
+        let last = music_timeline_playhead_center_scroll_offset_for_layout(
+            49.0, 10.0, 240.0, 116.0, 12.0, 5,
+        )
+        .unwrap();
+        let content_h = TIMELINE_CONTENT_PADDING_Y * 2.0 + 5.0 * 116.0 + 4.0 * 12.0;
+        assert_eq!(last, content_h - 240.0);
     }
 
     #[test]
