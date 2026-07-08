@@ -1249,11 +1249,15 @@ impl App {
             DetachedActivationCloseHitTest::ImageBar => {
                 crate::ui_fullscreen::detached_image_window_bar_close_button_rect(full_rect)
             }
-            DetachedActivationCloseHitTest::MusicChrome => Self::parked_live_music_close_slot_rect(
-                full_rect,
-                crate::ui_helpers::panel_edge_trigger_px(full_rect.width()),
-            )
-            .unwrap_or(full_rect),
+            DetachedActivationCloseHitTest::MusicChrome => {
+                match Self::parked_live_music_close_slot_rect(
+                    full_rect,
+                    crate::ui_helpers::panel_edge_trigger_px(full_rect.width()),
+                ) {
+                    Some(rect) => rect,
+                    None => return false,
+                }
+            }
         };
         (x as f32) >= rect.left()
             && (x as f32) < rect.right()
@@ -1883,6 +1887,7 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
+        self.discard_parked_source_swap_pending_for_window(window_id, reason);
         let runtime = self.detached_window_runtimes.remove(&window_id);
         if let Some(runtime) = runtime.as_ref() {
             if let Some(placement) = runtime

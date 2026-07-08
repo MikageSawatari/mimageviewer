@@ -2650,49 +2650,8 @@ pub(super) fn draw_top_bar_background(painter: &egui::Painter, overlay_width_poi
     );
 }
 
-pub(super) fn draw_native_hud_dim_overlay(
-    ctx: &egui::Context,
-    overlay_width_points: f32,
-    overlay_height_points: f32,
-    top_visible: bool,
-    bottom_visible: bool,
-) {
-    let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 86);
-    if top_visible {
-        egui::Area::new(egui::Id::new("native_video_hud_dim_top"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::Pos2::ZERO)
-            .interactable(false)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(overlay_width_points, 54.0),
-                );
-                ui.set_min_size(rect.size());
-                ui.painter().rect_filled(rect, 0.0, dim);
-            });
-    }
-    if bottom_visible {
-        egui::Area::new(egui::Id::new("native_video_hud_dim_bottom"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(
-                0.0,
-                (overlay_height_points - crate::video::native_presenter::HUD_BOTTOM_HEIGHT)
-                    .max(0.0),
-            ))
-            .interactable(false)
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(
-                        overlay_width_points,
-                        crate::video::native_presenter::HUD_BOTTOM_HEIGHT,
-                    ),
-                );
-                ui.set_min_size(rect.size());
-                ui.painter().rect_filled(rect, 0.0, dim);
-            });
-    }
+pub(super) fn native_hud_dim_color() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 86)
 }
 
 pub(super) fn draw_top_bar_text_lines(
@@ -2731,6 +2690,7 @@ pub(super) fn draw_native_top_bar(
     // 音声のみ native シェル (music Inc 6 ②): タイル一覧 / Perf グラフ (動画専用) を出さず、
     // 音楽ビュー上バーと同じ VST・フルスクリーン切替・閉じるだけにする。
     audio_only: bool,
+    dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_top_bar"))
@@ -2898,6 +2858,9 @@ pub(super) fn draw_native_top_bar(
                     commands,
                 );
             }
+            if dimmed {
+                painter.rect_filled(rect, 0.0, native_hud_dim_color());
+            }
         });
 }
 
@@ -2906,6 +2869,7 @@ pub(super) fn draw_native_top_bar_tile(
     overlay_width_points: f32,
     metadata: Option<&NativeOverlayMetadata>,
     tile_state: &NativeOverlayTileOverlay,
+    dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_tile_top_bar"))
@@ -3035,6 +2999,9 @@ pub(super) fn draw_native_top_bar_tile(
                 NativeOverlayCommand::TileColumnsDelta { delta: -1 },
                 commands,
             );
+            if dimmed {
+                painter.rect_filled(rect, 0.0, native_hud_dim_color());
+            }
         });
 }
 

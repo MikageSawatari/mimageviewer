@@ -3880,6 +3880,18 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn music_chrome_button_dim_overlay_color(interactive: bool) -> Option<egui::Color32> {
+        (!interactive).then_some(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 77))
+    }
+
+    #[cfg(windows)]
+    fn paint_music_chrome_button_dim(painter: &egui::Painter, rect: egui::Rect, interactive: bool) {
+        if let Some(color) = Self::music_chrome_button_dim_overlay_color(interactive) {
+            painter.rect_filled(rect, 4.0, color);
+        }
+    }
+
+    #[cfg(windows)]
     fn music_chrome_close_slot_rect(top_rect: egui::Rect) -> egui::Rect {
         egui::Rect::from_center_size(
             egui::pos2(
@@ -3968,6 +3980,7 @@ impl App {
                 .hover_tip_dark("閉じる".to_string());
             painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
             draw_overlay_close_icon(&painter, rect);
+            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
             response.close_clicked = resp.clicked();
         }
 
@@ -3983,6 +3996,7 @@ impl App {
                 .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
             painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
             draw_overlay_window_toggle_icon(&painter, rect);
+            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
             response.window_clicked = interactive && resp.clicked();
         }
 
@@ -4009,6 +4023,7 @@ impl App {
                 .hover_tip_dark(back_tip);
             painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
             draw_overlay_video_icon(&painter, rect);
+            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
             response.back_to_video_clicked = interactive && resp.clicked();
         }
 
@@ -4024,6 +4039,7 @@ impl App {
                 .hover_tip_dark("VST プラグイン画面を開く".to_string());
             painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
             draw_overlay_vst3_top_icon(&painter, rect);
+            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
             response.vst_clicked = interactive && resp.clicked();
             top_rx
         } else {
@@ -4058,6 +4074,7 @@ impl App {
                 ],
                 egui::Stroke::new(2.0, fg),
             );
+            Self::paint_music_chrome_button_dim(&painter, minus_rect, interactive);
             painter.text(
                 egui::pos2(cx, cy),
                 egui::Align2::CENTER_CENTER,
@@ -4084,6 +4101,7 @@ impl App {
                 ],
                 egui::Stroke::new(2.0, fg),
             );
+            Self::paint_music_chrome_button_dim(&painter, plus_rect, interactive);
             if interactive && plus_resp.clicked() {
                 response.row_delta = -1;
             }
@@ -21567,6 +21585,22 @@ mod tests {
     fn music_chrome_noninteractive_uses_hover_sense() {
         assert_eq!(App::music_chrome_click_sense(true), egui::Sense::click());
         assert_eq!(App::music_chrome_click_sense(false), egui::Sense::hover());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_chrome_noninteractive_dims_chrome_colors() {
+        let color = egui::Color32::from_rgba_unmultiplied(100, 120, 200, 255);
+        assert_eq!(App::music_chrome_dim_color(color, true), color);
+        assert_eq!(
+            App::music_chrome_dim_color(color, false),
+            egui::Color32::from_rgba_unmultiplied(70, 84, 140, 178)
+        );
+        assert_eq!(App::music_chrome_button_dim_overlay_color(true), None);
+        assert_eq!(
+            App::music_chrome_button_dim_overlay_color(false),
+            Some(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 77))
+        );
     }
 
     #[test]

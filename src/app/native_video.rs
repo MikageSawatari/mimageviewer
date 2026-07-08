@@ -800,7 +800,10 @@ impl App {
             pending.requested_at = now;
             pending.deadline = now + std::time::Duration::from_secs(10);
             pending.input_seq = self.input_seq;
-            pending.parked_live_window_id = parked_live_window_id.or(pending.parked_live_window_id);
+            pending.parked_live_window_id = Self::source_swap_owner_after_update(
+                parked_live_window_id,
+                pending.parked_live_window_id,
+            );
             pending.audio_mode_after_swap = keep_audio_after_update;
             pending
                 .native_output
@@ -1039,6 +1042,51 @@ impl App {
         current_parked_input_window_id: Option<u64>,
     ) -> bool {
         pending_window_id.is_none() || pending_window_id == current_parked_input_window_id
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn source_swap_owner_after_update(
+        current_parked_window_id: Option<u64>,
+        _previous_pending_owner: Option<u64>,
+    ) -> Option<u64> {
+        current_parked_window_id
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn parked_source_swap_pending_belongs_to_window(
+        pending_window_id: Option<u64>,
+        window_id: u64,
+    ) -> bool {
+        pending_window_id == Some(window_id)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn discard_parked_source_swap_pending_for_window(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        let belongs_to_window =
+            self.native_video_source_swap_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    Self::parked_source_swap_pending_belongs_to_window(
+                        pending.parked_live_window_id,
+                        window_id,
+                    )
+                });
+        if !belongs_to_window {
+            return false;
+        }
+        if let Some(pending) = self.native_video_source_swap_pending.take() {
+            pending.native_output.set_navigation_preview(None);
+            crate::logger::log(format!(
+                "[native-video] parked deferred source swap discarded: \
+                 window_id={window_id} reason={reason} target_idx={} pending_reason={}",
+                pending.target_idx, pending.reason
+            ));
+        }
+        true
     }
 
     #[cfg(windows)]

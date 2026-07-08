@@ -6046,17 +6046,9 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     video_metadata.as_ref(),
                     tile_overlay,
+                    hud_dimmed,
                     &mut commands,
                 );
-                if hud_dimmed {
-                    draw_native_hud_dim_overlay(
-                        ctx,
-                        overlay_width_points,
-                        overlay_height_points,
-                        true,
-                        false,
-                    );
-                }
                 // タイル表示中も境界トースト (= 「最後の項目です」「次のフォルダが見つかりません」
                 // 等) は出す。元実装は早期 return で line 4342 の draw_native_toast に
                 // 到達しなかったため、タイル末尾に達してもユーザーへの feedback がゼロだった。
@@ -6183,6 +6175,7 @@ impl NativeEguiOverlay {
                     vst3_available,
                     vst3_panel_visible,
                     audio_only,
+                    hud_dimmed,
                     &mut commands,
                 );
             }
@@ -7546,15 +7539,6 @@ impl NativeEguiOverlay {
                         }
                     });
             } // ← `if bottom_hud_visible {` の閉じ (Codex 4周目 P1)
-            if hud_dimmed {
-                draw_native_hud_dim_overlay(
-                    ctx,
-                    overlay_width_points,
-                    overlay_height_points,
-                    panel_chrome_visible,
-                    false,
-                );
-            }
             // Codex 3周目 P2 反映: 音量ノーマライズ進捗パネルは **すべての overlay UI
             // 描画の最後** に置く。同じ Order::Foreground の Area は描画順 = z-order なので、
             // metadata panel / jump panel / bookmark editor / bottom HUD より後に描けば

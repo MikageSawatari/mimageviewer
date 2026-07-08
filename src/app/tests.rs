@@ -22350,6 +22350,40 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn source_swap_update_replaces_stale_parked_owner() {
+        assert_eq!(
+            App::source_swap_owner_after_update(Some(7), None),
+            Some(7),
+            "parked enqueue/update should stamp the current parked owner"
+        );
+        assert_eq!(
+            App::source_swap_owner_after_update(Some(8), Some(7)),
+            Some(8),
+            "a later parked update belongs to the current parked owner"
+        );
+        assert_eq!(
+            App::source_swap_owner_after_update(None, Some(7)),
+            None,
+            "non-parked update must clear stale parked ownership"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_source_swap_pending_is_discarded_only_for_owner_window() {
+        assert!(App::parked_source_swap_pending_belongs_to_window(
+            Some(7),
+            7
+        ));
+        assert!(!App::parked_source_swap_pending_belongs_to_window(
+            Some(7),
+            8
+        ));
+        assert!(!App::parked_source_swap_pending_belongs_to_window(None, 7));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn video_continuous_target_search_skips_audio_items() {
         let mut app = setup_app();
         let video_a = push_video(&mut app, r"C:\clips\a.mp4");
@@ -23474,6 +23508,43 @@ mod still_window_mode_key_tests {
                 Some((target.right - 10, target.top + 10))
             ),
             "music parked windows must not reuse the legacy image close-bar hit rect"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_music_window_close_button_hit_ignores_invalid_layout() {
+        let target = DetachedActivationWatchTargetRect {
+            window_id: 7,
+            hwnd: 0x7000,
+            left: 100,
+            top: 100,
+            right: 140,
+            bottom: 140,
+            eligible: true,
+            close_hit_test: DetachedActivationCloseHitTest::MusicChrome,
+        };
+
+        assert!(
+            App::parked_live_music_close_slot_rect(
+                egui::Rect::from_min_max(
+                    egui::pos2(target.left as f32, target.top as f32),
+                    egui::pos2(target.right as f32, target.bottom as f32),
+                ),
+                crate::ui_helpers::panel_edge_trigger_px((target.right - target.left) as f32),
+            )
+            .is_none(),
+            "the tiny music window layout has no valid close slot"
+        );
+        assert!(
+            !App::detached_activation_close_button_contains(
+                target,
+                Some((
+                    (target.left + target.right) / 2,
+                    (target.top + target.bottom) / 2
+                ))
+            ),
+            "invalid music chrome layout must not treat the whole window as the close button"
         );
     }
 
