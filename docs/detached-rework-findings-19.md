@@ -722,3 +722,30 @@ fix14 は「Auto 分岐内の bbox 供給」だけを守ったが、**分岐の�
    再アクティブ化とも) (ii) fix14 のシナリオ (動画別窓 open) の回帰確認 (iii) メイン
    fullscreen 側の自動トリムに退行なし。
 6. コミット `(detached-rework findings-19 fix15)`。
+
+### fix15 実装メモ (Codex 2026-07-09)
+
+- 調査結果: `preserve_active_detached_for_main_change` の skip は、active Book 窓が
+  `active_detached_viewer_context` 側に退避されているのに、判定が main App の
+  `fullscreen_idx/viewer_presentation/detached_viewer_window_id` を見ていたため。ただし
+  表示退化の直接根はさらに手前で、`ViewerContextBundle` が `view_trim_apply_mode` /
+  `view_trim_book_settings` / page override 群を所有していなかったこと。active Book context は
+  `items/fs_cache` だけ独立し、trim 決定だけ main context の `apply_view_trim_for_key()` に
+  上書きされていた。
+- 選択した修正: 指示 2(b) の「live 維持」を採用。`ViewerContextBundle` に view-trim 状態一式
+  (`view_trim_mode`, apply mode, page-apply root, spread UI state, book settings,
+  page overrides, dirty set, save pending) を追加し、`swap_viewer_context_bundle()` に含めた。
+  これで active detached live 描画は、その窓自身の trim 状態を読む。main のお気に入り /
+  folder load が別フォルダの trim 設定をロードしても、mounted detached context には伝播しない。
+- 採用理由: fix14 の runtime bbox 焼き込みだけでは Auto 分岐に入る前の apply-mode 依存を断てない。
+  一方、active context は既に items / fs_cache / zoom / spread 等を bundle 所有しており、view-trim
+  も同じ表示文脈の一部として bundle 化するのが所有境界に合う。park 強制は live 窓を不必要に
+  frozen 化し、Context が無い load 経路で spread snapshot を完全に焼けない既存制約も残るため
+  採らなかった。
+- `preserve_active_detached_for_main_change skipped` には `actual_session_window` /
+  `actual_session_source` を追記し、今後同じ述語ズレが起きた時に main App 側の値と実セッションを
+  1 行で突き合わせられるようにした。
+- 回帰テスト `active_detached_context_owns_view_trim_state_across_main_context_change` で、
+  active detached context に Book trim を持たせた後、main 側を別フォルダ相当に
+  `ViewTrimApplyMode::None` へ上書きしても、mounted detached context の bbox が維持され、
+  mount 後に main 側の trim mode が復元されることを固定した。

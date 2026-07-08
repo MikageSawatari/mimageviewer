@@ -2154,6 +2154,15 @@ struct ViewerContextBundle {
     analysis_mosaic_grid: bool,
     analysis_filter_mag: u8,
     analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
+    view_trim_mode: bool,
+    view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    view_trim_page_apply_root_idx: Option<usize>,
+    view_trim_page_spread_separate: bool,
+    view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
+    view_trim_page_overrides:
+        std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
+    view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
+    view_trim_save_pending: bool,
     fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
@@ -2333,6 +2342,14 @@ impl ViewerContextBundle {
             analysis_mosaic_grid: false,
             analysis_filter_mag: 0,
             analysis_guide_drag: None,
+            view_trim_mode: false,
+            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_page_apply_root_idx: None,
+            view_trim_page_spread_separate: false,
+            view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
+            view_trim_page_overrides: std::collections::HashMap::new(),
+            view_trim_dirty_page_overrides: std::collections::HashSet::new(),
+            view_trim_save_pending: false,
             fs_cache: std::collections::HashMap::new(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
@@ -10572,6 +10589,14 @@ impl App {
             analysis_mosaic_grid,
             analysis_filter_mag,
             analysis_guide_drag,
+            view_trim_mode,
+            view_trim_apply_mode,
+            view_trim_page_apply_root_idx,
+            view_trim_page_spread_separate,
+            view_trim_book_settings,
+            view_trim_page_overrides,
+            view_trim_dirty_page_overrides,
+            view_trim_save_pending,
             fs_cache,
             fs_margin_bbox_cache,
             input_generation,
@@ -10730,6 +10755,14 @@ impl App {
         swap_field!(analysis_mosaic_grid);
         swap_field!(analysis_filter_mag);
         swap_field!(analysis_guide_drag);
+        swap_field!(view_trim_mode);
+        swap_field!(view_trim_apply_mode);
+        swap_field!(view_trim_page_apply_root_idx);
+        swap_field!(view_trim_page_spread_separate);
+        swap_field!(view_trim_book_settings);
+        swap_field!(view_trim_page_overrides);
+        swap_field!(view_trim_dirty_page_overrides);
+        swap_field!(view_trim_save_pending);
         swap_field!(fs_cache);
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
@@ -27905,10 +27938,19 @@ impl App {
     #[cfg(windows)]
     fn preserve_active_detached_image_window_for_main_context_change(&mut self) -> bool {
         if !self.should_preserve_active_detached_image_window_for_main_context_change() {
+            let actual_session_window = self
+                .active_detached_session
+                .map(|session| session.window_id);
+            let actual_session_source = self
+                .active_detached_session
+                .map(|session| format!("{:?}", session.source))
+                .unwrap_or_else(|| "None".to_string());
             self.log_detached_image_window_debug(format!(
                 "preserve_active_detached_for_main_change skipped fs_idx={:?} \
                  session_detached={} independent={} active_context={} \
-                 window_id={:?} passive_windows={} fs_nav_locked={}",
+                 window_id={:?} actual_session_window={actual_session_window:?} \
+                 actual_session_source={actual_session_source} passive_windows={} \
+                 fs_nav_locked={}",
                 self.fullscreen_idx,
                 self.viewer_session_is_detached(),
                 self.detached_viewer_independent_active,

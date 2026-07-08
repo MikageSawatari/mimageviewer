@@ -20285,6 +20285,62 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn active_detached_context_owns_view_trim_state_across_main_context_change() {
+        let mut app = setup_app();
+        let detached_idx = push_image(&mut app, r"C:\books\a.pdf.page-1.png");
+        app.fullscreen_idx = Some(detached_idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(74);
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_settings.enabled = true;
+        app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
+            left: 0.10,
+            top: 0.05,
+            right: 0.20,
+            bottom: 0.15,
+        };
+        let expected_bbox = app
+            .view_trim_single_content_bbox(detached_idx)
+            .expect("detached book trim should produce a bbox before parking");
+        let bundle = app.take_current_viewer_context_bundle();
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.begin_active_detached_session(74, DetachedSource::Book);
+
+        let main_idx = push_image(&mut app, r"C:\other\main.png");
+        app.fullscreen_idx = None;
+        app.selected = Some(main_idx);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+        app.view_trim_book_settings = crate::view_trim::ViewTrimBookSettings::default();
+        app.view_trim_page_overrides.clear();
+
+        app.with_active_detached_viewer_context(|mounted| {
+            assert_eq!(mounted.fullscreen_idx, Some(detached_idx));
+            assert_eq!(
+                mounted.viewer_presentation,
+                ViewerPresentation::DetachedWindow
+            );
+            assert_eq!(
+                mounted.view_trim_apply_mode,
+                crate::view_trim::ViewTrimApplyMode::Book,
+                "active detached context must not inherit the main folder trim mode"
+            );
+            let actual = mounted
+                .view_trim_single_content_bbox(detached_idx)
+                .expect("detached context should keep its own book trim bbox");
+            assert_rect_close(actual, expected_bbox);
+        })
+        .expect("active detached context should mount");
+
+        assert_eq!(
+            app.view_trim_apply_mode,
+            crate::view_trim::ViewTrimApplyMode::None,
+            "mounting the detached context must restore the main folder trim mode"
+        );
+    }
+
+    #[test]
     fn paused_single_page_detached_window_does_not_use_multi_page_frozen_snapshot() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
