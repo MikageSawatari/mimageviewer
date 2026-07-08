@@ -18723,6 +18723,17 @@ mod still_window_mode_key_tests {
             app.panorama_state.is_none(),
             "opening the follow-up window should still reset foreground panorama mode"
         );
+        let second_window_id = app
+            .detached_viewer_window_id
+            .expect("second detached window should be active");
+        assert_ne!(first_window_id, second_window_id);
+        app.detached_window_hwnd_set(second_window_id, 0x2222);
+        app.transition_detached_window_state(
+            second_window_id,
+            DetachedWindowState::Active,
+            "test_active_switch_second",
+        );
+        app.detached_viewer_host_generation = 17;
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, first_window_id));
 
@@ -18740,6 +18751,21 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].location_display, "b.jpg");
         assert!(app.detached_image_windows[0].can_activate());
+        assert_eq!(app.detached_image_windows[0].id, second_window_id);
+        assert_eq!(
+            app.detached_window_state(second_window_id),
+            Some(DetachedWindowState::Parked),
+            "switching active still windows must park the previous active window in place"
+        );
+        assert_eq!(
+            app.detached_window_hwnd_raw_for_window_id(second_window_id),
+            0x2222,
+            "the previous active window HWND must survive the active switch"
+        );
+        assert_eq!(
+            app.detached_viewer_host_generation, 17,
+            "active switching must not close/recreate the previous active window"
+        );
     }
 
     #[test]

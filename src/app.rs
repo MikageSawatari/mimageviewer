@@ -26825,6 +26825,17 @@ impl App {
             );
             return self.close_current_active_detached_viewer_context(ctx);
         } else if self.viewer_session_is_detached() {
+            if self.preserve_active_detached_image_window_for_main_context_change() {
+                self.log_detached_image_window_debug(format!(
+                    "park_current_active_detached result=parked_legacy_detached fs_idx={:?} \
+                     independent={} passive_windows={} session={:?}",
+                    self.fullscreen_idx,
+                    self.detached_viewer_independent_active,
+                    self.detached_image_windows.len(),
+                    self.active_detached_session
+                ));
+                return true;
+            }
             self.log_detached_image_window_debug(format!(
                 "park_current_active_detached result=close_legacy_detached fs_idx={:?} \
                  independent={} passive_windows={}",
@@ -26832,7 +26843,6 @@ impl App {
                 self.detached_viewer_independent_active,
                 self.detached_image_windows.len()
             ));
-            self.preserve_active_detached_image_window_for_main_context_change();
             let closing_window_id = self
                 .active_detached_session
                 .map(|session| session.window_id)
@@ -27796,6 +27806,7 @@ impl App {
             ));
             return false;
         }
+        let parked_window_id = self.detached_viewer_window_id;
         let parked = self.park_active_detached_image_window();
         self.log_detached_image_window_debug(format!(
             "preserve_active_detached_for_main_change result={parked} \
@@ -27809,6 +27820,13 @@ impl App {
         ));
         if parked {
             self.handoff_active_detached_viewport_to_passive("main_context_change");
+            if let Some(window_id) = parked_window_id {
+                self.transition_detached_window_state(
+                    window_id,
+                    DetachedWindowState::Parked,
+                    "main_context_change_handoff",
+                );
+            }
             self.detached_viewer_independent_active = false;
         }
         self.detached_viewer_open_next_still_detached_once = false;
