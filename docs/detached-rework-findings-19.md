@@ -187,3 +187,37 @@ Phase 1 の判断 (A = legacy close 経路の誤発火、B = snapshot/live の f
   補償機構 (resume_still_snapshot / reopen_descriptor) の到達性整理はリリース後の
   クリーンアップ候補としてここに記録する。
 - 実機確認 (ユーザー): W1/W2/W10 (高速切替・全閉じ) + アクティブ化瞬間の画像静止。
+
+## fix11 (実機 FB 2026-07-08): 非アクティブ窓で OS の × ボタンが効かない
+
+**症状**: passive (非アクティブ) 静止画窓のタイトルバー × をクリックしても閉じない。
+1 回クリックでアクティブ化した後なら閉じられる。ユーザー判断 = 直感に反するので修正する。
+
+**機構 (Fable 見立て、Phase 1 で確認)**: OS の × は非アクティブ窓にも WM_CLOSE を送り、
+コードは deferred/immediate 両 passive 経路とも `viewport_close_requested` を配線済み
+(ui_fullscreen.rs 4494/4935)。効かない原因の有力候補:
+(a) **deferred viewport のイベント配送欠落** (findings-8 A1 と同じ配送路) が
+close_requested にも及ぶ、(b) × の物理 down を watcher がタイトルバー click と解釈して
+activation に変換 (G1 層別) し、close にならない。
+
+### fix11 要件 — 短い Phase 1 → 実装
+
+1. **Phase 1 (計装 or コード確認、1 ラウンド)**: 非アクティブ窓の × クリック時に
+   deferred 側の `viewport_close_requested` が true で観測されるかを確認 (probe 可。
+   `MIV_DETACHED_WINDOW_DEBUG` ゲート + イベント時のみ出力)。観測されるなら race/処理順、
+   されないなら配送欠落と確定。
+2. **実装 (どちらかを採用、採った方と理由を実装メモに記載)**:
+   - **案 A**: watcher の down/up に `WM_NCHITTEST == HTCLOSE` 判定を追加し、× 上の
+     down→up は activation でなく既存 close intent (G2 経路) に変換する。判定は OS への
+     問い合わせのみ (ジオメトリ計算・DPI 補正を自前でしない)。cross-thread
+     `SendMessageW` のブロッキングが気になる場合は `SendMessageTimeoutW` 小 timeout 可
+     (時間窓ではなくデッドロック回避の下限)。
+   - **案 B**: 登録済み detached HWND に軽量 subclass を張り、WM_CLOSE (または
+     WM_SYSCOMMAND/SC_CLOSE) を既存 close intent チャネルへ変換する
+     (`install_main_window_subclass` と同パターン)。install/uninstall は HWND registry の
+     登録/クリアに同期。
+3. どちらの案でも: 既存の close 優先処理 (close と activation が同時に来たら close 勝ち) と
+   dedup を再利用。アクティブ窓・メイン窓の × は不変。ParkedLive (メディア) 窓の × も
+   同じ経路で閉じることを確認。
+4. テスト: × 由来の close intent が activation より優先されること (純関数 or シーケンス)。
+5. コミット `(detached-rework findings-19 fix11)`。
