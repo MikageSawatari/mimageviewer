@@ -1316,6 +1316,26 @@ take して破棄する (ログなし)**。fix7-2 は close / timeout / abort �
    既存 fix7/fix7-2 テスト維持。
 6. コミット `(detached-rework stage-audio fix7-3)`。
 
+### fix7-3 実装メモ (Codex 2026-07-08)
+
+- `poll_native_video_source_swap_pending()` の冒頭で parked-origin pending の owner を確認する。
+  `pending.parked_live_window_id=Some(id)` かつ
+  `native_video_parked_live_input_window_id != Some(id)` の poll 文脈では、event drain /
+  context mismatch guard / timeout 判定を含めて一切処理せず pending を温存する。
+- これにより、parked poll で enqueue された pending を、後段の root main poll や
+  `update_active_detached_viewer_context()` 内の別 bundle mount poll が誤って drop する経路を
+  塞ぐ。実機ログでは root main poll は active context へ委譲されていたため、候補は
+  active detached context 側の `poll_video()` 到達経路。いずれの文脈でも owner 不一致なら
+  pending に触れない。
+- 旧 `fullscreen_idx != target_idx || target item != Video(path)` branch は silent drop だったため、
+  drop 理由・current fs idx・target idx・target item kind・parked owner を必ずログする。
+- 動画 EOF の次ターゲットは `find_next_video_in_display_order_from()` が `GridItem::Video` のみを
+  返すため、動画 source-swap completion guard の `GridItem::Video` 限定とは衝突しない。
+  音声ファイル EOF は fix7-2 の parked-safe audio path を使う。
+- 回帰テスト:
+  `parked_source_swap_pending_waits_for_matching_parked_poll_owner` /
+  `video_continuous_target_search_skips_audio_items`。
+
 ### 保留中の実機 FB (fix7-3 の後に対応、未指示)
 
 - 音声モード上 HUD の右側ボタン群と、動画の上 HUD が減光されていない (fix6b の top dim

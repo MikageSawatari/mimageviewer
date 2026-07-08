@@ -1013,8 +1013,36 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn poll_native_video_source_swap_pending(&mut self, ctx: &egui::Context) {
-        self.drain_native_video_source_swap_pending_events(ctx);
+        let Some(parked_live_window_id) = self
+            .native_video_source_swap_pending
+            .as_ref()
+            .and_then(|pending| pending.parked_live_window_id)
+        else {
+            self.drain_native_video_source_swap_pending_events(ctx);
+            return self.poll_native_video_source_swap_pending_after_owner_gate(ctx);
+        };
 
+        if !Self::parked_source_swap_poll_owner_matches(
+            Some(parked_live_window_id),
+            self.native_video_parked_live_input_window_id,
+        ) {
+            return;
+        }
+
+        self.drain_native_video_source_swap_pending_events(ctx);
+        self.poll_native_video_source_swap_pending_after_owner_gate(ctx);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn parked_source_swap_poll_owner_matches(
+        pending_window_id: Option<u64>,
+        current_parked_input_window_id: Option<u64>,
+    ) -> bool {
+        pending_window_id.is_none() || pending_window_id == current_parked_input_window_id
+    }
+
+    #[cfg(windows)]
+    fn poll_native_video_source_swap_pending_after_owner_gate(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.native_video_source_swap_pending.as_ref() else {
             return;
         };
@@ -1032,6 +1060,17 @@ impl App {
             if let Some(pending) = self.native_video_source_swap_pending.take() {
                 pending.native_output.set_navigation_preview(None);
             }
+            let item_kind = self
+                .items
+                .get(target_idx)
+                .map(Self::grid_item_kind_for_source_swap_log)
+                .unwrap_or("missing");
+            crate::logger::log(format!(
+                "[native-video] deferred source swap dropped: reason=context_mismatch \
+                 current_fs_idx={:?} target_idx={target_idx} target_item_kind={item_kind} \
+                 parked_live_window_id={parked_live_window_id:?}",
+                self.fullscreen_idx
+            ));
             return;
         }
 
@@ -1262,6 +1301,25 @@ impl App {
             );
         }
         ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn grid_item_kind_for_source_swap_log(item: &GridItem) -> &'static str {
+        match item {
+            GridItem::Folder { .. } => "folder",
+            GridItem::Image(_) => "image",
+            GridItem::Video(_) => "video",
+            GridItem::Audio(_) => "audio",
+            GridItem::ZipFile(_) => "zip-file",
+            GridItem::PdfFile(_) => "pdf-file",
+            GridItem::ConvertibleArchive { .. } => "convertible-archive",
+            GridItem::ZipImage { .. } => "zip-image",
+            GridItem::ZipSeparator { .. } => "zip-separator",
+            GridItem::ZipDir { .. } => "zip-dir",
+            GridItem::PdfPage { .. } => "pdf-page",
+            GridItem::Stack { .. } => "stack",
+            GridItem::SearchContainer { .. } => "search-container",
+        }
     }
 
     #[cfg(windows)]

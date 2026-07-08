@@ -22334,6 +22334,43 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn parked_source_swap_pending_waits_for_matching_parked_poll_owner() {
+        assert!(App::parked_source_swap_poll_owner_matches(None, None));
+        assert!(App::parked_source_swap_poll_owner_matches(None, Some(7)));
+        assert!(App::parked_source_swap_poll_owner_matches(Some(7), Some(7)));
+        assert!(
+            !App::parked_source_swap_poll_owner_matches(Some(7), None),
+            "a parked-origin pending must not be processed by main or active-context poll"
+        );
+        assert!(
+            !App::parked_source_swap_poll_owner_matches(Some(7), Some(8)),
+            "a parked-origin pending belongs to exactly one parked window bundle"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_continuous_target_search_skips_audio_items() {
+        let mut app = setup_app();
+        let video_a = push_video(&mut app, r"C:\clips\a.mp4");
+        let audio = push_audio(&mut app, r"C:\music\b.flac");
+        let video_b = push_video(&mut app, r"C:\clips\c.mp4");
+        let order = vec![video_a, audio, video_b];
+
+        assert_eq!(
+            App::find_next_video_in_display_order_from(&app.items, &order, video_a, false),
+            Some(video_b),
+            "video EOF uses the video-only source-swap path and must not target audio"
+        );
+        assert_eq!(
+            App::find_next_audio_in_display_order_from(&app.items, &order, video_a, false),
+            Some(audio),
+            "audio EOF has its own parked-safe path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn parked_audio_continuous_target_stays_inside_bundle() {
         let mut app = setup_app();
         let audio_a = push_audio(&mut app, r"C:\music\a.flac");
