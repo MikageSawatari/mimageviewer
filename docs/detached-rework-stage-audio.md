@@ -1352,12 +1352,51 @@ main 側の動画ナビが止まり得る。対策 = ①parked 窓の close/remo
 pending を破棄 (ログ付き) ②update 分岐は「現在文脈が非 parked なら owner を None に更新」が
 正しいか検討して揃える。テスト各 1 本。
 
-### 保留中の実機 FB (fix7-3 の後に対応、未指示)
+### fix7-3 実機確認 OK (ユーザー 2026-07-08)
 
-- 音声モード上 HUD の右側ボタン群と、動画の上 HUD が減光されていない (fix6b の top dim
-  適用範囲もれの疑い、スクリーンショットあり 2026-07-08)。
-- 複数ウィンドウモードで「右クリックで画像が閉じない」「リングショートカット・マウス
-  ジェスチャが機能しない」(fix6f のポインタ配送停止 or 入力経路の対象窓判定の疑い、要調査)。
+parked EOF 進行 = 動画→次ファイル / 動画の音声モード / 音声ファイルのすべてで、
+非アクティブのまま次へ進むことを実機確認 (§5 項目 8 の進行部分クリア)。
+
+## 3.22 実機 FB: fix6h = HUD 減光の適用もれ 2 箇所 (機構確定済み)
+
+- **① native 動画の上バーが減光されない**: 上バーの dim は `draw_native_hud_dim_overlay`
+  ([mod.rs:7549-7556](../src/video/native_presenter/mod.rs)) が `panel_chrome_visible` を
+  ゲートに別 Area 帯を重ねる方式のままで、**上バーの実表示ゲート (`top_bar_visible`、
+  fix6g で raw hover 化) と不一致**。fix6b-2 が bottom で確立した **in-place dim**
+  (描画ブロック末尾で同 painter に dim rect) を上バーにも適用して
+  `draw_native_hud_dim_overlay` を撤去する (タイルモード側の呼び出し
+  [mod.rs:6052](../src/video/native_presenter/mod.rs) も同様に in-place 化)。
+- **② 音声 (音楽ビュー) parked 窓の上部右側ボタン群が減光されない**: `draw_music_top_chrome`
+  のボタンは bg (`top_btn_bg`) が interactive 無関係の固定色 + アイコン描画関数
+  (`draw_overlay_close_icon` / `draw_overlay_window_toggle_icon` / `draw_overlay_video_icon` /
+  `draw_overlay_vst3_top_icon`) が**固定色で dim 未適用**。interactive=false のとき
+  ボタン bg + アイコンにも `music_chrome_dim_color` 相当の減光を適用する (アイコン関数に
+  色/係数引数を足す or ボタン rect に dim rect を重ねる、いずれでも可。× は parked でも
+  クリック可能だが見た目は他ボタンと同じ減光でよい)。
+- テスト: 可能な範囲で dim 色導出の純関数テスト。目視確認は実機 (§5 項目 7/6)。
+- コミット `(detached-rework stage-audio fix6h)`。**fix6g-2 (× fallback) と fix7-4
+  (stale pending 掃除) をこのコミットに同梱してよい**。
+
+## 3.23 実機 FB: fix9 = 複数ウィンドウモードで右クリック close / リング / マウスジェスチャ不能 — Phase 1 調査 → 報告 → 実装
+
+**症状 (実機 2026-07-08)**: 複数ウィンドウモード (ON) のアクティブ静止画窓で、
+右クリックで画像 (窓) が閉じない・リングショートカット (右ドラッグ)・マウスジェスチャが
+機能しない。
+
+**Phase 1 (調査、先に報告)**:
+
+1. egui の右クリック/右ドラッグ処理ブロック ([ui_fullscreen.rs:11426-](../src/ui_fullscreen.rs)、
+   `handle_fs_wheel_and_click` 内) が、ON モードのアクティブ detached 静止画窓の描画で
+   **どの ctx (root / viewport) の input を読んでいるか**、そもそもこのブロックに到達して
+   いるかを特定する (still_window_mode 系の独自 dispatch が key と同様に右クリックを
+   別扱いしている可能性)。
+2. これが**リワークでの退行か、ON モード初期からの未配線か**を切り分ける (git 履歴 or
+   旧ビルド確認は不要、コード構造からの判断でよい)。
+3. 右クリック close の期待挙動を報告に含める: ON モードの独立窓で「右クリック = 窓 close」
+   で良いか、リング/ジェスチャの context (`current_right_drag_context`) が独立窓で正しく
+   解決されるか。
+4. 修正方針を提示して Fable 承認後に実装 (`(detached-rework stage-audio fix9)`)。
+   activation/parked 系 (watcher・filter) には触れないこと (スコープは入力 dispatch のみ)。
 
 ## 4. 完了条件
 
