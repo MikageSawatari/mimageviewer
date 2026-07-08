@@ -749,3 +749,26 @@ fix14 は「Auto 分岐内の bbox 供給」だけを守ったが、**分岐の�
   active detached context に Book trim を持たせた後、main 側を別フォルダ相当に
   `ViewTrimApplyMode::None` へ上書きしても、mounted detached context の bbox が維持され、
   mount 後に main 側の trim mode が復元されることを固定した。
+
+### fix15 検収 (Fable 2026-07-09)
+
+260d8800 を diff 検収。**検収 OK、実機 OK (ユーザー確認済み)。トリム退化問題クローズ**。
+
+- 選択は指示 2(b) の徹底版: view-trim 状態一式 (mode / apply mode / page-apply root /
+  spread UI / book settings / page overrides / dirty set / save pending の 8 フィールド) を
+  `ViewerContextBundle` に移し `swap_viewer_context_bundle()` で完全交換。所有境界
+  (items / fs_cache と同じ「表示文脈の一部」) に合わせる筋で、active-decoupled 独自バンドル
+  構造 (pin redesign §3.0) と整合。(a) を採らない理由も実装メモに明記されており妥当
+  (park 強制は live 窓の不必要な frozen 化 + context 無し load 経路の snapshot 制約)。
+- 憲法: App 新規 bool なし (バンドルへ)・時間窓なし・症状パッチでなく所有境界の修正。
+- 述語ズレ (fix15 指示 1) は「preserve 判定が main App の値を見る一方、Book context は
+  退避済み」という正常状態の誤読と特定。(b) 採用後は independent 窓は park 不要 = skip は
+  正しい動作になるため判定は温存、計装 (`actual_session_window/source`) で将来の突き合わせを
+  可能にした。指示の意図を満たす。
+- テスト `active_detached_context_owns_view_trim_state_across_main_context_change` は
+  指示 4 どおり (main 側 None 上書き後も mounted context の Book trim と bbox が不変 +
+  mount 後の main 復元)。フルテスト 3265 green。
+- **P3 観察 (対応不要、記録のみ)**: `view_trim_save_pending` / dirty set も bundle 交換される
+  ため、detached 窓で trim 操作直後 (pointer up 前) に swap-out すると persist が mount まで
+  遅延する。通常は pointer up で即 persist されるので窓は極小。終了時に swap-out 側の
+  pending が保存されない可能性だけ頭の隅に置く。
