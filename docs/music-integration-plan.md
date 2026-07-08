@@ -173,7 +173,7 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 
 ### 3.1 ラボで完成済み（`music-core` + `music_lab`）
 - stereo waveform bin / low-mid-high energy / loudness / 簡易 BPM・beat/bar grid（`WaveformBin`/`BeatGrid`）
-- 30〜60秒 1 行の DJ 風カラー波形タイムライン + メトリクスレーン（loudness+bass root / key / vocal hint）
+- 30〜60秒 1 行の DJ 風カラー波形タイムライン + メトリクスレーン（loudness+bass root / key）
 - MIDI 半音 spectrum analyzer（`SpectrumAnalyzer`、多解像度 FFT）
 - 部分解析ストリーミング（decode 中に約5秒単位で timeline を先出し）
 
@@ -958,7 +958,7 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   in-memory 化 (§6/D8) 済みなのでディスク増はゼロ。
 - [x] loudness+bass root レーン（高さ=loudness、色=`bass_pitch_class` 五度圏）（Inc 3b）
 - [x] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）（Inc 3b）
-- [ ] vocal hint 独立レーン（`vocal_score` / `center_ratio`）（未着手）
+- [x] 歌声目安レーンはキャンセル済み。`center_ratio` は汎用の stereo center metric として残す。
 - [x] Row 秒数切替（解析キャッシュ再生成せず raster のみ作り直し）（Inc 3b、上バー巡回）
 - [x] メトリクスレーンのホバー（レーン名/値/時刻/推定音名）（Inc 3b）
 - [x] 再生カーソル行の自動スクロール（手動スクロール中は追従しない）（Inc 3b、follow_playhead）
@@ -1184,7 +1184,7 @@ placement に作り直す経路。headless→native の「presenter 無し→有
     基準で安定。timeline cache は解析 `Arc` identity 変化時に全 `row_version` を進めて既存 tile を
     再ラスタ（playhead→可視の優先描画はそのまま再利用）。partial 後に decode 失敗しても波形は消さ
     ない。music-core は無改変。Codex 設計レビュー（P1×1 / P2×4 / P3×2 すべて反映）+ code review 済み。
-  - **残り（Inc 3 の未実装）**: vocal hint 独立レーン / 手動 BPM 補正は未着手。
+  - **残り（Inc 3 の未実装）**: 手動 BPM 補正は未着手。歌声目安レーンはキャンセル済み。
 
 - **Inc 4: MIDI 半音 spectrum worker（下段）** — ✅ **実装済み（2026-07-02、半音バー化 2026-07-05）**
   - `SpectrumAnalyzer` 常駐 worker + 展開済み PCM の playhead ±1s スライス（案A、§11 で確定）。
@@ -1373,7 +1373,7 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 
 ### ラボ側（機能の正本）
 - `C:\home\mimageviewer-music-lab\docs\music-lab-plan.md`（データ契約・非同期境界・解析エンジン方針）
-- `music-lab-vocal-eval.md` / `music-lab-validation-checklist.md`（ラボ実機検証）
+- `music-lab-validation-checklist.md`（ラボ実機検証）
 - `crates/music-core/src/lib.rs`（公開契約）
 
 ### mIV 本体側（統合先の作法）

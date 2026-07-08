@@ -51,29 +51,10 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - All-In-One は intro / verse / chorus / bridge / outro などの functional label を返すため優先評価する。
   - librosa の recurrence / agglomerative clustering、MSAF 系を試作候補にする。
   - 意味ラベルは自動判定だけに頼らず、ユーザー補正・色分け・保存を前提にする。
-- Vocal interval:
-  - 曲冒頭シーク用途では音源分離ではなく、vocal activity 区間だけを検出する。
-  - Clean MVP は数秒窓の mid-band energy、harmonicity、spectral flatness、onset density から
-    vocal-likelihood を作り、歌い出し候補時刻だけをキャッシュする。
-  - 初期実装は `WaveformBin.vocal_score` として、軽量 DSP の中域比率 / zero-crossing /
-    crest / transient 抑制 / 約 1 秒の持続性から 0..1 のスコアを作る。
-    タイムライン下段はラウドネスと混色せず、vocal hint を独立レーンとして表示する。
-  - 散発的な誤反応を避けるため、短い断片は捨て、約 2 秒以上まとまる候補だけを表示する。
-    autocorrelation による有声音の周期性も加えて、ノイズ的な中域反応を抑える。
-    倍音/周期性はギターやシンセにも出るため、軽量 DSP だけではインストとの完全分離は期待しない。
-    次の改善候補は formant 風の中域包絡や YAMNet / PANNs sidecar との比較。
-    短いギャップは bridge し、明確な終了では release を速める。
-    男性ボーカル / ラップ / 強い加工声では高精度ラベルと軽量 DSP のズレが大きくなりやすいので、
-    評価セットに含める。軽量 DSP は完全一致ではなく、低 FP 寄りの「それっぽいヒント」
-    を合格ラインにする。
-  - DSP の調整は [music-lab-vocal-eval.md](music-lab-vocal-eval.md) の教師ラベル JSON と
-    `cargo run -p music_lab --bin vocal_eval -- labels.json` で precision / recall を見ながら進める。
-    教師ラベルは手入力を正本にせず外部高精度ツールで作ってよいが、重いモデルの起動コードは
-    lab 本体に持たせず、生成済み JSON を明示的に評価 CLI へ渡す。
-  - All-In-One の demixed vocal stem や embeddings を利用できるか評価する。
-  - 重い音源分離 / 高精度モデルは lab 本体から起動せず、必要なら外部で評価ラベルを生成して持ち込む。
-  - inaSpeechSegmenter は MIT だが singing voice は music 扱いなので、歌あり区間の検出にはそのまま使わない。
-  - SingingVoiceDetection 系の MIT 実装や music tagging モデルを、ONNX 化できるか確認する。
+- 歌声区間推定:
+  - 「歌声の目安」表示はキャンセル済み。`music-core` は歌声専用スコアを持たず、
+    タイムライン下段は loudness+bass root と key の 2 レーンだけを扱う。
+  - `center_ratio` は stereo center dominance の汎用メトリクスとして残すが、歌声推定には使わない。
 
 ## 初期スコープ
 
@@ -131,7 +112,7 @@ UI の手触りとデータモデルを固めてから本体へ統合する。
   - DJ 風カラー波形: `band_energy`, `transient`, `transient_band`
   - 構成ヒント: `brightness`, `transient_density`, `novelty`
   - 音程ヒント: `bass_pitch_class`, `bass_pitch_confidence`, `key_pitch_class`, `key_confidence`, `bass_chroma`, `chroma`
-  - ボーカル試作値: `center_ratio`, `vocal_score`
+  - 定位ヒント: `center_ratio`
 - `BeatGrid` は `TimelineAnalysis` に含める。低 confidence の自動推定は表示側で隠せるが、キャッシュ上は推定結果と confidence を保持する。
 - Row 秒数や表示幅は解析結果に含めず、表示時の row texture raster 条件として扱う。Row 切替は解析キャッシュの再生成条件にしない。
 - 本体統合時の DB key は path / size / mtime / duration / sample_rate / channels / `analysis_version` を最低限の一致条件にする。

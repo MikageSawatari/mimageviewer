@@ -4522,7 +4522,6 @@ mod tests {
             bass_pitch_confidence: 0.82,
             key_pitch_class: 0,
             key_confidence: 0.70,
-            vocal_score: 0.42,
             ..WaveformBin::default()
         };
 

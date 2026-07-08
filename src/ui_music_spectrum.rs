@@ -59,7 +59,7 @@ const KEY_LOCAL_RATIO_HI: f32 = 1.25;
 /// Layer ③ 埋もれた鍵の最小 factor (完全に消さずチラつき防止)。
 const KEY_LOCAL_FLOOR: f32 = 0.2;
 /// Layer ③ 適用強度の周波数フェード。低域 (~FULL_HZ 以下)=full(1.0) / 高域 (~FADE_HZ 以上)=MIN。
-/// 機能している中高域 (ボーカル帯) を壊さないよう低域中心に効かせる。
+/// 機能している中高域を壊さないよう低域中心に効かせる。
 const KEY_LOCAL_FULL_HZ: f32 = 160.0;
 const KEY_LOCAL_FADE_HZ: f32 = 700.0;
 const KEY_LOCAL_MIN_STRENGTH: f32 = 0.45;

@@ -13,7 +13,7 @@ pub const SPECTRUM_BAND_MIN_MIDI: u8 = 16; // E0, the first semitone band above 
 pub const SPECTRUM_BAND_MAX_MIDI: u8 = 133; // C#10, whose upper edge covers 18kHz.
 pub const SPECTRUM_BAND_COUNT: usize =
     (SPECTRUM_BAND_MAX_MIDI - SPECTRUM_BAND_MIN_MIDI + 1) as usize;
-pub const TIMELINE_ANALYSIS_VERSION: u32 = 1;
+pub const TIMELINE_ANALYSIS_VERSION: u32 = 2;
 const SPECTRUM_MIN_HZ: f32 = 20.0;
 const SPECTRUM_DISPLAY_MAX_HZ: f32 = 18_000.0;
 const SPECTRUM_DB_FLOOR: f32 = -72.0;
@@ -27,7 +27,6 @@ const SPECTRUM_LOW_SECONDARY_MAX_MIX: f32 = 0.45;
 const SPECTRUM_LOW_DISPLAY_ATTENUATION_DB: f32 = 5.5;
 const SPECTRUM_SUB_DISPLAY_ATTENUATION_DB: f32 = 1.0;
 const SPECTRUM_PRESENCE_DISPLAY_BOOST_DB: f32 = 1.25;
-const VOCAL_PERIODICITY_TARGET_HZ: u32 = 8_000;
 const TIMELINE_CHROMA_CLASSES: usize = 12;
 const TIMELINE_CHROMA_WINDOW_SIZE: usize = 8_192;
 const TIMELINE_CHROMA_HOP_SECS: f64 = 0.10;
@@ -152,10 +151,8 @@ pub struct WaveformBin {
     pub transient: f32,
     /// Normalized low / mid / high contribution to the transient accent.
     pub transient_band: [f32; 3],
-    /// 0..1 stereo center dominance. Lead vocals are often mixed near center.
+    /// 0..1 stereo center dominance.
     pub center_ratio: f32,
-    /// 0..1 lightweight vocal-likelihood estimate for timeline coloring.
-    pub vocal_score: f32,
     /// 0..1 high-band presence normalized for section-change hints.
     #[serde(default)]
     pub brightness: f32,
@@ -246,10 +243,6 @@ pub fn analyze_stereo_timeline(
     let mut prev_band_rms = [0.0_f32; 3];
     let low_alpha = one_pole_alpha(config.low_cut_hz, sample_rate);
     let mid_alpha = one_pole_alpha(config.mid_cut_hz, sample_rate);
-    let mut vocal_raw = Vec::with_capacity(frame_count.div_ceil(frames_per_bin));
-    let vocal_period_step = (sample_rate / VOCAL_PERIODICITY_TARGET_HZ).max(1) as usize;
-    let vocal_period_rate = sample_rate as f32 / vocal_period_step as f32;
-
     let mut frame_start = 0usize;
     while frame_start < frame_count {
         let frame_end = (frame_start + frames_per_bin).min(frame_count);
@@ -264,21 +257,12 @@ pub fn analyze_stereo_timeline(
         let mut low_sum = 0.0_f64;
         let mut mid_sum = 0.0_f64;
         let mut high_sum = 0.0_f64;
-        let mut abs_sum = 0.0_f64;
-        let mut crossings = 0usize;
-        let mut prev_mono = 0.0_f32;
-        let mut have_prev_mono = false;
-        let mut periodicity_samples =
-            Vec::with_capacity((frame_end - frame_start).div_ceil(vocal_period_step).max(1));
 
         for frame_idx in frame_start..frame_end {
             let l = stereo_samples[frame_idx * 2];
             let r = stereo_samples[frame_idx * 2 + 1];
             let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
             let side = ((l - r) * 0.5).clamp(-1.0, 1.0);
-            if (frame_idx - frame_start) % vocal_period_step == 0 {
-                periodicity_samples.push(mono);
-            }
             let abs = mono.abs();
             peak = peak.max(abs);
             square_sum += (mono as f64) * (mono as f64);
@@ -289,16 +273,6 @@ pub fn analyze_stereo_timeline(
             square_sum_l += (lc as f64) * (lc as f64);
             square_sum_r += (rc as f64) * (rc as f64);
             side_square_sum += (side as f64) * (side as f64);
-            abs_sum += abs as f64;
-            if have_prev_mono
-                && mono.signum() != prev_mono.signum()
-                && abs.max(prev_mono.abs()) > 0.004
-            {
-                crossings += 1;
-            }
-            prev_mono = mono;
-            have_prev_mono = true;
-
             low_state += low_alpha * (mono - low_state);
             mid_state += mid_alpha * (mono - mid_state);
             let low = low_state;
@@ -343,22 +317,6 @@ pub fn analyze_stereo_timeline(
         } else {
             [0.0; 3]
         };
-        let crest = peak / rms.max(1.0e-6);
-        let zero_cross_rate = crossings as f32 / (frame_end - frame_start).max(1) as f32;
-        let mean_abs = (abs_sum / n) as f32;
-        let periodicity = voiced_periodicity_score(&periodicity_samples, vocal_period_rate);
-        let vocal_candidate = vocal_candidate_score(
-            loudness_db,
-            band_energy,
-            zero_cross_rate,
-            crest,
-            transient,
-            mean_abs,
-            rms,
-            periodicity,
-            center_ratio,
-        );
-        vocal_raw.push(vocal_candidate);
         bins.push(WaveformBin {
             start_secs: frame_start as f64 / sample_rate as f64,
             duration_secs: (frame_end - frame_start) as f64 / sample_rate as f64,
@@ -373,7 +331,6 @@ pub fn analyze_stereo_timeline(
             transient,
             transient_band,
             center_ratio,
-            vocal_score: 0.0,
             brightness: 0.0,
             transient_density: 0.0,
             novelty: 0.0,
@@ -392,7 +349,6 @@ pub fn analyze_stereo_timeline(
 
         frame_start = frame_end;
     }
-    apply_vocal_scores(&mut bins, &vocal_raw, config.bin_secs);
     apply_timeline_summary_metrics(&mut bins, config.bin_secs);
     apply_chroma_metrics(&mut bins, stereo_samples, sample_rate, config.bin_secs);
     apply_novelty_scores(&mut bins, config.bin_secs);
@@ -518,7 +474,7 @@ impl SpectrumAnalyzer {
                 // Q1: 鍵盤 notes は低音セカンダリ混合を外す (半音分解能優先、低域クラッタ低減)。
                 let power = self.power_for_range(hz, low_hz.max(10.0), high_hz.min(max_hz), false);
                 // Layer ① 知覚補正: 鍵盤 notes にも棒グラフ同等の等ラウドネス dB カーブを掛け、
-                // 低域偏重を解消してボーカル帯を見えやすくする (棒グラフだけ重み付けだった非対称を是正)。
+                // 低域偏重を解消して中高域を見えやすくする (棒グラフだけ重み付けだった非対称を是正)。
                 notes.push(power_to_display_value(
                     power,
                     spectrum_display_weight_db(hz),
@@ -820,239 +776,6 @@ fn linear_to_db(v: f32) -> f32 {
         -120.0
     } else {
         (20.0 * v.log10()).clamp(-120.0, 12.0)
-    }
-}
-
-fn vocal_candidate_score(
-    loudness_db: f32,
-    band_energy: [f32; 3],
-    zero_cross_rate: f32,
-    crest: f32,
-    transient: f32,
-    mean_abs: f32,
-    rms: f32,
-    periodicity: f32,
-    center_ratio: f32,
-) -> f32 {
-    let loudness_gate = smoothstep(-50.0, -20.0, loudness_db);
-    let mid_score = smoothstep(0.14, 0.50, band_energy[1]);
-    let low_penalty = 1.0 - 0.55 * smoothstep(0.55, 0.84, band_energy[0]);
-    let high_penalty = 1.0 - 0.48 * smoothstep(0.56, 0.86, band_energy[2]);
-    let zcr_score = smoothstep(0.0025, 0.0090, zero_cross_rate)
-        * (1.0 - smoothstep(0.08, 0.16, zero_cross_rate));
-    let abs_to_rms = mean_abs / rms.max(1.0e-6);
-    let fullness =
-        smoothstep(0.38, 0.64, abs_to_rms) * (1.0 - 0.35 * smoothstep(0.84, 0.96, abs_to_rms));
-    let crest_penalty = 1.0 - 0.55 * smoothstep(7.0, 16.0, crest);
-    let transient_penalty = 1.0 - 0.55 * smoothstep(0.36, 0.92, transient);
-    let periodicity_gate = 0.34 + 0.66 * smoothstep(0.12, 0.52, periodicity);
-    let center_gate = 0.48 + 0.52 * smoothstep(0.50, 0.82, center_ratio);
-
-    let spectral = (mid_score * low_penalty * high_penalty).sqrt();
-    let tonal = zcr_score * 0.64 + fullness * 0.36;
-    (loudness_gate
-        * spectral
-        * tonal
-        * periodicity_gate
-        * center_gate
-        * crest_penalty
-        * transient_penalty)
-        .clamp(0.0, 1.0)
-}
-
-fn voiced_periodicity_score(samples: &[f32], sample_rate: f32) -> f32 {
-    if samples.len() < 48 || sample_rate <= 0.0 {
-        return 0.0;
-    }
-    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
-    let energy = samples
-        .iter()
-        .map(|sample| {
-            let centered = *sample - mean;
-            centered * centered
-        })
-        .sum::<f32>();
-    if energy <= 1.0e-8 {
-        return 0.0;
-    }
-
-    let min_lag = (sample_rate / 360.0).round().max(2.0) as usize;
-    let max_lag = (sample_rate / 80.0).round().max(min_lag as f32 + 1.0) as usize;
-    let max_lag = max_lag.min(samples.len().saturating_sub(8));
-    if max_lag <= min_lag {
-        return 0.0;
-    }
-
-    let mut best = 0.0_f32;
-    for lag in min_lag..=max_lag {
-        let mut corr = 0.0;
-        let mut a_energy = 0.0;
-        let mut b_energy = 0.0;
-        for i in lag..samples.len() {
-            let a = samples[i] - mean;
-            let b = samples[i - lag] - mean;
-            corr += a * b;
-            a_energy += a * a;
-            b_energy += b * b;
-        }
-        let norm = (a_energy * b_energy).sqrt();
-        if norm > 1.0e-8 {
-            best = best.max((corr / norm).max(0.0));
-        }
-    }
-
-    best.clamp(0.0, 1.0)
-}
-
-fn vocal_phrase_hint_score(bin: &WaveformBin) -> f32 {
-    let loudness = smoothstep(-48.0, -18.0, bin.loudness_db);
-    let mid = smoothstep(0.18, 0.52, bin.band_energy[1]);
-    let air = smoothstep(0.22, 0.64, bin.band_energy[2]);
-    let voice_band = (mid * 0.86 + air * 0.20).min(1.0);
-    let low_penalty = 1.0 - 0.68 * smoothstep(0.62, 0.90, bin.band_energy[0]);
-    let high_penalty = 1.0 - 0.48 * smoothstep(0.74, 0.96, bin.band_energy[2]);
-    let transient_penalty = 1.0 - 0.48 * smoothstep(0.38, 0.90, bin.transient);
-    let center_gate = smoothstep(0.46, 0.82, bin.center_ratio);
-    (loudness * voice_band * low_penalty * high_penalty * transient_penalty * center_gate)
-        .clamp(0.0, 1.0)
-}
-
-fn apply_vocal_scores(bins: &mut [WaveformBin], raw: &[f32], bin_secs: f64) {
-    if bins.is_empty() || raw.is_empty() {
-        return;
-    }
-    let radius = (1.10 / bin_secs.max(0.01)).round().max(1.0) as usize;
-    let phrase_radius = (1.85 / bin_secs.max(0.01)).round().max(radius as f64) as usize;
-    let phrase_hint: Vec<f32> = bins.iter().map(vocal_phrase_hint_score).collect();
-    let mut smoothed = vec![0.0_f32; bins.len()];
-    for i in 0..bins.len() {
-        let start = i.saturating_sub(radius);
-        let end = (i + radius + 1).min(raw.len());
-        let mut score_sum = 0.0;
-        let mut transient_sum = 0.0;
-        let mut active_count = 0usize;
-        let mut strong_count = 0usize;
-        let mut count = 0usize;
-        for j in start..end {
-            score_sum += raw[j];
-            transient_sum += bins[j].transient;
-            if raw[j] > 0.16 {
-                active_count += 1;
-            }
-            if raw[j] > 0.34 {
-                strong_count += 1;
-            }
-            count += 1;
-        }
-        let count_f = count.max(1) as f32;
-        let local_score = score_sum / count_f;
-        let local_transient = transient_sum / count_f;
-        let active_ratio = active_count as f32 / count_f;
-        let strong_ratio = strong_count as f32 / count_f;
-        let sustain_gate = smoothstep(0.24, 0.62, active_ratio)
-            * (0.45 + 0.55 * smoothstep(0.05, 0.28, strong_ratio));
-        let score_gate = smoothstep(0.17, 0.42, local_score);
-        let transient_penalty = 1.0 - 0.62 * smoothstep(0.20, 0.68, local_transient);
-        let raw_score = (local_score.powf(0.85) * sustain_gate * score_gate * transient_penalty)
-            .clamp(0.0, 1.0);
-
-        let phrase_start = i.saturating_sub(phrase_radius);
-        let phrase_end = (i + phrase_radius + 1).min(phrase_hint.len());
-        let mut phrase_sum = 0.0;
-        let mut phrase_active = 0usize;
-        let mut phrase_strong = 0usize;
-        let mut phrase_count = 0usize;
-        for score in &phrase_hint[phrase_start..phrase_end] {
-            phrase_sum += *score;
-            if *score > 0.16 {
-                phrase_active += 1;
-            }
-            if *score > 0.34 {
-                phrase_strong += 1;
-            }
-            phrase_count += 1;
-        }
-        let phrase_count_f = phrase_count.max(1) as f32;
-        let local_phrase = phrase_sum / phrase_count_f;
-        let phrase_active_ratio = phrase_active as f32 / phrase_count_f;
-        let phrase_strong_ratio = phrase_strong as f32 / phrase_count_f;
-        let raw_support = smoothstep(0.018, 0.11, local_score)
-            * (0.48 + 0.52 * smoothstep(0.03, 0.18, active_ratio));
-        let phrase_sustain = smoothstep(0.32, 0.72, phrase_active_ratio)
-            * (0.28 + 0.72 * smoothstep(0.05, 0.26, phrase_strong_ratio))
-            * (0.35 + 0.65 * raw_support);
-        let phrase_score =
-            (local_phrase.powf(0.88) * phrase_sustain * transient_penalty).clamp(0.0, 1.0);
-
-        smoothed[i] = raw_score.max(phrase_score * 0.56).clamp(0.0, 1.0);
-    }
-
-    keep_only_vocal_like_segments(&mut smoothed, bin_secs);
-
-    let mut state = 0.0_f32;
-    for (bin, target) in bins.iter_mut().zip(smoothed) {
-        if target > state {
-            state = state * 0.82 + target * 0.18;
-        } else {
-            let release = if target < 0.05 { 0.94 } else { 0.965 };
-            state = (state * release).max(target * 0.55);
-        }
-        bin.vocal_score = state.clamp(0.0, 1.0);
-    }
-}
-
-fn keep_only_vocal_like_segments(scores: &mut [f32], bin_secs: f64) {
-    if scores.is_empty() {
-        return;
-    }
-    let min_segment_bins = (1.80 / bin_secs.max(0.01)).round().max(1.0) as usize;
-    let bridge_bins = (0.85 / bin_secs.max(0.01)).round().max(1.0) as usize;
-
-    let mut i = 0usize;
-    while i < scores.len() {
-        if scores[i] > 0.12 {
-            i += 1;
-            continue;
-        }
-        let gap_start = i;
-        while i < scores.len() && scores[i] <= 0.12 {
-            i += 1;
-        }
-        let gap_end = i;
-        if gap_start > 0 && gap_end < scores.len() && gap_end - gap_start <= bridge_bins {
-            let bridge_score =
-                (scores[gap_start - 1].min(scores[gap_end]) * 0.72).clamp(0.22, 0.42);
-            for score in &mut scores[gap_start..gap_end] {
-                *score = bridge_score;
-            }
-        }
-    }
-
-    let mut start = None;
-    for idx in 0..=scores.len() {
-        let active = idx < scores.len() && scores[idx] > 0.12;
-        match (start, active) {
-            (None, true) => start = Some(idx),
-            (Some(segment_start), false) => {
-                let segment_end = idx;
-                let segment_len = segment_end - segment_start;
-                let peak = scores[segment_start..segment_end]
-                    .iter()
-                    .copied()
-                    .fold(0.0_f32, f32::max);
-                if segment_len < min_segment_bins || peak < 0.22 {
-                    for score in &mut scores[segment_start..segment_end] {
-                        *score = 0.0;
-                    }
-                }
-                start = None;
-            }
-            _ => {}
-        }
-    }
-
-    for score in scores {
-        *score = smoothstep(0.18, 0.55, *score);
     }
 }
 
@@ -1372,8 +1095,7 @@ fn apply_novelty_scores(bins: &mut [WaveformBin], bin_secs: f64) {
         let scalar_delta = (prev.loudness - next.loudness).abs() * 0.60
             + (prev.bass - next.bass).abs() * 0.42
             + (prev.brightness - next.brightness).abs() * 0.72
-            + (prev.transient_density - next.transient_density).abs() * 0.70
-            + (prev.vocal - next.vocal).abs() * 0.38;
+            + (prev.transient_density - next.transient_density).abs() * 0.70;
         raw[i] = smoothstep(0.12, 0.56, scalar_delta + chroma_delta + bass_delta);
     }
     let smooth_radius = (0.12 / bin_secs.max(0.01)).round().max(1.0) as usize;
@@ -1391,7 +1113,6 @@ struct TimelineFeatureAverage {
     bass: f32,
     brightness: f32,
     transient_density: f32,
-    vocal: f32,
     bass_chroma: [f32; TIMELINE_CHROMA_CLASSES],
     chroma: [f32; TIMELINE_CHROMA_CLASSES],
 }
@@ -1403,7 +1124,6 @@ fn average_feature_window(window: &[WaveformBin]) -> TimelineFeatureAverage {
         bass: 0.0,
         brightness: 0.0,
         transient_density: 0.0,
-        vocal: 0.0,
         bass_chroma: [0.0; TIMELINE_CHROMA_CLASSES],
         chroma: [0.0; TIMELINE_CHROMA_CLASSES],
     };
@@ -1412,7 +1132,6 @@ fn average_feature_window(window: &[WaveformBin]) -> TimelineFeatureAverage {
         avg.bass += bin.band_energy[0].clamp(0.0, 1.0);
         avg.brightness += bin.brightness;
         avg.transient_density += bin.transient_density;
-        avg.vocal += bin.vocal_score;
         for pc in 0..TIMELINE_CHROMA_CLASSES {
             avg.bass_chroma[pc] += bin.bass_chroma[pc] * bin.bass_pitch_confidence;
             avg.chroma[pc] += bin.chroma[pc] * bin.key_confidence;
@@ -1422,7 +1141,6 @@ fn average_feature_window(window: &[WaveformBin]) -> TimelineFeatureAverage {
     avg.bass /= count;
     avg.brightness /= count;
     avg.transient_density /= count;
-    avg.vocal /= count;
     for pc in 0..TIMELINE_CHROMA_CLASSES {
         avg.bass_chroma[pc] /= count;
         avg.chroma[pc] /= count;
@@ -1646,117 +1364,6 @@ mod tests {
             .fold(0.0_f32, f32::max);
 
         assert!(max_novelty > 0.16, "max_novelty={max_novelty}");
-    }
-
-    #[test]
-    fn analysis_marks_sustained_midrange_as_vocal_candidate() {
-        let mut samples = Vec::new();
-        for i in 0..96_000 {
-            let t = i as f32 / 48_000.0;
-            let envelope = if t < 0.1 {
-                t / 0.1
-            } else if t > 1.9 {
-                (2.0 - t) / 0.1
-            } else {
-                1.0
-            }
-            .clamp(0.0, 1.0);
-            let x = envelope
-                * 0.20
-                * ((std::f32::consts::TAU * 220.0 * t).sin()
-                    + 0.55 * (std::f32::consts::TAU * 440.0 * t).sin()
-                    + 0.35 * (std::f32::consts::TAU * 660.0 * t).sin()
-                    + 0.18 * (std::f32::consts::TAU * 880.0 * t).sin());
-            samples.extend([x, x]);
-        }
-
-        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
-        let max_vocal = analysis
-            .bins
-            .iter()
-            .map(|b| b.vocal_score)
-            .fold(0.0_f32, f32::max);
-
-        assert!(max_vocal > 0.35, "max_vocal={max_vocal}");
-    }
-
-    #[test]
-    fn analysis_bridges_short_vocal_gaps() {
-        let mut samples = Vec::new();
-        for i in 0..144_000 {
-            let t = i as f32 / 48_000.0;
-            let active = (0.25..1.35).contains(&t) || (1.75..2.85).contains(&t);
-            let envelope = if active { 1.0 } else { 0.0 };
-            let x = envelope
-                * 0.20
-                * ((std::f32::consts::TAU * 220.0 * t).sin()
-                    + 0.55 * (std::f32::consts::TAU * 440.0 * t).sin()
-                    + 0.35 * (std::f32::consts::TAU * 660.0 * t).sin()
-                    + 0.18 * (std::f32::consts::TAU * 880.0 * t).sin());
-            samples.extend([x, x]);
-        }
-
-        let analysis = analyze_stereo_timeline(
-            &samples,
-            48_000,
-            AnalysisConfig {
-                bin_secs: 0.025,
-                ..AnalysisConfig::default()
-            },
-        );
-        let gap_score = analysis
-            .bins
-            .iter()
-            .filter(|bin| bin.start_secs >= 1.40 && bin.start_secs <= 1.65)
-            .map(|bin| bin.vocal_score)
-            .fold(0.0_f32, f32::max);
-
-        assert!(gap_score > 0.08, "gap_score={gap_score}");
-    }
-
-    #[test]
-    fn analysis_keeps_percussive_bursts_low_vocal_score() {
-        let mut samples = Vec::new();
-        for i in 0..96_000 {
-            let phase = i % 12_000;
-            let x = if phase < 220 {
-                let decay = 1.0 - phase as f32 / 220.0;
-                0.9 * decay
-            } else {
-                0.0
-            };
-            samples.extend([x, x]);
-        }
-
-        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
-        let max_vocal = analysis
-            .bins
-            .iter()
-            .map(|b| b.vocal_score)
-            .fold(0.0_f32, f32::max);
-
-        assert!(max_vocal < 0.18, "max_vocal={max_vocal}");
-    }
-
-    #[test]
-    fn analysis_keeps_noise_low_vocal_score() {
-        let mut samples = Vec::new();
-        let mut state = 0x1234_5678_u32;
-        for _ in 0..96_000 {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let white = ((state >> 8) as f32 / 16_777_215.0) * 2.0 - 1.0;
-            let x = white * 0.16;
-            samples.extend([x, x]);
-        }
-
-        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
-        let max_vocal = analysis
-            .bins
-            .iter()
-            .map(|b| b.vocal_score)
-            .fold(0.0_f32, f32::max);
-
-        assert!(max_vocal < 0.12, "max_vocal={max_vocal}");
     }
 
     #[test]
