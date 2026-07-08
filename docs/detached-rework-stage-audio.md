@@ -1269,7 +1269,54 @@ pointer は None 維持・suppress 分類テストで再確認)・可視性判�
   `parked_video_deferred_swap_completion_does_not_open_fullscreen` /
   `parked_audio_continuous_target_stays_inside_bundle`。
 
-### 保留中の実機 FB (fix7-2 の後に対応、未指示)
+## 3.21 fix7-2 実機 NG (2026-07-08): parked EOF の pending が他文脈の poll に沈黙 drop される — fix7-3 (P1)
+
+**症状**: 非アクティブ (ParkedLive) のまま次のメディアに進もうとすると再生が止まる。
+
+**ログ確定 (scratchpad/fix72-cur.log)**:
+
+- `25.917s` parked 窓 id=1 (動画 idx=15) が Eof → EOF 進行発火。`fast video swap throttled
+  (live_video_decode_threads=1)` → `defer source swap: from_idx=15 -> target_idx=16
+  parked_live_window_id=Some(1)` (**fix7-2 の origin 焼き込みは正常動作**)。
+- `25.959-25.984s` 旧デコーダ退出 (throttle 条件は解除済み)。
+- 以後 **completion 試行がゼロ回** (`VideoPlayer::open` / run_decoder / parked 系 completion
+  ログが皆無)。parked poll 自体は毎フレーム継続 (`parked_live_poll_begin` frame=3600/4200、
+  `bundle_fs_idx=Some(16)` まで前進済み)。`36.9s` のクリック復帰後も player 未 open で停止。
+- **この間、active detached context = window 2 (Book/Image、PDF閲覧中)** が存在し、
+  main poll は毎フレーム active context へ委譲 (`main_poll_video_deferred_to_active_context`)。
+
+**機構 (コード照合で確定)**: `poll_native_video_source_swap_pending`
+([native_video.rs:1029-1036](../src/app/native_video.rs)) の**文脈不一致 guard が
+`fullscreen_idx != target_idx || items[target] != Video(path)` のとき pending を無言で
+take して破棄する (ログなし)**。fix7-2 は close / timeout / abort に parked ガードを足したが
+**この branch は未対応**。parked poll (bundle mount 中) が enqueue した pending を、
+**同フレーム後段/次フレームの別文脈の poll (今回 = Book 窓 or main の poll_video 到達経路)
+が guard で沈黙 drop** → completion が永久に来ない = 停止。ログが一切出ないのはこの branch
+に log が無いため (診断を難航させた点も要修正)。
+
+### fix7-3 要件 (P1)
+
+1. **parked-origin pending の処理は「pending の窓の bundle が mount されている文脈」に限定**:
+   `pending.parked_live_window_id == Some(id)` のとき、
+   `native_video_parked_live_input_window_id == Some(id)` でない poll では
+   **guard を評価せず素通り (drop しない、pending 温存)** する。処理・drop してよいのは
+   一致する parked poll のみ (deadline timeout は既存の parked ガードどおり)。
+2. **沈黙 drop の禁止**: 1029-1036 の branch に必ずログを追加する (drop 理由 +
+   fullscreen_idx / target / item 種別 / parked_live_window_id)。今後 pending を捨てる
+   すべての経路はログを持つこと。
+3. **Phase 1 確認**: どの文脈の poll が今回 drop したか (Book 窓の poll_video 到達経路 /
+   main 側の別到達点) をコード上で特定して実装メモに記載する。fix7 の main poll 抑止と
+   の関係 (抑止をすり抜けた poll_video 呼び出し元) も明記。
+4. **動画→次が音声のケースの確認**: EOF の次メディアが `GridItem::Audio` の場合、video
+   fast-swap 経路の completion guard (`GridItem::Video` 限定) と衝突しないか確認し、
+   衝突するなら音声 open 経路 (fix7-2 の `open_parked_live_audio_from_continuous_eof`) に
+   振る。
+5. テスト: 「parked poll で enqueue → 直後に別文脈 (Book) の poll_native が走る」
+   シーケンスで pending が温存され、次の parked poll で完結すること (今回の再現形)。
+   既存 fix7/fix7-2 テスト維持。
+6. コミット `(detached-rework stage-audio fix7-3)`。
+
+### 保留中の実機 FB (fix7-3 の後に対応、未指示)
 
 - 音声モード上 HUD の右側ボタン群と、動画の上 HUD が減光されていない (fix6b の top dim
   適用範囲もれの疑い、スクリーンショットあり 2026-07-08)。
