@@ -1497,6 +1497,18 @@ findings-6/12/17 と同族の「bundle 外グローバル導出が root pass で
    静止画窓で 右クリック close / リング / ジェスチャ の 3 点。
 5. コミット `(detached-rework stage-audio fix9)`。
 
+### fix9 検収合格 + 実機 OK (Fable 2026-07-08) — stage-audio の既知問題ゼロ
+
+**fix9 (6ea3706e) = 合格**。`update_mouse_ring_flick` / `update_mouse_gesture` の context
+不一致分岐を「常に温存 (None)」へ変更 (stale cancel と `current_ring_shortcut_context()`
+依存を撤去、理由コメント付き)。掃除は close_fullscreen + detached pause cleanup の 2 箇所に
+明示 cancel を追加。回帰テスト 2 本 (温存 / 掃除)。**実機 = 静止画・動画とも
+リング / マウスジェスチャ / 右クリック close の 3 点動作確認済み (ユーザー)**。
+probe は debug ゲート内で残置。
+
+これで §3.12〜§3.23 (fix6 系 / fix7 系 / fix8 / fix9) の既知問題はすべてクローズ。
+残り = §5 実機確認の未消化分 → ship-checklist → 1 日常用 → リリース手順 Phase 0。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
