@@ -243,6 +243,24 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "2.3.0",
+        must_read: &[],
+        highlights: &[
+            HighlightItem {
+                title: "音楽を波形・スペクトラムで見ながら再生",
+                body: "音声ファイル (MP3 / FLAC / WAV / M4A など) を一覧からそのままフルスクリーンで再生できます。\
+                       曲全体の波形タイムライン、半音ごとのバーと 88 鍵ピアノ鍵盤のスペクトラム、\
+                       ★・タグ・ブックマーク・音量の自動調整・VST3 に対応します。",
+            },
+            HighlightItem {
+                title: "複数ウィンドウで開けるようになりました",
+                body: "環境設定の「ビューワモード」で「複数ウィンドウ」を選ぶと、画像を開くたびに別ウィンドウとして残り、\
+                       一覧を操作しても各ウィンドウは独立して残ります。「フル機能ウィンドウ」ではこれまでどおり\
+                       メインと 1 つの別ウィンドウを F12 で切り替えます。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]
@@ -387,6 +405,28 @@ mod tests {
                 .iter()
                 .any(|item| item.title.contains("サブフォルダ"))
         );
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_3_0_entry() {
+        let entries = for_version("2.3.0", table());
+        assert_eq!(versions(&entries), ["2.3.0"]);
+        let entry = entries[0];
+        assert!(entry.must_read.is_empty());
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("音楽"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("複数ウィンドウ"))
+        );
+        // 通知は 2 件 (音楽 / 複数ウィンドウ) に絞る方針。
+        assert_eq!(entry.highlights.len(), 2);
     }
 
     #[test]
