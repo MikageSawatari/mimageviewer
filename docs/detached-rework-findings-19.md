@@ -544,3 +544,20 @@ fix13-2 (06eb05d8 = paint_rect_norm + uv_rect 焼き込み、指示どおりの�
 4. 実機再確認: 同再現で (i) 中央の白被りなし (ii) 左右の白柱なし (iii) live で見えていた
    上端の白余白 (ページ自身のピクセル) は見える、の 3 点。
 5. コミット `(detached-rework findings-19 fix13-4)`。
+
+### fix13-4 実装メモ (Codex 2026-07-09)
+
+- clip 方式を採用。`DetachedImageWindowFrozenPage` に `clip_rect_norm` を追加し、park 時に
+  per-page の可視 clip を焼き込む。passive は `painter.with_clip_rect(restored_clip)` で
+  同じ clip を掛けた上で、fix13-2 の `paint_rect_norm` / `uv_rect` を直接描く。
+- 見開きの clip は `layout_spread_page_rects` の full page rect から **content bbox の x 範囲だけ**
+  を取り、y は full page のまま残す (`spread_page_horizontal_visible_clip`)。これにより中央側・
+  外側の隠れ余白だけを消し、live で見えていた上端/下端のページ自身の白ピクセルは残る。
+  最後に `image_rect` と intersect して live の viewport clip と揃える。
+- continuous はページ同士の横重なりを持たないため、`clip_rect_norm = paint_rect_norm` として
+  既存表示を保つ。
+- `frozen_page_bake` / `frozen_page_restore` の計装には `clip` / `clip_norm` を追加し、
+  今後は paint/uv だけでなく clip も含めて bake/restore の等価性を確認できる。
+- テストは `detached_spread_snapshot_preserves_trim_uv_and_background` で「full page rect は重なるが
+  clip は重ならない」ことを固定し、`spread_page_horizontal_visible_clip_keeps_vertical_page_pixels`
+  で y 方向を crop しないことを純関数で固定した。

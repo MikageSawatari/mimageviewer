@@ -3601,6 +3601,14 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn spread_page_horizontal_visible_clip(rect: egui::Rect, bbox: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + bbox.min.x * rect.width(), rect.min.y),
+            egui::pos2(rect.min.x + bbox.max.x * rect.width(), rect.max.y),
+        )
+    }
+
+    #[cfg(windows)]
     fn detached_frozen_debug_rect(rect: egui::Rect) -> String {
         format!(
             "({:.2},{:.2})-({:.2},{:.2})/{:.2}x{:.2}",
@@ -3629,9 +3637,11 @@ impl App {
         page_ord: usize,
         paint_rect: egui::Rect,
         uv_rect: egui::Rect,
+        clip_rect: egui::Rect,
         basis_rect: egui::Rect,
         media_rect: egui::Rect,
         paint_rect_norm: egui::Rect,
+        clip_rect_norm: egui::Rect,
         pixels_per_point: f32,
         content_bbox: Option<egui::Rect>,
         placement: crate::settings::DetachedViewerWindowPlacement,
@@ -3641,12 +3651,14 @@ impl App {
         }
         self.log_detached_image_window_debug(format!(
             "frozen_page_bake phase={phase} window_id={window_id} idx={idx} page_ord={page_ord} \
-             basis_kind=full_rect basis_source=runtime_placement basis={} media={} paint={} \
-             norm={} uv={} content_bbox={} ppp={:.3} placement={:?}",
+             basis_kind=full_rect basis_source=runtime_placement basis={} media={} paint={} clip={} \
+             norm={} clip_norm={} uv={} content_bbox={} ppp={:.3} placement={:?}",
             Self::detached_frozen_debug_rect(basis_rect),
             Self::detached_frozen_debug_rect(media_rect),
             Self::detached_frozen_debug_rect(paint_rect),
+            Self::detached_frozen_debug_rect(clip_rect),
             Self::detached_frozen_debug_rect(paint_rect_norm),
+            Self::detached_frozen_debug_rect(clip_rect_norm),
             Self::detached_frozen_debug_rect(uv_rect),
             Self::detached_frozen_debug_opt_rect(content_bbox),
             pixels_per_point,
@@ -3667,15 +3679,18 @@ impl App {
         }
         for (page_ord, page) in window.frozen_continuous_pages.iter().enumerate() {
             let paint_rect = Self::rect_from_normalized(full_rect, page.paint_rect_norm);
+            let clip_rect = Self::rect_from_normalized(full_rect, page.clip_rect_norm);
             crate::logger::log(format!(
                 "[detached-window-debug] frozen_page_restore source={source} window_id={} \
                  page_ord={} basis_kind=full_rect basis_source=passive_client basis={} paint={} \
-                 norm={} uv={} ppp={:.3} placement={:?}",
+                 clip={} norm={} clip_norm={} uv={} ppp={:.3} placement={:?}",
                 window.id,
                 page_ord,
                 Self::detached_frozen_debug_rect(full_rect),
                 Self::detached_frozen_debug_rect(paint_rect),
+                Self::detached_frozen_debug_rect(clip_rect),
                 Self::detached_frozen_debug_rect(page.paint_rect_norm),
+                Self::detached_frozen_debug_rect(page.clip_rect_norm),
                 Self::detached_frozen_debug_rect(page.uv_rect),
                 pixels_per_point,
                 window.placement
@@ -3728,6 +3743,7 @@ impl App {
                 }?;
                 let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
+                let clip_rect_norm = rect_norm;
                 self.log_detached_frozen_page_bake_debug(
                     "continuous",
                     window_id,
@@ -3735,9 +3751,11 @@ impl App {
                     page_ord,
                     page.rect,
                     uv_rect,
+                    page.rect,
                     full_rect,
                     image_rect,
                     rect_norm,
+                    clip_rect_norm,
                     pixels_per_point,
                     page.content_bbox,
                     placement,
@@ -3746,6 +3764,7 @@ impl App {
                     texture,
                     paint_rect_norm: rect_norm,
                     uv_rect,
+                    clip_rect_norm,
                     rotation: self.get_rotation(page.idx),
                     background: background.clone(),
                 })
@@ -3919,6 +3938,13 @@ impl App {
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
         let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
+        let left_clip_rect = Self::spread_page_horizontal_visible_clip(rects.left_rect, left_bbox)
+            .intersect(image_rect);
+        let right_clip_rect =
+            Self::spread_page_horizontal_visible_clip(rects.right_rect, right_bbox)
+                .intersect(image_rect);
+        let left_clip_rect_norm = Self::normalize_rect_to_full_rect(left_clip_rect, full_rect);
+        let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
         let right_uv_rect = Self::full_uv_rect();
         let pixels_per_point = ctx.pixels_per_point();
@@ -3929,9 +3955,11 @@ impl App {
             0,
             rects.left_rect,
             left_uv_rect,
+            left_clip_rect,
             full_rect,
             image_rect,
             left_rect_norm,
+            left_clip_rect_norm,
             pixels_per_point,
             content_left,
             placement,
@@ -3943,9 +3971,11 @@ impl App {
             1,
             rects.right_rect,
             right_uv_rect,
+            right_clip_rect,
             full_rect,
             image_rect,
             right_rect_norm,
+            right_clip_rect_norm,
             pixels_per_point,
             content_right,
             placement,
@@ -3956,6 +3986,7 @@ impl App {
                 texture: left_texture,
                 paint_rect_norm: left_rect_norm,
                 uv_rect: left_uv_rect,
+                clip_rect_norm: left_clip_rect_norm,
                 rotation: left_rot,
                 background: background.clone(),
             },
@@ -3963,6 +3994,7 @@ impl App {
                 texture: right_texture,
                 paint_rect_norm: right_rect_norm,
                 uv_rect: right_uv_rect,
+                clip_rect_norm: right_clip_rect_norm,
                 rotation: right_rot,
                 background,
             },
@@ -4052,6 +4084,8 @@ impl App {
             let painter = ui.painter().with_clip_rect(full_rect);
             for page in &window.frozen_continuous_pages {
                 let paint_rect = Self::rect_from_normalized(full_rect, page.paint_rect_norm);
+                let clip_rect = Self::rect_from_normalized(full_rect, page.clip_rect_norm);
+                let painter = painter.with_clip_rect(clip_rect);
                 let bg_style = Self::detached_frozen_background_style(&page.background);
                 if page.rotation.is_none() {
                     paint_transparent_bg(&painter, paint_rect, &bg_style);
@@ -22842,6 +22876,19 @@ mod tests {
         );
         assert!(rects.left_rect.right() > rects.left_hit_rect.right());
         assert!(rects.right_rect.left() < rects.right_hit_rect.left());
+    }
+
+    #[test]
+    fn spread_page_horizontal_visible_clip_keeps_vertical_page_pixels() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, -30.0), egui::pos2(210.0, 270.0));
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.20, 0.15), egui::pos2(0.85, 0.70));
+
+        let clip = App::spread_page_horizontal_visible_clip(rect, bbox);
+
+        assert_f32_close(clip.left(), 50.0);
+        assert_f32_close(clip.right(), 180.0);
+        assert_f32_close(clip.top(), -30.0);
+        assert_f32_close(clip.bottom(), 270.0);
     }
 
     #[test]

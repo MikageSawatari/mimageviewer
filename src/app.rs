@@ -217,6 +217,7 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) texture: egui::TextureHandle,
     pub(crate) paint_rect_norm: egui::Rect,
     pub(crate) uv_rect: egui::Rect,
+    pub(crate) clip_rect_norm: egui::Rect,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) background: DetachedImageWindowFrozenBackground,
 }

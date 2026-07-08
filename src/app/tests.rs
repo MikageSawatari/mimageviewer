@@ -20168,6 +20168,19 @@ mod still_window_mode_key_tests {
             left_page.paint_rect_norm.right() > right_page.paint_rect_norm.left(),
             "frozen page rects must keep the hidden inner trim margins behind the cropped UVs"
         );
+        assert!(
+            left_page.clip_rect_norm.right() <= right_page.clip_rect_norm.left() + 0.001,
+            "frozen page clips must remove the overlap between full page rects"
+        );
+        assert!(left_page.clip_rect_norm.left() >= left_page.paint_rect_norm.left() - 0.001);
+        assert!(left_page.clip_rect_norm.right() <= left_page.paint_rect_norm.right() + 0.001);
+        assert!(right_page.clip_rect_norm.left() >= right_page.paint_rect_norm.left() - 0.001);
+        assert!(right_page.clip_rect_norm.right() <= right_page.paint_rect_norm.right() + 0.001);
+        assert!(
+            left_page.clip_rect_norm.width() < left_page.paint_rect_norm.width()
+                && right_page.clip_rect_norm.width() < right_page.paint_rect_norm.width(),
+            "trimmed spread pages must preserve full paint rects but clip hidden side margins"
+        );
     }
 
     #[test]
