@@ -273,3 +273,35 @@ close > activation 優先、`activation_ready_frame` 前でも close 可 (window
 P4 (任意、次回ついで可): watcher の OS sample が「カーソル下の任意の root HWND」へ毎回
 WM_NCHITTEST を送る。登録済み detached HWND のときだけ問い合わせるようゲートすると、
 無関係ウィンドウ (他プロセス含む) へのメッセージ送信が消えて僅かに安全・軽量になる。
+
+## fix12 (実機 FB 2026-07-08、checklist V1): 音楽ビューの VST ボタンが detached で表示される
+
+**症状**: 複数ウィンドウ (ON) モードのメディア窓で、動画→音声モード / 音声ファイル再生の
+上部バーに VST ボタンが出る。クリックすると不適切なエラー。native 動画 HUD の VST ボタンは
+出ない (正しい)。
+
+**機構**: native 側は `presentation == Fullscreen` 限定 (app.rs:45403-45408) だが、音楽
+chrome の `show_vst` (ui_fullscreen.rs:3956-3961) は stage-audio Phase I 承認 #4 で
+`Fullscreen | DetachedWindow` に拡張された。実機でチェーン/GUI が detached で機能しない
+(クリックでエラー) ため、**Phase I の拡張前提は不成立 → 撤回する** (将来 detached 対応する
+なら独立ステージで再導入)。
+
+**確定仕様 (ユーザー決定 2026-07-08)**: VST ボタン = **フル機能 (OFF) モード + メイン
+ウィンドウ表示 (非 detached) + フルスクリーン**のみ。ON モードと F12 detached では出さない。
+VST 機能自体 (メイン fullscreen での チェーン / V キー GUI) は不変。
+
+### fix12 要件
+
+1. 音楽 chrome の `show_vst` 条件から `DetachedWindow` を外し、native 側と同じ
+   `presentation == Fullscreen` 基準に揃える (単一ソース化できるなら共通 helper 可)。
+2. parked chrome (`parked_live_music_chrome_view_state`) の `show_vst: true` 固定を
+   false に変更 (parked は常に detached のため表示しない。パリティ維持 = active 側も
+   detached では非表示なので整合)。
+3. **V キー (keymap 経由の VST GUI toggle) の detached 中ガード**: 現状の「不適切な
+   エラー」の正体を確認して実装メモに記載し、detached 中は適切な no-op または簡潔な
+   トースト (「VST はメインウィンドウのフルスクリーンでのみ使用できます」相当) に変える。
+4. ship-checklist v2 の V8 を新仕様に更新: VST 確認は「OFF モード + メインウィンドウ +
+   フルスクリーン」で実施、detached ではボタンが出ないことを確認項目に追加。
+   stage-audio §5 項目 5 (音声 detached で VST) は本仕様変更で読み替え。
+5. テスト: `show_vst` 導出 (Fullscreen=true / DetachedWindow=false / parked=false)。
+6. コミット `(detached-rework findings-19 fix12)`。
