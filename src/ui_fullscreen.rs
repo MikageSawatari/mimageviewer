@@ -9707,6 +9707,15 @@ impl App {
         };
         let stack_jump_next = stack_jump == Some(KeyAction::FsStackJumpNext);
         let stack_jump_prev = stack_jump == Some(KeyAction::FsStackJumpPrev);
+        // フラット読書中に物理的に Shift を押している ↓↑ は「スタックジャンプ」。上の
+        // `consume_first_action` は Win32 KeySlot キュー経由で consume するため、**egui イベント
+        // キューには同じ ↓↑ が残る**。下の plain ページ送りは egui の `consume_key` を使うが、
+        // egui は `matches_logically` で「余分な Shift」を無視する (extra Shift ignored) ので、
+        // `consume_key(NONE, ArrowDown)` が残存 Shift+↓ を拾ってスタックジャンプと二重発火する
+        // (v2.2.0 回帰: 646e7709 でスタックジャンプを egui consume_key → keymap Win32 キュー経路へ
+        // 移したことで露呈)。FS ビューポートでは egui の modifiers が stale になり得るため、Shift
+        // は OS から直読み (`shift_held_via_os`) して plain ページ送りから除外する。
+        let stack_shift_arrow = stack_flat_nav && shift_held_via_os();
         // 音声の前/次ファイル移動は上の `video_file_nav` (VideoNextFile/PrevFile = plain ↓↑) で
         // 処理する (adjacent_navigable_idx に Audio を含め、動画と統一)。下の `!fs_music_view_active`
         // ガードは残す: 音声は plain/Shift 矢印をこの image 経路では消費せず、plain ↓↑ は
@@ -9716,17 +9725,21 @@ impl App {
             || (!is_video_fs
                 && !fs_music_view_active
                 && ctx.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                    // egui イベントは常に drain する (残すと後段ハンドラが拾う恐れ)。ただし
+                    // flat 読書中の Shift+↓ (= スタックジャンプ) はページ送りとしては扱わない。
+                    let consumed = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
                         || (!stack_flat_nav
-                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown))
+                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
+                    consumed && !stack_shift_arrow
                 }));
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
             || (!is_video_fs
                 && !fs_music_view_active
                 && ctx.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                    let consumed = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
                         || (!stack_flat_nav
-                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp))
+                            && i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
+                    consumed && !stack_shift_arrow
                 }));
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
@@ -21503,6 +21516,33 @@ mod tests {
     }
     fn tz_cursor(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
         zip_cursor_image_px(band, egui::Vec2::ZERO, image, cursor)
+    }
+
+    // ファイル名スタックのフラット読書中に Shift+↓↑ が「スタックジャンプ」ではなく通常ページ
+    // 送りになる v2.2.0 回帰 (646e7709 でスタックジャンプを egui `consume_key` → keymap の
+    // Win32 KeySlot キュー経路へ移したことが発端) の再発防止テスト。
+    //
+    // 根本原因は egui の `consume_key(NONE, key)` が `matches_logically` を使い「余分な Shift」を
+    // 無視する契約にある: plain ↓ のつもりの consume が Shift+↓ イベントも飲み込む。スタック
+    // ジャンプは別キュー (Win32) で consume するため egui 側に残った Shift+↓ を plain ページ送りが
+    // 拾って二重発火していた。ui_fullscreen 側は `stack_shift_arrow` (OS 直読み Shift) で除外して
+    // いる。将来 egui 更新でこの契約が変わったら (= 下の assert が false になったら) 除外ロジックを
+    // 見直せるよう、依存している egui 挙動をここで固定する。
+    #[test]
+    fn egui_plain_arrow_consume_swallows_shift_modified_event() {
+        let mut input = egui::InputState::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        // plain ↓ (NONE) の consume が Shift+↓ イベントを飲み込む = 二重発火の温床。
+        assert!(
+            input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            "egui consume_key(NONE) が Shift+↓ を拾わなくなったら stack_shift_arrow 除外を再検討する"
+        );
     }
 
     #[test]
