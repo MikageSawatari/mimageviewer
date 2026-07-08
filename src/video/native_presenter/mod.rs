@@ -984,6 +984,9 @@ pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
     pub text_input_active: bool,
+    /// ParkedLive の inert/dimmed HUD。ボタン機能は App 側 filter で実行されないため、
+    /// HUD chrome 上の raw mouse button も復帰クリックとして App へ流してよい。
+    pub hud_dimmed: bool,
     /// この egui パスが wheel イベントを `NavigateItem` / `TileColumnsDelta` コマンドへ
     /// 変換したか。true のとき同じ raw wheel イベントを `Window(MouseWheel)` として App へ
     /// 二重転送しない (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
@@ -1388,10 +1391,13 @@ impl NativeOverlayInputRouting {
             NativeEvent::MouseButton(button)
                 if button.button == crate::video::native_window::NativeVideoMouseButton::Right =>
             {
-                !self.modal_dialog_active
+                self.hud_dimmed || !self.modal_dialog_active
             }
-            NativeEvent::MouseMove(_) | NativeEvent::MouseButton(_) | NativeEvent::MouseLeave => {
+            NativeEvent::MouseMove(_) | NativeEvent::MouseLeave => {
                 !self.wants_pointer_input && !self.modal_dialog_active
+            }
+            NativeEvent::MouseButton(_) => {
+                self.hud_dimmed || (!self.wants_pointer_input && !self.modal_dialog_active)
             }
             // native viewer の close は App 側でセッション終了として扱う。
             NativeEvent::CloseRequested { .. } => true,
@@ -5446,6 +5452,7 @@ impl NativeEguiOverlay {
             wants_pointer_input: self.wants_pointer_input,
             wants_keyboard_input: self.wants_keyboard_input,
             text_input_active: self.text_input_active(),
+            hud_dimmed: self.hud_dimmed,
             // consumed_wheel は commands を見て render_if_dirty 側で設定する。
             ..Default::default()
         }
@@ -8362,6 +8369,23 @@ mod tests {
         assert!(!modal.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Right)));
         assert!(!modal.should_forward_to_ui(&NativeVideoWindowEvent::Text('?')));
         assert!(!modal.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+    }
+
+    #[test]
+    fn parked_dimmed_hud_forwards_raw_mouse_buttons_but_not_wheel() {
+        let parked_over_ui = NativeOverlayInputRouting {
+            wants_pointer_input: true,
+            modal_dialog_active: true,
+            hud_dimmed: true,
+            ..Default::default()
+        };
+
+        assert!(parked_over_ui.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Left)));
+        assert!(parked_over_ui.should_forward_to_ui(&mouse_button(NativeVideoMouseButton::Right)));
+        assert!(
+            !parked_over_ui.should_forward_to_ui(&wheel(false)),
+            "parked passthrough is limited to raw mouse buttons; wheel remains inert"
+        );
     }
 
     #[test]

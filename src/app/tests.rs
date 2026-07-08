@@ -21869,7 +21869,8 @@ mod still_window_mode_key_tests {
         use crate::video::NativeVideoOutputEvent as Ev;
         use crate::video::NativeVideoPlacement;
         use crate::video::native_window::{
-            NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
+            NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
+            NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
         };
 
         let mut app = setup_app();
@@ -21985,6 +21986,37 @@ mod still_window_mode_key_tests {
             app.native_video_parked_live_activation_requests,
             vec![92],
             "activation requests are deduplicated while parked"
+        );
+
+        let left_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Left,
+            down: true,
+            double_click: false,
+            x: 10,
+            y: 10,
+            shift: false,
+            ctrl: false,
+        };
+        let left_up = NativeVideoMouseButtonEvent {
+            down: false,
+            ..left_down
+        };
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::Window(WinEv::MouseButton(left_down)),
+        );
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::Window(WinEv::MouseButton(left_up)),
+        );
+        assert_eq!(
+            app.native_video_parked_live_activation_requests,
+            vec![92],
+            "semantic HUD command + raw click converge to one parked activation request"
         );
 
         app.native_video_parked_live_activation_requests.clear();

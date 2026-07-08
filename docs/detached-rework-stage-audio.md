@@ -899,6 +899,22 @@ fix6b/fix6c ビルドの実機 smoke でユーザー FB 2 件 (スクリーン�
 - `interactive=false` の chrome button sense は `hover` に落とし、click sense を作らない。
   下 HUD は描画後に dim overlay を重ね、操作 intent は App/player に適用しない。
 
+### fix6e Phase 0 / 実装メモ (2026-07-08)
+
+- 影響範囲は native presenter の raw `MouseButton` 転送だけ。active (`hud_dimmed=false`) の
+  routing は従来どおり `wants_pointer_input` / modal gate を使い、wheel は `consumed_wheel`
+  と `wants_pointer_input` の既存規則を維持する。
+- ParkedLive (`hud_dimmed=true`) では HUD chrome が inert で App 側 filter により機能実行
+  されないため、raw `MouseButton` は modal/wants pointer に関係なく App へ転送する。
+  semantic HUD command と raw click の二重経路は既存 activation request dedup で 1 回に
+  収束することをテストで固定した。
+- 右クリックも raw button として転送対象だが、App 側の ParkedLive activation は左 click
+  down/up のみを見るため、右クリック機能は実行されない。wheel / key は従来どおり inert。
+- 音声モード parked の egui 音楽ビューは native presenter の HUD HWND ではなく通常 egui
+  側で描く。`set_hud_window_visible` は定義のみで現行経路からは呼ばれておらず、今回の
+  native 映像 parked HUD dead zone とは独立。実機で奪いが確認された場合は別途 HUD HWND
+  visibility/region の責務で扱う。
+
 ### fix7 開始 (②の根治を含む)
 
 fix6d-2/fix6e の後、§3.13 のとおり **Phase 0 調査 → Fable 承認 → 実装**。追加要件:
