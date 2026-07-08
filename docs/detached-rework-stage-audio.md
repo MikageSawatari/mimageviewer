@@ -1398,6 +1398,49 @@ parked EOF 進行 = 動画→次ファイル / 動画の音声モード / 音声
 4. 修正方針を提示して Fable 承認後に実装 (`(detached-rework stage-audio fix9)`)。
    activation/parked 系 (watcher・filter) には触れないこと (スコープは入力 dispatch のみ)。
 
+### fix9 Phase 1 調査結果 (Codex 2026-07-08)
+
+- `handle_fs_wheel_and_click()` は `render_fullscreen_viewport()` の `CentralPanel` 内で呼ばれ、
+  `ctx.input(|i| i.pointer.secondary_*)` を読む。active detached は
+  `show_viewport_immediate(fs_id, ..., |vp_ctx, _| render_fs_body(vp_ctx, false))` で描画されるため、
+  **Active(immediate) の静止画 detached 窓では viewport ctx の入力を読む構造**になっている。
+  `with_active_detached_viewer_context()` mount 中も `app.render_fullscreen_viewport(ctx)` →
+  `show_viewport_immediate(... vp_ctx ...)` の同じ経路に入る。
+- 右クリック block の実行条件は
+  `(!state.is_video || video_in_audio_mode) && !analysis_mode && !any_dialog_open()
+   && fs_context_menu_idx.is_none() && !spread/fit/slideshow popup`。
+  ON モードの独立静止画窓は `state.is_video=false` なので、Active であれば block へ到達する。
+  Parked/deferred 窓は別物で、右クリック/リング/ジェスチャは設計上受けず、左クリック復帰のみ。
+- `current_right_drag_context()` は mount された bundle の `fullscreen_idx` を見る。
+  静止画なら `RightDragContext::ImageFullscreen`、動画/音声モードなら `VideoFullscreen`、
+  編集中なら `EditMode`。したがって Active 独立静止画窓でのリング/ジェスチャ context は
+  main ではなくその窓の画像 fullscreen context に解決される。
+- 期待仕様: ON モードの **Active 独立静止画窓** では、右クリック short tap はその detached
+  窓を close、右ドラッグは設定に応じて `ImageFullscreen` のリングショートカットまたは
+  マウスジェスチャを実行する。メイン一覧へは伝播しない。Parked/deferred 窓では右クリックは
+  inert (左クリックで復帰)。
+- コード構造上、Active immediate 窓の入力 dispatch は既に存在するため、「ON モード初期から
+  完全未配線」というより、実機失敗時に (a) その窓が実は Parked/deferred のまま、
+  (b) viewport ctx に secondary press/release が届いていない、(c) 上記 gate
+  (dialog/popup/analysis/context menu/seek panel) のどれかが弾いている、のいずれか。
+
+**fix9 実装方針案 (Fable 承認待ち)**:
+
+1. まず `MIV_DETACHED_WINDOW_DEBUG=1` 配下で、右クリック block の直前に
+   `right_drag_probe` を追加する。出力項目:
+   `window_id/session/state(fs_idx, is_video, analysis, dialogs, popups, context_menu)`,
+   `focused/foreground/active_hwnd`, `secondary_down/pressed/released`,
+   `right_drag_context/right_drag_mode`, `secondary_in_seek_panel`,
+   `events/key/wheel counts`。これで block 未到達・入力未配送・gate reject のどれかを
+   1 回の実機ログで確定する。
+2. ログで Active immediate + secondary event 到達が確認できたのに close/ring が出ない場合は、
+   `right_drag_mode` 分岐内の close/gesture result をログして handler-level test を追加する。
+3. ログで Active ではなく Parked/deferred と判明した場合は仕様どおり左クリック復帰に寄せ、
+   右クリックで復帰/close する変更は入れない (activation watcher/filter のスコープ外)。
+4. ログで viewport ctx に secondary event が届かない場合だけ、active detached still の
+   右クリック入力を別配送へ寄せる。ただし parked watcher には触らず、Active immediate の
+   input dispatch に限定する。
+
 ## 4. 完了条件
 
 - [ ] Phase S 報告 (§2 の 1〜6)。コミット不要 (調査ログ・診断追加のみ可)
