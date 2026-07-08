@@ -1494,11 +1494,11 @@ struct MusicTopChromeResponse {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DetachedImageWindowBarMode {
-    Full,
-    CloseOnly,
-}
+const MUSIC_CHROME_TOP_BUTTON_SIZE: f32 = 28.0;
+#[cfg(windows)]
+const MUSIC_CHROME_TOP_BUTTON_GAP: f32 = 8.0;
+#[cfg(windows)]
+const MUSIC_CHROME_RIGHT_MARGIN: f32 = 12.0;
 
 /// 動画のチャプター・ブックマーク・ピンを 1 本の Vec に集約するための種別タグ。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3849,9 +3849,8 @@ impl App {
             show_back_to_video: info.video_audio_mode,
             show_vst: true,
             show_window_toggle: true,
-            // The parked window keeps the watcher-compatible close-only button outside this
-            // chrome, so the parity top chrome suppresses its own close button.
-            show_close: false,
+            // ParkedLive keeps the same close slot as active music; only close remains clickable.
+            show_close: true,
         }
     }
 
@@ -3876,6 +3875,17 @@ impl App {
                 (color.a() as f32 * 0.70) as u8,
             )
         }
+    }
+
+    #[cfg(windows)]
+    fn music_chrome_close_slot_rect(top_rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_center_size(
+            egui::pos2(
+                top_rect.right() - MUSIC_CHROME_RIGHT_MARGIN - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5,
+                top_rect.center().y,
+            ),
+            egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
+        )
     }
 
     #[cfg(windows)]
@@ -3910,8 +3920,6 @@ impl App {
             fg,
         );
 
-        const TOP_BTN: f32 = 28.0;
-        const TOP_BTN_GAP: f32 = 8.0;
         let top_btn_cy = top_rect.center().y;
         let top_btn_bg = |hovered: bool| {
             if interactive && hovered {
@@ -3927,28 +3935,29 @@ impl App {
         };
         let sense = Self::music_chrome_click_sense(interactive);
         let mut response = MusicTopChromeResponse::default();
-        let mut top_rx = top_rect.right() - 12.0;
+        let mut top_rx = top_rect.right() - MUSIC_CHROME_RIGHT_MARGIN;
 
         if chrome.show_close {
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
-                egui::vec2(TOP_BTN, TOP_BTN),
-            );
-            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            let rect = Self::music_chrome_close_slot_rect(top_rect);
+            top_rx = rect.left() - MUSIC_CHROME_TOP_BUTTON_GAP;
             let resp = ui
-                .interact(rect, ui.id().with(("music_top_close", fs_idx)), sense)
+                .interact(
+                    rect,
+                    ui.id().with(("music_top_close", fs_idx)),
+                    egui::Sense::click(),
+                )
                 .hover_tip_dark("閉じる".to_string());
             painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
             draw_overlay_close_icon(&painter, rect);
-            response.close_clicked = interactive && resp.clicked();
+            response.close_clicked = resp.clicked();
         }
 
         if chrome.show_window_toggle {
             let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
-                egui::vec2(TOP_BTN, TOP_BTN),
+                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
+                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
             );
-            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
             let resp = ui
                 .interact(rect, ui.id().with(("music_top_window", fs_idx)), sense)
                 .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
@@ -3959,10 +3968,10 @@ impl App {
 
         if chrome.show_back_to_video {
             let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
-                egui::vec2(TOP_BTN, TOP_BTN),
+                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
+                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
             );
-            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
             let back_tip = match self
                 .keymap
                 .first_chord_label(KeyAction::VideoToggleAudioMode)
@@ -3984,10 +3993,10 @@ impl App {
 
         let vst_left = if chrome.show_vst {
             let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - TOP_BTN * 0.5, top_btn_cy),
-                egui::vec2(TOP_BTN, TOP_BTN),
+                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
+                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
             );
-            top_rx -= TOP_BTN + TOP_BTN_GAP;
+            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
             let resp = ui
                 .interact(rect, ui.id().with(("music_top_vst", fs_idx)), sense)
                 .hover_tip_dark("VST プラグイン画面を開く".to_string());
@@ -4070,6 +4079,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         info: &crate::app::ParkedLiveMusicWindowInfo,
+        close_requested: &mut bool,
     ) {
         let painter = ui.painter_at(full_rect);
         let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
@@ -4080,7 +4090,7 @@ impl App {
             return;
         };
         let chrome = Self::parked_live_music_chrome_view_state(info);
-        let _ = self.draw_music_top_chrome(
+        let chrome_response = self.draw_music_top_chrome(
             ui,
             layout.top_rect,
             info.fs_idx,
@@ -4089,6 +4099,9 @@ impl App {
             egui::Color32::from_rgb(90, 150, 220),
             false,
         );
+        if chrome_response.close_clicked {
+            *close_requested = true;
+        }
 
         let central_rect = layout.central_rect;
         debug_assert!(!layout.draw_timeline);
@@ -4148,15 +4161,6 @@ impl App {
         self.draw_music_bottom_hud(ui, hud_rect, info.fs_idx, &chrome, true, false);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
-    }
-
-    #[cfg(windows)]
-    fn detached_image_window_bar_mode(parked_live_music: bool) -> DetachedImageWindowBarMode {
-        if parked_live_music {
-            DetachedImageWindowBarMode::CloseOnly
-        } else {
-            DetachedImageWindowBarMode::Full
-        }
     }
 
     #[cfg(windows)]
@@ -4860,29 +4864,22 @@ impl App {
                     .show(vp_ctx, |ui| {
                         let full_rect = ui.max_rect();
                         if let Some(info) = parked_live_music_info.as_ref() {
-                            self.draw_parked_live_music_window(ui, vp_ctx, full_rect, info);
+                            self.draw_parked_live_music_window(
+                                ui,
+                                vp_ctx,
+                                full_rect,
+                                info,
+                                &mut bar_close_requested,
+                            );
                         } else {
                             Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
-                        }
-                        match Self::detached_image_window_bar_mode(parked_live_music_info.is_some())
-                        {
-                            DetachedImageWindowBarMode::Full => {
-                                Self::draw_detached_image_window_bar(
-                                    ui,
-                                    vp_ctx,
-                                    full_rect,
-                                    &view,
-                                    &mut bar_close_requested,
-                                );
-                            }
-                            DetachedImageWindowBarMode::CloseOnly => {
-                                Self::draw_detached_image_window_close_button(
-                                    ui,
-                                    full_rect,
-                                    "detached_music_close_btn",
-                                    &mut bar_close_requested,
-                                );
-                            }
+                            Self::draw_detached_image_window_bar(
+                                ui,
+                                vp_ctx,
+                                full_rect,
+                                &view,
+                                &mut bar_close_requested,
+                            );
                         }
                     });
             });
@@ -21425,19 +21422,23 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn parked_live_music_uses_close_only_bar_mode() {
+    fn parked_live_music_uses_music_chrome_close_slot() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let layout = App::parked_live_music_window_layout(full, 24.0)
+            .expect("parked music window should have a chrome layout");
+        let close_rect = App::music_chrome_close_slot_rect(layout.top_rect);
+        let legacy_close_rect = detached_image_window_bar_close_button_rect(full);
+
+        assert_eq!(close_rect.width(), MUSIC_CHROME_TOP_BUTTON_SIZE);
+        assert_eq!(close_rect.height(), MUSIC_CHROME_TOP_BUTTON_SIZE);
         assert_eq!(
-            App::detached_image_window_bar_mode(true),
-            DetachedImageWindowBarMode::CloseOnly
+            close_rect.right(),
+            layout.top_rect.right() - MUSIC_CHROME_RIGHT_MARGIN
         );
-        assert_eq!(
-            App::detached_image_window_bar_mode(false),
-            DetachedImageWindowBarMode::Full
+        assert_ne!(
+            close_rect, legacy_close_rect,
+            "ParkedLive music must not use the old close-only bar rect that overlaps the top chrome"
         );
-        let close_rect = detached_image_window_bar_close_button_rect(full);
-        assert_eq!(close_rect.width(), BAR_BUTTON_SIZE);
-        assert_eq!(close_rect.height(), BAR_BUTTON_SIZE);
     }
 
     #[test]
@@ -21471,8 +21472,8 @@ mod tests {
         assert!(chrome.show_vst);
         assert!(chrome.show_window_toggle);
         assert!(
-            !chrome.show_close,
-            "ParkedLive keeps its watcher-compatible close-only button outside the music chrome"
+            chrome.show_close,
+            "ParkedLive reserves the same close slot as active music; only that button remains clickable"
         );
         assert_eq!(chrome.playback_speed, 1.25);
         assert_eq!(chrome.volume, 0.75);

@@ -4045,6 +4045,27 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn hud_dimmed_suppresses_overlay_pointer_event(
+        event: &crate::video::native_window::NativeVideoWindowEvent,
+    ) -> bool {
+        use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
+
+        matches!(
+            event,
+            NativeEvent::MouseMove(_)
+                | NativeEvent::MouseButton(_)
+                | NativeEvent::MouseWheel(_)
+                | NativeEvent::MouseLeave
+        )
+    }
+
+    fn clear_overlay_pointer_for_dimmed_hud(&mut self) {
+        if self.pointer_pos.take().is_some() {
+            self.pending_events.push(egui::Event::PointerGone);
+            self.dirty = true;
+        }
+    }
+
     fn push_native_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent) {
         use crate::video::native_window::{
             NativeVideoImeEvent, NativeVideoMouseButton, NativeVideoWindowEvent as NativeEvent,
@@ -4084,6 +4105,10 @@ impl NativeEguiOverlay {
         if cursor_activity {
             self.cursor_last_activity = Some(Instant::now());
             self.cursor_hidden = false;
+        }
+        if self.hud_dimmed && Self::hud_dimmed_suppresses_overlay_pointer_event(&event) {
+            self.clear_overlay_pointer_for_dimmed_hud();
+            return;
         }
         match event {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
@@ -4573,6 +4598,9 @@ impl NativeEguiOverlay {
             return;
         }
         self.hud_dimmed = dimmed;
+        if dimmed {
+            self.clear_overlay_pointer_for_dimmed_hud();
+        }
         self.dirty = true;
     }
 
@@ -5960,6 +5988,15 @@ impl NativeEguiOverlay {
                     tile_overlay,
                     &mut commands,
                 );
+                if hud_dimmed {
+                    draw_native_hud_dim_overlay(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        true,
+                        false,
+                    );
+                }
                 // タイル表示中も境界トースト (= 「最後の項目です」「次のフォルダが見つかりません」
                 // 等) は出す。元実装は早期 return で line 4342 の draw_native_toast に
                 // 到達しなかったため、タイル末尾に達してもユーザーへの feedback がゼロだった。
@@ -8274,16 +8311,16 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativePixelSample,
-        NativeRightPanelVisibilityInputs, compare_pixel_probe, compute_video_visual_transform,
-        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, egui_key_from_virtual_key,
-        metadata_clean_text, native_jump_panel_visible_from_inputs,
+        NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
+        NativePixelSample, NativeRightPanelVisibilityInputs, compare_pixel_probe,
+        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
+        egui_key_from_virtual_key, metadata_clean_text, native_jump_panel_visible_from_inputs,
         native_right_panel_visible_from_inputs, native_video_fullscreen_shortcut_key,
         sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
-        NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
+        NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
     };
 
     fn key(virtual_key: u32) -> NativeVideoKeyEvent {
@@ -8313,6 +8350,15 @@ mod tests {
             button,
             down: true,
             double_click: false,
+            x: 100,
+            y: 100,
+            shift: false,
+            ctrl: false,
+        })
+    }
+
+    fn mouse_move() -> NativeVideoWindowEvent {
+        NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent {
             x: 100,
             y: 100,
             shift: false,
@@ -8385,6 +8431,32 @@ mod tests {
         assert!(
             !parked_over_ui.should_forward_to_ui(&wheel(false)),
             "parked passthrough is limited to raw mouse buttons; wheel remains inert"
+        );
+    }
+
+    #[test]
+    fn dimmed_hud_suppresses_pointer_delivery_to_overlay_egui() {
+        assert!(NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(&mouse_move()));
+        assert!(
+            NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(&mouse_button(
+                NativeVideoMouseButton::Left
+            ))
+        );
+        assert!(NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(&wheel(false)));
+        assert!(
+            NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
+                &NativeVideoWindowEvent::MouseLeave
+            )
+        );
+        assert!(
+            !NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
+                &NativeVideoWindowEvent::KeyDown(key(0x20))
+            )
+        );
+        assert!(
+            !NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
+                &NativeVideoWindowEvent::CloseRequested { generation: 7 }
+            )
         );
     }
 
