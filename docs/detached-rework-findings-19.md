@@ -124,3 +124,41 @@ Phase 2 では、A を先に in-place park/handoff へ直し、OS 窓の close+r
 ```powershell
 Select-String -Path $log -Pattern 'park_close_legacy_detached|hwnd_adopted_deferred|ambiguous|unconfirmed_hwnd_serialized|repair_failed'
 ```
+
+## Phase 2 承認 (Fable 2026-07-08)
+
+Phase 1 の判断 (A = legacy close 経路の誤発火、B = snapshot/live の fit 入力不一致) を
+**承認**する。A → B の順で実装する (別コミット可: `fix10a` / `fix10b`)。
+
+### fix10a (A) 実装条件
+
+1. ON モードの静止画 active switch では、`park_and_close_current_active_detached_viewer` の
+   legacy 分岐が handoff 後に行う **close/remove 一式 (begin/finish close +
+   ViewportCommand::Close + close_fullscreen + remove_detached_window_runtime) を発生させない**。
+   `pause_current_active_detached_viewer_context` / live-park inner と同じ「handoff で
+   OS 窓・ViewportId・HWND 登録を保持したまま Parked 化」で完結させる。
+2. **legacy close 経路そのものは残す** — OFF (linked) の main_context_change close という
+   本来の用途があるため。分岐は既存の事実 (independent/linked、モード) で判定し、
+   新規 bool・ヒューリスティックを足さない (憲法 §3/§6)。
+3. **補償機構 (resume_still_snapshot / reopen_descriptor) はこの fix では削除しない**
+   (switch 経路から到達しなくなるだけ)。book (PDF/ZIP) 窓の park が paused_bundle /
+   凍結ページを保持したまま in-place で成立すること (W8/W9 相当) を確認し、descriptor
+   復帰に依存していた箇所があれば報告する。デッドコード化した範囲は実装メモに列挙
+   (削除は別途判断)。
+4. 回帰テスト: 高速切替 (再作成完了を待たず 2 連続以上) のシーケンスで、
+   - 旧 active 窓の HWND 登録が切替をまたいで**不変** (clear/adopt が発生しない)
+   - `Removed` 遷移が発生しない / host_generation が増えない
+   - メディア窓の live-park (park_current_viewer_context_as_live_media) は不変
+5. 実機確認: checklist v2 の W1/W2/W10 (高速切替 10 回+ → 全部閉じる)。
+
+### fix10b (B) 実装条件
+
+1. 方式はどちらでも可 (採った方を実装メモに明記):
+   - (推奨) snapshot 作成時に **live 描画で実際に使った normalized image/page rect を保存**し、
+     passive 描画は同一 rect で描く (seek panel・fit state・bbox/trim の再現に頑健)。
+   - 代替: snapshot 描画に live と同じ入力 (`fullscreen_media_rect` /
+     `effective_fullscreen_fit_mode` / `fullscreen_fit_scale_limits` / bbox) を与える。
+2. 見開き/連続ページ snapshot も同じ入力源に揃っていることを確認 (既に近いが、
+   placement size 変化時のズレ余地を含めて検証)。
+3. テスト: snapshot rect と live rect の一致を純関数で固定 (単一画像 + 見開きの 2 ケース)。
+4. 実機確認: W2 (アクティブ化の瞬間に画像が動かない)。
