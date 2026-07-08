@@ -3544,7 +3544,8 @@ pub(crate) fn point_in_polygon(pt: (f32, f32), poly: &[(f32, f32)]) -> bool {
 /// どの背景色 (白/黒/中間色) でも視認できるブラシカーソル用。
 /// 内側を黒線、外側を白線で 1px ずつずらして描くことで
 /// 単色背景でも必ず片方が見える。
-fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+/// 消しゴム (erase) と隠蔽加工 (conceal) の筆ツールで共用する。
+pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     if radius < 1.5 {
         // 小さい場合はシンプルに十字で表示
         let s = 4.0;

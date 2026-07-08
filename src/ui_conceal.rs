@@ -1662,11 +1662,37 @@ impl App {
         // (Codex P2 #5: 旧版は Crosshair が後勝ちでハンドルカーソルが見えなかった)。
         ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
 
+        // 筆ツール中はブラシ範囲の点線サークル (消しゴムと同じ表示)
+        self.draw_conceal_brush_cursor(ui, ctx, full_rect, zoom_pan);
+
         // 選択中の shape のハンドル
         self.draw_selected_handles(ui, ctx, full_rect, zoom_pan);
 
         // パネル
         self.draw_conceal_panel(ctx, full_rect);
+    }
+
+    /// 筆ツールのブラシ範囲サークル。消しゴムの `draw_brush_cursor` と同型
+    /// (`conceal_brush_radius` は画像ピクセル単位なので表示倍率を掛けて screen 半径にする)。
+    fn draw_conceal_brush_cursor(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) {
+        if self.conceal_tool != ConcealTool::Brush {
+            return;
+        }
+        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+            if full_rect.contains(pos) {
+                let Some((total_scale, _)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+                    return;
+                };
+                let screen_r = self.settings.conceal_brush_radius.max(1.0) * total_scale;
+                crate::ui_erase::draw_dashed_circle(ui.painter(), pos, screen_r);
+            }
+        }
     }
 
     fn draw_conceal_tool_preview(
