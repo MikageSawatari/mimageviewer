@@ -399,3 +399,14 @@ Phase 1 の突き合わせ結果:
 
 - `paused_continuous_detached_window_preserves_transparent_background`
 - `detached_spread_snapshot_preserves_trim_uv_and_background`
+
+### fix13 検収合格 (Fable 2026-07-08)
+
+**fix13 (d68f2d49) = 合格**。Phase 1 で (a) rect / (b) UV は欠落なし (live と共有の
+layout_spread_page_rects / content_bbox UV) を確認し、根因 = (c) **passive の frozen pages が
+常に FsBgStyle::Default で描かれ、live の transparent_bg_style (白/市松) が失われていた**と
+特定。修正 = `DetachedImageWindowFrozenBackground` (Default/Solid/Checker) を park 時に
+per-page DTO へ焼き込み、passive は snapshot の背景を FsBgStyle に戻して描画 (現在の
+メイン状態を再解釈しない = fix10b/fix6d-2 と同じ「park 時焼き込み」原則)。continuous /
+spread は同一 DTO で共有。テストあり・実装メモ完備・コミットタグあり。
+実機確認 (ユーザー): 見開き + 自動トリム + 白背景で park → 白のまま揃って見えること。
