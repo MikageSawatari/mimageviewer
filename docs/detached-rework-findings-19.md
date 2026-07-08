@@ -463,3 +463,38 @@ fix13 (背景焼き込み) 後も実機 NG (同スクリーンショット)。�
   DTO から削除した。
 - テストは既存 fix13 の 2 本を強化し、見開き/continuous の `paint_rect_norm` が
   park 時の live layout を保持することと、`uv_rect == full_uv` を固定した。
+
+## fix13-3 (実機 NG 2026-07-09): 黒露出は解消、代わりに白被り (ページが live と別スケール/位置)
+
+fix13-2 (06eb05d8 = paint_rect_norm + uv_rect 焼き込み、指示どおりの実装) で黒トリム露出は
+解消。しかし parked 化すると**画像の一部が白く塗られたように見える** — スクリーンショット
+比較では、parked 側はページが live と異なるスケール/位置で描かれ、live ではウィンドウ外に
+クリップされていた白余白 (ページ自身のピクセル) が窓内に現れている形。
+
+**方針転換: 推測をやめ、数値突き合わせで 1 回確定させる (fix13-3 Phase 1)。**
+
+### Phase 1 — 計装 (MIV_DETACHED_WINDOW_DEBUG ゲート、イベント時のみ出力)
+
+1. **park 時** に 1 行/ページ: live 最終 paint_rect (絶対値) と uv_rect、正規化に使った
+   基準 rect (full_rect or media_rect、その由来 = placement か実 client か、値)、
+   焼き込んだ paint_rect_norm。
+2. **passive 初回描画時** に 1 行/ページ: 復元後 paint_rect (絶対値)、使った full_rect
+   (実 client)、ppp。
+3. ユーザー実機 1 回 (同再現) → ログの数値差からズレの原因を確定して報告 → 修正。
+
+### 原因候補 (計装で判別する。先に直しに行かない)
+
+- (i) **正規化基準の不一致**: park 側の基準 (placement 由来 w/h、または media_rect =
+  seek panel 除外後) と passive 側の基準 (CentralPanel の実 full_rect) が別物 →
+  スケール/オフセット差。live 画面にはページ表示 (107,108/120) があり seek panel 分の
+  差が疑わしい。
+- (ii) rect と uv の組み合わせ取り違え (uv がフルページ化したのに rect 側の意味が旧の
+  content 配置のまま、等)。
+- (iii) 背景 fill (fix13) の塗り順/塗り範囲が paint_rect 全面に出て content に重なる。
+
+### 実装条件
+
+- 数値差の原因確定後、park と passive の**基準 rect を同一定義に統一**して修正
+  (fix10b 単一画像と同じ「同じ座標系で焼いて同じ座標系で戻す」)。
+- 回帰テスト: 基準 rect (placement/media/client) の変換を含めた rect/uv round-trip 一致。
+- 計装は debug ゲート内で残置可。コミット `(detached-rework findings-19 fix13-3)`。
