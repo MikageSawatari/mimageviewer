@@ -345,3 +345,29 @@ native availability / panel / owner-enter の全経路を同 helper に統一・
 イベントは案内トースト「VST はメインウィンドウのフルスクリーンでのみ使用できます」へ。
 stage-audio §3.5-4 の supersede 記載と §5-5 の書き換え、導出テスト両方向。実機 OK
 (ユーザー確認)。チェーン効果の共有 (音は全再生に効く / UI のみ制限) も docs に明文化された。
+
+## fix13 (実機 FB 2026-07-08、checklist P 中): 見開き + 自動トリムの passive snapshot が live の揃え描画を再現しない
+
+**症状**: 画像窓が見開き + 自動トリム (view trim) 表示のとき、別窓 (動画) をアクティブ化して
+passive になると、live では「左右ページの上下トリム位置を揃え、余白は白 (紙色)」だったものが、
+**ページがずれて黒背景が露出**する (スクリーンショットあり: 右ページ上部に黒帯)。
+P1-P11 自体は OK。
+
+**見立て**: fix10b は単一画像の rect/UV を live 入力で焼き込んだが、見開き凍結ページ
+(`DetachedImageWindowFrozenPage` = texture / rect_norm / rotation / content_bbox) の
+passive 描画が live のトリム揃えを再現していない。候補:
+(a) rect_norm がトリム揃えオフセット適用**前**の値で焼かれている、
+(b) passive 描画が content_bbox の **UV crop を適用せず**フルテクスチャを描いている、
+(c) live はトリム露出部を**白 (紙色) で塗る**が、passive は CentralPanel の黒 fill のまま。
+
+### fix13 要件 — 短い Phase 1 → 実装
+
+1. **Phase 1**: live の見開きトリム揃え描画 (rect / UV crop / 背景 fill) と、park 時の
+   `detached_spread_frozen_pages_for_snapshot` + passive 描画を突き合わせ、(a)(b)(c) の
+   どれが欠けているかを特定して報告 (複合可)。
+2. **実装**: fix10b と同じ方針 = **park 時に live 描画と同一の per-page draw rect + UV +
+   背景色を焼き込み、passive は同一入力で描く** (fit/トリム数式は既存の共有純関数群に
+   揃える。snapshot 用の独自解釈を作らない)。live で白く見えていた領域は passive でも白。
+3. 連続表示 (continuous) の凍結ページも同じ入力源であることを確認。
+4. テスト: トリム量が左右で異なる見開きの rect + UV 一致 (純関数)、背景 fill の分岐。
+5. コミット `(detached-rework findings-19 fix13)`。
