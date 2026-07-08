@@ -260,3 +260,16 @@ activation に変換 (G1 層別) し、close にならない。
 - `activation_watcher_native_caption_close_sends_close_not_activation`
 - `activation_watcher_native_caption_close_release_outside_is_ignored`
 - `activation_watcher_native_caption_close_works_before_activation_ready`
+
+## fix11 検収合格 + 実機 OK (Fable 2026-07-08)
+
+**fix11 (285ad4f7) = 合格**。案 A (watcher に `WM_NCHITTEST == HTCLOSE` 判定) を採用理由付きで
+実装。`SendMessageTimeoutW(SMTO_ABORTIFHUNG, 50ms)` はデッドロック回避 (時間窓ではない) と
+明記あり ✓。LPARAM の座標 packing は負座標 (マルチモニタの y<0) でも Win32 規約どおり ✓。
+down/up とも × 上で完結したときのみ close intent、外して release はキャンセル、
+close > activation 優先、`activation_ready_frame` 前でも close 可 (window manager 操作として
+妥当)。テスト 3 本。**実機 = 非アクティブ窓の × で即 close 確認済み (ユーザー)**。
+
+P4 (任意、次回ついで可): watcher の OS sample が「カーソル下の任意の root HWND」へ毎回
+WM_NCHITTEST を送る。登録済み detached HWND のときだけ問い合わせるようゲートすると、
+無関係ウィンドウ (他プロセス含む) へのメッセージ送信が消えて僅かに安全・軽量になる。
