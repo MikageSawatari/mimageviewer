@@ -16488,6 +16488,80 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn grid_updater_preserves_fullscreen_right_drag_state_owned_by_other_surface() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(24.0, 32.0);
+
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        assert_eq!(
+            app.update_mouse_ring_flick(&ctx, crate::ring_shortcut::RingShortcutContext::Grid),
+            crate::ring_shortcut::MouseFlickOutcome::None
+        );
+        assert_eq!(
+            app.mouse_ring_flick.as_ref().map(|flick| flick.context),
+            Some(crate::ring_shortcut::RingShortcutContext::ImageFullscreen)
+        );
+
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        assert_eq!(
+            app.update_mouse_gesture(&ctx, crate::ring_shortcut::RightDragContext::Grid),
+            crate::ring_shortcut::MouseFlickOutcome::None
+        );
+        assert_eq!(
+            app.mouse_gesture.as_ref().map(|gesture| gesture.context),
+            Some(crate::ring_shortcut::RightDragContext::ImageFullscreen)
+        );
+    }
+
+    #[test]
+    fn fullscreen_close_and_detached_pause_cleanup_clear_right_drag_state() {
+        let mut app = setup_app();
+        let pos = egui::pos2(10.0, 20.0);
+        let idx = push_image(&mut app, r"C:\pics\right-drag-cleanup.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+
+        app.close_fullscreen();
+
+        assert!(app.mouse_ring_flick.is_none());
+        assert!(app.mouse_gesture.is_none());
+
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+
+        app.reset_detached_pause_foreground_modes(idx);
+
+        assert!(app.mouse_ring_flick.is_none());
+        assert!(app.mouse_gesture.is_none());
+    }
+
+    #[test]
     fn detached_hwnd_diff_accepts_single_created_egui_window() {
         let before = vec![thread_window_entry(0x10, true, "Window Class")];
         let after = vec![

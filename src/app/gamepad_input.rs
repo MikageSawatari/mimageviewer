@@ -489,20 +489,12 @@ impl App {
             return MouseFlickOutcome::None;
         };
         if existing.context != context {
-            // This entry point is the grid's per-frame ring updater (always called with
-            // `RingShortcutContext::Grid`). While a fullscreen viewer lives in a separate
-            // viewport (normal F11 or the detached window), the main window keeps rendering
-            // the grid behind it, so this runs every frame even though the grid is not the
-            // active surface. Do NOT cancel a flick that belongs to the currently-active
-            // ring context — doing so destroyed the fullscreen flick one frame after it was
-            // created, so the overlay only flashed for a single frame and never reached
-            // `guide_visible()`. Only drop a genuinely stale flick whose context is no
-            // longer the active one.
-            if existing.context == self.current_ring_shortcut_context() {
-                return MouseFlickOutcome::None;
-            }
-            self.cancel_mouse_ring_flick();
-            self.clear_native_video_ring_guide_overlay(ctx);
+            // A per-surface updater must not cancel another surface's live flick. In ON
+            // detached mode the root grid pass runs every frame with `context=Grid` while
+            // the active detached viewer owns an ImageFullscreen flick. The root App state
+            // has the viewer bundle swapped out during that pass, so deriving "current"
+            // context here misclassifies the detached flick as stale and destroys it
+            // before release. Ownership cleanup happens at surface close/park boundaries.
             return MouseFlickOutcome::None;
         }
 
@@ -664,14 +656,9 @@ impl App {
             return MouseFlickOutcome::None;
         };
         if existing.context != context {
-            if existing.context == self.current_right_drag_context() {
-                return MouseFlickOutcome::None;
-            }
-            let old_context = existing.context;
-            self.cancel_mouse_gesture();
-            if old_context == RightDragContext::VideoFullscreen {
-                self.clear_native_video_mouse_gesture_overlay(ctx);
-            }
+            // See `update_mouse_ring_flick`: a root/grid pass is not the owner of a
+            // fullscreen or detached gesture, so it must leave the other surface's gesture
+            // alive until that surface updates or closes.
             return MouseFlickOutcome::None;
         }
         let fallback_pos = existing.current_pos;

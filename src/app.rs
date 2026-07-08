@@ -25518,6 +25518,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
 
@@ -35449,6 +35450,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
         // 音楽ビュー (Inc 3b/4) の解析ワーカー + row raster + spectrum worker + PCM を止めて捨てる
