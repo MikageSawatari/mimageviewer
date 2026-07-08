@@ -334,3 +334,14 @@ no-op / トーストにする。現状ユーザーが見た「不適切なエラ
 なお「フル機能側で設定したチェーンの効果が ON モードの再生にも乗る」ことはユーザー実機で
 確認済み = 仕様どおり (チェーン共用 1 本、UI のみメイン fullscreen 限定)。
 ship-checklist V8 も同時訂正済み。
+
+### fix12 検収合格 + 実機 OK (Fable 2026-07-08)
+
+**fix12 (60fc2f2e) = 合格**。露出条件を helper 連鎖
+(`vst3_playback_ui_context_is_main_fullscreen` = 設定 OFF モード + presentation==Fullscreen →
+`vst3_playback_controls_available` → native/music 変種) に**単一ソース化** (既存事実のみ、
+新規 bool なし)。music chrome から DetachedWindow 撤去・parked chrome `show_vst:false`・
+native availability / panel / owner-enter の全経路を同 helper に統一・stale `ToggleVst3Gui`
+イベントは案内トースト「VST はメインウィンドウのフルスクリーンでのみ使用できます」へ。
+stage-audio §3.5-4 の supersede 記載と §5-5 の書き換え、導出テスト両方向。実機 OK
+(ユーザー確認)。チェーン効果の共有 (音は全再生に効く / UI のみ制限) も docs に明文化された。
