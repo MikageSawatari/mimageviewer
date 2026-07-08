@@ -410,3 +410,39 @@ per-page DTO へ焼き込み、passive は snapshot の背景を FsBgStyle に�
 メイン状態を再解釈しない = fix10b/fix6d-2 と同じ「park 時焼き込み」原則)。continuous /
 spread は同一 DTO で共有。テストあり・実装メモ完備・コミットタグあり。
 実機確認 (ユーザー): 見開き + 自動トリム + 白背景で park → 白のまま揃って見えること。
+
+## fix13-2 (実機 NG 2026-07-08): 真因は背景でなく「passive がページを crop + 再フィットで描き直す」非対称
+
+fix13 (背景焼き込み) 後も実機 NG (同スクリーンショット)。コード照合で機構を確定
+(計装不要):
+
+- **live** = `layout_spread_page_rects` ([ui_fullscreen.rs:1331](../src/ui_fullscreen.rs)) が
+  **フルページ矩形** (余白込み `scaled_w × scaled_h`、start_y 共有) を返し、bbox は
+  「コンテンツ端の突き合わせ配置」と hit rect にのみ使用。**白く見えるのはページ自身の
+  白余白ピクセル** (背景 fill ではない)。
+- **passive** = `draw_fs_spread_page` ([ui_fullscreen.rs:16431-16443](../src/ui_fullscreen.rs))
+  が保存 rect 内で `fit_display_size_in_rect` により**再フィット**し、さらに
+  `normalized_sub_rect(img_rect, bbox)` + `uv=bbox` で**コンテンツのみ crop 描画**。
+  余白が描かれず黒露出 + 再フィットによる配置差。
+- fix13 の背景焼き込みは実在する差分だが副次的 (背景モード Default では不変)。
+  Phase 1 (b) の「UV crop は欠落なし」は crop の存在確認であって、live が crop
+  **しない**非対称の見落とし。
+
+### fix13-2 要件
+
+1. **再導出の廃止 = 最終描画値の焼き込み** (fix10b の単一画像と同じ原則を見開きにも
+   徹底する): park 時に live が実際に描いた **per-page の最終 paint rect (正規化) と
+   uv rect** を `DetachedImageWindowFrozenPage` に焼き込み、passive は
+   `painter.image(tex, rect, uv)` を直接呼ぶ。`draw_fs_spread_page` の
+   再フィット (`fit_display_size_in_rect`) と bbox crop を frozen 経路から**通さない**。
+   - 見開きトリム揃えでは live = フルページ rect + uv 全面。焼き込みが live の
+     layout 出力 (`layout_spread_page_rects` の rect) をそのまま使えば余白ピクセルも
+     再現される。
+2. 背景 fill (fix13 の `DetachedImageWindowFrozenBackground`) は温存 (フルページ描画では
+   ほぼ見えないが、live で背景が見えるケースの正しさのため)。
+3. continuous (連続表示) の凍結ページも同じ「最終 rect + uv」焼き込みに揃える。
+4. テスト: **左右で上下トリム量が異なる見開き**で、park 焼き込み rect/uv == live layout
+   出力の一致 (純関数)。既存 fix13 テストは維持。
+5. 実機再確認 (ユーザー): 同じ再現手順 (見開き + 自動トリム + 動画側アクティブ化) で
+   白余白のまま揃って見えること。
+6. コミット `(detached-rework findings-19 fix13-2)`。
