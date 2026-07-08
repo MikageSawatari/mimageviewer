@@ -26234,6 +26234,17 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn parked_live_media_window_exists(&self) -> bool {
+        self.detached_image_windows.iter().any(|window| {
+            self.detached_window_state_is_parked_live(window.id)
+                && window
+                    .paused_bundle
+                    .as_deref()
+                    .is_some_and(Self::viewer_context_bundle_contains_video)
+        })
+    }
+
+    #[cfg(windows)]
     pub(crate) fn native_video_hud_dimmed_for_current_poll(&self) -> bool {
         self.native_video_parked_live_input_window_id.is_some()
     }
@@ -26263,14 +26274,11 @@ impl App {
                 ));
             }
             self.swap_viewer_context_bundle(&mut bundle);
-            let saved_continuous_mode = self.video_continuous_mode;
             let saved_input_window_id = self.native_video_parked_live_input_window_id;
-            self.video_continuous_mode = crate::video::VideoContinuousMode::Off;
             self.native_video_parked_live_input_window_id = Some(id);
             self.poll_video(ctx);
             self.update_parked_live_audio_music_view_state(ctx);
             self.native_video_parked_live_input_window_id = saved_input_window_id;
-            self.video_continuous_mode = saved_continuous_mode;
             self.swap_viewer_context_bundle(&mut bundle);
             if let Some(window) = self
                 .detached_image_windows
@@ -26315,6 +26323,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn should_poll_main_video_context(&self) -> bool {
         !self.active_detached_viewer_context_contains_video()
+            && !self.parked_live_media_window_exists()
     }
 
     #[cfg(windows)]

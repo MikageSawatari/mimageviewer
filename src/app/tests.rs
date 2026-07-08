@@ -18304,6 +18304,94 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn parked_live_media_context_owns_video_polling() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\parked.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(93);
+        let tex = ctx.load_texture(
+            "parked_live_poll_owner",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 93,
+                texture: tex,
+                title: "parked".to_owned(),
+                location_display: "parked".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(93, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.parked_live_media_window_exists());
+        assert!(
+            !app.should_poll_main_video_context(),
+            "ParkedLive media must be polled only while its bundle is mounted; main poll would abort or handle pending source-swap in the wrong context"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_still_context_does_not_steal_main_video_polling() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\parked.jpg");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(image);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(94);
+        let tex = ctx.load_texture(
+            "parked_live_still_poll_owner",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 94,
+                texture: tex,
+                title: "parked still".to_owned(),
+                location_display: "parked still".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(94, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(!app.parked_live_media_window_exists());
+        assert!(
+            app.should_poll_main_video_context(),
+            "non-media parked windows must not suppress unrelated main video polling"
+        );
+    }
+
+    #[test]
     fn stale_independent_flag_does_not_make_new_linked_window_independent() {
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\linked_again.jpg");
@@ -22156,7 +22244,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn parked_live_poll_restores_continuous_mode_after_suppressing_auto_advance() {
+    fn parked_live_poll_preserves_user_continuous_mode() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\live.mp4");
@@ -22197,7 +22285,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.video_continuous_mode,
             crate::video::VideoContinuousMode::ContinuousLoop,
-            "ParkedLive suppresses auto-advance only while polling and restores the global setting"
+            "ParkedLive must preserve the user's continuous setting so EOF can advance while parked"
         );
         assert!(
             app.detached_image_windows
