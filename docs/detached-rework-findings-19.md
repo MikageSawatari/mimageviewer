@@ -221,3 +221,42 @@ activation に変換 (G1 層別) し、close にならない。
    同じ経路で閉じることを確認。
 4. テスト: × 由来の close intent が activation より優先されること (純関数 or シーケンス)。
 5. コミット `(detached-rework findings-19 fix11)`。
+
+## fix11 Phase 1 / 実装メモ (Codex 2026-07-08)
+
+コード確認で次を確定した。
+
+- deferred/immediate passive 経路は `viewport_close_requested` を読む配線自体はある
+  (`ui_fullscreen.rs` の deferred event / parked-live render)。ただし findings-8 A1 と同じく、
+  deferred viewport では OS 側イベント配送が信頼できない前提が既にある。
+- 既存の `DetachedActivationWatcher` は close intent を持っていたが、判定対象は
+  mIV が描く独自バー (`detached_image_window_bar_close_button_rect`) / music chrome の
+  close slot であり、Windows の非クライアント caption button そのものではなかった。
+  そのため OS のタイトルバー × を押した場合、`viewport_close_requested` が届かなければ
+  watcher は activate と close を因果的に識別できない。
+
+採用案は **案 A**。理由:
+
+- 非アクティブ passive 窓の物理クリックを App の intent へ変換する所有境界は既に
+  `DetachedActivationWatcher` に集約されている。ここへ OS の
+  `WM_NCHITTEST == HTCLOSE` を足すのが最小変更で、subclass の install/uninstall
+  ライフタイムを増やさずに済む。
+- `SendMessageTimeoutW(..., WM_NCHITTEST, ..., 50ms)` を使う。これは時間窓で競合を
+  吸収するものではなく、別スレッド window への問い合わせが hung したときの
+  デッドロック回避である。
+
+実装:
+
+- watcher の OS sample に `native_close_hit_hwnd` を追加し、カーソル下 root HWND に
+  `WM_NCHITTEST` を投げて `HTCLOSE` ならその HWND を記録。
+- down/up が同じ native close hit 上で完結したときだけ `DetachedCloseRequest` を発行する。
+  release が × から外れた場合は既存の `up_close_outside` としてキャンセル。
+- close と activation が同時候補になる場合は既存どおり close 勝ち。
+- OS × は activation readiness と独立した window manager 操作なので、
+  `activation_ready_frame` 前の passive 窓でも close intent として扱う。
+
+回帰テスト:
+
+- `activation_watcher_native_caption_close_sends_close_not_activation`
+- `activation_watcher_native_caption_close_release_outside_is_ignored`
+- `activation_watcher_native_caption_close_works_before_activation_ready`

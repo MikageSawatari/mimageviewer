@@ -443,6 +443,7 @@ pub(crate) struct DetachedActivationWatchSample {
     pub(crate) left_button_down: bool,
     pub(crate) foreground_hwnd: u64,
     pub(crate) cursor_root_hwnd: u64,
+    pub(crate) native_close_hit_hwnd: u64,
     pub(crate) cursor_pos: Option<(i32, i32)>,
 }
 
@@ -683,10 +684,11 @@ impl DetachedActivationWatcher {
 
     #[cfg(not(test))]
     fn os_sample() -> DetachedActivationWatchSample {
-        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
         use windows::Win32::UI::WindowsAndMessaging::{
-            GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, WindowFromPoint,
+            GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, HTCLOSE, SMTO_ABORTIFHUNG,
+            SendMessageTimeoutW, WM_NCHITTEST, WindowFromPoint,
         };
 
         let left_button_down =
@@ -708,10 +710,33 @@ impl DetachedActivationWatcher {
         } else {
             0
         };
+        let native_close_hit_hwnd = if cursor_ok && cursor_root_hwnd != 0 {
+            let packed = ((point.y as u32 & 0xffff) << 16) | (point.x as u32 & 0xffff);
+            let mut hit_test_result = 0usize;
+            let send_result = unsafe {
+                SendMessageTimeoutW(
+                    HWND(cursor_root_hwnd as *mut _),
+                    WM_NCHITTEST,
+                    WPARAM(0),
+                    LPARAM(packed as isize),
+                    SMTO_ABORTIFHUNG,
+                    50,
+                    Some(&mut hit_test_result),
+                )
+            };
+            if send_result.0 != 0 && hit_test_result as u32 == HTCLOSE {
+                cursor_root_hwnd
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         DetachedActivationWatchSample {
             left_button_down,
             foreground_hwnd,
             cursor_root_hwnd,
+            native_close_hit_hwnd,
             cursor_pos,
         }
     }
@@ -1216,22 +1241,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn detached_activation_hit_test(
-        targets: &[DetachedActivationWatchTargetRect],
-        cursor_root_hwnd: u64,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> Option<DetachedActivationWatchTargetRect> {
-        let (x, y) = cursor_pos?;
-        targets.iter().copied().find(|target| {
-            target.eligible
-                && target.hwnd == cursor_root_hwnd
-                && x >= target.left
-                && x < target.right
-                && y >= target.top
-                && y < target.bottom
-        })
-    }
-
     #[cfg(windows)]
     fn detached_activation_target_full_rect(
         target: DetachedActivationWatchTargetRect,
@@ -1272,6 +1281,23 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_activation_native_close_hit(
+        target: DetachedActivationWatchTargetRect,
+        sample: DetachedActivationWatchSample,
+    ) -> bool {
+        sample.native_close_hit_hwnd != 0 && sample.native_close_hit_hwnd == target.hwnd
+    }
+
+    #[cfg(windows)]
+    fn detached_activation_close_hit(
+        target: DetachedActivationWatchTargetRect,
+        sample: DetachedActivationWatchSample,
+    ) -> bool {
+        Self::detached_activation_native_close_hit(target, sample)
+            || Self::detached_activation_close_button_contains(target, sample.cursor_pos)
+    }
+
+    #[cfg(windows)]
     fn detached_activation_title_bar_contains(
         target: DetachedActivationWatchTargetRect,
         cursor_pos: Option<(i32, i32)>,
@@ -1308,14 +1334,17 @@ impl App {
         claimed_hwnds: &[u64],
     ) -> Option<DetachedActivationClickCandidate> {
         if let Some(target) =
-            Self::detached_activation_hit_test(targets, sample.cursor_root_hwnd, sample.cursor_pos)
+            Self::detached_activation_target_containing_cursor(targets, sample.cursor_pos)
+                .filter(|target| target.hwnd == sample.cursor_root_hwnd)
         {
-            let intent =
-                if Self::detached_activation_close_button_contains(target, sample.cursor_pos) {
-                    DetachedActivationClickIntent::Close
-                } else {
-                    DetachedActivationClickIntent::Activate
-                };
+            let intent = if Self::detached_activation_close_hit(target, sample) {
+                DetachedActivationClickIntent::Close
+            } else {
+                if !target.eligible {
+                    return None;
+                }
+                DetachedActivationClickIntent::Activate
+            };
             return Some(DetachedActivationClickCandidate {
                 window_id: target.window_id,
                 hwnd: target.hwnd,
@@ -1339,7 +1368,7 @@ impl App {
         ) {
             return None;
         }
-        let intent = if Self::detached_activation_close_button_contains(target, sample.cursor_pos) {
+        let intent = if Self::detached_activation_close_hit(target, sample) {
             DetachedActivationClickIntent::Close
         } else {
             if !target.eligible {
@@ -1496,9 +1525,8 @@ impl App {
                     sample,
                 ));
             } else if click.intent == DetachedActivationClickIntent::Close {
-                if target.is_some_and(|target| {
-                    Self::detached_activation_close_button_contains(target, sample.cursor_pos)
-                }) {
+                if target.is_some_and(|target| Self::detached_activation_close_hit(target, sample))
+                {
                     close = Some(DetachedCloseRequest {
                         window_id: click.window_id,
                     });

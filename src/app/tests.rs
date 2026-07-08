@@ -23637,6 +23637,24 @@ mod still_window_mode_key_tests {
             left_button_down,
             foreground_hwnd,
             cursor_root_hwnd,
+            native_close_hit_hwnd: 0,
+            cursor_pos,
+        }
+    }
+
+    #[cfg(windows)]
+    fn activation_sample_native_close(
+        left_button_down: bool,
+        foreground_hwnd: u64,
+        cursor_root_hwnd: u64,
+        native_close_hit_hwnd: u64,
+        cursor_pos: Option<(i32, i32)>,
+    ) -> DetachedActivationWatchSample {
+        DetachedActivationWatchSample {
+            left_button_down,
+            foreground_hwnd,
+            cursor_root_hwnd,
+            native_close_hit_hwnd,
             cursor_pos,
         }
     }
@@ -23798,6 +23816,91 @@ mod still_window_mode_key_tests {
             Some("up_close_outside"),
             "a close-button press released outside the button is a canceled button click"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_native_caption_close_sends_close_not_activation() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step_result(
+                &mut state,
+                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
+                &targets,
+            ),
+            DetachedActivationWatchStepResult::default()
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample_native_close(false, 0x1000, 0x1000, 0x1000, Some((294, 106))),
+            &targets,
+        );
+        assert_eq!(
+            result.close,
+            Some(DetachedCloseRequest { window_id: 7 }),
+            "the OS caption close button must close a passive window even before it activates"
+        );
+        assert_eq!(
+            result.activation, None,
+            "native caption close must win over passive activation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_native_caption_close_release_outside_is_ignored() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(true)];
+
+        assert_eq!(
+            App::detached_activation_watch_step_result(
+                &mut state,
+                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
+                &targets,
+            ),
+            DetachedActivationWatchStepResult::default()
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample_native_close(false, 0x1000, 0x1000, 0, Some((294, 106))),
+            &targets,
+        );
+        assert_eq!(result.close, None);
+        assert_eq!(result.activation, None);
+        assert_eq!(
+            result.diagnostic.map(|diagnostic| diagnostic.reason),
+            Some("up_close_outside"),
+            "native caption close is canceled when release no longer hits HTCLOSE"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_native_caption_close_works_before_activation_ready() {
+        let mut state = DetachedActivationWatchState::default();
+        let targets = [activation_target_rect(false)];
+
+        assert_eq!(
+            App::detached_activation_watch_step_result(
+                &mut state,
+                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
+                &targets,
+            ),
+            DetachedActivationWatchStepResult::default()
+        );
+        let result = App::detached_activation_watch_step_result(
+            &mut state,
+            activation_sample_native_close(false, 0x1000, 0x1000, 0x1000, Some((294, 106))),
+            &targets,
+        );
+        assert_eq!(
+            result.close,
+            Some(DetachedCloseRequest { window_id: 7 }),
+            "window manager close must not be gated by passive activation readiness"
+        );
+        assert_eq!(result.activation, None);
     }
 
     #[test]
