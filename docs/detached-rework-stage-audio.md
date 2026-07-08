@@ -1336,6 +1336,22 @@ take して破棄する (ログなし)**。fix7-2 は close / timeout / abort �
   `parked_source_swap_pending_waits_for_matching_parked_poll_owner` /
   `video_continuous_target_search_skips_audio_items`。
 
+### fix7-3 検収合格 (Fable 2026-07-08) + P3 残余 fix7-4 (次回同梱可)
+
+**fix7-3 (ef6b0553) = 合格**。要件 5 点すべて充足: owner gate (他文脈は drain/guard/timeout
+含め不介入)・沈黙 drop の全ログ化 (理由 + fs_idx + target + item 種別 + owner)・drop 元
+文脈の特定報告 (active detached context 側の poll_video 到達経路)・動画 EOF ターゲットの
+`GridItem::Video` 限定 + 音声は parked-safe path (テスト固定)・owner 一致の純関数テスト。
+
+**fix7-4 (P3 残余、次の作業コミットに同梱可)**: parked 窓が **pending 在飛行中 (EOF swap の
+~100-200ms 窓) に close** されると、owner の parked poll が二度と走らず deadline 判定にも
+到達しないため pending が恒久残留する。さらに enqueue の update 分岐
+`pending.parked_live_window_id = parked_live_window_id.or(pending.parked_live_window_id)` が
+stale owner を温存するため、後続の非 parked swap がこの pending を引き継ぐと処理されず
+main 側の動画ナビが止まり得る。対策 = ①parked 窓の close/removal 時に parked-origin
+pending を破棄 (ログ付き) ②update 分岐は「現在文脈が非 parked なら owner を None に更新」が
+正しいか検討して揃える。テスト各 1 本。
+
 ### 保留中の実機 FB (fix7-3 の後に対応、未指示)
 
 - 音声モード上 HUD の右側ボタン群と、動画の上 HUD が減光されていない (fix6b の top dim
