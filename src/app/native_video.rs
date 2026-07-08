@@ -2904,6 +2904,13 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
+                if !self.vst3_playback_ui_context_is_main_fullscreen() {
+                    self.show_feedback_toast(
+                        "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
+                    );
+                    self.mark_native_video_hud_activity(ctx);
+                    return;
+                }
                 self.toggle_native_video_vst3_gui();
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -4910,11 +4917,9 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため)。
-        // モード切替の進行中も実モード未確定なので保守的に false にする (Codex 再 P1)。
-        let vst3_ok = self.settings.vst3_enabled
-            && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
-            && self.native_video_mode_switch.is_none();
+        // VST GUI/owner/HUD は OFF モードのメイン fullscreen だけで有効。
+        // 複数ウィンドウモード / F12 detached では音声チェーンだけを維持し、UI は出さない。
+        let vst3_ok = self.native_video_vst3_controls_available();
         player.set_native_vst3_available(vst3_ok);
         player.set_native_video_compact(
             vst3_ok && self.settings.vst3_gui_visible && self.settings.vst3_video_compact,
@@ -4926,11 +4931,9 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        // in-window モードでは VST3 を対象外にするため panel を出さない (Codex P2)。
-        // モード切替の進行中も実モード未確定なので panel は出さない (Codex 再 P1)。
-        let panel = if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
-            || self.native_video_mode_switch.is_some()
-        {
+        // Availability と同じ境界にそろえる。detached / 複数ウィンドウ mode では
+        // panel イベントだけ残る半端な状態を作らない。
+        let panel = if !self.native_video_vst3_controls_available() {
             None
         } else {
             self.build_native_video_vst3_panel()
@@ -6646,10 +6649,12 @@ impl App {
         if !matches!(self.items.get(fs_idx), Some(GridItem::Audio(_))) {
             return;
         }
-        // VST owner/HUD 機構はフルスクリーン borderless presenter 前提 (§5.9)。video-in-window
-        // 等で presentation が Fullscreen でないと owner/HUD 同期が発火しないので拒否する (Codex)。
-        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
-            self.show_feedback_toast("VST 設定はフルスクリーン表示中のみ利用できます".to_string());
+        // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
+        // ウィンドウ mode ではチェーン処理だけを共有し、GUI は開かない。
+        if !self.vst3_playback_ui_context_is_main_fullscreen() {
+            self.show_feedback_toast(
+                "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
+            );
             return;
         }
         if !self.settings.vst3_enabled
@@ -7250,9 +7255,12 @@ impl App {
         if self.video_audio_exit_pending.is_some() {
             return;
         }
-        // VST owner/HUD 機構はフルスクリーン borderless presenter 前提 (§5.9)。
-        if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen) {
-            self.show_feedback_toast("VST 設定はフルスクリーン表示中のみ利用できます".to_string());
+        // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
+        // ウィンドウ mode ではチェーン処理だけを共有し、GUI は開かない。
+        if !self.vst3_playback_ui_context_is_main_fullscreen() {
+            self.show_feedback_toast(
+                "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
+            );
             return;
         }
         if !self.settings.vst3_enabled

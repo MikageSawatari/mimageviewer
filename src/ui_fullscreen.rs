@@ -3953,12 +3953,7 @@ impl App {
             _ => (1.0, false),
         };
         let video_audio_mode = self.video_audio_mode == Some(fs_idx);
-        let show_vst = self.settings.vst3_enabled
-            && (self.video_audio_mode.is_none() || video_audio_mode)
-            && matches!(
-                self.viewer_presentation,
-                ViewerPresentation::Fullscreen | ViewerPresentation::DetachedWindow
-            );
+        let show_vst = self.music_chrome_should_show_vst(fs_idx);
         let normalize_ui_state = self
             .normalize_ui_states
             .get(&fs_idx)
@@ -4011,7 +4006,7 @@ impl App {
             // row control slot as active music. It is dimmed and inert.
             show_row_stepper: true,
             show_back_to_video: info.video_audio_mode,
-            show_vst: true,
+            show_vst: false,
             show_window_toggle: true,
             // ParkedLive keeps the same close slot as active music; only close remains clickable.
             show_close: true,
@@ -21807,7 +21802,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn parked_live_music_chrome_state_keeps_active_controls_visible_but_inert() {
+    fn parked_live_music_chrome_state_keeps_detached_safe_controls_visible_but_inert() {
         let info = crate::app::ParkedLiveMusicWindowInfo {
             fs_idx: 3,
             title: "Song Title".to_owned(),
@@ -21833,7 +21828,10 @@ mod tests {
         assert_eq!(chrome.title, "Song Title");
         assert!(chrome.show_row_stepper);
         assert!(chrome.show_back_to_video);
-        assert!(chrome.show_vst);
+        assert!(
+            !chrome.show_vst,
+            "ParkedLive is always detached; VST GUI controls are main fullscreen only"
+        );
         assert!(chrome.show_window_toggle);
         assert!(
             chrome.show_close,

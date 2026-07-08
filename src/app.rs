@@ -28042,6 +28042,29 @@ impl App {
         None
     }
 
+    #[cfg(windows)]
+    pub(crate) fn vst3_playback_ui_context_is_main_fullscreen(&self) -> bool {
+        !self.settings.detached_viewer_open_images_in_window
+            && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn vst3_playback_controls_available(&self) -> bool {
+        self.settings.vst3_enabled && self.vst3_playback_ui_context_is_main_fullscreen()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_vst3_controls_available(&self) -> bool {
+        self.vst3_playback_controls_available() && self.native_video_mode_switch.is_none()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn music_chrome_should_show_vst(&self, fs_idx: usize) -> bool {
+        let video_audio_mode = self.video_audio_mode == Some(fs_idx);
+        self.vst3_playback_controls_available()
+            && (self.video_audio_mode.is_none() || video_audio_mode)
+    }
+
     #[cfg(not(windows))]
     pub(crate) fn detached_viewer_image_edit_tools_disabled_reason(&self) -> Option<&'static str> {
         None
@@ -45330,6 +45353,8 @@ impl App {
         let mut native_owner_hwnd: u64 = 0;
         #[cfg(windows)]
         let native_hud_dimmed = self.native_video_hud_dimmed_for_current_poll();
+        #[cfg(windows)]
+        let native_vst3_controls_available = self.native_video_vst3_controls_available();
         // 音声 VST シェル (Inc 6 ②-3): フレーム開始時点のシェル対象 fs_idx。close race
         // (soft close イベントで exit 済み ↔ hard close の native_closed_idx) を安全に判定する
         // ため、イベント処理で music_vst_shell が変わる前に焼き付ける。
@@ -45401,11 +45426,10 @@ impl App {
                 active_video_indices.push(*idx);
                 #[cfg(windows)]
                 player.set_native_vst3_available(
-                    self.settings.vst3_enabled
-                        && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
-                        // モード切替の進行中は presenter HWND 再構築中で実モードが
-                        // 未確定。VST availability は保守的に false にする (Codex P1)。
-                        && self.native_video_mode_switch.is_none(),
+                    // VST GUI/owner/HUD は OFF モードのメイン fullscreen だけで有効。
+                    // 複数ウィンドウモード / F12 detached では音声チェーンだけを維持し、
+                    // UI は出さない (findings-19 fix12)。
+                    native_vst3_controls_available,
                 );
                 #[cfg(windows)]
                 player.set_native_checked(self.checked.contains(idx));

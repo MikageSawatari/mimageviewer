@@ -92,11 +92,11 @@ DetachedSource 追加) は**そのまま承認**。争点だった 3 (music_* �
      スナップショット + 音声再生継続にフォールバック (どちらを採ったか完了報告に明記)。
    - どちらでも**音の継続は必須**・**クリック復帰で即ライブ描画に戻る**は必須。
    - 時間窓・新規 bool 禁止は憲法どおり (状態は DetachedWindowState / runtime に載せる)。
-4. **VST**: ボタン表示条件 (`viewer_presentation == Fullscreen` 前提) を detached にも
-   拡張する。**「音にチェーンが効く」ことが Phase I の必須要件**。VST GUI (V キー) が
-   native shell owner の都合で detached 窓と両立しない場合は、GUI 側のみ一旦非対応
-   (実挙動を報告、仕様判断は Fable に戻す) でよい — 勝手なヒューリスティックで
-   塞がないこと。
+4. **VST**: fix12 (2026-07-08) で Phase I の detached GUI 拡張前提を撤回した。
+   VST チェーン (音への効果) は従来どおり `dsp_bridge` 共有で全再生に効くが、
+   VST GUI / VST ボタン / native HUD panel は **フル機能 (OFF) モード + メインウィンドウ
+   fullscreen** のみで表示する。複数ウィンドウ mode / F12 detached / ParkedLive では
+   ボタンを出さない。
 5. **startup direct open (SendTo 等) の Audio は今回スコープ外** (現状 Image/Video のみ
    のまま維持。広げない)。
 6. 過去の wgpu Validation revert 歴があるため、実装後の実機 smoke では起動直後に
@@ -1526,7 +1526,9 @@ probe は debug ゲート内で残置。
 2. 音声窓で F12 → main に戻る / 再度 F12 → detached (音切れなし)
 3. 音声再生中に別窓クリック (park) → 再生継続 → クリック復帰 → 操作有効
 4. 音声窓がある状態で動画を開く → メディア窓が動画に差し替わる (逆も)
-5. VST ON で音声 detached → 音にチェーンが効いている / V キーの挙動が破綻しない
+5. VST ON → フル機能 (OFF) モード + メインウィンドウ fullscreen で VST ボタン / GUI が
+   動作する。複数ウィンドウ mode / F12 detached / ParkedLive では VST ボタンが表示されない。
+   音へのチェーン効果は共有 1 本として維持される。
 6. (fix6/fix6c/fix6d) 音声モード parked 窓: 別窓で PDF ホイール → 上グラフがちらつかない /
    下 spectrum は動く / ヘッダ文字が二重にならない (タイトル 1 本 + × のみ) / spectrum の
    位置が park⇄active で動かない / **上下 HUD の項目構成が active と同じで減光表示**

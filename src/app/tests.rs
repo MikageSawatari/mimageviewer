@@ -17418,6 +17418,48 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn vst_playback_ui_is_full_feature_main_fullscreen_only() {
+        let mut app = setup_app();
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.vst3_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+
+        assert!(app.vst3_playback_ui_context_is_main_fullscreen());
+        assert!(app.vst3_playback_controls_available());
+        assert!(app.native_video_vst3_controls_available());
+        assert!(app.music_chrome_should_show_vst(audio));
+
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        assert!(!app.vst3_playback_ui_context_is_main_fullscreen());
+        assert!(!app.vst3_playback_controls_available());
+        assert!(!app.native_video_vst3_controls_available());
+        assert!(!app.music_chrome_should_show_vst(audio));
+
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.detached_viewer_open_images_in_window = true;
+        assert!(
+            !app.vst3_playback_ui_context_is_main_fullscreen(),
+            "always-new mode must not expose VST GUI even after F12 migrates a media window back to main fullscreen"
+        );
+        assert!(!app.music_chrome_should_show_vst(audio));
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.video_audio_mode = Some(video);
+        assert!(
+            !app.music_chrome_should_show_vst(audio),
+            "plain audio chrome must not expose the video-audio VST host while another item owns video_audio_mode"
+        );
+        assert!(app.music_chrome_should_show_vst(video));
+
+        app.settings.vst3_enabled = false;
+        assert!(!app.vst3_playback_controls_available());
+        assert!(!app.music_chrome_should_show_vst(video));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn video_presentation_switch_updates_detached_session_lifecycle() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");

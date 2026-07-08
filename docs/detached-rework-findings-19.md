@@ -306,6 +306,24 @@ VST 機能自体 (メイン fullscreen での チェーン / V キー GUI) は�
 5. テスト: `show_vst` 導出 (Fullscreen=true / DetachedWindow=false / parked=false)。
 6. コミット `(detached-rework findings-19 fix12)`。
 
+### fix12 実装メモ (Codex 2026-07-08)
+
+- VST GUI / panel の露出条件を `vst3_playback_ui_context_is_main_fullscreen()` /
+  `vst3_playback_controls_available()` / `native_video_vst3_controls_available()` に集約。
+  条件は **VST 有効 + 複数ウィンドウ mode OFF + `ViewerPresentation::Fullscreen`**
+  (native はさらに placement switch なし)。音声チェーン処理は変更せず、GUI/owner/HUD
+  だけを main fullscreen に限定する。
+- 音楽 chrome の `show_vst` は `music_chrome_should_show_vst(fs_idx)` から導出し、
+  `DetachedWindow` / always-new ON / ParkedLive では false。ParkedLive の `show_vst: true`
+  固定も削除。
+- native 動画 HUD の availability / VST panel も同じ helper へ寄せ、button だけ消えて
+  panel event が残る半端な状態を避けた。
+- 旧 V キーの keymap VST GUI toggle は既に撤去済みだったため、新規 key route の変更はなし。
+  誤って音楽 chrome 入口が呼ばれた場合は
+  `VST はメインウィンドウのフルスクリーンでのみ使用できます` を出す。
+- ship-checklist v2 の V8 は既に fix12 仕様 (main fullscreen で確認、detached はボタン absent)
+  へ更新済み。stage-audio §3.5 / §5 の古い detached VST 前提も撤回済み。
+
 ### fix12 訂正 (Fable 2026-07-08、ユーザー指摘): V キーショートカットは存在しない
 
 fix12 要件 3 の「V キー (keymap 経由の VST GUI toggle)」は**誤り** (stage-audio 時代の古い
