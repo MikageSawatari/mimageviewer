@@ -27223,6 +27223,20 @@ impl App {
             return self.close_current_active_detached_viewer_context(ctx);
         } else if self.viewer_session_is_detached() {
             if self.preserve_active_detached_image_window_for_main_context_change() {
+                // preserve (legacy park) 自体は main のフルスクリーン状態を触らない
+                // (load_folder 直呼び経路では後続のフォルダ install が畳むため)。ここ
+                // (parked_live_activate / activate_snapshot などの文脈切替) では畳む者が
+                // 居らず、main に fs_idx / presentation=DetachedWindow のゴーストセッションが
+                // 残る。残すと次のフォルダ移動で preserve がゴーストの idx に反応し、
+                // アクティブなメディア窓へ「別アイテムの画像スナップショット」を焼き付けて
+                // park してしまう (2026-07-09 実機 2 件目: 動画窓に画像が表示・点滅)。
+                // live-media park (park_current_viewer_context_as_live_media_inner 末尾) と
+                // 同じ後始末で main を非 detached へ戻す。
+                self.fullscreen_idx = None;
+                self.viewer_presentation = self.non_detached_viewer_presentation();
+                self.detached_viewer_independent_active = false;
+                self.detached_viewer_window_id = None;
+                self.last_viewer_sync_stamp = None;
                 self.log_detached_image_window_debug(format!(
                     "park_current_active_detached result=parked_legacy_detached fs_idx={:?} \
                      independent={} passive_windows={} session={:?}",

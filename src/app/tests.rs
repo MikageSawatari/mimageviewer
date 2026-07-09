@@ -18794,6 +18794,103 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn parked_live_activation_clears_ghost_linked_session() {
+        // 2026-07-09 実機 2 件目: parked live メディア窓の再activate 時、直前の main 連動
+        // 画像セッションは legacy park (preserve) で退避されるが、main 側の fullscreen_idx /
+        // presentation=DetachedWindow がクリアされずゴーストとして残っていた。次のフォルダ
+        // 移動で preserve がゴーストの idx に反応し、アクティブなメディア窓 (別 window_id) へ
+        // 別アイテムの画像スナップショットを焼き付けて park → 動画窓に画像が表示・点滅。
+        // park_and_close の legacy 分岐が main を非 detached へ戻すことを固定する。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\linked.jpg");
+        let video = push_video(&mut app, r"C:\clips\parked-live.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        // main 連動の画像セッション (window 70)。snapshot 用にサムネ texture を種入れ。
+        let img_tex = ctx.load_texture(
+            "ghost_linked_image",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[image] = ThumbnailState::Loaded {
+            tex: img_tex,
+            from_cache: false,
+            rendered_at_px: 128,
+            source_dims: Some((1, 1)),
+        };
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(70);
+        app.begin_active_detached_session(70, DetachedSource::Image);
+
+        // ParkedLive のメディア窓 (61)。
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_window_id = Some(61);
+        let media_tex = ctx.load_texture(
+            "parked_live_ghost_media",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 61,
+                texture: media_tex,
+                title: "parked media".to_owned(),
+                location_display: "parked media".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 61));
+
+        // メディアセッションが active になり、直前の画像窓は Parked で温存される。
+        assert_eq!(
+            app.active_detached_session.map(|s| s.window_id),
+            Some(61),
+            "メディア窓が active セッションになる"
+        );
+        assert_eq!(
+            app.detached_window_state(70),
+            Some(DetachedWindowState::Parked),
+            "直前の画像セッションは Parked で温存"
+        );
+        // ゴーストが残らない (main は非 detached へ戻る)。
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "main に fullscreen_idx のゴーストが残らない"
+        );
+        assert_ne!(
+            app.viewer_presentation,
+            ViewerPresentation::DetachedWindow,
+            "main の presentation が DetachedWindow のまま残らない"
+        );
+        assert_eq!(app.detached_viewer_window_id, Some(61));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn park_active_media_context_clears_stale_main_window_id() {
         // 同上の実機事象の発生源側: park_active_detached_context_as_live_media 後、復元された
         // main 文脈に parked 窓 id の stale コピーが残らない。
