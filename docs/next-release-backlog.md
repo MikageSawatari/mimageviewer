@@ -151,6 +151,101 @@
   → ④ 同名 ZIP 優先表示 → ⑤ 変換メニュー → ⑥ docs（`virtual-folders.md` の分岐表に RAR 直読み行を追記）。
 - 優先度: P2 candidate。着手前に `docs/virtual-folders.md`（分岐表・キー規則）と本正本を読む。
 
+### 1.6 グリッドのソートで実フォルダ / アーカイブ類 / 画像 / 動画・音声の表示順を設定
+
+- 背景: mImageViewer 専用スレ 37。当初要望は「ソートのオプションでファイルとフォルダを
+  分けて表示したい。フォルダを前 / 後に配置も選べると尚よい」。専用スレ 39 で、要望の主旨は
+  「フォルダを通常ファイルと混ぜて名前順にする / フォルダだけ先頭へ寄せる / フォルダだけ末尾へ
+  寄せる」を選びたいというものだと分かった。
+  一方、mIV では ZIP / PDF / 変換アーカイブを「本」コンテナとして扱う使い方や、
+  「画像のみのフォルダを本として扱う」設定もあるため、アーカイブ類を常に画像・動画側へ
+  混ぜる固定仕様にすると不便になる利用者も出そう。
+- 現状 (調査済み 2026-07-08):
+  - スキャン時点で `folders` (Folder / ZipFile / PdfFile / ConvertibleArchive) と `all_media`
+    (Image / Video / Audio) の 2 配列に分離済み (`src/app/folder_scan.rs`
+    `scan_directory_with_convertible_archives`)。
+  - ただし `folders` ブロック内は 4 種を**種別区別せず** `sort_order` だけで一列に並べる
+    (`crate::grid_item::sort_folder_block`, `src/grid_item.rs:447`)。結果、実フォルダと ZIP / PDF /
+    変換アーカイブが名前順で交互に混在する (例: `apple/` `banana.zip` `cat/` `dog.pdf`)。
+  - `items` の組み立ては「`folders` 先頭 → `all_media`」の固定 2 段構成 (`src/app.rs:12574` 付近)。
+    前後の入れ替えはできない。
+  - ソート順は `folders` / `all_media` とも同一の `sort_order`
+    (`self.book_sort_order_for_path(&path)`, 通常 `settings.sort_order`) を使う。グループ別の
+    ソート順は持っていない (`src/app.rs:12530-12542`)。
+- 方針:
+  - 表示順を 4 段の表形式で設定できるようにする。対象カテゴリは
+    `実フォルダ` / `アーカイブ類 (ZIP / PDF / 変換アーカイブ。RAR 直読み追加後は RAR もここ)`
+    / `画像` / `動画・音声`。
+  - UI イメージ:
+
+    | 表示順 | フォルダ | アーカイブ類 (ZIP/PDF/RAR 等) | 画像 | 動画・音声 |
+    | --- | --- | --- | --- | --- |
+    | 1 | □ | □ | □ | □ |
+    | 2 | □ | □ | □ | □ |
+    | 3 | □ | □ | □ | □ |
+    | 4 | □ | □ | □ | □ |
+
+  - 各カテゴリはいずれか 1 行にだけ所属する。空行は許可して詰めて扱うか、保存時に正規化する。
+  - 同じ行に複数カテゴリを入れた場合は、同一グループとして**混ぜて `sort_order` でソート**する。
+    例: `アーカイブ類 + 画像 + 動画・音声` を同じ行にすると、`A.zip / C.rar / E.lzh / page01.jpg`
+    のように通常ファイル側として混在できる。`フォルダ` を別行にすればフォルダ前置 / 後置が可能。
+  - 既定値は既存挙動に近い `1: フォルダ + アーカイブ類`、`2: 画像 + 動画・音声` とする。
+    ただしリリース前に、初回表示の分かりやすさを優先して
+    `1: フォルダ`、`2: アーカイブ類`、`3: 画像`、`4: 動画・音声` を既定にするか再判断する。
+  - **各グループ別のソート順**までは持たせない。各行の中は従来どおり同じ `sort_order` を使う。
+  - `items` を組み立てる経路が複数あるため、グループ順の適用を共通ヘルパーに集約して全経路で
+    揃える: メインの `load_folder_with_scan` (`src/app.rs`) / ZIP 内列挙 (`finalize_zip_enumerate`) /
+    ファイル名スタックの materialize (`src/filename_stack.rs`) / レーティング一覧 / サブフォルダ
+    展開ビュー。全文検索の結果一覧 (`src/global_search_ui.rs:782` `build_flat_items`) は元々
+    「フォルダ / ファイル区別なく一律ソート」なので、この表示順設定を適用するか従来どおりにするかを
+    別途決める。
+- 永続化 / 移行:
+  - 4 カテゴリの行割り当てを `Settings` に新フィールドとして追加する。
+    例: `Vec<Vec<GridItemDisplayKind>>` または固定長 `[DisplayGroup; 4]`。保存時はカテゴリ重複 /
+    未所属を正規化し、壊れた設定は既定値へフォールバックする。
+  - 既定値を既存互換にする場合は「重要な変更点」告知は不要。既定値を分離寄りに変える場合は
+    `version_highlights.rs` へ追記する。
+- 規模 / リスク: Medium / 低〜中。中核の並べ替えロジックは小さいが、`items` 構築経路が分散して
+  いるため各経路への反映漏れに注意する。着手前に `docs/virtual-folders.md` (グリッド構成) と
+  `CLAUDE.md` の「サムネイルロード / Grid contents」節を読む。
+- 優先度: P3。今後のバージョンで検討 (2026-07-08 ユーザー要望)。すぐの実装は予定しない。
+
+### 1.7 フル機能モードでも動画・音声だけ独立メディアウィンドウで再生
+
+- 背景: detached リワーク checklist 中のユーザー発案 (2026-07-09)。フル機能 (連動 1 枚)
+  モードのまま、動画/音声だけはメイン非連動の別ウィンドウ (複数ウィンドウモードと同じ
+  live-park するメディア窓) に出し、その窓で再生を続けながらメイン側で画像を閲覧したい。
+- 現状: メディア窓インフラ (動画/音声共用 1 本規則・live-park・独立 bundle・in-place park・
+  parked EOF 自動進行・HUD 減光・watcher クリック復帰/× close) は detached リワーク
+  (2026-07 時点) で実装済みでほぼモード非依存 = そのまま流用できる。不足は「フル機能モード
+  でメディアをこの経路に振る入口」と、CUT の不変条件「フル機能 = 連動 1 枚のみ」に第 3 状態
+  (フル機能 + 独立メディア窓) が加わることへの述語対応。
+- 方針 (設計時に確定、現時点の推奨は A):
+  - **A (推奨): フル機能モードのサブオプション** — 「本の表示モード」sub-radio と同じ場所に
+    checkbox「動画・音声は別ウィンドウで再生」を追加。トップレベルの radio は 2 モードの
+    まま (モード切替の全窓クローズ規則も 2 値のまま)。判定は
+    `effective_auto_fullscreen_zip_pdf()` と同じ派生述語パターン
+    (`effective_media_in_media_window()` 等) で読み取りサイトを一元化。
+    複数ウィンドウモードは常にメディア窓なので checkbox はフル機能側にだけ効く。
+  - B (代替): ビューワモードを 3 択 radio (フル機能 / フル機能+メディア別窓 / 複数ウィンドウ)
+    にする。発見性は高いが、モード切替クローズ・4 象限テスト・マニュアルのマトリクスが
+    3 モード化して保守コスト増。サブオプションで表現できる差分なので A が軽い。
+  - トリガー範囲も設計時に確定: (i) グリッドから動画/音声を開いた時点で常にメディア窓
+    (checkbox の意味が素直、推奨) か、(ii) F12 を押したときだけ独立メディア窓化し通常 open は
+    メイン内 fullscreen のまま、か。原案 (ユーザー初出) は F12 起点だが、設定として持つなら
+    (i) の方が一貫する。
+  - メディア窓存在中の動画への再 F12 = メインに戻す (窓 close + メイン fullscreen)、を既定に
+    する想定。VST UI は fix12 準拠 (メイン fullscreen のみ表示、チェーン効果は共有で全再生に
+    乗る) のまま変えない。
+- 規模 / リスク: Medium (ステージ 1 本、実働 2〜4 日 + 検証込みで 1 週間弱) / 中。
+  工数の 5〜6 割は述語の棚卸し (`detached_viewer_open_images_in_window` / モード判定を読む
+  述語群に第 3 状態を通す総点検。findings-6/12/17/19 クラスの「bundle 外グローバルが root
+  pass で別の顔になる」取り漏らしが出やすい)。detached リワークと同じ
+  指示書 → Codex 実装 → Fable 検収の体制で独立ステージ「stage-media-window-off」として実施。
+- 優先度: P3。次バージョン以降で検討 (今回リリースには含めない = 出荷ゲート直前に CUT
+  不変条件を触らない)。着手前に `docs/detached-rework-plan.md` §2 (憲法) と
+  `docs/detached-rework-stage-settings.md` (派生述語パターン) を読む。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断
@@ -367,6 +462,43 @@
 - 優先度: P2 candidate。報告としてはバグ寄りだが、PDF 対応まで含めると範囲が広がるため
   ZIP 内画像を先に小さく直す。
 
+### 4.6 操作カスタマイズの共有・差分・世代取り込み
+
+- 正本: **`docs/operation-customize-share-plan.md`**（設計・ファイル形式・UI・実装順・テストまで記載）。以下は要約。
+- 背景: 操作カスタマイズ（キー割り当て / 右ドラッグ・リング・マウス・ゲームパッド /
+  メニュー構成）は作り込む設定なので、「他人に配れるプリセットとして共有したい」「標準や
+  現在との差分を見たい」「変な割り当てをしたので操作カスタマイズだけ 2 日前に戻したい」
+  という需要がある。
+- 現状（調査済み）:
+  - 操作カスタマイズは `settings.db` 内の 3 フィールド（`Settings.keymap` /
+    `ring_shortcuts` / `menu_layout`、いずれも serde 対応）に保存され、`settings.db` 世代
+    バックアップ `bak1..bak10` + 「設定の復元」に含まれる（除外されていない）。
+  - ただし世代ローテはプロセス起動ごとに 1 回、復元は settings.db 全体の差し替え（他設定も
+    巻き込む・要再起動）、操作カスタマイズ専用の差分 / エクスポート / インポートは無い。
+- 確定方針（ユーザー合意）:
+  1. 既存の設定バックアップ（settings.db 世代 + 設定の復元）は現状維持。新しい永続化・
+     スキーマ変更はしない。世代を読むだけ + ファイル入出力 + 純関数の差分で作る。
+  2. 共有・差分・世代取り込みはすべて「設定の復元」ダイアログに集約し、縦長回避のため
+     **タブ化**（`設定の復元` / `操作カスタマイズ`）。
+  3. 共有は `.mivkeys.json`（3 点セット + `format_version` + `app_version` + `label`）を
+     エクスポート / インポート。**インポートは置換のみ**（マージなし）、未知アクションは
+     warn-and-skip、適用前に「取り込み元 vs 現在」の差分プレビュー。
+  4. 差分は実効チョード（override or `default_chords`）単位で 追加/削除/変更 を表表示。
+     比較対象は 標準 / 現在 / 前世代（前世代は起動ごとローテのため空が多い）。
+  5. 世代からの取り込みも可能（2 日前の操作カスタマイズを現在へ、**再起動なしのライブ適用**
+     = `apply_operation_customize_state` 経路）。取り込み前に現在設定を
+     `before-import-*.mivkeys.json` へ自動退避して undo 経路を確保。
+- 実装戦略: 新規純ロジック `src/operation_customize_share.rs`（Bundle / JSON / diff）+
+  `settings_restore.rs` に世代抽出（既存 `validate_in_dir` の read-only 展開を流用）+
+  `ui_dialogs/settings_restore.rs` のタブ化。keymap 側は `KeyAction::all` / `default_chords` /
+  `effective_chords` / warnings を再利用（新規ロジックはほぼ不要）。ファイルダイアログは既存 `rfd`。
+- 規模 / リスク: Medium / 低。スキーマ非変更・読み取り中心で、書き込みは取り込み時のみ
+  （既存の save 経路 + 自動退避で保護）。detached 凍結ルールとは無関係。
+- 段階実装: ① 純ロジック + test → ② 世代/現在から Bundle 抽出 + エクスポート →
+  ③ 差分ビュー → ④ 取り込み（ファイル + 世代、プレビュー + ライブ適用 + 自動退避）→
+  ⑤ ダイアログのタブ統合 → ⑥ マニュアル / 製品ページ更新。
+- 優先度: P2 candidate。操作カスタマイズ系（4.2 / 4.3）と同時期に着手すると相性がよい。
+
 ### 4.5 サムネイル選択情報の下部 1 行バー / ツールチップ改善
 
 - 背景: mImageViewer 専用スレ 17。サムネイル情報ツールチップが下の列のサムネイルに被って
@@ -444,7 +576,7 @@
 | サブフォルダ展開 / フラット仮想ビュー | `docs/subfolder-expansion-view-plan.md`, `docs/ui-responsiveness.md`, `docs/async-architecture.md`, `docs/details-view-and-filter-plan.md`, `docs/virtual-folders.md` |
 | ZIP / PDF / 変換アーカイブ | `docs/virtual-folders.md`, `docs/shell-file-operations-context-menu-plan.md` |
 | フォルダ移動 / Ctrl+↑↓ | `docs/fullscreen-navigation-consistency.md`, `docs/keymap-spec.md` |
-| 入力カスタマイズ / マウス / ゲームパッド | `docs/keymap-spec.md`, `docs/key-customization-impl-plan.md`, `docs/ring-shortcut-plan.md` |
+| 入力カスタマイズ / マウス / ゲームパッド | `docs/keymap-spec.md`, `docs/key-customization-impl-plan.md`, `docs/ring-shortcut-plan.md`, `docs/operation-customize-share-plan.md` |
 | フルスクリーン / F12 別ウィンドウ / 連結読み | `docs/display-pipeline.md`, `docs/detached-viewer-implementation-plan.md`, `docs/fullscreen-navigation-consistency.md` |
 | 表示 / AI / 補正 | `docs/display-pipeline.md`, `docs/preset-and-adjustment.md` |
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
