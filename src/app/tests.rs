@@ -18743,6 +18743,93 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn ensure_window_id_rejects_id_of_parked_window() {
+        // 2026-07-09 実機 (review-v2.3.0 checklist P2-3 確認中): park 直後の grid open が
+        // stale な detached_viewer_window_id を直参照分岐で再利用し、ParkedLive メディア窓と
+        // 新しい画像セッションが同一 window_id / HWND を取り合った (parked 窓に画像が表示され
+        // 点滅・操作不能)。passive/parked に存在する id は直参照でも再利用しない (BA-7)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "stale_window_id_guard",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 7,
+                texture: tex,
+                title: "parked media".to_owned(),
+                location_display: "parked media".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(ViewerContextBundle::empty())),
+            });
+        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
+        app.detached_viewer_window_id = Some(7);
+        app.last_active_detached_window_id = Some(7);
+
+        let id = app.ensure_detached_viewer_window_id();
+        assert_ne!(id, 7, "parked/passive 窓の id を新セッションに再利用しない");
+        assert_eq!(app.detached_viewer_window_id, Some(id));
+
+        // 衝突が無ければ従来どおり直参照を再利用する (フォルダナビの窓安定性を壊さない)。
+        let id2 = app.ensure_detached_viewer_window_id();
+        assert_eq!(id2, id);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn park_active_media_context_clears_stale_main_window_id() {
+        // 同上の実機事象の発生源側: park_active_detached_context_as_live_media 後、復元された
+        // main 文脈に parked 窓 id の stale コピーが残らない。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\live2.mp4");
+        let window_id = 53;
+        app.settings.detached_viewer_enabled = true;
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(window_id);
+        bundle.detached_viewer_independent_active = true;
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+        // main 側の stale コピー (実機の再現条件)。
+        app.detached_viewer_window_id = Some(window_id);
+        app.last_active_detached_window_id = Some(window_id);
+
+        assert!(app.park_active_detached_context_as_live_media(&ctx, "test_park_stale_id"));
+
+        assert_ne!(
+            app.detached_viewer_window_id,
+            Some(window_id),
+            "park 後の main 文脈に parked 窓 id の stale コピーが残らない"
+        );
+        let new_id = app.ensure_detached_viewer_window_id();
+        assert_ne!(
+            new_id, window_id,
+            "直後の open が parked 窓の id を掴まない"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn parked_live_music_window_blocks_music_state_clear_on_non_media_open() {
         // review-v2.3.0 P2-3: ParkedLive の音楽窓 (音声ファイル) が global music_* を消費して
         // いる間、メイン文脈の非メディア open は音楽状態を破棄しない (破棄すると別窓 BGM 中の

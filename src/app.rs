@@ -25736,8 +25736,22 @@ impl App {
     #[cfg(windows)]
     fn ensure_detached_viewer_window_id(&mut self) -> u64 {
         if let Some(id) = self.detached_viewer_window_id {
-            self.last_active_detached_window_id = Some(id);
-            return id;
+            // この id が passive / ParkedLive 窓として detached_image_windows に居るなら
+            // stale なコピー (直前の park で窓は手放したのに main 文脈側の参照が残った)。
+            // 再利用すると parked 窓と新セッションが同一 window_id・同一 HWND を取り合い、
+            // parked live メディア窓に画像が表示されて点滅・操作不能になる
+            // (2026-07-09 実機、review-v2.3.0 checklist 中に発生。BA-7)。下の
+            // last_active_detached_window_id 再利用と同じ衝突ガードを直参照側にも適用し、
+            // stale なら捨てて新規 allocate へ落とす。
+            if !self.detached_image_windows.iter().any(|w| w.id == id) {
+                self.last_active_detached_window_id = Some(id);
+                return id;
+            }
+            self.log_detached_image_window_debug(format!(
+                "stale_window_id_dropped reason=ensure_detached_viewer_window_id id={id} \
+                 (passive/parked window with same id exists)"
+            ));
+            self.detached_viewer_window_id = None;
         }
         // フォルダナビ (Ctrl+↑↓) の reopen は同じ detached ウィンドウの中で内容を差し替える
         // 継続操作。grid からの新規オープンでない (= !fs_open_intent_from_grid) 場合は、直前に
@@ -28167,11 +28181,18 @@ impl App {
             self.active_detached_viewer_context = Some(active);
             return false;
         }
+        let parked_window_id = active.bundle.detached_viewer_window_id;
         self.swap_viewer_context_bundle(&mut active.bundle);
         let parked = self.park_current_viewer_context_as_live_media_inner(ctx, reason, false);
         self.swap_viewer_context_bundle(&mut active.bundle);
         if !parked {
             self.active_detached_viewer_context = Some(active);
+        } else if parked_window_id.is_some() && self.detached_viewer_window_id == parked_window_id {
+            // park_inner の window_id クリアは take_current 後の**空バンドル側**に書かれるため、
+            // ここで復元した main 文脈には parked 窓 id の stale コピーが残り得る。残すと直後の
+            // grid open (ensure_detached_viewer_window_id の直参照分岐) が同じ id を再利用し、
+            // parked live メディア窓と新セッションが同一窓を取り合う (2026-07-09 実機、BA-7)。
+            self.detached_viewer_window_id = None;
         }
         parked
     }
