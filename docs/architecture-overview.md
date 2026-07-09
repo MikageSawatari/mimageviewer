@@ -111,6 +111,37 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |
 | `panorama.rs` / `panorama_wgpu.rs` | 360 度パノラマビュー (Phase 1 + 1.5 + 2a)。`panorama.rs` は state / GPano XMP 検出 / 解像度ゲート / settle policy / CPU bilinear sampler / `render_settle_overlay`、`panorama_wgpu.rs` は equirect WGSL シェーダ + 8K base アップロード + settle overlay の alpha blend pipeline。詳細は [`docs/panorama-360-view-plan.md`](panorama-360-view-plan.md) |
 
+### 音楽ビュー / 音声再生 (v2.3.0)
+
+音声ファイル (`GridItem::Audio`) は「映像なし動画」として `FsCacheEntry::Video` の headless
+`VideoPlayer` で再生し、フルスクリーンには egui の音楽ビュー (DJ 風タイムライン +
+スペクトラム) を描く。動画も HUD の ♪ / Z キーで「動画→音声モード」(presenter を hide して
+音楽ビューで聴く hidden presenter 方式) にトグルできる。正本:
+[music-integration-plan.md](music-integration-plan.md)、動画→音声モードは
+[video-architecture.md](video-architecture.md) の該当節。
+
+| モジュール | 役割 |
+| --- | --- |
+| `audio_decode.rs` | 音楽解析用の FFmpeg 音声デコード (48kHz stereo f32 固定)。全尺一括 + progressive 差分の 2 API。EOF で swresample の内部 delay を flush する (再生系の `video/decoder.rs` とは独立した解析専用デコーダ) |
+| `crates/music-core` | 解析純ロジック (`analysis.rs` = タイムライン bin 化 + FFT/クロマ、`beat.rs` = BPM グリッド、`timeline.rs` / `effects.rs`)。I/O なしで unit test 容易 |
+| `ui_music_timeline.rs` | 音楽ビュー中央の行分割波形タイムライン。row raster worker + 行テクスチャキャッシュ (`TimelineTextureCache`、解析の版数 = `music_analysis_version` で再ラスタ判定)。行数は `TIMELINE_MAX_ROWS` でキャップ |
+| `ui_music_spectrum.rs` | 下段 108band スペクトラム + 鍵盤。専用 worker が共有 `MusicPcm` の窓を FFT (in-flight 1 件 coalesce) |
+| `ui_music_panels.rs` | 音楽ビューの左右ホバーパネル (ブックマーク / ループ / 行秒数) と下 HUD (動画 native HUD とレイアウト一致) |
+| App の `music_*` 状態 | 解析ワーカー / `MusicPcm` / spectrum / timeline cache は **ViewerContextBundle に入れず global** (stage-audio §3.5: ParkedLive 音楽窓も同じ global を消費する)。表示ゲートの中央述語は `fs_music_view_active`、動画→音声モードの transient は `video_audio_mode` / `video_audio_vst` |
+
+### マルチウィンドウ / detached viewer (F12)
+
+⚠️ 構造リワーク中 (凍結ルールあり)。正本:
+[detached-rework-plan.md](detached-rework-plan.md) (§2 憲法 = BA-1〜BA-7)。
+音声メディア窓は [detached-rework-stage-audio.md](detached-rework-stage-audio.md)。
+
+| モジュール / 概念 | 役割 |
+| --- | --- |
+| `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / ピン / Book) と parked live 窓は bundle swap で mount/unmount する。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む) |
+| `DetachedWindowRuntime` (app.rs) | 窓ごとの HWND / placement / 状態遷移 (Active/Passive/Parked/ParkedLive/Resuming/Closing) を一元管理する runtime (リワーク R2) |
+| `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
+| `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
+
 ### 補正 / 編集 / AI
 
 | モジュール | 役割 |
@@ -295,6 +326,9 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | [local-adjustment-layer-v1.1.0-plan.md](local-adjustment-layer-v1.1.0-plan.md) | 補正レイヤー / ローカル調整 / レイヤー合成を触るとき。本体統合タスクリストと cache 方針 |
 | [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md) | 補正レイヤー効果候補、効果ピッカー、効果追加方針を触るとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグ関連を触るとき。**Ctrl+S/F/G の経路とインデクサパイプラインの全体像** |
+| [music-integration-plan.md](music-integration-plan.md) | 音楽ビュー / 音声再生 / 動画→音声モードを触るとき (Inc 履歴含む正本) |
+| [video-architecture.md](video-architecture.md) | 動画 HUD・native presenter・動画→音声モードを触るとき |
+| [detached-rework-plan.md](detached-rework-plan.md) | detached viewer / F12 / 複数ウィンドウを触るとき。**§2 憲法 (BA-1〜7) 必読、凍結ルールあり** |
 | [spec.md](spec.md) | 機能仕様・設定項目の正式な定義 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の詳細設計 |
 | [thumbnail-memory-redesign.md](thumbnail-memory-redesign.md) | サムネイルメモリ管理の背景経緯 |
