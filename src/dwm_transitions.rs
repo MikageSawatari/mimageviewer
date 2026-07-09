@@ -13,7 +13,7 @@
 //!
 //! Windows 11 で効きが不安定という報告があるため、失敗は無視 (ベストエフォート)。
 
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, S_OK};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, S_FALSE, S_OK};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_COLOR_DEFAULT,
     DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
@@ -36,8 +36,12 @@ struct ComInitScope {
 impl ComInitScope {
     fn init_sta() -> Self {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // COM の契約では S_FALSE (既に初期化済み) でも参照カウントは +1 されるので、
+        // CoUninitialize で釣り合わせる必要がある。S_OK 限定だと呼び出しごとに
+        // カウントが単調増加する (review-v2.3.0 hunt P3)。失敗 (RPC_E_CHANGED_MODE 等)
+        // のときだけ uninit しない。
         Self {
-            needs_uninit: hr == S_OK,
+            needs_uninit: hr == S_OK || hr == S_FALSE,
         }
     }
 }

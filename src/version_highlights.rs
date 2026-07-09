@@ -245,7 +245,13 @@ const TABLE: &[VersionHighlights] = &[
     },
     VersionHighlights {
         version: "2.3.0",
-        must_read: &[],
+        must_read: &[HighlightItem {
+            title: "旧バージョンへ戻す場合の注意",
+            body: "スマートフィルタの「種類」で「音声」を選んだままこのバージョンを終了し、\
+                   v2.2.0 以前へ戻して起動すると、旧バージョンが設定を読めず、設定が自動バックアップの\
+                   世代へ巻き戻ることがあります。旧バージョンへ戻す場合は、先に種類フィルタから\
+                   「音声」を外して (またはフィルタを解除して) 終了してください。",
+        }],
         highlights: &[
             HighlightItem {
                 title: "音楽を波形・スペクトラムで見ながら再生",
@@ -412,7 +418,10 @@ mod tests {
         let entries = for_version("2.3.0", table());
         assert_eq!(versions(&entries), ["2.3.0"]);
         let entry = entries[0];
-        assert!(entry.must_read.is_empty());
+        // must_read = 旧バージョンへ戻す場合の注意 (音声の種類フィルタを外してから終了。
+        // v2.2.0 が読めない設定値による設定巻き戻り防止、review-v2.3.0)。
+        assert_eq!(entry.must_read.len(), 1);
+        assert!(entry.must_read[0].title.contains("旧バージョン"));
         assert!(
             entry
                 .highlights

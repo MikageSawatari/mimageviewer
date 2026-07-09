@@ -262,9 +262,10 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
         }
     }
 
-    // EOF: decoder に溜まった残りフレームを drain する。
+    // EOF: decoder に溜まった残りフレームを drain し、resampler の内部 delay も吐き切る。
     let _ = decoder.send_eof();
     drain_decoder(&mut decoder, &mut frame, &mut resampler, &mut out, in_rate)?;
+    flush_resampler(&mut resampler, &mut out)?;
 
     let frame_count = out.len() / OUT_CHANNELS;
     let duration_secs = frame_count as f64 / OUT_RATE as f64;
@@ -337,7 +338,7 @@ pub fn decode_audio_file_progressive(
         }
     }
 
-    // EOF: decoder に溜まった残りフレームを drain する。
+    // EOF: decoder に溜まった残りフレームを drain し、resampler の内部 delay も吐き切る。
     let _ = decoder.send_eof();
     scratch.clear();
     drain_decoder(
@@ -347,6 +348,7 @@ pub fn decode_audio_file_progressive(
         &mut scratch,
         in_rate,
     )?;
+    flush_resampler(&mut resampler, &mut scratch)?;
     if !scratch.is_empty() {
         total_frames += scratch.len() / OUT_CHANNELS;
         on_delta(&scratch, OUT_RATE)?;
@@ -528,11 +530,65 @@ fn drain_decoder(
     Ok(())
 }
 
+/// swresample の出力バッファ確保に足す安全マージン (delay 見積りの端数吸収)。
+const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
+
+/// EOF 後に swresample の内部 delay に残ったサンプルを吐き切って `out` へ追記する。
+///
+/// 通常レート変換の delay は数十サンプルで解析への影響は無視できるが、極短ファイル
+/// (数千サンプル級) では末尾の transient が丸ごと delay に取り残されて波形 /
+/// スペクトラム / ビート解析から欠ける (review-v2.3.0 hunt P2)。EOF 時に一度だけ
+/// 呼び、出力が空になるまで flush を繰り返す。再生系 (video/decoder.rs) はストリーミング
+/// 途中で flush できないので従来どおり (この関数は解析用デコーダ専用)。
+fn flush_resampler(resampler: &mut ResampleContext, out: &mut Vec<f32>) -> Result<(), String> {
+    loop {
+        let delay_out = resampler
+            .delay()
+            .map(|d| d.output.max(0) as u64)
+            .unwrap_or(0);
+        if delay_out == 0 {
+            return Ok(());
+        }
+        let out_cap = (delay_out + SWR_OUTPUT_SAFETY_SAMPLES) as usize;
+        let mut resampled = AudioFrame::empty();
+        unsafe {
+            resampled.alloc(
+                Sample::F32(SampleType::Packed),
+                out_cap,
+                ffmpeg::ChannelLayoutMask::STEREO,
+            );
+            resampled.set_rate(OUT_RATE);
+        }
+        if let Err(e) = resampler.flush(&mut resampled) {
+            // flush 失敗は末尾数十サンプルの欠落に留まるので致命的でない。
+            crate::logger::log(format!("[audio] swr flush: {e}"));
+            return Ok(());
+        }
+        let nb = resampled.samples();
+        if nb == 0 {
+            return Ok(());
+        }
+        let count = nb * OUT_CHANNELS;
+        if out.try_reserve(count).is_err() {
+            return Err(format!(
+                "音声デコードのメモリ確保に失敗しました (ファイルが長すぎる可能性: {} samples)",
+                out.len() + count
+            ));
+        }
+        unsafe {
+            let ptr = (*resampled.as_ptr()).data[0] as *const f32;
+            if ptr.is_null() {
+                return Ok(());
+            }
+            out.extend_from_slice(std::slice::from_raw_parts(ptr, count));
+        }
+    }
+}
+
 /// 1 音声フレームを 48kHz stereo f32 packed に resample して `out` に追記する。
 ///
-/// swresample の内部バッファリング (位相補間の遅延) は解析用途では無視できる (曲全体で
-/// bin 化するので末尾数十サンプルの欠落は影響しない)。よって動画のストリーミング再生と
-/// 同じく「入力フレームごとに 1 回 run」する方式にし、最終 flush は行わない。
+/// swresample の内部バッファリング (位相補間の遅延) は「入力フレームごとに 1 回 run」で
+/// 進め、EOF 時に `flush_resampler` で吐き切る (review-v2.3.0 hunt P2)。
 fn append_resampled(
     resampler: &mut ResampleContext,
     frame: &mut AudioFrame,
@@ -555,7 +611,6 @@ fn append_resampled(
     // で確保する (Codex P2)。floor + 固定 64 だと downsample や delay > 64 のときに
     // サンプルが swr 内部 delay に取り残されたり run() error になる
     // (video/decoder.rs:5376 resample_output_buffer_samples と同式)。
-    const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
     let delay_out = resampler
         .delay()
         .map(|d| d.output.max(0) as u64)

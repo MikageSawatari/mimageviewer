@@ -196,10 +196,16 @@ pub(super) fn item_supports_tags(item: &GridItem) -> bool {
 }
 
 pub(super) fn facet_tag_filter_applies(item: &GridItem) -> bool {
+    // Audio は v2.3.0 でタグ対象 (tag_item_path / tag_ops) に加わったので、ファセットの
+    // タグ絞り込みでも他のリーフ (Image/Video) と同様に評価対象にする。ここに入れないと
+    // タグ絞り込み中も音声だけ全件素通しになり、付けたタグで絞れない
+    // (review-v2.3.0 hunt P2)。Folder の素通しは意図的仕様のまま
+    // (facet_tag_passthrough_for_folder_still_applies_date_filter で固定)。
     matches!(
         item,
         GridItem::Image(_)
             | GridItem::Video(_)
+            | GridItem::Audio(_)
             | GridItem::ZipFile(_)
             | GridItem::PdfFile(_)
             | GridItem::ConvertibleArchive { .. }
@@ -1232,5 +1238,11 @@ mod tests {
         // (= facet_ai_filter_applies はスタック以外を対象にする)。
         assert!(!facet_tag_filter_applies(&folder));
         assert!(facet_ai_filter_applies(&folder));
+
+        // 音声はタグ対象 (tag_item_path が Some を返す) なので、タグファセットの評価対象
+        // でもある。ここが false だとタグ絞り込み中も音声だけ全件素通しになる
+        // (review-v2.3.0 hunt P2)。
+        let audio = GridItem::Audio(PathBuf::from("a.flac"));
+        assert!(facet_tag_filter_applies(&audio));
     }
 }

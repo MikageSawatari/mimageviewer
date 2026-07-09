@@ -3023,14 +3023,12 @@ pub(super) fn draw_native_navigation_preview(
             );
             ui.set_min_size(full_rect.size());
             let painter = ui.painter();
-            // サムネイルがあるときだけ黒背景で埋めてスワップ中の中間フレームを隠す。
-            // サムネイル無し (resume サムネ未キャッシュの新規動画など) で黒く塗ると、
-            // 動画→動画ナビの間じゅう全画面が真っ黒に点滅して見えるだけなので塗らない。
-            // その場合は presenter の video visual (スワップ中は直前フレーム) を透かす。
-            let has_thumbnail = preview_texture_id.is_some() && preview.thumbnail.is_some();
-            if has_thumbnail {
-                painter.rect_filled(full_rect, 0.0, egui::Color32::BLACK);
-            }
+            // ナビプレビュー表示中は常に黒背景で埋め、スワップ中の中間フレーム (= 直前の
+            // 動画の最終フレーム) を隠す。旧実装はサムネイル未キャッシュ時に透過させて
+            // 黒点滅を避けていたが、その間「新ファイル名の上バー + 旧動画の映像」に見えて
+            // 別ファイルの内容と誤認しうるため、一瞬の黒を挟む方を採る
+            // (review-v2.3.0 hunt P3、ユーザー判断 2026-07-09)。
+            painter.rect_filled(full_rect, 0.0, egui::Color32::BLACK);
             let _ = ui.interact(
                 full_rect,
                 egui::Id::new("native_video_navigation_preview_bg"),

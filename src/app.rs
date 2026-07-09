@@ -1106,6 +1106,17 @@ impl App {
                 !entry.is_main
                     && entry.class_name == Self::EGUI_VIEWPORT_CLASS
                     && !claimed.contains(&entry.hwnd_raw)
+                    // 可視な実窓だけをフォールバック採用の候補にする。hidden / minimized /
+                    // rect 取得不能な stale viewport が「唯一の未登録窓」として誤採用される
+                    // と、host resync / focus / close が実際の detached 窓ではなく残骸 HWND
+                    // へ向く (review-v2.3.0 hunt P2、BA-1/BA-4)。正規の host は表示直後の
+                    // フォールバック経路なので可視のはずで、まだ不可視なら NoChange →
+                    // 次フレームの再試行に任せる。created 側 (before/after 差分) は stale 窓
+                    // が before に含まれるため元々安全で、生成直後の未表示フレームを
+                    // 取りこぼさないようこの条件は付けない。
+                    && entry.visible
+                    && !entry.iconic
+                    && entry.rect_ok
             })
             .map(|entry| entry.hwnd_raw)
             .collect::<Vec<_>>();
@@ -2120,6 +2131,27 @@ struct ViewerContextBundle {
     details_image_dims_state: LazyColumnState,
     tag_prewarm_queued: std::collections::HashSet<usize>,
     pending_finalize: std::collections::HashSet<usize>,
+    // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
+    // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
+    // ロードごとに作り直す「現用セット」で、コンテキストに属する。bundle に含めないと
+    // (a) detached book context の load_zip/pdf_as_folder が main の cancel_token を flip し、
+    //     main の動画サムネ抽出 (再リクエスト経路なし) を恒久停止させる (P2-9)、
+    // (b) channel/token が global なせいで bundle 済み bookkeeping (requested 等) が swap 後に
+    //     信用できず、swap のたびに clear → 毎フレーム再エンキュー → サムネ重複デコード
+    //     churn になる (P2-8)。
+    tx: mpsc::Sender<ThumbMsg>,
+    rx: mpsc::Receiver<ThumbMsg>,
+    cancel_token: Arc<AtomicBool>,
+    reload_queue: Option<Arc<NotifyQueue>>,
+    heavy_io_queue: Option<Arc<NotifyQueue>>,
+    // worker が out-of-keep skip / 優先度計算に読む共有 atomic も per-context にする。
+    // global のままだと (a) detached ロードの初期化 (0,0 store) が main の keep range を
+    // 一瞬潰して可視サムネの skip churn を起こし、(b) detached の queue 項目が以後
+    // main の keep range で gate され続ける (review-v2.3.0 hunt P3)。
+    scroll_hint: Arc<AtomicUsize>,
+    visible_end_shared: Arc<AtomicUsize>,
+    keep_start_shared: Arc<AtomicUsize>,
+    keep_end_shared: Arc<AtomicUsize>,
     last_vis_range: (usize, usize),
     vis_settle_at: Option<std::time::Instant>,
     vis_first_logged: bool,
@@ -2276,8 +2308,32 @@ struct ViewerContextBundle {
 }
 
 #[cfg(windows)]
+impl Drop for ViewerContextBundle {
+    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
+    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
+    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
+    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
+    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
+    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
+    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
+    fn drop(&mut self) {
+        self.cancel_token
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(q) = &self.reload_queue {
+            q.1.notify_all();
+        }
+        if let Some(q) = &self.heavy_io_queue {
+            q.1.notify_all();
+        }
+    }
+}
+
 impl ViewerContextBundle {
     fn empty() -> Self {
+        // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
+        // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
+        // rx は常に Empty を返す)。
+        let (tx, rx) = mpsc::channel();
         Self {
             address: String::new(),
             current_folder: None,
@@ -2312,6 +2368,15 @@ impl ViewerContextBundle {
             details_image_dims_state: LazyColumnState::Disabled,
             tag_prewarm_queued: std::collections::HashSet::new(),
             pending_finalize: std::collections::HashSet::new(),
+            tx,
+            rx,
+            cancel_token: Arc::new(AtomicBool::new(false)),
+            reload_queue: None,
+            heavy_io_queue: None,
+            scroll_hint: Arc::new(AtomicUsize::new(0)),
+            visible_end_shared: Arc::new(AtomicUsize::new(0)),
+            keep_start_shared: Arc::new(AtomicUsize::new(0)),
+            keep_end_shared: Arc::new(AtomicUsize::new(0)),
             last_vis_range: (0, 0),
             vis_settle_at: None,
             vis_first_logged: false,
@@ -5381,9 +5446,13 @@ pub struct App {
     pub(crate) gamepad_location_picker: Option<crate::ring_shortcut::GamepadLocationPickerState>,
     pub(crate) gamepad_video_marker_picker:
         Option<crate::ring_shortcut::GamepadVideoMarkerPickerState>,
+    /// thumb 結果チャネル + ロードキャンセルトークン。`start_loading_items` がロードごとに
+    /// 作り直す。**per-context**: ViewerContextBundle にも同名フィールドがあり bundle swap で
+    /// コンテキストと一緒に移動する (review-v2.3.0 P2-8/P2-9)。detached context のロードが
+    /// main のロードを cancel したり、main の未受信 ThumbMsg を捨てたりしない。
     pub(crate) tx: mpsc::Sender<ThumbMsg>,
     pub(crate) rx: mpsc::Receiver<ThumbMsg>,
-    /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
+    /// フォルダ移動時に true にセットすると旧ロードタスクが中断する (per-context、上記参照)
     pub(crate) cancel_token: Arc<AtomicBool>,
     /// Ctrl+G 検索結果ビューでの動画サムネ抽出スレッドの cancel フラグ。
     /// streaming 中の rebuild ごとに再 spawn される (= 旧 spawn を cancel する)。
@@ -7340,7 +7409,14 @@ pub struct App {
     pub(crate) music_analysis_path: Option<PathBuf>,
     /// 音楽ビューのタイムライン解析結果 (LRU hit または worker 完了で埋まる)。
     /// `Arc` で保持し、row raster worker へは refcount のクローンだけ渡す (Codex P2)。
+    /// 代入は必ず `set_music_analysis` を通す (下の版数を進めるため)。
     pub(crate) music_analysis: Option<std::sync::Arc<music_core::TimelineAnalysis>>,
+    /// `music_analysis` を差し替えるたびに進む版数 (1 始まり、0 は timeline cache 側の
+    /// 「未取得」sentinel)。行ラスタの「解析が変わったか」判定はこの版数で行う。
+    /// `Arc::as_ptr` の identity 比較は、複数メッセージを 1 drain で連続適用したとき
+    /// 旧 Arc の drop 直後に新 Arc が同アドレスへ確保される ABA で「変わっていない」と
+    /// 誤認し、確定解析への再ラスタが不発になる (review-v2.3.0 P2-4)。
+    pub(crate) music_analysis_version: u64,
     /// 直近 N 曲のタイムライン解析結果を保持する in-memory LRU (先頭が最新)。永続 DB
     /// (旧 `audio_analysis.db`) はやめた: どのみち spectrum 用に毎回全尺デコードするので永続
     /// キャッシュの実利は薄く、セッション内の A/B 切替を即時にする効果だけで十分 (§D9)。
@@ -9283,6 +9359,7 @@ impl App {
             video_session_muted,
             music_analysis_path: None,
             music_analysis: None,
+            music_analysis_version: 0,
             music_analysis_lru: Vec::new(),
             music_analysis_error: None,
             music_analysis_pending: None,
@@ -10559,6 +10636,15 @@ impl App {
             details_image_dims_state,
             tag_prewarm_queued,
             pending_finalize,
+            tx,
+            rx,
+            cancel_token,
+            reload_queue,
+            heavy_io_queue,
+            scroll_hint,
+            visible_end_shared,
+            keep_start_shared,
+            keep_end_shared,
             last_vis_range,
             vis_settle_at,
             vis_first_logged,
@@ -10725,6 +10811,18 @@ impl App {
         swap_field!(details_image_dims_state);
         swap_field!(tag_prewarm_queued);
         swap_field!(pending_finalize);
+        // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
+        // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
+        // swap 後もそのまま信用できる (末尾の clear は不要になった)。
+        swap_field!(tx);
+        swap_field!(rx);
+        swap_field!(cancel_token);
+        swap_field!(reload_queue);
+        swap_field!(heavy_io_queue);
+        swap_field!(scroll_hint);
+        swap_field!(visible_end_shared);
+        swap_field!(keep_start_shared);
+        swap_field!(keep_end_shared);
         swap_field!(last_vis_range);
         swap_field!(vis_settle_at);
         swap_field!(vis_first_logged);
@@ -10857,11 +10955,12 @@ impl App {
         swap_field!(music_bookmarks_loaded_for);
         swap_field!(last_loop_pos);
 
-        // The worker queues are App-global, so thumbnail request bookkeeping restored from a
-        // parked viewer context cannot be trusted after a swap. Let the active context rebuild
-        // requests from its current keep range instead of inheriting stale in-flight markers.
-        self.requested.clear();
-        self.pending_finalize.clear();
+        // 旧実装はここで requested / pending_finalize を無条件 clear していた (worker queue が
+        // App-global で、swap 後の bookkeeping を信用できなかったため)。detached 窓が 1 枚でも
+        // あると mount/unmount + parked poll の swap が毎フレーム走るので、main の bookkeeping が
+        // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
+        // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
+        // bookkeeping がコンテキストと一緒に移動するため clear 不要。
     }
 
     #[cfg(windows)]
@@ -10913,6 +11012,17 @@ impl App {
             Ok(value) => Some(value),
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+
+    /// 現在マウント中のコンテキストの thumb 結果チャネル (`self.rx`) を読み捨てる。
+    /// グリッドを描かない detached context 用 (review-v2.3.0 P2-9): channel を bundle 化した
+    /// ことで、detached context のロードが spawn した worker の結果 (ZIP 内動画サムネ等) は
+    /// その context の rx に届くが、poll_thumbnails を回さないため放置するとバッファが
+    /// 溜まり続ける。表示予定が無いので捨てる。detached での panorama 高解像度アップグレード
+    /// も同 channel 経由だが、これは bundle 化前から detached では機能していない経路
+    /// (main mount 中の poll で世代不一致 drop) なので挙動退行にはならない。
+    fn drain_thumb_results_discard(&mut self) {
+        while self.rx.try_recv().is_ok() {}
     }
 
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
@@ -19039,7 +19149,113 @@ impl App {
             .selected
             .map(|sel| sel - sorted_asc.partition_point(|&x| x < sel));
 
+        // ── フルスクリーン / 音声モードの viewer 状態も shift する (review-v2.3.0 P2-2) ──
+        // detached / マルチウィンドウでは「別窓で視聴中にメイン窓グリッドから削除」が一級
+        // フローになり、shift しないと視聴中 idx が削除後に別のアイテムを指す (表示のズレ +
+        // レーティング等 idx ベース操作の誤適用)。視聴中アイテム自体が削除された場合は
+        // selected と同じ「次の残存アイテムが詰まる」規則で送り、全消えなら None
+        // (= 既存の `fullscreen_idx.is_none()` クリーンアップ経路がビューポートを閉じる)。
+        let n_after = self.items.len();
+        if let Some(old) = self.fullscreen_idx {
+            self.fullscreen_idx = match shift(old) {
+                Some(ni) => Some(ni),
+                None => {
+                    let slid = old - sorted_asc.partition_point(|&x| x < old);
+                    (n_after > 0).then(|| slid.min(n_after - 1))
+                }
+            };
+        }
+        // 音声モード系の idx-keyed 状態は対象アイテムが残存したときだけ追随し、消えたら畳む
+        // (fullscreen_idx と同じ p で shift されるので、残存時は相互一致が保たれる)。
+        self.video_audio_mode = self.video_audio_mode.and_then(shift);
+        self.video_audio_vst = self.video_audio_vst.take().and_then(|mut s| {
+            shift(s.fs_idx).map(|ni| {
+                s.fs_idx = ni;
+                s
+            })
+        });
+        #[cfg(windows)]
+        {
+            self.video_audio_exit_pending =
+                self.video_audio_exit_pending.take().and_then(|mut p| {
+                    shift(p.fs_idx).map(|ni| {
+                        p.fs_idx = ni;
+                        p
+                    })
+                });
+            if self.video_audio_mode.is_none() {
+                self.video_audio_mode_entry_target = None;
+            }
+        }
+        self.video_continuous_last_eof = self
+            .video_continuous_last_eof
+            .and_then(|(i, serial)| shift(i).map(|ni| (ni, serial)));
+        // 音量ノーマライズ / ループ位置の idx-keyed 状態も同様に shift (Codex fix-review P2)。
+        self.normalize_ui_states = std::mem::take(&mut self.normalize_ui_states)
+            .into_iter()
+            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .collect();
+        self.normalize_auto_scan_suppressed = self
+            .normalize_auto_scan_suppressed
+            .iter()
+            .filter_map(|&i| shift(i))
+            .collect();
+        self.last_loop_pos = std::mem::take(&mut self.last_loop_pos)
+            .into_iter()
+            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .collect();
+        // 進行中の音量スキャンは対象が残存すれば fs_idx を追随させる (完了側は
+        // fs_idx + file_path で検証するので、追随しないと無関係アイテムの削除のたびに
+        // 完了結果が stale 扱いになり、再生再開 / preroll 解除 / gain 反映が落ちる)。
+        // 対象自体が削除されたら worker を cancel して畳む (player も fs_cache から
+        // 消えるので preroll suspend の解除は不要)。
+        if let Some(mut st) = self.normalize_state.take() {
+            match shift(st.fs_idx) {
+                Some(ni) => {
+                    st.fs_idx = ni;
+                    self.normalize_state = Some(st);
+                }
+                None => {
+                    st.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        // 音声 VST シェル (プレーン音声の presenter 流用): 対象が残存すれば fs_idx を追随、
+        // 対象自体が削除されたら正規手順 (exit_music_vst_shell) で GUI/owner ごと畳む
+        // (state だけ落とすと VST GUI が孤児 owner のまま残る)。teardown は下の fs_cache
+        // take より前に行うこと (exit が対象 player から native output を外すため、
+        // fs_cache に旧 idx の entry が残っている必要がある)。(Codex fix-review2 P2)
+        #[cfg(windows)]
+        if let Some(cur) = self.music_vst_shell.as_ref().map(|s| s.fs_idx) {
+            match shift(cur) {
+                Some(ni) => {
+                    if let Some(shell) = self.music_vst_shell.as_mut() {
+                        shell.fs_idx = ni;
+                    }
+                }
+                None => self.exit_music_vst_shell(),
+            }
+        }
+        // VST3 起動待ちで保留中のメディア open も追随 (再開側が fullscreen_idx 一致を
+        // 要求するため、shift しないと保留 open が黙って失われる)。対象削除なら None。
+        #[cfg(windows)]
+        {
+            self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(shift);
+        }
+
+        // 再生中の動画/音声 player (FsCacheEntry::Video) は shift した新 idx で温存する。
+        // invalidate の fs_cache.clear() に任せると、削除対象と無関係な別窓再生中の player が
+        // その場で drop され再生が突然止まる (review-v2.3.0 P2-2)。画像 entry は再デコードが
+        // 安価なので従来どおり捨てて再ロードに任せる。
+        let preserved_video_entries: Vec<(usize, FsCacheEntry)> =
+            std::mem::take(&mut self.fs_cache)
+                .into_iter()
+                .filter(|(_, entry)| matches!(entry, FsCacheEntry::Video { .. }))
+                .filter_map(|(i, entry)| shift(i).map(|ni| (ni, entry)))
+                .collect();
+
         self.invalidate_idx_state_and_queues();
+        self.fs_cache.extend(preserved_video_entries);
         // Loaded のサムネイル本体は Vec::remove で残るため、補正用 source も同じ
         // idx shift で残す。補正済み TextureHandle は invalidate 後に再生成させる。
         self.thumb_pixels = shifted_thumb_pixels;
@@ -20313,19 +20529,39 @@ impl App {
     ///
     /// items 差し替え経路の共通 (docs/pdf-pool-context-epoch-plan.md Phase 4)。
     fn bump_full_context_for_load(&mut self) {
+        // cancel_token は per-context (bundle 化済み、review-v2.3.0 P2-9)。detached context の
+        // ロードでは detached 自身の旧ロードだけが止まり、main のワーカー / 動画サムネ抽出
+        // スレッドには波及しない。
         self.cancel_token.store(true, Ordering::Relaxed);
         // Ctrl+G 結果ビュー専用の動画サムネ抽出スレッドは `cancel_token` ではなく
         // 専用 flag を見ているので、ここで明示的に止める。これをやらないと、Ctrl+G
         // 結果から PDF/ZIP/フォルダを Enter で開いて load_folder 経路に入った後も
         // 旧 Ctrl+G の動画スレッドが裏で Shell 抽出を続ける (Codex P2 #1 指摘)。
         // メッセージは items_gen 不一致で破棄されるが、Shell リトライ等が無駄に走る。
-        if let Some(old) = self.search_video_thread_cancel.take() {
+        // これは main 文脈専用の global state なので detached context のロードでは触らない。
+        if !self.detached_viewer_context_is_mounted()
+            && let Some(old) = self.search_video_thread_cancel.take()
+        {
             old.store(true, Ordering::Relaxed);
         }
         self.wake_all_workers();
         self.cancel_token = Arc::new(AtomicBool::new(false));
-        crate::thumb_loader::bump_catchup_epoch();
-        let _ = crate::pdf_loader::bump_render_context_epoch();
+        // catchup / PDF render epoch は crate-global。detached context のロードで bump すると
+        // main 文脈の queue 済み PDF render が stale 扱いで prune され、requested が in-flight の
+        // まま固着する (swap 時の requested clear を撤去した P2-8 以降は自己回復しない)。
+        // detached 側は epoch prune の恩恵 (Ctrl+↑↓ 高速フォルダめくりの旧ジョブ破棄) を
+        // 必要としないので main 文脈のロードに限定する (review-v2.3.0 P2-9)。
+        if !self.detached_viewer_context_is_mounted() {
+            crate::thumb_loader::bump_catchup_epoch();
+            let _ = crate::pdf_loader::bump_render_context_epoch();
+        }
+    }
+
+    /// 現在 detached viewer context (独立/ピン/Book) がマウント中 (= bundle swap で App が
+    /// detached 側の状態を保持している) か。`with_active_detached_viewer_context` が mount 中
+    /// だけ suppression depth を上げるので、それを流用する。
+    fn detached_viewer_context_is_mounted(&self) -> bool {
+        self.detached_viewer_main_history_suppression_depth > 0
     }
 
     /// `replace_search_view_items` (Ctrl+G) 用: PDF render epoch のみ bump。
@@ -26437,6 +26673,22 @@ impl App {
         })
     }
 
+    /// ParkedLive のメディア窓が「音楽ビュー」(音声ファイル or 音声モードの動画) として
+    /// 生きているか。music_* (解析ワーカー / PCM / spectrum / timeline cache) は bundle に
+    /// 入れず global のまま parked 窓も消費する設計 (stage-audio §3.5、毎フレームの
+    /// `update_parked_live_audio_music_view_state`) なので、これが true の間はメイン文脈の
+    /// open/close が global music_* を破棄してはいけない (review-v2.3.0 P2-3)。
+    #[cfg(windows)]
+    pub(crate) fn parked_live_music_window_exists(&self) -> bool {
+        self.detached_image_windows.iter().any(|window| {
+            self.detached_window_state_is_parked_live(window.id)
+                && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                    self.viewer_context_bundle_music_window_info(bundle)
+                        .is_some()
+                })
+        })
+    }
+
     #[cfg(windows)]
     pub(crate) fn native_video_hud_dimmed_for_current_poll(&self) -> bool {
         self.native_video_parked_live_input_window_id.is_some()
@@ -27393,6 +27645,11 @@ impl App {
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
+                // per-context 化した thumb channel の掃除 (review-v2.3.0 P2-9): detached
+                // context はグリッドを描かず poll_thumbnails を回さないので、ZIP 内動画の
+                // サムネ抽出などが送ってきた結果を放置すると自分の rx に溜まり続ける。
+                // 表示する場が無いので読み捨てる (サムネ状態は Pending のまま = 従来挙動)。
+                app.drain_thumb_results_discard();
                 if app.current_viewer_context_contains_video() {
                     app.poll_video(ctx);
                 }
@@ -27784,8 +28041,15 @@ impl App {
         let mut parked_bundle = if preserve_main_context {
             let mut main_restore_bundle =
                 self.cloned_main_viewer_context_after_detached_live_media_park();
-            let parked_bundle = self.take_current_viewer_context_bundle();
+            let mut parked_bundle = self.take_current_viewer_context_bundle();
             self.swap_viewer_context_bundle(&mut main_restore_bundle);
+            // ロード複合体 (worker pool / channel / token / keep atomic) は、グリッドを
+            // 駆動し続ける側 = 復元 main に戻す。clone ベースの復元 bundle は empty() の
+            // 空複合体を持つため、これをしないと park 後のメイングリッドで reload_queue が
+            // None になりサムネ再投入 / idle upgrade が止まる (Codex huntfix P2)。parked
+            // メディア窓は動画/音声再生のみでサムネロードを行わないので空複合体でよく、
+            // 窓 close 時の bundle Drop も no-op になる (= main のプールを巻き込まない)。
+            self.swap_load_complex_with_bundle(&mut parked_bundle);
             parked_bundle
         } else {
             self.take_current_viewer_context_bundle()
@@ -27854,6 +28118,23 @@ impl App {
         bundle.reading_history_return_from = self.reading_history_return_from.clone();
         bundle.search_filter = self.search_filter.clone();
         bundle.search_filter_origin_folder = self.search_filter_origin_folder.clone();
+    }
+
+    /// ロード複合体 (thumb channel / cancel_token / worker queue / keep atomic 群) **だけ**を
+    /// bundle と交換する。legacy ParkedLive の park (preserve_main_context=true) 専用:
+    /// グリッド状態は clone で複製する一方、ワーカープールは 1 つしか無いので、グリッドを
+    /// 駆動する側へ明示的に付け替える必要がある (review-v2.3.0 Codex huntfix P2)。
+    #[cfg(windows)]
+    fn swap_load_complex_with_bundle(&mut self, bundle: &mut ViewerContextBundle) {
+        std::mem::swap(&mut self.tx, &mut bundle.tx);
+        std::mem::swap(&mut self.rx, &mut bundle.rx);
+        std::mem::swap(&mut self.cancel_token, &mut bundle.cancel_token);
+        std::mem::swap(&mut self.reload_queue, &mut bundle.reload_queue);
+        std::mem::swap(&mut self.heavy_io_queue, &mut bundle.heavy_io_queue);
+        std::mem::swap(&mut self.scroll_hint, &mut bundle.scroll_hint);
+        std::mem::swap(&mut self.visible_end_shared, &mut bundle.visible_end_shared);
+        std::mem::swap(&mut self.keep_start_shared, &mut bundle.keep_start_shared);
+        std::mem::swap(&mut self.keep_end_shared, &mut bundle.keep_end_shared);
     }
 
     #[cfg(windows)]
@@ -29432,7 +29713,9 @@ impl App {
         // ワーカー / 常駐 PCM / parked な spectrum worker が次の音声 open か close まで残る
         // (Codex Inc 4 P2)。音声→別音声は draw_fs_music_view の ensure_music_analysis が path
         // 比較で処理するのでここでは触らない。
-        if !matches!(self.items.get(idx), Some(GridItem::Audio(_))) {
+        // ParkedLive の音楽窓が global music_* を消費中の非メディア open は破棄しない
+        // (詳細は should_clear_music_view_on_open、review-v2.3.0 P2-3)。
+        if self.should_clear_music_view_on_open(idx) {
             self.clear_music_view_state();
         }
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
@@ -34156,7 +34439,7 @@ impl App {
         // 別ファイルへ移動すると古い delta が次のタイムラインに適用されてしまう)。
         self.music_timeline_scroll_req = 0.0;
         self.music_timeline_reanchor_playhead_once = false;
-        self.music_analysis = None;
+        self.set_music_analysis(None);
         self.music_pcm = None;
         self.music_probe = None;
         self.music_analysis_error = None;
@@ -34180,7 +34463,7 @@ impl App {
         if let Some(k) = key.as_ref()
             && let Some(arc) = self.music_analysis_lru_get(k)
         {
-            self.music_analysis = Some(arc);
+            self.set_music_analysis(Some(arc));
             want_analysis = false;
             hit_meta = Some((k.mtime, k.size));
         }
@@ -34252,11 +34535,11 @@ impl App {
                         match msg {
                             // progressive 途中経過: 表示だけ更新 (LRU には載せない)。
                             MusicAnalysisMsg::Timeline(Ok(analysis)) => {
-                                self.music_analysis = Some(std::sync::Arc::new(analysis));
+                                self.set_music_analysis(Some(std::sync::Arc::new(analysis)));
                                 self.music_analysis_error = None;
                             }
                             MusicAnalysisMsg::Timeline(Err(e)) => {
-                                self.music_analysis = None;
+                                self.set_music_analysis(None);
                                 self.music_analysis_error = Some(e);
                             }
                             // 全尺デコード後の確定版: 表示更新 + in-memory LRU に載せる。
@@ -34265,7 +34548,7 @@ impl App {
                             // code P2)。meta が None (stat 失敗 / size=0) ならキャッシュしない。
                             MusicAnalysisMsg::TimelineComplete { analysis, meta } => {
                                 let arc = std::sync::Arc::new(analysis);
-                                self.music_analysis = Some(arc.clone());
+                                self.set_music_analysis(Some(arc.clone()));
                                 self.music_analysis_error = None;
                                 if let Some((mtime, size)) = meta {
                                     let key = MusicAnalysisKey {
@@ -34327,11 +34610,45 @@ impl App {
     /// spectrum worker + 常駐 PCM。フルスクリーンを抜けた / 音声以外へ移ったときに呼ぶ
     /// (§7.9 grid/viewer lifecycle)。Inc 4 で spectrum worker が parked のまま + PCM が常駐する
     /// ようになったため、音声→画像/動画への移動でも確実に teardown する必要がある (Codex P2)。
+    /// `open_fullscreen` で音楽ビュー状態 (`music_*`) を破棄すべきか (review-v2.3.0 P2-3)。
+    ///
+    /// - 音声を開くとき: 破棄しない (音声→別音声は `ensure_music_analysis` が path 比較で処理)。
+    /// - ParkedLive の音楽窓が global music_* を消費中で、開くのが非メディア (画像 / PDF
+    ///   ページ等): 破棄しない。破棄すると「別窓 BGM 再生中にメイン窓で画像を見る」際、
+    ///   ページを開くたびに解析ワーカー respawn + PCM 全尺再デコードが走り、parked 窓の
+    ///   スペクトラムが playhead 追いつきまで空白になる (1h 級ファイルで数十秒 + ~GB 級の
+    ///   アロケーション churn)。
+    /// - 動画を開くとき: 従来どおり破棄する。直後の `prepare_viewer_presentation_open` →
+    ///   `close_parked_live_media_windows_for_new_media` が parked メディア窓ごと閉じる
+    ///   (メディア窓 1 本規則) ので、音楽状態の消費者は残らない。
+    fn should_clear_music_view_on_open(&self, idx: usize) -> bool {
+        if matches!(self.items.get(idx), Some(GridItem::Audio(_))) {
+            return false;
+        }
+        #[cfg(windows)]
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_)))
+            && self.parked_live_music_window_exists()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// `music_analysis` の代入は必ずここを通し、版数を進める (フィールドコメント参照、
+    /// review-v2.3.0 P2-4)。
+    fn set_music_analysis(
+        &mut self,
+        analysis: Option<std::sync::Arc<music_core::TimelineAnalysis>>,
+    ) {
+        self.music_analysis = analysis;
+        self.music_analysis_version = self.music_analysis_version.wrapping_add(1);
+    }
+
     pub(crate) fn clear_music_view_state(&mut self) {
         self.cancel_music_analysis();
         self.music_timeline_cache.clear();
         self.music_spectrum.clear();
-        self.music_analysis = None;
+        self.set_music_analysis(None);
         // LRU 本体 (直近 N 曲) はセッション中保持して音声への再入を即時にする。キーは
         // path+size+mtime + ワーカーの fresh stat 検証なので stale hit は起きない。
         self.music_pcm = None;
@@ -35681,7 +35998,16 @@ impl App {
         self.clear_fullscreen_tag_picker_state();
         // 音楽ビュー (Inc 3b/4) の解析ワーカー + row raster + spectrum worker + PCM を止めて捨てる
         // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
-        self.clear_music_view_state();
+        // ただし ParkedLive の音楽窓が global music_* を消費中なら破棄しない。このとき閉じて
+        // いるのは非音楽セッション — メディア窓 1 本規則により、音楽セッションと parked
+        // 音楽窓は併存しない (review-v2.3.0 P2-3)。
+        #[cfg(windows)]
+        let parked_music_alive = self.parked_live_music_window_exists();
+        #[cfg(not(windows))]
+        let parked_music_alive = false;
+        if !parked_music_alive {
+            self.clear_music_view_state();
+        }
         // 「動画→音声モード」(Inc 7) はフルスクリーンを閉じたら終わる。動画プレイヤーはこの後
         // fs_cache.clear() で drop されるので、ここではフラグを落とすだけでよい (Codex 7c 設計)。
         self.video_audio_mode = None;
@@ -45100,10 +45426,19 @@ impl App {
         }
         // 進行中の swap / placement 切替中は多重起動しない (enter_video_audio_mode と同じ保護、
         // stale pending の混線を避ける)。
+        //
+        // exit 進行中 (`video_audio_exit_pending`) も弾く。exit は presenter 再表示確認まで
+        // `video_audio_mode = Some` を維持する設計なので、その窓で EOF が来るとここが
+        // keep-audio swap を開始して `video_audio_mode` を next へ進め、
+        // `poll_video_audio_exit_pending` が mode 不一致で pending を黙って破棄する
+        // (= ユーザーの「動画へ戻る」が消失 + show 済み presenter に旧動画 hold フレームが
+        // 露出)。exit 完了後の EOF は mode=None で Video 分類に落ち、通常の連続再生として
+        // 次動画が映像表示で開く (review-v2.3.0 P2-1)。
         if self.native_video_mode_switch.is_some()
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
+            || self.video_audio_exit_pending.is_some()
         {
             return;
         }

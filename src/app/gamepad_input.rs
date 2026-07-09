@@ -1954,7 +1954,13 @@ impl App {
                 self.gamepad_state.require_directional_neutral();
                 self.trigger_gamepad_ring_action(ctx, direction)
             }
-            WestReleaseOutcome::Suppressed => None,
+            WestReleaseOutcome::Suppressed => {
+                // 抑止されたリング操作 (ブロック中に suppress された等) でも、リング用に
+                // 倒したままのスティックが通常アナログ操作へ漏れないようニュートラル通過を
+                // 要求する (review-v2.3.0 hunt P2。Ring 側と対称)。
+                self.gamepad_state.require_directional_neutral();
+                None
+            }
         }
     }
 

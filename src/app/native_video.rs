@@ -2334,6 +2334,19 @@ impl App {
             self.toggle_egui_viewer_window_mode_for_input(ctx);
             return;
         }
+        // 音声ファイルの音楽ビュー: native presenter を持たないので still (egui viewer) の
+        // ウィンドウ/全画面トグルへ振る。F11 キー (handle_fs_key_input) と音楽 chrome の
+        // window ボタンは既にこの経路だが、ring / ゲームパッド / 右ドラッグの
+        // ToggleWindowMode だけが下の toggle_video_window_mode →
+        // switch_native_video_viewer_presentation の GridItem::Video ガードで silent no-op に
+        // なっていた (review-v2.3.0 P2-5)。detached の音声は helper 内の detached 分岐が
+        // borderless トグルに解決するので従来挙動と同じ。
+        if let Some(fs_idx) = self.fullscreen_idx
+            && self.fs_music_view_active(fs_idx)
+        {
+            self.toggle_egui_viewer_window_mode_for_input(ctx);
+            return;
+        }
         if self.viewer_session_is_detached() {
             if self.video_tile_mode_active {
                 return;

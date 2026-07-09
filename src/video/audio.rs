@@ -1437,7 +1437,13 @@ fn run_pump(
             };
             (secs, audible, buf.pump_seek_serial)
         };
-        if processed_secs >= READY_THRESHOLD_SECS {
+        // 音声実長が閾値未満のファイル (0.1 秒未満の SFX 等 / 極短音声トラックの動画) は
+        // processed がこの閾値に永久に届かず、BufferReady が一度も emit されないまま
+        // Buffering 固着する (再生開始不能)。demux がファイル全体を読み切っている
+        // (`is_eof_reached`) ならこれ以上 processed が増える見込みは無いので、残量に
+        // 関わらず readiness を通知する (review-v2.3.0 P2-6)。post-seek で末尾間際に
+        // 到達した場合も同様 (残り実データが閾値未満でも開始してよい)。
+        if processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached() {
             // T15 (Codex R-VENG-001): BufferReady を **engine が待っている state でのみ** 送る。
             // 旧コードは Playing 中も pump loop ごと (audio frame rate ≈ 100-200Hz) に
             // BufferReady を try_send していた。engine 側はそれを epoch < current 早期 return

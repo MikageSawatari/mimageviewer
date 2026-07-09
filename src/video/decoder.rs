@@ -2726,10 +2726,37 @@ fn run_decoder(
     let mut pending_video_peak_bytes: usize = 0;
     let mut next_video_overflow_log_bytes: usize = 0;
     let mut last_demux_queue_state_at = std::time::Instant::now();
+    // try_send に失敗した SeekCompleted の再送待ち (serial, actual_pts)。SeekCompleted は
+    // one-shot の critical event で、engine event lane (bounded 64) が Buffering 中の
+    // BufferReady + UI 停滞で満杯のときに silently drop すると engine が Seeking に固着する
+    // (「シーク中」表示 + 無音のまま、次の seek まで回復しない)。native FirstFrameReady の
+    // pending 再送と同じ考え方でループ先頭から再送する (review-v2.3.0 P2-7)。
+    let mut pending_seek_completed: Option<(u64, f64)> = None;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
+        }
+        // 前回失敗した SeekCompleted を再送。新しい seek が始まっていたら (serial が進んで
+        // いたら) demux はこの後その seek を処理して新しい SeekCompleted を送るので、stale な
+        // pending は捨てる。
+        if let Some((pending_serial, pending_pts)) = pending_seek_completed {
+            if pending_serial != clock.current_seek_serial() {
+                pending_seek_completed = None;
+            } else if engine_event_tx
+                .try_send(crate::video::engine::EngineEvent::Decoder(
+                    crate::video::engine::state::DecoderEvent::SeekCompleted {
+                        epoch: pending_serial,
+                        actual_pts: pending_pts,
+                    },
+                ))
+                .is_ok()
+            {
+                crate::logger::log(format!(
+                    "[decoder] SeekCompleted resent after full event lane serial={pending_serial}"
+                ));
+                pending_seek_completed = None;
+            }
         }
 
         // loop-top の pending video drain。cancel/disconnect で false なら 'outer break。
@@ -2959,13 +2986,22 @@ fn run_decoder(
             }
             // Phase 3e: engine にも SeekCompleted を通知 (= Seeking → Buffering 遷移)。
             // これがないと engine は永久 Seeking 状態に張り付き、pacing escape が
-            // 解除されない。
-            let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Decoder(
+            // 解除されない。lane 満杯 (Full) で送れなかったら pending に退避して
+            // ループ先頭から再送する (review-v2.3.0 P2-7)。Disconnected は engine 側の
+            // teardown 中なので再送しない。
+            match engine_event_tx.try_send(crate::video::engine::EngineEvent::Decoder(
                 crate::video::engine::state::DecoderEvent::SeekCompleted {
                     epoch: serial,
                     actual_pts: display_target_secs,
                 },
-            ));
+            )) {
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    pending_seek_completed = Some((serial, display_target_secs));
+                }
+                _ => {
+                    pending_seek_completed = None;
+                }
+            }
         }
 
         // 1 パケット読み込み前に pending video backlog を drain。

@@ -648,6 +648,27 @@ impl KeySlot {
         }
     }
 
+    /// KeyHold の同フレーム押下+離し (fast-tap) 救済に使う egui Key。
+    /// `to_egui` が**別の物理キーへ畳む**もの (Numpad0-9 → 上段 Num0-9) は None を返し、
+    /// テンキー割当なのに上段数字キーのイベントを消費 / 誤発火させない
+    /// (review-v2.3.0 hunt P2)。これらのキーの hold 判定は OS 直読み
+    /// (`key_held_via_os` = VK_NUMPAD1 等の固有 VK) 側で正しく成立する。
+    pub fn egui_key_for_hold_edges(self) -> Option<egui::Key> {
+        match self {
+            KeyName::Numpad0
+            | KeyName::Numpad1
+            | KeyName::Numpad2
+            | KeyName::Numpad3
+            | KeyName::Numpad4
+            | KeyName::Numpad5
+            | KeyName::Numpad6
+            | KeyName::Numpad7
+            | KeyName::Numpad8
+            | KeyName::Numpad9 => None,
+            other => other.to_egui(),
+        }
+    }
+
     pub fn matches_win32(self, virtual_key: u32, scan_code: u16, _extended: bool) -> bool {
         match self {
             KeyName::JisCaret => scan_code == Self::JIS_CARET_SCAN,
@@ -5861,16 +5882,19 @@ impl Keymap {
     /// (idle からの同フレーム 押下+離し) を救うために併用する。修飾キー付きは対象外。
     pub fn take_key_hold_edges(&self, ctx: &egui::Context, action: KeyAction) -> (bool, bool) {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        // Numpad0-9 は to_egui が上段 Num0-9 へ畳むため、ここで使うと「テンキー割当なのに
+        // 上段数字キーのイベントを消費 / fast-tap 誤発火」になる。fast-tap 救済から除外し、
+        // hold 判定は key_held_chord の OS 直読み (固有 VK) に任せる (review-v2.3.0 hunt P2)。
         let keys: Vec<egui::Key> = if let Some(chords) = self.overrides.get(&action) {
             chords
                 .iter()
-                .filter_map(|c| c.key.and_then(KeyName::to_egui))
+                .filter_map(|c| c.key.and_then(KeyName::egui_key_for_hold_edges))
                 .collect()
         } else {
             action
                 .default_chords()
                 .iter()
-                .filter_map(|c| c.key.and_then(KeyName::to_egui))
+                .filter_map(|c| c.key.and_then(KeyName::egui_key_for_hold_edges))
                 .collect()
         };
         if keys.is_empty() {
@@ -6268,7 +6292,7 @@ impl Keymap {
         if chord.ctrl || chord.shift || chord.alt {
             return false;
         }
-        let Some(key) = chord.key.and_then(KeyName::to_egui) else {
+        let Some(name) = chord.key else {
             return false;
         };
         // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
@@ -6277,22 +6301,34 @@ impl Keymap {
         // stale な egui modifiers を避け、押下中判定と同じく OS 直読みを使う。
         #[cfg(windows)]
         {
+            let _ = ctx;
             if modifier_held_via_os(ModKind::Ctrl)
                 || modifier_held_via_os(ModKind::Shift)
                 || modifier_held_via_os(ModKind::Alt)
             {
                 return false;
             }
-            if let Some(name) = chord.key
-                && key_held_via_os(name)
-            {
-                return true;
-            }
+            // Windows では OS 直読み (KeyName の固有 VK) を唯一の判定にする
+            // (review-v2.3.0 hunt P2):
+            // - `to_egui` が None のキー (NumpadEnter / Yen 等) でも hold が成立する
+            //   (旧実装は to_egui gate で常に false = 割り当てたのに効かない)。
+            // - Numpad0-9 は VK_NUMPAD* で判定されるため、egui fallback (Num0-9 へ畳む)
+            //   経由の「上段数字キーで誤発火」も起きない。
+            // 制約: NumpadEnter は GetAsyncKeyState では主 Enter と同じ VK_RETURN なので、
+            // hold 判定上は主 Enter でも成立する (edge 側 = matches_win32 は extended で
+            // 区別する。KeyHold 用途では許容)。
+            key_held_via_os(name)
         }
-        ctx.input(|i| {
-            let m = i.modifiers;
-            !m.ctrl && !m.shift && !m.alt && i.key_down(key)
-        })
+        #[cfg(not(windows))]
+        {
+            let Some(key) = KeyName::to_egui(name) else {
+                return false;
+            };
+            ctx.input(|i| {
+                let m = i.modifiers;
+                !m.ctrl && !m.shift && !m.alt && i.key_down(key)
+            })
+        }
     }
 
     fn modifier_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
@@ -6685,6 +6721,29 @@ fn next_legacy_keymap_backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_edge_keys_do_not_collapse_numpad_to_top_row() {
+        // review-v2.3.0 hunt P2: KeyHold の fast-tap 救済で Numpad0-9 を上段 Num0-9 に
+        // 畳まない (畳むとテンキー割当なのに上段数字キーで発火 / イベント消費する)。
+        for name in [
+            KeyName::Numpad0,
+            KeyName::Numpad1,
+            KeyName::Numpad5,
+            KeyName::Numpad9,
+        ] {
+            assert_eq!(name.egui_key_for_hold_edges(), None, "{name:?}");
+        }
+        // 忠実に対応するキーは従来どおり (Z = FsZoomMode 既定、上段数字は上段のまま)。
+        assert_eq!(KeyName::Z.egui_key_for_hold_edges(), Some(egui::Key::Z));
+        assert_eq!(
+            KeyName::Num1.egui_key_for_hold_edges(),
+            Some(egui::Key::Num1)
+        );
+        // to_egui が None のキー (NumpadEnter / Yen) は edge 救済なし = hold は OS 直読み。
+        assert_eq!(KeyName::NumpadEnter.egui_key_for_hold_edges(), None);
+        assert_eq!(KeyName::IntlYen.egui_key_for_hold_edges(), None);
+    }
 
     #[cfg(windows)]
     fn native_video_shortcut_test_guard() -> std::sync::MutexGuard<'static, ()> {

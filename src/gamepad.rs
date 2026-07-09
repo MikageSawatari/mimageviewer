@@ -329,6 +329,11 @@ impl GamepadInputState {
         if self.buttons.contains(&PadButton::West) {
             self.west_tap_suppressed = true;
             self.west_ring_direction = None;
+            // X リング操作中にブロックされた場合、リング用に倒していたスティックが
+            // ブロック解除後 (または X 離しがブロック中に処理された後) にそのまま通常
+            // アナログ操作 (ページ移動 / シーク / グリッド移動) として発火しないよう、
+            // ニュートラル通過を要求する (review-v2.3.0 hunt P2)。
+            self.require_directional_neutral();
         }
     }
 
@@ -549,6 +554,30 @@ mod tests {
     use super::{GamepadInputState, PadAxis, PadButton, WestReleaseOutcome};
     use crate::ring_shortcut::RingDirection;
     use std::time::Instant;
+
+    #[test]
+    fn suppress_during_west_ring_requires_directional_neutral() {
+        // review-v2.3.0 hunt P2: X リング中にディスパッチがブロックされたら、リング用に
+        // 倒していたスティックがブロック解除後に通常アナログ操作へ漏れない (ニュートラル
+        // 通過を要求する)。
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        state.set_button_down(PadButton::West, true, now);
+        state.set_axis(PadAxis::LeftX, 1.0);
+        assert!(!state.directional_neutral_required());
+
+        state.suppress_pending_actions();
+
+        assert!(
+            state.directional_neutral_required(),
+            "ブロック中の suppress は neutral gate を立てる"
+        );
+        // West を保持していない通常ブロックでは gate を立てない (アナログ操作継続の設計)。
+        let mut plain = GamepadInputState::default();
+        plain.set_axis(PadAxis::LeftX, 1.0);
+        plain.suppress_pending_actions();
+        assert!(!plain.directional_neutral_required());
+    }
 
     #[test]
     fn west_release_without_direction_opens_picker() {

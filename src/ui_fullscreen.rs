@@ -2148,7 +2148,14 @@ impl App {
             && !self.is_overlay_edit_mode_active()
             // 比較表示中は通常閲覧外 (Double では比較描画が優先され入力と表示がずれるため、Codex P3)。
             && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
-            && !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            // 音声 (音楽ビュー) も対象外。除外しないと Z (VideoToggleAudioMode の既定と同じキー) が
+            // ここで fs_zoom_active をラッチし、音楽ビューでは見た目の変化がないまま
+            // 次に画像へナビした瞬間に全画面ズームモードで表示される (review-v2.3.0 P2-10)。
+            // 動画→音声モードは item が Video なので下の Video 除外で既に守られている。
+            && !matches!(
+                self.items.get(fs_idx),
+                Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+            )
     }
 
     /// Ring / mouse button などの一発操作から ZipPla 風ズームを切り替える。
@@ -21613,6 +21620,7 @@ impl App {
             child.set_clip_rect(timeline_rect);
             *child.visuals_mut() = egui::Visuals::dark();
             let row_secs = self.music_timeline_row_secs;
+            let analysis_version = self.music_analysis_version;
             let analysis = self.music_analysis.as_ref().unwrap();
             // x 軸幅は player duration を優先。まだ 0 (player 未 open) の間は probe → 解析結果の
             // duration で全幅を安定させる (Codex P2: progressive ロード中に幅が 0→伸びるのを防ぐ)。
@@ -21664,6 +21672,7 @@ impl App {
                     outcome = crate::ui_music_timeline::draw_music_timeline(
                         ui,
                         analysis,
+                        analysis_version,
                         timeline_dur,
                         pos,
                         playing,

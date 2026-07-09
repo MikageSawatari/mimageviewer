@@ -10718,7 +10718,12 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn restored_viewer_context_clears_stale_thumbnail_request_markers_and_requeues() {
+    fn restored_viewer_context_keeps_thumbnail_request_markers_without_requeue() {
+        // review-v2.3.0 P2-8: thumb channel / cancel_token / ワーカーキューを bundle 化した
+        // ので、bundle swap は requested / pending_finalize を clear しない (channel が
+        // コンテキストと一緒に移動するため in-flight マーカーは swap 後も有効)。
+        // 旧実装は swap ごとに clear → 可視 Pending が毎フレーム再エンキューされ、同じ
+        // サムネを何度もデコードする churn だった。
         use crate::grid_item::GridItem;
         use std::sync::{Arc, Condvar, Mutex};
 
@@ -10743,26 +10748,26 @@ mod favorite_adjustment_defaults_tests {
         app.swap_viewer_context_bundle(&mut bundle);
 
         assert!(
-            app.requested.is_empty(),
-            "restored bundle must not inherit stale request markers from an old worker queue"
+            app.requested.contains_key(&0),
+            "bundle round-trip must preserve in-flight request markers (P2-8)"
         );
         assert!(
-            app.pending_finalize.is_empty(),
-            "restored bundle must not inherit stale finalize markers from an old worker queue"
+            app.pending_finalize.contains(&0),
+            "bundle round-trip must preserve finalize markers (P2-8)"
         );
 
         app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
 
-        assert!(
-            app.requested.contains_key(&0),
-            "Evicted visible thumbnail should be requeued after stale markers are cleared"
-        );
+        // 既に in-flight なので重複エンキューしない (churn 防止の核心)。
         let queue_len = app
             .reload_queue
             .as_ref()
             .map(|queue| queue.0.lock().unwrap().len())
             .unwrap_or(0);
-        assert_eq!(queue_len, 1);
+        assert_eq!(
+            queue_len, 0,
+            "in-flight marker must prevent duplicate enqueue after bundle swap"
+        );
     }
 
     /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
@@ -16815,6 +16820,46 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn unclaimed_hwnd_adoption_ignores_hidden_and_iconic_viewports() {
+        // review-v2.3.0 hunt P2 (BA-1/BA-4): hidden / minimized / rect 取得不能な stale
+        // egui viewport を「唯一の未登録窓」として detached host に誤採用しない。
+        let claimed = std::collections::HashSet::from([0x800_u64]);
+        let mut hidden = thread_window_entry(0x900, false, "Window Class");
+        hidden.visible = false;
+        let mut iconic = thread_window_entry(0xa00, false, "Window Class");
+        iconic.iconic = true;
+        let mut rect_err = thread_window_entry(0xb00, false, "Window Class");
+        rect_err.rect_ok = false;
+        let after = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x800, false, "Window Class"),
+            hidden,
+            iconic,
+            rect_err,
+        ];
+        assert_eq!(
+            App::select_detached_unclaimed_hwnd(&after, &claimed),
+            DetachedWindowHwndDiff::NoChange,
+            "不可視 viewport はフォールバック採用しない (次フレーム再試行に任せる)"
+        );
+
+        // 可視の未登録窓が 1 つだけなら、hidden が同居していても曖昧化せず採用する。
+        let mut hidden2 = thread_window_entry(0x900, false, "Window Class");
+        hidden2.visible = false;
+        let after_with_visible = vec![
+            thread_window_entry(0x10, true, "Window Class"),
+            thread_window_entry(0x800, false, "Window Class"),
+            hidden2,
+            thread_window_entry(0xc00, false, "Window Class"),
+        ];
+        assert_eq!(
+            App::select_detached_unclaimed_hwnd(&after_with_visible, &claimed),
+            DetachedWindowHwndDiff::Created(0xc00)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_hwnd_no_change_path_adopts_single_unclaimed_egui_window() {
         let mut app = setup_app();
         app.detached_window_hwnd_set(8, 0x800);
@@ -17736,6 +17781,65 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn continuous_eof_is_blocked_while_video_audio_exit_pending() {
+        // review-v2.3.0 P2-1: exit (「動画へ戻る」) 進行中に連続再生 EOF が重なっても
+        // keep-audio swap を開始しない。開始すると video_audio_mode が next へ進み、
+        // poll_video_audio_exit_pending が mode 不一致で exit pending を黙って捨てる
+        // (= ユーザーの exit 操作の消失 + show 済み presenter への旧動画フレーム露出)。
+        let mut app = setup_app();
+        let a = push_video(&mut app, r"C:\clips\a.mp4");
+        let _b = push_video(&mut app, r"C:\clips\b.mp4");
+        app.fullscreen_idx = Some(a);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+        app.video_audio_mode = Some(a);
+        app.video_audio_exit_pending = Some(VideoAudioExitPending {
+            fs_idx: a,
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(1200),
+            saw_hidden: false,
+        });
+        let ctx = egui::Context::default();
+
+        app.handle_video_audio_mode_continuous_eof(&ctx, a, 1);
+
+        assert_eq!(
+            app.video_audio_mode,
+            Some(a),
+            "exit pending 中の EOF は音声モードを next へ進めない"
+        );
+        assert!(
+            app.video_audio_exit_pending.is_some(),
+            "exit pending は EOF 継続に破棄されない"
+        );
+        assert_eq!(
+            app.video_continuous_last_eof, None,
+            "ガードは dedup 記録より前に効く (exit 完了後に同じ EOF を再判定できる)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ring_window_toggle_on_audio_music_view_uses_egui_viewer_toggle() {
+        // review-v2.3.0 P2-5: 音声ファイルの音楽ビューで ring / ゲームパッド / 右ドラッグの
+        // ToggleWindowMode (toggle_video_window_mode_for_input に合流) が silent no-op に
+        // ならず、F11 キーと同じ still (egui viewer) トグルに落ちる。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.fullscreen_idx = Some(audio);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.video_in_window_mode = false;
+
+        app.toggle_video_window_mode_for_input(&ctx);
+
+        assert!(
+            app.settings.video_in_window_mode,
+            "audio music view ring window toggle must flip the still in-window mode (F11 parity)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn audio_detached_f11_toggles_borderless_without_leaving_detached() {
         // Stage AUDIO fix2: 音声ファイルの detached 音楽ビューで F11 / 上バーの window ボタンを
         // 押しても MainWindow/Fullscreen へ再解決せず、detached 窓自体の borderless を切り替える。
@@ -18503,6 +18607,206 @@ mod still_window_mode_key_tests {
             app.should_poll_main_video_context(),
             "still detached contexts must not suppress unrelated main video polling"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bundle_swap_preserves_thumb_request_bookkeeping_and_load_complex() {
+        // review-v2.3.0 P2-8/P2-9: thumb channel / cancel_token / ワーカーキューを bundle 化した
+        // ので、(a) swap しても requested / pending_finalize が clear されない (P2-8: detached 窓
+        // 表示中の毎フレーム swap がサムネ bookkeeping を消して重複デコード churn になっていた)、
+        // (b) cancel_token はコンテキストごとに独立し、detached context のロードキャンセルが
+        // main のロード (動画サムネ抽出含む) に波及しない (P2-9)。
+        let mut app = setup_app();
+        app.requested.insert(3, false);
+        app.pending_finalize.insert(4);
+        let main_cancel = std::sync::Arc::clone(&app.cancel_token);
+        let mut bundle = ViewerContextBundle::empty();
+        let bundle_cancel = std::sync::Arc::clone(&bundle.cancel_token);
+
+        app.swap_viewer_context_bundle(&mut bundle);
+        // mount 中 (= 空コンテキスト側): main の bookkeeping は bundle に退避され、App 側は
+        // 空 bookkeeping + 独立 token を持つ。
+        assert!(app.requested.is_empty());
+        assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &bundle_cancel));
+        // mount 中のロードキャンセル (load_zip_as_folder 相当) は main の token を倒さない。
+        app.cancel_token
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!main_cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+        app.swap_viewer_context_bundle(&mut bundle);
+        // unmount: main の bookkeeping が clear されずそのまま戻る (P2-8 の核心)。
+        assert!(app.requested.contains_key(&3));
+        assert!(app.pending_finalize.contains(&4));
+        assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &main_cancel));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_items_batch_shifts_fullscreen_and_audio_mode_state() {
+        // review-v2.3.0 P2-2: 別窓/フルスクリーンで視聴中にグリッド削除が完了しても、
+        // fullscreen_idx / video_audio_mode 系が削除後の items で同じアイテムを指し続ける。
+        // 視聴中アイテム自体が削除されたら音声モード系は畳み、fullscreen は次の残存
+        // アイテムへ送る (selected と同じ規則)。
+        let mut app = setup_app();
+        let _img_a = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\b.mp4");
+        let _img_c = push_image(&mut app, r"C:\pics\c.jpg");
+        app.fullscreen_idx = Some(video);
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = Some(VideoAudioVstState {
+            fs_idx: video,
+            phase: VideoAudioVstPhase::Active,
+        });
+        // 音量ノーマライズ / ループ位置の idx-keyed 状態も shift 対象 (Codex fix-review P2)。
+        app.normalize_ui_states.insert(
+            video,
+            crate::video::normalize_types::NormalizeUiState::OnApplied { gain_db: -1.5 },
+        );
+        app.normalize_auto_scan_suppressed.insert(video);
+        app.last_loop_pos.insert(video, (12.5, 3));
+        // 進行中の音量スキャン (dummy worker) と VST シェル / 保留 open も shift 対象
+        // (Codex fix-review2)。
+        let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            fs_idx: video,
+            cancel: std::sync::Arc::clone(&scan_cancel),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: true,
+            file_path: PathBuf::from(r"C:\clips\b.mp4"),
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+        app.music_vst_shell = Some(MusicVstShell {
+            fs_idx: video,
+            activated: true,
+        });
+        app.vst3_deferred_media_open = Some(video);
+
+        // 前方の無関係アイテムを削除 → 全て 1 つ前へ shift し、同じ動画を指し続ける。
+        app.remove_items_batch(&[0]);
+        assert_eq!(app.fullscreen_idx, Some(video - 1));
+        assert_eq!(app.video_audio_mode, Some(video - 1));
+        assert_eq!(
+            app.video_audio_vst.as_ref().map(|s| s.fs_idx),
+            Some(video - 1)
+        );
+        assert!(matches!(app.items.get(video - 1), Some(GridItem::Video(_))));
+        assert!(
+            matches!(
+                app.normalize_ui_states.get(&(video - 1)),
+                Some(crate::video::normalize_types::NormalizeUiState::OnApplied { .. })
+            ),
+            "normalize UI 状態は shift された新 idx に付く"
+        );
+        assert!(app.normalize_auto_scan_suppressed.contains(&(video - 1)));
+        assert_eq!(app.last_loop_pos.get(&(video - 1)), Some(&(12.5, 3)));
+        assert_eq!(
+            app.normalize_state.as_ref().map(|s| s.fs_idx),
+            Some(video - 1),
+            "進行中スキャンの fs_idx は残存対象に追随する"
+        );
+        assert!(!scan_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.music_vst_shell.as_ref().map(|s| s.fs_idx),
+            Some(video - 1)
+        );
+        assert_eq!(app.vst3_deferred_media_open, Some(video - 1));
+
+        // 視聴中の動画そのものを削除 → fullscreen は削除スロットへ詰まった次のアイテムを
+        // 指し、音声モード系は畳む。進行中スキャンは cancel、VST シェルは teardown。
+        app.remove_items_batch(&[video - 1]);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(matches!(app.items.get(0), Some(GridItem::Image(_))));
+        assert_eq!(app.video_audio_mode, None);
+        assert!(app.video_audio_vst.is_none());
+        assert!(app.normalize_state.is_none(), "対象削除でスキャンは畳む");
+        assert!(
+            scan_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "対象削除で worker に cancel が伝わる"
+        );
+        assert!(
+            app.music_vst_shell.is_none(),
+            "対象削除で VST シェルは teardown"
+        );
+        assert_eq!(app.vst3_deferred_media_open, None);
+
+        // 残り全部削除 → None (既存の fullscreen_idx.is_none() クリーンアップ経路が閉じる)。
+        app.remove_items_batch(&[0]);
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_music_window_blocks_music_state_clear_on_non_media_open() {
+        // review-v2.3.0 P2-3: ParkedLive の音楽窓 (音声ファイル) が global music_* を消費して
+        // いる間、メイン文脈の非メディア open は音楽状態を破棄しない (破棄すると別窓 BGM 中の
+        // 画像ページ送りごとに解析 respawn + PCM 全尺再デコードが走る)。動画 open は
+        // close_parked_live_media_windows_for_new_media が parked 窓ごと閉じるので従来どおり破棄。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\b.mp4");
+        let audio = push_audio(&mut app, r"C:\music\bgm.flac");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(audio);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(95);
+        let tex = ctx.load_texture(
+            "parked_live_music_clear_guard",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 95,
+                texture: tex,
+                title: "parked music".to_owned(),
+                location_display: "parked music".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(95, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.parked_live_music_window_exists());
+        assert!(
+            !app.should_clear_music_view_on_open(image),
+            "parked 音楽窓が生きている間、非メディア open は music_* を破棄しない"
+        );
+        assert!(
+            app.should_clear_music_view_on_open(video),
+            "動画 open は parked メディア窓ごと閉じる経路なので従来どおり破棄する"
+        );
+        assert!(
+            !app.should_clear_music_view_on_open(audio),
+            "音声 open は従来から破棄しない (ensure が path 比較で処理)"
+        );
+
+        // parked 音楽窓が無くなれば従来どおり非メディア open で破棄する。
+        app.detached_image_windows.clear();
+        assert!(!app.parked_live_music_window_exists());
+        assert!(app.should_clear_music_view_on_open(image));
     }
 
     #[test]
@@ -22021,6 +22325,18 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_window_id = Some(window_id);
         app.begin_active_detached_session(window_id, DetachedSource::Video);
+        // review-v2.3.0 Codex huntfix P2: ロード複合体 (worker queue / cancel token) は
+        // park 後もグリッドを駆動する main 側に残ることを検証するための現物。
+        use std::sync::{Condvar, Mutex};
+        app.reload_queue = Some(std::sync::Arc::new((
+            Mutex::new(Vec::new()),
+            Condvar::new(),
+        )));
+        app.heavy_io_queue = Some(std::sync::Arc::new((
+            Mutex::new(Vec::new()),
+            Condvar::new(),
+        )));
+        let main_cancel = std::sync::Arc::clone(&app.cancel_token);
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test_live_park"));
 
@@ -22033,6 +22349,28 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::ParkedLive)
+        );
+        // ロード複合体は復元 main 側に残る (parked 側は空複合体 → close 時の Drop も no-op)。
+        assert!(
+            app.reload_queue.is_some() && app.heavy_io_queue.is_some(),
+            "park 後の main は worker queue を保持する (reload_queue=None だとサムネ再投入が止まる)"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&app.cancel_token, &main_cancel),
+            "park 後の main は元の cancel token を保持する"
+        );
+        let parked_bundle = parked.paused_bundle.as_deref().expect("bundle");
+        assert!(
+            parked_bundle.reload_queue.is_none() && parked_bundle.heavy_io_queue.is_none(),
+            "parked メディア窓は空のロード複合体を持つ"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&parked_bundle.cancel_token, &main_cancel),
+            "parked 側の cancel token は main と独立 (Drop が main のプールを巻き込まない)"
+        );
+        assert!(
+            !main_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "park の過程で main のロードが cancel されない"
         );
     }
 

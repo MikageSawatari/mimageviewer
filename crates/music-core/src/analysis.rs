@@ -259,8 +259,11 @@ pub fn analyze_stereo_timeline(
         let mut high_sum = 0.0_f64;
 
         for frame_idx in frame_start..frame_end {
-            let l = stereo_samples[frame_idx * 2];
-            let r = stereo_samples[frame_idx * 2 + 1];
+            // デコード異常 (壊れたファイル) 由来の NaN/Inf は 0 に落とす。clamp は NaN を
+            // 素通しするため、放置すると square_sum 経由で rms/loudness/band_energy が
+            // NaN になり hover 表示や波形描画が壊れる (review-v2.3.0 hunt P2)。
+            let l = finite_or_zero(stereo_samples[frame_idx * 2]);
+            let r = finite_or_zero(stereo_samples[frame_idx * 2 + 1]);
             let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
             let side = ((l - r) * 0.5).clamp(-1.0, 1.0);
             let abs = mono.abs();
@@ -661,9 +664,17 @@ fn fft_power_window_into(
         .min(max_start);
     for (i, sample) in window.samples.iter_mut().enumerate() {
         let frame_idx = start_frame + i;
-        let l = stereo_samples[frame_idx * 2];
-        let r = stereo_samples[frame_idx * 2 + 1];
-        let mono = ((l + r) * 0.5).clamp(-1.0, 1.0);
+        // 境界ガード: 空 / 奇数長入力でも panic しない (chroma 側と同じ防御。アプリ内の
+        // 呼び出し元は空入力を渡さないが、library API としての頑健性。review-v2.3.0 hunt P3)。
+        // NaN/Inf サンプルの除去は bin 集計側と同じ理由 (FFT に NaN が入ると窓全体の
+        // スペクトラムが NaN になる)。
+        let mono = if frame_idx < frame_count && frame_idx * 2 + 1 < stereo_samples.len() {
+            let l = finite_or_zero(stereo_samples[frame_idx * 2]);
+            let r = finite_or_zero(stereo_samples[frame_idx * 2 + 1]);
+            ((l + r) * 0.5).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
         let hann = window.hann[i];
         sample.re = mono * hann;
         sample.im = 0.0;
@@ -777,6 +788,14 @@ fn linear_to_db(v: f32) -> f32 {
     } else {
         (20.0 * v.log10()).clamp(-120.0, 12.0)
     }
+}
+
+/// デコード異常 (壊れたファイル) 由来の NaN/Inf サンプルを 0 に落とす。
+/// `clamp` は NaN を素通しするため、集計前にここで除去しないと rms / loudness /
+/// band_energy / FFT 結果へ NaN が伝播する (review-v2.3.0 hunt P2)。
+#[inline]
+fn finite_or_zero(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
@@ -932,7 +951,10 @@ fn analyze_chroma_frame(
     for (i, sample) in samples.iter_mut().enumerate() {
         let frame_idx = start_frame + i;
         let mono = if frame_idx < frame_count {
-            ((stereo_samples[frame_idx * 2] + stereo_samples[frame_idx * 2 + 1]) * 0.5)
+            // NaN/Inf サンプルの除去 (bin 集計側と同じ理由)。
+            ((finite_or_zero(stereo_samples[frame_idx * 2])
+                + finite_or_zero(stereo_samples[frame_idx * 2 + 1]))
+                * 0.5)
                 .clamp(-1.0, 1.0)
         } else {
             0.0
@@ -1212,6 +1234,31 @@ mod tests {
         assert_eq!(out.len(), 12);
         assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 1.0);
+    }
+
+    #[test]
+    fn analysis_stays_finite_with_nan_inf_samples() {
+        // review-v2.3.0 hunt P2: デコード異常由来の NaN/Inf が bin metrics に伝播しない。
+        let mut samples = Vec::new();
+        for i in 0..48_000 {
+            let x = match i % 5 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                _ => 0.25,
+            };
+            samples.extend([x, -x]);
+        }
+        let analysis = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        assert!(!analysis.bins.is_empty());
+        for bin in &analysis.bins {
+            assert!(bin.rms.is_finite(), "rms must stay finite");
+            assert!(bin.rms_l.is_finite() && bin.rms_r.is_finite());
+            assert!(bin.peak.is_finite() && bin.peak_l.is_finite() && bin.peak_r.is_finite());
+            assert!(bin.loudness_db.is_finite());
+            assert!(bin.band_energy.iter().all(|v| v.is_finite()));
+            assert!(bin.transient.is_finite());
+        }
     }
 
     #[test]

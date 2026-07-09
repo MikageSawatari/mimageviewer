@@ -85,9 +85,11 @@ pub struct TimelineTextureCache {
     raster_tx: Option<mpsc::Sender<TimelineRasterRequest>>,
     raster_rx: Option<mpsc::Receiver<TimelineRasterResult>>,
     raster_cancel: Option<Arc<AtomicBool>>,
-    /// 直近フレームで描いた解析 `Arc` の identity (`Arc::as_ptr as usize`、0 = 未取得)。
+    /// 直近フレームで描いた解析の版数 (`App::music_analysis_version`、0 = 未取得)。
     /// progressive partial で解析が差し替わったら全 row を再ラスタするために使う。
-    last_analysis_ptr: usize,
+    /// `Arc::as_ptr` の identity 比較はアドレス再利用 (ABA) で差し替えを見逃すため
+    /// 版数で判定する (review-v2.3.0 P2-4)。
+    last_analysis_version: u64,
 }
 
 struct TimelineRowTexture {
@@ -150,20 +152,20 @@ impl TimelineTextureCache {
         self.rows.clear();
         self.pending.clear();
         self.row_versions.clear();
-        self.last_analysis_ptr = 0;
+        self.last_analysis_version = 0;
     }
 
-    /// 解析結果 `Arc` の identity が変わったら（progressive partial → 成長 / partial → final）、
+    /// 解析結果の版数が変わったら（progressive partial → 成長 / partial → final）、
     /// 既存の全 row を再ラスタ対象にする。`TimelineTextureCacheKey` は x 軸幅（= player duration）
     /// が不変なら同一なので、`ensure` の key 差分だけでは無効化されない（Codex P1）。key を保った
     /// まま全 `row_version` を進めて古い row texture を stale 化する（worker は残す）。partial は
-    /// 幾何級数で高々十数回なので再ラスタ総コストは有界。`analysis_ptr` = `Arc::as_ptr as usize`、
-    /// 0 は「未取得」sentinel。
-    fn note_analysis_identity(&mut self, analysis_ptr: usize) {
-        if analysis_ptr == 0 || self.last_analysis_ptr == analysis_ptr {
+    /// 幾何級数で高々十数回なので再ラスタ総コストは有界。`analysis_version` =
+    /// `App::music_analysis_version`（代入ごとに単調増加、0 は「未取得」sentinel）。
+    fn note_analysis_identity(&mut self, analysis_version: u64) {
+        if analysis_version == 0 || self.last_analysis_version == analysis_version {
             return;
         }
-        self.last_analysis_ptr = analysis_ptr;
+        self.last_analysis_version = analysis_version;
         for v in self.row_versions.iter_mut() {
             *v = v.wrapping_add(1);
         }
@@ -420,6 +422,8 @@ pub struct MusicTimelineOutcome {
 pub fn draw_music_timeline(
     ui: &mut egui::Ui,
     analysis: &Arc<TimelineAnalysis>,
+    // `App::music_analysis_version` (解析差し替えごとに進む。row 再ラスタ判定に使う)。
+    analysis_version: u64,
     duration_secs: f64,
     position_secs: f64,
     playing: bool,
@@ -480,7 +484,7 @@ pub fn draw_music_timeline(
     cache.ensure(texture_key);
     // progressive partial で解析が差し替わっていたら全 row を再ラスタ対象にする（key は
     // player duration 基準の全幅なので変わらず、ensure では無効化されない。Codex P1）。
-    cache.note_analysis_identity(Arc::as_ptr(analysis) as usize);
+    cache.note_analysis_identity(analysis_version);
     cache.poll_finished_rows(ui.ctx(), TIMELINE_ROW_TEXTURE_UPLOAD_BUDGET_PER_FRAME);
 
     let text_color = ui.visuals().text_color();
@@ -687,6 +691,14 @@ fn timeline_seek_target_secs(
     None
 }
 
+/// タイムライン行数の上限。壊れた音声ファイルはコンテナ duration に i64::MAX 級の
+/// ゴミを報告することがあり (probe は上限なしで秒に変換する)、無制限だと
+/// `TimelineTextureCache::ensure` が兆単位の `resize_with` を試みて OOM abort /
+/// フリーズする (review-v2.3.0 hunt P1)。row_secs は描画側で 1.0 秒以上に clamp
+/// されるので、100_000 行 ≒ 27 時間超の音声までは実表示を維持できる (それ以上は
+/// 末尾が切れるだけで、正常ファイルでは実質到達しない)。
+const TIMELINE_MAX_ROWS: usize = 100_000;
+
 fn timeline_row_count(duration_secs: f64, row_secs: f64) -> usize {
     if !duration_secs.is_finite()
         || duration_secs <= 0.0
@@ -695,7 +707,7 @@ fn timeline_row_count(duration_secs: f64, row_secs: f64) -> usize {
     {
         1
     } else {
-        (duration_secs / row_secs).ceil().max(1.0) as usize
+        ((duration_secs / row_secs).ceil().max(1.0) as usize).min(TIMELINE_MAX_ROWS)
     }
 }
 
@@ -2141,6 +2153,19 @@ mod tests {
         assert_eq!(timeline_row_count(f64::NAN, 30.0), 1);
         assert_eq!(timeline_row_count(90.0, 30.0), 3);
         assert_eq!(timeline_row_count(91.0, 30.0), 4);
+    }
+
+    #[test]
+    fn row_count_is_capped_for_garbage_durations() {
+        // review-v2.3.0 hunt P1: 壊れたファイルのコンテナ duration (i64::MAX 級) で
+        // 兆単位の row を確保して OOM/フリーズしない。
+        assert_eq!(
+            timeline_row_count(9_223_372_036_854.0, 1.0),
+            TIMELINE_MAX_ROWS
+        );
+        assert_eq!(timeline_row_count(f64::MAX, 1.0), TIMELINE_MAX_ROWS);
+        // 正常域はキャップの影響を受けない (24h 音声 @ row_secs=1.0)。
+        assert_eq!(timeline_row_count(86_400.0, 1.0), 86_400);
     }
 
     #[test]

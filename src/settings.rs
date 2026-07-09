@@ -453,6 +453,15 @@ pub enum FacetItemKind {
     PdfPage,
     Separator,
     SearchContainer,
+    /// 将来バージョンが書いた未知の variant の受け皿 (ダウングレード耐性、
+    /// `ToolbarFacetFilterItem::Unknown` と同じ方針)。実アイテムがこの kind に
+    /// なることはなく、絞り込み集合に残っていても何にもマッチしない。
+    /// なお v2.2.0 の同 enum にはこの受け皿が無いため、`Audio` を含む facet_filter を
+    /// 保存したまま v2.2.0 へ戻すと設定 DB が Corrupted 扱いになる (bak 世代へ巻き戻り)。
+    /// これは v2.2.0 側が出荷済みで直せない既知の非互換 (review-v2.3.0 hunt P2、
+    /// リリースノート記載で対応)。
+    #[serde(other)]
+    Unknown,
 }
 
 impl FacetItemKind {
@@ -469,6 +478,7 @@ impl FacetItemKind {
             Self::PdfPage => "PDFページ",
             Self::Separator => "見出し",
             Self::SearchContainer => "検索コンテナ",
+            Self::Unknown => "不明",
         }
     }
 }

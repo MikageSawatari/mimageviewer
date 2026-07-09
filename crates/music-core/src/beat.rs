@@ -57,14 +57,24 @@ impl BeatGrid {
         }
 
         let beat_period = 60.0 / bpm as f64;
+        // 上限ガード (review-v2.3.0 hunt P2): BPM はビート検出以外にメタデータ / 外部入力
+        // 由来の値も通り得る。異常な高 BPM だと (a) 数千万 beat の確保、(b) beat_period が
+        // float 精度以下になって `t += beat_period` が進まない無限ループ、の両方が起きる。
+        // 実用域 (〜300 BPM × 数時間) は 200_000 で余裕を持ってカバーする。
+        const MAX_BEATS: usize = 200_000;
         let mut beats = Vec::new();
         let mut t = first_beat_secs.max(0.0);
-        while t <= duration_secs + beat_period * 0.5 {
+        while t <= duration_secs + beat_period * 0.5 && beats.len() < MAX_BEATS {
             beats.push(BeatMarker {
                 time_secs: t,
                 confidence,
             });
-            t += beat_period;
+            let next = t + beat_period;
+            if next <= t {
+                // beat_period が t の float 精度以下 (進まない): これ以上生成できない。
+                break;
+            }
+            t = next;
         }
 
         let mut bars = Vec::new();
@@ -102,5 +112,18 @@ mod tests {
         assert!(grid.beats.len() >= 32);
         assert_eq!(grid.bars[1].beat_index, 4);
         assert!((grid.bars[1].time_secs - 2.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn bpm_grid_is_bounded_for_garbage_bpm() {
+        // review-v2.3.0 hunt P2: 異常 BPM で巨大 allocation / 無限ループにならない。
+        let grid = BeatGrid::from_bpm(60.0, 1_000_000.0, 0.0, 1.0);
+        assert!(grid.beats.len() <= 200_000);
+        // beat_period が float 精度以下でも終了する (進まなくなったら break)。
+        let grid = BeatGrid::from_bpm(3600.0, f32::MAX, 0.0, 1.0);
+        assert!(grid.beats.len() <= 200_000);
+        // 通常域は従来どおり。
+        let grid = BeatGrid::from_bpm(60.0, 120.0, 0.0, 0.8);
+        assert!((grid.beats.len() as i64 - 121).abs() <= 1);
     }
 }
