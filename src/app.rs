@@ -5053,6 +5053,11 @@ pub(crate) struct NativeVideoModeSwitchPending {
     pub target_presentation: ViewerPresentation,
     /// presenter 無応答時の保険。これを過ぎたら pending を捨てて次トグルを許可する。
     pub deadline: std::time::Instant,
+    /// メディア窓→メイン切替 (F12/リング) の案内トーストを、**切替の確定**
+    /// (`PlacementSwitched` 適用) 時に出すか。要求発行時に出すと presenter 無応答で
+    /// 切り替わらなかったのに「切り替えました」と表示してしまう (Sol P2)。
+    /// F12 トグル経路だけが true にする (F11 等の in-window/全画面切替では出さない)。
+    pub announce_main_hint: bool,
 }
 
 /// Inc 7 hidden presenter: exit (音声モード→動画) の非同期完了待ち 1 件。
@@ -5363,7 +5368,9 @@ const MUSIC_PCM_RESERVE_MAX_FRAMES: usize = 4 * 3600 * 48_000;
 /// **fresh stat** し、ヒットに使われた `hit_meta` と (mtime,size) が食い違う場合 (= フォルダ再読込
 /// 前に外部更新された) は stale ヒットと判断して解析し直す (Codex code P2)。UI スレッド stat は
 /// 避けたまま、キャッシュ正しさは背景 stat で担保する。`TimelineComplete.meta` にこの検証済み
-/// (mtime,size) を載せ、UI はそれで LRU を keying する。`cancel` は decode 中と各節目で確認する。
+/// (mtime,size) を載せ、UI はそれで LRU を keying する。`cancel` は decode 中・各節目に加え、
+/// タイムライン解析の内側 (bin / FFT 窓単位) でも確認する = 解析 1 パス丸ごとの
+/// 非キャンセル区間は存在しない (leak-hunt P1)。
 fn run_music_analysis(
     path: &std::path::Path,
     cancel: &std::sync::atomic::AtomicBool,
@@ -5440,15 +5447,19 @@ fn run_music_analysis(
             if !schedule.should_emit(frames) {
                 return Ok(());
             }
-            // 共有バッファのプレフィックスを lock 下で解析する (analyze_stereo_timeline は cancel
-            // 不可なので前後で cancel を確認する、Codex P3)。lock 保持は partial のときだけ =
-            // 幾何級数で稀 (全長 50% で停止) なので spectrum worker の窓コピーへの影響は限定的。
+            // 共有バッファのプレフィックスを lock 下で解析する。解析は cancel を bin /
+            // FFT 窓単位で確認して中断できる (leak-hunt P1: 旧実装は解析パスが cancel 不可で、
+            // 長尺ファイル連続切替時に放棄ワーカーが数 GB の PCM Arc を解析 1 パス分
+            // 保持し続けた)。lock 保持は partial のときだけ = 幾何級数で稀 (全長 50% で
+            // 停止) なので spectrum worker の窓コピーへの影響は限定的。
             let ta = pcm.with_prefix(|prefix, rate| {
-                music_core::analyze_stereo_timeline(prefix, rate, config)
+                music_core::analyze_stereo_timeline_cancellable(prefix, rate, config, &|| {
+                    cancel.load(Ordering::Relaxed)
+                })
             });
-            if cancel.load(Ordering::Relaxed) {
+            let Some(ta) = ta else {
                 return Ok(());
-            }
+            };
             if tx.send(MusicAnalysisMsg::Timeline(Ok(ta))).is_ok() {
                 partial_sent = true;
             }
@@ -5479,14 +5490,214 @@ fn run_music_analysis(
     // 載せる)。有効な LRU ヒットは既に確定済みなので送らない (stale ヒットはここで補正済みの新解析を
     // 送る)。final 解析は共有バッファを lock 下で 1 回走査するだけ (spectrum を一時ブロックするが 1 回)。
     if should_analyze {
-        let ta = pcm
-            .with_prefix(|prefix, rate| music_core::analyze_stereo_timeline(prefix, rate, config));
-        let _ = tx.send(MusicAnalysisMsg::TimelineComplete {
-            analysis: ta,
-            meta: fresh_meta,
+        let ta = pcm.with_prefix(|prefix, rate| {
+            music_core::analyze_stereo_timeline_cancellable(prefix, rate, config, &|| {
+                cancel.load(Ordering::Relaxed)
+            })
         });
+        if let Some(ta) = ta {
+            let _ = tx.send(MusicAnalysisMsg::TimelineComplete {
+                analysis: ta,
+                meta: fresh_meta,
+            });
+        }
     }
     // Pcm は既にデコード開始前に送信済み (共有 Arc に append してきた)。ここでは再送しない。
+}
+
+/// 削除 / リネームされた path 群に対する正規化キー一致判定 closure を作る
+/// (`release_viewer_surfaces_for_removed_paths` / resume purge 用)。完全一致に加え、
+/// フォルダ配下 (`<key>/…`) とアーカイブ内エントリ (`<key>::…`、
+/// `adjustment_db::zip_entry_key` 形式) のプレフィックス一致も対象にする。
+fn removed_path_key_matcher(removed: &[std::path::PathBuf]) -> impl Fn(&str) -> bool + use<> {
+    let keys: std::collections::HashSet<String> = removed
+        .iter()
+        .map(|p| crate::adjustment_db::normalize_path(p))
+        .collect();
+    let prefixes: Vec<String> = keys
+        .iter()
+        .flat_map(|k| [format!("{k}/"), format!("{k}::")])
+        .collect();
+    move |key: &str| keys.contains(key) || prefixes.iter().any(|pre| key.starts_with(pre.as_str()))
+}
+
+/// fullscreen 表示中の項目を削除した後、削除位置へ詰まった次項目を優先し、無ければ
+/// 直前の表示可能項目へ戻す。Folder / ZipFile / PdfFile 等のコンテナセルを選ぶと
+/// fullscreen 描画側が表示対象を失うため、単なる items.len() clamp にはしない。
+/// Audio は ↑↓ ナビ (`adjacent_navigable_idx`) と同じ「映像なし動画」扱いで対象に含める。
+fn fullscreen_neighbor_after_removal(items: &[GridItem], removed_slot: usize) -> Option<usize> {
+    let displayable = |item: &GridItem| {
+        matches!(
+            item,
+            GridItem::Image(_)
+                | GridItem::Video(_)
+                | GridItem::Audio(_)
+                | GridItem::ZipImage { .. }
+                | GridItem::PdfPage { .. }
+        )
+    };
+
+    items
+        .iter()
+        .enumerate()
+        .skip(removed_slot)
+        .find_map(|(idx, item)| displayable(item).then_some(idx))
+        .or_else(|| {
+            items[..removed_slot.min(items.len())]
+                .iter()
+                .rposition(displayable)
+        })
+}
+
+/// `consume_video_thumb_overrides_dirty` の再ロード判定: ピンを書き換えた動画の
+/// いずれかが現在のグリッド items に実ファイル `Video` セルとして見えているか。
+/// Windows の大文字小文字非区別に合わせ、正規化キー (`path_key::normalize_keep_drive`)
+/// で比較する。ZIP/PDF の仮想ビューに実ファイル動画セルは出ず、ファイル名スタックも
+/// 動画を畳まない (`filename_stack::videos_never_grouped_even_same_prefix`) ので、
+/// `GridItem::Video` だけ見れば足りる。
+fn video_pin_dirty_paths_visible(
+    dirty: &std::collections::HashSet<PathBuf>,
+    items: &[GridItem],
+) -> bool {
+    if dirty.is_empty() {
+        return false;
+    }
+    let keys: std::collections::HashSet<String> = dirty
+        .iter()
+        .map(|p| crate::path_key::normalize_keep_drive(p))
+        .collect();
+    items.iter().any(|item| match item {
+        GridItem::Video(p) => keys.contains(&crate::path_key::normalize_keep_drive(p)),
+        _ => false,
+    })
+}
+
+/// 実行中のリネーム移行 worker のハンドル (`App::rename_migration_in_flight`)。
+pub(crate) struct RenameMigrationInFlight {
+    pub(crate) old_path: std::path::PathBuf,
+    pub(crate) new_path: std::path::PathBuf,
+    pub(crate) rx: std::sync::mpsc::Receiver<crate::rename_key_migration::RenameMigrationReport>,
+}
+
+/// `key` がリネーム対象 (`old_k` の exact / `old_k/…` 配下 / `old_k::…` アーカイブ内) に
+/// 該当すれば付け替え後の新キーを返す。DB 側の移行 (`rename_key_migration`) と同じ規則。
+fn renamed_key_for(key: &str, old_k: &str, new_k: &str) -> Option<String> {
+    if key == old_k {
+        return Some(new_k.to_string());
+    }
+    let rest = key.strip_prefix(old_k)?;
+    if rest.starts_with('/') || rest.starts_with("::") {
+        Some(format!("{new_k}{rest}"))
+    } else {
+        None
+    }
+}
+
+/// presence set (`BTreeSet<String>`) のキーをリネーム規則で書き換える。
+fn rewrite_key_set_for_rename(
+    set: &mut std::collections::BTreeSet<String>,
+    old_k: &str,
+    new_k: &str,
+) {
+    let affected: Vec<String> = set
+        .iter()
+        .filter(|k| renamed_key_for(k, old_k, new_k).is_some())
+        .cloned()
+        .collect();
+    for key in affected {
+        set.remove(&key);
+        if let Some(new_key) = renamed_key_for(&key, old_k, new_k) {
+            set.insert(new_key);
+        }
+    }
+}
+
+/// `HashMap<String, V>` のキーをリネーム規則で付け替える。新キー側に既存エントリが
+/// ある場合はそちらを優先する (リネーム後に先へ操作した値を潰さない、DB 側と同じ)。
+fn migrate_key_map_for_rename<V>(
+    map: &mut std::collections::HashMap<String, V>,
+    old_k: &str,
+    new_k: &str,
+) {
+    let affected: Vec<String> = map
+        .keys()
+        .filter(|k| renamed_key_for(k, old_k, new_k).is_some())
+        .cloned()
+        .collect();
+    for key in affected {
+        if let Some(value) = map.remove(&key) {
+            if let Some(new_key) = renamed_key_for(&key, old_k, new_k) {
+                map.entry(new_key).or_insert(value);
+            }
+        }
+    }
+}
+
+/// bundle が削除 / リネーム対象 path を「表示中 / 再生中」か。判定対象は現在表示
+/// アイテム (fullscreen_idx)・bundle の current_folder (フォルダ / コンテナ自体の削除)・
+/// fs_cache 内の VideoPlayer (再生中 handle)。含まれるだけのアイテムは対象外。
+#[cfg(windows)]
+fn viewer_bundle_references_removed(
+    bundle: &ViewerContextBundle,
+    matches_key: &dyn Fn(&str) -> bool,
+) -> bool {
+    if bundle
+        .fullscreen_idx
+        .and_then(|idx| bundle.items.get(idx))
+        .and_then(|item| item.drag_source_path())
+        .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p)))
+    {
+        return true;
+    }
+    if bundle
+        .current_folder
+        .as_deref()
+        .is_some_and(|folder| matches_key(&crate::adjustment_db::normalize_path(folder)))
+    {
+        return true;
+    }
+    bundle.fs_cache.values().any(|entry| {
+        matches!(entry, FsCacheEntry::Video { player, .. }
+            if matches_key(&crate::adjustment_db::normalize_path(player.path())))
+    })
+}
+
+/// detached 窓 (passive / parked) が削除 / リネーム対象 path を表示中か。
+/// sync stamp の item_key は `metadata_cache_key` 由来 (= 正規化済み / zip_entry_key
+/// 形式) なのでそのまま照合できる。reopen descriptor と paused_bundle も見る。
+#[cfg(windows)]
+fn detached_window_references_removed(
+    window: &DetachedImageWindowSnapshot,
+    matches_key: &dyn Fn(&str) -> bool,
+) -> bool {
+    if window
+        .reopen_sync_stamp
+        .as_ref()
+        .is_some_and(|stamp| matches_key(&stamp.item_key))
+    {
+        return true;
+    }
+    if let Some(desc) = window.reopen_descriptor.as_ref() {
+        let (path, source_override) = match desc {
+            ViewerContextDescriptor::Pdf { path, .. } => (path, None),
+            ViewerContextDescriptor::Zip {
+                path,
+                archive_source_override,
+                ..
+            } => (path, archive_source_override.as_deref()),
+            ViewerContextDescriptor::Image { path } => (path, None),
+        };
+        if matches_key(&crate::adjustment_db::normalize_path(path)) {
+            return true;
+        }
+        if source_override.is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p))) {
+            return true;
+        }
+    }
+    window
+        .paused_bundle
+        .as_deref()
+        .is_some_and(|bundle| viewer_bundle_references_removed(bundle, matches_key))
 }
 
 pub struct App {
@@ -5997,6 +6208,35 @@ pub struct App {
     pub(crate) rename_input: String,
     pub(crate) rename_error: Option<String>,
     pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenameReceiver>,
+    /// ダイアログを開いた時点で対象が実ファイルだったか。毎フレームの stat を避ける。
+    pub(crate) rename_target_is_file: bool,
+    /// TextEdit の初回フォーカス時に Explorer 風の選択範囲を設定する one-shot。
+    pub(crate) rename_initial_selection_pending: bool,
+    /// ファイルの拡張子変更を実行する前の確認画面を表示中か。
+    pub(crate) rename_extension_confirm: bool,
+    /// リネーム移行 (`rename_key_migration`) のジョブキュー (FIFO)。連続リネーム
+    /// A→B→C を並列 worker にすると逆順実行で中間 path にデータが取り残されるため、
+    /// 必ず 1 本ずつ直列実行する (Sol rename-mig P1。根拠テスト =
+    /// `rename_key_migration::tests::sequential_chained_renames_require_fifo_ordering`)。
+    pub(crate) rename_migration_queue:
+        std::collections::VecDeque<(std::path::PathBuf, std::path::PathBuf)>,
+    /// 実行中のリネーム移行 worker (直列実行なので常に高々 1 本)。(old, new) は
+    /// 完了時の in-memory 引き直しとジャーナル消し込みに使う。
+    pub(crate) rename_migration_in_flight: Option<RenameMigrationInFlight>,
+    /// 実行中に worker が消息不明 (Disconnected) になったジョブ。セッション内では
+    /// 再試行せず、ジャーナルに残して次回起動時に再実行する。
+    pub(crate) rename_migration_boot_retry: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// ジャーナル (`rename_key_migration::JOURNAL_FILE`) を今セッションで読み込み済みか。
+    /// 最初の enqueue / poll の前に必ず読み込む (先に enqueue の persist が走ると
+    /// 前セッションの回復エントリを上書きしてしまうため)。
+    pub(crate) rename_migration_journal_loaded: bool,
+    /// リネーム移行完了時に main 文脈の再構築が必要だったが、補正スライダーの
+    /// ドラッグ中だったため次のドラッグ終了後フレームへ繰り延べた印 (角度⑦ P1)。
+    pub(crate) rename_rehydrate_main_deferred: bool,
+    /// テスト用: リネーム移行 worker / ジャーナルが使う data_dir の差し替え
+    /// (None = `data_dir::get()`)。
+    #[cfg(test)]
+    pub(crate) rename_migration_data_dir_override: Option<std::path::PathBuf>,
 
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
@@ -6503,7 +6743,7 @@ pub struct App {
     /// `converted_archive_cache_paths` を UI スレッド外で構築している worker。
     pub(crate) converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
-    /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty` と同じ作法)。
+    /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty_paths` と同じ作法)。
     pub(crate) folder_thumb_pin_dirty: bool,
 
     // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
@@ -6575,9 +6815,19 @@ pub struct App {
     /// presentation を維持する (ユーザー手動ナビは従来どおり設定に従うので None)。
     #[cfg(windows)]
     pub(crate) fs_media_open_forced_presentation: Option<ViewerPresentation>,
-    /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
-    /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
-    pub(crate) video_thumb_overrides_dirty: bool,
+    /// ピンを書き換えた (P ピン / 解除 / 後追い WebP 補完) 動画パスの集合 (Phase 8.B')。
+    /// 空でなければ「次の機会にフォルダを再ロードしてグリッドサムネへ反映する」dirty 状態。
+    /// 消費は `consume_video_thumb_overrides_dirty` — `close_fullscreen` に加えて
+    /// `App::update` からも毎フレーム呼ぶ (フル機能モード + メディア別ウィンドウで
+    /// P ピンしたときメイン窓のグリッドが開きっぱなしでも反映されるように)。
+    /// パスを持つのは「メイン表示中の items に居る動画のピンが変わったときだけ
+    /// 再ロードする」判定のため (無関係フォルダの再ロードでスクロール/選択を壊さない)。
+    pub(crate) video_thumb_overrides_dirty_paths: std::collections::HashSet<PathBuf>,
+    /// 直近に動画ピン dirty の consume が可視性判定を通過した時刻 (安全網)。producer が
+    /// 何らかの経路で dirty を再点火し続ける状態に陥っても、再ロード連打 (= サムネが
+    /// Pending のまま黒く見える) にならないよう最短間隔を強制する。dirty は捨てずに
+    /// 保持し、間隔経過後の consume で処理する。
+    pub(crate) video_thumb_reload_last_at: Option<std::time::Instant>,
     /// ピン留めボタン押下時に thumb worker キャッシュが空だった場合の後追い更新待ち。
     /// `tick_pending_pin_thumb_refresh` が後続フレームで worker 完了をポーリングし、
     /// 取れ次第 `VideoPinDb::set_pin` を再呼び出しして DB のサムネ BLOB を埋める。
@@ -8900,6 +9150,16 @@ impl App {
             rename_input: String::new(),
             rename_error: None,
             rename_pending: None,
+            rename_target_is_file: false,
+            rename_initial_selection_pending: false,
+            rename_extension_confirm: false,
+            rename_migration_queue: std::collections::VecDeque::new(),
+            rename_migration_in_flight: None,
+            rename_migration_boot_retry: Vec::new(),
+            rename_migration_journal_loaded: false,
+            rename_rehydrate_main_deferred: false,
+            #[cfg(test)]
+            rename_migration_data_dir_override: None,
             show_preferences: false,
             show_preferences_discard_confirm: false,
             show_operation_customize: false,
@@ -9114,7 +9374,8 @@ impl App {
             fs_video_open_ignore_resume_once: false,
             #[cfg(windows)]
             fs_media_open_forced_presentation: None,
-            video_thumb_overrides_dirty: false,
+            video_thumb_overrides_dirty_paths: std::collections::HashSet::new(),
+            video_thumb_reload_last_at: None,
             #[cfg(windows)]
             pending_pin_thumb_refresh: None,
             fullscreen_video_marker_cache: None,
@@ -18577,6 +18838,115 @@ impl App {
         }
     }
 
+    /// 動画ピンの書き換え (P ピン / 解除 / 後追い WebP 補完) があったら現フォルダを
+    /// 再ロードしてグリッドサムネに反映する (Phase 8.B')。`close_fullscreen` と
+    /// `App::update` (= 毎フレーム、メインビューア非表示時) の両方から呼ばれる。
+    /// close_fullscreen だけで consume していると、フル機能モード + メディア別
+    /// ウィンドウの P ピンではメイン窓のグリッドが開きっぱなしで反映契機が来ない
+    /// (実機 FB 2026-07-10。`consume_folder_thumb_pin_dirty` と同じ構造の修正)。
+    ///
+    /// 再ロードは「ピンした動画が現在の items に見えているとき」だけ行う。別窓が
+    /// メイン表示と無関係なフォルダの動画をピンしたケースで、メイン側のスクロール /
+    /// 選択を巻き込む無駄な再ロードを避けるため。ここで dirty を捨てても、その動画の
+    /// フォルダを次に開く load_folder が video_pins.db から WebP を snapshot し直す
+    /// (`start_loading_items` の pin_blobs) ので反映漏れにはならない。
+    pub(crate) fn consume_video_thumb_overrides_dirty(&mut self) {
+        if self.video_thumb_overrides_dirty_paths.is_empty() {
+            return;
+        }
+        // P ピン時に thumb worker のフレームがまだ無かった場合 (空 WebP で set_pin →
+        // 旧 blob 温存)、後追い補完 (`tick_pending_pin_thumb_refresh`) が DB に正しい
+        // フレームを書き込むまで consume を遅らせる。先に再ロードすると「古いフレームの
+        // まま」を一度描いてから補完後にもう一度リロードする二度手間になる。pending は
+        // 完了 / 10s タイムアウト / 動画切替の全ケースで None に戻るので詰まらない。
+        #[cfg(windows)]
+        if self.pending_pin_thumb_refresh.is_some() {
+            return;
+        }
+        // 再ロードの最短間隔 (安全網)。マーカーキャッシュ経由の producer が dirty を
+        // 再点火し続ける状態 (実機 2026-07-10: persist ↔ 再ロードの自己ループで
+        // ~50ms 周期の load_folder 連打、全動画サムネが Pending=黒に固着) に陥っても、
+        // 連打にはさせない。dirty は捨てず保持し、間隔経過後の consume で処理する。
+        if let Some(t) = self.video_thumb_reload_last_at
+            && t.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return;
+        }
+        let dirty = std::mem::take(&mut self.video_thumb_overrides_dirty_paths);
+        if !self.video_pin_dirty_visible_in_items(&dirty) {
+            return;
+        }
+        self.video_thumb_reload_last_at = Some(std::time::Instant::now());
+        if self.items_are_subfolder_expansion_view {
+            // 同じ snapshot を再適用して動画ピンの WebP を再取得する。
+            if !self.reinstall_subfolder_expansion_snapshot()
+                && let Some(root) = self.subfolder_expansion_root.clone()
+            {
+                let roots = if self.subfolder_expansion_roots.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    self.subfolder_expansion_roots.clone()
+                };
+                self.start_subfolder_expansion_scan_roots(root, roots);
+            }
+        } else if let Some(cur) = self.current_folder.clone()
+            && !is_synthetic_view_path(&cur)
+        {
+            // 現フォルダ + 履歴を温存したまま再ロード。folder pin 側にある zip_nav
+            // 分岐 (ルートへ飛ぶ罠の回避) は不要 — ZIP ビューには実ファイル Video
+            // セルも動画へ解決される Folder タイルも出ないため、可視性チェックで
+            // 必ず手前で return する。
+            self.folder_history.remove(&cur);
+            self.load_folder(cur);
+        }
+        // 既知の制限 (bool フラグ時代から同じ): 検索 / タグ等の合成ビューに dirty 動画の
+        // Video セルが見えている場合、可視性は true になるがどの再ロード分岐にも入らず
+        // サムネは古いまま (従来も close_fullscreen で consume して何もしなかった)。
+        // ビューを閉じてフォルダへ戻る load_folder で反映される。
+    }
+
+    /// `consume_video_thumb_overrides_dirty` の可視性判定 (App 状態込み)。
+    /// items の実ファイル `Video` セル (純関数 `video_pin_dirty_paths_visible`) に加え、
+    /// 代表サムネ 📌 の cascade 解決が dirty 動画へ到達する `Folder` タイルも対象にする
+    /// (親フォルダ表示中に別窓でピンを付け替えたとき、`seed_folder_video_pin_thumbs` が
+    /// 焼いたタイル WebP を再ロードで更新するため。Codex P1)。解決ロジックは seed 側と
+    /// 同じ folder_pin_map + cascade。resolve は fs metadata / pin DB lookup を伴うが、
+    /// ここへ来るのはピン操作直後の 1 回だけなので負荷は seed (フォルダロード毎) 以下。
+    fn video_pin_dirty_visible_in_items(&self, dirty: &std::collections::HashSet<PathBuf>) -> bool {
+        if video_pin_dirty_paths_visible(dirty, &self.items) {
+            return true;
+        }
+        if self.folder_pin_map.is_empty() {
+            return false;
+        }
+        let dirty_keys: std::collections::HashSet<String> = dirty
+            .iter()
+            .map(|p| crate::path_key::normalize_keep_drive(p))
+            .collect();
+        let pin_db = self.folder_thumb_pin_db.as_deref();
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
+        self.items.iter().any(|item| {
+            let GridItem::Folder(container_path) = item else {
+                return false;
+            };
+            let container_key = crate::path_key::normalize_keep_drive(container_path);
+            let Some(source) = self.folder_pin_map.get(&container_key) else {
+                return false;
+            };
+            let lookup = |p: &std::path::Path| pin_db.and_then(|db| db.lookup(p));
+            let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                container_path,
+                source,
+                lookup,
+                max_cascade_depth,
+            ) else {
+                return false;
+            };
+            matches!(resolved.kind, crate::folder_thumb_pins::ResolvedKind::Video)
+                && dirty_keys.contains(&crate::path_key::normalize_keep_drive(&resolved.abs_path))
+        })
+    }
+
     /// Ctrl+E エクスポートが現在表示中の実フォルダへ書き出したら、一覧復帰時の
     /// 再読み込み対象として記録する。ZIP / PDF / 検索結果などの仮想ビューでは
     /// 一覧文脈が変わってしまうため、ここでは何もしない。
@@ -19228,13 +19598,12 @@ impl App {
         // レーティング等 idx ベース操作の誤適用)。視聴中アイテム自体が削除された場合は
         // selected と同じ「次の残存アイテムが詰まる」規則で送り、全消えなら None
         // (= 既存の `fullscreen_idx.is_none()` クリーンアップ経路がビューポートを閉じる)。
-        let n_after = self.items.len();
         if let Some(old) = self.fullscreen_idx {
             self.fullscreen_idx = match shift(old) {
                 Some(ni) => Some(ni),
                 None => {
                     let slid = old - sorted_asc.partition_point(|&x| x < old);
-                    (n_after > 0).then(|| slid.min(n_after - 1))
+                    fullscreen_neighbor_after_removal(&self.items, slid)
                 }
             };
         }
@@ -19353,12 +19722,569 @@ impl App {
         }
     }
 
+    /// 削除 / リネームで消える path を表示・再生中の viewer サーフェス (メイン fullscreen /
+    /// active detached / passive・parked detached 窓) を閉じる (review-v2.3.0 角度④ (A)(B)
+    /// の最小対応)。
+    ///
+    /// - **削除は shell 操作の前に呼ぶ**: 再生中 decoder が file handle を掴んだままだと
+    ///   ゴミ箱移動が共有違反で失敗し続けるため (B)。削除確認ダイアログ通過後に呼ぶので、
+    ///   その後の削除失敗で窓だけ閉じ損になるケースは許容する。
+    /// - **リネームは成功後に旧 path で呼ぶ**: parked bundle が旧 path のまま生き残ると、
+    ///   再生位置の書き戻しやメタデータ書込が旧名キーへ流れるため (A)。
+    /// - フォルダ / ZIP / PDF コンテナは配下 (`<key>/…`) とアーカイブ内エントリ
+    ///   (`<key>::…`) のプレフィックス一致でも閉じる。
+    /// - bundle に「含まれるだけで表示していない」アイテムは閉じない (再活性化時の
+    ///   `resolve_viewer_sync_stamp_idx` が fail-safe に空振る既存動作に任せる)。
+    pub(crate) fn release_viewer_surfaces_for_removed_paths(
+        &mut self,
+        ctx: &egui::Context,
+        removed: &[std::path::PathBuf],
+        reason: &'static str,
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        let matches_key = removed_path_key_matcher(removed);
+
+        // メイン fullscreen は「再生中の VideoPlayer が対象 path を掴んでいる」ときだけ
+        // 閉じる (fs_cache clear で player が drop され handle が解放される)。静止画は
+        // 閉じない: メイン文脈は削除完了後に `remove_items_batch` が fullscreen_idx を
+        // 隣へスライドする既存の再整合を持つので、閲覧継続の UX を維持する
+        // (窓を閉じるのは再整合を持たない detached/parked bundle 側だけ)。
+        if let Some(idx) = self.fullscreen_idx {
+            let player_matches = matches!(
+                self.fs_cache.get(&idx),
+                Some(FsCacheEntry::Video { player, .. })
+                    if matches_key(&crate::adjustment_db::normalize_path(player.path()))
+            );
+            if player_matches {
+                crate::logger::log(format!(
+                    "[removed-path] close main fullscreen (playing target) reason={reason}"
+                ));
+                self.close_fullscreen();
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // active detached (live bundle) が対象を表示 / 再生中なら閉じる。
+            let active_matches = self
+                .active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|c| viewer_bundle_references_removed(&c.bundle, &matches_key));
+            if active_matches {
+                crate::logger::log(format!(
+                    "[removed-path] close active detached reason={reason}"
+                ));
+                self.close_current_active_detached_viewer_context(ctx);
+            }
+
+            // passive / parked 窓 (parked-live メディア含む)。ctx 不要の close 経路
+            // (`close_parked_live_media_windows_for_new_media` と同じ手順) で閉じる。
+            let ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .filter(|w| detached_window_references_removed(w, &matches_key))
+                .map(|w| w.id)
+                .collect();
+            if !ids.is_empty() {
+                self.log_detached_image_window_debug(format!(
+                    "close_for_removed_path ids={ids:?} reason={reason}"
+                ));
+                for id in &ids {
+                    self.transition_detached_window_state(
+                        *id,
+                        DetachedWindowState::Closing,
+                        reason,
+                    );
+                    self.detached_image_window_close_pending.push(*id);
+                    self.clear_detached_window_hwnd_for_window_id(*id);
+                }
+                self.detached_image_windows
+                    .retain(|window| !ids.contains(&window.id));
+                for id in ids {
+                    self.remove_detached_window_runtime(id, reason);
+                }
+                self.prune_deferred_detached_image_window_views();
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+
+        // ラウドネス測定 (音量スキャン) ワーカーも App-global で対象ファイルを開いている。
+        // parked bundle の close は `cleanup_normalize_state_for_fs_idx` を通らないため、
+        // 削除対象をスキャン中なら path 一致で cancel する (Sol 角度④検収 P2 その2。
+        // fs_idx は文脈依存なので使わない)。
+        if self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|st| matches_key(&crate::adjustment_db::normalize_path(&st.file_path)))
+        {
+            if let Some(st) = self.normalize_state.take() {
+                crate::logger::log(format!(
+                    "[removed-path] cancel normalize scan reason={reason}"
+                ));
+                st.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // 音楽解析ワーカーは bundle 所有ではなく App-global で、対象ファイルを FFmpeg decode
+        // 用に開いている。窓や player を閉じても解析側の handle は残るため、削除対象が解析中
+        // ならここで破棄する (Sol 角度④検収 P2)。解析はキャンセル可 (decode 毎パケット +
+        // 解析 bin/FFT 窓単位) なので handle は数 ms で閉じる。窓 close の後に呼ぶこと
+        // (現在ビューの teardown 順を既存経路と揃えるため)。
+        let current_analysis_matches = self
+            .music_analysis_path
+            .as_deref()
+            .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p)));
+        if current_analysis_matches {
+            crate::logger::log(format!(
+                "[removed-path] clear music view state reason={reason}"
+            ));
+            self.clear_music_view_state();
+        } else if self
+            .music_analysis_pending
+            .as_ref()
+            .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(&p.path)))
+        {
+            // 現在ビューは別ファイルだが、走行中ワーカーが削除対象を開いているケース
+            // (連続切替直後など)。ビュー状態には触れず解析だけ止める。
+            crate::logger::log(format!(
+                "[removed-path] cancel stale music analysis reason={reason}"
+            ));
+            self.cancel_music_analysis();
+        }
+    }
+
+    /// 削除 (成功分) / リネーム (旧 path) に対応する動画再生位置の記録を破棄する
+    /// (角度④ (A): 消えた path のキーで resume が残る / 書き戻されるのを防ぐ)。
+    /// フォルダ / コンテナの削除は配下キーもまとめて落とす。
+    pub(crate) fn purge_video_resume_positions_for_removed_paths(
+        &mut self,
+        removed: &[std::path::PathBuf],
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        let matches_key = removed_path_key_matcher(removed);
+        self.settings
+            .video_resume_positions
+            .retain(|key, _| !matches_key(key));
+        self.video_resume_thumb_last_request
+            .retain(|key, _| !matches_key(key));
+    }
+
+    /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
+    fn rename_migration_data_dir(&self) -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(dir) = &self.rename_migration_data_dir_override {
+            return dir.clone();
+        }
+        crate::data_dir::get()
+    }
+
+    /// ジャーナル (`rename_key_migration::JOURNAL_FILE`) を現在の未完了ジョブ集合
+    /// (in-flight + queue + boot_retry) で書き直す。enqueue / 完了 / Disconnected の
+    /// 状態変化ごとに呼ぶ (best-effort、失敗はログのみ)。
+    fn persist_rename_migration_journal(&self) {
+        let mut entries: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        if let Some(job) = &self.rename_migration_in_flight {
+            entries.push((job.old_path.clone(), job.new_path.clone()));
+        }
+        entries.extend(self.rename_migration_queue.iter().cloned());
+        entries.extend(self.rename_migration_boot_retry.iter().cloned());
+        crate::rename_key_migration::journal_save(&self.rename_migration_data_dir(), &entries);
+    }
+
+    /// 前セッションの未完了ジャーナルを読み込んでキューへ積む。最初の enqueue / poll の
+    /// 前に必ず 1 回呼ばれる (先に enqueue の persist が走ると回復エントリを上書き
+    /// してしまうため、lazy guard で担保する)。移行は冪等なので、クラッシュで途中まで
+    /// 走ったジョブを再実行しても安全 (角度⑤ Sol/Terra P1)。
+    fn ensure_rename_migration_journal_loaded(&mut self) {
+        if self.rename_migration_journal_loaded {
+            return;
+        }
+        self.rename_migration_journal_loaded = true;
+        let entries = crate::rename_key_migration::journal_load(&self.rename_migration_data_dir());
+        if entries.is_empty() {
+            return;
+        }
+        crate::logger::log(format!(
+            "[RENAME-MIG] recovering {} unfinished migration(s) from journal",
+            entries.len()
+        ));
+        self.rename_migration_queue.extend(entries);
+    }
+
+    /// 削除に成功した path を**新側**に持つ未実行のリネーム移行を破棄する (角度⑦ P1:
+    /// 「A→B を改名 → 移行がタグ書込ゲートで待機中に B を削除」すると、後から走る移行が
+    /// 削除済み B のメタデータ行を作り直してしまう)。フォルダ削除は配下 (`<key>/…`) も対象。
+    /// 実行中 (in-flight) のジョブは中断できないため対象外: その結末は「削除済み path に
+    /// 孤児行が残る」= 通常削除と同じ性質 (mIV は削除時に path-keyed 行を消さない) で許容。
+    pub(crate) fn invalidate_rename_migrations_for_removed_paths(
+        &mut self,
+        removed: &[std::path::PathBuf],
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        // ジャーナル未読込のまま journal 書き戻しをすると回復エントリを失うので先に読む。
+        self.ensure_rename_migration_journal_loaded();
+        let matches_key = removed_path_key_matcher(removed);
+        let keep = |new_path: &std::path::Path| {
+            !matches_key(&crate::adjustment_db::normalize_path(new_path))
+        };
+        let before = self.rename_migration_queue.len() + self.rename_migration_boot_retry.len();
+        self.rename_migration_queue.retain(|(_, new)| keep(new));
+        self.rename_migration_boot_retry
+            .retain(|(_, new)| keep(new));
+        let after = self.rename_migration_queue.len() + self.rename_migration_boot_retry.len();
+        if after != before {
+            crate::logger::log(format!(
+                "[RENAME-MIG] dropped {} migration(s) targeting deleted path(s)",
+                before - after
+            ));
+            self.persist_rename_migration_journal();
+        }
+    }
+
+    /// リネーム成功後に path-keyed 永続データの移行ジョブを FIFO キューへ積む
+    /// ([`crate::rename_key_migration`]、対象ストアと制限はモジュール doc 参照)。
+    /// DB の cold open が UI を止めないよう worker スレッドで実行し、完了は
+    /// `poll_rename_migration_pending` が拾って in-memory キャッシュを引き直す。
+    /// ジョブはジャーナルにも書かれ、終了 / クラッシュ / トレイ Exit
+    /// (`std::process::exit` で `on_exit` を通らない) を跨いでも次回起動時に再実行される。
+    pub(crate) fn spawn_rename_key_migration(
+        &mut self,
+        old_path: std::path::PathBuf,
+        new_path: std::path::PathBuf,
+    ) {
+        self.ensure_rename_migration_journal_loaded();
+        self.rename_migration_queue.push_back((old_path, new_path));
+        self.persist_rename_migration_journal();
+        self.try_start_next_rename_migration();
+    }
+
+    /// リネーム移行の開始を遅らせるべき書込 worker が残っているか。
+    ///
+    /// tags.db はタグ書込 worker が**ジョブ実行時に**キーを解決して書くため、旧 path 宛の
+    /// 実行待ちジョブが残ったまま移行すると、移行後に旧キーの行が復活して失われる
+    /// (Sol rename-mig P2)。worker が空になるまで移行開始を遅らせれば、残ジョブが先に
+    /// 旧キーへ着地し、その後の移行がまとめて新キーへ運ぶので順序が正しくなる。
+    ///
+    /// タグ側は `is_busy()` ではなく **`has_unconsumed_batch()`** を使う: is_busy は
+    /// worker の DB 書込完了で false になるが、UI 側の結果消費 (`poll_tag_write_results` の
+    /// sidecar ミラー書込) はさらに後のフレーム後半に走るため、is_busy だけだと移行開始後に
+    /// 旧 path のサイドカーが書き直される (Sol rename-mig R2 P2)。
+    /// ★の書込 worker (ファイル XMP / 動画サイドカー) も同様に待つ (DB は書かず、
+    /// sidecar 書込は worker 内で完結するので is_busy で足りる)。
+    fn rename_migration_writers_busy(&self) -> bool {
+        let tag_busy = self
+            .tag_write_handle
+            .as_ref()
+            .is_some_and(|h| h.has_unconsumed_batch());
+        let rating_busy = self
+            .rating_write_handle
+            .as_ref()
+            .is_some_and(|h| h.is_busy());
+        tag_busy || rating_busy
+    }
+
+    /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
+    /// 書込 worker が busy の間は開始せず、`poll_rename_migration_pending` が毎フレーム
+    /// 再試行する。
+    fn try_start_next_rename_migration(&mut self) {
+        if self.rename_migration_in_flight.is_some() || self.rename_migration_queue.is_empty() {
+            return;
+        }
+        if self.rename_migration_writers_busy() {
+            return;
+        }
+        let Some((old_path, new_path)) = self.rename_migration_queue.pop_front() else {
+            return;
+        };
+        let data_dir = self.rename_migration_data_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_old = old_path.clone();
+        let worker_new = new_path.clone();
+        match std::thread::Builder::new()
+            .name("rename-key-migration".into())
+            .spawn(move || {
+                // panic は report 化して返す (Disconnected をプロセス死のみに限定する)。
+                // panicked=true の report は poll 側でジャーナルに残し、次回起動で
+                // 冪等に再実行する (残ストア未試行のまま消し込まない、Sol 角度⑤検収)。
+                let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::rename_key_migration::run_at(&data_dir, &worker_old, &worker_new)
+                }))
+                .unwrap_or_else(|_| {
+                    crate::rename_key_migration::RenameMigrationReport {
+                        rows: 0,
+                        errors: vec!["worker panicked".to_string()],
+                        panicked: true,
+                    }
+                });
+                let _ = tx.send(report);
+            }) {
+            Ok(_) => {
+                self.rename_migration_in_flight = Some(RenameMigrationInFlight {
+                    old_path,
+                    new_path,
+                    rx,
+                });
+            }
+            Err(e) => {
+                // ジョブを失わない (Terra 角度⑤ P2): 先頭へ戻して次フレームで再試行する。
+                // ジャーナルにも残っているので、失敗が続いたまま終了しても次回起動で回復する。
+                crate::logger::log(format!("[RENAME-MIG] spawn failed (requeue): {e}"));
+                self.rename_migration_queue.push_front((old_path, new_path));
+            }
+        }
+    }
+
+    /// リネーム移行 worker の完了を受信し、移行後の値で in-memory キャッシュを引き直して
+    /// キューの次ジョブを開始する。ジャーナル回復もここが起点 (初回呼び出しで読込)。
+    pub(crate) fn poll_rename_migration_pending(&mut self, ctx: &egui::Context) {
+        self.ensure_rename_migration_journal_loaded();
+        // ドラッグ中で繰り延べた main 文脈の再構築を、ドラッグが終わったフレームで実行。
+        if self.rename_rehydrate_main_deferred && self.adjustment_drag_session.is_none() {
+            self.rename_rehydrate_main_deferred = false;
+            self.rehydrate_mounted_context_after_rename();
+        }
+        if let Some(job) = self.rename_migration_in_flight.as_ref() {
+            match job.rx.try_recv() {
+                Ok(report) => {
+                    let job = self
+                        .rename_migration_in_flight
+                        .take()
+                        .expect("guarded above");
+                    if report.panicked {
+                        // panic = 残ストアを試行しないまま中断した可能性がある。per-store
+                        // エラー (全ストア試行済み) と違って消し込まず、ジャーナルに残して
+                        // 次回起動で冪等に再実行する (Sol 角度⑤検収)。セッション内での
+                        // 再試行はしない (決定的 panic の無限ループ回避)。
+                        crate::logger::log("[RENAME-MIG] worker panicked (boot retry)".to_string());
+                        self.show_feedback_toast(
+                            "名前変更に伴う設定の引き継ぎが中断されました (次回起動時に再実行します)"
+                                .to_string(),
+                        );
+                        self.rename_migration_boot_retry
+                            .push((job.old_path, job.new_path));
+                        self.persist_rename_migration_journal();
+                        self.try_start_next_rename_migration();
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                        return;
+                    }
+                    // report を受信できたジョブはジャーナルから消し込む (per-store エラーは
+                    // 通常経路と同じ best-effort = 再試行しない)。
+                    self.persist_rename_migration_journal();
+                    crate::logger::log(format!(
+                        "[RENAME-MIG] done rows={} errors={}",
+                        report.rows,
+                        report.errors.len()
+                    ));
+                    for e in report.errors.iter().take(3) {
+                        crate::logger::log(format!("[RENAME-MIG] error: {e}"));
+                    }
+                    if !report.errors.is_empty() {
+                        self.show_feedback_toast(format!(
+                            "名前変更に伴う設定の引き継ぎに一部失敗しました ({} 件)",
+                            report.errors.len()
+                        ));
+                    }
+                    // presence set / resume キーを引き直す。通常経路では rename 成功時に
+                    // 書換済みで no-op だが、ジャーナル回復ジョブ (起動後に走る) では
+                    // 起動時ロードが旧キーを読んでいるためここでの書換が本番になる。
+                    self.rewrite_page_edit_presence_for_rename(&job.old_path, &job.new_path);
+                    self.migrate_video_resume_positions_for_renamed_path(
+                        &job.old_path,
+                        &job.new_path,
+                    );
+                    // ★ / タグの path-keyed 表示キャッシュはグローバルに引き直す (安全)。
+                    self.rating_cache.clear();
+                    self.invalidate_rating_counts_cache();
+                    self.tags_cache.clear();
+                    // idx キーのページ編集 state は「リネームに関係する文脈」だけ再構築する。
+                    // 旧実装の全文脈 clear_page_edit_state は、無関係な画像の編集中ドラッグ値
+                    // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
+                    // (角度⑦ P1、Sol/Terra/Luna 一致)。
+                    self.rehydrate_contexts_after_rename_migration(&job.old_path, &job.new_path);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // report が届かないままプロセス内で消息不明 (通常は起きない: panic は
+                    // catch して report 化している)。セッション内では再試行せず、ジャーナルに
+                    // 残して次回起動で回復させる。
+                    let job = self
+                        .rename_migration_in_flight
+                        .take()
+                        .expect("guarded above");
+                    crate::logger::log("[RENAME-MIG] worker disconnected".to_string());
+                    self.rename_migration_boot_retry
+                        .push((job.old_path, job.new_path));
+                    self.persist_rename_migration_journal();
+                }
+            }
+        }
+        self.try_start_next_rename_migration();
+        if self.rename_migration_in_flight.is_some() || !self.rename_migration_queue.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// リネーム移行の完了後、影響を受ける文脈 (mounted main / active detached /
+    /// parked bundle) の idx キー編集 state と★キャッシュを DB から再構築する
+    /// (角度⑦ P1/P2)。無関係な文脈には一切触れない。
+    ///
+    /// - main: 改名アイテムの親フォルダを表示中 (または改名フォルダ配下) のときだけ。
+    ///   補正スライダーのドラッグ中は据え置き、ドラッグ終了後のフレームで実行する
+    ///   (ドラッグ値の消失 → 離した時に既存補正が削除される事故を防ぐ、Terra 角度⑦)。
+    /// - active/parked bundle: 移行ギャップ中に新 path を開いて旧 DB 状態のまま hydrate
+    ///   した bundle は再活性化しても再読込されない (Sol/Terra 角度⑦ P2) ため、
+    ///   `poll_parked_live_detached_windows` と同じ swap 手順で一時 mount して再構築する。
+    ///   parked bundle は編集中ではないので即時で安全。
+    fn rehydrate_contexts_after_rename_migration(
+        &mut self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) {
+        let removed = [old_path.to_path_buf(), new_path.to_path_buf()];
+        let matches_key = removed_path_key_matcher(&removed);
+        let parent_keys: Vec<String> = [old_path.parent(), new_path.parent()]
+            .into_iter()
+            .flatten()
+            .map(crate::adjustment_db::normalize_path)
+            .collect();
+        let folder_refs = |folder: Option<&std::path::Path>| -> bool {
+            folder.is_some_and(|f| {
+                let fk = crate::adjustment_db::normalize_path(f);
+                matches_key(&fk) || parent_keys.iter().any(|p| *p == fk)
+            })
+        };
+        // 全体検索 / サブ展開などの合成ビューは current_folder が合成 path のため
+        // フォルダ照合に掛からない。items にリネーム対象が含まれるかも見る
+        // (Sol 角度⑦検収 P2。リネームは稀な操作なので O(items) 走査を許容)。
+        let items_ref = |items: &[crate::grid_item::GridItem]| -> bool {
+            items.iter().any(|item| {
+                item.drag_source_path()
+                    .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p)))
+            })
+        };
+
+        if folder_refs(self.current_folder.as_deref()) || items_ref(&self.items) {
+            if self.adjustment_drag_session.is_some() {
+                self.rename_rehydrate_main_deferred = true;
+            } else {
+                self.rehydrate_mounted_context_after_rename();
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let active_matches = self
+                .active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|c| {
+                    viewer_bundle_references_removed(&c.bundle, &matches_key)
+                        || folder_refs(c.bundle.current_folder.as_deref())
+                        || items_ref(&c.bundle.items)
+                });
+            if active_matches {
+                if let Some(ctx_state) = self.active_detached_viewer_context.take() {
+                    let mut bundle = ctx_state.bundle;
+                    self.swap_viewer_context_bundle(&mut bundle);
+                    self.rehydrate_mounted_context_after_rename();
+                    self.swap_viewer_context_bundle(&mut bundle);
+                    self.active_detached_viewer_context =
+                        Some(ActiveDetachedViewerContext { bundle });
+                }
+            }
+            let idxs: Vec<usize> = self
+                .detached_image_windows
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| {
+                    w.paused_bundle.as_deref().is_some_and(|b| {
+                        viewer_bundle_references_removed(b, &matches_key)
+                            || folder_refs(b.current_folder.as_deref())
+                            || items_ref(&b.items)
+                    })
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for i in idxs {
+                let Some(mut bundle) = self.detached_image_windows[i].paused_bundle.take() else {
+                    continue;
+                };
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.rehydrate_mounted_context_after_rename();
+                self.swap_viewer_context_bundle(&mut bundle);
+                self.detached_image_windows[i].paused_bundle = Some(bundle);
+            }
+        }
+    }
+
+    /// mounted 文脈の per-page 編集 state (idx キー) と★/タグ表示キャッシュを DB から
+    /// 再構築する。`rehydrate_page_edit_state_for_current_items` は移行後の DB を読むので
+    /// 値は正しくなる。
+    fn rehydrate_mounted_context_after_rename(&mut self) {
+        let Some(folder) = self.current_folder.clone() else {
+            return;
+        };
+        self.rehydrate_page_edit_state_for_current_items(&folder);
+        self.rating_cache.clear();
+        self.current_folder_rating_cache = None;
+        self.tags_cache.clear();
+    }
+
+    /// リネームに合わせて、編集済みバッジ用の presence set (起動時に全 DB キーを読み込む
+    /// グローバル集合) のキーを in-memory で書き換える。DB 側の移行
+    /// (`rename_key_migration`) と同じ exact + `/` + `::` の 3 面規則。
+    pub(crate) fn rewrite_page_edit_presence_for_rename(
+        &mut self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) {
+        let old_k = crate::adjustment_db::normalize_path(old_path);
+        let new_k = crate::adjustment_db::normalize_path(new_path);
+        if old_k == new_k {
+            return;
+        }
+        rewrite_key_set_for_rename(&mut self.adjusted_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.local_adjust_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.mask_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.conceal_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.comic_page_keys, &old_k, &new_k);
+    }
+
+    /// リネームに合わせて動画再生位置の in-memory 記録キーを付け替える (DB 側は settings
+    /// 保存時に反映される)。削除時の `purge_video_resume_positions_for_removed_paths` と
+    /// 対になる移行版。
+    pub(crate) fn migrate_video_resume_positions_for_renamed_path(
+        &mut self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) {
+        let old_k = crate::adjustment_db::normalize_path(old_path);
+        let new_k = crate::adjustment_db::normalize_path(new_path);
+        if old_k == new_k {
+            return;
+        }
+        migrate_key_map_for_rename(&mut self.settings.video_resume_positions, &old_k, &new_k);
+        migrate_key_map_for_rename(&mut self.video_resume_thumb_last_request, &old_k, &new_k);
+    }
+
     /// 削除ワーカーを spawn し、`delete_pending` に保持する。
     /// 既に実行中の場合は何もしない (UI 側でダイアログ表示中はボタン無効化する前提)。
-    pub(crate) fn start_delete_files(&mut self, paths: Vec<std::path::PathBuf>) {
+    /// 対象を表示・再生中の窓は spawn 前に閉じる (decoder handle 解放、上記 (B))。
+    pub(crate) fn start_delete_files(
+        &mut self,
+        ctx: &egui::Context,
+        paths: Vec<std::path::PathBuf>,
+    ) {
         if paths.is_empty() || self.delete_pending.is_some() {
             return;
         }
+        self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
         // 削除中に items を差し替える恐れのある in-flight pending を停止。poll_delete_pending
         // は path で現 items に引き直すので世代一致は厳密には不要だが、余計な再描画・
         // キャッシュ無効化を避けるため事前に静かにしておく。
@@ -19434,6 +20360,12 @@ impl App {
         if succeeded.is_empty() {
             return;
         }
+
+        // 消えた path の再生位置記録を破棄する (角度④ (A)。窓のクローズは
+        // `start_delete_files` が worker spawn 前に済ませている)。
+        self.purge_video_resume_positions_for_removed_paths(&succeeded);
+        // 消えた path を新側に持つ未実行のリネーム移行も破棄する (角度⑦ P1)。
+        self.invalidate_rename_migrations_for_removed_paths(&succeeded);
 
         // 成功 path を現在の items から引き直して idx 配列を作る。
         // items が途中で入れ替わっても (Ctrl+G 結果差し替え等) 現 items に残っている分だけ
@@ -26793,20 +27725,24 @@ impl App {
         })
     }
 
-    /// ParkedLive のメディア窓が「音楽ビュー」(音声ファイル or 音声モードの動画) として
-    /// 生きているか。music_* (解析ワーカー / PCM / spectrum / timeline cache) は bundle に
-    /// 入れず global のまま parked 窓も消費する設計 (stage-audio §3.5、毎フレームの
-    /// `update_parked_live_audio_music_view_state`) なので、これが true の間はメイン文脈の
-    /// open/close が global music_* を破棄してはいけない (review-v2.3.0 P2-3)。
+    /// active / ParkedLive の別メディア窓が音楽ビューを所有しているか。
+    /// music_* は bundle に入れない App-global 状態なので、別窓の bundle が参照中は
+    /// main 文脈の open/close から破棄してはいけない (review-v2.3.0 P2-3)。
     #[cfg(windows)]
-    pub(crate) fn parked_live_music_window_exists(&self) -> bool {
-        self.detached_image_windows.iter().any(|window| {
-            self.detached_window_state_is_parked_live(window.id)
-                && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                    self.viewer_context_bundle_music_window_info(bundle)
-                        .is_some()
-                })
-        })
+    pub(crate) fn detached_music_window_exists(&self) -> bool {
+        self.active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| {
+                self.viewer_context_bundle_music_window_info(&active.bundle)
+                    .is_some()
+            })
+            || self.detached_image_windows.iter().any(|window| {
+                self.detached_window_state_is_parked_live(window.id)
+                    && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                        self.viewer_context_bundle_music_window_info(bundle)
+                            .is_some()
+                    })
+            })
     }
 
     #[cfg(windows)]
@@ -29642,7 +30578,12 @@ impl App {
             return false;
         }
 
-        if self.viewer_item_supports_detached_still(idx) {
+        // 音声 (音楽ビュー) は still と同じ egui viewport が描くので、still と同じ
+        // focus コマンドで前面化する。Video 限定の raise 分岐だけだと Audio が素通りし、
+        // 再生中の音声をグリッドで再クリックしても無反応になる (Sol P2)。
+        if self.viewer_item_supports_detached_still(idx)
+            || matches!(self.items.get(idx), Some(GridItem::Audio(_)))
+        {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
@@ -34936,7 +35877,7 @@ impl App {
         }
         #[cfg(windows)]
         if !matches!(self.items.get(idx), Some(GridItem::Video(_)))
-            && self.parked_live_music_window_exists()
+            && self.detached_music_window_exists()
         {
             return false;
         }
@@ -36310,14 +37251,14 @@ impl App {
         self.clear_fullscreen_tag_picker_state();
         // 音楽ビュー (Inc 3b/4) の解析ワーカー + row raster + spectrum worker + PCM を止めて捨てる
         // (フルスクリーンを抜けたら別ファイル扱い。§7.9 grid/viewer lifecycle)。
-        // ただし ParkedLive の音楽窓が global music_* を消費中なら破棄しない。このとき閉じて
-        // いるのは非音楽セッション — メディア窓 1 本規則により、音楽セッションと parked
-        // 音楽窓は併存しない (review-v2.3.0 P2-3)。
+        // ただし別メディア窓の active / ParkedLive bundle が global music_* を消費中なら
+        // 破棄しない。実際のメディア窓 close は bundle を mount してからここへ入るため、
+        // その場合は consumer が残らず従来どおり teardown される (review-v2.3.0 P2-3)。
         #[cfg(windows)]
-        let parked_music_alive = self.parked_live_music_window_exists();
+        let detached_music_alive = self.detached_music_window_exists();
         #[cfg(not(windows))]
-        let parked_music_alive = false;
-        if !parked_music_alive {
+        let detached_music_alive = false;
+        if !detached_music_alive {
             self.clear_music_view_state();
         }
         // 「動画→音声モード」(Inc 7) はフルスクリーンを閉じたら終わる。動画プレイヤーはこの後
@@ -36379,27 +37320,10 @@ impl App {
         }
         // Phase 8.B': 動画ピン留めが変更されていたら現在フォルダを再ロードして
         // グリッドサムネに反映 (= ピンの WebP がグリッド表示に出る)。
-        if std::mem::take(&mut self.video_thumb_overrides_dirty) {
-            if self.items_are_subfolder_expansion_view {
-                // 同じ snapshot を再適用して動画ピンの WebP を再取得する。
-                if !self.reinstall_subfolder_expansion_snapshot()
-                    && let Some(root) = self.subfolder_expansion_root.clone()
-                {
-                    let roots = if self.subfolder_expansion_roots.is_empty() {
-                        vec![root.clone()]
-                    } else {
-                        self.subfolder_expansion_roots.clone()
-                    };
-                    self.start_subfolder_expansion_scan_roots(root, roots);
-                }
-            } else if let Some(cur) = self.current_folder.clone()
-                && !is_synthetic_view_path(&cur)
-            {
-                // 現フォルダ + 履歴を温存したまま再ロード
-                self.folder_history.remove(&cur);
-                self.load_folder(cur);
-            }
-        }
+        // close_fullscreen + メインの update 両方から拾うため共通ヘルパー経由
+        // (folder_thumb_pin_dirty と同じ構造。フル機能モード + メディア別ウィンドウ
+        // では close_fullscreen を通らずメイン窓のグリッドが開きっぱなしになるため)。
+        self.consume_video_thumb_overrides_dirty();
         // 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネピンが書き換わっていたら
         // 同じく現フォルダを再ロードしてグリッドに反映する。
         // close_fullscreen + メインの update 両方から拾うため共通ヘルパー経由
@@ -42421,11 +43345,37 @@ impl App {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
+                    // メイン側へ切り替えた場合だけ案内を出す: 「この表示先はビューア内の
+                    // 前後ナビでも維持され、グリッドから開き直すと別ウィンドウへ戻る」
+                    // ことが見えず、設定が壊れたと誤認されるため (実機 FB 2026-07-10)。
+                    // 別ウィンドウへ戻る方向は映像移動が視覚的に自明なので無通知のまま。
+                    // 旧廃止理由 (両ビューポートの二重表示ちらつき、2026-07-02) は
+                    // 面 routing (ActionSurface::Viewer) の単面表示で解消済み。
+                    let announce_main_hint =
+                        !matches!(target_presentation, ViewerPresentation::DetachedWindow);
                     if self
                         .fullscreen_idx
                         .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
                     {
+                        // switch はタイルモード / player 未 ready / rect 解決失敗などで
+                        // no-op になり得る。新しい placement 切替要求が実際に発行されたかを
+                        // request_id の変化で観測する (Codex P3)。さらに案内トーストは
+                        // 要求発行時ではなく **切替の確定** (`PlacementSwitched` 適用) 時に
+                        // 出す — presenter 無応答で切り替わらなかったのに「切り替えました」を
+                        // 表示しない (Sol P2)。pending にフラグを焼き、確定側が発火する。
+                        let request_before = self
+                            .native_video_mode_switch
+                            .map(|pending| pending.request_id);
                         self.switch_native_video_viewer_presentation(target_presentation, true);
+                        let switch_started = self
+                            .native_video_mode_switch
+                            .is_some_and(|pending| Some(pending.request_id) != request_before);
+                        if switch_started
+                            && announce_main_hint
+                            && let Some(pending) = self.native_video_mode_switch.as_mut()
+                        {
+                            pending.announce_main_hint = true;
+                        }
                     } else if let Some(idx) = self.fullscreen_idx
                         && self.viewer_item_supports_egui_detached_viewport(idx)
                     {
@@ -42434,12 +43384,12 @@ impl App {
                             target_presentation,
                             "always_new_media_f12",
                         );
+                        // egui 経路は同期適用なのでここで即案内する。
+                        if announce_main_hint {
+                            self.show_media_window_main_hint_toast();
+                        }
                     }
                 }
-                // 切替トースト (「このメディアを別ウィンドウへ/メインウィンドウへ切り替えます」) は
-                // 出さない。切替中は main と detached の両ビューポートがフィードバックトーストを
-                // 描くため右上に二重表示されてちらつく (実機 FB 2026-07-02)。切替自体は映像が
-                // 移動するので視覚的に自明。
                 return;
             }
         }
@@ -42512,6 +43462,21 @@ impl App {
     /// 代わりに native overlay トーストへ送る (egui ビューアは presenter の下で不可視)。
     /// 音声モード (`fs_music_view_active`) 中は presenter が hidden なので egui 側を使う。
     pub(crate) fn show_feedback_toast_on(&mut self, text: String, surface: ActionSurface) {
+        self.show_feedback_toast_on_with_duration(
+            text,
+            surface,
+            crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
+        );
+    }
+
+    /// `show_feedback_toast_on` の表示秒数指定版。長めの案内文向け
+    /// (native overlay へ送る場合は linger として同じ秒数を渡す)。
+    pub(crate) fn show_feedback_toast_on_with_duration(
+        &mut self,
+        text: String,
+        surface: ActionSurface,
+        duration_secs: f32,
+    ) {
         #[cfg(windows)]
         if matches!(surface, ActionSurface::Viewer) {
             let native_overlay_visible = self.fullscreen_idx.is_some_and(|fs_idx| {
@@ -42519,15 +43484,15 @@ impl App {
                     && !self.fs_music_view_active(fs_idx)
             });
             if native_overlay_visible {
-                self.show_native_video_overlay_toast(text, false);
+                self.show_native_video_overlay_toast_with_linger(
+                    text,
+                    false,
+                    Some(std::time::Duration::from_secs_f32(duration_secs)),
+                );
                 return;
             }
         }
-        self.fs_feedback_toast = Some((
-            text,
-            std::time::Instant::now(),
-            crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
-        ));
+        self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
         self.fs_feedback_toast_reveal_path = None;
         self.fs_feedback_toast_surface = Some(surface);
     }
@@ -42537,6 +43502,18 @@ impl App {
         self.fs_feedback_toast_reveal_path = None;
         self.fs_feedback_toast_surface = None;
         self.fs_boundary_hint = None;
+    }
+
+    /// メディア窓 → メイン切替 (F12/リング) の案内トースト (実機 FB 2026-07-10)。
+    /// egui 経路は切替と同期に、native 動画経路は `PlacementSwitched` 確定時に呼ばれる。
+    #[cfg(windows)]
+    pub(crate) fn show_media_window_main_hint_toast(&mut self) {
+        self.show_feedback_toast_on_with_duration(
+            "メインウィンドウ表示に切り替えました。グリッドから開き直すと別ウィンドウで再生されます"
+                .to_string(),
+            ActionSurface::Viewer,
+            3.5,
+        );
     }
 
     /// native ファイル D&D 完了後のトーストをまとめて出す。
@@ -47156,6 +48133,7 @@ impl eframe::App for App {
         self.poll_file_drop_pending();
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
+        self.poll_rename_migration_pending(ctx);
         self.poll_capture_pending(ctx);
         self.poll_book_op_pending(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
@@ -47839,6 +48817,10 @@ impl eframe::App for App {
         if !main_viewer_blocked {
             self.consume_export_folder_refresh_pending();
             self.consume_folder_thumb_pin_dirty();
+            // メディア別ウィンドウ (フル機能モード) の P ピンをメイン窓のグリッドへ
+            // 即時反映する。従来は close_fullscreen でしか consume されず、メイン窓の
+            // グリッドが開きっぱなしの構成では反映契機が無かった。
+            self.consume_video_thumb_overrides_dirty();
         }
 
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────

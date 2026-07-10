@@ -74,3 +74,23 @@ Clean. `Ok` and `Disconnected` now both produce `received` and fall through to t
 - The previous bypass is gone.
 
 Verification: `cargo test stack_aggregation_park_keeps_media_playing_and_main_folder` passed.
+## F12/リング メディア切替の案内トースト (2026-07-10 実機 FB)
+
+[P3] [src/app.rs](C:/home/mimageviewer/src/app.rs:42424): video main-direction toast can fire even when the video placement switch is a no-op. `switch_native_video_viewer_presentation` can return early when tile mode is active, the video player/cache is not ready, or target rect resolution fails ([src/app/native_video.rs](C:/home/mimageviewer/src/app/native_video.rs:2125)). The always-new media branch then still emits “メインウィンドウ表示に切り替えました...” at [src/app.rs](C:/home/mimageviewer/src/app.rs:42444), although `viewer_presentation` may still be `DetachedWindow` and no setting changed. Audio/egui migration does not have this problem because `apply_egui_viewer_presentation_for_current_item` applies synchronously.
+
+Everything else checked clean: the toast is inside `target != current` and non-detached gating, all production F12/ring/HUD/gamepad paths funnel through `toggle_detached_viewer_mode`, no other production caller of `always_new_media_f12_target_presentation` emits feedback, and native overlay linger passes the requested duration through.
+
+Verification: `cargo fmt --check` passed. Targeted `cargo test` / `cargo check` could not complete in this environment due Windows pagefile/access-denied failures in `target`/target-dir creation, not a Rust diagnostic from this diff.
+### P3 (no-op ゲート) 修正後
+
+Clean.
+
+`switch_started` gating is correct in the diff:
+
+- Native video no-op paths leave `native_video_mode_switch` unchanged, so no toast.
+- A real native placement request writes a new pending request id, so the main-direction hint fires.
+- Expired pending is handled: the outer in-flight gate lets it through, `switch_native_video_viewer_presentation` replaces it after incrementing `native_video_mode_switch_seq`, so `request_after != request_before`.
+- Egui/audio path is synchronous and sets `switch_started = true`.
+- Detached-direction remains silent because the toast still requires non-`DetachedWindow`.
+
+Checks run: `git diff --check -- src/app.rs src/app/tests.rs` and `cargo fmt --check`, both passed.

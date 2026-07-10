@@ -159,6 +159,14 @@ impl TagWriteHandle {
             || self.pending_in_writer.load(Ordering::Relaxed) > 0
     }
 
+    /// 直前バッチが **UI (完了 poll) に消費される**まで true。
+    /// worker は結果送信前に `done` を進めるため `is_busy()` は一足先に false へ
+    /// 落ちるが、`total` は完了 poll の `reset_counters_if_idle` まで残る。
+    /// 「前バッチがまだ完了トーストとして集計されていないか」の判定はこちらを使う。
+    pub fn has_unconsumed_batch(&self) -> bool {
+        self.is_busy() || self.total.load(Ordering::Relaxed) > 0
+    }
+
     pub fn reset_counters_if_idle(&self) {
         if !self.is_busy() {
             self.total.store(0, Ordering::Relaxed);

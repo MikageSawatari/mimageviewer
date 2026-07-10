@@ -230,6 +230,23 @@ pub fn analyze_stereo_timeline(
     sample_rate: u32,
     config: AnalysisConfig,
 ) -> TimelineAnalysis {
+    analyze_stereo_timeline_cancellable(stereo_samples, sample_rate, config, &|| false)
+        .expect("never-abort analysis cannot return None")
+}
+
+/// `analyze_stereo_timeline` の協調キャンセル版。`should_abort` を bin 集計ループと
+/// chroma FFT の窓ループで確認し、true になったら `None` を返して即座に抜ける。
+///
+/// 長尺ファイル (数時間) の解析は 1 パス数秒〜数十秒かかり、その間ワーカーは全尺 PCM
+/// (数 GB 級) の `Arc` を保持し続ける。キャンセル不可のままだとファイル連続切替で
+/// 放棄ワーカーの PCM が重なって積み上がるため、解析自体を中断可能にしている
+/// (v2.3.0 leak-hunt P1)。
+pub fn analyze_stereo_timeline_cancellable(
+    stereo_samples: &[f32],
+    sample_rate: u32,
+    config: AnalysisConfig,
+    should_abort: &dyn Fn() -> bool,
+) -> Option<TimelineAnalysis> {
     let sample_rate = sample_rate.max(1);
     let frame_count = stereo_samples.len() / 2;
     let duration_secs = frame_count as f64 / sample_rate as f64;
@@ -245,6 +262,9 @@ pub fn analyze_stereo_timeline(
     let mid_alpha = one_pole_alpha(config.mid_cut_hz, sample_rate);
     let mut frame_start = 0usize;
     while frame_start < frame_count {
+        if should_abort() {
+            return None;
+        }
         let frame_end = (frame_start + frames_per_bin).min(frame_count);
         let mut peak = 0.0_f32;
         let mut square_sum = 0.0_f64;
@@ -352,13 +372,25 @@ pub fn analyze_stereo_timeline(
 
         frame_start = frame_end;
     }
-    apply_timeline_summary_metrics(&mut bins, config.bin_secs);
-    apply_chroma_metrics(&mut bins, stereo_samples, sample_rate, config.bin_secs);
-    apply_novelty_scores(&mut bins, config.bin_secs);
+    if !apply_timeline_summary_metrics(&mut bins, config.bin_secs, should_abort) {
+        return None;
+    }
+    if !apply_chroma_metrics(
+        &mut bins,
+        stereo_samples,
+        sample_rate,
+        config.bin_secs,
+        should_abort,
+    ) {
+        return None;
+    }
+    if !apply_novelty_scores(&mut bins, config.bin_secs, should_abort) {
+        return None;
+    }
 
-    let beat_grid = estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs);
+    let beat_grid = estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs, should_abort)?;
 
-    TimelineAnalysis::new(
+    Some(TimelineAnalysis::new(
         AudioStreamInfo {
             sample_rate,
             channels: 2,
@@ -367,7 +399,7 @@ pub fn analyze_stereo_timeline(
         config,
         bins,
         beat_grid,
-    )
+    ))
 }
 
 pub fn resample_linear_stereo(input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
@@ -813,9 +845,16 @@ fn normalize_range(value: f32, low: f32, high: f32) -> f32 {
     ((value - low) / (high - low)).clamp(0.0, 1.0)
 }
 
-fn apply_timeline_summary_metrics(bins: &mut [WaveformBin], bin_secs: f64) {
+/// 概況メトリクス (transient_density / brightness) を bins に焼き込む。窓スキャンが
+/// O(bins × radius) で長尺 (10ms bin × 数時間 = 百万 bin 級) では秒単位かかるため、
+/// `ABORT_CHECK_STRIDE` bin ごとに `should_abort` を確認し、中断したら `false` を返す。
+fn apply_timeline_summary_metrics(
+    bins: &mut [WaveformBin],
+    bin_secs: f64,
+    should_abort: &dyn Fn() -> bool,
+) -> bool {
     if bins.is_empty() {
-        return;
+        return true;
     }
     let density_radius = (0.70 / bin_secs.max(0.01)).round().max(1.0) as usize;
     let brightness_radius = (1.20 / bin_secs.max(0.01)).round().max(1.0) as usize;
@@ -829,6 +868,9 @@ fn apply_timeline_summary_metrics(bins: &mut [WaveformBin], bin_secs: f64) {
         .collect();
 
     for i in 0..bins.len() {
+        if i % ABORT_CHECK_STRIDE == 0 && should_abort() {
+            return false;
+        }
         let density_start = i.saturating_sub(density_radius);
         let density_end = (i + density_radius + 1).min(bins.len());
         let mut transient_sum = 0.0;
@@ -857,17 +899,26 @@ fn apply_timeline_summary_metrics(bins: &mut [WaveformBin], bin_secs: f64) {
         let lift = smoothstep(0.018, 0.13, high_mid[i] - local_mean);
         bins[i].brightness = (absolute * 0.74 + lift * 0.38).clamp(0.0, 1.0);
     }
+    true
 }
 
+/// 後処理パス (O(bins × radius) の窓スキャン群) での `should_abort` 確認間隔。
+/// 1 iteration が radius ~70-120 の窓走査なので、4096 bin ごとでも確認間隔は
+/// サブミリ秒〜数 ms に収まり、チェックのオーバーヘッドは無視できる。
+const ABORT_CHECK_STRIDE: usize = 4096;
+
+/// chroma / pitch メトリクスを bins に焼き込む。FFT 窓ループごとに `should_abort` を
+/// 確認し、中断したら `false` を返す (bins は部分更新のまま = 呼び出し元が破棄する前提)。
 fn apply_chroma_metrics(
     bins: &mut [WaveformBin],
     stereo_samples: &[f32],
     sample_rate: u32,
     bin_secs: f64,
-) {
+    should_abort: &dyn Fn() -> bool,
+) -> bool {
     let frame_count = stereo_samples.len() / 2;
     if bins.is_empty() || sample_rate == 0 || frame_count == 0 {
-        return;
+        return true;
     }
     let fft_size = TIMELINE_CHROMA_WINDOW_SIZE.min(frame_count).max(64);
     let hop_frames = (TIMELINE_CHROMA_HOP_SECS * sample_rate as f64)
@@ -887,6 +938,9 @@ fn apply_chroma_metrics(
     let mut frames = Vec::new();
     let mut center_frame = 0usize;
     while center_frame < frame_count {
+        if should_abort() {
+            return false;
+        }
         frames.push(analyze_chroma_frame(
             stereo_samples,
             center_frame,
@@ -899,10 +953,13 @@ fn apply_chroma_metrics(
         center_frame = center_frame.saturating_add(hop_frames);
     }
     if frames.is_empty() {
-        return;
+        return true;
     }
 
-    for bin in &mut *bins {
+    for (i, bin) in bins.iter_mut().enumerate() {
+        if i % ABORT_CHECK_STRIDE == 0 && should_abort() {
+            return false;
+        }
         let center_secs = bin.start_secs + bin.duration_secs * 0.5;
         let frame_idx = (center_secs / TIMELINE_CHROMA_HOP_SECS).round().max(0.0) as usize;
         let frame = &frames[frame_idx.min(frames.len() - 1)];
@@ -920,7 +977,7 @@ fn apply_chroma_metrics(
     }
 
     let smooth_radius = (0.42 / bin_secs.max(0.01)).round().max(1.0) as usize;
-    smooth_pitch_confidence(bins, smooth_radius);
+    smooth_pitch_confidence(bins, smooth_radius, should_abort)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1042,9 +1099,15 @@ fn normalize_chroma(
     (normalized, peak_idx as u8, confidence)
 }
 
-fn smooth_pitch_confidence(bins: &mut [WaveformBin], radius: usize) {
+/// pitch confidence の多数決スムージング。O(bins × radius) なので
+/// `ABORT_CHECK_STRIDE` ごとに `should_abort` を確認し、中断で `false` を返す。
+fn smooth_pitch_confidence(
+    bins: &mut [WaveformBin],
+    radius: usize,
+    should_abort: &dyn Fn() -> bool,
+) -> bool {
     if bins.is_empty() || radius == 0 {
-        return;
+        return true;
     }
     let original: Vec<(u8, f32, u8, f32)> = bins
         .iter()
@@ -1058,6 +1121,9 @@ fn smooth_pitch_confidence(bins: &mut [WaveformBin], radius: usize) {
         })
         .collect();
     for i in 0..bins.len() {
+        if i % ABORT_CHECK_STRIDE == 0 && should_abort() {
+            return false;
+        }
         let start = i.saturating_sub(radius);
         let end = (i + radius + 1).min(bins.len());
         let mut bass_votes = [0.0_f32; TIMELINE_CHROMA_CLASSES];
@@ -1079,6 +1145,7 @@ fn smooth_pitch_confidence(bins: &mut [WaveformBin], radius: usize) {
             .key_confidence
             .max(key_conf * 0.50 * key_loudness_gate);
     }
+    true
 }
 
 fn best_vote(votes: &[f32; TIMELINE_CHROMA_CLASSES]) -> (u8, f32) {
@@ -1096,13 +1163,23 @@ fn best_vote(votes: &[f32; TIMELINE_CHROMA_CLASSES]) -> (u8, f32) {
     (best_idx as u8, confidence.clamp(0.0, 1.0))
 }
 
-fn apply_novelty_scores(bins: &mut [WaveformBin], bin_secs: f64) {
+/// 局所変化 (novelty) スコアを bins に焼き込む。O(bins × radius) の特徴量平均を
+/// 2 窓ずつ取るため長尺では重い。`ABORT_CHECK_STRIDE` ごとに `should_abort` を確認し、
+/// 中断で `false` を返す。
+fn apply_novelty_scores(
+    bins: &mut [WaveformBin],
+    bin_secs: f64,
+    should_abort: &dyn Fn() -> bool,
+) -> bool {
     if bins.len() < 4 {
-        return;
+        return true;
     }
     let radius = (1.20 / bin_secs.max(0.01)).round().max(2.0) as usize;
     let mut raw = vec![0.0_f32; bins.len()];
     for i in 0..bins.len() {
+        if i % ABORT_CHECK_STRIDE == 0 && should_abort() {
+            return false;
+        }
         let prev_start = i.saturating_sub(radius);
         let prev_end = i;
         let next_start = i;
@@ -1122,11 +1199,15 @@ fn apply_novelty_scores(bins: &mut [WaveformBin], bin_secs: f64) {
     }
     let smooth_radius = (0.12 / bin_secs.max(0.01)).round().max(1.0) as usize;
     for i in 0..bins.len() {
+        if i % ABORT_CHECK_STRIDE == 0 && should_abort() {
+            return false;
+        }
         let start = i.saturating_sub(smooth_radius);
         let end = (i + smooth_radius + 1).min(bins.len());
         let peak = raw[start..end].iter().copied().fold(0.0_f32, f32::max);
         bins[i].novelty = peak.clamp(0.0, 1.0);
     }
+    true
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1174,9 +1255,16 @@ fn l1_delta(a: &[f32; TIMELINE_CHROMA_CLASSES], b: &[f32; TIMELINE_CHROMA_CLASSE
     a.iter().zip(b).map(|(a, b)| (a - b).abs()).sum::<f32>() / TIMELINE_CHROMA_CLASSES as f32
 }
 
-fn estimate_simple_beat_grid(bins: &[WaveformBin], duration_secs: f64, bin_secs: f64) -> BeatGrid {
+/// BPM 推定。111 通りの BPM 候補 × O(bins) の自己相関で長尺では重い。
+/// BPM 候補ごとに `should_abort` を確認し、中断で `None` を返す。
+fn estimate_simple_beat_grid(
+    bins: &[WaveformBin],
+    duration_secs: f64,
+    bin_secs: f64,
+    should_abort: &dyn Fn() -> bool,
+) -> Option<BeatGrid> {
     if bins.len() < 32 || bin_secs <= 0.0 {
-        return BeatGrid::empty();
+        return Some(BeatGrid::empty());
     }
     let mut onset = vec![0.0_f32; bins.len()];
     for i in 1..bins.len() {
@@ -1191,6 +1279,9 @@ fn estimate_simple_beat_grid(bins: &[WaveformBin], duration_secs: f64, bin_secs:
     let mut best_bpm = 0.0_f32;
     let mut best_score = 0.0_f32;
     for bpm in 70..=180 {
+        if should_abort() {
+            return None;
+        }
         let lag = (60.0 / bpm as f64 / bin_secs).round() as usize;
         if lag < 2 || lag >= onset.len() / 2 {
             continue;
@@ -1207,7 +1298,7 @@ fn estimate_simple_beat_grid(bins: &[WaveformBin], duration_secs: f64, bin_secs:
     }
 
     if best_bpm <= 0.0 {
-        return BeatGrid::empty();
+        return Some(BeatGrid::empty());
     }
 
     let max_onset = onset.iter().copied().fold(0.0_f32, f32::max).max(1.0e-6);
@@ -1220,7 +1311,12 @@ fn estimate_simple_beat_grid(bins: &[WaveformBin], duration_secs: f64, bin_secs:
         .map(|(idx, _)| idx as f64 * bin_secs)
         .unwrap_or(0.0);
 
-    BeatGrid::from_bpm(duration_secs, best_bpm, first_beat, confidence)
+    Some(BeatGrid::from_bpm(
+        duration_secs,
+        best_bpm,
+        first_beat,
+        confidence,
+    ))
 }
 
 #[cfg(test)]
@@ -1273,6 +1369,47 @@ mod tests {
         assert!(analysis.is_current_version());
         assert!(!analysis.bins.is_empty());
         assert!(analysis.bins.iter().any(|b| b.peak > 0.5));
+    }
+
+    #[test]
+    fn analysis_cancellable_aborts_and_matches_when_not_aborted() {
+        let mut samples = Vec::new();
+        for i in 0..48_000 {
+            let x = if i % 4800 < 120 { 0.8 } else { 0.0 };
+            samples.extend([x, x]);
+        }
+        // 常時 abort → None (bin ループの先頭で即中断)。
+        assert!(
+            analyze_stereo_timeline_cancellable(
+                &samples,
+                48_000,
+                AnalysisConfig::default(),
+                &|| true
+            )
+            .is_none()
+        );
+        // 途中から abort → None (chroma FFT 窓ループ側の中断点も効く)。
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(
+            analyze_stereo_timeline_cancellable(
+                &samples,
+                48_000,
+                AnalysisConfig::default(),
+                &|| { calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 2 }
+            )
+            .is_none()
+        );
+        // abort しない場合は非キャンセル版と同一結果。
+        let a = analyze_stereo_timeline_cancellable(
+            &samples,
+            48_000,
+            AnalysisConfig::default(),
+            &|| false,
+        )
+        .expect("non-aborted analysis must complete");
+        let b = analyze_stereo_timeline(&samples, 48_000, AnalysisConfig::default());
+        assert_eq!(a.bins.len(), b.bins.len());
+        assert_eq!(a.stream.duration_secs, b.stream.duration_secs);
     }
 
     #[test]

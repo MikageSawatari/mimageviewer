@@ -41,7 +41,7 @@ fn ensure_ffmpeg_init() {
 ///
 /// decode (FFmpeg) → `analyze_stereo_timeline` (純ロジック) の合成。DB キャッシュの
 /// 参照・保存は呼び出し側 (Inc 3 の解析ワーカー) の責務にして、この関数はステートレスに
-/// 保つ。`cancel` は decode 中と解析直前で確認する。
+/// 保つ。`cancel` は decode 中・解析直前に加え、解析の内側 (bin / FFT 窓単位) でも確認する。
 pub fn analyze_audio_file(
     path: &Path,
     cancel: &AtomicBool,
@@ -61,11 +61,13 @@ pub fn analyze_audio_file_with_config(
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".to_string());
     }
-    Ok(music_core::analyze_stereo_timeline(
+    music_core::analyze_stereo_timeline_cancellable(
         &decoded.stereo_samples,
         decoded.info.sample_rate,
         config,
-    ))
+        &|| cancel.load(Ordering::Relaxed),
+    )
+    .ok_or_else(|| "cancelled".to_string())
 }
 
 /// progressive partial emit の最小 wall-clock 間隔。デコードが realtime より速いと 2/4/8 秒の

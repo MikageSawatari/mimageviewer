@@ -240,6 +240,91 @@
      stack 状態) を持つ §1.2 系の設計が必要。現行でも Shift+↓↑ ジャンプは動作する。
 - 優先度: P2〜P3。detached リワークの後続ステージ (発火面設計の一般化) で対応。
 
+### 1.8 rename transaction — path-keyed 永続データの移行 (タグ/★/回転/編集レイヤー等)
+
+**→ 2026-07-10 に段階 1+2 とも v2.3.0 で実装済み** (ユーザー判断「広めに実機検証を行う
+今回のうちに段階 2 まで」)。実装 = `src/rename_key_migration.rs` (worker、
+zip_key_migration 方式の UPDATE OR IGNORE + DELETE、substr 等値 prefix 照合) +
+`App::spawn_rename_key_migration` / `poll_rename_migration_pending` / in-memory
+presence set・resume キー書換。対象ストア・許容制限の正本はモジュール doc。
+以下は当時の調査記録として保持。
+
+- 背景: v2.3.0 角度④レビュー (docs/review-v2.3.0/sol-angle-reviews.md (C))。rename は
+  v2.2.0 出荷時から path-keyed DB を一切移行しておらず、リネームでタグ/★/回転/
+  編集レイヤー/マスク/ブックマーク/再生位置などが旧 path キーに置き去りになる。
+- **ストア全数調査済み (2026-07-10、Explore agent)**。移行必須 (authoritative):
+  - page-key 8 ストア (rating / adjustment / mask / conceal / local_adjust / comic /
+    export_crop / tags) — **`App::apply_book_page_edit_moves` (app.rs:20099) /
+    `move_book_page_edit_key` (20195) がほぼそのまま使える前例** (per-store
+    `move_entry_key` helper + 2 相 temp-key + in-memory cache 更新まで実装済み)
+  - 前例に**入っていない**ギャップ: rotation.db / video_pins.db / video_bookmarks.db
+    (=音楽ブックマーク) / settings.video_resume_positions (in-memory map キー改名) /
+    **動画 `.xmp` sidecar のファイル改名** (xmp_writer::sidecar_path_for、現状
+    リネームで孤児化) / mimageviewer.dat の rel-key (sidecar backup 有効時のみ) /
+    pdf_passwords (キーが SHA-256 ハッシュ → remove+set、平文がセッション内にある時のみ) /
+    コンテナ行 (reading_history / book_resume / spread / folder_thumb_pins 自行)
+  - スキップ可 (rebuildable): サムネ catalog / tile・chapter thumbs / audio_normalize /
+    auto_aspect / 検索索引 (search_watcher が rename を Remove+Upsert 分解して自己修復) /
+    archive_cache
+- キー正規化は 2 系統ある点に注意: `adjustment_db::normalize_path` (drive 保持、主流) と
+  `path_key::normalize` (drive 除去: spread / book_resume / pdf_passwords / archive_cache)。
+- **段階案**:
+  - 段階 1 = 単一ファイル rename (画像/動画/音声 + コンテナ自体の exact キー)。前例 +
+    ギャップ helper 追加 + sidecar 改名。目安 1 日 (Codex 検収込み)、リスク中低。
+  - 段階 2 = フォルダ rename の配下 prefix 書換 (`old/%`) + コンテナ rename の
+    アーカイブ内 composite キー (`old::%`) + drive 除去系 + sidecar_sync/tag_sidecar_sync。
+    SQL 雛形 = src/zip_key_migration.rs (`UPDATE OR IGNORE` + `DELETE`)。目安 +1〜1.5 日、
+    リスク中 (キー規則 2 系統の混在に注意)。
+- 優先度: P2 (ユーザー要望 2026-07-10「可能ならば設定値を引き継ぎたい」)。
+
+### 1.9 parked 窓のリソース制御 (サムネ pipeline 停止 / VRAM 合算予算) — 角度⑥送り
+
+- 出典: v2.3.0 角度⑥レビュー (Sol/Terra 一致、docs/review-v2.3.0/sol-angle-reviews.md)。
+  いずれも bounded な効率問題でデータ喪失は無し。park/再活性ライフサイクルの構造に
+  踏み込むため、リリース直前パッチではなく detached リワーク後続で設計対応する。
+  1. **P2: park してもサムネ pipeline が止まらない**: `pause_background_work_keep_current_frame`
+     は fullscreen/AI 系のみ cancel し、bundle の `cancel_token` / `reload_queue` /
+     `heavy_io_queue` に触れない。park 時点で積まれていたデコードが走り切り、結果
+     `ColorImage` が誰も poll しない rx に溜まる (窓の再活性化 / close まで保持)。
+     対応案 = park 時に queue を drain (worker pool は殺さない)。ただし Requested 状態の
+     サムネが再活性化時に再要求される仕組みの確認が必要 (state が Requested のまま
+     queue から消えると復帰後にロードされない恐れ)。
+  2. **P2: サムネ VRAM 上限が文脈単位**: `update_keep_range_and_requests` の予算は
+     mounted 文脈にしか効かず、parked bundle N 個がそれぞれ上限近くまで保持し得る
+     (動画サムネは eviction 対象外なのでフォルダサイズ分)。対応 = 全 bundle 合算の
+     予算会計 + cross-bundle eviction (リワークの資源予算ステージ)。
+  3. P3: `display_px_shared` が App-global のため、detached 文脈のデコード解像度が
+     メイングリッドの表示密度に引きずられる (適用ミスは無し、品質/CPU の無駄のみ)。
+- 関連: v2.3.0 で対応済みの境界 = bundle Drop の解放 (角度①でクリーン確認)、
+  文脈別 channel/cancel/世代 (P2-9)。
+
+### 1.10 終了時の削除 worker 未調整 — 角度⑤送り (P2、実害小)
+
+- 出典: v2.3.0 角度⑤ Sol P2。数百件削除の実行中に終了すると、実行中の
+  IFileOperation チャンクは完走するが後続チャンクは開始されず、部分削除の最終報告と
+  完了後クリーンアップ (resume purge 等) が走らない。一覧は次回起動の走査で実態に
+  収束するため破壊は無し。対応案 = 終了時に cancel を立てて現行チャンクの完了を
+  短時間待つ + 次回起動時の注意トースト。v2.2.0 出荷時からの既存挙動。
+
+### 1.11 視聴中ファイル削除の初回失敗 (sharing violation リトライ)
+
+- 出典: v2.3.0 実機検証 §4 #24 (2026-07-10)。別窓で再生中のファイルを削除すると、
+  (A)(B) 実装どおり窓は閉じるが、プレイヤーのファイルハンドル解放が非同期のため
+  初回の削除が共有違反で「削除に失敗しました」になることがある (2 回目で成功)。
+  ユーザー許容済み (「この動作でも大丈夫」)。
+- 対応案: 削除 worker 側で ERROR_SHARING_VIOLATION 時に短時間リトライ
+  (例: 200ms×5 回バックオフ)。削除対象が再生解放直後のケースだけ効き、
+  他の共有違反 (他プロセス占有) はリトライ後に従来どおり失敗表示。
+
+### 1.12 detached 静止画窓から音声/動画へのフォルダ内ナビ不可 (メディア昇格導線)
+
+- 出典: v2.3.0 実機検証 §5 #33 (2026-07-10)。別窓 (静止画) で ↑↓ ナビ中、音声/動画の
+  アイテムへは移動できない (静止画窓はメディア再生セッションを持てない設計境界)。
+  音楽ビュー→画像の方向は移動できるため非対称。ユーザー許容済み (「一旦これでもよさそう」)。
+- 対応案: detached リワークの後続ステージで「静止画窓がメディアに到達したらメディア
+  セッションへ昇格 (または既存メディア窓へ委譲)」の導線を設計。凍結ルール下では
+  症状パッチを入れない。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断

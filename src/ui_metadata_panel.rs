@@ -84,38 +84,28 @@ impl App {
     ) -> bool {
         let panel_rect = crate::ui_fullscreen::metadata_panel_rect(full_rect);
 
+        // forced 描画 (補正パネルと同時表示) 中もラッチを更新する。ここで false にすると、
+        // 右端で補正モードが開いた次フレームに sustain へ遷移できず、右パネルだけ即閉じる。
+        let pointer_pos = ctx.input(|i| {
+            if self.cursor_hidden {
+                None
+            } else {
+                i.pointer.hover_pos()
+            }
+        });
+        let hover_visible = crate::ui_fullscreen::metadata_panel_hover_active_at(
+            full_rect,
+            pointer_pos,
+            self.metadata_panel_hover_active,
+        );
+        self.metadata_panel_hover_active = !self.show_metadata_panel && hover_visible;
+
         if !force_show {
-            let activation_rect =
-                crate::ui_fullscreen::metadata_panel_hover_activation_rect(full_rect);
-
-            // ホバー判定: 描画される右パネル幅内。カーソル非表示中は最後の座標が stale なので、
-            // 実入力でカーソルが復帰するまでは passive hover でパネルを開かない。
-            let pointer_pos = ctx.input(|i| {
-                if self.cursor_hidden {
-                    None
-                } else {
-                    i.pointer.hover_pos()
-                }
-            });
-
-            let hover_in_right = pointer_pos.is_some_and(|p| activation_rect.contains(p));
-            // 開いた後の維持は panel_rect + ヒステリシス余白。内端をわずかに越えた瞬間に
-            // 閉じるちらつきを防ぐ (実機 FB 2026-07)。開くトリガ (activation_rect) は右端の
-            // 細いストリップなので、維持はこちらで広めに取る二段判定になる。
-            let sustain_rect =
-                panel_rect.expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
-            let hover_in_open_panel = self.metadata_panel_hover_active
-                && pointer_pos.is_some_and(|p| sustain_rect.contains(p));
-            let hover_visible = hover_in_right || hover_in_open_panel;
-
             let visible =
                 self.show_metadata_panel || self.fullscreen_tag_picker_open || hover_visible;
-            self.metadata_panel_hover_active = !self.show_metadata_panel && hover_visible;
             if !visible {
                 return false;
             }
-        } else {
-            self.metadata_panel_hover_active = false;
         }
 
         // パネル背景

@@ -258,6 +258,20 @@ pub(crate) fn metadata_panel_hover_activation_rect(full_rect: egui::Rect) -> egu
     )
 }
 
+/// 右メタデータパネルの端ホバーラッチを現在座標から更新する。
+/// 開くときは右端トリガ、開いた後は実描画矩形 + sustain margin を使う。
+pub(crate) fn metadata_panel_hover_active_at(
+    full_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    was_active: bool,
+) -> bool {
+    let activation_rect = metadata_panel_hover_activation_rect(full_rect);
+    let sustain_rect = metadata_panel_rect(full_rect)
+        .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
+    pointer_pos
+        .is_some_and(|p| activation_rect.contains(p) || (was_active && sustain_rect.contains(p)))
+}
+
 fn should_handle_fullscreen_wheel(
     cursor_in_panel: bool,
     in_video_tile: bool,
@@ -298,8 +312,9 @@ fn should_suppress_egui_wheel_for_native_detached_video(
     is_video: bool,
     detached: bool,
     native_presenter_active: bool,
+    music_view_active: bool,
 ) -> bool {
-    is_video && detached && native_presenter_active
+    is_video && detached && native_presenter_active && !music_view_active
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11508,6 +11523,8 @@ impl App {
             state.is_video,
             self.viewer_session_is_detached(),
             self.native_video_presenter_hwnd().is_some(),
+            self.fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx)),
         );
         #[cfg(not(windows))]
         let suppress_egui_wheel = false;
@@ -22226,6 +22243,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_panel_hover_sustains_across_detached_panel_width() {
+        // detached viewport のような非ゼロ原点・狭幅でも、右端で開いたラッチは描画パネル
+        // 内へ左移動した後に維持される。未ラッチなら同じ位置は新規発火にならない。
+        let viewport = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(900.0, 700.0));
+        let panel = metadata_panel_rect(viewport);
+        let inside_left = egui::pos2(panel.left() + 1.0, panel.center().y);
+        assert!(metadata_panel_hover_active_at(
+            viewport,
+            Some(egui::pos2(viewport.right() - 1.0, panel.center().y)),
+            false,
+        ));
+        assert!(metadata_panel_hover_active_at(
+            viewport,
+            Some(inside_left),
+            true
+        ));
+        assert!(!metadata_panel_hover_active_at(
+            viewport,
+            Some(inside_left),
+            false
+        ));
+    }
+
+    #[test]
     fn zip_cover_zoom_factor_one_fills_screen_no_margin() {
         // 横長画像 (400x200) を 300x300 のビューに cover 表示すると、factor=1 でも画面を覆い、
         // 横はパン可能、縦は range 0 になる。cursor は画像ピクセル座標で渡す。
@@ -23098,16 +23139,19 @@ mod tests {
     #[test]
     fn detached_native_video_suppresses_parent_viewport_wheel() {
         assert!(should_suppress_egui_wheel_for_native_detached_video(
-            true, true, true
+            true, true, true, false
         ));
         assert!(!should_suppress_egui_wheel_for_native_detached_video(
-            true, false, true
+            true, false, true, false
         ));
         assert!(!should_suppress_egui_wheel_for_native_detached_video(
-            false, true, true
+            false, true, true, false
         ));
         assert!(!should_suppress_egui_wheel_for_native_detached_video(
-            true, true, false
+            true, true, false, false
+        ));
+        assert!(!should_suppress_egui_wheel_for_native_detached_video(
+            true, true, true, true
         ));
     }
 

@@ -456,10 +456,11 @@ pub enum FacetItemKind {
     /// 将来バージョンが書いた未知の variant の受け皿 (ダウングレード耐性、
     /// `ToolbarFacetFilterItem::Unknown` と同じ方針)。実アイテムがこの kind に
     /// なることはなく、絞り込み集合に残っていても何にもマッチしない。
-    /// なお v2.2.0 の同 enum にはこの受け皿が無いため、`Audio` を含む facet_filter を
-    /// 保存したまま v2.2.0 へ戻すと設定 DB が Corrupted 扱いになる (bak 世代へ巻き戻り)。
-    /// これは v2.2.0 側が出荷済みで直せない既知の非互換 (review-v2.3.0 hunt P2、
-    /// リリースノート記載で対応)。
+    /// なお v2.2.0 の同 enum にはこの受け皿が無いため、`Audio` を kinds に書いたまま
+    /// v2.2.0 へ戻すと設定 DB が Corrupted 扱いになる (bak 世代へ巻き戻り)。この非互換は
+    /// 保存時に `Audio` を `FacetFilter::kind_audio_stash` (v2.2.0 が無視する未知フィールド)
+    /// へ退避することで回避している (`stash_kind_audio_for_persist` 参照、Sol 角度②レビュー)。
+    /// 新しい kind variant を追加するときも同じ退避が必要になる点に注意。
     #[serde(other)]
     Unknown,
 }
@@ -659,9 +660,34 @@ pub struct FacetFilter {
     pub edits: std::collections::BTreeSet<FacetEditFlag>,
     #[serde(default, alias = "ai_adjustment_include_descendants")]
     pub edit_include_descendants: bool,
+    /// `kinds` の `Audio` メンバーシップの保存用キャリア (v2.2.0 ダウングレード互換)。
+    /// v2.2.0 の `FacetItemKind` には `Audio` も `#[serde(other)]` 受け皿も無く、kinds に
+    /// `"Audio"` を書いた settings.db を v2.2.0 が読むと deserialize 失敗 → Corrupted 隔離
+    /// (bak 世代へ巻き戻り) になる。そこで保存時は `stash_kind_audio_for_persist` で kinds
+    /// から Audio を外してこの bool へ退避し、読み込み後に `restore_kind_audio_after_load`
+    /// (`Settings::sanitize` 経由) で kinds へ戻す。v2.2.0 は未知フィールドを無視するので、
+    /// この形ならダウングレードしても設定 DB は壊れない。実行時の正は常に `kinds` 側で、
+    /// この bool は永続化の瞬間にだけ意味を持つ。
+    #[serde(default)]
+    pub kind_audio_stash: bool,
 }
 
 impl FacetFilter {
+    /// 永続化直前に呼ぶ: `kinds` から `Audio` を外して `kind_audio_stash` へ退避する。
+    /// live な Settings には適用せず、保存用クローンに対して使う (`SettingsDb::save_full`)。
+    /// 理由は `kind_audio_stash` フィールドのコメント参照 (v2.2.0 ダウングレード互換)。
+    pub fn stash_kind_audio_for_persist(&mut self) {
+        self.kind_audio_stash = self.kinds.remove(&FacetItemKind::Audio);
+    }
+
+    /// 読み込み直後に呼ぶ (`Settings::sanitize`): 退避キャリアから `Audio` を `kinds` へ
+    /// 戻し、実行時状態を「正は kinds」の形に正規化する。
+    pub fn restore_kind_audio_after_load(&mut self) {
+        if std::mem::take(&mut self.kind_audio_stash) {
+            self.kinds.insert(FacetItemKind::Audio);
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         !self.kinds.is_empty()
             || !self.exts.is_empty()
@@ -4817,6 +4843,9 @@ impl Settings {
         if self.facet_filter.edits.remove(&FacetEditFlag::AiAdjustment) {
             self.facet_filter.edits.insert(FacetEditFlag::Adjustment);
         }
+        // 保存時に退避した種類フィルタの Audio を kinds へ戻す (v2.2.0 ダウングレード互換、
+        // `FacetFilter::kind_audio_stash` のコメント参照)。
+        self.facet_filter.restore_kind_audio_after_load();
     }
 
     fn normalize_tag_settings(&mut self) {
@@ -5305,6 +5334,66 @@ mod tests {
             ToolbarFacetFilterItem::visible_order(&[]).is_empty(),
             "空 Vec は「全部隠す」として保持する"
         );
+    }
+
+    /// 種類フィルタの Audio は保存時に kinds から `kind_audio_stash` へ退避され、
+    /// 永続化 JSON の kinds に "Audio" が現れない = v2.2.0 (Audio variant も
+    /// `#[serde(other)]` 受け皿も無い) がその settings をエラーなく読める。
+    /// これが壊れると v2.2.0 へのダウングレードで settings.db が Corrupted 隔離される。
+    #[test]
+    fn facet_kind_audio_stash_keeps_persisted_form_v22_compatible() {
+        let mut ff = FacetFilter::default();
+        ff.kinds.insert(FacetItemKind::Audio);
+        ff.kinds.insert(FacetItemKind::Image);
+
+        // 保存形: kinds から Audio が消え、stash が立つ。
+        let mut persist = ff.clone();
+        persist.stash_kind_audio_for_persist();
+        let json = serde_json::to_value(&persist).unwrap();
+        let kinds = json["kinds"].as_array().unwrap();
+        assert!(
+            kinds.iter().all(|k| k != "Audio"),
+            "persisted kinds must not contain Audio: {kinds:?}"
+        );
+        assert_eq!(json["kind_audio_stash"], serde_json::Value::Bool(true));
+
+        // v2.2.0 の FacetFilter 形状シミュレーション: Audio variant 無しの enum で
+        // deserialize が成功する (未知フィールド kind_audio_stash は無視される)。
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum V22Kind {
+            Folder,
+            Image,
+            Video,
+            Zip,
+            Pdf,
+            Archive,
+            ZipImage,
+            PdfPage,
+            Separator,
+            SearchContainer,
+        }
+        #[derive(serde::Deserialize)]
+        struct V22Filter {
+            #[serde(default)]
+            kinds: Vec<V22Kind>,
+        }
+        let v22: V22Filter =
+            serde_json::from_value(json.clone()).expect("v2.2.0 shape must accept persisted form");
+        assert_eq!(v22.kinds.len(), 1, "v2.2.0 側には Image だけ見える");
+
+        // 読み戻し: restore で Audio が kinds に戻り、stash は false に正規化される。
+        let mut loaded: FacetFilter = serde_json::from_value(json).unwrap();
+        loaded.restore_kind_audio_after_load();
+        assert!(loaded.kinds.contains(&FacetItemKind::Audio));
+        assert!(loaded.kinds.contains(&FacetItemKind::Image));
+        assert!(!loaded.kind_audio_stash);
+
+        // stash → restore の往復で元の実行時状態と一致する。
+        let mut roundtrip = ff.clone();
+        roundtrip.stash_kind_audio_for_persist();
+        roundtrip.restore_kind_audio_after_load();
+        assert_eq!(roundtrip, ff);
     }
 
     #[test]
@@ -7567,6 +7656,9 @@ mod tests {
             s.details_name_width_auto = false;
             s.details_name_width = 222.0;
             s.facet_filter.kinds.insert(FacetItemKind::Image);
+            // Audio は保存時に kind_audio_stash へ退避され、読み戻しで kinds に復元される
+            // (v2.2.0 ダウングレード互換)。roundtrip で往復が壊れていないことを確認する。
+            s.facet_filter.kinds.insert(FacetItemKind::Audio);
             s.facet_filter.exts.insert("png".to_string());
             s.facet_filter
                 .place_keys
@@ -7753,6 +7845,14 @@ mod tests {
             assert!(
                 loaded.facet_filter.kinds.contains(&FacetItemKind::Image),
                 "facet_filter kinds should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.kinds.contains(&FacetItemKind::Audio),
+                "facet_filter Audio kind should survive roundtrip via kind_audio_stash"
+            );
+            assert!(
+                !loaded.facet_filter.kind_audio_stash,
+                "kind_audio_stash must be normalized back to false after load"
             );
             assert!(
                 loaded.facet_filter.exts.contains("png"),

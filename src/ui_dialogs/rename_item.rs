@@ -20,9 +20,13 @@ impl App {
             self.show_feedback_toast("この項目は名前を変更できません".to_owned());
             return;
         };
+        // 対象種別はダイアログを開く時に一度だけ確認し、描画中は filesystem に触れない。
+        self.rename_target_is_file = target.is_file();
         self.rename_target = Some(target);
         self.rename_input = name;
         self.rename_error = None;
+        self.rename_initial_selection_pending = true;
+        self.rename_extension_confirm = false;
         self.show_rename_dialog = true;
     }
 
@@ -39,7 +43,9 @@ impl App {
         let pending = self.rename_pending.is_some();
         let mut open = true;
         let mut apply = false;
+        let mut apply_confirmed = false;
         let mut cancel = false;
+        let mut back_to_edit = false;
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(90.0, 70.0);
@@ -54,15 +60,47 @@ impl App {
                 ui.label(format!("対象: {}", target.display()));
                 ui.add_space(4.0);
 
-                let resp = ui.add_enabled(
-                    !pending,
-                    egui::TextEdit::singleline(&mut self.rename_input).desired_width(f32::INFINITY),
-                );
-                if !pending && !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
-                    resp.request_focus();
-                }
-                if !pending && enter_pressed && (resp.has_focus() || resp.lost_focus()) {
-                    apply = true;
+                if self.rename_extension_confirm {
+                    let old_name = target
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    ui.label(extension_change_confirmation_message(
+                        old_name,
+                        &self.rename_input,
+                    ));
+                } else {
+                    let resp = ui.add_enabled(
+                        !pending,
+                        egui::TextEdit::singleline(&mut self.rename_input)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if !pending && self.rename_initial_selection_pending {
+                        resp.request_focus();
+                        if let Some(mut state) =
+                            egui::text_edit::TextEditState::load(ui.ctx(), resp.id)
+                        {
+                            let end = if self.rename_target_is_file {
+                                rename_stem_char_count(&self.rename_input)
+                            } else {
+                                self.rename_input.chars().count()
+                            };
+                            state
+                                .cursor
+                                .set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(end),
+                                )));
+                            state.store(ui.ctx(), resp.id);
+                        }
+                        self.rename_initial_selection_pending = false;
+                    } else if !pending && !resp.has_focus() && !ui.memory(|m| m.focused().is_some())
+                    {
+                        resp.request_focus();
+                    }
+                    if !pending && enter_pressed && (resp.has_focus() || resp.lost_focus()) {
+                        apply = true;
+                    }
                 }
 
                 if let Some(ref err) = self.rename_error {
@@ -86,27 +124,45 @@ impl App {
                 ui.separator();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let can_apply = !pending && !self.rename_input.trim().is_empty();
-                    if ui
-                        .add_enabled(can_apply, egui::Button::new("  変更  "))
-                        .clicked()
-                    {
-                        apply = true;
-                    }
-                    if ui
-                        .add_enabled(!pending, egui::Button::new("キャンセル"))
-                        .clicked()
-                    {
-                        cancel = true;
+                    if self.rename_extension_confirm {
+                        if ui.button("変更する").clicked() {
+                            apply_confirmed = true;
+                        }
+                        if ui.button("戻す").clicked() {
+                            back_to_edit = true;
+                        }
+                    } else {
+                        let can_apply = !pending && !self.rename_input.trim().is_empty();
+                        if ui
+                            .add_enabled(can_apply, egui::Button::new("  変更  "))
+                            .clicked()
+                        {
+                            apply = true;
+                        }
+                        if ui
+                            .add_enabled(!pending, egui::Button::new("キャンセル"))
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
                     }
                 });
 
                 if !pending && escape_pressed {
-                    cancel = true;
+                    if self.rename_extension_confirm {
+                        back_to_edit = true;
+                    } else {
+                        cancel = true;
+                    }
+                }
+                if self.rename_extension_confirm && enter_pressed {
+                    apply_confirmed = true;
                 }
             });
 
-        if apply {
+        if back_to_edit {
+            self.rename_extension_confirm = false;
+        } else if apply || apply_confirmed {
             match validate_rename_item_name(&self.rename_input) {
                 Ok(name) => {
                     if target
@@ -119,6 +175,18 @@ impl App {
                     }
                     self.rename_input = name.clone();
                     self.rename_error = None;
+                    let old_name = target
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    if !apply_confirmed
+                        && self.rename_target_is_file
+                        && rename_extension_changed(old_name, &name)
+                    {
+                        self.rename_extension_confirm = true;
+                        return;
+                    }
+                    self.rename_extension_confirm = false;
                     self.rename_pending = Some(crate::shell_file_ops::rename_item_async(
                         self.main_hwnd,
                         target,
@@ -146,8 +214,30 @@ impl App {
                     self.show_feedback_toast("名前の変更をキャンセルしました".to_owned());
                     return;
                 }
+                // 旧 path を表示・再生中の窓を閉じる (review-v2.3.0 角度④ (A):
+                // parked bundle が旧 path のまま生き残ると再生位置やメタデータ書込が
+                // 旧名キーへ流れる)。
+                self.release_viewer_surfaces_for_removed_paths(
+                    ctx,
+                    std::slice::from_ref(&outcome.target),
+                    "rename_old_path",
+                );
+                // 旧 path キーの永続データ (★ / タグ / 回転 / 編集レイヤー / マスク /
+                // ブックマーク / 続き位置 / サイドカー等) を新 path へ移行する
+                // (`rename_key_migration`、worker)。in-memory 側 (再生位置 / 編集済み
+                // バッジの presence set) はここで同期的に付け替える。
+                self.migrate_video_resume_positions_for_renamed_path(
+                    &outcome.target,
+                    &outcome.new_path,
+                );
+                self.rewrite_page_edit_presence_for_rename(&outcome.target, &outcome.new_path);
+                self.spawn_rename_key_migration(outcome.target.clone(), outcome.new_path.clone());
+                // 再読み込み判定は「お気に入りへ追加できる場所」ではなく、一覧を実際に
+                // 列挙した current_folder と比較する。current_favorite_target() は ZIP/PDF の
+                // enumerate 中や archive_source_override が残る遷移フレームでは None を返すため、
+                // 直前に ZIP を閲覧した通常フォルダで rename 成功を取りこぼし得る。
                 let current_matches_parent = outcome.target.parent().is_some_and(|parent| {
-                    self.current_favorite_target()
+                    self.current_folder
                         .as_ref()
                         .is_some_and(|cur| crate::folder_tree::path_eq(cur, parent))
                 });
@@ -184,7 +274,44 @@ impl App {
         self.rename_target = None;
         self.rename_input.clear();
         self.rename_error = None;
+        self.rename_target_is_file = false;
+        self.rename_initial_selection_pending = false;
+        self.rename_extension_confirm = false;
     }
+}
+
+/// 最終拡張子を除いた stem の文字数。拡張子なし・dotfile は名前全体を返す。
+fn rename_stem_char_count(name: &str) -> usize {
+    let Some(ext) = final_extension(name) else {
+        return name.chars().count();
+    };
+    name[..name.len() - ext.len() - 1].chars().count()
+}
+
+fn final_extension(name: &str) -> Option<&str> {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+}
+
+fn rename_extension_changed(old_name: &str, new_name: &str) -> bool {
+    match (final_extension(old_name), final_extension(new_name)) {
+        (Some(old), Some(new)) => !old.eq_ignore_ascii_case(new),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn extension_change_confirmation_message(old_name: &str, new_name: &str) -> String {
+    let display = |ext: Option<&str>| match ext {
+        Some(ext) => format!("\".{ext}\""),
+        None => "\"(なし)\"".to_owned(),
+    };
+    format!(
+        "拡張子が {} から {} に変わります。ファイルが開けなくなる可能性があります。変更しますか?",
+        display(final_extension(old_name)),
+        display(final_extension(new_name))
+    )
 }
 
 fn validate_rename_item_name(input: &str) -> Result<String, String> {
@@ -230,7 +357,31 @@ fn matches_reserved_numbered_device(stem: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_rename_item_name;
+    use super::{rename_extension_changed, rename_stem_char_count, validate_rename_item_name};
+
+    #[test]
+    fn rename_stem_char_count_handles_extensions_dotfiles_and_unicode() {
+        assert_eq!(rename_stem_char_count("a.tar.gz"), "a.tar".chars().count());
+        assert_eq!(rename_stem_char_count("README"), "README".chars().count());
+        assert_eq!(
+            rename_stem_char_count(".gitignore"),
+            ".gitignore".chars().count()
+        );
+        assert_eq!(
+            rename_stem_char_count("日本語画像.jpg"),
+            "日本語画像".chars().count()
+        );
+    }
+
+    #[test]
+    fn rename_extension_changed_compares_final_extension_case_insensitively() {
+        assert!(!rename_extension_changed("photo.JPG", "renamed.jpg"));
+        assert!(!rename_extension_changed("README", "RENAMED"));
+        assert!(!rename_extension_changed(".gitignore", ".ignore"));
+        assert!(rename_extension_changed("a.tar.gz", "a.tar.zip"));
+        assert!(rename_extension_changed("movie.mp4", "movie"));
+        assert!(rename_extension_changed("README", "README.txt"));
+    }
 
     #[test]
     fn validate_rename_item_name_accepts_normal_names() {

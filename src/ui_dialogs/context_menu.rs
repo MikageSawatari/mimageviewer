@@ -1709,7 +1709,7 @@ impl crate::app::App {
             self.show_delete_confirm = false;
             self.delete_targets.clear();
             self.delete_confirm_label = None;
-            self.start_delete_files(paths);
+            self.start_delete_files(ctx, paths);
         }
     }
 

@@ -17584,6 +17584,12 @@ mod still_window_mode_key_tests {
             app.settings.detached_viewer_open_images_in_window,
             "the persistent default for the next video open remains detached"
         );
+        // 動画経路の切替は player 未 ready (テスト環境) では no-op になるため、
+        // 「切り替えました」トーストも出ない (Codex P3: no-op 時は案内しない)。
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "a no-op video placement switch must stay silent"
+        );
         assert_eq!(
             app.requested_viewer_presentation_for_open(video),
             ViewerPresentation::DetachedWindow,
@@ -17602,10 +17608,87 @@ mod still_window_mode_key_tests {
             "audio F12 in always-new mode must also stay a per-item migration"
         );
         assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+        // メイン側への切替 (egui 経路 = 同期適用) は「維持される + グリッドから開き直すと
+        // 別窓」の案内トーストを Viewer 面に出す (実機 FB 2026-07-10)。
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, ..)| text.contains("メインウィンドウ表示に切り替えました")),
+            "media migration to main shows the persistence hint"
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::Viewer)
+        );
         assert_eq!(
             app.requested_viewer_presentation_for_open(audio),
             ViewerPresentation::DetachedWindow,
             "the next explicit audio open should return to the shared media window"
+        );
+
+        // 別ウィンドウへ戻す方向は映像移動が自明なので無通知のまま。
+        app.fs_feedback_toast = None;
+        app.fs_feedback_toast_surface = None;
+        app.toggle_detached_viewer_mode();
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "switching back to the media window stays silent"
+        );
+    }
+
+    /// Sol P2: native 動画のメディア窓→メイン切替の案内トーストは、要求発行時ではなく
+    /// `PlacementSwitched` の**確定時**に出す (presenter 無応答なら出ない)。
+    #[test]
+    #[cfg(windows)]
+    fn media_window_main_hint_fires_on_placement_switch_confirmation() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.fullscreen_idx = Some(video);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 7,
+            target_presentation: ViewerPresentation::MainWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: true,
+        });
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "no hint before the presenter confirms the switch"
+        );
+
+        app.apply_native_video_placement_switch_state(
+            7,
+            crate::video::NativeVideoPlacement::MainWindowChild,
+            1,
+        );
+
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, ..)| text.contains("メインウィンドウ表示に切り替えました")),
+            "the hint fires when PlacementSwitched confirms the main-side switch"
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::Viewer)
+        );
+
+        // announce フラグなし (F11 等の in-window/全画面切替) では出ない。
+        app.fs_feedback_toast = None;
+        app.fs_feedback_toast_surface = None;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 8,
+            target_presentation: ViewerPresentation::Fullscreen,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+        app.apply_native_video_placement_switch_state(
+            8,
+            crate::video::NativeVideoPlacement::FullscreenBorderless,
+            2,
+        );
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "plain window-mode switches stay silent"
         );
     }
 
@@ -17941,6 +18024,7 @@ mod still_window_mode_key_tests {
             request_id: 7,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
@@ -17985,6 +18069,7 @@ mod still_window_mode_key_tests {
             request_id: 3,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
@@ -18528,6 +18613,7 @@ mod still_window_mode_key_tests {
             request_id: 1,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
         assert!(
             app.detached_video_presentation_active_or_targeted(),
@@ -18539,6 +18625,7 @@ mod still_window_mode_key_tests {
             request_id: 2,
             target_presentation: ViewerPresentation::MainWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
         assert!(!app.detached_video_presentation_active_or_targeted());
     }
@@ -19072,6 +19159,48 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn remove_items_batch_moves_fullscreen_from_last_image_to_previous_image() {
+        let mut app = setup_app();
+        let first = push_image(&mut app, stringify!(a.jpg));
+        let last = push_image(&mut app, stringify!(b.jpg));
+        app.fullscreen_idx = Some(last);
+
+        app.remove_items_batch(&[last]);
+
+        assert_eq!(app.fullscreen_idx, Some(first));
+        assert!(matches!(app.items.get(first), Some(GridItem::Image(_))));
+    }
+
+    #[test]
+    fn remove_items_batch_skips_container_cells_when_choosing_fullscreen_neighbor() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, stringify!(a.jpg));
+        app.items.push(GridItem::Folder(PathBuf::new()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.image_metas.push(None);
+        app.fullscreen_idx = Some(image);
+
+        app.remove_items_batch(&[image]);
+
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn remove_items_batch_moves_fullscreen_to_audio_neighbor() {
+        // Audio は ↑↓ ナビ (adjacent_navigable_idx) と同じ「映像なし動画」扱いなので、
+        // 削除後スライドの遷移先にも含める (検収追加)。
+        let mut app = setup_app();
+        let image = push_image(&mut app, stringify!(a.jpg));
+        push_audio(&mut app, r"C:\music\b.flac");
+        app.fullscreen_idx = Some(image);
+
+        app.remove_items_batch(&[image]);
+
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(matches!(app.items.get(0), Some(GridItem::Audio(_))));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn ensure_window_id_rejects_id_of_parked_window() {
         // 2026-07-09 実機 (review-v2.3.0 checklist P2-3 確認中): park 直後の grid open が
@@ -19220,6 +19349,776 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn removed_path_key_matcher_covers_folder_and_archive_prefixes() {
+        // review-v2.3.0 角度④ (A)(B): 完全一致 + フォルダ配下 + アーカイブ内エントリ、
+        // Windows の大文字小文字非区別。似た名前の別ファイルは巻き込まない。
+        let matches = crate::app::removed_path_key_matcher(&[
+            std::path::PathBuf::from(r"D:\Media\Trip"),
+            std::path::PathBuf::from(r"D:\Books\A.ZIP"),
+        ]);
+        assert!(matches("d:/media/trip"), "フォルダ自身");
+        assert!(matches("d:/media/trip/a.mp4"), "フォルダ配下");
+        assert!(matches("d:/books/a.zip"), "大文字小文字非区別");
+        assert!(
+            matches("d:/books/a.zip::inner/x.jpg"),
+            "アーカイブ内エントリ"
+        );
+        assert!(!matches("d:/media/trip.zip"), "接頭辞が似た別ファイル");
+        assert!(!matches("d:/media/trip2/a.mp4"), "接頭辞が似た別フォルダ");
+    }
+
+    #[test]
+    fn video_pin_dirty_paths_visible_matches_video_cells_only() {
+        // 別窓 P ピンの consume 判定: 大文字小文字非区別で items の Video セルだけを
+        // 対象にする (Folder / Image は同フォルダ・同 path でも対象外)。
+        use crate::grid_item::GridItem;
+        let dirty: std::collections::HashSet<std::path::PathBuf> =
+            [std::path::PathBuf::from(r"C:\Clips\Movie.MP4")]
+                .into_iter()
+                .collect();
+        let unrelated = vec![
+            GridItem::Folder(std::path::PathBuf::from(r"c:\clips")),
+            GridItem::Video(std::path::PathBuf::from(r"c:\clips\other.mp4")),
+        ];
+        assert!(
+            !crate::app::video_pin_dirty_paths_visible(&dirty, &unrelated),
+            "親フォルダセルや別動画では再ロードしない"
+        );
+        let visible = vec![GridItem::Video(std::path::PathBuf::from(
+            r"c:\clips\movie.mp4",
+        ))];
+        assert!(
+            crate::app::video_pin_dirty_paths_visible(&dirty, &visible),
+            "大文字小文字違いの同一動画セルは可視扱い"
+        );
+        assert!(
+            !crate::app::video_pin_dirty_paths_visible(&std::collections::HashSet::new(), &visible),
+            "dirty 空は常に false"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_pin_dirty_consume_drops_invisible_and_waits_for_pending() {
+        // 別窓 P ピン → メイン update の consume: 表示中 items に無い動画の dirty は
+        // 再ロードせず捨てる (次にそのフォルダを開く load_folder が pin_blobs を
+        // snapshot し直すので反映漏れなし)。後追い WebP 補完 (pending) 中は dirty を
+        // 保持したまま consume を保留する。
+        let mut app = setup_app();
+        push_video(&mut app, r"C:\clips\visible.mp4");
+        let hidden = std::path::PathBuf::from(r"C:\elsewhere\clip.mp4");
+
+        app.video_thumb_overrides_dirty_paths.insert(hidden.clone());
+        app.consume_video_thumb_overrides_dirty();
+        assert!(
+            app.video_thumb_overrides_dirty_paths.is_empty(),
+            "非表示動画の dirty は消費して捨てる"
+        );
+
+        app.video_thumb_overrides_dirty_paths.insert(hidden.clone());
+        app.pending_pin_thumb_refresh = Some(crate::app::native_video::PendingPinThumbRefresh {
+            fs_idx: 0,
+            path: hidden.clone(),
+            pts: 1.0,
+            started_at: std::time::Instant::now(),
+        });
+        app.consume_video_thumb_overrides_dirty();
+        assert!(
+            !app.video_thumb_overrides_dirty_paths.is_empty(),
+            "pending 補完中は dirty を保持して保留"
+        );
+        app.pending_pin_thumb_refresh = None;
+        app.consume_video_thumb_overrides_dirty();
+        assert!(
+            app.video_thumb_overrides_dirty_paths.is_empty(),
+            "pending 解消後に消費される"
+        );
+    }
+
+    #[test]
+    fn video_pin_dirty_consume_respects_reload_cooldown() {
+        // 再ロードストーム安全網 (実機 2026-07-10): 直近 1 秒以内に pin 起因リロードを
+        // 実行していたら、dirty を保持したまま consume を見送る。
+        let mut app = setup_app();
+        push_video(&mut app, r"C:\clips\visible.mp4");
+        app.video_thumb_overrides_dirty_paths
+            .insert(std::path::PathBuf::from(r"C:\elsewhere\clip.mp4"));
+
+        app.video_thumb_reload_last_at = Some(std::time::Instant::now());
+        app.consume_video_thumb_overrides_dirty();
+        assert!(
+            !app.video_thumb_overrides_dirty_paths.is_empty(),
+            "クールダウン中は dirty を保持して見送る"
+        );
+
+        app.video_thumb_reload_last_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.consume_video_thumb_overrides_dirty();
+        assert!(
+            app.video_thumb_overrides_dirty_paths.is_empty(),
+            "クールダウン経過後は consume される"
+        );
+    }
+
+    #[test]
+    fn video_pin_dirty_visible_via_pinned_folder_tile_cascade() {
+        // Codex P1: 親フォルダ表示中 (Folder タイルのみ) でも、タイルの代表サムネ 📌 の
+        // cascade 解決が dirty 動画へ到達するなら再ロード対象にする
+        // (seed_folder_video_pin_thumbs が焼いた WebP の更新契機を失わない)。
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("clips");
+        std::fs::create_dir_all(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        std::fs::write(&video, b"x").unwrap();
+        app.items.push(GridItem::Folder(folder.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "clip.mp4".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::Video,
+            },
+        );
+        let dirty: std::collections::HashSet<std::path::PathBuf> =
+            [video.clone()].into_iter().collect();
+        assert!(
+            app.video_pin_dirty_visible_in_items(&dirty),
+            "📌 cascade が dirty 動画へ解決される Folder タイルは可視扱い"
+        );
+        let other: std::collections::HashSet<std::path::PathBuf> =
+            [folder.join("other.mp4")].into_iter().collect();
+        assert!(
+            !app.video_pin_dirty_visible_in_items(&other),
+            "別動画の dirty では反応しない"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn delete_closes_parked_live_media_window_and_purges_resume() {
+        // review-v2.3.0 角度④ (A)(B): parked-live メディア窓が再生中のファイルを
+        // メイングリッドから削除 → worker spawn 前に窓が閉じ (handle 解放)、
+        // 削除完了後に旧 path キーの resume 記録が破棄される。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = r"C:\clips\deleting.mp4";
+        let video = push_video(&mut app, video_path);
+        app.settings.detached_viewer_enabled = true;
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_independent_active = true;
+        bundle.detached_viewer_window_id = Some(61);
+        let media_tex = ctx.load_texture(
+            "removed_path_media",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 61,
+                texture: media_tex,
+                title: "parked media".to_owned(),
+                location_display: "parked media".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
+
+        let resume_key = crate::adjustment_db::normalize_path(std::path::Path::new(video_path));
+        app.settings
+            .video_resume_positions
+            .insert(resume_key.clone(), 12.5);
+        app.video_resume_thumb_last_request
+            .insert(resume_key.clone(), 1);
+
+        let removed = vec![std::path::PathBuf::from(video_path)];
+        app.release_viewer_surfaces_for_removed_paths(&ctx, &removed, "test_delete");
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "対象を再生中の parked-live 窓は閉じられる"
+        );
+        assert!(
+            app.detached_image_window_close_pending.contains(&61),
+            "viewport close が予約される"
+        );
+
+        app.purge_video_resume_positions_for_removed_paths(&removed);
+        assert!(
+            !app.settings
+                .video_resume_positions
+                .contains_key(&resume_key),
+            "削除 path の resume 記録は破棄される"
+        );
+        assert!(
+            !app.video_resume_thumb_last_request
+                .contains_key(&resume_key),
+            "resume サムネ要求記録も破棄される"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removed_path_release_closes_only_matching_still_windows() {
+        // review-v2.3.0 角度④ (A): リネーム旧 path を表示中の parked still 窓だけが
+        // 閉じられ、無関係な窓は残る (descriptor 照合)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_enabled = true;
+        let make_snapshot =
+            |id: u64, tex: egui::TextureHandle, path: &str| DetachedImageWindowSnapshot {
+                id,
+                texture: tex,
+                title: format!("still {id}"),
+                location_display: format!("still {id}"),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: Some(ViewerContextDescriptor::Image {
+                    path: std::path::PathBuf::from(path),
+                }),
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: None,
+            };
+        let tex_a = ctx.load_texture(
+            "removed_still_a",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        let tex_b = ctx.load_texture(
+            "removed_still_b",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.detached_image_windows
+            .push(make_snapshot(70, tex_a, r"C:\pics\renamed_old.jpg"));
+        app.detached_image_windows
+            .push(make_snapshot(71, tex_b, r"C:\pics\unrelated.jpg"));
+        app.transition_detached_window_state(70, DetachedWindowState::Parked, "test_setup");
+        app.transition_detached_window_state(71, DetachedWindowState::Parked, "test_setup");
+
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            &[std::path::PathBuf::from(r"C:\pics\RENAMED_OLD.jpg")],
+            "test_rename",
+        );
+        assert_eq!(
+            app.detached_image_windows
+                .iter()
+                .map(|w| w.id)
+                .collect::<Vec<_>>(),
+            vec![71],
+            "旧 path の窓だけ閉じ、無関係な窓は残る (大文字小文字非区別)"
+        );
+    }
+
+    #[test]
+    fn rename_rewrites_presence_sets_and_resume_keys_in_memory() {
+        // rename transaction (§1.8): DB 移行は rename_key_migration (worker) 側でテスト
+        // 済み。ここでは in-memory 側 = 編集済みバッジの presence set と動画再生位置の
+        // キー付け替え (exact + `/` + `::`、隣接プレフィックス非巻き込み、新キー優先)。
+        let mut app = setup_app();
+        let old = std::path::Path::new(r"D:\Pics\Trip");
+        let new = std::path::Path::new(r"D:\Pics\Trip 2026");
+        let old_k = crate::adjustment_db::normalize_path(old);
+        let new_k = crate::adjustment_db::normalize_path(new);
+
+        app.adjusted_page_keys.insert(format!("{old_k}/a.jpg"));
+        app.adjusted_page_keys.insert(format!("{old_k}2/other.jpg"));
+        app.mask_page_keys.insert(old_k.clone());
+        app.comic_page_keys.insert(format!("{old_k}::p1.jpg"));
+        app.settings
+            .video_resume_positions
+            .insert(format!("{old_k}/v.mp4"), 12.0);
+        // 新キー側に既存値 (リネーム後に先へ再生した想定) → 既存優先。
+        app.settings
+            .video_resume_positions
+            .insert(format!("{old_k}/w.mp4"), 5.0);
+        app.settings
+            .video_resume_positions
+            .insert(format!("{new_k}/w.mp4"), 99.0);
+
+        app.rewrite_page_edit_presence_for_rename(old, new);
+        app.migrate_video_resume_positions_for_renamed_path(old, new);
+
+        assert!(app.adjusted_page_keys.contains(&format!("{new_k}/a.jpg")));
+        assert!(
+            app.adjusted_page_keys
+                .contains(&format!("{old_k}2/other.jpg")),
+            "隣接プレフィックス (Trip2) は巻き込まれない"
+        );
+        assert!(app.mask_page_keys.contains(&new_k), "exact キーも移る");
+        assert!(app.comic_page_keys.contains(&format!("{new_k}::p1.jpg")));
+        assert!(!app.comic_page_keys.contains(&format!("{old_k}::p1.jpg")));
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&format!("{new_k}/v.mp4")),
+            Some(&12.0),
+            "再生位置が新キーへ移る"
+        );
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&format!("{new_k}/w.mp4")),
+            Some(&99.0),
+            "新キー側の既存値を優先する"
+        );
+        assert!(
+            !app.settings
+                .video_resume_positions
+                .keys()
+                .any(|k| k.starts_with(&format!("{old_k}/"))),
+            "旧キーは残らない"
+        );
+    }
+
+    #[test]
+    fn rename_migration_queue_runs_fifo_and_lands_on_final_path() {
+        // Sol rename-mig P1: 連続リネーム A→B→C を並列 worker にすると逆順実行で
+        // 中間 path にデータが取り残される。FIFO 直列実行で最終 path に集約されること。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+
+        let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
+        let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
+        let c = std::path::PathBuf::from(r"D:\pics\c.jpg");
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("rotation.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL DEFAULT 0)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 90)",
+                [crate::adjustment_db::normalize_path(&a)],
+            )
+            .unwrap();
+        }
+
+        app.spawn_rename_key_migration(a.clone(), b.clone());
+        app.spawn_rename_key_migration(b.clone(), c.clone());
+        assert!(
+            app.rename_migration_in_flight.is_some(),
+            "1 本目は即時開始される"
+        );
+        assert_eq!(
+            app.rename_migration_queue.len(),
+            1,
+            "2 本目は直列キューで待機する"
+        );
+        assert_eq!(
+            crate::rename_key_migration::journal_load(dir.path()).len(),
+            2,
+            "未完了ジョブがジャーナルに永続化される (終了 / クラッシュ回復用)"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (app.rename_migration_in_flight.is_some() || !app.rename_migration_queue.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_rename_migration_pending(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.rename_migration_in_flight.is_none() && app.rename_migration_queue.is_empty(),
+            "両ジョブとも完了する"
+        );
+
+        let conn = rusqlite::Connection::open(dir.path().join("rotation.db")).unwrap();
+        let angle: i64 = conn
+            .query_row(
+                "SELECT angle FROM rotations WHERE path = ?1",
+                [crate::adjustment_db::normalize_path(&c)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(angle, 90, "FIFO 直列実行で最終 path に集約される");
+        assert!(
+            crate::rename_key_migration::journal_load(dir.path()).is_empty(),
+            "完了したジョブはジャーナルから消し込まれる"
+        );
+    }
+
+    #[test]
+    fn delete_invalidates_queued_rename_migrations() {
+        // 角度⑦ P1: 「A→B 改名 → 移行が待機中に B を削除」で、後から走る移行が削除済み
+        // B のメタデータ行を作り直さないよう、削除成功時にキューから該当ジョブを落とす。
+        let mut app = setup_app();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+        app.rename_migration_journal_loaded = true;
+
+        let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
+        let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
+        let x = std::path::PathBuf::from(r"D:\other\x.jpg");
+        let y = std::path::PathBuf::from(r"D:\other\y.jpg");
+        app.rename_migration_queue.push_back((a.clone(), b.clone()));
+        app.rename_migration_queue.push_back((x.clone(), y.clone()));
+        app.persist_rename_migration_journal();
+
+        app.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&b));
+        assert_eq!(
+            app.rename_migration_queue
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(x, y)],
+            "削除された B を新側に持つジョブだけが落ちる"
+        );
+        assert_eq!(
+            crate::rename_key_migration::journal_load(dir.path()).len(),
+            1,
+            "ジャーナルも同期して書き戻される"
+        );
+    }
+
+    #[test]
+    fn rename_completion_preserves_unrelated_edit_state() {
+        // 角度⑦ P1: 無関係なフォルダを表示・編集中に、別フォルダのリネーム移行が完了しても
+        // mounted 文脈の idx キー編集 state を吹き飛ばさない (旧実装は全消しで、ドラッグ中の
+        // 補正値消失 → 離した時に保存済み補正が削除される実害があった)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+        app.rename_migration_journal_loaded = true;
+
+        app.current_folder = Some(std::path::PathBuf::from(r"D:\unrelated"));
+        app.mask_pages.insert(3);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
+            old_path: std::path::PathBuf::from(r"D:\pics\a.jpg"),
+            new_path: std::path::PathBuf::from(r"D:\pics\b.jpg"),
+            rx,
+        });
+        tx.send(crate::rename_key_migration::RenameMigrationReport {
+            rows: 1,
+            errors: Vec::new(),
+            panicked: false,
+        })
+        .unwrap();
+        app.poll_rename_migration_pending(&ctx);
+
+        assert!(
+            app.mask_pages.contains(&3),
+            "無関係な文脈のページ編集 state は保持される"
+        );
+        assert!(
+            !app.rename_rehydrate_main_deferred,
+            "無関係な文脈では繰り延べフラグも立たない"
+        );
+    }
+
+    #[test]
+    fn rename_completion_rehydrates_synthetic_view_containing_renamed_item() {
+        // Sol 角度⑦検収 P2: 全体検索 / サブ展開の合成ビューは current_folder が合成 path
+        // なのでフォルダ照合に掛からない。items にリネーム対象が含まれれば再構築される。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+        app.rename_migration_journal_loaded = true;
+
+        app.current_folder = Some(std::path::PathBuf::from(r"D:\__search_view__"));
+        let idx = push_video(&mut app, r"D:\pics\b.jpg");
+        app.mask_pages.insert(idx); // 移行前 DB 由来の stale presence
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
+            old_path: std::path::PathBuf::from(r"D:\pics\a.jpg"),
+            new_path: std::path::PathBuf::from(r"D:\pics\b.jpg"),
+            rx,
+        });
+        tx.send(crate::rename_key_migration::RenameMigrationReport {
+            rows: 1,
+            errors: Vec::new(),
+            panicked: false,
+        })
+        .unwrap();
+        app.poll_rename_migration_pending(&ctx);
+
+        assert!(
+            app.mask_pages.is_empty(),
+            "リネーム対象を items に含む合成ビューは再構築される (stale presence が消える)"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn rename_completion_rehydrates_matching_parked_bundle() {
+        // 角度⑦ P2: 移行ギャップ中に hydrate した parked bundle の stale なページ編集
+        // state が、移行完了時に一時 mount で再構築される。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+        app.rename_migration_journal_loaded = true;
+
+        let media_tex = ctx.load_texture(
+            "rehydrate_parked",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.current_folder = Some(std::path::PathBuf::from(r"D:\pics"));
+        bundle.local_adjust_pages.insert(0); // 移行前 DB 由来の stale presence
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 91,
+                texture: media_tex,
+                title: "parked".to_owned(),
+                location_display: "parked".to_owned(),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: true,
+                paused_bundle: Some(Box::new(bundle)),
+            });
+        app.transition_detached_window_state(91, DetachedWindowState::Parked, "test_setup");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
+            old_path: std::path::PathBuf::from(r"D:\pics\a.jpg"),
+            new_path: std::path::PathBuf::from(r"D:\pics\b.jpg"),
+            rx,
+        });
+        tx.send(crate::rename_key_migration::RenameMigrationReport {
+            rows: 1,
+            errors: Vec::new(),
+            panicked: false,
+        })
+        .unwrap();
+        app.poll_rename_migration_pending(&ctx);
+
+        let rehydrated = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .expect("bundle は温存される");
+        assert!(
+            rehydrated.local_adjust_pages.is_empty(),
+            "改名アイテムの親フォルダを持つ parked bundle は再構築される (stale presence が消える)"
+        );
+    }
+
+    #[test]
+    fn rename_migration_panic_keeps_journal_entry_for_boot_retry() {
+        // Sol 角度⑤検収: panic した移行は残ストア未試行の可能性があるため、per-store
+        // エラーと違って消し込まず、ジャーナルに残して次回起動で再実行する。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+
+        let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
+        let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rename_migration_journal_loaded = true;
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight {
+            old_path: a.clone(),
+            new_path: b.clone(),
+            rx,
+        });
+        app.persist_rename_migration_journal();
+        tx.send(crate::rename_key_migration::RenameMigrationReport {
+            rows: 0,
+            errors: vec!["worker panicked".to_string()],
+            panicked: true,
+        })
+        .unwrap();
+
+        app.poll_rename_migration_pending(&ctx);
+        assert!(app.rename_migration_in_flight.is_none());
+        assert_eq!(
+            crate::rename_key_migration::journal_load(dir.path()),
+            vec![(a.clone(), b.clone())],
+            "panic した移行はジャーナルに残る (次回起動で再実行)"
+        );
+        assert_eq!(
+            app.rename_migration_boot_retry,
+            vec![(a, b)],
+            "セッション内では再試行せず boot_retry に退避する"
+        );
+    }
+
+    #[test]
+    fn rename_migration_journal_recovers_on_next_startup() {
+        // 角度⑤ Sol/Terra P1: 終了 / クラッシュ / トレイ Exit で失われた未完了移行を、
+        // 次回起動時にジャーナルから再実行して完走させる (移行は冪等)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.rename_migration_data_dir_override = Some(dir.path().to_path_buf());
+
+        let a = std::path::PathBuf::from(r"D:\pics\a.jpg");
+        let b = std::path::PathBuf::from(r"D:\pics\b.jpg");
+        // 前セッションのクラッシュを模擬: ジャーナルに未完了ジョブ + 未移行の DB。
+        crate::rename_key_migration::journal_save(dir.path(), &[(a.clone(), b.clone())]);
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("rotation.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL DEFAULT 0)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 270)",
+                [crate::adjustment_db::normalize_path(&a)],
+            )
+            .unwrap();
+        }
+
+        // 初回 poll がジャーナルを読み込み、回復ジョブを開始する。
+        app.poll_rename_migration_pending(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (app.rename_migration_in_flight.is_some() || !app.rename_migration_queue.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_rename_migration_pending(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let conn = rusqlite::Connection::open(dir.path().join("rotation.db")).unwrap();
+        let angle: i64 = conn
+            .query_row(
+                "SELECT angle FROM rotations WHERE path = ?1",
+                [crate::adjustment_db::normalize_path(&b)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(angle, 270, "回復ジョブが移行を完走させる");
+        assert!(
+            crate::rename_key_migration::journal_load(dir.path()).is_empty(),
+            "完了後はジャーナルが消える"
+        );
+    }
+
+    #[test]
+    fn removed_path_release_stops_matching_music_analysis() {
+        // Sol 角度④検収 P2: 音楽解析ワーカーは App-global で対象ファイルを decode 用に
+        // 開いている。削除対象が解析中なら release がビューごと破棄 (current 一致) するか、
+        // 解析だけ止める (pending のみ一致)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        // current 一致 → ビュー状態ごと破棄。ラウドネス測定 (App-global) も path 一致で
+        // cancel される (fs_idx は文脈依存なので使わない)。
+        let deleting = std::path::PathBuf::from(r"C:\music\deleting.flac");
+        app.music_analysis_path = Some(deleting.clone());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.music_analysis_pending = Some(MusicAnalysisPending {
+            path: deleting.clone(),
+            cancel: std::sync::Arc::clone(&cancel),
+            rx,
+        });
+        let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            fs_idx: 0,
+            cancel: std::sync::Arc::clone(&scan_cancel),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: false,
+            file_path: deleting.clone(),
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            std::slice::from_ref(&deleting),
+            "test_delete_music",
+        );
+        assert!(
+            app.music_analysis_path.is_none(),
+            "削除対象を解析中ならビュー状態ごと破棄される"
+        );
+        assert!(app.music_analysis_pending.is_none());
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "ワーカーの cancel が立つ (decode/解析の handle 解放)"
+        );
+        assert!(
+            app.normalize_state.is_none(),
+            "削除対象のラウドネス測定は畳まれる"
+        );
+        assert!(
+            scan_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "測定ワーカーの cancel が立つ (decode handle 解放)"
+        );
+
+        // pending のみ一致 (連続切替直後の stale ワーカー) → 解析だけ止まりビューは残る。
+        let other = std::path::PathBuf::from(r"C:\music\other.flac");
+        let stale = std::path::PathBuf::from(r"C:\music\deleting2.flac");
+        app.music_analysis_path = Some(other.clone());
+        let cancel2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx2, rx2) = std::sync::mpsc::channel();
+        app.music_analysis_pending = Some(MusicAnalysisPending {
+            path: stale.clone(),
+            cancel: std::sync::Arc::clone(&cancel2),
+            rx: rx2,
+        });
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            std::slice::from_ref(&stale),
+            "test_delete_music_stale",
+        );
+        assert_eq!(
+            app.music_analysis_path.as_deref(),
+            Some(other.as_path()),
+            "別ファイルのビュー状態は保持される"
+        );
+        assert!(app.music_analysis_pending.is_none());
+        assert!(cancel2.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn park_active_media_context_clears_stale_main_window_id() {
         // 同上の実機事象の発生源側: park_active_detached_context_as_live_media 後、復元された
@@ -19303,7 +20202,7 @@ mod still_window_mode_key_tests {
             });
         app.transition_detached_window_state(95, DetachedWindowState::ParkedLive, "test_setup");
 
-        assert!(app.parked_live_music_window_exists());
+        assert!(app.detached_music_window_exists());
         assert!(
             !app.should_clear_music_view_on_open(image),
             "parked 音楽窓が生きている間、非メディア open は music_* を破棄しない"
@@ -19319,8 +20218,35 @@ mod still_window_mode_key_tests {
 
         // parked 音楽窓が無くなれば従来どおり非メディア open で破棄する。
         app.detached_image_windows.clear();
-        assert!(!app.parked_live_music_window_exists());
+        assert!(!app.detached_music_window_exists());
         assert!(app.should_clear_music_view_on_open(image));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn active_detached_music_window_survives_main_close_fullscreen() {
+        // main フォルダ移動後も Active のメディア窓が参照する global 状態を維持する。
+        let mut app = setup_app();
+        let audio = push_audio(&mut app, r"C:\music\bgm.flac");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(audio);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(96);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        let path = std::path::PathBuf::from(r"C:\music\bgm.flac");
+        app.music_analysis_path = Some(path.clone());
+        app.music_pcm = Some(std::sync::Arc::new(
+            crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
+        ));
+        app.music_analysis_version = 17;
+
+        assert!(app.detached_music_window_exists());
+        app.close_fullscreen();
+
+        assert_eq!(app.music_analysis_path.as_deref(), Some(path.as_path()));
+        assert!(app.music_pcm.is_some());
+        assert_eq!(app.music_analysis_version, 17);
     }
 
     #[test]
@@ -21595,6 +22521,7 @@ mod still_window_mode_key_tests {
             request_id: 42,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
 
         assert!(
@@ -21628,6 +22555,7 @@ mod still_window_mode_key_tests {
             request_id: 1,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
 
         assert!(!app.viewer_session_is_detached());
@@ -21903,6 +22831,7 @@ mod still_window_mode_key_tests {
             request_id: 1,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: now + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
         assert!(!app.main_font_atlas_resync_settled_frame());
         app.native_video_mode_switch = None;
@@ -24563,6 +25492,7 @@ mod still_window_mode_key_tests {
             request_id: 7,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            announce_main_hint: false,
         });
         app.settings.detached_viewer_window_placement = Some(previous);
         app.detached_viewer_window_id = Some(12);
@@ -24664,6 +25594,7 @@ mod still_window_mode_key_tests {
             request_id: 7,
             target_presentation: ViewerPresentation::Fullscreen,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
         });
 
         app.toggle_detached_viewer_mode();

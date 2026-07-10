@@ -269,6 +269,18 @@ fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), WriteError> {
         f.write_all(bytes)?;
         f.sync_all().ok();
     }
+    // read してからここまでの間に target が削除 / 改名されていたら書き込みを破棄する。
+    // 無条件 rename だと「ゴミ箱へ削除済みのファイルを旧 path へ復活させる」「改名直後に
+    // 旧名の複製を作る」事故になる (review-v2.3.0 角度④ Terra P1: レーティング直後の
+    // 削除と書込ワーカーの競合)。存在確認と rename の間の TOCTOU 窓は残るが、
+    // read〜rename の数十 ms がチェック〜rename の µs 級まで縮む。
+    if !target.exists() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(WriteError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "対象ファイルが書き込み中に削除または移動されました",
+        )));
+    }
     match std::fs::rename(&tmp, target) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -1516,6 +1528,30 @@ mod tests {
 </x:xmpmeta>"#
             .as_bytes()
             .to_vec()
+    }
+
+    #[test]
+    fn write_atomically_discards_when_target_disappeared() {
+        // review-v2.3.0 角度④ Terra P1: read〜rename の間に対象が削除されると、
+        // 無条件 rename が削除済みファイルを復活させる。存在確認で破棄されること。
+        let dir = std::env::temp_dir().join(format!("miv-xmpw-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("gone.jpg");
+        // 対象が存在しない状態で書き込み → NotFound エラーで復活しない。
+        let err = write_atomically(&target, b"resurrected").unwrap_err();
+        assert!(matches!(
+            &err,
+            WriteError::Io(e) if e.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!target.exists(), "削除済み対象が復活してはならない");
+        // tmp ファイルも残らない。
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(leftovers.is_empty(), "tmp が残留: {leftovers:?}");
+        // 対象が存在すれば従来どおり置換される。
+        std::fs::write(&target, b"old").unwrap();
+        write_atomically(&target, b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

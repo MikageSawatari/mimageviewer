@@ -303,7 +303,7 @@ impl App {
         // に設定する。早期 return 経路で上書きすると、in-flight の前バッチの完了トーストが
         // 誤ったタグ名を名乗る (空 targets での中断 → 古いバッチに新ラベル)。
         self.tag_toast_label = Some(format!("#{name_owned}"));
-        self.tag_toast_surface = Some(surface);
+        self.set_tag_toast_surface_for_new_batch(surface);
         self.hydrate_tags_cache_for_paths(&paths);
         let tag_key = crate::tags_db::normalize_tag_key(&name_owned);
         let all_have_tag = paths.iter().all(|path| {
@@ -424,7 +424,7 @@ impl App {
 
         let with_hash = crate::tags_db::format_display_tag(&name);
         self.tag_toast_label = Some(with_hash.clone());
-        self.tag_toast_surface = Some(surface);
+        self.set_tag_toast_surface_for_new_batch(surface);
         let summary = if add {
             format!("{with_hash} の付与")
         } else {
@@ -484,7 +484,7 @@ impl App {
         // 早期 return 経路で上書きすると in-flight の前バッチの完了トーストが
         // 誤った面/ラベルで表示される — Codex P3)。
         self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
-        self.tag_toast_surface = Some(surface);
+        self.set_tag_toast_surface_for_new_batch(surface);
         // 楽観的 UI 更新: tags.db 上の mIV タグを空にする。
         let summary = format!("{count} 件の mIV タグをクリア");
         self.optimistic_update_tags_cache(&paths, |_before| Vec::new());
@@ -492,6 +492,30 @@ impl App {
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
         self.submit_tag_jobs(&targets, "clear", tx_id, |_| TagJobKind::ClearMiv);
+    }
+
+    /// 新しいタグバッチの発火面を単一スロット `tag_toast_surface` に記録する。
+    /// 完了トーストはキュー全体で 1 本 (label と同じ設計) のため、in-flight バッチと
+    /// 発火面が食い違う場合は面を確定できない — その場合は従来の全面表示 (None) に
+    /// 落とし、混在バッチの完了が最後の面へ誤着弾しないようにする (Sol P2)。
+    ///
+    /// in-flight 判定は worker カウンタの未リセット (`has_unconsumed_batch`) を使う。
+    /// `pending_tag_undos` は `clear_meta_undo` (フォルダ移動等) が worker 稼働中でも
+    /// 意図的に破棄するため proxy にならず、`is_busy()` も worker が結果送信前に
+    /// done を進めるため「完了したが未 poll」の 1 フレーム窓を取りこぼす
+    /// (Sol P2 追指摘×2)。カウンタは完了 poll の `reset_counters_if_idle` まで
+    /// 残るので、「前バッチが完了トーストとして未集計」を正しく表す。
+    /// この呼び出しは新バッチの submit 前に行われる。
+    fn set_tag_toast_surface_for_new_batch(&mut self, surface: crate::app::ActionSurface) {
+        let in_flight = self
+            .tag_write_handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_unconsumed_batch());
+        if !in_flight || self.tag_toast_surface == Some(surface) {
+            self.tag_toast_surface = Some(surface);
+        } else {
+            self.tag_toast_surface = None;
+        }
     }
 
     /// `tag_write_handle` を遅延初期化し、利用可能か確認する。

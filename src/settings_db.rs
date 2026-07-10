@@ -478,6 +478,15 @@ impl SettingsDb {
                 )));
             }
         };
+        // facet_filter は「kinds の Audio を v2.2.0 互換キャリアへ退避した形」で書く。
+        // live な settings は変更せず、永続化用クローンにだけ適用する
+        // (詳細は `FacetFilter::kind_audio_stash` のコメント。読み戻しは
+        // `Settings::sanitize` の `restore_kind_audio_after_load`)。
+        {
+            let mut ff = settings.facet_filter.clone();
+            ff.stash_kind_audio_for_persist();
+            map.insert("facet_filter".into(), serde_json::to_value(ff)?);
+        }
         let complex = extract_complex_fields(map);
 
         // 3. transaction 内で DB 更新

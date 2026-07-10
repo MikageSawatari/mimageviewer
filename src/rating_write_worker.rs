@@ -35,6 +35,8 @@ pub struct RatingWriteResult {
 pub struct RatingWriteHandle {
     job_tx: Sender<RatingWriteJob>,
     result_rx: Receiver<RatingWriteResult>,
+    /// submit したジョブ数 (busy 判定用。done と対で読む)。
+    submitted: Arc<AtomicUsize>,
     pub done: Arc<AtomicUsize>,
     pub failures: Arc<AtomicUsize>,
     _thread: Option<std::thread::JoinHandle<()>>,
@@ -62,6 +64,7 @@ impl RatingWriteHandle {
         Self {
             job_tx,
             result_rx,
+            submitted: Arc::new(AtomicUsize::new(0)),
             done,
             failures,
             _thread: Some(handle),
@@ -70,7 +73,13 @@ impl RatingWriteHandle {
     }
 
     pub fn submit(&self, job: RatingWriteJob) {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
         let _ = self.job_tx.send(job);
+    }
+
+    /// 実行待ち / 実行中のジョブが残っているか (リネーム移行の開始ゲート用)。
+    pub fn is_busy(&self) -> bool {
+        self.submitted.load(Ordering::Relaxed) != self.done.load(Ordering::Relaxed)
     }
 
     pub fn try_recv_result(&self) -> Option<RatingWriteResult> {

@@ -22,6 +22,10 @@ use std::sync::mpsc;
 /// 大きいほど Shell の固定費を畳めるが、mIV 側キャンセルはチャンク間でしか効かない。
 const FILE_OPERATION_CHUNK_SIZE: usize = 100;
 
+/// viewer close 後の decoder teardown を待つための Shell 再試行上限。
+const DELETE_RETRY_LIMIT: usize = 5;
+const DELETE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// ワーカーから UI への進捗通知。
 #[derive(Debug)]
 pub enum DeleteMsg {
@@ -120,7 +124,7 @@ fn run_worker_with_recycler<F>(
         }
 
         let t0 = std::time::Instant::now();
-        let outcome = recycle(hwnd, chunk);
+        let outcome = recycle_chunk_with_retry(hwnd, chunk, &cancel, &mut recycle);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "delete",
@@ -175,6 +179,7 @@ struct DeleteChunkOutcome {
     succeeded: Vec<PathBuf>,
     failed: Vec<(PathBuf, String)>,
     shell_aborted: bool,
+    retryable: bool,
 }
 
 impl DeleteChunkOutcome {
@@ -187,8 +192,76 @@ impl DeleteChunkOutcome {
                 .map(|path| (path, message.clone()))
                 .collect(),
             shell_aborted: false,
+            retryable: false,
         }
     }
+}
+
+fn recycle_chunk_with_retry<F>(
+    hwnd: isize,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    recycle: &mut F,
+) -> DeleteChunkOutcome
+where
+    F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
+{
+    let mut pending = paths.to_vec();
+    let mut succeeded = Vec::new();
+    for retry in 0..=DELETE_RETRY_LIMIT {
+        let outcome = recycle(hwnd, &pending);
+        succeeded.extend(outcome.succeeded);
+        if outcome.failed.is_empty() {
+            return DeleteChunkOutcome {
+                succeeded,
+                failed: Vec::new(),
+                shell_aborted: outcome.shell_aborted,
+                retryable: false,
+            };
+        }
+        if !outcome.retryable || retry == DELETE_RETRY_LIMIT || cancel.load(Ordering::Relaxed) {
+            return DeleteChunkOutcome {
+                succeeded,
+                failed: outcome.failed,
+                shell_aborted: outcome.shell_aborted,
+                retryable: outcome.retryable,
+            };
+        }
+        if wait_retry_backoff(cancel) {
+            return DeleteChunkOutcome {
+                succeeded,
+                failed: outcome.failed,
+                shell_aborted: outcome.shell_aborted,
+                retryable: true,
+            };
+        }
+        // 成功済み項目は再投入せず、残った失敗項目だけを新しい IFileOperation で試す。
+        pending = outcome.failed.into_iter().map(|(path, _)| path).collect();
+    }
+    unreachable!()
+}
+
+fn wait_retry_backoff(cancel: &AtomicBool) -> bool {
+    let deadline = std::time::Instant::now() + DELETE_RETRY_BACKOFF;
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    cancel.load(Ordering::Relaxed)
+}
+
+fn is_retryable_shell_failure(shell_aborted: bool, hresult: Option<i32>) -> bool {
+    const WIN32_SHARING: i32 = 0x8007_0020_u32 as i32;
+    const WIN32_LOCK: i32 = 0x8007_0021_u32 as i32;
+    const COPYENGINE_SHARING_SRC: i32 = 0x8027_0027_u32 as i32;
+    const COPYENGINE_SHARING_DEST: i32 = 0x8027_0028_u32 as i32;
+    shell_aborted
+        || matches!(
+            hresult,
+            Some(WIN32_SHARING | WIN32_LOCK | COPYENGINE_SHARING_SRC | COPYENGINE_SHARING_DEST)
+        )
 }
 
 /// `IFileOperation` (削除) のフラグ。**FOF_WANTNUKEWARNING を必ず含める**こと。
@@ -321,6 +394,7 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
             succeeded,
             failed,
             shell_aborted: false,
+            retryable: false,
         };
     }
 
@@ -328,6 +402,10 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
     let shell_aborted = unsafe { op.GetAnyOperationsAborted() }
         .map(|v| v.as_bool())
         .unwrap_or(false);
+    let retryable = is_retryable_shell_failure(
+        shell_aborted,
+        perform_error.as_ref().map(|error| error.code().0),
+    );
 
     for path in scheduled {
         if path_is_gone(&path) {
@@ -348,6 +426,7 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
         succeeded,
         failed,
         shell_aborted,
+        retryable,
     }
 }
 
@@ -396,6 +475,7 @@ mod worker_tests {
                 .map(|path| (path, "simulated failure".to_string()))
                 .collect(),
             shell_aborted,
+            retryable: shell_aborted,
         }
     }
 
@@ -414,7 +494,53 @@ mod worker_tests {
     }
 
     #[test]
-    fn worker_continues_after_shell_aborted_chunk() {
+    fn retry_decision_accepts_abort_and_sharing_hresult() {
+        assert!(is_retryable_shell_failure(true, None));
+        assert!(is_retryable_shell_failure(
+            false,
+            Some(0x8007_0020_u32 as i32)
+        ));
+        assert!(is_retryable_shell_failure(
+            false,
+            Some(0x8027_0027_u32 as i32)
+        ));
+        assert!(!is_retryable_shell_failure(false, None));
+        assert!(!is_retryable_shell_failure(
+            false,
+            Some(0x8007_0005_u32 as i32)
+        ));
+    }
+
+    #[test]
+    fn retry_requeues_only_failed_paths() {
+        let paths = dummy_paths(2);
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        let outcome = recycle_chunk_with_retry(0, &paths, &cancel, &mut |_hwnd, chunk| {
+            calls += 1;
+            if calls == 1 {
+                DeleteChunkOutcome {
+                    succeeded: vec![chunk[0].clone()],
+                    failed: vec![(chunk[1].clone(), String::new())],
+                    shell_aborted: true,
+                    retryable: true,
+                }
+            } else {
+                DeleteChunkOutcome {
+                    succeeded: chunk.to_vec(),
+                    failed: Vec::new(),
+                    shell_aborted: false,
+                    retryable: false,
+                }
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(outcome.succeeded, paths);
+        assert!(outcome.failed.is_empty());
+    }
+
+    #[test]
+    fn worker_continues_after_failed_chunk() {
         let paths = dummy_paths(FILE_OPERATION_CHUNK_SIZE + 1);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -422,7 +548,7 @@ mod worker_tests {
 
         run_worker_with_recycler(paths, 0, cancel, tx, |_hwnd, chunk| {
             calls += 1;
-            failed_outcome(chunk, calls == 1)
+            failed_outcome(chunk, false)
         });
 
         let messages: Vec<_> = rx.try_iter().collect();

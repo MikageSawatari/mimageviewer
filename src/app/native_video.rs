@@ -32,7 +32,7 @@ fn native_video_key_physically_down(
 /// ピン留めボタンが押されたが thumb worker キャッシュにそのフレームがまだ無い場合、
 /// 1 件だけ pending を保持して `tick_pending_pin_thumb_refresh` が後続フレームで
 /// 完了をポーリングし、揃ったところで `VideoPinDb::set_pin` を再呼び出ししてグリッド
-/// サムネに反映する (`video_thumb_overrides_dirty` を立て直す)。
+/// サムネに反映する (`video_thumb_overrides_dirty_paths` を立て直す)。
 #[cfg(windows)]
 pub(crate) struct PendingPinThumbRefresh {
     pub(crate) fs_idx: usize,
@@ -2205,6 +2205,7 @@ impl App {
                 request_id,
                 target_presentation,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                announce_main_hint: false,
             });
         }
         crate::logger::log(format!(
@@ -2271,6 +2272,7 @@ impl App {
             request_id,
             target_presentation: ViewerPresentation::DetachedWindow,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            announce_main_hint: false,
         });
         crate::logger::log(format!(
             "[native-video] sync detached child rect request={request_id} \
@@ -2487,7 +2489,7 @@ impl App {
     /// presentation/session/settings を反映する。stale/mismatch な成功通知で新状態を巻き
     /// 戻さないため。
     #[cfg(windows)]
-    fn apply_native_video_placement_switch_state(
+    pub(super) fn apply_native_video_placement_switch_state(
         &mut self,
         request_id: u64,
         placement: crate::video::NativeVideoPlacement,
@@ -2502,6 +2504,13 @@ impl App {
                     "[native-video] PlacementSwitched request={request_id} matched pending; \
                      applied {presentation:?} generation={generation}"
                 ));
+                // F12/リングのメディア窓→メイン切替は、確定したここで初めて案内する
+                // (Sol P2: 要求発行時に出すと presenter 無応答でも「切り替えました」が出る)。
+                if p.announce_main_hint
+                    && !matches!(presentation, ViewerPresentation::DetachedWindow)
+                {
+                    self.show_media_window_main_hint_toast();
+                }
             }
             Some(p) if p.target_presentation == presentation => {
                 // request_id はズレたが presenter が pending の目標に収束した。
@@ -2513,6 +2522,11 @@ impl App {
                      presenter converged to pending target {presentation:?}; applied \
                      generation={generation}"
                 ));
+                if p.announce_main_hint
+                    && !matches!(presentation, ViewerPresentation::DetachedWindow)
+                {
+                    self.show_media_window_main_hint_toast();
+                }
             }
             Some(_) => {
                 // stale かつ pending target とも不一致: 反映しない (巻き戻し防止)。
@@ -4548,9 +4562,37 @@ impl App {
                 let Some(db) = self.video_pin_db.as_ref() else {
                     return;
                 };
+                // DB に同じ pin 位置の現行サムネが既にあるなら書き直さない (dirty も
+                // 立てない)。マーカーキャッシュは App-global のため、メイン側の
+                // フォルダ再ロード (close_fullscreen) で破棄→再構築されるたびに
+                // pending_saves が同一 WebP をここへ再発行する。無条件に set_pin +
+                // dirty すると「dirty → メイン再ロード → キャッシュ再構築 → また
+                // dirty」の自己ループになり、~50ms 周期の再ロード連打で全動画サムネが
+                // Pending (黒) に固着する (実機 2026-07-10、§1.7 メディア別窓 + P ピン)。
+                // in-memory キャッシュ側の表示フィールドだけ同期して終了する。
+                // 許容制限 (Sol P2): 照合はメタ (pts) のみで blob 内容は見ない。同一パスで
+                // 動画ファイル自体を差し替えた場合など、旧フレームが DB に残り得るが、
+                // byte 比較は抽出フレームの揺らぎで再ループするリスクがあるため採らない
+                // (ピンを付け直せば pts が変わり回復する)。
+                let db_thumb_current = db.lookup_meta(path).is_some_and(|meta| {
+                    (meta.pin_pts_secs - pts_secs).abs() < 1e-3 && meta.thumb_is_current()
+                });
+                if db_thumb_current {
+                    if let Some(cache) = self
+                        .fullscreen_video_marker_cache
+                        .as_mut()
+                        .filter(|cache| cache.fs_idx == fs_idx && cache.path.as_path() == path)
+                    {
+                        cache.pin_pts = Some(pts_secs);
+                        cache.pin_thumbnail = Some(cached);
+                        cache.pin_thumb_current = true;
+                    }
+                    return;
+                }
                 match db.set_pin(path, pts_secs, &thumb_webp) {
                     Ok(()) => {
-                        self.video_thumb_overrides_dirty = true;
+                        self.video_thumb_overrides_dirty_paths
+                            .insert(path.to_path_buf());
                         if let Some(cache) = self
                             .fullscreen_video_marker_cache
                             .as_mut()
@@ -5590,7 +5632,17 @@ impl App {
         if let (Some(path), Some(db)) = (path, self.video_pin_db.as_ref()) {
             match db.remove(&path) {
                 Ok(()) => {
-                    self.video_thumb_overrides_dirty = true;
+                    // P ピン直後の後追い WebP 補完 (`tick_pending_pin_thumb_refresh`) が
+                    // 残っていると、解除後に set_pin が走ってピンが復活する (Codex P1)。
+                    // 解除した path の pending はここで破棄する。
+                    if self
+                        .pending_pin_thumb_refresh
+                        .as_ref()
+                        .is_some_and(|p| p.path == path)
+                    {
+                        self.pending_pin_thumb_refresh = None;
+                    }
+                    self.video_thumb_overrides_dirty_paths.insert(path.clone());
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                         player.set_native_hover_preview_pinned(false);
                     }
@@ -5876,7 +5928,7 @@ impl App {
         let webp_was_empty = webp.is_empty();
         match db.set_pin(&path, pts, &webp) {
             Ok(()) => {
-                self.video_thumb_overrides_dirty = true;
+                self.video_thumb_overrides_dirty_paths.insert(path.clone());
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_hover_preview_pinned(true);
                 }
@@ -6002,7 +6054,7 @@ impl App {
         if let Some(db) = self.video_pin_db.as_ref() {
             match db.set_pin(&path, pts, &webp) {
                 Ok(()) => {
-                    self.video_thumb_overrides_dirty = true;
+                    self.video_thumb_overrides_dirty_paths.insert(path.clone());
                     self.refresh_fullscreen_video_marker_cache(fs_idx);
                     self.sync_native_video_timeline_markers(fs_idx);
                     crate::logger::log(format!(
