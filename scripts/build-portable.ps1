@@ -14,11 +14,19 @@
 
 [CmdletBinding()]
 param(
-    [switch] $SkipBuild
+    [switch] $SkipBuild,
+    [switch] $Sign
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Get-Location).Path
+
+# Optional code signing (Certum / SimplySign). Assert the certificate up front
+# when -Sign is set (SimplySign Desktop must be logged in). See sign-files.ps1.
+if ($Sign) {
+    . (Join-Path $PSScriptRoot 'sign-files.ps1')
+    Assert-MivSignReady
+}
 
 # ---------------------------------------------------------------------------
 # LIBCLANG_PATH (ffmpeg-sys-the-third bindgen). Mirror of build-release.ps1.
@@ -162,6 +170,24 @@ if ($absent) {
 
 $exeSizeMb = [math]::Round((Get-Item $coreExe).Length / 1MB, 1)
 Write-Host "[portable] portable core exe size: $exeSizeMb MB (embedded native deps removed)"
+
+# ---------------------------------------------------------------------------
+# Sign the loose PE files (portable ships them uncompressed, no embedding), so
+# sign the actual package copies here. onnxruntime*.dll are Microsoft-signed and
+# NOT re-signed; models/*.onnx and the text files are not PE. vst3-host is not
+# bundled in the portable package.
+# ---------------------------------------------------------------------------
+if ($Sign) {
+    $portablePe = @(
+        'mimageviewer.exe',
+        'pdfium.dll',
+        'mimageviewer-susie32.exe',
+        'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',
+        'avfilter-10.dll', 'swscale-8.dll', 'swresample-5.dll'
+    ) | ForEach-Object { Join-Path $pkgDir $_ }
+    Write-Host "[portable] signing portable PE files"
+    Invoke-MivSign -Files $portablePe -Verify
+}
 
 # ---------------------------------------------------------------------------
 # Zip it.

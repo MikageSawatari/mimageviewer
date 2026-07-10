@@ -28,13 +28,24 @@
 
 [CmdletBinding()]
 param(
-    [switch] $SkipVst3Bridge
+    [switch] $SkipVst3Bridge,
+    [switch] $NoSign
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Get-Location).Path
 $scripts = Join-Path $repoRoot 'scripts'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
+
+# Code signing is ON by default for distribution builds; pass -NoSign to skip it.
+# Assert the signing certificate up front (SimplySign Desktop must be running and
+# logged in) so a missing cert fails before the multi-minute clean+build, not
+# after. build-release.ps1 / build-portable.ps1 do the actual interleaved signing.
+$sign = -not $NoSign
+if ($sign) {
+    . (Join-Path $scripts 'sign-files.ps1')
+    Assert-MivSignReady
+}
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
@@ -51,6 +62,7 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (e
 # --- 2. Core + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
+if ($sign) { $releaseArgs += '-Sign' }
 Write-Host ("[build-dist] (2/4) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-release.ps1') @releaseArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-release.ps1 failed (exit {0})" -f $LASTEXITCODE) }
@@ -71,9 +83,19 @@ Write-Host ("[build-dist] (3/4) {0} installer\mimageviewer.iss" -f $isccPath)
 & $isccPath (Join-Path $repoRoot 'installer\mimageviewer.iss')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] ISCC failed (exit {0})" -f $LASTEXITCODE) }
 
+if ($sign) {
+    # Sign the installer itself. The launcher inside it was already signed in
+    # step 2 (build-release), before Inno embedded it.
+    $setupExe = Join-Path $repoRoot 'installer\Output\mImageViewer_setup.exe'
+    Write-Host ("[build-dist]       signing {0}" -f $setupExe)
+    Invoke-MivSign -Files @($setupExe) -Verify
+}
+
 # --- 4. Portable (into target-portable; its app package was cleaned above) ---
+$portableArgs = @()
+if ($sign) { $portableArgs += '-Sign' }
 Write-Host "[build-dist] (4/4) build-portable.ps1"
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-portable.ps1')
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-portable.ps1') @portableArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-portable.ps1 failed (exit {0})" -f $LASTEXITCODE) }
 
 # --- Summary ---

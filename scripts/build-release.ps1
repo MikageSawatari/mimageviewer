@@ -16,11 +16,20 @@
 [CmdletBinding()]
 param(
     [switch] $SkipVst3Bridge,
+    [switch] $Sign,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $CargoArgs
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Optional code signing (Certum / SimplySign). Imported only when -Sign is set.
+# Assert the certificate is available (SimplySign Desktop logged in) up front so
+# a missing cert fails fast, before the multi-minute build. See sign-files.ps1.
+if ($Sign) {
+    . (Join-Path $PSScriptRoot 'sign-files.ps1')
+    Assert-MivSignReady
+}
 
 function Ensure-LibclangPath {
     if ($env:LIBCLANG_PATH) {
@@ -269,6 +278,26 @@ if (-not $SkipVst3Bridge) {
     Write-Warning "[build-release] skipping VST3 bridge rebuild; core will embed the existing vendor/vst3-host exe."
 }
 
+if ($Sign) {
+    # Sign every vendor PE that core/launcher embed with include_bytes! and later
+    # extract to APPDATA, so the EXTRACTED copies carry our signature. This must
+    # happen BEFORE the builds embed them. onnxruntime*.dll are Microsoft-signed
+    # and are intentionally NOT re-signed; *.onnx models are not PE files.
+    $vendorEmbedTargets = @(
+        'vendor\pdfium\bin\pdfium.dll',
+        'vendor\susie-worker\mimageviewer-susie32.exe',
+        'vendor\vst3-host\mimageviewer-vst3-host.exe',
+        'vendor\ffmpeg\bin\avcodec-61.dll',
+        'vendor\ffmpeg\bin\avformat-61.dll',
+        'vendor\ffmpeg\bin\avutil-59.dll',
+        'vendor\ffmpeg\bin\avfilter-10.dll',
+        'vendor\ffmpeg\bin\swscale-8.dll',
+        'vendor\ffmpeg\bin\swresample-5.dll'
+    ) | ForEach-Object { Join-Path $repoRoot $_ }
+    Write-Host "[build-release] signing vendor embed-targets (pre-core/launcher)"
+    Invoke-MivSign -Files $vendorEmbedTargets
+}
+
 Ensure-LibclangPath
 
 # NOTE: this script is the fast DEV build (incremental, shared target\release).
@@ -283,11 +312,24 @@ Write-Host ("[build-release] (2/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd
 if ($coreExit -ne 0) { exit $coreExit }
 
+if ($Sign) {
+    # Sign core BEFORE the launcher build, because the launcher embeds core.exe
+    # with include_bytes! (and extracts it to APPDATA at runtime).
+    Write-Host "[build-release] signing mimageviewer-core.exe (pre-launcher)"
+    Invoke-MivSign -Files @((Join-Path $repoRoot 'target\release\mimageviewer-core.exe'))
+}
+
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
 Write-Host ("[build-release] (3/3) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
 $launcherExit = Invoke-ReleaseCargo -Args $launcherCmd
 if ($launcherExit -ne 0) { exit $launcherExit }
+
+if ($Sign) {
+    # Sign the launcher (the distributed single exe) and verify the final artifact.
+    Write-Host "[build-release] signing mimageviewer.exe (launcher)"
+    Invoke-MivSign -Files @($releaseExe) -Verify
+}
 
 $extractedBridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
 $extractedBridgeHash = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe.sha256'

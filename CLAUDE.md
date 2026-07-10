@@ -1410,7 +1410,18 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       ([docs は feedback_release_stale_core_cache の方針] 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
     - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
+    - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
+      のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
+      core / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
+      **`include_bytes!` で埋め込む物は「埋め込み前」に署名する** (内側 vendor PE → core → launcher → setup.exe の順)。
+      でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知 ([[project_portable_av_false_positive]]) が
+      再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
+      **前提: 署名前に SimplySign Desktop を起動しログインしておく** (未ログインなら clean 前に `Assert-MivSignReady`
+      で即停止)。署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
+      (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
+      `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **開発中の素早い反復は `.\scripts\build-release.ps1` 単体** (incremental・clean なし・速い)。
+      署名も既定 OFF (署名込みで作りたいときだけ `-Sign`)。
       stale 検出ガードは持たないので**配布物の生成には使わない** (必ず build-dist.ps1)。
     - portable core は専用 target dir `target-portable` に分離して焼くので、非portable の
       `target\release\mimageviewer-core.exe` を上書きしない (フレーバー混入防止)。
@@ -1436,6 +1447,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     - メイン exe: `ort` クレート機能から `load-dynamic` が抜けていないか確認
     - Susie ワーカー: `.cargo/config.toml` の `i686-pc-windows-msvc` 向け
       `+crt-static` 設定が残っているか確認
+12.5. **コード署名の回帰チェック** — 配布成果物 (単体exe / setup.exe / portable の mimageviewer.exe) に
+    `signtool verify /pa /v <exe>` を走らせ、`Open Source Developer Taku Sano` 名義の証明書チェーン
+    (Certum Code Signing → Certum Trusted Network CA) と **RFC3161 タイムスタンプ**が付いていることを
+    目視確認する。build-dist は署名時に検証も済ませているが、最終成果物で 1 度確認する。未署名・失効なら
+    SimplySign Desktop のログイン状態を確認 (証明書は 1 年ごとに更新 → 更新時は `sign-files.ps1` の
+    既定 subject が一致するか、または `$env:MIV_SIGN_SHA1` を新拇印に更新)。
 
 ### Phase 4: GitHub Release 公開
 
