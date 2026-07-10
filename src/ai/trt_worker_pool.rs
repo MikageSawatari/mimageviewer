@@ -467,6 +467,26 @@ impl TrtWorkerPool {
         kind: super::ModelKind,
         input: &ndarray::Array4<f32>,
     ) -> Result<(Vec<i64>, Vec<f32>), String> {
+        self.infer_impl(kind, input)
+    }
+
+    /// 非 Windows stub (`start_with_exe` と同パターン)。TRT worker は共有メモリ
+    /// IPC が Windows 専用なので、呼ばれたら常に Err を返す。
+    #[cfg(not(windows))]
+    pub fn infer(
+        &self,
+        _kind: super::ModelKind,
+        _input: &ndarray::Array4<f32>,
+    ) -> Result<(Vec<i64>, Vec<f32>), String> {
+        Err("TRT worker pool は Windows 専用".to_string())
+    }
+
+    #[cfg(windows)]
+    fn infer_impl(
+        &self,
+        kind: super::ModelKind,
+        input: &ndarray::Array4<f32>,
+    ) -> Result<(Vec<i64>, Vec<f32>), String> {
         if self.is_dead() {
             return Err("worker is dead (前段で死亡判定済み)".to_string());
         }

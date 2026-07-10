@@ -98,6 +98,20 @@ fn dark_tooltip_frame() -> egui::Frame {
 /// アクセシビリティ設定での拡大や高 DPI でも正しい。
 #[allow(dead_code)]
 fn cursor_extent_physical() -> Option<(f32, f32)> {
+    // 非 Windows では計測不可 → None (呼び出し側が固定 fallback 値を使う)。
+    #[cfg(not(windows))]
+    {
+        return None;
+    }
+
+    #[cfg(windows)]
+    {
+        cursor_extent_physical_win()
+    }
+}
+
+#[cfg(windows)]
+fn cursor_extent_physical_win() -> Option<(f32, f32)> {
     use std::ffi::c_void;
     use windows::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW, HGDIOBJ};
     use windows::Win32::UI::WindowsAndMessaging::{

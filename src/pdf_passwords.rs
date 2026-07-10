@@ -7,8 +7,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Digest, Sha256};
+// windows-dpapi クレートは中身がすべて #[cfg(windows)] で、非 Windows ターゲット
+// では空クレートになる (= この use が unresolved import でコンパイル不能になる)。
+// 非 Windows ビルド (CI の ubuntu cargo check) を通すため use と暗号化経路を
+// cfg(windows) でガードし、非 Windows では get=None / set=no-op にする。
+#[cfg(windows)]
 use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 
 // -----------------------------------------------------------------------
@@ -51,24 +57,40 @@ impl PdfPasswordStore {
     }
 
     /// 指定 PDF パスの保存済みパスワードを DPAPI で復号して返す。
+    /// 非 Windows では DPAPI が無いので常に None (保存済みパスワード機能は無効)。
     pub fn get(&self, pdf_path: &Path) -> Option<String> {
-        let hash = Self::path_hash(pdf_path);
-        let b64 = self.entries.get(&hash)?;
-        let encrypted = BASE64.decode(b64).ok()?;
-        let decrypted = decrypt_data(&encrypted, Scope::User, None).ok()?;
-        String::from_utf8(decrypted).ok()
+        #[cfg(windows)]
+        {
+            let hash = Self::path_hash(pdf_path);
+            let b64 = self.entries.get(&hash)?;
+            let encrypted = BASE64.decode(b64).ok()?;
+            let decrypted = decrypt_data(&encrypted, Scope::User, None).ok()?;
+            String::from_utf8(decrypted).ok()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pdf_path;
+            None
+        }
     }
 
-    /// パスワードを DPAPI で暗号化して保存する。
+    /// パスワードを DPAPI で暗号化して保存する。非 Windows では no-op。
     pub fn set(&mut self, pdf_path: &Path, password: &str) {
-        let hash = Self::path_hash(pdf_path);
-        match encrypt_data(password.as_bytes(), Scope::User, None) {
-            Ok(encrypted) => {
-                self.entries.insert(hash, BASE64.encode(&encrypted));
+        #[cfg(windows)]
+        {
+            let hash = Self::path_hash(pdf_path);
+            match encrypt_data(password.as_bytes(), Scope::User, None) {
+                Ok(encrypted) => {
+                    self.entries.insert(hash, BASE64.encode(&encrypted));
+                }
+                Err(e) => {
+                    eprintln!("pdf_passwords DPAPI encrypt failed: {e}");
+                }
             }
-            Err(e) => {
-                eprintln!("pdf_passwords DPAPI encrypt failed: {e}");
-            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (pdf_path, password);
         }
     }
 

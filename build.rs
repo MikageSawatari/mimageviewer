@@ -1,7 +1,19 @@
 fn main() {
+    // vendor アセットのチェックと winresource 埋め込みは **Windows ターゲット**の
+    // ビルドでのみ行う。CI (ubuntu) では `cargo check --bin mimageviewer-core
+    // --features portable` を回して #[cfg(windows)] 宣言の unguarded 参照を検出する
+    // が、そこでは vendor/ が存在しない (portable feature により include_bytes! の
+    // vendor 参照もコンパイルされない)。
+    // 注意: build.rs 自体は HOST 用にコンパイルされるため、#[cfg(target_os)] は
+    // クロスコンパイル時にターゲット判定として機能しない。ターゲット側の
+    // CARGO_CFG_TARGET_OS 環境変数で実行時判定する。
+    let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+
     // 先に vendor ファイルの存在チェックをして、cryptic な include_bytes! エラーに
     // 代わって復旧手順付きの明確なメッセージを出す。
-    check_vendor_files();
+    if target_is_windows {
+        check_vendor_files();
+    }
 
     // 絵文字スタンプ (Twemoji SVG) を exe に同梱するためのコード生成 (Inc 4c)。
     generate_emoji_assets();
@@ -25,8 +37,9 @@ fn main() {
     // 合わない。`/DELAYLOAD` も rustc 経由の link.exe で Delay Import Directory が
     // 空のまま生成される問題があり機能せず、最終的にランチャー方式に切り替えた。
 
+    // ↑と同じく Windows ターゲット限定 (cfg は HOST 判定なので実行時ガードも併用)。
     #[cfg(target_os = "windows")]
-    {
+    if target_is_windows {
         // VS_FIXEDFILEINFO は winresource が CARGO_PKG_VERSION_{MAJOR,MINOR,PATCH}
         // から自動で 0.9.0.0 を埋める。文字列版 (ファイルプロパティに表示される) も
         // 揃えるため CARGO_PKG_VERSION から導出する (以前は "0.1.0.0" 決め打ちで

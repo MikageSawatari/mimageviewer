@@ -17,13 +17,23 @@
 use std::path::Path;
 
 /// COM 初期化スコープガード。Drop 時に自動で CoUninitialize を呼ぶ。
+/// 非 Windows では no-op (このモジュールの decode 系 stub と同じ方針)。
 pub(crate) struct ComScope {
+    #[cfg_attr(not(windows), allow(dead_code))]
     needs_uninit: bool,
 }
 
 impl ComScope {
     /// COM を初期化する。既に初期化済みの場合も安全に扱う。
     pub fn init() -> Self {
+        #[cfg(not(windows))]
+        {
+            Self {
+                needs_uninit: false,
+            }
+        }
+
+        #[cfg(windows)]
         unsafe {
             let hr = windows::Win32::System::Com::CoInitializeEx(
                 None,
@@ -37,6 +47,7 @@ impl ComScope {
 
 impl Drop for ComScope {
     fn drop(&mut self) {
+        #[cfg(windows)]
         if self.needs_uninit {
             unsafe {
                 windows::Win32::System::Com::CoUninitialize();

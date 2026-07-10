@@ -20,7 +20,12 @@ use crate::ui_fullscreen::MusicChromeViewState;
 // 音楽ビューはメイン egui ctx (アプリテーマ = Light になり得る) に描くため、egui 既定の
 // `on_hover_text` はツールチップが明色になる。動画 native HUD (専用ダーク ctx) と見た目を
 // 揃えるため、ctx テーマに依らずダーク枠で描く `hover_tip_dark` を使う。
+#[cfg(windows)]
 use crate::ui_helpers::HoverTipExt;
+// native_presenter (アイコン描画 / ジャンプパネル / ダイアログ helper) は cfg(windows)
+// モジュール。これらを使う描画 fn (draw_music_bookmark_ui / draw_music_bottom_hud) も
+// cfg(windows) + 非 Windows no-op stub にしている (review-v2.3.0 P3)。
+#[cfg(windows)]
 use crate::video::native_presenter::overlay_draw::{
     NativeJumpPanelOptions, draw_native_bookmark_title_editor, draw_native_bulk_bookmark_dialog,
     draw_native_jump_panel_body, draw_overlay_arrow_icon, draw_overlay_bookmark_icon,
@@ -29,6 +34,7 @@ use crate::video::native_presenter::overlay_draw::{
     draw_overlay_skip_to_marker_icon, draw_overlay_speaker_icon, draw_overlay_speed_control,
     draw_overlay_volume_slider,
 };
+#[cfg(windows)]
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
 };
@@ -168,6 +174,8 @@ impl App {
             .unwrap_or_default();
         self.music_bookmarks_loaded_for = Some(path.to_path_buf());
         // 改名ダイアログ中の項目が消えていたら編集状態を解除する。
+        // (ダイアログ state は native_presenter 型のため cfg(windows))
+        #[cfg(windows)]
         if let Some(edit) = self.music_bookmark_title_edit.as_ref()
             && !self.music_bookmarks.iter().any(|b| b.id == edit.id)
         {
@@ -321,6 +329,7 @@ impl App {
         if let Some(db) = self.video_bookmark_db.as_ref() {
             let _ = db.remove(id);
         }
+        #[cfg(windows)]
         if self.music_bookmark_title_edit.as_ref().map(|e| e.id) == Some(id) {
             self.music_bookmark_title_edit = None;
         }
@@ -413,7 +422,10 @@ impl App {
             .video_bookmark_db
             .as_ref()
             .map(|db| db.clear_for(&path));
-        self.music_bookmark_title_edit = None;
+        #[cfg(windows)]
+        {
+            self.music_bookmark_title_edit = None;
+        }
         self.reload_music_bookmarks(&path);
         self.apply_music_loop_mode(fs_idx);
         match result {
@@ -562,6 +574,19 @@ impl App {
     /// `panel_rect` = 左端ホバー領域。`full_rect` = 音楽ビュー全域 (中央モーダルの中心決めと、
     /// 背後 timeline/パネルへのクリック漏れを防ぐバックドロップ用)。改名/一括ダイアログは
     /// ホバーに依らず開いている間常に描画する。
+    /// 非 Windows stub: パネル描画は native_presenter helper (cfg(windows)) 依存。
+    #[cfg(not(windows))]
+    pub(crate) fn draw_music_bookmark_ui(
+        &mut self,
+        _ctx: &egui::Context,
+        _panel_rect: egui::Rect,
+        _full_rect: egui::Rect,
+        _fs_idx: usize,
+        _show_panel: bool,
+    ) {
+    }
+
+    #[cfg(windows)]
     pub(crate) fn draw_music_bookmark_ui(
         &mut self,
         ctx: &egui::Context,
@@ -712,7 +737,14 @@ impl App {
     /// 音楽ビューでブックマーク改名 / 一括登録の中央モーダルが開いているか
     /// (キー・シーク入力を抑止するモーダル判定用)。
     pub(crate) fn music_bookmark_modal_open(&self) -> bool {
-        self.music_bookmark_title_edit.is_some() || self.music_bulk_bookmark_dialog.is_some()
+        #[cfg(windows)]
+        {
+            self.music_bookmark_title_edit.is_some() || self.music_bulk_bookmark_dialog.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     // ───────────────────────── 下 HUD (seek 行 + コントロール行) ─────────────────────────
@@ -723,6 +755,21 @@ impl App {
     ///
     /// (音量ノーマライズは動画のようなスキャン UI が必要なため、この HUD には載せていない。
     /// 音量正規化は開いた時点で `audio_normalize_db` キャッシュ値が適用される。)
+    /// 非 Windows stub: HUD 描画は native_presenter のアイコン helper (cfg(windows)) 依存。
+    #[cfg(not(windows))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_music_bottom_hud(
+        &mut self,
+        _ui: &mut egui::Ui,
+        _hud_rect: egui::Rect,
+        _fs_idx: usize,
+        _chrome: &MusicChromeViewState,
+        _dark: bool,
+        _interactive: bool,
+    ) {
+    }
+
+    #[cfg(windows)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_music_bottom_hud(
         &mut self,

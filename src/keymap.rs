@@ -6564,6 +6564,10 @@ pub(crate) fn native_video_context_shortcuts_help_key_down(
         .any(matches)
 }
 
+// 引数型 NativeVideoKeyEvent (video::native_window) が cfg(windows) 宣言なので、
+// この helper も揃えてゲートする (唯一の呼び出し元
+// native_video_fullscreen_shortcut_key も cfg(windows) 済み)。
+#[cfg(windows)]
 fn native_video_fixed_shortcut_key(key: &crate::video::native_window::NativeVideoKeyEvent) -> bool {
     match key.virtual_key {
         0x1B => !key.ctrl && !key.shift && !key.alt, // Escape

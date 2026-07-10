@@ -5610,6 +5610,7 @@ impl VideoPlayer {
         }
     }
 
+    #[cfg(windows)]
     pub fn request_presenter_raise(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.request_presenter_raise();

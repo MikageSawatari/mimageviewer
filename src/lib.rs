@@ -6,7 +6,11 @@
 //! main.rs と lib.rs の両方からアクセスできるよう、ここに `app` 互換 stub を置く
 //! (= main.rs の app module の同名定数の真値とは別実体だが、lib 側で実用上問題がないもの)。
 
-#[cfg(windows)]
+// cfg(windows) を付けない: `video` module (下方、こちらも非ゲート) が非 Windows
+// でもコンパイルされ、`crate::app::MAX_TEXTURE_DIM` 等を参照するため。
+// (settings / ring_shortcut / keymap 等の共有 module も `crate::video::*` の
+// クロスプラットフォーム型を参照しており、lib 側で video を windows 限定にすると
+// 非 Windows の cargo check が成立しない。review-v2.3.0 P3)
 #[doc(hidden)]
 pub mod app {
     /// GPU テクスチャ上限。bin (lib) 側の video モジュールで `crate::app::MAX_TEXTURE_DIM`
@@ -136,7 +140,12 @@ pub mod undo_stack;
 pub mod update_check;
 pub mod vector_edit;
 pub mod version_highlights;
-#[cfg(windows)]
+// cfg(windows) を付けない: settings / ring_shortcut / audio_normalize_db /
+// cache_maintenance / books / keymap が `crate::video::*` のクロスプラットフォーム
+// 型 (VideoContinuousMode / NormalizeResult / TileThumbCache 等) を参照するため、
+// lib 側でも常にコンパイルする (main.rs 側と同じ扱い)。Windows 専用の内部
+// (native_presenter / gpu_renderer / dsp / native_window) は video/mod.rs 内で
+// cfg(windows) 済み。
 pub mod video;
 pub mod video_bookmarks;
 pub mod video_bookmarks_parser;

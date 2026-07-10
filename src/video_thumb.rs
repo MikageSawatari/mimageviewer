@@ -1,7 +1,10 @@
 //! Windows Shell API を使った動画サムネイル取得
+//! (非 Windows では常に CreateItem 失敗扱いの stub。wic_decoder と同じ方針)
 
+#[cfg(windows)]
 use std::mem::size_of;
 use std::path::Path;
+#[cfg(windows)]
 use std::time::Instant;
 
 use eframe::egui;
@@ -55,6 +58,33 @@ pub enum VideoThumbFailStage {
 ///
 /// 呼び出し側でログに出したい診断情報を `diag` に書き込んで返す。
 pub fn get_video_thumbnail(
+    path: &Path,
+    shell_size: i32,
+) -> (Option<egui::ColorImage>, VideoThumbDiag) {
+    #[cfg(not(windows))]
+    {
+        let _ = (path, shell_size);
+        return (
+            None,
+            VideoThumbDiag {
+                hresult: 0,
+                get_image_ms: 0,
+                dims: None,
+                avg_rgb: None,
+                span_rgb: None,
+                fail_stage: Some(VideoThumbFailStage::CreateItem),
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        get_video_thumbnail_win(path, shell_size)
+    }
+}
+
+#[cfg(windows)]
+fn get_video_thumbnail_win(
     path: &Path,
     shell_size: i32,
 ) -> (Option<egui::ColorImage>, VideoThumbDiag) {

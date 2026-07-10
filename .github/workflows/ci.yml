@@ -1,8 +1,12 @@
 name: CI
 
 # 公開リポジトリなので GitHub Actions は標準ランナーで無制限・無料。
-# まずは vendor DLL / LFS モデル不要で確実に回る `cargo fmt --check` だけを
-# 全 push / PR でゲートする (ローカル pre-commit フックの cloud 版)。
+# 現在のゲートは 2 本:
+#   1. `cargo fmt --check` (ローカル pre-commit フックの cloud 版)
+#   2. ubuntu での `cargo check --bin mimageviewer-core --features portable`
+#      — Windows 上の cargo check では原理的に検出できない「#[cfg(windows)] 宣言の
+#      unguarded 参照 (非 Windows ビルド破壊)」を機械的に検出する
+#      (v2.3.0 レビュー docs/review-v2.3.0/claude-hunt-crosscut.md [P3] の再発防止)。
 #
 # clippy / test の本格ゲートは Windows ランナー + vendor bootstrap (PDFium/ONNX/
 # FFmpeg/Susie) + Git LFS (models) + VST3 host exe が必要で、build.rs が
@@ -34,6 +38,61 @@ jobs:
         run: rustup component add rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 非 Windows cfg の compile ゲート。
+  #
+  # 目的: `#[cfg(windows)]` 宣言 (App フィールド / メソッド / 型) を unguarded に
+  # 参照して非 Windows ビルドを壊す退行は、Windows 上の cargo check では原理的に
+  # 検出できない (cfg(windows) が常に真のため)。ubuntu で bin をチェックして
+  # このクラスを機械的に検出する (docs/review-v2.3.0/claude-hunt-crosscut.md [P3])。
+  #
+  # 構成メモ:
+  # - `--features portable`: vendor アセット (pdfium/ort/susie/vst3/モデル) の
+  #   include_bytes! をコンパイル対象から外す (vendor/ は CI に存在しない)。
+  #   build.rs の vendor チェックも非 Windows ターゲットではスキップされる。
+  #   portable cfg 分岐の腐敗検知 (pre-push の cargo check --features portable と
+  #   同じ役割) も兼ねる。
+  # - FFmpeg: ffmpeg-sys-the-third が FFMPEG_DIR (.cargo/config.toml の [env] で
+  #   vendor/ffmpeg に解決) のヘッダを bindgen で読む。setup-ffmpeg.sh で本番と
+  #   同一バージョン (BtbN n7.1) のヘッダを取得する。ヘッダはプラットフォーム
+  #   非依存で、.lib はリンクしない cargo check では未使用。
+  #   (setup-ffmpeg.sh が壊れた場合の代替: apt の libavcodec-dev 等を入れて
+  #   FFMPEG_DIR を multiarch prefix の symlink に向ける手もあるが、FFmpeg 6.x に
+  #   なるため本番 7.1 とバインディングが変わる。基本は setup script を直す。)
+  # - turbojpeg: 既定の TURBOJPEG_SOURCE=vendor は cmake+NASM で libjpeg-turbo を
+  #   フルビルドする。check には不要なので explicit + 存在するダミー lib dir で
+  #   スキップ (バインディングは pregenerated、リンクは発生しない)。
+  # - apt: ビルドスクリプトが pkg-config で存在確認する -sys クレートのぶんだけ
+  #   入れる (alsa=cpal / udev=gilrs / gtk-3=tray-icon / wayland=winit 系)。
+  #   libxdo-sys / libappindicator-sys は probe せず link 指定のみなので dev
+  #   パッケージ不要。
+  check-non-windows:
+    name: cargo check (ubuntu / non-Windows cfg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: dtolnay/rust-toolchain@stable
+      # cargo registry / target をキャッシュして 2 回目以降を高速化 (~10 分 → 数分)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-non-windows
+      - name: Install native build deps (pkg-config probed -sys crates)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev libgtk-3-dev libwayland-dev
+      - name: Fetch FFmpeg headers (vendor/ffmpeg, same version as production)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/setup-ffmpeg.sh
+      - name: cargo check (bin, portable feature)
+        env:
+          TURBOJPEG_SOURCE: explicit
+          TURBOJPEG_LIB_DIR: /usr/lib/x86_64-linux-gnu
+        run: cargo check --locked --bin mimageviewer-core --features portable
 
   # ───────────────────────────────────────────────────────────────────────────
   # 次段階で有効化する Windows clippy/test ジョブのテンプレート (現状コメントアウト)。
