@@ -4999,6 +4999,7 @@ impl App {
             let viewport_id = Self::detached_image_window_viewport_id(*id);
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
         }
+        self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
         self.detached_image_windows
             .retain(|window| !close_ids.contains(&window.id));
         for id in &close_ids {

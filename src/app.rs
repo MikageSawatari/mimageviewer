@@ -2203,6 +2203,8 @@ struct ViewerContextBundle {
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     rating_cache: std::collections::HashMap<usize, u8>,
     current_folder_rating_cache: Option<u8>,
+    /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
+    vst3_deferred_media_open: Option<usize>,
     fullscreen_idx: Option<usize>,
     viewer_presentation: ViewerPresentation,
     last_viewer_sync_stamp: Option<ViewerSyncStamp>,
@@ -2429,6 +2431,7 @@ impl ViewerContextBundle {
             rotation_cache: std::collections::HashMap::new(),
             rating_cache: std::collections::HashMap::new(),
             current_folder_rating_cache: None,
+            vst3_deferred_media_open: None,
             fullscreen_idx: None,
             viewer_presentation: ViewerPresentation::Fullscreen,
             last_viewer_sync_stamp: None,
@@ -5662,6 +5665,132 @@ fn viewer_bundle_references_removed(
     })
 }
 
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ViewerContextMediaResumeUpdate {
+    path: PathBuf,
+    key: String,
+    position: f64,
+    duration: f64,
+}
+
+#[cfg(windows)]
+#[derive(Default, Debug)]
+struct ViewerContextMediaTeardownPlan {
+    resume_updates: Vec<ViewerContextMediaResumeUpdate>,
+    media_paths: Vec<PathBuf>,
+    music_consumer: bool,
+}
+
+#[cfg(windows)]
+fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool {
+    let Some(idx) = bundle.fullscreen_idx else {
+        return false;
+    };
+    matches!(bundle.items.get(idx), Some(GridItem::Audio(_)))
+        || (bundle.video_audio_mode == Some(idx)
+            && !bundle
+                .video_audio_vst
+                .as_ref()
+                .is_some_and(|state| state.fs_idx == idx))
+}
+
+#[cfg(windows)]
+fn viewer_context_media_teardown_plan(
+    bundle: &ViewerContextBundle,
+) -> ViewerContextMediaTeardownPlan {
+    let mut plan = ViewerContextMediaTeardownPlan {
+        music_consumer: viewer_context_bundle_is_music_consumer(bundle),
+        ..Default::default()
+    };
+    let mut push_media_path = |path: &std::path::Path| {
+        if !plan
+            .media_paths
+            .iter()
+            .any(|known| crate::folder_tree::path_eq(known, path))
+        {
+            plan.media_paths.push(path.to_path_buf());
+        }
+    };
+    if let Some(item) = bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)) {
+        match item {
+            GridItem::Video(path) | GridItem::Audio(path) => push_media_path(path),
+            _ => {}
+        }
+    }
+    for entry in bundle.fs_cache.values() {
+        if let FsCacheEntry::Video { player, .. } = entry {
+            let path = player.path().clone();
+            push_media_path(&path);
+            plan.resume_updates.push(ViewerContextMediaResumeUpdate {
+                key: crate::adjustment_db::normalize_path(&path),
+                path,
+                position: player
+                    .last_displayed_pts_secs()
+                    .unwrap_or_else(|| player.position()),
+                duration: player.duration(),
+            });
+        }
+    }
+    plan
+}
+
+#[cfg(windows)]
+fn apply_viewer_context_media_resume_updates(
+    map: &mut std::collections::HashMap<String, f64>,
+    updates: &[ViewerContextMediaResumeUpdate],
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    for update in updates {
+        if !save_video_resume_position(map, update.key.clone(), update.position, update.duration) {
+            removed.push(update.key.clone());
+        }
+    }
+    removed
+}
+
+#[cfg(windows)]
+fn viewer_context_teardown_paths_contain(paths: &[PathBuf], candidate: &std::path::Path) -> bool {
+    paths
+        .iter()
+        .any(|path| crate::folder_tree::path_eq(path, candidate))
+}
+
+#[cfg(windows)]
+fn grid_item_media_path(item: &GridItem) -> Option<&std::path::Path> {
+    match item {
+        GridItem::Video(path) | GridItem::Audio(path) => Some(path),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn viewer_context_bundle_displays_media_path(
+    bundle: &ViewerContextBundle,
+    target: &std::path::Path,
+) -> bool {
+    let Some(idx) = bundle.fullscreen_idx else {
+        return false;
+    };
+    let player_matches = matches!(
+        bundle.fs_cache.get(&idx),
+        Some(FsCacheEntry::Video { player, .. })
+            if crate::folder_tree::path_eq(player.path(), target)
+    );
+    let item_matches = bundle
+        .items
+        .get(idx)
+        .and_then(grid_item_media_path)
+        .is_some_and(|path| crate::folder_tree::path_eq(path, target));
+    let normalized_target = crate::adjustment_db::normalize_path(target);
+    player_matches
+        || item_matches
+        || bundle
+            .last_viewer_sync_stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.item_key == normalized_target)
+}
+
 /// detached 窓 (passive / parked) が削除 / リネーム対象 path を表示中か。
 /// sync stamp の item_key は `metadata_cache_key` 由来 (= 正規化済み / zip_entry_key
 /// 形式) なのでそのまま照合できる。reopen descriptor と paused_bundle も見る。
@@ -8604,7 +8733,8 @@ pub struct App {
     /// 起動直後に UI を塞がず走らせる VST3 チェーンロード。
     #[cfg(windows)]
     pub(crate) vst3_startup_load: Option<Vst3StartupLoadPending>,
-    /// VST3 起動ロードが終わるまで動画開始を保留している fullscreen idx。
+    /// VST3 起動ロードが終わるまで media start を保留している mounted context の idx。
+    /// `ViewerContextBundle` に同名 field があり、items / fullscreen_idx と一緒に swap される。
     #[cfg(windows)]
     pub(crate) vst3_deferred_media_open: Option<usize>,
     /// 直前フレームでフルスクリーンモードだったか (= TOPMOST 切替検出用)。
@@ -10989,6 +11119,7 @@ impl App {
             rotation_cache,
             rating_cache,
             current_folder_rating_cache,
+            vst3_deferred_media_open,
             fullscreen_idx,
             viewer_presentation,
             last_viewer_sync_stamp,
@@ -11167,6 +11298,9 @@ impl App {
         swap_field!(rotation_cache);
         swap_field!(rating_cache);
         swap_field!(current_folder_rating_cache);
+        // VST3 deferred open は fullscreen_idx / items と同じ context ownership。
+        // (review-v2.3.0 追補 BA-7: vst3 deferred)
+        swap_field!(vst3_deferred_media_open);
         swap_field!(fullscreen_idx);
         swap_field!(viewer_presentation);
         swap_field!(last_viewer_sync_stamp);
@@ -13538,23 +13672,99 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn resume_deferred_vst3_media_open(&mut self, ctx: &egui::Context) {
-        if let Some(idx) = self.vst3_deferred_media_open.take() {
-            // 動画 / 音声どちらの遅延 open も再開する (start_fs_load が種別を分岐)。
-            if self.fullscreen_idx == Some(idx)
-                && matches!(
-                    self.items.get(idx),
-                    Some(GridItem::Video(_) | GridItem::Audio(_))
-                )
-                && !self.fs_cache.contains_key(&idx)
+    fn take_mounted_deferred_vst3_media_open(&mut self) -> Option<usize> {
+        let idx = self.vst3_deferred_media_open.take()?;
+        (self.fullscreen_idx == Some(idx)
+            && matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            )
+            && !self.fs_cache.contains_key(&idx))
+        .then_some(idx)
+    }
+
+    #[cfg(windows)]
+    fn consume_deferred_vst3_media_open_in_all_contexts(
+        &mut self,
+        mut consume: impl FnMut(&mut Self, usize),
+    ) {
+        if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
+            consume(self, idx);
+        }
+
+        let active_has_pending = self
+            .active_detached_viewer_context
+            .as_ref()
+            .is_some_and(|active| active.bundle.vst3_deferred_media_open.is_some());
+        if active_has_pending && let Some(mut active) = self.active_detached_viewer_context.take() {
+            self.swap_viewer_context_bundle(&mut active.bundle);
+            if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
+                consume(self, idx);
+            }
+            self.swap_viewer_context_bundle(&mut active.bundle);
+            self.active_detached_viewer_context = Some(active);
+        }
+
+        self.consume_deferred_vst3_media_open_in_parked_contexts(&mut consume);
+    }
+
+    #[cfg(windows)]
+    fn consume_deferred_vst3_media_open_in_parked_contexts(
+        &mut self,
+        consume: &mut impl FnMut(&mut Self, usize),
+    ) {
+        let ids: Vec<u64> = self
+            .detached_image_windows
+            .iter()
+            .filter(|window| {
+                window
+                    .paused_bundle
+                    .as_deref()
+                    .is_some_and(|bundle| bundle.vst3_deferred_media_open.is_some())
+            })
+            .map(|window| window.id)
+            .collect();
+        for id in ids {
+            let Some(pos) = self
+                .detached_image_windows
+                .iter()
+                .position(|window| window.id == id)
+            else {
+                continue;
+            };
+            let Some(mut bundle) = self.detached_image_windows[pos].paused_bundle.take() else {
+                continue;
+            };
+            self.swap_viewer_context_bundle(&mut bundle);
+            let saved_input_window_id = self.native_video_parked_live_input_window_id;
+            self.native_video_parked_live_input_window_id = Some(id);
+            if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
+                consume(self, idx);
+            }
+            self.native_video_parked_live_input_window_id = saved_input_window_id;
+            self.swap_viewer_context_bundle(&mut bundle);
+            if let Some(window) = self
+                .detached_image_windows
+                .iter_mut()
+                .find(|window| window.id == id)
             {
-                crate::logger::log(format!(
-                    "[VST3 startup] deferred media open resumes idx={idx}"
-                ));
-                self.start_fs_load(idx);
-                ctx.request_repaint();
+                window.paused_bundle = Some(bundle);
             }
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn resume_deferred_vst3_media_open(&mut self, ctx: &egui::Context) {
+        // mounted main だけでなく promote 済み active / ParkedLive bundle も同じ ownership
+        // seam で mount し、各 context 自身の pending を消費する。
+        // (review-v2.3.0 追補 BA-7: vst3 deferred)
+        self.consume_deferred_vst3_media_open_in_all_contexts(|app, idx| {
+            crate::logger::log(format!(
+                "[VST3 startup] deferred media open resumes idx={idx}"
+            ));
+            app.start_fs_load(idx);
+            ctx.request_repaint();
+        });
     }
 
     #[cfg(windows)]
@@ -27297,8 +27507,11 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn active_detached_hwnd_window_id(&self) -> Option<u64> {
-        self.active_detached_session
-            .map(|session| session.window_id)
+        self.native_video_parked_live_input_window_id
+            .or_else(|| {
+                self.active_detached_session
+                    .map(|session| session.window_id)
+            })
             .or(self.detached_viewer_window_id)
             .or_else(|| {
                 (self.viewer_session_is_detached_or_switching()
@@ -27559,7 +27772,15 @@ impl App {
             .fullscreen_idx
             .and_then(|idx| bundle.items.get(idx))
             .is_some_and(|item| matches!(item, GridItem::Video(_)));
+        let deferred_item_is_media = bundle.vst3_deferred_media_open.is_some_and(|idx| {
+            bundle.fullscreen_idx == Some(idx)
+                && matches!(
+                    bundle.items.get(idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                )
+        });
         active_item_is_video
+            || deferred_item_is_media
             || bundle
                 .fs_cache
                 .values()
@@ -27588,7 +27809,7 @@ impl App {
                 .video_audio_vst
                 .as_ref()
                 .is_some_and(|s| s.fs_idx == idx);
-        if !matches!(item, GridItem::Audio(_)) && !video_audio_mode {
+        if !Self::viewer_context_bundle_is_music_consumer(bundle) {
             return None;
         }
         let (position_secs, duration_secs, playing, title, volume, muted) =
@@ -27644,7 +27865,15 @@ impl App {
             .fullscreen_idx
             .and_then(|idx| self.items.get(idx))
             .is_some_and(|item| matches!(item, GridItem::Video(_)));
+        let deferred_item_is_media = self.vst3_deferred_media_open.is_some_and(|idx| {
+            self.fullscreen_idx == Some(idx)
+                && matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                )
+        });
         active_item_is_video
+            || deferred_item_is_media
             || self
                 .fs_cache
                 .values()
@@ -27746,6 +27975,132 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool {
+        viewer_context_bundle_is_music_consumer(bundle)
+    }
+
+    /// ParkedLive / passive 窓が所有する bundle を drop する直前のメディア後始末。
+    /// fs_idx は context ごとに別空間なので App-global normalize は path で照合する。
+    /// (review-v2.3.0 追補 BA-7: parked teardown)
+    #[cfg(windows)]
+    pub(crate) fn teardown_paused_media_bundles_for_window_ids(
+        &mut self,
+        window_ids: &[u64],
+        reason: &'static str,
+    ) {
+        let mut dropped_bundles = Vec::new();
+        for window in &mut self.detached_image_windows {
+            if window_ids.contains(&window.id)
+                && let Some(bundle) = window.paused_bundle.take()
+            {
+                dropped_bundles.push(bundle);
+            }
+        }
+        self.teardown_paused_media_bundles(dropped_bundles, reason);
+    }
+
+    #[cfg(windows)]
+    fn teardown_paused_media_bundles(
+        &mut self,
+        mut dropped_bundles: Vec<Box<ViewerContextBundle>>,
+        reason: &'static str,
+    ) {
+        if dropped_bundles.is_empty() {
+            return;
+        }
+        let plans: Vec<ViewerContextMediaTeardownPlan> = dropped_bundles
+            .iter()
+            .map(|bundle| viewer_context_media_teardown_plan(bundle))
+            .collect();
+        self.save_viewer_context_media_teardown_resumes(&plans);
+        self.cleanup_viewer_context_media_teardown_globals(&plans, reason);
+        for bundle in &mut dropped_bundles {
+            bundle.normalize_ui_states.clear();
+            bundle.normalize_auto_scan_suppressed.clear();
+        }
+    }
+
+    #[cfg(windows)]
+    fn save_viewer_context_media_teardown_resumes(
+        &mut self,
+        plans: &[ViewerContextMediaTeardownPlan],
+    ) {
+        let updates: Vec<ViewerContextMediaResumeUpdate> = plans
+            .iter()
+            .flat_map(|plan| plan.resume_updates.iter().cloned())
+            .collect();
+        let removed = apply_viewer_context_media_resume_updates(
+            &mut self.settings.video_resume_positions,
+            &updates,
+        );
+        for key in removed {
+            self.video_resume_thumb_last_request.remove(&key);
+        }
+        for update in &updates {
+            if self
+                .settings
+                .video_resume_positions
+                .contains_key(&update.key)
+            {
+                self.maybe_schedule_video_resume_thumbnail(
+                    &update.path,
+                    &update.key,
+                    update.position,
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn cleanup_viewer_context_media_teardown_globals(
+        &mut self,
+        plans: &[ViewerContextMediaTeardownPlan],
+        reason: &'static str,
+    ) {
+        self.cancel_viewer_context_teardown_normalize(plans, reason);
+        self.clear_music_state_after_viewer_context_teardown(plans, reason);
+    }
+
+    #[cfg(windows)]
+    fn cancel_viewer_context_teardown_normalize(
+        &mut self,
+        plans: &[ViewerContextMediaTeardownPlan],
+        reason: &'static str,
+    ) {
+        let paths: Vec<PathBuf> = plans
+            .iter()
+            .flat_map(|plan| plan.media_paths.iter().cloned())
+            .collect();
+        let matches = self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|state| viewer_context_teardown_paths_contain(&paths, &state.file_path));
+        if matches {
+            self.cancel_matching_viewer_context_normalize(reason);
+        }
+    }
+
+    #[cfg(windows)]
+    fn cancel_matching_viewer_context_normalize(&mut self, _reason: &'static str) {
+        if let Some(state) = self.normalize_state.take() {
+            state.cancel();
+        }
+    }
+
+    #[cfg(windows)]
+    fn clear_music_state_after_viewer_context_teardown(
+        &mut self,
+        plans: &[ViewerContextMediaTeardownPlan],
+        _reason: &'static str,
+    ) {
+        let dropped_music = plans.iter().any(|plan| plan.music_consumer);
+        let mounted_music = self.current_music_fullscreen_idx().is_some();
+        if dropped_music && !mounted_music && !self.detached_music_window_exists() {
+            self.clear_music_view_state();
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn native_video_hud_dimmed_for_current_poll(&self) -> bool {
         self.native_video_parked_live_input_window_id.is_some()
     }
@@ -27814,6 +28169,7 @@ impl App {
             self.detached_image_window_close_pending.push(*id);
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
+        self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
         self.detached_image_windows
             .retain(|window| !ids.contains(&window.id));
         for id in ids {
@@ -30563,40 +30919,110 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn raise_active_detached_media_for_grid_open(
+        &mut self,
+        ctx: &egui::Context,
+        target_path: &std::path::Path,
+    ) -> bool {
+        let Some(active) = self.active_detached_viewer_context.as_ref() else {
+            return false;
+        };
+        if !viewer_context_bundle_displays_media_path(&active.bundle, target_path) {
+            return false;
+        }
+        let Some(idx) = active.bundle.fullscreen_idx else {
+            return false;
+        };
+        let window_id = active.bundle.detached_viewer_window_id.or_else(|| {
+            self.active_detached_session
+                .map(|session| session.window_id)
+        });
+        let presenter_raised = if matches!(active.bundle.items.get(idx), Some(GridItem::Video(_))) {
+            if let Some(FsCacheEntry::Video { player, .. }) = active.bundle.fs_cache.get(&idx) {
+                player.request_presenter_raise();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if presenter_raised {
+            self.native_video_front_recover_after_external_foreground = true;
+            self.native_video_front_last_raise = None;
+        } else if let Some(window_id) = window_id {
+            let viewport_id = Self::detached_image_window_viewport_id(window_id);
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+        }
+        ctx.request_repaint();
+        true
+    }
+
+    #[cfg(windows)]
     pub(crate) fn activate_existing_detached_viewer_for_grid_open(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
-        if !self.viewer_session_is_detached() || self.fullscreen_idx != Some(idx) {
-            return false;
-        }
-        let Some(stamp) = self.viewer_sync_stamp_for_idx(idx) else {
-            return false;
-        };
-        if self.last_viewer_sync_stamp.as_ref() != Some(&stamp) {
-            return false;
-        }
+        let mounted_matches = self.viewer_session_is_detached()
+            && self.fullscreen_idx == Some(idx)
+            && self
+                .viewer_sync_stamp_for_idx(idx)
+                .is_some_and(|stamp| self.last_viewer_sync_stamp.as_ref() == Some(&stamp));
 
         // 音声 (音楽ビュー) は still と同じ egui viewport が描くので、still と同じ
         // focus コマンドで前面化する。Video 限定の raise 分岐だけだと Audio が素通りし、
         // 再生中の音声をグリッドで再クリックしても無反応になる (Sol P2)。
-        if self.viewer_item_supports_detached_still(idx)
-            || matches!(self.items.get(idx), Some(GridItem::Audio(_)))
+        if mounted_matches
+            && (self.viewer_item_supports_detached_still(idx)
+                || matches!(self.items.get(idx), Some(GridItem::Audio(_))))
         {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
-        } else if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+        } else if mounted_matches && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                 player.request_presenter_raise();
             }
         }
-        ctx.request_repaint();
-        true
+        if mounted_matches {
+            ctx.request_repaint();
+            return true;
+        }
+
+        let Some(target_path) = self
+            .items
+            .get(idx)
+            .and_then(grid_item_media_path)
+            .map(std::path::Path::to_path_buf)
+        else {
+            return false;
+        };
+        // context ごとに idx 空間が違うため、promote / ParkedLive 済み media は path で探す。
+        // parked は窓クリックと同じ activation 経路を通してから raise する。
+        // (review-v2.3.0 追補 BA-7: same-media raise)
+        if self.raise_active_detached_media_for_grid_open(ctx, &target_path) {
+            return true;
+        }
+        let parked_id = self.detached_image_windows.iter().find_map(|window| {
+            (self.detached_window_state_is_parked_live(window.id)
+                && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                    viewer_context_bundle_displays_media_path(bundle, &target_path)
+                }))
+            .then_some(window.id)
+        });
+        if let Some(window_id) = parked_id
+            && self.activate_parked_live_media_window_snapshot(ctx, window_id)
+        {
+            let _ = self.raise_active_detached_media_for_grid_open(ctx, &target_path);
+            return true;
+        }
+        false
     }
 
     /// grid から別の画像/動画を明示 open するとき、独立 active context は passive /
@@ -36100,9 +36526,11 @@ impl App {
                     {
                         return;
                     }
-                    let activate_on_show =
-                        !matches!(presentation, ViewerPresentation::DetachedWindow)
-                            || self.take_detached_viewer_activate_on_show();
+                    // ParkedLive 中に初めて player を作る deferred open は、既存の非アクティブ窓を
+                    // owner にしても前面を奪わない。通常の active detached だけ one-shot を消費する。
+                    let activate_on_show = self.native_video_parked_live_input_window_id.is_none()
+                        && (!matches!(presentation, ViewerPresentation::DetachedWindow)
+                            || self.take_detached_viewer_activate_on_show());
                     target.and_then(|(placement, rect, owner_hwnd)| {
                         native_video_presenter_config(
                             owner_hwnd,

@@ -16668,6 +16668,38 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    fn parked_bundle_snapshot(
+        ctx: &egui::Context,
+        id: u64,
+        bundle: ViewerContextBundle,
+    ) -> DetachedImageWindowSnapshot {
+        let texture = ctx.load_texture(
+            format!("parked_bundle_{id}"),
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        DetachedImageWindowSnapshot {
+            id,
+            texture,
+            title: format!("parked-{id}"),
+            location_display: format!("parked-{id}"),
+            image_dims: None,
+            rotation: crate::rotation_db::Rotation::None,
+            zoom_pan: None,
+            free_rotation: 0.0,
+            image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            image_content_bbox: None,
+            frozen_continuous_pages: Vec::new(),
+            reopen_descriptor: None,
+            reopen_sync_stamp: None,
+            activation_ready_frame: 0,
+            activation_armed: true,
+            focused_last_frame: false,
+            initial_placement_applied: true,
+            paused_bundle: Some(Box::new(bundle)),
+        }
+    }
+
     fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
         app.detached_viewer_window_id = Some(window_id);
         app.detached_window_hwnd_set(window_id, hwnd);
@@ -19037,6 +19069,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         app.requested.insert(3, false);
         app.pending_finalize.insert(4);
+        app.vst3_deferred_media_open = Some(5);
         let main_cancel = std::sync::Arc::clone(&app.cancel_token);
         let mut bundle = ViewerContextBundle::empty();
         let bundle_cancel = std::sync::Arc::clone(&bundle.cancel_token);
@@ -19045,6 +19078,8 @@ mod still_window_mode_key_tests {
         // mount 中 (= 空コンテキスト側): main の bookkeeping は bundle に退避され、App 側は
         // 空 bookkeeping + 独立 token を持つ。
         assert!(app.requested.is_empty());
+        assert_eq!(app.vst3_deferred_media_open, None);
+        assert_eq!(bundle.vst3_deferred_media_open, Some(5));
         assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &bundle_cancel));
         // mount 中のロードキャンセル (load_zip_as_folder 相当) は main の token を倒さない。
         app.cancel_token
@@ -19055,7 +19090,95 @@ mod still_window_mode_key_tests {
         // unmount: main の bookkeeping が clear されずそのまま戻る (P2-8 の核心)。
         assert!(app.requested.contains_key(&3));
         assert!(app.pending_finalize.contains(&4));
+        assert_eq!(app.vst3_deferred_media_open, Some(5));
         assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &main_cancel));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn vst3_deferred_media_open_survives_promote_park_and_completion() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\deferred.mp4");
+        let window_id = 89;
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(window_id);
+        app.vst3_deferred_media_open = Some(video);
+        app.begin_active_detached_session(window_id, DetachedSource::Video);
+
+        assert!(app.promote_active_detached_video_for_main_context_change());
+        assert_eq!(app.vst3_deferred_media_open, None);
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.vst3_deferred_media_open),
+            Some(video)
+        );
+        assert!(app.park_active_detached_context_for_new_grid_open(&ctx));
+        assert!(app.active_detached_viewer_context.is_none());
+        assert_eq!(
+            app.detached_image_windows[0]
+                .paused_bundle
+                .as_deref()
+                .and_then(|bundle| bundle.vst3_deferred_media_open),
+            Some(video)
+        );
+
+        let mut consumed = Vec::new();
+        app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
+            consumed.push((
+                mounted.detached_viewer_window_id,
+                mounted.native_video_parked_live_input_window_id,
+                idx,
+            ));
+            mounted.pending_auto_fs_open = true;
+        });
+
+        assert_eq!(consumed, vec![(Some(window_id), Some(window_id), video)]);
+        let parked = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .expect("parked bundle");
+        assert_eq!(parked.vst3_deferred_media_open, None);
+        assert!(parked.pending_auto_fs_open);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_close_and_other_open_do_not_clear_detached_vst3_deferred_media() {
+        let mut app = setup_app();
+        let first = push_image(&mut app, r"C:\pics\first.jpg");
+        let second = push_image(&mut app, r"C:\pics\second.jpg");
+        let video = push_video(&mut app, r"C:\clips\detached.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(90);
+        bundle.vst3_deferred_media_open = Some(video);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.fullscreen_idx = Some(first);
+        app.prepare_viewer_presentation_close();
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.vst3_deferred_media_open),
+            Some(video)
+        );
+
+        app.vst3_deferred_media_open = Some(video);
+        app.open_fullscreen(second);
+        assert_eq!(app.vst3_deferred_media_open, None);
+        assert_eq!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| active.bundle.vst3_deferred_media_open),
+            Some(video),
+            "main context open may clear only its own deferred request"
+        );
     }
 
     #[test]
@@ -20247,6 +20370,83 @@ mod still_window_mode_key_tests {
         assert_eq!(app.music_analysis_path.as_deref(), Some(path.as_path()));
         assert!(app.music_pcm.is_some());
         assert_eq!(app.music_analysis_version, 17);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_media_teardown_resume_seam_applies_final_positions() {
+        let kept = crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\keep.mp4"));
+        let finished =
+            crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\finished.mp4"));
+        let updates = vec![
+            ViewerContextMediaResumeUpdate {
+                path: PathBuf::from(r"C:\clips\keep.mp4"),
+                key: kept.clone(),
+                position: 37.5,
+                duration: 120.0,
+            },
+            ViewerContextMediaResumeUpdate {
+                path: PathBuf::from(r"C:\clips\finished.mp4"),
+                key: finished.clone(),
+                position: 118.0,
+                duration: 120.0,
+            },
+        ];
+        let mut resume = std::collections::HashMap::from([(finished.clone(), 10.0)]);
+
+        let removed = apply_viewer_context_media_resume_updates(&mut resume, &updates);
+
+        assert_eq!(resume.get(&kept), Some(&37.5));
+        assert!(!resume.contains_key(&finished));
+        assert_eq!(removed, vec![finished]);
+        assert!(viewer_context_teardown_paths_contain(
+            &[PathBuf::from(r"C:\Music\BGM.FLAC")],
+            std::path::Path::new(r"c:\music\bgm.flac")
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_close_ids_tears_down_last_music_consumer_by_path() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(r"C:\music\closing.flac");
+        let audio = push_audio(&mut app, path.to_str().unwrap());
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(audio);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(97);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 97, bundle));
+        app.transition_detached_window_state(97, DetachedWindowState::ParkedLive, "test_setup");
+        app.music_analysis_path = Some(path.clone());
+        app.music_pcm = Some(std::sync::Arc::new(
+            crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
+        ));
+        let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            fs_idx: audio,
+            cancel: std::sync::Arc::clone(&scan_cancel),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: false,
+            file_path: path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+
+        app.close_detached_image_windows_by_ids(&ctx, &[97], &[], "test_close", None);
+
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.music_analysis_path.is_none());
+        assert!(app.music_pcm.is_none());
+        assert!(app.normalize_state.is_none());
+        assert!(scan_cancel.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -24647,6 +24847,40 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn same_media_grid_open_activates_parked_live_without_close() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\same.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(72);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 72, bundle));
+        app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
+
+        assert!(app.activate_existing_detached_viewer_for_grid_open(&ctx, video));
+
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.detached_image_window_close_pending.is_empty());
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("same media should be activated");
+        assert!(viewer_context_bundle_displays_media_path(
+            &active.bundle,
+            std::path::Path::new(r"C:\clips\same.mp4")
+        ));
+        assert!(
+            app.activate_existing_detached_viewer_for_grid_open(&ctx, video),
+            "the promoted active context must also take the path-based raise path"
+        );
+        assert!(app.active_detached_viewer_context.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn new_media_open_closes_existing_parked_live_window() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -24688,6 +24922,11 @@ mod still_window_mode_key_tests {
             });
         app.transition_detached_window_state(71, DetachedWindowState::ParkedLive, "test_setup");
 
+        assert!(
+            !app.activate_existing_detached_viewer_for_grid_open(&ctx, new_video),
+            "different media must continue into the normal park/close/open path"
+        );
+        assert!(app.park_active_detached_context_for_new_grid_open(&ctx));
         app.prepare_viewer_presentation_open(new_video, true);
 
         assert!(app.detached_image_windows.is_empty());

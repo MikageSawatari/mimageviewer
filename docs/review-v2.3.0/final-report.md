@@ -257,6 +257,19 @@ P2-1〜10 の全件を修正済み (未コミット)。Codex 検収 3 ラウン�
 **問題なし確認**: settings 互換 (新規 7 キー)、fs_animation、logger、HUD hit-test、
 panic ハント (新規 unwrap 69 件全照合)、エラー経路後始末、リソース teardown — 各レポート参照。
 
+### 追補 (2026-07-11): ParkedLive / VST3 deferred BA-7 P2 3 件
+
+発見: Codex 出荷前最終レビュー / 裏取り: Fable / 修正: Codex Sol。
+
+- VST3 startup load 待ちの media open を `ViewerContextBundle` 所有へ移し、main / active
+  detached / ParkedLive の各 context で pending を再開するよう修正。main 側 close/open による
+  別 context の pending 消失も防止した。
+- ParkedLive の直接 close と新メディアによる close に共通の bundle teardown を追加。最終再生
+  位置の保存、path 所有での normalize scan cancel、最後の音楽 consumer close 時の global
+  music 状態解放を行う。
+- grid から同じ media を開いた場合は context 間で path 照合し、active は raise、ParkedLive は
+  既存 activation 経路で前面化するよう修正。別 media の 1 本規則と teardown 付き close は維持。
+
 ## 推奨アクション (優先順)
 
 1. **出荷前修正 (小粒・低リスク・凍結対象外)**: P2-1 (ガード 1 条件) / P2-3 (clear 条件化) /
