@@ -3081,17 +3081,17 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleTag { name } => {
-                self.request_tag_toggle_for_selection(&name);
+                self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::Viewer);
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::AddTag { name } => {
-                self.request_tag_add_for_selection(&name);
+                self.request_tag_add_for_selection(&name, crate::app::ActionSurface::Viewer);
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::RemoveTag { name } => {
-                self.request_tag_remove_for_selection(&name);
+                self.request_tag_remove_for_selection(&name, crate::app::ActionSurface::Viewer);
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }

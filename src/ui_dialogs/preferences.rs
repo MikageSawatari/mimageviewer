@@ -1045,6 +1045,8 @@ impl App {
                 #[cfg(windows)]
                 let old_detached_open_images_in_window =
                     self.settings.detached_viewer_open_images_in_window;
+                #[cfg(windows)]
+                let old_fullfeature_media_window = self.settings.fullfeature_media_window;
                 // VST3 ページで再スキャンした候補を App 側に反映
                 #[cfg(windows)]
                 let new_vst3_discovered = state.vst3_discovered.clone();
@@ -1075,8 +1077,9 @@ impl App {
                     self.keymap = keymap;
                 }
                 #[cfg(windows)]
-                if old_detached_open_images_in_window
+                if (old_detached_open_images_in_window
                     != self.settings.detached_viewer_open_images_in_window
+                    || old_fullfeature_media_window != self.settings.fullfeature_media_window)
                     && self.close_all_detached_viewers_for_mode_change(ctx)
                 {
                     self.show_feedback_toast(
@@ -1506,7 +1509,10 @@ impl App {
             }
             keymap.install_global_native_video_shortcuts();
             self.keymap = keymap;
-            self.native_overlay_shortcut_help_cache = None;
+            #[cfg(windows)]
+            {
+                self.native_overlay_shortcut_help_cache = None;
+            }
         }
         if old_ring_shortcuts != self.settings.ring_shortcuts {
             #[cfg(windows)]

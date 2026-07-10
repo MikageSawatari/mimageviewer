@@ -1545,7 +1545,9 @@ struct ParkedLiveMusicWindowLayout {
     draw_waveform_fallback: bool,
 }
 
-#[cfg(windows)]
+// 音楽ビュー chrome (上部バー + 下部 HUD) の表示状態スナップショット。純データで
+// プラットフォーム非依存 (draw_fs_music_view / ui_music_panels の非 Windows ビルド
+// からも参照されるため cfg(windows) を付けない。review-v2.3.0 P3)。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MusicChromeViewState {
     pub(crate) title: String,
@@ -1569,7 +1571,8 @@ pub(crate) struct MusicChromeViewState {
     pub(crate) show_close: bool,
 }
 
-#[cfg(windows)]
+// 純データ (bool/i32 のみ)。非 Windows でも draw_fs_music_view が
+// draw_music_top_chrome stub の戻り値として使うため cfg(windows) を付けない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MusicTopChromeResponse {
     close_clicked: bool,
@@ -4163,7 +4166,8 @@ impl App {
         })
     }
 
-    #[cfg(windows)]
+    // draw_fs_music_view (プラットフォーム非依存) から呼ばれるため cfg(windows) を
+    // 付けない (review-v2.3.0 P3)。Windows 専用要素 (VST) は内部で cfg フォールバック。
     fn active_music_chrome_view_state(
         &self,
         fs_idx: usize,
@@ -4178,7 +4182,11 @@ impl App {
             _ => (1.0, false),
         };
         let video_audio_mode = self.video_audio_mode == Some(fs_idx);
+        // VST3 bridge は Windows 専用機能なので、非 Windows では VST ボタンを常に隠す。
+        #[cfg(windows)]
         let show_vst = self.music_chrome_should_show_vst(fs_idx);
+        #[cfg(not(windows))]
+        let show_vst = false;
         let normalize_ui_state = self
             .normalize_ui_states
             .get(&fs_idx)
@@ -4304,6 +4312,22 @@ impl App {
             egui::pos2(left, top_rect.top()),
             egui::pos2(right, top_rect.bottom()),
         )
+    }
+
+    /// 非 Windows stub: 上バー描画は native_presenter の overlay_draw (cfg(windows))
+    /// 依存のため描かない。ボタン応答は常に「何も押されていない」。
+    #[cfg(not(windows))]
+    fn draw_music_top_chrome(
+        &self,
+        _ui: &mut egui::Ui,
+        _top_rect: egui::Rect,
+        _fs_idx: usize,
+        _chrome: &MusicChromeViewState,
+        _fg: egui::Color32,
+        _accent: egui::Color32,
+        _interactive: bool,
+    ) -> MusicTopChromeResponse {
+        MusicTopChromeResponse::default()
     }
 
     #[cfg(windows)]
@@ -6056,14 +6080,17 @@ impl App {
                 self.release_fs_nav_lock();
                 // deferred holdover 中の Esc / × は detached viewer を閉じる明示操作。
                 // 同フレームの backstop より前に session を畳んで空窓の再描画を防ぐ
-                // (Codex レビュー #3 site 3)。
-                let closing_window_id = self
-                    .active_detached_session
-                    .map(|session| session.window_id);
-                self.begin_active_detached_session_close("deferred_holdover_cancel");
-                self.finish_active_detached_session_close("deferred_holdover_cancel");
-                if let Some(window_id) = closing_window_id {
-                    self.remove_detached_window_runtime(window_id, "deferred_holdover_cancel");
+                // (Codex レビュー #3 site 3)。(detached session は cfg(windows))
+                #[cfg(windows)]
+                {
+                    let closing_window_id = self
+                        .active_detached_session
+                        .map(|session| session.window_id);
+                    self.begin_active_detached_session_close("deferred_holdover_cancel");
+                    self.finish_active_detached_session_close("deferred_holdover_cancel");
+                    if let Some(window_id) = closing_window_id {
+                        self.remove_detached_window_runtime(window_id, "deferred_holdover_cancel");
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -6115,6 +6142,7 @@ impl App {
         ));
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
+        #[cfg(windows)]
         self.log_main_flash_probe(
             "fs_visible_false",
             format!("reason=keep_alive_cleanup viewport={fs_id:?}"),
@@ -6552,7 +6580,9 @@ impl App {
         #[cfg(not(windows))]
         let detached_seed_placement = need_show;
         #[cfg(not(windows))]
-        let detached_builder_placement = None;
+        let detached_builder_placement: Option<
+            crate::settings::DetachedViewerWindowPlacement,
+        > = None;
         #[cfg(windows)]
         let (
             detached_open_display_ready,
@@ -6589,13 +6619,23 @@ impl App {
             || detached_open_holdover_ready
             || detached_open_cache_state == "failed";
         let mut fs_builder = if detached {
-            self.build_detached_viewer_viewport_builder(
-                fs_idx,
-                detached_activate_on_show,
-                detached_seed_placement,
-                detached_builder_placement,
-                "active_render",
-            )
+            #[cfg(windows)]
+            {
+                self.build_detached_viewer_viewport_builder(
+                    fs_idx,
+                    detached_activate_on_show,
+                    detached_seed_placement,
+                    detached_builder_placement,
+                    "active_render",
+                )
+            }
+            // detached viewer は Windows 専用 (非 Windows では detached=false のため
+            // このパスには到達しない。コンパイルを通すためのフォールバックのみ)。
+            #[cfg(not(windows))]
+            {
+                let _ = (detached_seed_placement, detached_builder_placement);
+                self.build_fullscreen_viewport_builder()
+            }
         } else if state.is_video && !self.fs_music_view_active(fs_idx) {
             self.build_fullscreen_viewport_builder()
         } else {
@@ -7992,7 +8032,12 @@ impl App {
                         self.draw_gamepad_picker_overlay(ui, full_rect);
                         self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                         self.draw_gamepad_video_marker_picker_overlay(ui, full_rect);
-                        self.draw_feedback_toast(ui, full_rect, ctx);
+                        self.draw_feedback_toast(
+                            ui,
+                            full_rect,
+                            ctx,
+                            crate::app::ActionSurface::Viewer,
+                        );
 
                         // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
                         self.draw_stamp_embed_overlay(ui, full_rect, ctx);
@@ -8816,6 +8861,9 @@ impl App {
         }
     }
 
+    // detached 専用 state (borderless / placement log) を参照し、呼び出し元 4 箇所も
+    // すべて cfg(windows) 側にあるため関数ごとゲートする。
+    #[cfg(windows)]
     fn build_detached_viewer_viewport_builder(
         &self,
         fs_idx: usize,
@@ -11747,7 +11795,10 @@ impl App {
                         // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
                         // で seek + close を行うため、background catch-all は完全抑止
                         // (Codex P5.5 H1 反映)。
+                        #[cfg(windows)]
                         let tile_active = self.video_tile_mode_active;
+                        #[cfg(not(windows))]
+                        let tile_active = false;
                         let pos_opt = fs_response.interact_pointer_pos();
                         // 旧 egui HUD は撤去済 (native presenter overlay が代替)。
                         // egui main window 側で intercept すべき HUD 矩形は無いので常に false。
@@ -18245,11 +18296,14 @@ impl App {
     /// フルスクリーン側 (`render_fullscreen_viewport`) とグリッド側 (`render_grid`) の
     /// 両方から呼ばれる。どちらで描画しても同じ見た目になるよう、描画先 `ui` と
     /// トーストの基準矩形 `full_rect` を呼び出し側が渡す。
+    /// `drawing_surface` は呼び出し元の面。トーストに発火面が記録されていれば
+    /// 一致する面だけが描く (detached 窓 + グリッド同時表示での二重表示防止)。
     pub(crate) fn draw_feedback_toast(
         &mut self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         ctx: &egui::Context,
+        drawing_surface: crate::app::ActionSurface,
     ) {
         let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
@@ -18258,12 +18312,22 @@ impl App {
         if elapsed > duration {
             self.fs_feedback_toast = None;
             self.fs_feedback_toast_reveal_path = None;
+            self.fs_feedback_toast_surface = None;
             return;
         }
         // トースト表示中は自前で再描画を要求する。worker 駆動でない同期操作
         // (グリッドからのコンテナ評価付与など) でも、表示時間いっぱいフェードアウトまで
         // 確実に描画されるようにする (worker 経路だけ偶発的に repaint される状態を解消)。
+        // 面ゲートより**前**に要求する: 対象面のビューアが既に閉じている場合でも、
+        // 生き残っている面 (グリッド) の draw が repaint を回し続け、上の期限切れ
+        // 判定で Some が確実に掃除されるようにする (レビュー P3)。
         ctx.request_repaint();
+        // 期限切れ判定・repaint 要求は面に関係なく行い、描画だけ発火面に限定する。
+        if let Some(surface) = self.fs_feedback_toast_surface
+            && surface != drawing_surface
+        {
+            return;
+        }
 
         // フェードアウト (最後の0.3秒)
         let alpha = if elapsed > duration - 0.3 {
@@ -18315,6 +18379,7 @@ impl App {
                 crate::capture::reveal_path_async(path);
                 self.fs_feedback_toast = None;
                 self.fs_feedback_toast_reveal_path = None;
+                self.fs_feedback_toast_surface = None;
             }
         }
 
@@ -20816,7 +20881,10 @@ impl App {
         // タイル中は seek せずカーソル移動に切り替える。Ctrl 併用時だけ 1 行分移動。
         // ↑↓ は root 側で VideoPrevFile/VideoNextFile として扱う
         // (= native 動画経路と同じ keymap action)。Shift+↑↓ だけ動画モードで音量に使う。
+        #[cfg(windows)]
         let tile_active_for_keyboard = self.video_tile_mode_active;
+        #[cfg(not(windows))]
+        let tile_active_for_keyboard = false;
         let tile_left_ctrl = if tile_active_for_keyboard {
             if self
                 .keymap
@@ -20957,8 +21025,12 @@ impl App {
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
+        // (タイルモード = video_tile_* は native presenter 前提の Windows 専用機能)
+        #[cfg(windows)]
         let escape_for_tile = self.video_tile_mode_active
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        #[cfg(not(windows))]
+        let escape_for_tile = false;
 
         if close_video {
             self.close_fullscreen();
@@ -20970,14 +21042,18 @@ impl App {
             }
             return;
         }
+        #[cfg(windows)]
         if play_pause && self.video_tile_mode_active {
             self.play_selected_video_tile(ctx, fs_idx);
             return;
         }
+        #[cfg(windows)]
         if let Some(ctrl) = tile_left_ctrl.or(tile_right_ctrl) {
             self.handle_video_tile_cursor_key(ctx, fs_idx, ctrl, tile_left);
             return;
         }
+        #[cfg(not(windows))]
+        let _ = (tile_left_ctrl, tile_right_ctrl, tile_left);
         if save_frame_key {
             self.save_video_frame_to_file(ctx, fs_idx);
             return;
@@ -21082,10 +21158,13 @@ impl App {
         // Phase 5.5: S キーでタイルモード トグル。画面サイズは native presenter の
         // 実クライアントサイズ優先で取得 (取得不可なら content rect にフォールバック)。
         // toggle 内で fs_cache / video_tile_state を借用するので、player 借用後に呼ぶ。
+        #[cfg(windows)]
         if tile_key {
             let screen = self.video_tile_layout_size(fs_idx, ctx);
             self.toggle_video_tile_mode(fs_idx, screen);
         }
+        #[cfg(not(windows))]
+        let _ = tile_key;
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
             // perf overlay は native presenter が描画する。フラグを反転するだけでなく、
@@ -21208,6 +21287,7 @@ impl App {
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
         // (handle_image_keys 後段) の通常 ESC で扱う。
         if escape_for_tile {
+            #[cfg(windows)]
             self.close_video_tile_mode();
         }
 
@@ -21810,6 +21890,7 @@ impl App {
         if top_response.close_clicked {
             self.music_view_close_requested = true;
         }
+        #[cfg(windows)]
         if top_response.window_clicked {
             self.toggle_egui_viewer_window_mode_for_input(ctx);
         }

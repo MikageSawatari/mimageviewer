@@ -241,6 +241,7 @@ impl App {
                     crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
                 ));
                 self.fs_feedback_toast_reveal_path = Some(done.manifest_path);
+                self.fs_feedback_toast_surface = None;
             }
             Err(err) => {
                 crate::logger::log(format!("pipeline-debug: export failed: {err}"));

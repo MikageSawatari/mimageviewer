@@ -21,7 +21,7 @@ pub(crate) struct TagChoice {
 
 impl App {
     pub(crate) fn open_tag_apply_dialog(&mut self) {
-        let paths = self.tag_target_paths();
+        let paths = self.tag_target_paths(crate::app::ActionSurface::MainWindow);
         if paths.is_empty() {
             self.show_feedback_toast("[タグ対象なし]".to_string());
             return;
@@ -65,7 +65,7 @@ impl App {
             .as_ref()
             .is_some_and(|(fp, _, _)| *fp == fingerprint);
         if !cache_valid {
-            let paths = self.tag_target_paths();
+            let paths = self.tag_target_paths(crate::app::ActionSurface::MainWindow);
             self.hydrate_tags_cache_for_paths(&paths);
             let current = current_selection_tags(self, &paths)
                 .into_iter()
@@ -294,12 +294,12 @@ impl App {
             });
 
         if let Some(name) = add_tag {
-            self.request_tag_add_for_selection(&name);
+            self.request_tag_add_for_selection(&name, crate::app::ActionSurface::MainWindow);
             self.tag_apply_input.clear();
             self.invalidate_tag_apply_suggestions();
         }
         if let Some(name) = remove_tag {
-            self.request_tag_remove_for_selection(&name);
+            self.request_tag_remove_for_selection(&name, crate::app::ActionSurface::MainWindow);
             self.invalidate_tag_apply_suggestions();
         }
         if close || !open {

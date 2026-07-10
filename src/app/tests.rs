@@ -6469,11 +6469,101 @@ mod favorite_adjustment_defaults_tests {
         });
         app.fullscreen_idx = Some(0);
 
-        assert_eq!(app.tag_target_paths(), vec![source_rar.clone()]);
+        assert_eq!(
+            app.tag_target_paths(crate::app::ActionSurface::Viewer),
+            vec![source_rar.clone()]
+        );
 
         // 通常 ZIP (override なし) では従来どおり zip_path 自身がタグ対象。
         app.archive_source_override = None;
-        assert_eq!(app.tag_target_paths(), vec![cache_zip]);
+        assert_eq!(
+            app.tag_target_paths(crate::app::ActionSurface::Viewer),
+            vec![cache_zip]
+        );
+    }
+
+    /// 発火面ごとの対象解決 (findings-19): detached viewer 中はグリッドとビューアを
+    /// 同時に操作できるため、MainWindow 面は fullscreen_idx を見ずグリッド選択を、
+    /// Viewer 面はビューアの現在アイテムだけを対象にする。
+    #[test]
+    fn tag_targets_resolve_by_action_surface() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"D:\pics"));
+        let grid_idx = push_image(&mut app, r"D:\pics\grid_selected.jpg");
+        let viewer_idx = push_image(&mut app, r"D:\pics\viewer_item.jpg");
+        app.selected = Some(grid_idx);
+        // detached viewer が viewer_item を表示している状態を模す。
+        app.fullscreen_idx = Some(viewer_idx);
+
+        assert_eq!(
+            app.tag_target_paths(crate::app::ActionSurface::MainWindow),
+            vec![PathBuf::from(r"D:\pics\grid_selected.jpg")],
+            "grid-origin tag ops must target the grid selection, not the detached viewer item"
+        );
+        assert_eq!(
+            app.tag_target_paths(crate::app::ActionSurface::Viewer),
+            vec![PathBuf::from(r"D:\pics\viewer_item.jpg")],
+        );
+    }
+
+    /// parked still の再オープン descriptor (findings-19): 通常画像には Image
+    /// フォールバックを焼き付けるが、open ルーティング用 descriptor は従来どおり
+    /// (画像 = None = still 経路のまま) であることを固定する。
+    #[test]
+    #[cfg(windows)]
+    fn parked_still_reopen_descriptor_adds_image_fallback_without_touching_open_routing() {
+        let mut app = setup_app();
+        let img_idx = push_image(&mut app, r"D:\pics\a.jpg");
+        app.items.push(GridItem::ZipImage {
+            zip_path: PathBuf::from(r"D:\c\b.zip"),
+            entry_name: "p1.jpg".into(),
+        });
+        let zip_idx = app.items.len() - 1;
+        app.items
+            .push(GridItem::Video(PathBuf::from(r"D:\v\m.mp4")));
+        let vid_idx = app.items.len() - 1;
+
+        // open ルーティング用 descriptor は画像では従来どおり None (still 経路)。
+        assert!(
+            app.detached_viewer_context_descriptor_for_idx(img_idx)
+                .is_none(),
+            "adding the parked-snapshot fallback must not reroute grid opens of plain images"
+        );
+
+        // parked snapshot 用は Image フォールバックが付く。
+        assert!(matches!(
+            app.parked_still_reopen_descriptor_for_idx(img_idx),
+            Some(crate::app::ViewerContextDescriptor::Image { path })
+                if path == PathBuf::from(r"D:\pics\a.jpg")
+        ));
+        // ZipImage は従来の Zip descriptor、動画はフォールバックなし。
+        assert!(matches!(
+            app.parked_still_reopen_descriptor_for_idx(zip_idx),
+            Some(crate::app::ViewerContextDescriptor::Zip { .. })
+        ));
+        assert!(
+            app.parked_still_reopen_descriptor_for_idx(vid_idx)
+                .is_none()
+        );
+    }
+
+    /// トーストの面 routing (findings-19): 発火面付きトーストは該当面にだけ表示する。
+    #[test]
+    fn feedback_toast_surface_is_recorded_per_origin() {
+        let mut app = setup_app();
+        app.show_feedback_toast_on("grid".to_string(), crate::app::ActionSurface::MainWindow);
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        app.show_feedback_toast_on("viewer".to_string(), crate::app::ActionSurface::Viewer);
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::Viewer)
+        );
+        // 従来経路 (発火面不明) は全面表示 = None。
+        app.show_feedback_toast("legacy".to_string());
+        assert_eq!(app.fs_feedback_toast_surface, None);
     }
 
     #[test]
@@ -16276,6 +16366,55 @@ mod native_video_rating_key_tests {
         assert_eq!(app.current_folder_rating_cache, Some(0));
     }
 
+    /// 契約固定 (2026-07-10 監査の反証): bundle 化された detached メディア窓での
+    /// コンテナ★ (Shift+F1-F6) は、main が別フォルダへ移動していても**窓自身の
+    /// フォルダ** (bundle の current_folder) に付く。実機経路 = poll_video が
+    /// `with_active_detached_viewer_context` 内で native キーを処理するため、
+    /// current_folder / zip_nav / current_folder_rating_cache は bundle 側が見える。
+    #[test]
+    #[cfg(windows)]
+    fn container_rating_in_bundled_media_window_targets_window_folder() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_folder = PathBuf::from(r"C:\A");
+        let main_folder = PathBuf::from(r"C:\B");
+        app.current_folder = Some(window_folder.clone());
+        let video = push_video(&mut app, window_folder.join("v.mp4"));
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        // main のフォルダ移動相当: 動画セッションを bundle 化して main を解放。
+        assert!(app.promote_active_detached_video_for_main_context_change());
+        app.current_folder = Some(main_folder.clone());
+        app.items.clear();
+        app.current_folder_rating_cache = None;
+
+        // 実機と同じ mounted 経路で Shift+F5 を処理する。
+        app.with_active_detached_viewer_context(|app| {
+            let fs_idx = app.fullscreen_idx.expect("bundle keeps the media session");
+            app.handle_native_video_key_event(&ctx, fs_idx, native_key(0x74, true));
+        });
+
+        let window_key = crate::adjustment_db::normalize_path(&window_folder);
+        let main_key = crate::adjustment_db::normalize_path(&main_folder);
+        let db = app.rating_db.as_ref().unwrap();
+        assert_eq!(
+            db.get(&window_key),
+            5,
+            "container rating from the media window must hit the window's own folder"
+        );
+        assert_eq!(
+            db.get(&main_key),
+            0,
+            "main's current folder must not receive the rating"
+        );
+        assert_eq!(
+            app.current_folder_rating_cache, None,
+            "main-context rating cache must stay untouched (the bundle owns its own cache)"
+        );
+    }
+
     /// F11 (VK 0x7A) で `toggle_video_window_mode` 経路が走っても、
     /// active `VideoPlayer` がまだ無い場合は orphan pending を作らない。
     /// 実際の placement switch は `FsCacheEntry::Video` が存在する実再生中 session だけで行う。
@@ -17467,6 +17606,197 @@ mod still_window_mode_key_tests {
             app.requested_viewer_presentation_for_open(audio),
             ViewerPresentation::DetachedWindow,
             "the next explicit audio open should return to the shared media window"
+        );
+    }
+
+    /// §1.7 フル機能モード + 「動画・音声は別ウィンドウで再生」checkbox。
+    /// メディアだけ複数ウィンドウモードと同じメディア窓経路に乗り、画像は従来どおり
+    /// メイン fullscreen のまま。F12 はメディア窓 ⇔ メインのトグルとして機能する。
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_media_window_routes_media_only_to_detached() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.detached_viewer_enabled = false;
+        app.settings.fullfeature_media_window = true;
+
+        assert_eq!(
+            app.requested_viewer_presentation_for_open(video),
+            ViewerPresentation::DetachedWindow,
+            "video opens route to the media window when the sub-option is on"
+        );
+        assert_eq!(
+            app.requested_viewer_presentation_for_open(audio),
+            ViewerPresentation::DetachedWindow,
+        );
+        assert_ne!(
+            app.requested_viewer_presentation_for_open(image),
+            ViewerPresentation::DetachedWindow,
+            "images keep the full-feature main viewer"
+        );
+
+        // F12 トグル: メディア窓のメディアはメインへ、メインのメディアはメディア窓へ。
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        assert_eq!(
+            app.always_new_media_f12_target_presentation(),
+            Some(app.non_detached_viewer_presentation())
+        );
+        app.viewer_presentation = app.non_detached_viewer_presentation();
+        assert_eq!(
+            app.always_new_media_f12_target_presentation(),
+            Some(ViewerPresentation::DetachedWindow)
+        );
+        // 画像には効かない (通常の F12 = detached_viewer_enabled トグルのまま)。
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert_eq!(app.always_new_media_f12_target_presentation(), None);
+        // 画像の F12 still トグルは checkbox では無効化されない (複数ウィンドウ専用の制限)。
+        assert!(!app.detached_toggle_disabled_by_always_new_images());
+
+        // checkbox OFF (既定) では従来どおりメディアもメイン。
+        app.settings.fullfeature_media_window = false;
+        assert_ne!(
+            app.requested_viewer_presentation_for_open(video),
+            ViewerPresentation::DetachedWindow,
+        );
+    }
+
+    /// §1.7 (Codex audit P1/P2): 第3状態のメディア窓は folder nav を consume し、
+    /// main のフォルダ移動では音声も promote 対象になる。
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_media_window_blocks_folder_nav_and_promotes_audio() {
+        let mut app = setup_app();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        let audio = push_audio(&mut app, r"C:\music\a.flac");
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.fullfeature_media_window = true;
+
+        // メディア窓セッション (bundle 化前) は folder nav を consume する。
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        assert!(
+            app.detached_independent_session_blocks_folder_nav(),
+            "the media window must consume folder navigation like multi-window detached windows"
+        );
+        // 音声も同様。
+        app.fullscreen_idx = Some(audio);
+        assert!(app.detached_independent_session_blocks_folder_nav());
+        // フル機能の連動画像セッション (F12) は従来どおりブロックしない。
+        app.fullscreen_idx = Some(image);
+        assert!(!app.detached_independent_session_blocks_folder_nav());
+
+        // main のフォルダ移動時の promote は音声にも効く (Video 限定だと再生が止まる)。
+        app.fullscreen_idx = Some(audio);
+        assert!(app.should_promote_active_detached_video_for_main_context_change());
+        app.fullscreen_idx = Some(video);
+        assert!(app.should_promote_active_detached_video_for_main_context_change());
+        app.fullscreen_idx = Some(image);
+        assert!(!app.should_promote_active_detached_video_for_main_context_change());
+    }
+
+    /// スタック集約の適用前退避 (2026-07-10 監査): unbundled detached メディア
+    /// セッションは live-park で再生を続けたまま main を解放し、main の
+    /// current_folder (= stack pending の妥当性) は clone で維持される。
+    #[test]
+    #[cfg(windows)]
+    fn stack_aggregation_park_keeps_media_playing_and_main_folder() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\stackdir");
+        app.current_folder = Some(folder.clone());
+        let video = push_video(&mut app, r"C:\stackdir\v.mp4");
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.reload_queue = Some(std::sync::Arc::new((
+            Mutex::new(Vec::new()),
+            Condvar::new(),
+        )));
+        app.heavy_io_queue = Some(std::sync::Arc::new((
+            Mutex::new(Vec::new()),
+            Condvar::new(),
+        )));
+
+        app.park_detached_session_for_stack_aggregation(&ctx);
+
+        assert_eq!(app.fullscreen_idx, None, "main is freed for the items swap");
+        assert_eq!(
+            app.current_folder.as_deref(),
+            Some(folder.as_path()),
+            "in-place live-park must keep main's folder so the stack pending stays valid"
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert!(
+            app.detached_image_windows[0].paused_bundle.is_some(),
+            "the media session survives as a ParkedLive window (keeps playing)"
+        );
+    }
+
+    /// §1.7: メディア窓セッションはメイン一覧カーソルに追従しない
+    /// (フル機能モードの連動 F12 ビューアと違い、メディア窓は独立再生)。
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_media_window_session_does_not_follow_grid_cursor() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.detached_viewer_enabled = true;
+        app.settings.fullfeature_media_window = true;
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.selected = Some(image);
+
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(video),
+            "the media window must keep playing its own item when the grid cursor moves"
+        );
+    }
+
+    /// §1.7: bundle 化前の連動 detached メディアセッションは、grid open の直前に
+    /// live-park される (open_non_detached 経路で閉じられて再生が止まらない)。
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_media_window_unbundled_session_parks_on_grid_open() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.fullfeature_media_window = true;
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        // ロード複合体 (park で main へ引き継がれる) を模擬。
+        app.reload_queue = Some(std::sync::Arc::new((
+            Mutex::new(Vec::new()),
+            Condvar::new(),
+        )));
+        app.heavy_io_queue = Some(std::sync::Arc::new((
+            Mutex::new(Vec::new()),
+            Condvar::new(),
+        )));
+
+        assert!(app.park_active_detached_context_for_new_grid_open(&ctx));
+
+        assert_eq!(
+            app.detached_image_windows.len(),
+            1,
+            "the unbundled media session must be parked as a live media window"
+        );
+        assert!(app.detached_image_windows[0].paused_bundle.is_some());
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "main context is freed for the upcoming grid open"
         );
     }
 
@@ -19277,7 +19607,13 @@ mod still_window_mode_key_tests {
             app.detached_image_windows[0].can_activate(),
             "plain image snapshots must be able to become the active viewer again"
         );
-        assert!(app.detached_image_windows[0].reopen_descriptor.is_none());
+        // findings-19: 通常画像の parked still にも Image フォールバック descriptor が
+        // 付く。ただし後段の activation はスタンプ優先で従来どおり成功すること
+        // (このテストの activate 成功 assert がその契約を固定する)。
+        assert!(matches!(
+            app.detached_image_windows[0].reopen_descriptor,
+            Some(crate::app::ViewerContextDescriptor::Image { .. })
+        ));
         assert!(app.detached_image_windows[0].reopen_sync_stamp.is_some());
         assert!(
             app.panorama_state.is_none(),
@@ -24871,6 +25207,76 @@ mod still_window_mode_key_tests {
             ),
             None,
             "clicks whose cursor root HWND is not a passive window are ignored"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn activation_watcher_resolves_overlapping_targets_by_cursor_root_hwnd() {
+        // findings-19 実機バグ: parked 窓が重なっているとき、targets のリスト順
+        // (≠ z-order) の矩形あたり判定が背面窓を照準に選び、前面窓へのクリックが
+        // hwnd 不一致で丸ごと棄却されていた。OS の cursor_root_hwnd と一致する
+        // target を優先して解決することを固定する。
+        let back = DetachedActivationWatchTargetRect {
+            window_id: 3,
+            hwnd: 0x3000,
+            eligible: true,
+            close_hit_test: DetachedActivationCloseHitTest::ImageBar,
+            left: 50,
+            top: 50,
+            right: 350,
+            bottom: 300,
+        };
+        let front = DetachedActivationWatchTargetRect {
+            window_id: 6,
+            hwnd: 0x6000,
+            eligible: true,
+            close_hit_test: DetachedActivationCloseHitTest::ImageBar,
+            left: 100,
+            top: 100,
+            right: 400,
+            bottom: 350,
+        };
+        // 背面窓がリスト先頭 = 実機で踏んだ順序。クリック点は両矩形の重なり内。
+        let targets = [back, front];
+        let mut state = DetachedActivationWatchState::default();
+
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x6000, 0x6000, Some((200, 200))),
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(false, 0x6000, 0x6000, Some((200, 200))),
+                &targets,
+            ),
+            Some(6),
+            "a click on the front window must activate it even when a back window's \
+             rect also contains the cursor and precedes it in the target list"
+        );
+
+        // 逆方向: 同じ重なり点でも root が背面窓なら背面窓が照準になる。
+        let mut state = DetachedActivationWatchState::default();
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(true, 0x3000, 0x3000, Some((200, 200))),
+                &targets,
+            ),
+            None
+        );
+        assert_eq!(
+            App::detached_activation_watch_step(
+                &mut state,
+                activation_sample(false, 0x3000, 0x3000, Some((200, 200))),
+                &targets,
+            ),
+            Some(3),
         );
     }
 

@@ -2632,6 +2632,13 @@ pub struct Settings {
     /// は開くたびに detached image window を残し、動画/音声は単一の detached media window を再利用する。
     #[serde(default)]
     pub detached_viewer_open_images_in_window: bool,
+    /// フル機能モードのサブオプション「動画・音声は別ウィンドウで再生」(§1.7)。
+    /// ON にすると、フル機能モードでも動画/音声だけは複数ウィンドウモードと同じ
+    /// 独立メディアウィンドウ (live-park する単一窓) で再生する。
+    /// 実効判定は `effective_media_in_media_window()` を使うこと
+    /// (複数ウィンドウモードでは常にメディア窓なので、このフラグは見ない)。
+    #[serde(default)]
+    pub fullfeature_media_window: bool,
     /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
     /// top-level window の両方で共有する。
     #[serde(default)]
@@ -3634,6 +3641,7 @@ impl Default for Settings {
             video_in_window_mode: false,
             detached_viewer_enabled: false,
             detached_viewer_open_images_in_window: false,
+            fullfeature_media_window: false,
             detached_viewer_window_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
@@ -4382,6 +4390,15 @@ impl Settings {
 
     pub fn auto_fullscreen_image_folders_enabled(&self) -> bool {
         self.effective_auto_fullscreen_zip_pdf() && self.auto_fullscreen_image_folders
+    }
+
+    /// 動画/音声を独立メディアウィンドウで再生するか (§1.7 派生述語)。
+    /// 複数ウィンドウモードでは常に true。フル機能モードではサブオプション
+    /// 「動画・音声は別ウィンドウで再生」に従う。メディア挙動の分岐は
+    /// このヘルパー経由に統一する (`detached_viewer_open_images_in_window`
+    /// 直読みでメディア経路を分岐させない)。
+    pub fn effective_media_in_media_window(&self) -> bool {
+        self.detached_viewer_open_images_in_window || self.fullfeature_media_window
     }
 
     pub fn books_root_path(&self) -> PathBuf {
@@ -5523,6 +5540,27 @@ mod tests {
                     s.auto_fullscreen_zip_pdf, saved_direct_open,
                     "switching viewer mode must preserve the saved book display preference"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn effective_media_in_media_window_truth_table() {
+        // §1.7: 複数ウィンドウモードでは常に true (checkbox は見ない)。
+        // フル機能モードでは checkbox に従う。保存値は変異しない。
+        for multi_window in [false, true] {
+            for media_checkbox in [false, true] {
+                let s = Settings {
+                    detached_viewer_open_images_in_window: multi_window,
+                    fullfeature_media_window: media_checkbox,
+                    ..Settings::default()
+                };
+                assert_eq!(
+                    s.effective_media_in_media_window(),
+                    multi_window || media_checkbox,
+                    "multi_window={multi_window} media_checkbox={media_checkbox}"
+                );
+                assert_eq!(s.fullfeature_media_window, media_checkbox);
             }
         }
     }

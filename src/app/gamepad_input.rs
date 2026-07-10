@@ -4071,7 +4071,9 @@ impl App {
             return;
         };
         self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
-        self.request_tag_toggle_for_selection(&name);
+        // ピン留めタグ KeyAction は Grid コンテキスト専用 (keymap テストで固定) なので
+        // 発火面はメイングリッド。
+        self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
     }
 
     fn apply_favorite_cycle_nav(
@@ -4552,6 +4554,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && self.toggle_video_session_mute_for_fs_idx(fs_idx)
                 {
+                    #[cfg(windows)]
                     self.request_native_video_hud_repaint(ctx);
                 }
                 None
@@ -4564,6 +4567,8 @@ impl App {
                     if self.fs_music_view_active(fs_idx) {
                         self.cycle_music_loop_mode(ctx, fs_idx);
                     } else {
+                        // native presenter 経路 (app/native_video.rs) は cfg(windows)。
+                        #[cfg(windows)]
                         self.cycle_native_video_loop_common(ctx, fs_idx);
                     }
                 }
@@ -4655,6 +4660,8 @@ impl App {
                 }
             }
             RingShortcutContext::VideoFullscreen => {
+                // native presenter 経路 (app/native_video.rs) は cfg(windows)。
+                #[cfg(windows)]
                 self.toggle_video_window_mode_for_input(ctx);
             }
             RingShortcutContext::Grid => {}

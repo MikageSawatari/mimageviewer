@@ -1768,7 +1768,14 @@ impl crate::app::App {
 
     /// DEL キーで選択中またはチェック済みの実ファイル / 実フォルダを削除するハンドラ。
     pub(crate) fn handle_delete_key(&mut self, ctx: &egui::Context) {
-        if self.fullscreen_idx.is_some() || self.address_has_focus || self.any_dialog_open() {
+        // detached viewer 中はグリッドが操作可能なので Delete も生かす
+        // (`fullscreen_idx.is_some()` の旧述語だと detached 窓を開いている間
+        // グリッドの Delete キーが無効化される)。GridDelete は Grid コンテキストの
+        // KeyAction なので、detached 窓側のキー入力がここへ流れることはない。
+        if self.viewer_session_blocks_main_window()
+            || self.address_has_focus
+            || self.any_dialog_open()
+        {
             return;
         }
         let del = self

@@ -83,22 +83,27 @@ impl App {
         target
     }
 
-    /// 選択解決の共有ポリシー。優先順位:
-    ///   1. **フルスクリーン中** (`fullscreen_idx` Some) は常にフルスクリーン中のページのみ。
-    ///      古い `checked` がグリッドに残っていても無視する (フルスクリーンで見えているのは
-    ///      1 枚なので、ユーザーの「これに操作」期待と必ず一致させる)。
-    ///   2. グリッドで `checked` が **selected も含む** 形で揃っていれば、checked 全件を bulk 対象
-    ///      にする (典型的な multi-select フロー)。selected が checked に含まれない場合は
-    ///      「checked は古い残りもの」とみなして selected 単体に落とす — クリックしたサムネが
-    ///      対象にならない事故を防ぐ。
-    ///   3. checked が空なら selected 単体。
+    /// 選択解決の共有ポリシー。発火面 (`ActionSurface`) で対象が決まる:
+    ///   - **Viewer 面**: ビューアの現在アイテム (`fullscreen_idx`) のみ。古い `checked` が
+    ///     グリッドに残っていても無視する (ビューアで見えているのは 1 枚なので、
+    ///     ユーザーの「これに操作」期待と必ず一致させる)。
+    ///   - **MainWindow 面**: `fullscreen_idx` は見ない (detached viewer 中はグリッドと
+    ///     ビューアを同時に操作できるため)。グリッドで `checked` が **selected も含む** 形で
+    ///     揃っていれば checked 全件を bulk 対象にする (典型的な multi-select フロー)。
+    ///     selected が checked に含まれない場合は「checked は古い残りもの」とみなして
+    ///     selected 単体に落とす — クリックしたサムネが対象にならない事故を防ぐ。
+    ///     checked が空なら selected 単体。
     ///
     /// タグ操作 (`tag_targets`) と旧XMP取り込み (`legacy_xmp_targets`) の**両方がこの
     /// 1 実装を使う** — bulk_intent の stale-check が片方だけ改良されると、同じ選択でも
     /// 対象ファイル集合が割れ、破壊的な XMP 編集が想定外のファイルに当たる。
-    fn selection_target_indices(&self) -> Vec<usize> {
-        if let Some(fs_idx) = self.fullscreen_idx {
-            return vec![fs_idx];
+    fn selection_target_indices(&self, surface: crate::app::ActionSurface) -> Vec<usize> {
+        // Viewer 面はビューアの現在アイテムだけを対象にする。MainWindow 面では
+        // fullscreen_idx を見ない: detached viewer 中はグリッドとビューアを同時に
+        // 操作できるため、「fullscreen_idx があればフルスクリーン対象」という従来の
+        // 推定ではグリッド操作が detached 窓のアイテムに誤爆する (findings-19)。
+        if matches!(surface, crate::app::ActionSurface::Viewer) {
+            return self.fullscreen_idx.map(|idx| vec![idx]).unwrap_or_default();
         }
         let bulk_intent = match self.selected {
             Some(sel) => !self.checked.is_empty() && self.checked.contains(&sel),
@@ -132,30 +137,31 @@ impl App {
     }
 
     /// タグ書き込みの対象ファイル列 (`selection_target_indices` の解決結果のうち、
-    /// 実パスを持つタグ対応 item のみ)。ZIP/PDF ページのフルスクリーン中は
+    /// 実パスを持つタグ対応 item のみ)。ZIP/PDF ページのビューア面では
     /// コンテナ自身へフォールバックする (変換アーカイブは元パスへ remap)。
-    fn tag_targets(&self) -> Vec<TagTarget> {
-        let fullscreen = self.fullscreen_idx.is_some();
-        self.selection_target_indices()
+    fn tag_targets(&self, surface: crate::app::ActionSurface) -> Vec<TagTarget> {
+        let fullscreen = matches!(surface, crate::app::ActionSurface::Viewer);
+        self.selection_target_indices(surface)
             .into_iter()
             .filter_map(|idx| self.tag_target_for_index(idx, fullscreen))
             .collect()
     }
 
-    pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
-        self.tag_targets()
+    pub(crate) fn tag_target_paths(&self, surface: crate::app::ActionSurface) -> Vec<PathBuf> {
+        self.tag_targets(surface)
             .into_iter()
             .map(|target| target.path)
             .collect()
     }
 
-    pub(crate) fn tag_target_path_count(&self) -> usize {
-        self.tag_targets().len()
+    pub(crate) fn tag_target_path_count(&self, surface: crate::app::ActionSurface) -> usize {
+        self.tag_targets(surface).len()
     }
 
     fn legacy_xmp_targets(&self) -> Vec<PathBuf> {
+        // 旧 XMP 取り込みはグリッドのメニューからのみ起動する (MainWindow 固定)。
         let mut out: Vec<PathBuf> = self
-            .selection_target_indices()
+            .selection_target_indices(crate::app::ActionSurface::MainWindow)
             .into_iter()
             .filter(|&idx| !self.idx_is_compiled_book_page(idx))
             .filter_map(|idx| self.items.get(idx).and_then(legacy_xmp_target_for_item))
@@ -182,8 +188,9 @@ impl App {
             // 実行中の再実行 = 中止要求。ImportAndRemove はファイルを書き換える
             // 破壊的バッチなので、必ずユーザーが止められる経路を持つ。
             pending.cancel();
-            self.show_feedback_toast(
+            self.show_feedback_toast_on(
                 "旧XMPタグの取り込みを中止します (処理済み分は反映されます)".to_string(),
+                crate::app::ActionSurface::MainWindow,
             );
             return;
         }
@@ -194,7 +201,10 @@ impl App {
         targets.sort();
         targets.dedup();
         if targets.is_empty() {
-            self.show_feedback_toast("旧XMPタグの取り込み対象がありません".to_string());
+            self.show_feedback_toast_on(
+                "旧XMPタグの取り込み対象がありません".to_string(),
+                crate::app::ActionSurface::MainWindow,
+            );
             return;
         }
         let count = targets.len();
@@ -203,28 +213,36 @@ impl App {
             targets,
             mode,
         ));
-        self.show_feedback_toast(format!(
-            "{} ({count} 件) — もう一度実行すると中止",
-            mode.progress_label()
-        ));
+        self.show_feedback_toast_on(
+            format!(
+                "{} ({count} 件) — もう一度実行すると中止",
+                mode.progress_label()
+            ),
+            crate::app::ActionSurface::MainWindow,
+        );
     }
 
-    pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
-        let mode = if self.fullscreen_idx.is_some() {
-            "fullscreen"
-        } else {
-            "grid"
+    pub(crate) fn request_tag_toggle_for_selection(
+        &mut self,
+        name: &str,
+        surface: crate::app::ActionSurface,
+    ) {
+        let mode = match surface {
+            crate::app::ActionSurface::Viewer => "fullscreen",
+            crate::app::ActionSurface::MainWindow => "grid",
         };
-        let targets = self.tag_targets();
-        self.request_tag_toggle_for_targets_impl(name, targets, mode);
+        let targets = self.tag_targets(surface);
+        self.request_tag_toggle_for_targets_impl(name, targets, mode, surface);
     }
 
     /// 「今いるコンテナ」(current_folder = 実フォルダ / ZIP / PDF) にタグをトグルする。
     /// ツールバーのピンタグ Shift+右クリック用 (toolbar-customization-plan.md §1.1)。
     /// 合成ビュー (検索 / タグビュー / 読書履歴) は対象コンテナが無いので no-op + 通知。
     pub(crate) fn request_tag_toggle_for_current_container(&mut self, name: &str) {
+        // ツールバーのピンタグ専用 (= グリッド面固定)。
+        let surface = crate::app::ActionSurface::MainWindow;
         let Some(folder) = self.current_folder.clone() else {
-            self.show_feedback_toast("タグを付けるコンテナがありません".to_string());
+            self.show_feedback_toast_on("タグを付けるコンテナがありません".to_string(), surface);
             return;
         };
         // 合成ビューでは実コンテナが無いので no-op + 通知。判定は経路ごとに異なる:
@@ -237,16 +255,24 @@ impl App {
             || self.items_are_tag_view
             || self.items_are_drive_list
         {
-            self.show_feedback_toast("この画面ではコンテナにタグを付けられません".to_string());
+            self.show_feedback_toast_on(
+                "この画面ではコンテナにタグを付けられません".to_string(),
+                surface,
+            );
             return;
         }
         // コンテナ (フォルダ/ZIP/PDF) は XMP サイドカー非対象なので tags.db のみ。
         let target = self.tag_target_for_path(folder, false);
-        self.request_tag_toggle_for_targets(name, vec![target]);
+        self.request_tag_toggle_for_targets(name, vec![target], surface);
     }
 
-    pub(crate) fn request_tag_toggle_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
-        self.request_tag_toggle_for_targets_impl(name, targets, "explicit");
+    pub(crate) fn request_tag_toggle_for_targets(
+        &mut self,
+        name: &str,
+        targets: Vec<TagTarget>,
+        surface: crate::app::ActionSurface,
+    ) {
+        self.request_tag_toggle_for_targets_impl(name, targets, "explicit", surface);
     }
 
     fn request_tag_toggle_for_targets_impl(
@@ -254,6 +280,7 @@ impl App {
         name: &str,
         targets: Vec<TagTarget>,
         mode: &str,
+        surface: crate::app::ActionSurface,
     ) {
         let name_owned = name.to_string();
         crate::logger::log(format!(
@@ -276,6 +303,7 @@ impl App {
         // に設定する。早期 return 経路で上書きすると、in-flight の前バッチの完了トーストが
         // 誤ったタグ名を名乗る (空 targets での中断 → 古いバッチに新ラベル)。
         self.tag_toast_label = Some(format!("#{name_owned}"));
+        self.tag_toast_surface = Some(surface);
         self.hydrate_tags_cache_for_paths(&paths);
         let tag_key = crate::tags_db::normalize_tag_key(&name_owned);
         let all_have_tag = paths.iter().all(|path| {
@@ -326,28 +354,57 @@ impl App {
         });
     }
 
-    pub(crate) fn request_tag_add_for_selection(&mut self, name: &str) {
-        self.request_tag_set_for_selection(name, true);
+    pub(crate) fn request_tag_add_for_selection(
+        &mut self,
+        name: &str,
+        surface: crate::app::ActionSurface,
+    ) {
+        self.request_tag_set_for_selection(name, true, surface);
     }
 
-    pub(crate) fn request_tag_remove_for_selection(&mut self, name: &str) {
-        self.request_tag_set_for_selection(name, false);
+    pub(crate) fn request_tag_remove_for_selection(
+        &mut self,
+        name: &str,
+        surface: crate::app::ActionSurface,
+    ) {
+        self.request_tag_set_for_selection(name, false, surface);
     }
 
-    pub(crate) fn request_tag_add_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
-        self.request_tag_set_for_targets(name, targets, true);
+    pub(crate) fn request_tag_add_for_targets(
+        &mut self,
+        name: &str,
+        targets: Vec<TagTarget>,
+        surface: crate::app::ActionSurface,
+    ) {
+        self.request_tag_set_for_targets(name, targets, true, surface);
     }
 
-    pub(crate) fn request_tag_remove_for_targets(&mut self, name: &str, targets: Vec<TagTarget>) {
-        self.request_tag_set_for_targets(name, targets, false);
+    pub(crate) fn request_tag_remove_for_targets(
+        &mut self,
+        name: &str,
+        targets: Vec<TagTarget>,
+        surface: crate::app::ActionSurface,
+    ) {
+        self.request_tag_set_for_targets(name, targets, false, surface);
     }
 
-    fn request_tag_set_for_selection(&mut self, name: &str, add: bool) {
-        let targets = self.tag_targets();
-        self.request_tag_set_for_targets(name, targets, add);
+    fn request_tag_set_for_selection(
+        &mut self,
+        name: &str,
+        add: bool,
+        surface: crate::app::ActionSurface,
+    ) {
+        let targets = self.tag_targets(surface);
+        self.request_tag_set_for_targets(name, targets, add, surface);
     }
 
-    fn request_tag_set_for_targets(&mut self, name: &str, targets: Vec<TagTarget>, add: bool) {
+    fn request_tag_set_for_targets(
+        &mut self,
+        name: &str,
+        targets: Vec<TagTarget>,
+        add: bool,
+        surface: crate::app::ActionSurface,
+    ) {
         let name = crate::tags_db::normalize_tag_display_name(name);
         if name.is_empty() {
             return;
@@ -367,6 +424,7 @@ impl App {
 
         let with_hash = crate::tags_db::format_display_tag(&name);
         self.tag_toast_label = Some(with_hash.clone());
+        self.tag_toast_surface = Some(surface);
         let summary = if add {
             format!("{with_hash} の付与")
         } else {
@@ -406,9 +464,8 @@ impl App {
         );
     }
 
-    pub(crate) fn request_tag_clear_for_selection(&mut self) {
-        self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
-        let targets = self.tag_targets();
+    pub(crate) fn request_tag_clear_for_selection(&mut self, surface: crate::app::ActionSurface) {
+        let targets = self.tag_targets(surface);
         let count = targets.len();
         if count == 0 {
             crate::logger::log(
@@ -423,10 +480,15 @@ impl App {
         if !self.precheck_tag_write_available("clear") {
             return;
         }
+        // ラベル/発火面はバリデーション通過後に設定する (toggle/add と同じ規約。
+        // 早期 return 経路で上書きすると in-flight の前バッチの完了トーストが
+        // 誤った面/ラベルで表示される — Codex P3)。
+        self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
+        self.tag_toast_surface = Some(surface);
         // 楽観的 UI 更新: tags.db 上の mIV タグを空にする。
         let summary = format!("{count} 件の mIV タグをクリア");
         self.optimistic_update_tags_cache(&paths, |_before| Vec::new());
-        self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
+        self.show_feedback_toast_on(format!("{count} 件から mIV タグをクリア中"), surface);
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
         self.submit_tag_jobs(&targets, "clear", tx_id, |_| TagJobKind::ClearMiv);
@@ -658,14 +720,28 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join(" / ");
-            self.show_feedback_toast(format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview));
+            let msg = format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview);
+            // 発火面が分かるバッチはその面に出す (undo 復元など面未記録は従来どおり全面)。
+            match self.tag_toast_surface {
+                Some(surface) => self.show_feedback_toast_on(msg, surface),
+                None => self.show_feedback_toast(msg),
+            }
         } else if just_completed && (added + removed + cleared + restored + noop) > 0 {
             let label = self.tag_toast_label.take();
+            let surface = self.tag_toast_surface.take();
             let msg =
                 format_completion_toast(label.as_deref(), added, removed, cleared, restored, noop);
-            self.show_feedback_toast(msg);
+            match surface {
+                Some(surface) => self.show_feedback_toast_on(msg, surface),
+                None => self.show_feedback_toast(msg),
+            }
         }
         if just_completed {
+            // バッチ完了時は、完了トーストに使わなかった場合 (エラー完了等) でも
+            // routing 状態を必ず破棄する。残すと次バッチの完了トーストが古い
+            // ラベル/発火面で表示される (Codex P3)。成功分岐の take() 後は no-op。
+            self.tag_toast_label = None;
+            self.tag_toast_surface = None;
             if let Some(h) = self.tag_write_handle.as_ref() {
                 h.reset_counters_if_idle();
             }
@@ -730,14 +806,16 @@ impl App {
                     report.db_errors,
                     report.write_errors
                 ));
-                self.show_feedback_toast(format_legacy_xmp_import_toast(
-                    mode,
-                    &report,
-                    &result.errors,
-                ));
+                self.show_feedback_toast_on(
+                    format_legacy_xmp_import_toast(mode, &report, &result.errors),
+                    crate::app::ActionSurface::MainWindow,
+                );
             }
             Err(e) => {
-                self.show_feedback_toast(format!("旧XMPタグの取り込みに失敗: {e}"));
+                self.show_feedback_toast_on(
+                    format!("旧XMPタグの取り込みに失敗: {e}"),
+                    crate::app::ActionSurface::MainWindow,
+                );
             }
         }
     }

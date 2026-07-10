@@ -2550,7 +2550,7 @@ impl App {
                                         }
                                     }
                                     ui.separator();
-                                    let selection_count = self.tag_target_path_count();
+                                    let selection_count = self.tag_target_path_count(crate::app::ActionSurface::MainWindow);
                                     let has_target = selection_count > 0;
                                     if ui
                                         .add_enabled(
@@ -2574,7 +2574,7 @@ impl App {
                                         .hover_tip("mIV 内のタグだけを削除します。")
                                         .clicked()
                                     {
-                                        self.request_tag_clear_for_selection();
+                                        self.request_tag_clear_for_selection(crate::app::ActionSurface::MainWindow);
                                         ui.close();
                                     }
                                     let legacy_xmp_count = self.legacy_xmp_target_path_count();
@@ -2642,7 +2642,7 @@ impl App {
                                                 }
                                             });
                                             if clicked {
-                                                self.request_tag_toggle_for_selection(&tag.name);
+                                                self.request_tag_toggle_for_selection(&tag.name, crate::app::ActionSurface::MainWindow);
                                                 ui.close();
                                             }
                                         }
@@ -5197,7 +5197,7 @@ impl App {
                         &mut current_section_anchors,
                         &last_section_anchors,
                     );
-                    let has_target = self.tag_target_path_count() > 0;
+                    let has_target = self.tag_target_path_count(crate::app::ActionSurface::MainWindow) > 0;
                     // 「設定」「検索」はセクション全体の操作 (タグエディタを開く / タグビュー全体を開く)
                     // で、下のプルダウンの「付与」「タグビュー」(= 選択した 1 タグに対する操作) とは
                     // スコープが異なる。表示形式 (展開/折りたたみ/プルダウン) に依らず常に出して、
@@ -5412,7 +5412,7 @@ impl App {
 
         // ツールバーのタグ項目クリック
         if let Some(name) = toolbar_tag_click {
-            self.request_tag_toggle_for_selection(&name);
+            self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
         }
         if let Some(name) = toolbar_tag_search {
             self.open_tag_view_for_tag(&name);
@@ -9675,7 +9675,7 @@ impl App {
         self.draw_gamepad_picker_overlay(ui, full_rect);
         self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
         self.draw_gamepad_location_picker_overlay(ui, full_rect);
-        self.draw_feedback_toast(ui, full_rect, ctx);
+        self.draw_feedback_toast(ui, full_rect, ctx, crate::app::ActionSurface::MainWindow);
         self.render_details_thumbnail_tooltip(ctx, hovered_preview);
 
         nav
@@ -10584,7 +10584,12 @@ impl App {
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                     self.draw_gamepad_location_picker_overlay(ui, full_rect);
-                    self.draw_feedback_toast(ui, full_rect, ctx);
+                    self.draw_feedback_toast(
+                        ui,
+                        full_rect,
+                        ctx,
+                        crate::app::ActionSurface::MainWindow,
+                    );
                     self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
                 }
@@ -10620,7 +10625,12 @@ impl App {
                     self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                     self.draw_gamepad_location_picker_overlay(ui, full_rect);
-                    self.draw_feedback_toast(ui, full_rect, ctx);
+                    self.draw_feedback_toast(
+                        ui,
+                        full_rect,
+                        ctx,
+                        crate::app::ActionSurface::MainWindow,
+                    );
                     self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
                 }
@@ -10878,7 +10888,7 @@ impl App {
                 self.draw_gamepad_picker_overlay(ui, full_rect);
                 self.draw_gamepad_favorite_picker_overlay(ui, full_rect);
                 self.draw_gamepad_location_picker_overlay(ui, full_rect);
-                self.draw_feedback_toast(ui, full_rect, ctx);
+                self.draw_feedback_toast(ui, full_rect, ctx, crate::app::ActionSurface::MainWindow);
 
                 nav
             })

@@ -279,24 +279,37 @@ impl crate::app::App {
         }
         // 計算中は再描画を促す (通常フォルダのサムネ完了後でも poll を回すため)。
         ctx.request_repaint();
-        // フルスクリーン表示中は items 差し替えを避ける (閉じてから適用。結果は channel で待つ)。
-        if self.fullscreen_idx.is_some() {
+        // メイン窓内フルスクリーン表示中は items 差し替えを避ける (閉じてから適用。
+        // 結果は channel で待つ)。detached セッション (別ウィンドウ) はここでは
+        // 弾かない: 結果が届いた時点で退避 (下) してから適用する。旧ゲートの
+        // 「fullscreen_idx.is_some() で一律保留」は、別ウィンドウを開いている間
+        // 集約が永久に適用されない実害があった (2026-07-10 監査)。
+        if self.fullscreen_idx.is_some() && !self.viewer_session_is_detached() {
             return;
         }
         let received = match self.stack_script_pending.as_ref().unwrap().rx.try_recv() {
             Ok(r) => r,
             Err(TryRecvError::Empty) => return,
+            // ワーカー起動失敗等で tx が落ちた → 組み込み既定でフォールバック集約する
+            // (通常フォルダ表示のまま放置せず、スタックを成立させる)。適用前の
+            // detached 退避も Ok 経路と共有する (Codex P3: fallback だけ素通りさせない)。
             Err(TryRecvError::Disconnected) => {
-                // ワーカー起動失敗等で tx が落ちた → 組み込み既定でフォールバック集約する
-                // (通常フォルダ表示のまま放置せず、スタックを成立させる)。
-                let pending = self.stack_script_pending.take().unwrap();
-                self.apply_stack_script_result(
-                    pending,
-                    Err("スタックスクリプトのワーカーを起動できませんでした".to_string()),
-                );
-                return;
+                Err("スタックスクリプトのワーカーを起動できませんでした".to_string())
             }
         };
+        // 結果が届いた今、main items を差し替える前に detached セッションを退避する
+        // (メディア窓は in-place live-park で再生継続 + main 文脈は clone 維持、
+        //  画像 still はフォルダ移動時と同じ preserve → close で parked 化)。
+        // 計算中に窓を畳まないよう、退避は受信後にだけ行う。
+        #[cfg(windows)]
+        if self.fullscreen_idx.is_some() {
+            self.park_detached_session_for_stack_aggregation(ctx);
+        }
+        if self.fullscreen_idx.is_some() {
+            // 退避に失敗した稀ケース (park snapshot 失敗等)。dangling fs_idx の上に
+            // items を差し替えないよう、ハードに閉じてから適用する。
+            self.close_fullscreen();
+        }
         let pending = self.stack_script_pending.take().unwrap();
         self.apply_stack_script_result(pending, received);
     }

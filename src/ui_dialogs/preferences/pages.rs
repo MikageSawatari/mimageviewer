@@ -123,6 +123,19 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 "画像のみのフォルダは、PDF/ZIP のように本として扱う",
             );
         });
+        ui.add_space(4.0);
+        ui.add_enabled_ui(full_mode, |ui| {
+            ui.checkbox(
+                &mut state.settings.fullfeature_media_window,
+                "動画・音声は別ウィンドウで再生",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "動画/音声を独立したメディアウィンドウで再生し、再生を続けたままメインウィンドウで画像を閲覧できます。F12 でメインウィンドウ表示との切り替えができます。",
+                )
+                .weak(),
+            );
+        });
     });
 
     ui.add_space(8.0);

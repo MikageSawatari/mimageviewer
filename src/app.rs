@@ -191,6 +191,9 @@ pub(crate) struct ViewerSyncStamp {
     items_generation: u64,
 }
 
+// フィールド型 (ViewerContextDescriptor / ViewerContextBundle) が cfg(windows) の
+// detached 専用型なので、struct と impl も揃えてゲートする (非 Windows check 対応)。
+#[cfg(windows)]
 pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) id: u64,
     pub(crate) texture: egui::TextureHandle,
@@ -339,6 +342,7 @@ impl DeferredDetachedImageWindowShared {
     }
 }
 
+#[cfg(windows)]
 impl Clone for DetachedImageWindowSnapshot {
     fn clone(&self) -> Self {
         Self {
@@ -364,6 +368,7 @@ impl Clone for DetachedImageWindowSnapshot {
     }
 }
 
+#[cfg(windows)]
 impl DetachedImageWindowSnapshot {
     pub(crate) fn can_activate(&self) -> bool {
         self.reopen_descriptor.is_some()
@@ -1408,10 +1413,16 @@ impl App {
         main_hwnd: u64,
         claimed_hwnds: &[u64],
     ) -> Option<DetachedActivationClickCandidate> {
-        if let Some(target) =
-            Self::detached_activation_target_containing_cursor(targets, sample.cursor_pos)
-                .filter(|target| target.hwnd == sample.cursor_root_hwnd)
-        {
+        // 直接ヒットは「OS が報告したクリック先 (cursor_root_hwnd) と一致する target」を
+        // 最優先で探す。targets のリスト順は z-order ではないため、矩形あたり判定を
+        // リスト先頭から行うと、重なった parked 窓で背面窓が前面窓へのクリックを吸い、
+        // hwnd 不一致でクリックが丸ごと棄却される (findings-19 実機バグ: 重なった
+        // Page 107 窓がクリック不能)。
+        if let Some(target) = Self::detached_activation_target_for_cursor_root(
+            targets,
+            sample.cursor_pos,
+            sample.cursor_root_hwnd,
+        ) {
             let intent = if Self::detached_activation_close_hit(target, sample) {
                 DetachedActivationClickIntent::Close
             } else {
@@ -1471,6 +1482,31 @@ impl App {
         let (x, y) = cursor_pos?;
         targets.iter().copied().find(|target| {
             x >= target.left && x < target.right && y >= target.top && y < target.bottom
+        })
+    }
+
+    /// cursor_root_hwnd (OS の WindowFromPoint root) と一致する target を返す。
+    /// 矩形あたり判定だけの `detached_activation_target_containing_cursor` と違い、
+    /// parked 窓が重なっていても実際にクリックされた窓を一意に特定できる。
+    /// 矩形包含も併せて確認するのは、close ボタン / タイトルバー判定が
+    /// target の矩形を基準にしているため。hwnd 一致で矩形だけ外れたクリックは、
+    /// repair 側も targets 内 hwnd を除外するため結局棄却される (= 従来と同じ保守挙動)。
+    #[cfg(windows)]
+    fn detached_activation_target_for_cursor_root(
+        targets: &[DetachedActivationWatchTargetRect],
+        cursor_pos: Option<(i32, i32)>,
+        cursor_root_hwnd: u64,
+    ) -> Option<DetachedActivationWatchTargetRect> {
+        if cursor_root_hwnd == 0 {
+            return None;
+        }
+        let (x, y) = cursor_pos?;
+        targets.iter().copied().find(|target| {
+            target.hwnd == cursor_root_hwnd
+                && x >= target.left
+                && x < target.right
+                && y >= target.top
+                && y < target.bottom
         })
     }
 
@@ -2045,6 +2081,11 @@ pub(crate) enum ViewerContextDescriptor {
         entry_name: Option<String>,
         archive_source_override: Option<PathBuf>,
     },
+    /// 通常画像。parked still の再オープン**フォールバック専用** (findings-19):
+    /// 同期スタンプが main の現行 items で解決できないとき、親フォルダを窓内
+    /// コンテキストとして読み込んでこの画像を開き直す。グリッドからの open
+    /// ルーティング (`detached_viewer_context_descriptor_for_idx`) には使わない。
+    Image { path: PathBuf },
 }
 
 #[cfg(windows)]
@@ -2328,6 +2369,7 @@ impl Drop for ViewerContextBundle {
     }
 }
 
+#[cfg(windows)]
 impl ViewerContextBundle {
     fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
@@ -4503,6 +4545,22 @@ pub(crate) struct AdjustmentDragSession {
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
+/// メタ操作 (タグ付与など) を発火させた UI 面。
+///
+/// detached viewer 時代はメイングリッドとビューア窓が同時に見える + 同時に操作できる
+/// ため、「fullscreen_idx があればフルスクリーン対象」という従来の推定では
+/// (1) グリッド操作が detached 窓のアイテムに誤爆する、
+/// (2) フィードバックトーストが両面に二重表示される。
+/// 発火面を呼び出し元で明示し、対象解決 (`selection_target_indices`) と
+/// トースト表示面 (`show_feedback_toast_on`) の両方をこれで決める (findings-19)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionSurface {
+    /// メインウィンドウ (グリッド / メニュー / ツールバー / グリッド用ダイアログ)。
+    MainWindow,
+    /// ビューア面 (メイン fullscreen / detached viewer / native 動画 overlay)。
+    Viewer,
+}
+
 /// タグ操作の保留 Undo entry を集計するためのバッファ。
 ///
 /// 1 トランザクション (1 回の `request_tag_toggle_for_selection` / `_clear_for_selection`
@@ -6241,6 +6299,9 @@ pub struct App {
     /// tag toast 用: 直近の Toggle 操作で UI が使っていたタグ名 (`#ドール` 等)。
     /// worker 完了時に「N 件に #ドール を付与 / 削除」として表示するのに使う。
     pub(crate) tag_toast_label: Option<String>,
+    /// 進行中タグバッチの発火面。`tag_toast_label` と同じライフサイクルで、
+    /// 完了トーストをどの面に出すかを決める (`poll_tag_write_results` で take)。
+    pub(crate) tag_toast_surface: Option<ActionSurface>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -7385,6 +7446,10 @@ pub struct App {
     /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
     /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
     pub(crate) fs_feedback_toast_reveal_path: Option<PathBuf>,
+    /// 現在のトーストを描画する面。`Some` なら該当面の `draw_feedback_toast`
+    /// だけが描く (detached 窓とグリッドの二重表示防止)。`None` は発火面不明の
+    /// 従来トーストで、従来どおり全面に描く。
+    pub(crate) fs_feedback_toast_surface: Option<ActionSurface>,
     /// ユーザー画像スタンプの埋め込み (read→decode→縮小→PNG→base64) を UI スレッドから
     /// 逃がす worker の進行状態 (R2-6)。大判画像で file picker 後に固まるのを防ぐため、処理中は
     /// 画面中央に「スタンプ読み込み中…」を出し、完了で `apply_stamp_choice` を適用する。
@@ -7493,11 +7558,14 @@ pub struct App {
     pub(crate) music_bookmarks_loaded_for: Option<PathBuf>,
     /// ブックマーク名の編集ダイアログ (動画と共有、Inc 5c-A)。左パネルの行の鉛筆ボタンで
     /// 開き、中央モーダルで改名する。`draw_native_bookmark_title_editor` が描画する。
+    /// (型が native_presenter = cfg(windows) モジュール由来のためゲート)
+    #[cfg(windows)]
     pub(crate) music_bookmark_title_edit:
         Option<crate::video::native_presenter::NativeBookmarkTitleEdit>,
     /// 一括ブックマーク登録ダイアログ (動画と共有、Inc 5c-A)。左パネルヘッダの一括ボタンで
     /// 開き、中央モーダルで貼り付け一括登録 / エクスポート / 全削除する。`Some` の間描画される。
     /// 動画の `draw_native_bulk_bookmark_dialog` をそのまま流用し、IME・貼り付けも動画と揃う。
+    #[cfg(windows)]
     pub(crate) music_bulk_bookmark_dialog:
         Option<crate::video::native_presenter::NativeBulkBookmarkDialog>,
     /// 音声 VST シェル (Inc 6 ②-3、B-prime)。`Some` の間、音楽ビューは native presenter を
@@ -8787,6 +8855,7 @@ impl App {
             native_overlay_tag_choices_cache: None,
             #[cfg(windows)]
             native_overlay_shortcut_tags_cache: None,
+            #[cfg(windows)]
             native_overlay_shortcut_help_cache: None,
             fullscreen_tag_picker_open: false,
             fullscreen_tag_picker_input: String::new(),
@@ -8953,6 +9022,7 @@ impl App {
             pano_banner_remember_session: false,
             tags_cache: std::collections::HashMap::new(),
             tag_toast_label: None,
+            tag_toast_surface: None,
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -9352,6 +9422,7 @@ impl App {
             ime_last_event_at: None,
             fs_feedback_toast: None,
             fs_feedback_toast_reveal_path: None,
+            fs_feedback_toast_surface: None,
             stamp_embed_pending: None,
             cursor_last_activity: None,
             cursor_hidden: false,
@@ -9381,7 +9452,9 @@ impl App {
             music_right_panel_active: false,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
+            #[cfg(windows)]
             music_bookmark_title_edit: None,
+            #[cfg(windows)]
             music_bulk_bookmark_dialog: None,
             #[cfg(windows)]
             music_vst_shell: None,
@@ -20561,7 +20634,14 @@ impl App {
     /// detached 側の状態を保持している) か。`with_active_detached_viewer_context` が mount 中
     /// だけ suppression depth を上げるので、それを流用する。
     fn detached_viewer_context_is_mounted(&self) -> bool {
-        self.detached_viewer_main_history_suppression_depth > 0
+        #[cfg(windows)]
+        {
+            self.detached_viewer_main_history_suppression_depth > 0
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     /// `replace_search_view_items` (Ctrl+G) 用: PDF render epoch のみ bump。
@@ -22608,15 +22688,20 @@ impl App {
             return None;
         }
         if self.active_detached_viewer_has_foreground() {
-            let has_key_event = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
-            });
-            if has_key_event {
-                self.log_detached_image_window_debug(
-                    "main_keyboard_suppressed_active_detached_foreground".to_string(),
-                );
+            // debug ログ (log_detached_image_window_debug) は detached 実装ごと
+            // cfg(windows) なので、この診断部分だけゲートする。
+            #[cfg(windows)]
+            {
+                let has_key_event = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+                });
+                if has_key_event {
+                    self.log_detached_image_window_debug(
+                        "main_keyboard_suppressed_active_detached_foreground".to_string(),
+                    );
+                }
             }
             return None;
         }
@@ -25542,6 +25627,26 @@ impl App {
         }
     }
 
+    /// parked still snapshot に焼き付ける再オープン descriptor。
+    /// 通常画像は open ルーティング用の descriptor
+    /// (`detached_viewer_context_descriptor_for_idx`) を持たない (still 経路のまま) が、
+    /// parked snapshot にはフォールバック用 `Image` descriptor を焼き付ける。
+    /// 同期スタンプが main の一覧変更で解決不能になっても、親フォルダを窓内
+    /// コンテキストとして開き直せるようにする (findings-19 stamp_not_resolved)。
+    #[cfg(windows)]
+    pub(crate) fn parked_still_reopen_descriptor_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<ViewerContextDescriptor> {
+        self.detached_viewer_context_descriptor_for_idx(idx)
+            .or_else(|| match self.items.get(idx) {
+                Some(GridItem::Image(path)) => {
+                    Some(ViewerContextDescriptor::Image { path: path.clone() })
+                }
+                _ => None,
+            })
+    }
+
     #[cfg(windows)]
     fn detached_book_context_descriptor_for_grid_idx(
         &self,
@@ -26467,6 +26572,7 @@ impl App {
         match descriptor {
             Some(ViewerContextDescriptor::Pdf { .. }) => "pdf",
             Some(ViewerContextDescriptor::Zip { .. }) => "zip",
+            Some(ViewerContextDescriptor::Image { .. }) => "image",
             None => "none",
         }
     }
@@ -27309,9 +27415,16 @@ impl App {
         self.detached_viewer_folder_nav_reuse_window_once = false;
         // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
         // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
-        self.begin_active_detached_session(window_id, DetachedSource::Book);
-        self.pending_auto_fs_open = true;
-        self.fs_open_intent_from_grid = true;
+        let session_source = match &descriptor {
+            ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
+            _ => DetachedSource::Book,
+        };
+        self.begin_active_detached_session(window_id, session_source);
+        // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
+        // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
+        let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
+        self.pending_auto_fs_open = !is_image_reopen;
+        self.fs_open_intent_from_grid = !is_image_reopen;
 
         self.with_detached_viewer_main_history_suppressed(|app| match descriptor {
             ViewerContextDescriptor::Zip {
@@ -27327,6 +27440,46 @@ impl App {
             }
             ViewerContextDescriptor::Pdf { path, .. } => {
                 app.load_pdf_as_folder(path);
+            }
+            ViewerContextDescriptor::Image { path } => {
+                // 親フォルダを窓内コンテキストとして同期スキャンし、対象画像を
+                // 開き直す (findings-19: 連動 park 画像窓のスタンプ解決不能フォールバック)。
+                //
+                // `load_folder` の同期スキャンはグリッドでフォルダをクリックした
+                // ときの標準経路と同一 (= 既存フォルダナビと同じレイテンシクラス) で、
+                // ユーザーのクリック 1 回につき 1 回だけ走る。巨大/ネットワーク
+                // フォルダで待たされる場合も既存のフォルダ open と同じ症状に収まる。
+                // 非同期 reopen 化はフォルダ open 全体の worker 化と同時に扱う
+                // (Codex P2 判断済み: 新種の UI 同期 I/O ではなく既存経路の流用)。
+                if let Some(parent) = path.parent().map(|p| p.to_path_buf()) {
+                    app.load_folder(parent);
+                }
+                let target_idx = app
+                    .items
+                    .iter()
+                    .position(|item| {
+                        matches!(item, GridItem::Image(p)
+                            if crate::folder_tree::path_eq(p, &path))
+                    })
+                    .or_else(|| {
+                        // 対象画像が消えていたらフォルダ先頭の画像で代替する
+                        // (Pdf/Zip の deferred open が先頭ページへ落ちるのと同じ寛容さ)。
+                        app.items
+                            .iter()
+                            .position(|item| matches!(item, GridItem::Image(_)))
+                    });
+                if let Some(idx) = target_idx {
+                    // still 経路の再開 (resume_still_snapshot) と同じ扱いで、既存の
+                    // window_id を持つ detached still として開く。多窓モードの
+                    // 「グリッド intent = 常に新窓」経路に流さない。
+                    app.detached_viewer_independent_active = true;
+                    app.detached_viewer_open_next_still_detached_once = true;
+                    app.open_fullscreen(idx);
+                } else {
+                    app.log_detached_image_window_debug(
+                        "image_reopen_no_target_after_folder_load".to_string(),
+                    );
+                }
             }
         });
 
@@ -27521,22 +27674,31 @@ impl App {
             return true;
         }
 
-        if snapshot.reopen_descriptor.is_none()
+        // 通常画像の parked still はまず同期スタンプ (main の現行 items) で解決する。
+        // `Image` descriptor はスタンプが解決できないときのフォールバック専用
+        // (親フォルダを窓内コンテキストとして開き直す)。Pdf/Zip descriptor は
+        // 従来どおり descriptor 優先 (この if を素通りして下の descriptor 経路へ)。
+        let stamp_first = matches!(
+            snapshot.reopen_descriptor,
+            None | Some(ViewerContextDescriptor::Image { .. })
+        );
+        if stamp_first
             && let Some(stamp) = snapshot.reopen_sync_stamp.clone()
+            && let Some(idx) = self.resolve_viewer_sync_stamp_idx(&stamp).or_else(|| {
+                if snapshot.reopen_descriptor.is_none() {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_activate_still_aborted id={} reason=stamp_not_resolved",
+                        snapshot.id
+                    ));
+                } else {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_activate_stamp_fallback_to_descriptor id={}",
+                        snapshot.id
+                    ));
+                }
+                None
+            })
         {
-            let Some(idx) = self.resolve_viewer_sync_stamp_idx(&stamp) else {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_still_aborted id={} reason=stamp_not_resolved",
-                    snapshot.id
-                ));
-                self.transition_detached_window_state(
-                    snapshot.id,
-                    DetachedWindowState::Parked,
-                    "passive_activate_still_aborted",
-                );
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
-            };
             self.log_detached_image_window_debug(format!(
                 "passive_activate_still_snapshot id={} idx={idx} independent=true \
                  descriptor={} zoom_pan={} free_rotation={:.3}",
@@ -27602,6 +27764,50 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
+        // Image フォールバックは親フォルダが読めることを先に確認する。still 窓を閉じた
+        // 後で load に失敗すると窓ごと失われるため、無理なら parked のまま残す。
+        // (ユーザーのクリック 1 回につき is_dir 1 回の同期 I/O。恒常経路ではない。)
+        if let ViewerContextDescriptor::Image { path } = &descriptor {
+            if !path.parent().is_some_and(|p| p.is_dir()) {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_reopen_descriptor_aborted id={} reason=image_parent_missing",
+                    snapshot.id
+                ));
+                self.transition_detached_window_state(
+                    snapshot.id,
+                    DetachedWindowState::Parked,
+                    "passive_activate_reopen_descriptor_aborted",
+                );
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            }
+            // ★固定 (Snapshot Lock) 中は範囲外フォルダの `load_folder` が早期 return し、
+            // 窓を閉じた後に items が空のまま = 窓が無言で失われる (レビュー P2)。
+            // snapshot は bundle 非対象の App-global なので、load_folder と同じ判定で
+            // ここで先に弾き、parked のまま残す。
+            if self.is_snapshot_active()
+                && !self.snapshot_internal_nav
+                && path
+                    .parent()
+                    .is_some_and(|p| self.snapshot_owner_entry(p).is_none())
+            {
+                self.log_detached_image_window_debug(format!(
+                    "passive_activate_reopen_descriptor_aborted id={} reason=snapshot_lock_out_of_range",
+                    snapshot.id
+                ));
+                self.show_feedback_toast(
+                    "スナップショット中は範囲外の別ウィンドウを復帰できません (★固定を解除してください)"
+                        .to_string(),
+                );
+                self.transition_detached_window_state(
+                    snapshot.id,
+                    DetachedWindowState::Parked,
+                    "passive_activate_reopen_descriptor_aborted",
+                );
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            }
+        }
         self.log_detached_image_window_debug(format!(
             "passive_activate_reopen_descriptor id={} descriptor={} title={:?}",
             snapshot.id,
@@ -27964,7 +28170,7 @@ impl App {
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
             .unwrap_or_default();
-        let reopen_descriptor = self.detached_viewer_context_descriptor_for_idx(idx);
+        let reopen_descriptor = self.parked_still_reopen_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         self.log_detached_image_window_debug(format!(
             "build_active_snapshot_ok id={id} idx={idx} \
@@ -28053,6 +28259,27 @@ impl App {
         reason: &'static str,
     ) -> bool {
         self.park_current_viewer_context_as_live_media_inner(ctx, reason, true)
+    }
+
+    /// スタック集約の適用直前に、bundle 化前の detached セッションを退避する
+    /// (`poll_stack_script` 専用)。main の items を集約ビューへ差し替えるため、
+    /// main items を参照している unbundled セッションを残したまま適用できない。
+    /// - メディア (動画/音声): in-place live-park。窓は再生を続け、main 文脈は
+    ///   clone で維持される (= 現行フォルダと stack pending が生きる)。
+    /// - 画像 still: フォルダ移動時と同じ preserve → close_fullscreen の対で
+    ///   parked still 化する (集約後は元 idx が存在しないため能動セッションを残せない)。
+    #[cfg(windows)]
+    pub(crate) fn park_detached_session_for_stack_aggregation(&mut self, ctx: &egui::Context) {
+        if !self.viewer_session_is_detached() {
+            return;
+        }
+        if self.current_viewer_context_contains_video()
+            && self.park_current_viewer_context_as_live_media(ctx, "stack_aggregation")
+        {
+            return;
+        }
+        self.preserve_active_detached_image_window_for_main_context_change();
+        self.close_fullscreen();
     }
 
     #[cfg(windows)]
@@ -28312,7 +28539,10 @@ impl App {
         self.active_detached_viewer_context.is_none()
             && self.viewer_session_is_detached()
             && !self.fs_nav_is_locked()
-            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+            // 音声もメディア窓を使う (stage-audio / §1.7)。Video 限定だと main の
+            // フォルダ移動で detached 音声が promote されず close_fullscreen で
+            // 再生ごと止まる (Codex audit P2、複数ウィンドウモードにも存在した既存ギャップ)。
+            && self.viewer_item_is_media(idx)
     }
 
     #[cfg(windows)]
@@ -28445,6 +28675,18 @@ impl App {
         if self.detached_viewer_independent_session() {
             return true;
         }
+        // §1.7 第3状態 (フル機能+メディア別窓): メディア窓セッション (bundle 化前を
+        // 含む) は複数ウィンドウモードの detached 窓と同じく folder nav を consume する。
+        // これを落とすと、メディア窓からの Ctrl+↑↓ が main のフォルダナビとして走り、
+        // close/reopen 経路がメディアセッションを巻き込んで閉じる (Codex audit P1)。
+        if self.settings.effective_media_in_media_window()
+            && self.viewer_session_is_detached()
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| self.viewer_item_is_media(idx))
+        {
+            return true;
+        }
         self.settings.detached_viewer_open_images_in_window && self.viewer_session_is_detached()
     }
 
@@ -28504,7 +28746,8 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn always_new_media_f12_target_presentation(&self) -> Option<ViewerPresentation> {
-        if !self.settings.detached_viewer_open_images_in_window {
+        // §1.7: フル機能+メディア別窓でも同じ F12 トグル (メディア窓 ⇔ メイン) を使う。
+        if !self.settings.effective_media_in_media_window() {
             return None;
         }
         let idx = self.fullscreen_idx?;
@@ -28574,8 +28817,7 @@ impl App {
         if (self.viewer_session_is_detached()
             && self.detached_viewer_independent_active
             && self.viewer_item_supports_detached_still(idx))
-            || (self.settings.detached_viewer_open_images_in_window
-                && self.viewer_item_is_media(idx))
+            || (self.settings.effective_media_in_media_window() && self.viewer_item_is_media(idx))
             || (self.settings.detached_viewer_enabled && self.viewer_item_supports_session(idx))
             || self.detached_viewer_open_still_requested(idx)
         {
@@ -29337,6 +29579,15 @@ impl App {
         if self.settings.detached_viewer_open_images_in_window {
             return;
         }
+        // §1.7 フル機能+メディア別窓: メディアセッションはメイン一覧カーソルに追従しない
+        // (メディア窓は独立再生。複数ウィンドウモードは直前の mode check で return 済み)。
+        if self.settings.effective_media_in_media_window()
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| self.viewer_item_is_media(idx))
+        {
+            return;
+        }
         let Some(selected) = self.selected else {
             return;
         };
@@ -29434,6 +29685,25 @@ impl App {
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
                 self.active_detached_viewer_context.is_some(),
+                self.active_detached_session
+            ));
+            return ok;
+        }
+        // §1.7 メディア別窓: bundle 化前の連動 detached メディアセッション (grid から
+        // 動画/音声を開いた直後で main 文脈のまま) も、次の grid open が presentation を
+        // 取り戻す前に live-park する。これを落とすと `prepare_viewer_presentation_open`
+        // の open_non_detached 経路がメディアセッションごと閉じて再生が止まる。
+        // 注: `current_viewer_context_contains_video` は名前に反して**音声も含む**
+        // (音声再生も `FsCacheEntry::Video` を使うため)。音声だけ判定から漏らさないこと。
+        if self.settings.effective_media_in_media_window()
+            && self.viewer_session_is_detached()
+            && self.current_viewer_context_contains_video()
+        {
+            let ok = self.park_and_close_current_active_detached_viewer(ctx);
+            self.log_detached_image_window_debug(format!(
+                "park_active_context_for_grid_open result={ok} reason=unbundled_media \
+                 passive_windows={} session={:?}",
+                self.detached_image_windows.len(),
                 self.active_detached_session
             ));
             return ok;
@@ -29915,8 +30185,12 @@ impl App {
                             player.seek(0.0);
                         }
                     }
+                    // タイルモード (video_tile_*) は native presenter 前提の Windows 専用。
+                    #[cfg(windows)]
                     let should_autoplay_cached_video =
                         !self.video_tile_mode_active && !self.video_tile_reopen_pending;
+                    #[cfg(not(windows))]
+                    let should_autoplay_cached_video = true;
                     if should_autoplay_cached_video {
                         #[cfg(windows)]
                         let started_normalize_scan =
@@ -34705,8 +34979,11 @@ impl App {
         // ループ設定はセッション設定として保持 (パネルは端ホバーで出すので開閉トグル状態は持たない)。
         self.music_bookmarks.clear();
         self.music_bookmarks_loaded_for = None;
-        self.music_bookmark_title_edit = None;
-        self.music_bulk_bookmark_dialog = None;
+        #[cfg(windows)]
+        {
+            self.music_bookmark_title_edit = None;
+            self.music_bulk_bookmark_dialog = None;
+        }
     }
 
     /// 音声ファイル用の headless `VideoPlayer` を作る (映像出力なし・native presenter なし)。
@@ -42224,11 +42501,41 @@ impl App {
         self.show_native_video_overlay_toast(text.clone(), false);
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
         self.fs_feedback_toast_reveal_path = None;
+        // 発火面不明の従来経路: 全面に描く (単面表示は show_feedback_toast_on を使う)。
+        self.fs_feedback_toast_surface = None;
+    }
+
+    /// 発火面を明示したフィードバックトースト。指定面にだけ表示する
+    /// (detached 窓とメイングリッドが同時に見える構成での二重表示防止)。
+    ///
+    /// `Viewer` 面で現在アイテムが native presenter 表示中の動画なら、egui トーストの
+    /// 代わりに native overlay トーストへ送る (egui ビューアは presenter の下で不可視)。
+    /// 音声モード (`fs_music_view_active`) 中は presenter が hidden なので egui 側を使う。
+    pub(crate) fn show_feedback_toast_on(&mut self, text: String, surface: ActionSurface) {
+        #[cfg(windows)]
+        if matches!(surface, ActionSurface::Viewer) {
+            let native_overlay_visible = self.fullscreen_idx.is_some_and(|fs_idx| {
+                matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }))
+                    && !self.fs_music_view_active(fs_idx)
+            });
+            if native_overlay_visible {
+                self.show_native_video_overlay_toast(text, false);
+                return;
+            }
+        }
+        self.fs_feedback_toast = Some((
+            text,
+            std::time::Instant::now(),
+            crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
+        ));
+        self.fs_feedback_toast_reveal_path = None;
+        self.fs_feedback_toast_surface = Some(surface);
     }
 
     pub(crate) fn clear_fullscreen_feedback_for_viewer_switch(&mut self) {
         self.fs_feedback_toast = None;
         self.fs_feedback_toast_reveal_path = None;
+        self.fs_feedback_toast_surface = None;
         self.fs_boundary_hint = None;
     }
 
@@ -42295,6 +42602,7 @@ impl App {
             crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
         ));
         self.fs_feedback_toast_reveal_path = Some(path);
+        self.fs_feedback_toast_surface = None;
     }
 
     /// 指定ページの有効パラメータへの参照を返す。

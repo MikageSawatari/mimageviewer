@@ -498,13 +498,25 @@ impl App {
         }
         // タグボタンクリックの後処理 (closure 外で self を可変借用する)
         if let Some((tag_name, targets)) = clicked_tag {
-            self.request_tag_toggle_for_targets(&tag_name, targets);
+            self.request_tag_toggle_for_targets(
+                &tag_name,
+                targets,
+                crate::app::ActionSurface::Viewer,
+            );
         }
         if let Some((tag_name, add, targets)) = set_tag {
             if add {
-                self.request_tag_add_for_targets(&tag_name, targets);
+                self.request_tag_add_for_targets(
+                    &tag_name,
+                    targets,
+                    crate::app::ActionSurface::Viewer,
+                );
             } else {
-                self.request_tag_remove_for_targets(&tag_name, targets);
+                self.request_tag_remove_for_targets(
+                    &tag_name,
+                    targets,
+                    crate::app::ActionSurface::Viewer,
+                );
             }
         }
         if let Some(tag_name) = searched_tag {
@@ -620,13 +632,25 @@ impl App {
 
         // タグボタンクリックの後処理 (closure 外で self を可変借用、画像パネルと同一経路)。
         if let Some((tag_name, targets)) = clicked_tag {
-            self.request_tag_toggle_for_targets(&tag_name, targets);
+            self.request_tag_toggle_for_targets(
+                &tag_name,
+                targets,
+                crate::app::ActionSurface::Viewer,
+            );
         }
         if let Some((tag_name, add, targets)) = set_tag {
             if add {
-                self.request_tag_add_for_targets(&tag_name, targets);
+                self.request_tag_add_for_targets(
+                    &tag_name,
+                    targets,
+                    crate::app::ActionSurface::Viewer,
+                );
             } else {
-                self.request_tag_remove_for_targets(&tag_name, targets);
+                self.request_tag_remove_for_targets(
+                    &tag_name,
+                    targets,
+                    crate::app::ActionSurface::Viewer,
+                );
             }
         }
         if let Some(tag_name) = searched_tag {

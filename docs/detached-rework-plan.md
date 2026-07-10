@@ -209,6 +209,13 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 **→ R2 全サブステージ完了。ゲート C (2026-07-06 到達)。スコープ決定 = CUT (2026-07-07)。findings-10 で多窓 churn 根治済み、findings-11 も C1/C3 完了済み (行参照)。findings-19 は fix15 まで検収済み。**
 **2026-07-09 追記: 出荷前品質レビュー (docs/review-v2.3.0/final-report.md) で BA-7 系の構造修正を実施 (コミット 1bb26360): ロード複合体 (thumb channel / cancel_token / worker queue / keep atomic) の ViewerContextBundle 化 + bundle Drop teardown + legacy ParkedLive park の複合体引き継ぎ + unclaimed HWND fallback の可視性フィルタ (BA-1/BA-4)。凍結例外はユーザー指示。実機確認は review-v2.3.0/fix-verification-checklist.md。**
 
+**2026-07-09 夜 追記 (実機検証で出た findings-19 続報 + stage-media-window 前倒し、凍結例外はユーザー指示):**
+
+- **クリック照準バグ** (findings-19 実機 3 件目の真因): parked 窓が重なっていると、activation watcher の down-edge 照準解決が「targets リスト先頭からの矩形あたり判定」で背面窓を選び、実クリック先 (cursor_root_hwnd) と不一致 → クリック丸ごと棄却。修正 = hwnd 一致 target を最優先で解決 (`detached_activation_target_for_cursor_root`)。リスト順 ≠ z-order。
+- **stale window_id 再利用** (d6bf04f0) / **legacy park のゴースト連動セッション** (5c9be17d): 同夜の実機 2 件、個別修正済み。
+- **連動 park 画像窓の復帰フォールバック**: 連動セッション由来の parked still (descriptor=none) は main の一覧変更で stamp_not_resolved になり復帰不能だった。`ViewerContextDescriptor::Image` を parked snapshot 専用フォールバックとして追加 (open ルーティングは不変)。activation は stamp 優先・解決不能時のみ親フォルダを窓内コンテキストとして開き直す。
+- **stage-media-window (旧バックログ §1.7) 前倒し実装**: フル機能モードのサブオプション「動画・音声は別ウィンドウで再生」(`Settings::fullfeature_media_window` + 派生述語 `effective_media_in_media_window()`)。メディア窓インフラはモード非依存のまま、入口 (`requested_viewer_presentation_for_open` / F12 / カーソル同期 skip / grid open 前の unbundled live-park) だけ実効述語化。
+
 ## 10. ゲート C 後の候補ステージ (別機能、リワーク出荷スコープ外)
 
 - **音声ファイルの detached 対応** (stage-audio): Phase S 検収合格後、Phase I で実装。
