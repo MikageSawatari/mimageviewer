@@ -763,6 +763,29 @@ pub(crate) struct NativeVideoOutput {
 
 #[cfg(windows)]
 impl NativeVideoOutput {
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test() -> Self {
+        let (command_tx, _command_rx) = std::sync::mpsc::channel();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            hwnd: Arc::new(AtomicU64::new(0)),
+            hud_hwnd: Arc::new(AtomicU64::new(0)),
+            first_presented: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            presenter_hidden: Arc::new(AtomicBool::new(false)),
+            perf_overlay_visible: Arc::new(AtomicBool::new(false)),
+            source_epoch: Arc::new(AtomicU64::new(0)),
+            committed_generation: AtomicU64::new(0),
+            last_vst3_available: AtomicBool::new(false),
+            last_checked: AtomicBool::new(false),
+            command_tx,
+            event_rx: std::sync::Mutex::new(event_rx),
+            init_error: Arc::new(Mutex::new(None)),
+            thread: None,
+        }
+    }
+
     fn spawn(
         video_rx: crossbeam_channel::Receiver<VideoFrame>,
         clock: Arc<AvClock>,

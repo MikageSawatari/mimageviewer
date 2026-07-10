@@ -115,6 +115,9 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
+    /// ParkedLive mount 中に生成された pending の owner window id。
+    /// VST3 deferred open からも parked mount 中に到達するため mounted 専用ではない。
+    pub(crate) parked_live_window_id: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -363,6 +366,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
+            parked_live_window_id: self.native_video_parked_live_input_window_id,
         });
         crate::logger::log(format!(
             "[native-video] defer regular open: idx={idx} live_video_decode_threads={live_decoders} max={max_live_video_decode_threads}"
@@ -409,6 +413,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
+            parked_live_window_id: self.native_video_parked_live_input_window_id,
         });
         crate::logger::log(format!(
             "[native-video] defer regular open until detached host is ready: idx={idx}"
@@ -421,6 +426,12 @@ impl App {
         let Some(pending) = self.native_video_open_pending.as_ref() else {
             return;
         };
+        if !Self::parked_source_swap_poll_owner_matches(
+            pending.parked_live_window_id,
+            self.native_video_parked_live_input_window_id,
+        ) {
+            return;
+        }
         let idx = pending.idx;
         let path = pending.path.clone();
         let from_grid = pending.from_grid;
@@ -1053,6 +1064,57 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn pending_owner_after_context_transition(
+        pending_owner: Option<u64>,
+        from_owner: Option<u64>,
+        to_owner: Option<u64>,
+    ) -> Option<u64> {
+        if pending_owner == from_owner {
+            to_owner
+        } else {
+            pending_owner
+        }
+    }
+
+    /// App-global pending の mounted/active と ParkedLive の ownership 遷移。
+    #[cfg(windows)]
+    pub(crate) fn rebind_native_video_pending_owners(
+        &mut self,
+        from_owner: Option<u64>,
+        to_owner: Option<u64>,
+        _reason: &'static str,
+    ) {
+        if let Some(pending) = self.native_video_source_swap_pending.as_mut() {
+            pending.parked_live_window_id = Self::pending_owner_after_context_transition(
+                pending.parked_live_window_id,
+                from_owner,
+                to_owner,
+            );
+        }
+        if let Some(pending) = self.native_video_open_pending.as_mut() {
+            pending.parked_live_window_id = Self::pending_owner_after_context_transition(
+                pending.parked_live_window_id,
+                from_owner,
+                to_owner,
+            );
+        }
+        if let Some(pending) = self.native_video_fast_swap_pending.as_mut() {
+            pending.parked_live_window_id = Self::pending_owner_after_context_transition(
+                pending.parked_live_window_id,
+                from_owner,
+                to_owner,
+            );
+        }
+        if let Some(pending) = self.video_tile_swap_pending.as_mut() {
+            pending.parked_live_window_id = Self::pending_owner_after_context_transition(
+                pending.parked_live_window_id,
+                from_owner,
+                to_owner,
+            );
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn parked_source_swap_pending_belongs_to_window(
         pending_window_id: Option<u64>,
         window_id: u64,
@@ -1087,6 +1149,74 @@ impl App {
             ));
         }
         true
+    }
+
+    /// ParkedLive teardown 時に、その窓が所有する App-global pending だけを破棄する。
+    /// (review-v2.3.0 追補2 BA-7: parked pending teardown)
+    #[cfg(windows)]
+    pub(crate) fn discard_parked_native_video_pending_for_window(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        let mut discarded = self.discard_parked_source_swap_pending_for_window(window_id, reason);
+        if self
+            .native_video_open_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
+        {
+            self.native_video_open_pending = None;
+            discarded = true;
+        }
+        if self
+            .native_video_fast_swap_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
+        {
+            self.native_video_fast_swap_pending = None;
+            discarded = true;
+        }
+        if self
+            .video_tile_swap_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
+        {
+            self.video_tile_swap_pending = None;
+            discarded = true;
+        }
+        discarded
+    }
+
+    /// close_fullscreen が現在 mount 中の context に属する pending だけを破棄する。
+    #[cfg(windows)]
+    pub(crate) fn clear_mounted_native_video_pending(&mut self) {
+        // promoted active context は owner=None だが、main close 中は bundle が unmounted。
+        // media 窓自身の close は active context を take + mount してからここへ来るため false。
+        if self.active_detached_viewer_context_contains_video() {
+            return;
+        }
+        if self
+            .native_video_source_swap_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id.is_none())
+            && let Some(pending) = self.native_video_source_swap_pending.take()
+        {
+            pending.native_output.set_navigation_preview(None);
+        }
+        if self
+            .native_video_open_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id.is_none())
+        {
+            self.native_video_open_pending = None;
+        }
+        if self
+            .native_video_fast_swap_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id.is_none())
+        {
+            self.native_video_fast_swap_pending = None;
+        }
     }
 
     #[cfg(windows)]
@@ -1313,6 +1443,7 @@ impl App {
                 source_epoch,
                 started_at,
                 deadline: started_at + std::time::Duration::from_secs(2),
+                parked_live_window_id,
             });
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
@@ -1323,6 +1454,7 @@ impl App {
                 source_epoch,
                 started_at,
                 deadline: started_at + std::time::Duration::from_secs(2),
+                parked_live_window_id,
             });
         }
 
@@ -5103,6 +5235,12 @@ impl App {
         let Some(pending) = self.native_video_fast_swap_pending.as_ref() else {
             return;
         };
+        if !Self::parked_source_swap_poll_owner_matches(
+            pending.parked_live_window_id,
+            self.native_video_parked_live_input_window_id,
+        ) {
+            return;
+        }
         let target_idx = pending.target_idx;
         let target_path = pending.target_path.clone();
         let source_epoch = pending.source_epoch;
@@ -5224,6 +5362,12 @@ impl App {
         let Some(pending) = self.video_tile_swap_pending.as_ref() else {
             return;
         };
+        if !Self::parked_source_swap_poll_owner_matches(
+            pending.parked_live_window_id,
+            self.native_video_parked_live_input_window_id,
+        ) {
+            return;
+        }
         let target_idx = pending.target_idx;
         let target_path = pending.target_path.clone();
         let source_epoch = pending.source_epoch;
@@ -8025,6 +8169,7 @@ impl App {
             source_epoch: started.source_epoch,
             started_at: started.started_at,
             deadline: started.started_at + std::time::Duration::from_secs(2),
+            parked_live_window_id: self.native_video_parked_live_input_window_id,
         });
         self.video_tile_reopen_pending = false;
         self.video_tile_reopen_deadline = None;

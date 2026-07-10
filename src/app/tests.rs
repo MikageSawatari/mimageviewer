@@ -16700,6 +16700,33 @@ mod still_window_mode_key_tests {
         }
     }
 
+    fn source_swap_pending_for_test(
+        app: &App,
+        target_idx: usize,
+        owner: Option<u64>,
+    ) -> native_video::NativeVideoSourceSwapPending {
+        let GridItem::Video(path) = &app.items[target_idx] else {
+            unreachable!()
+        };
+        let now = std::time::Instant::now();
+        native_video::NativeVideoSourceSwapPending {
+            from_idx: target_idx,
+            target_idx,
+            target_path: path.clone(),
+            native_output: crate::video::NativeVideoOutput::disconnected_for_test(),
+            autoplay_override: None,
+            ignore_resume: false,
+            show_preparing_overlay: false,
+            reason: "test",
+            requested_at: now,
+            deadline: now,
+            input_seq: 0,
+            cursor_state: app.fullscreen_cursor_state(),
+            parked_live_window_id: owner,
+            audio_mode_after_swap: false,
+        }
+    }
+
     fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
         app.detached_viewer_window_id = Some(window_id);
         app.detached_window_hwnd_set(window_id, hwnd);
@@ -19092,6 +19119,71 @@ mod still_window_mode_key_tests {
         assert!(app.pending_finalize.contains(&4));
         assert_eq!(app.vst3_deferred_media_open, Some(5));
         assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &main_cancel));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn live_park_returns_thumb_bookkeeping_with_load_complex_to_main() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\bookkeeping.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(88);
+        app.begin_active_detached_session(88, DetachedSource::Video);
+        app.requested.insert(video, false);
+        app.pending_finalize.insert(video);
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, None));
+        let video_path = match &app.items[video] {
+            GridItem::Video(path) => path.clone(),
+            _ => unreachable!(),
+        };
+        let now = std::time::Instant::now();
+        app.video_tile_swap_pending = Some(VideoTileSwapPending {
+            target_idx: video,
+            target_path: video_path,
+            source_epoch: 1,
+            started_at: now,
+            deadline: now,
+            parked_live_window_id: None,
+        });
+        let items_gen = app.items_generation;
+        app.texture_backlog.push(crate::thumb_loader::ThumbMsg {
+            idx: video,
+            image: None,
+            from_cache: false,
+            source_dims: None,
+            canceled: false,
+            finalized: false,
+            input_seq: 0,
+            items_gen,
+        });
+
+        assert!(app.park_current_viewer_context_as_live_media(&ctx, "test"));
+
+        assert!(app.requested.contains_key(&video));
+        assert!(app.pending_finalize.contains(&video));
+        assert_eq!(app.texture_backlog.len(), 1);
+        assert_eq!(
+            app.native_video_source_swap_pending
+                .as_ref()
+                .and_then(|pending| pending.parked_live_window_id),
+            Some(88)
+        );
+        assert_eq!(
+            app.video_tile_swap_pending
+                .as_ref()
+                .and_then(|pending| pending.parked_live_window_id),
+            Some(88)
+        );
+        let parked = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .unwrap();
+        assert!(parked.requested.is_empty());
+        assert!(parked.pending_finalize.is_empty());
+        assert!(parked.texture_backlog.is_empty());
     }
 
     #[test]
@@ -24128,7 +24220,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_mode_change_closes_active_passive_and_parked_live_windows() {
+    fn detached_mode_change_closes_active_passive_and_parked_live_music() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let image = push_image(&mut app, r"C:\pics\active.jpg");
@@ -24171,8 +24263,10 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(102, DetachedWindowState::Parked, "test_setup");
         app.update_detached_window_runtime_flags(102, false, "test_setup");
 
+        let live_audio = push_audio(&mut app, r"C:\music\live.flac");
         let mut live_bundle = ViewerContextBundle::empty();
-        live_bundle.fullscreen_idx = Some(push_video(&mut app, r"C:\clips\live.mp4"));
+        live_bundle.items = app.items.clone();
+        live_bundle.fullscreen_idx = Some(live_audio);
         live_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         live_bundle.detached_viewer_window_id = Some(103);
         live_bundle.detached_viewer_independent_active = true;
@@ -24203,6 +24297,11 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(103, DetachedWindowState::ParkedLive, "test_setup");
         app.update_detached_window_runtime_flags(103, false, "test_setup");
 
+        app.music_analysis_path = Some(PathBuf::from(r"C:\music\live.flac"));
+        app.music_pcm = Some(std::sync::Arc::new(
+            crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
+        ));
+
         assert!(app.close_all_detached_viewers_for_mode_change(&ctx));
 
         assert_eq!(app.fullscreen_idx, None);
@@ -24218,6 +24317,8 @@ mod still_window_mode_key_tests {
         assert_eq!(app.last_active_detached_window_id, None);
         assert!(!app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
+        assert!(app.music_analysis_path.is_none());
+        assert!(app.music_pcm.is_none());
         assert!(app.pending_detached_cleanup_font_atlas_resync.is_some());
     }
 
@@ -24860,6 +24961,8 @@ mod still_window_mode_key_tests {
             .push(parked_bundle_snapshot(&ctx, 72, bundle));
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
 
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, Some(72)));
         assert!(app.activate_existing_detached_viewer_for_grid_open(&ctx, video));
 
         assert!(app.detached_image_windows.is_empty());
@@ -24872,10 +24975,41 @@ mod still_window_mode_key_tests {
             &active.bundle,
             std::path::Path::new(r"C:\clips\same.mp4")
         ));
+        let owner = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .map(|pending| pending.parked_live_window_id);
+        assert_eq!(owner, Some(None));
+        assert!(App::parked_source_swap_poll_owner_matches(
+            owner.flatten(),
+            None
+        ));
         assert!(
             app.activate_existing_detached_viewer_for_grid_open(&ctx, video),
             "the promoted active context must also take the path-based raise path"
         );
+        assert!(app.active_detached_viewer_context.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn same_media_open_focuses_active_viewport_while_video_player_is_deferred() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\deferred-same.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(73);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.native_video_front_recover_after_external_foreground = false;
+        app.native_video_front_last_raise = Some(std::time::Instant::now());
+
+        assert!(app.activate_existing_detached_viewer_for_grid_open(&ctx, video));
+
+        assert!(!app.native_video_front_recover_after_external_foreground);
+        assert!(app.native_video_front_last_raise.is_some());
         assert!(app.active_detached_viewer_context.is_some());
     }
 
@@ -25077,6 +25211,82 @@ mod still_window_mode_key_tests {
             8
         ));
         assert!(!App::parked_source_swap_pending_belongs_to_window(None, 7));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_close_fullscreen_preserves_parked_source_swap_pending() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\parked-pending.mp4");
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, Some(7)));
+
+        app.close_fullscreen();
+
+        assert!(app.native_video_source_swap_pending.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_close_preserves_promoted_active_source_swap_pending() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\active-pending.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, None));
+
+        app.close_fullscreen();
+
+        assert!(app.native_video_source_swap_pending.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mounted_close_fullscreen_clears_owned_source_swap_pending() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\mounted-pending.mp4");
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, None));
+
+        app.close_fullscreen();
+
+        assert!(app.native_video_source_swap_pending.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_window_direct_close_discards_owned_source_swap_pending() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\closing-pending.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 7, bundle));
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, Some(7)));
+
+        let path = match &app.items[video] {
+            GridItem::Video(path) => path.clone(),
+            _ => unreachable!(),
+        };
+        let now = std::time::Instant::now();
+        app.video_tile_swap_pending = Some(VideoTileSwapPending {
+            target_idx: video,
+            target_path: path,
+            source_epoch: 1,
+            started_at: now,
+            deadline: now,
+            parked_live_window_id: Some(7),
+        });
+        app.close_detached_image_windows_by_ids(&ctx, &[7], &[], "test_close", None);
+
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert!(app.video_tile_swap_pending.is_none());
     }
 
     #[test]
@@ -25598,6 +25808,24 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(idx));
         assert!(app.native_video_front_recover_after_external_foreground);
         assert!(app.native_video_front_last_raise.is_none());
+    }
+
+    #[test]
+    fn detached_same_video_open_in_audio_mode_focuses_music_viewport() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, r"C:\clips\audio-mode.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.last_viewer_sync_stamp = app.viewer_sync_stamp_for_idx(idx);
+        app.video_audio_mode = Some(idx);
+        app.native_video_front_recover_after_external_foreground = false;
+        app.native_video_front_last_raise = Some(std::time::Instant::now());
+
+        assert!(app.activate_existing_detached_viewer_for_grid_open(&ctx, idx));
+        assert!(!app.native_video_front_recover_after_external_foreground);
+        assert!(app.native_video_front_last_raise.is_some());
     }
 
     #[test]

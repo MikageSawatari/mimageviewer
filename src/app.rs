@@ -2032,7 +2032,7 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
-        self.discard_parked_source_swap_pending_for_window(window_id, reason);
+        self.discard_parked_native_video_pending_for_window(window_id, reason);
         let runtime = self.detached_window_runtimes.remove(&window_id);
         if let Some(runtime) = runtime.as_ref() {
             if let Some(placement) = runtime
@@ -4853,6 +4853,8 @@ pub(crate) struct VideoTileSwapPending {
     pub(crate) source_epoch: u64,
     pub(crate) started_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
+    /// ParkedLive poll 中に生成された pending の owner window id。
+    pub(crate) parked_live_window_id: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -4862,6 +4864,9 @@ pub(crate) struct NativeVideoFastSwapPending {
     pub(crate) source_epoch: u64,
     pub(crate) started_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
+    /// ParkedLive poll 中に生成された pending の owner window id。
+    /// App-global な pending を別 context の poll / close から守る。
+    pub(crate) parked_live_window_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -27375,6 +27380,10 @@ impl App {
                 egui::ViewportCommand::Close,
             );
         }
+        self.teardown_paused_media_bundles_for_window_ids(
+            &passive_ids,
+            "mode_change_close_all_passive",
+        );
         self.detached_image_windows.clear();
         self.deferred_detached_image_window_views.clear();
         self.native_video_parked_live_activation_requests.clear();
@@ -27988,6 +27997,12 @@ impl App {
         window_ids: &[u64],
         reason: &'static str,
     ) {
+        // bundle が既に外されていても、App-global pending の owner は window id で残り得る。
+        // teardown seam で先に破棄して presenter/output を孤児化させない。
+        // (review-v2.3.0 追補2 BA-7: parked pending teardown)
+        for &window_id in window_ids {
+            self.discard_parked_native_video_pending_for_window(window_id, reason);
+        }
         let mut dropped_bundles = Vec::new();
         for window in &mut self.detached_image_windows {
             if window_ids.contains(&window.id)
@@ -28410,6 +28425,10 @@ impl App {
         paused_bundle.pending_return_to_parent = false;
         paused_bundle.pdf_prefetch_grace_until = None;
 
+        // ParkedLive owner の pending は active context の通常 poll へ引き継ぐ。
+        // owner を残すと parked poll が二度と来ず、timeout 判定も含めて永久停止する。
+        // (review-v2.3.0 追補2 BA-7: activation pending ownership)
+        self.rebind_native_video_pending_owners(Some(id), None, "parked_live_activate_commit");
         self.detached_viewer_window_id = Some(id);
         self.update_detached_window_runtime_flags(id, false, "parked_live_activate_commit");
         self.transition_detached_window_state(
@@ -29613,6 +29632,9 @@ impl App {
         parked_bundle.detached_viewer_open_next_still_detached_once = false;
         snapshot.paused_bundle = Some(Box::new(parked_bundle));
         self.detached_image_windows.push(snapshot);
+        // mounted/active owner の pending を ParkedLive window へ焼き直す。別 parked window の
+        // owner は一致しないため変更しない (review-v2.3.0 追補2 BA-7)。
+        self.rebind_native_video_pending_owners(None, Some(snapshot_id), "parked_live_park_commit");
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
@@ -29667,12 +29689,19 @@ impl App {
         bundle.search_filter_origin_folder = self.search_filter_origin_folder.clone();
     }
 
-    /// ロード複合体 (thumb channel / cancel_token / worker queue / keep atomic 群) **だけ**を
+    /// ロード複合体 (thumb channel / cancel_token / worker queue / request bookkeeping /
+    /// keep atomic 群) **だけ**を
     /// bundle と交換する。legacy ParkedLive の park (preserve_main_context=true) 専用:
     /// グリッド状態は clone で複製する一方、ワーカープールは 1 つしか無いので、グリッドを
     /// 駆動する側へ明示的に付け替える必要がある (review-v2.3.0 Codex huntfix P2)。
     #[cfg(windows)]
     fn swap_load_complex_with_bundle(&mut self, bundle: &mut ViewerContextBundle) {
+        // queue と dedup / finalize / upload 待ちを必ず同じ context へ動かす。queue だけ
+        // main へ戻すと、空 requested が同じサムネを毎フレーム再投入する。
+        // (review-v2.3.0 追補2 P2: live-park load complex)
+        std::mem::swap(&mut self.requested, &mut bundle.requested);
+        std::mem::swap(&mut self.pending_finalize, &mut bundle.pending_finalize);
+        std::mem::swap(&mut self.texture_backlog, &mut bundle.texture_backlog);
         std::mem::swap(&mut self.tx, &mut bundle.tx);
         std::mem::swap(&mut self.rx, &mut bundle.rx);
         std::mem::swap(&mut self.cancel_token, &mut bundle.cancel_token);
@@ -30937,17 +30966,17 @@ impl App {
             self.active_detached_session
                 .map(|session| session.window_id)
         });
-        let presenter_raised = if matches!(active.bundle.items.get(idx), Some(GridItem::Video(_))) {
-            if let Some(FsCacheEntry::Video { player, .. }) = active.bundle.fs_cache.get(&idx) {
-                player.request_presenter_raise();
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let presenter_player = match active.bundle.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some(player.as_ref()),
+            _ => None,
         };
-        if presenter_raised {
+        let presenter_target = matches!(active.bundle.items.get(idx), Some(GridItem::Video(_)))
+            && !Self::viewer_context_bundle_is_music_consumer(&active.bundle)
+            && presenter_player.is_some();
+        if let Some(player) = presenter_player.filter(|_| presenter_target) {
+            player.request_presenter_raise();
+        }
+        if presenter_target {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
         } else if let Some(window_id) = window_id {
@@ -30972,12 +31001,13 @@ impl App {
                 .viewer_sync_stamp_for_idx(idx)
                 .is_some_and(|stamp| self.last_viewer_sync_stamp.as_ref() == Some(&stamp));
 
-        // 音声 (音楽ビュー) は still と同じ egui viewport が描くので、still と同じ
-        // focus コマンドで前面化する。Video 限定の raise 分岐だけだと Audio が素通りし、
-        // 再生中の音声をグリッドで再クリックしても無反応になる (Sol P2)。
+        // 音声と動画→音声モード (VST host 非表示) は still と同じ egui viewport が描く。
+        // hidden presenter を raise せず、見えている音楽 viewport を前面化する。
+        // VST host 中は current_music_fullscreen_idx() が None なので従来どおり presenter。
+        // (review-v2.3.0 追補2 P2: visible media surface)
         if mounted_matches
             && (self.viewer_item_supports_detached_still(idx)
-                || matches!(self.items.get(idx), Some(GridItem::Audio(_))))
+                || self.current_music_fullscreen_idx() == Some(idx))
         {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
@@ -37946,17 +37976,36 @@ impl App {
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]
         {
-            self.video_tile_state = None;
-            self.video_tile_mode_active = false;
-            self.video_tile_reopen_pending = false;
-            self.video_tile_reopen_deadline = None;
-            self.video_tile_swap_pending = None;
-            self.native_video_fast_swap_pending = None;
-            self.native_video_open_pending = None;
-            self.native_video_source_swap_pending = None;
-            // フルスクリーン終了時には保持中の deferred nav も破棄する
-            // (再オープン後に過去の delta が誤発火しないように)。
-            self.native_video_deferred_nav_delta = None;
+            let detached_pending_owner = self.active_detached_viewer_context_contains_video()
+                || self.parked_live_media_window_exists()
+                || self
+                    .native_video_source_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.parked_live_window_id.is_some())
+                || self
+                    .native_video_open_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.parked_live_window_id.is_some())
+                || self
+                    .native_video_fast_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.parked_live_window_id.is_some())
+                || self
+                    .video_tile_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.parked_live_window_id.is_some());
+            if !detached_pending_owner {
+                self.video_tile_state = None;
+                self.video_tile_mode_active = false;
+                self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
+                self.video_tile_swap_pending = None;
+                self.native_video_deferred_nav_delta = None;
+            }
+            // App-global native pending は mounted context owner (None) だけ閉じる。
+            // Some(window_id) は別 ParkedLive context の presenter/open を所有しているため、
+            // main 画像の close から破棄しない (review-v2.3.0 追補2 BA-7)。
+            self.clear_mounted_native_video_pending();
         }
         self.reset_erase_mode();
         self.reset_conceal_mode();

@@ -270,6 +270,25 @@ panic ハント (新規 unwrap 69 件全照合)、エラー経路後始末、リ
 - grid から同じ media を開いた場合は context 間で path 照合し、active は raise、ParkedLive は
   既存 activation 経路で前面化するよう修正。別 media の 1 本規則と teardown 付き close は維持。
 
+### 追補 第 2 弾 (2026-07-11): ParkedLive 所有権境界 P2 5 件
+
+発見: Codex 出荷前最終レビュー / 裏取り: Fable / 修正: Codex Sol。
+
+- ParkedLive source-swap 中の activation で pending owner を mounted/active 所有へ移し、
+  active poll が completion / timeout を引き継ぐよう修正。逆向き live-park も owner を
+  window id へ移す。parked mount から生成可能な open / fast-swap / video-tile pending にも
+  同じ owner を追加。
+- close_fullscreen は実際に閉じる context の native pending だけを破棄し、別 ParkedLive /
+  promoted active 窓所有分は温存。parked 窓 teardown では一致 owner の pending を明示破棄して
+  presenter/output 残留を防止。
+- preserve-main live-park のロード複合体へ requested / pending_finalize /
+  texture_backlog を追加し、worker queue と重複投入防止状態を同じ context へ戻す。
+
+- same-media 再クリックは表示面で raise 先を選び、動画→音声モードでは hidden presenter
+  でなく egui 音楽 viewport を focus。VST host 表示中と通常動画は presenter raise を維持。
+- 表示モード変更の passive 一括 close を共通 media teardown seam に通し、最終 resume 保存、
+  normalize cancel、最後の音楽 consumer の global 状態解放を揃えた。
+
 ## 推奨アクション (優先順)
 
 1. **出荷前修正 (小粒・低リスク・凍結対象外)**: P2-1 (ガード 1 条件) / P2-3 (clear 条件化) /
