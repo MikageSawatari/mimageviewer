@@ -453,9 +453,10 @@ impl SidecarFile {
 
     /// dirty ならディスクに書き出す (または空なら削除する)。dirty でなければ何もしない。
     /// 書き込み失敗時は `disabled = true` にして以降の書き込みをスキップ。
-    pub fn flush(&mut self) {
+    /// 戻り値は、未変更を含めてディスクと整合した場合だけ true。
+    pub fn flush(&mut self) -> bool {
         if !self.dirty || self.disabled {
-            return;
+            return !self.dirty;
         }
         let path = self.folder.join(SIDECAR_FILENAME);
 
@@ -477,7 +478,7 @@ impl SidecarFile {
                     self.disabled = true;
                 }
             }
-            return;
+            return !self.dirty;
         }
 
         let json_value = SidecarJson {
@@ -491,7 +492,7 @@ impl SidecarFile {
             Err(e) => {
                 crate::logger::log(format!("sidecar: serialize failed: {e}"));
                 self.disabled = true;
-                return;
+                return false;
             }
         };
 
@@ -500,7 +501,7 @@ impl SidecarFile {
         if let Err(e) = std::fs::write(&tmp, &json) {
             crate::logger::log(format!("sidecar: write failed: {} ({})", tmp.display(), e));
             self.disabled = true;
-            return;
+            return false;
         }
         // 既存ファイルの属性を一度クリアしないと rename が失敗するケースがあるため、
         // 既存ファイルがあれば属性を NORMAL に戻してから rename する。
@@ -515,11 +516,12 @@ impl SidecarFile {
             ));
             let _ = std::fs::remove_file(&tmp);
             self.disabled = true;
-            return;
+            return false;
         }
         #[cfg(windows)]
         mark_hidden_system(&path);
         self.dirty = false;
+        true
     }
 }
 

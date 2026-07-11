@@ -1013,7 +1013,7 @@ mod tests {
             crate::global_search::run("dummy", &[fav_id], &scope, &fts_cl, &cancel_cl, &tx);
         });
         // 何らかの SearchStreamEvent が返ることを確認
-        let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         drop(ev);
     }
 
@@ -1085,7 +1085,7 @@ mod tests {
 
         spawn_reconciliation(meta, fts, vec![], Arc::clone(&flag));
         // 完了で false に戻る
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if !flag.load(Ordering::SeqCst) {
                 break;

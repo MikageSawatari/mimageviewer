@@ -166,6 +166,20 @@ impl App {
                         self.cache_manager_confirm_delete_all = true;
                     }
 
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label("画像の評価・補正・タグなどの孤児データを確認します。");
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("  メタデータを整理…  "))
+                        .clicked()
+                    {
+                        self.metadata_cleanup_scan = None;
+                        self.metadata_cleanup_result = None;
+                        self.show_metadata_cleanup = true;
+                        self.show_cache_manager = false;
+                    }
+
                     // ── 処理中ラベル / 結果メッセージ ─────────────
                     if busy {
                         ui.add_space(8.0);

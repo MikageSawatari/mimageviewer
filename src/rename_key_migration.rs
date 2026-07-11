@@ -33,6 +33,9 @@
 
 use std::path::{Path, PathBuf};
 
+/// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
+const PURGE_EXACT_BATCH_SIZE: usize = 500;
+
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
 pub struct RenameMigrationReport {
     pub rows: usize,
@@ -341,6 +344,8 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
 #[derive(Debug, Default)]
 pub(crate) struct PurgeReport {
     pub(crate) rows: usize,
+    /// SQLite connection open を試みた回数。delete worker の perf 計装用。
+    pub(crate) db_open_count: usize,
     pub(crate) errors: Vec<String>,
 }
 
@@ -380,6 +385,13 @@ pub(crate) fn purge_removed_paths_at(
 }
 
 fn purge_sidecar_backups(removed: &[PathBuf], report: &mut PurgeReport) {
+    purge_sidecar_backups_with_flush(removed, report, |sidecar| sidecar.flush());
+}
+
+fn purge_sidecar_backups_with_flush<F>(removed: &[PathBuf], report: &mut PurgeReport, mut flush: F)
+where
+    F: FnMut(&mut crate::sidecar::SidecarFile) -> bool,
+{
     let mut roots_by_parent = std::collections::HashMap::<PathBuf, Vec<String>>::new();
     for path in removed {
         let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
@@ -405,8 +417,14 @@ fn purge_sidecar_backups(removed: &[PathBuf], report: &mut PurgeReport) {
             sidecar.purge_deleted_root(root) || changed
         });
         if changed {
-            sidecar.flush();
-            report.rows += 1;
+            if flush(&mut sidecar) {
+                report.rows += 1;
+            } else {
+                report.errors.push(format!(
+                    "{}: sidecar purge flush failed",
+                    sidecar_path.display()
+                ));
+            }
         }
     }
 }
@@ -428,6 +446,21 @@ fn normalized_removed_keys(
     keys
 }
 
+/// BINARY collation で `prefix` から始まる文字列の排他的 upper bound を返す。
+///
+/// UTF-8 の辞書順は Unicode code point 順を保つため、最後の scalar value を次へ進めれば
+/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。最後が `char::MAX`
+/// または次が surrogate で scalar value にできない場合は `None` とし、呼び出し側で従来の
+/// `substr` 条件へ安全に fallback する。hard purge が渡す prefix は `/` / `:` 終端なので
+/// 通常は必ず index range 条件を使える。
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let (last_index, last) = prefix.char_indices().next_back()?;
+    let next = char::from_u32((last as u32).checked_add(1)?)?;
+    let mut upper = prefix[..last_index].to_owned();
+    upper.push(next);
+    Some(upper)
+}
+
 fn purge_store(
     data_dir: &Path,
     descriptor: &StoreDescriptor,
@@ -438,6 +471,7 @@ fn purge_store(
     if removed_keys.is_empty() || !db_path.exists() {
         return;
     }
+    report.db_open_count += 1;
     let result = (|| -> Result<usize, rusqlite::Error> {
         let mut conn = rusqlite::Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -450,26 +484,42 @@ fn purge_store(
             return Ok(0);
         }
         let tx = conn.transaction()?;
-        let sql = format!(
-            "DELETE FROM {} WHERE {} = ?1
-             OR substr({}, 1, ?2) = ?3
-             OR substr({}, 1, ?4) = ?5",
-            descriptor.table, descriptor.column, descriptor.column, descriptor.column,
-        );
         let mut changed = 0usize;
-        for key in removed_keys {
-            let folder_prefix = format!("{key}/");
-            let container_prefix = format!("{key}::");
-            changed += tx.execute(
-                &sql,
-                rusqlite::params![
-                    key,
-                    folder_prefix.chars().count() as i64,
-                    folder_prefix,
-                    container_prefix.chars().count() as i64,
-                    container_prefix,
-                ],
-            )?;
+
+        // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
+        // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
+        for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
+            let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "DELETE FROM {} WHERE {} IN ({placeholders})",
+                descriptor.table, descriptor.column
+            );
+            changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
+        }
+
+        // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
+        // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
+        let range_sql = format!(
+            "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
+            descriptor.table, descriptor.column, descriptor.column
+        );
+        let fallback_sql = format!(
+            "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
+            descriptor.table, descriptor.column
+        );
+        {
+            let mut range_statement = tx.prepare(&range_sql)?;
+            let mut fallback_statement = tx.prepare(&fallback_sql)?;
+            for key in removed_keys {
+                for prefix in [format!("{key}/"), format!("{key}::")] {
+                    if let Some(upper) = prefix_upper_bound(&prefix) {
+                        changed += range_statement.execute(rusqlite::params![prefix, upper])?;
+                    } else {
+                        changed += fallback_statement
+                            .execute(rusqlite::params![prefix.chars().count() as i64, prefix,])?;
+                    }
+                }
+            }
         }
         tx.commit()?;
         Ok(changed)
@@ -688,6 +738,211 @@ mod tests {
         rusqlite::Connection::open(dir.join(file)).unwrap()
     }
 
+    fn sorted_keys(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("SELECT path FROM {table} ORDER BY path"))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn prefix_upper_bound_advances_the_last_unicode_scalar() {
+        assert_eq!(prefix_upper_bound("a/b/").as_deref(), Some("a/b0"));
+        assert_eq!(prefix_upper_bound("a.zip::").as_deref(), Some("a.zip:;"));
+        assert_eq!(prefix_upper_bound("本").as_deref(), Some("札"));
+        assert_eq!(prefix_upper_bound(""), None);
+        assert_eq!(prefix_upper_bound("\u{d7ff}"), None, "surrogate gap");
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None, "char::MAX");
+    }
+
+    #[test]
+    fn exact_and_prefix_query_plans_use_the_binary_primary_key_index() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE entries (path TEXT PRIMARY KEY, value INTEGER)")
+            .unwrap();
+
+        for (sql, parameters) in [
+            (
+                "EXPLAIN QUERY PLAN DELETE FROM entries WHERE path IN (?1, ?2)",
+                vec!["a", "b"],
+            ),
+            (
+                "EXPLAIN QUERY PLAN DELETE FROM entries WHERE path >= ?1 AND path < ?2",
+                vec!["a/", "a0"],
+            ),
+        ] {
+            let mut statement = connection.prepare(sql).unwrap();
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ");
+            assert!(plan.contains("SEARCH"), "{sql}: {plan}");
+            assert!(!plan.contains("SCAN"), "{sql}: {plan}");
+        }
+    }
+
+    #[test]
+    fn range_purge_matches_legacy_substr_for_exact_folder_and_container_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = open(dir.path(), "equivalence.db");
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy_rows (path TEXT PRIMARY KEY);
+                 CREATE TABLE range_rows (path TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        let values = [
+            "c:/root/a/b.jpg",
+            "c:/root/a/b",
+            "c:/root/a/b/c.jpg",
+            "c:/root/a/b/sub/d.jpg",
+            "c:/root/a/b2/keep.jpg",
+            "c:/root/a.zip",
+            "c:/root/a.zip::x",
+            "c:/root/a.zip::dir/y",
+            "c:/root/a.zip:;keep",
+            "c:/root/100%_本",
+            "c:/root/100%_本/child.jpg",
+            "c:/root/100x_本/keep.jpg",
+        ];
+        for value in values {
+            connection
+                .execute("INSERT INTO legacy_rows(path) VALUES (?1)", [value])
+                .unwrap();
+            connection
+                .execute("INSERT INTO range_rows(path) VALUES (?1)", [value])
+                .unwrap();
+        }
+        let removed_keys = vec![
+            "c:/root/a/b.jpg".to_owned(),
+            "c:/root/a/b".to_owned(),
+            "c:/root/a.zip".to_owned(),
+            "c:/root/100%_本".to_owned(),
+        ];
+
+        let legacy_sql = "DELETE FROM legacy_rows WHERE path = ?1
+                          OR substr(path, 1, ?2) = ?3
+                          OR substr(path, 1, ?4) = ?5";
+        let mut legacy_changed = 0usize;
+        for key in &removed_keys {
+            let folder_prefix = format!("{key}/");
+            let container_prefix = format!("{key}::");
+            legacy_changed += connection
+                .execute(
+                    legacy_sql,
+                    rusqlite::params![
+                        key,
+                        folder_prefix.chars().count() as i64,
+                        folder_prefix,
+                        container_prefix.chars().count() as i64,
+                        container_prefix,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let descriptor = StoreDescriptor {
+            file: "equivalence.db",
+            table: "range_rows",
+            column: "path",
+            unique: true,
+            normalization: StoreKeyNormalization::KeepDrive,
+            rename_generic: true,
+        };
+        let mut report = PurgeReport::default();
+        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, legacy_changed);
+        assert_eq!(
+            sorted_keys(&connection, "range_rows"),
+            sorted_keys(&connection, "legacy_rows")
+        );
+        assert_eq!(
+            sorted_keys(&connection, "range_rows"),
+            [
+                "c:/root/100x_本/keep.jpg",
+                "c:/root/a.zip:;keep",
+                "c:/root/a/b2/keep.jpg"
+            ]
+        );
+    }
+
+    #[test]
+    fn index_fast_purge_handles_27000_rows_and_1000_removed_keys_within_seconds() {
+        const TOTAL_ROWS: usize = 27_000;
+        const REMOVED_ROWS: usize = 1_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = open(dir.path(), "perf.db");
+        connection
+            .execute_batch("CREATE TABLE entries (path TEXT PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        let removed_keys = (0..REMOVED_ROWS)
+            .map(|index| format!("c:/removed/{index:04}.jpg"))
+            .collect::<Vec<_>>();
+        {
+            let transaction = connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare("INSERT INTO entries(path, value) VALUES (?1, ?2)")
+                    .unwrap();
+                for (index, key) in removed_keys.iter().enumerate() {
+                    insert
+                        .execute(rusqlite::params![key, index as i64])
+                        .unwrap();
+                }
+                for index in REMOVED_ROWS..TOTAL_ROWS {
+                    insert
+                        .execute(rusqlite::params![
+                            format!("c:/kept/{index:05}.jpg"),
+                            index as i64
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+        drop(connection);
+
+        let descriptor = StoreDescriptor {
+            file: "perf.db",
+            table: "entries",
+            column: "path",
+            unique: true,
+            normalization: StoreKeyNormalization::KeepDrive,
+            rename_generic: true,
+        };
+        let started = std::time::Instant::now();
+        let mut report = PurgeReport::default();
+        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        let elapsed = started.elapsed();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, REMOVED_ROWS);
+        let connection = open(dir.path(), "perf.db");
+        let remaining: usize = connection
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, TOTAL_ROWS - REMOVED_ROWS);
+        eprintln!(
+            "index-fast purge: total_rows={TOTAL_ROWS} removed_keys={REMOVED_ROWS} elapsed_ms={:.1}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "27k rows / 1k keys purge took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn shared_store_list_hard_purge_covers_exact_folder_and_container_prefixes() {
         let dir = tempfile::tempdir().unwrap();
@@ -782,6 +1037,30 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(db.count_by_stars().unwrap()[5], 0);
         assert_eq!(db.count(), 0);
+    }
+
+    #[test]
+    fn failed_sidecar_flush_is_not_counted_as_a_purged_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let removed = media.join("gone.jpg");
+        let sidecar_path = media.join(crate::sidecar::SIDECAR_FILENAME);
+        std::fs::write(
+            &sidecar_path,
+            br#"{"version":1,"items":{"gone.jpg":{"tags":["old"]}}}"#,
+        )
+        .unwrap();
+        let mut report = PurgeReport::default();
+        purge_sidecar_backups_with_flush(&[removed], &mut report, |_sidecar| false);
+        assert_eq!(report.rows, 0, "failed sidecar write is not a success row");
+        assert_eq!(report.errors.len(), 1);
+        assert!(
+            std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .contains("gone.jpg"),
+            "failed flush must leave the previous sidecar intact"
+        );
     }
 
     /// ジャーナルの往復と消し込み (空で削除・無ければ空・壊れていたら破棄)。

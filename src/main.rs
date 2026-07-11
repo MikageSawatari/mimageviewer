@@ -92,6 +92,7 @@ pub mod logger;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
+pub mod metadata_cleanup;
 pub mod monitor;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;

@@ -156,6 +156,8 @@ const BOOK_ADD_UNSUPPORTED_ITEM_HINT: &str =
 const BOOK_ADD_MIXED_UNSUPPORTED_HINT: &str = "画像・ページ以外が選ばれているため追加できません";
 const BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT: &str =
     "追加先に設定されている本のページは、同じ本に追加できません";
+pub(crate) const BOOK_UNBAKED_EDIT_WARNING: &str =
+    "隠蔽・消しゴム等の編集は本棚のファイルには反映されません (mIV 内でのみ表示)";
 
 fn friendly_book_add_error(err: String) -> String {
     if err.contains("最終合成の完了後")
@@ -19479,6 +19481,7 @@ impl App {
         let target_folder = crate::books::book_folder(&self.book_root_path(), &book_name);
         let mut sources = Vec::new();
         let mut errors = Vec::new();
+        let mut warn_unbaked_edits = false;
         for idx in indices {
             // ファイル名スタックの集約セルは、そのメンバー画像を 1 枚ずつ通常の Grid 追加と同じ規則
             // (同一本ページ拒否 + 色補正/非破壊回転の焼き込み) で展開する。Stack セルは
@@ -19486,6 +19489,7 @@ impl App {
             // これで「スタックを本へ追加」が「スタック解除 → メンバー全選択 → 本へ追加」と同結果になる。
             if let Some(member_paths) = self.stack_member_paths(idx) {
                 for member_path in member_paths {
+                    warn_unbaked_edits |= self.book_page_path_has_unbaked_edits(&member_path);
                     match self.book_page_source_for_stack_member(&member_path, &target_folder) {
                         Ok(source) => sources.push(source),
                         Err(err) => {
@@ -19499,6 +19503,7 @@ impl App {
                 }
                 continue;
             }
+            warn_unbaked_edits |= self.book_page_idx_has_unbaked_edits(idx);
             match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid, &target_folder) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
@@ -19512,7 +19517,7 @@ impl App {
             return;
         }
         let count = sources.len();
-        self.start_book_append_to_named(ctx, book_name.clone(), sources);
+        self.start_book_append_to_named(ctx, book_name.clone(), sources, warn_unbaked_edits);
         self.show_feedback_toast(format!("「{book_name}」へ追加中: {count} ページ"));
     }
 
@@ -19542,6 +19547,7 @@ impl App {
             return;
         }
         let active_folder = self.active_book_folder_path();
+        let warn_unbaked_edits = self.book_page_idx_has_unbaked_edits(fs_idx);
         let source = match self.book_page_source_for_idx(
             ctx,
             fs_idx,
@@ -19554,7 +19560,8 @@ impl App {
                 return;
             }
         };
-        self.start_book_append(ctx, vec![source]);
+        let book_name = self.active_book_name();
+        self.start_book_append_to_named(ctx, book_name, vec![source], warn_unbaked_edits);
         self.show_feedback_toast("追加先の本へ追加中".to_string());
     }
 
@@ -19685,6 +19692,23 @@ impl App {
             return p.clone();
         }
         self.settings.global_preset.clone()
+    }
+
+    fn book_page_key_has_unbaked_edits(&self, key: &str) -> bool {
+        self.conceal_page_keys.contains(key)
+            || self.mask_page_keys.contains(key)
+            || self.local_adjust_page_keys.contains(key)
+            || self.comic_page_keys.contains(key)
+    }
+
+    fn book_page_path_has_unbaked_edits(&self, path: &std::path::Path) -> bool {
+        let key = crate::adjustment_db::normalize_path(path);
+        self.book_page_key_has_unbaked_edits(&key)
+    }
+
+    fn book_page_idx_has_unbaked_edits(&self, idx: usize) -> bool {
+        self.page_path_key(idx)
+            .is_some_and(|key| self.book_page_key_has_unbaked_edits(&key))
     }
 
     fn book_page_source_for_idx(

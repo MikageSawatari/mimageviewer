@@ -12,6 +12,8 @@
 //! - **チャンク = cancel / UI 進捗粒度**: チャンク完了ごとに `DeleteMsg::Batch` を送り、
 //!   チャンク間で mIV 側キャンセルを受け付ける。Shell 側の中断はチャンク内の
 //!   失敗として扱い、未処理チャンクを捨てない。
+//! - **メタ purge は worker 末尾で 1 回**: 各チャンクの Shell 成功 path と削除前 PDF path
+//!   を蓄積し、キャンセル時も recycle 済みの成功分だけをまとめて hard purge する。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +39,8 @@ pub enum DeleteMsg {
         /// SHA-256 キーの pdf_passwords を worker 側で purge した実 PDF path。
         /// UI は disk I/O なしで in-memory store から同じ hash を除く。
         purged_pdf_password_paths: Vec<PathBuf>,
+        /// 最終 purge 失敗が永続 journal に保存され、後続 retry が必要。
+        purge_deferred: bool,
     },
     /// 全バッチが終わった (キャンセル含む)。`canceled` が true ならユーザーが途中で止めた。
     Done { canceled: bool },
@@ -53,6 +57,7 @@ pub struct DeletePending {
     /// これまでに失敗したパスとエラーメッセージ (トースト / ログ通知用)。
     pub failed: Vec<(PathBuf, String)>,
     pub purged_pdf_password_paths: Vec<PathBuf>,
+    pub purge_deferred: bool,
 }
 
 impl DeletePending {
@@ -91,6 +96,7 @@ pub fn spawn(paths: Vec<PathBuf>, hwnd: Option<isize>) -> DeletePending {
             succeeded: Vec::new(),
             failed,
             purged_pdf_password_paths: Vec::new(),
+            purge_deferred: false,
         });
         let _ = tx.send(DeleteMsg::Done { canceled: false });
     }
@@ -102,6 +108,7 @@ pub fn spawn(paths: Vec<PathBuf>, hwnd: Option<isize>) -> DeletePending {
         succeeded: Vec::new(),
         failed: Vec::new(),
         purged_pdf_password_paths: Vec::new(),
+        purge_deferred: false,
     }
 }
 
@@ -111,46 +118,69 @@ fn run_worker(
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
 ) {
+    let data_dir = crate::data_dir::get();
+    let purge_data_dir = data_dir.clone();
+    let has_pdf_passwords = crate::pdf_passwords::PdfPasswordStore::has_entries_at(&data_dir);
     run_worker_with_recycler(
         paths,
         hwnd,
         cancel,
         tx,
+        has_pdf_passwords,
         recycle_chunk,
+        collect_pdf_paths_for_delete,
         |succeeded, pdf_paths| {
             crate::rename_key_migration::purge_removed_paths_at(
-                &crate::data_dir::get(),
+                &purge_data_dir,
                 succeeded,
                 pdf_paths,
             )
         },
+        |succeeded, pdf_paths| {
+            crate::metadata_cleanup::journal_failed_delete_purge(&data_dir, succeeded, pdf_paths)
+        },
     );
 }
 
-fn run_worker_with_recycler<F, P>(
+fn run_worker_with_recycler<F, C, P, J>(
     paths: Vec<PathBuf>,
     hwnd: isize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
+    collect_pdf_paths: bool,
     mut recycle: F,
+    mut collect_pdfs: C,
     mut purge: P,
+    mut journal_failure: J,
 ) where
     F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
+    C: FnMut(&[PathBuf], &AtomicBool) -> Vec<PathBuf>,
     P: FnMut(&[PathBuf], &[PathBuf]) -> crate::rename_key_migration::PurgeReport,
+    J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
 {
+    let mut succeeded_for_purge = Vec::new();
+    let mut pdf_paths_for_purge = Vec::new();
+    let mut canceled = false;
+    let mut receiver_open = true;
+
     for chunk in paths.chunks(FILE_OPERATION_CHUNK_SIZE) {
         if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(DeleteMsg::Done { canceled: true });
-            return;
+            canceled = true;
+            break;
         }
 
         let t0 = std::time::Instant::now();
         // pdf_passwords.json は path hash しか持たず prefix 逆引きできないため、フォルダが
-        // Shell で消える前に配下 PDF path を列挙する。reparse directory は辿らない。
-        let pdf_candidates = collect_pdf_paths_for_delete(chunk, &cancel);
+        // Shell で消える前に配下 PDF path を列挙する。保存行が無い場合は走査自体を省く。
+        // reparse directory は辿らない。
+        let pdf_candidates = if collect_pdf_paths {
+            collect_pdfs(chunk, &cancel)
+        } else {
+            Vec::new()
+        };
         if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(DeleteMsg::Done { canceled: true });
-            return;
+            canceled = true;
+            break;
         }
         let outcome = recycle_chunk_with_retry(hwnd, chunk, &cancel, &mut recycle);
         if crate::perf::is_enabled() {
@@ -188,45 +218,102 @@ fn run_worker_with_recycler<F, P>(
             .into_iter()
             .filter(|path| path_matches_removed(path, &outcome.succeeded))
             .collect::<Vec<_>>();
-        if !outcome.succeeded.is_empty() {
-            let mut report = purge(&outcome.succeeded, &purged_pdf_password_paths);
-            let mut rows = report.rows;
-            for retry in 1..=3 {
-                if report.errors.is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50 * retry));
-                report = purge(&outcome.succeeded, &purged_pdf_password_paths);
-                rows += report.rows;
-            }
-            crate::logger::log(format!(
-                "[delete] metadata hard purge rows={} removed={} errors={}",
-                rows,
-                outcome.succeeded.len(),
-                report.errors.len()
-            ));
-            for error in report.errors {
-                crate::logger::log(format!("[delete] metadata hard purge failed: {error}"));
-            }
-        }
+        succeeded_for_purge.extend(outcome.succeeded.iter().cloned());
+        pdf_paths_for_purge.extend(purged_pdf_password_paths.iter().cloned());
         if tx
             .send(DeleteMsg::Batch {
                 succeeded: outcome.succeeded,
                 failed: outcome.failed,
                 purged_pdf_password_paths,
+                purge_deferred: false,
             })
             .is_err()
         {
-            return;
+            receiver_open = false;
+            break;
         }
         if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(DeleteMsg::Done { canceled: true });
-            return;
+            canceled = true;
+            break;
         }
     }
-    let _ = tx.send(DeleteMsg::Done {
-        canceled: cancel.load(Ordering::Relaxed),
-    });
+    pdf_paths_for_purge.sort();
+    pdf_paths_for_purge.dedup();
+    let mut purge_deferred = false;
+    if !succeeded_for_purge.is_empty() {
+        let purge_started = std::time::Instant::now();
+        let mut attempts = 1usize;
+        let mut report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+        let mut rows = report.rows;
+        let mut db_open_count = report.db_open_count;
+        for retry in 1..=3 {
+            if report.errors.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50 * retry));
+            report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+            attempts += 1;
+            rows += report.rows;
+            db_open_count += report.db_open_count;
+        }
+        let purge_ms = purge_started.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "[delete] metadata hard purge rows={rows} removed={} errors={} attempts={attempts} db_opens={db_open_count} ms={purge_ms:.1}",
+            succeeded_for_purge.len(),
+            report.errors.len()
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "delete",
+                "metadata_purge",
+                Some("worker_tail"),
+                0,
+                &[
+                    ("ms", serde_json::Value::from(purge_ms)),
+                    (
+                        "removed",
+                        serde_json::Value::from(succeeded_for_purge.len() as u64),
+                    ),
+                    (
+                        "pdf_paths",
+                        serde_json::Value::from(pdf_paths_for_purge.len() as u64),
+                    ),
+                    ("attempts", serde_json::Value::from(attempts as u64)),
+                    ("db_opens", serde_json::Value::from(db_open_count as u64)),
+                    ("rows", serde_json::Value::from(rows as u64)),
+                    (
+                        "errors",
+                        serde_json::Value::from(report.errors.len() as u64),
+                    ),
+                ],
+            );
+        }
+        if !report.errors.is_empty() {
+            purge_deferred = journal_failure(&succeeded_for_purge, &pdf_paths_for_purge);
+            crate::logger::log(format!(
+                "[delete] metadata hard purge deferred journaled={purge_deferred}"
+            ));
+        }
+        for error in report.errors {
+            crate::logger::log(format!("[delete] metadata hard purge failed: {error}"));
+        }
+    }
+
+    if receiver_open && purge_deferred {
+        receiver_open = tx
+            .send(DeleteMsg::Batch {
+                succeeded: Vec::new(),
+                failed: Vec::new(),
+                purged_pdf_password_paths: Vec::new(),
+                purge_deferred: true,
+            })
+            .is_ok();
+    }
+    if receiver_open {
+        let _ = tx.send(DeleteMsg::Done {
+            canceled: canceled || cancel.load(Ordering::Relaxed),
+        });
+    }
 }
 
 fn path_matches_removed(path: &std::path::Path, removed: &[PathBuf]) -> bool {
@@ -664,11 +751,14 @@ mod worker_tests {
             0,
             cancel,
             tx,
+            false,
             |_hwnd, chunk| {
                 calls += 1;
                 failed_outcome(chunk, false)
             },
+            |_paths, _cancel| Vec::new(),
             |_succeeded, _pdf_paths| crate::rename_key_migration::PurgeReport::default(),
+            |_succeeded, _pdf_paths| false,
         );
 
         let messages: Vec<_> = rx.try_iter().collect();
@@ -692,12 +782,15 @@ mod worker_tests {
             0,
             cancel,
             tx,
+            false,
             |_hwnd, chunk| {
                 calls += 1;
                 cancel_for_recycler.store(true, Ordering::Relaxed);
                 failed_outcome(chunk, false)
             },
+            |_paths, _cancel| Vec::new(),
             |_succeeded, _pdf_paths| crate::rename_key_migration::PurgeReport::default(),
+            |_succeeded, _pdf_paths| false,
         );
 
         let messages: Vec<_> = rx.try_iter().collect();
@@ -705,6 +798,140 @@ mod worker_tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(batch_counts(&messages[0]), (0, FILE_OPERATION_CHUNK_SIZE));
         assert!(done_canceled(&messages[1]));
+    }
+
+    #[test]
+    fn worker_purges_all_succeeded_chunks_once_at_tail() {
+        let paths = dummy_paths(FILE_OPERATION_CHUNK_SIZE * 2 + 1);
+        let expected = paths.clone();
+        let (tx, rx) = mpsc::channel();
+        let mut recycle_calls = 0usize;
+        let mut purge_calls = 0usize;
+        let mut purged = Vec::new();
+
+        run_worker_with_recycler(
+            paths,
+            0,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            false,
+            |_hwnd, chunk| {
+                recycle_calls += 1;
+                DeleteChunkOutcome {
+                    succeeded: chunk.to_vec(),
+                    failed: Vec::new(),
+                    shell_aborted: false,
+                    retryable: false,
+                }
+            },
+            |_paths, _cancel| Vec::new(),
+            |removed, _pdf_paths| {
+                purge_calls += 1;
+                purged.extend_from_slice(removed);
+                crate::rename_key_migration::PurgeReport::default()
+            },
+            |_succeeded, _pdf_paths| false,
+        );
+
+        assert_eq!(recycle_calls, 3);
+        assert_eq!(purge_calls, 1, "purge must not scale with chunk count");
+        assert_eq!(purged, expected);
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 4);
+        assert!(!done_canceled(&messages[3]));
+    }
+
+    #[test]
+    fn cancellation_purges_only_already_recycled_successes() {
+        let paths = dummy_paths(FILE_OPERATION_CHUNK_SIZE + 1);
+        let expected = paths[..FILE_OPERATION_CHUNK_SIZE].to_vec();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_recycler = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let mut recycle_calls = 0usize;
+        let mut purge_calls = 0usize;
+        let mut purged = Vec::new();
+
+        run_worker_with_recycler(
+            paths,
+            0,
+            cancel,
+            tx,
+            false,
+            |_hwnd, chunk| {
+                recycle_calls += 1;
+                cancel_for_recycler.store(true, Ordering::Relaxed);
+                DeleteChunkOutcome {
+                    succeeded: chunk.to_vec(),
+                    failed: Vec::new(),
+                    shell_aborted: false,
+                    retryable: false,
+                }
+            },
+            |_paths, _cancel| Vec::new(),
+            |removed, _pdf_paths| {
+                purge_calls += 1;
+                purged.extend_from_slice(removed);
+                crate::rename_key_migration::PurgeReport::default()
+            },
+            |_succeeded, _pdf_paths| false,
+        );
+
+        assert_eq!(recycle_calls, 1);
+        assert_eq!(purge_calls, 1);
+        assert_eq!(purged, expected);
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(batch_counts(&messages[0]), (FILE_OPERATION_CHUNK_SIZE, 0));
+        assert!(done_canceled(&messages[1]));
+    }
+
+    #[test]
+    fn empty_pdf_password_store_skips_pdf_tree_collection() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("pdf_passwords.json"), b"{}").unwrap();
+        let has_pdf_passwords = crate::pdf_passwords::PdfPasswordStore::has_entries_at(temp.path());
+        assert!(!has_pdf_passwords);
+        let root = temp.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("nested.pdf"), b"pdf").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut collect_calls = 0usize;
+        let mut purge_pdf_paths = Vec::new();
+
+        run_worker_with_recycler(
+            vec![root],
+            0,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            has_pdf_passwords,
+            |_hwnd, chunk| DeleteChunkOutcome {
+                succeeded: chunk.to_vec(),
+                failed: Vec::new(),
+                shell_aborted: false,
+                retryable: false,
+            },
+            |paths, cancel| {
+                collect_calls += 1;
+                collect_pdf_paths_for_delete(paths, cancel)
+            },
+            |_removed, pdf_paths| {
+                purge_pdf_paths.extend_from_slice(pdf_paths);
+                crate::rename_key_migration::PurgeReport::default()
+            },
+            |_succeeded, _pdf_paths| false,
+        );
+
+        assert_eq!(collect_calls, 0, "read_dir traversal must be skipped");
+        assert!(purge_pdf_paths.is_empty());
+        std::fs::write(
+            temp.path().join("pdf_passwords.json"),
+            br#"{"hash":"cipher"}"#,
+        )
+        .unwrap();
+        assert!(crate::pdf_passwords::PdfPasswordStore::has_entries_at(
+            temp.path()
+        ));
     }
 
     #[test]
@@ -748,21 +975,82 @@ mod worker_tests {
             0,
             Arc::new(AtomicBool::new(false)),
             tx,
+            false,
             |_hwnd, _chunk| DeleteChunkOutcome {
                 succeeded: vec![succeeded.clone()],
                 failed: vec![(failed.clone(), "simulated failure".to_string())],
                 shell_aborted: false,
                 retryable: false,
             },
+            |_paths, _cancel| Vec::new(),
             |removed, pdf_paths| {
                 crate::rename_key_migration::purge_removed_paths_at(temp.path(), removed, pdf_paths)
             },
+            |_succeeded, _pdf_paths| false,
         );
 
         let messages = rx.try_iter().collect::<Vec<_>>();
         assert_eq!(batch_counts(&messages[0]), (1, 1));
         assert_eq!(db.get(&succeeded_key), 0);
         assert_eq!(db.get(&failed_key), 4);
+    }
+
+    #[test]
+    fn final_purge_failure_is_persisted_for_idle_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::create_dir(&files).unwrap();
+        let removed = files.join("gone.jpg");
+        let (tx, rx) = mpsc::channel();
+        let mut purge_calls = 0usize;
+        let journal_data_dir = data_dir.clone();
+
+        run_worker_with_recycler(
+            vec![removed.clone()],
+            0,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            false,
+            |_hwnd, _chunk| DeleteChunkOutcome {
+                succeeded: vec![removed.clone()],
+                failed: Vec::new(),
+                shell_aborted: false,
+                retryable: false,
+            },
+            |_paths, _cancel| Vec::new(),
+            |_removed, _pdf_paths| {
+                purge_calls += 1;
+                crate::rename_key_migration::PurgeReport {
+                    rows: 0,
+                    db_open_count: 0,
+                    errors: vec!["simulated database lock".into()],
+                }
+            },
+            |removed, pdf_paths| {
+                crate::metadata_cleanup::journal_failed_delete_purge(
+                    &journal_data_dir,
+                    removed,
+                    pdf_paths,
+                )
+            },
+        );
+
+        assert_eq!(purge_calls, 4, "initial attempt plus three retries");
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            DeleteMsg::Batch {
+                purge_deferred: true,
+                ..
+            }
+        )));
+        assert!(
+            data_dir
+                .join(crate::metadata_cleanup::DELETE_PURGE_JOURNAL_FILE)
+                .exists()
+        );
     }
 }
 

@@ -46,6 +46,14 @@ impl PdfPasswordStore {
         Self { entries }
     }
 
+    /// delete worker 用。保存済みパスワードが 1 件でもある場合だけ、削除前の PDF
+    /// path 列挙が必要になる。ファイル不在・空・壊れた JSON は load_at と同じく空扱い。
+    pub(crate) fn has_entries_at(data_dir: &Path) -> bool {
+        !Self::load_at(&data_dir.join("pdf_passwords.json"))
+            .entries
+            .is_empty()
+    }
+
     /// ストアファイルに保存する。
     pub fn save(&self) {
         let path = Self::store_path();

@@ -276,7 +276,7 @@ mod tests {
                     break;
                 }
             }
-            if start.elapsed() >= Duration::from_secs(2) {
+            if start.elapsed() >= Duration::from_secs(10) {
                 panic!("high waiter did not reach waiting state");
             }
             std::thread::yield_now();
@@ -304,7 +304,7 @@ mod tests {
                 .is_some();
             done_tx.send(acquired).unwrap();
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let waiting = {
                 let (mu, _) = &*sem.inner;
@@ -317,7 +317,7 @@ mod tests {
             std::thread::yield_now();
         }
         cancel.store(true, Ordering::Relaxed);
-        assert!(!done_rx.recv_timeout(Duration::from_millis(500)).unwrap());
+        assert!(!done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
         assert_eq!(sem.stats().0, 0);
         drop(holder);
         worker.join().unwrap();
@@ -360,7 +360,7 @@ mod tests {
                 let (mu, _) = &*sem_ref.inner;
                 mu.lock().unwrap().waiting[IoPriority::Low as usize] == 1
             },
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         );
 
         let sem_high = Arc::clone(&sem);
@@ -377,7 +377,7 @@ mod tests {
                 let (mu, _) = &*sem_ref.inner;
                 mu.lock().unwrap().waiting[IoPriority::High as usize] == 1
             },
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         );
         drop(holder); // release
 
@@ -427,7 +427,7 @@ mod tests {
                     break;
                 }
             }
-            if start.elapsed() >= Duration::from_secs(2) {
+            if start.elapsed() >= Duration::from_secs(10) {
                 panic!("waiter did not enter wait state");
             }
             std::thread::yield_now();

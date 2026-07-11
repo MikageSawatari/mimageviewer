@@ -43,7 +43,14 @@ impl App {
             config.data_dir,
             "data_dir::set_test_override(Some(config.data_dir)) を先に呼ぶこと"
         );
-        let app = App::default();
+        let mut app = App::default();
+        // 起動時 purge-retry worker はテストハーネスでは既定オフにする。本番の既定は true
+        // (app.rs:9667) だが、テストで有効だと `App::update` を回す並列テストがこの worker を
+        // spawn し、プロセスグローバルの data_dir override 経由で別テストの rating.db 等を
+        // 触ってフレークする (undo_restores_zip_book_container_rating_key ほか、並列時のみ稀に
+        // 失敗)。purge-retry の journal 再試行そのものを検証するテストだけ明示的に true へ
+        // 戻して driver を回す契約にする (review-v2.3.0 追補19: テスト隔離)。
+        app.delete_purge_retry_needed = false;
         // `spawn_initial_name_index_supervisors` はテスト側で必要なときだけ呼ぶ契約
         app
     }
@@ -7968,6 +7975,94 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn grid_book_add_warns_for_each_unbaked_edit_kind() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        for edit_kind in ["conceal", "mask", "local_adjust", "comic"] {
+            let mut app = setup_app();
+            let src = app.tmp.path().join(format!("{edit_kind}.jpg"));
+            let root = app.tmp.path().join("books");
+            std::fs::write(&src, b"book warning source").expect("write source bytes");
+            app.settings.book_root = Some(root);
+            app.settings.active_book_name = "target".to_string();
+            app.items = vec![GridItem::Image(src)];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.selected = Some(0);
+            app.rebuild_visible_indices();
+            let key = app.page_path_key(0).expect("page path key");
+            match edit_kind {
+                "conceal" => {
+                    app.conceal_page_keys.insert(key);
+                }
+                "mask" => {
+                    app.mask_page_keys.insert(key);
+                }
+                "local_adjust" => {
+                    app.local_adjust_page_keys.insert(key);
+                }
+                "comic" => {
+                    app.comic_page_keys.insert(key);
+                }
+                _ => unreachable!(),
+            }
+
+            let ctx = egui::Context::default();
+            app.add_grid_selection_to_active_book(&ctx);
+            assert!(
+                app.book_append_warn_unbaked_edits,
+                "{edit_kind} の path key で警告 pending が立つ"
+            );
+            wait_for_book_op(&mut app, &ctx);
+            assert!(!app.book_append_warn_unbaked_edits);
+            assert!(
+                app.fs_feedback_toast.as_ref().is_some_and(|toast| toast
+                    .0
+                    .contains(crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING)),
+                "{edit_kind} の追加完了トーストに未焼き込み警告を含める"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_book_add_does_not_warn_for_adjustment_only_or_no_edit() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        for adjustment_only in [false, true] {
+            let mut app = setup_app();
+            let src = app.tmp.path().join(if adjustment_only {
+                "adjustment-only.jpg"
+            } else {
+                "no-edit.jpg"
+            });
+            let root = app.tmp.path().join("books");
+            std::fs::write(&src, b"book no-warning source").expect("write source bytes");
+            app.settings.book_root = Some(root);
+            app.settings.active_book_name = "target".to_string();
+            app.items = vec![GridItem::Image(src)];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.selected = Some(0);
+            app.rebuild_visible_indices();
+            if adjustment_only {
+                let key = app.page_path_key(0).expect("page path key");
+                app.adjusted_page_keys.insert(key);
+            }
+
+            let ctx = egui::Context::default();
+            app.add_grid_selection_to_active_book(&ctx);
+            assert!(
+                !app.book_append_warn_unbaked_edits,
+                "補正のみ・無編集では未焼き込み警告 pending を立てない"
+            );
+            wait_for_book_op(&mut app, &ctx);
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+                !toast
+                    .0
+                    .contains(crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING)
+            }));
+        }
+    }
+
+    #[test]
     fn grid_book_add_expands_stack_to_all_members() {
         // ファイル名スタックの集約セルを選んで本へ追加すると、メンバー全部がコピーされる
         // (Codex P2 修正: stack_member_paths による展開、設計 §5)。
@@ -8018,9 +8113,15 @@ mod favorite_adjustment_defaults_tests {
         app.stack_showing_flat = false;
         app.selected = Some(0);
         app.rebuild_visible_indices();
+        app.conceal_page_keys
+            .insert(crate::adjustment_db::normalize_path(&p1));
 
         let ctx = egui::Context::default();
         app.add_grid_selection_to_active_book(&ctx);
+        assert!(
+            app.book_append_warn_unbaked_edits,
+            "items に無い stack member も path key で警告対象にする"
+        );
         wait_for_book_op(&mut app, &ctx);
 
         let outputs = std::fs::read_dir(root.join("target"))
@@ -8031,6 +8132,12 @@ mod favorite_adjustment_defaults_tests {
             outputs.len(),
             2,
             "スタックの全メンバー (2 枚) が本へ追加される"
+        );
+        assert!(
+            app.fs_feedback_toast.as_ref().is_some_and(|toast| toast
+                .0
+                .contains(crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING)),
+            "複数ページ追加でも警告は完了トースト 1 本へ集約する"
         );
     }
 
@@ -12112,6 +12219,7 @@ mod favorite_adjustment_defaults_tests {
             succeeded: vec![target_path.clone()],
             failed: vec![],
             purged_pdf_password_paths: vec![],
+            purge_deferred: false,
         })
         .unwrap();
         tx.send(DeleteMsg::Done { canceled: false }).unwrap();
@@ -12124,6 +12232,7 @@ mod favorite_adjustment_defaults_tests {
             succeeded: vec![],
             failed: vec![],
             purged_pdf_password_paths: vec![],
+            purge_deferred: false,
         });
 
         // 実 ファイルも消しておかないと metadata() が古いまま (実機では worker が消す)。
@@ -30328,4 +30437,33 @@ mod pano_settle_size_tests {
         let out = downsample_color_image(&ci, 8);
         assert!(out.size[0] >= 1 && out.size[1] >= 1, "got {:?}", out.size);
     }
+}
+#[test]
+fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
+    // App::default() を直接呼ぶと、並列中の別 App test が設定した process-global
+    // data_dir override 上で同じ DB を開く。共有 lock + RAII cleanup を必ず通す。
+    let mut app = phase_c_support::setup_app();
+    let key = "c:/photos/gone.jpg".to_string();
+    app.rating_counts_cache = Some([0, 1, 0, 0, 0, 0]);
+    app.adjusted_page_keys.insert(key.clone());
+    app.local_adjust_page_keys.insert(key.clone());
+    app.mask_page_keys.insert(key.clone());
+    app.conceal_page_keys.insert(key.clone());
+    app.comic_page_keys.insert(key.clone());
+    app.rotation_page_keys.insert(key.clone());
+    app.tags_cache.insert(key.clone(), vec!["old".into()]);
+
+    app.apply_metadata_cleanup_result(&crate::metadata_cleanup::DeleteReport {
+        deleted_keys: vec![key.clone()],
+        ..Default::default()
+    });
+
+    assert!(app.rating_counts_cache.is_none());
+    assert!(!app.adjusted_page_keys.contains(&key));
+    assert!(!app.local_adjust_page_keys.contains(&key));
+    assert!(!app.mask_page_keys.contains(&key));
+    assert!(!app.conceal_page_keys.contains(&key));
+    assert!(!app.comic_page_keys.contains(&key));
+    assert!(!app.rotation_page_keys.contains(&key));
+    assert!(!app.tags_cache.contains_key(&key));
 }

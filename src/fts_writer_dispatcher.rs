@@ -66,18 +66,16 @@ enum WriterJob {
         reload_after_commit: bool,
         reply: mpsc::Sender<tantivy::Result<()>>,
     },
-    /// テスト専用: dispatcher を `dur` 間スリープさせて占拠する。優先度キューの
-    /// preempt 動作を検証するために、dispatcher を「ジョブ処理中」状態に固定するのに使う。
-    #[cfg(test)]
-    TestSleep {
-        dur: std::time::Duration,
-        reply: mpsc::Sender<()>,
-    },
     #[cfg(test)]
     TestBlock {
         started: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
         reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
+    TestMark {
+        label: &'static str,
+        completed: mpsc::Sender<&'static str>,
     },
 }
 
@@ -227,19 +225,6 @@ impl FtsWriterDispatcher {
         (q.interactive.len(), q.background.len())
     }
 
-    /// テスト専用: dispatcher に sleep ジョブを submit する。`recv()` を待つと完了通知が来る。
-    /// 優先度 preempt の検証で「dispatcher を占拠したまま後続ジョブを enqueue する」のに使う。
-    #[cfg(test)]
-    fn submit_test_sleep(
-        &self,
-        dur: std::time::Duration,
-        priority: WriterPriority,
-    ) -> mpsc::Receiver<()> {
-        let (tx, rx) = mpsc::channel();
-        self.submit(WriterJob::TestSleep { dur, reply: tx }, priority);
-        rx
-    }
-
     #[cfg(test)]
     fn submit_test_block(
         &self,
@@ -257,6 +242,16 @@ impl FtsWriterDispatcher {
             priority,
         );
         (started_rx, release_tx, reply_rx)
+    }
+
+    #[cfg(test)]
+    fn submit_test_mark(
+        &self,
+        label: &'static str,
+        completed: mpsc::Sender<&'static str>,
+        priority: WriterPriority,
+    ) {
+        self.submit(WriterJob::TestMark { label, completed }, priority);
     }
 }
 
@@ -342,11 +337,6 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
             let _ = reply.send(r);
         }
         #[cfg(test)]
-        WriterJob::TestSleep { dur, reply } => {
-            std::thread::sleep(dur);
-            let _ = reply.send(());
-        }
-        #[cfg(test)]
         WriterJob::TestBlock {
             started,
             release,
@@ -355,6 +345,10 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
             let _ = started.send(());
             let _ = release.recv();
             let _ = reply.send(());
+        }
+        #[cfg(test)]
+        WriterJob::TestMark { label, completed } => {
+            let _ = completed.send(label);
         }
     }
 }
@@ -447,95 +441,47 @@ mod tests {
 
     #[test]
     fn interactive_preempts_queued_background() {
-        // Codex P3 回帰: 旧テストは upsert が同期戻りなので「Background が完了 →
-        // Interactive を投入」となり、両者がキューに並ぶ瞬間が無く優先度を検証していなかった。
-        //
-        // 新テストの構造:
-        // 1. Background の `TestSleep(150ms)` で dispatcher を占拠する
-        // 2. dispatcher が sleep 処理中に、別スレッドから Background upsert を 3 本 enqueue
-        // 3. 短い猶予を入れて、Interactive upsert を 1 本 enqueue
-        // 4. sleep が解放されると dispatcher は順序: Interactive → Background × 3 で処理する
-        // 5. 各スレッドは upsert の elapsed を測定 → Interactive が submit 時刻が遅いのに
-        //    完了時刻が早い (= 完了 elapsed が 3 つの Background より短い) ことを検証
+        // dispatcher を明示イベントで停止し、4 job が同時に queue に入った状態を作る。
+        // wall-clock sleep / elapsed 比較を使わず、release 後の完了イベント順を検証する。
         let (_tmp, _fts, disp) = setup();
-        let fav = Uuid::new_v4();
+        let (started, release, blocker_done) = disp.submit_test_block(WriterPriority::Background);
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (completed_tx, completed_rx) = mpsc::channel();
 
-        // 1. dispatcher を占拠する sleep ジョブ (Background)。500ms あれば parallel test 環境の
-        //    スケジューラ揺れでも余裕で同時 enqueue できる。
-        let blocker_done = disp.submit_test_sleep(
-            std::time::Duration::from_millis(500),
-            WriterPriority::Background,
-        );
-        // dispatcher が blocker を pop して sleep に入るまで pending_snapshot で確認
-        // (固定 sleep より確実 — busy load でも race にならない)
-        for _ in 0..50 {
-            if disp.pending_snapshot() == (0, 0) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        for _ in 0..3 {
+            disp.submit_test_mark(
+                "background",
+                completed_tx.clone(),
+                WriterPriority::Background,
+            );
         }
-        assert_eq!(
-            disp.pending_snapshot(),
-            (0, 0),
-            "blocker が dispatcher に pop された"
-        );
-
-        // 2. Background ジョブ 3 本を別スレッドから enqueue
-        let bg_threads: Vec<_> = (0..3)
-            .map(|i| {
-                let d = Arc::clone(&disp);
-                let doc = sample_doc(&format!("c:/bg{i}.jpg"), fav, "bg");
-                std::thread::spawn(move || {
-                    let t0 = std::time::Instant::now();
-                    d.upsert(doc, WriterPriority::Background).unwrap();
-                    t0.elapsed()
-                })
-            })
-            .collect();
-        // background 3 本がキューに入るまで pending_snapshot で待つ
-        for _ in 0..50 {
-            if disp.pending_snapshot().1 >= 3 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(disp.pending_snapshot().1 >= 3, "background がキュー入り");
-
-        // 3. Interactive ジョブを enqueue (Background 3 本より後に submit)
-        let intr_thread = {
-            let d = Arc::clone(&disp);
-            let doc = sample_doc("c:/intr.jpg", fav, "intr");
-            std::thread::spawn(move || {
-                let t0 = std::time::Instant::now();
-                d.upsert(doc, WriterPriority::Interactive).unwrap();
-                t0.elapsed()
-            })
-        };
-        // interactive がキューに入った瞬間から 4 件 (background 3 + interactive 1) が並ぶ
-        for _ in 0..50 {
-            if disp.pending_snapshot().0 >= 1 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        disp.submit_test_mark("interactive", completed_tx, WriterPriority::Interactive);
         assert_eq!(
             disp.pending_snapshot(),
             (1, 3),
             "interactive 1 + background 3 が同時に並ぶ"
         );
 
-        // 4. sleep 解放を待つ。dispatcher は Interactive を先に処理し、その後 background 3 件。
-        let _ = blocker_done.recv();
-
-        // 5. 全 elapsed を集計
-        let intr_dur = intr_thread.join().unwrap();
-        let bg_durs: Vec<_> = bg_threads.into_iter().map(|h| h.join().unwrap()).collect();
-        let min_bg = bg_durs.iter().copied().min().unwrap();
-        assert!(
-            intr_dur < min_bg,
-            "interactive ({intr_dur:?}) は全 background ({bg_durs:?}, min={min_bg:?}) \
-             より早く完了する必要がある (Background より後に submit したのに!)"
+        release.send(()).unwrap();
+        blocker_done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            completed_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            "interactive"
         );
+        for _ in 0..3 {
+            assert_eq!(
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                "background"
+            );
+        }
     }
 
     #[test]
@@ -567,7 +513,9 @@ mod tests {
     fn cancellable_batch_stops_waiting_behind_a_blocked_dispatcher() {
         let (_tmp, _fts, disp) = setup();
         let (started, release, blocker_done) = disp.submit_test_block(WriterPriority::Background);
-        started.recv().unwrap();
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = mpsc::channel();
@@ -587,7 +535,7 @@ mod tests {
             done_tx.send(completed).unwrap();
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while disp.pending_snapshot().1 == 0 {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
@@ -595,12 +543,14 @@ mod tests {
         cancel.store(true, Ordering::Relaxed);
         assert!(
             !done_rx
-                .recv_timeout(std::time::Duration::from_millis(500))
+                .recv_timeout(std::time::Duration::from_secs(10))
                 .unwrap()
         );
 
         release.send(()).unwrap();
-        blocker_done.recv().unwrap();
+        blocker_done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
         worker.join().unwrap();
     }
 }

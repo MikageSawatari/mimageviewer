@@ -1,8 +1,13 @@
 ﻿# v2.3.0 出荷前 品質レビュー 統合レポート (確定版)
 
-## 現在のステータス (2026-07-11、追補第 10 弾反映)
+## 現在の出荷候補ステータス (2026-07-11、追補第 21 弾反映)
 
-- 対象: `master @ c3efcedc` + working tree (追補第 3〜9 弾)。
+- 対象: `master @ 30b42707` + working tree (追補第 15〜21 弾、未コミット)。
+- 追補とコミットの対応: 第1弾 = `bf1e2370`、第2弾 = `c3efcedc`、第3〜13b弾 =
+  `30b42707`。第14弾は full composite の実現可能性調査だけで実装コミットなし。
+  第15〜21弾は現在の working tree にあり、コミット / stage 前。
+- 第16弾の `src/metadata_cleanup.rs` / `src/ui_dialogs/metadata_cleanup.rs` は新規ファイルで
+  現在未追跡。モジュール宣言だけの欠落ではなく、次コミットで tracked 化する実装本体である。
 - R1 第2波で新規検出された P1-1 / P2-1 / P2-2 は追補第7弾で修正済み。
   P1-1 の同期 `Path::exists` は候補解決 worker へ移し、UI thread の EOF / 手動送りから
   metadata I/O を除去した。
@@ -15,11 +20,8 @@
 - 実機 FB の「`NumpadEnter` に KeyHold を割り当てると本体 Enter でも発動」は追補第10弾で
   修正した。Win32 extended bit の物理ラッチにより、Press / KeyHold / native / 割当キャプチャの
   全経路で本体 Enter とテンキー Enter を双方向に分離する。
-- 追補第10弾反映後の `cargo fmt` / `cargo fmt --check`、
-  `cargo test --bin mimageviewer-core` (3377 passed / 17 ignored)、
-  `build-release.ps1 -SkipVst3Bridge` は green。追補第8弾の50,000文書 benchも
-  全10クエリ +30%以内 (最大 +6.2%) で、追補第9弾は索引経路を変更していない。
-  現在の出荷判断は残る実機 smoke 結果で確定する。
+- 第15〜20弾の最終自動検証結果は各追補節を正とする。現在の出荷判断は残る実機 smoke
+  結果で確定する。
 
 以下の 2026-07-09 の件数・総評・優先順位は当時のレビュー記録であり、現在ステータスは
 本節と末尾「推奨アクション」を正とする。
@@ -752,15 +754,261 @@ Audio kind の保存値と検索フィルタ、Flat / DrilledInto の `GridItem:
   既存 VST3 host 本体と sha256 の削除は access denied warning だったが、SkipVst3Bridge の
   既存 bridge 埋め込みと今回の core / launcher 生成には影響しなかった。
 
+### 追補 第 14 弾 (2026-07-11): 本棚追加時 full composite の実現可能性調査
+
+実装: Codex Sol / 検収予定: Fable。
+
+- **判定はケース C**。隠蔽 / 補正レイヤー / テキスト / 補正 / 回転は path キーの DB データと
+  CPU 合成部品から headless 再構成できる。一方、消しゴムは `mask.db` に bitmap + shapes だけを
+  保存し、MI-GAN / diffusion の確定画素はメモリ上の `erase_result_cache` にしか保持しない。
+- Ctrl+E の最終合成は任意 path 用の純粋 API ではなく、表示 item の `idx`、`fs_cache`、各 edit
+  result cache、`final_composite_cache`、`egui::Context` に接続されている。消しゴム結果が無い場合は
+  `ensure_erase_result_texture` が保存マスクから MI-GAN を非同期再投入し、完了まで export を保留する。
+- 任意 path の製本 worker で同じことを行うには AI runtime / model を新経路から利用する必要がある。
+  モデル不在・ロード失敗では diffusion fallback になるため、編集確定時にユーザーが確認した画素と
+  同一になる保証がない。よってマスクの存在だけで焼き込み対象にしても「フル最終 composite」の
+  確定仕様を満たさない。
+- 指示されたケース C の停止条件に従い、`BookPageSource`、`write_source`、焼き判定、UI、マニュアルは
+  変更していない。選択肢は (1) 検証キー付き消しゴム確定 artifact の永続化、(2) 製本時の MI-GAN
+  再推論と非同一可能性の仕様許容、(3) 消しゴムだけ表示後追加を要求する hybrid。詳細は
+  `docs/compile-book-plan.md` の第 14 弾調査節を正本とする。
+- 調査のみのため `cargo fmt`、テスト、release build は未実施（コード変更なし）。
+
+### 追補 第 15 弾 (2026-07-11): 削除確認 Y/N と本棚未焼き込み編集の警告
+
+実機 FB / 仕様裁定: ユーザー、実装: Codex Sol、検収予定: Fable。
+
+- **削除確認の固定入力**: `show_delete_confirm_dialog` は Y = 削除、N / Esc = キャンセル、
+  Enter = 無効とした。`dialog_escape_pressed(ctx)` と `ime_input_active()` は Window closure 前に
+  capture し、IME 変換中は Y / N / Esc の確認 action を発火しない。Y / N / Esc の egui key event は
+  ダイアログ描画時に consume するため、N / Esc で同 frame にダイアログが閉じても後段の
+  `consume_key` / keymap dispatch へ漏れない。Delete action は既存ボタンと同じ reducer で path を
+  take し、フラグ / targets / label を clear して `start_delete_files` へ渡す。
+- **ビューポート確認**: この確認ダイアログを開くのはメイングリッドの Delete / context menu 経路だけで、
+  `show_delete_confirm_dialog` も main viewport だけで描画される。現行 FS context menu は同ダイアログを
+  開く削除項目を持たないため、fullscreen viewport 用の Y / N 配線追加は不要だった。
+- **横展開候補 (今回は未変更)**: サムネイルキャッシュ全削除、アーカイブキャッシュ全削除、
+  本マネージャの本削除、お気に入り削除、TensorRT パック削除、編集用追加ファイル削除の各確認は、
+  confirm ボタンがマウス中心で Y / N 固定操作を持たない。cache 2 種は Esc キャンセル済み。
+  destructive confirmation 全体の統一はユーザー裁定待ちとし、今回の対象を広げていない。
+- **本棚警告トースト**: Grid / fullscreen / stack member の通常ページ追加前に、既存の path-key
+  presence set で conceal / mask / local_adjust / comic の 4 種だけを exact 判定する。adjustment / rotation
+  は対象外。複数ページに複数編集があっても単一 book worker の pending flagへ OR 集約し、Append 成功時の
+  完了トースト 1 本へ「本棚のファイルには反映されない」警告を連結する。失敗時、動画フレーム、
+  クリップボード追加では出さない。フル composite 焼き込み自体は backlog §1.14 の v2.4.0 対応のまま。
+- **ドキュメント / smoke**: keymap 固定入力理由、spec、compile-book-plan、削除 / 製本マニュアルを更新し、
+  `full-verification-checklist.md` に「Y / N / Esc / Enter / 背面漏れ」と本棚警告の実機 smoke を追加した。
+  `tests/ui_snapshot.rs` には削除確認ダイアログの snapshot は無く、ボタン文言・配置も変更していないため
+  snapshot 更新は不要。
+
+#### 回帰 coverage と自動検証
+
+- Y / N / Esc / Enter の action、IME 中の Y / N 無視、Delete worker 直前の path take / cancel state、
+  Y / N / Esc consume 後に背面 KeyAction が発火しないこと。
+- conceal / mask / local_adjust / comic 各 path key の warning pending と完了トースト、
+  adjustment only / no edit の非発火、items に現れない stack member の path-key 判定と複数追加の 1 回集約。
+- `cargo fmt` / `cargo fmt --check`: exit 0。
+- `python scripts/check_ui_glyphs.py`: exit 0、dangerous glyph 0。
+- focused tests: exit 0 (delete confirm 13 件 + book warning 3 件)。
+- `cargo test --bin mimageviewer-core`: exit 0、3402 passed / 17 ignored / 0 failed。
+- `cargo test --test ui_snapshot`: exit 0、15 passed / 0 failed (削除確認 snapshot は対象外、既存 snapshot 差分なし)。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher release build 成功。
+  既存 VST3 host 本体と sha256 の削除は access denied warning だったが、SkipVst3Bridge の既存 bridge
+  埋め込みと今回の core / launcher 生成には影響しなかった。
+
+## 追補第16弾: 孤児メタデータ整理 (全ストア横断、明示トリガー)
+
+- **入口**: 設定 → サムネイルキャッシュ管理 →「メタデータを整理…」。自動実行はしない。
+- **worker**: `metadata-cleanup-scan` が正本 `rename_key_migration::STORES` の全行と実体を確認し、
+  ストア別件数を返す。「整理する」確認後だけ `metadata-cleanup-delete` が DELETE する。
+  scan/delete とも cancel + atomic 進捗を持ち、delete は descriptor 単位 transaction。削除直前にも
+  実体と親を再判定する。
+- **オフライン保護**: 物理実体が `try_exists() == Ok(false)` で、直上親が実在 directory の場合だけ
+  orphan。親ごと見えない切断ドライブ / NAS / 権限エラーは保護して残す。製本用本棚配下も除外。
+- **in-memory**: 完了結果の exact key で rating/tag/folder-pin cache と編集 presence set を更新し、
+  `rating_counts_cache` / folder rating count を無効化。表示中の tag/rating 一覧は worker で再構築する。
+
+| ストア | 判断 |
+| --- | --- |
+| rating / adjustment(page) / mask / conceal / local-adjust / comic / export-crop / tags(item×2) / rotation / view-trim(page) / video pins / video bookmarks | keep-drive path または `container::entry` の物理 container を判定して整理対象 |
+| adjustment.sidecar-sync / tags.sidecar-sync | `folder_key` のフォルダ実体で判定 |
+| folder thumbnail pins | 通常 folder/file はその実体、ZIP 内本の合成 key は最初の archive component を物理 container として判定 |
+| book-resume / spread / view-trim(book) | drive-stripped key からオンラインの正しい drive を一意に逆引きできないため対象外 |
+| PDF passwords | SHA-256 key だけで元 PDF path を逆引きできないため対象外 |
+| reading-history | missing でも「以前読んだ記録」というユーザー価値と既存 spec の非破壊方針を優先して残す |
+| 製本用本棚配下 | 通常削除フローと別管理のため全ストアで対象外 |
+
+自動 coverage は、親あり missing / 親ごと missing / 実在 path、ストア別集計、folder/hash/drive-stripped/
+本棚判断、delete、途中 cancel rollback、整理後の rating count / presence set 無効化を追加した。
+
+検証結果:
+
+- `cargo fmt` / `cargo fmt --check`: exit 0。
+- `python scripts/check_ui_glyphs.py`: exit 0、dangerous glyph 0。
+- focused metadata cleanup tests: 7 passed / 0 failed。
+- `cargo test --bin mimageviewer-core`: exit 0、3409 passed / 17 ignored / 0 failed。
+  初回並列実行では既存の ZIP 本 rating undo test が 1 回だけ揺れたが、単独再実行と全体再実行は成功。
+- `cargo test --test ui_snapshot`: exit 0、15 passed / 0 failed。既存 snapshot に新ダイアログは
+  含まれず、既存画像差分なしのため PNG 更新なし。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher release build 成功。
+  既存 VST3 host と sha256 の削除は access denied warning だが、既存 bridge 埋め込みと生成物には影響なし。
+
+## 追補第17弾: 削除 purge 失敗の永続再試行 + フレーキーテスト堅牢化
+
+- **失敗の所有境界**: `delete_worker` は Shell 成功 path の hard purge を初回 + 3 回試し、
+  なお `PurgeReport.errors` が残る場合だけ `delete_purge_journal.json` へ path 単位で永続化する。
+  フォルダ削除時の PDF password 用に、削除前に列挙した配下 PDF path も entry に保持する。
+- **孤児整理との関係**: journal は全ストア scan を自動実行せず、削除成功済み path だけを
+  `delete-purge-retry` worker でピンポイント処理する。ストア正本と DELETE は第13/16弾と同じ
+  `rename_key_migration::STORES` / `purge_removed_paths_at` を再利用し、再試行前には第16弾と同じ
+  「親へ到達可能 + path 不在」を確認する。同名 path が再作成済み、または親ごと見えない場合は
+  新メタの誤削除を避けて entry を残す。起動時、1秒入力 idle 後、失敗時は10秒 backoff後に再実行し、
+  成功 entry だけ journal から atomic に消し込む。
+- **sidecar**: `SidecarFile::flush()` を成否 bool にし、削除 root をメモリ上で除いても flush が失敗した
+  場合は purge rows に加算せず error とする。この error も DB lock と同じ journal 再試行対象になる。
+- **フレーク特定**: `fts_writer_dispatcher::interactive_preempts_queued_background` は500ms sleep中に
+  4 jobを投入し、submit側スレッドの elapsedを比較していた。dispatcherが正しい順で処理しても
+  parallel負荷で完了側スレッドの再スケジュール順が逆転し得るため、test-only `TestBlock` / `TestMark`
+  で queue `(interactive=1, background=3)` を確定後に解放し、dispatcher自身の処理イベント順を
+  検証する決定的テストへ置換した。製品 job / dispatcher 動作は変更していない。
+- **負荷時マージン**: `io_semaphore` / dispatcher cancel / `indexer_manager` の待機 deadline は、
+  条件待ち・cancel pollingという意味論を維持したまま、フル並列CPU競合用に10〜20秒へ拡大した。
+
+自動 coverage:
+
+- purge 最終失敗を注入 → 初回 + 3 retry → journal 作成。
+- journal entry + 孤児 rating → retryでDB行削除 → journal消し込み。
+- sidecar flush失敗 → rowsへ非加算 + error。
+- dispatcher queueのInteractive先行をsleep / elapsedなしでイベント順検証。
+
+検証結果:
+
+- `cargo fmt` / `cargo fmt --check`: exit 0。
+- focused purge / sidecar / dispatcher / cancellable tests: exit 0。
+- `io_semaphore` / `fts_writer_dispatcher` / `indexer_manager`: 20反復ずつ、計60 cargo test runが
+  すべて exit 0。`cargo test --lib` フル並列も5反復すべて exit 0。
+- `cargo test --bin mimageviewer-core`: exit 0、3412 passed / 17 ignored / 0 failed。
+- `.\\scripts\\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher release build成功。
+  既存VST3 host本体とsha256の削除は従来同様 access denied warningだが、既存bridge埋め込みと
+  今回の core / launcher生成には影響なし。
+
+## 追補第18弾: 削除確認ラベル + 重要な変更点 + 更新履歴
+
+- **削除確認ラベル**: 固定入力を画面上でも明示するため、ボタンを「削除[Y]」と
+  「キャンセル[N]」へ変更した。Y / N / Esc の割り当て、Enter 無効、IME 中の抑止、
+  背面 KeyAction への漏出防止は第15弾のまま変更していない。
+- **更新後の重要な変更点**: v2.3.0 の `must_read` に、ファイル削除時はレーティング・タグ・
+  補正・回転なども消え、ごみ箱から戻しても復元されないことを追加した。過去の削除で残った
+  データの整理経路と、取り外し中の外付け / 接続不能ネットワークドライブを対象外にする保護も
+  同じ画面で案内する。
+- **更新履歴**: README.md と `release-note-drafts.md` に、削除時のデータ消去と
+  「設定 → サムネイルキャッシュ管理 → メタデータを整理…」の整理機能を追記した。
+- **実文言 / snapshot**: 起動点は `cache_manager.rs` の「サムネイルキャッシュ管理」内にある
+  「メタデータを整理…」で一致した。削除確認ダイアログは既存 snapshot に収載されておらず、
+  `version_highlights` の snapshot も固定 fixture のため PNG 更新は不要。
+
+### 第18弾 実機 smoke
+
+- [ ] 削除確認ボタンが「削除[Y]」/「キャンセル[N]」と表示される。
+- [ ] 更新後初回起動で、削除するとレーティング・タグ・補正なども消える重要なお知らせが出る。
+
+### 第18弾 自動検証
+
+- `cargo fmt`: exit 0。
+- `cargo test --bin mimageviewer-core`: exit 0、3412 passed / 17 ignored / 0 failed。
+  途中、既知の `undo_restores_zip_book_container_rating_key` が 1 回だけ揺れたが、単独再実行と
+  bin 全体再実行は成功した。
+- `cargo test --lib version_highlights::`: exit 0、15 passed / 0 failed。
+- `python scripts/check_ui_glyphs.py`: exit 0、dangerous glyph 0。
+- `cargo test --test ui_snapshot`: exit 0、15 passed / 0 failed。既存 PNG 差分なし。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher release build 成功。
+  既存 VST3 host 本体と sha256 の削除は access denied warning だったが、既存 bridge 埋め込みと
+  今回の core / launcher 生成には影響しなかった。
+
+## 追補第19弾: App テストの削除 purge-retry 隔離
+
+- **Fable 適用分を保持**: `App::new_for_test` は本番既定 `true` の
+  `delete_purge_retry_needed` をテスト harness だけ `false` に戻す。`App::update` を回す
+  並列テストが process-global `data_dir` override 越しに別テストの DB を purge しない契約を維持した。
+- **journal coverage**: retry の意味論は App update に依存せず、
+  `metadata_cleanup::tests::delete_purge_journal_retries_confirmed_orphan_and_clears_itself` が
+  「journal enqueue は DB 非変更 → 到達可能な orphan を再 purge → 成功 entry 消し込み」を直接検証する。
+- **反復中に見つけた追加隔離漏れ**: 初回確認 run で
+  `undo_restores_zip_book_container_rating_key` が `rating_db == None` となり再発した。原因は第16弾の
+  `metadata_cleanup_result_invalidates_counts_and_presence_sets` だけが `setup_app()` を通らず
+  `App::default()` を直接生成し、別 App test の process-global `data_dir` override 上で同じ
+  `rating.db` schema open と競合していたこと。製品コードや Fable 適用行は変えず、このテストも
+  共有 lock + RAII cleanup 付き `phase_c_support::setup_app()` に統一した。
+- **反復結果**: 修正後の `cargo test --bin mimageviewer-core` 既定並列を20回反復し、
+  全 run が 3415 passed / 17 ignored / 0 failed (合計 68,300 passed)。undo 系と
+  `fts_writer_dispatcher::interactive_preempts_queued_background` は全 run に含まれ、再発なし。
+
+## 追補第20弾: 削除時メタ purge の末尾1回化
+
+- **purge 所有境界**: `delete_worker` は最大100件の Shell recycle chunk ごとに
+  `DeleteMsg::Batch` を送り、進捗を従来どおり更新する。同時に Shell 成功 path と削除前 PDF candidate
+  を worker 内へ蓄積し、全チャンク終了後に `purge_removed_paths_at` を成功 path 全体へ1回だけ呼ぶ。
+  1400件なら SQLite store open は従来の約14 × 16回から約16回へ減る。
+- **cancel / UI 整合**: chunk 境界の cancel では、すでに recycle 成功した path だけを末尾 purge する。
+  `Done` は purge と、最終失敗時の journal 永続化が終わってから送るため、UI の items 除去と
+  rating/tag/rotation 等の in-memory clear は永続 purge より後になる。進捗先行は維持するが、
+  purge 完了前に UI state を消す protocol 変更は行わなかった。
+- **PDF 走査スキップ**: worker 起動時に `pdf_passwords.json` を1回だけ読み、保存 entry が0件
+  (空 / 不在 / 壊れた JSON) なら `collect_pdf_paths_for_delete` 自体を呼ばず、フォルダの
+  `read_dir` 再帰を丸ごと省く。entry がある場合だけ従来どおり削除前に列挙する。
+- **journal / perf**: 初回 + 最大3 retry と `delete_purge_journal.json` の意味は維持した。
+  `perf::event("delete", "metadata_purge", ..., "worker_tail")` に purge ms、論理 attempt、
+  SQLite DB open attempt、成功 path、PDF path、削除 row、最終 error 数を記録する。
+- **回帰 coverage**: 201 path / 3 chunk でも purge closure 1回、1 chunk成功後 cancel は
+  成功済み100件だけ purge、空 PDF password store は collector 0回、Shell失敗 pathは非 purge、
+  purge最終失敗はjournal化、を `delete_worker::worker_tests` で固定した。
+- **自動検証**: `cargo fmt` / `cargo fmt --check` exit 0。focused delete worker は
+  10 passed / 0 failed、journal / dispatcher / ZIP本 rating undo の各 focused test は green。
+  full bin と20回反復の結果は追補第19弾のとおり。
+- **release build**: `.\scripts\build-release.ps1 -SkipVst3Bridge` exit 0。core / launcher の
+  release build 成功。既存 VST3 host 本体と sha256 の削除は access denied warning だったが、
+  `-SkipVst3Bridge` の既存 bridge 埋め込みと今回の生成物には影響しない。
+
+## 追補第21弾: 削除 purge の index-fast 化
+
+- **根因 / 修正境界**: 共通 `purge_store` は削除キーごとに exact + folder prefix +
+  container prefixをOR接続し、列への `substr` 適用で全表scanになっていた。exactを最大500件の
+  `DELETE ... IN (...)` batchへ分離し、2種prefixは
+  `col >= prefix AND col < next(prefix)` のrange DELETEへ変更した。1ストア1transaction、
+  初回+最大3 retry、journal、`Done`後送の順序は維持した。孤児整理はexact DELETEのみで
+  同型の関数条件を持たないため変更していない。
+- **upper / COLLATE**: `prefix_upper_bound` は最後のUnicode scalarを1つ進めた排他的上限を作る。
+  hard purgeのprefixは `/` / `:` 終端なので通常は `key/` → `key0`、
+  `key::` → `key:;` となる。次scalarが作れないsurrogate境界 / `char::MAX` は旧
+  `substr` へ安全にfallbackする。全 `STORES` の対象列は宣言上既定BINARYで、PRIMARY KEY、
+  `item_tags(item_key, tag_key)` の左端、または `idx_video_bookmarks_path` の索引を持つ。
+  範囲境界は従来と同じkeep-drive / drive-strippedの小文字化・slash統一キーから構築する。
+- **正しさ / planner coverage**: 旧substr版とrange版へexact file、folder配下、
+  container配下、隣接prefix、`%` / `_` / 日本語を投入し、削除row数と残存集合の一致を固定した。
+  `EXPLAIN QUERY PLAN` はIN / rangeとも `SEARCH`、`SCAN`なしを確認した。
+- **perf**: debug unit testの27,000行PRIMARY KEY table + 1,000削除キーで、exact 2 batch +
+  空のprefix range 2,000本を含むpurge本体は **6.9 ms**。5秒上限の回帰テストを追加した。
+- **focused検証**: `cargo fmt` exit 0。
+  `cargo test --bin mimageviewer-core rename_key_migration::tests:: -- --nocapture` は
+  15 passed / 0 failed、exit 0。
+- **全体検証 / build**: `cargo fmt --check` / `git diff --check` はexit 0。
+  `cargo test --bin mimageviewer-core` は3419 passed / 17 ignored / 0 failed、exit 0。
+  `.\scripts\build-release.ps1 -SkipVst3Bridge` はexit 0でcore / launcher release build成功。
+  既存VST3 host本体とsha256の削除は従来同様access denied warningだったが、
+  `-SkipVst3Bridge` の既存bridge埋め込みと今回の生成物には影響しない。
+
 ## 推奨アクション (現在、優先順)
 
-1. **実機 smoke**: 追補第13弾・改の「mIV削除で★件数が即減り、補正/タグ/回転も消える /
+1. **ユーザー裁定**: 第14弾の消しゴム確定画素を artifact 永続化 / 製本時に再推論 / hybrid の
+   どれで扱うかを確定する。裁定までは full composite 焼き込みを実装しない。
+2. **実機 smoke**: 追補第13弾・改の「mIV削除で★件数が即減り、補正/タグ/回転も消える /
    同 path へごみ箱復元後もメタは戻らない / 外付け切断中のタグ検索はDB非破壊」、
+   追補第17弾の「削除中DB lockでpurge失敗 → lock解除・再起動でjournal再試行し旧メタ消去」、
    追補第12弾の数千ファイル削除直後の終了、追補第10弾の本体 /
    テンキー Enter 双方向分離、checklist の P2-11 継続項目、
    NAS/切断ドライブ相当の EOF/次送り (連打でも resolver thread 最大 1、ParkedLive 中の
    main 入力後も EOF 再試行)、
    音声タグ結果、タグビューの種類 = 音声、MP3 の Ctrl+G ファイル名 hit → 音楽ビュー再生、
    種類ファセットの音声絞り込みを確認する。
-2. **将来の detached リワーク**: bundle × App-global runtime のさらなる所有境界一本化は、
+3. **将来の detached リワーク**: bundle × App-global runtime のさらなる所有境界一本化は、
    凍結中の構造課題として既存リワーク計画へ引き継ぐ。

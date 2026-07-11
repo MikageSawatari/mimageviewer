@@ -90,6 +90,7 @@ pub mod known_folders;
 pub mod local_adjust_db;
 pub mod logger;
 pub mod mask_db;
+pub mod metadata_cleanup;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
 pub mod native_context_menu;

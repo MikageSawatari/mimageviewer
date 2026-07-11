@@ -10,7 +10,7 @@
 > 並べ替え・カスタマイズは、ツールバー全体の統一モデル
 > [toolbar-customization-plan.md](toolbar-customization-plan.md) に集約 (この refactor が先行)。
 
-> **追補 (2026-07-11, 設計確定・v2.3.0 スコープ・未実装): 本棚追加時のフル composite 焼き込み**
+> **追補 (2026-07-11, 設計確定・実現可能性調査済み・ケース C 裁定待ち): 本棚追加時のフル composite 焼き込み**
 > ユーザー実機 FB: 隠蔽加工した画像を本棚に右クリック追加すると加工が消える (= SNS 直アップ
 > 用途で戸惑う)。原因は現状の焼き込みが `AdjustedFile` = **補正 + 非破壊回転のみ**で、
 > 隠蔽 / 消しゴム / 補正レイヤー / テキストを含まないため (`src/books.rs::write_source` /
@@ -35,6 +35,49 @@
 > - 実装規模見積り = 中 (2〜4 日)。エンジン部品は全て既存、本棚書き出しへの full-composite
 >   再配線 + BookPageSource 追加 + 判定拡張が主。**要リリース前レビュー + 実機確認**
 >   (追加経路の新規性ゆえ)。
+
+> **v2.3.0 の対応は警告トーストのみ**: 隠蔽 / 消しゴム / 補正レイヤー / テキストの path key が
+> あるページを追加した場合、これらが本棚の画像ファイルへ反映されないことを追加完了時に 1 回通知する。
+> フル composite 焼き込みは [next-release-backlog.md §1.14](next-release-backlog.md#114-本棚追加時のフル-composite-焼き込み-消しゴム再推論--v240-送り) の v2.4.0 対応とする。
+
+### 実現可能性調査 (2026-07-11、第 14 弾)
+
+**判定: ケース C。消しゴムだけは保存済みの最終画素を headless に再現できないため、実装を停止して
+ユーザー裁定を待つ。** Ctrl+E の `comic_composited_pixels_for_export` /
+`ensure_final_composite_pixels` は任意 path を受ける純粋な書き出し API ではなく、`idx`、`fs_cache`、
+`erase_result_cache`、`local_adjust_cache`、`final_composite_cache` と `egui::Context` を使う
+表示パイプラインである。非表示 item の CPU 先読みは一部あるが、任意 path / stack member を DB から
+同期的に復元する汎用 headless compositor にはなっていない。
+
+| レイヤー | path キーの永続データ | headless 再構成 | 調査結果 |
+| --- | --- | --- | --- |
+| 補正 | `adjustment.db` の `AdjustParams` | 可能 | 通常の色補正は `apply_adjustments_fast`、最終シャープ / post-filter も CPU 部品がある。AI 補正を含む場合はモデル / runtime の worker 配線が別途必要 |
+| 回転 | `rotation.db` | 可能 | `get_key` は Image / ZIP / PDF の正規化ページキーを扱える |
+| 隠蔽 | `conceal.db` の bitmap + shapes、処理値は settings | 可能 | `get_full` → `rasterize_shapes_into` → `conceal_compose::compose_with_preset` が CPU で完結する。ジョブ投入時に現 settings を snapshot する必要がある |
+| 消しゴム | `mask.db` の bitmap + shapes のみ | **再推論なしでは不可** | MI-GAN / diffusion の確定画素は `erase_result_cache` のメモリキャッシュだけで、DB やファイルへ永続化されない。未キャッシュ時の `ensure_erase_result_texture` / `auto_apply_saved_mask` は保存マスクから AI 推論を再投入する |
+| 補正レイヤー | `local_adjust.db` のレイヤー JSON | 可能 | `local_adjust_core::apply_layers_with_progress` は CPU worker で実行できる |
+| テキスト注釈 | `comic.db` の object JSON | 可能（参照資産が存在すること） | `comic_core` の bake + src-over 合成は CPU で実行できる。フォント registry、絵文字 / stamp（外部 `File` または埋め込みデータ）を worker snapshot に解決する必要がある |
+
+消しゴムを任意 path で再実行すること自体は可能だが、AI runtime / MI-GAN モデルを製本 worker から
+利用する重い経路が必要になる。モデル不在・ロード失敗時は diffusion fallback になるため、追加時の
+環境が編集確定時と違うと「ユーザーが確認した確定画素」と同一になる保証もない。このため、単に
+マスクの存在を焼き判定へ足すだけでは確定仕様の「フル最終 composite」を満たさない。
+
+裁定候補:
+
+1. 消しゴム確定結果を、元画像 / マスク / 推論実装・モデルを識別する検証キー付き artifact として
+   永続化し、製本 headless compositor はそれを読む。表示確認済み画素を最も確実に再現できるが、
+   保存容量・失効・既存マスクの初回生成方針を追加設計する必要がある。
+2. 製本 worker で保存マスクから MI-GAN を再推論する。追加 storage は不要だが重く、AI runtime / model
+   可用性と fallback 差により確定時と完全一致しない可能性を仕様として許容する必要がある。
+3. 隠蔽 / 補正レイヤー / テキスト等だけ headless 焼き込みし、消しゴム付きページは表示後追加を要求
+   する hybrid。無言で編集が消える問題は防げるが、「任意ページを一括でフル composite」の確定仕様を
+   分割するため、明示承認なしには実装しない。
+
+ケース C の指示に従い、この調査では `BookPageSource` / `write_source` / UI / マニュアルを変更して
+いない。実装を再開する場合は、選択した消しゴム方針を先に本節へ確定し、リリース前レビューと
+「隠蔽加工を追加して本ファイルへ焼き込み」「無編集画像は byte copy で AI メタ保持」の実機 smoke を
+必須にする。
 
 ## 実装メモ (v1.7.0)
 

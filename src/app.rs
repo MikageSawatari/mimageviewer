@@ -6658,6 +6658,9 @@ pub struct App {
     pub(crate) capture_region_selection: Option<crate::ui_fullscreen::CaptureRegionSelection>,
     /// 製本のページ追加 / 作成 / 改名 / 削除 / 一覧更新 worker 完了待ち。
     pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
+    /// 進行中の Append 元に、ファイルへ未焼き込みの編集が含まれるか。
+    /// Append 成功後の警告トーストを 1 回に集約するため、単一 book worker と同じ寿命で保持する。
+    pub(crate) book_append_warn_unbaked_edits: bool,
     pub(crate) show_book_manager: bool,
     pub(crate) book_manager_new_name: String,
     pub(crate) book_manager_rename_name: String,
@@ -6707,6 +6710,11 @@ pub struct App {
 
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     pub(crate) show_cache_manager: bool,
+    /// 全 path-keyed メタストアを明示スキャンして孤児行を整理するダイアログ。
+    pub(crate) show_metadata_cleanup: bool,
+    pub(crate) metadata_cleanup_pending: Option<crate::metadata_cleanup::CleanupPending>,
+    pub(crate) metadata_cleanup_scan: Option<crate::metadata_cleanup::ScanReport>,
+    pub(crate) metadata_cleanup_result: Option<crate::metadata_cleanup::DeleteReport>,
     /// キャッシュ管理の「◯日以上古い」入力値
     pub(crate) cache_manager_days: u32,
     /// 開いたときに取得するキャッシュ統計: (フォルダ数, 合計バイト)
@@ -6949,6 +6957,12 @@ pub struct App {
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
     pub(crate) delete_pending: Option<crate::delete_worker::DeletePending>,
+    /// 削除成功後に busy 等で残ったメタ行を永続 journal から再 purge する worker。
+    pub(crate) delete_purge_retry_pending: Option<crate::metadata_cleanup::DeletePurgeRetryPending>,
+    /// 起動時または新しい journal 追記後に retry worker を開始すべきか。
+    pub(crate) delete_purge_retry_needed: bool,
+    /// 失敗が残ったときの session 内 idle 再試行時刻。
+    pub(crate) delete_purge_retry_after: Option<std::time::Instant>,
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -9534,6 +9548,7 @@ impl App {
             capture_pending: None,
             capture_region_selection: None,
             book_op_pending: None,
+            book_append_warn_unbaked_edits: false,
             show_book_manager: false,
             book_manager_new_name: String::new(),
             book_manager_rename_name: String::new(),
@@ -9560,6 +9575,10 @@ impl App {
             video_thumb_overrides: std::collections::HashMap::new(),
             show_rotation_reset_confirm: false,
             show_cache_manager: false,
+            show_metadata_cleanup: false,
+            metadata_cleanup_pending: None,
+            metadata_cleanup_scan: None,
+            metadata_cleanup_result: None,
             cache_manager_days: 90,
             cache_manager_stats: None,
             cache_manager_tile_bytes: None,
@@ -9644,6 +9663,9 @@ impl App {
             tag_legacy_seed_pending: None,
             tag_legacy_xmp_pending: None,
             delete_pending: None,
+            delete_purge_retry_pending: None,
+            delete_purge_retry_needed: true,
+            delete_purge_retry_after: None,
             search_filter: None,
             search_filter_origin_folder: None,
             visible_indices: Vec::new(),
@@ -11138,6 +11160,8 @@ impl App {
             || self.show_context_shortcuts_help
             || self.show_toolbar_reset_confirm
             || self.show_cache_manager
+            || self.show_metadata_cleanup
+            || self.metadata_cleanup_pending.is_some()
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
             || self.show_pdf_password_dialog
@@ -11183,6 +11207,8 @@ impl App {
             || self.show_context_shortcuts_help
             || self.show_toolbar_reset_confirm
             || self.show_cache_manager
+            || self.show_metadata_cleanup
+            || self.metadata_cleanup_pending.is_some()
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
             || self.show_pdf_password_dialog
@@ -15563,7 +15589,7 @@ impl App {
         self.install_rating_view_rows();
     }
 
-    fn reload_current_rating_view_preserving_sort(&mut self) {
+    pub(crate) fn reload_current_rating_view_preserving_sort(&mut self) {
         let stars = self.rating_view_stars.clamp(1, 5);
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
@@ -15579,6 +15605,16 @@ impl App {
             crate::rating_db::RatingDb::db_path(),
             stars,
         ));
+    }
+
+    pub(crate) fn reload_open_metadata_views_after_cleanup(&mut self) {
+        if self.items_are_rating_view {
+            self.reload_current_rating_view_preserving_sort();
+        }
+        if self.tag_view.on_results_grid() {
+            self.tag_view.last_executed.clear();
+            self.execute_tag_view();
+        }
     }
 
     fn install_rating_view_rows(&mut self) {
@@ -20636,7 +20672,7 @@ impl App {
     /// 旧 path のサイドカーが書き直される (Sol rename-mig R2 P2)。
     /// ★の書込 worker (ファイル XMP / 動画サイドカー) も同様に待つ (DB は書かず、
     /// sidecar 書込は worker 内で完結するので is_busy で足りる)。
-    fn rename_migration_writers_busy(&self) -> bool {
+    pub(crate) fn rename_migration_writers_busy(&self) -> bool {
         let tag_busy = self
             .tag_write_handle
             .as_ref()
@@ -20651,11 +20687,17 @@ impl App {
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
     /// 書込 worker が busy の間は開始せず、`poll_rename_migration_pending` が毎フレーム
     /// 再試行する。
-    fn try_start_next_rename_migration(&mut self) {
+    pub(crate) fn try_start_next_rename_migration(&mut self) {
         if self.rename_migration_in_flight.is_some() || self.rename_migration_queue.is_empty() {
             return;
         }
         if self.rename_migration_writers_busy() {
+            return;
+        }
+        if self.metadata_cleanup_pending.is_some() {
+            return;
+        }
+        if self.delete_purge_retry_pending.is_some() {
             return;
         }
         let Some((old_path, new_path)) = self.rename_migration_queue.pop_front() else {
@@ -20931,6 +20973,76 @@ impl App {
         migrate_key_map_for_rename(&mut self.video_resume_thumb_last_request, &old_k, &new_k);
     }
 
+    /// 起動時と後続 idle 時に delete purge journal を worker で再実行する。
+    /// journal の path は「Shell 削除成功済み」の証跡だが、再作成された同名ファイルの
+    /// 新メタを消さないよう、孤児整理と同じ親到達可能 + path 不在の条件も再確認する。
+    pub(crate) fn poll_delete_purge_retry(&mut self, ctx: &egui::Context) {
+        if let Some(pending) = self.delete_purge_retry_pending.as_ref() {
+            match pending.rx.try_recv() {
+                Ok(report) => {
+                    self.delete_purge_retry_pending = None;
+                    crate::logger::log(format!(
+                        "[delete-purge] retry done attempted={} purged={} rows={} remaining={} errors={}",
+                        report.attempted,
+                        report.purged,
+                        report.rows,
+                        report.remaining,
+                        report.errors.len()
+                    ));
+                    for error in report.errors.iter().take(3) {
+                        crate::logger::log(format!("[delete-purge] retry error: {error}"));
+                    }
+                    self.delete_purge_retry_needed = report.remaining > 0;
+                    self.delete_purge_retry_after = self
+                        .delete_purge_retry_needed
+                        .then(|| std::time::Instant::now() + std::time::Duration::from_secs(10));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.delete_purge_retry_pending = None;
+                    self.delete_purge_retry_needed = true;
+                    self.delete_purge_retry_after =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                }
+            }
+        }
+        const DELETE_PURGE_INPUT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+        if let Some(last_input_at) = self.last_input_at
+            && last_input_at.elapsed() < DELETE_PURGE_INPUT_IDLE
+        {
+            ctx.request_repaint_after(
+                DELETE_PURGE_INPUT_IDLE.saturating_sub(last_input_at.elapsed()),
+            );
+            return;
+        }
+        if !self.delete_purge_retry_needed
+            || self.delete_pending.is_some()
+            || self.metadata_cleanup_pending.is_some()
+            || self.rename_migration_in_flight.is_some()
+            || !self.rename_migration_queue.is_empty()
+            || self.rename_migration_writers_busy()
+            || self
+                .delete_purge_retry_after
+                .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
+        {
+            if let Some(retry_at) = self.delete_purge_retry_after {
+                ctx.request_repaint_after(
+                    retry_at.saturating_duration_since(std::time::Instant::now()),
+                );
+            }
+            return;
+        }
+        self.delete_purge_retry_needed = false;
+        self.delete_purge_retry_after = None;
+        self.delete_purge_retry_pending = Some(crate::metadata_cleanup::spawn_delete_purge_retry(
+            self.rename_migration_data_dir(),
+        ));
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     /// 削除ワーカーを spawn し、`delete_pending` に保持する。
     /// 既に実行中の場合は何もしない (UI 側でダイアログ表示中はボタン無効化する前提)。
     /// 対象を表示・再生中の窓は spawn 前に閉じる (decoder handle 解放、上記 (B))。
@@ -20939,7 +21051,11 @@ impl App {
         ctx: &egui::Context,
         paths: Vec<std::path::PathBuf>,
     ) {
-        if paths.is_empty() || self.delete_pending.is_some() {
+        if paths.is_empty()
+            || self.delete_pending.is_some()
+            || self.metadata_cleanup_pending.is_some()
+            || self.delete_purge_retry_pending.is_some()
+        {
             return;
         }
         self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
@@ -20977,12 +21093,14 @@ impl App {
                     succeeded,
                     failed,
                     purged_pdf_password_paths,
+                    purge_deferred,
                 }) => {
                     pending.succeeded.extend(succeeded);
                     pending.failed.extend(failed);
                     pending
                         .purged_pdf_password_paths
                         .extend(purged_pdf_password_paths);
+                    pending.purge_deferred |= purge_deferred;
                 }
                 Ok(crate::delete_worker::DeleteMsg::Done { canceled: c }) => {
                     done = true;
@@ -21005,6 +21123,10 @@ impl App {
         let succeeded = pending.succeeded;
         let purged_pdf_password_paths = pending.purged_pdf_password_paths;
         let failed_count = pending.failed.len();
+        if pending.purge_deferred {
+            self.delete_purge_retry_needed = true;
+            self.delete_purge_retry_after = None;
+        }
 
         crate::logger::log(format!(
             "[delete] done: canceled={canceled} succeeded={} failed={failed_count}",
@@ -21027,8 +21149,8 @@ impl App {
             return;
         }
 
-        // delete-worker は Shell 成功バッチを送る前に全 path-keyed store を hard purge 済み。
-        // UI 側は disk I/O をせず presence set / cache を同じ path 境界で整合させる。
+        // delete-worker は全 Shell 成功 path を末尾で hard purge してから Done を送る。
+        // UI 側は Done 後に disk I/O なしで presence set / cache を同じ path 境界で整合させる。
         self.purge_in_memory_metadata_for_removed_paths(&succeeded, &purged_pdf_password_paths);
 
         // 消えた path の再生位置記録を破棄する (角度④ (A)。窓のクローズは
@@ -21588,7 +21710,7 @@ impl App {
         sources: Vec<crate::books::BookPageSource>,
     ) {
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, sources);
+        self.start_book_append_to_named(ctx, book_name, sources, false);
     }
 
     /// `start_book_append` の本名指定版 (ツールバーのピン留め本へ追加する用)。
@@ -21597,15 +21719,18 @@ impl App {
         ctx: &egui::Context,
         book_name: String,
         sources: Vec<crate::books::BookPageSource>,
+        warn_unbaked_edits: bool,
     ) {
         if sources.is_empty() {
             self.show_feedback_toast("追加するページがありません".to_string());
             return;
         }
         let root = self.book_root_path();
-        self.start_book_op(ctx, "book-append", move || {
+        if self.start_book_op(ctx, "book-append", move || {
             crate::books::append_pages(root, book_name, sources)
-        });
+        }) {
+            self.book_append_warn_unbaked_edits = warn_unbaked_edits;
+        }
     }
 
     pub(crate) fn start_book_reorder_flush(
@@ -21850,13 +21975,13 @@ impl App {
         ));
     }
 
-    fn start_book_op<F>(&mut self, ctx: &egui::Context, thread_name: &'static str, f: F)
+    fn start_book_op<F>(&mut self, ctx: &egui::Context, thread_name: &'static str, f: F) -> bool
     where
         F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
     {
         if self.book_op_pending.is_some() {
             self.show_feedback_toast("製本処理中です".to_string());
-            return;
+            return false;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
@@ -21867,9 +21992,11 @@ impl App {
             Ok(_) => {
                 self.book_op_pending = Some(crate::books::BookOpPending { rx });
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                true
             }
             Err(err) => {
                 self.show_feedback_toast(format!("製本 worker を開始できません: {err}"));
+                false
             }
         }
     }
@@ -21889,6 +22016,7 @@ impl App {
             }
         };
         self.book_op_pending = None;
+        let warn_unbaked_edits = std::mem::take(&mut self.book_append_warn_unbaked_edits);
         match result {
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 self.apply_book_page_edit_copies(&summary.edit_copies);
@@ -21906,10 +22034,22 @@ impl App {
                     summary.added,
                     summary.folder.display()
                 ));
-                self.show_feedback_toast(format!(
-                    "「{}」に {} ページ追加しました",
-                    summary.book_name, summary.added
-                ));
+                if warn_unbaked_edits {
+                    self.show_feedback_toast_with_duration(
+                        format!(
+                            "「{}」に {} ページ追加しました\n{}",
+                            summary.book_name,
+                            summary.added,
+                            crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING
+                        ),
+                        4.5,
+                    );
+                } else {
+                    self.show_feedback_toast(format!(
+                        "「{}」に {} ページ追加しました",
+                        summary.book_name, summary.added
+                    ));
+                }
                 if let Some(path) = summary.first_path {
                     crate::logger::log(format!("book append first page: {}", path.display()));
                 }
@@ -50302,6 +50442,7 @@ impl eframe::App for App {
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_rename_migration_pending(ctx);
+        self.poll_delete_purge_retry(ctx);
         self.poll_capture_pending(ctx);
         self.poll_book_op_pending(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
@@ -50326,6 +50467,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.poll_cache_maint_pending();
+        self.poll_metadata_cleanup(ctx);
         self.poll_archive_cache_maint_pending();
         self.poll_converted_archive_cache_paths(ctx);
         self.ensure_folder_rating_counter();
@@ -50876,6 +51018,7 @@ impl eframe::App for App {
         self.draw_book_manager(ctx);
         self.draw_book_reorder(ctx);
         self.show_cache_manager_dialog(ctx);
+        self.show_metadata_cleanup_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);

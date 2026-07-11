@@ -20,6 +20,8 @@
 | AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
+| 孤児メタデータ整理 | `std::thread` (`metadata-cleanup-scan` / `metadata-cleanup-delete`) + mpsc | 明示操作ごとに 1 本 | `rename_key_migration::STORES` の全行列挙と path 存在確認、確認後の DELETE を UI スレッド外で行う。`Arc<AtomicBool>` で行境界キャンセル、atomic 進捗、削除直前のオフライン再判定、descriptor 単位 transaction rollback を持つ |
+| 削除 purge journal 再試行 | `std::thread` (`delete-purge-retry`) + mpsc | 最大 1 | Shell 削除成功後の hard purge が最終失敗した path を `delete_purge_journal.json` から読み、起動時 / 1 秒入力 idle 後 / 失敗時 10 秒 backoff 後にピンポイント再 purge。孤児整理と同じ親到達可能 + path 不在を再確認し、成功 entry だけ atomic に消し込む |
 | 読書履歴 writer | `std::thread` (`reading-history-writer`) + mpsc | 1 | フルスクリーンで読んだ画像フォルダ / ZIP / PDF / 変換アーカイブを `reading_history.db` へ upsert / prune する。UI スレッドは履歴 entry を送るだけで、ファイルサイズ / mtime の `metadata()` 補完も writer 側で行う。キャンセルは持たず、App drop 時に tx close → queue drain → join |
 | テキスト注釈ベイク | `std::thread` (`comic-bake`) + mpsc | 閲覧時最大 2 | Ctrl+T 注釈を final composite 上へ焼き込む。閲覧時は stamp 画像の cache miss デコードも worker 側で行い、完了時に `comic_stamp_cache` へ merge する。編集中はライブ追従を優先し、プレビュー解像度で同期ベイクする |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
@@ -501,12 +503,24 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
   物理 shift + `items_generation` bump + `adjustment_page_params` / `mask_pages` /
   `search_filter` の O(K log K) idx shift + `invalidate_idx_state_and_queues` を行う。
   ゴミ箱移動は `delete_worker` が Windows Shell `IFileOperation` へ最大 100 件ずつ
-  `DeleteItem` を予約し、チャンクごとに `PerformOperations` を 1 回だけ呼ぶ。
-  Shell 成功 path は UI へ通知する前に、同じ worker 上で
-  `rename_key_migration::STORES` の全 path-keyed SQLite 行を hard purge する。
-  キー照合は exact + `<key>/` + `<key>::`。hash key の PDF password は削除前に worker が
-  配下 PDF を列挙して hash を確定する。UI 側は完了通知で presence set / rating・tag・rotation
-  等の cache だけを同期し、DB I/O は行わない。missing の観測からこの purge 経路は呼ばない。
+  `DeleteItem` を予約し、チャンクごとに `PerformOperations` を 1 回だけ呼ぶ。チャンク完了の
+  `DeleteMsg::Batch` は recycle 進捗として即時通知する一方、Shell 成功 path と PDF candidate は
+  worker 内へ蓄積し、全チャンク完了後 (途中 cancel なら recycle 済み成功分まで) に
+  `rename_key_migration::STORES` の全 path-keyed SQLite 行を **1 回だけ** hard purge する。
+  `Done` は purge / journal 永続化の後に送るため、UI の items 除去と presence set /
+  rating・tag・rotation 等の in-memory clear は永続 purge より後になる。キー照合は exact +
+  `<key>/` + `<key>::`。hash key の PDF password は保存行が 1 件以上ある場合だけ、削除前に
+  worker が配下 PDF を列挙して hash を確定する。ストア不在 / 空なら read_dir 走査を丸ごと省く。
+  第21弾では SQLite purge の exact を最大500 parameterの `IN` batchへまとめ、`<key>/` /
+  `<key>::` は `col >= prefix AND col < next(prefix)` の BINARY index range scanへ変更した。
+  `next(prefix)` は末尾 Unicode scalar を1つ進め、構築不能時だけ旧 `substr` 条件へfallbackする。
+  対象列は既定 BINARY collationのPRIMARY KEY、複合PK先頭列、または明示path indexであり、
+  keep-drive / drive-strippedの既存小文字化キーをそのまま境界に使う。1ストア1transactionと
+  `Done`後送の順序は変えず、削除数×総行数の全表scanだけを除いた。
+  UI 側は DB I/O を行わず、missing の観測からこの purge 経路は呼ばない。
+  初回 + 3 回の purge 後もエラーが残れば path 単位で `delete_purge_journal.json` に永続化し、
+  `delete-purge-retry` が起動時と後続 idle 時に同じ共通 purge を冪等再実行する。PDF password 用の
+  削除前列挙 path も entry に保持する。sidecar backup は `flush()` 成功時だけ purge rows に数える。
   mIV 側の削除確認 / 進捗 UI を正とするため通常の Shell UI は抑制しつつ、
   ゴミ箱不可時の完全削除警告 (`FOF_WANTNUKEWARNING`) は残す。mIV 側キャンセルは
   チャンク間で判定する。Shell 側の中断は `GetAnyOperationsAborted` と削除後の
@@ -527,6 +541,19 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
 この設計が崩れると 2026-04 に発生した「削除後に別 item のサムネが表示される」
 「Ctrl+G 直後に重い ZIP/PDF decode が worker を占有して新結果のサムネが来ない」
 といった再発しやすいバグが戻ってくる。
+
+### 5.2.2 孤児メタデータ整理 worker
+
+`metadata_cleanup.rs` はスキャン結果を候補 snapshot として UI へ返し、ユーザー確認後に別 worker で
+削除する。候補条件は `try_exists() == Ok(false)` かつ物理実体の直上親が `is_dir()` の場合だけ。
+切断ドライブ等で親ごと見えない行は `Protected` として残す。スキャン後にドライブ状態が変わる race を
+避けるため DELETE 直前にも同じ判定と本棚除外を再実行する。cancel は scan では候補全体を破棄し、
+delete では処理中 descriptor の transaction を rollback する。完了通知は削除済み exact key だけを
+返し、UI 側は SQLite I/O をせず rating count / path cache / presence set を無効化・更新する。
+
+削除 purge journal はこの全走査 UI を自動実行するものではない。Shell 削除成功済み path だけを
+ピンポイント対象にし、`STORES` と `PathClassification::Orphan` の安全条件を共有する。再作成済みの
+同名 path や親へ到達不能な path は新しいメタを誤削除しないよう journal に残して繰り延べる。
 
 ### 5.3 UI スレッドで重処理
 

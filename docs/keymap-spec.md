@@ -92,6 +92,7 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 |---|---|---|
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>Enter</kbd> = 無効 | 誤操作防止のため keymap 対象外の固定入力。ダイアログ表示中に Y / N / Esc を消費し、背面の KeyAction へ漏らさない。IME 変換中は Y / N / Esc の確認操作を行わない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
 | サムネイル一覧の範囲選択 | <kbd>Shift</kbd>+矢印キー | グリッド選択カーソルの移動とチェック追加が一体になった固定操作。Grid 文脈で同じキーを割り当てた場合は予約キー警告を出す |
 | Shell / クリップボード / D&D | Shell コピー / 切り取り / 貼り付け、Shell 右クリックメニュー、外部アプリへのドラッグ送出 | Windows Shell やクリップボードイベントの経路を優先するため、キーボードコマンドとは分ける |
