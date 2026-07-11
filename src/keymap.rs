@@ -5882,6 +5882,25 @@ impl Keymap {
     /// (idle からの同フレーム 押下+離し) を救うために併用する。修飾キー付きは対象外。
     pub fn take_key_hold_edges(&self, ctx: &egui::Context, action: KeyAction) -> (bool, bool) {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active() {
+            let chords: Vec<Chord> = if let Some(chords) = self.overrides.get(&action) {
+                chords.iter().copied().collect()
+            } else {
+                action.default_chords().iter().collect()
+            };
+            return crate::key_input::consume_key_edges(|edge| {
+                chords.iter().copied().any(|chord| {
+                    let physical_match = chord.key.is_some_and(|name| {
+                        name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
+                    });
+                    // A release still belongs to the physical slot even when a
+                    // modifier changed after key-down. Presses keep the
+                    // SinglePlainKey modifier contract.
+                    physical_match && (!edge.pressed || chord.matches_key_edge(edge))
+                })
+            });
+        }
         // Numpad0-9 は to_egui が上段 Num0-9 へ畳むため、ここで使うと「テンキー割当なのに
         // 上段数字キーのイベントを消費 / fast-tap 誤発火」になる。fast-tap 救済から除外し、
         // hold 判定は key_held_chord の OS 直読み (固有 VK) に任せる (review-v2.3.0 hunt P2)。
@@ -6314,9 +6333,8 @@ impl Keymap {
             //   (旧実装は to_egui gate で常に false = 割り当てたのに効かない)。
             // - Numpad0-9 は VK_NUMPAD* で判定されるため、egui fallback (Num0-9 へ畳む)
             //   経由の「上段数字キーで誤発火」も起きない。
-            // 制約: NumpadEnter は GetAsyncKeyState では主 Enter と同じ VK_RETURN なので、
-            // hold 判定上は主 Enter でも成立する (edge 側 = matches_win32 は extended で
-            // 区別する。KeyHold 用途では許容)。
+            // - Enter / NumpadEnter は共有 VK_RETURN を直接読まず、Win32 edge の extended bit
+            //   から作る物理ラッチを使うため、KeyHold でも双方向に分離される。
             key_held_via_os(name)
         }
         #[cfg(not(windows))]
@@ -6475,6 +6493,13 @@ impl KeymapSettings {
 fn key_held_via_os(key: KeyName) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
+    if crate::key_input::is_frame_active() {
+        match key {
+            KeyName::Enter => return crate::key_input::return_key_held(false),
+            KeyName::NumpadEnter => return crate::key_input::return_key_held(true),
+            _ => {}
+        }
+    }
     unsafe { GetAsyncKeyState(key.to_vk() as i32) < 0 }
 }
 
@@ -8390,6 +8415,28 @@ mod tests {
             KeyName::from_win32(0xC0, KeyName::JIS_AT_SCAN, false),
             Some(KeyName::JisAt)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_hold_slot_matching_distinguishes_both_enter_directions() {
+        let edge = |extended| crate::key_input::KeyEdge {
+            virtual_key: 0x0D,
+            scan_code: 0x1C,
+            extended,
+            pressed: true,
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        };
+        let main_enter = Chord::key(KeyName::Enter);
+        let numpad_enter = Chord::key(KeyName::NumpadEnter);
+
+        assert!(main_enter.matches_key_edge(edge(false)));
+        assert!(!main_enter.matches_key_edge(edge(true)));
+        assert!(numpad_enter.matches_key_edge(edge(true)));
+        assert!(!numpad_enter.matches_key_edge(edge(false)));
     }
 
     #[test]

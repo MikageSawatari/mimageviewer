@@ -19,9 +19,10 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 | --- | --- | --- | --- | --- |
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
-| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
+| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画 / 音声を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
+- **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
 - **ZIP はアイテム索引 (Ctrl+G) の対象外** — ZIP はコンテナなので Ctrl+S で扱う。
   ZIP 内画像のメタ検索はどのモードでも行わない (§4.6)。
 - **製本ルート (`Settings.book_root` / 既定 `Pictures\mimageviewer\books`) は
@@ -149,7 +150,7 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 
 ### 4.1 アイテム索引 (Ctrl+G 用)
 
-画像 / PDF / 動画を、ファイル名・タグ・EXIF・AI プロンプト等で横断検索する
+画像 / PDF / 動画 / 音声を、ファイル名・タグ・EXIF・AI プロンプト等で横断検索する
 ための索引。Ctrl+G が使う。Ctrl+F (現在地フィルタ) はこの索引を使わず、
 表示中アイテムを on-demand に判定する (§5.2)。
 
@@ -171,12 +172,28 @@ IndexerSupervisor (スレッド 1 本):
          両方あり mtime/size 差 → 再 ingest queue
   3. IngestSession::run   …… Tantivy First 書き込み順序 (§4.2) で反映
   4. 以降 watcher イベント (DebouncedChange) を受け取り小刻みに 3 と同じ処理
-  5. App drop で cancel + FsWatcher drop + thread join
+  5. App drop で全員 cancel。join は全 supervisor 合計 4 秒まで、超過時は detach
 
 IngestSession の writer は IndexerManager が保有する dispatcher 経由で共有する
 (Tantivy の writer は Index あたり 1 本制約)。通常タグ操作は tags.db のみを更新し、
 Tantivy writer には触れない。
 ```
+
+#### 終了応答性と有界 shutdown
+
+大量削除では watcher overflow の full rescan、または debounce 済みイベント列が
+delete ingest を集中させる。walker / ingest のループcheckだけでは、共有I/O permit取得と
+writer dispatcherのreply待ちが無期限だったため、cancelを観測できずApp dropのjoinを塞いだ。
+
+v2.3.0第12弾では次を不変条件とする。
+
+- walk entryと3-way diff、delete / ingest loopにcancel checkpointを置く。
+- I/O permitとdispatcher replyは50ms timeoutでcancelを再確認する。cancel後は未flush batchを
+  submitせず、受信済みを含むwatcher queueも捨てる。
+- IndexerManager dropはmanager-wide 4秒 deadlineでjoinし、未完了handleはdetachする。
+  final commitとdispatcherの最終Dropはbackground finalizerがbest-effortで担当する。
+- submit済みbatchがcancel後にTantivyだけへ反映されても、SQLiteを先行更新しない
+  Tantivy Firstを維持する。次回起動時のFS / Tantivy / fts_meta 3-way diffが再投入・再削除する。
 
 ### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
 
@@ -351,6 +368,16 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
   `dc:subject` は移行元としてのみ扱い、Ctrl+F / Ctrl+G の検索ソースにはしない。
 - フレーム内容 / 音声文字起こし / チャプター以外の本文抽出は対象外。動画再生や
   サムネイル抽出とは独立した低頻度のメタ読み取りだけを行う。
+
+### 4.8.1 音声対応のスコープ
+
+- 音声ファイル本体: 共通 `folder_tree::is_audio_ext` が認識する拡張子を対象に、
+  ファイル名だけを `name` へ登録する。ID3 等の曲名・アーティスト・アルバム情報は将来機能。
+- `kind` は既存の Tantivy `STRING | STORED` フィールドへ `audio` を追加するだけで、schema は
+  変わらない。`INDEX_VERSION` は bump せず、既存ユーザーの音声は次回 supervisor 初期 scan の
+  FS/DB 3-way diff で「FS にあり DB になし」として自然に追加される。
+- watcher 差分も同じ共通拡張子判定を使い、新規追加・rename・更新を `CandidateKind::Audio` として
+  ingest する。結果は Flat / DrilledInto の共通 materialize で `GridItem::Audio` へ変換する。
 
 ### 4.9 タグ書き込みと旧タグ移行
 
@@ -664,6 +691,14 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 | NameIndexSupervisor | 同上 | 同構造 |
 | Ingest / Walker 内部 | supervisor cancel | 各ループの checkpoint で `Ordering::Relaxed` read |
 | tag_write_worker | App drop | 送信側が `None` を送る + cancel |
+
+#### Indexer固有の停止境界
+
+IndexerSupervisorはevent受信直後にもcancelを再確認する。したがってStopとwatcher eventが
+同時readyでもcancel後のeventをapplyしない。GlobalIoSemaphoreの待機と
+FtsWriterDispatcherのbatch応答待ちは50msごとにcancel可能であり、現在実行中のOS I/Oや
+Tantivy commit自体を強制中断はしない。そこで上位のIndexerManagerが全体4秒でjoinを打ち切り、
+プロセス終了時間を有界にする二層構造とする。
 
 ### 7.2 I/O セマフォの優先度マップ
 

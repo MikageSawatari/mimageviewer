@@ -73,6 +73,12 @@ enum WriterJob {
         dur: std::time::Duration,
         reply: mpsc::Sender<()>,
     },
+    #[cfg(test)]
+    TestBlock {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        reply: mpsc::Sender<()>,
+    },
 }
 
 #[derive(Default)]
@@ -147,6 +153,47 @@ impl FtsWriterDispatcher {
         })
     }
 
+    /// Submit a batch, but stop waiting when the owning worker is cancelled.
+    /// A submitted job may still complete; the next three-way scan reconciles
+    /// a partially observed Tantivy/SQLite boundary.
+    pub fn batch_cancellable(
+        &self,
+        upserts: Vec<IndexDoc>,
+        deletes: Vec<String>,
+        commit_after: bool,
+        reload_after_commit: bool,
+        priority: WriterPriority,
+        cancel: &AtomicBool,
+    ) -> tantivy::Result<bool> {
+        const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let (tx, rx) = mpsc::channel();
+        self.submit(
+            WriterJob::Batch {
+                upserts,
+                deletes,
+                commit_after,
+                reload_after_commit,
+                reply: tx,
+            },
+            priority,
+        );
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok(result) => return result.map(|()| true),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(tantivy::TantivyError::SystemError(LOG_PREFIX.to_owned()));
+                }
+            }
+        }
+    }
+
     /// `tantivy::Result` を返す系ジョブ (Upsert / Commit / Batch) の共通実装。
     /// channel 切断は同じ SystemError にマップする。
     fn submit_with_reply<F>(&self, priority: WriterPriority, build: F) -> tantivy::Result<()>
@@ -191,6 +238,25 @@ impl FtsWriterDispatcher {
         let (tx, rx) = mpsc::channel();
         self.submit(WriterJob::TestSleep { dur, reply: tx }, priority);
         rx
+    }
+
+    #[cfg(test)]
+    fn submit_test_block(
+        &self,
+        priority: WriterPriority,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.submit(
+            WriterJob::TestBlock {
+                started: started_tx,
+                release: release_rx,
+                reply: reply_tx,
+            },
+            priority,
+        );
+        (started_rx, release_tx, reply_rx)
     }
 }
 
@@ -278,6 +344,16 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
         #[cfg(test)]
         WriterJob::TestSleep { dur, reply } => {
             std::thread::sleep(dur);
+            let _ = reply.send(());
+        }
+        #[cfg(test)]
+        WriterJob::TestBlock {
+            started,
+            release,
+            reply,
+        } => {
+            let _ = started.send(());
+            let _ = release.recv();
             let _ = reply.send(());
         }
     }
@@ -485,5 +561,46 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 100).unwrap();
         assert_eq!(hits.len(), 10);
+    }
+
+    #[test]
+    fn cancellable_batch_stops_waiting_behind_a_blocked_dispatcher() {
+        let (_tmp, _fts, disp) = setup();
+        let (started, release, blocker_done) = disp.submit_test_block(WriterPriority::Background);
+        started.recv().unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel();
+        let disp_worker = Arc::clone(&disp);
+        let cancel_worker = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            let completed = disp_worker
+                .batch_cancellable(
+                    vec![],
+                    vec![],
+                    true,
+                    false,
+                    WriterPriority::Background,
+                    &cancel_worker,
+                )
+                .unwrap();
+            done_tx.send(completed).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while disp.pending_snapshot().1 == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            !done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .unwrap()
+        );
+
+        release.send(()).unwrap();
+        blocker_done.recv().unwrap();
+        worker.join().unwrap();
     }
 }

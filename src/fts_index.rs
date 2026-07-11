@@ -2,7 +2,8 @@
 //!
 //! ## 役割 (INDEX_VERSION=9)
 //!
-//! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタを転置索引化
+//! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタと
+//!   音声ファイル名を転置索引化
 //! - **検索原文 (post-filter 用) を STORED で保持する**。`*_text` フィールドが bigram
 //!   索引 + STORED 原文の両方を担い、`fts_meta.db` は管理メタ (path / mtime / size /
 //!   status=Ok|Failed / index_generation) のみを持つ
@@ -20,7 +21,7 @@
 //! container        STRING | STORED            "fs" / "zip"
 //! zip_entry        STRING | STORED            container="zip" のとき ZIP 内相対パス
 //! favorite_id      STRING | STORED            UUID (exact term filter 用)
-//! kind             STRING | STORED            "folder" / "image" / "zip" / "pdf" / "video"
+//! kind             STRING | STORED            "folder" / "image" / "zip" / "pdf" / "video" / "audio"
 //! mtime            i64    INDEXED | STORED
 //! file_size        i64    STORED
 //! name             TEXT   bigram | STORED     ファイル名 / ZIP エントリ名
@@ -157,6 +158,7 @@ pub enum IndexKind {
     Zip,
     Pdf,
     Video,
+    Audio,
 }
 
 impl IndexKind {
@@ -167,6 +169,7 @@ impl IndexKind {
             IndexKind::Zip => "zip",
             IndexKind::Pdf => "pdf",
             IndexKind::Video => "video",
+            IndexKind::Audio => "audio",
         }
     }
 
@@ -178,6 +181,7 @@ impl IndexKind {
             IndexKind::Zip => 2,
             IndexKind::Pdf => 3,
             IndexKind::Video => 4,
+            IndexKind::Audio => 5,
         }
     }
 
@@ -189,6 +193,7 @@ impl IndexKind {
             2 => IndexKind::Zip,
             3 => IndexKind::Pdf,
             4 => IndexKind::Video,
+            5 => IndexKind::Audio,
             other => {
                 crate::logger::log(format!(
                     "fts_index: unexpected IndexKind discriminant {other} — falling back to Image"
@@ -1721,15 +1726,29 @@ mod tests {
             &sample_video_doc_with_meta("c:/d.mp4", fav, "夕焼け video"),
         )
         .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_sources(
+                "c:/e.flac",
+                fav,
+                IndexKind::Audio,
+                "夕焼け audio",
+                "",
+                "",
+                "",
+            ),
+        )
+        .unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
         let searcher = idx.searcher();
 
-        // kinds=None → 5 件全部
+        // kinds=None → 6 件全部
         let q_all_q = q_all(idx.fields(), &["夕焼け"]).unwrap();
         let all_hits = search_page(&searcher, idx.fields(), &q_all_q, 0, 10).unwrap();
-        assert_eq!(all_hits.len(), 5);
+        assert_eq!(all_hits.len(), 6);
 
         // kinds=[Zip, Pdf, Video] → 3 件
         let kinds = [IndexKind::Zip, IndexKind::Pdf, IndexKind::Video];
@@ -1748,6 +1767,27 @@ mod tests {
         assert!(paths.contains("c:/a.zip"));
         assert!(paths.contains("c:/b.pdf"));
         assert!(paths.contains("c:/d.mp4"));
+
+        let audio_kinds = [IndexKind::Audio];
+        let audio_q = build_bigram_and_query(
+            idx.fields(),
+            &["夕焼け"],
+            &QueryFilters {
+                kinds: Some(&audio_kinds),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let audio_hits = search_page(&searcher, idx.fields(), &audio_q, 0, 10).unwrap();
+        assert_eq!(audio_hits.len(), 1);
+        assert_eq!(audio_hits[0].0, "c:/e.flac");
+    }
+
+    #[test]
+    fn audio_kind_uses_additive_stable_serialization_values() {
+        assert_eq!(IndexKind::Audio.as_str(), "audio");
+        assert_eq!(IndexKind::Audio.to_i64(), 5);
+        assert_eq!(IndexKind::from_i64(5), IndexKind::Audio);
     }
 
     /// target=Only([Tags]) は旧状態として受けても通常検索には参加しない。

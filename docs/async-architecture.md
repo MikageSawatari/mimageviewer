@@ -36,6 +36,7 @@
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
 | 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。新しい activation が来たら旧 pending を cancel し、古い結果は適用しない |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
+| メディア前後送り候補の存在確認 | 常駐 `std::thread` (`media-nav-resolver`) + mpsc mailbox | App-global 0 or 1 (初回要求時に lazy 起動) | EOF / 手動前後送り時、UI が bundle items から抽出した方向付き候補列の実ファイルだけを `Path::exists` で順次検証する。worker は受信時に mailbox を drain して最新 request だけを処理し、キャンセル不能な `Path::exists` 中の新要求も同じ 1 thread に滞留させる。結果は単調増加 request id が最新 pending と一致する場合だけ検討し、`items_generation` / owner window / 開始時 `fullscreen_idx` を context-local stale 条件とする。App-global `input_seq` の一致は owner なしの mounted context だけで要求し、ParkedLive では無関係な main 入力を stale 理由にしない。owner 不一致中は結果を受信せず保留する。EOF action を stale / superseded / context close・load / resolver 切断 / apply 拒否のいずれかで捨てる場合は、対応する `(fs_idx, seek_serial)` と現在値が一致するときだけ video / 動画音声モード / music 共通 dedup latch を解除して次 tick の再試行を許す。ZIP/PDF 仮想 entry は I/O せず候補に残す。App drop で request sender が drop され、in-flight I/O が戻った後に receiver disconnect で自然終了する (終了時 join なし)。 |
 | ファイル名スタック分類 | `std::thread` (`stack-script`) + mpsc | スタックモード ON かつスクリプト有効時、フォルダ読込ごとに最大 1 本 | ユーザー定義 Rhai スクリプト ([`filename_stack_script`](../src/filename_stack_script.rs)) でフォルダ内画像のグループキーを算出する。重くなり得る (実測 10 万件 ~1 秒) ので UI スレッドから外す。通常フォルダを先に表示し、完了後 `poll_stack_script` が `start_loading_items` 経由で集約ビューへ差し替える。`StackScriptPending` の cancel + folder 一致で stale 判定、別フォルダ移動 / スタック OFF / 再ロードで cancel、失敗は組み込み既定へフォールバック。組み込み既定 (separator) ルールは軽量なので同期構築のまま。詳細 [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + mpsc | 音楽ビューを開くごとに最大 1 本 | `run_music_analysis` が FFmpeg 全尺 decode + `analyze_stereo_timeline` を**全て UI スレッド外**で行う (Inc 3b)。**永続 DB (`audio_analysis.db`) はやめ in-memory LRU に置換 (2026-07-03)**: 結果は UI スレッドが `music_analysis_lru` (直近 N 曲、path+size+mtime キー) に保持し、`ensure_music_analysis` が `image_metas` の (mtime,size) で LRU を楽観的に lookup (UI スレッド stat しない) してヒットならタイムラインを即セット + ワーカーを `want_analysis=false` で起動、miss なら `want_analysis=true`。ワーカーは DB は触らないが背景で実ファイルを **fresh stat** し、ヒットに使った `hit_meta` と食い違えば (外部更新) 解析し直す + LRU 挿入キーに検証済み (mtime,size) を返す (`TimelineComplete{analysis,meta}`、image_metas スナップショットが stale でも正しい key)。**Inc 4**: 同ワーカーが spectrum 用に全尺 PCM も**1 回だけ**デコードし (timeline と共有)、`MusicAnalysisMsg::{Timeline(progressive 部分), TimelineComplete(全尺確定=LRU 挿入), Pcm, Probe}` を送る。`poll_music_analysis` が届いた分を Disconnected まで drain (pending は取り出して末尾で戻す)、pending 中は `request_repaint_after(50ms)`。新ファイル / `close_fullscreen` で cancel。decode ループは cancel を確認するが post-decode の解析パスは単一 pass で cancel 不可 (支配的コストの decode はキャンセル可)。**progressive spectrum PCM (2026-07-07)**: `Pcm` は**デコード開始前**に空の共有バッファ (`Arc<MusicPcm>` = `RwLock<Vec<f32>>` 追記式) として送り、デコードは新 API `audio_decode::decode_audio_file_progressive` (差分 `on_delta` を渡す) で回して差分を `append` (write)。timeline partial / 最終確定は同じ共有バッファのプレフィックス (`with_prefix` = read ロック下解析) から作る。これで下段スペクトラムが全尺デコード完了を待たず出る (§5.6)。**`RwLock`** なのは、長い解析 read (`with_prefix`) と spectrum の窓コピー read (`copy_window`) を並行させて spectrum を固まらせないため (`Mutex` だと解析中フリーズの実機 FB → RwLock で解消)。共通セットアップ `open_audio_decode` / partial スケジュール `PartialEmitSchedule` は既存 streaming decode と共有 |
 | 音楽ビュー row raster | `std::thread` (`miv-music-timeline-raster`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`TimelineTextureCache`) | `TimelineAnalysis` から DJ 風波形タイムラインを **1 行 (row) ずつ** `egui::ColorImage` にラスタライズ。UI は request に `Arc<TimelineAnalysis>` を渡すだけ (行ウィンドウ切り出しは worker 側で zero-copy) で、結果は generation / row_version / key が現要求と一致するものだけを 1 フレーム 1 枚 `load_texture` する。旧 key / generation の結果は採用側で破棄。`ensure` (key 変更) / `clear` (ファイル変更・close) で worker を作り直す。詳細は [`src/ui_music_timeline.rs`](../src/ui_music_timeline.rs) |
@@ -385,6 +386,19 @@ ingest worker と tag_write_worker が共有する。独自に `fts.writer()` �
 `LockBusy` で **全 upsert が無効化される**。新しい書き込み経路を足すなら必ず
 共有 writer を使う。
 
+#### Indexer shutdown の有界化 (v2.3.0 第12弾)
+
+- App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
+  manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、
+  プロセス終了を将来追加される長時間処理でも塞がない。
+- walker は entry / 3-way diff の各ループ、ingest は delete / ingest の各ループで cancel を見る。
+  GlobalIoSemaphore の permit 待ちと FtsWriterDispatcher の reply 待ちは50ms timeoutで再確認する。
+  cancel 後の未flush batchはsubmitせず、受信済みを含む watcher queue も処理しない。
+- final commit と dispatcher の最終所有は indexer-writer-finalizer へ移し、main thread は
+  commit / queue drain / dispatcher join を待たない。submit済みbatchの応答をcancelで放棄しても、
+  Tantivy First により SQLite側を先行更新しない。次回起動時の FS / Tantivy / fts_meta
+  3-way diff が未反映・片側反映を再照合するため、detachは索引整合性を犠牲にしない。
+
 ### 3.5 新ワーカー追加時のテンプレ
 
 ```rust
@@ -488,6 +502,11 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
   `search_filter` の O(K log K) idx shift + `invalidate_idx_state_and_queues` を行う。
   ゴミ箱移動は `delete_worker` が Windows Shell `IFileOperation` へ最大 100 件ずつ
   `DeleteItem` を予約し、チャンクごとに `PerformOperations` を 1 回だけ呼ぶ。
+  Shell 成功 path は UI へ通知する前に、同じ worker 上で
+  `rename_key_migration::STORES` の全 path-keyed SQLite 行を hard purge する。
+  キー照合は exact + `<key>/` + `<key>::`。hash key の PDF password は削除前に worker が
+  配下 PDF を列挙して hash を確定する。UI 側は完了通知で presence set / rating・tag・rotation
+  等の cache だけを同期し、DB I/O は行わない。missing の観測からこの purge 経路は呼ばない。
   mIV 側の削除確認 / 進捗 UI を正とするため通常の Shell UI は抑制しつつ、
   ゴミ箱不可時の完全削除警告 (`FOF_WANTNUKEWARNING`) は残す。mIV 側キャンセルは
   チャンク間で判定する。Shell 側の中断は `GetAnyOperationsAborted` と削除後の

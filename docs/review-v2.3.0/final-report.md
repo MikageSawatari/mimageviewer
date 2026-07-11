@@ -1,6 +1,32 @@
 ﻿# v2.3.0 出荷前 品質レビュー 統合レポート (確定版)
 
-実施: 2026-07-09 / 対象: `7eff5a9e` (v2.2.0) .. `01910684` (HEAD、362 コミット / +77k 行)
+## 現在のステータス (2026-07-11、追補第 10 弾反映)
+
+- 対象: `master @ c3efcedc` + working tree (追補第 3〜9 弾)。
+- R1 第2波で新規検出された P1-1 / P2-1 / P2-2 は追補第7弾で修正済み。
+  P1-1 の同期 `Path::exists` は候補解決 worker へ移し、UI thread の EOF / 手動送りから
+  metadata I/O を除去した。
+- 当初確定 P2-1〜10 は追補第1〜6弾までに修正済み。P2-11 はコード欠陥ではなく
+  detached 動画×音声モードの実機 smoke 項目としてチェックリストで継続する。
+- R1 第2波 P3-1 (音声の Ctrl+G 索引対象化) はユーザー裁定「v2.3.0 で対応」に従い、
+  追補第8弾で実装済み。ID3 等の埋め込みメタデータは対象外で、ファイル名検索に限定する。
+- 実機 FB で判明したタグビューの種類 dropdown の音声欠落は追補第9弾で修正し、
+  kind フィルタ UI の横断監査も完了した。タグビューの選択は設定/DBへ永続化しない。
+- 実機 FB の「`NumpadEnter` に KeyHold を割り当てると本体 Enter でも発動」は追補第10弾で
+  修正した。Win32 extended bit の物理ラッチにより、Press / KeyHold / native / 割当キャプチャの
+  全経路で本体 Enter とテンキー Enter を双方向に分離する。
+- 追補第10弾反映後の `cargo fmt` / `cargo fmt --check`、
+  `cargo test --bin mimageviewer-core` (3377 passed / 17 ignored)、
+  `build-release.ps1 -SkipVst3Bridge` は green。追補第8弾の50,000文書 benchも
+  全10クエリ +30%以内 (最大 +6.2%) で、追補第9弾は索引経路を変更していない。
+  現在の出荷判断は残る実機 smoke 結果で確定する。
+
+以下の 2026-07-09 の件数・総評・優先順位は当時のレビュー記録であり、現在ステータスは
+本節と末尾「推奨アクション」を正とする。
+
+---
+
+実施 (当時): 2026-07-09 / 対象: `7eff5a9e` (v2.2.0) .. `01910684` (HEAD、362 コミット / +77k 行)
 体制: Codex CLI ×3 セッション (性能 / レース / モード) + Claude (Fable) エージェント ×3 (同 3 観点)
 + 委任サブ調査 ×3 (音楽解析 / detached 共有基盤 / 動画エンジン・音声) + ドキュメント調査 ×1。
 全 P1/P2 候補は検収側 (このセッション) が HEAD のコードを直接読んで裏取り済み。
@@ -13,7 +39,7 @@ claude-{perf,race,mode}.md / brief.md。
 
 ---
 
-## 総評
+## 総評 (2026-07-09 当時)
 
 - **P1 (クラッシュ・データ破壊・UI 長時間ブロック) は 0 件**。ユーザーが最重視していた
   「UI スレッドの同期 I/O・長時間ブロック」は、音楽/音声/detached の新規経路について
@@ -28,7 +54,7 @@ claude-{perf,race,mode}.md / brief.md。
 
 ---
 
-## P2 確定指摘 (11 件、対処優先順)
+## P2 確定指摘 (2026-07-09 当時: 11 件、対処優先順)
 
 凡例: [裏取り] = 検収でコード照合済み / (検出元)
 
@@ -289,14 +315,452 @@ panic ハント (新規 unwrap 69 件全照合)、エラー経路後始末、リ
 - 表示モード変更の passive 一括 close を共通 media teardown seam に通し、最終 resume 保存、
   normalize cancel、最後の音楽 consumer の global 状態解放を揃えた。
 
-## 推奨アクション (優先順)
+### 追補 第 3 弾 (2026-07-11): 角度 A/B 追加レビュー P2 4 件 + P3 1 件
 
-1. **出荷前修正 (小粒・低リスク・凍結対象外)**: P2-1 (ガード 1 条件) / P2-3 (clear 条件化) /
-   P2-4 (版数カウンタ) / P2-5 (`fs_music_view_active` 分岐) / P2-10 (除外条件 1 つ)
-2. **出荷前修正 (要設計判断)**: P2-6 (EOF 時 BufferReady) / P2-7 (SeekCompleted 再送) /
-   P2-2 (shift 対象追加 + 削除ガード、リワークと調整)
-3. **detached リワークへ引き継ぎ (凍結、パッチ禁止)**: P2-8 / P2-9 + BA-7 系 P3 群 →
-   プラン §2 に従い、bundle × App-global ワーカー基盤の境界再設計をステージ項目化
-4. **実機 smoke 追加**: detached 動画 → ♪/Z → exit / F11 / host 再生成 / EOF 継続 (P2-11)、
-   0.1s 未満音声ファイル (P2-6 確認)
-5. **docs**: architecture-overview 追記 (必須) ほか上表
+発見: Codex Sol の read-only 追加レビュー (角度 A = 直近 2 コミット相互作用、
+角度 B = 連続再生・スライドショー) / 裏取り: Fable / 修正: Codex Sol。
+
+- **[P2 / A-1] 削除時の native pending idx shift 漏れ**:
+  `remove_items_batch` で source-swap / open / fast-swap / video-tile の 4 種を
+  owner=None (mounted 所有) の場合だけ old→new idx へ追随させた。owner=Some の
+  ParkedLive pending は bundle の idx 空間なので不変。target 削除時は pending を畳み、
+  source-swap の navigation preview と presenter を正規 teardown する。
+- **[P2 / A-2] ParkedLive close の companion state 残留**:
+  所有 fast/tile pending の破棄と同時に deferred navigation を破棄。tile companion は
+  owner stamp を優先し、完成済み tile は閉じる bundle の表示動画 path、他の mounted /
+  active / parked video context 不在を照合してから mode/state/reopen/deadline を消す。
+  無関係な mounted tile state は温存する。
+- **[P2 / A-3] player 作成前 deferred media の削除・rename 照合漏れ**:
+  mounted fullscreen の表示 item が対象 Video/Audio で、VST3 deferred open または
+  owner=None の native open pending と一致する場合も、player 一致時と同じ close 経路へ
+  入れる。静止画の隣接再整合 UX は変更しない。
+- **[P3 / A-4] removed-path passive close の teardown seam 迂回**:
+  passive / ParkedLive bundle を retain-drop する前に共通 teardown を呼び、close 時点の
+  最終 resume を保存する。rename はその後に既存の path migration が走るため、
+  「最終位置を旧 path へ保存 → 新 path へ移行」の順序を固定した。
+- **[P2 / B-1] EOF source-swap 中 F12 の設定・表示乖離**:
+  案 a を採用。現在 context と owner が一致する source-swap pending 中は、通常モードと
+  メディア別窓モードの共通 F12 入口でトグル全体を無視し、設定も反転しない。player 不在で
+  placement だけ適用不能になる二相不整合を、小さな owner gate で防いだ。
+
+「偶然防御」は c3efcedc でも生存しており、今回も owner の明示照合・破棄範囲限定で
+さらに強化されたことを再確認した。
+
+### 追補 第 4 弾 (2026-07-11): GUI レビュー P1/P2 の裁定と修正
+
+対象: Codex GUI レビュー (c3efcedc) / 裏取り・検収: Fable / 修正: Codex Sol。
+
+- **① [P1] live-park の部分 clone による main 文脈喪失 — 修正**:
+  preserve-main 経路を空 bundle + allowlist clone から、`ViewerContextBundle` 全 field を
+  destructure して「main/parked へ複製」「parked へ移送」「main に保持」の 3 群へ分類する
+  split に置換した。player、fullscreen load/pending、fullscreen 一時 UI、動画音声/UI 状態だけを
+  ParkedLive へ移し、ページ補正・マスク/隠蔽/注釈・補正レイヤー・見開き/読書方向・view-trim・
+  サムネ補正・詳細列/tag prewarm・folder load 複合体は main が原本を保持する。items など EOF
+  連続再生に必要な一覧 identity は従来どおり parked にも複製する。
+- **② [P2] ダブルクリック same-media 前面化迂回 — 修正**:
+  grid leaf open の共通前処理を追加し、Enter / ダブルクリック / ゲームパッド accept /
+  stack 集約フラット open の全経路で activate-existing を park より先に実行する。同じ
+  active/ParkedLive 動画・音声は既存窓を前面化して open を消費し、再起動しない。
+- **③④ — 追補第 3 弾で対応済み**:
+  native pending idx の owner-aware shift/target 削除 teardown、および ParkedLive close の
+  tile/deferred-navigation companion teardown は追補第 3 弾 A-1/A-2/A-4 の修正を正とする。
+- **⑤ — 既知 P3、detached リワーク送り**:
+  bundle と App-global native runtime の所有境界をさらに一本化する構造変更は凍結対象であり、
+  v2.3.0 の局所修正には含めない。付随指摘の `native_video_mode_switch` は owner stamp が無く、
+  close 後も deadline まで font-atlas settle/native control を塞ぐ実害があるため、閉じる
+  ParkedLive 群が唯一の video context と確定できる場合だけ teardown する。mounted / active /
+  surviving parked video があれば無関係な切替を壊さないよう温存する。
+
+### 追補 第 5 弾 (2026-07-11): §1.7 linked 画像窓の media open 乗っ取り
+
+実機報告 / 機構確定: Fable / 修正: Codex Sol。
+
+- grid leaf open seam に opening item を渡し、media-window へ入る item のときだけ mounted
+  detached still を先に passive snapshot へ handoff する。通常の linked still→still は
+  従来どおり同じ窓を reuse し、§1.7 OFF の linked 窓 close 仕様も変更しない。
+- ParkedLive の same-media activation も media handoff 専用 preserve を通す。§1.7 の F12
+  linked still は閉じず passive に残り、既存メディア窓だけが active へ戻る。
+- 別 media open は旧 ParkedLive を既存 teardown seam で close し、その runtime placement
+  を settings seed へ保存してから新 window_id を allocate する。画像窓 ID は再利用せず、
+  新メディア窓の位置・サイズは直前のメディア窓を継承する。
+- 複数ウィンドウモードにも mounted still→media の同じ seam 欠落があり、既存の independent
+  still preserve 条件を同じ分岐から利用して防止した。
+- 実機ログで、ダブルクリック前の選択変更を sync_detached_viewer_to_selected が先に処理し、
+  grid-open seam を通らず linked 画像窓へ media を開く cursor-follow 経路の取り残しを検出。
+  §1.7 中は「現在表示中が media」に加えて「追従先 selected が media」でも sync を skip
+  するようガードを拡張した。クリック・矢印・ゲームパッドの選択移動を同じ gate で保護し、
+  非 §1.7 の linked 窓が動画へ追従する従来仕様は維持する。
+- 追加実機ログで、media handoff により Parked になった linked still を次の画像 grid open が
+  再利用せず、新しい画像窓を allocate して3窓化する取り残しを検出。handoff元runtimeの
+  linked + Parkedをone-shot identityとして保持し、snapshotとruntimeが両方生存する一意候補
+  だけを次のstill openで消費する。同じwindow_id・placement・HWND runtimeをResuming→Active
+  へ戻すため、画像→動画→画像と画像→動画→動画→画像はいずれも「media 1 + still 1」を維持。
+  close / 直接passive activate / mode一括closeではruntime removalまたはlinked解除により
+  one-shotが失効し、stale IDは再利用しない。複数ウィンドウmodeのalways-new仕様は対象外。
+
+### 追補 第 6 弾 (2026-07-11): MPEG-PS EOF位置のresume汚染
+
+実機ログ / 機構確定: Fable / 修正・追加調査: Codex Sol。
+
+- MPEG-PSでavformat durationが0または過大な場合、従来のposition対duration終端guardを
+  EOF位置がすり抜け、終端秒がresumeとして保存されて再open直後にEOFへ戻るループを確認。
+- resume保存判断へEngineActorのpublished EOF stateを追加。5秒周期、save-all、ParkedLive /
+  passive teardown planの3経路すべてで、EOFならduration値に関係なく既存entryを削除する。
+  既に終端値で汚染されたentryも、そのplayerがEOFへ到達した保存/closeで自動回復する。
+- open-time resumeはVideoPlayerとEngineActorの両適用点を共通sanitizeへ集約。duration既知で
+  末端5秒以内ならseekせず先頭から、正常な途中位置は従来どおり復元する。
+- **P3 / 別件 — MPEG-PSのduration学習とシーク精度**: VideoInfoとnative HUD用duration atomicは
+  avformat情報受領時に一度だけ設定される。decode EOF時はduration不明ならclock現在位置を
+  EngineActorのEof freezeへ渡すが、VideoInfo/HUD durationへ書き戻す機構は無い。duration=0では
+  seek barの尺が得られず、過大値では実在しない範囲へのseekになり得る。ファイル固有の推定尺
+  補正はresume汚染と分離し、v2.3.0出荷前修正では深追いしない。
+
+#### 追補 第 6 弾 続報: xhigh R1×4 + R2×3 (重複統合後 P2 6 件)
+
+レビュー: Codex xhigh R1/R2 / コード照合・検収: Fable / 修正: Codex Sol。
+R1-3 と R2-P2-3 は同じ stale bundle item 問題として統合した。
+
+- **R1-1 音声モード resume 巻き戻り**: resume 位置選択を helper 化し、5 秒周期、
+  `save_all_video_resume_positions`、ParkedLive/passive teardown plan の全経路へ適用した。
+  純粋な動画→音声モードは音声 clock の `position()`、VST host 表示中と通常動画は
+  `last_displayed_pts` 優先を維持する。bundle 側は bundle 自身の mode/VST state で判定する。
+- **R1-2 終了時 detached resume 未収穫**: on_exit で mount 中 player を保存した後、active
+  detached bundle と全 paused bundle を read-only teardown plan 化して resume を収穫する。
+  bundle の drop/mount や playback teardown は行わない。
+- **R1-3 = R2-P2-3 stale sibling path**: promoted/ParkedLive の items snapshot は main の
+  delete/rename と同期せず、使用時検証を採用した。動画 EOF、動画→音声モード EOF、音楽 EOF、
+  メディア窓の手動前後送りで Image/Video/Audio の実 path に `Path::exists` を行い、欠損候補を
+  ログ 1 行付きでスキップする。ZIP/PDF 仮想 entry は existence check 対象外。全滅時は従来の
+  folder-end/boundary 動作へ落とす。
+- **R1-4 ParkedLive open timeout zombie**: detached host 待ちと decoder 待ちの両 timeout で
+  owner=Some のとき mounted fullscreen を閉じない。mount 中 bundle を snapshot へ swap-back
+  した後、owner 窓を共通 paused-media teardown seam 経由で close する。
+- **R2-P2-1 main delete の誤 idx shift**: owner=None の native pending 4 種は active promoted
+  media context が存在する間 shift しない。App-global normalize/continuous EOF state は active
+  promoted または ParkedLive media window が存在する間 shift しない。ParkedLive pending は
+  既存 owner=Some gate、mounted media は従来 shift を維持する。メディア窓 1 本規則により
+  detached 所有中の mounted media state 併存はない。
+- **R2-P2-2 ZIP 専用入口の promote 迂回**: `load_zip_as_folder` の items clear より前、still
+  preserve/close より前に media promote を追加した。cache-hit 振替と入れ子 ZIP の再帰呼び出しは
+  2 回目の `fullscreen_idx=None` で no-op となり、アドレスバー/お気に入り等の同入口を一括で守る。
+
+追加 unit coverage は audio-mode save-all/teardown、on_exit 相当 active+paused 収穫、欠損候補
+skip+仮想 entry 非検証、ParkedLive host timeout owner close、mounted/promoted/ParkedLive の idx
+ownership、ZIP load 前 promote を対象とする。
+
+### 追補 第 7 弾 (2026-07-11): R1 第 2 波 P1×1 + P2×2 + doc 整合
+
+レビュー: Codex R1 第2波 / コード照合・検収: Fable / 修正: Codex Sol。
+
+- **[P1-1] stale bundle path 検証の UI thread 同期 I/O**: 案 A (候補解決 worker) を採用。
+  EOF / 手動前後送りは `items` と表示順から方向付き候補列だけを同期抽出し、実ファイルの
+  `Path::exists` は cancel token 付き worker で順次実行する。結果は mpsc で返し、適用時に
+  `items_generation` / `input_seq` / ParkedLive owner window の一致を検証する。新規要求、
+  context close/load、worker loop の3箇所に cancel を置き、開始・完了・適用を perf 計装した。
+  動画 EOF、動画→音声モード EOF、音楽 EOF、メディア窓の手動前後送りを同じ経路へ統合。
+- **[P2-1] ParkedLive source-swap 失敗後の zombie bundle**: presenter-closed と decoder
+  解放待ち timeout の owner=Some 分岐を `request_parked_live_media_close_after_poll` へ接続。
+  mount 中 bundle を swap-back してから対象 owner 窓だけを共通 teardown seam で閉じる。
+  mounted (owner=None) は従来どおり `close_fullscreen` を使う。
+- **[P2-2] タグビュー音声の Folder 誤復元**: in-memory の `TagViewItemKind` に `Audio` を追加し、
+  共通 `folder_tree::is_audio_ext` で Folder fallback より先に分類、結果を `GridItem::Audio` へ
+  マップした。この型は DB/設定へ serialize されないため v2.2.0 永続化互換策は不要。
+  既存種別フィルタには音声カテゴリがないため選択肢は増やさず、「すべて」では表示し
+  「フォルダ」への混入だけを解消した。
+- **[P3-1] 音声 Ctrl+G 索引**: 機能スコープのユーザー裁定待ち。追補第7弾では変更しない。
+- **[P3-2] final report 整合**: 冒頭に現在ステータスを追加し、旧 HEAD / 総評 / 件数を
+  当時記録と明示。推奨アクションを現在の残作業へ更新した。
+
+追加 unit coverage は候補抽出 + 欠損/仮想候補解決、generation/input/owner gate、
+source-swap の presenter-closed/timeout owner close 要求、音声 classify と GridItem 適用を対象とする。
+
+### 追補 第 8 弾 (2026-07-11): P3-1 ユーザー裁定「音声 Ctrl+G 対応」
+
+裁定: v2.3.0 で対応 / 実装: Codex Sol / 検収: Fable。
+
+- 初期 `search_walker` と watcher 差分 `build_candidate_from_path` の双方を、既存共通
+  `folder_tree::is_audio_ext` へ接続した。独自の拡張子一覧は追加せず、音声を
+  `CandidateKind::Audio` → `IndexKind::Audio` として ingest する。
+- 音声 ingest はファイルを読まず、共通正規化した basename だけを `name` へ格納する。
+  ID3 の曲名・アーティスト・アルバム等は今回の対象外。Tantivy の既存 `kind` 文字列へ
+  `audio`、`fts_meta.db.kind` の既存末尾へ整数 `5` を加えた。
+- Ctrl+G の Flat / DrilledInto が共有する FS hit materialize 境界を作り、共通拡張子判定で
+  `GridItem::Audio` へ復元する。結果セルの double-click / Enter は既存 Audio open 経路から
+  音楽ビューへ入り、Ctrl+↑↓ の検索結果ナビにも音声を追加した。streaming rebuild 用の
+  内容キーにも Audio を加え、選択・チェック追従を維持する。
+- Ctrl+G の索引 kind ドロップダウンへ「音声ファイル」を追加。検索結果のスマートファセットは
+  既存 `GridItem::Audio → FacetItemKind::Audio` 接続がそのまま機能し、回帰テストで固定した。
+
+#### 既存索引・ダウングレード判断
+
+- **full rebuild / schema version bump は不要**。`kind` は元から `STRING | STORED` で、`audio` は
+  新しい term 値にすぎず schema は変わらない。既存ユーザーの DB に音声行がなくても、次回の
+  supervisor 初期 scan で「FS にあり DB になし」と判定され、通常の差分 ingest に自然に入る。
+  watcher はアップグレード後の新規追加・rename・更新を同じ Audio 候補として取り込む。
+- **v2.2.0 へ戻しても Corrupted 級にはならない**。v2.2.0 の `IndexKind::from_i64` は未知の整数
+  `5` を診断ログ付きで `Image` へフォールバックし、Tantivy の `kind="audio"` は既存 STRING
+  schema で開ける。v2.2.0 walker は音声を FS 候補にしないため、初期 3-way diff で該当 DB 行を
+  delete queue に落とし、Tantivy doc と SQLite 行を通常削除する。削除 commit 前の短い窓に
+  kind 未指定検索を行うと音声 hit が旧 materialize の Image fallback で見える可能性はあるが、
+  画像 decode に失敗するだけで DB 隔離・schema破損・設定 Corrupted には至らない。
+
+#### 自動検証
+
+- `cargo fmt` / `cargo fmt --check`: exit 0。
+- `cargo test --bin mimageviewer-core`: exit 0、3374 passed / 17 ignored / 0 failed。
+- `cargo run --release --bin bench_search -- --docs 50000 --json target/bench-audio-search/bench_new.json`:
+  exit 0。続く `check_bench_regression.py` も exit 0、全10クエリが +30%以内、最大 +6.2%。
+  初回計測は短時間クエリ3件が閾値を超えたが、同条件の再計測で解消し baseline は更新していない。
+- `python scripts/check_ui_glyphs.py`: exit 0、危険グリフ 0。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher とも release build 成功。
+
+追加 unit coverage は walker Audio 候補化、watcher 差分 Audio 分類、filename-only ingest、
+Audio kind の保存値と検索フィルタ、Flat / DrilledInto の `GridItem::Audio` 復元、
+音声の fullscreen target とファセット kind 判定を対象とする。
+
+### 追補 第 9 弾 (2026-07-11): 種類フィルタ UI の音声対応 実機 FB + 横断監査
+
+実機報告 / 裁定: ユーザー / 実装・監査: Codex Sol / 検収: Fable。
+
+- **観測**: タグビュー (Ctrl+T) の「すべての種類」には音声が無く、動画を選ぶと
+  音声は正しく除外される一方、音声だけへ絞る経路が無かった。
+- **不変条件**: タグビューが `TagViewItemKind::Audio` を結果種別として扱うなら、
+  同じ種類 dropdown から Audio を選択でき、Audio だけが通り、動画/フォルダへ混入しない。
+- **原因と修正**: 追補第7弾で結果分類と `GridItem::Audio` 復元だけを追加し、
+  UI 選択 enum `TagViewKindFilter` への Audio 追加を見送った取り残し。
+  `TAG_VIEW_KIND_FILTER_CHOICES`、表示ラベル、`matches` 判定、実ファイルを使う検索テストへ
+  Audio を一貫して追加した。件数表示はフィルタ済み `entries.len()` を既存どおり使う。
+
+#### kind フィルタ UI 横断監査
+
+| UI | 現状 | 判断 | 対応 |
+|---|---|---|---|
+| タグビュー (Ctrl+T) 種類 dropdown | Audio 結果分類はあるが選択肢だけ欠落 | 音声を扱うため必須 | **修正**: Audio 選択・ラベル・判定・回帰テストを追加 |
+| Ctrl+G アイテム検索 種類 dropdown | `IndexKind::Audio` / 「音声ファイル」あり | 音声を扱うため必要、追補第8弾で対応済み | 変更なし |
+| 共通スマートフィルタ「種類」(通常/詳細/サブ展開/検索・タグ結果/レーティング一覧) | `GridItem::Audio → FacetItemKind::Audio`、動的件数・ラベル・保存退避あり | 音声が一覧にあるビューでは必要 | 変更なし。動画/Folder への混入なし |
+| Ctrl+S コンテナ検索「種別」 | フォルダ / ZIP / PDF のみ | コンテナ検索であり音声・動画は対象外 | 変更なし |
+| レーティング一覧 | `RatingItemKind::Audio=9` と `GridItem::Audio` 復元、共通種類 facet が利用可能 | 音声レーティングを扱うため Audio 分類が必要 | 対応済み、変更なし |
+| 読書履歴 | 画像本の Folder / ZIP / PDF / Archive のみ。動画・音声は記録対象外 | 「最近読んだ本」専用なので音声選択は不要 | 変更なし |
+| サブ展開 | 画像 / 動画だけのフラット表示と UI に明記し、Audio は走査対象外 | 現仕様では音声を扱わない | 変更なし |
+| 画像色フィルタ | `has_page_data` の画像/ZIP画像/PDFページと Stack のみ | 色を持たない音声は対象外 | 変更なし |
+| 同名ファイル処理 | アーカイブ対フォルダ、動画対画像、画像拡張子間の明示ルール。Audio は除外しない | 音声を動画 companion / 画像扱いしてはならない | 既存の kind 限定を確認、変更なし |
+| キャッシュ一括作成 | 画像 / ZIP画像 / PDFページの raster thumbnail 作成。kind 選択 UI は無い | raster thumbnail を持たない音声は対象外 | 変更なし |
+
+#### 永続化・互換・snapshot
+
+- `TagViewState.kind_filter` は `Settings` のフィールドでも serde 型でもなく、
+  App のプロセス内 state にだけ保持される。settings.db / tags.db への保存・復元参照は無い。
+  したがって v2.2.0 ダウングレード対策は不要。
+- 永続化される共通 `FacetFilter.kinds` の Audio は、追補済みの
+  `kind_audio_stash` 退避/復元により v2.2.0 互換を維持している。
+- `tests/ui_snapshot.rs` は再利用可能な独立 UI と診断/Markdown描画だけを対象とし、
+  App 内のタグビュー dropdown を含まない。snapshot PNG 更新は不要。
+
+#### 自動検証
+
+- `cargo fmt` / `cargo fmt --check`: exit 0。
+- focused `cargo test --bin mimageviewer-core tag_view_`: exit 0、14 passed。
+- `cargo test --bin mimageviewer-core`: exit 0、3374 passed / 17 ignored / 0 failed。
+- `python scripts/check_ui_glyphs.py`: exit 0、危険グリフ 0。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher の release build 成功。
+- `tests/ui_snapshot.rs` は対象 UI を含まないため更新・実行なし。
+
+`docs/next-release-backlog.md` には、実機確認済みの duration 不明/不正 MPEG-PS の
+シークバー不能を P3 / 次版送りとして追記した。
+
+### 追補 第 10 弾 (2026-07-11): テンキー Enter の KeyHold が本体 Enter でも発動する実機 FB
+
+実機報告 / 検収仮説: Fable / 実装・経路監査: Codex Sol / 検収: Fable。
+
+- **観測と不変条件**: `FsZoomMode = NumpadEnter` で本体 Enter までズームを起動した。
+  `Enter` と `NumpadEnter` は別 `KeySlot` なので、Press / KeyHold / native 動画 /
+  操作カスタマイズのキャプチャの全経路で相互発火してはならない。逆方向の
+  `FsZoomMode = Enter` もテンキー Enter で発動してはならない。
+- **経路監査**: Win32 key edge、native `NativeVideoKeyEvent`、キャプチャ UI はいずれも
+  `scan_code` と `extended` を保持し、既存 `matches_win32` / `from_win32` は
+  extended=false を本体 Enter、true を `NumpadEnter` として正しく分離していた。
+  一方、KeyHold held 判定だけは `GetAsyncKeyState(VK_RETURN)` を使用し、共有 VK の時点で
+  区別を失っていた。高速タップ補完も本体 Enter 側では egui の Enter event を使うため、
+  逆方向の誤発火余地があった。egui 0.33.3 の `physical_key` は
+  `Option<egui::Key>` で、egui-winit が `Enter | NumpadEnter => Key::Enter` に畳むため
+  scancode 代替にはならない。
+- **根治設計**: main / fullscreen viewport の `WM_KEYDOWN/WM_KEYUP` edge から、
+  `VK_RETURN` の extended=false/true を別々にラッチする。KeyHold held はこの物理ラッチ、
+  高速タップ edge は同じ Win32 frame queue を使い、両経路を同じ物理 identity に統一した。
+  フォーカス喪失 / 最終 subclass 破棄時は両ラッチを clear し、未配送 KeyUp の stale 状態を
+  次フレームへ残さない。Enter 以外の固有 VK の held は従来どおり OS 直読みを維持する。
+- **互換とキャプチャ**: `KeyName::parse` / settings 名 / 旧 `keymap.ini` の
+  `Enter` / `NumpadEnter` 表記は変更していないため migration 不要。キャプチャ UI は既存の
+  Win32 `from_win32(..., extended)` 経路を維持し、本体 / テンキーを別名で記録する。
+- **回帰 coverage**: extended bit による chord の双方向不一致、main/numpad を同時押下しても
+  独立する held latch、フォーカス喪失相当の latch clear を unit test 化。既存 keymap 85件
+  (ini/settings round-trip、native VK、Numpad 名を含む) も green。
+
+#### 自動検証と実機 smoke
+
+- `cargo fmt`: exit 0。
+- `cargo fmt --check`: exit 0。
+- focused `cargo test keymap --bin mimageviewer-core`: exit 0、85 passed。
+- focused `cargo test key_input --bin mimageviewer-core`: exit 0、3 passed。
+- `cargo test --bin mimageviewer-core`: exit 0、3377 passed / 17 ignored / 0 failed。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher の release build 成功。
+  既存 VST3 host と sha256 の削除は権限拒否 warning になったが、`-SkipVst3Bridge` の既存
+  bridge 埋め込みと今回の core / launcher 生成は完了した。
+- 実機未確認: `FsZoomMode = NumpadEnter` で本体 Enter がズームを起動せず、テンキー Enter
+  だけが起動すること。本体 Enter の既定「一覧へ戻る」が維持されること。逆割当
+  `FsZoomMode = Enter` でもテンキー Enter が起動しないこと。操作カスタマイズの
+  「押して入力」が両 Enter を別表記で記録すること。
+
+### 追補 第 11 弾 (2026-07-11): R1 第 3 波 P2 — media navigation resolver
+
+レビュー / 検収: Fable / 実装・根因照合: Codex Sol。
+
+- **観測と不変条件**: ParkedLive の EOF 候補解決中にメイン一覧の入力で App-global
+  `input_seq` が進むと、別 context の結果が stale 破棄されていた。EOF 開始前に
+  `video_continuous_last_eof` を記録済みなのに破棄時の解除が無く、同じ EOF は
+  処理済みのまま永久停止した。また要求ごとの `media-nav-exists` spawn は、
+  キャンセル不能な `Path::exists` 中の旧 thread を回収できず、遅延 NAS で連打回数分
+  thread が累積した。context-local な新しい入力だけが古い結果を無効化し、EOF 結果を
+  適用しなかった場合は同じ EOF を次 tick で再試行でき、存在確認 thread は App-global
+  最大 1 本でなければならない。
+- **stale 条件**: 結果適用は `items_generation`、ParkedLive
+  `owner_window_id`、解決開始時の `fullscreen_idx` が現在の mounted bundle と一致する
+  ことを必須にした。owner なしの mounted context だけは従来どおり `input_seq` 一致も
+  要求し、後続の手動入力で古い手動送りを捨てる。owner ありの ParkedLive は main 入力で
+  進む global `input_seq` を stale 条件に使わない。owner 不一致中は result channel を
+  読まず pending と結果を保留し、該当 bundle が再 mount された時に検証・適用する。
+- **EOF dedup rollback**: `VideoContinuousEof` /
+  `VideoAudioModeContinuousEof` / `MusicContinuousEof` を共通 helper で
+  `(fs_idx, seek_serial)` へ写像した。stale、後続要求による supersede、
+  context close/load、resolver spawn/channel 失敗、apply 前の状態拒否のどれで捨てても、
+  現在の latch がその key と一致する場合だけ `None` へ戻す。これにより新しい EOF key を
+  誤って解除せず、EOF 由来だけを再試行可能にする。手動送り action は rollback 対象外。
+
+#### 常駐 resolver
+
+- `MediaNavigationResolver` は最初の要求時に `media-nav-resolver` thread を lazy 起動する。
+  App は request sender / result receiver / 単調増加 request id を1組だけ保持する。
+- worker は blocking `recv` 後に `try_iter` で mailbox を drain し、その時点の最後の要求だけを
+  処理する。in-flight `Path::exists` は中断できないが、その間の新要求は同じ channel に溜まり、
+  新しい OS thread を作らない。poll は pending の最新 request id と一致しない旧 response を捨てる。
+- App drop で唯一の request sender が drop される。worker は in-flight I/O が戻った後、
+  receiver disconnect で自然終了する。join は行わず、アプリ終了を OS I/O timeout で待たせない。
+- soft timeout は追加しなかった。同期 `Path::exists` 自体を停止できないため、UI だけ先に
+  「対象なし」へ落とすと、復帰を待って次候補を採用する既存動作を変える一方、後続 request の
+  resolver 待ちは解消しない。今回の保証は UI 非 blocking と thread 数上限 1 であり、
+  1 本が OS timeout まで遅れる点は残る。
+
+#### 回帰 coverage と自動検証
+
+- context-local stale predicate: generation / owner / fullscreen idx、mounted だけの input seq、
+  ParkedLive での unrelated input seq 許容。
+- stale EOF result の poll 破棄で dedup latch が解除されること、および video /
+  動画音声モード / music の3 action が共通 rollback 対象であること。
+- owner 不一致中は queued result を消費せず、owner 再 mount 後に適用すること。
+- mailbox drain が最後の request だけを選ぶこと、旧 request id response を捨てて最新 response を
+  適用すること、欠損実ファイル skip / 仮想 entry 非 stat の既存 coverage。
+- `cargo fmt`: exit 0。
+- `cargo test --bin mimageviewer-core`: exit 0、3383 passed / 17 ignored / 0 failed。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher の release build 成功。
+  既存 VST3 host と sha256 の削除は権限拒否、停止済み Susie PID の再停止は not found warning
+  だったが、今回の core / launcher 生成には影響しなかった。
+
+### 追補 第 12 弾 (2026-07-11): 大量削除後の終了ハング
+
+実機ログ解析 / 検収: Fable / 根因確定・実装: Codex Sol。
+
+- **観測**: 約9,700ファイル削除後、IndexerManager dropの最初のsupervisor joinが
+  170秒以上停止した。7 supervisorには先にsignal_stop済みで、main threadだけがjoin待ち、
+  tray / VST3 heartbeatは生存していた。
+- **根因**: watcher overflowのfull rescanまたは大量DebouncedChangeが入口になり得る一方、
+  長時間停止を可能にした所有境界は search_walkerのGlobalIoSemaphore無期限acquire、
+  ingest_workerの同acquire、およびFtsWriterDispatcherのreply無期限recvだった。
+  さらにcancel検出後も保留delete batchをflushする経路があり、新しいwriter待ちへ入れた。
+  よって仮説1 / 3が負荷の入口、仮説2が停止不能の直接原因である。
+- **応答性修正**: walk entry / 3-way diff / delete / ingest loopへcheckpointを追加した。
+  I/O permit取得とdispatcher batch応答は50ms timeoutでcancelを再確認する。
+  cancel後は未flush batchをsubmitせず、event受信直後にも再確認してqueue済みwatcher eventを
+  applyしない。既にsubmit済みのbatchはdispatcher内で完了し得るが、呼び出し側は待機を離脱する。
+- **有界shutdown**: IndexerManager dropは全supervisor共通の4秒deadlineまでjoinし、
+  超過handleをdetachしてjoined / detached数をログへ残す。final commitとdispatcherの最終所有は
+  indexer-writer-finalizerへ移し、main threadはcommit / queue drain / dispatcher joinを待たない。
+- **整合性**: cancel後に未submit batchを捨てても次回scanでFS差分として再検出される。
+  submit済みbatchの応答を放棄してTantivyだけ更新された場合もSQLiteを先行更新しない
+  Tantivy Firstを維持し、次回のFS / Tantivy / fts_meta 3-way diffで再投入・再削除される。
+- **catalog migration**: source_width / source_heightはpragma_table_infoで存在確認してからALTERし、
+  並行open競合時のduplicate columnだけを無言のidempotent successとした。1017行は
+  CatalogDb openごとに既存列へALTERしていたためのログ増幅である。catalogはフォルダ単位DBで
+  cold worker openもあるためopen回数だけでリークとは断定できず、今回のjoin停止原因でもないが、
+  1セッション1017 openは高めなので将来のpath付き計測 / cache hit率監査候補とする。
+
+#### 回帰coverage
+
+- permit待機中のcancelで500ms以内に未取得return。
+- blocked dispatcherの後ろにsubmitしたbatch待機がcancelで500ms以内にreturn。
+- deadline消費済みのjoin seamがworkerをdetachして即return。
+- cancel後のqueue済みchangeをdiscard。
+- legacy catalogへ列を一度だけ追加し、2回目initが成功して列が重複しない。
+
+#### 自動検証
+
+- cargo fmt / cargo fmt --check: exit 0。
+- focused回帰5件: exit 0。
+- cargo test --bin mimageviewer-core: exit 0、3388 passed / 17 ignored / 0 failed。
+- .\scripts\build-release.ps1 -SkipVst3Bridge: exit 0。core / launcher release build成功。
+  既存VST3 host本体とsha256の削除はaccess denied warningだったが、SkipVst3Bridgeの
+  既存bridge埋め込みと今回のcore / launcher生成には影響しなかった。
+
+### 追補 第 13 弾・改 (2026-07-11): 全メタ hard purge / missing 非破壊の統一
+
+実機 FB / 仕様裁定: ユーザー、検収: Fable、実装: Codex Sol。
+
+- **差し替え経緯**: 当初の第13弾は rating だけを `deleted_at_ms` tombstone + prewarm unflag
+  で扱ったが、タグ・補正・回転等と削除意味論が分裂し、ごみ箱復元時の挙動もストアごとに
+  異なるため撤回した。`deleted_at_ms` は未コミット・未出荷列だったので schema 追加そのものを
+  撤去し、既存ユーザーの `rating.db` に migration は不要。
+- **トリガー分離**: (1) mIV の `delete_worker` が Shell 成功を確認した path は、全
+  path-keyed メタを hard purge。(2) スキャン・検索・一覧復元・履歴 open の missing は、
+  外付け切断 / NAS offline / 権限エラーを含み得るため表示除外・open 抑止だけで DB は非破壊。
+- **共通ストア正本**: `rename_key_migration::STORES` に keep-drive / drive-stripped の正規化、
+  DB / table / key column、rename の一意性を集約。rename と purge が同じ記述子を走査するため、
+  新ストア追加時に対象がずれない。読書履歴は rename 時だけ raw path 更新を伴う専用処理、
+  PDF password は SHA-256 key のため削除前に worker が配下 PDF path を列挙する専用処理。
+- **削除連携**: Shell 成功 batch を UI へ送る前に worker 上で exact + `<key>/` +
+  `<key>::` を `DELETE`。UI 完了ハンドラは rating / tags / rotation cache、タグ候補、
+  folder count、編集済み presence set、動画 marker / resume、読書履歴 cache、PDF password
+  in-memory store を同じ境界で整合させる。rename は従来 migration だけで、削除 purge と二重実行しない。
+- **missing 横断監査**: rating view / count / folder counter / prewarm には missing 起因の
+  DELETE は無かった。タグビューの `should_prune_missing_path` + `prune_items` を撤去し、結果から
+  隠して行を保持するテストへ変更した。さらに読書履歴 open guard に missing 時の DB 削除が
+  あったため、toast + open 抑止のみへ非破壊化した。Tantivy / FTS / catalog / archive cache の
+  stale delete は再生成可能な索引・cache であり、ユーザーメタではないため対象外。
+
+#### 回帰 coverage
+
+- 共通 `STORES` の全 descriptor で exact / `<key>/` / `<key>::` hard purge と隣接 prefix 保持。
+- rating hard delete 後の `count_by_stars` 即時減少。
+- PDF password の exact / フォルダ配下 hash purge。
+- タグ検索 missing の結果非表示 + `item_tags` / `tag_item_state` 保持。
+- 削除完了時の rating / tags cache と補正・回転 presence set 整合。
+
+#### 自動検証
+
+- `cargo fmt` / `cargo fmt --check`: exit 0。
+- `cargo test --bin mimageviewer-core`: exit 0、3393 passed / 17 ignored / 0 failed。
+- `python scripts/check_ui_glyphs.py`: exit 0、dangerous glyph 0。
+- `.\scripts\build-release.ps1 -SkipVst3Bridge`: exit 0。core / launcher release build成功。
+  既存 VST3 host 本体と sha256 の削除は access denied warning だったが、SkipVst3Bridge の
+  既存 bridge 埋め込みと今回の core / launcher 生成には影響しなかった。
+
+## 推奨アクション (現在、優先順)
+
+1. **実機 smoke**: 追補第13弾・改の「mIV削除で★件数が即減り、補正/タグ/回転も消える /
+   同 path へごみ箱復元後もメタは戻らない / 外付け切断中のタグ検索はDB非破壊」、
+   追補第12弾の数千ファイル削除直後の終了、追補第10弾の本体 /
+   テンキー Enter 双方向分離、checklist の P2-11 継続項目、
+   NAS/切断ドライブ相当の EOF/次送り (連打でも resolver thread 最大 1、ParkedLive 中の
+   main 入力後も EOF 再試行)、
+   音声タグ結果、タグビューの種類 = 音声、MP3 の Ctrl+G ファイル名 hit → 音楽ビュー再生、
+   種類ファセットの音声絞り込みを確認する。
+2. **将来の detached リワーク**: bundle × App-global runtime のさらなる所有境界一本化は、
+   凍結中の構造課題として既存リワーク計画へ引き継ぐ。

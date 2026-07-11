@@ -2033,6 +2033,7 @@ impl App {
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
         self.discard_parked_native_video_pending_for_window(window_id, reason);
+        self.cancel_media_navigation_pending_for_owner(Some(window_id), reason);
         let runtime = self.detached_window_runtimes.remove(&window_id);
         if let Some(runtime) = runtime.as_ref() {
             if let Some(placement) = runtime
@@ -4857,6 +4858,165 @@ pub(crate) struct VideoTileSwapPending {
     pub(crate) parked_live_window_id: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MediaNavigationCandidate {
+    pub(crate) idx: usize,
+    /// `Some` は UI thread 外で existence check が必要な実ファイル。
+    /// `None` は ZIP/PDF 内 entry など、実ファイル検証の対象外である仮想項目。
+    pub(crate) path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManualMediaNavigationLanding {
+    Fullscreen,
+    #[cfg(windows)]
+    NativeVideo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MediaNavigationAction {
+    VideoContinuousEof {
+        fs_idx: usize,
+        seek_serial: u64,
+    },
+    #[cfg(windows)]
+    VideoAudioModeContinuousEof {
+        fs_idx: usize,
+        seek_serial: u64,
+    },
+    MusicContinuousEof {
+        fs_idx: usize,
+        seek_serial: u64,
+    },
+    Manual {
+        fs_idx: usize,
+        delta: i32,
+        landing: ManualMediaNavigationLanding,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct MediaNavigationResolveResult {
+    pub(crate) target_idx: Option<usize>,
+    pub(crate) missing: Vec<(usize, PathBuf)>,
+}
+
+struct MediaNavigationResolverRequest {
+    request_id: u64,
+    candidates: Vec<MediaNavigationCandidate>,
+    required_matches: u32,
+    source: &'static str,
+    input_seq: u64,
+}
+
+struct MediaNavigationResolverResponse {
+    request_id: u64,
+    result: MediaNavigationResolveResult,
+}
+
+/// `Path::exists` を直列化する App-global dispatcher。
+///
+/// request sender の drop が終了通知になる。in-flight の `Path::exists` は OS から戻るまで
+/// 中断できないため join はせず、終了時に UI thread を待たせない。
+pub(crate) struct MediaNavigationResolver {
+    request_tx: mpsc::Sender<MediaNavigationResolverRequest>,
+    result_rx: mpsc::Receiver<MediaNavigationResolverResponse>,
+    next_request_id: u64,
+}
+
+pub(crate) struct MediaNavigationPending {
+    request_id: u64,
+    items_generation: u64,
+    input_seq: u64,
+    owner_window_id: Option<u64>,
+    fullscreen_idx: Option<usize>,
+    source: &'static str,
+    action: MediaNavigationAction,
+    started_at: std::time::Instant,
+}
+
+fn coalesce_latest_media_navigation_request(
+    first: MediaNavigationResolverRequest,
+    queued: impl IntoIterator<Item = MediaNavigationResolverRequest>,
+) -> MediaNavigationResolverRequest {
+    queued.into_iter().last().unwrap_or(first)
+}
+
+impl MediaNavigationResolver {
+    fn spawn() -> Option<Self> {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("media-nav-resolver".to_string())
+            .spawn(move || {
+                while let Ok(first) = request_rx.recv() {
+                    // Mailbox semantics: a burst queued before this dispatch starts is
+                    // coalesced to its newest request. An in-flight Path::exists cannot be
+                    // cancelled; requests arriving during it wait here instead of spawning.
+                    let request =
+                        coalesce_latest_media_navigation_request(first, request_rx.try_iter());
+                    let started = std::time::Instant::now();
+                    let candidate_count = request.candidates.len();
+                    let never_cancel = std::sync::atomic::AtomicBool::new(false);
+                    let result = App::resolve_media_navigation_candidates(
+                        &request.candidates,
+                        request.required_matches,
+                        &never_cancel,
+                        std::path::Path::exists,
+                    );
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "media_nav",
+                            "candidate_worker_done",
+                            None,
+                            request.input_seq,
+                            &[
+                                ("source", serde_json::Value::from(request.source)),
+                                (
+                                    "request_id",
+                                    serde_json::Value::from(request.request_id as i64),
+                                ),
+                                (
+                                    "candidate_count",
+                                    serde_json::Value::from(candidate_count as i64),
+                                ),
+                                (
+                                    "elapsed_ms",
+                                    serde_json::Value::from(
+                                        started.elapsed().as_secs_f64() * 1000.0,
+                                    ),
+                                ),
+                            ],
+                        );
+                    }
+                    if result_tx
+                        .send(MediaNavigationResolverResponse {
+                            request_id: request.request_id,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            request_tx,
+            result_rx,
+            next_request_id: 0,
+        })
+    }
+
+    fn allocate_request_id(&mut self) -> u64 {
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        if self.next_request_id == 0 {
+            self.next_request_id = 1;
+        }
+        self.next_request_id
+    }
+}
+
 #[cfg(windows)]
 pub(crate) struct NativeVideoFastSwapPending {
     pub(crate) target_idx: usize,
@@ -5677,6 +5837,7 @@ struct ViewerContextMediaResumeUpdate {
     key: String,
     position: f64,
     duration: f64,
+    at_eof: bool,
 }
 
 #[cfg(windows)]
@@ -5698,6 +5859,24 @@ fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool
                 .video_audio_vst
                 .as_ref()
                 .is_some_and(|state| state.fs_idx == idx))
+}
+
+/// resume 保存に使う現在位置を、映像の表示状態に合わせて選ぶ。
+///
+/// 純粋な動画→音声モードでは presenter が hidden のため表示 PTS が入口で止まる。
+/// VST ホスト表示中は presenter が再び進むので、通常動画と同じ表示 PTS を優先する。
+/// (review-v2.3.0 追補6: R1-1 audio-mode resume)
+fn video_resume_position_for_save(
+    player: &crate::video::VideoPlayer,
+    audio_mode_without_vst: bool,
+) -> f64 {
+    if audio_mode_without_vst {
+        player.position()
+    } else {
+        player
+            .last_displayed_pts_secs()
+            .unwrap_or_else(|| player.position())
+    }
 }
 
 #[cfg(windows)]
@@ -5723,17 +5902,21 @@ fn viewer_context_media_teardown_plan(
             _ => {}
         }
     }
-    for entry in bundle.fs_cache.values() {
+    for (idx, entry) in &bundle.fs_cache {
         if let FsCacheEntry::Video { player, .. } = entry {
             let path = player.path().clone();
             push_media_path(&path);
+            let audio_mode_without_vst = bundle.video_audio_mode == Some(*idx)
+                && !bundle
+                    .video_audio_vst
+                    .as_ref()
+                    .is_some_and(|state| state.fs_idx == *idx);
             plan.resume_updates.push(ViewerContextMediaResumeUpdate {
                 key: crate::adjustment_db::normalize_path(&path),
                 path,
-                position: player
-                    .last_displayed_pts_secs()
-                    .unwrap_or_else(|| player.position()),
+                position: video_resume_position_for_save(player, audio_mode_without_vst),
                 duration: player.duration(),
+                at_eof: player.is_at_eof(),
             });
         }
     }
@@ -5747,7 +5930,13 @@ fn apply_viewer_context_media_resume_updates(
 ) -> Vec<String> {
     let mut removed = Vec::new();
     for update in updates {
-        if !save_video_resume_position(map, update.key.clone(), update.position, update.duration) {
+        if !save_video_resume_position(
+            map,
+            update.key.clone(),
+            update.position,
+            update.duration,
+            update.at_eof,
+        ) {
             removed.push(update.key.clone());
         }
     }
@@ -6072,6 +6261,10 @@ pub struct App {
     /// 次の描画フレームで該当 viewport へ明示 close を送るためのキュー。
     #[cfg(windows)]
     pub(crate) detached_image_window_close_pending: Vec<u64>,
+    /// ParkedLive bundle を一時 mount している poll 中に判明した致命的 open failure。
+    /// bundle を snapshot へ戻した後で共通 teardown seam を通して窓を閉じる。
+    #[cfg(windows)]
+    pub(crate) parked_live_media_close_after_poll: Vec<(u64, &'static str)>,
     #[cfg(windows)]
     pub(crate) next_detached_image_window_id: u64,
     /// 直近にアクティブだった detached ウィンドウの window_id。`detached_viewer_window_id`
@@ -6986,6 +7179,13 @@ pub struct App {
     /// `source_epoch` ではなく `AvClock::current_seek_serial()` を使うことで、同一動画を
     /// seek(0) で再生し直した場合も次の EOF は別イベントとして扱える。
     pub(crate) video_continuous_last_eof: Option<(usize, u64)>,
+    /// 欠損した stale bundle path を UI thread で stat せずに飛ばす候補解決 worker。
+    /// App-global だが owner stamp + items generation で mounted / ParkedLive を分離する。
+    /// (review-v2.3.0 追補7: R1 第2波 P1-1)
+    pub(crate) media_navigation_pending: Option<MediaNavigationPending>,
+    /// `Path::exists` を 1 本の常駐 thread に直列化する lazy dispatcher。
+    /// request mailbox は worker が受信時に drain し、最新 request だけを処理する。
+    pub(crate) media_navigation_resolver: Option<MediaNavigationResolver>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (F キーでトグル)。
     pub(crate) video_perf_overlay_visible: bool,
 
@@ -9185,6 +9385,7 @@ impl App {
             detached_viewer_main_history_suppression_depth: 0,
             #[cfg(windows)]
             detached_image_window_close_pending: Vec::new(),
+            parked_live_media_close_after_poll: Vec::new(),
             #[cfg(windows)]
             next_detached_image_window_id: 1,
             #[cfg(windows)]
@@ -9518,6 +9719,8 @@ impl App {
             last_loop_pos: std::collections::HashMap::new(),
             video_continuous_mode,
             video_continuous_last_eof: None,
+            media_navigation_pending: None,
+            media_navigation_resolver: None,
             video_perf_overlay_visible: false,
             rating_db,
             tags_db,
@@ -11566,7 +11769,8 @@ impl App {
     ///
     /// 表示直後に履歴全体を検査すると、外付けドライブやネットワークパスで UI が重くなったり、
     /// 後から件数が変わって行がずれる体験になる。ここではユーザーが実際に開こうとした
-    /// 1 件だけを軽く確認し、確実に存在しない場合だけ現在のビューと DB から外す。
+    /// 1 件だけを軽く確認する。missing は外付け切断や NAS offline と区別できないため、
+    /// 現在のビューにも DB にも破壊的変更を加えない。
     pub(crate) fn guard_reading_history_open(&mut self, idx: usize) -> bool {
         if !self.items_are_reading_history_view {
             return true;
@@ -11595,10 +11799,10 @@ impl App {
         match reading_history_open_path_status(&path) {
             ReadingHistoryOpenPathStatus::Available => true,
             ReadingHistoryOpenPathStatus::Missing => {
-                self.forget_missing_reading_history_entry(idx, key);
                 self.show_feedback_toast(
-                    "ファイルが見つからないため、読書履歴から削除しました".to_string(),
+                    "ファイルが見つかりません。読書履歴は保持されています".to_string(),
                 );
+                let _ = key;
                 false
             }
             ReadingHistoryOpenPathStatus::Unavailable => {
@@ -11608,22 +11812,6 @@ impl App {
                 );
                 false
             }
-        }
-    }
-
-    fn forget_missing_reading_history_entry(&mut self, idx: usize, key: Option<String>) {
-        if let Some(key) = key {
-            self.reading_history_rows.remove(&key);
-            if let Some(writer) = &self.reading_history_writer {
-                writer.remove_keys(vec![key.clone()]);
-            } else if let Some(db) = self.reading_history_db.as_ref()
-                && let Err(e) = db.remove_key(&key)
-            {
-                crate::logger::log(format!("reading-history: remove missing failed: {e}"));
-            }
-        }
-        if idx < self.items.len() {
-            self.remove_items_batch(&[idx]);
         }
     }
 
@@ -14646,6 +14834,7 @@ impl App {
                 crate::tag_view::TagViewItemKind::Folder => GridItem::Folder(entry.path.clone()),
                 crate::tag_view::TagViewItemKind::Image => GridItem::Image(entry.path.clone()),
                 crate::tag_view::TagViewItemKind::Video => GridItem::Video(entry.path.clone()),
+                crate::tag_view::TagViewItemKind::Audio => GridItem::Audio(entry.path.clone()),
                 crate::tag_view::TagViewItemKind::ZipFile => GridItem::ZipFile(entry.path.clone()),
                 crate::tag_view::TagViewItemKind::PdfFile => GridItem::PdfFile(entry.path.clone()),
                 crate::tag_view::TagViewItemKind::Archive(format) => GridItem::ConvertibleArchive {
@@ -15547,9 +15736,19 @@ impl App {
         ));
 
         #[cfg(windows)]
-        if self.should_preserve_active_detached_image_window_for_main_context_change() {
-            self.preserve_active_detached_image_window_for_main_context_change();
-            self.close_fullscreen();
+        {
+            // ZIP は列挙待ちで items を先に clear するため、完了後の start_loading_items では
+            // unbundled メディアを判定できない。still preserve / close より先に退避する。
+            // cache-hit / 入れ子 ZIP の再帰入口でも二度目は fullscreen_idx=None で no-op。
+            // (review-v2.3.0 追補6: R2-P2-2 ZIP media promote)
+            let detached_media_preserved =
+                self.promote_active_detached_video_for_main_context_change();
+            if !detached_media_preserved
+                && self.should_preserve_active_detached_image_window_for_main_context_change()
+            {
+                self.preserve_active_detached_image_window_for_main_context_change();
+                self.close_fullscreen();
+            }
         }
 
         // 入れ子に RAR/7z/LZH を含み、過去に「展開キャッシュ」へ変換済みの ZIP は、
@@ -17151,6 +17350,7 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
     ) {
+        self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         self.clear_color_filter_for_new_items();
         self.color_filter_scope_refresh_pending = false;
         self.current_color_cache_map = None;
@@ -19502,7 +19702,10 @@ impl App {
     /// 「ページ編集 overlay を出さない」べき経路 (= 検索 view 由来 snapshot や
     /// `replace_search_view_items`) からも単独で呼ぶ。**ここに列挙するマップ集合が
     /// idx-keyed ページ編集状態の正準リスト**。新しい idx-keyed ページ編集マップを足したら
-    /// ここと `remove_items_batch` の shift 群の両方に追加すること。
+    /// ここと `remove_items_batch` の shift 群の両方に追加すること。bundle 外の native pending
+    /// (`native_video_source_swap_pending` / `native_video_open_pending` /
+    /// `native_video_fast_swap_pending` / `video_tile_swap_pending`) も owner=None の mounted 所有だけ
+    /// 同じ shift 群へ追加すること (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
         self.adjustment_page_params.clear();
         self.local_adjust_page_layers.clear();
@@ -19844,9 +20047,21 @@ impl App {
                 self.video_audio_mode_entry_target = None;
             }
         }
-        self.video_continuous_last_eof = self
-            .video_continuous_last_eof
-            .and_then(|(i, serial)| shift(i).map(|ni| (ni, serial)));
+        #[cfg(windows)]
+        let detached_media_owns_global_indices = self
+            .active_detached_viewer_context_contains_video()
+            || self.parked_live_media_window_exists();
+        #[cfg(not(windows))]
+        let detached_media_owns_global_indices = false;
+        // active promoted は owner=None、ParkedLive は bundle mount 時だけ global EOF state を使う。
+        // いずれも fs_idx は bundle 空間なので、main items の削除では shift しない。
+        // メディア窓 1 本規則により、この間に mounted main media の EOF state は併存しない。
+        // (review-v2.3.0 追補6: R2-P2-1 media index ownership)
+        if !detached_media_owns_global_indices {
+            self.video_continuous_last_eof = self
+                .video_continuous_last_eof
+                .and_then(|(i, serial)| shift(i).map(|ni| (ni, serial)));
+        }
         // 音量ノーマライズ / ループ位置の idx-keyed 状態も同様に shift (Codex fix-review P2)。
         self.normalize_ui_states = std::mem::take(&mut self.normalize_ui_states)
             .into_iter()
@@ -19866,14 +20081,18 @@ impl App {
         // 完了結果が stale 扱いになり、再生再開 / preroll 解除 / gain 反映が落ちる)。
         // 対象自体が削除されたら worker を cancel して畳む (player も fs_cache から
         // 消えるので preroll suspend の解除は不要)。
-        if let Some(mut st) = self.normalize_state.take() {
-            match shift(st.fs_idx) {
-                Some(ni) => {
-                    st.fs_idx = ni;
-                    self.normalize_state = Some(st);
-                }
-                None => {
-                    st.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // normalize_state も App-global だが、active promoted / ParkedLive の poll 中は bundle の
+        // fs_idx を保持する。path 所有は teardown 側で照合するため main 削除では触らない。
+        if !detached_media_owns_global_indices {
+            if let Some(mut st) = self.normalize_state.take() {
+                match shift(st.fs_idx) {
+                    Some(ni) => {
+                        st.fs_idx = ni;
+                        self.normalize_state = Some(st);
+                    }
+                    None => {
+                        st.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -19898,6 +20117,109 @@ impl App {
         #[cfg(windows)]
         {
             self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(shift);
+            // owner=None は mounted と promoted active の二義。active bundle が存在する間は
+            // 4 pending の idx 空間も bundle 側なので main items の削除では shift しない。
+            // ParkedLive pending は owner=Some(window_id) の既存 gate で別途守られる。
+            let shift_ownerless_native_pending =
+                !self.active_detached_viewer_context_contains_video();
+            // bundle 外の native pending 4 種も、現在 mount 中の context 所有 (owner=None)
+            // だけ main items の old→new idx へ追随させる。owner=Some(window_id) は ParkedLive
+            // bundle 内 items の idx 空間なので、main grid の削除では絶対に動かさない。
+            // (review-v2.3.0 追補3: 角度A-1)
+            let discard_source_swap =
+                self.native_video_source_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.parked_live_window_id.is_none()
+                            && shift_ownerless_native_pending
+                            && shift(pending.target_idx).is_none()
+                    });
+            if discard_source_swap {
+                if let Some(pending) = self.native_video_source_swap_pending.take() {
+                    // source-swap は presenter を pending.native_output だけで保持するため、
+                    // state を単に drop せず close_fullscreen と同じ overlay 後始末を通す。
+                    pending.native_output.set_navigation_preview(None);
+                    if pending.reason == "tile" {
+                        self.video_tile_state = None;
+                        self.video_tile_mode_active = false;
+                        self.video_tile_reopen_pending = false;
+                        self.video_tile_reopen_deadline = None;
+                    }
+                }
+            } else if let Some(pending) = self.native_video_source_swap_pending.as_mut()
+                && pending.parked_live_window_id.is_none()
+                && shift_ownerless_native_pending
+            {
+                // from_idx は完了ログ用の provenance で、旧 source 自体が削除されても target
+                // が残る限り swap は継続できる。削除スロットへ詰まった位置に collapse する。
+                let collapsed_from =
+                    pending.from_idx - sorted_asc.partition_point(|&x| x < pending.from_idx);
+                pending.from_idx = shift(pending.from_idx)
+                    .unwrap_or_else(|| collapsed_from.min(self.items.len().saturating_sub(1)));
+                pending.target_idx =
+                    shift(pending.target_idx).expect("source-swap target removal handled above");
+            }
+
+            let discard_open = self
+                .native_video_open_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.parked_live_window_id.is_none()
+                        && shift_ownerless_native_pending
+                        && shift(pending.idx).is_none()
+                });
+            if discard_open {
+                self.native_video_open_pending = None;
+            } else if let Some(pending) = self.native_video_open_pending.as_mut()
+                && pending.parked_live_window_id.is_none()
+                && shift_ownerless_native_pending
+            {
+                pending.idx = shift(pending.idx).expect("native open target removal handled above");
+            }
+
+            let discard_fast =
+                self.native_video_fast_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.parked_live_window_id.is_none()
+                            && shift_ownerless_native_pending
+                            && shift(pending.target_idx).is_none()
+                    });
+            if discard_fast {
+                self.native_video_fast_swap_pending = None;
+                // deferred delta は fast/tile pending の companion。pending だけ落として残すと
+                // 別 context の poll が取り出すため、同時に破棄する (追補3: 角度A-2)。
+                self.native_video_deferred_nav_delta = None;
+            } else if let Some(pending) = self.native_video_fast_swap_pending.as_mut()
+                && pending.parked_live_window_id.is_none()
+                && shift_ownerless_native_pending
+            {
+                pending.target_idx =
+                    shift(pending.target_idx).expect("fast-swap target removal handled above");
+            }
+
+            let discard_tile = self
+                .video_tile_swap_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.parked_live_window_id.is_none()
+                        && shift_ownerless_native_pending
+                        && shift(pending.target_idx).is_none()
+                });
+            if discard_tile {
+                self.video_tile_swap_pending = None;
+                self.video_tile_state = None;
+                self.video_tile_mode_active = false;
+                self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
+                self.native_video_deferred_nav_delta = None;
+            } else if let Some(pending) = self.video_tile_swap_pending.as_mut()
+                && pending.parked_live_window_id.is_none()
+                && shift_ownerless_native_pending
+            {
+                pending.target_idx =
+                    shift(pending.target_idx).expect("tile-swap target removal handled above");
+            }
         }
 
         // 再生中の動画/音声 player (FsCacheEntry::Video) は shift した新 idx で温存する。
@@ -19972,9 +20294,39 @@ impl App {
                 Some(FsCacheEntry::Video { player, .. })
                     if matches_key(&crate::adjustment_db::normalize_path(player.path()))
             );
-            if player_matches {
+            // player 作成前でも、表示 item 自体が削除対象の media で、かつ VST3/native open
+            // 待ちなら handle 取得競合前に同じ close 経路へ入れる。静止画は従来どおり
+            // remove_items_batch の隣接再整合へ任せる (review-v2.3.0 追補3: 角度A-3)。
+            #[cfg(windows)]
+            let deferred_media_matches = self
+                .items
+                .get(idx)
+                .and_then(grid_item_media_path)
+                .is_some_and(|item_path| {
+                    if !matches_key(&crate::adjustment_db::normalize_path(item_path)) {
+                        return false;
+                    }
+                    let vst_waiting = self.vst3_deferred_media_open == Some(idx);
+                    let native_waiting = !self.active_detached_viewer_context_contains_video()
+                        && self
+                            .native_video_open_pending
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.parked_live_window_id.is_none()
+                                    && pending.idx == idx
+                                    && crate::folder_tree::path_eq(&pending.path, item_path)
+                                    && matches_key(&crate::adjustment_db::normalize_path(
+                                        &pending.path,
+                                    ))
+                            });
+                    vst_waiting || native_waiting
+                });
+            #[cfg(not(windows))]
+            let deferred_media_matches = false;
+            if player_matches || deferred_media_matches {
                 crate::logger::log(format!(
-                    "[removed-path] close main fullscreen (playing target) reason={reason}"
+                    "[removed-path] close main fullscreen (playing/deferred media target) \
+                     reason={reason} player={player_matches} deferred={deferred_media_matches}"
                 ));
                 self.close_fullscreen();
             }
@@ -20015,6 +20367,9 @@ impl App {
                     self.detached_image_window_close_pending.push(*id);
                     self.clear_detached_window_hwnd_for_window_id(*id);
                 }
+                // passive/parked の直接 retain-drop でも共通 teardown seam を通し、最終
+                // resume を保存してから rename の path 移行へ渡す (review-v2.3.0 追補3: A-4)。
+                self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
                 self.detached_image_windows
                     .retain(|window| !ids.contains(&window.id));
                 for id in ids {
@@ -20087,6 +20442,94 @@ impl App {
             .retain(|key, _| !matches_key(key));
         self.video_resume_thumb_last_request
             .retain(|key, _| !matches_key(key));
+    }
+
+    /// delete worker が hard purge 済みの path に合わせて、DB を再読込せず App-global の
+    /// presence set / path cache を同じ exact + `/` + `::` 規則で整合させる。
+    fn purge_in_memory_metadata_for_removed_paths(
+        &mut self,
+        removed: &[std::path::PathBuf],
+        purged_pdf_password_paths: &[std::path::PathBuf],
+    ) {
+        let matches_key = removed_path_key_matcher(removed);
+
+        self.rating_cache.clear();
+        self.rotation_cache.clear();
+        self.current_folder_rating_cache = None;
+        self.invalidate_rating_counts_cache();
+        self.reset_folder_rating_counts();
+        self.tags_cache.retain(|key, _| !matches_key(key));
+        self.user_set_rating_keys.retain(|key| !matches_key(key));
+        self.folder_pin_map.retain(|key, _| !matches_key(key));
+        self.search_drilled_folder_counts
+            .retain(|key, _| !matches_key(key));
+        self.reading_history_rows.retain(|key, _| !matches_key(key));
+        self.rating_view_rows.retain(|row| !matches_key(&row.key));
+
+        for set in [
+            &mut self.adjusted_page_keys,
+            &mut self.local_adjust_page_keys,
+            &mut self.mask_page_keys,
+            &mut self.conceal_page_keys,
+            &mut self.comic_page_keys,
+            &mut self.rotation_page_keys,
+        ] {
+            set.retain(|key| !matches_key(key));
+        }
+
+        if self
+            .fullscreen_video_marker_cache
+            .as_ref()
+            .is_some_and(|cache| matches_key(&crate::adjustment_db::normalize_path(&cache.path)))
+        {
+            self.fullscreen_video_marker_cache = None;
+            self.cancel_fullscreen_video_marker_thumb_decode();
+        }
+        if self
+            .music_bookmarks_loaded_for
+            .as_ref()
+            .is_some_and(|path| matches_key(&crate::adjustment_db::normalize_path(path)))
+        {
+            self.music_bookmarks.clear();
+            self.music_bookmarks_loaded_for = None;
+        }
+        if self
+            .last_book_resume
+            .as_ref()
+            .is_some_and(|(path, _)| matches_key(&crate::adjustment_db::normalize_path(path)))
+        {
+            self.last_book_resume = None;
+        }
+        if self
+            .last_reading_history_touch
+            .as_ref()
+            .is_some_and(|(key, _)| matches_key(key))
+        {
+            self.last_reading_history_touch = None;
+        }
+        if self
+            .reading_history_return_from
+            .as_ref()
+            .is_some_and(|path| matches_key(&crate::adjustment_db::normalize_path(path)))
+        {
+            self.reading_history_return_from = None;
+        }
+        self.video_thumb_overrides_dirty_paths
+            .retain(|path| !matches_key(&crate::adjustment_db::normalize_path(path)));
+        for path in purged_pdf_password_paths {
+            self.pdf_passwords.remove(path);
+        }
+        for path in removed {
+            let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+                continue;
+            };
+            if let Some(sidecar) = self.sidecars.get_mut(parent) {
+                sidecar.purge_deleted_root(&file_name.to_string_lossy().to_lowercase());
+            }
+        }
+        self.sidecars
+            .retain(|folder, _| !matches_key(&crate::adjustment_db::normalize_path(folder)));
+        self.invalidate_tag_apply_suggestions();
     }
 
     /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
@@ -20530,9 +20973,16 @@ impl App {
         let mut canceled = false;
         loop {
             match pending.rx.try_recv() {
-                Ok(crate::delete_worker::DeleteMsg::Batch { succeeded, failed }) => {
+                Ok(crate::delete_worker::DeleteMsg::Batch {
+                    succeeded,
+                    failed,
+                    purged_pdf_password_paths,
+                }) => {
                     pending.succeeded.extend(succeeded);
                     pending.failed.extend(failed);
+                    pending
+                        .purged_pdf_password_paths
+                        .extend(purged_pdf_password_paths);
                 }
                 Ok(crate::delete_worker::DeleteMsg::Done { canceled: c }) => {
                     done = true;
@@ -20553,6 +21003,7 @@ impl App {
 
         let pending = self.delete_pending.take().expect("guarded above");
         let succeeded = pending.succeeded;
+        let purged_pdf_password_paths = pending.purged_pdf_password_paths;
         let failed_count = pending.failed.len();
 
         crate::logger::log(format!(
@@ -20575,6 +21026,10 @@ impl App {
         if succeeded.is_empty() {
             return;
         }
+
+        // delete-worker は Shell 成功バッチを送る前に全 path-keyed store を hard purge 済み。
+        // UI 側は disk I/O をせず presence set / cache を同じ path 境界で整合させる。
+        self.purge_in_memory_metadata_for_removed_paths(&succeeded, &purged_pdf_password_paths);
 
         // 消えた path の再生位置記録を破棄する (角度④ (A)。窓のクローズは
         // `start_delete_files` が worker spawn 前に済ませている)。
@@ -24314,7 +24769,9 @@ impl App {
                     // (= 動画 + shift_enter のときは intercept をスキップして下の Video arm に流す)。
                     let stack_skip_for_external_video = external_player_video
                         && matches!(self.items.get(idx), Some(GridItem::Video(_)));
-                    if !stack_skip_for_external_video && self.stack_try_open_from_grid(idx, false) {
+                    if !stack_skip_for_external_video
+                        && self.stack_try_open_from_grid(ctx, idx, false)
+                    {
                         return None;
                     }
                     #[cfg(windows)]
@@ -24330,7 +24787,8 @@ impl App {
                             let p = p.clone();
                             let auto_fs = self.should_auto_fullscreen_grid_container(idx);
                             #[cfg(windows)]
-                            if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx)
+                            if auto_fs
+                                && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
                             {
                                 return None;
                             }
@@ -24352,12 +24810,7 @@ impl App {
                         | Some(GridItem::Video(_))
                         | Some(GridItem::Audio(_)) => {
                             #[cfg(windows)]
-                            if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
-                                return None;
-                            }
-                            // §3.0 ④: 連動なし窓があれば passive へ退避してから新規 open。
-                            #[cfg(windows)]
-                            if !self.park_active_detached_context_for_new_grid_open(ctx) {
+                            if !self.prepare_detached_context_for_grid_open(ctx, idx) {
                                 return None;
                             }
                             // 動画も画像と同じくフルスクリーン化 → インライン再生。
@@ -25091,7 +25544,7 @@ impl App {
                     return None;
                 }
                 #[cfg(windows)]
-                if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx) {
+                if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                     return None;
                 }
                 self.pending_auto_fs_open = auto_fs;
@@ -27988,6 +28441,110 @@ impl App {
         viewer_context_bundle_is_music_consumer(bundle)
     }
 
+    /// App-global な tile companion が、閉じる ParkedLive 窓のものかを判定する。
+    /// owner stamp がある tile/source-swap pending を最優先し、pending が無い完成済み
+    /// tile は bundle の表示動画 path と「他に video context が無い」事実で帰属を決める。
+    /// これにより無関係な mounted tile state を巻き込まない。
+    /// (review-v2.3.0 追補3: 角度A-2)
+    #[cfg(windows)]
+    fn parked_window_owns_video_tile_companion(&self, window_id: u64) -> bool {
+        let explicit_owner = self
+            .video_tile_swap_pending
+            .as_ref()
+            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
+            || self
+                .native_video_source_swap_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.reason == "tile" && pending.parked_live_window_id == Some(window_id)
+                });
+        if explicit_owner {
+            return true;
+        }
+        // 別 owner (None = mounted を含む) の tile pending があるなら companion はそちら。
+        if self.video_tile_swap_pending.is_some()
+            || self
+                .native_video_source_swap_pending
+                .as_ref()
+                .is_some_and(|pending| pending.reason == "tile")
+        {
+            return false;
+        }
+        if !self.video_tile_mode_active
+            && !self.video_tile_reopen_pending
+            && self.video_tile_state.is_none()
+        {
+            return false;
+        }
+
+        let bundle_video_path = self
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .and_then(|window| window.paused_bundle.as_deref())
+            .and_then(|bundle| {
+                bundle
+                    .fullscreen_idx
+                    .and_then(|idx| bundle.items.get(idx))
+                    .and_then(|item| match item {
+                        GridItem::Video(path) => Some(path.as_path()),
+                        _ => None,
+                    })
+            });
+        let Some(bundle_video_path) = bundle_video_path else {
+            return false;
+        };
+        if self.current_viewer_context_contains_video()
+            || self.active_detached_viewer_context_contains_video()
+        {
+            return false;
+        }
+        let another_parked_video_exists = self.detached_image_windows.iter().any(|window| {
+            window.id != window_id
+                && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                    bundle
+                        .fullscreen_idx
+                        .and_then(|idx| bundle.items.get(idx))
+                        .is_some_and(|item| matches!(item, GridItem::Video(_)))
+                })
+        });
+        if another_parked_video_exists {
+            return false;
+        }
+        self.video_tile_state
+            .as_ref()
+            .is_none_or(|state| crate::folder_tree::path_eq(&state.video_path, bundle_video_path))
+    }
+
+    /// owner stamp を持たない `native_video_mode_switch` が、まとめて閉じる ParkedLive 群の
+    /// player だけに帰属すると確定できるか。残すと最長 5 秒、font-atlas settle と native
+    /// control availability を塞ぐ。別の mounted/active/surviving parked video があれば
+    /// owner を断定できないので温存する。(review-v2.3.0 追補4: mode-switch teardown)
+    #[cfg(windows)]
+    fn closing_parked_windows_own_native_video_mode_switch(&self, window_ids: &[u64]) -> bool {
+        if self.native_video_mode_switch.is_none()
+            || self.current_viewer_context_contains_video()
+            || self.active_detached_viewer_context_contains_video()
+        {
+            return false;
+        }
+        let closing_has_video = self.detached_image_windows.iter().any(|window| {
+            window_ids.contains(&window.id)
+                && window
+                    .paused_bundle
+                    .as_deref()
+                    .is_some_and(Self::viewer_context_bundle_contains_video)
+        });
+        closing_has_video
+            && !self.detached_image_windows.iter().any(|window| {
+                !window_ids.contains(&window.id)
+                    && window
+                        .paused_bundle
+                        .as_deref()
+                        .is_some_and(Self::viewer_context_bundle_contains_video)
+            })
+    }
+
     /// ParkedLive / passive 窓が所有する bundle を drop する直前のメディア後始末。
     /// fs_idx は context ごとに別空間なので App-global normalize は path で照合する。
     /// (review-v2.3.0 追補 BA-7: parked teardown)
@@ -27997,11 +28554,29 @@ impl App {
         window_ids: &[u64],
         reason: &'static str,
     ) {
+        let clears_tile_companion = window_ids
+            .iter()
+            .any(|&window_id| self.parked_window_owns_video_tile_companion(window_id));
+        let clears_mode_switch =
+            self.closing_parked_windows_own_native_video_mode_switch(window_ids);
         // bundle が既に外されていても、App-global pending の owner は window id で残り得る。
         // teardown seam で先に破棄して presenter/output を孤児化させない。
         // (review-v2.3.0 追補2 BA-7: parked pending teardown)
         for &window_id in window_ids {
             self.discard_parked_native_video_pending_for_window(window_id, reason);
+            self.cancel_media_navigation_pending_for_owner(Some(window_id), reason);
+        }
+        if clears_tile_companion {
+            // tile state/reopen/deadline は bundle 外の companion。所有窓の teardown と同時に
+            // 畳み、次の動画 open へ tile overlay を持ち越さない (追補3: 角度A-2)。
+            self.video_tile_state = None;
+            self.video_tile_mode_active = false;
+            self.video_tile_reopen_pending = false;
+            self.video_tile_reopen_deadline = None;
+            self.native_video_deferred_nav_delta = None;
+        }
+        if clears_mode_switch {
+            self.native_video_mode_switch = None;
         }
         let mut dropped_bundles = Vec::new();
         for window in &mut self.detached_image_windows {
@@ -28066,6 +28641,24 @@ impl App {
         }
     }
 
+    /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
+    /// bundle は所有権を移さず、teardown plan の read-only 部分だけを再利用する。
+    /// (review-v2.3.0 追補6: R1-2 detached exit resume)
+    #[cfg(windows)]
+    pub(crate) fn save_detached_video_resume_positions_for_exit(&mut self) {
+        let mut plans = Vec::new();
+        if let Some(active) = self.active_detached_viewer_context.as_ref() {
+            plans.push(viewer_context_media_teardown_plan(&active.bundle));
+        }
+        plans.extend(
+            self.detached_image_windows
+                .iter()
+                .filter_map(|window| window.paused_bundle.as_deref())
+                .map(viewer_context_media_teardown_plan),
+        );
+        self.save_viewer_context_media_teardown_resumes(&plans);
+    }
+
     #[cfg(windows)]
     fn cleanup_viewer_context_media_teardown_globals(
         &mut self,
@@ -28120,6 +28713,25 @@ impl App {
         self.native_video_parked_live_input_window_id.is_some()
     }
 
+    /// ParkedLive bundle の mount 中は snapshot.paused_bundle が一時的に None なので、その場で
+    /// window を retain-drop せず、poll 後の swap-back まで close を遅延する。
+    /// (review-v2.3.0 追補6: R1-4 parked open timeout)
+    #[cfg(windows)]
+    pub(crate) fn request_parked_live_media_close_after_poll(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) {
+        if !self
+            .parked_live_media_close_after_poll
+            .iter()
+            .any(|(known_id, _)| *known_id == window_id)
+        {
+            self.parked_live_media_close_after_poll
+                .push((window_id, reason));
+        }
+    }
+
     #[cfg(windows)]
     pub(crate) fn poll_parked_live_detached_windows(&mut self, ctx: &egui::Context) {
         let ids = self.parked_live_media_window_ids();
@@ -28157,6 +28769,14 @@ impl App {
                 .find(|window| window.id == id)
             {
                 window.paused_bundle = Some(bundle);
+            }
+            if let Some(request_pos) = self
+                .parked_live_media_close_after_poll
+                .iter()
+                .position(|(window_id, _)| *window_id == id)
+            {
+                let (_, reason) = self.parked_live_media_close_after_poll.remove(request_pos);
+                self.close_detached_image_windows_by_ids(ctx, &[id], &[id], reason, None);
             }
         }
     }
@@ -28372,7 +28992,7 @@ impl App {
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
 
-        if !self.park_and_close_current_active_detached_viewer(ctx) {
+        if !self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx) {
             self.log_detached_image_window_debug(format!(
                 "parked_live_activate_aborted id={id} reason=park_current_failed"
             ));
@@ -28598,6 +29218,23 @@ impl App {
 
     #[cfg(windows)]
     fn park_and_close_current_active_detached_viewer(&mut self, ctx: &egui::Context) -> bool {
+        self.park_and_close_current_active_detached_viewer_inner(ctx, false)
+    }
+
+    #[cfg(windows)]
+    fn park_and_close_current_active_detached_viewer_for_media_handoff(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        self.park_and_close_current_active_detached_viewer_inner(ctx, true)
+    }
+
+    #[cfg(windows)]
+    fn park_and_close_current_active_detached_viewer_inner(
+        &mut self,
+        ctx: &egui::Context,
+        preserve_fullfeature_linked_still: bool,
+    ) -> bool {
         if self.active_detached_viewer_context_contains_video()
             && self
                 .park_active_detached_context_as_live_media(ctx, "park_active_context_live_media")
@@ -28639,7 +29276,9 @@ impl App {
             );
             return self.close_current_active_detached_viewer_context(ctx);
         } else if self.viewer_session_is_detached() {
-            if self.preserve_active_detached_image_window_for_main_context_change() {
+            if self.preserve_active_detached_image_window_for_main_context_change_inner(
+                preserve_fullfeature_linked_still,
+            ) {
                 // preserve (legacy park) 自体は main のフルスクリーン状態を触らない
                 // (load_folder 直呼び経路では後続のフォルダ install が畳むため)。ここ
                 // (parked_live_activate / activate_snapshot などの文脈切替) では畳む者が
@@ -29605,20 +30244,9 @@ impl App {
         };
         let snapshot_id = snapshot.id;
         let mut parked_bundle = if preserve_main_context {
-            let mut main_restore_bundle =
-                self.cloned_main_viewer_context_after_detached_live_media_park();
-            let mut parked_bundle = self.take_current_viewer_context_bundle();
-            self.swap_viewer_context_bundle(&mut main_restore_bundle);
-            // ロード複合体 (worker pool / channel / token / keep atomic) は、グリッドを
-            // 駆動し続ける側 = 復元 main に戻す。clone ベースの復元 bundle は empty() の
-            // 空複合体を持つため、これをしないと park 後のメイングリッドで reload_queue が
-            // None になりサムネ再投入 / idle upgrade が止まる (Codex huntfix P2)。parked
-            // メディア窓は動画/音声再生のみでサムネロードを行わないので空複合体でよく、
-            // 窓 close 時の bundle Drop も no-op になる (= main のプールを巻き込まない)。
-            self.swap_load_complex_with_bundle(&mut parked_bundle);
-            parked_bundle
+            self.split_current_context_for_live_media_park()
         } else {
-            self.take_current_viewer_context_bundle()
+            Box::new(self.take_current_viewer_context_bundle())
         };
         if !Self::viewer_context_bundle_contains_video(&parked_bundle) {
             if !preserve_main_context {
@@ -29630,7 +30258,7 @@ impl App {
         parked_bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
         parked_bundle.detached_viewer_independent_active = true;
         parked_bundle.detached_viewer_open_next_still_detached_once = false;
-        snapshot.paused_bundle = Some(Box::new(parked_bundle));
+        snapshot.paused_bundle = Some(parked_bundle);
         self.detached_image_windows.push(snapshot);
         // mounted/active owner の pending を ParkedLive window へ焼き直す。別 parked window の
         // owner は一致しないため変更しない (review-v2.3.0 追補2 BA-7)。
@@ -29650,84 +30278,393 @@ impl App {
         true
     }
 
+    /// legacy/unbundled live-media park 用に、現在 context を main と ParkedLive に分割する。
+    /// `ViewerContextBundle` の全 field を destructure して 3 分類するため、field 追加時は
+    /// コンパイルエラーになり、空 bundle + allowlist 方式の状態喪失を再発させない。
+    /// (review-v2.3.0 追補4: live-park main 文脈保持)
     #[cfg(windows)]
-    fn clone_current_viewer_context_grid_fields_into(&self, bundle: &mut ViewerContextBundle) {
-        bundle.items = self.items.clone();
-        bundle.thumbnails = self.thumbnails.clone();
-        bundle.image_metas = self.image_metas.clone();
-        bundle.visible_indices = self.visible_indices.clone();
-        bundle.details_order = self.details_order.clone();
-        bundle.current_folder = self.current_folder.clone();
-        bundle.address = self.address.clone();
-        bundle.archive_source_override = self.archive_source_override.clone();
-        bundle.zip_nav = self.zip_nav.clone();
-        bundle.stack_mode_requested = self.stack_mode_requested;
-        bundle.stack_view = self.stack_view.clone();
-        bundle.stack_showing_flat = self.stack_showing_flat;
-        bundle.stack_active_rule = self.stack_active_rule.clone();
-        bundle.stack_script_error = self.stack_script_error.clone();
-        bundle.stack_toggle_select_path = self.stack_toggle_select_path.clone();
-        bundle.items_generation = self.items_generation;
-        bundle.auto_aspect = self.auto_aspect.clone();
-        bundle.items_are_global_search_view = self.items_are_global_search_view;
-        bundle.items_are_tag_view = self.items_are_tag_view;
-        bundle.items_are_reading_history_view = self.items_are_reading_history_view;
-        bundle.items_are_rating_view = self.items_are_rating_view;
-        bundle.items_are_subfolder_expansion_view = self.items_are_subfolder_expansion_view;
-        bundle.items_are_drive_list = self.items_are_drive_list;
-        bundle.rotation_cache = self.rotation_cache.clone();
-        bundle.rating_cache = self.rating_cache.clone();
-        bundle.current_folder_rating_cache = self.current_folder_rating_cache;
-        bundle.selected = self.selected;
-        bundle.scroll_offset_y = self.scroll_offset_y;
-        bundle.scroll_to_selected = self.scroll_to_selected;
-        bundle.keep_range = self.keep_range;
-        bundle.keep_set = self.keep_set.clone();
-        bundle.checked = self.checked.clone();
-        bundle.reading_history_return_from = self.reading_history_return_from.clone();
-        bundle.search_filter = self.search_filter.clone();
-        bundle.search_filter_origin_folder = self.search_filter_origin_folder.clone();
-    }
+    fn split_current_context_for_live_media_park(&mut self) -> Box<ViewerContextBundle> {
+        macro_rules! duplicate_for_parked {
+            ($($field:ident),+ $(,)?) => {
+                $(*$field = self.$field.clone();)+
+            };
+        }
+        macro_rules! move_to_parked {
+            ($($field:ident),+ $(,)?) => {
+                $(std::mem::swap(&mut self.$field, $field);)+
+            };
+        }
+        macro_rules! keep_in_main {
+            ($($field:ident),+ $(,)?) => {
+                $(let _ = $field;)+
+            };
+        }
 
-    /// ロード複合体 (thumb channel / cancel_token / worker queue / request bookkeeping /
-    /// keep atomic 群) **だけ**を
-    /// bundle と交換する。legacy ParkedLive の park (preserve_main_context=true) 専用:
-    /// グリッド状態は clone で複製する一方、ワーカープールは 1 つしか無いので、グリッドを
-    /// 駆動する側へ明示的に付け替える必要がある (review-v2.3.0 Codex huntfix P2)。
-    #[cfg(windows)]
-    fn swap_load_complex_with_bundle(&mut self, bundle: &mut ViewerContextBundle) {
-        // queue と dedup / finalize / upload 待ちを必ず同じ context へ動かす。queue だけ
-        // main へ戻すと、空 requested が同じサムネを毎フレーム再投入する。
-        // (review-v2.3.0 追補2 P2: live-park load complex)
-        std::mem::swap(&mut self.requested, &mut bundle.requested);
-        std::mem::swap(&mut self.pending_finalize, &mut bundle.pending_finalize);
-        std::mem::swap(&mut self.texture_backlog, &mut bundle.texture_backlog);
-        std::mem::swap(&mut self.tx, &mut bundle.tx);
-        std::mem::swap(&mut self.rx, &mut bundle.rx);
-        std::mem::swap(&mut self.cancel_token, &mut bundle.cancel_token);
-        std::mem::swap(&mut self.reload_queue, &mut bundle.reload_queue);
-        std::mem::swap(&mut self.heavy_io_queue, &mut bundle.heavy_io_queue);
-        std::mem::swap(&mut self.scroll_hint, &mut bundle.scroll_hint);
-        std::mem::swap(&mut self.visible_end_shared, &mut bundle.visible_end_shared);
-        std::mem::swap(&mut self.keep_start_shared, &mut bundle.keep_start_shared);
-        std::mem::swap(&mut self.keep_end_shared, &mut bundle.keep_end_shared);
-    }
+        let mut parked = Box::new(ViewerContextBundle::empty());
+        let ViewerContextBundle {
+            address,
+            current_folder,
+            archive_source_override,
+            zip_nav,
+            stack_mode_requested,
+            stack_view,
+            stack_showing_flat,
+            stack_active_rule,
+            stack_script_error,
+            stack_toggle_select_path,
+            items,
+            thumbnails,
+            image_metas,
+            auto_aspect,
+            selected,
+            scroll_offset_y,
+            scroll_to_selected,
+            requested,
+            keep_range,
+            keep_set,
+            details_thumb_suppression_applied,
+            details_hover_thumb_idx,
+            details_hover_thumb_viewport_open,
+            texture_backlog,
+            visible_indices,
+            details_order,
+            details_tag_prewarm_indices,
+            details_lazy_meta,
+            details_meta_pending,
+            details_lazy_visible_revision,
+            details_image_dims_state,
+            tag_prewarm_queued,
+            pending_finalize,
+            tx,
+            rx,
+            cancel_token,
+            reload_queue,
+            heavy_io_queue,
+            scroll_hint,
+            visible_end_shared,
+            keep_start_shared,
+            keep_end_shared,
+            last_vis_range,
+            vis_settle_at,
+            vis_first_logged,
+            vis_all_logged,
+            search_filter,
+            search_filter_origin_folder,
+            checked,
+            rotation_cache,
+            rating_cache,
+            current_folder_rating_cache,
+            vst3_deferred_media_open,
+            fullscreen_idx,
+            viewer_presentation,
+            last_viewer_sync_stamp,
+            native_video_in_window_active,
+            video_audio_mode,
+            video_audio_vst,
+            video_audio_mode_entry_target,
+            video_audio_exit_pending,
+            detached_viewer_independent_active,
+            detached_viewer_open_next_still_detached_once,
+            detached_viewer_window_id,
+            panorama_state,
+            pano_toast_shown_for_current_fs,
+            analysis_mode,
+            analysis_hover_color,
+            analysis_pinned_color,
+            analysis_grayscale,
+            analysis_mosaic_grid,
+            analysis_filter_mag,
+            analysis_guide_drag,
+            view_trim_mode,
+            view_trim_apply_mode,
+            view_trim_page_apply_root_idx,
+            view_trim_page_spread_separate,
+            view_trim_book_settings,
+            view_trim_page_overrides,
+            view_trim_dirty_page_overrides,
+            view_trim_save_pending,
+            fs_cache,
+            fs_margin_bbox_cache,
+            input_generation,
+            fs_pending,
+            fs_early_dims,
+            fs_upload_backlog,
+            items_generation,
+            items_are_global_search_view,
+            items_are_tag_view,
+            items_are_reading_history_view,
+            items_are_rating_view,
+            items_are_subfolder_expansion_view,
+            items_are_drive_list,
+            reading_history_return_from,
+            fs_open_intent_from_grid,
+            pending_detached_video_host_switch,
+            fs_zoom,
+            fs_pan,
+            fs_zoom_active,
+            fs_zoom_aiming,
+            fs_zoom_factor,
+            fs_zoom_pdf_rerender_idx,
+            fs_zoom_pdf_rerender_zoom,
+            fs_pan_drag_start,
+            fs_vertical_scroll,
+            fs_seek_drag_active,
+            fs_seek_overlay_visible,
+            fs_vertical_cache_keep_set,
+            fs_free_rotation,
+            fs_rotation_drag_start,
+            analysis_zoom,
+            analysis_pan,
+            analysis_pan_drag_start,
+            analysis_overlay_cache,
+            analysis_hist_cache,
+            analysis_sv_cache,
+            spread_mode,
+            spread_shift_anchor_idx,
+            reading_flow,
+            reading_direction,
+            slideshow_playing,
+            slideshow_next_at,
+            slideshow_anchor_idx,
+            slideshow_scroll_anim,
+            slideshow_scroll_range_cache,
+            pdf_enumerate_pending,
+            zip_enumerate_pending,
+            fs_nav_after_pdf_enumerate,
+            pending_auto_fs_open,
+            pending_return_to_parent,
+            pdf_placeholder_count,
+            cached_nav_indices,
+            cached_fs_seek_info,
+            fs_nav_locked_gen,
+            fs_holdover_tex,
+            virtual_folder_writeback,
+            pdf_prefetch_grace_until,
+            thumb_pixels,
+            thumb_adjust_tex,
+            adjustment_page_params,
+            local_adjust_page_layers,
+            local_adjust_pages,
+            local_adjust_selected_layers,
+            local_adjust_generation,
+            local_adjust_cache,
+            local_adjust_pending,
+            export_crop_page_settings,
+            export_crop_pages,
+            mask_pages,
+            comic_pages,
+            conceal_pages,
+            erase_mask_generation,
+            conceal_mask_generation,
+            edit_result_cache,
+            final_ai_cache,
+            final_ai_pending,
+            final_ai_failed,
+            final_composite_cache,
+            adjustment_cache,
+            erase_result_cache,
+            erase_preview_cache,
+            erase_base_cache,
+            conceal_base_cache,
+            conceal_cache,
+            comic_cache,
+            comic_bake_pending,
+            erase_inpaint_pending,
+            ai_classify_cache,
+            normalize_ui_states,
+            normalize_auto_scan_suppressed,
+            music_bookmarks,
+            music_bookmarks_loaded_for,
+            last_loop_pos,
+        } = parked.as_mut();
 
-    #[cfg(windows)]
-    fn cloned_main_viewer_context_after_detached_live_media_park(&self) -> ViewerContextBundle {
-        let mut bundle = ViewerContextBundle::empty();
-        self.clone_current_viewer_context_grid_fields_into(&mut bundle);
-        bundle.fullscreen_idx = None;
-        bundle.viewer_presentation = self.non_detached_viewer_presentation();
-        bundle.native_video_in_window_active = false;
-        bundle.detached_viewer_independent_active = false;
-        bundle.detached_viewer_open_next_still_detached_once = false;
-        bundle.detached_viewer_window_id = None;
-        bundle.last_viewer_sync_stamp = None;
-        bundle.fs_open_intent_from_grid = false;
-        bundle.pending_auto_fs_open = false;
-        bundle.pending_return_to_parent = false;
-        bundle
+        // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
+        duplicate_for_parked!(
+            address,
+            current_folder,
+            archive_source_override,
+            zip_nav,
+            stack_mode_requested,
+            stack_view,
+            stack_showing_flat,
+            stack_active_rule,
+            stack_script_error,
+            stack_toggle_select_path,
+            items,
+            thumbnails,
+            image_metas,
+            auto_aspect,
+            selected,
+            scroll_offset_y,
+            scroll_to_selected,
+            keep_range,
+            keep_set,
+            visible_indices,
+            details_order,
+            search_filter,
+            search_filter_origin_folder,
+            checked,
+            rotation_cache,
+            rating_cache,
+            current_folder_rating_cache,
+            items_generation,
+            items_are_global_search_view,
+            items_are_tag_view,
+            items_are_reading_history_view,
+            items_are_rating_view,
+            items_are_subfolder_expansion_view,
+            items_are_drive_list,
+            reading_history_return_from,
+        );
+
+        // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
+        move_to_parked!(
+            vst3_deferred_media_open,
+            fullscreen_idx,
+            viewer_presentation,
+            last_viewer_sync_stamp,
+            native_video_in_window_active,
+            video_audio_mode,
+            video_audio_vst,
+            video_audio_mode_entry_target,
+            video_audio_exit_pending,
+            detached_viewer_independent_active,
+            detached_viewer_open_next_still_detached_once,
+            detached_viewer_window_id,
+            panorama_state,
+            pano_toast_shown_for_current_fs,
+            analysis_mode,
+            analysis_hover_color,
+            analysis_pinned_color,
+            analysis_grayscale,
+            analysis_mosaic_grid,
+            analysis_filter_mag,
+            analysis_guide_drag,
+            fs_cache,
+            fs_margin_bbox_cache,
+            input_generation,
+            fs_pending,
+            fs_early_dims,
+            fs_upload_backlog,
+            fs_open_intent_from_grid,
+            pending_detached_video_host_switch,
+            fs_zoom,
+            fs_pan,
+            fs_zoom_active,
+            fs_zoom_aiming,
+            fs_zoom_factor,
+            fs_zoom_pdf_rerender_idx,
+            fs_zoom_pdf_rerender_zoom,
+            fs_pan_drag_start,
+            fs_vertical_scroll,
+            fs_seek_drag_active,
+            fs_seek_overlay_visible,
+            fs_vertical_cache_keep_set,
+            fs_free_rotation,
+            fs_rotation_drag_start,
+            analysis_zoom,
+            analysis_pan,
+            analysis_pan_drag_start,
+            analysis_overlay_cache,
+            analysis_hist_cache,
+            analysis_sv_cache,
+            slideshow_playing,
+            slideshow_next_at,
+            slideshow_anchor_idx,
+            slideshow_scroll_anim,
+            slideshow_scroll_range_cache,
+            cached_fs_seek_info,
+            fs_nav_locked_gen,
+            fs_holdover_tex,
+            normalize_ui_states,
+            normalize_auto_scan_suppressed,
+            music_bookmarks,
+            music_bookmarks_loaded_for,
+            last_loop_pos,
+        );
+
+        // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
+        // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
+        keep_in_main!(
+            requested,
+            details_thumb_suppression_applied,
+            details_hover_thumb_idx,
+            details_hover_thumb_viewport_open,
+            texture_backlog,
+            details_tag_prewarm_indices,
+            details_lazy_meta,
+            details_meta_pending,
+            details_lazy_visible_revision,
+            details_image_dims_state,
+            tag_prewarm_queued,
+            pending_finalize,
+            tx,
+            rx,
+            cancel_token,
+            reload_queue,
+            heavy_io_queue,
+            scroll_hint,
+            visible_end_shared,
+            keep_start_shared,
+            keep_end_shared,
+            last_vis_range,
+            vis_settle_at,
+            vis_first_logged,
+            vis_all_logged,
+            view_trim_mode,
+            view_trim_apply_mode,
+            view_trim_page_apply_root_idx,
+            view_trim_page_spread_separate,
+            view_trim_book_settings,
+            view_trim_page_overrides,
+            view_trim_dirty_page_overrides,
+            view_trim_save_pending,
+            spread_mode,
+            spread_shift_anchor_idx,
+            reading_flow,
+            reading_direction,
+            pdf_enumerate_pending,
+            zip_enumerate_pending,
+            fs_nav_after_pdf_enumerate,
+            pending_auto_fs_open,
+            pending_return_to_parent,
+            pdf_placeholder_count,
+            cached_nav_indices,
+            virtual_folder_writeback,
+            pdf_prefetch_grace_until,
+            thumb_pixels,
+            thumb_adjust_tex,
+            adjustment_page_params,
+            local_adjust_page_layers,
+            local_adjust_pages,
+            local_adjust_selected_layers,
+            local_adjust_generation,
+            local_adjust_cache,
+            local_adjust_pending,
+            export_crop_page_settings,
+            export_crop_pages,
+            mask_pages,
+            comic_pages,
+            conceal_pages,
+            erase_mask_generation,
+            conceal_mask_generation,
+            edit_result_cache,
+            final_ai_cache,
+            final_ai_pending,
+            final_ai_failed,
+            final_composite_cache,
+            adjustment_cache,
+            erase_result_cache,
+            erase_preview_cache,
+            erase_base_cache,
+            conceal_base_cache,
+            conceal_cache,
+            comic_cache,
+            comic_bake_pending,
+            erase_inpaint_pending,
+            ai_classify_cache,
+        );
+        parked
     }
 
     #[cfg(windows)]
@@ -29783,7 +30720,22 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn fullfeature_linked_still_media_window_mode(&self) -> bool {
+        self.settings.detached_viewer_enabled
+            && !self.settings.detached_viewer_open_images_in_window
+            && self.settings.effective_media_in_media_window()
+    }
+
+    #[cfg(windows)]
     fn should_preserve_active_detached_image_window_for_main_context_change(&self) -> bool {
+        self.should_preserve_active_detached_image_window_for_main_context_change_inner(false)
+    }
+
+    #[cfg(windows)]
+    fn should_preserve_active_detached_image_window_for_main_context_change_inner(
+        &self,
+        preserve_fullfeature_linked_still: bool,
+    ) -> bool {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -29796,12 +30748,28 @@ impl App {
         }
         self.viewer_session_is_detached()
             && self.viewer_item_supports_detached_still(idx)
-            && self.settings.detached_viewer_open_images_in_window
+            && (self.settings.detached_viewer_open_images_in_window
+                // review-v2.3.0 追補5: §1.7 linked still × media open。
+                // 通常の main context change では CUT 後の linked 非 passive 仕様を維持し、
+                // media handoff と明示されたときだけ F12 linked still を退避可能にする。
+                || (preserve_fullfeature_linked_still
+                    && !self.settings.detached_viewer_open_images_in_window
+                    && self.settings.fullfeature_media_window))
     }
 
     #[cfg(windows)]
     fn preserve_active_detached_image_window_for_main_context_change(&mut self) -> bool {
-        if !self.should_preserve_active_detached_image_window_for_main_context_change() {
+        self.preserve_active_detached_image_window_for_main_context_change_inner(false)
+    }
+
+    #[cfg(windows)]
+    fn preserve_active_detached_image_window_for_main_context_change_inner(
+        &mut self,
+        preserve_fullfeature_linked_still: bool,
+    ) -> bool {
+        if !self.should_preserve_active_detached_image_window_for_main_context_change_inner(
+            preserve_fullfeature_linked_still,
+        ) {
             let actual_session_window = self
                 .active_detached_session
                 .map(|session| session.window_id);
@@ -29826,6 +30794,8 @@ impl App {
             return false;
         }
         let parked_window_id = self.detached_viewer_window_id;
+        let parked_as_fullfeature_linked_still =
+            preserve_fullfeature_linked_still && self.fullfeature_linked_still_media_window_mode();
         let parked = self.park_active_detached_image_window();
         self.log_detached_image_window_debug(format!(
             "preserve_active_detached_for_main_change result={parked} \
@@ -29838,6 +30808,17 @@ impl App {
             self.active_detached_session
         ));
         if parked {
+            if parked_as_fullfeature_linked_still && let Some(window_id) = parked_window_id {
+                // review-v2.3.0 追補5 完結編: media handoff で退避した linked still。
+                // Parked + linked を one-shot identity とし、次の still grid open で同じ
+                // viewport を取り戻す。close は runtime ごと削除、直接 activate は linked
+                // を false にするため stale id を再利用しない。
+                self.update_detached_window_runtime_flags(
+                    window_id,
+                    true,
+                    "fullfeature_linked_still_media_handoff",
+                );
+            }
             self.handoff_active_detached_viewport_to_passive("main_context_change");
             if let Some(window_id) = parked_window_id {
                 self.transition_detached_window_state(
@@ -30900,18 +31881,20 @@ impl App {
         if self.settings.detached_viewer_open_images_in_window {
             return;
         }
-        // §1.7 フル機能+メディア別窓: メディアセッションはメイン一覧カーソルに追従しない
-        // (メディア窓は独立再生。複数ウィンドウモードは直前の mode check で return 済み)。
-        if self.settings.effective_media_in_media_window()
-            && self
-                .fullscreen_idx
-                .is_some_and(|idx| self.viewer_item_is_media(idx))
-        {
-            return;
-        }
         let Some(selected) = self.selected else {
             return;
         };
+        // §1.7 フル機能+メディア別窓: メディアセッションはメイン一覧カーソルに追従せず、
+        // 連動 still 窓も media 選択には追従しない。media は Enter / ダブルクリックの
+        // grid-open seam からメディア窓へ渡す。複数ウィンドウ mode は直前で return 済み。
+        if self.settings.effective_media_in_media_window()
+            && (self
+                .fullscreen_idx
+                .is_some_and(|idx| self.viewer_item_is_media(idx))
+                || self.viewer_item_is_media(selected))
+        {
+            return;
+        }
         let Some(stamp) = self.viewer_sync_stamp_for_idx(selected) else {
             return;
         };
@@ -31055,13 +32038,31 @@ impl App {
         false
     }
 
+    /// grid の leaf open 共通前処理。同じ active/ParkedLive メディアなら前面化して open を
+    /// 消費し、それ以外だけ既存 context の park/close へ進める。Enter / ダブルクリック /
+    /// ゲームパッド / stack フラット open の順序を同じ seam で固定する。
+    /// (review-v2.3.0 追補4: same-media grid open)
+    #[cfg(windows)]
+    pub(crate) fn prepare_detached_context_for_grid_open(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> bool {
+        if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
+            return false;
+        }
+        self.park_active_detached_context_for_new_grid_open(ctx, idx)
+    }
+
     /// grid から別の画像/動画を明示 open するとき、独立 active context は passive /
     /// ParkedLive へ退避する。通常の linked detached セッションは CUT 後の仕様では passive
-    /// にならないため、ここでは対象外 (= 従来どおり reuse / 追従)。
+    /// にならないため対象外 (= 従来どおり reuse / 追従)。ただし media-window へ handoff
+    /// するときだけ、window_id 衝突を避けるため mounted still を先に passive へ退避する。
     #[cfg(windows)]
     pub(crate) fn park_active_detached_context_for_new_grid_open(
         &mut self,
         ctx: &egui::Context,
+        opening_idx: usize,
     ) -> bool {
         self.log_detached_image_window_debug(format!(
             "park_active_context_for_grid_open begin active_context={} session={:?} \
@@ -31085,6 +32086,17 @@ impl App {
                 self.active_detached_session
             ));
             return ok;
+        }
+        // review-v2.3.0 追補5: §1.7 linked still × media open。
+        // mounted detached still は media open 前に passive へ handoff し、window_id を分ける。
+        if self.settings.effective_media_in_media_window()
+            && self.viewer_item_is_media(opening_idx)
+            && self.viewer_session_is_detached()
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| self.viewer_item_supports_detached_still(idx))
+        {
+            return self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx);
         }
         // §1.7 メディア別窓: bundle 化前の連動 detached メディアセッション (grid から
         // 動画/音声を開いた直後で main 文脈のまま) も、次の grid open が presentation を
@@ -31179,6 +32191,66 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn take_parked_fullfeature_linked_still_for_grid_open(
+        &mut self,
+        idx: usize,
+        presentation: ViewerPresentation,
+    ) -> Option<u64> {
+        if !self.fs_open_intent_from_grid
+            || !matches!(presentation, ViewerPresentation::DetachedWindow)
+            || !self.viewer_item_supports_detached_still(idx)
+            || !self.fullfeature_linked_still_media_window_mode()
+            || self.active_detached_session.is_some()
+            || self.detached_viewer_window_id.is_some()
+        {
+            return None;
+        }
+
+        let candidates = self
+            .detached_image_windows
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, window)| {
+                let runtime = self.detached_window_runtimes.get(&window.id)?;
+                (window.paused_bundle.is_none()
+                    && runtime.linked
+                    && runtime.state == DetachedWindowState::Parked)
+                    .then_some((pos, window.id))
+            })
+            .collect::<Vec<_>>();
+        let [(pos, window_id)] = candidates.as_slice() else {
+            if candidates.len() > 1 {
+                self.log_detached_image_window_debug(format!(
+                    "fullfeature_linked_still_reuse_skipped reason=ambiguous candidates={candidates:?}"
+                ));
+            }
+            return None;
+        };
+        let pos = *pos;
+        let window_id = *window_id;
+        let snapshot = self.detached_image_windows.remove(pos);
+        self.deferred_detached_image_window_views.remove(&window_id);
+        self.detached_viewer_window_id = Some(window_id);
+        self.last_active_detached_window_id = Some(window_id);
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_open_next_still_detached_once = false;
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Resuming,
+            "fullfeature_linked_still_grid_reuse",
+        );
+        self.adopt_active_detached_viewport_runtime_from_passive(
+            "fullfeature_linked_still_grid_reuse",
+        );
+        self.log_detached_image_window_debug(format!(
+            "fullfeature_linked_still_reuse id={window_id} idx={idx} title={:?} passive_remaining={}",
+            snapshot.title,
+            self.detached_image_windows.len()
+        ));
+        Some(window_id)
+    }
+
+    #[cfg(windows)]
     fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
         let entering_media =
             entering_native_video || matches!(self.items.get(idx), Some(GridItem::Audio(_)));
@@ -31213,6 +32285,9 @@ impl App {
             self.detached_image_windows.len()
         ));
         self.viewer_presentation = presentation;
+        if detached_still && !independent_detached_still {
+            let _ = self.take_parked_fullfeature_linked_still_for_grid_open(idx, presentation);
+        }
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
             // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
@@ -31381,8 +32456,9 @@ impl App {
         // ダブルクリック) だけに適用し、F12 で main に出した動画を矢印 / wheel / Home / End /
         // Ctrl+G / 検索ジャンプで送っても別窓へ飛ばさない (実機 FB 2026-07-02、Codex 実機 P1/P2)。
         // 全 nav 経路が open_fullscreen に集約するのでここ 1 箇所で塞ぐ。deferred source-swap は
-        // 完了時にこの open_fullscreen を通り、その時点の `viewer_presentation` (pending 中に F12
-        // されていれば反映済み) を読むので同じ規則で正しく維持される。auto-advance が明示 one-shot
+        // 完了時にこの open_fullscreen を通り、その時点の `viewer_presentation` を読む。
+        // pending 中の F12 は共通入口で無視するため、player 不在時に設定だけが反転することもない。
+        // auto-advance が明示 one-shot
         // を立てている場合はそれを尊重する (is_none 判定)。この判定は `fullscreen_idx` を idx へ
         // 更新する前・`prepare_viewer_presentation_open` が presentation を書き換える前に行う。
         #[cfg(windows)]
@@ -35080,10 +36156,9 @@ impl App {
     /// 結果に含まれないキーは 0 (未評価) としてキャッシュに入れ、以後の DB アクセスを抑制する。
     /// ページ単位とコンテナの両方を対象とする。
     pub(crate) fn prewarm_rating_cache(&mut self) {
-        let db = match self.rating_db.as_ref() {
-            Some(db) => db,
-            None => return,
-        };
+        if self.rating_db.is_none() {
+            return;
+        }
         let mut idx_keys: Vec<(usize, String)> = Vec::with_capacity(self.items.len());
         for (idx, item) in self.items.iter().enumerate() {
             if !item.accepts_rating() {
@@ -35094,7 +36169,11 @@ impl App {
             }
         }
         let keys: Vec<String> = idx_keys.iter().map(|(_, k)| k.clone()).collect();
-        let map = db.get_many(&keys);
+        let map = self
+            .rating_db
+            .as_ref()
+            .map(|db| db.get_many(&keys))
+            .unwrap_or_default();
         for (idx, key) in idx_keys {
             let stars = map.get(&key).copied().unwrap_or(0);
             self.rating_cache.insert(idx, stars);
@@ -37699,6 +38778,7 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.cancel_media_navigation_pending_for_current_context("close_fullscreen");
         // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
         self.spread_popup_open = false;
@@ -43796,6 +44876,18 @@ impl App {
             return;
         }
         #[cfg(windows)]
+        if self.current_context_owns_source_swap_pending() {
+            // source-swap 中は player が fs_cache から外れており placement を確定できない。
+            // 設定だけ反転させる divergence を避け、swap 完了後の再操作に委ねる。
+            // 通常 F12 / §1.7 メディア別窓の両入口はここへ合流する。
+            // (review-v2.3.0 追補3: 角度B-1、案a)
+            crate::logger::log(
+                "[detached-viewer] ignore F12 toggle while owned source-swap is pending"
+                    .to_string(),
+            );
+            return;
+        }
+        #[cfg(windows)]
         {
             if self.detached_toggle_disabled_by_always_new_images() {
                 self.show_feedback_toast(
@@ -46914,26 +48006,30 @@ impl App {
     /// fs_cache 内の `FsCacheEntry::Video` ごとに [`crate::video::VideoPlayer::tick`] を呼ぶ。
     /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
     pub(crate) fn save_all_video_resume_positions(&mut self) {
-        let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        let mut updates: Vec<(String, f64, f64, bool)> = Vec::new();
         #[cfg(windows)]
         let mut thumb_requests: Vec<(std::path::PathBuf, String, f64)> = Vec::new();
-        for entry in self.fs_cache.values() {
+        for (idx, entry) in &self.fs_cache {
             if let FsCacheEntry::Video { player, .. } = entry {
                 let key = crate::adjustment_db::normalize_path(player.path());
-                let pos = player
-                    .last_displayed_pts_secs()
-                    .unwrap_or_else(|| player.position());
+                let audio_mode_without_vst = self.video_audio_mode == Some(*idx)
+                    && !self
+                        .video_audio_vst
+                        .as_ref()
+                        .is_some_and(|state| state.fs_idx == *idx);
+                let pos = video_resume_position_for_save(player, audio_mode_without_vst);
                 #[cfg(windows)]
                 thumb_requests.push((player.path().clone(), key.clone(), pos));
-                updates.push((key, pos, player.duration()));
+                updates.push((key, pos, player.duration(), player.is_at_eof()));
             }
         }
-        for (key, pos, dur) in updates {
+        for (key, pos, dur, at_eof) in updates {
             let kept = save_video_resume_position(
                 &mut self.settings.video_resume_positions,
                 key.clone(),
                 pos,
                 dur,
+                at_eof,
             );
             #[cfg(windows)]
             if !kept {
@@ -47009,6 +48105,7 @@ impl App {
     /// `display_order` 上で `current_idx` の **次** に `pred` を満たす idx を返す (連続再生の
     /// 次項目探索)。`wrap` で末尾折り返し。`current_idx` が order に無ければ wrap 時のみ
     /// 先頭から最初の該当を返す。動画は `is_video`、音声は `is_audio` の述語で共有する。
+    #[cfg(test)]
     pub(crate) fn find_next_matching_in_display_order_from(
         display_order: &[usize],
         current_idx: usize,
@@ -47036,6 +48133,7 @@ impl App {
         None
     }
 
+    #[cfg(test)]
     pub(crate) fn find_next_video_in_display_order_from(
         items: &[GridItem],
         display_order: &[usize],
@@ -47048,6 +48146,7 @@ impl App {
     }
 
     /// 連続再生 (音声) の次曲探索: display 順で次の `GridItem::Audio` を返す。
+    #[cfg(test)]
     pub(crate) fn find_next_audio_in_display_order_from(
         items: &[GridItem],
         display_order: &[usize],
@@ -47059,22 +48158,516 @@ impl App {
         })
     }
 
-    fn find_next_video_in_display_order(&self, current_idx: usize, wrap: bool) -> Option<usize> {
-        Self::find_next_video_in_display_order_from(
-            &self.items,
-            self.current_grid_order(),
-            current_idx,
-            wrap,
-        )
+    /// bundle snapshot の候補は main 側 delete/rename に追従しないため、実ファイルだけを
+    /// 使用直前に検証する。ZIP/PDF 内 entry は仮想項目なのでここでは検証しない。
+    /// (review-v2.3.0 追補7: R1 第2波 P1-1)
+    fn media_navigation_candidate(item: &GridItem, idx: usize) -> MediaNavigationCandidate {
+        let path = match item {
+            GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path) => {
+                Some(path.clone())
+            }
+            _ => None,
+        };
+        MediaNavigationCandidate { idx, path }
     }
 
-    fn find_next_audio_in_display_order(&self, current_idx: usize, wrap: bool) -> Option<usize> {
-        Self::find_next_audio_in_display_order_from(
+    pub(crate) fn collect_matching_media_navigation_candidates(
+        items: &[GridItem],
+        display_order: &[usize],
+        current_idx: usize,
+        wrap: bool,
+        media_matches: impl Fn(&GridItem) -> bool,
+    ) -> Vec<MediaNavigationCandidate> {
+        let Some(pos) = display_order.iter().position(|&idx| idx == current_idx) else {
+            if !wrap {
+                return Vec::new();
+            }
+            return display_order
+                .iter()
+                .filter_map(|&idx| {
+                    let item = items.get(idx)?;
+                    media_matches(item).then(|| Self::media_navigation_candidate(item, idx))
+                })
+                .collect();
+        };
+        let mut ordered = display_order
+            .iter()
+            .skip(pos + 1)
+            .copied()
+            .collect::<Vec<_>>();
+        if wrap {
+            ordered.extend(display_order.iter().take(pos + 1).copied());
+        }
+        ordered
+            .into_iter()
+            .filter_map(|idx| {
+                let item = items.get(idx)?;
+                media_matches(item).then(|| Self::media_navigation_candidate(item, idx))
+            })
+            .collect()
+    }
+
+    /// メディア窓の手動前後送り。欠損した実ファイルは 1 候補ずつ飛ばし、仮想 entry は
+    /// 従来どおり候補に残す。delta の絶対値分だけ有効候補を進める。
+    pub(crate) fn collect_manual_media_navigation_candidates(
+        items: &[GridItem],
+        display_order: &[usize],
+        current_idx: usize,
+        delta: i32,
+    ) -> Vec<MediaNavigationCandidate> {
+        let direction = delta.signum();
+        if direction == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cursor = current_idx;
+        while let Some(idx) =
+            crate::ui_helpers::adjacent_navigable_idx(items, display_order, cursor, direction)
+        {
+            let Some(item) = items.get(idx) else {
+                break;
+            };
+            out.push(Self::media_navigation_candidate(item, idx));
+            cursor = idx;
+        }
+        out
+    }
+
+    pub(crate) fn resolve_media_navigation_candidates(
+        candidates: &[MediaNavigationCandidate],
+        required_matches: u32,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut path_exists: impl FnMut(&std::path::Path) -> bool,
+    ) -> MediaNavigationResolveResult {
+        let mut remaining = required_matches.max(1);
+        let mut missing = Vec::new();
+        for candidate in candidates {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let exists = match candidate.path.as_deref() {
+                Some(path) => path_exists(path),
+                None => true,
+            };
+            if !exists {
+                if let Some(path) = candidate.path.clone() {
+                    missing.push((candidate.idx, path));
+                }
+                continue;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return MediaNavigationResolveResult {
+                    target_idx: Some(candidate.idx),
+                    missing,
+                };
+            }
+        }
+        MediaNavigationResolveResult {
+            target_idx: None,
+            missing,
+        }
+    }
+
+    pub(crate) fn media_navigation_result_is_current(
+        pending_generation: u64,
+        current_generation: u64,
+        pending_input_seq: u64,
+        current_input_seq: u64,
+        pending_owner: Option<u64>,
+        current_owner: Option<u64>,
+        pending_fullscreen_idx: Option<usize>,
+        current_fullscreen_idx: Option<usize>,
+    ) -> bool {
+        pending_generation == current_generation
+            && pending_owner == current_owner
+            && pending_fullscreen_idx == current_fullscreen_idx
+            // ParkedLive has its own owner/context stamp. App-global input_seq also
+            // advances for unrelated main-grid input, so only mounted navigation uses it.
+            && (pending_owner.is_some() || pending_input_seq == current_input_seq)
+    }
+
+    fn media_navigation_response_is_latest(
+        response_request_id: u64,
+        latest_request_id: u64,
+    ) -> bool {
+        response_request_id == latest_request_id
+    }
+
+    fn media_navigation_eof_key(action: &MediaNavigationAction) -> Option<(usize, u64)> {
+        match action {
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+            }
+            | MediaNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => Some((*fs_idx, *seek_serial)),
+            #[cfg(windows)]
+            MediaNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => Some((*fs_idx, *seek_serial)),
+            MediaNavigationAction::Manual { .. } => None,
+        }
+    }
+
+    fn media_navigation_action_can_apply(&self, action: &MediaNavigationAction) -> bool {
+        match action {
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+            }
+            | MediaNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => {
+                self.fullscreen_idx == Some(*fs_idx)
+                    && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+            }
+            #[cfg(windows)]
+            MediaNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => {
+                self.fullscreen_idx == Some(*fs_idx)
+                    && self.video_audio_mode == Some(*fs_idx)
+                    && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.native_video_mode_switch.is_none()
+                    && self.native_video_source_swap_pending.is_none()
+                    && self.native_video_fast_swap_pending.is_none()
+                    && self.video_tile_swap_pending.is_none()
+                    && self.video_audio_exit_pending.is_none()
+            }
+            MediaNavigationAction::Manual { fs_idx, .. } => self.fullscreen_idx == Some(*fs_idx),
+        }
+    }
+
+    fn rollback_media_navigation_eof_dedup(
+        &mut self,
+        action: &MediaNavigationAction,
+        reason: &'static str,
+    ) {
+        let Some(eof_key) = Self::media_navigation_eof_key(action) else {
+            return;
+        };
+        if self.video_continuous_last_eof == Some(eof_key) {
+            self.video_continuous_last_eof = None;
+            crate::logger::log(format!(
+                "[media-nav] EOF dedup rolled back: reason={reason}"
+            ));
+        }
+    }
+
+    fn discard_media_navigation_pending(&mut self, reason: &'static str) -> bool {
+        let Some(pending) = self.media_navigation_pending.take() else {
+            return false;
+        };
+        self.rollback_media_navigation_eof_dedup(&pending.action, reason);
+        true
+    }
+
+    fn current_media_navigation_owner(&self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            self.native_video_parked_live_input_window_id
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn cancel_media_navigation_pending_for_owner(
+        &mut self,
+        owner_window_id: Option<u64>,
+        reason: &'static str,
+    ) -> bool {
+        let matches = self
+            .media_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.owner_window_id == owner_window_id);
+        if !matches {
+            return false;
+        }
+        self.discard_media_navigation_pending(reason)
+    }
+
+    fn cancel_media_navigation_pending_for_current_context(&mut self, reason: &'static str) {
+        #[cfg(windows)]
+        if self.current_media_navigation_owner().is_none()
+            && self.active_detached_viewer_context_contains_video()
+        {
+            // promoted active media は owner=None だが現在 App へ mount されていない。
+            // main context の close/load から別 context の候補解決を破棄しない。
+            return;
+        }
+        self.cancel_media_navigation_pending_for_owner(
+            self.current_media_navigation_owner(),
+            reason,
+        );
+    }
+
+    fn start_media_navigation_candidate_resolution(
+        &mut self,
+        ctx: &egui::Context,
+        candidates: Vec<MediaNavigationCandidate>,
+        required_matches: u32,
+        source: &'static str,
+        action: MediaNavigationAction,
+    ) {
+        self.discard_media_navigation_pending("superseded");
+        if self.media_navigation_resolver.is_none() {
+            self.media_navigation_resolver = MediaNavigationResolver::spawn();
+        }
+        let Some(resolver) = self.media_navigation_resolver.as_mut() else {
+            crate::logger::log(format!(
+                "[media-nav] resolver thread spawn failed: source={source}"
+            ));
+            self.rollback_media_navigation_eof_dedup(&action, "resolver_spawn_failed");
+            return;
+        };
+
+        let request_id = resolver.allocate_request_id();
+        let input_seq = self.input_seq;
+        let candidate_count = candidates.len();
+        if resolver
+            .request_tx
+            .send(MediaNavigationResolverRequest {
+                request_id,
+                candidates,
+                required_matches,
+                source,
+                input_seq,
+            })
+            .is_err()
+        {
+            crate::logger::log(format!(
+                "[media-nav] resolver request channel disconnected: request_id={request_id} source={source}"
+            ));
+            self.media_navigation_resolver = None;
+            self.rollback_media_navigation_eof_dedup(&action, "resolver_disconnected");
+            return;
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "media_nav",
+                "candidate_worker_start",
+                None,
+                input_seq,
+                &[
+                    ("source", serde_json::Value::from(source)),
+                    ("request_id", serde_json::Value::from(request_id as i64)),
+                    (
+                        "candidate_count",
+                        serde_json::Value::from(candidate_count as i64),
+                    ),
+                ],
+            );
+        }
+        self.media_navigation_pending = Some(MediaNavigationPending {
+            request_id,
+            items_generation: self.items_generation,
+            input_seq,
+            owner_window_id: self.current_media_navigation_owner(),
+            fullscreen_idx: self.fullscreen_idx,
+            source,
+            action,
+            started_at: std::time::Instant::now(),
+        });
+        // ローカル完備時は同フレーム完了も拾い、それ以外は次フレームを保証する。
+        self.poll_media_navigation_pending(ctx);
+        if self.media_navigation_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    pub(crate) fn start_manual_media_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        display_order: &[usize],
+        fs_idx: usize,
+        delta: i32,
+        source: &'static str,
+        landing: ManualMediaNavigationLanding,
+    ) {
+        let candidates = Self::collect_manual_media_navigation_candidates(
             &self.items,
-            self.current_grid_order(),
-            current_idx,
-            wrap,
-        )
+            display_order,
+            fs_idx,
+            delta,
+        );
+        self.start_media_navigation_candidate_resolution(
+            ctx,
+            candidates,
+            delta.unsigned_abs(),
+            source,
+            MediaNavigationAction::Manual {
+                fs_idx,
+                delta,
+                landing,
+            },
+        );
+    }
+
+    fn poll_media_navigation_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.media_navigation_pending.as_ref() else {
+            return;
+        };
+        let current_owner = self.current_media_navigation_owner();
+        if pending.owner_window_id != current_owner {
+            return;
+        }
+        let latest_request_id = pending.request_id;
+        loop {
+            let received = match self.media_navigation_resolver.as_ref() {
+                Some(resolver) => resolver.result_rx.try_recv(),
+                None => {
+                    self.discard_media_navigation_pending("resolver_missing");
+                    return;
+                }
+            };
+            let response = match received {
+                Ok(response) => response,
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.media_navigation_resolver = None;
+                    self.discard_media_navigation_pending("resolver_disconnected");
+                    return;
+                }
+            };
+            if !Self::media_navigation_response_is_latest(response.request_id, latest_request_id) {
+                crate::logger::log(format!(
+                    "[media-nav] stale resolver response discarded: response_id={} latest_id={latest_request_id}",
+                    response.request_id
+                ));
+                continue;
+            }
+
+            let pending = self.media_navigation_pending.take().unwrap();
+            let is_current = Self::media_navigation_result_is_current(
+                pending.items_generation,
+                self.items_generation,
+                pending.input_seq,
+                self.input_seq,
+                pending.owner_window_id,
+                current_owner,
+                pending.fullscreen_idx,
+                self.fullscreen_idx,
+            );
+            if !is_current {
+                crate::logger::log(format!(
+                    "[media-nav] stale candidate result discarded: request_id={} source={}",
+                    pending.request_id, pending.source
+                ));
+                self.rollback_media_navigation_eof_dedup(&pending.action, "stale_result");
+                return;
+            }
+            let result = response.result;
+            for (idx, path) in &result.missing {
+                crate::logger::log(format!(
+                    "[media-nav] skipped missing real-file candidate: source={} idx={idx} path={}",
+                    pending.source,
+                    path.display()
+                ));
+            }
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "media_nav",
+                    "candidate_apply",
+                    None,
+                    pending.input_seq,
+                    &[
+                        ("source", serde_json::Value::from(pending.source)),
+                        (
+                            "request_id",
+                            serde_json::Value::from(pending.request_id as i64),
+                        ),
+                        (
+                            "target_idx",
+                            result
+                                .target_idx
+                                .map(|idx| serde_json::Value::from(idx as i64))
+                                .unwrap_or(serde_json::Value::Null),
+                        ),
+                        (
+                            "elapsed_ms",
+                            serde_json::Value::from(
+                                pending.started_at.elapsed().as_secs_f64() * 1000.0,
+                            ),
+                        ),
+                    ],
+                );
+            }
+            if !self.media_navigation_action_can_apply(&pending.action) {
+                self.rollback_media_navigation_eof_dedup(&pending.action, "apply_rejected");
+                return;
+            }
+            self.apply_media_navigation_result(ctx, pending.action, result.target_idx);
+            return;
+        }
+    }
+
+    fn apply_media_navigation_result(
+        &mut self,
+        ctx: &egui::Context,
+        action: MediaNavigationAction,
+        target_idx: Option<usize>,
+    ) {
+        match action {
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => self.apply_video_continuous_eof_target(ctx, fs_idx, seek_serial, target_idx),
+            #[cfg(windows)]
+            MediaNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => self.apply_video_audio_mode_continuous_eof_target(
+                ctx,
+                fs_idx,
+                seek_serial,
+                target_idx,
+            ),
+            MediaNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+            } => self.apply_music_continuous_eof_target(ctx, fs_idx, seek_serial, target_idx),
+            MediaNavigationAction::Manual {
+                fs_idx,
+                delta,
+                landing,
+            } => {
+                if self.fullscreen_idx != Some(fs_idx) {
+                    return;
+                }
+                if let Some(new_idx) = target_idx {
+                    match landing {
+                        ManualMediaNavigationLanding::Fullscreen => {
+                            self.open_fullscreen_from_fs_navigation(ctx, new_idx);
+                        }
+                        #[cfg(windows)]
+                        ManualMediaNavigationLanding::NativeVideo => {
+                            self.open_native_video_fullscreen_from_navigation(ctx, new_idx);
+                        }
+                    }
+                } else {
+                    #[cfg(windows)]
+                    if matches!(landing, ManualMediaNavigationLanding::NativeVideo) {
+                        self.show_native_video_boundary_toast(ctx, delta > 0);
+                        return;
+                    }
+                    self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                        at_end: delta > 0,
+                        at: std::time::Instant::now(),
+                    });
+                }
+            }
+        }
     }
 
     pub(crate) fn cycle_video_continuous_mode_common(
@@ -47148,7 +48741,38 @@ impl App {
         }
         self.video_continuous_last_eof = Some(eof_key);
 
-        let Some(next_idx) = self.find_next_video_in_display_order(fs_idx, mode.wraps()) else {
+        let candidates = Self::collect_matching_media_navigation_candidates(
+            &self.items,
+            self.current_grid_order(),
+            fs_idx,
+            mode.wraps(),
+            |item| matches!(item, GridItem::Video(_)),
+        );
+        self.start_media_navigation_candidate_resolution(
+            ctx,
+            candidates,
+            1,
+            "video_continuous_eof",
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+            },
+        );
+    }
+
+    fn apply_video_continuous_eof_target(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seek_serial: u64,
+        target_idx: Option<usize>,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx)
+            || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
+        {
+            return;
+        }
+        let Some(next_idx) = target_idx else {
             #[cfg(windows)]
             self.show_native_video_overlay_toast(
                 "フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string(),
@@ -47245,7 +48869,45 @@ impl App {
         }
         self.video_continuous_last_eof = Some(eof_key);
 
-        let Some(next_idx) = self.find_next_video_in_display_order(fs_idx, mode.wraps()) else {
+        let candidates = Self::collect_matching_media_navigation_candidates(
+            &self.items,
+            self.current_grid_order(),
+            fs_idx,
+            mode.wraps(),
+            |item| matches!(item, GridItem::Video(_)),
+        );
+        self.start_media_navigation_candidate_resolution(
+            ctx,
+            candidates,
+            1,
+            "video_audio_mode_continuous_eof",
+            MediaNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    fn apply_video_audio_mode_continuous_eof_target(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seek_serial: u64,
+        target_idx: Option<usize>,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx)
+            || self.video_audio_mode != Some(fs_idx)
+            || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
+            || self.native_video_mode_switch.is_some()
+            || self.native_video_source_swap_pending.is_some()
+            || self.native_video_fast_swap_pending.is_some()
+            || self.video_tile_swap_pending.is_some()
+            || self.video_audio_exit_pending.is_some()
+        {
+            return;
+        }
+        let Some(next_idx) = target_idx else {
             self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
             return;
         };
@@ -47479,7 +49141,38 @@ impl App {
         }
         self.video_continuous_last_eof = Some(eof_key);
 
-        let Some(next_idx) = self.find_next_audio_in_display_order(fs_idx, mode.wraps()) else {
+        let candidates = Self::collect_matching_media_navigation_candidates(
+            &self.items,
+            self.current_grid_order(),
+            fs_idx,
+            mode.wraps(),
+            |item| matches!(item, GridItem::Audio(_)),
+        );
+        self.start_media_navigation_candidate_resolution(
+            ctx,
+            candidates,
+            1,
+            "music_continuous_eof",
+            MediaNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+            },
+        );
+    }
+
+    fn apply_music_continuous_eof_target(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seek_serial: u64,
+        target_idx: Option<usize>,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx)
+            || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
+        {
+            return;
+        }
+        let Some(next_idx) = target_idx else {
             self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
             return;
         };
@@ -47554,7 +49247,7 @@ impl App {
             .video_resume_last_save
             .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
             .unwrap_or(true);
-        let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        let mut updates: Vec<(String, f64, f64, bool)> = Vec::new();
 
         // Phase 0: bookmark cache を ensure (Phase 1 / Phase 3 で直読みするため)。
         // 既存の sync_native_video_timeline_markers 経路でも ensure されているが、
@@ -47739,15 +49432,11 @@ impl App {
                     // で byte-equivalent を維持するため video_audio_mode 限定で分岐)。
                     // 7e: VST ホスト表示中は映像フレームが進むので last_displayed_pts を使う
                     // (native video と同じ)。純粋な音声モード (映像固着) のときだけ position()。
-                    let pos = if video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx)
-                    {
-                        player.position()
-                    } else {
-                        player
-                            .last_displayed_pts_secs()
-                            .unwrap_or_else(|| player.position())
-                    };
-                    updates.push((path_key, pos, player.duration()));
+                    let pos = video_resume_position_for_save(
+                        player,
+                        video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx),
+                    );
+                    updates.push((path_key, pos, player.duration(), player.is_at_eof()));
                 }
                 if continuous_enabled
                     && !continuous_tile_active
@@ -47855,6 +49544,7 @@ impl App {
                 }
             }
         }
+        self.poll_media_navigation_pending(ctx);
         // Phase 3: 入力イベント (= seek / ToggleLoop / pause) 反映後に CH/BM ループ境界 tick。
         // 順序が重要 (Codex P2 第4ラウンド): native_events を先に処理することで、
         // 直近の手動 seek が serial 変化として可視化され、誤爆 seek を防げる。
@@ -47964,12 +49654,13 @@ impl App {
         }
         if do_save {
             self.video_resume_last_save = Some(now);
-            for (key, pos, dur) in updates {
+            for (key, pos, dur, at_eof) in updates {
                 let kept = save_video_resume_position(
                     &mut self.settings.video_resume_positions,
                     key.clone(),
                     pos,
                     dur,
+                    at_eof,
                 );
                 #[cfg(windows)]
                 if !kept {
@@ -51650,6 +53341,7 @@ pub(crate) const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 3.0;
 pub(crate) const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
 
 /// 動画再生位置を `Settings::video_resume_positions` に保存する。
+/// - engine state が EOF → duration に関係なくエントリ削除
 /// - position が `VIDEO_RESUME_MIN_POSITION_SECS` 未満 → エントリ削除 (最初から)
 /// - 残り `VIDEO_RESUME_END_GUARD_SECS` 以下 → エントリ削除 (完走済み)
 /// - それ以外 → position を保存
@@ -51658,7 +53350,12 @@ fn save_video_resume_position(
     key: String,
     position: f64,
     duration: f64,
+    at_eof: bool,
 ) -> bool {
+    if at_eof {
+        map.remove(&key);
+        return false;
+    }
     if position < VIDEO_RESUME_MIN_POSITION_SECS {
         map.remove(&key);
         return false;

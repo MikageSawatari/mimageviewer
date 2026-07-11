@@ -325,6 +325,16 @@ presence set・resume キー書換。対象ストア・許容制限の正本は�
   セッションへ昇格 (または既存メディア窓へ委譲)」の導線を設計。凍結ルール下では
   症状パッチを入れない。
 
+### 1.13 duration 不明/不正 MPEG-PS のシークバー不能
+
+- 背景: `sample.mpg` で実機確認済み。duration が不明または不正な MPEG-PS は
+  シークバーで移動できない。VLC は同じファイルをバイトシーク + PTS 再スキャン方式で
+  シークできる。
+- 対応案: decode EOF で実尺を学習して `VideoInfo` / HUD の duration へ反映するか、
+  duration を信頼できない場合にバイト位置シークへフォールバックする。
+- 裁定: v2.2.0 以前から同挙動で、ユーザー裁定により次版送り。優先度 P3。
+  final-report 追補 5 の P3 参照。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断

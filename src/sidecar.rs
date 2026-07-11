@@ -388,6 +388,25 @@ impl SidecarFile {
         }
     }
 
+    /// mIV 内削除成功時、実ファイル / コンテナ名に対応する全バックアップ項目を落とす。
+    /// 通常画像は exact、ZIP/PDF は `<file>::...` 配下も対象。隣接名は巻き込まない。
+    pub fn purge_deleted_root(&mut self, rel_root: &str) -> bool {
+        let container_prefix = format!("{rel_root}::");
+        let folder_prefix = format!("{rel_root}/");
+        let before = self.items.len();
+        self.items.retain(|key, _| {
+            key != rel_root
+                && !key.starts_with(&container_prefix)
+                && !key.starts_with(&folder_prefix)
+        });
+        if self.items.len() != before {
+            self.mark_dirty();
+            true
+        } else {
+            false
+        }
+    }
+
     /// 複数エントリの adjust を一括セット (「全画像に適用」用)。
     pub fn set_adjust_bulk<I>(&mut self, iter: I, params: &AdjustParams)
     where
@@ -750,6 +769,20 @@ fn current_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_deleted_root_removes_exact_and_container_entries_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(temp.path().to_path_buf());
+        sidecar.set_adjust("book.pdf", AdjustParams::default());
+        sidecar.set_adjust("book.pdf::page_1", AdjustParams::default());
+        sidecar.set_adjust("book.pdf2::page_1", AdjustParams::default());
+
+        assert!(sidecar.purge_deleted_root("book.pdf"));
+        assert!(!sidecar.items().contains_key("book.pdf"));
+        assert!(!sidecar.items().contains_key("book.pdf::page_1"));
+        assert!(sidecar.items().contains_key("book.pdf2::page_1"));
+    }
     use local_adjust_core::{LocalAdjustmentLayer, LocalEffect, LocalMask};
     use std::path::PathBuf;
 

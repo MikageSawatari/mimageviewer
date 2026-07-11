@@ -12768,7 +12768,20 @@ impl App {
                 self.open_fullscreen_from_fs_navigation(ctx, new_idx);
             } else if nav_delta != 0 {
                 let display_order = self.current_grid_order().to_vec();
-                if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
+                let current_is_media = matches!(
+                    self.items.get(fs_idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                );
+                if current_is_media {
+                    self.start_manual_media_navigation(
+                        ctx,
+                        &display_order,
+                        fs_idx,
+                        nav_delta,
+                        "media_window_manual",
+                        crate::app::ManualMediaNavigationLanding::Fullscreen,
+                    );
+                } else if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
                     &self.items,
                     &display_order,
                     fs_idx,

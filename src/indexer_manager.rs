@@ -698,19 +698,51 @@ impl Drop for IndexerManager {
             handle.signal_stop();
         }
 
-        // STEP 2: drain + drop (drop は thread join を含む)
+        // STEP 2: manager 全体で 4 秒だけ join を待つ。期限後の JoinHandle は detach し、
+        // プロセス終了を supervisor 内の将来の長時間処理で塞がない。
+        let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let supervisor_count = self.supervisors.len();
+        let mut detached = 0usize;
         for (id, handle) in self.supervisors.drain() {
             crate::logger::log(format!("IndexerManager: joining supervisor {id}"));
-            drop(handle);
+            if !handle.join_until(shutdown_deadline) {
+                detached += 1;
+            }
+        }
+        let joined = supervisor_count - detached;
+        if detached > 0 {
+            crate::logger::log(format!(
+                "IndexerManager: shutdown deadline reached; joined={joined}, detached={detached}"
+            ));
+        } else {
+            crate::logger::log(format!(
+                "IndexerManager: all supervisors joined within deadline ({joined})"
+            ));
         }
 
-        // STEP 3: 全 supervisor が止まった後に共有 writer を 1 回 commit する。
-        // dispatcher の Background 優先度で submit (Interactive キューが空なので即実行)。
-        if let Err(e) = self.writer.commit(
-            false,
-            crate::fts_writer_dispatcher::WriterPriority::Background,
-        ) {
-            crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
+        // STEP 3: join済み / detach済みにかかわらず共有writerへbest-effort commitを送る。
+        // main threadでは待たない。cancel-aware waiter が abandoned job を
+        // dispatcher queue に残していても、この clone が dispatcher の最終 Drop/join を
+        // background 側で所有する。Tantivy First + 次回 3-way diff の不変条件は維持される。
+        let writer = Arc::clone(&self.writer);
+        if let Err(e) = std::thread::Builder::new()
+            .name("indexer-writer-finalizer".into())
+            .spawn(move || {
+                if let Err(e) = writer.commit(
+                    false,
+                    crate::fts_writer_dispatcher::WriterPriority::Background,
+                ) {
+                    crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
+                } else {
+                    crate::logger::log(
+                        "IndexerManager: final writer commit completed (best effort)",
+                    );
+                }
+            })
+        {
+            crate::logger::log(format!(
+                "IndexerManager: writer finalizer spawn failed; skipping final commit: {e}"
+            ));
         }
         // dispatcher 自身は Arc::strong_count が 0 になった時点で Drop → スレッド join される。
     }

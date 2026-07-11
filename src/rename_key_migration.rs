@@ -90,42 +90,195 @@ pub fn journal_save(data_dir: &Path, entries: &[(PathBuf, PathBuf)]) {
     }
 }
 
-/// keep-drive 正規化キー ([`crate::adjustment_db::normalize_path`]) のストア。
-/// `(<db ファイル名>, <テーブル>, <キー列>, <キー列に一意制約があるか>)`。
-/// 列挙は各モジュールの CREATE TABLE (スキーマ正本) と一致させること。
-const KEEP_DRIVE_TARGETS: &[(&str, &str, &str, bool)] = &[
-    ("rating.db", "ratings", "path", true),
-    ("adjustment.db", "page_params", "page_path", true),
-    ("adjustment.db", "sidecar_sync", "folder_key", true),
-    ("mask.db", "masks", "path", true),
-    ("conceal.db", "conceal_entries", "page_path", true),
-    ("local_adjust.db", "local_adjust_pages", "page_path", true),
-    ("comic.db", "comic_entries", "page_path", true),
-    ("export_crop.db", "export_crop_pages", "page_path", true),
-    ("tags.db", "item_tags", "item_key", true),
-    ("tags.db", "tag_item_state", "item_key", true),
-    ("tags.db", "tag_sidecar_sync", "folder_key", true),
-    ("rotation.db", "rotations", "path", true),
-    // 表示トリムのページ上書き (Sol rename-mig P2: 調査時の見落としを補完)。
-    ("view_trim.db", "view_trim_pages", "page_path", true),
-    ("video_pins.db", "video_pins", "path", true),
-    // video_bookmarks は id が PK で path は非一意 (1 ファイル複数ブックマーク)。
-    ("video_bookmarks.db", "video_bookmarks", "path", false),
-    (
+/// path-keyed SQLite ストアのキー正規化規則。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreKeyNormalization {
+    /// [`crate::adjustment_db::normalize_path`] / `path_key::normalize_keep_drive`。
+    KeepDrive,
+    /// [`crate::path_key::normalize`]。USB 等のドライブレターを除去する軽量設定用。
+    DriveStripped,
+}
+
+/// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
+///
+/// `unique` は rename の衝突処理にだけ使う。purge は全行を素の `DELETE` にする。
+/// `rename_generic=false` は raw `path` 列も同時更新する読書履歴だけで、rename 側は専用処理を
+/// 使うが purge 側は同じ記述子を使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoreDescriptor {
+    pub(crate) file: &'static str,
+    pub(crate) table: &'static str,
+    pub(crate) column: &'static str,
+    pub(crate) unique: bool,
+    pub(crate) normalization: StoreKeyNormalization,
+    pub(crate) rename_generic: bool,
+}
+
+const fn store(
+    file: &'static str,
+    table: &'static str,
+    column: &'static str,
+    unique: bool,
+    normalization: StoreKeyNormalization,
+) -> StoreDescriptor {
+    StoreDescriptor {
+        file,
+        table,
+        column,
+        unique,
+        normalization,
+        rename_generic: true,
+    }
+}
+
+/// path-keyed SQLite ストアの正本。
+///
+/// 新しい rename 対象ストアを追加するときは必ずここへ足すこと。この同じ表を削除 worker の
+/// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
+/// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
+pub(crate) const STORES: &[StoreDescriptor] = &[
+    store(
+        "rating.db",
+        "ratings",
+        "path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "adjustment.db",
+        "page_params",
+        "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "adjustment.db",
+        "sidecar_sync",
+        "folder_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "mask.db",
+        "masks",
+        "path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "conceal.db",
+        "conceal_entries",
+        "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "local_adjust.db",
+        "local_adjust_pages",
+        "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "comic.db",
+        "comic_entries",
+        "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "export_crop.db",
+        "export_crop_pages",
+        "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "tags.db",
+        "item_tags",
+        "item_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "tags.db",
+        "tag_item_state",
+        "item_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "tags.db",
+        "tag_sidecar_sync",
+        "folder_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "rotation.db",
+        "rotations",
+        "path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "view_trim.db",
+        "view_trim_pages",
+        "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "video_pins.db",
+        "video_pins",
+        "path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    // id が PK で path は非一意 (1 ファイル複数ブックマーク)。
+    store(
+        "video_bookmarks.db",
+        "video_bookmarks",
+        "path",
+        false,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
         "folder_thumb_pins.db",
         "folder_thumb_pins",
         "container_key",
         true,
+        StoreKeyNormalization::KeepDrive,
     ),
-];
-
-/// drive 除去正規化キー ([`crate::path_key::normalize`]) のストア (USB ドライブ等で
-/// ドライブレターが変わっても引き継ぐ設計の、コンテナ単位の軽量設定)。
-const DRIVE_STRIPPED_TARGETS: &[(&str, &str, &str, bool)] = &[
-    ("book_resume.db", "book_resume", "path", true),
-    ("spread.db", "spreads", "path", true),
-    // 表示トリムの本単位設定 (Sol rename-mig P2)。
-    ("view_trim.db", "view_trim_books", "book_key", true),
+    store(
+        "book_resume.db",
+        "book_resume",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    store(
+        "spread.db",
+        "spreads",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    store(
+        "view_trim.db",
+        "view_trim_books",
+        "book_key",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    StoreDescriptor {
+        file: "reading_history.db",
+        table: "reading_history",
+        column: "key",
+        unique: true,
+        normalization: StoreKeyNormalization::KeepDrive,
+        rename_generic: false,
+    },
 ];
 
 /// リネーム移行の本体 (worker スレッドで呼ぶ)。`old_path` は改名前 (もう存在しない)、
@@ -150,46 +303,184 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     //    平文を読み直して新キーで保存し直す)。
     migrate_pdf_password(old_path, new_path, &mut report);
 
-    // 3. keep-drive キーのストア群 (exact + `/` prefix + `::` prefix)。
+    // 3. 共通 STORES の generic rename 群 (exact + `/` prefix + `::` prefix)。
+    //    削除 hard purge も同じ STORES を使う。追加時は片側だけに別表を作らないこと。
     let old_k = crate::adjustment_db::normalize_path(old_path);
     let new_k = crate::adjustment_db::normalize_path(new_path);
-    if old_k != new_k {
-        for (file, table, col, unique) in KEEP_DRIVE_TARGETS {
-            migrate_store(
-                &data_dir.join(file),
-                table,
-                col,
-                *unique,
-                &old_k,
-                &new_k,
-                &mut report,
-            );
-        }
-    }
-
-    // 4. drive 除去キーのストア群。
     let old_s = crate::path_key::normalize(old_path);
     let new_s = crate::path_key::normalize(new_path);
-    if old_s != new_s {
-        for (file, table, col, unique) in DRIVE_STRIPPED_TARGETS {
-            migrate_store(
-                &data_dir.join(file),
-                table,
-                col,
-                *unique,
-                &old_s,
-                &new_s,
-                &mut report,
-            );
+    for descriptor in STORES.iter().filter(|store| store.rename_generic) {
+        let (old_key, new_key) = match descriptor.normalization {
+            StoreKeyNormalization::KeepDrive => (&old_k, &new_k),
+            StoreKeyNormalization::DriveStripped => (&old_s, &new_s),
+        };
+        if old_key == new_key {
+            continue;
         }
+        migrate_store(
+            &data_dir.join(descriptor.file),
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            old_key,
+            new_key,
+            &mut report,
+        );
     }
 
-    // 5. 読書履歴 (exact のみ。raw path 列も更新する)。
+    // 4. 読書履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
+    //    purge は exact + prefix で同じ行を削除する。
     if old_k != new_k {
         migrate_reading_history(data_dir, new_path, &old_k, &new_k, &mut report);
     }
 
     report
+}
+
+/// mIV 内削除の成功 path に対応する全 path-keyed メタストア hard purge 結果。
+#[derive(Debug, Default)]
+pub(crate) struct PurgeReport {
+    pub(crate) rows: usize,
+    pub(crate) errors: Vec<String>,
+}
+
+/// `delete_worker` 専用。Shell が削除成功と確認した path だけを hard purge する。
+///
+/// スキャン・検索・ロード中の missing 判定からは絶対に呼ばない。SQLite ストアは共通
+/// [`STORES`] を走査し、exact + `<key>/` + `<key>::` を素の `DELETE` にする。
+/// `pdf_paths` は SHA-256 キーの逆引きができない PDF password 用に、worker が削除前に
+/// 列挙した実 path 群。
+pub(crate) fn purge_removed_paths_at(
+    data_dir: &Path,
+    removed: &[PathBuf],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    let mut report = PurgeReport::default();
+    if removed.is_empty() {
+        return report;
+    }
+
+    let keep_drive_keys = normalized_removed_keys(removed, StoreKeyNormalization::KeepDrive);
+    let drive_stripped_keys =
+        normalized_removed_keys(removed, StoreKeyNormalization::DriveStripped);
+    for descriptor in STORES {
+        let keys = match descriptor.normalization {
+            StoreKeyNormalization::KeepDrive => &keep_drive_keys,
+            StoreKeyNormalization::DriveStripped => &drive_stripped_keys,
+        };
+        purge_store(data_dir, descriptor, keys, &mut report);
+    }
+
+    match crate::pdf_passwords::PdfPasswordStore::purge_paths_at(data_dir, pdf_paths) {
+        Ok(rows) => report.rows += rows,
+        Err(error) => report.errors.push(format!("pdf_passwords.json: {error}")),
+    }
+    purge_sidecar_backups(removed, &mut report);
+    report
+}
+
+fn purge_sidecar_backups(removed: &[PathBuf], report: &mut PurgeReport) {
+    let mut roots_by_parent = std::collections::HashMap::<PathBuf, Vec<String>>::new();
+    for path in removed {
+        let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        // 親が残る単一ファイル/コンテナ削除だけを安全に更新できる。削除済みフォルダ内の
+        // sidecar はごみ箱側へ移動済みで所在を追えない。
+        if !parent.is_dir() {
+            continue;
+        }
+        roots_by_parent
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push(file_name.to_string_lossy().to_lowercase());
+    }
+    for (parent, roots) in roots_by_parent {
+        let sidecar_path = parent.join(crate::sidecar::SIDECAR_FILENAME);
+        if !sidecar_path.exists() {
+            continue;
+        }
+        let mut sidecar = crate::sidecar::SidecarFile::load(&parent);
+        let changed = roots.iter().fold(false, |changed, root| {
+            sidecar.purge_deleted_root(root) || changed
+        });
+        if changed {
+            sidecar.flush();
+            report.rows += 1;
+        }
+    }
+}
+
+fn normalized_removed_keys(
+    removed: &[PathBuf],
+    normalization: StoreKeyNormalization,
+) -> Vec<String> {
+    let mut keys = removed
+        .iter()
+        .map(|path| match normalization {
+            StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
+            StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
+        })
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn purge_store(
+    data_dir: &Path,
+    descriptor: &StoreDescriptor,
+    removed_keys: &[String],
+    report: &mut PurgeReport,
+) {
+    let db_path = data_dir.join(descriptor.file);
+    if removed_keys.is_empty() || !db_path.exists() {
+        return;
+    }
+    let result = (|| -> Result<usize, rusqlite::Error> {
+        let mut conn = rusqlite::Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let table_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [descriptor.table],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(0);
+        }
+        let tx = conn.transaction()?;
+        let sql = format!(
+            "DELETE FROM {} WHERE {} = ?1
+             OR substr({}, 1, ?2) = ?3
+             OR substr({}, 1, ?4) = ?5",
+            descriptor.table, descriptor.column, descriptor.column, descriptor.column,
+        );
+        let mut changed = 0usize;
+        for key in removed_keys {
+            let folder_prefix = format!("{key}/");
+            let container_prefix = format!("{key}::");
+            changed += tx.execute(
+                &sql,
+                rusqlite::params![
+                    key,
+                    folder_prefix.chars().count() as i64,
+                    folder_prefix,
+                    container_prefix.chars().count() as i64,
+                    container_prefix,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    })();
+    match result {
+        Ok(rows) => report.rows += rows,
+        Err(error) => report.errors.push(format!(
+            "{}: {}.{}: {error}",
+            descriptor.file, descriptor.table, descriptor.column
+        )),
+    }
 }
 
 /// 1 ストア分の移行: exact + `<old>/` prefix + `<old>::` prefix。
@@ -397,6 +688,102 @@ mod tests {
         rusqlite::Connection::open(dir.join(file)).unwrap()
     }
 
+    #[test]
+    fn shared_store_list_hard_purge_covers_exact_folder_and_container_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed = PathBuf::from(r"C:\Root\Gone");
+        for descriptor in STORES {
+            let conn = open(dir.path(), descriptor.file);
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {} ({} TEXT)",
+                descriptor.table, descriptor.column
+            ))
+            .unwrap();
+            let base = match descriptor.normalization {
+                StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(&removed),
+                StoreKeyNormalization::DriveStripped => crate::path_key::normalize(&removed),
+            };
+            for key in [
+                base.clone(),
+                format!("{base}/child.jpg"),
+                format!("{base}::page_1"),
+                format!("{base}2/keep.jpg"),
+            ] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {} ({}) VALUES (?1)",
+                        descriptor.table, descriptor.column
+                    ),
+                    [key],
+                )
+                .unwrap();
+            }
+        }
+
+        let pdf_exact = PathBuf::from(r"C:\Root\Gone.pdf");
+        let pdf_nested = PathBuf::from(r"C:\Root\Gone\nested.pdf");
+        let pdf_keep = PathBuf::from(r"C:\Root\Gone2\keep.pdf");
+        let password_entries = serde_json::json!({
+            crate::pdf_passwords::PdfPasswordStore::path_hash(&pdf_exact): "exact",
+            crate::pdf_passwords::PdfPasswordStore::path_hash(&pdf_nested): "nested",
+            crate::pdf_passwords::PdfPasswordStore::path_hash(&pdf_keep): "keep",
+        });
+        std::fs::write(
+            dir.path().join("pdf_passwords.json"),
+            serde_json::to_vec(&password_entries).unwrap(),
+        )
+        .unwrap();
+
+        let report = purge_removed_paths_at(
+            dir.path(),
+            std::slice::from_ref(&removed),
+            &[pdf_exact, pdf_nested],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, STORES.len() * 3 + 2);
+
+        for descriptor in STORES {
+            let conn = open(dir.path(), descriptor.file);
+            let remaining: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", descriptor.table),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                remaining, 1,
+                "{}.{} must retain only the adjacent prefix",
+                descriptor.table, descriptor.column
+            );
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("pdf_passwords.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.as_object().unwrap().len(), 1);
+        assert!(
+            saved
+                .get(crate::pdf_passwords::PdfPasswordStore::path_hash(&pdf_keep))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rating_count_drops_immediately_after_shared_hard_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from(r"C:\Pics\rated.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        let db_path = dir.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        db.set(&key, 5).unwrap();
+        assert_eq!(db.count_by_stars().unwrap()[5], 1);
+
+        let report = purge_removed_paths_at(dir.path(), &[path], &[]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(db.count_by_stars().unwrap()[5], 0);
+        assert_eq!(db.count(), 0);
+    }
+
     /// ジャーナルの往復と消し込み (空で削除・無ければ空・壊れていたら破棄)。
     #[test]
     fn journal_roundtrip_and_cleanup() {
@@ -548,7 +935,8 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO ratings (path, stars, rated_at_ms, source_path) VALUES (?1, 4, 111, ?1)",
+                "INSERT INTO ratings (path, stars, rated_at_ms, source_path)
+                 VALUES (?1, 4, 111, ?1)",
                 [&old_k],
             )
             .unwrap();

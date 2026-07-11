@@ -9132,7 +9132,7 @@ impl App {
             self.note_reading_history_open(idx);
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
-            if self.stack_try_open_from_grid(idx, true) {
+            if self.stack_try_open_from_grid(ctx, idx, true) {
                 return nav;
             }
             #[cfg(windows)]
@@ -9150,7 +9150,8 @@ impl App {
                         let p = p.clone();
                         let auto_fs = self.should_auto_fullscreen_grid_container(idx);
                         #[cfg(windows)]
-                        if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx) {
+                        if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
+                        {
                             return nav;
                         }
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
@@ -9167,7 +9168,7 @@ impl App {
                     let p = p.clone();
                     let auto_fs = self.should_auto_fullscreen_grid_container(idx);
                     #[cfg(windows)]
-                    if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx) {
+                    if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                         return nav;
                     }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
@@ -9190,6 +9191,12 @@ impl App {
                     // 右クリックメニューから (近日対応予定)。
                     // Phase 7.J: グリッドから明示的に開いたケースなので、
                     // 「一覧から開いたときだけ再生する」設定でも再生開始する。
+                    // 同じ active/ParkedLive メディアなら park より先に前面化して open を消費する。
+                    // (review-v2.3.0 追補4: double-click same-media)
+                    #[cfg(windows)]
+                    if !self.prepare_detached_context_for_grid_open(ctx, idx) {
+                        return nav;
+                    }
                     self.bump_input_seq_for_item("grid_double_click", idx);
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                         // Prevent the second click of the grid double-click from
@@ -9197,11 +9204,6 @@ impl App {
                         // playback back to paused.
                         self.fs_suppress_primary_until_release = true;
                         self.fs_focus_regained_at = Some(std::time::Instant::now());
-                    }
-                    // §3.0 ④: 連動なし窓があれば passive へ退避してから新規 open。
-                    #[cfg(windows)]
-                    if !self.park_active_detached_context_for_new_grid_open(ctx) {
-                        return nav;
                     }
                     self.fs_open_intent_from_grid = true;
                     // P10-1 follow-up: grid_action_open は Enter (および双クリック) からも

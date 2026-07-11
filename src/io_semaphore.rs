@@ -33,7 +33,9 @@
 //! permit の drop で自動的に release し、`notify_all` で起床させる。
 //! Condvar は spurious wakeup 耐性のため `while` ループで条件を再確認する。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IoPriority {
@@ -141,6 +143,41 @@ impl GlobalIoSemaphore {
         IoPermit {
             sem: Arc::clone(&self.inner),
         }
+    }
+
+    /// Cancel-aware blocking acquire for long-lived background workers.
+    ///
+    /// The timeout is only a checkpoint for observing cancel; permit ordering
+    /// and wakeups still use the same Condvar as the regular acquire.
+    pub fn acquire_cancellable(
+        &self,
+        priority: IoPriority,
+        cancel: &AtomicBool,
+    ) -> Option<IoPermit> {
+        const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+        let (mu, cv) = &*self.inner;
+        let mut st = mu.lock().unwrap();
+        st.waiting[priority as usize] += 1;
+        while !st.can_acquire(priority) {
+            if cancel.load(Ordering::Relaxed) {
+                st.waiting[priority as usize] -= 1;
+                cv.notify_all();
+                return None;
+            }
+            let (next, _) = cv.wait_timeout(st, CANCEL_POLL).unwrap();
+            st = next;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            st.waiting[priority as usize] -= 1;
+            cv.notify_all();
+            return None;
+        }
+        st.waiting[priority as usize] -= 1;
+        st.available -= 1;
+        Some(IoPermit {
+            sem: Arc::clone(&self.inner),
+        })
     }
 
     /// Non-blocking acquire。permit が取れないなら即 None を返す。
@@ -251,6 +288,40 @@ mod tests {
         // holder を解放
         drop(_holder);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn cancellable_acquire_leaves_wait_without_a_permit() {
+        let sem = Arc::new(GlobalIoSemaphore::new(1));
+        let holder = sem.acquire(IoPriority::Normal);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sem_worker = Arc::clone(&sem);
+        let cancel_worker = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            let acquired = sem_worker
+                .acquire_cancellable(IoPriority::Low, &cancel_worker)
+                .is_some();
+            done_tx.send(acquired).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let waiting = {
+                let (mu, _) = &*sem.inner;
+                mu.lock().unwrap().waiting[IoPriority::Low as usize]
+            };
+            if waiting == 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!done_rx.recv_timeout(Duration::from_millis(500)).unwrap());
+        assert_eq!(sem.stats().0, 0);
+        drop(holder);
+        worker.join().unwrap();
+        assert_eq!(sem.stats().0, 1);
     }
 
     #[test]

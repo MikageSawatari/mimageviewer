@@ -318,6 +318,8 @@ impl App {
         // (角度⑤ Sol P2: `close_fullscreen` を経ない終了では最後の再生位置が
         // settings 保存に乗らず、前回 capture 時点の値へ巻き戻っていた)。
         self.save_all_video_resume_positions();
+        #[cfg(windows)]
+        self.save_detached_video_resume_positions_for_exit();
         self.persist_window_state_and_flush();
     }
 }

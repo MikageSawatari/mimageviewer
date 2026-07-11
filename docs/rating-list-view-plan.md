@@ -181,6 +181,17 @@ impl RatingDb {
 }
 ```
 
+### 2.3 削除ポリシー (全メタストア hard purge、v2.3.0)
+
+- mIV の削除 worker が Shell 削除成功を返した path だけ、rating を含む path-keyed
+  全メタストアから素の `DELETE` を行う。照合は exact + `<key>/` + `<key>::` で、
+  フォルダ / ZIP / PDF 等の配下キーも対象にする。
+- 対象表は `rename_key_migration::STORES` を rename と purge で共有する。rating だけの
+  tombstone は設けず、未出荷だった `deleted_at_ms` 列追加・alive filter・prewarm unflag は撤去した。
+- ごみ箱から同じ path へ戻しても★は戻らない。タグ・補正・回転等も同じ hard purge 仕様。
+- Explorer 等による外部削除、一覧構築時の stat 失敗、切断ドライブでは DB 行を変更しない。
+  missing は表示結果から除外するだけで、到達不能を削除と誤認しない。
+
 ---
 
 ## 3. フラット一覧ビュー本体
@@ -296,7 +307,8 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
   合流できるか実装時に確認する。できない場合は、その行だけ開く時に PDF password flow へ
   送るか、MVP では PDF 本体へ誘導する。
 - 消えたファイル / 切断ドライブ → stat 失敗で除外。除外件数を表示 (掃除導線は将来)。
-  自動で rating 行を削除しない。外付けドライブ未接続を「削除済み」と誤判定しないため。
+  stat 失敗だけでは rating 行を削除・flag しない。外付けドライブ未接続を「削除済み」と
+  誤判定しないため。mIV 内削除成功だけは §2.3 の hard purge を適用する。
 
 ---
 

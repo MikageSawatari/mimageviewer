@@ -1244,5 +1244,9 @@ mod tests {
         // (review-v2.3.0 hunt P2)。
         let audio = GridItem::Audio(PathBuf::from("a.flac"));
         assert!(facet_tag_filter_applies(&audio));
+        assert_eq!(
+            facet_kind_for_item(&audio),
+            crate::settings::FacetItemKind::Audio
+        );
     }
 }

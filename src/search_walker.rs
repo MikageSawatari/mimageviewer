@@ -60,6 +60,8 @@ pub enum CandidateKind {
     Pdf,
     /// 動画 (ファイル名 + mXD XMP + sidecar tags + container metadata)
     Video,
+    /// 音声 (ファイル名のみ。ID3 等の埋め込みタグは対象外)
+    Audio,
 }
 
 /// 3-way diff 結果。
@@ -174,6 +176,9 @@ pub fn scan(
     result.diag = diag;
 
     for (key, cand) in &fs_map {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         match db_map.get(key) {
             None => {
                 // FS only → 新規 ingest
@@ -192,6 +197,9 @@ pub fn scan(
         }
     }
     for key in db_map.keys() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         if !fs_map.contains_key(key) {
             result.to_delete.push(key.clone());
         }
@@ -239,7 +247,9 @@ fn walk_dir_recursive(
         p.set(format!("スキャン: {} ({} 件)", dir.display(), out.len()));
     }
 
-    let _permit = io_sem.acquire(priority);
+    let Some(_permit) = io_sem.acquire_cancellable(priority, cancel) else {
+        return Ok(());
+    };
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => {
@@ -301,6 +311,8 @@ fn walk_dir_recursive(
             CandidateKind::Pdf
         } else if folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
             CandidateKind::Video
+        } else if folder_tree::is_audio_ext(&ext) {
+            CandidateKind::Audio
         } else if folder_tree::is_recognized_image_ext(&ext) {
             CandidateKind::Image
         } else {
@@ -437,13 +449,14 @@ mod tests {
         make_file(&root, "archive.zip", b"PK");
         make_file(&root, "doc.pdf", b"%PDF");
         make_file(&root, "clip.mp4", b"fake mp4");
+        make_file(&root, "song.MP3", b"fake mp3");
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(
-            r.total_scanned, 4,
-            "jpg+png+pdf+mp4 の 4 つ (zip/txt は除外)"
+            r.total_scanned, 5,
+            "jpg+png+pdf+mp4+mp3 の 5 つ (zip/txt は除外)"
         );
-        assert_eq!(r.to_ingest.len(), 4);
+        assert_eq!(r.to_ingest.len(), 5);
         assert_eq!(r.unchanged, 0);
         assert!(r.to_delete.is_empty());
 
@@ -451,6 +464,7 @@ mod tests {
         assert!(kinds.contains(&CandidateKind::Image));
         assert!(kinds.contains(&CandidateKind::Pdf));
         assert!(kinds.contains(&CandidateKind::Video));
+        assert!(kinds.contains(&CandidateKind::Audio));
     }
 
     #[test]

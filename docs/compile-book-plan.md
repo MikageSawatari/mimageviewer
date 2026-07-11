@@ -10,6 +10,32 @@
 > 並べ替え・カスタマイズは、ツールバー全体の統一モデル
 > [toolbar-customization-plan.md](toolbar-customization-plan.md) に集約 (この refactor が先行)。
 
+> **追補 (2026-07-11, 設計確定・v2.3.0 スコープ・未実装): 本棚追加時のフル composite 焼き込み**
+> ユーザー実機 FB: 隠蔽加工した画像を本棚に右クリック追加すると加工が消える (= SNS 直アップ
+> 用途で戸惑う)。原因は現状の焼き込みが `AdjustedFile` = **補正 + 非破壊回転のみ**で、
+> 隠蔽 / 消しゴム / 補正レイヤー / テキストを含まないため (`src/books.rs::write_source` /
+> `write_adjusted_color_image`)。
+>
+> **確定仕様 (ユーザー裁定)**: 追加時に「編集がある時だけ焼く / 無編集なら byte コピー」の
+> 既存ポリシーは維持しつつ、**焼く対象を Ctrl+E と同じフル最終 composite に拡張**する。
+> - 判定 = 対象アイテムに 補正(adjustment_page_params) / 回転 / 隠蔽(conceal) / 消しゴム(erase) /
+>   補正レイヤー(local_adjust) / テキスト(comic) のいずれかが乗っているか。1 つでもあれば焼く。
+> - 焼く経路 = Ctrl+E エクスポートの最終合成部品を再利用
+>   (`comic_composited_pixels_for_export` + final composite / adjustment / conceal / erase の合成)。
+>   `write_adjusted_color_image` (補正+回転のみ) では不足なので、本棚書き出しに full-composite
+>   経路を新設し `BookPageSource` に追加する (`CompositedFile` 等)。
+> - **無編集なら従来どおり byte コピー** (原本ビット保持 = AI メタデータ [PNG tEXt prompt/EXIF/XMP] /
+>   アニメーション GIF・APNG / 未圧縮性を保つ)。理由: 常時再エンコードすると素材まで劣化・
+>   メタ剥離・アニメ静止画化する。「編集が消えるのを防ぐ」という要望は編集時焼きだけで満たせる。
+> - **焼いた場合はメタデータが剥がれる** (生 RGBA から再エンコードのため)。SNS アップ用途では
+>   むしろ望ましいので許容。ZIP 内画像 / PDF ページは既存の Adjusted* 同様に full-composite 化。
+> - フォーマット = 原則ソース形式を踏襲 (PNG→PNG / JPEG→JPEG)、透過を含む合成で JPEG のときは
+>   既存 jpeg_matte を使う。既存 Ctrl+E の format/matte 選定に合わせる。
+> - worker + 進捗は既存の adjusted book page 追加経路を流用 (UI スレッドで decode/encode しない)。
+> - 実装規模見積り = 中 (2〜4 日)。エンジン部品は全て既存、本棚書き出しへの full-composite
+>   再配線 + BookPageSource 追加 + 判定拡張が主。**要リリース前レビュー + 実機確認**
+>   (追加経路の新規性ゆえ)。
+
 ## 実装メモ (v1.7.0)
 
 - 製本ルートは設定可能で、既定は `Pictures\mimageviewer\books`。`Settings.book_root` が

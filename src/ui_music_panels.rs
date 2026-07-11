@@ -238,16 +238,14 @@ impl App {
         // perf 帰属 / last_input_at ベースの idle 判定を今回の操作に紐付ける、Codex P3)。
         self.bump_input_seq("music_nav_file", Some(&format!("delta={delta}")));
         let display_order = self.current_grid_order().to_vec();
-        if let Some(new_idx) =
-            crate::ui_helpers::adjacent_navigable_idx(&self.items, &display_order, fs_idx, delta)
-        {
-            self.open_fullscreen_from_fs_navigation(ctx, new_idx);
-        } else {
-            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
-                at_end: delta > 0,
-                at: std::time::Instant::now(),
-            });
-        }
+        self.start_manual_media_navigation(
+            ctx,
+            &display_order,
+            fs_idx,
+            delta,
+            "music_window_manual",
+            crate::app::ManualMediaNavigationLanding::Fullscreen,
+        );
     }
 
     /// J/K マーカーナビ (ブックマーク間の前後ジャンプ)。動画 `VideoMarkerPrev`/`VideoMarkerNext`

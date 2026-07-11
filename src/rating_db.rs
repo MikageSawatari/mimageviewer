@@ -146,6 +146,17 @@ impl RatingDb {
         Ok(Self { conn })
     }
 
+    /// 起動時 migration 済みの既存 DB を worker から更新用に開く。
+    /// delete worker が main 接続と並行して schema DDL を再発行しないための経路。
+    pub fn open_existing_for_write(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("rating.db")
     }

@@ -5416,7 +5416,7 @@ impl App {
         self.note_reading_history_open(idx);
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
-        if self.stack_try_open_from_grid(idx, false) {
+        if self.stack_try_open_from_grid(ctx, idx, false) {
             return None;
         }
         #[cfg(windows)]
@@ -5439,6 +5439,12 @@ impl App {
             | Some(GridItem::PdfPage { .. })
             | Some(GridItem::Video(_))
             | Some(GridItem::Audio(_)) => {
+                // Enter / ダブルクリックと同じく、same-media 前面化を park より先に通す。
+                // (review-v2.3.0 追補4: gamepad grid open)
+                #[cfg(windows)]
+                if !self.prepare_detached_context_for_grid_open(ctx, idx) {
+                    return None;
+                }
                 self.bump_input_seq_for_item("gamepad_grid_open", idx);
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(idx);

@@ -691,6 +691,11 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    渡した `OpenOptions.autoplay` を尊重する。通常 open は自動再生し、タイル表示や normalize
    scan など再生開始を保留する経路では、native presenter が最初の post-seek frame を `Present`
    した時点でその PTS に凍結して seek override を解除する。
+   resume保存はposition/duration guardに加えて、EngineActorのpublished stateがEOFなら
+   durationに関係なくentryを削除する。対象は5秒周期、save-all、parked/passive teardownの
+   全経路。open時はVideoPlayer/EngineActor共通sanitizeで、duration既知かつ末端guard内の
+   resumeを無視する。なおVideoInfo/HUD durationはavformat情報受領時の値で、decode EOFの
+   実位置を尺として学習・書き戻す機構は現時点では無い。
 
 3. **旧 player の eager drop**
    `start_native_video_source_swap` は `take_native_output` で旧 player から

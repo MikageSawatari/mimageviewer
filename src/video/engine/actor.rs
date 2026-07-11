@@ -527,15 +527,13 @@ impl EngineActor {
                 }
                 // resume が指定されていれば、open path 内で seek を発火する。
                 // resume_secs を一度消費して以降の再 InfoReceived では発火しない。
-                if let Some(resume) = self.opts.resume_secs.take() {
-                    let near_end = duration_secs > 0.0
-                        && resume >= duration_secs - VIDEO_RESUME_END_GUARD_SECS;
-                    let safe = resume >= VIDEO_RESUME_MIN_POSITION_SECS && !near_end;
-                    if safe {
-                        // Loading → Seeking{resume} へ。epoch++ + latch reset を伴う。
-                        self.handle_seek_request(resume);
-                        return;
-                    }
+                if let Some(resume) = crate::video::sanitize_resume_for_duration(
+                    self.opts.resume_secs.take(),
+                    duration_secs,
+                ) {
+                    // Loading → Seeking{resume} へ。epoch++ + latch reset を伴う。
+                    self.handle_seek_request(resume);
+                    return;
                 }
                 // resume 不要ケース: Loading → Buffering (preroll、READY を待つ)
                 self.transition_to_buffering(0.0);
@@ -701,12 +699,6 @@ impl EngineActor {
         }
     }
 }
-
-/// 末尾近く (残り 5 秒以下) の resume は無視する境界 (= 完走済みとみなす)。
-/// 既存 `crate::app::VIDEO_RESUME_END_GUARD_SECS` と同値で揃える (Phase 3b で配線)。
-const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
-/// resume が小さすぎ (動画開始直後) の場合は無視する閾値。
-const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 1.0;
 
 #[cfg(test)]
 mod tests {

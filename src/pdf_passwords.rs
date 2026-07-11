@@ -35,7 +35,10 @@ pub struct PdfPasswordStore {
 impl PdfPasswordStore {
     /// ストアファイルから読み込む。ファイルが無ければ空のストアを返す。
     pub fn load() -> Self {
-        let path = Self::store_path();
+        Self::load_at(&Self::store_path())
+    }
+
+    fn load_at(path: &Path) -> Self {
         let entries = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -46,14 +49,18 @@ impl PdfPasswordStore {
     /// ストアファイルに保存する。
     pub fn save(&self) {
         let path = Self::store_path();
+        if let Err(e) = self.save_at(&path) {
+            eprintln!("pdf_passwords save failed: {e}");
+        }
+    }
+
+    fn save_at(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(&self.entries) {
-            if let Err(e) = std::fs::write(&path, json) {
-                eprintln!("pdf_passwords save failed: {e}");
-            }
-        }
+        let json = serde_json::to_string_pretty(&self.entries)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        std::fs::write(path, json)
     }
 
     /// 指定 PDF パスの保存済みパスワードを DPAPI で復号して返す。
@@ -106,11 +113,33 @@ impl PdfPasswordStore {
         crate::data_dir::get().join("pdf_passwords.json")
     }
 
-    fn path_hash(pdf_path: &Path) -> String {
+    pub(crate) fn path_hash(pdf_path: &Path) -> String {
         let normalized = crate::path_key::normalize(pdf_path);
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    /// delete worker 用。削除前に列挙した PDF path のハッシュ行だけを hard purge する。
+    /// path 自体を保存しない既存形式のため、フォルダ削除では worker が削除前に配下 PDF を
+    /// 列挙してからこの関数へ渡す。
+    pub(crate) fn purge_paths_at(data_dir: &Path, pdf_paths: &[PathBuf]) -> std::io::Result<usize> {
+        if pdf_paths.is_empty() {
+            return Ok(0);
+        }
+        let path = data_dir.join("pdf_passwords.json");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut store = Self::load_at(&path);
+        let mut removed = 0usize;
+        for pdf_path in pdf_paths {
+            removed += usize::from(store.entries.remove(&Self::path_hash(pdf_path)).is_some());
+        }
+        if removed > 0 {
+            store.save_at(&path)?;
+        }
+        Ok(removed)
     }
 }
 

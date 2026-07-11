@@ -77,6 +77,15 @@ fn engine_state_code_name(code: u8) -> &'static str {
     }
 }
 
+/// duration が判明した時点で open-time resume を安全な途中位置だけに絞る。
+/// コンテナ情報到着後に呼び、末端 guard 内なら先頭から再生する。
+pub(crate) fn sanitize_resume_for_duration(resume: Option<f64>, duration: f64) -> Option<f64> {
+    let resume = resume?;
+    let near_end = duration > 0.0 && resume >= duration - crate::app::VIDEO_RESUME_END_GUARD_SECS;
+    (resume.is_finite() && resume >= crate::app::VIDEO_RESUME_MIN_POSITION_SECS && !near_end)
+        .then_some(resume)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VideoContinuousMode {
     #[default]
@@ -784,6 +793,11 @@ impl NativeVideoOutput {
             init_error: Arc::new(Mutex::new(None)),
             thread: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_closed_for_test(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 
     fn spawn(
@@ -4409,6 +4423,89 @@ fn frame_step_waiting_for_display(
 }
 
 impl VideoPlayer {
+    /// ParkedLive teardown の resume 保存テスト用。worker / native HWND を起動しない。
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test(path: PathBuf, position_secs: f64) -> Self {
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, seek_serial.clone()));
+        clock.set_paused_position(position_secs);
+        let engine = Arc::new(Mutex::new(EngineActor::new(
+            OpenOptions {
+                initial_volume: 1.0,
+                autoplay: false,
+                ..Default::default()
+            },
+            seek_serial,
+            clock.clone(),
+        )));
+        let engine_state_atomic = engine.lock().unwrap().published_state_handle();
+        let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(1);
+        Self {
+            path,
+            clock,
+            engine,
+            engine_state_atomic,
+            engine_event_tx,
+            engine_event_rx,
+            info_event_emitted: false,
+            first_frame_event_last_epoch: None,
+            displayed_frame_seq: Arc::new(AtomicU64::new(0)),
+            last_displayed_pts_bits: Arc::new(AtomicU64::new(position_secs.to_bits())),
+            frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
+            frame_step_active: Arc::new(AtomicBool::new(false)),
+            frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
+            #[cfg(windows)]
+            duration_secs_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
+            ui_dropped_past_count: AtomicU64::new(0),
+            cancel: Arc::new(AtomicBool::new(true)),
+            decode: dummy_decode_handles(),
+            audio: None,
+            info: None,
+            error: None,
+            thumb_worker: None,
+            marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
+            future_frames: std::collections::VecDeque::new(),
+            pending_resume_secs: None,
+            last_seen_seek_serial: 0,
+            loop_enabled: AtomicBool::new(false),
+            loop_target_bits: AtomicU64::new(0),
+            eof_loop_quiet_ticks: AtomicU32::new(0),
+            seek_inflight_since: None,
+            seek_eof_stuck_since: None,
+            user_seek_coalesce: Mutex::new(UserSeekCoalesceState::default()),
+            #[cfg(windows)]
+            gpu_latest: None,
+            #[cfg(windows)]
+            native_output: None,
+            #[cfg(windows)]
+            native_hover_thumbnail_target_secs: Mutex::new(None),
+            #[cfg(windows)]
+            native_hover_thumbnail_sent_key: Mutex::new(None),
+            #[cfg(windows)]
+            dynamic: Arc::new(crate::video::decoder::VideoDynamicState::default()),
+            audio_diagnostics: Arc::new(crate::video::audio_diagnostics::AudioDiagnostics::new(
+                std::time::Instant::now(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_displayed_pts_for_test(&self, position_secs: f64) {
+        self.last_displayed_pts_bits
+            .store(position_secs.to_bits(), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_eof_for_test(&self, duration_secs: f64) {
+        let mut engine = self.engine.lock().unwrap();
+        let epoch = engine.current_seek_epoch();
+        engine.handle_decoder_event(engine::state::DecoderEvent::EofReached {
+            epoch,
+            duration_secs,
+        });
+    }
+
     fn repaint_prewake_secs(&self) -> f64 {
         let fps = self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0);
         if fps.is_finite() && fps > 1.0 {
@@ -6022,28 +6119,26 @@ impl VideoPlayer {
                         // resume 指定があれば最初の info 到着時に 1 度だけ実行。
                         // 末尾近く (残り 5 秒以下) なら 0 から再生 (= 完走済みと見なす)。
                         // 保存側 (`save_video_resume_position`) と同じ閾値で gate する。
-                        if let Some(resume) = self.pending_resume_secs.take() {
-                            let dur = info.duration_secs;
-                            let near_end = dur > 0.0
-                                && resume >= dur - crate::app::VIDEO_RESUME_END_GUARD_SECS;
-                            if resume >= crate::app::VIDEO_RESUME_MIN_POSITION_SECS && !near_end {
-                                self.clock.request_seek(resume);
-                                // 共有 seek_serial は clock.request_seek で 1 回 bump。
-                                // 続く engine.handle_seek_request は adaptive ロジックで
-                                // 「外部 bump 検知」となり、自身は bump せず state 更新のみ。
-                                // engine の InfoReceived ハンドラ内 resume 経路と二重に
-                                // 走ったとしても、後発側は observed (= bump 後) と
-                                // last_observed_serial (= 進行済) で外部判定 → 余計な
-                                // bump を避ける構造になっている。
-                                //
-                                // **意図的に apply_command(Play) は呼ばない**:
-                                // open-time の resume は user 操作ではなく自動復元なので、
-                                // 通常オープンやタイル/遅延オープンが渡した `OpenOptions.autoplay`
-                                // をそのまま尊重する。
-                                // user 操作の seek/seek_relative/toggle_play は
-                                // 別経路で apply_command(Play) を呼ぶ。
-                                self.engine.lock().unwrap().handle_seek_request(resume);
-                            }
+                        if let Some(resume) = sanitize_resume_for_duration(
+                            self.pending_resume_secs.take(),
+                            info.duration_secs,
+                        ) {
+                            self.clock.request_seek(resume);
+                            // 共有 seek_serial は clock.request_seek で 1 回 bump。
+                            // 続く engine.handle_seek_request は adaptive ロジックで
+                            // 「外部 bump 検知」となり、自身は bump せず state 更新のみ。
+                            // engine の InfoReceived ハンドラ内 resume 経路と二重に
+                            // 走ったとしても、後発側は observed (= bump 後) と
+                            // last_observed_serial (= 進行済) で外部判定 → 余計な
+                            // bump を避ける構造になっている。
+                            //
+                            // **意図的に apply_command(Play) は呼ばない**:
+                            // open-time の resume は user 操作ではなく自動復元なので、
+                            // 通常オープンやタイル/遅延オープンが渡した `OpenOptions.autoplay`
+                            // をそのまま尊重する。
+                            // user 操作の seek/seek_relative/toggle_play は
+                            // 別経路で apply_command(Play) を呼ぶ。
+                            self.engine.lock().unwrap().handle_seek_request(resume);
                         }
                         self.info = Some(info);
                     }
@@ -6768,6 +6863,12 @@ impl VideoPlayer {
 
     pub fn engine_state_name(&self) -> &'static str {
         engine_state_code_name(self.engine_state_code())
+    }
+
+    /// EngineActor の published state が terminal EOF なら true。
+    /// AvClock の eof_reached は互換複製なので、resume ownership 判定ではこちらを使う。
+    pub fn is_at_eof(&self) -> bool {
+        self.engine_state_code() == engine::actor::state_code::EOF
     }
 
     /// engine が readiness 待ちの遷移中か (= Loading / Buffering / Seeking)。

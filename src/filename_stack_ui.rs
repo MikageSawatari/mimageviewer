@@ -601,6 +601,7 @@ impl crate::app::App {
     /// 抑制するため)。通常の grid→fullscreen 経路と同じ開幕ガードをここで張る。
     pub(crate) fn stack_try_open_from_grid(
         &mut self,
+        ctx: &egui::Context,
         agg_idx: usize,
         from_double_click: bool,
     ) -> bool {
@@ -615,6 +616,15 @@ impl crate::app::App {
             // passthrough コンテナ → フルスクリーンでなく通常ナビへ。
             return false;
         };
+        #[cfg(not(windows))]
+        let _ = ctx;
+        // items をフラット配列へ差し替える前に、集約セルの path で same-media 前面化を
+        // 判定する。別 media/still のときだけ現 active context を先に park する。
+        // (review-v2.3.0 追補4: stack flat grid open)
+        #[cfg(windows)]
+        if !self.prepare_detached_context_for_grid_open(ctx, agg_idx) {
+            return true;
+        }
         // 開幕ガード (通常の grid open 経路と同じ):
         // - Enter で開いた同フレームに fullscreen 側が同じ Enter を拾って即 close するのを防ぐ
         //   (Enter が押下されていなければ fullscreen 側初フレームで自動リセットされるので、

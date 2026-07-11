@@ -441,6 +441,7 @@ impl App {
         let requested_at = pending.requested_at;
         let deadline = pending.deadline;
         let input_seq = pending.input_seq;
+        let parked_live_window_id = pending.parked_live_window_id;
 
         if self.fullscreen_idx != Some(idx)
             || !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path)
@@ -461,6 +462,14 @@ impl App {
                 self.show_feedback_toast(
                     "別ウィンドウの準備に失敗したため動画を開けませんでした".to_string(),
                 );
+                if let Some(window_id) = parked_live_window_id {
+                    self.request_parked_live_media_close_after_poll(
+                        window_id,
+                        "parked_native_open_host_timeout",
+                    );
+                    ctx.request_repaint();
+                    return;
+                }
                 self.close_fullscreen();
                 ctx.request_repaint();
             } else {
@@ -535,6 +544,14 @@ impl App {
                 );
             }
             self.show_feedback_toast("前の動画デコード終了待ちがタイムアウトしました".to_string());
+            if let Some(window_id) = parked_live_window_id {
+                self.request_parked_live_media_close_after_poll(
+                    window_id,
+                    "parked_native_open_decoder_timeout",
+                );
+                ctx.request_repaint();
+                return;
+            }
             self.close_fullscreen();
             ctx.request_repaint();
         } else {
@@ -1055,6 +1072,20 @@ impl App {
         pending_window_id.is_none() || pending_window_id == current_parked_input_window_id
     }
 
+    /// F12 の入口が、現在 mount 中の context 所有 source-swap を見ているか。
+    /// owner=None は mounted/active の共通 stamp なので、active bundle が unmount 中の
+    /// root 処理からは所有扱いしない (review-v2.3.0 追補3: 角度B-1)。
+    #[cfg(windows)]
+    pub(crate) fn current_context_owns_source_swap_pending(&self) -> bool {
+        self.native_video_source_swap_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.parked_live_window_id == self.native_video_parked_live_input_window_id
+                    && (self.native_video_parked_live_input_window_id.is_some()
+                        || !self.active_detached_viewer_context_contains_video())
+            })
+    }
+
     #[cfg(windows)]
     pub(crate) fn source_swap_owner_after_update(
         current_parked_window_id: Option<u64>,
@@ -1108,6 +1139,13 @@ impl App {
         if let Some(pending) = self.video_tile_swap_pending.as_mut() {
             pending.parked_live_window_id = Self::pending_owner_after_context_transition(
                 pending.parked_live_window_id,
+                from_owner,
+                to_owner,
+            );
+        }
+        if let Some(pending) = self.media_navigation_pending.as_mut() {
+            pending.owner_window_id = Self::pending_owner_after_context_transition(
+                pending.owner_window_id,
                 from_owner,
                 to_owner,
             );
@@ -1168,21 +1206,26 @@ impl App {
             self.native_video_open_pending = None;
             discarded = true;
         }
-        if self
+        let discarded_fast = self
             .native_video_fast_swap_pending
             .as_ref()
-            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
-        {
+            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id));
+        if discarded_fast {
             self.native_video_fast_swap_pending = None;
             discarded = true;
         }
-        if self
+        let discarded_tile = self
             .video_tile_swap_pending
             .as_ref()
-            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
-        {
+            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id));
+        if discarded_tile {
             self.video_tile_swap_pending = None;
             discarded = true;
+        }
+        if discarded_fast || discarded_tile {
+            // fast/tile pending 中の追加ナビは App-global companion に残る。owner pending と
+            // 同時に落とさないと別 context の poll が drain する (review-v2.3.0 追補3: A-2)。
+            self.native_video_deferred_nav_delta = None;
         }
         discarded
     }
@@ -1262,9 +1305,16 @@ impl App {
             self.show_feedback_toast("動画プレゼンターが閉じられました".to_string());
             if let Some(window_id) = parked_live_window_id {
                 crate::logger::log(format!(
-                    "[native-video] parked deferred source swap aborted without closing fullscreen: \
+                    "[native-video] parked deferred source swap aborted; closing owner after poll: \
                      window_id={window_id} target_idx={target_idx} reason=presenter_closed"
                 ));
+                // mount 中 bundle を先に snapshot へ戻し、共通 teardown seam で owner 窓だけ閉じる。
+                // close_fullscreen は mounted main を誤って閉じるため呼ばない。
+                // (review-v2.3.0 追補7: R1 第2波 P2-1)
+                self.request_parked_live_media_close_after_poll(
+                    window_id,
+                    "source_swap_presenter_closed",
+                );
                 ctx.request_repaint();
                 return;
             }
@@ -1321,9 +1371,14 @@ impl App {
                 );
                 if let Some(window_id) = parked_live_window_id {
                     crate::logger::log(format!(
-                        "[native-video] parked deferred source swap timed out without closing fullscreen: \
+                        "[native-video] parked deferred source swap timed out; closing owner after poll: \
                          window_id={window_id} target_idx={target_idx} reason={reason}"
                     ));
+                    // (review-v2.3.0 追補7: R1 第2波 P2-1)
+                    self.request_parked_live_media_close_after_poll(
+                        window_id,
+                        "source_swap_decoder_timeout",
+                    );
                     ctx.request_repaint();
                     return;
                 }
@@ -1522,8 +1577,9 @@ impl App {
         }
 
         // deferred swap を確定する open_fullscreen は「viewer 内ナビ」相当なので、
-        // open_fullscreen 冒頭の一括ガードが現在の `viewer_presentation` (pending 中に F12
-        // されていれば反映済み) から presentation 維持 one-shot を焼き付ける。
+        // open_fullscreen 冒頭の一括ガードが現在の `viewer_presentation` から presentation
+        // 維持 one-shot を焼き付ける。pending 中の F12 は player 不在で設定だけ反転しないよう
+        // 共通入口で無視する (review-v2.3.0 追補3: 角度B-1、案a)。
         self.open_fullscreen(target_idx);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
         true
@@ -7815,19 +7871,14 @@ impl App {
         }
         let nav_delta = self.spread_nav_delta(base_delta);
         let display_order = self.current_grid_order().to_vec();
-        if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
-            &self.items,
+        self.start_manual_media_navigation(
+            ctx,
             &display_order,
             fs_idx,
             nav_delta,
-        ) {
-            // presentation 維持 (「別ウィンドウで開く」設定を手動ナビで再適用しない) は
-            // `open_fullscreen` 冒頭の一括ガードで行う (Home/End / Ctrl+G / 検索ジャンプ / fast-swap
-            // deferred 経路も同じ経路に集約されるので一箇所で塞げる。実機 P1/P2)。
-            self.open_native_video_fullscreen_from_navigation(ctx, new_idx);
-        } else {
-            self.show_native_video_boundary_toast(ctx, nav_delta > 0);
-        }
+            "native_media_window_manual",
+            crate::app::ManualMediaNavigationLanding::NativeVideo,
+        );
     }
 
     /// `poll_native_video_fast_swap` / `poll_video_tile_swap_pending` が pending を

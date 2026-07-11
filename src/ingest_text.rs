@@ -140,15 +140,26 @@ pub fn parse_tags_column(s: &str) -> Vec<String> {
     s.split_whitespace().map(|t| t.to_string()).collect()
 }
 
+/// ファイル名だけを検索対象にする種類向けのソース別テキストを構築する。
+///
+/// 音声ファイルは ID3 等の埋め込みタグを今回の索引スコープに含めないため、ファイルを
+/// 読まずにこの helper を使う。正規化規則は他の ingest 経路と同じ。
+pub fn build_per_source_for_filename(path: &Path) -> PerSourceText {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(normalize_for_match)
+        .unwrap_or_default();
+    PerSourceText {
+        name,
+        ..Default::default()
+    }
+}
+
 /// 1 ファイル分のソース別検索テキストをディスクから構築する。
 /// 抽出に失敗した部分は空文字列。ファイル名は必ず含める。
 pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
-    let mut out = PerSourceText::default();
-
-    // 1. ファイル名
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        out.name = normalize_for_match(name);
-    }
+    let mut out = build_per_source_for_filename(path);
 
     // 2. XMP / PNG / EXIF UserComment AI メタは同じファイル実体を
     //    複数回読む path-based 版を使うと
@@ -467,6 +478,19 @@ mod tests {
         let pst = build_per_source_for_file(&path);
         assert!(!pst.name.contains("CAMERA"));
         assert!(pst.name.contains("camera_photo.jpg"));
+    }
+
+    #[test]
+    fn filename_only_helper_does_not_populate_metadata_sources() {
+        let pst = build_per_source_for_filename(Path::new("C:/Music/MixedCase.MP3"));
+        assert_eq!(pst.name, "mixedcase.mp3");
+        assert!(pst.exif.is_empty());
+        assert!(pst.xmp_tweet.is_empty());
+        assert!(pst.png_prompt.is_empty());
+        assert!(pst.pdf_meta.is_empty());
+        assert!(pst.video_meta.is_empty());
+        assert!(pst.tags.is_empty());
+        assert!(pst.sidecar.is_empty());
     }
 
     #[test]

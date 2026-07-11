@@ -162,7 +162,7 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 
 機能追加・変更で以下を触るときは、この順で確認する。
 
-- [ ] **file I/O (read, open, metadata)**: UI スレッドから呼ぶなら 1ms 以下に収まるか?
+- [ ] **file I/O (read, open, metadata, `Path::exists` / `try_exists`)**: UI スレッドから呼ぶなら 1ms 以下に収まるか?
       超えるなら worker thread に出す。
 - [ ] **`read_dir` ループ内で `path.is_dir()` / `is_file()` を使っていないか**: Windows で
       遅い。`entry.file_type()` を使う。

@@ -214,12 +214,10 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 
 ## 5. アーキテクチャ配置マップ（mIV のどこに何を差すか・実識別子に接続）
 
-### 5.1 GridItem::Audio + 検出
-- `src/grid_item.rs:36` の `GridItem::Video(PathBuf)` の隣に **`Audio(PathBuf)`** を追加。
-- `src/folder_tree.rs:73` の `SUPPORTED_VIDEO_EXTENSIONS` の隣に **`SUPPORTED_AUDIO_EXTENSIONS`**
-  （例: `mp3` / `flac` / `wav` / `m4a` / `aac` / `ogg` / `opus` / `wma`。FFmpeg が開ける範囲で確定）。
-- 検出 2 箇所: `src/search_walker.rs:302`（`CandidateKind` に Audio 追加）/
-  `src/app.rs:10194` 付近のフォルダ読み込み（`is_video` 分岐の隣に audio 分岐）。
+### 5.1 GridItem::Audio + 検出（実装済み）
+- `GridItem::Audio(PathBuf)` と共通 `SUPPORTED_AUDIO_EXTENSIONS` / `is_audio_ext` を実装済み。
+- 通常フォルダ読み込み、タグビュー、Ctrl+G の初期 walker / watcher 差分を共通拡張子判定へ接続済み。
+  Ctrl+G はファイル名のみを索引化し、Flat / DrilledInto の検索結果を `GridItem::Audio` へ復元する。
 - **要更新の網羅 match**（`GridItem` の exhaustive match）: `grid_item.rs` の
   `has_page_data()`(146) / `is_rating_leaf()`(157) / `name()`(218) / `display_path()`(242) /
   `perf_key()`(321) ＋ `app.rs` 内で `GridItem::Video(_)` を処理する全アーム。

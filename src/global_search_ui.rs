@@ -39,7 +39,7 @@ use crate::indexer_manager::SearchHandle;
 pub struct GlobalSearchFilters {
     /// None = 登録済み全お気に入りを対象。Some(id) なら単一 favorite に限定。
     pub favorite: Option<Uuid>,
-    /// None = 全タイプ (画像/PDF/動画)。Some(k) で単一種別に限定。
+    /// None = 全タイプ (画像/PDF/動画/音声)。Some(k) で単一種別に限定。
     pub kind: Option<IndexKind>,
     /// 検索対象ソース。既定は All (= 全ソース OR)。
     pub target: SearchTarget,
@@ -66,6 +66,7 @@ pub fn kind_label(k: IndexKind) -> &'static str {
         IndexKind::Zip => "ZIP ファイル",
         IndexKind::Pdf => "PDF ファイル",
         IndexKind::Video => "動画ファイル",
+        IndexKind::Audio => "音声ファイル",
     }
 }
 
@@ -121,13 +122,14 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::Sidecar),
 ];
 
-// アイテム検索 (Ctrl+G) の対象は 画像 / PDF / 動画。フォルダ・ZIP はコンテナなので
+// アイテム検索 (Ctrl+G) の対象は 画像 / PDF / 動画 / 音声。フォルダ・ZIP はコンテナなので
 // コンテナ検索 (Ctrl+S) 側で扱う (docs/search-container-item-redesign.md §3.2, §6)。
 pub const KIND_CHOICES: &[Option<IndexKind>] = &[
     None,
     Some(IndexKind::Image),
     Some(IndexKind::Pdf),
     Some(IndexKind::Video),
+    Some(IndexKind::Audio),
 ];
 
 /// クエリ入力後、検索実行までの debounce 間隔 (既存 Ctrl+F と揃える)。
@@ -778,7 +780,7 @@ pub(crate) fn build_aggregated_items(
 /// Flat (一覧) view の items + image_metas を組み立てる
 /// (docs/search-container-item-redesign.md §4.3.1)。
 ///
-/// `state.all_hits` を走査して各ヒットを `GridItem::{Image, PdfFile, Video}` に変換し、
+/// `state.all_hits` を走査して各ヒットを `GridItem::{Image, PdfFile, Video, Audio}` に変換し、
 /// メインの `sort_order` で一律ソートする。ZIP 内画像ヒットはアイテム索引に存在しない
 /// が (§3.2)、stale な索引が残るケースに備えて防御的にスキップする。
 /// `build_drilled_items` と同じく placeholder image_metas を使い、UI スレッドでの
@@ -800,19 +802,16 @@ pub(crate) fn build_flat_items(
             continue;
         }
         let p = PathBuf::from(&h.path);
-        let ext = p
-            .extension()
+        // ZIP ファイル自体もアイテム索引対象外 (§3.2)。Flat では stale doc を
+        // 防御的にスキップする。DrilledInto の既存復元契約は ZipFile のまま維持する。
+        if p.extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let item = match ext.as_str() {
-            "pdf" => GridItem::PdfFile(p.clone()),
-            // ZIP ファイル自体もアイテム索引対象外 (§3.2)。防御的にスキップ。
-            "zip" => continue,
-            _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
-                GridItem::Video(p.clone())
-            }
-            _ => GridItem::Image(p.clone()),
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            continue;
+        }
+        let Some(item) = grid_item_from_fs_hit_path(&p) else {
+            continue;
         };
         let basename = p
             .file_name()
@@ -918,18 +917,8 @@ pub(crate) fn build_drilled_items(
         // `GridItem::Image` を入れていたため、ScanSnap のような PDF だらけの
         // favorite に drill-in すると全サムネが「画像フォーマット判定不可」で
         // 失敗する現象があった (2026-04 ユーザー報告)。
-        let ext = f
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let item = match ext.as_str() {
-            "pdf" => GridItem::PdfFile(f.clone()),
-            "zip" => GridItem::ZipFile(f.clone()),
-            _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
-                GridItem::Video(f.clone())
-            }
-            _ => GridItem::Image(f.clone()),
+        let Some(item) = grid_item_from_fs_hit_path(f) else {
+            continue;
         };
         items.push(item);
         image_metas.push(placeholder);
@@ -976,12 +965,34 @@ fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
     child == ancestor || child.starts_with(ancestor)
 }
 
+/// Ctrl+G の通常 FS ヒットを表示用 GridItem へ変換する共通境界。
+///
+/// Flat / DrilledInto の両経路が同じ分類を使うことで、音声を未知画像へフォールバック
+/// させず `GridItem::Audio` として音楽ビューの open 経路へ渡す。
+fn grid_item_from_fs_hit_path(path: &Path) -> Option<GridItem> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => Some(GridItem::PdfFile(path.to_path_buf())),
+        "zip" => Some(GridItem::ZipFile(path.to_path_buf())),
+        _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
+            Some(GridItem::Video(path.to_path_buf()))
+        }
+        _ if crate::folder_tree::is_audio_ext(&ext) => Some(GridItem::Audio(path.to_path_buf())),
+        _ => Some(GridItem::Image(path.to_path_buf())),
+    }
+}
+
 /// フルスクリーンで開ける image-like アイテムか。Ctrl+↑↓ の飛び先判定に使う。
 fn is_fullscreen_target(item: Option<&GridItem>) -> bool {
     matches!(
         item,
         Some(GridItem::Image(_))
             | Some(GridItem::Video(_))
+            | Some(GridItem::Audio(_))
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. })
     )
@@ -1033,6 +1044,7 @@ pub(crate) enum ThumbReuseKey {
     Folder(PathBuf),
     Image(PathBuf),
     Video(PathBuf),
+    Audio(PathBuf),
     ZipFile(PathBuf),
     PdfFile(PathBuf),
     Archive(PathBuf),
@@ -1052,6 +1064,9 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         GridItem::Folder(p) => Some(ThumbReuseKey::Folder(p.clone())),
         GridItem::Image(p) => Some(ThumbReuseKey::Image(p.clone())),
         GridItem::Video(p) => Some(ThumbReuseKey::Video(p.clone())),
+        // Audio はテクスチャを持たないが、この key は streaming rebuild 時の選択・
+        // チェック状態の内容追従にも使う。
+        GridItem::Audio(p) => Some(ThumbReuseKey::Audio(p.clone())),
         GridItem::ZipFile(p) => Some(ThumbReuseKey::ZipFile(p.clone())),
         GridItem::PdfFile(p) => Some(ThumbReuseKey::PdfFile(p.clone())),
         GridItem::ConvertibleArchive { path, .. } => Some(ThumbReuseKey::Archive(path.clone())),
@@ -1076,14 +1091,10 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         GridItem::PdfPage {
             pdf_path, page_num, ..
         } => Some(ThumbReuseKey::PdfPage(pdf_path.clone(), *page_num)),
-        // Audio は固定の音楽アイコン表示でキャッシュテクスチャを持たないため reuse 不要。
         // ZipSeparator / ZipDir / Stack は Ctrl+G 検索結果には出ない (通常フォルダ閲覧専用)。
         // 検索 rebuild の reuse 対象外 (スタックの drill/back は install_new_items 経由で
         // この関数を通らない)。
-        GridItem::Audio(_)
-        | GridItem::ZipSeparator { .. }
-        | GridItem::ZipDir { .. }
-        | GridItem::Stack { .. } => None,
+        GridItem::ZipSeparator { .. } | GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
     }
 }
 
@@ -3081,6 +3092,24 @@ mod tests {
         assert_eq!(names(&desc), vec!["new.jpg", "mid.jpg", "old.jpg"]);
         let (asc, _) = build_flat_items(&state, crate::settings::SortOrder::DateAsc, &[true; 6]);
         assert_eq!(names(&asc), vec!["old.jpg", "mid.jpg", "new.jpg"]);
+    }
+
+    #[test]
+    fn audio_hit_materializes_as_audio_in_flat_and_drilled_views() {
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/music/MixedCase.FLAC".into(),
+            score: 1.0,
+            mtime: 100,
+            stars: 0,
+        });
+
+        let (flat, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
+        assert!(matches!(&flat[..], [GridItem::Audio(p)] if p.ends_with("MixedCase.FLAC")));
+
+        let (drilled, _) = build_drilled_items(&state, Path::new("c:/music"), false, &[true; 6]);
+        assert!(matches!(&drilled[..], [GridItem::Audio(p)] if p.ends_with("MixedCase.FLAC")));
+        assert!(is_fullscreen_target(drilled.first()));
     }
 
     /// 多階層のフォルダ構造の一部だけがヒットしたとき、drill-in でヒットを含む

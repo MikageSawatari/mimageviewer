@@ -40,7 +40,7 @@
 //! - PDFium document info の取り込みは §16 step 17 (別モジュール)
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -160,15 +160,31 @@ impl<'a> IngestSession<'a> {
         let flush_batch = |batch_upserts: &mut Vec<IndexDoc>,
                            batch_deletes: &mut Vec<String>,
                            pending_ok_meta: &mut Vec<(String, IndexKind, i64, i64)>|
-         -> tantivy::Result<()> {
+         -> tantivy::Result<bool> {
             if batch_upserts.is_empty() && batch_deletes.is_empty() {
-                return Ok(());
+                return Ok(true);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                batch_upserts.clear();
+                batch_deletes.clear();
+                pending_ok_meta.clear();
+                return Ok(false);
             }
             let upserts = std::mem::take(batch_upserts);
             let deletes = std::mem::take(batch_deletes);
             let deletes_for_sqlite = deletes.clone();
             let ok_meta = std::mem::take(pending_ok_meta);
-            writer.batch(upserts, deletes, true, true, WriterPriority::Background)?;
+            let completed = writer.batch_cancellable(
+                upserts,
+                deletes,
+                true,
+                true,
+                WriterPriority::Background,
+                cancel,
+            )?;
+            if !completed {
+                return Ok(false);
+            }
             // ここに来た時点で Tantivy commit + reader reload が完了している。
             // SQLite 側を Tantivy に合わせて更新する。
             for (key, kind, mtime, file_size) in &ok_meta {
@@ -188,7 +204,7 @@ impl<'a> IngestSession<'a> {
                     crate::logger::log(format!("ingest: delete_paths failed: {e}"));
                 }
             }
-            Ok(())
+            Ok(true)
         };
 
         // === 1. 削除フェーズ ===
@@ -209,13 +225,15 @@ impl<'a> IngestSession<'a> {
             stats.deleted += 1;
 
             if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
-                flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
+                if !flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)? {
+                    stats.cancelled = true;
+                    break;
+                }
                 last_flush = Instant::now();
             }
         }
 
         if stats.cancelled {
-            flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
             return Ok(stats);
         }
 
@@ -238,11 +256,15 @@ impl<'a> IngestSession<'a> {
                     ingest_total as u64,
                 );
             }
-            let _permit = io_sem.acquire(priority);
+            let Some(_permit) = io_sem.acquire_cancellable(priority, cancel) else {
+                stats.cancelled = true;
+                break;
+            };
             let built = match cand.kind {
                 CandidateKind::Image => self.build_doc_for_image(&cand),
                 CandidateKind::Pdf => self.build_doc_for_pdf(&cand),
                 CandidateKind::Video => self.build_doc_for_video(&cand),
+                CandidateKind::Audio => self.build_doc_for_audio(&cand),
             };
             drop(_permit);
             match built {
@@ -271,12 +293,19 @@ impl<'a> IngestSession<'a> {
             }
 
             if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
-                flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
+                if !flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)? {
+                    stats.cancelled = true;
+                    break;
+                }
                 last_flush = Instant::now();
             }
         }
 
-        flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
+        if !stats.cancelled
+            && !flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?
+        {
+            stats.cancelled = true;
+        }
         if let Some(p) = progress {
             p.clear_count();
         }
@@ -305,6 +334,13 @@ impl<'a> IngestSession<'a> {
     fn build_doc_for_video(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
         self.build_doc(cand, Container::Fs, IndexKind::Video, norms)
+    }
+
+    /// 音声ファイルからファイル名だけの IndexDoc を組み立てる。
+    /// ID3 等の埋め込みメタデータは将来スコープのため読み取らない。
+    fn build_doc_for_audio(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
+        let norms = crate::ingest_text::build_per_source_for_filename(&cand.abs_path);
+        self.build_doc(cand, Container::Fs, IndexKind::Audio, norms)
     }
 
     /// PDF から IndexDoc を組み立てる (§16 step 17)。
@@ -604,6 +640,56 @@ mod tests {
         // タグ刷新後: `#` タグは FTS へ投影されないので 0 件 (旧挙動は 1 件)。
         // タグの検索は tags.db / タグビュー側で行う。
         assert_eq!(hits.len(), 0);
+    }
+
+    #[test]
+    fn audio_file_ingests_as_audio_with_filename_only() {
+        let (tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = AtomicBool::new(false);
+
+        let mut cand = make_image_file(tmp.path(), "SearchableSong.MP3");
+        cand.kind = CandidateKind::Audio;
+        let key = cand.key.clone();
+        let stats = session
+            .apply(
+                vec![cand],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 1);
+        assert_eq!(meta.get(&key).unwrap().unwrap().kind, IndexKind::Audio);
+
+        let favs = [fav];
+        let kinds = [IndexKind::Audio];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["searchablesong"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                kinds: Some(&kinds),
+                target: crate::fts_index::SearchTarget::Only(vec![
+                    crate::fts_index::SourceKind::Filename,
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fts.reload_reader().unwrap();
+        let hits = fts_index::search_page(&fts.searcher(), fts.fields(), &q, 0, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, key);
     }
 
     /// Codex P1 回帰: ingest commit 後に reader が確実に reload 済みであること。

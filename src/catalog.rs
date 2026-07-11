@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 const CATALOG_VERSION: &str = "2";
@@ -446,18 +446,18 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              password_required INTEGER NOT NULL DEFAULT 0
          );",
     )?;
-    // 非破壊マイグレーション: 既存 DB で source_width/source_height が欠けていれば追加する。
-    // 列が既にある場合 ALTER TABLE はエラーを返すので、結果は無視する。
-    if let Err(e) = conn.execute("ALTER TABLE thumbnails ADD COLUMN source_width INTEGER", []) {
-        // "duplicate column name" is expected if column already exists
-        crate::logger::log(format!("catalog migration source_width: {e}"));
-    }
-    if let Err(e) = conn.execute(
+    // 非破壊マイグレーション。open ごとの ALTER 失敗ログを避け、並行 open が同時に
+    // missing を観測した場合だけ duplicate column を idempotent success として扱う。
+    add_thumbnail_column_if_missing(
+        conn,
+        "source_width",
+        "ALTER TABLE thumbnails ADD COLUMN source_width INTEGER",
+    )?;
+    add_thumbnail_column_if_missing(
+        conn,
+        "source_height",
         "ALTER TABLE thumbnails ADD COLUMN source_height INTEGER",
-        [],
-    ) {
-        crate::logger::log(format!("catalog migration source_height: {e}"));
-    }
+    )?;
 
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
     let version: Option<String> = conn
@@ -473,6 +473,33 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn add_thumbnail_column_if_missing(
+    conn: &Connection,
+    column: &str,
+    alter_sql: &str,
+) -> rusqlite::Result<()> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('thumbnails') WHERE name = ?1 LIMIT 1",
+            [column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+    match conn.execute(alter_sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -809,6 +836,34 @@ mod tests {
         assert_eq!(filename, "folderthumb:child#pin:image|cover|-|-|20|2");
         assert_eq!(entry.jpeg_data, b"pin");
         assert!(db.load_latest_with_prefix("missing:").unwrap().is_none());
+    }
+
+    #[test]
+    fn catalog_column_migration_runs_once_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+                filename TEXT NOT NULL PRIMARY KEY,
+                mtime INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                thumb_data BLOB NOT NULL
+            );",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        let migrated: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('thumbnails')
+                 WHERE name IN ('source_width', 'source_height')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, 2);
     }
 
     #[test]

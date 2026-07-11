@@ -95,6 +95,7 @@ pub struct SupervisorHandle {
     stats: Arc<Mutex<SupervisorStats>>,
     progress: ProgressReporter,
     thread: Option<JoinHandle<()>>,
+    finished_rx: std::sync::mpsc::Receiver<()>,
 }
 
 impl SupervisorHandle {
@@ -157,6 +158,34 @@ impl SupervisorHandle {
         self.cancel.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(SupervisorCommand::Stop);
     }
+
+    /// Stop and join only until the manager-wide shutdown deadline.
+    /// Returns false after detaching a worker that did not finish in time.
+    pub fn join_until(mut self, deadline: Instant) -> bool {
+        self.signal_stop();
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        join_thread_until(thread, &self.finished_rx, deadline)
+    }
+}
+
+fn join_thread_until(
+    thread: JoinHandle<()>,
+    finished_rx: &std::sync::mpsc::Receiver<()>,
+    deadline: Instant,
+) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match finished_rx.recv_timeout(remaining) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = thread.join();
+            true
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            drop(thread);
+            false
+        }
+    }
 }
 
 impl Drop for SupervisorHandle {
@@ -207,6 +236,7 @@ pub fn spawn(
     let progress = ProgressReporter::new();
     let (cmd_tx, cmd_rx) = bounded::<SupervisorCommand>(4);
     let (change_tx, change_rx) = crossbeam_channel::unbounded::<DebouncedChange>();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
 
     let fav_id = params.favorite_id;
     let root = params.favorite_root.clone();
@@ -239,6 +269,7 @@ pub fn spawn(
                 change_tx,
                 change_rx,
             );
+            let _ = finished_tx.send(());
         })
         .expect("failed to spawn indexer supervisor");
 
@@ -249,6 +280,7 @@ pub fn spawn(
         stats,
         progress,
         thread: Some(thread),
+        finished_rx,
     }
 }
 
@@ -308,6 +340,9 @@ fn supervisor_loop(
                 match msg {
                     Ok(SupervisorCommand::Stop) => break,
                     Ok(SupervisorCommand::FullRescan) => {
+                        if cancel.load(Ordering::SeqCst) {
+                            break;
+                        }
                         run_initial_scan(
                             favorite_id,
                             &favorite_root,
@@ -327,7 +362,12 @@ fn supervisor_loop(
             }
             recv(change_rx) -> msg => {
                 match msg {
-                    Ok(DebouncedChange { favorite_id: fid, path, kind }) => {
+                    Ok(change) => {
+                        let Some(DebouncedChange { favorite_id: fid, path, kind }) =
+                            accept_change_unless_cancelled(&cancel, change)
+                        else {
+                            break;
+                        };
                         // 他お気に入りのイベントが来ることは無いが念のため
                         if fid != favorite_id {
                             continue;
@@ -378,6 +418,17 @@ fn supervisor_loop(
     crate::logger::log(format!("indexer[{favorite_id}]: supervisor exiting"));
 }
 
+fn accept_change_unless_cancelled(
+    cancel: &AtomicBool,
+    change: DebouncedChange,
+) -> Option<DebouncedChange> {
+    if cancel.load(Ordering::SeqCst) {
+        None
+    } else {
+        Some(change)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_initial_scan(
     favorite_id: Uuid,
@@ -390,6 +441,9 @@ fn run_initial_scan(
     stats: &Mutex<SupervisorStats>,
     progress: &ProgressReporter,
 ) {
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
     // 所要時間計測: walker + ingest を含むフル scan の時間を拾う
     // (初期スキャンは supervisor 起動後 1 度のみ "initial"、以降の FullRescan /
     //  watcher overflow は last_scan_duration_ms のみ更新する)。
@@ -439,6 +493,9 @@ fn run_initial_scan(
             return;
         }
     };
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
     let walk_ms = t_walk.elapsed().as_millis() as u64;
     let total_scanned = scan.total_scanned;
     let diag = scan.diag;
@@ -519,6 +576,9 @@ fn apply_single_change(
     path: PathBuf,
     kind: ChangeKind,
 ) {
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
     if crate::books::path_is_under_any(&path, excluded_roots) {
         return;
     }
@@ -687,6 +747,8 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
         search_walker::CandidateKind::Pdf
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         search_walker::CandidateKind::Video
+    } else if crate::folder_tree::is_audio_ext(&ext) {
+        search_walker::CandidateKind::Audio
     } else if crate::folder_tree::is_recognized_image_ext(&ext) {
         search_walker::CandidateKind::Image
     } else {
@@ -768,6 +830,36 @@ mod tests {
         fs::write(dir.join(name), b"pretend-image").unwrap();
     }
 
+    #[test]
+    fn bounded_join_detaches_when_deadline_is_exhausted() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+        });
+
+        assert!(!join_thread_until(worker, &finished_rx, Instant::now()));
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn queued_change_is_discarded_after_cancel() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = AtomicBool::new(false);
+        tx.send(DebouncedChange {
+            favorite_id: Uuid::new_v4(),
+            path: PathBuf::from(OVERFLOW_MARKER_PATH),
+            kind: ChangeKind::Upsert,
+        })
+        .unwrap();
+        cancel.store(true, Ordering::SeqCst);
+
+        let queued = rx.recv().unwrap();
+        assert!(accept_change_unless_cancelled(&cancel, queued).is_none());
+    }
+
     /// ZIP はアイテム索引の対象外なので、notify 差分追従の候補ビルダは ZIP に対し
     /// None を返す。呼び出し側はこれを upsert→remove フォールバックに流し、既存
     /// ZIP doc を索引から掃除する (§3.2、Codex P3)。
@@ -789,6 +881,13 @@ mod tests {
             build_candidate_from_path(&jpg, jpg_key).is_some(),
             "画像は候補になる"
         );
+
+        // 回帰: watcher 差分でも共通の音声拡張子判定を通って Audio 候補になる。
+        let audio = tmp.path().join("track.FLAC");
+        fs::write(&audio, b"fake-flac").unwrap();
+        let audio_key = crate::search_index_db::normalize_path(&audio);
+        let candidate = build_candidate_from_path(&audio, audio_key).expect("音声は候補になる");
+        assert_eq!(candidate.kind, search_walker::CandidateKind::Audio);
     }
 
     /// supervisor の初期スキャンが走り、stats に結果が反映されることを確認する。

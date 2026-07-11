@@ -52,6 +52,9 @@ cargo run --bin mimageviewer-core
 |  | メイン `1` と `Numpad1` を別々にキャプチャできる |
 |  | メイン `1` と `Numpad1` に別操作を割り当て、別々に発火する |
 |  | 通常 Enter と `NumpadEnter` を別々にキャプチャできる |
+|  | `FsZoomMode = NumpadEnter` でテンキー Enter だけが照準 / ズームになり、本体 Enter では発動しない |
+|  | `FsZoomMode = Enter` (確認中は競合する `FsClose` を解除) で本体 Enter だけが照準 / ズームになり、テンキー Enter では発動しない |
+|  | 設定を戻した後、`FsZoomMode = NumpadEnter` のままでも本体 Enter の既定「一覧へ戻る」が維持される |
 |  | Shift+数字が物理数字キーとして発火する |
 
 ## ウィンドウ / 文脈ごとの入力到達

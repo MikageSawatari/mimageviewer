@@ -22,6 +22,12 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear`、
 `RatingContainer1..5/Clear`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
 同じ割り当てを共有する。v2.2.0 からは物理キー寄りの `KeySlot` を正本にし、通常の数字キーとテンキー数字を別キーとして扱う。互換性のため、従来の数字キー既定操作は `1` と `Numpad1` のように両方を既定割り当てにする。
+本体 <kbd>Enter</kbd> と `NumpadEnter` も別スロットであり、押下操作、KeyHold、native 動画、
+操作カスタマイズの「押して入力」の全経路で相互に発火しない。Windows では両者が
+`VK_RETURN` を共有するため、Win32 `WM_KEYDOWN/WM_KEYUP` の extended bit を物理種別の
+正本にする。egui 0.33 の `physical_key` は両者を同じ `egui::Key::Enter` へ畳むため、
+この 2 スロットの照合には使わない。旧 `keymap.ini` と現行設定の表記は従来どおり
+`Enter` / `NumpadEnter` で、migration や破壊的な表記変更は行わない。
 OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keymap では上書きできない。
 `Esc` と修飾なし矢印ナビゲーションは、モード脱出と閲覧の最低限の固定入力として keymap 対象外にする。
 Enter / Backspace / Home / End / PageUp / PageDown などの閲覧操作は文脈ごとの `KeyAction`
@@ -126,7 +132,7 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 | <kbd>F</kbd> | 左側のフォルダツリーペインの表示 / 非表示を切り替える。表示時は現在フォルダへツリーカーソルを移す。非表示にする時、ツリーカーソルが別フォルダへ動いていれば <kbd>Enter</kbd> 相当でそのフォルダへ移動してグリッドへ戻る (動いていなければ単に閉じる) |
 | 既定キーなし (`GridToggleStackMode`) | コマンド設定でキーを割り当てると、フォルダバーの「スタック」と同じスタック表示トグルを実行する。実フォルダまたはサブ展開ビューで有効 |
 | <kbd>T</kbd> | 選択中アイテムへタグを付ける/外すダイアログを開く |
-| <kbd>Ctrl</kbd>+<kbd>T</kbd> | タグビューを開く / 閉じる。`tags.db` のタグから候補を表示し、選んだタグを持つフォルダ・画像・動画・ZIP/PDF/対応アーカイブを検索結果グリッドに表示する。「すべての種類」プルダウンで結果の種類を絞れる。フルスクリーン中はテキスト注釈モードの <kbd>Ctrl</kbd>+<kbd>T</kbd> を優先する |
+| <kbd>Ctrl</kbd>+<kbd>T</kbd> | タグビューを開く / 閉じる。`tags.db` のタグから候補を表示し、選んだタグを持つフォルダ・画像・動画・音声・ZIP/PDF/対応アーカイブを検索結果グリッドに表示する。「すべての種類」プルダウンで画像・動画・音声など結果の種類を絞れる。フルスクリーン中はテキスト注釈モードの <kbd>Ctrl</kbd>+<kbd>T</kbd> を優先する |
 | 既定キーなし (`GridTogglePinnedTag1..20`) | コマンド設定でキーを割り当てると、ピン留めタグ 1〜20 番を選択中またはチェック済みアイテムへ付与/解除する。ピン留めタグの番号は「ピン留めタグの管理」画面の番号列と同じ |
 | <kbd>X</kbd> | 選択中の画像 / ZIP 内画像 / PDF ページを比較スロットへピン留め / 同じ画像なら解除 |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> | 選択中またはチェック済みの画像 / ZIP 内画像 / PDF ページを追加先の本へ追加する。画像・ページ以外が選択に混在している場合は一部追加せず全体を拒否する |
@@ -466,7 +472,9 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
   ハイブリッドだが、`KeyHold` アクション基盤 (Shift ルーペ `FsLoupeHold` / 編集モードの Space パンと
   同じ枠組み) に乗せてカスタマイズ可能にした。押下状態は `keymap.key_held_action` (OS 直読み =
   フルスクリーンビューポートで stale な egui key_down を回避) で取り、高速タップ (idle からの同
-  フレーム押下+離し) は `keymap.take_key_hold_edges` (egui Key イベント) で補完する (Codex P2)。
+  フレーム押下+離し) は `keymap.take_key_hold_edges` で補完する。Windows では held と edge の
+  両方を Win32 物理入力へ統一し、`Enter` / `NumpadEnter` は extended bit 別の押下ラッチを
+  参照する。その他の固有 VK は従来どおり `GetAsyncKeyState` を使う (Codex P2)。
   状態 (`fs_zoom_active` / `fs_zoom_aiming` / `fs_zoom_factor`) は settings に保存せずアプリ
   セッション内のみ保持し、グリッドへ戻ると解除 (倍率は維持)。
 - **画像分析モードは `FsAnalysis` → `FsImageAnalysis` へ改名し、既定 chord を <kbd>Shift</kbd>+<kbd>Z</kbd>

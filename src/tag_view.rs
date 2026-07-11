@@ -21,6 +21,7 @@ pub(crate) enum TagViewKindFilter {
     Folder,
     Image,
     Video,
+    Audio,
     ZipFile,
     PdfFile,
     Archive,
@@ -30,6 +31,7 @@ pub(crate) const TAG_VIEW_KIND_FILTER_CHOICES: &[TagViewKindFilter] = &[
     TagViewKindFilter::All,
     TagViewKindFilter::Image,
     TagViewKindFilter::Video,
+    TagViewKindFilter::Audio,
     TagViewKindFilter::Folder,
     TagViewKindFilter::ZipFile,
     TagViewKindFilter::PdfFile,
@@ -43,6 +45,7 @@ impl TagViewKindFilter {
             TagViewKindFilter::Folder => "フォルダ",
             TagViewKindFilter::Image => "画像",
             TagViewKindFilter::Video => "動画",
+            TagViewKindFilter::Audio => "音声",
             TagViewKindFilter::ZipFile => "ZIP ファイル",
             TagViewKindFilter::PdfFile => "PDF ファイル",
             TagViewKindFilter::Archive => "アーカイブ",
@@ -55,6 +58,7 @@ impl TagViewKindFilter {
             TagViewKindFilter::Folder => matches!(kind, TagViewItemKind::Folder),
             TagViewKindFilter::Image => matches!(kind, TagViewItemKind::Image),
             TagViewKindFilter::Video => matches!(kind, TagViewItemKind::Video),
+            TagViewKindFilter::Audio => matches!(kind, TagViewItemKind::Audio),
             TagViewKindFilter::ZipFile => matches!(kind, TagViewItemKind::ZipFile),
             TagViewKindFilter::PdfFile => matches!(kind, TagViewItemKind::PdfFile),
             TagViewKindFilter::Archive => matches!(kind, TagViewItemKind::Archive(_)),
@@ -67,6 +71,7 @@ pub(crate) struct TagViewState {
     pub active: bool,
     pub query: String,
     pub last_executed: String,
+    /// プロセス内だけで保持する session-local 選択。Settings / DB には永続化しない。
     pub kind_filter: TagViewKindFilter,
     pub last_executed_kind_filter: TagViewKindFilter,
     pub focus_request: bool,
@@ -133,6 +138,7 @@ pub(crate) enum TagViewItemKind {
     Folder,
     Image,
     Video,
+    Audio,
     ZipFile,
     PdfFile,
     Archive(ArchiveFormat),
@@ -165,7 +171,7 @@ fn run_tag_view_search(
     cancel: &AtomicBool,
 ) -> Result<TagViewResult, String> {
     let db_path = data_dir.join("tags.db");
-    let mut db = crate::tags_db::TagsDb::open_at(&db_path)
+    let db = crate::tags_db::TagsDb::open_at(&db_path)
         .map_err(|e| format!("タグDBを開けません: {e}"))?;
     let summaries = db.tag_summaries();
     let trimmed = query.trim();
@@ -196,7 +202,6 @@ fn run_tag_view_search(
     let scan_truncated = keys.len() > scan_limit;
     let mut truncated = false;
     let mut entries = Vec::with_capacity(keys.len().min(TAG_VIEW_RESULT_LIMIT));
-    let mut prune_keys = Vec::new();
     for key in keys.into_iter().take(scan_limit) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(TagViewResult {
@@ -218,21 +223,9 @@ fn run_tag_view_search(
                     entries.push(entry);
                 }
             }
-            ClassifiedTagViewPath::Missing(path) => {
-                if should_prune_missing_path(&path) {
-                    prune_keys.push(key);
-                }
-            }
-        }
-    }
-    if !prune_keys.is_empty() && !cancel.load(Ordering::Relaxed) {
-        match db.prune_items(&prune_keys) {
-            Ok(removed) => crate::logger::log(format!(
-                "tag_view: pruned {} stale item(s), removed {} tag row(s)",
-                prune_keys.len(),
-                removed
-            )),
-            Err(e) => crate::logger::log(format!("tag_view: stale item prune failed: {e}")),
+            // missing は外付け切断 / NAS offline でも起きる。検索結果から隠すだけで、
+            // tags.db は絶対に変更しない。
+            ClassifiedTagViewPath::Missing => {}
         }
     }
     if scan_truncated {
@@ -273,7 +266,7 @@ fn dedup_tag_terms(terms: Vec<String>) -> Vec<String> {
 
 enum ClassifiedTagViewPath {
     Existing(TagViewEntry),
-    Missing(PathBuf),
+    Missing,
 }
 
 fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
@@ -290,7 +283,7 @@ fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
             {
                 return existing_tag_view_entry(real, meta);
             }
-            ClassifiedTagViewPath::Missing(path)
+            ClassifiedTagViewPath::Missing
         }
     }
 }
@@ -355,18 +348,6 @@ fn find_case_insensitive_sibling(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn should_prune_missing_path(path: &Path) -> bool {
-    if !path.is_absolute() {
-        return false;
-    }
-    if !matches!(path.try_exists(), Ok(false)) {
-        return false;
-    }
-    path.ancestors()
-        .skip(1)
-        .any(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.is_dir())
-}
-
 fn classify_file_kind(path: &Path) -> TagViewItemKind {
     let ext = path
         .extension()
@@ -377,6 +358,10 @@ fn classify_file_kind(path: &Path) -> TagViewItemKind {
         TagViewItemKind::Image
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         TagViewItemKind::Video
+    } else if crate::folder_tree::is_audio_ext(&ext) {
+        // 音声は Folder fallback に落とさず、結果適用側で音楽ビューへ接続する。
+        // (review-v2.3.0 追補7: R1 第2波 P2-2)
+        TagViewItemKind::Audio
     } else if crate::folder_tree::is_zip_extension(&ext) {
         TagViewItemKind::ZipFile
     } else if ext == "pdf" {
@@ -577,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn tag_view_search_hides_and_prunes_reachable_missing_paths() {
+    fn tag_view_search_hides_but_preserves_missing_path_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -608,8 +593,8 @@ mod tests {
         );
 
         let db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
-        assert!(db.display_tags_for_item(&missing_key).is_empty());
-        assert!(!db.has_item_state(&missing_key));
+        assert_eq!(db.display_tags_for_item(&missing_key), vec!["#cat"]);
+        assert!(db.has_item_state(&missing_key));
     }
 
     #[test]
@@ -620,17 +605,21 @@ mod tests {
 
         let image = temp.path().join("image.jpg");
         let video = temp.path().join("video.mp4");
+        let audio = temp.path().join("audio.flac");
         let zip = temp.path().join("book.zip");
         std::fs::write(&image, b"jpg").unwrap();
         std::fs::write(&video, b"mp4").unwrap();
+        std::fs::write(&audio, b"flac").unwrap();
         std::fs::write(&zip, b"zip").unwrap();
 
         let image_key = crate::tags_db::item_key_for_path(&image);
         let video_key = crate::tags_db::item_key_for_path(&video);
+        let audio_key = crate::tags_db::item_key_for_path(&audio);
         let zip_key = crate::tags_db::item_key_for_path(&zip);
         let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
         db.set_item_tags(&image_key, ["cat"], "test").unwrap();
         db.set_item_tags(&video_key, ["cat"], "test").unwrap();
+        db.set_item_tags(&audio_key, ["cat"], "test").unwrap();
         db.set_item_tags(&zip_key, ["cat"], "test").unwrap();
         drop(db);
 
@@ -649,5 +638,35 @@ mod tests {
             video_key
         );
         assert_eq!(result.entries[0].kind, TagViewItemKind::Video);
+
+        let result = run_tag_view_search(
+            &data_dir,
+            "#cat",
+            TagViewKindFilter::Audio,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.kind_filter, TagViewKindFilter::Audio);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            crate::tags_db::item_key_for_path(&result.entries[0].path),
+            audio_key
+        );
+        assert_eq!(result.entries[0].kind, TagViewItemKind::Audio);
+    }
+
+    #[test]
+    fn tag_view_classifies_audio_without_folder_fallback() {
+        assert_eq!(
+            classify_file_kind(Path::new("MixedCase.FLAC")),
+            TagViewItemKind::Audio
+        );
+        assert!(TagViewKindFilter::All.matches(TagViewItemKind::Audio));
+        assert!(TagViewKindFilter::Audio.matches(TagViewItemKind::Audio));
+        assert!(!TagViewKindFilter::Video.matches(TagViewItemKind::Audio));
+        assert!(!TagViewKindFilter::Folder.matches(TagViewItemKind::Audio));
+        assert!(TAG_VIEW_KIND_FILTER_CHOICES.contains(&TagViewKindFilter::Audio));
+        assert_eq!(TagViewKindFilter::Audio.label(), "音声");
     }
 }

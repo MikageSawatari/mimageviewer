@@ -286,17 +286,18 @@ mod tests {
         {
             let conn = Connection::open(&tmp).unwrap();
             conn.execute_batch(
-                "CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL);
-                 INSERT INTO ratings VALUES ('c:/root/sub/a.jpg', 5);
-                 INSERT INTO ratings VALUES ('c:/root/sub/b.jpg', 5);
-                 INSERT INTO ratings VALUES ('c:/root/sub/c.jpg', 3);
-                 INSERT INTO ratings VALUES ('c:/root/sub/deep/d.jpg', 4);
-                 INSERT INTO ratings VALUES ('c:/root/other/e.jpg', 2);
-                 INSERT INTO ratings VALUES ('c:/root/book.zip::p01.jpg', 5);
-                 INSERT INTO ratings VALUES ('c:/root/book.zip::p02.jpg', 5);
-                 INSERT INTO ratings VALUES ('c:/root/doc.pdf::page_0001', 4);
-                 INSERT INTO ratings VALUES ('c:/root/direct.jpg', 1);
-                 INSERT INTO ratings VALUES ('c:/otherroot/x.jpg', 5);",
+                "CREATE TABLE ratings (
+                    path TEXT PRIMARY KEY, stars INTEGER NOT NULL);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/sub/a.jpg', 5);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/sub/b.jpg', 5);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/sub/c.jpg', 3);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/sub/deep/d.jpg', 4);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/other/e.jpg', 2);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/book.zip::p01.jpg', 5);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/book.zip::p02.jpg', 5);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/doc.pdf::page_0001', 4);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/root/direct.jpg', 1);
+                 INSERT INTO ratings (path, stars) VALUES ('c:/otherroot/x.jpg', 5);",
             )
             .unwrap();
         }

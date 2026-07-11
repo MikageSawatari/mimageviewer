@@ -40,7 +40,7 @@ tag-feature.md から **置き換える部分**: §1/§3.1/§5 (XMP・動画 `.x
 | D13 | **書き込み投影ゼロ**: タグ書き込みは `tags.db` のみ。Tantivy/search_index には書かない | D4 の帰結。stale化しない |
 | D14 | **移行 = 既存 Tantivy `tags` の `#` 付き値を `tags.db` へ一括コピー (`#` 剥がし)** | ファイル I/O・再スキャン・リバイバルなし。§7 |
 | D15 | **既存 FTS のタグ経路を能動的に閉じる**: `SourceKind::Tags` を検索/ingest から外し、STORED tags は移行専用に | 「分離」を原則でなく実挙動にする。§5.4 |
-| D16 | **タグビューの stale パスは worker で存在確認 → 欠落セル表示 + 日和見/手動 prune (自動全削除しない)** | 索引非依存にした分 notify 掃除を失うため。§5.5 |
+| D16 | **タグビューの stale パスは worker で存在確認 → 結果から非表示。missing だけでは DB を変更しない** | 外付け/NAS offline と恒久削除を安全に区別できないため。§5.5 |
 | D17 | **体験層では D4 の分離を見せない (UX レビュー)**: Ctrl+G の素キーワード→タグ件数ヒント / チップ・バッジのクリック=タグ検索 / メニューに「タグビュー (Ctrl+T)」 | 分離が体験の断絶として出ると「タグが壊れた」と誤解される。§13 |
 | D18 | **複数選択トグルは all-or-nothing** (全付与済み→全削除、それ以外→全付与) | 結果が予測しやすい。出荷マニュアルの「各ファイル独立」記述を改める。§6.1 |
 | D19 | **`tags.db` は settings.db 同様の世代バックアップを持つ。外部書き出しはしない** | 世代バックアップは実装済み (2026-06-12)。非破壊・外部書き込み無し方針は維持。§13 |
@@ -267,23 +267,15 @@ AND `facet_filter` を合成して `visible_indices` を作る ([docs/details-vi
 
 ### 5.5 タグビューの stale パス処理 (Codex P2)
 
-`tags.db` はパスキーなので、削除・移動・外付けドライブ未接続で **stale パスが必ず出る**。お気に入り
-索引を不要にした分、notify-rs による自然な掃除も失う。方針:
-
-**ユーザー決定 (2026-06-12)**: 欠落セルは**画面に出さず除外**し、確実に消えたものは**非同期で tags.db から
-prune** する (dimmed セル案は不採用)。ただし外付け/NAS 未接続の誤削除を防ぐ**ボリューム到達性ゲート**を必須にする。
+`tags.db` はパスキーなので、削除・移動・外付けドライブ未接続で **stale パスが必ず出る**。
+欠落セルは画面に出さず除外するが、missing 判定だけでは `tags.db` を変更しない。mIV 内削除の
+Shell 成功 path だけを、共通 delete worker が全 path-keyed store と一緒に hard purge する。
 
 - タグビュー構築時、**worker で存在確認**する (UI スレッドを止めない)。`fs::metadata` は既に worker が
   全件呼ぶので追加コストはフィルタ判定のみ。
 - **欠落パスは結果から除外して表示しない** (`meta.is_none()` を entry から落とす)。dimmed セルは出さない。
-- **非同期 prune (ボリューム到達性ゲート付き、最重要)**: 確定 missing な `item_key` を別経路で prune worker へ
-  渡し、`item_tags` + `tag_item_state` を DELETE する。**発火条件は「そのパスのドライブ root (または最寄りの
-  実在する親) が `is_dir()` で到達可能なのに当該ファイルが無い」に限定**する。
-  - ドライブ root/親が到達可能 + ファイル無し → 真に削除 → prune 安全。
-  - ドライブ root 自体が到達不可 (USB 抜き / NAS オフライン / 権限拒否) → **prune スキップ (タグ保持)**。
-  - `fs::metadata` の失敗は「削除」と「未接続」を区別できないため、この区別ゲートが無いと未接続ドライブの
-    タグを全消ししてしまう (§13.5 で「残すべき判断」とされた stale パスの丁寧な扱い)。
-- **未接続時の自動全削除はしない** (上記ゲートの帰結)。
+- **missing は常に非破壊**: `fs::metadata` / `try_exists` の結果だけでは「恒久削除」と
+  「USB 抜き / NAS オフライン / 権限拒否」を区別しない。結果から隠してタグ行を保持する。
 - 手動の「タグ整合性チェック / 掃除」アクション (既存のキャッシュ管理ダイアログ同様) も将来用意してよい。
 - **実 casing の復元 (v1.4.0 リリース前レビュー)**: item_key は小文字正規化なので、キーから直接
   GridItem を作ると結果グリッドが全小文字表示になる。worker の存在確認時に `canonicalize` で実
@@ -503,7 +495,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
   抜けると Ctrl+F が「すべて」で `dc:subject` を読む)、Ctrl+G 検索対象 UI のタグ項目撤去
   ([src/global_search_ui.rs:112](../src/global_search_ui.rs))、ingest の `tags` populate 停止
   ([src/ingest_text.rs:183](../src/ingest_text.rs))、Ctrl+F の `dc:subject` 読み停止 ([src/app.rs:2076](../src/app.rs))。
-- **タグビューの stale パス処理 (§5.5)**: worker 存在確認 + 欠落 index 集合 gate + 日和見/手動 prune。
+- **タグビューの stale パス処理 (§5.5)**: worker 存在確認 + 結果からの非表示のみ。DB は非破壊。
 - **`settings.db` の tags テーブル移行 (Codex P2)**: `show_shortcut` と **`tag_key`** を追加。現行は
   `id/name/sort_index` のみで read/write も id/name だけ ([src/settings_db.rs:1080](../src/settings_db.rs) /
   [src/settings_db.rs:1275](../src/settings_db.rs))。`ALTER TABLE tags ADD COLUMN show_shortcut INTEGER
@@ -598,8 +590,8 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
   依存追加と、既存タグが同一 key に統合される場合の表示形マージ実装のみ。
 - タグビューの chord は **既定 = グリッド context の `Ctrl+T`** に確定 (フルスクリーンは `FsTextMode`
   のまま、context で曖昧性解消、[src/keymap.rs:1887](../src/keymap.rs))。二義性を嫌うユーザーは keymap で
-  `Ctrl+Shift+T` 等へ再割当可能。**欠落セルは「画面非表示 + ボリューム到達性ゲート付き非同期 prune」で確定**
-  (§5.5、ユーザー決定 2026-06-12)。local 集合 gate / variant 案は不採用。
+  `Ctrl+Shift+T` 等へ再割当可能。**欠落セルは画面非表示だが DB 行は保持**する
+  (§5.5、2026-07-11 統一設計)。
 - 移行(§7.1) の Tantivy 走査コスト (大規模ライブラリでの一括コピー時間) と進捗 UX。
 - 大量一括付与時の進捗 UX / キャンセル。
 - タグビュー結果の並び順 (パス順 / 付与日時順) の既定と切替 (UX レビュー【中6】)。

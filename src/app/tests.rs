@@ -763,6 +763,25 @@ fn video_resume_for_open_grid_and_nav_modes() {
 }
 
 #[test]
+fn video_resume_known_duration_rejects_end_and_keeps_midpoint() {
+    assert_eq!(
+        crate::video::sanitize_resume_for_duration(Some(28.0), 30.0),
+        None,
+        "resume inside the end guard starts from the beginning"
+    );
+    assert_eq!(
+        crate::video::sanitize_resume_for_duration(Some(15.0), 30.0),
+        Some(15.0),
+        "a normal midpoint remains resumable"
+    );
+    assert_eq!(
+        crate::video::sanitize_resume_for_duration(Some(13.0), 0.0),
+        Some(13.0),
+        "unknown duration cannot be end-clamped before decode"
+    );
+}
+
+#[test]
 fn rating_filter_container_uses_all_6_buckets() {
     let folder = GridItem::Folder(PathBuf::from("/a"));
     // ★なし OFF → 未評価フォルダも隠れる (「★5 のみ表示」が実際に効くために必要)
@@ -4704,6 +4723,33 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn tag_view_audio_result_maps_to_grid_audio() {
+        let mut app = setup_app();
+        let audio = app.tmp.path().join("tagged.flac");
+        std::fs::write(&audio, b"audio").unwrap();
+        app.tag_view.last_executed = "#music".to_string();
+        app.tag_view.last_executed_kind_filter = crate::tag_view::TagViewKindFilter::All;
+
+        app.apply_tag_view_result(crate::tag_view::TagViewResult {
+            query: "#music".to_string(),
+            kind_filter: crate::tag_view::TagViewKindFilter::All,
+            summaries: Vec::new(),
+            entries: vec![crate::tag_view::TagViewEntry {
+                path: audio.clone(),
+                kind: crate::tag_view::TagViewItemKind::Audio,
+                mtime: 1,
+                file_size: 5,
+            }],
+            truncated: false,
+        });
+
+        assert!(matches!(
+            app.items.as_slice(),
+            [crate::grid_item::GridItem::Audio(path)] if path == &audio
+        ));
+    }
+
+    #[test]
     fn closing_rating_view_after_result_restores_subfolder_expansion_snapshot() {
         use crate::app::subfolder_expansion::{
             SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
@@ -4930,7 +4976,7 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
-    fn reading_history_open_guard_removes_definitely_missing_item() {
+    fn reading_history_open_guard_preserves_definitely_missing_item() {
         use crate::app::{ReadingHistoryOpenPathStatus, reading_history_open_path_status};
         use crate::grid_item::{GridItem, ThumbnailState};
         let mut app = setup_app();
@@ -4964,13 +5010,13 @@ mod phase_c_drill_nav_tests {
             ReadingHistoryOpenPathStatus::Missing
         );
         assert!(!app.guard_reading_history_open(0));
-        assert!(app.items.is_empty());
-        assert!(app.reading_history_rows.is_empty());
-        assert!(app.selected.is_none());
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.reading_history_rows.len(), 1);
+        assert_eq!(app.selected, Some(0));
         assert!(
             app.fs_feedback_toast
                 .as_ref()
-                .is_some_and(|(text, _, _)| text.contains("ファイルが見つからない"))
+                .is_some_and(|(text, _, _)| text.contains("読書履歴は保持"))
         );
     }
 
@@ -12049,12 +12095,23 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder_signature = Some(0xDEAD_BEEF);
         app.items.push(GridItem::Image(target_path.clone()));
         app.thumbnails.push(ThumbnailState::Pending);
+        app.rating_cache.insert(0, 5);
+        app.rating_counts_cache = Some([0, 0, 0, 0, 0, 1]);
+        let target_key = crate::adjustment_db::normalize_path(&target_path);
+        app.tags_cache
+            .insert(target_key.clone(), vec!["delete".to_string()]);
+        app.adjusted_page_keys.insert(target_key.clone());
+        app.rotation_page_keys
+            .insert(format!("{target_key}::page_1"));
+        app.adjusted_page_keys
+            .insert(format!("{target_key}2/keep.jpg"));
 
         // 完了済み worker を疑似する: succeeded に target_path を入れて Done を即送る。
         let (tx, rx) = std::sync::mpsc::channel::<DeleteMsg>();
         tx.send(DeleteMsg::Batch {
             succeeded: vec![target_path.clone()],
             failed: vec![],
+            purged_pdf_password_paths: vec![],
         })
         .unwrap();
         tx.send(DeleteMsg::Done { canceled: false }).unwrap();
@@ -12066,6 +12123,7 @@ mod favorite_adjustment_defaults_tests {
             total: 1,
             succeeded: vec![],
             failed: vec![],
+            purged_pdf_password_paths: vec![],
         });
 
         // 実 ファイルも消しておかないと metadata() が古いまま (実機では worker が消す)。
@@ -12085,6 +12143,19 @@ mod favorite_adjustment_defaults_tests {
             app.items.len(),
             0,
             "削除成功した path は items から抜かれる"
+        );
+        assert!(app.rating_cache.is_empty());
+        assert!(app.rating_counts_cache.is_none());
+        assert!(!app.tags_cache.contains_key(&target_key));
+        assert!(!app.adjusted_page_keys.contains(&target_key));
+        assert!(
+            !app.rotation_page_keys
+                .contains(&format!("{target_key}::page_1"))
+        );
+        assert!(
+            app.adjusted_page_keys
+                .contains(&format!("{target_key}2/keep.jpg")),
+            "隣接 prefix は presence purge に巻き込まない"
         );
     }
 
@@ -16700,6 +16771,76 @@ mod still_window_mode_key_tests {
         }
     }
 
+    #[cfg(windows)]
+    fn install_fullfeature_linked_still_with_parked_media(
+        app: &mut App,
+        ctx: &egui::Context,
+        image: usize,
+        media: usize,
+        image_window_id: u64,
+        media_window_id: u64,
+    ) -> (
+        crate::settings::DetachedViewerWindowPlacement,
+        crate::settings::DetachedViewerWindowPlacement,
+    ) {
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.fullfeature_media_window = true;
+        app.fullscreen_idx = Some(image);
+        app.selected = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(image_window_id);
+        insert_static_fs_entry(app, ctx, image, "linked_still_before_media");
+        app.begin_active_detached_session(image_window_id, DetachedSource::Image);
+        app.update_detached_window_runtime_flags(image_window_id, true, "test_linked_still");
+
+        let media_placement = app.detached_viewer_window_placement();
+        let image_placement = crate::settings::DetachedViewerWindowPlacement {
+            w: media_placement.w - 64.0,
+            ..media_placement
+        };
+        app.set_detached_window_runtime_placement(
+            image_window_id,
+            image_placement,
+            "test_image_placement",
+        );
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(media);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(media_window_id);
+        bundle.detached_viewer_independent_active = true;
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(ctx, media_window_id, bundle));
+        app.transition_detached_window_state(
+            media_window_id,
+            DetachedWindowState::ParkedLive,
+            "test_parked_media",
+        );
+        app.update_detached_window_runtime_flags(media_window_id, false, "test_parked_media");
+        app.set_detached_window_runtime_placement(
+            media_window_id,
+            media_placement,
+            "test_media_placement",
+        );
+
+        (image_placement, media_placement)
+    }
+
+    #[cfg(windows)]
+    fn complete_detached_grid_open_for_test(app: &mut App, ctx: &egui::Context, idx: usize) -> u64 {
+        assert!(app.prepare_detached_context_for_grid_open(ctx, idx));
+        app.fs_open_intent_from_grid = true;
+        let entering_video = matches!(app.items.get(idx), Some(GridItem::Video(_)));
+        app.prepare_viewer_presentation_open(idx, entering_video);
+        app.fullscreen_idx = Some(idx);
+        app.selected = Some(idx);
+        app.fs_open_intent_from_grid = false;
+        app.detached_viewer_window_id
+            .expect("detached grid open window id")
+    }
+
     fn source_swap_pending_for_test(
         app: &App,
         target_idx: usize,
@@ -16724,6 +16865,95 @@ mod still_window_mode_key_tests {
             cursor_state: app.fullscreen_cursor_state(),
             parked_live_window_id: owner,
             audio_mode_after_swap: false,
+        }
+    }
+
+    fn poll_media_navigation_until_done_for_test(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..10_000 {
+            app.poll_media_navigation_pending(ctx);
+            if app.media_navigation_pending.is_none() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("media navigation worker did not finish");
+    }
+
+    fn install_fake_media_navigation_resolver(
+        app: &mut App,
+    ) -> mpsc::Sender<MediaNavigationResolverResponse> {
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        app.media_navigation_resolver = Some(MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 0,
+        });
+        result_tx
+    }
+
+    fn install_all_native_pending_for_test(
+        app: &mut App,
+        from_idx: usize,
+        target_idx: usize,
+        owner: Option<u64>,
+    ) {
+        let GridItem::Video(target_path) = &app.items[target_idx] else {
+            unreachable!()
+        };
+        let target_path = target_path.clone();
+        let now = std::time::Instant::now();
+        let mut source = source_swap_pending_for_test(app, target_idx, owner);
+        source.from_idx = from_idx;
+        app.native_video_source_swap_pending = Some(source);
+        app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
+            idx: target_idx,
+            path: target_path.clone(),
+            from_grid: false,
+            autoplay_override: None,
+            ignore_resume: false,
+            wait_for_detached_host: false,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(10),
+            input_seq: 0,
+            parked_live_window_id: owner,
+        });
+        app.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
+            target_idx,
+            target_path: target_path.clone(),
+            source_epoch: 1,
+            started_at: now,
+            deadline: now + std::time::Duration::from_secs(2),
+            parked_live_window_id: owner,
+        });
+        app.video_tile_swap_pending = Some(VideoTileSwapPending {
+            target_idx,
+            target_path,
+            source_epoch: 1,
+            started_at: now,
+            deadline: now + std::time::Duration::from_secs(2),
+            parked_live_window_id: owner,
+        });
+    }
+
+    #[cfg(windows)]
+    fn normalize_scan_state_for_test(
+        fs_idx: usize,
+        file_path: PathBuf,
+    ) -> crate::app::normalize::NormalizeScanState {
+        crate::app::normalize::NormalizeScanState {
+            fs_idx,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: true,
+            file_path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
         }
     }
 
@@ -17905,6 +18135,34 @@ mod still_window_mode_key_tests {
         );
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_linked_still_does_not_follow_selected_media() {
+        // review-v2.3.0 追補5 実機 follow-up: クリック/矢印など入力元によらず、
+        // selected media は cursor-follow で linked still 窓へ開かない。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\cursor-still.jpg");
+        let video = push_video(&mut app, r"C:\clips\cursor-media.mp4");
+        install_fullfeature_linked_still_with_parked_media(&mut app, &ctx, image, video, 61, 62);
+        let stamp_before = app.viewer_sync_stamp_for_idx(image);
+        app.last_viewer_sync_stamp = stamp_before.clone();
+        app.selected = Some(video);
+
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(image));
+        assert_eq!(app.detached_viewer_window_id, Some(61));
+        assert_eq!(app.last_viewer_sync_stamp, stamp_before);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 62);
+        assert_eq!(
+            app.detached_window_state(62),
+            Some(DetachedWindowState::ParkedLive)
+        );
+        assert!(app.detached_image_window_close_pending.is_empty());
+    }
+
     /// §1.7: bundle 化前の連動 detached メディアセッションは、grid open の直前に
     /// live-park される (open_non_detached 経路で閉じられて再生が止まらない)。
     #[test]
@@ -17928,7 +18186,7 @@ mod still_window_mode_key_tests {
             Condvar::new(),
         )));
 
-        assert!(app.park_active_detached_context_for_new_grid_open(&ctx));
+        assert!(app.park_active_detached_context_for_new_grid_open(&ctx, video));
 
         assert_eq!(
             app.detached_image_windows.len(),
@@ -18537,8 +18795,12 @@ mod still_window_mode_key_tests {
         // ときだけ現在の presentation を one-shot へ焼き付けることで維持する。
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let first = push_video(&mut app, r"C:\clips\a.mp4");
-        let second = push_video(&mut app, r"C:\clips\b.mp4");
+        let first_path = app.tmp.path().join("manual-nav-a.mp4");
+        let second_path = app.tmp.path().join("manual-nav-b.mp4");
+        std::fs::write(&first_path, b"a").unwrap();
+        std::fs::write(&second_path, b"b").unwrap();
+        let first = push_video(&mut app, first_path.to_str().unwrap());
+        let second = push_video(&mut app, second_path.to_str().unwrap());
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.video_in_window_mode = true;
         app.selected = Some(first);
@@ -18548,6 +18810,7 @@ mod still_window_mode_key_tests {
         app.native_video_in_window_active = true;
 
         app.navigate_native_video_fullscreen(&ctx, first, 1);
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(
@@ -18777,7 +19040,6 @@ mod still_window_mode_key_tests {
         app.pending_folder_nav_steps = -2;
         app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
         app.native_video_deferred_nav_delta = Some(-1);
-
         app.with_active_detached_viewer_context(|mounted| {
             assert!(
                 mounted.active_detached_viewer_context.is_none(),
@@ -19188,6 +19450,109 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn live_park_split_keeps_main_edit_state_and_moves_player_with_items_clone() {
+        // review-v2.3.0 追補4 P1: media session だけを parked へ移し、同じフォルダを
+        // 表示し続ける main のページ編集・見開き・サムネ補正状態は原本を保持する。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\adjusted.jpg");
+        let video_path = PathBuf::from(r"C:\pics\live.mp4");
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        let mut page_params = crate::adjustment::AdjustParams::default();
+        page_params.brightness = 42.0;
+        app.adjustment_page_params.insert(image, page_params);
+        app.mask_pages.insert(image);
+        app.local_adjust_pages.insert(image);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        let tex = ctx.load_texture(
+            "live_park_main_thumb_adjust",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumb_adjust_tex.insert(image, tex);
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path, 12.0,
+                )),
+                load_seq: 0,
+            },
+        );
+
+        assert!(app.park_current_viewer_context_as_live_media(&ctx, "test"));
+
+        assert_eq!(app.effective_params(image).brightness, 42.0);
+        assert!(app.mask_pages.contains(&image));
+        assert!(app.local_adjust_pages.contains(&image));
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert!(app.thumb_adjust_tex.contains_key(&image));
+        let same_page_params = app.effective_params(image).clone();
+        app.set_page_params(image, same_page_params);
+        assert!(
+            app.adjustment_page_params.contains_key(&image),
+            "live-park 後も既存ページ個別値を見て、標準への誤フォールバック削除をしない"
+        );
+
+        let parked = app.detached_image_windows[0]
+            .paused_bundle
+            .as_deref()
+            .expect("parked bundle");
+        assert_eq!(parked.items.len(), app.items.len());
+        assert!(matches!(
+            parked.fs_cache.get(&video),
+            Some(FsCacheEntry::Video { .. })
+        ));
+        assert!(parked.adjustment_page_params.is_empty());
+        assert!(parked.mask_pages.is_empty());
+        assert!(parked.local_adjust_pages.is_empty());
+        assert_eq!(parked.spread_mode, crate::settings::SpreadMode::Single);
+        assert!(parked.thumb_adjust_tex.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn load_zip_promotes_unbundled_detached_media_before_clearing_items() {
+        // review-v2.3.0 追補6 R2-P2-2: ZIP 専用入口でも通常 folder load と同じ順序で promote。
+        let mut app = setup_app();
+        let video_path = app.tmp.path().join("zip-promote.mp4");
+        let zip_path = app.tmp.path().join("destination.zip");
+        std::fs::write(&video_path, b"video").unwrap();
+        std::fs::write(&zip_path, b"not-a-real-zip").unwrap();
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(109);
+        app.begin_active_detached_session(109, DetachedSource::Video);
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    video_path, 18.0,
+                )),
+                load_seq: 0,
+            },
+        );
+
+        app.load_zip_as_folder(zip_path);
+
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("media context must be promoted before ZIP clears main items");
+        assert_eq!(active.bundle.fullscreen_idx, Some(video));
+        assert!(matches!(
+            active.bundle.fs_cache.get(&video),
+            Some(FsCacheEntry::Video { .. })
+        ));
+        assert!(app.fullscreen_idx.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn vst3_deferred_media_open_survives_promote_park_and_completion() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -19208,7 +19573,7 @@ mod still_window_mode_key_tests {
                 .and_then(|active| active.bundle.vst3_deferred_media_open),
             Some(video)
         );
-        assert!(app.park_active_detached_context_for_new_grid_open(&ctx));
+        assert!(app.park_active_detached_context_for_new_grid_open(&ctx, video));
         assert!(app.active_detached_viewer_context.is_none());
         assert_eq!(
             app.detached_image_windows[0]
@@ -19857,6 +20222,60 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn removed_path_release_closes_mounted_deferred_media_without_player() {
+        // review-v2.3.0 追補3 A-3: player 作成前の native/VST3 待ちも対象 media
+        // path を解放する。静止画は同じ deferred idx があっても閉じない。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video_path = PathBuf::from(r"C:\clips\native-pending.mp4");
+        let video = push_video(&mut app, video_path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        let now = std::time::Instant::now();
+        app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
+            idx: video,
+            path: video_path.clone(),
+            from_grid: false,
+            autoplay_override: None,
+            ignore_resume: false,
+            wait_for_detached_host: false,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(10),
+            input_seq: 0,
+            parked_live_window_id: None,
+        });
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            std::slice::from_ref(&video_path),
+            "test_native_pending",
+        );
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.native_video_open_pending.is_none());
+
+        let audio_path = PathBuf::from(r"C:\music\vst-pending.flac");
+        let audio = push_audio(&mut app, audio_path.to_str().unwrap());
+        app.fullscreen_idx = Some(audio);
+        app.vst3_deferred_media_open = Some(audio);
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            std::slice::from_ref(&audio_path),
+            "test_vst_pending",
+        );
+        assert!(app.fullscreen_idx.is_none());
+
+        let image_path = PathBuf::from(r"C:\pics\still.jpg");
+        let image = push_image(&mut app, image_path.to_str().unwrap());
+        app.fullscreen_idx = Some(image);
+        app.vst3_deferred_media_open = Some(image);
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            std::slice::from_ref(&image_path),
+            "test_still",
+        );
+        assert_eq!(app.fullscreen_idx, Some(image));
+    }
+
+    #[test]
     fn rename_rewrites_presence_sets_and_resume_keys_in_memory() {
         // rename transaction (§1.8): DB 移行は rename_key_migration (worker) 側でテスト
         // 済み。ここでは in-memory 側 = 編集済みバッジの presence set と動画再生位置の
@@ -20476,12 +20895,14 @@ mod still_window_mode_key_tests {
                 key: kept.clone(),
                 position: 37.5,
                 duration: 120.0,
+                at_eof: false,
             },
             ViewerContextMediaResumeUpdate {
                 path: PathBuf::from(r"C:\clips\finished.mp4"),
                 key: finished.clone(),
                 position: 118.0,
                 duration: 120.0,
+                at_eof: false,
             },
         ];
         let mut resume = std::collections::HashMap::from([(finished.clone(), 10.0)]);
@@ -20495,6 +20916,235 @@ mod still_window_mode_key_tests {
             &[PathBuf::from(r"C:\Music\BGM.FLAC")],
             std::path::Path::new(r"c:\music\bgm.flac")
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn save_all_video_resume_removes_eof_even_when_duration_is_zero() {
+        let mut app = setup_app();
+        let eof_path = PathBuf::from(r"C:\clips\mpeg-ps-eof.mpg");
+        let mid_path = PathBuf::from(r"C:\clips\midpoint.mp4");
+        let eof_idx = push_video(&mut app, eof_path.to_str().unwrap());
+        let mid_idx = push_video(&mut app, mid_path.to_str().unwrap());
+        let eof_key = crate::adjustment_db::normalize_path(&eof_path);
+        let mid_key = crate::adjustment_db::normalize_path(&mid_path);
+        let eof_player = crate::video::VideoPlayer::disconnected_for_test(eof_path, 13.046);
+        eof_player.mark_eof_for_test(0.0);
+        app.fs_cache.insert(
+            eof_idx,
+            FsCacheEntry::Video {
+                player: Box::new(eof_player),
+                load_seq: 0,
+            },
+        );
+        app.fs_cache.insert(
+            mid_idx,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    mid_path, 40.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.settings
+            .video_resume_positions
+            .insert(eof_key.clone(), 13.046);
+
+        app.save_all_video_resume_positions();
+
+        assert!(!app.settings.video_resume_positions.contains_key(&eof_key));
+        assert_eq!(
+            app.settings.video_resume_positions.get(&mid_key),
+            Some(&40.0),
+            "normal midpoint remains saved when the player is not at EOF"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn audio_mode_resume_uses_clock_for_save_all_and_teardown_plan() {
+        // review-v2.3.0 追補6 R1-1: hidden presenter の表示 PTS=10 秒に対し、
+        // 音声 clock=40 秒を最終 resume として使う。
+        let mut app = setup_app();
+        let path = PathBuf::from(r"C:\clips\audio-mode.mp4");
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 40.0);
+        player.set_last_displayed_pts_for_test(10.0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.video_audio_mode = Some(idx);
+        let key = crate::adjustment_db::normalize_path(&path);
+
+        app.save_all_video_resume_positions();
+        assert_eq!(app.settings.video_resume_positions.get(&key), Some(&40.0));
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(idx);
+        bundle.video_audio_mode = Some(idx);
+        let player = crate::video::VideoPlayer::disconnected_for_test(path, 55.0);
+        player.set_last_displayed_pts_for_test(12.0);
+        bundle.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let plan = viewer_context_media_teardown_plan(&bundle);
+        assert_eq!(plan.resume_updates[0].position, 55.0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn exit_resume_harvest_reads_active_and_paused_bundles_without_dropping_them() {
+        // review-v2.3.0 追補6 R1-2: on_exit 相当の収穫で mount 外 2 箇所を両方保存する。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let active_path = PathBuf::from(r"C:\clips\active-exit.mp4");
+        let parked_path = PathBuf::from(r"C:\clips\parked-exit.mp4");
+
+        let mut active_bundle = ViewerContextBundle::empty();
+        active_bundle
+            .items
+            .push(GridItem::Video(active_path.clone()));
+        active_bundle.fullscreen_idx = Some(0);
+        active_bundle.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    active_path.clone(),
+                    41.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: active_bundle,
+        });
+
+        let mut parked_bundle = ViewerContextBundle::empty();
+        parked_bundle
+            .items
+            .push(GridItem::Video(parked_path.clone()));
+        parked_bundle.fullscreen_idx = Some(0);
+        parked_bundle.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    parked_path.clone(),
+                    52.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 106, parked_bundle));
+
+        app.save_detached_video_resume_positions_for_exit();
+
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&active_path)),
+            Some(&41.0)
+        );
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+            Some(&52.0)
+        );
+        assert!(app.active_detached_viewer_context.is_some());
+        assert!(app.detached_image_windows[0].paused_bundle.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn teardown_plan_bakes_eof_and_removes_polluted_resume() {
+        let mut bundle = ViewerContextBundle::empty();
+        let path = PathBuf::from(r"C:\clips\teardown-eof.mpg");
+        let idx = bundle.items.len();
+        bundle.items.push(GridItem::Video(path.clone()));
+        bundle.fullscreen_idx = Some(idx);
+        let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 13.046);
+        player.mark_eof_for_test(0.0);
+        bundle.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let key = crate::adjustment_db::normalize_path(&path);
+        let plan = viewer_context_media_teardown_plan(&bundle);
+        assert_eq!(plan.resume_updates.len(), 1);
+        assert!(plan.resume_updates[0].at_eof);
+        assert_eq!(plan.resume_updates[0].duration, 0.0);
+        let mut resume = std::collections::HashMap::from([(key.clone(), 13.046)]);
+
+        let removed = apply_viewer_context_media_resume_updates(&mut resume, &plan.resume_updates);
+
+        assert!(!resume.contains_key(&key));
+        assert_eq!(removed, vec![key]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removed_path_passive_close_saves_final_resume_before_rename_migration() {
+        // review-v2.3.0 追補3 A-4: removed-path の passive close も teardown seam を通り、
+        // 5 秒周期値ではなく close 時点の位置を保存してから新 path へ移す。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("rename-old.mp4");
+        let new_path = app.tmp.path().join("rename-new.mp4");
+        std::fs::write(&old_path, b"test").unwrap();
+        let video = push_video(&mut app, old_path.to_str().unwrap());
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    old_path.clone(),
+                    37.5,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 98, bundle));
+        app.transition_detached_window_state(98, DetachedWindowState::ParkedLive, "test_setup");
+        let old_key = crate::adjustment_db::normalize_path(&old_path);
+        let new_key = crate::adjustment_db::normalize_path(&new_path);
+        app.settings
+            .video_resume_positions
+            .insert(old_key.clone(), 32.5);
+
+        app.release_viewer_surfaces_for_removed_paths(
+            &ctx,
+            std::slice::from_ref(&old_path),
+            "test_rename_close",
+        );
+        assert_eq!(
+            app.settings.video_resume_positions.get(&old_key),
+            Some(&37.5),
+            "close 時点の最終位置が旧 path へ先に保存される"
+        );
+
+        app.migrate_video_resume_positions_for_renamed_path(&old_path, &new_path);
+        assert_eq!(
+            app.settings.video_resume_positions.get(&new_key),
+            Some(&37.5)
+        );
+        assert!(!app.settings.video_resume_positions.contains_key(&old_key));
     }
 
     #[test]
@@ -24948,6 +25598,174 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn fullfeature_linked_still_is_preserved_before_different_media_open() {
+        // review-v2.3.0 追補5: §1.7 linked still × media open (a)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\linked.jpg");
+        let first_video = push_video(&mut app, r"C:\clips\v1.mp4");
+        let second_video = push_video(&mut app, r"C:\clips\v2.mp4");
+        let (_, media_placement) = install_fullfeature_linked_still_with_parked_media(
+            &mut app,
+            &ctx,
+            image,
+            first_video,
+            71,
+            72,
+        );
+
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, second_video));
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.detached_image_windows.iter().any(|w| w.id == 71));
+        app.prepare_viewer_presentation_open(second_video, true);
+
+        let new_id = app.detached_viewer_window_id.expect("new media window id");
+        assert_ne!(new_id, 71);
+        assert_ne!(new_id, 72);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 71);
+        assert_eq!(
+            app.detached_window_state(71),
+            Some(DetachedWindowState::Parked)
+        );
+        assert!(app.detached_image_window_close_pending.contains(&72));
+        assert_eq!(app.detached_window_state(72), None);
+        assert_eq!(
+            app.detached_window_runtime_placement(new_id),
+            Some(media_placement),
+            "new media id inherits the closed ParkedLive placement"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_image_media_image_reuses_parked_linked_still_window() {
+        // review-v2.3.0 追補5 完結編: 画像→動画→画像は linked still 窓を1本に保つ。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\return.jpg");
+        let old_video = push_video(&mut app, r"C:\clips\old.mp4");
+        let video = push_video(&mut app, r"C:\clips\new.mp4");
+        let (still_placement, _) = install_fullfeature_linked_still_with_parked_media(
+            &mut app, &ctx, image, old_video, 111, 112,
+        );
+
+        let media_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, video);
+        assert_eq!(
+            app.detached_window_runtimes
+                .get(&111)
+                .map(|runtime| (runtime.state, runtime.linked)),
+            Some((DetachedWindowState::Parked, true))
+        );
+
+        let still_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, image);
+
+        assert_eq!(still_window_id, 111);
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(111)
+        );
+        assert_eq!(
+            app.detached_window_runtime_placement(111),
+            Some(still_placement),
+            "reusing the window keeps its runtime placement"
+        );
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 111)
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, media_window_id);
+        assert_eq!(
+            app.detached_window_state(media_window_id),
+            Some(DetachedWindowState::ParkedLive)
+        );
+        assert!(
+            !app.activate_detached_image_window_snapshot(&ctx, 111),
+            "the consumed one-shot snapshot cannot later close/swap the active still window"
+        );
+        assert_eq!(app.detached_viewer_window_id, Some(111));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_image_media_media_image_reuses_same_still_window() {
+        // 実機列: 画像→動画→動画→画像でもstill snapshotを増殖させない。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\return-after-two.jpg");
+        let old_video = push_video(&mut app, r"C:\clips\old-before-two.mp4");
+        let first_video = push_video(&mut app, r"C:\clips\first.mp4");
+        let second_video = push_video(&mut app, r"C:\clips\second.mp4");
+        install_fullfeature_linked_still_with_parked_media(
+            &mut app, &ctx, image, old_video, 121, 122,
+        );
+
+        let _ = complete_detached_grid_open_for_test(&mut app, &ctx, first_video);
+        let second_media_window_id =
+            complete_detached_grid_open_for_test(&mut app, &ctx, second_video);
+        let still_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, image);
+
+        assert_eq!(still_window_id, 121);
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 121)
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, second_media_window_id);
+        assert_eq!(
+            app.detached_window_state(second_media_window_id),
+            Some(DetachedWindowState::ParkedLive)
+        );
+        assert_eq!(
+            app.detached_image_windows.len() + usize::from(app.active_detached_session.is_some()),
+            2,
+            "§1.7 keeps at most one media window plus one linked still window"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_closed_parked_linked_still_falls_back_to_new_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\closed-return.jpg");
+        let old_video = push_video(&mut app, r"C:\clips\old-before-close.mp4");
+        let video = push_video(&mut app, r"C:\clips\active-before-close.mp4");
+        install_fullfeature_linked_still_with_parked_media(
+            &mut app, &ctx, image, old_video, 131, 132,
+        );
+
+        let media_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, video);
+        app.close_detached_image_windows_by_ids(
+            &ctx,
+            &[131],
+            &[],
+            "test_close_linked_one_shot",
+            None,
+        );
+        assert_eq!(app.detached_window_state(131), None);
+
+        let new_still_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, image);
+
+        assert_ne!(new_still_window_id, 131);
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 131)
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, media_window_id);
+        assert_eq!(
+            app.detached_image_windows.len() + usize::from(app.active_detached_session.is_some()),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn same_media_grid_open_activates_parked_live_without_close() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -24989,6 +25807,119 @@ mod still_window_mode_key_tests {
             "the promoted active context must also take the path-based raise path"
         );
         assert!(app.active_detached_viewer_context.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_linked_still_is_preserved_when_same_parked_media_activates() {
+        // review-v2.3.0 追補5: §1.7 linked still × media open (b)。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\linked-same.jpg");
+        let video = push_video(&mut app, r"C:\clips\same-v1.mp4");
+        install_fullfeature_linked_still_with_parked_media(&mut app, &ctx, image, video, 81, 82);
+
+        assert!(
+            !app.prepare_detached_context_for_grid_open(&ctx, video),
+            "same ParkedLive media activation consumes the grid open"
+        );
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 81);
+        assert_eq!(
+            app.detached_window_state(81),
+            Some(DetachedWindowState::Parked)
+        );
+        assert_eq!(
+            app.detached_window_state(82),
+            Some(DetachedWindowState::Active)
+        );
+        assert_eq!(app.detached_viewer_window_id, Some(82));
+        assert!(app.active_detached_viewer_context.is_some());
+        assert!(app.detached_image_window_close_pending.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fullfeature_linked_still_to_still_reuses_mounted_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\first.jpg");
+        let second = push_image(&mut app, r"C:\pics\second.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.fullfeature_media_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_window_id = Some(91);
+        insert_static_fs_entry(&mut app, &ctx, first, "linked_still_reuse");
+        app.begin_active_detached_session(91, DetachedSource::Image);
+        app.update_detached_window_runtime_flags(91, true, "test_linked_reuse");
+
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, second));
+        app.open_fullscreen(second);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.detached_viewer_window_id, Some(91));
+        assert!(app.detached_image_windows.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn multi_window_mounted_still_is_preserved_before_media_open() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_image(&mut app, r"C:\pics\multi.jpg");
+        let video = push_video(&mut app, r"C:\clips\multi.mp4");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullfeature_media_window = false;
+        app.fullscreen_idx = Some(image);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(101);
+        insert_static_fs_entry(&mut app, &ctx, image, "multi_still_before_media");
+        app.begin_active_detached_session(101, DetachedSource::Image);
+        app.update_detached_window_runtime_flags(101, false, "test_multi_still");
+
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, video));
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, 101);
+        assert_eq!(
+            app.detached_window_state(101),
+            Some(DetachedWindowState::Parked)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn double_click_grid_router_activates_same_media_before_park_and_open() {
+        // review-v2.3.0 追補4 P2: ui_main のダブルクリック分岐が呼ぶ共通 seam は、
+        // park/close/open を始めず ParkedLive の same-media を active 化して消費する。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\double-click-same.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(74);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 74, bundle));
+        app.transition_detached_window_state(74, DetachedWindowState::ParkedLive, "test_setup");
+        let input_seq_before = app.input_seq;
+
+        assert!(
+            !app.prepare_detached_context_for_grid_open(&ctx, video),
+            "same-media activation consumes the grid open before park/open"
+        );
+
+        assert!(app.active_detached_viewer_context.is_some());
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.detached_image_window_close_pending.is_empty());
+        assert_eq!(app.input_seq, input_seq_before, "open path did not run");
     }
 
     #[test]
@@ -25060,7 +25991,7 @@ mod still_window_mode_key_tests {
             !app.activate_existing_detached_viewer_for_grid_open(&ctx, new_video),
             "different media must continue into the normal park/close/open path"
         );
-        assert!(app.park_active_detached_context_for_new_grid_open(&ctx));
+        assert!(app.park_active_detached_context_for_new_grid_open(&ctx, new_video));
         app.prepare_viewer_presentation_open(new_video, true);
 
         assert!(app.detached_image_windows.is_empty());
@@ -25215,6 +26146,171 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn remove_items_batch_shifts_all_mounted_native_pending_indices() {
+        // review-v2.3.0 追補3 A-1: detached 動画 B→C の準備中に、main grid の
+        // 前方 A が削除されても 4 種 pending は target C を指し続ける。
+        let mut app = setup_app();
+        push_image(&mut app, r"C:\pics\a.jpg");
+        let from = push_video(&mut app, r"C:\clips\b.mp4");
+        let target = push_video(&mut app, r"C:\clips\c.mp4");
+        install_all_native_pending_for_test(&mut app, from, target, None);
+        app.video_continuous_last_eof = Some((target, 17));
+        app.normalize_state = Some(normalize_scan_state_for_test(
+            target,
+            PathBuf::from(r"C:\clips\c.mp4"),
+        ));
+
+        app.remove_items_batch(&[0]);
+
+        let source = app.native_video_source_swap_pending.as_ref().unwrap();
+        assert_eq!((source.from_idx, source.target_idx), (0, 1));
+        assert_eq!(
+            app.native_video_open_pending.as_ref().map(|p| p.idx),
+            Some(1)
+        );
+        assert_eq!(
+            app.native_video_fast_swap_pending
+                .as_ref()
+                .map(|p| p.target_idx),
+            Some(1)
+        );
+        assert_eq!(
+            app.video_tile_swap_pending.as_ref().map(|p| p.target_idx),
+            Some(1)
+        );
+        assert_eq!(app.video_continuous_last_eof, Some((1, 17)));
+        assert_eq!(app.normalize_state.as_ref().map(|s| s.fs_idx), Some(1));
+        assert!(matches!(app.items.get(1), Some(GridItem::Video(path)) if path.ends_with("c.mp4")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_items_batch_does_not_shift_parked_native_pending_indices() {
+        let mut app = setup_app();
+        push_image(&mut app, r"C:\pics\a.jpg");
+        let from = push_video(&mut app, r"C:\clips\b.mp4");
+        let target = push_video(&mut app, r"C:\clips\c.mp4");
+        install_all_native_pending_for_test(&mut app, from, target, Some(7));
+
+        app.remove_items_batch(&[0]);
+
+        let source = app.native_video_source_swap_pending.as_ref().unwrap();
+        assert_eq!((source.from_idx, source.target_idx), (from, target));
+        assert_eq!(
+            app.native_video_open_pending.as_ref().map(|p| p.idx),
+            Some(target)
+        );
+        assert_eq!(
+            app.native_video_fast_swap_pending
+                .as_ref()
+                .map(|p| p.target_idx),
+            Some(target)
+        );
+        assert_eq!(
+            app.video_tile_swap_pending.as_ref().map(|p| p.target_idx),
+            Some(target)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_items_batch_preserves_promoted_active_media_global_indices() {
+        // review-v2.3.0 追補6 R2-P2-1: owner=None でも promoted active 所有なら bundle idx。
+        let mut app = setup_app();
+        push_image(&mut app, r"C:\pics\a.jpg");
+        let from = push_video(&mut app, r"C:\clips\b.mp4");
+        let target = push_video(&mut app, r"C:\clips\c.mp4");
+        install_all_native_pending_for_test(&mut app, from, target, None);
+        app.video_continuous_last_eof = Some((target, 23));
+        app.normalize_state = Some(normalize_scan_state_for_test(
+            target,
+            PathBuf::from(r"C:\clips\c.mp4"),
+        ));
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(from);
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+
+        app.remove_items_batch(&[0]);
+
+        let source = app.native_video_source_swap_pending.as_ref().unwrap();
+        assert_eq!((source.from_idx, source.target_idx), (from, target));
+        assert_eq!(
+            app.native_video_open_pending.as_ref().map(|p| p.idx),
+            Some(target)
+        );
+        assert_eq!(
+            app.native_video_fast_swap_pending
+                .as_ref()
+                .map(|p| p.target_idx),
+            Some(target)
+        );
+        assert_eq!(
+            app.video_tile_swap_pending.as_ref().map(|p| p.target_idx),
+            Some(target)
+        );
+        assert_eq!(app.video_continuous_last_eof, Some((target, 23)));
+        assert_eq!(
+            app.normalize_state.as_ref().map(|state| state.fs_idx),
+            Some(target)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_items_batch_preserves_parked_media_normalize_and_eof_indices() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        push_image(&mut app, r"C:\pics\a.jpg");
+        let target = push_video(&mut app, r"C:\clips\parked.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(target);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 107, bundle));
+        app.transition_detached_window_state(107, DetachedWindowState::ParkedLive, "test_setup");
+        app.video_continuous_last_eof = Some((target, 29));
+        app.normalize_state = Some(normalize_scan_state_for_test(
+            target,
+            PathBuf::from(r"C:\clips\parked.mp4"),
+        ));
+
+        app.remove_items_batch(&[0]);
+
+        assert_eq!(app.video_continuous_last_eof, Some((target, 29)));
+        assert_eq!(
+            app.normalize_state.as_ref().map(|state| state.fs_idx),
+            Some(target)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_items_batch_discards_mounted_pending_when_target_is_deleted() {
+        let mut app = setup_app();
+        let from = push_video(&mut app, r"C:\clips\b.mp4");
+        let target = push_video(&mut app, r"C:\clips\c.mp4");
+        install_all_native_pending_for_test(&mut app, from, target, None);
+        app.video_tile_mode_active = true;
+        app.video_tile_reopen_pending = true;
+        app.video_tile_reopen_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        app.native_video_deferred_nav_delta = Some(1);
+
+        app.remove_items_batch(&[target]);
+
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert!(app.native_video_open_pending.is_none());
+        assert!(app.native_video_fast_swap_pending.is_none());
+        assert!(app.video_tile_swap_pending.is_none());
+        assert!(!app.video_tile_mode_active);
+        assert!(!app.video_tile_reopen_pending);
+        assert!(app.video_tile_reopen_deadline.is_none());
+        assert!(app.native_video_deferred_nav_delta.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn main_close_fullscreen_preserves_parked_source_swap_pending() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\parked-pending.mp4");
@@ -25224,6 +26320,96 @@ mod still_window_mode_key_tests {
         app.close_fullscreen();
 
         assert!(app.native_video_source_swap_pending.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_native_open_host_timeout_closes_only_owner_window_after_poll() {
+        // review-v2.3.0 追補6 R1-4: mounted main fullscreen を close せず、mount 中の
+        // ParkedLive bundle を swap-back してから共通 teardown で owner 窓だけ閉じる。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let mounted = push_image(&mut app, r"C:\pics\mounted.jpg");
+        app.fullscreen_idx = Some(mounted);
+        let path = PathBuf::from(r"C:\clips\pending.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items.push(GridItem::Video(path.clone()));
+        bundle.fullscreen_idx = Some(0);
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        bundle.detached_viewer_window_id = Some(108);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 108, bundle));
+        app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
+        let now = std::time::Instant::now();
+        app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
+            idx: 0,
+            path,
+            from_grid: false,
+            autoplay_override: None,
+            ignore_resume: false,
+            wait_for_detached_host: true,
+            requested_at: now - std::time::Duration::from_secs(11),
+            deadline: now - std::time::Duration::from_millis(1),
+            input_seq: 0,
+            parked_live_window_id: Some(108),
+        });
+
+        app.poll_parked_live_detached_windows(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(mounted));
+        assert!(app.native_video_open_pending.is_none());
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.parked_live_media_close_after_poll.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_source_swap_presenter_closed_requests_owner_close_after_poll() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\presenter-closed.mp4");
+        app.fullscreen_idx = Some(video);
+        app.native_video_parked_live_input_window_id = Some(109);
+        let pending = source_swap_pending_for_test(&app, video, Some(109));
+        pending.native_output.mark_closed_for_test();
+        app.native_video_source_swap_pending = Some(pending);
+
+        app.poll_native_video_source_swap_pending(&ctx);
+
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert_eq!(
+            app.parked_live_media_close_after_poll,
+            vec![(109, "source_swap_presenter_closed")]
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_source_swap_decoder_timeout_requests_owner_close_after_poll() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\decoder-timeout.mp4");
+        app.fullscreen_idx = Some(video);
+        app.native_video_parked_live_input_window_id = Some(110);
+        let mut pending = source_swap_pending_for_test(&app, video, Some(110));
+        pending.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        app.native_video_source_swap_pending = Some(pending);
+
+        let before = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS.swap(
+            crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        app.poll_native_video_source_swap_pending(&ctx);
+        crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .store(before, std::sync::atomic::Ordering::Release);
+
+        assert!(app.native_video_source_swap_pending.is_none());
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert_eq!(
+            app.parked_live_media_close_after_poll,
+            vec![(110, "source_swap_decoder_timeout")]
+        );
     }
 
     #[test]
@@ -25283,10 +26469,89 @@ mod still_window_mode_key_tests {
             deadline: now,
             parked_live_window_id: Some(7),
         });
+        app.video_tile_mode_active = true;
+        app.video_tile_reopen_pending = true;
+        app.video_tile_reopen_deadline = Some(now + std::time::Duration::from_secs(3));
+        app.native_video_deferred_nav_delta = Some(1);
         app.close_detached_image_windows_by_ids(&ctx, &[7], &[], "test_close", None);
 
         assert!(app.native_video_source_swap_pending.is_none());
         assert!(app.video_tile_swap_pending.is_none());
+        assert!(app.native_video_deferred_nav_delta.is_none());
+        assert!(!app.video_tile_mode_active);
+        assert!(!app.video_tile_reopen_pending);
+        assert!(app.video_tile_reopen_deadline.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_close_preserves_unrelated_mounted_tile_companion() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let parked_video = push_video(&mut app, r"C:\clips\parked.mp4");
+        let mounted_video = push_video(&mut app, r"C:\clips\mounted.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(parked_video);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 8, bundle));
+        app.transition_detached_window_state(8, DetachedWindowState::ParkedLive, "test_setup");
+        app.fullscreen_idx = Some(mounted_video);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 81,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+        assert!(!app.closing_parked_windows_own_native_video_mode_switch(&[8]));
+        app.video_tile_mode_active = true;
+        app.video_tile_reopen_pending = true;
+        app.video_tile_reopen_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        app.native_video_deferred_nav_delta = Some(-1);
+
+        app.close_detached_image_windows_by_ids(&ctx, &[8], &[], "test_close", None);
+
+        assert!(app.video_tile_mode_active);
+        assert!(app.video_tile_reopen_pending);
+        assert!(app.video_tile_reopen_deadline.is_some());
+        assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
+        assert!(app.native_video_mode_switch.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_close_clears_bundle_owned_tile_companion_without_pending() {
+        // tile swap 完了後は owner stamp 付き pending が無い。ParkedLive bundle の表示動画が
+        // 唯一の video context なら bundle 内容で companion 所有を確定して畳む。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\parked-tile.mp4");
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = app.items.clone();
+        bundle.fullscreen_idx = Some(video);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 9, bundle));
+        app.transition_detached_window_state(9, DetachedWindowState::ParkedLive, "test_setup");
+        app.video_tile_mode_active = true;
+        app.video_tile_reopen_pending = true;
+        app.video_tile_reopen_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        app.native_video_deferred_nav_delta = Some(1);
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 91,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+
+        app.close_detached_image_windows_by_ids(&ctx, &[9], &[], "test_close", None);
+
+        assert!(!app.video_tile_mode_active);
+        assert!(!app.video_tile_reopen_pending);
+        assert!(app.video_tile_reopen_deadline.is_none());
+        assert!(app.native_video_deferred_nav_delta.is_none());
+        assert!(app.native_video_mode_switch.is_none());
     }
 
     #[test]
@@ -25307,6 +26572,302 @@ mod still_window_mode_key_tests {
             App::find_next_audio_in_display_order_from(&app.items, &order, video_a, false),
             Some(audio),
             "audio EOF has its own parked-safe path"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bundle_media_navigation_skips_missing_real_files_but_not_virtual_entries() {
+        // review-v2.3.0 追補7 P1-1: UI 側は候補抽出だけ、worker 純関数が path を照会する。
+        let mut app = setup_app();
+        let current_path = app.tmp.path().join("a.mp4");
+        let missing_path = app.tmp.path().join("b-deleted.mp4");
+        let existing_path = app.tmp.path().join("c.mp4");
+        std::fs::write(&current_path, b"a").unwrap();
+        std::fs::write(&existing_path, b"c").unwrap();
+        let current = push_video(&mut app, current_path.to_str().unwrap());
+        let missing = push_video(&mut app, missing_path.to_str().unwrap());
+        let existing = push_video(&mut app, existing_path.to_str().unwrap());
+        let order = vec![current, missing, existing];
+
+        let eof_candidates = App::collect_matching_media_navigation_candidates(
+            &app.items,
+            &order,
+            current,
+            false,
+            |item| matches!(item, GridItem::Video(_)),
+        );
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let eof_result = App::resolve_media_navigation_candidates(
+            &eof_candidates,
+            1,
+            &cancel,
+            std::path::Path::exists,
+        );
+        assert_eq!(
+            eof_result.target_idx,
+            Some(existing),
+            "EOF search must skip the deleted next video"
+        );
+        assert_eq!(eof_result.missing, vec![(missing, missing_path.clone())]);
+
+        let manual_candidates =
+            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1);
+        let manual_result = App::resolve_media_navigation_candidates(
+            &manual_candidates,
+            1,
+            &cancel,
+            std::path::Path::exists,
+        );
+        assert_eq!(
+            manual_result.target_idx,
+            Some(existing),
+            "manual next-file navigation must use the same existence gate"
+        );
+
+        let virtual_item = GridItem::ZipImage {
+            zip_path: app.tmp.path().join("missing-container.zip"),
+            entry_name: "page.jpg".to_string(),
+        };
+        let virtual_candidate = App::media_navigation_candidate(&virtual_item, 99);
+        let virtual_result =
+            App::resolve_media_navigation_candidates(&[virtual_candidate], 1, &cancel, |_| {
+                panic!("virtual ZIP/PDF entries must not call Path::exists")
+            });
+        assert_eq!(virtual_result.target_idx, Some(99));
+    }
+
+    #[test]
+    fn media_navigation_result_uses_context_local_stale_signals() {
+        assert!(App::media_navigation_result_is_current(
+            7,
+            7,
+            11,
+            11,
+            Some(3),
+            Some(3),
+            Some(4),
+            Some(4),
+        ));
+        assert!(!App::media_navigation_result_is_current(
+            7,
+            8,
+            11,
+            11,
+            Some(3),
+            Some(3),
+            Some(4),
+            Some(4),
+        ));
+        assert!(App::media_navigation_result_is_current(
+            7,
+            7,
+            11,
+            12,
+            Some(3),
+            Some(3),
+            Some(4),
+            Some(4),
+        ));
+        assert!(!App::media_navigation_result_is_current(
+            7,
+            7,
+            11,
+            11,
+            Some(3),
+            Some(4),
+            Some(4),
+            Some(4),
+        ));
+        assert!(!App::media_navigation_result_is_current(
+            7,
+            7,
+            11,
+            12,
+            None,
+            None,
+            Some(4),
+            Some(4),
+        ));
+        assert!(!App::media_navigation_result_is_current(
+            7,
+            7,
+            11,
+            11,
+            Some(3),
+            Some(3),
+            Some(4),
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn media_navigation_mailbox_drain_keeps_only_latest_request() {
+        let request = |request_id| MediaNavigationResolverRequest {
+            request_id,
+            candidates: Vec::new(),
+            required_matches: 1,
+            source: "test",
+            input_seq: request_id,
+        };
+        let latest =
+            coalesce_latest_media_navigation_request(request(1), vec![request(2), request(3)]);
+        assert_eq!(latest.request_id, 3);
+        assert_eq!(latest.input_seq, 3);
+    }
+
+    #[test]
+    fn media_navigation_request_id_rejects_stale_response() {
+        assert!(!App::media_navigation_response_is_latest(4, 5));
+        assert!(App::media_navigation_response_is_latest(5, 5));
+    }
+
+    #[test]
+    fn stale_eof_resolution_rolls_back_dedup_for_retry() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let result_tx = install_fake_media_navigation_resolver(&mut app);
+        let fs_idx = 0;
+        let seek_serial = 17;
+        app.fullscreen_idx = Some(fs_idx);
+        app.video_continuous_last_eof = Some((fs_idx, seek_serial));
+        app.media_navigation_pending = Some(MediaNavigationPending {
+            request_id: 1,
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            owner_window_id: None,
+            fullscreen_idx: Some(fs_idx),
+            source: "test_eof",
+            action: MediaNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+            },
+            started_at: std::time::Instant::now(),
+        });
+        app.items_generation = app.items_generation.wrapping_add(1);
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: 1,
+                result: MediaNavigationResolveResult {
+                    target_idx: None,
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        app.poll_media_navigation_pending(&ctx);
+
+        assert!(app.media_navigation_pending.is_none());
+        assert_eq!(app.video_continuous_last_eof, None);
+    }
+
+    #[test]
+    fn eof_dedup_rollback_covers_video_audio_mode_and_music_actions() {
+        let mut app = setup_app();
+        let key = (3, 29);
+        let mut actions = vec![
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx: key.0,
+                seek_serial: key.1,
+            },
+            MediaNavigationAction::MusicContinuousEof {
+                fs_idx: key.0,
+                seek_serial: key.1,
+            },
+        ];
+        #[cfg(windows)]
+        actions.push(MediaNavigationAction::VideoAudioModeContinuousEof {
+            fs_idx: key.0,
+            seek_serial: key.1,
+        });
+
+        for action in actions {
+            app.video_continuous_last_eof = Some(key);
+            app.rollback_media_navigation_eof_dedup(&action, "test");
+            assert_eq!(app.video_continuous_last_eof, None);
+        }
+    }
+
+    #[test]
+    fn poll_media_navigation_discards_old_response_id_then_applies_latest() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let result_tx = install_fake_media_navigation_resolver(&mut app);
+        app.fullscreen_idx = Some(0);
+        app.media_navigation_pending = Some(MediaNavigationPending {
+            request_id: 5,
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            owner_window_id: None,
+            fullscreen_idx: Some(0),
+            source: "test_manual",
+            action: MediaNavigationAction::Manual {
+                fs_idx: 0,
+                delta: 1,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+            },
+            started_at: std::time::Instant::now(),
+        });
+        for request_id in [4, 5] {
+            result_tx
+                .send(MediaNavigationResolverResponse {
+                    request_id,
+                    result: MediaNavigationResolveResult {
+                        target_idx: None,
+                        missing: Vec::new(),
+                    },
+                })
+                .unwrap();
+        }
+
+        app.poll_media_navigation_pending(&ctx);
+
+        assert!(app.media_navigation_pending.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn media_navigation_result_waits_while_parked_owner_is_not_mounted() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let result_tx = install_fake_media_navigation_resolver(&mut app);
+        app.fullscreen_idx = Some(0);
+        app.media_navigation_pending = Some(MediaNavigationPending {
+            request_id: 9,
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            owner_window_id: Some(82),
+            fullscreen_idx: Some(0),
+            source: "test_parked",
+            action: MediaNavigationAction::Manual {
+                fs_idx: 0,
+                delta: 1,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+            },
+            started_at: std::time::Instant::now(),
+        });
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: 9,
+                result: MediaNavigationResolveResult {
+                    target_idx: None,
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        app.input_seq = app.input_seq.wrapping_add(1);
+
+        app.poll_media_navigation_pending(&ctx);
+        assert!(
+            app.media_navigation_pending.is_some(),
+            "owner mismatch must retain both the pending action and queued result"
+        );
+
+        app.native_video_parked_live_input_window_id = Some(82);
+        app.poll_media_navigation_pending(&ctx);
+        assert!(
+            app.media_navigation_pending.is_none(),
+            "matching owner may consume the held result despite unrelated global input"
         );
     }
 
@@ -25612,6 +27173,10 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\movie.mp4");
         app.settings.detached_viewer_enabled = true;
         app.settings.video_in_window_mode = false;
+        assert!(
+            !app.settings.effective_media_in_media_window(),
+            "non-§1.7 linked viewer keeps the legacy media cursor-follow behavior"
+        );
         app.selected = Some(first);
         app.open_fullscreen(first);
 
@@ -25632,14 +27197,19 @@ mod still_window_mode_key_tests {
     fn detached_native_video_navigation_syncs_main_selection() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let first = push_video(&mut app, r"C:\clips\a.mp4");
-        let second = push_video(&mut app, r"C:\clips\b.mp4");
+        let first_path = app.tmp.path().join("detached-nav-a.mp4");
+        let second_path = app.tmp.path().join("detached-nav-b.mp4");
+        std::fs::write(&first_path, b"a").unwrap();
+        std::fs::write(&second_path, b"b").unwrap();
+        let first = push_video(&mut app, first_path.to_str().unwrap());
+        let second = push_video(&mut app, second_path.to_str().unwrap());
         app.settings.detached_viewer_enabled = true;
         app.settings.video_in_window_mode = false;
         app.selected = Some(first);
         app.open_fullscreen(first);
 
         app.navigate_native_video_fullscreen(&ctx, first, 1);
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.selected, Some(second));
@@ -26073,6 +27643,51 @@ mod still_window_mode_key_tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(app.fullscreen_idx, Some(idx));
         assert!(app.native_video_mode_switch.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn f12_is_ignored_during_owned_source_swap_in_both_media_modes() {
+        // review-v2.3.0 追補3 B-1 案a: EOF swap 中は player が無いので、通常モードも
+        // §1.7 メディア別窓も設定/presentation を一切変更しない。
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\next.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.detached_viewer_enabled = false;
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, None));
+
+        app.toggle_detached_viewer_mode();
+
+        assert!(!app.settings.detached_viewer_enabled);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+        assert!(app.native_video_source_swap_pending.is_some());
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_feedback_toast = None;
+        app.toggle_detached_viewer_mode();
+
+        assert!(!app.settings.detached_viewer_enabled);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.fs_feedback_toast.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn source_swap_f12_gate_matches_only_current_owner_context() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\next.mp4");
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, Some(7)));
+        assert!(!app.current_context_owns_source_swap_pending());
+
+        app.native_video_parked_live_input_window_id = Some(7);
+        assert!(app.current_context_owns_source_swap_pending());
+
+        app.native_video_parked_live_input_window_id = Some(8);
+        assert!(!app.current_context_owns_source_swap_pending());
     }
 
     #[test]
