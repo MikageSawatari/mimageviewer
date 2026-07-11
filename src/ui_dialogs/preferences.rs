@@ -995,6 +995,7 @@ impl App {
                     self.settings.video_thumb_use_sidecar_image,
                     self.settings.archive_file_handling_resolved(),
                 );
+                let old_grid_display_order = self.settings.grid_display_order.clone();
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
                 let old_susie = (
@@ -1152,8 +1153,13 @@ impl App {
                     self.settings.video_thumb_use_sidecar_image,
                     self.settings.archive_file_handling_resolved(),
                 );
-                if old_dup != new_dup {
+                let duplicate_settings_changed = old_dup != new_dup;
+                let grid_display_order_changed =
+                    old_grid_display_order != self.settings.grid_display_order;
+                if duplicate_settings_changed {
                     self.reload_current_folder_preserving_override();
+                } else if grid_display_order_changed {
+                    self.apply_sort_change_reload();
                 }
                 if old_exif != self.settings.exif_hidden_tags {
                     self.exif_cache.clear();

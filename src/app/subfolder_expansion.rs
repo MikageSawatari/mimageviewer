@@ -1067,20 +1067,25 @@ impl App {
         let build_t0 = Instant::now();
         let mut items = Vec::with_capacity(sorted.len());
         let mut image_metas = Vec::with_capacity(sorted.len());
-        let mut video_items = Vec::new();
 
         for entry in sorted {
-            let idx = items.len();
             let mtime = entry.mtime;
             let file_size = entry.file_size;
             if entry.is_video {
                 items.push(GridItem::Video(entry.path.clone()));
-                video_items.push((idx, entry.path, file_size.max(0) as u64));
             } else {
                 items.push(GridItem::Image(entry.path));
             }
             image_metas.push(Some((mtime, file_size)));
         }
+        let sort = self.book_sort_order_for_path(&root);
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut image_metas,
+            &self.settings.grid_display_order,
+            Some(sort),
+        );
+        let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
         if perf_on {
             crate::perf::event(
                 "subfolder",

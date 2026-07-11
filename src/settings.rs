@@ -1029,6 +1029,150 @@ impl SortOrder {
 }
 
 // -----------------------------------------------------------------------
+// GridDisplayOrder
+// -----------------------------------------------------------------------
+
+/// グリッド表示順を構成する 4 カテゴリ。
+///
+/// 同じ表示行に割り当てられたカテゴリは、共通の [`SortOrder`] で混在ソートされる。
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GridItemDisplayKind {
+    Folder,
+    Archive,
+    Image,
+    VideoAudio,
+}
+
+impl GridItemDisplayKind {
+    pub const ALL: [Self; 4] = [Self::Folder, Self::Archive, Self::Image, Self::VideoAudio];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Folder => "実フォルダ",
+            Self::Archive => "アーカイブ類",
+            Self::Image => "画像",
+            Self::VideoAudio => "動画・音声",
+        }
+    }
+
+    fn from_persisted_name(value: &str) -> Option<Self> {
+        match value {
+            "folder" => Some(Self::Folder),
+            "archive" => Some(Self::Archive),
+            "image" => Some(Self::Image),
+            "video_audio" => Some(Self::VideoAudio),
+            _ => None,
+        }
+    }
+
+    fn default_row(self) -> usize {
+        match self {
+            Self::Folder | Self::Archive => 0,
+            Self::Image | Self::VideoAudio => 1,
+        }
+    }
+}
+
+/// 4 カテゴリを 4 つの表示行へ割り当てる設定。
+///
+/// 空行は保持する。各カテゴリは正規化後に必ずちょうど 1 行へ所属する。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct GridDisplayOrder([Vec<GridItemDisplayKind>; 4]);
+
+impl GridDisplayOrder {
+    pub fn from_rows(rows: [Vec<GridItemDisplayKind>; 4]) -> Self {
+        Self(rows)
+    }
+
+    pub fn rows(&self) -> &[Vec<GridItemDisplayKind>; 4] {
+        &self.0
+    }
+
+    pub fn row_for(&self, kind: GridItemDisplayKind) -> usize {
+        self.0
+            .iter()
+            .position(|row| row.contains(&kind))
+            .unwrap_or_else(|| kind.default_row())
+    }
+
+    pub fn assign(&mut self, kind: GridItemDisplayKind, row: usize) {
+        let row = row.min(self.0.len() - 1);
+        for current in &mut self.0 {
+            current.retain(|candidate| *candidate != kind);
+        }
+        self.0[row].push(kind);
+    }
+
+    /// 重複を先勝ちで除去し、未所属カテゴリを既定行へ補完する。
+    pub fn normalize(&mut self) {
+        let mut normalized: [Vec<GridItemDisplayKind>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut seen = std::collections::HashSet::new();
+        for (row_idx, row) in self.0.iter().enumerate() {
+            for &kind in row {
+                if seen.insert(kind) {
+                    normalized[row_idx].push(kind);
+                }
+            }
+        }
+        for kind in GridItemDisplayKind::ALL {
+            if seen.insert(kind) {
+                normalized[kind.default_row()].push(kind);
+            }
+        }
+        self.0 = normalized;
+    }
+
+    pub fn normalized(&self) -> Self {
+        let mut value = self.clone();
+        value.normalize();
+        value
+    }
+}
+
+impl Default for GridDisplayOrder {
+    fn default() -> Self {
+        Self([
+            vec![GridItemDisplayKind::Folder, GridItemDisplayKind::Archive],
+            vec![GridItemDisplayKind::Image, GridItemDisplayKind::VideoAudio],
+            Vec::new(),
+            Vec::new(),
+        ])
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GridDisplayOrder {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let Some(rows) = value.as_array() else {
+            return Ok(Self::default());
+        };
+        if rows.len() != 4 || rows.iter().any(|row| !row.is_array()) {
+            return Ok(Self::default());
+        }
+
+        let mut parsed: [Vec<GridItemDisplayKind>; 4] = std::array::from_fn(|_| Vec::new());
+        for (row_idx, row) in rows.iter().enumerate() {
+            for raw in row.as_array().expect("row shape checked above") {
+                if let Some(kind) = raw
+                    .as_str()
+                    .and_then(GridItemDisplayKind::from_persisted_name)
+                {
+                    parsed[row_idx].push(kind);
+                }
+            }
+        }
+        let mut order = Self(parsed);
+        order.normalize();
+        Ok(order)
+    }
+}
+
+// -----------------------------------------------------------------------
 // CachePolicy
 // -----------------------------------------------------------------------
 
@@ -1850,6 +1994,10 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// 実フォルダ / アーカイブ類 / 画像 / 動画・音声を 4 行へ割り当てる表示順。
+    /// 同じ行は `sort_order` で混在ソートし、空行は表示時に読み飛ばす。
+    #[serde(default)]
+    pub grid_display_order: GridDisplayOrder,
     /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
     /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
     /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
@@ -3477,6 +3625,7 @@ impl Default for Settings {
             prefetch_forward: default_prefetch_forward(),
             folder_skip_limit: default_folder_skip_limit(),
             sort_order: SortOrder::default(),
+            grid_display_order: GridDisplayOrder::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
             thumb_quality: default_thumb_quality(),
@@ -4746,6 +4895,7 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        self.grid_display_order.normalize();
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
         // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
@@ -5108,6 +5258,7 @@ impl Settings {
         // self は &self なので clone してから書き換える。
         let snapshot = {
             let mut s = self.clone();
+            s.grid_display_order.normalize();
             s.video_loop = !matches!(s.video_loop_mode, VideoLoopMode::Off);
             let archive_handling = s.archive_file_handling_resolved();
             s.archive_file_handling = archive_handling;
@@ -5402,6 +5553,40 @@ mod tests {
         // (フィールド無し) を読んだとき既定 '_' になる (docs/filename-stack-plan.md §6)。
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.stack_separator, '_');
+    }
+
+    #[test]
+    fn grid_display_order_defaults_to_existing_compatible_rows_when_missing() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.grid_display_order, GridDisplayOrder::default());
+        assert_eq!(
+            s.grid_display_order.rows()[0],
+            [GridItemDisplayKind::Folder, GridItemDisplayKind::Archive]
+        );
+        assert_eq!(
+            s.grid_display_order.rows()[1],
+            [GridItemDisplayKind::Image, GridItemDisplayKind::VideoAudio]
+        );
+    }
+
+    #[test]
+    fn grid_display_order_normalizes_duplicates_unknown_and_missing_categories() {
+        let order: GridDisplayOrder =
+            serde_json::from_str(r#"[["folder","folder","future_kind"],["video_audio"],[],[]]"#)
+                .unwrap();
+        assert_eq!(
+            order.rows()[0],
+            [GridItemDisplayKind::Folder, GridItemDisplayKind::Archive]
+        );
+        assert_eq!(
+            order.rows()[1],
+            [GridItemDisplayKind::VideoAudio, GridItemDisplayKind::Image]
+        );
+        assert!(order.rows()[2].is_empty());
+        assert!(order.rows()[3].is_empty());
+
+        let corrupt: GridDisplayOrder = serde_json::from_str(r#"{"bad":true}"#).unwrap();
+        assert_eq!(corrupt, GridDisplayOrder::default());
     }
 
     #[test]

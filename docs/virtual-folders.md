@@ -27,6 +27,14 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 `ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
 同じリストに外側と内側が混在することはない。
 
+通常グリッドの表示順は `Settings.grid_display_order` の 4 行割り当てで決まる。カテゴリは
+実フォルダ (`Folder`) / アーカイブ類 (`ZipFile` / `PdfFile` / `ConvertibleArchive`、ZIP 内では
+`ZipDir`) / 画像 (`Image` / `ZipImage` / `PdfPage` / `Stack`) / 動画・音声 (`Video` / `Audio`)。
+同じ行へ割り当てたカテゴリは共通の `sort_order` で混在ソートし、空行は読み飛ばす。既定は
+1 行目が実フォルダ + アーカイブ類、2 行目が画像 + 動画・音声。組み立ては
+`grid_item::arrange_grid_items` を通常フォルダ、ZIP materialize、ファイル名スタック、
+レーティング一覧、サブフォルダ展開から共有する。全文検索の flat result は対象外。
+
 ### 製本への追加 (v1.7.0)
 
 メニュー「製本 > 追加先の本に追加」、ツールバーの本棚「追加」、追加ショートカットは、

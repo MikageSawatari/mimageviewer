@@ -213,9 +213,9 @@ pub fn group_by_keys(media: Vec<StackMember>, keys: &[String], sort: SortOrder) 
 /// の先頭へジャンプ、`Ctrl+↓↑` はフォルダ移動 (据え置き)。メンバーグリッドは設けない
 /// (1 枚スタックの割合が高く、毎回中間グリッドを挟むと煩雑なため。実機フィードバック 2026-06-20)。
 ///
-/// `passthrough` は画像以外 (フォルダ / ZIP / PDF / 変換アーカイブ) のセル列で、両ビューの先頭に
-/// 置く (= 通常レイアウトのコンテナ先頭慣習を踏襲、plan §4 「素通し表示」)。`groups` はメディア
-/// (画像 + 動画) を prefix でまとめたもの (動画は単独固定)。
+/// `passthrough` は画像・動画以外のセル列。materialize 時に `display_order` を適用するため、
+/// コンテナや音声も設定されたカテゴリ行へ配置される。`groups` はメディア (画像 + 動画) を
+/// prefix でまとめたもの (動画は単独固定)。
 /// (`GridItem` が `Debug` 非対応のため `Debug` は derive しない。)
 #[derive(Clone)]
 pub struct StackView {
@@ -225,12 +225,19 @@ pub struct StackView {
     pub separator: char,
     /// 構築時のソート順 (グループ/メンバーの並びはこれに従う)。
     pub sort: SortOrder,
+    /// 構築時のカテゴリ表示順。
+    pub display_order: crate::settings::GridDisplayOrder,
     /// 画像以外のコンテナセル (両ビュー先頭の passthrough)。
     pub passthrough: Vec<GridItem>,
     /// `passthrough` と同インデックスの `(mtime, size)`。
     pub passthrough_metas: Vec<Option<(i64, i64)>>,
     /// メディアグループ (表示順)。
     pub groups: Vec<StackGroup>,
+    /// カテゴリ並べ替え後の index 写像。構築時に 1 回だけ計算し、ナビ操作では再ソートしない。
+    flat_group_by_index: Vec<Option<usize>>,
+    flat_group_starts: Vec<Option<usize>>,
+    aggregated_group_by_index: Vec<Option<usize>>,
+    aggregated_group_indices: Vec<usize>,
 }
 
 impl StackView {
@@ -265,14 +272,41 @@ impl StackView {
         sort: SortOrder,
         groups: Vec<StackGroup>,
     ) -> Self {
-        Self {
+        Self::from_groups_with_display_order(
+            folder,
+            passthrough,
+            passthrough_metas,
+            separator,
+            sort,
+            groups,
+            crate::settings::GridDisplayOrder::default(),
+        )
+    }
+
+    pub fn from_groups_with_display_order(
+        folder: PathBuf,
+        passthrough: Vec<GridItem>,
+        passthrough_metas: Vec<Option<(i64, i64)>>,
+        separator: char,
+        sort: SortOrder,
+        groups: Vec<StackGroup>,
+        display_order: crate::settings::GridDisplayOrder,
+    ) -> Self {
+        let mut view = Self {
             folder,
             separator,
             sort,
+            display_order,
             passthrough,
             passthrough_metas,
             groups,
-        }
+            flat_group_by_index: Vec::new(),
+            flat_group_starts: Vec::new(),
+            aggregated_group_by_index: Vec::new(),
+            aggregated_group_indices: Vec::new(),
+        };
+        view.rebuild_materialized_index_maps();
+        view
     }
 
     /// 畳めるスタック (画像 2 枚以上のグループ) が 1 つでもあるか。
@@ -302,6 +336,12 @@ impl StackView {
             }
             metas.push(Some((rep.mtime, rep.size)));
         }
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut metas,
+            &self.display_order,
+            Some(self.sort),
+        );
         (items, metas)
     }
 
@@ -321,6 +361,12 @@ impl StackView {
                 metas.push(Some((m.mtime, m.size)));
             }
         }
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut metas,
+            &self.display_order,
+            Some(self.sort),
+        );
         (items, metas)
     }
 
@@ -330,41 +376,32 @@ impl StackView {
         if g >= self.groups.len() {
             return None;
         }
-        let before: usize = self.groups[..g].iter().map(|x| x.members.len()).sum();
-        Some(self.passthrough.len() + before)
+        self.flat_group_starts[g]
     }
 
     /// フラットビューの index `flat_idx` が属するグループ index。passthrough 領域や
     /// 範囲外なら `None`。`Shift+↓↑` のジャンプ元判定 / 閉じたときの集約セル再選択に使う。
     pub fn group_of_flat_index(&self, flat_idx: usize) -> Option<usize> {
-        let pt = self.passthrough.len();
-        if flat_idx < pt {
-            return None;
-        }
-        let mut offset = pt;
-        for (g, group) in self.groups.iter().enumerate() {
-            let end = offset + group.members.len();
-            if flat_idx < end {
-                return Some(g);
-            }
-            offset = end;
-        }
-        None
+        self.flat_group_by_index.get(flat_idx).copied().flatten()
     }
 
     /// 集約ビューの index `agg_idx` をフラットビューでの先頭メンバー index へ写す。
     /// passthrough 領域 (コンテナ) は `None` (= 開く動作はフルスクリーンでなく通常ナビ)。
     pub fn flat_index_for_aggregated(&self, agg_idx: usize) -> Option<usize> {
-        let pt = self.passthrough.len();
-        if agg_idx < pt {
-            return None;
-        }
-        self.flat_start_of_group(agg_idx - pt)
+        let group = self
+            .aggregated_group_by_index
+            .get(agg_idx)
+            .copied()
+            .flatten()?;
+        self.flat_group_starts.get(group).copied().flatten()
     }
 
     /// グループ g に対応する集約ビューの index (= passthrough 長 + g)。
     pub fn aggregated_index_of_group(&self, g: usize) -> usize {
-        self.passthrough.len() + g
+        self.aggregated_group_indices
+            .get(g)
+            .copied()
+            .unwrap_or(usize::MAX)
     }
 
     /// `Shift+↓↑` のジャンプ先 (フラットビュー index)。フラットビューの現在地 `cur` から:
@@ -373,17 +410,84 @@ impl StackView {
     ///   先頭スタックの先頭なら `None`。
     /// `cur` が passthrough 領域 (コンテナ) のときは `None`。
     pub fn stack_jump_target(&self, cur: usize, forward: bool) -> Option<usize> {
-        let g = self.group_of_flat_index(cur)?;
+        let g = self.flat_group_by_index.get(cur).copied().flatten()?;
+        let mut ordered: Vec<(usize, usize)> = self
+            .flat_group_starts
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(group, start)| start.map(|start| (group, start)))
+            .collect();
+        ordered.sort_by_key(|(_, start)| *start);
+        let ordered_idx = ordered.iter().position(|(group, _)| *group == g)?;
         if forward {
-            self.flat_start_of_group(g + 1)
+            ordered.get(ordered_idx + 1).map(|(_, start)| *start)
         } else {
-            let start = self.flat_start_of_group(g)?;
+            let start = ordered[ordered_idx].1;
             if cur > start {
                 Some(start)
             } else {
-                g.checked_sub(1).and_then(|pg| self.flat_start_of_group(pg))
+                ordered_idx
+                    .checked_sub(1)
+                    .and_then(|previous| ordered.get(previous))
+                    .map(|(_, start)| *start)
             }
         }
+    }
+
+    /// 現在のカテゴリ表示順を適用した aggregate / flat items の index 写像を構築する。
+    /// StackView 構築時だけ呼び、キー操作や close reconcile ではソートを繰り返さない。
+    fn rebuild_materialized_index_maps(&mut self) {
+        let mut group_by_path: std::collections::HashMap<&Path, usize> =
+            std::collections::HashMap::new();
+        let mut group_by_stack_key: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (group_idx, group) in self.groups.iter().enumerate() {
+            for member in &group.members {
+                group_by_path.insert(member.path.as_path(), group_idx);
+            }
+            if group.is_stack() {
+                group_by_stack_key.insert(group.key.as_str(), group_idx);
+            }
+        }
+
+        let (items, _) = self.materialize_flat();
+        let mut flat_group_by_index = Vec::with_capacity(items.len());
+        let mut flat_group_starts = vec![None; self.groups.len()];
+        for (idx, item) in items.iter().enumerate() {
+            let group = match item {
+                GridItem::Image(path) | GridItem::Video(path) => {
+                    group_by_path.get(path.as_path()).copied()
+                }
+                _ => None,
+            };
+            if let Some(group) = group {
+                flat_group_starts[group].get_or_insert(idx);
+            }
+            flat_group_by_index.push(group);
+        }
+
+        let (items, _) = self.materialize_aggregated();
+        let mut aggregated_group_by_index = Vec::with_capacity(items.len());
+        let mut aggregated_group_indices = vec![usize::MAX; self.groups.len()];
+        for (idx, item) in items.iter().enumerate() {
+            let group = match item {
+                GridItem::Stack { key, .. } => group_by_stack_key.get(key.as_str()).copied(),
+                GridItem::Image(path) | GridItem::Video(path) => {
+                    group_by_path.get(path.as_path()).copied()
+                }
+                _ => None,
+            };
+            if let Some(group) = group {
+                aggregated_group_indices[group] = idx;
+            }
+            aggregated_group_by_index.push(group);
+        }
+
+        self.flat_group_by_index = flat_group_by_index;
+        self.flat_group_starts = flat_group_starts;
+        self.aggregated_group_by_index = aggregated_group_by_index;
+        self.aggregated_group_indices = aggregated_group_indices;
     }
 
     /// `key` を持つグループの index を返す。

@@ -13499,19 +13499,15 @@ impl App {
             );
         }
 
-        // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
-        let folder_count = folders.len();
+        // items を一度全カテゴリへ materialize し、共通 helper で設定された表示行へ配置する。
         let mut items: Vec<GridItem> = folders;
         let mut image_metas: Vec<Option<(i64, i64)>> = folder_metas;
-        let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
 
-        for (offset, (p, media_kind, mtime, file_size)) in all_media.iter().enumerate() {
-            let item_idx = folder_count + offset;
+        for (p, media_kind, mtime, file_size) in &all_media {
             match media_kind {
                 crate::app::folder_scan::ScanMediaKind::Video => {
                     items.push(GridItem::Video(p.clone()));
                     image_metas.push(Some((*mtime, *file_size)));
-                    video_items.push((item_idx, p.clone(), (*file_size).max(0) as u64));
                 }
                 crate::app::folder_scan::ScanMediaKind::Audio => {
                     // 音声はフルスクリーンで音楽ビューを開く。サムネは固定の音楽アイコン
@@ -13525,6 +13521,13 @@ impl App {
                 }
             }
         }
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut image_metas,
+            &self.settings.grid_display_order,
+            Some(sort),
+        );
+        let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
         let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
             self.settings.auto_fullscreen_image_folders_enabled()
                 && Self::grid_items_are_image_only_folder_pages(&items)
@@ -13593,7 +13596,7 @@ impl App {
             // 「スクリプトを使うか」のフラグだけを渡す (UI スレッドの同期 read_to_string 回避)。
             let script_enabled = self.settings.stack_script_enabled;
             let (passthrough, passthrough_metas, media) =
-                crate::filename_stack_ui::extract_stack_parts(&items, &image_metas, folder_count);
+                crate::filename_stack_ui::extract_stack_parts(&items, &image_metas);
             Some((
                 script_enabled,
                 self.settings.stack_separator,
@@ -15621,15 +15624,42 @@ impl App {
         let previous_selected = self.selected;
         let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
         crate::rating_view::sort_rows(&mut self.rating_view_rows, self.rating_view_sort);
-        let items: Vec<GridItem> = self
+        let mut items: Vec<GridItem> = self
             .rating_view_rows
             .iter()
             .map(|row| row.item.clone())
             .collect();
-        let image_metas: Vec<Option<(i64, i64)>> = self
+        let mut image_metas: Vec<Option<(i64, i64)>> = self
             .rating_view_rows
             .iter()
             .map(|row| row.image_meta)
+            .collect();
+        // ★設定時刻順を含む rating view 固有の行内順序は維持し、カテゴリ行だけを共通
+        // helper で組み替える。Normal sort も直前の sort_rows で既に確定済み。
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut image_metas,
+            &self.settings.grid_display_order,
+            None,
+        );
+        let mut rows_by_item: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<crate::rating_view::RatingViewRow>,
+        > = std::collections::HashMap::new();
+        for row in self.rating_view_rows.drain(..) {
+            rows_by_item
+                .entry(row.item.perf_key())
+                .or_default()
+                .push_back(row);
+        }
+        self.rating_view_rows = items
+            .iter()
+            .map(|item| {
+                rows_by_item
+                    .get_mut(&item.perf_key())
+                    .and_then(std::collections::VecDeque::pop_front)
+                    .expect("arranged rating item must retain its source row")
+            })
             .collect();
         let video_items: Vec<(usize, PathBuf, u64)> = items
             .iter()
@@ -16095,7 +16125,13 @@ impl App {
             existing_keys.extend(pinned);
         }
         let nav = crate::zip_tree::ZipNavState::new(tree);
-        let (items, image_metas) = nav.materialize_current(sort);
+        let (mut items, mut image_metas) = nav.materialize_current(sort);
+        crate::grid_item::arrange_grid_items(
+            &mut items,
+            &mut image_metas,
+            &self.settings.grid_display_order,
+            Some(sort),
+        );
 
         self.start_loading_items(
             zip_path.clone(),
@@ -16208,11 +16244,19 @@ impl App {
     /// サムネは永続ワーカー + 毎フレーム reconcile が Pending を拾って再ロードする。
     /// `zip_nav` 自体は維持される (= ナビ継続)。
     fn zip_nav_show_current_level(&mut self) {
+        let sort = self.settings.sort_order;
+        let display_order = self.settings.grid_display_order.clone();
         let (items, metas, zip_path) = {
             let Some(nav) = self.zip_nav.as_ref() else {
                 return;
             };
-            let (items, metas) = nav.materialize_current(self.settings.sort_order);
+            let (mut items, mut metas) = nav.materialize_current(sort);
+            crate::grid_item::arrange_grid_items(
+                &mut items,
+                &mut metas,
+                &display_order,
+                Some(sort),
+            );
             (items, metas, nav.tree.zip_path.clone())
         };
         // 旧レベルの in-flight 検索 / 詳細メタ pending を停止 (idx が付け替わるので無意味)。

@@ -471,6 +471,64 @@ pub fn sort_folder_block(
     }
 }
 
+/// 設定された 4 行のカテゴリ割り当てで items と同位置メタデータを並べ直す。
+///
+/// 各行は [`sort_folder_block`] で同じ `SortOrder` を適用する。`sort == None` は
+/// レーティング設定時刻順など、呼び出し側が既に作った行内順序を安定保持する集約ビュー用。
+/// 空行は出力を持たないため自動的に読み飛ばされる。
+pub fn arrange_grid_items(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    display_order: &crate::settings::GridDisplayOrder,
+    sort: Option<crate::settings::SortOrder>,
+) {
+    assert_eq!(items.len(), image_metas.len());
+    let display_order = display_order.normalized();
+    let mut row_items: [Vec<GridItem>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut row_metas: [Vec<Option<(i64, i64)>>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut other_items = Vec::new();
+    let mut other_metas = Vec::new();
+
+    for (item, meta) in items.drain(..).zip(image_metas.drain(..)) {
+        if let Some(kind) = display_kind(&item) {
+            let row = display_order.row_for(kind);
+            row_items[row].push(item);
+            row_metas[row].push(meta);
+        } else {
+            other_items.push(item);
+            other_metas.push(meta);
+        }
+    }
+
+    for row in 0..4 {
+        if let Some(sort) = sort {
+            sort_folder_block(&mut row_items[row], &mut row_metas[row], sort);
+        }
+        items.append(&mut row_items[row]);
+        image_metas.append(&mut row_metas[row]);
+    }
+    // §1.6 の 4 カテゴリ外にある検索専用/レガシー疑似セルは、欠落させず末尾へ保つ。
+    items.append(&mut other_items);
+    image_metas.append(&mut other_metas);
+}
+
+fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind> {
+    use crate::settings::GridItemDisplayKind;
+    match item {
+        GridItem::Folder(_) => Some(GridItemDisplayKind::Folder),
+        GridItem::ZipFile(_)
+        | GridItem::PdfFile(_)
+        | GridItem::ConvertibleArchive { .. }
+        | GridItem::ZipDir { .. } => Some(GridItemDisplayKind::Archive),
+        GridItem::Image(_)
+        | GridItem::ZipImage { .. }
+        | GridItem::PdfPage { .. }
+        | GridItem::Stack { .. } => Some(GridItemDisplayKind::Image),
+        GridItem::Video(_) | GridItem::Audio(_) => Some(GridItemDisplayKind::VideoAudio),
+        GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +842,102 @@ mod tests {
             }
             .drag_source_path()
             .is_none()
+        );
+    }
+
+    fn arranged_names(
+        mut items: Vec<GridItem>,
+        order: crate::settings::GridDisplayOrder,
+    ) -> Vec<String> {
+        let mut metas = vec![Some((0, 0)); items.len()];
+        arrange_grid_items(
+            &mut items,
+            &mut metas,
+            &order,
+            Some(crate::settings::SortOrder::FileName),
+        );
+        items.iter().map(|item| item.name().into_owned()).collect()
+    }
+
+    fn mixed_outer_items() -> Vec<GridItem> {
+        vec![
+            GridItem::Image(PathBuf::from(r"C:\grid\z.jpg")),
+            GridItem::Folder(PathBuf::from(r"C:\grid\b-folder")),
+            GridItem::Video(PathBuf::from(r"C:\grid\c.mp4")),
+            GridItem::ZipFile(PathBuf::from(r"C:\grid\a.zip")),
+        ]
+    }
+
+    #[test]
+    fn arrange_default_reproduces_container_then_media_blocks() {
+        assert_eq!(
+            arranged_names(
+                mixed_outer_items(),
+                crate::settings::GridDisplayOrder::default()
+            ),
+            ["a.zip", "b-folder", "c.mp4", "z.jpg"]
+        );
+    }
+
+    #[test]
+    fn arrange_supports_folder_first_and_folder_last() {
+        use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        let folder_first = crate::settings::GridDisplayOrder::from_rows([
+            vec![Folder],
+            vec![Archive, Image, VideoAudio],
+            vec![],
+            vec![],
+        ]);
+        let folder_last = crate::settings::GridDisplayOrder::from_rows([
+            vec![Archive, Image, VideoAudio],
+            vec![],
+            vec![],
+            vec![Folder],
+        ]);
+        assert_eq!(
+            arranged_names(mixed_outer_items(), folder_first),
+            ["b-folder", "a.zip", "c.mp4", "z.jpg"]
+        );
+        assert_eq!(
+            arranged_names(mixed_outer_items(), folder_last),
+            ["a.zip", "c.mp4", "z.jpg", "b-folder"]
+        );
+    }
+
+    #[test]
+    fn arrange_merges_archives_into_media_row() {
+        use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        let order = crate::settings::GridDisplayOrder::from_rows([
+            vec![Folder],
+            vec![Archive, Image, VideoAudio],
+            vec![],
+            vec![],
+        ]);
+        assert_eq!(
+            arranged_names(
+                vec![
+                    GridItem::Image(PathBuf::from(r"C:\grid\a.jpg")),
+                    GridItem::ZipFile(PathBuf::from(r"C:\grid\b.zip")),
+                    GridItem::Video(PathBuf::from(r"C:\grid\c.mp4")),
+                ],
+                order,
+            ),
+            ["a.jpg", "b.zip", "c.mp4"]
+        );
+    }
+
+    #[test]
+    fn arrange_skips_empty_rows() {
+        use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        let order = crate::settings::GridDisplayOrder::from_rows([
+            vec![],
+            vec![Image],
+            vec![],
+            vec![Folder, Archive, VideoAudio],
+        ]);
+        assert_eq!(
+            arranged_names(mixed_outer_items(), order),
+            ["z.jpg", "a.zip", "b-folder", "c.mp4"]
         );
     }
 }

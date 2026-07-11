@@ -2859,6 +2859,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_grid_display_order_uses_additive_settings_default() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM settings_kv WHERE key = 'grid_display_order'",
+                    [],
+                )
+                .unwrap();
+        }
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.grid_display_order,
+            crate::settings::GridDisplayOrder::default()
+        );
+    }
+
+    #[test]
     fn migrates_legacy_tags_table_to_tag_key_and_shortcut_columns() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
