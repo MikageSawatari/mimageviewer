@@ -104,6 +104,7 @@ pub mod reading_history_db;
 pub mod db_backup;
 #[cfg(feature = "portable")]
 pub mod native_assets;
+pub mod operation_customize_share;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod perf;

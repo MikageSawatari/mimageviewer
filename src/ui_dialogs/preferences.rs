@@ -1495,12 +1495,22 @@ impl App {
     }
 
     fn apply_operation_customize_state(&mut self, state: PreferencesState) {
+        let mut bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+            &self.settings,
+        );
+        bundle.keymap = state.settings.keymap;
+        bundle.ring_shortcuts = state.settings.ring_shortcuts;
+        self.apply_operation_customize_bundle(bundle);
+    }
+
+    pub(crate) fn apply_operation_customize_bundle(
+        &mut self,
+        mut bundle: crate::operation_customize_share::OperationCustomizeBundle,
+    ) {
         let old_keymap_settings = self.settings.keymap.clone();
         let old_ring_shortcuts = self.settings.ring_shortcuts.clone();
-
-        self.settings.keymap = state.settings.keymap;
-        self.settings.ring_shortcuts = state.settings.ring_shortcuts;
-        self.settings.ring_shortcuts.sanitize();
+        bundle.ring_shortcuts.sanitize();
+        bundle.apply_to(&mut self.settings);
 
         if old_keymap_settings != self.settings.keymap {
             let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);

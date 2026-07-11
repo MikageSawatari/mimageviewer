@@ -436,6 +436,100 @@ fn family_deletion_order_main_last() -> Vec<String> {
 // 内部ヘルパ
 // ──────────────────────────────────────────────────────────────────────
 
+const OPERATION_IMPORT_BACKUP_LIMIT: usize = 10;
+
+/// Extract only operation customization from an older generation.
+///
+/// `Current` must come from the live in-memory `Settings` so its WAL-backed
+/// state cannot be missed. Older generations are copied to a private temporary
+/// directory before `SettingsDb` opens them.
+pub fn load_operation_customize(
+    data_dir: &Path,
+    source: &BackupSource,
+) -> Result<crate::operation_customize_share::OperationCustomizeBundle, RestoreError> {
+    if source.is_current() {
+        return Err(RestoreError::ValidationFailed(
+            "current operation customization must be read from live settings".to_string(),
+        ));
+    }
+    let src = data_dir.join(source.filename());
+    if !src.exists() {
+        return Err(RestoreError::SourceMissing(src));
+    }
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_base = std::env::temp_dir().join(format!(
+        "mimageviewer-operation-import-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_base).map_err(RestoreError::Io)?;
+    let result = load_operation_customize_in_dir(&tmp_base, &src);
+    let _ = std::fs::remove_dir_all(&tmp_base);
+    result
+}
+
+fn load_operation_customize_in_dir(
+    tmp_base: &Path,
+    src: &Path,
+) -> Result<crate::operation_customize_share::OperationCustomizeBundle, RestoreError> {
+    let settings = load_settings_copy_in_dir(tmp_base, src)?;
+    Ok(
+        crate::operation_customize_share::OperationCustomizeBundle::from_settings(&settings)
+            .with_label("バックアップ"),
+    )
+}
+
+/// Save the live operation customization immediately before a replace import.
+/// Only the newest bounded set is retained.
+pub fn backup_operation_customize_before_import(
+    data_dir: &Path,
+    bundle: &crate::operation_customize_share::OperationCustomizeBundle,
+) -> Result<PathBuf, RestoreError> {
+    std::fs::create_dir_all(data_dir)?;
+    let timestamp = unix_seconds_now();
+    let mut ordinal = 1u32;
+    let path = loop {
+        let suffix = if ordinal == 1 {
+            String::new()
+        } else {
+            format!("-{ordinal}")
+        };
+        let candidate = data_dir.join(format!(
+            "operation-customize.before-import-{timestamp}{suffix}.mivkeys.json"
+        ));
+        if !candidate.exists() {
+            break candidate;
+        }
+        ordinal += 1;
+    };
+    let json = crate::operation_customize_share::to_json(bundle)
+        .map_err(|error| RestoreError::ValidationFailed(error.to_string()))?;
+    std::fs::write(&path, json)?;
+    prune_operation_import_backups(data_dir)?;
+    Ok(path)
+}
+
+fn prune_operation_import_backups(data_dir: &Path) -> Result<(), RestoreError> {
+    let mut backups: Vec<_> = std::fs::read_dir(data_dir)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("operation-customize.before-import-")
+                && name.ends_with(".mivkeys.json")
+        })
+        .collect();
+    backups.sort_by_key(|entry| {
+        std::cmp::Reverse(entry.metadata().and_then(|meta| meta.modified()).ok())
+    });
+    for entry in backups.into_iter().skip(OPERATION_IMPORT_BACKUP_LIMIT) {
+        std::fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}
+
 /// 選択した世代を temp dir に「settings.db」として展開し、`SettingsDb::open` +
 /// `load_into_settings` まで通るか確認する。`Current` は実行中の DB 自身なので skip。
 ///
@@ -466,12 +560,18 @@ fn validate_backup(data_dir: &Path, source: &BackupSource) -> Result<(), Restore
 }
 
 fn validate_in_dir(tmp_base: &Path, src: &Path) -> Result<(), RestoreError> {
+    load_settings_copy_in_dir(tmp_base, src).map(|_| ())
+}
+
+fn load_settings_copy_in_dir(
+    tmp_base: &Path,
+    src: &Path,
+) -> Result<crate::settings::Settings, RestoreError> {
     let dst = tmp_base.join("settings.db");
     std::fs::copy(src, &dst).map_err(RestoreError::Io)?;
     match crate::settings_db::SettingsDb::open(tmp_base) {
         Ok(db) => db
             .load_into_settings()
-            .map(|_| ())
             .map_err(|e| RestoreError::ValidationFailed(format!("読み込み失敗: {e}"))),
         Err(e) => Err(RestoreError::ValidationFailed(format!("open 失敗: {e}"))),
     }
@@ -879,6 +979,81 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert_eq!(loaded.favorites.len(), state.favorites.len());
         let _ = report;
+    }
+
+    #[test]
+    fn load_operation_customize_extracts_three_fields_from_generation() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let mut expected = sample_settings();
+        expected.keymap.overrides = vec![crate::keymap::KeyBindingOverride {
+            action: "GridPin".to_string(),
+            chords: vec!["Ctrl+P".to_string()],
+        }];
+        expected.ring_shortcuts.mouse_ring_help_visible = false;
+        expected.menu_layout.hidden_commands = vec!["SettingsOperationCustomize".to_string()];
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&expected).unwrap();
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+
+        let bundle = load_operation_customize(dir, &BackupSource::Bak(1)).unwrap();
+        assert_eq!(bundle.keymap, expected.keymap);
+        assert_eq!(bundle.ring_shortcuts, expected.ring_shortcuts);
+        assert_eq!(bundle.menu_layout, expected.menu_layout);
+    }
+
+    #[test]
+    fn load_operation_customize_rejects_corrupted_generation_without_touching_main() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let expected = sample_settings();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&expected).unwrap();
+        }
+        std::fs::write(dir.join("settings.db.bak1"), b"NOT A SQLITE DB!").unwrap();
+
+        let error = load_operation_customize(dir, &BackupSource::Bak(1)).unwrap_err();
+        assert!(matches!(error, RestoreError::ValidationFailed(_)));
+        let db = SettingsDb::open(dir).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.favorites.len(), expected.favorites.len());
+    }
+
+    #[test]
+    fn before_import_backup_is_valid_bundle_and_retention_is_bounded() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+            &sample_settings(),
+        );
+        let first = backup_operation_customize_before_import(dir, &bundle).unwrap();
+        let text = std::fs::read_to_string(first).unwrap();
+        assert_eq!(
+            crate::operation_customize_share::parse_json(&text)
+                .unwrap()
+                .bundle
+                .keymap,
+            bundle.keymap
+        );
+
+        for _ in 0..OPERATION_IMPORT_BACKUP_LIMIT + 2 {
+            backup_operation_customize_before_import(dir, &bundle).unwrap();
+        }
+        let count = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("operation-customize.before-import-")
+            })
+            .count();
+        assert_eq!(count, OPERATION_IMPORT_BACKUP_LIMIT);
     }
 
     fn sample_settings() -> Settings {
