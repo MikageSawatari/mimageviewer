@@ -1,6 +1,6 @@
-# 仮想フォルダ (ZIP / PDF) 処理
+# 仮想フォルダ (ZIP / RAR / PDF) 処理
 
-ZIP アーカイブと PDF ドキュメントは「中身のページをフォルダ内のファイルに見立てて扱う」仮想フォルダとして実装されている。
+ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは「中身のページをフォルダ内のファイルに見立てて扱う」仮想フォルダとして実装されている。
 通常画像ファイルとの処理分岐が多く、修正漏れが起きやすい。**ZIP/PDF 対応のある機能を触るときは必ずこのドキュメントを見る**。
 
 ---
@@ -16,7 +16,7 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
 | `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
 | `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
-| `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。クリックで ZIP 変換キャッシュ経由で開く (v0.7.0) |
+| `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。RAR は worker 判定で直接閲覧または ZIP 変換キャッシュ、7z/LZH は ZIP 変換キャッシュ経由で開く |
 | `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ。`entry_name` はネストでも `"outer/ch01.zip/p.jpg"` のフルパス |
 | `ZipDir { zip_path, dir_prefix, is_archive, representative }` | ネスト ZIP を開いた中 (v1.3.0) | 「入れる」子ディレクトリ / 内側アーカイブ。Enter で降りる。仮想コンテナで実パスなし |
 | `ZipSeparator { dir_display }` | **(レガシー、現在は未生成)** | 旧フラット展開時の区切り疑似アイテム。v1.3.0 のツリーナビ化で `finalize_zip_enumerate` は生成しなくなった。variant 自体と各 match arm は後方互換で残置 |
@@ -62,7 +62,7 @@ Enter/ダブルクリック/ゲームパッド/Ctrl+↑↓(本またぎ)/Backspa
 | --- | --- | --- | --- |
 | `.zip` / **`.cbz`** | ネイティブ ZIP (変換不要で最速ブラウズ) | `ZipFile` | `folder_tree::is_zip_extension` |
 | `.pdf` | ネイティブ PDF | `PdfFile` | `ext == "pdf"` |
-| `.rar` / **`.cbr`** | クリックで ZIP 変換 | `ConvertibleArchive{Rar}` | `archive_converter::ArchiveFormat::from_extension` |
+| `.rar` / **`.cbr`** | 非ソリッドかつ入れ子なしなら直接閲覧。それ以外は ZIP 変換キャッシュ | 外側は `ConvertibleArchive{Rar}`、内側は `ZipImage` を再利用 | worker の `rar_loader::inspect_for_direct_read` + `zip_loader` 末端 dispatch |
 | `.7z` / **`.cb7`** | クリックで ZIP 変換 | `ConvertibleArchive{SevenZ}` | 同上 |
 | `.lzh` / `.lha` | クリックで ZIP 変換 | `ConvertibleArchive{Lzh}` | 同上 |
 
@@ -77,6 +77,8 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 | 外側 | 入れ子 | 挙動 |
 | --- | --- | --- |
+| 非ソリッド RAR/CBR | なし | **直接閲覧**。`GridItem::ZipImage { zip_path: 元 RAR, entry_name }` を使い、永続 ZIP キャッシュは作らない |
+| ソリッド RAR/CBR、または入れ子あり RAR/CBR | 任意 | 従来どおり ZIP 変換キャッシュを作成して閲覧 |
 | ZIP/CBZ | ZIP/CBZ のみ | 従来どおり**無変換**でネスト ZIP ツリー表示 (`entry_name` 不変、一般ケース最速) |
 | ZIP/CBZ | RAR/CBR/7z/CB7/LZH/LHA を含む | 列挙 (`enumerate_image_entries_detailed`) が `has_foreign_archives` フラグを立て、`finalize_zip_enumerate` → `offer_zip_foreign_archive_conversion` が **`ArchiveFormat::Zip` で変換ダイアログを提案**。キャンセルしても非 ZIP の中身が見えないだけでツリー閲覧は継続できる |
 | RAR/7z/LZH | 任意のアーカイブ | 変換時に**再帰展開** (従来は skip で中身が消えていた) |
@@ -110,11 +112,19 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 ### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
 
-RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<hash>\book.zip`)、以降は
-それを通常 ZIP として開く。このとき **`current_folder` はキャッシュ ZIP を指す**が、ユーザー
-視点 (address bar / BS の親 / 次回起動の復元) では **元アーカイブ** を見せる必要がある。両者は
-`archive_source_override` で橋渡しする (`open_archive_via_cache` が set、`effective_folder()` =
+ソリッド・入れ子あり・暗号化 RAR/CBR と 7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し
+(`archive_cache\<hash>\book.zip`)、以降はそれを通常 ZIP として開く。このとき **`current_folder` は
+キャッシュ ZIP を指す**が、ユーザー視点 (address bar / BS の親 / 次回起動の復元) では
+**元アーカイブ** を見せる必要がある。両者は `archive_source_override` で橋渡しする
+(`open_archive_via_cache` が set、`effective_folder()` =
 `archive_source_override.or(current_folder)`)。
+
+直接閲覧 RAR/CBR は `current_folder` 自体が元アーカイブを指し、`archive_source_override` は
+使わない。現在開いているコンテナの判定には `is_open_as_container` を使い、静的な一覧分類用
+`is_virtual_folder` は RAR を false のまま保つ。ページ DB / sidecar キーは常に
+`ZipImage.zip_path::{entry_name}` で作るため、直接閲覧は `{元 RAR}::entry`、従来の変換
+キャッシュ閲覧はリリース済みデータと互換の `{cache ZIP}::entry` になる。両経路のキー parity
+は既存データの明示 migration が必要なので、ここでは追求しない。
 
 新しく「現在のフォルダ」を永続化・ナビゲーションに使う箇所を足すときは、`current_folder` を
 直接使わず **`effective_folder()` を使う** こと。過去に漏れた実例:
@@ -146,10 +156,11 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
 
 ## 2. 仮想フォルダの展開
 
-### 2.1 ZIP を開く (`App::load_zip_as_folder`)
+### 2.1 ZIP / 直接閲覧 RAR を開く (`App::load_zip_as_folder`)
 
 ```
-1. zip_loader::enumerate_image_entries(zip_path)
+1. `zip_loader::enumerate_image_entries(zip_path)`。RAR/CBR パスでは末端 dispatch により
+   `rar_loader` の listing を使う
    - ZIP を 1 度だけ開いて全エントリをスキャン
    - **拡張子フィルタは `folder_tree::is_recognized_image_ext` に委譲**
      (ネイティブ + WIC + ロード済み Susie プラグインの対応拡張子すべて)

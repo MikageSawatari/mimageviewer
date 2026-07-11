@@ -2116,6 +2116,13 @@ impl App {
                     GridItem::Video(path) => Some(path.clone()),
                     _ => None,
                 });
+        let selected_convert_archive =
+            self.selected
+                .and_then(|idx| self.items.get(idx))
+                .and_then(|item| match item {
+                    GridItem::ConvertibleArchive { path, format } => Some((path.clone(), *format)),
+                    _ => None,
+                });
         let resolved_menu_layout = resolve_menu_layout(&self.settings.menu_layout);
         let open_folder_menu_label = self
             .keymap
@@ -2158,6 +2165,7 @@ impl App {
             .keymap
             .menu_command_label(MenuCommandId::BooksReorderCurrentBook);
         let book_manage_menu_label = self.keymap.menu_command_label(MenuCommandId::BooksManage);
+        let convert_to_zip_menu_label = self.keymap.menu_command_label(MenuCommandId::ConvertToZip);
         let video_register_upscale_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::VideoRegisterUpscale);
@@ -2205,7 +2213,7 @@ impl App {
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                let mut top_menu_responses = Vec::with_capacity(7);
+                let mut top_menu_responses = Vec::with_capacity(8);
 
                 for resolved_top_menu in &resolved_menu_layout.menus {
                     match resolved_top_menu.id {
@@ -2474,6 +2482,36 @@ impl App {
                                     }
                                     None => {
                                         ui.label(egui::RichText::new("本棚を読み込み中…").weak());
+                                    }
+                                }
+                            });
+                            top_menu_responses.push(response.response);
+                        }
+                        TopMenuId::Convert => {
+                            let commands = &resolved_top_menu.commands;
+                            let response = ui.menu_button(TopMenuId::Convert.label(), |ui| {
+                                for &command in commands {
+                                    if command != MenuCommandId::ConvertToZip {
+                                        continue;
+                                    }
+                                    let enabled = selected_convert_archive.is_some()
+                                        && self.archive_convert.is_none();
+                                    let response = ui
+                                        .add_enabled(
+                                            enabled,
+                                            egui::Button::new(&convert_to_zip_menu_label),
+                                        )
+                                        .hover_tip_disabled(
+                                            "RAR/CBR/7z/CB7/LZH/LHA ファイルを選択してください",
+                                        );
+                                    if response.clicked() {
+                                        if let Some((path, format)) =
+                                            selected_convert_archive.clone()
+                                        {
+                                            let _ = self
+                                                .request_explicit_zip_convert(path, format);
+                                        }
+                                        ui.close();
                                     }
                                 }
                             });
@@ -9213,9 +9251,8 @@ impl App {
                     self.fs_suppress_enter_close_until_release = true;
                     self.open_fullscreen(idx);
                 }
-                Some(GridItem::ConvertibleArchive { path, format }) => {
+                Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
-                    let fmt = *format;
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active
                         || self.tag_view.active
@@ -9234,23 +9271,8 @@ impl App {
                     self.record_rating_view_nav_open(&pf);
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
-                    let open_outcome = if self.settings.archive_file_handling_ignores_convertible()
-                    {
-                        self.show_feedback_toast(
-                            "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
-                        );
-                        crate::app::FolderOpenOutcome::Ignored
-                    } else if let Some(cached) = self.try_archive_cache_lookup(&pf) {
-                        if self.open_archive_via_cache(pf, cached, auto_fs) {
-                            crate::app::FolderOpenOutcome::Loaded
-                        } else {
-                            crate::app::FolderOpenOutcome::Ignored
-                        }
-                    } else if self.request_archive_convert(pf, fmt, auto_fs) {
-                        crate::app::FolderOpenOutcome::ConversionDialogOpened
-                    } else {
-                        crate::app::FolderOpenOutcome::Ignored
-                    };
+                    let open_outcome =
+                        self.load_folder_or_convert_archive_with_auto_fullscreen(pf, auto_fs);
                     match (open_outcome, search_rollback) {
                         (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                             self.attach_archive_convert_nav_history_rollback(snapshot);

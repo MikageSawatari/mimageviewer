@@ -199,7 +199,7 @@ impl From<std::io::Error> for ConvertError {
 /// `folder_tree::is_recognized_image_ext` を用いるので、ネイティブ対応拡張子に加え
 /// ロード済み Susie プラグインの対応拡張子 (PI / MAG / Q0 等) も画像として扱う。
 /// これによりフォルダ列挙・本表示での認識と RAR/7z/LZH 変換対象が一致する。
-fn is_image_entry(name: &str) -> bool {
+pub(crate) fn is_image_entry(name: &str) -> bool {
     let Some(dot) = name.rfind('.') else {
         return false;
     };
@@ -215,7 +215,7 @@ fn is_image_entry(name: &str) -> bool {
 }
 
 /// エントリ名 (アーカイブ内相対パス) が再帰展開対象の入れ子アーカイブか判定する。
-fn nested_archive_kind(name: &str) -> Option<ArchiveFormat> {
+pub(crate) fn nested_archive_kind(name: &str) -> Option<ArchiveFormat> {
     let dot = name.rfind('.')?;
     let last_sep = name
         .rfind(|c: char| c == '/' || c == '\\')
@@ -229,7 +229,7 @@ fn nested_archive_kind(name: &str) -> Option<ArchiveFormat> {
 /// `zip_loader::should_ignore` と同じ除外規則 (macOS の `__MACOSX/` リソース等)。
 /// 変換出力に書くエントリと通常 ZIP 閲覧で見えるエントリを一致させる
 /// (変換キャッシュ側だけ macOS ゴミが「本」として現れる不整合を防ぐ)。
-fn should_ignore_entry(name: &str) -> bool {
+pub(crate) fn should_ignore_entry(name: &str) -> bool {
     name.contains("__MACOSX/") || name.starts_with('.')
 }
 
@@ -432,7 +432,7 @@ fn scan_summary_zip(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
 /// 変換を実行し、`dst` に STORE モードの ZIP を生成する。
 ///
 /// - 既に `dst` が存在する場合は上書き。
-/// - 失敗 / キャンセル時は `dst` を削除してクリーンにする (途中生成物を残さない)。
+/// - 失敗 / キャンセル時は既存の `dst` を保持し、途中生成物だけを削除する。
 /// - `cancel` は各エントリ境界でチェックする。キャンセル検出時は `ConvertError::Cancelled`。
 /// - `progress` が `Some` の場合、各ファイル処理完了後に呼ぶ。
 pub fn convert_to_zip(
@@ -473,12 +473,41 @@ pub fn convert_to_zip_with_password(
         return Err(ConvertError::NoImages);
     }
 
-    // 既存の dst があれば置き換え
-    if dst.exists() {
-        let _ = std::fs::remove_file(dst);
+    if let Err(e) = replace_file_atomic(&tmp_path, dst) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(ConvertError::Io(e));
     }
-    std::fs::rename(&tmp_path, dst)?;
     Ok(summary)
+}
+
+/// Atomically publish a completed sibling temp file over `dst`.
+///
+/// The temp path is always beside `dst`, so Windows `MoveFileExW` and POSIX `rename(2)`
+/// can replace the directory entry without a delete gap. A failed replace leaves the old
+/// destination intact.
+#[cfg(windows)]
+fn replace_file_atomic(tmp_path: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    let tmp_wide: Vec<u16> = tmp_path.as_os_str().encode_wide().chain([0]).collect();
+    let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(tmp_wide.as_ptr()),
+            PCWSTR(dst_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(tmp_path: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp_path, dst)
 }
 
 fn do_convert(
@@ -978,7 +1007,10 @@ fn expand_7z(
 /// normalize_entry_name は `\`→`/`・先頭 `/` 除去を行うため、元が異なる 2 エントリが同名に
 /// なり得る。同名で複数 start_file すると read 時 by_name が 1 つしか返せず片方が不可視に
 /// なるので、両方を個別に名前解決できるようにする (v1.0.0 データ整合性レビュー DI-5)。
-fn dedup_entry_name(name: String, seen: &mut std::collections::HashSet<String>) -> String {
+pub(crate) fn dedup_entry_name(
+    name: String,
+    seen: &mut std::collections::HashSet<String>,
+) -> String {
     if seen.insert(name.clone()) {
         return name;
     }
@@ -1397,6 +1429,31 @@ mod tests {
         // 拡張子なしでも壊れない
         assert_eq!(dedup_entry_name("x".to_string(), &mut seen), "x");
         assert_eq!(dedup_entry_name("x".to_string(), &mut seen), "x (2)");
+    }
+
+    #[test]
+    fn atomic_replace_overwrites_destination_without_a_delete_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("book.zip");
+        let tmp = dir.path().join("book.zip.part");
+        std::fs::write(&dst, b"old zip").unwrap();
+        std::fs::write(&tmp, b"new zip").unwrap();
+
+        replace_file_atomic(&tmp, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new zip");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("book.zip");
+        let missing_tmp = dir.path().join("missing.zip.part");
+        std::fs::write(&dst, b"user owned zip").unwrap();
+
+        assert!(replace_file_atomic(&missing_tmp, &dst).is_err());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"user owned zip");
     }
 
     #[test]

@@ -6206,6 +6206,11 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
     );
     ui.add_space(4.0);
     ui.checkbox(
+        &mut s.skip_archive_if_zip_exists,
+        "同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示",
+    );
+    ui.add_space(4.0);
+    ui.checkbox(
         &mut s.skip_image_if_video_exists,
         "同名の動画と画像がある場合、画像をスキップ",
     );

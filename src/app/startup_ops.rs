@@ -250,7 +250,7 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     }
     match kind {
         crate::folder_tree::OpenablePathKind::File => {
-            crate::folder_tree::is_virtual_folder(openable)
+            crate::folder_tree::is_open_as_container(openable)
                 || (!settings.archive_file_handling_ignores_convertible()
                     && crate::folder_tree::is_convertible_archive_path(openable))
         }

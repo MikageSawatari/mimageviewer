@@ -126,31 +126,6 @@
 - 優先度: P2 candidate。設計・Codex レビュー済みで着手しやすい。動画まわりに触るため、
   操作カスタマイズ系 (4.x) と時期が重なる場合は presenter への同時変更に注意。
 
-### 1.5 RAR 直読み + 明示 ZIP 変換 + 同名 ZIP 優先表示
-
-- 正本: **`docs/rar-direct-read-plan.md`**（設計・実装順・触るファイル・テスト項目まで記載）。以下は要約。
-- 背景: RAR を開くたびに永続 cache ZIP を作る現状は disk 累積・二重化を生む。一般的な RAR
-  （非ソリッド・入れ子なし・画像のみ）は ZIP 同様ランダムアクセス可能なので変換せず直読みできる。
-  ソリッド / 入れ子 RAR の直読みは materialize / 一時展開 / 順次不変条件が必要で不安定化しやすいため対象外にする。
-- 確定方針（4 点）:
-  1. **RAR 直読み**: 非ソリッド かつ 入れ子アーカイブを含まない `.rar` / `.cbr` のみ直読み（cache 生成なし）。
-  2. **フォールバック**: それ以外（ソリッド RAR / 入れ子 RAR / 7z / LZH）は従来通り ZIP cache 変換で開く。
-  3. **明示変換メニュー**「変換 > ZIP ファイルに変換」: RAR/7z/LZH から**同じフォルダに同名 `.zip`** を生成
-     （cache ではなくユーザー所有の実ファイル。既存 `archive_converter::convert_to_zip` 流用）。
-  4. **同名 ZIP 優先表示**（既定 ON）: 同 basename の `.zip` と RAR/7z/LZH が並ぶとき `.zip` だけ表示。
-     既存「同名ファイル処理」設定群（`skip_zip_if_folder_exists` 等の隣）に追加。
-- 実装戦略: **道B**（`GridItem::ZipImage` を `zip_path=.rar` で再利用し、フォーマット分岐を `zip_loader` の末端 read
-  関数だけに閉じ込める）。新 `RarImage` variant を全分岐に足す道A（`ZipImage` 303 / `zip_path` 660 箇所へ波及、
-  ~1 万行）は採らない。直読み判定は `open_for_listing().is_solid()` + `nested_archive_kind` 走査で worker 内 1 回 list。
-- 主リスク（局在）: `is_virtual_folder(current_folder)` 系 ~5–10 箇所を「直読み `.rar` を開いている状態」も真と扱う
-  対応（BS / 親 / 退出ルーティング / `last_folder` 保存）。`zip_loader` dispatch の網羅性。DB キーは既存 `rar_path::entry`
-  のままで変換 cache とも parity（回転 / ★ / タグ / 補正が壊れない）。
-- 規模 / リスク: Medium / 低〜中。道B なら概ね 1,000–2,500 行、`rar_loader` / `zip_loader` / open routing /
-  同名 dedup に集中。難ケースは枯れた convert に委譲するので materialize / LRU 系の不安定さは持ち込まない。
-- 段階実装: ① フラット RAR 1 本を直読みで開く spike → ② 判定 + routing → ③ container 述語網羅 + キー parity テスト
-  → ④ 同名 ZIP 優先表示 → ⑤ 変換メニュー → ⑥ docs（`virtual-folders.md` の分岐表に RAR 直読み行を追記）。
-- 優先度: P2 candidate。着手前に `docs/virtual-folders.md`（分岐表・キー規則）と本正本を読む。
-
 ### 1.6 グリッドのソートで実フォルダ / アーカイブ類 / 画像 / 動画・音声の表示順を設定
 
 - 背景: mImageViewer 専用スレ 37。当初要望は「ソートのオプションでファイルとフォルダを
@@ -174,7 +149,7 @@
     ソート順は持っていない (`src/app.rs:12530-12542`)。
 - 方針:
   - 表示順を 4 段の表形式で設定できるようにする。対象カテゴリは
-    `実フォルダ` / `アーカイブ類 (ZIP / PDF / 変換アーカイブ。RAR 直読み追加後は RAR もここ)`
+    `実フォルダ` / `アーカイブ類 (ZIP / PDF / 変換アーカイブ / 直接閲覧 RAR)`
     / `画像` / `動画・音声`。
   - UI イメージ:
 

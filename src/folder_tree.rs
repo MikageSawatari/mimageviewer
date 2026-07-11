@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct FolderTreeOptions {
     /// 同名フォルダがある ZIP をスキップする (= `Settings.skip_zip_if_folder_exists`)。
     pub skip_zip: bool,
+    /// 同名 ZIP/CBZ がある変換アーカイブをスキップする。
+    pub skip_archive_if_zip_exists: bool,
     /// RAR/7z/LZH などの変換アーカイブをフォルダ移動候補に含める。
     pub include_convertible_archives: bool,
     /// サブフォルダ / ZIP のソート順 (= `Settings.sort_order`)。
@@ -32,6 +34,7 @@ impl FolderTreeOptions {
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
         Self {
             skip_zip: settings.skip_zip_if_folder_exists,
+            skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
             sort_order: settings.sort_order,
         }
@@ -42,6 +45,7 @@ impl Default for FolderTreeOptions {
     fn default() -> Self {
         Self {
             skip_zip: true,
+            skip_archive_if_zip_exists: true,
             include_convertible_archives: true,
             sort_order: crate::settings::SortOrder::default(),
         }
@@ -145,6 +149,13 @@ pub fn is_virtual_folder(path: &Path) -> bool {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     is_zip_extension(&ext) || ext == "pdf"
+}
+
+/// Runtime container predicate for a path already opened as a page list.
+/// Static scanning keeps RAR as `ConvertibleArchive`; only the active direct-read
+/// RAR/CBR view uses this broader predicate.
+pub fn is_open_as_container(path: &Path) -> bool {
+    is_virtual_folder(path) || crate::rar_loader::is_rar_path(path)
 }
 
 /// RAR/CBR / 7z/CB7 / LZH/LHA など、クリックで ZIP に変換してから開くアーカイブか。
@@ -671,7 +682,20 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
         }
     }
 
-    // コンテナフィルタ: 同名フォルダがあればスキップ
+    let native_zip_stems: std::collections::HashSet<String> = container_candidates
+        .iter()
+        .filter_map(|(path, _)| {
+            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            is_zip_extension(&ext).then(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("")
+                    .to_lowercase()
+            })
+        })
+        .collect();
+
+    // コンテナフィルタ: 同名フォルダ、または優先 ZIP/CBZ があればスキップ
     for (zp, mtime) in container_candidates {
         if skip_zip {
             let stem = zp
@@ -682,6 +706,17 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
             if real_folder_names.contains(&stem) {
                 continue; // スキップ
             }
+        }
+        if opts.skip_archive_if_zip_exists
+            && is_convertible_archive_path(&zp)
+            && native_zip_stems.contains(
+                &zp.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("")
+                    .to_lowercase(),
+            )
+        {
+            continue;
         }
         dirs.push((zp, mtime));
     }
@@ -832,6 +867,18 @@ mod tests {
     }
 
     #[test]
+    fn opened_container_predicate_covers_direct_read_rar_without_reclassifying_scans() {
+        for path in [r"C:\books\a.rar", r"C:\books\a.CBR"] {
+            assert!(is_open_as_container(Path::new(path)));
+            assert!(!is_virtual_folder(Path::new(path)));
+        }
+        assert!(is_open_as_container(Path::new(r"C:\books\a.zip")));
+        assert!(is_open_as_container(Path::new(r"C:\books\a.pdf")));
+        assert!(!is_open_as_container(Path::new(r"C:\books\a.7z")));
+        assert!(!is_open_as_container(Path::new(r"C:\books\a.jpg")));
+    }
+
+    #[test]
     fn convertible_archive_path_detection() {
         for ext in ["rar", "cbr", "7z", "cb7", "lzh", "lha", "RAR", "CBR"] {
             assert!(
@@ -943,6 +990,38 @@ mod tests {
                 "unexpected {ignored}: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn sorted_subdirs_prefers_same_name_zip_over_convertible_archives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in ["book.zip", "book.rar", "other.7z"] {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        let names: Vec<_> = sorted_subdirs(tmp.path(), FolderTreeOptions::default())
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(names.iter().any(|name| name == "book.zip"));
+        assert!(!names.iter().any(|name| name == "book.rar"));
+        assert!(names.iter().any(|name| name == "other.7z"));
+
+        let options = FolderTreeOptions {
+            skip_archive_if_zip_exists: false,
+            ..FolderTreeOptions::default()
+        };
+        let names: Vec<_> = sorted_subdirs(tmp.path(), options)
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(names.iter().any(|name| name == "book.zip"));
+        assert!(names.iter().any(|name| name == "book.rar"));
     }
 
     #[test]

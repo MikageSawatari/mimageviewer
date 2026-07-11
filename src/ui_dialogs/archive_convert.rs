@@ -33,9 +33,16 @@ use crate::archive_converter::{
 
 /// スキャン完了 / 変換完了通知用メッセージ。
 pub(crate) enum ArchiveConvertMsg {
-    ScanDone(Result<ArchiveImageSummary, ConvertError>),
+    ScanDone(Result<(ArchiveImageSummary, bool), ConvertError>),
     /// 変換完了。Ok なら (summary, cached_zip_path, cached_zip_size)
     ConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
+    SiblingConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveConvertDestination {
+    CacheAndOpen,
+    SiblingZip,
 }
 
 /// 進捗の共有ハンドル。変換ワーカーが書き、UI スレッドが読む。
@@ -97,6 +104,14 @@ pub(crate) struct ArchiveConvertState {
     /// 変換完了後にメイン UI がナビゲーションに使うキャッシュ ZIP パス。
     /// `update()` が毎フレーム見に行き、Some なら `load_folder` を呼んでクリアする。
     pub pending_nav: Option<PathBuf>,
+    /// Direct-readable RAR path waiting to enter the ZipImage-compatible viewer.
+    pub pending_direct_nav: Option<PathBuf>,
+    /// Probe flat non-solid RAR before falling back to conversion/cache.
+    pub allow_direct_read: bool,
+    /// Existing conversion cache, used only when the direct-read probe rejects the RAR.
+    pub fallback_cached_zip: Option<PathBuf>,
+    pub destination: ArchiveConvertDestination,
+    pub pending_sibling_output: Option<PathBuf>,
     /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
     /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
     pub nav_history_rollback: Option<crate::app::FolderNavHistorySnapshot>,
@@ -118,10 +133,25 @@ fn spawn_archive_scan(
     src: PathBuf,
     format: ArchiveFormat,
     password: Option<String>,
+    allow_direct_read: bool,
 ) -> mpsc::Receiver<ArchiveConvertMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = scan_summary_with_password(&src, format, password.as_deref());
+        let result = if allow_direct_read && format == ArchiveFormat::Rar && password.is_none() {
+            match crate::rar_loader::inspect_for_direct_read(&src) {
+                Ok(inspection) => Ok((
+                    inspection.summary,
+                    inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct,
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    scan_summary_with_password(&src, format, None).map(|summary| (summary, false))
+                }
+                Err(error) => Err(ConvertError::Archive(error.to_string())),
+            }
+        } else {
+            scan_summary_with_password(&src, format, password.as_deref())
+                .map(|summary| (summary, false))
+        };
         let _ = tx.send(ArchiveConvertMsg::ScanDone(result));
     });
     rx
@@ -146,8 +176,16 @@ fn prepare_archive_password_retry(
     Some((resume, password))
 }
 
-fn archive_convert_window_suppressed(phase: &ArchiveConvertPhase, suppress_confirm: bool) -> bool {
-    suppress_confirm && matches!(phase, ArchiveConvertPhase::Scanning)
+fn archive_convert_window_suppressed(
+    phase: &ArchiveConvertPhase,
+    suppress_confirm: bool,
+    allow_direct_read: bool,
+) -> bool {
+    (suppress_confirm || allow_direct_read) && matches!(phase, ArchiveConvertPhase::Scanning)
+}
+
+fn sibling_zip_path(src: &std::path::Path) -> PathBuf {
+    src.with_extension("zip")
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -234,7 +272,7 @@ impl App {
         if self.archive_convert.is_some() {
             return false;
         }
-        let rx = spawn_archive_scan(src.clone(), format, None);
+        let rx = spawn_archive_scan(src.clone(), format, None, false);
         let suppress_confirm = self.settings.archive_convert_suppresses_confirm();
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
@@ -244,10 +282,82 @@ impl App {
             phase: ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination: ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
             suppress_confirm,
+            suppress_confirm_next_time: false,
+        });
+        true
+    }
+
+    /// Probe a RAR on the scan worker and open it directly when eligible.
+    /// Rejected RARs continue through the unchanged conversion-cache flow.
+    pub(crate) fn request_rar_open(
+        &mut self,
+        src: PathBuf,
+        auto_fullscreen: bool,
+        fallback_cached_zip: Option<PathBuf>,
+    ) -> bool {
+        if self.settings.archive_file_handling_ignores_convertible()
+            || self.archive_convert.is_some()
+        {
+            return false;
+        }
+        let rx = spawn_archive_scan(src.clone(), ArchiveFormat::Rar, None, true);
+        self.archive_convert = Some(ArchiveConvertState {
+            src_path: src,
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: String::new(),
+            phase: ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: true,
+            fallback_cached_zip,
+            destination: ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen,
+            deferred_fullscreen: None,
+            suppress_confirm: self.settings.archive_convert_suppresses_confirm(),
+            suppress_confirm_next_time: false,
+        });
+        true
+    }
+
+    pub(crate) fn request_explicit_zip_convert(
+        &mut self,
+        src: PathBuf,
+        format: ArchiveFormat,
+    ) -> bool {
+        if self.archive_convert.is_some() || format == ArchiveFormat::Zip {
+            return false;
+        }
+        let rx = spawn_archive_scan(src.clone(), format, None, false);
+        self.archive_convert = Some(ArchiveConvertState {
+            src_path: src,
+            format,
+            password: None,
+            password_input: String::new(),
+            phase: ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination: ArchiveConvertDestination::SiblingZip,
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
         true
@@ -269,7 +379,7 @@ impl App {
         let Some(state) = self.archive_convert.as_mut() else {
             return false;
         };
-        if !state.suppress_confirm {
+        if !state.suppress_confirm && !state.allow_direct_read {
             return false;
         }
         state.deferred_fullscreen = Some(ArchiveConvertDeferredFullscreen {
@@ -300,6 +410,69 @@ impl App {
     pub(crate) fn show_archive_convert_dialog(&mut self, ctx: &egui::Context) {
         // 先にメッセージ処理 (ステート遷移)
         self.poll_archive_convert_messages();
+
+        if let Some(src) = self
+            .archive_convert
+            .as_mut()
+            .and_then(|state| state.pending_direct_nav.take())
+        {
+            let auto_fs = self
+                .archive_convert
+                .as_ref()
+                .is_some_and(|state| state.auto_fullscreen);
+            let deferred = self
+                .archive_convert
+                .as_mut()
+                .and_then(|state| state.deferred_fullscreen.take());
+            self.archive_convert = None;
+            if auto_fs {
+                self.pending_auto_fs_open = true;
+            }
+            self.load_zip_as_folder(src.clone());
+            self.advance_drilled_current_path(&src);
+            if self.favsearch.active {
+                self.update_favsearch_address();
+            }
+            if self.tag_view.active {
+                self.update_tag_view_address();
+            }
+            if let Some(deferred) = deferred {
+                let reason = self.reopen_fullscreen_after_folder_nav_load(
+                    ctx,
+                    deferred.restore_video_tile,
+                    deferred.reopen.resume_slideshow,
+                );
+                if reason == "enumerate_defer" {
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+
+        if let Some(output) = self
+            .archive_convert
+            .as_mut()
+            .and_then(|state| state.pending_sibling_output.take())
+        {
+            self.archive_convert = None;
+            let output_name = output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("ZIP")
+                .to_string();
+            self.show_feedback_toast(format!("ZIP ファイルを作成しました: {output_name}"));
+            let parent = output.parent().map(std::path::Path::to_path_buf);
+            if let Some(parent) = parent
+                && self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|current| crate::folder_tree::path_eq(current, &parent))
+            {
+                self.select_after_load = Some(output_name);
+                self.load_folder(parent);
+            }
+            return;
+        }
 
         // 変換完了後のナビゲーション処理 (別フィールドに移動して state を Drop)
         if let Some(nav) = self
@@ -397,11 +570,9 @@ impl App {
             }
         }
 
-        if self
-            .archive_convert
-            .as_ref()
-            .is_some_and(|s| archive_convert_window_suppressed(&s.phase, s.suppress_confirm))
-        {
+        if self.archive_convert.as_ref().is_some_and(|s| {
+            archive_convert_window_suppressed(&s.phase, s.suppress_confirm, s.allow_direct_read)
+        }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
@@ -427,6 +598,7 @@ impl App {
         // ZIP (入れ子アーカイブ展開、v1.3.0) は「ZIP を ZIP に変換」だと意味が通らない
         // ので展開系の文言にする。
         let is_zip_expand = state.format == ArchiveFormat::Zip;
+        let is_sibling_zip = state.destination == ArchiveConvertDestination::SiblingZip;
         let title = match &state.phase {
             ArchiveConvertPhase::Scanning => format!("{fmt_label} を読み込み中..."),
             ArchiveConvertPhase::PasswordRequired { .. } => {
@@ -502,13 +674,12 @@ impl App {
                             );
                         }
                         ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "パスワードは保存しません。変換後の ZIP キャッシュはパスワードなしで保存され、キャッシュが残っている間は次回以降そのまま開けます。",
-                            )
-                            .small()
-                            .weak(),
-                        );
+                        let password_note = if is_sibling_zip {
+                            "パスワードは保存しません。変換後の ZIP ファイルはパスワードなしで保存されます。"
+                        } else {
+                            "パスワードは保存しません。変換後の ZIP キャッシュはパスワードなしで保存され、キャッシュが残っている間は次回以降そのまま開けます。"
+                        };
+                        ui.label(egui::RichText::new(password_note).small().weak());
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(4.0);
@@ -526,7 +697,12 @@ impl App {
                         });
                     }
                     ArchiveConvertPhase::Confirm { summary } => {
-                        if is_zip_expand {
+                        if is_sibling_zip {
+                            ui.label(format!(
+                                "{fmt_label} を同じフォルダの同名 ZIP ファイルに変換します。"
+                            ));
+                            ui.label("元ファイルはそのまま残ります。同名 ZIP がある場合は上書きします。");
+                        } else if is_zip_expand {
                             ui.label(
                                 "この ZIP には RAR / 7z / LZH などのアーカイブが\
                                  入れ子になっています。",
@@ -540,11 +716,13 @@ impl App {
                                 "{fmt_label} を ZIP に変換して閲覧できるようにします。"
                             ));
                         }
-                        ui.label(
-                            "元ファイルはそのまま残り、変換したファイルが\
-                             キャッシュとして作成されます。",
-                        );
-                        ui.label("キャッシュ管理メニューから削除することができます。");
+                        if !is_sibling_zip {
+                            ui.label(
+                                "元ファイルはそのまま残り、変換したファイルが\
+                                 キャッシュとして作成されます。",
+                            );
+                            ui.label("キャッシュ管理メニューから削除することができます。");
+                        }
                         if state.format == ArchiveFormat::Rar && state.password.is_some() {
                             ui.add_space(4.0);
                             ui.label(
@@ -579,15 +757,25 @@ impl App {
                                 .color(egui::Color32::from_gray(160)),
                         );
                         ui.add_space(10.0);
-                        ui.checkbox(&mut state.suppress_confirm_next_time, "次回から表示しない");
-                        ui.add_space(6.0);
+                        if !is_sibling_zip {
+                            ui.checkbox(
+                                &mut state.suppress_confirm_next_time,
+                                "次回から表示しない",
+                            );
+                            ui.add_space(6.0);
+                        }
                         // 直下画像が 0 でも入れ子アーカイブがあれば変換する価値がある
                         // (中身の画像は変換時に展開されて初めて数えられる)。
                         let convertible =
                             summary.image_count > 0 || summary.nested_archive_count > 0;
                         ui.horizontal(|ui| {
+                            let action_label = if is_sibling_zip {
+                                "ZIP ファイルに変換"
+                            } else {
+                                "変換して開く"
+                            };
                             if ui
-                                .add_enabled(convertible, egui::Button::new("変換して開く"))
+                                .add_enabled(convertible, egui::Button::new(action_label))
                                 .clicked()
                             {
                                 start_convert = true;
@@ -703,7 +891,16 @@ impl App {
         let mut clear_deferred_fullscreen = false;
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
-                ArchiveConvertMsg::ScanDone(Ok(summary)) => {
+                ArchiveConvertMsg::ScanDone(Ok((summary, direct_read))) => {
+                    if direct_read {
+                        state.pending_direct_nav = Some(state.src_path.clone());
+                        continue;
+                    }
+                    state.allow_direct_read = false;
+                    if let Some(cached_zip) = state.fallback_cached_zip.take() {
+                        state.pending_nav = Some(cached_zip);
+                        continue;
+                    }
                     // 直下画像 0 でも入れ子アーカイブがあれば変換対象 (展開で画像が出る)。
                     if summary.image_count == 0 && summary.nested_archive_count == 0 {
                         state.phase = ArchiveConvertPhase::Error {
@@ -762,7 +959,11 @@ impl App {
                         clear_deferred_fullscreen = true;
                     }
                 }
-                ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled)) => {
+                ArchiveConvertMsg::SiblingConvertDone(Ok((_summary, output, _size))) => {
+                    state.pending_sibling_output = Some(output);
+                }
+                ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled))
+                | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::Cancelled)) => {
                     // ユーザーキャンセルならダイアログを即閉じる
                     let nav_history_rollback = state.nav_history_rollback.clone();
                     let had_deferred = state.deferred_fullscreen.is_some();
@@ -775,7 +976,8 @@ impl App {
                     }
                     return;
                 }
-                ArchiveConvertMsg::ConvertDone(Err(ConvertError::PasswordRequired)) => {
+                ArchiveConvertMsg::ConvertDone(Err(ConvertError::PasswordRequired))
+                | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::PasswordRequired)) => {
                     state.password = None;
                     state.password_input.clear();
                     state.phase = ArchiveConvertPhase::PasswordRequired {
@@ -784,7 +986,8 @@ impl App {
                     };
                     clear_deferred_fullscreen = true;
                 }
-                ArchiveConvertMsg::ConvertDone(Err(ConvertError::BadPassword)) => {
+                ArchiveConvertMsg::ConvertDone(Err(ConvertError::BadPassword))
+                | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::BadPassword)) => {
                     state.password = None;
                     state.password_input.clear();
                     state.phase = ArchiveConvertPhase::PasswordRequired {
@@ -793,7 +996,8 @@ impl App {
                     };
                     clear_deferred_fullscreen = true;
                 }
-                ArchiveConvertMsg::ConvertDone(Err(e)) => {
+                ArchiveConvertMsg::ConvertDone(Err(e))
+                | ArchiveConvertMsg::SiblingConvertDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
                         message: format!("変換失敗: {e}"),
                     };
@@ -822,7 +1026,8 @@ impl App {
         match resume {
             ArchivePasswordResume::Scan => {
                 if let Some(state) = self.archive_convert.as_mut() {
-                    state.rx = spawn_archive_scan(src, format, Some(password));
+                    state.rx = spawn_archive_scan(src, format, Some(password), false);
+                    state.allow_direct_read = false;
                     state.phase = ArchiveConvertPhase::Scanning;
                 }
             }
@@ -834,6 +1039,14 @@ impl App {
 
     /// Confirm 段階で「変換して開く」が押されたときの遷移。
     fn start_archive_convert(&mut self) {
+        if self
+            .archive_convert
+            .as_ref()
+            .is_some_and(|state| state.destination == ArchiveConvertDestination::SiblingZip)
+        {
+            self.start_sibling_zip_convert();
+            return;
+        }
         let Some(state) = self.archive_convert.as_mut() else {
             return;
         };
@@ -949,6 +1162,49 @@ impl App {
         state.phase = ArchiveConvertPhase::Converting { progress, cancel };
         state.rx = rx;
     }
+
+    fn start_sibling_zip_convert(&mut self) {
+        let Some(state) = self.archive_convert.as_mut() else {
+            return;
+        };
+        let dst = sibling_zip_path(&state.src_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(ArchiveConvertProgressShared::new());
+        let (tx, rx) = mpsc::channel();
+        let src = state.src_path.clone();
+        let format = state.format;
+        let password = state.password.clone();
+        let cancel_worker = Arc::clone(&cancel);
+        let progress_worker = Arc::clone(&progress);
+        thread::spawn(move || {
+            let cb = |p: ConvertProgress| {
+                progress_worker
+                    .files_done
+                    .store(p.files_done as u64, Ordering::Relaxed);
+                progress_worker
+                    .files_total
+                    .store(p.files_total as u64, Ordering::Relaxed);
+                progress_worker
+                    .bytes_written
+                    .store(p.bytes_written, Ordering::Relaxed);
+            };
+            let result = convert_to_zip_with_password(
+                &src,
+                &dst,
+                format,
+                password.as_deref(),
+                &cancel_worker,
+                Some(&cb),
+            )
+            .map(|summary| {
+                let size = std::fs::metadata(&dst).map_or(0, |meta| meta.len() as i64);
+                (summary, dst, size)
+            });
+            let _ = tx.send(ArchiveConvertMsg::SiblingConvertDone(result));
+        });
+        state.phase = ArchiveConvertPhase::Converting { progress, cancel };
+        state.rx = rx;
+    }
 }
 
 #[cfg(test)]
@@ -968,6 +1224,11 @@ mod tests {
             },
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination: ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -1002,31 +1263,53 @@ mod tests {
     fn suppress_confirm_hides_only_scanning_phase() {
         assert!(archive_convert_window_suppressed(
             &ArchiveConvertPhase::Scanning,
-            true
+            true,
+            false
         ));
         assert!(!archive_convert_window_suppressed(
             &ArchiveConvertPhase::Converting {
                 progress: Arc::new(ArchiveConvertProgressShared::new()),
                 cancel: Arc::new(AtomicBool::new(false)),
             },
-            true
+            true,
+            false
         ));
         assert!(!archive_convert_window_suppressed(
             &ArchiveConvertPhase::PasswordRequired {
                 message: None,
                 resume: ArchivePasswordResume::Scan,
             },
-            true
+            true,
+            false
         ));
         assert!(!archive_convert_window_suppressed(
             &ArchiveConvertPhase::Error {
                 message: "failed".to_string(),
             },
-            true
+            true,
+            false
         ));
         assert!(!archive_convert_window_suppressed(
             &ArchiveConvertPhase::Scanning,
+            false,
             false
         ));
+        assert!(archive_convert_window_suppressed(
+            &ArchiveConvertPhase::Scanning,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn explicit_conversion_uses_same_folder_and_basename() {
+        assert_eq!(
+            sibling_zip_path(std::path::Path::new(r"C:\books\Comic.CBR")),
+            PathBuf::from(r"C:\books\Comic.zip")
+        );
+        assert_eq!(
+            sibling_zip_path(std::path::Path::new(r"C:\books\set.7z")),
+            PathBuf::from(r"C:\books\set.zip")
+        );
     }
 }

@@ -10779,7 +10779,7 @@ impl App {
         let viewing_container_page = self
             .current_folder
             .as_deref()
-            .is_some_and(crate::folder_tree::is_virtual_folder)
+            .is_some_and(crate::folder_tree::is_open_as_container)
             || self.auto_open_for_current_container();
         if self.keymap.consume_action(ctx, KeyAction::FsBackToList) {
             if viewing_container_page {

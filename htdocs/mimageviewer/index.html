@@ -794,7 +794,7 @@
       <div class="feature-card">
         <div class="icon">📦</div>
         <h3>多彩なアーカイブを直読み</h3>
-        <p>ZIP / CBZ は展開不要でそのまま閲覧。RAR / CBR / 7z / CB7 / LZH も初回だけ自動変換してキャッシュし、2 回目以降は即座に開けます。パスワード付き書庫や入れ子アーカイブにも対応。</p>
+        <p>ZIP / CBZ に加え、一般的な非ソリッド・入れ子なしの RAR / CBR も変換せず閲覧。ソリッド RAR、7z、LZH、パスワード付き書庫、入れ子アーカイブは ZIP キャッシュへ変換して安定して開けます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">📷</div>
@@ -863,7 +863,8 @@
       <li><strong>お気に入りフォルダ</strong> — よく使うフォルダに名前を付けて登録</li>
       <li><strong>フォルダツリー巡回</strong> — 左ツリー表示と Ctrl+↑↓ の深さ優先フォルダ移動</li>
       <li><strong>自動索引管理</strong> — ファイル追加 / 更新 / 削除を自動監視して索引を最新に維持</li>
-      <li><strong>同名ファイル処理</strong> — 同名の書庫 + フォルダ、動画 + 画像などを自動整理</li>
+      <li><strong>同名ファイル処理</strong> — 同名 ZIP を優先し、書庫 + フォルダ、動画 + 画像なども自動整理</li>
+      <li><strong>ZIP ファイルへ変換</strong> — RAR / 7z / LZH と同じ場所へ、通常ファイルとして残る同名 ZIP を作成</li>
       <li><strong>EXIF 表示</strong> — カメラ・レンズ・露出・GPS 等の撮影情報をグループ別に表示</li>
       <li><strong>XMP ツイート情報表示</strong> — 埋め込まれたツイート ID・投稿者・本文・日時を表示</li>
       <li><strong>外部メタデータ (サイドカー)</strong> — 画像の隣の同名 JSON / テキストを読み取って表示</li>
@@ -886,7 +887,7 @@
     <p><strong>アニメーション：</strong>アニメーション GIF、APNG、Animated WebP</p>
     <p><strong>動画：</strong>MP4、AVI、MOV、MKV、WMV、MPEG（サムネイル表示 + フルスクリーン再生）</p>
     <p><strong>ドキュメント：</strong>PDF（ページごとに表示、パスワード付き対応）</p>
-    <p><strong>アーカイブ：</strong>ZIP / CBZ（展開不要でブラウズ可）、RAR / CBR / 7z / CB7 / LZH（確認後または自動で ZIP 変換。無視設定も可能）</p>
+    <p><strong>アーカイブ：</strong>ZIP / CBZ、非ソリッド・入れ子なしの RAR / CBR は直接ブラウズ。ソリッド RAR / 7z / CB7 / LZH は確認後または自動で ZIP 変換。明示的な同名 ZIP 作成にも対応</p>
     <p style="margin-top:0.5rem;"><a href="manual/formats.html">→ 対応フォーマット詳細・コーデックのインストール方法</a></p>
   </section>
 

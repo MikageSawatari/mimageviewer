@@ -737,7 +737,7 @@ pub(crate) fn active_filesystem_folder(path: &Path) -> Option<PathBuf> {
     // 入力は `App::effective_folder()`、すなわち実ディレクトリ (current_folder) か
     // ZIP/PDF/変換アーカイブを仮想フォルダ source として開いたファイルパスのいずれか。
     // 後者は拡張子で判定して親ディレクトリを返し、それ以外はディレクトリとして扱う。
-    if crate::folder_tree::is_virtual_folder(path)
+    if crate::folder_tree::is_open_as_container(path)
         || crate::folder_tree::is_convertible_archive_path(path)
     {
         return path.parent().map(Path::to_path_buf);
