@@ -83,6 +83,8 @@ pub struct SaveOptions {
     pub webp_lossless: bool,
     /// WebP lossy 品質 (0.0-100.0、既定 90.0)。`webp_lossless=true` の時は無視。
     pub webp_quality: f32,
+    /// JPEG 保存時に透過画素を合成する背景。
+    pub jpeg_matte: crate::capture::JpegMatte,
     /// 元のメタデータを保持するか。`false` ならメタデータ無しの素の画像を出力。
     pub include_metadata: bool,
     /// 呼び出し側で **既に** EXIF Orientation 通りに pixels を回転済みか。
@@ -106,6 +108,7 @@ impl Default for SaveOptions {
             jpeg_subsampling: turbojpeg::Subsamp::Sub2x2,
             webp_lossless: false,
             webp_quality: 90.0,
+            jpeg_matte: crate::capture::JpegMatte::Black,
             include_metadata: true,
             caller_applied_orientation: true,
         }
@@ -299,7 +302,7 @@ fn encode_jpeg_with_metadata(
     // RGBA → RGB (アルファは black-matte で flatten)。
     let (w, h) = (pixels.size[0] as u32, pixels.size[1] as u32);
     let rgba = color_image_to_rgba(pixels);
-    let rgb = flatten_rgba_to_rgb_black(&rgba, w);
+    let rgb = flatten_rgba_to_rgb(&rgba, w, options.jpeg_matte);
     let image = image::RgbImage::from_raw(w, h, rgb)
         .ok_or_else(|| SaveError::EncodingFailed("RGB バッファ作成失敗".into()))?;
     let jpeg_bytes = turbojpeg::compress_image(
@@ -959,25 +962,33 @@ fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
     out
 }
 
-/// 透過 RGBA を black-matte で RGB に flatten する (= JPEG 用)。
+/// 透過 RGBA を指定背景で RGB に flatten する (= JPEG 用)。
 /// 入力 RGBA は**unmultiplied** であることを前提とする (= `color_image_to_rgba` の
 /// 出力を直接渡せる)。
-fn flatten_rgba_to_rgb_black(rgba: &[u8], _width: u32) -> Vec<u8> {
+fn flatten_rgba_to_rgb(rgba: &[u8], width: u32, matte: crate::capture::JpegMatte) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.chunks_exact(4) {
+    for (index, px) in rgba.chunks_exact(4).enumerate() {
         let alpha = px[3] as u16;
         if alpha == 255 {
             rgb.extend_from_slice(&px[..3]);
             continue;
         }
-        // black matte (= 透明部は 0 black に flatten)
+        let x = index as u32 % width.max(1);
+        let y = index as u32 / width.max(1);
+        let background = matte.color_at(x, y);
         for channel in 0..3 {
             let fg = px[channel] as u16;
-            let blended = (fg * alpha + 127) / 255;
+            let bg = background[channel] as u16;
+            let blended = (fg * alpha + bg * (255 - alpha) + 127) / 255;
             rgb.push(blended as u8);
         }
     }
     rgb
+}
+
+#[cfg(test)]
+fn flatten_rgba_to_rgb_black(rgba: &[u8], width: u32) -> Vec<u8> {
+    flatten_rgba_to_rgb(rgba, width, crate::capture::JpegMatte::Black)
 }
 
 #[cfg(test)]

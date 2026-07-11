@@ -156,8 +156,6 @@ const BOOK_ADD_UNSUPPORTED_ITEM_HINT: &str =
 const BOOK_ADD_MIXED_UNSUPPORTED_HINT: &str = "画像・ページ以外が選ばれているため追加できません";
 const BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT: &str =
     "追加先に設定されている本のページは、同じ本に追加できません";
-pub(crate) const BOOK_UNBAKED_EDIT_WARNING: &str =
-    "隠蔽・消しゴム等の編集は本棚のファイルには反映されません (mIV 内でのみ表示)";
 
 fn friendly_book_add_error(err: String) -> String {
     if err.contains("最終合成の完了後")
@@ -19481,7 +19479,6 @@ impl App {
         let target_folder = crate::books::book_folder(&self.book_root_path(), &book_name);
         let mut sources = Vec::new();
         let mut errors = Vec::new();
-        let mut warn_unbaked_edits = false;
         for idx in indices {
             // ファイル名スタックの集約セルは、そのメンバー画像を 1 枚ずつ通常の Grid 追加と同じ規則
             // (同一本ページ拒否 + 色補正/非破壊回転の焼き込み) で展開する。Stack セルは
@@ -19489,7 +19486,6 @@ impl App {
             // これで「スタックを本へ追加」が「スタック解除 → メンバー全選択 → 本へ追加」と同結果になる。
             if let Some(member_paths) = self.stack_member_paths(idx) {
                 for member_path in member_paths {
-                    warn_unbaked_edits |= self.book_page_path_has_unbaked_edits(&member_path);
                     match self.book_page_source_for_stack_member(&member_path, &target_folder) {
                         Ok(source) => sources.push(source),
                         Err(err) => {
@@ -19503,7 +19499,6 @@ impl App {
                 }
                 continue;
             }
-            warn_unbaked_edits |= self.book_page_idx_has_unbaked_edits(idx);
             match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid, &target_folder) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
@@ -19517,7 +19512,7 @@ impl App {
             return;
         }
         let count = sources.len();
-        self.start_book_append_to_named(ctx, book_name.clone(), sources, warn_unbaked_edits);
+        self.start_book_append_to_named(ctx, book_name.clone(), sources);
         self.show_feedback_toast(format!("「{book_name}」へ追加中: {count} ページ"));
     }
 
@@ -19547,7 +19542,6 @@ impl App {
             return;
         }
         let active_folder = self.active_book_folder_path();
-        let warn_unbaked_edits = self.book_page_idx_has_unbaked_edits(fs_idx);
         let source = match self.book_page_source_for_idx(
             ctx,
             fs_idx,
@@ -19561,7 +19555,7 @@ impl App {
             }
         };
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, vec![source], warn_unbaked_edits);
+        self.start_book_append_to_named(ctx, book_name, vec![source]);
         self.show_feedback_toast("追加先の本へ追加中".to_string());
     }
 
@@ -19621,10 +19615,11 @@ impl App {
 
     /// スタックメンバー (集約ビューでは `items` に現れない実ファイル) を、通常の Grid 追加と同じ規則で
     /// `BookPageSource` へ変換する。`book_page_source_for_idx` の Image + Grid 分岐をパスベースで再現:
-    /// 同一本ページは拒否し、色補正/非破壊回転があれば `AdjustedFile` に焼き込む。idx を持たないので
-    /// params / rotation は各 DB をパスキーで直接引く (= スタック解除 → メンバー選択 → 追加と同結果)。
+    /// 同一本ページは拒否し、編集があれば `Composited` に焼き込む。idx を持たないので
+    /// params / rotation / edit snapshot は各 DB をパスキーで直接引く
+    /// (= スタック解除 → メンバー選択 → 追加と同結果)。
     fn book_page_source_for_stack_member(
-        &self,
+        &mut self,
         path: &std::path::Path,
         target_book_folder: &std::path::Path,
     ) -> Result<crate::books::BookPageSource, String> {
@@ -19633,15 +19628,12 @@ impl App {
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "page".to_string());
-        // 本ページは同一本なら拒否、別本なら生コピー (book_page_source_for_idx と同じ)。
+        // 同じ本への自己追加だけを拒否する。別本のページも後段編集があれば通常画像と
+        // 同じ full composite 判定へ通す。
         if let Some(book_folder) = self.compiled_book_page_folder(path) {
             if crate::folder_tree::path_eq(&book_folder, target_book_folder) {
                 return Err(BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string());
             }
-            return Ok(crate::books::BookPageSource::File {
-                src: path.to_path_buf(),
-                original_name,
-            });
         }
         let key = crate::adjustment_db::normalize_path(path);
         let rotation = self
@@ -19650,21 +19642,38 @@ impl App {
             .and_then(|db| db.get_key(&key))
             .unwrap_or(crate::rotation_db::Rotation::None);
         let params = self.stack_member_effective_params(path, &key);
-        if params.is_color_identity() && rotation.is_none() {
+        let has_export_crop = self
+            .export_crop_db
+            .as_ref()
+            .and_then(|db| db.get(&key))
+            .is_some();
+        let needs_composite = crate::books::page_requires_full_composite(
+            &params,
+            rotation,
+            self.conceal_page_keys.contains(&key),
+            self.mask_page_keys.contains(&key),
+            self.local_adjust_page_keys.contains(&key),
+            self.comic_page_keys.contains(&key),
+            has_export_crop,
+        );
+        if !needs_composite {
             Ok(crate::books::BookPageSource::File {
                 src: path.to_path_buf(),
                 original_name,
             })
         } else {
-            Ok(crate::books::BookPageSource::AdjustedFile {
-                src: path.to_path_buf(),
-                original_name,
-                params,
-                rotation,
-                format: self.settings.capture_format,
-                jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
-                    self.fs_transparent_bg_mode,
-                ),
+            let edits = self.book_baked_edit_snapshot(&key, None, params, rotation)?;
+            let basename = std::path::Path::new(&original_name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("page")
+                .to_string();
+            Ok(crate::books::BookPageSource::Composited {
+                source: crate::books::CompositeSource::File {
+                    path: path.to_path_buf(),
+                },
+                basename,
+                edits,
             })
         }
     }
@@ -19694,26 +19703,164 @@ impl App {
         self.settings.global_preset.clone()
     }
 
-    fn book_page_key_has_unbaked_edits(&self, key: &str) -> bool {
-        self.conceal_page_keys.contains(key)
-            || self.mask_page_keys.contains(key)
-            || self.local_adjust_page_keys.contains(key)
-            || self.comic_page_keys.contains(key)
+    fn book_mask_snapshot(
+        bitmap: Vec<bool>,
+        shapes: Vec<crate::mask_db::Shape>,
+        size: [usize; 2],
+    ) -> crate::books::BookMaskSnapshot {
+        crate::books::BookMaskSnapshot {
+            bitmap,
+            shapes,
+            size,
+        }
     }
 
-    fn book_page_path_has_unbaked_edits(&self, path: &std::path::Path) -> bool {
-        let key = crate::adjustment_db::normalize_path(path);
-        self.book_page_key_has_unbaked_edits(&key)
-    }
+    fn book_baked_edit_snapshot(
+        &mut self,
+        key: &str,
+        idx: Option<usize>,
+        params: crate::adjustment::AdjustParams,
+        rotation: crate::rotation_db::Rotation,
+    ) -> Result<crate::books::BakedEditSnapshot, String> {
+        let has_conceal = self.conceal_page_keys.contains(key);
+        let has_erase = self.mask_page_keys.contains(key);
+        let has_local_adjust = self.local_adjust_page_keys.contains(key);
+        let has_comic = self.comic_page_keys.contains(key);
 
-    fn book_page_idx_has_unbaked_edits(&self, idx: usize) -> bool {
-        self.page_path_key(idx)
-            .is_some_and(|key| self.book_page_key_has_unbaked_edits(&key))
+        let conceal = if has_conceal {
+            let db = self
+                .conceal_db
+                .as_ref()
+                .ok_or_else(|| "隠蔽加工データを読み取れません".to_string())?;
+            let size = db
+                .dimensions(key)
+                .ok_or_else(|| "隠蔽加工マスクのサイズを読み取れません".to_string())?;
+            let (bitmap, shapes) = db
+                .get_full(key, size[0], size[1])
+                .ok_or_else(|| "隠蔽加工マスクを読み取れません".to_string())?;
+            Some(crate::books::BookConcealSnapshot {
+                mask: Self::book_mask_snapshot(bitmap, shapes, size),
+                preset: self.current_conceal_preset_from_settings(),
+            })
+        } else {
+            None
+        };
+
+        let erase_mask = if has_erase {
+            let db = self
+                .mask_db
+                .as_ref()
+                .ok_or_else(|| "消しゴムデータを読み取れません".to_string())?;
+            let size = db
+                .dimensions(key)
+                .ok_or_else(|| "消しゴムマスクのサイズを読み取れません".to_string())?;
+            let (bitmap, shapes) = db
+                .get_full(key, size[0], size[1])
+                .ok_or_else(|| "消しゴムマスクを読み取れません".to_string())?;
+            Some(Self::book_mask_snapshot(bitmap, shapes, size))
+        } else {
+            None
+        };
+
+        let local_adjust = if has_local_adjust {
+            if let Some(idx) = idx {
+                self.ensure_local_adjust_layers_loaded(idx);
+                self.local_adjust_page_layers.get(&idx).cloned()
+            } else {
+                self.local_adjust_db
+                    .as_ref()
+                    .and_then(|db| db.get_layers(key))
+            }
+            .filter(|layers| !layers.is_empty())
+            .ok_or_else(|| "補正レイヤーを読み取れません".to_string())?
+            .into()
+        } else {
+            None
+        };
+
+        let comic = if has_comic {
+            let objects = if idx.is_some() {
+                self.ensure_comic_doc_loaded(key);
+                self.comic_docs.get(key).cloned()
+            } else {
+                self.comic_db.as_ref().and_then(|db| db.get(key))
+            }
+            .filter(|objects| !objects.is_empty())
+            .ok_or_else(|| "テキスト注釈を読み取れません".to_string())?;
+            let fonts = self
+                .ensure_comic_fonts_for(&objects)
+                .ok_or_else(|| "テキスト注釈用フォントを読み取れません".to_string())?;
+            Some(crate::books::BookComicSnapshot {
+                objects,
+                fonts,
+                stamp_cache: self.comic_stamp_cache.clone(),
+            })
+        } else {
+            None
+        };
+        let comic_source_dims = idx.and_then(|idx| {
+            self.source_dims_for_idx(idx)
+                .map(|(width, height)| [width.round() as usize, height.round() as usize])
+        });
+
+        let export_crop = if let Some(idx) = idx {
+            self.export_crop_page_settings
+                .get(&idx)
+                .map(|settings| settings.rect)
+        } else {
+            self.export_crop_db
+                .as_ref()
+                .and_then(|db| db.get(key))
+                .map(|settings| settings.rect)
+        };
+        let crop_source_dims = idx.and_then(|idx| {
+            self.current_raw_source_pixels(idx)
+                .map(|pixels| pixels.size)
+        });
+
+        let erase = erase_mask.map(|mask| {
+            self.ensure_ai_runtime();
+            let runtime = self.ai_runtime.clone();
+            let manager = Arc::clone(&self.ai_model_manager);
+            let run: crate::books::BookEraseRunner =
+                Box::new(move |base, bitmap, shapes, cancel| {
+                    let result = crate::ui_erase::erase_from_saved_mask(
+                        runtime.as_ref(),
+                        &manager,
+                        base,
+                        bitmap,
+                        shapes,
+                        cancel,
+                        "book-composite",
+                    )?;
+                    Ok(crate::books::BookEraseResult {
+                        image: result.image,
+                        used_diffusion_fallback: result.used_diffusion_fallback,
+                    })
+                });
+            crate::books::BookEraseSnapshot { mask, run }
+        });
+
+        Ok(crate::books::BakedEditSnapshot {
+            params,
+            rotation,
+            conceal,
+            erase,
+            local_adjust,
+            comic,
+            comic_source_dims,
+            export_crop,
+            crop_source_dims,
+            format: self.settings.capture_format,
+            jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
+                self.fs_transparent_bg_mode,
+            ),
+        })
     }
 
     fn book_page_source_for_idx(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         idx: usize,
         mode: BookAddMode,
         target_book_folder: &std::path::Path,
@@ -19723,154 +19870,104 @@ impl App {
             .get(idx)
             .cloned()
             .ok_or_else(|| "このアイテムは追加できません".to_string())?;
+        if matches!(item, GridItem::Video(_)) {
+            return Err(if mode == BookAddMode::Grid {
+                BOOK_GRID_VIDEO_HINT.to_string()
+            } else {
+                "動画は再生中のフレーム追加を使ってください".to_string()
+            });
+        }
         if let GridItem::Image(path) = &item
             && let Some(book_folder) = self.compiled_book_page_folder(path)
         {
             if crate::folder_tree::path_eq(&book_folder, target_book_folder) {
                 return Err(BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string());
             }
-            let original_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "page".to_string());
-            return Ok(crate::books::BookPageSource::File {
-                src: path.clone(),
-                original_name,
-            });
         }
-        let needs_render = match mode {
-            BookAddMode::Grid => false,
-            BookAddMode::Fullscreen => self.book_page_needs_render_fullscreen(idx, &item),
-        };
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムは追加できません".to_string())?;
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let needs_composite = crate::books::page_requires_full_composite(
+            &params,
+            rotation,
+            self.conceal_page_keys.contains(&key),
+            self.mask_page_keys.contains(&key),
+            self.local_adjust_page_keys.contains(&key),
+            self.comic_page_keys.contains(&key),
+            self.export_crop_pages.contains(&idx),
+        );
         match item {
-            GridItem::Image(path) if mode == BookAddMode::Grid => {
+            GridItem::Image(path) => {
                 let original_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "page".to_string());
-                let params = self.effective_params(idx).clone();
-                let rotation = self.get_rotation(idx);
-                if params.is_color_identity() && rotation.is_none() {
+                if !needs_composite {
                     Ok(crate::books::BookPageSource::File {
                         src: path,
                         original_name,
                     })
                 } else {
-                    Ok(crate::books::BookPageSource::AdjustedFile {
-                        src: path,
-                        original_name,
-                        params,
-                        rotation,
-                        format: self.settings.capture_format,
-                        jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
-                            self.fs_transparent_bg_mode,
-                        ),
+                    let basename = std::path::Path::new(&original_name)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("page")
+                        .to_string();
+                    let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                    Ok(crate::books::BookPageSource::Composited {
+                        source: crate::books::CompositeSource::File { path },
+                        basename,
+                        edits,
                     })
                 }
             }
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
-            } if mode == BookAddMode::Grid => {
+            } => {
                 let original_name = crate::zip_loader::entry_basename(&entry_name).to_string();
-                let params = self.effective_params(idx).clone();
-                let rotation = self.get_rotation(idx);
-                if params.is_color_identity() && rotation.is_none() {
+                if !needs_composite {
                     Ok(crate::books::BookPageSource::ZipEntry {
                         zip_path,
                         entry_name,
                         original_name,
                     })
                 } else {
-                    Ok(crate::books::BookPageSource::AdjustedZipEntry {
-                        zip_path,
-                        entry_name,
-                        original_name,
-                        params,
-                        rotation,
-                        format: self.settings.capture_format,
-                        jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
-                            self.fs_transparent_bg_mode,
-                        ),
+                    let basename = std::path::Path::new(&original_name)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("page")
+                        .to_string();
+                    let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                    Ok(crate::books::BookPageSource::Composited {
+                        source: crate::books::CompositeSource::ZipEntry {
+                            zip_path,
+                            entry_name,
+                        },
+                        basename,
+                        edits,
                     })
                 }
             }
             GridItem::PdfPage {
                 pdf_path, page_num, ..
-            } if mode == BookAddMode::Grid => {
-                let params = self.effective_params(idx).clone();
-                let rotation = self.get_rotation(idx);
-                Ok(crate::books::BookPageSource::AdjustedPdfPage {
-                    pdf_path,
-                    page_num,
-                    password: self.pdf_current_password.clone(),
+            } => {
+                let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                Ok(crate::books::BookPageSource::Composited {
+                    source: crate::books::CompositeSource::PdfPage {
+                        pdf_path,
+                        page_num,
+                        password: self.pdf_current_password.clone(),
+                    },
                     basename: format!("page_{:04}", page_num + 1),
-                    params,
-                    rotation,
-                    format: self.settings.capture_format,
-                    jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
-                        self.fs_transparent_bg_mode,
-                    ),
+                    edits,
                 })
-            }
-            GridItem::Image(path) if !needs_render => {
-                let original_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "page".to_string());
-                Ok(crate::books::BookPageSource::File {
-                    src: path,
-                    original_name,
-                })
-            }
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } if !needs_render => {
-                let original_name = crate::zip_loader::entry_basename(&entry_name).to_string();
-                Ok(crate::books::BookPageSource::ZipEntry {
-                    zip_path,
-                    entry_name,
-                    original_name,
-                })
-            }
-            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-                self.ensure_export_erase_ready(ctx, &[idx])?;
-                self.ensure_export_local_adjust_ready(ctx, &[idx])?;
-                let job = self.prepare_capture_pixel_job(ctx, idx)?;
-                let format = self.settings.capture_format;
-                let jpeg_matte = crate::capture::JpegMatte::from_fs_transparent_bg_mode(
-                    self.fs_transparent_bg_mode,
-                );
-                Ok(crate::books::BookPageSource::Rendered {
-                    work: crate::capture::CapturePixelWork::Single(job),
-                    format,
-                    jpeg_matte,
-                })
-            }
-            GridItem::Video(_) if mode == BookAddMode::Grid => {
-                Err(BOOK_GRID_VIDEO_HINT.to_string())
             }
             _ => Err("このアイテムは本へ追加できません".to_string()),
         }
-    }
-
-    fn book_page_needs_render_fullscreen(&mut self, idx: usize, item: &GridItem) -> bool {
-        let params_need_render = !self.effective_params(idx).is_identity();
-        matches!(item, GridItem::PdfPage { .. })
-            || params_need_render
-            || self.adjustment_page_params.contains_key(&idx)
-            || self.local_adjust_pages.contains(&idx)
-            || self.mask_pages.contains(&idx)
-            || self.conceal_pages.contains(&idx)
-            || self.comic_pages.contains(&idx)
-            || self.export_crop_pages.contains(&idx)
-            || !self.get_rotation(idx).is_none()
-            || self.ai_upscale_enabled
-            || self.ai_denoise_model.is_some()
     }
 
     pub(crate) fn idx_is_compiled_book_page(&self, idx: usize) -> bool {

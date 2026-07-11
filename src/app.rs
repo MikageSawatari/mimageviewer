@@ -6660,7 +6660,6 @@ pub struct App {
     pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
     /// 進行中の Append 元に、ファイルへ未焼き込みの編集が含まれるか。
     /// Append 成功後の警告トーストを 1 回に集約するため、単一 book worker と同じ寿命で保持する。
-    pub(crate) book_append_warn_unbaked_edits: bool,
     pub(crate) show_book_manager: bool,
     pub(crate) book_manager_new_name: String,
     pub(crate) book_manager_rename_name: String,
@@ -9548,7 +9547,6 @@ impl App {
             capture_pending: None,
             capture_region_selection: None,
             book_op_pending: None,
-            book_append_warn_unbaked_edits: false,
             show_book_manager: false,
             book_manager_new_name: String::new(),
             book_manager_rename_name: String::new(),
@@ -21710,7 +21708,7 @@ impl App {
         sources: Vec<crate::books::BookPageSource>,
     ) {
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, sources, false);
+        self.start_book_append_to_named(ctx, book_name, sources);
     }
 
     /// `start_book_append` の本名指定版 (ツールバーのピン留め本へ追加する用)。
@@ -21719,18 +21717,15 @@ impl App {
         ctx: &egui::Context,
         book_name: String,
         sources: Vec<crate::books::BookPageSource>,
-        warn_unbaked_edits: bool,
     ) {
         if sources.is_empty() {
             self.show_feedback_toast("追加するページがありません".to_string());
             return;
         }
         let root = self.book_root_path();
-        if self.start_book_op(ctx, "book-append", move || {
+        self.start_book_op(ctx, "book-append", move || {
             crate::books::append_pages(root, book_name, sources)
-        }) {
-            self.book_append_warn_unbaked_edits = warn_unbaked_edits;
-        }
+        });
     }
 
     pub(crate) fn start_book_reorder_flush(
@@ -21805,6 +21800,21 @@ impl App {
             self.copy_book_page_edit_key(&from, &to, &mut errors);
         }
         self.finish_book_page_edit_mapping("copy", errors);
+    }
+
+    pub(crate) fn apply_book_page_semantic_copies(
+        &mut self,
+        mappings: &[crate::books::BookPathMapping],
+    ) {
+        let mappings = Self::normalized_book_page_edit_mappings(mappings);
+        if mappings.is_empty() {
+            return;
+        }
+        let mut errors = Vec::new();
+        for (from, to) in mappings {
+            self.copy_book_page_semantic_key(&from, &to, &mut errors);
+        }
+        self.finish_book_page_semantic_mapping(errors);
     }
 
     pub(crate) fn apply_book_page_edit_moves(
@@ -21903,6 +21913,19 @@ impl App {
         }
     }
 
+    fn copy_book_page_semantic_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
+        if let Some(db) = &self.rating_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("rating: {e}"));
+        }
+        if let Some(db) = self.tags_db.as_mut()
+            && let Err(e) = db.copy_item_key(from, to)
+        {
+            errors.push(format!("tags: {e}"));
+        }
+    }
+
     fn move_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
         if let Some(db) = &self.adjustment_db {
             match db.move_page_params_key(from, to) {
@@ -21949,6 +21972,29 @@ impl App {
         {
             errors.push(format!("tags: {e}"));
         }
+    }
+
+    fn finish_book_page_semantic_mapping(&mut self, errors: Vec<String>) {
+        self.rating_cache.clear();
+        self.invalidate_rating_counts_cache();
+        self.tags_cache.clear();
+        if errors.is_empty() {
+            return;
+        }
+        let preview = errors
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" / ");
+        crate::logger::log(format!(
+            "book page semantic metadata copy partially failed ({}): {preview}",
+            errors.len()
+        ));
+        self.show_feedback_toast(format!(
+            "本ページの評価・タグの引き継ぎに一部失敗しました ({} 件)",
+            errors.len()
+        ));
     }
 
     fn finish_book_page_edit_mapping(&mut self, op: &str, errors: Vec<String>) {
@@ -22016,10 +22062,10 @@ impl App {
             }
         };
         self.book_op_pending = None;
-        let warn_unbaked_edits = std::mem::take(&mut self.book_append_warn_unbaked_edits);
         match result {
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 self.apply_book_page_edit_copies(&summary.edit_copies);
+                self.apply_book_page_semantic_copies(&summary.semantic_copies);
                 self.book_list_cache = None;
                 if self
                     .current_folder
@@ -22034,13 +22080,13 @@ impl App {
                     summary.added,
                     summary.folder.display()
                 ));
-                if warn_unbaked_edits {
+                if summary.erase_fallback_pages > 0 {
                     self.show_feedback_toast_with_duration(
                         format!(
-                            "「{}」に {} ページ追加しました\n{}",
+                            "「{}」に {} ページ追加しました\n{} ページの消しゴム補完は簡易処理で再作成しました",
                             summary.book_name,
                             summary.added,
-                            crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING
+                            summary.erase_fallback_pages,
                         ),
                         4.5,
                     );
@@ -44036,35 +44082,7 @@ impl App {
         Vec<(String, Option<Arc<comic_core::RgbaOverlay>>)>,
         f64,
     ) {
-        use comic_core::AnnotationKind;
-        use std::sync::atomic::Ordering::Relaxed;
-
-        let mut images = comic_core::StampImages::new();
-        let mut updates = Vec::new();
-        let mut decode_ms = 0.0;
-        for o in objects {
-            if cancel.load(Relaxed) {
-                break;
-            }
-            let AnnotationKind::Stamp(stamp) = &o.kind else {
-                continue;
-            };
-            let key = crate::comic_stamp::stamp_source_key(&stamp.source);
-            let entry = if let Some(entry) = cache.get(&key) {
-                entry.clone()
-            } else {
-                let t_decode = std::time::Instant::now();
-                let decoded = crate::comic_stamp::load_stamp_image(&stamp.source).map(Arc::new);
-                decode_ms += t_decode.elapsed().as_secs_f64() * 1000.0;
-                cache.insert(key.clone(), decoded.clone());
-                updates.push((key, decoded.clone()));
-                decoded
-            };
-            if let Some(img) = entry {
-                images.insert(o.id, img);
-            }
-        }
-        (images, updates, decode_ms)
+        crate::comic_stamp::build_stamp_images_from_cache_snapshot(objects, cache, cancel)
     }
 
     pub(crate) fn ensure_comic_composite_texture(

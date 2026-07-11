@@ -39,6 +39,7 @@ pub mod changelog_markdown;
 pub mod color_search;
 pub mod comic_db;
 pub mod comic_overlay;
+pub mod comic_stamp;
 pub mod compare_wgpu;
 pub mod conceal;
 pub mod conceal_compose;

@@ -100,6 +100,22 @@ impl ConcealDb {
         Some((mask, shapes))
     }
 
+    /// 保存時のマスク寸法を返す。製本用 snapshot はこの寸法の `get_full` 結果を
+    /// UI thread で取り込み、worker 側で decode 後の実寸へ合わせる。
+    pub fn dimensions(&self, key: &str) -> Option<[usize; 2]> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT bitmap_w, bitmap_h FROM conceal_entries WHERE page_path = ?1")
+            .ok()?;
+        stmt.query_row([key], |row| {
+            Ok([
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+            ])
+        })
+        .ok()
+    }
+
     /// マスク + ベクタを保存する。ビットマップが全 false でベクタも空なら削除する。
     pub fn set(
         &self,

@@ -28,7 +28,7 @@ impl JpegMatte {
         }
     }
 
-    fn color_at(self, x: u32, y: u32) -> [u8; 3] {
+    pub(crate) fn color_at(self, x: u32, y: u32) -> [u8; 3] {
         match self {
             Self::Black => [0, 0, 0],
             Self::White => [255, 255, 255],
@@ -58,7 +58,7 @@ impl CaptureFormat {
         }
     }
 
-    fn jpeg_quality(self) -> Option<u8> {
+    pub(crate) fn jpeg_quality(self) -> Option<u8> {
         match self {
             Self::Png => None,
             Self::Jpeg95 => Some(95),

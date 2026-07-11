@@ -7975,91 +7975,65 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn grid_book_add_warns_for_each_unbaked_edit_kind() {
+    fn grid_book_add_bakes_conceal_into_output() {
         use crate::grid_item::{GridItem, ThumbnailState};
 
-        for edit_kind in ["conceal", "mask", "local_adjust", "comic"] {
-            let mut app = setup_app();
-            let src = app.tmp.path().join(format!("{edit_kind}.jpg"));
-            let root = app.tmp.path().join("books");
-            std::fs::write(&src, b"book warning source").expect("write source bytes");
-            app.settings.book_root = Some(root);
-            app.settings.active_book_name = "target".to_string();
-            app.items = vec![GridItem::Image(src)];
-            app.thumbnails = vec![ThumbnailState::Pending];
-            app.selected = Some(0);
-            app.rebuild_visible_indices();
-            let key = app.page_path_key(0).expect("page path key");
-            match edit_kind {
-                "conceal" => {
-                    app.conceal_page_keys.insert(key);
-                }
-                "mask" => {
-                    app.mask_page_keys.insert(key);
-                }
-                "local_adjust" => {
-                    app.local_adjust_page_keys.insert(key);
-                }
-                "comic" => {
-                    app.comic_page_keys.insert(key);
-                }
-                _ => unreachable!(),
-            }
+        let mut app = setup_app();
+        let src = app.tmp.path().join("conceal.png");
+        let root = app.tmp.path().join("books");
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        image.save(&src).expect("write source image");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+        app.settings.conceal_type = crate::conceal::ConcealType::BlackFill;
+        app.items = vec![GridItem::Image(src)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+        let key = app.page_path_key(0).expect("page path key");
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &[true, false], &[], 2, 1)
+            .expect("save conceal mask");
+        app.conceal_page_keys.insert(key);
 
-            let ctx = egui::Context::default();
-            app.add_grid_selection_to_active_book(&ctx);
-            assert!(
-                app.book_append_warn_unbaked_edits,
-                "{edit_kind} の path key で警告 pending が立つ"
-            );
-            wait_for_book_op(&mut app, &ctx);
-            assert!(!app.book_append_warn_unbaked_edits);
-            assert!(
-                app.fs_feedback_toast.as_ref().is_some_and(|toast| toast
-                    .0
-                    .contains(crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING)),
-                "{edit_kind} の追加完了トーストに未焼き込み警告を含める"
-            );
-        }
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let output = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .next()
+            .expect("output entry")
+            .expect("output path")
+            .path();
+        let output = image::open(output).expect("decode baked output").to_rgba8();
+        assert_eq!(output.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(output.get_pixel(1, 0).0, [255, 0, 0, 255]);
     }
 
     #[test]
-    fn grid_book_add_does_not_warn_for_adjustment_only_or_no_edit() {
+    fn grid_book_add_clean_page_has_plain_success_toast() {
         use crate::grid_item::{GridItem, ThumbnailState};
 
-        for adjustment_only in [false, true] {
-            let mut app = setup_app();
-            let src = app.tmp.path().join(if adjustment_only {
-                "adjustment-only.jpg"
-            } else {
-                "no-edit.jpg"
-            });
-            let root = app.tmp.path().join("books");
-            std::fs::write(&src, b"book no-warning source").expect("write source bytes");
-            app.settings.book_root = Some(root);
-            app.settings.active_book_name = "target".to_string();
-            app.items = vec![GridItem::Image(src)];
-            app.thumbnails = vec![ThumbnailState::Pending];
-            app.selected = Some(0);
-            app.rebuild_visible_indices();
-            if adjustment_only {
-                let key = app.page_path_key(0).expect("page path key");
-                app.adjusted_page_keys.insert(key);
-            }
+        let mut app = setup_app();
+        let src = app.tmp.path().join("no-edit.jpg");
+        let root = app.tmp.path().join("books");
+        std::fs::write(&src, b"book no-warning source").expect("write source bytes");
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "target".to_string();
+        app.items = vec![GridItem::Image(src)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
 
-            let ctx = egui::Context::default();
-            app.add_grid_selection_to_active_book(&ctx);
-            assert!(
-                !app.book_append_warn_unbaked_edits,
-                "補正のみ・無編集では未焼き込み警告 pending を立てない"
-            );
-            wait_for_book_op(&mut app, &ctx);
-            assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
-                !toast
-                    .0
-                    .contains(crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING)
-            }));
-        }
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("1 ページ追加しました") && !toast.0.contains("簡易処理で再作成")
+        }));
     }
 
     #[test]
@@ -8113,15 +8087,8 @@ mod favorite_adjustment_defaults_tests {
         app.stack_showing_flat = false;
         app.selected = Some(0);
         app.rebuild_visible_indices();
-        app.conceal_page_keys
-            .insert(crate::adjustment_db::normalize_path(&p1));
-
         let ctx = egui::Context::default();
         app.add_grid_selection_to_active_book(&ctx);
-        assert!(
-            app.book_append_warn_unbaked_edits,
-            "items に無い stack member も path key で警告対象にする"
-        );
         wait_for_book_op(&mut app, &ctx);
 
         let outputs = std::fs::read_dir(root.join("target"))
@@ -8132,12 +8099,6 @@ mod favorite_adjustment_defaults_tests {
             outputs.len(),
             2,
             "スタックの全メンバー (2 枚) が本へ追加される"
-        );
-        assert!(
-            app.fs_feedback_toast.as_ref().is_some_and(|toast| toast
-                .0
-                .contains(crate::ui_fullscreen::BOOK_UNBAKED_EDIT_WARNING)),
-            "複数ページ追加でも警告は完了トースト 1 本へ集約する"
         );
     }
 
@@ -8353,6 +8314,79 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(
             std::fs::read(&outputs[0]).expect("read copied page"),
             b"compiled book page bytes"
+        );
+    }
+
+    #[test]
+    fn grid_book_add_composited_cross_book_page_copies_only_rating_and_tags() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books");
+        let source_book = root.join("source");
+        let page = source_book.join("0001_page.png");
+        std::fs::create_dir_all(&source_book).expect("create source book");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&page)
+            .expect("write source book page");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+        app.settings.conceal_type = crate::conceal::ConcealType::BlackFill;
+        app.items = vec![GridItem::Image(page.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+
+        let source_key = crate::adjustment_db::normalize_path(&page);
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&source_key, &[true, false], &[], 2, 1)
+            .expect("save conceal mask");
+        app.conceal_page_keys.insert(source_key.clone());
+        app.rating_db
+            .as_ref()
+            .expect("rating db")
+            .set(&source_key, 4)
+            .expect("save source rating");
+        app.tags_db
+            .as_mut()
+            .expect("tags db")
+            .set_item_tags(&source_key, ["cross-book"], "test")
+            .expect("save source tag");
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let output = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .next()
+            .expect("output entry")
+            .expect("output path")
+            .path();
+        let output_key = crate::adjustment_db::normalize_path(&output);
+        assert_eq!(
+            app.rating_db.as_ref().expect("rating db").get(&output_key),
+            4
+        );
+        assert_eq!(
+            app.tags_db
+                .as_ref()
+                .expect("tags db")
+                .get_item_tags(&output_key)
+                .into_iter()
+                .map(|tag| tag.tag)
+                .collect::<Vec<_>>(),
+            vec!["cross-book"]
+        );
+        assert!(
+            app.conceal_db
+                .as_ref()
+                .expect("conceal db")
+                .dimensions(&output_key)
+                .is_none(),
+            "conceal must be baked, not copied as an edit store"
         );
     }
 

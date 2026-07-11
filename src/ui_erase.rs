@@ -132,6 +132,19 @@ fn erase_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32
     (full_rect.max.y - panel_pos.y - PANEL_BOTTOM_MARGIN).max(PANEL_MIN_BODY_H + 40.0)
 }
 
+/// 透明部を黒背景へ合成して全面不透明にする消しゴム入力の共通変換。
+pub(crate) fn black_flatten_if_transparent(img: &egui::ColorImage) -> Option<egui::ColorImage> {
+    if img.pixels.iter().all(|pixel| pixel.a() == 255) {
+        return None;
+    }
+    let pixels = img
+        .pixels
+        .iter()
+        .map(|pixel| egui::Color32::from_rgba_premultiplied(pixel.r(), pixel.g(), pixel.b(), 255))
+        .collect();
+    Some(egui::ColorImage::new(img.size, pixels))
+}
+
 /// Undo スタックの最大エントリ数。
 const UNDO_MAX: usize = 20;
 
@@ -150,15 +163,7 @@ impl App {
     /// MI-GAN は alpha を扱えず透明部を黒として補完するため、消しゴム作業時はこの「不透明黒」に
     /// 統一して WYSIWYG にする。全画素が既に不透明なら None (= 変換不要)。
     pub(crate) fn black_flatten_if_transparent(img: &egui::ColorImage) -> Option<egui::ColorImage> {
-        if img.pixels.iter().all(|p| p.a() == 255) {
-            return None;
-        }
-        let pixels = img
-            .pixels
-            .iter()
-            .map(|p| egui::Color32::from_rgba_premultiplied(p.r(), p.g(), p.b(), 255))
-            .collect();
-        Some(egui::ColorImage::new(img.size, pixels))
+        black_flatten_if_transparent(img)
     }
 
     pub(crate) fn enter_erase_mode(&mut self, fs_idx: usize) {
@@ -2859,7 +2864,8 @@ impl App {
                     h,
                     &cancel_for_thread,
                     log_prefix,
-                );
+                )
+                .image;
                 if cancel_for_thread.load(Ordering::Relaxed) {
                     return;
                 }
@@ -3021,6 +3027,46 @@ impl App {
 /// worker thread で走る inpaint 本体。`AiRuntime` が利用可能なら MI-GAN、
 /// 失敗 / runtime 不在なら拡散 fallback。`&mut self` を取らないことで
 /// UI スレッドに戻らずに完結できる。
+pub(crate) struct InpaintOutcome {
+    pub(crate) image: egui::ColorImage,
+    pub(crate) used_diffusion_fallback: bool,
+}
+
+/// 保存済み mask snapshot を headless に再適用する製本向け入口。
+/// Shape のラスタライズと透明画像の黒 flatten をここへ集約し、表示用 inpaint と
+/// 同じ MI-GAN → diffusion fallback を使う。
+pub(crate) fn erase_from_saved_mask(
+    runtime: Option<&Arc<crate::ai::runtime::AiRuntime>>,
+    manager: &Arc<crate::ai::model_manager::ModelManager>,
+    base: &egui::ColorImage,
+    bitmap: &[bool],
+    shapes: &[crate::mask_db::Shape],
+    cancel: &Arc<AtomicBool>,
+    log_prefix: &str,
+) -> Result<InpaintOutcome, String> {
+    let [w, h] = base.size;
+    if bitmap.len() != w.saturating_mul(h) {
+        return Err(format!(
+            "消しゴムマスクのサイズが一致しません: mask={}, expected={}",
+            bitmap.len(),
+            w.saturating_mul(h)
+        ));
+    }
+    let mut composite = bitmap.to_vec();
+    crate::mask_db::rasterize_shapes_into(&mut composite, shapes, w, h);
+    if !composite.iter().any(|masked| *masked) {
+        return Ok(InpaintOutcome {
+            image: base.clone(),
+            used_diffusion_fallback: false,
+        });
+    }
+    let flattened = black_flatten_if_transparent(base);
+    let input = flattened.as_ref().unwrap_or(base);
+    Ok(run_inpaint_pure(
+        runtime, manager, input, &composite, w, h, cancel, log_prefix,
+    ))
+}
+
 fn run_inpaint_pure(
     runtime: Option<&Arc<crate::ai::runtime::AiRuntime>>,
     manager: &Arc<crate::ai::model_manager::ModelManager>,
@@ -3030,7 +3076,7 @@ fn run_inpaint_pure(
     h: usize,
     cancel: &Arc<AtomicBool>,
     log_prefix: &str,
-) -> egui::ColorImage {
+) -> InpaintOutcome {
     if let Some(rt) = runtime {
         let kind = crate::ai::ModelKind::InpaintMiGan;
         match manager.model_path(kind) {
@@ -3040,11 +3086,19 @@ fn run_inpaint_pure(
                         crate::logger::log(format!(
                             "[erase] {log_prefix} MI-GAN load failed: {e}, falling back to diffusion"
                         ));
-                        return inpaint_diffuse(original, composite, w, h);
+                        return InpaintOutcome {
+                            image: inpaint_diffuse(original, composite, w, h),
+                            used_diffusion_fallback: true,
+                        };
                     }
                 }
                 match inpaint_migan(rt, original, composite, w, h, cancel) {
-                    Ok(r) => return r,
+                    Ok(image) => {
+                        return InpaintOutcome {
+                            image,
+                            used_diffusion_fallback: false,
+                        };
+                    }
                     Err(e) => {
                         crate::logger::log(format!(
                             "[erase] {log_prefix} MI-GAN failed: {e}, falling back to diffusion"
@@ -3063,7 +3117,10 @@ fn run_inpaint_pure(
             "[erase] {log_prefix} AI runtime not available, falling back to diffusion"
         ));
     }
-    inpaint_diffuse(original, composite, w, h)
+    InpaintOutcome {
+        image: inpaint_diffuse(original, composite, w, h),
+        used_diffusion_fallback: true,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3596,5 +3653,40 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
         if i % 2 == 0 {
             painter.line_segment([points[i], points[i + 1]], white);
         }
+    }
+}
+
+#[cfg(test)]
+mod book_erase_tests {
+    use super::*;
+
+    #[test]
+    fn saved_mask_without_runtime_uses_deterministic_diffusion_fallback() {
+        let base = egui::ColorImage::new(
+            [3, 1],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+            ],
+        );
+        let manager = Arc::new(crate::ai::model_manager::ModelManager::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = erase_from_saved_mask(
+            None,
+            &manager,
+            &base,
+            &[false, true, false],
+            &[],
+            &cancel,
+            "book-test",
+        )
+        .unwrap();
+
+        assert!(result.used_diffusion_fallback);
+        assert_ne!(result.image.pixels[1], base.pixels[1]);
+        assert_eq!(result.image.pixels[0], base.pixels[0]);
+        assert_eq!(result.image.pixels[2], base.pixels[2]);
     }
 }

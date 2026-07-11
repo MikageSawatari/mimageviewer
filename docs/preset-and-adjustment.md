@@ -686,6 +686,14 @@ failed / pending をクリアする。これがないと
 
 ## 5. 消しゴム (Erase) との関係
 
+製本追加の headless bake (`BookPageSource::Composited` / `BakedEditSnapshot`) も同じ早期
+erase 契約を使う。UI thread で `mask.db` の bitmap + shapes と AI runtime/model manager を
+snapshot し、book worker が raw decode を必要なら黒で不透明化してから保存マスクをラスタライズし、
+MI-GAN を再推論する。erase 完了後にだけ local_adjust → conceal → adjustment の下流を合成するため、
+erase mask があるページを未消去 base のまま部分焼き込みすることはない。製本では global AI
+upscale / denoise を除外するが、非 AI 出力用 smart sharpen と post_filter は維持する。
+MI-GAN が利用できず diffusion fallback になった場合は処理を継続し、追加完了トーストで通知する。
+
 `ui_erase.rs` と `mask_db.rs` で実装された消しゴム機能は、補正パイプラインと連携している:
 
 ```

@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use eframe::egui;
 
@@ -28,6 +30,8 @@ pub struct BookAppendSummary {
     pub added: usize,
     pub first_path: Option<PathBuf>,
     pub edit_copies: Vec<BookPathMapping>,
+    pub semantic_copies: Vec<BookPathMapping>,
+    pub erase_fallback_pages: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -87,37 +91,16 @@ pub enum BookPageSource {
         src: PathBuf,
         original_name: String,
     },
-    AdjustedFile {
-        src: PathBuf,
-        original_name: String,
-        params: crate::adjustment::AdjustParams,
-        rotation: crate::rotation_db::Rotation,
-        format: crate::capture::CaptureFormat,
-        jpeg_matte: crate::capture::JpegMatte,
-    },
     ZipEntry {
         zip_path: PathBuf,
         entry_name: String,
         original_name: String,
     },
-    AdjustedZipEntry {
-        zip_path: PathBuf,
-        entry_name: String,
-        original_name: String,
-        params: crate::adjustment::AdjustParams,
-        rotation: crate::rotation_db::Rotation,
-        format: crate::capture::CaptureFormat,
-        jpeg_matte: crate::capture::JpegMatte,
-    },
-    AdjustedPdfPage {
-        pdf_path: PathBuf,
-        page_num: u32,
-        password: Option<String>,
+    /// UI thread で edit DB / settings / comic assets を snapshot 済みの headless 合成。
+    Composited {
+        source: CompositeSource,
         basename: String,
-        params: crate::adjustment::AdjustParams,
-        rotation: crate::rotation_db::Rotation,
-        format: crate::capture::CaptureFormat,
-        jpeg_matte: crate::capture::JpegMatte,
+        edits: BakedEditSnapshot,
     },
     Rendered {
         work: crate::capture::CapturePixelWork,
@@ -136,6 +119,91 @@ pub enum BookPageSource {
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
     },
+}
+
+pub enum CompositeSource {
+    File {
+        path: PathBuf,
+    },
+    ZipEntry {
+        zip_path: PathBuf,
+        entry_name: String,
+    },
+    PdfPage {
+        pdf_path: PathBuf,
+        page_num: u32,
+        password: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+pub struct BookMaskSnapshot {
+    pub bitmap: Vec<bool>,
+    pub shapes: Vec<crate::mask_db::Shape>,
+    pub size: [usize; 2],
+}
+
+pub struct BookEraseResult {
+    pub image: egui::ColorImage,
+    pub used_diffusion_fallback: bool,
+}
+
+pub type BookEraseRunner = Box<
+    dyn Fn(
+            &egui::ColorImage,
+            &[bool],
+            &[crate::mask_db::Shape],
+            &Arc<AtomicBool>,
+        ) -> Result<BookEraseResult, String>
+        + Send,
+>;
+
+pub struct BookEraseSnapshot {
+    pub mask: BookMaskSnapshot,
+    pub run: BookEraseRunner,
+}
+
+pub struct BookConcealSnapshot {
+    pub mask: BookMaskSnapshot,
+    pub preset: crate::conceal::ConcealPreset,
+}
+
+pub struct BookComicSnapshot {
+    pub objects: Vec<comic_core::AnnotationObject>,
+    pub fonts: Arc<comic_core::FontSet>,
+    pub stamp_cache: std::collections::HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>,
+}
+
+pub struct BakedEditSnapshot {
+    pub params: crate::adjustment::AdjustParams,
+    pub rotation: crate::rotation_db::Rotation,
+    pub conceal: Option<BookConcealSnapshot>,
+    pub erase: Option<BookEraseSnapshot>,
+    pub local_adjust: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    pub comic: Option<BookComicSnapshot>,
+    pub comic_source_dims: Option<[usize; 2]>,
+    pub export_crop: Option<crate::export_crop::CropRect>,
+    pub crop_source_dims: Option<[usize; 2]>,
+    pub format: crate::capture::CaptureFormat,
+    pub jpeg_matte: crate::capture::JpegMatte,
+}
+
+pub fn page_requires_full_composite(
+    params: &crate::adjustment::AdjustParams,
+    rotation: crate::rotation_db::Rotation,
+    has_conceal: bool,
+    has_erase: bool,
+    has_local_adjust: bool,
+    has_comic: bool,
+    has_export_crop: bool,
+) -> bool {
+    !params.is_color_identity()
+        || !rotation.is_none()
+        || has_conceal
+        || has_erase
+        || has_local_adjust
+        || has_comic
+        || has_export_crop
 }
 
 pub fn default_books_root() -> PathBuf {
@@ -306,16 +374,24 @@ pub fn append_pages(
 
     let mut first_path = None;
     let mut edit_copies = Vec::new();
+    let mut semantic_copies = Vec::new();
+    let mut erase_fallback_pages = 0;
     for (offset, source) in sources.into_iter().enumerate() {
         let page_no = start + offset;
         let dest = destination_for_source(&folder, page_no, &source)?;
-        if let Some(src) = source_edit_copy_path(&root, &folder, &source) {
-            edit_copies.push(BookPathMapping {
-                from: src,
+        if let Some(copy) = source_edit_copy_path(&root, &folder, &source) {
+            let mapping = BookPathMapping {
+                from: copy.path().to_path_buf(),
                 to: dest.clone(),
-            });
+            };
+            match copy {
+                BookSourceCopy::Full(_) => edit_copies.push(mapping),
+                BookSourceCopy::Semantic(_) => semantic_copies.push(mapping),
+            }
         }
-        write_source(source, &dest)?;
+        if write_source(source, &dest)? {
+            erase_fallback_pages += 1;
+        }
         if first_path.is_none() {
             first_path = Some(dest);
         }
@@ -327,6 +403,8 @@ pub fn append_pages(
         added,
         first_path,
         edit_copies,
+        semantic_copies,
+        erase_fallback_pages,
     }))
 }
 
@@ -593,19 +671,11 @@ fn flush_reorder_paths(
         .collect())
 }
 
-fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
+fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
     match source {
-        BookPageSource::File { src, .. } => copy_file_snapshot(&src, dest),
-        BookPageSource::AdjustedFile {
-            src,
-            params,
-            rotation,
-            format,
-            jpeg_matte,
-            ..
-        } => {
-            let image = decode_file_color_image(&src)?;
-            write_adjusted_color_image(dest, image, &params, rotation, format, jpeg_matte)
+        BookPageSource::File { src, .. } => {
+            copy_file_snapshot(&src, dest)?;
+            Ok(false)
         }
         BookPageSource::ZipEntry {
             zip_path,
@@ -614,45 +684,14 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
         } => {
             let bytes = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
                 .map_err(|e| format!("ZIP 内画像を読み取れません: {}: {e}", entry_name))?;
-            write_bytes_create_new(dest, &bytes)
+            write_bytes_create_new(dest, &bytes)?;
+            Ok(false)
         }
-        BookPageSource::AdjustedZipEntry {
-            zip_path,
-            entry_name,
-            params,
-            rotation,
-            format,
-            jpeg_matte,
-            ..
-        } => {
-            let bytes = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                .map_err(|e| format!("ZIP 内画像を読み取れません: {}: {e}", entry_name))?;
-            let image = decode_bytes_color_image(&entry_name, &bytes)?;
-            write_adjusted_color_image(dest, image, &params, rotation, format, jpeg_matte)
-        }
-        BookPageSource::AdjustedPdfPage {
-            pdf_path,
-            page_num,
-            password,
-            params,
-            rotation,
-            format,
-            jpeg_matte,
-            ..
-        } => {
-            let result = crate::pdf_loader::render_page(
-                &pdf_path,
-                page_num,
-                4096,
-                password.as_deref(),
-                None,
-                crate::pdf_loader::JobPriority::Critical,
-                0,
-                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-            )
-            .map_err(|e| format!("PDF ページを描画できません: {}: {e}", pdf_path.display()))?;
-            let image = dynamic_image_to_color_image(&result.image);
-            write_adjusted_color_image(dest, image, &params, rotation, format, jpeg_matte)
+        BookPageSource::Composited { source, edits, .. } => {
+            let image = decode_composite_source(&source)?;
+            let result = compose_book_page(image, &edits)?;
+            write_composited_color_image(dest, &result.image, edits.format, edits.jpeg_matte)?;
+            Ok(result.used_diffusion_fallback)
         }
         BookPageSource::Rendered {
             work,
@@ -662,7 +701,8 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
             let (_basename, width, height, rgba) = crate::capture::run_pixel_work(work)?;
             crate::capture::save_rgba_exact_with_matte(
                 dest, format, jpeg_matte, width, height, &rgba,
-            )
+            )?;
+            Ok(false)
         }
         BookPageSource::VideoFrame {
             path,
@@ -680,7 +720,8 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
                 frame.width,
                 frame.height,
                 &frame.rgba,
-            )
+            )?;
+            Ok(false)
         }
         BookPageSource::ClipboardImage {
             format, jpeg_matte, ..
@@ -688,22 +729,40 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
             let (width, height, rgba) = read_clipboard_rgba_image()?;
             crate::capture::save_rgba_exact_with_matte(
                 dest, format, jpeg_matte, width, height, &rgba,
-            )
+            )?;
+            Ok(false)
         }
     }
 }
 
-fn source_edit_copy_path(
+enum BookSourceCopy<'a> {
+    Full(&'a Path),
+    Semantic(&'a Path),
+}
+
+impl BookSourceCopy<'_> {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Full(path) | Self::Semantic(path) => path,
+        }
+    }
+}
+
+fn source_edit_copy_path<'a>(
     root: &Path,
     dest_folder: &Path,
-    source: &BookPageSource,
-) -> Option<PathBuf> {
-    let src = match source {
-        BookPageSource::File { src, .. } | BookPageSource::AdjustedFile { src, .. } => src,
+    source: &'a BookPageSource,
+) -> Option<BookSourceCopy<'a>> {
+    let copy = match source {
+        BookPageSource::File { src, .. } => BookSourceCopy::Full(src),
+        BookPageSource::Composited {
+            source: CompositeSource::File { path },
+            ..
+        } => BookSourceCopy::Semantic(path),
         _ => return None,
     };
-    let source_book = containing_book_folder(root, src)?;
-    (!crate::folder_tree::path_eq(&source_book, dest_folder)).then(|| src.clone())
+    let source_book = containing_book_folder(root, copy.path())?;
+    (!crate::folder_tree::path_eq(&source_book, dest_folder)).then_some(copy)
 }
 
 fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
@@ -743,27 +802,240 @@ fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage
     Ok(dynamic_image_to_color_image(&image))
 }
 
-fn write_adjusted_color_image(
-    dest: &Path,
+fn decode_composite_source(source: &CompositeSource) -> Result<egui::ColorImage, String> {
+    match source {
+        CompositeSource::File { path } => decode_file_color_image(path),
+        CompositeSource::ZipEntry {
+            zip_path,
+            entry_name,
+        } => {
+            let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name)
+                .map_err(|e| format!("ZIP 内画像を読み取れません: {entry_name}: {e}"))?;
+            decode_bytes_color_image(entry_name, &bytes)
+        }
+        CompositeSource::PdfPage {
+            pdf_path,
+            page_num,
+            password,
+        } => {
+            let result = crate::pdf_loader::render_page(
+                pdf_path,
+                *page_num,
+                4096,
+                password.as_deref(),
+                None,
+                crate::pdf_loader::JobPriority::Critical,
+                0,
+                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            )
+            .map_err(|e| format!("PDF ページを描画できません: {}: {e}", pdf_path.display()))?;
+            Ok(dynamic_image_to_color_image(&result.image))
+        }
+    }
+}
+
+struct BookCompositeResult {
     image: egui::ColorImage,
-    params: &crate::adjustment::AdjustParams,
+    used_diffusion_fallback: bool,
+}
+
+/// 表示の source 解像度 edit chain を headless に再構成する。
+/// global AI upscale / denoise だけを除外し、それ以外は Ctrl+E と同じ順で適用する。
+fn compose_book_page(
+    mut image: egui::ColorImage,
+    edits: &BakedEditSnapshot,
+) -> Result<BookCompositeResult, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut used_diffusion_fallback = false;
+
+    if let Some(erase) = &edits.erase {
+        let mask = resize_book_mask(&erase.mask, image.size)?;
+        let result = (erase.run)(&image, &mask.bitmap, &mask.shapes, &cancel)?;
+        image = result.image;
+        used_diffusion_fallback = result.used_diffusion_fallback;
+    }
+
+    if let Some(layers) = &edits.local_adjust {
+        let [width, height] = image.size;
+        let mut layers = layers.clone();
+        for layer in &mut layers {
+            layer.resize_masks_to(width, height);
+        }
+        let rgba = crate::capture::color_image_to_rgba(&image);
+        let source = local_adjust_core::RgbaImageRef {
+            width,
+            height,
+            pixels: &rgba,
+        };
+        let rendered = local_adjust_core::apply_layers_with_progress(
+            source,
+            &layers,
+            Some(cancel.as_ref()),
+            |_| {},
+        )
+        .map_err(|e| format!("補正レイヤーを合成できません: {e}"))?;
+        image = egui::ColorImage::from_rgba_unmultiplied(
+            [rendered.width, rendered.height],
+            &rendered.pixels,
+        );
+    }
+
+    if let Some(conceal) = &edits.conceal {
+        let mut mask = resize_book_mask(&conceal.mask, image.size)?;
+        crate::mask_db::rasterize_shapes_into(
+            &mut mask.bitmap,
+            &mask.shapes,
+            image.size[0],
+            image.size[1],
+        );
+        image = crate::conceal_compose::compose_with_preset(&image, &mask.bitmap, &conceal.preset);
+    }
+
+    image = crate::adjustment::apply_adjustments_fast(&image, &edits.params);
+
+    if let Some(comic) = &edits.comic {
+        let scaled_objects = edits.comic_source_dims.and_then(|[source_w, source_h]| {
+            let s_bake =
+                image.size[0].max(image.size[1]) as f32 / source_w.max(source_h).max(1) as f32;
+            ((s_bake - 1.0).abs() > 1e-4).then(|| comic_core::scale_scene(&comic.objects, s_bake))
+        });
+        let objects = scaled_objects.as_deref().unwrap_or(&comic.objects);
+        let mut stamp_cache = comic.stamp_cache.clone();
+        let (stamps, _, _) = crate::comic_stamp::build_stamp_images_from_cache_snapshot(
+            objects,
+            &mut stamp_cache,
+            cancel.as_ref(),
+        );
+        let overlay = comic_core::bake_overlay_with_stamps(
+            objects,
+            image.size[0],
+            image.size[1],
+            &comic.fonts,
+            &stamps,
+        );
+        image = crate::comic_overlay::composite_overlay_over(&image, &overlay);
+    }
+
+    let crop = edits.export_crop.map(|crop| {
+        let crop = if let Some(source_size) = edits.crop_source_dims
+            && source_size != image.size
+        {
+            let sx = image.size[0] as f32 / source_size[0].max(1) as f32;
+            let sy = image.size[1] as f32 / source_size[1].max(1) as f32;
+            crate::export_crop::CropRect {
+                min_x: crop.min_x * sx,
+                min_y: crop.min_y * sy,
+                max_x: crop.max_x * sx,
+                max_y: crop.max_y * sy,
+            }
+        } else {
+            crop
+        };
+        crop_after_rotation(crop, image.size, edits.rotation)
+    });
+    if !edits.rotation.is_none() {
+        image = crate::capture::rotate_color_image(&image, edits.rotation);
+    }
+    if let Some(crop) = crop {
+        image = crate::export_crop::crop_color_image(&image, crop)?;
+    }
+
+    Ok(BookCompositeResult {
+        image,
+        used_diffusion_fallback,
+    })
+}
+
+fn crop_after_rotation(
+    crop: crate::export_crop::CropRect,
+    source_size: [usize; 2],
     rotation: crate::rotation_db::Rotation,
+) -> crate::export_crop::CropRect {
+    let [width, height] = source_size;
+    let crop = crop.sanitized(width, height);
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    match rotation {
+        crate::rotation_db::Rotation::None => crop,
+        crate::rotation_db::Rotation::Cw90 => crate::export_crop::CropRect {
+            min_x: height - crop.max_y,
+            min_y: crop.min_x,
+            max_x: height - crop.min_y,
+            max_y: crop.max_x,
+        },
+        crate::rotation_db::Rotation::Cw180 => crate::export_crop::CropRect {
+            min_x: width - crop.max_x,
+            min_y: height - crop.max_y,
+            max_x: width - crop.min_x,
+            max_y: height - crop.min_y,
+        },
+        crate::rotation_db::Rotation::Cw270 => crate::export_crop::CropRect {
+            min_x: crop.min_y,
+            min_y: width - crop.max_x,
+            max_x: crop.max_y,
+            max_y: width - crop.min_x,
+        },
+    }
+}
+
+fn resize_book_mask(
+    snapshot: &BookMaskSnapshot,
+    target: [usize; 2],
+) -> Result<BookMaskSnapshot, String> {
+    let [source_w, source_h] = snapshot.size;
+    let [target_w, target_h] = target;
+    if source_w == 0 || source_h == 0 || snapshot.bitmap.len() != source_w.saturating_mul(source_h)
+    {
+        return Err("編集マスクの保存サイズが不正です".to_string());
+    }
+    if snapshot.size == target {
+        return Ok(snapshot.clone());
+    }
+    let mut bitmap = vec![false; target_w.saturating_mul(target_h)];
+    for y in 0..target_h {
+        let source_y = y.saturating_mul(source_h) / target_h.max(1);
+        for x in 0..target_w {
+            let source_x = x.saturating_mul(source_w) / target_w.max(1);
+            bitmap[y * target_w + x] =
+                snapshot.bitmap[source_y.min(source_h - 1) * source_w + source_x.min(source_w - 1)];
+        }
+    }
+    let sx = target_w as f32 / source_w as f32;
+    let sy = target_h as f32 / source_h as f32;
+    let mut shapes = snapshot.shapes.clone();
+    for shape in &mut shapes {
+        shape.scale_xy(sx, sy);
+    }
+    Ok(BookMaskSnapshot {
+        bitmap,
+        shapes,
+        size: target,
+    })
+}
+
+fn write_composited_color_image(
+    dest: &Path,
+    image: &egui::ColorImage,
     format: crate::capture::CaptureFormat,
     jpeg_matte: crate::capture::JpegMatte,
 ) -> Result<(), String> {
-    let mut adjusted = crate::adjustment::apply_adjustments_fast(&image, params);
-    if !rotation.is_none() {
-        adjusted = crate::capture::rotate_color_image(&adjusted, rotation);
-    }
-    let rgba = crate::capture::color_image_to_rgba(&adjusted);
-    crate::capture::save_rgba_exact_with_matte(
-        dest,
-        format,
+    let src_format = if format.jpeg_quality().is_some() {
+        crate::save_with_metadata::SrcFormat::Jpeg
+    } else {
+        crate::save_with_metadata::SrcFormat::Png
+    };
+    let options = crate::save_with_metadata::SaveOptions {
+        jpeg_quality: format.jpeg_quality().unwrap_or(95),
         jpeg_matte,
-        adjusted.size[0] as u32,
-        adjusted.size[1] as u32,
-        &rgba,
+        // 焼き込み済みの本ページは新しい完成画像。元ページの EXIF/XMP/prompt は
+        // 転記せず、byte-copy fast path だけが原本 metadata を保持する。
+        include_metadata: false,
+        ..Default::default()
+    };
+    crate::save_with_metadata::save_image_with_metadata(
+        image, None, None, dest, src_format, &options,
     )
+    .map_err(|e| format!("本ページを保存できません: {}: {e}", dest.display()))
 }
 
 fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
@@ -1161,23 +1433,13 @@ fn destination_for_source(
 ) -> Result<PathBuf, String> {
     let raw_name = match source {
         BookPageSource::File { original_name, .. } => sanitize_filename(original_name, "page"),
-        BookPageSource::AdjustedFile {
-            original_name,
-            format,
-            ..
-        } => adjusted_destination_name(original_name, *format),
         BookPageSource::ZipEntry { original_name, .. } => sanitize_filename(original_name, "page"),
-        BookPageSource::AdjustedZipEntry {
-            original_name,
-            format,
-            ..
-        } => adjusted_destination_name(original_name, *format),
-        BookPageSource::AdjustedPdfPage {
-            basename, format, ..
+        BookPageSource::Composited {
+            basename, edits, ..
         } => format!(
             "{}.{}",
             crate::capture::basename_from_text(basename),
-            format.extension()
+            edits.format.extension()
         ),
         BookPageSource::Rendered { work, format, .. } => {
             let basename = match work {
@@ -1223,18 +1485,6 @@ fn destination_for_existing_page(
         return Err(format!("ページ番号が既に存在します: {}", path.display()));
     }
     Ok(path)
-}
-
-fn adjusted_destination_name(original_name: &str, format: crate::capture::CaptureFormat) -> String {
-    let stem = Path::new(original_name)
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("page");
-    format!(
-        "{}.{}",
-        crate::capture::basename_from_text(stem),
-        format.extension()
-    )
 }
 
 fn next_page_number(folder: &Path) -> Result<usize, String> {
@@ -1387,6 +1637,336 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_baked_edits() -> BakedEditSnapshot {
+        BakedEditSnapshot {
+            params: crate::adjustment::AdjustParams::default(),
+            rotation: crate::rotation_db::Rotation::None,
+            conceal: None,
+            erase: None,
+            local_adjust: None,
+            comic: None,
+            comic_source_dims: None,
+            export_crop: None,
+            crop_source_dims: None,
+            format: crate::capture::CaptureFormat::Png,
+            jpeg_matte: crate::capture::JpegMatte::Black,
+        }
+    }
+
+    #[test]
+    fn full_composite_trigger_excludes_display_only_enhancements() {
+        let identity = crate::adjustment::AdjustParams::default();
+        assert!(!page_requires_full_composite(
+            &identity,
+            crate::rotation_db::Rotation::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+
+        let mut color = identity.clone();
+        color.brightness = 1.0;
+        assert!(page_requires_full_composite(
+            &color,
+            crate::rotation_db::Rotation::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        let mut smart_sharpen = identity.clone();
+        smart_sharpen.smart_sharpen = 1;
+        assert!(!page_requires_full_composite(
+            &smart_sharpen,
+            crate::rotation_db::Rotation::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        let mut post_filter = identity.clone();
+        post_filter.post_filter = crate::adjustment::PostFilter::Sepia;
+        assert!(!page_requires_full_composite(
+            &post_filter,
+            crate::rotation_db::Rotation::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(page_requires_full_composite(
+            &identity,
+            crate::rotation_db::Rotation::Cw90,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(page_requires_full_composite(
+            &identity,
+            crate::rotation_db::Rotation::None,
+            true,
+            false,
+            false,
+            false,
+            false,
+        ));
+        for edit in 1..5 {
+            let mut flags = [false; 5];
+            flags[edit] = true;
+            assert!(page_requires_full_composite(
+                &identity,
+                crate::rotation_db::Rotation::None,
+                flags[0],
+                flags[1],
+                flags[2],
+                flags[3],
+                flags[4],
+            ));
+        }
+
+        let mut ai_only = identity;
+        ai_only.upscale_model = Some("auto".to_string());
+        ai_only.denoise_model = Some("jpeg".to_string());
+        assert!(!page_requires_full_composite(
+            &ai_only,
+            crate::rotation_db::Rotation::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn post_filter_downscale_only_uses_byte_copy_without_resizing() {
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.post_filter = crate::adjustment::PostFilter::Downscale2x;
+
+        assert!(!page_requires_full_composite(
+            &params,
+            crate::rotation_db::Rotation::None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn full_composite_ignores_display_only_filter_and_sharpen() {
+        let base = egui::ColorImage::new(
+            [4, 2],
+            vec![
+                egui::Color32::from_rgb(10, 20, 30),
+                egui::Color32::from_rgb(40, 50, 60),
+                egui::Color32::from_rgb(70, 80, 90),
+                egui::Color32::from_rgb(100, 110, 120),
+                egui::Color32::from_rgb(130, 140, 150),
+                egui::Color32::from_rgb(160, 170, 180),
+                egui::Color32::from_rgb(190, 200, 210),
+                egui::Color32::from_rgb(220, 230, 240),
+            ],
+        );
+        let mut edits = empty_baked_edits();
+        edits.params.brightness = 10.0;
+        edits.params.smart_sharpen = 100;
+        edits.params.post_filter = crate::adjustment::PostFilter::Downscale2x;
+        let expected = crate::adjustment::apply_adjustments_fast(&base, &edits.params);
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert_eq!(result.image.size, [4, 2]);
+        assert_eq!(result.image.pixels, expected.pixels);
+    }
+
+    #[test]
+    fn full_composite_applies_erase_before_conceal() {
+        let base = egui::ColorImage::new(
+            [3, 1],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+            ],
+        );
+        let mask = BookMaskSnapshot {
+            bitmap: vec![false, true, false],
+            shapes: Vec::new(),
+            size: [3, 1],
+        };
+        let run: BookEraseRunner = Box::new(|base, _, _, _| {
+            let mut image = base.clone();
+            image.pixels[1] = egui::Color32::WHITE;
+            Ok(BookEraseResult {
+                image,
+                used_diffusion_fallback: true,
+            })
+        });
+        let mut edits = empty_baked_edits();
+        edits.erase = Some(BookEraseSnapshot {
+            mask: mask.clone(),
+            run,
+        });
+        edits.conceal = Some(BookConcealSnapshot {
+            mask,
+            preset: crate::conceal::ConcealPreset {
+                conceal_type: crate::conceal::ConcealType::BlackFill,
+                fill_opacity_percent: 50,
+                ..Default::default()
+            },
+        });
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert!(result.used_diffusion_fallback);
+        let middle = result.image.pixels[1].to_srgba_unmultiplied();
+        assert!(middle[0] >= 126 && middle[0] <= 129);
+        assert_eq!(middle[0], middle[1]);
+        assert_eq!(middle[1], middle[2]);
+    }
+
+    #[test]
+    fn full_composite_applies_local_adjust_adjustment_rotation_and_crop() {
+        let base = egui::ColorImage::new(
+            [2, 1],
+            vec![egui::Color32::from_rgb(10, 20, 30), egui::Color32::WHITE],
+        );
+        let mut edits = empty_baked_edits();
+        edits.local_adjust = Some(vec![local_adjust_core::LocalAdjustmentLayer::new(
+            "invert",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::Invert(local_adjust_core::InvertParams::default()),
+        )]);
+        edits.params.brightness = 10.0;
+        edits.rotation = crate::rotation_db::Rotation::Cw90;
+        edits.export_crop = Some(crate::export_crop::CropRect {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 1.0,
+            max_y: 1.0,
+        });
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert_eq!(result.image.size, [1, 1]);
+        assert_ne!(result.image.pixels[0], egui::Color32::from_rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn full_composite_applies_comic_stamp_on_top() {
+        let base = egui::ColorImage::new([8, 8], vec![egui::Color32::BLACK; 64]);
+        let source = comic_core::StampSource::Emoji("book-test".to_string());
+        let object = comic_core::AnnotationObject::new_stamp(
+            1,
+            (4.0, 4.0),
+            comic_core::StampObject {
+                source: source.clone(),
+                half_w: 2.0,
+                half_h: 2.0,
+                ..Default::default()
+            },
+        );
+        let mut stamp = comic_core::RgbaOverlay::new(2, 2);
+        stamp.pixels = [255u8, 0, 0, 255].repeat(4);
+        let mut stamp_cache = std::collections::HashMap::new();
+        stamp_cache.insert(
+            crate::comic_stamp::stamp_source_key(&source),
+            Some(Arc::new(stamp)),
+        );
+        let mut edits = empty_baked_edits();
+        edits.comic = Some(BookComicSnapshot {
+            objects: vec![object],
+            fonts: Arc::new(comic_core::FontSet::new()),
+            stamp_cache,
+        });
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert!(
+            result
+                .image
+                .pixels
+                .iter()
+                .any(|pixel| pixel.r() > 0 && pixel.g() == 0 && pixel.b() == 0)
+        );
+    }
+
+    #[test]
+    fn full_composite_scales_comic_from_authoring_source_dims() {
+        let base = egui::ColorImage::new([8, 8], vec![egui::Color32::BLACK; 64]);
+        let source = comic_core::StampSource::Emoji("book-scaled-test".to_string());
+        let object = comic_core::AnnotationObject::new_stamp(
+            1,
+            (12.0, 4.0),
+            comic_core::StampObject {
+                source: source.clone(),
+                half_w: 2.0,
+                half_h: 2.0,
+                ..Default::default()
+            },
+        );
+        let mut stamp = comic_core::RgbaOverlay::new(2, 2);
+        stamp.pixels = [255u8, 0, 0, 255].repeat(4);
+        let mut stamp_cache = std::collections::HashMap::new();
+        stamp_cache.insert(
+            crate::comic_stamp::stamp_source_key(&source),
+            Some(Arc::new(stamp)),
+        );
+        let mut edits = empty_baked_edits();
+        edits.comic = Some(BookComicSnapshot {
+            objects: vec![object],
+            fonts: Arc::new(comic_core::FontSet::new()),
+            stamp_cache,
+        });
+        edits.comic_source_dims = Some([16, 16]);
+
+        let result = compose_book_page(base, &edits).unwrap();
+        let red_pixels = result
+            .image
+            .pixels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pixel)| (pixel.r() > 0).then_some((index % 8, index / 8)))
+            .collect::<Vec<_>>();
+
+        assert!(!red_pixels.is_empty());
+        assert!(red_pixels.iter().all(|&(x, y)| x < 8 && y < 4));
+        assert!(red_pixels.iter().any(|&(x, y)| x >= 5 && y >= 1));
+    }
+
+    #[test]
+    fn full_composite_scales_crop_from_authoring_source_dims() {
+        let pixels = (0..4)
+            .flat_map(|y| {
+                (0..8).map(move |x| egui::Color32::from_rgb((x * 20) as u8, (y * 30) as u8, 0))
+            })
+            .collect();
+        let base = egui::ColorImage::new([8, 4], pixels);
+        let mut edits = empty_baked_edits();
+        edits.export_crop = Some(crate::export_crop::CropRect {
+            min_x: 8.0,
+            min_y: 0.0,
+            max_x: 16.0,
+            max_y: 8.0,
+        });
+        edits.crop_source_dims = Some([16, 8]);
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert_eq!(result.image.size, [4, 4]);
+        assert_eq!(result.image.pixels[0], egui::Color32::from_rgb(80, 0, 0));
+        assert_eq!(result.image.pixels[3], egui::Color32::from_rgb(140, 0, 0));
+    }
 
     #[test]
     fn sanitize_book_name_preserves_japanese_and_replaces_windows_invalids() {

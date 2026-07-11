@@ -894,6 +894,12 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
 解像度で先に確定し、その後に明るさ・色・AI 拡大・効果フィルタが最後に乗る。
 そのためアップスケール ON/OFF や補正スライダー変更で編集マスクの解像度は変わらない。
 
+製本追加は表示 cache を読まず、UI thread で固定した `BakedEditSnapshot` を book worker の
+headless compositor が復元する。順序は raw → erase → local_adjust → conceal → adjustment →
+smart sharpen → post_filter → comic → rotation → export crop。表示専用の global AI upscale /
+denoise は意図的に飛ばすため、grid / fullscreen / stack のどこから追加しても原寸の edit composite
+になる。編集が 1 つも無い File / ZIP entry はこの経路へ入れず byte copy を維持する。
+
 ### 3.1 詳細
 
 詳細は [preset-and-adjustment.md](preset-and-adjustment.md) に譲る。ここでは要点のみ:

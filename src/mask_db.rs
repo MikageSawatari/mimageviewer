@@ -798,6 +798,20 @@ impl MaskDb {
         self.get_full(key, expected_w, expected_h).map(|(m, _)| m)
     }
 
+    pub fn dimensions(&self, key: &str) -> Option<[usize; 2]> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT width, height FROM masks WHERE path = ?1")
+            .ok()?;
+        stmt.query_row([key], |row| {
+            Ok([
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+            ])
+        })
+        .ok()
+    }
+
     /// マスクとベクタ群をまとめて取得する (`Vec<Shape>` 形式)。
     /// 画像サイズが保存時と異なる場合 (PDF 再レンダリング等) はビットマップをリスケールし、
     /// ベクタ座標も比率で伸縮する (`Shape::scale_xy` 経由)。

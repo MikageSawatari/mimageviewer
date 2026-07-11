@@ -13,6 +13,7 @@
 //! exe へ同梱した SVG バイト列から解決する点と、最近使用の保存先を `data_dir` に置く点のみ。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use comic_core::{RgbaOverlay, StampSource};
@@ -36,6 +37,49 @@ pub const FILE_STAMP_MAX_PX: usize = 2048;
 /// base64 で `StampSource::Embedded` に格納する。大きすぎると comic.db が肥大化するので
 /// 画質とサイズのバランスでこの値にする (canvas へはバイリニア拡縮)。
 pub const FILE_STAMP_EMBED_PX: usize = 1024;
+
+/// 閲覧用 comic worker と製本 worker で共有する stamp snapshot resolver。
+/// UI thread から渡された cache の浅い clone を起点に、未解決 source だけを worker
+/// 上で decode する。失敗した source は placeholder 描画へ委ねる。
+pub fn build_stamp_images_from_cache_snapshot(
+    objects: &[comic_core::AnnotationObject],
+    cache: &mut std::collections::HashMap<String, Option<Arc<RgbaOverlay>>>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> (
+    comic_core::StampImages,
+    Vec<(String, Option<Arc<RgbaOverlay>>)>,
+    f64,
+) {
+    use comic_core::AnnotationKind;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let mut images = comic_core::StampImages::new();
+    let mut updates = Vec::new();
+    let mut decode_ms = 0.0;
+    for object in objects {
+        if cancel.load(Relaxed) {
+            break;
+        }
+        let AnnotationKind::Stamp(stamp) = &object.kind else {
+            continue;
+        };
+        let key = stamp_source_key(&stamp.source);
+        let entry = if let Some(entry) = cache.get(&key) {
+            entry.clone()
+        } else {
+            let started = std::time::Instant::now();
+            let decoded = load_stamp_image(&stamp.source).map(Arc::new);
+            decode_ms += started.elapsed().as_secs_f64() * 1000.0;
+            cache.insert(key.clone(), decoded.clone());
+            updates.push((key, decoded.clone()));
+            decoded
+        };
+        if let Some(image) = entry {
+            images.insert(object.id, image);
+        }
+    }
+    (images, updates, decode_ms)
+}
 
 /// ピッカーのカテゴリ。`all()` の順 = タブ順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
