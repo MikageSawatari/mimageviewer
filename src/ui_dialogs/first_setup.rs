@@ -72,34 +72,43 @@ impl App {
                 false,
                 "フル機能ウィンドウ（編集機能あり）",
             );
-            ui.add_enabled_ui(!self.settings.detached_viewer_open_images_in_window, |ui| {
-                ui.radio_value(
-                    &mut self.settings.auto_fullscreen_zip_pdf,
-                    false,
-                    "本はページ一覧を表示して開く",
-                );
-                ui.radio_value(
-                    &mut self.settings.auto_fullscreen_zip_pdf,
-                    true,
-                    "本はページを表示して開く",
-                );
-                ui.add_enabled_ui(self.settings.auto_fullscreen_zip_pdf, |ui| {
-                    ui.checkbox(
-                        &mut self.settings.auto_fullscreen_image_folders,
-                        "画像のみのフォルダは、PDF/ZIP のように本として扱う",
+            // サブ選択肢 (本の開き方 / 画像フォルダ) は ui.indent で 1 段字下げして、
+            // 上位のモード選択 (フル機能 / 複数ウィンドウ) との階層を視覚的に分ける。
+            // 字下げが無いと 4 つの radio が同列に見えて何を選ぶ設定か分からなくなる
+            // (環境設定ページ pages.rs の viewer_mode_* と同じパターン)。
+            ui.indent("first_setup_viewer_mode_full", |ui| {
+                ui.add_enabled_ui(!self.settings.detached_viewer_open_images_in_window, |ui| {
+                    ui.radio_value(
+                        &mut self.settings.auto_fullscreen_zip_pdf,
+                        false,
+                        "本はページ一覧を表示して開く",
                     );
+                    ui.radio_value(
+                        &mut self.settings.auto_fullscreen_zip_pdf,
+                        true,
+                        "本はページを表示して開く",
+                    );
+                    ui.add_enabled_ui(self.settings.auto_fullscreen_zip_pdf, |ui| {
+                        ui.checkbox(
+                            &mut self.settings.auto_fullscreen_image_folders,
+                            "画像のみのフォルダは、PDF/ZIP のように本として扱う",
+                        );
+                    });
                 });
             });
+            ui.add_space(8.0);
             ui.radio_value(
                 &mut self.settings.detached_viewer_open_images_in_window,
                 true,
                 "複数ウィンドウ（編集機能なし）",
             );
-            ui.add_enabled_ui(self.settings.detached_viewer_open_images_in_window, |ui| {
-                ui.checkbox(
-                    &mut self.settings.auto_fullscreen_image_folders,
-                    "画像のみのフォルダは、PDF/ZIP のように本として扱う",
-                );
+            ui.indent("first_setup_viewer_mode_multi", |ui| {
+                ui.add_enabled_ui(self.settings.detached_viewer_open_images_in_window, |ui| {
+                    ui.checkbox(
+                        &mut self.settings.auto_fullscreen_image_folders,
+                        "画像のみのフォルダは、PDF/ZIP のように本として扱う",
+                    );
+                });
             });
 
             ui.add_space(14.0);
