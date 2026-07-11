@@ -282,6 +282,56 @@ impl GridViewMode {
 }
 
 // -----------------------------------------------------------------------
+// 選択情報の表示方法
+// -----------------------------------------------------------------------
+
+/// 一覧で選択中のアイテム情報を表示する場所。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に
+/// 既存動作の `Tooltip` へ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SelectionInfoDisplayMode {
+    #[default]
+    Tooltip,
+    BottomBar,
+    Both,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SelectionInfoDisplayMode {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Tooltip => "ツールチップ",
+            Self::BottomBar => "下部情報バー",
+            Self::Both => "両方",
+            Self::Hidden => "非表示",
+            Self::Unknown => unreachable!("normalized selection-info mode"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Tooltip, Self::BottomBar, Self::Both, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Tooltip,
+            mode => mode,
+        }
+    }
+
+    pub fn shows_tooltip(self) -> bool {
+        matches!(self.normalized(), Self::Tooltip | Self::Both)
+    }
+
+    pub fn shows_bottom_bar(self) -> bool {
+        matches!(self.normalized(), Self::BottomBar | Self::Both)
+    }
+}
+
+// -----------------------------------------------------------------------
 // 詳細表示ソート
 // -----------------------------------------------------------------------
 
@@ -1942,43 +1992,46 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
-    /// サムネイル選択情報ツールチップにファイル名を表示する。
+    /// 一覧の選択情報を表示する場所。
+    #[serde(default)]
+    pub selection_info_display_mode: SelectionInfoDisplayMode,
+    /// 選択情報にファイル名を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_filename: bool,
-    /// サムネイル選択情報ツールチップに画像解像度を表示する。
+    /// 選択情報に画像解像度を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_image_dimensions: bool,
-    /// サムネイル選択情報ツールチップに動画長さを表示する。
+    /// 選択情報に動画長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_video_duration: bool,
-    /// サムネイル選択情報ツールチップに種類を表示する。
+    /// 選択情報に種類を表示する。
     #[serde(default)]
     pub thumb_tooltip_show_kind: bool,
-    /// サムネイル選択情報ツールチップにファイルサイズを表示する。
+    /// 選択情報にファイルサイズを表示する。
     #[serde(default)]
     pub thumb_tooltip_show_file_size: bool,
-    /// サムネイル選択情報ツールチップに更新日時を表示する。
+    /// 選択情報に更新日時を表示する。
     #[serde(default)]
     pub thumb_tooltip_show_modified: bool,
-    /// サムネイル選択情報ツールチップに作成日時を表示する。
+    /// 選択情報に作成日時を表示する。
     #[serde(default)]
     pub thumb_tooltip_show_created: bool,
-    /// サムネイル選択情報ツールチップに動画解像度を表示する。
+    /// 選択情報に動画解像度を表示する。
     #[serde(default)]
     pub thumb_tooltip_show_video_dimensions: bool,
-    /// サムネイル選択情報ツールチップに動画コーデックを表示する。
+    /// 選択情報に動画コーデックを表示する。
     #[serde(default)]
     pub thumb_tooltip_show_video_codec: bool,
-    /// サムネイル選択情報ツールチップに親フォルダ / コンテナ名を短い名前で表示する。
+    /// 選択情報に親フォルダ / コンテナ名を短い名前で表示する。
     #[serde(default)]
     pub thumb_tooltip_show_location: bool,
-    /// サムネイル選択情報ツールチップに場所をフルパスで表示する。
+    /// 選択情報に場所をフルパスで表示する。
     #[serde(default)]
     pub thumb_tooltip_show_full_location: bool,
-    /// サムネイル選択情報ツールチップに読書履歴の最終閲覧日時を表示する。
+    /// 選択情報に読書履歴の最終閲覧日時を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_reading_history_last_read: bool,
-    /// サムネイル選択情報ツールチップに読書履歴の既読位置を表示する。
+    /// 選択情報に読書履歴の既読位置を表示する。
     #[serde(default = "default_true")]
     pub thumb_tooltip_show_reading_history_progress: bool,
 
@@ -3498,6 +3551,7 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
             thumb_idle_upgrade: true,
+            selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -4831,6 +4885,7 @@ impl Settings {
         sanitize_details_column_widths(&mut self.details_column_widths);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
+        self.selection_info_display_mode = self.selection_info_display_mode.normalized();
         // 手編集や移行で非有限 / 範囲外の名前列幅が混入しても安全にする
         // (列幅と同じ 40.0..=800.0 へ clamp。実行時もレイアウト側で clamp するが二重に守る)。
         if !self.details_name_width.is_finite() {
@@ -5320,6 +5375,45 @@ mod tests {
                 && s.show_location_drive_roots,
             "場所メニュー項目は旧 settings 欠落時に全表示"
         );
+    }
+
+    #[test]
+    fn selection_info_display_mode_defaults_to_tooltip() {
+        assert_eq!(
+            Settings::default().selection_info_display_mode,
+            SelectionInfoDisplayMode::Tooltip
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.selection_info_display_mode,
+            SelectionInfoDisplayMode::Tooltip,
+            "旧設定でフィールドが欠けていても従来のツールチップ表示を維持する"
+        );
+    }
+
+    #[test]
+    fn selection_info_display_mode_normalizes_unknown_to_tooltip() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"selection_info_display_mode":"FutureMode"}"#).unwrap();
+        assert_eq!(
+            loaded.selection_info_display_mode,
+            SelectionInfoDisplayMode::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.selection_info_display_mode,
+            SelectionInfoDisplayMode::Tooltip
+        );
+    }
+
+    #[test]
+    fn bottom_bar_mode_suppresses_tooltip_but_both_keeps_it() {
+        assert!(!SelectionInfoDisplayMode::BottomBar.shows_tooltip());
+        assert!(SelectionInfoDisplayMode::BottomBar.shows_bottom_bar());
+        assert!(SelectionInfoDisplayMode::Both.shows_tooltip());
+        assert!(SelectionInfoDisplayMode::Both.shows_bottom_bar());
+        assert!(!SelectionInfoDisplayMode::Hidden.shows_tooltip());
+        assert!(!SelectionInfoDisplayMode::Hidden.shows_bottom_bar());
     }
 
     #[test]

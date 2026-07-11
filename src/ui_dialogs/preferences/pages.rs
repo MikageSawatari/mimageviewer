@@ -393,10 +393,21 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 
     ui.add_space(12.0);
-    ui.label(egui::RichText::new("サムネイル情報ツールチップ").strong());
+    ui.label(egui::RichText::new("選択情報の表示").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示方法:");
+        egui::ComboBox::from_id_salt("selection_info_display_mode")
+            .selected_text(s.selection_info_display_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::settings::SelectionInfoDisplayMode::all() {
+                    ui.selectable_value(&mut s.selection_info_display_mode, mode, mode.label());
+                }
+            });
+    });
     ui.label(
-        "サムネイル表示で選択中セルの下に表示する内容です。長さなどは必要なときにバックグラウンドで読み込みます。",
+        "ツールチップは選択行の下に、下部情報バーは一覧と重ならないウィンドウ下部に表示します。長さなどは必要なときにバックグラウンドで読み込みます。",
     );
+    ui.label("表示する項目:");
     ui.add_space(4.0);
     ui.checkbox(&mut s.thumb_tooltip_show_filename, "ファイル名");
     ui.checkbox(&mut s.thumb_tooltip_show_image_dimensions, "画像解像度");

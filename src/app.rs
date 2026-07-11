@@ -33040,10 +33040,8 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
-            && !self.ai_model_facet_should_load()
-        {
-            let target_key = self.thumbnail_tooltip_lazy_target_key();
+        if self.selection_info_only_lazy_load() {
+            let target_key = self.selection_info_lazy_target_key();
             let pending_is_stale = self.details_meta_pending.as_ref().is_some_and(|pending| {
                 target_key
                     .as_ref()
@@ -33059,7 +33057,7 @@ impl App {
                 self.details_image_dims_state = LazyColumnState::NotRequested;
                 ctx.request_repaint();
             } else if self.details_meta_pending.is_none()
-                && self.thumbnail_tooltip_needs_lazy_meta_request()
+                && self.selection_info_needs_lazy_meta_request()
                 && !matches!(
                     self.details_image_dims_state,
                     LazyColumnState::NotRequested | LazyColumnState::Loading { .. }
@@ -33179,11 +33177,12 @@ impl App {
         }
         match self.settings.grid_view_mode {
             crate::settings::GridViewMode::Details => {
-                self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load()
+                self.details_any_lazy_columns_enabled()
+                    || self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx().is_some()
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.ai_model_facet_should_load()
-                    || self.thumbnail_tooltip_lazy_target_idx().is_some()
+                self.ai_model_facet_should_load() || self.selection_info_lazy_target_idx().is_some()
             }
         }
     }
@@ -33196,27 +33195,28 @@ impl App {
             || self.settings.details_show_video_codec
     }
 
-    fn thumbnail_tooltip_lazy_target_idx(&self) -> Option<usize> {
-        if self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
-            || self.items_are_drive_list
+    fn selection_info_lazy_target_idx(&self) -> Option<usize> {
+        if self.items_are_drive_list
             || self.items.is_empty()
+            || (!self.settings.selection_info_display_mode.shows_tooltip()
+                && !self.settings.selection_info_display_mode.shows_bottom_bar())
         {
             return None;
         }
         let idx = self.selected?;
-        if idx >= self.items.len() || !self.details_item_requires_lazy_meta(idx) {
+        if idx >= self.items.len() || !self.selection_info_item_requires_lazy_meta(idx) {
             return None;
         }
         Some(idx)
     }
 
-    fn thumbnail_tooltip_lazy_target_key(&self) -> Option<String> {
-        let idx = self.thumbnail_tooltip_lazy_target_idx()?;
+    fn selection_info_lazy_target_key(&self) -> Option<String> {
+        let idx = self.selection_info_lazy_target_idx()?;
         self.metadata_cache_key(idx)
     }
 
-    fn thumbnail_tooltip_needs_lazy_meta_request(&self) -> bool {
-        let Some(idx) = self.thumbnail_tooltip_lazy_target_idx() else {
+    fn selection_info_needs_lazy_meta_request(&self) -> bool {
+        let Some(idx) = self.selection_info_lazy_target_idx() else {
             return false;
         };
         self.details_lazy_meta_for_idx(idx)
@@ -33224,9 +33224,40 @@ impl App {
             .unwrap_or(true)
     }
 
+    fn selection_info_only_lazy_load(&self) -> bool {
+        !self.ai_model_facet_should_load()
+            && match self.settings.grid_view_mode {
+                crate::settings::GridViewMode::Thumbnail => true,
+                crate::settings::GridViewMode::Details => !self.details_any_lazy_columns_enabled(),
+            }
+    }
+
+    fn selection_info_item_requires_lazy_meta(&self, idx: usize) -> bool {
+        (self.settings.thumb_tooltip_show_created && self.details_item_supports_created_at(idx))
+            || (self.settings.thumb_tooltip_show_image_dimensions
+                && self.details_item_supports_image_dims(idx))
+            || match self.items.get(idx) {
+                Some(GridItem::Video(_)) => {
+                    self.settings.thumb_tooltip_show_video_duration
+                        || self.settings.thumb_tooltip_show_video_dimensions
+                        || self.settings.thumb_tooltip_show_video_codec
+                }
+                Some(GridItem::Audio(_)) => {
+                    self.settings.thumb_tooltip_show_video_duration
+                        || self.settings.thumb_tooltip_show_video_codec
+                }
+                _ => false,
+            }
+    }
+
     fn lazy_load_created_for_idx(&self, idx: usize) -> bool {
         let requested = match self.settings.grid_view_mode {
-            crate::settings::GridViewMode::Details => self.settings.details_show_created,
+            crate::settings::GridViewMode::Details => {
+                self.settings.details_show_created
+                    || (self.selection_info_only_lazy_load()
+                        && self.selection_info_lazy_target_idx() == Some(idx)
+                        && self.settings.thumb_tooltip_show_created)
+            }
             crate::settings::GridViewMode::Thumbnail => self.settings.thumb_tooltip_show_created,
         };
         requested && self.details_item_supports_created_at(idx)
@@ -33234,7 +33265,12 @@ impl App {
 
     fn lazy_load_image_dims_for_idx(&self, idx: usize) -> bool {
         let requested = match self.settings.grid_view_mode {
-            crate::settings::GridViewMode::Details => self.settings.details_show_image_dimensions,
+            crate::settings::GridViewMode::Details => {
+                self.settings.details_show_image_dimensions
+                    || (self.selection_info_only_lazy_load()
+                        && self.selection_info_lazy_target_idx() == Some(idx)
+                        && self.settings.thumb_tooltip_show_image_dimensions)
+            }
             crate::settings::GridViewMode::Thumbnail => {
                 self.settings.thumb_tooltip_show_image_dimensions
             }
@@ -33244,11 +33280,18 @@ impl App {
 
     fn lazy_load_video_meta_for_idx(&self, idx: usize) -> bool {
         let (want_duration, want_dims, want_codec) = match self.settings.grid_view_mode {
-            crate::settings::GridViewMode::Details => (
-                self.settings.details_show_video_duration,
-                self.settings.details_show_video_dimensions,
-                self.settings.details_show_video_codec,
-            ),
+            crate::settings::GridViewMode::Details => {
+                let selection_target = self.selection_info_only_lazy_load()
+                    && self.selection_info_lazy_target_idx() == Some(idx);
+                (
+                    self.settings.details_show_video_duration
+                        || (selection_target && self.settings.thumb_tooltip_show_video_duration),
+                    self.settings.details_show_video_dimensions
+                        || (selection_target && self.settings.thumb_tooltip_show_video_dimensions),
+                    self.settings.details_show_video_codec
+                        || (selection_target && self.settings.thumb_tooltip_show_video_codec),
+                )
+            }
             crate::settings::GridViewMode::Thumbnail => (
                 self.settings.thumb_tooltip_show_video_duration,
                 self.settings.thumb_tooltip_show_video_dimensions,
@@ -33461,22 +33504,17 @@ impl App {
 
         let generation = self.items_generation;
         let ai_facet_load = self.ai_model_facet_should_load();
-        let (order, visible_near): (Vec<usize>, HashSet<usize>) = if self.settings.grid_view_mode
-            == crate::settings::GridViewMode::Thumbnail
-            && !ai_facet_load
-        {
-            let order: Vec<usize> = self
-                .thumbnail_tooltip_lazy_target_idx()
-                .into_iter()
-                .collect();
-            let visible_near = order.iter().copied().collect();
-            (order, visible_near)
-        } else {
-            (
-                self.current_grid_order().to_vec(),
-                self.details_tag_prewarm_indices.iter().copied().collect(),
-            )
-        };
+        let (order, visible_near): (Vec<usize>, HashSet<usize>) =
+            if self.selection_info_only_lazy_load() {
+                let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
+                let visible_near = order.iter().copied().collect();
+                (order, visible_near)
+            } else {
+                (
+                    self.current_grid_order().to_vec(),
+                    self.details_tag_prewarm_indices.iter().copied().collect(),
+                )
+            };
         let mut visible_targets = Vec::new();
         let mut background_targets = Vec::new();
         let mut cached_done = 0usize;
@@ -51363,6 +51401,10 @@ impl eframe::App for App {
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
         self.render_details_lazy_status_bar(ctx);
+
+        // 下部情報バーは CentralPanel のグリッドより先に確保する。egui が残り領域を
+        // render_grid へ渡すため、last_viewport_h と仮想スクロール範囲にも反映される。
+        self.render_selection_info_bar(ctx);
         let folder_pane_nav = self.render_folder_pane(ctx);
 
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
