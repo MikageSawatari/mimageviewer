@@ -2762,6 +2762,22 @@ impl App {
                                         }
                                     });
                                 }
+                                ui.menu_button("スケーリング", |ui| {
+                                    for scale in crate::settings::ui_scale_factor_steps() {
+                                        let checked = (self.settings.ui_scale_factor - scale).abs()
+                                            < f32::EPSILON;
+                                        let prefix = if checked { "✓ " } else { "  " };
+                                        let percent = (scale * 100.0).round() as u32;
+                                        if ui
+                                            .button(format!("{prefix}{percent}%"))
+                                            .clicked()
+                                        {
+                                            self.set_ui_scale_factor(ctx, scale);
+                                            settings_changed = true;
+                                            ui.close();
+                                        }
+                                    }
+                                });
                                 ui.separator();
                                 let mut toolbar_menu_drawn = false;
                                 for &command in settings_menu_commands {

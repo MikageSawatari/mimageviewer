@@ -200,10 +200,14 @@ raise 経路で **allowlist 判定**):
 
 詳細は [vst3-integration.md](vst3-integration.md) の "Fullscreen focus handoff" 節を参照。
 
-**Geometry / DPI 同期**: presenter HWND の `WM_WINDOWPOSCHANGED` → `GeometryChanged` event →
-HUD HWND の `SetWindowPos` + overlay surface resize。HUD HWND の `WM_DPICHANGED` → `DpiChanged` event →
-`set_overlay_pixels_per_point(dpi/96.0)` + HUD `set_hud_geometry(suggested_rect)` +
-`resize_overlay_surface_only`。presenter HWND 自身 (= video transform / background) には影響させない。
+**Geometry / DPI / UI 表示倍率の同期**: presenter HWND の `WM_WINDOWPOSCHANGED` →
+`GeometryChanged` event → HUD HWND の `SetWindowPos` + overlay surface resize。HUD HWND の
+`WM_DPICHANGED` → `DpiChanged` event → `set_overlay_pixels_per_point(dpi/96.0)` + HUD
+`set_hud_geometry(suggested_rect)` + `resize_overlay_surface_only`。`NativeEguiOverlay` は main egui
+Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源を
+`(dpi / 96.0) * ui_scale` とする。`NativeVideoOutput.cur_ui_scale` と command 経路で実行中の変更を
+伝え、placement 切替で presenter を再生成するときも同じ値を再適用する。presenter HWND 自身
+(= video transform / background) には影響させず、VST editor の別 HWND にもアプリ内倍率を掛けない。
 
 **フォールバック経路**: HUD HWND 生成失敗 / 環境変数 `MIV_HUD_OVERLAY=0` でフォールバック有効化。
 従来通り egui overlay を presenter HWND の DComp tree に attach (`NativeEguiOverlay::new` の

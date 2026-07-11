@@ -9006,6 +9006,31 @@ impl Default for App {
 }
 
 impl App {
+    /// 設定メニューで選ばれた UI 表示倍率を main Context と全 live native presenter へ
+    /// 同期する。detached の状態判定・配置には触れず、保持中 presenter の ppp だけを更新する。
+    pub(crate) fn set_ui_scale_factor(&mut self, ctx: &egui::Context, value: f32) {
+        let scale = crate::settings::apply_ui_scale_factor(ctx, value);
+        self.settings.ui_scale_factor = scale;
+
+        #[cfg(windows)]
+        {
+            for entry in self.fs_cache.values() {
+                if let FsCacheEntry::Video { player, .. } = entry {
+                    player.set_native_ui_scale(scale);
+                }
+            }
+            for window in &self.detached_image_windows {
+                if let Some(bundle) = window.paused_bundle.as_deref() {
+                    for entry in bundle.fs_cache.values() {
+                        if let FsCacheEntry::Video { player, .. } = entry {
+                            player.set_native_ui_scale(scale);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 起動時の保存済み設定 `saved` を受け取って App を構築する (Phase 4)。
     ///
     /// spec §8 で並列 `Settings::load()` を撲滅した結果、production では main thread の
@@ -37794,6 +37819,7 @@ impl App {
                             self.video_tile_mode_active || self.video_tile_reopen_pending,
                             self.settings.vst3_enabled,
                             self.checked.contains(&idx),
+                            self.settings.ui_scale_factor,
                             self.settings.fullscreen_cursor_hide_delay_secs,
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
@@ -53744,6 +53770,7 @@ fn native_video_presenter_config(
     initial_tile_overlay: bool,
     vst3_available: bool,
     checked: bool,
+    ui_scale: f32,
     cursor_hide_delay_secs: f32,
     editor_hwnds_snapshot: Option<
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
@@ -53770,6 +53797,7 @@ fn native_video_presenter_config(
         // child presenter を指定すると z-order/focus が壊れるため、音声処理だけ継続する。
         vst3_available: vst3_available && placement.is_fullscreen_borderless(),
         checked,
+        ui_scale: crate::settings::normalize_ui_scale_factor(ui_scale),
         cursor_hide_delay_secs: crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
             cursor_hide_delay_secs,
         ),

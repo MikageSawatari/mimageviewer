@@ -88,6 +88,11 @@ resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで
 2. mpsc で (idx, ColorImage, from_cache, source_dims) を送信
 ```
 
+`display_px` の算出には main egui Context の実効 `pixels_per_point` (= OS DPI × UI 表示倍率) を
+使う。そのため「設定 → スケーリング」を上げるとサムネイル / 表示用デコード解像度も上がり、
+高倍率ではメモリ使用量が増える。要求サイズは 256〜2048px に clamp されるため、UI 表示倍率を
+200% にしても 2048px を超えて増え続けることはない。
+
 ### 1.3.1 親コンテナの代表サムネ — 優先順位
 
 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネは次の順で決まる:

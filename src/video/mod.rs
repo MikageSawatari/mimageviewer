@@ -318,6 +318,8 @@ pub struct NativeVideoOutputConfig {
     pub vst3_available: bool,
     pub checked: bool,
     pub cursor_hide_delay_secs: f32,
+    /// main egui Context の zoom_factor を native overlay にミラーする倍率。
+    pub ui_scale: f32,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -538,6 +540,10 @@ pub(crate) struct SwitchSourcePayload {
 
 #[cfg(windows)]
 enum NativeVideoOutputCommand {
+    #[allow(dead_code)]
+    SetUiScale {
+        scale: f32,
+    },
     SetHoverThumbnail {
         thumbnail: Option<native_presenter::NativeOverlayThumbnail>,
     },
@@ -760,6 +766,9 @@ pub(crate) struct NativeVideoOutput {
     committed_generation: AtomicU64,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
+    /// presenter 再生成時にも再適用する現在の UI 表示倍率 (f32::to_bits)。
+    #[allow(dead_code)]
+    cur_ui_scale: AtomicU32,
     command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
     event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(u64, NativeVideoOutputEvent)>>,
     /// Presenter thread 内で起きた fatal init error (`CoInitializeEx` /
@@ -788,6 +797,7 @@ impl NativeVideoOutput {
             committed_generation: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
+            cur_ui_scale: AtomicU32::new(1.0_f32.to_bits()),
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error: Arc::new(Mutex::new(None)),
@@ -822,6 +832,7 @@ impl NativeVideoOutput {
         let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
         let initial_checked = config.checked;
+        let initial_ui_scale = crate::settings::normalize_ui_scale_factor(config.ui_scale);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -897,6 +908,7 @@ impl NativeVideoOutput {
             committed_generation: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
+            cur_ui_scale: AtomicU32::new(initial_ui_scale.to_bits()),
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             init_error,
@@ -921,6 +933,18 @@ impl NativeVideoOutput {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    fn set_ui_scale(&self, scale: f32) {
+        let scale = crate::settings::normalize_ui_scale_factor(scale);
+        if self.cur_ui_scale.swap(scale.to_bits(), Ordering::AcqRel) == scale.to_bits() {
+            return;
+        }
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetUiScale { scale });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
     /// Inc 7 hidden presenter: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
@@ -1923,6 +1947,7 @@ fn run_native_video_output(
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
+            ui_scale: config.ui_scale,
             hud_event_tx,
         },
     ) {
@@ -1976,6 +2001,7 @@ fn run_native_video_output(
     let mut cur_owner_hwnd = config.owner_hwnd;
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
+    let mut cur_ui_scale = crate::settings::normalize_ui_scale_factor(config.ui_scale);
     let mut cur_hud_dimmed = false;
     let mut cur_sar: Option<(u32, u32)> = None;
     // **review #12 対応**: SwitchPlacement で presenter を作り直したとき再適用が
@@ -2397,6 +2423,10 @@ fn run_native_video_output(
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
         while let Ok(command) = command_rx.try_recv() {
             match command {
+                NativeVideoOutputCommand::SetUiScale { scale } => {
+                    cur_ui_scale = crate::settings::normalize_ui_scale_factor(scale);
+                    presenter.set_ui_scale(cur_ui_scale);
+                }
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
                     presenter.set_overlay_hover_thumbnail(thumbnail);
                 }
@@ -2843,6 +2873,7 @@ fn run_native_video_output(
                                                 true,
                                             ),
                                             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
+                                            ui_scale: cur_ui_scale,
                                             hud_event_tx: new_hud_event_tx,
                                         },
                                     );
@@ -3176,7 +3207,7 @@ fn run_native_video_output(
                     suggested_rect,
                 } => {
                     // CP8: HUD HWND の `WM_DPICHANGED` を受けて以下を実行:
-                    //   1. overlay の pixels_per_point を `dpi / 96.0` で更新
+                    //   1. overlay の pixels_per_point を `(dpi / 96.0) * ui_scale` で更新
                     //   2. HUD HWND を `suggested_rect` で移動・リサイズ
                     //   3. **overlay surface のみ** を新サイズで resize (= `resize_overlay_surface_only`)。
                     //      presenter 全体 (background / video transform / swap chain) はここでは触らない
@@ -5664,6 +5695,15 @@ impl VideoPlayer {
             .as_ref()
             .map(NativeVideoOutput::hwnd)
             .unwrap_or(0)
+    }
+
+    /// main egui Context の UI 表示倍率を native overlay へ同期する。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn set_native_ui_scale(&self, scale: f32) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_ui_scale(scale);
+        }
     }
 
     /// Inc 7 hidden presenter (動画→音声モード): presenter ウィンドウ (+ HUD overlay) の
