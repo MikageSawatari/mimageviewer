@@ -799,10 +799,14 @@ pub fn draw_rating_stars(ui: &mut egui::Ui, current: u8) -> Option<u8> {
             } else {
                 egui::Color32::from_gray(96)
             };
-            let resp = ui.add(
-                egui::Label::new(egui::RichText::new("★").color(color).size(20.0))
-                    .sense(egui::Sense::click()),
-            );
+            // Label はクリック可能にしてもホバー時に I 字 (テキスト) カーソルになるため、
+            // クリックできる★であることが分かるよう PointingHand を明示する。
+            let resp = ui
+                .add(
+                    egui::Label::new(egui::RichText::new("★").color(color).size(20.0))
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.clicked() {
                 result = Some(if star == current { 0 } else { star });
             }
