@@ -38,6 +38,7 @@ const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
 const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
+const SELECTION_INFO_BAR_HEIGHT: f32 = 24.0;
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
     [255, 255, 255],
@@ -2024,6 +2025,21 @@ fn selection_info_parent_location_label(item: &GridItem) -> Option<String> {
             short_path_name(representative.parent()?).map(|name| format!("親フォルダ名 {name}"))
         }
         GridItem::ZipSeparator { .. } => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectionInfoContent {
+    lines: Vec<String>,
+}
+
+impl SelectionInfoContent {
+    fn tooltip_text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn single_line_text(&self) -> String {
+        self.lines.join("   ")
     }
 }
 
@@ -10940,34 +10956,45 @@ impl App {
 
     // ── 選択情報オーバーレイ ─────────────────────────────────────────
 
-    /// 選択中アイテムの情報をセル直下に表示する。
-    pub(crate) fn render_selection_info(&self, ctx: &egui::Context) {
-        // メインウィンドウを専有するビューア中は出さない (独自のホバーヘッダーを持つため)。
-        if self.viewer_session_blocks_main_window() {
-            return;
-        }
-        if self.settings.grid_view_mode == GridViewMode::Details {
-            return;
-        }
-        if self.items_are_drive_list {
-            return;
+    /// ツールチップと下部情報バーが共有する、選択情報の整形結果を構築する。
+    /// 参照するのは一覧・サムネイル・遅延メタデータの既存キャッシュだけで、I/O は行わない。
+    fn selection_info_content(&self) -> Option<SelectionInfoContent> {
+        let mut checked_indices = self
+            .checked
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                self.items
+                    .get(idx)
+                    .is_some_and(|item| !matches!(item, GridItem::ZipSeparator { .. }))
+            })
+            .collect::<Vec<_>>();
+        checked_indices.sort_unstable();
+        if checked_indices.len() > 1 {
+            let mut lines = vec![format!("{} 個選択", checked_indices.len())];
+            if self.settings.thumb_tooltip_show_file_size {
+                let total_size = checked_indices.iter().try_fold(0u64, |total, &idx| {
+                    let (_, size) = self.image_metas.get(idx).copied().flatten()?;
+                    total.checked_add(u64::try_from(size).ok()?)
+                });
+                if let Some(total_size) = total_size {
+                    lines.push(format!(
+                        "合計サイズ {}",
+                        crate::ui_helpers::format_details_size(
+                            total_size,
+                            self.settings.details_size_display_mode,
+                        )
+                    ));
+                }
+            }
+            return Some(SelectionInfoContent { lines });
         }
 
-        let (Some(idx), Some(cell_rect)) = (self.selected, self.selected_cell_rect) else {
-            return;
-        };
-
-        // ZipSeparator はスキップ
-        if matches!(
-            self.items.get(idx),
-            Some(GridItem::ZipSeparator { .. }) | None
-        ) {
-            return;
+        let idx = self.selected?;
+        let item = self.items.get(idx)?;
+        if matches!(item, GridItem::ZipSeparator { .. }) {
+            return None;
         }
-        let Some(item) = self.items.get(idx) else {
-            return;
-        };
-
         let mut lines = Vec::new();
         if self.settings.thumb_tooltip_show_filename {
             let name = item.name().into_owned();
@@ -11097,10 +11124,65 @@ impl App {
         if let Some(location) = full_location_line {
             lines.push(location);
         }
-        if lines.is_empty() {
+        (!lines.is_empty()).then_some(SelectionInfoContent { lines })
+    }
+
+    /// 選択情報の固定 1 行バーを、グリッド用 CentralPanel より先に確保する。
+    /// TopBottomPanel が `ctx.available_rect()` を縮めるため、render_grid が読む
+    /// `ui.available_height()` と仮想スクロールの viewport 高さには予約分が反映される。
+    pub(crate) fn render_selection_info_bar(&self, ctx: &egui::Context) {
+        if self.viewer_session_blocks_main_window()
+            || !self.settings.selection_info_display_mode.shows_bottom_bar()
+        {
             return;
         }
-        let text = lines.join("\n");
+
+        let text = if self.items_are_drive_list {
+            String::new()
+        } else {
+            self.selection_info_content()
+                .map(|content| content.single_line_text())
+                .unwrap_or_default()
+        };
+        let available_before = ctx.available_rect();
+        let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
+            .exact_height(SELECTION_INFO_BAR_HEIGHT)
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_sized(
+                        ui.available_size(),
+                        egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
+                    );
+                });
+            });
+        let available_after = ctx.available_rect();
+        debug_assert!(
+            available_before.height() <= 0.0
+                || available_before.height() - available_after.height() + 0.5
+                    >= panel.response.rect.height().min(available_before.height()),
+            "selection-info bar must reserve height before the grid viewport"
+        );
+    }
+
+    /// 選択中アイテムの情報を選択セル / 行の直下に表示する。
+    pub(crate) fn render_selection_info(&self, ctx: &egui::Context) {
+        // メインウィンドウを専有するビューア中は出さない (独自のホバーヘッダーを持つため)。
+        if self.viewer_session_blocks_main_window()
+            || !self.settings.selection_info_display_mode.shows_tooltip()
+            || self.items_are_drive_list
+        {
+            return;
+        }
+
+        let Some(cell_rect) = self.selected_cell_rect else {
+            return;
+        };
+        let Some(content) = self.selection_info_content() else {
+            return;
+        };
+        let text = content.tooltip_text();
 
         let viewport = ctx.content_rect();
         let popup_w = (cell_rect.width() * 2.5)
@@ -11185,6 +11267,205 @@ impl App {
                         ui.add(egui::Label::new(galley));
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod selection_info_tests {
+    use super::*;
+    use crate::app::DetailsLazyMeta;
+
+    fn app_with_item(item: GridItem, meta: Option<(i64, i64)>) -> App {
+        let mut app = App::default();
+        app.items = vec![item];
+        app.image_metas = vec![meta];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.settings.thumb_tooltip_show_kind = true;
+        app
+    }
+
+    fn loaded_thumbnail(ctx: &egui::Context, dims: (u32, u32)) -> ThumbnailState {
+        let tex = ctx.load_texture(
+            "selection_info_test",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        ThumbnailState::Loaded {
+            tex,
+            from_cache: false,
+            rendered_at_px: 128,
+            source_dims: Some(dims),
+        }
+    }
+
+    #[test]
+    fn shared_builder_formats_image_fields() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_item(
+            GridItem::Image(PathBuf::from(r"C:\pics\photo.jpg")),
+            Some((1_700_000_000, 2048)),
+        );
+        app.settings.thumb_tooltip_show_file_size = true;
+        app.thumbnails[0] = loaded_thumbnail(&ctx, (640, 480));
+
+        let text = app.selection_info_content().unwrap().single_line_text();
+        assert!(text.contains("photo.jpg"));
+        assert!(text.contains("種類 JPG 画像"));
+        assert!(text.contains("サイズ 2.0 KB"));
+        assert!(text.contains("画像 640 × 480"));
+    }
+
+    #[test]
+    fn shared_builder_formats_video_fields_from_cached_lazy_meta() {
+        let mut app = app_with_item(
+            GridItem::Video(PathBuf::from(r"C:\clips\movie.mp4")),
+            Some((1_700_000_000, 4096)),
+        );
+        app.settings.thumb_tooltip_show_video_dimensions = true;
+        app.settings.thumb_tooltip_show_video_codec = true;
+        let key = app.metadata_cache_key(0).unwrap();
+        app.details_lazy_meta.insert(
+            key,
+            DetailsLazyMeta {
+                source_mtime: 1_700_000_000,
+                source_size: 4096,
+                video_duration_secs: Some(125.0),
+                video_dims: Some((1920, 1080)),
+                video_codec: Some("h264".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let text = app.selection_info_content().unwrap().single_line_text();
+        assert!(text.contains("movie.mp4"));
+        assert!(text.contains("種類 MP4 動画"));
+        assert!(text.contains("長さ 2:05"));
+        assert!(text.contains("動画 1920 × 1080"));
+        assert!(text.contains("コーデック h264"));
+    }
+
+    #[test]
+    fn shared_builder_formats_zip_image_fields() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_item(
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\books\book.zip"),
+                entry_name: "chapter/page01.png".to_string(),
+            },
+            Some((1_700_000_000, 1024)),
+        );
+        app.thumbnails[0] = loaded_thumbnail(&ctx, (800, 1200));
+
+        let text = app.selection_info_content().unwrap().single_line_text();
+        assert!(text.contains("page01.png"));
+        assert!(text.contains("種類 ZIP 内画像"));
+        assert!(text.contains("画像 800 × 1200"));
+    }
+
+    #[test]
+    fn shared_builder_formats_pdf_page_fields() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_item(
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\book.pdf"),
+                page_num: 2,
+                content_type: None,
+            },
+            Some((1_700_000_000, 3072)),
+        );
+        app.thumbnails[0] = loaded_thumbnail(&ctx, (1200, 1600));
+
+        let text = app.selection_info_content().unwrap().single_line_text();
+        assert!(text.contains("Page 3"));
+        assert!(text.contains("種類 PDF ページ"));
+        assert!(text.contains("画像 1200 × 1600"));
+    }
+
+    #[test]
+    fn shared_builder_formats_zip_and_pdf_container_fields() {
+        let mut zip = app_with_item(
+            GridItem::ZipFile(PathBuf::from(r"C:\books\book.zip")),
+            Some((1_700_000_000, 4096)),
+        );
+        zip.settings.thumb_tooltip_show_file_size = true;
+        let zip_text = zip.selection_info_content().unwrap().single_line_text();
+        assert!(zip_text.contains("book.zip"));
+        assert!(zip_text.contains("種類 ZIP"));
+        assert!(zip_text.contains("サイズ 4.0 KB"));
+
+        let mut pdf = app_with_item(
+            GridItem::PdfFile(PathBuf::from(r"C:\books\book.pdf")),
+            Some((1_700_000_000, 8192)),
+        );
+        pdf.settings.thumb_tooltip_show_file_size = true;
+        let pdf_text = pdf.selection_info_content().unwrap().single_line_text();
+        assert!(pdf_text.contains("book.pdf"));
+        assert!(pdf_text.contains("種類 PDF"));
+        assert!(pdf_text.contains("サイズ 8.0 KB"));
+    }
+
+    #[test]
+    fn shared_builder_formats_multi_selection_and_cached_total_size() {
+        let mut app = App::default();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\pics\b.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\pics\c.jpg")),
+        ];
+        app.image_metas = vec![Some((1, 1024)), Some((2, 2048)), Some((3, 3072))];
+        app.selected = Some(1);
+        app.checked = [0usize, 1, 2].into_iter().collect();
+        app.settings.thumb_tooltip_show_file_size = true;
+
+        let content = app.selection_info_content().unwrap();
+        assert_eq!(content.lines, vec!["3 個選択", "合計サイズ 6.0 KB"]);
+    }
+
+    #[test]
+    fn multi_selection_omits_total_until_every_size_is_cached() {
+        let mut app = App::default();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\pics\b.jpg")),
+        ];
+        app.image_metas = vec![Some((1, 1024)), None];
+        app.selected = Some(0);
+        app.checked = [0usize, 1].into_iter().collect();
+        app.settings.thumb_tooltip_show_file_size = true;
+
+        assert_eq!(
+            app.selection_info_content().unwrap().lines,
+            vec!["2 個選択"]
+        );
+    }
+
+    #[test]
+    fn bottom_bar_reserves_height_from_grid_central_panel() {
+        let mut app = App::default();
+        app.settings.selection_info_display_mode =
+            crate::settings::SelectionInfoDisplayMode::BottomBar;
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut measured = None;
+
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect().height();
+            app.render_selection_info_bar(ctx);
+            let after = ctx.available_rect().height();
+            let central = egui::CentralPanel::default()
+                .show(ctx, |ui| ui.available_height())
+                .inner;
+            measured = Some((before, after, central));
+        });
+
+        let (before, after, central) = measured.unwrap();
+        assert!(before - after >= SELECTION_INFO_BAR_HEIGHT - 0.5);
+        assert!(central <= after + 0.5);
     }
 }
 

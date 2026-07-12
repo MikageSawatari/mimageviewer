@@ -1121,19 +1121,20 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態・AI モデル・生成ツールなど。場所条件はセッション中の一時状態で、フォルダ / ZIP / PDF / 仮想ビューの移動時に解除し、設定には保存しない。絞り込み中に ZIP/PDF/フォルダなどのコンテナへ入ると親階層の条件を一時退避し、内側では別条件を設定できる。Backspace などで親階層へ戻ると退避した条件を復元する |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
-| `thumb_tooltip_show_filename` | bool | true | サムネイル情報ツールチップにファイル名を表示するか |
-| `thumb_tooltip_show_image_dimensions` | bool | true | サムネイル情報ツールチップに画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
-| `thumb_tooltip_show_video_duration` | bool | true | サムネイル情報ツールチップに長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |
-| `thumb_tooltip_show_kind` | bool | false | サムネイル情報ツールチップに種類を表示するか |
-| `thumb_tooltip_show_file_size` | bool | false | サムネイル情報ツールチップにファイルサイズを表示するか |
-| `thumb_tooltip_show_modified` | bool | false | サムネイル情報ツールチップに更新日時を表示するか |
-| `thumb_tooltip_show_created` | bool | false | サムネイル情報ツールチップに作成日時を表示するか。選択中の 1 件だけバックグラウンド取得する |
-| `thumb_tooltip_show_video_dimensions` | bool | false | サムネイル情報ツールチップに動画解像度を表示するか。長さと同じ遅延メタデータを使う (動画のみ) |
-| `thumb_tooltip_show_video_codec` | bool | false | サムネイル情報ツールチップにコーデックを表示するか。長さと同じ遅延メタデータを使う (動画・音声) |
-| `thumb_tooltip_show_location` | bool | false | サムネイル情報ツールチップに親フォルダ / コンテナ名を短い名前で表示するか。表示名は「親フォルダ名」 |
-| `thumb_tooltip_show_full_location` | bool | false | サムネイル情報ツールチップに場所をフルパスで表示するか。スマートフィルタの場所表示と同じラベルを使う |
-| `thumb_tooltip_show_reading_history_last_read` | bool | true | 読書履歴ビューのサムネイル情報ツールチップに最終閲覧日時を表示するか |
-| `thumb_tooltip_show_reading_history_progress` | bool | true | 読書履歴ビューのサムネイル情報ツールチップに既読位置を表示するか |
+| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報の表示方法。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。`BottomBar` はグリッドの `CentralPanel` より先に固定高を予約し、仮想スクロールの viewport 高さから除外される |
+| `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
+| `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
+| `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |
+| `thumb_tooltip_show_kind` | bool | false | 選択情報に種類を表示するか |
+| `thumb_tooltip_show_file_size` | bool | false | 選択情報にファイルサイズを表示するか。複数選択時は全件の値が取得済みなら合計サイズを表示する |
+| `thumb_tooltip_show_modified` | bool | false | 選択情報に更新日時を表示するか |
+| `thumb_tooltip_show_created` | bool | false | 選択情報に作成日時を表示するか。選択中の 1 件だけバックグラウンド取得する |
+| `thumb_tooltip_show_video_dimensions` | bool | false | 選択情報に動画解像度を表示するか。長さと同じ遅延メタデータを使う (動画のみ) |
+| `thumb_tooltip_show_video_codec` | bool | false | 選択情報にコーデックを表示するか。長さと同じ遅延メタデータを使う (動画・音声) |
+| `thumb_tooltip_show_location` | bool | false | 選択情報に親フォルダ / コンテナ名を短い名前で表示するか。表示名は「親フォルダ名」 |
+| `thumb_tooltip_show_full_location` | bool | false | 選択情報に場所をフルパスで表示するか。スマートフィルタの場所表示と同じラベルを使う |
+| `thumb_tooltip_show_reading_history_last_read` | bool | true | 読書履歴ビューの選択情報に最終閲覧日時を表示するか |
+| `thumb_tooltip_show_reading_history_progress` | bool | true | 読書履歴ビューの選択情報に既読位置を表示するか |
 | `sort_order` | SortOrder | FileName | 通常フォルダのソート順（FileName / Numeric / DateAsc / DateDesc）。UI 上の `Numeric` は `番号順（区切り無視）` と表示する。本フォルダ閲覧中は UI を無効化し、設定値に関わらず番号順固定 |
 | `stack_separator` | char | `_` | ファイル名スタックの **フォールバック用** 区切り文字。グループ分けは常にスクリプト (ワーカー) で行うが、スクリプトがコンパイル/実行に失敗したときだけ、この区切り文字で「末尾区切りの前」で畳む組み込みルールへフォールバックする (例 `_`: `12345678_p0.jpg` → `12345678`)。スタックモードの ON/OFF 自体は transient で永続化しない。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | `stack_script_enabled` | bool | false | ファイル名スタックの分類にユーザー定義スクリプトを使うか。**false でも内蔵既定スクリプト (mXD/末尾連番/先頭連番/連写のカスケード) で分類する** (常にワーカー実行)。true のときユーザーの `<data_dir>/stack_rules.rhai` (無ければ内蔵既定) を使う。どちらも失敗時は `stack_separator` の組み込みルールへフォールバック。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
