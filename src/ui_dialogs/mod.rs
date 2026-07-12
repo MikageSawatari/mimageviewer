@@ -10,6 +10,7 @@
 mod about;
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
+pub(crate) mod batch_convert;
 mod cache_creator;
 mod cache_manager;
 pub(crate) mod context_menu;

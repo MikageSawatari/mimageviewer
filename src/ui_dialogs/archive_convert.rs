@@ -23,7 +23,7 @@ use eframe::egui;
 use crate::app::App;
 use crate::archive_cache::ArchiveCacheDb;
 use crate::archive_converter::{
-    ArchiveFormat, ArchiveImageSummary, ConvertError, ConvertProgress,
+    ArchiveFormat, ArchiveImageSummary, ConvertError, ConvertOptions, ConvertProgress,
     convert_to_zip_with_password, scan_summary_with_password,
 };
 
@@ -269,7 +269,7 @@ impl App {
         if self.settings.archive_file_handling_ignores_convertible() {
             return false;
         }
-        if self.archive_convert.is_some() {
+        if self.archive_convert.is_some() || self.batch_convert.is_some() {
             return false;
         }
         let rx = spawn_archive_scan(src.clone(), format, None, false);
@@ -306,6 +306,7 @@ impl App {
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible()
             || self.archive_convert.is_some()
+            || self.batch_convert.is_some()
         {
             return false;
         }
@@ -701,7 +702,7 @@ impl App {
                             ui.label(format!(
                                 "{fmt_label} を同じフォルダの同名 ZIP ファイルに変換します。"
                             ));
-                            ui.label("元ファイルはそのまま残ります。同名 ZIP がある場合は上書きします。");
+                            ui.label("元ファイルはそのまま残ります。");
                         } else if is_zip_expand {
                             ui.label(
                                 "この ZIP には RAR / 7z / LZH などのアーカイブが\
@@ -1106,6 +1107,7 @@ impl App {
                 password.as_deref(),
                 &cancel_worker,
                 Some(&cb),
+                ConvertOptions::default(), // 閲覧キャッシュは従来どおり寛容・上書き可
             );
             let msg = match result {
                 Ok(summary) => {
@@ -1195,6 +1197,10 @@ impl App {
                 password.as_deref(),
                 &cancel_worker,
                 Some(&cb),
+                ConvertOptions {
+                    no_clobber: true,
+                    verify: true,
+                },
             )
             .map(|summary| {
                 let size = std::fs::metadata(&dst).map_or(0, |meta| meta.len() as i64);

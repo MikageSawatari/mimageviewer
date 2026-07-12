@@ -97,7 +97,10 @@ impl App {
     /// タグ操作 (`tag_targets`) と旧XMP取り込み (`legacy_xmp_targets`) の**両方がこの
     /// 1 実装を使う** — bulk_intent の stale-check が片方だけ改良されると、同じ選択でも
     /// 対象ファイル集合が割れ、破壊的な XMP 編集が想定外のファイルに当たる。
-    fn selection_target_indices(&self, surface: crate::app::ActionSurface) -> Vec<usize> {
+    pub(crate) fn selection_target_indices(
+        &self,
+        surface: crate::app::ActionSurface,
+    ) -> Vec<usize> {
         // Viewer 面はビューアの現在アイテムだけを対象にする。MainWindow 面では
         // fullscreen_idx を見ない: detached viewer 中はグリッドとビューアを同時に
         // 操作できるため、「fullscreen_idx があればフルスクリーン対象」という従来の

@@ -88,8 +88,14 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 **フラットな literal エントリ名** (`"books/inner.rar/p01.jpg"`) で書くので、ツリー表示は
 `/` split だけで入れ子アーカイブが「本」ノードになる。要点:
 
-- 深さ上限 `MAX_NESTED_ARCHIVE_DEPTH` (=8)。超過・壊れた・パスワード付き入れ子は
-  ログ + skip (変換全体は続行。`expand_nested_guarded` が Archive 系エラーだけ握る)
+- 深さ上限 `MAX_NESTED_ARCHIVE_DEPTH` (=8)。閲覧用 cache 変換は、超過・壊れた・
+  パスワード付き入れ子をログ + skip して従来の寛容な表示用変換を維持する。
+- 「変換 > ZIP ファイルに変換」の sibling / batch 経路は
+  `ConvertOptions { no_clobber: true, verify: true }` を使う。`verify` は
+  `ConvertCtx.strict` も兼ね、入れ子展開失敗、アーカイブエントリ読取失敗、
+  LZH の未対応圧縮方式 / CRC 不一致、深さ超過を伝播する。変換完了後は一時 ZIP を
+  publish 前に開き直し、画像数一致と全画像の終端 / CRC を検証する。どれか失敗すれば
+  `TmpCleanup` が一時 ZIP を削除し、同名 `.zip` は残さない。
 - **読み戻し**: cache ZIP の literal な `".zip/"` 入りエントリ名は、`read_entry_bytes` の
   **exact-name fallback** (NESTED_CACHE 未ヒット時にフルネーム直接読みを先に試す) で
   解決される。`".rar/"` 等の境界はそもそも分割対象でないので直接読みになる

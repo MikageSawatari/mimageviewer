@@ -989,6 +989,7 @@ impl App {
             if let Some(mut state) = self.pref_state.take() {
                 let old_dup = (
                     self.settings.skip_zip_if_folder_exists,
+                    self.settings.skip_archive_if_zip_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
@@ -1146,6 +1147,7 @@ impl App {
                 // video_thumb_overrides を作り直すため)
                 let new_dup = (
                     self.settings.skip_zip_if_folder_exists,
+                    self.settings.skip_archive_if_zip_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),

@@ -2116,13 +2116,19 @@ impl App {
                     GridItem::Video(path) => Some(path.clone()),
                     _ => None,
                 });
-        let selected_convert_archive =
-            self.selected
-                .and_then(|idx| self.items.get(idx))
-                .and_then(|item| match item {
-                    GridItem::ConvertibleArchive { path, format } => Some((path.clone(), *format)),
+        // 変換対象 = スペース選択 (checked) があればその集合、無ければカーソル位置の
+        // ConvertibleArchive。レーティング / タグと同じ selection_target_indices を使う。
+        let convert_target_count = {
+            let mut seen = std::collections::HashSet::new();
+            self.selection_target_indices(crate::app::ActionSurface::MainWindow)
+                .into_iter()
+                .filter_map(|idx| match self.items.get(idx) {
+                    Some(GridItem::ConvertibleArchive { path, .. }) => Some(path.clone()),
                     _ => None,
-                });
+                })
+                .filter(|p| seen.insert(p.clone()))
+                .count()
+        };
         let resolved_menu_layout = resolve_menu_layout(&self.settings.menu_layout);
         let open_folder_menu_label = self
             .keymap
@@ -2494,23 +2500,20 @@ impl App {
                                     if command != MenuCommandId::ConvertToZip {
                                         continue;
                                     }
-                                    let enabled = selected_convert_archive.is_some()
-                                        && self.archive_convert.is_none();
+                                    let enabled = convert_target_count > 0
+                                        && self.archive_convert.is_none()
+                                        && self.batch_convert.is_none();
                                     let response = ui
                                         .add_enabled(
                                             enabled,
                                             egui::Button::new(&convert_to_zip_menu_label),
                                         )
                                         .hover_tip_disabled(
-                                            "RAR/CBR/7z/CB7/LZH/LHA ファイルを選択してください",
+                                            "RAR/CBR/7z/CB7/LZH/LHA ファイルを選択してください\
+                                             (スペースキーで複数選択可)",
                                         );
                                     if response.clicked() {
-                                        if let Some((path, format)) =
-                                            selected_convert_archive.clone()
-                                        {
-                                            let _ = self
-                                                .request_explicit_zip_convert(path, format);
-                                        }
+                                        self.start_batch_convert_to_zip();
                                         ui.close();
                                     }
                                 }

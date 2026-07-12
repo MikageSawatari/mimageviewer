@@ -13,8 +13,8 @@
 //!   ([`crate::zip_tree`]) はエントリ名を `/` で split するので、入れ子アーカイブが
 //!   そのまま「本」ノードになる。読み戻しは literal なフルネーム一致
 //!   (`zip_loader::read_entry_bytes` の exact-name fallback) で解決される。
-//!   深さ上限 [`MAX_NESTED_ARCHIVE_DEPTH`]。壊れた / パスワード付き入れ子はログして skip
-//!   (変換全体は失敗させない)。
+//!   深さ上限 [`MAX_NESTED_ARCHIVE_DEPTH`]。閲覧キャッシュ変換では壊れた / パスワード付き
+//!   入れ子をログして skip する。明示 sibling / batch 変換では厳格に失敗させる。
 //! - キャンセル: `Arc<AtomicBool>` を各エントリ境界でチェック。
 //! - 進捗: `Fn(ConvertProgress)` コールバック。`files_total` は入れ子アーカイブを
 //!   展開するたびに増える (事前スキャンでは入れ子の中身を数えないため)。
@@ -151,6 +151,17 @@ pub struct ConvertProgress {
     pub files_total: u32,
     /// 書き込んだバイト数 (ZIP ヘッダ等は含まない、本体のみの目安)
     pub bytes_written: u64,
+}
+
+/// ZIP 変換の publish / 完全性検証オプション。
+///
+/// 閲覧キャッシュなど従来経路は [`Self::default`] (上書き可・寛容変換・検証なし)。
+/// ユーザーが元アーカイブを削除し得る明示 sibling / batch 変換だけ
+/// `no_clobber: true, verify: true` にする。`verify` は変換中の厳格モードも兼ねる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConvertOptions {
+    pub no_clobber: bool,
+    pub verify: bool,
 }
 
 /// 変換失敗理由。
@@ -442,9 +453,20 @@ pub fn convert_to_zip(
     cancel: &AtomicBool,
     progress: Option<&dyn Fn(ConvertProgress)>,
 ) -> Result<ArchiveImageSummary, ConvertError> {
-    convert_to_zip_with_password(src, dst, format, None, cancel, progress)
+    convert_to_zip_with_password(
+        src,
+        dst,
+        format,
+        None,
+        cancel,
+        progress,
+        ConvertOptions::default(),
+    )
 }
 
+/// `options.no_clobber` が `true` のとき、publish 時に `dst` が既に存在すれば上書きせず
+/// エラーで返す。`options.verify` が `true` のとき、入力展開を厳格化し、完成した tmp ZIP の
+/// 全画像を publish 前に開き直して CRC 検証付きで読み切る。
 pub fn convert_to_zip_with_password(
     src: &Path,
     dst: &Path,
@@ -452,6 +474,7 @@ pub fn convert_to_zip_with_password(
     password: Option<&str>,
     cancel: &AtomicBool,
     progress: Option<&dyn Fn(ConvertProgress)>,
+    options: ConvertOptions,
 ) -> Result<ArchiveImageSummary, ConvertError> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -459,25 +482,127 @@ pub fn convert_to_zip_with_password(
     // 中間ファイルに書いて atomic rename。途中失敗時に壊れた zip が残らないようにする。
     let tmp_path = dst.with_extension("zip.part");
     let _ = std::fs::remove_file(&tmp_path);
+    // 早期 return / panic のいずれでも .part を残さない RAII ガード。publish 成功後だけ
+    // disarm する (成功時は tmp が消費済みなので掃除不要)。
+    let mut tmp_guard = TmpCleanup::armed(&tmp_path);
 
-    let summary = match do_convert(src, &tmp_path, format, password, cancel, progress) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-    };
+    let summary = do_convert(
+        src,
+        &tmp_path,
+        format,
+        password,
+        cancel,
+        progress,
+        options.verify,
+    )?;
 
     if summary.image_count == 0 {
-        let _ = std::fs::remove_file(&tmp_path);
         return Err(ConvertError::NoImages);
     }
 
-    if let Err(e) = replace_file_atomic(&tmp_path, dst) {
-        let _ = std::fs::remove_file(&tmp_path);
+    if options.verify {
+        verify_output_zip(&tmp_path, summary.image_count, cancel)?;
+    }
+
+    // publish 直前の最終キャンセルチェック。検証中 / 検証後にキャンセルされたのに
+    // ZIP を公開してしまわないようにする (TmpCleanup が tmp を掃除する)。
+    if cancel.load(Ordering::Relaxed) {
+        return Err(ConvertError::Cancelled);
+    }
+
+    if let Err(e) = replace_file_atomic(&tmp_path, dst, options.no_clobber) {
+        // no_clobber の非置換 move が「既存 dst」で失敗した場合は、汎用 Io ではなく
+        // 意味の分かるメッセージで返す (publish 直前に同名 zip が現れたレース)。
+        if options.no_clobber && dst.exists() {
+            return Err(ConvertError::Archive(
+                "同名の ZIP が既に存在するため上書きしませんでした".to_string(),
+            ));
+        }
         return Err(ConvertError::Io(e));
     }
+    tmp_guard.disarm();
     Ok(summary)
+}
+
+fn verify_output_zip(
+    tmp_path: &Path,
+    expected_image_count: u32,
+    cancel: &AtomicBool,
+) -> Result<(), ConvertError> {
+    let file = match std::fs::File::open(tmp_path) {
+        Ok(file) => file,
+        Err(e) => return Err(output_verification_error(format!("ZIP を開けません: {e}"))),
+    };
+    let mut archive = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+        Ok(archive) => archive,
+        Err(e) => {
+            return Err(output_verification_error(format!(
+                "ZIP を解析できません: {e}"
+            )));
+        }
+    };
+
+    let mut image_count = 0u32;
+    for i in 0..archive.len() {
+        // 大きな ZIP の再読み込みは時間がかかるので、各エントリ境界でキャンセルを見る。
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ConvertError::Cancelled);
+        }
+        let mut entry = match archive.by_index(i) {
+            Ok(entry) => entry,
+            Err(e) => {
+                return Err(output_verification_error(format!(
+                    "エントリ {i} を開けません: {e}"
+                )));
+            }
+        };
+        if !entry.is_file() || !is_image_entry(entry.name()) {
+            continue;
+        }
+        image_count = image_count.saturating_add(1);
+        let name = entry.name().to_string();
+        if let Err(e) = std::io::copy(&mut entry, &mut std::io::sink()) {
+            return Err(output_verification_error(format!(
+                "{name} を最後まで読み取れません: {e}"
+            )));
+        }
+    }
+
+    if image_count != expected_image_count {
+        return Err(output_verification_error(format!(
+            "画像数が一致しません (変換時 {expected_image_count} 件、検証時 {image_count} 件)"
+        )));
+    }
+    Ok(())
+}
+
+fn output_verification_error(detail: impl std::fmt::Display) -> ConvertError {
+    ConvertError::Archive(format!("変換結果の検証に失敗しました: {detail}"))
+}
+
+/// 変換中の中間ファイル (`*.zip.part`) を drop 時に削除する RAII ガード。
+/// publish 成功後は [`Self::disarm`] で解除する。早期 return や panic の際に
+/// 巨大な `.part` を残さないため (Codex P3)。
+struct TmpCleanup<'a> {
+    path: Option<&'a Path>,
+}
+
+impl<'a> TmpCleanup<'a> {
+    fn armed(path: &'a Path) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TmpCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Atomically publish a completed sibling temp file over `dst`.
@@ -485,29 +610,41 @@ pub fn convert_to_zip_with_password(
 /// The temp path is always beside `dst`, so Windows `MoveFileExW` and POSIX `rename(2)`
 /// can replace the directory entry without a delete gap. A failed replace leaves the old
 /// destination intact.
+/// `no_clobber` が `true` のときは既存 `dst` を上書きしない (MoveFileExW から
+/// `MOVEFILE_REPLACE_EXISTING` を外し、dst が在れば失敗させる = atomic な no-clobber)。
 #[cfg(windows)]
-fn replace_file_atomic(tmp_path: &Path, dst: &Path) -> std::io::Result<()> {
+fn replace_file_atomic(tmp_path: &Path, dst: &Path, no_clobber: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
     use windows::core::PCWSTR;
 
+    let flags = if no_clobber {
+        MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    };
     let tmp_wide: Vec<u16> = tmp_path.as_os_str().encode_wide().chain([0]).collect();
     let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain([0]).collect();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(tmp_wide.as_ptr()),
-            PCWSTR(dst_wide.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .map_err(|error| std::io::Error::other(error.to_string()))
+    unsafe { MoveFileExW(PCWSTR(tmp_wide.as_ptr()), PCWSTR(dst_wide.as_ptr()), flags) }
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomic(tmp_path: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::rename(tmp_path, dst)
+fn replace_file_atomic(tmp_path: &Path, dst: &Path, no_clobber: bool) -> std::io::Result<()> {
+    if no_clobber {
+        // atomic no-clobber: hard_link は dst が既存なら EEXIST で失敗する (POSIX link(2))。
+        // link 成功時点で dst は変換結果を指す (publish 済み)。tmp の除去は best-effort に
+        // する — remove 失敗で Err を返すと、呼び出し側が「既存 dst にブロックされた」と
+        // 誤報告する (Codex P3)。呼び出し側の TmpCleanup ガードも残った tmp を掃除する。
+        // (実行時経路は Windows のみ。このパスは主に非 Windows の cargo check 用。)
+        std::fs::hard_link(tmp_path, dst)?;
+        let _ = std::fs::remove_file(tmp_path);
+        Ok(())
+    } else {
+        std::fs::rename(tmp_path, dst)
+    }
 }
 
 fn do_convert(
@@ -517,6 +654,7 @@ fn do_convert(
     password: Option<&str>,
     cancel: &AtomicBool,
     progress: Option<&dyn Fn(ConvertProgress)>,
+    strict: bool,
 ) -> Result<ArchiveImageSummary, ConvertError> {
     let out_file = std::fs::File::create(tmp_path)?;
     let mut zw = zip::ZipWriter::new(std::io::BufWriter::new(out_file));
@@ -529,6 +667,7 @@ fn do_convert(
         files_total: 0,
         bytes_written: 0,
         seen_names: std::collections::HashSet::new(),
+        strict,
     };
     match format {
         ArchiveFormat::Rar => expand_rar(&mut ctx, src, password, "", 0)?,
@@ -548,7 +687,11 @@ fn do_convert(
     };
     drop(ctx);
 
-    zw.finish().map_err(zip_writer_error)?;
+    // finish が返す BufWriter を明示的に flush し、ハンドルを閉じてから publish 前検証で
+    // 開き直す。BufWriter::drop の best-effort flush に出力完全性を委ねない。
+    let mut out = zw.finish().map_err(zip_writer_error)?;
+    out.flush()?;
+    drop(out);
     Ok(summary)
 }
 
@@ -575,6 +718,8 @@ struct ConvertCtx<'a> {
     bytes_written: u64,
     /// 出力エントリ名の一意化 (DI-5)。全階層・全入れ子で共有する。
     seen_names: std::collections::HashSet<String>,
+    /// 明示 sibling / batch 変換では、欠落につながる skip を許さず変換全体を失敗させる。
+    strict: bool,
 }
 
 impl ConvertCtx<'_> {
@@ -732,6 +877,16 @@ fn expand_nested_guarded(
     };
     match result {
         Ok(()) => Ok(()),
+        // 入れ子側の password error をそのまま返すと、単一変換 UI が外側アーカイブの
+        // password prompt と誤認して再試行を繰り返す。入れ子の読取失敗として確定させる。
+        Err(ConvertError::PasswordRequired) if ctx.strict => Err(ConvertError::Archive(format!(
+            "入れ子アーカイブ {prefix} を開くにはパスワードが必要です"
+        ))),
+        Err(ConvertError::BadPassword) if ctx.strict => Err(ConvertError::Archive(format!(
+            "入れ子アーカイブ {prefix} のパスワードが正しくありません"
+        ))),
+        // 明示 sibling / batch 変換は、入れ子の一部欠落を成功扱いにしない。
+        Err(e) if ctx.strict => Err(e),
         // TooLarge は展開爆弾なので skip せず伝播 (Cancelled / Io と同じ扱い)。
         Err(e @ (ConvertError::Cancelled | ConvertError::Io(_) | ConvertError::TooLarge)) => Err(e),
         Err(e) => {
@@ -763,8 +918,14 @@ fn expand_zip<R: Read + Seek>(
 
     for i in 0..archive.len() {
         ctx.check_cancel()?;
-        let Ok(mut entry) = archive.by_index(i) else {
-            continue;
+        let mut entry = match archive.by_index(i) {
+            Ok(entry) => entry,
+            Err(e) if ctx.strict => {
+                return Err(ConvertError::Archive(format!(
+                    "ZIP エントリ {i} を読み取れません: {e}"
+                )));
+            }
+            Err(_) => continue,
         };
         if !entry.is_file() {
             continue;
@@ -778,12 +939,24 @@ fn expand_zip<R: Read + Seek>(
             continue;
         }
         let Some(name) = normalize_entry_name(&raw_name) else {
+            if ctx.strict
+                && (is_image_entry(&normalized) || nested_archive_kind(&normalized).is_some())
+            {
+                return Err(ConvertError::Archive(format!(
+                    "安全な出力名に変換できないエントリです: {raw_name}"
+                )));
+            }
             continue;
         };
         if is_image_entry(&name) {
             ctx.write_image_reader(format!("{prefix}{name}"), &mut entry)?;
         } else if let Some(kind) = nested_archive_kind(&name) {
             if depth + 1 > MAX_NESTED_ARCHIVE_DEPTH {
+                if ctx.strict {
+                    return Err(ConvertError::Archive(format!(
+                        "入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} を超えました: {prefix}{name}"
+                    )));
+                }
                 crate::logger::log(format!(
                     "archive_converter: 入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} 超過、skip: {prefix}{name}"
                 ));
@@ -856,6 +1029,11 @@ fn expand_rar(
         } else if is_image_entry(&normalized) {
             match normalize_entry_name(&raw_name) {
                 Some(name) => RarEntryAction::Image(name),
+                None if ctx.strict => {
+                    return Err(ConvertError::Archive(format!(
+                        "安全な出力名に変換できない RAR エントリです: {raw_name}"
+                    )));
+                }
                 None => RarEntryAction::Skip,
             }
         } else if let Some(kind) = nested_archive_kind(&normalized) {
@@ -863,11 +1041,21 @@ fn expand_rar(
                 Some(name) if depth + 1 <= MAX_NESTED_ARCHIVE_DEPTH => {
                     RarEntryAction::Nested(name, kind)
                 }
+                Some(name) if ctx.strict => {
+                    return Err(ConvertError::Archive(format!(
+                        "入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} を超えました: {prefix}{name}"
+                    )));
+                }
                 Some(name) => {
                     crate::logger::log(format!(
                         "archive_converter: 入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} 超過、skip: {prefix}{name}"
                     ));
                     RarEntryAction::Skip
+                }
+                None if ctx.strict => {
+                    return Err(ConvertError::Archive(format!(
+                        "安全な出力名に変換できない RAR エントリです: {raw_name}"
+                    )));
                 }
                 None => RarEntryAction::Skip,
             }
@@ -951,6 +1139,13 @@ fn expand_7z(
         }
         if is_image_entry(&normalized) {
             let Some(name) = normalize_entry_name(&entry.name) else {
+                if ctx.strict {
+                    deferred = Some(ConvertError::Archive(format!(
+                        "安全な出力名に変換できない 7z エントリです: {}",
+                        entry.name
+                    )));
+                    return Ok(false);
+                }
                 // 正規化不能な画像エントリも drain してから skip (同上、stream 整合のため)。
                 std::io::copy(r, &mut std::io::sink())?;
                 return Ok(true);
@@ -963,10 +1158,23 @@ fn expand_7z(
         }
         if let Some(kind) = nested_archive_kind(&normalized) {
             let Some(name) = normalize_entry_name(&entry.name) else {
+                if ctx.strict {
+                    deferred = Some(ConvertError::Archive(format!(
+                        "安全な出力名に変換できない 7z エントリです: {}",
+                        entry.name
+                    )));
+                    return Ok(false);
+                }
                 std::io::copy(r, &mut std::io::sink())?;
                 return Ok(true);
             };
             if depth + 1 > MAX_NESTED_ARCHIVE_DEPTH {
+                if ctx.strict {
+                    deferred = Some(ConvertError::Archive(format!(
+                        "入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} を超えました: {prefix}{name}"
+                    )));
+                    return Ok(false);
+                }
                 crate::logger::log(format!(
                     "archive_converter: 入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} 超過、skip: {prefix}{name}"
                 ));
@@ -1067,38 +1275,84 @@ fn expand_lzh(
             )
         };
         let normalized = raw_name.replace('\\', "/");
-        if !is_dir && !should_ignore_entry(&normalized) && reader.is_decoder_supported() {
-            if is_image_entry(&normalized) {
-                if let Some(name) = normalize_entry_name(&raw_name) {
-                    ctx.write_image_reader(format!("{prefix}{name}"), &mut reader)?;
-                    // CRC 検証は失敗しても致命的ではない (ファイルは既に書き込み済み)。
+        if !is_dir && !should_ignore_entry(&normalized) {
+            let is_image = is_image_entry(&normalized);
+            let nested_kind = nested_archive_kind(&normalized);
+            if !reader.is_decoder_supported() {
+                if ctx.strict && (is_image || nested_kind.is_some()) {
+                    return Err(ConvertError::Archive(format!(
+                        "LZH エントリの圧縮方式に対応していません: {raw_name}"
+                    )));
+                }
+            } else if is_image {
+                let Some(name) = normalize_entry_name(&raw_name) else {
+                    if ctx.strict {
+                        return Err(ConvertError::Archive(format!(
+                            "安全な出力名に変換できない LZH エントリです: {raw_name}"
+                        )));
+                    }
+                    if !reader
+                        .next_file()
+                        .map_err(|e| ConvertError::Archive(e.to_string()))?
+                    {
+                        break;
+                    }
+                    continue;
+                };
+                ctx.write_image_reader(format!("{prefix}{name}"), &mut reader)?;
+                if let Err(e) = reader.crc_check() {
+                    if ctx.strict {
+                        return Err(ConvertError::Archive(format!(
+                            "LZH エントリの CRC 検証に失敗しました: {raw_name}: {e}"
+                        )));
+                    }
+                    crate::logger::log(format!(
+                        "archive_converter: LZH CRC mismatch for {raw_name}: {e}"
+                    ));
+                }
+            } else if let Some(kind) = nested_kind {
+                let Some(name) = normalize_entry_name(&raw_name) else {
+                    if ctx.strict {
+                        return Err(ConvertError::Archive(format!(
+                            "安全な出力名に変換できない LZH エントリです: {raw_name}"
+                        )));
+                    }
+                    if !reader
+                        .next_file()
+                        .map_err(|e| ConvertError::Archive(e.to_string()))?
+                    {
+                        break;
+                    }
+                    continue;
+                };
+                if depth + 1 > MAX_NESTED_ARCHIVE_DEPTH {
+                    if ctx.strict {
+                        return Err(ConvertError::Archive(format!(
+                            "入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} を超えました: {prefix}{name}"
+                        )));
+                    }
+                    crate::logger::log(format!(
+                        "archive_converter: 入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} 超過、skip: {prefix}{name}"
+                    ));
+                } else {
+                    let tmp = write_reader_to_temp(&mut reader, kind)?;
                     if let Err(e) = reader.crc_check() {
+                        if ctx.strict {
+                            return Err(ConvertError::Archive(format!(
+                                "LZH エントリの CRC 検証に失敗しました: {raw_name}: {e}"
+                            )));
+                        }
                         crate::logger::log(format!(
                             "archive_converter: LZH CRC mismatch for {raw_name}: {e}"
                         ));
                     }
-                }
-            } else if let Some(kind) = nested_archive_kind(&normalized) {
-                if let Some(name) = normalize_entry_name(&raw_name) {
-                    if depth + 1 > MAX_NESTED_ARCHIVE_DEPTH {
-                        crate::logger::log(format!(
-                            "archive_converter: 入れ子深さ上限 {MAX_NESTED_ARCHIVE_DEPTH} 超過、skip: {prefix}{name}"
-                        ));
-                    } else {
-                        let tmp = write_reader_to_temp(&mut reader, kind)?;
-                        if let Err(e) = reader.crc_check() {
-                            crate::logger::log(format!(
-                                "archive_converter: LZH CRC mismatch for {raw_name}: {e}"
-                            ));
-                        }
-                        expand_nested_guarded(
-                            ctx,
-                            kind,
-                            tmp.path(),
-                            &format!("{prefix}{name}/"),
-                            depth + 1,
-                        )?;
-                    }
+                    expand_nested_guarded(
+                        ctx,
+                        kind,
+                        tmp.path(),
+                        &format!("{prefix}{name}/"),
+                        depth + 1,
+                    )?;
                 }
             }
         }
@@ -1303,6 +1557,34 @@ mod tests {
     }
 
     #[test]
+    fn strict_convert_rejects_corrupt_nested_archive_and_cleans_tmp() {
+        let outer =
+            build_zip_bytes(&[("ok.jpg", b"OK"), ("bad.rar", b"this is not a rar archive")]);
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.zip");
+        let dst = dir.path().join("out.zip");
+        let tmp = dst.with_extension("zip.part");
+        std::fs::write(&src, outer).unwrap();
+
+        let result = convert_to_zip_with_password(
+            &src,
+            &dst,
+            ArchiveFormat::Zip,
+            None,
+            &AtomicBool::new(false),
+            None,
+            ConvertOptions {
+                no_clobber: true,
+                verify: true,
+            },
+        );
+
+        assert!(matches!(result, Err(ConvertError::Archive(_))));
+        assert!(!dst.exists(), "失敗した変換結果を publish しないこと");
+        assert!(!tmp.exists(), "TmpCleanup が中間 ZIP を削除すること");
+    }
+
+    #[test]
     fn zip_convert_ignores_macosx_entries() {
         // __MACOSX/ 配下と dot 始まりは通常 ZIP 閲覧 (zip_loader::should_ignore) と
         // 同様に除外する。
@@ -1439,10 +1721,76 @@ mod tests {
         std::fs::write(&dst, b"old zip").unwrap();
         std::fs::write(&tmp, b"new zip").unwrap();
 
-        replace_file_atomic(&tmp, &dst).unwrap();
+        replace_file_atomic(&tmp, &dst, false).unwrap();
 
         assert_eq!(std::fs::read(&dst).unwrap(), b"new zip");
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn no_clobber_replace_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("book.zip");
+        let tmp = dir.path().join("book.zip.part");
+        std::fs::write(&dst, b"user owned zip").unwrap();
+        std::fs::write(&tmp, b"new zip").unwrap();
+
+        // no_clobber = true なので既存 dst を上書きしない。
+        assert!(replace_file_atomic(&tmp, &dst, true).is_err());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"user owned zip");
+    }
+
+    #[test]
+    fn verify_output_zip_accepts_complete_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("complete.zip.part");
+        let bytes = build_zip_bytes(&[("a.jpg", b"A"), ("dir/b.png", b"BBBB")]);
+        std::fs::write(&path, bytes).unwrap();
+
+        verify_output_zip(&path, 2, &AtomicBool::new(false)).unwrap();
+    }
+
+    #[test]
+    fn verify_output_zip_aborts_on_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel.zip.part");
+        let bytes = build_zip_bytes(&[("a.jpg", b"A"), ("dir/b.png", b"BBBB")]);
+        std::fs::write(&path, bytes).unwrap();
+
+        // 事前にキャンセルを立てておくと、公開前検証は Cancelled で抜ける。
+        let error = verify_output_zip(&path, 2, &AtomicBool::new(true)).unwrap_err();
+        assert!(matches!(error, ConvertError::Cancelled));
+    }
+
+    #[test]
+    fn verify_output_zip_rejects_image_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count-mismatch.zip.part");
+        let bytes = build_zip_bytes(&[("a.jpg", b"A")]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = verify_output_zip(&path, 2, &AtomicBool::new(false)).unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::Archive(message)
+                if message.starts_with("変換結果の検証に失敗しました:")
+        ));
+    }
+
+    #[test]
+    fn verify_output_zip_rejects_truncated_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.zip.part");
+        let mut bytes = build_zip_bytes(&[("a.jpg", b"complete image bytes")]);
+        bytes.truncate(bytes.len().saturating_sub(12));
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = verify_output_zip(&path, 1, &AtomicBool::new(false)).unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::Archive(message)
+                if message.starts_with("変換結果の検証に失敗しました:")
+        ));
     }
 
     #[test]
@@ -1452,7 +1800,7 @@ mod tests {
         let missing_tmp = dir.path().join("missing.zip.part");
         std::fs::write(&dst, b"user owned zip").unwrap();
 
-        assert!(replace_file_atomic(&missing_tmp, &dst).is_err());
+        assert!(replace_file_atomic(&missing_tmp, &dst, false).is_err());
         assert_eq!(std::fs::read(&dst).unwrap(), b"user owned zip");
     }
 

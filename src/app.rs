@@ -6956,6 +6956,9 @@ pub struct App {
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
     pub(crate) delete_pending: Option<crate::delete_worker::DeletePending>,
+    /// 複数アーカイブの明示 ZIP 変換 (バッチ)。`start_batch_convert_to_zip` で spawn、
+    /// `poll_batch_convert` で受信、`show_batch_convert_progress_dialog` でモーダル表示。
+    pub(crate) batch_convert: Option<crate::ui_dialogs::batch_convert::BatchConvertPending>,
     /// 削除成功後に busy 等で残ったメタ行を永続 journal から再 purge する worker。
     pub(crate) delete_purge_retry_pending: Option<crate::metadata_cleanup::DeletePurgeRetryPending>,
     /// 起動時または新しい journal 追記後に retry worker を開始すべきか。
@@ -9700,6 +9703,7 @@ impl App {
             tag_legacy_seed_pending: None,
             tag_legacy_xmp_pending: None,
             delete_pending: None,
+            batch_convert: None,
             delete_purge_retry_pending: None,
             delete_purge_retry_needed: true,
             delete_purge_retry_after: None,
@@ -11213,6 +11217,7 @@ impl App {
             || self.local_adjust_effect_picker_dialog_open
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
+            || self.batch_convert.is_some()
             || self.editing_addon_install_state.is_some()
             || self.text_subdialog_open()
     }
@@ -11259,6 +11264,7 @@ impl App {
             || self.local_adjust_effect_picker_dialog_open
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
+            || self.batch_convert.is_some()
             // 編集用追加パック DL ダイアログ (フルスクリーンビューポートで描画)。表示中は
             // フルスクリーンのキー (Enter で閉じる / Esc で選択解除・テキストモード退出 /
             // 矢印ナビ) を止め、ダイアログ操作に集中させる (Codex 監査)。
@@ -16218,6 +16224,7 @@ impl App {
         !crate::archive_cache::is_under_cache_root(zip_path)
             && self.archive_source_override.is_none()
             && self.archive_convert.is_none()
+            && self.batch_convert.is_none()
             && !self.is_snapshot_active()
             && !self.settings.archive_file_handling_ignores_convertible()
     }
@@ -50651,6 +50658,7 @@ impl eframe::App for App {
         self.poll_tag_legacy_seed_results();
         self.poll_legacy_xmp_import_results();
         self.poll_delete_pending();
+        self.poll_batch_convert();
         self.poll_file_drop_pending();
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
@@ -51277,6 +51285,7 @@ impl eframe::App for App {
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
         self.show_delete_progress_dialog(ctx);
+        self.show_batch_convert_progress_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
