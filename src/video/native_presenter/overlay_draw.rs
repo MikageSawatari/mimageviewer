@@ -436,8 +436,10 @@ pub(super) fn draw_native_jump_panel(
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: &mut Option<NativeBulkBookmarkDialog>,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+    click_to_show: bool,
+) -> bool {
     let panel_rect = native_jump_panel_rect(overlay_height_points);
+    let mut close_clicked = false;
 
     egui::Area::new(egui::Id::new("native_video_jump_panel"))
         .order(egui::Order::Foreground)
@@ -448,6 +450,7 @@ pub(super) fn draw_native_jump_panel(
                 ui,
                 panel_rect,
                 &VIDEO_JUMP_PANEL_OPTIONS,
+                if click_to_show { 32.0 } else { 0.0 },
                 position_secs,
                 entries,
                 jump_texture_ids,
@@ -456,7 +459,22 @@ pub(super) fn draw_native_jump_panel(
                 bulk_bookmark_dialog,
                 commands,
             );
+            if click_to_show {
+                let close_rect = egui::Rect::from_min_size(
+                    panel_rect.right_top() + egui::vec2(-30.0, 6.0),
+                    egui::vec2(24.0, 24.0),
+                );
+                let response = ui.interact(
+                    close_rect,
+                    egui::Id::new("native_jump_close"),
+                    egui::Sense::click(),
+                );
+                draw_overlay_button_bg(ui.painter(), close_rect, response.hovered(), false);
+                draw_overlay_close_icon(ui.painter(), close_rect);
+                close_clicked = response.on_hover_text("ジャンプパネルを閉じる").clicked();
+            }
         });
+    close_clicked
 }
 
 /// ジャンプ / ブックマークパネルの本体描画 (背景 + ヘッダボタン + スクロール一覧)。
@@ -470,6 +488,7 @@ pub(crate) fn draw_native_jump_panel_body(
     ui: &mut egui::Ui,
     panel_rect: egui::Rect,
     opts: &NativeJumpPanelOptions,
+    header_trailing_reserved: f32,
     position_secs: f64,
     entries: &[NativeOverlayJumpEntry],
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
@@ -511,7 +530,7 @@ pub(crate) fn draw_native_jump_panel_body(
     // ブックマーク系を右側にまとめる。一括は低頻度なので右端維持。
     if opts.show_bulk_button {
         let bulk_rect = egui::Rect::from_min_size(
-            rect.min + egui::vec2(rect.width() - 36.0, 6.0),
+            rect.min + egui::vec2(rect.width() - 36.0 - header_trailing_reserved, 6.0),
             egui::vec2(26.0, 24.0),
         );
         let bulk_resp = ui.interact(
@@ -538,7 +557,7 @@ pub(crate) fn draw_native_jump_panel_body(
 
     if opts.show_pin_button {
         let pin_rect = egui::Rect::from_min_size(
-            rect.min + egui::vec2(rect.width() - 100.0, 6.0),
+            rect.min + egui::vec2(rect.width() - 100.0 - header_trailing_reserved, 6.0),
             egui::vec2(26.0, 24.0),
         );
         let pin_resp = ui.interact(
@@ -565,7 +584,7 @@ pub(crate) fn draw_native_jump_panel_body(
     }
 
     let bm_rect = egui::Rect::from_min_size(
-        rect.min + egui::vec2(rect.width() - 68.0, 6.0),
+        rect.min + egui::vec2(rect.width() - 68.0 - header_trailing_reserved, 6.0),
         egui::vec2(26.0, 24.0),
     );
     let bm_resp = ui.interact(
@@ -1447,6 +1466,9 @@ pub(super) enum NativeTopButtonGlyph {
     Vst3,
     Close,
     WindowToggle,
+    Info {
+        click_to_show: bool,
+    },
     /// 音符 (♪): 動画→音声モードのトグルボタン (Inc 7)。
     AudioMode,
 }
@@ -1477,6 +1499,9 @@ pub(super) fn draw_native_top_button(
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
         NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
         NativeTopButtonGlyph::WindowToggle => draw_overlay_window_toggle_icon(painter, rect),
+        NativeTopButtonGlyph::Info { click_to_show } => {
+            draw_overlay_info_icon(painter, rect, click_to_show)
+        }
         NativeTopButtonGlyph::AudioMode => draw_overlay_music_note_icon(painter, rect),
     }
     let resp = resp.hover_tip_dark(tooltip);
@@ -1484,6 +1509,147 @@ pub(super) fn draw_native_top_button(
         commands.push(command);
     }
     *x -= width + gap;
+}
+
+fn draw_overlay_info_icon(painter: &egui::Painter, rect: egui::Rect, click_to_show: bool) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.3;
+    let color = if click_to_show {
+        egui::Color32::from_rgb(95, 175, 255)
+    } else {
+        egui::Color32::WHITE
+    };
+    painter.circle_stroke(c, r, egui::Stroke::new(1.5, color));
+    let bar_w = r * 0.22;
+    painter.line_segment(
+        [
+            egui::pos2(c.x, c.y - r * 0.05),
+            egui::pos2(c.x, c.y + r * 0.55),
+        ],
+        egui::Stroke::new(bar_w, color),
+    );
+    painter.circle_filled(egui::pos2(c.x, c.y - r * 0.45), bar_w * 0.7, color);
+    if click_to_show {
+        let tip = egui::pos2(c.x + r * 0.18, c.y + r * 0.1);
+        let size = r * 0.75;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                tip,
+                tip + egui::vec2(size * 0.12, size),
+                tip + egui::vec2(size * 0.42, size * 0.7),
+            ],
+            egui::Color32::WHITE,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 80, 130)),
+        ));
+        painter.line_segment(
+            [
+                tip + egui::vec2(size * 0.35, size * 0.64),
+                tip + egui::vec2(size * 0.68, size * 0.95),
+            ],
+            egui::Stroke::new(size * 0.18, color),
+        );
+    }
+}
+
+/// ClickToShow の最端 hover strip。pointer は physical px から overlay points へ
+/// 変換済みなので、共有定数も egui points として使う。
+pub(super) fn native_panel_callout_edge_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    left: bool,
+) -> egui::Rect {
+    let width = crate::ui_helpers::PANEL_CALLOUT_HIT_PX.min(overlay_width_points.max(1.0));
+    let x = if left {
+        0.0
+    } else {
+        (overlay_width_points - width).max(0.0)
+    };
+    egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(width, overlay_height_points))
+}
+
+pub(super) fn native_panel_callout_bar_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    left: bool,
+) -> egui::Rect {
+    let width = 20.0_f32.min(overlay_width_points.max(1.0));
+    let height = (overlay_height_points * 0.24)
+        .clamp(96.0, 220.0)
+        .min(overlay_height_points.max(1.0));
+    let x = if left {
+        0.0
+    } else {
+        (overlay_width_points - width).max(0.0)
+    };
+    let y = ((overlay_height_points - height) * 0.5).max(0.0);
+    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
+}
+
+pub(super) fn native_panel_callout_arrow_direction(left: bool, open: bool) -> f32 {
+    let inward = if left { 1.0 } else { -1.0 };
+    if open { -inward } else { inward }
+}
+
+pub(super) fn draw_native_panel_callout(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    left: bool,
+    open: bool,
+) -> bool {
+    let bar = native_panel_callout_bar_rect(overlay_width_points, overlay_height_points, left);
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new(if left {
+        "native_left_panel_callout"
+    } else {
+        "native_right_panel_callout"
+    }))
+    .order(crate::ui_helpers::PANEL_CALLOUT_ORDER)
+    .fixed_pos(bar.min)
+    .show(ctx, |ui| {
+        ui.set_min_size(bar.size());
+        let rect = egui::Rect::from_min_size(ui.min_rect().min, bar.size());
+        let response = ui.interact(
+            rect,
+            egui::Id::new(if left {
+                "native_left_panel_callout_hit"
+            } else {
+                "native_right_panel_callout_hit"
+            }),
+            egui::Sense::click(),
+        );
+        let fill = if response.hovered() {
+            egui::Color32::from_rgba_unmultiplied(48, 120, 190, 225)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(20, 36, 54, 205)
+        };
+        ui.painter().rect_filled(rect, 4.0, fill);
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(95, 175, 255)),
+            egui::StrokeKind::Inside,
+        );
+        let center = rect.center();
+        let direction = native_panel_callout_arrow_direction(left, open);
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(center.x + direction * 5.5, center.y),
+                egui::pos2(center.x - direction * 5.5, center.y - 8.0),
+                egui::pos2(center.x - direction * 5.5, center.y + 8.0),
+            ],
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
+        clicked = response
+            .hover_tip_dark(if left {
+                "ジャンプパネルを開閉"
+            } else {
+                "情報パネルを開閉"
+            })
+            .clicked();
+    });
+    clicked
 }
 
 pub(super) fn draw_native_frame_step_button(
@@ -2690,6 +2856,7 @@ pub(super) fn draw_native_top_bar(
     // 音声のみ native シェル (music Inc 6 ②): タイル一覧 / Perf グラフ (動画専用) を出さず、
     // 音楽ビュー上バーと同じ VST・フルスクリーン切替・閉じるだけにする。
     audio_only: bool,
+    side_panel_mode: crate::settings::FsSidePanelMode,
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
@@ -2780,6 +2947,28 @@ pub(super) fn draw_native_top_bar(
                     shortcuts.and_then(|s| s.window_mode.as_deref()),
                 ),
                 NativeOverlayCommand::ToggleWindowMode,
+                commands,
+            );
+            let side_panel_mode = side_panel_mode.normalized();
+            let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
+            let info_tip = format!(
+                "パネル表示: {}\nクリックで「{}」に切り替え",
+                side_panel_mode.label(),
+                side_panel_mode.toggled().label()
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_side_panel_mode",
+                NativeTopButtonGlyph::Info { click_to_show },
+                click_to_show,
+                &info_tip,
+                NativeOverlayCommand::ToggleSidePanelMode,
                 commands,
             );
             // タイル一覧 / Perf グラフ / 音声モードは動画専用。音声のみ native シェルでは出さない
@@ -3890,6 +4079,7 @@ pub(super) fn draw_native_metadata_panel(
     tag_picker_escape_pressed: bool,
     tag_picker_ime_active: bool,
     commands: &mut Vec<NativeOverlayCommand>,
+    click_to_show: bool,
 ) {
     let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
     egui::Area::new(egui::Id::new("native_video_metadata_panel"))
@@ -3923,6 +4113,23 @@ pub(super) fn draw_native_metadata_panel(
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(238, 238, 238),
             );
+            if click_to_show {
+                let close_rect = egui::Rect::from_min_size(
+                    rect.right_top() + egui::vec2(-58.0, 6.0),
+                    egui::vec2(24.0, 24.0),
+                );
+                let response = ui.interact(
+                    close_rect,
+                    egui::Id::new("native_metadata_close"),
+                    egui::Sense::click(),
+                );
+                draw_overlay_button_bg(painter, close_rect, response.hovered(), false);
+                draw_overlay_close_icon(painter, close_rect);
+                if response.on_hover_text("情報パネルを閉じる").clicked() {
+                    *tag_picker_open = false;
+                    commands.push(NativeOverlayCommand::ToggleClickInfoOpen);
+                }
+            }
 
             let title = metadata
                 .title

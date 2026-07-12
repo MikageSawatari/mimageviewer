@@ -52,6 +52,7 @@ pub mod dwm_iconic_thumbnail;
 pub mod dwm_transitions;
 pub mod editing_addon;
 pub mod editing_addon_download;
+pub mod egui_focus_policy;
 pub mod exif_reader;
 pub mod explorer_integration;
 pub mod export_crop;

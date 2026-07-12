@@ -142,6 +142,10 @@ pub enum FsSidePanelMode {
 - **決定 B = 明示クローズまで維持 (確定)**。バー / × / Esc で明示的に閉じるまでパネルは残る
   (マウス離脱では閉じない)。開いている間はバーを「閉じる」アフォーダンス (`◀`↔`▶` 反転 or `×`)
   に変える。
+- 呼び出しバーはパネルより高い固定 order で描画する。同じ order の `egui::Area` はクリックで
+  前面へ移動するため、パネル操作後も左右バーが背面へ回らないレイヤ分離を不変条件とする。
+- 3 面の左右パネルには ClickToShow 時だけヘッダ × を表示する。静止画左は
+  `画像補正 / 表示トリム` タブ幅を縮め、その右に painter の線 2 本で × を描く。
 - **右情報パネル (◀) の開状態は永続** (`fullscreen_click_info_open`)。画像切替でも維持し、
   フルスクリーンを抜けて再入場しても復元する (= 旧 Pinned の吸収。クリック 1 回で以後記憶)。
 - **左編集パネル (▶) の開状態はセッション限定**。画像切替はまたいで維持するが、フルスクリーンを
@@ -152,6 +156,9 @@ pub enum FsSidePanelMode {
 - `i` ボタン / `I` キー / Tab / ゲームパッド `ImageToggleMetadata` は **モードトグル
   (Hover ↔ ClickToShow)** にする (`cycle_fs_side_panel_mode` → 2 状態なので実質トグル)。
   永続。変更時にフィードバックトースト (`パネル表示: クリック表示` 等) を出す。
+- `I` / Tab は 1 物理押下につき 1 回だけ切り替える。egui 経路も autorepeat を受理しない。
+- キー処理の所有者は、静止画・音楽・動画→音声モード = egui、通常動画 = native presenter の
+  どちらか一方だけとする。hidden presenter からイベントが届く過渡状態でも二重発火させない。
 - アイコン: Hover = 通常色の `i` (`draw_info_icon`)。ClickToShow = `i` の右下に小さいマウス
   カーソルを重ねた青系アイコン (バックログ第一候補、`draw_icons.rs` に glyph 追加。視認性が
   悪ければ tooltip 補足)。tooltip は現在 + 次状態を明示。
@@ -180,6 +187,9 @@ pub enum FsSidePanelMode {
     動画=presenter ランタイム flag、音楽=`music_left_click_open` 等)。フルスクリーン退場でリセット。
 - **`i` ボタン = モードトグル** (Hover↔ClickToShow)。3 面すべての上バーに置き、同じ設定を切り替える。
   アイコンも 3 面で揃える (Hover=通常 `i` / ClickToShow=`i`+小マウスカーソル)。
+- 動画↔音声モードの遷移は左パネルの session 境界として扱い、動画 presenter の
+  `left_session_open` と音楽ビューの `music_left_click_open` を両方リセットする。
+  右の `fullscreen_click_info_open` は遷移をまたいで保持する。
 
 動画への伝搬 (native presenter は別スレッド):
 - `settings.fullscreen_side_panel_mode` / `fullscreen_click_info_open` を presenter へ **sync**
@@ -317,6 +327,12 @@ ClickToShow の右情報パネル開状態を永続化 (`fullscreen_click_info_o
   hover latch を無視、click_info_open で右が出る、等。既存テスト `mod.rs:8389-8642` に相乗り)。
 - **音楽**: 左右ラッチのモード分岐を純関数化してテスト (可能な範囲で)。
 - `i` / I / パッドが Hover↔ClickToShow をトグルし `open_fullscreen` を跨いで維持されること。
+- egui 0.33 の `begin_pass` が event consume より先に決める Tab focus 方向は、全 Context の
+  `on_begin_pass` ポリシーで TextEdit 編集中でない場合だけ `None` へ戻すこと。その後、通常押下 /
+  autorepeat を KeySlot と egui event queue の双方から consume する。ClickToShow で左右パネルが
+  開いていても、静止画・音声・動画→音声モードの 3 面で Tab が 1 物理押下 1 回だけ Hover と
+  往復すること。
+- TextEdit / IME が `wants_keyboard_input()` を所有する間は Tab を consume しないこと。
 - version_highlights テーブルのパース (`--lib version_highlights::`)。
 - UI スナップショット (必要なら) は `docs/ui-snapshot-policy.md` に従う。
 

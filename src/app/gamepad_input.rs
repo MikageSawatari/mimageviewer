@@ -4237,7 +4237,7 @@ impl App {
         false
     }
 
-    fn apply_ring_action(
+    pub(crate) fn apply_ring_action(
         &mut self,
         ctx: &egui::Context,
         context: RingShortcutContext,
@@ -4465,15 +4465,8 @@ impl App {
             RingActionId::ImageToggleMetadata
                 if context == RingShortcutContext::ImageFullscreen =>
             {
-                if let Some(fs_idx) = self.fullscreen_idx {
-                    if self.current_fullscreen_spread_is_double(fs_idx) {
-                        self.show_feedback_toast(
-                            "見開き表示中はメタデータ表示を切り替えできません".to_string(),
-                        );
-                    } else {
-                        self.show_metadata_panel = !self.show_metadata_panel;
-                        self.metadata_panel_hover_active = false;
-                    }
+                if self.fullscreen_idx.is_some() {
+                    self.cycle_fs_side_panel_mode();
                 }
                 None
             }

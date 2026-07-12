@@ -1015,6 +1015,8 @@ impl App {
                 let old_ai_feature_mode = self.settings.ai_feature_mode;
                 let old_reading_history_limit = self.settings.reading_history_limit;
                 let old_keymap_settings = self.settings.keymap.clone();
+                let old_fullscreen_side_panel_mode =
+                    self.settings.fullscreen_side_panel_mode.normalized();
 
                 // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
                 // 無効化トリガに使う)
@@ -1070,6 +1072,11 @@ impl App {
                     .reading_history_limit
                     .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
                 self.settings = state.settings;
+                if old_fullscreen_side_panel_mode
+                    != self.settings.fullscreen_side_panel_mode.normalized()
+                {
+                    self.reset_fs_side_panel_runtime_for_mode_change();
+                }
                 if old_keymap_settings != self.settings.keymap {
                     let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
                     for warning in keymap.warnings() {

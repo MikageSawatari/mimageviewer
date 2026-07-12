@@ -40,6 +40,75 @@ pub(crate) fn panel_edge_trigger_px(view_width: f32) -> f32 {
     view_width.max(0.0) * 0.05
 }
 
+/// クリック表示モードで呼び出しバーを出す画面最端の当たり幅。
+///
+/// 通常ホバーの 5% 帯より十分狭くし、画像上のクリック操作を奪わない。
+#[allow(dead_code)]
+pub(crate) const PANEL_CALLOUT_HIT_PX: f32 = 24.0;
+
+/// ClickToShow の呼び出しバーはパネル (`Foreground`) より常に手前に固定する。
+///
+/// 同じ Order の Area はクリックで前面へ移動するため、パネルと同じ Foreground にすると
+/// パネル操作後に呼び出しバーが背面へ回る。Tooltip order を専用の上位レイヤとして使う。
+#[allow(dead_code)]
+pub(crate) const PANEL_CALLOUT_ORDER: egui::Order = egui::Order::Tooltip;
+
+/// フルスクリーン左右パネル表示モードキーを処理する唯一の入力面。
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsSidePanelKeyOwner {
+    Egui,
+    NativeVideo,
+}
+
+/// 静止画 / 音楽 / 動画→音声モードは egui、通常動画だけ native presenter が所有する。
+/// hidden presenter からイベントが届く過渡状態でも両経路が同じ押下を処理しないための正本。
+#[allow(dead_code)]
+pub(crate) fn fs_side_panel_key_owner(
+    current_item_is_video: bool,
+    music_view_active: bool,
+) -> FsSidePanelKeyOwner {
+    if current_item_is_video && !music_view_active {
+        FsSidePanelKeyOwner::NativeVideo
+    } else {
+        FsSidePanelKeyOwner::Egui
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PanelEdge {
+    Left,
+    Right,
+    Top,
+}
+
+/// 呼び出しバーの最端帯にポインタが入っているか。
+#[allow(dead_code)]
+pub(crate) fn callout_hit(edge_rect: egui::Rect, pointer: Option<egui::Pos2>) -> bool {
+    pointer.is_some_and(|pos| edge_rect.contains(pos))
+}
+
+/// 端ホバーが静止画の左補正パネルを召喚するか。
+///
+/// Hover でも辺ごとに責務を分離し、左端だけが補正パネルを開く。
+#[allow(dead_code)]
+pub(crate) fn edge_summons_adjustment(
+    mode: crate::settings::FsSidePanelMode,
+    edge: PanelEdge,
+) -> bool {
+    mode.normalized() == crate::settings::FsSidePanelMode::Hover && edge == PanelEdge::Left
+}
+
+/// ClickToShow の右情報パネルが永続的に開いているか。
+#[allow(dead_code)]
+pub(crate) fn metadata_panel_persistently_shown(
+    mode: crate::settings::FsSidePanelMode,
+    click_info_open: bool,
+) -> bool {
+    mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow && click_info_open
+}
+
 /// 一度開いた左右パネルを「維持」するヒステリシス余白 (px)。トリガと同じく **ビュー幅の 5%**。
 /// 描画パネル矩形をこの分だけ広げた範囲から出るまで閉じない。パネル内端をわずかに越えた瞬間に
 /// パネルが消えるちらつきを防ぐ。
@@ -1988,5 +2057,45 @@ mod tests {
         ];
         let vi = vec![0, 1, 2];
         assert_eq!(first_slideshow_still_idx(&items, &vi), Some(2));
+    }
+
+    #[test]
+    fn callout_hit_only_accepts_pointer_inside_edge_rect() {
+        let edge = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(34.0, 220.0));
+        assert!(callout_hit(edge, Some(egui::pos2(10.0, 20.0))));
+        assert!(callout_hit(edge, Some(egui::pos2(33.9, 219.9))));
+        assert!(!callout_hit(edge, Some(egui::pos2(34.1, 100.0))));
+        assert!(!callout_hit(edge, None));
+    }
+
+    #[test]
+    fn side_panel_mode_key_has_exactly_one_owner_per_surface() {
+        use FsSidePanelKeyOwner::{Egui, NativeVideo};
+
+        assert_eq!(fs_side_panel_key_owner(false, false), Egui);
+        assert_eq!(fs_side_panel_key_owner(false, true), Egui);
+        assert_eq!(fs_side_panel_key_owner(true, true), Egui);
+        assert_eq!(fs_side_panel_key_owner(true, false), NativeVideo);
+        assert_eq!(PANEL_CALLOUT_ORDER, egui::Order::Tooltip);
+    }
+
+    #[test]
+    fn adjustment_summoning_is_left_hover_only() {
+        use crate::settings::FsSidePanelMode::{ClickToShow, Hover};
+        assert!(edge_summons_adjustment(Hover, PanelEdge::Left));
+        assert!(!edge_summons_adjustment(Hover, PanelEdge::Right));
+        assert!(!edge_summons_adjustment(Hover, PanelEdge::Top));
+        assert!(!edge_summons_adjustment(ClickToShow, PanelEdge::Left));
+        assert!(!edge_summons_adjustment(ClickToShow, PanelEdge::Right));
+        assert!(!edge_summons_adjustment(ClickToShow, PanelEdge::Top));
+    }
+
+    #[test]
+    fn metadata_persistence_is_click_mode_only() {
+        use crate::settings::FsSidePanelMode::{ClickToShow, Hover};
+        assert!(!metadata_panel_persistently_shown(Hover, false));
+        assert!(!metadata_panel_persistently_shown(Hover, true));
+        assert!(!metadata_panel_persistently_shown(ClickToShow, false));
+        assert!(metadata_panel_persistently_shown(ClickToShow, true));
     }
 }

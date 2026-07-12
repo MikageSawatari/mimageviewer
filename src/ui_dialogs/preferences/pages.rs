@@ -6534,6 +6534,15 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
+    egui::ComboBox::from_label("左右パネルの表示")
+        .selected_text(s.fullscreen_side_panel_mode.label())
+        .show_ui(ui, |ui| {
+            for &mode in crate::settings::FsSidePanelMode::all() {
+                ui.selectable_value(&mut s.fullscreen_side_panel_mode, mode, mode.label());
+            }
+        });
+    ui.small("通常ホバーは左端 / 右端で各パネルを表示します。クリック表示は最端の細いバーをクリックして開きます。");
+    ui.add_space(8.0);
     ui.label(
         "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向、0 でズーム/フィットを切り替えできます。",
     );

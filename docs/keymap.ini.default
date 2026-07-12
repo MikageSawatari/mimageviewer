@@ -244,6 +244,8 @@
 # GridDeleteConcealMask.2 = Shift+F10 ; 選択中またはチェック済み画像の隠蔽マスクを削除する
 
 [FsCommon] ; フルスクリーン共通
+# FsToggleMetadata.1 = I ; 左右パネルの表示モードを切り替える
+# FsToggleMetadata.2 = Tab ; 左右パネルの表示モードを切り替える
 # FsBackToList = Backspace ; フルスクリーンを閉じて一覧へ戻る
 # FsToggleWindowMode = F11 ; ウィンドウ表示と全画面表示を切り替える
 # FsJumpFirst = Home ; 先頭の項目へ移動する
@@ -268,8 +270,6 @@
 # RatingContainerClear = Shift+F6 ; レーティングを解除する（コンテナ）
 
 [FsImage] ; 画像フルスクリーン
-# FsToggleMetadata.1 = I ; メタデータパネルの固定表示を切り替える
-# FsToggleMetadata.2 = Tab ; メタデータパネルの固定表示を切り替える
 # FsClose = Enter ; 画像フルスクリーンを閉じる
 # FsPagePrev = none ; 前のページへ移動する
 # FsPageNext = none ; 次のページへ移動する

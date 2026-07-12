@@ -7066,6 +7066,39 @@ fn draw_left_panel_tab_button(
     }
 }
 
+fn draw_left_panel_close_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        egui::Id::new("left_panel_close"),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+        );
+    }
+    let center = rect.center();
+    let delta = rect.width().min(rect.height()) * 0.22;
+    let stroke = egui::Stroke::new(1.7, egui::Color32::from_gray(225));
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x - delta, center.y - delta),
+            egui::pos2(center.x + delta, center.y + delta),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x + delta, center.y - delta),
+            egui::pos2(center.x - delta, center.y + delta),
+        ],
+        stroke,
+    );
+    response.on_hover_text("閉じる")
+}
+
 fn local_adjust_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
     (full_rect.max.y - panel_pos.y - LOCAL_ADJUST_PANEL_BOTTOM_MARGIN)
         .max(LOCAL_ADJUST_PANEL_MIN_BODY_H + 40.0)
@@ -11470,10 +11503,20 @@ impl App {
         const HEADER_BTN_SIZE: f32 = 28.0;
         const HEADER_BTN_GAP: f32 = 4.0;
         const HEADER_RIGHT_PAD: f32 = 8.0;
+        const CLOSE_BTN_SIZE: f32 = 24.0;
         let mut selected_tab = self.settings.fullscreen_left_panel_tab;
+        let click_to_show = self.settings.fullscreen_side_panel_mode.normalized()
+            == crate::settings::FsSidePanelMode::ClickToShow;
         let tab_gap = 4.0;
+        let close_reserved = if click_to_show {
+            CLOSE_BTN_SIZE + tab_gap
+        } else {
+            0.0
+        };
         let tab_w =
-            ((header_rect.width() - BODY_PAD_LEFT - BODY_PAD_RIGHT - tab_gap) * 0.5).max(80.0);
+            ((header_rect.width() - BODY_PAD_LEFT - BODY_PAD_RIGHT - tab_gap - close_reserved)
+                * 0.5)
+                .max(80.0);
         let tab_y = header_rect.min.y + 6.0;
         let tab_x = header_rect.min.x + BODY_PAD_LEFT;
         let adjustment_tab_rect =
@@ -11482,6 +11525,15 @@ impl App {
             egui::pos2(tab_x + tab_w + tab_gap, tab_y),
             egui::vec2(tab_w, TAB_ROW_H),
         );
+        let close_clicked = click_to_show
+            && draw_left_panel_close_button(
+                &mut child,
+                egui::Rect::from_min_size(
+                    egui::pos2(view_trim_tab_rect.right() + tab_gap, tab_y),
+                    egui::vec2(CLOSE_BTN_SIZE, CLOSE_BTN_SIZE),
+                ),
+            )
+            .clicked();
         let adjustment_tab_changed = draw_left_panel_tab_button(
             &mut child,
             adjustment_tab_rect,
@@ -11507,6 +11559,12 @@ impl App {
             self.settings.fullscreen_left_panel_tab = selected_tab;
             self.settings.save();
             child.ctx().request_repaint();
+        }
+        if close_clicked {
+            self.persist_pending_view_trim_state();
+            self.adjustment_mode = false;
+            child.ctx().request_repaint();
+            return;
         }
         if selected_tab == crate::settings::FullscreenLeftPanelTab::Adjustment {
             // 起動可能か (= 画像のみ。動画 / セパレータ / コンテナ は無効化)。

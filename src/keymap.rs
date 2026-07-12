@@ -3640,7 +3640,7 @@ impl KeyAction {
             GridApplyConceal2 => "隠蔽マスクスロット2を選択中またはチェック済み画像に適用する",
             GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
             GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
-            FsToggleMetadata => "メタデータパネルの固定表示を切り替える",
+            FsToggleMetadata => "左右パネルの表示モードを切り替える",
             FsClose => "画像フルスクリーンを閉じる",
             FsBackToList => "フルスクリーンを閉じて一覧へ戻る",
             FsToggleWindowMode => "ウィンドウ表示と全画面表示を切り替える",
@@ -4040,14 +4040,13 @@ impl KeyAction {
             | GridApplyConceal2
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
-            FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast | FsCtrlNavPrev
-            | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => KeyContext::FsCommon,
+            FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
+            | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => KeyContext::FsCommon,
             RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
             | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
             | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
-            | FsToggleMetadata
             | FsClose
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
@@ -6265,32 +6264,92 @@ impl Keymap {
                 return false;
             }
             if crate::key_input::frame_had_key_down() {
-                return crate::key_input::consume_key_down(allow_repeat, |edge| {
+                let result = crate::key_input::consume_key_down_with_result(allow_repeat, |edge| {
                     chord.matches_key_edge(edge)
                 });
+                if result.matched {
+                    // The Win32 KeySlot queue and egui event queue describe the same physical
+                    // press. Claim both at this ownership boundary so direct widget readers do
+                    // not see the shortcut too. For no-repeat actions, matching repeat events
+                    // are claimed without retriggering the action. egui has already derived Tab
+                    // traversal in begin_pass, so removing events alone is not enough.
+                    Self::remove_matching_egui_key_presses(ctx, chord, allow_repeat);
+                    Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+                }
+                return result.triggered;
             }
         }
-        ctx.input_mut(|i| {
+        let (triggered, matched) = ctx.input_mut(|i| {
             let mut found = false;
+            let mut matched = false;
             i.events.retain(|event| {
-                let consume = !found
-                    && matches!(
-                        event,
-                        egui::Event::Key {
-                            key,
-                            pressed: true,
-                            repeat,
-                            modifiers,
-                            ..
-                        } if (allow_repeat || !*repeat) && chord.matches_egui(*key, *modifiers)
-                    );
-                if consume {
+                let matches = matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                );
+                if !matches {
+                    return true;
+                }
+                matched = true;
+                let repeat = matches!(event, egui::Event::Key { repeat: true, .. });
+                if allow_repeat {
+                    if found {
+                        return true;
+                    }
+                    found = true;
+                    return false;
+                }
+                if !repeat {
                     found = true;
                 }
-                !consume
+                // A no-repeat shortcut owns its repeat events even though they do not fire the
+                // action. This prevents direct widget readers from seeing the repeat.
+                false
             });
-            found
-        })
+            (found, matched)
+        });
+        if matched {
+            Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+        }
+        triggered
+    }
+
+    fn cancel_claimed_tab_focus_traversal(ctx: &egui::Context, chord: Chord) {
+        if chord.key == Some(KeyName::Tab) {
+            crate::egui_focus_policy::cancel_tab_focus_traversal(ctx);
+        }
+    }
+
+    fn remove_matching_egui_key_presses(ctx: &egui::Context, chord: Chord, allow_repeat: bool) {
+        ctx.input_mut(|i| {
+            let mut removed = false;
+            i.events.retain(|event| {
+                let matches = matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                );
+                if !matches {
+                    return true;
+                }
+                if allow_repeat {
+                    if removed {
+                        return true;
+                    }
+                    removed = true;
+                }
+                false
+            });
+        });
     }
 
     fn pressed_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
@@ -6812,6 +6871,51 @@ mod tests {
             events: vec![key_event(key, modifiers)],
             ..Default::default()
         });
+    }
+
+    fn draw_test_focusable(ctx: &egui::Context, id: &'static str) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+            let _ = ui.interact(rect, egui::Id::new(id), egui::Sense::click_and_drag());
+        });
+    }
+
+    #[cfg(windows)]
+    fn tab_edge(repeat: bool) -> crate::key_input::KeyEdge {
+        crate::key_input::KeyEdge {
+            virtual_key: 0x09,
+            scan_code: 0x0f,
+            extended: false,
+            pressed: true,
+            repeat,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn plain_key_edge(virtual_key: u32, scan_code: u16) -> crate::key_input::KeyEdge {
+        crate::key_input::KeyEdge {
+            virtual_key,
+            scan_code,
+            extended: false,
+            pressed: true,
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    #[cfg(windows)]
+    struct ClearTestKeyFrame;
+
+    #[cfg(windows)]
+    impl Drop for ClearTestKeyFrame {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_frame();
+        }
     }
 
     fn key_action_enum_names_from_source() -> std::collections::BTreeSet<String> {
@@ -7432,8 +7536,8 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_metadata_action_is_image_scoped_not_video_scoped() {
-        assert_eq!(KeyAction::FsToggleMetadata.context(), KeyContext::FsImage);
+    fn fullscreen_side_panel_action_is_shared_by_image_and_video() {
+        assert_eq!(KeyAction::FsToggleMetadata.context(), KeyContext::FsCommon);
         for action in [
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
@@ -7457,10 +7561,9 @@ mod tests {
         let video_rows =
             keymap.command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, false);
         assert!(
-            !video_rows
+            video_rows
                 .iter()
-                .any(|row| row.spec.action == KeyAction::FsToggleMetadata),
-            "video fullscreen active scopes should not advertise metadata toggle"
+                .any(|row| row.spec.action == KeyAction::FsToggleMetadata)
         );
         for action in [
             KeyAction::FsToggleWindowMode,
@@ -8195,6 +8298,169 @@ mod tests {
         let _ = ctx.end_pass();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn no_repeat_tab_claims_win32_and_egui_events_without_focus_traversal_leak() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                key_event(egui::Key::Tab, egui::Modifiers::NONE),
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        });
+        crate::key_input::set_test_frame(vec![tab_edge(false), tab_edge(true)]);
+
+        assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        assert!(ctx.input(|i| i.events.is_empty()));
+        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        draw_test_focusable(&ctx, "tab_claim_surface");
+        let _ = ctx.end_pass();
+        assert!(!ctx.wants_keyboard_input());
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        crate::key_input::set_test_frame(vec![tab_edge(true)]);
+        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        assert!(ctx.input(|i| i.events.is_empty()));
+        draw_test_focusable(&ctx, "tab_repeat_claim_surface");
+        let _ = ctx.end_pass();
+        assert!(!ctx.wants_keyboard_input());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tab_does_not_block_following_metadata_rating_or_navigation_shortcuts() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+
+        begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![tab_edge(false)]);
+        assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        draw_test_focusable(&ctx, "tab_then_shortcuts_surface");
+        let _ = ctx.end_pass();
+        assert!(!ctx.wants_keyboard_input());
+
+        begin_key_pass(&ctx, egui::Key::I, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![plain_key_edge(0x49, 0x17)]);
+        assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        let _ = ctx.end_pass();
+
+        begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![plain_key_edge(0x71, 0x3c)]);
+        assert_eq!(keymap.consume_rating_action(&ctx, false), Some(2));
+        let _ = ctx.end_pass();
+
+        begin_key_pass(&ctx, egui::Key::Home, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![plain_key_edge(0x24, 0x47)]);
+        assert!(keymap.consume_action(&ctx, KeyAction::FsJumpFirst));
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tab_reassigned_to_another_action_still_cancels_focus_traversal() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [FsImage]
+            FsSlideshow = Tab
+            "#,
+        );
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![tab_edge(false)]);
+
+        assert!(keymap.consume_action(&ctx, KeyAction::FsSlideshow));
+        draw_test_focusable(&ctx, "reassigned_tab_surface");
+        let _ = ctx.end_pass();
+        assert!(!ctx.wants_keyboard_input());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn focused_text_edit_keeps_tab_from_keymap_and_moves_to_next_field() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+        let first_id = egui::Id::new("keymap_tab_first_text");
+        let second_id = egui::Id::new("keymap_tab_second_text");
+        let mut first = String::new();
+        let mut second = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let first_response = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+                let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+                first_response.request_focus();
+            });
+        });
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+            ..Default::default()
+        });
+        crate::key_input::set_test_frame(vec![tab_edge(false)]);
+
+        assert!(ctx.wants_keyboard_input());
+        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        assert_eq!(ctx.input(|i| i.events.len()), 1);
+        assert!(crate::key_input::pressed_key_down(
+            |edge| edge.virtual_key == 0x09
+        ));
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+            let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+        });
+        let _ = ctx.end_pass();
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second_id));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn focused_non_text_modal_widget_still_blocks_application_tab_shortcut() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+        let focused_id = egui::Id::new("modal_focus_surface");
+        ctx.memory_mut(|memory| memory.request_focus(focused_id));
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+            ..Default::default()
+        });
+        crate::key_input::set_test_frame(vec![tab_edge(false)]);
+
+        assert!(ctx.wants_keyboard_input());
+        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        draw_test_focusable(&ctx, "modal_focus_surface");
+        let _ = ctx.end_pass();
+        assert!(ctx.wants_keyboard_input());
+    }
+
     #[test]
     fn rating_actions_are_exact_and_customizable() {
         let keymap = Keymap::empty();
@@ -8896,6 +9162,29 @@ mod tests {
         keymap.install_global_native_video_shortcuts();
         assert!(!native_video_fullscreen_shortcut_key(&event(0x7A)));
         assert!(!native_video_fullscreen_shortcut_key(&event(0x7C)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_side_panel_shortcut_follows_effective_chords() {
+        let _guard = native_video_shortcut_test_guard();
+        let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&event(0x49)));
+        assert!(native_video_fullscreen_shortcut_key(&event(0x09)));
+
+        let keymap = Keymap::from_ini_str("[FsImage]\nFsToggleMetadata = F13\n");
+        keymap.install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event(0x49)));
+        assert!(native_video_fullscreen_shortcut_key(&event(0x7C)));
     }
 
     #[cfg(windows)]

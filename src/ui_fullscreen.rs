@@ -298,6 +298,129 @@ pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+pub(crate) fn panel_callout_edge_rect(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+) -> egui::Rect {
+    let width = crate::ui_helpers::PANEL_CALLOUT_HIT_PX.min(full_rect.width().max(0.0));
+    match edge {
+        crate::ui_helpers::PanelEdge::Left => egui::Rect::from_min_max(
+            full_rect.min,
+            egui::pos2(full_rect.min.x + width, full_rect.max.y),
+        ),
+        crate::ui_helpers::PanelEdge::Right => egui::Rect::from_min_max(
+            egui::pos2(full_rect.max.x - width, full_rect.min.y),
+            full_rect.max,
+        ),
+        crate::ui_helpers::PanelEdge::Top => egui::Rect::NOTHING,
+    }
+}
+
+pub(crate) fn panel_callout_bar_rect(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+) -> egui::Rect {
+    let width = 20.0_f32.min(full_rect.width().max(0.0));
+    let height = (full_rect.height() * 0.24).clamp(96.0, 220.0);
+    let center_y = full_rect.center().y;
+    let x = match edge {
+        crate::ui_helpers::PanelEdge::Left => full_rect.left(),
+        crate::ui_helpers::PanelEdge::Right => full_rect.right() - width,
+        crate::ui_helpers::PanelEdge::Top => return egui::Rect::NOTHING,
+    };
+    egui::Rect::from_min_size(
+        egui::pos2(x, center_y - height * 0.5),
+        egui::vec2(width, height),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct StillSidePanelChromeInputs {
+    is_music_view: bool,
+    analysis_active: bool,
+    is_video: bool,
+    compare_wipe_active: bool,
+    panorama_active: bool,
+    overlay_edit_active: bool,
+    view_trim_active: bool,
+    zoom_active: bool,
+    paged: bool,
+    animated: bool,
+}
+
+fn still_side_panel_chrome_enabled(input: StillSidePanelChromeInputs) -> bool {
+    !input.is_music_view
+        && !input.analysis_active
+        && !input.is_video
+        && !input.compare_wipe_active
+        && !input.panorama_active
+        && !input.overlay_edit_active
+        && !input.view_trim_active
+        && !input.zoom_active
+        && input.paged
+        && !input.animated
+}
+
+fn fullscreen_side_panel_contains_pointer(
+    full_rect: egui::Rect,
+    pos: egui::Pos2,
+    chrome_enabled: bool,
+    mode: crate::settings::FsSidePanelMode,
+    right_panel_visible: bool,
+    left_panel_visible: bool,
+) -> bool {
+    if !chrome_enabled {
+        return false;
+    }
+    let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
+    let right_rect = if right_panel_visible {
+        metadata_panel_rect(full_rect)
+    } else if click_mode {
+        panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Right)
+    } else {
+        metadata_panel_hover_activation_rect(full_rect)
+    };
+    let in_left_panel =
+        left_panel_visible && pos.x < adjustment_panel_rect(full_rect).max.x && pos.y >= 60.0;
+    let in_left_callout = click_mode
+        && panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Left).contains(pos);
+    right_rect.contains(pos) || in_left_panel || in_left_callout
+}
+
+fn music_left_panel_visible_from_inputs(
+    mode: crate::settings::FsSidePanelMode,
+    hover_active: bool,
+    session_open: bool,
+    modal_open: bool,
+) -> bool {
+    if modal_open {
+        return false;
+    }
+    match mode.normalized() {
+        crate::settings::FsSidePanelMode::Hover => hover_active,
+        crate::settings::FsSidePanelMode::ClickToShow => session_open,
+        crate::settings::FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
+    }
+}
+
+fn music_right_panel_visible_from_inputs(
+    mode: crate::settings::FsSidePanelMode,
+    hover_active: bool,
+    click_info_open: bool,
+    modal_open: bool,
+) -> bool {
+    if modal_open {
+        return false;
+    }
+    match mode.normalized() {
+        crate::settings::FsSidePanelMode::Hover => hover_active,
+        crate::settings::FsSidePanelMode::ClickToShow => {
+            crate::ui_helpers::metadata_panel_persistently_shown(mode, click_info_open)
+        }
+        crate::settings::FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
+    }
+}
+
 /// メタデータパネルを「開く」ホバートリガ矩形。画面右端の細いストリップ
 /// (`PANEL_EDGE_TRIGGER_WIDTH`) だけを判定に使う。縦方向は従来どおり全高 (上バー / シーク
 /// バー帯でも右端ホバーで開ける)。一度開いた後の「維持」判定は `draw_metadata_panel` 側で
@@ -1645,6 +1768,7 @@ pub(crate) struct MusicChromeViewState {
 struct MusicTopChromeResponse {
     close_clicked: bool,
     window_clicked: bool,
+    side_panel_mode_clicked: bool,
     back_to_video_clicked: bool,
     vst_clicked: bool,
     row_delta: i32,
@@ -3571,6 +3695,187 @@ fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> 
 }
 
 impl App {
+    fn draw_fs_panel_callouts(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        enabled: bool,
+    ) {
+        if !enabled
+            || self.settings.fullscreen_side_panel_mode.normalized()
+                != crate::settings::FsSidePanelMode::ClickToShow
+        {
+            return;
+        }
+        let pointer = ctx.input(|i| {
+            if self.cursor_hidden {
+                None
+            } else {
+                i.pointer.hover_pos()
+            }
+        });
+        for edge in [
+            crate::ui_helpers::PanelEdge::Left,
+            crate::ui_helpers::PanelEdge::Right,
+        ] {
+            let edge_rect = panel_callout_edge_rect(full_rect, edge);
+            if !crate::ui_helpers::callout_hit(edge_rect, pointer) {
+                continue;
+            }
+            let bar_rect = panel_callout_bar_rect(full_rect, edge);
+            let response = ui.interact(
+                bar_rect,
+                egui::Id::new(("fs_panel_callout", edge)),
+                egui::Sense::click(),
+            );
+            let fill = if response.hovered() {
+                egui::Color32::from_rgba_unmultiplied(65, 125, 205, 235)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(35, 70, 115, 210)
+            };
+            ui.painter().rect_filled(bar_rect, 3.0, fill);
+
+            let open = match edge {
+                crate::ui_helpers::PanelEdge::Left => self.adjustment_mode,
+                crate::ui_helpers::PanelEdge::Right => self.metadata_panel_persistently_shown(),
+                crate::ui_helpers::PanelEdge::Top => false,
+            };
+            let points_right = match edge {
+                crate::ui_helpers::PanelEdge::Left => !open,
+                crate::ui_helpers::PanelEdge::Right => open,
+                crate::ui_helpers::PanelEdge::Top => false,
+            };
+            draw_panel_callout_arrow(
+                ui.painter(),
+                bar_rect.center(),
+                points_right,
+                egui::Color32::WHITE,
+            );
+            let tip = if open {
+                "パネルを閉じる"
+            } else {
+                "パネルを開く"
+            };
+            if response.on_hover_text(tip).clicked() {
+                match edge {
+                    crate::ui_helpers::PanelEdge::Left => {
+                        if self.adjustment_mode {
+                            self.persist_pending_view_trim_state();
+                        }
+                        self.adjustment_mode = !self.adjustment_mode;
+                    }
+                    crate::ui_helpers::PanelEdge::Right => {
+                        self.toggle_fullscreen_click_info_open();
+                    }
+                    crate::ui_helpers::PanelEdge::Top => {}
+                }
+            }
+        }
+    }
+
+    fn draw_music_panel_callouts(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        panel_band_top: f32,
+        panel_band_bottom: f32,
+        fs_idx: usize,
+        enabled: bool,
+    ) {
+        if !enabled
+            || self.settings.fullscreen_side_panel_mode.normalized()
+                != crate::settings::FsSidePanelMode::ClickToShow
+        {
+            return;
+        }
+        let pointer = ctx.input(|i| {
+            if self.cursor_hidden {
+                None
+            } else {
+                i.pointer.hover_pos()
+            }
+        });
+        let panel_band = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), panel_band_top),
+            egui::pos2(full_rect.right(), panel_band_bottom.max(panel_band_top)),
+        );
+        let mut toggle_left = false;
+        let mut toggle_right = false;
+        for edge in [
+            crate::ui_helpers::PanelEdge::Left,
+            crate::ui_helpers::PanelEdge::Right,
+        ] {
+            if !crate::ui_helpers::callout_hit(panel_callout_edge_rect(full_rect, edge), pointer) {
+                continue;
+            }
+            // 通常サイズでは静止画と同じ 96..220pt bar。極端に低いウィンドウだけ
+            // top chrome / bottom HUD へ重ならないよう panel band でクリップする。
+            let bar_rect = panel_callout_bar_rect(full_rect, edge).intersect(panel_band);
+            if !bar_rect.is_positive() {
+                continue;
+            }
+            let open = match edge {
+                crate::ui_helpers::PanelEdge::Left => self.music_left_click_open,
+                crate::ui_helpers::PanelEdge::Right => self.metadata_panel_persistently_shown(),
+                crate::ui_helpers::PanelEdge::Top => false,
+            };
+            let clicked = egui::Area::new(egui::Id::new(("music_panel_callout", fs_idx, edge)))
+                .order(crate::ui_helpers::PANEL_CALLOUT_ORDER)
+                .fixed_pos(bar_rect.min)
+                .show(ctx, |ui| {
+                    ui.set_min_size(bar_rect.size());
+                    let rect = egui::Rect::from_min_size(ui.min_rect().min, bar_rect.size());
+                    let response = ui.interact(
+                        rect,
+                        ui.id().with(("music_panel_callout_hit", fs_idx, edge)),
+                        egui::Sense::click(),
+                    );
+                    let fill = if response.hovered() {
+                        egui::Color32::from_rgba_unmultiplied(65, 125, 205, 235)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(35, 70, 115, 210)
+                    };
+                    ui.painter().rect_filled(rect, 3.0, fill);
+                    let points_right = match edge {
+                        crate::ui_helpers::PanelEdge::Left => !open,
+                        crate::ui_helpers::PanelEdge::Right => open,
+                        crate::ui_helpers::PanelEdge::Top => false,
+                    };
+                    draw_panel_callout_arrow(
+                        ui.painter(),
+                        rect.center(),
+                        points_right,
+                        egui::Color32::WHITE,
+                    );
+                    response
+                        .hover_tip_dark(if open {
+                            "パネルを閉じる"
+                        } else {
+                            "パネルを開く"
+                        })
+                        .clicked()
+                })
+                .inner;
+            if clicked {
+                match edge {
+                    crate::ui_helpers::PanelEdge::Left => toggle_left = true,
+                    crate::ui_helpers::PanelEdge::Right => toggle_right = true,
+                    crate::ui_helpers::PanelEdge::Top => {}
+                }
+            }
+        }
+        if toggle_left {
+            self.music_left_click_open = !self.music_left_click_open;
+        }
+        if toggle_right {
+            self.toggle_fullscreen_click_info_open();
+        }
+        if toggle_left || toggle_right {
+            ctx.request_repaint();
+        }
+    }
+
     pub(crate) fn fullscreen_viewport_id(&self) -> egui::ViewportId {
         // keep-alive (§3.1/§3.2): detached セッションが在る間は、その window_id を**最優先**で
         // ViewportId の素にする。これで既存描画経路 (fullscreen_viewport_id 利用) と backstop
@@ -4477,6 +4782,46 @@ impl App {
             draw_overlay_window_toggle_icon(&painter, rect);
             Self::paint_music_chrome_button_dim(&painter, rect, interactive);
             response.window_clicked = interactive && resp.clicked();
+        }
+
+        // 左右パネル表示モード。ParkedLive の非操作 chrome には出さず、通常の音楽ビューだけ
+        // 静止画 / native 動画と同じ i / i+マウスカーソルを表示する。
+        if interactive {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
+                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
+            );
+            first_right_control_left = first_right_control_left.min(rect.left());
+            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
+            let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
+            let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
+            let tip = format!(
+                "パネル表示: {}\nクリックで「{}」に切り替え",
+                side_panel_mode.label(),
+                side_panel_mode.toggled().label()
+            );
+            let resp = ui
+                .interact(
+                    rect,
+                    ui.id().with(("music_top_side_panel_mode", fs_idx)),
+                    sense,
+                )
+                .hover_tip_dark(
+                    self.keymap
+                        .chord_list_bracket_label(&tip, KeyAction::FsToggleMetadata),
+                );
+            let button_bg = if click_to_show && !resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(45, 100, 170, 180)
+            } else {
+                top_btn_bg(resp.hovered())
+            };
+            painter.rect_filled(rect, 4.0, button_bg);
+            if click_to_show {
+                draw_info_click_icon(&painter, rect.center(), rect.width() * 0.29);
+            } else {
+                draw_info_icon(&painter, rect.center(), rect.width() * 0.29);
+            }
+            response.side_panel_mode_clicked = resp.clicked();
         }
 
         if chrome.show_back_to_video {
@@ -7805,12 +8150,10 @@ impl App {
                             // ZipPla ズーム中 (照準含む) は表示トリムパネルも抑止する。
                             self.draw_view_trim_panel(ctx, full_rect, fs_idx, spread_pair);
                         } else if adjustment_active {
-                            // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
-                            // 描画と当たり判定で同じ rect を使う (adjustment_panel_rect 参照)。
+                            // 左補正パネル。右情報パネルは独立した表示条件で描く。
                             let panel_rect = adjustment_panel_rect(full_rect);
                             self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
-                            // 右側にメタデータパネルも同時表示（show_metadata_panel の状態に関係なく）
-                            self.draw_metadata_panel_forced(ui, ctx, full_rect);
+                            self.draw_metadata_panel(ui, ctx, full_rect);
                         } else if panorama_mode_active_now {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
                             // (docs/panorama-360-view-plan.md フィードバック対応)。
@@ -7831,6 +8174,25 @@ impl App {
                                 self.draw_metadata_panel(ui, ctx, full_rect);
                             let _ = right_panel_visible;
                         }
+                        let callouts_enabled =
+                            still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
+                                is_music_view,
+                                analysis_active,
+                                is_video: state.is_video,
+                                compare_wipe_active,
+                                panorama_active: panorama_mode_active_now,
+                                overlay_edit_active: self.is_overlay_edit_mode_active(),
+                                view_trim_active: self.view_trim_mode,
+                                zoom_active: self.fs_zoom_mode_engaged(),
+                                paged: self.reading_flow.is_paged(),
+                                animated: self.fs_entry_is_animated(fs_idx),
+                            });
+                        self.draw_fs_panel_callouts(
+                            ui,
+                            ctx,
+                            full_rect,
+                            callouts_enabled,
+                        );
                         fs_panels_ms = panels_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── ホバーバー ──
@@ -7956,13 +8318,15 @@ impl App {
                             let mut fit_no_upscale_choice: Option<bool> = None;
                             let mut fit_no_downscale_choice: Option<bool> = None;
                             let mut bar_analysis_pressed = false;
+                            let mut side_panel_mode_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, &self.keymap, full_rect,
                                 &state.location_display,
                                 display_dims, state.image_file_size,
                                 state.image_downscaled,
                                 &mut close_fs, &mut nav_delta,
-                                &mut self.show_metadata_panel,
+                                self.settings.fullscreen_side_panel_mode,
+                                &mut side_panel_mode_pressed,
                                 false,
                                 &mut self.slideshow_playing,
                                 &mut self.settings.slideshow_interval_secs,
@@ -7980,7 +8344,6 @@ impl App {
                                 &mut self.spread_popup_open,
                                 is_spread_double,
                                 ai_upscale_info,
-                                &mut self.adjustment_mode,
                                 &mut self.local_adjust_mode,
                                 has_page_override,
                                 fit_mode,
@@ -8011,6 +8374,9 @@ impl App {
                                 &mut window_mode_pressed,
                                 self.cursor_hidden,
                             );
+                            if side_panel_mode_pressed {
+                                self.cycle_fs_side_panel_mode();
+                            }
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(ctx, fs_idx);
                             }
@@ -9521,7 +9887,7 @@ impl App {
     }
 
     /// フルスクリーンのキー入力を処理し、アクションを返す。
-    fn handle_fs_key_input(
+    pub(crate) fn handle_fs_key_input(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -10304,12 +10670,14 @@ impl App {
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         // `fs_music_view_active` は is_video_fs 直後で定義済み (spread-shift で先に使うため)。
-        // 音楽ビューも除外する (Inc 5 FB, Codex P3): 音楽ビューの右パネルは端ホバー式で
-        // show_metadata_panel を使わなくなったので、音声で I を押すと隠れたグローバルフラグだけ
-        // トグルされ、次に画像へ移ると意図せず画像メタパネルがピン表示される事故になる。
-        let key_i = !current_item_is_video
-            && !fs_music_view_active
-            && self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
+        // 静止画と音楽ビューはこの egui 経路で同じ FsToggleMetadata を消費する。
+        // 通常の動画は native presenter 側で処理するため、ここでは音楽ビュー中だけ許可する。
+        let key_i =
+            crate::ui_helpers::fs_side_panel_key_owner(current_item_is_video, fs_music_view_active)
+                == crate::ui_helpers::FsSidePanelKeyOwner::Egui
+                && self
+                    .keymap
+                    .consume_action_no_repeat(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
         // 動画モードでは `handle_video_input` 側で play/pause として消費するため、ここでは
         // 画像系処理に流さない。**`is_video_fs` ではなく純粋な「現在アイテムが Video か」で
@@ -10870,6 +11238,8 @@ impl App {
             self.compare_view_mode = crate::app::CompareViewMode::Off;
             self.compare_wipe_dragging = false;
             self.show_feedback_toast("[比較: Normal]".to_string());
+        } else if esc && !pano_active_now && self.close_click_side_panels() {
+            // ClickToShow の明示オープンは Esc で先に閉じる。
         } else if esc {
             action.close = true;
         }
@@ -10890,10 +11260,9 @@ impl App {
                 action.close = true;
             }
         }
-        // 見開きダブル表示中は Z/R/L を無効化。I はタグ右パネルでも使う。
+        // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
-            self.show_metadata_panel = !self.show_metadata_panel;
-            self.metadata_panel_hover_active = false;
+            self.cycle_fs_side_panel_mode();
         }
         // V: 360 度パノラマビューモード トグル。
         // 検出済み (= 360 ボタンが有効な状態) のときだけ反応する。非対応画像で
@@ -11423,16 +11792,27 @@ impl App {
             self.compare_view_mode,
             crate::app::CompareViewMode::Wipe { .. }
         );
+        let panel_fs_idx = self.fullscreen_idx;
+        let panorama_active = panel_fs_idx.is_some_and(|idx| self.is_panorama_mode_active(idx));
+        let side_panel_chrome_enabled =
+            still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
+                is_music_view: panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx)),
+                analysis_active: self.analysis_mode && !is_spread_double && !panorama_active,
+                is_video: state.is_video,
+                compare_wipe_active,
+                panorama_active,
+                overlay_edit_active: self.is_overlay_edit_mode_active(),
+                view_trim_active: self.view_trim_mode,
+                zoom_active: self.fs_zoom_mode_engaged(),
+                paged: self.reading_flow.is_paged(),
+                animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
+            });
 
         // ── ホイール ──
         // パネル領域内ではホイールナビゲーションを抑制
-        let right_panel_rect = metadata_panel_rect(full_rect);
-        let right_panel_activation_rect = metadata_panel_hover_activation_rect(full_rect);
-        let has_right_panel = self.show_metadata_panel
+        let has_right_panel = self.metadata_panel_persistently_shown()
             || self.metadata_panel_hover_active
             || self.fullscreen_tag_picker_open;
-        // 当たり判定は描画と同じ rect を使う (adjustment_panel_rect 参照)。
-        let left_panel_right = adjustment_panel_rect(full_rect).max.x;
         // When the OS cursor is hidden, egui still exposes the last hover position.
         // Treat that position as stale and block passive hover side effects until a
         // real input event revives the cursor.
@@ -11452,16 +11832,14 @@ impl App {
                 i.pointer
                     .hover_pos()
                     .map(|p| {
-                        let in_right = !compare_wipe_active
-                            && (if has_right_panel {
-                                right_panel_rect.contains(p)
-                            } else {
-                                right_panel_activation_rect.contains(p)
-                            });
-                        let in_left = !compare_wipe_active
-                            && self.adjustment_mode
-                            && p.x < left_panel_right
-                            && p.y >= 60.0;
+                        let in_side_panel = fullscreen_side_panel_contains_pointer(
+                            full_rect,
+                            p,
+                            side_panel_chrome_enabled,
+                            self.settings.fullscreen_side_panel_mode,
+                            has_right_panel,
+                            self.adjustment_mode,
+                        );
                         let in_erase_panel =
                             self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
                         let in_local_adjust_panel = self.local_adjust_mode
@@ -11481,8 +11859,7 @@ impl App {
                         let in_text_panel = self.text_mode
                             && (self.text_panel_rect(full_rect).contains(p)
                                 || self.text_detail_panel_rect(full_rect).contains(p));
-                        in_right
-                            || in_left
+                        in_side_panel
                             || in_erase_panel
                             || in_local_adjust_panel
                             || in_conceal_panel
@@ -11494,7 +11871,8 @@ impl App {
                     .unwrap_or(false)
             });
 
-        // 左端・上端・右端のホバーでオーバーレイ（上バー＋左パネル＋右パネル）を同時表示/非表示
+        // Hover モードでは左端だけが左補正パネルを召喚する。右端は右情報パネル、
+        // 上端は上バーの各経路へ委ねる。ClickToShow は呼び出しバーでのみ開閉する。
         // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する。
         // 加えて、消しゴムモードに入る前から adjustment_mode が立っていると、消しゴムパネルが
         // 左端を占有している間 edge_hover が常に true 扱いになり off へ遷移できないので、
@@ -11530,30 +11908,32 @@ impl App {
             // ここで OFF に固定する (Inc 3 パネル漏れ修正)。
             self.adjustment_mode = false;
         } else {
-            let edge_hover = passive_hover_enabled
+            let mode = self.settings.fullscreen_side_panel_mode.normalized();
+            let left_edge_hover = passive_hover_enabled
+                && crate::ui_helpers::edge_summons_adjustment(
+                    mode,
+                    crate::ui_helpers::PanelEdge::Left,
+                )
                 && ctx.input(|i| {
                     i.pointer
                         .hover_pos()
                         .map(|p| {
-                            // 端 5% ホバーで補正パネル (+上バー) を開く。トリガ幅は左右メタ
-                            // パネル / 音楽パネルと共通の panel_edge_trigger_px に統一 (実機 FB 2026-07)。
                             let edge = crate::ui_helpers::panel_edge_trigger_px(full_rect.width());
-                            p.y < 60.0  // 上端
-                    || p.x < full_rect.min.x + edge  // 左端
-                    || p.x > full_rect.max.x - edge // 右端
+                            p.x < full_rect.min.x + edge
                         })
                         .unwrap_or(false)
                 });
-            if edge_hover
+            if left_edge_hover
                 && !self.analysis_mode
                 && self.reading_flow.is_paged()
                 && self.fullscreen_idx.is_some()
             {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel
-                && !edge_hover
+                && !left_edge_hover
                 && self.adjustment_mode
                 && !self.adjustment_dragging
+                && mode == crate::settings::FsSidePanelMode::Hover
             {
                 self.persist_pending_view_trim_state();
                 self.adjustment_mode = false;
@@ -11949,36 +12329,24 @@ impl App {
                             || self.slideshow_popup_open;
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
-                                let right_panel_rect = metadata_panel_rect(full_rect);
-                                let right_panel_activation_rect =
-                                    metadata_panel_hover_activation_rect(full_rect);
-                                // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、クリック
-                                // ナビの当たり判定でもパネル領域を無効化する (Codex P2)。
-                                let zoom_engaged = self.fs_zoom_mode_engaged();
-                                let has_right_panel = self.show_metadata_panel
+                                let has_right_panel = self.metadata_panel_persistently_shown()
                                     || self.metadata_panel_hover_active
                                     || self.fullscreen_tag_picker_open;
-                                let in_right_panel = !zoom_engaged
-                                    && (if has_right_panel {
-                                        right_panel_rect.contains(pos)
-                                    } else {
-                                        right_panel_activation_rect.contains(pos)
-                                    });
-                                let in_left_panel = !zoom_engaged
-                                    && self.adjustment_mode
-                                    && pos.x < adjustment_panel_rect(full_rect).max.x
-                                    && pos.y >= 60.0;
+                                let in_side_panel = fullscreen_side_panel_contains_pointer(
+                                    full_rect,
+                                    pos,
+                                    side_panel_chrome_enabled,
+                                    self.settings.fullscreen_side_panel_mode,
+                                    has_right_panel,
+                                    self.adjustment_mode,
+                                );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
                                 // 連続読み中はクリックでのページジャンプを抑制する。連続読みは
                                 // 連続スクロール表示なので、左半分/右半分クリックで別ファイルへ
                                 // 飛ぶのはモデルに反する (特に fs_zoom が一瞬インフレされず
                                 // has_transform=false になった隙のクリックで誤爆する)。
-                                if !in_right_panel
-                                    && !in_left_panel
-                                    && !in_seek_panel
-                                    && !continuous_active
-                                {
+                                if !in_side_panel && !in_seek_panel && !continuous_active {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
@@ -16855,13 +17223,28 @@ impl App {
         // immediately revive the OS cursor after slideshow advances.
         let passive_hover_enabled = !self.cursor_hidden;
         let in_top = passive_hover_enabled && pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
+        let click_mode = self.settings.fullscreen_side_panel_mode.normalized()
+            == crate::settings::FsSidePanelMode::ClickToShow;
         let in_right = passive_hover_enabled
-            && pointer.is_some_and(|p| metadata_panel_hover_activation_rect(full_rect).contains(p));
+            && pointer.is_some_and(|p| {
+                let rect = if click_mode {
+                    panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Right)
+                } else {
+                    metadata_panel_hover_activation_rect(full_rect)
+                };
+                rect.contains(p)
+            });
+        let in_left_callout = passive_hover_enabled
+            && click_mode
+            && pointer.is_some_and(|p| {
+                panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Left).contains(p)
+            });
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
         !in_top
             && !in_right
-            && !self.show_metadata_panel
+            && !in_left_callout
+            && !self.metadata_panel_persistently_shown()
             && !self.metadata_panel_hover_active
             && !self.adjustment_mode
             && !self.view_trim_mode
@@ -16891,7 +17274,8 @@ impl App {
         image_downscaled: bool,
         close_fs: &mut bool,
         nav_delta: &mut i32,
-        show_info: &mut bool,
+        side_panel_mode: crate::settings::FsSidePanelMode,
+        side_panel_mode_pressed: &mut bool,
         force_show: bool,
         slideshow_playing: &mut bool,
         slideshow_interval: &mut f32,
@@ -16920,8 +17304,6 @@ impl App {
         is_spread_double: bool,
         // AI アップスケール後のサイズとモデル名（表示用）。動画モードでは無視される。
         ai_upscale_info: Option<(&str, u32, u32)>,
-        // 画像補正パネル表示トグル
-        adjustment_mode: &mut bool,
         _local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         _has_page_override: bool,
@@ -16973,13 +17355,11 @@ impl App {
                     .map(|p| p.y < TOP_BAR_HOVER_Y)
                     .unwrap_or(false)
         });
-        // adjustment_mode がオンならオーバーレイとして常に表示
         if !hover_in_top
             && !force_show
             && !*spread_popup_open
             && !*fit_popup_open
             && !*slideshow_popup_open
-            && !*adjustment_mode
             && !*view_trim_mode
         {
             return;
@@ -17415,22 +17795,34 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // ℹ Info ボタン (360 モード中は非表示)
+        // ℹ 左右パネル表示モードボタン (360 モード中は非表示)
         if !panorama_mode_active {
+            let side_panel_mode = side_panel_mode.normalized();
+            let click_mode = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
             let info_resp = draw_bar_button(
                 ui,
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_info_btn",
-                |hovered| bar_button_bg(hovered, *show_info),
-                *show_info,
-                |p, c, r| draw_info_icon(p, c, r),
+                |hovered| bar_button_bg(hovered, click_mode),
+                click_mode,
+                |p, c, r| {
+                    if click_mode {
+                        draw_info_click_icon(p, c, r);
+                    } else {
+                        draw_info_icon(p, c, r);
+                    }
+                },
             );
-            let info_resp = info_resp.hover_tip_dark(
-                keymap.chord_list_bracket_label("メタデータ", KeyAction::FsToggleMetadata),
+            let tip = format!(
+                "パネル表示: {}\nクリックで「{}」に切り替え",
+                side_panel_mode.label(),
+                side_panel_mode.toggled().label()
             );
+            let info_resp = info_resp
+                .hover_tip_dark(keymap.chord_list_bracket_label(&tip, KeyAction::FsToggleMetadata));
             if info_resp.clicked() {
-                *show_info = !*show_info;
+                *side_panel_mode_pressed = true;
             }
             if info_resp.hovered() {
                 *nav_delta = 0;
@@ -21797,8 +22189,8 @@ impl App {
 
         // ── レイアウト (Inc 5 FB: 動画に合わせる) ──
         // 上バー (常時) / 中央 (timeline + spectrum、全幅・縮小しない) / 下 HUD (常時、
-        // seek 行 + コントロール行)。左右パネルは端ホバーでオーバーレイ表示し、**中央は
-        // 縮小しない** (動画のジャンプ/メタパネルと同じ。ピン/トグルボタンは持たない)。
+        // seek 行 + コントロール行)。左右パネルは表示モードに従ってオーバーレイ表示し、
+        // **中央は縮小しない** (動画のジャンプ/メタパネルと同じ)。
         // 上バー高さは動画 native 上バー (draw_top_bar_background = 54px) に合わせる。これで
         // 音楽ビューと VST 画面 (native シェル) でボタン / タイトルの縦位置が揃う (ユーザー要望)。
         let top_h = 54.0;
@@ -21875,13 +22267,14 @@ impl App {
                 i.pointer.hover_pos()
             }
         });
-        // 左右パネルは二段判定 (実機 FB 2026-07):
+        // Hover は左右パネルの二段判定 (実機 FB 2026-07):
         //  - 開くトリガ = 画面端の細いストリップ (PANEL_EDGE_TRIGGER_WIDTH)。パネル幅ぶんの
         //    広い当たり判定にすると中央の全幅波形 seek の左右端 (left_w / right_w) が押せなく
         //    なる catch-22 が起きる。細ストリップなら seek 不能域が端の数十 px に縮む。
         //  - 維持 = 描画パネル矩形 + PANEL_HOVER_SUSTAIN_MARGIN。内端をわずかに越えても即
         //    閉じないヒステリシス (ブックマーク項目クリックへ移動する動線を確保)。
-        //  ラッチ state は music_left/right_panel_active。モーダル中は両方 OFF に固定する。
+        //  ラッチ state は music_left/right_panel_active。ClickToShow / モーダル中は両方 OFF。
+        // ClickToShow の実効表示は左=session、右=Settings 永続状態を純関数で解決する。
         let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
         let trigger_w =
             crate::ui_helpers::panel_edge_trigger_px(rect.width()).min(rect.width().max(0.0));
@@ -21894,16 +22287,33 @@ impl App {
             egui::pos2(rect.right() - right_w, panel_band_top),
             egui::pos2(rect.right(), panel_band_bottom),
         );
-        let left_open = hover_pos.is_some_and(|p| p.x <= rect.left() + trigger_w && in_band(p));
-        let right_open = hover_pos.is_some_and(|p| p.x >= rect.right() - trigger_w && in_band(p));
-        let left_sustain = self.music_left_panel_active
-            && hover_pos.is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
-        let right_sustain = self.music_right_panel_active
-            && hover_pos.is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
-        self.music_left_panel_active = !music_modal_open && (left_open || left_sustain);
-        self.music_right_panel_active = !music_modal_open && (right_open || right_sustain);
-        let left_hover = self.music_left_panel_active;
-        let right_hover = self.music_right_panel_active;
+        let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
+        if side_panel_mode == crate::settings::FsSidePanelMode::Hover && !music_modal_open {
+            let left_open = hover_pos.is_some_and(|p| p.x <= rect.left() + trigger_w && in_band(p));
+            let right_open =
+                hover_pos.is_some_and(|p| p.x >= rect.right() - trigger_w && in_band(p));
+            let left_sustain = self.music_left_panel_active
+                && hover_pos.is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
+            let right_sustain = self.music_right_panel_active
+                && hover_pos.is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
+            self.music_left_panel_active = left_open || left_sustain;
+            self.music_right_panel_active = right_open || right_sustain;
+        } else {
+            self.music_left_panel_active = false;
+            self.music_right_panel_active = false;
+        }
+        let left_hover = music_left_panel_visible_from_inputs(
+            side_panel_mode,
+            self.music_left_panel_active,
+            self.music_left_click_open,
+            music_modal_open,
+        );
+        let right_hover = music_right_panel_visible_from_inputs(
+            side_panel_mode,
+            self.music_right_panel_active,
+            self.settings.fullscreen_click_info_open,
+            music_modal_open,
+        );
         let pointer_over_panel = left_hover || right_hover || music_modal_open;
 
         let show_timeline = !music_shell_active
@@ -22124,9 +22534,8 @@ impl App {
                 .draw(ui, spectrum_rect, norm_gain_db, bass_marker);
         }
 
-        // ── 左右パネル (Inc 5 FB) ── 端ホバーでオーバーレイ表示 (動画のジャンプ/メタパネルと
-        // 同じ)。中央は縮小しないので、中央 timeline/spectrum の上に重ねて描く (クリックは後描画
-        // のパネルが優先。ピン/トグルボタンは持たない)。左=ブックマーク、右=情報/タグ/★。
+        // ── 左右パネル (Inc 5 FB / §1.15) ── 表示モードに従ってオーバーレイ表示する。
+        // 中央は縮小せず timeline/spectrum の上に重ねる。左=ブックマーク、右=情報/タグ/★。
         // ホバー判定 (left_hover / right_hover) は timeline seek 抑止のため上で計算済み。
         // 左ブックマーク UI: 一覧パネル本体は左端ホバー時のみ、中央モーダル (改名 / 一括登録)
         // は開いている間常に描く (draw_music_bookmark_ui 内で分岐)。動画のジャンプ/ブックマーク
@@ -22136,10 +22545,17 @@ impl App {
         if right_hover {
             self.draw_fs_music_right_panel(ui, ctx, right_panel_rect, fs_idx);
         }
+        self.draw_music_panel_callouts(
+            ctx,
+            rect,
+            panel_band_top,
+            panel_band_bottom,
+            fs_idx,
+            !music_modal_open,
+        );
 
-        // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時)。
-        // 左右パネルは端ホバーで出すのでトグルボタンは置かない (Inc 5 FB、動画と同じ)。
-        // 位置/長さ・音量・再生などは下 HUD に集約 (動画のレイアウト思想)。
+        // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時) +
+        // 左右パネル表示モード i。位置/長さ・音量・再生などは下 HUD に集約する。
         let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
         let top_response =
             self.draw_music_top_chrome(ui, top_rect, fs_idx, &active_chrome, fg, accent, true);
@@ -22149,6 +22565,9 @@ impl App {
         #[cfg(windows)]
         if top_response.window_clicked {
             self.toggle_egui_viewer_window_mode_for_input(ctx);
+        }
+        if top_response.side_panel_mode_clicked {
+            self.cycle_fs_side_panel_mode();
         }
         #[cfg(windows)]
         if top_response.back_to_video_clicked {
@@ -22202,6 +22621,62 @@ mod tests {
     use super::*;
     use crate::grid_item::GridItem;
     use std::path::PathBuf;
+
+    #[test]
+    fn music_panel_visibility_uses_hover_or_explicit_click_state_by_mode() {
+        use crate::settings::FsSidePanelMode;
+
+        assert!(music_left_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            true,
+            false,
+            false,
+        ));
+        assert!(!music_left_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            true,
+            false,
+            false,
+        ));
+        assert!(music_left_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            false,
+            true,
+            false,
+        ));
+
+        assert!(!music_right_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            true,
+            false,
+            false,
+        ));
+        assert!(music_right_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            false,
+            true,
+            false,
+        ));
+        assert!(!music_right_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            true,
+            false,
+        ));
+
+        assert!(!music_left_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            false,
+            true,
+            true,
+        ));
+        assert!(!music_right_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            false,
+            true,
+            true,
+        ));
+    }
 
     // テスト用ラッパ: コンテンツ領域 = 画像全体 (トリムなし) で zoom helper を呼ぶ。
     fn tz_pan(
@@ -22470,6 +22945,80 @@ mod tests {
             !activation.contains(egui::pos2(panel.left() + 1.0, 120.0)),
             "パネル本体の左寄り (ストリップ外) では開かない"
         );
+    }
+
+    #[test]
+    fn click_callout_edge_is_fixed_and_narrower_than_hover_trigger() {
+        let viewport =
+            egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(1920.0, 1080.0));
+        let left = panel_callout_edge_rect(viewport, crate::ui_helpers::PanelEdge::Left);
+        let right = panel_callout_edge_rect(viewport, crate::ui_helpers::PanelEdge::Right);
+        assert_eq!(left.left(), viewport.left());
+        assert_eq!(right.right(), viewport.right());
+        assert_eq!(left.width(), crate::ui_helpers::PANEL_CALLOUT_HIT_PX);
+        assert_eq!(right.width(), crate::ui_helpers::PANEL_CALLOUT_HIT_PX);
+        assert!(left.width() < crate::ui_helpers::panel_edge_trigger_px(viewport.width()));
+    }
+
+    #[test]
+    fn hidden_side_panel_chrome_does_not_claim_panel_or_callout_rects() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let right_panel = egui::pos2(1800.0, 300.0);
+        let left_callout = egui::pos2(2.0, viewport.center().y);
+
+        for pos in [right_panel, left_callout] {
+            assert!(!fullscreen_side_panel_contains_pointer(
+                viewport,
+                pos,
+                false,
+                crate::settings::FsSidePanelMode::ClickToShow,
+                true,
+                true,
+            ));
+        }
+        assert!(fullscreen_side_panel_contains_pointer(
+            viewport,
+            left_callout,
+            true,
+            crate::settings::FsSidePanelMode::ClickToShow,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn still_side_panel_chrome_matches_draw_suppression_modes() {
+        let base = StillSidePanelChromeInputs {
+            is_music_view: false,
+            analysis_active: false,
+            is_video: false,
+            compare_wipe_active: false,
+            panorama_active: false,
+            overlay_edit_active: false,
+            view_trim_active: false,
+            zoom_active: false,
+            paged: true,
+            animated: false,
+        };
+        assert!(still_side_panel_chrome_enabled(base));
+        assert!(!still_side_panel_chrome_enabled(
+            StillSidePanelChromeInputs {
+                overlay_edit_active: true,
+                ..base
+            }
+        ));
+        assert!(!still_side_panel_chrome_enabled(
+            StillSidePanelChromeInputs {
+                view_trim_active: true,
+                ..base
+            }
+        ));
+        assert!(!still_side_panel_chrome_enabled(
+            StillSidePanelChromeInputs {
+                analysis_active: true,
+                ..base
+            }
+        ));
     }
 
     #[test]

@@ -146,22 +146,64 @@ pub fn frame_had_key_down() -> bool {
         .unwrap_or(false)
 }
 
-pub fn consume_key_down<F>(allow_repeat: bool, mut predicate: F) -> bool
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConsumeKeyDownResult {
+    pub matched: bool,
+    pub triggered: bool,
+}
+
+pub fn consume_key_down_with_result<F>(allow_repeat: bool, mut predicate: F) -> ConsumeKeyDownResult
 where
     F: FnMut(KeyEdge) -> bool,
 {
     state()
         .lock()
         .map(|mut guard| {
-            let Some(index) = guard.frame.iter().position(|edge| {
-                edge.pressed && (allow_repeat || !edge.repeat) && predicate(*edge)
-            }) else {
-                return false;
-            };
-            guard.frame.remove(index);
-            true
+            let mut result = ConsumeKeyDownResult::default();
+            let mut index = 0;
+            while index < guard.frame.len() {
+                let edge = guard.frame[index];
+                if edge.pressed && predicate(edge) {
+                    result.matched = true;
+                    if allow_repeat || !edge.repeat {
+                        result.triggered = true;
+                    }
+                    guard.frame.remove(index);
+                    if allow_repeat {
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            result
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+pub fn consume_key_down<F>(allow_repeat: bool, predicate: F) -> bool
+where
+    F: FnMut(KeyEdge) -> bool,
+{
+    consume_key_down_with_result(allow_repeat, predicate).triggered
+}
+
+#[cfg(test)]
+pub fn set_test_frame(edges: Vec<KeyEdge>) {
+    if let Ok(mut guard) = state().lock() {
+        guard.frame = edges;
+        guard.frame_had_key_down = guard.frame.iter().any(|edge| edge.pressed);
+        guard.frame_active = true;
+    }
+}
+
+#[cfg(test)]
+pub fn clear_test_frame() {
+    if let Ok(mut guard) = state().lock() {
+        guard.frame.clear();
+        guard.frame_active = false;
+        guard.frame_had_key_down = false;
+    }
 }
 
 pub fn pressed_key_down<F>(predicate: F) -> bool

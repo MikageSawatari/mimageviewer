@@ -55,6 +55,20 @@ const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 168, 205);
 const VALUE_COLOR: egui::Color32 = egui::Color32::from_rgb(228, 230, 236);
 const TITLE_H: f32 = 30.0;
 
+fn draw_music_panel_close_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let c = rect.center();
+    let d = rect.width().min(rect.height()) * 0.22;
+    let stroke = egui::Stroke::new(1.7, egui::Color32::from_gray(225));
+    painter.line_segment(
+        [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)],
+        stroke,
+    );
+}
+
 /// ツールチップにショートカットを併記する ("ミュート" + Some("M") → "ミュート [M]")。
 /// 動画 native HUD の `native_label_with_shortcut` 相当。未割り当て (None / 空) はラベルのみ。
 fn label_with_shortcut(label: &str, chord: Option<&str>) -> String {
@@ -469,6 +483,31 @@ impl App {
             egui::FontId::proportional(13.0),
             egui::Color32::from_gray(205),
         );
+        let mut close_requested = false;
+        if self.settings.fullscreen_side_panel_mode.normalized()
+            == crate::settings::FsSidePanelMode::ClickToShow
+        {
+            let close_rect = egui::Rect::from_center_size(
+                egui::pos2(title_rect.right() - 16.0, title_rect.center().y),
+                egui::vec2(24.0, 24.0),
+            );
+            let close_response = ui
+                .interact(
+                    close_rect,
+                    ui.id().with(("music_right_close", fs_idx)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text("閉じる");
+            if close_response.hovered() {
+                ui.painter().rect_filled(
+                    close_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+                );
+            }
+            draw_music_panel_close_icon(ui.painter(), close_rect);
+            close_requested = close_response.clicked();
+        }
 
         let content_rect = egui::Rect::from_min_max(
             egui::pos2(panel_rect.left(), title_rect.bottom()),
@@ -556,13 +595,16 @@ impl App {
             // draw_rating_stars が「同★再クリック=0」を解決済み。
             self.set_rating(fs_idx, new_stars);
         }
+        if close_requested {
+            self.toggle_fullscreen_click_info_open();
+        }
     }
 
     // ───────────────────────── 左パネル (ブックマーク一覧) ─────────────────────────
 
     /// 音楽ビューのブックマーク UI (Inc 5c-A、動画のジャンプ/ブックマークパネルを共有)。
     ///
-    /// - 左端ホバーで出す一覧パネル本体 (`show_panel`) は `draw_native_jump_panel_body` を
+    /// - 表示モードに従って出す一覧パネル本体 (`show_panel`) は `draw_native_jump_panel_body` を
     ///   音声オプション (ピン/チャプター/サムネなし・種別見出しなし) で呼ぶ。
     /// - 改名ダイアログ / 一括登録ダイアログは動画と同一の中央モーダル
     ///   (`draw_native_bookmark_title_editor` / `draw_native_bulk_bookmark_dialog`) を使う。
@@ -616,6 +658,9 @@ impl App {
         let mut title_edit = self.music_bookmark_title_edit.take();
         let mut bulk = self.music_bulk_bookmark_dialog.take();
         let mut commands: Vec<NativeOverlayCommand> = Vec::new();
+        let click_to_show = self.settings.fullscreen_side_panel_mode.normalized()
+            == crate::settings::FsSidePanelMode::ClickToShow;
+        let mut close_left_requested = false;
         // 音声はサムネを持たないので空の texture マップを渡す (show_thumbnails=false で未参照)。
         let empty_tex: std::collections::HashMap<usize, egui::TextureId> =
             std::collections::HashMap::new();
@@ -645,6 +690,7 @@ impl App {
                         ui,
                         panel_rect,
                         &opts,
+                        0.0,
                         position_secs,
                         &entries,
                         &empty_tex,
@@ -653,7 +699,34 @@ impl App {
                         &mut bulk,
                         &mut commands,
                     );
+                    if click_to_show {
+                        // 共有 body の右側はブックマーク / 一括ボタンが使うため、タイトル直後に
+                        // music 専用の明示クローズを置く。
+                        let close_rect = egui::Rect::from_min_size(
+                            panel_rect.min + egui::vec2(102.0, 6.0),
+                            egui::vec2(24.0, 24.0),
+                        );
+                        let close_response = ui
+                            .interact(
+                                close_rect,
+                                ui.id().with(("music_left_close", fs_idx)),
+                                egui::Sense::click(),
+                            )
+                            .hover_tip_dark("閉じる");
+                        if close_response.hovered() {
+                            ui.painter().rect_filled(
+                                close_rect,
+                                4.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+                            );
+                        }
+                        draw_music_panel_close_icon(ui.painter(), close_rect);
+                        close_left_requested = close_response.clicked();
+                    }
                 });
+        }
+        if close_left_requested {
+            self.music_left_click_open = false;
         }
 
         // ── 中央モーダル (改名 / 一括登録) は開いている間常に描く ──

@@ -44,6 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
+use crate::settings::FsSidePanelMode;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 
@@ -444,6 +445,12 @@ struct NativeEguiOverlay {
     top_bar_visible: bool,
     right_panel_visible: bool,
     jump_panel_visible: bool,
+    /// App settings から同期される、左右パネル共通の表示モード。
+    side_panel_mode: FsSidePanelMode,
+    /// ClickToShow の右情報パネル永続状態。正本は App settings。
+    click_info_open: bool,
+    /// ClickToShow の左ジャンプパネル状態。動画ソース単位の presenter-local session。
+    left_session_open: bool,
     /// 右パネル (情報/★/タグ) の端ホバー開閉ラッチ。画面右端 5% の細いトリガで開き、
     /// パネル矩形 + ヒステリシス余白から出るまで維持する。パネル幅ぶんの広い当たり判定が
     /// 中央のクリック (右クリックページ送り等) を食う問題への対策 (実機 FB 2026-07)。
@@ -452,6 +459,8 @@ struct NativeEguiOverlay {
     right_panel_hover_latched: bool,
     /// 左ジャンプ・情報パネルの端ホバー開閉ラッチ。右と同じ二段判定。
     jump_panel_hover_latched: bool,
+    /// ClickToShow の開いたパネルを Escape で閉じた入力 batch を App へ流さないための印。
+    side_panel_escape_consumed: bool,
     /// 実機修正 (2026-05-12): 外部 drag (= HUD region 外で left button down 中、典型的には VST window
     /// のドラッグ) を検出するフラグ。`NativeVideoPresenter::cursor_polling_tick` で `GetAsyncKeyState
     /// (VK_LBUTTON)` の結果と egui の `pointer.any_down()` の差から判定して set する。
@@ -1136,6 +1145,8 @@ struct NativeRightPanelVisibilityInputs {
     hover_preview_active: bool,
     tag_picker_open: bool,
     pointer_in_hover_rect: bool,
+    side_panel_mode: FsSidePanelMode,
+    click_info_open: bool,
 }
 
 fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
@@ -1151,7 +1162,15 @@ fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInput
     if input.video_speed_popup_open || input.hover_preview_active {
         return false;
     }
-    input.tag_picker_open || input.pointer_in_hover_rect
+    input.tag_picker_open
+        || match input.side_panel_mode.normalized() {
+            FsSidePanelMode::Hover => input.pointer_in_hover_rect,
+            FsSidePanelMode::ClickToShow => crate::ui_helpers::metadata_panel_persistently_shown(
+                input.side_panel_mode,
+                input.click_info_open,
+            ),
+            FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
+        }
 }
 
 #[derive(Clone, Copy)]
@@ -1161,6 +1180,8 @@ struct NativeJumpPanelVisibilityInputs {
     video_speed_popup_open: bool,
     hover_preview_active: bool,
     pointer_in_hover_rect: bool,
+    side_panel_mode: FsSidePanelMode,
+    left_session_open: bool,
 }
 
 fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs) -> bool {
@@ -1173,7 +1194,11 @@ fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs)
     if input.video_speed_popup_open || input.hover_preview_active {
         return false;
     }
-    input.pointer_in_hover_rect
+    match input.side_panel_mode.normalized() {
+        FsSidePanelMode::Hover => input.pointer_in_hover_rect,
+        FsSidePanelMode::ClickToShow => input.left_session_open,
+        FsSidePanelMode::Unknown => unreachable!("normalized side panel mode"),
+    }
 }
 
 #[cfg(test)]
@@ -1211,6 +1236,22 @@ mod clipboard_normalize_tests {
     }
 }
 
+fn native_panel_callout_hud_rects(
+    width: f32,
+    height: f32,
+    left_visible: bool,
+    right_visible: bool,
+    vst_visible: bool,
+) -> [Option<egui::Rect>; 2] {
+    if vst_visible {
+        return [None, None];
+    }
+    [
+        left_visible.then(|| native_panel_callout_bar_rect(width, height, true)),
+        right_visible.then(|| native_panel_callout_bar_rect(width, height, false)),
+    ]
+}
+
 fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
@@ -1240,6 +1281,8 @@ pub enum NativeOverlayCommand {
     ClearSeekThumbnail,
     ToggleTileMode,
     TogglePerfOverlay,
+    ToggleSidePanelMode,
+    ToggleClickInfoOpen,
     ToggleVst3Gui,
     /// 動画 HUD の「音声モード」ボタン: 映像を切って音楽ビュー (DJ 波形 + spectrum) へ切り替える
     /// (Inc 7、動画→音声モード)。App が `enter_video_audio_mode` を呼ぶ。音声は無中断。
@@ -3114,6 +3157,19 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_side_panel_state(&mut self, mode: FsSidePanelMode, click_info_open: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_side_panel_state(mode, click_info_open);
+        }
+    }
+
+    /// Source swap では右の永続設定を保ち、左の動画単位セッションだけを閉じる。
+    pub fn reset_overlay_side_panel_session(&mut self) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.reset_side_panel_session();
+        }
+    }
+
     pub fn set_overlay_fallback_file_name(&mut self, file_name: String) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_fallback_file_name(file_name);
@@ -3872,6 +3928,7 @@ impl NativeEguiOverlay {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         configure_overlay_fonts(&egui_ctx);
         configure_overlay_style(&egui_ctx);
@@ -3987,8 +4044,12 @@ impl NativeEguiOverlay {
             top_bar_visible: false,
             right_panel_visible: false,
             jump_panel_visible: false,
+            side_panel_mode: FsSidePanelMode::Hover,
+            click_info_open: false,
+            left_session_open: false,
             right_panel_hover_latched: false,
             jump_panel_hover_latched: false,
+            side_panel_escape_consumed: false,
             external_drag_in_progress: false,
             raw_hover_pos: None,
             pending_overlay_commands: Vec::new(),
@@ -4212,6 +4273,25 @@ impl NativeEguiOverlay {
                     && self.can_open_shortcut_help()
                 {
                     self.shortcut_help_open = true;
+                    self.dirty = true;
+                    return;
+                }
+                // ClickToShow の左右パネルは Escape で明示的に閉じる。App の通常 Escape
+                // (fullscreen close) へ同じ key batch を転送しないよう consumed 印も立てる。
+                if matches!(event, NativeEvent::KeyDown(_))
+                    && !key.repeat
+                    && key.virtual_key == 0x1B
+                    && self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow
+                    && !self.text_input_active()
+                    && (self.left_session_open || self.click_info_open)
+                {
+                    self.left_session_open = false;
+                    self.tag_picker_open = false;
+                    if self.click_info_open {
+                        self.pending_overlay_commands
+                            .push(NativeOverlayCommand::ToggleClickInfoOpen);
+                    }
+                    self.side_panel_escape_consumed = true;
                     self.dirty = true;
                     return;
                 }
@@ -4608,6 +4688,34 @@ impl NativeEguiOverlay {
         }
         self.video_metadata = metadata;
         self.dirty = true;
+    }
+
+    fn set_side_panel_state(&mut self, mode: FsSidePanelMode, click_info_open: bool) {
+        let mode = mode.normalized();
+        let mode_changed = self.side_panel_mode != mode;
+        if !mode_changed && self.click_info_open == click_info_open {
+            return;
+        }
+        self.side_panel_mode = mode;
+        self.click_info_open = click_info_open;
+        if mode_changed {
+            self.left_session_open = false;
+            self.right_panel_hover_latched = false;
+            self.jump_panel_hover_latched = false;
+        }
+        self.dirty = true;
+    }
+
+    fn reset_side_panel_session(&mut self) {
+        let changed = self.left_session_open
+            || self.right_panel_hover_latched
+            || self.jump_panel_hover_latched;
+        self.left_session_open = false;
+        self.right_panel_hover_latched = false;
+        self.jump_panel_hover_latched = false;
+        if changed {
+            self.dirty = true;
+        }
     }
 
     fn set_fallback_file_name(&mut self, file_name: String) {
@@ -5102,6 +5210,7 @@ impl NativeEguiOverlay {
         // (IME 確定後の Enter で再現)。イベント処理 *前* のテキスト入力状態を捕まえ、転送判定は
         // これを OR して「受領時にテキスト入力中だったキーは App へ転送しない」を保証する。
         let text_input_active_before_events = self.text_input_active();
+        let side_panel_escape_consumed = std::mem::take(&mut self.side_panel_escape_consumed);
         let commands = self.render_once()?;
         // overlay が wheel を NavigateItem / TileColumnsDelta に変換したフレームでは、
         // 同じ raw wheel イベントを App へ二重転送しないよう routing に印を付ける。
@@ -5115,9 +5224,10 @@ impl NativeEguiOverlay {
         let mut routing = self.input_routing();
         routing.text_input_active |= text_input_active_before_events;
         routing.consumed_wheel = consumed_wheel;
+        routing.modal_dialog_active |= side_panel_escape_consumed;
         // モーダル中央テキストダイアログの表示中は、App へ raw event を流さない
         // (Codex C1/C2/C3: dark backdrop 上の wheel/right-click が暴発する事故防止)。
-        routing.modal_dialog_active = self.modal_dialog_active_for_routing();
+        routing.modal_dialog_active |= self.modal_dialog_active_for_routing();
         Ok(NativeOverlayInputOutcome {
             routing,
             commands,
@@ -5201,7 +5311,8 @@ impl NativeEguiOverlay {
         let navigation_preview_visible = self.navigation_preview.is_some();
         let top_bar_visible_flag = self.top_bar_visible;
         let right_panel_visible_flag = self.right_panel_visible();
-        let jump_panel_visible_flag = self.jump_panel_visible;
+        let jump_panel_visible_flag = self.jump_panel_visible();
+        let (left_callout_visible, right_callout_visible) = self.side_panel_callout_visibility();
         let side_panel_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (jump_panel_visible_flag || right_panel_visible_flag);
@@ -5310,6 +5421,21 @@ impl NativeEguiOverlay {
             regions.push(rect_to_px(self::overlay_draw::native_jump_panel_rect(
                 height_points,
             )));
+        }
+
+        // ClickToShow callout は activation zone ではなく実際にクリックする UI なので、
+        // 表示中の細い bar rect だけを HUD HWND region に含める。
+        for rect in native_panel_callout_hud_rects(
+            width_points,
+            height_points,
+            left_callout_visible,
+            right_callout_visible,
+            self.vst3_panel_visible(),
+        )
+        .into_iter()
+        .flatten()
+        {
+            regions.push(rect_to_px(rect));
         }
 
         // 実機修正 (2026-05-12 P2): Perf overlay 表示中は perf rect を region に
@@ -5685,6 +5811,11 @@ impl NativeEguiOverlay {
     ///    わずかに越えても即閉じない (項目クリックへ移動する動線を確保)。
     /// egui / 音楽ビュー側の二段ラッチと同じモデル。`render_once` の先頭で 1 回だけ呼ぶ。
     fn update_side_panel_hover_latches(&mut self) {
+        if self.side_panel_mode.normalized() != FsSidePanelMode::Hover {
+            self.right_panel_hover_latched = false;
+            self.jump_panel_hover_latched = false;
+            return;
+        }
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         let hover_bottom = native_panel_hover_bottom(overlay_height_points);
@@ -5732,6 +5863,8 @@ impl NativeEguiOverlay {
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             tag_picker_open: self.tag_picker_open,
             pointer_in_hover_rect: self.right_panel_hover_latched,
+            side_panel_mode: self.side_panel_mode,
+            click_info_open: self.click_info_open,
         })
     }
 
@@ -5743,7 +5876,48 @@ impl NativeEguiOverlay {
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             pointer_in_hover_rect: self.jump_panel_hover_latched,
+            side_panel_mode: self.side_panel_mode,
+            left_session_open: self.left_session_open,
         })
+    }
+
+    fn metadata_available(&self) -> bool {
+        self.video_metadata.as_ref().is_some_and(|metadata| {
+            metadata.probe_info_available
+                || !metadata.shortcut_tags.is_empty()
+                || !metadata.current_tags.is_empty()
+                || !metadata.tag_choices.is_empty()
+        })
+    }
+
+    /// ClickToShow の最端 hover で表示する左右 callout。panel 本体の modal gate と揃える。
+    fn side_panel_callout_visibility(&self) -> (bool, bool) {
+        if self.side_panel_mode.normalized() != FsSidePanelMode::ClickToShow
+            || self.external_drag_in_progress
+            || self.shortcut_help_open
+            || self.vst3_panel_visible()
+            || self.video_speed_popup_open
+            || self.hover_preview_target_secs.is_some()
+            || self.tile_overlay.is_some()
+            || self.navigation_preview.is_some()
+        {
+            return (false, false);
+        }
+        let Some(pointer) = self.visibility_hover_pos() else {
+            return (false, false);
+        };
+        let width = self.width as f32 / self.pixels_per_point;
+        let height = self.height as f32 / self.pixels_per_point;
+        let left = crate::ui_helpers::callout_hit(
+            native_panel_callout_edge_rect(width, height, true),
+            Some(pointer),
+        );
+        let right = self.metadata_available()
+            && crate::ui_helpers::callout_hit(
+                native_panel_callout_edge_rect(width, height, false),
+                Some(pointer),
+            );
+        (left, right)
     }
 
     fn pointer_over_scroll_panel(&self, pos: egui::Pos2) -> bool {
@@ -5842,6 +6016,7 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / ppp;
         let overlay_height_points = self.height as f32 / ppp;
+        let (left_callout_visible, right_callout_visible) = self.side_panel_callout_visibility();
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
         // P10-2: now-playing バナー (現在再生中のチャプター/ブックマーク) は左パネル
@@ -5897,6 +6072,7 @@ impl NativeEguiOverlay {
         let perf_visible = self.perf_visible;
         let vst3_available = self.vst3_available;
         let audio_only = self.audio_only;
+        let side_panel_mode = self.side_panel_mode;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
         let perf_latest = self.perf_latest;
@@ -5949,6 +6125,8 @@ impl NativeEguiOverlay {
             || vst3_panel_visible
             || ring_picker_visible
             || ring_guide_visible
+            || left_callout_visible
+            || right_callout_visible
             || normalize_scanning;
         // カーソル auto-hide の判定用: チェックマークのような「受動表示」(ユーザーが
         // 操作する対象ではなく単なる状態インジケータ) は countdown をブロックしない。
@@ -5983,7 +6161,9 @@ impl NativeEguiOverlay {
             || ring_guide_visible
             || normalize_scanning
             || in_top_activation_zone
-            || in_bottom_activation_zone;
+            || in_bottom_activation_zone
+            || left_callout_visible
+            || right_callout_visible;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -6005,6 +6185,8 @@ impl NativeEguiOverlay {
         let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_picker_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_guide_rect: Option<egui::Rect> = None;
+        let left_session_open_before = self.left_session_open;
+        let mut left_session_open = left_session_open_before;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -6193,6 +6375,7 @@ impl NativeEguiOverlay {
                     vst3_available,
                     vst3_panel_visible,
                     audio_only,
+                    side_panel_mode,
                     hud_dimmed,
                     &mut commands,
                 );
@@ -6256,10 +6439,11 @@ impl NativeEguiOverlay {
                     tag_picker_escape_pressed,
                     tag_picker_ime_active,
                     &mut commands,
+                    self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                 );
             }
             if jump_panel_visible {
-                draw_native_jump_panel(
+                let close_left = draw_native_jump_panel(
                     ctx,
                     overlay_height_points,
                     position_secs,
@@ -6269,7 +6453,35 @@ impl NativeEguiOverlay {
                     &mut bookmark_title_edit,
                     &mut bulk_bookmark_dialog,
                     &mut commands,
+                    self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                 );
+                if close_left {
+                    left_session_open = false;
+                }
+            }
+            // Panel より後に描いて、開いている panel の端でも callout をクリック可能にする。
+            if left_callout_visible
+                && draw_native_panel_callout(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    true,
+                    left_session_open,
+                )
+            {
+                left_session_open = !left_session_open;
+            }
+            if right_callout_visible
+                && draw_native_panel_callout(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    false,
+                    self.click_info_open,
+                )
+            {
+                self.tag_picker_open = false;
+                commands.push(NativeOverlayCommand::ToggleClickInfoOpen);
             }
             if bookmark_title_edit.is_some() {
                 last_drawn_bookmark_editor_rect = draw_native_bookmark_title_editor(
@@ -7634,6 +7846,8 @@ impl NativeEguiOverlay {
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
+        self.left_session_open = left_session_open;
+        let left_session_open_changed = left_session_open != left_session_open_before;
         // egui 側で発行されたクリップボードコピー (Ctrl+C / Ctrl+X 応答) を OS に流す。
         for cmd in &full_output.platform_output.commands {
             if let egui::OutputCommand::CopyText(text) = cmd {
@@ -7749,7 +7963,8 @@ impl NativeEguiOverlay {
         self.dirty = self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
             || self.bulk_bookmark_dialog.is_some()
-            || self.shortcut_help_open;
+            || self.shortcut_help_open
+            || left_session_open_changed;
         log_event(
             "egui_overlay_present",
             &[
@@ -8381,14 +8596,19 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use super::overlay_draw::{
+        native_panel_callout_arrow_direction, native_panel_callout_bar_rect,
+    };
     use super::{
         NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
         NativePixelSample, NativeRightPanelVisibilityInputs, compare_pixel_probe,
         compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
         effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_right_panel_visible_from_inputs,
-        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        native_right_panel_visible_from_inputs, native_video_fullscreen_shortcut_key,
+        sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
+    use crate::settings::FsSidePanelMode;
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
         NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
@@ -8607,6 +8827,8 @@ mod tests {
             hover_preview_active: false,
             tag_picker_open: false,
             pointer_in_hover_rect: true,
+            side_panel_mode: FsSidePanelMode::Hover,
+            click_info_open: false,
         };
         assert!(native_right_panel_visible_from_inputs(right_base));
         assert!(!native_right_panel_visible_from_inputs(
@@ -8637,6 +8859,8 @@ mod tests {
             video_speed_popup_open: false,
             hover_preview_active: false,
             pointer_in_hover_rect: true,
+            side_panel_mode: FsSidePanelMode::Hover,
+            left_session_open: false,
         };
         assert!(native_jump_panel_visible_from_inputs(jump_base));
         assert!(!native_jump_panel_visible_from_inputs(
@@ -8645,6 +8869,79 @@ mod tests {
                 ..jump_base
             }
         ));
+    }
+
+    #[test]
+    fn click_to_show_native_panels_ignore_hover_and_use_explicit_open_state() {
+        let right_base = NativeRightPanelVisibilityInputs {
+            shortcut_help_open: false,
+            external_drag_in_progress: false,
+            vst3_panel_visible: false,
+            metadata_available: true,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            tag_picker_open: false,
+            pointer_in_hover_rect: true,
+            side_panel_mode: FsSidePanelMode::ClickToShow,
+            click_info_open: false,
+        };
+        assert!(!native_right_panel_visible_from_inputs(right_base));
+        assert!(native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                click_info_open: true,
+                pointer_in_hover_rect: false,
+                ..right_base
+            }
+        ));
+        assert!(!native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                metadata_available: false,
+                click_info_open: true,
+                ..right_base
+            }
+        ));
+
+        let jump_base = NativeJumpPanelVisibilityInputs {
+            shortcut_help_open: false,
+            vst3_panel_visible: false,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            pointer_in_hover_rect: true,
+            side_panel_mode: FsSidePanelMode::ClickToShow,
+            left_session_open: false,
+        };
+        assert!(!native_jump_panel_visible_from_inputs(jump_base));
+        assert!(native_jump_panel_visible_from_inputs(
+            NativeJumpPanelVisibilityInputs {
+                left_session_open: true,
+                pointer_in_hover_rect: false,
+                ..jump_base
+            }
+        ));
+    }
+
+    #[test]
+    fn native_callout_arrow_reverses_when_panel_is_open() {
+        assert_eq!(native_panel_callout_arrow_direction(true, false), 1.0);
+        assert_eq!(native_panel_callout_arrow_direction(true, true), -1.0);
+        assert_eq!(native_panel_callout_arrow_direction(false, false), -1.0);
+        assert_eq!(native_panel_callout_arrow_direction(false, true), 1.0);
+    }
+
+    #[test]
+    fn native_callout_hud_regions_use_only_bars_and_disappear_for_vst() {
+        let rects = native_panel_callout_hud_rects(1920.0, 1080.0, true, true, false);
+        assert_eq!(
+            rects,
+            [
+                Some(native_panel_callout_bar_rect(1920.0, 1080.0, true)),
+                Some(native_panel_callout_bar_rect(1920.0, 1080.0, false)),
+            ]
+        );
+        assert_eq!(
+            native_panel_callout_hud_rects(1920.0, 1080.0, true, true, true),
+            [None, None]
+        );
     }
 
     #[test]
@@ -8687,6 +8984,8 @@ mod tests {
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x75))));
         // F11 (window/fullscreen toggle) も whitelist 経由で App へ流す。
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x7A))));
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x49))));
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x09))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x41))));
         // マウス進む/戻る (VK_BROWSER_BACK/FORWARD) も overlay が keyboard を欲しがる
         // 状態 (text input 以外) でも fullscreen ショートカットとして App 側へ流す (Codex P2)。

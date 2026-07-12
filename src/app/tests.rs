@@ -17021,6 +17021,41 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn native_video_i_and_tab_toggle_side_panel_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\panel-mode.mp4"));
+        app.fullscreen_idx = Some(idx);
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x49, false));
+        assert_eq!(
+            app.settings.fullscreen_side_panel_mode,
+            crate::settings::FsSidePanelMode::ClickToShow
+        );
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x09, false));
+        assert_eq!(
+            app.settings.fullscreen_side_panel_mode,
+            crate::settings::FsSidePanelMode::Hover
+        );
+    }
+
+    #[test]
+    fn hidden_native_video_does_not_toggle_mode_owned_by_egui_music_view() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::new());
+        app.fullscreen_idx = Some(idx);
+        app.video_audio_mode = Some(idx);
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x49, false));
+
+        assert_eq!(
+            app.settings.fullscreen_side_panel_mode,
+            crate::settings::FsSidePanelMode::Hover
+        );
+    }
+
+    #[test]
     fn native_video_shift_fkeys_rate_current_container() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -31062,4 +31097,333 @@ fn thumbnail_bottom_bar_created_column_requests_lazy_meta_without_tooltip_create
 
     assert!(app.selection_info_item_requires_lazy_meta(0));
     assert!(app.lazy_load_created_for_idx(0));
+}
+
+#[test]
+fn fullscreen_side_panel_settings_persist_while_left_panel_resets_on_exit() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/panel-mode.jpg")));
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.settings.fullscreen_click_info_open = true;
+    app.open_fullscreen(idx);
+    app.adjustment_mode = true;
+
+    app.close_fullscreen();
+
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::ClickToShow
+    );
+    assert!(app.settings.fullscreen_click_info_open);
+    assert!(app.metadata_panel_persistently_shown());
+    assert!(!app.adjustment_mode);
+
+    app.open_fullscreen(idx);
+    assert!(app.metadata_panel_persistently_shown());
+    assert!(!app.adjustment_mode);
+}
+
+#[test]
+fn fullscreen_info_action_toggles_mode_for_button_key_and_gamepad_path() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/panel-input.jpg")));
+    app.fullscreen_idx = Some(idx);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+
+    // ホバーバー i と I / Tab はこの共通入口を使う。
+    app.cycle_fs_side_panel_mode();
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::ClickToShow
+    );
+
+    let ctx = egui::Context::default();
+    app.apply_ring_action(
+        &ctx,
+        crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+        crate::ring_shortcut::RingActionId::ImageToggleMetadata,
+        "test",
+    );
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+}
+
+#[test]
+fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
+    let mut app = phase_c_support::setup_app();
+    app.adjustment_mode = true;
+    app.metadata_panel_hover_active = true;
+    app.music_left_panel_active = true;
+    app.music_right_panel_active = true;
+    app.music_left_click_open = true;
+    app.settings.fullscreen_click_info_open = true;
+
+    app.reset_fs_side_panel_runtime_for_mode_change();
+
+    assert!(!app.adjustment_mode);
+    assert!(!app.metadata_panel_hover_active);
+    assert!(!app.music_left_panel_active);
+    assert!(!app.music_right_panel_active);
+    assert!(!app.music_left_click_open);
+    assert!(app.settings.fullscreen_click_info_open);
+}
+
+fn fullscreen_tab_event(repeat: bool) -> egui::Event {
+    egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn begin_fullscreen_tab_pass(ctx: &egui::Context, repeat: bool) {
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_tab_event(repeat)],
+        ..Default::default()
+    });
+}
+
+fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
+    let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_tab_event(false), fullscreen_tab_event(true)],
+        ..Default::default()
+    });
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+    assert!(ctx.input(|i| i.events.is_empty()));
+    egui::CentralPanel::default().show(&ctx, |ui| {
+        let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+        let _ = ui.interact(
+            rect,
+            egui::Id::new("fullscreen_tab_round_trip_surface"),
+            egui::Sense::click_and_drag(),
+        );
+    });
+    assert!(!ctx.wants_keyboard_input());
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+    let _ = ctx.end_pass();
+
+    begin_fullscreen_tab_pass(&ctx, true);
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::Hover
+    );
+    assert!(ctx.input(|i| i.events.is_empty()));
+    let _ = ctx.end_pass();
+
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+    let _ = ctx.end_pass();
+
+    begin_fullscreen_tab_pass(&ctx, false);
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::ClickToShow
+    );
+    assert!(ctx.input(|i| i.events.is_empty()));
+    let _ = ctx.end_pass();
+}
+
+#[test]
+fn fullscreen_i_key_toggles_side_panel_mode() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Image(PathBuf::from("C:/photos/panel-key.jpg")));
+    app.fullscreen_idx = Some(idx);
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::I,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::ClickToShow
+    );
+}
+
+#[test]
+fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::new()));
+    app.fullscreen_idx = Some(idx);
+    let ctx = egui::Context::default();
+
+    for key in [egui::Key::I, egui::Key::Tab] {
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        for repeat in [false, true] {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_fs_key_input(&ctx, idx, false);
+            let _ = ctx.end_pass();
+        }
+
+        assert_eq!(
+            app.settings.fullscreen_side_panel_mode,
+            crate::settings::FsSidePanelMode::Hover
+        );
+    }
+}
+
+#[test]
+fn music_fullscreen_i_key_toggles_side_panel_mode() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Audio(PathBuf::from("C:/music/panel-key.flac")));
+    app.fullscreen_idx = Some(idx);
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::I,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert_eq!(
+        app.settings.fullscreen_side_panel_mode,
+        crate::settings::FsSidePanelMode::ClickToShow
+    );
+}
+
+#[test]
+fn music_fullscreen_i_and_tab_return_to_hover_without_repeat_retoggle() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Audio(PathBuf::new()));
+    app.fullscreen_idx = Some(idx);
+    let ctx = egui::Context::default();
+
+    for key in [egui::Key::I, egui::Key::Tab] {
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        for repeat in [false, true] {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_fs_key_input(&ctx, idx, false);
+            let _ = ctx.end_pass();
+        }
+
+        assert_eq!(
+            app.settings.fullscreen_side_panel_mode,
+            crate::settings::FsSidePanelMode::Hover
+        );
+    }
+}
+
+#[test]
+fn fullscreen_tab_round_trips_with_open_panels_on_all_egui_surfaces() {
+    for kind in 0..3 {
+        let mut app = phase_c_support::setup_app();
+        let idx = app.items.len();
+        let item = match kind {
+            0 => GridItem::Image(PathBuf::new()),
+            1 => GridItem::Audio(PathBuf::new()),
+            _ => GridItem::Video(PathBuf::new()),
+        };
+        app.items.push(item);
+        app.fullscreen_idx = Some(idx);
+        if kind == 2 {
+            app.video_audio_mode = Some(idx);
+        }
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.settings.fullscreen_click_info_open = true;
+        if kind == 0 {
+            app.adjustment_mode = true;
+        } else {
+            app.music_left_click_open = true;
+        }
+
+        assert_fullscreen_tab_round_trip(&mut app, idx);
+    }
+}
+
+#[test]
+fn music_left_click_panel_resets_with_music_view_session() {
+    let mut app = phase_c_support::setup_app();
+    app.music_left_click_open = true;
+
+    app.clear_music_view_state();
+
+    assert!(!app.music_left_click_open);
+}
+
+#[cfg(windows)]
+#[test]
+fn video_audio_transition_resets_music_left_session_but_keeps_right_persistent() {
+    let mut app = phase_c_support::setup_app();
+    app.music_left_panel_active = true;
+    app.music_right_panel_active = true;
+    app.music_left_click_open = true;
+    app.settings.fullscreen_click_info_open = true;
+
+    app.reset_video_audio_side_panel_sessions(usize::MAX);
+
+    assert!(!app.music_left_panel_active);
+    assert!(!app.music_right_panel_active);
+    assert!(!app.music_left_click_open);
+    assert!(app.settings.fullscreen_click_info_open);
 }

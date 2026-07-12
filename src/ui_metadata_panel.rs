@@ -49,30 +49,20 @@ impl App {
     /// 画像は常に `full_rect` 全体に表示し、パネルは画像の上に重ねる。
     ///
     /// 表示条件:
-    /// - `I` キーまたはピン留めで固定表示 ON/OFF
-    /// - マウスカーソルが画面右端のパネル幅内にあるときもホバー表示
+    /// - 通常ホバー: マウスカーソルが画面右端にある間
+    /// - クリック表示: 永続設定 fullscreen_click_info_open が ON
     ///
     /// 右パネル表示中は上部バーも常に同時表示する。
     /// 右パネルは常に上部バーの下から開始する。
     ///
     /// 戻り値: 右パネルが表示中なら true（上部バーの強制表示に使う）
-    /// オーバーレイモード用: ホバー判定なしで強制表示する。
-    pub(crate) fn draw_metadata_panel_forced(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        full_rect: egui::Rect,
-    ) {
-        self.draw_metadata_panel_inner(ui, ctx, full_rect, true);
-    }
-
     pub(crate) fn draw_metadata_panel(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> bool {
-        self.draw_metadata_panel_inner(ui, ctx, full_rect, false)
+        self.draw_metadata_panel_inner(ui, ctx, full_rect)
     }
 
     fn draw_metadata_panel_inner(
@@ -80,12 +70,9 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-        force_show: bool,
     ) -> bool {
         let panel_rect = crate::ui_fullscreen::metadata_panel_rect(full_rect);
 
-        // forced 描画 (補正パネルと同時表示) 中もラッチを更新する。ここで false にすると、
-        // 右端で補正モードが開いた次フレームに sustain へ遷移できず、右パネルだけ即閉じる。
         let pointer_pos = ctx.input(|i| {
             if self.cursor_hidden {
                 None
@@ -93,19 +80,20 @@ impl App {
                 i.pointer.hover_pos()
             }
         });
-        let hover_visible = crate::ui_fullscreen::metadata_panel_hover_active_at(
-            full_rect,
-            pointer_pos,
-            self.metadata_panel_hover_active,
-        );
-        self.metadata_panel_hover_active = !self.show_metadata_panel && hover_visible;
+        let hover_mode = self.settings.fullscreen_side_panel_mode.normalized()
+            == crate::settings::FsSidePanelMode::Hover;
+        let hover_visible = hover_mode
+            && crate::ui_fullscreen::metadata_panel_hover_active_at(
+                full_rect,
+                pointer_pos,
+                self.metadata_panel_hover_active,
+            );
+        let persistent = self.metadata_panel_persistently_shown();
+        self.metadata_panel_hover_active = !persistent && hover_visible;
 
-        if !force_show {
-            let visible =
-                self.show_metadata_panel || self.fullscreen_tag_picker_open || hover_visible;
-            if !visible {
-                return false;
-            }
+        let visible = persistent || self.fullscreen_tag_picker_open || hover_visible;
+        if !visible {
+            return false;
         }
 
         // パネル背景
@@ -160,59 +148,42 @@ impl App {
             egui::Color32::from_gray(200),
         );
 
-        // ピン留めボタン (右端)
-        let pin_size = 22.0;
-        let pin_margin = 5.0;
-        let pin_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                title_rect.max.x - pin_size - pin_margin,
-                title_rect.min.y + (TITLE_BAR_H - pin_size) * 0.5,
-            ),
-            egui::vec2(pin_size, pin_size),
-        );
-        let pin_resp = ui.interact(
-            pin_rect,
-            egui::Id::new("metadata_pin_btn"),
-            egui::Sense::click(),
-        );
-        let pin_bg = if self.show_metadata_panel {
-            egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-        } else if pin_resp.hovered() {
-            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        ui.painter().rect_filled(pin_rect, 3.0, pin_bg);
-        // ピンアイコン (📌 の代わりにシンプルなテキスト)
-        ui.painter().text(
-            pin_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            if self.show_metadata_panel {
-                "📌"
+        // ClickToShow で開いた右パネルを明示的に閉じるボタン。
+        if persistent {
+            let close_size = 22.0;
+            let close_margin = 5.0;
+            let close_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    title_rect.max.x - close_size - close_margin,
+                    title_rect.min.y + (TITLE_BAR_H - close_size) * 0.5,
+                ),
+                egui::vec2(close_size, close_size),
+            );
+            let close_resp = ui.interact(
+                close_rect,
+                egui::Id::new("metadata_close_btn"),
+                egui::Sense::click(),
+            );
+            let close_bg = if close_resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
             } else {
-                "📌"
-            },
-            egui::FontId::proportional(14.0),
-            if self.show_metadata_panel {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_gray(140)
-            },
-        );
-        let pin_resp = pin_resp.on_hover_text(if self.show_metadata_panel {
-            "常時表示を解除 [I / Tab]"
-        } else {
-            "常時表示に固定 [I / Tab]"
-        });
-        if pin_resp.clicked() {
-            self.show_metadata_panel = !self.show_metadata_panel;
-            self.metadata_panel_hover_active = !self.show_metadata_panel
-                && ctx.input(|i| {
-                    !self.cursor_hidden
-                        && i.pointer
-                            .hover_pos()
-                            .is_some_and(|p| panel_rect.contains(p))
-                });
+                egui::Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(close_rect, 3.0, close_bg);
+            let c = close_rect.center();
+            let d = close_rect.width().min(close_rect.height()) * 0.22;
+            let stroke = egui::Stroke::new(1.7, egui::Color32::from_gray(225));
+            ui.painter().line_segment(
+                [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)],
+                stroke,
+            );
+            if close_resp.on_hover_text("情報パネルを閉じる").clicked() {
+                self.toggle_fullscreen_click_info_open();
+            }
         }
 
         // ── コンテンツ領域 (タイトルバーの下) ──

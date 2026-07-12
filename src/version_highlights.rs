@@ -276,12 +276,21 @@ const TABLE: &[VersionHighlights] = &[
     },
     VersionHighlights {
         version: "2.4.0",
-        must_read: &[HighlightItem {
-            title: "本のページはファイル名順で進みます",
-            body: "ZIP や対応アーカイブ、画像だけのフォルダを本として読むときは、\
+        must_read: &[
+            HighlightItem {
+                title: "本のページはファイル名順で進みます",
+                body: "ZIP や対応アーカイブ、画像だけのフォルダを本として読むときは、\
                    一覧の並べ替え設定にかかわらずファイル名順でページが進みます。",
+            },
+            HighlightItem {
+                title: "フルスクリーンのパネル操作が変わりました",
+                body: "通常ホバーでは、左端で補正パネル、右端で情報パネルを個別に表示します。右端へ寄せても左の編集パネルは開きません。上部の i ボタンと I / Tab キーは、情報パネルの固定ではなく、通常ホバーとクリック表示の切り替えに変わりました。",
+            },
+        ],
+        highlights: &[HighlightItem {
+            title: "左右パネルのクリック表示モード",
+            body: "画面の左右最端に出る細いバーをクリックしてパネルを開き、明示的に閉じるまで表示できます。右の情報パネルを開いた状態は、画像を切り替えたりフルスクリーンへ入り直したりしても維持します。",
         }],
-        highlights: &[],
     },
 ];
 
@@ -477,6 +486,18 @@ mod tests {
                 .iter()
                 .any(|item| item.title == "本のページはファイル名順で進みます"),
             "§1.14 の告知は v2.4.0 の must_read に入れる"
+        );
+        assert!(
+            entry
+                .must_read
+                .iter()
+                .any(|item| item.title.contains("パネル操作"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("クリック表示"))
         );
     }
 

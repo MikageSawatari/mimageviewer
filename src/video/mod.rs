@@ -377,6 +377,8 @@ pub enum NativeVideoOutputEvent {
     ClearSeekThumbnail,
     ToggleTileMode,
     TogglePerfOverlay,
+    ToggleSidePanelMode,
+    ToggleClickInfoOpen,
     ToggleVst3Gui,
     /// 動画 HUD の「音声モード」ボタン (Inc 7、動画→音声モード)。App が `enter_video_audio_mode`
     /// を呼ぶ (映像を切って音楽ビューへ、音声無中断)。
@@ -555,6 +557,11 @@ enum NativeVideoOutputCommand {
     SetMetadata {
         metadata: Option<native_presenter::NativeOverlayMetadata>,
     },
+    SetSidePanelState {
+        mode: crate::settings::FsSidePanelMode,
+        click_info_open: bool,
+    },
+    ResetSidePanelSession,
     SetLoopEnabled {
         enabled: bool,
     },
@@ -1007,6 +1014,21 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetMetadata { metadata });
+    }
+
+    fn set_side_panel_state(&self, mode: crate::settings::FsSidePanelMode, click_info_open: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetSidePanelState {
+                mode,
+                click_info_open,
+            });
+    }
+
+    fn reset_side_panel_session(&self) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::ResetSidePanelSession);
     }
 
     fn set_loop_enabled(&self, enabled: bool) {
@@ -1606,6 +1628,8 @@ fn send_native_overlay_command(
         Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
+        Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
+        Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
         Command::ToggleAudioMode => NativeVideoOutputEvent::ToggleAudioMode,
         Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen { generation },
@@ -2416,6 +2440,15 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
                     presenter.set_overlay_metadata(metadata);
                 }
+                NativeVideoOutputCommand::SetSidePanelState {
+                    mode,
+                    click_info_open,
+                } => {
+                    presenter.set_overlay_side_panel_state(mode, click_info_open);
+                }
+                NativeVideoOutputCommand::ResetSidePanelSession => {
+                    presenter.reset_overlay_side_panel_session();
+                }
                 NativeVideoOutputCommand::SetLoopEnabled { enabled } => {
                     cur_loop_enabled = Some(enabled);
                     presenter.set_overlay_loop_enabled(enabled);
@@ -2684,6 +2717,7 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
+                    presenter.reset_overlay_side_panel_session();
                     // 前ソースの perf 履歴 (interval_ms / source_delta_ms / av_offset_ms)
                     // が残ったまま新ソースの最初のサンプルが入ると、median ベースの Y 軸が
                     // 古い fps を引きずって新サンプル蓄積後にガクッと切り替わる。新動画は
@@ -3339,6 +3373,20 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::TogglePerfOverlay,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleSidePanelMode => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleSidePanelMode,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleClickInfoOpen => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleClickInfoOpen,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {
@@ -5935,6 +5983,24 @@ impl VideoPlayer {
     pub fn set_native_metadata(&self, metadata: Option<native_presenter::NativeOverlayMetadata>) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_metadata(metadata);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_side_panel_state(
+        &self,
+        mode: crate::settings::FsSidePanelMode,
+        click_info_open: bool,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_side_panel_state(mode, click_info_open);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn reset_native_side_panel_session(&self) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.reset_side_panel_session();
         }
     }
 

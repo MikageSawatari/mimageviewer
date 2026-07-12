@@ -124,10 +124,20 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   KeyDown 判定も同じ effective chord に追従する。ヘルプ表示中は中央モーダルを優先し、
   右メタデータパネル / 左ジャンプパネルの edge-hover 表示は抑止する。
 
+左右パネルの召喚方法は Settings の `FsSidePanelMode` を presenter overlay へ同期する。`Hover` は
+左右それぞれの edge-hover 二段ラッチ、`ClickToShow` は最端の細い callout bar のクリックを使う。
+右メタデータパネルは App の `fullscreen_click_info_open` を正本として source swap 後も維持し、
+左ジャンプパネルは presenter-local なセッション状態として新しい動画への source swap で閉じる。
+callout は実際にクリックする UI なので、表示中の bar rect だけを HUD region に含める。
+動画↔音声モードの遷移も左右パネルの session 境界として扱い、presenter の左ジャンプ状態と
+音楽ビューの左ブックマーク状態を両方閉じる。右の `fullscreen_click_info_open` は保持する。
+ClickToShow の左右パネルには明示的な × を置き、callout 矢印は開状態で外向きへ反転する。
+VST3 パネル表示中は callout を描画せず、HUD region にも含めない。
+
 **Region 計算とアクティベーション検出**:
 
 `NativeEguiOverlay::compute_hud_regions` が egui run 末尾で表示中の各 UI 要素の rect を集めて返す
-(= 上 hover bar / 下 HUD / right panel / jump panel / VST3 panel / speed popup / bookmark editor /
+(= 上 hover bar / 下 HUD / right panel / jump panel / ClickToShow callout / VST3 panel / speed popup / bookmark editor /
 normalize blocker / tile overlay / seek hover thumbnail / checkmark)。**activation zone** (= bar
 非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
 ノブが上下端と重なったとき入力を奪うため。

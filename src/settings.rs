@@ -389,6 +389,52 @@ impl SelectionInfoDisplayMode {
 }
 
 // -----------------------------------------------------------------------
+// フルスクリーン左右パネルの表示方法
+// -----------------------------------------------------------------------
+
+/// フルスクリーン左右パネルを呼び出す方法。
+///
+/// Unknown は将来版の値を旧版で読み込んだときの受け皿。sanitize 時に
+/// 既存動作の Hover へ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FsSidePanelMode {
+    #[default]
+    Hover,
+    ClickToShow,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FsSidePanelMode {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Hover => "通常ホバー",
+            Self::ClickToShow => "クリック表示",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Hover, Self::ClickToShow]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Hover,
+            mode => mode,
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self.normalized() {
+            Self::Hover => Self::ClickToShow,
+            Self::ClickToShow => Self::Hover,
+            Self::Unknown => unreachable!(),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 詳細表示ソート
 // -----------------------------------------------------------------------
 
@@ -2504,6 +2550,12 @@ pub struct Settings {
     /// フルスクリーン左ホバーパネルで最後に開いていたタブ。
     #[serde(default)]
     pub fullscreen_left_panel_tab: FullscreenLeftPanelTab,
+    /// フルスクリーン左右パネルを呼び出す方法。
+    #[serde(default)]
+    pub fullscreen_side_panel_mode: FsSidePanelMode,
+    /// クリック表示モードで右情報パネルを開いているか。
+    #[serde(default)]
+    pub fullscreen_click_info_open: bool,
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
@@ -3803,6 +3855,8 @@ impl Default for Settings {
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
+            fullscreen_side_panel_mode: FsSidePanelMode::default(),
+            fullscreen_click_info_open: false,
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
@@ -5103,6 +5157,7 @@ impl Settings {
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
+        self.fullscreen_side_panel_mode = self.fullscreen_side_panel_mode.normalized();
         // 手編集や移行で非有限 / 範囲外の名前列幅が混入しても安全にする
         // (列幅と同じ 40.0..=800.0 へ clamp。実行時もレイアウト側で clamp するが二重に守る)。
         if !self.details_name_width.is_finite() {
@@ -5213,6 +5268,10 @@ impl Settings {
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
         self.ui_scale_factor = src.ui_scale_factor;
+        // ClickToShow の右情報パネル開状態は、callout / × / Esc が更新する runtime 設定。
+        // 環境設定ダイアログの snapshot より live 側を優先し、ダイアログを開いている間の
+        // 開閉を OK 押下で巻き戻さない。
+        self.fullscreen_click_info_open = src.fullscreen_click_info_open;
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -5733,6 +5792,48 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_side_panel_mode_defaults_and_toggles() {
+        assert_eq!(
+            Settings::default().fullscreen_side_panel_mode,
+            FsSidePanelMode::Hover
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.fullscreen_side_panel_mode, FsSidePanelMode::Hover);
+        assert!(!loaded.fullscreen_click_info_open);
+        assert_eq!(FsSidePanelMode::Hover.label(), "通常ホバー");
+        assert_eq!(FsSidePanelMode::ClickToShow.label(), "クリック表示");
+        assert_eq!(
+            FsSidePanelMode::all(),
+            &[FsSidePanelMode::Hover, FsSidePanelMode::ClickToShow]
+        );
+        assert_eq!(
+            FsSidePanelMode::Hover.toggled(),
+            FsSidePanelMode::ClickToShow
+        );
+        assert_eq!(
+            FsSidePanelMode::ClickToShow.toggled(),
+            FsSidePanelMode::Hover
+        );
+    }
+
+    #[test]
+    fn fullscreen_side_panel_mode_normalizes_unknown_to_hover() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"fullscreen_side_panel_mode":"FutureMode"}"#).unwrap();
+        assert_eq!(loaded.fullscreen_side_panel_mode, FsSidePanelMode::Unknown);
+        assert_eq!(
+            FsSidePanelMode::Unknown.normalized(),
+            FsSidePanelMode::Hover
+        );
+        assert_eq!(
+            FsSidePanelMode::Unknown.toggled(),
+            FsSidePanelMode::ClickToShow
+        );
+        loaded.sanitize();
+        assert_eq!(loaded.fullscreen_side_panel_mode, FsSidePanelMode::Hover);
+    }
+
+    #[test]
     fn toolbar_facet_filter_items_dedup_unknown_but_preserve_empty() {
         let v: Vec<ToolbarFacetFilterItem> =
             serde_json::from_str(r#"["Ext","FutureFacet","Kind","Ext"]"#).unwrap();
@@ -6135,6 +6236,24 @@ mod tests {
                 maximized: true,
             })
         );
+    }
+
+    #[test]
+    fn overwrite_non_preferences_keeps_live_fullscreen_click_info_open() {
+        let mut edited = Settings {
+            fullscreen_side_panel_mode: FsSidePanelMode::ClickToShow,
+            ..Settings::default()
+        };
+        let mut live = Settings {
+            fullscreen_click_info_open: true,
+            ..Settings::default()
+        };
+        edited.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            edited.fullscreen_side_panel_mode,
+            FsSidePanelMode::ClickToShow
+        );
+        assert!(edited.fullscreen_click_info_open);
     }
 
     /// 旧設定 (`ai_upscale_skip_px` のみ、新フィールドなし) は `N x N` として

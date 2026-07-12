@@ -45,6 +45,7 @@ pub mod dwm_transitions {
 }
 pub mod editing_addon;
 pub mod editing_addon_download;
+pub mod egui_focus_policy;
 pub mod exif_reader;
 pub mod explorer_integration;
 pub mod export_crop;
@@ -1038,6 +1039,7 @@ fn main() -> eframe::Result {
             // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
             emit_startup("creator_enter", None);
+            egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
             let t = Instant::now();
             ui_fonts::configure_fonts(&cc.egui_ctx);
             emit_startup("setup_fonts", Some(t));

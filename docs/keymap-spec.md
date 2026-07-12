@@ -61,7 +61,7 @@ Escape / 修飾なし矢印キーへ割り当てた場合は起動時に警告�
 `RatingItem*` / `RatingContainer*` の実割り当てから `F1〜F6` / `Shift+F1〜F6` などの
 表示を作る。
 静止画フルスクリーンの上部ホバーバー tooltip と、表示モード / ズーム・フィット
-popup の shortcut 表記は、`分析ツール [Shift+Z]` や `メタデータ [I / Tab]`
+popup の shortcut 表記は、`分析ツール [Shift+Z]` や `パネル表示 [I / Tab]`
 のように実割り当てから作る。native 動画 overlay の top bar / bottom HUD / jump panel /
 seek hover thumbnail も KeyAction 由来の shortcut 表記を実割り当てから作る。
 グリッドの <kbd>Backspace</kbd> 親フォルダ移動、Enter / Home / End / PageUp / PageDown
@@ -73,8 +73,19 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 `VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
 `VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
 動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` は音楽ビューでは無効
-(キャプチャパレット / コマ送り UI を出さない)。メタデータパネルの <kbd>I</kbd> / <kbd>Tab</kbd> と
-`[Rating]` グループは静止画・動画と同じく音楽ビューでも使える。
+(キャプチャパレット / コマ送り UI を出さない)。`[Rating]` グループは静止画・動画と同じく
+音楽ビューでも使える。左右パネル表示モードの <kbd>I</kbd> / <kbd>Tab</kbd> は 3 面で同じ
+`FsToggleMetadata` を使い、native 動画も effective chord を App 側へ転送する。
+Windows の egui 経路では、KeySlot でショートカットを所有した押下を egui event queue からも
+同時に除去する。ただし egui 0.33 は UI 実行前の `begin_pass` で <kbd>Tab</kbd> から focus
+方向を確定するため、event 除去だけでは traversal を止められない。各 egui Context に登録した
+`on_begin_pass` ポリシーが、viewport ごとに直前 pass の `PlatformOutput::ime` と focus ID の
+`TextEdit::load_state` を参照し、実際の TextEdit 編集中でない <kbd>Tab</kbd> の focus 方向を
+最初の focusable widget 登録前に
+`FocusDirection::None` へ戻す。event 自体はこの段階では残し、後段の Keymap が通常どおり
+consume する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
+`wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
+キーボードを所有している間は KeySlot と egui event の双方を残す。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
@@ -245,7 +256,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | キー | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 画像フルスクリーンで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
-| <kbd>I</kbd> / <kbd>Tab</kbd> | メタデータパネル固定表示トグル (右パネル)。Action: `FsToggleMetadata`。動画フルスクリーンには対応する固定右パネルがないため画像専用 |
+| <kbd>I</kbd> / <kbd>Tab</kbd> | 左右パネルの表示モード (通常ホバー / クリック表示) を切り替える。Action: `FsToggleMetadata`。画像フルスクリーン、native 動画、egui 音楽ビューで共通。native 動画では effective chord を presenter から App へ転送する |
 | <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次のファイル (見開き中は前 / 次の見開き = 2 ページ送り) |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次のファイル (= 一般慣例で左右と同義)。縦連結では縦スクロール、横連結では前 / 次ファイル。スライドショー中もフォルダ内移動は再生を止めない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 通常はプレーン <kbd>↑</kbd>/<kbd>↓</kbd> と同義 (前 / 次ファイル)。**ファイル名スタックのフラット読書中 (v2.0.0)** は「前 / 次のスタックの先頭画像へジャンプ」(= 今の投稿の残りをスキップ。`Shift+↑` はスタック途中なら現スタック先頭、先頭なら前スタック先頭)。端では no-op (次フォルダは <kbd>Ctrl</kbd>+<kbd>↓</kbd>)。スタックジャンプ部分の Action: `FsStackJumpPrev` / `FsStackJumpNext`。動画再生中は音量 (下表参照) |

@@ -6801,7 +6801,8 @@ pub struct App {
     pub(crate) favsearch: FavSearchState,
 
     // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
-    /// フルスクリーンでメタデータパネルを表示するか
+    /// 旧メタデータ固定表示フラグ。静止画経路は Settings 由来へ置換済み。
+    /// detached context bundle の互換状態として後続 Run まで残す。
     pub(crate) show_metadata_panel: bool,
     /// 右端ホバーで開いたメタデータパネルを、カーソルがパネル内にいる間だけ維持する。
     pub(crate) metadata_panel_hover_active: bool,
@@ -8170,9 +8171,12 @@ pub struct App {
     pub(crate) music_left_panel_active: bool,
     /// 音楽ビュー右パネル (情報/★/タグ) の端ホバー開閉ラッチ。左と同じ二段判定。
     pub(crate) music_right_panel_active: bool,
+    /// ClickToShow の音楽ビュー左ジャンプパネル開状態。フルスクリーン / 楽曲単位の
+    /// セッション状態であり、Settings には保存しない。
+    pub(crate) music_left_click_open: bool,
     /// 左パネルに表示するブックマークのキャッシュ (現在の音声 path 用)。動画と同じ
     /// `VideoBookmarkDb` を path キーで共有する (D5.1)。追加/削除/改名/import で再取得。
-    /// 左パネルは端ホバーで出す (動画のジャンプパネルと同じ、Inc 5 FB。トグルボタンは廃止)。
+    /// 左パネルは Hover の端ラッチまたは ClickToShow のセッション状態で表示する。
     pub(crate) music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
     /// `music_bookmarks` をどの path 用に読んだか。fs のファイルが変わったら再取得する。
     pub(crate) music_bookmarks_loaded_for: Option<PathBuf>,
@@ -10133,6 +10137,7 @@ impl App {
             music_limiter_visible_until: None,
             music_left_panel_active: false,
             music_right_panel_active: false,
+            music_left_click_open: false,
             music_bookmarks: Vec::new(),
             music_bookmarks_loaded_for: None,
             #[cfg(windows)]
@@ -37765,6 +37770,8 @@ impl App {
         self.music_probe = None;
         self.music_analysis_error = None;
         self.music_analysis_path = Some(path.to_path_buf());
+        // 左ジャンプパネルは楽曲単位のセッション状態。音声→音声ナビでも引き継がない。
+        self.music_left_click_open = false;
 
         // ルックアップキー: size>0 (信頼できる) のときだけ作る。size 不明のビュー (mtime のみ等)
         // では LRU を使わない。
@@ -37987,8 +37994,9 @@ impl App {
         // だけでパネルが再表示される (Codex P3)。
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
+        self.music_left_click_open = false;
         // ブックマークの一時状態 (キャッシュ / 改名ダイアログ / 一括登録ダイアログ) は破棄する。
-        // ループ設定はセッション設定として保持 (パネルは端ホバーで出すので開閉トグル状態は持たない)。
+        // ループ設定はセッション設定として保持する。
         self.music_bookmarks.clear();
         self.music_bookmarks_loaded_for = None;
         #[cfg(windows)]
@@ -39468,6 +39476,9 @@ impl App {
 
         self.fullscreen_idx = None;
         self.metadata_panel_hover_active = false;
+        // 左編集パネルはフルスクリーンセッション限定。右の ClickToShow 開状態は
+        // Settings に保持し、ここでは落とさない。
+        self.adjustment_mode = false;
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
         // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
         // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
@@ -45331,6 +45342,68 @@ impl App {
     /// 短い確認系トースト (レーティング変更 / スロット適用など) 向け。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
         self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
+    }
+
+    pub(crate) fn metadata_panel_persistently_shown(&self) -> bool {
+        crate::ui_helpers::metadata_panel_persistently_shown(
+            self.settings.fullscreen_side_panel_mode,
+            self.settings.fullscreen_click_info_open,
+        )
+    }
+
+    pub(crate) fn cycle_fs_side_panel_mode(&mut self) {
+        let next = self.settings.fullscreen_side_panel_mode.toggled();
+        self.settings.fullscreen_side_panel_mode = next;
+        self.reset_fs_side_panel_runtime_for_mode_change();
+        self.settings.save();
+        self.show_feedback_toast(format!("パネル表示: {}", next.label()));
+    }
+
+    /// モード依存の左パネルと hover latch を閉じる。右の永続状態は保持する。
+    pub(crate) fn reset_fs_side_panel_runtime_for_mode_change(&mut self) {
+        self.metadata_panel_hover_active = false;
+        if self.adjustment_mode {
+            self.persist_pending_view_trim_state();
+        }
+        self.adjustment_mode = false;
+        self.music_left_panel_active = false;
+        self.music_right_panel_active = false;
+        self.music_left_click_open = false;
+    }
+
+    pub(crate) fn toggle_fullscreen_click_info_open(&mut self) {
+        if self.settings.fullscreen_side_panel_mode.normalized()
+            != crate::settings::FsSidePanelMode::ClickToShow
+        {
+            return;
+        }
+        self.settings.fullscreen_click_info_open = !self.settings.fullscreen_click_info_open;
+        self.metadata_panel_hover_active = false;
+        self.settings.save();
+    }
+
+    pub(crate) fn close_click_side_panels(&mut self) -> bool {
+        if self.settings.fullscreen_side_panel_mode.normalized()
+            != crate::settings::FsSidePanelMode::ClickToShow
+        {
+            return false;
+        }
+        let close_right = self.settings.fullscreen_click_info_open;
+        let close_music_left = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.fs_music_view_active(idx))
+            && self.music_left_click_open;
+        let closed = self.adjustment_mode || close_music_left || close_right;
+        if self.adjustment_mode {
+            self.persist_pending_view_trim_state();
+        }
+        self.adjustment_mode = false;
+        self.music_left_click_open = false;
+        if close_right {
+            self.settings.fullscreen_click_info_open = false;
+            self.settings.save();
+        }
+        closed
     }
 
     #[cfg(windows)]

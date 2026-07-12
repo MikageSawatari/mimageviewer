@@ -650,17 +650,66 @@ pub(super) fn draw_panorama_icon_disabled(painter: &egui::Painter, c: egui::Pos2
 
 /// ℹ アイコンを描画する。
 pub(super) fn draw_info_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
-    let white = egui::Color32::WHITE;
-    painter.circle_stroke(c, r, egui::Stroke::new(1.5, white));
+    draw_info_icon_colored(painter, c, r, egui::Color32::WHITE);
+}
+
+fn draw_info_icon_colored(painter: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {
+    painter.circle_stroke(c, r, egui::Stroke::new(1.5, color));
     let bar_w = r * 0.22;
     painter.line_segment(
         [
             egui::pos2(c.x, c.y - r * 0.05),
             egui::pos2(c.x, c.y + r * 0.55),
         ],
-        egui::Stroke::new(bar_w, white),
+        egui::Stroke::new(bar_w, color),
     );
-    painter.circle_filled(egui::pos2(c.x, c.y - r * 0.45), bar_w * 0.7, white);
+    painter.circle_filled(egui::pos2(c.x, c.y - r * 0.45), bar_w * 0.7, color);
+}
+
+/// ClickToShow の ℹ アイコン。青い情報アイコンへ小さなマウスカーソルを重ねる。
+pub(super) fn draw_info_click_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let blue = egui::Color32::from_rgb(95, 175, 255);
+    draw_info_icon_colored(painter, c, r, blue);
+
+    let tip = egui::pos2(c.x + r * 0.18, c.y + r * 0.1);
+    let size = r * 0.75;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            tip + egui::vec2(size * 0.12, size),
+            tip + egui::vec2(size * 0.42, size * 0.7),
+        ],
+        egui::Color32::WHITE,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 80, 130)),
+    ));
+    painter.line_segment(
+        [
+            tip + egui::vec2(size * 0.35, size * 0.64),
+            tip + egui::vec2(size * 0.68, size * 0.95),
+        ],
+        egui::Stroke::new(size * 0.18, blue),
+    );
+}
+
+/// 左右パネル呼び出しバーの内向き三角。フォント glyph は使わない。
+pub(super) fn draw_panel_callout_arrow(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    points_right: bool,
+    color: egui::Color32,
+) {
+    let dx = 5.5;
+    let dy = 8.0;
+    let sign = if points_right { 1.0 } else { -1.0 };
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(center.x + sign * dx, center.y),
+            egui::pos2(center.x - sign * dx, center.y - dy),
+            egui::pos2(center.x - sign * dx, center.y + dy),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// チェックマーク（右上）を描画する。

@@ -1161,7 +1161,7 @@ impl RingActionId {
             Self::ImageRotateLeft => "回転 L",
             Self::ImageRotateRight => "回転 R",
             Self::ImageCapture => "キャプチャ保存",
-            Self::ImageToggleMetadata => "メタデータ表示",
+            Self::ImageToggleMetadata => "パネル表示モード",
             Self::ImageSlideshow => "スライドショー",
             Self::ImageZoomMode => "全画面ズームモード",
             Self::ImagePixelGrid => "ピクセルグリッド",

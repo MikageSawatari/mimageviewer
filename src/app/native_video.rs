@@ -3081,6 +3081,8 @@ impl App {
             if matches!(
                 event,
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
+                    | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
+                    | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
             ) {
                 // fall through: NavigateItem は dispatch 続行
             } else {
@@ -3122,6 +3124,18 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::TogglePerfOverlay => {
                 self.toggle_native_video_perf_overlay(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleSidePanelMode => {
+                self.cycle_fs_side_panel_mode();
+                let label = self.settings.fullscreen_side_panel_mode.label();
+                self.show_native_video_overlay_toast(format!("パネル表示: {label}"), false);
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen => {
+                self.toggle_fullscreen_click_info_open();
+                self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
@@ -5070,6 +5084,8 @@ impl App {
         let shortcut_tags = self.cached_native_overlay_shortcut_tags();
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
+        let side_panel_mode = self.settings.fullscreen_side_panel_mode;
+        let click_info_open = self.settings.fullscreen_click_info_open;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
 
@@ -5159,6 +5175,7 @@ impl App {
             }
         };
         player.set_native_metadata(Some(metadata));
+        player.set_native_side_panel_state(side_panel_mode, click_info_open);
     }
 
     #[cfg(windows)]
@@ -6347,6 +6364,24 @@ impl App {
             }
             return;
         }
+        let side_panel_key_owned_by_native = crate::ui_helpers::fs_side_panel_key_owner(
+            matches!(self.items.get(fs_idx), Some(GridItem::Video(_))),
+            self.fs_music_view_active(fs_idx),
+        )
+            == crate::ui_helpers::FsSidePanelKeyOwner::NativeVideo;
+        if side_panel_key_owned_by_native
+            && !key.repeat
+            && self
+                .keymap
+                .matches_vk_action(KeyAction::FsToggleMetadata, &key)
+        {
+            self.cycle_fs_side_panel_mode();
+            let label = self.settings.fullscreen_side_panel_mode.label();
+            self.show_native_video_overlay_toast(format!("パネル表示: {label}"), false);
+            self.sync_native_video_metadata(fs_idx);
+            self.request_native_video_hud_repaint(ctx);
+            return;
+        }
         match key.virtual_key {
             _ if !key.repeat
                 && self
@@ -7105,6 +7140,8 @@ impl App {
                 | Ev::SetVolume { .. }
                 | Ev::SetPlaybackSpeed { .. }
                 | Ev::TogglePerfOverlay
+                | Ev::ToggleSidePanelMode
+                | Ev::ToggleClickInfoOpen
                 | Ev::SetVst3PanelVisible { .. }
                 | Ev::SetVst3PanelPos { .. }
                 | Ev::Vst3ShowSlotGui { .. }
@@ -7129,6 +7166,15 @@ impl App {
     /// 呼び出し元 = 動画 HUD の「音声モード」ボタン (`NativeVideoOutputEvent::ToggleAudioMode` →
     /// `handle_native_video_output_event`、7d で配線)。
     #[cfg(windows)]
+    pub(crate) fn reset_video_audio_side_panel_sessions(&mut self, fs_idx: usize) {
+        self.music_left_panel_active = false;
+        self.music_right_panel_active = false;
+        self.music_left_click_open = false;
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.reset_native_side_panel_session();
+        }
+    }
+
     pub(crate) fn enter_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_audio_mode.is_some() {
             return;
@@ -7226,6 +7272,7 @@ impl App {
         // 「SwitchPlacement で作り直し」かを選ぶ (Codex 案D)。
         self.video_audio_mode_entry_target = entry_target;
         self.video_audio_exit_pending = None;
+        self.reset_video_audio_side_panel_sessions(fs_idx);
         self.video_audio_mode = Some(fs_idx);
         // 動画モードで追加/改名/削除したブックマークを音楽ビューへ確実に反映する (#6 修正)。
         // 動画側は video_bookmark_db + fullscreen_video_marker_cache を更新するが、音楽ビューの
@@ -7290,6 +7337,7 @@ impl App {
             ));
             return;
         }
+        self.reset_video_audio_side_panel_sessions(fs_idx);
         // saw_hidden を「今 hidden か」でシードする (Codex P2 検証): 音声モードでは presenter は既に
         // hide 済み (でないと音楽ビューが見えずこのボタンも押せない) なので通常 true になる。これで
         // show / SwitchPlacement を送ったあと、次の poll より前に presenter が hidden→表示 を処理して
