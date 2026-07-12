@@ -30755,3 +30755,44 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     assert!(!app.rotation_page_keys.contains(&key));
     assert!(!app.tags_cache.contains_key(&key));
 }
+
+#[test]
+fn settings_restore_blocks_background_dialog_input() {
+    let mut app = phase_c_support::setup_app();
+    assert!(!app.any_dialog_open());
+    app.show_settings_restore = true;
+    assert!(app.any_dialog_open());
+}
+
+#[test]
+fn settings_restore_blocks_background_wheel_scroll() {
+    let mut app = phase_c_support::setup_app();
+    app.last_cell_h = 28.0;
+    app.scroll_offset_y = 56.0;
+    app.show_settings_restore = true;
+    let ctx = egui::Context::default();
+    let mut input = egui::RawInput::default();
+    input.events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -1.0),
+        modifiers: egui::Modifiers::NONE,
+    });
+
+    let _ = ctx.run(input, |ctx| app.process_scroll(ctx));
+
+    assert_eq!(app.scroll_offset_y, 56.0);
+}
+
+#[test]
+fn thumbnail_bottom_bar_created_column_requests_lazy_meta_without_tooltip_created() {
+    let mut app = phase_c_support::setup_app();
+    app.items = vec![GridItem::Image(PathBuf::from(r"C:\photos\created.jpg"))];
+    app.selected = Some(0);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
+    app.settings.thumb_tooltip_show_created = false;
+    app.settings.details_show_created = true;
+
+    assert!(app.selection_info_item_requires_lazy_meta(0));
+    assert!(app.lazy_load_created_for_idx(0));
+}

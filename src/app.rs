@@ -6171,6 +6171,9 @@ pub struct App {
     /// 選択情報オーバーレイをセル直下に配置するために使用。
     /// 選択セルがスクロール圏外だと None。
     pub(crate) selected_cell_rect: Option<egui::Rect>,
+    /// 現フレームの下部選択情報バー矩形。バー上の右クリックを背面グリッドの
+    /// アイテム / 背景コンテキストメニューへ通さないために使用。
+    pub(crate) selection_info_bar_rect: Option<egui::Rect>,
 
     // ── 段階 E: アイドル時の画質向上 ─────────────────────────────
     /// 前フレームでの scroll_offset_y（変化検知用）
@@ -9406,6 +9409,7 @@ impl App {
             progress_normal_peak: 0,
             progress_upgrade_peak: 0,
             selected_cell_rect: None,
+            selection_info_bar_rect: None,
             last_scroll_offset_y_tracked: 0.0,
             last_scroll_change_time: std::time::Instant::now(),
             display_px_shared: Arc::new(AtomicU32::new(512)),
@@ -11194,6 +11198,7 @@ impl App {
             || self.book_reorder.is_some()
             || self.show_preferences
             || self.show_preferences_discard_confirm
+            || self.show_settings_restore
             || self.show_operation_customize
             || self.show_operation_customize_discard_confirm
             || self.show_mouse_nav_migration_prompt
@@ -33454,18 +33459,46 @@ impl App {
     }
 
     fn selection_info_item_requires_lazy_meta(&self, idx: usize) -> bool {
-        (self.settings.thumb_tooltip_show_created && self.details_item_supports_created_at(idx))
-            || (self.settings.thumb_tooltip_show_image_dimensions
+        use crate::ui_main::{DetailsColumn, selection_info_bottom_bar_shows_column};
+
+        ((self.settings.thumb_tooltip_show_created
+            || selection_info_bottom_bar_shows_column(&self.settings, DetailsColumn::Created))
+            && self.details_item_supports_created_at(idx))
+            || ((self.settings.thumb_tooltip_show_image_dimensions
+                || selection_info_bottom_bar_shows_column(
+                    &self.settings,
+                    DetailsColumn::ImageDimensions,
+                ))
                 && self.details_item_supports_image_dims(idx))
             || match self.items.get(idx) {
                 Some(GridItem::Video(_)) => {
                     self.settings.thumb_tooltip_show_video_duration
+                        || selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            DetailsColumn::VideoDuration,
+                        )
                         || self.settings.thumb_tooltip_show_video_dimensions
+                        || selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            DetailsColumn::VideoDimensions,
+                        )
                         || self.settings.thumb_tooltip_show_video_codec
+                        || selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            DetailsColumn::VideoCodec,
+                        )
                 }
                 Some(GridItem::Audio(_)) => {
                     self.settings.thumb_tooltip_show_video_duration
+                        || selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            DetailsColumn::VideoDuration,
+                        )
                         || self.settings.thumb_tooltip_show_video_codec
+                        || selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            DetailsColumn::VideoCodec,
+                        )
                 }
                 _ => false,
             }
@@ -33479,7 +33512,13 @@ impl App {
                         && self.selection_info_lazy_target_idx() == Some(idx)
                         && self.settings.thumb_tooltip_show_created)
             }
-            crate::settings::GridViewMode::Thumbnail => self.settings.thumb_tooltip_show_created,
+            crate::settings::GridViewMode::Thumbnail => {
+                self.settings.thumb_tooltip_show_created
+                    || crate::ui_main::selection_info_bottom_bar_shows_column(
+                        &self.settings,
+                        crate::ui_main::DetailsColumn::Created,
+                    )
+            }
         };
         requested && self.details_item_supports_created_at(idx)
     }
@@ -33494,6 +33533,10 @@ impl App {
             }
             crate::settings::GridViewMode::Thumbnail => {
                 self.settings.thumb_tooltip_show_image_dimensions
+                    || crate::ui_main::selection_info_bottom_bar_shows_column(
+                        &self.settings,
+                        crate::ui_main::DetailsColumn::ImageDimensions,
+                    )
             }
         };
         requested && self.details_item_supports_image_dims(idx)
@@ -33514,9 +33557,21 @@ impl App {
                 )
             }
             crate::settings::GridViewMode::Thumbnail => (
-                self.settings.thumb_tooltip_show_video_duration,
-                self.settings.thumb_tooltip_show_video_dimensions,
-                self.settings.thumb_tooltip_show_video_codec,
+                self.settings.thumb_tooltip_show_video_duration
+                    || crate::ui_main::selection_info_bottom_bar_shows_column(
+                        &self.settings,
+                        crate::ui_main::DetailsColumn::VideoDuration,
+                    ),
+                self.settings.thumb_tooltip_show_video_dimensions
+                    || crate::ui_main::selection_info_bottom_bar_shows_column(
+                        &self.settings,
+                        crate::ui_main::DetailsColumn::VideoDimensions,
+                    ),
+                self.settings.thumb_tooltip_show_video_codec
+                    || crate::ui_main::selection_info_bottom_bar_shows_column(
+                        &self.settings,
+                        crate::ui_main::DetailsColumn::VideoCodec,
+                    ),
             ),
         };
         match self.items.get(idx) {

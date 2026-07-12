@@ -557,4 +557,23 @@ mod tests {
         assert_eq!(settings.keymap.overrides, imported.keymap.overrides);
         assert_eq!(settings.favorites.len(), 1);
     }
+
+    #[test]
+    fn applying_defaults_resets_all_operation_customization_fields() {
+        let mut settings = Settings::default();
+        settings.keymap.overrides = vec![binding("GridPin", &["Q"])];
+        settings.ring_shortcuts.mouse_ring_help_visible =
+            !RingShortcutSettings::default().mouse_ring_help_visible;
+        settings.menu_layout.hidden_commands = vec![
+            MenuCommandId::SettingsOperationCustomize
+                .stable_name()
+                .to_string(),
+        ];
+
+        OperationCustomizeBundle::defaults().apply_to(&mut settings);
+
+        assert_eq!(settings.keymap, KeymapSettings::default());
+        assert_eq!(settings.ring_shortcuts, RingShortcutSettings::default());
+        assert_eq!(settings.menu_layout, MenuLayoutSettings::default());
+    }
 }

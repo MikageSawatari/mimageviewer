@@ -18,6 +18,12 @@ use crate::app::App;
 use crate::settings_restore::{self, BackupSource, BackupSummary, ResetReport, RestoreReport};
 use crate::ui_helpers::format_bytes;
 
+const OPERATION_MODAL_SIZE: egui::Vec2 = egui::vec2(720.0, 540.0);
+const OPERATION_MODAL_MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 420.0);
+const OPERATION_MODAL_VIEWPORT_MARGIN: egui::Vec2 = egui::vec2(32.0, 32.0);
+const OPERATION_MODAL_HEADER_RESERVE: f32 = 58.0;
+const OPERATION_MODAL_FOOTER_RESERVE: f32 = 42.0;
+
 /// ダイアログの状態。Default で「未起動」。`App::open_settings_restore` で
 /// 一覧をロードし、`show_settings_restore_dialog` で描画する。
 
@@ -81,11 +87,39 @@ enum OperationTaskResult {
     Exported {
         result: Result<String, String>,
     },
-    PreparedImport {
-        source_label: String,
+    PreparedApply {
+        kind: OperationApplyKind,
         bundle: crate::operation_customize_share::OperationCustomizeBundle,
         result: Result<PathBuf, String>,
     },
+}
+
+#[derive(Clone)]
+enum OperationApplyKind {
+    Import { source_label: String },
+    ResetDefaults,
+}
+
+fn operation_apply_success_message(kind: &OperationApplyKind, backup_name: &str) -> String {
+    match kind {
+        OperationApplyKind::Import { source_label } => format!(
+            "{source_label} を取り込みました。取り込み前の設定は {backup_name} に退避しました。"
+        ),
+        OperationApplyKind::ResetDefaults => format!(
+            "操作カスタマイズを初期値に戻しました。元の設定は {backup_name} に退避しました。"
+        ),
+    }
+}
+
+fn operation_apply_failure_message(kind: &OperationApplyKind, error: &str) -> String {
+    match kind {
+        OperationApplyKind::Import { .. } => {
+            format!("取り込み前の自動退避に失敗したため、取り込みを中止しました: {error}")
+        }
+        OperationApplyKind::ResetDefaults => {
+            format!("初期値へ戻す前の自動退避に失敗したため、リセットを中止しました: {error}")
+        }
+    }
 }
 
 enum OperationModal {
@@ -116,6 +150,7 @@ enum OperationModal {
         warnings: Vec<String>,
         ignored_items: usize,
     },
+    ResetConfirm,
 }
 
 #[derive(Clone)]
@@ -658,7 +693,6 @@ impl App {
                 {
                     *previous = Some(result);
                 }
-                self.settings_restore_state.operation_message = None;
             }
             OperationTaskResult::Exported { result } => match result {
                 Ok(message) => {
@@ -669,8 +703,8 @@ impl App {
                         Some((true, format!("書き出しに失敗しました: {error}")));
                 }
             },
-            OperationTaskResult::PreparedImport {
-                source_label,
+            OperationTaskResult::PreparedApply {
+                kind,
                 bundle,
                 result,
             } => match result {
@@ -680,20 +714,12 @@ impl App {
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string());
-                    self.settings_restore_state.operation_message = Some((
-                        false,
-                        format!(
-                            "{source_label} を取り込みました。取り込み前の設定は {backup_name} に退避しました。"
-                        ),
-                    ));
+                    let message = operation_apply_success_message(&kind, &backup_name);
+                    self.settings_restore_state.operation_message = Some((false, message));
                 }
                 Err(error) => {
-                    self.settings_restore_state.operation_message = Some((
-                        true,
-                        format!(
-                            "取り込み前の自動退避に失敗したため、取り込みを中止しました: {error}"
-                        ),
-                    ));
+                    let message = operation_apply_failure_message(&kind, &error);
+                    self.settings_restore_state.operation_message = Some((true, message));
                 }
             },
         }
@@ -706,7 +732,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let mut keep_open = true;
-        let mut apply_bundle = None;
+        let mut apply_request = None;
 
         match &mut modal {
             OperationModal::Export {
@@ -762,11 +788,12 @@ impl App {
                 previous,
             } => {
                 let mut window_open = true;
+                let modal_size = operation_modal_size(ctx.available_rect().size());
                 egui::Window::new("操作カスタマイズの差分")
                     .open(&mut window_open)
                     .collapsible(false)
-                    .resizable(true)
-                    .default_width(720.0)
+                    .resizable(false)
+                    .fixed_size(modal_size)
                     .show(ctx, |ui| {
                         ui.label(format!("比較する設定: {source_label}"));
                         ui.horizontal(|ui| {
@@ -800,16 +827,27 @@ impl App {
                                 _ => None,
                             },
                         };
-                        if let Some((before_label, before)) = comparison {
-                            let operation_diff =
-                                crate::operation_customize_share::diff(before, bundle);
-                            ui.add_space(6.0);
-                            ui.label(format!("{before_label} -> {source_label}"));
-                            draw_operation_diff(ui, &operation_diff);
-                        } else if let Some(Err(error)) = previous.as_ref() {
-                            ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), error);
-                        }
+                        ui.add_space(6.0);
+                        draw_operation_modal_scroll_body(
+                            ui,
+                            "operation_customize_diff_scroll",
+                            modal_size.y,
+                            |ui| {
+                                if let Some((before_label, before)) = comparison {
+                                    let operation_diff =
+                                        crate::operation_customize_share::diff(before, bundle);
+                                    ui.label(format!("{before_label} -> {source_label}"));
+                                    draw_operation_diff(ui, &operation_diff);
+                                } else if let Some(Err(error)) = previous.as_ref() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0xc0, 0x40, 0x40),
+                                        error,
+                                    );
+                                }
+                            },
+                        );
                         ui.add_space(8.0);
+                        ui.separator();
                         if ui.button("閉じる").clicked() || escape_pressed {
                             keep_open = false;
                         }
@@ -831,32 +869,41 @@ impl App {
                 let preview = crate::operation_customize_share::diff(&current, bundle);
                 let mut window_open = true;
                 let mut apply = false;
+                let modal_size = operation_modal_size(ctx.available_rect().size());
                 egui::Window::new("操作カスタマイズを取り込む")
                     .open(&mut window_open)
                     .collapsible(false)
-                    .resizable(true)
-                    .default_width(720.0)
+                    .resizable(false)
+                    .fixed_size(modal_size)
                     .show(ctx, |ui| {
                         ui.label(format!("取り込み元: {source_label}"));
                         ui.label("現在 -> 取り込み後の差分を確認してください。");
-                        if *ignored_items > 0 {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(0xc0, 0x70, 0x20),
-                                format!("無視した項目: {ignored_items} 件"),
-                            );
-                        }
-                        if !warnings.is_empty() {
-                            egui::CollapsingHeader::new(format!(
-                                "読み込み時の注意: {} 件",
-                                warnings.len()
-                            ))
-                            .show(ui, |ui| {
-                                for warning in warnings.iter() {
-                                    ui.label(warning);
+                        ui.add_space(6.0);
+                        draw_operation_modal_scroll_body(
+                            ui,
+                            "operation_customize_import_scroll",
+                            modal_size.y,
+                            |ui| {
+                                if *ignored_items > 0 {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0xc0, 0x70, 0x20),
+                                        format!("無視した項目: {ignored_items} 件"),
+                                    );
                                 }
-                            });
-                        }
-                        draw_operation_diff(ui, &preview);
+                                if !warnings.is_empty() {
+                                    egui::CollapsingHeader::new(format!(
+                                        "読み込み時の注意: {} 件",
+                                        warnings.len()
+                                    ))
+                                    .show(ui, |ui| {
+                                        for warning in warnings.iter() {
+                                            ui.label(warning);
+                                        }
+                                    });
+                                }
+                                draw_operation_diff(ui, &preview);
+                            },
+                        );
                         ui.add_space(8.0);
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -872,14 +919,53 @@ impl App {
                     keep_open = false;
                 }
                 if apply {
-                    apply_bundle = Some((source_label.clone(), bundle.clone()));
+                    apply_request = Some((
+                        OperationApplyKind::Import {
+                            source_label: source_label.clone(),
+                        },
+                        bundle.clone(),
+                    ));
+                    keep_open = false;
+                }
+            }
+            OperationModal::ResetConfirm => {
+                let mut window_open = true;
+                let mut reset = false;
+                egui::Window::new("操作カスタマイズを初期値に戻す")
+                    .open(&mut window_open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_pos(ctx.content_rect().min + egui::vec2(100.0, 80.0))
+                    .show(ctx, |ui| {
+                        ui.label(
+                            "操作カスタマイズ (キー/リング/メニュー) を初期値に戻します。\nよろしいですか？",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("初期値に戻す").clicked() {
+                                reset = true;
+                            }
+                            if ui.button("キャンセル").clicked() || escape_pressed {
+                                keep_open = false;
+                            }
+                        });
+                    });
+                if !window_open {
+                    keep_open = false;
+                }
+                if reset {
+                    apply_request = Some((
+                        OperationApplyKind::ResetDefaults,
+                        crate::operation_customize_share::OperationCustomizeBundle::defaults()
+                            .with_label("初期値"),
+                    ));
                     keep_open = false;
                 }
             }
         }
 
-        if let Some((source_label, bundle)) = apply_bundle {
-            begin_operation_import_backup(self, source_label, bundle);
+        if let Some((kind, bundle)) = apply_request {
+            begin_operation_apply_backup(self, kind, bundle);
         }
 
         if keep_open {
@@ -964,6 +1050,22 @@ fn draw_operation_customize_body(app: &mut App, ui: &mut egui::Ui) {
             begin_file_import(app, path);
         }
         ui.weak("取り込みは現在の操作カスタマイズを置き換えます。");
+    });
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("キー割り当て、リング/マウス、メニュー構成だけを初期値に戻す場合:");
+        if ui
+            .add_enabled(
+                app.settings_restore_state.operation_task_rx.is_none(),
+                egui::Button::new("操作カスタマイズを初期値に戻す..."),
+            )
+            .clicked()
+        {
+            app.settings_restore_state.operation_modal = Some(OperationModal::ResetConfirm);
+        }
     });
 
     if let Some((is_error, message)) = &app.settings_restore_state.operation_message {
@@ -1135,20 +1237,24 @@ fn begin_operation_export(
     }
 }
 
-fn begin_operation_import_backup(
+fn begin_operation_apply_backup(
     app: &mut App,
-    source_label: String,
+    kind: OperationApplyKind,
     bundle: crate::operation_customize_share::OperationCustomizeBundle,
 ) {
     if app.settings_restore_state.operation_task_rx.is_some() {
         return;
     }
+    let backup_label = match &kind {
+        OperationApplyKind::Import { .. } => "取り込み前",
+        OperationApplyKind::ResetDefaults => "初期値へ戻す前",
+    };
     let current =
         crate::operation_customize_share::OperationCustomizeBundle::from_settings(&app.settings)
-            .with_label("取り込み前");
+            .with_label(backup_label);
     let data_dir = crate::data_dir::get();
     let worker_bundle = bundle.clone();
-    let worker_label = source_label.clone();
+    let worker_kind = kind.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     match std::thread::Builder::new()
         .name("operation-customize-backup".to_string())
@@ -1156,21 +1262,28 @@ fn begin_operation_import_backup(
             let result =
                 settings_restore::backup_operation_customize_before_import(&data_dir, &current)
                     .map_err(|error| error.to_string());
-            let _ = tx.send(OperationTaskResult::PreparedImport {
-                source_label: worker_label,
+            let _ = tx.send(OperationTaskResult::PreparedApply {
+                kind: worker_kind,
                 bundle: worker_bundle,
                 result,
             });
         }) {
         Ok(_) => {
             app.settings_restore_state.operation_task_rx = Some(rx);
-            app.settings_restore_state.operation_message =
-                Some((false, "取り込み前の設定を退避しています...".to_string()));
+            let message = match &kind {
+                OperationApplyKind::Import { .. } => "取り込み前の設定を退避しています...",
+                OperationApplyKind::ResetDefaults => "初期値へ戻す前の設定を退避しています...",
+            };
+            app.settings_restore_state.operation_message = Some((false, message.to_string()));
         }
         Err(error) => {
+            let action = match &kind {
+                OperationApplyKind::Import { .. } => "取り込み",
+                OperationApplyKind::ResetDefaults => "リセット",
+            };
             app.settings_restore_state.operation_message = Some((
                 true,
-                format!("自動退避処理を開始できなかったため、取り込みを中止しました: {error}"),
+                format!("自動退避処理を開始できなかったため、{action}を中止しました: {error}"),
             ));
         }
     }
@@ -1206,8 +1319,6 @@ fn begin_previous_operation_load(app: &mut App, source: BackupSource) -> bool {
         return false;
     }
     app.settings_restore_state.operation_task_rx = Some(rx);
-    app.settings_restore_state.operation_message =
-        Some((false, "前世代を読み込んでいます...".to_string()));
     true
 }
 
@@ -1233,6 +1344,39 @@ fn load_previous_operation_bundle(
     settings_restore::load_operation_customize(&crate::data_dir::get(), &previous)
         .map(|bundle| (label, bundle))
         .map_err(|error| format!("前世代を読み込めませんでした: {error}"))
+}
+
+fn draw_operation_modal_scroll_body(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    modal_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let body_height = operation_modal_body_height(modal_height);
+    let body_size = egui::vec2(ui.available_width(), body_height);
+    ui.allocate_ui_with_layout(body_size, egui::Layout::top_down(egui::Align::Min), |ui| {
+        egui::ScrollArea::both()
+            .id_salt(id_salt)
+            .auto_shrink([false, false])
+            .max_height(body_height)
+            .show(ui, add_contents);
+    });
+}
+
+fn operation_modal_body_height(modal_height: f32) -> f32 {
+    (modal_height - OPERATION_MODAL_HEADER_RESERVE - OPERATION_MODAL_FOOTER_RESERVE).max(80.0)
+}
+
+fn operation_modal_size(viewport_size: egui::Vec2) -> egui::Vec2 {
+    let available = viewport_size - OPERATION_MODAL_VIEWPORT_MARGIN;
+    egui::vec2(
+        available
+            .x
+            .clamp(OPERATION_MODAL_MIN_SIZE.x, OPERATION_MODAL_SIZE.x),
+        available
+            .y
+            .clamp(OPERATION_MODAL_MIN_SIZE.y, OPERATION_MODAL_SIZE.y),
+    )
 }
 
 fn draw_operation_diff(
@@ -1269,29 +1413,25 @@ fn draw_operation_diff(
         return;
     }
 
-    egui::ScrollArea::vertical()
-        .max_height(300.0)
+    egui::Grid::new("operation_customize_diff_grid")
+        .num_columns(3)
+        .striped(true)
+        .spacing(egui::vec2(12.0, 4.0))
         .show(ui, |ui| {
-            egui::Grid::new("operation_customize_diff_grid")
-                .num_columns(3)
-                .striped(true)
-                .spacing(egui::vec2(12.0, 4.0))
-                .show(ui, |ui| {
-                    ui.strong("コマンド");
-                    ui.strong("変更前");
-                    ui.strong("変更後");
-                    ui.end_row();
-                    for change in &operation_diff.key_changes {
-                        ui.label(format!(
-                            "{} / {}",
-                            change.action.context().description(),
-                            change.action.description()
-                        ));
-                        ui.label(format_chords(&change.before));
-                        ui.label(format_chords(&change.after));
-                        ui.end_row();
-                    }
-                });
+            ui.strong("コマンド");
+            ui.strong("変更前");
+            ui.strong("変更後");
+            ui.end_row();
+            for change in &operation_diff.key_changes {
+                ui.label(format!(
+                    "{} / {}",
+                    change.action.context().description(),
+                    change.action.description()
+                ));
+                ui.label(format_chords(&change.before));
+                ui.label(format_chords(&change.after));
+                ui.end_row();
+            }
         });
 }
 
@@ -1349,6 +1489,31 @@ mod tests {
     use super::*;
     use crate::keymap::KeyBindingOverride;
     use egui_kittest::Harness;
+
+    #[test]
+    fn operation_modal_size_is_clamped_to_the_viewport() {
+        assert_eq!(
+            operation_modal_size(egui::vec2(1_200.0, 900.0)),
+            OPERATION_MODAL_SIZE
+        );
+        assert_eq!(
+            operation_modal_size(egui::vec2(640.0, 580.0)),
+            egui::vec2(608.0, 540.0)
+        );
+        assert_eq!(
+            operation_modal_size(egui::vec2(500.0, 400.0)),
+            OPERATION_MODAL_MIN_SIZE
+        );
+    }
+
+    #[test]
+    fn operation_modal_body_height_is_derived_only_from_the_fixed_modal_height() {
+        assert_eq!(operation_modal_body_height(OPERATION_MODAL_SIZE.y), 440.0);
+        assert_eq!(
+            operation_modal_body_height(OPERATION_MODAL_MIN_SIZE.y),
+            320.0
+        );
+    }
 
     #[test]
     fn operation_customize_diff_preview_snapshot() {

@@ -38,7 +38,9 @@ const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
 const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
-const SELECTION_INFO_BAR_HEIGHT: f32 = 24.0;
+// 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行を
+// CentralPanel より先に予約し、グリッドの仮想 viewport から確実に除外する。
+const SELECTION_INFO_BAR_HEIGHT: f32 = 58.0;
 const COLOR_FILTER_PRESETS: [[u8; 3]; 12] = [
     [86, 86, 86],
     [255, 255, 255],
@@ -861,8 +863,8 @@ fn switch_menubar_popup_on_hover(ctx: &egui::Context, responses: &[egui::Respons
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum DetailsColumn {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DetailsColumn {
     Preview,
     Name,
     Rating,
@@ -876,6 +878,18 @@ enum DetailsColumn {
     VideoDuration,
     VideoDimensions,
     VideoCodec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetailsColumnSet {
+    All,
+    TextOnly,
+}
+
+impl DetailsColumnSet {
+    fn includes(self, column: DetailsColumn) -> bool {
+        self == Self::All || column != DetailsColumn::Preview
+    }
 }
 
 impl DetailsColumn {
@@ -1057,6 +1071,41 @@ fn details_ordered_columns(
         .collect()
 }
 
+fn details_column_is_visible(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+    column: DetailsColumn,
+) -> bool {
+    column_set.includes(column) && column.visible(settings)
+}
+
+fn details_visible_columns(
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> Vec<DetailsColumn> {
+    details_ordered_columns(settings, false)
+        .into_iter()
+        .filter(|column| details_column_is_visible(settings, column_set, *column))
+        .collect()
+}
+
+pub(crate) fn selection_info_bottom_bar_shows_column(
+    settings: &crate::settings::Settings,
+    column: DetailsColumn,
+) -> bool {
+    settings.selection_info_display_mode.shows_bottom_bar()
+        && details_column_is_visible(settings, DetailsColumnSet::TextOnly, column)
+}
+
+fn selection_info_bar_contains_pos(
+    bar_rect: Option<egui::Rect>,
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    bar_rect
+        .zip(pointer_pos)
+        .is_some_and(|(rect, pos)| rect.contains(pos))
+}
+
 fn details_column_width(settings: &crate::settings::Settings, col: DetailsColumn) -> f32 {
     if col == DetailsColumn::Name {
         return col.default_width();
@@ -1168,6 +1217,34 @@ fn details_row_background(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DetailsRowVisualState {
+    selected: bool,
+    checked: bool,
+    hovered: bool,
+}
+
+fn details_row_visual_state(
+    display_only: bool,
+    selected: bool,
+    checked: bool,
+    hovered: bool,
+) -> DetailsRowVisualState {
+    if display_only {
+        DetailsRowVisualState {
+            selected: false,
+            checked: false,
+            hovered: false,
+        }
+    } else {
+        DetailsRowVisualState {
+            selected,
+            checked,
+            hovered,
+        }
+    }
+}
+
 fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
     if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
         pixels_per_point
@@ -1194,6 +1271,20 @@ struct DetailsLayout {
     pane_w: f32,
     /// 外側 (水平) スクロールが扱う総コンテンツ幅 (= pane_w + gutter)。
     extent: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetailsRowData {
+    cells: Vec<(DetailsColumn, String)>,
+}
+
+impl DetailsRowData {
+    fn text(&self, column: DetailsColumn) -> &str {
+        self.cells
+            .iter()
+            .find_map(|(candidate, text)| (*candidate == column).then_some(text.as_str()))
+            .unwrap_or_default()
+    }
 }
 
 fn details_fixed_columns_width(settings: &crate::settings::Settings) -> f32 {
@@ -1226,11 +1317,25 @@ fn details_layout(
     }
 }
 
-fn details_column_rects(
+fn details_content_width_for_column_set(
+    full_pane_width: f32,
+    settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
+) -> f32 {
+    let omitted_width: f32 = details_ordered_columns(settings, false)
+        .into_iter()
+        .filter(|column| !column_set.includes(*column))
+        .map(|column| details_column_width(settings, column))
+        .sum();
+    (full_pane_width - omitted_width).max(DetailsColumn::Name.min_width())
+}
+
+fn details_column_rects_for_columns(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
+    column_set: DetailsColumnSet,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
-    let columns = details_ordered_columns(settings, false);
+    let columns = details_visible_columns(settings, column_set);
     let fixed: f32 = columns
         .iter()
         .copied()
@@ -1264,6 +1369,13 @@ fn details_column_rects(
         x = right;
     }
     out
+}
+
+fn details_column_rects(
+    rect: egui::Rect,
+    settings: &crate::settings::Settings,
+) -> Vec<(DetailsColumn, egui::Rect)> {
+    details_column_rects_for_columns(rect, settings, DetailsColumnSet::All)
 }
 
 fn details_column_at_x(
@@ -9366,6 +9478,7 @@ impl App {
         // 右クリック → コンテキストメニュー
         if !self.items_are_drive_list
             && response.secondary_clicked()
+            && !self.selection_info_bar_contains_pointer(ctx)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
             self.selected = Some(idx);
@@ -9459,6 +9572,7 @@ impl App {
             || self.items_are_drive_list
             || self.mouse_ring_flick.is_some()
             || self.mouse_gesture.is_some()
+            || self.selection_info_bar_contains_pointer(ctx)
         {
             return;
         }
@@ -9523,6 +9637,9 @@ impl App {
         ctx: &egui::Context,
         target_idx: Option<usize>,
     ) {
+        if self.selection_info_bar_contains_pointer(ctx) {
+            return;
+        }
         let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
         if self.context_menu_idx.is_some() {
             return;
@@ -9688,6 +9805,9 @@ impl App {
                                 idx,
                                 row,
                                 spread_pair_cursor_idx == Some(idx),
+                                DetailsColumnSet::All,
+                                false,
+                                true,
                             ) {
                                 hovered_preview = Some((idx, preview_rect));
                             }
@@ -9708,6 +9828,7 @@ impl App {
             && ctx.input(|i| i.pointer.secondary_clicked());
         if bg_right_clicked
             && self.context_menu_idx.is_none()
+            && !self.selection_info_bar_contains_pointer(ctx)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
             self.open_current_folder_context_menu(ctx);
@@ -9966,6 +10087,89 @@ impl App {
         });
     }
 
+    fn details_header_title(
+        &self,
+        col: DetailsColumn,
+        book_sort_locked: bool,
+        show_sort_indicator: bool,
+    ) -> String {
+        let mut base_title = if self.items_are_reading_history_view {
+            match col {
+                DetailsColumn::Modified => "最終閲覧".to_string(),
+                DetailsColumn::State => "既読位置".to_string(),
+                _ => col.title().to_string(),
+            }
+        } else {
+            col.title().to_string()
+        };
+        if col.is_lazy()
+            && matches!(
+                self.details_image_dims_state,
+                LazyColumnState::Loading { .. } | LazyColumnState::NotRequested
+            )
+        {
+            base_title.push_str(" ...");
+        }
+        let sorted = show_sort_indicator
+            && !book_sort_locked
+            && col
+                .sort_key()
+                .is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
+        if sorted {
+            format!(
+                "{} {}",
+                base_title,
+                if self.settings.details_sort_ascending {
+                    "↑"
+                } else {
+                    "↓"
+                }
+            )
+        } else {
+            base_title
+        }
+    }
+
+    fn draw_details_header_static(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        column_set: DetailsColumnSet,
+    ) {
+        let response = ui.interact(
+            rect,
+            ui.id().with("details_header_static_context_menu"),
+            egui::Sense::click(),
+        );
+        let bg = ui.visuals().extreme_bg_color;
+        let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+        let text_color = ui.visuals().strong_text_color();
+        let book_sort_locked =
+            self.current_folder_is_book_folder() || self.items_are_reading_history_view;
+        ui.painter().rect_filled(rect, 0.0, bg);
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0, stroke_color),
+        );
+        for (col, col_rect) in details_column_rects_for_columns(rect, &self.settings, column_set) {
+            draw_details_text(
+                ui,
+                col_rect,
+                &self.details_header_title(col, book_sort_locked, false),
+                egui::Align2::LEFT_CENTER,
+                text_color,
+                true,
+            );
+            ui.painter().line_segment(
+                [col_rect.right_top(), col_rect.right_bottom()],
+                egui::Stroke::new(1.0, stroke_color),
+            );
+        }
+        response.context_menu(|ui| {
+            self.draw_details_column_context_menu(ui);
+        });
+    }
+
     fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
@@ -9979,7 +10183,7 @@ impl App {
             egui::Stroke::new(1.0, stroke_color),
         );
 
-        let columns = details_column_rects(rect, &self.settings);
+        let columns = details_column_rects_for_columns(rect, &self.settings, DetailsColumnSet::All);
         let header_drag_id = ui.id().with("details_header_drag_state");
         for (col, col_rect) in columns.iter().copied() {
             let mut header_hit = col_rect;
@@ -10065,43 +10269,7 @@ impl App {
                     }
                 }
             }
-            let sorted = !book_sort_locked
-                && sort_key.is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
-            let mut base_title = if self.items_are_reading_history_view {
-                match col {
-                    DetailsColumn::Modified => "最終閲覧".to_string(),
-                    DetailsColumn::State => "既読位置".to_string(),
-                    _ => col.title().to_string(),
-                }
-            } else {
-                col.title().to_string()
-            };
-            if matches!(
-                col,
-                DetailsColumn::Created
-                    | DetailsColumn::ImageDimensions
-                    | DetailsColumn::VideoDuration
-                    | DetailsColumn::VideoDimensions
-                    | DetailsColumn::VideoCodec
-            ) && matches!(
-                self.details_image_dims_state,
-                LazyColumnState::Loading { .. } | LazyColumnState::NotRequested
-            ) {
-                base_title.push_str(" ...");
-            }
-            let title = if sorted {
-                format!(
-                    "{} {}",
-                    base_title,
-                    if self.settings.details_sort_ascending {
-                        "↑"
-                    } else {
-                        "↓"
-                    }
-                )
-            } else {
-                base_title
-            };
+            let title = self.details_header_title(col, book_sort_locked, true);
             draw_details_text(
                 ui,
                 col_rect,
@@ -10328,6 +10496,76 @@ impl App {
         }
     }
 
+    fn details_cell_text(
+        &mut self,
+        idx: usize,
+        item: &GridItem,
+        meta: Option<(i64, i64)>,
+        column: DetailsColumn,
+    ) -> String {
+        match column {
+            DetailsColumn::Preview => String::new(),
+            DetailsColumn::Name => item.name().into_owned(),
+            DetailsColumn::Rating => {
+                let rating = if self.items_are_drive_list {
+                    0
+                } else {
+                    self.get_rating(idx)
+                };
+                "★".repeat(rating as usize)
+            }
+            DetailsColumn::Tags => self.cell_tag_list(idx).join(" "),
+            DetailsColumn::Kind => details_kind_label(item),
+            DetailsColumn::Size => meta
+                .and_then(|(_, size)| (size > 0).then_some(size))
+                .map(|size| {
+                    crate::ui_helpers::format_details_size(
+                        size as u64,
+                        self.settings.details_size_display_mode,
+                    )
+                })
+                .unwrap_or_default(),
+            DetailsColumn::Modified => {
+                if self.items_are_reading_history_view {
+                    self.reading_history_last_read_for_idx(idx)
+                        .unwrap_or_default()
+                } else {
+                    meta.map(|(mtime, _)| {
+                        format_details_mtime(mtime, self.settings.details_timestamp_show_seconds)
+                    })
+                    .unwrap_or_default()
+                }
+            }
+            DetailsColumn::Created => self.details_created_text(idx),
+            DetailsColumn::State => self.details_state_text(idx),
+            DetailsColumn::ImageDimensions => self.details_image_dims_text(idx),
+            DetailsColumn::VideoDuration => self.details_video_duration_text(idx),
+            DetailsColumn::VideoDimensions => self.details_video_dims_text(idx),
+            DetailsColumn::VideoCodec => self.details_video_codec_text(idx),
+        }
+    }
+
+    /// 詳細一覧と下部情報バーが共有する、指定列の表示文字列を構築する。
+    /// 既存キャッシュだけを参照し、列ごとの書式を単一箇所に保つ。
+    fn details_row_data(
+        &mut self,
+        idx: usize,
+        columns: &[DetailsColumn],
+    ) -> Option<DetailsRowData> {
+        let item = self.items.get(idx)?.clone();
+        let meta = self.image_metas.get(idx).copied().flatten();
+        let mut cells = Vec::with_capacity(columns.len());
+
+        for &column in columns {
+            if column == DetailsColumn::Preview {
+                continue;
+            }
+            let text = self.details_cell_text(idx, &item, meta, column);
+            cells.push((column, text));
+        }
+        Some(DetailsRowData { cells })
+    }
+
     fn draw_details_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -10335,13 +10573,28 @@ impl App {
         idx: usize,
         row: usize,
         is_spread_pair_cursor: bool,
+        column_set: DetailsColumnSet,
+        display_only: bool,
+        show_tooltip: bool,
     ) -> Option<egui::Rect> {
         let Some(item) = self.items.get(idx).cloned() else {
             return None;
         };
+        let column_rects = details_column_rects_for_columns(rect, &self.settings, column_set);
+        let columns = column_rects
+            .iter()
+            .map(|(column, _)| *column)
+            .collect::<Vec<_>>();
+        let row_data = self.details_row_data(idx, &columns)?;
         let visuals = ui.visuals();
-        let selected = self.selected == Some(idx);
-        let checked = self.checked.contains(&idx);
+        let visual_state = details_row_visual_state(
+            display_only,
+            self.selected == Some(idx),
+            self.checked.contains(&idx),
+            ui.rect_contains_pointer(rect),
+        );
+        let selected = visual_state.selected;
+        let checked = visual_state.checked;
         let row_style = self.settings.details_row_style;
         let bg = details_row_background(
             visuals,
@@ -10349,7 +10602,7 @@ impl App {
             row,
             selected,
             checked,
-            ui.rect_contains_pointer(rect),
+            visual_state.hovered,
         );
         let text_color = if selected {
             visuals.selection.stroke.color
@@ -10381,49 +10634,16 @@ impl App {
             crate::app::draw_spread_pair_cursor(painter, rect, visuals);
         }
 
-        let name = item.name().into_owned();
-        let rating = if self.items_are_drive_list {
-            0
-        } else {
-            self.get_rating(idx)
-        };
-        let rating_text = if rating == 0 {
-            String::new()
-        } else {
-            "★".repeat(rating as usize)
-        };
-        let tags_text = self.cell_tag_list(idx).join(" ");
-        let kind_text = details_kind_label(&item);
-        let (size_text, modified_text) = self
-            .image_metas
-            .get(idx)
-            .and_then(|m| *m)
-            .map(|(mtime, size)| {
-                let size_text = if size > 0 {
-                    crate::ui_helpers::format_details_size(
-                        size as u64,
-                        self.settings.details_size_display_mode,
-                    )
-                } else {
-                    String::new()
-                };
-                (
-                    size_text,
-                    format_details_mtime(mtime, self.settings.details_timestamp_show_seconds),
-                )
-            })
-            .unwrap_or_else(|| (String::new(), String::new()));
-        // 読書履歴ビューでは「更新日時」列を最終閲覧、「状態」列を既読位置に転用する。
-        let modified_text = if self.items_are_reading_history_view {
-            self.reading_history_last_read_for_idx(idx)
-                .unwrap_or_default()
-        } else {
-            modified_text
-        };
-        let state_text = self.details_state_text(idx);
+        let name = row_data.text(DetailsColumn::Name);
+        let rating_text = row_data.text(DetailsColumn::Rating);
+        let tags_text = row_data.text(DetailsColumn::Tags);
+        let kind_text = row_data.text(DetailsColumn::Kind);
+        let size_text = row_data.text(DetailsColumn::Size);
+        let modified_text = row_data.text(DetailsColumn::Modified);
+        let state_text = row_data.text(DetailsColumn::State);
         let mut hovered_preview_rect = None;
 
-        for (col, col_rect) in details_column_rects(rect, &self.settings) {
+        for (col, col_rect) in column_rects {
             match col {
                 DetailsColumn::Preview => {
                     let enabled = !matches!(item, GridItem::ZipSeparator { .. });
@@ -10493,7 +10713,7 @@ impl App {
                 DetailsColumn::Created => draw_details_text(
                     ui,
                     col_rect,
-                    &self.details_created_text(idx),
+                    row_data.text(DetailsColumn::Created),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
@@ -10501,7 +10721,7 @@ impl App {
                 DetailsColumn::ImageDimensions => draw_details_text(
                     ui,
                     col_rect,
-                    &self.details_image_dims_text(idx),
+                    row_data.text(DetailsColumn::ImageDimensions),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
@@ -10509,7 +10729,7 @@ impl App {
                 DetailsColumn::VideoDuration => draw_details_text(
                     ui,
                     col_rect,
-                    &self.details_video_duration_text(idx),
+                    row_data.text(DetailsColumn::VideoDuration),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
@@ -10517,7 +10737,7 @@ impl App {
                 DetailsColumn::VideoDimensions => draw_details_text(
                     ui,
                     col_rect,
-                    &self.details_video_dims_text(idx),
+                    row_data.text(DetailsColumn::VideoDimensions),
                     egui::Align2::RIGHT_CENTER,
                     text_color,
                     false,
@@ -10525,7 +10745,7 @@ impl App {
                 DetailsColumn::VideoCodec => draw_details_text(
                     ui,
                     col_rect,
-                    &self.details_video_codec_text(idx),
+                    row_data.text(DetailsColumn::VideoCodec),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
@@ -10540,7 +10760,9 @@ impl App {
                 ),
             }
         }
-        self.draw_reading_history_tooltip(ui, rect, idx);
+        if show_tooltip {
+            self.draw_reading_history_tooltip(ui, rect, idx);
+        }
         hovered_preview_rect
     }
 
@@ -10914,6 +11136,7 @@ impl App {
                     && ctx.input(|i| i.pointer.secondary_clicked());
                 if bg_right_clicked
                     && self.context_menu_idx.is_none()
+                    && !self.selection_info_bar_contains_pointer(ctx)
                     && !self.mouse_ring_context_menu_suppressed(ctx)
                 {
                     self.open_current_folder_context_menu(ctx);
@@ -11130,33 +11353,68 @@ impl App {
     /// 選択情報の固定 1 行バーを、グリッド用 CentralPanel より先に確保する。
     /// TopBottomPanel が `ctx.available_rect()` を縮めるため、render_grid が読む
     /// `ui.available_height()` と仮想スクロールの viewport 高さには予約分が反映される。
-    pub(crate) fn render_selection_info_bar(&self, ctx: &egui::Context) {
+    pub(crate) fn render_selection_info_bar(&mut self, ctx: &egui::Context) {
+        self.selection_info_bar_rect = None;
         if self.viewer_session_blocks_main_window()
             || !self.settings.selection_info_display_mode.shows_bottom_bar()
+            || self.items_are_drive_list
         {
             return;
         }
 
-        let text = if self.items_are_drive_list {
-            String::new()
-        } else {
-            self.selection_info_content()
-                .map(|content| content.single_line_text())
-                .unwrap_or_default()
-        };
+        let selected_idx = self.selected.filter(|&idx| {
+            self.items
+                .get(idx)
+                .is_some_and(|item| !matches!(item, GridItem::ZipSeparator { .. }))
+        });
         let available_before = ctx.available_rect();
         let panel = egui::TopBottomPanel::bottom("selection_info_bottom_bar")
             .exact_height(SELECTION_INFO_BAR_HEIGHT)
             .show_separator_line(true)
             .show(ctx, |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add_sized(
-                        ui.available_size(),
-                        egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
-                    );
-                });
+                let avail_w = ui.available_width().max(1.0);
+                let full_layout = details_layout(avail_w, 0.0, &self.settings);
+                let content_w = details_content_width_for_column_set(
+                    full_layout.pane_w,
+                    &self.settings,
+                    DetailsColumnSet::TextOnly,
+                );
+                egui::ScrollArea::horizontal()
+                    .id_salt("selection_info_bottom_bar_horizontal")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let old_spacing_y = ui.spacing().item_spacing.y;
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.set_min_width(content_w);
+                        let (header_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(content_w, Self::DETAILS_HEADER_H),
+                            egui::Sense::hover(),
+                        );
+                        self.draw_details_header_static(
+                            ui,
+                            header_rect,
+                            DetailsColumnSet::TextOnly,
+                        );
+                        let (row_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(content_w, Self::DETAILS_ROW_H),
+                            egui::Sense::hover(),
+                        );
+                        if let Some(idx) = selected_idx {
+                            let _ = self.draw_details_row(
+                                ui,
+                                row_rect,
+                                idx,
+                                0,
+                                false,
+                                DetailsColumnSet::TextOnly,
+                                true,
+                                false,
+                            );
+                        }
+                        ui.spacing_mut().item_spacing.y = old_spacing_y;
+                    });
             });
+        self.selection_info_bar_rect = Some(panel.response.rect);
         let available_after = ctx.available_rect();
         debug_assert!(
             available_before.height() <= 0.0
@@ -11164,6 +11422,16 @@ impl App {
                     >= panel.response.rect.height().min(available_before.height()),
             "selection-info bar must reserve height before the grid viewport"
         );
+    }
+
+    fn selection_info_bar_contains_pointer(&self, ctx: &egui::Context) -> bool {
+        let pos = ctx.input(|input| {
+            input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.latest_pos())
+        });
+        selection_info_bar_contains_pos(self.selection_info_bar_rect, pos)
     }
 
     /// 選択中アイテムの情報を選択セル / 行の直下に表示する。
@@ -11317,6 +11585,29 @@ mod selection_info_tests {
     }
 
     #[test]
+    fn details_row_data_uses_shared_details_formatting_for_cursor_index() {
+        let mut app = app_with_item(
+            GridItem::Image(PathBuf::from(r"C:\pics\photo.jpg")),
+            Some((1_700_000_000, 2048)),
+        );
+        let columns = [
+            DetailsColumn::Name,
+            DetailsColumn::Kind,
+            DetailsColumn::Size,
+            DetailsColumn::Modified,
+        ];
+        let data = app.details_row_data(0, &columns).unwrap();
+
+        assert_eq!(data.text(DetailsColumn::Name), "photo.jpg");
+        assert_eq!(data.text(DetailsColumn::Kind), "JPG 画像");
+        assert_eq!(data.text(DetailsColumn::Size), "2.0 KB");
+        assert_eq!(
+            data.text(DetailsColumn::Modified),
+            format_details_mtime(1_700_000_000, false)
+        );
+    }
+
+    #[test]
     fn shared_builder_formats_video_fields_from_cached_lazy_meta() {
         let mut app = app_with_item(
             GridItem::Video(PathBuf::from(r"C:\clips\movie.mp4")),
@@ -11466,6 +11757,23 @@ mod selection_info_tests {
         let (before, after, central) = measured.unwrap();
         assert!(before - after >= SELECTION_INFO_BAR_HEIGHT - 0.5);
         assert!(central <= after + 0.5);
+    }
+
+    #[test]
+    fn bottom_bar_context_menu_suppression_only_matches_its_own_rect() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 420.0), egui::pos2(640.0, 480.0));
+        assert!(selection_info_bar_contains_pos(
+            Some(rect),
+            Some(egui::pos2(320.0, 450.0))
+        ));
+        assert!(!selection_info_bar_contains_pos(
+            Some(rect),
+            Some(egui::pos2(320.0, 200.0))
+        ));
+        assert!(!selection_info_bar_contains_pos(
+            None,
+            Some(egui::pos2(320.0, 450.0))
+        ));
     }
 }
 
@@ -12052,6 +12360,26 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn display_only_details_row_ignores_all_interaction_visuals() {
+        assert_eq!(
+            details_row_visual_state(true, true, true, true),
+            DetailsRowVisualState {
+                selected: false,
+                checked: false,
+                hovered: false,
+            }
+        );
+        assert_eq!(
+            details_row_visual_state(false, true, true, true),
+            DetailsRowVisualState {
+                selected: true,
+                checked: true,
+                hovered: true,
+            }
+        );
+    }
+
+    #[test]
     fn details_layout_overflows_when_saved_width_needs_it() {
         let mut settings = minimal_details_settings();
         assert!(set_details_column_width(
@@ -12090,6 +12418,55 @@ mod compute_cell_size_tests {
         let layout = details_layout(600.0, 0.0, &settings);
         assert!((layout.extent - 600.0).abs() < 0.01);
         assert!((layout.pane_w - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn bottom_bar_columns_follow_details_order_and_omit_preview() {
+        let mut settings = minimal_details_settings();
+        settings.details_show_preview = true;
+        settings.details_show_kind = true;
+        settings.details_column_order = vec![
+            DetailsColumnId::Kind,
+            DetailsColumnId::Preview,
+            DetailsColumnId::Size,
+            DetailsColumnId::Name,
+        ];
+
+        assert_eq!(
+            details_visible_columns(&settings, DetailsColumnSet::TextOnly),
+            vec![
+                DetailsColumn::Kind,
+                DetailsColumn::Size,
+                DetailsColumn::Name
+            ]
+        );
+    }
+
+    #[test]
+    fn bottom_bar_text_columns_keep_details_widths() {
+        let mut settings = minimal_details_settings();
+        settings.details_show_preview = true;
+        let full_layout = details_layout(600.0, 0.0, &settings);
+        let text_width = details_content_width_for_column_set(
+            full_layout.pane_w,
+            &settings,
+            DetailsColumnSet::TextOnly,
+        );
+        let full_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(full_layout.pane_w, 24.0));
+        let text_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
+        let full = details_column_rects(full_rect, &settings);
+        let text =
+            details_column_rects_for_columns(text_rect, &settings, DetailsColumnSet::TextOnly);
+
+        for (column, rect) in text {
+            let full_width = full
+                .iter()
+                .find(|(candidate, _)| *candidate == column)
+                .map(|(_, rect)| rect.width())
+                .unwrap();
+            assert!((rect.width() - full_width).abs() < 0.01, "{column:?}");
+        }
     }
 
     #[test]

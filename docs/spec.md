@@ -1013,6 +1013,10 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
   `keymap` / `ring_shortcuts` / `menu_layout` を `.mivkeys.json` として書き出し・
   置換取り込みできる。差分は実効チョード単位で標準 / 現在 / 前世代と比較する。世代からの
   取り込みは設定全体を復元せずライブ適用し、直前の 3 点セットを同形式で自動退避する。
+  同タブから 3 点セットだけを確認後に初期値へ戻すこともでき、この場合も適用前の内容を
+  同じ自動退避経路へ保存してからライブ適用・永続化する。
+  差分 / 取り込みウィンドウは基準 720x540 の固定外形を viewport に合わせて縮め、本文だけを
+  縦横スクロールする。比較元の切替では外形を変えず、操作ボタンはスクロール領域の外に固定する。
   既存の settings.db 世代を読み取るだけで、永続化スキーマは追加しない。
 - **自動復旧**: 起動時に main DB が壊れていたら (`PRAGMA integrity_check` 失敗 /
   `NotADatabase` / `DatabaseCorrupt`)、`settings.db` / `settings.db-wal` / `settings.db-shm`
@@ -1126,7 +1130,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態・AI モデル・生成ツールなど。場所条件はセッション中の一時状態で、フォルダ / ZIP / PDF / 仮想ビューの移動時に解除し、設定には保存しない。絞り込み中に ZIP/PDF/フォルダなどのコンテナへ入ると親階層の条件を一時退避し、内側では別条件を設定できる。Backspace などで親階層へ戻ると退避した条件を復元する |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
-| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報の表示方法。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。`BottomBar` はグリッドの `CentralPanel` より先に固定高を予約し、仮想スクロールの viewport 高さから除外される |
+| `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報の表示方法。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。`BottomBar` はグリッドの `CentralPanel` より先に「詳細表示のヘッダ + カーソル位置の 1 行」の高さを予約し、仮想スクロールの viewport 高さから除外される。列順・列幅・表示列は詳細表示と共有し、プレビュー列だけ除外する。データ行は選択・チェック・ホバーの強調を出さず、クリックや右クリックによるアイテム操作を受け付けない表示専用とする。ヘッダには詳細一覧のソート矢印を出さず、左クリックではソートせず、右クリックだけ詳細一覧と共通の列カスタマイズメニューを開く。表示中の遅延列はツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
 | `thumb_tooltip_show_image_dimensions` | bool | true | 選択情報に画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
 | `thumb_tooltip_show_video_duration` | bool | true | 選択情報に長さを表示するか。動画・音声の選択時だけバックグラウンド取得する |

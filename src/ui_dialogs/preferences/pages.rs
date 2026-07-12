@@ -442,9 +442,9 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             });
     });
     ui.label(
-        "ツールチップは選択行の下に、下部情報バーは一覧と重ならないウィンドウ下部に表示します。長さなどは必要なときにバックグラウンドで読み込みます。",
+        "ツールチップは選択行の下に表示します。下部情報バーは詳細表示と同じ列構成で、ヘッダと選択中の 1 行をウィンドウ下部に表示します。",
     );
-    ui.label("表示する項目:");
+    ui.label("ツールチップに表示する項目:");
     ui.add_space(4.0);
     ui.checkbox(&mut s.thumb_tooltip_show_filename, "ファイル名");
     ui.checkbox(&mut s.thumb_tooltip_show_image_dimensions, "画像解像度");
