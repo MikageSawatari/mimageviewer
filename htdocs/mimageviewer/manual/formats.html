@@ -161,12 +161,18 @@
         </thead>
         <tbody>
           <tr><td><code>.zip</code> / <code>.cbz</code></td><td>ZIP / CBZ</td><td>アーカイブ内の画像をそのまま閲覧可能（変換不要）。中にサブフォルダや別の ZIP がある場合は、それぞれを「開いて中に入れるフォルダ」として表示し、ツリー状に行き来できます。CBZ は中身が ZIP のコミック形式で、ZIP と同じく扱います</td></tr>
-          <tr><td><code>.rar</code> / <code>.cbr</code></td><td>RAR / CBR</td><td>設定に応じて確認後または自動で ZIP に変換して閲覧（パスワード付き対応。パスワード自体は保存せず、変換後 ZIP キャッシュはパスワードなし。分割 RAR は先頭パートから開く）。設定で無視することもできます</td></tr>
+          <tr><td><code>.rar</code> / <code>.cbr</code></td><td>RAR / CBR</td><td>非ソリッド圧縮で入れ子アーカイブを含まない場合は変換せず直接閲覧します。ソリッド圧縮、入れ子あり、パスワード付きは設定に応じて ZIP キャッシュへ変換します。分割 RAR は先頭パートから開きます</td></tr>
           <tr><td><code>.7z</code> / <code>.cb7</code></td><td>7z / CB7</td><td>設定に応じて確認後または自動で ZIP に変換して閲覧（変換は初回のみ、2 回目以降はキャッシュから高速表示）。CB7 は中身が 7z のコミック形式。設定で無視することもできます</td></tr>
           <tr><td><code>.lzh</code> / <code>.lha</code></td><td>LZH</td><td>設定に応じて確認後または自動で ZIP に変換して閲覧（7z と同様）。設定で無視することもできます</td></tr>
         </tbody>
       </table>
     </div>
+    <p>RAR / CBR / 7z / CB7 / LZH / LHA を選択して
+    <strong>変換 → ZIP ファイルに変換</strong>を実行すると、元ファイルと同じフォルダに
+    同名の <code>.zip</code> を作成できます。これは閲覧用キャッシュではなく、通常のファイルとして残ります。
+    同名 ZIP を優先する設定が有効な場合、変換後の一覧には ZIP だけが表示されます。
+    元アーカイブから再変換したい場合は、環境設定の「同名の ZIP/CBZ と RAR/7z/LZH がある場合、
+    ZIP/CBZ だけ表示」を一時的に OFF にして元アーカイブを選択してください。</p>
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">

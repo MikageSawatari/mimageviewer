@@ -1390,6 +1390,76 @@ mod rotation_key_tests {
             "0度へ戻ったら ZIP ページの回転レコードも削除する"
         );
     }
+
+    #[test]
+    fn direct_rar_and_conversion_cache_keep_their_existing_page_roots() {
+        let mut app = setup_app();
+        let source = PathBuf::from(r"C:\Books\comic.rar");
+        let cached = PathBuf::from(r"C:\Cache\archive\book.zip");
+        let entry_name = "Chapter01/Page002.JPG".to_string();
+
+        app.current_folder = Some(cached.clone());
+        app.archive_source_override = Some(source.clone());
+        app.items = vec![GridItem::ZipImage {
+            zip_path: cached,
+            entry_name: entry_name.clone(),
+        }];
+        let converted_key = app.page_path_key(0).unwrap();
+
+        app.current_folder = Some(source.clone());
+        app.archive_source_override = None;
+        app.items = vec![GridItem::ZipImage {
+            zip_path: source.clone(),
+            entry_name: entry_name.clone(),
+        }];
+        let direct_key = app.page_path_key(0).unwrap();
+
+        assert_ne!(direct_key, converted_key);
+        assert_eq!(
+            direct_key,
+            crate::adjustment_db::zip_entry_key(&source, &entry_name)
+        );
+        assert_eq!(
+            converted_key,
+            crate::adjustment_db::zip_entry_key(
+                &PathBuf::from(r"C:\Cache\archive\book.zip"),
+                &entry_name
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod same_name_zip_preference_tests {
+    use super::*;
+
+    #[test]
+    fn grid_dedup_prefers_native_zip_and_preserves_parallel_metadata() {
+        let mut items = vec![
+            GridItem::ZipFile(PathBuf::from(r"C:\Books\Book.ZIP")),
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\Books\book.rar"),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\Books\other.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+        ];
+        let mut metas = vec![Some((1, 10)), Some((2, 20)), Some((3, 30))];
+        App::filter_convertible_archive_duplicates(&mut items, &mut metas);
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], GridItem::ZipFile(_)));
+        assert!(matches!(
+            items[1],
+            GridItem::ConvertibleArchive {
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+                ..
+            }
+        ));
+        assert_eq!(metas, vec![Some((1, 10)), Some((3, 30))]);
+    }
 }
 
 #[cfg(test)]
@@ -2661,6 +2731,12 @@ mod phase_c_folder_nav_history_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -2716,6 +2792,12 @@ mod phase_c_folder_nav_history_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -2749,6 +2831,12 @@ mod phase_c_folder_nav_history_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -2787,6 +2875,12 @@ mod phase_c_folder_nav_history_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -4923,6 +5017,38 @@ mod phase_c_drill_nav_tests {
         assert_eq!(path, std::path::PathBuf::from("c:/books/source.rar"));
         assert_eq!(kind, crate::reading_history_db::ReadingHistoryKind::Archive);
         assert_eq!(format, Some(crate::archive_converter::ArchiveFormat::Rar));
+    }
+
+    #[test]
+    fn direct_rar_reading_history_records_and_reopens_as_archive() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let path = std::path::PathBuf::from("c:/books/direct.cbr");
+        app.items = vec![GridItem::ZipImage {
+            zip_path: path.clone(),
+            entry_name: "p1.jpg".to_string(),
+        }];
+
+        let (target, kind, format) = app.reading_history_target_for_page(0).unwrap();
+        assert_eq!(target, path);
+        assert_eq!(kind, crate::reading_history_db::ReadingHistoryKind::Archive);
+        assert_eq!(format, Some(crate::archive_converter::ArchiveFormat::Rar));
+
+        let entry = crate::reading_history_db::ReadingHistoryEntry::new(
+            target.clone(),
+            kind,
+            format,
+            "direct.cbr".to_string(),
+            Some(1),
+            Some(2),
+        );
+        assert!(matches!(
+            crate::app::reading_history_grid_item(&entry),
+            GridItem::ConvertibleArchive {
+                path: reopened,
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            } if reopened == target
+        ));
     }
 
     #[test]
@@ -11489,7 +11615,7 @@ mod favorite_adjustment_defaults_tests {
     /// Ctrl+↑↓ フルスクリーンナビ中に未キャッシュの 7z/RAR/LZH を踏んでも、
     /// 確認なし自動変換なら fullscreen 復帰予約を保持し、一覧への露出を防ぐ。
     #[test]
-    fn archive_convert_deferred_fullscreen_attaches_only_when_confirm_is_suppressed() {
+    fn archive_convert_deferred_fullscreen_attaches_for_suppressed_or_direct_read() {
         let mut app = setup_app();
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -11500,6 +11626,12 @@ mod favorite_adjustment_defaults_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -11530,6 +11662,12 @@ mod favorite_adjustment_defaults_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -11542,6 +11680,48 @@ mod favorite_adjustment_defaults_tests {
             "ユーザー確認が必要な変換では fullscreen 継続予約を付けない"
         );
         assert!(!app.archive_convert_deferred_fullscreen_active());
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\books\04.rar"),
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: true,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        assert!(
+            app.attach_archive_convert_deferred_fullscreen(false, false),
+            "確認設定が Ask でも direct-read probe 中は fullscreen 復帰予約を保持する"
+        );
+        assert!(app.archive_convert_deferred_fullscreen_active());
+
+        let direct_path = PathBuf::from(r"C:\books\04.rar");
+        app.archive_convert.as_mut().unwrap().pending_direct_nav = Some(direct_path.clone());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder, Some(direct_path));
+        assert!(app.zip_enumerate_pending.is_some());
+        assert!(
+            app.fs_nav_after_pdf_enumerate.is_some(),
+            "direct RAR navigation must keep the deferred fullscreen reopen through enumeration"
+        );
+        assert!(app.fs_nav_is_locked());
     }
 
     /// パスワード入力が必要になった場合はユーザー操作待ちになるため、fullscreen 継続予約を
@@ -11565,6 +11745,12 @@ mod favorite_adjustment_defaults_tests {
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -11619,6 +11805,12 @@ mod favorite_adjustment_defaults_tests {
             },
             rx,
             pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            destination:
+                crate::ui_dialogs::archive_convert::ArchiveConvertDestination::CacheAndOpen,
+            pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
@@ -29125,6 +29317,38 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.selected, Some(idx));
         assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+    }
+
+    #[test]
+    fn direct_rar_root_backspace_returns_to_page_list() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let rar = PathBuf::from(r"C:\books\direct.rar");
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(rar.clone());
+        app.items = vec![GridItem::ZipImage {
+            zip_path: rar,
+            entry_name: "p1.jpg".to_string(),
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+
+        begin_root_key_pass(&ctx, egui::Key::Backspace, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(
+            !app.pending_return_to_parent,
+            "Backspace must stop at the direct RAR page list instead of using generic close"
+        );
+        assert_eq!(
+            app.current_folder,
+            Some(PathBuf::from(r"C:\books\direct.rar"))
+        );
     }
 
     #[test]

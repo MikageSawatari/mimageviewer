@@ -11952,7 +11952,7 @@ impl App {
         let in_virtual_page_list = self
             .current_folder
             .as_deref()
-            .is_some_and(crate::folder_tree::is_virtual_folder);
+            .is_some_and(crate::folder_tree::is_open_as_container);
         if in_virtual_page_list && self.viewer_session_is_detached() {
             // virtual page list (本の中の親) から detached を閉じる = セッション終了 (§3.7)。
             #[cfg(windows)]
@@ -13258,6 +13258,14 @@ impl App {
                     "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                 );
                 return FolderOpenOutcome::Ignored;
+            }
+            if format == crate::archive_converter::ArchiveFormat::Rar {
+                let fallback_cached_zip = self.try_archive_cache_lookup(&path);
+                return if self.request_rar_open(path, auto_fullscreen, fallback_cached_zip) {
+                    FolderOpenOutcome::ConversionDialogOpened
+                } else {
+                    FolderOpenOutcome::Ignored
+                };
             }
             if let Some(cached) = self.try_archive_cache_lookup(&path) {
                 if self
@@ -15829,7 +15837,8 @@ impl App {
         // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
         // 無限再帰にはならない。lookup は mtime+size 検証付き (元 ZIP が更新されたら
         // miss して通常経路 → 列挙で再検出 → 再変換提案)。
-        if !self.settings.archive_file_handling_ignores_convertible()
+        if !crate::rar_loader::is_rar_path(&zip_path)
+            && !self.settings.archive_file_handling_ignores_convertible()
             && let Some(cached) = self.try_archive_cache_lookup(&zip_path)
             && !crate::folder_tree::path_eq(&cached, &zip_path)
         {
@@ -18395,6 +18404,18 @@ impl App {
                         return;
                     }
                     peeked += 1;
+                    if crate::rar_loader::is_rar_path(&path)
+                        && crate::rar_loader::inspect_for_direct_read(&path).is_ok_and(
+                            |inspection| {
+                                inspection.decision
+                                    == crate::rar_loader::RarDirectReadDecision::Direct
+                            },
+                        )
+                    {
+                        hits += 1;
+                        paths.insert(crate::path_key::normalize_keep_drive(&path), path.clone());
+                        continue;
+                    }
                     // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
                     // last_access UPDATE (書き込みトランザクション) を発行しない。
                     if let Some(cached_zip) = db.peek(&path, mtime, file_size) {
@@ -25050,9 +25071,8 @@ impl App {
                             self.fs_suppress_enter_close_until_release = true;
                             self.open_fullscreen(idx);
                         }
-                        Some(GridItem::ConvertibleArchive { path, format }) => {
+                        Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
-                            let fmt = *format;
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
                             let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
@@ -25071,24 +25091,8 @@ impl App {
                                 self.record_tag_view_nav_open(&pf);
                             }
                             self.record_rating_view_nav_open(&pf);
-                            let open_outcome =
-                                if self.settings.archive_file_handling_ignores_convertible() {
-                                    self.show_feedback_toast(
-                                        "設定により RAR / 7z / LZH アーカイブを無視しています"
-                                            .into(),
-                                    );
-                                    FolderOpenOutcome::Ignored
-                                } else if let Some(cached) = self.try_archive_cache_lookup(&pf) {
-                                    if self.open_archive_via_cache(pf, cached, auto_fs) {
-                                        FolderOpenOutcome::Loaded
-                                    } else {
-                                        FolderOpenOutcome::Ignored
-                                    }
-                                } else if self.request_archive_convert(pf, fmt, auto_fs) {
-                                    FolderOpenOutcome::ConversionDialogOpened
-                                } else {
-                                    FolderOpenOutcome::Ignored
-                                };
+                            let open_outcome = self
+                                .load_folder_or_convert_archive_with_auto_fullscreen(pf, auto_fs);
                             match (open_outcome, search_rollback) {
                                 (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                                     self.attach_archive_convert_nav_history_rollback(snapshot);
@@ -25844,7 +25848,7 @@ impl App {
         let Some(current_folder) = self.current_folder.as_deref() else {
             return false;
         };
-        if crate::folder_tree::is_virtual_folder(current_folder) {
+        if crate::folder_tree::is_open_as_container(current_folder) {
             return true;
         }
         self.settings.auto_fullscreen_image_folders_enabled()
@@ -26852,11 +26856,21 @@ impl App {
                     None,
                 ))
             }
-            GridItem::ZipImage { zip_path, .. } => Some((
-                zip_path.clone(),
-                crate::reading_history_db::ReadingHistoryKind::Zip,
-                None,
-            )),
+            GridItem::ZipImage { zip_path, .. } => {
+                if crate::rar_loader::is_rar_path(zip_path) {
+                    Some((
+                        zip_path.clone(),
+                        crate::reading_history_db::ReadingHistoryKind::Archive,
+                        Some(crate::archive_converter::ArchiveFormat::Rar),
+                    ))
+                } else {
+                    Some((
+                        zip_path.clone(),
+                        crate::reading_history_db::ReadingHistoryKind::Zip,
+                        None,
+                    ))
+                }
+            }
             GridItem::PdfPage { pdf_path, .. } => Some((
                 pdf_path.clone(),
                 crate::reading_history_db::ReadingHistoryKind::Pdf,
@@ -33975,6 +33989,9 @@ impl App {
         if self.settings.skip_zip_if_folder_exists {
             Self::filter_virtual_folder_duplicates(folders, folder_metas);
         }
+        if self.settings.skip_archive_if_zip_exists {
+            Self::filter_convertible_archive_duplicates(folders, folder_metas);
+        }
         if self.settings.skip_image_if_video_exists {
             self.filter_video_image_duplicates(all_media);
         }
@@ -34022,6 +34039,34 @@ impl App {
         folders.retain(|_| *ki.next().unwrap());
         let mut ki = keep.iter();
         folder_metas.retain(|_| *ki.next().unwrap());
+    }
+
+    /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
+    fn filter_convertible_archive_duplicates(
+        folders: &mut Vec<GridItem>,
+        folder_metas: &mut Vec<Option<(i64, i64)>>,
+    ) {
+        let zip_stems: std::collections::HashSet<String> = folders
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::ZipFile(path) => Some(stem_lower(path)),
+                _ => None,
+            })
+            .collect();
+        if zip_stems.is_empty() {
+            return;
+        }
+        let keep: Vec<bool> = folders
+            .iter()
+            .map(|item| match item {
+                GridItem::ConvertibleArchive { path, .. } => !zip_stems.contains(&stem_lower(path)),
+                _ => true,
+            })
+            .collect();
+        let mut iter = keep.iter();
+        folders.retain(|_| *iter.next().unwrap());
+        let mut iter = keep.iter();
+        folder_metas.retain(|_| *iter.next().unwrap());
     }
 
     /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
@@ -40458,7 +40503,11 @@ impl App {
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
-            } => crate::adjustment_db::zip_entry_key(zip_path, entry_name),
+            } => {
+                // Keep released cache-ZIP page keys intact. Direct/cache parity would require an
+                // explicit user-data migration and is deliberately deferred.
+                crate::adjustment_db::zip_entry_key(zip_path, entry_name)
+            }
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => crate::adjustment_db::zip_entry_key(pdf_path, &format!("page_{page_num}")),

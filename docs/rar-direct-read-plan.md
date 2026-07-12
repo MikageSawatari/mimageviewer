@@ -1,6 +1,6 @@
 # RAR 直読み + 明示 ZIP 変換 + 同名 ZIP 優先表示 設計
 
-ステータス: 未着手（バックログ `docs/next-release-backlog.md` 参照）。
+ステータス: 実装済み（実 RAR の最終スモークのみ実機確認対象）。
 
 関連: [virtual-folders.md](virtual-folders.md)（分岐表・キー規則）/ [async-architecture.md](async-architecture.md)（worker 判定）/
 `src/archive_converter.rs`（`convert_to_zip` / `scan_summary_rar` / `expand_rar` の流用元）。
@@ -74,9 +74,9 @@
   - `open_archive` / `read_entry_from_archive`
 - 新規 `src/rar_loader.rs`: 上記に対応する RAR 版（`open_for_listing` で列挙、`open_for_processing` で目的エントリまで
   skip して read）。土台は `archive_converter` の `scan_summary_rar` / `expand_rar`。
-- **DB キー parity**: ZipImage キーは `zip_path::entry` = `rar_path::entry`。変換 cache 経由のキーも
-  `archive_source_override`（元アーカイブ）で `rar_path::entry` に正規化されるので、**直読みと変換でキーが一致**
-  （回転 / ★ / タグ / 補正がモードに依らず引ける。§10 でテスト）。
+- **DB キー互換性**: ZipImage キーは常に `zip_path::entry`。直読みは `rar_path::entry`、
+  変換 cache 経由はリリース済みデータと同じ `cache.zip::entry` で、両者は意図的に一致させない。
+  parity には既存の回転 / ★ / タグ / 補正等を移す明示 migration が必要なので別判断とする。
 - **静的述語は据え置き**: `is_zip_extension` / `is_virtual_folder` は `.rar` を今まで通り false（= `ConvertibleArchive` 扱い）
   のまま。scan / nav / startup を触らない。直読みか否かは「開く瞬間」に list で決める。
 
@@ -143,7 +143,8 @@
 - 直読みはフラット非ソリッドのみ = materialize / 一時展開 / LRU / 順次不変条件を **一切導入しない**ので低リスク。難ケースは
   枯れた convert に委譲。
 - 主リスクは局在（`zip_loader` dispatch の網羅性、`is_virtual_folder(current_folder)` 漏れ）。303 箇所には散らない。
-- 永続データ: 直読みは新規スキーマを作らない（キーは既存 `rar_path::entry`）。方針 4 設定は新規 bool（後方互換 `default_true`）。
+- 永続データ: 直読みは新規スキーマを作らない（キーは `rar_path::entry`）。既存の変換 cache
+  ページは従来どおり `cache.zip::entry` を保持する。方針 4 設定は新規 bool（後方互換 `default_true`）。
   `archive_cache` は変更しない（従来通り併存）。→ **未リリース機能ではなく、既存の永続ストア（archive_cache / rating / rotation 等）
   との整合を壊さない**方向。
 
@@ -153,7 +154,8 @@
   （`is_solid` と `nested_archive_kind` の分岐）。
 - `rar_loader`: enumerate / first image / `read_entry_bytes` の round-trip（フラット RAR fixture、サブフォルダ RAR fixture）。
   CP932 名の解釈が zip_loader と一致すること。
-- キー parity: 同じ内容を「直読み RAR」と「（同名 `.zip` に変換後の）ZIP」で開いたとき、回転 / ★ / タグのキーが一致すること。
+- キー互換性: 直読み RAR は `rar::entry`、従来の変換 cache は `cache.zip::entry` となり、
+  リリース済み cache キーが元 RAR へ remap されないこと。
 - 方針 4: 同名 `.zip` 存在時に RAR/7z/LZH が一覧から消える / 設定 OFF で両方出る / サブフォルダ展開ビューでも一致。
 - `is_virtual_folder(current_folder)` 系: 直読み RAR 内で BS / 親移動 / 退出ルーティング / `last_folder` 復元が cache 版と同じ挙動。
 
@@ -171,7 +173,7 @@
 1. `rar_loader` + zip_loader dispatch で「**フラット RAR 1 本を直読みで開く**」を end-to-end で通す spike
    （`is_virtual_folder(current_folder)` 対応は最小限）。ここで方式の成立を確認してから広げる。
 2. 判定（`is_solid` / nested）+ routing（直読み / convert 分岐）。
-3. `is_virtual_folder(current_folder)` 系の網羅対応 + キー parity テスト。
+3. `is_virtual_folder(current_folder)` 系の網羅対応 + リリース済みキー互換テスト。
 4. 方針 4 同名 ZIP 優先表示（設定 + dedup + UI）。
 5. 方針 3 変換メニュー（`convert_to_zip` 流用）。
 6. docs 更新（`virtual-folders.md` の分岐表に「RAR 直読み」行と拡張子対応を追記）。

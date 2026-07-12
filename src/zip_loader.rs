@@ -341,6 +341,9 @@ pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageE
 
 /// `enumerate_image_entries` + 付帯情報 (非 ZIP アーカイブの有無)。
 pub fn enumerate_image_entries_detailed(zip_path: &Path) -> std::io::Result<ZipEnumeration> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        return crate::rar_loader::enumerate_image_entries_detailed(zip_path);
+    }
     let file = File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -470,6 +473,9 @@ fn enumerate_recursive<R: Read + Seek>(
 /// `None` を返して早期離脱する (巨大な非画像 ZIP のスキャン中に Ctrl+↑↓
 /// 連打がきたとき DFS をすぐ畳めるようにするため)。
 pub fn first_image_entry(zip_path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        return crate::rar_loader::first_image_entry(zip_path, cancel);
+    }
     let file = File::open(zip_path).ok()?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
     first_image_recursive(&mut archive, zip_path, "", cancel)
@@ -549,6 +555,9 @@ fn first_image_recursive<R: Read + Seek>(
 ///
 /// 戻り値: `Some((entry_name, bytes))` or `None` (画像エントリが無い場合)
 pub fn read_first_image_bytes(zip_path: &Path) -> Option<(String, Vec<u8>)> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        return crate::rar_loader::read_first_image_bytes(zip_path);
+    }
     let file = File::open(zip_path).ok()?;
     let file_size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
     let t0 = std::time::Instant::now();
@@ -641,6 +650,9 @@ fn read_first_image_recursive<R: Read + Seek>(
 /// 保持されるため、同じ内側 ZIP 内のエントリを連続で読む場合は再展開コストが
 /// 発生しない。
 pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Vec<u8>> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        return crate::rar_loader::read_entry_bytes(zip_path, entry_name);
+    }
     let parts = split_nested_zip_path(entry_name);
     if parts.len() == 1 {
         return read_entry_from_disk(zip_path, entry_name);
@@ -820,14 +832,21 @@ fn read_by_exact_name<R: Read + Seek>(
 ///
 /// このハンドルは**外側 ZIP のみ**を保持する。ネストパスを読む場合は
 /// `read_entry_bytes` を使い、関数側でネスト境界を解釈させること。
-pub type ZipArchiveHandle = zip::ZipArchive<BufReader<File>>;
+pub enum ZipArchiveHandle {
+    Zip(zip::ZipArchive<BufReader<File>>),
+    Rar(PathBuf),
+}
 
 /// ZIP を開いて `ZipArchiveHandle` を返す。
 /// ネットワークドライブなど open が高コストな場合、同じハンドルから複数エントリを
 /// 順に読めるようにするためのバッチ処理用入り口。
 pub fn open_archive(zip_path: &Path) -> std::io::Result<ZipArchiveHandle> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        return Ok(ZipArchiveHandle::Rar(zip_path.to_path_buf()));
+    }
     let file = File::open(zip_path)?;
     zip::ZipArchive::new(BufReader::new(file))
+        .map(ZipArchiveHandle::Zip)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
@@ -837,9 +856,13 @@ pub fn read_entry_from_archive(
     archive: &mut ZipArchiveHandle,
     entry_name: &str,
 ) -> std::io::Result<Vec<u8>> {
-    // バッチハンドルはパスを保持しないため index キャッシュなし
-    // (ハンドル保持中は central directory が温まっており走査も安価)。
-    read_by_name(archive, entry_name, None)
+    match archive {
+        ZipArchiveHandle::Zip(archive) => {
+            // ZIP バッチハンドルはパスを保持しないため index キャッシュなし。
+            read_by_name(archive, entry_name, None)
+        }
+        ZipArchiveHandle::Rar(path) => crate::rar_loader::read_entry_bytes(path, entry_name),
+    }
 }
 
 /// ZIP 内エントリ名からサブディレクトリ名 (親ディレクトリ) を取り出す。
