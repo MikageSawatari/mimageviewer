@@ -8,6 +8,26 @@ use std::sync::{
 
 use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS};
 
+/// ZIP/対応アーカイブ、および本扱いの画像のみフォルダを読むときのページ順。
+/// 一覧整理用のソート設定から独立した、Windows に近いファイル名自然順で固定する。
+pub(crate) const BOOK_READING_PAGE_ORDER: crate::settings::SortOrder =
+    crate::settings::SortOrder::FileName;
+
+fn folder_media_sort_order(
+    fallback: crate::settings::SortOrder,
+    is_compiled_book: bool,
+    folders_empty: bool,
+    media_are_images_only: bool,
+    auto_image_folder_book_enabled: bool,
+) -> crate::settings::SortOrder {
+    if !is_compiled_book && folders_empty && media_are_images_only && auto_image_folder_book_enabled
+    {
+        BOOK_READING_PAGE_ORDER
+    } else {
+        fallback
+    }
+}
+
 mod cache_ops;
 mod color_filter;
 mod folder_scan;
@@ -2728,9 +2748,6 @@ pub(crate) struct ZipEnumeratePending {
     pub zip_path: PathBuf,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<crate::zip_loader::ZipEnumeration, String>>,
-    /// 結果受信後のグルーピング/ソートで使う。起動時の `settings.sort_order` をキャプチャ
-    /// (worker 実行中にユーザーが設定を変えても、このロード分は開始時の値で処理する)。
-    pub sort_order: crate::settings::SortOrder,
 }
 
 impl Drop for ZipEnumeratePending {
@@ -13511,19 +13528,28 @@ impl App {
         }
 
         let sort_t0 = std::time::Instant::now();
-        let sort = self.book_sort_order_for_path(&path);
+        let folder_sort = self.book_sort_order_for_path(&path);
+        let media_sort = folder_media_sort_order(
+            folder_sort,
+            is_book_page_folder,
+            folders.is_empty(),
+            all_media
+                .iter()
+                .all(|(_, kind, _, _)| *kind == crate::app::folder_scan::ScanMediaKind::Image),
+            self.settings.auto_fullscreen_image_folders_enabled(),
+        );
         // folders (Folder / ZipFile / PdfFile / ConvertibleArchive) も sort_order に
         // 従って並べる (Explorer / Finder と同じ慣習で 2 段構成は維持)。
-        crate::grid_item::sort_folder_block(&mut folders, &mut folder_metas, sort);
+        crate::grid_item::sort_folder_block(&mut folders, &mut folder_metas, folder_sort);
         let mut keyed_media: Vec<_> = all_media
             .into_iter()
             .map(|entry| {
                 let name = entry.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let key = sort.name_key(name);
+                let key = media_sort.name_key(name);
                 (entry, key)
             })
             .collect();
-        keyed_media.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.2, bk, b.2));
+        keyed_media.sort_by(|(a, ak), (b, bk)| media_sort.compare_name_keys(ak, a.2, bk, b.2));
         all_media = keyed_media.into_iter().map(|(entry, _)| entry).collect();
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -13581,7 +13607,7 @@ impl App {
             &mut items,
             &mut image_metas,
             &self.settings.grid_display_order,
-            Some(sort),
+            Some(media_sort),
         );
         let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
         let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
@@ -13696,7 +13722,7 @@ impl App {
                 passthrough_metas,
                 media,
                 separator,
-                sort,
+                folder_sort,
                 stack_existing,
                 Some(folder_signature),
                 script_enabled,
@@ -16006,7 +16032,7 @@ impl App {
             drop(rx);
             let result = crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
                 .map_err(|e| e.to_string());
-            self.finalize_zip_enumerate(zip_path, self.settings.sort_order, result);
+            self.finalize_zip_enumerate(zip_path, result);
             return;
         }
 
@@ -16014,7 +16040,6 @@ impl App {
             zip_path,
             cancel,
             rx,
-            sort_order: self.settings.sort_order,
         });
     }
 
@@ -16056,9 +16081,8 @@ impl App {
             }
         };
         let zip_path = pending.zip_path.clone();
-        let sort = pending.sort_order;
         self.zip_enumerate_pending = None;
-        self.finalize_zip_enumerate(zip_path, sort, result);
+        self.finalize_zip_enumerate(zip_path, result);
     }
 
     /// enumerate 結果 → group/sort → `start_loading_items`。
@@ -16066,9 +16090,9 @@ impl App {
     fn finalize_zip_enumerate(
         &mut self,
         zip_path: PathBuf,
-        sort: crate::settings::SortOrder,
         result: Result<crate::zip_loader::ZipEnumeration, String>,
     ) {
+        let sort = BOOK_READING_PAGE_ORDER;
         let enumeration = match result {
             Ok(e) => e,
             Err(e) => {
@@ -16302,7 +16326,7 @@ impl App {
     /// サムネは永続ワーカー + 毎フレーム reconcile が Pending を拾って再ロードする。
     /// `zip_nav` 自体は維持される (= ナビ継続)。
     fn zip_nav_show_current_level(&mut self) {
-        let sort = self.settings.sort_order;
+        let sort = BOOK_READING_PAGE_ORDER;
         let display_order = self.settings.grid_display_order.clone();
         let (items, metas, zip_path) = {
             let Some(nav) = self.zip_nav.as_ref() else {
@@ -16580,7 +16604,7 @@ impl App {
         if self.zip_nav.is_none() {
             return false;
         }
-        let sort = self.settings.sort_order;
+        let sort = BOOK_READING_PAGE_ORDER;
         let moved = self
             .zip_nav
             .as_mut()
@@ -16609,7 +16633,7 @@ impl App {
     /// 探索は clone した nav 上で行い items は触らないので、着地確定後
     /// `zip_nav_show_current_level` の前に capture すれば旧ページの holdover を正しく取れる。
     pub(crate) fn zip_nav_dfs_fullscreen(&mut self, fs_idx: usize, forward: bool) -> bool {
-        let sort = self.settings.sort_order;
+        let sort = BOOK_READING_PAGE_ORDER;
         let Some(nav) = self.zip_nav.as_ref() else {
             return false;
         };
@@ -21734,6 +21758,33 @@ impl App {
             return false;
         };
         crate::books::is_direct_book_folder(&self.book_root_path(), folder)
+    }
+
+    /// 現在のビューがページ順を固定する「本」文脈か (= 一覧ソートが効かない)。
+    /// 製本した本 / 読書履歴 / ZIP・PDF・直接閲覧RAR・変換キャッシュを開いている /
+    /// 画像のみフォルダを本扱いしている場合に true。
+    pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
+        if self.current_folder_is_book_folder() || self.items_are_reading_history_view {
+            return true;
+        }
+
+        let Some(current_folder) = self.current_folder.as_deref() else {
+            return false;
+        };
+        if crate::folder_tree::is_open_as_container(current_folder) {
+            return true;
+        }
+
+        self.settings.auto_fullscreen_image_folders_enabled()
+            && !self.items_are_rating_view
+            && !self.items_are_global_search_view
+            && !self.items_are_tag_view
+            && !self.items_are_subfolder_expansion_view
+            && !self.items.is_empty()
+            && self
+                .items
+                .iter()
+                .all(|item| matches!(item, GridItem::Image(_)))
     }
 
     pub(crate) fn book_address_label_for_path(&self, path: &Path) -> Option<String> {

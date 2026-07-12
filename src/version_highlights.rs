@@ -274,6 +274,15 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "2.4.0",
+        must_read: &[HighlightItem {
+            title: "本のページはファイル名順で進みます",
+            body: "ZIP や対応アーカイブ、画像だけのフォルダを本として読むときは、\
+                   一覧の並べ替え設定にかかわらずファイル名順でページが進みます。",
+        }],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -455,6 +464,20 @@ mod tests {
         );
         // 通知は 2 件 (音楽 / 複数ウィンドウ) に絞る方針。
         assert_eq!(entry.highlights.len(), 2);
+    }
+
+    #[test]
+    fn embedded_table_contains_v2_4_0_book_page_order_notice() {
+        let entries = for_version("2.4.0", table());
+        assert_eq!(versions(&entries), ["2.4.0"]);
+        let entry = entries[0];
+        assert!(
+            entry
+                .must_read
+                .iter()
+                .any(|item| item.title == "本のページはファイル名順で進みます"),
+            "§1.14 の告知は v2.4.0 の must_read に入れる"
+        );
     }
 
     #[test]

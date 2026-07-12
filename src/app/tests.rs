@@ -8026,6 +8026,273 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn book_page_order_is_filename_while_normal_folder_keeps_list_sort() {
+        use crate::grid_item::GridItem;
+        use crate::settings::{Settings, SortOrder};
+
+        let mut settings = Settings::default();
+        settings.sort_order = SortOrder::DateDesc;
+        let display_order = settings.grid_display_order.clone();
+        let names_and_mtimes = [
+            ("10.jpg", 100),
+            ("2.jpg", 400),
+            ("1.jpg", 300),
+            ("p03.png", 200),
+        ];
+
+        let mut archive_pages: Vec<GridItem> = names_and_mtimes
+            .iter()
+            .map(|(name, _)| GridItem::ZipImage {
+                zip_path: PathBuf::from("book.zip"),
+                entry_name: (*name).to_string(),
+            })
+            .collect();
+        let mut archive_metas: Vec<Option<(i64, i64)>> = names_and_mtimes
+            .iter()
+            .map(|(_, mtime)| Some((*mtime, 0)))
+            .collect();
+        crate::grid_item::arrange_grid_items(
+            &mut archive_pages,
+            &mut archive_metas,
+            &display_order,
+            Some(BOOK_READING_PAGE_ORDER),
+        );
+        let archive_names: Vec<&str> = archive_pages
+            .iter()
+            .map(|item| match item {
+                GridItem::ZipImage { entry_name, .. } => entry_name.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(archive_names, ["1.jpg", "2.jpg", "10.jpg", "p03.png"]);
+
+        let mut normal_pages: Vec<GridItem> = names_and_mtimes
+            .iter()
+            .map(|(name, _)| GridItem::Image(PathBuf::from(name)))
+            .collect();
+        let mut normal_metas: Vec<Option<(i64, i64)>> = names_and_mtimes
+            .iter()
+            .map(|(_, mtime)| Some((*mtime, 0)))
+            .collect();
+        crate::grid_item::arrange_grid_items(
+            &mut normal_pages,
+            &mut normal_metas,
+            &display_order,
+            Some(settings.sort_order),
+        );
+        let normal_names: Vec<&str> = normal_pages
+            .iter()
+            .map(|item| match item {
+                GridItem::Image(path) => path.file_name().unwrap().to_str().unwrap(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(normal_names, ["2.jpg", "1.jpg", "p03.png", "10.jpg"]);
+    }
+
+    #[test]
+    fn image_only_folder_book_order_respects_effective_mode_and_compiled_books() {
+        use crate::settings::SortOrder;
+
+        assert_eq!(
+            folder_media_sort_order(SortOrder::DateDesc, false, true, true, true),
+            SortOrder::FileName,
+            "image-only folders use book reading order when book mode is enabled"
+        );
+        assert_eq!(
+            folder_media_sort_order(SortOrder::DateDesc, false, true, true, false),
+            SortOrder::DateDesc,
+            "disabling image-folder book mode keeps the list sort"
+        );
+        assert_eq!(
+            folder_media_sort_order(SortOrder::DateDesc, false, false, true, true),
+            SortOrder::DateDesc,
+            "a subfolder block makes this a normal folder browse"
+        );
+        assert_eq!(
+            folder_media_sort_order(SortOrder::DateDesc, false, true, false, true),
+            SortOrder::DateDesc,
+            "video or audio content makes this a normal folder browse"
+        );
+        assert_eq!(
+            folder_media_sort_order(SortOrder::Numeric, true, true, true, true),
+            SortOrder::Numeric,
+            "compiled books retain their dedicated Numeric order"
+        );
+    }
+
+    /// 本番の ZIP materialize 経路 (`zip_nav_show_current_level`) を、一覧ソート =
+    /// DateDesc の状態で駆動し、ページが実際にファイル名順で並ぶことを検証する。
+    /// mtime を名前順とわざと矛盾させる (10.jpg が最新) ので、production の sort が
+    /// `settings.sort_order` に戻ると [10, 2, 1] になって落ちる = 回帰検知になる
+    /// (Codex レビュー §1.14 の「arrange 手渡しテストは本番配線を検証しない」指摘への対応)。
+    #[test]
+    fn zip_page_materialize_uses_filename_order_despite_date_desc_list_sort() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SortOrder;
+
+        let mut app = setup_app();
+        app.settings.sort_order = SortOrder::DateDesc;
+        let zip_path = std::path::PathBuf::from(r"C:\test\book.zip");
+        app.current_folder = Some(zip_path.clone());
+        // FileName 順 [1, 2, 10] と DateDesc 順 [10, 2, 1] が食い違うよう mtime を設定。
+        let entries = vec![
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "10.jpg".to_string(),
+                uncompressed_size: 0,
+                mtime: 300,
+            },
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "2.jpg".to_string(),
+                uncompressed_size: 0,
+                mtime: 200,
+            },
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "1.jpg".to_string(),
+                uncompressed_size: 0,
+                mtime: 100,
+            },
+        ];
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
+        app.zip_nav_show_current_level();
+
+        let names: Vec<&str> = app
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::ZipImage { entry_name, .. } => Some(entry_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["1.jpg", "2.jpg", "10.jpg"],
+            "本のページは一覧ソート (DateDesc) にかかわらずファイル名順で並ぶ"
+        );
+    }
+
+    fn enable_auto_image_folder_book(app: &mut App) {
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+    }
+
+    #[test]
+    fn page_order_lock_detects_open_zip_container() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\book.zip");
+        app.current_folder = Some(zip_path);
+        app.zip_nav = Some(test_zip_nav(&["p001.jpg", "p002.jpg"]));
+
+        assert!(app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_detects_open_pdf_container() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\test\book.pdf"));
+
+        assert!(app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_detects_image_only_folder_when_book_mode_is_on() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        app.current_folder = Some(app.tmp.path().join("images"));
+        push_image(&mut app, r"C:\test\images\p001.jpg");
+        push_image(&mut app, r"C:\test\images\p002.png");
+
+        assert!(app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_leaves_image_folder_unlocked_when_suboption_is_off() {
+        let mut app = setup_app();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.current_folder = Some(app.tmp.path().join("images"));
+        push_image(&mut app, r"C:\test\images\p001.jpg");
+
+        assert!(!app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_leaves_mixed_folder_unlocked() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        app.current_folder = Some(app.tmp.path().join("mixed"));
+        push_image(&mut app, r"C:\test\mixed\p001.jpg");
+        app.items
+            .push(GridItem::Folder(PathBuf::from(r"C:\test\mixed\chapter")));
+
+        assert!(!app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_leaves_rating_view_unlocked() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        app.current_folder = Some(app.tmp.path().join("rating-view"));
+        app.items_are_rating_view = true;
+        push_image(&mut app, r"C:\test\rating\p001.jpg");
+
+        assert!(!app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_detects_compiled_book_folder() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books");
+        app.settings.book_root = Some(root.clone());
+        app.current_folder = Some(root.join("sample"));
+
+        assert!(app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_leaves_plain_image_folder_unlocked() {
+        let mut app = setup_app();
+        app.current_folder = Some(app.tmp.path().join("plain-images"));
+        push_image(&mut app, r"C:\test\plain-images\p001.jpg");
+
+        assert!(!app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_leaves_synthetic_image_views_unlocked() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        app.current_folder = Some(app.tmp.path().join("synthetic"));
+        push_image(&mut app, r"C:\test\synthetic\p001.jpg");
+
+        app.items_are_global_search_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_global_search_view = false;
+
+        app.items_are_tag_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+        app.items_are_tag_view = false;
+
+        app.items_are_subfolder_expansion_view = true;
+        assert!(!app.page_order_locked_for_current_view());
+    }
+
+    #[test]
+    fn page_order_lock_leaves_filename_stack_view_unlocked() {
+        let mut app = setup_app();
+        enable_auto_image_folder_book(&mut app);
+        app.current_folder = Some(app.tmp.path().join("stacks"));
+        app.items.push(GridItem::Stack {
+            key: "page".to_string(),
+            representative: PathBuf::from(r"C:\test\stacks\page001.jpg"),
+            count: 2,
+        });
+
+        assert!(!app.page_order_locked_for_current_view());
+    }
+
+    #[test]
     fn compiled_book_folder_ignores_non_images_and_keeps_numeric_order() {
         use crate::grid_item::GridItem;
 

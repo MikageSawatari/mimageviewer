@@ -35,6 +35,12 @@ ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは�
 `grid_item::arrange_grid_items` を通常フォルダ、ZIP materialize、ファイル名スタック、
 レーティング一覧、サブフォルダ展開から共有する。全文検索の flat result は対象外。
 
+ただし、本として読むページ列は一覧整理用の `sort_order` から独立する。ZIP / CBZ / 直接閲覧
+RAR / CBR / 変換キャッシュ ZIP のページと ZIP 内階層は、常にファイル名順
+(`SortOrder::FileName`、Windows に近い自然順) で materialize する。画像のみの通常フォルダも
+「画像のみのフォルダを本として扱う」が実効 ON のときは同じ順序を使う。通常フォルダ browse、
+製本した本 (`Numeric`)、PDF の enumerate 順は従来どおりである。
+
 ### 製本への追加 (v1.7.0)
 
 メニュー「製本 > 追加先の本に追加」、ツールバーの本棚「追加」、追加ショートカットは、

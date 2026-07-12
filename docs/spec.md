@@ -55,9 +55,10 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   しない。
   上部の本一覧から別の本を選び、選択ページをコピー/移動できる。閉じる時は未保存の並び替えを
   連番ファイル名へ反映し、編集破棄ボタンは置かない。
-- 本フォルダ閲覧中はページ順を番号順に固定するため、メニュー/ツールバー/詳細ヘッダの
-  ソート操作は無効化される。手動で混入した ZIP/PDF/フォルダ/動画など、画像以外の項目は
-  本ページとして表示しない。
+- 製本した本、ZIP / PDF / 直接閲覧 RAR / 変換キャッシュ、画像のみフォルダの本表示、
+  読書履歴ではページ順を各文脈の規定順に固定するため、メニュー / ツールバー / 詳細ヘッダの
+  ソート操作は無効化し、ホバーで一覧の並べ替えが使えない理由を表示する。製本した本に手動で
+  混入した ZIP / PDF / フォルダ / 動画など、画像以外の項目は本ページとして表示しない。
 - 本ページは追加時に焼き込んだ画像ファイルを正本にするが、タグ/★/補正/消しゴム/
   補正レイヤー/隠蔽加工/テキスト注釈/切り取りは mIV 内部 DB の後段編集として許可する。
   本ページはグローバル補正やお気に入り標準を継承せず、個別設定だけを焼き込み済み画像の上へ
@@ -1144,7 +1145,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `thumb_tooltip_show_full_location` | bool | false | 選択情報に場所をフルパスで表示するか。スマートフィルタの場所表示と同じラベルを使う |
 | `thumb_tooltip_show_reading_history_last_read` | bool | true | 読書履歴ビューの選択情報に最終閲覧日時を表示するか |
 | `thumb_tooltip_show_reading_history_progress` | bool | true | 読書履歴ビューの選択情報に既読位置を表示するか |
-| `sort_order` | SortOrder | FileName | 通常フォルダのソート順（FileName / Numeric / DateAsc / DateDesc）。UI 上の `Numeric` は `番号順（区切り無視）` と表示する。本フォルダ閲覧中は UI を無効化し、設定値に関わらず番号順固定 |
+| `sort_order` | SortOrder | FileName | 通常フォルダのソート順（FileName / Numeric / DateAsc / DateDesc）。UI 上の `Numeric` は `番号順（区切り無視）` と表示する。本として表示中や読書履歴では UI を無効化し、文脈ごとのページ順に固定 |
 | `stack_separator` | char | `_` | ファイル名スタックの **フォールバック用** 区切り文字。グループ分けは常にスクリプト (ワーカー) で行うが、スクリプトがコンパイル/実行に失敗したときだけ、この区切り文字で「末尾区切りの前」で畳む組み込みルールへフォールバックする (例 `_`: `12345678_p0.jpg` → `12345678`)。スタックモードの ON/OFF 自体は transient で永続化しない。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | `stack_script_enabled` | bool | false | ファイル名スタックの分類にユーザー定義スクリプトを使うか。**false でも内蔵既定スクリプト (mXD/末尾連番/先頭連番/連写のカスケード) で分類する** (常にワーカー実行)。true のときユーザーの `<data_dir>/stack_rules.rhai` (無ければ内蔵既定) を使う。どちらも失敗時は `stack_separator` の組み込みルールへフォールバック。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | `show_address_bar_stack_toggle` | bool | true | フォルダバーに「スタック」表示トグルボタンを出すか。フォルダバー左端「フォルダ:」の右クリックメニューで切替 |

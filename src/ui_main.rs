@@ -2234,8 +2234,7 @@ impl App {
         let mut fav_nav: Option<PathBuf> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
-        let book_sort_locked =
-            self.current_folder_is_book_folder() || self.items_are_reading_history_view;
+        let book_sort_locked = self.page_order_locked_for_current_view();
         let rating_counts = self.rating_counts();
         let selected_video_path =
             self.selected
@@ -2887,8 +2886,12 @@ impl App {
                                     }
                                 });
                                 if book_sort_locked {
-                                    ui.add_enabled(false, egui::Button::new("ソート順: 番号順固定"))
-                                        .on_hover_text("本棚内または読書履歴では表示順が固定されます。");
+                                    // 無効ウィジェットは通常の hover を sense しないため、
+                                    // disabled 専用ツールチップで理由を出す。
+                                    ui.add_enabled(false, egui::Button::new("ソート順: 固定"))
+                                        .on_disabled_hover_text(
+                                            "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                                        );
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
                                         for &order in crate::settings::SortOrder::all() {
@@ -4540,8 +4543,7 @@ impl App {
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
-        let book_sort_locked =
-            self.current_folder_is_book_folder() || self.items_are_reading_history_view;
+        let book_sort_locked = self.page_order_locked_for_current_view();
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
         }
@@ -5051,7 +5053,9 @@ impl App {
                     let sort_disabled = details_sort_disabled || book_sort_locked;
                     let sort_label = toolbar_label(ui, "ソート:", 54.0, drag_enabled);
                     let sort_label = if book_sort_locked {
-                        sort_label.hover_tip("本棚内または読書履歴では表示順が固定されます。")
+                        sort_label.hover_tip(
+                            "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                        )
                     } else if details_sort_disabled {
                         sort_label.hover_tip(
                             "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
@@ -5076,19 +5080,26 @@ impl App {
                             // 次行へ自然に流す。
                             for &order in &tb_sorts {
                                 let selected = if book_sort_locked {
-                                    order == crate::settings::SortOrder::Numeric
+                                    false
                                 } else if self.items_are_rating_view {
                                     self.rating_view_sort
                                         == crate::rating_view::RatingViewSort::Normal(order)
                                 } else {
                                     self.settings.sort_order == order
                                 };
-                                let resp = ui
-                                    .add_enabled(
-                                        !sort_disabled,
-                                        egui::Button::selectable(selected, order.short_label()),
+                                let resp = ui.add_enabled(
+                                    !sort_disabled,
+                                    egui::Button::selectable(selected, order.short_label()),
+                                );
+                                // 固定中はボタンが無効なので、通常 hover ではなく disabled
+                                // 専用ツールチップで固定理由を出す。
+                                let resp = if book_sort_locked {
+                                    resp.hover_tip_disabled(
+                                        "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
                                     )
-                                    .on_hover_text(order.description());
+                                } else {
+                                    resp.on_hover_text(order.description())
+                                };
                                 if resp.clicked() && !selected {
                                     self.settings.sort_order = order;
                                     self.settings.save();
@@ -5120,7 +5131,7 @@ impl App {
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
                             ui.add_enabled_ui(!sort_disabled, |ui| {
                                 let current_text = if book_sort_locked {
-                                    "番号固定".to_string()
+                                    "固定".to_string()
                                 } else if self.items_are_rating_view {
                                     self.rating_view_sort.short_label().to_string()
                                 } else {
@@ -5172,8 +5183,16 @@ impl App {
                                             }
                                         }
                                     });
+                                // 固定中はコンボが無効なので、disabled 専用ツールチップで
+                                // 「固定」表示のホバー時に固定理由を出す。
+                                let combo_id = combo.response.id;
+                                if book_sort_locked {
+                                    combo.response.hover_tip_disabled(
+                                        "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                                    );
+                                }
                                 toolbar_combo_popup_open |=
-                                    egui::ComboBox::is_open(ctx, combo.response.id);
+                                    egui::ComboBox::is_open(ctx, combo_id);
                             });
                         }
                     }
@@ -10144,8 +10163,7 @@ impl App {
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
-        let book_sort_locked =
-            self.current_folder_is_book_folder() || self.items_are_reading_history_view;
+        let book_sort_locked = self.page_order_locked_for_current_view();
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
@@ -10175,8 +10193,7 @@ impl App {
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
         let hover_bg = ui.visuals().widgets.hovered.bg_fill;
-        let book_sort_locked =
-            self.current_folder_is_book_folder() || self.items_are_reading_history_view;
+        let book_sort_locked = self.page_order_locked_for_current_view();
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
@@ -10336,7 +10353,9 @@ impl App {
             let response = if sort_enabled {
                 response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
             } else if book_sort_locked && sort_key.is_some() {
-                response.hover_tip("本棚内または読書履歴では表示順が固定されます")
+                response.hover_tip(
+                    "本として表示中や読書履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                )
             } else if sort_key.is_none() {
                 response.hover_tip("サムネイルプレビュー")
             } else {
