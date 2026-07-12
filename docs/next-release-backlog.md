@@ -374,6 +374,41 @@ presence set・resume キー書換。対象ストア・許容制限の正本は�
 - 優先度: P3。操作感改善。実装時は `docs/display-pipeline.md`、
   `docs/detached-viewer-implementation-plan.md`、動画へ広げる場合は `docs/video-architecture.md` を読む。
 
+### 1.16 読書履歴などの合成ビューで ←/→ ボタンを押すと `__reading_history__` へ移動して空表示になる
+
+- 背景: 読書履歴を表示した状態でアドレスバーのフォルダ ← / → ボタンを押すと、
+  `C:\Users\<user>\AppData\Roaming\mimageviewer\__reading_history__` に移動し、
+  「表示するファイルがありません」になる (2026-07-12 ユーザー報告)。
+- 現状 (調査済み):
+  - 読書履歴ビューは `current_folder` に合成パス
+    `%APPDATA%/mimageviewer/__reading_history__` (`reading_history_synthetic_path()`,
+    `src/app.rs:4754`。実在させない・カタログキー専用) をセットする。
+  - フォルダ移動履歴の戻る/進む (`navigate_folder_history_back` `src/app.rs:12452` /
+    `navigate_folder_history_forward` `src/app.rs:12611`) は `folder_nav_back_stack` /
+    `folder_nav_forward_stack` から pop したパスを**そのまま実フォルダとしてロード**する。
+    履歴スタックに合成ビューのパスが積まれていると、←/→ でそこへ移動して実ディレクトリ
+    として走査 → 空 → 「表示するファイルがありません」。
+  - 判定ヘルパー `is_synthetic_view_path(path)` (`src/app.rs:4775`、search_results /
+    reading_history / rating_view / subfolder_expansion の合成パスを判定) は既にあるが、
+    ←/→ の nav 経路がこれを通していない。レーティング一覧 / Ctrl+G 検索結果 /
+    サブフォルダ展開ビューでも同じ構造なら同様に再現する可能性が高い (実装時に確認)。
+- 方針 (実装時に 2 案から選ぶ):
+  - 案 A: **合成ビューのパスを nav 履歴スタックに積まない** (`push_folder_nav_stack` /
+    現在地を forward へ退避する箇所で `is_synthetic_view_path` を弾く)。←/→ は実フォルダ
+    履歴だけを辿る。実装は小さいが、「←で読書履歴ビューへ戻る」はできなくなる。
+  - 案 B: **←/→ の pop 先が合成ビューパスなら、実フォルダとしてロードせず対応ビューを
+    再構築する** (reading_history / rating / search / subfolder_expansion をパスから判別して
+    再表示)。挙動は自然だが、各ビューの再入エントリを nav 経路から呼べるようにする必要がある。
+  - どちらでも、少なくとも「合成パスを実ディレクトリとしてロードして空表示になる」状態は
+    起こさないこと。既存の BS (親へ) / `reading_history_back_nav` の扱いと矛盾しないか確認する。
+- 確認:
+  - 読書履歴 / レーティング一覧 / Ctrl+G 検索結果 / サブフォルダ展開ビューを表示した状態で
+    ←/→ を押しても `__reading_history__` 等の合成パスに落ちて空表示にならない。
+  - 通常フォルダ間の ←/→ 履歴移動は従来どおり動く (回帰なし)。
+- 優先度: P3 (バグだが実害は限定的・データ破壊なし)。着手時は `src/app.rs` の
+  nav 履歴 (`folder_nav_back_stack` / `folder_nav_forward_stack`) と合成ビュー
+  (`is_synthetic_view_path` / `items_are_reading_history_view` 等) の関係を読む。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断
