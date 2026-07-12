@@ -2115,7 +2115,7 @@ pub(super) fn native_ring_guide_overlay_rect(
     let center = guide.center_client_px.map_or_else(
         || egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
         |pos| {
-            let ppp = pixels_per_point.max(1.0);
+            let ppp = pixels_per_point;
             egui::pos2(pos.x / ppp, pos.y / ppp)
         },
     );

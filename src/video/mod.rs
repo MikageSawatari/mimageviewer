@@ -318,6 +318,8 @@ pub struct NativeVideoOutputConfig {
     pub vst3_available: bool,
     pub checked: bool,
     pub cursor_hide_delay_secs: f32,
+    /// main egui Context の zoom_factor を native overlay にミラーする倍率。
+    pub ui_scale: f32,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -1923,6 +1925,7 @@ fn run_native_video_output(
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
+            ui_scale: config.ui_scale,
             hud_event_tx,
         },
     ) {
@@ -1976,6 +1979,7 @@ fn run_native_video_output(
     let mut cur_owner_hwnd = config.owner_hwnd;
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
+    let cur_ui_scale = crate::settings::normalize_ui_scale_factor(config.ui_scale);
     let mut cur_hud_dimmed = false;
     let mut cur_sar: Option<(u32, u32)> = None;
     // **review #12 対応**: SwitchPlacement で presenter を作り直したとき再適用が
@@ -2843,6 +2847,7 @@ fn run_native_video_output(
                                                 true,
                                             ),
                                             cursor_hide_delay_secs: config.cursor_hide_delay_secs,
+                                            ui_scale: cur_ui_scale,
                                             hud_event_tx: new_hud_event_tx,
                                         },
                                     );
@@ -3176,7 +3181,7 @@ fn run_native_video_output(
                     suggested_rect,
                 } => {
                     // CP8: HUD HWND の `WM_DPICHANGED` を受けて以下を実行:
-                    //   1. overlay の pixels_per_point を `dpi / 96.0` で更新
+                    //   1. overlay の pixels_per_point を `(dpi / 96.0) * ui_scale` で更新
                     //   2. HUD HWND を `suggested_rect` で移動・リサイズ
                     //   3. **overlay surface のみ** を新サイズで resize (= `resize_overlay_surface_only`)。
                     //      presenter 全体 (background / video transform / swap chain) はここでは触らない

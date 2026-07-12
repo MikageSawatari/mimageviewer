@@ -1047,6 +1047,11 @@ fn main() -> eframe::Result {
             let resolved = os_theme::resolve(saved.ui_theme);
             os_theme::apply_resolved(&cc.egui_ctx, resolved);
             emit_startup("apply_theme", Some(t));
+            // UI 表示倍率も初回フレーム前に復元する。キーボードズームは settings と
+            // presenter の倍率同期を迂回するため、初回リリースでは無効化する。
+            cc.egui_ctx
+                .options_mut(|options| options.zoom_with_keyboard = false);
+            crate::settings::apply_ui_scale_factor(&cc.egui_ctx, saved.ui_scale_factor);
             let t = Instant::now();
             // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。

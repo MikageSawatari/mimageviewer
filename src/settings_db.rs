@@ -2737,6 +2737,7 @@ mod tests {
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;
+        s.ui_scale_factor = 1.5;
         s.thumb_quality = 88;
         s.last_folder = Some(PathBuf::from(r"C:\Users\test\Pictures"));
         s.favorites = vec![
@@ -2856,6 +2857,7 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+        assert_eq!(loaded.ui_scale_factor, 1.5);
     }
 
     #[test]

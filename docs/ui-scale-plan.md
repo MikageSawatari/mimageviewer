@@ -100,6 +100,8 @@ UI スケールの実効値を **メイン egui Context の `zoom_factor` に一
 - **エントリポイントはメニューバーの「設定」→「スケーリング」サブメニュー**。50%〜200% を
   10% 刻みで並べ、現在値にチェックマークを付ける (ラジオ的な選択)。
 - 選択時に `ctx.set_zoom_factor(v)` を即時適用 + `settings.ui_scale_factor = v` を保存。
+  active な fullscreen / detached / native video viewer がある場合は、ビューワモード設定変更と
+  同じ close 経路で閉じる。再 open 時に新倍率で presenter / viewport content を構築する。
 - 現在値は `settings.ui_scale_factor` を正とする (キーボードズームは §下記で無効化するため、
   値が外部から動くことはない)。
 - (任意) 環境設定ダイアログの表示ページにも同じ選択肢を置くかは実装時判断。まずはメニュー優先。
@@ -144,16 +146,17 @@ UI スケールの実効値を **メイン egui Context の `zoom_factor` に一
     渡す経路 (mod.rs:5183) と二重に絡むので特に注意。
   - **`(self.width/ppp).max(1.0)` 等、"結果" 側の `max(1.0)`(最小 1pt ガード)は残す**(ppp の床とは別物)。
 
-### 3.2 App → presenter へのスケール伝搬
+### 3.2 App → presenter の倍率適用と実行中変更
 
 - presenter は別スレッド。生成時に現在の `ctx.zoom_factor()` を渡す(コンストラクタ引数)。
-- 実行中に settings/keyboard でスケールが変わったら、App から presenter へ `set_ui_scale` 相当の
-  メッセージを送る(既存の presenter 制御チャネルに 1 バリアント追加)。
+- 実行中の live propagation は行わない。倍率変更時は active viewer を既存 close 経路で閉じ、
+  再 open 時に正しい倍率を渡す。mounted active detached bundle / source-swap pending など複数所有先への
+  伝搬漏れを避ける低リスク方針とし、短い再生中断を仕様として許容する。
 - **detached viewer (F12) は専用の別経路は不要 (Codex P2 反映)**。F12 は placement を
   `DetachedViewerChild` に切替 (app.rs:24294) し、`SwitchPlacement` が presenter を作り直す
   (video/mod.rs:2540)。既存状態は `cur_*` として新 presenter に再適用される (video/mod.rs:2567)。
-  → **`NativeVideoOutput` 側に `cur_ui_scale` を保持し、presenter を (再)生成するたびに再適用**すれば、
-    main fullscreen と detached の両方が同じ経路でカバーされる。detached 専用ルートは作らない。
+  → session 内の placement 切替では生成時の `ui_scale` を `cur_ui_scale` として保持し、presenter を
+    再生成するたびに再適用する。settings から倍率を変えた session 自体は上記 close 経路で終了する。
 
 ### 3.3 直接 `GetDpiForWindow` を読む App 側ヘルパーの辻褄合わせ
 
@@ -180,8 +183,10 @@ overlay を scale する以上、presenter の ppp を経由せず OS DPI を直
 - VST3 音声処理 (normalize / LUFS / bridge IPC): 座標無関係。
 - スクリーンショット/キャプチャ: `ColorImage` 物理サイズ、zoom 非依存。
 - UI スナップショットテスト: 固定 ppp。
-- detached viewer 窓配置判定 (app.rs:23650 系の 800x600 定数): egui points×ppp が物理 px に自己
-  整合するため zoom で崩れない(ただし §3.2 の detached presenter scale 伝搬は別途必要)。
+- viewport の物理 geometry は UI 表示倍率から独立させる。保存 placement / monitor rect は OS DPI only
+  の論理 geometry を正本とし、`ViewportBuilder` / `ViewportCommand` へ渡す直前に `ui_scale` で割る。
+  egui から placement を保存するときは逆に `ui_scale` を掛けて正本へ戻す。native DPI は eframe / winit
+  の logical→physical 変換に残すため、高 DPI / 複数 monitor を壊さない。
 
 ## 5. リスクと検証計画
 
@@ -190,7 +195,7 @@ overlay を scale する以上、presenter の ppp を経由せず OS DPI を直
 | メイン窓スケール (Phase 1) | 低 (egui 自己整合) | 数段階 (100/150/200%) でダイアログ・タグ設定・グリッドが崩れず、小窓+高スケールで固定高パネル(消しゴム等)が見切れないか目視 |
 | overlay スケール (Phase 2) | 低〜中 (単一 ppp 源だが presenter は別スレッド) | 動画 fullscreen で HUD/チャプター/ブックマーク/タグ picker が拡大し、**クリック位置が合う**か。tile grid が正しく敷き詰まるか |
 | VST overlap (§3.3) | 中 (scale HUD × 非scale VST 窓) | **実プラグイン 1 本**で、スケール変更時に VST 窓が HUD に不正に重なる/飛ぶことがないか目視 (time-box 可) |
-| detached viewer presenter | 中 (伝搬漏れ) | F12 detached で動画再生し overlay がスケールするか |
+| detached viewer presenter | 中 (再生成時の初期値) | 倍率変更で active detached が閉じ、F12 で開き直した動画 overlay が新倍率になるか |
 | サムネ解像度 | 低 (クランプ済) | 高スケールでメモリ増が過大でないか (2048 上限確認) |
 
 - **多モニタ DPI 全網羅の再検証は不要**(overlay スケールは DPI 変更パス流用)。VST overlap のみ
@@ -222,7 +227,7 @@ overlay を scale する以上、presenter の ppp を経由せず OS DPI を直
   (アプリ内スケールは反映されません)」と注記。バージョンタグは書かない。
 - `htdocs/mimageviewer/index.html`: 機能一覧に「UI 表示倍率の設定」。
 - `docs/video-architecture.md` / `docs/display-pipeline.md`: presenter の ppp に UI スケールを
-  乗せる旨、`ui_scale` の伝搬経路を追記。
+  乗せる旨、生成時の `ui_scale` 適用と変更時 close 経路を追記。
 - `docs/spec.md`: 設定項目 `ui_scale_factor` を追加。
 - キーボードズームを無効化する場合 (案 ii) は、その旨と理由を `docs/keymap-spec.md` に
   「固定扱い/対象外」として残す。
@@ -231,8 +236,8 @@ overlay を scale する以上、presenter の ppp を経由せず OS DPI を直
 
 1. Phase 1 (settings `ui_scale_factor` + 起動時 set_zoom_factor + メニュー「設定>スケーリング」
    50-200% 10%刻み + 両 Context の keyboard zoom 無効化) — 単体で価値があり低リスク。
-2. Phase 2 §3.1〜3.2 (presenter ppp 注入 + `max(1.0)` 4 箇所を生 ppp 化 + App→presenter 伝搬 +
-   detached の `cur_ui_scale` 再適用)。
+2. Phase 2 §3.1〜3.2 (presenter ppp 注入 + `max(1.0)` 4 箇所を生 ppp 化 + 変更時 viewer close +
+   session 内 placement 再生成時の `cur_ui_scale` 再適用)。
 3. Phase 2 §3.3 (VST overlap / tile size 辻褄) — 最注意。
 4. ドキュメント更新。
 5. 検証 (§5 + §5.1 の 50% チェックリスト) → Codex レビュー → リリース手順。
@@ -244,8 +249,8 @@ overlay を scale する以上、presenter の ppp を経由せず OS DPI を直
 2. **OS DPI 直読みの見落とし**: §3.3 の 2 箇所 (native_video.rs:1407 / 4533) に加え、**WM_DPICHANGED
    の presenter 更新 (video/mod.rs:2859) と初期 DPI (mod.rs:7858)** も注入点 (§3.1 に反映済み)。
    App 側リストはこれで概ね完全との評価。
-3. **detached viewer**: 別経路不要。`NativeVideoOutput` に `cur_ui_scale` を持ち、presenter 再生成時に
-   再適用 (§3.2 に反映済み)。
+3. **detached viewer**: 別の live propagation は作らない。倍率変更時は既存 viewer close 経路を使い、
+   session 内の placement 再生成だけ `cur_ui_scale` を再適用する (§3.2 に反映済み)。
 4. **VST overlap**: HUD 領域は `os_ppp × ui_scale` で px 化、VST 窓矩形は screen px のまま比較。
    VST タイトルバー/Windows chrome は OS DPI 寸法として扱う。**HUD ppp に `max(1.0)` を入れない**
    (§3.3 の方針どおり)。
@@ -259,7 +264,7 @@ overlay を scale する以上、presenter の ppp を経由せず OS DPI を直
   `max(1.0)` 4 箇所 (§3.1) を生 ppp に直して 50% でも整合させる。**残リスクは小要素の ±1〜2px
   見た目ズレのみ**でクリック位置は合う、という前提で許容。ppp≥1.0 では no-op のため既存挙動は不変。
 - **P2 (反映済み)**: キーボードズームは両 Context で無効化 / WM_DPICHANGED (video/mod.rs:2859) も
-  注入点 / detached は `cur_ui_scale` 再適用。
+  注入点 / 倍率変更時は viewer close / session 内 detached 再生成は `cur_ui_scale` 再適用。
 - **P3**: VST3 は egui scale から独立との主張は妥当 (別 HWND・OS API、`vst3_available` は fullscreen
   borderless 限定 app.rs:44574)。VST 除外方針で問題なし。
 

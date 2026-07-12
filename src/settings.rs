@@ -5,6 +5,63 @@ use uuid::Uuid;
 
 pub const MAX_FAVORITES: usize = 100;
 
+pub const UI_SCALE_FACTOR_MIN: f32 = 0.5;
+pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
+pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
+pub const UI_SCALE_FACTOR_STEP_COUNT: usize = 16;
+
+fn default_ui_scale_factor() -> f32 {
+    1.0
+}
+
+/// UI 表示倍率を設定 UI と同じ 50%..=200% / 10% 刻みに正規化する。
+/// 非有限値は既定の 100% に戻す。
+pub fn normalize_ui_scale_factor(value: f32) -> f32 {
+    if !value.is_finite() {
+        return default_ui_scale_factor();
+    }
+    let clamped = value.clamp(UI_SCALE_FACTOR_MIN, UI_SCALE_FACTOR_MAX);
+    let step = ((clamped - UI_SCALE_FACTOR_MIN) / UI_SCALE_FACTOR_STEP).round();
+    UI_SCALE_FACTOR_MIN + step * UI_SCALE_FACTOR_STEP
+}
+
+/// メイン egui Context に正規化済みの UI 表示倍率を適用し、実際の値を返す。
+pub fn apply_ui_scale_factor(ctx: &egui::Context, value: f32) -> f32 {
+    let normalized = normalize_ui_scale_factor(value);
+    ctx.set_zoom_factor(normalized);
+    normalized
+}
+
+/// OS DPI only の論理 window geometry を、egui viewport API に渡す points へ変換する。
+///
+/// eframe は viewport の size / position に main Context の `zoom_factor` を掛けてから
+/// winit へ渡すため、物理 window geometry を UI 表示倍率から独立させる箇所では、ここで
+/// 追加倍率だけを相殺する。native DPI は winit 側の logical -> physical 変換に残す。
+pub fn window_geometry_to_viewport_points(value: f32, ui_scale: f32) -> f32 {
+    value / normalize_ui_scale_factor(ui_scale)
+}
+
+/// egui が報告した viewport points を、UI 表示倍率に依存しない OS DPI only の論理
+/// window geometry へ戻す。
+pub fn viewport_points_to_window_geometry(value: f32, ui_scale: f32) -> f32 {
+    value * normalize_ui_scale_factor(ui_scale)
+}
+
+/// main Context の実効 ppp (`native_ppp * ui_scale`) から OS native ppp を取り出す。
+pub fn native_pixels_per_point_from_effective(effective_ppp: f32, ui_scale: f32) -> f32 {
+    let effective_ppp = if effective_ppp.is_finite() && effective_ppp > 0.0 {
+        effective_ppp
+    } else {
+        1.0
+    };
+    effective_ppp / normalize_ui_scale_factor(ui_scale)
+}
+
+pub fn ui_scale_factor_steps() -> impl ExactSizeIterator<Item = f32> {
+    (0..UI_SCALE_FACTOR_STEP_COUNT)
+        .map(|step| UI_SCALE_FACTOR_MIN + step as f32 * UI_SCALE_FACTOR_STEP)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FavoriteAddError {
     Duplicate,
@@ -2299,6 +2356,10 @@ pub struct Settings {
     #[serde(default)]
     pub ui_theme: UiTheme,
 
+    /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
+    #[serde(default = "default_ui_scale_factor")]
+    pub ui_scale_factor: f32,
+
     /// 初回セットアップダイアログを完了したか。
     #[serde(default)]
     pub first_setup_completed: bool,
@@ -3551,6 +3612,7 @@ impl Default for Settings {
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
+            ui_scale_factor: default_ui_scale_factor(),
             first_setup_completed: false,
             ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
@@ -4746,6 +4808,7 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
         // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
@@ -4938,6 +5001,9 @@ impl Settings {
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
+        // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
+        // 変更しても OK 押下時の古い snapshot で巻き戻さない。
+        self.ui_scale_factor = src.ui_scale_factor;
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -5215,6 +5281,101 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "actual={actual} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn ui_scale_defaults_to_one_and_missing_field_uses_default() {
+        assert_f32_close(Settings::default().ui_scale_factor, 1.0);
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_f32_close(loaded.ui_scale_factor, 1.0);
+    }
+
+    #[test]
+    fn ui_scale_normalizes_to_supported_range_and_steps() {
+        for (input, expected) in [
+            (0.1, 0.5),
+            (0.54, 0.5),
+            (0.56, 0.6),
+            (1.04, 1.0),
+            (1.06, 1.1),
+            (2.4, 2.0),
+            (f32::NAN, 1.0),
+            (f32::INFINITY, 1.0),
+        ] {
+            assert_f32_close(normalize_ui_scale_factor(input), expected);
+        }
+
+        let mut settings = Settings::default();
+        settings.ui_scale_factor = 1.46;
+        settings.sanitize();
+        assert_f32_close(settings.ui_scale_factor, 1.5);
+    }
+
+    #[test]
+    fn ui_scale_steps_cover_fifty_through_two_hundred_percent() {
+        let steps: Vec<_> = ui_scale_factor_steps().collect();
+        assert_eq!(steps.len(), 16);
+        assert_f32_close(steps[0], 0.5);
+        assert_f32_close(steps[15], 2.0);
+        for pair in steps.windows(2) {
+            assert_f32_close(pair[1] - pair[0], 0.1);
+        }
+    }
+
+    #[test]
+    fn apply_ui_scale_sets_main_context_zoom_factor() {
+        let ctx = egui::Context::default();
+        let applied = apply_ui_scale_factor(&ctx, 1.46);
+        assert_f32_close(applied, 1.5);
+        ctx.begin_pass(egui::RawInput::default());
+        let _ = ctx.end_pass();
+        assert_f32_close(ctx.zoom_factor(), 1.5);
+    }
+
+    #[test]
+    fn viewport_window_geometry_keeps_physical_size_across_ui_scale_and_dpi() {
+        let intended_os_logical = 1600.0_f32;
+        for native_ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            let intended_physical = intended_os_logical * native_ppp;
+            for ui_scale in [0.5_f32, 1.0, 1.5, 2.0] {
+                let viewport_points =
+                    window_geometry_to_viewport_points(intended_os_logical, ui_scale);
+                let effective_ppp = native_ppp * ui_scale;
+                assert!((viewport_points * effective_ppp - intended_physical).abs() < 1.0e-3);
+                assert!(
+                    (viewport_points_to_window_geometry(viewport_points, ui_scale)
+                        - intended_os_logical)
+                        .abs()
+                        < 1.0e-3
+                );
+                assert!(
+                    (native_pixels_per_point_from_effective(effective_ppp, ui_scale) - native_ppp)
+                        .abs()
+                        < 1.0e-3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_window_geometry_is_bit_identical_at_one_hundred_percent() {
+        for value in [-1920.0_f32, 0.0, 720.5, 3840.0] {
+            assert_eq!(
+                window_geometry_to_viewport_points(value, 1.0).to_bits(),
+                value.to_bits()
+            );
+            assert_eq!(
+                viewport_points_to_window_geometry(value, 1.0).to_bits(),
+                value.to_bits()
+            );
+        }
+    }
 
     // -- Toolbar section order (v2.0.0 Phase 1) --
 

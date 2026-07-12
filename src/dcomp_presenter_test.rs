@@ -131,6 +131,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
         egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
         cursor_hide_delay_secs: crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
+        ui_scale: 1.0,
         // CP4: prototype CLI は HUD overlay HWND を作らない (= フォールバック経路で
         // 従来通り presenter HWND の DComp tree に egui overlay を載せる)。
         hud_event_tx: None,

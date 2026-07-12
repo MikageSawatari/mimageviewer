@@ -1866,13 +1866,19 @@ impl App {
             return;
         }
         let dpi = unsafe { GetDpiForWindow(presenter_win) } as f32;
-        let ppp = (dpi / 96.0).max(1.0);
-        let top_band_px = (62.0_f32 * ppp).round() as i32; // 54pt + 8pt margin
+        let os_ppp = (dpi / 96.0).max(0.5);
+        let overlay_ppp = crate::video::native_presenter::effective_overlay_pixels_per_point(
+            os_ppp,
+            self.settings.ui_scale_factor,
+        );
+        let top_band_px = (62.0_f32 * overlay_ppp).round() as i32; // 54pt + 8pt margin
         // 動画 HUD 2 段化リデザイン (Phase 3): HUD_BOTTOM_HEIGHT = 64pt + 8pt margin = 72pt。
         // 旧 1 段では 46+8=54pt だった。
-        let bottom_band_px =
-            ((crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 8.0) * ppp).round() as i32;
-        let titlebar_px = (30.0_f32 * ppp).round() as i32; // VST タイトルバー想定高さ
+        let bottom_band_px = ((crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 8.0)
+            * overlay_ppp)
+            .round() as i32;
+        // VST editor は bridge 所有の別 HWND なのでアプリ内 UI 倍率を掛けない。
+        let titlebar_px = (30.0_f32 * os_ppp).round() as i32;
         let presenter_top = presenter_rect.top;
         let presenter_bottom = presenter_rect.bottom;
         let zone_top_limit = presenter_top + top_band_px;
@@ -5396,10 +5402,12 @@ impl App {
         if w_px < 1.0 || h_px < 1.0 {
             return None;
         }
-        // presenter overlay の pixels_per_point は `pixels_per_point_for_hwnd` =
-        // `GetDpiForWindow / 96.0` と同じ計算なので、ここで points に戻すと描画側の
-        // `overlay_*_points` と一致する。
-        let ppp = (unsafe { GetDpiForWindow(win) } as f32 / 96.0).max(0.5);
+        // presenter overlay と同じ `(GetDpiForWindow / 96.0) * ui_scale` で points に戻す。
+        let os_ppp = (unsafe { GetDpiForWindow(win) } as f32 / 96.0).max(0.5);
+        let ppp = crate::video::native_presenter::effective_overlay_pixels_per_point(
+            os_ppp,
+            self.settings.ui_scale_factor,
+        );
         Some(egui::vec2(w_px / ppp, h_px / ppp))
     }
 
@@ -6954,6 +6962,7 @@ impl App {
             false, // initial_tile_overlay: 音声は preparing タイルを出さない
             true,  // vst3_available
             self.checked.contains(&fs_idx), // checked: グリッドのチェック状態 (動画 HUD と同じ)
+            self.settings.ui_scale_factor,
             self.settings.fullscreen_cursor_hide_delay_secs,
             Some(self.dsp_bridge.editor_hwnds_snapshot()),
             self.main_hwnd.unwrap_or(0) as u64,
@@ -7442,6 +7451,7 @@ impl App {
                 false,
                 self.settings.vst3_enabled,
                 self.checked.contains(&fs_idx),
+                self.settings.ui_scale_factor,
                 self.settings.fullscreen_cursor_hide_delay_secs,
                 Some(self.dsp_bridge.editor_hwnds_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,

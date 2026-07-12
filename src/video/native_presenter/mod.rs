@@ -126,6 +126,8 @@ pub struct NativePresenterConfig {
     pub test_overlay: bool,
     pub egui_overlay: bool,
     pub cursor_hide_delay_secs: f32,
+    /// OS DPI に追加で掛けるアプリ内 UI 表示倍率。
+    pub ui_scale: f32,
     /// HUD overlay HWND の wndproc が拾った mouse / DPI / raise 要求を流す sender。
     /// `Some` のとき、presenter は HUD overlay HWND を作って egui overlay を
     /// その DComp tree にぶら下げる (CP4 反映)。`None` または HUD HWND 作成失敗時は
@@ -463,6 +465,8 @@ struct NativeEguiOverlay {
     pending_overlay_commands: Vec<NativeOverlayCommand>,
     last_volume_target: Option<f64>,
     visual_attached: bool,
+    /// main egui Context の zoom_factor をミラーするアプリ内倍率。
+    ui_scale: f32,
     pixels_per_point: f32,
     width: u32,
     height: u32,
@@ -1664,6 +1668,7 @@ impl NativeVideoPresenter {
                         config.width,
                         config.height,
                         config.cursor_hide_delay_secs,
+                        config.ui_scale,
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -1716,6 +1721,7 @@ impl NativeVideoPresenter {
                         config.width,
                         config.height,
                         config.cursor_hide_delay_secs,
+                        config.ui_scale,
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -2662,13 +2668,13 @@ impl NativeVideoPresenter {
         }
     }
 
-    /// HUD HWND の `WM_DPICHANGED` を受けて overlay の pixels_per_point を更新する。
+    /// HUD HWND の `WM_DPICHANGED` を受けて overlay の OS ppp を更新する。
     /// `dirty = true` 化されるので次フレームの render で region 物理ピクセル換算が新 DPI 基準になる。
     /// 戻り値: 値が変わったかどうか。
-    pub fn set_overlay_pixels_per_point(&mut self, ppp: f32) -> bool {
+    pub fn set_overlay_pixels_per_point(&mut self, os_ppp: f32) -> bool {
         self.egui_overlay
             .as_mut()
-            .map(|o| o.set_pixels_per_point(ppp))
+            .map(|o| o.set_os_pixels_per_point(os_ppp))
             .unwrap_or(false)
     }
 
@@ -2875,7 +2881,7 @@ impl NativeVideoPresenter {
         let ppp = self
             .egui_overlay
             .as_ref()
-            .map(|o| o.pixels_per_point.max(1.0))
+            .map(|o| o.pixels_per_point)
             .unwrap_or(1.0);
         let top_band_px = (76.0_f32 * ppp).round() as i32;
         let bottom_band_top = self.height as i32 - (220.0_f32 * ppp).round() as i32;
@@ -3820,6 +3826,7 @@ impl NativeEguiOverlay {
         width: u32,
         height: u32,
         cursor_hide_delay_secs: f32,
+        ui_scale: f32,
         cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -3865,9 +3872,12 @@ impl NativeEguiOverlay {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
+        egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         configure_overlay_fonts(&egui_ctx);
         configure_overlay_style(&egui_ctx);
-        let pixels_per_point = pixels_per_point_for_hwnd(dcomp_hwnd);
+        let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
+        let pixels_per_point =
+            effective_overlay_pixels_per_point(pixels_per_point_for_hwnd(dcomp_hwnd), ui_scale);
         let cursor_hide_delay_secs =
             crate::settings::clamp_fullscreen_cursor_hide_delay_secs(cursor_hide_delay_secs);
         let this = Self {
@@ -3984,6 +3994,7 @@ impl NativeEguiOverlay {
             pending_overlay_commands: Vec::new(),
             last_volume_target: None,
             visual_attached: false,
+            ui_scale,
             pixels_per_point,
             width: width.max(1),
             height: height.max(1),
@@ -4027,11 +4038,18 @@ impl NativeEguiOverlay {
         self.render_once().map(|_| ())
     }
 
-    /// CP8: DPI 変更を反映する。`pixels_per_point = dpi as f32 / 96.0`。
+    /// CP8: DPI 変更を反映する。`pixels_per_point = os_ppp * ui_scale`。
     /// 戻り値: 値が変わったかどうか。変わった場合は呼び出し側で next render の
     /// region 再計算を期待する (= `dirty = true`)。
-    fn set_pixels_per_point(&mut self, ppp: f32) -> bool {
-        let new_ppp = ppp.max(0.5).min(8.0); // 50%-800% の範囲にクランプ
+    fn set_os_pixels_per_point(&mut self, os_ppp: f32) -> bool {
+        self.set_effective_pixels_per_point(effective_overlay_pixels_per_point(
+            os_ppp,
+            self.ui_scale,
+        ))
+    }
+
+    fn set_effective_pixels_per_point(&mut self, ppp: f32) -> bool {
+        let new_ppp = ppp.clamp(0.5, 16.0);
         if (self.pixels_per_point - new_ppp).abs() < f32::EPSILON {
             return false;
         }
@@ -5142,7 +5160,7 @@ impl NativeEguiOverlay {
     /// **概算 RECT** (= 既知の固定高さ帯) で実装する。CP7 で有効化したあとの実機検証で
     /// rect ずれが出たら egui レイアウト結果から rect を引いてくる方式に補修する。
     fn compute_hud_regions(&self) -> Vec<RECT> {
-        let ppp = self.pixels_per_point.max(1.0);
+        let ppp = self.pixels_per_point;
         let width_px = self.width.max(1) as i32;
         let height_px = self.height.max(1) as i32;
 
@@ -7760,7 +7778,7 @@ impl NativeEguiOverlay {
         let Some(ime) = ime else {
             return;
         };
-        let ppp = self.pixels_per_point.max(1.0);
+        let ppp = self.pixels_per_point;
         let cursor = ime.cursor_rect;
         let x = (cursor.min.x * ppp).round() as i32;
         let y = (cursor.min.y * ppp).round() as i32;
@@ -7892,6 +7910,15 @@ fn pixels_per_point_for_hwnd(hwnd: HWND) -> f32 {
     } else {
         1.0
     }
+}
+
+pub(crate) fn effective_overlay_pixels_per_point(os_ppp: f32, ui_scale: f32) -> f32 {
+    let os_ppp = if os_ppp.is_finite() && os_ppp > 0.0 {
+        os_ppp
+    } else {
+        1.0
+    };
+    os_ppp * crate::settings::normalize_ui_scale_factor(ui_scale)
 }
 
 fn egui_modifiers(shift: bool, ctrl: bool, alt: bool) -> egui::Modifiers {
@@ -8358,9 +8385,9 @@ mod tests {
         NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
         NativePixelSample, NativeRightPanelVisibilityInputs, compare_pixel_probe,
         compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
-        egui_key_from_virtual_key, metadata_clean_text, native_jump_panel_visible_from_inputs,
-        native_right_panel_visible_from_inputs, native_video_fullscreen_shortcut_key,
-        sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
+        native_jump_panel_visible_from_inputs, native_right_panel_visible_from_inputs,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
@@ -8408,6 +8435,28 @@ mod tests {
             shift: false,
             ctrl: false,
         })
+    }
+
+    #[test]
+    fn presenter_ppp_is_os_dpi_times_ui_scale() {
+        for (os_ppp, ui_scale, expected) in [
+            (1.0, 0.5, 0.5),
+            (1.0, 1.0, 1.0),
+            (1.25, 1.2, 1.5),
+            (1.5, 2.0, 3.0),
+        ] {
+            let actual = effective_overlay_pixels_per_point(os_ppp, ui_scale);
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn raw_ppp_floor_removal_is_noop_at_or_above_one() {
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0, 4.0] {
+            assert_eq!(ppp, ppp.max(1.0));
+        }
+        assert_eq!(effective_overlay_pixels_per_point(1.0, 0.5), 0.5);
+        assert_ne!(0.5_f32, 0.5_f32.max(1.0));
     }
 
     #[test]
