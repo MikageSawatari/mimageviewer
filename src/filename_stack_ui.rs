@@ -60,13 +60,11 @@ pub(crate) struct StackScriptPending {
 pub(crate) fn extract_stack_parts(
     items: &[GridItem],
     image_metas: &[Option<(i64, i64)>],
-    folder_count: usize,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>, Vec<StackMember>) {
-    let fc = folder_count.min(items.len()).min(image_metas.len());
-    let mut passthrough: Vec<GridItem> = items[..fc].to_vec();
-    let mut passthrough_metas: Vec<Option<(i64, i64)>> = image_metas[..fc].to_vec();
+    let mut passthrough: Vec<GridItem> = Vec::new();
+    let mut passthrough_metas: Vec<Option<(i64, i64)>> = Vec::new();
     let mut media: Vec<StackMember> = Vec::new();
-    for (it, meta) in items[fc..].iter().zip(&image_metas[fc..]) {
+    for (it, meta) in items.iter().zip(image_metas) {
         let (mtime, size) = meta.unwrap_or((0, 0));
         match it {
             GridItem::Image(path) => media.push(StackMember {
@@ -363,13 +361,14 @@ impl crate::app::App {
                 )
             }
         };
-        let sv = StackView::from_groups(
+        let sv = StackView::from_groups_with_display_order(
             folder.clone(),
             passthrough,
             passthrough_metas,
             separator,
             sort,
             groups,
+            self.settings.grid_display_order.clone(),
         );
         let collapsible = sv.has_collapsible_stack();
         let (agg_items, agg_metas) = sv.materialize_aggregated();
@@ -567,7 +566,7 @@ impl crate::app::App {
         }
 
         let (passthrough, passthrough_metas, media) =
-            extract_stack_parts(&self.items, &self.image_metas, 0);
+            extract_stack_parts(&self.items, &self.image_metas);
         self.stack_mode_requested = true;
         self.stack_toggle_select_path = target;
         self.stack_showing_flat = false;

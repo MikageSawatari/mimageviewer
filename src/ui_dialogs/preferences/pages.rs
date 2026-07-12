@@ -12,7 +12,8 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode, FullscreenJumpMode,
-    Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, UiTheme,
+    GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
+    StartupFolderMode, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -383,6 +384,42 @@ fn refresh_send_to_status(state: &mut PreferencesState) {
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
+    ui.label(egui::RichText::new("グリッドのカテゴリ表示順").strong());
+    ui.small(
+        "各カテゴリを表示する行を選びます。同じ行のカテゴリは、現在のソート順で混ぜて表示します。空の行は表示時に詰められます。",
+    );
+    ui.add_space(4.0);
+    egui::Grid::new("grid_category_display_order")
+        .num_columns(5)
+        .striped(true)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.strong("表示順");
+            for kind in GridItemDisplayKind::ALL {
+                ui.strong(kind.label());
+            }
+            ui.end_row();
+            for row in 0..4 {
+                ui.label(format!("{}", row + 1));
+                for kind in GridItemDisplayKind::ALL {
+                    let selected = s.grid_display_order.row_for(kind) == row;
+                    if ui.radio(selected, "").clicked() {
+                        s.grid_display_order.assign(kind, row);
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    ui.horizontal(|ui| {
+        if ui.button("既定に戻す").clicked() {
+            s.grid_display_order = settings::GridDisplayOrder::default();
+        }
+        ui.small("アーカイブ類: ZIP / PDF / 対応アーカイブ");
+    });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
     ui.checkbox(
         &mut s.thumb_idle_upgrade,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",

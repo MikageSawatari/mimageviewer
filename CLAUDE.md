@@ -373,8 +373,10 @@ egui::Window::new("...").show(ctx, |ui| {
 (`PreferencesState::enter_pressed` 等) のフィールドに載せて伝搬する。
 
 ### サムネイルロード
-- **Grid contents**: フォルダ・ZIP・PDF 先頭（名前順）、画像後続（ソート順設定可）。
-  ZIP/PDF ファイルは 1 枚目/1 ページ目のサムネイル＋種別バッジで表示。非画像は無視。
+- **Grid contents**: 実フォルダ / アーカイブ類 / 画像 / 動画・音声を、設定された 4 行へ
+  カテゴリごとに配置する。同じ行は共通の `sort_order` で混在ソートし、空行は読み飛ばす。
+  既定は「実フォルダ + アーカイブ類」先頭、「画像 + 動画・音声」後続の従来互換。
+  ZIP/PDF ファイルは 1 枚目/1 ページ目のサムネイル＋種別バッジで表示。非対応ファイルは無視。
 - **Cancellation**: `Arc<AtomicBool>` キャンセルトークン。`load_folder` 呼び出し時に
   旧トークンを `true` にして旧タスクを中断。
 - **Per-load thread pool**: フォルダごとに新規 `rayon::ThreadPool` を作成。
