@@ -20,14 +20,15 @@ use crate::ui_helpers::format_bytes;
 
 /// ダイアログの状態。Default で「未起動」。`App::open_settings_restore` で
 /// 一覧をロードし、`show_settings_restore_dialog` で描画する。
+
 pub(crate) struct SettingsRestoreState {
-    /// 一覧キャッシュ (= ダイアログ起動時に固定)。
     pub(crate) backups: Vec<BackupSummary>,
-    /// ユーザーがボタンを押したアクション (= 確認待ち or 実行待ち)。
     pub(crate) pending: Option<PendingAction>,
-    /// 実行結果 (= 成功なら snapshot 情報、失敗ならエラー文字列)。
-    /// `Some` の状態でダイアログを閉じると `ViewportCommand::Close` でアプリ終了。
     pub(crate) result: Option<ActionResult>,
+    tab: SettingsRestoreTab,
+    operation_modal: Option<OperationModal>,
+    operation_message: Option<(bool, String)>,
+    operation_task_rx: Option<std::sync::mpsc::Receiver<OperationTaskResult>>,
 }
 
 impl Default for SettingsRestoreState {
@@ -36,8 +37,85 @@ impl Default for SettingsRestoreState {
             backups: Vec::new(),
             pending: None,
             result: None,
+            tab: SettingsRestoreTab::Restore,
+            operation_modal: None,
+            operation_message: None,
+            operation_task_rx: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsRestoreTab {
+    Restore,
+    OperationCustomize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffCompareTarget {
+    Standard,
+    Current,
+    Previous,
+}
+
+enum OperationTaskResult {
+    LoadedRow {
+        source: BackupSource,
+        action: OperationRowAction,
+        result: Result<crate::operation_customize_share::ParsedImport, String>,
+    },
+    ImportedFile {
+        result: Result<crate::operation_customize_share::ParsedImport, String>,
+        fallback_label: String,
+    },
+    LoadedPrevious {
+        source: BackupSource,
+        result: Result<
+            (
+                String,
+                crate::operation_customize_share::OperationCustomizeBundle,
+            ),
+            String,
+        >,
+    },
+    Exported {
+        result: Result<String, String>,
+    },
+    PreparedImport {
+        source_label: String,
+        bundle: crate::operation_customize_share::OperationCustomizeBundle,
+        result: Result<PathBuf, String>,
+    },
+}
+
+enum OperationModal {
+    Export {
+        source_label: String,
+        bundle: crate::operation_customize_share::OperationCustomizeBundle,
+        label: String,
+    },
+    Diff {
+        source_label: String,
+        source: BackupSource,
+        bundle: crate::operation_customize_share::OperationCustomizeBundle,
+        current: crate::operation_customize_share::OperationCustomizeBundle,
+        target: DiffCompareTarget,
+        previous: Option<
+            Result<
+                (
+                    String,
+                    crate::operation_customize_share::OperationCustomizeBundle,
+                ),
+                String,
+            >,
+        >,
+    },
+    Import {
+        source_label: String,
+        bundle: crate::operation_customize_share::OperationCustomizeBundle,
+        warnings: Vec<String>,
+        ignored_items: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -77,8 +155,7 @@ impl App {
         let backups = settings_restore::list_backups(&dir);
         self.settings_restore_state = SettingsRestoreState {
             backups,
-            pending: None,
-            result: None,
+            ..SettingsRestoreState::default()
         };
         self.show_settings_restore = true;
     }
@@ -87,6 +164,8 @@ impl App {
         if !self.show_settings_restore {
             return;
         }
+
+        self.poll_operation_share_task(ctx);
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
@@ -98,6 +177,7 @@ impl App {
         // (2026-05-17 Codex P2 round 2 対応)。
         let confirm_open = self.settings_restore_state.pending.is_some();
         let result_open = self.settings_restore_state.result.is_some();
+        let operation_modal_open = self.settings_restore_state.operation_modal.is_some();
 
         egui::Window::new("設定の復元")
             .open(&mut open)
@@ -109,7 +189,7 @@ impl App {
                 draw_body(self, ui);
             });
 
-        if !open || (escape_pressed && !confirm_open && !result_open) {
+        if !open || (escape_pressed && !confirm_open && !result_open && !operation_modal_open) {
             self.show_settings_restore = false;
             self.settings_restore_state = SettingsRestoreState::default();
         }
@@ -118,6 +198,7 @@ impl App {
         // ブロックするので、Terminal でも Recoverable でも背景 UI 操作は不可能。
         self.show_settings_restore_confirm_dialog(ctx);
         self.show_settings_restore_result_dialog(ctx);
+        self.show_operation_share_modal(ctx);
     }
 
     fn show_settings_restore_confirm_dialog(&mut self, ctx: &egui::Context) {
@@ -417,6 +498,27 @@ fn push_snapshot_lines(lines: &mut Vec<String>, paths: &[PathBuf]) {
 // ──────────────────────────────────────────────────────────────────────
 
 fn draw_body(app: &mut App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(
+            &mut app.settings_restore_state.tab,
+            SettingsRestoreTab::Restore,
+            "設定の復元",
+        );
+        ui.selectable_value(
+            &mut app.settings_restore_state.tab,
+            SettingsRestoreTab::OperationCustomize,
+            "操作カスタマイズ",
+        );
+    });
+    ui.separator();
+    ui.add_space(6.0);
+    match app.settings_restore_state.tab {
+        SettingsRestoreTab::Restore => draw_restore_body(app, ui),
+        SettingsRestoreTab::OperationCustomize => draw_operation_customize_body(app, ui),
+    }
+}
+
+fn draw_restore_body(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
         "現在の設定または過去のバックアップから設定を復元できます。\n\
          復元すると現在の設定は上書きされ、アプリは自動で終了します。",
@@ -494,6 +596,727 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+impl App {
+    fn poll_operation_share_task(&mut self, ctx: &egui::Context) {
+        let received = self
+            .settings_restore_state
+            .operation_task_rx
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "バックグラウンド処理が応答せず終了しました。".to_string(),
+                )),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            });
+        let Some(received) = received else {
+            if self.settings_restore_state.operation_task_rx.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        };
+        self.settings_restore_state.operation_task_rx = None;
+        let result = match received {
+            Ok(result) => result,
+            Err(error) => {
+                self.settings_restore_state.operation_message = Some((true, error));
+                return;
+            }
+        };
+        match result {
+            OperationTaskResult::LoadedRow {
+                source,
+                action,
+                result,
+            } => finish_loaded_row_action(self, source, action, result),
+            OperationTaskResult::ImportedFile {
+                result,
+                fallback_label,
+            } => match result {
+                Ok(parsed) => {
+                    let source_label = parsed.bundle.label.clone().unwrap_or(fallback_label);
+                    self.settings_restore_state.operation_modal = Some(OperationModal::Import {
+                        source_label,
+                        bundle: parsed.bundle,
+                        warnings: parsed.warnings,
+                        ignored_items: parsed.ignored_items,
+                    });
+                    self.settings_restore_state.operation_message = None;
+                }
+                Err(error) => {
+                    self.settings_restore_state.operation_message =
+                        Some((true, format!("ファイルを読み込めませんでした: {error}")));
+                }
+            },
+            OperationTaskResult::LoadedPrevious { source, result } => {
+                if let Some(OperationModal::Diff {
+                    source: modal_source,
+                    previous,
+                    ..
+                }) = self.settings_restore_state.operation_modal.as_mut()
+                    && *modal_source == source
+                {
+                    *previous = Some(result);
+                }
+                self.settings_restore_state.operation_message = None;
+            }
+            OperationTaskResult::Exported { result } => match result {
+                Ok(message) => {
+                    self.settings_restore_state.operation_message = Some((false, message));
+                }
+                Err(error) => {
+                    self.settings_restore_state.operation_message =
+                        Some((true, format!("書き出しに失敗しました: {error}")));
+                }
+            },
+            OperationTaskResult::PreparedImport {
+                source_label,
+                bundle,
+                result,
+            } => match result {
+                Ok(path) => {
+                    self.apply_operation_customize_bundle(bundle);
+                    let backup_name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.settings_restore_state.operation_message = Some((
+                        false,
+                        format!(
+                            "{source_label} を取り込みました。取り込み前の設定は {backup_name} に退避しました。"
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    self.settings_restore_state.operation_message = Some((
+                        true,
+                        format!(
+                            "取り込み前の自動退避に失敗したため、取り込みを中止しました: {error}"
+                        ),
+                    ));
+                }
+            },
+        }
+    }
+
+    fn show_operation_share_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.settings_restore_state.operation_modal.take() else {
+            return;
+        };
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let mut keep_open = true;
+        let mut apply_bundle = None;
+
+        match &mut modal {
+            OperationModal::Export {
+                source_label,
+                bundle,
+                label,
+            } => {
+                let mut window_open = true;
+                let mut save = false;
+                egui::Window::new("操作カスタマイズを書き出す")
+                    .open(&mut window_open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label(format!("書き出し元: {source_label}"));
+                        ui.label("共有用の名前 (省略可):");
+                        ui.add(egui::TextEdit::singleline(label).hint_text("例: ブラウザー風"));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("保存...").clicked() || enter_pressed {
+                                save = true;
+                            }
+                            if ui.button("キャンセル").clicked() || escape_pressed {
+                                keep_open = false;
+                            }
+                        });
+                    });
+                if !window_open {
+                    keep_open = false;
+                }
+                if save {
+                    let export_bundle = bundle.clone().with_label(label.clone());
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("mIV operation customize", &["json"])
+                        .set_file_name("operation-customize.mivkeys.json")
+                        .save_file()
+                    {
+                        begin_operation_export(
+                            self,
+                            ensure_operation_customize_extension(path),
+                            export_bundle,
+                        );
+                        keep_open = false;
+                    }
+                }
+            }
+            OperationModal::Diff {
+                source_label,
+                source,
+                bundle,
+                current,
+                target,
+                previous,
+            } => {
+                let mut window_open = true;
+                egui::Window::new("操作カスタマイズの差分")
+                    .open(&mut window_open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(720.0)
+                    .show(ctx, |ui| {
+                        ui.label(format!("比較する設定: {source_label}"));
+                        ui.horizontal(|ui| {
+                            ui.label("比較元:");
+                            ui.selectable_value(target, DiffCompareTarget::Standard, "標準");
+                            ui.add_enabled_ui(!source.is_current(), |ui| {
+                                ui.selectable_value(target, DiffCompareTarget::Current, "現在");
+                            });
+                            ui.selectable_value(target, DiffCompareTarget::Previous, "前世代");
+                        });
+
+                        if *target == DiffCompareTarget::Previous && previous.is_none() {
+                            if begin_previous_operation_load(self, source.clone()) {
+                                *previous = Some(Err("前世代を読み込んでいます...".to_string()));
+                            } else {
+                                *previous = Some(Err(
+                                    "前世代の読み込みを開始できませんでした。".to_string()
+                                ));
+                            }
+                        }
+
+                        let defaults =
+                            crate::operation_customize_share::OperationCustomizeBundle::defaults();
+                        let comparison = match *target {
+                            DiffCompareTarget::Standard => Some(("標準".to_string(), &defaults)),
+                            DiffCompareTarget::Current => Some(("現在".to_string(), &*current)),
+                            DiffCompareTarget::Previous => match previous.as_ref() {
+                                Some(Ok((label, previous_bundle))) => {
+                                    Some((label.clone(), previous_bundle))
+                                }
+                                _ => None,
+                            },
+                        };
+                        if let Some((before_label, before)) = comparison {
+                            let operation_diff =
+                                crate::operation_customize_share::diff(before, bundle);
+                            ui.add_space(6.0);
+                            ui.label(format!("{before_label} -> {source_label}"));
+                            draw_operation_diff(ui, &operation_diff);
+                        } else if let Some(Err(error)) = previous.as_ref() {
+                            ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), error);
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("閉じる").clicked() || escape_pressed {
+                            keep_open = false;
+                        }
+                    });
+                if !window_open {
+                    keep_open = false;
+                }
+            }
+            OperationModal::Import {
+                source_label,
+                bundle,
+                warnings,
+                ignored_items,
+            } => {
+                let current =
+                    crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+                        &self.settings,
+                    );
+                let preview = crate::operation_customize_share::diff(&current, bundle);
+                let mut window_open = true;
+                let mut apply = false;
+                egui::Window::new("操作カスタマイズを取り込む")
+                    .open(&mut window_open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(720.0)
+                    .show(ctx, |ui| {
+                        ui.label(format!("取り込み元: {source_label}"));
+                        ui.label("現在 -> 取り込み後の差分を確認してください。");
+                        if *ignored_items > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xc0, 0x70, 0x20),
+                                format!("無視した項目: {ignored_items} 件"),
+                            );
+                        }
+                        if !warnings.is_empty() {
+                            egui::CollapsingHeader::new(format!(
+                                "読み込み時の注意: {} 件",
+                                warnings.len()
+                            ))
+                            .show(ui, |ui| {
+                                for warning in warnings.iter() {
+                                    ui.label(warning);
+                                }
+                            });
+                        }
+                        draw_operation_diff(ui, &preview);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("取り込む").clicked() {
+                                apply = true;
+                            }
+                            if ui.button("キャンセル").clicked() || escape_pressed {
+                                keep_open = false;
+                            }
+                        });
+                    });
+                if !window_open {
+                    keep_open = false;
+                }
+                if apply {
+                    apply_bundle = Some((source_label.clone(), bundle.clone()));
+                    keep_open = false;
+                }
+            }
+        }
+
+        if let Some((source_label, bundle)) = apply_bundle {
+            begin_operation_import_backup(self, source_label, bundle);
+        }
+
+        if keep_open {
+            self.settings_restore_state.operation_modal = Some(modal);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OperationRowAction {
+    Diff,
+    Export,
+    Import,
+}
+
+fn draw_operation_customize_body(app: &mut App, ui: &mut egui::Ui) {
+    ui.label(
+        "キー割り当て、リング/マウス、メニュー構成をまとめて共有・比較できます。\n         操作カスタマイズだけを取り込み、再起動せずに反映します。",
+    );
+    ui.add_space(8.0);
+
+    let backups = app.settings_restore_state.backups.clone();
+    let now = SystemTime::now();
+    egui::ScrollArea::vertical()
+        .max_height(340.0)
+        .show(ui, |ui| {
+            egui::Grid::new("operation_customize_share_grid")
+                .num_columns(5)
+                .striped(true)
+                .spacing(egui::vec2(10.0, 4.0))
+                .show(ui, |ui| {
+                    ui.strong("世代");
+                    ui.strong("日時");
+                    ui.strong("差分");
+                    ui.strong("共有");
+                    ui.strong("取り込み");
+                    ui.end_row();
+
+                    for backup in backups {
+                        ui.label(backup.source.label());
+                        let when = backup
+                            .mtime
+                            .map(|time| format_relative_time(time, now))
+                            .unwrap_or_else(|| "-".to_string());
+                        ui.label(when);
+                        if ui.button("差分を見る...").clicked() {
+                            begin_operation_row_action(
+                                app,
+                                backup.source.clone(),
+                                OperationRowAction::Diff,
+                            );
+                        }
+                        if ui.button("書き出す...").clicked() {
+                            begin_operation_row_action(
+                                app,
+                                backup.source.clone(),
+                                OperationRowAction::Export,
+                            );
+                        }
+                        if backup.source.is_current() {
+                            ui.weak("(現在使用中)");
+                        } else if ui.button("取り込む...").clicked() {
+                            begin_operation_row_action(
+                                app,
+                                backup.source.clone(),
+                                OperationRowAction::Import,
+                            );
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        if ui.button("ファイルから読み込む...").clicked()
+            && app.settings_restore_state.operation_task_rx.is_none()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("mIV operation customize", &["json"])
+                .pick_file()
+        {
+            begin_file_import(app, path);
+        }
+        ui.weak("取り込みは現在の操作カスタマイズを置き換えます。");
+    });
+
+    if let Some((is_error, message)) = &app.settings_restore_state.operation_message {
+        ui.add_space(8.0);
+        if *is_error {
+            ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), message);
+        } else {
+            ui.label(message);
+        }
+    }
+}
+
+fn begin_operation_row_action(app: &mut App, source: BackupSource, action: OperationRowAction) {
+    if app.settings_restore_state.operation_task_rx.is_some() {
+        return;
+    }
+    let source_label = source.label();
+    if source.is_current() {
+        let result = normalize_operation_bundle(
+            crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+                &app.settings,
+            )
+            .with_label(source_label),
+        );
+        finish_loaded_row_action(app, source, action, result);
+        return;
+    }
+
+    let data_dir = crate::data_dir::get();
+    let worker_source = source.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("operation-customize-load".to_string())
+        .spawn(move || {
+            let result = settings_restore::load_operation_customize(&data_dir, &worker_source)
+                .map_err(|error| error.to_string())
+                .and_then(|bundle| {
+                    normalize_operation_bundle(bundle.with_label(worker_source.label()))
+                });
+            let _ = tx.send(OperationTaskResult::LoadedRow {
+                source: worker_source,
+                action,
+                result,
+            });
+        }) {
+        Ok(_) => {
+            app.settings_restore_state.operation_task_rx = Some(rx);
+            app.settings_restore_state.operation_message =
+                Some((false, "世代を読み込んでいます...".to_string()));
+        }
+        Err(error) => {
+            app.settings_restore_state.operation_message =
+                Some((true, format!("読み込み処理を開始できませんでした: {error}")));
+        }
+    }
+}
+
+fn finish_loaded_row_action(
+    app: &mut App,
+    source: BackupSource,
+    action: OperationRowAction,
+    result: Result<crate::operation_customize_share::ParsedImport, String>,
+) {
+    match result {
+        Ok(parsed) => {
+            let source_label = source.label();
+            let bundle = parsed.bundle;
+            let current = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+                &app.settings,
+            );
+            app.settings_restore_state.operation_modal = Some(match action {
+                OperationRowAction::Diff => OperationModal::Diff {
+                    source_label,
+                    source,
+                    bundle,
+                    current,
+                    target: DiffCompareTarget::Standard,
+                    previous: None,
+                },
+                OperationRowAction::Export => OperationModal::Export {
+                    source_label,
+                    bundle,
+                    label: String::new(),
+                },
+                OperationRowAction::Import => OperationModal::Import {
+                    source_label,
+                    bundle,
+                    warnings: parsed.warnings,
+                    ignored_items: parsed.ignored_items,
+                },
+            });
+            app.settings_restore_state.operation_message = None;
+        }
+        Err(error) => {
+            app.settings_restore_state.operation_message =
+                Some((true, format!("世代を読み込めませんでした: {error}")));
+        }
+    }
+}
+
+fn begin_file_import(app: &mut App, path: PathBuf) {
+    if app.settings_restore_state.operation_task_rx.is_some() {
+        return;
+    }
+    let fallback_label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ファイル".to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("operation-customize-file-import".to_string())
+        .spawn(move || {
+            let result = std::fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|json| {
+                    crate::operation_customize_share::parse_json(&json)
+                        .map_err(|error| error.to_string())
+                });
+            let _ = tx.send(OperationTaskResult::ImportedFile {
+                result,
+                fallback_label,
+            });
+        }) {
+        Ok(_) => {
+            app.settings_restore_state.operation_task_rx = Some(rx);
+            app.settings_restore_state.operation_message =
+                Some((false, "ファイルを読み込んでいます...".to_string()));
+        }
+        Err(error) => {
+            app.settings_restore_state.operation_message =
+                Some((true, format!("読み込み処理を開始できませんでした: {error}")));
+        }
+    }
+}
+
+fn begin_operation_export(
+    app: &mut App,
+    path: PathBuf,
+    bundle: crate::operation_customize_share::OperationCustomizeBundle,
+) {
+    if app.settings_restore_state.operation_task_rx.is_some() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("operation-customize-export".to_string())
+        .spawn(move || {
+            let result = crate::operation_customize_share::to_json(&bundle)
+                .map_err(|error| error.to_string())
+                .and_then(|json| std::fs::write(&path, json).map_err(|error| error.to_string()))
+                .map(|()| {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    format!("{name} に書き出しました。")
+                });
+            let _ = tx.send(OperationTaskResult::Exported { result });
+        }) {
+        Ok(_) => {
+            app.settings_restore_state.operation_task_rx = Some(rx);
+            app.settings_restore_state.operation_message =
+                Some((false, "ファイルへ書き出しています...".to_string()));
+        }
+        Err(error) => {
+            app.settings_restore_state.operation_message =
+                Some((true, format!("書き出し処理を開始できませんでした: {error}")));
+        }
+    }
+}
+
+fn begin_operation_import_backup(
+    app: &mut App,
+    source_label: String,
+    bundle: crate::operation_customize_share::OperationCustomizeBundle,
+) {
+    if app.settings_restore_state.operation_task_rx.is_some() {
+        return;
+    }
+    let current =
+        crate::operation_customize_share::OperationCustomizeBundle::from_settings(&app.settings)
+            .with_label("取り込み前");
+    let data_dir = crate::data_dir::get();
+    let worker_bundle = bundle.clone();
+    let worker_label = source_label.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("operation-customize-backup".to_string())
+        .spawn(move || {
+            let result =
+                settings_restore::backup_operation_customize_before_import(&data_dir, &current)
+                    .map_err(|error| error.to_string());
+            let _ = tx.send(OperationTaskResult::PreparedImport {
+                source_label: worker_label,
+                bundle: worker_bundle,
+                result,
+            });
+        }) {
+        Ok(_) => {
+            app.settings_restore_state.operation_task_rx = Some(rx);
+            app.settings_restore_state.operation_message =
+                Some((false, "取り込み前の設定を退避しています...".to_string()));
+        }
+        Err(error) => {
+            app.settings_restore_state.operation_message = Some((
+                true,
+                format!("自動退避処理を開始できなかったため、取り込みを中止しました: {error}"),
+            ));
+        }
+    }
+}
+
+fn normalize_operation_bundle(
+    bundle: crate::operation_customize_share::OperationCustomizeBundle,
+) -> Result<crate::operation_customize_share::ParsedImport, String> {
+    crate::operation_customize_share::to_json(&bundle)
+        .map_err(|error| error.to_string())
+        .and_then(|json| {
+            crate::operation_customize_share::parse_json(&json).map_err(|error| error.to_string())
+        })
+}
+
+fn begin_previous_operation_load(app: &mut App, source: BackupSource) -> bool {
+    if app.settings_restore_state.operation_task_rx.is_some() {
+        return false;
+    }
+    let backups = app.settings_restore_state.backups.clone();
+    let worker_source = source.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("operation-customize-previous".to_string())
+        .spawn(move || {
+            let result = load_previous_operation_bundle(&backups, &worker_source);
+            let _ = tx.send(OperationTaskResult::LoadedPrevious {
+                source: worker_source,
+                result,
+            });
+        });
+    if spawned.is_err() {
+        return false;
+    }
+    app.settings_restore_state.operation_task_rx = Some(rx);
+    app.settings_restore_state.operation_message =
+        Some((false, "前世代を読み込んでいます...".to_string()));
+    true
+}
+
+fn load_previous_operation_bundle(
+    backups: &[BackupSummary],
+    source: &BackupSource,
+) -> Result<
+    (
+        String,
+        crate::operation_customize_share::OperationCustomizeBundle,
+    ),
+    String,
+> {
+    let previous = match source {
+        BackupSource::Current => BackupSource::Bak(1),
+        BackupSource::Bak(number) if *number < 10 => BackupSource::Bak(number + 1),
+        BackupSource::Bak(_) => return Err("前世代はありません。".to_string()),
+    };
+    if !backups.iter().any(|backup| backup.source == previous) {
+        return Err("前世代はありません。".to_string());
+    }
+    let label = previous.label();
+    settings_restore::load_operation_customize(&crate::data_dir::get(), &previous)
+        .map(|bundle| (label, bundle))
+        .map_err(|error| format!("前世代を読み込めませんでした: {error}"))
+}
+
+fn draw_operation_diff(
+    ui: &mut egui::Ui,
+    operation_diff: &crate::operation_customize_share::OperationDiff,
+) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "キー割り当て: {} 件",
+            operation_diff.key_changes.len()
+        ));
+        ui.separator();
+        ui.label(format!(
+            "リング/マウス: {}",
+            if operation_diff.ring_change_count == 0 {
+                "変更なし".to_string()
+            } else {
+                format!("変更 {} 件", operation_diff.ring_change_count)
+            }
+        ));
+        ui.separator();
+        ui.label(format!(
+            "メニュー構成: {}",
+            if operation_diff.menu_change_count == 0 {
+                "変更なし".to_string()
+            } else {
+                format!("変更 {} 件", operation_diff.menu_change_count)
+            }
+        ));
+    });
+    if operation_diff.is_empty() {
+        ui.weak("差分はありません。");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(300.0)
+        .show(ui, |ui| {
+            egui::Grid::new("operation_customize_diff_grid")
+                .num_columns(3)
+                .striped(true)
+                .spacing(egui::vec2(12.0, 4.0))
+                .show(ui, |ui| {
+                    ui.strong("コマンド");
+                    ui.strong("変更前");
+                    ui.strong("変更後");
+                    ui.end_row();
+                    for change in &operation_diff.key_changes {
+                        ui.label(format!(
+                            "{} / {}",
+                            change.action.context().description(),
+                            change.action.description()
+                        ));
+                        ui.label(format_chords(&change.before));
+                        ui.label(format_chords(&change.after));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn format_chords(chords: &[String]) -> String {
+    if chords.is_empty() {
+        "(なし)".to_string()
+    } else {
+        chords.join(" / ")
+    }
+}
+
+fn ensure_operation_customize_extension(path: PathBuf) -> PathBuf {
+    if path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".mivkeys.json")
+    {
+        path
+    } else {
+        let mut filename = path.into_os_string();
+        filename.push(".mivkeys.json");
+        PathBuf::from(filename)
+    }
+}
+
 fn first_partial_error(backups: &[BackupSummary]) -> Option<String> {
     backups
         .iter()
@@ -518,5 +1341,55 @@ fn format_relative_time(mtime: SystemTime, now: SystemTime) -> String {
         format!("{} 週間前", secs / (86_400 * 7))
     } else {
         format!("{} か月前", secs / (86_400 * 30))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::KeyBindingOverride;
+    use egui_kittest::Harness;
+
+    #[test]
+    fn operation_customize_diff_preview_snapshot() {
+        let defaults = crate::operation_customize_share::OperationCustomizeBundle::defaults();
+        let mut imported = defaults.clone();
+        imported.keymap.overrides = vec![
+            KeyBindingOverride {
+                action: "GridPin".to_string(),
+                chords: vec!["Ctrl+P".to_string()],
+            },
+            KeyBindingOverride {
+                action: "FsSlideshow".to_string(),
+                chords: Vec::new(),
+            },
+        ];
+        imported.ring_shortcuts.mouse_ring_help_visible = false;
+        imported.menu_layout.hidden_commands = vec!["SettingsOperationCustomize".to_string()];
+        let operation_diff = crate::operation_customize_share::diff(&defaults, &imported);
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(760.0, 420.0))
+            .build(move |ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                if !fonts_ready {
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("操作カスタマイズの差分");
+                    ui.horizontal(|ui| {
+                        let _ = ui.selectable_label(false, "標準");
+                        let _ = ui.selectable_label(true, "現在");
+                        let _ = ui.selectable_label(false, "前世代");
+                    });
+                    ui.separator();
+                    draw_operation_diff(ui, &operation_diff);
+                });
+            });
+        harness.run();
+        harness.snapshot("settings_restore_operation_diff_preview");
     }
 }

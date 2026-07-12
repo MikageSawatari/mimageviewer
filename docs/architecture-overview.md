@@ -71,6 +71,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `data_dir.rs` | `%APPDATA%/mimageviewer/` のパス解決 |
 | `explorer_integration.rs` | Windows Explorer 連携。SendTo Known Folder (`FOLDERID_SendTo`) を解決し、ShellLink COM (`IShellLinkW` / `IPersistFile`) で per-user の `mImageViewer.lnk` を作成・削除・状態確認する。launcher から起動された core では `MIV_LAUNCHER_EXE_PATH` を優先して配布用 `mimageviewer.exe` を登録先にする |
 | `keymap.rs` | キーボード割り当ての `KeyAction` / `Chord` / parser / Action 定義 / egui exact-match / native VK 判定 helper。現在の正本は `Settings.keymap` (`settings.db`) で、旧 `%APPDATA%/mimageviewer/keymap.ini` は初回起動時に 1 回だけ取り込んで `keymap.ini.imported*.bak` へ退避する。`keymap.ini.default` は Action 名と既定キーの参照として起動時に更新する。フレーム中にファイル I/O はしない |
+| `operation_customize_share.rs` | 操作カスタマイズ 3 点セット (`keymap` / `ring_shortcuts` / `menu_layout`) の共有 JSON、未知項目の警告付き正規化、実効チョード単位の差分計算を担う純ロジック |
+| `settings_restore.rs` | 設定全体の世代復元に加え、過去世代を一時ディレクトリへ読み取り専用展開して操作カスタマイズだけを抽出し、取り込み前の `.mivkeys.json` 自動退避を管理 |
 | `books.rs` | 製本機能。製本ルート直下の通常フォルダを本として扱い、`0001_元名.ext` のページ保存、通常画像/ZIP 内画像の無加工コピー、補正/PDF/動画フレームの焼き込み追加、2 パス temp rename による並べ替えフラッシュを担当 |
 | `reading_history_db.rs` | 読書履歴 (`%APPDATA%/mimageviewer/reading_history.db`)。フルスクリーンで読んだ画像フォルダ / ZIP / PDF / 変換アーカイブを MRU として保持し、`reading-history-writer` で upsert / prune と file metadata 補完を行う |
 | `metadata_cleanup.rs` | 明示操作の孤児メタデータ整理。`rename_key_migration::STORES` を正本に全 path-keyed DB を worker で走査し、親フォルダ到達可能な missing だけを確認後に transaction DELETE する。切断ドライブ、本棚、逆引き不能キーは非破壊側へ倒す。mIV 削除後の purge 最終失敗は `delete_purge_journal.json` に path 単位で残し、同じ孤児安全判定 + 共通 hard-purge を起動時 / idle 時にピンポイント再実行する |

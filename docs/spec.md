@@ -1009,6 +1009,11 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
   `VACUUM INTO` で `settings.db.bak1`〜`settings.db.bak10` に過去 10 セッション分の
   consistent な snapshot を保持する。同セッション内の追加保存は in-place 更新のみで
   bak には伝播しない (= 1 起動 = 1 世代)。
+- **操作カスタマイズの共有・世代取り込み**: 「設定の復元」の「操作カスタマイズ」タブで
+  `keymap` / `ring_shortcuts` / `menu_layout` を `.mivkeys.json` として書き出し・
+  置換取り込みできる。差分は実効チョード単位で標準 / 現在 / 前世代と比較する。世代からの
+  取り込みは設定全体を復元せずライブ適用し、直前の 3 点セットを同形式で自動退避する。
+  既存の settings.db 世代を読み取るだけで、永続化スキーマは追加しない。
 - **自動復旧**: 起動時に main DB が壊れていたら (`PRAGMA integrity_check` 失敗 /
   `NotADatabase` / `DatabaseCorrupt`)、`settings.db` / `settings.db-wal` / `settings.db-shm`
   を 3 セットで `.corrupted-<ts>-<seq>` に quarantine 退避し、`bak1`→`bak10` を新→古の
