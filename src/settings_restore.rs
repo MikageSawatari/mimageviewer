@@ -456,18 +456,16 @@ pub fn load_operation_customize(
     if !src.exists() {
         return Err(RestoreError::SourceMissing(src));
     }
-    let unique = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let tmp_base = std::env::temp_dir().join(format!(
-        "mimageviewer-operation-import-{}-{unique}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&tmp_base).map_err(RestoreError::Io)?;
-    let result = load_operation_customize_in_dir(&tmp_base, &src);
-    let _ = std::fs::remove_dir_all(&tmp_base);
-    result
+    // 一意な scratch dir を tempfile で確保する (旧実装は `pid + nanos` の手組み名)。
+    // ランダム suffix + RAII cleanup で、直列化された復元テスト群が同名 dir を再利用して
+    // Windows の delete-pending / sharing violation race を踏むのを防ぐ。SettingsDb の
+    // ハンドルは load_operation_customize_in_dir 内で drop されてから TempDir が drop
+    // される (= handle クローズが temp 削除より先)。
+    let tmp = tempfile::Builder::new()
+        .prefix("mimageviewer-operation-import-")
+        .tempdir()
+        .map_err(RestoreError::Io)?;
+    load_operation_customize_in_dir(tmp.path(), &src)
 }
 
 fn load_operation_customize_in_dir(
@@ -533,9 +531,11 @@ fn prune_operation_import_backups(data_dir: &Path) -> Result<(), RestoreError> {
 /// 選択した世代を temp dir に「settings.db」として展開し、`SettingsDb::open` +
 /// `load_into_settings` まで通るか確認する。`Current` は実行中の DB 自身なので skip。
 ///
-/// 一時 dir は `tempfile` クレートに頼らず手動で作る (= validate のためだけに
-/// production の dep を増やさない方針)。clean up は always-cleanup パターンで
-/// 末尾の `remove_dir_all` に任せる。
+/// scratch dir は `tempfile` で一意名を確保する (`tempfile` は archive 変換で既に
+/// production 依存に入っている)。旧実装は `pid + 秒` の手組み名だったため、同一秒に
+/// 連続する復元呼び出し (= cargo test で直列化された復元テスト群) が同名 dir を
+/// 再利用し、Windows の delete-pending / sharing violation race を誘発していた。
+/// clean up は `TempDir` の Drop (= always-cleanup、失敗は無視) に任せる。
 fn validate_backup(data_dir: &Path, source: &BackupSource) -> Result<(), RestoreError> {
     let src = data_dir.join(source.filename());
     if !src.exists() {
@@ -546,17 +546,13 @@ fn validate_backup(data_dir: &Path, source: &BackupSource) -> Result<(), Restore
         // SettingsDb::open(tmp) しても自分自身の状態確認にならない。skip。
         return Ok(());
     }
-    let tmp_base = std::env::temp_dir().join(format!(
-        "mimageviewer-validate-{}-{}",
-        std::process::id(),
-        unix_seconds_now()
-    ));
-    std::fs::create_dir_all(&tmp_base).map_err(RestoreError::Io)?;
-    let result = validate_in_dir(&tmp_base, &src);
-    // 検証の成否に関わらず必ず掃除する。失敗は無視 (= AV 等で一時的にロックされても
-    // 次回プロセスで再利用しない名前 (pid + 秒) なので致命ではない)。
-    let _ = std::fs::remove_dir_all(&tmp_base);
-    result
+    // SettingsDb ハンドルは validate_in_dir 内で drop されてから TempDir が drop される
+    // (= handle クローズが temp 削除より先) 順序が保たれる。
+    let tmp = tempfile::Builder::new()
+        .prefix("mimageviewer-validate-")
+        .tempdir()
+        .map_err(RestoreError::Io)?;
+    validate_in_dir(tmp.path(), &src)
 }
 
 fn validate_in_dir(tmp_base: &Path, src: &Path) -> Result<(), RestoreError> {
@@ -692,6 +688,38 @@ mod tests {
     use crate::settings::Settings;
     use crate::settings_db::{DataDirOverrideGuard, SettingsDb};
 
+    /// 並列 `cargo test` のもとでは、AV / Windows Search インデクサ / 直前に閉じた
+    /// SQLite ハンドルが settings.db 家族ファイルを一瞬ロックし、`restore_from` /
+    /// `full_reset` が transient な `Recoverable(Io)` (Windows の sharing violation =
+    /// OS error 32「別のプロセスが使用中」) で失敗することがある (2026-07-12 に観測した
+    /// test-isolation flake)。本番の復元はユーザー操作起点の単発呼び出しなので、この
+    /// ロック窓は無視できるほど短く実害にならないが、多数テスト同時実行の FS 負荷下では
+    /// 500ms の内部 retry 予算を超えることがある。
+    ///
+    /// `Recoverable` は「まだファイルを変更していない = 安全に再試行できる」契約なので
+    /// (`restore_from` の失敗は全て `Recoverable`。`full_reset` は削除前の snapshot 失敗のみ
+    /// `Recoverable`)、テスト側では **transient な IO 失敗に限り** リトライしてロックが
+    /// 解けるのを待つ。`Terminal` や `ValidationFailed` のような恒久エラーは即座に返し、
+    /// 本物のバグを握り潰さない。
+    fn retry_on_transient_lock<T>(
+        mut op: impl FnMut() -> Result<T, RestoreFailure>,
+    ) -> Result<T, RestoreFailure> {
+        // 最大 40 回リトライ (× 50ms = 2s)。並列テストの transient lock は通常 1s 未満で解ける。
+        let mut result = op();
+        let mut retries = 0;
+        while retries < 40 {
+            match &result {
+                Err(f) if !f.is_terminal() && matches!(f.error(), RestoreError::Io(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    result = op();
+                    retries += 1;
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
     /// `list_backups` は存在する世代だけ返し、無い世代はスキップする。
     #[test]
     fn list_backups_skips_missing_generations() {
@@ -728,7 +756,7 @@ mod tests {
             db.save_full(&bad_state).unwrap();
         }
         // 復元実行
-        let report = restore_from(dir, &BackupSource::Bak(1)).unwrap();
+        let report = retry_on_transient_lock(|| restore_from(dir, &BackupSource::Bak(1))).unwrap();
         assert!(!report.snapshot_paths.is_empty(), "snapshot を取っている");
         assert!(
             report.snapshot_paths.iter().any(|p| p
@@ -765,7 +793,7 @@ mod tests {
             db.backup_to(&dir.join("settings.db.bak1")).unwrap();
             db.backup_to(&dir.join("settings.db.bak2")).unwrap();
         }
-        let report = full_reset(dir).unwrap();
+        let report = retry_on_transient_lock(|| full_reset(dir)).unwrap();
         // 退避は最低でも main + bak1 + bak2 の 3 つ (WAL/SHM は有無依存)。
         assert!(report.snapshot_paths.len() >= 3);
         // 削除されたものに settings.db / bak1 / bak2 が含まれる。
@@ -816,7 +844,7 @@ mod tests {
         // 確実に閉じてからファイル操作する経路を踏む。
         drop(outcome);
 
-        let report = restore_from(dir, &BackupSource::Bak(1))
+        let report = retry_on_transient_lock(|| restore_from(dir, &BackupSource::Bak(1)))
             .expect("生きた GLOBAL_DB の状態でも復元は成功する");
         assert!(!report.snapshot_paths.is_empty());
 
@@ -842,6 +870,13 @@ mod tests {
         {
             let db = SettingsDb::create_new(dir).unwrap();
             db.save_full(&original).unwrap();
+            // WAL を main に統合して settings.db を self-contained にする。この経路の
+            // restore_from(Bak) は validate 失敗で main を **書き換えない** ので、末尾の
+            // 再 open は「setup で書いた main が close-on-drop の checkpoint で永続化された」
+            // ことに依存する。並列テストの高負荷下では AV / インデクサが -wal / -shm を
+            // 一瞬握って close 時 checkpoint が不完全になり、再 open が 0 favorites を
+            // 読む race がある (2026-07-12 flake)。明示 checkpoint で決定的にする。
+            db.checkpoint_truncate().unwrap();
         }
         // bak1 として「sqlite ヘッダではない」16 バイトを書く (= open 段階で Corrupted)。
         std::fs::write(dir.join("settings.db.bak1"), b"NOT A SQLITE DB!").unwrap();
@@ -912,7 +947,8 @@ mod tests {
         // 復元実行 (bak1 = 古い state へ戻す)。
         // 復元成功 = checkpoint も無事に走ったとみなす (= 失敗してもベストエフォートで
         // 続行するが、ここでは本番想定のスムーズな成功経路を見たい)。
-        let report = restore_from(dir, &BackupSource::Bak(1)).expect("checkpoint + 復元は成功する");
+        let report = retry_on_transient_lock(|| restore_from(dir, &BackupSource::Bak(1)))
+            .expect("checkpoint + 復元は成功する");
         assert!(!report.snapshot_paths.is_empty());
 
         // 復元後の WAL は最終的に消える (bak 復元の best-effort delete 経路でも、
@@ -965,14 +1001,19 @@ mod tests {
         {
             let db = SettingsDb::create_new(dir).unwrap();
             db.save_full(&state).unwrap();
-            // 何回か save を回して WAL を確実に生む。
+            // まず main へ checkpoint して「無傷であるべき good state」を self-contained に
+            // 永続化する。これで末尾の再 open は close-on-drop の checkpoint 成否 (並列高負荷下で
+            // AV / インデクサの -wal/-shm ロックにより不完全化しうる) に依存しなくなる。
+            db.checkpoint_truncate().unwrap();
+            // その後、何回か save を回して WAL に (Current 復元が破棄する) frame を積む。
+            // main は既に durable なので、この WAL が checkpoint されなくても再 open は無事。
             for _ in 0..3 {
                 db.save_full(&state).unwrap();
             }
         }
         // WAL がディスクに残るのは sqlite の checkpoint タイミング次第なので、
         // ここでは「WAL/SHM が消えていること」 + 「main が無傷」だけを確認する。
-        let report = restore_from(dir, &BackupSource::Current).unwrap();
+        let report = retry_on_transient_lock(|| restore_from(dir, &BackupSource::Current)).unwrap();
         assert!(!dir.join("settings.db-wal").exists());
         assert!(!dir.join("settings.db-shm").exists());
         let db = SettingsDb::open(dir).unwrap();
@@ -1013,6 +1054,12 @@ mod tests {
         {
             let db = SettingsDb::create_new(dir).unwrap();
             db.save_full(&expected).unwrap();
+            // WAL を main に統合して settings.db を self-contained にする。load_operation_customize
+            // は main を **一切触らない** (壊れた bak を scratch dir に copy して検証するだけ) ので、
+            // 末尾の再 open は setup の main 永続化に依存する。並列テストの高負荷下では
+            // close-on-drop の checkpoint が AV / インデクサの -wal/-shm 一時ロックで不完全になり、
+            // 再 open が 0 favorites を読む race がある (2026-07-12 flake)。明示 checkpoint で決定的にする。
+            db.checkpoint_truncate().unwrap();
         }
         std::fs::write(dir.join("settings.db.bak1"), b"NOT A SQLITE DB!").unwrap();
 
