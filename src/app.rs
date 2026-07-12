@@ -6080,9 +6080,9 @@ pub struct App {
     /// ウィンドウ状態保存用：最後に確認した outer_rect（最小化・最大化時は更新しない）
     pub(crate) last_outer_rect: Option<egui::Rect>,
     /// ウィンドウ状態保存用：最後に確認した inner_size（クライアント領域）。
-    /// `ViewportCommand::InnerSize` / `ViewportBuilder::with_inner_size` の入力と
-    /// 直接整合する値。起動時の「outer を保存して inner として適用」によるタイトルバー
-    /// 分のサイズ縮小を防ぐために、これを settings.window_size に書き戻す。
+    /// 現在の UI 表示倍率込み viewport points なので、settings.window_size へ書くときは
+    /// OS DPI only の論理 geometry に戻す。inner を優先することで、outer を inner として
+    /// 再適用するタイトルバー分のサイズ縮小を防ぐ。
     pub(crate) last_inner_size: Option<[f32; 2]>,
     /// 直近に `ViewportCommand::Title` で送信したタイトル文字列のキャッシュ。
     /// 毎フレーム無条件に send_viewport_cmd(Title(...)) すると、egui 内部の
@@ -9006,28 +9006,42 @@ impl Default for App {
 }
 
 impl App {
-    /// 設定メニューで選ばれた UI 表示倍率を main Context と全 live native presenter へ
-    /// 同期する。detached の状態判定・配置には触れず、保持中 presenter の ppp だけを更新する。
+    /// 設定メニューで選ばれた UI 表示倍率を main Context へ適用する。
+    ///
+    /// active viewer / native presenter は、別ウィンドウ表示モード変更と同じ teardown 経路で
+    /// 閉じる。再 open 時に新倍率で presenter を構築することで、bundle / source-swap pending
+    /// まで含む live ppp 伝搬を不要にする。
     pub(crate) fn set_ui_scale_factor(&mut self, ctx: &egui::Context, value: f32) {
+        let previous = self.settings.ui_scale_factor;
         let scale = crate::settings::apply_ui_scale_factor(ctx, value);
         self.settings.ui_scale_factor = scale;
+        if (previous - scale).abs() < f32::EPSILON {
+            return;
+        }
 
         #[cfg(windows)]
         {
-            for entry in self.fs_cache.values() {
-                if let FsCacheEntry::Video { player, .. } = entry {
-                    player.set_native_ui_scale(scale);
-                }
+            let mounted_source_swap_presenter = self
+                .native_video_source_swap_pending
+                .as_ref()
+                .is_some_and(|pending| pending.parked_live_window_id.is_none());
+            // Viewer-mode settings use this path to close mounted + passive detached sessions.
+            // It is a no-op when no such window/session exists.
+            if self.close_all_detached_viewers_for_mode_change(ctx) {
+                return;
             }
-            for window in &self.detached_image_windows {
-                if let Some(bundle) = window.paused_bundle.as_deref() {
-                    for entry in bundle.fs_cache.values() {
-                        if let FsCacheEntry::Video { player, .. } = entry {
-                            player.set_native_ui_scale(scale);
-                        }
-                    }
-                }
+            if mounted_source_swap_presenter {
+                self.close_fullscreen();
+                ctx.request_repaint();
+                return;
             }
+        }
+
+        // Native fullscreen has no egui detached host, so the detached teardown can be a no-op.
+        // `close_fullscreen` also drops mounted source-swap/native-output pending state.
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+            ctx.request_repaint();
         }
     }
 
@@ -31663,7 +31677,11 @@ impl App {
         }
 
         let placement = self.active_detached_viewer_current_placement();
-        let scale = self.last_pixels_per_point.max(0.5);
+        let scale = crate::settings::native_pixels_per_point_from_effective(
+            self.last_pixels_per_point,
+            self.settings.ui_scale_factor,
+        )
+        .max(0.5);
         let x = (placement.x + placement.w * 0.5) * scale;
         let y = (placement.y + placement.h * 0.5) * scale;
         crate::monitor::get_monitor_logical_rect_at(x, y)
@@ -31753,19 +31771,59 @@ impl App {
             );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(true));
-            ctx.send_viewport_cmd_to(
-                viewport_id,
-                egui::ViewportCommand::OuterPosition(egui::pos2(placement.x, placement.y)),
+            let viewport_position = egui::pos2(
+                crate::settings::window_geometry_to_viewport_points(
+                    placement.x,
+                    self.settings.ui_scale_factor,
+                ),
+                crate::settings::window_geometry_to_viewport_points(
+                    placement.y,
+                    self.settings.ui_scale_factor,
+                ),
+            );
+            let viewport_inner_size = egui::vec2(
+                crate::settings::window_geometry_to_viewport_points(
+                    placement.w,
+                    self.settings.ui_scale_factor,
+                ),
+                crate::settings::window_geometry_to_viewport_points(
+                    placement.h,
+                    self.settings.ui_scale_factor,
+                ),
             );
             ctx.send_viewport_cmd_to(
                 viewport_id,
-                egui::ViewportCommand::InnerSize(egui::vec2(placement.w, placement.h)),
+                egui::ViewportCommand::OuterPosition(viewport_position),
+            );
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::InnerSize(viewport_inner_size),
             );
             if placement.maximized {
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
             }
         } else {
             let rect = self.detached_viewer_borderless_target_rect();
+            let viewport_position = egui::pos2(
+                crate::settings::window_geometry_to_viewport_points(
+                    rect.min.x,
+                    self.settings.ui_scale_factor,
+                ),
+                crate::settings::window_geometry_to_viewport_points(
+                    rect.min.y,
+                    self.settings.ui_scale_factor,
+                ),
+            );
+            let viewport_inner_size = egui::vec2(
+                crate::settings::window_geometry_to_viewport_points(
+                    rect.width(),
+                    self.settings.ui_scale_factor,
+                ),
+                crate::settings::window_geometry_to_viewport_points(
+                    rect.height(),
+                    self.settings.ui_scale_factor,
+                ),
+            );
             self.detached_viewer_borderless_fullscreen = true;
             self.log_detached_viewport_placement_event(
                 "borderless_enter",
@@ -31781,8 +31839,14 @@ impl App {
             );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(false));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::OuterPosition(rect.min));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::InnerSize(rect.size()));
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::OuterPosition(viewport_position),
+            );
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::InnerSize(viewport_inner_size),
+            );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
         }
         ctx.request_repaint();
@@ -31829,7 +31893,11 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn detached_viewer_rect_physical(&self) -> windows::Win32::Foundation::RECT {
         let placement = self.active_detached_viewer_current_placement();
-        let scale = self.last_pixels_per_point.max(0.5);
+        let scale = crate::settings::native_pixels_per_point_from_effective(
+            self.last_pixels_per_point,
+            self.settings.ui_scale_factor,
+        )
+        .max(0.5);
         windows::Win32::Foundation::RECT {
             left: (placement.x * scale).round() as i32,
             top: (placement.y * scale).round() as i32,
@@ -31915,6 +31983,23 @@ impl App {
         {
             return None;
         }
+        let ui_scale = self.settings.ui_scale_factor;
+        let to_window_geometry_rect = |rect: egui::Rect| {
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    crate::settings::viewport_points_to_window_geometry(rect.min.x, ui_scale),
+                    crate::settings::viewport_points_to_window_geometry(rect.min.y, ui_scale),
+                ),
+                egui::pos2(
+                    crate::settings::viewport_points_to_window_geometry(rect.max.x, ui_scale),
+                    crate::settings::viewport_points_to_window_geometry(rect.max.y, ui_scale),
+                ),
+            )
+        };
+        let outer_rect = to_window_geometry_rect(outer_rect);
+        let inner_rect = inner_rect.map(to_window_geometry_rect);
+        let geometry_ppp =
+            crate::settings::native_pixels_per_point_from_effective(pixels_per_point, ui_scale);
         let Some(window_id) = self.active_detached_hwnd_window_id() else {
             self.log_detached_viewport_placement_event(
                 source,
@@ -31988,7 +32073,7 @@ impl App {
                 && Self::detached_active_placement_update_looks_like_default_viewport(
                     previous,
                     placement,
-                    pixels_per_point,
+                    geometry_ppp,
                 )
             {
                 self.log_detached_viewport_placement_event(
@@ -40451,19 +40536,44 @@ impl App {
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
     pub(crate) fn persist_window_state_and_flush(&mut self) {
         if let Some(rect) = self.last_outer_rect {
-            if crate::monitor::title_bar_on_some_monitor(rect.min.x, rect.min.y, rect.width()) {
-                self.settings.window_pos = Some([rect.min.x, rect.min.y]);
+            let x = crate::settings::viewport_points_to_window_geometry(
+                rect.min.x,
+                self.settings.ui_scale_factor,
+            );
+            let y = crate::settings::viewport_points_to_window_geometry(
+                rect.min.y,
+                self.settings.ui_scale_factor,
+            );
+            let w = crate::settings::viewport_points_to_window_geometry(
+                rect.width(),
+                self.settings.ui_scale_factor,
+            );
+            if crate::monitor::title_bar_on_some_monitor(x, y, w) {
+                self.settings.window_pos = Some([x, y]);
             } else {
                 crate::logger::log(format!(
                     "[window] skipped saving off-screen main window position: ({:.1}, {:.1}) size={:.1}x{:.1}",
-                    rect.min.x,
-                    rect.min.y,
-                    rect.width(),
-                    rect.height()
+                    x,
+                    y,
+                    w,
+                    crate::settings::viewport_points_to_window_geometry(
+                        rect.height(),
+                        self.settings.ui_scale_factor,
+                    )
                 ));
             }
         }
-        if let Some(size) = self.last_inner_size {
+        if let Some(raw_size) = self.last_inner_size {
+            let size = [
+                crate::settings::viewport_points_to_window_geometry(
+                    raw_size[0],
+                    self.settings.ui_scale_factor,
+                ),
+                crate::settings::viewport_points_to_window_geometry(
+                    raw_size[1],
+                    self.settings.ui_scale_factor,
+                ),
+            ];
             if size[0].is_finite()
                 && size[1].is_finite()
                 && size[0] >= 320.0
@@ -50375,10 +50485,20 @@ impl eframe::App for App {
             // DPI が確定した初回フレームで意図したサイズを再適用して矯正する。
             if let Some([w, h]) = self.pending_initial_size.take() {
                 let ppp = ctx.input(|i| i.pixels_per_point);
+                let viewport_size = egui::vec2(
+                    crate::settings::window_geometry_to_viewport_points(
+                        w,
+                        self.settings.ui_scale_factor,
+                    ),
+                    crate::settings::window_geometry_to_viewport_points(
+                        h,
+                        self.settings.ui_scale_factor,
+                    ),
+                );
                 crate::logger::log(format!(
                     "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2}"
                 ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
             }
         }
 

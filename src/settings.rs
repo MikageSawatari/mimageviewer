@@ -32,6 +32,31 @@ pub fn apply_ui_scale_factor(ctx: &egui::Context, value: f32) -> f32 {
     normalized
 }
 
+/// OS DPI only の論理 window geometry を、egui viewport API に渡す points へ変換する。
+///
+/// eframe は viewport の size / position に main Context の `zoom_factor` を掛けてから
+/// winit へ渡すため、物理 window geometry を UI 表示倍率から独立させる箇所では、ここで
+/// 追加倍率だけを相殺する。native DPI は winit 側の logical -> physical 変換に残す。
+pub fn window_geometry_to_viewport_points(value: f32, ui_scale: f32) -> f32 {
+    value / normalize_ui_scale_factor(ui_scale)
+}
+
+/// egui が報告した viewport points を、UI 表示倍率に依存しない OS DPI only の論理
+/// window geometry へ戻す。
+pub fn viewport_points_to_window_geometry(value: f32, ui_scale: f32) -> f32 {
+    value * normalize_ui_scale_factor(ui_scale)
+}
+
+/// main Context の実効 ppp (`native_ppp * ui_scale`) から OS native ppp を取り出す。
+pub fn native_pixels_per_point_from_effective(effective_ppp: f32, ui_scale: f32) -> f32 {
+    let effective_ppp = if effective_ppp.is_finite() && effective_ppp > 0.0 {
+        effective_ppp
+    } else {
+        1.0
+    };
+    effective_ppp / normalize_ui_scale_factor(ui_scale)
+}
+
 pub fn ui_scale_factor_steps() -> impl ExactSizeIterator<Item = f32> {
     (0..UI_SCALE_FACTOR_STEP_COUNT)
         .map(|step| UI_SCALE_FACTOR_MIN + step as f32 * UI_SCALE_FACTOR_STEP)
@@ -5311,6 +5336,45 @@ mod tests {
         ctx.begin_pass(egui::RawInput::default());
         let _ = ctx.end_pass();
         assert_f32_close(ctx.zoom_factor(), 1.5);
+    }
+
+    #[test]
+    fn viewport_window_geometry_keeps_physical_size_across_ui_scale_and_dpi() {
+        let intended_os_logical = 1600.0_f32;
+        for native_ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            let intended_physical = intended_os_logical * native_ppp;
+            for ui_scale in [0.5_f32, 1.0, 1.5, 2.0] {
+                let viewport_points =
+                    window_geometry_to_viewport_points(intended_os_logical, ui_scale);
+                let effective_ppp = native_ppp * ui_scale;
+                assert!((viewport_points * effective_ppp - intended_physical).abs() < 1.0e-3);
+                assert!(
+                    (viewport_points_to_window_geometry(viewport_points, ui_scale)
+                        - intended_os_logical)
+                        .abs()
+                        < 1.0e-3
+                );
+                assert!(
+                    (native_pixels_per_point_from_effective(effective_ppp, ui_scale) - native_ppp)
+                        .abs()
+                        < 1.0e-3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_window_geometry_is_bit_identical_at_one_hundred_percent() {
+        for value in [-1920.0_f32, 0.0, 720.5, 3840.0] {
+            assert_eq!(
+                window_geometry_to_viewport_points(value, 1.0).to_bits(),
+                value.to_bits()
+            );
+            assert_eq!(
+                viewport_points_to_window_geometry(value, 1.0).to_bits(),
+                value.to_bits()
+            );
+        }
     }
 
     // -- Toolbar section order (v2.0.0 Phase 1) --

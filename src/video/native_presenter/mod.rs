@@ -2678,14 +2678,6 @@ impl NativeVideoPresenter {
             .unwrap_or(false)
     }
 
-    /// main egui Context の UI 表示倍率を native overlay に同期する。
-    pub fn set_ui_scale(&mut self, ui_scale: f32) -> bool {
-        self.egui_overlay
-            .as_mut()
-            .map(|o| o.set_ui_scale(ui_scale))
-            .unwrap_or(false)
-    }
-
     /// **overlay (egui_wgpu) の surface だけ** を resize する。
     /// presenter 全体 (= background / video transform / swap chain) は触らない。
     ///
@@ -4054,15 +4046,6 @@ impl NativeEguiOverlay {
             os_ppp,
             self.ui_scale,
         ))
-    }
-
-    fn set_ui_scale(&mut self, ui_scale: f32) -> bool {
-        let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
-        if (self.ui_scale - ui_scale).abs() < f32::EPSILON {
-            return false;
-        }
-        self.ui_scale = ui_scale;
-        self.set_os_pixels_per_point(pixels_per_point_for_hwnd(self.dcomp_hwnd))
     }
 
     fn set_effective_pixels_per_point(&mut self, ppp: f32) -> bool {

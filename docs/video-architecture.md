@@ -205,8 +205,10 @@ raise 経路で **allowlist 判定**):
 `WM_DPICHANGED` → `DpiChanged` event → `set_overlay_pixels_per_point(dpi/96.0)` + HUD
 `set_hud_geometry(suggested_rect)` + `resize_overlay_surface_only`。`NativeEguiOverlay` は main egui
 Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源を
-`(dpi / 96.0) * ui_scale` とする。`NativeVideoOutput.cur_ui_scale` と command 経路で実行中の変更を
-伝え、placement 切替で presenter を再生成するときも同じ値を再適用する。presenter HWND 自身
+`(dpi / 96.0) * ui_scale` とする。placement 切替で presenter を再生成するときは session 生成時の
+値を再適用する。settings から UI 表示倍率を変更した場合は live propagation せず、ビューワモード
+設定変更と同じ close 経路で active fullscreen / detached / native presenter session を閉じる。
+再 open で新倍率を適用するため、短い再生中断は許容する。presenter HWND 自身
 (= video transform / background) には影響させず、VST editor の別 HWND にもアプリ内倍率を掛けない。
 
 **フォールバック経路**: HUD HWND 生成失敗 / 環境変数 `MIV_HUD_OVERLAY=0` でフォールバック有効化。

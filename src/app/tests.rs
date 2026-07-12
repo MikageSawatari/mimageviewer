@@ -25095,6 +25095,36 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn ui_scale_change_without_active_viewer_does_not_run_viewer_teardown() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.ui_scale_factor = 1.0;
+
+        app.set_ui_scale_factor(&ctx, 1.5);
+
+        assert_eq!(app.settings.ui_scale_factor, 1.5);
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.pending_detached_cleanup_font_atlas_resync.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ui_scale_change_closes_active_viewer_but_same_value_does_not() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\page.jpg");
+        app.settings.ui_scale_factor = 1.0;
+        app.fullscreen_idx = Some(idx);
+
+        app.set_ui_scale_factor(&ctx, 1.0);
+        assert_eq!(app.fullscreen_idx, Some(idx));
+
+        app.set_ui_scale_factor(&ctx, 1.5);
+        assert!(app.fullscreen_idx.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn linked_live_media_park_keeps_main_grid_context() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
