@@ -1371,6 +1371,7 @@ fn details_column_rects_for_columns(
     out
 }
 
+#[cfg(test)]
 fn details_column_rects(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
@@ -2150,6 +2151,7 @@ impl SelectionInfoContent {
         self.lines.join("\n")
     }
 
+    #[cfg(test)]
     fn single_line_text(&self) -> String {
         self.lines.join("   ")
     }
