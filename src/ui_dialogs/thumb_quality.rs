@@ -61,6 +61,8 @@ impl App {
                         ui.set_min_width(360.0);
                         if self.tq.load_pending.is_some() {
                             ui.label("サンプル画像を読み込み中…");
+                        } else if self.tq.load_failed {
+                            ui.label("サンプル画像を読み込めませんでした。");
                         } else {
                             ui.label("画像を1枚選択してからもう一度お試しください。");
                         }
@@ -73,11 +75,8 @@ impl App {
                     }
 
                     // サンプル画像情報
-                    if let Some(ref p) = self.tq.sample_path {
-                        ui.label(
-                            egui::RichText::new(format!("サンプル: {}", p.to_string_lossy()))
-                                .small(),
-                        );
+                    if let Some(ref display_name) = self.tq.sample_display_name {
+                        ui.label(egui::RichText::new(format!("サンプル: {display_name}")).small());
                     }
                     if let Some(ref img) = self.tq.sample {
                         let sz = self.tq.sample_original_size;

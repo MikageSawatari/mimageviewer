@@ -236,33 +236,6 @@
   現行 UI / 入力経路からは参照しない。
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
 
-### 4.4 サムネイル画質設定の ZIP 内画像サンプル対応
-
-- 背景: mImageViewer 専用スレ 12。「設定 → サムネイル画質設定」が ZIP 内画像選択時に
-  「画像を1枚選択してからもう一度お試しください。」となり設定できないという報告。
-- 現状:
-  - `open_thumb_quality_dialog` は `last_selected_image_path: Option<PathBuf>` を使い、
-    worker で `image::open(path)` して A/B サンプルを作る。
-  - `update_last_selected_image` は `GridItem::Image` の実ファイルパスだけを保存し、
-    `GridItem::ZipImage` / `PdfPage` は対象外。ZIP 内画像は実パスが無いため現状の構造では
-    サンプルにできない。
-- 方針:
-  - `last_selected_image_path` ではなく、選択中 item からサンプル取得ジョブを作る構造へ変える。
-    初期対応は `GridItem::Image` と `GridItem::ZipImage`。ZIP は `zip_loader::read_entry_bytes`
-    で entry bytes を読み、`image::load_from_memory` でデコードする。
-  - PDF ページは PDFium worker / render サイズの扱いが別になるため、同時対応するか別タスクにするか判断する。
-    まずはメッセージを「ZIP/PDF内ページは未対応」ではなく実対応に寄せたい。
-  - デコードは現在と同じく worker で行い、UI スレッドで ZIP 読み / 画像デコードをしない。
-  - サンプル表示名は実パスだけでなく `book.zip > page.jpg` のような仮想表示名を持てるようにする。
-- 確認:
-  - 通常画像と ZIP 内画像でサムネイル画質 A/B ダイアログが開く。
-  - 壊れた ZIP entry / 非対応画像 / ZIP が削除済みの場合は失敗メッセージを出し、UI は固まらない。
-  - 画質適用後のキャッシュ再生成が通常画像 / ZIP 内画像で同じ設定を使う。
-- 優先度: P2 candidate。報告としてはバグ寄りだが、PDF 対応まで含めると範囲が広がるため
-  ZIP 内画像を先に小さく直す。
-
----
-
 ## 5. リリース前確認 / 依存更新
 
 ### 5.1 ネイティブ依存

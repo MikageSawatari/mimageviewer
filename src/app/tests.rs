@@ -1238,6 +1238,111 @@ mod phase_c_support {
 }
 
 #[cfg(test)]
+mod thumb_quality_sample_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    #[test]
+    fn update_last_selected_image_tracks_file_and_zip_sources() {
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("C:/Pictures/page001.jpg")),
+            GridItem::ZipImage {
+                zip_path: PathBuf::from("C:/Books/book.zip"),
+                entry_name: "chapter01/page002.png".to_owned(),
+            },
+        ];
+
+        app.selected = Some(0);
+        app.update_last_selected_image();
+        assert!(matches!(
+            app.last_selected_thumb_sample.as_ref(),
+            Some(ThumbSampleSource::File(path))
+                if path == &PathBuf::from("C:/Pictures/page001.jpg")
+        ));
+
+        app.selected = Some(1);
+        app.update_last_selected_image();
+        assert!(matches!(
+            app.last_selected_thumb_sample.as_ref(),
+            Some(ThumbSampleSource::ZipEntry { zip_path, entry_name })
+                if zip_path == &PathBuf::from("C:/Books/book.zip")
+                    && entry_name == "chapter01/page002.png"
+        ));
+    }
+
+    #[test]
+    fn update_last_selected_image_preserves_source_for_unsupported_items() {
+        let mut app = setup_app();
+        let previous = PathBuf::from("C:/Pictures/previous.jpg");
+        app.last_selected_thumb_sample = Some(ThumbSampleSource::File(previous.clone()));
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("C:/Books/book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::Video(PathBuf::from("C:/Videos/clip.mp4")),
+        ];
+        app.selected = Some(0);
+
+        app.update_last_selected_image();
+
+        assert!(matches!(
+            app.last_selected_thumb_sample.as_ref(),
+            Some(ThumbSampleSource::File(path)) if path == &previous
+        ));
+
+        app.selected = Some(1);
+        app.update_last_selected_image();
+        assert!(matches!(
+            app.last_selected_thumb_sample.as_ref(),
+            Some(ThumbSampleSource::File(path)) if path == &previous
+        ));
+    }
+
+    #[test]
+    fn zip_sample_display_name_uses_archive_and_entry_base_names() {
+        let source = ThumbSampleSource::ZipEntry {
+            zip_path: PathBuf::from("C:/Books/book.zip"),
+            entry_name: "chapter01/sub/page.jpg".to_owned(),
+        };
+
+        assert_eq!(source.display_name(), "book.zip > page.jpg");
+    }
+
+    #[test]
+    fn thumb_quality_load_failure_is_distinct_from_no_selection() {
+        let mut app = setup_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(None).unwrap();
+        app.tq.load_pending = Some(ThumbQualityLoadPending {
+            display_name: "broken.zip > page.jpg".to_owned(),
+            rx,
+        });
+
+        app.poll_thumb_quality_pending(&egui::Context::default());
+
+        assert!(app.tq.load_pending.is_none());
+        assert!(app.tq.sample.is_none());
+        assert!(app.tq.load_failed);
+    }
+
+    #[test]
+    fn opening_thumb_quality_dialog_resets_previous_load_failure() {
+        let mut app = setup_app();
+        app.tq.load_failed = true;
+        app.last_selected_thumb_sample = None;
+
+        app.open_thumb_quality_dialog(&egui::Context::default());
+
+        assert!(app.tq.show);
+        assert!(app.tq.load_pending.is_none());
+        assert!(!app.tq.load_failed);
+    }
+}
+
+#[cfg(test)]
 mod startup_open_path_resolve_tests {
     use super::phase_c_support::setup_app;
     use super::*;

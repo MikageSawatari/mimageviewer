@@ -7,8 +7,9 @@ impl App {
     pub(crate) fn open_thumb_quality_dialog(&mut self, _ctx: &egui::Context) {
         // 既存状態をリセット
         self.tq.sample = None;
-        self.tq.sample_path = None;
+        self.tq.sample_display_name = None;
         self.tq.sample_original_size = 0;
+        self.tq.load_failed = false;
         self.tq.a_texture = None;
         self.tq.b_texture = None;
         self.tq.a_bytes = 0;
@@ -22,30 +23,39 @@ impl App {
         self.tq.b_size = self.settings.thumb_px;
         self.tq.b_quality = (self.settings.thumb_quality as u32 + 10).min(95) as u8;
 
-        // 最後に選択した画像を取得
-        let Some(path) = self.last_selected_image_path.clone() else {
+        // 最後に選択した有効な画像サンプルを取得
+        let Some(source) = self.last_selected_thumb_sample.clone() else {
             // None のままダイアログを開く (メッセージだけ出る)
             self.tq.show = true;
             return;
         };
 
-        // decode を worker に回す。20MP 超や巨大 RAW の image::open + metadata は UI を
+        // decode を worker に回す。20MP 超や巨大 RAW の image::open、ZIP entry 読込は UI を
         // 数百ms〜秒単位止めるため同期実行しない。ダイアログは即座に「読み込み中」で開く。
         let (tx, rx) = mpsc::channel();
-        let path_for_worker = path.clone();
+        let display_name = source.display_name();
         std::thread::Builder::new()
             .name("thumb-quality-sample-decode".into())
             .spawn(move || {
-                let result = image::open(&path_for_worker).ok().map(|img| {
-                    let orig = std::fs::metadata(&path_for_worker)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    (img, orig)
-                });
+                let result = match source {
+                    ThumbSampleSource::File(path) => image::open(&path).ok().map(|img| {
+                        let orig = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        (img, orig)
+                    }),
+                    ThumbSampleSource::ZipEntry {
+                        zip_path,
+                        entry_name,
+                    } => crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+                        .ok()
+                        .and_then(|bytes| {
+                            let orig = bytes.len() as u64;
+                            image::load_from_memory(&bytes).ok().map(|img| (img, orig))
+                        }),
+                };
                 let _ = tx.send(result);
             })
             .ok();
-        self.tq.load_pending = Some(ThumbQualityLoadPending { path, rx });
+        self.tq.load_pending = Some(ThumbQualityLoadPending { display_name, rx });
         self.tq.show = true;
     }
 
@@ -65,17 +75,18 @@ impl App {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.tq.load_pending = None;
+                self.tq.load_failed = true;
                 return;
             }
         };
-        let path = pending.path.clone();
+        let display_name = pending.display_name.clone();
         self.tq.load_pending = None;
         let Some((img, orig_size)) = msg else {
-            // decode 失敗 — 空状態のまま残す
+            self.tq.load_failed = true;
             return;
         };
         self.tq.sample = Some(Arc::new(img));
-        self.tq.sample_path = Some(path);
+        self.tq.sample_display_name = Some(display_name);
         self.tq.sample_original_size = orig_size;
         self.reencode_tq_panel(true);
         self.reencode_tq_panel(false);
@@ -201,7 +212,8 @@ impl App {
     pub(crate) fn close_thumb_quality_dialog(&mut self) {
         self.tq.show = false;
         self.tq.sample = None;
-        self.tq.sample_path = None;
+        self.tq.sample_display_name = None;
+        self.tq.load_failed = false;
         self.tq.a_texture = None;
         self.tq.b_texture = None;
         self.tq.fullscreen = false;

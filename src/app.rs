@@ -4627,11 +4627,42 @@ pub(crate) struct PendingTagUndo {
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
 // -----------------------------------------------------------------------
 
+#[derive(Clone)]
+pub(crate) enum ThumbSampleSource {
+    File(PathBuf),
+    ZipEntry {
+        zip_path: PathBuf,
+        entry_name: String,
+    },
+}
+
+impl ThumbSampleSource {
+    pub(crate) fn display_name(&self) -> String {
+        match self {
+            Self::File(path) => path.to_string_lossy().into_owned(),
+            Self::ZipEntry {
+                zip_path,
+                entry_name,
+            } => {
+                let zip_name = zip_path
+                    .file_name()
+                    .unwrap_or_else(|| zip_path.as_os_str())
+                    .to_string_lossy();
+                let entry_name = entry_name
+                    .rsplit(|c| c == '/' || c == '\\')
+                    .find(|name| !name.is_empty())
+                    .unwrap_or(entry_name);
+                format!("{zip_name} > {entry_name}")
+            }
+        }
+    }
+}
+
 /// サムネイル画質 A/B ダイアログの初期サンプル decode を worker 化するための pending。
 /// ダイアログは即座に「読み込み中」表示で開き、decode 完了後にサンプル + A/B プレビューを
 /// 構築する (docs/ui-responsiveness.md §4)。
 pub(crate) struct ThumbQualityLoadPending {
-    pub path: PathBuf,
+    pub display_name: String,
     pub rx: mpsc::Receiver<Option<(image::DynamicImage, u64)>>,
 }
 
@@ -4654,12 +4685,14 @@ pub(crate) struct ThumbQualityState {
     /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)。`Arc` で worker 共有し、
     /// clone コストを O(1) にする。20MP 級の DynamicImage を worker 都度コピーするのは高価。
     pub sample: Option<Arc<image::DynamicImage>>,
-    /// サンプル画像のパス表示用
-    pub sample_path: Option<PathBuf>,
+    /// サンプル画像の表示名。ZIP entry は `book.zip > page.jpg` 形式の仮想名を保持する。
+    pub sample_display_name: Option<String>,
     /// サンプル画像の元ファイルサイズ (bytes)
     pub sample_original_size: u64,
     /// サンプル decode 進行中の pending (ダイアログ開く時に spawn)
     pub load_pending: Option<ThumbQualityLoadPending>,
+    /// サンプルの読込または decode に失敗した。未選択 (`false`) と区別して案内する。
+    pub load_failed: bool,
     /// パネル A: サイズ (long side px)
     pub a_size: u32,
     /// パネル A: 品質 (1–100)
@@ -6796,8 +6829,8 @@ pub struct App {
     /// 「すべて削除」確認ステップ
     pub(crate) archive_cache_confirm_delete_all: bool,
 
-    // ── 最後に選択した画像 (サムネイル画質ダイアログで使用) ──
-    pub(crate) last_selected_image_path: Option<PathBuf>,
+    // ── 最後に選択した有効なサムネイル画質サンプル ──
+    pub(crate) last_selected_thumb_sample: Option<ThumbSampleSource>,
 
     // ── サムネイル画質設定ダイアログ ───────────────────────────
     pub(crate) tq: ThumbQualityState,
@@ -9689,7 +9722,7 @@ impl App {
             archive_cache_selection: std::collections::HashSet::new(),
             archive_cache_manager_result: None,
             archive_cache_confirm_delete_all: false,
-            last_selected_image_path: None,
+            last_selected_thumb_sample: None,
             tq: ThumbQualityState {
                 fs_divider: 0.5,
                 a_size: 512,
@@ -48309,14 +48342,28 @@ impl App {
         self.evict_adjustment_cache_for_keep_set(&keep_set);
     }
 
-    /// `self.selected` に対応するアイテムが画像の場合、パスを last_selected_image_path に保存する。
+    /// `self.selected` に対応するアイテムがサンプル対応画像の場合、取得元を保存する。
     /// (フォルダ移動後もサムネイル画質ダイアログで使えるよう、セッション内で保持)
     pub(crate) fn update_last_selected_image(&mut self) {
-        if let Some(idx) = self.selected {
-            if let Some(GridItem::Image(p)) = self.items.get(idx) {
-                self.last_selected_image_path = Some(p.clone());
+        let Some(item) = self.selected.and_then(|idx| self.items.get(idx)) else {
+            return;
+        };
+        let source = match item {
+            GridItem::Image(path) => ThumbSampleSource::File(path.clone()),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => ThumbSampleSource::ZipEntry {
+                zip_path: zip_path.clone(),
+                entry_name: entry_name.clone(),
+            },
+            GridItem::PdfPage { .. } => {
+                // TODO: PDF ページは PDFium worker 経路と render サイズを設計してから対応する。
+                return;
             }
-        }
+            _ => return,
+        };
+        self.last_selected_thumb_sample = Some(source);
     }
 
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
