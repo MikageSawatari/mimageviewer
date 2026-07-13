@@ -2372,7 +2372,7 @@ impl App {
                                         }
                                         MenuCommandId::FileReadingHistory => {
                                             if ui.button(&reading_history_menu_label).clicked() {
-                                                self.enter_reading_history();
+                                                self.enter_reading_history_from_menu();
                                                 ui.close();
                                             }
                                             ui.menu_button("レーティング一覧", |ui| {
@@ -2384,7 +2384,7 @@ impl App {
                                                         ))
                                                         .clicked()
                                                     {
-                                                        self.enter_rating_view(stars);
+                                                        self.enter_rating_view_from_menu(stars);
                                                         ui.close();
                                                     }
                                                 }
@@ -2431,7 +2431,7 @@ impl App {
                                                 .button(rating_view_menu_label(stars, rating_counts))
                                                 .clicked()
                                             {
-                                                self.enter_rating_view(stars);
+                                                self.enter_rating_view_from_menu(stars);
                                                 ui.close();
                                             }
                                         }
@@ -7939,9 +7939,7 @@ impl App {
                         // 検索 (Ctrl+G / Ctrl+S) 中は ←/→ を無効化する。検索は透明な
                         // 一時オーバーレイで、フォルダ履歴の概念が適用されないため。
                         // ★固定 中も同様に無効化 (Codex P2-1)。
-                        let back_hover = if drive_list_active {
-                            "ドライブ一覧では履歴ナビを使用できません".to_string()
-                        } else if snapshot_active {
+                        let back_hover = if snapshot_active {
                             "★固定中は履歴ナビを使用できません".to_string()
                         } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
@@ -7953,10 +7951,7 @@ impl App {
                         };
                         if ui
                             .add_enabled(
-                                back_target.is_some()
-                                    && !search_active
-                                    && !snapshot_active
-                                    && !drive_list_active,
+                                back_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("←"),
                             )
                             .hover_tip(back_hover)
@@ -7964,9 +7959,7 @@ impl App {
                         {
                             result = Some(AddressBarNav::HistoryBack);
                         }
-                        let forward_hover = if drive_list_active {
-                            "ドライブ一覧では履歴ナビを使用できません".to_string()
-                        } else if snapshot_active {
+                        let forward_hover = if snapshot_active {
                             "★固定中は履歴ナビを使用できません".to_string()
                         } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
@@ -7978,10 +7971,7 @@ impl App {
                         };
                         if ui
                             .add_enabled(
-                                forward_target.is_some()
-                                    && !search_active
-                                    && !snapshot_active
-                                    && !drive_list_active,
+                                forward_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("→"),
                             )
                             .hover_tip(forward_hover)
@@ -8079,7 +8069,9 @@ impl App {
                             }
                         } else {
                             // Codex P2-1: ★固定 中は親への移動 (= scope 外) を disabled
-                            let parent_hover = if snapshot_active {
+                            let parent_hover = if drive_list_active {
+                                "ドライブ一覧には親フォルダがありません".to_string()
+                            } else if snapshot_active {
                                 "★固定中は親フォルダへ移動できません".to_string()
                             } else if local_search_blocks_parent {
                                 "Ctrl+F フィルタ中は親フォルダへ移動できません\nEsc または × で検索を閉じます"
@@ -8213,7 +8205,7 @@ impl App {
                                             .button(rating_view_menu_label(stars, rating_counts))
                                             .clicked()
                                         {
-                                            self.enter_rating_view(stars);
+                                            self.enter_rating_view_from_menu(stars);
                                             ui.close();
                                         }
                                     }

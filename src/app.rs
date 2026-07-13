@@ -83,8 +83,11 @@ const CURRENT_FOLDER_WATCH_DEBOUNCE_MS: u64 = 700;
 pub(crate) struct FolderNavHistorySnapshot {
     back_stack: Vec<PathBuf>,
     forward_stack: Vec<PathBuf>,
+    back_rating_view_stars: Vec<Option<u8>>,
+    forward_rating_view_stars: Vec<Option<u8>>,
     recent_folders: Vec<PathBuf>,
     suppress_record_once: bool,
+    pending_rating_view_stars: Option<u8>,
     quick_folder_workspaces: [QuickFolderWorkspace; 2],
     active_quick_folder_slot: Option<QuickFolderSlotId>,
     favsearch_nav_stack: Vec<PathBuf>,
@@ -128,6 +131,8 @@ pub(crate) enum QuickFolderSwitchTarget {
 pub(crate) struct FolderNavHistoryState {
     pub back_stack: Vec<PathBuf>,
     pub forward_stack: Vec<PathBuf>,
+    pub back_rating_view_stars: Vec<Option<u8>>,
+    pub forward_rating_view_stars: Vec<Option<u8>>,
     pub suppress_record_once: bool,
 }
 
@@ -4823,6 +4828,12 @@ pub(crate) fn rating_view_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__rating_view__")
 }
 
+/// ドライブ一覧ビューで current_folder に設定する合成パス。
+/// `%APPDATA%/mimageviewer/__drive_list__` (実在させず、フォルダ履歴上の現在地にのみ使用)。
+pub(crate) fn drive_list_synthetic_path() -> PathBuf {
+    crate::data_dir::get().join("__drive_list__")
+}
+
 /// サブフォルダ展開ビューで current_folder に設定する合成パス。
 /// `%APPDATA%/mimageviewer/__subfolder_expansion__` (実在させない、カタログキーとしてのみ使用)。
 pub(crate) fn subfolder_expansion_synthetic_path() -> PathBuf {
@@ -4838,6 +4849,14 @@ pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
         || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
         || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
         || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
+        || crate::folder_tree::path_eq(path, &drive_list_synthetic_path())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyntheticFolderHistoryDispatch {
+    NotSynthetic,
+    Restored,
+    Unavailable,
 }
 
 pub(crate) fn drive_root_path_for_letter(letter: char) -> Option<PathBuf> {
@@ -6435,8 +6454,8 @@ pub struct App {
     /// 現在の `items` がサブフォルダ展開のスナップショット仮想ビューかを示す。
     pub(crate) items_are_subfolder_expansion_view: bool,
     /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
-    /// `current_folder = None` と併用し、通常フォルダの D&D / rating / 代表サムネ探索
-    /// を明示的に止める。
+    /// `current_folder` は履歴用の synthetic marker を持つが、通常フォルダの D&D / rating /
+    /// 代表サムネ探索はこのフラグで明示的に止める。
     pub(crate) items_are_drive_list: bool,
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
@@ -6962,10 +6981,22 @@ pub struct App {
     pub(crate) folder_nav_back_stack: Vec<PathBuf>,
     /// フォルダ移動履歴の進むスタック。末尾が次に進む先。
     pub(crate) folder_nav_forward_stack: Vec<PathBuf>,
+    /// back/forward stack と同じ添字で、レーティング一覧 entry の星数だけを保持する。
+    /// `rating_view_synthetic_path()` は catalog の永続キーでもあるため、星数を path に埋め込まない。
+    pub(crate) folder_nav_back_rating_view_stars: Vec<Option<u8>>,
+    pub(crate) folder_nav_forward_rating_view_stars: Vec<Option<u8>>,
     /// 履歴メニュー用の最近開いたフォルダ。先頭が最新。
     pub(crate) recent_folders: Vec<PathBuf>,
     /// 履歴戻る/進むで発生する次回 load_folder は通常履歴に積まない。
     pub(crate) suppress_folder_nav_record_once: bool,
+    /// navigate_* が pop したレーティング一覧 entry の星数。
+    /// 直後の synthetic dispatch が消費し、同じ単一 synthetic path から星を復元する。
+    pub(crate) pending_folder_nav_rating_view_stars: Option<u8>,
+    /// サブ展開ビューを通常のフォルダ履歴から復元するための退避 state。
+    /// 実フォルダへの遷移で active state が破棄される直前に移し、履歴が
+    /// `__subfolder_expansion__` を指したときに再インストールする。
+    pub(crate) folder_nav_subfolder_restore:
+        Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     /// フォルダバー A/B クイックフォルダのターゲットと、スロットごとの履歴。
     pub(crate) quick_folder_workspaces: [QuickFolderWorkspace; 2],
     /// 現在ナビゲーション履歴を受け持つクイックフォルダスロット。
@@ -7330,6 +7361,8 @@ pub struct App {
     pub(crate) rating_view_stars: u8,
     pub(crate) rating_view_sort: crate::rating_view::RatingViewSort,
     pub(crate) rating_view_rows: Vec<crate::rating_view::RatingViewRow>,
+    /// rating_view_rows がどの星の build 完了結果か。空の正規結果と未ロードを区別する。
+    pub(crate) rating_view_rows_stars: Option<u8>,
     pub(crate) rating_view_pending: Option<crate::rating_view::RatingViewPending>,
     pub(crate) rating_view_skipped: usize,
     pub(crate) rating_view_saved_folder: Option<PathBuf>,
@@ -9765,8 +9798,12 @@ impl App {
             folder_pane: crate::folder_pane::FolderPaneState::default(),
             folder_nav_back_stack: Vec::new(),
             folder_nav_forward_stack: Vec::new(),
+            folder_nav_back_rating_view_stars: Vec::new(),
+            folder_nav_forward_rating_view_stars: Vec::new(),
             recent_folders,
             suppress_folder_nav_record_once: false,
+            pending_folder_nav_rating_view_stars: None,
+            folder_nav_subfolder_restore: None,
             quick_folder_workspaces,
             active_quick_folder_slot: Some(QuickFolderSlotId::A),
             suppress_nav_record_for_search_restore: false,
@@ -9879,6 +9916,7 @@ impl App {
             rating_view_stars: 0,
             rating_view_sort: crate::rating_view::RatingViewSort::default(),
             rating_view_rows: Vec::new(),
+            rating_view_rows_stars: None,
             rating_view_pending: None,
             rating_view_skipped: 0,
             rating_view_saved_folder: None,
@@ -11859,9 +11897,13 @@ impl App {
     }
 
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
-        self.archive_source_override
-            .clone()
-            .or_else(|| self.current_folder.clone())
+        if self.items_are_drive_list {
+            None
+        } else {
+            self.archive_source_override
+                .clone()
+                .or_else(|| self.current_folder.clone())
+        }
     }
 
     pub(crate) fn current_location_root(&self) -> Option<PathBuf> {
@@ -12134,7 +12176,7 @@ impl App {
                 true
             }
             crate::ui_main::AddressBarNav::DriveList(origin) => {
-                self.enter_drive_list(origin);
+                self.enter_drive_list_from_navigation(origin);
                 true
             }
             crate::ui_main::AddressBarNav::ReadingHistory => {
@@ -12167,27 +12209,62 @@ impl App {
                 })
     }
 
-    fn push_folder_nav_stack(stack: &mut Vec<PathBuf>, path: PathBuf) {
-        // 合成ビューパス (__search_results__ / __reading_history__ / __rating_view__ /
-        // __subfolder_expansion__) は実在しないため、戻る/進む履歴に積まない。積むと ←/→ で
-        // 実ディレクトリとして開こうとして「表示するファイルがありません」になる (§1.16)。
-        // record_folder_nav_transition は移動元の合成パスを既に弾いているが、
-        // navigate_folder_history_back/forward が現在地を反対スタックへ退避する経路が漏れており、
-        // 読書履歴などを表示中に ←/→ を押すと合成パスへ移動していた。両スタックの単一
-        // チョークポイントであるここで一括して弾く。
-        if is_synthetic_view_path(&path) {
-            return;
+    fn normalize_folder_nav_rating_metadata(
+        stack: &[PathBuf],
+        rating_view_stars: &mut Vec<Option<u8>>,
+    ) {
+        rating_view_stars.resize(stack.len(), None);
+    }
+
+    fn folder_nav_targets_eq(
+        left: &Path,
+        left_rating_view_stars: Option<u8>,
+        right: &Path,
+        right_rating_view_stars: Option<u8>,
+    ) -> bool {
+        if !crate::folder_tree::path_eq(left, right) {
+            return false;
         }
-        if stack
-            .last()
-            .is_some_and(|last| crate::folder_tree::path_eq(last, &path))
-        {
+        if crate::folder_tree::path_eq(left, &rating_view_synthetic_path()) {
+            left_rating_view_stars == right_rating_view_stars
+        } else {
+            true
+        }
+    }
+
+    fn push_folder_nav_stack(
+        stack: &mut Vec<PathBuf>,
+        rating_view_stars: &mut Vec<Option<u8>>,
+        path: PathBuf,
+        stars: Option<u8>,
+    ) {
+        Self::normalize_folder_nav_rating_metadata(stack, rating_view_stars);
+        if stack.last().is_some_and(|last| {
+            Self::folder_nav_targets_eq(
+                last,
+                rating_view_stars.last().copied().flatten(),
+                &path,
+                stars,
+            )
+        }) {
             return;
         }
         stack.push(path);
+        rating_view_stars.push(stars);
         if stack.len() > MAX_FOLDER_NAV_STACK {
             stack.remove(0);
+            rating_view_stars.remove(0);
         }
+    }
+
+    fn pop_folder_nav_stack(
+        stack: &mut Vec<PathBuf>,
+        rating_view_stars: &mut Vec<Option<u8>>,
+    ) -> Option<(PathBuf, Option<u8>)> {
+        Self::normalize_folder_nav_rating_metadata(stack, rating_view_stars);
+        let path = stack.pop()?;
+        let stars = rating_view_stars.pop().flatten();
+        Some((path, stars))
     }
 
     fn active_quick_folder_workspace(&self) -> Option<&QuickFolderWorkspace> {
@@ -12200,19 +12277,31 @@ impl App {
             .map(|slot| &mut self.quick_folder_workspaces[slot.index()])
     }
 
-    fn push_active_folder_nav_back_stack(&mut self, path: PathBuf) {
+    fn push_active_folder_nav_back_stack(&mut self, path: PathBuf, stars: Option<u8>) {
         if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-            Self::push_folder_nav_stack(&mut workspace.history.back_stack, path);
+            Self::push_folder_nav_stack(
+                &mut workspace.history.back_stack,
+                &mut workspace.history.back_rating_view_stars,
+                path,
+                stars,
+            );
         } else {
-            Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, path);
+            Self::push_folder_nav_stack(
+                &mut self.folder_nav_back_stack,
+                &mut self.folder_nav_back_rating_view_stars,
+                path,
+                stars,
+            );
         }
     }
 
     fn clear_active_folder_nav_forward_stack(&mut self) {
         if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             workspace.history.forward_stack.clear();
+            workspace.history.forward_rating_view_stars.clear();
         } else {
             self.folder_nav_forward_stack.clear();
+            self.folder_nav_forward_rating_view_stars.clear();
         }
     }
 
@@ -12346,11 +12435,20 @@ impl App {
                 }
             }
             None if self.items_are_drive_list => QuickFolderSwitchTarget::Current,
-            None => QuickFolderSwitchTarget::DriveList,
+            None => {
+                // A/B 切替自体は履歴に積まない。DriveList の通常入口が行う履歴記録を
+                // 新しく active になった空スロット側で 1 回だけ抑止する。
+                self.set_active_folder_nav_suppress_record_once(true);
+                QuickFolderSwitchTarget::DriveList
+            }
         }
     }
 
     pub(crate) fn update_active_quick_folder_target(&mut self, target: &Path) {
+        // 合成ビューは一時的な current_folder marker。A/B の永続ターゲットへ保存しない。
+        if is_synthetic_view_path(target) {
+            return;
+        }
         if let Some(slot) = self.active_quick_folder_slot {
             let workspace = &mut self.quick_folder_workspaces[slot.index()];
             workspace.target = Some(target.to_path_buf());
@@ -12367,11 +12465,15 @@ impl App {
     /// `record_folder_nav_transition` の自動記録では移動元が正しく取れないケース
     /// (検索から「フォルダに移動」で抜ける等) に、呼び出し側が確定した移動元を渡す。
     pub(crate) fn push_nav_history_entry(&mut self, from: PathBuf) {
-        self.push_active_folder_nav_back_stack(from);
+        self.push_active_folder_nav_back_stack(from, None);
         self.clear_active_folder_nav_forward_stack();
     }
 
     pub(crate) fn remember_recent_folder(&mut self, path: &Path) {
+        // 合成ビューは「履歴▼」の永続 MRU には保存しない。←/→ の session 履歴だけで扱う。
+        if is_synthetic_view_path(path) {
+            return;
+        }
         // 検索 (Ctrl+G / Ctrl+S / Ctrl+T) 中は recent_folders を一切変更しない。
         // record_folder_nav_transition 以外に archive_convert などが直接呼ぶため、
         // recent_folders を汚さないチョークポイントをここに置く。
@@ -12400,6 +12502,28 @@ impl App {
     /// ここで扱う履歴はスクロール復元用の `folder_history` とは別物で、
     /// ユーザーがフォルダバーの ←/→ や履歴メニューで辿るためのもの。
     fn record_folder_nav_transition(&mut self, target: &Path) {
+        self.record_folder_nav_transition_with_rating(target, None);
+    }
+
+    fn folder_nav_current_location(&self) -> Option<PathBuf> {
+        if self.items_are_drive_list {
+            Some(drive_list_synthetic_path())
+        } else {
+            self.effective_folder()
+        }
+    }
+
+    fn folder_nav_rating_view_stars_for_path(&self, path: &Path) -> Option<u8> {
+        (crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
+            && (1..=5).contains(&self.rating_view_stars))
+        .then_some(self.rating_view_stars)
+    }
+
+    fn record_folder_nav_transition_with_rating(
+        &mut self,
+        target: &Path,
+        target_rating_view_stars: Option<u8>,
+    ) {
         if self.detached_viewer_suppresses_main_history_persistence() {
             self.suppress_nav_record_for_search_restore = false;
             self.set_active_folder_nav_suppress_record_once(false);
@@ -12421,11 +12545,22 @@ impl App {
             return;
         }
 
-        if self
-            .current_folder
-            .as_ref()
-            .is_some_and(|current| crate::folder_tree::path_eq(current, target))
-        {
+        let target_rating_view_stars = target_rating_view_stars.filter(|stars| {
+            crate::folder_tree::path_eq(target, &rating_view_synthetic_path())
+                && (1..=5).contains(stars)
+        });
+        let current = self.folder_nav_current_location();
+        let current_rating_view_stars = current
+            .as_deref()
+            .and_then(|path| self.folder_nav_rating_view_stars_for_path(path));
+        if current.as_deref().is_some_and(|current| {
+            Self::folder_nav_targets_eq(
+                current,
+                current_rating_view_stars,
+                target,
+                target_rating_view_stars,
+            )
+        }) {
             self.update_active_quick_folder_target(target);
             self.set_active_folder_nav_suppress_record_once(false);
             return;
@@ -12438,27 +12573,21 @@ impl App {
             return;
         }
 
-        let Some(current) = self.effective_folder() else {
+        let Some(current) = current else {
             self.update_active_quick_folder_target(target);
             return;
         };
-        if crate::folder_tree::path_eq(&current, target) {
+        if Self::folder_nav_targets_eq(
+            &current,
+            current_rating_view_stars,
+            target,
+            target_rating_view_stars,
+        ) {
             self.update_active_quick_folder_target(target);
             return;
         }
 
-        // 合成パス (__search_results__ / __reading_history__ / __rating_view__) は実在しないため、移動元
-        // として履歴スタックに積まない (戻る/Alt+← で実フォルダとして開こうとして失敗する
-        // のを防ぐ。読書履歴へ戻る導線は reading_history_back_nav 経由の専用経路を使う)。
-        // ただし新しい遷移自体は発生しているので forward 履歴はクリアする
-        // (新規ナビゲーションが forward 履歴を無効化する原則)。
-        if is_synthetic_view_path(&current) {
-            self.clear_active_folder_nav_forward_stack();
-            self.update_active_quick_folder_target(target);
-            return;
-        }
-
-        self.push_active_folder_nav_back_stack(current);
+        self.push_active_folder_nav_back_stack(current, current_rating_view_stars);
         self.clear_active_folder_nav_forward_stack();
         self.update_active_quick_folder_target(target);
     }
@@ -12467,8 +12596,11 @@ impl App {
         FolderNavHistorySnapshot {
             back_stack: self.folder_nav_back_stack.clone(),
             forward_stack: self.folder_nav_forward_stack.clone(),
+            back_rating_view_stars: self.folder_nav_back_rating_view_stars.clone(),
+            forward_rating_view_stars: self.folder_nav_forward_rating_view_stars.clone(),
             recent_folders: self.recent_folders.clone(),
             suppress_record_once: self.suppress_folder_nav_record_once,
+            pending_rating_view_stars: self.pending_folder_nav_rating_view_stars,
             quick_folder_workspaces: self.quick_folder_workspaces.clone(),
             active_quick_folder_slot: self.active_quick_folder_slot,
             favsearch_nav_stack: self.favsearch.nav_stack.clone(),
@@ -12481,8 +12613,11 @@ impl App {
     pub(crate) fn restore_folder_nav_history(&mut self, snapshot: FolderNavHistorySnapshot) {
         self.folder_nav_back_stack = snapshot.back_stack;
         self.folder_nav_forward_stack = snapshot.forward_stack;
+        self.folder_nav_back_rating_view_stars = snapshot.back_rating_view_stars;
+        self.folder_nav_forward_rating_view_stars = snapshot.forward_rating_view_stars;
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
+        self.pending_folder_nav_rating_view_stars = snapshot.pending_rating_view_stars;
         self.quick_folder_workspaces = snapshot.quick_folder_workspaces;
         self.active_quick_folder_slot = snapshot
             .active_quick_folder_slot
@@ -12543,22 +12678,115 @@ impl App {
     }
 
     pub(crate) fn navigate_folder_history_back(&mut self) -> Option<PathBuf> {
-        let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-            workspace.history.back_stack.pop()?
-        } else {
-            self.folder_nav_back_stack.pop()?
-        };
-        if let Some(current) = self.effective_folder()
-            && !crate::folder_tree::path_eq(&current, &target)
+        let current = self.folder_nav_current_location();
+        let current_rating_view_stars = current
+            .as_deref()
+            .and_then(|path| self.folder_nav_rating_view_stars_for_path(path));
+        let (target, target_rating_view_stars) =
+            if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+                Self::pop_folder_nav_stack(
+                    &mut workspace.history.back_stack,
+                    &mut workspace.history.back_rating_view_stars,
+                )?
+            } else {
+                Self::pop_folder_nav_stack(
+                    &mut self.folder_nav_back_stack,
+                    &mut self.folder_nav_back_rating_view_stars,
+                )?
+            };
+        if let Some(current) = current
+            && !Self::folder_nav_targets_eq(
+                &current,
+                current_rating_view_stars,
+                &target,
+                target_rating_view_stars,
+            )
         {
             if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-                Self::push_folder_nav_stack(&mut workspace.history.forward_stack, current);
+                Self::push_folder_nav_stack(
+                    &mut workspace.history.forward_stack,
+                    &mut workspace.history.forward_rating_view_stars,
+                    current,
+                    current_rating_view_stars,
+                );
             } else {
-                Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, current);
+                Self::push_folder_nav_stack(
+                    &mut self.folder_nav_forward_stack,
+                    &mut self.folder_nav_forward_rating_view_stars,
+                    current,
+                    current_rating_view_stars,
+                );
             }
         }
+        self.pending_folder_nav_rating_view_stars = target_rating_view_stars;
         self.set_active_folder_nav_suppress_record_once(true);
         Some(target)
+    }
+
+    /// フォルダ履歴が指す合成パスを、実ディレクトリとしてロードせず対応ビューへ戻す。
+    ///
+    /// `Unavailable` は保持 state が既に無いケース。呼び出し側は履歴 snapshot を戻して
+    /// no-op にし、合成パスを `load_folder` へ流してはならない。
+    pub(crate) fn dispatch_synthetic_folder_history_target(
+        &mut self,
+        target: &Path,
+    ) -> SyntheticFolderHistoryDispatch {
+        let target_rating_view_stars = self.pending_folder_nav_rating_view_stars.take();
+        let dispatch = if crate::folder_tree::path_eq(target, &drive_list_synthetic_path()) {
+            let origin = self.effective_folder();
+            self.enter_drive_list(origin);
+            SyntheticFolderHistoryDispatch::Restored
+        } else if crate::folder_tree::path_eq(target, &reading_history_synthetic_path()) {
+            self.enter_reading_history();
+            SyntheticFolderHistoryDispatch::Restored
+        } else if crate::folder_tree::path_eq(target, &rating_view_synthetic_path()) {
+            let stars = target_rating_view_stars.or_else(|| {
+                (1..=5)
+                    .contains(&self.rating_view_stars)
+                    .then_some(self.rating_view_stars)
+            });
+            if let Some(stars) = stars {
+                self.rating_view_nav_stack.clear();
+                self.pending_rating_view_zipdir_open = None;
+                if self.rating_view_rows_stars == Some(stars) && self.rating_view_pending.is_none()
+                {
+                    self.install_rating_view_rows();
+                } else {
+                    self.rating_view_stars = stars;
+                    self.rating_view_sort = crate::rating_view::RatingViewSort::default();
+                    self.reload_current_rating_view_preserving_sort();
+                }
+                SyntheticFolderHistoryDispatch::Restored
+            } else {
+                SyntheticFolderHistoryDispatch::Unavailable
+            }
+        } else if crate::folder_tree::path_eq(target, &subfolder_expansion_synthetic_path()) {
+            let restored = if let Some(state) = self.folder_nav_subfolder_restore.take() {
+                self.restore_subfolder_expansion_for_synthetic_path_with_state(target, Some(state))
+            } else if self.subfolder_expansion_snapshot.is_some() {
+                self.reinstall_subfolder_expansion_snapshot()
+            } else if self.subfolder_expansion_root.is_some()
+                || self.subfolder_expansion_saved_folder.is_some()
+            {
+                self.restore_subfolder_expansion_for_synthetic_path(target)
+            } else {
+                false
+            };
+            if restored {
+                SyntheticFolderHistoryDispatch::Restored
+            } else {
+                SyntheticFolderHistoryDispatch::Unavailable
+            }
+        } else {
+            SyntheticFolderHistoryDispatch::NotSynthetic
+        };
+
+        if dispatch == SyntheticFolderHistoryDispatch::Restored {
+            // 合成ビュー再構築は load_folder を通らないため、navigate_* が立てた
+            // suppress ワンショットをここで消費し、次の通常ナビへ漏らさない。
+            self.set_active_folder_nav_suppress_record_once(false);
+        }
+        dispatch
     }
 
     /// お気に入り追加対象として扱える現在地。お気に入りは検索/索引のルートに
@@ -12702,20 +12930,47 @@ impl App {
     }
 
     pub(crate) fn navigate_folder_history_forward(&mut self) -> Option<PathBuf> {
-        let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-            workspace.history.forward_stack.pop()?
-        } else {
-            self.folder_nav_forward_stack.pop()?
-        };
-        if let Some(current) = self.effective_folder()
-            && !crate::folder_tree::path_eq(&current, &target)
+        let current = self.folder_nav_current_location();
+        let current_rating_view_stars = current
+            .as_deref()
+            .and_then(|path| self.folder_nav_rating_view_stars_for_path(path));
+        let (target, target_rating_view_stars) =
+            if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+                Self::pop_folder_nav_stack(
+                    &mut workspace.history.forward_stack,
+                    &mut workspace.history.forward_rating_view_stars,
+                )?
+            } else {
+                Self::pop_folder_nav_stack(
+                    &mut self.folder_nav_forward_stack,
+                    &mut self.folder_nav_forward_rating_view_stars,
+                )?
+            };
+        if let Some(current) = current
+            && !Self::folder_nav_targets_eq(
+                &current,
+                current_rating_view_stars,
+                &target,
+                target_rating_view_stars,
+            )
         {
             if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-                Self::push_folder_nav_stack(&mut workspace.history.back_stack, current);
+                Self::push_folder_nav_stack(
+                    &mut workspace.history.back_stack,
+                    &mut workspace.history.back_rating_view_stars,
+                    current,
+                    current_rating_view_stars,
+                );
             } else {
-                Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
+                Self::push_folder_nav_stack(
+                    &mut self.folder_nav_back_stack,
+                    &mut self.folder_nav_back_rating_view_stars,
+                    current,
+                    current_rating_view_stars,
+                );
             }
         }
+        self.pending_folder_nav_rating_view_stars = target_rating_view_stars;
         self.set_active_folder_nav_suppress_record_once(true);
         Some(target)
     }
@@ -13141,6 +13396,13 @@ impl App {
         self.load_folder_with_scan(path, None);
     }
 
+    /// メニュー / BS / 場所アクションからドライブ一覧を開き、直前の場所を ← 履歴へ積む。
+    pub(crate) fn enter_drive_list_from_navigation(&mut self, origin: Option<PathBuf>) {
+        self.record_folder_nav_transition(&drive_list_synthetic_path());
+        self.enter_drive_list(origin);
+    }
+
+    /// ドライブ一覧本体を構築する。履歴 dispatch からも呼ぶため、ここでは履歴を記録しない。
     pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
@@ -13178,7 +13440,7 @@ impl App {
         self.clear_pending_folder_nav_steps();
         self.bump_full_context_for_load();
         // ドライブ一覧は start_loading_items を通らない経路。残った ZIP ツリーナビ状態を
-        // 破棄しないと、BS / gamepad-back が zip_nav_back() を先に拾って current_folder=None の
+        // 破棄しないと、BS / gamepad-back が zip_nav_back() を先に拾って drive-list marker の
         // まま旧 ZIP 階層を復活させてしまう (Codex P2)。ネスト ZIP バイト列キャッシュも破棄。
         self.zip_nav = None;
         // ファイル名スタックも同様に解除 (SLI を通らない経路なので明示的に)。
@@ -13186,15 +13448,23 @@ impl App {
         self.stack_view = None;
         self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
+        if self.items_are_subfolder_expansion_view {
+            let synthetic = subfolder_expansion_synthetic_path();
+            self.folder_nav_subfolder_restore =
+                self.take_subfolder_expansion_restore_for_synthetic_path(Some(&synthetic));
+        }
         self.cancel_subfolder_expansion_pending();
         self.clear_subfolder_expansion_view_state();
+        if let Some(pending) = self.rating_view_pending.take() {
+            pending.cancel();
+        }
         crate::zip_loader::clear_nested_cache();
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
         self.rx = rx;
 
-        self.current_folder = None;
+        self.current_folder = Some(drive_list_synthetic_path());
         self.current_folder_last_mtime = None;
         self.current_folder_signature = None;
         self.current_folder_rating_cache = None;
@@ -15403,6 +15673,16 @@ impl App {
         self.update_favsearch_address();
     }
 
+    /// メニュー操作で読書履歴を開く。
+    ///
+    /// 履歴 ←/→ からの復元は `dispatch_synthetic_folder_history_target` が
+    /// `enter_reading_history` を直接呼ぶ。ここでだけ遷移を記録することで、メニュー起動時の
+    /// 直前フォルダは back stack に残しつつ、履歴復元時の二重記録を避ける。
+    pub(crate) fn enter_reading_history_from_menu(&mut self) {
+        self.record_folder_nav_transition(&reading_history_synthetic_path());
+        self.enter_reading_history();
+    }
+
     /// 読書履歴ビューを開く。
     pub(crate) fn enter_reading_history(&mut self) {
         crate::logger::log("=== enter_reading_history ===");
@@ -15518,6 +15798,16 @@ impl App {
         }
     }
 
+    /// メニュー操作でレーティング一覧を開く。
+    ///
+    /// 非同期 build 完了後の `install_rating_view_rows` が current_folder を合成パスへ
+    /// 切り替える前に、直前フォルダを back stack へ記録する。
+    pub(crate) fn enter_rating_view_from_menu(&mut self, stars: u8) {
+        let stars = stars.clamp(1, 5);
+        self.record_folder_nav_transition_with_rating(&rating_view_synthetic_path(), Some(stars));
+        self.enter_rating_view(stars);
+    }
+
     /// ★N が付いたアイテム / コンテナをフラットに並べるレーティング一覧ビューを開く。
     pub(crate) fn enter_rating_view(&mut self, stars: u8) {
         let stars = stars.clamp(1, 5);
@@ -15529,6 +15819,7 @@ impl App {
         self.rating_view_stars = stars;
         self.rating_view_sort = crate::rating_view::RatingViewSort::default();
         self.rating_view_rows.clear();
+        self.rating_view_rows_stars = None;
         self.rating_view_skipped = 0;
         self.rating_view_nav_stack.clear();
         self.pending_rating_view_zipdir_open = None;
@@ -15574,6 +15865,7 @@ impl App {
             pending.cancel();
         }
         self.rating_view_rows.clear();
+        self.rating_view_rows_stars = None;
         self.rating_view_skipped = 0;
         self.rating_view_nav_stack.clear();
         self.pending_rating_view_zipdir_open = None;
@@ -15581,7 +15873,11 @@ impl App {
         let restore_state = self.rating_view_subfolder_restore.take();
         if let Some(saved) = self.rating_view_saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
-            if self.restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
+            if crate::folder_tree::path_eq(&saved, &drive_list_synthetic_path()) {
+                self.suppress_nav_record_for_search_restore = false;
+                self.enter_drive_list(None);
+            } else if self
+                .restore_subfolder_expansion_for_synthetic_path_with_state(&saved, restore_state)
             {
                 self.suppress_nav_record_for_search_restore = false;
             } else {
@@ -15602,7 +15898,17 @@ impl App {
         if !self.rating_view_nav_context_active() || is_synthetic_view_path(path) {
             return;
         }
-        Self::push_folder_nav_stack(&mut self.rating_view_nav_stack, path.to_path_buf());
+        if self
+            .rating_view_nav_stack
+            .last()
+            .is_some_and(|last| crate::folder_tree::path_eq(last, path))
+        {
+            return;
+        }
+        self.rating_view_nav_stack.push(path.to_path_buf());
+        if self.rating_view_nav_stack.len() > MAX_FOLDER_NAV_STACK {
+            self.rating_view_nav_stack.remove(0);
+        }
     }
 
     pub(crate) fn rating_view_parent_nav(&mut self) {
@@ -15685,6 +15991,7 @@ impl App {
     }
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
+        self.rating_view_rows_stars = Some(result.stars);
         self.rating_view_rows = result.rows;
         self.rating_view_skipped = result.skipped;
         self.install_rating_view_rows();
@@ -15757,6 +16064,7 @@ impl App {
         }
         self.rating_view_stars = stars;
         self.rating_view_rows.clear();
+        self.rating_view_rows_stars = None;
         self.rating_view_skipped = 0;
         self.address = format!(
             "{} レーティング一覧を読み込み中…",
@@ -17613,6 +17921,11 @@ impl App {
         // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
         self.cancel_stack_script_pending();
         if !crate::folder_tree::path_eq(&source_path, &subfolder_expansion_synthetic_path()) {
+            if !is_synthetic_view_path(&source_path) && self.items_are_subfolder_expansion_view {
+                let synthetic = subfolder_expansion_synthetic_path();
+                self.folder_nav_subfolder_restore =
+                    self.take_subfolder_expansion_restore_for_synthetic_path(Some(&synthetic));
+            }
             self.cancel_subfolder_expansion_pending();
             self.clear_subfolder_expansion_view_state();
         }
@@ -25410,7 +25723,6 @@ impl App {
             && !self.favsearch.active
             && !self.tag_view.active
             && !self.show_search_bar
-            && !self.items_are_drive_list
             && !self.is_snapshot_active(); // Codex P2-1: ★固定 中は履歴ナビ block
         if history_back_key && history_shortcut_allowed {
             return Some(crate::ui_main::AddressBarNav::HistoryBack);
@@ -52045,11 +52357,11 @@ impl eframe::App for App {
                 match nav {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
                     crate::ui_main::AddressBarNav::DriveList(origin) => {
-                        self.enter_drive_list(origin);
+                        self.enter_drive_list_from_navigation(origin);
                         None
                     }
                     crate::ui_main::AddressBarNav::ReadingHistory => {
-                        self.enter_reading_history();
+                        self.enter_reading_history_from_menu();
                         None
                     }
                     crate::ui_main::AddressBarNav::RatingViewBack => {
@@ -52063,18 +52375,42 @@ impl eframe::App for App {
                     crate::ui_main::AddressBarNav::HistoryBack => {
                         let snapshot = self.folder_nav_history_snapshot();
                         let target = self.navigate_folder_history_back();
-                        if target.is_some() {
-                            history_nav_rollback = Some(snapshot);
+                        match target {
+                            Some(target) => {
+                                match self.dispatch_synthetic_folder_history_target(&target) {
+                                    SyntheticFolderHistoryDispatch::NotSynthetic => {
+                                        history_nav_rollback = Some(snapshot);
+                                        Some(target)
+                                    }
+                                    SyntheticFolderHistoryDispatch::Restored => None,
+                                    SyntheticFolderHistoryDispatch::Unavailable => {
+                                        self.restore_folder_nav_history(snapshot);
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
                         }
-                        target
                     }
                     crate::ui_main::AddressBarNav::HistoryForward => {
                         let snapshot = self.folder_nav_history_snapshot();
                         let target = self.navigate_folder_history_forward();
-                        if target.is_some() {
-                            history_nav_rollback = Some(snapshot);
+                        match target {
+                            Some(target) => {
+                                match self.dispatch_synthetic_folder_history_target(&target) {
+                                    SyntheticFolderHistoryDispatch::NotSynthetic => {
+                                        history_nav_rollback = Some(snapshot);
+                                        Some(target)
+                                    }
+                                    SyntheticFolderHistoryDispatch::Restored => None,
+                                    SyntheticFolderHistoryDispatch::Unavailable => {
+                                        self.restore_folder_nav_history(snapshot);
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
                         }
-                        target
                     }
                 }
             } else if let Some(p) = open_folder_nav {
@@ -52096,7 +52432,7 @@ impl eframe::App for App {
                         .and_then(|nav| match nav {
                             crate::ui_main::AddressBarNav::Direct(path) => Some(path),
                             crate::ui_main::AddressBarNav::DriveList(origin) => {
-                                self.enter_drive_list(origin);
+                                self.enter_drive_list_from_navigation(origin);
                                 None
                             }
                             crate::ui_main::AddressBarNav::ReadingHistory => {

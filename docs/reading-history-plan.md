@@ -180,6 +180,13 @@ fn reading_history_synthetic_path() -> PathBuf {
 
 App 状態には `items_are_reading_history_view: bool` を追加する。
 
+フォルダバーの履歴 ←/→ では、この synthetic path 自体を back/forward stack に保持する。
+場所 / ファイルメニューから開くときは、専用ビューをインストールする前に直前の実フォルダを
+back stack へ記録するため、メニュー起動直後から ← で元のフォルダへ戻れる。
+履歴から pop したときは実ディレクトリとしてロードせず `enter_reading_history()` へ
+ディスパッチし、DB から専用ビューを再構築する。これにより実フォルダへ移動した後も
+←/→ で読書履歴へ戻れ、`__reading_history__` を開いた空表示には落ちない。
+
 読書履歴ビューの `items` は、既存の `GridItem` を再利用する:
 
 | DB kind | GridItem |

@@ -1880,7 +1880,11 @@ mod phase_c_key_tests {
         app.enter_drive_list(None);
 
         assert!(app.items_are_drive_list);
-        assert!(app.current_folder.is_none());
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::drive_list_synthetic_path())
+        );
+        assert!(app.effective_folder().is_none());
         assert!(app.address.is_empty());
         assert!(
             app.settings
@@ -2498,6 +2502,26 @@ mod phase_c_folder_nav_history_tests {
                 .target
                 .is_none()
         );
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .history
+                .suppress_record_once
+        );
+
+        app.enter_drive_list_from_navigation(None);
+
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .history
+                .back_stack
+                .is_empty(),
+            "A/B 切替自体は新しいスロットの履歴へ積まない"
+        );
+        assert!(
+            !app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .history
+                .suppress_record_once
+        );
     }
 
     #[test]
@@ -3110,12 +3134,180 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.recent_folders, vec![recent0]);
     }
 
-    // ── §1.16: 合成ビュー (読書履歴 / ★一覧 / 検索結果 / サブフォルダ展開) 表示中の ←/→ ──
-    // 合成パスは実在しないため、戻る/進むで現在地を反対スタックへ退避するとき積まない。
-    // 積むと ←/→ で `__reading_history__` 等を実ディレクトリとして開こうとして空表示になる。
+    // ── §1.16: 合成ビュー (読書履歴 / ★一覧 / サブフォルダ展開) 表示中の ←/→ ──
+    // 案Bでは合成パスも通常の履歴に積み、pop 時に対応ビューを再構築する。
 
     #[test]
-    fn folder_nav_back_from_synthetic_view_keeps_synthetic_off_forward_stack() {
+    fn location_menu_reading_history_records_previous_folder_for_back() {
+        let mut app = setup_app();
+        let real = app.tmp.path().join("before-reading-history-menu");
+        std::fs::create_dir_all(&real).unwrap();
+        // setup_app は quick folder A が active。通常アドレスバーの履歴を検証する。
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(real.clone());
+
+        app.enter_reading_history_from_menu();
+
+        assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
+        assert_eq!(app.folder_history_back_target(), Some(&real));
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::reading_history_synthetic_path())
+        );
+        assert!(app.items_are_reading_history_view);
+    }
+
+    #[test]
+    fn location_menu_rating_view_records_previous_folder_for_back() {
+        let mut app = setup_app();
+        let real = app.tmp.path().join("before-rating-menu");
+        std::fs::create_dir_all(&real).unwrap();
+        // setup_app は quick folder A が active。通常アドレスバーの履歴を検証する。
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(real.clone());
+
+        app.enter_rating_view_from_menu(4);
+        if let Some(pending) = app.rating_view_pending.take() {
+            pending.cancel();
+        }
+        app.install_rating_view_rows();
+
+        assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
+        assert_eq!(app.folder_history_back_target(), Some(&real));
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::rating_view_synthetic_path())
+        );
+        assert!(app.items_are_rating_view);
+    }
+
+    #[test]
+    fn rating_view_star_change_records_distinct_history_and_restores_previous_stars() {
+        let mut app = setup_app();
+        let real = app.tmp.path().join("before-rating-star-switch");
+        std::fs::create_dir_all(&real).unwrap();
+        // setup_app は quick folder A が active。通常アドレスバーの履歴を検証する。
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(real.clone());
+
+        app.enter_rating_view_from_menu(3);
+        if let Some(pending) = app.rating_view_pending.take() {
+            pending.cancel();
+        }
+        app.install_rating_view_rows();
+        app.rating_view_rows_stars = Some(3);
+
+        app.enter_rating_view_from_menu(5);
+        if let Some(pending) = app.rating_view_pending.take() {
+            pending.cancel();
+        }
+        app.install_rating_view_rows();
+        app.rating_view_rows_stars = Some(5);
+
+        assert_eq!(
+            app.folder_nav_back_stack,
+            vec![real, super::rating_view_synthetic_path()]
+        );
+        assert_eq!(app.folder_nav_back_rating_view_stars, vec![None, Some(3)]);
+
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(target, super::rating_view_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert_eq!(app.rating_view_stars, 3);
+        assert_eq!(
+            app.folder_nav_forward_stack,
+            vec![super::rating_view_synthetic_path()]
+        );
+        assert_eq!(app.folder_nav_forward_rating_view_stars, vec![Some(5)]);
+
+        // ☆3 の再構築完了前にさらに ← で実フォルダへ戻り、→ で ☆3 へ進んでも、
+        // 空 rows を正規結果と誤認せず worker を再起動する。
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
+        );
+        app.load_folder(target);
+        assert!(app.rating_view_pending.is_none());
+        let target = app.navigate_folder_history_forward().unwrap();
+        assert_eq!(target, super::rating_view_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert_eq!(app.rating_view_stars, 3);
+        assert!(app.rating_view_pending.is_some());
+        if let Some(pending) = app.rating_view_pending.take() {
+            pending.cancel();
+        }
+    }
+
+    #[test]
+    fn folder_to_drive_list_records_back_target_and_restores_both_directions() {
+        let mut app = setup_app();
+        let real = app.tmp.path().join("before-drive-list");
+        std::fs::create_dir_all(&real).unwrap();
+        // setup_app は quick folder A が active。通常アドレスバーの履歴を検証する。
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(real.clone());
+
+        app.enter_drive_list_from_navigation(Some(real.clone()));
+
+        assert!(app.items_are_drive_list);
+        assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
+        assert_eq!(app.folder_history_back_target(), Some(&real));
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::drive_list_synthetic_path())
+        );
+
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(target, real);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
+        );
+        app.load_folder(target.clone());
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        assert_eq!(
+            app.folder_nav_forward_stack,
+            vec![super::drive_list_synthetic_path()]
+        );
+
+        let target = app.navigate_folder_history_forward().unwrap();
+        assert_eq!(target, super::drive_list_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(app.items_are_drive_list);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::drive_list_synthetic_path())
+        );
+        assert!(app.folder_history_back_target().is_some());
+
+        let opened = app.tmp.path().join("opened-from-drive-list");
+        std::fs::create_dir_all(&opened).unwrap();
+        app.load_folder(opened);
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&super::drive_list_synthetic_path())
+        );
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(target, super::drive_list_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(app.items_are_drive_list);
+    }
+
+    #[test]
+    fn folder_nav_back_from_synthetic_view_records_synthetic_on_forward_stack() {
         let mut app = setup_app();
         let real = PathBuf::from(r"C:\miv-test\real-folder");
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
@@ -3126,15 +3318,15 @@ mod phase_c_folder_nav_history_tests {
 
         // 戻るで実フォルダへは戻れる。
         assert_eq!(app.navigate_folder_history_back(), Some(real));
-        // 現在地だった合成パスは forward スタックへ積まれない。
-        assert!(
-            app.folder_nav_forward_stack.is_empty(),
-            "synthetic view path must not be pushed onto the forward stack"
+        // 現在地だった合成パスを forward に残し、ビューへ戻せる。
+        assert_eq!(
+            app.folder_nav_forward_stack,
+            vec![super::reading_history_synthetic_path()]
         );
     }
 
     #[test]
-    fn folder_nav_forward_from_synthetic_view_keeps_synthetic_off_back_stack() {
+    fn folder_nav_forward_from_synthetic_view_records_synthetic_on_back_stack() {
         let mut app = setup_app();
         let real = PathBuf::from(r"C:\miv-test\real-folder");
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
@@ -3144,9 +3336,171 @@ mod phase_c_folder_nav_history_tests {
         app.folder_nav_back_stack = Vec::new();
 
         assert_eq!(app.navigate_folder_history_forward(), Some(real));
+        assert_eq!(
+            app.folder_nav_back_stack,
+            vec![super::rating_view_synthetic_path()]
+        );
+    }
+
+    #[test]
+    fn folder_history_back_and_forward_restore_reading_history_without_folder_load() {
+        let mut app = setup_app();
+        let before = app.tmp.path().join("before-reading-history");
+        let after = app.tmp.path().join("after-reading-history");
+        std::fs::create_dir_all(&before).unwrap();
+        std::fs::create_dir_all(&after).unwrap();
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(before);
+
+        app.enter_reading_history();
+        assert!(app.items_are_reading_history_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::reading_history_synthetic_path())
+        );
+
+        app.load_folder(after.clone());
+        assert_eq!(
+            app.folder_nav_back_stack.last(),
+            Some(&super::reading_history_synthetic_path())
+        );
+
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(target, super::reading_history_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(app.items_are_reading_history_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::reading_history_synthetic_path())
+        );
+        assert_eq!(app.folder_nav_forward_stack.last(), Some(&after));
+        assert!(!app.suppress_folder_nav_record_once);
+
+        let target = app.navigate_folder_history_forward().unwrap();
+        assert_eq!(target, after);
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::NotSynthetic
+        );
+        app.load_folder(target);
+
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(target, super::reading_history_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(app.items_are_reading_history_view);
+    }
+
+    #[test]
+    fn folder_history_dispatch_restores_rating_view() {
+        let mut rating_app = setup_app();
+        rating_app.active_quick_folder_slot = None;
+        rating_app.rating_view_stars = 4;
+        rating_app.rating_view_rows_stars = Some(4);
+        rating_app.set_active_folder_nav_suppress_record_once(true);
+        assert_eq!(
+            rating_app
+                .dispatch_synthetic_folder_history_target(&super::rating_view_synthetic_path()),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(rating_app.items_are_rating_view);
+        assert_eq!(
+            rating_app.current_folder.as_ref(),
+            Some(&super::rating_view_synthetic_path())
+        );
+        assert!(!rating_app.suppress_folder_nav_record_once);
+    }
+
+    #[test]
+    fn folder_history_back_restores_preserved_subfolder_expansion_snapshot() {
+        use crate::app::subfolder_expansion::{
+            SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,
+        };
+
+        let mut app = setup_app();
+        let root = app.tmp.path().join("subfolder-root");
+        let real = app.tmp.path().join("after-subfolder-view");
+        let image = root.join("nested").join("page.jpg");
+        std::fs::create_dir_all(&real).unwrap();
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(super::subfolder_expansion_synthetic_path());
+        app.items_are_subfolder_expansion_view = true;
+        app.subfolder_expansion_root = Some(root.clone());
+        app.subfolder_expansion_roots = vec![root.clone()];
+        app.subfolder_expansion_saved_folder = Some(root.clone());
+        app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            entries: vec![SubfolderExpansionEntry {
+                path: image.clone(),
+                is_video: false,
+                mtime: 1,
+                file_size: 10,
+            }],
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        });
+
+        app.load_folder(real);
+        assert!(app.subfolder_expansion_snapshot.is_none());
+        assert!(app.folder_nav_subfolder_restore.is_some());
+
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(target, super::subfolder_expansion_synthetic_path());
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Restored
+        );
+        assert!(app.items_are_subfolder_expansion_view);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&super::subfolder_expansion_synthetic_path())
+        );
         assert!(
-            app.folder_nav_back_stack.is_empty(),
-            "synthetic view path must not be pushed onto the back stack"
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path == &image))
+        );
+    }
+
+    #[test]
+    fn folder_history_missing_synthetic_state_is_a_true_no_op() {
+        let mut app = setup_app();
+        let real = app.tmp.path().join("real-folder");
+        std::fs::create_dir_all(&real).unwrap();
+        app.current_folder = Some(real.clone());
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![super::rating_view_synthetic_path()];
+        let snapshot = app.folder_nav_history_snapshot();
+
+        let target = app.navigate_folder_history_back().unwrap();
+        assert_eq!(
+            app.dispatch_synthetic_folder_history_target(&target),
+            super::SyntheticFolderHistoryDispatch::Unavailable
+        );
+        app.restore_folder_nav_history(snapshot);
+
+        assert_eq!(app.current_folder.as_ref(), Some(&real));
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![super::rating_view_synthetic_path()]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
+        assert!(
+            !app.quick_folder_workspaces[slot.index()]
+                .history
+                .suppress_record_once
         );
     }
 
@@ -3275,36 +3629,6 @@ mod phase_c_folder_nav_history_tests {
         app.favsearch.active = false;
         app.remember_recent_folder(&archive);
         assert_eq!(app.recent_folder_entries().first(), Some(&archive));
-    }
-
-    #[test]
-    fn synthetic_search_path_not_pushed_as_nav_source() {
-        let mut app = setup_app();
-        let prev = PathBuf::from(r"C:\miv-test\prev");
-        let stale_forward = PathBuf::from(r"C:\miv-test\stale-forward");
-        let target = PathBuf::from(r"C:\miv-test\target");
-        let slot = QuickFolderSlotId::A;
-        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![prev.clone()];
-        // 検索前に ← で残っていた forward 履歴を模擬。新規ナビなのでクリアされるべき。
-        app.quick_folder_workspaces[slot.index()]
-            .history
-            .forward_stack = vec![stale_forward];
-        // 合成検索結果パスを移動元にした記録を試みても back_stack には積まれない。
-        app.current_folder = Some(crate::app::search_results_synthetic_path());
-
-        app.record_folder_nav_transition(&target);
-
-        // 合成 source は back には積まないが forward は無効化する (新規ナビなので)。
-        assert_eq!(
-            app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![prev]
-        );
-        assert!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .forward_stack
-                .is_empty()
-        );
     }
 
     #[test]

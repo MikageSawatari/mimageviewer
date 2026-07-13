@@ -100,13 +100,15 @@ if (backspace && !ctrl_held) || alt_up {
   UI は止まらないが、システムドライブで無意味な画像を拾う/遅い。
   → §3 の「ピンのみ解決」でドライブルートの自動スキャンを抑止する。
 
-### 1.4 `current_folder == None` をドライブ一覧の状態にする
+### 1.4 current_folder に履歴用 synthetic marker を持たせる
 
 ユーザーの「場所が空欄 = ドライブ一覧」というメンタルモデルに対応させ、
-ドライブ一覧ビューでは `current_folder = None` / `address = ""` とする。
-合成パス sentinel (検索ビュー方式) も選べるが、`None` の方がアドレスバーが
-自然に空欄になり、判定もシンプル。状態の明示化と各種ガード合流のために
-ブール値フラグ `items_are_drive_list: bool` を併用する。
+アドレス表示は従来どおり `address = ""` とする。一方、フォルダ履歴の ←/→ で
+ドライブ一覧への出入りを表せるよう、`current_folder` には実在しない
+`drive_list_synthetic_path()` (`__drive_list__`) を持たせる。
+通常フォルダ処理へ synthetic path を流さないため、`items_are_drive_list: bool` 中の
+`effective_folder()` は従来どおり `None` を返す。親移動、Ctrl+↑↓、D&D、rating、代表サムネ
+探索などの既存 drive-list ガードは維持し、履歴コードだけが marker を現在地として扱う。
 
 ---
 
@@ -120,7 +122,7 @@ if (backspace && !ctrl_held) || alt_up {
 - **`enter_drive_list(&mut self, origin: Option<PathBuf>)`** を新設。
   `start_loading_items` ([src/app.rs:9473](../src/app.rs)) を参考に:
   - サイドカー flush / フルスクリーン close / 進行中 nav cancel / 各種キャッシュ clear。
-  - `self.current_folder = None; self.address = String::new();`
+  - `self.current_folder = Some(drive_list_synthetic_path()); self.address = String::new();`
   - `self.items = available_drives().map(GridItem::Folder)`、`image_metas` は全 None。
     `install_new_items` で割り当て (これで `items_are_global_search_view=false` も倒れる)。
   - `self.items_are_drive_list = true;` (install_new_items の**後**に立てる)。
@@ -225,16 +227,17 @@ if (backspace && !ctrl_held) || alt_up {
   を足す。Shift+F1〜F5 (`set_current_folder_rating`) は `current_folder==None` で
   既に false 返し ([src/app.rs:16836](../src/app.rs)) なので追加不要。
   F6 (★解除) も `apply_rating_to_selection` 経由なので上記ゲートでカバーされる。
-- **履歴 (folder_history)**: ドライブ一覧ビューは実体パスが無いので
-  `folder_history` に記録しない (検索ビューの leaving_search_view 判定と同じ要領、
-  [src/app.rs:9574](../src/app.rs))。Alt+←/→ の履歴ナビからも除外。
+- **履歴**: スクロール復元用の `folder_history` には記録しない。一方、フォルダバー / Alt+←→ の
+  back/forward 履歴には `drive_list_synthetic_path()` を保持する。メニュー / BS / 場所アクションから
+  入るときだけ「直前の場所 → ドライブ一覧」を記録し、履歴 dispatch からの再入場では二重記録しない。
+  ドライブ一覧では親移動 (BS / ⬆) は引き続き no-op だが、back/forward target があれば ←/→ は有効。
 - **Ctrl+↑↓ / Ctrl+PageUp/Down**: `effective_folder()==None` なので
   `start_folder_nav` は自然に no-op (追加対応不要、念のためテストで確認)。
 - **`last_folder` の保存**: ドライブ一覧表示中に終了したときは、
   **空パス sentinel** を `last_folder` に保存する。`StartupFolderMode::Previous`
   (= 前回終了した場所) では、この空パスをドライブ一覧として復元する。
   実フォルダの `last_folder` は通常フォルダへ移動したときに上書きされるため、
-  最近使ったフォルダ履歴にはドライブ一覧を入れない。
+  最近使ったフォルダ履歴にはドライブ一覧 synthetic path を入れない。
 - **ドキュメント同時更新** (CLAUDE.md 必須):
   - `docs/keymap-spec.md` — BS のドライブルート挙動 (ドライブ一覧へ) を追記。
   - `docs/spec.md` — `StartupFolderMode` に `Drives` を追記 ([docs/spec.md:609](spec.md))。
@@ -251,7 +254,9 @@ if (backspace && !ctrl_held) || alt_up {
     「ドライブルートで BS → `items_are_drive_list==true` かつ items がドライブ群」。
   - 「`StartupFolderMode::Drives` で起動 → ドライブ一覧」。
   - 「ドライブをダブルクリック → `load_folder(drive)` で通常フォルダに入る」。
-  - 「ドライブ一覧中は folder_history に記録されない」。
+  - 「ドライブ一覧中はスクロール復元用 folder_history に記録されない」。
+  - 「フォルダ → ドライブ一覧 → ← で元フォルダ、→ でドライブ一覧へ戻る」。
+  - 「ドライブ一覧からフォルダを開いた後、← でドライブ一覧へ戻る」。
 - 手動検証 (`/run` または実機): BS 往復・起動モード・ピン留めサムネ・
   ボリューム名表示・空の光学/リムーバブルドライブで UI がハングしないこと。
 

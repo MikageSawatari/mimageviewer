@@ -555,6 +555,12 @@ UI (global_search_ui::render_global_search_bar)
     → pending が残っていれば ctx.request_repaint()
 ```
 
+検索結果はフォルダバー履歴の ←/→ 復帰対象にしない。検索は透明な一時オーバーレイであり、
+検索中の移動は back/forward stack に記録せず、検索中は履歴ボタン自体を無効化する。
+検索を抜けると `global_search.active = false` にしてクエリと結果 state を破棄し、検索前の
+場所へ履歴を変更せず復帰する。したがって `search_results_synthetic_path()` を履歴から
+ディスパッチして検索結果を再構築する経路は持たない。
+
 **post-filter が必須な理由**: Tantivy の `NgramTokenizer` は token position を
 常に 0 で吐く仕様。bigram だけでは phrase `"海辺 夕焼け"` と AND の連続部分一致を
 正しく判別できず、偽陽性が出る。post-filter で `normalize_for_match` 済みの原文に

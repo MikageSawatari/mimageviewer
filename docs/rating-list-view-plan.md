@@ -273,6 +273,17 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
 - ページ (Image/Video/ZipImage/PdfPage) を開く → フルスクリーン。閉じたら通常のグリッド復帰。
 - 抜ける → レーティング一覧最上位で Backspace、または Esc / 実フォルダへナビゲートで通常表示
   (他ビューと同じ復帰機構)。
+- フォルダバーの履歴 ←/→ には `rating_view_synthetic_path()` も保持する。この path は
+  `start_loading_items` から永続 catalog のキーにも渡るため星数を埋め込まず、back/forward
+  stack と位置同期する `Option<u8>` の星メタデータを別 stack に保持する。これにより
+  ★3 → ★5 のような同一 synthetic path 間の遷移も別 entry として扱える。
+- 履歴から rating synthetic path を pop したときは星メタデータを `rating_view_stars` へ
+  復元し、同じ星の `rating_view_rows` が残っていれば `install_rating_view_rows()` で
+  再インストールする。別の星へ戻る場合は星別の正しい行を worker で再構築し、実フォルダとして
+  `__rating_view__` をロードしない。星メタデータも保持 state も無い場合は no-op にする。
+- 場所 / ファイルメニューから開くときは、非同期 build を始める前に直前の実フォルダを
+  back stack へ記録する。build 完了後に current_folder が synthetic path へ切り替わっても、
+  メニュー起動直後の戻り先を失わない。
 
 ### 3.4 サムネイル
 

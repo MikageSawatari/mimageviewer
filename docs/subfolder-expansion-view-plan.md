@@ -381,6 +381,11 @@ scope signature は `subfolder_expansion` として通常フォルダと分け�
 - `grid_parent_nav_target` / `resolve_grid_parent_nav` / `resolve_return_to_parent_nav` 系では、
   synthetic path の `parent()` を使わず、`subfolder_expansion_saved_folder` へ `Direct` で戻す。
 - アドレスバー / パンくずは synthetic path を見せず、`サブ展開: <root>` を表示する。
+- フォルダバーの履歴 ←/→ には synthetic path も保持する。サブ展開から実フォルダへ
+  移るときは `start_loading_items` が active state を破棄する前に snapshot/root/roots を
+  履歴復帰用 state へ退避し、履歴から synthetic path を pop したときに同じ snapshot を
+  再インストールする。保持 state が無い場合は no-op とし、synthetic path を実フォルダとして
+  ロードしない。
 
 ### 8.2 フルスクリーン
 
