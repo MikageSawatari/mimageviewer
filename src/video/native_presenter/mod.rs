@@ -447,7 +447,7 @@ struct NativeEguiOverlay {
     jump_panel_visible: bool,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
-    /// ClickToShow の右情報パネル永続状態。正本は App settings。
+    /// ClickToShow の右情報パネル状態。正本は App の現在ファイル用 runtime flag。
     click_info_open: bool,
     /// ClickToShow の左ジャンプパネル状態。動画ソース単位の presenter-local session。
     left_session_open: bool,
@@ -1165,7 +1165,7 @@ fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInput
     input.tag_picker_open
         || match input.side_panel_mode.normalized() {
             FsSidePanelMode::Hover => input.pointer_in_hover_rect,
-            FsSidePanelMode::ClickToShow => crate::ui_helpers::metadata_panel_persistently_shown(
+            FsSidePanelMode::ClickToShow => crate::ui_helpers::metadata_panel_click_shown(
                 input.side_panel_mode,
                 input.click_info_open,
             ),
@@ -3163,7 +3163,8 @@ impl NativeVideoPresenter {
         }
     }
 
-    /// Source swap では右の永続設定を保ち、左の動画単位セッションだけを閉じる。
+    /// Source swap で presenter-local な左セッションと hover latch を閉じる。
+    /// 右状態は App が新ファイルの false を別 command で同期する。
     pub fn reset_overlay_side_panel_session(&mut self) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.reset_side_panel_session();

@@ -100,9 +100,9 @@ pub(crate) fn edge_summons_adjustment(
     mode.normalized() == crate::settings::FsSidePanelMode::Hover && edge == PanelEdge::Left
 }
 
-/// ClickToShow の右情報パネルが永続的に開いているか。
+/// ClickToShow の右情報パネルが現在ファイルで明示的に開いているか。
 #[allow(dead_code)]
-pub(crate) fn metadata_panel_persistently_shown(
+pub(crate) fn metadata_panel_click_shown(
     mode: crate::settings::FsSidePanelMode,
     click_info_open: bool,
 ) -> bool {
@@ -2091,11 +2091,11 @@ mod tests {
     }
 
     #[test]
-    fn metadata_persistence_is_click_mode_only() {
+    fn metadata_click_state_is_click_mode_only() {
         use crate::settings::FsSidePanelMode::{ClickToShow, Hover};
-        assert!(!metadata_panel_persistently_shown(Hover, false));
-        assert!(!metadata_panel_persistently_shown(Hover, true));
-        assert!(!metadata_panel_persistently_shown(ClickToShow, false));
-        assert!(metadata_panel_persistently_shown(ClickToShow, true));
+        assert!(!metadata_panel_click_shown(Hover, false));
+        assert!(!metadata_panel_click_shown(Hover, true));
+        assert!(!metadata_panel_click_shown(ClickToShow, false));
+        assert!(metadata_panel_click_shown(ClickToShow, true));
     }
 }

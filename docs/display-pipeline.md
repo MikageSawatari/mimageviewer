@@ -446,16 +446,19 @@ placement を上書きせず、`maximized` だけを更新する。
 静止画フルスクリーンの左右パネル召喚は Settings の `FsSidePanelMode` を正本にする。
 `Hover` は左端だけが補正パネル、右端だけがメタデータパネルを召喚し、上端は上バーの
 独立経路だけを動かす。`ClickToShow` は端ホバーでパネルを開かず、通常ホバー帯より狭い
-最端帯で呼び出しバーを表示する。左の開状態はフルスクリーンセッション内だけ、右の開状態は
-`fullscreen_click_info_open` として永続化し、再入場後も復元する。端判定とモード別召喚判定は
-`ui_helpers` の純関数へ置き、動画 native presenter も同じ最端判定と永続状態を共有する。
+最端帯で呼び出しバーを表示する。ClickToShow の左右開状態は per-file transient で、
+ファイル移動とフルスクリーン退出で閉じる。右は `App.fs_click_info_open`、左は面ごとの runtime
+flag を使い、Settings には保存しない。端判定とモード別召喚判定は `ui_helpers` の純関数へ置く。
 動画では左をジャンプ / ブックマーク、右をメタデータ / タグとして独立させ、`Hover` は従来の
-二段ラッチ、`ClickToShow` は presenter-local な左セッション状態と Settings 由来の右永続状態で
-可視性を決める。egui 音楽ビューも同じ Settings を直読みし、左ジャンプ / ブックマークは
-楽曲セッション、右タグ / メタデータは永続状態で表示する。3 面とも ClickToShow では通常の
-端ホバーを無効化し、最端の painter 描画 callout から明示的に開閉する。
+二段ラッチ、`ClickToShow` は presenter-local な左状態と App から同期した右状態で可視性を決める。
+egui 音楽ビューも同じ mode と App runtime を使う。3 面とも ClickToShow では通常の端ホバーを
+無効化し、最端の painter 描画 callout から明示的に開閉する。
+左右いずれかの実パネルが表示中なら上 + 下のクロームも同時表示する。動画は既存の
+`panel_chrome_visible`、音楽は上下常時表示、静止画は render 経路で集約した
+`side_panel_visible` を上バーと `FS_SEEK_BAR` の force 条件に使う。辺ごとの召喚分離は維持し、
+右端ホバーだけで左編集パネルを開くことはない。
 静止画では callout / 右パネルの描画可否と wheel・click の当たり判定を同じ述語で決める。
-補正編集、表示トリム、分析、比較 wipe、360、ズーム、アニメ中など描画抑止中は、永続 ON の
+補正編集、表示トリム、分析、比較 wipe、360、ズーム、アニメ中など描画抑止中は、非表示の
 右パネル矩形や ClickToShow の最端帯も入力を奪わない。
 
 ### 2.2.2 動画フルスクリーンとタイルモード

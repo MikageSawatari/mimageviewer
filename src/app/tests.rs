@@ -31130,14 +31130,14 @@ fn thumbnail_bottom_bar_created_column_requests_lazy_meta_without_tooltip_create
 }
 
 #[test]
-fn fullscreen_side_panel_settings_persist_while_left_panel_resets_on_exit() {
+fn fullscreen_side_panel_mode_persists_while_open_states_reset_on_exit() {
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items
         .push(GridItem::Image(PathBuf::from("C:/photos/panel-mode.jpg")));
     app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
-    app.settings.fullscreen_click_info_open = true;
     app.open_fullscreen(idx);
+    app.fs_click_info_open = true;
     app.adjustment_mode = true;
 
     app.close_fullscreen();
@@ -31146,13 +31146,34 @@ fn fullscreen_side_panel_settings_persist_while_left_panel_resets_on_exit() {
         app.settings.fullscreen_side_panel_mode,
         crate::settings::FsSidePanelMode::ClickToShow
     );
-    assert!(app.settings.fullscreen_click_info_open);
-    assert!(app.metadata_panel_persistently_shown());
+    assert!(!app.fs_click_info_open);
+    assert!(!app.metadata_panel_click_shown());
     assert!(!app.adjustment_mode);
 
     app.open_fullscreen(idx);
-    assert!(app.metadata_panel_persistently_shown());
+    assert!(!app.metadata_panel_click_shown());
     assert!(!app.adjustment_mode);
+}
+
+#[test]
+fn fullscreen_file_change_resets_left_and_right_click_panels() {
+    let mut app = phase_c_support::setup_app();
+    let first = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::new()));
+    let second = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::new()));
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+
+    app.open_fullscreen(first);
+    app.adjustment_mode = true;
+    app.fs_click_info_open = true;
+    assert!(app.metadata_panel_click_shown());
+
+    app.open_fullscreen(second);
+
+    assert!(!app.adjustment_mode);
+    assert!(!app.fs_click_info_open);
+    assert!(!app.metadata_panel_click_shown());
 }
 
 #[test]
@@ -31195,7 +31216,7 @@ fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     app.music_left_panel_active = true;
     app.music_right_panel_active = true;
     app.music_left_click_open = true;
-    app.settings.fullscreen_click_info_open = true;
+    app.fs_click_info_open = true;
 
     app.reset_fs_side_panel_runtime_for_mode_change();
 
@@ -31204,7 +31225,7 @@ fn fullscreen_mode_change_resets_still_and_music_left_runtime_state() {
     assert!(!app.music_left_panel_active);
     assert!(!app.music_right_panel_active);
     assert!(!app.music_left_click_open);
-    assert!(app.settings.fullscreen_click_info_open);
+    assert!(!app.fs_click_info_open);
 }
 
 fn fullscreen_tab_event(repeat: bool) -> egui::Event {
@@ -31420,7 +31441,7 @@ fn fullscreen_tab_round_trips_with_open_panels_on_all_egui_surfaces() {
             app.video_audio_mode = Some(idx);
         }
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
-        app.settings.fullscreen_click_info_open = true;
+        app.fs_click_info_open = true;
         if kind == 0 {
             app.adjustment_mode = true;
         } else {
@@ -31443,17 +31464,17 @@ fn music_left_click_panel_resets_with_music_view_session() {
 
 #[cfg(windows)]
 #[test]
-fn video_audio_transition_resets_music_left_session_but_keeps_right_persistent() {
+fn video_audio_transition_resets_music_left_session_but_keeps_same_file_right_state() {
     let mut app = phase_c_support::setup_app();
     app.music_left_panel_active = true;
     app.music_right_panel_active = true;
     app.music_left_click_open = true;
-    app.settings.fullscreen_click_info_open = true;
+    app.fs_click_info_open = true;
 
     app.reset_video_audio_side_panel_sessions(usize::MAX);
 
     assert!(!app.music_left_panel_active);
     assert!(!app.music_right_panel_active);
     assert!(!app.music_left_click_open);
-    assert!(app.settings.fullscreen_click_info_open);
+    assert!(app.fs_click_info_open);
 }

@@ -126,11 +126,13 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 
 左右パネルの召喚方法は Settings の `FsSidePanelMode` を presenter overlay へ同期する。`Hover` は
 左右それぞれの edge-hover 二段ラッチ、`ClickToShow` は最端の細い callout bar のクリックを使う。
-右メタデータパネルは App の `fullscreen_click_info_open` を正本として source swap 後も維持し、
-左ジャンプパネルは presenter-local なセッション状態として新しい動画への source swap で閉じる。
+右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
+左ジャンプパネルは presenter-local な per-file 状態とする。新しい動画への source swap では左を
+presenter 内で閉じ、右も App から false を同期する。
 callout は実際にクリックする UI なので、表示中の bar rect だけを HUD region に含める。
 動画↔音声モードの遷移も左右パネルの session 境界として扱い、presenter の左ジャンプ状態と
-音楽ビューの左ブックマーク状態を両方閉じる。右の `fullscreen_click_info_open` は保持する。
+音楽ビューの左ブックマーク状態を両方閉じる。同じファイル内の遷移では右状態を保持するが、
+ファイル移動とフルスクリーン退出では閉じ、Settings へ保存しない。
 ClickToShow の左右パネルには明示的な × を置き、callout 矢印は開状態で外向きへ反転する。
 VST3 パネル表示中は callout を描画せず、HUD region にも含めない。
 

@@ -2553,9 +2553,6 @@ pub struct Settings {
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
-    /// クリック表示モードで右情報パネルを開いているか。
-    #[serde(default)]
-    pub fullscreen_click_info_open: bool,
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
@@ -3856,7 +3853,6 @@ impl Default for Settings {
             fullscreen_fit_no_downscale: false,
             fullscreen_left_panel_tab: FullscreenLeftPanelTab::default(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
-            fullscreen_click_info_open: false,
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
@@ -5268,10 +5264,6 @@ impl Settings {
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
         self.ui_scale_factor = src.ui_scale_factor;
-        // ClickToShow の右情報パネル開状態は、callout / × / Esc が更新する runtime 設定。
-        // 環境設定ダイアログの snapshot より live 側を優先し、ダイアログを開いている間の
-        // 開閉を OK 押下で巻き戻さない。
-        self.fullscreen_click_info_open = src.fullscreen_click_info_open;
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -5799,7 +5791,6 @@ mod tests {
         );
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(loaded.fullscreen_side_panel_mode, FsSidePanelMode::Hover);
-        assert!(!loaded.fullscreen_click_info_open);
         assert_eq!(FsSidePanelMode::Hover.label(), "通常ホバー");
         assert_eq!(FsSidePanelMode::ClickToShow.label(), "クリック表示");
         assert_eq!(
@@ -6236,24 +6227,6 @@ mod tests {
                 maximized: true,
             })
         );
-    }
-
-    #[test]
-    fn overwrite_non_preferences_keeps_live_fullscreen_click_info_open() {
-        let mut edited = Settings {
-            fullscreen_side_panel_mode: FsSidePanelMode::ClickToShow,
-            ..Settings::default()
-        };
-        let mut live = Settings {
-            fullscreen_click_info_open: true,
-            ..Settings::default()
-        };
-        edited.overwrite_non_preferences_from(&mut live);
-        assert_eq!(
-            edited.fullscreen_side_panel_mode,
-            FsSidePanelMode::ClickToShow
-        );
-        assert!(edited.fullscreen_click_info_open);
     }
 
     /// 旧設定 (`ai_upscale_skip_px` のみ、新フィールドなし) は `N x N` として

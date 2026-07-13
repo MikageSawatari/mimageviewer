@@ -50,7 +50,7 @@ impl App {
     ///
     /// 表示条件:
     /// - 通常ホバー: マウスカーソルが画面右端にある間
-    /// - クリック表示: 永続設定 fullscreen_click_info_open が ON
+    /// - クリック表示: 現在ファイルの runtime flag が ON
     ///
     /// 右パネル表示中は上部バーも常に同時表示する。
     /// 右パネルは常に上部バーの下から開始する。
@@ -88,10 +88,10 @@ impl App {
                 pointer_pos,
                 self.metadata_panel_hover_active,
             );
-        let persistent = self.metadata_panel_persistently_shown();
-        self.metadata_panel_hover_active = !persistent && hover_visible;
+        let explicit = self.metadata_panel_click_shown();
+        self.metadata_panel_hover_active = !explicit && hover_visible;
 
-        let visible = persistent || self.fullscreen_tag_picker_open || hover_visible;
+        let visible = explicit || self.fullscreen_tag_picker_open || hover_visible;
         if !visible {
             return false;
         }
@@ -149,7 +149,7 @@ impl App {
         );
 
         // ClickToShow で開いた右パネルを明示的に閉じるボタン。
-        if persistent {
+        if explicit {
             let close_size = 22.0;
             let close_margin = 5.0;
             let close_rect = egui::Rect::from_min_size(

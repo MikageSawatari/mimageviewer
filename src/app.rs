@@ -6817,6 +6817,9 @@ pub struct App {
     pub(crate) show_metadata_panel: bool,
     /// 右端ホバーで開いたメタデータパネルを、カーソルがパネル内にいる間だけ維持する。
     pub(crate) metadata_panel_hover_active: bool,
+    /// ClickToShow で右情報パネルを開いているか。現在ファイルだけの transient 状態で、
+    /// ファイル移動またはフルスクリーン退出時に閉じる。
+    pub(crate) fs_click_info_open: bool,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) metadata_cache:
@@ -9700,6 +9703,7 @@ impl App {
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
             metadata_panel_hover_active: false,
+            fs_click_info_open: false,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -32884,6 +32888,9 @@ impl App {
     /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
+        // ClickToShow の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
+        // ファイル移動が集約されるこの境界で、前ファイルの開状態を引き継がない。
+        self.reset_fs_side_panel_runtime_for_file_change();
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         // 別アイテムへナビ / 新規オープンする時点で、前アイテムの「動画→音声モード」(Inc 7) は
         // 終わる。stale index (同 idx が別 item を指す) 事故を避けるため必ずクリアする
@@ -39498,11 +39505,8 @@ impl App {
         let preserve_viewport_for_folder_nav_reopen =
             self.fs_nav_locked_gen.is_some() && self.fs_viewport_shown;
 
+        self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
-        self.metadata_panel_hover_active = false;
-        // 左編集パネルはフルスクリーンセッション限定。右の ClickToShow 開状態は
-        // Settings に保持し、ここでは落とさない。
-        self.adjustment_mode = false;
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
         // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
         // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
@@ -45370,10 +45374,10 @@ impl App {
         self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
     }
 
-    pub(crate) fn metadata_panel_persistently_shown(&self) -> bool {
-        crate::ui_helpers::metadata_panel_persistently_shown(
+    pub(crate) fn metadata_panel_click_shown(&self) -> bool {
+        crate::ui_helpers::metadata_panel_click_shown(
             self.settings.fullscreen_side_panel_mode,
-            self.settings.fullscreen_click_info_open,
+            self.fs_click_info_open,
         )
     }
 
@@ -45385,13 +45389,19 @@ impl App {
         self.show_feedback_toast(format!("パネル表示: {}", next.label()));
     }
 
-    /// モード依存の左パネルと hover latch を閉じる。右の永続状態は保持する。
+    /// モード依存の左右パネルと hover latch を閉じる。
     pub(crate) fn reset_fs_side_panel_runtime_for_mode_change(&mut self) {
+        self.reset_fs_side_panel_runtime_for_file_change();
+    }
+
+    /// ClickToShow の左右パネルを現在ファイルの境界で閉じる。
+    pub(crate) fn reset_fs_side_panel_runtime_for_file_change(&mut self) {
         self.metadata_panel_hover_active = false;
         if self.adjustment_mode {
             self.persist_pending_view_trim_state();
         }
         self.adjustment_mode = false;
+        self.fs_click_info_open = false;
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
         self.music_left_click_open = false;
@@ -45403,9 +45413,8 @@ impl App {
         {
             return;
         }
-        self.settings.fullscreen_click_info_open = !self.settings.fullscreen_click_info_open;
+        self.fs_click_info_open = !self.fs_click_info_open;
         self.metadata_panel_hover_active = false;
-        self.settings.save();
     }
 
     pub(crate) fn close_click_side_panels(&mut self) -> bool {
@@ -45414,7 +45423,7 @@ impl App {
         {
             return false;
         }
-        let close_right = self.settings.fullscreen_click_info_open;
+        let close_right = self.fs_click_info_open;
         let close_music_left = self
             .fullscreen_idx
             .is_some_and(|idx| self.fs_music_view_active(idx))
@@ -45425,10 +45434,7 @@ impl App {
         }
         self.adjustment_mode = false;
         self.music_left_click_open = false;
-        if close_right {
-            self.settings.fullscreen_click_info_open = false;
-            self.settings.save();
-        }
+        self.fs_click_info_open = false;
         closed
     }
 

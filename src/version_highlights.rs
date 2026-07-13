@@ -289,7 +289,7 @@ const TABLE: &[VersionHighlights] = &[
         ],
         highlights: &[HighlightItem {
             title: "左右パネルのクリック表示モード",
-            body: "画面の左右最端に出る細いバーをクリックしてパネルを開き、明示的に閉じるまで表示できます。右の情報パネルを開いた状態は、画像を切り替えたりフルスクリーンへ入り直したりしても維持します。",
+            body: "画面の左右最端に出る細いバーをクリックしてパネルを開き、表示中のファイルでは明示的に閉じるまで表示できます。別のファイルへ移動すると、左右のパネルは閉じます。",
         }],
     },
 ];
@@ -499,6 +499,13 @@ mod tests {
                 .iter()
                 .any(|item| item.title.contains("クリック表示"))
         );
+        let click_to_show = entry
+            .highlights
+            .iter()
+            .find(|item| item.title.contains("クリック表示"))
+            .expect("クリック表示モードの highlights がある");
+        assert!(click_to_show.body.contains("別のファイルへ移動すると"));
+        assert!(!click_to_show.body.contains("入り直したりしても維持"));
     }
 
     #[test]

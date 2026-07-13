@@ -797,6 +797,9 @@ impl App {
             self.cancel_stale_video_tile_reopen(Some(target_idx), "deferred-update");
         }
         if self.native_video_source_swap_pending.is_some() {
+            if self.fullscreen_idx != Some(target_idx) {
+                self.reset_fs_side_panel_runtime_for_file_change();
+            }
             self.fullscreen_idx = Some(target_idx);
             // Inc 7: 進行中の swap が既に音声モード維持 (audio_mode_after_swap=true) なら、
             // 通常ナビによる update でもその intent を維持する。keep_audio_mode(=この update の
@@ -893,6 +896,9 @@ impl App {
             self.fs_cache.remove(&from_idx);
         }
         self.native_video_open_pending = None;
+        if self.fullscreen_idx != Some(target_idx) {
+            self.reset_fs_side_panel_runtime_for_file_change();
+        }
         self.fullscreen_idx = Some(target_idx);
         // Inc 7: 音声モード維持 swap は fullscreen_idx を target へ進めた瞬間から
         // video_audio_mode も target に合わせて音楽ビューを継続表示する (Codex #5)。旧 idx の
@@ -5085,7 +5091,7 @@ impl App {
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
-        let click_info_open = self.settings.fullscreen_click_info_open;
+        let click_info_open = self.fs_click_info_open;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
 

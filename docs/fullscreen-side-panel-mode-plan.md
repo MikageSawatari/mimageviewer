@@ -7,9 +7,11 @@
 **2 モード (通常ホバー / クリック表示)** を切り替え、パネルの召喚方法をユーザーが選べるようにする。
 **静止画・動画・音楽の 3 面すべてを同じ挙動に統一する** (ユーザー要望 2026-07-12、操作感を揃える)。
 
-> 設計変遷: 当初 3 状態 (Hover/Pinned/ClickToShow) 案 → ClickToShow を「明示クローズまで維持 +
-> 右情報パネルの開状態を永続化」にしたことで Pinned が冗長になり、**2 モードへ簡素化** (決定 C)。
-> さらにスコープを静止画のみ → **3 面統一** に拡張 (§2.5)。
+> 設計変遷: 当初 3 状態 (Hover/Pinned/ClickToShow) 案から、召喚方法を Hover / ClickToShow の
+> **2 モードへ簡素化** (決定 C)。さらにスコープを静止画のみ → **3 面統一** に拡張 (§2.5)。
+> 追補 (2026-07-13): ClickToShow の開状態を cross-session 永続化せず、左右とも
+> **per-file transient** とする。ファイル移動 / フルスクリーン退出で閉じる。静止画も動画と同様、
+> 左右どちらかの実パネルが表示中は上バー + 下部ページシークバーを同時表示する。
 
 ---
 
@@ -85,11 +87,12 @@
 
 ## 2. ターゲットモデル (2 モード)
 
-**決定 (2026-07-12): Pinned を廃止し 2 モードにする。** ClickToShow で開いた右情報パネルを
-「画像切替 + フルスクリーン再入場をまたいで維持 (永続トグル)」にすることで、旧 Pinned の
-「情報を常に見たい」需要を吸収する。モードが 2 つになりモデルが単純化する。
+**決定 (2026-07-12、2026-07-13 追補): Pinned を廃止し 2 モードにする。** Hover と
+ClickToShow は左右パネルの**召喚方法**だけを選ぶ。ClickToShow で開いた左右パネルは現在ファイル中、
+明示的に閉じるまで維持するが、ファイル移動とフルスクリーン退出では閉じる。再入場や次ファイルへ
+開状態を持ち越さない。
 
-### 2.1 永続設定 (settings.rs、2 フィールド)
+### 2.1 永続設定とランタイム状態
 
 ```rust
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -102,37 +105,38 @@ pub enum FsSidePanelMode {
 }
 ```
 
-1. `Settings.fullscreen_side_panel_mode: FsSidePanelMode` — 既定 `Hover` (= 現行挙動)。
+1. `Settings.fullscreen_side_panel_mode: FsSidePanelMode` — 唯一の永続設定。既定 `Hover` (= 現行挙動)。
    `label()` / `all()` / `normalized()`(`Unknown → Hover`) / `toggled()`(Hover↔ClickToShow) を実装。
-2. `Settings.fullscreen_click_info_open: bool` — 既定 `false`。**ClickToShow モードの右情報
-   パネルの開状態**を永続化する。ClickToShow 中の右呼び出しバー / パネルヘッダ ×(📌) で
-   トグルし、画像切替 + 再入場をまたいで維持する。Hover モードでは参照しない
-   (Hover では右端ホバーで transient 表示)。
+2. `App.fs_click_info_open: bool` — ClickToShow の右情報パネルを現在ファイルで開いているかを持つ
+   runtime flag。Settings へ保存しない。表示条件は
+   `mode==ClickToShow && fs_click_info_open` (`metadata_panel_click_shown()`) に集約する。
+3. 左開状態も各面の runtime flag (`adjustment_mode` / presenter `left_session_open` /
+   `music_left_click_open`) を使い、右と同じ per-file lifecycle に揃える。
 
-- **どちらも新規フィールド + 既定値ありなので migration 不要** (旧 settings.db は default で
-  読める / 後方互換)。
+- `Settings.fullscreen_click_info_open` は §1.15 の未リリース実装で追加されたフィールドなので削除する。
+  migration は不要で、旧データに同名キーが残っていても読み捨てる。
 - **現行 `show_metadata_panel` (App ランタイム・セッション毎 false リセット) は廃止/置換**。
-  右情報パネルの「常時表示」は `mode==ClickToShow && fullscreen_click_info_open` から導出する
-  helper (`metadata_panel_persistently_shown()`) にまとめる。これで「ピンが毎回戻る」不満も解消。
+  右情報パネルの ClickToShow 表示は上記 runtime flag から導出する。
 
 ### 2.2 各モードの挙動
 
-| モード | 左パネル (補正/編集) | 右パネル (情報) | 上バー |
+| モード | 左パネル (補正/編集) | 右パネル (情報) | 上下バー |
 | --- | --- | --- | --- |
-| **Hover** | 左端ホバーで表示 (transient) | 右端ホバーで表示 (transient) | 上端ホバー |
-| **ClickToShow** | 左呼び出しバー `▶` クリックで表示 | 右呼び出しバー `◀` クリックで表示 (**開状態は永続**) | 上端ホバー (不変) |
+| **Hover** | 左端ホバーで表示 (transient) | 右端ホバーで表示 (transient) | 通常は各面の既存条件。左右いずれか表示中は上 + 下も表示 |
+| **ClickToShow** | 左呼び出しバー `▶` クリックで表示 (per-file) | 右呼び出しバー `◀` クリックで表示 (per-file) | 左右いずれか表示中は上 + 下も表示 |
 
 - **決定 A = 辺ごとに分離 (確定)**。Hover モードでも 3 辺を分離する:
   - 左端ホバー → 左パネル (補正/編集 = `adjustment_mode`) **のみ**。右パネルは連動させない。
   - 右端ホバー → 右パネル (情報) **のみ** (既存 `metadata_panel_hover_active` 経路)。
   - 上端ホバー → 上バーのみ。
   - これで「右に寄っただけで編集パネルが出る」誤爆が Hover モードでも解消する。
-- **上バーは両モードで上端ホバー表示のまま** (× / ナビ / 見開き / フィット等の主要操作面。
-  「怖いパネル」ではないので click-to-show にしない)。
-- **右情報パネルの永続開状態は ClickToShow モード限定**。Hover モードでは右端ホバーの
-  transient 表示のみで、「常時表示」は無い (= 常時表示が欲しい人は ClickToShow を選ぶ)。
+- 上端ホバーによる上バー表示は両モードで維持する。加えて、**左または右の実パネルが表示中なら
+  上バーと下バーも同時表示**する。静止画の下バーはページシークバー、動画は既存の下 HUD、音楽は
+  常時表示の下 HUD。callout が見えているだけではこの連動を発火しない。
+- Hover モードの右パネルは右端ホバー中だけの transient 表示。ClickToShow も開状態は現在ファイルに
+  限定し、cross-session の常時表示にはしない。
 
-### 2.3 ClickToShow の呼び出しバーと開状態の永続
+### 2.3 ClickToShow の呼び出しバーと per-file lifecycle
 
 - 画面**左右の最端 ≒ 2%** (`panel_edge_trigger_px` より狭い専用定数 `PANEL_CALLOUT_HIT_PX`) に
   カーソルが入ったときだけ、縦長の細いバー (幅 ~20px) をフェード表示する。
@@ -146,10 +150,12 @@ pub enum FsSidePanelMode {
   前面へ移動するため、パネル操作後も左右バーが背面へ回らないレイヤ分離を不変条件とする。
 - 3 面の左右パネルには ClickToShow 時だけヘッダ × を表示する。静止画左は
   `画像補正 / 表示トリム` タブ幅を縮め、その右に painter の線 2 本で × を描く。
-- **右情報パネル (◀) の開状態は永続** (`fullscreen_click_info_open`)。画像切替でも維持し、
-  フルスクリーンを抜けて再入場しても復元する (= 旧 Pinned の吸収。クリック 1 回で以後記憶)。
-- **左編集パネル (▶) の開状態はセッション限定**。画像切替はまたいで維持するが、フルスクリーンを
-  抜けると閉じる (`adjustment_mode` の現行ライフサイクルに準拠。編集はタスクなので常時 ON にしない)。
+- **左右とも per-file transient**。現在ファイルではバー / × / Esc で閉じるまで維持するが、
+  ファイル移動とフルスクリーン退出で閉じる。次ファイルや再入場へは復元しない。
+- 静止画は `open_fullscreen` と連結読みの直接ページ着地で `adjustment_mode` / `fs_click_info_open` を
+  同時リセットする。動画は source swap で presenter `left_session_open` を落とし、App から右の
+  `false` を同期する。音楽は別楽曲の解析開始時に `music_left_click_open` を落とし、右も App の
+  ファイル境界リセットに従う。
 
 ### 2.4 `i` ボタン / キー = モードトグル
 
@@ -169,33 +175,37 @@ pub enum FsSidePanelMode {
 ### 2.5 3 面統一 (静止画 / 動画 / 音楽) ⚠ スコープ本体
 
 **ユーザー要望で 3 面すべてを同じ 2 モードに統一する** (最初から統一した操作感)。
-`FsSidePanelMode` と `fullscreen_click_info_open` は **1 つの Settings** に置き、3 面が共有する。
+`FsSidePanelMode` は 1 つの Settings を 3 面が共有する。右開状態は App の
+`fs_click_info_open`、左開状態は面ごとの runtime flag とし、いずれも現在ファイルだけに限定する。
 
 | 面 | 左パネル | 右パネル | `i` ボタン | モードの読み方 |
 | --- | --- | --- | --- | --- |
-| 静止画 (egui) | 補正/編集 (session) | メタデータ (**永続**) | 既存 `fs_info_btn` を転用 | `settings` 直読み |
-| 動画 (native presenter) | ジャンプ/BM (session) | メタ/タグ (**永続**) | **新規追加** (上バー) | presenter へ sync |
-| 音楽 (egui) | ジャンプ/BM (session) | タグ/メタ (**永続**) | **新規追加** (上バー) | `settings` 直読み |
+| 静止画 (egui) | 補正/編集 (per-file) | メタデータ (per-file) | 既存 `fs_info_btn` を転用 | mode=Settings / open=App runtime |
+| 動画 (native presenter) | ジャンプ/BM (per-file) | メタ/タグ (per-file) | **新規追加** (上バー) | App から presenter へ sync |
+| 音楽 (egui) | ジャンプ/BM (per-file) | タグ/メタ (per-file) | **新規追加** (上バー) | mode=Settings / open=App runtime |
 
 共通ルール (3 面同一):
 - **Hover モード**: 左端ホバー→左パネル / 右端ホバー→右パネル / 上端ホバー→上バー (分離)。
   動画・音楽は既に分離済みなので Hover は現状維持。静止画のみ分離が新規 (決定 A)。
 - **ClickToShow モード**: 端ホバーで開かない。左 `▶` / 右 `◀` 呼び出しバーのクリックで開く。
-  - **右パネル (◀) = 永続** (`fullscreen_click_info_open`、3 面共通の 1 bool)。ON なら
-    どの面でも ClickToShow 中に右パネルを表示 (面ごとに中身は違うが概念は「右の情報パネル」)。
-  - **左パネル (▶) = セッション限定** (面ごとのランタイムフラグ。静止画=`adjustment_mode`、
-    動画=presenter ランタイム flag、音楽=`music_left_click_open` 等)。フルスクリーン退場でリセット。
+  - **右パネル (◀) = per-file** (`fs_click_info_open`、3 面共通の App runtime bool)。ON なら
+    現在ファイルの ClickToShow 中に右パネルを表示する。
+  - **左パネル (▶) = per-file** (静止画=`adjustment_mode`、動画=presenter `left_session_open`、
+    音楽=`music_left_click_open`)。左右ともファイル移動とフルスクリーン退場でリセットする。
+- **側パネルと上下クロームの連動**: 左右いずれかの実パネルが表示中なら上 + 下を同時表示する。
+  動画は `panel_chrome_visible` で実装済み、音楽は上下常時表示。静止画は render 経路の
+  `side_panel_visible` を上バーの force 条件とページシークバーの force 条件に使う。
 - **`i` ボタン = モードトグル** (Hover↔ClickToShow)。3 面すべての上バーに置き、同じ設定を切り替える。
   アイコンも 3 面で揃える (Hover=通常 `i` / ClickToShow=`i`+小マウスカーソル)。
 - 動画↔音声モードの遷移は左パネルの session 境界として扱い、動画 presenter の
   `left_session_open` と音楽ビューの `music_left_click_open` を両方リセットする。
-  右の `fullscreen_click_info_open` は遷移をまたいで保持する。
+  同じファイル内の遷移では右の `fs_click_info_open` は保持し、ファイル移動時に閉じる。
 
 動画への伝搬 (native presenter は別スレッド):
-- `settings.fullscreen_side_panel_mode` / `fullscreen_click_info_open` を presenter へ **sync**
+- `settings.fullscreen_side_panel_mode` / App の `fs_click_info_open` を presenter へ **sync**
   (既存の overlay メタデータ同期経路 = `app/native_video.rs::sync_native_video_metadata` に相乗り)。
 - 上バーの `i` クリック → `NativeOverlayCommand::ToggleSidePanelMode` を App へ → App が
-  `settings` をトグル → 次 sync で presenter へ反映。右 `◀` バー → `ToggleClickInfoOpen`、
+  mode 設定をトグル → 次 sync で presenter へ反映。右 `◀` バー → `ToggleClickInfoOpen`、
   左 `▶` バー → presenter ローカルの session open flag をトグル (App 往復不要)。
 - presenter の `right_panel_visible()` / `jump_panel_visible()` 純関数に mode / click_info_open /
   left_session_open を入力追加。callout バーの rect を `compute_hud_regions` に含める。
@@ -208,40 +218,41 @@ pub enum FsSidePanelMode {
 detached viewer 固有コードには触れない (凍結ルール)。動画 HUD の `i` / callout は共有 overlay に
 足すので detached 動画にも自然に出るが、detached 固有の分岐は増やさない (fullscreen / main で先に検証)。
 
-1. **`src/settings.rs`** (3 面共通): `FsSidePanelMode { Hover, ClickToShow }` enum
-   (`label/all/normalized/toggled`) + `Settings.fullscreen_side_panel_mode` +
-   `Settings.fullscreen_click_info_open: bool`。
+1. **`src/settings.rs` / `src/app.rs`** (3 面共通): `FsSidePanelMode { Hover, ClickToShow }` enum
+   (`label/all/normalized/toggled`) + 永続する `Settings.fullscreen_side_panel_mode` +
+   per-file runtime の `App.fs_click_info_open: bool`。
 2. **`src/ui_fullscreen.rs`**:
    - `:11497-11561` の端ホバー→`adjustment_mode` を **モード分岐**へ (決定 A = 分離)。
      - Hover: **左端のみ** `adjustment_mode` を立てる (右端・上端では立てない)。
        右端は §1.1 (B) の `metadata_panel_hover_active` 経路に委ね、上端は上バー自経路。
      - ClickToShow: 端ホバーで `adjustment_mode` を立てない。呼び出しバー処理を追加。
-       左 `▶` クリックで `adjustment_mode=true`、右 `◀` クリックで `fullscreen_click_info_open` トグル。
+       左 `▶` クリックで `adjustment_mode=true`、右 `◀` クリックで `fs_click_info_open` トグル。
    - `:7807` `adjustment_active` 分岐: 決定 A = 分離につき、左パネル描画時の
      `draw_metadata_panel_forced` (右パネル強制) を**やめる**。右は自経路
-     (`draw_metadata_panel`: 右端ホバー[Hover] / 永続開状態[ClickToShow]) に委ねる。
-   - `:16977` 上バー可視ゲート: `adjustment_mode` 結合を見直し (上端ホバーは維持)。
+      (`draw_metadata_panel`: 右端ホバー[Hover] / per-file 明示開状態[ClickToShow]) に委ねる。
+   - 上バー可視ゲートを純関数化し、render 経路で得た `side_panel_visible` を force 条件にする。
+     同じ値で `FS_SEEK_BAR` 経路も force 表示する。
    - `has_right_panel` (`:11431` `:11958`): 「実効的に右パネル表示中」を
-     `metadata_panel_persistently_shown()` (= `mode==ClickToShow && fullscreen_click_info_open`)
+     `metadata_panel_click_shown()` (= `mode==ClickToShow && fs_click_info_open`)
      で算出。Hover の transient 表示は従来どおり別扱い。
    - ClickToShow 呼び出しバーの矩形計算・描画・クリック判定 helper を新設
      (`callout_bar_rect_left/right`, `callout_hit`, 純関数でテスト可能に)。
 3. **`src/ui_metadata_panel.rs`**: `show_metadata_panel` 直接参照を helper
-   `self.metadata_panel_persistently_shown()` に置換 (`:96-108` の hover ラッチ /
+   `self.metadata_panel_click_shown()` に置換 (`:96-108` の hover ラッチ /
    `:178-216` のヘッダ pin ボタン)。ヘッダ ×(📌) は ClickToShow の
-   `fullscreen_click_info_open` を落とす (Hover では非表示 or 無効)。
+   `fs_click_info_open` を落とす (Hover では非表示 or 無効)。
 4. **`src/ui_fullscreen/draw_icons.rs`**: `i` ボタンの ClickToShow バリアント (青 + 小マウス
    カーソル)。`draw_info_icon` に variant 追加 or overlay helper。
 5. **`src/ui_fullscreen.rs` `:17418` の `i` ボタン**と **`:10894` の `I` キー**、
    **`gamepad_input.rs:4474` の `ImageToggleMetadata`**: `show_metadata_panel` トグルを
    **モードトグル (`cycle_fs_side_panel_mode`, Hover↔ClickToShow)** に統一。トースト表示。
-6. **`open_fullscreen` の `show_metadata_panel = false` リセット** (`app.rs:27989` 等):
-   モード・`fullscreen_click_info_open` は永続なので**リセットしない**。左編集パネル
-   (`adjustment_mode`) は現行どおりフルスクリーン退場でリセット (セッション限定)。
+6. **ファイル境界リセット**: `open_fullscreen`、連結読みの直接ページ着地、動画の遅延 source swap、
+   `close_fullscreen` から共通 helper を呼び、`adjustment_mode` / `fs_click_info_open` /
+   `music_left_click_open` と hover latch を閉じる。モード設定だけは保持する。
 7. **環境設定 (任意)**: `ui_dialogs/preferences/pages.rs` の表示系ページに
    `FsSidePanelMode` セレクタを追加 (主導線は `i` ボタンだが、設定からも変えられると親切)。
-8. **ドキュメント**: `htdocs/mimageviewer/manual/fullscreen.html` に 2 モードの説明。
-   `docs/display-pipeline.md` §2.2.2 付近に召喚モデルを追記。
+8. **ドキュメント**: `docs/display-pipeline.md` / `docs/spec.md` と本正本を更新する。
+   `htdocs/mimageviewer/manual/` はユーザーが別途編集中のため本追補では変更しない。
 9. **version_highlights**: 決定 A (右端ホバーで左編集パネルが出なくなる) と `i` の意味変更
    (右情報トグル → モードトグル) の両方が **操作既定の変更**なので `must_read` エントリを
    追加。加えて 2 モード + クリック表示の追加を `highlights` に 1 行。
@@ -260,15 +271,15 @@ detached viewer 固有コードには触れない (凍結ルール)。動画 HUD
       左 `▶` / 右 `◀` の callout バー描画 helper を新設。
     - `NativeTopButtonGlyph` / `NativeOverlayCommand` に `Info` / `ToggleSidePanelMode` /
       `ToggleClickInfoOpen` を追加。左 `▶` は presenter ローカルの `left_session_open` トグル。
-    - `src/app/native_video.rs`: `sync_native_video_metadata` で `settings` の mode /
+    - `src/app/native_video.rs`: `sync_native_video_metadata` で Settings の mode / App runtime の
       click_info_open を presenter へ流す。`NativeOverlayCommand::ToggleSidePanelMode` /
-      `ToggleClickInfoOpen` を App 側でハンドルして `settings` を更新 (次 sync で反映)。
+      `ToggleClickInfoOpen` を App 側でハンドルし、mode または runtime flag を更新する。
       入場時の presenter 生成/再生成でも同期。
 11. **音楽ビュー (egui)**:
     - `src/ui_fullscreen.rs::draw_fs_music_view` (`:21715`): 左右パネルの二段ラッチ
       (`:21897-21906`) を **モード分岐**。ClickToShow では端ホバーで開かず、callout バー
-      (左 `▶` / 右 `◀`) のクリックで開く。右 = `fullscreen_click_info_open` (永続)、
-      左 = `music_left_click_open` 等のセッションフラグ。上バー (54px, `:21804`) に `i` ボタン
+      (左 `▶` / 右 `◀`) のクリックで開く。右 = `fs_click_info_open`、
+      左 = `music_left_click_open` の per-file flag。上バー (54px, `:21804`) に `i` ボタン
       (`settings` のモードトグル) を追加。
     - `src/ui_music_panels.rs`: 必要なら callout バー描画 helper を共有。右パネル
       (`draw_fs_music_right_panel`) の可視条件を helper へ寄せる。
@@ -291,10 +302,10 @@ detached viewer 固有コードには触れない (凍結ルール)。動画 HUD
 
 ### 決定 C — Pinned/ClickToShow の重複解消 → **Pinned 廃止・2 モード化で確定**
 
-ClickToShow の右情報パネル開状態を永続化 (`fullscreen_click_info_open`) して旧 Pinned の
-「情報常時表示」を吸収する。モードは Hover / ClickToShow の 2 つ。`i` は 2 モードのトグル。
-右情報パネルの永続表示は ClickToShow 限定 (Hover は transient 表示のみ)。左編集パネルは
-セッション限定 (永続しない)。
+モードは Hover / ClickToShow の 2 つとし、`i` は召喚方法をトグルする。2026-07-13 追補で、
+旧 Pinned の「情報常時表示」を ClickToShow の cross-session 状態へ吸収する案は撤回した。
+ClickToShow は端ホバー誤爆を避けて明示召喚できることに価値を限定し、開状態は左右とも per-file
+transient とする。`Settings.fullscreen_click_info_open` は未リリースのため migration 無しで削除する。
 
 ---
 
@@ -304,8 +315,8 @@ ClickToShow の右情報パネル開状態を永続化 (`fullscreen_click_info_o
   静止画 = 通常画像 / ZIP 内画像 / PDF ページ。動画 = native presenter。音楽 = 音声モード /
   音声ファイルの音楽ビュー。
 - **実装順 (1 ブランチ内で段階的に、各段でテスト)**:
-  1. 共通設定 (`FsSidePanelMode` + `fullscreen_click_info_open`) + 純関数 helper + unit test。
-  2. 静止画 (項目 2-9): 分離 + callout + `i` 転用 + 永続。ここで実機確認できる形にする。
+  1. 共通設定 (`FsSidePanelMode`) + per-file runtime + 純関数 helper + unit test。
+  2. 静止画 (項目 2-9): 分離 + callout + `i` 転用 + per-file lifecycle + 上下バー連動。
   3. 動画 (項目 10): presenter sync + `i` 追加 + callout + region。
   4. 音楽 (項目 11): egui 分岐 + `i` 追加 + callout。
   - ユーザーは「最初から統一」を要望しているので、**3 面揃えてから実機検証 → コミット**する
@@ -320,13 +331,16 @@ ClickToShow の右情報パネル開状態を永続化 (`fullscreen_click_info_o
 - **静止画**: 端ホバー→モード別の期待状態 (Hover 分離時: 右端ホバーで `adjustment_mode` が
   立たないこと / ClickToShow: 端ホバーで左右パネルが開かないこと)。純関数化した判定
   (`callout_hit`, `edge_summons_adjustment(mode, edge)`) で discriminating に。
-  `fullscreen_click_info_open=true` で `metadata_panel_persistently_shown()` が true、
-  `open_fullscreen` を跨いでも維持 / 左編集は退場リセット (app::tests、`--bin mimageviewer-core`)。
+  `fs_click_info_open=true` で `metadata_panel_click_shown()` が true、`open_fullscreen` による
+  ファイル移動 / 退場で左右とも false へ戻ることを確認する (app::tests、`--bin mimageviewer-core`)。
+  側パネル表示中に上バーが可視になる判定は純関数で確認し、ページシークバーも同じ
+  `side_panel_visible` を force 条件に使う。
 - **動画**: `native_right_panel_visible_from_inputs` / `native_jump_panel_visible_from_inputs` の
   純関数テストに mode / click_info_open / left_session_open ケースを追加 (ClickToShow で
   hover latch を無視、click_info_open で右が出る、等。既存テスト `mod.rs:8389-8642` に相乗り)。
 - **音楽**: 左右ラッチのモード分岐を純関数化してテスト (可能な範囲で)。
-- `i` / I / パッドが Hover↔ClickToShow をトグルし `open_fullscreen` を跨いで維持されること。
+- `i` / I / パッドが Hover↔ClickToShow をトグルし、モード設定だけは `open_fullscreen` を跨いで
+  維持されること。
 - egui 0.33 の `begin_pass` が event consume より先に決める Tab focus 方向は、全 Context の
   `on_begin_pass` ポリシーで TextEdit 編集中でない場合だけ `None` へ戻すこと。その後、通常押下 /
   autorepeat を KeySlot と egui event queue の双方から consume する。ClickToShow で左右パネルが
