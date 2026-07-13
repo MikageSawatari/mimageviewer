@@ -103,41 +103,6 @@
 - 裁定: v2.2.0 以前から同挙動で、ユーザー裁定により次版送り。優先度 P3。
   final-report 追補 5 の P3 参照。
 
-### 1.16 読書履歴などの合成ビューで ←/→ ボタンを押すと `__reading_history__` へ移動して空表示になる
-
-- 背景: 読書履歴を表示した状態でアドレスバーのフォルダ ← / → ボタンを押すと、
-  `C:\Users\<user>\AppData\Roaming\mimageviewer\__reading_history__` に移動し、
-  「表示するファイルがありません」になる (2026-07-12 ユーザー報告)。
-- 現状 (調査済み):
-  - 読書履歴ビューは `current_folder` に合成パス
-    `%APPDATA%/mimageviewer/__reading_history__` (`reading_history_synthetic_path()`,
-    `src/app.rs:4754`。実在させない・カタログキー専用) をセットする。
-  - フォルダ移動履歴の戻る/進む (`navigate_folder_history_back` `src/app.rs:12452` /
-    `navigate_folder_history_forward` `src/app.rs:12611`) は `folder_nav_back_stack` /
-    `folder_nav_forward_stack` から pop したパスを**そのまま実フォルダとしてロード**する。
-    履歴スタックに合成ビューのパスが積まれていると、←/→ でそこへ移動して実ディレクトリ
-    として走査 → 空 → 「表示するファイルがありません」。
-  - 判定ヘルパー `is_synthetic_view_path(path)` (`src/app.rs:4775`、search_results /
-    reading_history / rating_view / subfolder_expansion の合成パスを判定) は既にあるが、
-    ←/→ の nav 経路がこれを通していない。レーティング一覧 / Ctrl+G 検索結果 /
-    サブフォルダ展開ビューでも同じ構造なら同様に再現する可能性が高い (実装時に確認)。
-- 方針 (実装時に 2 案から選ぶ):
-  - 案 A: **合成ビューのパスを nav 履歴スタックに積まない** (`push_folder_nav_stack` /
-    現在地を forward へ退避する箇所で `is_synthetic_view_path` を弾く)。←/→ は実フォルダ
-    履歴だけを辿る。実装は小さいが、「←で読書履歴ビューへ戻る」はできなくなる。
-  - 案 B: **←/→ の pop 先が合成ビューパスなら、実フォルダとしてロードせず対応ビューを
-    再構築する** (reading_history / rating / search / subfolder_expansion をパスから判別して
-    再表示)。挙動は自然だが、各ビューの再入エントリを nav 経路から呼べるようにする必要がある。
-  - どちらでも、少なくとも「合成パスを実ディレクトリとしてロードして空表示になる」状態は
-    起こさないこと。既存の BS (親へ) / `reading_history_back_nav` の扱いと矛盾しないか確認する。
-- 確認:
-  - 読書履歴 / レーティング一覧 / Ctrl+G 検索結果 / サブフォルダ展開ビューを表示した状態で
-    ←/→ を押しても `__reading_history__` 等の合成パスに落ちて空表示にならない。
-  - 通常フォルダ間の ←/→ 履歴移動は従来どおり動く (回帰なし)。
-- 優先度: P3 (バグだが実害は限定的・データ破壊なし)。着手時は `src/app.rs` の
-  nav 履歴 (`folder_nav_back_stack` / `folder_nav_forward_stack`) と合成ビュー
-  (`is_synthetic_view_path` / `items_are_reading_history_view` 等) の関係を読む。
-
 ### 1.17 UI レイアウト崩れ (文字はみ出し / 見切れ) の自動検出 QA → その後に英語対応を再検討
 
 - 背景: 英語対応 (UI ローカライズ) を検討したが、AlternativeTo は「英語 UI 必須」
@@ -231,13 +196,10 @@
     明記、renderer は `mip_level_count:1` 固定・`create_sampler` が mipmap_mode 無視)。
     実ソースで確認済み → native mipmap は不可。
 - 方針 (段階投資):
-  - ⓪ **(先行・当面の対応) 手動 post_filter 縮小フィルタ**。ユーザーが選ぶ post_filter として
-    1/2 / 1/4 縮小を追加し、フィット表示のモアレを自衛できるようにする。CRT 系が既に
-    post_filter でサイズを変える道を通しており下流 (`draw_fs_image` の `size_vec2()` レイアウト)
-    が吸収するので、下流改修はほぼ不要 = 小規模。切替は既存 T (`FsPostFilterNext` が
-    `PostFilter::ALL` 巡回) に自動で乗る。制約: フルスクリーン専用 (サムネ非適用) / 他 post_filter
-    と排他 / 静的倍率。正本 §4.4 に触るファイル一覧 (`adjustment.rs` / `post_filter.rs` /
-    `ui_adjustment_panel.rs` / `gamepad_input.rs` のドリルグループ + テスト)。
+  - ⓪ **(実装済み v2.3.0、`4be5944a`) 手動 post_filter 縮小フィルタ**。ユーザーが選ぶ post_filter
+    として 1/2 / 1/4 縮小 (`PostFilter::Downscale2x` / `Downscale4x`) を追加し、フィット表示の
+    モアレを自衛できる。既存 T (`FsPostFilterNext` の `PostFilter::ALL` 巡回) に乗る。制約:
+    フルスクリーン専用 (サムネ非適用) / 他 post_filter と排他 / 静的倍率。以下 ①〜③ が残作業。
   - ① **CPU 2 段 (原寸 + 表示解像度版)** から。フィット表示は倍率固定なので worker で
     Lanczos 縮小した 1 枚を貼り、ズーム拡大時だけ原寸へ持ち替える。原寸→8192 縮小は
     既に `clamp_dynamic_for_gpu` が worker でやっているので **UI ブロックなし**。
@@ -254,9 +216,8 @@
   `size_vec2()` 経路の分離・`final_composite_cache` 回帰テスト群・編集全経路の再生成配線・
   **detached-rework 凍結ルール** (表示テクスチャ経路を共有するため、着手前に
   `docs/detached-rework-plan.md` §2 で境界を確定する)。
-- 優先度: ⓪ 手動 post_filter 縮小フィルタ (回避策) = 小規模の先行実装候補。他セッションの
-  並行作業が落ち着いてから着手予定 (2026-07-08 合意)。①〜③ の LOD による根本的解決 = P3、
-  将来再検討 (画質要望の蓄積時 or detached-rework 完了後)。
+- 優先度: ⓪ 手動 post_filter 縮小フィルタ (回避策) = **実装済み (v2.3.0)**。①〜③ の LOD による
+  根本的解決 = P3、将来再検討 (画質要望の蓄積時 or detached-rework 完了後)。
 
 ---
 

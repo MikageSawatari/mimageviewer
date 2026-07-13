@@ -3005,6 +3005,46 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.recent_folders, vec![recent0]);
     }
 
+    // ── §1.16: 合成ビュー (読書履歴 / ★一覧 / 検索結果 / サブフォルダ展開) 表示中の ←/→ ──
+    // 合成パスは実在しないため、戻る/進むで現在地を反対スタックへ退避するとき積まない。
+    // 積むと ←/→ で `__reading_history__` 等を実ディレクトリとして開こうとして空表示になる。
+
+    #[test]
+    fn folder_nav_back_from_synthetic_view_keeps_synthetic_off_forward_stack() {
+        let mut app = setup_app();
+        let real = PathBuf::from(r"C:\miv-test\real-folder");
+        // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(super::reading_history_synthetic_path());
+        app.folder_nav_back_stack = vec![real.clone()];
+        app.folder_nav_forward_stack = Vec::new();
+
+        // 戻るで実フォルダへは戻れる。
+        assert_eq!(app.navigate_folder_history_back(), Some(real));
+        // 現在地だった合成パスは forward スタックへ積まれない。
+        assert!(
+            app.folder_nav_forward_stack.is_empty(),
+            "synthetic view path must not be pushed onto the forward stack"
+        );
+    }
+
+    #[test]
+    fn folder_nav_forward_from_synthetic_view_keeps_synthetic_off_back_stack() {
+        let mut app = setup_app();
+        let real = PathBuf::from(r"C:\miv-test\real-folder");
+        // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(super::rating_view_synthetic_path());
+        app.folder_nav_forward_stack = vec![real.clone()];
+        app.folder_nav_back_stack = Vec::new();
+
+        assert_eq!(app.navigate_folder_history_forward(), Some(real));
+        assert!(
+            app.folder_nav_back_stack.is_empty(),
+            "synthetic view path must not be pushed onto the back stack"
+        );
+    }
+
     #[test]
     fn closing_global_search_does_not_record_history() {
         let mut app = setup_app();

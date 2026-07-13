@@ -12135,6 +12135,16 @@ impl App {
     }
 
     fn push_folder_nav_stack(stack: &mut Vec<PathBuf>, path: PathBuf) {
+        // 合成ビューパス (__search_results__ / __reading_history__ / __rating_view__ /
+        // __subfolder_expansion__) は実在しないため、戻る/進む履歴に積まない。積むと ←/→ で
+        // 実ディレクトリとして開こうとして「表示するファイルがありません」になる (§1.16)。
+        // record_folder_nav_transition は移動元の合成パスを既に弾いているが、
+        // navigate_folder_history_back/forward が現在地を反対スタックへ退避する経路が漏れており、
+        // 読書履歴などを表示中に ←/→ を押すと合成パスへ移動していた。両スタックの単一
+        // チョークポイントであるここで一括して弾く。
+        if is_synthetic_view_path(&path) {
+            return;
+        }
         if stack
             .last()
             .is_some_and(|last| crate::folder_tree::path_eq(last, &path))
