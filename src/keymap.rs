@@ -6577,7 +6577,7 @@ fn key_held_via_os(key: KeyName) -> bool {
 }
 
 #[cfg(windows)]
-fn modifier_held_via_os(kind: ModKind) -> bool {
+pub(crate) fn modifier_held_via_os(kind: ModKind) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
     };
@@ -6588,6 +6588,11 @@ fn modifier_held_via_os(kind: ModKind) -> bool {
         ModKind::Alt => VK_MENU.0,
     };
     unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn modifier_held_via_os(_kind: ModKind) -> bool {
+    false
 }
 
 #[cfg(windows)]

@@ -28,7 +28,7 @@
 
 use crate::app::{App, TextDrag, TextDragKind};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
-use crate::keymap::KeyAction;
+use crate::keymap::{KeyAction, ModKind, modifier_held_via_os};
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
@@ -957,6 +957,101 @@ fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
     }
 }
 
+/// `handle_points` の四隅生成順 (TL, TR, BR, BL) に対応する局所座標の符号。
+fn corner_signs(corner_idx: usize) -> (f32, f32) {
+    const SIGNS: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    SIGNS[corner_idx]
+}
+
+/// ドラッグ開始時の矩形と現在カーソルだけから四隅リサイズ結果を再計算する。
+///
+/// `symmetric` では開始時 pivot を固定する。反対角アンカーモードでは開始時の反対角を
+/// 固定し、最小寸法のクランプ後に中心を求めるため、クランプ中もアンカーが動かない。
+fn corner_resize_from_start(
+    start_pivot: (f32, f32),
+    hw0: f32,
+    hh0: f32,
+    rotation_rad: f32,
+    corner_idx: usize,
+    cursor_img: (f32, f32),
+    symmetric: bool,
+    min_hw: f32,
+    min_hh: f32,
+) -> ((f32, f32), f32, f32) {
+    let (sin, cos) = rotation_rad.sin_cos();
+    let relx = cursor_img.0 - start_pivot.0;
+    let rely = cursor_img.1 - start_pivot.1;
+    let cursor_local = (relx * cos + rely * sin, -relx * sin + rely * cos);
+
+    if symmetric {
+        return (
+            start_pivot,
+            cursor_local.0.abs().max(min_hw),
+            cursor_local.1.abs().max(min_hh),
+        );
+    }
+
+    let (sx, sy) = corner_signs(corner_idx);
+    let anchor_local = (-sx * hw0, -sy * hh0);
+    let new_hw = ((cursor_local.0 - anchor_local.0).abs() * 0.5).max(min_hw);
+    let new_hh = ((cursor_local.1 - anchor_local.1).abs() * 0.5).max(min_hh);
+    let center_local = (anchor_local.0 + sx * new_hw, anchor_local.1 + sy * new_hh);
+    let new_pivot = (
+        start_pivot.0 + center_local.0 * cos - center_local.1 * sin,
+        start_pivot.1 + center_local.0 * sin + center_local.1 * cos,
+    );
+    (new_pivot, new_hw, new_hh)
+}
+
+/// Stamp の開始時アスペクト比を保ったまま、一様スケールで四隅リサイズする。
+fn stamp_corner_resize_from_start(
+    start_pivot: (f32, f32),
+    hw0: f32,
+    hh0: f32,
+    rotation_rad: f32,
+    corner_idx: usize,
+    cursor_img: (f32, f32),
+    symmetric: bool,
+) -> ((f32, f32), f32, f32) {
+    const MIN_HALF_EXTENT: f32 = 8.0;
+    let base_hw = hw0.max(1e-3);
+    let base_hh = hh0.max(1e-3);
+    let (sin, cos) = rotation_rad.sin_cos();
+    let relx = cursor_img.0 - start_pivot.0;
+    let rely = cursor_img.1 - start_pivot.1;
+    let cursor_local = (relx * cos + rely * sin, -relx * sin + rely * cos);
+    let (sx, sy) = corner_signs(corner_idx);
+
+    let (scale_x, scale_y, anchor_local) = if symmetric {
+        (
+            cursor_local.0.abs() / base_hw,
+            cursor_local.1.abs() / base_hh,
+            None,
+        )
+    } else {
+        let anchor = (-sx * base_hw, -sy * base_hh);
+        (
+            (cursor_local.0 - anchor.0).abs() / (2.0 * base_hw),
+            (cursor_local.1 - anchor.1).abs() / (2.0 * base_hh),
+            Some(anchor),
+        )
+    };
+    let min_scale = (MIN_HALF_EXTENT / base_hw).max(MIN_HALF_EXTENT / base_hh);
+    let scale = scale_x.max(scale_y).max(min_scale);
+    let new_hw = base_hw * scale;
+    let new_hh = base_hh * scale;
+
+    let Some(anchor_local) = anchor_local else {
+        return (start_pivot, new_hw, new_hh);
+    };
+    let center_local = (anchor_local.0 + sx * new_hw, anchor_local.1 + sy * new_hh);
+    let new_pivot = (
+        start_pivot.0 + center_local.0 * cos - center_local.1 * sin,
+        start_pivot.1 + center_local.0 * sin + center_local.1 * cos,
+    );
+    (new_pivot, new_hw, new_hh)
+}
+
 /// drag-start: 選択中オブジェクトのどのハンドルを掴んだかを判定する。
 /// 優先順: しっぽ先端 → しっぽ根元 → 回転ノブ → 四隅。いずれも当たらなければ None
 /// (呼び出し側で本体 hit-test → Move にフォールバックする)。ラボ `handle_canvas_input`
@@ -1001,6 +1096,7 @@ fn apply_text_drag(
     drag: &TextDrag,
     img: (f32, f32),
     fonts: Option<&FontSet>,
+    symmetric_corner_resize: bool,
 ) -> bool {
     // 借用衝突を避けるため、可変借用の前に不変参照から必要値を読む。
     let rot_center = objs
@@ -1045,41 +1141,68 @@ fn apply_text_drag(
                 o.rotation_rad = rely.atan2(relx) + std::f32::consts::FRAC_PI_2;
                 changed = true;
             }
-            TextDragKind::Corner(_) => {
-                let pivot = o.pivot;
-                let (sin, cos) = o.rotation_rad.sin_cos();
-                let relx = img.0 - pivot.0;
-                let rely = img.1 - pivot.1;
-                // 局所軸へ逆回転 (pivot 対称リサイズ)。
-                let lx = relx * cos + rely * sin;
-                let ly = -relx * sin + rely * cos;
+            TextDragKind::Corner(corner_idx) => {
                 match &mut o.kind {
                     AnnotationKind::Bubble(b) => {
-                        set_bubble_half_extents(b, lx.abs().max(10.0), ly.abs().max(10.0));
+                        let Some((hw0, hh0)) = drag.start_half_extents else {
+                            return false;
+                        };
+                        let (pivot, hw, hh) = corner_resize_from_start(
+                            drag.start_pivot,
+                            hw0,
+                            hh0,
+                            drag.start_rotation_rad,
+                            corner_idx,
+                            img,
+                            symmetric_corner_resize,
+                            10.0,
+                            10.0,
+                        );
+                        o.pivot = pivot;
+                        set_bubble_half_extents(b, hw, hh);
                         b.auto_size = false;
                         clear_shape_style_link(b);
                         changed = true;
                     }
                     AnnotationKind::MessageWindow(w) => {
-                        w.half_w = lx.abs().max(20.0);
-                        w.half_h = ly.abs().max(12.0);
+                        let Some((hw0, hh0)) = drag.start_half_extents else {
+                            return false;
+                        };
+                        let (pivot, hw, hh) = corner_resize_from_start(
+                            drag.start_pivot,
+                            hw0,
+                            hh0,
+                            drag.start_rotation_rad,
+                            corner_idx,
+                            img,
+                            symmetric_corner_resize,
+                            20.0,
+                            12.0,
+                        );
+                        o.pivot = pivot;
+                        w.half_w = hw;
+                        w.half_h = hh;
                         w.size_mode = SizeMode::Inset;
                         w.position = WindowPosition::Free;
                         w.style_preset_link = None;
                         changed = true;
                     }
                     AnnotationKind::Stamp(s) => {
-                        // アスペクト比を保った一様スケール。
-                        let aspect = if s.half_h > 1e-3 {
-                            s.half_w / s.half_h
-                        } else {
-                            1.0
+                        let Some((hw0, hh0)) = drag.start_half_extents else {
+                            return false;
                         };
-                        let cand_w = lx.abs().max(8.0);
-                        let cand_h = ly.abs().max(8.0);
-                        let new_w = cand_w.max(cand_h * aspect);
-                        s.half_w = new_w;
-                        s.half_h = (new_w / aspect.max(1e-3)).max(8.0);
+                        let (pivot, hw, hh) = stamp_corner_resize_from_start(
+                            drag.start_pivot,
+                            hw0,
+                            hh0,
+                            drag.start_rotation_rad,
+                            corner_idx,
+                            img,
+                            symmetric_corner_resize,
+                        );
+                        o.pivot = pivot;
+                        s.half_w = hw;
+                        s.half_h = hh;
                         changed = true;
                     }
                     AnnotationKind::Text(t) => {
@@ -1877,14 +2000,22 @@ impl App {
                     }
                 };
                 self.text_drag = match (drag_id, kind) {
-                    (Some(id), Some(kind)) => Some(TextDrag {
-                        id,
-                        kind,
-                        start: pos,
-                        last_img: img,
-                        armed: false,
-                        moved: false,
-                    }),
+                    (Some(id), Some(kind)) => self
+                        .comic_docs
+                        .get(&key)
+                        .and_then(|objs| objs.iter().find(|o| o.id == id))
+                        .map(|o| TextDrag {
+                            id,
+                            kind,
+                            start: pos,
+                            start_pivot: o.pivot,
+                            start_half_extents: handle_half_extents(o, fonts.as_deref())
+                                .map(|(half_extents, _)| half_extents),
+                            start_rotation_rad: o.rotation_rad,
+                            last_img: img,
+                            armed: false,
+                            moved: false,
+                        }),
                     _ => None,
                 };
             }
@@ -1896,10 +2027,21 @@ impl App {
                 if drag.armed || (pos - drag.start).length() >= DRAG_ARM_PX {
                     drag.armed = true;
                     let img = view.screen_to_image(pos);
+                    // FS キャンバスでは egui modifiers が stale になり得るため、Ctrl は
+                    // ドラッグ中の各フレームで OS から直接読む。
+                    let symmetric_corner_resize = modifier_held_via_os(ModKind::Ctrl);
                     let changed = self
                         .comic_docs
                         .get_mut(&key)
-                        .map(|objs| apply_text_drag(objs, &drag, img, fonts.as_deref()))
+                        .map(|objs| {
+                            apply_text_drag(
+                                objs,
+                                &drag,
+                                img,
+                                fonts.as_deref(),
+                                symmetric_corner_resize,
+                            )
+                        })
                         .unwrap_or(false);
                     if changed {
                         drag.moved = true;
@@ -9010,6 +9152,162 @@ mod tests {
         )
     }
 
+    fn local_to_image(pivot: (f32, f32), local: (f32, f32), rotation_rad: f32) -> (f32, f32) {
+        let (sin, cos) = rotation_rad.sin_cos();
+        (
+            pivot.0 + local.0 * cos - local.1 * sin,
+            pivot.1 + local.0 * sin + local.1 * cos,
+        )
+    }
+
+    fn corner_image_point(
+        pivot: (f32, f32),
+        hw: f32,
+        hh: f32,
+        rotation_rad: f32,
+        corner_idx: usize,
+    ) -> (f32, f32) {
+        let (sx, sy) = corner_signs(corner_idx);
+        local_to_image(pivot, (sx * hw, sy * hh), rotation_rad)
+    }
+
+    fn assert_point_close(actual: (f32, f32), expected: (f32, f32)) {
+        assert!((actual.0 - expected.0).abs() < 1e-4);
+        assert!((actual.1 - expected.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn corner_resize_anchor_keeps_opposite_corner_at_zero_rotation() {
+        let start_pivot = (100.0, 80.0);
+        let (hw0, hh0) = (40.0, 20.0);
+        let corner_idx = 2;
+        let old_anchor = corner_image_point(start_pivot, hw0, hh0, 0.0, 0);
+        let cursor = local_to_image(start_pivot, (70.0, 50.0), 0.0);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            0.0,
+            corner_idx,
+            cursor,
+            false,
+            10.0,
+            10.0,
+        );
+
+        assert_point_close(corner_image_point(pivot, hw, hh, 0.0, 0), old_anchor);
+    }
+
+    #[test]
+    fn corner_resize_anchor_keeps_opposite_corner_at_thirty_degrees() {
+        let rotation_rad = 30.0_f32.to_radians();
+        let start_pivot = (100.0, 80.0);
+        let (hw0, hh0) = (40.0, 20.0);
+        let corner_idx = 1;
+        let opposite_idx = 3;
+        let old_anchor = corner_image_point(start_pivot, hw0, hh0, rotation_rad, opposite_idx);
+        let cursor = local_to_image(start_pivot, (75.0, -45.0), rotation_rad);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            rotation_rad,
+            corner_idx,
+            cursor,
+            false,
+            10.0,
+            10.0,
+        );
+
+        assert_point_close(
+            corner_image_point(pivot, hw, hh, rotation_rad, opposite_idx),
+            old_anchor,
+        );
+    }
+
+    #[test]
+    fn corner_resize_symmetric_keeps_pivot_and_uses_cursor_extents() {
+        let rotation_rad = 30.0_f32.to_radians();
+        let start_pivot = (120.0, 90.0);
+        let cursor = local_to_image(start_pivot, (65.0, -25.0), rotation_rad);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            40.0,
+            20.0,
+            rotation_rad,
+            1,
+            cursor,
+            true,
+            10.0,
+            10.0,
+        );
+
+        assert_eq!(pivot, start_pivot);
+        assert!((hw - 65.0).abs() < 1e-4);
+        assert!((hh - 25.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn corner_resize_ctrl_toggle_recomputes_without_drift() {
+        let start_pivot = (100.0, 80.0);
+        let cursor = (180.0, 135.0);
+        let anchored_before =
+            corner_resize_from_start(start_pivot, 40.0, 20.0, 0.0, 2, cursor, false, 10.0, 10.0);
+        let symmetric =
+            corner_resize_from_start(start_pivot, 40.0, 20.0, 0.0, 2, cursor, true, 10.0, 10.0);
+        let anchored_after =
+            corner_resize_from_start(start_pivot, 40.0, 20.0, 0.0, 2, cursor, false, 10.0, 10.0);
+
+        assert_ne!(anchored_before, symmetric);
+        assert_eq!(anchored_after, anchored_before);
+    }
+
+    #[test]
+    fn corner_resize_clamp_keeps_opposite_corner() {
+        let start_pivot = (100.0, 80.0);
+        let (hw0, hh0) = (50.0, 30.0);
+        let corner_idx = 2;
+        let anchor = corner_image_point(start_pivot, hw0, hh0, 0.0, 0);
+
+        let (pivot, hw, hh) = corner_resize_from_start(
+            start_pivot,
+            hw0,
+            hh0,
+            0.0,
+            corner_idx,
+            anchor,
+            false,
+            20.0,
+            12.0,
+        );
+
+        assert_eq!((hw, hh), (20.0, 12.0));
+        assert_point_close(corner_image_point(pivot, hw, hh, 0.0, 0), anchor);
+    }
+
+    #[test]
+    fn stamp_corner_resize_preserves_aspect_and_anchor() {
+        let start_pivot = (100.0, 80.0);
+        let (hw0, hh0) = (40.0, 20.0);
+        let corner_idx = 1;
+        let opposite_idx = 3;
+        let anchor = corner_image_point(start_pivot, hw0, hh0, 0.0, opposite_idx);
+        let cursor = local_to_image(start_pivot, (80.0, -40.0), 0.0);
+
+        let (pivot, hw, hh) =
+            stamp_corner_resize_from_start(start_pivot, hw0, hh0, 0.0, corner_idx, cursor, false);
+        let (symmetric_pivot, symmetric_hw, symmetric_hh) =
+            stamp_corner_resize_from_start(start_pivot, hw0, hh0, 0.0, corner_idx, cursor, true);
+
+        assert!((hw / hh - hw0 / hh0).abs() < 1e-4);
+        assert_point_close(corner_image_point(pivot, hw, hh, 0.0, opposite_idx), anchor);
+        assert_eq!(symmetric_pivot, start_pivot);
+        assert!((symmetric_hw / symmetric_hh - hw0 / hh0).abs() < 1e-4);
+    }
+
     #[test]
     fn rotate_drag_sets_rotation_about_center() {
         // フォント非依存のスタンプで回転ノブの数式を検証。
@@ -9018,15 +9316,24 @@ mod tests {
             id: 1,
             kind: TextDragKind::Rotate,
             start: egui::pos2(0.0, 0.0),
+            start_pivot: (100.0, 100.0),
+            start_half_extents: Some((50.0, 30.0)),
+            start_rotation_rad: 0.0,
             last_img: (0.0, 0.0),
             armed: true,
             moved: false,
         };
         // 中心の真右 → atan2(0,+) + π/2 = π/2。
-        assert!(apply_text_drag(&mut objs, &drag, (200.0, 100.0), None));
+        assert!(apply_text_drag(
+            &mut objs,
+            &drag,
+            (200.0, 100.0),
+            None,
+            false,
+        ));
         assert!((objs[0].rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
         // 中心の真上 (画面 y は下向き) → atan2(-1,0) + π/2 = 0。
-        apply_text_drag(&mut objs, &drag, (100.0, 50.0), None);
+        apply_text_drag(&mut objs, &drag, (100.0, 50.0), None, false);
         assert!(objs[0].rotation_rad.abs() < 1e-4);
     }
 
@@ -9038,11 +9345,20 @@ mod tests {
             id: 1,
             kind: TextDragKind::Corner(2),
             start: egui::pos2(0.0, 0.0),
+            start_pivot: (100.0, 100.0),
+            start_half_extents: Some((40.0, 20.0)),
+            start_rotation_rad: 0.0,
             last_img: (0.0, 0.0),
             armed: true,
             moved: false,
         };
-        assert!(apply_text_drag(&mut objs, &drag, (180.0, 100.0), None));
+        assert!(apply_text_drag(
+            &mut objs,
+            &drag,
+            (180.0, 100.0),
+            None,
+            true,
+        ));
         if let AnnotationKind::Stamp(s) = &objs[0].kind {
             assert!((s.half_w - 80.0).abs() < 1e-3, "half_w={}", s.half_w);
             // アスペクト 2:1 を保持。
