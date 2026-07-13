@@ -383,6 +383,50 @@ presence set・resume キー書換。対象ストア・許容制限の正本は�
   nav 履歴 (`folder_nav_back_stack` / `folder_nav_forward_stack`) と合成ビュー
   (`is_synthetic_view_path` / `items_are_reading_history_view` 等) の関係を読む。
 
+### 1.17 UI レイアウト崩れ (文字はみ出し / 見切れ) の自動検出 QA → その後に英語対応を再検討
+
+- 背景: 英語対応 (UI ローカライズ) を検討したが、AlternativeTo は「英語 UI 必須」
+  (FAQ: DB 登録アプリは英語対応が必須) のため、日本語のみの現状では掲載できない。
+  一方、多機能ゆえに英語 UI を実機で全画面目視 QA するのは負担が大きく、しかも日本語でも
+  文字はみ出し / 見切れのレイアウトバグが繰り返し発生している。そこで **まず言語非依存の
+  「レイアウト崩れ自動検出」QA ツールに投資**し、日本語バグに即効かつ将来の英語化の
+  「目視 2 倍」問題を先に解消する。英語対応の可否はその後に再判断する。
+  (2026-07-13 相談。ユーザー方針: QA 投資を先行 → その後に英語対応を再検討。今は別作業中のため別途着手)
+- 現状 (確認済み):
+  - egui は文字配置時に galley サイズが取れ、painter は clip rect を持つため
+    「galley 幅 > 割り当て幅」で見切れを機械判定できる。
+  - UI スナップショット基盤 `tests/ui_snapshot.rs` (egui_kittest) が既にある (回帰検出向け)。
+  - 文字列は現状ハードコード (i18n 未 externalize)。見切れ計装は現行日本語のままでも動く
+    ので、i18n とは分離して先行できる。
+- 方針 (QA ツール先行 → 英語再検討):
+  - QA ツール (言語非依存・日本語バグにも効く):
+    1. **見切れ計装**: 描画時に galley 幅 vs clip/available 幅を比較し、超過した文字列 +
+       ウィジェット位置をログ列挙する。全画面を人が見なくても崩れ候補の一覧が出る。
+    2. **疑似ローカライズ (幅ストレス)**: UI 文字列を ~1.4x 長い擬似文字列に置換したビルドで
+       幅不足のウィジェットを炙り出す (英語が長くなる前提の先行テスト。日本語のままでも
+       将来はみ出しやすい箇所を潰せる)。
+    3. 既存 egui_kittest スナップショットを併用 (変化検出。最終は差分画像を目視)。
+    4. (任意) スクショ自動キャプチャ + ビジョン判定で「切れ / 重なり」を triage。
+    - 限界: 得意なのは見切れ / はみ出し / 行あふれ。位置ズレ・不格好な折り返し・パネルの
+      重なりは取りこぼしがあり、多少の目視が残る。
+  - 英語対応 (QA ツール整備後に可否判断):
+    - 前工程 = 文字列の externalize (i18n 化)。
+    - AI 一括翻訳 + **用語集** (見開き=Two-page spread 等を先に固定) + 各文字列の文脈付与で
+      用語ゆらぎ / 品詞ズレを抑える。
+    - **変数整合チェック**: `%s` / `{}` / 改行 の個数・種類が元と英訳で一致するか機械照合。
+    - **逆翻訳 QA**: 重要文字列 (削除 / 上書き / 警告 / エラーダイアログ) に限定して英→日へ
+      訳し戻し、元日本語と比較する。英語力が無くても意味ズレを検知できる (日本語同士の比較)。
+    - 実機確認は見切れ計装 + 疑似ロカライズで大半を機械化し、目視は残差のみ。
+    - "English is machine-assisted; feedback welcome" と明示し、OSS の Issue / PR で継続改善。
+- AlternativeTo 連携: 英語 UI が入れば掲載可。申請素材 (Tagline / Description の v2.3.0 版
+  = 音楽再生 + VST3 入り / Website / Source / License Free+OSS(MIT) / 画像 = icon.png + ss_*.png
+  含む ss_music.png / Alternative to = NeeView・MangaMeeya・Leeyes・ZipPla・Honeyview・
+  ImageGlass・IrfanView・XnView MP・nomacs・FastStone) は準備済み。GitHub Topics / 英語 README
+  サマリ / egui Showcase / awesome-egui PR は UI 言語非依存の枠なので実施済み。
+- 規模 / リスク: QA 計装 = Medium (描画経路への hook + 幅バジェット定義)。英語化 = Large
+  (externalize + 翻訳 + QA 工程)。QA ツールは日本語バグにも効くため単独で投資回収がある。
+- 優先度: P2 candidate (QA ツール)。英語対応は QA ツール整備後に再判断 (現時点は保留)。
+
 ## 2. フォルダツリーペイン
 
 ### 2.1 folder pane scan worker の thread 構成判断
