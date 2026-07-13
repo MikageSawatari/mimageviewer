@@ -21,6 +21,8 @@ use comic_core::{RgbaOverlay, StampSource};
 // build.rs が生成する `pub static EMOJI_SVGS: &[(&str, &[u8])]` (key → SVG バイト列)。
 // アセット未配置なら空配列になる。
 include!(concat!(env!("OUT_DIR"), "/emoji_svgs.rs"));
+// mIV オリジナル注釈 SVG は Twemoji と独立した生成テーブルで同梱する。
+include!(concat!(env!("OUT_DIR"), "/annotation_stamp_svgs.rs"));
 
 /// 絵文字 SVG をラスタライズするネイティブ解像度。ベイカが canvas サイズへ
 /// バイリニア縮小するので、ここでは鮮明さ / メモリの上限を決めるだけ。
@@ -91,13 +93,14 @@ pub enum EmojiCategory {
     Food,
     Activities,
     Symbols,
+    Annotation,
 }
 
 impl EmojiCategory {
     pub fn all() -> &'static [EmojiCategory] {
         use EmojiCategory::*;
         &[
-            Smileys, Gestures, Hearts, Animals, Food, Activities, Symbols,
+            Smileys, Gestures, Hearts, Animals, Food, Activities, Symbols, Annotation,
         ]
     }
 
@@ -110,23 +113,38 @@ impl EmojiCategory {
             EmojiCategory::Food => "食べ物",
             EmojiCategory::Activities => "活動",
             EmojiCategory::Symbols => "記号",
+            EmojiCategory::Annotation => "注釈",
         }
     }
 }
 
-/// カタログ 1 件: Twemoji ファイル名 (小文字 16 進コードポイントを `-` 連結)、
-/// 検索用の名前 (英語 + 少しの日本語)、カテゴリ。
+/// カタログ 1 件: Twemoji コードポイントまたは `miv:` キー、検索名、カテゴリ。
 pub struct EmojiEntry {
     pub key: &'static str,
     pub name: &'static str,
     pub category: EmojiCategory,
 }
 
+/// 注釈カテゴリに並べる mIV オリジナルスタンプ。順序はピッカー表示順でもある。
+pub const ANNOTATION_STAMP_KEYS: [&str; 5] = [
+    "miv:cursor-arrow-white",
+    "miv:cursor-arrow-black",
+    "miv:cursor-hand",
+    "miv:cursor-ibeam",
+    "miv:click-ring",
+];
+
 /// 厳選した汎用絵文字。数百件に絞ることで、3,500 件の無分類ファイルではなく
 /// 「カテゴリ + 名前 + 小さな同梱サイズ」のピッカーになる。`setup-twemoji.sh` は
 /// このキー集合をちょうど取得する。
 #[rustfmt::skip]
 pub const EMOJI_CATALOG: &[EmojiEntry] = &[
+    // ---- mIV annotation cursors ----
+    EmojiEntry { key: "miv:cursor-arrow-white", name: "white cursor arrow 白矢印", category: EmojiCategory::Annotation },
+    EmojiEntry { key: "miv:cursor-arrow-black", name: "black cursor arrow 黒矢印", category: EmojiCategory::Annotation },
+    EmojiEntry { key: "miv:cursor-hand", name: "pointing hand cursor 指差し", category: EmojiCategory::Annotation },
+    EmojiEntry { key: "miv:cursor-ibeam", name: "text ibeam cursor Iビーム", category: EmojiCategory::Annotation },
+    EmojiEntry { key: "miv:click-ring", name: "click ring ripple クリックリング", category: EmojiCategory::Annotation },
     // ---- Smileys / faces ----
     EmojiEntry { key: "1f600", name: "grinning face にっこり",        category: EmojiCategory::Smileys },
     EmojiEntry { key: "1f603", name: "smiling face 笑顔",            category: EmojiCategory::Smileys },
@@ -263,9 +281,10 @@ pub const EMOJI_CATALOG: &[EmojiEntry] = &[
 
 /// 同梱絵文字 SVG のバイト列を返す (未同梱なら `None`)。
 pub fn emoji_svg_bytes(key: &str) -> Option<&'static [u8]> {
-    EMOJI_SVGS
+    ANNOTATION_STAMP_SVGS
         .iter()
         .find(|(k, _)| *k == key)
+        .or_else(|| EMOJI_SVGS.iter().find(|(k, _)| *k == key))
         .map(|(_, bytes)| *bytes)
 }
 
@@ -290,6 +309,7 @@ fn embedded_data_key(data: &str) -> String {
 /// スタンプソースの短い表示名 (オブジェクト一覧 / プロパティ)。
 pub fn stamp_label(source: &StampSource) -> String {
     match source {
+        StampSource::Emoji(key) if key.starts_with("miv:") => "カーソル".to_string(),
         StampSource::Emoji(key) => EMOJI_CATALOG
             .iter()
             .find(|e| e.key == key && !e.name.is_empty())
@@ -627,6 +647,27 @@ mod tests {
     }
 
     #[test]
+    fn annotation_category_has_five_decodable_assets() {
+        let keys: Vec<_> = EMOJI_CATALOG
+            .iter()
+            .filter(|entry| entry.category == EmojiCategory::Annotation)
+            .map(|entry| entry.key)
+            .collect();
+        assert_eq!(keys, ANNOTATION_STAMP_KEYS);
+
+        for key in ANNOTATION_STAMP_KEYS {
+            let source = StampSource::Emoji(key.to_string());
+            let image = load_stamp_image(&source)
+                .unwrap_or_else(|| panic!("annotation stamp should decode: {key}"));
+            assert_eq!((image.w, image.h), (512, 512), "{key} viewBox is square");
+            assert!(
+                image.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0),
+                "{key} should contain visible pixels"
+            );
+        }
+    }
+
+    #[test]
     fn downscale_shrinks_to_target() {
         let src = RgbaOverlay {
             w: 100,
@@ -643,6 +684,9 @@ mod tests {
         let e = StampSource::Emoji("1f600".into());
         assert_eq!(stamp_source_key(&e), "e:1f600");
         assert_eq!(stamp_label(&e), "にっこり");
+        let cursor = StampSource::Emoji("miv:cursor-arrow-white".into());
+        assert_eq!(stamp_source_key(&cursor), "e:miv:cursor-arrow-white");
+        assert_eq!(stamp_label(&cursor), "カーソル");
         let f = StampSource::File(PathBuf::from("/x/y/cat.png"));
         assert_eq!(stamp_source_key(&f), "f:/x/y/cat.png");
         assert_eq!(stamp_label(&f), "cat.png");

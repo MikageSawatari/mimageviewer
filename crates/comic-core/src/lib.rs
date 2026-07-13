@@ -25,7 +25,7 @@ pub use font::{FontSet, GlyphBitmap, LoadedFont, rotate_cw};
 pub use layout::{GlyphForm, GlyphPlacement, TextLayout, layout_text, layout_text_wrapped};
 pub use model::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
-    DecorationLayer, FillMode, FrameStyle, IndicatorKind, InlineDir, Insets, MarkupRule,
+    DecorationLayer, FillBlend, FillMode, FrameStyle, IndicatorKind, InlineDir, Insets, MarkupRule,
     MessageWindowObject, NamePlate, NamePlateMode, Orientation, PortraitSide, PortraitSlot, Rgba,
     ShadowStyle, SizeMode, StampObject, StampSource, StrokeStyle, Tail, TailKind, TextAlign,
     TextBackgroundStyle, TextBlock, TextEchoStyle, TextGlowStyle, TextShadowStyle, VAnchor,
@@ -33,8 +33,9 @@ pub use model::{
     markup_rules_white,
 };
 pub use raster::{
-    RgbaOverlay, StampImages, bake_overlay, bake_overlay_with_stamps, composite_stamp_sticker,
-    effective_bubble_shape, effective_window_half_extents, message_window_overflows,
+    AnnotationLayer, RgbaOverlay, StampImages, bake_annotation_layers, bake_overlay,
+    bake_overlay_with_stamps, composite_stamp_sticker, effective_bubble_shape,
+    effective_window_half_extents, message_window_overflows,
 };
 pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,

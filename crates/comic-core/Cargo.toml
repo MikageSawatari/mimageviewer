@@ -32,3 +32,6 @@ self_cell = "1"
 # bake into their own AABB-sized buffers concurrently, then composite in z-order. The
 # glyph cache is generation-based so it works correctly across rayon worker threads.
 rayon = "1"
+
+[dev-dependencies]
+serde_json = "1"

@@ -80,6 +80,13 @@ Inc 8 (仕上げ・回帰) 完了 (2026-06-07): マニュアル (`annotation.htm
 - `tools/comic_lab`（egui アプリ）は **UI 参照実装**。mIV 側 UI は mIV 作法で書き直す。
 - **許容される comic-core への追加**: ロジックの書き換えは不可だが、**純粋・加法的なヘルパー**
   （例: シーン全体の一様スケール `scale_scene`、§5.4）の追加は可（既存挙動を変えず、単体テスト付き）。
+- 注釈矢印は `BubbleShape::Arrow` に `#[serde(default)]` の
+  `head_len_px: Option<f32>` / `shaft_half_px: Option<f32>` を加えて表現する。
+  `None` は従来比率と完全に同じ形状とし、旧 JSON との互換性を維持する。
+- 蛍光マーカー / 下線は `BubbleObject::blend: FillBlend` (`#[serde(default)]`、既定
+  `Normal`) でオブジェクト全体の描画モードを保持する。`Multiply` は fill・outline・text を
+  分離せず、z 順の連続セグメントとして `bake_annotation_layers` で焼き、表示・本フルベイク・
+  エクスポートの全経路を `composite_annotation_layers` で同じ順序に合成する。
 - **decode 非依存**: スタンプ画像（絵文字 SVG / ユーザー画像）は呼び出し側がデコードして
   `StampImages`（`HashMap<id, RgbaOverlay>`）で渡す契約。mIV にこのデコード層を用意する
   （ラボ `tools/comic_lab/src/stamp.rs` 相当）。

@@ -32,15 +32,18 @@ use crate::keymap::KeyAction;
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
-    DecorationLayer, FillMode, FontSet, FrameStyle, IndicatorKind, InlineDir, MarkupRule,
-    MessageWindowObject, NamePlateMode, Orientation, PortraitSide, Rgba, ShadowStyle, SizeMode,
-    StampObject, StrokeStyle, Tail, TailKind, TextAlign, TextBackgroundStyle, TextBlock,
+    DecorationLayer, FillBlend, FillMode, FontSet, FrameStyle, IndicatorKind, InlineDir,
+    MarkupRule, MessageWindowObject, NamePlateMode, Orientation, PortraitSide, Rgba, ShadowStyle,
+    SizeMode, StampObject, StrokeStyle, Tail, TailKind, TextAlign, TextBackgroundStyle, TextBlock,
     TextEchoStyle, TextGlowStyle, TextShadowStyle, VAnchor, WindowPosition,
 };
 use std::collections::HashMap;
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
 const PANEL_W: f32 = 268.0;
+/// ラベル・色ボタンと横並びにする Slider の幅。Area の auto-size が PANEL_W を
+/// 超えて詳細パネル幅を変えないよう、横並び行だけ既定値より狭くする。
+const DETAIL_ROW_SLIDER_W: f32 = 70.0;
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
 /// ハンドル (回転ノブ / 四隅 / しっぽ) の当たり判定半径 (画面 px)。ラボと同値。
@@ -48,6 +51,296 @@ const HANDLE_R: f32 = 7.0;
 /// エディタ専用 Undo/Redo (Inc 6) の最大スタック深さ。ラボ (`UNDO_CAP`) と同値。
 /// 超過時は最古エントリから捨てる。
 const COMIC_UNDO_CAP: usize = 100;
+
+const ANNOTATION_DEFAULT_COLOR: Rgba = Rgba::new(242, 60, 60, 255);
+pub(crate) const ANNOTATION_MARKER_DEFAULT_COLOR: Rgba = Rgba::new(255, 235, 59, 255);
+const ANNOTATION_PALETTE: [(&str, Rgba); 6] = [
+    ("赤", ANNOTATION_DEFAULT_COLOR),
+    ("橙", Rgba::new(255, 149, 0, 255)),
+    ("黄", Rgba::new(255, 235, 59, 255)),
+    ("緑", Rgba::new(52, 199, 89, 255)),
+    ("青", Rgba::new(0, 122, 255, 255)),
+    ("ピンク", Rgba::new(255, 45, 85, 255)),
+];
+
+/// 「注釈追加」ダイアログのプリセット。後続 Stage の項目は `ALL` と builder へ追加する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnnotationPreset {
+    Rect,
+    RoundRect,
+    Ellipse,
+    Arrow,
+    Marker,
+    Underline,
+    StepBadge,
+    CursorArrowWhite,
+    CursorArrowBlack,
+    CursorHand,
+    CursorIBeam,
+    ClickRing,
+}
+
+impl Default for AnnotationPreset {
+    fn default() -> Self {
+        Self::Rect
+    }
+}
+
+impl AnnotationPreset {
+    const ALL: [Self; 7] = [
+        Self::Rect,
+        Self::RoundRect,
+        Self::Ellipse,
+        Self::Arrow,
+        Self::Marker,
+        Self::Underline,
+        Self::StepBadge,
+    ];
+
+    const CURSORS: [Self; 5] = [
+        Self::CursorArrowWhite,
+        Self::CursorArrowBlack,
+        Self::CursorHand,
+        Self::CursorIBeam,
+        Self::ClickRing,
+    ];
+
+    fn is_marker(self) -> bool {
+        matches!(self, Self::Marker | Self::Underline)
+    }
+
+    fn cursor_key(self) -> Option<&'static str> {
+        match self {
+            Self::CursorArrowWhite => Some("miv:cursor-arrow-white"),
+            Self::CursorArrowBlack => Some("miv:cursor-arrow-black"),
+            Self::CursorHand => Some("miv:cursor-hand"),
+            Self::CursorIBeam => Some("miv:cursor-ibeam"),
+            Self::ClickRing => Some("miv:click-ring"),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rect => "枠 (長方形)",
+            Self::RoundRect => "枠 (角丸)",
+            Self::Ellipse => "枠 (楕円)",
+            Self::Arrow => "矢印",
+            Self::Marker => "蛍光マーカー",
+            Self::Underline => "蛍光下線",
+            Self::StepBadge => "番号バッジ",
+            Self::CursorArrowWhite => "白矢印カーソル",
+            Self::CursorArrowBlack => "黒矢印カーソル",
+            Self::CursorHand => "指差しカーソル",
+            Self::CursorIBeam => "I ビーム",
+            Self::ClickRing => "クリックリング",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Rect => "miv:annot-rect",
+            Self::RoundRect => "miv:annot-rect-round",
+            Self::Ellipse => "miv:annot-ellipse",
+            Self::Arrow => "miv:annot-arrow",
+            Self::Marker => "miv:annot-marker",
+            Self::Underline => "miv:annot-underline",
+            Self::StepBadge => "miv:step-badge",
+            Self::CursorArrowWhite
+            | Self::CursorArrowBlack
+            | Self::CursorHand
+            | Self::CursorIBeam
+            | Self::ClickRing => self.cursor_key().expect("cursor preset has a key"),
+        }
+    }
+}
+
+/// 注釈枠の線太さプリセット。実 px は画像長辺から追加時に計算する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnnotationStrokePreset {
+    Thin,
+    Standard,
+    Thick,
+}
+
+impl Default for AnnotationStrokePreset {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+impl AnnotationStrokePreset {
+    const ALL: [Self; 3] = [Self::Thin, Self::Standard, Self::Thick];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Thin => "細",
+            Self::Standard => "標準",
+            Self::Thick => "太",
+        }
+    }
+
+    fn width_px(self, image_long: f32) -> f32 {
+        let standard = (image_long * 0.0025).clamp(3.0, 12.0);
+        standard
+            * match self {
+                Self::Thin => 0.6,
+                Self::Standard => 1.0,
+                Self::Thick => 1.8,
+            }
+    }
+}
+
+fn build_annotation_bubble(
+    preset: AnnotationPreset,
+    color: Rgba,
+    stroke_width: f32,
+    image_size: (f32, f32),
+    badge_number: u64,
+    font_key: &str,
+) -> BubbleObject {
+    let (sw, sh) = image_size;
+    if preset == AnnotationPreset::StepBadge {
+        let radius = sw.max(sh) * 0.02;
+        return BubbleObject {
+            shape: BubbleShape::Ellipse {
+                rx: radius,
+                ry: radius,
+            },
+            fill: Some(color),
+            fill_opacity: 1.0,
+            blend: FillBlend::Normal,
+            outline: StrokeStyle {
+                color: Rgba::WHITE,
+                width_px: stroke_width,
+            },
+            tail: None,
+            padding_px: 0.0,
+            decorations: Vec::new(),
+            text: TextBlock {
+                text: badge_number.to_string(),
+                font_key: font_key.to_string(),
+                size_px: radius * 1.2,
+                color: Rgba::WHITE,
+                align: TextAlign::Center,
+                v_center_ink: true,
+                bold: true,
+                ..TextBlock::default()
+            },
+            auto_size: false,
+            merge_with_below: false,
+            shape_preset_link: Some(preset.tag().to_string()),
+        };
+    }
+
+    let frame_half_w = sw * 0.12;
+    let frame_half_h = sh * 0.07;
+    let frame_outline = StrokeStyle {
+        color,
+        width_px: stroke_width,
+    };
+    let (shape, fill, outline) = match preset {
+        AnnotationPreset::Rect => (
+            BubbleShape::RoundRect {
+                half_w: frame_half_w,
+                half_h: frame_half_h,
+                corner_px: 0.0,
+            },
+            None,
+            frame_outline,
+        ),
+        AnnotationPreset::RoundRect => (
+            BubbleShape::RoundRect {
+                half_w: frame_half_w,
+                half_h: frame_half_h,
+                corner_px: stroke_width * 2.0,
+            },
+            None,
+            frame_outline,
+        ),
+        AnnotationPreset::Ellipse => (
+            BubbleShape::Ellipse {
+                rx: frame_half_w,
+                ry: frame_half_h,
+            },
+            None,
+            frame_outline,
+        ),
+        AnnotationPreset::Arrow => (
+            BubbleShape::Arrow {
+                half_w: sw.max(sh) * 0.09,
+                half_h: stroke_width * 3.0,
+                dir_rad: 0.0,
+                head_len_px: Some(stroke_width * 6.0),
+                shaft_half_px: Some(stroke_width / 2.0),
+            },
+            Some(color),
+            StrokeStyle {
+                color,
+                width_px: 0.0,
+            },
+        ),
+        AnnotationPreset::Marker | AnnotationPreset::Underline => (
+            BubbleShape::RoundRect {
+                half_w: sw * 0.12,
+                half_h: if preset == AnnotationPreset::Marker {
+                    sh * 0.02
+                } else {
+                    stroke_width * 0.75
+                },
+                corner_px: stroke_width,
+            },
+            Some(color),
+            StrokeStyle {
+                color,
+                width_px: 0.0,
+            },
+        ),
+        AnnotationPreset::StepBadge => unreachable!(),
+        AnnotationPreset::CursorArrowWhite
+        | AnnotationPreset::CursorArrowBlack
+        | AnnotationPreset::CursorHand
+        | AnnotationPreset::CursorIBeam
+        | AnnotationPreset::ClickRing => unreachable!("cursor presets build StampObject"),
+    };
+    BubbleObject {
+        shape,
+        fill,
+        fill_opacity: if preset.is_marker() { 0.55 } else { 1.0 },
+        blend: if preset.is_marker() {
+            FillBlend::Multiply
+        } else {
+            FillBlend::Normal
+        },
+        outline,
+        tail: None,
+        padding_px: 0.0,
+        decorations: Vec::new(),
+        text: TextBlock {
+            font_key: font_key.to_string(),
+            align: TextAlign::Center,
+            ..TextBlock::default()
+        },
+        auto_size: false,
+        merge_with_below: false,
+        shape_preset_link: Some(preset.tag().to_string()),
+    }
+}
+
+fn build_annotation_cursor_stamp(
+    preset: AnnotationPreset,
+    image_size: (f32, f32),
+) -> Option<StampObject> {
+    let key = preset.cursor_key()?;
+    let half = image_size.0.max(image_size.1) * 0.04;
+    Some(StampObject {
+        source: comic_core::StampSource::Emoji(key.to_string()),
+        half_w: half,
+        half_h: half,
+        opacity: 1.0,
+        ..StampObject::default()
+    })
+}
 
 /// 右詳細パネルのカテゴリタブ。補正レイヤーの section-accent と同じく、各カテゴリに
 /// アクセント色を割り当て、タブボタン + コンテンツ左端の色帯で「カラーの縦線での分類」を
@@ -633,10 +926,27 @@ fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
             *rx = hw;
             *ry = hh;
         }
+        BubbleShape::Arrow {
+            half_w,
+            half_h,
+            head_len_px,
+            shaft_half_px,
+            ..
+        } => {
+            let length_scale = if *half_w > 0.0 { hw / *half_w } else { 1.0 };
+            let cross_scale = if *half_h > 0.0 { hh / *half_h } else { 1.0 };
+            if let Some(value) = head_len_px {
+                *value *= length_scale;
+            }
+            if let Some(value) = shaft_half_px {
+                *value *= cross_scale;
+            }
+            *half_w = hw;
+            *half_h = hh;
+        }
         BubbleShape::RoundRect { half_w, half_h, .. }
         | BubbleShape::SpeedLines { half_w, half_h, .. }
         | BubbleShape::Diamond { half_w, half_h }
-        | BubbleShape::Arrow { half_w, half_h, .. }
         | BubbleShape::Soft { half_w, half_h, .. }
         | BubbleShape::TextOnly { half_w, half_h }
         | BubbleShape::Strokes { half_w, half_h, .. }
@@ -747,7 +1057,7 @@ fn apply_text_drag(
                     AnnotationKind::Bubble(b) => {
                         set_bubble_half_extents(b, lx.abs().max(10.0), ly.abs().max(10.0));
                         b.auto_size = false;
-                        b.shape_preset_link = None;
+                        clear_shape_style_link(b);
                         changed = true;
                     }
                     AnnotationKind::MessageWindow(w) => {
@@ -840,6 +1150,22 @@ fn apply_text_drag(
 /// 新規オブジェクトに割り当てる id (既存最大 + 1)。
 fn next_id(objs: &[AnnotationObject]) -> u64 {
     objs.iter().map(|o| o.id).max().unwrap_or(0) + 1
+}
+
+/// 同一画像内にある番号バッジ本文の最大整数 + 1。手編集された非整数本文は無視する。
+fn next_step_badge_number(objs: &[AnnotationObject]) -> u64 {
+    objs.iter()
+        .filter_map(|o| match &o.kind {
+            AnnotationKind::Bubble(b)
+                if b.shape_preset_link.as_deref() == Some("miv:step-badge") =>
+            {
+                b.text.text.trim().parse::<u64>().ok()
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 /// z を vec 順に正規化する (z == index)。bake は z 昇順で描くので vec 順 = 描画順。
@@ -944,6 +1270,128 @@ fn from_c32(c: egui::Color32) -> Rgba {
     Rgba::new(r, g, b, a)
 }
 
+/// App を借りない注釈ダイアログ本体。戻り値は (追加, キャンセル)。
+fn annotation_dialog_contents_ui(
+    ui: &mut egui::Ui,
+    preset: &mut AnnotationPreset,
+    shape_color: &mut Rgba,
+    marker_color: &mut Rgba,
+    stroke: &mut AnnotationStrokePreset,
+    cursor_thumbs: &HashMap<String, egui::TextureHandle>,
+    image_long: f32,
+) -> (bool, bool) {
+    ui.label(
+        egui::RichText::new("種類と色、線太さを選んで追加します。")
+            .size(12.0)
+            .color(egui::Color32::from_gray(190)),
+    );
+    ui.add_space(6.0);
+    ui.strong("プリセット");
+    ui.horizontal_wrapped(|ui| {
+        for candidate in AnnotationPreset::ALL {
+            let selected = *preset == candidate;
+            let mut button = egui::Button::new(candidate.label()).min_size(egui::vec2(116.0, 30.0));
+            if selected {
+                button = button
+                    .fill(egui::Color32::from_rgb(58, 96, 150))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::WHITE));
+            }
+            if ui.add(button).clicked() {
+                *preset = candidate;
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.strong("カーソル");
+    ui.horizontal_wrapped(|ui| {
+        for candidate in AnnotationPreset::CURSORS {
+            let key = candidate.cursor_key().expect("cursor preset has a key");
+            let cache_key = format!("e:{key}");
+            let selected = *preset == candidate;
+            let mut button = if let Some(texture) = cursor_thumbs.get(&cache_key) {
+                egui::Button::image(egui::load::SizedTexture::new(
+                    texture.id(),
+                    egui::vec2(42.0, 42.0),
+                ))
+                .min_size(egui::vec2(50.0, 50.0))
+                .corner_radius(4.0)
+            } else {
+                egui::Button::new(candidate.label()).min_size(egui::vec2(92.0, 50.0))
+            };
+            if selected {
+                button = button
+                    .fill(egui::Color32::from_rgb(58, 96, 150))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::WHITE));
+            }
+            if ui.add(button).on_hover_text(candidate.label()).clicked() {
+                *preset = candidate;
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.strong("色");
+    let color = if preset.is_marker() {
+        marker_color
+    } else {
+        shape_color
+    };
+    ui.horizontal_wrapped(|ui| {
+        for (label, candidate) in ANNOTATION_PALETTE {
+            let c32 = to_c32(candidate);
+            let text_color = if u16::from(c32.r()) + u16::from(c32.g()) + u16::from(c32.b()) < 330 {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::BLACK
+            };
+            let mut button = egui::Button::new(egui::RichText::new(label).color(text_color))
+                .fill(c32)
+                .min_size(egui::vec2(48.0, 26.0));
+            if *color == candidate {
+                button = button.stroke(egui::Stroke::new(2.0, egui::Color32::WHITE));
+            }
+            if ui.add(button).clicked() {
+                *color = candidate;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("カスタム:");
+        let mut custom = to_c32(*color);
+        if ui.color_edit_button_srgba(&mut custom).changed() {
+            *color = from_c32(custom);
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.strong("線太さ");
+        for candidate in AnnotationStrokePreset::ALL {
+            if ui
+                .selectable_label(*stroke == candidate, candidate.label())
+                .clicked()
+            {
+                *stroke = candidate;
+            }
+        }
+        ui.label(format!("({:.1} px)", stroke.width_px(image_long)));
+    });
+    ui.add_space(10.0);
+    ui.separator();
+    let mut add_clicked = false;
+    let mut cancel_clicked = false;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        add_clicked = ui
+            .add_sized([88.0, 28.0], egui::Button::new("追加"))
+            .clicked();
+        cancel_clicked = ui
+            .add_sized([88.0, 28.0], egui::Button::new("キャンセル"))
+            .clicked();
+    });
+    (add_clicked, cancel_clicked)
+}
+
 impl App {
     // ── モード入退場 ────────────────────────────────────────────────
 
@@ -976,6 +1424,7 @@ impl App {
         self.text_drag = None;
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
+        self.text_add_annotation_dialog = false;
         self.text_add_window_dialog = false;
         self.text_add_onomatopoeia_dialog = false;
         self.text_font_dialog = false;
@@ -1018,6 +1467,7 @@ impl App {
         self.text_drag = None;
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
+        self.text_add_annotation_dialog = false;
         self.text_add_window_dialog = false;
         self.text_add_onomatopoeia_dialog = false;
         self.text_font_dialog = false;
@@ -1540,6 +1990,7 @@ impl App {
         let prev_visuals = ctx.style().visuals.clone();
         ctx.set_visuals(egui::Visuals::dark());
         self.draw_text_add_bubble_dialog(ctx);
+        self.draw_text_add_annotation_dialog(ctx);
         self.draw_text_add_window_dialog(ctx);
         self.draw_text_add_stamp_dialog(ctx);
         self.draw_text_add_onomatopoeia_dialog(ctx);
@@ -1667,6 +2118,7 @@ impl App {
         let mut changed = false;
         let mut close = false;
         let mut open_bubble_dialog = false;
+        let mut open_annotation_dialog = false;
         let mut open_window_dialog = false;
         let mut open_stamp_dialog = false;
         let mut open_stamp_replace = false;
@@ -1804,6 +2256,13 @@ impl App {
                             .clicked()
                         {
                             open_onomatopoeia_dialog = true;
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .add_sized([add_w, 26.0], egui::Button::new("注釈追加"))
+                            .clicked()
+                        {
+                            open_annotation_dialog = true;
                         }
                         ui.add_space(2.0);
                         if ui
@@ -1952,6 +2411,9 @@ impl App {
         // 追加ボタンはダイアログを開く (実際の追加はダイアログ側)。
         if open_bubble_dialog {
             self.text_add_bubble_dialog = true;
+        }
+        if open_annotation_dialog {
+            self.text_add_annotation_dialog = true;
         }
         if open_window_dialog {
             self.text_add_window_dialog = true;
@@ -2139,6 +2601,121 @@ impl App {
             self.mark_comic_dirty();
             self.text_add_bubble_dialog = false;
         }
+    }
+
+    /// 枠・番号バッジなど、スクリーンショット向け注釈プリセットの追加ダイアログ。
+    fn draw_text_add_annotation_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_add_annotation_dialog {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            self.text_add_annotation_dialog = false;
+            return;
+        };
+        let Some(key) = self.page_path_key(fs_idx) else {
+            self.text_add_annotation_dialog = false;
+            return;
+        };
+        let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+
+        for cursor in AnnotationPreset::CURSORS {
+            let source = comic_core::StampSource::Emoji(
+                cursor
+                    .cursor_key()
+                    .expect("cursor preset has a key")
+                    .to_string(),
+            );
+            self.ensure_stamp_thumb(ctx, &source);
+        }
+        let cursor_thumbs = self.stamp_thumb_cache.clone();
+
+        // IME 変換中の Enter/Escape を奪わない。Window closure より前で必ず捕捉する。
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let mut preset = self.text_annotation_preset;
+        let mut shape_color = self.text_annotation_shape_color;
+        let mut marker_color = self.text_annotation_marker_color;
+        let mut stroke = self.text_annotation_stroke;
+        let mut open = true;
+        let mut add_requested = false;
+        let mut cancel_requested = false;
+        let avail = ctx.content_rect();
+        let default_size = egui::vec2((avail.width() - 32.0).clamp(420.0, 600.0), 430.0);
+        let frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("注釈を追加")
+            .id(egui::Id::new("text_add_annotation_dialog"))
+            .order(egui::Order::Foreground)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(default_size)
+            .default_pos(avail.center() - default_size * 0.5)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                let (add_clicked, cancel_clicked) = annotation_dialog_contents_ui(
+                    ui,
+                    &mut preset,
+                    &mut shape_color,
+                    &mut marker_color,
+                    &mut stroke,
+                    &cursor_thumbs,
+                    sw.max(sh),
+                );
+                add_requested |= add_clicked || enter_pressed;
+                cancel_requested |= cancel_clicked || escape_pressed;
+            });
+
+        self.text_annotation_preset = preset;
+        self.text_annotation_shape_color = shape_color;
+        self.text_annotation_marker_color = marker_color;
+        self.text_annotation_stroke = stroke;
+        if cancel_requested {
+            open = false;
+        }
+        self.text_add_annotation_dialog = open;
+        if !add_requested || cancel_requested {
+            return;
+        }
+
+        let mut objects = self.comic_docs.remove(&key).unwrap_or_default();
+        let id = next_id(&objects);
+        let z = objects.len() as i32;
+        let pivot = (sw * 0.3, sh * 0.3);
+        let badge_number = next_step_badge_number(&objects);
+        let mut object = if let Some(stamp) = build_annotation_cursor_stamp(preset, (sw, sh)) {
+            AnnotationObject::new_stamp(id, pivot, stamp)
+        } else {
+            let color = if preset.is_marker() {
+                marker_color
+            } else {
+                shape_color
+            };
+            let bubble = build_annotation_bubble(
+                preset,
+                color,
+                stroke.width_px(sw.max(sh)),
+                (sw, sh),
+                badge_number,
+                crate::comic_overlay::COMIC_FONT_KEY,
+            );
+            AnnotationObject::new_bubble(id, pivot, bubble)
+        };
+        object.z = z;
+        objects.push(object);
+        self.comic_docs.insert(key, objects);
+        self.text_selected = Some(id);
+        // 「テキスト追加」と同じくメモリ更新 + debounce 保存へ載せる。フレーム末の
+        // commit_comic_undo_on_settle がこの追加を 1 undo エントリとして確定する。
+        self.text_dirty_at = Some(std::time::Instant::now());
+        self.mark_comic_dirty();
+        self.text_add_annotation_dialog = false;
     }
 
     /// 「ウィンドウを追加」スタイルピッカー。定義済みスタイルのボタンからクリックで追加する。
@@ -2903,7 +3480,9 @@ impl App {
                 let preset = ShapeStylePreset::from_bubble(id.clone(), name, b);
                 self.comic_shape_presets.push(preset);
                 if let AnnotationKind::Bubble(bb) = &mut objects[idx].kind {
-                    bb.shape_preset_link = Some(id);
+                    if !is_annotation_shape_tag(bb.shape_preset_link.as_deref()) {
+                        bb.shape_preset_link = Some(id);
+                    }
                 }
             }
             PresetTarget::Window => {
@@ -3150,8 +3729,8 @@ impl App {
         // 件数が bounded + resvg 512px と軽量 + デコード結果はキャッシュで 1 度きり、
         // (3) ユーザー画像は FILE_STAMP_MAX_PX で抑制済み、なので許容する。将来、開封時の
         // 引っかかりが問題になれば worker 化する (docs/ui-responsiveness.md §2 のテンプレ)。
-        if assets {
-            for (k, _) in &visible {
+        for (k, _) in &visible {
+            if crate::comic_stamp::emoji_svg_bytes(k).is_some() {
                 self.ensure_stamp_thumb(ctx, &comic_core::StampSource::Emoji((*k).to_string()));
             }
         }
@@ -3290,7 +3869,7 @@ impl App {
                     ui.add_space(2.0);
                 }
 
-                if !assets {
+                if !assets && cat_local != crate::comic_stamp::EmojiCategory::Annotation {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 180, 90),
                         "絵文字アセット未配置: scripts/setup-twemoji.sh で取得 (画像ファイルからは追加できます)",
@@ -4023,6 +4602,8 @@ impl BubblePreset {
                 half_w: 150.0,
                 half_h: 110.0,
                 dir_rad: -std::f32::consts::FRAC_PI_2,
+                head_len_px: None,
+                shaft_half_px: None,
             },
             BubblePreset::MotionLines => BubbleShape::MotionLines {
                 rx: 240.0,
@@ -4116,6 +4697,7 @@ impl BubblePreset {
             shape: self.shape(),
             fill: Some(Rgba::WHITE),
             fill_opacity: 1.0,
+            blend: FillBlend::Normal,
             outline: StrokeStyle {
                 color: Rgba::BLACK,
                 width_px: self.outline_width(),
@@ -5028,13 +5610,46 @@ fn short_excerpt(s: &str) -> String {
 
 /// オブジェクト一覧カードのラベル「種類: 本文抜粋」(ラボ `draw_object_list` 相当)。
 fn object_list_label(o: &AnnotationObject) -> String {
+    let annotation_kind = match &o.kind {
+        AnnotationKind::Bubble(b) => match b.shape_preset_link.as_deref() {
+            Some("miv:annot-rect" | "miv:annot-rect-round" | "miv:annot-ellipse") => Some("枠"),
+            Some("miv:annot-arrow") => Some("矢印"),
+            Some("miv:annot-marker" | "miv:annot-underline") => Some("マーカー"),
+            Some("miv:step-badge") => Some("バッジ"),
+            _ => None,
+        },
+        _ => None,
+    };
     let detail = match &o.kind {
         AnnotationKind::Bubble(b) => short_excerpt(&b.text.text),
         AnnotationKind::Text(t) => short_excerpt(&t.text),
         AnnotationKind::MessageWindow(w) => short_excerpt(&w.text.text),
         AnnotationKind::Stamp(s) => crate::comic_stamp::stamp_label(&s.source).to_string(),
     };
-    format!("{}: {}", kind_label(o), detail)
+    let kind = annotation_kind.unwrap_or_else(|| kind_label(o));
+    if annotation_kind.is_some() && detail.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}: {detail}")
+    }
+}
+
+fn is_annotation_shape_tag(link: Option<&str>) -> bool {
+    matches!(link, Some("miv:step-badge"))
+        || link.is_some_and(|value| value.starts_with("miv:annot-"))
+}
+
+fn is_annotation_arrow_bubble(bubble: &BubbleObject) -> bool {
+    bubble.shape_preset_link.as_deref() == Some("miv:annot-arrow")
+        && matches!(bubble.shape, BubbleShape::Arrow { .. })
+}
+
+/// 注釈の種別識別タグは一覧ラベルと自動採番に使うため、個別編集後も保持する。
+/// 通常の本体プリセットリンクだけを従来どおり解除する。
+fn clear_shape_style_link(bubble: &mut BubbleObject) {
+    if !is_annotation_shape_tag(bubble.shape_preset_link.as_deref()) {
+        bubble.shape_preset_link = None;
+    }
 }
 
 fn object_list_rows_ui(
@@ -5261,14 +5876,26 @@ fn edit_object_ui(
     ui.strong(kind_label(o));
     ui.separator();
 
+    let is_multiply_bubble = matches!(
+        &o.kind,
+        AnnotationKind::Bubble(bubble) if bubble.blend == FillBlend::Multiply
+    );
+    let is_annotation_arrow = matches!(
+        &o.kind,
+        AnnotationKind::Bubble(bubble) if is_annotation_arrow_bubble(bubble)
+    );
+    let uses_dedicated_bubble_body = is_multiply_bubble || is_annotation_arrow;
+
     // 回転 (全種共通、タブの外)。mIV 独自 (ラボにはスライダーは無いがそのまま残す)。
-    let mut deg = o.rotation_rad.to_degrees();
-    if ui
-        .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("回転°"))
-        .changed()
-    {
-        o.rotation_rad = deg.to_radians();
-        *changed = true;
+    if !is_multiply_bubble {
+        let mut deg = o.rotation_rad.to_degrees();
+        if ui
+            .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("回転°"))
+            .changed()
+        {
+            o.rotation_rad = deg.to_radians();
+            *changed = true;
+        }
     }
     let pivot = o.pivot;
     let obj_id = o.id;
@@ -5283,7 +5910,9 @@ fn edit_object_ui(
     let is_window = matches!(o.kind, AnnotationKind::MessageWindow(_));
 
     // 選択種別に合わせて現在タブを正規化 (持ち越しを補正)。
-    if !is_bubble && !is_window {
+    if uses_dedicated_bubble_body {
+        *tab = TextPropTab::Body;
+    } else if !is_bubble && !is_window {
         *tab = TextPropTab::Serifu;
     } else if is_window && matches!(*tab, TextPropTab::Tail | TextPropTab::Deco) {
         *tab = TextPropTab::Body;
@@ -5306,7 +5935,9 @@ fn edit_object_ui(
 
     // 本文テキスト欄 + (記法 ON 時) 記号挿入。窓が枠から溢れていれば赤枠 + 警告。
     // 本文内容の編集はプリセットリンクを解除しない (mIV 規約)。
-    if is_window && window_overflow {
+    if uses_dedicated_bubble_body {
+        // Marker and annotation-arrow objects intentionally expose no text editor.
+    } else if is_window && window_overflow {
         ui.colored_label(
             egui::Color32::from_rgb(235, 100, 100),
             "(!) テキストが枠に収まっていません",
@@ -5324,41 +5955,51 @@ fn edit_object_ui(
     }
 
     // (吹) 自動サイズ — 記号挿入のすぐ下 (頻繁に切り替えるので本体タブに埋めない)。
-    if let AnnotationKind::Bubble(b) = &mut o.kind {
+    if !uses_dedicated_bubble_body && let AnnotationKind::Bubble(b) = &mut o.kind {
         bubble_autosize_toggle_ui(ui, b, changed);
     }
 
     // プリセットバー (色帯): セリフ (常時) + 本体 (吹) / ウィンドウ (窓)。
-    ui.add_space(4.0);
-    // 窓に対しテキストプリセットを当てると本文スタイルが変わり、ウィンドウプリセットが捉える
-    // 本文スタイルから乖離する → ウィンドウリンクを解除する (本文内容では解除しない規約と一貫。
-    // Codex P2)。適用検出のため当てる前の本文スタイルを控える。
-    let win_text_snap = match &o.kind {
-        AnnotationKind::MessageWindow(w) => Some(w.text.clone()),
-        _ => None,
-    };
-    draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
-        if let Some(tb) = o.text_block_mut() {
-            text_preset_bar(ui, tb, presets, changed);
-        }
-    });
-    if let (Some(snap), AnnotationKind::MessageWindow(w)) = (&win_text_snap, &mut o.kind) {
-        if w.style_preset_link.is_some() && text_style_diverged(snap, &w.text) {
-            w.style_preset_link = None;
-        }
-    }
-    if let AnnotationKind::Bubble(b) = &mut o.kind {
-        draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
-            shape_preset_bar(ui, b, pivot, presets, changed);
+    if !uses_dedicated_bubble_body {
+        ui.add_space(4.0);
+        // 窓に対しテキストプリセットを当てると本文スタイルが変わり、ウィンドウプリセットが捉える
+        // 本文スタイルから乖離する → ウィンドウリンクを解除する (本文内容では解除しない規約と一貫。
+        // Codex P2)。適用検出のため当てる前の本文スタイルを控える。
+        let win_text_snap = match &o.kind {
+            AnnotationKind::MessageWindow(w) => Some(w.text.clone()),
+            _ => None,
+        };
+        draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
+            if let Some(tb) = o.text_block_mut() {
+                text_preset_bar(ui, tb, presets, changed);
+            }
         });
-    } else if let AnnotationKind::MessageWindow(w) = &mut o.kind {
-        draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
-            window_preset_bar(ui, w, presets, changed);
-        });
+        if let (Some(snap), AnnotationKind::MessageWindow(w)) = (&win_text_snap, &mut o.kind) {
+            if w.style_preset_link.is_some() && text_style_diverged(snap, &w.text) {
+                w.style_preset_link = None;
+            }
+        }
+        if let AnnotationKind::Bubble(b) = &mut o.kind {
+            draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
+                shape_preset_bar(ui, b, pivot, presets, changed);
+            });
+        } else if let AnnotationKind::MessageWindow(w) = &mut o.kind {
+            draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
+                window_preset_bar(ui, w, presets, changed);
+            });
+        }
     }
 
     // (吹) 構造トグル: 結合 / しっぽ表示。戻り値 = しっぽタブを有効化するか。
     let tail_enabled = match &mut o.kind {
+        AnnotationKind::Bubble(b) if b.blend == FillBlend::Multiply => {
+            if b.merge_with_below {
+                b.merge_with_below = false;
+                *changed = true;
+            }
+            false
+        }
+        AnnotationKind::Bubble(b) if is_annotation_arrow_bubble(b) => false,
         AnnotationKind::Bubble(b) => {
             bubble_struct_toggles_ui(ui, b, changed, obj_id, pivot, tail_stash)
         }
@@ -5385,6 +6026,18 @@ fn edit_object_ui(
             });
         }
         AnnotationKind::Bubble(b) => {
+            if b.blend == FillBlend::Multiply {
+                draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
+                    marker_bubble_body_ui(ui, b, changed);
+                });
+                return;
+            }
+            if is_annotation_arrow_bubble(b) {
+                draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
+                    annotation_arrow_body_ui(ui, b, changed);
+                });
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                 for t in [
@@ -5417,7 +6070,7 @@ fn edit_object_ui(
                     bubble_tail_ui(ui, b, changed);
                     // しっぽ種別はプリセット (tail_kind) に含まれる → 個別編集で link 解除。
                     if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
-                        b.shape_preset_link = None;
+                        clear_shape_style_link(b);
                     }
                 }
                 TextPropTab::Deco => {
@@ -5429,7 +6082,7 @@ fn edit_object_ui(
                     let snap = b.clone();
                     bubble_body_ui(ui, b, changed);
                     if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
-                        b.shape_preset_link = None;
+                        clear_shape_style_link(b);
                     }
                 }
             });
@@ -5603,7 +6256,7 @@ fn bubble_struct_toggles_ui(
             tail_stash.insert(obj_id, t);
         }
         // しっぽ種別は形状プリセットに含まれる → 付与/除去で link 解除 (glow off)。
-        b.shape_preset_link = None;
+        clear_shape_style_link(b);
         *changed = true;
     }
     if !tail_supported {
@@ -5871,7 +6524,15 @@ fn shape_preset_bar(
     );
     if let Some(id) = applied {
         if let Some(p) = presets.shape.iter().find(|p| p.id == id) {
+            let annotation_tag = b
+                .shape_preset_link
+                .as_deref()
+                .filter(|link| is_annotation_shape_tag(Some(link)))
+                .map(str::to_owned);
             p.apply_to(b, default_bubble_tail(pivot));
+            if annotation_tag.is_some() {
+                b.shape_preset_link = annotation_tag;
+            }
             *changed = true;
         }
     }
@@ -6014,6 +6675,7 @@ fn text_block_ui(
     }
     if let Some(o) = &mut t.outline {
         ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
             ui.label("縁色");
             let mut col = to_c32(o.color);
             if ui.color_edit_button_srgba(&mut col).changed() {
@@ -6093,6 +6755,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         let mut remove = None;
         for (i, outline) in t.extra_outlines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
+                ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
                 ui.label(format!("外フチ{}", i + 1));
                 let mut col = to_c32(outline.color);
                 if ui.color_edit_button_srgba(&mut col).changed() {
@@ -6264,6 +6927,108 @@ fn shape_seed_row(ui: &mut egui::Ui, shape_seed: &mut u32, changed: &mut bool) {
     });
 }
 
+/// Multiply marker editor: one object stays entirely in the multiply path, so
+/// only the marker's geometry, color, and strength are user-editable.
+fn marker_bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+    if let BubbleShape::RoundRect {
+        half_w,
+        half_h,
+        corner_px,
+    } = &mut b.shape
+    {
+        *changed |= ui
+            .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+            .changed();
+        *changed |= ui
+            .add(egui::Slider::new(half_h, 1.0..=800.0).text("半高"))
+            .changed();
+        *changed |= ui
+            .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+            .changed();
+    }
+    if let Some(fill) = &mut b.fill {
+        ui.horizontal(|ui| {
+            ui.label("塗り色");
+            let mut color = to_c32(*fill);
+            if ui.color_edit_button_srgba(&mut color).changed() {
+                *fill = from_c32(color);
+                *changed = true;
+            }
+        });
+    }
+    if ui
+        .add(egui::Slider::new(&mut b.fill_opacity, 0.0..=1.0).text("不透明度"))
+        .changed()
+    {
+        *changed = true;
+    }
+}
+
+/// 注釈プリセットの矢印専用エディタ。内部の half extent / half thickness は
+/// 利用者向けには全長・全幅・線太さへ換算して表示する。
+fn annotation_arrow_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+    if let BubbleShape::Arrow {
+        half_w,
+        half_h,
+        head_len_px,
+        shaft_half_px,
+        ..
+    } = &mut b.shape
+    {
+        let mut full_length = *half_w * 2.0;
+        if ui
+            .add(egui::Slider::new(&mut full_length, 20.0..=2000.0).text("全長"))
+            .changed()
+        {
+            *half_w = full_length * 0.5;
+            *changed = true;
+        }
+
+        let mut shaft_width = shaft_half_px.unwrap_or(*half_h * 0.45) * 2.0;
+        if ui
+            .add(egui::Slider::new(&mut shaft_width, 1.0..=60.0).text("線太さ"))
+            .changed()
+        {
+            *shaft_half_px = Some(shaft_width * 0.5);
+            *changed = true;
+        }
+
+        let mut head_length = head_len_px.unwrap_or(*half_w * 0.9);
+        if ui
+            .add(egui::Slider::new(&mut head_length, 1.0..=2000.0).text("先端の長さ"))
+            .changed()
+        {
+            *head_len_px = Some(head_length);
+            *changed = true;
+        }
+
+        let mut head_width = *half_h * 2.0;
+        if ui
+            .add(egui::Slider::new(&mut head_width, 2.0..=1000.0).text("先端の幅"))
+            .changed()
+        {
+            *half_h = head_width * 0.5;
+            *changed = true;
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
+        ui.label("塗り色");
+        let mut color = to_c32(b.fill.unwrap_or(b.outline.color));
+        if ui.color_edit_button_srgba(&mut color).changed() {
+            b.fill = Some(from_c32(color));
+            *changed = true;
+        }
+        if ui
+            .add(egui::Slider::new(&mut b.fill_opacity, 0.0..=1.0).text("不透明"))
+            .changed()
+        {
+            *changed = true;
+        }
+    });
+}
+
 /// 吹き出し「本体」タブ (形状・形状別パラメータ・塗り・輪郭・余白)。本文は セリフ タブ、
 /// しっぽは しっぽ タブ、自動サイズ・結合は常時表示エリアへ分離している。形状別スライダーの
 /// 個別編集は `b.shape` を変えるので、呼び出し側の `shape_style_diverged` 判定でプリセット
@@ -6282,7 +7047,7 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         });
     if next != cur {
         b.shape = next.to_shape(hw, hh);
-        b.shape_preset_link = None;
+        clear_shape_style_link(b);
         *changed = true;
     }
 
@@ -6401,6 +7166,7 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
             half_w,
             half_h,
             dir_rad,
+            ..
         } => {
             if !auto {
                 *changed |= ui
@@ -6568,6 +7334,7 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     }
     if let Some(f) = &mut b.fill {
         ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
             ui.label("塗り色");
             let mut col = to_c32(*f);
             if ui.color_edit_button_srgba(&mut col).changed() {
@@ -6584,6 +7351,7 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     }
     // 輪郭。
     ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
         ui.label("線色");
         let mut col = to_c32(b.outline.color);
         if ui.color_edit_button_srgba(&mut col).changed() {
@@ -7251,6 +8019,7 @@ fn stamp_ui(
     };
     let mut long = s.half_w.max(s.half_h) * 2.0;
     ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
         ui.label("大きさ");
         if ui
             .add(egui::Slider::new(&mut long, 16.0..=1600.0).suffix("px"))
@@ -7303,6 +8072,7 @@ fn stamp_ui(
     }
     if let Some(o) = &mut s.outline {
         ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
             ui.label("縁色");
             let mut col = to_c32(o.color);
             if ui.color_edit_button_srgba(&mut col).changed() {
@@ -7436,6 +8206,8 @@ impl ShapeKind {
                 half_w: hw,
                 half_h: hh,
                 dir_rad: -std::f32::consts::FRAC_PI_2,
+                head_len_px: None,
+                shaft_half_px: None,
             },
             ShapeKind::Soft => BubbleShape::Soft {
                 half_w: hw,
@@ -7506,6 +8278,509 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    fn badge_object(id: u64, text: &str, tagged: bool) -> AnnotationObject {
+        let mut bubble = build_annotation_bubble(
+            AnnotationPreset::StepBadge,
+            ANNOTATION_DEFAULT_COLOR,
+            4.0,
+            (1000.0, 500.0),
+            1,
+            "test",
+        );
+        bubble.text.text = text.to_string();
+        if !tagged {
+            bubble.shape_preset_link = None;
+        }
+        AnnotationObject::new_bubble(id, (100.0, 100.0), bubble)
+    }
+
+    #[test]
+    fn step_badge_number_uses_max_valid_integer_plus_one() {
+        let objects = vec![
+            badge_object(1, "2", true),
+            badge_object(2, "A", true),
+            badge_object(3, "7", true),
+            badge_object(4, "99", false),
+        ];
+        assert_eq!(next_step_badge_number(&objects), 8);
+    }
+
+    #[test]
+    fn step_badge_number_starts_at_one_when_no_valid_badges_exist() {
+        assert_eq!(next_step_badge_number(&[]), 1);
+        assert_eq!(next_step_badge_number(&[badge_object(1, "A", true)]), 1);
+    }
+
+    #[test]
+    fn annotation_stroke_width_tracks_image_long_edge() {
+        assert_eq!(AnnotationStrokePreset::Standard.width_px(800.0), 3.0);
+        assert!((AnnotationStrokePreset::Standard.width_px(1920.0) - 4.8).abs() < 1e-5);
+        assert_eq!(AnnotationStrokePreset::Standard.width_px(10_000.0), 12.0);
+        assert!((AnnotationStrokePreset::Thin.width_px(1920.0) - 4.8 * 0.6).abs() < 1e-5);
+        assert!((AnnotationStrokePreset::Thick.width_px(1920.0) - 4.8 * 1.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn arrow_resize_scales_explicit_head_and_shaft_dimensions() {
+        let mut bubble = BubbleObject {
+            shape: BubbleShape::Arrow {
+                half_w: 100.0,
+                half_h: 20.0,
+                dir_rad: 0.25,
+                head_len_px: Some(30.0),
+                shaft_half_px: Some(4.0),
+            },
+            ..BubbleObject::default()
+        };
+
+        set_bubble_half_extents(&mut bubble, 150.0, 10.0);
+
+        assert_eq!(
+            bubble.shape,
+            BubbleShape::Arrow {
+                half_w: 150.0,
+                half_h: 10.0,
+                dir_rad: 0.25,
+                head_len_px: Some(45.0),
+                shaft_half_px: Some(2.0),
+            }
+        );
+    }
+
+    #[test]
+    fn arrow_resize_preserves_none_dimensions_and_other_shape_behavior() {
+        let mut arrow = BubbleObject {
+            shape: BubbleShape::Arrow {
+                half_w: 80.0,
+                half_h: 12.0,
+                dir_rad: -0.5,
+                head_len_px: None,
+                shaft_half_px: None,
+            },
+            ..BubbleObject::default()
+        };
+        set_bubble_half_extents(&mut arrow, 40.0, 24.0);
+        assert_eq!(
+            arrow.shape,
+            BubbleShape::Arrow {
+                half_w: 40.0,
+                half_h: 24.0,
+                dir_rad: -0.5,
+                head_len_px: None,
+                shaft_half_px: None,
+            }
+        );
+
+        let mut round_rect = BubbleObject {
+            shape: BubbleShape::RoundRect {
+                half_w: 80.0,
+                half_h: 40.0,
+                corner_px: 9.0,
+            },
+            ..BubbleObject::default()
+        };
+        set_bubble_half_extents(&mut round_rect, 55.0, 33.0);
+        assert_eq!(
+            round_rect.shape,
+            BubbleShape::RoundRect {
+                half_w: 55.0,
+                half_h: 33.0,
+                corner_px: 9.0,
+            }
+        );
+    }
+
+    #[test]
+    fn arrow_resize_uses_unit_scale_for_non_positive_old_extents() {
+        let mut bubble = BubbleObject {
+            shape: BubbleShape::Arrow {
+                half_w: 0.0,
+                half_h: -1.0,
+                dir_rad: 0.0,
+                head_len_px: Some(12.0),
+                shaft_half_px: Some(3.0),
+            },
+            ..BubbleObject::default()
+        };
+
+        set_bubble_half_extents(&mut bubble, 40.0, 20.0);
+
+        assert_eq!(
+            bubble.shape,
+            BubbleShape::Arrow {
+                half_w: 40.0,
+                half_h: 20.0,
+                dir_rad: 0.0,
+                head_len_px: Some(12.0),
+                shaft_half_px: Some(3.0),
+            }
+        );
+    }
+
+    #[test]
+    fn annotation_presets_build_stage_one_models() {
+        let round = build_annotation_bubble(
+            AnnotationPreset::RoundRect,
+            ANNOTATION_DEFAULT_COLOR,
+            5.0,
+            (1000.0, 500.0),
+            1,
+            "test",
+        );
+        assert_eq!(round.fill, None);
+        assert_eq!(round.outline.color, ANNOTATION_DEFAULT_COLOR);
+        assert_eq!(round.outline.width_px, 5.0);
+        assert_eq!(
+            round.shape_preset_link.as_deref(),
+            Some("miv:annot-rect-round")
+        );
+        assert!(!round.auto_size);
+        assert!(round.text.text.is_empty());
+        assert_eq!(
+            round.shape,
+            BubbleShape::RoundRect {
+                half_w: 120.0,
+                half_h: 35.0,
+                corner_px: 10.0,
+            }
+        );
+
+        let badge = build_annotation_bubble(
+            AnnotationPreset::StepBadge,
+            ANNOTATION_DEFAULT_COLOR,
+            5.0,
+            (1000.0, 500.0),
+            12,
+            "test",
+        );
+        assert_eq!(badge.shape, BubbleShape::Ellipse { rx: 20.0, ry: 20.0 });
+        assert_eq!(badge.fill, Some(ANNOTATION_DEFAULT_COLOR));
+        assert_eq!(badge.fill_opacity, 1.0);
+        assert_eq!(badge.outline.color, Rgba::WHITE);
+        assert_eq!(badge.text.text, "12");
+        assert_eq!(badge.text.size_px, 24.0);
+        assert_eq!(badge.text.color, Rgba::WHITE);
+        assert_eq!(badge.text.align, TextAlign::Center);
+        assert!(badge.text.v_center_ink);
+        assert!(badge.text.bold);
+        assert_eq!(badge.shape_preset_link.as_deref(), Some("miv:step-badge"));
+    }
+
+    #[test]
+    fn annotation_arrow_preset_builds_expected_model() {
+        let color = Rgba::new(255, 149, 0, 255);
+        let arrow = build_annotation_bubble(
+            AnnotationPreset::Arrow,
+            color,
+            5.0,
+            (1000.0, 500.0),
+            1,
+            "test",
+        );
+        assert_eq!(
+            AnnotationPreset::ALL,
+            [
+                AnnotationPreset::Rect,
+                AnnotationPreset::RoundRect,
+                AnnotationPreset::Ellipse,
+                AnnotationPreset::Arrow,
+                AnnotationPreset::Marker,
+                AnnotationPreset::Underline,
+                AnnotationPreset::StepBadge,
+            ]
+        );
+        assert_eq!(
+            arrow.shape,
+            BubbleShape::Arrow {
+                half_w: 90.0,
+                half_h: 15.0,
+                dir_rad: 0.0,
+                head_len_px: Some(30.0),
+                shaft_half_px: Some(2.5),
+            }
+        );
+        assert_eq!(arrow.fill, Some(color));
+        assert_eq!(arrow.fill_opacity, 1.0);
+        assert_eq!(arrow.outline.width_px, 0.0);
+        assert!(arrow.text.text.is_empty());
+        assert!(!arrow.auto_size);
+        assert_eq!(arrow.shape_preset_link.as_deref(), Some("miv:annot-arrow"));
+    }
+
+    #[test]
+    fn annotation_marker_presets_build_multiply_models() {
+        let marker = build_annotation_bubble(
+            AnnotationPreset::Marker,
+            ANNOTATION_MARKER_DEFAULT_COLOR,
+            5.0,
+            (1000.0, 500.0),
+            1,
+            "test",
+        );
+        assert_eq!(
+            marker.shape,
+            BubbleShape::RoundRect {
+                half_w: 120.0,
+                half_h: 10.0,
+                corner_px: 5.0,
+            }
+        );
+        assert_eq!(marker.fill, Some(ANNOTATION_MARKER_DEFAULT_COLOR));
+        assert_eq!(marker.fill_opacity, 0.55);
+        assert_eq!(marker.blend, FillBlend::Multiply);
+        assert_eq!(marker.outline.width_px, 0.0);
+        assert!(marker.text.text.is_empty());
+        assert!(!marker.auto_size);
+        assert!(!marker.merge_with_below);
+        assert_eq!(
+            marker.shape_preset_link.as_deref(),
+            Some("miv:annot-marker")
+        );
+
+        let underline = build_annotation_bubble(
+            AnnotationPreset::Underline,
+            ANNOTATION_MARKER_DEFAULT_COLOR,
+            5.0,
+            (1000.0, 500.0),
+            1,
+            "test",
+        );
+        assert_eq!(
+            underline.shape,
+            BubbleShape::RoundRect {
+                half_w: 120.0,
+                half_h: 3.75,
+                corner_px: 5.0,
+            }
+        );
+        assert_eq!(underline.blend, FillBlend::Multiply);
+        assert_eq!(
+            underline.shape_preset_link.as_deref(),
+            Some("miv:annot-underline")
+        );
+    }
+
+    #[test]
+    fn annotation_cursor_preset_builds_stamp_model() {
+        let stamp =
+            build_annotation_cursor_stamp(AnnotationPreset::CursorArrowWhite, (1000.0, 600.0))
+                .expect("cursor preset should build a stamp");
+        assert_eq!(
+            stamp.source,
+            comic_core::StampSource::Emoji("miv:cursor-arrow-white".to_string())
+        );
+        assert_eq!((stamp.half_w, stamp.half_h), (40.0, 40.0));
+        assert_eq!(stamp.opacity, 1.0);
+
+        let object = AnnotationObject::new_stamp(1, (100.0, 100.0), stamp);
+        assert_eq!(object_list_label(&object), "スタンプ: カーソル");
+        let keys: Vec<_> = AnnotationPreset::CURSORS
+            .iter()
+            .map(|preset| preset.cursor_key().expect("cursor key"))
+            .collect();
+        assert_eq!(keys, crate::comic_stamp::ANNOTATION_STAMP_KEYS);
+    }
+
+    #[test]
+    fn annotation_list_labels_use_preset_tags() {
+        let frame = AnnotationObject::new_bubble(
+            1,
+            (100.0, 100.0),
+            build_annotation_bubble(
+                AnnotationPreset::Rect,
+                ANNOTATION_DEFAULT_COLOR,
+                4.0,
+                (1000.0, 500.0),
+                1,
+                "test",
+            ),
+        );
+        assert_eq!(object_list_label(&frame), "枠");
+        assert_eq!(object_list_label(&badge_object(2, "3", true)), "バッジ: 3");
+        assert_eq!(
+            object_list_label(&badge_object(3, "3", false)),
+            "吹き出し: 3"
+        );
+    }
+
+    #[test]
+    fn annotation_tags_survive_individual_shape_edits() {
+        let mut annotation = build_annotation_bubble(
+            AnnotationPreset::Rect,
+            ANNOTATION_DEFAULT_COLOR,
+            4.0,
+            (1000.0, 500.0),
+            1,
+            "test",
+        );
+        clear_shape_style_link(&mut annotation);
+        assert_eq!(
+            annotation.shape_preset_link.as_deref(),
+            Some("miv:annot-rect")
+        );
+
+        let mut regular = BubbleObject {
+            shape_preset_link: Some("user:shape:1".to_string()),
+            ..BubbleObject::default()
+        };
+        clear_shape_style_link(&mut regular);
+        assert_eq!(regular.shape_preset_link, None);
+    }
+
+    #[test]
+    fn empty_text_annotation_frame_layout_hit_test_and_bake_are_valid() {
+        let bubble = build_annotation_bubble(
+            AnnotationPreset::Rect,
+            ANNOTATION_DEFAULT_COLOR,
+            4.0,
+            (400.0, 300.0),
+            1,
+            "test",
+        );
+        let fonts = FontSet::new();
+        assert_eq!(
+            comic_core::effective_bubble_shape(&bubble, &fonts),
+            bubble.shape
+        );
+        let object = AnnotationObject::new_bubble(1, (160.0, 120.0), bubble);
+        let stamps = comic_core::StampImages::new();
+        assert_eq!(
+            hit_test_visible(
+                std::slice::from_ref(&object),
+                (160.0, 120.0),
+                Some(&fonts),
+                &stamps
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test_visible(
+                std::slice::from_ref(&object),
+                (20.0, 20.0),
+                Some(&fonts),
+                &stamps
+            ),
+            None
+        );
+        let overlay = comic_core::bake_overlay(&[object], 400, 300, &fonts);
+        assert!(
+            overlay.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "空テキストでも枠線はベイクされる"
+        );
+    }
+
+    fn bubble_body_rendered_width(fill: Option<Rgba>) -> f32 {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let measured = Arc::new(Mutex::new(0.0));
+        let measured_in_ui = Arc::clone(&measured);
+        let mut fonts_ready = false;
+        let mut bubble = BubbleObject {
+            shape: BubbleShape::RoundRect {
+                half_w: 120.0,
+                half_h: 70.0,
+                corner_px: 12.0,
+            },
+            fill,
+            auto_size: false,
+            ..BubbleObject::default()
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(PANEL_W + 32.0, 720.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(PANEL_W, 680.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_width(PANEL_W);
+                            ui.set_max_width(PANEL_W);
+                            let mut changed = false;
+                            bubble_body_ui(ui, &mut bubble, &mut changed);
+                            *measured_in_ui.lock().expect("width capture") = ui.min_rect().width();
+                        },
+                    );
+                });
+            });
+        harness.run();
+        let width = *measured.lock().expect("width result");
+        assert!(width > 0.0, "bubble body was not rendered");
+        width
+    }
+
+    #[test]
+    fn bubble_body_stays_within_panel_width_with_fill_on_or_off() {
+        for fill in [None, Some(Rgba::WHITE)] {
+            let width = bubble_body_rendered_width(fill);
+            assert!(
+                width <= PANEL_W,
+                "bubble body width {width} exceeded PANEL_W {PANEL_W} (fill={fill:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_add_dialog_snapshot_dark() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut preset = AnnotationPreset::Rect;
+        let mut shape_color = ANNOTATION_DEFAULT_COLOR;
+        let mut marker_color = ANNOTATION_MARKER_DEFAULT_COLOR;
+        let mut stroke = AnnotationStrokePreset::Standard;
+        let mut cursor_thumbs = HashMap::new();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(620.0, 460.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                if cursor_thumbs.is_empty() {
+                    for key in crate::comic_stamp::ANNOTATION_STAMP_KEYS {
+                        let source = comic_core::StampSource::Emoji(key.to_string());
+                        let image = crate::comic_stamp::load_stamp_image(&source)
+                            .expect("annotation cursor should decode");
+                        let thumb = crate::comic_stamp::downscale_overlay(&image, 44);
+                        let color = egui::ColorImage::from_rgba_unmultiplied(
+                            [thumb.w, thumb.h],
+                            &thumb.pixels,
+                        );
+                        let cache_key = crate::comic_stamp::stamp_source_key(&source);
+                        let texture = ctx.load_texture(
+                            format!("annotation_snapshot_{cache_key}"),
+                            color,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        cursor_thumbs.insert(cache_key, texture);
+                    }
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = annotation_dialog_contents_ui(
+                        ui,
+                        &mut preset,
+                        &mut shape_color,
+                        &mut marker_color,
+                        &mut stroke,
+                        &cursor_thumbs,
+                        1920.0,
+                    );
+                });
+            });
+        harness.run();
+        harness.snapshot("annotation_add_dialog_dark");
+    }
 
     #[test]
     fn onomatopoeia_preset_builds_text_block_style() {

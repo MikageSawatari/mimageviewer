@@ -4678,6 +4678,7 @@ impl ComicLab {
                 half_w,
                 half_h,
                 dir_rad,
+                ..
             } => {
                 if !auto {
                     edited |= ui
@@ -6615,6 +6616,8 @@ impl BubblePreset {
                 half_w: 150.0,
                 half_h: 110.0,
                 dir_rad: -std::f32::consts::FRAC_PI_2,
+                head_len_px: None,
+                shaft_half_px: None,
             },
             BubblePreset::MotionLines => BubbleShape::MotionLines {
                 rx: 240.0,
@@ -6716,6 +6719,7 @@ impl BubblePreset {
             shape: self.shape(),
             fill: Some(Rgba::WHITE),
             fill_opacity: 1.0,
+            blend: comic_core::FillBlend::Normal,
             outline: StrokeStyle {
                 color: Rgba::BLACK,
                 width_px: self.outline_width(),

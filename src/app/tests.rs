@@ -89,6 +89,36 @@ fn scan_folder_names(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
+fn comic_export_composition_applies_multiply_marker() {
+    let base = egui::ColorImage::new([8, 8], vec![egui::Color32::WHITE; 64]);
+    let mut bubble = comic_core::BubbleObject::default();
+    bubble.shape = comic_core::BubbleShape::RoundRect {
+        half_w: 2.0,
+        half_h: 2.0,
+        corner_px: 0.0,
+    };
+    bubble.fill = Some(comic_core::Rgba::new(255, 235, 59, 255));
+    bubble.fill_opacity = 1.0;
+    bubble.blend = comic_core::FillBlend::Multiply;
+    bubble.outline.width_px = 0.0;
+    bubble.text = comic_core::TextBlock::default();
+    bubble.auto_size = false;
+    let object = comic_core::AnnotationObject::new_bubble(1, (4.0, 4.0), bubble);
+
+    let result = composite_comic_objects_for_export(
+        &base,
+        &[object],
+        &comic_core::FontSet::new(),
+        &comic_core::StampImages::new(),
+    );
+
+    assert_eq!(
+        result.pixels[4 * 8 + 4].to_srgba_unmultiplied(),
+        [255, 235, 59, 255]
+    );
+}
+
+#[test]
 fn fullscreen_pdf_loads_are_not_pruned_by_grid_epoch() {
     for priority in [
         crate::pdf_loader::JobPriority::Critical,

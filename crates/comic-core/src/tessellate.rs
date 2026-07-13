@@ -53,7 +53,9 @@ pub fn tessellate_bubble(shape: &BubbleShape, pivot: (f32, f32)) -> Vec<(f32, f3
             half_w,
             half_h,
             dir_rad,
-        } => arrow(cx, cy, half_w, half_h, dir_rad),
+            head_len_px,
+            shaft_half_px,
+        } => arrow(cx, cy, half_w, half_h, dir_rad, head_len_px, shaft_half_px),
         BubbleShape::Soft {
             half_w,
             half_h,
@@ -138,12 +140,27 @@ fn heart(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
 
 /// Arrow outline (矢印): built pointing toward +x in local space, then rotated
 /// by `dir_rad` about the pivot. `half_w` is the half-length along the arrow,
-/// `half_h` the half cross-width. Head spans the front ~45%, shaft is ~45% tall.
-fn arrow(cx: f32, cy: f32, half_w: f32, half_h: f32, dir_rad: f32) -> Vec<(f32, f32)> {
+/// `half_h` the half cross-width. Without explicit dimensions, the head spans
+/// the front ~45% and the shaft is ~45% of `half_h`.
+fn arrow(
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+    dir_rad: f32,
+    head_len_px: Option<f32>,
+    shaft_half_px: Option<f32>,
+) -> Vec<(f32, f32)> {
     let hw = half_w.max(2.0);
     let hh = half_h.max(2.0);
-    let head_x = hw * 0.1; // head base x (front 45% is the triangle)
-    let shaft_hh = hh * 0.45; // shaft half-thickness
+    let head_x = match head_len_px {
+        Some(value) => hw - clamp_arrow_dimension(value, hw * 2.0),
+        None => hw * 0.1, // legacy: front 45% is the triangle
+    };
+    let shaft_hh = match shaft_half_px {
+        Some(value) => clamp_arrow_dimension(value, hh),
+        None => hh * 0.45, // legacy shaft half-thickness
+    };
     // 7-point arrow in local space (+x = tip).
     let local = [
         (hw, 0.0),           // tip
@@ -159,6 +176,14 @@ fn arrow(cx: f32, cy: f32, half_w: f32, half_h: f32, dir_rad: f32) -> Vec<(f32, 
         .iter()
         .map(|&(x, y)| (cx + x * cos - y * sin, cy + x * sin + y * cos))
         .collect()
+}
+
+fn clamp_arrow_dimension(value: f32, max: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, max)
+    }
 }
 
 /// Soft / やわらか outline: a rounded rect whose perimeter gently undulates
@@ -299,12 +324,19 @@ pub fn fit_bubble_shape(
         // and the arrow can point any direction, so size both axes from the larger
         // text half-extent: 0.45*2.6*d = 1.17*d >= d covers the cross; 2.0*d covers
         // the length.
-        BubbleShape::Arrow { dir_rad, .. } => {
+        BubbleShape::Arrow {
+            dir_rad,
+            head_len_px,
+            shaft_half_px,
+            ..
+        } => {
             let d = hw.max(hh);
             BubbleShape::Arrow {
                 half_w: d * 2.0,
                 half_h: d * 2.6,
                 dir_rad,
+                head_len_px,
+                shaft_half_px,
             }
         }
         // Soft: like a rounded rect (the wave is small); keep corner + seed.
@@ -1388,6 +1420,8 @@ mod tests {
                 half_w: 40.0,
                 half_h: 30.0,
                 dir_rad: -std::f32::consts::FRAC_PI_2,
+                head_len_px: None,
+                shaft_half_px: None,
             },
             (0.0, 0.0),
         );
@@ -1400,6 +1434,86 @@ mod tests {
             tip.1 < -30.0 && tip.0.abs() < 2.0,
             "arrow tip points up: {tip:?}"
         );
+    }
+
+    #[test]
+    fn arrow_none_dimensions_match_legacy_polygon_exactly() {
+        let actual = tessellate_bubble(
+            &BubbleShape::Arrow {
+                half_w: 50.0,
+                half_h: 20.0,
+                dir_rad: 0.0,
+                head_len_px: None,
+                shaft_half_px: None,
+            },
+            (0.0, 0.0),
+        );
+        let expected = vec![
+            (50.0, 0.0),
+            (5.0, 20.0),
+            (5.0, 9.0),
+            (-50.0, 9.0),
+            (-50.0, -9.0),
+            (5.0, -9.0),
+            (5.0, -20.0),
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arrow_explicit_dimensions_control_head_and_shaft() {
+        let actual = tessellate_bubble(
+            &BubbleShape::Arrow {
+                half_w: 50.0,
+                half_h: 20.0,
+                dir_rad: 0.0,
+                head_len_px: Some(12.0),
+                shaft_half_px: Some(3.0),
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(
+            actual,
+            vec![
+                (50.0, 0.0),
+                (38.0, 20.0),
+                (38.0, 3.0),
+                (-50.0, 3.0),
+                (-50.0, -3.0),
+                (38.0, -3.0),
+                (38.0, -20.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn arrow_explicit_dimensions_clamp_without_invalid_points() {
+        let cases = [
+            (200.0, 40.0, -50.0, 20.0),
+            (0.0, 0.0, 50.0, 0.0),
+            (-10.0, -5.0, 50.0, 0.0),
+        ];
+        for (head_len, shaft_half, expected_head_x, expected_shaft_half) in cases {
+            let points = tessellate_bubble(
+                &BubbleShape::Arrow {
+                    half_w: 50.0,
+                    half_h: 20.0,
+                    dir_rad: 0.0,
+                    head_len_px: Some(head_len),
+                    shaft_half_px: Some(shaft_half),
+                },
+                (0.0, 0.0),
+            );
+            assert_eq!(points.len(), 7);
+            assert_eq!(points[1].0, expected_head_x);
+            assert_eq!(points[2], (expected_head_x, expected_shaft_half));
+            assert!(points.iter().all(|&(x, y)| {
+                x.is_finite()
+                    && y.is_finite()
+                    && (-50.0..=50.0).contains(&x)
+                    && (-20.0..=20.0).contains(&y)
+            }));
+        }
     }
 
     #[test]
@@ -1422,6 +1536,8 @@ mod tests {
                 half_w: 1.0,
                 half_h: 1.0,
                 dir_rad: 0.5,
+                head_len_px: None,
+                shaft_half_px: None,
             },
             100.0,
             80.0,

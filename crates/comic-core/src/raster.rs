@@ -15,8 +15,9 @@ use crate::font::{FontSet, GlyphBitmap, LoadedFont, rotate_cw};
 use crate::layout::{GlyphForm, TextLayout, layout_text, layout_text_wrapped};
 use crate::model::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecorationLayer,
-    FillMode, FrameStyle, IndicatorKind, MessageWindowObject, NamePlateMode, Orientation,
-    PortraitSide, Rgba, SizeMode, StampObject, StrokeStyle, TextAlign, TextBlock, VAnchor,
+    FillBlend, FillMode, FrameStyle, IndicatorKind, MessageWindowObject, NamePlateMode,
+    Orientation, PortraitSide, Rgba, SizeMode, StampObject, StrokeStyle, TextAlign, TextBlock,
+    VAnchor,
 };
 use crate::tessellate::{
     PlacedDeco, bubble_geometry, fit_bubble_shape, place_decorations, resolve_tail_base,
@@ -103,6 +104,14 @@ impl RgbaOverlay {
 /// pixels (it shares its decode cache by `Arc::clone`).
 pub type StampImages = HashMap<u64, std::sync::Arc<RgbaOverlay>>;
 
+/// One z-ordered annotation segment. Normal layers contain straight-alpha RGBA;
+/// multiply layers contain opaque RGB multiplication factors (white = no effect).
+#[derive(Debug, Clone)]
+pub enum AnnotationLayer {
+    Normal(RgbaOverlay),
+    Multiply(RgbaOverlay),
+}
+
 /// Bake all enabled objects (z-sorted ascending) into a fresh overlay. Stamps
 /// render as missing-image placeholders (use [`bake_overlay_with_stamps`] to
 /// supply real stamp pixels).
@@ -113,6 +122,111 @@ pub fn bake_overlay(
     fonts: &FontSet,
 ) -> RgbaOverlay {
     bake_overlay_with_stamps(objects, w, h, fonts, &StampImages::new())
+}
+
+/// Bake enabled annotations into consecutive z-ordered blend segments.
+///
+/// Normal-only scenes deliberately take the legacy function as a fast path, so
+/// their single returned overlay remains byte-for-byte identical. Multiply
+/// objects are baked one at a time through that same rasterizer, then their
+/// straight-alpha pixels are converted to `lerp(white, color, alpha)` factors
+/// and accumulated into the segment's white multiplication buffer.
+pub fn bake_annotation_layers(
+    objects: &[AnnotationObject],
+    w: usize,
+    h: usize,
+    fonts: &FontSet,
+    stamps: &StampImages,
+) -> Vec<AnnotationLayer> {
+    let object_blend = |object: &AnnotationObject| match &object.kind {
+        AnnotationKind::Bubble(bubble) => bubble.blend,
+        _ => FillBlend::Normal,
+    };
+    let has_multiply = objects
+        .iter()
+        .any(|object| object.enabled && object_blend(object) == FillBlend::Multiply);
+    if !has_multiply {
+        return vec![AnnotationLayer::Normal(bake_overlay_with_stamps(
+            objects, w, h, fonts, stamps,
+        ))];
+    }
+
+    let mut order: Vec<usize> = (0..objects.len())
+        .filter(|&index| objects[index].enabled)
+        .collect();
+    order.sort_by_key(|&index| objects[index].z);
+
+    let mut layers = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let blend = object_blend(&objects[order[start]]);
+        let mut end = start + 1;
+        while end < order.len() && object_blend(&objects[order[end]]) == blend {
+            end += 1;
+        }
+        let segment: Vec<AnnotationObject> = order[start..end]
+            .iter()
+            .map(|&index| objects[index].clone())
+            .collect();
+        match blend {
+            FillBlend::Normal => layers.push(AnnotationLayer::Normal(bake_overlay_with_stamps(
+                &segment, w, h, fonts, stamps,
+            ))),
+            FillBlend::Multiply => {
+                let mut factors = RgbaOverlay {
+                    w,
+                    h,
+                    pixels: vec![255; w * h * 4],
+                };
+                crate::font::reset_glyph_cache();
+                for mut object in segment {
+                    // A multiply object is never allowed to join a normal bubble
+                    // merge chain. Clearing the stale serialized flag also makes
+                    // that ownership invariant explicit inside the bake boundary.
+                    if let AnnotationKind::Bubble(bubble) = &mut object.kind {
+                        bubble.merge_with_below = false;
+                    }
+                    if let Some((ox, oy, scratch)) = bake_group_to_buffer(
+                        &[0],
+                        std::slice::from_ref(&object),
+                        fonts,
+                        stamps,
+                        w,
+                        h,
+                    ) {
+                        accumulate_multiply_factors(&mut factors, &scratch, ox, oy);
+                    }
+                }
+                layers.push(AnnotationLayer::Multiply(factors));
+            }
+        }
+        start = end;
+    }
+    layers
+}
+
+fn accumulate_multiply_factors(dst: &mut RgbaOverlay, scratch: &RgbaOverlay, ox: i32, oy: i32) {
+    for y in 0..scratch.h {
+        for x in 0..scratch.w {
+            let source_index = (y * scratch.w + x) * 4;
+            let source = &scratch.pixels[source_index..source_index + 4];
+            let alpha = source[3] as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let dst_x = ox + x as i32;
+            let dst_y = oy + y as i32;
+            debug_assert!(dst_x >= 0 && dst_y >= 0);
+            let factor_index = (dst_y as usize * dst.w + dst_x as usize) * 4;
+            let factor = &mut dst.pixels[factor_index..factor_index + 4];
+            for channel in 0..3 {
+                let color = source[channel] as u32;
+                let object_factor = (255 * (255 - alpha) + color * alpha + 127) / 255;
+                factor[channel] = ((factor[channel] as u32 * object_factor + 127) / 255) as u8;
+            }
+            factor[3] = 255;
+        }
+    }
 }
 
 /// Bake all enabled objects, compositing image stamps from `stamps` (keyed by
@@ -1494,7 +1608,14 @@ fn bake_text(
     let layout = layout_text(block, font);
     let (lw, lh) = layout.bounds;
     let (origin_x, origin_y) = if centered {
-        (pivot.0 - lw * 0.5, pivot.1 - lh * 0.5)
+        let origin_y = if block.v_center_ink && block.orientation == Orientation::Horizontal {
+            measure_layout_ink_bounds(&layout, font)
+                .map(|bounds| pivot.1 - (bounds.min_y + bounds.max_y) * 0.5)
+                .unwrap_or(pivot.1 - lh * 0.5)
+        } else {
+            pivot.1 - lh * 0.5
+        };
+        (pivot.0 - lw * 0.5, origin_y)
     } else {
         (pivot.0, pivot.1)
     };
@@ -1649,21 +1770,6 @@ fn draw_layout_glyphs(
     );
 }
 
-/// Blit a coverage bitmap centered at (cx, cy) in image space, in `color`,
-/// optionally clipped to a rect `(x0, y0, x1, y1)`.
-fn blit_centered(
-    overlay: &mut RgbaOverlay,
-    bmp: &GlyphBitmap,
-    cx: f32,
-    cy: f32,
-    color: Rgba,
-    clip: Option<(f32, f32, f32, f32)>,
-) {
-    let left = cx - bmp.width as f32 * 0.5;
-    let top = cy - bmp.height as f32 * 0.5;
-    blit_bitmap(overlay, bmp, left, top, color, clip);
-}
-
 fn blit_bitmap(
     overlay: &mut RgbaOverlay,
     bmp: &GlyphBitmap,
@@ -1692,6 +1798,77 @@ fn blit_bitmap(
     }
 }
 
+/// Visit each rasterized glyph with the bitmap top-left produced by the same
+/// placement rules used for drawing. Measurement and rendering deliberately
+/// share this helper so their upright/sideways positioning cannot drift apart.
+fn for_each_layout_glyph_bitmap(
+    layout: &TextLayout,
+    font: &LoadedFont,
+    origin_x: f32,
+    origin_y: f32,
+    dilate_px: f32,
+    mut visit: impl FnMut(&GlyphBitmap, f32, f32),
+) {
+    for g in &layout.glyphs {
+        let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, dilate_px.max(0.0)) else {
+            continue;
+        };
+        if g.form == GlyphForm::Sideways {
+            let rot = rotate_cw(&bmp);
+            let left = origin_x + g.x - rot.width as f32 * 0.5;
+            let top = origin_y + g.y - rot.height as f32 * 0.5;
+            visit(&rot, left, top);
+        } else {
+            visit(&bmp, origin_x + g.x + bmp.left, origin_y + g.y + bmp.top);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InkBounds {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
+/// Measure the actual non-zero glyph coverage in layout space. Effects and
+/// outlines are intentionally excluded: symmetric outlines do not change the
+/// ink center, and the opt-in is defined by the body glyphs themselves.
+fn measure_layout_ink_bounds(layout: &TextLayout, font: &LoadedFont) -> Option<InkBounds> {
+    let mut bounds: Option<InkBounds> = None;
+    for_each_layout_glyph_bitmap(layout, font, 0.0, 0.0, 0.0, |bmp, left, top| {
+        for py in 0..bmp.height {
+            for px in 0..bmp.width {
+                if bmp.coverage[py * bmp.width + px] <= 0.0 {
+                    continue;
+                }
+                let x0 = left + px as f32;
+                let y0 = top + py as f32;
+                let x1 = x0 + 1.0;
+                let y1 = y0 + 1.0;
+                match &mut bounds {
+                    Some(bounds) => {
+                        bounds.min_x = bounds.min_x.min(x0);
+                        bounds.min_y = bounds.min_y.min(y0);
+                        bounds.max_x = bounds.max_x.max(x1);
+                        bounds.max_y = bounds.max_y.max(y1);
+                    }
+                    None => {
+                        bounds = Some(InkBounds {
+                            min_x: x0,
+                            min_y: y0,
+                            max_x: x1,
+                            max_y: y1,
+                        });
+                    }
+                }
+            }
+        }
+    });
+    bounds
+}
+
 fn draw_layout_mask(
     overlay: &mut RgbaOverlay,
     layout: &TextLayout,
@@ -1705,24 +1882,14 @@ fn draw_layout_mask(
     if color.a == 0 {
         return;
     }
-    for g in &layout.glyphs {
-        let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, dilate_px.max(0.0)) else {
-            continue;
-        };
-        if g.form == GlyphForm::Sideways {
-            let rot = rotate_cw(&bmp);
-            blit_centered(overlay, &rot, origin_x + g.x, origin_y + g.y, color, clip);
-        } else {
-            blit_bitmap(
-                overlay,
-                &bmp,
-                origin_x + g.x + bmp.left,
-                origin_y + g.y + bmp.top,
-                color,
-                clip,
-            );
-        }
-    }
+    for_each_layout_glyph_bitmap(
+        layout,
+        font,
+        origin_x,
+        origin_y,
+        dilate_px,
+        |bmp, left, top| blit_bitmap(overlay, bmp, left, top, color, clip),
+    );
 }
 
 fn draw_layout_soft_mask(
@@ -2487,7 +2654,7 @@ fn stroke_segment(overlay: &mut RgbaOverlay, a: (f32, f32), b: (f32, f32), strok
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BubbleObject, BubbleShape};
+    use crate::model::{BubbleObject, BubbleShape, FillBlend};
 
     const FONT_CANDIDATES: &[&str] = &[
         r"C:\Windows\Fonts\YuGothM.ttc",
@@ -2495,9 +2662,13 @@ mod tests {
         r"C:\Windows\Fonts\msgothic.ttc",
         r"C:\Windows\Fonts\YuGothR.ttc",
     ];
+    const YU_GOTHIC_FONT_CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\YuGothR.ttc",
+    ];
 
-    fn load_test_font() -> Option<LoadedFont> {
-        for path in FONT_CANDIDATES {
+    fn load_font_from(candidates: &[&str]) -> Option<LoadedFont> {
+        for path in candidates {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(font) = LoadedFont::from_bytes("test", bytes) {
                     return Some(font);
@@ -2507,6 +2678,126 @@ mod tests {
         None
     }
 
+    fn load_test_font() -> Option<LoadedFont> {
+        load_font_from(FONT_CANDIDATES)
+    }
+
+    fn load_yu_gothic_test_font() -> Option<LoadedFont> {
+        load_font_from(YU_GOTHIC_FONT_CANDIDATES)
+    }
+
+    fn baked_badge_text_ink_center_y(fonts: &FontSet, text: &str, v_center_ink: bool) -> f32 {
+        let pivot = (64.0, 64.0);
+        let bubble = BubbleObject {
+            shape: BubbleShape::Ellipse { rx: 20.0, ry: 20.0 },
+            fill: Some(Rgba::new(220, 0, 0, 255)),
+            fill_opacity: 1.0,
+            outline: StrokeStyle {
+                color: Rgba::TRANSPARENT,
+                width_px: 0.0,
+            },
+            text: TextBlock {
+                text: text.to_string(),
+                font_key: "test".to_string(),
+                size_px: 24.0,
+                color: Rgba::WHITE,
+                align: TextAlign::Center,
+                v_center_ink,
+                bold: true,
+                ..TextBlock::default()
+            },
+            auto_size: false,
+            ..BubbleObject::default()
+        };
+        let overlay = bake_overlay(
+            &[AnnotationObject::new_bubble(1, pivot, bubble)],
+            128,
+            128,
+            fonts,
+        );
+        // The badge fill has green == 0, so any non-zero green is white glyph
+        // coverage (including its anti-aliased edge), not the circle itself.
+        let mut min_y = usize::MAX;
+        let mut max_y = 0usize;
+        for (i, pixel) in overlay.pixels.chunks_exact(4).enumerate() {
+            if pixel[1] > 0 {
+                let y = i / overlay.w;
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        assert_ne!(min_y, usize::MAX, "badge text must produce ink: {text}");
+        (min_y as f32 + max_y as f32) * 0.5
+    }
+
+    #[test]
+    fn horizontal_badge_text_can_center_measured_ink_on_pivot() {
+        let Some(font) = load_yu_gothic_test_font() else {
+            eprintln!("skip: no Yu Gothic test font");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let pivot_y = 64.0;
+
+        let legacy_center = baked_badge_text_ink_center_y(&fonts, "1", false);
+        let centered = baked_badge_text_ink_center_y(&fonts, "1", true);
+        let legacy_delta = legacy_center - pivot_y;
+        eprintln!(
+            "Yu Gothic badge '1': legacy ink-center delta={legacy_delta:.2}px ({:.4}em), corrected delta={:.2}px",
+            legacy_delta / 24.0,
+            centered - pivot_y
+        );
+        assert!(
+            legacy_delta < -1.5,
+            "legacy line-box centering should leave digit ink above pivot; delta={legacy_delta}"
+        );
+        assert!(
+            (centered - pivot_y).abs() <= 1.5,
+            "ink-centered digit must match pivot within raster tolerance; center={centered}"
+        );
+
+        for text in ["12", "A"] {
+            let center = baked_badge_text_ink_center_y(&fonts, text, true);
+            assert!(
+                (center - pivot_y).abs() <= 1.5,
+                "ink-centered {text:?} must match pivot; center={center}"
+            );
+        }
+    }
+
+    #[test]
+    fn ink_centering_falls_back_for_vertical_or_empty_ink() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows Japanese test font");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let bake = |text: &str, orientation: Orientation, v_center_ink: bool| {
+            let mut overlay = RgbaOverlay::new(128, 128);
+            let block = TextBlock {
+                text: text.to_string(),
+                font_key: "test".to_string(),
+                size_px: 24.0,
+                color: Rgba::WHITE,
+                orientation,
+                v_center_ink,
+                ..TextBlock::default()
+            };
+            bake_text(&mut overlay, &block, (64.0, 64.0), &fonts, true);
+            overlay
+        };
+
+        let vertical_legacy = bake("12", Orientation::Vertical, false);
+        let vertical_opt_in = bake("12", Orientation::Vertical, true);
+        assert_eq!(vertical_opt_in.pixels, vertical_legacy.pixels);
+
+        let empty_legacy = bake(" ", Orientation::Horizontal, false);
+        let empty_opt_in = bake(" ", Orientation::Horizontal, true);
+        assert_eq!(empty_opt_in.pixels, empty_legacy.pixels);
+    }
+
     #[test]
     fn empty_objects_make_transparent_overlay() {
         let fonts = FontSet::new();
@@ -2514,6 +2805,199 @@ mod tests {
         assert_eq!(ov.w, 8);
         assert_eq!(ov.h, 8);
         assert!(ov.pixels.iter().all(|&p| p == 0));
+    }
+
+    fn marker_object(
+        id: u64,
+        z: i32,
+        pivot: (f32, f32),
+        color: Rgba,
+        opacity: f32,
+    ) -> AnnotationObject {
+        let mut bubble = BubbleObject::default();
+        bubble.shape = BubbleShape::RoundRect {
+            half_w: 12.0,
+            half_h: 8.0,
+            corner_px: 2.0,
+        };
+        bubble.fill = Some(color);
+        bubble.fill_opacity = opacity;
+        bubble.blend = FillBlend::Multiply;
+        bubble.outline.width_px = 0.0;
+        bubble.text = TextBlock::default();
+        bubble.auto_size = false;
+        bubble.merge_with_below = false;
+        let mut object = AnnotationObject::new_bubble(id, pivot, bubble);
+        object.z = z;
+        object
+    }
+
+    #[test]
+    fn annotation_layers_normal_only_match_legacy_bake_byte_for_byte() {
+        let fonts = FontSet::new();
+        let mut lower = BubbleObject::default();
+        lower.shape = BubbleShape::Ellipse { rx: 14.0, ry: 10.0 };
+        lower.fill = Some(Rgba::new(20, 80, 160, 180));
+        lower.text = TextBlock::default();
+        let mut upper = lower.clone();
+        upper.fill = Some(Rgba::new(220, 60, 30, 160));
+        upper.merge_with_below = true;
+        let mut objects = vec![
+            AnnotationObject::new_bubble(1, (22.0, 20.0), lower),
+            AnnotationObject::new_bubble(2, (30.0, 20.0), upper),
+        ];
+        objects[0].z = 4;
+        objects[1].z = 9;
+
+        let legacy = bake_overlay_with_stamps(&objects, 64, 48, &fonts, &StampImages::new());
+        let layers = bake_annotation_layers(&objects, 64, 48, &fonts, &StampImages::new());
+        let [AnnotationLayer::Normal(normal)] = layers.as_slice() else {
+            panic!("normal-only scene must produce one normal layer");
+        };
+        assert_eq!((normal.w, normal.h), (legacy.w, legacy.h));
+        assert_eq!(normal.pixels, legacy.pixels);
+    }
+
+    #[test]
+    fn multiply_factor_respects_opacity_and_accumulates_overlap() {
+        let fonts = FontSet::new();
+        let yellow = Rgba::new(255, 235, 59, 255);
+        let one = marker_object(1, 0, (24.0, 20.0), yellow, 0.55);
+        let two = marker_object(2, 1, (24.0, 20.0), yellow, 0.55);
+        let layers =
+            bake_annotation_layers(&[one.clone(), two], 48, 40, &fonts, &StampImages::new());
+        let [AnnotationLayer::Multiply(factors)] = layers.as_slice() else {
+            panic!("adjacent markers must share one multiply segment");
+        };
+        let center = (20 * factors.w + 24) * 4;
+        let alpha = (255.0f32 * 0.55).round() as u32;
+        let factor = |color: u32| (255 * (255 - alpha) + color * alpha + 127) / 255;
+        let accumulated = |color: u32| {
+            let f = factor(color);
+            ((f * f + 127) / 255) as u8
+        };
+        assert_eq!(factors.pixels[center], accumulated(255));
+        assert_eq!(factors.pixels[center + 1], accumulated(235));
+        assert_eq!(factors.pixels[center + 2], accumulated(59));
+        assert_eq!(factors.pixels[center + 3], 255);
+
+        let no_effect = marker_object(3, 0, (24.0, 20.0), yellow, 0.0);
+        let no_effect_layers =
+            bake_annotation_layers(&[no_effect], 48, 40, &fonts, &StampImages::new());
+        let [AnnotationLayer::Multiply(no_effect)] = no_effect_layers.as_slice() else {
+            unreachable!()
+        };
+        assert!(no_effect.pixels.iter().all(|&value| value == 255));
+    }
+
+    #[test]
+    fn multiply_objects_form_z_segments_and_ignore_merge_chain_flag() {
+        let fonts = FontSet::new();
+        let mut normal = marker_object(1, 0, (18.0, 18.0), Rgba::WHITE, 1.0);
+        if let AnnotationKind::Bubble(bubble) = &mut normal.kind {
+            bubble.blend = FillBlend::Normal;
+        }
+        let multiply = marker_object(2, 1, (22.0, 18.0), Rgba::new(255, 200, 40, 255), 0.7);
+        let mut top = normal.clone();
+        top.id = 3;
+        top.z = 2;
+        let layers = bake_annotation_layers(
+            &[top, multiply.clone(), normal],
+            48,
+            40,
+            &fonts,
+            &StampImages::new(),
+        );
+        assert!(matches!(
+            layers.as_slice(),
+            [
+                AnnotationLayer::Normal(_),
+                AnnotationLayer::Multiply(_),
+                AnnotationLayer::Normal(_)
+            ]
+        ));
+
+        let mut stale_merge = multiply.clone();
+        if let AnnotationKind::Bubble(bubble) = &mut stale_merge.kind {
+            bubble.merge_with_below = true;
+        }
+        let clean = bake_annotation_layers(&[multiply], 48, 40, &fonts, &StampImages::new());
+        let stale = bake_annotation_layers(&[stale_merge], 48, 40, &fonts, &StampImages::new());
+        let (AnnotationLayer::Multiply(clean), AnnotationLayer::Multiply(stale)) =
+            (&clean[0], &stale[0])
+        else {
+            unreachable!()
+        };
+        assert_eq!(clean.pixels, stale.pixels);
+    }
+
+    #[test]
+    fn multiply_object_routes_fill_outline_and_text_to_one_multiply_layer() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows Japanese test font");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let mut bubble = BubbleObject::default();
+        bubble.shape = BubbleShape::RoundRect {
+            half_w: 24.0,
+            half_h: 18.0,
+            corner_px: 4.0,
+        };
+        bubble.fill = Some(Rgba::new(255, 235, 59, 255));
+        bubble.fill_opacity = 0.55;
+        bubble.blend = FillBlend::Multiply;
+        bubble.outline = StrokeStyle {
+            color: Rgba::new(220, 40, 30, 255),
+            width_px: 3.0,
+        };
+        bubble.text = TextBlock {
+            text: "A".to_string(),
+            font_key: "test".to_string(),
+            size_px: 18.0,
+            color: Rgba::new(20, 70, 220, 255),
+            ..TextBlock::default()
+        };
+        bubble.auto_size = false;
+        bubble.merge_with_below = true;
+        let object = AnnotationObject::new_bubble(1, (32.0, 28.0), bubble);
+
+        let layers = bake_annotation_layers(
+            std::slice::from_ref(&object),
+            64,
+            56,
+            &fonts,
+            &StampImages::new(),
+        );
+        let [AnnotationLayer::Multiply(actual)] = layers.as_slice() else {
+            panic!("the whole object must be emitted only as a multiply layer");
+        };
+
+        let mut normal_object = object;
+        if let AnnotationKind::Bubble(bubble) = &mut normal_object.kind {
+            bubble.blend = FillBlend::Normal;
+            bubble.merge_with_below = false;
+        }
+        let scratch =
+            bake_overlay_with_stamps(&[normal_object], 64, 56, &fonts, &StampImages::new());
+        for (factor, source) in actual
+            .pixels
+            .chunks_exact(4)
+            .zip(scratch.pixels.chunks_exact(4))
+        {
+            for channel in 0..3 {
+                let alpha = source[3] as u32;
+                let expected = (255 * (255 - alpha) + source[channel] as u32 * alpha + 127) / 255;
+                assert_eq!(factor[channel], expected as u8);
+            }
+            assert_eq!(factor[3], 255);
+        }
+        assert!(
+            scratch.pixels.chunks_exact(4).any(|pixel| {
+                pixel[3] > 0 && pixel[0] == 20 && pixel[1] == 70 && pixel[2] == 220
+            })
+        );
     }
 
     #[test]

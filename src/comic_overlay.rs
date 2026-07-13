@@ -24,7 +24,8 @@
 //! docs/comic-ui-bugfix-checklist.md の C5 エントリ。
 
 use comic_core::{
-    AnnotationObject, FontSet, LoadedFont, Orientation, Rgba, RgbaOverlay, StrokeStyle, TextBlock,
+    AnnotationLayer, AnnotationObject, FontSet, LoadedFont, Orientation, Rgba, RgbaOverlay,
+    StrokeStyle, TextBlock,
 };
 use egui::{Color32, ColorImage};
 
@@ -114,6 +115,83 @@ pub fn composite_overlay_over(base: &ColorImage, overlay: &RgbaOverlay) -> Color
                 );
             }
         });
+    ColorImage::new([w, h], pixels)
+}
+
+/// z 順の注釈セグメント列を下地へ合成する。Normal は従来の source-over、Multiply は
+/// RGB 係数 (白 = 無効果) を現在までの合成結果へ掛ける。alpha は Multiply で変えない。
+pub fn composite_annotation_layers(base: &ColorImage, layers: &[AnnotationLayer]) -> ColorImage {
+    use rayon::prelude::*;
+
+    // Normal-only fast path keeps the legacy result byte-identical, including
+    // Color32's premultiplied-alpha conversion and all rounding behavior.
+    if let [AnnotationLayer::Normal(overlay)] = layers {
+        return composite_overlay_over(base, overlay);
+    }
+
+    let [w, h] = base.size;
+    let mut pixels = base.pixels.clone();
+    if w == 0 || h == 0 {
+        return ColorImage::new([w, h], pixels);
+    }
+    for layer in layers {
+        let overlay = match layer {
+            AnnotationLayer::Normal(overlay) | AnnotationLayer::Multiply(overlay) => overlay,
+        };
+        let cw = w.min(overlay.w);
+        let ch = h.min(overlay.h);
+        if cw == 0 || ch == 0 {
+            continue;
+        }
+        pixels
+            .par_chunks_mut(w)
+            .take(ch)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..cw {
+                    let oi = (y * overlay.w + x) * 4;
+                    match layer {
+                        AnnotationLayer::Normal(_) => {
+                            let oa = overlay.pixels[oi + 3];
+                            if oa == 0 {
+                                continue;
+                            }
+                            let [br, bg, bb, ba] = row[x].to_srgba_unmultiplied();
+                            let oaf = oa as f32 / 255.0;
+                            let baf = ba as f32 / 255.0;
+                            let out_a = oaf + baf * (1.0 - oaf);
+                            if out_a <= 0.0 {
+                                row[x] = Color32::TRANSPARENT;
+                                continue;
+                            }
+                            let blend = |fc: u8, bc: u8| -> u8 {
+                                ((fc as f32 * oaf + bc as f32 * baf * (1.0 - oaf)) / out_a)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8
+                            };
+                            row[x] = Color32::from_rgba_unmultiplied(
+                                blend(overlay.pixels[oi], br),
+                                blend(overlay.pixels[oi + 1], bg),
+                                blend(overlay.pixels[oi + 2], bb),
+                                (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                            );
+                        }
+                        AnnotationLayer::Multiply(_) => {
+                            let [br, bg, bb, ba] = row[x].to_srgba_unmultiplied();
+                            let multiply = |value: u8, factor: u8| -> u8 {
+                                ((value as u32 * factor as u32 + 127) / 255) as u8
+                            };
+                            row[x] = Color32::from_rgba_unmultiplied(
+                                multiply(br, overlay.pixels[oi]),
+                                multiply(bg, overlay.pixels[oi + 1]),
+                                multiply(bb, overlay.pixels[oi + 2]),
+                                ba,
+                            );
+                        }
+                    }
+                }
+            });
+    }
     ColorImage::new([w, h], pixels)
 }
 
@@ -294,5 +372,78 @@ mod tests {
         let out = composite_overlay_over(&base, &ov);
         assert_eq!(out.size, [2, 2]);
         assert_eq!(out.pixels.len(), 4);
+    }
+
+    #[test]
+    fn normal_annotation_layer_matches_legacy_composite() {
+        let base = ColorImage::new(
+            [2, 1],
+            vec![Color32::from_rgb(10, 20, 30), Color32::from_rgb(70, 80, 90)],
+        );
+        let mut overlay = RgbaOverlay::new(2, 1);
+        overlay.pixels[0..4].copy_from_slice(&[200, 30, 80, 137]);
+        overlay.pixels[4..8].copy_from_slice(&[10, 220, 40, 255]);
+        let legacy = composite_overlay_over(&base, &overlay);
+        let layered = composite_annotation_layers(&base, &[AnnotationLayer::Normal(overlay)]);
+        assert_eq!(layered.pixels, legacy.pixels);
+    }
+
+    #[test]
+    fn multiply_layer_colors_white_and_preserves_black() {
+        let base = ColorImage::new([2, 1], vec![Color32::WHITE, Color32::BLACK]);
+        let mut factors = RgbaOverlay::new(2, 1);
+        for pixel in factors.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[255, 235, 59, 255]);
+        }
+        let out = composite_annotation_layers(&base, &[AnnotationLayer::Multiply(factors)]);
+        assert_eq!(out.pixels[0].to_srgba_unmultiplied(), [255, 235, 59, 255]);
+        assert_eq!(out.pixels[1].to_srgba_unmultiplied(), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn annotation_layer_order_controls_marker_visibility_over_opaque_bubble() {
+        let base = ColorImage::new([2, 1], vec![Color32::from_rgb(40, 80, 120); 2]);
+        let mut bubble = RgbaOverlay::new(2, 1);
+        bubble.pixels[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        bubble.pixels[4..8].copy_from_slice(&[0, 0, 0, 255]);
+        let mut marker = RgbaOverlay::new(2, 1);
+        for pixel in marker.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[255, 235, 120, 255]);
+        }
+
+        let marker_above = composite_annotation_layers(
+            &base,
+            &[
+                AnnotationLayer::Normal(bubble.clone()),
+                AnnotationLayer::Multiply(marker.clone()),
+            ],
+        );
+        assert_eq!(
+            marker_above.pixels[0].to_srgba_unmultiplied(),
+            [255, 235, 120, 255],
+            "marker above multiplies the opaque bubble fill"
+        );
+        assert_eq!(
+            marker_above.pixels[1].to_srgba_unmultiplied(),
+            [0, 0, 0, 255],
+            "black bubble text stays black under multiply"
+        );
+
+        let marker_below = composite_annotation_layers(
+            &base,
+            &[
+                AnnotationLayer::Multiply(marker),
+                AnnotationLayer::Normal(bubble),
+            ],
+        );
+        assert_eq!(
+            marker_below.pixels[0].to_srgba_unmultiplied(),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            marker_below.pixels[1].to_srgba_unmultiplied(),
+            [0, 0, 0, 255]
+        );
+        assert_ne!(marker_above.pixels, marker_below.pixels);
     }
 }

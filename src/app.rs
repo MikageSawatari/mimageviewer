@@ -4091,6 +4091,17 @@ pub(crate) struct ComicPreviewBase {
     pub reduced: Arc<egui::ColorImage>,
 }
 
+fn composite_comic_objects_for_export(
+    base: &egui::ColorImage,
+    objects: &[comic_core::AnnotationObject],
+    fonts: &comic_core::FontSet,
+    stamps: &comic_core::StampImages,
+) -> egui::ColorImage {
+    let [w, h] = base.size;
+    let layers = comic_core::bake_annotation_layers(objects, w, h, fonts, stamps);
+    crate::comic_overlay::composite_annotation_layers(base, &layers)
+}
+
 /// 注釈ベイク worker (B) の結果。CPU 合成済みピクセル + perf 計測値。GPU upload は
 /// 受け取った UI スレッド側 (`poll_comic_bake`) で行う。
 pub(crate) struct ComicBakeResult {
@@ -8584,6 +8595,13 @@ pub struct App {
     pub(crate) text_dirty_at: Option<std::time::Instant>,
     /// 「吹き出しを追加」形状ピッカーダイアログの表示中フラグ。
     pub(crate) text_add_bubble_dialog: bool,
+    /// 「注釈を追加」プリセットダイアログの表示中フラグ。
+    pub(crate) text_add_annotation_dialog: bool,
+    /// 注釈ダイアログで前回選んだ値（セッション内で復元）。
+    pub(crate) text_annotation_preset: crate::ui_text::AnnotationPreset,
+    pub(crate) text_annotation_shape_color: comic_core::Rgba,
+    pub(crate) text_annotation_marker_color: comic_core::Rgba,
+    pub(crate) text_annotation_stroke: crate::ui_text::AnnotationStrokePreset,
     /// 「ウィンドウを追加」スタイルピッカーダイアログの表示中フラグ。
     pub(crate) text_add_window_dialog: bool,
     /// 「スタンプを追加/変更」絵文字ピッカーダイアログの表示中フラグ (Inc 4c)。
@@ -10258,6 +10276,11 @@ impl App {
             text_drag: None,
             text_dirty_at: None,
             text_add_bubble_dialog: false,
+            text_add_annotation_dialog: false,
+            text_annotation_preset: crate::ui_text::AnnotationPreset::default(),
+            text_annotation_shape_color: comic_core::Rgba::new(242, 60, 60, 255),
+            text_annotation_marker_color: crate::ui_text::ANNOTATION_MARKER_DEFAULT_COLOR,
+            text_annotation_stroke: crate::ui_text::AnnotationStrokePreset::default(),
             text_add_window_dialog: false,
             text_add_stamp_dialog: false,
             text_add_onomatopoeia_dialog: false,
@@ -11192,12 +11215,13 @@ impl App {
 
     /// いずれかのモーダルダイアログが開いているか。
     /// true の場合、キーボードショートカットやスクロールを無効化する。
-    /// テキスト注釈モードの子ダイアログ (吹き出し/ウィンドウ/スタンプ/オノマトペ/フォント
+    /// テキスト注釈モードの子ダイアログ (吹き出し/注釈/ウィンドウ/スタンプ/オノマトペ/フォント
     /// ピッカー) が開いているか。開いている間はキャンバスのポインタ操作 (選択/移動/削除) と
     /// フルスクリーンキー (Esc 退場 / Delete / 矢印ナビ) を止め、ダイアログ操作に集中させる
     /// (Codex P2: 子ダイアログが非モーダルで背面オブジェクトへ入力漏れしていた)。
     pub(crate) fn text_subdialog_open(&self) -> bool {
         self.text_add_bubble_dialog
+            || self.text_add_annotation_dialog
             || self.text_add_window_dialog
             || self.text_add_stamp_dialog
             || self.text_add_onomatopoeia_dialog
@@ -44632,10 +44656,9 @@ impl App {
             } else {
                 objects.clone()
             };
-            let overlay =
-                comic_core::bake_overlay_with_stamps(&scaled, bw, bh, &fonts, &stamp_images);
-            let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
-                &bake_base, &overlay,
+            let layers = comic_core::bake_annotation_layers(&scaled, bw, bh, &fonts, &stamp_images);
+            let composed = Arc::new(crate::comic_overlay::composite_annotation_layers(
+                &bake_base, &layers,
             ));
             let upload = clamp_for_gpu(&composed).into_owned();
             let texture = ctx.load_texture(
@@ -44698,7 +44721,7 @@ impl App {
                     return;
                 }
                 let t_bake = std::time::Instant::now();
-                let overlay = comic_core::bake_overlay_with_stamps(
+                let layers = comic_core::bake_annotation_layers(
                     &scaled,
                     bw,
                     bh,
@@ -44710,7 +44733,8 @@ impl App {
                     return;
                 }
                 let t_comp = std::time::Instant::now();
-                let composed = crate::comic_overlay::composite_overlay_over(&base_worker, &overlay);
+                let composed =
+                    crate::comic_overlay::composite_annotation_layers(&base_worker, &layers);
                 let composite_ms = t_comp.elapsed().as_secs_f64() * 1000.0;
                 if cancel_worker.load(Relaxed) {
                     return;
@@ -44809,9 +44833,11 @@ impl App {
             objects
         };
         let stamp_images = self.build_stamp_images(&scaled);
-        let overlay = comic_core::bake_overlay_with_stamps(&scaled, w, h, &fonts, &stamp_images);
-        Some(Arc::new(crate::comic_overlay::composite_overlay_over(
-            &base, &overlay,
+        Some(Arc::new(composite_comic_objects_for_export(
+            &base,
+            &scaled,
+            &fonts,
+            &stamp_images,
         )))
     }
 

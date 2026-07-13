@@ -1151,6 +1151,7 @@ dependencies = [
  "rustybuzz",
  "self_cell",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

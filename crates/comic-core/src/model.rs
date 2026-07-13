@@ -237,6 +237,11 @@ pub struct TextBlock {
     pub orientation: Orientation,
     #[serde(default)]
     pub align: TextAlign,
+    /// Opt-in visual vertical centering for horizontal bubble text. When true,
+    /// the rasterizer centers the measured glyph ink instead of the font's line
+    /// box. Kept false by default so existing bubble placement is unchanged.
+    #[serde(default)]
+    pub v_center_ink: bool,
     /// Extra spacing between lines/columns, added to the font's natural advance.
     #[serde(default)]
     pub line_gap: f32,
@@ -290,6 +295,7 @@ impl Default for TextBlock {
             color: Rgba::BLACK,
             orientation: Orientation::Horizontal,
             align: TextAlign::Start,
+            v_center_ink: false,
             line_gap: 0.0,
             letter_gap: 0.0,
             outline: None,
@@ -365,6 +371,14 @@ pub enum BubbleShape {
         half_h: f32,
         #[serde(default = "arrow_up")]
         dir_rad: f32,
+        /// Length of the triangular head in px. `None` preserves the legacy
+        /// ratio (the front 45% of the full arrow length).
+        #[serde(default)]
+        head_len_px: Option<f32>,
+        /// Half-thickness of the shaft in px. `None` preserves the legacy
+        /// ratio (45% of `half_h`).
+        #[serde(default)]
+        shaft_half_px: Option<f32>,
     },
     /// Soft / やわらか balloon: a rounded rect with gently wavy edges.
     /// `corner_px` rounds the corners; `shape_seed` jitters the wave phase.
@@ -615,6 +629,16 @@ impl Default for DecorationLayer {
     }
 }
 
+/// Object-wide compositing mode for a bubble and all of its rendered parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FillBlend {
+    /// Legacy straight-alpha source-over rendering.
+    #[default]
+    Normal,
+    /// Multiply the already-composited content by this object's rendered color.
+    Multiply,
+}
+
 /// A bubble = container shape + embedded text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BubbleObject {
@@ -624,6 +648,9 @@ pub struct BubbleObject {
     pub fill: Option<Rgba>,
     #[serde(default = "one")]
     pub fill_opacity: f32,
+    /// Compositing mode for the entire object (fill, outline, decorations, text).
+    #[serde(default)]
+    pub blend: FillBlend,
     #[serde(default)]
     pub outline: StrokeStyle,
     #[serde(default)]
@@ -662,6 +689,7 @@ impl Default for BubbleObject {
             shape: BubbleShape::default(),
             fill: Some(Rgba::WHITE),
             fill_opacity: 1.0,
+            blend: FillBlend::Normal,
             outline: StrokeStyle::default(),
             tail: None,
             padding_px: 16.0,
@@ -1234,5 +1262,76 @@ impl AnnotationObject {
             AnnotationKind::MessageWindow(w) => Some(&mut w.text),
             AnnotationKind::Stamp(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BubbleObject, BubbleShape, FillBlend, TextBlock};
+
+    #[test]
+    fn text_block_v_center_ink_serde_round_trip_and_legacy_default() {
+        let block = TextBlock {
+            v_center_ink: true,
+            ..TextBlock::default()
+        };
+        let json = serde_json::to_string(&block).expect("serialize text block");
+        let decoded: TextBlock = serde_json::from_str(&json).expect("deserialize text block");
+        assert!(decoded.v_center_ink);
+
+        let mut legacy_value = serde_json::to_value(block).expect("text block JSON value");
+        legacy_value
+            .as_object_mut()
+            .expect("text block object")
+            .remove("v_center_ink");
+        let legacy: TextBlock =
+            serde_json::from_value(legacy_value).expect("deserialize legacy text block");
+        assert!(!legacy.v_center_ink);
+    }
+
+    #[test]
+    fn arrow_dimensions_serde_round_trip() {
+        let shape = BubbleShape::Arrow {
+            half_w: 90.0,
+            half_h: 12.0,
+            dir_rad: 0.25,
+            head_len_px: Some(20.0),
+            shaft_half_px: Some(2.5),
+        };
+        let json = serde_json::to_string(&shape).expect("serialize arrow");
+        let decoded: BubbleShape = serde_json::from_str(&json).expect("deserialize arrow");
+        assert_eq!(decoded, shape);
+    }
+
+    #[test]
+    fn legacy_arrow_json_defaults_new_dimensions_to_none() {
+        let json = r#"{"Arrow":{"half_w":90.0,"half_h":12.0,"dir_rad":0.25}}"#;
+        let decoded: BubbleShape = serde_json::from_str(json).expect("deserialize legacy arrow");
+        assert_eq!(
+            decoded,
+            BubbleShape::Arrow {
+                half_w: 90.0,
+                half_h: 12.0,
+                dir_rad: 0.25,
+                head_len_px: None,
+                shaft_half_px: None,
+            }
+        );
+    }
+
+    #[test]
+    fn bubble_blend_serde_round_trip_and_legacy_default() {
+        let bubble = BubbleObject {
+            blend: FillBlend::Multiply,
+            ..BubbleObject::default()
+        };
+        let json = serde_json::to_string(&bubble).expect("serialize bubble blend");
+        let decoded: BubbleObject = serde_json::from_str(&json).expect("deserialize bubble blend");
+        assert_eq!(decoded.blend, FillBlend::Multiply);
+
+        let mut legacy_value = serde_json::to_value(BubbleObject::default()).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("blend");
+        let legacy: BubbleObject = serde_json::from_value(legacy_value).expect("legacy bubble");
+        assert_eq!(legacy.blend, FillBlend::Normal);
     }
 }

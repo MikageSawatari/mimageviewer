@@ -906,14 +906,14 @@ fn compose_book_page(
             &mut stamp_cache,
             cancel.as_ref(),
         );
-        let overlay = comic_core::bake_overlay_with_stamps(
+        let layers = comic_core::bake_annotation_layers(
             objects,
             image.size[0],
             image.size[1],
             &comic.fonts,
             &stamps,
         );
-        image = crate::comic_overlay::composite_overlay_over(&image, &overlay);
+        image = crate::comic_overlay::composite_annotation_layers(&image, &layers);
     }
 
     let crop = edits.export_crop.map(|crop| {
@@ -1898,6 +1898,37 @@ mod tests {
                 .pixels
                 .iter()
                 .any(|pixel| pixel.r() > 0 && pixel.g() == 0 && pixel.b() == 0)
+        );
+    }
+
+    #[test]
+    fn full_composite_applies_multiply_marker() {
+        let base = egui::ColorImage::new([8, 8], vec![egui::Color32::WHITE; 64]);
+        let mut bubble = comic_core::BubbleObject::default();
+        bubble.shape = comic_core::BubbleShape::RoundRect {
+            half_w: 2.0,
+            half_h: 2.0,
+            corner_px: 0.0,
+        };
+        bubble.fill = Some(comic_core::Rgba::new(255, 235, 59, 255));
+        bubble.fill_opacity = 1.0;
+        bubble.blend = comic_core::FillBlend::Multiply;
+        bubble.outline.width_px = 0.0;
+        bubble.text = comic_core::TextBlock::default();
+        bubble.auto_size = false;
+        let object = comic_core::AnnotationObject::new_bubble(1, (4.0, 4.0), bubble);
+        let mut edits = empty_baked_edits();
+        edits.comic = Some(BookComicSnapshot {
+            objects: vec![object],
+            fonts: Arc::new(comic_core::FontSet::new()),
+            stamp_cache: std::collections::HashMap::new(),
+        });
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert_eq!(
+            result.image.pixels[4 * 8 + 4].to_srgba_unmultiplied(),
+            [255, 235, 59, 255]
         );
     }
 

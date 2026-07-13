@@ -111,6 +111,7 @@ fn scale_text(t: &TextBlock, s: f32) -> TextBlock {
         color: t.color,
         orientation: t.orientation,
         align: t.align,
+        v_center_ink: t.v_center_ink,
         line_gap: t.line_gap * s,
         letter_gap: t.letter_gap * s,
         outline: scale_opt_stroke(&t.outline, s),
@@ -190,10 +191,14 @@ fn scale_shape(shape: BubbleShape, s: f32) -> BubbleShape {
             half_w,
             half_h,
             dir_rad,
+            head_len_px,
+            shaft_half_px,
         } => BubbleShape::Arrow {
             half_w: half_w * s,
             half_h: half_h * s,
             dir_rad, // angle, unchanged
+            head_len_px: head_len_px.map(|value| value * s),
+            shaft_half_px: shaft_half_px.map(|value| value * s),
         },
         BubbleShape::Soft {
             half_w,
@@ -298,6 +303,7 @@ fn scale_bubble(b: &BubbleObject, s: f32) -> BubbleObject {
         shape: scale_shape(b.shape, s),
         fill: b.fill,
         fill_opacity: b.fill_opacity, // ratio
+        blend: b.blend,
         outline: scale_stroke(&b.outline, s),
         tail: b.tail.as_ref().map(|t| scale_tail(t, s)),
         padding_px: b.padding_px * s,
@@ -406,6 +412,7 @@ mod tests {
             },
             fill: Some(Rgba::WHITE),
             fill_opacity: 0.5,
+            blend: crate::model::FillBlend::Multiply,
             outline: StrokeStyle {
                 color: Rgba::BLACK,
                 width_px: 4.0,
@@ -562,6 +569,30 @@ mod tests {
     }
 
     #[test]
+    fn arrow_explicit_dimensions_scale_as_absolute_lengths() {
+        let scaled = scale_shape(
+            BubbleShape::Arrow {
+                half_w: 90.0,
+                half_h: 10.0,
+                dir_rad: 0.25,
+                head_len_px: Some(20.0),
+                shaft_half_px: Some(2.5),
+            },
+            2.0,
+        );
+        assert_eq!(
+            scaled,
+            BubbleShape::Arrow {
+                half_w: 180.0,
+                half_h: 20.0,
+                dir_rad: 0.25,
+                head_len_px: Some(40.0),
+                shaft_half_px: Some(5.0),
+            }
+        );
+    }
+
+    #[test]
     fn identity_scale_is_exact() {
         let s = scene();
         // s == 1.0 must be a byte-for-byte identity (no fp drift), so re-baking at
@@ -696,6 +727,7 @@ mod tests {
             color: Rgba::BLACK,
             align: TextAlign::Center,
             orientation: Orientation::Vertical,
+            v_center_ink: true,
             outline: Some(StrokeStyle {
                 color: Rgba::WHITE,
                 width_px: 5.0,
@@ -730,6 +762,7 @@ mod tests {
             "orientation unchanged"
         );
         assert_eq!(t.preset_link.as_deref(), Some("user:caption"));
+        assert!(t.v_center_ink, "ink-centering opt-in preserved");
         assert_eq!(t.text, "標語", "text content unchanged");
     }
 
@@ -796,6 +829,8 @@ mod tests {
                 half_w: 10.0,
                 half_h: 20.0,
                 dir_rad: 1.2,
+                head_len_px: None,
+                shaft_half_px: None,
             },
             BubbleShape::Soft {
                 half_w: 10.0,
@@ -878,6 +913,7 @@ mod tests {
                     half_w,
                     half_h,
                     dir_rad,
+                    ..
                 } => {
                     assert_eq!((half_w, half_h), (20.0, 40.0));
                     assert_eq!(dir_rad, 1.2, "angle unchanged");
