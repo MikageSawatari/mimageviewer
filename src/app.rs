@@ -52263,13 +52263,24 @@ impl eframe::App for App {
         // 下部情報バーは CentralPanel のグリッドより先に確保する。egui が残り領域を
         // render_grid へ渡すため、last_viewport_h と仮想スクロール範囲にも反映される。
         self.render_selection_info_bar(ctx);
-        let folder_pane_nav = self.render_folder_pane(ctx);
+        let (folder_pane_nav, folder_pane_rect) = self.render_folder_pane(ctx);
 
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
         self.suppress_popup_wheel_before_grid(ctx);
-        self.process_scroll(ctx);
+        // フォルダツリーの ScrollArea を描いた frame でも raw wheel input は残り得る。
+        // ポインタが SidePanel の実矩形内なら、内容が短くツリー側にスクロール余地がない
+        // 場合も含めて背面グリッドへ適用しない。矩形外では従来どおりグリッドを動かす。
+        let folder_pane_blocks_grid_scroll =
+            crate::ui_folder_pane::folder_pane_hover_blocks_grid_scroll(
+                self.settings.folder_tree_pane_visible,
+                folder_pane_rect,
+                ctx.pointer_latest_pos(),
+            );
+        if !folder_pane_blocks_grid_scroll {
+            self.process_scroll(ctx);
+        }
 
         // ファイル名スタック: フラット読書フルスクリーンを閉じたら集約グリッドへ戻す
         // (render_grid の直前で reconcile して、閉じた瞬間に集約表示が出るようにする)。

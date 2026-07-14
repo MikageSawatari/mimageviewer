@@ -158,22 +158,6 @@
   - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
 - 優先度: P3。
 
-### 2.2 ツリーペイン上のホイールが背面のサムネイル一覧にも通る (wheel passthrough)
-
-- 症状: ツールバーのツリーボタンで左にフォルダツリーを出し、ツリー上でホイール操作すると、
-  ツリー側と右側のサムネイル一覧の**両方が同時にスクロール**する (2026-07-14 ユーザー報告)。
-- 原因 (推定): グローバルな一覧ホイール処理 `App::process_scroll` が、ポインタがツリーペイン上に
-  あるフレームでも wheel を消費してグリッドを動かしている。CLAUDE.md「Popup / menu wheel
-  passthrough」と同種で、ツリーペインの `ScrollArea` を描くフレームでは wheel をツリー側で
-  消費し、ポインタがツリーペイン矩形内なら `process_scroll` のグリッド処理をスキップする必要がある。
-- 方針:
-  - ポインタがフォルダツリーペインの rect 内にある間は、グリッド側の `process_scroll` を
-    ゲートする (ツリーの `ScrollArea` が wheel を消費し、背面グリッドへ通さない)。
-  - `process_scroll` は「メニュー/ツールバー/アドレスバー等を描いた後・グリッド描画直前に呼ぶ」
-    既存順序 (CLAUDE.md UI/スクロール節) と整合させ、ツリーペインも hover 判定に含める。
-  - 関連: `src/folder_pane.rs` (ツリー描画) と `App::process_scroll` の呼び出し順。
-- 優先度: P3 (UX、データ破壊なし)。
-
 ## 3. 補正 / AI
 
 ### 3.1 local-adjust layers の入場時同期 DB 読み

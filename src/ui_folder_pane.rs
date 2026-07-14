@@ -14,6 +14,17 @@ const FOLDER_PANE_ROW_HEIGHT: f32 = 24.0;
 const FOLDER_PANE_INDENT_WIDTH: f32 = 14.0;
 const FOLDER_PANE_ARROW_WIDTH: f32 = 24.0;
 
+pub(crate) fn folder_pane_hover_blocks_grid_scroll(
+    pane_visible: bool,
+    pane_rect: Option<egui::Rect>,
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    pane_visible
+        && pane_rect
+            .zip(pointer_pos)
+            .is_some_and(|(rect, pos)| rect.contains(pos))
+}
+
 impl App {
     pub(crate) fn set_folder_tree_pane_visible(&mut self, visible: bool) {
         self.settings.folder_tree_pane_visible = visible;
@@ -139,9 +150,12 @@ impl App {
         None
     }
 
-    pub(crate) fn render_folder_pane(&mut self, ctx: &egui::Context) -> Option<std::path::PathBuf> {
+    pub(crate) fn render_folder_pane(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> (Option<std::path::PathBuf>, Option<egui::Rect>) {
         if !self.settings.folder_tree_pane_visible {
-            return None;
+            return (None, None);
         }
 
         self.sync_folder_pane_state(ctx);
@@ -174,7 +188,7 @@ impl App {
         {
             self.settings.folder_tree_pane_width_ratio = width_ratio;
         }
-        nav
+        (nav, Some(panel.response.rect))
     }
 
     fn render_folder_pane_header(&mut self, ui: &mut egui::Ui) {
@@ -335,5 +349,36 @@ impl App {
             self.folder_pane.scroll_to_cursor = false;
         }
         nav
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_pane_hover_gates_only_pointer_inside_visible_pane() {
+        let pane_rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(240.0, 720.0));
+
+        assert!(folder_pane_hover_blocks_grid_scroll(
+            true,
+            Some(pane_rect),
+            Some(egui::pos2(120.0, 200.0)),
+        ));
+        assert!(!folder_pane_hover_blocks_grid_scroll(
+            true,
+            Some(pane_rect),
+            Some(egui::pos2(600.0, 200.0)),
+        ));
+        assert!(!folder_pane_hover_blocks_grid_scroll(
+            false,
+            Some(pane_rect),
+            Some(egui::pos2(120.0, 200.0)),
+        ));
+        assert!(!folder_pane_hover_blocks_grid_scroll(
+            true,
+            Some(pane_rect),
+            None,
+        ));
     }
 }
