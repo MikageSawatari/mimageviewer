@@ -1478,6 +1478,48 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     body が想定どおりに表示されることを目視確認 (改行・見出し・リンクの崩れチェック)。
     短縮版を使った場合は、目玉の新機能が末尾で切れずに表示されているかを特に確認する。
 
+### Phase 5: 配布チャネルへの反映・申請 (公開後)
+
+GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vector と MS Store は忘れやすいので、
+リリースのたびに必ずこのリストを通し、ユーザーに作業を案内すること。**
+
+16. **mikage.to へ反映**:
+    - 3 直接DL成果物 (`mImageViewer_setup.exe` / `mimageviewer.exe` /
+      `mImageViewer_portable_v<VER>.zip`) を配置。
+    - 製品ページ (`htdocs/mimageviewer/index.html`) のダウンロード欄・バージョン表記・「最終更新」
+      日付を新版に更新。ダウンロード欄に **「Microsoft Store でも入手可能」バッジ** (`.btn-store`、
+      リンク先 `https://apps.microsoft.com/detail/xp8jlwdwv5ls01`) が入っていることを確認。
+17. **Vector 申請**: `mImageViewer_installer_v<VERSION>.zip` (`mImageViewer_setup.exe` +
+    `installer/readme.txt`) を申請。readme の版表記更新を忘れずに (本書「Distribution」節参照)。
+18. **窓の杜** (任意): これまで見送り実績が多い。掲載する場合はインストーラ zip を申請
+    (本書「窓の杜」まわり / メモリ [[reference_madonomori_coverage]] 参照)。
+19. **Microsoft Store 更新申請** (区切りの良い版で。毎リリース必須ではない):
+    - **前提**: EXE/MSI 掲載は **Store が既存ユーザーを自動更新しない** (自動更新は MSIX のみ)。
+      **既存ユーザーは mIV 自身の更新通知で自己更新**するので、Store 更新は「新規 Store インストール
+      の初期版を新しく保つ」ためのもの。**毎リリースで出す必要はなく、区切りの良い版で更新すれば十分**。
+    - **① 版付きの直リンクにインストーラを配置**: 署名済み `mImageViewer_setup.exe` を mikage.to の
+      版付きパスに**直リンク**で置く。例: `https://mikage.to/mimageviewer/download/v<VER>/mImageViewer_setup.exe`。
+      - ⚠ **GitHub Release の URL は使えない** (実体 CDN へ 302 リダイレクトし、Store に
+        「リダイレクトのないダウンロード URL を指定して」と却下される)。
+      - ⚠ **非バージョン名の setup.exe (上書き運用) も使わない** (Store は提出後のバイナリ変更を
+        許さないので、版でパスを分ける)。**提出後はそのファイルを消さない・上書きしない**
+        (Store が再DLして再検証する)。
+      - リダイレクト無しを確認: `curl -sI <URL>` が `200 OK` (301/302 が出ないこと)、
+        `Content-Length` が署名済み setup.exe と一致すること。
+    - **② Partner Center で更新**: [partner.microsoft.com](https://partner.microsoft.com/) →
+      mImageViewer → 「アプリを更新」→ **パッケージ**のパッケージ URL を新 URL に差し替え →
+      **各ページで必ず「下書きの保存」** (保存せず「次へ」だと入力が消える) → 「すべて保存」→
+      **Package validation を「実行」** (署名・サイレントインストール・リダイレクトを検証、~30分〜数時間) →
+      合格を確認 → **送信**。
+    - **③ 認定待ち**: 新規提出と同様 **約1〜3営業日**。合格でメール通知。年齢区分アンケートの回答が
+      変わらなければ **IARC レーティングはそのまま引き継がれる** (mIV はローカルビューアなので通常不変)。
+    - **確定値の控え** (変更なければ毎回同じ): Architecture=**x64** / Language=**ja** /
+      App type=**EXE** / Installer parameters=**`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`** /
+      Installation successful=**0** / プライバシーURL=`https://mikage.to/mimageviewer/privacy.html`。
+      Microsoft Store ID=**`XP8JLWDWV5LS01`**、公開ページ=`https://apps.microsoft.com/detail/xp8jlwdwv5ls01`。
+      コード署名は build-dist.ps1 が実施済み (本書 Phase 3 / 「code signing」)。詳細な経緯・ハマりどころは
+      メモリ [[project_msstore_publishing]] 参照。
+
 ## Codex CLI レビュー
 
 ユーザーから「Codex にレビューしてもらって」「Codex レビューを取って」等と指示された場合は、
