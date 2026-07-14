@@ -30,8 +30,11 @@ impl App {
         self.settings.folder_tree_pane_visible = visible;
         if visible {
             let active = self.effective_folder();
-            self.folder_pane
-                .sync_to_active(active.as_deref(), self.settings.sort_order);
+            self.folder_pane.sync_to_active(
+                active.as_deref(),
+                self.settings.sort_order,
+                self.settings.show_hidden_files,
+            );
             self.folder_pane.set_focus_tree_at_active();
         } else {
             self.folder_pane.set_focus_grid();
@@ -64,8 +67,11 @@ impl App {
             return;
         }
         let active = self.effective_folder();
-        self.folder_pane
-            .sync_to_active(active.as_deref(), self.settings.sort_order);
+        self.folder_pane.sync_to_active(
+            active.as_deref(),
+            self.settings.sort_order,
+            self.settings.show_hidden_files,
+        );
         if self.folder_pane.poll_pending() {
             ctx.request_repaint();
         }
@@ -228,8 +234,11 @@ impl App {
                 .on_hover_text("フォルダツリーを再読み込み");
             if reload.clicked() {
                 let active = self.effective_folder();
-                self.folder_pane
-                    .reload_for_active(active.as_deref(), self.settings.sort_order);
+                self.folder_pane.reload_for_active(
+                    active.as_deref(),
+                    self.settings.sort_order,
+                    self.settings.show_hidden_files,
+                );
             }
         });
     }

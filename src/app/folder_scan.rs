@@ -37,7 +37,7 @@ pub(crate) struct ScannedDir {
 /// 方針は [docs/ui-responsiveness.md §1.1](../../docs/ui-responsiveness.md) にまとめてある。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
-    scan_directory_with_convertible_archives(path, true)
+    scan_directory_with_convertible_archives(path, true, false)
 }
 
 pub(crate) fn scan_directory_with_settings(
@@ -47,12 +47,14 @@ pub(crate) fn scan_directory_with_settings(
     scan_directory_with_convertible_archives(
         path,
         !settings.archive_file_handling_ignores_convertible(),
+        settings.show_hidden_files,
     )
 }
 
 pub(crate) fn scan_directory_with_convertible_archives(
     path: &std::path::Path,
     include_convertible_archives: bool,
+    show_hidden_files: bool,
 ) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, ScanMediaKind, i64, i64)> = Vec::new();
@@ -70,6 +72,9 @@ pub(crate) fn scan_directory_with_convertible_archives(
             .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft))
             .unwrap_or(crate::fs_entry::DirEntryKind::Other);
         entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        if crate::fs_entry::should_hide_fs_entry(&entry, show_hidden_files) {
+            continue;
+        }
         let p = entry.path();
         if kind.is_directory() {
             if crate::video::upscale::paths::has_work_dir_suffix(&p) {

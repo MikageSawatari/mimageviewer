@@ -2144,6 +2144,9 @@ pub struct Settings {
     /// Ctrl+↑↓ フォルダ移動時に画像なしフォルダをスキップする最大回数（1〜10）
     #[serde(default = "default_folder_skip_limit")]
     pub folder_skip_limit: usize,
+    /// Hidden 属性のファイル / フォルダを一覧に表示する。Hidden + System は常に非表示。
+    #[serde(default)]
+    pub show_hidden_files: bool,
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
@@ -3790,6 +3793,7 @@ impl Default for Settings {
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
             folder_skip_limit: default_folder_skip_limit(),
+            show_hidden_files: false,
             sort_order: SortOrder::default(),
             grid_display_order: GridDisplayOrder::default(),
             thumb_px: default_thumb_px(),
@@ -6032,6 +6036,12 @@ mod tests {
     // -- Settings defaults --
 
     #[test]
+    fn missing_show_hidden_files_defaults_to_false() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.show_hidden_files);
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -6064,6 +6074,7 @@ mod tests {
             RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT
         );
         assert_eq!(s.folder_skip_limit, 5);
+        assert!(!s.show_hidden_files);
         assert_eq!(s.sort_order, SortOrder::FileName);
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);

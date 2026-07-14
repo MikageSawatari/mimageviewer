@@ -6118,6 +6118,17 @@ pub(super) fn page_vst3(_ui: &mut egui::Ui, _state: &mut PreferencesState) {}
 pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
+    ui.label(egui::RichText::new("ファイル・フォルダの表示").strong());
+    ui.add_space(4.0);
+    ui.checkbox(&mut s.show_hidden_files, "隠しファイル・フォルダを表示する");
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("システムファイル ($Recycle.Bin 等) は常に非表示です")
+            .size(11.0)
+            .color(egui::Color32::from_gray(150)),
+    );
+
+    ui.add_space(12.0);
     ui.label(egui::RichText::new("フォルダサムネイル").strong());
     ui.add_space(4.0);
     ui.label("フォルダの代表画像をどの順序で選ぶか。\n先頭の画像がサムネイルとして表示されます。");

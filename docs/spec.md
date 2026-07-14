@@ -721,6 +721,10 @@ SW fallback で隠さず再生エラーとして表示する。
 ### 5.2 自動除外
 
 - macOS / iPhone の AppleDouble メタデータファイル（`._*`）は自動的に除外
+- Windows の Hidden + System 属性を持つ保護された OS ファイル / フォルダ
+  (`$Recycle.Bin` / `System Volume Information` / `pagefile.sys` 等) は常に除外する
+- Hidden 属性のみのファイル / フォルダは `show_hidden_files` が false のとき除外し、
+  true のとき表示する。非 Windows では先頭 `.` を Hidden 相当として扱う
 
 ### 5.3 グリッド内のアイテム順
 
@@ -1221,6 +1225,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 |--------|-----|---------|------|
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30）。PDF/変換アーカイブはコンテナ候補として停止対象 |
+| `show_hidden_files` | bool | false | Hidden 属性のファイル / フォルダをグリッド一覧とフォルダツリーペインに表示する。Hidden + System 属性の保護された OS ファイルは設定に関係なく常に非表示。非 Windows では先頭 `.` を Hidden 相当として扱う |
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_playback_speed` | f64 | 1.0 | 動画再生速度。HUD の速度ボタンから変更し、動画切替とアプリ再起動後も維持する。読み込み時は `0.25..=4.0` にクランプ |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |

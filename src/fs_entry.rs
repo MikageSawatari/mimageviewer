@@ -37,6 +37,38 @@ pub fn classify_dir_entry(entry: &DirEntry, file_type: &FileType) -> DirEntryKin
     classify_special_dir_entry(entry, file_type)
 }
 
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+
+/// Windows のファイル属性から、一覧で除外すべきエントリかを判定する純関数。
+///
+/// Hidden + System は保護された OS ファイルとして常に隠し、Hidden のみは
+/// show_hidden_files が false のときだけ隠す。
+pub fn should_hide_dir_entry(attributes: u32, show_hidden_files: bool) -> bool {
+    let hidden = attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+    let system = attributes & FILE_ATTRIBUTE_SYSTEM != 0;
+    hidden && (system || !show_hidden_files)
+}
+
+/// DirEntry のキャッシュ済み情報だけを使って一覧の表示可否を判定する。
+///
+/// Windows の entry.metadata() は FindFirstFile / FindNextFile の結果を再利用するため、
+/// エントリごとの追加 syscall は発生しない。属性を取得できない場合は従来どおり表示側へ倒す。
+#[cfg(windows)]
+pub fn should_hide_fs_entry(entry: &DirEntry, show_hidden_files: bool) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    entry.metadata().ok().is_some_and(|metadata| {
+        should_hide_dir_entry(metadata.file_attributes(), show_hidden_files)
+    })
+}
+
+/// Unix 系では Windows 属性がないため、先頭 . を Hidden 相当として扱う。
+#[cfg(not(windows))]
+pub fn should_hide_fs_entry(entry: &DirEntry, show_hidden_files: bool) -> bool {
+    !show_hidden_files && entry.file_name().to_string_lossy().starts_with('.')
+}
+
 #[cfg(windows)]
 fn classify_special_dir_entry(entry: &DirEntry, file_type: &FileType) -> DirEntryKind {
     use std::os::windows::fs::{FileTypeExt, MetadataExt};
@@ -113,6 +145,25 @@ mod tests {
                 .expect("file")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn hidden_system_entries_are_always_hidden() {
+        let attributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+        assert!(should_hide_dir_entry(attributes, false));
+        assert!(should_hide_dir_entry(attributes, true));
+    }
+
+    #[test]
+    fn hidden_only_entries_follow_show_hidden_setting() {
+        assert!(should_hide_dir_entry(FILE_ATTRIBUTE_HIDDEN, false));
+        assert!(!should_hide_dir_entry(FILE_ATTRIBUTE_HIDDEN, true));
+    }
+
+    #[test]
+    fn normal_entries_are_always_visible() {
+        assert!(!should_hide_dir_entry(0, false));
+        assert!(!should_hide_dir_entry(0, true));
     }
 
     #[cfg(windows)]

@@ -25915,6 +25915,7 @@ impl App {
         // 呼び出し側から `FolderTreeOptions` を受ける形に変更済み。ここで一度だけ
         // 値をスナップショットして worker thread に move する。
         let tree_opts = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
+        let show_hidden_files = self.settings.show_hidden_files;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -26026,6 +26027,7 @@ impl App {
                     let s = scan_directory_with_convertible_archives(
                         &o.path,
                         tree_opts.include_convertible_archives,
+                        show_hidden_files,
                     );
                     if crate::perf::is_enabled() {
                         crate::perf::event(
@@ -26144,12 +26146,16 @@ impl App {
         let scan_path = path.clone();
         let include_convertible_archives =
             !self.settings.archive_file_handling_ignores_convertible();
+        let show_hidden_files = self.settings.show_hidden_files;
         std::thread::spawn(move || {
             if cancel_w.load(Ordering::Relaxed) {
                 return;
             }
-            let scan =
-                scan_directory_with_convertible_archives(&scan_path, include_convertible_archives);
+            let scan = scan_directory_with_convertible_archives(
+                &scan_path,
+                include_convertible_archives,
+                show_hidden_files,
+            );
             if !cancel_w.load(Ordering::Relaxed) {
                 let _ = tx.send(scan);
             }

@@ -161,7 +161,7 @@ fn scan_directory_can_ignore_convertible_archives() {
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
 
-    let scan = scan_directory_with_convertible_archives(tmp.path(), false);
+    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false);
 
     assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
