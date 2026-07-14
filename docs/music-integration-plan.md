@@ -691,7 +691,8 @@ audio buffer を clear するため発生）を **完全シームレス**にす�
 - **動画専用（共有しない）**: ホバーサムネプレビュー・タイルモード・Perf グラフ・（動画のみの）
   prev/next file・capture パレット等。音楽側では出さない。
 - **ブックマークパネル**: 見た目は動画ジャンプパネルに寄せ、一括登録は動画と同じダイアログを共有
-  （IME も動画実装に揃う）。中身は音声にあるブックマークのみ（サムネ/ピン/チャプター欄は出さない）。
+  （IME も動画実装に揃う）。通常音声はブックマークのみ。再生中の player がチャプターを持つ場合は
+  チャプター節も出す（ピン/サムネ欄は出さない）。
 - **リスク管理**: released な動画 overlay の改修になるので、小インクリメント（コントロール行 →
   パネル → 一括ダイアログ）に分け、各段で build + test + Codex レビュー。動画側の見た目・挙動を
   バイト等価に保つことを最優先。
@@ -741,7 +742,7 @@ normalize 進捗ダイアログ / 動画のみの prev-next file・capture palet
   P2 fix fa714a40、Codex P1/P2/P3 クリア、test 3126 green）**:
   - `draw_native_jump_panel` の本体を `draw_native_jump_panel_body(ui, panel_rect, opts, ...)` に抽出。
     `NativeJumpPanelOptions`（title/empty_text/show_pin_button/show_bulk_button/show_pins/
-    show_chapters/show_section_headers/show_thumbnails）で音声=ブックマークのみに切替。動画は
+    show_chapters/show_section_headers/show_thumbnails）で通常音声=ブックマークのみに切替。動画は
     `VIDEO_JUMP_PANEL_OPTIONS`（全 true）で呼ぶだけ＝バイト等価。`draw_native_jump_row` に
     `show_thumbnail` 追加（false=サムネ列省略・行高 52px・テキスト +12px）。
   - `NativeBulkBookmarkDialog`/`NativeBookmarkTitleEdit` と body/bulk dialog/title editor/size fn を
@@ -1058,7 +1059,9 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   - 全 seek / 頭出しは `music_seek_to` 経由でブックマーク区間ループ target を再計算。
 
 ### 7.5 ブックマーク（左パネル、動画機構を再利用 D5.1。5c-A で動画 UI を共有）
-- [x] 一覧表示（代表サムネ・チャプターなし）（Inc 5 → 5c-A で `draw_native_jump_panel_body` 共有）
+- [x] 一覧表示（通常音声はブックマークのみ。player がチャプターを持つ動画→音声モード等では
+  チャプター節も表示。代表サムネなし）（Inc 5 → 5c-A で `draw_native_jump_panel_body` 共有、
+  チャプター表示は 2026-07-14 追加）
 - [x] 現在位置に追加（`KeyAction::VideoBookmark`、既定 `B`）/ 削除 / 改名（中央モーダル改名ダイアログ）/ クリックでジャンプ（Inc 5 / 5c-A）
 - [x] インポート（動画と同一の中央モーダル一括登録ダイアログ = `draw_native_bulk_bookmark_dialog`、`parse_chapter_text` + プレビュー。IME・貼り付けが動画実装に揃う）（5c-A）
 - [x] エクスポート（一括ダイアログ内、`format_chapter_lines` + `seconds_only` トグル）（Inc 5 / 5c-A）

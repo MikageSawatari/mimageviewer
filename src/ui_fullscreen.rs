@@ -448,6 +448,23 @@ fn music_right_panel_visible_from_inputs(
     }
 }
 
+const MUSIC_TOP_BAR_HEIGHT: f32 = 54.0;
+
+fn music_side_panel_contains_pointer(
+    full_rect: egui::Rect,
+    pos: egui::Pos2,
+    left_visible: bool,
+    right_visible: bool,
+) -> bool {
+    let band_top = full_rect.top() + MUSIC_TOP_BAR_HEIGHT;
+    let band_bottom = full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT;
+    let left_w = crate::ui_music_panels::MUSIC_LEFT_PANEL_WIDTH;
+    let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5);
+    let in_band = pos.y >= band_top && pos.y <= band_bottom;
+    (left_visible && in_band && pos.x <= full_rect.left() + left_w)
+        || (right_visible && in_band && pos.x >= full_rect.right() - right_w)
+}
+
 /// メタデータパネルを「開く」ホバートリガ矩形。画面右端の細いストリップ
 /// (`PANEL_EDGE_TRIGGER_WIDTH`) だけを判定に使う。縦方向は従来どおり全高 (上バー / シーク
 /// バー帯でも右端ホバーで開ける)。一度開いた後の「維持」判定は `draw_metadata_panel` 側で
@@ -11837,9 +11854,10 @@ impl App {
         );
         let panel_fs_idx = self.fullscreen_idx;
         let panorama_active = panel_fs_idx.is_some_and(|idx| self.is_panorama_mode_active(idx));
+        let music_view_active = panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
         let side_panel_chrome_enabled =
             still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
-                is_music_view: panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx)),
+                is_music_view: music_view_active,
                 analysis_active: self.analysis_mode && !is_spread_double && !panorama_active,
                 is_video: state.is_video,
                 compare_wipe_active,
@@ -11856,6 +11874,23 @@ impl App {
         let has_right_panel = self.metadata_panel_click_shown()
             || self.metadata_panel_hover_active
             || self.fullscreen_tag_picker_open;
+        let music_modal_open = music_view_active
+            && (self.music_bookmark_modal_open()
+                || panel_fs_idx.is_some_and(|idx| self.music_normalize_modal_active(idx)));
+        let music_left_panel_visible = music_view_active
+            && music_left_panel_visible_from_inputs(
+                self.settings.fullscreen_side_panel_mode,
+                self.music_left_panel_active,
+                self.music_left_click_open,
+                music_modal_open,
+            );
+        let music_right_panel_visible = music_view_active
+            && music_right_panel_visible_from_inputs(
+                self.settings.fullscreen_side_panel_mode,
+                self.music_right_panel_active,
+                self.fs_click_info_open,
+                music_modal_open,
+            );
         // When the OS cursor is hidden, egui still exposes the last hover position.
         // Treat that position as stale and block passive hover side effects until a
         // real input event revives the cursor.
@@ -11883,6 +11918,12 @@ impl App {
                             has_right_panel,
                             self.adjustment_mode,
                         );
+                        let in_music_side_panel = music_side_panel_contains_pointer(
+                            full_rect,
+                            p,
+                            music_left_panel_visible,
+                            music_right_panel_visible,
+                        );
                         let in_erase_panel =
                             self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
                         let in_local_adjust_panel = self.local_adjust_mode
@@ -11903,6 +11944,7 @@ impl App {
                             && (self.text_panel_rect(full_rect).contains(p)
                                 || self.text_detail_panel_rect(full_rect).contains(p));
                         in_side_panel
+                            || in_music_side_panel
                             || in_erase_panel
                             || in_local_adjust_panel
                             || in_conceal_panel
@@ -22244,7 +22286,7 @@ impl App {
         // **中央は縮小しない** (動画のジャンプ/メタパネルと同じ)。
         // 上バー高さは動画 native 上バー (draw_top_bar_background = 54px) に合わせる。これで
         // 音楽ビューと VST 画面 (native シェル) でボタン / タイトルの縦位置が揃う (ユーザー要望)。
-        let top_h = 54.0;
+        let top_h = MUSIC_TOP_BAR_HEIGHT;
         let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
         let hud_top = rect.bottom() - hud_h;
         let panel_band_top = rect.top() + top_h;
@@ -22380,6 +22422,16 @@ impl App {
             playing,
             show_timeline,
         );
+        // 左右パネルは中央タイムラインに重なるため、パネル上のホイールを背面の ScrollArea へ
+        // 渡さない。パネル自身は後段で描くので、描画後に delta を復元して従来どおり受け取らせる。
+        let panel_scroll_deltas = pointer_over_panel.then(|| {
+            ctx.input_mut(|i| {
+                let deltas = (i.raw_scroll_delta, i.smooth_scroll_delta);
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                deltas
+            })
+        });
         if show_timeline {
             // タイムラインは複数行 (row) になり中央領域より高くなるので ScrollArea で縦スクロール。
             // 子 UI は常に DARK visuals (フルスクリーン内は黒背景ベース統一)。
@@ -22561,6 +22613,13 @@ impl App {
             }
         }
 
+        if let Some((raw_scroll_delta, smooth_scroll_delta)) = panel_scroll_deltas {
+            ctx.input_mut(|i| {
+                i.raw_scroll_delta = raw_scroll_delta;
+                i.smooth_scroll_delta = smooth_scroll_delta;
+            });
+        }
+
         // ── 下段 MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4)。──
         // 再生位置周辺 ±1 秒の PCM をワーカーで FFT して描く。PCM 未着 (デコード中) の間は
         // 空バンド = 鍵盤ベースラインのみ。Arc は clone で借用衝突を避ける。
@@ -22731,6 +22790,83 @@ mod tests {
             FsSidePanelMode::ClickToShow,
             false,
             true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn music_side_panel_hit_test_respects_left_and_right_visibility() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let left = egui::pos2(120.0, 300.0);
+        let right = egui::pos2(1700.0, 300.0);
+
+        assert!(!music_side_panel_contains_pointer(
+            viewport, left, false, false
+        ));
+        assert!(music_side_panel_contains_pointer(
+            viewport, left, true, false
+        ));
+        assert!(!music_side_panel_contains_pointer(
+            viewport, left, false, true
+        ));
+        assert!(music_side_panel_contains_pointer(
+            viewport, right, false, true
+        ));
+        assert!(!music_side_panel_contains_pointer(
+            viewport, right, true, false
+        ));
+    }
+
+    #[test]
+    fn music_side_panel_hit_test_is_limited_to_the_drawn_vertical_band() {
+        let viewport =
+            egui::Rect::from_min_size(egui::pos2(100.0, 200.0), egui::vec2(1920.0, 1080.0));
+        let x = viewport.left() + 100.0;
+        let band_top = viewport.top() + MUSIC_TOP_BAR_HEIGHT;
+        let band_bottom = viewport.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT;
+
+        assert!(!music_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(x, band_top - 0.1),
+            true,
+            false,
+        ));
+        assert!(music_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(x, band_top),
+            true,
+            false,
+        ));
+        assert!(music_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(x, band_bottom),
+            true,
+            false,
+        ));
+        assert!(!music_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(x, band_bottom + 0.1),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn music_right_panel_hit_test_clamps_width_to_half_the_viewport() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 500.0));
+        let panel_left = viewport.right() - viewport.width() * 0.5;
+        let y = viewport.top() + MUSIC_TOP_BAR_HEIGHT + 10.0;
+
+        assert!(!music_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(panel_left - 0.1, y),
+            false,
+            true,
+        ));
+        assert!(music_side_panel_contains_pointer(
+            viewport,
+            egui::pos2(panel_left, y),
+            false,
             true,
         ));
     }

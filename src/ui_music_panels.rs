@@ -7,7 +7,8 @@
 //!   (`music_probe`) を表示する。
 //! - 左パネルのブックマークは動画の `VideoBookmarkDb` を **path キーで共有** する
 //!   (docs/music-integration-plan.md D5.1)。フォーマット (parse/format) も動画と同じ
-//!   `video_bookmarks_parser` を使う。
+//!   `video_bookmarks_parser` を使う。再生中の player がチャプターを持つ場合は、同じ
+//!   ジャンプパネルへチャプター節も表示する。
 //!
 //! フルスクリーン内は黒背景ベース統一なので、両パネルとも常にダーク配色で描く。
 
@@ -89,6 +90,57 @@ fn format_hms(secs: f64) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+/// 音楽ビュー左パネルの表示オプション。
+///
+/// 通常の音声ファイルは従来どおりブックマークだけを見出しなしで表示する。再生中の
+/// player がチャプターを持つ場合だけ、チャプター節と種別見出しを追加する。
+#[cfg(windows)]
+fn music_jump_panel_options(has_chapters: bool) -> NativeJumpPanelOptions<'static> {
+    NativeJumpPanelOptions {
+        title: "ブックマーク",
+        empty_text: "ブックマークはありません",
+        show_pin_button: false,
+        show_bulk_button: true,
+        show_pins: false,
+        show_chapters: has_chapters,
+        show_section_headers: has_chapters,
+        show_thumbnails: false,
+    }
+}
+
+/// ブックマークと player のチャプターを共有ジャンプパネル用 entry に変換する。
+/// `draw_native_jump_panel_body` は種別ごとに section 化するが、元 entry 自体も時刻順に
+/// 揃えておき、各 section 内の順序と同時刻時の扱いを決定的にする。
+#[cfg(windows)]
+fn build_music_jump_entries(
+    bookmarks: &[crate::video_bookmarks::VideoBookmarkMeta],
+    chapters: &[crate::video::decoder::Chapter],
+) -> Vec<NativeOverlayJumpEntry> {
+    let mut entries: Vec<NativeOverlayJumpEntry> = bookmarks
+        .iter()
+        .map(|bookmark| NativeOverlayJumpEntry {
+            pts_secs: bookmark.pts_secs,
+            kind: NativeOverlayTimelineMarkerKind::Bookmark,
+            title: bookmark.title.clone(),
+            bookmark_id: Some(bookmark.id),
+            thumbnail: None,
+        })
+        .collect();
+    entries.extend(chapters.iter().map(|chapter| NativeOverlayJumpEntry {
+        pts_secs: chapter.start_secs,
+        kind: NativeOverlayTimelineMarkerKind::Chapter,
+        title: chapter.title.clone(),
+        bookmark_id: None,
+        thumbnail: None,
+    }));
+    entries.sort_by(|a, b| {
+        a.pts_secs
+            .partial_cmp(&b.pts_secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries
 }
 
 /// J/K マーカーナビの seek 結果。`Marker` = 具体的なブックマーク秒へ、`Start` = 前ブックマークが
@@ -605,7 +657,8 @@ impl App {
     /// 音楽ビューのブックマーク UI (Inc 5c-A、動画のジャンプ/ブックマークパネルを共有)。
     ///
     /// - 表示モードに従って出す一覧パネル本体 (`show_panel`) は `draw_native_jump_panel_body` を
-    ///   音声オプション (ピン/チャプター/サムネなし・種別見出しなし) で呼ぶ。
+    ///   音楽ビュー用オプションで呼ぶ。通常音声は従来どおりブックマークだけ、player に
+    ///   チャプターがある場合はチャプター節と種別見出しも出す (ピン/サムネは出さない)。
     /// - 改名ダイアログ / 一括登録ダイアログは動画と同一の中央モーダル
     ///   (`draw_native_bookmark_title_editor` / `draw_native_bulk_bookmark_dialog`) を使う。
     ///   IME・貼り付けも動画実装に揃う (Inc 5 FB のインポート欄 IME 不具合を解消)。
@@ -641,18 +694,15 @@ impl App {
         self.ensure_music_bookmarks_loaded(&path);
 
         let position_secs = self.music_player_position(fs_idx).unwrap_or(0.0);
-        // 一覧 → 共有 body 用のジャンプエントリ (全て Bookmark 種別、サムネなし)。
-        let entries: Vec<NativeOverlayJumpEntry> = self
-            .music_bookmarks
-            .iter()
-            .map(|b| NativeOverlayJumpEntry {
-                pts_secs: b.pts_secs,
-                kind: NativeOverlayTimelineMarkerKind::Bookmark,
-                title: b.title.clone(),
-                bookmark_id: Some(b.id),
-                thumbnail: None,
-            })
-            .collect();
+        let chapters = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player
+                .info()
+                .map(|info| info.chapters.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let has_chapters = !chapters.is_empty();
+        let entries = build_music_jump_entries(&self.music_bookmarks, &chapters);
 
         // 借用衝突を避けるためダイアログ state を self から取り出し、末尾で書き戻す。
         let mut title_edit = self.music_bookmark_title_edit.take();
@@ -661,22 +711,14 @@ impl App {
         let click_to_show = self.settings.fullscreen_side_panel_mode.normalized()
             == crate::settings::FsSidePanelMode::ClickToShow;
         let mut close_left_requested = false;
-        // 音声はサムネを持たないので空の texture マップを渡す (show_thumbnails=false で未参照)。
+        // 音楽ビューではサムネを出さないので空の texture マップを渡す
+        // (show_thumbnails=false で未参照)。
         let empty_tex: std::collections::HashMap<usize, egui::TextureId> =
             std::collections::HashMap::new();
 
         // ── 左端ホバー一覧パネル本体 ──
         if show_panel {
-            let opts = NativeJumpPanelOptions {
-                title: "ブックマーク",
-                empty_text: "ブックマークはありません",
-                show_pin_button: false,
-                show_bulk_button: true,
-                show_pins: false,
-                show_chapters: false,
-                show_section_headers: false,
-                show_thumbnails: false,
-            };
+            let opts = music_jump_panel_options(has_chapters);
             egui::Area::new(egui::Id::new(("music_jump_panel", fs_idx)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(panel_rect.min)
@@ -1728,6 +1770,75 @@ mod tests {
         assert_eq!(format_channels(2), "2 (ステレオ)");
         assert_eq!(format_channels(6), "6 ch");
         assert_eq!(format_channels(0), "-");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn music_jump_panel_without_chapters_keeps_bookmark_only_presentation() {
+        let opts = music_jump_panel_options(false);
+        assert_eq!(opts.title, "ブックマーク");
+        assert_eq!(opts.empty_text, "ブックマークはありません");
+        assert!(!opts.show_pin_button);
+        assert!(opts.show_bulk_button);
+        assert!(!opts.show_pins);
+        assert!(!opts.show_chapters);
+        assert!(!opts.show_section_headers);
+        assert!(!opts.show_thumbnails);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn music_jump_panel_adds_sorted_chapters_and_section_headers() {
+        let bookmarks = vec![
+            crate::video_bookmarks::VideoBookmarkMeta {
+                id: 2,
+                pts_secs: 30.0,
+                title: Some("後のブックマーク".to_string()),
+            },
+            crate::video_bookmarks::VideoBookmarkMeta {
+                id: 1,
+                pts_secs: 10.0,
+                title: Some("先のブックマーク".to_string()),
+            },
+        ];
+        let chapters = vec![
+            crate::video::decoder::Chapter {
+                start_secs: 40.0,
+                end_secs: 50.0,
+                title: Some("第2章".to_string()),
+            },
+            crate::video::decoder::Chapter {
+                start_secs: 20.0,
+                end_secs: 30.0,
+                title: Some("第1章".to_string()),
+            },
+        ];
+
+        let entries = build_music_jump_entries(&bookmarks, &chapters);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.pts_secs)
+                .collect::<Vec<_>>(),
+            vec![10.0, 20.0, 30.0, 40.0]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.kind).collect::<Vec<_>>(),
+            vec![
+                NativeOverlayTimelineMarkerKind::Bookmark,
+                NativeOverlayTimelineMarkerKind::Chapter,
+                NativeOverlayTimelineMarkerKind::Bookmark,
+                NativeOverlayTimelineMarkerKind::Chapter,
+            ]
+        );
+        assert_eq!(entries[0].bookmark_id, Some(1));
+        assert_eq!(entries[1].bookmark_id, None);
+        assert_eq!(entries[1].title.as_deref(), Some("第1章"));
+
+        let opts = music_jump_panel_options(true);
+        assert!(opts.show_chapters);
+        assert!(opts.show_section_headers);
+        assert!(!opts.show_thumbnails);
     }
 
     #[test]
